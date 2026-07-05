@@ -1,0 +1,65 @@
+# fetch.yaml — reference policy for mcp-server-fetch
+#
+# `fetch` is the classical SSRF surface in MCP: an agent that can fetch any
+# URL can pivot to the cloud metadata service (169.254.169.254), to
+# RFC-1918 internal addresses, or to localhost. Lexical hostname filtering
+# is not a security boundary on its own — a malicious DNS record can resolve
+# a public name to 127.0.0.1 — but it's a meaningful first line of defense
+# and pairs well with a network-layer egress firewall.
+#
+# What the default `https://**` glob enforces
+# --------------------------------------------
+#   The default allowlist pins ONLY the scheme: any public-or-private HTTPS URL
+#   matches. It addresses:
+#   1. Plain-text HTTP downgrades and non-web schemes.
+#      → http://, file://, ftp:// are not permitted; only https:// is.
+#
+#   It does NOT, by itself, block these — an HTTPS request to any of them still
+#   matches `https://**`, so you MUST narrow the glob (see Adapt) and/or rely on
+#   the egress firewall below:
+#   1. Cloud-metadata exfiltration — `https://169.254.169.254/…`,
+#      `https://100.100.100.200/…` (AWS / GCP / Azure / Alibaba IMDS) all match.
+#   2. Localhost / RFC-1918 pivoting — `https://localhost/…`,
+#      `https://10.0.0.1/…`, etc. all match.
+#   Narrowing the glob to your specific upstream origins is what actually closes
+#   #1 and #2 at the policy layer.
+#
+# Real SSRF protection
+# --------------------
+#   Run the upstream behind an egress allowlist (squid, iptables) — this
+#   policy reduces the attack surface but the kernel is the enforcement
+#   point. If your agent must reach internal hosts, do it through a
+#   reverse-proxied named endpoint rather than letting `fetch` see private
+#   IP space.
+#
+# Adapt
+# -----
+#   Tighten the `url` glob set to the specific origins your agent needs
+#   (e.g. `https://api.example.com/**`). The default allows any public HTTPS
+#   URL, which is permissive — narrow it.
+
+schemaVersion: "0.1"
+name: fetch-policy
+version: "0.1.0"
+description: >
+  HTTPS-only fetch. Non-HTTPS schemes (http://, file://, ftp://) denied by
+  absence; rate-limited; pair with a network-layer egress firewall.
+
+capabilities:
+  - target: tool:fetch
+    actions: [call]
+    conditions:
+      - type: allowedValues
+        argument: url
+        values:
+          # Any public HTTPS URL, including paths and query strings. The matcher uses
+          # path-style glob semantics for a pattern containing '/', where a single '*'
+          # does NOT cross a '/', so `https://*` would reject a normal URL like
+          # `https://example.com/docs/page.html`; `**` spans the remaining segments.
+          # Tighten this glob to your actual upstreams — `https://api.example.com/**`,
+          # etc. This enforces the scheme only — it does not structurally exclude a
+          # userinfo authority; rely on the egress firewall for real SSRF protection.
+          - "https://**"
+      - type: maxCalls
+        count: 120
+        windowSeconds: 3600

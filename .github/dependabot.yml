@@ -1,0 +1,38 @@
+# Copyright 2026 Eunolabs, LLC
+# SPDX-License-Identifier: Apache-2.0
+
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+
+  # Track the Docker base images (builder and distroless/nanoserver runtime),
+  # including the demo images built in demo-integration.yml CI. Without this, a
+  # base-image patch carrying a security fix is only caught by the release-time
+  # Trivy gate rather than surfaced as a routine PR.
+  - package-ecosystem: docker
+    directories:
+      - /deploy/docker
+      - /demo/opa-comparison/server
+      - /demo/mock-mcp-server
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies

@@ -1,0 +1,273 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "proxy: stdio enforce (local)",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceFolder}/cmd/eunox",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "args": [
+        "proxy",
+        "--config",
+        "${workspaceFolder}/demo/eunox.local.stdio.yaml"
+      ]
+    },
+    {
+      "name": "proxy: stdio wiretap (--audit, no config)",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceFolder}/cmd/eunox",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "args": [
+        "proxy",
+        "--audit",
+        "--audit-log",
+        "${workspaceFolder}/demo/audit/audit.jsonl",
+        "--audit-key-path",
+        "${workspaceFolder}/demo/audit/audit.key",
+        "--",
+        "go",
+        "run",
+        "./demo/mock-mcp-server-stdio"
+      ]
+    },
+    {
+      "name": "proxy: HTTP enforce (local)",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceFolder}/cmd/eunox",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "args": [
+        "proxy",
+        "--config",
+        "${workspaceFolder}/demo/eunox.local.http.yaml"
+      ]
+    },
+    {
+      "name": "proxy: HTTP + JWT (local, needs Keycloak)",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceFolder}/cmd/eunox",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "args": [
+        "proxy",
+        "--config",
+        "${workspaceFolder}/demo/eunox.local.http.yaml",
+        "--jwks-uri",
+        "http://localhost:8081/realms/eunox-demo/protocol/openid-connect/certs",
+        "--jwt-issuer",
+        "http://localhost:8081/realms/eunox-demo",
+        "--jwt-allow-any-audience"
+      ]
+    },
+    {
+      "name": "proxy: gateway (local, 2 upstreams)",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceFolder}/cmd/eunox",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "args": [
+        "proxy",
+        "--config",
+        "${workspaceFolder}/demo/eunox.local.gateway.yaml"
+      ]
+    },
+    {
+      "name": "upstream: HTTP mock (:8080)",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceFolder}/demo/mock-mcp-server",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "env": {
+        "PORT": "8080"
+      }
+    },
+    {
+      "name": "validate: demo manifest (syntax)",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceFolder}/cmd/eunox",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "validate",
+        "${workspaceFolder}/demo/manifest.yaml"
+      ]
+    },
+    {
+      "name": "validate: config (all routes)",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceFolder}/cmd/eunox",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "validate",
+        "--config",
+        "${workspaceFolder}/demo/eunox.local.stdio.yaml"
+      ]
+    },
+    {
+      "name": "validate: live vs stdio mock",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceFolder}/cmd/eunox",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "validate",
+        "${workspaceFolder}/demo/manifest.yaml",
+        "--live",
+        "--transport",
+        "stdio",
+        "--",
+        "go",
+        "run",
+        "./demo/mock-mcp-server-stdio"
+      ]
+    },
+    {
+      "name": "init: deny-all manifest from stdio mock",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceFolder}/cmd/eunox",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "init",
+        "--transport",
+        "stdio",
+        "--",
+        "go",
+        "run",
+        "./demo/mock-mcp-server-stdio"
+      ]
+    },
+    {
+      "name": "suggest: draft manifest from audit log",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceFolder}/cmd/eunox",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "suggest",
+        "--audit-log",
+        "${workspaceFolder}/demo/audit/audit.jsonl"
+      ]
+    },
+    {
+      "name": "stats: denial histogram",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceFolder}/cmd/eunox",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "stats",
+        "--audit-log",
+        "${workspaceFolder}/demo/audit/audit.jsonl"
+      ]
+    },
+    {
+      "name": "doctor: support bundle",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceFolder}/cmd/eunox",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "doctor",
+        "--config",
+        "${workspaceFolder}/demo/eunox.local.stdio.yaml",
+        "--audit-log",
+        "${workspaceFolder}/demo/audit/audit.jsonl",
+        "--audit-key-path",
+        "${workspaceFolder}/demo/audit/audit.key"
+      ]
+    },
+    {
+      "name": "audit-verify: demo tape",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceFolder}/cmd/eunox",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "audit-verify",
+        "--audit-log",
+        "${workspaceFolder}/demo/audit/audit.jsonl",
+        "--audit-key-path",
+        "${workspaceFolder}/demo/audit/audit.key"
+      ]
+    },
+    {
+      "name": "kill: all sessions (HTTP control)",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceFolder}/cmd/eunox",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "kill",
+        "all"
+      ]
+    },
+    {
+      "name": "version",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceFolder}/cmd/eunox",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "version"
+      ]
+    },
+    {
+      "name": "test: function under cursor",
+      "type": "go",
+      "request": "launch",
+      "mode": "test",
+      "program": "${fileDirname}",
+      "args": [
+        "-test.v",
+        "-test.run",
+        "${selectedText}"
+      ]
+    },
+    {
+      "name": "test: current package",
+      "type": "go",
+      "request": "launch",
+      "mode": "test",
+      "program": "${fileDirname}",
+      "args": [
+        "-test.v"
+      ]
+    }
+  ],
+  "compounds": [
+    {
+      "name": "proxy: HTTP enforce + mock upstream",
+      "configurations": [
+        "upstream: HTTP mock (:8080)",
+        "proxy: HTTP enforce (local)"
+      ],
+      "stopAll": true
+    }
+  ]
+}

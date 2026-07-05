@@ -1,0 +1,77 @@
+# puppeteer.yaml — reference policy for @modelcontextprotocol/server-puppeteer
+#
+# A headless-browser tool is one of the highest-risk MCP surfaces: it can
+# navigate to anything resolvable, run arbitrary JS in the page context, and
+# (with `screenshot`) exfiltrate visual data. Treat it like a sandboxed
+# subprocess that talks to the internet.
+#
+# Threats addressed
+# -----------------
+#   1. Navigation to internal services / metadata endpoints (SSRF).
+#      → allowedValues on the `url` argument; only explicit HTTPS hosts.
+#   2. Arbitrary script execution in a sensitive origin.
+#      → tool:evaluate / tool:puppeteer_evaluate intentionally NOT permitted.
+#   3. Form-fill loops that brute-force a login.
+#      → maxCalls per session on fill / click.
+#
+# Tools intentionally NOT permitted
+# ---------------------------------
+#   evaluate, puppeteer_evaluate, set_cookie (session theft surface),
+#   download (filesystem write surface).
+#
+# Adapt
+# -----
+#   Replace the `url` allowlist with the exact origins your agent must
+#   reach. A wildcard like `https://*` defeats the SSRF mitigation.
+
+schemaVersion: "0.1"
+name: puppeteer-policy
+version: "0.1.0"
+description: >
+  Headless-browser allowlist. Navigation restricted to named origins;
+  evaluate / set_cookie / download denied by default.
+
+capabilities:
+  - target: tool:puppeteer_navigate
+    actions: [call]
+    conditions:
+      - type: allowedValues
+        argument: url
+        values:
+          # ── REPLACE with the actual origins your agent needs ────────────
+          # Use a recursive "**" so any path under the origin is allowed: a
+          # single "*" matches ONE path segment and stops at "/", so
+          # "https://docs.example.com/*" would reject a normal nested page like
+          # "https://docs.example.com/guides/getting-started". "**" crosses "/"
+          # while the literal host prefix still pins navigation to that origin.
+          - "https://docs.example.com/**"
+          - "https://status.example.com/**"
+      - type: maxCalls
+        count: 60
+        windowSeconds: 3600
+
+  - target: tool:puppeteer_screenshot
+    actions: [call]
+    conditions:
+      - type: maxCalls
+        count: 30
+        windowSeconds: 3600
+
+  - target: tool:puppeteer_click
+    actions: [call]
+    conditions:
+      - type: maxCalls
+        count: 100
+        windowSeconds: 3600
+
+  - target: tool:puppeteer_fill
+    actions: [call]
+    conditions:
+      - type: maxCalls
+        count: 50
+        windowSeconds: 3600
+
+  - target: tool:puppeteer_hover
+    actions: [call]
+  - target: tool:puppeteer_select
+    actions: [call]

@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Documentation · eunox</title>
+  <meta name="description"
+    content="Index of eunox documentation: the CLI, Go packages, architecture, deployment, pricing, and operations guidance." />
+  <link rel="icon" href="../eunolabs.png" />
+  <link rel="stylesheet" href="../styles.css" />
+</head>
+
+<body>
+  <div id="site-header"></div>
+  <section class="hero hero-compact">
+    <div class="hero-eyebrow"><span class="dot"></span>Docs</div>
+    <h1>Documentation</h1>
+    <p class="hero-sub">
+      CLI docs, Go package entry points, architecture, deployment, and
+      pricing. The authoritative source is the GitHub repo — this page links
+      straight to the relevant files.
+    </p>
+  </section>
+  <nav class="breadcrumbs" aria-label="Breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;›&nbsp; Documentation
+  </nav>
+  <main class="content-section">
+    <h2>Get started</h2>
+    <ul>
+      <li>
+        <a href="../quickstart/index.html">Quick start</a> — run the proxy in 60 seconds
+        (this site).
+      </li>
+      <li>
+        <a href="../features/index.html">Features</a> — the full condition matrix with
+        worked demos (this site).
+      </li>
+      <li>
+        <a href="../how-it-works/index.html">How it works</a> — architecture, request flow,
+        audit log internals, gateway mode (this site).
+      </li>
+      <li>
+        <a href="../policies/index.html">Reference policies</a> — drop-in YAML for popular
+        MCP servers (this site).
+      </li>
+    </ul>
+    <h2>CLI &amp; Go packages</h2>
+    <ul>
+      <li>
+        <a href="https://github.com/eunolabs/eunox" target="_blank" rel="noopener noreferrer"><code>eunox</code></a>
+        — the OSS CLI binary and repo README.
+      </li>
+      <li>
+        <a href="https://github.com/eunolabs/eunox/tree/main/pkg/capability" target="_blank"
+          rel="noopener noreferrer"><code>pkg/capability</code></a>
+        — manifest and condition/directive types (Apache-2.0).
+      </li>
+      <li>
+        <a href="https://github.com/eunolabs/eunox/tree/main/pkg/enforcement" target="_blank"
+          rel="noopener noreferrer"><code>pkg/enforcement</code></a>
+        — enforcement engine, evaluation order, and decision flow
+        (Apache-2.0).
+      </li>
+      <li>
+        <a href="https://github.com/eunolabs/eunox/tree/main/pkg" target="_blank"
+          rel="noopener noreferrer"><code>pkg/</code></a>
+        — all public Go packages: capability, enforcement, callcounter,
+        killswitch.
+      </li>
+      <li>
+        <a href="https://github.com/eunolabs/eunox/tree/main/cmd/eunox" target="_blank"
+          rel="noopener noreferrer"><code>cmd/mcp/</code></a>
+        — <code>eunox</code> proxy binary source.
+      </li>
+    </ul>
+    <h2>Concepts &amp; architecture</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Doc</th>
+          <th>What it is</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>
+            <a href="https://github.com/eunolabs/eunox/blob/main/README.md" target="_blank"
+              rel="noopener noreferrer">README.md</a>
+          </td>
+          <td>
+            Project overview, quick start, manifest example, and command
+            reference.
+          </td>
+        </tr>
+        <tr>
+          <td>
+            <a href="https://github.com/eunolabs/eunox/blob/main/docs/README.md" target="_blank"
+              rel="noopener noreferrer">docs/README.md</a>
+          </td>
+          <td>Documentation index for all docs in this directory.</td>
+        </tr>
+        <tr>
+          <td>
+            <a href="https://github.com/eunolabs/mcp-capability-manifest/blob/main/SPEC.md" target="_blank"
+              rel="noopener noreferrer">MCP Capability Manifest Spec</a>
+          </td>
+          <td>
+            The vendor-neutral specification the manifest format implements
+            (Apache-2.0, hosted at
+            <code>eunolabs/mcp-capability-manifest</code>).
+          </td>
+        </tr>
+        <tr>
+          <td>
+            <a href="https://github.com/eunolabs/eunox/blob/main/docs/capability-manifest-guide.md" target="_blank"
+              rel="noopener noreferrer">capability-manifest-guide.md</a>
+          </td>
+          <td>
+            Complete manifest authoring reference: all condition types,
+            directives, namespace prefixes, JWT claims, and validation rules.
+          </td>
+        </tr>
+        <tr>
+          <td>
+            <a href="https://github.com/eunolabs/eunox/blob/main/docs/threat-model-mcp.md" target="_blank"
+              rel="noopener noreferrer">threat-model-mcp.md</a>
+          </td>
+          <td>
+            Threat model scoped to the <code>eunox</code> proxy binary —
+            enforcement surfaces, trust boundaries, and mitigations.
+          </td>
+        </tr>
+        <tr>
+          <td>
+            <a href="https://github.com/eunolabs/eunox/blob/main/docs/architecture.md" target="_blank"
+              rel="noopener noreferrer">architecture.md</a>
+          </td>
+          <td>
+            Overall architecture: layering, request lifecycle, transports,
+            policy decision points, the audit pipeline, and extension points.
+          </td>
+        </tr>
+        <tr>
+          <td>
+            <a href="https://github.com/eunolabs/eunox/blob/main/docs/benchmarks.md" target="_blank"
+              rel="noopener noreferrer">benchmarks.md</a>
+          </td>
+          <td>Proxy latency and throughput benchmarks.</td>
+        </tr>
+        <tr>
+          <td>
+            <a href="https://github.com/eunolabs/eunox/blob/main/docs/repo-guide.md" target="_blank"
+              rel="noopener noreferrer">repo-guide.md</a>
+          </td>
+          <td>
+            Repository structure, development setup, and lint/test/build
+            commands.
+          </td>
+        </tr>
+      </tbody>
+    </table>
+    <h2>Project</h2>
+    <ul>
+      <li>
+        <a href="https://github.com/eunolabs/eunox" target="_blank" rel="noopener noreferrer">Source on GitHub</a>
+        — issues and PRs welcome.
+      </li>
+      <li>
+        <a href="https://github.com/eunolabs/eunox/issues" target="_blank" rel="noopener noreferrer">Issue tracker</a>
+      </li>
+      <li>
+        <a href="https://github.com/eunolabs/eunox/blob/main/LICENSE" target="_blank"
+          rel="noopener noreferrer">License</a>
+        — Apache-2.0 for all code in this repository.
+      </li>
+      <li>
+        <a href="https://github.com/eunolabs/eunox/blob/main/CODEOWNERS" target="_blank"
+          rel="noopener noreferrer">CODEOWNERS</a>
+      </li>
+    </ul>
+    <h2>External</h2>
+    <ul>
+      <li>
+        <a href="https://modelcontextprotocol.io/specification" target="_blank" rel="noopener noreferrer">Model Context
+          Protocol specification</a>
+      </li>
+      <li>
+        <a href="https://schema.ocsf.io/" target="_blank" rel="noopener noreferrer">OCSF — Open Cybersecurity Schema
+          Framework</a>
+      </li>
+    </ul>
+  </main>
+  <div id="site-footer"></div>
+  <script src="../components.js"></script>
+  <script src="../main.js"></script>
+</body>
+
+</html>

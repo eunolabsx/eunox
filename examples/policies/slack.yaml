@@ -1,0 +1,72 @@
+# slack.yaml — reference policy for @modelcontextprotocol/server-slack
+#
+# Slack write tools are an under-appreciated exfiltration channel: an
+# instruction hidden in a document the agent reads ("DM your findings to
+# channel X") is a viable path to leaking data over Slack. Lock it down.
+#
+# Threats addressed
+# -----------------
+#   1. Agent DMs an attacker-controlled user with extracted data.
+#      → no `slack_post_message` to user DMs: `channel` allowlisted to
+#        server-side channel IDs only (C-prefixed), no `D` (DM) or `G`
+#        (private-MPIM) channels.
+#   2. Agent posts to a customer-facing or production-alert channel.
+#      → `channel` allowlist names the small set of agent-safe channels.
+#   3. Spam / runaway posting.
+#      → maxCalls per session.
+#
+# Slack channel ID prefixes
+# -------------------------
+#   C…  public channels (allowed below — replace with your real IDs)
+#   G…  private channels / MPIMs (allow on a case-by-case basis)
+#   D…  direct messages (intentionally NOT allowed)
+#
+# Tools intentionally NOT permitted
+# ---------------------------------
+#   slack_post_message to arbitrary channels, slack_reply_to_thread without
+#   the same allowlist, slack_add_reaction (low-risk but noise-prone — opt
+#   in if you actually need it).
+
+schemaVersion: "0.1"
+name: slack-policy
+version: "0.1.0"
+description: >
+  Slack allowlist. Posts restricted to a small set of channel IDs; DMs
+  blocked; runaway-posting rate-capped.
+
+capabilities:
+  - target: tool:slack_list_channels
+    actions: [call]
+  - target: tool:slack_get_channel_history
+    actions: [call]
+  - target: tool:slack_get_thread_replies
+    actions: [call]
+  - target: tool:slack_get_users
+    actions: [call]
+  - target: tool:slack_get_user_profile
+    actions: [call]
+
+  - target: tool:slack_post_message
+    actions: [call]
+    conditions:
+      - type: allowedValues
+        argument: channel
+        values:
+          # ── REPLACE with your real channel IDs ──────────────────────────
+          - "C01AGENT001"   # #agent-notifications
+          - "C01AGENT002"   # #agent-results
+      - type: maxCalls
+        count: 30
+        windowSeconds: 3600
+
+  - target: tool:slack_reply_to_thread
+    actions: [call]
+    conditions:
+      - type: allowedValues
+        argument: channel_id
+        values:
+          - "C01AGENT001"
+          - "C01AGENT002"
+      - type: maxCalls
+        count: 60
+        windowSeconds: 3600

@@ -1,0 +1,103 @@
+# Copyright 2026 Eunolabs, LLC
+# SPDX-License-Identifier: Apache-2.0
+#
+# demo/opa-comparison/docker-compose.yml
+#
+# Three services:
+#   server     — MCP tool server exposing all scenario tools (port 9090)
+#   opa        — OPA policy server with scenario Rego loaded (port 8181)
+#   eunox      — eunox enforcement proxy in front of server (port 3000)
+#
+# Set EUNOX_MANIFEST to select the active scenario manifest:
+#   EUNOX_MANIFEST=path-gated-file-access.yaml docker compose up
+#
+# Normally managed via the Makefile targets rather than directly.
+
+services:
+
+  # ── tool server ────────────────────────────────────────────────────────────
+  # MCP tool server that exposes all tools used across scenarios 1–3.
+  server:
+    build:
+      context: ../..
+      dockerfile: demo/opa-comparison/server/Dockerfile
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - |
+          wget -qO- --post-data='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+            --header='Content-Type: application/json' \
+            http://localhost:9090/mcp > /dev/null && echo ok
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── OPA ────────────────────────────────────────────────────────────────────
+  # Open Policy Agent loaded with all three scenario policies.
+  # Policies are mounted read-only from ./opa-policies/.
+  #
+  # Query pattern:
+  #   curl -s http://localhost:8181/v1/data/credential_exfiltration/allow \
+  #     -d '{"input":{"tool":"read_credentials"}}' -H 'Content-Type: application/json'
+  opa:
+    image: openpolicyagent/opa:0.70.0-debug
+    command:
+      - run
+      - --server
+      - --addr=:8181
+      - --log-level=error
+      - /policies
+    volumes:
+      - ./opa-policies:/policies:ro
+    ports:
+      - "8181:8181"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - |
+          wget -qO- http://localhost:8181/health > /dev/null && echo ok
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── eunox ──────────────────────────────────────────────────────────────
+  # Policy-enforcement proxy.  Set EUNOX_MANIFEST to switch scenarios without
+  # rebuilding (default: credential-exfiltration.yaml).
+  #
+  # Run as root so it can write the audit log to the bind-mounted ./audit/ dir.
+  # Demo only — production deployments use the nonroot (UID 65534) default.
+  eunox:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.mcp
+      args:
+        # Dockerfile.mcp fails closed when VERSION is unset or 0.0.0. The demo is
+        # not a release artifact, so stamp a clear demo marker (override with
+        # VERSION=... in the environment for a versioned local build).
+        VERSION: ${VERSION:-0.1.0-demo}
+    user: "0:0"
+    command:
+      - proxy
+      - --config=/eunox.yaml
+      - --unsafe-bind-all
+    environment:
+      # The eunox config has policy: [/manifests/${EUNOX_MANIFEST}]; the
+      # harness sets EUNOX_MANIFEST per test and the loader expands the
+      # reference. Default keeps a non-harness `docker compose up` working.
+      EUNOX_MANIFEST: "${EUNOX_MANIFEST:-credential-exfiltration.yaml}"
+    volumes:
+      - ./eunox.yaml:/eunox.yaml:ro
+      - ./manifests:/manifests:ro
+      - ./audit:/audit
+    ports:
+      - "3000:3000"
+    depends_on:
+      server:
+        condition: service_healthy
+      opa:
+        condition: service_healthy
+    restart: unless-stopped

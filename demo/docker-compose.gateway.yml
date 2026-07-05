@@ -1,0 +1,91 @@
+# Copyright 2026 Eunolabs, LLC
+# SPDX-License-Identifier: Apache-2.0
+#
+# demo/docker-compose.gateway.yml — gateway-mode demo stack for eunox.
+#
+# ONE eunox process fronts TWO mock MCP servers, each on its own
+# /mcp/<name> route with its own independently versioned manifest, all sharing
+# one tamper-evident audit tape.
+#
+#   MCP host ──► eunox-gateway ──► /mcp/files ──► mock-files  (policy files.yaml @ 0.1.0)
+#                              └─► /mcp/db    ──► mock-db     (policy db.yaml    @ 0.2.0)
+#
+# Quick start (from repo root):
+#   make -C demo gateway-up
+#   make -C demo gw-files-allow   # read_file on /mcp/files → ALLOWED
+#   make -C demo gw-cross-deny    # read_file on /mcp/db    → DENIED (per-route policy)
+#   make -C demo gw-db-allow      # query_db SELECT on /mcp/db → ALLOWED
+#   make -C demo gateway-audit    # tail the shared tape (upstream + policy_version stamped)
+#   make -C demo gateway-down
+
+services:
+
+  # ── mock-files ─────────────────────────────────────────────────────
+  # Upstream behind the /mcp/files route. Same mock image as the base demo;
+  # exposes read_file, write_file, query_db with deterministic fake responses.
+  mock-files:
+    build:
+      context: ..
+      dockerfile: demo/mock-mcp-server/Dockerfile
+    restart: unless-stopped
+    healthcheck:
+      # GET the side-effect-free /healthz endpoint; healthy when it returns 200.
+      # Probing with a real `initialize` (the old check) would leak one resident
+      # session per interval, since the probe never sends the matching DELETE.
+      test:
+        - "CMD-SHELL"
+        - "wget -qO- http://localhost:8080/healthz > /dev/null && echo ok"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── mock-db ────────────────────────────────────────────────────────
+  # Upstream behind the /mcp/db route.
+  mock-db:
+    build:
+      context: ..
+      dockerfile: demo/mock-mcp-server/Dockerfile
+    restart: unless-stopped
+    healthcheck:
+      # GET the side-effect-free /healthz endpoint; healthy when it returns 200.
+      # Probing with a real `initialize` (the old check) would leak one resident
+      # session per interval, since the probe never sends the matching DELETE.
+      test:
+        - "CMD-SHELL"
+        - "wget -qO- http://localhost:8080/healthz > /dev/null && echo ok"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── eunox-gateway ──────────────────────────────────────────────────
+  # One proxy process, many upstreams. Routes + per-route policies are declared
+  # in gateway.yaml. --unsafe-bind-all permits the config's 0.0.0.0 bind inside
+  # the container (demo only; production binds loopback or sits behind a proxy).
+  eunox-gateway:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.mcp
+      args:
+        # Dockerfile.mcp fails closed when VERSION is unset or 0.0.0. The demo is
+        # not a release artifact, so stamp a clear demo marker (override with
+        # VERSION=... in the environment for a versioned local build).
+        VERSION: ${VERSION:-0.1.0-demo}
+    # Run as root so it can write the audit log to the bind-mounted ./audit/ dir.
+    # Demo only — production deployments use the nonroot (UID 65534) default.
+    user: "0:0"
+    command:
+      - proxy
+      - --config=/demo/gateway.yaml
+      - --unsafe-bind-all
+    volumes:
+      - ./gateway.yaml:/demo/gateway.yaml:ro
+      - ./policies:/demo/policies:ro
+      - ./audit:/audit
+    ports:
+      - "3000:3000"
+    depends_on:
+      mock-files:
+        condition: service_healthy
+      mock-db:
+        condition: service_healthy
+    restart: unless-stopped

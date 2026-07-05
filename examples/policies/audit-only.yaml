@@ -1,0 +1,42 @@
+# audit-only.yaml — observe an upstream before writing a real policy
+#
+# Use this when you're standing up an unfamiliar MCP server and don't yet
+# know what tools your agent calls, with what arguments, or how often. The
+# upstream's traffic is recorded to the audit log with full arguments;
+# nothing is blocked. Read the tape, then write a real allowlist (use one of
+# the other files in this directory as a template).
+#
+# This file is intentionally empty of capabilities — the *route* is what
+# observes, not the manifest. Reference this file from a route that sets
+# `enforcement: audit`:
+#
+#   # eunox.yaml
+#   upstreams:
+#     - name: unknown
+#       transport: stdio
+#       command: npx
+#       args: ["-y", "@vendor/server-unknown"]
+#       enforcement: audit                   # ← observe, don't block
+#       policy: ["./examples/policies/audit-only.yaml"]
+#
+# Read the tape:
+#
+#   eunox stats                  # per-tool histogram, allowed + observed
+#   tail -f ~/.eunox/audit.jsonl     # full arguments per call
+#
+# When you've seen what the agent actually does, scaffold a deny-all
+# starter manifest from the live tool list and graduate to enforcement:
+#
+#   eunox init --upstream-url <url> --output manifest.yaml
+#
+# See docs/capability-manifest-guide.md § 0 ("wiretap first, write second").
+
+schemaVersion: "0.1"
+name: audit-only-template
+version: "0.0.1"
+description: >
+  Placeholder manifest used with `enforcement: audit` on the route.
+  Empty capabilities list — every call is recorded with full arguments
+  and forwarded unchanged.
+
+capabilities: []

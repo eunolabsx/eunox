@@ -1,0 +1,13 @@
+# Copyright 2026 Eunolabs, LLC
+# SPDX-License-Identifier: Apache-2.0
+
+.git
+.github
+.gitignore
+*.md
+!README.md
+docs/
+site/
+coverage.out
+deploy/
+.golangci.yml

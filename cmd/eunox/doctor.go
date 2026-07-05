@@ -1,0 +1,869 @@
+// Copyright 2026 Eunolabs, LLC
+// SPDX-License-Identifier: Apache-2.0
+
+// doctor: a user-initiated support bundle. Nothing is uploaded — the operator
+// pastes it into a bug report. It gathers binary identity, redacted transport
+// config, manifest digests + validation summary, the scrubbed tail of the audit
+// log, and (with --live) drift against each declared upstream.
+//
+// Redaction is allowlist-based: a fixed set of secret-bearing field names is
+// replaced with a length-only placeholder, and URL userinfo + query values are
+// scrubbed; everything else is verbatim. The rule is deliberately narrow —
+// heuristic secret detection silently corrupts diagnostics — and the footer
+// reminds the operator to skim before sharing.
+
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"net/url"
+	"os"
+	"runtime"
+	"runtime/debug"
+	"strings"
+	"time"
+
+	"gopkg.in/yaml.v3"
+
+	"github.com/eunolabs/eunox/internal/audit"
+	"github.com/eunolabs/eunox/internal/config"
+	"github.com/eunolabs/eunox/internal/transport"
+)
+
+const (
+	defaultDoctorAuditTail = 50
+	doctorSep              = "────────────────────────────────────────────────────────────"
+)
+
+// wf and wln are package-level write helpers for the doctor bundle; per-call
+// write errors are discarded here (not actionable for stdout). When the bundle
+// goes to --output FILE, w is an *errTrackingWriter so a short write IS caught and
+// the truncated file is reported instead of announced as complete.
+func wf(w io.Writer, format string, args ...interface{}) { _, _ = fmt.Fprintf(w, format, args...) }
+func wln(w io.Writer, args ...interface{})               { _, _ = fmt.Fprintln(w, args...) }
+
+// writers binds w into the (wf, wln) pair used by the CLI's report writers, so a
+// function emitting a single stream declares `wf, wln := writers(out)` once instead
+// of re-deriving the two Fprintf/Fprintln closures inline at each site. They delegate
+// to the package-level wf/wln, so the write logic lives in exactly one place.
+func writers(w io.Writer) (writef func(string, ...interface{}), writeln func(...interface{})) {
+	return func(format string, args ...interface{}) { wf(w, format, args...) },
+		func(args ...interface{}) { wln(w, args...) }
+}
+
+// errTrackingWriter records the first write error. Writing to --output FILE makes
+// a short write (e.g. ENOSPC mid-bundle) actionable: the on-disk file is a partial
+// bundle missing later sections, which the operator would otherwise paste into a
+// bug report believing it complete because the tool said "Wrote support bundle"
+// and exited 0. The stdout path keeps the discard-errors behavior.
+type errTrackingWriter struct {
+	w   io.Writer
+	err error
+}
+
+func (e *errTrackingWriter) Write(p []byte) (int, error) {
+	if e.err != nil {
+		return 0, e.err
+	}
+	n, err := e.w.Write(p)
+	if err != nil {
+		e.err = err
+	}
+	return n, err
+}
+
+// redactedConfigFields names the YAML keys whose string values are scrubbed from
+// the doctor bundle; anything not listed shows verbatim. Keep in sync with
+// config.GatewayConfig — every sensitive field the schema admits must appear in one
+// of these two maps: a full length-only placeholder (redactedConfigFields) or a URL
+// scrub (urlConfigFields).
+var redactedConfigFields = map[string]bool{
+	"authToken":          true, // listen.authToken
+	"upstreamAuthHeader": true, // upstreams[].upstreamAuthHeader
+}
+
+// urlConfigFields names the URL/URI keys whose value is routed through redactURL
+// (userinfo, query values, and fragment scrubbed; host/path kept) rather than emitted
+// verbatim — whether the value is a single scalar URL or a sequence of them (see
+// redactURLValue). Keyed on the field name because a credential is as likely in any of
+// these as in the original upstreamUrl.
+var urlConfigFields = map[string]bool{
+	"upstreamUrl":               true, // upstreams[].upstreamUrl (scalar)
+	"oauthResource":             true, // listen.oauthResource (scalar, RFC 9728 resource URI)
+	"oauthAuthorizationServers": true, // listen.oauthAuthorizationServers (sequence of IdP URLs)
+	"allowedOrigins":            true, // listen.allowedOrigins (sequence)
+}
+
+// redactURLValue scrubs a URL-bearing config value of ANY shape: a scalar URL string
+// (userinfo/query/fragment stripped via redactURL), a sequence of URL strings, or
+// (defensively) a nested map. The doctor bundle raw-parses the on-disk YAML to surface
+// a config exactly as written, so a URL field can arrive in a shape the typed loader
+// would reject — a scalar where a list was expected, or a list where a scalar was.
+// Scrubbing on the value's SHAPE rather than the declared schema shape means a
+// credential under any URL key is scrubbed regardless of how it was (mis)written; the
+// prior split scalar/array handling leaked a scalar written under an array-typed key.
+func redactURLValue(val interface{}) interface{} {
+	switch v := val.(type) {
+	case string:
+		return redactURL(v)
+	case []interface{}:
+		for i, it := range v {
+			v[i] = redactURLValue(it)
+		}
+		return v
+	default:
+		// A map or other nested shape: recurse so a credential under a known key inside
+		// it is still scrubbed. A scalar number/bool has nothing to scrub.
+		redactConfigValue(val)
+		return val
+	}
+}
+
+// doctorOptions bundles the parsed CLI flags for cmdDoctor so the bundle
+// writer can be unit-tested without going through os.Args.
+type doctorOptions struct {
+	configPath   string
+	auditLogPath string
+	auditKeyPath string
+	auditTail    int
+	live         bool
+}
+
+func cmdDoctor() {
+	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
+	fs.Usage = func() {
+		fmt.Fprint(os.Stderr, `Usage:
+  eunox doctor [flags]
+
+Print a user-initiated support bundle: binary identity, redacted transport
+config, manifest digests + validation summary, the tail of the audit log
+(values scrubbed), and — with --live — drift against each declared upstream.
+
+Nothing leaves your machine. The bundle prints to stdout (or --output FILE)
+so you control what gets pasted into a bug report. Secrets in named fields
+(authToken, upstreamAuthHeader) are redacted; URL userinfo, query
+values, and fragments are scrubbed in the URL/URI fields (upstreamUrl,
+oauthResource, oauthAuthorizationServers, allowedOrigins).
+Command-line args, paths, and audit metadata are shown verbatim — skim
+before sharing.
+
+Flags:
+`)
+		fs.PrintDefaults()
+	}
+
+	configPath := fs.String("config", "", "Path to the eunox config (YAML). When set, the bundle includes the\nredacted config, manifest validation per route, and (with --live) drift.")
+	auditLog := fs.String("audit-log", "", "Path to the audit JSONL log (default: ~/.eunox/audit.jsonl).")
+	auditKey := fs.String("audit-key-path", "", "Path to the HMAC signing key (default: ~/.eunox/audit.key). Only used\nto report whether the key is loadable; signatures are not re-verified here.")
+	auditTail := fs.Int("audit-tail", defaultDoctorAuditTail, "Number of trailing audit records to include (values redacted). 0 ⟹ skip.")
+	live := fs.Bool("live", false, "Connect to each declared upstream and include the drift report.\nRequires --config.")
+	output := fs.String("output", "", "Write the bundle to this file instead of stdout. The conventional name\nis eunox-doctor-<timestamp>.txt; --output auto picks one automatically.")
+
+	// flag.ExitOnError: Parse exits the process on a bad flag or -help, so it never
+	// returns a non-nil error here (the old `if err != nil` branch was dead).
+	_ = fs.Parse(os.Args[2:])
+	// All inputs are flags; reject a stray positional rather than ignore it.
+	if fs.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "eunox doctor: unexpected argument %q (all inputs are flags; see --help)\n", fs.Arg(0))
+		os.Exit(1)
+	}
+
+	// If --config is provided, use its audit.log/audit.keyPath as defaults for
+	// --audit-log/--audit-key-path, matching suggest/stats/audit-verify — the other
+	// readers of the same tape. Without this, `doctor --config foo.yaml` (no
+	// --audit-log) reported against the built-in default path even when foo.yaml
+	// pointed its audit.log elsewhere.
+	if err := applyConfigAuditDefaults("doctor", *configPath, auditLog, auditKey); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
+	opts := doctorOptions{
+		configPath:   *configPath,
+		auditLogPath: *auditLog,
+		auditKeyPath: *auditKey,
+		auditTail:    *auditTail,
+		live:         *live,
+	}
+
+	// Stdout: discard write errors (a broken pipe is not actionable).
+	if *output == "" {
+		writeDoctorBundle(os.Stdout, opts)
+		return
+	}
+
+	outPath := *output
+	if outPath == "auto" {
+		outPath = fmt.Sprintf("eunox-doctor-%s.txt", time.Now().UTC().Format("20060102T150405Z"))
+	}
+	f, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600) //nolint:gosec // G304: --output is an operator-supplied destination
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "eunox doctor: opening %q: %v\n", outPath, err)
+		os.Exit(1)
+	}
+	// Track write errors AND the close (which flushes) so a truncated bundle is
+	// reported with a non-zero exit rather than announced as complete.
+	tw := &errTrackingWriter{w: f}
+	writeDoctorBundle(tw, opts)
+	closeErr := f.Close()
+	if writeErr := tw.err; writeErr != nil {
+		fmt.Fprintf(os.Stderr, "eunox doctor: writing %q: %v\n", outPath, writeErr)
+		os.Exit(1)
+	}
+	if closeErr != nil {
+		fmt.Fprintf(os.Stderr, "eunox doctor: writing %q: %v\n", outPath, closeErr)
+		os.Exit(1)
+	}
+	fmt.Fprintf(os.Stderr, "Wrote support bundle to %s\n", outPath)
+	fmt.Fprintln(os.Stderr, "Review for any remaining sensitive values before sharing.")
+}
+
+// writeDoctorBundle emits the support bundle to w. Sections are independent —
+// a failure in any one (missing config, unreadable audit log, …) is reported
+// in place and the remaining sections still render.
+func writeDoctorBundle(w io.Writer, opts doctorOptions) {
+	wln(w, "eunox doctor — support bundle")
+	wf(w, "Generated: %s\n", time.Now().UTC().Format(time.RFC3339))
+	wln(w)
+
+	// Parse the gateway config ONCE for the manifest (section 3) and live-drift
+	// (section 5) walks, which both operate on the same ${ENV}-expanded config, rather
+	// than re-loading it per section. Section 2 deliberately keeps its own RAW read
+	// (no env expansion) so it can surface the config exactly as written on disk.
+	var cfg *config.GatewayConfig
+	var cfgErr error
+	if opts.configPath != "" {
+		cfg, cfgErr = config.LoadGatewayConfig(opts.configPath)
+	}
+
+	wln(w, doctorSep)
+	wln(w, "1. Binary")
+	wln(w, doctorSep)
+	writeDoctorBinary(w)
+
+	wln(w)
+	wln(w, doctorSep)
+	wln(w, "2. Config (redacted)")
+	wln(w, doctorSep)
+	if opts.configPath == "" {
+		wln(w, "(no --config provided)")
+	} else {
+		writeDoctorConfig(w, opts.configPath)
+	}
+
+	wln(w)
+	wln(w, doctorSep)
+	wln(w, "3. Manifests")
+	wln(w, doctorSep)
+	if opts.configPath == "" {
+		wln(w, "(no --config provided; nothing to validate)")
+	} else {
+		writeDoctorManifests(w, cfg, cfgErr)
+	}
+
+	wln(w)
+	wln(w, doctorSep)
+	wln(w, "4. Audit log")
+	wln(w, doctorSep)
+	writeDoctorAudit(w, opts.auditLogPath, opts.auditKeyPath, opts.auditTail)
+
+	wln(w)
+	wln(w, doctorSep)
+	wln(w, "5. Live upstream check")
+	wln(w, doctorSep)
+	switch {
+	case !opts.live:
+		wln(w, "(skipped — pass --live to introspect each declared upstream)")
+	case opts.configPath == "":
+		wln(w, "(skipped — --live requires --config)")
+	default:
+		writeDoctorLive(w, cfg, cfgErr)
+	}
+
+	wln(w)
+	wln(w, doctorSep)
+	wln(w, "End of bundle. Nothing has been sent — review and paste manually.")
+}
+
+// writeDoctorBinary stamps the binary identity: build version (from -ldflags),
+// Go runtime, OS/arch, and (when the binary embeds VCS info) the commit SHA
+// and dirty flag from runtime/debug.BuildInfo.
+func writeDoctorBinary(w io.Writer) {
+	wf(w, "  version:    %s\n", version)
+	wf(w, "  go:         %s\n", runtime.Version())
+	wf(w, "  os/arch:    %s/%s\n", runtime.GOOS, runtime.GOARCH)
+
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		wf(w, "  vcs:        (build info unavailable)\n")
+		return
+	}
+	var rev, modified, vcsTime string
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			rev = s.Value
+		case "vcs.modified":
+			modified = s.Value
+		case "vcs.time":
+			vcsTime = s.Value
+		}
+	}
+	switch rev {
+	case "":
+		wf(w, "  vcs:        (not embedded — `go install` or `go build .` in a git tree to capture)\n")
+	default:
+		wf(w, "  vcs:        %s (modified=%s, time=%s)\n", rev, modified, vcsTime)
+	}
+}
+
+// writeDoctorConfig parses the raw config file (no env expansion — we want to
+// surface the as-on-disk shape), redacts known-sensitive fields, and emits
+// it back as YAML, indented under the section header.
+func writeDoctorConfig(w io.Writer, path string) {
+	wf(w, "  path: %s\n\n", path)
+
+	raw, err := os.ReadFile(path) //nolint:gosec // G304: operator-supplied --config path
+	if err != nil {
+		wf(w, "  could not read: %v\n", err)
+		return
+	}
+	var root interface{}
+	if err := yaml.Unmarshal(raw, &root); err != nil {
+		wf(w, "  could not parse YAML: %v\n", err)
+		return
+	}
+	redactConfigValue(root)
+	out, err := yaml.Marshal(root)
+	if err != nil {
+		wf(w, "  could not re-emit YAML: %v\n", err)
+		return
+	}
+	for _, line := range strings.Split(strings.TrimRight(string(out), "\n"), "\n") {
+		wf(w, "  %s\n", line)
+	}
+}
+
+// redactConfigValue walks a yaml.Unmarshal-shaped value in place, recursing into
+// maps and slices. A redactedConfigFields key's value becomes a length-only
+// placeholder; a urlConfigFields value is scrubbed through redactURLValue (userinfo/
+// query/fragment stripped, host/path kept) whether it is a scalar URL or a sequence
+// of them.
+func redactConfigValue(v interface{}) {
+	switch x := v.(type) {
+	case map[string]interface{}:
+		for k, val := range x {
+			switch {
+			case redactedConfigFields[k]:
+				x[k] = redactString(val)
+			case urlConfigFields[k]:
+				x[k] = redactURLValue(val)
+			default:
+				redactConfigValue(val)
+			}
+		}
+	case map[interface{}]interface{}:
+		// gopkg.in/yaml.v3 decodes a mapping as map[interface{}]interface{} (NOT
+		// map[string]interface{}) whenever ANY key is non-string (an integer, bool, ...).
+		// Without this case such a map falls through the no-op default and every value in
+		// it — including a sibling authToken/upstreamAuthHeader — is emitted verbatim into
+		// the support bundle. Normalize each key to its string form and apply the same
+		// redaction as the string-keyed case so a non-string sibling key cannot defeat it.
+		for k, val := range x {
+			ks := fmt.Sprintf("%v", k)
+			switch {
+			case redactedConfigFields[ks]:
+				x[k] = redactString(val)
+			case urlConfigFields[ks]:
+				x[k] = redactURLValue(val)
+			default:
+				redactConfigValue(val)
+			}
+		}
+	case []interface{}:
+		for _, it := range x {
+			redactConfigValue(it)
+		}
+	}
+}
+
+// redactString renders a present secret as "<redacted len=N>", a non-string as
+// "<redacted non-string>", and an empty value as "" — so an omitted/empty secret
+// reads differently from a present-but-redacted one.
+func redactString(v interface{}) string {
+	s, ok := v.(string)
+	if !ok {
+		return "<redacted non-string>"
+	}
+	if s == "" {
+		return ""
+	}
+	return fmt.Sprintf("<redacted len=%d>", len(s))
+}
+
+// redactURL replaces userinfo (user:pass@) and every non-empty query value with a
+// placeholder, leaving scheme/host/path and query parameter names intact — a
+// credential is as likely in ?api_key=/?token= as in userinfo. A URL with neither
+// is returned unchanged. On a url.Parse failure the raw value is NOT returned
+// (a malformed URL can still carry a credential); a conservative textual
+// redaction is used instead.
+func redactURL(s string) string {
+	if s == "" {
+		return s
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return redactURLFallback(s)
+	}
+	changed := false
+	if u.User != nil {
+		u.User = url.UserPassword("REDACTED", "REDACTED")
+		changed = true
+	}
+	if u.RawQuery != "" {
+		// Replace each non-empty query value with a length-tagged placeholder,
+		// preserving parameter order and names. url.URL.String() emits RawQuery
+		// verbatim, so the placeholder stays unencoded and matches redactConfigValue's
+		// "<redacted len=N>" form. The length is the decoded byte count (via
+		// QueryUnescape), falling back to the raw count on a malformed escape.
+		parts := strings.Split(u.RawQuery, "&")
+		queryChanged := false
+		for i, p := range parts {
+			if p == "" {
+				continue // empty segment (e.g. trailing "&"): nothing to redact
+			}
+			eq := strings.IndexByte(p, '=')
+			if eq < 0 {
+				// A bare token with no "=" is a value with no name (e.g.
+				// "?sk_live_abcdef" or "?<jwt>"); it can be a credential just as
+				// readily as a key=value pair. Redact the whole token to a
+				// length-tagged placeholder rather than passing it through (the
+				// redactURLFallback sibling drops such tokens entirely, so the
+				// parseable path must not be strictly less safe).
+				n := len(p)
+				if decoded, derr := url.QueryUnescape(p); derr == nil {
+					n = len(decoded)
+				}
+				parts[i] = fmt.Sprintf("<redacted len=%d>", n)
+				queryChanged = true
+				continue
+			}
+			if eq == len(p)-1 {
+				continue // flag-style param with empty value (key=): nothing to redact
+			}
+			val := p[eq+1:]
+			n := len(val)
+			if decoded, derr := url.QueryUnescape(val); derr == nil {
+				n = len(decoded)
+			}
+			parts[i] = p[:eq+1] + fmt.Sprintf("<redacted len=%d>", n)
+			queryChanged = true
+		}
+		if queryChanged {
+			u.RawQuery = strings.Join(parts, "&")
+			changed = true
+		}
+	}
+	// The fragment is a credential location too: the OAuth 2.0 implicit flow returns
+	// #access_token=... in the fragment, and other schemes stash bearer tokens
+	// there. u.String() re-emits it verbatim, so drop it entirely (its structure is
+	// not guaranteed key=value, so a whole-component drop is the safe scrub).
+	if u.Fragment != "" || u.RawFragment != "" {
+		u.Fragment = ""
+		u.RawFragment = ""
+		changed = true
+	}
+	// url.Parse accepts opaque ("custom:user:pass@host") and scheme-less
+	// ("user:pass@host/path") credentialed forms, where the userinfo lands in
+	// u.Opaque rather than u.User and the query never populates u.RawQuery, so the
+	// userinfo/query scrubs above cannot reach it. Route those to the textual
+	// fallback (which also strips the query and fragment) regardless of the fragment
+	// scrub above, so dropping a fragment does not let opaque userinfo slip past.
+	if u.Opaque != "" {
+		return redactURLFallback(s)
+	}
+	if !changed {
+		// A hierarchical "scheme://host/..." with authority credentials always
+		// populates u.User (handled above), so a bare '@' in the path of an
+		// opaque-free, fragment-free URL is not a credential and is correctly returned
+		// unchanged (redacting it would needlessly mangle a legitimate value).
+		return s
+	}
+	return u.String()
+}
+
+// redactURLFallback conservatively strips userinfo from a URL string url.Parse
+// could not handle. It locates the authority (after "scheme://", up to the first
+// '/', '?', or '#') and replaces anything before its last '@' with "REDACTED".
+// If an '@' still appears past the authority boundary (a malformed URL where the
+// credential cannot be located safely), or the string has no "scheme://" but
+// contains an '@', the whole value is replaced with a placeholder.
+func redactURLFallback(s string) string {
+	const sep = "://"
+	schemeEnd := strings.Index(s, sep)
+	if schemeEnd < 0 {
+		if strings.Contains(s, "@") {
+			return "<redacted unparseable URL>"
+		}
+		return redactRawQuery(s)
+	}
+	authStart := schemeEnd + len(sep)
+	rest := s[authStart:]
+	authority := rest
+	tail := ""
+	if end := strings.IndexAny(rest, "/?#"); end >= 0 {
+		authority = rest[:end]
+		tail = rest[end:]
+	}
+	at := strings.LastIndex(authority, "@")
+	if at < 0 {
+		// No userinfo in the authority — but this fallback only runs because
+		// url.Parse failed, so an '@' past the authority boundary (credentials hidden
+		// after an unescaped '/') cannot be located safely; replace the whole value.
+		if strings.Contains(tail, "@") {
+			return "<redacted unparseable URL>"
+		}
+		return redactRawQuery(s)
+	}
+	return redactRawQuery(s[:authStart] + "REDACTED@" + authority[at+1:] + tail)
+}
+
+// redactRawQuery replaces the query AND fragment components of a raw (possibly
+// unparseable) URL, so a ?api_key=/?token= or #access_token= credential cannot leak
+// through the url.Parse-failure path. The query runs from the first '?' to '#' or
+// end; scheme/host/path are preserved and an empty "?" is left as-is. A non-empty
+// fragment is DROPPED ENTIRELY (delimiter included), matching how the parse-success
+// path (redactURL) scrubs u.Fragment, so the same #fragment renders identically
+// regardless of which path handled it; a bare '#' is preserved.
+//
+// Unlike redactURL's per-value scrub, this drops the whole query including
+// parameter names: since the URL would not parse, the query cannot be safely
+// tokenized on '='/'&' (an encoded '%26' could split differently than the server
+// reads it), so wholesale redaction is the safe tradeoff. The same reasoning
+// applies to the fragment.
+func redactRawQuery(s string) string {
+	// Split the fragment off first so it is redacted whether or not a query exists.
+	fragMarker := ""
+	if h := strings.IndexByte(s, '#'); h >= 0 {
+		if h == len(s)-1 {
+			fragMarker = "#" // bare '#', nothing to redact; preserved like redactURL
+		}
+		// A non-empty fragment is dropped entirely (fragMarker stays ""), mirroring
+		// redactURL's u.Fragment = "".
+		s = s[:h]
+	}
+	q := strings.IndexByte(s, '?')
+	if q < 0 || q == len(s)-1 {
+		// No query, or an empty "?" trailer: leave the query span untouched.
+		return s + fragMarker
+	}
+	return s[:q] + "?<redacted query>" + fragMarker
+}
+
+// reportCfgErr writes the standard "could not load config" line when cfgErr is
+// non-nil and reports whether it did, so writeDoctorManifests and writeDoctorLive
+// report an unusable config identically instead of each keeping its own copy of the
+// same guard clause. The caller's section body must return immediately when this
+// reports true.
+func reportCfgErr(w io.Writer, cfgErr error) bool {
+	if cfgErr == nil {
+		return false
+	}
+	wf(w, "  could not load config: %v\n", cfgErr)
+	return true
+}
+
+// writeDoctorManifests walks each declared upstream, loads its policy files,
+// reports per-file load result, and prints the merged manifest digest. Errors are
+// reported in line and do not abort the section.
+//
+// cfg is loaded by the caller via config.LoadGatewayConfig (once, shared with the
+// live-drift section), which expands ${ENV} references, so emit only non-sensitive
+// derived fields (Name, Transport, digest) — never UpstreamURL, UpstreamAuthHeader,
+// or other secret-bearing cfg fields. cfgErr is that load's error (config unusable).
+func writeDoctorManifests(w io.Writer, cfg *config.GatewayConfig, cfgErr error) {
+	if reportCfgErr(w, cfgErr) {
+		return
+	}
+	wf(w, "  host transport: %s\n", cfg.HostTransport())
+	wf(w, "  upstreams:      %d\n", len(cfg.Upstreams))
+
+	for i := range cfg.Upstreams {
+		u := &cfg.Upstreams[i]
+		wln(w)
+		wf(w, "  ── route %q (transport: %s) ──\n", u.Name, u.Transport)
+
+		// Reproduce the proxy's actual startup policy-load decision so the bundle
+		// cannot report OK for a route `proxy` would refuse to boot, via the shared
+		// walk both doctor and validate use (load → merge → StartupFatalManifestCheck).
+		outcome := transport.WalkRouteManifests(cfg, u)
+
+		if outcome.NoPolicy {
+			// Classify exactly as the proxy would at startup, so a no-policy route
+			// that would fail closed is not misreported as a valid wiretap.
+			switch {
+			case outcome.NoPolicyReason != "":
+				wf(w, "    (WOULD FAIL CLOSED at startup: %s)\n", outcome.NoPolicyReason)
+			case outcome.AuditMode:
+				wln(w, "    (no policy configured — observe-only/wiretap route)")
+			default:
+				wln(w, "    (no policy configured — allow-all route)")
+			}
+			continue
+		}
+		writePolicyLoadResults(func(format string, args ...interface{}) { wf(w, format, args...) }, "    ", outcome.LoadResults)
+		if outcome.LoadFailed {
+			continue
+		}
+		if outcome.MergeErr != nil {
+			wf(w, "    merged manifest:         <invalid: %v>\n", outcome.MergeErr)
+			continue
+		}
+		merged := outcome.Merged
+		if digest, err := merged.Digest(); err != nil {
+			wf(w, "    merged digest:           <error: %v>\n", err)
+		} else {
+			wf(w, "    merged digest:           %s\n", digest)
+		}
+		if merged.ServerVersion != "" {
+			wf(w, "    pinned serverVersion:    %s\n", merged.ServerVersion)
+		}
+		if n := merged.AuditOnlyCount(); n > 0 {
+			wf(w, "    audit-only capabilities: %d (observed but not enforced)\n", n)
+		}
+		if outcome.StartupErr != nil {
+			wf(w, "    WOULD FAIL CLOSED at startup: %v\n", outcome.StartupErr)
+		}
+	}
+}
+
+// writeDoctorAudit prints aggregated counts from the audit log, then the last
+// `tail` records with `details` values scrubbed and the (noisy) HMAC stripped —
+// the operator can re-verify with `eunox audit-verify` after sharing.
+func writeDoctorAudit(w io.Writer, logPath, keyPath string, tail int) {
+	resolvedLog, logErr := audit.ResolveLogPath(logPath)
+	if logErr != nil {
+		wf(w, "  log path:  (cannot resolve: %v)\n", logErr)
+	} else {
+		wf(w, "  log path:  %s\n", resolvedLog)
+	}
+
+	resolvedKey, keyErr := audit.ResolveKeyPath(keyPath)
+	if keyErr != nil {
+		wf(w, "  key path:  (cannot resolve: %v)\n", keyErr)
+	} else if _, err := os.Stat(resolvedKey); err == nil { //nolint:gosec // G304: resolvedKey is operator-supplied key path; Stat only checks existence
+		wf(w, "  key path:  %s (present)\n", resolvedKey)
+	} else {
+		wf(w, "  key path:  %s (%v)\n", resolvedKey, err)
+	}
+
+	// Skip the log-file stat when the path could not be resolved: resolvedLog is ""
+	// and os.Stat("") would print a confusing second error on top of the "cannot
+	// resolve" line. Mirrors the key-path block above.
+	if logErr != nil {
+		return
+	}
+	// Cover the FULL rotated set (siblings + active base), like audit-verify/stats,
+	// not just the active base file — otherwise the totals and tail silently omit
+	// every rotated segment once the log has rotated at least once.
+	chainFiles, err := audit.LogChainFiles(resolvedLog)
+	if err != nil {
+		wf(w, "  log file:  %v\n", err)
+		return
+	}
+	if len(chainFiles) == 0 {
+		wf(w, "  log file:  %v\n", os.ErrNotExist)
+		return
+	}
+	var totalSize int64
+	for _, p := range chainFiles {
+		if fi, e := os.Stat(p); e == nil { //nolint:gosec // G304: operator-configured audit log path
+			totalSize += fi.Size()
+		}
+	}
+	if info, e := os.Stat(resolvedLog); e == nil { //nolint:gosec // G304: operator-configured audit log path
+		wf(w, "  log size:  %d bytes across %d file(s) (active modified %s)\n",
+			totalSize, len(chainFiles), info.ModTime().UTC().Format(time.RFC3339))
+	} else {
+		wf(w, "  log size:  %d bytes across %d file(s)\n", totalSize, len(chainFiles))
+	}
+
+	statsReader := audit.OpenLogChain(chainFiles)
+	summary, statsErr := computeAuditStats(statsReader)
+	_ = statsReader.Close()
+	if statsErr != nil {
+		wf(w, "  could not aggregate: %v\n", statsErr)
+	} else {
+		wf(w, "  totals:    records=%d allowed=%d blocked=%d observed=%d",
+			summary.total, summary.allowed, summary.blocked, summary.observed)
+		if summary.other > 0 {
+			wf(w, " other=%d", summary.other)
+		}
+		wln(w)
+	}
+
+	if tail <= 0 {
+		wln(w)
+		wln(w, "  (--audit-tail=0 — record tail skipped)")
+		return
+	}
+
+	// The chain reader is not seekable, so reopen the chain for the tail pass.
+	tailReader := audit.OpenLogChain(chainFiles)
+	defer func() { _ = tailReader.Close() }()
+	lines, err := tailAuditLines(tailReader, tail)
+	if err != nil {
+		wf(w, "  could not read tail: %v\n", err)
+		return
+	}
+	wln(w)
+	wf(w, "  Last %d record(s) (details values redacted, HMAC stripped):\n", len(lines))
+	for _, line := range lines {
+		wf(w, "    %s\n", redactAuditLine(line))
+	}
+}
+
+// tailAuditLines returns the last n non-blank lines from r in original order.
+// Uses a fixed-size circular buffer so an enormous log does not blow up memory and
+// each record costs O(1), not O(n); the scanner buffer bound comes from
+// audit.NewLineScanner so it stays identical to every other audit-log reader.
+func tailAuditLines(r io.Reader, n int) ([]string, error) {
+	if n <= 0 {
+		return nil, nil
+	}
+	sc := audit.NewLineScanner(r)
+	// Cap the up-front ring allocation: n flows straight from --audit-tail with no
+	// bound, and make([]string, 0, n) reserves n*16 bytes immediately (e.g.
+	// --audit-tail 2000000000 -> ~32 GB) even against a one-line log. The ring
+	// appends, so it still grows to n only if the log actually has that many lines.
+	const maxTailPrealloc = 8192
+	ring := make([]string, 0, min(n, maxTailPrealloc))
+	next := 0        // write position once the ring is full
+	wrapped := false // whether the ring has overwritten at least one slot
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		if len(ring) < n {
+			ring = append(ring, line)
+			continue
+		}
+		// Ring full: overwrite the oldest slot and advance the write position modulo n.
+		// This is the true circular-buffer write — O(1) per record, never shifting the
+		// retained tail (the previous copy(ring, ring[1:]) was O(n) on every line past
+		// the first n, making --audit-tail O(records * n)).
+		ring[next] = line
+		next = (next + 1) % n
+		wrapped = true
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	if !wrapped {
+		// Never overwrote a slot: the ring is already in chronological order.
+		return ring, nil
+	}
+	// Wrapped: the oldest retained line now sits at next. Rotate exactly once into
+	// chronological order — ring[next:] (older) followed by ring[:next] (newer).
+	ordered := make([]string, 0, n)
+	ordered = append(ordered, ring[next:]...)
+	ordered = append(ordered, ring[:next]...)
+	return ordered, nil
+}
+
+// redactAuditLine returns line with the HMAC stripped and every `details` value
+// replaced with "<redacted>" (keys preserved). Unparseable lines are flagged but
+// kept. Uses SetEscapeHTML(false) so the plain-text bundle stays readable.
+func redactAuditLine(line string) string {
+	var rec map[string]interface{}
+	if err := json.Unmarshal([]byte(line), &rec); err != nil {
+		return fmt.Sprintf(`{"_doctor_note":"unparseable record","raw_len":%d}`, len(line))
+	}
+	delete(rec, "_hmac")
+	if d, ok := rec["details"].(map[string]interface{}); ok {
+		for k := range d {
+			d[k] = "<redacted>"
+		}
+	}
+	// For resource targets the `target` field holds the raw resource URI, which can
+	// embed credentials in userinfo or query (e.g. postgres://admin:hunter2@db, or
+	// https://api/secrets?api_key=...). Scrub it with the same URL redactor used for
+	// the config section so a credential does not survive into the support bundle.
+	// Gate on target_type == "resource": tool/prompt/system targets are bare names,
+	// not URIs, and a name that happens to contain '?'/'#'/'@' would otherwise be
+	// mis-parsed by redactURL and rewritten, distorting the bundle's record relative
+	// to the signed tape.
+	if t, ok := rec["target"].(string); ok && t != "" && rec["target_type"] == "resource" {
+		rec["target"] = redactURL(t)
+	}
+	var buf strings.Builder
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(rec); err != nil {
+		return fmt.Sprintf(`{"_doctor_note":"re-marshal failed","error":%q}`, err.Error())
+	}
+	return strings.TrimRight(buf.String(), "\n")
+}
+
+// writeDoctorLive reuses validateConfigRoutes so the bundle reports drift by the
+// same rules as `eunox validate --config --live`. cfg is loaded by the caller with
+// ${ENV} expanded (shared with the manifest section); only the exit code is printed,
+// no secret-bearing cfg fields. cfgErr is that load's error (config unusable).
+func writeDoctorLive(w io.Writer, cfg *config.GatewayConfig, cfgErr error) {
+	if reportCfgErr(w, cfgErr) {
+		return
+	}
+	// Base context with no deadline: fetchRouteLive applies its own per-route
+	// liveUpstreamTimeout, so a shared parent deadline would leave each later route
+	// only the remaining budget and could report a healthy route as a connection
+	// failure once a slow early route consumed most of it. Mirrors the
+	// `validate --config --live` path (main.go), which passes context.Background()
+	// for the same reason.
+	iw := &indentWriter{w: w, prefix: []byte("  "), atLineStart: true}
+	code := validateConfigRoutes(context.Background(), cfg, true, iw)
+	wf(w, "\n  validate exit code: %d  (0=clean, 1=drift, 2=parse/connection error)\n", code)
+}
+
+// indentWriter prefixes each line written to it with `prefix` so reused section
+// writers line up under the doctor section header. The pointer receiver tracks
+// atLineStart across Write calls, handling a logical line split over several.
+type indentWriter struct {
+	w           io.Writer
+	prefix      []byte
+	atLineStart bool
+}
+
+func (iw *indentWriter) Write(p []byte) (int, error) {
+	written := 0
+	for len(p) > 0 {
+		if iw.atLineStart {
+			if _, err := iw.w.Write(iw.prefix); err != nil {
+				return written, err
+			}
+		}
+		nl := bytes.IndexByte(p, '\n')
+		if nl < 0 {
+			n, err := iw.w.Write(p)
+			iw.atLineStart = false
+			return written + n, err
+		}
+		n, err := iw.w.Write(p[:nl+1])
+		written += n
+		// Mark line-start only once the newline actually reached the writer; a short
+		// write leaves the stream mid-line, where a prefix must not be prepended.
+		if n == nl+1 {
+			iw.atLineStart = true
+		}
+		if err != nil {
+			return written, err
+		}
+		p = p[nl+1:]
+	}
+	return written, nil
+}

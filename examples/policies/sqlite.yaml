@@ -1,0 +1,51 @@
+# sqlite.yaml — reference policy for @modelcontextprotocol/server-sqlite
+#
+# The SQLite upstream exposes a `read_query`/`write_query` split alongside a
+# generic `list_tables` / `describe_table`. We allow the read side and the
+# schema-introspection side; the write side is denied by absence.
+#
+# Threats addressed
+# -----------------
+#   1. Agent issues UPDATE / DELETE / DROP through the write tool.
+#      → write_query is not in the allowlist.
+#   2. Agent slips a non-SELECT through `read_query` (e.g. attached schema).
+#      → allowedOperations enforces SELECT on the read side too.
+#   3. Schema-exhaustion (an agent walking every table it can find).
+#      → maxCalls on list/describe.
+#
+# Tools intentionally NOT permitted
+# ---------------------------------
+#   write_query, create_table, append_insight (or any future mutators).
+
+schemaVersion: "0.1"
+name: sqlite-policy
+version: "0.1.0"
+description: >
+  Read-only SQLite. SELECT-only on read_query; write_query denied;
+  schema introspection rate-capped.
+
+capabilities:
+  - target: tool:read_query
+    actions: [call]
+    conditions:
+      - type: allowedOperations
+        argument: query
+        operations:
+          - SELECT
+      - type: maxCalls
+        count: 200
+        windowSeconds: 3600
+
+  - target: tool:list_tables
+    actions: [call]
+    conditions:
+      - type: maxCalls
+        count: 30
+        windowSeconds: 3600
+
+  - target: tool:describe_table
+    actions: [call]
+    conditions:
+      - type: maxCalls
+        count: 60
+        windowSeconds: 3600

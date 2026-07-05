@@ -1,0 +1,25 @@
+# yaml-language-server: $schema=../schemas/eunox-gateway-config.schema.json
+# demo/eunox.local.stdio.yaml — LOCAL debug config (host-run, NOT used by Docker).
+#
+# Single stdio host: eunox speaks MCP over stdin/stdout and launches the stdio
+# mock as a `go run` subprocess. Self-contained — no external services needed.
+#
+# Wired to the ".vscode/launch.json → proxy: stdio enforce (local)" target.
+# Paths are relative to the repo root (the debug config sets cwd there).
+#
+#   make build && bin/eunox proxy --config demo/eunox.local.stdio.yaml
+
+schemaVersion: "0.1"
+transport: stdio
+
+audit:
+  log: demo/audit/audit.jsonl     # gitignored; HMAC key auto-generated on first run
+  keyPath: demo/audit/audit.key
+
+upstreams:
+  - name: mock
+    transport: stdio
+    command: go
+    args: ["run", "./demo/mock-mcp-server-stdio"]
+    policy:
+      - demo/manifest.yaml         # read_file under /reports/, query_db SELECT (rate-limited)

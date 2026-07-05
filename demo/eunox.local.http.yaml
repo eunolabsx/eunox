@@ -1,0 +1,28 @@
+# yaml-language-server: $schema=../schemas/eunox-gateway-config.schema.json
+# demo/eunox.local.http.yaml — LOCAL debug config (host-run, NOT used by Docker).
+#
+# HTTP host on 127.0.0.1:3000 fronting the HTTP mock on 127.0.0.1:8080.
+# Loopback bind, so no --unsafe-bind-all is needed. The named "mock" route is
+# served at POST http://127.0.0.1:3000/mcp/mock.
+#
+# Start the upstream first (`go run ./demo/mock-mcp-server`, listens on :8080),
+# or launch the ".vscode/launch.json → proxy: HTTP enforce + mock upstream"
+# compound, which brings up both. Paths are relative to the repo root.
+
+schemaVersion: "0.1"
+transport: http
+
+listen:
+  bind: 127.0.0.1
+  port: 3000
+
+audit:
+  log: demo/audit/audit.jsonl     # gitignored; HMAC key auto-generated on first run
+  keyPath: demo/audit/audit.key
+
+upstreams:
+  - name: mock                     # -> POST /mcp/mock
+    transport: http
+    upstreamUrl: http://127.0.0.1:8080
+    policy:
+      - demo/manifest.yaml

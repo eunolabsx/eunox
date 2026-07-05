@@ -1,0 +1,20 @@
+# demo/e2e/policy-db.yaml — per-route manifest for the "db" upstream in the
+# HTTP gateway leg of the e2e suite (demo/e2e/gateway.yaml).
+#
+# It permits only query_db SELECT. read_file (and everything else) is absent,
+# so a read_file call on /mcp/db is denied even though /mcp/main permits it —
+# proving each gateway route is enforced against its own manifest.
+
+schemaVersion: "0.1"
+name: e2e-db-policy
+version: "1.0.0"
+description: query_db SELECT only — used to prove per-route policy isolation.
+
+capabilities:
+  - target: tool:query_db
+    actions: [call]
+    conditions:
+      - type: allowedOperations
+        argument: query
+        operations:
+          - SELECT

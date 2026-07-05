@@ -1,0 +1,416 @@
+# Copyright 2026 Eunolabs, LLC
+# SPDX-License-Identifier: Apache-2.0
+
+name: Release
+
+# Triggered by semver tags (e.g. v0.1.0) and pre-release tags (v0.1.0-rc.1).
+# Pre-release tags build, push, update the Homebrew tap, and open a winget PR.
+# The `latest` Docker tag is suppressed for pre-release tags by `latest=auto`
+# in the docker/metadata-action flavor, and the GitHub Release is marked as a
+# pre-release by `prerelease: auto` in .goreleaser.yml.
+#
+# Job graph:
+#   validate → goreleaser        (binaries, .deb, .rpm, .mcpb desktop extensions,
+#            │                    Homebrew cask PR, winget PR, GitHub Release)
+#            → docker-linux      (GHCR, linux/amd64 + arm64)
+#            → docker-mac        (GHCR, linux/arm64, tagged -mac for Apple Silicon)
+#            → docker-windows    (GHCR, windows/amd64 + arm64)
+#
+# Distribution channels are declared in .goreleaser.yml — adding a channel
+# (scoop, AUR, snap, ...) means editing that file, not this workflow. The
+# Claude Desktop extension (.mcpb) channel is packed by a goreleaser build
+# post-hook (scripts/build-mcpb.sh) from each freshly built binary, so the
+# bundles ride the same checksums.txt, SBOMs, signature, and provenance as the
+# archives — no separate job.
+on:
+  push:
+    tags:
+      # Keep the event filter broad: GitHub evaluates this as a glob, not the
+      # regular expression used by the validation gate below. In particular,
+      # this guarantees release-candidate tags such as v0.1.0-rc1 trigger the
+      # workflow. The validate job rejects malformed v-prefixed tags before any
+      # publishing job can run.
+      - "v*"
+
+# Least privilege by default: the workflow token starts read-only and each job
+# elevates only the scopes it actually needs via its own `permissions:` block.
+# This keeps the write scopes (notably id-token and packages) off the build/test
+# job, which runs the tag's own code and dependency graph under `go test`.
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  # ── Gate: verify the tag is clean before publishing anything ────────────────
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read        # checkout + go build/test only; no publish scopes
+    steps:
+      - name: Validate release tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "OK: '$TAG' is a valid release tag."
+            exit 0
+          fi
+          echo "::error title=Invalid release tag::'$TAG' is not a valid v-prefixed SemVer tag."
+          exit 1
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.4"
+          cache-dependency-path: go.sum
+
+      - name: Verify module
+        run: go mod verify
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test -race -count=1 ./...
+
+  # ── GoReleaser: binaries, native packages, brew/winget, GitHub Release ──────
+  #
+  # Reads .goreleaser.yml. Cross-compiles all six (OS × arch) binaries with
+  # consistent ldflags, builds .deb + .rpm via nfpm, commits a Homebrew cask
+  # to eunolabs/homebrew-tap, opens a winget PR against microsoft/winget-pkgs,
+  # and publishes the GitHub Release with all assets attached.
+  #
+  # Required repository secrets (set under Settings → Secrets → Actions):
+  #   HOMEBREW_TAP_GITHUB_TOKEN     — PAT with contents:write on
+  #                                   eunolabs/homebrew-tap
+  #   WINGET_PKGS_PUBLIC_REPO_TOKEN — PAT with contents:write on
+  #                                   eunolabs/winget-pkgs (a fork of
+  #                                   microsoft/winget-pkgs) and PR-open
+  #                                   rights on microsoft/winget-pkgs
+  #
+  # Both must be set before the first goreleaser-driven tag, or the run
+  # fails at template-expansion time. The release checklist (§1.6) gates
+  # this.
+  goreleaser:
+    name: GoReleaser
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # create the GitHub Release and upload assets
+      id-token: write       # Sigstore OIDC for cosign keyless signing of checksums.txt
+      attestations: write   # SLSA build-provenance for the release artifacts
+      # No packages: write — GoReleaser does not push images (the docker-* jobs do).
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0   # goreleaser needs full history for the changelog
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.4"
+          cache-dependency-path: go.sum
+
+      # Cosign signs the aggregate checksums.txt with a Sigstore keyless
+      # certificate. The `signs:` block in .goreleaser.yml shells out to it.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: "v3.0.6"
+
+      # Syft generates an SPDX SBOM per release archive and per native
+      # package (the `sboms:` block in .goreleaser.yml shells out to it) and per
+      # .mcpb bundle (the build post-hook's scripts/build-mcpb.sh shells out to
+      # it when MCPB_REQUIRE_SBOM=1, set below).
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          syft-version: "v1.18.1"
+
+      - uses: goreleaser/goreleaser-action@5daf1e915a5f0af01ddbcd89a43b8061ff4f1a89 # v7
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+          WINGET_PKGS_PUBLIC_REPO_TOKEN: ${{ secrets.WINGET_PKGS_PUBLIC_REPO_TOKEN }}
+          # Make the .mcpb SBOM mandatory: the build post-hook fails the release
+          # if syft is somehow absent, so no bundle ships without one. Inherited
+          # by goreleaser's build hooks.
+          MCPB_REQUIRE_SBOM: "1"
+
+      # SLSA build provenance for the release binaries, native packages, and
+      # .mcpb desktop extensions. This complements the cosign signature of
+      # checksums.txt: the signature proves "Eunolabs released these bytes", the
+      # provenance attestation proves "this GitHub Actions workflow, at this
+      # commit, built them", and is recorded in the public Sigstore transparency
+      # log. Verify with:
+      #   gh attestation verify <artifact> --repo eunolabs/eunox
+      - name: Attest release artifact provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.deb
+            dist/*.rpm
+            dist/*.mcpb
+
+  # ── Linux Docker: linux/amd64 + linux/arm64 via BuildKit + QEMU ─────────────
+  docker-linux:
+    name: Linux image (amd64 + arm64)
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read        # checkout
+      packages: write       # push the image to ghcr.io
+      id-token: write       # Sigstore OIDC for cosign keyless image signing
+      attestations: write   # SLSA build-provenance pushed to GHCR
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6
+        with:
+          images: |
+            ghcr.io/eunolabs/eunox
+          flavor: |
+            latest=auto
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: "v3.0.6"
+
+      - name: Build and push Linux image
+        id: build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.mcp
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Scan the image we just pushed before it can be pulled in anger. The
+      # filesystem scan in go-ci.yml covers the source tree's dependencies; this
+      # covers the assembled image (base layer + binary). ignore-unfixed keeps
+      # the gate actionable — a vuln with no available fix alerts but does not
+      # wedge the release. The distroless base keeps the surface tiny, so a
+      # fixable CRITICAL/HIGH here is a real, addressable signal.
+      - name: Scan published Linux image (gate on fixable CRITICAL/HIGH)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ghcr.io/eunolabs/eunox@${{ steps.build.outputs.digest }}
+          severity: "CRITICAL,HIGH"
+          ignore-unfixed: true
+          exit-code: "1"
+
+      # Keyless-sign the pushed image manifest by its immutable digest.
+      # Signing the digest (not the tag) means the signature is bound to the
+      # exact bytes that were pushed; a future re-tag cannot point the
+      # signature at different content.
+      - name: Sign Linux image (cosign keyless)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS:   ${{ steps.meta.outputs.tags }}
+        run: |
+          for tag in $TAGS; do
+            cosign sign --yes "${tag%%:*}@${DIGEST}"
+          done
+
+      # SLSA build provenance for the pushed image, bound to its digest and
+      # pushed to GHCR alongside the cosign signature. Verify with:
+      #   gh attestation verify oci://ghcr.io/eunolabs/eunox:<tag> --repo eunolabs/eunox
+      - name: Attest Linux image provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-name: ghcr.io/eunolabs/eunox
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+  # ── Mac Docker: linux/arm64, tagged -mac for Apple Silicon users ─────────────
+  # Publishes the linux/arm64 image with a -mac suffix so Mac users can
+  # explicitly pull the Apple-Silicon-native image.  On Docker Desktop for Mac
+  # the untagged linux image also resolves to arm64 automatically.
+  docker-mac:
+    name: Mac image (linux/arm64)
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read        # checkout
+      packages: write       # push the image to ghcr.io
+      id-token: write       # Sigstore OIDC for cosign keyless image signing
+      attestations: write   # SLSA build-provenance pushed to GHCR
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata (Mac)
+        id: meta
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6
+        with:
+          images: |
+            ghcr.io/eunolabs/eunox
+          flavor: |
+            latest=auto
+            suffix=-mac,onlatest=true
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: "v3.0.6"
+
+      - name: Build and push Mac image
+        id: build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.mcp
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Sign Mac image (cosign keyless)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS:   ${{ steps.meta.outputs.tags }}
+        run: |
+          for tag in $TAGS; do
+            cosign sign --yes "${tag%%:*}@${DIGEST}"
+          done
+
+      - name: Attest Mac image provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-name: ghcr.io/eunolabs/eunox
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+  # ── Windows Docker: windows/amd64 + windows/arm64 ───────────────────────────
+  # Runs on Ubuntu: the Dockerfile uses a Linux builder stage with Go
+  # cross-compilation, so no Windows runner is required.
+  docker-windows:
+    name: Windows image (amd64 + arm64)
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read        # checkout
+      packages: write       # push the image to ghcr.io
+      id-token: write       # Sigstore OIDC for cosign keyless image signing
+      attestations: write   # SLSA build-provenance pushed to GHCR
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata (Windows)
+        id: meta
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6
+        with:
+          images: |
+            ghcr.io/eunolabs/eunox
+          flavor: |
+            latest=auto
+            suffix=-windows,onlatest=true
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: "v3.0.6"
+
+      - name: Build and push Windows image
+        id: build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.mcp.windows
+          platforms: windows/amd64,windows/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Sign Windows image (cosign keyless)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS:   ${{ steps.meta.outputs.tags }}
+        run: |
+          for tag in $TAGS; do
+            cosign sign --yes "${tag%%:*}@${DIGEST}"
+          done
+
+      - name: Attest Windows image provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-name: ghcr.io/eunolabs/eunox
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true

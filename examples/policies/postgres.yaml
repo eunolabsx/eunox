@@ -1,0 +1,45 @@
+# postgres.yaml — reference policy for @modelcontextprotocol/server-postgres
+#
+# This is the canonical "DROP TABLE" mitigation. The upstream's `query` tool
+# accepts a free-form SQL string; an agent that has been prompt-injected or
+# is reasoning poorly can do enormous damage in a single call. Two layers:
+#
+#   1. allowedOperations restricts the SQL verb to SELECT.
+#      → no INSERT, UPDATE, DELETE, DROP, TRUNCATE, ALTER, GRANT, CREATE.
+#   2. maxCalls bounds the blast radius if the SQL-verb check is ever
+#      bypassed by a grammar quirk.
+#
+# allowedOperations is best-effort SQL parsing — not a substitute for a
+# read-only database role. Run the upstream as a Postgres user that physically
+# cannot write anything; this policy is defense-in-depth on top of that.
+#
+# Tools intentionally NOT permitted
+# ---------------------------------
+#   The default upstream exposes only `query`; any future write-side tool
+#   (insert, exec, copy) is denied by absence.
+#
+# Adapt
+# -----
+#   Tighten `maxCalls` once you know your agent's traffic shape. If your
+#   upstream wraps the connection as a separate write-capable tool (some
+#   forks do), keep it absent from this manifest unless you genuinely need
+#   it.
+
+schemaVersion: "0.1"
+name: postgres-policy
+version: "0.1.0"
+description: >
+  Read-only Postgres allowlist. SELECT-only, per-session call cap.
+  Pair with a read-only Postgres role for table-level protection.
+
+capabilities:
+  - target: tool:query
+    actions: [call]
+    conditions:
+      - type: allowedOperations
+        argument: sql
+        operations:
+          - SELECT
+      - type: maxCalls
+        count: 200
+        windowSeconds: 3600

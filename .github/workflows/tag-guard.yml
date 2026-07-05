@@ -1,0 +1,44 @@
+# Copyright 2026 Eunolabs, LLC
+# SPDX-License-Identifier: Apache-2.0
+
+name: Tag format guard
+
+# Catches mis-named release tags. The Release workflow (release.yml) triggers
+# on v-prefixed tags and validates the full SemVer shape before publishing, so
+# a tag like `0.0.9` — missing the leading `v` — fires no release workflow:
+# no binaries, no GitHub Release assets, no Homebrew/winget, no Docker images,
+# and crucially no failure to alert you. This guard runs on EVERY tag push and
+# fails loudly when the tag is not a valid release tag, turning a silent no-op
+# into a red X plus the usual failed-run notification.
+#
+# A valid `vX.Y.Z` tag also runs this guard; it passes, giving a positive
+# "the release pipeline will run" confirmation alongside release.yml.
+on:
+  push:
+    tags:
+      - "**"
+
+permissions:
+  contents: read
+
+jobs:
+  check-tag-format:
+    name: Reject non-release tags
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate tag name
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "OK: '$TAG' is a valid release tag — the Release workflow will run."
+            exit 0
+          fi
+          echo "::error title=Invalid release tag::'$TAG' is not a valid release tag, so nothing was published."
+          echo "Release tags must be vMAJOR.MINOR.PATCH (optionally a pre-release suffix, e.g. v0.1.0-rc1)."
+          echo "The Release workflow only fires on v-prefixed semver tags; '$TAG' triggered no publish."
+          echo ""
+          echo "Fix forward — delete this tag and re-tag with the v prefix:"
+          echo "  git push origin :refs/tags/$TAG"
+          echo "  git tag -s vMAJOR.MINOR.PATCH <commit> && git push origin vMAJOR.MINOR.PATCH"
+          exit 1

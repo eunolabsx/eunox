@@ -1,0 +1,101 @@
+# github.yaml — reference policy for @modelcontextprotocol/server-github
+#
+# Threats addressed
+# -----------------
+#   1. Agent rewrites or deletes branches / repositories.
+#      → delete_repository, fork_repository, merge_pull_request,
+#        create_branch (force-targets), and admin tools are denied by absence.
+#   2. Runaway automation creates hundreds of issues / PRs / comments.
+#      → maxCalls on every write tool, with conservative per-hour caps.
+#   3. Cross-org / cross-repo writes from a prompt-injected agent.
+#      → allowedValues on `owner` pins writes to your org.
+#
+# Tools intentionally NOT permitted
+# ---------------------------------
+#   delete_repository, delete_branch, delete_file, fork_repository,
+#   create_repository, merge_pull_request, update_pull_request (force-merge
+#   path), add_collaborator, transfer_repository, update_repository,
+#   any *_protection / *_settings mutators.
+#
+# Adapt
+# -----
+#   Replace `your-org` with the exact GitHub organization login your agent
+#   should be confined to. If your agent legitimately needs to file PRs into
+#   multiple orgs, add them — explicitly.
+
+schemaVersion: "0.1"
+name: github-policy
+version: "0.1.0"
+description: >
+  GitHub MCP allowlist. Reads broad, writes narrow and rate-limited,
+  destructive operations denied by default.
+
+capabilities:
+  # ── Reads ────────────────────────────────────────────────────────────────
+  - target: "tool:get_*"
+    actions: [call]
+  - target: "tool:list_*"
+    actions: [call]
+  - target: "tool:search_*"
+    actions: [call]
+
+  # ── Writes — narrow, rate-limited, org-pinned ────────────────────────────
+  - target: tool:create_issue
+    actions: [call]
+    conditions:
+      - type: allowedValues
+        argument: owner
+        values: ["your-org"]
+      - type: maxCalls
+        count: 20
+        windowSeconds: 3600
+
+  - target: tool:add_issue_comment
+    actions: [call]
+    conditions:
+      - type: allowedValues
+        argument: owner
+        values: ["your-org"]
+      - type: maxCalls
+        count: 50
+        windowSeconds: 3600
+
+  - target: tool:create_pull_request
+    actions: [call]
+    conditions:
+      - type: allowedValues
+        argument: owner
+        values: ["your-org"]
+      - type: maxCalls
+        count: 10
+        windowSeconds: 3600
+
+  - target: tool:create_pull_request_review
+    actions: [call]
+    conditions:
+      - type: allowedValues
+        argument: owner
+        values: ["your-org"]
+      - type: maxCalls
+        count: 30
+        windowSeconds: 3600
+
+  - target: tool:create_or_update_file
+    actions: [call]
+    conditions:
+      - type: allowedValues
+        argument: owner
+        values: ["your-org"]
+      - type: maxCalls
+        count: 50
+        windowSeconds: 3600
+
+  - target: tool:push_files
+    actions: [call]
+    conditions:
+      - type: allowedValues
+        argument: owner
+        values: ["your-org"]
+      - type: maxCalls
+        count: 20
+        windowSeconds: 3600

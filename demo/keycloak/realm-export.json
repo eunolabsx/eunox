@@ -1,0 +1,104 @@
+{
+  "realm": "eunox-demo",
+  "displayName": "Eunox Demo",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": false,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": false,
+  "editUsernameAllowed": false,
+  "bruteForceProtected": false,
+  "accessTokenLifespan": 3600,
+  "clients": [
+    {
+      "id": "a1b2c3d4-0000-0000-0000-demo-agent01",
+      "clientId": "demo-agent",
+      "name": "Demo Agent",
+      "description": "Service account used in the eunox demo.  Issues JWTs with eunox capability claims.",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "authorizationServicesEnabled": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "demo-secret",
+      "attributes": {
+        "post.logout.redirect.uris": "+"
+      },
+      "protocolMappers": [
+        {
+          "id": "a1b2c3d4-0000-0000-0000-cap-mapper00",
+          "name": "mcp-version",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper",
+          "consentRequired": false,
+          "config": {
+            "claim.name": "mcp.v",
+            "claim.value": "0.2",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "jsonType.label": "String"
+          }
+        },
+        {
+          "id": "a1b2c3d4-0000-0000-0001-cap-mapper01",
+          "name": "mcp-capabilities",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper",
+          "consentRequired": false,
+          "config": {
+            "claim.name": "mcp.capabilities",
+            "claim.value": "[\"tool:read_file?path=/reports/*\",\"tool:query_db?op=SELECT\"]",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "jsonType.label": "JSON"
+          }
+        },
+        {
+          "id": "a1b2c3d4-0000-0000-0002-cap-mapper02",
+          "name": "mcp-task-id",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper",
+          "consentRequired": false,
+          "config": {
+            "claim.name": "mcp.task_id",
+            "claim.value": "demo-task-001",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "jsonType.label": "String"
+          }
+        },
+        {
+          "id": "a1b2c3d4-0000-0000-0003-cap-mapper03",
+          "name": "mcp-agent-id",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper",
+          "consentRequired": false,
+          "config": {
+            "claim.name": "mcp.agent_id",
+            "claim.value": "demo-agent",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "jsonType.label": "String"
+          }
+        },
+        {
+          "id": "a1b2c3d4-0000-0000-0004-cap-mapper04",
+          "name": "eunox-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.custom.audience": "eunox",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ]
+}

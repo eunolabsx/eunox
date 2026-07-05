@@ -1,0 +1,95 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Build Binary",
+      "type": "shell",
+      "command": "make build",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": ["$go"]
+    },
+    {
+      "label": "Build (check all packages)",
+      "type": "shell",
+      "command": "go build ./...",
+      "group": "build",
+      "problemMatcher": ["$go"]
+    },
+    {
+      "label": "Test All",
+      "type": "shell",
+      "command": "go test -race -count=1 ./...",
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      },
+      "problemMatcher": ["$go"]
+    },
+    {
+      "label": "Test Package",
+      "type": "shell",
+      "command": "go test -race -count=1 -v ${relativeFileDirname}/...",
+      "group": "test",
+      "problemMatcher": ["$go"]
+    },
+    {
+      "label": "Lint",
+      "type": "shell",
+      "command": "make lint",
+      "group": "test",
+      "problemMatcher": ["$go"]
+    },
+    {
+      "label": "Vet",
+      "type": "shell",
+      "command": "go vet ./...",
+      "group": "test",
+      "problemMatcher": ["$go"]
+    },
+    {
+      "label": "Coverage",
+      "type": "shell",
+      "command": "make coverage",
+      "group": "test",
+      "problemMatcher": ["$go"]
+    },
+    {
+      "label": "Generate",
+      "type": "shell",
+      "command": "make generate",
+      "group": "build",
+      "problemMatcher": ["$go"]
+    },
+    {
+      "label": "Check License Headers",
+      "type": "shell",
+      "command": "make check-license",
+      "group": "test",
+      "problemMatcher": []
+    },
+    {
+      "label": "Docker Build MCP",
+      "type": "shell",
+      "command": "make docker-build-mcp",
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "Docker Build MCP (multi-arch)",
+      "type": "shell",
+      "command": "make docker-build-mcp-multi",
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "Clean",
+      "type": "shell",
+      "command": "make clean",
+      "group": "build",
+      "problemMatcher": []
+    }
+  ]
+}

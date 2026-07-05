@@ -1,0 +1,285 @@
+# goreleaser configuration for eunox
+# See https://goreleaser.com/customization/
+
+version: 2
+
+project_name: eunox
+
+before:
+  hooks:
+    - make check-license
+
+builds:
+  # ── eunox (public, Apache-2.0) ─────────────────────────────────────────
+  # The primary open-source binary.  Builds for 5 platforms: linux/amd64,
+  # linux/arm64, darwin/arm64 (Apple Silicon), windows/amd64, windows/arm64.
+  # darwin/amd64 (Intel Mac) is excluded -- Apple ended Intel Mac support and
+  # all modern Macs run arm64.
+  - id: mcp
+    main: ./cmd/eunox
+    binary: eunox
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: darwin
+        goarch: amd64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+    hooks:
+      # Pack a Claude Desktop extension (.mcpb) from each freshly built binary
+      # into dist/. Build hooks run once per target BEFORE the archive/checksum/
+      # release stages, so the bundles ride the same signed checksums.txt, SBOM
+      # set, and provenance as the archives (see checksum.extra_files and
+      # release.extra_files below, and the attestation step in release.yml) —
+      # rather than a separate re-download-and-re-sign job. The platform set is
+      # THIS build matrix, the single source of truth; build-mcpb.sh errors on a
+      # GOOS it cannot map, so a new target fails the release until it is wired.
+      # MCPB_REQUIRE_SBOM=1 (set on the release job) makes the SBOM mandatory.
+      post:
+        - cmd: ./scripts/build-mcpb.sh "{{ .Version }}" "{{ .Os }}" "{{ .Arch }}" "{{ .Path }}" dist
+          output: true
+
+archives:
+  # eunox archive: include the Apache-2.0 license from cmd/eunox/LICENSE.
+  - id: mcp
+    ids: [mcp]
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    name_template: "eunox_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - src: cmd/eunox/LICENSE
+        dst: LICENSE
+      - NOTICE
+      - README.md
+
+# Docker images (linux/amd64, linux/arm64, plus -mac and -windows suffix tags)
+# are pushed by the `docker-linux`, `docker-mac`, and `docker-windows` jobs in
+# .github/workflows/release.yml. They use buildx + QEMU + GHA cache, which is
+# richer than goreleaser's per-arch image build. Keeping a `dockers:` block
+# here would push the same images twice and conflict on tag.
+
+# ── Linux native packages (.deb, .rpm) ────────────────────────────────────────
+# Built from the cross-compiled Linux binaries and attached to the GitHub
+# Release alongside the tarballs. No external apt/yum repo is required —
+# users download with `curl` and install with `dpkg -i` / `rpm -i`. (Hosting
+# an actual apt/yum repo is a separate decision; see deploy/ docs.)
+nfpms:
+  - id: mcp
+    package_name: eunox
+    ids: [mcp]
+    vendor: "Eunolabs, LLC"
+    homepage: https://github.com/eunolabs/eunox
+    maintainer: "Eunolabs <security@eunolabs.ai>"
+    description: |
+      Policy-enforcement proxy for MCP servers. Sits between an MCP host and
+      any MCP server (local subprocess or remote HTTPS); every tools/call,
+      resources/read, resources/subscribe, prompts/get, and
+      sampling/createMessage is checked against a YAML capability manifest
+      before forwarding. Every decision is written to a tamper-evident OCSF
+      audit log.
+    license: Apache-2.0
+    section: utils
+    priority: optional
+    formats:
+      - deb
+      - rpm
+    bindir: /usr/bin
+    contents:
+      - src: cmd/eunox/LICENSE
+        dst: /usr/share/doc/eunox/LICENSE
+      - src: NOTICE
+        dst: /usr/share/doc/eunox/NOTICE
+      - src: README.md
+        dst: /usr/share/doc/eunox/README.md
+    rpm:
+      group: Applications/System
+      summary: Policy-enforcement proxy for MCP servers
+
+# ── Homebrew tap (cask) ───────────────────────────────────────────────────────
+# Publishes a cask to github.com/eunolabs/homebrew-tap on every tag,
+# including pre-release tags. Users install with:
+#   brew install eunolabs/tap/eunox
+#
+# GoReleaser's `brews:` (formula) form is deprecated; binary distributions
+# now flow through Homebrew casks. Requires the eunolabs/homebrew-tap repo
+# to exist and a PAT with write access to it exposed to goreleaser as
+# HOMEBREW_TAP_GITHUB_TOKEN.
+#
+# Note: casks installed from an unsigned binary will trigger macOS Gatekeeper
+# on first launch. Code-signing the darwin builds (a separate workstream) is
+# the proper fix; until then, users can clear the quarantine attribute or the
+# cask's `caveats:` block can document it.
+homebrew_casks:
+  - name: eunox
+    ids: [mcp]
+    binaries:
+      - eunox
+    repository:
+      owner: eunolabs
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    commit_author:
+      name: eunolabs-bot
+      email: bot@eunolabs.ai
+    commit_msg_template: "eunox: bump to {{ .Tag }}"
+    homepage: https://github.com/eunolabs/eunox
+    description: "Policy-enforcement proxy for MCP servers — deny-by-default capability firewall."
+    license: Apache-2.0
+# ── Winget (Windows Package Manager) ──────────────────────────────────────────
+# On every tag (including pre-release tags), opens a PR against
+# microsoft/winget-pkgs adding a
+# manifest for eunolabs.eunox at the new version. Users install with:
+#   winget install eunolabs.eunox
+#
+# Requires a fork at github.com/eunolabs/winget-pkgs and a PAT with write
+# access to that fork (and PR-creation rights on microsoft/winget-pkgs)
+# exposed as WINGET_PKGS_PUBLIC_REPO_TOKEN.
+winget:
+  - name: eunox
+    ids: [mcp]
+    publisher: eunolabs
+    publisher_url: https://github.com/eunolabs
+    publisher_support_url: "https://github.com/eunolabs/eunox/issues"
+    package_identifier: eunolabs.eunox
+    homepage: https://github.com/eunolabs/eunox
+    short_description: "Policy-enforcement proxy for MCP servers."
+    description: |
+      eunox is a deny-by-default capability firewall for Model Context
+      Protocol servers. It enforces a YAML manifest in front of any local
+      or remote MCP server and writes a tamper-evident audit log of every
+      decision.
+    license: Apache-2.0
+    license_url: "https://github.com/eunolabs/eunox/blob/main/cmd/eunox/LICENSE"
+    copyright: "Copyright 2026 Eunolabs, LLC"
+    copyright_url: "https://github.com/eunolabs/eunox/blob/main/cmd/eunox/LICENSE"
+    # winget's ReleaseNotes locale field is capped at 10,000 characters by
+    # schema; the full changelog can exceed that, so link to the GitHub
+    # release notes instead of inlining them.
+    release_notes_url: "https://github.com/eunolabs/eunox/releases/tag/{{.Tag}}"
+    tags:
+      - mcp
+      - security
+      - policy
+      - proxy
+      - ai-agents
+    repository:
+      owner: eunolabs
+      name: winget-pkgs
+      branch: "eunox-{{.Version}}"
+      token: "{{ .Env.WINGET_PKGS_PUBLIC_REPO_TOKEN }}"
+      pull_request:
+        enabled: true
+        draft: false
+        base:
+          owner: microsoft
+          name: winget-pkgs
+          branch: master
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+  # Fold the .mcpb bundles (packed by the build post-hook into dist/) into the
+  # one checksums.txt, so the single cosign signature over it (signs: below)
+  # transitively covers the desktop extensions too — one verify surface for
+  # every artifact, including the .mcpb. Their SBOMs are uploaded alongside (see
+  # release.extra_files) but, like goreleaser's own per-archive SBOMs, are not
+  # themselves checksummed here.
+  extra_files:
+    - glob: dist/*.mcpb
+
+# ── Supply-chain: cosign keyless signing + syft SBOMs ─────────────────────────
+# Every release artifact (binaries, tarballs, zip, .deb, .rpm) gets:
+#
+#   1. An SPDX SBOM next to it (<artifact>.sbom.json), generated by syft.
+#   2. A Sigstore keyless signature of the aggregate `checksums.txt`. Users
+#      verify by cosign-verifying the checksums file, then sha256-verifying
+#      whichever artifact they downloaded against the file — one signature
+#      transitively covers every artifact in the release.
+#
+# Keyless signing means no GPG key, no Cosign key file, no secret to leak or
+# rotate. The signature is bound to the GitHub Actions OIDC identity
+# `https://github.com/eunolabs/eunox/.github/workflows/release.yml@refs/tags/<tag>`
+# and recorded in the public Sigstore transparency log (Rekor) so revocation
+# is publicly auditable. The job needs `id-token: write` permission for the
+# OIDC token — set in `.github/workflows/release.yml`.
+#
+# Verifying a release locally:
+#
+#   cosign verify-blob \
+#     --certificate-identity-regexp "https://github.com/eunolabs/eunox/.*" \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+#     --bundle checksums.txt.sigstore.json \
+#     checksums.txt
+#   sha256sum -c checksums.txt --ignore-missing
+#
+# The signature is emitted as a Sigstore bundle (checksums.txt.sigstore.json)
+# rather than a detached .pem/.sig pair; cosign v3+ is required to verify it.
+sboms:
+  - id: archive
+    artifacts: archive
+    documents:
+      - "${artifact}.sbom.json"
+  - id: package
+    artifacts: package
+    documents:
+      - "${artifact}.sbom.json"
+
+signs:
+  - id: checksum
+    cmd: cosign
+    signature: "${artifact}.sigstore.json"
+    args:
+      - sign-blob
+      - "--bundle=${signature}"
+      - "${artifact}"
+      - --yes
+    artifacts: checksum
+    output: true
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "^chore:"
+  groups:
+    - title: "Features"
+      regexp: '^.*?feat(\([[:word:]]+\))?!?:.+$'
+    - title: "Bug Fixes"
+      regexp: '^.*?fix(\([[:word:]]+\))?!?:.+$'
+    - title: "Security"
+      regexp: '^.*?sec(\([[:word:]]+\))?!?:.+$'
+    - title: "Others"
+      order: 999
+
+release:
+  github:
+    owner: eunolabs
+    name: eunox
+  prerelease: auto
+  draft: false
+  name_template: "v{{ .Version }}"
+  # Upload the Claude Desktop extensions and their SBOMs (packed by the build
+  # post-hook into dist/). checksum.extra_files only hashes the bundles into
+  # checksums.txt; uploading them to the Release is this block's job. The .mcpb
+  # bundles also get SLSA provenance via the attestation step in release.yml.
+  extra_files:
+    - glob: dist/*.mcpb
+    - glob: dist/*.mcpb.sbom.json

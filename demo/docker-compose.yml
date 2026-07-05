@@ -1,0 +1,108 @@
+# Copyright 2026 Eunolabs, LLC
+# SPDX-License-Identifier: Apache-2.0
+#
+# demo/docker-compose.yml — two-service demo stack for eunox (manifest-only);
+# a third service (Keycloak) is added by the "jwt" profile, see below.
+#
+# Quick start (from repo root):
+#   make -C demo up
+#   make -C demo allow    # → allowed tool call
+#   make -C demo deny     # → policy denial
+#   make -C demo audit    # → tail the audit log
+#
+# For JWT-mode (manifest + IdP-issued capability claims):
+#   make -C demo up-jwt
+#   make -C demo jwt       # → print a test JWT from Keycloak
+#   make -C demo jwt-allow # → JWT-authenticated allowed call
+#   make -C demo jwt-deny  # → denied by JWT capability
+
+services:
+
+  # ── mock-mcp-server ────────────────────────────────────────────────
+  # Minimal MCP Streamable HTTP server that exposes three tools:
+  # read_file, write_file, query_db.  Returns deterministic fake
+  # responses — purpose-built for policy enforcement demos.
+  mock-mcp-server:
+    build:
+      context: ..
+      dockerfile: demo/mock-mcp-server/Dockerfile
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    healthcheck:
+      # GET the side-effect-free /healthz endpoint; healthy when it returns 200.
+      # Probing with a real `initialize` (the old check) would leak one resident
+      # session per interval, since the probe never sends the matching DELETE.
+      test:
+        - "CMD-SHELL"
+        - "wget -qO- http://localhost:8080/healthz > /dev/null && echo ok"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── keycloak ───────────────────────────────────────────────────────
+  # Keycloak pre-seeded with the eunox-demo realm.  The demo-agent
+  # client uses client-credentials flow and carries mcp.capabilities
+  # claims in every access token (JWT mode only; run `make up-jwt`).
+  #
+  # profiles: ["jwt"] keeps this service out of the default compose
+  # set so that `make up` (manifest-only) never pulls the image.
+  # Activate with: docker compose --profile jwt up
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    profiles: [ "jwt" ]
+    command:
+      - start-dev
+      - --import-realm
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    volumes:
+      - ./keycloak:/opt/keycloak/data/import:ro
+    ports:
+      - "8081:8080"
+    restart: unless-stopped
+    healthcheck:
+      # bash is available in the Keycloak UBI image and supports /dev/tcp.
+      # A successful TCP handshake on port 8080 is sufficient: Keycloak only
+      # begins accepting connections *after* realm import completes, so
+      # connectivity implies the eunox-demo realm is ready.
+      # CMD-SHELL is run with bash explicitly (/dev/tcp is a bash-only feature
+      # not available in the POSIX /bin/sh that CMD-SHELL uses by default).
+      test:
+        - "CMD-SHELL"
+        - "bash -c 'exec 6<>/dev/tcp/localhost/8080'"
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
+
+  # ── eunox ──────────────────────────────────────────────────────
+  # Policy-enforcement proxy in manifest-only mode.
+  # Run `make up-jwt` to start in JWT + manifest intersection mode.
+  eunox:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.mcp
+      args:
+        # Dockerfile.mcp fails closed when VERSION is unset or 0.0.0. The demo is
+        # not a release artifact, so stamp a clear demo marker (override with
+        # VERSION=... in the environment for a versioned local build).
+        VERSION: ${VERSION:-0.1.0-demo}
+    # Run as root so it can write the audit log to the bind-mounted ./audit/ dir.
+    # Demo only — production deployments use the nonroot (UID 65534) default.
+    user: "0:0"
+    command:
+      - proxy
+      - --config=/demo/manifest-only.yaml
+      - --unsafe-bind-all
+    volumes:
+      - ./manifest-only.yaml:/demo/manifest-only.yaml:ro
+      - ./manifest.yaml:/demo/manifest.yaml:ro
+      - ./audit:/audit
+    ports:
+      - "3000:3000"
+    depends_on:
+      mock-mcp-server:
+        condition: service_healthy
+    restart: unless-stopped

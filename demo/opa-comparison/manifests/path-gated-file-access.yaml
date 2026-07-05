@@ -1,0 +1,59 @@
+# Copyright 2026 Eunolabs, LLC
+# SPDX-License-Identifier: Apache-2.0
+#
+# Scenario 2 — Path-gated file access with rate limiting
+#
+# Ten tools share one policy: every `path` argument must fall under /reports/,
+# and each tool is capped at 5 calls per minute. The spec rejects a bare
+# `tool:*` as too broad (SPEC § 3.2.1), so the tools are enumerated — but the
+# policy itself is written once and shared across all ten via a YAML anchor
+# (`&path-policy`).
+#
+# The OPA equivalent must hand-write the path check per tool and, more
+# importantly, cannot express the per-tool rate limit at all (it has no state).
+schemaVersion: "0.1"
+name: opa-comparison-path-gated-file-access
+version: "0.1.0"
+
+capabilities:
+  - target: "tool:read_file"
+    actions: [call]
+    conditions: &path-policy
+      - type: allowedValues
+        argument: path
+        values:
+          # `/reports/**` matches any path under /reports/ (nested included),
+          # equivalent to the OPA rule's startswith(path, "/reports/"). A single-star
+          # `/reports/*` would match only one segment and deny /reports/sub/q3.pdf,
+          # making the two policies non-equivalent.
+          - "/reports/**"
+      - type: maxCalls
+        count: 5
+        windowSeconds: 60
+  - target: "tool:write_file"
+    actions: [call]
+    conditions: *path-policy
+  - target: "tool:read_config"
+    actions: [call]
+    conditions: *path-policy
+  - target: "tool:update_config"
+    actions: [call]
+    conditions: *path-policy
+  - target: "tool:read_log"
+    actions: [call]
+    conditions: *path-policy
+  - target: "tool:delete_file"
+    actions: [call]
+    conditions: *path-policy
+  - target: "tool:stat_file"
+    actions: [call]
+    conditions: *path-policy
+  - target: "tool:read_secret"
+    actions: [call]
+    conditions: *path-policy
+  - target: "tool:write_secret"
+    actions: [call]
+    conditions: *path-policy
+  - target: "tool:read_backup"
+    actions: [call]
+    conditions: *path-policy

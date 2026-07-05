@@ -1,0 +1,14 @@
+# demo/e2e/policy-sampling.yaml — the server-initiated sampling opt-in, split out
+# of policy.yaml so the comprehensive policy can be reused by the HTTP gateway leg
+# (where a sampling opt-in is rejected at load, since it cannot be enforced over a
+# remote HTTP upstream). The stdio sampling-ALLOW leg merges this overlay on top
+# of policy.yaml to grant the opt-in where sampling IS enforced.
+
+schemaVersion: "0.1"
+name: e2e-policy-sampling
+version: "1.0.0"
+description: server-initiated sampling/createMessage opt-in overlay for the stdio leg.
+
+capabilities:
+  - target: "system:sampling/createMessage"
+    actions: [allow]

@@ -1,0 +1,318 @@
+# Copyright 2026 Eunolabs, LLC
+# SPDX-License-Identifier: Apache-2.0
+
+name: Go CI
+
+on:
+  push:
+    branches: [main, "copilot/**", "feat/**", "claude/**"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.4"
+          cache-dependency-path: go.sum
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@82606bf257cbaff209d206a39f5134f0cfbfd2ee # v9
+        with:
+          # Pin the linter version (matches GOLANGCI_LINT_VERSION in the Makefile)
+          # so CI is reproducible: a linter release cannot change results between
+          # runs without a deliberate bump here.
+          version: v2.12.2
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.4"
+          cache-dependency-path: go.sum
+
+      - name: Run tests with race detector
+        run: go test -race -count=1 -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Check coverage threshold (80% for pkg/ and cmd/)
+        run: |
+          COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print substr($3, 1, length($3)-1)}')
+          echo "Total coverage: ${COVERAGE}%"
+          PKG_COVERAGE=$(go tool cover -func=coverage.out | grep "^github.com/eunolabs/eunox/pkg/" | awk '{sum += substr($3, 1, length($3)-1); n++} END {if (n>0) printf "%.1f", sum/n; else print "0"}')
+          echo "pkg/ average coverage: ${PKG_COVERAGE}%"
+          # Gate the cmd/ binary too: it is the network-facing attack surface
+          # (transports, audit sink, PDP wiring), so a coverage floor there matters
+          # as much as the engine's. The floor is lower than pkg/ because cmd/ holds
+          # some thin process-lifecycle glue that is exercised end-to-end rather
+          # than unit-tested.
+          CMD_COVERAGE=$(go tool cover -func=coverage.out | grep "^github.com/eunolabs/eunox/cmd/" | awk '{sum += substr($3, 1, length($3)-1); n++} END {if (n>0) printf "%.1f", sum/n; else print "0"}')
+          echo "cmd/ average coverage: ${CMD_COVERAGE}%"
+          fail=0
+          if [ "$(echo "$PKG_COVERAGE < 80" | bc -l)" -eq 1 ]; then
+            echo "::error::Coverage for pkg/ is below 80% threshold: ${PKG_COVERAGE}%"
+            fail=1
+          fi
+          if [ "$(echo "$CMD_COVERAGE < 80" | bc -l)" -eq 1 ]; then
+            echo "::error::Coverage for cmd/ is below 80% threshold: ${CMD_COVERAGE}%"
+            fail=1
+          fi
+          if [ "$fail" -eq 1 ]; then exit 1; fi
+
+  gofmt:
+    name: Formatting (gofmt)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.4"
+          cache-dependency-path: go.sum
+
+      - name: Check gofmt formatting
+        run: make check-fmt
+
+  license-check:
+    name: License Headers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Check Apache-2.0 license headers
+        run: make check-license
+
+  notice-check:
+    name: NOTICE up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.4"
+          cache-dependency-path: go.sum
+
+      - name: Check NOTICE matches the binary's dependencies
+        run: make check-notice
+
+  build:
+    name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux, darwin, windows]
+        goarch: [amd64, arm64]
+        exclude:
+          - goos: darwin
+            goarch: amd64
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.4"
+          cache-dependency-path: go.sum
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build ./...
+
+  consistency:
+    name: Consistency (toolchain + cross-compile)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.4"
+          cache-dependency-path: go.sum
+
+      # The signed release images are built from deploy/docker/Dockerfile.mcp* — if
+      # their builder Go version drifts from go.mod/CI, the published binary is built
+      # by an untested toolchain. Fail before release if they disagree.
+      - name: Check Dockerfile Go version matches go.mod
+        run: make check-go-version
+
+      # plan9 is the canonical lock_other target: it exercises the build-tag-portable
+      # hard-link errno seam (audit_hardlink_*.go), which a shared reference to a
+      # plan9-undefined syscall errno would silently break. The main build matrix
+      # (linux/darwin/windows) does not cover it.
+      - name: Cross-compile internal/audit for plan9
+        run: make check-cross-compile
+
+  types-sync:
+    name: Types Sync (upstream wire.ts)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.4"
+          cache-dependency-path: go.sum
+
+      - name: Verify Go condition types match upstream TypeScript
+        run: go test ./pkg/capability/ -run 'TestConditionTypesInSyncWithUpstreamTypeScript|TestConditionTypeConstantsValid' -v -count=1
+
+  enforcement-compliance:
+    name: Enforcement compliance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.4"
+          cache-dependency-path: go.sum
+
+      # The `test` job above already runs the whole suite (go test ./...) with
+      # the race detector, so it covers every invariant below. This job re-runs
+      # only the load-bearing enforcement/security subset as one combined gate,
+      # selected by stable test-function-name prefixes (decoupled from how the
+      # test files are organized), so a regression in any of them surfaces as a
+      # dedicated red X instead of being buried in the full run. The subset:
+      #   - target key acceptance + namespace-prefix validation
+      #   - conditions/directives split + redactFields obligations and recursion
+      #   - argumentSchema structural validation ordering (INVALID_PARAMS first)
+      #   - JSON-RPC denial codes: exact integers, symbolic message, no raw args
+      #   - unmapped methods denied AUTHORIZATION_FAILED and never forwarded
+      #   - JWT &-chains, exhaustive allowlist, OR-list, and list filtering
+      #   - Rego input contract: arguments{} / directives[] always populated
+      #   - namespace isolation + manifest load-time validation
+      #
+      # These prefixes are load-bearing: keep them in sync with test renames.
+      # `go test -run` exits 0 when a pattern matches nothing, so the step also
+      # asserts a floor on the number of top-level tests actually run -- if a
+      # guarded prefix is renamed out of the regex the count drops and the gate
+      # fails loudly instead of passing vacuously. ~181 match today; floor 150.
+      - name: Enforcement invariant gate
+        run: |
+          go test -race -count=1 ./... -v -run \
+            'TestConstraintUnmarshal_TargetKey_Accepted|TestConstraintRedactFieldsInConditions_MigrationHint|TestDirective|TestDirectiveTypeConstantsValid|TestDirectives_|TestRedactFields_|TestManifestDirective_|TestArgumentSchema_|TestJSONRPCCode_|TestUnmappedMethod_|TestJWTCondChain_|TestJWTAllowlist_|TestJWT_MultipleEntriesSameTool_|TestJWT_BroadEntryFirst_|TestJWT_UnconditionalEntryAfterConditional_|TestJWT_FilterToolsList_|TestJWT_FilterResourcesAndPrompts|TestBuildConstraintsFromClaims_ReturnsAllMatches|TestListFilterer_Satisfied|TestBuildRegoInput_|TestRequestIDFromContext_|TestPolicyEvaluator_|TestEvaluateConditions_Populates|TestValidateAction_Populates|TestExistingArguments|TestCrossNamespace|TestLoadManifest_Rejects' \
+            | tee gate.txt
+          matched=$(grep -cE '^=== RUN   Test[^/]+$' gate.txt)
+          echo "enforcement invariant gate ran ${matched} top-level tests"
+          if [ "$matched" -lt 150 ]; then
+            echo "::error::enforcement gate ran only ${matched} top-level tests (<150 floor); a guarded test prefix was likely renamed out of the -run regex"
+            exit 1
+          fi
+
+  benchmark:
+    name: Benchmark (sanity)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.4"
+          cache-dependency-path: go.sum
+
+      # Run each benchmark for 100 ms x 1 iteration.  This is intentionally
+      # short: the goal is to catch panics, deadlocks, and compilation errors,
+      # not to enforce latency targets (GH runner performance is too variable
+      # for that).  Full target validation is done locally via scripts/bench.sh.
+      - name: Run benchmarks (smoke)
+        run: |
+          # pipefail so a failing `go test` (panic/deadlock/compile error) fails the
+          # step: without it the pipeline's exit status is `tee`'s (always 0) and a
+          # failed benchmark would pass the job. Set explicitly rather than relying on
+          # the runner's default shell flags.
+          set -eo pipefail
+          go test \
+            -run='^$' \
+            -bench=. \
+            -benchtime=100ms \
+            -benchmem \
+            -count=1 \
+            ./cmd/eunox/ \
+            2>&1 | grep -v '^\[eunox\]' | tee bench-ci.txt
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: bench-results
+          path: bench-ci.txt
+          retention-days: 30
+
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.4"
+          cache-dependency-path: go.sum
+
+      - name: Run govulncheck
+        # Pinned (not @latest) so the scanner version is reproducible: a tool
+        # regression cannot silently change results between runs.
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.4.0 ./...
+
+  vulnerability-scan:
+    name: Trivy Vulnerability Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # Two passes over the same filesystem so the result is both surfaced AND
+      # gating, without the SARIF upload masking a failure:
+      #   1. SARIF artifact for the full CRITICAL/HIGH inventory (non-blocking,
+      #      always uploaded for triage).
+      #   2. A blocking pass that fails the build on a fixable CRITICAL/HIGH. A
+      #      security product must not ship a known-fixable high-severity vuln;
+      #      ignore-unfixed keeps the gate actionable (no fix available => not a
+      #      release blocker, only an alert) so it does not wedge on upstream
+      #      vulns the project cannot remediate.
+      - name: Run Trivy filesystem scan (report)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "CRITICAL,HIGH"
+          exit-code: "0"
+
+      - name: Upload Trivy results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: trivy-results
+          path: trivy-results.sarif
+          retention-days: 30
+
+      - name: Run Trivy filesystem scan (gate on fixable CRITICAL/HIGH)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          format: "table"
+          severity: "CRITICAL,HIGH"
+          ignore-unfixed: true
+          exit-code: "1"

@@ -1,0 +1,48 @@
+Eunox
+Copyright (c) 2026 Eunolabs.
+
+This product is distributed under the Apache License, Version 2.0.
+See cmd/eunox/LICENSE for the full license text.
+
+---
+
+This product includes the following third-party software, linked into the
+eunox binary. Test-only dependencies are not distributed and are not
+listed here. The module list is kept in sync with the binary's build closure
+across every released platform (linux, darwin, windows) by `make check-notice`
+(CI-enforced); the license and copyright lines below are hand-curated. A module
+reached on only one platform (golang.org/x/sys is linked only by the Windows
+audit-log file-locking path) is still listed here so the same NOTICE ships with
+every artifact.
+
+github.com/cespare/xxhash/v2
+License: MIT
+Copyright (c) 2016 Caleb Spare
+
+github.com/go-jose/go-jose/v4
+License: Apache-2.0
+Copyright (c) 2014 Square Inc.
+
+github.com/google/uuid
+License: BSD-3-Clause
+Copyright (c) 2009, 2014 Google Inc.
+
+github.com/redis/go-redis/v9
+License: BSD-2-Clause
+Copyright (c) 2013 The github.com/redis/go-redis Authors.
+
+go.uber.org/atomic
+License: MIT
+Copyright (c) 2016 Uber Technologies, Inc.
+
+golang.org/x/sync
+License: BSD-3-Clause
+Copyright (c) 2009 The Go Authors.
+
+golang.org/x/sys
+License: BSD-3-Clause
+Copyright (c) 2009 The Go Authors.
+
+gopkg.in/yaml.v3
+License: MIT and Apache-2.0
+Copyright (c) 2006-2011 Kirill Simonov, 2011-2016 Canonical Ltd.

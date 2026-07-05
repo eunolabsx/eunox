@@ -1,0 +1,6 @@
+# Eunox Repository Licensing
+
+All files in this repository are licensed under the **Apache License, Version 2.0**.
+See [`cmd/eunox/LICENSE`](cmd/eunox/LICENSE) for the full license text.
+
+SPDX-License-Identifier: Apache-2.0

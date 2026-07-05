@@ -1,0 +1,100 @@
+# filesystem.yaml — reference policy for @modelcontextprotocol/server-filesystem
+#
+# Threats addressed
+# -----------------
+#   1. Agent reads secrets it shouldn't see (.env, .pem, .key, id_rsa).
+#      → allowedExtensions narrows read_file and read_multiple_files to data
+#        formats; an allowedValues path-glob on the single-path read tools
+#        keeps them inside the sandbox; private-key/.env names are denied by
+#        absence. read_multiple_files takes a `paths` array, so it relies on
+#        the upstream's sandbox root for path confinement.
+#   2. Agent writes outside the sandbox (~/.ssh, /etc, project root).
+#      → allowedValues on `path` confines writes to /data/.
+#   3. Agent drops an executable into the sandbox and asks the host to run it.
+#      → allowedExtensions on write_file refuses anything but the data formats
+#        listed below.
+#   4. Runaway-loop file churn.
+#      → maxCalls caps writes per session.
+#
+# Tools intentionally NOT permitted
+# ---------------------------------
+#   move_file, copy_file, create_directory, search_files (recursive scans
+#   surface arbitrary files), list_allowed_directories. Add them back
+#   explicitly once you understand the blast radius for your sandbox.
+#
+# Adapt
+# -----
+#   Change /data/ to whatever path you launched the upstream with, e.g.
+#   `npx @modelcontextprotocol/server-filesystem /workspace` → /workspace/*.
+#   Tighten `allowedExtensions` to match the file types your agent actually
+#   produces — narrower is always safer.
+
+schemaVersion: "0.1"
+name: filesystem-policy
+version: "0.1.0"
+description: >
+  Sandbox-confined filesystem access. Reads limited to data file types;
+  writes limited to the sandbox and to the same extension allowlist.
+
+capabilities:
+  - target: tool:read_file
+    actions: [call]
+    conditions:
+      - type: allowedValues
+        argument: path
+        values:
+          - "/data/*"
+      - type: allowedExtensions
+        argument: path
+        extensions: [".csv", ".json", ".txt", ".md", ".log", ".yaml", ".yml"]
+
+  - target: tool:read_multiple_files
+    actions: [call]
+    conditions:
+      - type: allowedExtensions
+        argument: paths
+        extensions: [".csv", ".json", ".txt", ".md", ".log", ".yaml", ".yml"]
+
+  - target: tool:list_directory
+    actions: [call]
+    conditions:
+      - type: allowedValues
+        argument: path
+        values:
+          - "/data/*"
+
+  - target: tool:get_file_info
+    actions: [call]
+    conditions:
+      - type: allowedValues
+        argument: path
+        values:
+          - "/data/*"
+
+  - target: tool:write_file
+    actions: [call]
+    conditions:
+      - type: allowedValues
+        argument: path
+        values:
+          - "/data/*"
+      - type: allowedExtensions
+        argument: path
+        extensions: [".csv", ".json", ".txt", ".md", ".log", ".yaml", ".yml"]
+      - type: maxCalls
+        count: 100
+        windowSeconds: 3600
+
+  - target: tool:edit_file
+    actions: [call]
+    conditions:
+      - type: allowedValues
+        argument: path
+        values:
+          - "/data/*"
+      - type: allowedExtensions
+        argument: path
+        extensions: [".csv", ".json", ".txt", ".md", ".log", ".yaml", ".yml"]
+      - type: maxCalls
+        count: 100
+        windowSeconds: 3600

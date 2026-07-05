@@ -1,0 +1,27 @@
+# demo/policies/db.yaml — per-route manifest for the "db" upstream.
+#
+# Governs the /mcp/db route in the gateway demo (demo/gateway.yaml).
+# Carries its own version, independent of the files-policy version — the whole
+# point of "N manifests, 1 gateway": policies evolve on their own cadence.
+#
+# Rules:
+#   query_db   — allowed only for SELECT; rate-limited to 5 calls per hour
+#   read_file, write_file — intentionally absent → denied by default
+#
+# read_file on /mcp/db is therefore denied even though /mcp/files permits it.
+
+schemaVersion: "0.1"
+name: db-policy
+version: "0.2.0"
+
+capabilities:
+  - target: tool:query_db
+    actions: [call]
+    conditions:
+      - type: maxCalls
+        count: 5
+        windowSeconds: 3600
+      - type: allowedOperations
+        argument: query
+        operations:
+          - SELECT

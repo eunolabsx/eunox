@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>How it works · eunox</title>
+    <meta
+      name="description"
+      content="How eunox and the Go service stack enforce capability policy on every MCP tool call: architecture, request flow, schema parity, and the OCSF audit log."
+    />
+    <link rel="icon" href="../eunolabs.png" />
+    <link rel="stylesheet" href="../styles.css" />
+  </head>
+  <body>
+    <div id="site-header"></div>
+    <section class="hero hero-compact">
+      <div class="hero-eyebrow"><span class="dot"></span>How it works</div>
+      <h1>A reference monitor <em>at the protocol boundary</em></h1>
+      <p class="hero-sub">
+        eunox is a transparent Go-based MCP proxy and service stack that speaks
+        the protocol on both ends and evaluates capability policy in the middle.
+        The decision happens before the upstream is contacted, and every event
+        is signed and audited.
+      </p>
+    </section>
+    <nav class="breadcrumbs" aria-label="Breadcrumb">
+      <a href="../index.html">Home</a> &nbsp;›&nbsp; How it works
+    </nav>
+    <main class="content-section">
+      <div class="page-toc" aria-label="On this page">
+        <h4>On this page</h4>
+        <ul>
+          <li><a href="#architecture">Architecture</a></li>
+          <li><a href="#flow">Request flow</a></li>
+          <li><a href="#parity">Schema parity</a></li>
+          <li><a href="#audit">Audit log internals</a></li>
+          <li><a href="#gateway">Gateway — many upstreams</a></li>
+          <li><a href="#guarantees">Enforcement guarantees</a></li>
+        </ul>
+      </div>
+      <h2 id="architecture">Architecture</h2>
+      <p>
+        The proxy sits between any MCP host (Claude Desktop, Cursor, Windsurf,
+        LangChain, Go agents, …) and any upstream MCP server. It is transparent
+        on the protocol — the host sees an MCP server, the upstream sees an MCP
+        client.
+      </p>
+      <pre
+        style="
+          background: #0a0a14;
+          color: #cbd5e1;
+          padding: 20px;
+          border-radius: 10px;
+          font-size: 0.85em;
+        "
+      >
+                       ┌──────────────────────────────────────────┐
+   MCP host            │                eunox                     │         Upstream MCP server
+ (Claude / Cursor /    │                                          │     (filesystem, postgres, github,
+  Windsurf / agent)    │   ┌────────────┐    ┌─────────────────┐  │       slack, fetch, your own…)
+        │              │   │  Policy    │    │  Audit sink     │  │                  │
+        │  tools/call  │   │  engine    │    │  (OCSF + HMAC)  │  │                  │
+        ├──────────────┼──►│  evaluate  │───►│ ~/.eunox/audit  │  │                  │
+        │              │   │ conditions │    │ .jsonl          │  │                  │
+        │              │   └─────┬──────┘    └─────────────────┘  │                  │
+        │  CapDenied   │         │ allow                          │                  │
+        │◄─────────────┼─────────┼────────────────────────────────┼──────────────────►
+        │              │         │                                │     forward call │
+        │              │         │   ┌────────────────────────┐   │                  │
+        │              │         └──►│  StdioProxy / HTTP     │───┼────────►         │
+        │              │             │  transport             │   │                  │
+        │              │             └────────────────────────┘   │                  │
+        │              └──────────────────────────────────────────┘                  │
+</pre
+      >
+      <p>
+        Two transports are supported: <strong>stdio</strong> (Claude / Cursor /
+        Windsurf) and <strong>HTTP</strong> (LangChain, Go runtimes, and other
+        HTTP clients). The same policy file works for both.
+        <code>ipRange</code> is enforceable only on HTTP — stdio sessions have
+        no source IP.
+      </p>
+      <h2 id="flow">Request flow</h2>
+      <ol>
+        <li>
+          The host issues an MCP call — <code>tools/call</code>,
+          <code>resources/read</code>, <code>resources/subscribe</code>,
+          <code>prompts/get</code>, or <code>sampling/createMessage</code>. List
+          methods (<code>tools/list</code>, <code>resources/list</code>,
+          <code>prompts/list</code>) are filtered to permitted entries only.
+          Unrecognized methods are denied without forwarding.
+        </li>
+        <li>
+          The proxy looks up the matching capability in the manifest.
+          Capabilities absent from the manifest are
+          <strong>denied by default</strong> (fail-closed). If a match is found,
+          <code>argumentSchema</code> is validated first; then each condition is
+          evaluated in order — the first deny wins.
+        </li>
+        <li>
+          If allowed, the call is forwarded to the upstream. The upstream's
+          response is post-processed by any <code>directives</code> on the
+          capability (e.g. <code>redactFields</code>) before being returned to
+          the host. An unparseable upstream response triggers a sanitized error
+          — unredacted data is never returned.
+        </li>
+        <li>
+          If denied, the upstream is <strong>never contacted</strong>. The host
+          receives a structured JSON-RPC error:
+          <code>-32001</code> AUTHORIZATION_FAILED,
+          <code>-32002</code> CAPABILITY_DENIED,
+          <code>-32003</code> CONDITION_FAILED, or
+          <code>-32602</code> INVALID_PARAMS (schema failure).
+        </li>
+        <li>
+          Every decision — allow or deny — is written to the OCSF audit log,
+          signed with HMAC-SHA256.
+        </li>
+      </ol>
+      <pre
+        style="
+          background: #0a0a14;
+          color: #cbd5e1;
+          padding: 20px;
+          border-radius: 10px;
+          font-size: 0.85em;
+        "
+      >
+host ──tools/call──►  proxy ──► [parse] ──► [match capability] ──► [evaluate conditions]
+                                                                          │
+                                                ┌─────────────────────────┴─────────────┐
+                                                ▼                                       ▼
+                                            allow                                    deny
+                                                │                                       │
+                                                ▼                                       │
+                                  forward to upstream ───response──► [post-process] ──┐ │
+                                                                                      │ │
+host ◄────────────────── result / CapabilityDenied ──────────────────────────────────┴─┘
+                                                                       │
+                                                                       ▼
+                                                          OCSF audit (~/.eunox/audit.jsonl)
+</pre
+      >
+      <h2 id="parity">Schema parity — one shape, zero drift</h2>
+      <p>
+        The policy file is shared across the Go implementation, including
+        <code>pkg/capability</code>, <code>pkg/enforcement</code>, and
+        <code>eunox</code>. The CLI and hosted services consume the same
+        manifest and condition definitions. This means:
+      </p>
+      <ul>
+        <li>
+          Unknown condition types are denied at <strong>two</strong> points:
+          <code>eunox validate</code> rejects the policy, and the runtime
+          engine refuses to evaluate it.
+        </li>
+        <li>
+          The same enforcement engine is reused by the Go packages under
+          <code>pkg/</code> for in-process use.
+        </li>
+      </ul>
+      <h2 id="audit">Audit log internals</h2>
+      <p>
+        Each event conforms to the
+        <a
+          href="https://schema.ocsf.io/"
+          target="_blank"
+          rel="noopener noreferrer"
+          >OCSF</a
+        >
+        API Activity class (<code>class_uid: 6003</code>). The signer:
+      </p>
+      <ul>
+        <li>
+          generates a 32-byte random key on first run and stores it at
+          <code>~/.eunox/audit.key</code> with mode <code>0600</code>;
+        </li>
+        <li>
+          computes
+          <code>HMAC-SHA256(key, SHA-256(canonical-json(event)))</code>;
+        </li>
+        <li>
+          writes the event with its signature as a single JSON line to
+          <code>~/.eunox/audit.jsonl</code>.
+        </li>
+      </ul>
+      <p>
+        The log rotates at <strong>100 MiB</strong>. Rotated files are named
+        <code>audit.jsonl.&lt;ISO-timestamp&gt;</code>.
+        <code>verifyAuditEvent()</code> recomputes the HMAC for round-trip
+        integrity checks, and <code>eunox stats</code> aggregates denials
+        across active and rotated logs into an ASCII histogram grouped by
+        <code>conditionType</code> and <code>denialCode</code>.
+      </p>
+      <div class="callout">
+        <strong>Why HMAC and not a digital signature?</strong> Local audit is
+        <em>tamper-evident on-device</em> — anyone with read access to the key
+        can verify, anyone without it cannot forge. The key is stored at
+        <code>~/.eunox/audit.key</code> (mode <code>0600</code>) and can be
+        relocated with <code>--audit-key-path</code> or
+        <code>EUNOX_AUDIT_KEY_PATH</code>.
+      </div>
+      <h2 id="gateway">Gateway — one proxy, many upstreams</h2>
+      <p>
+        Over HTTP, a single <code>eunox</code> process can front
+        <strong>every</strong> MCP server a host talks to. Each upstream is
+        declared in a YAML gateway config and served on its own
+        <code>/mcp/&lt;name&gt;</code> route, governed by its own capability
+        manifest, all writing to <strong>one</strong> tamper-evident audit tape:
+      </p>
+      <pre><code>eunox proxy --config gateway.yaml
+  ├─ POST /mcp/filesystem   → stdio upstream, policy filesystem.yaml
+  └─ POST /mcp/stripe       → https://mcp.stripe.com, policy stripe.yaml</code></pre>
+      <p>
+        Each manifest carries its own <code>version</code>, so policies are
+        reviewed and versioned independently. A route may
+        <strong>pin</strong> an expected version (<code>expectVersion</code>);
+        the gateway <strong>fails closed</strong> — refusing to start — if the
+        loaded manifest's version differs. Every audit record is stamped with the
+        handling <code>upstream</code>, the in-force <code>policy_version</code>,
+        and a <code>policy_sha256</code> digest, so the shared tape proves
+        <em>which policy version of which upstream</em> allowed or denied each
+        call. A single remote upstream is just a gateway with one route.
+      </p>
+      <p>
+        The same fail-closed posture runs through the rest of the config. A
+        gateway route declared with no <code>policy:</code> <strong>refuses to
+        start</strong> — the gateway aborts at startup naming the unprotected
+        upstream — unless you explicitly opt that route into observe-only mode
+        with <code>enforcement: audit</code>. Sessions are bound to
+        the route they were opened on — a request that reuses another route's
+        session id is refused rather than silently crossing upstreams. And
+        secrets interpolate with <code>${VAR}</code> while a literal
+        <code>$</code> is left untouched, so a token containing <code>$</code> is
+        never corrupted on the way in.
+      </p>
+      <p>
+        Hosts that speak remote MCP (Claude Code, Cursor, VS Code/Copilot, Cline,
+        Roo, Windsurf) connect by URL; stdio-only hosts attach through a small
+        per-route stdio↔HTTP bridge. When a JWKS endpoint is configured, the
+        bearer token is intersected against <em>each route's own</em> manifest
+        (JWT ∩ manifest), per upstream.
+      </p>
+      <h2 id="guarantees">Enforcement guarantees</h2>
+      <p>
+        Enforcement runs on the arguments
+        <strong>the agent actually sent</strong> — before the upstream is
+        called. The guarantee is:
+        <em
+          >"the agent sent this tool call with these arguments, and it was
+          allowed/denied by this policy."</em
+        >
+        It is not a guarantee about what the upstream server does internally —
+        for that, instrument the upstream as well.
+      </p>
+      <p>
+        <strong>No telemetry, no phone-home.</strong> eunox opens no analytics,
+        usage-reporting, or update-check connections. The only outbound traffic
+        is what your config declares — the upstream MCP server, and, when
+        configured, the JWKS endpoint and Redis. Everything else, including the
+        audit log and its signing key, stays on the machine running the proxy.
+      </p>
+      <p>Three practical notes:</p>
+      <ul>
+        <li>
+          <strong>Absent entries are denied by default.</strong> Any capability
+          not listed in the manifest is denied for every enforced MCP method.
+          Unrecognized MCP methods are also denied and never forwarded.
+        </li>
+        <li>
+          <strong><code>allowedOperations</code> is a first-word check</strong>
+          — it splits on whitespace and matches the first token against the
+          allowlist. It is not a SQL parser. Pair with
+          <code>argumentSchema</code> if you need stricter parsing.
+        </li>
+        <li>
+          <strong><code>enforcement: audit</code> stages a rule without
+          blocking.</strong> Mark a single capability entry
+          <code>enforcement: audit</code> and the denial it would produce is
+          logged and the call forwarded — observe mode for rolling out a new tool
+          or a stricter condition before it blocks. It never opens the allowlist,
+          bypasses the kill switch, or downgrades a JWT-scope denial; flip to
+          <code>enforce</code> once the rule runs clean.
+        </li>
+      </ul>
+      <p>
+        See
+        <a
+          href="https://github.com/eunolabs/eunox/blob/main/docs/architecture.md"
+          target="_blank"
+          rel="noopener noreferrer"
+          >docs/architecture.md</a
+        >
+        for the architecture overview and
+        <a
+          href="https://github.com/eunolabs/eunox/blob/main/docs/capability-manifest-guide.md"
+          target="_blank"
+          rel="noopener noreferrer"
+          >docs/capability-manifest-guide.md</a
+        >
+        for the full manifest reference.
+      </p>
+      <p style="margin-top: 32px">
+        <a href="../quickstart/index.html" class="btn-primary" style="text-decoration: none"
+          >Try it in 60 seconds →</a
+        >
+      </p>
+    </main>
+    <div id="site-footer"></div>
+    <script src="../components.js"></script>
+    <script src="../main.js"></script>
+  </body>
+</html>

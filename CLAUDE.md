@@ -1,0 +1,69 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+`eunox` is a policy-enforcement proxy for MCP servers (Go, one static binary). It sits between an MCP host and an upstream MCP server, checks every enforced MCP method (`tools/call`, `resources/read`, `resources/subscribe`, `prompts/get`, `sampling/createMessage`) against a YAML capability manifest before forwarding, filters `*/list` responses to permitted entries, and writes every decision to an HMAC-SHA256-signed OCSF JSONL audit log.
+
+## Commands
+
+```bash
+make build           # → bin/eunox
+make test            # go test -race -count=1 ./...
+make lint            # go vet + golangci-lint (installs golangci-lint if missing)
+make fmt             # gofmt -w every .go file
+make check-fmt       # gofmt-clean check on every .go file (CI-enforced); fix with `make fmt`
+make check-license   # Apache-2.0 SPDX header on every .go file (CI-enforced)
+make check-notice    # NOTICE lists exactly the binary's third-party modules (CI-enforced)
+make coverage        # coverage.out for pkg/ — CI gates pkg/ at 80%
+```
+
+Run a single test (standard Go tooling):
+
+```bash
+go test -race -count=1 -run 'TestName' ./cmd/eunox/
+```
+
+End-to-end demo stack (Docker) — the fastest way to verify a behavior change against a real proxy + mock upstream: `make -C demo up`, then `make -C demo allow|deny|audit`; gateway variant `make -C demo gateway-up`.
+
+## Architecture
+
+Three layers: `cmd/eunox/` is the binary (CLI, transport wiring, PDP wiring); `pkg/` holds the importable engine and supporting libraries; and `internal/` holds subsystems factored out of the binary behind narrow seams — `internal/audit` (the tamper-evident audit log, consumed through the exported `audit.Sink`), `internal/mcp` (the MCP protocol message types plus the JSON-RPC envelope/newline-framing/classification layer — `RPCMsg`, `MsgReader`/`MsgWriter`, `MsgKey`, the response builders — shared by the transports, PDPs, and the CLI's live-upstream probe), `internal/pdp` (the policy decision points: the `PolicyDecisionPoint` contract and the `ManifestPDP`/`JWTPDP`/`AlwaysAllowPDP` implementations), `internal/config` (the config + manifest loading layer: `GatewayConfig` parsing, `LocalManifest` load/validate/merge, schema-version negotiation), `internal/drift` (the startup manifest-drift-comparison policy: `CheckManifestDrift`/`MakeDriftCheck`/`UpstreamTool`/`Warning`/`ParseToolsListResult`/`CheckFunc`, shared by the binary's `validate --live` and the transport runtime), and `internal/transport` (the stdio + HTTP/gateway transport runtime — the proxies, the shared dispatch/forward/enforcement core, the remote-upstream bridge, the route wiring, and the control-token/OAuth-metadata/health endpoints; the binary just wires it). The layering is `internal/mcp` ← `internal/pdp` ← `internal/transport` ← the binary, with `internal/config` and `internal/drift` sibling lower layers (`internal/drift` builds on `internal/{config,mcp,pdp}` + `pkg/{capability,enforcement}`) imported by both the CLI and the transport layer; `internal/transport` builds standalone on `internal/{audit,config,drift,mcp,pdp}` + `pkg/*` with zero references back into the binary.
+
+**Request flow:** host JSON-RPC request → transport layer parses method + arguments → `PolicyDecisionPoint.Decide(...)` → allow: forward to upstream; deny: structured JSON-RPC error back to host (upstream never called) → either way, an audit record is written.
+
+### cmd/eunox
+
+- **Transports** — their own package `internal/transport`; the binary just constructs the proxies (`transport.NewStdioProxy`/`transport.NewHTTPProxyGateway`) and calls `.Start`/`.Serve`. `stdio.go` (`StdioProxy`: host on stdin/stdout, one upstream as subprocess or remote HTTP via `stdio_http_upstream.go`); the `http*.go` files (`HTTPProxy`: MCP Streamable HTTP/SSE, one upstream subprocess per client session, `Mcp-Session-Id` header, loopback-only `/control/kill`) — split by concern into `http.go` (server core: construction + `Serve`), `http_routing.go` (`/mcp` POST/GET/DELETE + `/control/kill`), `http_security.go` (auth, Origin/DNS-rebinding, source-IP, loopback), `http_session.go` (`httpSession` lifecycle, registry, idle reaper, upstream I/O, SSE broadcast), and `http_handlers.go` (upstream-timeout/denial helpers + server-initiated request handling). Both transports route enforced requests through one shared `dispatchRequest` (`dispatch.go`: the method→handler mapping and fail-closed default) and the shared deny/forward/record core (`forward.go`: `enforcedForwardCore`/`forwardServerRequest`), so the dispatch and enforcement logic live once instead of being hand-mirrored per transport; `initialize` routes through `dispatchRequest` too (its cross-cutting kill gate shared with the other locally-answered methods), with the per-transport response body supplied by an injected `buildInit` responder — only the HTTP *session-creating* `initialize` (no session/dispatchParams yet, and it carries the strict-audit gate) is answered outside the shared dispatcher. Gateway mode (top-level `transport: http` in config) multiplexes N upstreams on one `HTTPProxy`, each at `/mcp/<name>` with its own policy — per-route state lives in `route.go` (`UpstreamRoute`, built by `BuildRoutes`; its `routeSink` wraps the shared `*audit.Sink` and stamps the route name + policy version/digest), config parsing in `internal/config` (`GatewayConfig`; unknown YAML keys rejected; JSON Schema in `schemas/`). The package builds standalone on `internal/{audit,config,drift,mcp,pdp}` + `pkg/*`; the drift-check policy lives in `internal/drift`, and the transport imports it only for the `drift.CheckFunc` hook type (the binary injects `drift.MakeDriftCheck` as that hook, so the runtime calls the opaque hook and never references the comparison). The exported seam the CLI consumes: `NewStdioProxy`/`StdioProxyOptions`, `NewHTTPProxyGateway`/`HTTPGatewayOptions`, `BuildRoutes`/`UpstreamRoute`/`LoadUpstreamPDP`/`WrapRoutesWithJWT`/`AnyRouteHasMaxCalls`, the `Resolve*` flag resolvers, the control-token + OAuth-metadata helpers, `SetProxyVersion`, and the CLI-probe plumbing (`DoMCPHTTP`, `BuildUpstreamClient`, `ProxyName`, `MCPProtocolVersion`, `SessionHeader`, `IsInfraDenialCode`, `MaxUpstreamErrBodyBytes`).
+- **PDP abstraction** — its own package `internal/pdp` (`pdp.go` + `jwt.go`) defines `PolicyDecisionPoint`: Decide / DecideResourceRead / DecidePromptGet plus the embedded `ListFilterer` (list filtering) and `SamplingAuthorizer` (sampling) facets, folded into the one contract so every PDP implements them and the transports call them directly (no optional-interface type assertion). Implementations: `ManifestPDP` (manifest via pkg/enforcement engine), `JWTPDP` (IdP capability claims; intersects with the manifest — JWT can only restrict, never expand. The `mcp.capabilities` claim schema is experimental and the intersection is off by default, gated behind `--jwt-experimental-capabilities`/`JWTPDPOptions.ExperimentalCapabilities`; with it off, a token carrying `mcp.capabilities` is rejected at validation, fail closed. JWT signature/exp/iss/aud verification and identity claims stay always-active), `AlwaysAllowPDP` (audit/wiretap mode). The package builds standalone on `pkg/*` (no `internal/mcp` dependency — the `sampling/createMessage` method name it consults lives in `pkg/capability.MethodSamplingCreateMessage`, reachable from every layer including `internal/audit`); the binary wires concrete PDPs into the transports via the exported contract. Every PDP must decide every method explicitly — no silent fall-through to "forward verbatim".
+- **Audit** — its own package `internal/audit` (`audit.go` writer core, `rotate.go` size-triggered rotation + retention pruning, `verify.go` per-record HMAC + tamper-evident chain verification), consumed by the binary through the exported `audit.Sink` (`RecordAllow`/`RecordDeny`/`Close`/`VerifyLog`). The recorders are non-blocking (struct init + channel send); serialization, HMAC signing, and disk I/O happen in a single background drainer goroutine. The package builds standalone — it depends only on `internal/config` (the shared `ExpandHome` helper), `pkg/capability`, and the stdlib, never back on the binary. In gateway mode, `routeSink` (in `internal/transport`) wraps the shared `*audit.Sink` and stamps each record with the route name, `policy_version`, and `policy_sha256`.
+- **Config** — its own package `internal/config` (`manifest.go` `LocalManifest` load/validate/merge, `gateway_config.go` `GatewayConfig` parse/validate + env-ref expansion, `schema_version.go` grammar-version negotiation, `resolve.go` shared `ResolveBool`/`MaxDurationMs`/`ExpandHome` helpers, `manifest_policy.go` the `(*LocalManifest)` policy-property methods `HasMaxCalls`/`AuditOnlyCount`/`Digest`). It holds the binary's config + manifest *loading* layer and builds standalone — depends only on `pkg/*`, `gopkg.in/yaml.v3`, and the stdlib, never back on the binary — so the CLI subcommands, `internal/audit` (`ExpandHome`), and the transport layer import the config/manifest types from a non-main home. Exported seam: `LocalManifest`/`LoadManifest`/`MergeManifests`, `GatewayConfig`/`UpstreamConfig`/`RouteDefaults`/`LoadGatewayConfig`, `ExpandHome`, and the consumed `(*GatewayConfig).Validate`/`HostTransport`/`AuditModeFor`/`NoPolicyStartupRejection` plus `HostTransportHTTP`/`HostTransportStdio`; the validators (`validateLocalManifest`, …) stay unexported.
+- **Drift** — its own package `internal/drift` (`drift.go`: the startup manifest-drift-comparison policy, FM-1 through FM-6). `CheckManifestDrift` compares the live upstream tool list + server version against the manifest and returns `Warning`s; `MakeDriftCheck` builds the session-start `CheckFunc` hook the transports run (fatal-or-skip on a probe failure depending on whether the manifest pins descriptionHash); `ParseToolsListResult` decodes the probed `tools/list` into `[]UpstreamTool`; `BestManifestConstraint` backs the `validate --live` COVERED report. The `CheckFunc` type moved here from `internal/transport`. The package builds standalone on `internal/{config,mcp,pdp}` + `pkg/{capability,enforcement}` (never `internal/transport`, which imports it — so no cycle), and is imported by the binary (`drift.MakeDriftCheck` wired into `transport.BuildRoutes`, `validate --live`, the live-upstream probe) and by `internal/transport` (the `CheckFunc` field on the proxy/route + the `BuildRoutes` hook-factory param).
+- **Subcommands** — proxy, validate (`--live` diffs manifest against a running upstream), init (deny-all starter manifest from live tool list), suggest (proposes manifest tightenings from the audit log), kill, audit-verify, stats, doctor, version. Dispatch is in `main.go`.
+
+### pkg/
+
+- **`pkg/capability`** — manifest/constraint/condition types, validation, directives (e.g. `redactFields`), JWKS fetching and JWT verification. Condition types are string-discriminated (`allowedValues`, `maxCalls`, `timeWindow`, …; authoritative list in `pkg/capability/condition.go`).
+- **`pkg/enforcement`** — the decision engine. Conditions are evaluated through a `ConditionHandler` registry on `Engine`; pluggable `Clock`, `CallCounter`, and `PolicyEvaluator` (external PDPs like OPA/Cedar) via functional options.
+- **`pkg/callcounter`**, **`pkg/killswitch`** — in-memory and Redis backends behind a common interface (Redis enables multi-instance deployments; tests use miniredis).
+- **`pkg/circuitbreaker`** — generic circuit breaker; the only production wiring today guards JWKS endpoint fetches (not upstream MCP calls, which rely on per-call timeouts).
+
+## Load-bearing invariants (from CONTRIBUTING.md)
+
+- **Fail closed.** On any ambiguity — missing manifest, unmapped method, malformed JWT, unset condition argument — deny, with a structured error code (`AUTHORIZATION_FAILED`, `CONDITION_FAILED`, …), and log it. New code paths must preserve this.
+- **Audit records are append-only and structured.** Never rewrite a record, never put free-form text in a structured field, never add a top-level field without updating the threat model (`docs/threat-model-mcp.md`).
+- **No telemetry / background network activity** without explicit design discussion.
+- **Pre-1.0: no backwards-compatibility shims.** Change manifest grammar, audit shape, or config keys cleanly and document the migration. Don't flag back-compat breaks as problems.
+- **One static binary on purpose** — new runtime dependencies need strong justification.
+- **No emojis in source files or code comments** (README/site are fine).
+- Conditions match a specific argument name; never silently match alternatives.
+
+## Conventions
+
+- Every `.go` file starts with the two-line header: `// Copyright 2026 Eunolabs, LLC` + `// SPDX-License-Identifier: Apache-2.0`.
+- Conventional Commits (`feat:`, `fix:`, `sec:`, `docs:`, `test:`, `ci:`, `chore:`; `!` for breaking). DCO sign-off required: `git commit -s`.
+- Tests: new condition types need table-driven tests under `pkg/capability/` (allow + deny + malformed-input cases); new MCP method coverage needs a test in `internal/transport/enforcement_gaps_test.go`; new audit-record fields need a sign-and-verify round-trip test.
+- Behavior changes need a docs update in the same PR. Manifest grammar changes also update `docs/capability-manifest-guide.md` and the spec repo (`eunolabs/mcp-capability-manifest`). Schema changes update `schemas/` plus a roundtrip test.
+- Security vulnerabilities go through `SECURITY.md`, not public issues.
+- Never reference issue numbers, bug IDs, or internal milestones (stages, phases, epics, sprints) in code comments, documentation, or site copy. Those references rot and belong in the PR description or commit message only.

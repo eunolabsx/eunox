@@ -1,0 +1,180 @@
+# Copyright 2026 Eunolabs, LLC
+# SPDX-License-Identifier: Apache-2.0
+
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  enable:
+    - gocritic
+    - revive
+    - gosec
+    - misspell
+    - unconvert
+    - unparam
+    - noctx
+    - contextcheck
+    # Complexity guardrails. These are ratchet ceilings, not targets: each
+    # threshold below sits just above the current worst offender so the tree is
+    # green today, while any NEW code that exceeds today's worst is rejected.
+    # CI runs golangci-lint on a shallow checkout (no git history), so a
+    # diff-based baseline is not viable here; a fixed ceiling is the robust
+    # equivalent. As the incremental refactors land (transport unification,
+    # audit decomposition, condition registry), lower each threshold toward the
+    # `target:` noted beside it and drop the matching grandfather exclusion.
+    - funlen
+    - gocyclo
+    - gocognit
+    - nestif
+    - dupl
+
+  settings:
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+    revive:
+      rules:
+        - name: exported
+          arguments:
+            - "checkPrivateReceivers"
+    gosec:
+      excludes:
+        - G404 # Allow math/rand for non-crypto uses (test helpers)
+    # ignore-comments is load-bearing: this codebase is intentionally and
+    # heavily commented (~37% of lines), so function length must be measured on
+    # code lines only or every well-documented function would trip the limit.
+    funlen:
+      lines: 110 # target: 80. Eight functions exceed the ceiling today and are
+      statements: 70 # target: 60. grandfathered below; many more sit just under.
+      ignore-comments: true
+    gocyclo:
+      min-complexity: 30 # target: 15. Four functions above 30 are grandfathered.
+    gocognit:
+      min-complexity: 60 # target: 30. Two functions above 60 are grandfathered.
+    nestif:
+      min-complexity: 13 # target: 6. Current max 12 (audit chain-resume blocks).
+    dupl:
+      threshold: 150 # target: 100. The known clones (transport handshake, list
+      # filtering, killswitch status) live in the files excluded below and are
+      # tracked for the transport-dedup refactor.
+
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+          - unparam
+          - noctx
+          - contextcheck
+          - errcheck
+      # Complexity ceilings apply to production code only. Test files are long
+      # and duplicative by nature (table-driven cases) and demo/ programs favor
+      # linear readability over factoring, so neither should gate the metrics.
+      - path: (_test\.go|demo/)
+        linters:
+          - funlen
+          - gocyclo
+          - gocognit
+          - nestif
+          - dupl
+      # Grandfathered complexity hotspots: functions whose cyclomatic/cognitive
+      # complexity is above the ceiling today. Each is a named refactor target;
+      # remove a name from the regex once its function is brought under the
+      # ceiling, and tighten the ceiling when the list is empty.
+      #   validateLocalManifest: one switch enumerates every condition type as
+      #     both value and pointer (cyclo 70 / cognit 147) -> condition registry.
+      #   (*GatewayConfig).Validate: flat sequence of route guards (cyclo 48).
+      #   verifyAuditLog: audit chain-verification state machine (cyclo 37)
+      #     -> decompose into classifier + chain-state.
+      #   renderLiveReport: manifest-vs-live diff report renderer (cyclo 44) ->
+      #     decompose by report section. runValidateLive itself (the prior
+      #     grandfathered name) is now a two-line wrapper around
+      #     buildLiveReport + renderLiveReport and carries none of the
+      #     complexity; the entry moved with the logic when the function split.
+      #   evaluateJWTConditions: re-implements the engine's condition handlers
+      #     (cognit 70) -> route through engine.EvaluateConditions.
+      - linters:
+          - gocyclo
+        text: 'func `(validateLocalManifest|\(\*GatewayConfig\)\.Validate|VerifyLog|renderLiveReport)` is high'
+      - linters:
+          - gocognit
+        text: 'func `(validateLocalManifest|evaluateJWTConditions)` is high'
+      # Length grandfathers (above the 110-line / 70-statement ceiling): the CLI
+      # entry points (cmdProxy, cmdValidate, serveHTTPGateway), the audit-sink
+      # constructor (openAuditSink), the POST dispatcher (handleMCPPost), the
+      # manifest validator and condition marshaller, and the live-validate
+      # report renderer (renderLiveReport, 114 statements — see the gocyclo
+      # entry above for why the name moved off runValidateLive). All are
+      # decomposed by the audit's transport/audit/main phases.
+      - linters:
+          - funlen
+        text: "Function '(Open|handleMCPPost|cmdProxy|serveHTTPGateway|cmdValidate|validateLocalManifest|renderLiveReport|marshalCondition)'"
+      # Known duplication catalogued for the transport-dedup refactor: the two
+      # transports hand-mirror the upstream initialize handshake and the
+      # list/tools handlers, and the kill-switch status projection is shared
+      # between its in-memory and Redis backends. dupl still guards every other
+      # file; drop each entry as its clones are factored into a shared helper.
+      - path: internal/transport/http\.go
+        linters:
+          - dupl
+      - path: internal/transport/stdio\.go
+        linters:
+          - dupl
+      - path: pkg/killswitch/
+        linters:
+          - dupl
+      # pkg/killswitch/redis.go: handlePubSubMessage kicks off a background
+      # full-state refresh from the service lifecycle context, not the pub/sub
+      # message context, so the resync outlives any single message handling.
+      - path: pkg/killswitch/redis\.go
+        text: "handlePubSubMessage"
+        linters:
+          - contextcheck
+      # cmd/eunox: rpcMsg and options structs are intentionally passed by value for
+      # clarity at call sites; copy overhead is acceptable in this proxy.
+      # internal/mcp: RPCMsg is passed by value through the framing writer and the
+      # MsgSink interface for call-site clarity (these moved out of cmd/eunox,
+      # which already excluded them).
+      # internal/audit: the auditRecord value is likewise passed by value through the
+      # chain-verifier (updateChain/classify) and test signers for call-site clarity.
+      # internal/pdp: JWTPDPOptions and capability.EnforceResponse are passed by value
+      # through the PDP constructors and the audit-mode antecedent helper for the same
+      # call-site clarity (these moved out of cmd/eunox, which already excluded them).
+      # internal/transport: rpcMsg and the *ProxyOptions structs are likewise passed by
+      # value through the transports, the dispatch/forward core, and the proxy
+      # constructors for call-site clarity (these moved out of cmd/eunox, which
+      # already excluded them).
+      # internal/drift: Warning is passed by value through its IsFatal/severity/
+      # LogLine methods for call-site clarity (it moved out of cmd/eunox, which
+      # already excluded it).
+      - path: (cmd/eunox/|internal/mcp/|internal/audit/|internal/pdp/|internal/transport/|internal/drift/)
+        text: "hugeParam"
+        linters:
+          - gocritic
+
+      # cmd/eunox: os.Exit on fatal errors is intentional; deferred file close is
+      # not critical when the process is terminating (OS cleans up).
+      - path: cmd/eunox/
+        text: "exitAfterDefer"
+        linters:
+          - gocritic
+      # internal/transport: graceful HTTP shutdown uses context.Background() because
+      # the server context is already canceled; the fresh timeout is intentional.
+      - path: internal/transport/http\.go
+        text: "Non-inherited new context"
+        linters:
+          - contextcheck
+      # pkg/capability: TokenCache.runCleanup can restart its loop with a LATER
+      # Start call's ctx (stashed in pendingCtx) instead of the ctx it was launched
+      # with, so a Start racing the outgoing goroutine's teardown is never silently
+      # lost (see the runCleanup doc comment). The "non-inherited" context is
+      # another Start call's own parameter, not an orphaned context.Background().
+      - path: pkg/capability/token_cache\.go
+        text: "Non-inherited new context"
+        linters:
+          - contextcheck

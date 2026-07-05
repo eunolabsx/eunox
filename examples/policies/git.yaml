@@ -1,0 +1,72 @@
+# git.yaml — reference policy for @modelcontextprotocol/server-git
+#
+# Local-repo git tools are dangerous for the same reason filesystem tools
+# are: they touch user state. Many of the destructive ones are also silent
+# (no confirmation), so a misled agent can rewrite history in a single call.
+#
+# Threats addressed
+# -----------------
+#   1. Agent rewrites or discards committed history.
+#      → git_reset, git_clean, git_checkout (with --force semantics),
+#        git_rebase, git_revert not in the allowlist.
+#   2. Agent pushes to a remote (data exfiltration via a malicious remote).
+#      → git_push, git_remote_add not in the allowlist.
+#   3. Agent commits secrets pulled from the workspace.
+#      → git_commit is allowed but rate-limited; pair with a hook on the
+#        repo that scans for secrets pre-commit.
+#
+# Tools intentionally NOT permitted
+# ---------------------------------
+#   git_push, git_remote_add, git_remote_remove, git_reset, git_clean,
+#   git_rebase, git_checkout (destructive variants), git_branch_delete,
+#   git_tag_delete, git_stash_drop.
+#
+# Adapt
+# -----
+#   If your agent only needs to read history, remove git_add and git_commit.
+#   The narrowest useful "read-only" git tool surface is: status, log, diff,
+#   show, branch list.
+
+schemaVersion: "0.1"
+name: git-policy
+version: "0.1.0"
+description: >
+  Read-mostly local git access. History inspection allowed; pushes,
+  resets, cleans, and force-checkouts denied by default.
+
+capabilities:
+  - target: tool:git_status
+    actions: [call]
+  - target: tool:git_log
+    actions: [call]
+  - target: tool:git_diff
+    actions: [call]
+  - target: tool:git_diff_unstaged
+    actions: [call]
+  - target: tool:git_diff_staged
+    actions: [call]
+  - target: tool:git_show
+    actions: [call]
+  - target: tool:git_branch
+    actions: [call]
+
+  - target: tool:git_add
+    actions: [call]
+    conditions:
+      - type: maxCalls
+        count: 100
+        windowSeconds: 3600
+
+  - target: tool:git_commit
+    actions: [call]
+    conditions:
+      - type: maxCalls
+        count: 30
+        windowSeconds: 3600
+
+  - target: tool:git_create_branch
+    actions: [call]
+    conditions:
+      - type: maxCalls
+        count: 20
+        windowSeconds: 3600

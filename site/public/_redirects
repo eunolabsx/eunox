@@ -1,0 +1,16 @@
+# Cloudflare Pages redirects (https://developers.cloudflare.com/pages/configuration/redirects/).
+# Each section page is a directory with an index.html, served at a clean
+# extensionless URL (e.g. quickstart/index.html -> /quickstart). A directory
+# index is NOT served at the ".html" path, so requests that include the
+# extension (e.g. /quickstart.html) would otherwise 404. Permanently redirect
+# the ".html" form of every section to its canonical clean URL so old links,
+# bookmarks, and typed-in extensions resolve.
+#
+# Format: <from> <to> <status>
+/quickstart.html    /quickstart    301
+/features.html      /features      301
+/how-it-works.html  /how-it-works  301
+/policies.html      /policies      301
+/docs.html          /docs          301
+/deploy.html        /deploy        301
+/blog.html          /blog          301

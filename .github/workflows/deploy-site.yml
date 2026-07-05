@@ -1,0 +1,70 @@
+name: Deploy to Cloudflare Pages
+
+# Publishes the static HTML site to Cloudflare Pages whenever changes land on
+# main, or when this workflow file is modified. There is no framework build, but
+# the workflow assembles the authoring tree (`site/public/`) into `site/dist/`,
+# which is what ships (see site/wrangler.toml).
+#
+# Prerequisites:
+#  1. Create a Cloudflare Pages project named "eunolabs-site" in the dashboard
+#     and connect the custom domain eunolabs.ai (see site/wrangler.toml).
+#  2. Add these repository SECRETS (Settings → Secrets and variables → Actions):
+#       CLOUDFLARE_API_TOKEN   — API token with "Cloudflare Pages: Edit" permission
+#       CLOUDFLARE_ACCOUNT_ID  — your Cloudflare account ID
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/public/**"
+      - "site/functions/**"
+      - "site/wrangler.toml"
+      - ".github/workflows/deploy-site.yml"
+  # Allow a manual redeploy from the Actions tab without a code push.
+  workflow_dispatch:
+
+# Least-privilege token — Cloudflare deployment uses its own credentials.
+permissions:
+  contents: read
+
+# Prevent concurrent deployments.
+concurrency:
+  group: cloudflare-pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to Cloudflare Pages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Assemble site
+        run: |
+          rm -rf site/dist
+          mkdir -p site/dist
+          # Copy the entire authoring tree: the landing page and root assets plus
+          # every section directory (quickstart, features, how-it-works, policies,
+          # docs, deploy, blog). Using `site/public/.` copies the directory
+          # *contents*, so new section directories are picked up automatically and
+          # can't be silently dropped by an out-of-date copy list.
+          cp -r site/public/. site/dist/
+          # NOTE: site/functions is intentionally NOT under site/public, so the
+          # copy above never includes it. Cloudflare Pages discovers the
+          # functions/ directory at the Pages project root (the working directory
+          # wrangler runs from), not inside the deployed static output directory.
+          # The publish step below runs wrangler from site/, so it picks up
+          # site/functions/ as Pages Functions and deploys dist/ as the static
+          # assets. Copying functions into dist would upload the API handler as a
+          # static file and the /api/subscribe route would 404.
+
+      - name: Publish to Cloudflare Pages
+        uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # Run from site/ so wrangler discovers site/functions/ as Pages Functions
+          # (it looks for functions/ relative to the working directory, not inside
+          # the deployed dist/). dist is then site/dist relative to this directory.
+          workingDirectory: site
+          command: pages deploy dist --project-name=eunolabs-site

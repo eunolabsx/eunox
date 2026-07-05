@@ -1,0 +1,40 @@
+{
+  "manifest_version": "0.3",
+  "name": "eunox",
+  "display_name": "eunox — MCP policy firewall",
+  "version": "{{VERSION}}",
+  "description": "Deny-by-default policy-enforcement proxy that sits in front of any MCP server and audits every call.",
+  "long_description": "eunox wraps a single upstream MCP server and enforces a YAML capability manifest in front of it: every tools/call, resources/read, resources/subscribe, prompts/get, and sampling/createMessage is checked before it is forwarded, */list responses are filtered to permitted entries, and every decision is written to a tamper-evident OCSF audit log (default ~/.eunox/audit.jsonl). This extension runs eunox in enforce mode against an eunox.yaml you provide. Scaffold a starter config + manifest from a live server with `eunox init --upstream-url <url> --output manifest.yaml --config-output eunox.yaml`. Note: a `transport: stdio` upstream is launched as a subprocess of eunox, so its runtime (npx / uvx / python) must be on PATH in Claude Desktop's launch environment — use an absolute command path, or point eunox at a `transport: http` upstream, if the upstream fails to start. The audit log defaults to ~/.eunox/audit.jsonl; if that path is not writable in the launch environment, set `audit.log` to an absolute writable path in your eunox.yaml.",
+  "author": {
+    "name": "Eunolabs, LLC",
+    "url": "https://github.com/eunolabs/eunox"
+  },
+  "homepage": "https://github.com/eunolabs/eunox",
+  "documentation": "https://github.com/eunolabs/eunox/blob/main/docs/client-integration.md",
+  "support": "https://github.com/eunolabs/eunox/issues",
+  "license": "Apache-2.0",
+  "keywords": ["mcp", "security", "policy", "proxy", "firewall", "audit"],
+  "server": {
+    "type": "binary",
+    "entry_point": "{{BINARY}}",
+    "mcp_config": {
+      "command": "${__dirname}/eunox",
+      "args": ["proxy", "--config", "${user_config.config_path}"],
+      "env": {}
+    }
+  },
+  "tools_generated": true,
+  "prompts_generated": true,
+  "user_config": {
+    "config_path": {
+      "type": "file",
+      "title": "eunox config (eunox.yaml)",
+      "description": "Absolute path to YOUR eunox.yaml — a YAML text file you create, NOT the .mcpb bundle you just downloaded. It names the one upstream MCP server to wrap and the policy to enforce. No config yet? Copy the observe-only starter at examples/eunox.example.yaml in the eunox repo, or scaffold one with `eunox init` (see the install guide for the full command).",
+      "required": true
+    }
+  },
+  "compatibility": {
+    "claude_desktop": ">=0.10.0",
+    "platforms": ["{{PLATFORM}}"]
+  }
+}

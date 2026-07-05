@@ -1,0 +1,35 @@
+# yaml-language-server: $schema=../schemas/eunox-gateway-config.schema.json
+# demo/gateway.yaml — multi-upstream gateway config for the eunox demo.
+#
+# One eunox process fronts TWO upstreams, each on its own /mcp/<name> route,
+# each governed by its own independently versioned manifest, all writing to ONE
+# tamper-evident audit tape. Loaded by `make -C demo gateway-up`.
+#
+# Connection wiring lives here; the enforcement policy stays in the per-route
+# manifest files referenced by `policy:`.
+
+schemaVersion: "0.1"        # gateway-config grammar version (fail-closed if unsupported)
+
+listen:
+  bind: 0.0.0.0          # container-internal; paired with --unsafe-bind-all on the CLI
+  port: 3000
+
+audit:
+  log: /audit/audit.jsonl     # one shared, signed tape for every route
+  keyPath: /audit/audit.key
+
+defaults:
+  upstreamTimeoutMs: 30000
+
+upstreams:
+  - name: files                          # → POST /mcp/files
+    transport: http
+    upstreamUrl: http://mock-files:8080
+    policy: ["/demo/policies/files.yaml"]
+    expectVersion: "0.1.0"               # gateway fails closed if files.yaml version drifts
+
+  - name: db                             # → POST /mcp/db
+    transport: http
+    upstreamUrl: http://mock-db:8080
+    policy: ["/demo/policies/db.yaml"]
+    expectVersion: "0.2.0"

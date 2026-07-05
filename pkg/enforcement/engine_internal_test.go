@@ -1,0 +1,881 @@
+// Copyright 2026 Eunolabs, LLC
+// SPDX-License-Identifier: Apache-2.0
+
+// White-box (package enforcement) tests for the counter-key construction shared
+// by the maxCalls quota bucket and the sequenceBlock session-history marker. Both
+// keys are (sessionID, targetType, name) tuples; the encoding must map distinct
+// tuples to distinct buckets even when a component contains the ":" separator,
+// the collision class reported.
+
+// White-box (package enforcement) regression test: the
+// logical maxCalls counter key must NOT fold windowSeconds in. Each backend
+// appends the window to the physical key exactly once, so embedding it here too
+// made the physical key carry the window twice (callcounter:maxcalls:...:300:300).
+
+// White-box (package enforcement) tests for small unexported helpers whose
+// branches are awkward to reach exhaustively through the public Engine API:
+// the JSON type discriminator used by schema validation and the
+// SequenceBlockCondition type assertion that accepts both value and pointer
+// forms.
+
+package enforcement
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/eunolabs/eunox/pkg/callcounter"
+	"github.com/eunolabs/eunox/pkg/capability"
+)
+
+// TestSequenceHistoryKey_ColonCollisionResistant pins the ambiguity from
+// the three-component history key: joined with a bare ":" delimiter,
+// (session "a:b", type "c", target "d") and (session "a", type "b", target "c:d")
+// both render "seq:a:b:c:d" and so address one bucket. The length-prefixed
+// encoding must keep them distinct.
+func TestSequenceHistoryKey_ColonCollisionResistant(t *testing.T) {
+	a := sequenceHistoryKey("", "a:b", "c", "d")
+	b := sequenceHistoryKey("", "a", "b", "c:d")
+	if a == b {
+		t.Fatalf("sequenceHistoryKey collides for ('a:b','c','d') and ('a','b','c:d'): both = %q", a)
+	}
+	// A distinct namespace (gateway route) must also disjoin two otherwise-identical
+	// (session, type, target) tuples, so routes sharing one CallCounter cannot collide.
+	if sequenceHistoryKey("routeA", "s", "tool", "x") == sequenceHistoryKey("routeB", "s", "tool", "x") {
+		t.Fatal("sequenceHistoryKey must disjoin distinct namespaces for the same tuple")
+	}
+}
+
+// TestCounterKeyNamespace_DisjoinsRoutes confirms the route namespace disjoins both
+// counter kinds so gateway routes sharing one CallCounter cannot drain or interfere
+// with each other's maxCalls/sequenceBlock buckets under a session-id collision.
+func TestCounterKeyNamespace_DisjoinsRoutes(t *testing.T) {
+	if compositeCounterKey("maxcalls", "routeA", "s", "tool", "x") ==
+		compositeCounterKey("maxcalls", "routeB", "s", "tool", "x") {
+		t.Fatal("maxCalls key must disjoin distinct route namespaces for the same tuple")
+	}
+	// An empty namespace (single-upstream) keeps a stable, collision-resistant key.
+	if compositeCounterKey("maxcalls", "", "s", "tool", "x") ==
+		compositeCounterKey("maxcalls", "", "s", "tool", "y") {
+		t.Fatal("distinct tools must not collide under an empty namespace")
+	}
+}
+
+// TestMaxCallsCounterKey_ColonCollisionResistant covers the same ambiguity for
+// the three-component maxCalls key, across each adjacent-component boundary a
+// colon could bleed across (session/type and type/tool), plus the empty-type
+// case a nil req.Target produces.
+func TestMaxCallsCounterKey_ColonCollisionResistant(t *testing.T) {
+	cases := []struct {
+		name string
+		x, y [3]string // sessionID, targetType, toolName
+	}{
+		{"session-into-type", [3]string{"s:tool", "", "export"}, [3]string{"s", "tool", "export"}},
+		{"type-into-tool", [3]string{"s", "tool", "a:b"}, [3]string{"s", "tool:a", "b"}},
+		{"session-into-tool-empty-type", [3]string{"a:b", "", "c"}, [3]string{"a", "", "b:c"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			kx := compositeCounterKey("maxcalls", tc.x[0], tc.x[1], tc.x[2])
+			ky := compositeCounterKey("maxcalls", tc.y[0], tc.y[1], tc.y[2])
+			if kx == ky {
+				t.Fatalf("maxCalls key collides for %v and %v: both = %q", tc.x, tc.y, kx)
+			}
+		})
+	}
+}
+
+// TestCompositeCounterKey_NulSeparatorWouldNotSuffice guards the choice of
+// length-prefixing over a single sentinel separator: a NUL byte (the separator
+// the issue floated as "the simplest option") can appear in a caller-supplied
+// component just as a colon can, so length-prefixing — not any one-byte sentinel
+// — is what makes the encoding injective for arbitrary content.
+func TestCompositeCounterKey_NulSeparatorWouldNotSuffice(t *testing.T) {
+	a := compositeCounterKey("seq", "a\x00b", "c")
+	b := compositeCounterKey("seq", "a", "b\x00c")
+	if a == b {
+		t.Fatalf("compositeCounterKey collides for NUL-bearing components: both = %q", a)
+	}
+}
+
+// TestCompositeCounterKey_PrefixPreserved confirms the disjoint "seq:" /
+// "maxcalls:" namespaces the callcounter backends rely on (redis.go) survive the
+// length-prefixed encoding: each key still leads with its verbatim prefix token.
+func TestCompositeCounterKey_PrefixPreserved(t *testing.T) {
+	if got := sequenceHistoryKey("", "s", "tool", "t"); !strings.HasPrefix(got, "seq:") {
+		t.Errorf("sequenceHistoryKey = %q, want \"seq:\" prefix", got)
+	}
+	if got := compositeCounterKey("maxcalls", "s", "tool", "t"); !strings.HasPrefix(got, "maxcalls:") {
+		t.Errorf("maxCalls key = %q, want \"maxcalls:\" prefix", got)
+	}
+}
+
+// keyCapturingCounter records the key and window handleMaxCalls passes to the
+// rate limiter. Peek/PeekRetryAfter are stubs: handleMaxCalls' commit path uses
+// only IncrementIfBelow, which is what this test inspects.
+type keyCapturingCounter struct {
+	gotKey       string
+	gotWindowSec int
+}
+
+func (c *keyCapturingCounter) IncrementAndGet(_ context.Context, _ string, _, _ int) (int64, error) {
+	return 1, nil
+}
+
+func (c *keyCapturingCounter) IncrementIfBelow(_ context.Context, key string, windowSec int, _ int64) (count int64, admitted bool, retryAfter time.Duration, err error) {
+	c.gotKey = key
+	c.gotWindowSec = windowSec
+	return 1, true, 0, nil
+}
+
+func (c *keyCapturingCounter) Peek(_ context.Context, _ string, _ int) (int64, error) {
+	return 0, nil
+}
+
+func (c *keyCapturingCounter) IncrementIfAllBelow(_ context.Context, _ []string, _ []int, _ []int64) (admitted bool, deniedIndex int, count int64, retryAfter time.Duration, err error) {
+	return true, 0, 0, 0, nil
+}
+
+// incrKeyCapturingCounter records every key recordSessionCall passes to
+// IncrementAndGet (the sequenceBlock history write path).
+type incrKeyCapturingCounter struct {
+	keyCapturingCounter
+	incrKeys []string
+}
+
+func (c *incrKeyCapturingCounter) IncrementAndGet(_ context.Context, key string, _, _ int) (int64, error) {
+	c.incrKeys = append(c.incrKeys, key)
+	return 1, nil
+}
+
+func (c *incrKeyCapturingCounter) hasKey(key string) bool {
+	for _, k := range c.incrKeys {
+		if k == key {
+			return true
+		}
+	}
+	return false
+}
+
+// recordingCommittingHandler is a custom CommittingConditionHandler registered under
+// the maxCalls type. It records that PrepareCommit was called and otherwise delegates
+// to the built-in bucket derivation, so the test can prove the multi-deferred commit
+// path dispatches through the registry rather than a hardcoded maxCalls type switch.
+// Pointer receiver so the copy held in the registry and the test's reference share
+// the same engine pointer and call counter.
+type recordingCommittingHandler struct {
+	e            *Engine
+	prepareCalls int
+}
+
+func (h *recordingCommittingHandler) Handle(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) *ConditionError {
+	return h.e.handleMaxCalls(ctx, cond, req)
+}
+
+func (h *recordingCommittingHandler) PrepareCommit(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (DeferredCommit, bool, *ConditionError) {
+	h.prepareCalls++
+	mc, key, skip, condErr := h.e.maxCallsBucket(ctx, cond, req)
+	if skip {
+		return DeferredCommit{}, true, nil
+	}
+	if condErr != nil {
+		return DeferredCommit{}, false, condErr
+	}
+	return DeferredCommit{
+		Key:        key,
+		WindowSecs: mc.WindowSeconds,
+		Limit:      int64(mc.Count),
+		Deny: func(count int64, retryAfter time.Duration) *ConditionError {
+			return maxCallsRateLimited(mc, count, retryAfterSeconds(retryAfter, mc.WindowSeconds))
+		},
+	}, false, nil
+}
+
+// TestCommitDeferredAtomic_DispatchesThroughRegistry pins the contract that a constraint
+// carrying more than one deferred condition commits through the registered
+// CommittingConditionHandler, so a custom WithConditionHandler for maxCalls is honored
+// on the multi-deferred path exactly as on the single-condition path — not bypassed by
+// a hardcoded maxCalls type switch. Before the fix commitDeferredAtomic called the
+// built-in maxCallsBucket directly and this custom handler's PrepareCommit was never
+// invoked.
+func TestCommitDeferredAtomic_DispatchesThroughRegistry(t *testing.T) {
+	counter := callcounter.NewInMemory()
+	handler := &recordingCommittingHandler{}
+	// The handler is only invoked during ValidateAction, after e is assigned below, so
+	// wiring e post-construction is safe (WithConditionHandler only registers the
+	// pointer; the deferred call reads h.e once set).
+	e := New(WithCallCounter(counter), WithConditionHandler(capability.ConditionTypeMaxCalls, handler))
+	handler.e = e
+
+	req := &capability.EnforceRequest{SessionID: "sess-1", ToolName: "tool"}
+	caps := []capability.Constraint{{
+		Target:  "tool",
+		Actions: []string{"*"},
+		// Two maxCalls with DISTINCT windows: forces the multi-deferred atomic-commit path
+		// (validateMaxCallsWindowsDistinct requires the windows differ).
+		Conditions: []capability.Condition{
+			&capability.MaxCallsCondition{Count: 5, WindowSeconds: 60},
+			&capability.MaxCallsCondition{Count: 3, WindowSeconds: 3600},
+		},
+	}}
+
+	resp := e.ValidateAction(context.Background(), req, caps)
+	if resp.Decision != capability.DecisionAllow {
+		t.Fatalf("decision = %q, want allow", resp.Decision)
+	}
+	if handler.prepareCalls != 2 {
+		t.Fatalf("custom PrepareCommit called %d times, want 2 (once per deferred condition) — the multi-deferred path must dispatch through the registry", handler.prepareCalls)
+	}
+}
+
+// nonUniformSkipHandler is a custom CommittingConditionHandler that reports skip=true
+// for its OWN reason (never from ctx/skipQuota), violating the contract that skip must
+// be uniform across the constraint. On the multi-deferred path this would fail OPEN —
+// one bucket's skip shortcuts the whole set to allow without limit-checking the rest —
+// so commitDeferredAtomic must instead fail closed.
+type nonUniformSkipHandler struct{ e *Engine }
+
+func (h nonUniformSkipHandler) Handle(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) *ConditionError {
+	return h.e.handleMaxCalls(ctx, cond, req)
+}
+
+func (h nonUniformSkipHandler) PrepareCommit(_ context.Context, _ capability.Condition, _ *capability.EnforceRequest) (DeferredCommit, bool, *ConditionError) {
+	// skip unconditionally, regardless of ctx — the contract violation under test.
+	return DeferredCommit{}, true, nil
+}
+
+// TestCommitDeferredAtomic_NonUniformSkipFailsClosed pins that a committing handler
+// reporting skip for a reason other than the ctx (skipQuota) is rejected with a deny
+// rather than admitting the call. Without the guard, one bucket's non-uniform skip
+// would allow the whole deferred set without limit-checking the remaining conditions.
+func TestCommitDeferredAtomic_NonUniformSkipFailsClosed(t *testing.T) {
+	counter := callcounter.NewInMemory()
+	handler := nonUniformSkipHandler{}
+	e := New(WithCallCounter(counter), WithConditionHandler(capability.ConditionTypeMaxCalls, handler))
+	handler.e = e
+
+	req := &capability.EnforceRequest{SessionID: "sess-1", ToolName: "tool"}
+	caps := []capability.Constraint{{
+		Target:  "tool",
+		Actions: []string{"*"},
+		// Two maxCalls with DISTINCT windows: forces the multi-deferred atomic-commit path.
+		Conditions: []capability.Condition{
+			&capability.MaxCallsCondition{Count: 5, WindowSeconds: 60},
+			&capability.MaxCallsCondition{Count: 3, WindowSeconds: 3600},
+		},
+	}}
+
+	// No WithSkipQuota on the context, so skipQuota(ctx) is false: the handler's skip is
+	// non-uniform and must fail closed.
+	resp := e.ValidateAction(context.Background(), req, caps)
+	if resp.Decision != capability.DecisionDeny {
+		t.Fatalf("decision = %q, want deny (non-uniform skip must fail closed)", resp.Decision)
+	}
+	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeConditionFailed {
+		t.Fatalf("denial = %+v, want CONDITION_FAILED", resp.Denial)
+	}
+}
+
+// nilDenyHandler is a custom CommittingConditionHandler whose PrepareCommit
+// derives a real bucket (Key/WindowSecs/Limit) via the built-in maxCallsBucket
+// but deliberately leaves Deny nil — a handler bug commitDeferredAtomic must not
+// let panic the enforcement goroutine when that bucket is the one the call
+// counter denies. Pointer receiver so the copy held in the registry and the
+// test's reference share the same engine pointer (mirrors
+// recordingCommittingHandler).
+type nilDenyHandler struct{ e *Engine }
+
+func (h *nilDenyHandler) Handle(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) *ConditionError {
+	return h.e.handleMaxCalls(ctx, cond, req)
+}
+
+func (h *nilDenyHandler) PrepareCommit(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (DeferredCommit, bool, *ConditionError) {
+	mc, key, skip, condErr := h.e.maxCallsBucket(ctx, cond, req)
+	if skip {
+		return DeferredCommit{}, true, nil
+	}
+	if condErr != nil {
+		return DeferredCommit{}, false, condErr
+	}
+	return DeferredCommit{
+		Key:        key,
+		WindowSecs: mc.WindowSeconds,
+		Limit:      int64(mc.Count),
+		// Deny deliberately left nil: the handler bug under test.
+	}, false, nil
+}
+
+// forceDenyAtIndexZeroCounter is a minimal CallCounter fake whose
+// IncrementIfAllBelow always denies bucket 0, deterministically driving
+// commitDeferredAtomic to invoke denies[0] regardless of the built-in InMemory
+// counter's real quota semantics.
+type forceDenyAtIndexZeroCounter struct{}
+
+func (forceDenyAtIndexZeroCounter) IncrementAndGet(_ context.Context, _ string, _, _ int) (int64, error) {
+	return 1, nil
+}
+func (forceDenyAtIndexZeroCounter) Peek(_ context.Context, _ string, _ int) (int64, error) {
+	return 0, nil
+}
+func (forceDenyAtIndexZeroCounter) IncrementIfBelow(_ context.Context, _ string, _ int, _ int64) (count int64, admitted bool, retryAfter time.Duration, err error) {
+	return 0, true, 0, nil
+}
+func (forceDenyAtIndexZeroCounter) IncrementIfAllBelow(_ context.Context, _ []string, _ []int, _ []int64) (admitted bool, deniedIndex int, count int64, retryAfter time.Duration, err error) {
+	return false, 0, 5, 0, nil
+}
+
+// TestCommitDeferredAtomic_NilDenyCallbackFailsClosed pins that a committing
+// handler whose PrepareCommit leaves DeferredCommit.Deny nil is denied with a
+// structured CONDITION_FAILED error, not a nil-func-call panic, when the call
+// counter denies that handler's bucket on the multi-deferred atomic-commit path.
+func TestCommitDeferredAtomic_NilDenyCallbackFailsClosed(t *testing.T) {
+	handler := &nilDenyHandler{}
+	e := New(WithCallCounter(forceDenyAtIndexZeroCounter{}), WithConditionHandler(capability.ConditionTypeMaxCalls, handler))
+	handler.e = e
+
+	req := &capability.EnforceRequest{SessionID: "sess-1", ToolName: "tool"}
+	caps := []capability.Constraint{{
+		Target:  "tool",
+		Actions: []string{"*"},
+		// Two maxCalls with DISTINCT windows: forces the multi-deferred atomic-commit path.
+		Conditions: []capability.Condition{
+			&capability.MaxCallsCondition{Count: 5, WindowSeconds: 60},
+			&capability.MaxCallsCondition{Count: 3, WindowSeconds: 3600},
+		},
+	}}
+
+	resp := e.ValidateAction(context.Background(), req, caps)
+	if resp.Decision != capability.DecisionDeny {
+		t.Fatalf("decision = %q, want deny (a nil Deny callback must fail closed, not panic)", resp.Decision)
+	}
+	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeConditionFailed {
+		t.Fatalf("denial = %+v, want CONDITION_FAILED", resp.Denial)
+	}
+}
+
+// typedNilCondition is a Condition implementation used only as a nil pointer, to
+// exercise the isTypedNil guard: as an interface value it is non-nil (it
+// carries a concrete type), but the pointer it wraps is nil.
+type typedNilCondition struct{ capability.MaxCallsCondition }
+
+// TestRunConditions_TypedNilConditionFailsClosed pins that a Condition interface
+// value wrapping a nil pointer — which survives a plain `cond == nil` check — is
+// rejected with a structured deny instead of panicking in ConditionType(),
+// mirroring collectObligations' identical typed-nil directive guard.
+func TestRunConditions_TypedNilConditionFailsClosed(t *testing.T) {
+	e := New(WithCallCounter(callcounter.NewInMemory()))
+	req := &capability.EnforceRequest{SessionID: "sess-1", ToolName: "tool"}
+	var nilCond *typedNilCondition // typed nil: (*typedNilCondition)(nil)
+	constraint := &capability.Constraint{
+		Target:     "tool",
+		Actions:    []string{"*"},
+		Conditions: []capability.Condition{nilCond},
+	}
+
+	resp := e.EvaluateConditions(context.Background(), req, constraint)
+	if resp.Decision != capability.DecisionDeny {
+		t.Fatalf("decision = %q, want deny (a typed-nil condition must fail closed, not panic)", resp.Decision)
+	}
+	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeConditionFailed {
+		t.Fatalf("denial = %+v, want CONDITION_FAILED", resp.Denial)
+	}
+}
+
+// recordSessionCall must key the sequenceBlock history WRITE under req.Target.Name
+// VERBATIM (only whitespace-trimmed) so the explicit afterTools spelling
+// ("resource:system:foo") matches, AND ALSO write a secondary marker keyed the way
+// the lookup parses the bare spelling ("system:foo" -> (system, foo)), so a target
+// whose name itself begins with a recognized namespace token trips the gate by
+// either spelling. Recording only the prefix-stripped name failed the gate OPEN for
+// the explicit spelling; recording only the verbatim name fails it OPEN for the bare
+// spelling — both keys must be present.
+func TestRecordSessionCall_TargetNameKeyedVerbatim(t *testing.T) {
+	counter := &incrKeyCapturingCounter{}
+	e := New(WithCallCounter(counter))
+
+	// A resource whose URI begins with a recognized engine token. The afterTools
+	// entry naming this antecedent is "resource:system:foo", whose lookup key is
+	// (resource, "system:foo") — recording must match it byte-for-byte.
+	req := &capability.EnforceRequest{
+		SessionID: "s1",
+		ToolName:  "system:foo",
+		Target:    &capability.EnforceRequestTarget{Type: "resource", Name: "system:foo"},
+	}
+	if err := e.RecordSessionCall(context.Background(), req); err != nil {
+		t.Fatalf("RecordSessionCall: %v", err)
+	}
+
+	// Primary: the explicit afterTools entry "resource:system:foo" strips one
+	// "resource:" token via splitEnginePrefix, leaving the name "system:foo" verbatim.
+	_, priorName := splitEnginePrefix("resource:system:foo")
+	primaryKey := sequenceHistoryKey("", "s1", "resource", priorName)
+	if !counter.hasKey(primaryKey) {
+		t.Errorf("verbatim primary key %q not recorded; keys=%v", primaryKey, counter.incrKeys)
+	}
+
+	// Secondary: the bare afterTools entry "system:foo" splits to (system, foo).
+	secType, secName := splitEnginePrefix("system:foo")
+	secondaryKey := sequenceHistoryKey("", "s1", secType, secName)
+	if !counter.hasKey(secondaryKey) {
+		t.Errorf("bare-spelling secondary key %q not recorded; keys=%v", secondaryKey, counter.incrKeys)
+	}
+}
+
+// recordFaultCounter admits maxCalls (IncrementIfBelow) but fails the
+// sequenceBlock-antecedent write (IncrementAndGet), reproducing the counter-fault
+// the recordSessionCall deny path is reachable through.
+type recordFaultCounter struct {
+	incrementAndGetCalls int
+}
+
+func (c *recordFaultCounter) IncrementAndGet(_ context.Context, _ string, _, _ int) (int64, error) {
+	c.incrementAndGetCalls++
+	return 0, errors.New("counter backend fault")
+}
+func (c *recordFaultCounter) IncrementIfBelow(_ context.Context, _ string, _ int, _ int64) (count int64, admitted bool, retryAfter time.Duration, err error) {
+	return 1, true, 0, nil // admit: maxCalls passes and commits a slot
+}
+func (c *recordFaultCounter) Peek(_ context.Context, _ string, _ int) (int64, error) { return 0, nil }
+func (c *recordFaultCounter) IncrementIfAllBelow(_ context.Context, _ []string, _ []int, _ []int64) (admitted bool, deniedIndex int, count int64, retryAfter time.Duration, err error) {
+	return true, 0, 0, 0, nil
+}
+
+// TestRecordSessionCall_NoSequenceBlock_NoQuotaBurnOnRecordFault is the regression
+// for the maxCalls slot being burned on a recordSessionCall-fault deny. For a
+// maxCalls-only policy (no sequenceBlock), WithoutAntecedentRecording skips the
+// antecedent write entirely, so a counter fault on that write can no longer turn a
+// committed-maxCalls allow into a deny. The default engine (no option) still
+// records and so still denies on the fault, demonstrating the difference.
+func TestRecordSessionCall_NoSequenceBlock_NoQuotaBurnOnRecordFault(t *testing.T) {
+	maxCallsOnly := []capability.Constraint{{
+		Target:     "tool:t",
+		Actions:    []string{"call"},
+		Conditions: []capability.Condition{capability.MaxCallsCondition{Count: 5, WindowSeconds: 60}},
+	}}
+	req := &capability.EnforceRequest{
+		SessionID: "s1",
+		ToolName:  "t",
+		Target:    &capability.EnforceRequestTarget{Type: "tool", Name: "t"},
+	}
+
+	// Default engine: records the antecedent, so the IncrementAndGet fault denies the
+	// call (the residual burn the invariant doc now acknowledges).
+	cDefault := &recordFaultCounter{}
+	respDefault := New(WithCallCounter(cDefault)).ValidateAction(context.Background(), req, maxCallsOnly)
+	if respDefault.Decision != capability.DecisionDeny {
+		t.Fatalf("default engine: a record fault must deny, got %v", respDefault.Decision)
+	}
+	if cDefault.incrementAndGetCalls == 0 {
+		t.Error("default engine must attempt the antecedent write")
+	}
+
+	// With WithoutAntecedentRecording: the antecedent write is skipped, so the same
+	// fault cannot deny — the call is allowed and IncrementAndGet is never called.
+	cSkip := &recordFaultCounter{}
+	respSkip := New(WithCallCounter(cSkip), WithoutAntecedentRecording()).ValidateAction(context.Background(), req, maxCallsOnly)
+	if respSkip.Decision != capability.DecisionAllow {
+		t.Fatalf("skip-recording engine: a maxCalls-only call must be allowed despite a record-path fault, got %v (denial=%+v)", respSkip.Decision, respSkip.Denial)
+	}
+	if cSkip.incrementAndGetCalls != 0 {
+		t.Errorf("skip-recording engine must not attempt the antecedent write, got %d calls", cSkip.incrementAndGetCalls)
+	}
+}
+
+func TestHandleMaxCalls_LogicalKeyExcludesWindow(t *testing.T) {
+	counter := &keyCapturingCounter{}
+	e := New(WithCallCounter(counter))
+
+	req := &capability.EnforceRequest{
+		SessionID: "sess-1",
+		ToolName:  "export",
+		Target:    &capability.EnforceRequestTarget{Type: "tool", Name: "export"},
+	}
+	constraint := &capability.Constraint{
+		Target:  "tool:export",
+		Actions: []string{"call"},
+		Conditions: []capability.Condition{
+			&capability.MaxCallsCondition{Count: 5, WindowSeconds: 300},
+		},
+	}
+
+	resp := e.EvaluateConditions(context.Background(), req, constraint)
+	if resp.Decision != capability.DecisionAllow {
+		t.Fatalf("decision = %v, want allow: %+v", resp.Decision, resp.Denial)
+	}
+
+	// The window travels as the windowSec argument, never folded into the logical
+	// key — so the backend appends it exactly once and the physical key carries it
+	// once, not twice.
+	wantKey := compositeCounterKey("maxcalls", "", "sess-1", "tool", "export")
+	if counter.gotKey != wantKey {
+		t.Errorf("maxCalls logical key = %q, want %q (window must not be in the key)", counter.gotKey, wantKey)
+	}
+	if strings.Contains(counter.gotKey, "300") {
+		t.Errorf("maxCalls logical key %q must not embed the window 300", counter.gotKey)
+	}
+	if counter.gotWindowSec != 300 {
+		t.Errorf("windowSec argument = %d, want 300", counter.gotWindowSec)
+	}
+}
+
+func TestSchemaJSONTypeOf_AllCases(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		val  interface{}
+		want string
+	}{
+		{"string", "hello", "string"},
+		{"number", float64(3.14), "number"},
+		{"boolean", true, "boolean"},
+		{"object", map[string]interface{}{"k": "v"}, "object"},
+		{"array", []interface{}{1, 2}, "array"},
+		{"null", nil, "null"},
+		{"unknown int", 42, "unknown"}, // raw int is not a JSON-decoded type
+		{"unknown struct", struct{}{}, "unknown"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := schemaJSONTypeOf(tc.val); got != tc.want {
+				t.Errorf("schemaJSONTypeOf(%T) = %q, want %q", tc.val, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSchemaTypeCompatible(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name        string
+		got, schema string
+		val         interface{}
+		want        bool
+	}{
+		{"string matches string", "string", "string", "x", true},
+		{"number matches number", "number", "number", float64(1.5), true},
+		{"whole number matches integer", "number", "integer", float64(42), true},
+		{"fractional number rejects integer", "number", "integer", float64(3.14), false},
+		{"string rejects integer", "string", "integer", "x", false},
+		{"boolean rejects string", "boolean", "string", true, false},
+	}
+	for _, tc := range cases {
+		if got := schemaTypeCompatible(tc.got, tc.schema, tc.val); got != tc.want {
+			t.Errorf("%s: schemaTypeCompatible(%q,%q,%v) = %v, want %v", tc.name, tc.got, tc.schema, tc.val, got, tc.want)
+		}
+	}
+}
+
+func TestAsSequenceBlock_PointerValueAndMismatch(t *testing.T) {
+	t.Parallel()
+
+	// Pointer form.
+	ptr := &capability.SequenceBlockCondition{}
+	if got, ok := asCondition[capability.SequenceBlockCondition](ptr); !ok || got != ptr {
+		t.Errorf("pointer form: got (%v,%v), want (%v,true)", got, ok, ptr)
+	}
+
+	// Value form: must be normalised to a non-nil pointer.
+	val := capability.SequenceBlockCondition{}
+	if got, ok := asCondition[capability.SequenceBlockCondition](val); !ok || got == nil {
+		t.Errorf("value form: got (%v,%v), want (non-nil,true)", got, ok)
+	}
+
+	// A different condition type must not match.
+	other := &capability.MaxCallsCondition{}
+	if got, ok := asCondition[capability.SequenceBlockCondition](other); ok || got != nil {
+		t.Errorf("mismatch: got (%v,%v), want (nil,false)", got, ok)
+	}
+}
+
+// TestFileSuffix locks the presentational suffix used in allowedExtensions
+// denial messages, including the compound-extension and dotfile edge cases
+// raised in review. The realistic compound case ("archive.tar.gz" and the hidden
+// ".archive.tar.gz") yields ".tar.gz"; the dotfile prefix is treated as a base
+// name so its own dot is never a suffix boundary. This is presentational only —
+// the allow/deny decision is strings.HasSuffix in handleAllowedExtensions.
+func TestFileSuffix(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		base string
+		want string
+	}{
+		{"backup.zip.gz", ".zip.gz"},   // compound extension, normal base name
+		{"archive.tar.gz", ".tar.gz"},  // the realistic .tar.gz case
+		{".archive.tar.gz", ".tar.gz"}, // hidden file, compound ext: base "archive"
+		{"data.gz", ".gz"},             // single extension
+		{".env", ".env"},               // bare dotfile, no internal dot
+		{".tar.gz", ".gz"},             // hidden file "tar" with ext ".gz"
+		{".gitignore", ".gitignore"},   // bare dotfile
+		{"noext", "noext"},             // no dot at all
+		{"REPORT.PDF", ".pdf"},         // suffix is lower-cased
+		{"a.b.c.d", ".b.c.d"},          // multiple dots: from the first
+	}
+	for _, tc := range cases {
+		if got := fileSuffix(tc.base); got != tc.want {
+			t.Errorf("fileSuffix(%q) = %q, want %q", tc.base, got, tc.want)
+		}
+	}
+}
+
+// TestCompilePattern_CachesAndReuses verifies that compilePattern returns the
+// identical *regexp.Regexp instance on repeat calls for the same pattern — the
+// point of the cache is that the hot enforcement path does not recompile a
+// static manifest pattern on every request.
+func TestCompilePattern_CachesAndReuses(t *testing.T) {
+	// Not parallel: asserts on the shared package-level patternCache.
+	const pat = `^cache-probe-[0-9]+$`
+	patternCache.Delete(pat)
+
+	first, err := compilePattern(pat)
+	if err != nil {
+		t.Fatalf("first compile: unexpected error %v", err)
+	}
+	second, err := compilePattern(pat)
+	if err != nil {
+		t.Fatalf("second compile: unexpected error %v", err)
+	}
+	if first != second {
+		t.Errorf("compilePattern returned distinct instances %p and %p; the cache should reuse the first", first, second)
+	}
+	if !first.MatchString("cache-probe-42") {
+		t.Errorf("cached regexp does not match a value it should")
+	}
+}
+
+// TestCompilePattern_BadPatternNotCached verifies that a pattern that fails to
+// compile returns an error and is not stored, so a later valid registration of
+// the same key would not be shadowed by a cached failure.
+func TestCompilePattern_BadPatternNotCached(t *testing.T) {
+	const pat = "[unclosed"
+	patternCache.Delete(pat)
+	if _, err := compilePattern(pat); err == nil {
+		t.Fatalf("compilePattern(%q) = nil error, want a compile error", pat)
+	}
+	if _, ok := patternCache.Load(pat); ok {
+		t.Errorf("a non-compiling pattern was cached; only successful compiles should be stored")
+	}
+}
+
+// TestCompileSchemaPatterns_WalksTreeAndReports verifies that CompileSchemaPatterns
+// recurses through properties and items, rejects the first malformed pattern with
+// a path-qualified message, and primes the cache for valid patterns.
+func TestCompileSchemaPatterns_WalksTreeAndReports(t *testing.T) {
+	t.Parallel()
+
+	// nil is a no-op.
+	if err := CompileSchemaPatterns("argumentSchema", nil); err != nil {
+		t.Errorf("nil schema: unexpected error %v", err)
+	}
+
+	// A valid tree compiles cleanly and primes the cache.
+	good := &capability.ArgumentSchema{
+		Properties: map[string]*capability.ArgumentSchema{
+			"name": {Pattern: `^[a-z]+$`},
+			"tags": {Items: &capability.ArgumentSchema{Pattern: `^t-[0-9]+$`}},
+		},
+	}
+	if err := CompileSchemaPatterns("argumentSchema", good); err != nil {
+		t.Fatalf("valid schema: unexpected error %v", err)
+	}
+	if _, ok := patternCache.Load(`^t-[0-9]+$`); !ok {
+		t.Errorf("nested items pattern was not primed into the cache")
+	}
+
+	// A malformed pattern nested under a property is rejected, and the error
+	// extends the supplied root with the schema-location path so the operator
+	// can locate the offending node.
+	bad := &capability.ArgumentSchema{
+		Properties: map[string]*capability.ArgumentSchema{
+			"q": {Pattern: "[unclosed"},
+		},
+	}
+	err := CompileSchemaPatterns("argumentSchema", bad)
+	if err == nil {
+		t.Fatalf("malformed pattern: got nil error, want a compile error")
+	}
+	for _, want := range []string{"argumentSchema.properties.q", "invalid pattern"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not contain %q", err.Error(), want)
+		}
+	}
+}
+
+// ---- merged from allowed_value_precision_test.go ----
+
+// A manifest allowedValues literal above 2^53 must authorize exactly that value
+// and not its float64-rounded neighbour. With UseNumber decoding preserving the
+// policy literal as json.Number, MatchAllowedValue (via numericEqual/asInt64)
+// compares the integers exactly: the authored value matches, the adjacent value
+// is denied.
+func TestMatchAllowedValue_LargeIntegerExactMatch(t *testing.T) {
+	allowed := []interface{}{json.Number("9007199254740993")} // 2^53 + 1, as decoded from the manifest
+
+	authored := json.Number("9007199254740993") // request carrying the authorized value
+	adjacent := json.Number("9007199254740992") // the float64-rounded neighbour
+
+	if !MatchAllowedValue(authored, allowed) {
+		t.Errorf("the authored value %s must be allowed", authored)
+	}
+	if MatchAllowedValue(adjacent, allowed) {
+		t.Errorf("the adjacent value %s must NOT be allowed (would authorize the wrong value)", adjacent)
+	}
+}
+
+// numericEqual must not collapse an exact int64 onto a non-int64 operand that
+// rounds to the same float64. math.MaxInt64 (an exact int64) and MaxInt64+1=2^63
+// (which overflows int64) share a float64; the allowlist authorizing only MaxInt64
+// must deny a request carrying MaxInt64+1, and symmetrically.
+func TestNumericEqual_MaxInt64BoundaryNotConflated(t *testing.T) {
+	maxInt64 := json.Number("9223372036854775807")  // math.MaxInt64
+	overInt64 := json.Number("9223372036854775808") // one past MaxInt64 (two to the 63rd power)
+
+	if numericEqual(maxInt64, overInt64) {
+		t.Errorf("MaxInt64 and MaxInt64+1 must not compare equal")
+	}
+	if numericEqual(overInt64, maxInt64) {
+		t.Errorf("MaxInt64+1 and MaxInt64 must not compare equal (symmetric)")
+	}
+	if !numericEqual(maxInt64, json.Number("9223372036854775807")) {
+		t.Errorf("MaxInt64 must compare equal to itself")
+	}
+
+	allowed := []interface{}{maxInt64}
+	if MatchAllowedValue(maxInt64, allowed) != true {
+		t.Errorf("the authorized MaxInt64 must be allowed")
+	}
+	if MatchAllowedValue(overInt64, allowed) {
+		t.Errorf("MaxInt64+1 must NOT be allowed by an allowlist of only MaxInt64")
+	}
+}
+
+// ---- merged from collect_obligations_test.go ----
+
+// TestCollectObligationsValueDirective verifies that a value-typed
+// RedactFieldsDirective (as opposed to a pointer) yields the same obligation
+// instead of failing closed with ENFORCEMENT_ERROR.
+func TestCollectObligationsValueDirective(t *testing.T) {
+	e := New()
+
+	cases := map[string]capability.Directive{
+		"pointer": &capability.RedactFieldsDirective{Fields: []string{"ssn", "token"}},
+		"value":   capability.RedactFieldsDirective{Fields: []string{"ssn", "token"}},
+	}
+
+	for name, dir := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := &capability.Constraint{
+				Target:     "tool:read_user",
+				Actions:    []string{"call"},
+				Directives: []capability.Directive{dir},
+			}
+			obs, deny := e.collectObligations(c, "req-1", "2026-06-14T00:00:00Z")
+			if deny != nil {
+				t.Fatalf("collectObligations denied a valid redactFields directive: %+v", deny.Denial)
+			}
+			if len(obs) != 1 || obs[0].Type != capability.DirectiveTypeRedactFields {
+				t.Fatalf("unexpected obligations: %+v", obs)
+			}
+			if len(obs[0].Paths) != 2 || obs[0].Paths[0] != "ssn" || obs[0].Paths[1] != "token" {
+				t.Fatalf("unexpected obligation paths: %v", obs[0].Paths)
+			}
+		})
+	}
+}
+
+// ---- merged from numeric_equal_test.go ----
+
+func TestNumericEqual(t *testing.T) {
+	tests := []struct {
+		name string
+		a, b any
+		want bool
+	}{
+		// The bridge the function exists for: manifest int vs request float64.
+		{"int vs equal float64", 5, float64(5), true},
+		{"int vs unequal float64", 5, float64(6), false},
+		{"int vs fractional float64", 5, 5.5, false},
+		{"negative int vs float64", -3, float64(-3), true},
+
+		// Exact integer comparison above 2^53: these two int64 values share a
+		// float64 representation, so the old float-only path matched them. They
+		// must now be distinguished.
+		{"distinct int64 above 2^53", int64(9007199254740993), int64(9007199254740992), false},
+		{"equal int64 above 2^53", int64(9007199254740993), int64(9007199254740993), true},
+
+		// A request float64 that exactly equals a large manifest int still matches;
+		// one that differs by one (but rounds to the same float) must not.
+		{"int64 vs exact large float64", int64(9007199254740992), float64(9007199254740992), true},
+		{"int64 vs near-but-distinct large float64", int64(9007199254740993), float64(9007199254740992), false},
+
+		// Mixed signed/unsigned integer types compare by value.
+		{"int vs uint equal", 7, uint(7), true},
+		{"int8 vs int64 equal", int8(42), int64(42), true},
+
+		// Non-numeric and bool are not numerically equal.
+		{"bool is not numeric", true, 1, false},
+		{"string is not numeric", "5", 5, false},
+		{"nil is not numeric", nil, 0, false},
+
+		// Float-to-float still works for genuinely fractional values.
+		{"equal float64", 1.5, 1.5, true},
+		{"unequal float64", 1.5, 2.5, false},
+
+		// json.Number (produced by a json.Decoder in UseNumber mode) must compare
+		// by value against both manifest ints and request floats. Without
+		// the json.Number arms in asInt64/toFloat64 these all returned false.
+		{"json.Number int vs int", json.Number("5"), 5, true},
+		{"json.Number int vs unequal int", json.Number("5"), 6, false},
+		{"json.Number int vs float64", json.Number("5"), float64(5), true},
+		{"json.Number fractional vs float64", json.Number("1.5"), 1.5, true},
+		{"json.Number negative vs int", json.Number("-3"), -3, true},
+		{"json.Number large int distinct", json.Number("9007199254740993"), int64(9007199254740992), false},
+		{"json.Number large int equal", json.Number("9007199254740993"), int64(9007199254740993), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := numericEqual(tt.a, tt.b); got != tt.want {
+				t.Errorf("numericEqual(%v, %v) = %v, want %v", tt.a, tt.b, got, tt.want)
+			}
+			// Symmetry: the comparison must not depend on argument order.
+			if got := numericEqual(tt.b, tt.a); got != tt.want {
+				t.Errorf("numericEqual(%v, %v) [swapped] = %v, want %v", tt.b, tt.a, got, tt.want)
+			}
+		})
+	}
+}
+
+// ---- merged from retry_after_test.go ----
+
+func TestRetryAfterSeconds(t *testing.T) {
+	const windowSec = 60
+
+	cases := []struct {
+		name string
+		d    time.Duration
+		want int64
+	}{
+		{"zero falls back to window", 0, windowSec},
+		{"exactly one second", time.Second, 1},
+		{"sub-second rounds up", 500 * time.Millisecond, 1},
+		{"ceiling of fractional", 1500 * time.Millisecond, 2},
+		{"exact multiple", 3 * time.Second, 3},
+		{"negative sub-second falls back to window", -500 * time.Millisecond, windowSec},
+		{"negative nanosecond falls back to window", -1 * time.Nanosecond, windowSec},
+		{"negative whole second falls back to window", -1 * time.Second, windowSec},
+		{"large negative falls back to window", -9 * time.Hour, windowSec},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := retryAfterSeconds(tc.d, windowSec); got != tc.want {
+				t.Errorf("retryAfterSeconds(%v, %d) = %d, want %d", tc.d, windowSec, got, tc.want)
+			}
+		})
+	}
+}

@@ -1,0 +1,39 @@
+# demo/docker-compose.jwt.yml — overlay that switches eunox from manifest-only
+# mode into JWT + manifest intersection mode.
+#
+# Usage:
+#   make -C demo up-jwt      (equivalent to docker compose -f docker-compose.yml -f docker-compose.jwt.yml up)
+#
+# In this mode every request to eunox must carry a Bearer JWT signed by
+# Keycloak.  The JWT's mcp.capabilities claims are intersected with the
+# manifest: the JWT can only restrict, never expand what the manifest allows.
+#
+# The mcp.capabilities claim schema (JWT v0.2) is EXPERIMENTAL and off by default,
+# so this demo opts in with --jwt-experimental-capabilities. JWT signature/issuer/
+# audience verification and the identity claims are stable and need no flag.
+#
+# Get a test JWT:  make -C demo jwt
+
+services:
+  eunox:
+    command:
+      - proxy
+      - --config=/demo/manifest-only.yaml
+      - --unsafe-bind-all
+      - --jwks-uri=http://keycloak:8080/realms/eunox-demo/protocol/openid-connect/certs
+      # Development only: the JWKS endpoint is reached over plaintext http to a
+      # non-loopback host (the Keycloak service on the demo's private Docker
+      # network). eunox requires https for a remote JWKS in production; this flag
+      # opts into the insecure fetch for the self-contained demo stack.
+      - --jwks-allow-insecure-http
+      - --jwt-issuer=http://localhost:8081/realms/eunox-demo
+      - --jwt-audience=eunox
+      # The mcp.capabilities claim schema (JWT v0.2) is experimental; this opt-in
+      # enables the JWT-claim intersection the JWT-mode assertions below exercise.
+      # Without it a token carrying mcp.capabilities is rejected (HTTP 401).
+      - --jwt-experimental-capabilities
+    depends_on:
+      keycloak:
+        condition: service_healthy
+      mock-mcp-server:
+        condition: service_healthy

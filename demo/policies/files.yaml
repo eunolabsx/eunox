@@ -1,0 +1,25 @@
+# demo/policies/files.yaml — per-route manifest for the "files" upstream.
+#
+# Governs the /mcp/files route in the gateway demo (demo/gateway.yaml).
+# Versioned independently of every other route's manifest.
+#
+# Rules:
+#   read_file  — allowed only for paths under /reports/  (glob via allowedValues)
+#   query_db, write_file — intentionally absent → denied by default
+#
+# Because this manifest has no query_db entry, a query_db call on /mcp/files is
+# denied even though the /mcp/db route permits it: each route is enforced against
+# its own manifest.
+
+schemaVersion: "0.1"
+name: files-policy
+version: "0.1.0"
+
+capabilities:
+  - target: tool:read_file
+    actions: [call]
+    conditions:
+      - type: allowedValues
+        argument: path
+        values:
+          - "/reports/*"

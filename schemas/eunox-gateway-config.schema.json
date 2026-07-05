@@ -1,0 +1,307 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/eunolabs/eunox/main/schemas/eunox-gateway-config.schema.json",
+  "title": "eunox Config",
+  "description": "Configuration for `eunox proxy --config <file>`. The top-level `transport` selects the host-facing transport: \"http\" (default, gateway shape) fronts many MCP upstreams from one process, each on its own /mcp/<name> route; \"stdio\" speaks MCP over stdin/stdout to exactly one upstream. Each upstream is governed by its own capability manifest, all writing to one shared, signed audit tape. Connection wiring lives here; enforcement policy stays in the per-route manifest files referenced by `policy`.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "upstreams"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "description": "Config grammar version. Required. This build understands \"0.1\"; a document with an absent or unrecognized value is rejected at load (fail-closed). Distinct from a manifest's policy-content version.",
+      "enum": [
+        "0.1"
+      ]
+    },
+    "transport": {
+      "type": "string",
+      "description": "Host-facing transport — how eunox speaks to its MCP host. \"http\" (default) listens on a socket and fronts N upstreams on /mcp/<name> routes. \"stdio\" speaks MCP over stdin/stdout to exactly one upstream (no `listen` block). \"\" (or an omitted key) defaults to \"http\". Independent of each upstream's own `transport`.",
+      "enum": [
+        "",
+        "stdio",
+        "http"
+      ],
+      "default": "http"
+    },
+    "listen": {
+      "type": "object",
+      "description": "Where the gateway binds for incoming MCP hosts.",
+      "additionalProperties": false,
+      "properties": {
+        "bind": {
+          "type": "string",
+          "description": "Bind address. Defaults to 127.0.0.1. Binding to a non-loopback address additionally requires the --unsafe-bind-all CLI flag.",
+          "default": "127.0.0.1"
+        },
+        "port": {
+          "type": "integer",
+          "description": "TCP port to listen on. 0 (or an omitted key) means unset — the loader applies the default 3000. A non-zero value must be in [1, 65535].",
+          "minimum": 0,
+          "maximum": 65535,
+          "default": 3000
+        },
+        "authToken": {
+          "type": "string",
+          "description": "Optional static bearer token required from incoming hosts (Authorization: Bearer <token>). Use ${VAR} to read it from the environment rather than committing it. A literal $ that is not a valid reference, and any reference to an unset variable, are left untouched — so a token containing $ is never blanked or corrupted."
+        },
+        "oauthResource": {
+          "type": "string",
+          "description": "URI identifying this resource server (RFC 9728 'resource' field). When set, published in the protected-resource metadata document at /.well-known/oauth-protected-resource and in WWW-Authenticate challenges as resource_metadata. Never derived from the request Host header. Only valid for transport: http.",
+          "format": "uri"
+        },
+        "oauthAuthorizationServers": {
+          "type": "array",
+          "description": "Authorization server URIs published in the RFC 9728 protected-resource metadata document. Defaults to --jwt-issuer when not set. Only valid for transport: http.",
+          "items": {
+            "type": "string",
+            "format": "uri"
+          }
+        },
+        "allowedOrigins": {
+          "type": "array",
+          "description": "Extends the built-in Origin allowlist (loopback names and the bind host) used by the DNS-rebinding guard. List full origins, e.g. \"https://app.example.com\". A present Origin header that matches none of the allowed origins is rejected with 403. Only valid for transport: http.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "trustedProxyCIDRs": {
+          "type": "array",
+          "description": "CIDR ranges a reverse proxy may connect from for its X-Forwarded-For header to be trusted under --trust-forwarded-for. The immediate TCP peer must match one of these ranges, or X-Forwarded-For is ignored and the connection's own address is used instead. Only valid for transport: http.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "maxSessions": {
+          "type": "integer",
+          "description": "Cap on concurrent client sessions; each session owns one upstream subprocess or remote connection. A new initialize beyond the cap is refused with 503 rather than spawning unbounded upstreams. 0 means unlimited. When this key is omitted, the proxy applies a safe backstop default (see --max-sessions). Only valid for transport: http.",
+          "minimum": 0
+        },
+        "sessionIdleTimeoutMs": {
+          "type": "integer",
+          "description": "Reap a session whose host has sent no request for this many milliseconds, closing its upstream so idle sessions cannot pin resources. 0 (default) disables idle reaping. Only valid for transport: http.",
+          "minimum": 0,
+          "maximum": 9223372036854,
+          "default": 0
+        }
+      }
+    },
+    "audit": {
+      "type": "object",
+      "description": "Shared OCSF audit tape for every route. Each record is signed with HMAC-SHA256 and stamped with the handling upstream, the in-force policy version, and a policy digest.",
+      "additionalProperties": false,
+      "properties": {
+        "log": {
+          "type": "string",
+          "description": "Path to the append-only audit log (JSON Lines). Defaults to ~/.eunox/audit.jsonl."
+        },
+        "keyPath": {
+          "type": "string",
+          "description": "Path to the HMAC signing key. Generated with mode 0600 on first run if absent. Defaults to ~/.eunox/audit.key."
+        },
+        "rotateSizeBytes": {
+          "type": "integer",
+          "description": "Rotate the audit log once it exceeds this size, in bytes. Defaults to 104857600 (100 MiB). 0 (default) uses the built-in size; a negative value is rejected at load.",
+          "minimum": 0
+        },
+        "retainRotated": {
+          "type": "integer",
+          "description": "Bound how many rotated audit files (audit.jsonl.<timestamp>) are kept after each rotation; the oldest beyond this count are deleted so the log directory cannot grow without bound. 0 (default) keeps every rotated file. The active log is never deleted.",
+          "minimum": 0,
+          "default": 0
+        }
+      }
+    },
+    "defaults": {
+      "$ref": "#/$defs/routeDefaults"
+    },
+    "upstreams": {
+      "type": "array",
+      "description": "One entry per upstream MCP server. With transport: http each is served at POST /mcp/<name>; with transport: stdio there is exactly one.",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/upstream"
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "transport": {
+            "const": "stdio"
+          }
+        },
+        "required": [
+          "transport"
+        ]
+      },
+      "then": {
+        "description": "transport: stdio has no network listener and fronts exactly one upstream.",
+        "not": {
+          "required": [
+            "listen"
+          ]
+        },
+        "properties": {
+          "upstreams": {
+            "maxItems": 1
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "routeDefaults": {
+      "type": "object",
+      "description": "Enforcement posture applied to every route unless overridden per-upstream.",
+      "additionalProperties": false,
+      "properties": {
+        "enforcement": {
+          "type": "string",
+          "description": "Enforcement posture applied to every route: \"enforce\" (default — block on denial) or \"audit\" (observe — evaluate and log, but forward instead of block). \"\" (or an omitted key) defaults to \"enforce\".",
+          "enum": [
+            "",
+            "enforce",
+            "audit"
+          ]
+        },
+        "strictDrift": {
+          "type": "boolean",
+          "description": "Treat any manifest/upstream capability drift as fatal rather than warning.",
+          "default": false
+        },
+        "upstreamTimeoutMs": {
+          "type": "integer",
+          "description": "Per-call timeout when contacting an upstream, in milliseconds. The loader treats a value of 0 as unset (the flag/default applies) and rejects a negative value; the maximum guards against overflow when the value is scaled to nanoseconds.",
+          "minimum": 0,
+          "maximum": 9223372036854
+        }
+      }
+    },
+    "upstream": {
+      "type": "object",
+      "description": "One upstream route. transport selects the wiring: 'stdio' launches `command` as a subprocess; 'http' proxies to `upstreamUrl`.",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "transport"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Route name, used verbatim as the /mcp/<name> URL path segment. Must be unique across upstreams.",
+          "pattern": "^[a-zA-Z0-9_-]+$"
+        },
+        "transport": {
+          "type": "string",
+          "description": "Upstream transport.",
+          "enum": [
+            "stdio",
+            "http"
+          ]
+        },
+        "command": {
+          "type": "string",
+          "description": "stdio transport only: executable to launch as the upstream MCP server subprocess."
+        },
+        "args": {
+          "type": "array",
+          "description": "stdio transport only: arguments passed to `command`.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "upstreamUrl": {
+          "type": "string",
+          "description": "http transport only: base URL of the upstream MCP server.",
+          "format": "uri"
+        },
+        "upstreamAuthHeader": {
+          "type": "string",
+          "description": "http transport only: a header line injected on every upstream request, e.g. 'Authorization: Bearer ${TOKEN}'. Use ${VAR} to avoid committing secrets; ${VAR}/$VAR are expanded from the environment, and a literal $ or a reference to an unset variable is left untouched."
+        },
+        "upstreamTlsSkipVerify": {
+          "type": "boolean",
+          "description": "http transport only: skip TLS certificate verification for the upstream. For local/dev use only.",
+          "default": false
+        },
+        "policy": {
+          "type": "array",
+          "description": "One or more capability manifest files, merged in order, governing this route. Omitting it is only valid when the effective enforcement is \"audit\" (observe-only): in gateway mode a route with no policy and no audit posture fails closed at startup (the gateway refuses to start). With \"audit\", the route forwards and logs every call without blocking.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "expectVersion": {
+          "type": "string",
+          "description": "Pin the manifest's `version`. When set and the loaded version differs, the gateway fails closed (refuses to start). Requires `policy` to be set, and is only supported with a single policy file (the pin is unambiguous only then).",
+          "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)$"
+        },
+        "enforcement": {
+          "type": "string",
+          "description": "Per-route enforcement posture: \"enforce\" or \"audit\". \"\" (or an omitted key) inherits from defaults.",
+          "enum": [
+            "",
+            "enforce",
+            "audit"
+          ]
+        },
+        "strictDrift": {
+          "type": "boolean",
+          "description": "Per-route override of defaults.strictDrift."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "transport"
+            ],
+            "properties": {
+              "transport": {
+                "const": "stdio"
+              }
+            }
+          },
+          "then": {
+            "description": "stdio routes allow command/args; HTTP-only fields are rejected.",
+            "required": [
+              "command"
+            ],
+            "properties": {
+              "upstreamUrl": false,
+              "upstreamAuthHeader": false,
+              "upstreamTlsSkipVerify": false
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "transport"
+            ],
+            "properties": {
+              "transport": {
+                "const": "http"
+              }
+            }
+          },
+          "then": {
+            "description": "http routes allow upstreamUrl/HTTP options; stdio-only command/args are rejected.",
+            "required": [
+              "upstreamUrl"
+            ],
+            "properties": {
+              "command": false,
+              "args": false
+            }
+          }
+        }
+      ]
+    }
+  }
+}

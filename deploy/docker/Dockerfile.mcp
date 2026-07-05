@@ -1,0 +1,66 @@
+# Copyright 2026 Eunolabs, LLC
+# SPDX-License-Identifier: Apache-2.0
+#
+# Multi-stage Dockerfile for the eunox proxy (Linux).
+# Produces a distroless image for linux/amd64 and linux/arm64.
+#
+# Usage:
+#   docker build -f deploy/docker/Dockerfile.mcp -t eunolabs/eunox:latest .
+
+# ── Build stage ──────────────────────────────────────────────────────────────
+# Pinned to the same patch release as go.mod and CI (go 1.26.4) so the released
+# image is built with the exact toolchain the binary was tested against.
+FROM golang:1.26.4-alpine AS builder
+
+ARG VERSION
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+
+# Fail closed on an unset version. A plain `docker build` without
+# `--build-arg VERSION=...` would otherwise stamp the binary "0.0.0" and ship an
+# image that misreports its own version. Every supported build path passes it:
+# `make docker-build-mcp`, .github/workflows/release.yml, and the demo
+# docker-compose stacks (which set `args: VERSION` in their `build:` sections).
+RUN if [ -z "$VERSION" ] || [ "$VERSION" = "0.0.0" ]; then \
+    echo "VERSION must be passed via --build-arg (make docker-build-mcp, release.yml, or a demo compose stack's build.args)" >&2; \
+    exit 1; \
+    fi
+
+# git: VCS stamp; ca-certificates + tzdata: copied into the distroless final stage.
+RUN apk add --no-cache git ca-certificates tzdata
+
+WORKDIR /src
+
+# Cache module downloads independently of source changes.
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
+    -trimpath \
+    -ldflags="-s -w -X main.version=${VERSION} -buildid=" \
+    -o /out/mcp \
+    ./cmd/eunox/
+
+# ── Final stage (distroless/nonroot) ────────────────────────────────────────
+FROM gcr.io/distroless/static-debian12:nonroot
+
+COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=builder /out/mcp /usr/local/bin/mcp
+
+# Apache-2.0 attribution: ship LICENSE + NOTICE inside the image (NOTICE is
+# required by Apache-2.0 section 4(d) wherever the binary is redistributed).
+COPY --from=builder /src/cmd/eunox/LICENSE /usr/local/share/eunox/LICENSE
+COPY --from=builder /src/NOTICE /usr/local/share/eunox/NOTICE
+
+# UID 65534 = nonroot in distroless.
+USER 65534:65534
+
+LABEL org.opencontainers.image.source="https://github.com/eunolabs/eunox"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+LABEL org.opencontainers.image.vendor="Eunox"
+LABEL org.opencontainers.image.description="Eunox MCP capability enforcement proxy"
+
+ENTRYPOINT ["/usr/local/bin/mcp"]

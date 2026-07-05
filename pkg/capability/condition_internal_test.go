@@ -1,0 +1,342 @@
+// Copyright 2026 Eunolabs, LLC
+// SPDX-License-Identifier: Apache-2.0
+
+package capability
+
+import (
+	"encoding/json"
+	"fmt"
+	"net"
+	"regexp"
+	"testing"
+	"time"
+)
+
+// TestIPRangeCondition_Compile covers the load-time pre-compilation of ipRange
+// CIDRs: a compiled condition exposes ready *net.IPNet values that
+// match the same IPs net.ParseCIDR would, an uncompiled one reports no networks
+// so the handler falls back to per-request parsing, and a malformed CIDR errors
+// without clobbering any previously compiled result.
+func TestIPRangeCondition_Compile(t *testing.T) {
+	t.Run("valid CIDRs compile and match", func(t *testing.T) {
+		c := &IPRangeCondition{CIDRs: []string{"10.0.0.0/8", "192.168.0.0/16"}}
+		if err := c.Compile(); err != nil {
+			t.Fatalf("Compile: unexpected error: %v", err)
+		}
+		networks, ok := c.Networks()
+		if !ok {
+			t.Fatal("Networks: ok = false after Compile, want true")
+		}
+		if len(networks) != 2 {
+			t.Fatalf("Networks: got %d networks, want 2", len(networks))
+		}
+		// In-range and out-of-range IPs resolve as net.ParseCIDR would.
+		cases := []struct {
+			ip   string
+			want bool
+		}{
+			{"10.1.2.3", true},
+			{"192.168.50.50", true},
+			{"172.16.0.1", false},
+			{"8.8.8.8", false},
+		}
+		for _, tc := range cases {
+			ip := net.ParseIP(tc.ip)
+			var matched bool
+			for _, nw := range networks {
+				if nw.Contains(ip) {
+					matched = true
+					break
+				}
+			}
+			if matched != tc.want {
+				t.Errorf("IP %s: matched=%v, want %v", tc.ip, matched, tc.want)
+			}
+		}
+	})
+
+	t.Run("uncompiled reports no networks", func(t *testing.T) {
+		c := &IPRangeCondition{CIDRs: []string{"10.0.0.0/8"}}
+		if networks, ok := c.Networks(); ok || networks != nil {
+			t.Errorf("Networks before Compile = (%v, %v), want (nil, false)", networks, ok)
+		}
+	})
+
+	t.Run("malformed CIDR errors and leaves prior result untouched", func(t *testing.T) {
+		c := &IPRangeCondition{CIDRs: []string{"10.0.0.0/8"}}
+		if err := c.Compile(); err != nil {
+			t.Fatalf("first Compile: unexpected error: %v", err)
+		}
+		first, _ := c.Networks()
+
+		c.CIDRs = []string{"10.0.0.0/8", "not-a-cidr"}
+		err := c.Compile()
+		if err == nil {
+			t.Fatal("Compile: expected error for malformed CIDR, got nil")
+		}
+		// The earlier compiled slice is still in place (Compile commits only on
+		// full success), so the condition never ends up half-compiled.
+		got, ok := c.Networks()
+		if !ok {
+			t.Fatal("Networks: ok = false after failed recompile, want the prior result")
+		}
+		if len(got) != len(first) {
+			t.Errorf("Networks: got %d networks after failed recompile, want %d (unchanged)", len(got), len(first))
+		}
+	})
+
+	t.Run("idempotent recompile", func(t *testing.T) {
+		c := &IPRangeCondition{CIDRs: []string{"10.0.0.0/8"}}
+		if err := c.Compile(); err != nil {
+			t.Fatalf("Compile: unexpected error: %v", err)
+		}
+		if err := c.Compile(); err != nil {
+			t.Fatalf("second Compile: unexpected error: %v", err)
+		}
+		if networks, ok := c.Networks(); !ok || len(networks) != 1 {
+			t.Errorf("Networks after recompile = (len %d, %v), want (1, true)", len(networks), ok)
+		}
+	})
+
+	t.Run("empty CIDRs compile to a non-nil empty set", func(t *testing.T) {
+		c := &IPRangeCondition{CIDRs: []string{}}
+		if err := c.Compile(); err != nil {
+			t.Fatalf("Compile: unexpected error: %v", err)
+		}
+		networks, ok := c.Networks()
+		if !ok {
+			t.Error("Networks: ok = false after compiling empty CIDRs, want true (compiled, matches nothing)")
+		}
+		if len(networks) != 0 {
+			t.Errorf("Networks: got %d networks, want 0", len(networks))
+		}
+	})
+}
+
+// TestTimeWindowCondition_Compile covers the load-time pre-parse of notBefore /
+// notAfter: a compiled condition reports ready time.Time values (so the hot path
+// skips time.Parse), an uncompiled one reports ok=false (the handler parses on
+// demand), a blank bound stays the zero Time, and a malformed bound errors without
+// clobbering a prior compiled result.
+func TestTimeWindowCondition_Compile(t *testing.T) {
+	t.Run("both bounds compile and parse as UTC", func(t *testing.T) {
+		c := &TimeWindowCondition{NotBefore: "2025-01-01T00:00:00Z", NotAfter: "2025-12-31T23:59:59Z"}
+		if err := c.Compile(); err != nil {
+			t.Fatalf("Compile: unexpected error: %v", err)
+		}
+		nb, na, ok := c.Window()
+		if !ok {
+			t.Fatal("Window: ok = false after Compile, want true")
+		}
+		wantNB, _ := time.Parse(time.RFC3339Nano, "2025-01-01T00:00:00Z")
+		wantNA, _ := time.Parse(time.RFC3339Nano, "2025-12-31T23:59:59Z")
+		if !nb.Equal(wantNB) || !na.Equal(wantNA) {
+			t.Errorf("Window = (%v, %v), want (%v, %v)", nb, na, wantNB, wantNA)
+		}
+	})
+
+	t.Run("blank bound stays the zero time", func(t *testing.T) {
+		c := &TimeWindowCondition{NotAfter: "2025-12-31T23:59:59Z"}
+		if err := c.Compile(); err != nil {
+			t.Fatalf("Compile: unexpected error: %v", err)
+		}
+		nb, _, ok := c.Window()
+		if !ok {
+			t.Fatal("Window: ok = false after Compile, want true")
+		}
+		if !nb.IsZero() {
+			t.Errorf("Window notBefore = %v, want the zero Time for a blank bound", nb)
+		}
+	})
+
+	t.Run("uncompiled reports not-ok", func(t *testing.T) {
+		c := &TimeWindowCondition{NotBefore: "2025-01-01T00:00:00Z"}
+		if _, _, ok := c.Window(); ok {
+			t.Error("Window before Compile: ok = true, want false")
+		}
+	})
+
+	t.Run("malformed bound errors and leaves prior result untouched", func(t *testing.T) {
+		c := &TimeWindowCondition{NotBefore: "2025-01-01T00:00:00Z"}
+		if err := c.Compile(); err != nil {
+			t.Fatalf("first Compile: unexpected error: %v", err)
+		}
+		first, _, _ := c.Window()
+
+		c.NotAfter = "not-a-time"
+		if err := c.Compile(); err == nil {
+			t.Fatal("Compile: expected error for malformed notAfter, got nil")
+		}
+		got, _, ok := c.Window()
+		if !ok {
+			t.Fatal("Window: ok = false after failed recompile, want the prior result")
+		}
+		if !got.Equal(first) {
+			t.Errorf("Window notBefore = %v after failed recompile, want the prior %v", got, first)
+		}
+	})
+}
+
+// goConditionTypes lists every condition type discriminator registered in Go.
+// This must be kept in sync with condition.go.
+// NOTE: redactFields is intentionally absent — it is a directive
+// (DirectiveTypeRedactFields), never a condition, and has no condition-type
+// constant.
+var goConditionTypes = []string{
+	ConditionTypeTimeWindow,
+	ConditionTypeIPRange,
+	ConditionTypeAllowedOperations,
+	ConditionTypeAllowedExtensions,
+	ConditionTypeAllowedTables,
+	ConditionTypeMaxCalls,
+	ConditionTypeRecipientDomain,
+	ConditionTypeAllowedValues,
+	ConditionTypeSequenceBlock,
+	ConditionTypePolicy,
+	ConditionTypeCustom,
+}
+
+// goDirectiveTypes lists every directive type discriminator registered in Go.
+// This must be kept in sync with directive.go.
+var goDirectiveTypes = []string{
+	DirectiveTypeRedactFields,
+}
+
+// TestConditionTypeConstantsValid verifies that each Go condition type constant
+// is a non-empty camelCase string and matches the JSON round-trip discriminator.
+func TestConditionTypeConstantsValid(t *testing.T) {
+	camelCase := regexp.MustCompile(`^[a-z][a-zA-Z0-9]+$`)
+	for _, ct := range goConditionTypes {
+		ct := ct
+		t.Run(ct, func(t *testing.T) {
+			if ct == "" {
+				t.Error("condition type constant is empty")
+			}
+			if !camelCase.MatchString(ct) {
+				t.Errorf("condition type %q is not camelCase", ct)
+			}
+
+			// Verify that newCondition can create an instance for this type.
+			cond := newCondition(ct)
+			if cond == nil {
+				t.Errorf("newCondition(%q) returned nil", ct)
+				return
+			}
+			if cond.ConditionType() != ct {
+				t.Errorf("ConditionType() = %q, want %q", cond.ConditionType(), ct)
+			}
+
+			// Verify that JSON round-trip preserves the discriminator.
+			data, err := json.Marshal(cond)
+			if err != nil {
+				t.Fatalf("json.Marshal: %v", err)
+			}
+			var envelope struct {
+				Type string `json:"type"`
+			}
+			if err := json.Unmarshal(data, &envelope); err != nil {
+				t.Fatalf("json.Unmarshal: %v", err)
+			}
+			if envelope.Type != ct {
+				t.Errorf("JSON type discriminator = %q, want %q", envelope.Type, ct)
+			}
+		})
+	}
+}
+
+// TestAllConditionTypesHaveHandlers checks that every condition type constant
+// exposed by the capability package can be JSON-marshalled with its discriminator
+// and round-tripped through ConditionWrapper unmarshalling without error. It does
+// not verify enforcement-engine handler registration; see enforcement_test.go for that.
+func TestAllConditionTypesHaveHandlers(t *testing.T) {
+	for _, ct := range goConditionTypes {
+		ct := ct
+		t.Run(ct, func(t *testing.T) {
+			cond := newCondition(ct)
+			if cond == nil {
+				t.Fatalf("newCondition(%q) returned nil", ct)
+			}
+			// Verifying condition type is registered: just ensure it round-trips.
+			data, err := json.Marshal(cond)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			var envelope struct {
+				Type string `json:"type"`
+			}
+			if err := json.Unmarshal(data, &envelope); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if envelope.Type != ct {
+				t.Errorf("got type %q, want %q", envelope.Type, ct)
+			}
+			// Marshal via ConditionWrapper to exercise full polymorphic path.
+			w := ConditionWrapper{Condition: cond}
+			wData, err := json.Marshal(w)
+			if err != nil {
+				t.Fatalf("marshal wrapper: %v", err)
+			}
+			var decoded ConditionWrapper
+			if err := json.Unmarshal(wData, &decoded); err != nil {
+				t.Fatalf("unmarshal wrapper: %v (%s)", err, ct)
+			}
+			if decoded.ConditionType() != ct {
+				t.Errorf("decoded type = %q, want %q", decoded.ConditionType(), ct)
+			}
+			_ = fmt.Sprintf("ok: %s", ct)
+		})
+	}
+}
+
+// TestDirectiveTypeConstantsValid verifies that each Go directive type constant
+// is a non-empty camelCase string and round-trips through DirectiveWrapper
+// marshaling/unmarshaling without error.
+func TestDirectiveTypeConstantsValid(t *testing.T) {
+	camelCase := regexp.MustCompile(`^[a-z][a-zA-Z0-9]+$`)
+	for _, dt := range goDirectiveTypes {
+		dt := dt
+		t.Run(dt, func(t *testing.T) {
+			if dt == "" {
+				t.Error("directive type constant is empty")
+			}
+			if !camelCase.MatchString(dt) {
+				t.Errorf("directive type %q is not camelCase", dt)
+			}
+			dir := newDirective(dt)
+			if dir == nil {
+				t.Fatalf("newDirective(%q) returned nil", dt)
+			}
+			if dir.DirectiveType() != dt {
+				t.Errorf("DirectiveType() = %q, want %q", dir.DirectiveType(), dt)
+			}
+			// Verify JSON round-trip via DirectiveWrapper.
+			w := DirectiveWrapper{Directive: dir}
+			data, err := json.Marshal(w)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			var decoded DirectiveWrapper
+			if err := json.Unmarshal(data, &decoded); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if decoded.DirectiveType() != dt {
+				t.Errorf("decoded type = %q, want %q", decoded.DirectiveType(), dt)
+			}
+			_ = fmt.Sprintf("ok: %s", dt)
+		})
+	}
+}
+
+// TestRedactFieldsInConditions_IsRejected verifies the migration hint:
+// a "redactFields" entry inside "conditions" must fail with a clear error.
+func TestRedactFieldsInConditions_IsRejected(t *testing.T) {
+	data := []byte(`{"type":"redactFields","fields":["ssn"]}`)
+	var w ConditionWrapper
+	err := json.Unmarshal(data, &w)
+	if err == nil {
+		t.Fatal("expected error for redactFields in conditions, got nil")
+	}
+	if !regexp.MustCompile(`directives`).MatchString(err.Error()) {
+		t.Errorf("expected migration hint mentioning 'directives', got: %v", err)
+	}
+}

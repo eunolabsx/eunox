@@ -1,0 +1,24 @@
+# yaml-language-server: $schema=../schemas/eunox-gateway-config.schema.json
+# demo/manifest-only.yaml — single-upstream demo config (manifest-only mode).
+#
+# One eunox process fronts one HTTP MCP upstream (mock-mcp-server),
+# governed by demo/manifest.yaml. Loaded by demo/docker-compose.yml (paired
+# with --unsafe-bind-all on the CLI to allow 0.0.0.0 inside the container).
+#
+# Used by `make -C demo up` and the manifest-only CI integration test.
+
+schemaVersion: "0.1"
+
+listen:
+  bind: 0.0.0.0          # container-internal; paired with --unsafe-bind-all on the CLI
+  port: 3000
+
+audit:
+  log: /audit/audit.jsonl
+  keyPath: /audit/audit.key
+
+upstreams:
+  - name: mock                           # → POST /mcp/mock
+    transport: http
+    upstreamUrl: http://mock-mcp-server:8080
+    policy: ["/demo/manifest.yaml"]

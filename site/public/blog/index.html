@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Blog · eunox</title>
+  <meta name="description"
+    content="Education and field notes on AI-agent security, capability-based policy, MCP enforcement, and the engineering behind eunox." />
+  <link rel="icon" href="../eunolabs.png" />
+  <link rel="stylesheet" href="../styles.css" />
+</head>
+
+<body>
+  <div id="site-header"></div>
+  <section class="hero hero-compact">
+    <div class="hero-eyebrow"><span class="dot"></span>Blog</div>
+    <h1>Agent security, <em>in depth</em></h1>
+    <p class="hero-sub">
+      Education and field notes on AI-agent security, capability-based policy,
+      MCP enforcement, and the engineering behind eunox.
+    </p>
+  </section>
+  <nav class="breadcrumbs" aria-label="Breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;›&nbsp; Blog
+  </nav>
+  <main class="content-section">
+    <div class="blog-list">
+      <a class="blog-card" href="../blog/21-blocking-the-lethal-trifecta/index.html">
+        <div class="blog-card-meta">
+          <time datetime="2026-06-25">25 June 2026</time>
+        </div>
+        <h2 class="blog-card-title">Blocking the lethal trifecta: the one attack only the MCP layer can stop</h2>
+        <p class="blog-card-desc">An agent with read-access to secrets, an exfiltration channel, and untrusted input is
+          the canonical agentic-AI attack. Each tool call is individually authorized — the danger is the sequence,
+          read_credentials → write_external, and eunox’s <code>sequenceBlock</code> condition is the only practical
+          place to break that chain.</p>
+        <span class="blog-card-read">Read →</span>
+      </a>
+      <a class="blog-card" href="../blog/20-from-observation-to-policy/index.html" style="display:none">
+        <div class="blog-card-meta">
+          <time datetime="2026-06-10">10 June 2026</time>
+        </div>
+        <h2 class="blog-card-title">From Observation to Policy: Drafting a Manifest From What Your Agent Actually Did
+        </h2>
+        <p class="blog-card-desc">The proxy is the easy part — the blank page where you write the first policy is the
+          real adoption cliff. <code>eunox suggest</code> reads the wiretap tape and drafts a manifest grounded in
+          observed usage, with allowedValues conditions built from the argument values the agent actually used.</p>
+        <span class="blog-card-read">Read →</span>
+      </a>
+      <a class="blog-card" href="../blog/19-one-proxy-many-upstreams/index.html" style="display:none">
+        <div class="blog-card-meta">
+          <time datetime="2026-06-24">24 June 2026</time>
+        </div>
+        <h2 class="blog-card-title">One Proxy, Many Upstreams: Governing Every MCP Server From a Single Gateway</h2>
+        <p class="blog-card-desc">Running one policy proxy per MCP server doesn’t scale past a couple of servers. The
+          gateway fronts every upstream from one process — each on its own route, with its own versioned manifest, all
+          writing to one signed audit tape.</p>
+        <span class="blog-card-read">Read →</span>
+      </a>
+      <a class="blog-card" href="../blog/01-prompt-injection-policy-layer/index.html">
+        <div class="blog-card-meta">
+          <time datetime="2026-06-04">4 June 2026</time>
+        </div>
+        <h2 class="blog-card-title">The prompt injection problem: why every AI agent needs a policy layer</h2>
+        <p class="blog-card-desc">Why fixing prompt injection inside the model doesn’t work, and why the only reliable
+          defense is a policy layer at the structured tool call.</p>
+        <span class="blog-card-read">Read →</span>
+      </a>
+    </div>
+  </main>
+  <div id="site-footer"></div>
+  <script src="../components.js"></script>
+  <script src="../main.js"></script>
+</body>
+
+</html>

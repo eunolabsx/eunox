@@ -1,0 +1,24 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/eunolabs/eunox/main/schemas/eunox-gateway-config.schema.json
+#
+# Starter eunox config for the Claude Desktop extension (.mcpb).
+#
+# Point the extension's "eunox config (eunox.yaml)" field at a COPY of this file
+# that you have edited — NOT at the .mcpb bundle you downloaded. The .mcpb is a
+# binary archive; pointing eunox at it makes it fail closed at startup ("looks
+# like a ZIP archive … not a text config").
+#
+# This starts in AUDIT (observe-only) mode: every call is forwarded and recorded, and
+# nothing is blocked — so you need no policy manifest to begin. Run the agent for
+# a session, inspect what it did with `eunox stats`, then add a `policy:` and
+# flip `enforcement: enforce` once you know what to allow.
+schemaVersion: "0.1"
+transport: stdio                       # speak MCP to Claude Desktop over stdin/stdout
+audit:
+  log: ~/.eunox/audit.jsonl            # set an absolute writable path if ~ is not writable
+upstreams:
+  - name: filesystem
+    transport: stdio
+    command: npx                       # use an absolute path (e.g. /opt/homebrew/bin/npx) if npx is not on Claude Desktop's PATH
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/absolute/path/to/allow"]
+    enforcement: audit                 # observe-only: forward + log, no policy required
+    # policy: ["/absolute/path/to/manifest.yaml"]   # add this and remove `enforcement: audit` to enforce

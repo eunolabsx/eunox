@@ -1,0 +1,87 @@
+# memory.yaml — reference policy for @modelcontextprotocol/server-memory
+#
+# The reference memory server is an in-process knowledge graph. The threat
+# model is mostly about *what the agent writes into it* — memory poisoning
+# (the agent records an attacker-supplied fact and then acts on it later)
+# is a real but currently underexplored failure mode.
+#
+# This policy is deliberately permissive: it allows every memory operation
+# and uses the audit log as the control. If your agent uses memory across
+# tasks or across users, narrow the writes — or front this server with a
+# JWT-scoped manifest where the issuing IdP tags `task_id` and you can
+# attribute every write.
+#
+# Threats addressed
+# -----------------
+#   1. Memory poisoning (agent records adversarial content as "fact").
+#      → not prevented; logged. Pair with a downstream LLM-judge over the
+#        audit tape, or — if you embed the engine as a Go library — a
+#        `policy:` condition on `add_observations` that calls your own
+#        evaluator (e.g. an OPA/Rego check) against your taxonomy. The stock
+#        binary ships no Rego interpreter, so a `policy:` condition is
+#        denied fail-closed unless an evaluator is wired in code.
+#   2. Runaway writes flooding the graph.
+#      → maxCalls on the mutator tools.
+#
+# Adapt
+# -----
+#   If your deployment uses memory for shared/team knowledge, tighten
+#   `delete_*` tools further — the default upstream lets the agent rewrite
+#   the graph silently.
+
+schemaVersion: "0.1"
+name: memory-policy
+version: "0.1.0"
+description: >
+  Knowledge-graph memory access. Reads unrestricted; writes rate-capped.
+  Audit log is the primary control — pair with a poisoning review.
+
+capabilities:
+  - target: tool:read_graph
+    actions: [call]
+  - target: tool:search_nodes
+    actions: [call]
+  - target: tool:open_nodes
+    actions: [call]
+
+  - target: tool:create_entities
+    actions: [call]
+    conditions:
+      - type: maxCalls
+        count: 200
+        windowSeconds: 3600
+
+  - target: tool:create_relations
+    actions: [call]
+    conditions:
+      - type: maxCalls
+        count: 200
+        windowSeconds: 3600
+
+  - target: tool:add_observations
+    actions: [call]
+    conditions:
+      - type: maxCalls
+        count: 500
+        windowSeconds: 3600
+
+  - target: tool:delete_entities
+    actions: [call]
+    conditions:
+      - type: maxCalls
+        count: 30
+        windowSeconds: 3600
+
+  - target: tool:delete_observations
+    actions: [call]
+    conditions:
+      - type: maxCalls
+        count: 50
+        windowSeconds: 3600
+
+  - target: tool:delete_relations
+    actions: [call]
+    conditions:
+      - type: maxCalls
+        count: 50
+        windowSeconds: 3600

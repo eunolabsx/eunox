@@ -1,0 +1,71 @@
+# Copyright 2026 Eunolabs, LLC
+# SPDX-License-Identifier: Apache-2.0
+#
+# Multi-arch Windows Dockerfile for eunox (windows/amd64, windows/arm64).
+# The builder stage uses a Linux image and Go cross-compilation so the image
+# can be produced from an Ubuntu CI runner without a Windows host.
+#
+# Usage (requires Docker with the containerd image store):
+#   docker buildx build --platform windows/amd64,windows/arm64 \
+#     -f deploy/docker/Dockerfile.mcp.windows -t eunolabs/eunox:latest-windows .
+
+# Declare TARGETARCH before the first FROM so it can be referenced in
+# subsequent FROM --platform flags.  BuildKit overrides it with the actual
+# target architecture when --platform is specified.
+ARG TARGETARCH=amd64
+
+# ── Build stage (Linux, cross-compile to Windows) ────────────────────────────
+# Pinned to the same patch release as go.mod and CI (go 1.26.4) so the released
+# image is built with the exact toolchain the binary was tested against.
+FROM --platform=linux/amd64 golang:1.26.4 AS builder
+
+ARG TARGETARCH=amd64
+ARG VERSION
+
+# Fail closed on an unset version. The builder stage is a Debian-based Linux
+# image (cross-compiling to Windows), so the guard runs under /bin/sh. A plain
+# `docker build` without `--build-arg VERSION=...` would otherwise stamp the
+# binary "0.0.0"; both supported build paths (`make docker-build-mcp` and
+# .github/workflows/release.yml) always pass it.
+RUN if [ -z "$VERSION" ] || [ "$VERSION" = "0.0.0" ]; then \
+    echo "VERSION must be passed via --build-arg (use make docker-build-mcp or release.yml)" >&2; \
+    exit 1; \
+    fi
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+
+# -buildvcs=false: no git history in the Docker build context.
+RUN CGO_ENABLED=0 GOOS=windows GOARCH=${TARGETARCH} \
+    go build \
+    -trimpath \
+    -buildvcs=false \
+    "-ldflags=-s -w -X main.version=${VERSION}" \
+    -o /out/mcp.exe \
+    ./cmd/eunox/
+
+# ── Final stage ───────────────────────────────────────────────────────────────
+# Explicitly request the Windows platform manifest so BuildKit (running on
+# Linux) does not try to resolve a linux/* variant of the base image.
+FROM --platform=windows/${TARGETARCH} mcr.microsoft.com/windows/nanoserver:ltsc2025
+
+COPY --from=builder /out/mcp.exe C:/app/mcp.exe
+
+# Apache-2.0 attribution: ship LICENSE + NOTICE alongside the binary (NOTICE is
+# required by Apache-2.0 section 4(d) wherever the binary is redistributed).
+COPY --from=builder /src/cmd/eunox/LICENSE C:/app/LICENSE
+COPY --from=builder /src/NOTICE C:/app/NOTICE
+
+LABEL org.opencontainers.image.source="https://github.com/eunolabs/eunox"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+LABEL org.opencontainers.image.vendor="Eunox"
+LABEL org.opencontainers.image.description="Eunox MCP capability enforcement proxy (Windows)"
+
+# Drop from the default admin context to the built-in unprivileged account, so
+# the proxy does not run with administrator rights (the distroless Linux image
+# already runs as a nonroot UID).
+USER ContainerUser
+
+ENTRYPOINT ["C:\\app\\mcp.exe"]

@@ -1,0 +1,17 @@
+# demo/e2e/policy-no-sampling.yaml — minimal manifest used for the sampling
+# DENY leg of the e2e suite.
+#
+# trigger_sampling is permitted (so the tool call reaches the upstream), but
+# there is NO `system:sampling/createMessage` opt-in, so the server-initiated
+# sampling/createMessage request the upstream emits is denied by the proxy and
+# never forwarded to the host. The upstream reflects that verdict back as
+# "sampling:denied", which the host asserts.
+
+schemaVersion: "0.1"
+name: e2e-policy-no-sampling
+version: "1.0.0"
+description: trigger_sampling allowed, sampling channel NOT opted in.
+
+capabilities:
+  - target: tool:trigger_sampling
+    actions: [call]

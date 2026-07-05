@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Reference policies · eunox</title>
+  <meta name="description"
+    content="Drop-in YAML policies for the most popular MCP servers — filesystem, Postgres, GitHub, Slack, fetch." />
+  <link rel="icon" href="../eunolabs.png" />
+  <link rel="stylesheet" href="../styles.css" />
+</head>
+
+<body>
+  <div id="site-header"></div>
+  <section class="hero hero-compact">
+    <div class="hero-eyebrow">
+      <span class="dot"></span>Reference policies
+    </div>
+    <h1>Drop-in YAML for <em>every popular MCP server</em></h1>
+    <p class="hero-sub">
+      Five ready-to-use policies you can copy into your repo and adapt today.
+      Each one is a sensible default — read it, adapt it, validate it.
+    </p>
+  </section>
+  <nav class="breadcrumbs" aria-label="Breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;›&nbsp; Reference policies
+  </nav>
+  <main class="content-section">
+    <p>
+      Use the examples below as starting points, adapt them to your repo, and
+      validate them with the Go-based CLI:
+    </p>
+    <pre><code>eunox validate ./eunox.policy.yaml
+# reference the policy from a route's `policy:` in eunox.yaml, then:
+eunox proxy --config ./eunox.yaml</code></pre>
+    <table>
+      <thead>
+        <tr>
+          <th>Policy</th>
+          <th>Upstream</th>
+          <th>What it enforces</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>
+            <a href="#filesystem"><code>filesystem.policy.yaml</code></a>
+          </td>
+          <td><code>@modelcontextprotocol/server-filesystem</code></td>
+          <td>
+            Writes &amp; deletes confined to <code>/data/</code>; executable
+            file types blocked.
+          </td>
+        </tr>
+        <tr>
+          <td>
+            <a href="#postgres"><code>postgres.policy.yaml</code></a>
+          </td>
+          <td><code>@modelcontextprotocol/server-postgres</code></td>
+          <td>
+            Non-<code>SELECT</code> SQL blocked; credential and audit tables
+            blocked.
+          </td>
+        </tr>
+        <tr>
+          <td>
+            <a href="#github"><code>github.policy.yaml</code></a>
+          </td>
+          <td><code>@modelcontextprotocol/server-github</code></td>
+          <td>Write tools rate-limited to prevent runaway automation.</td>
+        </tr>
+        <tr>
+          <td>
+            <a href="#slack"><code>slack.policy.yaml</code></a>
+          </td>
+          <td><code>@modelcontextprotocol/server-slack</code></td>
+          <td>
+            Direct messages restricted to your domain via
+            <code>recipientDomain</code>.
+          </td>
+        </tr>
+        <tr>
+          <td>
+            <a href="#fetch"><code>fetch.policy.yaml</code></a>
+          </td>
+          <td><code>mcp-server-fetch</code></td>
+          <td>
+            HTTP blocked; userinfo authority blocked; private RFC-1918 and
+            metadata endpoints blocked (lexical SSRF guard).
+          </td>
+        </tr>
+      </tbody>
+    </table>
+    <h2 id="filesystem">Filesystem</h2>
+    <p>
+      Stops the agent from reading sensitive file types and confines writes to
+      a sandbox directory. <code>argumentSchema</code> is a top-level field on
+      the constraint (not a condition); <code>maxCalls</code> uses
+      <code>count</code>.
+    </p>
+    <pre><code>schemaVersion: "0.1"
+name:    filesystem-agent
+version: 0.1.0
+
+capabilities:
+  - target: tool:read_file
+    actions: [call]
+    conditions:
+      - type: allowedExtensions
+        argument: path
+        extensions: [".csv", ".json", ".txt", ".md"]
+
+  - target: tool:write_file
+    actions: [call]
+    argumentSchema:
+      type: object
+      required: [path, content]
+      properties:
+        path:    { type: string, pattern: &quot;/data/.*&quot; }
+        content: { type: string }
+      additionalProperties: false
+    conditions:
+      - type: allowedExtensions
+        argument: path
+        extensions: [".csv", ".json", ".txt", ".md"]
+      - type: maxCalls
+        count: 100
+        windowSeconds: 60
+
+  - target: tool:list_directory
+    actions: [call]</code></pre>
+    <h2 id="postgres">Postgres</h2>
+    <p>
+      <code>SELECT</code>-only, with a per-session call cap. Table-level
+      protection comes from running the upstream under a read-only database
+      role — the proxy can't reliably pull table names out of free-form SQL,
+      so it doesn't try.
+    </p>
+    <pre><code>schemaVersion: "0.1"
+name:    postgres-agent
+version: 0.1.0
+
+capabilities:
+  - target: tool:query
+    actions: [call]
+    conditions:
+      - type: allowedOperations
+        argument: sql
+        operations: [SELECT, EXPLAIN, SHOW]
+      - type: maxCalls
+        count: 100
+        windowSeconds: 60</code></pre>
+    <h2 id="github">GitHub</h2>
+    <p>
+      Read-heavy, write-rate-limited — protects against runaway issue or PR
+      creation.
+    </p>
+    <pre><code>schemaVersion: "0.1"
+name:    github-agent
+version: 0.1.0
+
+capabilities:
+  - target: tool:search_repositories
+    actions: [call]
+  - target: tool:get_file_contents
+    actions: [call]
+
+  - target: tool:create_issue
+    actions: [call]
+    conditions:
+      - type: maxCalls
+        count: 10
+        windowSeconds: 3600
+
+  - target: tool:create_pull_request
+    actions: [call]
+    conditions:
+      - type: maxCalls
+        count: 5
+        windowSeconds: 3600</code></pre>
+    <h2 id="slack">Slack</h2>
+    <p>
+      Restricts DMs to your own domain — a single
+      <code>recipientDomain</code> condition stops agents from leaking
+      conversations. Channel posting (<code>post_message</code>) addresses
+      Slack channel IDs (e.g. <code>C12345</code>), so a domain gate doesn't
+      apply there.
+    </p>
+    <pre><code>schemaVersion: "0.1"
+name:    slack-agent
+version: 0.1.0
+
+capabilities:
+  - target: tool:send_dm
+    actions: [call]
+    conditions:
+      - type: recipientDomain
+        argument: to
+        domains: [company.com]
+      - type: maxCalls
+        count: 20
+        windowSeconds: 3600
+
+  - target: tool:post_message
+    actions: [call]
+    conditions:
+      - type: maxCalls
+        count: 50
+        windowSeconds: 3600</code></pre>
+    <h2 id="fetch">Fetch — lexical SSRF guard</h2>
+    <p>
+      Blocks <code>http://</code>, userinfo authorities, and any bare IP-literal
+      host by only allowing a dotted DNS hostname — covering the private
+      RFC-1918 ranges and the cloud metadata endpoint
+      <code>169.254.169.254</code> along with every other raw IP. The guard is
+      implemented purely with <code>argumentSchema</code> + <code>maxCalls</code>
+      — no custom condition module required. Read it as a
+      <em>defense-in-depth</em> guard rather than a complete SSRF solution —
+      pair with network-level controls in production.
+    </p>
+    <pre><code>schemaVersion: "0.1"
+name:    fetch-agent
+version: 0.1.0
+
+capabilities:
+  - target: tool:fetch
+    actions: [call]
+    argumentSchema:
+      type: object
+      required: [url]
+      additionalProperties: false
+      properties:
+        url:
+          type: string
+          # https-only, DNS-hostname allow-list. Go's regexp (RE2) has no
+          # lookahead, so this blocks by shape instead of enumerating bad
+          # prefixes: the host must be a dotted name ending in an alphabetic
+          # label, which structurally excludes bare IPv4/IPv6 literals
+          # (including the 169.254.169.254 metadata endpoint) and userinfo
+          # (user@host). It does not resolve hostnames, so a private name
+          # that resolves to an internal address is not caught here — pair
+          # with network egress controls for that.
+          pattern: '^https://(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}(?::\d{1,5})?(?:/\S*)?$'
+        method:
+          type: string
+          enum: [GET, HEAD, OPTIONS]
+    conditions:
+      - type: maxCalls
+        count: 60
+        windowSeconds: 60</code></pre>
+    <div class="callout">
+      <strong>Fail-closed by default.</strong> Absent entries are
+      <em>denied</em> for every enforced MCP method — <code>tools/call</code>,
+      <code>resources/read</code>, <code>prompts/get</code>,
+      <code>sampling/createMessage</code>, and unrecognized methods. Only
+      capabilities explicitly listed in the manifest are permitted.
+    </div>
+    <p style="margin-top: 32px">
+      <a href="../quickstart/index.html" class="btn-primary" style="text-decoration: none">Try one in 60 seconds →</a>
+      &nbsp;
+      <a href="https://github.com/eunolabs/eunox/blob/main/docs/capability-manifest-guide.md" target="_blank"
+        rel="noopener noreferrer" class="btn-ghost"
+        style="text-decoration: none; color: #6d28d9; border-color: #a78bfa">Manifest guide</a>
+    </p>
+  </main>
+  <div id="site-footer"></div>
+  <script src="../components.js"></script>
+  <script src="../main.js"></script>
+</body>
+
+</html>

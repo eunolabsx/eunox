@@ -1,0 +1,23 @@
+# yaml-language-server: $schema=../../schemas/eunox-gateway-config.schema.json
+# demo/opa-comparison/eunox.yaml — single-upstream config for the OPA
+# comparison harness.
+#
+# The harness swaps the active manifest per test by setting EUNOX_MANIFEST
+# (e.g. EUNOX_MANIFEST=token-reuse.yaml). The config supports ${VAR}
+# expansion, so the value is interpolated at load time — no per-test
+# config file is needed. Loaded by demo/opa-comparison/docker-compose.yml.
+
+schemaVersion: "0.1"
+
+listen:
+  bind: 0.0.0.0
+  port: 3000
+
+audit:
+  log: /audit/audit.jsonl
+
+upstreams:
+  - name: mock
+    transport: http
+    upstreamUrl: http://server:9090
+    policy: ["/manifests/${EUNOX_MANIFEST}"]

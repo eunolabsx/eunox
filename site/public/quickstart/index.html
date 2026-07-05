@@ -1,0 +1,472 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Quick start · eunox</title>
+  <meta name="description"
+    content="Run eunox in 60 seconds. Drop-in setup for Claude Desktop, Cursor, Windsurf, Go services, and any HTTP MCP client." />
+  <link rel="icon" href="../eunolabs.png" />
+  <link rel="stylesheet" href="../styles.css" />
+</head>
+
+<body>
+  <div id="site-header"></div>
+  <section class="hero hero-compact">
+    <div class="hero-eyebrow"><span class="dot"></span>Quick start</div>
+    <h1>Ship a governed agent <em>in 60 seconds</em></h1>
+    <p class="hero-sub">
+      Start with one line — no config — to observe what your agent calls. Then
+      graduate to a YAML policy when you're ready to enforce. The Go-based
+      proxy runs locally, wraps any MCP server, and writes a tamper-evident
+      audit tape on the way.
+    </p>
+    <div aria-live="polite" aria-atomic="true" id="copy-announce" class="sr-only"></div>
+    <button class="install-snippet" aria-label="Copy wiretap command">
+      <span class="prompt" aria-hidden="true">$</span>
+      <span class="cmd">eunox proxy --audit -- npx -y @modelcontextprotocol/server-filesystem /data</span>
+      <span class="copy-btn" aria-hidden="true">copy</span>
+    </button>
+  </section>
+  <nav class="breadcrumbs" aria-label="Breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;›&nbsp; Quick start
+  </nav>
+  <main class="content-section">
+    <div class="page-toc" aria-label="On this page">
+      <h4>On this page</h4>
+      <ul>
+        <li><a href="#prereqs">Prerequisites</a></li>
+        <li><a href="#step-1">Install</a></li>
+        <li><a href="#step-0-wiretap">Wiretap (zero-config)</a></li>
+        <li><a href="#step-2">Author a policy</a></li>
+        <li><a href="#step-3">Validate the policy</a></li>
+        <li><a href="#step-4">Run the proxy</a></li>
+        <li><a href="#step-5">Try it from a host</a></li>
+        <li><a href="#step-6">Inspect the audit log</a></li>
+        <li><a href="#claude">Claude Desktop / Cursor / Windsurf</a></li>
+        <li><a href="#mcpb">Desktop Extension (.mcpb)</a></li>
+        <li><a href="#http">HTTP transport · any MCP client</a></li>
+        <li><a href="#gateway">Gateway · many upstreams</a></li>
+        <li><a href="#redis">Redis · shared state</a></li>
+        <li><a href="#go-sdk">Go SDK embedding</a></li>
+        <li><a href="#next">Next steps</a></li>
+      </ul>
+    </div>
+    <h2 id="prereqs">Prerequisites</h2>
+    <ul>
+      <li>
+        The <code>eunox</code> binary on your <code>PATH</code> — install
+        it via Homebrew, winget, Docker, a native package, or
+        <code>go install</code> (<a href="#step-1">step 1</a>). No Go toolchain
+        is required unless you build from source.
+      </li>
+      <li>
+        An MCP host:
+        <a href="https://claude.ai/download" target="_blank" rel="noopener noreferrer">Claude Desktop</a>,
+        <a href="https://cursor.com/" target="_blank" rel="noopener noreferrer">Cursor</a>,
+        <a href="https://windsurf.com/" target="_blank" rel="noopener noreferrer">Windsurf</a>, or any agent that speaks
+        <a href="https://modelcontextprotocol.io/specification" target="_blank" rel="noopener noreferrer">MCP</a>
+      </li>
+      <li>
+        An upstream MCP server you want to govern (for example
+        <code>@modelcontextprotocol/server-filesystem</code>)
+      </li>
+    </ul>
+    <div class="callout">
+      <strong>License.</strong> <code>eunox</code> and its supporting Go
+      packages (<code>pkg/capability</code>, <code>pkg/enforcement</code>,
+      <code>pkg/callcounter</code>, <code>pkg/killswitch</code>, and more) are
+      Apache-2.0 — free to use, embed, and redistribute. See
+      <a href="https://github.com/eunolabs/eunox/blob/main/LICENSE" target="_blank"
+        rel="noopener noreferrer">LICENSE</a>
+      for details.
+    </div>
+    <h2 id="step-1">1. Install</h2>
+    <p>
+      Install the <code>eunox</code> binary with your platform's package
+      manager, pull the container image, or grab a pre-built binary. Every
+      release is signed with
+      <a href="https://www.sigstore.dev/" target="_blank" rel="noopener noreferrer">Sigstore</a>
+      keyless signing and ships with an SPDX SBOM per artifact — see
+      <a href="https://github.com/eunolabs/eunox/blob/main/SECURITY.md#verifying-a-release" target="_blank"
+        rel="noopener noreferrer">Verifying a release</a>
+      for the <code>cosign</code> commands.
+    </p>
+    <h3>macOS / Linux — Homebrew</h3>
+    <pre><code>brew install eunolabs/tap/eunox</code></pre>
+    <h3>Windows — winget</h3>
+    <pre><code>winget install eunolabs.eunox</code></pre>
+    <h3>Docker</h3>
+    <pre><code>docker pull ghcr.io/eunolabs/eunox:latest</code></pre>
+    <h3>
+      Debian / Ubuntu (<code>.deb</code>) · Fedora / RHEL (<code>.rpm</code>) ·
+      pre-built binaries
+    </h3>
+    <p>
+      Native packages and pre-built binaries for every supported platform are
+      attached to each
+      <a href="https://github.com/eunolabs/eunox/releases/latest" target="_blank" rel="noopener noreferrer">GitHub
+        release</a>. Pick the asset that matches your OS and architecture and install with
+      <code>dpkg -i</code>, <code>rpm -i</code>, or unpack the tarball onto
+      your <code>PATH</code>:
+    </p>
+    <pre><code># macOS / Linux — release assets carry the version in their name, so resolve
+# the latest tag first, then download for your OS/ARCH. Pre-built binaries are
+# published for darwin/arm64 (Apple Silicon) and linux/amd64|arm64 only — no
+# darwin/amd64 (Intel Mac) asset exists; use Homebrew or source install instead.
+os=$(uname -s | tr '[:upper:]' '[:lower:]')
+arch=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+if [ "$os" = "darwin" ] && [ "$arch" = "amd64" ]; then
+  echo "No darwin/amd64 release asset is published for Intel Macs." >&2
+  echo "Use 'brew install eunolabs/tap/eunox' or the from-source install below." >&2
+else
+  ver=$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+    https://github.com/eunolabs/eunox/releases/latest | sed 's#.*/tag/v##')
+  curl -sSL "https://github.com/eunolabs/eunox/releases/download/v${ver}/eunox_${ver}_${os}_${arch}.tar.gz" \
+    | tar -xz eunox
+  chmod +x eunox
+  sudo mv eunox /usr/local/bin/
+fi</code></pre>
+    <h3>From source (Go 1.26.4+)</h3>
+    <pre><code>go install github.com/eunolabs/eunox/cmd/eunox@latest</code></pre>
+    <p>
+      However you installed it, confirm the binary is on your
+      <code>PATH</code>:
+    </p>
+    <pre><code>eunox version</code></pre>
+    <h2 id="step-0-wiretap">Wiretap — zero-config observation</h2>
+    <p>
+      Before writing a policy, see what your agent actually calls. Front any
+      MCP server with <code>--audit</code> — no config file, no manifest.
+      Every call is forwarded, every call is recorded to
+      <code>~/.eunox/audit.jsonl</code> with full arguments and an HMAC
+      signature.
+    </p>
+    <pre><code># wrap any stdio subprocess MCP server
+eunox proxy --audit -- npx -y @modelcontextprotocol/server-filesystem /data
+
+# or a remote MCP HTTP server
+eunox proxy --audit --upstream-url https://mcp.example.com
+
+# point your MCP host at the command above, use the agent for a while, then:
+eunox stats</code></pre>
+    <p>
+      <code>eunox stats</code> prints a per-tool histogram split into
+      <strong>BLOCKED</strong> (none — wiretap blocks nothing) and
+      <strong>OBSERVED</strong> (would-be denials if you had a policy), so
+      the call patterns and argument shapes guide your first manifest. When
+      you're ready to enforce, step 2 turns that tape straight into a draft
+      policy.
+    </p>
+    <h2 id="step-2">2. Author a policy</h2>
+    <p>
+      A policy is a single YAML file describing which tools are allowed and
+      the conditions on each call. You don't have to write it from a blank
+      page — <code>eunox suggest</code> reads the wiretap tape and drafts
+      one for you, grounded in what the agent actually did:
+    </p>
+    <pre><code>eunox suggest --output eunox.policy.yaml</code></pre>
+    <p>
+      It emits one entry per observed target and, for tool arguments seen with
+      a bounded set of string values, an <code>allowedValues</code> condition
+      listing those values (with a commented glob hint when they share a
+      directory prefix). The sensitive sampling opt-in is always left
+      commented out, and anything seen only as a denial is listed commented so
+      regenerating never silently widens access. The output is a
+      <strong>draft describing observed usage, not vetted policy</strong> —
+      review and tighten every entry before enforcing.
+    </p>
+    <p>
+      A hand-written policy has the same shape. Save the following as
+      <code>eunox.policy.yaml</code> to see the anatomy:
+    </p>
+    <pre><code>schemaVersion: "0.1"
+name:    filesystem-agent
+version: 0.1.0
+
+capabilities:
+  - target: tool:read_file      # "tool:" prefix required
+    actions: [call]
+    conditions:
+      - type: allowedExtensions
+        argument: path
+        extensions: [".csv", ".json", ".txt", ".md"]
+      - type: maxCalls
+        count: 50
+        windowSeconds: 60
+
+  - target: tool:list_directory
+    actions: [call]
+</code></pre>
+    <p>
+      The manifest format follows the
+      <a href="https://github.com/eunolabs/mcp-capability-manifest/blob/main/SPEC.md" target="_blank"
+        rel="noopener noreferrer">MCP Capability Manifest Specification</a>. The Go implementation tracks the spec
+      exactly — there is one shape
+      shared across <code>pkg/capability</code>, <code>pkg/enforcement</code>,
+      and <code>eunox</code> with no drift.
+    </p>
+    <h2 id="step-3">3. Validate the policy</h2>
+    <pre><code>eunox validate ./eunox.policy.yaml</code></pre>
+    <p>
+      Validation runs without contacting any server and rejects unknown
+      condition types and malformed YAML up front.
+    </p>
+    <h2 id="step-4">4. Run the proxy</h2>
+    <p>
+      Declare the upstream in an <code>eunox.yaml</code> and point the proxy at
+      it:
+    </p>
+    <pre><code>schemaVersion: "0.1"
+transport: stdio
+upstreams:
+  - name: filesystem
+    transport: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/data"]
+    policy: ["./eunox.policy.yaml"]
+</code></pre>
+    <pre><code>eunox proxy --config ./eunox.yaml</code></pre>
+    <p>
+      The proxy speaks MCP on stdio in both directions and is transparent to
+      clients. (<code>eunox init --upstream-url &lt;url&gt; --output
+        eunox.policy.yaml --config-output eunox.yaml</code> scaffolds both files
+      from a live server.)
+    </p>
+    <h2 id="step-5">5. Try it from a host</h2>
+    <p>
+      Point your MCP host (or any client) at the proxy command above. From
+      <a href="#claude">Claude Desktop</a>, attempt to read
+      <code>/data/keys.pem</code> — the proxy denies it before the upstream is
+      contacted, and the agent receives a structured
+      <code>CapabilityDenied</code> error.
+    </p>
+    <h2 id="step-6">6. Inspect the audit log</h2>
+    <p>
+      Every decision — allow or deny — is recorded as a signed OCSF API
+      Activity event:
+    </p>
+    <pre><code>tail -F ~/.eunox/audit.jsonl | jq</code></pre>
+    <p>For aggregated denial counts, run:</p>
+    <pre><code>eunox stats</code></pre>
+    <p>
+      This prints an ASCII histogram grouped by condition type and denial
+      code, including rotated log files.
+    </p>
+    <h2 id="claude">Claude Desktop / Cursor / Windsurf</h2>
+    <p>
+      Add the proxy as an <code>mcpServers</code> entry in
+      <code>claude_desktop_config.json</code> (or the equivalent file for
+      Cursor / Windsurf):
+    </p>
+    <pre><code>{
+  "mcpServers": {
+    "filesystem-governed": {
+      "command": "eunox",
+      "args": ["proxy", "--config", "/absolute/path/to/eunox.yaml"]
+    }
+  }
+}</code></pre>
+    <p>
+      Omit a route's <code>policy:</code> (or set <code>enforcement: audit</code>)
+      — handy for capturing an audit trail before you write any rules.
+    </p>
+    <h3 id="mcpb">Desktop Extension (.mcpb) — one-click install</h3>
+    <p>
+      Claude Desktop can also install eunox as a signed
+      <strong>Desktop Extension</strong>: a <code>.mcpb</code> bundle that
+      ships the static binary and registers it through the UI, with no
+      <code>claude_desktop_config.json</code> editing. eunox is one static
+      binary, so it packs as a <code>binary</code>-type bundle (one per
+      platform).
+    </p>
+    <ol>
+      <li>
+        <strong>Download</strong> the bundle for your platform —
+        <code>eunox_&lt;version&gt;_&lt;os&gt;_&lt;arch&gt;.mcpb</code> —
+        from the
+        <a href="https://github.com/eunolabs/eunox/releases/latest" target="_blank" rel="noopener noreferrer">latest
+          release</a>. Optionally verify it like any other release artifact: the
+        <code>.mcpb</code> hashes live in the release's single
+        <code>checksums.txt</code> (covered by one Sigstore signature), and
+        each bundle ships an SPDX SBOM and a SLSA build-provenance
+        attestation.
+      </li>
+      <li>
+        <strong>Install</strong> it in Claude Desktop under
+        <strong>Settings → Extensions → Advanced settings → Install
+          Extension…</strong>
+        and select the <code>.mcpb</code>.
+      </li>
+      <li>
+        <strong>Configure</strong> the <strong>eunox config (eunox.yaml)</strong>
+        prompt with the absolute path to <strong>your <code>eunox.yaml</code>,
+          not the <code>.mcpb</code> bundle you just downloaded</strong>. No config
+        yet? Scaffold one from a live server with
+        <code>eunox init --upstream-url &lt;url&gt; --output
+            eunox.policy.yaml --config-output eunox.yaml</code>, or copy the observe-only starter at
+        <a href="https://github.com/eunolabs/eunox/blob/main/examples/eunox.example.yaml" target="_blank"
+          rel="noopener noreferrer"><code>examples/eunox.example.yaml</code></a>.
+      </li>
+    </ol>
+    <div class="callout warn">
+      <strong>Don't select the <code>.mcpb</code> here.</strong> A
+      <code>.mcpb</code> is a binary archive, not a config. Pointing the config
+      field at it makes eunox fail closed at startup (it reports the file "looks
+      like a ZIP archive … not a text config"), so the extension serves no
+      tools — pick your <code>eunox.yaml</code> instead.
+    </div>
+    <p>
+      The extension launches eunox in enforce mode
+      (<code>proxy --config &lt;your eunox.yaml&gt;</code>), so the tool list
+      Claude sees is already filtered by your manifest. A
+      <code>transport: stdio</code> upstream is launched as a subprocess, so
+      its runtime (<code>npx</code> / <code>uvx</code> / <code>python</code>)
+      must be reachable on Claude Desktop's <code>PATH</code> — use an
+      absolute command path, or a <code>transport: http</code> upstream, if it
+      fails to start. The full per-client walkthrough lives in the
+      <a href="https://github.com/eunolabs/eunox/blob/main/docs/client-integration.md#desktop-extension-mcpb"
+        target="_blank" rel="noopener noreferrer">client-integration guide</a>.
+    </p>
+    <h2 id="http">HTTP transport · any MCP client</h2>
+    <p>
+      For agents that connect over HTTP rather than stdio, set the host
+      transport to <code>http</code> in the config:
+    </p>
+    <pre><code>schemaVersion: "0.1"
+transport: http
+listen: { bind: 127.0.0.1, port: 7391 }
+upstreams:
+  - name: local
+    transport: stdio
+    command: ./my-mcp-server
+    policy: ["./eunox.policy.yaml"]
+</code></pre>
+    <pre><code>eunox proxy --config ./eunox.yaml</code></pre>
+    <p>
+      Connect your client to <code>http://127.0.0.1:7391/mcp/local</code>. The
+      same policy file works on both transports — and
+      <code>ipRange</code> conditions become enforceable here.
+    </p>
+    <h2 id="gateway">Gateway · many upstreams, one process</h2>
+    <p>
+      The recommended HTTP shape is the <strong>gateway</strong>: one process
+      fronting every MCP server you use, each on its own
+      <code>/mcp/&lt;name&gt;</code> route with its own versioned manifest, all
+      sharing one signed audit tape. Declare the upstreams in a config:
+    </p>
+    <pre><code>schemaVersion: "0.1"
+upstreams:
+  - name: filesystem            # → /mcp/filesystem
+    transport: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/data"]
+    policy: ["./policies/filesystem.yaml"]
+    expectVersion: "0.1.0"      # fail closed if the manifest version differs
+  - name: stripe                # → /mcp/stripe
+    transport: http
+    upstreamUrl: https://mcp.stripe.com
+    policy: ["./policies/stripe.yaml"]</code></pre>
+    <pre><code>eunox proxy --config gateway.yaml
+</code></pre>
+    <p>
+      Every audit record is stamped with the <code>upstream</code>,
+      <code>policy_version</code>, and a <code>policy_sha256</code> digest. A
+      single remote upstream is just a gateway with one route.
+    </p>
+    <p>
+      Two things worth knowing before you copy this: <code>expectVersion</code>
+      pins a <strong>single</strong> manifest file (merge a multi-file policy
+      first), and a route with no <code>policy:</code> at all makes the gateway
+      <strong>refuse to start</strong> — it fails closed at startup naming the
+      unprotected upstream, unless that route explicitly declares
+      <code>enforcement: audit</code> to acknowledge observe-only mode. Put secrets in the environment
+      and reference them with <code>${VAR}</code>; a literal <code>$</code> in a
+      token is preserved, not eaten by expansion.
+    </p>
+    <h2 id="redis">Redis — shared state across instances</h2>
+    <p>
+      The <code>maxCalls</code> rate limit in the policy above keeps its
+      counters in-process by default — one set per proxy, reset when the proxy
+      restarts. The same is true of the kill switch. That is exactly right for
+      a single proxy, a developer laptop, or CI, and needs no setup. But run
+      <strong>more than one</strong> proxy instance behind a load balancer, or
+      require counters and revocations to survive a restart, and that
+      per-process state has to live somewhere shared. Point the proxy at
+      Redis:
+    </p>
+    <pre><code>eunox proxy \
+  --config ./eunox.yaml \
+  --redis-addr localhost:6379     # add --redis-password / --redis-tls if your Redis needs them</code></pre>
+    <p>
+      With <code>--redis-addr</code> set, every instance reads and writes the
+      same call-counter and kill-switch state: a <code>maxCalls</code> quota is
+      enforced across the whole fleet, and an <code>eunox kill</code>
+      revocation reaches every instance. Nothing else changes — same policy,
+      same audit tape, same transports. Redis is the proxy's only optional
+      runtime dependency; leave it off and everything still works, just
+      per-process. (A policy that uses <code>maxCalls</code> without
+      <code>--redis-addr</code> prints a startup notice to that effect.)
+    </p>
+    <p>
+      For the production trade-offs — how the kill switch fails
+      <strong>closed</strong> during a Redis outage, and
+      <code>--killswitch-fail-open</code> if you would rather keep the data
+      plane available — see the
+      <a href="../deploy/index.html#redis">deployment guide</a>.
+    </p>
+    <h2 id="go-sdk">Go packages — in-process embedding</h2>
+    <p>
+      If your agent runtime already runs in Go and you do not want a separate
+      proxy process, reuse the same manifest and enforcement primitives
+      directly:
+    </p>
+    <ul>
+      <li>
+        <a href="https://github.com/eunolabs/eunox/tree/main/pkg/capability" target="_blank"
+          rel="noopener noreferrer"><code>pkg/capability</code></a>
+        — manifest and condition types (Apache-2.0).
+      </li>
+      <li>
+        <a href="https://github.com/eunolabs/eunox/tree/main/pkg/enforcement" target="_blank"
+          rel="noopener noreferrer"><code>pkg/enforcement</code></a>
+        — enforcement engine and decision flow (Apache-2.0).
+      </li>
+      <li>
+        <a href="https://github.com/eunolabs/eunox/tree/main/pkg/callcounter" target="_blank"
+          rel="noopener noreferrer"><code>pkg/callcounter</code></a>
+        — per-session rate-limit counters (Apache-2.0).
+      </li>
+    </ul>
+    <p>
+      Same YAML policy model, same conditions, same audit semantics — evaluate
+      a manifest in-process without any proxy hop.
+    </p>
+    <h2 id="next">Next steps</h2>
+    <ul>
+      <li>
+        Drop in a ready-made policy from the
+        <a href="../policies/index.html">reference policies</a> page.
+      </li>
+      <li>
+        Browse the <a href="../features/index.html">full condition matrix</a> with worked
+        demos for each.
+      </li>
+      <li>
+        Read
+        <a href="../how-it-works/index.html">how the proxy enforces policy</a> end-to-end.
+      </li>
+      <li>
+        Explore the source on
+        <a href="https://github.com/eunolabs/eunox" target="_blank" rel="noopener noreferrer">GitHub</a>
+        — issues and PRs welcome.
+      </li>
+    </ul>
+  </main>
+  <div id="site-footer"></div>
+  <script src="../components.js"></script>
+  <script src="../main.js"></script>
+</body>
+
+</html>

@@ -1,0 +1,26 @@
+# Copyright 2026 Eunolabs, LLC
+# SPDX-License-Identifier: Apache-2.0
+#
+# Scenario 3 — Short-lived cloud token reuse
+#
+# Each cloud-token tool is limited to a single call per hour.  A legitimate
+# agent requests the token once; a misbehaving or compromised agent cannot
+# accumulate a pool of live credentials by looping.
+schemaVersion: "0.1"
+name: opa-comparison-token-reuse
+version: "0.1.0"
+
+capabilities:
+  - target: tool:get_aws_token
+    actions: [call]
+    conditions:
+      - type: maxCalls
+        count: 1
+        windowSeconds: 3600
+
+  - target: tool:get_github_token
+    actions: [call]
+    conditions:
+      - type: maxCalls
+        count: 1
+        windowSeconds: 3600

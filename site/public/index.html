@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>eunox — Policy Proxy for AI Agents</title>
+    <meta
+      name="description"
+      content="Go-based MCP policy proxy. One YAML file enforces what every AI agent is allowed to do — before the tool call reaches your backend. Drop-in. eunox Apache-2.0."
+    />
+    <link rel="icon" href="eunolabs.png" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="site-header"></div>
+    <section class="waitlist">
+      <div class="waitlist-inner">
+        <div class="hero-eyebrow">
+          <span class="dot"></span>Coming soon · open source · Apache-2.0
+        </div>
+        <h1>A capability firewall for <em>AI agents</em></h1>
+        <p class="waitlist-sub">
+          The capability-enforcement layer MCP left out. Your IdP says
+          <strong>who you are</strong>; eunox says <strong>which tool calls,
+          with which arguments, in which order</strong> — one YAML file,
+          enforced <strong>before</strong> the call ever runs. Drop-in,
+          Go-based, no infrastructure — and no telemetry: it never phones
+          home.
+        </p>
+        <form class="waitlist-form" id="waitlist-form" novalidate>
+          <label class="sr-only" for="waitlist-email">Email address</label>
+          <input
+            id="waitlist-email"
+            name="email"
+            type="email"
+            required
+            autocomplete="email"
+            placeholder="you@company.com"
+          />
+          <button type="submit">Notify me at launch</button>
+        </form>
+        <p
+          class="waitlist-note"
+          id="waitlist-status"
+          role="status"
+          aria-live="polite"
+        >
+          No spam. One email when it launches.
+        </p>
+      </div>
+    </section>
+    <section class="demo-section" id="demo">
+      <div class="demo-inner">
+        <div class="demo-header">
+          <div class="section-label">Sneak peek</div>
+          <h2 class="section-title">Three ways eunox enforces — swipe through</h2>
+          <p class="section-desc">
+            The controls at the core of the MVP: session-aware blocking with
+            response masking, a tamper-evident audit trail, and per-call rate
+            &amp; argument limits. Each call is authorized on its own — eunox
+            blocks the <strong>combination</strong> no database role or API
+            gateway can see. <strong>A preview of what’s launching.</strong>
+          </p>
+        </div>
+        <div class="demo-carousel" data-demo-carousel role="group" aria-roledescription="carousel" aria-label="Three ways eunox enforces">
+          <button class="demo-nav demo-prev" type="button" aria-label="Previous demo" aria-controls="demo-track">
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M15 5l-7 7 7 7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+          </button>
+          <div class="demo-viewport">
+            <div class="demo-track" id="demo-track">
+              <article class="demo-slide" data-render="term-body" role="group" aria-roledescription="slide" aria-label="1 of 3: block the kill-chain and mask the leak">
+                <div class="demo-slide-head">
+                  <h3 class="demo-slide-title">Block the kill-chain, mask the leak</h3>
+                  <p class="demo-slide-desc">
+                    <code class="kbd">sequenceBlock</code> denies an external
+                    write once secrets were read this session;
+                    <code class="kbd">redactFields</code> masks sensitive values
+                    in whatever does come back — the key stays, the value becomes
+                    <code class="kbd">"[redacted]"</code>.
+                  </p>
+                </div>
+                <div class="demo-layout">
+                  <div class="code-panel" role="img" aria-label="Policy file eunox.policy.yaml: read_credentials may be called; write_external may be called only when read_credentials has not run this session, enforced by a sequenceBlock condition; query_db is allowed but a redactFields directive masks the ssn and email fields in its response.">
+                    <div class="code-bar">
+                      <span class="code-icon">📄</span>
+                      <span class="code-filename">eunox.policy.yaml</span>
+                    </div>
+                    <div class="code-body">
+                      <pre><span class="y-key">schemaVersion</span>: <span class="y-str">"0.1"</span>
+<span class="y-key">name</span>: <span class="y-str">dev-agent</span>
+<span class="y-key">version</span>: <span class="y-str">"0.1.0"</span>
+
+<span class="y-key">capabilities</span>:
+  <span class="y-comment"># The agent may read secrets — that’s its job.</span>
+  - <span class="y-key">target</span>: <span class="y-str">tool:read_credentials</span>
+    <span class="y-key">actions</span>: [<span class="y-str">call</span>]
+
+  <span class="y-comment"># External writes are fine — but NOT after</span>
+  <span class="y-comment"># credentials were read this session.</span>
+  - <span class="y-key">target</span>: <span class="y-str">tool:write_external</span>
+    <span class="y-key">actions</span>: [<span class="y-str">call</span>]
+    <span class="y-key">conditions</span>:
+      - <span class="y-key">type</span>: <span class="y-str">sequenceBlock</span>
+        <span class="y-key">afterTools</span>: [<span class="y-str">read_credentials</span>]
+
+  <span class="y-comment"># Reads are allowed — but PII is masked on the</span>
+  <span class="y-comment"># way back, before the agent ever sees it.</span>
+  - <span class="y-key">target</span>: <span class="y-str">tool:query_db</span>
+    <span class="y-key">actions</span>: [<span class="y-str">call</span>]
+    <span class="y-key">directives</span>:
+      - <span class="y-key">type</span>: <span class="y-str">redactFields</span>
+        <span class="y-key">fields</span>: [<span class="y-str">"ssn"</span>, <span class="y-str">"email"</span>]</pre>
+                    </div>
+                  </div>
+                  <div class="terminal" id="term" role="img" aria-label="Animated terminal: eunox allows the agent's read_credentials call, then denies write_external via the sequenceBlock policy, blocking the credential-exfiltration kill-chain before the upstream is contacted.">
+                    <div class="terminal-bar">
+                      <div class="terminal-dot red"></div>
+                      <div class="terminal-dot amber"></div>
+                      <div class="terminal-dot green"></div>
+                      <span class="terminal-title">eunox proxy</span>
+                    </div>
+                    <div class="terminal-body" id="term-body"></div>
+                  </div>
+                </div>
+                <div class="redact-strip">
+                  <div class="redact-col">
+                    <span class="redact-label">upstream response</span>
+                    <pre><span class="y-key">"email"</span>: <span class="y-str">"alice@example.com"</span>,
+<span class="y-key">"ssn"</span>:   <span class="y-str">"123-45-6789"</span></pre>
+                  </div>
+                  <div class="redact-arrow" aria-hidden="true">→</div>
+                  <div class="redact-col">
+                    <span class="redact-label">what the agent sees</span>
+                    <pre><span class="y-key">"email"</span>: <span class="y-str">"[redacted]"</span>,
+<span class="y-key">"ssn"</span>:   <span class="y-str">"[redacted]"</span></pre>
+                  </div>
+                </div>
+              </article>
+              <article class="demo-slide" data-render="audit-body" role="group" aria-roledescription="slide" aria-label="2 of 3: tamper-evident audit log" aria-hidden="true">
+                <div class="demo-slide-head">
+                  <h3 class="demo-slide-title">Every decision, signed and chained</h3>
+                  <p class="demo-slide-desc">
+                    Allow or deny, every verdict is appended to an OCSF log,
+                    <code class="kbd">HMAC-SHA256</code>-signed and linked to its
+                    predecessor — so deletion, reordering, or edits are all
+                    detectable after the fact.
+                  </p>
+                </div>
+                <div class="demo-layout">
+                  <div class="code-panel" role="img" aria-label="Config eunox.yaml: the stdio proxy fronts one upstream governed by eunox.policy.yaml, and the audit block writes an HMAC-signed OCSF log to ~/.eunox/audit.jsonl, keyed by ~/.eunox/audit.key.">
+                    <div class="code-bar">
+                      <span class="code-icon">📄</span>
+                      <span class="code-filename">eunox.yaml</span>
+                    </div>
+                    <div class="code-body">
+                      <pre><span class="y-comment"># eunox.yaml — turns on the signed audit log</span>
+<span class="y-key">transport</span>: <span class="y-str">stdio</span>
+
+<span class="y-key">audit</span>:
+  <span class="y-key">log</span>: <span class="y-str">~/.eunox/audit.jsonl</span>
+  <span class="y-key">keyPath</span>: <span class="y-str">~/.eunox/audit.key</span>
+
+<span class="y-key">upstreams</span>:
+  - <span class="y-key">name</span>: <span class="y-str">dev-agent</span>
+    <span class="y-key">command</span>: <span class="y-str">dev-agent-tools</span>
+    <span class="y-key">policy</span>: [<span class="y-str">./eunox.policy.yaml</span>]</pre>
+                    </div>
+                  </div>
+                  <div class="terminal" id="audit" role="img" aria-label="Terminal: cat ~/.eunox/audit.jsonl prints the three real OCSF records — an allow for read_credentials (seq 1), a deny for write_external (seq 2, CONDITION_FAILED, sequenceBlock) whose prev_hmac chains to seq 1, and an allow for query_db (seq 3, redactFields) chaining to seq 2 — then eunox audit-verify reports 3 valid records and 0 chain breaks.">
+                    <div class="terminal-bar">
+                      <div class="terminal-dot red"></div>
+                      <div class="terminal-dot amber"></div>
+                      <div class="terminal-dot green"></div>
+                      <span class="terminal-title">eunox</span>
+                    </div>
+                    <div class="terminal-body" id="audit-body"></div>
+                  </div>
+                </div>
+              </article>
+              <article class="demo-slide" data-render="rate-body" role="group" aria-roledescription="slide" aria-label="3 of 3: rate and argument limits on every call" aria-hidden="true">
+                <div class="demo-slide-head">
+                  <h3 class="demo-slide-title">Rate &amp; argument guards on every call</h3>
+                  <p class="demo-slide-desc">
+                    <code class="kbd">maxCalls</code> caps how often a tool runs;
+                    <code class="kbd">allowedOperations</code> and
+                    <code class="kbd">allowedValues</code> pin what each argument
+                    may carry — every call checked before the upstream is touched.
+                  </p>
+                </div>
+                <div class="demo-layout">
+                  <div class="code-panel" role="img" aria-label="Policy file eunox.policy.yaml: query_db is capped at five calls per sixty seconds and restricted to SELECT operations; read_file is restricted to paths under /reports.">
+                    <div class="code-bar">
+                      <span class="code-icon">📄</span>
+                      <span class="code-filename">eunox.policy.yaml</span>
+                    </div>
+                    <div class="code-body">
+                      <pre><span class="y-key">schemaVersion</span>: <span class="y-str">"0.1"</span>
+<span class="y-key">name</span>: <span class="y-str">dev-agent</span>
+<span class="y-key">version</span>: <span class="y-str">"0.1.0"</span>
+
+<span class="y-key">capabilities</span>:
+  - <span class="y-key">target</span>: <span class="y-str">tool:query_db</span>
+    <span class="y-key">actions</span>: [<span class="y-str">call</span>]
+    <span class="y-key">conditions</span>:
+      - <span class="y-key">type</span>: <span class="y-str">maxCalls</span>       <span class="y-comment"># 5 per minute</span>
+        <span class="y-key">count</span>: <span class="y-num">5</span>
+        <span class="y-key">windowSeconds</span>: <span class="y-num">60</span>
+      - <span class="y-key">type</span>: <span class="y-str">allowedOperations</span>
+        <span class="y-key">argument</span>: <span class="y-str">query</span>
+        <span class="y-key">operations</span>: [<span class="y-str">SELECT</span>]   <span class="y-comment"># reads only</span>
+
+  - <span class="y-key">target</span>: <span class="y-str">tool:read_file</span>
+    <span class="y-key">actions</span>: [<span class="y-str">call</span>]
+    <span class="y-key">conditions</span>:
+      - <span class="y-key">type</span>: <span class="y-str">allowedValues</span>
+        <span class="y-key">argument</span>: <span class="y-str">path</span>
+        <span class="y-key">values</span>: [<span class="y-str">"/reports/*"</span>]</pre>
+                    </div>
+                  </div>
+                  <div class="terminal" id="rate" role="img" aria-label="Animated terminal: eunox allows a SELECT query, denies a DROP TABLE with OPERATION_NOT_PERMITTED, denies a read_file outside /reports with VALUE_NOT_PERMITTED, then denies a sixth query_db call in the window with RATE_LIMITED.">
+                    <div class="terminal-bar">
+                      <div class="terminal-dot red"></div>
+                      <div class="terminal-dot amber"></div>
+                      <div class="terminal-dot green"></div>
+                      <span class="terminal-title">eunox proxy</span>
+                    </div>
+                    <div class="terminal-body" id="rate-body"></div>
+                  </div>
+                </div>
+              </article>
+            </div>
+          </div>
+          <button class="demo-nav demo-next" type="button" aria-label="Next demo" aria-controls="demo-track">
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M9 5l7 7-7 7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+          </button>
+        </div>
+        <div class="demo-controls">
+          <button class="demo-playpause" type="button" aria-pressed="false" aria-label="Pause demos">
+            <svg class="icon-pause" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="5" width="4" height="14" rx="1" /><rect x="14" y="5" width="4" height="14" rx="1" /></svg>
+            <svg class="icon-play" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z" /></svg>
+          </button>
+          <div class="demo-dots" role="group" aria-label="Choose a demo">
+            <button class="demo-dot is-active" type="button" aria-current="true" aria-label="Demo 1: block and mask"></button>
+            <button class="demo-dot" type="button" aria-label="Demo 2: audit log"></button>
+            <button class="demo-dot" type="button" aria-label="Demo 3: rate and argument limits"></button>
+          </div>
+        </div>
+        <div class="demo-more">
+          <p class="demo-more-label">
+            Three of many. The same one-file policy also enforces:
+          </p>
+          <ul class="demo-more-list" aria-label="More eunox capabilities">
+            <li><code class="kbd">argumentSchema</code> JSON-Schema validation</li>
+            <li><code class="kbd">allowedExtensions</code> file-type allowlists</li>
+            <li><code class="kbd">allowedTables</code> database-table allowlists</li>
+            <li><code class="kbd">timeWindow</code> wall-clock gates</li>
+            <li><code class="kbd">ipRange</code> source-IP CIDRs</li>
+            <li><code class="kbd">recipientDomain</code> exfil guards</li>
+            <li>identity-aware <code class="kbd">JWT</code> / IdP claims</li>
+            <li>filtered <code class="kbd">tools/list</code></li>
+            <li>multi-upstream <code class="kbd">gateway</code></li>
+            <li>fleet-wide kill switch</li>
+          </ul>
+          <a class="demo-more-link" href="features/index.html"
+            >Browse the full condition matrix →</a
+          >
+        </div>
+      </div>
+    </section>
+    <main class="content-section">
+      <div class="waitlist-latest-label">Latest writing</div>
+      <div class="blog-list">
+        <a class="blog-card" href="blog/21-blocking-the-lethal-trifecta/index.html">
+          <div class="blog-card-meta">
+            <time datetime="2026-06-25">25 June 2026</time>
+          </div>
+          <h2 class="blog-card-title">Blocking the lethal trifecta: the one attack only the MCP layer can stop</h2>
+          <p class="blog-card-desc">An agent with read access to secrets and an external channel is one prompt injection away from exfiltrating them. Each call is authorized on its own — eunox's sequenceBlock condition blocks the combination, because only the proxy remembers what the agent already did this session.</p>
+          <span class="blog-card-read">Read →</span>
+        </a>
+        <a class="blog-card" href="blog/01-prompt-injection-policy-layer/index.html">
+          <div class="blog-card-meta">
+            <time datetime="2026-06-04">4 June 2026</time>
+          </div>
+          <h2 class="blog-card-title">The prompt injection problem: why every AI agent needs a policy layer</h2>
+          <p class="blog-card-desc">Why fixing prompt injection inside the model doesn't work, and why the only reliable defense is a policy layer at the structured tool call.</p>
+          <span class="blog-card-read">Read →</span>
+        </a>
+      </div>
+    </main>
+    <div id="site-footer"></div>
+    <script src="components.js"></script>
+    <script src="main.js"></script>
+  </body>
+</html>

@@ -1,0 +1,42 @@
+# CODEOWNERS — eunox ownership
+#
+# This repository ships a single binary (cmd/eunox) plus its supporting
+# libraries (pkg/) and internal subsystems (internal/). Earlier revisions of
+# this file were copied from a multi-service layout and referenced directories
+# that do not exist here (cmd/gateway, infra/, k8s/); those entries are removed
+# so the file matches the actual tree. The default-owner line uses the valid `*`
+# pattern (a leading `-` is not a CODEOWNERS pattern and silently matched
+# nothing, leaving paths without a required reviewer).
+
+# Default owner for everything not matched by a more specific rule below.
+*                       @eunolabs/eunox-leads
+
+# Security-critical code: the policy engine and supporting libraries (pkg/), the
+# internal subsystems behind the binary (transports, audit sink, PDP wiring,
+# drift, config), and the network-facing proxy binary itself. These are the
+# attack surface and must carry a required reviewer.
+/pkg/                   @eunolabs/eunox-leads
+/internal/              @eunolabs/eunox-leads
+/cmd/eunox/             @eunolabs/eunox-leads
+
+# Capability-manifest JSON Schemas (kept in sync with the engine and the spec).
+/schemas/               @eunolabs/eunox-leads
+
+# Documentation
+/docs/                  @eunolabs/eunox-leads
+/README.md              @eunolabs/eunox-leads
+
+# Website
+/site/                  @eunolabs/eunox-dx
+
+# Build, packaging, and deployment
+/Makefile               @eunolabs/eunox-leads
+/.goreleaser.yml        @eunolabs/eunox-leads
+/deploy/                @eunolabs/eunox-leads
+/scripts/               @eunolabs/eunox-leads
+
+# Repository & CI configuration (supply-chain sensitive).
+/CODEOWNERS             @eunolabs/eunox-leads
+/go.mod                 @eunolabs/eunox-leads
+/go.sum                 @eunolabs/eunox-leads
+/.github/               @eunolabs/eunox-leads

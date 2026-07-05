@@ -1,0 +1,275 @@
+# Copyright 2026 Eunolabs, LLC
+# SPDX-License-Identifier: Apache-2.0
+#
+# End-to-end integration tests for all eunox demos:
+#   - manifest-only and JWT-mode (demo/)          — Docker Compose
+#   - stdio transport mode (demo/)                — local Go binaries, no Docker
+#   - OPA/Envoy comparison demo (demo/opa-comparison/) — Docker Compose
+#
+# Each job builds its stack (or binaries), runs the test script, and always
+# tears down afterwards.  Jobs run in parallel on separate runners so there
+# are no port conflicts.
+#
+# Triggered on:
+#   - push / PR touching demo code, enforcement engine, proxy, or Dockerfile
+#   - manual dispatch (workflow_dispatch)
+#
+# All required tools are pre-installed on ubuntu-latest:
+#   Docker Engine + Compose v2, Go toolchain, jq, make, curl, bash
+
+name: Demo Integration Tests
+
+on:
+  push:
+    branches: [main, "copilot/**"]
+    paths:
+      - "demo/**"
+      - "internal/**"
+      - "pkg/**"
+      - "cmd/eunox/**"
+      - "deploy/docker/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - "demo/**"
+      - "internal/**"
+      - "pkg/**"
+      - "cmd/eunox/**"
+      - "deploy/docker/**"
+  workflow_dispatch: {}
+
+concurrency:
+  group: demo-integration-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  opa-comparison:
+    name: "OPA comparison / ${{ matrix.scenario }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    strategy:
+      # Keep running the other scenarios even if one fails so we see
+      # all failures in a single CI run rather than one at a time.
+      fail-fast: false
+      matrix:
+        scenario: [credential-exfiltration, path-gated-file-access, token-reuse]
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Print toolchain versions
+        run: |
+          docker version --format 'Docker {{.Server.Version}}'
+          docker compose version
+          jq --version
+          make --version | head -1
+
+      - name: Run ${{ matrix.scenario }}
+        run: make -C demo/opa-comparison ${{ matrix.scenario }}
+        # CI=true is already set by GitHub Actions; common.sh reads it to
+        # suppress ANSI color codes so the log output is clean.
+
+      # On failure, capture container logs before the Makefile cleanup
+      # removes the stack.  The cleanup step in the Makefile always runs
+      # (see the ;STATUS=$$?; pattern), but Docker may already be down
+      # when this step fires — the "|| true" handles that gracefully.
+      - name: Dump container logs on failure
+        if: failure()
+        run: |
+          docker compose -f demo/opa-comparison/docker-compose.yml \
+            logs --no-color --timestamps 2>/dev/null || true
+
+      - name: Force cleanup on failure
+        if: failure()
+        run: |
+          docker compose -f demo/opa-comparison/docker-compose.yml \
+            down --remove-orphans --volumes 2>/dev/null || true
+
+  # ── demo: stdio transport mode ───────────────────────────────────────────
+  demo-stdio:
+    name: "demo / stdio"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.4"
+          cache-dependency-path: go.sum
+
+      - name: Print toolchain versions
+        run: |
+          go version
+          jq --version
+
+      - name: Run stdio integration tests
+        run: make -C demo ci-test-stdio
+        # Builds eunox + mock-mcp-server-stdio locally, then runs 8 policy
+        # enforcement assertions and validates audit log HMAC signatures.
+        # No Docker required.
+
+  # ── demo: full end-to-end suite (demo/e2e) ────────────────────────────────
+  # A mock host + mock server drive the REAL eunox binary as a black box
+  # across stdio AND http, asserting every enforced MCP method (allow, deny,
+  # edge), list filtering, redaction, the sampling round-trip, kill-switch, and
+  # audit-tape integrity across process restarts. No Docker — Go + curl only.
+  demo-e2e:
+    name: "demo / e2e"
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.4"
+          cache-dependency-path: go.sum
+
+      - name: Print toolchain versions
+        run: |
+          go version
+          curl --version | head -1
+
+      - name: Run end-to-end MCP enforcement suite
+        run: make -C demo ci-test-e2e
+
+  # ── demo: manifest-only mode ──────────────────────────────────────────────
+  demo-manifest:
+    name: "demo / manifest-only"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Print toolchain versions
+        run: |
+          docker version --format 'Docker {{.Server.Version}}'
+          docker compose version
+          jq --version
+
+      - name: Run manifest-only integration tests
+        run: make -C demo ci-test
+        # Starts mock-mcp-server + eunox.
+        # Keycloak is excluded entirely (profiles: ["jwt"]) so its image is
+        # never pulled and quay.io availability cannot affect this job.
+        # CI=true is set by GitHub Actions; color output is suppressed.
+
+      - name: Dump container logs on failure
+        if: failure()
+        run: |
+          docker compose -f demo/docker-compose.yml \
+            logs --no-color --timestamps 2>/dev/null || true
+
+      - name: Force cleanup on failure
+        if: failure()
+        run: |
+          docker compose -f demo/docker-compose.yml \
+            down --remove-orphans --volumes 2>/dev/null || true
+
+  # ── demo: gateway mode ────────────────────────────────────────────────────
+  demo-gateway:
+    name: "demo / gateway"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Print toolchain versions
+        run: |
+          docker version --format 'Docker {{.Server.Version}}'
+          docker compose version
+          jq --version
+
+      - name: Run gateway integration tests
+        run: make -C demo ci-test-gateway
+        # Starts one eunox-gateway fronting two mock upstreams (/mcp/files,
+        # /mcp/db), each with its own versioned manifest. No Keycloak.
+
+      - name: Dump container logs on failure
+        if: failure()
+        run: |
+          docker compose -f demo/docker-compose.gateway.yml \
+            logs --no-color --timestamps 2>/dev/null || true
+
+      - name: Force cleanup on failure
+        if: failure()
+        run: |
+          docker compose -f demo/docker-compose.gateway.yml \
+            down --remove-orphans --volumes 2>/dev/null || true
+
+  # ── demo: JWT mode ────────────────────────────────────────────────────────
+  demo-jwt:
+    name: "demo / JWT mode"
+    runs-on: ubuntu-latest
+    # Keycloak startup + 18 health-check retries (10 s each) + 30 s start_period
+    # = up to ~3.5 min just for Keycloak, plus image build and test run.
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Print toolchain versions
+        run: |
+          docker version --format 'Docker {{.Server.Version}}'
+          docker compose version
+          jq --version
+
+      # Cache the Keycloak image as a tar so quay.io outages do not block CI.
+      # The cache key includes the image tag; bump the suffix (v1→v2) to force
+      # a fresh pull after a Keycloak upgrade.
+      - name: Cache Keycloak image
+        id: cache-keycloak
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v5
+        with:
+          path: /tmp/keycloak-image
+          key: keycloak-image-26.0-v1
+
+      - name: Restore or pull Keycloak image
+        run: |
+          if [ "${{ steps.cache-keycloak.outputs.cache-hit }}" = "true" ]; then
+            echo "Loading Keycloak image from Actions cache..."
+            docker load --input /tmp/keycloak-image/keycloak.tar
+          else
+            echo "Pulling Keycloak from quay.io (up to 6 attempts, 30 s apart)..."
+            for i in $(seq 1 6); do
+              docker pull quay.io/keycloak/keycloak:26.0 && break
+              echo "Attempt $i/6 failed."
+              [ "$i" -eq 6 ] && { echo "All pull attempts exhausted."; exit 1; }
+              sleep 30
+            done
+            mkdir -p /tmp/keycloak-image
+            docker save quay.io/keycloak/keycloak:26.0 \
+              --output /tmp/keycloak-image/keycloak.tar
+          fi
+
+      - name: Run JWT-mode integration tests
+        run: make -C demo ci-test-jwt
+        # Starts mock-mcp-server + Keycloak (--profile jwt) + eunox (JWT overlay).
+        # --wait blocks until Keycloak's healthcheck passes before running tests.
+
+      - name: Dump container logs on failure
+        if: failure()
+        run: |
+          docker compose \
+            -f demo/docker-compose.yml \
+            -f demo/docker-compose.jwt.yml \
+            logs --no-color --timestamps 2>/dev/null || true
+
+      - name: Force cleanup on failure
+        if: failure()
+        run: |
+          docker compose \
+            -f demo/docker-compose.yml \
+            -f demo/docker-compose.jwt.yml \
+            down --remove-orphans --volumes 2>/dev/null || true

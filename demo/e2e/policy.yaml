@@ -1,0 +1,183 @@
+# demo/e2e/policy.yaml — comprehensive capability manifest for the eunox
+# end-to-end test suite (demo/e2e).
+#
+# Every target type (tool / resource / prompt / system), every built-in
+# condition type, and the redactFields directive is exercised here so the e2e
+# host can drive an allow AND a deny (and, where relevant, an edge) case
+# through the real proxy for each one. Entries are deliberately omitted for
+# some upstream tools/resources/prompts so the host can assert deny-by-default
+# and */list filtering.
+#
+# Companion manifests:
+#   policy-sampling.yaml    — the system:sampling/createMessage opt-in, split out
+#                             of this file (see below) and merged back on top of
+#                             it for the stdio sampling-ALLOW leg
+#   policy-no-sampling.yaml — minimal: trigger_sampling only (sampling DENY leg)
+#   policy-db.yaml          — query_db only (HTTP gateway cross-route isolation)
+#
+# The system:sampling/createMessage opt-in is intentionally NOT in this file: it
+# cannot be enforced for a remote HTTP upstream (eunox does not read server-
+# initiated requests back over HTTP), and the proxy rejects such an opt-in at
+# load. Keeping it out lets the HTTP gateway leg reuse this comprehensive policy;
+# the stdio sampling-ALLOW leg layers policy-sampling.yaml on top to grant it.
+
+schemaVersion: "0.1"
+name: e2e-policy
+version: "1.0.0"
+description: >
+  End-to-end coverage policy: one capability per enforced method, condition,
+  and directive, with intentional omissions for deny-by-default and list
+  filtering assertions.
+
+capabilities:
+  # ── tools/call ────────────────────────────────────────────────────────────
+
+  # allowedValues with a single-star glob: matches /reports/q3.pdf but NOT
+  # /reports/2025/q4.pdf (a single '*' does not cross '/').
+  - target: tool:read_file
+    actions: [call]
+    conditions:
+      - type: allowedValues
+        argument: path
+        values:
+          - "/reports/*"
+
+  # allowedValues with a double-star glob: matches at any depth under /reports/.
+  - target: tool:read_any_report
+    actions: [call]
+    conditions:
+      - type: allowedValues
+        argument: path
+        values:
+          - "/reports/**"
+
+  # allowedOperations: only SELECT statements may run.
+  - target: tool:query_db
+    actions: [call]
+    conditions:
+      - type: allowedOperations
+        argument: query
+        operations:
+          - SELECT
+
+  # allowedExtensions: only data file types.
+  - target: tool:read_doc
+    actions: [call]
+    conditions:
+      - type: allowedExtensions
+        argument: path
+        extensions:
+          - ".csv"
+          - ".txt"
+
+  # recipientDomain: outbound mail confined to one domain.
+  - target: tool:send_email
+    actions: [call]
+    conditions:
+      - type: recipientDomain
+        argument: to
+        domains:
+          - "example.com"
+
+  # read_credentials is allowed unconditionally — it arms the sequenceBlock.
+  - target: tool:read_credentials
+    actions: [call]
+
+  # sequenceBlock: deny write_external in any session that already called
+  # read_credentials (cross-tool sequencing — a stateful check no stateless
+  # PDP can express; hard to cover without a real session).
+  - target: tool:write_external
+    actions: [call]
+    conditions:
+      - type: sequenceBlock
+        afterTools:
+          - read_credentials
+
+  # maxCalls: two calls per window, the third is RATE_LIMITED.
+  - target: tool:rate_limited
+    actions: [call]
+    conditions:
+      - type: maxCalls
+        count: 2
+        windowSeconds: 3600
+
+  # timeWindow: notAfter is in the past, so this tool is always denied.
+  - target: tool:time_gated
+    actions: [call]
+    conditions:
+      - type: timeWindow
+        notAfter: "2000-01-01T00:00:00Z"
+
+  # redactFields: mask sensitive paths in the tools/call result (each matched
+  # value is replaced with "[redacted]", the key is kept). Paths apply to both
+  # the text-content JSON and structuredContent.
+  - target: tool:get_secret_record
+    actions: [call]
+    directives:
+      - type: redactFields
+        fields:
+          - "ssn"
+          - "nested.token"
+          - "api_key"
+
+  # redactFields over a malformed (JSON-looking) response passes through unredacted:
+  # it redacts cleanly-parseable JSON only and never fails closed over content it
+  # cannot parse (accepted residual; redact such data upstream).
+  - target: tool:get_malformed
+    actions: [call]
+    directives:
+      - type: redactFields
+        fields:
+          - "secret"
+
+  # redactFields over free-form (non-JSON) text must pass through unchanged.
+  - target: tool:get_plaintext
+    actions: [call]
+    directives:
+      - type: redactFields
+        fields:
+          - "secret"
+
+  # trigger_sampling is itself an ordinary allowed tool; the sampling channel it
+  # opens is governed by the system:sampling/createMessage opt-in, which lives in
+  # policy-sampling.yaml and is merged in only for the stdio sampling-ALLOW leg.
+  - target: tool:trigger_sampling
+    actions: [call]
+
+  # big_response returns a multi-megabyte payload; permitted so the host can
+  # assert the proxy forwards large responses intact (no truncation).
+  - target: tool:big_response
+    actions: [call]
+
+  # NOTE: write_file and secret_tool are intentionally ABSENT →
+  # AUTHORIZATION_FAILED on call, filtered out of tools/list.
+
+  # ── resources/read + resources/subscribe ──────────────────────────────────
+
+  - target: "resource:file:///data/reports/*"
+    actions: [read]
+
+  # read also authorizes resources/subscribe on the same URI pattern.
+  - target: "resource:file:///data/live/*"
+    actions: [read]
+
+  - target: "resource:db://warehouse/orders"
+    actions: [read]
+
+  # NOTE: file:///data/secret.txt and db://warehouse/secret are ABSENT →
+  # denied on read/subscribe, filtered out of resources/list.
+
+  # ── prompts/get ───────────────────────────────────────────────────────────
+
+  - target: "prompt:code_review"
+    actions: [get]
+
+  - target: "prompt:summarize_*"
+    actions: [get]
+
+  # NOTE: internal_secret_prompt is ABSENT → denied on get, filtered from
+  # prompts/list.
+
+  # ── system: server-initiated sampling opt-in ──────────────────────────────
+  # Lives in policy-sampling.yaml (see the header note), not here, so this
+  # manifest is loadable on the HTTP gateway leg where the opt-in is rejected.

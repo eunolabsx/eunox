@@ -1,0 +1,161 @@
+// Copyright 2026 Eunolabs, LLC
+// SPDX-License-Identifier: Apache-2.0
+
+package capability
+
+import (
+	"encoding/json"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestRedactFieldsDirective_RoundTrip(t *testing.T) {
+	dir := RedactFieldsDirective{Fields: []string{"$.user.ssn", "creditCard"}}
+
+	data, err := json.Marshal(DirectiveWrapper{Directive: dir})
+	require.NoError(t, err)
+	assert.Contains(t, string(data), `"type":"redactFields"`)
+	assert.Contains(t, string(data), `"fields"`)
+
+	var decoded DirectiveWrapper
+	require.NoError(t, json.Unmarshal(data, &decoded))
+	assert.Equal(t, DirectiveTypeRedactFields, decoded.DirectiveType())
+	rd := decoded.Directive.(*RedactFieldsDirective)
+	assert.Equal(t, []string{"$.user.ssn", "creditCard"}, rd.Fields)
+}
+
+func TestRedactFieldsDirective_Pointer_RoundTrip(t *testing.T) {
+	dir := &RedactFieldsDirective{Fields: []string{"secret"}}
+
+	data, err := json.Marshal(DirectiveWrapper{Directive: dir})
+	require.NoError(t, err)
+
+	var decoded DirectiveWrapper
+	require.NoError(t, json.Unmarshal(data, &decoded))
+	assert.Equal(t, DirectiveTypeRedactFields, decoded.DirectiveType())
+	assert.Equal(t, []string{"secret"}, decoded.Directive.(*RedactFieldsDirective).Fields)
+}
+
+func TestDirectiveWrapper_NullRoundTrip(t *testing.T) {
+	w := DirectiveWrapper{}
+	data, err := json.Marshal(w)
+	require.NoError(t, err)
+	assert.Equal(t, "null", string(data))
+
+	var decoded DirectiveWrapper
+	require.NoError(t, json.Unmarshal([]byte("null"), &decoded))
+	assert.Nil(t, decoded.Directive)
+}
+
+func TestDirectiveWrapper_TypedNilPointer_MarshalsToNull(t *testing.T) {
+	// A typed-nil pointer (not a nil interface) carries a concrete type, so the
+	// nil-interface guard in MarshalJSON is skipped; marshalDirective must still
+	// emit "null" rather than dereference the nil pointer through the value-receiver
+	// DirectiveType() and panic.
+	w := DirectiveWrapper{Directive: (*RedactFieldsDirective)(nil)}
+	data, err := json.Marshal(w)
+	require.NoError(t, err)
+	assert.Equal(t, "null", string(data))
+}
+
+func TestUnknownDirectiveType_RejectsAtLoad(t *testing.T) {
+	// An unknown directive type must be rejected fail-closed.
+	raw := `{"type":"purgeDatabase","target":"*"}`
+	var w DirectiveWrapper
+	err := json.Unmarshal([]byte(raw), &w)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown directive type")
+	assert.Contains(t, err.Error(), "purgeDatabase")
+}
+
+func TestDirectiveMissingType_RejectsAtLoad(t *testing.T) {
+	raw := `{"fields":["ssn"]}`
+	var w DirectiveWrapper
+	err := json.Unmarshal([]byte(raw), &w)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "type")
+}
+
+func TestConstraint_DirectivesRoundTrip(t *testing.T) {
+	// A constraint with both conditions and directives round-trips via JSON.
+	c := Constraint{
+		Target:  "tool:read_file",
+		Actions: []string{"call"},
+		Conditions: []Condition{
+			AllowedValuesCondition{Argument: "path", Values: []interface{}{"/reports/*"}},
+		},
+		Directives: []Directive{
+			&RedactFieldsDirective{Fields: []string{"$.user.ssn", "$.creditCard"}},
+		},
+	}
+
+	data, err := json.Marshal(c)
+	require.NoError(t, err)
+	assert.Contains(t, string(data), `"type":"allowedValues"`)
+	assert.Contains(t, string(data), `"type":"redactFields"`)
+
+	var decoded Constraint
+	require.NoError(t, json.Unmarshal(data, &decoded))
+	require.Len(t, decoded.Conditions, 1)
+	require.Len(t, decoded.Directives, 1)
+	assert.Equal(t, DirectiveTypeRedactFields, decoded.Directives[0].DirectiveType())
+	rd := decoded.Directives[0].(*RedactFieldsDirective)
+	assert.Equal(t, []string{"$.user.ssn", "$.creditCard"}, rd.Fields)
+}
+
+func TestConstraint_NoDirectives_RoundTrips(t *testing.T) {
+	// A constraint with no directives should round-trip without a "directives" key.
+	c := Constraint{
+		Target:  "tool:query_db",
+		Actions: []string{"call"},
+	}
+	data, err := json.Marshal(c)
+	require.NoError(t, err)
+	assert.NotContains(t, string(data), "directives")
+
+	var decoded Constraint
+	require.NoError(t, json.Unmarshal(data, &decoded))
+	assert.Nil(t, decoded.Directives)
+}
+
+func TestConstraint_UnknownDirectiveType_FailsClosed(t *testing.T) {
+	// An unknown directive type in a constraint must fail at load time.
+	raw := `{"target":"tool:foo","actions":["call"],"directives":[{"type":"selfDestruct"}]}`
+	var c Constraint
+	err := json.Unmarshal([]byte(raw), &c)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown directive type")
+}
+
+func TestConstraint_MultipleDirectives_RoundTrip(t *testing.T) {
+	c := Constraint{
+		Target:  "tool:read_file",
+		Actions: []string{"call"},
+		Directives: []Directive{
+			&RedactFieldsDirective{Fields: []string{"ssn"}},
+			&RedactFieldsDirective{Fields: []string{"creditCard", "cvv"}},
+		},
+	}
+
+	data, err := json.Marshal(c)
+	require.NoError(t, err)
+
+	var decoded Constraint
+	require.NoError(t, json.Unmarshal(data, &decoded))
+	require.Len(t, decoded.Directives, 2)
+	assert.Equal(t, []string{"ssn"}, decoded.Directives[0].(*RedactFieldsDirective).Fields)
+	assert.Equal(t, []string{"creditCard", "cvv"}, decoded.Directives[1].(*RedactFieldsDirective).Fields)
+}
+
+func TestRedactFieldsDirective_EmptyFields_RoundTrip(t *testing.T) {
+	dir := RedactFieldsDirective{Fields: []string{}}
+	data, err := json.Marshal(DirectiveWrapper{Directive: dir})
+	require.NoError(t, err)
+
+	var decoded DirectiveWrapper
+	require.NoError(t, json.Unmarshal(data, &decoded))
+	assert.NotNil(t, decoded.Directive)
+	assert.Equal(t, DirectiveTypeRedactFields, decoded.DirectiveType())
+}

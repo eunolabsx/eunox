@@ -1,0 +1,42 @@
+# brave-search.yaml — reference policy for @modelcontextprotocol/server-brave-search
+#
+# Search tools are usually low-risk, but they're a common target for
+# runaway-loop behavior: an agent stuck in a search-then-fetch loop can
+# burn through API quota in minutes. The risk addressed here is bill, not
+# breach.
+#
+# Threats addressed
+# -----------------
+#   1. Quota exhaustion / runaway looping.
+#      → maxCalls per session.
+#   2. Search-as-egress (encoding data into long, structured queries).
+#      → no protection from policy alone; pair with an egress firewall if
+#        the threat model includes a compromised agent process. Mentioned
+#        here so it's not silently assumed away.
+#
+# Adapt
+# -----
+#   Lower maxCalls if you've seen what your agent does. A research agent
+#   doing ~10 searches per task is normal; 200 per hour is not.
+
+schemaVersion: "0.1"
+name: brave-search-policy
+version: "0.1.0"
+description: >
+  Brave Search rate-cap. No argument constraint; the conservative call cap
+  is the entire control surface.
+
+capabilities:
+  - target: tool:brave_web_search
+    actions: [call]
+    conditions:
+      - type: maxCalls
+        count: 60
+        windowSeconds: 3600
+
+  - target: tool:brave_local_search
+    actions: [call]
+    conditions:
+      - type: maxCalls
+        count: 30
+        windowSeconds: 3600

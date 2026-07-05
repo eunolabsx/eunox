@@ -1,0 +1,58 @@
+# stripe.yaml — reference policy for the Stripe MCP server
+#
+# Stripe is the canonical "anything that moves money is blocked" upstream.
+# The default posture is read-only — reporting agents work; payment-mutating
+# agents are denied by absence and you opt into individual write tools
+# explicitly, one at a time, with rate limits.
+#
+# Threats addressed
+# -----------------
+#   1. Agent issues a refund / charge / payout in response to a prompt
+#      injection.
+#      → create_payment_intent, create_refund, create_payout NOT permitted.
+#   2. Agent mutates customer records (price, subscription, tax).
+#      → update_*, create_subscription, cancel_subscription NOT permitted.
+#   3. Reporting-loop quota exhaustion.
+#      → maxCalls on the list tools.
+#
+# Tools intentionally NOT permitted (every "money-moving" surface)
+# ----------------------------------------------------------------
+#   create_payment_intent, create_refund, create_payout, create_charge,
+#   create_subscription, update_subscription, cancel_subscription,
+#   create_price, create_invoice, void_invoice, create_coupon,
+#   create_promotion_code, delete_customer.
+#
+# Adapt
+# -----
+#   The supported tool set varies by Stripe's MCP version; treat this list
+#   as the baseline and re-validate with `eunox validate --live` after
+#   every Stripe upstream upgrade.
+
+schemaVersion: "0.1"
+name: stripe-policy
+version: "0.1.0"
+description: >
+  Read-only Stripe access. The side that moves money is denied by default;
+  opt in to individual write tools one at a time.
+
+capabilities:
+  - target: "tool:list_*"
+    actions: [call]
+    conditions:
+      - type: maxCalls
+        count: 60
+        windowSeconds: 3600
+
+  - target: "tool:retrieve_*"
+    actions: [call]
+    conditions:
+      - type: maxCalls
+        count: 120
+        windowSeconds: 3600
+
+  - target: tool:search_customers
+    actions: [call]
+    conditions:
+      - type: maxCalls
+        count: 60
+        windowSeconds: 3600

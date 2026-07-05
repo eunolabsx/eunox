@@ -1,0 +1,39 @@
+# yaml-language-server: $schema=../schemas/eunox-gateway-config.schema.json
+# demo/eunox.local.gateway.yaml — LOCAL debug config (host-run, NOT used by Docker).
+#
+# Gateway: one HTTP server on 127.0.0.1:3000 multiplexing TWO stdio upstreams,
+# each enforced by its own independently versioned manifest, all sharing one
+# signed audit tape:
+#
+#   POST /mcp/files -> stdio mock, enforced by demo/policies/files.yaml (v0.1.0)
+#   POST /mcp/db    -> stdio mock, enforced by demo/policies/db.yaml    (v0.2.0)
+#
+# Self-contained — each upstream is its own `go run` subprocess, no external
+# services. Wired to ".vscode/launch.json → proxy: gateway (local, 2 upstreams)".
+# Paths are relative to the repo root.
+
+schemaVersion: "0.1"
+transport: http
+
+listen:
+  bind: 127.0.0.1
+  port: 3000
+
+audit:
+  log: demo/audit/audit.jsonl     # one shared, signed tape for both routes
+  keyPath: demo/audit/audit.key
+
+upstreams:
+  - name: files                    # -> POST /mcp/files
+    transport: stdio
+    command: go
+    args: ["run", "./demo/mock-mcp-server-stdio"]
+    policy:
+      - policies/files.yaml
+
+  - name: db                       # -> POST /mcp/db
+    transport: stdio
+    command: go
+    args: ["run", "./demo/mock-mcp-server-stdio"]
+    policy:
+      - policies/db.yaml

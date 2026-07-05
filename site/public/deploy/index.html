@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Deploy · eunox</title>
+  <meta name="description" content="Deploy eunox locally — zero infrastructure, one Go binary, one YAML policy file." />
+  <link rel="icon" href="../eunolabs.png" />
+  <link rel="stylesheet" href="../styles.css" />
+</head>
+
+<body>
+  <div id="site-header"></div>
+  <section class="hero hero-compact">
+    <div class="hero-eyebrow"><span class="dot"></span>Deploy</div>
+    <h1>Deploy eunox <em>in minutes</em></h1>
+    <p class="hero-sub">
+      One Go binary. One YAML policy file. No Redis, no Postgres, no gateway
+      process — everything runs locally, in-process, on your machine.
+    </p>
+  </section>
+  <nav class="breadcrumbs" aria-label="Breadcrumb">
+    <a href="../index.html">Home</a> &nbsp;›&nbsp; Deploy
+  </nav>
+  <main class="content-section">
+    <div class="page-toc" aria-label="On this page">
+      <h4>On this page</h4>
+      <ul>
+        <li><a href="#install">Install</a></li>
+        <li><a href="#policy">Write a policy</a></li>
+        <li><a href="#run">Run the proxy</a></li>
+        <li>
+          <a href="#claude-desktop">Claude Desktop / Cursor / Windsurf</a>
+        </li>
+        <li><a href="#http">HTTP transport</a></li>
+        <li><a href="#audit">Audit log</a></li>
+        <li><a href="#redis">Optional: Redis for shared state</a></li>
+        <li><a href="#docker">Docker</a></li>
+      </ul>
+    </div>
+    <h2 id="install">Install</h2>
+    <p>
+      Download the pre-built binary for your platform from the
+      <a href="https://github.com/eunolabs/eunox/releases/latest" target="_blank" rel="noopener noreferrer">latest
+        GitHub release</a>:
+    </p>
+    <pre><code># macOS / Linux — release assets carry the version in their name, so resolve
+# the latest tag first, then download for your OS/ARCH (darwin/linux, amd64/arm64)
+os=$(uname -s | tr '[:upper:]' '[:lower:]')
+arch=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+ver=$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+  https://github.com/eunolabs/eunox/releases/latest | sed 's#.*/tag/v##')
+curl -sSL "https://github.com/eunolabs/eunox/releases/download/v${ver}/eunox_${ver}_${os}_${arch}.tar.gz" \
+  | tar -xz eunox
+chmod +x eunox
+sudo mv eunox /usr/local/bin/
+
+eunox version</code></pre>
+    <p>Or install from source with Go 1.26.4+:</p>
+    <pre><code>go install github.com/eunolabs/eunox/cmd/eunox@latest</code></pre>
+    <h2 id="policy">Write a policy</h2>
+    <p>
+      Save the following as <code>eunox.policy.yaml</code>. This is the
+      <strong>AgentCapabilityManifest</strong> format — the same schema used
+      by <code>eunox validate</code>, <code>pkg/capability</code>, and
+      <code>pkg/enforcement</code>:
+    </p>
+    <pre><code>schemaVersion: "0.1"
+name:    filesystem-agent
+version: 0.1.0
+
+capabilities:
+  - target: tool:read_file
+    actions: [call]
+    conditions:
+      - type: allowedExtensions
+        argument: path
+        extensions: [".csv", ".json", ".txt", ".md"]
+      - type: maxCalls
+        count: 50
+        windowSeconds: 60
+
+  - target: tool:write_file
+    actions: [call]
+    argumentSchema:
+      type: object
+      required: [path, content]
+      properties:
+        path:
+          type: string
+          pattern: "^/data/.*"
+        content:
+          type: string
+      additionalProperties: false
+    conditions:
+      - type: maxCalls
+        count: 20
+        windowSeconds: 60
+
+  - target: tool:list_directory
+    actions: [call]</code></pre>
+    <p>Validate before running:</p>
+    <pre><code>eunox validate ./eunox.policy.yaml</code></pre>
+    <p>
+      See the
+      <a href="https://github.com/eunolabs/eunox/blob/main/docs/capability-manifest-guide.md" target="_blank"
+        rel="noopener noreferrer">capability-manifest-guide.md</a>
+      for all condition types, or browse the
+      <a href="../features/index.html">full condition matrix</a> with worked demos.
+    </p>
+    <h2 id="run">Run the proxy</h2>
+    <p>
+      Declare the upstream and its policy in an <code>eunox.yaml</code>:
+    </p>
+    <pre><code>schemaVersion: "0.1"
+transport: stdio
+upstreams:
+  - name: filesystem
+    transport: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/data"]
+    policy: ["./eunox.policy.yaml"]
+</code></pre>
+    <pre><code>eunox proxy --config ./eunox.yaml</code></pre>
+    <p>Key flags:</p>
+    <table>
+      <thead>
+        <tr>
+          <th>Flag</th>
+          <th>Default</th>
+          <th>Description</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>--config</code></td>
+          <td>—</td>
+          <td>
+            Path to the eunox config (YAML): host transport, upstream(s),
+            per-route policy, and listen settings. Required.
+          </td>
+        </tr>
+        <tr>
+          <td><code>--audit-log</code></td>
+          <td><code>~/.eunox/audit.jsonl</code></td>
+          <td>OCSF audit log path. Overridden by the config's <code>audit.log</code>.</td>
+        </tr>
+        <tr>
+          <td><code>--audit-key-path</code></td>
+          <td><code>~/.eunox/audit.key</code></td>
+          <td>HMAC signing key path (auto-created on first run).</td>
+        </tr>
+        <tr>
+          <td><code>--shutdown-timeout</code></td>
+          <td>5000</td>
+          <td>Grace period (ms) before SIGKILL is sent to a subprocess upstream.</td>
+        </tr>
+      </tbody>
+    </table>
+    <h2 id="claude-desktop">Claude Desktop / Cursor / Windsurf</h2>
+    <p>
+      Add the proxy as an <code>mcpServers</code> entry in
+      <code>claude_desktop_config.json</code> (or the Cursor / Windsurf
+      equivalent). Use absolute paths:
+    </p>
+    <pre><code>{
+  "mcpServers": {
+    "filesystem-governed": {
+      "command": "eunox",
+      "args": ["proxy", "--config", "/absolute/path/to/eunox.yaml"]
+    }
+  }
+}</code></pre>
+    <p>
+      Omit a route's <code>policy:</code> (or set <code>enforcement: audit</code>)
+      — useful for capturing an audit trail before you write any rules.
+    </p>
+    <h2 id="http">HTTP transport</h2>
+    <p>
+      For agents that connect over HTTP rather than stdio (LangChain, Go
+      services, curl):
+    </p>
+    <pre><code>schemaVersion: "0.1"
+transport: http
+listen: { bind: 127.0.0.1, port: 7391, authToken: ${MY_SECRET} }
+upstreams:
+  - name: local
+    transport: stdio
+    command: ./my-mcp-server
+    policy: ["./eunox.policy.yaml"]
+</code></pre>
+    <pre><code>eunox proxy --config ./eunox.yaml</code></pre>
+    <p>
+      Connect your client to <code>http://127.0.0.1:7391/mcp/local</code> with
+      <code>Authorization: Bearer $MY_SECRET</code>. The same policy file
+      works on both transports. <code>ipRange</code> conditions become
+      enforceable only on HTTP — stdio sessions have no source IP.
+    </p>
+    <h2 id="audit">Audit log</h2>
+    <p>
+      Every decision — allow or deny — is written to the OCSF audit log as a
+      signed JSON line:
+    </p>
+    <pre><code># Stream live decisions
+tail -F ~/.eunox/audit.jsonl | jq
+
+# ASCII histogram of denials grouped by condition type
+eunox stats
+
+# Verify a specific event's HMAC signature
+eunox audit-verify --audit-log ~/.eunox/audit.jsonl</code></pre>
+    <p>
+      The signing key is auto-generated at
+      <code>~/.eunox/audit.key</code> (mode <code>0600</code>) on first run.
+      Override with <code>--audit-key-path</code> or the
+      <code>EUNOX_AUDIT_KEY_PATH</code> environment variable. Logs rotate at
+      100 MiB; rotated files are named
+      <code>audit.jsonl.&lt;ISO-timestamp&gt;</code>.
+    </p>
+    <h2 id="redis">Optional: Redis for shared call counters</h2>
+    <p>
+      <code>maxCalls</code> conditions use in-process counters by default —
+      one counter per session, reset when the proxy restarts. For shared
+      counters across multiple proxy instances or persistent counters across
+      restarts, point the proxy at Redis:
+    </p>
+    <pre><code>eunox proxy \
+  --config ./eunox.yaml \
+  --redis-addr localhost:6379</code></pre>
+    <p>
+      Redis is entirely optional. A single developer or a CI pipeline never
+      needs it.
+    </p>
+    <h2 id="docker">Docker</h2>
+    <p>
+      The <code>eunox</code> image is published to the GitHub Container
+      Registry:
+    </p>
+    <pre><code>docker pull ghcr.io/eunolabs/eunox:latest</code></pre>
+    <p>Run with a mounted config (which references the policy):</p>
+    <pre><code>docker run --rm -it \
+  -v "$PWD/eunox.yaml:/eunox.yaml:ro" \
+  -v "$PWD/eunox.policy.yaml:/eunox.policy.yaml:ro" \
+  ghcr.io/eunolabs/eunox:latest \
+  proxy --config /eunox.yaml</code></pre>
+    <p>
+      For CI pipelines, the image is also available for
+      <code>linux/amd64</code> and <code>linux/arm64</code>. See the
+      <a href="https://github.com/eunolabs/eunox/blob/main/deploy/docker/Dockerfile.mcp" target="_blank"
+        rel="noopener noreferrer">Dockerfile.mcp</a>
+      for the build recipe.
+    </p>
+  </main>
+  <div id="site-footer"></div>
+  <script src="../components.js"></script>
+  <script src="../main.js"></script>
+</body>
+
+</html>
