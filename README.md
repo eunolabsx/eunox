@@ -422,7 +422,28 @@ configured. Point all instances at one Redis (`--redis-addr`) to share both.
 
 ---
 
-## Why not OPA or Envoy?
+## How eunox compares
+
+Controls for agent behavior now exist at every layer: identity platforms
+(Okta's Cross App Access, Descope) govern which agent may connect to which
+app; API gateways (Kong, Cloudflare, agentgateway, Pomerium) attach per-tool
+ACLs to routes; managed runtimes (Arcade.dev) execute tools behind delegated
+OAuth; authorization platforms (Oso, Permit.io) offer policy engines as a
+service; scanners (Snyk agent-scan) inventory what is installed. eunox
+occupies one deliberate niche among them: **deny-by-default capability
+enforcement at the MCP protocol boundary** — argument and call-ordering
+constraints, discovery filtering, and a signed audit tape, for any MCP server
+you can point it at, including the local stdio servers no network gateway can
+reach. Identity says *who is calling*; the manifest says *what a call may do* —
+and it is the control that still holds when a prompt-injected agent misuses
+access it legitimately has.
+
+The category-by-category breakdown — what each layer does well, what to
+verify before relying on it, and how eunox composes with each — is in
+[`docs/comparison.md`](./docs/comparison.md). The three worked comparisons
+below stay here because they come up most often.
+
+### Why not OPA or Envoy?
 
 OPA and Envoy enforce access control at the HTTP layer — they see the HTTP request but have no concept of the session, what the agent has already done this session, or what individual tool arguments mean. Three failure modes they cannot address:
 
@@ -690,6 +711,7 @@ For integration examples with Auth0, Okta, WorkOS, and Cloudflare Access, see
 - 📄 **Capability Manifest Specification** — [SPEC.md](https://github.com/eunolabs/mcp-capability-manifest/blob/main/SPEC.md)
 - 📋 **Capability manifest guide** — [`docs/capability-manifest-guide.md`](./docs/capability-manifest-guide.md)
 - 🗺 **MCP 2025-11-25 conformance matrix** — what eunox enforces, what the IdP must provide, known gaps, Auth0/Okta/WorkOS/Cloudflare integration examples — [`docs/conformance.md`](./docs/conformance.md)
+- ⚖️ **How eunox compares** — API gateways, managed runtimes, authorization platforms, identity-layer controls, scanners — [`docs/comparison.md`](./docs/comparison.md)
 - 🛡 **Threat model** — [`docs/threat-model-mcp.md`](./docs/threat-model-mcp.md)
 - 🔒 **Deployment hardening** (mandatory enforcement chokepoint: credential, network, and endpoint controls) — [`docs/deployment-hardening.md`](./docs/deployment-hardening.md)
 - ⚡ **Benchmarks** — [`docs/benchmarks.md`](./docs/benchmarks.md)

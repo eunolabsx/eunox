@@ -20,6 +20,7 @@ Design and operational documentation for `eunox`.
 | [conformance.md](./conformance.md) | MCP 2025-11-25 conformance matrix: per-method enforcement status, OAuth/IdP boundary, known gaps, IdP integration examples. |
 | [adr/](./adr/) | Architecture Decision Records — why specific load-bearing decisions were made, one short file per decision. |
 | [capability-manifest-guide.md](./capability-manifest-guide.md) | Manifest authoring: structure, conditions, anti-patterns. |
+| [comparison.md](./comparison.md) | How eunox compares to API gateways, managed runtimes, authorization platforms, identity-layer controls, and scanners — and how it composes with each. |
 | [threat-model-mcp.md](./threat-model-mcp.md) | Security threat model for the `eunox` proxy. |
 | [deployment-hardening.md](./deployment-hardening.md) | Making eunox a mandatory enforcement chokepoint: credential, network, and endpoint controls that prevent direct-to-upstream bypass. |
 | [whitepaper/deploymentwhitepaper.pdf](./whitepaper/deploymentwhitepaper.pdf) | Deployment whitepaper (PDF) — the printable companion to `deployment-hardening.md`. |
