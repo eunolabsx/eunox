@@ -437,9 +437,8 @@ Runnable demos for all three scenarios: [`demo/opa-comparison/`](./demo/opa-comp
 ### Why not authorization middleware inside the server?
 
 If you wrote the MCP server yourself, in-process authorization middleware
-(FastMCP's auth hooks, whataboutyou-ai's Eunomia,
-and similar) is a good fit: add it to the framework, decide who may call which
-tool, done. eunox solves the opposite problem — the servers you **didn't**
+(FastMCP's auth hooks and similar) is a good fit: add it to the framework,
+decide who may call which tool, done. eunox solves the opposite problem — the servers you **didn't**
 write and can't modify: a community package launched with `npx`, a vendor's
 remote endpoint, an internal server owned by another team. A proxy needs no
 code changes, no particular framework, and no particular language.
