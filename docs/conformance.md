@@ -322,6 +322,41 @@ obtain a Bearer JWT from that IdP directly and present it in the standard
 control; eunox verifies the upstream IdP's Bearer token using that IdP's
 `--jwks-uri`, `--jwt-issuer`, and `--jwt-audience` values.
 
+### Enterprise-Managed Authorization (Okta Cross App Access and compatible IdPs)
+
+MCP's [Enterprise-Managed Authorization extension](https://modelcontextprotocol.io/extensions/auth/enterprise-managed-authorization)
+(stable since June 2026) standardizes enterprise-IdP-brokered access to MCP
+servers. It is built on the IETF Identity Assertion JWT Authorization Grant
+(ID-JAG): the client signs in through enterprise SSO, exchanges its identity
+assertion at the IdP for an ID-JAG (RFC 8693 token exchange — the IdP's
+policy checkpoint), then redeems the ID-JAG at the MCP server's **own**
+authorization server (RFC 7523 JWT-bearer grant), which issues the
+audience-restricted access token. Okta ships the flow as Cross App Access;
+other identity vendors have announced or begun implementations of the same
+grant.
+
+No EMA-specific support is needed in eunox, because the token that arrives is
+an ordinary `Authorization: Bearer` JWT issued by that resource-side
+authorization server:
+
+1. Point `--jwks-uri`, `--jwt-issuer`, and `--jwt-audience` at the
+   authorization server that issues the **final access token** (where the
+   ID-JAG is redeemed) — not at the enterprise IdP that brokered the grant.
+   Validation then proceeds exactly as in the examples above.
+2. The grant governs whether a token is issued and with which scopes;
+   per-call capability within the authenticated session remains the
+   manifest's job. The extension itself scopes the IdP's visibility to token
+   issuance — it does not extend to the MCP traffic inside the session, which
+   is the layer the manifest enforces.
+3. If that authorization server also attaches the `mcp.capabilities` claim,
+   the experimental intersection applies with
+   `--jwt-experimental-capabilities`, unchanged. The capability-manifest
+   specification covers
+   [issuer configuration](https://github.com/eunolabs/mcp-capability-manifest/blob/main/SPEC.md#43-issuer-configuration-non-normative)
+   and
+   [composition with MCP authorization flows](https://github.com/eunolabs/mcp-capability-manifest/blob/main/SPEC.md#44-composition-with-mcp-authorization-flows-non-normative)
+   in detail.
+
 ---
 
 ## Audit log and compliance

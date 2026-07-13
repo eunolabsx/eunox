@@ -78,7 +78,7 @@ make check-notice    # NOTICE matches the binary's third-party modules
 make coverage        # write coverage.out
 ```
 
-Full prerequisites (Go 1.26.4+, golangci-lint v2.12+, Docker) and the
+Full prerequisites (Go 1.26.5+, golangci-lint v2.12+, Docker) and the
 repository layout are in [`docs/repo-guide.md`](./docs/repo-guide.md).
 
 The end-to-end demo lives under [`demo/`](./demo/) — `make -C demo up` is the

@@ -11,7 +11,7 @@ built on the [Model Context Protocol](https://spec.modelcontextprotocol.io/).
 
 ## Prerequisites
 
-- Go 1.26.4+
+- Go 1.26.5+
 - golangci-lint v2.12+
 - Docker (for integration tests and local deployment)
 

@@ -39,7 +39,7 @@
 </p>
 
 <p align="center">
-  <a href="https://go.dev/"><img alt="go version" src="https://img.shields.io/badge/go-%E2%89%A51.26.4-00ADD8"></a>
+  <a href="https://go.dev/"><img alt="go version" src="https://img.shields.io/badge/go-%E2%89%A51.26.5-00ADD8"></a>
   <a href="https://pkg.go.dev/github.com/eunolabs/eunox"><img alt="go reference" src="https://pkg.go.dev/badge/github.com/eunolabs/eunox.svg"></a>
   <a href="https://github.com/eunolabs/eunox/blob/main/cmd/eunox/LICENSE"><img alt="license" src="https://img.shields.io/badge/eunox-Apache--2.0-green.svg"></a>
   <a href="https://spec.modelcontextprotocol.io/"><img alt="mcp" src="https://img.shields.io/badge/MCP-supported-7c3aed"></a>
@@ -437,9 +437,8 @@ Runnable demos for all three scenarios: [`demo/opa-comparison/`](./demo/opa-comp
 ### Why not authorization middleware inside the server?
 
 If you wrote the MCP server yourself, in-process authorization middleware
-(FastMCP's auth hooks, whataboutyou-ai's Eunomia,
-and similar) is a good fit: add it to the framework, decide who may call which
-tool, done. eunox solves the opposite problem — the servers you **didn't**
+(FastMCP's auth hooks and similar) is a good fit: add it to the framework,
+decide who may call which tool, done. eunox solves the opposite problem — the servers you **didn't**
 write and can't modify: a community package launched with `npx`, a vendor's
 remote endpoint, an internal server owned by another team. A proxy needs no
 code changes, no particular framework, and no particular language.
@@ -701,7 +700,7 @@ For integration examples with Auth0, Okta, WorkOS, and Cloudflare Access, see
 PR workflow, commit conventions, DCO sign-off, and house style are in
 [`CONTRIBUTING.md`](./CONTRIBUTING.md). Build, test, and lint with `make build` /
 `make test` / `make lint`; `make check-license` verifies the Apache-2.0 headers.
-Prerequisites (Go 1.26.4+, golangci-lint), repository layout, and the CI matrix
+Prerequisites (Go 1.26.5+, golangci-lint), repository layout, and the CI matrix
 are in [`docs/repo-guide.md`](./docs/repo-guide.md). Vulnerability reports go
 through [`SECURITY.md`](./SECURITY.md), not the public issue tracker.
 
