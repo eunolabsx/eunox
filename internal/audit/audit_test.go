@@ -968,14 +968,20 @@ func TestAuditDropMarker_NamesAffectedMethodTarget(t *testing.T) {
 		t.Fatalf("openAuditSink: %v", err)
 	}
 
-	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false)
 	// Simulate what the real enqueue-path drops in Record would produce: the
 	// aggregate counter plus the per-method/target tally recordDropBucket
-	// accumulates alongside it.
+	// accumulates alongside it. The simulated state must be complete BEFORE the
+	// first record is enqueued: the drainer runs flushDropMarker before writing
+	// every drained record, and only the channel send orders these stores ahead
+	// of that flush. Enqueuing first races the flush against the stores below —
+	// a mid-store snapshot emits a marker with a partial bucket breakdown,
+	// advances lastDroppedMarked past the aggregate count, and orphans the
+	// remaining buckets with no later marker to carry them.
 	sink.dropped.Store(3)
 	sink.recordDropBucket("tools/call", "probe_tool")
 	sink.recordDropBucket("tools/call", "probe_tool")
 	sink.recordDropBucket("resources/read", "file:///etc/passwd")
+	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false)
 	sink.RecordDeny(context.Background(), "sess", "write_file", "tools/call", "CAPABILITY_DENIED", "", nil, false)
 
 	if err := sink.Close(); err != nil {

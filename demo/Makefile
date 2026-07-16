@@ -12,7 +12,7 @@
 .PHONY: up up-jwt down allow deny deny-path deny-op audit jwt jwt-allow jwt-deny logs ci-test ci-test-jwt \
         stdio-allow stdio-deny stdio-deny-path stdio-deny-op ci-test-stdio \
         gateway-up gateway-down gw-files-allow gw-files-deny gw-db-allow gw-db-deny gw-cross-deny gw-404 \
-        gateway-audit ci-test-gateway ci-test-e2e e2e trifecta help
+        gateway-audit ci-test-gateway ci-test-e2e e2e trifecta trifecta-audit help
 
 DEMO_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
@@ -273,6 +273,10 @@ ci-test-stdio:
 ## trifecta: The lethal-trifecta hero demo — eunox blocks credential exfiltration (read->write) via sequenceBlock.
 trifecta:
 	@bash "$(DEMO_DIR)trifecta/run.sh"
+
+## trifecta-audit: Trifecta with a persistent signed tape (demo/trifecta/audit/) — raw records, cross-run chain verification, live tamper detection.
+trifecta-audit:
+	@bash "$(DEMO_DIR)trifecta/run.sh" --persist
 
 ## e2e: Run the full end-to-end MCP enforcement suite (alias for ci-test-e2e).
 e2e: ci-test-e2e

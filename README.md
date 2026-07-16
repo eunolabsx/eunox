@@ -65,19 +65,30 @@
 
 ## Quick start
 
-**Zero-config wiretap** — wrap any MCP server in audit-only mode in one line, no files:
+eunox is adopted as a loop, not a leap: **wiretap → see the evidence → draft the policy from it → enforce**. Nothing is blocked until the last step — no scary day-one deny — and every step is one command that already ships in the binary.
+
+**Step 1 — wiretap.** Wrap any MCP server in audit-only mode in one line, no files:
 
 ```bash
 eunox proxy --audit -- npx -y @modelcontextprotocol/server-filesystem /data
-# …point your MCP host at this command, use the agent for a while, then:
-eunox stats          # what the agent actually called, with full arguments
+# …point your MCP host at this command and use the agent for a while
 ```
 
 (The example wraps the npm `server-filesystem`, so it needs Node / `npx` on `PATH` — the one-liner wraps **any** MCP server, e.g. a Python one via `uvx`, or a local binary. No toolchain at all? See the Docker / no-Docker trials below.)
 
-Every enforced-method call (`tools/call`, `resources/read`, `resources/subscribe`, `prompts/get`, `sampling/createMessage`) is forwarded and recorded to `~/.eunox/audit.jsonl` with an HMAC signature; `tools/call` records also include the full argument map. (`…/list` calls forward the full upstream catalog unfiltered and are recorded as enumeration events — without a per-entry argument map.) Once you've seen what your agent really does, turn that tape straight into a draft manifest:
+Every enforced-method call (`tools/call`, `resources/read`, `resources/subscribe`, `prompts/get`, `sampling/createMessage`) is forwarded and recorded to `~/.eunox/audit.jsonl` with an HMAC signature; `tools/call` records also include the full argument map. (`…/list` calls forward the full upstream catalog unfiltered and are recorded as enumeration events — without a per-entry argument map.)
 
 > **Security note:** In audit/wiretap mode the log contains full tool call argument values for every call. Treat `audit.jsonl` as sensitive regardless of mode — even in enforce mode, denial records include condition-specific argument excerpts (e.g., the rejected value that triggered an `allowedValues` check). Apply appropriate access controls and retention policy to this file.
+
+**Step 2 — see what the agent actually did.**
+
+```bash
+eunox stats          # per-tool allow/deny histogram from the signed tape
+```
+
+Everything your agent really called, with full arguments, signed — that visibility alone justifies the wiretap, and it is exactly the evidence the next step turns into policy.
+
+**Step 3 — draft the manifest from the evidence.**
 
 ```bash
 eunox suggest --output manifest.yaml   # draft entries grounded in observed usage
@@ -85,7 +96,9 @@ eunox suggest --output manifest.yaml   # draft entries grounded in observed usag
 eunox validate manifest.yaml
 ```
 
-Then wrap the **same** upstream with a config that enforces the reviewed manifest:
+`suggest` reads the wiretap tape and proposes one entry per observed target — including `allowedValues` conditions built from the actual argument values it saw. The policy writes itself from evidence; you review and tighten it.
+
+**Step 4 — enforce the reviewed manifest.** Wrap the **same** upstream with a config that points at it:
 
 ```yaml
 # eunox.yaml
@@ -103,7 +116,9 @@ upstreams:
 eunox proxy --config eunox.yaml
 ```
 
-`suggest` reads the wiretap tape and proposes one entry per observed target — including `allowedValues` conditions built from the actual argument values it saw. (Prefer to scaffold both files in one step? `eunox init --upstream-url <url> --output manifest.yaml --config-output eunox.yaml` writes a deny-all manifest *and* a runnable config from a live server's tool list.)
+Anything outside the manifest is now denied before it reaches the server, with a structured error to the host and a signed audit record. Keep tightening from there — a single new rule can be staged observe-only with per-entry `enforcement: audit` (see the [audit log section](#audit-log)) while the rest of the manifest keeps blocking.
+
+**Prefer to start deny-all instead of observe-first?** `eunox init --upstream-url <url> --output manifest.yaml --config-output eunox.yaml` scaffolds a deny-all starter manifest (every live tool present but commented out) *and* a runnable config from the server's tool list — the same loop entered from the closed end: uncomment what the wiretap proved the agent needs.
 
 **The hero demo — block credential exfiltration (Go only, no Docker).** An agent reads a secret, then a prompt injection tells it to POST the secret to an attacker. Each call is individually authorized; eunox blocks the *combination* with one `sequenceBlock` condition — the one attack no database role or API gateway can catch, because only the proxy remembers what the agent already did this session:
 
@@ -111,7 +126,7 @@ eunox proxy --config eunox.yaml
 make -C demo trifecta   # builds the real binary, drives read_credentials ALLOW -> write_external DENY
 ```
 
-It prints the ALLOW/DENY verdicts, the signed audit records, and a clean HMAC-chain verification. Walkthrough: [`demo/trifecta/`](./demo/trifecta/).
+It prints the ALLOW/DENY verdicts, the signed audit records, and a clean HMAC-chain verification. The persistent variant, `make -C demo trifecta-audit`, keeps the tape across runs (one HMAC chain spanning proxy restarts) and shows tampering with it — a rewritten verdict, a forged record — being caught live by `eunox audit-verify`. Walkthrough: [`demo/trifecta/`](./demo/trifecta/).
 
 Prefer a runnable end-to-end demo with Docker? Prerequisites: Docker 24+, docker compose 2.20+, `curl`, `jq`.
 
