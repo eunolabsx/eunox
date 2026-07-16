@@ -115,6 +115,35 @@ jobs:
         # enforcement assertions and validates audit log HMAC signatures.
         # No Docker required.
 
+  # ── demo: lethal-trifecta hero demo ────────────────────────────────────────
+  # Drives the real binary through the read->exfiltrate kill-chain (sequenceBlock
+  # DENY), then the persistent-audit variant twice: the second run proves the
+  # HMAC chain continues across proxy restarts, and each run asserts that a
+  # rewritten verdict and a forged record on a copy of the tape are detected.
+  # No Docker — Go only.
+  demo-trifecta:
+    name: "demo / trifecta"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.5"
+          cache-dependency-path: go.sum
+
+      - name: Run hero demo (one-shot)
+        run: make -C demo trifecta
+
+      - name: Run persistent-audit variant (fresh tape)
+        run: make -C demo trifecta-audit
+
+      - name: Re-run persistent-audit variant (chain must extend across restarts)
+        run: make -C demo trifecta-audit
+
   # ── demo: full end-to-end suite (demo/e2e) ────────────────────────────────
   # A mock host + mock server drive the REAL eunox binary as a black box
   # across stdio AND http, asserting every enforced MCP method (allow, deny,

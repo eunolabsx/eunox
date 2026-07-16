@@ -5,7 +5,9 @@ Two Docker services. One manifest file. First enforced tool call in under 10 min
 > **Just want the hero demo?** [`trifecta/`](./trifecta/) shows eunox blocking
 > credential exfiltration — `read_credentials` ALLOW then `write_external` DENY
 > via one `sequenceBlock` condition — against the real binary, Go only, no
-> Docker: `make -C demo trifecta`.
+> Docker: `make -C demo trifecta`. The persistent-audit variant,
+> `make -C demo trifecta-audit`, keeps the signed tape across runs and shows
+> tampering with it — a rewritten verdict, a forged record — being caught live.
 
 ## What this demo shows
 

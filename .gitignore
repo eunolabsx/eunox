@@ -54,6 +54,9 @@ demo/audit/*.jsonl
 demo/audit/*.jsonl.*
 demo/audit/*.key
 
+# Trifecta persistent-audit tape (written by `make -C demo trifecta-audit`)
+demo/trifecta/audit/
+
 # Temporary files
 tmp/
 temp/
