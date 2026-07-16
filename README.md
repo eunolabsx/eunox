@@ -434,6 +434,45 @@ OPA and Envoy enforce access control at the HTTP layer — they see the HTTP req
 
 Runnable demos for all three scenarios: [`demo/opa-comparison/`](./demo/opa-comparison/).
 
+### Why not Cedar as the policy grammar?
+
+Cedar answers a different question. As an authorization language it shares the
+manifest's best properties — deny-by-default (a request needs an explicit
+`permit`), schema-validated so typos fail at authoring time, and built for
+automated analysis. But Cedar is deliberately stateless: every decision is a
+pure function of the request, the policy set, and the entity data passed in.
+The manifest's decisive conditions are stateful, and several of its features
+are not decisions at all.
+
+The sequential-exfiltration rule from the table above illustrates the
+boundary. In Cedar it is one honest line:
+
+```cedar
+forbid (principal, action == MCP::Action::"tools/call", resource == MCP::Tool::"write_external")
+when { context.sessionToolHistory.contains("read_credentials") };
+```
+
+Perfectly expressible — but only because something outside Cedar watched every
+call in the session, maintained `sessionToolHistory`, and injected it into the
+request context. That something is the enforcement engine at the protocol
+boundary. The predicate was never the hard part of `sequenceBlock`; the
+session memory is. The same split applies to `maxCalls` (Cedar can compare a
+count, not keep one), argument normalization (`allowedOperations` case
+folding, `recipientDomain` extraction — Cedar has no string manipulation, by
+design), and the features that are not authorization decisions at all:
+`redactFields` response redaction, `*/list` discovery filtering, the kill
+switch, and the signed audit tape.
+
+So the two compose rather than compete. The manifest's `policy` condition
+delegates a predicate to an external evaluator through the engine's
+`PolicyEvaluator` seam — fail-closed when no evaluator is configured — while
+the manifest remains the deny-by-default ceiling. If you need
+identity-differentiated authorization (roles, groups, entity hierarchies) or
+automated policy analysis across a large estate, that is what Cedar is
+genuinely better at, and exactly what the delegation hook is for: Cedar
+decides the principal-specific predicate; the manifest stays the boundary that
+no delegation can expand.
+
 ### Why not authorization middleware inside the server?
 
 If you wrote the MCP server yourself, in-process authorization middleware
