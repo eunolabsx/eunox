@@ -234,7 +234,8 @@ contains an unprefixed `target` string (fail-closed at startup):
 The prefix makes matching **namespace-scoped**: a `tool:` constraint can
 never authorize a `resources/read` request, even if the pattern strings
 happen to match. This closes the cross-namespace authorization bypasses
-described in the specification § 7.10.
+described in the specification § 7.7 (with the MCP method mapping in the
+spec's MCP binding § 2.2).
 
 **Matching** — after stripping the prefix, the proxy matches the remaining
 pattern against the target using `path.Match` glob semantics.
@@ -531,7 +532,7 @@ It is deliberately fail-open **for that one entry**, so the scope is bounded:
 
 The proxy logs a startup notice naming how many entries are in audit mode, so an
 unenforced rule can't hide. Treat `audit` as a transient rollout state, not a
-steady-state posture. See SPEC § 3.2.3 / § 7.12.
+steady-state posture. See SPEC § 3.2.3 / § 7.9.
 
 ## 2g. Denial codes — what the host sees
 
