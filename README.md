@@ -19,6 +19,10 @@
 </p>
 
 <p align="center">
+  <em>Authorization, not detection: eunox is the least-privilege layer for agent actions — a deny-by-default allowlist, so the dangerous call is impossible rather than merely recognized. MCP is the first and sharpest boundary; the open <a href="https://github.com/eunolabs/mcp-capability-manifest">capability-manifest standard</a> behind it is protocol-neutral, with a draft model-API binding already published.</em>
+</p>
+
+<p align="center">
   <em>eunox is named for the ancient Greek ideal of <strong>good order under good laws</strong> (εὐνομία).</em>
 </p>
 
