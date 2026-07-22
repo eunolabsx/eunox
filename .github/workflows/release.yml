@@ -61,7 +61,7 @@ jobs:
           echo "::error title=Invalid release tag::'$TAG' is not a valid v-prefixed SemVer tag."
           exit 1
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
@@ -105,7 +105,7 @@ jobs:
       attestations: write   # SLSA build-provenance for the release artifacts
       # No packages: write — GoReleaser does not push images (the docker-* jobs do).
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0   # goreleaser needs full history for the changelog
 
@@ -172,7 +172,7 @@ jobs:
       id-token: write       # Sigstore OIDC for cosign keyless image signing
       attestations: write   # SLSA build-provenance pushed to GHCR
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
@@ -272,7 +272,7 @@ jobs:
       id-token: write       # Sigstore OIDC for cosign keyless image signing
       attestations: write   # SLSA build-provenance pushed to GHCR
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
@@ -350,7 +350,7 @@ jobs:
       id-token: write       # Sigstore OIDC for cosign keyless image signing
       attestations: write   # SLSA build-provenance pushed to GHCR
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
