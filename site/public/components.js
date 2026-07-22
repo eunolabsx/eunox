@@ -68,7 +68,7 @@
             '<ul>' +
               '<li><a href="https://modelcontextprotocol.io/specification" target="_blank" rel="noopener noreferrer">MCP spec</a></li>' +
               '<li style="display:none"><a href="' + GITHUB + '" target="_blank" rel="noopener noreferrer">eunox README</a></li>' +
-              '<li><a href="https://github.com/eunolabs/mcp-capability-manifest" target="_blank" rel="noopener noreferrer">MCP Capability Manifest</a></li>' +
+              '<li><a href="https://github.com/eunolabs/mcp-capability-manifest" target="_blank" rel="noopener noreferrer">Capability Manifest spec</a></li>' +
             '</ul>' +
           '</div>' +
           '<div class="footer-col">' +

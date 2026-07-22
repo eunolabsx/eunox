@@ -658,7 +658,10 @@ denial histogram (since rotation):
     <div class="callout">
       <strong>Schema parity.</strong> The manifest format follows the
       <a href="https://github.com/eunolabs/mcp-capability-manifest/blob/main/SPEC.md" target="_blank"
-        rel="noopener noreferrer">MCP Capability Manifest Specification</a>. The policy file is shared across
+        rel="noopener noreferrer">Capability Manifest Specification</a> — a
+      protocol-neutral core; eunox implements its
+      <a href="https://github.com/eunolabs/mcp-capability-manifest/blob/main/bindings/mcp.md" target="_blank"
+        rel="noopener noreferrer">MCP binding</a> (binding&nbsp;#1). The policy file is shared across
       <code>eunox</code>,
       <code>pkg/capability</code>, and <code>pkg/enforcement</code> — exactly
       one shape, zero drift between the proxy and the rest of the system.
