@@ -15,11 +15,11 @@
 </p>
 
 <p align="center">
-  <em>Identity answers <strong>who is calling</strong> — that's your IdP or OAuth stack. Capabilities answer <strong>what a call may do</strong> — eunox enforces them from a <a href="https://github.com/eunolabs/mcp-capability-manifest">capability manifest for agent actions</a> whose grammar is protocol-neutral. <strong>MCP is binding&nbsp;#1</strong>: the first boundary eunox polices.</em>
+  <em>Identity answers <strong>who is calling</strong> — that's your IdP or OAuth stack. Capabilities answer <strong>what a call may do</strong> — eunox enforces them from a <a href="https://github.com/eunolabs/agent-capability-manifest">capability manifest for agent actions</a> whose grammar is protocol-neutral. <strong>MCP is binding&nbsp;#1</strong>: the first boundary eunox polices.</em>
 </p>
 
 <p align="center">
-  <em>Authorization, not detection: eunox is the least-privilege layer for agent actions — a deny-by-default allowlist, so the dangerous call is impossible rather than merely recognized. MCP is the first and sharpest boundary; the open <a href="https://github.com/eunolabs/mcp-capability-manifest">capability-manifest standard</a> behind it is protocol-neutral, with a draft model-API binding already published.</em>
+  <em>Authorization, not detection: eunox is the least-privilege layer for agent actions — a deny-by-default allowlist, so the dangerous call is impossible rather than merely recognized. MCP is the first and sharpest boundary; the open <a href="https://github.com/eunolabs/agent-capability-manifest">capability-manifest standard</a> behind it is protocol-neutral, with a draft model-API binding already published.</em>
 </p>
 
 <p align="center">
@@ -293,7 +293,7 @@ Validate without running:
 eunox validate manifest.yaml
 ```
 
-See the [Capability Manifest Specification](https://github.com/eunolabs/mcp-capability-manifest/blob/main/SPEC.md) for the normative format definition — a protocol-neutral core with per-protocol bindings, of which the [MCP binding](https://github.com/eunolabs/mcp-capability-manifest/blob/main/bindings/mcp.md) is the first — and [`docs/capability-manifest-guide.md`](./docs/capability-manifest-guide.md) for the full condition reference (11 built-in condition types — nine enforced directly by the stock binary, plus the `policy` and `custom` extension hooks that require wiring — and response directives like `redactFields`).
+See the [Capability Manifest Specification](https://github.com/eunolabs/agent-capability-manifest/blob/main/SPEC.md) for the normative format definition — a protocol-neutral core with per-protocol bindings, of which the [MCP binding](https://github.com/eunolabs/agent-capability-manifest/blob/main/bindings/mcp.md) is the first — and [`docs/capability-manifest-guide.md`](./docs/capability-manifest-guide.md) for the full condition reference (11 built-in condition types — nine enforced directly by the stock binary, plus the `policy` and `custom` extension hooks that require wiring — and response directives like `redactFields`).
 
 ---
 
@@ -744,7 +744,7 @@ For integration examples with Auth0, Okta, WorkOS, and Cloudflare Access, see
 - 🚀 **Demo — first enforcement in 10 minutes** — [`demo/README.md`](./demo/README.md)
 - 📚 **Reference policy library** (filesystem, GitHub, Postgres, SQLite, Slack, fetch, git, Brave Search, Puppeteer, memory, Stripe) — [`examples/policies/`](./examples/policies/)
 - 🔌 **MCP client integration** (Claude Desktop, Cursor, VS Code/Copilot, Cline, Roo, Windsurf) — [`docs/client-integration.md`](./docs/client-integration.md)
-- 📄 **Capability Manifest Specification** (protocol-neutral core; MCP is binding #1) — [SPEC.md](https://github.com/eunolabs/mcp-capability-manifest/blob/main/SPEC.md) · [MCP binding](https://github.com/eunolabs/mcp-capability-manifest/blob/main/bindings/mcp.md)
+- 📄 **Capability Manifest Specification** (protocol-neutral core; MCP is binding #1) — [SPEC.md](https://github.com/eunolabs/agent-capability-manifest/blob/main/SPEC.md) · [MCP binding](https://github.com/eunolabs/agent-capability-manifest/blob/main/bindings/mcp.md)
 - 📋 **Capability manifest guide** — [`docs/capability-manifest-guide.md`](./docs/capability-manifest-guide.md)
 - 🗺 **MCP 2025-11-25 conformance matrix** — what eunox enforces, what the IdP must provide, known gaps, Auth0/Okta/WorkOS/Cloudflare integration examples — [`docs/conformance.md`](./docs/conformance.md)
 - 🛡 **Threat model** — [`docs/threat-model-mcp.md`](./docs/threat-model-mcp.md)

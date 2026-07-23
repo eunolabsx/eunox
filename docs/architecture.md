@@ -413,7 +413,7 @@ lifecycle:
 
 - [adr/](./adr/) — Architecture Decision Records: why specific load-bearing decisions were made.
 - [capability-manifest-guide.md](./capability-manifest-guide.md) — manifest authoring.
-- [Capability Manifest Specification](https://github.com/eunolabs/mcp-capability-manifest) — the normative grammar.
+- [Capability Manifest Specification](https://github.com/eunolabs/agent-capability-manifest) — the normative grammar.
 - [threat-model-mcp.md](./threat-model-mcp.md) — what the proxy defends against, and what it cannot.
 - [benchmarks.md](./benchmarks.md) — enforcement overhead numbers.
 - [repo-guide.md](./repo-guide.md) — building, testing, repository layout.

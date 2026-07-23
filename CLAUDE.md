@@ -64,6 +64,6 @@ Three layers: `cmd/eunox/` is the binary (CLI, transport wiring, PDP wiring); `p
 - Every `.go` file starts with the two-line header: `// Copyright 2026 Eunolabs, LLC` + `// SPDX-License-Identifier: Apache-2.0`.
 - Conventional Commits (`feat:`, `fix:`, `sec:`, `docs:`, `test:`, `ci:`, `chore:`; `!` for breaking). DCO sign-off required: `git commit -s`.
 - Tests: new condition types need table-driven tests under `pkg/capability/` (allow + deny + malformed-input cases); new MCP method coverage needs a test in `internal/transport/enforcement_gaps_test.go`; new audit-record fields need a sign-and-verify round-trip test.
-- Behavior changes need a docs update in the same PR. Manifest grammar changes also update `docs/capability-manifest-guide.md` and the spec repo (`eunolabs/mcp-capability-manifest`). Schema changes update `schemas/` plus a roundtrip test.
+- Behavior changes need a docs update in the same PR. Manifest grammar changes also update `docs/capability-manifest-guide.md` and the spec repo (`eunolabs/agent-capability-manifest`). Schema changes update `schemas/` plus a roundtrip test.
 - Security vulnerabilities go through `SECURITY.md`, not public issues.
 - Never reference issue numbers, bug IDs, or internal milestones (stages, phases, epics, sprints) in code comments, documentation, or site copy. Those references rot and belong in the PR description or commit message only.
