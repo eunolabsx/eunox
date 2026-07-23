@@ -23,7 +23,7 @@ Design and operational documentation for `eunox`.
 | [threat-model-mcp.md](./threat-model-mcp.md) | Security threat model for the `eunox` proxy. |
 | [deployment-hardening.md](./deployment-hardening.md) | Making eunox a mandatory enforcement chokepoint: credential, network, and endpoint controls that prevent direct-to-upstream bypass. |
 | [whitepaper/deploymentwhitepaper.pdf](./whitepaper/deploymentwhitepaper.pdf) | Deployment whitepaper (PDF) — the printable companion to `deployment-hardening.md`. |
-| [Capability Manifest Specification](https://github.com/eunolabs/mcp-capability-manifest) | The normative spec — published as a standalone vendor-neutral repo (Apache-2.0). |
+| [Capability Manifest Specification](https://github.com/eunolabs/agent-capability-manifest) | The normative spec — published as a standalone vendor-neutral repo (Apache-2.0). |
 
 ## Performance
 

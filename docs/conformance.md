@@ -352,9 +352,9 @@ authorization server:
    the experimental intersection applies with
    `--jwt-experimental-capabilities`, unchanged. The capability-manifest
    specification covers
-   [issuer configuration](https://github.com/eunolabs/mcp-capability-manifest/blob/main/SPEC.md#43-issuer-configuration-non-normative)
+   [issuer configuration](https://github.com/eunolabs/agent-capability-manifest/blob/main/SPEC.md#43-issuer-configuration-non-normative)
    and
-   [composition with MCP authorization flows](https://github.com/eunolabs/mcp-capability-manifest/blob/main/SPEC.md#44-composition-with-mcp-authorization-flows-non-normative)
+   [composition with MCP authorization flows](https://github.com/eunolabs/agent-capability-manifest/blob/main/SPEC.md#44-composition-with-mcp-authorization-flows-non-normative)
    in detail.
 
 ---

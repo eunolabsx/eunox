@@ -2,7 +2,7 @@
 
 > Patterns for writing capability manifests that work the first time
 > and age well. This guide is the practical companion to the normative
-> [Capability Manifest Specification](https://github.com/eunolabs/mcp-capability-manifest/blob/main/SPEC.md)
+> [Capability Manifest Specification](https://github.com/eunolabs/agent-capability-manifest/blob/main/SPEC.md)
 > and to `eunox validate` in `cmd/eunox/`. Where this guide and the
 > specification differ, the specification governs.
 
@@ -455,7 +455,7 @@ capability claim.
 | | **IdP capability claim** |
 |---|---|
 | Where it lives | `mcp.*` claim inside a JWT your IdP issues |
-| Schema | published [`mcp-jwt-claim.json`](https://github.com/eunolabs/mcp-capability-manifest/blob/main/schemas/0.1/mcp-jwt-claim.json), `mcp.v = "0.2"` (experimental) |
+| Schema | published [`mcp-jwt-claim.json`](https://github.com/eunolabs/agent-capability-manifest/blob/main/schemas/0.1/mcp-jwt-claim.json), `mcp.v = "0.2"` (experimental) |
 | Go type | `mcpClaimSet` in `internal/pdp/jwt.go` |
 | Verified by | the IdP's JWKS (`--jwks-uri`) |
 | `capabilities` shape | array of **shorthand strings** (`tool:read_file?path=/reports/*`) |

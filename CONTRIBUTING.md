@@ -225,7 +225,7 @@ rules:
 - Manifest grammar changes need an update to
   [`docs/capability-manifest-guide.md`](./docs/capability-manifest-guide.md)
   *and* a corresponding change in the public spec repo
-  ([`eunolabs/mcp-capability-manifest`](https://github.com/eunolabs/mcp-capability-manifest)).
+  ([`eunolabs/agent-capability-manifest`](https://github.com/eunolabs/agent-capability-manifest)).
 - Schema changes need [`schemas/`](./schemas/) updated and a roundtrip test.
 - Dependency changes that add or drop a third-party module linked into the
   binary need a matching [`NOTICE`](./NOTICE) update. `make check-notice`
