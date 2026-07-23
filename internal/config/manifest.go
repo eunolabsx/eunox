@@ -881,27 +881,49 @@ func validateLocalManifest(m *LocalManifest) error {
 				return err
 			}
 		}
-		// Response directives (e.g. redactFields) mutate the upstream RESPONSE, and
-		// the proxy only redacts tools/call results. A directive on a non-tool
-		// target would never apply — a fail-open leak plus a false "discharged"
-		// audit record. Reject at load.
-		if len(c.Directives) > 0 && targetType != capability.TargetTypeTool {
-			return fmt.Errorf("capability at index %d: constraint %q carries directives, which apply only to tool: targets (the proxy redacts tools/call results, not %s responses)", i, c.Target, targetType)
-		}
 		// Validate principal scoping: only supported claims, each with a non-empty
 		// pattern, so a typo'd claim (which would never match) is caught at load.
 		if err := validatePrincipal(c.Principal); err != nil {
 			return fmt.Errorf("capability at index %d: %w", i, err)
 		}
-		// Reject redactFields array-index notation; see validateRedactFields.
+		// Validate directives. redactFields mutates the tools/call RESPONSE and so
+		// applies only to tool: targets (a directive that never applies is a fail-open
+		// leak plus a false "discharged" audit record). labelOutput is different: it is
+		// an enforce-time state directive that records flow labels on allow, not a
+		// response mutation, so it is valid on any source target and is staged behind the
+		// flow+effect draft schemaVersion. A null directive is rejected fail-closed like
+		// a null condition.
 		for j, dir := range c.Directives {
-			switch rd := dir.(type) {
+			if dir == nil {
+				return fmt.Errorf("capability at index %d, directive %d: a null directive is not permitted; every directives entry must be a typed directive object", i, j)
+			}
+			switch d := dir.(type) {
 			case *capability.RedactFieldsDirective:
-				if err := validateRedactFields(i, j, rd.Fields); err != nil {
+				if err := requireResponseDirectiveTarget(i, c.Target, targetType); err != nil {
+					return err
+				}
+				if err := validateRedactFields(i, j, d.Fields); err != nil {
 					return err
 				}
 			case capability.RedactFieldsDirective:
-				if err := validateRedactFields(i, j, rd.Fields); err != nil {
+				if err := requireResponseDirectiveTarget(i, c.Target, targetType); err != nil {
+					return err
+				}
+				if err := validateRedactFields(i, j, d.Fields); err != nil {
+					return err
+				}
+			case *capability.LabelOutputDirective:
+				if err := requireFlowEffectDraft(m, "the labelOutput directive", i); err != nil {
+					return err
+				}
+				if err := validateLabelOutput(i, j, d.Labels); err != nil {
+					return err
+				}
+			case capability.LabelOutputDirective:
+				if err := requireFlowEffectDraft(m, "the labelOutput directive", i); err != nil {
+					return err
+				}
+				if err := validateLabelOutput(i, j, d.Labels); err != nil {
 					return err
 				}
 			}
@@ -1008,6 +1030,20 @@ func validateLocalManifest(m *LocalManifest) error {
 				}
 			case *capability.SequenceBlockCondition:
 				if err := validateSequenceBlock(i, j, v); err != nil {
+					return err
+				}
+			case capability.FlowLabelCondition:
+				if err := requireFlowEffectDraft(m, "the flowLabel condition", i); err != nil {
+					return err
+				}
+				if err := validateFlowLabel(i, j, v.Allow); err != nil {
+					return err
+				}
+			case *capability.FlowLabelCondition:
+				if err := requireFlowEffectDraft(m, "the flowLabel condition", i); err != nil {
+					return err
+				}
+				if err := validateFlowLabel(i, j, v.Allow); err != nil {
 					return err
 				}
 			}
@@ -1475,6 +1511,59 @@ func validateSequenceBlock(i, j int, v *capability.SequenceBlockCondition) error
 		// prefix (see the doc comment).
 		if strings.Contains(entry, ":") && stripped == entry {
 			return fmt.Errorf("capability at index %d, condition %d, afterTools entry %d: sequenceBlock entry %q is ambiguous: the text before its first ':' is not a recognized namespace prefix (tool:, resource:, prompt:, system:), so the entry is matched literally — a namespace typo like 'mcp:read_file' then silently never fires, and a resource URI must carry the explicit resource: prefix (resource:file:///secrets). Add one of tool:, resource:, prompt:, or system: to disambiguate", i, j, k, entry)
+		}
+	}
+	return nil
+}
+
+// requireFlowEffectDraft fails closed unless the manifest opts into the experimental
+// flow+effect draft grammar. The flowLabel condition and labelOutput directive are
+// staged behind schema-version negotiation: valid only under the draft revision, so a
+// published "0.1" manifest that uses one is rejected (the closed grammar stays closed)
+// rather than silently enabling an experimental predicate. The SchemaVersion is
+// compared trimmed so a quoted, whitespace-padded scalar is judged on its real value.
+func requireFlowEffectDraft(m *LocalManifest, feature string, i int) error {
+	if strings.TrimSpace(m.SchemaVersion) != ManifestSchemaVersionFlowEffectDraft {
+		return fmt.Errorf("capability at index %d: %s is experimental and requires schemaVersion %q (the flow+effect draft); this manifest declares schemaVersion %q, under which the token is not part of the grammar", i, feature, ManifestSchemaVersionFlowEffectDraft, strings.TrimSpace(m.SchemaVersion))
+	}
+	return nil
+}
+
+// requireResponseDirectiveTarget rejects a response-mutating directive (redactFields)
+// on a non-tool target: the proxy redacts tools/call results only, so such a directive
+// would never apply — a fail-open leak plus a false "discharged" audit record.
+// labelOutput does not go through here; it is an enforce-time state directive valid on
+// any source target.
+func requireResponseDirectiveTarget(i int, target string, targetType capability.TargetType) error {
+	if targetType != capability.TargetTypeTool {
+		return fmt.Errorf("capability at index %d: constraint %q carries a redactFields directive; redactFields directives apply only to tool: targets (the proxy redacts tools/call results, not %s responses)", i, target, targetType)
+	}
+	return nil
+}
+
+// validateFlowLabel checks a flowLabel condition's Allow set against the closed native
+// vocabulary, so a misspelled label is a load-time error rather than an inert entry
+// (the closed grammar is a determinism invariant). An empty Allow is valid — it admits
+// only an unlabeled, clean-context flow (the strictest, fail-closed sink).
+func validateFlowLabel(i, j int, allow []string) error {
+	for _, l := range allow {
+		if !capability.IsFlowLabel(l) {
+			return fmt.Errorf("capability at index %d, condition %d: flowLabel 'allow' contains unknown label %q — valid native flow labels are %s", i, j, l, strings.Join(capability.FlowLabelVocabulary(), ", "))
+		}
+	}
+	return nil
+}
+
+// validateLabelOutput checks a labelOutput directive: a non-empty Labels list (an
+// empty one records nothing and is an authoring mistake, like an empty sequenceBlock),
+// every entry drawn from the closed native vocabulary.
+func validateLabelOutput(i, j int, labels []string) error {
+	if len(labels) == 0 {
+		return fmt.Errorf("capability at index %d, directive %d: labelOutput requires a non-empty 'labels' list naming the native flow labels this call's output carries; an empty list records nothing", i, j)
+	}
+	for _, l := range labels {
+		if !capability.IsFlowLabel(l) {
+			return fmt.Errorf("capability at index %d, directive %d: labelOutput 'labels' contains unknown label %q — valid native flow labels are %s", i, j, l, strings.Join(capability.FlowLabelVocabulary(), ", "))
 		}
 	}
 	return nil

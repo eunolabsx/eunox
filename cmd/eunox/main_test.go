@@ -498,7 +498,7 @@ func TestCmdAuditVerify_WithRecords(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openAuditSink: %v", err)
 	}
-	sink.RecordAllow(context.Background(), "sess-1", "read_file", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess-1", "read_file", "tools/call", nil, nil, false, nil, nil)
 	sink.RecordDeny(context.Background(), "sess-1", "write_file", "tools/call", "CAPABILITY_DENIED", "", nil, false)
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -527,8 +527,8 @@ func TestCmdAuditVerify_VerifiesRotatedSet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	sink.RecordAllow(context.Background(), "sess", "a", "tools/call", nil, nil, false)
-	sink.RecordAllow(context.Background(), "sess", "b", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess", "a", "tools/call", nil, nil, false, nil, nil)
+	sink.RecordAllow(context.Background(), "sess", "b", "tools/call", nil, nil, false, nil, nil)
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -540,7 +540,7 @@ func TestCmdAuditVerify_VerifiesRotatedSet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
-	sink.RecordAllow(context.Background(), "sess", "c", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess", "c", "tools/call", nil, nil, false, nil, nil)
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close (segment 2): %v", err)
 	}
@@ -626,7 +626,7 @@ func TestCmdAuditVerify_WithRequestIDFilter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openAuditSink: %v", err)
 	}
-	sink.RecordAllow(context.Background(), "sess-1", "read_file", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess-1", "read_file", "tools/call", nil, nil, false, nil, nil)
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -676,7 +676,7 @@ func TestCmdAuditVerify_SinceFilter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openAuditSink: %v", err)
 	}
-	sink.RecordAllow(context.Background(), "sess-1", "read_file", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess-1", "read_file", "tools/call", nil, nil, false, nil, nil)
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -1380,7 +1380,7 @@ func TestRecordOversizedAgentTaskIDBounded(t *testing.T) {
 
 	huge := strings.Repeat("A", 5<<20) // ~5 MiB attacker-controlled JWT claim
 	ctx := pdp.WithJWTClaims(context.Background(), &pdp.JWTClaims{AgentID: huge, TaskID: huge})
-	sink.RecordAllow(ctx, "sess", "read_file", "tools/call", nil, nil, false)
+	sink.RecordAllow(ctx, "sess", "read_file", "tools/call", nil, nil, false, nil, nil)
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -3429,7 +3429,7 @@ func TestAuditRecord_SignVerifyRoundTrip(t *testing.T) {
 		if c.decision == "deny" {
 			sink.RecordDeny(context.Background(), c.session, c.tool, "tools/call", c.denialCode, "", nil, false)
 		} else {
-			sink.RecordAllow(context.Background(), c.session, c.tool, "tools/call", nil, nil, false)
+			sink.RecordAllow(context.Background(), c.session, c.tool, "tools/call", nil, nil, false, nil, nil)
 		}
 	}
 	// Record enqueues to a background drainer goroutine; Close flushes it.
@@ -3492,7 +3492,7 @@ func TestAuditSink_ConcurrentRecord(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < perGoroutine; j++ {
-				sink.RecordAllow(context.Background(), "sess-c", "list_files", "tools/call", nil, nil, false)
+				sink.RecordAllow(context.Background(), "sess-c", "list_files", "tools/call", nil, nil, false, nil, nil)
 			}
 		}()
 	}
@@ -3515,7 +3515,7 @@ func TestAuditSink_CloseFlushesQueuedRecords(t *testing.T) {
 
 	const n = 100
 	for i := 0; i < n; i++ {
-		sink.RecordAllow(context.Background(), "sess-flush", "read_file", "tools/call", nil, nil, false)
+		sink.RecordAllow(context.Background(), "sess-flush", "read_file", "tools/call", nil, nil, false, nil, nil)
 	}
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -3545,8 +3545,8 @@ func TestAuditSink_RotateKeepsWriting(t *testing.T) {
 		t.Fatalf("openAuditSink: %v", err)
 	}
 
-	sink.RecordAllow(context.Background(), "sess-before", "tool_before_rotate", "tools/call", nil, nil, false)
-	sink.RecordAllow(context.Background(), "sess-after", "tool_after_rotate", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess-before", "tool_before_rotate", "tools/call", nil, nil, false, nil, nil)
+	sink.RecordAllow(context.Background(), "sess-after", "tool_after_rotate", "tools/call", nil, nil, false, nil, nil)
 
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -3589,7 +3589,7 @@ func TestAuditSink_NormalWrite_StillWorks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openAuditSink: %v", err)
 	}
-	sink.RecordAllow(context.Background(), "sess-ok", "read_file", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess-ok", "read_file", "tools/call", nil, nil, false, nil, nil)
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}

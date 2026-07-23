@@ -1,0 +1,33 @@
+# demo/manifest-flow.yaml — information-flow-control demo policy (Demo (a)).
+#
+# Opts into the experimental flow+effect draft grammar (schemaVersion 0.2-draft), so
+# the flowLabel condition and labelOutput directive are available. The published "0.1"
+# grammar does NOT recognize these tokens — they are staged behind schema-version
+# negotiation until a batched grammar bump.
+#
+# The scenario: an agent holds granted capabilities for BOTH a sensitive read and an
+# egress write. Reading the sensitive source labels the task; the egress sink permits
+# only public/internal-labeled flows, so once the confidential label is present the
+# egress is denied by source->sink flow policy — deterministically, no model involved.
+# In a clean session (no sensitive read) the identical egress write is allowed.
+schemaVersion: "0.2-draft"
+name: demo-flow-policy
+version: "0.1.0"
+
+capabilities:
+  # Source: reading the customer/financial file is permitted, and its output carries
+  # the `confidential` label into the task (assertion by policy, never content inference).
+  - target: tool:read_file
+    actions: [call]
+    directives:
+      - type: labelOutput
+        labels: [confidential]
+
+  # Sink: the egress write is permitted, but only for flows whose accumulated labels are
+  # a subset of {public, internal}. A confidential (or untrusted) label in the task is
+  # outside that set, so the write is denied at the boundary.
+  - target: tool:write_file
+    actions: [call]
+    conditions:
+      - type: flowLabel
+        allow: [public, internal]

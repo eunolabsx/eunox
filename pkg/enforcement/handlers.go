@@ -167,6 +167,7 @@ func (e *Engine) registerBuiltins() {
 	e.handlers[capability.ConditionTypeRecipientDomain] = ConditionHandlerFunc(e.handleRecipientDomain)
 	e.handlers[capability.ConditionTypeAllowedValues] = ConditionHandlerFunc(e.handleAllowedValues)
 	e.handlers[capability.ConditionTypeSequenceBlock] = ConditionHandlerFunc(e.handleSequenceBlock)
+	e.handlers[capability.ConditionTypeFlowLabel] = ConditionHandlerFunc(e.handleFlowLabel)
 	e.handlers[capability.ConditionTypePolicy] = ConditionHandlerFunc(e.handlePolicy)
 	e.handlers[capability.ConditionTypeCustom] = ConditionHandlerFunc(e.handleCustom)
 }

@@ -754,7 +754,7 @@ func TestAdv7_NotificationFramedEnforcedMethod_Stdio_AuditRecordWritten(t *testi
 // captured output reflects the true call order in dispatchUnmapped.
 type orderTrackingRecorder struct{}
 
-func (orderTrackingRecorder) RecordAllow(context.Context, string, string, string, map[string]interface{}, []string, bool) {
+func (orderTrackingRecorder) RecordAllow(context.Context, string, string, string, map[string]interface{}, []string, bool, []string, []string) {
 }
 
 func (orderTrackingRecorder) RecordDeny(context.Context, string, string, string, string, string, map[string]interface{}, bool) {

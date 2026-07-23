@@ -25,7 +25,7 @@ import (
 // test; a direct assignment of a nil concrete pointer would reintroduce the typed-nil
 // interface trap.
 type auditRecorder interface {
-	RecordAllow(ctx context.Context, sessionID, identifier, method string, details map[string]interface{}, obligs []string, auditOnly bool)
+	RecordAllow(ctx context.Context, sessionID, identifier, method string, details map[string]interface{}, obligs []string, auditOnly bool, labelsOut, carriedLabels []string)
 	RecordDeny(ctx context.Context, sessionID, identifier, method, denialCode, condType string, details map[string]interface{}, observe bool)
 	// AuditDegraded reports whether the audit trail has lost coverage (a dropped or
 	// failed-to-write record). reason is a short prose note for the host-facing
@@ -396,7 +396,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 	// genuine allow. allowDetails supplies the structured details.
 	warnIfStrictAuditJustDegraded(fp.requireAuditStrict, fp.rec, kind, denialTarget, func() {
 		if fp.rec != nil {
-			fp.rec.RecordAllow(ctx, fp.sessionID, auditID, method, allowDetails(upResp), oblNames, fp.audit || dec.AuditOnly)
+			fp.rec.RecordAllow(ctx, fp.sessionID, auditID, method, allowDetails(upResp), oblNames, fp.audit || dec.AuditOnly, dec.LabelsOut, dec.CarriedLabels)
 		}
 	})
 	upResp.ID = msg.ID
@@ -535,7 +535,7 @@ func recordForwardOutcome(ctx context.Context, strict bool, rec auditRecorder, s
 			return
 		}
 		if delivered {
-			rec.RecordAllow(ctx, sessionID, method, method, nil, nil, auditOnly)
+			rec.RecordAllow(ctx, sessionID, method, method, nil, nil, auditOnly, nil, nil)
 		} else {
 			rec.RecordDeny(ctx, sessionID, method, method, capability.ErrCodeEnforcementError, "", nil, false)
 		}

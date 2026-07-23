@@ -94,11 +94,11 @@ type routeSink struct {
 // RecordAllow stamps the route identity and policy provenance onto an allow
 // record and forwards to the shared sink. RecordAllow/RecordDeny match
 // *audit.Sink's typed recorders so the HTTP handlers stay upstream-agnostic.
-func (r *routeSink) RecordAllow(ctx context.Context, sessionID, identifier, method string, details map[string]interface{}, obligs []string, auditOnly bool) {
+func (r *routeSink) RecordAllow(ctx context.Context, sessionID, identifier, method string, details map[string]interface{}, obligs []string, auditOnly bool, labelsOut, carriedLabels []string) {
 	if r == nil || r.sink == nil {
 		return
 	}
-	r.sink.Record(ctx, r.upstream, r.policyVersion, r.policySHA256, sessionID, identifier, method, "allow", "", "", details, obligs, auditOnly)
+	r.sink.Record(ctx, r.upstream, r.policyVersion, r.policySHA256, sessionID, identifier, method, "allow", "", "", details, obligs, auditOnly, labelsOut, carriedLabels)
 }
 
 // RecordDeny stamps route identity onto a deny record (see RecordAllow).
@@ -106,7 +106,7 @@ func (r *routeSink) RecordDeny(ctx context.Context, sessionID, identifier, metho
 	if r == nil || r.sink == nil {
 		return
 	}
-	r.sink.Record(ctx, r.upstream, r.policyVersion, r.policySHA256, sessionID, identifier, method, "deny", denialCode, condType, details, nil, observe)
+	r.sink.Record(ctx, r.upstream, r.policyVersion, r.policySHA256, sessionID, identifier, method, "deny", denialCode, condType, details, nil, observe, nil, nil)
 }
 
 // AuditDegraded delegates to the shared sink so the --require-audit=strict gate

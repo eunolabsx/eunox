@@ -60,9 +60,18 @@ type auditRecord struct {
 	ConditionType string          `json:"condition_type,omitempty"`
 	Details       json.RawMessage `json:"details,omitempty"` // marshaled once at record time (marshalAndBoundDetails); writeRecord embeds it verbatim rather than re-marshaling the map
 	Obligations   []string        `json:"obligations,omitempty"`
-	KeyID         string          `json:"key_id,omitempty"` // id of the HMAC key that signed this record; lets audit-verify select the right key after rotation (§ 3.4)
-	PrevHMAC      string          `json:"prev_hmac"`        // _hmac of the preceding record (genesis sentinel for the first); chains records together
-	HMAC          string          `json:"_hmac,omitempty"`
+	// LabelsOut and CarriedLabels are the information-flow-control fields: the native
+	// flow labels this call's output asserted into the session (labelsOut, from its
+	// labelOutput directives) and the session's accumulated label set observed at
+	// decision time (carriedLabels), so a source->sink flow reconstructs from the tape
+	// alone. Both are drawn from the closed native vocabulary — never free-form, never
+	// IdP- or argument-sourced — so unlike Obligations they need no length bound.
+	// Present only on flow-relevant decisions; omitted otherwise.
+	LabelsOut     []string `json:"labels_out,omitempty"`
+	CarriedLabels []string `json:"carried_labels,omitempty"`
+	KeyID         string   `json:"key_id,omitempty"` // id of the HMAC key that signed this record; lets audit-verify select the right key after rotation (§ 3.4)
+	PrevHMAC      string   `json:"prev_hmac"`        // _hmac of the preceding record (genesis sentinel for the first); chains records together
+	HMAC          string   `json:"_hmac,omitempty"`
 }
 
 // auditGenesisPrev is the prev_hmac stamped on the first record of a brand-new
@@ -1283,8 +1292,8 @@ func truncatePartialTail(f *os.File) (int64, error) {
 // whose agent_id/task_id/user_id are stamped (§ 2.1). auditOnly marks an observed-but-not-
 // enforced allow (audit mode): the would-be verdict is logged with full arguments
 // and the call forwarded.
-func (s *Sink) RecordAllow(ctx context.Context, sessionID, identifier, method string, details map[string]interface{}, obligs []string, auditOnly bool) {
-	s.Record(ctx, "", "", "", sessionID, identifier, method, "allow", "", "", details, obligs, auditOnly)
+func (s *Sink) RecordAllow(ctx context.Context, sessionID, identifier, method string, details map[string]interface{}, obligs []string, auditOnly bool, labelsOut, carriedLabels []string) {
+	s.Record(ctx, "", "", "", sessionID, identifier, method, "allow", "", "", details, obligs, auditOnly, labelsOut, carriedLabels)
 }
 
 // RecordDeny enqueues a deny audit record (see RecordAllow for the shared
@@ -1292,7 +1301,10 @@ func (s *Sink) RecordAllow(ctx context.Context, sessionID, identifier, method st
 // observe is the audit-mode flag — an observed deny is logged and forwarded rather
 // than enforced. A deny never carries obligations, so none is accepted.
 func (s *Sink) RecordDeny(ctx context.Context, sessionID, identifier, method, denialCode, condType string, details map[string]interface{}, observe bool) {
-	s.Record(ctx, "", "", "", sessionID, identifier, method, "deny", denialCode, condType, details, nil, observe)
+	// A deny carries no labels_out (the call produced no output) and no carried_labels:
+	// a flowLabel deny already names the offending label in its structured details, so
+	// the deny path stays on the narrow signature and passes nil for both.
+	s.Record(ctx, "", "", "", sessionID, identifier, method, "deny", denialCode, condType, details, nil, observe, nil, nil)
 }
 
 // clock returns the sink's current time via the injected now func, falling back
@@ -1308,7 +1320,7 @@ func (s *Sink) clock() time.Time {
 // stamp the route name and in-force policy provenance. RecordAllow/RecordDeny
 // forward here with empty values for the single-upstream/stdio path; gateway
 // routeSinks call it directly.
-func (s *Sink) Record(ctx context.Context, upstream, policyVersion, policySHA256, sessionID, identifier, method, decision, denialCode, condType string, details map[string]interface{}, obligs []string, auditOnly bool) {
+func (s *Sink) Record(ctx context.Context, upstream, policyVersion, policySHA256, sessionID, identifier, method, decision, denialCode, condType string, details map[string]interface{}, obligs []string, auditOnly bool, labelsOut, carriedLabels []string) {
 	activityID := 1
 	if decision == "deny" {
 		activityID = 2
@@ -1362,7 +1374,14 @@ func (s *Sink) Record(ctx context.Context, upstream, policyVersion, policySHA256
 		// emit one obligation per match, so a crafted manifest can grow this slice past
 		// the 4 MiB scanner buffer and defeat the queue's per-record bound.
 		Obligations: boundAuditObligations(slices.Clone(obligs)),
-		KeyID:       s.keyID,
+		// Clone the label slices so the queued record owns immutable bytes (a caller
+		// mutation after Record returns cannot reach the serialized record), mirroring
+		// Obligations. No length bound: labels are drawn from the closed native
+		// vocabulary, not caller free-form text. slices.Clone(nil) is nil, so a non-flow
+		// decision keeps both fields omitted.
+		LabelsOut:     slices.Clone(labelsOut),
+		CarriedLabels: slices.Clone(carriedLabels),
+		KeyID:         s.keyID,
 	}
 
 	// Non-blocking enqueue: drop and count if the channel is full. The read lock

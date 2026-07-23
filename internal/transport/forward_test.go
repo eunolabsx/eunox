@@ -31,12 +31,14 @@ import (
 )
 
 type fwdCapturedRecord struct {
-	decision   string
-	code       string
-	details    map[string]interface{}
-	obligs     []string
-	auditOnly  bool
-	identifier string
+	decision      string
+	code          string
+	details       map[string]interface{}
+	obligs        []string
+	auditOnly     bool
+	labelsOut     []string
+	carriedLabels []string
+	identifier    string
 }
 
 type fwdRecorder struct {
@@ -55,9 +57,9 @@ type fwdRecorder struct {
 	degradeOnRecord bool
 }
 
-func (f *fwdRecorder) RecordAllow(_ context.Context, _, identifier, _ string, details map[string]interface{}, obligs []string, auditOnly bool) {
+func (f *fwdRecorder) RecordAllow(_ context.Context, _, identifier, _ string, details map[string]interface{}, obligs []string, auditOnly bool, labelsOut, carriedLabels []string) {
 	f.records = append(f.records, fwdCapturedRecord{
-		decision: "allow", details: details, obligs: obligs, auditOnly: auditOnly, identifier: identifier,
+		decision: "allow", details: details, obligs: obligs, auditOnly: auditOnly, identifier: identifier, labelsOut: labelsOut, carriedLabels: carriedLabels,
 	})
 	if f.degradeOnRecord {
 		f.degraded = true
@@ -697,7 +699,7 @@ func TestForwardServerRequest_ObserveLeg_RecordsDenyBeforeForward(t *testing.T) 
 // mirroring orderTrackingRecorder in dispatch_test.go.
 type forwardOrderRecorder struct{}
 
-func (forwardOrderRecorder) RecordAllow(context.Context, string, string, string, map[string]interface{}, []string, bool) {
+func (forwardOrderRecorder) RecordAllow(context.Context, string, string, string, map[string]interface{}, []string, bool, []string, []string) {
 }
 
 func (forwardOrderRecorder) RecordDeny(context.Context, string, string, string, string, string, map[string]interface{}, bool) {
@@ -894,7 +896,7 @@ func TestAuditSink_CloseRace_NoSendOnClosedChannel(t *testing.T) {
 			<-start // release all producers at once to widen the race window
 			for j := 0; j < 500; j++ {
 				// Must not panic even when the channel is closed underneath us.
-				sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false)
+				sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false, nil, nil)
 			}
 		}()
 	}
@@ -932,7 +934,7 @@ func TestAuditSink_RecordAfterClose_DropsWithoutPanic(t *testing.T) {
 	}
 
 	before := sink.DroppedRecords()
-	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false, nil, nil)
 	if got := sink.DroppedRecords(); got != before+1 {
 		t.Fatalf("record after close: dropped = %d, want %d", got, before+1)
 	}
@@ -962,7 +964,7 @@ func TestAuditSink_RecordNoRaceOnDetailsMutation(t *testing.T) {
 				nested := map[string]interface{}{"secret": "v"}
 				details := map[string]interface{}{"path": "/tmp/file", "n": float64(j), "nested": nested}
 				obligs := []string{"redactFields"}
-				sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", details, obligs, true)
+				sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", details, obligs, true, nil, nil)
 				// Race the drainer: keep writing to the same structures — top-level
 				// and nested — after the handoff. The deep clone inside Record means
 				// the drainer never touches these, so the detector must stay silent.
@@ -997,7 +999,7 @@ func TestAuditRotate_TriggeredByMaxBytes(t *testing.T) {
 	t.Cleanup(func() { _ = sink.Close() })
 
 	// Write a record → triggers drain → triggers rotate().
-	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false, nil, nil)
 
 	// Closing flushes the drainer.
 	if err := sink.Close(); err != nil {
@@ -1734,7 +1736,7 @@ func TestAuditOnly_StdioProxy_DeniedToolForwarded(t *testing.T) {
 func TestAuditSink_Record_AuditOnlyWrittenToFile(t *testing.T) {
 	sink, logPath := newTempAuditSink(t)
 
-	sink.RecordAllow(context.Background(), "sess1", "read_file", "tools/call", map[string]interface{}{"path": "/x"}, nil, true)
+	sink.RecordAllow(context.Background(), "sess1", "read_file", "tools/call", map[string]interface{}{"path": "/x"}, nil, true, nil, nil)
 	sink.RecordDeny(context.Background(), "sess1", "write_file", "tools/call", "AUTHORIZATION_FAILED", "", nil, false)
 	_ = sink.Close()
 
@@ -1760,7 +1762,7 @@ func TestAuditSink_Record_AuditOnlyPreservesHMACVerification(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openAuditSink: %v", err)
 	}
-	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, true)
+	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, true, nil, nil)
 	_ = sink.Close()
 
 	data, _ := os.ReadFile(logPath) //nolint:gosec // G304: path is test-controlled temp dir
@@ -1795,8 +1797,8 @@ func TestAuditSink_Record_StructuredTargetFields(t *testing.T) {
 	// memory:notes is an opaque resource URI (no "://") that a string heuristic
 	// would misread as a tool; the prompt identifier carries the "prompts/"
 	// display prefix that target must strip.
-	sink.RecordAllow(context.Background(), "s", "memory:notes", "resources/read", nil, nil, false)
-	sink.RecordAllow(context.Background(), "s", "prompts/code_review", "prompts/get", nil, nil, false)
+	sink.RecordAllow(context.Background(), "s", "memory:notes", "resources/read", nil, nil, false, nil, nil)
+	sink.RecordAllow(context.Background(), "s", "prompts/code_review", "prompts/get", nil, nil, false, nil, nil)
 	sink.RecordDeny(context.Background(), "s", "read_file", "tools/call", "AUTHORIZATION_FAILED", "", nil, false)
 	sink.RecordDeny(context.Background(), "s", "sampling/createMessage", "sampling/createMessage", "SAMPLING_DENIED", "", nil, false)
 	// A pre-dispatch record (e.g. a JWT rejection) carries no MCP method, so the
@@ -1890,7 +1892,7 @@ func TestVerifyAuditLog_SanitizesControlCharsInInvalidLine(t *testing.T) {
 	// Both fields carry a newline followed by a forged INVALID line.
 	spoofSession := "sess\nINVALID  seq=98 request_id=forged session_id= target=spoofed-session"
 	spoofTarget := "tool-x\nINVALID  seq=99 request_id=forged session_id= target=spoofed-target"
-	sink.RecordAllow(context.Background(), spoofSession, spoofTarget, "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), spoofSession, spoofTarget, "tools/call", nil, nil, false, nil, nil)
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -2039,9 +2041,9 @@ func TestAuditRecord_StampsJWTAgentAndTask(t *testing.T) {
 		TaskID:  "task-abc",
 		Subject: "sub-1",
 	})
-	sink.RecordAllow(ctx, "sess", "read_file", "tools/call", nil, nil, false)
+	sink.RecordAllow(ctx, "sess", "read_file", "tools/call", nil, nil, false, nil, nil)
 	// No JWT in context → agent_id/task_id must be omitted.
-	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false, nil, nil)
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}

@@ -280,7 +280,7 @@ func TestCmdAuditVerify_ConfigProvidesDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("audit.Open: %v", err)
 	}
-	sink.RecordAllow(context.Background(), "sess-1", "read_file", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess-1", "read_file", "tools/call", nil, nil, false, nil, nil)
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -577,7 +577,7 @@ func TestWriteDoctorAudit_WithKeyPresentAndTail(t *testing.T) {
 	if err != nil {
 		t.Fatalf("audit.Open: %v", err)
 	}
-	sink.RecordAllow(context.Background(), "sess-1", "read_file", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess-1", "read_file", "tools/call", nil, nil, false, nil, nil)
 	sink.RecordDeny(context.Background(), "sess-1", "write_file", "tools/call", "CAPABILITY_DENIED", "", nil, false)
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -606,7 +606,7 @@ func TestWriteDoctorAudit_TailSkipped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("audit.Open: %v", err)
 	}
-	sink.RecordAllow(context.Background(), "sess-1", "read_file", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess-1", "read_file", "tools/call", nil, nil, false, nil, nil)
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -2514,7 +2514,7 @@ func TestCmdAuditVerify_InvalidSince(t *testing.T) {
 	if err != nil {
 		t.Fatalf("audit.Open: %v", err)
 	}
-	sink.RecordAllow(context.Background(), "s", "c", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "s", "c", "tools/call", nil, nil, false, nil, nil)
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -2822,7 +2822,7 @@ func TestCmdAuditVerify_UnknownKeyID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("audit.Open: %v", err)
 	}
-	sink.RecordAllow(context.Background(), "s", "c", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "s", "c", "tools/call", nil, nil, false, nil, nil)
 	if err := sink.Close(); err != nil {
 		t.Fatalf("sink.Close: %v", err)
 	}

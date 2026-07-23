@@ -189,7 +189,7 @@ func TestRotateOrdinal_SeededPastSiblings_SurvivesSeqReset(t *testing.T) {
 	// Enough records that at least one rotation fires (each record > 256 bytes with the
 	// envelope), post-reset so their seq is low.
 	for i := 0; i < 6; i++ {
-		sink.RecordAllow(context.Background(), "sess", "tool-with-a-longish-name-to-exceed-the-tiny-rotate-threshold", "tools/call", nil, nil, false)
+		sink.RecordAllow(context.Background(), "sess", "tool-with-a-longish-name-to-exceed-the-tiny-rotate-threshold", "tools/call", nil, nil, false, nil, nil)
 	}
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -612,7 +612,7 @@ func TestOpenAuditSinkResumesFromRotatedSiblingWhenBaseEmpty(t *testing.T) {
 		t.Fatalf("openAuditSink: %v", err)
 	}
 	for _, tool := range []string{"a", "b", "c"} {
-		sink.RecordAllow(context.Background(), "sess", tool, "tools/call", nil, nil, false)
+		sink.RecordAllow(context.Background(), "sess", tool, "tools/call", nil, nil, false, nil, nil)
 	}
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -649,7 +649,7 @@ func TestOpenAuditSinkResumesFromRotatedSiblingWhenBaseEmpty(t *testing.T) {
 
 	// Phase 4: the next record must continue the chain at seq+1, linked to the
 	// rotated tail's HMAC — no break, no gap across the two files.
-	sink2.RecordAllow(context.Background(), "sess", "d", "tools/call", nil, nil, false)
+	sink2.RecordAllow(context.Background(), "sess", "d", "tools/call", nil, nil, false, nil, nil)
 	if err := sink2.Close(); err != nil {
 		t.Fatalf("Close (restart): %v", err)
 	}
@@ -682,7 +682,7 @@ func TestOpenAuditSinkSkipsEmptyNewestSiblingOnResume(t *testing.T) {
 		t.Fatalf("openAuditSink: %v", err)
 	}
 	for _, tool := range []string{"a", "b", "c"} {
-		sink.RecordAllow(context.Background(), "sess", tool, "tools/call", nil, nil, false)
+		sink.RecordAllow(context.Background(), "sess", tool, "tools/call", nil, nil, false, nil, nil)
 	}
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -875,7 +875,7 @@ func TestOpenAuditSinkIgnoresSpuriousSiblingOnResume(t *testing.T) {
 		t.Fatalf("openAuditSink: %v", err)
 	}
 	for _, tool := range []string{"a", "b", "c"} {
-		sink.RecordAllow(context.Background(), "sess", tool, "tools/call", nil, nil, false)
+		sink.RecordAllow(context.Background(), "sess", tool, "tools/call", nil, nil, false, nil, nil)
 	}
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)

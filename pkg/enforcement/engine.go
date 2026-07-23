@@ -818,6 +818,22 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 		return *denyResp
 	}
 
+	// Information-flow bookkeeping, only for flow-relevant constraints (those with a
+	// flowLabel condition or a labelOutput directive) so a non-flow policy pays no
+	// extra counter round-trips. carriedLabels is the accumulated set observed at
+	// decision time — peeked BEFORE recordLabels writes this call's own output, so it
+	// reflects what flowed IN, not what this call adds. labelsOut is this call's added
+	// labels. A recordLabels fault fails closed (see labelRecordFailureDenial).
+	var carriedLabels, labelsOut []string
+	if constraintHasFlow(matched) {
+		carriedLabels = e.peekSessionLabels(ctx, req)
+		var err error
+		labelsOut, err = e.recordLabels(ctx, req, matched)
+		if err != nil {
+			return labelRecordFailureDenial(requestID, now, matched.IsAuditOnly(), obligations)
+		}
+	}
+
 	// Allowed and forwarding: record the call so a later sequenceBlock on a different
 	// tool can detect it. A write failure fails closed (see recordSessionCall).
 	if err := e.recordSessionCall(ctx, req); err != nil {
@@ -825,11 +841,13 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 	}
 
 	return capability.EnforceResponse{
-		RequestID:   requestID,
-		Decision:    capability.DecisionAllow,
-		Obligations: obligations,
-		DecidedAt:   now,
-		AuditOnly:   matched.IsAuditOnly(),
+		RequestID:     requestID,
+		Decision:      capability.DecisionAllow,
+		Obligations:   obligations,
+		DecidedAt:     now,
+		AuditOnly:     matched.IsAuditOnly(),
+		LabelsOut:     labelsOut,
+		CarriedLabels: carriedLabels,
 	}
 }
 
@@ -1053,6 +1071,13 @@ func (e *Engine) collectObligations(matched *capability.Constraint, requestID, n
 		// produces one; this preserves the prior type switch's explicit nil-pointer
 		// guard so a constructed Constraint cannot crash the engine on a fail-closed path).
 		if isTypedNil(dir) {
+			continue
+		}
+		// labelOutput is an enforce-time state directive, not a response obligation:
+		// its effect is the session-label write recordLabels performs on allow, so it
+		// produces no post-allow response action. Skip it before ToObligation so it is
+		// neither applied to the response nor tripped by the unknown-obligation guard.
+		if dir.DirectiveType() == capability.DirectiveTypeLabelOutput {
 			continue
 		}
 		ob := dir.ToObligation()

@@ -214,7 +214,7 @@ func TestOpenResumesPastTrailingPartialWrite(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	for _, tool := range []string{"a", "b", "c"} {
-		sink.RecordAllow(context.Background(), "sess", tool, "tools/call", nil, nil, false)
+		sink.RecordAllow(context.Background(), "sess", tool, "tools/call", nil, nil, false, nil, nil)
 	}
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -739,7 +739,7 @@ func signedThreeRecordLog(t *testing.T) (lines [][]byte, keyPath string) {
 		t.Fatalf("openAuditSink: %v", err)
 	}
 	for _, tool := range []string{"a", "b", "c"} {
-		sink.RecordAllow(context.Background(), "sess", tool, "tools/call", nil, nil, false)
+		sink.RecordAllow(context.Background(), "sess", tool, "tools/call", nil, nil, false, nil, nil)
 	}
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -853,7 +853,7 @@ func TestVerifyAuditLog_LegacyHeadStillExempt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openAuditSink: %v", err)
 	}
-	sink.RecordAllow(context.Background(), "sess", "c", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess", "c", "tools/call", nil, nil, false, nil, nil)
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -1283,7 +1283,7 @@ func writeChainSegment(t *testing.T, logPath, keyPath, sidecarStamp string, tool
 		t.Fatalf("Open(%q): %v", logPath, err)
 	}
 	for _, tl := range tools {
-		sink.RecordAllow(context.Background(), "sess", tl, "tools/call", nil, nil, false)
+		sink.RecordAllow(context.Background(), "sess", tl, "tools/call", nil, nil, false, nil, nil)
 	}
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -1458,7 +1458,7 @@ func TestVerifyLogFiles_MidStreamOpenErrorFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	sink.RecordAllow(context.Background(), "sess", "a", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess", "a", "tools/call", nil, nil, false, nil, nil)
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -1484,7 +1484,7 @@ func TestVerifyLog_UnknownKeyIDNotTampering(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false, nil, nil)
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -1824,7 +1824,7 @@ func TestSessionID_OmittedWhenEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	sink2.RecordAllow(context.Background(), "sess-1", "read_file", "tools/call", nil, nil, false)
+	sink2.RecordAllow(context.Background(), "sess-1", "read_file", "tools/call", nil, nil, false, nil, nil)
 	if err := sink2.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}

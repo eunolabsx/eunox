@@ -73,6 +73,15 @@ type EnforceResponse struct {
 	Obligations []Obligation `json:"obligations,omitempty"`
 	Denial      *DenialInfo  `json:"denial,omitempty"`
 	DecidedAt   string       `json:"decidedAt"`
+	// LabelsOut is the set of native flow labels this call's output asserted into the
+	// session (from its labelOutput directives), and CarriedLabels is the session's
+	// accumulated label set observed at decision time (before this call's own output
+	// is added). Both are populated by the engine only for flow-relevant constraints
+	// (those carrying a flowLabel condition or a labelOutput directive) and are stamped
+	// onto the audit record so a source->sink flow reconstructs from the tape. Sorted
+	// in the fixed vocabulary order for a deterministic record; nil on a non-flow call.
+	LabelsOut     []string `json:"labelsOut,omitempty"`
+	CarriedLabels []string `json:"carriedLabels,omitempty"`
 }
 
 // Decision identifies the enforcement outcome.

@@ -170,8 +170,8 @@ func TestRotate_NewActiveLogIsRestrictiveMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	s.RecordAllow(context.Background(), "sess", "tool", "tools/call", nil, nil, false)
-	s.RecordAllow(context.Background(), "sess", "tool", "tools/call", nil, nil, false)
+	s.RecordAllow(context.Background(), "sess", "tool", "tools/call", nil, nil, false, nil, nil)
+	s.RecordAllow(context.Background(), "sess", "tool", "tools/call", nil, nil, false, nil, nil)
 	if err := s.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}

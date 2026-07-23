@@ -909,7 +909,7 @@ func BenchmarkAuditRecord(b *testing.B) {
 		b.ResetTimer()
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			sink.RecordAllow(context.Background(), "sess-bench", "read_file", "tools/call", nil, nil, false)
+			sink.RecordAllow(context.Background(), "sess-bench", "read_file", "tools/call", nil, nil, false, nil, nil)
 		}
 	})
 
@@ -926,7 +926,7 @@ func BenchmarkAuditRecord(b *testing.B) {
 		b.ResetTimer()
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			sink.RecordAllow(context.Background(), "sess-bench", "read_file", "tools/call", details, []string{"redactFields"}, false)
+			sink.RecordAllow(context.Background(), "sess-bench", "read_file", "tools/call", details, []string{"redactFields"}, false, nil, nil)
 		}
 	})
 }
