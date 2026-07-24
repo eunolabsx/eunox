@@ -63,14 +63,25 @@ func WriteControlTokenFile(path, token string) (string, error) {
 		dir = "."
 	}
 	if dir != "." {
+		// Whether the directory ALREADY exists decides if we may tighten its mode: eunox
+		// must not chmod a directory it did not create. A non-default --control-token-path
+		// can point at a shared or operator-managed dir (/tmp, /var/run, /etc/eunox), and
+		// forcing it to 0700 would strip /tmp's sticky bit + world access (system-wide
+		// breakage as root) or fail with EPERM on a dir the user doesn't own (refusing to
+		// start). MkdirAll creates any MISSING dirs at 0700 already, so a dir we create
+		// needs no chmod; a pre-existing one we leave alone and only warn about.
+		_, statErr := os.Stat(dir)
+		dirPreexisted := statErr == nil
 		if err := os.MkdirAll(dir, 0o700); err != nil { //nolint:gosec // G301: 0700 is the intended restrictive mode
 			return "", fmt.Errorf("creating control-token directory: %w", err)
 		}
-		// MkdirAll does not chmod an existing dir, so tighten the mode explicitly
-		// to honor the 0700 guarantee for a pre-existing looser-mode directory
-		// (mirrors the tmp.Chmod(0o600) below).
-		if err := os.Chmod(dir, 0o700); err != nil { //nolint:gosec // G302: 0700 is the intended restrictive mode for a directory (it needs the owner execute/traverse bit)
-			return "", fmt.Errorf("setting control-token directory mode: %w", err)
+		if dirPreexisted {
+			// Warn (do not mutate) if a pre-existing dir is looser than 0700, so the
+			// operator can decide — the control token gates the loopback emergency stop, so
+			// a group/world-accessible directory is worth flagging.
+			if fi, err := os.Stat(dir); err == nil && fi.Mode().Perm()&0o077 != 0 {
+				fmt.Fprintf(os.Stderr, "[eunox] WARNING: control-token directory %q has mode %v (group/world-accessible); eunox does not tighten a pre-existing directory it did not create — restrict it to 0700 yourself to protect the loopback control token\n", dir, fi.Mode().Perm())
+			}
 		}
 	}
 	tmp, err := os.CreateTemp(dir, ".control-token-*.tmp") //nolint:gosec // G304: dir derives from the operator-configured --control-token-path

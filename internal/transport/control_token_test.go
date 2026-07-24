@@ -112,15 +112,15 @@ func TestResolveControlToken_WhitespaceOnlyEnv_FallsThroughToFile(t *testing.T) 
 	}
 }
 
-func TestWriteControlTokenFile_TightensLooseModeDirTo0700(t *testing.T) {
-	// Pre-create the control-token directory world-traversable (0755); the write
-	// must tighten it to 0700 so the documented directory guarantee holds even
-	// for a pre-existing looser-mode directory.
+func TestWriteControlTokenFile_DoesNotMutatePreexistingDirMode(t *testing.T) {
+	// A PRE-EXISTING directory eunox did not create must NOT be force-chmod'd: doing so
+	// could strip /tmp's sticky bit as root or fail with EPERM on a dir the user doesn't
+	// own. The write must succeed and LEAVE the 0755 mode intact (a warning is emitted to
+	// stderr, which the operator can act on).
 	dir := filepath.Join(t.TempDir(), "eunox")
 	if err := os.Mkdir(dir, 0o755); err != nil { //nolint:gosec // test fixture: deliberately loose mode
 		t.Fatal(err)
 	}
-	// Re-Chmod in case umask narrowed the Mkdir mode below 0755.
 	if err := os.Chmod(dir, 0o755); err != nil { //nolint:gosec // test fixture: deliberately loose mode
 		t.Fatal(err)
 	}
@@ -132,8 +132,26 @@ func TestWriteControlTokenFile_TightensLooseModeDirTo0700(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if perm := info.Mode().Perm(); perm != 0o755 {
+		t.Errorf("dir mode = %o, want it LEFT at 0755 (eunox must not chmod a pre-existing dir it did not create)", perm)
+	}
+}
+
+func TestWriteControlTokenFile_TightensDirItCreatesTo0700(t *testing.T) {
+	// A directory eunox itself creates (via MkdirAll) IS at 0700 — the guarantee still
+	// holds for a path eunox owns.
+	base := t.TempDir()
+	dir := filepath.Join(base, "created-by-eunox")
+	path := filepath.Join(dir, "control.token")
+	if _, err := WriteControlTokenFile(path, "tok"); err != nil {
+		t.Fatalf("WriteControlTokenFile: %v", err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if perm := info.Mode().Perm(); perm != 0o700 {
-		t.Errorf("dir mode = %o, want 0700 even when the pre-existing dir was 0755", perm)
+		t.Errorf("dir mode = %o, want 0700 for a directory eunox created", perm)
 	}
 }
 

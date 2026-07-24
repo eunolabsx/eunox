@@ -46,7 +46,6 @@ type LocalManifest struct {
 	Description   string                  `json:"description,omitempty"`
 	ServerVersion string                  `json:"serverVersion,omitempty"`
 	Capabilities  []capability.Constraint `json:"capabilities"`
-	DefaultTTL    int                     `json:"defaultTtl,omitempty"`
 	// Audience, when set, pins the JWT 'aud' claim required on THIS route in gateway
 	// mode: a token is authorized on the route only if its aud carries this value,
 	// overriding the global --jwt-audience for the route (which stays the fallback for
@@ -136,6 +135,7 @@ func LoadManifest(path string) (*LocalManifest, error) {
 		return nil, err
 	}
 	forceTimestampsToStrings(&node)
+	forceSchemaVersionToString(&node)
 	// Reject a scalar in a condition values:/enum: list that auto-typed away from
 	// its source text (YAML: 010 -> 8 octal, 1.0 -> 1 float; JSON: a beyond-float64
 	// integer yaml.v3 rounds), which would otherwise silently enforce a value the
@@ -197,6 +197,35 @@ func rejectCoercedScalarsForFormat(node *yaml.Node, isJSON bool, path string) er
 		return fmt.Errorf("invalid manifest %q: %w", path, err)
 	}
 	return nil
+}
+
+// forceSchemaVersionToString retags an unquoted top-level `schemaVersion` scalar to
+// !!str so the natural `schemaVersion: 0.1` (which yaml.v3 auto-types as a float)
+// decodes as the string "0.1" and negotiates identically to the quoted form — and to
+// the gateway-config loader, which already preserves the verbatim source text. Without
+// this the number flows through node.Decode → json.Marshal → json.Unmarshal into the
+// string SchemaVersion field and fails with an opaque "cannot unmarshal number into ...
+// string" before validateManifestSchemaVersion can emit its friendly message. Retagging
+// keeps the verbatim text, so "0.10" stays "0.10" (≠ "0.1") rather than renormalizing;
+// an unsupported unquoted value (e.g. 1) then reaches the version check and is rejected
+// with a clear "unsupported version" error instead of a decode error.
+func forceSchemaVersionToString(node *yaml.Node) {
+	doc := node
+	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 {
+		doc = doc.Content[0]
+	}
+	if doc.Kind != yaml.MappingNode {
+		return
+	}
+	for i := 0; i+1 < len(doc.Content); i += 2 {
+		key, val := doc.Content[i], doc.Content[i+1]
+		if key.Kind == yaml.ScalarNode && key.Value == "schemaVersion" {
+			if val.Kind == yaml.ScalarNode && (val.Tag == "!!int" || val.Tag == "!!float") {
+				val.Tag = "!!str"
+			}
+			return
+		}
+	}
 }
 
 // forceTimestampsToStrings retags every !!timestamp scalar to !!str so the
@@ -440,9 +469,8 @@ func checkNumericFieldNotCoerced(item *yaml.Node, fieldName string, isJSON bool)
 
 // MergeManifests combines the Capabilities lists from all manifests.
 //
-// Pure-metadata fields (name, version, description, defaultTtl) are inherited from
-// the first manifest — none feeds enforcement or drift, so dropping the rest loses
-// nothing.
+// Pure-metadata fields (name, version, description) are inherited from the first
+// manifest — none feeds enforcement or drift, so dropping the rest loses nothing.
 //
 // Single-value fields that DO drive enforcement or drift — serverVersion (FM-4),
 // schemaVersion, and audience — are folded instead: the first non-empty value is adopted
@@ -478,7 +506,6 @@ func MergeManifests(ms []*LocalManifest) (*LocalManifest, error) {
 		Name:        ms[0].Name,
 		Version:     ms[0].Version,
 		Description: ms[0].Description,
-		DefaultTTL:  ms[0].DefaultTTL,
 	}
 	for _, m := range ms {
 		merged.Capabilities = append(merged.Capabilities, m.Capabilities...)
@@ -768,6 +795,13 @@ func validateLocalManifest(m *LocalManifest) error {
 		// which equals no live version and makes FM-4 fire every session (fatal under
 		// strictDrift). Reject it up front rather than ship a pin that can never match.
 		for _, part := range strings.Split(m.ServerVersion, ".") {
+			// An empty dot-component (a trailing '.', a doubled '..', or a lone '*.')
+			// passes the regex but can never equal any real version component, so the pin
+			// never matches and FM-4 fires every session — fatal under --strict-drift (a
+			// self-inflicted blackout), alarm fatigue otherwise. Reject the typo up front.
+			if part == "" {
+				return fmt.Errorf("'serverVersion' has an empty dot-component (e.g. \"1.2.\" or \"1..2\"); it can never match a real server version, got %q", m.ServerVersion)
+			}
 			if strings.Contains(part, "*") && part != "*" {
 				return fmt.Errorf("'serverVersion' wildcard must be a whole dot-component (e.g. \"1.2.*\", not \"1.2*\"); component %q mixes a literal with '*' and would never match, got %q", part, m.ServerVersion)
 			}
