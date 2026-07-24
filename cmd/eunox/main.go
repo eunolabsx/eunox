@@ -2573,7 +2573,7 @@ Flags:
 	if res.UnknownKey > 0 {
 		fmt.Printf("Note: %d record(s) were signed with a key absent from the verification ring (UNKNOWN_KEY_ID) — "+
 			"expected after a key rotation that retired the signing key. Add the retired key(s) to the ring "+
-			"(--audit-key / the configured keyPath) to verify them; they are NOT counted as tampered.\n", res.UnknownKey)
+			"(--audit-key-path / the configured keyPath) to verify them; they are NOT counted as tampered.\n", res.UnknownKey)
 	}
 	// UNVERIFIABLE is a record that names NO key_id which no held key matched: the
 	// signing key cannot be identified, so it cannot be proven tampered the way a

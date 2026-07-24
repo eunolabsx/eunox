@@ -172,7 +172,7 @@ func (w Warning) LogLine() string {
 	switch w.Kind {
 	case Fm1:
 		return fmt.Sprintf(
-			`[eunox] %s drift=fm1 tool=%q resource=%q — new upstream tool matched by manifest glob; verify this is intentional before deploying`,
+			`[eunox] %s drift=fm1 tool=%q resource=%q — upstream tool admitted by a manifest glob rather than an exact entry; verify this is intentional before deploying`,
 			w.severity(), w.Tool, w.Resource,
 		)
 	case Fm2:
@@ -911,9 +911,10 @@ func FetchAllToolPages(fetchPage func(cursor string) (json.RawMessage, error)) (
 				return nil, fmt.Errorf("parsing tools/list page: %w", err)
 			}
 		}
-		// Check the page against the remaining budget BEFORE appending, so a single
-		// oversized page from a malicious upstream cannot force an unbounded allocation
-		// (the post-append check would have already materialized the whole page).
+		// Bound the cumulative tool count across pages before appending, so a long tail
+		// of pages cannot grow "all" past maxToolsListTools. (This page's own size is
+		// already bounded by the maxToolsListBytes check above, before the Unmarshal that
+		// materializes p.Tools.)
 		if len(p.Tools) > maxToolsListTools-len(all) {
 			return nil, fmt.Errorf("tools/list returned more than %d tools; refusing to page further", maxToolsListTools)
 		}

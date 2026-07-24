@@ -36,11 +36,14 @@ const (
 	// ErrCodeEnforcementError is a reserved, fail-closed code for an internal
 	// enforcement-engine failure while evaluating a matched constraint's conditions
 	// — a request that can be neither allowed nor cleanly rejected by policy. It is
-	// distinct from CAPABILITY_DENIED and CONDITION_FAILED. No reachable path emits
-	// it today (condition handlers, including an unreachable MaxCalls backend, still
-	// resolve to CONDITION_FAILED); the PDP keeps it as a defensive guard so a
-	// future internal error denies with a distinct, matchable code rather than
-	// falling open. The resource-read and prompt-get paths also reuse it for a
+	// distinct from CAPABILITY_DENIED and CONDITION_FAILED. No enforcement-engine
+	// condition path emits it today (condition handlers, including an unreachable
+	// MaxCalls backend, still resolve to CONDITION_FAILED); the PDP keeps it as a
+	// defensive guard so a future internal error denies with a distinct, matchable
+	// code rather than falling open. The transport layer DOES emit it on reachable
+	// fail-closed paths — a redaction-obligation failure, an undelivered
+	// server-initiated request, and a malformed */list response — so it does appear
+	// on the tape. The resource-read and prompt-get paths also reuse it for a
 	// resource:/prompt: constraint carrying a tool-only argumentSchema (rejected at
 	// load, so likewise unreachable), denying rather than forwarding with the schema
 	// silently skipped. Maps to JSON-RPC -32603.

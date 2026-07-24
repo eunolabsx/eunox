@@ -1225,3 +1225,65 @@ func TestRetryRotateReopenRecovers(t *testing.T) {
 		t.Fatalf("recovered fd wrote %q to the base; want it to write to the fresh base log", string(got))
 	}
 }
+
+// TestRetryRotateReopenStillFailing covers the persistent-fault branch of
+// retryRotateReopen: when the reopen STILL fails (the base path remains unopenable), the
+// retry must not rename, must stay in fallback, and must back off the write counter so the
+// next attempt is one backoff cadence away rather than one record away. Same fallback
+// setup as the recovery test, but the blocker (logPath is a directory) is never cleared,
+// so OpenFile(logPath) keeps failing with EISDIR. Directory-based injection is root-safe
+// (chmod does not, since root bypasses DAC).
+func TestRetryRotateReopenStillFailing(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+	if err := os.Mkdir(logPath, 0o755); err != nil {
+		t.Fatalf("mkdir logPath: %v", err)
+	}
+
+	activePath := logPath + ".20260101T000000.000000000Z"
+	f, err := os.OpenFile(activePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open fallback active: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	fixed := time.Date(2026, 6, 22, 12, 0, 0, 0, time.UTC)
+	key := nonZeroTestKey()
+	s := &Sink{
+		key:        key,
+		keyID:      hmacKeyID(key),
+		logPath:    logPath,
+		activePath: activePath,
+		maxBytes:   1000,
+		retain:     0,
+		f:          f,
+		now:        func() time.Time { return fixed },
+		inFallback: true,
+	}
+	s.written = s.maxBytes // above the backoff mark, so the reset below is observable
+
+	entriesBefore, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+
+	// logPath is still a directory: retryRotateReopen's OpenFile fails again (EISDIR).
+	s.rotate()
+
+	if !s.inFallback {
+		t.Fatalf("s.inFallback must stay true while the reopen keeps failing")
+	}
+	if s.activePath != activePath {
+		t.Fatalf("a still-failing retry must NOT rename: activePath = %q, want unchanged %q", s.activePath, activePath)
+	}
+	if s.written != s.rotateBackoffWritten() {
+		t.Fatalf("a still-failing retry must back off: s.written = %d, want rotateBackoffWritten() = %d", s.written, s.rotateBackoffWritten())
+	}
+	entriesAfter, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	if len(entriesAfter) != len(entriesBefore) {
+		t.Fatalf("a still-failing retry must not create a filesystem entry: before=%d after=%d", len(entriesBefore), len(entriesAfter))
+	}
+}
