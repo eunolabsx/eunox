@@ -30,6 +30,17 @@ const (
 	defaultReconcileInterval = 30 * time.Second
 )
 
+// subscribeConfirmTimeout bounds the initial pub/sub subscription-confirmation read in
+// Start. pubsub.Receive issues a deadline-less socket read (go-redis passes timeout=0),
+// so a blackholed or half-open connection -- the TCP dial and SUBSCRIBE write are
+// accepted but the confirmation never arrives -- would block Start forever. Start holds
+// lifeMu across that call and Stop must take lifeMu to reach r.cancel, so an unbounded
+// block deadlocks a concurrent Stop (the cancel that could unblock the read is itself
+// unreachable). Bounding the confirmation read funnels a hung subscribe into the same
+// reconcile-only degraded mode as an outright subscribe error. A var, not a const, only
+// so the deadlock regression test can shrink it; production never mutates it.
+var subscribeConfirmTimeout = 5 * time.Second
+
 // ErrBackendUnreachable is returned by ShouldBlock in the default fail-closed
 // degraded mode when the most recent Redis refresh failed, so the cache may be
 // stale; the caller treats it as a denial. The underlying Redis error is NOT
@@ -240,11 +251,21 @@ func (r *Redis) Start(ctx context.Context) {
 	}); ok {
 		pubsub := sub.Subscribe(subCtx, redisPubSubChan)
 		// Block until the server confirms the subscription so the snapshot cannot
-		// precede it. On failure, log, close, and fall back to periodic reconcile
-		// rather than start a listener on an unconfirmed subscription.
-		if _, err := pubsub.Receive(subCtx); err != nil {
+		// precede it, but BOUND the wait: pubsub.Receive issues a deadline-less socket
+		// read, so a blackholed connection would hang here forever while Start holds
+		// lifeMu, deadlocking a concurrent Stop (see subscribeConfirmTimeout). A
+		// WithTimeout ctx carries a deadline, so the read returns i/o timeout instead of
+		// hanging. On any failure (timeout or error) log, close, and fall back to periodic
+		// reconcile rather than start a listener on an unconfirmed subscription.
+		recvCtx, recvCancel := context.WithTimeout(subCtx, subscribeConfirmTimeout)
+		_, err := pubsub.Receive(recvCtx)
+		recvCancel()
+		if err != nil {
 			if r.logger != nil {
-				r.logger.Warn("kill switch: pub/sub subscription failed; relying on periodic reconcile until it recovers",
+				// The subscription does not retry: real-time pub/sub stays off for this
+				// instance's lifetime and state converges only on the reconcile tick. Say
+				// so plainly rather than imply the subscription itself "recovers".
+				r.logger.Warn("kill switch: pub/sub subscription could not be confirmed; converging state on the periodic reconcile only (real-time pub/sub stays off until the process restarts)",
 					slog.String("error", err.Error()))
 			}
 			_ = pubsub.Close()
@@ -424,6 +445,14 @@ func (r *Redis) getRunCtx() context.Context {
 func (r *Redis) HealthStatus() error {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	// A stopped switch (Start context canceled) can no longer converge, so report the
+	// liveness cause rather than the stale refresh error the final in-flight refresh
+	// latched as Stop canceled it (context.Canceled). This mirrors ShouldBlock's gate
+	// ordering, so a health probe and the data plane agree on WHY a stopped switch is
+	// unhealthy — a permanently frozen switch, not a transient backend outage.
+	if r.runCtx != nil && r.runCtx.Err() != nil {
+		return ErrStopped
+	}
 	return r.lastRefreshErr
 }
 
@@ -455,20 +484,25 @@ func (r *Redis) ShouldBlock(_ context.Context, agentID, sessionID string) (bool,
 	if sessionID != "" && r.killedSessions[sessionID] {
 		return true, nil
 	}
-	// Nothing matches. In fail-closed mode a failed last refresh means the cache may
-	// be stale, so deny rather than admit an unconfirmed request; the reconcile loop
-	// clears lastRefreshErr on recovery, bounding the block window. Fail-open serves
-	// the cache as-is.
-	if r.lastRefreshErr != nil && !r.failOpen {
-		return false, ErrBackendUnreachable
-	}
-	// The Start context has been canceled (Stop, or the caller's own context) but this
-	// instance is still being queried: the convergence loops have exited and the cache
-	// can never observe a new kill, so a non-match is unconfirmed. Reading runCtx.Err()
-	// observes cancellation synchronously (no window). Fail closed regardless of
-	// failOpen — a stopped switch is a liveness failure, not a transient outage.
+	// Nothing matches. Check liveness BEFORE transient health: once the Start context
+	// is canceled (Stop, or the caller's own context) the convergence loops have exited
+	// and the cache can never observe a new kill, so a non-match is PERMANENTLY
+	// unconfirmed. Stop cancels runCtx, and an in-flight refreshState then records
+	// context.Canceled as lastRefreshErr — so a stopped switch is frequently also
+	// "degraded". It must report ErrStopped (the actionable liveness cause) rather than
+	// ErrBackendUnreachable (which reads as a transient outage that will self-heal). Both
+	// fail closed, so this ordering is diagnostic accuracy, not a security change.
+	// Reading runCtx.Err() observes cancellation synchronously (no window). Fail closed
+	// regardless of failOpen — a stopped switch is a liveness failure, not an outage.
 	if r.runCtx != nil && r.runCtx.Err() != nil {
 		return false, ErrStopped
+	}
+	// Still live, but the last refresh failed: in fail-closed mode the cache may be
+	// stale, so deny rather than admit an unconfirmed request; the reconcile loop clears
+	// lastRefreshErr on recovery, bounding the block window. Fail-open serves the cache
+	// as-is.
+	if r.lastRefreshErr != nil && !r.failOpen {
+		return false, ErrBackendUnreachable
 	}
 	return false, nil
 }
@@ -866,6 +900,18 @@ func (r *Redis) listenPubSub(ctx context.Context, pubsub *redis.PubSub) {
 			return
 		case msg, ok := <-ch:
 			if !ok {
+				// go-redis closes this channel only on an explicit pubsub.Close()
+				// (transient network drops auto-reconnect and resubscribe WITHOUT
+				// closing it). The sole Close() on this pubsub is this function's own
+				// deferred one, which runs after we return, and on teardown the
+				// ctx.Done() case above wins first — so reaching here means the channel
+				// closed while ctx is still live: an unexpected loss of the real-time
+				// path, not the normal shutdown. State still converges on the reconcile
+				// loop (fail-closed preserved), but surface it so the degraded
+				// propagation is not silent.
+				if r.logger != nil && ctx.Err() == nil {
+					r.logger.Warn("kill switch: pub/sub channel closed unexpectedly while running; converging state on the periodic reconcile only until the process restarts")
+				}
 				return
 			}
 			r.handlePubSubMessage(msg.Payload)

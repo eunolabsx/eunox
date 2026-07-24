@@ -29,6 +29,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -397,24 +398,11 @@ func cmdProxy() {
 		os.Exit(1)
 	}
 
-	// Reject negative concurrency limits at the flag leg, matching the config
-	// validator (gateway_config.go): a negative --max-sessions or --session-idle-timeout
-	// would otherwise pass through ResolveMaxSessions/registerSession verbatim and, since
-	// both treat <= 0 as "unlimited / no reaping", silently disable the documented cap —
-	// a fail-open the config leg refuses.
-	if *f.maxSessions < 0 {
-		fmt.Fprintf(os.Stderr, "eunox proxy: --max-sessions must be >= 0 (0 = unlimited)\n")
-		os.Exit(1)
-	}
-	if *f.sessionIdleTimeout < 0 {
-		fmt.Fprintf(os.Stderr, "eunox proxy: --session-idle-timeout must be >= 0 (0 = no idle reaping)\n")
-		os.Exit(1)
-	}
-	// Same fail-open guard for the counter-key ceiling: WithMaxKeys treats <= 0 as
-	// "unbounded", and 0 is the documented disable spelling, so a negative value would
-	// silently remove the OOM backstop rather than doing what the operator meant.
-	if *f.maxCallCounterKeys < 0 {
-		fmt.Fprintf(os.Stderr, "eunox proxy: --max-call-counter-keys must be >= 0 (0 = unbounded)\n")
+	// Reject negative numeric limit flags at the flag leg, matching the config validator
+	// (gateway_config.go). Extracted into a pure helper so each guard is unit-testable;
+	// cmdProxy itself must os.Exit, which a test cannot capture in-process.
+	if err := validateProxyNumericFlags(f); err != nil {
+		fmt.Fprintf(os.Stderr, "eunox proxy: %v\n", err)
 		os.Exit(1)
 	}
 	// The audit knobs mirror the config's fail-closed rejection (Validate rejects a
@@ -519,6 +507,18 @@ func cmdProxy() {
 	// error the operator can trivially fix should be reported before anything is
 	// touched, not after.
 	if err := validateJWTFlagsRequireJWKS(pf); err != nil {
+		fmt.Fprintf(os.Stderr, "[eunox] Fatal: %v\n", err)
+		exitCode = 1
+		return
+	}
+
+	// Fail closed if a Redis-only flag (--killswitch-fail-open, --redis-password, …) was
+	// set without --redis-addr: those configure the Redis-backed counter/kill switch that
+	// is never built without the backend, so the operator's intent would silently
+	// evaporate. Checked here, before buildCallCounterAndKillSwitch, for the same reason
+	// as the JWT guard above — report a trivially-fixable flag error before anything with
+	// side effects (a Redis dial, minting an audit key) runs.
+	if err := validateRedisFlagsRequireRedisAddr(fs, *f.redisAddr); err != nil {
 		fmt.Fprintf(os.Stderr, "[eunox] Fatal: %v\n", err)
 		exitCode = 1
 		return
@@ -638,7 +638,17 @@ func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, ki
 		flowStore = flowlabelstore.NewRedis(rdb)
 		// WithReconcileInterval(0) keeps the default; a positive value tunes kill
 		// propagation and (fail-closed) the post-recovery denial window.
-		ksRedis = killswitch.NewRedis(rdb).WithFailOpen(killswitchFailOpen).WithReconcileInterval(killswitchReconcile)
+		//
+		// WithLogger wires a real logger so the kill switch's degraded-mode breadcrumbs
+		// (initial-refresh-failed, pub/sub-subscription-unconfirmed, background-refresh
+		// failed/recovered) actually emit: every one is gated on a non-nil logger, so
+		// without this an operator watching for a Redis partition sees nothing in the log
+		// (HealthStatus on /healthz still reflects the state). Structured stderr matches
+		// where the other [eunox] startup lines already go.
+		ksRedis = killswitch.NewRedis(rdb).
+			WithFailOpen(killswitchFailOpen).
+			WithReconcileInterval(killswitchReconcile).
+			WithLogger(slog.New(slog.NewTextHandler(os.Stderr, nil)))
 		ks = ksRedis
 		if killswitchFailOpen {
 			fmt.Fprintf(os.Stderr, "[eunox] Kill switch: fail-OPEN during a Redis outage (--killswitch-fail-open). Kills issued while Redis is unreachable may be delayed until it recovers; the data plane stays available.\n")
@@ -864,6 +874,69 @@ var httpOnlyProxyFlags = []string{
 // guard.
 func httpOnlyFlagsSetOnStdio(fs *flag.FlagSet) []string {
 	return explicitlyActiveFlags(fs, httpOnlyProxyFlags)
+}
+
+// redisGatedFlags is the single authoritative list of proxy flags that take effect
+// ONLY when --redis-addr configures a Redis backend: each is read inside the
+// `redisAddr != ""` branch of buildCallCounterAndKillSwitch, so without --redis-addr
+// the proxy runs on the in-memory call counter / kill switch and every one is silently
+// dropped. An operator who sets --killswitch-fail-open expecting a fail-open outage
+// posture, or --redis-password expecting an authenticated connection, gets neither and
+// no diagnostic. (--max-call-counter-keys is deliberately NOT here: it is the inverse —
+// active in-memory and ignored WHEN --redis-addr is set — so it is meaningful without
+// Redis.) cmdKill already rejects the redis-password/redis-tls mix without --redis-addr;
+// this is the proxy-path equivalent.
+var redisGatedFlags = []string{
+	"redis-password",
+	"redis-tls",
+	"killswitch-fail-open",
+	"killswitch-reconcile-interval",
+}
+
+// validateProxyNumericFlags rejects negative values for the proxy's numeric limit flags,
+// matching the config validator (gateway_config.go): each of these treats <= 0 as
+// "unlimited / disabled / use-the-default", so a NEGATIVE value silently does the
+// opposite of the operator's intent —
+//
+//   - --max-sessions / --session-idle-timeout / --max-call-counter-keys: a negative
+//     silently disables the documented cap (a fail-open the config leg refuses).
+//   - --shutdown-timeout: the transports clamp a non-positive value to the 5000ms
+//     default, so a negative silently becomes the opposite of a "shorter grace" intent.
+//
+// Returns the first offending flag's error (without the "eunox proxy: " prefix the caller
+// adds), or nil. A pure function so every guard is unit-testable; cmdProxy calls os.Exit(1)
+// on a non-nil return, which a test cannot observe in-process. 0 stays a valid
+// "unlimited / disabled / default" spelling for every flag.
+func validateProxyNumericFlags(f *proxyCLIFlags) error {
+	switch {
+	case *f.maxSessions < 0:
+		return errors.New("--max-sessions must be >= 0 (0 = unlimited)")
+	case *f.sessionIdleTimeout < 0:
+		return errors.New("--session-idle-timeout must be >= 0 (0 = no idle reaping)")
+	case *f.maxCallCounterKeys < 0:
+		return errors.New("--max-call-counter-keys must be >= 0 (0 = unbounded)")
+	case *f.shutdownTimeout < 0:
+		return errors.New("--shutdown-timeout must be >= 0 (0 = use the default)")
+	}
+	return nil
+}
+
+// validateRedisFlagsRequireRedisAddr fails closed when any Redis-gated proxy flag is set
+// without --redis-addr. Without the backend those flags are silently ignored (the proxy
+// falls back to in-memory state), so an operator's fail-open/auth/TLS/reconcile intent
+// evaporates unobserved — the exact silent-drop the fail-loud posture elsewhere (the
+// --audit/--config and JWT-without-JWKS guards) refuses. Reject the mismatch at startup.
+// A no-op when --redis-addr is set or no such flag was given. Detection is driven off the
+// single redisGatedFlags list via explicitlyActiveFlags (value detection for these
+// zero-default flags), so a new Redis-only flag added to the list is guarded automatically.
+func validateRedisFlagsRequireRedisAddr(fs *flag.FlagSet, redisAddr string) error {
+	if redisAddr != "" {
+		return nil
+	}
+	if active := explicitlyActiveFlags(fs, redisGatedFlags); len(active) > 0 {
+		return fmt.Errorf("flag(s) %s require --redis-addr: they configure the Redis-backed call counter / kill switch, which is only built when --redis-addr is set — without it the proxy uses in-memory state and these are silently ignored. Set --redis-addr to enable the Redis backend, or remove these flags", strings.Join(active, ", "))
+	}
+	return nil
 }
 
 // jwtLeewayOption bridges the --jwt-leeway flag to pdp.JWTPDPOptions.Leeway. The
@@ -2228,17 +2301,23 @@ Flags:
 	controlToken := fs.String("control-token", "", "Control token for the HTTP /control/kill endpoint. If empty, read from\nEUNOX_CONTROL_TOKEN or --control-token-path (default ~/.eunox/control.token),\nwhere the running proxy wrote it.")
 	controlTokenPath := fs.String("control-token-path", "", "Path to the control-token file the proxy wrote (default ~/.eunox/control.token).\nUsed when --control-token and EUNOX_CONTROL_TOKEN are unset.")
 
-	if err := fs.Parse(os.Args[2:]); err != nil {
+	// Permit flags on either side of the positional: Go's flag package stops at the
+	// first non-flag token, so a plain fs.Parse would reject "eunox kill all --port 3001"
+	// (target first) while accepting "--port 3001 all" — a foot-gun on the emergency-stop
+	// path. parseFlagsAndPositionals (used by `validate` for the same reason) peels the
+	// positional and re-parses the rest, so order does not matter.
+	pos, err := parseFlagsAndPositionals(fs, os.Args[2:])
+	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
 		return 1
 	}
-	if fs.NArg() != 1 {
+	if len(pos) != 1 {
 		fmt.Fprintf(os.Stderr, "eunox kill: expected exactly one argument: <session-id|all>\n")
 		return 1
 	}
-	target := fs.Arg(0)
+	target := pos[0]
 
 	// fs.Visit only reports flags the operator actually passed (unlike comparing
 	// against defaults, which cannot distinguish an explicit --port=3000 from the
