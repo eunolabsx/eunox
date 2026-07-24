@@ -137,6 +137,13 @@ func (r *Redis) Get(ctx context.Context, sessionKey string) ([]string, error) {
 		return nil, fmt.Errorf("redis pipeline SMembers: %w", err)
 	}
 	labels := membersCmd.Val()
+	// Return nil (not a non-nil empty slice) for an absent/empty session, byte-for-byte
+	// matching InMemory.Get so the two backends are substitutable — a consumer that
+	// JSON-marshals the result, or distinguishes nil from [], sees the same shape either
+	// way. The engine treats both as "clean context" regardless.
+	if len(labels) == 0 {
+		return nil, nil
+	}
 	// Sort for a deterministic return, matching InMemory; the engine reorders into the
 	// canonical vocabulary regardless.
 	sort.Strings(labels)

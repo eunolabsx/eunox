@@ -51,8 +51,18 @@ func decisionEndFromContext(ctx context.Context) func() {
 // ticket to come up (begin) before running the PDP decision + state write, then advances
 // the turn (the returned end). Reserving the ticket in the reader — not in the racing
 // handler goroutine — is what makes the order RECEIPT order rather than
-// scheduler-dependent. The gate is leaf-level and never held across the upstream
-// forward, so it cannot deadlock with the upstream call or the audit drainer.
+// scheduler-dependent. The gate is leaf-level (no other lock is taken under it) and never
+// held across the upstream forward, so it cannot deadlock with the upstream call or the
+// audit drainer.
+//
+// Liveness: because the turn is held across the decision's flow-store round-trip, one slow
+// decision does impose head-of-line blocking — later tickets (and, for the sampling leg,
+// the upstream reader that borrows the gate) wait behind it. This is a bounded slowdown,
+// not a deadlock: the decision path is microseconds on the in-memory backend, and the
+// Redis backend's client carries its own read/write timeouts, so a stalled backend fails
+// the decision closed and advances the turn rather than parking it forever. It is the
+// accepted cost of the per-session ordering guarantee (a non-flow/non-sequenceBlock
+// session takes no ticket and keeps full parallelism).
 type decisionSerializer struct {
 	mu      sync.Mutex
 	cond    *sync.Cond

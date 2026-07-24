@@ -234,7 +234,7 @@ func (p *HTTPProxy) newRemoteSession(ctx context.Context, route *UpstreamRoute, 
 	}
 
 	// Cleanup goroutine: remove the session once done is closed.
-	go func() {
+	go func() { //nolint:contextcheck // teardown path: releaseSessionState uses a detached, bounded context by design (the session is gone; no request context).
 		<-sess.done
 		p.mu.Lock()
 		delete(p.sessions, sess.id)

@@ -354,16 +354,6 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 	// ── 6. Serve host until stdin closes ───────────────────────────────────────
 	p.serveHost(ctx)
 
-	// ── 6.5 Release this session's per-session enforcement state ────────────────
-	// The host is gone, so free the session's accumulated flow-label set: an ended
-	// session must retain no state, and a reused session id starts clean
-	// (docs/flow-label-hardening.md FR-H2). Detached, bounded context — teardown must
-	// not block on a slow store, and a Redis store reclaims an orphaned key by idle TTL
-	// regardless. A no-op when the policy uses no flow control.
-	releaseCtx, releaseCancel := context.WithTimeout(context.Background(), time.Duration(p.shutdownMs)*time.Millisecond)
-	p.pdp.ReleaseSession(releaseCtx, p.sessionID) //nolint:contextcheck // teardown path: the host is gone; a detached, bounded context is correct here as for the other teardown steps.
-	releaseCancel()
-
 	// ── 7. Drain upstream reader ──────────────────────────────────────────────
 	signal.Stop(sigCh)
 	close(sigCh)
@@ -377,6 +367,20 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 	}
 	p.killMu.Unlock()
 	p.waitUpstream()
+
+	// ── 8. Release this session's per-session enforcement state ─────────────────
+	// Free the session's accumulated flow-label set so an ended session retains nothing
+	// and a reused session id starts clean (docs/flow-label-hardening.md FR-H2). Ordered
+	// LAST, after the upstream drain: on the clean-EOF path serveHost already waited for
+	// every in-flight handler, and on the signal/upstream-exit paths (which do not wait)
+	// draining the upstream first lets in-flight handlers' decisions settle — so a Clear
+	// cannot empty the taint between a source's Add and a sink still deciding on this
+	// session (piece B). Detached, bounded context — teardown must not block on a slow
+	// store, and a Redis store reclaims an orphaned key by idle TTL regardless. A no-op
+	// when the policy uses no flow control.
+	releaseCtx, releaseCancel := context.WithTimeout(context.Background(), time.Duration(p.shutdownMs)*time.Millisecond)
+	p.pdp.ReleaseSession(releaseCtx, p.sessionID) //nolint:contextcheck // teardown path: the host is gone; a detached, bounded context is correct here as for the other teardown steps.
+	releaseCancel()
 
 	return nil
 }
@@ -1099,8 +1103,25 @@ func (p *StdioProxy) handleUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) 
 		pdp:              p.pdp,
 		forward:          func(m mcp.RPCMsg) bool { p.forwardServerRequestToHost(m); return true },
 		writeUpstream:    func(m mcp.RPCMsg) { _ = p.upWriter.Write(m) },
+		decideLock:       p.samplingDecideLock(),
 		strictAuditState: p.strictAudit(),
 	})
+}
+
+// samplingDecideLock returns the entry into this session's decision serializer for a
+// server-initiated (sampling) decision, or nil when the session is not serialize-relevant.
+// It reserves a ticket and waits its turn on the SAME decideGate the host path uses, so a
+// sampling flowLabel sink cannot read the flow set concurrently with a host source's write
+// (docs/flow-label-hardening.md piece B). Unlike a host request, a sampling request is
+// upstream-initiated with no proxy-receipt order, so it simply takes the next ticket:
+// mutual exclusion — not receipt ordering — is the property it needs. The gate is
+// leaf-level and released before the forward, so the brief block it can impose on the
+// upstream reader is bounded by the decision path, never the upstream round-trip.
+func (p *StdioProxy) samplingDecideLock() func() (end func()) {
+	if p.decideGate == nil {
+		return nil
+	}
+	return func() func() { return p.decideGate.begin(p.decideGate.take()) }
 }
 
 // withUpstreamTimeout bounds a StdioProxy upstream round-trip (see boundUpstreamCall).

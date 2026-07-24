@@ -29,10 +29,10 @@ func (faultOnIncrementCounter) IncrementAndGet(context.Context, string, int, int
 	return 0, errors.New("injected seq-write fault")
 }
 func (faultOnIncrementCounter) Peek(context.Context, string, int) (int64, error) { return 0, nil }
-func (faultOnIncrementCounter) IncrementIfBelow(context.Context, string, int, int64) (int64, bool, time.Duration, error) {
+func (faultOnIncrementCounter) IncrementIfBelow(context.Context, string, int, int64) (count int64, admitted bool, retryAfter time.Duration, err error) {
 	return 0, false, 0, nil
 }
-func (faultOnIncrementCounter) IncrementIfAllBelow(context.Context, []string, []int, []int64) (bool, int, int64, time.Duration, error) {
+func (faultOnIncrementCounter) IncrementIfAllBelow(context.Context, []string, []int, []int64) (admitted bool, deniedIndex int, count int64, retryAfter time.Duration, err error) {
 	return false, 0, 0, 0, nil
 }
 

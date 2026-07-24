@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/eunolabs/eunox/internal/mcp"
@@ -237,6 +238,18 @@ func (p *HTTPProxy) initAudienceDenial(ctx context.Context, route *UpstreamRoute
 // server-initiated requests are broadcast to SSE subscribers.
 func (p *HTTPProxy) handleHTTPUpstreamRequest(ctx context.Context, sess *httpSession, msg mcp.RPCMsg) {
 	rt := sess.route
+	// Serialize the sampling decision against this session's host-path decisions for a
+	// flow-/sequenceBlock-relevant route, so a flowLabel sink on system:sampling cannot
+	// peek the flow set concurrently with a host source's label write (docs/flow-label-
+	// hardening.md piece B). Same per-session decideMu the host path uses; released before
+	// the forward. nil (no serialization) for a non-flow route.
+	var decideLock func() (end func())
+	if rt != nil && rt.serializeDecisions {
+		decideLock = func() func() {
+			sess.decideMu.Lock()
+			return sync.OnceFunc(sess.decideMu.Unlock)
+		}
+	}
 	// sess.broadcastServerRequest reports whether an SSE subscriber received the
 	// request; sess.claims (captured at initialize) is attached for the sampling
 	// decision so per-agent kills are honored and the record carries agent_id/task_id.
@@ -249,6 +262,7 @@ func (p *HTTPProxy) handleHTTPUpstreamRequest(ctx context.Context, sess *httpSes
 		pdp:              rt.pdp,
 		forward:          sess.broadcastServerRequest,
 		writeUpstream:    func(m mcp.RPCMsg) { _ = sess.upWriter.Write(m) },
+		decideLock:       decideLock,
 		strictAuditState: p.strictAudit(),
 	})
 }

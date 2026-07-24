@@ -70,6 +70,19 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 	if condErr != nil {
 		return condErr
 	}
+	// Defense in depth against a typed-nil *FlowLabelCondition: castCondition matches the
+	// `*T` case and returns the nil pointer with condErr==nil, so `len(fl.Allow)` below
+	// would dereference nil. runConditions already rejects a typed-nil condition before
+	// dispatch (its isTypedNil guard), so this is unreachable in-tree — but the source
+	// half (recordLabels) guards its own typed-nil labelOutput, so guard the sink too: an
+	// unevaluable condition must fail closed, never panic the enforcement goroutine.
+	if fl == nil {
+		return &ConditionError{
+			Code:          capability.ErrCodeConditionFailed,
+			ConditionType: capability.ConditionTypeFlowLabel,
+			Message:       "flowLabel condition is nil and cannot be evaluated",
+		}
+	}
 
 	// Defense in depth: the loader rejects an unknown label in Allow, but a
 	// programmatically built condition can carry one. Surface it rather than silently
@@ -163,7 +176,12 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 // rely on — dropping any member outside the closed vocabulary (fail-safe; recordLabels
 // rejects such a label at the source, so this only guards a directly-poked store).
 func (e *Engine) peekSessionLabels(ctx context.Context, req *capability.EnforceRequest) ([]string, error) {
-	if e.flowStore == nil || req.SessionID == "" {
+	// skipFlow (the whole policy carries no flow token) short-circuits here as well as at
+	// the evaluateMatched gate, so the engine stays internally consistent even if a caller
+	// passes flowRelevant=true against a skipFlow engine (e.g. the PDP audit path derives
+	// flow-relevance from ConstraintHasFlow alone). skipFlow implies no flow constraint,
+	// so this cannot suppress a real flow read; it only makes the gate authoritative here.
+	if e.skipFlow || e.flowStore == nil || req.SessionID == "" {
 		return nil, nil
 	}
 	present, err := e.flowStore.Get(ctx, e.flowSessionKey(req.SessionID))
@@ -215,6 +233,12 @@ func (e *Engine) PeekSessionLabels(ctx context.Context, req *capability.EnforceR
 // commits the set atomically. The ordering of this write relative to recordSessionCall
 // (and the atomic-commit rollback across the two namespaces) lives in recordSourceCall.
 func (e *Engine) recordLabels(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint) ([]string, error) {
+	// skipFlow short-circuits recording too, mirroring peekSessionLabels, so a skipFlow
+	// engine never writes flow state regardless of the caller's flow-relevance derivation
+	// (defense in depth; skipFlow implies the policy has no labelOutput to record anyway).
+	if e.skipFlow {
+		return nil, nil
+	}
 	set := map[string]bool{}
 	for _, dir := range matched.Directives {
 		lo, ok := capability.AsValueOrPointer[capability.LabelOutputDirective](dir)

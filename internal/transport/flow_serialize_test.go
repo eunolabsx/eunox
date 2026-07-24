@@ -222,6 +222,75 @@ func TestFlowSerialize_ConcurrentEgressDeniedEveryTime(t *testing.T) {
 	}
 }
 
+// TestFlowSerialize_SamplingSinkSerializedAgainstSource is the piece-B acceptance test for
+// the sampling leg (docs/flow-label-hardening.md): a flowLabel sink on
+// system:sampling/createMessage reads the same per-session flow state a host source read
+// writes, but the sampling decision runs on the upstream-reader goroutine, OUTSIDE the host
+// decideGate. serverRequestParams.decideSampling threads the per-session decision lock so the
+// sampling peek is serialized with host-path source Adds — otherwise it could peek the flow
+// set mid-commit of a host source's Add and slip the taint. A host source read that taints
+// the session under the SAME gate (its ticket reserved first, as the single-threaded host
+// reader would) commits before the sampling decision runs, so the sink denies every time.
+// The Add delay makes ordering the SOLE determinant: without the lock the sampling peek races
+// ahead of the delayed Add and is wrongly allowed (verified by removing decideLock).
+func TestFlowSerialize_SamplingSinkSerializedAgainstSource(t *testing.T) {
+	t.Parallel()
+	const runs = 40
+	// One shared store across runs (each run a fresh session id), mirroring a long-lived
+	// proxy. The delayed Add widens the source-write window so a dropped lock leaks on EVERY
+	// run rather than intermittently.
+	store := &delayedAddStore{inner: flowlabelstore.NewInMemory(), delay: 20 * time.Millisecond}
+	engine := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()), enforcement.WithFlowLabelStore(store))
+	caps := []capability.Constraint{
+		{Target: "tool:read_secret", Actions: []string{"call"},
+			Directives: []capability.Directive{capability.LabelOutputDirective{Labels: []string{capability.FlowLabelConfidential}}}},
+		{Target: "system:sampling/createMessage", Actions: []string{"allow"},
+			Conditions: []capability.Condition{capability.FlowLabelCondition{Allow: []string{capability.FlowLabelPublic}}}},
+	}
+	dp := pdp.NewManifestPDP(caps, engine, killswitch.NewInMemory())
+
+	for i := 0; i < runs; i++ {
+		sessionID := fmt.Sprintf("sess-%d", i)
+		gate := newDecisionSerializer()
+		// The host reader reserves the source's decision ticket FIRST (receipt order), before
+		// the sampling decision is dispatched to the upstream-reader goroutine.
+		srcTicket := gate.take()
+
+		fp := serverRequestParams{
+			sessionID: sessionID,
+			pdp:       dp,
+			// The sampling decision reserves its own (later) ticket and blocks until its turn —
+			// the exact wiring stdio's samplingDecideLock installs.
+			decideLock: func() func() { return gate.begin(gate.take()) },
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			end := gate.begin(srcTicket)
+			defer end()
+			// The host source read taints the session (delayed Add) inside its serialized turn.
+			src := dp.Decide(context.Background(), sessionID,
+				pdp.EnforceTarget{Type: capability.TargetTypeTool, Name: "read_secret"}, map[string]interface{}{}, "")
+			if src.Decision != capability.DecisionAllow {
+				t.Errorf("run %d: the source read must be allowed, got %+v", i, src.Denial)
+			}
+		}()
+
+		// The sampling sink decision serializes behind the source's turn and observes the taint.
+		dec := fp.decideSampling(context.Background())
+		wg.Wait()
+
+		if dec.Decision != capability.DecisionDeny {
+			t.Fatalf("run %d: the sampling sink must be DENIED — the source->sampling race was not closed", i)
+		}
+		if dec.Denial == nil || dec.Denial.ConditionType != capability.ConditionTypeFlowLabel {
+			t.Fatalf("run %d: the sampling deny must be a flowLabel deny, got %+v", i, dec.Denial)
+		}
+	}
+}
+
 // denialConditionType decodes the structured conditionType from a denial response's
 // error.data (the denialErrorData the transport stamps), so a test can assert WHICH
 // control denied — "" for a non-denial or an undecodable payload.

@@ -486,9 +486,32 @@ type serverRequestParams struct {
 	pdp           pdp.PolicyDecisionPoint
 	forward       func(mcp.RPCMsg) bool
 	writeUpstream func(mcp.RPCMsg)
+	// decideLock serializes the sampling decision against the session's host-path
+	// decisions when the policy is flow-/sequenceBlock-relevant. A flowLabel sink on
+	// system:sampling reads the same per-session flow state a host source writes, and this
+	// path runs on the upstream-reader goroutine — outside the host decideGate/decideMu —
+	// so without it a sampling sink could peek the flow set mid-commit of a host source's
+	// Add and slip the taint (docs/flow-label-hardening.md piece B). Calling it enters the
+	// per-session decision critical section and returns the end func; nil disables
+	// serialization (a non-flow policy, or a direct test caller). It wraps ONLY the
+	// decision, never the forward. labelOutput on system:sampling is rejected at manifest
+	// load, so sampling is only ever a sink here, never a concurrent writer.
+	decideLock func() (end func())
 	// strictAuditState (embedded) carries the --require-audit=strict gate, which also
 	// covers the enforced sampling/createMessage path below. See forwardParams.
 	strictAuditState
+}
+
+// decideSampling runs the sampling decision under the per-session decision lock when one
+// is configured (see decideLock), releasing it (defer, panic-safe) BEFORE the caller
+// forwards to the host — so the flow peek is serialized with host-path label writes while
+// the forward stays concurrent. A no-op wrapper when serialization is off.
+func (fp serverRequestParams) decideSampling(ctx context.Context) capability.EnforceResponse {
+	if fp.decideLock != nil {
+		end := fp.decideLock()
+		defer end()
+	}
+	return fp.pdp.DecideSampling(ctx, fp.sessionID, fp.sourceIP)
 }
 
 // strictServerRequestAuditDenial applies the --require-audit=strict gate to a
@@ -597,7 +620,11 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 	if fp.audit {
 		ctx = enforcement.WithSkipQuota(ctx)
 	}
-	dec := fp.pdp.DecideSampling(ctx, fp.sessionID, fp.sourceIP)
+	// Serialized against host-path decisions for a flow-/sequenceBlock-relevant session,
+	// so a flowLabel sink on system:sampling cannot read the flow set concurrently with a
+	// host source's label write (piece B). The lock covers only the decision's flow peek;
+	// the forward below runs unlocked.
+	dec := fp.decideSampling(ctx)
 	if dec.Decision == capability.DecisionAllow {
 		// --require-audit=strict gates this enforced method too: a degraded trail
 		// fails an allowed sampling request closed (AUDIT_UNAVAILABLE to the upstream

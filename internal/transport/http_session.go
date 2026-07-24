@@ -422,7 +422,7 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 	// the process at the same time. That is benign: both close upIn and kill the
 	// process idempotently (a double-close/double-kill just returns an ignored
 	// error), and closeOnce only guards close()'s own body, not this goroutine's.
-	go func() {
+	go func() { //nolint:contextcheck // teardown path: releaseSessionState uses a detached, bounded context by design (the session is gone; no request context), matching the other teardown steps.
 		<-sess.done
 		if sess.upIn != nil {
 			_ = sess.upIn.Close()
@@ -1138,22 +1138,51 @@ func (s *httpSession) forwardNotification(ctx context.Context, msg mcp.RPCMsg) {
 	_ = s.upWriter.Write(msg)
 }
 
+// inFlightDrainPoll is how often releaseSessionState re-checks the in-flight counter
+// while waiting for enforced decisions to drain before it releases flow state.
+const inFlightDrainPoll = 2 * time.Millisecond
+
 // releaseSessionState releases a torn-down session's per-session enforcement state (its
 // accumulated flow-label set) via the route's PDP, so an ended session retains nothing
 // and a reused session id starts clean (docs/flow-label-hardening.md FR-H2). It is called
 // from the cleanup goroutine that runs after <-sess.done on EVERY teardown — idle reap,
 // DELETE, kill, shutdown, and natural subprocess exit — so it covers the paths
 // httpSession.close() alone does not (close() is skipped on a natural upstream exit).
-// Detached, bounded context: teardown must not block on a slow store, and a Redis store
-// reclaims an orphaned key by idle TTL regardless. A no-op when the policy uses no flow
-// control (ReleaseSession self-guards) or the route is unset (defensive).
+//
+// It first waits for in-flight enforced decisions to finish (bounded), so a teardown
+// Clear cannot empty the session's taint BETWEEN a source's committed Add and a sink
+// still deciding on the same session — the fail-open a teardown racing live decisions
+// would otherwise open (piece B). The wait is bounded by the session shutdown budget so a
+// wedged handler cannot pin teardown; a Redis store reclaims an orphaned key by idle TTL
+// if we time out. The Clear itself uses a detached, bounded context (teardown must not
+// block on a slow store). A no-op when the policy uses no flow control (ReleaseSession
+// self-guards) or the route is unset (defensive).
 func releaseSessionState(sess *httpSession) {
 	if sess.route == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), msToDuration(sess.proxy.shutdownMs))
+	budget := msToDuration(sess.proxy.shutdownMs)
+	sess.awaitInFlightDrained(budget)
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 	sess.route.pdp.ReleaseSession(ctx, sess.id)
+}
+
+// awaitInFlightDrained blocks until this session has no enforced request in flight, or
+// until timeout elapses. In-flight enforced requests may still be mid-decision when
+// teardown begins (sess.done is closed for the session, but a request that already passed
+// getSession runs to completion against its own request context), so releasing flow state
+// before they finish could drop a live taint (see releaseSessionState). Bounded and
+// poll-based: teardown is off the hot path, and the wait must never be unbounded on a
+// wedged handler.
+func (s *httpSession) awaitInFlightDrained(timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for s.inFlight.Load() > 0 {
+		if !time.Now().Before(deadline) {
+			return
+		}
+		time.Sleep(inFlightDrainPoll)
+	}
 }
 
 // close shuts down the session.

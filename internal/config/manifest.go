@@ -1589,10 +1589,12 @@ func requireResponseDirectiveTarget(i int, target string, targetType capability.
 }
 
 // requireSourceDirectiveTarget restricts labelOutput to tool: and resource: source
-// targets — the boundaries a sensitive read sits at. A prompt: or system: target is not
-// a flow source; in particular a labelOutput on system:sampling would write session
-// state on an allowed sampling call whose forward path does not record labels, so the
-// tape and state would disagree. Reject at load rather than admit that mismatch.
+// targets — the boundaries a sensitive read sits at. A prompt: or system: target is not a
+// flow SOURCE: a sampling/createMessage request is an egress the agent drives, a place a
+// flowLabel SINK belongs, not a source that asserts new taint. (This restriction is why
+// sampling can only ever be a flow sink, never a concurrent flow writer — see the
+// per-session serialization in internal/transport.) Reject at load rather than admit a
+// labelOutput on a non-source target.
 func requireSourceDirectiveTarget(i int, target string, targetType capability.TargetType) error {
 	if targetType != capability.TargetTypeTool && targetType != capability.TargetTypeResource {
 		return fmt.Errorf("capability at index %d: constraint %q carries a labelOutput directive, which is valid only on tool: or resource: source targets (a %s target is not a flow source)", i, target, targetType)

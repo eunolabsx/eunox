@@ -177,7 +177,9 @@ func TestFlowLabelStore_LifecycleThroughInterface(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range bothBackends(t) {
 		t.Run(tc.name, func(t *testing.T) {
-			var store capability.FlowLabelStore = tc.store
+			// tc.store is already a capability.FlowLabelStore, so the exercise is through
+			// the same interface the enforcement engine sees.
+			store := tc.store
 
 			// Source reads assert labels; a later sink observes the accumulated set.
 			require.NoError(t, store.Add(ctx, "sess", "pii"))
