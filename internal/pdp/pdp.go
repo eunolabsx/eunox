@@ -921,16 +921,26 @@ func targetOperationPhrase(t capability.TargetType) string {
 // stamped by evaluateMatched, so the Peek is skipped to avoid a redundant read. The
 // back-fill mutates resp through the pointer, so callers see the stamped labels.
 //
+// The flow peek/record and the label back-fill are gated on the SAME per-constraint
+// predicate the genuine-allow path uses (evaluateMatched's flowRelevant =
+// !skipFlow && constraintHasFlow), so a non-flow constraint's forwarded observe record
+// stays label-free — matching the record a genuine allow of that constraint writes,
+// rather than over-reporting the session's accumulated labels on a call that is neither a
+// flow source nor a sink — and pays none of the vocabulary Peek cost, honoring the
+// WithoutFlowLabels optimization on this path too. RecordSessionCall stays ungated: the
+// sequenceBlock antecedent must be recorded for every downgraded deny regardless of flow.
+//
 // clock is p.engineClock() at every call site so the frozen test clock is honored
 // and a nil engine never reaches engine.Clock() directly.
 func recordAuditModeAntecedent(ctx context.Context, engine *enforcement.Engine, clock enforcement.Clock, req *capability.EnforceRequest, matched *capability.Constraint, resp *capability.EnforceResponse) *capability.EnforceResponse {
 	if matched.IsAuditOnly() && resp.Decision == capability.DecisionDeny && (resp.Denial == nil || !resp.Denial.HardDeny) {
-		// Capture the carried set before any write, and only when the deny did not
-		// already stamp it (a condition deny routed through evaluateMatched has). The
-		// Peek is audit reflection, not a decision, so its error is not fail-closed —
-		// the enforcement verdict is already settled.
+		flowRelevant := capability.ConstraintHasFlow(matched)
+		// Capture the carried set before any write, only for a flow-relevant constraint
+		// whose deny did not already stamp it (a condition deny routed through
+		// evaluateMatched has). The Peek is audit reflection, not a decision, so its error
+		// is not fail-closed — the enforcement verdict is already settled.
 		var incoming []string
-		if resp.CarriedLabels == nil {
+		if flowRelevant && resp.CarriedLabels == nil {
 			incoming, _ = engine.PeekSessionLabels(ctx, req)
 		}
 		if err := engine.RecordSessionCall(ctx, req); err != nil {
@@ -938,17 +948,19 @@ func recordAuditModeAntecedent(ctx context.Context, engine *enforcement.Engine, 
 				"audit-mode antecedent record failed: "+err.Error())
 			return &deny
 		}
-		labels, err := engine.RecordLabels(ctx, req, matched)
-		if err != nil {
-			deny := hardDenyResponse(clock, capability.ErrCodeConditionFailed,
-				"audit-mode flow-label record failed: "+err.Error())
-			return &deny
-		}
-		if len(labels) > 0 {
-			resp.LabelsOut = labels
-		}
-		if resp.CarriedLabels == nil {
-			resp.CarriedLabels = incoming
+		if flowRelevant {
+			labels, err := engine.RecordLabels(ctx, req, matched)
+			if err != nil {
+				deny := hardDenyResponse(clock, capability.ErrCodeConditionFailed,
+					"audit-mode flow-label record failed: "+err.Error())
+				return &deny
+			}
+			if len(labels) > 0 {
+				resp.LabelsOut = labels
+			}
+			if resp.CarriedLabels == nil {
+				resp.CarriedLabels = incoming
+			}
 		}
 	}
 	return nil

@@ -97,6 +97,29 @@ func IsLabelOutputDirective(d Directive) bool {
 	return ok
 }
 
+// ConstraintHasFlow reports whether c participates in information-flow control — it
+// carries a flowLabel condition (sink) or a labelOutput directive (source). It is the
+// single constraint-level flow-relevance predicate, built from the nil-safe
+// IsFlowLabelCondition/IsLabelOutputDirective helpers, so the engine's per-call allow-path
+// gate and the PDP's audit-mode antecedent gate consult one definition and cannot drift on
+// what counts as flow. Nil-safe.
+func ConstraintHasFlow(c *Constraint) bool {
+	if c == nil {
+		return false
+	}
+	for _, cond := range c.Conditions {
+		if IsFlowLabelCondition(cond) {
+			return true
+		}
+	}
+	for _, dir := range c.Directives {
+		if IsLabelOutputDirective(dir) {
+			return true
+		}
+	}
+	return false
+}
+
 // FlowLabelCondition denies a call when the session's accumulated flow labels are
 // not a subset of Allow — i.e. when any source class that flowed into this session
 // is not permitted at this sink. It is the sink half of the source->sink invariant:

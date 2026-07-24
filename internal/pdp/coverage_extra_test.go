@@ -390,6 +390,38 @@ func TestRecordAuditModeAntecedent_BackfillsFlowLabels(t *testing.T) {
 		"carried_labels must reflect what flowed into the session before this read")
 }
 
+// TestRecordAuditModeAntecedent_NonFlowConstraintNoLabels asserts the flow back-fill is
+// gated on the same per-constraint predicate the genuine-allow path uses: a NON-flow
+// constraint (no flowLabel condition, no labelOutput directive) downgraded under audit in
+// a TAINTED session must not stamp carried_labels/labels_out — matching the empty-label
+// record a genuine allow of that constraint writes — instead of over-reporting the
+// session's accumulated labels on a call that is neither a flow source nor a sink.
+func TestRecordAuditModeAntecedent_NonFlowConstraintNoLabels(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	counter := callcounter.NewInMemory()
+	engine := enforcement.New(enforcement.WithCallCounter(counter))
+
+	// Taint the session via a real source read elsewhere.
+	src := &capability.Constraint{
+		Target:     "tool:a",
+		Actions:    []string{"call"},
+		Directives: []capability.Directive{capability.LabelOutputDirective{Labels: []string{capability.FlowLabelConfidential}}},
+	}
+	_, err := engine.RecordLabels(ctx, &capability.EnforceRequest{SessionID: "s", ToolName: "a"}, src)
+	require.NoError(t, err)
+
+	// A non-flow audit-only constraint hits a downgradable deny in the SAME tainted session.
+	nonFlow := &capability.Constraint{Target: "tool:ping", Actions: []string{"call"}, Enforcement: capability.EnforcementAudit}
+	req := &capability.EnforceRequest{SessionID: "s", ToolName: "ping"}
+	resp := &capability.EnforceResponse{Decision: capability.DecisionDeny}
+	override := recordAuditModeAntecedent(ctx, engine, engine.Clock(), req, nonFlow, resp)
+
+	require.Nil(t, override, "a clean record must not override the downgrade")
+	assert.Nil(t, resp.CarriedLabels, "a non-flow constraint must not stamp carried_labels, matching its genuine-allow record")
+	assert.Nil(t, resp.LabelsOut, "a non-flow constraint asserts no labels")
+}
+
 // targetOperationPhrase covers the system target (default bare-type branch) too.
 func TestTargetOperationPhrase_AllTypes(t *testing.T) {
 	t.Parallel()

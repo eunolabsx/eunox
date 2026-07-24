@@ -267,20 +267,12 @@ func (e *Engine) RecordLabels(ctx context.Context, req *capability.EnforceReques
 
 // constraintHasFlow reports whether matched participates in information-flow control
 // (carries a flowLabel condition or a labelOutput directive), so the engine peeks and
-// records label state only for flow-relevant constraints. Uses the single-sourced,
-// nil-safe capability predicates so it cannot drift from the config-level HasFlowLabel.
+// records label state only for flow-relevant constraints. Delegates to the single-sourced,
+// nil-safe capability.ConstraintHasFlow so the engine's allow-path gate, the PDP's
+// audit-mode antecedent gate, and the config-level HasFlowLabel cannot drift on what
+// counts as flow.
 func constraintHasFlow(matched *capability.Constraint) bool {
-	for _, cond := range matched.Conditions {
-		if capability.IsFlowLabelCondition(cond) {
-			return true
-		}
-	}
-	for _, dir := range matched.Directives {
-		if capability.IsLabelOutputDirective(dir) {
-			return true
-		}
-	}
-	return false
+	return capability.ConstraintHasFlow(matched)
 }
 
 // labelRecordFailureDenial is the fail-closed response when recordLabels cannot persist
