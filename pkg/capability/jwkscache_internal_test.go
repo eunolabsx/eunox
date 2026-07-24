@@ -9,6 +9,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -20,6 +21,8 @@ import (
 
 	jose "github.com/go-jose/go-jose/v4"
 	"github.com/stretchr/testify/require"
+
+	"github.com/eunolabs/eunox/pkg/circuitbreaker"
 )
 
 // TestIsLoopbackHost pins the single source of truth cmd/eunox's
@@ -390,6 +393,100 @@ func TestJWKSCache_RejectsOversizedKeySet(t *testing.T) {
 		}
 		if len(got.Keys) != maxJWKSKeys {
 			t.Fatalf("expected %d keys, got %d", maxJWKSKeys, len(got.Keys))
+		}
+	})
+}
+
+// TestJWKSCache_FetchFailuresTaggedUnavailable pins that every failure to obtain a
+// usable key set carries ErrJWKSUnavailable, so a caller (and the audit layer above
+// it) can tell a JWKS-infrastructure outage apart from a forged token: the token was
+// never checked against a key. It covers each origin — network error, non-200,
+// empty set, oversized set, and an open circuit breaker — through the exported
+// GetKeys, and confirms a healthy fetch is NOT tagged.
+func TestJWKSCache_FetchFailuresTaggedUnavailable(t *testing.T) {
+	t.Run("network error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write(jwksJSONWithNKeys(t, 1))
+		}))
+		url := srv.URL
+		srv.Close() // close before fetch so Do() returns a connection error
+		cache := NewJWKSCache(JWKSCacheConfig{JWKSURL: url, CacheTTL: time.Hour})
+		_, err := cache.GetKeys(context.Background())
+		if err == nil || !errors.Is(err, ErrJWKSUnavailable) {
+			t.Fatalf("GetKeys err = %v, want it to wrap ErrJWKSUnavailable", err)
+		}
+	})
+
+	t.Run("non-200", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		defer srv.Close()
+		cache := NewJWKSCache(JWKSCacheConfig{JWKSURL: srv.URL, Client: srv.Client(), CacheTTL: time.Hour})
+		_, err := cache.GetKeys(context.Background())
+		if err == nil || !errors.Is(err, ErrJWKSUnavailable) {
+			t.Fatalf("GetKeys err = %v, want it to wrap ErrJWKSUnavailable", err)
+		}
+	})
+
+	t.Run("empty key set", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"keys":[]}`))
+		}))
+		defer srv.Close()
+		cache := NewJWKSCache(JWKSCacheConfig{JWKSURL: srv.URL, Client: srv.Client(), CacheTTL: time.Hour})
+		_, err := cache.GetKeys(context.Background())
+		if err == nil || !errors.Is(err, ErrJWKSUnavailable) {
+			t.Fatalf("GetKeys err = %v, want it to wrap ErrJWKSUnavailable", err)
+		}
+	})
+
+	t.Run("oversized key set", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write(jwksJSONWithNKeys(t, maxJWKSKeys+1))
+		}))
+		defer srv.Close()
+		cache := NewJWKSCache(JWKSCacheConfig{JWKSURL: srv.URL, Client: srv.Client(), CacheTTL: time.Hour})
+		_, err := cache.GetKeys(context.Background())
+		if err == nil || !errors.Is(err, ErrJWKSUnavailable) {
+			t.Fatalf("GetKeys err = %v, want it to wrap ErrJWKSUnavailable", err)
+		}
+	})
+
+	t.Run("open circuit breaker", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		defer srv.Close()
+		// Threshold 1 trips the breaker on the first failed fetch; the long cooldown
+		// keeps it open for the second call, which is rejected as ErrOpen — the branch
+		// that must also carry ErrJWKSUnavailable.
+		br := circuitbreaker.New(circuitbreaker.Config{
+			FailureThreshold:  1,
+			CooldownDuration:  time.Hour,
+			HalfOpenMaxProbes: 1,
+		})
+		cache := NewJWKSCache(JWKSCacheConfig{JWKSURL: srv.URL, Client: srv.Client(), CacheTTL: time.Hour, Breaker: br})
+		if _, err := cache.GetKeys(context.Background()); err == nil {
+			t.Fatal("first GetKeys should fail (503) and trip the breaker")
+		}
+		_, err := cache.GetKeys(context.Background())
+		if err == nil || !errors.Is(err, circuitbreaker.ErrOpen) {
+			t.Fatalf("second GetKeys err = %v, want it to wrap circuitbreaker.ErrOpen (breaker should be open)", err)
+		}
+		if !errors.Is(err, ErrJWKSUnavailable) {
+			t.Fatalf("breaker-open err = %v, want it to also wrap ErrJWKSUnavailable", err)
+		}
+	})
+
+	t.Run("healthy fetch is not tagged", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write(jwksJSONWithNKeys(t, 1))
+		}))
+		defer srv.Close()
+		cache := NewJWKSCache(JWKSCacheConfig{JWKSURL: srv.URL, Client: srv.Client(), CacheTTL: time.Hour})
+		if _, err := cache.GetKeys(context.Background()); err != nil {
+			t.Fatalf("a healthy fetch must succeed, got %v", err)
 		}
 	})
 }

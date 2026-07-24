@@ -1892,6 +1892,39 @@ func TestJWKSClient_AllowsLoopbackRedirect(t *testing.T) {
 	}
 }
 
+// TestJWKSClient_BlocksCrossHostRedirect is the regression for the cross-host redirect
+// hole: the scheme check alone passes an https->https hop, so a valid IdP endpoint that
+// 30x's the key fetch to an ATTACKER host (an open-redirect or a compromised redirector)
+// would substitute the key set and forge capability claims. The client must refuse a
+// redirect that leaves the configured host, while still allowing a path/port change on
+// the same host.
+func TestJWKSClient_BlocksCrossHostRedirect(t *testing.T) {
+	t.Parallel()
+	client := newJWKSHTTPClient(false)
+	orig, _ := http.NewRequest(http.MethodGet, "https://idp.example.com/jwks", http.NoBody)
+	via := []*http.Request{orig}
+
+	// Same scheme (https), DIFFERENT host: must be blocked.
+	target, _ := http.NewRequest(http.MethodGet, "https://attacker.example.com/jwks", http.NoBody)
+	if err := client.CheckRedirect(target, via); err == nil {
+		t.Fatal("a same-scheme redirect to a different host must be blocked")
+	} else if !strings.Contains(err.Error(), "redirect blocked") {
+		t.Errorf("error = %v, want it to mention 'redirect blocked'", err)
+	}
+
+	// Same host, different port + path (an IdP relocating its key set): still allowed.
+	sameHost, _ := http.NewRequest(http.MethodGet, "https://idp.example.com:8443/keys", http.NoBody)
+	if err := client.CheckRedirect(sameHost, via); err != nil {
+		t.Fatalf("a same-host redirect (port/path change) must be allowed, got %v", err)
+	}
+
+	// Case-insensitive host match.
+	caseHost, _ := http.NewRequest(http.MethodGet, "https://IDP.EXAMPLE.COM/jwks", http.NoBody)
+	if err := client.CheckRedirect(caseHost, via); err != nil {
+		t.Fatalf("a same-host redirect differing only in case must be allowed, got %v", err)
+	}
+}
+
 // ===== merged from gateway_test.go =====
 
 // mustWriteFile writes content to dir/name (controlling the extension, which

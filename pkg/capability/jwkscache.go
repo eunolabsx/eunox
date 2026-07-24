@@ -25,6 +25,17 @@ import (
 	jose "github.com/go-jose/go-jose/v4"
 )
 
+// ErrJWKSUnavailable tags every failure to obtain a usable key set from the JWKS
+// endpoint — a network error, a non-200 response, an empty or oversized set, an
+// unparseable body, or an open circuit breaker. It marks the failure as an
+// availability problem with the key infrastructure rather than a problem with the
+// token: when a fetch fails, the presented token was never even checked against a
+// key, so it must NOT be recorded in the fail-closed audit trail as if it were
+// forged. Callers surface it through the "fetch JWKS"/"refresh JWKS" %w wraps in
+// VerifyWithKeyRotation, so errors.Is finds it end-to-end; the audit layer keys on
+// it to classify the record as a JWKS outage (see ClassifyJWTError).
+var ErrJWKSUnavailable = errors.New("JWKS unavailable")
+
 // JWKSCache fetches and caches a remote JSON Web Key Set. It is the shared cache
 // consumed by the gateway's IdP-JWT validator, which keeps only its own
 // claim-validation logic and delegates all fetch/cache/singleflight/breaker/TTL
@@ -185,6 +196,14 @@ func IsLoopbackHost(host string) bool {
 
 // GetKeys returns the cached JWKS when it is still within the TTL, otherwise it
 // fetches a fresh copy.
+//
+// The returned *jose.JSONWebKeySet is the cache's own shared instance, handed
+// concurrently to every verification in flight — it is READ-ONLY. Never mutate it or
+// its Keys slice; to obtain keys you can hold or reorder, copy them through FindKeys
+// (which always returns a fresh slice) as the production consumer (VerifyWithKeyRotation)
+// does. Mutating the returned set would corrupt the root-of-trust key material seen by
+// all concurrent token validations. Refresh and the ForceRefresh* methods carry the
+// same contract.
 func (c *JWKSCache) GetKeys(ctx context.Context) (*jose.JSONWebKeySet, error) {
 	c.mu.RLock()
 	if c.jwks != nil && c.now().Sub(c.fetchedAt) < c.cacheTTL {
@@ -197,7 +216,9 @@ func (c *JWKSCache) GetKeys(ctx context.Context) (*jose.JSONWebKeySet, error) {
 }
 
 // Refresh returns a fresh JWKS, respecting the cache TTL: if the cached copy is
-// still within TTL it is returned without an HTTP fetch.
+// still within TTL it is returned without an HTTP fetch. The returned set is the
+// cache's shared, READ-ONLY instance (see GetKeys) — copy through FindKeys before
+// holding or mutating.
 func (c *JWKSCache) Refresh(ctx context.Context) (*jose.JSONWebKeySet, error) {
 	keys, _, err := c.refresh(ctx, false)
 	return keys, err
@@ -225,6 +246,10 @@ func (c *JWKSCache) Refresh(ctx context.Context) (*jose.JSONWebKeySet, error) {
 // An empty kid is never suppressed, and a found kid never CHARGES either signal.
 // When the cache holds no set at all the fetch is not suppressed, so a cold start
 // never denies purely for lack of a cached copy.
+//
+// The returned set is the cache's shared, READ-ONLY instance (see GetKeys): a
+// suppressed call hands back the live cached pointer directly, so copy through
+// FindKeys before holding or mutating it.
 func (c *JWKSCache) ForceRefreshForKID(ctx context.Context, kid string) (*jose.JSONWebKeySet, error) {
 	if kid == "" {
 		// A kid-less lookup is not an unknown-kid lookup. The suppression block below
@@ -279,6 +304,10 @@ const sharedRefreshSentinel = ""
 // negativeKIDTTL, tracked under sharedRefreshSentinel (which ForceRefreshForKID
 // charges too, so the two paths share one budget). The caller fails closed when
 // suppressed.
+//
+// The returned set is the cache's shared, READ-ONLY instance (see GetKeys): a
+// suppressed call hands back the live cached pointer directly, so copy through
+// FindKeys before holding or mutating it.
 func (c *JWKSCache) ForceRefreshForVerify(ctx context.Context) (*jose.JSONWebKeySet, error) {
 	if c.kidRecentlyAbsent(sharedRefreshSentinel) {
 		c.mu.RLock()
@@ -507,7 +536,11 @@ func (c *JWKSCache) refresh(ctx context.Context, force bool) (*jose.JSONWebKeySe
 			jwks, ferr = circuitbreaker.Do(fetchCtx, c.breaker, fetch)
 			if ferr != nil {
 				if errors.Is(ferr, circuitbreaker.ErrOpen) {
-					return nil, fmt.Errorf("JWKS fetch blocked by circuit breaker: %w", ferr)
+					// Breaker-open is a JWKS-availability failure by a different mechanism than
+					// a fetchKeys error (which the defer already tags): the endpoint is being
+					// shielded because recent fetches failed. Tag it too so the audit layer
+					// classifies it as an outage, not a forged token.
+					return nil, fmt.Errorf("%w: JWKS fetch blocked by circuit breaker: %w", ErrJWKSUnavailable, ferr)
 				}
 				return nil, ferr
 			}
@@ -572,7 +605,17 @@ type refreshResult struct {
 	changed bool
 }
 
-func (c *JWKSCache) fetchKeys(ctx context.Context) (*jose.JSONWebKeySet, error) {
+func (c *JWKSCache) fetchKeys(ctx context.Context) (_ *jose.JSONWebKeySet, err error) {
+	// Every non-nil return below is a failure to obtain a usable key set; tag them all
+	// with ErrJWKSUnavailable in one place so the audit layer can tell a JWKS-infra
+	// outage apart from a forged token (the token was never checked against a key). The
+	// %w keeps errors.Is transparent to the underlying cause and leaves the descriptive
+	// message (checked by existing substring tests) intact.
+	defer func() {
+		if err != nil {
+			err = fmt.Errorf("%w: %w", ErrJWKSUnavailable, err)
+		}
+	}()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.jwksURI, http.NoBody)
 	if err != nil {
 		return nil, err

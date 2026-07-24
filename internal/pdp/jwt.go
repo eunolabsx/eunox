@@ -315,12 +315,12 @@ func NewJWTPDP(opts JWTPDPOptions) *JWTPDP {
 	// Pin JWT/JWKS logging to stderr: stdout is the JSON-RPC channel in stdio mode,
 	// so logging must never inherit a slog default that could corrupt the framing.
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	if opts.Audience == "" && !opts.AllowAnyAudience {
+	if normalizeAudience(opts.Audience) == "" && len(sanitizeAudiences(opts.AcceptedAudiences)) == 0 && !opts.AllowAnyAudience {
 		// No audience pinned but not opted out: EVERY token is rejected regardless of
 		// its aud claim (fail closed), mirroring the issuer check below — there is no
 		// pinned audience to trust, so a token cannot clear validation, including one
-		// that sets aud to the literal empty string. Likely a misconfiguration, so
-		// surface it.
+		// that sets aud to the literal empty string (or a whitespace-only pin, which
+		// normalizeAudience collapses to none). Likely a misconfiguration, so surface it.
 		logger.Warn("JWTPDP created without an Audience and without AllowAnyAudience; all tokens will be rejected regardless of aud because no audience is pinned (set --jwt-audience, or --jwt-allow-any-audience to accept any)")
 	}
 	if opts.Issuer == "" && !opts.AllowAnyIssuer {
@@ -346,17 +346,58 @@ func NewJWTPDP(opts JWTPDPOptions) *JWTPDP {
 	return newJWTPDP(opts, capability.NewJWKSCache(cacheConfig))
 }
 
+// normalizeAudience collapses a whitespace-only audience to the empty string so the
+// single-audience fail-closed guard in validateStandardClaims (which tests == "")
+// rejects every token when no real audience is pinned. A non-empty audience is
+// returned byte-for-byte unchanged, so an audience with surrounding spaces (unusual
+// but the operator's choice) still matches exactly.
+func normalizeAudience(aud string) string {
+	if strings.TrimSpace(aud) == "" {
+		return ""
+	}
+	return aud
+}
+
+// sanitizeAudiences drops empty and whitespace-only entries from an accepted-audience
+// list. An empty ("" or "   ") entry is a fail-open hole: go-jose matches audiences by
+// set intersection, so an expected AnyAudience carrying "" ACCEPTS a token whose own
+// aud is the literal empty string — the empty sentinel does not reject everything as
+// intended, it silently admits empty-aud tokens. Non-empty entries are left unchanged
+// so real audiences keep matching exactly. Returns a fresh slice (never aliases the
+// caller's). When every entry is dropped the result is empty, so validateStandardClaims
+// falls back to the single-audience path and its == "" guard fails closed.
+func sanitizeAudiences(auds []string) []string {
+	if len(auds) == 0 {
+		return auds
+	}
+	out := make([]string, 0, len(auds))
+	for _, a := range auds {
+		if strings.TrimSpace(a) != "" {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
 // newJWTPDP assembles a JWTPDP from opts and an already-resolved JWKS cache. Both
 // NewJWTPDP (which builds its own cache) and NewJWTPDPWithCache (which shares an
 // existing one) route through this, so the field set is defined once and the two
 // constructors cannot drift when a field is added.
 func newJWTPDP(opts JWTPDPOptions, cache *capability.JWKSCache) *JWTPDP {
 	p := &JWTPDP{
-		cache:                    cache,
-		issuer:                   opts.Issuer,
-		audience:                 opts.Audience,
+		cache:  cache,
+		issuer: opts.Issuer,
+		// Normalize a whitespace-only audience to "" so the fail-closed guard in
+		// validateStandardClaims (which tests p.audience == "") catches it, and drop any
+		// empty/whitespace entry from acceptedAudiences: go-jose matches audiences by set
+		// intersection, so an AnyAudience carrying "" would ACCEPT a token whose own aud is
+		// the literal empty string (see sanitizeAudiences). The shipped wiring already
+		// rejects an empty effective audience one seam away (transport/route.go + the CLI),
+		// so this is defense in depth for a direct JWTPDPOptions consumer and for the
+		// whitespace case == "" misses.
+		audience:                 normalizeAudience(opts.Audience),
 		allowAnyAudience:         opts.AllowAnyAudience,
-		acceptedAudiences:        opts.AcceptedAudiences,
+		acceptedAudiences:        sanitizeAudiences(opts.AcceptedAudiences),
 		routeAudience:            opts.RouteAudience,
 		allowAnyIssuer:           opts.AllowAnyIssuer,
 		inner:                    opts.Inner,
@@ -454,7 +495,13 @@ const (
 	jwtErrCapabilitiesDisabled = "capabilities_disabled"
 	jwtErrInvalidCapabilities  = "invalid_capabilities"
 	jwtErrSenderConstrained    = "sender_constrained"
-	jwtErrUnknown              = "invalid"
+	// jwtErrJWKSUnavailable marks a validation that failed because the key set could
+	// not be fetched (network error, non-200, empty/oversized set, open breaker), not
+	// because the token was bad — the token was never checked against a key. Keeping it
+	// distinct from "invalid" stops an IdP/JWKS outage from being recorded identically
+	// to a forged token in the fail-closed audit trail.
+	jwtErrJWKSUnavailable = "jwks_unavailable"
+	jwtErrUnknown         = "invalid"
 )
 
 // jwtValidationError tags a ValidateToken failure with a stable category code while
@@ -497,6 +544,12 @@ func ClassifyJWTError(err error) string {
 	// skips its built-in iss/sub validation because Expected leaves those fields unset.
 	// A signature mismatch surfaces as jose.ErrCryptoFailure from the verify closure.
 	switch {
+	case errors.Is(err, capability.ErrJWKSUnavailable):
+		// A fetch/refresh failure (network, non-200, empty/oversized set, open breaker)
+		// propagated up through VerifyWithKeyRotation's "fetch JWKS"/"refresh JWKS" wraps.
+		// The token was never checked against a key, so this is an infrastructure outage,
+		// not an invalid token — classify it as such rather than collapsing to "invalid".
+		return jwtErrJWKSUnavailable
 	case errors.Is(err, jwt.ErrExpired):
 		return jwtErrExpired
 	case errors.Is(err, jwt.ErrNotValidYet):
@@ -1004,6 +1057,16 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 
 	// JWT allows — intersect with the inner manifest PDP if configured (both sides
 	// must pass, § 5.2.1). The inner PDP stamps its own correlation fields.
+	//
+	// This gate is the plain p.inner != nil, deliberately weaker than the
+	// innerEnforces() gate the no-capabilities branch above uses — and that asymmetry is
+	// safe here. The two branches face opposite risks: there the JWT ABSTAINS (no
+	// mcp.capabilities), so an AlwaysAllow/nil inner would fail OPEN, which innerEnforces()
+	// prevents; here the JWT has ALREADY authorized this target against its exhaustive
+	// allowlist, so delegating to a permissive inner (an AlwaysAllowPDP) can only
+	// re-affirm the allow — a weaker gate cannot fail open. Using innerEnforces() here too
+	// would yield the identical decision (only the audit-stamping helper differs:
+	// AlwaysAllowPDP.Decide vs. newAllowResponse below), so the plain nil check is kept.
 	if p.inner != nil {
 		return p.decideInner(ctx, sessionID, target, args, sourceIP)
 	}
@@ -1113,6 +1176,27 @@ func parseV2Claim(claim string) (prefix capability.TargetType, bareName string, 
 	// outright otherwise), so a normal token is unaffected.
 	if p == capability.TargetTypeSystem {
 		return "", "", nil, fmt.Errorf("JWT capability claim %q: the system: namespace is not grantable from a JWT capability claim; system capabilities such as sampling are authorized by the manifest's system:sampling/createMessage opt-in, not a token claim", claim)
+	}
+
+	// Validate the bare target as a path.Match glob, mirroring the manifest loader
+	// (enforcement.ValidateResourcePattern, called from internal/config) so a malformed
+	// target glob is rejected identically whether it arrives in a manifest or a JWT
+	// claim. Without this a claim like "tool:read_[file" passes validation, then
+	// path.Match swallows the ErrBadPattern to a silent non-match at enforce time
+	// (matchesResource) — an inert grant that surfaces only as an opaque
+	// AUTHORIZATION_FAILED, indistinguishable from a target the token simply never
+	// listed. Validate exactly the substring matchClaimBare path.Match'es: for an
+	// http(s) resource claim carrying a query the query is compared literally (not
+	// globbed, see matchClaimBare), so only the path before '?' is the glob; every
+	// other claim globs its whole bare name.
+	globPart := bare
+	if p == capability.TargetTypeResource && isHTTPResourceValue(bare) {
+		if pathPart, _, hasQuery := strings.Cut(bare, "?"); hasQuery {
+			globPart = pathPart
+		}
+	}
+	if err := enforcement.ValidateResourcePattern(globPart); err != nil {
+		return "", "", nil, fmt.Errorf("JWT capability claim %q: invalid target pattern: %w", claim, err)
 	}
 
 	// Parse the optional condition suffix.

@@ -1085,6 +1085,17 @@ func newJWKSHTTPClient(allowInsecure bool) *http.Client {
 			if err := validateJWKSURIScheme(req.URL.String(), allowInsecure); err != nil {
 				return fmt.Errorf("JWKS redirect blocked: %w", err)
 			}
+			// The JWKS is the root of trust for every token, so a redirect must not leave
+			// the configured HOST: the scheme check above still passes an https->https hop,
+			// so without this an IdP open-redirect (or a compromised redirector) could point
+			// the key fetch at an attacker host and substitute the key set, forging
+			// capability claims. via[0] is the original request (the configured --jwks-uri);
+			// require every redirect target to share its hostname. Port and path may change
+			// (an IdP may relocate the key set within its own host — the same latitude the
+			// loopback dev redirect already gets), but the host may not.
+			if len(via) > 0 && !strings.EqualFold(req.URL.Hostname(), via[0].URL.Hostname()) {
+				return fmt.Errorf("JWKS redirect blocked: target host %q differs from the configured JWKS host %q; the key fetch must stay on the configured host", req.URL.Hostname(), via[0].URL.Hostname())
+			}
 			return nil
 		},
 	}
