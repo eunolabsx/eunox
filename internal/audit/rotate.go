@@ -187,23 +187,37 @@ func sortedRotatedSiblings(logPath string) ([]string, error) {
 
 // newestRotatedSiblingWithTail walks logPath's rotated siblings newest-to-oldest and
 // returns the first whose last line is readable and non-empty, along with that line.
-// It skips a sibling that is empty or otherwise unreadable (e.g. the empty rotated
-// file an empty-base rotate() guards against, or one left by a race with an
-// in-progress rotation) instead of treating it as "no tail" and restarting the chain
-// from genesis — which would silently orphan an older, non-empty sibling still on
-// disk. Returns ("", "") when no sibling has a usable tail. Used at both chain-resume
-// sites (Open, recoverTailAfterReadError).
-func newestRotatedSiblingWithTail(logPath string) (path, line string) {
+//
+// An EMPTY sibling (readable, no content — the empty rotated file an empty-base rotate()
+// guards against, or one left by a race with an in-progress rotation) is skipped: it
+// holds no seqs, so resuming from an older non-empty sibling loses nothing.
+//
+// An UNREADABLE newer sibling (a permission/IO error) is NOT skipped: it may hold higher
+// seqs than any older sibling, so silently rewinding to the older one would reissue the
+// unreadable file's seqs — a duplicate-seq cascade audit-verify cannot tell from
+// tampering. The walk stops and returns unreadableNewer=true so the caller fails closed
+// (seed past the on-disk max + write a chain_resume_failed marker) instead of rewinding.
+// This restores the same fail-closed stance recoverTailAfterReadError already takes for
+// an unreadable BASE log.
+//
+// Returns ("", "", false) when no sibling has a usable tail and none was unreadable.
+// Used at both chain-resume sites (Open, recoverTailAfterReadError).
+func newestRotatedSiblingWithTail(logPath string) (path, line string, unreadableNewer bool) {
 	files, err := sortedRotatedSiblings(logPath)
 	if err != nil {
-		return "", ""
+		return "", "", false
 	}
 	for i := len(files) - 1; i >= 0; i-- {
-		if l, lerr := readLastAuditLine(files[i]); lerr == nil && l != "" {
-			return files[i], l
+		l, lerr := readLastAuditLine(files[i])
+		if lerr != nil {
+			// A newer sibling we cannot read: do not skip to an older one, fail closed.
+			return "", "", true
+		}
+		if l != "" {
+			return files[i], l, false
 		}
 	}
-	return "", ""
+	return "", "", false
 }
 
 // LogChainFiles returns the files carrying the tamper-evident chain for logPath, in
@@ -298,6 +312,23 @@ func (s *Sink) swapToFreshBase(f *os.File, closeErrContext string) {
 	s.pruneRotated()
 }
 
+// openGuardedAppend opens logPath for append (creating it if absent), refusing a path
+// that exists but is NOT a regular file. os.OpenFile follows a symlink and would append
+// the tamper-evident tape straight through it; worse, a symlinked active log is silently
+// dropped from LogChainFiles' IsRegular() scan, so audit-verify would PASS without
+// reading a single live record. This mirrors the startup guard in openAndPrepareLog for
+// the two post-rotation reopen sites, where a symlink planted in the rename->reopen
+// window would otherwise be followed for the rest of the process. Lstat inspects the
+// path itself, not its target; a missing path is the ordinary post-rename case and
+// passes through to O_CREATE. On refusal the caller takes its existing reopen-failure
+// fallback (keep the renamed fd, retry later), the fail-closed direction.
+func openGuardedAppend(logPath string) (*os.File, error) {
+	if fi, statErr := os.Lstat(logPath); statErr == nil && !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("refusing a non-regular audit log path %q (mode %v): the audit log must be a regular file, not a symlink or other special file", logPath, fi.Mode())
+	}
+	return os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600) //nolint:gosec // G304: path is user-configured audit log location
+}
+
 func (s *Sink) rotate() {
 	if s.f == nil {
 		return
@@ -361,12 +392,23 @@ func (s *Sink) rotate() {
 	// OpenFile succeeds, so it stays valid (now synced) on reopen failure. A sync
 	// failure is logged, not fatal.
 	if err := s.f.Sync(); err != nil {
-		// Account for it in writeFailures (and so the metric and Close error) so a
-		// sync failure unique to rotation is not invisible to operators.
+		// A failed fsync means the rotated sibling's tail may not be durable on disk. Do
+		// NOT proceed to reopen+swap: swapToFreshBase closes this fd for good (Close does
+		// not fsync on Linux), so a crash would permanently drop the un-synced tail and
+		// leave a tamper-shaped chain gap at the rotation boundary — the HMAC-linked
+		// successor lives in the fresh base. Instead enter the reopen-fallback state,
+		// keeping this fd as the active path so retryRotateReopen re-Syncs it on the
+		// bounded backoff cadence and only completes the swap once the tail is durable.
+		// Account for it in writeFailures so the degradation stays visible to operators.
 		s.writeFailures.Add(1)
-		fmt.Fprintf(os.Stderr, "[eunox] audit rotate error (sync): %v\n", err)
+		fmt.Fprintf(os.Stderr, "[eunox] audit rotate error (sync): %v; deferring reopen until the rotated tail is durable\n", err)
+		s.activePath = rotated
+		s.inFallback = true
+		s.written = s.rotateBackoffWritten()
+		s.pruneRotated()
+		return
 	}
-	f, err := os.OpenFile(s.logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	f, err := openGuardedAppend(s.logPath)
 	if err != nil {
 		// Reopen failed; fall back to the renamed fd (valid and already synced).
 		// Point activePath at it so the next rotation renames it, but keep logPath as
@@ -419,7 +461,7 @@ func (s *Sink) retryRotateReopen() {
 		s.writeFailures.Add(1)
 		fmt.Fprintf(os.Stderr, "[eunox] audit rotate error (sync on fallback recovery): %v\n", serr)
 	}
-	f, err := os.OpenFile(s.logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	f, err := openGuardedAppend(s.logPath)
 	if err != nil {
 		// Still cannot open a fresh base. Do NOT rename (the fallback file already
 		// carries a rotated-sibling name); just back off so the next reopen attempt is
@@ -470,9 +512,21 @@ func (s *Sink) pruneRotated() {
 	if len(rotated) <= s.retain {
 		return
 	}
+	// Delete oldest-first. On the FIRST real failure, STOP rather than continue:
+	// retention is only safe because it removes a contiguous OLDEST prefix, leaving the
+	// kept files a contiguous suffix. Continuing past a failed unlink could delete a
+	// NEWER sibling while this OLDER one survives — an interior hole that cross-file
+	// verify (VerifyLogFiles) reports as a prev_hmac CHAIN BREAK + SEQ GAP at the seam,
+	// indistinguishable from an attacker deleting an interior file. A file already gone
+	// (a raced prune, or an operator removed it) is not a hole, so keep going past that.
+	// The next rotation retries the prune, so a transient fault self-heals.
 	for _, old := range rotated[:len(rotated)-s.retain] {
 		if err := os.Remove(old); err != nil {
-			fmt.Fprintf(os.Stderr, "[eunox] audit retention: could not delete %q: %v\n", old, err)
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "[eunox] audit retention: could not delete %q: %v; stopping prune to keep rotated files contiguous (retried on the next rotation)\n", old, err)
+			break
 		}
 	}
 }
@@ -512,12 +566,21 @@ func (s *Sink) rotatedPath() (string, error) {
 	// existing sibling rather than restarting from 1 and mis-ordering retention. Only
 	// raise the counter — never lower a value later rotations already advanced.
 	if s.ordinalSeedUncertain {
-		if seed, ok := maxRotatedOrdinal(s.logPath); ok {
-			if seed > s.rotateOrdinal {
-				s.rotateOrdinal = seed
-			}
-			s.ordinalSeedUncertain = false
+		seed, ok := maxRotatedOrdinal(s.logPath)
+		if !ok {
+			// The same directory-read fault that set the uncertain flag still persists (e.g.
+			// a write+exec-but-not-readable log dir, where ReadDir fails while Rename/Lstat
+			// still succeed). Do NOT fall through and stamp ordinal 1: it would sort BEFORE
+			// the existing higher-ordinal siblings, so pruneRotated would delete the NEWEST
+			// file first and LogChainFiles would feed verify out of order (a spurious CHAIN
+			// BREAK / SEQ GAP). Defer this rotation instead — rotate()'s target-error branch
+			// backs off and retries — keeping the uncertain flag set for the next attempt.
+			return "", fmt.Errorf("cannot seed the rotation ordinal for %q (sibling directory still unreadable); deferring rotation to avoid stamping a stale-low ordinal", s.logPath)
 		}
+		if seed > s.rotateOrdinal {
+			s.rotateOrdinal = seed
+		}
+		s.ordinalSeedUncertain = false
 	}
 	s.rotateOrdinal++
 	base := s.logPath + "." + fmt.Sprintf("%020d", s.rotateOrdinal) + "." + s.clock().UTC().Format("20060102T150405.000000000Z")
