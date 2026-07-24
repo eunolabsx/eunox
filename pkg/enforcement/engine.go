@@ -168,6 +168,15 @@ type Engine struct {
 	counter         capability.CallCounter
 	policyEvaluator PolicyEvaluator
 
+	// flowStore holds per-session information-flow-control label state (the source's
+	// labelOutput write, the sink's flowLabel read). It is a seam distinct from
+	// counter because provenance is a monotonic, session-lifetime SET, not a decaying
+	// sliding-window count: keeping flow state in the windowed counter aged a taint out
+	// mid-session (a fail-open). nil disables flow recording — a flowLabel/labelOutput
+	// constraint then fails closed exactly as a nil counter fails maxCalls closed. See
+	// docs/flow-label-hardening.md and pkg/flowlabelstore.
+	flowStore capability.FlowLabelStore
+
 	// skipAntecedentRecording is set when the policy provably contains no
 	// sequenceBlock condition, so the per-call antecedent marker recordSessionCall
 	// writes is never read. Skipping the write avoids a needless counter round-trip
@@ -217,6 +226,19 @@ func (e *Engine) Clock() Clock {
 func WithCallCounter(counter capability.CallCounter) Option {
 	return func(e *Engine) {
 		e.counter = counter
+	}
+}
+
+// WithFlowLabelStore sets the session-scoped flow-label store backing information-flow
+// control (the flowLabel condition and the labelOutput directive). It is distinct from
+// the CallCounter: flow-label provenance is a monotonic per-session set with a
+// session-scoped lifetime, so it must not live in the sliding-window counter that
+// backs maxCalls/sequenceBlock. Leave it unset only for a policy known to use no flow
+// control (see config.LocalManifest.HasFlowLabel); a flow constraint with no store
+// wired fails closed. See docs/flow-label-hardening.md and pkg/flowlabelstore.
+func WithFlowLabelStore(store capability.FlowLabelStore) Option {
+	return func(e *Engine) {
+		e.flowStore = store
 	}
 }
 
@@ -884,30 +906,23 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 		return *denyResp
 	}
 
-	// Record the sequenceBlock antecedent BEFORE the flow labels: a recordSessionCall
-	// fault then denies with no labels yet committed, so a blocked call never taints the
-	// session with flow labels. For a pure flow policy recordSessionCall is skipped (no
-	// sequenceBlock), so recordLabels below is the only state write and this ordering has
-	// no residual. RESIDUAL (both labelOutput AND sequenceBlock present): the two state
-	// writes span the disjoint "seq:"/"flow:" namespaces and are not atomic, so if
-	// recordSessionCall commits and recordLabels then HARD-denies, the seq marker persists
-	// for a call that never ran (a phantom antecedent). This is fail-closed (over-block,
-	// never a leak) and symmetric with the reverse ordering; the atomic-commit fix is
-	// tracked in docs/flow-label-hardening.md, mirroring the analogous sequenceBlock note.
-	if err := e.recordSessionCall(ctx, req); err != nil {
-		return recordFailureDenial(requestID, now, matched.IsAuditOnly(), obligations)
-	}
-
-	// This call's own emitted labels (from labelOutput directives). A recordLabels fault
-	// fails closed as a HARD deny (see labelRecordFailureDenial), so an audit-mode source
-	// whose label failed to persist is not forwarded unlabeled.
-	var labelsOut []string
-	if flowRelevant {
-		var err error
-		labelsOut, err = e.recordLabels(ctx, req, matched)
-		if err != nil {
+	// Commit this call's sequenceBlock antecedent and flow labels as a single
+	// all-or-nothing unit (recordSourceCall): the flow write goes first (the
+	// FlowLabelStore supports targeted rollback), the seq antecedent second, and a fault
+	// on the second write rolls the first back — so a hard-denied call that is never
+	// forwarded leaves NEITHER a phantom seq antecedent nor a stranded flow label
+	// (docs/flow-label-hardening.md defect D3/FR-H5). Each half still fails closed on its
+	// own fault: a flow-write fault is a HARD deny (labelRecordFailureDenial, so an
+	// audit-mode source whose label did not persist is not forwarded unlabeled); a
+	// seq-write fault denies via recordFailureDenial. The per-session decision lock
+	// (docs/flow-label-hardening.md piece B) serializes this critical section, so the
+	// rollback removes exactly this call's additions with no concurrent writer.
+	labelsOut, cerr := e.recordSourceCall(ctx, req, matched, flowRelevant, carriedLabels)
+	if cerr != nil {
+		if cerr.Flow {
 			return labelRecordFailureDenial(requestID, now, matched.IsAuditOnly(), obligations)
 		}
+		return recordFailureDenial(requestID, now, matched.IsAuditOnly(), obligations)
 	}
 
 	return capability.EnforceResponse{

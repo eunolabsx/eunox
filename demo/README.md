@@ -20,12 +20,16 @@ Two Docker services. One manifest file. First enforced tool call in under 10 min
 > [`manifest-flow.yaml`](./manifest-flow.yaml) — not part of the published `0.1`
 > grammar. Go + python3, no Docker.
 >
-> Honest limits (same shape as `sequenceBlock`): the source→sink guarantee holds
-> for a compliant, serialized MCP client — a client that fires the source read and
-> the egress write concurrently on one session can race the label write past the
-> sink's check; across multiple proxy instances it requires a shared Redis call
-> counter (a startup NOTICE warns when one is missing); and a session's taint is
-> retained for the session, not forever.
+> Scope: the source→sink guarantee holds even against a client that fires the
+> source read and the egress write concurrently on one session — the proxy
+> serializes a flow-relevant session's decision phase in receipt order, so the
+> source's label commits before the egress's check regardless of client
+> concurrency (the race the demo used to hide by serializing its client is closed;
+> see [`../docs/flow-label-hardening.md`](../docs/flow-label-hardening.md)). A
+> session's taint is retained for the whole session lifetime — no wall-clock
+> expiry — and reclaimed when the session ends. Across multiple proxy instances it
+> requires a shared Redis flow-label store (a startup NOTICE warns when one is
+> missing).
 
 ## What this demo shows
 

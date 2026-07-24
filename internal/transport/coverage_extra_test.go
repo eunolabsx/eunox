@@ -501,7 +501,7 @@ func TestWriteControlTokenFile_BareFilenameUsesCurrentDir(t *testing.T) {
 func TestLoadUpstreamPDP_ExpectVersionWithoutPolicy(t *testing.T) {
 	t.Parallel()
 	u := &config.UpstreamConfig{Name: "fs", Transport: "stdio", ExpectVersion: "1.0.0"}
-	_, _, _, _, err := LoadUpstreamPDP(u, config.HostTransportStdio, "", callcounter.NewInMemory(), killswitch.NewInMemory())
+	_, _, _, _, err := LoadUpstreamPDP(u, config.HostTransportStdio, "", callcounter.NewInMemory(), nil, killswitch.NewInMemory())
 	if err == nil {
 		t.Fatal("expectVersion without a policy must fail closed")
 	}
@@ -516,7 +516,7 @@ func TestLoadUpstreamPDP_ExpectVersionMultiplePolicies(t *testing.T) {
 	m1 := mustWriteFile(t, dir, "a.yaml", "schemaVersion: \"0.1\"\nname: a\nversion: \"1.0.0\"\ncapabilities:\n  - target: tool:read_file\n    actions: [call]\n")
 	m2 := mustWriteFile(t, dir, "b.yaml", "schemaVersion: \"0.1\"\nname: b\nversion: \"1.0.0\"\ncapabilities:\n  - target: tool:write_file\n    actions: [call]\n")
 	u := &config.UpstreamConfig{Name: "fs", Transport: "stdio", ExpectVersion: "1.0.0", Policy: []string{m1, m2}}
-	_, _, _, _, err := LoadUpstreamPDP(u, config.HostTransportStdio, "", callcounter.NewInMemory(), killswitch.NewInMemory())
+	_, _, _, _, err := LoadUpstreamPDP(u, config.HostTransportStdio, "", callcounter.NewInMemory(), nil, killswitch.NewInMemory())
 	if err == nil {
 		t.Fatal("expectVersion with multiple policy files must be rejected")
 	}
@@ -531,7 +531,7 @@ func TestLoadUpstreamPDP_SamplingOptInOnHTTPUpstreamRejected(t *testing.T) {
 	m := mustWriteFile(t, dir, "sampling.yaml",
 		"schemaVersion: \"0.1\"\nname: s\nversion: \"1.0.0\"\ncapabilities:\n  - target: system:sampling/createMessage\n    actions: [allow]\n")
 	u := &config.UpstreamConfig{Name: "remote", Transport: config.HostTransportHTTP, Policy: []string{m}}
-	_, _, _, _, err := LoadUpstreamPDP(u, config.HostTransportHTTP, "", callcounter.NewInMemory(), killswitch.NewInMemory())
+	_, _, _, _, err := LoadUpstreamPDP(u, config.HostTransportHTTP, "", callcounter.NewInMemory(), nil, killswitch.NewInMemory())
 	if err == nil {
 		t.Fatal("a sampling opt-in on an http upstream must fail closed (it cannot be enforced)")
 	}

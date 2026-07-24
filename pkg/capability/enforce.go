@@ -147,3 +147,50 @@ type CallCounter interface {
 	// records nothing. The single-bucket path stays on IncrementIfBelow.
 	IncrementIfAllBelow(ctx context.Context, keys []string, windowSecs []int, limits []int64) (admitted bool, deniedIndex int, count int64, retryAfter time.Duration, err error)
 }
+
+// FlowLabelStore holds each session's accumulated information-flow-control label
+// set — the source->sink provenance state a labelOutput directive writes and a
+// flowLabel condition reads. It is a seam distinct from CallCounter because
+// provenance has a different contract than counting: it is a MONOTONIC per-session
+// set with a SESSION-SCOPED lifetime, not a decaying sliding-window count. The
+// CallCounter's window ages a taint out mid-session (a fail-open the flow-control
+// "for all flows" claim cannot tolerate), so flow state lives here instead. See
+// docs/flow-label-hardening.md (defect D1) and pkg/flowlabelstore.
+//
+// Implementations must be safe for concurrent use. The sessionKey is opaque and
+// already namespaced by the caller (the engine folds its route namespace and the
+// session id into it, mirroring the CallCounter key discipline), so a shared
+// backend keeps gateway routes and sessions disjoint. All methods fail closed:
+// a backend fault surfaces as an error the engine turns into a deny (an
+// unreadable source->sink state must never be mistaken for "clean context").
+//
+// A custom backend pins conformance with
+// `var _ capability.FlowLabelStore = (*MyStore)(nil)`.
+type FlowLabelStore interface {
+	// Add unions labels into the session's accumulated set (idempotent — adding a
+	// label already present is a no-op). An empty labels list is a no-op. A backend
+	// that reclaims idle keys by TTL refreshes it here, so an active session never
+	// expires while it keeps emitting labels.
+	Add(ctx context.Context, sessionKey string, labels ...string) error
+
+	// Get returns the session's accumulated set (SET semantics: deduplicated,
+	// order unspecified — the engine reorders into the canonical vocabulary order).
+	// An absent session returns an empty slice and a nil error, never an error. A
+	// TTL-reclaiming backend refreshes the idle TTL here too, so reading a live
+	// session's taint keeps it alive.
+	Get(ctx context.Context, sessionKey string) ([]string, error)
+
+	// Remove deletes the named labels from the session's set (idempotent — removing
+	// an absent label is a no-op). It backs the fail-closed rollback of a source
+	// call's flow write when the paired sequenceBlock antecedent write then faults
+	// (docs/flow-label-hardening.md defect D3): the per-session decision lock makes
+	// this rollback race-free, so it removes exactly the labels the faulted call
+	// added and never a concurrent source's. An empty labels list is a no-op.
+	Remove(ctx context.Context, sessionKey string, labels ...string) error
+
+	// Clear releases the session's entire set, called from the transport's session
+	// teardown so an ended session retains no state and a reused session id starts
+	// clean (docs/flow-label-hardening.md FR-H2). Clearing an absent session is a
+	// no-op.
+	Clear(ctx context.Context, sessionKey string) error
+}

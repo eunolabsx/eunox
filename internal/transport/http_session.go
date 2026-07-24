@@ -99,6 +99,15 @@ type httpSession struct {
 	// evaluates against, since server-initiated sampling has no host request in scope.
 	clientIP string
 
+	// decideMu serializes this session's enforced-request decision phase when the route
+	// is flow- or sequenceBlock-relevant (route.serializeDecisions), so a source's
+	// per-session state write is not raced ahead of by a later sink's read on the same
+	// session (docs/flow-label-hardening.md piece B). HTTP has no serial reader, so it is
+	// held in arrival-at-the-lock order and released right after the decision (via the
+	// dispatch handler's finishDecision) so the upstream forward stays concurrent. Unused
+	// on a non-serialized route.
+	decideMu sync.Mutex
+
 	notifMu   sync.Mutex
 	notifSubs []chan mcp.RPCMsg
 
@@ -434,6 +443,12 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 		p.mu.Lock()
 		delete(p.sessions, sess.id)
 		p.mu.Unlock()
+		// Release this session's per-session flow-label state now it is gone from the
+		// registry (docs/flow-label-hardening.md FR-H2). This cleanup block runs on EVERY
+		// teardown — idle reap, DELETE, kill, shutdown, AND natural subprocess exit (which
+		// close() does not cover) — so it is the one place that reclaims state for all of
+		// them, co-located with the registry delete.
+		releaseSessionState(sess)
 		fmt.Fprintf(os.Stderr, "[eunox] HTTP session %s ended.\n", sess.id)
 	}()
 
@@ -1121,6 +1136,24 @@ func (s *httpSession) forwardNotification(ctx context.Context, msg mcp.RPCMsg) {
 		msg = rewritten
 	}
 	_ = s.upWriter.Write(msg)
+}
+
+// releaseSessionState releases a torn-down session's per-session enforcement state (its
+// accumulated flow-label set) via the route's PDP, so an ended session retains nothing
+// and a reused session id starts clean (docs/flow-label-hardening.md FR-H2). It is called
+// from the cleanup goroutine that runs after <-sess.done on EVERY teardown — idle reap,
+// DELETE, kill, shutdown, and natural subprocess exit — so it covers the paths
+// httpSession.close() alone does not (close() is skipped on a natural upstream exit).
+// Detached, bounded context: teardown must not block on a slow store, and a Redis store
+// reclaims an orphaned key by idle TTL regardless. A no-op when the policy uses no flow
+// control (ReleaseSession self-guards) or the route is unset (defensive).
+func releaseSessionState(sess *httpSession) {
+	if sess.route == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), msToDuration(sess.proxy.shutdownMs))
+	defer cancel()
+	sess.route.pdp.ReleaseSession(ctx, sess.id)
 }
 
 // close shuts down the session.

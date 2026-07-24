@@ -26,6 +26,7 @@ import (
 	"github.com/eunolabs/eunox/pkg/callcounter"
 	"github.com/eunolabs/eunox/pkg/capability"
 	"github.com/eunolabs/eunox/pkg/enforcement"
+	"github.com/eunolabs/eunox/pkg/flowlabelstore"
 	"github.com/eunolabs/eunox/pkg/killswitch"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -624,7 +625,7 @@ func TestForwardServerRequest_SamplingFlowLabelDenyRecordsDetails(t *testing.T) 
 	t.Parallel()
 	ctx := context.Background()
 	counter := callcounter.NewInMemory()
-	engine := enforcement.New(enforcement.WithCallCounter(counter))
+	engine := enforcement.New(enforcement.WithCallCounter(counter), enforcement.WithFlowLabelStore(flowlabelstore.NewInMemory()))
 
 	// Taint session "s" with a confidential source read.
 	_, err := engine.RecordLabels(ctx, &capability.EnforceRequest{SessionID: "s", ToolName: "read_secret"},

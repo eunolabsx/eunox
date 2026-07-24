@@ -96,6 +96,7 @@ func (denyAllPDP) CheckAudience(_ context.Context) *capability.EnforceResponse {
 	return nil
 }
 func (denyAllPDP) RecordObservedToolHashes(_ context.Context, _ json.RawMessage) int { return 0 }
+func (denyAllPDP) ReleaseSession(_ context.Context, _ string)                        {}
 func (denyAllPDP) FilterToolsList(_ context.Context, result json.RawMessage) ListFilterResult {
 	return ListFilterResult{Result: result}
 }
@@ -140,6 +141,7 @@ func (*staticPDP) CheckAudience(_ context.Context) *capability.EnforceResponse {
 	return nil
 }
 func (*staticPDP) RecordObservedToolHashes(_ context.Context, _ json.RawMessage) int { return 0 }
+func (*staticPDP) ReleaseSession(_ context.Context, _ string)                        {}
 func (*staticPDP) FilterToolsList(_ context.Context, result json.RawMessage) ListFilterResult {
 	return ListFilterResult{Result: result}
 }

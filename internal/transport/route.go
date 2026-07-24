@@ -45,6 +45,13 @@ type UpstreamRoute struct {
 	audit      bool                  // observe mode: evaluate and log, but forward instead of block
 	driftCheck drift.CheckFunc       // set from package main after BuildRoutes; nil = no drift checking
 
+	// serializeDecisions is set when the route's policy is flow- or sequenceBlock-relevant,
+	// so each of its sessions serializes its decision phase (the PDP decision + state
+	// write, NOT the upstream forward) to order a source's write before a later sink's
+	// read (docs/flow-label-hardening.md piece B). false keeps full intra-session
+	// decision parallelism. Read-only after BuildRoutes.
+	serializeDecisions bool
+
 	// Policy provenance is captured once at load and lives only on sink, which is the
 	// sole runtime consumer (it stamps every audit record). Keeping one authoritative
 	// home avoids a route-side copy drifting from what the audit tape records.
@@ -198,7 +205,7 @@ func PrintRoutePolicyNotices(w io.Writer, name, routePath string, auditOnlyCount
 //
 // driftCheckFor builds each route's session-start drift hook (the caller passes
 // drift.MakeDriftCheck), keeping the drift policy logic out of this layer.
-func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability.CallCounter, ks killswitch.Manager, globalStrictDrift bool, driftCheckFor func(*config.LocalManifest, bool) drift.CheckFunc) (map[string]*UpstreamRoute, error) {
+func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability.CallCounter, flowStore capability.FlowLabelStore, ks killswitch.Manager, globalStrictDrift bool, driftCheckFor func(*config.LocalManifest, bool) drift.CheckFunc) (map[string]*UpstreamRoute, error) {
 	routes := make(map[string]*UpstreamRoute, len(cfg.Upstreams))
 	anyPoliced := false
 	for i := range cfg.Upstreams {
@@ -229,12 +236,19 @@ func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability
 		}
 		configStrict := cfg.ResolvedStrictDrift(u)
 
-		dp, manifest, policyVersion, policySHA256, err := LoadUpstreamPDP(u, cfg.HostTransport(), cfg.BaseDir, counter, ks)
+		dp, manifest, policyVersion, policySHA256, err := LoadUpstreamPDP(u, cfg.HostTransport(), cfg.BaseDir, counter, flowStore, ks)
 		if err != nil {
 			return nil, err
 		}
 		r.pdp = dp
 		r.manifest = manifest
+		// Serialize this route's per-session decision phase when its policy is
+		// flow- or sequenceBlock-relevant (both read per-session state a source writes
+		// and a later call reads), so a source's write is ordered before a later sink's
+		// read on the same session under concurrent in-flight requests
+		// (docs/flow-label-hardening.md piece B). A non-flow/non-sequence route keeps full
+		// intra-session decision parallelism.
+		r.serializeDecisions = manifest != nil && (manifest.HasFlowLabel() || manifest.HasSequenceBlock())
 		// strictDrift is used only to build this route's drift hook (its one
 		// consumer), so it stays a local rather than write-only route state.
 		strictDrift := ResolveStrictDrift(configStrict, globalStrictDrift, manifest != nil)
@@ -414,7 +428,7 @@ func WalkRouteManifests(cfg *config.GatewayConfig, u *config.UpstreamConfig) Rou
 // against it, not the process working directory, so a config launched from any cwd
 // finds its manifests. An empty baseDir (e.g. a programmatically built config) keeps
 // the prior cwd-relative behavior. Absolute policy paths are used verbatim.
-func LoadUpstreamPDP(u *config.UpstreamConfig, hostTransport, baseDir string, counter capability.CallCounter, ks killswitch.Manager) (policy pdp.PolicyDecisionPoint, manifest *config.LocalManifest, policyVersion, policySHA256 string, err error) {
+func LoadUpstreamPDP(u *config.UpstreamConfig, hostTransport, baseDir string, counter capability.CallCounter, flowStore capability.FlowLabelStore, ks killswitch.Manager) (policy pdp.PolicyDecisionPoint, manifest *config.LocalManifest, policyVersion, policySHA256 string, err error) {
 	if len(u.Policy) == 0 {
 		if u.ExpectVersion != "" {
 			return nil, nil, "", "", fmt.Errorf("upstream %q: expectVersion %q set but no policy is configured", u.Name, u.ExpectVersion)
@@ -463,6 +477,11 @@ func LoadUpstreamPDP(u *config.UpstreamConfig, hostTransport, baseDir string, co
 	// namespaced.
 	engineOpts := []enforcement.Option{
 		enforcement.WithCallCounter(counter),
+		// Flow-label provenance lives in its own session-lifetime store, not the
+		// sliding-window counter (docs/flow-label-hardening.md). Wired unconditionally
+		// like the counter; the WithoutFlowLabels gate below skips the flow path for a
+		// non-flow policy, so a wired-but-unused store costs nothing.
+		enforcement.WithFlowLabelStore(flowStore),
 		enforcement.WithCounterKeyNamespace(u.Name),
 	}
 	if !merged.HasSequenceBlock() {

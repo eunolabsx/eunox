@@ -104,7 +104,7 @@ func TestBuildRoutes_VersionAndPDP(t *testing.T) {
 		Name: "fs", Transport: "stdio", Command: "echo",
 		Policy: []string{manifest}, ExpectVersion: "1.2.3",
 	}}}
-	routes, err := BuildRoutes(cfg, nil, callcounter.NewInMemory(), killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil })
+	routes, err := BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil })
 	if err != nil {
 		t.Fatalf("BuildRoutes: %v", err)
 	}
@@ -132,7 +132,7 @@ func TestBuildRoutes_NoPolicyInheritsAudit(t *testing.T) {
 	t.Parallel()
 	cfg := &config.GatewayConfig{Upstreams: []config.UpstreamConfig{{Name: "fs", Transport: "stdio", Command: "echo"}}}
 	cfg.Defaults.Enforcement = capability.EnforcementAudit
-	routes, err := BuildRoutes(cfg, nil, callcounter.NewInMemory(), killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil })
+	routes, err := BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil })
 	if err != nil {
 		t.Fatalf("BuildRoutes: %v", err)
 	}
@@ -164,7 +164,7 @@ func TestBuildRoutes_ManifestWithRouteAuditEmitsBanner(t *testing.T) {
 
 	var buildErr error
 	out := captureStderr(t, func() {
-		_, buildErr = BuildRoutes(cfg, nil, callcounter.NewInMemory(), killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil })
+		_, buildErr = BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil })
 	})
 	if buildErr != nil {
 		t.Fatalf("BuildRoutes: %v", buildErr)
@@ -188,7 +188,7 @@ func TestBuildRoutes_RemoteUpstreamServerInitiatedNotice(t *testing.T) {
 
 	var buildErr error
 	s := captureStderr(t, func() {
-		_, buildErr = BuildRoutes(cfg, nil, callcounter.NewInMemory(), killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil })
+		_, buildErr = BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil })
 	})
 	if buildErr != nil {
 		t.Fatalf("BuildRoutes: %v", buildErr)
@@ -218,7 +218,7 @@ func TestBuildRoutes_NoPolicyPerRouteAudit(t *testing.T) {
 	cfg := &config.GatewayConfig{Upstreams: []config.UpstreamConfig{{
 		Name: "fs", Transport: "stdio", Command: "echo", Enforcement: capability.EnforcementAudit,
 	}}}
-	routes, err := BuildRoutes(cfg, nil, callcounter.NewInMemory(), killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil })
+	routes, err := BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil })
 	if err != nil {
 		t.Fatalf("BuildRoutes: %v", err)
 	}
@@ -283,7 +283,7 @@ func TestBuildRoutes_GlobalStrictDrift(t *testing.T) {
 
 	t.Run("flag off honors per-route config", func(t *testing.T) {
 		var calls []driftArg
-		if _, err := BuildRoutes(newCfg(), nil, callcounter.NewInMemory(), killswitch.NewInMemory(), false, captureDrift(&calls)); err != nil {
+		if _, err := BuildRoutes(newCfg(), nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, captureDrift(&calls)); err != nil {
 			t.Fatalf("BuildRoutes: %v", err)
 		}
 		for _, c := range calls {
@@ -295,7 +295,7 @@ func TestBuildRoutes_GlobalStrictDrift(t *testing.T) {
 
 	t.Run("flag on promotes policed routes only", func(t *testing.T) {
 		var calls []driftArg
-		if _, err := BuildRoutes(newCfg(), nil, callcounter.NewInMemory(), killswitch.NewInMemory(), true, captureDrift(&calls)); err != nil {
+		if _, err := BuildRoutes(newCfg(), nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), true, captureDrift(&calls)); err != nil {
 			t.Fatalf("BuildRoutes: %v", err)
 		}
 		// Two policed routes (policed + optedOut — the latter's strictDrift:false is
@@ -326,7 +326,7 @@ func TestBuildRoutes_GlobalStrictDrift(t *testing.T) {
 			{Name: "a", Transport: "stdio", Command: "echo", Enforcement: capability.EnforcementAudit},
 		}}
 		var calls []driftArg
-		if _, err := BuildRoutes(cfg, nil, callcounter.NewInMemory(), killswitch.NewInMemory(), true, captureDrift(&calls)); err != nil {
+		if _, err := BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), true, captureDrift(&calls)); err != nil {
 			t.Fatalf("BuildRoutes: %v (flag must warn, not fail, on policyless config)", err)
 		}
 		for _, c := range calls {
@@ -681,7 +681,7 @@ func TestBuildRoutes_WiretapPDPWiredToKillSwitch(t *testing.T) {
 	ks := killswitch.NewInMemory()
 	rt := &UpstreamRoute{name: "wt"}
 	// A policyless upstream (no policy, no expectVersion) yields the wiretap PDP.
-	dp, _, _, _, err := LoadUpstreamPDP(&config.UpstreamConfig{Name: "wt"}, config.HostTransportStdio, "", nil, ks)
+	dp, _, _, _, err := LoadUpstreamPDP(&config.UpstreamConfig{Name: "wt"}, config.HostTransportStdio, "", nil, nil, ks)
 	if err != nil {
 		t.Fatalf("LoadUpstreamPDP: %v", err)
 	}
@@ -740,7 +740,7 @@ func TestBuildRoutes_RelativePolicyResolvedAgainstConfigDir(t *testing.T) {
 			Name: "fs", Transport: "stdio", Command: "echo", Policy: []string{"policy.yaml"},
 		}},
 	}
-	routes, err := BuildRoutes(cfg, nil, callcounter.NewInMemory(), killswitch.NewInMemory(), false, driftFor)
+	routes, err := BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, driftFor)
 	if err != nil {
 		t.Fatalf("BuildRoutes with BaseDir: %v", err)
 	}
@@ -755,7 +755,7 @@ func TestBuildRoutes_RelativePolicyResolvedAgainstConfigDir(t *testing.T) {
 			Name: "fs", Transport: "stdio", Command: "echo", Policy: []string{"policy.yaml"},
 		}},
 	}
-	if _, err := BuildRoutes(cwdCfg, nil, callcounter.NewInMemory(), killswitch.NewInMemory(), false, driftFor); err == nil {
+	if _, err := BuildRoutes(cwdCfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, driftFor); err == nil {
 		t.Error("BuildRoutes with empty BaseDir from a different cwd should fail to find the relative policy, but succeeded")
 	}
 }

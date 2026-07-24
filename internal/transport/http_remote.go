@@ -239,6 +239,9 @@ func (p *HTTPProxy) newRemoteSession(ctx context.Context, route *UpstreamRoute, 
 		p.mu.Lock()
 		delete(p.sessions, sess.id)
 		p.mu.Unlock()
+		// Release this session's per-session flow-label state (docs/flow-label-hardening.md
+		// FR-H2), mirroring the local-subprocess cleanup path.
+		releaseSessionState(sess)
 		fmt.Fprintf(os.Stderr, "[eunox] HTTP session %s ended.\n", sess.id)
 	}()
 

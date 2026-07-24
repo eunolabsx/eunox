@@ -78,6 +78,16 @@ type PolicyDecisionPoint interface {
 	// this feeds is a security control, not audit-logging bookkeeping: an audit-mode route
 	// running with no sink configured must still have the poisoning defense armed.
 	RecordObservedToolHashes(ctx context.Context, result json.RawMessage) (entryCount int)
+
+	// ReleaseSession releases per-session enforcement state when the transport tears a
+	// session down (idle reap, client DELETE, kill, shutdown, or natural upstream exit),
+	// so an ended session retains no state and a reused session id starts clean. Today
+	// that is the session's accumulated flow-label set (docs/flow-label-hardening.md
+	// FR-H2); it is the one teardown seam any future per-session state reuses. It must be
+	// a safe no-op for a PDP with no such state (AlwaysAllowPDP, DenyAllPDP) and for a
+	// session that recorded none, and must never block on the upstream — teardown paths
+	// call it with a detached, bounded context.
+	ReleaseSession(ctx context.Context, sessionID string)
 }
 
 // ListFilterer filters tools/resources/prompts list results down to the entries
@@ -397,6 +407,10 @@ func (AlwaysAllowPDP) RecordObservedToolHashes(_ context.Context, result json.Ra
 	return passThroughList(result, listKeyTools).Upstream
 }
 
+// ReleaseSession is a no-op: a wiretap PDP enforces no policy and holds no per-session
+// flow state to release.
+func (AlwaysAllowPDP) ReleaseSession(_ context.Context, _ string) {}
+
 // FilterToolsList passes the tools/list result through unchanged: wiretap/audit
 // mode applies no policy. It still reports an accurate entry count (Upstream ==
 // Kept) so a JWT route layered over a wiretap inner audits the right numbers.
@@ -480,6 +494,9 @@ func (DenyAllPDP) CheckAudience(_ context.Context) *capability.EnforceResponse {
 func (DenyAllPDP) RecordObservedToolHashes(_ context.Context, result json.RawMessage) int {
 	return passThroughList(result, listKeyTools).Upstream
 }
+
+// ReleaseSession is a no-op: the fail-closed default holds no per-session flow state.
+func (DenyAllPDP) ReleaseSession(_ context.Context, _ string) {}
 
 // FilterToolsList filters the tools/list result down to nothing (keep == false
 // for every entry), reusing the shared fail-closed envelope round-trip.
@@ -701,6 +718,18 @@ func (p *ManifestPDP) CheckKill(ctx context.Context, sessionID string) *capabili
 // the JWT aud claim. Per-route token-audience pinning lives in the JWTPDP wrapper.
 func (*ManifestPDP) CheckAudience(_ context.Context) *capability.EnforceResponse {
 	return nil
+}
+
+// ReleaseSession releases the session's accumulated flow-label state on teardown, via
+// the engine (which namespaces the store key by route). A no-op when the policy uses no
+// flow control or no store is wired (see Engine.ClearSessionLabels). Best-effort: a
+// store fault on teardown is swallowed rather than surfaced — the session is already
+// gone, and a Redis-backed store reclaims an orphaned key by idle TTL regardless.
+func (p *ManifestPDP) ReleaseSession(ctx context.Context, sessionID string) {
+	if p.engine == nil {
+		return
+	}
+	_ = p.engine.ClearSessionLabels(ctx, sessionID)
 }
 
 // Decide evaluates a tools/call against the manifest: it selects the
@@ -943,18 +972,25 @@ func recordAuditModeAntecedent(ctx context.Context, engine *enforcement.Engine, 
 		if flowRelevant && resp.CarriedLabels == nil {
 			incoming, _ = engine.PeekSessionLabels(ctx, req)
 		}
-		if err := engine.RecordSessionCall(ctx, req); err != nil {
-			deny := hardDenyResponse(clock, capability.ErrCodeConditionFailed,
-				"audit-mode antecedent record failed: "+err.Error())
+		// Commit the seq antecedent and the flow labels atomically (RecordSourceCall), so
+		// a fault between the two leaves neither stranded on this forwarded observe record
+		// (docs/flow-label-hardening.md FR-H5) — the same all-or-nothing the genuine-allow
+		// path uses. carried is the pre-write accumulated set for the rollback delta:
+		// resp.CarriedLabels when a flow-condition deny already stamped it, else the peek.
+		carried := resp.CarriedLabels
+		if carried == nil {
+			carried = incoming
+		}
+		labels, cerr := engine.RecordSourceCall(ctx, req, matched, flowRelevant, carried)
+		if cerr != nil {
+			msg := "audit-mode antecedent record failed: "
+			if cerr.Flow {
+				msg = "audit-mode flow-label record failed: "
+			}
+			deny := hardDenyResponse(clock, capability.ErrCodeConditionFailed, msg+cerr.Error())
 			return &deny
 		}
 		if flowRelevant {
-			labels, err := engine.RecordLabels(ctx, req, matched)
-			if err != nil {
-				deny := hardDenyResponse(clock, capability.ErrCodeConditionFailed,
-					"audit-mode flow-label record failed: "+err.Error())
-				return &deny
-			}
 			if len(labels) > 0 {
 				resp.LabelsOut = labels
 			}

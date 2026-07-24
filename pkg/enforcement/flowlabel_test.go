@@ -10,6 +10,7 @@ import (
 	"github.com/eunolabs/eunox/pkg/callcounter"
 	"github.com/eunolabs/eunox/pkg/capability"
 	"github.com/eunolabs/eunox/pkg/enforcement"
+	"github.com/eunolabs/eunox/pkg/flowlabelstore"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -45,7 +46,7 @@ func req(session, name string) *capability.EnforceRequest {
 // denial is distinguishable from a capability denial (flowLabel conditionType + a
 // "flow" detail + the offending label), the property the demo's contrast leg needs.
 func TestFlowLabel_SourceToSinkDeny(t *testing.T) {
-	eng := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()))
+	eng := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()), enforcement.WithFlowLabelStore(flowlabelstore.NewInMemory()))
 	ctx := context.Background()
 
 	src := eng.ValidateAction(ctx, req("s", "read_secret"), sourceCaps("read_secret", capability.FlowLabelConfidential))
@@ -73,7 +74,7 @@ func TestFlowLabel_SourceToSinkDeny(t *testing.T) {
 // session with no accumulated labels is allowed. This is the demo's within-scope
 // contrast leg — the same egress that a tainted session blocks succeeds when clean.
 func TestFlowLabel_CleanContextAllows(t *testing.T) {
-	eng := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()))
+	eng := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()), enforcement.WithFlowLabelStore(flowlabelstore.NewInMemory()))
 	ctx := context.Background()
 
 	resp := eng.ValidateAction(ctx, req("clean", "send_email"),
@@ -83,28 +84,29 @@ func TestFlowLabel_CleanContextAllows(t *testing.T) {
 }
 
 // TestFlowLabel_FailsClosedOnUnreadableState is coverage (c): flow state that
-// cannot be read denies. Two ways it is unreadable — no counter backend, and no session
-// id (which would merge state across callers) — and a labelOutput source that cannot
-// persist its label also fails closed rather than silently letting a later sink Peek empty.
+// cannot be read denies. Two ways it is unreadable — no flow-label store backend, and no
+// session id (which would merge state across callers) — and a labelOutput source that
+// cannot persist its label also fails closed rather than silently letting a later sink Get empty.
 func TestFlowLabel_FailsClosedOnUnreadableState(t *testing.T) {
 	ctx := context.Background()
 
-	// No counter: a flowLabel sink cannot read state -> deny.
-	noCounter := enforcement.New()
-	sink := noCounter.ValidateAction(ctx, req("s", "send_email"), sinkCaps("send_email", capability.FlowLabelPublic))
+	// No store: a flowLabel sink cannot read state -> deny.
+	noStore := enforcement.New()
+	sink := noStore.ValidateAction(ctx, req("s", "send_email"), sinkCaps("send_email", capability.FlowLabelPublic))
 	require.Equal(t, capability.DecisionDeny, sink.Decision)
 	assert.Equal(t, capability.ConditionTypeFlowLabel, sink.Denial.ConditionType)
 
-	// No session: state would merge across anonymous callers -> deny (MISSING_CONTEXT).
-	withCounter := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()))
+	// No session: state would merge across anonymous callers -> deny (MISSING_CONTEXT). The
+	// store is wired so the empty-session guard (not the missing-store guard) is what fires.
+	withStore := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()), enforcement.WithFlowLabelStore(flowlabelstore.NewInMemory()))
 	noSession := &capability.EnforceRequest{ToolName: "send_email", Target: &capability.EnforceRequestTarget{Type: "tool", Name: "send_email"}}
-	sink = withCounter.ValidateAction(ctx, noSession, sinkCaps("send_email", capability.FlowLabelPublic))
+	sink = withStore.ValidateAction(ctx, noSession, sinkCaps("send_email", capability.FlowLabelPublic))
 	require.Equal(t, capability.DecisionDeny, sink.Decision)
 	assert.Equal(t, capability.ErrCodeMissingContext, sink.Denial.Code)
 
-	// A labelOutput source that cannot persist its label (no counter) fails closed with a
+	// A labelOutput source that cannot persist its label (no store) fails closed with a
 	// record-phase flowLabel deny, so the source->sink guarantee is never silently dropped.
-	src := noCounter.ValidateAction(ctx, req("s", "read_secret"), sourceCaps("read_secret", capability.FlowLabelConfidential))
+	src := noStore.ValidateAction(ctx, req("s", "read_secret"), sourceCaps("read_secret", capability.FlowLabelConfidential))
 	require.Equal(t, capability.DecisionDeny, src.Decision)
 	assert.Equal(t, capability.ConditionTypeFlowLabel, src.Denial.ConditionType)
 	assert.Equal(t, "record", src.Denial.Details["phase"])
@@ -115,7 +117,7 @@ func TestFlowLabel_FailsClosedOnUnreadableState(t *testing.T) {
 // allow-set. It also checks the accumulated set surfaces on an allowed sink as
 // carried_labels, in the fixed vocabulary order.
 func TestFlowLabel_MultiSourceUnion(t *testing.T) {
-	eng := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()))
+	eng := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()), enforcement.WithFlowLabelStore(flowlabelstore.NewInMemory()))
 	ctx := context.Background()
 
 	require.Equal(t, capability.DecisionAllow,
@@ -142,7 +144,7 @@ func TestFlowLabel_MultiSourceUnion(t *testing.T) {
 // distinct escalate outcome is not part of this grammar). The destructive sink permits
 // every class but untrusted; a session touched by untrusted input is denied.
 func TestFlowLabel_IntegrityDual(t *testing.T) {
-	eng := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()))
+	eng := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()), enforcement.WithFlowLabelStore(flowlabelstore.NewInMemory()))
 	ctx := context.Background()
 
 	require.Equal(t, capability.DecisionAllow,
@@ -165,7 +167,7 @@ func TestFlowLabel_IntegrityDual(t *testing.T) {
 // order and de-duplicated, regardless of the order the directive declared them, so the
 // audit field is deterministic.
 func TestFlowLabel_LabelsOutCanonicalOrder(t *testing.T) {
-	eng := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()))
+	eng := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()), enforcement.WithFlowLabelStore(flowlabelstore.NewInMemory()))
 	ctx := context.Background()
 
 	// Declared out of vocabulary order and with a duplicate.
@@ -180,7 +182,7 @@ func TestFlowLabel_LabelsOutCanonicalOrder(t *testing.T) {
 // masked; and carried_labels is stamped on the deny response too, so the tape / an
 // observe-mode forward can reconstruct the accumulated set.
 func TestFlowLabel_DenyReportsAllBlockedLabels(t *testing.T) {
-	eng := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()))
+	eng := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()), enforcement.WithFlowLabelStore(flowlabelstore.NewInMemory()))
 	ctx := context.Background()
 
 	require.Equal(t, capability.DecisionAllow,
@@ -201,7 +203,7 @@ func TestFlowLabel_DenyReportsAllBlockedLabels(t *testing.T) {
 // labelOutput) reports neither label field, so a non-flow policy pays no label cost and
 // the audit record stays lean.
 func TestFlowLabel_NonFlowConstraintCarriesNoLabels(t *testing.T) {
-	eng := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()))
+	eng := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()), enforcement.WithFlowLabelStore(flowlabelstore.NewInMemory()))
 	ctx := context.Background()
 
 	resp := eng.ValidateAction(ctx, req("s", "plain"),

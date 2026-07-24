@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/eunolabs/eunox/internal/mcp"
@@ -505,7 +506,23 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 			sess.inFlight.Add(-1)
 			sess.releaseRequestSlot()
 		}()
-		resp = dispatchRequest(ctx, p.dispatchParams(sess, p.sourceIP(r)), msg)
+		d := p.dispatchParams(sess, p.sourceIP(r))
+		// Serialize the per-session decision phase for a flow-/sequenceBlock-relevant
+		// route (docs/flow-label-hardening.md piece B), so a source's state write is not
+		// raced ahead of by a later sink's read on the same session. Only enforced methods
+		// take the lock (only they run a PDP decision + state write); the Decide* handler
+		// releases it via finishDecision right after the decision, so the upstream forward
+		// runs outside it, and this defer is the idempotent backstop for the
+		// malformed-params path (which returns before the decision).
+		if sess.route != nil && sess.route.serializeDecisions && isEnforcedMethod(msg.Method) {
+			sess.decideMu.Lock()
+			// sync.OnceFunc so the handler's release-after-decision (finishDecision) and this
+			// deferred backstop unlock exactly once between them.
+			end := sync.OnceFunc(sess.decideMu.Unlock)
+			d.endDecision = end
+			defer end()
+		}
+		resp = dispatchRequest(ctx, d, msg)
 	}
 
 	// Re-arm a bounded write deadline for the actual response write, ALWAYS — the

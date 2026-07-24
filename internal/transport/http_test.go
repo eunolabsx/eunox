@@ -1540,6 +1540,9 @@ func (r recordingDecisionPoint) CheckAudience(ctx context.Context) *capability.E
 func (r recordingDecisionPoint) RecordObservedToolHashes(ctx context.Context, result json.RawMessage) int {
 	return r.inner.RecordObservedToolHashes(ctx, result)
 }
+func (r recordingDecisionPoint) ReleaseSession(ctx context.Context, sessionID string) {
+	r.inner.ReleaseSession(ctx, sessionID)
+}
 func (r recordingDecisionPoint) FilterToolsList(ctx context.Context, result json.RawMessage) pdp.ListFilterResult {
 	return r.inner.FilterToolsList(ctx, result)
 }
