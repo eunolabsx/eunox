@@ -1,14 +1,16 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// Package main — stdio proxy transport.
+// Package transport — stdio proxy transport.
 //
 //	MCP host  ──stdin/stdout──►  StdioProxy  ──►  upstream MCP server (subprocess)
 //
-// Enforced host requests pass through a PDP decision before reaching the
-// upstream; everything else (other requests, notifications both directions) is
-// forwarded verbatim. One goroutine reads from the host, one from the upstream;
-// upstream responses are routed back to the matching pending request.
+// Enforced host requests pass through a PDP decision before reaching the upstream.
+// Unmapped host requests are denied fail-closed (AUTHORIZATION_FAILED), */list
+// responses are filtered to the permitted subset, and initialize is answered
+// locally; notifications are gated by the dispatch allowlists rather than blindly
+// relayed. One goroutine reads from the host, one from the upstream; upstream
+// responses are routed back to the matching pending request.
 
 package transport
 

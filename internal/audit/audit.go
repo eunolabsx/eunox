@@ -235,8 +235,8 @@ type Sink struct {
 	// Sync/Close error. sync.Once.Do's happens-before makes the read safe.
 	closeErr error
 
-	// mu guards the records-channel send in record() against Close's channel close.
-	// record() holds it for read across the non-blocking send; Close holds it for
+	// mu guards the records-channel send in Record() against Close's channel close.
+	// Record() holds it for read across the non-blocking send; Close holds it for
 	// write while setting closed and closing the channel. The write lock cannot be
 	// acquired until every in-flight read lock releases, so a send can never be
 	// mid-flight when close(s.records) runs (which would panic). A read lock lets
@@ -1610,7 +1610,7 @@ const (
 // rather than serializing as `{}`. If the marshaled clone still exceeds
 // auditDetailsTotalCap, the whole map is replaced with a single marker (rebuilt
 // from a fresh map — truncation is rare, so its extra marshal does not matter).
-// record() and syntheticDenyMarker apply it before enqueue so the queue never
+// Record() and syntheticDenyMarker apply it before enqueue so the queue never
 // retains an un-truncated or aliased payload.
 func marshalAndBoundDetails(m map[string]interface{}) json.RawMessage {
 	if len(m) == 0 {
@@ -1659,7 +1659,7 @@ const auditObligationsTotalCap = 64 << 10 // 64 KiB
 // within auditObligationsTotalCap is returned unchanged; otherwise the leading
 // entries that fit are kept and a single "obligations_truncated:N" sentinel (N =
 // omitted count) is appended, keeping the record valid and the truncation visible.
-// record() applies it before enqueue, like marshalAndBoundDetails.
+// Record() applies it before enqueue, like marshalAndBoundDetails.
 func boundAuditObligations(obligs []string) []string {
 	if len(obligs) == 0 {
 		return obligs
@@ -2205,7 +2205,7 @@ func recordMAC(key, body []byte) string {
 // advancing the chain head and seq only after a successful durable write. A
 // dropped or failed record never consumes a seq or leaves a dangling link.
 func (s *Sink) writeRecord(rec *auditRecord) {
-	// Details and envelope are already bounded at record() time, so the serialized
+	// Details and envelope are already bounded at Record() time, so the serialized
 	// record is provably far below the 4 MiB scanner buffer / chain-resume window.
 
 	// Stamp the chain fields before signing so the HMAC covers them: the next
@@ -2353,10 +2353,10 @@ func (s *Sink) writeRecord(rec *auditRecord) {
 func (s *Sink) Close() error {
 	s.closeOnce.Do(func() {
 		// Set closed and close the channel under the write lock so no in-flight
-		// record() send is on the channel-send arm when close() runs (which would
+		// Record() send is on the channel-send arm when close() runs (which would
 		// panic). The write lock waits for every concurrent send (each read-locked) to
 		// finish; later sends see closed and drop. Released before wg.Wait so
-		// post-close record() calls are not blocked behind the final flush.
+		// post-close Record() calls are not blocked behind the final flush.
 		//
 		// A verify-only Sink (NewVerifier) has no records channel and no drainer, so
 		// guard the close: close(nil) panics, and there is nothing to drain or wait on.
@@ -2370,7 +2370,7 @@ func (s *Sink) Close() error {
 		s.wg.Wait() // block until the drainer has exited (no-op for a verifier)
 
 		// Sample the drop counter under the write lock so the warning counts every
-		// record() already in its read-locked critical section: a racing producer
+		// Record() already in its read-locked critical section: a racing producer
 		// does dropped.Add(1) under the read lock, and the write lock waits for those
 		// to complete, so an unsynchronized Load cannot miss one. Drops arriving after
 		// this barrier are post-shutdown and remain visible via DroppedRecords().

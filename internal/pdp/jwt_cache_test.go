@@ -10,8 +10,10 @@ import (
 	"github.com/eunolabs/eunox/pkg/capability"
 )
 
-// The generic cache engine (TTL, eviction, LRU, concurrency, Start/Stop) is tested in
-// pkg/capability; these tests cover only the JWT-specific wiring in newJWTTokenCache.
+// The generic cache engine (TTL, eviction, LRU-like ordering, concurrency) is tested in
+// pkg/capability (payload_cache_internal_test.go); it is lazy-pruned with no background
+// goroutine, so there is no Start/Stop. These tests cover only the JWT-specific wiring in
+// newJWTTokenCache.
 
 // TestJWTTokenCache_SharesPointer pins the identity-clone contract: Get returns the
 // SAME *JWTClaims pointer that was Put, so the immutable claims (and their cached

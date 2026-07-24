@@ -35,7 +35,7 @@ your IdP) and enforces a fine-grained YAML policy on top of it.
 | `prompts/get` | **Enforced** — PDP decision per manifest entry | |
 | `prompts/list` | **Filtered** — only prompts with `action: get` (or `*`) in manifest are returned | |
 | `sampling/createMessage` *(upstream→host)* | **Enforced** (local subprocess upstream only) — denied by default; requires explicit `system:sampling/createMessage` entry in manifest, and the kill switch applies. On the allow path the host's response is routed back to the upstream so the round-trip completes | Fail-closed: absent = deny. See the transport caveats in *Known gaps* below |
-| Upstream-initiated non-sampling requests (e.g. `roots/list`) | **Forwarded verbatim** for local subprocess upstreams — no PDP evaluation, no audit record; the host's response is routed back to the upstream | Remote HTTP upstreams have no background reader and do not consume server-initiated messages |
+| Upstream-initiated non-sampling requests (e.g. `roots/list`) | **Forwarded** for local subprocess upstreams — not policy-enforced (no allow/deny decision), but kill-switch-checked, `--require-audit=strict`-gated, and audited (an allow record on delivery, an `ENFORCEMENT_ERROR` deny if no client received it); the host's response is routed back to the upstream | Remote HTTP upstreams have no background reader and do not consume server-initiated messages |
 | `initialize` *(host→proxy)* | **Handled by proxy** — eunox sends its own `initialize` to the upstream at startup and synthesizes the host-facing response using the upstream's declared capabilities | Host never sees the upstream's raw response |
 | `ping` *(host→proxy)* | **Denied** — no handler registered; treated as unmapped request | Upstream is never called |
 | Host notifications (`notifications/*`) *(host→upstream)* | **Forwarded verbatim** — passed to upstream before request dispatch, no PDP evaluation | Exceptions: `notifications/initialized` is swallowed (the proxy has already sent its own to the upstream); `notifications/cancelled` has its `params.requestId` rewritten to the proxy nonce the upstream saw for that request (host request ids are nonce-rewritten on the wire), so the cancel actually targets the in-flight call — a cancel for a request no longer in flight is dropped. Cancellation is best-effort on HTTP: a cancel delivered on a separate connection concurrently with its target request (before the request registered) is dropped, matching the MCP spec's inherently-racy cancellation. A killed session's notifications are dropped (ack'd) rather than forwarded. |
@@ -176,8 +176,8 @@ server-initiated messages).
 
 | Feature | MCP 2025-11-25 method(s) | eunox behavior today | Notes |
 |---|---|---|---|
-| **Elicitation** | `elicitation/create` *(upstream→host)* | **Forwarded verbatim** for local subprocess upstreams — no PDP check or audit record; not consumed for remote HTTP upstreams | `elicitation/create` flows upstream→host; it is not a host-originated request and is not caught by the unmapped-method denial path |
-| **Tasks** | `tasks/get`, `tasks/result`, `tasks/cancel`, `tasks/list` | **Host-originated:** Denied (unmapped — fail-closed); **Upstream-initiated:** Forwarded verbatim for local subprocess upstreams — not consumed for remote HTTP upstreams | MCP 2025-11-25 tasks methods can flow in either direction; eunox has no handler for them in either direction |
+| **Elicitation** | `elicitation/create` *(upstream→host)* | **Forwarded** for local subprocess upstreams — not policy-enforced, but kill-switch-checked and audited via the shared server-request path; not consumed for remote HTTP upstreams | `elicitation/create` flows upstream→host; it is not a host-originated request and is not caught by the unmapped-method denial path |
+| **Tasks** | `tasks/get`, `tasks/result`, `tasks/cancel`, `tasks/list` | **Host-originated:** Denied (unmapped — fail-closed); **Upstream-initiated:** Forwarded for local subprocess upstreams — not policy-enforced, but kill-switch-checked and audited; not consumed for remote HTTP upstreams | MCP 2025-11-25 tasks methods can flow in either direction; eunox has no handler for them in either direction |
 | **Sampling tool calls** | `sampling/createMessage` with `tools` in model preferences | Enforced at the `sampling/createMessage` level only; per-tool sampling controls are not applied inside the sampling payload | Payload-level inspection not yet implemented |
 | **Sampling under JWT mode** | `sampling/createMessage` | **Manifest opt-in governs**, with or without `--jwks-uri`: the JWT wrapper delegates the sampling decision to the route's manifest. Token claims neither grant nor restrict it — the request is upstream-initiated, so no bearer token is in scope (the § 5.2 exhaustive-allowlist rule does not apply). The kill switch is enforced (global, session, and agent via the session's initialize-time identity) | See ADR-0001 (scope section) and the capability-manifest guide § 2b |
 | **Sampling — remote HTTP upstream** | `sampling/createMessage` | **Not enforced** — remote HTTP upstream mode has no background reader; server-initiated messages arrive on the SSE stream but are not consumed or forwarded | Only local subprocess upstreams support server-initiated sampling |
@@ -376,22 +376,31 @@ are otherwise untouched.
 - **Locally handled `initialize`** — registered and answered with a
   proxy-synthesized response built from capabilities gathered at startup. It
   succeeds (it is not a denial) and writes no audit record.
-- **Denied unmapped methods** (`ping` and any method with no registered
-  handler) — denied with `AUTHORIZATION_FAILED`, logged to stderr only, the
-  upstream is never called, and no audit record is written.
-- **`*/list` filtering** (`tools/list`, `resources/list`, `prompts/list`) —
-  these handlers *do* call the upstream, then filter the response down to
-  permitted entries before returning it. The filtering step produces no
-  per-call audit record.
-- **Upstream-initiated non-sampling requests** (e.g. `roots/list`,
-  `elicitation/create`; local subprocess upstreams) — forwarded verbatim to the
-  host with no PDP evaluation and no audit record. The host's response is routed
-  back to the upstream so the request completes.
 
-Of these, only the unmapped-method path is a denial; the others complete
-successfully (or pass through). Absence of an audit record on these
-paths therefore does not, on its own, indicate that a guarded action was
-allowed.
+**Locally-answered paths that DO produce records** (record-before-act on the
+tamper-evident tape):
+
+- **Denied unmapped methods** (`ping` and any method with no registered
+  handler) — denied with `AUTHORIZATION_FAILED`. A deny record is written to the
+  audit tape (record-before-act), then a stderr notice is logged, and the
+  upstream is never called.
+- **`*/list` filtering** (`tools/list`, `resources/list`, `prompts/list`) —
+  these handlers call the upstream, then filter the response down to permitted
+  entries. The enumeration is recorded as an allow record carrying filter
+  statistics (`upstream_count`, `filtered_count`, `suppressed_count`) so an
+  auditor can tell an empty client view caused by policy filtering from a
+  genuinely empty upstream.
+- **Upstream-initiated non-sampling requests** (e.g. `roots/list`,
+  `elicitation/create`, upstream-initiated `tasks/*`; local subprocess upstreams)
+  — not policy-enforced (no allow/deny decision), but kill-switch-checked,
+  `--require-audit=strict`-gated, and audited: an allow record on delivery to a
+  client, or an `ENFORCEMENT_ERROR` deny if no client received it. The host's
+  response is routed back to the upstream so the request completes.
+
+The only locally-answered path with no audit record is the `initialize`
+handshake, which is not a guarded action. The `*/list` and upstream-initiated
+paths complete successfully (or pass through) but are still recorded, so absence
+of a record is not evidence that a guarded action was allowed.
 
 Beyond those by-design paths, records can also be lost unintentionally, in two
 ways:

@@ -91,8 +91,10 @@ func (m *LocalManifest) HasFlowLabel() bool {
 
 // HasSamplingGrant reports whether the manifest grants server-initiated sampling:
 // a system: target whose bare name matches sampling/createMessage (by the same
-// enforcement.MatchesResource glob the engine uses, so "system:*" and
-// "system:sampling/*" count) AND whose actions permit it ("allow" or "*").
+// enforcement.MatchesResource matcher the engine uses; note that system: targets
+// reject glob metacharacters at load, so in practice only the exact
+// "system:sampling/createMessage" is loadable — the matcher is used for
+// engine-consistency, not to admit "system:*") AND whose actions permit it ("allow" or "*").
 //
 // This is single-sourced beside the other manifest-policy predicates so the startup
 // HTTP-upstream sampling guard and ManifestPDP.DecideSampling cannot drift: it

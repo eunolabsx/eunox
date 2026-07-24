@@ -124,7 +124,7 @@ func rotatedStampParts(name, logPath string) (ordinal uint64, hasOrdinal bool, t
 }
 
 // rotatedSiblings returns every file in logPath's directory whose name begins with
-// the base log name plus a literal "." — the rotated scheme "<logPath>.<timestamp>".
+// the base log name plus a literal "." — the rotated scheme "<logPath>.<ordinal>.<timestamp>Z".
 // It uses a literal os.ReadDir + HasPrefix scan rather than filepath.Glob, since a
 // logPath with glob metacharacters would make Glob match unrelated files, miss
 // siblings, or return ErrBadPattern callers treat as "no matches".
@@ -159,8 +159,9 @@ func rotatedSiblings(logPath string) ([]string, error) {
 }
 
 // sortedRotatedSiblings returns logPath's genuine rotated siblings
-// ("<logPath>.<timestamp>"), filtered through rotatedAuditRe and ordered
-// chronologically (timestamp base, then numeric collision suffix). Folding the
+// ("<logPath>.<ordinal>.<timestamp>Z"), filtered through rotatedAuditRe and ordered
+// by the monotonic rotation ordinal (timestamp base only as a legacy tiebreak), then
+// numeric collision suffix. Folding the
 // scan, filter, and sort here keeps newestRotatedSiblingWithTail, LogChainFiles, and
 // pruneRotated in lockstep, so a change to the rotated-naming scheme can't leave
 // one caller out of step. The filter drops unrelated "<base>." names

@@ -438,10 +438,11 @@ func dispatchPromptsGet(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) m
 
 // dispatchList forwards a */list request to the upstream and prunes the result
 // to permitted entries (filter selects the ListFilterer method for the flavor).
-// When no manifest is configured the response is forwarded verbatim. The
-// enumeration is recorded — listing is a common reconnaissance step — and
-// upstreamErrorDetail distinguishes a forwarded upstream error from a clean
-// enumeration.
+// When no policy is configured an enforce route uses DenyAllPDP and the list is
+// filtered to empty (fail closed); only an audit-mode (AlwaysAllowPDP) wiretap
+// route returns the upstream catalog unfiltered. The enumeration is recorded —
+// listing is a common reconnaissance step — and upstreamErrorDetail distinguishes
+// a forwarded upstream error from a clean enumeration.
 func dispatchList(ctx context.Context, d dispatchParams, msg mcp.RPCMsg, filter func(pdp.ListFilterer, context.Context, json.RawMessage) pdp.ListFilterResult) mcp.RPCMsg {
 	// The kill-switch check runs at the dispatchRequest boundary for the whole
 	// locally-answered set (a killed session must not enumerate the catalog), so this
