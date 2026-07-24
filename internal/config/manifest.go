@@ -900,8 +900,8 @@ func validateLocalManifest(m *LocalManifest) error {
 			// A typed-nil pointer (e.g. (*LabelOutputDirective)(nil)) is a non-nil
 			// interface, so it survives the dir==nil check above but would panic when a
 			// case below dereferences d.Fields/d.Labels. Reject it fail-closed, matching
-			// the engine's collectObligations typed-nil guard.
-			if rv := reflect.ValueOf(dir); rv.Kind() == reflect.Pointer && rv.IsNil() {
+			// the engine's collectObligations typed-nil guard (same capability.IsTypedNil).
+			if capability.IsTypedNil(dir) {
 				return fmt.Errorf("capability at index %d, directive %d: a typed-nil directive is not permitted; every directives entry must be a typed directive object", i, j)
 			}
 			// Each case pairs a directive's value and pointer decode forms and
@@ -951,8 +951,8 @@ func validateLocalManifest(m *LocalManifest) error {
 			// A typed-nil pointer (e.g. (*FlowLabelCondition)(nil)) is a non-nil interface,
 			// so it survives the cond==nil check above but would panic when a *Condition case
 			// below dereferences v (e.g. v.Allow). Reject it fail-closed, mirroring the
-			// directive loop's typed-nil guard.
-			if rv := reflect.ValueOf(cond); rv.Kind() == reflect.Pointer && rv.IsNil() {
+			// directive loop's typed-nil guard (same capability.IsTypedNil).
+			if capability.IsTypedNil(cond) {
 				return fmt.Errorf("capability at index %d, condition %d: a typed-nil condition is not permitted; every conditions entry must be a typed condition object", i, j)
 			}
 			switch v := cond.(type) {

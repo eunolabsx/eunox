@@ -9,7 +9,6 @@ import (
 	"context"
 	"fmt"
 	"path"
-	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -665,12 +664,12 @@ func (e *Engine) runConditions(ctx context.Context, req *capability.EnforceReque
 // or a (*RedactFieldsDirective)(nil) boxed into a capability.Directive. Such a
 // value survives a plain `v == nil` check (the interface itself is non-nil) but
 // would panic a value/pointer-receiver method that dereferences it (e.g.
-// ConditionType(), ToObligation()). The single source of truth for this guard,
-// shared by runConditions' condition check and collectObligations' directive
-// check, so the two cannot drift.
+// ConditionType(), ToObligation()). Delegates to capability.IsTypedNil, the single
+// source of truth for this guard, shared by runConditions' condition check,
+// collectObligations' directive check, and the config-loader validation guards, so
+// the copies cannot drift.
 func isTypedNil(v interface{}) bool {
-	rv := reflect.ValueOf(v)
-	return rv.Kind() == reflect.Pointer && rv.IsNil()
+	return capability.IsTypedNil(v)
 }
 
 // commitDeferredAtomic admits a constraint's deferred (quota-consuming) conditions

@@ -113,22 +113,21 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 
 	// Prefer the engine's already-peeked snapshot (threaded via ctx). A real Peek error
 	// makes the engine fail closed before this handler runs, so a threaded set is
-	// trustworthy; the fallback Peek covers a direct caller that did not thread one.
+	// trustworthy; the fallback reuses peekSessionLabels (the same vocab scan the audit
+	// path runs, single-sourced so the two cannot drift) for a direct caller that did not
+	// thread one. The counter==nil / empty-session guards above already fired, so
+	// peekSessionLabels' own short-circuit is unreachable here — it runs the full scan.
 	present, threaded := carriedLabelsFromContext(ctx)
 	if !threaded {
-		for _, label := range flowLabelVocab {
-			count, err := e.counter.Peek(ctx, flowLabelKey(e.counterKeyNamespace, req.SessionID, label), flowLabelWindowSec)
-			if err != nil {
-				return &ConditionError{
-					Code:          capability.ErrCodeConditionFailed,
-					ConditionType: capability.ConditionTypeFlowLabel,
-					Message:       fmt.Sprintf("flow-label state lookup failed: %v", err),
-				}
-			}
-			if count > 0 {
-				present = append(present, label)
+		peeked, err := e.peekSessionLabels(ctx, req)
+		if err != nil {
+			return &ConditionError{
+				Code:          capability.ErrCodeConditionFailed,
+				ConditionType: capability.ConditionTypeFlowLabel,
+				Message:       fmt.Sprintf("flow-label state lookup failed: %v", err),
 			}
 		}
+		present = peeked
 	}
 
 	// blocked = present labels not permitted here. present is vocabulary-ordered (both

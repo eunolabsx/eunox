@@ -23,6 +23,7 @@ import (
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/mcp/mcptest"
 	"github.com/eunolabs/eunox/internal/pdp"
+	"github.com/eunolabs/eunox/pkg/callcounter"
 	"github.com/eunolabs/eunox/pkg/capability"
 	"github.com/eunolabs/eunox/pkg/enforcement"
 	"github.com/eunolabs/eunox/pkg/killswitch"
@@ -610,6 +611,59 @@ func TestForwardServerRequest_StrictAudit_HealthyForwardsSampling(t *testing.T) 
 	assert.True(t, forwarded, "a healthy strict gate must forward allowed sampling")
 	require.Len(t, rec.records, 1)
 	assert.Equal(t, "allow", rec.records[0].decision)
+}
+
+// TestForwardServerRequest_SamplingFlowLabelDenyRecordsDetails is the regression for the
+// sampling leg dropping structured deny details: an ENFORCED flowLabel deny on
+// system:sampling must record the blocked provenance class in the audit record's details,
+// exactly as the tool/resource/prompt path (enforcedForwardCore) does. RecordDeny omits
+// carried_labels on a deny precisely BECAUSE a flowLabel deny names the offending class in
+// its details, so a nil-details sampling record would leave the blocked class absent from
+// the signed tape entirely.
+func TestForwardServerRequest_SamplingFlowLabelDenyRecordsDetails(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	counter := callcounter.NewInMemory()
+	engine := enforcement.New(enforcement.WithCallCounter(counter))
+
+	// Taint session "s" with a confidential source read.
+	_, err := engine.RecordLabels(ctx, &capability.EnforceRequest{SessionID: "s", ToolName: "read_secret"},
+		&capability.Constraint{Target: "tool:read_secret", Actions: []string{"call"},
+			Directives: []capability.Directive{capability.LabelOutputDirective{Labels: []string{capability.FlowLabelConfidential}}}})
+	require.NoError(t, err)
+
+	// A sampling sink that admits only public-provenance flows: the confidential taint is
+	// blocked, an enforced deny (no --audit, non-audit constraint).
+	samplingSink := capability.Constraint{
+		Target:     "system:sampling/createMessage",
+		Actions:    []string{"allow"},
+		Conditions: []capability.Condition{capability.FlowLabelCondition{Allow: []string{capability.FlowLabelPublic}}},
+	}
+	dp := pdp.NewManifestPDP([]capability.Constraint{samplingSink}, engine, killswitch.NewInMemory())
+
+	rec := &fwdRecorder{}
+	var upstreamReply mcp.RPCMsg
+	fp := serverRequestParams{
+		rec:       rec,
+		sessionID: "s",
+		pdp:       dp,
+		forward: func(mcp.RPCMsg) bool {
+			t.Error("an enforced flowLabel deny must not forward to the host")
+			return false
+		},
+		writeUpstream: func(m mcp.RPCMsg) { upstreamReply = m },
+	}
+	forwardServerRequest(ctx, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: "sampling/createMessage"}, fp)
+
+	// The upstream initiator gets a fail-closed error...
+	require.NotNil(t, upstreamReply.Error, "the upstream initiator must receive a fail-closed error")
+	// ...and the deny record names the blocked provenance class in its structured details.
+	require.Len(t, rec.records, 1)
+	assert.Equal(t, "deny", rec.records[0].decision)
+	require.NotNil(t, rec.records[0].details, "a flowLabel sampling deny must record structured details, not nil")
+	assert.Equal(t, capability.FlowLabelConfidential, rec.records[0].details["blockedLabel"],
+		"the sampling deny record must name the blocked class, as the tool path does")
+	assert.Equal(t, []string{capability.FlowLabelConfidential}, rec.records[0].details["blockedLabels"])
 }
 
 // TestForwardServerRequest_StrictAudit_DegradedDeniesNonSampling is the

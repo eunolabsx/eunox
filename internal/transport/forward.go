@@ -634,7 +634,11 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 		// sees the actual reason (CONDITION_FAILED, MAX_CALLS_EXCEEDED, …) instead of a
 		// hardcoded "AUTHORIZATION_FAILED" that contradicts the recorded code.
 		if fp.rec != nil {
-			fp.rec.RecordDeny(ctx, fp.sessionID, samplingMethod, samplingMethod, denial.Code, denial.ConditionType, nil, false)
+			// Pass denial.Details (as the tool/resource/prompt path does): a flowLabel deny
+			// on the system:sampling constraint names the blocked provenance class there, and
+			// the deny record carries no carried_labels precisely because details does — so
+			// dropping details would leave the offending label absent from the signed tape.
+			fp.rec.RecordDeny(ctx, fp.sessionID, samplingMethod, samplingMethod, denial.Code, denial.ConditionType, denial.Details, false)
 		}
 		fp.writeUpstream(mcp.ErrorResponse(msg.ID, denialToJSONRPCCode(denial.Code), denial.Code))
 		return
@@ -650,7 +654,9 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 	// between the two can never leave a SIEM-visible alert with no corresponding
 	// tamper-evident audit record.
 	if fp.rec != nil {
-		fp.rec.RecordDeny(ctx, fp.sessionID, samplingMethod, samplingMethod, denial.Code, denial.ConditionType, nil, true)
+		// Carry denial.Details on the observe path too, for the same reason as the hard-deny
+		// branch above: the would-be flowLabel deny's blocked label must reach the tape.
+		fp.rec.RecordDeny(ctx, fp.sessionID, samplingMethod, samplingMethod, denial.Code, denial.ConditionType, denial.Details, true)
 	}
 	fmt.Fprintf(os.Stderr,
 		"[eunox] AUDIT: sampling/createMessage would be denied (%s) — forwarding (audit mode)\n",
