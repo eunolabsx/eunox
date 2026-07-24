@@ -102,7 +102,7 @@ type httpSession struct {
 	// decideMu serializes this session's enforced-request decision phase when the route
 	// is flow- or sequenceBlock-relevant (route.serializeDecisions), so a source's
 	// per-session state write is not raced ahead of by a later sink's read on the same
-	// session (docs/flow-label-hardening.md piece B). HTTP has no serial reader, so it is
+	// session. HTTP has no serial reader, so it is
 	// held in arrival-at-the-lock order and released right after the decision (via the
 	// dispatch handler's finishDecision) so the upstream forward stays concurrent. Unused
 	// on a non-serialized route.
@@ -444,7 +444,7 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 		delete(p.sessions, sess.id)
 		p.mu.Unlock()
 		// Release this session's per-session flow-label state now it is gone from the
-		// registry (docs/flow-label-hardening.md FR-H2). This cleanup block runs on EVERY
+		// registry. This cleanup block runs on EVERY
 		// teardown — idle reap, DELETE, kill, shutdown, AND natural subprocess exit (which
 		// close() does not cover) — so it is the one place that reclaims state for all of
 		// them, co-located with the registry delete.
@@ -1144,7 +1144,7 @@ const inFlightDrainPoll = 2 * time.Millisecond
 
 // releaseSessionState releases a torn-down session's per-session enforcement state (its
 // accumulated flow-label set) via the route's PDP, so an ended session retains nothing
-// and a reused session id starts clean (docs/flow-label-hardening.md FR-H2). It is called
+// and a reused session id starts clean. It is called
 // from the cleanup goroutine that runs after <-sess.done on EVERY teardown — idle reap,
 // DELETE, kill, shutdown, and natural subprocess exit — so it covers the paths
 // httpSession.close() alone does not (close() is skipped on a natural upstream exit).
@@ -1152,7 +1152,7 @@ const inFlightDrainPoll = 2 * time.Millisecond
 // It first waits for in-flight enforced decisions to finish (bounded), so a teardown
 // Clear cannot empty the session's taint BETWEEN a source's committed Add and a sink
 // still deciding on the same session — the fail-open a teardown racing live decisions
-// would otherwise open (piece B). The wait is bounded by the session shutdown budget so a
+// would otherwise open. The wait is bounded by the session shutdown budget so a
 // wedged handler cannot pin teardown; a Redis store reclaims an orphaned key by idle TTL
 // if we time out. The Clear itself uses a detached, bounded context (teardown must not
 // block on a slow store). A no-op when the policy uses no flow control (ReleaseSession

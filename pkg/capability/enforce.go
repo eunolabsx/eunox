@@ -155,7 +155,7 @@ type CallCounter interface {
 // set with a SESSION-SCOPED lifetime, not a decaying sliding-window count. The
 // CallCounter's window ages a taint out mid-session (a fail-open the flow-control
 // "for all flows" claim cannot tolerate), so flow state lives here instead. See
-// docs/flow-label-hardening.md (defect D1) and pkg/flowlabelstore.
+// pkg/flowlabelstore.
 //
 // Implementations must be safe for concurrent use. The sessionKey is opaque and
 // already namespaced by the caller (the engine folds its route namespace and the
@@ -182,15 +182,14 @@ type FlowLabelStore interface {
 
 	// Remove deletes the named labels from the session's set (idempotent — removing
 	// an absent label is a no-op). It backs the fail-closed rollback of a source
-	// call's flow write when the paired sequenceBlock antecedent write then faults
-	// (docs/flow-label-hardening.md defect D3): the per-session decision lock makes
-	// this rollback race-free, so it removes exactly the labels the faulted call
-	// added and never a concurrent source's. An empty labels list is a no-op.
+	// call's flow write when the paired sequenceBlock antecedent write then faults:
+	// the per-session decision lock makes this rollback race-free, so it removes
+	// exactly the labels the faulted call added and never a concurrent source's. An
+	// empty labels list is a no-op.
 	Remove(ctx context.Context, sessionKey string, labels ...string) error
 
 	// Clear releases the session's entire set, called from the transport's session
 	// teardown so an ended session retains no state and a reused session id starts
-	// clean (docs/flow-label-hardening.md FR-H2). Clearing an absent session is a
-	// no-op.
+	// clean. Clearing an absent session is a no-op.
 	Clear(ctx context.Context, sessionKey string) error
 }

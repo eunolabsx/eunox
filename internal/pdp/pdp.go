@@ -82,8 +82,8 @@ type PolicyDecisionPoint interface {
 	// ReleaseSession releases per-session enforcement state when the transport tears a
 	// session down (idle reap, client DELETE, kill, shutdown, or natural upstream exit),
 	// so an ended session retains no state and a reused session id starts clean. Today
-	// that is the session's accumulated flow-label set (docs/flow-label-hardening.md
-	// FR-H2); it is the one teardown seam any future per-session state reuses. It must be
+	// that is the session's accumulated flow-label set; it is the one teardown seam any
+	// future per-session state reuses. It must be
 	// a safe no-op for a PDP with no such state (AlwaysAllowPDP, DenyAllPDP) and for a
 	// session that recorded none, and must never block on the upstream — teardown paths
 	// call it with a detached, bounded context.
@@ -1014,8 +1014,8 @@ func recordAuditModeAntecedent(ctx context.Context, engine *enforcement.Engine, 
 			}
 		}
 		// Commit the seq antecedent and the flow labels atomically (RecordSourceCall), so
-		// a fault between the two leaves neither stranded on this forwarded observe record
-		// (docs/flow-label-hardening.md FR-H5) — the same all-or-nothing the genuine-allow
+		// a fault between the two leaves neither stranded on this forwarded observe record —
+		// the same all-or-nothing the genuine-allow
 		// path uses. carried is the pre-write accumulated set for the rollback delta:
 		// resp.CarriedLabels when a flow-condition deny already stamped it, else the peek.
 		carried := resp.CarriedLabels
@@ -1185,7 +1185,7 @@ func containsAction(actions []string, act string) bool {
 // constraintWithUnionLabelOutput returns matched augmented so its labelOutput carries the
 // UNION of labelOutput labels across every entry matching this request — so a source read's
 // taint is not dropped when a sibling (a more-specific or principal-scoped entry) lacking
-// labelOutput wins selection over one that has it (docs/flow-label-hardening.md; mirrors the
+// labelOutput wins selection over one that has it (mirrors the
 // pinnedTools "enforce off any matching entry" rule). It returns matched UNCHANGED when the
 // policy declares no labelOutput, when no matching entry adds a label matched lacks, or when
 // matched already asserts the full union — so the common single-source case allocates

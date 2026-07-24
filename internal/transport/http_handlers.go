@@ -240,8 +240,8 @@ func (p *HTTPProxy) handleHTTPUpstreamRequest(ctx context.Context, sess *httpSes
 	rt := sess.route
 	// Serialize the sampling decision against this session's host-path decisions for a
 	// flow-/sequenceBlock-relevant route, so a flowLabel sink on system:sampling cannot
-	// peek the flow set concurrently with a host source's label write (docs/flow-label-
-	// hardening.md piece B). Same per-session decideMu the host path uses; released before
+	// peek the flow set concurrently with a host source's label write. Same per-session
+	// decideMu the host path uses; released before
 	// the forward. nil (no serialization) for a non-flow route.
 	var decideLock func() (end func())
 	if rt != nil && rt.serializeDecisions {

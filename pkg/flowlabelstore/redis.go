@@ -16,13 +16,13 @@ import (
 // override is given (or a non-positive one is). It is a safety-reclamation bound for
 // an orphaned session whose Clear never arrives — a crashed or leaked instance — NOT
 // a security-relevant taint lifetime: it is refreshed on every Add and Get, so a live
-// session never loses its provenance (FR-H1). Sized to a generous session idle timeout.
+// session never loses its provenance. Sized to a generous session idle timeout.
 const DefaultIdleTTL = 24 * time.Hour
 
 // Redis is a Redis-backed session-scoped flow-label store: each session's labels are
 // a Redis SET at "flowlabels:<sessionKey>" carrying an idle TTL refreshed on each
 // Add/Get. A shared Redis lets a source read on one instance and a sink on another
-// see the same taint (FR-H4). Safe for concurrent use.
+// see the same taint. Safe for concurrent use.
 type Redis struct {
 	client redis.Cmdable
 	// ttl is the configured idle TTL as passed to WithIdleTTL (DefaultIdleTTL when
@@ -37,7 +37,7 @@ type RedisOption func(*Redis)
 // WithIdleTTL overrides the idle TTL stamped (and refreshed) on each session's label
 // set. The TTL is a safety-reclamation bound for an orphaned session whose Clear never
 // arrives (e.g. a crashed instance), NOT a security-relevant lifetime: it is refreshed
-// on every Add and Get, so a live/active session never loses its taint (FR-H1). Size it
+// on every Add and Get, so a live/active session never loses its taint. Size it
 // to the deployment's session idle timeout. A non-positive d is ignored in favor of
 // DefaultIdleTTL (see effectiveTTL), since a zero/negative EXPIRE would drop a live
 // session's taint immediately — fail safe, not open.
@@ -85,7 +85,7 @@ func (r *Redis) effectiveTTL() time.Duration {
 }
 
 // Add unions labels into the session's set and refreshes the idle TTL, so an active
-// session that keeps emitting labels never expires (FR-H1). An empty labels list is a
+// session that keeps emitting labels never expires. An empty labels list is a
 // no-op — SADD requires at least one member, and there is nothing to union, matching
 // InMemory materializing no entry.
 func (r *Redis) Add(ctx context.Context, sessionKey string, labels ...string) error {
@@ -118,7 +118,7 @@ func (r *Redis) Add(ctx context.Context, sessionKey string, labels ...string) er
 }
 
 // Get returns a sorted copy of the session's accumulated set, refreshing the idle TTL
-// on the read too (FR-H1): a session that is only being READ — sink after sink,
+// on the read too: a session that is only being READ — sink after sink,
 // emitting no new labels — must not have its provenance reclaimed out from under it.
 // An absent session returns an empty slice and a nil error, never an error; EXPIRE on
 // an absent key is a harmless no-op, so an untainted session is unaffected.
@@ -153,7 +153,7 @@ func (r *Redis) Get(ctx context.Context, sessionKey string) ([]string, error) {
 
 // Remove deletes the named labels from the session's set (idempotent). A single SREM
 // is atomic on its own, so no transaction is needed, and there is deliberately NO TTL
-// refresh: a removal is a rollback (D3) or teardown shrinking the taint, not activity
+// refresh: a removal is a rollback or teardown shrinking the taint, not activity
 // keeping the session alive, so it must not extend the idle bound. Redis auto-deletes
 // the set once its last member is removed, mirroring InMemory reclaiming the map key.
 // An empty labels list is a no-op.
@@ -171,7 +171,7 @@ func (r *Redis) Remove(ctx context.Context, sessionKey string, labels ...string)
 	return nil
 }
 
-// Clear releases the session's entire set at teardown (FR-H2). DEL is a no-op on an
+// Clear releases the session's entire set at teardown. DEL is a no-op on an
 // absent key, so clearing an absent session is a no-op.
 func (r *Redis) Clear(ctx context.Context, sessionKey string) error {
 	if err := r.client.Del(ctx, redisKey(sessionKey)).Err(); err != nil {

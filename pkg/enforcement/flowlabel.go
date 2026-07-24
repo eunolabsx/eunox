@@ -22,7 +22,7 @@ import (
 // flow state has NO wall-clock expiry: it is a monotonic, session-lifetime fact,
 // reclaimed by the transport's Clear on session end (a windowed marker aged a taint out
 // mid-session, a fail-open the "for all flows" claim cannot tolerate). See
-// docs/flow-label-hardening.md and pkg/flowlabelstore.
+// pkg/flowlabelstore.
 
 // flowLabelVocab is the native flow-label vocabulary, cached once from
 // capability.FlowLabelVocabulary so the subset check and the accumulated-set peek do
@@ -60,7 +60,7 @@ func (e *Engine) flowSessionKey(sessionID string) string {
 //
 // Concurrency: the source's label write (recordLabels' Add) and this sink's read happen
 // in two independent requests. The transport serializes the per-session decision phase
-// for a flow-relevant session (docs/flow-label-hardening.md piece B), so a source read
+// for a flow-relevant session, so a source read
 // received before an egress commits its label before the egress's sink read runs —
 // deterministically, even under a client that pipelines both without waiting. (On a
 // direct engine caller that does not serialize, the ordering is the caller's
@@ -305,8 +305,8 @@ type SourceCommitError struct {
 func (e *SourceCommitError) Error() string { return e.Err.Error() }
 
 // recordSourceCall commits an allowed call's flow labels and its sequenceBlock
-// antecedent as a single all-or-nothing unit, closing the cross-namespace half-commit
-// (docs/flow-label-hardening.md defect D3/FR-H5). The two live in disjoint backends (the
+// antecedent as a single all-or-nothing unit, closing the cross-namespace half-commit.
+// The two live in disjoint backends (the
 // FlowLabelStore holds "flow:", the CallCounter holds "seq:"), so a fault between the two
 // writes could otherwise strand one: a phantom seq antecedent for a call that hard-denied
 // and never ran, or a stranded flow label.
@@ -315,7 +315,7 @@ func (e *SourceCommitError) Error() string { return e.Err.Error() }
 // antecedent; if the seq write faults, it rolls back the flow labels THIS call added
 // (out minus the pre-call carried set) so the hard-denied call leaves NEITHER committed.
 // This reverses the old seq-first order, which could not clean up a stranded write at
-// all. The per-session decision lock (piece B) serializes this critical section, so the
+// all. The per-session decision lock serializes this critical section, so the
 // rollback removes exactly this call's additions with no concurrent writer to race.
 //
 // Both writes still fail closed on their own fault (returned as a SourceCommitError the
@@ -338,7 +338,7 @@ func (e *Engine) recordSourceCall(ctx context.Context, req *capability.EnforceRe
 		// The seq write faulted after the flow write committed: roll the flow labels this
 		// call added back out so the hard-denied call taints nothing. Best-effort — a
 		// rollback fault leaves a stranded label (fail-closed: over-blocks a later sink,
-		// never a leak), the narrow residual documented in docs/flow-label-hardening.md.
+		// never a leak), the narrow accepted residual.
 		e.rollbackLabels(ctx, req, added)
 		return nil, &SourceCommitError{Err: err, Flow: false}
 	}
@@ -381,8 +381,8 @@ func labelsAdded(out, carried []string) []string {
 
 // rollbackLabels best-effort removes the labels a faulted source call added, so a
 // hard-denied call leaves no flow taint (see recordSourceCall). A nil store, empty
-// session, or empty set is a no-op; a Remove fault is swallowed (the fail-closed residual
-// documented in docs/flow-label-hardening.md — a stranded label over-blocks, never leaks).
+// session, or empty set is a no-op; a Remove fault is swallowed (the fail-closed
+// residual — a stranded label over-blocks, never leaks).
 func (e *Engine) rollbackLabels(ctx context.Context, req *capability.EnforceRequest, added []string) {
 	if e.flowStore == nil || req.SessionID == "" || len(added) == 0 {
 		return
@@ -392,7 +392,7 @@ func (e *Engine) rollbackLabels(ctx context.Context, req *capability.EnforceRequ
 
 // ClearSessionLabels releases a session's accumulated flow-label set, called from the
 // transport's session teardown so an ended session retains no state and a reused session
-// id starts clean (docs/flow-label-hardening.md FR-H2). It is a no-op when no store is
+// id starts clean. It is a no-op when no store is
 // wired, the policy uses no flow control (skipFlow), or the session id is empty — the
 // same guards recordLabels/peekSessionLabels apply, so a non-flow deployment pays
 // nothing on teardown.

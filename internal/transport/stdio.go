@@ -183,8 +183,8 @@ type StdioProxy struct {
 	fwdHostInFlight atomic.Int64
 
 	// decideGate serializes this session's enforced-request decisions in proxy-receipt
-	// order when the policy is flow- or sequenceBlock-relevant (docs/flow-label-hardening.md
-	// piece B); the serve loop gates on decideGate != nil. nil keeps full intra-session
+	// order when the policy is flow- or sequenceBlock-relevant; the serve loop gates on
+	// decideGate != nil. nil keeps full intra-session
 	// decision parallelism. Set from StdioProxyOptions.SerializeDecisions at construction.
 	decideGate *decisionSerializer
 }
@@ -215,7 +215,7 @@ type StdioProxyOptions struct {
 	// SerializeDecisions serializes this session's enforced-request decisions in
 	// proxy-receipt order when the policy is flow- or sequenceBlock-relevant, so a
 	// source's flow-label write is ordered before a later sink's read even under a
-	// pipelining client (docs/flow-label-hardening.md piece B). The binary sets it from
+	// pipelining client. The binary sets it from
 	// manifest.HasFlowLabel() || manifest.HasSequenceBlock().
 	SerializeDecisions bool
 
@@ -370,13 +370,13 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 
 	// ── 8. Release this session's per-session enforcement state ─────────────────
 	// Free the session's accumulated flow-label set so an ended session retains nothing
-	// and a reused session id starts clean (docs/flow-label-hardening.md FR-H2). Ordered
+	// and a reused session id starts clean. Ordered
 	// LAST, and gated behind a bounded drain of in-flight host decisions: on the clean-EOF
 	// path serveHost already waited for every handler, but on the signal/upstream-exit
 	// paths it returns WITHOUT waiting, and draining the upstream reader does NOT cover a
 	// handler still mid-DECISION (a sink peeking the flow set touches no upstream). Without
 	// the drain a Clear could empty the taint between a source's committed Add and a sink
-	// still deciding on this session (piece B). Detached, bounded context — teardown must
+	// still deciding on this session. Detached, bounded context — teardown must
 	// not block on a slow store, and a Redis store reclaims an orphaned key by idle TTL
 	// regardless. A no-op when the policy uses no flow control.
 	p.awaitHostDecisionsDrained(time.Duration(p.shutdownMs) * time.Millisecond)
@@ -392,8 +392,8 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 // flow state out from under a sink still deciding. serveHost returns without waiting for its
 // handler goroutines on the signal and upstream-exit paths, and the upstream drain does not
 // cover a handler still in its PDP decision (which touches no upstream), so releasing flow
-// state before those finish could drop a live taint (docs/flow-label-hardening.md piece B;
-// the stdio analogue of httpSession.awaitInFlightDrained). It is a no-op for a
+// state before those finish could drop a live taint (the stdio analogue of
+// httpSession.awaitInFlightDrained). It is a no-op for a
 // non-flow/non-sequenceBlock session (decideGate nil) — ReleaseSession is itself a no-op
 // there, so there is nothing to protect and no reason to add teardown latency. Bounded and
 // poll-based: teardown is off the hot path and must never hang on a wedged handler. The read
@@ -890,8 +890,8 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 			}
 			// Reserve the decision ticket HERE, in the single-threaded read loop, so it
 			// reflects proxy-RECEIPT order — the handler goroutines then run their
-			// decisions in that order regardless of scheduling (docs/flow-label-hardening.md
-			// piece B). Only enforced methods take a ticket (only they run a PDP decision +
+			// decisions in that order regardless of scheduling. Only enforced methods take a
+			// ticket (only they run a PDP decision +
 			// state write), and only after the hostSem acquire above, so a server-busy
 			// rejection never strands an un-begun ticket that would stall every later one.
 			// A non-serialized session (non-flow/non-sequenceBlock policy) reserves none.
@@ -1048,8 +1048,8 @@ func (p *StdioProxy) handleHostRequest(ctx context.Context, msg mcp.RPCMsg) {
 	d := p.dispatchParams()
 	// decisionEndFromContext is the per-session decision-lock release (nil unless the
 	// serve loop threaded one for a serialized enforced request); the Decide* handlers
-	// call it right after the PDP decision so the upstream forward runs outside the lock
-	// (piece B). A direct test caller of handleHostRequest threads none, so it is nil.
+	// call it right after the PDP decision so the upstream forward runs outside the lock.
+	// A direct test caller of handleHostRequest threads none, so it is nil.
 	d.endDecision = decisionEndFromContext(ctx)
 	_ = p.hostWriter.Write(dispatchRequest(ctx, d, msg))
 }
@@ -1139,8 +1139,8 @@ func (p *StdioProxy) handleUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) 
 // samplingDecideLock returns the entry into this session's decision serializer for a
 // server-initiated (sampling) decision, or nil when the session is not serialize-relevant.
 // It reserves a ticket and waits its turn on the SAME decideGate the host path uses, so a
-// sampling flowLabel sink cannot read the flow set concurrently with a host source's write
-// (docs/flow-label-hardening.md piece B). Unlike a host request, a sampling request is
+// sampling flowLabel sink cannot read the flow set concurrently with a host source's write.
+// Unlike a host request, a sampling request is
 // upstream-initiated with no proxy-receipt order, so it simply takes the next ticket:
 // mutual exclusion — not receipt ordering — is the property it needs. The gate is
 // leaf-level and released before the forward, so the brief block it can impose on the

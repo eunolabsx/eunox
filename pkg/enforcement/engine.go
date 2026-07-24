@@ -174,7 +174,7 @@ type Engine struct {
 	// sliding-window count: keeping flow state in the windowed counter aged a taint out
 	// mid-session (a fail-open). nil disables flow recording — a flowLabel/labelOutput
 	// constraint then fails closed exactly as a nil counter fails maxCalls closed. See
-	// docs/flow-label-hardening.md and pkg/flowlabelstore.
+	// pkg/flowlabelstore.
 	flowStore capability.FlowLabelStore
 
 	// skipAntecedentRecording is set when the policy provably contains no
@@ -235,7 +235,7 @@ func WithCallCounter(counter capability.CallCounter) Option {
 // session-scoped lifetime, so it must not live in the sliding-window counter that
 // backs maxCalls/sequenceBlock. Leave it unset only for a policy known to use no flow
 // control (see config.LocalManifest.HasFlowLabel); a flow constraint with no store
-// wired fails closed. See docs/flow-label-hardening.md and pkg/flowlabelstore.
+// wired fails closed. See pkg/flowlabelstore.
 func WithFlowLabelStore(store capability.FlowLabelStore) Option {
 	return func(e *Engine) {
 		e.flowStore = store
@@ -910,12 +910,12 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 	// all-or-nothing unit (recordSourceCall): the flow write goes first (the
 	// FlowLabelStore supports targeted rollback), the seq antecedent second, and a fault
 	// on the second write rolls the first back — so a hard-denied call that is never
-	// forwarded leaves NEITHER a phantom seq antecedent nor a stranded flow label
-	// (docs/flow-label-hardening.md defect D3/FR-H5). Each half still fails closed on its
+	// forwarded leaves NEITHER a phantom seq antecedent nor a stranded flow label.
+	// Each half still fails closed on its
 	// own fault: a flow-write fault is a HARD deny (labelRecordFailureDenial, so an
 	// audit-mode source whose label did not persist is not forwarded unlabeled); a
 	// seq-write fault denies via recordFailureDenial. The per-session decision lock
-	// (docs/flow-label-hardening.md piece B) serializes this critical section, so the
+	// serializes this critical section, so the
 	// rollback removes exactly this call's additions with no concurrent writer.
 	labelsOut, cerr := e.recordSourceCall(ctx, req, matched, flowRelevant, carriedLabels)
 	if cerr != nil {

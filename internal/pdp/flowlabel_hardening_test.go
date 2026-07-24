@@ -28,7 +28,7 @@ func newFlowManifestPDP(caps ...capability.Constraint) *ManifestPDP {
 }
 
 // TestFlowHardening_PrincipalScopedSiblingKeepsTaint is the constraint-shadowing
-// regression (docs/flow-label-hardening.md): when a more-specific, principal-scoped
+// regression: when a more-specific, principal-scoped
 // source entry that declares NO labelOutput wins findConstraint selection over a general
 // entry that HAS labelOutput, the source read must still record the general entry's taint
 // (the labelOutput union across every matching entry), so a later sink in the same session
@@ -131,8 +131,8 @@ func (faultingGetStore) Get(_ context.Context, _ string) ([]string, error) {
 	return nil, errors.New("flow store backend unavailable")
 }
 
-// TestFlowHardening_AuditModePeekFailsClosed is the audit-mode peek fail-closed regression
-// (docs/flow-label-hardening.md): when an audit-mode source read's deny is being downgraded
+// TestFlowHardening_AuditModePeekFailsClosed is the audit-mode peek fail-closed regression:
+// when an audit-mode source read's deny is being downgraded
 // to a forwarded observe-allow, recordAuditModeAntecedent peeks the carried label set to
 // stamp the record AND to hand RecordSourceCall a correct rollback baseline. If that peek
 // faults the carried set is unknown, so the antecedent path must HARD-deny (non-downgradable
