@@ -491,7 +491,7 @@ type serverRequestParams struct {
 	// system:sampling reads the same per-session flow state a host source writes, and this
 	// path runs on the upstream-reader goroutine — outside the host decideGate/decideMu —
 	// so without it a sampling sink could peek the flow set mid-commit of a host source's
-	// Add and slip the taint (docs/flow-label-hardening.md piece B). Calling it enters the
+	// Add and slip the taint. Calling it enters the
 	// per-session decision critical section and returns the end func; nil disables
 	// serialization (a non-flow policy, or a direct test caller). It wraps ONLY the
 	// decision, never the forward. labelOutput on system:sampling is rejected at manifest
@@ -622,7 +622,7 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 	}
 	// Serialized against host-path decisions for a flow-/sequenceBlock-relevant session,
 	// so a flowLabel sink on system:sampling cannot read the flow set concurrently with a
-	// host source's label write (piece B). The lock covers only the decision's flow peek;
+	// host source's label write. The lock covers only the decision's flow peek;
 	// the forward below runs unlocked.
 	dec := fp.decideSampling(ctx)
 	if dec.Decision == capability.DecisionAllow {

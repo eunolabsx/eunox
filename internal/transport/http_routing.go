@@ -508,7 +508,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 		}()
 		d := p.dispatchParams(sess, p.sourceIP(r))
 		// Serialize the per-session decision phase for a flow-/sequenceBlock-relevant
-		// route (docs/flow-label-hardening.md piece B), so a source's state write is not
+		// route, so a source's state write is not
 		// raced ahead of by a later sink's read on the same session. Only enforced methods
 		// take the lock (only they run a PDP decision + state write); the Decide* handler
 		// releases it via finishDecision right after the decision, so the upstream forward

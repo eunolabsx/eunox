@@ -48,7 +48,7 @@ type UpstreamRoute struct {
 	// serializeDecisions is set when the route's policy is flow- or sequenceBlock-relevant,
 	// so each of its sessions serializes its decision phase (the PDP decision + state
 	// write, NOT the upstream forward) to order a source's write before a later sink's
-	// read (docs/flow-label-hardening.md piece B). false keeps full intra-session
+	// read. false keeps full intra-session
 	// decision parallelism. Read-only after BuildRoutes.
 	serializeDecisions bool
 
@@ -245,8 +245,8 @@ func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability
 		// Serialize this route's per-session decision phase when its policy is
 		// flow- or sequenceBlock-relevant (both read per-session state a source writes
 		// and a later call reads), so a source's write is ordered before a later sink's
-		// read on the same session under concurrent in-flight requests
-		// (docs/flow-label-hardening.md piece B). A non-flow/non-sequence route keeps full
+		// read on the same session under concurrent in-flight requests.
+		// A non-flow/non-sequence route keeps full
 		// intra-session decision parallelism.
 		r.serializeDecisions = manifest != nil && (manifest.HasFlowLabel() || manifest.HasSequenceBlock())
 		// strictDrift is used only to build this route's drift hook (its one
@@ -478,7 +478,7 @@ func LoadUpstreamPDP(u *config.UpstreamConfig, hostTransport, baseDir string, co
 	engineOpts := []enforcement.Option{
 		enforcement.WithCallCounter(counter),
 		// Flow-label provenance lives in its own session-lifetime store, not the
-		// sliding-window counter (docs/flow-label-hardening.md). Wired unconditionally
+		// sliding-window counter. Wired unconditionally
 		// like the counter; the WithoutFlowLabels gate below skips the flow path for a
 		// non-flow policy, so a wired-but-unused store costs nothing.
 		enforcement.WithFlowLabelStore(flowStore),

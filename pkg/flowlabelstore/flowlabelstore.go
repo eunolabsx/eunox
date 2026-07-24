@@ -11,8 +11,7 @@
 // deliberately idled) session lose its taint — a fail-open the flow-control "for
 // all flows, a class outside Allow never reaches this sink" claim cannot tolerate —
 // so flow state lives here, in a store whose contract (Add/Get/Remove/Clear) matches
-// provenance rather than counting. See docs/flow-label-hardening.md (defect D1 and
-// requirements FR-H1/FR-H2).
+// provenance rather than counting.
 //
 // Two backends mirror pkg/callcounter: InMemory for single-replica deployments and
 // tests, and Redis (shared keys under a refreshed idle TTL) for multi-instance

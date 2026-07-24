@@ -28,7 +28,7 @@ import (
 // TestDecisionSerializer_FIFOOrderUnderConcurrency proves the serialization primitive
 // hands out and serves tickets in the order they were RESERVED (proxy-receipt order),
 // regardless of the order the handler goroutines happen to reach begin — the property
-// that makes the source-before-sink ordering deterministic (piece B).
+// that makes the source-before-sink ordering deterministic.
 func TestDecisionSerializer_FIFOOrderUnderConcurrency(t *testing.T) {
 	t.Parallel()
 	const n = 200
@@ -116,7 +116,7 @@ func newSerializedFlowProxy(t *testing.T, store capability.FlowLabelStore, sessi
 	p = &StdioProxy{
 		pdp:          dp,
 		sessionID:    sessionID,
-		decideGate:   newDecisionSerializer(), // per-session decision serialization ON (piece B)
+		decideGate:   newDecisionSerializer(), // per-session decision serialization ON
 		pending:      make(map[string]chan upstreamResult),
 		byUpstreamID: make(map[string]chan upstreamResult),
 		hostToUp:     make(map[string]*json.RawMessage),
@@ -144,13 +144,13 @@ func newSerializedFlowProxy(t *testing.T, store capability.FlowLabelStore, sessi
 	return p, hw, func() { _ = upW.Close(); _ = upR.Close() }
 }
 
-// TestFlowSerialize_ConcurrentEgressDeniedEveryTime is the FR-H3 (ordered source->sink
-// under concurrency) acceptance test: a client that pipelines a tainting source read and
+// TestFlowSerialize_ConcurrentEgressDeniedEveryTime is the ordered source->sink-under-
+// concurrency acceptance test: a client that pipelines a tainting source read and
 // an egress on ONE session — without waiting for the read's response — must have the
 // egress denied EVERY time. The source and egress are dispatched to concurrent handler
 // goroutines, so on the unserialized transport the sink could Get the label set before the
 // source Adds it and slip the flow (the demo's 17/20). Per-session receipt-order
-// serialization (piece B) closes that: repeated 120x against both store backends, the
+// serialization closes that: repeated 120x against both store backends, the
 // egress denies every run and the source is always allowed and forwarded.
 func TestFlowSerialize_ConcurrentEgressDeniedEveryTime(t *testing.T) {
 	t.Parallel()
@@ -222,8 +222,8 @@ func TestFlowSerialize_ConcurrentEgressDeniedEveryTime(t *testing.T) {
 	}
 }
 
-// TestFlowSerialize_SamplingSinkSerializedAgainstSource is the piece-B acceptance test for
-// the sampling leg (docs/flow-label-hardening.md): a flowLabel sink on
+// TestFlowSerialize_SamplingSinkSerializedAgainstSource is the per-session-decision-
+// serialization acceptance test for the sampling leg: a flowLabel sink on
 // system:sampling/createMessage reads the same per-session flow state a host source read
 // writes, but the sampling decision runs on the upstream-reader goroutine, OUTSIDE the host
 // decideGate. serverRequestParams.decideSampling threads the per-session decision lock so the
@@ -318,7 +318,7 @@ func findByID(msgs []mcp.RPCMsg, id string) *mcp.RPCMsg {
 }
 
 // TestAwaitHostDecisionsDrained_BlocksUntilInFlightZero pins the stdio teardown drain that
-// gates ReleaseSession (docs/flow-label-hardening.md piece B): on the signal/upstream-exit
+// gates ReleaseSession: on the signal/upstream-exit
 // paths serveHost returns WITHOUT waiting for its handler goroutines, so Start must not clear
 // per-session flow state while a sink handler is still mid-decision. The drain blocks on
 // fwdHostInFlight and returns once it reaches zero.

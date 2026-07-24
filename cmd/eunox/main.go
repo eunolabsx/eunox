@@ -591,9 +591,9 @@ func resolveRedisPassword(flagVal string) string {
 // buildCallCounterAndKillSwitch builds the shared call counter, flow-label store, and
 // kill-switch manager, Redis-backed when redisAddr is set (state survives restarts,
 // shared across instances) and in-memory otherwise. The flow-label store is a seam
-// distinct from the counter (session-lifetime provenance, not a sliding window; see
-// docs/flow-label-hardening.md) but is wired from the same backend so a flow policy gets
-// multi-instance parity exactly as maxCalls/sequenceBlock do. ksRedis is non-nil only in
+// distinct from the counter (session-lifetime provenance, not a sliding window) but is
+// wired from the same backend so a flow policy gets multi-instance parity exactly as
+// maxCalls/sequenceBlock do. ksRedis is non-nil only in
 // the Redis case, so cmdProxy can start its reconcile loop. A Redis config or
 // connectivity error is fatal.
 func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, killswitchFailOpen bool, killswitchReconcile time.Duration, maxCallCounterKeys int) (capability.CallCounter, capability.FlowLabelStore, killswitch.Manager, *killswitch.Redis) {
@@ -1435,8 +1435,8 @@ func serveStdioHost(ctx context.Context, cfg *config.GatewayConfig, sink *audit.
 		RequireAuditStrict:    pf.requireAuditStrict,
 		// Serialize the decision phase when the policy reads/writes per-session state a
 		// source commits and a later call reads (flow labels or sequenceBlock), so a
-		// pipelining host cannot race a sink ahead of its source (docs/flow-label-
-		// hardening.md piece B). A non-flow/non-sequence policy keeps full parallelism.
+		// pipelining host cannot race a sink ahead of its source. A non-flow/non-sequence
+		// policy keeps full parallelism.
 		SerializeDecisions: manifest != nil && (manifest.HasFlowLabel() || manifest.HasSequenceBlock()),
 		DriftCheck:         drift.MakeDriftCheck(manifest, strictDrift),
 	})

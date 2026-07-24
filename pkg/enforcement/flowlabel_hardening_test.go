@@ -19,8 +19,8 @@ import (
 	"github.com/eunolabs/eunox/pkg/flowlabelstore"
 )
 
-// TestFlowHardening_TaintOutlivesAnyWindow is the FR-H1 (session-lifetime taint)
-// acceptance test: a flow label set by a source read is visible to every later sink in
+// TestFlowHardening_TaintOutlivesAnyWindow is the session-lifetime-taint acceptance
+// test: a flow label set by a source read is visible to every later sink in
 // the same session with NO wall-clock expiry. It ties BOTH the engine clock and the call
 // counter's clock to one fake clock and advances it far past the retired 30-day
 // flow-label window; the taint must still deny a later sink. On the old windowed-counter
@@ -55,7 +55,7 @@ func TestFlowHardening_TaintOutlivesAnyWindow(t *testing.T) {
 	assert.Equal(t, capability.FlowLabelConfidential, sink.Denial.Details["blockedLabel"])
 }
 
-// TestFlowHardening_ClearReclaimsSession is the FR-H2 (session-end reclamation) acceptance
+// TestFlowHardening_ClearReclaimsSession is the session-end-reclamation acceptance
 // test: when a session ends, ClearSessionLabels releases its flow-label state, so the
 // SAME session id (were it reused) starts clean and a later sink sees no taint.
 func TestFlowHardening_ClearReclaimsSession(t *testing.T) {
@@ -85,8 +85,8 @@ func TestFlowHardening_ClearReclaimsSession(t *testing.T) {
 	require.NoError(t, enforcement.New().ClearSessionLabels(ctx, "s"))
 }
 
-// TestFlowHardening_MultiInstanceSharesTaint is the FR-H4 (multi-instance parity)
-// acceptance test: a source labeling its output on one engine/instance and a sink reading
+// TestFlowHardening_MultiInstanceSharesTaint is the multi-instance-parity acceptance
+// test: a source labeling its output on one engine/instance and a sink reading
 // it on another must agree, when both share one Redis-backed FlowLabelStore. This is the
 // deployment the shared backend exists for (a source on proxy A, an egress on proxy B);
 // without it, the two fail open silently.

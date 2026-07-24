@@ -22,7 +22,7 @@ import (
 // faultOnIncrementCounter fails every IncrementAndGet — the sequenceBlock antecedent write
 // recordSessionCall performs — so the atomic source-call commit's SECOND write faults after
 // the flow-label write has already committed. The other methods are inert (unused on this
-// path). It is the fault injector for the FR-H5 atomic-commit rollback test.
+// path). It is the fault injector for the atomic-commit rollback test.
 type faultOnIncrementCounter struct{}
 
 func (faultOnIncrementCounter) IncrementAndGet(context.Context, string, int, int) (int64, error) {
@@ -36,8 +36,8 @@ func (faultOnIncrementCounter) IncrementIfAllBelow(context.Context, []string, []
 	return false, 0, 0, 0, nil
 }
 
-// TestFlowHardening_AtomicCommitRollsBackOnSeqFault is the FR-H5 (atomic cross-namespace
-// commit) acceptance test: a single allowed source call whose constraint carries BOTH a
+// TestFlowHardening_AtomicCommitRollsBackOnSeqFault is the atomic-cross-namespace-commit
+// acceptance test: a single allowed source call whose constraint carries BOTH a
 // labelOutput directive and a sequenceBlock-relevant antecedent write commits both or
 // neither. A fault injected between the two writes (the flow write commits, then the seq
 // antecedent write faults) must leave NEITHER committed — no stranded flow label, so a
@@ -91,7 +91,7 @@ func TestFlowHardening_AtomicCommitRollsBackOnSeqFault(t *testing.T) {
 			assert.Empty(t, present, "the flow write must be rolled back when its paired seq write faults (neither committed)")
 
 			// And a later flowLabel sink — evaluated on a WORKING counter but the SAME store —
-			// sees clean state and is allowed, the concrete downstream guarantee FR-H5 makes.
+			// sees clean state and is allowed, the concrete downstream guarantee the atomic commit makes.
 			verifier := New(WithCallCounter(callcounter.NewInMemory()), WithFlowLabelStore(store))
 			sink := verifier.ValidateAction(ctx, &capability.EnforceRequest{
 				SessionID: "s",

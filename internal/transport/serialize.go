@@ -1,7 +1,7 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// Per-session decision serialization (docs/flow-label-hardening.md piece B). A
+// Per-session decision serialization. A
 // flow-label source's write and a later sink's read happen in two independent
 // requests, which the transports otherwise dispatch on concurrent goroutines; without
 // ordering, a client that pipelines a tainting read and an egress on one session can let

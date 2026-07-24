@@ -24,8 +24,7 @@ Two Docker services. One manifest file. First enforced tool call in under 10 min
 > source read and the egress write concurrently on one session — the proxy
 > serializes a flow-relevant session's decision phase in receipt order, so the
 > source's label commits before the egress's check regardless of client
-> concurrency (the race the demo used to hide by serializing its client is closed;
-> see [`../docs/flow-label-hardening.md`](../docs/flow-label-hardening.md)). A
+> concurrency (the race the demo used to hide by serializing its client is closed). A
 > session's taint is retained for the whole session lifetime — no wall-clock
 > expiry — and reclaimed when the session ends. Across multiple proxy instances it
 > requires a shared Redis flow-label store (a startup NOTICE warns when one is

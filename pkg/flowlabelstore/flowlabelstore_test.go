@@ -188,13 +188,13 @@ func TestFlowLabelStore_LifecycleThroughInterface(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, []string{"confidential", "pii"}, carried)
 
-			// A fail-closed rollback removes exactly the faulted call's label (D3).
+			// A fail-closed rollback removes exactly the faulted call's label.
 			require.NoError(t, store.Remove(ctx, "sess", "confidential"))
 			carried, err = store.Get(ctx, "sess")
 			require.NoError(t, err)
 			assert.Equal(t, []string{"pii"}, carried)
 
-			// Session teardown reclaims all state; a reused id starts clean (FR-H2).
+			// Session teardown reclaims all state; a reused id starts clean.
 			require.NoError(t, store.Clear(ctx, "sess"))
 			carried, err = store.Get(ctx, "sess")
 			require.NoError(t, err)
@@ -245,9 +245,9 @@ func TestInMemory_Concurrent_NoRace(t *testing.T) {
 }
 
 // TestRedis_IdleTTL_RefreshedOnAddAndGet pins the Redis idle-TTL contract: Add stamps
-// the TTL, both Get and Add refresh it (so a live session never loses its taint,
-// FR-H1), an un-refreshed key expires past the bound (the orphaned-session safety net),
-// and Clear deletes the key outright.
+// the TTL, both Get and Add refresh it (so a live session never loses its taint), an
+// un-refreshed key expires past the bound (the orphaned-session safety net), and Clear
+// deletes the key outright.
 func TestRedis_IdleTTL_RefreshedOnAddAndGet(t *testing.T) {
 	mr := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
@@ -316,7 +316,7 @@ func TestRedis_WithIdleTTL_BelowOneSecondFallsBackToDefault(t *testing.T) {
 }
 
 // TestRedis_MultiInstance_SharedTaint verifies the property the Redis backend exists
-// for (FR-H4): a source read on one instance and a sink on another, pointed at the
+// for: a source read on one instance and a sink on another, pointed at the
 // same Redis, see the same session taint — provenance is enforceable across a
 // horizontally-scaled deployment, not just per-process.
 func TestRedis_MultiInstance_SharedTaint(t *testing.T) {
