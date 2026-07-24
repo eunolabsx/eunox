@@ -1287,12 +1287,18 @@ list of exact strings or glob patterns (e.g. `/reports/*` matches
 >   `/a/x%2fy/z`), while one whose encoded separator lands in the `**` portion is
 >   admitted (`/a/*/**` matches `/a/b/x%2fy`). The presence of `**` elsewhere in the
 >   pattern does not relax the confinement of a co-occurring single `*`.
-> - **An unmatchable path-style pattern is rejected at load.** A path-style
->   `allowedValues` pattern that itself contains a literal `.` or `..` segment
->   (e.g. `/**/../x`, `/a/./b`) can never match any value — the confinement scan
->   above denies every value carrying the required `.`/`..` segment first — so it is
->   a silently dead, deny-all grant. The loader rejects such a pattern as an error
->   rather than shipping it.
+> - **An unmatchable pattern is rejected at load.** A pattern that can never match
+>   any value is a silently dead, deny-all grant, so the loader rejects it as an
+>   error rather than shipping it. Three cases:
+>   - a path-style pattern that itself contains a literal `.` or `..` segment
+>     (e.g. `/**/../x`, `/a/./b`) — the confinement scan above denies every value
+>     carrying the required `.`/`..` segment first;
+>   - a pattern carrying an *encoded* path separator (`%2f` or `%5c`, e.g. `a%2fb`)
+>     — the runtime confinement denies any value that decodes to contain a
+>     separator, so the only value the pattern could match is itself denied (write a
+>     literal `/` for a path separator);
+>   - a `**` pattern with more `/`-separated segments than the runtime match cap —
+>     the segment matcher refuses to match beyond the cap.
 > - A value you intend literally but that contains `*`, `?`, or `[` (a filename
 >   glob, a regex-looking token, a value like `a[1]`) is reinterpreted as a
 >   pattern (`a[1]` matches only `1`; `report*` matches `report_secret`).

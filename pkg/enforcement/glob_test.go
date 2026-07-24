@@ -296,6 +296,13 @@ func TestValidateValueGlob(t *testing.T) {
 		"/**/../x",
 		"/a/./b",
 		"/reports/../secret",
+		// An encoded path separator makes every candidate value decode to contain a
+		// '/', which the runtime confinement denies — so the grant is a dead deny-all.
+		"a%2fb",
+		"file%5cname",
+		"a%2Fb", // case-insensitive
+		// A "**" pattern exceeding the runtime segment cap matches nothing.
+		strings.Repeat("a/", 1001) + "**",
 	}
 	for _, p := range invalid {
 		if err := enforcement.ValidateValueGlob(p); err == nil {

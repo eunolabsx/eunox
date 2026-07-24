@@ -946,7 +946,9 @@ func TestServerVersionWildcard(t *testing.T) {
 		{"1.2", "1.*"},
 		// A bare major has nothing looser the matcher accepts; suggest the exact pin.
 		{"1", "1"},
-		{"", "*"},
+		// cmdInit guards on serverVersion != "", so "" never reaches this function in
+		// production; the pure-function contract is empty-in -> empty-out (no bogus "*").
+		{"", ""},
 		{"1.2.3.4", "1.2.*"}, // only first two parts used
 	}
 	for _, tc := range cases {

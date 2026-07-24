@@ -371,10 +371,11 @@ func propertyTypeYAML(prop interface{}) string {
 //	"1.2.3" -> "1.2.*"  (any patch of 1.2)
 //	"1.2"   -> "1.*"    (any minor of 1; "1.2.*" would need a 3rd component)
 //	"2"     -> "2"      (no minor/patch to wildcard; exact pin is the only match)
+//
+// The sole caller (cmdInit) guards on serverVersion != "", so v is never empty here;
+// no empty-string special case is needed (and a bare "*" would contradict the
+// "only wildcard a component v has" invariant above).
 func serverVersionWildcard(v string) string {
-	if v == "" {
-		return "*"
-	}
 	parts := strings.Split(v, ".")
 	switch len(parts) {
 	case 1:

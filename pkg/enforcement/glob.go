@@ -80,6 +80,23 @@ func ValidateValueGlob(pattern string) error {
 	if pattern == "*" || pattern == "**" {
 		return nil
 	}
+	// A pattern carrying an ENCODED path separator (%2f, %5c) is a silently dead grant:
+	// the runtime confinement decodes a candidate value's separators and denies any that
+	// decode to contain one, so the only value such a pattern could match is itself
+	// denied. Reject it at load (like the "."/".." segments below) so the operator sees
+	// the mistake instead of a rule that matches nothing. Write a literal '/' for a
+	// separator.
+	if containsEncodedSeparator(pattern) {
+		return fmt.Errorf("%w: pattern contains an encoded path separator (%%2f/%%5c); the runtime confinement denies any value that decodes to a separator, so the grant would match nothing", path.ErrBadPattern)
+	}
+	// A "**" pattern with more '/'-separated segments than the runtime cap is likewise a
+	// dead grant: matchGlobSegments refuses to match beyond maxGlobSegments. Segment
+	// count is one more than the '/' count, so "count >= cap" is "segments > cap". (A
+	// non-"**" pattern is matched whole by path.Match with no cap, so it is unaffected.)
+	// Reject it at load rather than let it silently match nothing.
+	if strings.Contains(pattern, "**") && strings.Count(pattern, "/") >= maxGlobSegments {
+		return fmt.Errorf("%w: pattern has more than %d path segments, exceeding the runtime match cap; the grant would match nothing", path.ErrBadPattern, maxGlobSegments)
+	}
 	// A path-style pattern containing a "."/".." segment can never match: the
 	// runtime confinement scan rejects any value with such a segment first, so the
 	// pattern loads clean but is a silently dead, deny-all grant. Reject it.
