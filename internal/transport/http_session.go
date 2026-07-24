@@ -345,6 +345,9 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 
 	cmd := exec.Command(route.command, route.args...) //nolint:gosec,noctx // G204: args are user-supplied CLI arguments; session lifecycle managed via done channel, not ctx
 	cmd.Stderr = os.Stderr
+	// Filter eunox-owned secrets out of the child environment (see UpstreamEnv): a nil
+	// cmd.Env would inherit the proxy's entire os.Environ() into the least-trusted process.
+	cmd.Env = UpstreamEnv()
 
 	upIn, err := cmd.StdinPipe()
 	if err != nil {

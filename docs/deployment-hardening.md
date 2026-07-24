@@ -45,6 +45,17 @@ regardless of network position or device.
   IdP/upstream policy) can be configured to honor only tokens that carry eunox's
   delegation marker (`act`) or audience, a client's own token — lacking eunox in
   the chain — is rejected by the upstream itself.
+- **eunox strips its own secrets from the upstream subprocess environment.** An
+  upstream launched as a subprocess is the least-trusted process eunox runs, yet a
+  child spawned with an unset environment inherits the parent's entire
+  `os.Environ()`. eunox filters its own emergency-stop credential
+  (`EUNOX_CONTROL_TOKEN`) and shared-backend password (`EUNOX_REDIS_PASSWORD`) out
+  of every spawn's environment, so a compromised upstream cannot read them from its
+  own environment. This is a denylist of eunox-owned names: a secret you reference
+  from the gateway config under an arbitrary `${VAR}` name (e.g. an
+  `upstreamAuthHeader` bearer) is **not** auto-stripped — start the proxy with only
+  the environment the upstream may legitimately see, or supply that secret to eunox
+  through a channel the child does not inherit.
 
 Credential control is enforced at the IdP and the upstream, so it does not depend
 on owning the network path or the device. It is the lever that works for remote

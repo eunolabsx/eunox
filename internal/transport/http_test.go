@@ -176,6 +176,7 @@ func TestHTTPHandleKill_NonPOST(t *testing.T) {
 	proxy := &HTTPProxy{sessions: make(map[string]*httpSession)}
 	req := httptest.NewRequest(http.MethodGet, "/control/kill", http.NoBody)
 	req.RemoteAddr = "127.0.0.1:9999"
+	req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	w := httptest.NewRecorder()
 	proxy.handleKill(w, req)
 	if w.Code != http.StatusMethodNotAllowed {
@@ -188,6 +189,7 @@ func TestHTTPHandleKill_InvalidJSON(t *testing.T) {
 	proxy := &HTTPProxy{sessions: make(map[string]*httpSession), controlToken: testControlToken}
 	req := httptest.NewRequest(http.MethodPost, "/control/kill", bytes.NewBufferString("bad json"))
 	req.RemoteAddr = "127.0.0.1:9999"
+	req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	req.Header.Set(ControlTokenHeader, testControlToken)
 	w := httptest.NewRecorder()
 	proxy.handleKill(w, req)
@@ -202,6 +204,7 @@ func TestHTTPHandleKill_NoSessionIDOrAll(t *testing.T) {
 	body := `{"sessionId":"","all":false}`
 	req := httptest.NewRequest(http.MethodPost, "/control/kill", bytes.NewBufferString(body))
 	req.RemoteAddr = "127.0.0.1:9999"
+	req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	req.Header.Set(ControlTokenHeader, testControlToken)
 	w := httptest.NewRecorder()
 	proxy.handleKill(w, req)
@@ -221,6 +224,7 @@ func TestHTTPHandleKill_RejectsTrailingJSONTokens(t *testing.T) {
 	body := `{"sessionId":"s1"} {"all":true}`
 	req := httptest.NewRequest(http.MethodPost, "/control/kill", bytes.NewBufferString(body))
 	req.RemoteAddr = "127.0.0.1:9999"
+	req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	req.Header.Set(ControlTokenHeader, testControlToken)
 	w := httptest.NewRecorder()
 	proxy.handleKill(w, req)
@@ -268,6 +272,7 @@ func TestHTTPHandleKill_ActivateGlobalErrorPropagated(t *testing.T) {
 	proxy := &HTTPProxy{sessions: make(map[string]*httpSession), ks: killWriteErrSwitch{}, controlToken: testControlToken}
 	req := httptest.NewRequest(http.MethodPost, "/control/kill", bytes.NewBufferString(`{"all":true}`))
 	req.RemoteAddr = "127.0.0.1:9999"
+	req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	req.Header.Set(ControlTokenHeader, testControlToken)
 	w := httptest.NewRecorder()
 	proxy.handleKill(w, req)
@@ -289,6 +294,7 @@ func TestHTTPHandleKill_KillSessionErrorPropagated(t *testing.T) {
 	proxy := &HTTPProxy{sessions: make(map[string]*httpSession), ks: killWriteErrSwitch{}, controlToken: testControlToken}
 	req := httptest.NewRequest(http.MethodPost, "/control/kill", bytes.NewBufferString(`{"sessionId":"s1"}`))
 	req.RemoteAddr = "127.0.0.1:9999"
+	req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	req.Header.Set(ControlTokenHeader, testControlToken)
 	w := httptest.NewRecorder()
 	proxy.handleKill(w, req)
@@ -312,6 +318,7 @@ func TestHTTPHandleKill_GlobalKill_NoWiretapCaveat(t *testing.T) {
 	}
 	req := httptest.NewRequest(http.MethodPost, "/control/kill", bytes.NewBufferString(`{"all":true}`))
 	req.RemoteAddr = "127.0.0.1:9999"
+	req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	req.Header.Set(ControlTokenHeader, testControlToken)
 	w := httptest.NewRecorder()
 	proxy.handleKill(w, req)
@@ -355,6 +362,7 @@ func TestHTTPHandleKill_ReclaimsSlotWithIdleReapingDisabled(t *testing.T) {
 		}
 		req := httptest.NewRequest(http.MethodPost, "/control/kill", bytes.NewBufferString(`{"sessionId":"s1"}`))
 		req.RemoteAddr = "127.0.0.1:9999"
+		req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 		req.Header.Set(ControlTokenHeader, testControlToken)
 		w := httptest.NewRecorder()
 		proxy.handleKill(w, req)
@@ -376,6 +384,7 @@ func TestHTTPHandleKill_ReclaimsSlotWithIdleReapingDisabled(t *testing.T) {
 		}
 		req := httptest.NewRequest(http.MethodPost, "/control/kill", bytes.NewBufferString(`{"all":true}`))
 		req.RemoteAddr = "127.0.0.1:9999"
+		req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 		req.Header.Set(ControlTokenHeader, testControlToken)
 		w := httptest.NewRecorder()
 		proxy.handleKill(w, req)
@@ -401,6 +410,7 @@ func TestHTTPHandleKill_PerSession_NoWiretapCaveat(t *testing.T) {
 	}
 	req := httptest.NewRequest(http.MethodPost, "/control/kill", bytes.NewBufferString(`{"sessionId":"sess-7"}`))
 	req.RemoteAddr = "127.0.0.1:9999"
+	req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	req.Header.Set(ControlTokenHeader, testControlToken)
 	w := httptest.NewRecorder()
 	proxy.handleKill(w, req)
@@ -4458,6 +4468,7 @@ func TestSourceIP_TrustXFF(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/mcp", http.NoBody)
 	req.Header.Set("X-Forwarded-For", "10.0.0.1")
 	req.RemoteAddr = "127.0.0.1:1234"
+	req.Host = "127.0.0.1:1234" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	ip := proxy.sourceIP(req)
 	if !strings.Contains(ip, "10.0.0.1") {
 		t.Errorf("sourceIP with trustFwdFor: want 10.0.0.1, got %q", ip)
@@ -4491,6 +4502,7 @@ func TestSourceIP_TrustXFF_EmptyAllowlistNeverTrusts(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/mcp", http.NoBody)
 	req.Header.Set("X-Forwarded-For", "10.0.0.1")
 	req.RemoteAddr = "127.0.0.1:1234"
+	req.Host = "127.0.0.1:1234" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	ip := proxy.sourceIP(req)
 	if ip != "127.0.0.1" {
 		t.Errorf("sourceIP: empty trustedProxyCIDRs must never trust XFF, got %q", ip)
@@ -4520,6 +4532,7 @@ func TestSourceIP_TrustXFF_RightmostHop(t *testing.T) {
 	// Left entry is attacker-injected; right entry is appended by the trusted hop.
 	req.Header.Set("X-Forwarded-For", "10.0.0.1, 203.0.113.7")
 	req.RemoteAddr = "127.0.0.1:1234"
+	req.Host = "127.0.0.1:1234" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	ip := proxy.sourceIP(req)
 	if ip != "203.0.113.7" {
 		t.Errorf("sourceIP: want right-most trusted hop 203.0.113.7, got %q (left-most is client-spoofable)", ip)
@@ -4540,6 +4553,7 @@ func TestSourceIP_TrustXFF_MultipleHeaderLines(t *testing.T) {
 	req.Header.Add("X-Forwarded-For", "10.0.0.1")
 	req.Header.Add("X-Forwarded-For", "203.0.113.7")
 	req.RemoteAddr = "127.0.0.1:1234"
+	req.Host = "127.0.0.1:1234" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	ip := proxy.sourceIP(req)
 	if ip != "203.0.113.7" {
 		t.Errorf("sourceIP: want right-most trusted hop 203.0.113.7, got %q (first line is client-spoofable)", ip)
@@ -4558,6 +4572,7 @@ func TestSourceIP_TrustXFF_StripsPort(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/mcp", http.NoBody)
 	req.Header.Set("X-Forwarded-For", "10.0.0.1, 203.0.113.7:5678")
 	req.RemoteAddr = "127.0.0.1:1234"
+	req.Host = "127.0.0.1:1234" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	if ip := proxy.sourceIP(req); ip != "203.0.113.7" {
 		t.Errorf("sourceIP: want port-stripped 203.0.113.7, got %q", ip)
 	}
@@ -4566,6 +4581,7 @@ func TestSourceIP_TrustXFF_StripsPort(t *testing.T) {
 	req6 := httptest.NewRequest(http.MethodGet, "/mcp", http.NoBody)
 	req6.Header.Set("X-Forwarded-For", "[2001:db8::1]:5678")
 	req6.RemoteAddr = "127.0.0.1:1234"
+	req6.Host = "127.0.0.1:1234" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	if ip := proxy.sourceIP(req6); ip != "2001:db8::1" {
 		t.Errorf("sourceIP: want port-stripped 2001:db8::1, got %q", ip)
 	}
@@ -4574,6 +4590,7 @@ func TestSourceIP_TrustXFF_StripsPort(t *testing.T) {
 	reqBare := httptest.NewRequest(http.MethodGet, "/mcp", http.NoBody)
 	reqBare.Header.Set("X-Forwarded-For", "203.0.113.7")
 	reqBare.RemoteAddr = "127.0.0.1:1234"
+	reqBare.Host = "127.0.0.1:1234" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	if ip := proxy.sourceIP(reqBare); ip != "203.0.113.7" {
 		t.Errorf("sourceIP: bare IP must pass through, got %q", ip)
 	}
@@ -4584,6 +4601,7 @@ func TestSourceIP_TrustXFF_StripsPort(t *testing.T) {
 	req6NoPort := httptest.NewRequest(http.MethodGet, "/mcp", http.NoBody)
 	req6NoPort.Header.Set("X-Forwarded-For", "[2001:db8::1]")
 	req6NoPort.RemoteAddr = "127.0.0.1:1234"
+	req6NoPort.Host = "127.0.0.1:1234" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	if ip := proxy.sourceIP(req6NoPort); ip != "2001:db8::1" {
 		t.Errorf("sourceIP: want unbracketed 2001:db8::1, got %q", ip)
 	}
@@ -4593,6 +4611,7 @@ func TestSourceIP_TrustXFF_StripsPort(t *testing.T) {
 	reqBare6 := httptest.NewRequest(http.MethodGet, "/mcp", http.NoBody)
 	reqBare6.Header.Set("X-Forwarded-For", "2001:db8::1")
 	reqBare6.RemoteAddr = "127.0.0.1:1234"
+	reqBare6.Host = "127.0.0.1:1234" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	if ip := proxy.sourceIP(reqBare6); ip != "2001:db8::1" {
 		t.Errorf("sourceIP: bare IPv6 must pass through, got %q", ip)
 	}

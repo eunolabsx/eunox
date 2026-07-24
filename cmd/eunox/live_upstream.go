@@ -121,6 +121,9 @@ func fetchLiveToolsStdio(ctx context.Context, command string, args []string) (Li
 	defer cancel()                                        // always release the context (covers the early-return error paths)
 	cmd := exec.CommandContext(procCtx, command, args...) //nolint:gosec // G204: command and args are user-supplied CLI arguments
 	cmd.Stderr = os.Stderr
+	// Filter eunox-owned secrets out of the probed upstream's environment, matching the
+	// runtime spawn sites (a nil cmd.Env would inherit the proxy's entire os.Environ()).
+	cmd.Env = transport.UpstreamEnv()
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

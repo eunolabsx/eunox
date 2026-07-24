@@ -109,6 +109,15 @@ type JWTClaims struct {
 	// its own audience after the shared validator has accepted the token — see
 	// JWTPDP.routeAudience and WrapRoutesWithJWT. Empty when the token carried no aud.
 	Audiences []string
+	// ExpiresAt is the verified token's `exp` as a wall-clock time. ValidateToken
+	// rejects a token with no exp, so this is always set on a validated JWTClaims; it is
+	// the zero Time for a JWTClaims built without ValidateToken (e.g. tests). A long-lived
+	// server->client stream (an SSE GET) is validated only once at open, so the transport
+	// arms a timer at this instant to end the stream when the token's lifetime elapses —
+	// otherwise an expired (or IdP-revoked but not kill-switched) client keeps receiving
+	// traffic until it disconnects or the idle reaper runs. Kill-switch eviction covers
+	// administrative revocation; this covers plain expiry.
+	ExpiresAt time.Time
 	// Extra holds every raw top-level claim from the verified token, keyed exactly
 	// as the IdP emitted it (standard fields, the nested mcp object, custom claims).
 	// It is the source of input.claims (see jwtClaimsAsMap), so a policy can
@@ -521,6 +530,13 @@ func newValidatedClaims(capsList []string, capsPresent bool, payload idpJWTPaylo
 		Audiences:  []string(std.Audience),
 		Extra:      rawClaims,
 		parsedCaps: parseCapHeads(capsList),
+	}
+	// Capture the verified exp as wall-clock time so a long-lived SSE stream can bound
+	// itself to the token lifetime. validateStandardClaims (run before this) rejects a
+	// token with no exp, so std.Expiry is non-nil on the ValidateToken path; guard anyway
+	// for any other caller.
+	if std.Expiry != nil {
+		claims.ExpiresAt = std.Expiry.Time()
 	}
 	claims.flatClaims = buildFlatClaims(claims)
 	return claims

@@ -245,14 +245,21 @@ func (p *HTTPProxy) originAllowed(origin string) bool {
 
 // sourceIP extracts the client IP address for PDP evaluation.
 //
-// Under --trust-forwarded-for the proxy trusts the immediate reverse proxy to have
-// appended the real client address as the RIGHT-MOST X-Forwarded-For entry — but only
-// when that immediate peer (RemoteAddr) itself matches listen.trustedProxyCIDRs.
-// Without this check, --trust-forwarded-for alone would trust the header from ANY
-// directly-connecting client, letting it spoof an ipRange source; requiring the peer to
-// be an actual configured trusted hop closes that gap. Left-most XFF entries are
-// client-controlled (a client can forge a trusted ipRange source), so reading the
-// right-most appended hop is what resists spoofing through a single trusted proxy.
+// Under --trust-forwarded-for the proxy trusts X-Forwarded-For — but only when the
+// immediate peer (RemoteAddr) itself matches listen.trustedProxyCIDRs. Without this
+// check, --trust-forwarded-for alone would trust the header from ANY directly-connecting
+// client, letting it spoof an ipRange source; requiring the peer to be a configured
+// trusted hop closes that gap.
+//
+// The client is resolved by walking the flattened chain RIGHT-TO-LEFT and skipping every
+// entry that is itself a trusted proxy, returning the first non-trusted address. For a
+// single trusted hop that is the right-most entry; for a CHAIN of trusted proxies
+// (client → p1 → p2 → eunox, where each hop appends the address it saw, so XFF becomes
+// [client, p1]) the right-most is the INNER proxy's own address, and returning it would
+// evaluate infrastructure rather than the client against an ipRange condition. Entries
+// to the left of the first non-trusted address are client-controllable and ignored, so a
+// client still cannot spoof an ipRange source by prepending a forged hop. If every entry
+// is trusted, fall through to RemoteAddr.
 func (p *HTTPProxy) sourceIP(r *http.Request) string {
 	if p.trustFwdFor && p.peerIsTrustedProxy(r.RemoteAddr) {
 		// Flatten ALL X-Forwarded-For lines, not just the first: an intermediary that
@@ -267,23 +274,15 @@ func (p *HTTPProxy) sourceIP(r *http.Request) string {
 					}
 				}
 			}
-			if n := len(all); n > 0 {
-				// Right-most across the whole chain: only the address our trusted edge
-				// appended is reliable; every entry to its left could be forged.
-				entry := all[n-1]
-				// Normalize like the RemoteAddr path below: some proxies append the client
-				// as IP:port or as a bracketed IPv6 literal, and the downstream ipRange
-				// condition runs net.ParseIP, which returns nil for a port-suffixed or a
-				// bracketed value — wrongly denying every request with CONDITION_FAILED.
-				if host, _, err := net.SplitHostPort(entry); err == nil {
-					return host
+			for i := len(all) - 1; i >= 0; i-- {
+				// Normalize like the RemoteAddr path below: proxies may append the client as
+				// IP:port or a bracketed IPv6 literal, and the downstream ipRange condition
+				// runs net.ParseIP, which returns nil for either form.
+				host := normalizeXFFHost(all[i])
+				if host == "" || p.hostInTrustedProxyNets(host) {
+					continue // an empty entry, or one of our own trusted proxies: keep walking left
 				}
-				// SplitHostPort failed: the entry carries no port. It is either a bare
-				// address (returned unchanged) or a bracketed IPv6 literal with no port
-				// ("[2001:db8::1]"), which net.ParseIP also rejects — strip the surrounding
-				// brackets so it parses. Mirrors bindIsLoopbackOnly, which keys on the
-				// unbracketed host.
-				return strings.TrimSuffix(strings.TrimPrefix(entry, "["), "]")
+				return host
 			}
 		}
 	}
@@ -291,17 +290,23 @@ func (p *HTTPProxy) sourceIP(r *http.Request) string {
 	return host
 }
 
-// peerIsTrustedProxy reports whether remoteAddr's host is a configured
-// listen.trustedProxyCIDRs entry — the gate sourceIP applies before trusting
-// X-Forwarded-For at all. An empty allowlist matches nothing, so
-// --trust-forwarded-for alone (no CIDRs configured) never trusts the header.
-func (p *HTTPProxy) peerIsTrustedProxy(remoteAddr string) bool {
+// normalizeXFFHost strips an optional port and IPv6 brackets from an X-Forwarded-For
+// entry, yielding the bare host net.ParseIP accepts (a proxy may append the client as a
+// bare address, IP:port, or a bracketed IPv6 literal). Empty in, empty out.
+func normalizeXFFHost(entry string) string {
+	if host, _, err := net.SplitHostPort(entry); err == nil {
+		return host
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(entry, "["), "]")
+}
+
+// hostInTrustedProxyNets reports whether a bare host (no port, no brackets) parses to an
+// IP inside listen.trustedProxyCIDRs. Shared by peerIsTrustedProxy (the immediate-peer
+// gate) and sourceIP's right-to-left XFF walk so both agree on what counts as a trusted
+// hop. An empty CIDR set matches nothing.
+func (p *HTTPProxy) hostInTrustedProxyNets(host string) bool {
 	if len(p.trustedProxyNets) == 0 {
 		return false
-	}
-	host, _, err := net.SplitHostPort(remoteAddr)
-	if err != nil {
-		host = remoteAddr
 	}
 	ip := net.ParseIP(host)
 	if ip == nil {
@@ -313,6 +318,18 @@ func (p *HTTPProxy) peerIsTrustedProxy(remoteAddr string) bool {
 		}
 	}
 	return false
+}
+
+// peerIsTrustedProxy reports whether remoteAddr's host is a configured
+// listen.trustedProxyCIDRs entry — the gate sourceIP applies before trusting
+// X-Forwarded-For at all. An empty allowlist matches nothing, so
+// --trust-forwarded-for alone (no CIDRs configured) never trusts the header.
+func (p *HTTPProxy) peerIsTrustedProxy(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	return p.hostInTrustedProxyNets(host)
 }
 
 // bindIsLoopbackOnly reports whether the bind host accepts connections only from
@@ -344,9 +361,17 @@ func openNonLoopbackBind(bind, authToken string, jwtConfigured bool) bool {
 	return !bindIsLoopbackOnly(bind) && authToken == "" && !jwtConfigured
 }
 
-// loopbackOnly reports whether the request originates from a loopback address,
-// writing a 403 and returning false otherwise. Shared by the control, health, and
-// metrics endpoints so none of them is reachable off-host.
+// loopbackOnly reports whether the request originates from a loopback address AND
+// carries a trusted Host, writing a 403 and returning false otherwise. Shared by the
+// control, health, and metrics endpoints so none of them is reachable off-host.
+//
+// The Host check is the DNS-rebinding guard: a loopback RemoteAddr alone is satisfied
+// by the victim's OWN browser after a rebind (attacker.com → 127.0.0.1), because the
+// TCP connection still originates on the local machine. Without also pinning the Host
+// to a trusted name, attacker JS on a rebound page could read /healthz and /metrics
+// operational state (session/route counts, audit-degradation and kill-switch health)
+// cross-site — the checkOrigin path already applies exactly this Host allowlist to
+// /mcp, but these endpoints are gated by loopbackOnly alone.
 func (p *HTTPProxy) loopbackOnly(w http.ResponseWriter, r *http.Request) bool {
 	// Under --trust-forwarded-for a reverse proxy may sit in front of the listener and
 	// forward these loopback-only control/health/metrics paths: it then connects from a
@@ -366,5 +391,40 @@ func (p *HTTPProxy) loopbackOnly(w http.ResponseWriter, r *http.Request) bool {
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return false
 	}
+	// DNS-rebinding guard: also require a trusted Host. Normalize r.Host to a bare
+	// hostname (strip an optional port and IPv6 brackets, lower-case) exactly as
+	// originAllowed normalizes an Origin via url.Hostname(), then require it to be in
+	// the same allowedOriginHosts set. A rebound request carries the attacker's name
+	// (Host: attacker.com) and is rejected; a legitimate loopback scrape uses
+	// localhost / 127.0.0.1 / ::1 / the non-wildcard bind host, all of which
+	// buildAllowedOriginHosts seeds.
+	reqHost := r.Host
+	if h, _, err := net.SplitHostPort(reqHost); err == nil {
+		reqHost = h
+	}
+	reqHost = strings.ToLower(strings.Trim(reqHost, "[]"))
+	if !p.hostAllowedForLoopbackEndpoint(reqHost) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return false
+	}
 	return true
+}
+
+// hostAllowedForLoopbackEndpoint reports whether reqHost (already normalized to a bare,
+// lower-cased hostname) is a trusted name for a loopback-only endpoint. It consults the
+// origin-host allowlist the constructor seeds (the loopback names plus any non-wildcard
+// bind host — the same set checkOrigin uses for /mcp); when that allowlist is empty it
+// falls back to the built-in loopback names alone, so a loopback endpoint has a safe,
+// complete default rather than depending on the allowlist having been populated. Either
+// way a rebound request carries a foreign Host (attacker.com) that matches neither, so
+// the DNS-rebinding guard holds; the source-IP loopback check remains the primary gate.
+func (p *HTTPProxy) hostAllowedForLoopbackEndpoint(reqHost string) bool {
+	if len(p.allowedOriginHosts) > 0 {
+		return p.allowedOriginHosts[reqHost]
+	}
+	switch reqHost {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	return false
 }
