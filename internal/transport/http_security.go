@@ -64,6 +64,15 @@ func (p *HTTPProxy) checkAuth(w http.ResponseWriter, r *http.Request) bool {
 	const prefix = "Bearer "
 	if len(auth) < len(prefix) || !strings.EqualFold(auth[:len(prefix)], prefix) ||
 		!constantTimeTokenEqual(p.authTimingKey, auth[len(prefix):], p.authToken) {
+		// Record the refusal so an off-host bearer-token brute-force leaves a trace on the
+		// tamper-evident tape, mirroring the ORIGIN_REJECTED / JWT_INVALID pre-route
+		// records. NEVER record the presented credential — only the source and the
+		// unverified claimed session id. Precedes any session lookup, so session_id stays
+		// empty and the client-supplied Mcp-Session-Id is kept as claimed_session_id.
+		if p.sink != nil {
+			details := addClaimedSessionID(map[string]interface{}{"source_ip": p.sourceIP(r)}, r)
+			p.sink.RecordDeny(r.Context(), "", "", "", codeAuthFailed, "auth", details, false)
+		}
 		w.Header().Set("WWW-Authenticate", buildWWWAuthenticate(credPresented, p.oauthMetaURL))
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return false
@@ -86,6 +95,14 @@ func (p *HTTPProxy) checkControlToken(w http.ResponseWriter, r *http.Request) bo
 	}
 	presented := r.Header.Get(ControlTokenHeader)
 	if presented == "" || !constantTimeTokenEqual(p.authTimingKey, presented, p.controlToken) {
+		// Record the refusal: /control/kill is the emergency-stop endpoint (SEC-07), so a
+		// same-host process probing it with a wrong/missing token is exactly the threat the
+		// token defends, and must not be invisible on the tape. NEVER record the presented
+		// token — only the source and the unverified claimed session id.
+		if p.sink != nil {
+			details := addClaimedSessionID(map[string]interface{}{"source_ip": p.sourceIP(r)}, r)
+			p.sink.RecordDeny(r.Context(), "", "", "", codeControlAuthFailed, "control", details, false)
+		}
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return false
 	}

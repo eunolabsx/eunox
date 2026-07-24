@@ -68,6 +68,29 @@ const (
 	codeInvalidRequest = "INVALID_REQUEST"
 )
 
+// Non-policy refusal codes for requests denied BEFORE (or independent of) a PDP
+// decision: a failed transport-auth credential, a saturated handler pool, or a
+// startup drift refusal. They are recorded so an off-host bearer/control-token
+// brute-force, a pool-saturation flood, or a tool-poisoning drift refusal leaves a
+// trace on the tamper-evident tape rather than a silent 401/503/500. All are
+// non-policy (no target to mine), so IsInfraDenialCode returns true for each and the
+// suggest subcommand skips them.
+const (
+	// codeAuthFailed marks a missing/invalid static Authorization bearer token
+	// (--listen-auth-token). The presented credential is NEVER recorded.
+	codeAuthFailed = "AUTH_FAILED"
+	// codeControlAuthFailed marks a missing/invalid X-Eunox-Control-Token on the
+	// loopback emergency-stop endpoint (SEC-07). The presented token is NEVER recorded.
+	codeControlAuthFailed = "CONTROL_AUTH_FAILED"
+	// codeResourceExhausted marks a host request refused because the concurrent-handler
+	// pool was saturated (server-busy), so a DoS-probe flood is visible on the tape.
+	codeResourceExhausted = "RESOURCE_EXHAUSTED"
+	// codeDriftRefused marks a session refused at startup because the manifest-drift
+	// check failed (FM-5 descriptionHash rug-pull / strict-drift refusal) — the security
+	// event this feature exists to catch, otherwise invisible to the audit trail.
+	codeDriftRefused = "DRIFT_REFUSED"
+)
+
 // JSON-RPC 2.0 error codes used for callUpstream-error responses.
 const (
 	jsonRPCCodeInvalidRequest = -32600
@@ -95,6 +118,12 @@ func IsInfraDenialCode(code string) bool {
 		// strict gate tripping after an audit-queue overflow. Mining any of these would let
 		// suggest fabricate a deny-only allowlist suggestion for a target that policy never
 		// actually denied.
+		return true
+	case codeAuthFailed, codeControlAuthFailed, codeResourceExhausted, codeDriftRefused:
+		// Non-policy refusals recorded before/independent of a PDP decision: a failed
+		// transport-auth credential, a saturated handler pool, or a startup drift refusal.
+		// None names a policy target, so mining them would fabricate a phantom-target
+		// suggestion; suggest must skip them like the other infra denials.
 		return true
 	}
 	return false
