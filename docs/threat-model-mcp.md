@@ -3,7 +3,7 @@
 **Document status:** Active  
 **Classification:** Public  
 **Scope:** `eunox` proxy binary (`cmd/eunox/`)  
-**Version:** 1.17  
+**Version:** 1.18  
 **Date:** 2026-07-25  
 **Authors:** Eunolabs Platform Security  
 **Reviewers:** Pending external audit (see §6)
@@ -764,6 +764,12 @@ In the default configuration, all data stays on the machine running the proxy:
 | Policy manifest    | Local file path provided by operator |
 
 When `--redis-addr` is configured, kill-switch and call-counter state are persisted to the Redis instance at that address. When a remote `upstreamUrl` is configured, tool call requests are forwarded to that URL (with the `upstreamAuthHeader` if provided). The remote-upstream HTTP client does **not** follow redirects: an MCP JSON-RPC POST has no legitimate redirect, and Go strips only `Authorization`/`Cookie` on a cross-host redirect, so a custom-named `upstreamAuthHeader` (e.g. `X-Api-Key`) would otherwise be replayed verbatim to whatever host a compromised upstream named in a `30x` `Location` — leaking the credential. A `30x` from the upstream is surfaced as an error instead. No other data is transmitted externally by the proxy.
+
+**Credential redaction in error paths and diagnostics.** A remote `upstreamUrl` can carry a credential in userinfo (`https://user:pass@host`) or in a query/fragment (`?api_key=…`, `#access_token=…`). Every path that surfaces such a URL routes it through **one consolidated redactor** (shared by config-validation errors, the live-upstream probe, and the `doctor` support bundle), so a credential cannot leak through any of them. This matters most for the **live probe**: a connection failure surfaces a Go `*url.Error` whose text the standard library scrubs only of the userinfo *password* — the username and the entire query string still print. The proxy redacts the whole URL (userinfo, query, and fragment) before that error reaches stderr or the paste-ready `doctor` bundle. The redactor handles the hierarchical, opaque (`scheme:user:pass@host`), scheme-less, and unparseable forms and fails safe (never returns the raw value) on anything `url.Parse` cannot handle. The `doctor` bundle additionally fails closed on an audit record whose `details` is a non-object JSON value, redacting it wholesale rather than emitting it verbatim.
+
+**Generated-file handling (`init` / `suggest`).** `eunox init` and `eunox suggest` write their output at mode `0600`, refuse to overwrite a pre-existing file unless `--force` is passed (so a hand-edited manifest is not silently clobbered), and — because `O_CREATE` applies a mode only on creation — re-tighten the mode to `0600` on an intentional overwrite. This is load-bearing for `init --config-output`, whose generated config can embed a cleartext `--upstream-auth-header` credential: writing it into a pre-existing group/world-readable file would otherwise leave that credential exposed.
+
+**Env-ref misdirection fails closed.** `audit.log` and `audit.keyPath` accept `${VAR}` references like the credential/URL config fields. An **unset** reference survives expansion as literal `${VAR}` text, which would silently write the tamper-evident tape (or its HMAC signing key) to a path literally named `${VAR}` — a fail-open on the core integrity artifact. The loader now rejects an unset reference in either field at startup, mirroring the fail-closed guard the `upstreamUrl`/credential fields already had.
 
 ### 6.5 Verified JWT claims at the policy-evaluator boundary
 

@@ -28,18 +28,37 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/eunolabs/eunox/internal/config"
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/pdp"
 )
+
+// scrubURLError redacts the credentialed URL carried by a *url.Error (the error type
+// net/http returns from client.Do) before it is wrapped and surfaced. The stdlib's own
+// formatting strips only the userinfo PASSWORD, leaving the userinfo username and the
+// entire query string (a ?api_key=/?token= credential) in the message — which then
+// reaches the live-probe's stderr and the paste-ready doctor support bundle. Replacing
+// the *url.Error with one whose URL is run through config.RedactURL closes that leak
+// while preserving the operation and the wrapped cause (so errors.Is/As still match).
+// A non-URL error is returned unchanged.
+func scrubURLError(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return &url.Error{Op: ue.Op, URL: config.RedactURL(ue.URL), Err: ue.Err}
+	}
+	return err
+}
 
 // upstreamSessionDeleteTimeout bounds the best-effort session-termination DELETE
 // sent to a remote upstream on close. It runs during teardown, so it must be short
@@ -378,7 +397,10 @@ func DoMCPHTTP(ctx context.Context, client *http.Client, endpoint string, msg mc
 	}
 	resp, err := client.Do(req) //nolint:gosec // G704: endpoint is the operator-configured upstream MCP URL (gateway config / CLI flag), not attacker-controlled input — reaching it is the proxy's purpose, not an SSRF (same rationale as the G107 suppression on the request build above)
 	if err != nil {
-		return mcp.RPCMsg{}, nil, fmt.Errorf("upstream HTTP: %w", err)
+		// Scrub the credentialed URL from the transport error before it is surfaced: the
+		// *url.Error text otherwise leaks the userinfo username and query string to the
+		// live-probe's stderr and the doctor bundle (net/http strips only the password).
+		return mcp.RPCMsg{}, nil, fmt.Errorf("upstream HTTP: %w", scrubURLError(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusAccepted {

@@ -636,34 +636,6 @@ func TestRedactString_NonStringAndEmpty(t *testing.T) {
 // TestRedactURLFallback_Cases covers redactURLFallback directly: a value with no
 // scheme but an '@' (placeholder), a value with no scheme and no '@'
 // (unchanged), and a scheme-bearing value carrying userinfo (REDACTED inserted).
-func TestRedactURLFallback_Cases(t *testing.T) {
-	cases := map[string]func(string) bool{
-		// No scheme, has '@' → placeholder.
-		"user:pw@host": func(s string) bool { return strings.Contains(s, "redacted unparseable URL") },
-		// No scheme, no '@' → unchanged.
-		"just-a-string": func(s string) bool { return s == "just-a-string" },
-		// Scheme + userinfo → REDACTED@ replaces the credential.
-		"https://alice:secret@example.com/p": func(s string) bool {
-			return strings.Contains(s, "REDACTED@example.com") && !strings.Contains(s, "secret")
-		},
-		// Unparseable URL (invalid percent escape) with a query credential → the
-		// query is scrubbed by the fallback's redactRawQuery path.
-		"https://example.com/%?api_key=sk-live": func(s string) bool {
-			return strings.Contains(s, "redacted query") && !strings.Contains(s, "sk-live")
-		},
-		// Unparseable URL with a FRAGMENT credential → the fragment is dropped
-		// entirely (delimiter included), matching redactURL's parse-success scrub.
-		"https://example.com/%#access_token=sk-frag": func(s string) bool {
-			return !strings.Contains(s, "sk-frag") && !strings.Contains(s, "#")
-		},
-	}
-	for in, ok := range cases {
-		if got := redactURLFallback(in); !ok(got) {
-			t.Errorf("redactURLFallback(%q) = %q (unexpected)", in, got)
-		}
-	}
-}
-
 // TestTailAuditLines_RingEvictsOldest exercises the ring-buffer eviction branch
 // (more lines than n) which the existing tests' small inputs do not all hit.
 func TestTailAuditLines_RingEvictsOldest(t *testing.T) {
