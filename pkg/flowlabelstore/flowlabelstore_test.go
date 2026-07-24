@@ -295,20 +295,22 @@ func TestRedis_IdleTTL_RefreshedOnAddAndGet(t *testing.T) {
 	assert.False(t, mr.Exists("flowlabels:s2"), "Clear must delete the session's key")
 }
 
-// TestRedis_WithIdleTTL_NonPositiveFallsBackToDefault verifies a misconfigured
-// (zero/negative) idle TTL is ignored in favor of DefaultIdleTTL rather than making
-// EXPIRE drop a live session's taint immediately — fail safe, not open.
-func TestRedis_WithIdleTTL_NonPositiveFallsBackToDefault(t *testing.T) {
+// TestRedis_WithIdleTTL_BelowOneSecondFallsBackToDefault verifies a misconfigured idle TTL
+// below one second is ignored in favor of DefaultIdleTTL rather than capping a live session's
+// taint at Redis EXPIRE's one-second granularity — fail safe, not open. It covers both the
+// non-positive values (a zero/negative EXPIRE would drop the taint at once) and a sub-second
+// value like 500ms (which would otherwise truncate to a ~1s taint lifetime).
+func TestRedis_WithIdleTTL_BelowOneSecondFallsBackToDefault(t *testing.T) {
 	mr := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
 	ctx := context.Background()
 
-	for _, ttl := range []time.Duration{0, -time.Second} {
+	for _, ttl := range []time.Duration{0, -time.Second, 500 * time.Millisecond, time.Second - time.Nanosecond} {
 		store := flowlabelstore.NewRedis(client, flowlabelstore.WithIdleTTL(ttl))
 		require.NoError(t, store.Add(ctx, "s", "pii"))
 		assert.InDelta(t, flowlabelstore.DefaultIdleTTL.Seconds(), mr.TTL("flowlabels:s").Seconds(), 5,
-			"a non-positive idle TTL must fall back to DefaultIdleTTL")
+			"an idle TTL below one second must fall back to DefaultIdleTTL")
 		require.NoError(t, store.Clear(ctx, "s"))
 	}
 }

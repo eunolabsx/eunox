@@ -70,14 +70,15 @@ func redisKey(sessionKey string) string {
 	return "flowlabels:" + sessionKey
 }
 
-// effectiveTTL is the idle TTL to stamp on a key, guarding a non-positive configured
-// value: a zero or negative ttl would make EXPIRE delete the key at once (or error),
-// silently dropping a live session's taint — a fail-open. Falling back to
-// DefaultIdleTTL keeps a misconfigured TTL fail-safe (taint retained for the default
-// bound). Redis EXPIRE has one-second granularity, so any realistic idle timeout is
-// far above the sub-second floor.
+// effectiveTTL is the idle TTL to stamp on a key, guarding any configured value below one
+// second (the floor subsumes non-positive values): a zero/negative ttl would make EXPIRE
+// delete the key at once, and a 0 < ttl < 1s value truncates to Redis EXPIRE's one-second
+// granularity — either way capping a live session's taint far below any real session, a
+// fail-open. Falling back to DefaultIdleTTL keeps a misconfigured TTL fail-safe (taint
+// retained for the default bound). Any realistic idle timeout is far above this one-second
+// floor, so a legitimate config is never clamped.
 func (r *Redis) effectiveTTL() time.Duration {
-	if r.ttl <= 0 {
+	if r.ttl < time.Second {
 		return DefaultIdleTTL
 	}
 	return r.ttl

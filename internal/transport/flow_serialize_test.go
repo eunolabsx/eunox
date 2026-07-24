@@ -316,3 +316,67 @@ func findByID(msgs []mcp.RPCMsg, id string) *mcp.RPCMsg {
 	}
 	return nil
 }
+
+// TestAwaitHostDecisionsDrained_BlocksUntilInFlightZero pins the stdio teardown drain that
+// gates ReleaseSession (docs/flow-label-hardening.md piece B): on the signal/upstream-exit
+// paths serveHost returns WITHOUT waiting for its handler goroutines, so Start must not clear
+// per-session flow state while a sink handler is still mid-decision. The drain blocks on
+// fwdHostInFlight and returns once it reaches zero.
+func TestAwaitHostDecisionsDrained_BlocksUntilInFlightZero(t *testing.T) {
+	t.Parallel()
+	p := &StdioProxy{decideGate: newDecisionSerializer()}
+	p.fwdHostInFlight.Store(1) // a handler dispatched but still mid-decision
+
+	done := make(chan struct{})
+	go func() { p.awaitHostDecisionsDrained(2 * time.Second); close(done) }()
+
+	// It must NOT return while a decision is in flight.
+	select {
+	case <-done:
+		t.Fatal("drain returned while a host decision was still in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Once the handler settles, the drain returns promptly.
+	p.fwdHostInFlight.Store(0)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("drain did not return after in-flight reached zero")
+	}
+}
+
+// TestAwaitHostDecisionsDrained_BoundedByTimeout: a wedged handler (fwdHostInFlight never
+// falls) must not hang teardown — the drain returns after its bounded timeout.
+func TestAwaitHostDecisionsDrained_BoundedByTimeout(t *testing.T) {
+	t.Parallel()
+	p := &StdioProxy{decideGate: newDecisionSerializer()}
+	p.fwdHostInFlight.Store(1) // never drains
+
+	start := time.Now()
+	p.awaitHostDecisionsDrained(80 * time.Millisecond)
+	elapsed := time.Since(start)
+	if elapsed < 60*time.Millisecond {
+		t.Fatalf("drain returned too early (%v); a wedged handler must be waited out to ~the timeout", elapsed)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("drain blocked far past its timeout (%v)", elapsed)
+	}
+}
+
+// TestAwaitHostDecisionsDrained_NoopWhenNoDecideGate: a non-flow session (decideGate nil)
+// has no flow state to protect and ReleaseSession is itself a no-op, so the drain must
+// short-circuit rather than add teardown latency waiting on unrelated in-flight handlers.
+func TestAwaitHostDecisionsDrained_NoopWhenNoDecideGate(t *testing.T) {
+	t.Parallel()
+	p := &StdioProxy{decideGate: nil}
+	p.fwdHostInFlight.Store(5) // would block to the timeout if not short-circuited
+
+	done := make(chan struct{})
+	go func() { p.awaitHostDecisionsDrained(10 * time.Second); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(1 * time.Second):
+		t.Fatal("drain must be a no-op for a non-flow session (decideGate nil)")
+	}
+}

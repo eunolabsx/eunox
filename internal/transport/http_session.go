@@ -1175,6 +1175,18 @@ func releaseSessionState(sess *httpSession) {
 // before they finish could drop a live taint (see releaseSessionState). Bounded and
 // poll-based: teardown is off the hot path, and the wait must never be unbounded on a
 // wedged handler.
+//
+// Residual (bounded, accepted): inFlight is incremented in handleSessionPost only AFTER
+// getSession, the session-security gates, and the request-slot acquire (http_routing.go),
+// so a request in that pre-count window is invisible here and the drain could observe zero
+// and Clear before it runs its decision. The window contains no flow read or write (the
+// PDP Decide, hence any peek/Add, happens after the increment), and it is only reachable
+// while the session is already tearing down (DELETE, idle reap, or upstream exit) — so the
+// worst case is one audit-fidelity false-allow on a session whose forward target is itself
+// going away, never a taint stranded for a live session. Closing it fully would mean
+// counting the request before the gates, entangling this with the idle reaper's inFlight
+// read; not worth that lifecycle risk for a dying-session edge. stdio has no analogue: its
+// counter is bumped in the single-threaded reader before dispatch (StdioProxy.awaitHostDecisionsDrained).
 func (s *httpSession) awaitInFlightDrained(timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for s.inFlight.Load() > 0 {

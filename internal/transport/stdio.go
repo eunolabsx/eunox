@@ -371,18 +371,46 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 	// ── 8. Release this session's per-session enforcement state ─────────────────
 	// Free the session's accumulated flow-label set so an ended session retains nothing
 	// and a reused session id starts clean (docs/flow-label-hardening.md FR-H2). Ordered
-	// LAST, after the upstream drain: on the clean-EOF path serveHost already waited for
-	// every in-flight handler, and on the signal/upstream-exit paths (which do not wait)
-	// draining the upstream first lets in-flight handlers' decisions settle — so a Clear
-	// cannot empty the taint between a source's Add and a sink still deciding on this
-	// session (piece B). Detached, bounded context — teardown must not block on a slow
-	// store, and a Redis store reclaims an orphaned key by idle TTL regardless. A no-op
-	// when the policy uses no flow control.
+	// LAST, and gated behind a bounded drain of in-flight host decisions: on the clean-EOF
+	// path serveHost already waited for every handler, but on the signal/upstream-exit
+	// paths it returns WITHOUT waiting, and draining the upstream reader does NOT cover a
+	// handler still mid-DECISION (a sink peeking the flow set touches no upstream). Without
+	// the drain a Clear could empty the taint between a source's committed Add and a sink
+	// still deciding on this session (piece B). Detached, bounded context — teardown must
+	// not block on a slow store, and a Redis store reclaims an orphaned key by idle TTL
+	// regardless. A no-op when the policy uses no flow control.
+	p.awaitHostDecisionsDrained(time.Duration(p.shutdownMs) * time.Millisecond)
 	releaseCtx, releaseCancel := context.WithTimeout(context.Background(), time.Duration(p.shutdownMs)*time.Millisecond)
 	p.pdp.ReleaseSession(releaseCtx, p.sessionID) //nolint:contextcheck // teardown path: the host is gone; a detached, bounded context is correct here as for the other teardown steps.
 	releaseCancel()
 
 	return nil
+}
+
+// awaitHostDecisionsDrained blocks until no dispatched host request is still mid-decision
+// (fwdHostInFlight == 0), or until timeout elapses, so teardown does not clear per-session
+// flow state out from under a sink still deciding. serveHost returns without waiting for its
+// handler goroutines on the signal and upstream-exit paths, and the upstream drain does not
+// cover a handler still in its PDP decision (which touches no upstream), so releasing flow
+// state before those finish could drop a live taint (docs/flow-label-hardening.md piece B;
+// the stdio analogue of httpSession.awaitInFlightDrained). It is a no-op for a
+// non-flow/non-sequenceBlock session (decideGate nil) — ReleaseSession is itself a no-op
+// there, so there is nothing to protect and no reason to add teardown latency. Bounded and
+// poll-based: teardown is off the hot path and must never hang on a wedged handler. The read
+// loop (the sole fwdHostInFlight increment site) has already exited by the time Start calls
+// this, so the counter only falls — no request can slip in uncounted, unlike the HTTP path's
+// getSession/inFlight window.
+func (p *StdioProxy) awaitHostDecisionsDrained(timeout time.Duration) {
+	if p.decideGate == nil {
+		return
+	}
+	deadline := time.Now().Add(timeout)
+	for p.fwdHostInFlight.Load() > 0 {
+		if !time.Now().Before(deadline) {
+			return
+		}
+		time.Sleep(inFlightDrainPoll)
+	}
 }
 
 // connectUpstream establishes the upstream connection and wires upWriter/upReader:

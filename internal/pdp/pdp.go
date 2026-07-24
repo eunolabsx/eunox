@@ -966,7 +966,9 @@ func targetOperationPhrase(t capability.TargetType) string {
 // When either record fails the corresponding integrity guarantee cannot be upheld, so
 // the call returns a hardDenyResponse CONDITION_FAILED deny — non-downgradable even
 // under audit (see hardDenyResponse), so the read is not forwarded with unreliable
-// state. RecordSessionCall runs first so a fault there commits no labels.
+// state. RecordSourceCall commits the two namespaces atomically — flow labels first,
+// then the seq antecedent, rolling the flow write back on a seq fault (see
+// recordSourceCall) — so a fault in either leaves NEITHER committed.
 //
 // On the downgrade the labels this forwarded read carries in and asserts out are
 // stamped back onto resp (LabelsOut from RecordLabels, CarriedLabels from a pre-write
