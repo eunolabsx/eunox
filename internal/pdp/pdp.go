@@ -899,28 +899,38 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 	// of a named return) keeps which verdicts are downgradable visible in the
 	// control flow, so a future early return added below cannot silently inherit it.
 	stamp := func(r capability.EnforceResponse) capability.EnforceResponse {
-		// Never stamp a hard deny as AuditOnly: it must block even on an audit-only
-		// constraint or a route running under --audit (e.g. antecedent record failure).
-		if matched.IsAuditOnly() && (r.Denial == nil || !r.Denial.HardDeny) {
+		// Never stamp/forward a hard deny: it must block even on an audit-only constraint or
+		// a route running under --audit (e.g. antecedent record failure), so it is never
+		// forwarded and needs no forwarded-response obligations.
+		if r.Denial != nil && r.Denial.HardDeny {
+			return r
+		}
+		// The per-entry audit-only flag is recorded only for a per-constraint audit
+		// constraint, never for the whole-route --audit posture (which the transport reads
+		// from fp.audit, not this flag).
+		if matched.IsAuditOnly() {
 			r.AuditOnly = true
-			// A downgraded (observe-mode) deny is still forwarded to the host, so it
-			// must carry the same redactFields obligations a genuine allow of this
-			// constraint would — the transport applies redaction only from
-			// resp.Obligations, so nil here forwards the upstream response unredacted,
-			// silently dropping the redaction the manifest declared (a condition,
-			// argumentSchema, or action-check failure all reach here without having run
-			// collectObligations). The genuine-allow path collects them in
-			// evaluateMatched; mirror it for the downgraded deny. Fill only when the deny
-			// carries none yet — a flow/record-fault deny already carries them.
-			// CollectObligations returns a HardDeny for an unwired directive type; honor
-			// it (fail closed) rather than forwarding unredacted.
-			if r.Decision == capability.DecisionDeny && r.Obligations == nil {
-				obs, deny := p.engine.CollectObligations(matched, r.RequestID, r.DecidedAt)
-				if deny != nil {
-					return *deny
-				}
-				r.Obligations = obs
+		}
+		// A downgraded (observe-mode) deny is still forwarded to the host, so it must carry
+		// the same redactFields obligations a genuine allow of this constraint would — the
+		// transport applies redaction only from resp.Obligations, so nil here forwards the
+		// upstream response unredacted, silently dropping the redaction the manifest declared
+		// (a condition, argumentSchema, or action-check failure all reach here without having
+		// run collectObligations). Gate on the SAME union the transport downgrades on and
+		// recordAuditModeAntecedent records on — per-constraint audit (IsAuditOnly) OR
+		// whole-route --audit (SkipQuota) — so a whole-route --audit deny is redacted too;
+		// gating on IsAuditOnly alone leaks the declared fields on the standard observe
+		// deployment. The genuine-allow path collects obligations in evaluateMatched; mirror
+		// it for the downgraded deny, filling only when the deny carries none yet (a
+		// flow/record-fault deny already carries them). CollectObligations returns a HardDeny
+		// for an unwired directive type; honor it (fail closed) rather than forwarding
+		// unredacted.
+		if (matched.IsAuditOnly() || enforcement.SkipQuota(ctx)) && r.Decision == capability.DecisionDeny && r.Obligations == nil {
+			obs, deny := p.engine.CollectObligations(matched, r.RequestID, r.DecidedAt)
+			if deny != nil {
+				return *deny
 			}
+			r.Obligations = obs
 		}
 		return r
 	}
@@ -1722,16 +1732,22 @@ type toolListEntry struct {
 	OutputSchema map[string]interface{} `json:"outputSchema,omitempty"`
 }
 
-// entryHasDuplicateTopLevelKeys reports whether a JSON object carries the same top-level
-// key more than once. encoding/json silently keeps the LAST value on a duplicate, so a
-// pinned tools/list entry like {"description":"<INJECT>","description":"<CLEAN>"} hashes
-// to <CLEAN> (matching the pin) while a first-key-wins host renders <INJECT> — a
-// pin-evasion vector. A pinned entry with any duplicate top-level key is therefore failed
-// closed (poisoned), never trusted. Non-object or malformed input reports false: the
-// caller's struct decode handles those on its own fail-closed path. Only top-level keys
-// are inspected — a nested object's duplicate keys are not the surface the pin hashes.
-func entryHasDuplicateTopLevelKeys(raw json.RawMessage) bool {
+// jsonKeyName is the top-level tools/list entry key whose duplication subverts the pinned
+// gate: Go decodes last-wins, so a duplicated "name" lets a first-key-wins host render a
+// different (possibly pinned) tool than the one the proxy routed on.
+const jsonKeyName = "name"
+
+// hasDuplicateTopLevelKey reports whether target appears more than once as a top-level key
+// in raw (a JSON object). encoding/json collapses a duplicate to last-wins, so a duplicated
+// "name" (which pinned-tool routing keys off) or a duplicated "tools" envelope key lets the
+// value the proxy decodes differ from what a first-key-wins host renders. The decoder runs
+// in UseNumber mode so an adversarial float64-overflowing numeric value (e.g. 1e999) is
+// read as a raw token instead of erroring the scan (see jsonHasAnyDuplicateKey). Reports
+// false on a non-object or a value that will not tokenize — the caller's own decode fails
+// those closed.
+func hasDuplicateTopLevelKey(raw json.RawMessage, target string) bool {
 	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
 	tok, err := dec.Token()
 	if err != nil {
 		return false
@@ -1739,7 +1755,7 @@ func entryHasDuplicateTopLevelKeys(raw json.RawMessage) bool {
 	if d, ok := tok.(json.Delim); !ok || d != '{' {
 		return false // not a JSON object
 	}
-	seen := make(map[string]struct{})
+	count := 0
 	for dec.More() {
 		keyTok, err := dec.Token()
 		if err != nil {
@@ -1749,10 +1765,11 @@ func entryHasDuplicateTopLevelKeys(raw json.RawMessage) bool {
 		if !ok {
 			return false
 		}
-		if _, dup := seen[key]; dup {
-			return true
+		if key == target {
+			if count++; count > 1 {
+				return true
+			}
 		}
-		seen[key] = struct{}{}
 		if err := skipJSONValue(dec); err != nil {
 			return false
 		}
@@ -1761,8 +1778,10 @@ func entryHasDuplicateTopLevelKeys(raw json.RawMessage) bool {
 }
 
 // skipJSONValue consumes exactly one JSON value (scalar, object, or array, nesting and
-// all) from dec, so entryHasDuplicateTopLevelKeys can advance past a key's value to the
-// next top-level key without descending into a nested object.
+// all) from dec, so hasDuplicateTopLevelKey can advance past a key's value to the next
+// top-level key without descending into a nested object. The caller sets dec.UseNumber()
+// so a float64-overflowing numeric value is a single json.Number token here rather than a
+// decode error that would abort the scan early.
 func skipJSONValue(dec *json.Decoder) error {
 	tok, err := dec.Token()
 	if err != nil {
@@ -1793,6 +1812,93 @@ func skipJSONValue(dec *json.Decoder) error {
 	return nil
 }
 
+// maxDuplicateKeyScanDepth bounds jsonHasAnyDuplicateKey's recursion so a pathologically
+// nested adversarial entry cannot exhaust the stack; past it the scan fails closed (reports
+// a duplicate), mirroring the ParamDescriptions / redaction depth guards. An honest
+// tools/list entry nests far shallower.
+const maxDuplicateKeyScanDepth = 64
+
+// jsonHasAnyDuplicateKey reports whether raw contains a JSON object with a duplicate key at
+// ANY nesting depth. encoding/json silently keeps the last value on a duplicate, so any
+// duplicate — a top-level "description", or one nested inside an inputSchema / outputSchema /
+// annotations description (all of which ComputeToolHash covers) — lets the value the proxy
+// hashes (last-wins) differ from what a first-key-wins host renders. A pinned entry with any
+// duplicate key is therefore failed closed. The decoder runs in UseNumber mode so an
+// adversarial float64-overflowing numeric value (e.g. 1e999) is read as a raw token instead
+// of erroring the scan: a plain Token() scan errors on such a number and bails early —
+// treating the entry as clean — whereas the struct decode that produced the hashed surface
+// skips that same unknown field unparsed. A malformed or over-deep value fails closed
+// (reports true).
+func jsonHasAnyDuplicateKey(raw json.RawMessage) bool {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	dup, err := scanDuplicateKeys(dec, 0)
+	return dup || err != nil
+}
+
+// scanDuplicateKeys consumes exactly one JSON value from dec and reports whether that value,
+// or anything nested within it, is an object with a duplicate key. depth guards the
+// recursion (see maxDuplicateKeyScanDepth). A token error is returned to the caller, which
+// treats it as fail-closed.
+func scanDuplicateKeys(dec *json.Decoder, depth int) (bool, error) {
+	if depth > maxDuplicateKeyScanDepth {
+		return true, nil // fail closed on a pathologically deep value
+	}
+	tok, err := dec.Token()
+	if err != nil {
+		return false, err
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok {
+		return false, nil // a scalar (string, number, bool, null) has no keys
+	}
+	switch delim {
+	case '{':
+		seen := make(map[string]struct{})
+		for dec.More() {
+			keyTok, err := dec.Token()
+			if err != nil {
+				return false, err
+			}
+			key, ok := keyTok.(string)
+			if !ok {
+				return false, nil
+			}
+			if _, isDup := seen[key]; isDup {
+				return true, nil
+			}
+			seen[key] = struct{}{}
+			dup, err := scanDuplicateKeys(dec, depth+1)
+			if err != nil {
+				return false, err
+			}
+			if dup {
+				return true, nil
+			}
+		}
+		if _, err := dec.Token(); err != nil { // consume the closing '}'
+			return false, err
+		}
+		return false, nil
+	case '[':
+		for dec.More() {
+			dup, err := scanDuplicateKeys(dec, depth+1)
+			if err != nil {
+				return false, err
+			}
+			if dup {
+				return true, nil
+			}
+		}
+		if _, err := dec.Token(); err != nil { // consume the closing ']'
+			return false, err
+		}
+		return false, nil
+	default:
+		return false, nil
+	}
+}
+
 // recordPinnedToolHash records entry's live description hash iff its NAME is pinned by
 // any manifest entry — keyed off pinnedTools, not a selected constraint. A duplicate
 // non-pinned sibling (or a pinned sibling lacking the "call" action) can win
@@ -1805,18 +1911,13 @@ func skipJSONValue(dec *json.Decoder) error {
 // by the enforce-mode filter and the audit-mode RecordObservedToolHashes pass so an
 // audit route records identically to an enforce route.
 //
-// raw is entry's original bytes. A pinned entry carrying duplicate top-level keys is
-// sticky-poisoned instead of hashed: Go's last-key-wins decode (which produced entry)
-// would hash a value a first-key-wins host may render differently, so trusting the hash
-// would let a duplicate-key entry pass the pin while the host sees an injected surface.
-func (p *ManifestPDP) recordPinnedToolHash(raw json.RawMessage, entry toolListEntry) (pinned bool) {
+// The caller MUST have already failed a duplicate-key entry closed (via
+// hasDuplicateTopLevelKey / jsonHasAnyDuplicateKey) BEFORE trusting entry, since the
+// duplicated key may be the name this gate keys off — this function trusts entry.Name.
+func (p *ManifestPDP) recordPinnedToolHash(entry toolListEntry) (pinned bool) {
 	pin, pinned := p.pinnedTools[entry.Name]
 	if !pinned {
 		return false
-	}
-	if entryHasDuplicateTopLevelKeys(raw) {
-		p.markToolPoisoned(entry.Name)
-		return true
 	}
 	p.recordObservedToolHash(entry.Name, entry.Description, entry.Title, entry.Annotations, entry.InputSchema, entry.OutputSchema, pin)
 	return true
@@ -1845,10 +1946,12 @@ type toolListEntryName struct {
 // When any pinned tool exists, this is a security control, not best-effort bookkeeping
 // (per the ListFilterer contract): a tools/list it cannot reduce to a comparable hash for
 // a pinned tool — an undecodable envelope/array, an entry whose name will not decode, an
-// entry that fails the full decode, or one carrying duplicate top-level keys — fails
-// CLOSED by sticky-poisoning the affected pin(s), so the call leg denies rather than
-// leaving the mid-session poisoning pin unarmed. With NO pinned tool there is nothing to
-// protect, so a malformed envelope simply returns 0.
+// entry that fails the full decode, a duplicate "tools" envelope key, or any entry carrying
+// a duplicate key (a duplicate name, a duplicate top-level field, or one nested in a hashed
+// description — an overflowing number cannot shield it) — fails CLOSED by sticky-poisoning
+// the affected pin(s), or every pin when the duplicate is the envelope key or the routing
+// name the proxy then cannot trust. With NO pinned tool there is nothing to protect, so a
+// malformed envelope simply returns 0.
 func (p *ManifestPDP) RecordObservedToolHashes(_ context.Context, result json.RawMessage) int {
 	if len(result) == 0 {
 		return 0
@@ -1874,7 +1977,22 @@ func (p *ManifestPDP) RecordObservedToolHashes(_ context.Context, result json.Ra
 		// fully unmarshaling every entry only to find none pinned.
 		return len(entries)
 	}
+	// Envelope-level duplicate "tools" key: the map decode above kept the last-wins array
+	// while a first-key-wins host renders the other. We cannot know which entries the host
+	// sees, so fail closed for every pin. (Honest upstreams never emit duplicate keys.)
+	if hasDuplicateTopLevelKey(result, listKeyTools) {
+		p.poisonAllPinned()
+		return len(entries)
+	}
 	for _, raw := range entries {
+		// A duplicated top-level "name" key makes the pinned gate below unreliable: Go
+		// decodes last-wins, but a first-wins host may render a DIFFERENT (possibly pinned)
+		// name, so we cannot tell which pinned tool the entry impersonates. Fail closed for
+		// every pin rather than trust the decoded name.
+		if hasDuplicateTopLevelKey(raw, jsonKeyName) {
+			p.poisonAllPinned()
+			continue
+		}
 		var name toolListEntryName
 		if err := json.Unmarshal(raw, &name); err != nil {
 			// Cannot read the entry's name, so cannot tell which pinned tool it is: fail
@@ -1895,23 +2013,60 @@ func (p *ManifestPDP) RecordObservedToolHashes(_ context.Context, result json.Ra
 			p.markToolPoisoned(name.Name)
 			continue
 		}
-		p.recordPinnedToolHash(raw, entry)
+		// A pinned entry carrying a duplicate key ANYWHERE (a top-level description, or one
+		// nested in an inputSchema / outputSchema / annotations description the hash covers)
+		// hashes a last-wins value a first-wins host may render differently: poison the pin.
+		if jsonHasAnyDuplicateKey(raw) {
+			p.markToolPoisoned(name.Name)
+			continue
+		}
+		p.recordPinnedToolHash(entry)
 	}
 	return len(entries)
 }
 
 func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims map[string]interface{}) ListFilterResult {
 	return filterListResult(resultBytes, listKeyTools, func(raw json.RawMessage) (bool, string) {
+		// A duplicated top-level "name" key makes the decode below untrustworthy (Go takes
+		// last-wins; a first-wins host may render a different, possibly pinned, name), so we
+		// cannot tell which pinned tool this entry is. Fail closed for every pin and hide it
+		// rather than echo its raw (dup-key) bytes to the host.
+		if hasDuplicateTopLevelKey(raw, jsonKeyName) {
+			mdp.poisonAllPinned()
+			return false, ""
+		}
 		var entry toolListEntry
 		if err := json.Unmarshal(raw, &entry); err != nil {
+			// Undecodable entry: if its (trustworthy, non-duplicated) name is pinned, poison
+			// that pin so the call leg denies — mirroring the audit-mode
+			// RecordObservedToolHashes path, which the shared recordPinnedToolHash doc says
+			// records identically — then hide it. A name that will not decode at all poisons
+			// every pin. Before the fix this returned without poisoning, leaving the call leg
+			// unarmed on an undecodable poisoned entry in shared-route mode.
+			var nameOnly toolListEntryName
+			if nerr := json.Unmarshal(raw, &nameOnly); nerr != nil {
+				mdp.poisonAllPinned()
+				return false, ""
+			}
+			if _, pinned := mdp.pinnedTools[nameOnly.Name]; pinned {
+				mdp.markToolPoisoned(nameOnly.Name)
+			}
+			return false, ""
+		}
+		// A pinned entry carrying a duplicate key ANYWHERE (a top-level description, or one
+		// nested in an inputSchema / outputSchema / annotations description the hash covers)
+		// hashes a last-wins value a first-wins host may render differently: poison the pin
+		// and hide it, before recording, so the raw dup-key bytes never reach the host.
+		if _, pinned := mdp.pinnedTools[entry.Name]; pinned && jsonHasAnyDuplicateKey(raw) {
+			mdp.markToolPoisoned(entry.Name)
 			return false, ""
 		}
 		c := mdp.findConstraint(EnforceTarget{Type: capability.TargetTypeTool, Name: entry.Name}, claims)
 
 		// Record the live description whenever the tool NAME is pinned (see
-		// recordPinnedToolHash), atomically sticky-marking a mismatch (or a
-		// duplicate-top-level-key entry) as poisoned BEFORE any early return below.
-		pinned := mdp.recordPinnedToolHash(raw, entry)
+		// recordPinnedToolHash), atomically sticky-marking a hash mismatch as poisoned
+		// BEFORE any early return below.
+		pinned := mdp.recordPinnedToolHash(entry)
 
 		// c is nil when the tool is absent from the manifest; guard every dereference
 		// below on it.

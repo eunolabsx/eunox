@@ -1525,13 +1525,17 @@ func validateSequenceBlock(i, j int, v *capability.SequenceBlockCondition) error
 		if strings.Contains(entry, ":") && stripped == entry {
 			return fmt.Errorf("capability at index %d, condition %d, afterTools entry %d: sequenceBlock entry %q is ambiguous: the text before its first ':' is not a recognized namespace prefix (tool:, resource:, prompt:, system:), so the entry is matched literally — a namespace typo like 'mcp:read_file' then silently never fires, and a resource URI must carry the explicit resource: prefix (resource:file:///secrets). Add one of tool:, resource:, prompt:, or system: to disambiguate", i, j, k, entry)
 		}
-		// afterTools is matched LITERALLY against the concrete tool names
-		// recordSessionCall persisted (splitEnginePrefix + an exact-key Peek), never
-		// glob-expanded. A metacharacter therefore never matches a real recorded name, so
-		// a globbed entry like "read_*" silently fails OPEN — a sequenceBlock that looks
-		// armed but never fires. Reject at load, mirroring the target-pattern glob
-		// rejection (validateTargetPatternBreadth).
-		if capability.ContainsGlobMeta(stripped) {
+		// afterTools is matched LITERALLY against the concrete names recordSessionCall
+		// persisted (splitEnginePrefix + an exact-key Peek), never glob-expanded. A
+		// metacharacter therefore never matches a real recorded name, so a globbed entry
+		// like "read_*" silently fails OPEN — a sequenceBlock that looks armed but never
+		// fires. Reject at load, mirroring the target-pattern glob rejection
+		// (validateTargetPatternBreadth). A resource: antecedent is EXEMPT: a resource URI
+		// legitimately contains a glob metacharacter (e.g. '[' in an IPv6 literal host such
+		// as file://[::1]/x), and it too is matched literally, so rejecting it would refuse a
+		// valid antecedent. tool:, prompt:, system:, and bare (tool) names are identifiers
+		// that never legitimately carry one.
+		if !strings.HasPrefix(entry, "resource:") && capability.ContainsGlobMeta(stripped) {
 			return fmt.Errorf("capability at index %d, condition %d, afterTools entry %d: sequenceBlock entry %q contains glob metacharacters (%s); afterTools is matched literally against recorded tool names, so a glob never fires and the block silently fails open — name the exact tool(s) instead", i, j, k, entry, capability.GlobMetaChars)
 		}
 	}

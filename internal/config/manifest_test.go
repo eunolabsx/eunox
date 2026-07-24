@@ -1010,6 +1010,30 @@ capabilities:
 	}
 }
 
+// TestLoadManifest_SequenceBlock_AllowsResourceURIWithGlobMeta pins that the afterTools
+// glob rejection does NOT apply to a resource: antecedent: a resource URI legitimately
+// contains a glob metacharacter (e.g. '[' in an IPv6 literal host, or '?' in a query
+// string), is matched literally at runtime, and must load. tool:/prompt:/system:/bare
+// identifiers still reject a metacharacter (see RejectsGlobAfterTools).
+func TestLoadManifest_SequenceBlock_AllowsResourceURIWithGlobMeta(t *testing.T) {
+	for _, uri := range []string{"resource:file://[::1]/secret", "resource:https://h/p?a=1"} {
+		yaml := `
+name: "seq-resource-uri"
+version: "0.1.0"
+capabilities:
+  - target: "tool:write_external"
+    actions: [call]
+    conditions:
+      - type: sequenceBlock
+        afterTools: ["` + uri + `"]
+`
+		path := writeManifestFile(t, yaml)
+		if _, err := LoadManifest(path); err != nil {
+			t.Fatalf("LoadManifest rejected a valid resource: antecedent %q (matched literally at runtime), want acceptance: %v", uri, err)
+		}
+	}
+}
+
 func TestLoadManifest_SequenceBlock_RejectsEntryThatStripsToEmpty(t *testing.T) {
 	// An entry that carries a recognized prefix but no name (e.g. "tool:"), or is
 	// empty outright, strips to "" and can never match session history — an

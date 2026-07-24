@@ -1560,10 +1560,15 @@ before in the session.
   `system:` are recognized. This is deliberately strict: a resource antecedent
   must use the explicit `resource:` prefix, since a bare URI is indistinguishable
   from a prefix typo at load time. Finally, because an entry is matched
-  **literally** against the concrete tool names recorded in session history, a
-  **glob metacharacter** (`*`, `?`, `[`, `\`) anywhere in an entry is rejected at
-  load: a pattern like `read_*` would never match a recorded name, so the block
-  would look armed yet silently fail open — name the exact tool(s) instead.
+  **literally** against the concrete names recorded in session history, a
+  **glob metacharacter** (`*`, `?`, `[`, `\`) in a `tool:`, `prompt:`, `system:`,
+  or bare (tool) entry is rejected at load: those names are identifiers, so a
+  pattern like `read_*` would never match a recorded name and the block would
+  look armed yet silently fail open — name the exact tool(s) instead. A
+  `resource:` antecedent is **exempt**, because a resource URI legitimately
+  contains such characters (e.g. `[` in an IPv6 literal host,
+  `resource:file://[::1]/x`, or `?` in a query string); it too is matched
+  literally, so name the exact resource.
 - The rule is **directional**: with the policy above, `read_credentials` →
   `write_external` is blocked, but `write_external` → `read_credentials` is
   allowed (nothing read credentials before the write).
