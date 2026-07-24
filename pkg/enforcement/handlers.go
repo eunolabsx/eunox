@@ -1500,17 +1500,11 @@ func parseTableArgument(v interface{}) ([]capability.TableAccess, error) {
 
 // asCondition returns cond as *T, accepting either a *T or a value T, since a
 // manifest condition may decode into either form. Returns (nil, false) otherwise.
+// It delegates to capability.AsValueOrPointer — the single value-or-pointer
+// normalizer, shared with the directive-side predicates — so the type-switch
+// pattern lives in exactly one place instead of a bespoke copy per concrete type.
 func asCondition[T any](cond capability.Condition) (*T, bool) {
-	// Switch on any(cond): a direct cond.(*T) is rejected because *T is not provably
-	// a capability.Condition, but a type switch over an empty interface accepts both.
-	switch t := any(cond).(type) {
-	case *T:
-		return t, true
-	case T:
-		return &t, true
-	default:
-		return nil, false
-	}
+	return capability.AsValueOrPointer[T](cond)
 }
 
 // castCondition casts cond to *T (via asCondition) and, on a type mismatch,

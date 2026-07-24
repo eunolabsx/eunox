@@ -66,6 +66,37 @@ func IsFlowLabel(s string) bool {
 	return flowLabelSet[s]
 }
 
+// AsValueOrPointer normalizes a polymorphic value that may be stored as either T or
+// *T (as manifest conditions and directives are, depending on decode path) to *T. It
+// is the single value-or-pointer normalizer, so the type-switch pattern is not
+// re-copied per concrete type. Returns (nil, false) when v is neither T nor *T; a
+// typed-nil *T is returned as-is (nil-safe — no dereference).
+func AsValueOrPointer[T any](v any) (*T, bool) {
+	switch t := v.(type) {
+	case *T:
+		return t, true
+	case T:
+		return &t, true
+	default:
+		return nil, false
+	}
+}
+
+// IsFlowLabelCondition reports whether c is a flowLabel condition (value or pointer
+// form). Single-sourced so the engine's flow-relevance check and the config-level
+// multi-instance advisory cannot drift on what counts as flow. Nil-safe.
+func IsFlowLabelCondition(c Condition) bool {
+	_, ok := AsValueOrPointer[FlowLabelCondition](c)
+	return ok
+}
+
+// IsLabelOutputDirective reports whether d is a labelOutput directive (value or
+// pointer form). Single-sourced alongside IsFlowLabelCondition. Nil-safe.
+func IsLabelOutputDirective(d Directive) bool {
+	_, ok := AsValueOrPointer[LabelOutputDirective](d)
+	return ok
+}
+
 // FlowLabelCondition denies a call when the session's accumulated flow labels are
 // not a subset of Allow — i.e. when any source class that flowed into this session
 // is not permitted at this sink. It is the sink half of the source->sink invariant:

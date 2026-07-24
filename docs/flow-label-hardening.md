@@ -1,12 +1,13 @@
 # Flow-label session state — concurrency and lifetime hardening
 
-**Status:** design / requirements; not yet implemented. Captures the two known
+**Status:** design / requirements; not yet implemented. Captures the known
 limitations of the information-flow-control feature (the `flowLabel` condition and the
 `labelOutput` directive) that the initial implementation documented but did not close,
-and specifies how to close them. Both stem from one root cause: flow-label state is
+and specifies how to close them. D1 and D2 stem from one root cause: flow-label state is
 stored in the `CallCounter` sliding-window seam, whose consistency and lifetime
 semantics do not match monotonic, per-session provenance, and enforcement is not
-serialized per session.
+serialized per session. D3 is a separate atomicity gap in how a single allowed call
+commits state across two counter namespaces.
 
 Companions: the `handleFlowLabel` / `recordLabels` doc comments in
 `pkg/enforcement/flowlabel.go` (where the limitations are noted today), the flow-exfil
@@ -32,7 +33,7 @@ that are acceptable for `sequenceBlock` but not for a security-grade flow contro
 `FlowLabelCondition` doc says *"for all flows, a class outside Allow never reaches this
 sink"* — so it must hold under an adversarial client and an arbitrarily long session.
 
-## The two defects
+## The defects
 
 ### D1 — Taint lifetime is a wall-clock window, not the session
 
@@ -81,7 +82,36 @@ So D2 is primarily a determinism + invariant-integrity defect, not a guaranteed
 data-exfil — fix it for correctness and robustness, and weight it accordingly against
 other work.
 
-### Shared root cause
+### D3 — Cross-namespace state commit is not atomic
+
+A single allowed call whose constraint carries **both** a `labelOutput` directive and a
+`sequenceBlock`-relevant marker writes two independent counter keys in disjoint namespaces:
+`recordSessionCall` writes the `seq:` antecedent and `recordLabels` writes the `flow:`
+markers. The engine writes them sequentially (`recordSessionCall` first, then
+`recordLabels`), and a backend fault between the two commits leaves the call half-recorded:
+
+- the `seq:` marker is committed, but
+- `recordLabels` then hard-denies (`labelRecordFailureDenial`), so the call is **never
+  forwarded** — yet a later `sequenceBlock` naming this tool `Peek`s the committed `seq:`
+  marker and treats the never-run call as an antecedent (a *phantom antecedent*).
+
+The ordering is a deliberate tradeoff, not a fix: `recordSessionCall` runs first so the
+symmetric fault (label committed, then the seq write faults) cannot taint the session for a
+denied call. Whichever write goes first, the other's fault strands the first write. The
+residual is **fail-closed in both directions** — a phantom `seq:` antecedent over-blocks a
+later `sequenceBlock`; a stranded `flow:` label over-blocks a later sink — so it can only
+*deny* a future call, never leak. It requires a policy that uses both features on one
+constraint *and* a transient backend fault between the two writes, so it is narrow. But a
+blip corrupts subsequent enforcement for the session until the markers age out.
+
+**Threat bound:** very low likelihood, no exfil. Fail-closed over-blocking on a both-features
+policy under a backend fault. Correctness/robustness, not a leak.
+
+**Root cause:** the two writes are not a single atomic commit. This is independent of the
+`CallCounter` lifetime/ordering mismatch behind D1/D2 — even a session-lifetime store (A
+below) split across a `seq:` and a `flow:` structure has it unless the two commit together.
+
+### Shared root cause (D1/D2)
 
 Provenance is a **monotonic, per-session** fact with a **session-scoped lifetime** and a
 **required happens-before** (source-write before any subsequent sink-read on the session).
@@ -130,6 +160,14 @@ the counter.
   configured (`AnyRouteHasFlowLabel` already wires this).
   **AC:** the concurrency and lifetime tests pass against the Redis (miniredis) backend,
   not only in-memory.
+- **FR-H5 — Atomic cross-namespace commit (closes D3).** A single allowed call's `seq:`
+  antecedent and `flow:` labels commit together or not at all, so a backend fault cannot
+  leave a phantom antecedent (or a stranded label) for a call that was hard-denied and
+  never forwarded.
+  **AC:** a fault injected between the two writes leaves *neither* committed (assertable on
+  the in-memory and miniredis backends); a later `sequenceBlock` / `flowLabel` sees clean
+  state. Independent of FR-H1/H3 — holds even with the session-lifetime store, since a store
+  split across two structures still needs the two writes to commit atomically.
 
 ## Design
 
@@ -192,6 +230,28 @@ decision parallelism.
   across I/O, so it cannot deadlock with the upstream call or the audit drainer. Document
   the ordering discipline next to the lock.
 
+### C. Atomic cross-namespace commit (closes D3, FR-H5)
+
+Make an allowed call's `seq:` antecedent and `flow:` label writes a single all-or-nothing
+commit so a fault between them cannot half-record the call. Options, cheapest first:
+
+- **Order + compensate (interim):** keep the current write order but, if the second write
+  faults, best-effort roll back the first (delete the just-written `seq:` marker) before
+  returning the hard deny. Simple, no new backend contract, but the rollback delete can
+  itself fault — narrows the window, does not close it.
+- **Single multi-key write (target):** commit both namespaces in one backend operation — a
+  Redis `MULTI`/pipeline (or a Lua script) writing both keys, and an in-memory backend that
+  takes both writes under one lock. This requires a small `CallCounter` (or the new
+  `FlowLabelStore`) method that accepts the antecedent and the labels together, replacing the
+  two sequential `IncrementAndGet` calls in `evaluateMatched`. It composes with B: the
+  per-session lock already serializes the decision, so the combined write has no concurrent
+  writer to race.
+
+Prefer the single multi-key write once B lands (B removes the concurrency that would
+otherwise complicate a compensating rollback). Until then the ordering (`recordSessionCall`
+before `recordLabels`) keeps the residual fail-closed, as documented at the `evaluateMatched`
+call site.
+
 ### Interaction with the existing fail-closed paths
 
 The store and the lock must preserve the current fail-closed behavior: a store error on
@@ -208,6 +268,9 @@ routes through the same store.
 2. **A (store) next** — the larger change (new seam + two backends + lifecycle wiring),
    closing the lifetime gap and retiring the window. The interim refresh-on-activity
    alternative can bridge if A is deferred.
+3. **C (atomic commit) with or after B** — small once B removes the concurrent writer; the
+   single multi-key write is the target, the compensating rollback an interim. Only matters
+   for a policy combining `labelOutput` and `sequenceBlock`, so it can trail A/B.
 
 Land each behind the existing flow-relevance gate so non-flow policies are unaffected, and
 add both to the demo/CI matrix (a concurrency stress target alongside `ci-test-flow`, run
@@ -240,7 +303,8 @@ against both counter backends).
   state self-reclaims after the idle timeout rather than persisting for a fixed 30 days.
 - **sequenceBlock.** It has the identical D2 race (documented, accepted). B could cover it
   too for consistency; decide explicitly rather than let flow and sequenceBlock diverge on
-  whether the race is closed.
+  whether the race is closed. D3 (C) is likewise a both-features concern — a policy mixing
+  `labelOutput` and `sequenceBlock` — so scope C's atomic write to that combination.
 
 ## Open questions
 

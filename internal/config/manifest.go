@@ -904,41 +904,32 @@ func validateLocalManifest(m *LocalManifest) error {
 			if rv := reflect.ValueOf(dir); rv.Kind() == reflect.Pointer && rv.IsNil() {
 				return fmt.Errorf("capability at index %d, directive %d: a typed-nil directive is not permitted; every directives entry must be a typed directive object", i, j)
 			}
-			switch d := dir.(type) {
-			case *capability.RedactFieldsDirective:
+			// Each case pairs a directive's value and pointer decode forms and
+			// re-normalizes to a pointer via AsValueOrPointer: the case types make that
+			// assertion infallible and the typed-nil guard above makes the deref safe, so
+			// the two logical directives need two arms, not four. An unrecognized directive
+			// type hits the fail-closed default — the YAML/JSON loader only produces the two
+			// known types (and rejects unknowns at decode), so this is defense in depth
+			// against a programmatically built manifest, not a manifest-author hole.
+			switch dir.(type) {
+			case capability.RedactFieldsDirective, *capability.RedactFieldsDirective:
+				d, _ := capability.AsValueOrPointer[capability.RedactFieldsDirective](dir)
 				if err := requireResponseDirectiveTarget(i, c.Target, targetType); err != nil {
 					return err
 				}
 				if err := validateRedactFields(i, j, d.Fields); err != nil {
 					return err
 				}
-			case capability.RedactFieldsDirective:
-				if err := requireResponseDirectiveTarget(i, c.Target, targetType); err != nil {
-					return err
-				}
-				if err := validateRedactFields(i, j, d.Fields); err != nil {
-					return err
-				}
-			case *capability.LabelOutputDirective:
-				if err := requireFlowEffectDraft(m, "the labelOutput directive", i); err != nil {
-					return err
-				}
+			case capability.LabelOutputDirective, *capability.LabelOutputDirective:
+				d, _ := capability.AsValueOrPointer[capability.LabelOutputDirective](dir)
 				if err := requireSourceDirectiveTarget(i, c.Target, targetType); err != nil {
 					return err
 				}
 				if err := validateLabelOutput(i, j, d.Labels); err != nil {
 					return err
 				}
-			case capability.LabelOutputDirective:
-				if err := requireFlowEffectDraft(m, "the labelOutput directive", i); err != nil {
-					return err
-				}
-				if err := requireSourceDirectiveTarget(i, c.Target, targetType); err != nil {
-					return err
-				}
-				if err := validateLabelOutput(i, j, d.Labels); err != nil {
-					return err
-				}
+			default:
+				return fmt.Errorf("capability at index %d, directive %d: unrecognized directive type %q; the only supported directives are redactFields and labelOutput", i, j, dir.DirectiveType())
 			}
 		}
 		// Reject two maxCalls sharing a windowSeconds before the per-condition pass,
@@ -956,6 +947,13 @@ func validateLocalManifest(m *LocalManifest) error {
 			// a whole-proxy DoS from one route manifest. Reject it at load, fail closed.
 			if cond == nil {
 				return fmt.Errorf("capability at index %d, condition %d: a null condition is not permitted; every conditions entry must be a typed condition object", i, j)
+			}
+			// A typed-nil pointer (e.g. (*FlowLabelCondition)(nil)) is a non-nil interface,
+			// so it survives the cond==nil check above but would panic when a *Condition case
+			// below dereferences v (e.g. v.Allow). Reject it fail-closed, mirroring the
+			// directive loop's typed-nil guard.
+			if rv := reflect.ValueOf(cond); rv.Kind() == reflect.Pointer && rv.IsNil() {
+				return fmt.Errorf("capability at index %d, condition %d: a typed-nil condition is not permitted; every conditions entry must be a typed condition object", i, j)
 			}
 			switch v := cond.(type) {
 			case capability.AllowedOperationsCondition:
@@ -1046,21 +1044,23 @@ func validateLocalManifest(m *LocalManifest) error {
 					return err
 				}
 			case capability.FlowLabelCondition:
-				if err := requireFlowEffectDraft(m, "the flowLabel condition", i); err != nil {
-					return err
-				}
 				if err := validateFlowLabel(i, j, v.Allow); err != nil {
 					return err
 				}
 			case *capability.FlowLabelCondition:
-				if err := requireFlowEffectDraft(m, "the flowLabel condition", i); err != nil {
-					return err
-				}
 				if err := validateFlowLabel(i, j, v.Allow); err != nil {
 					return err
 				}
 			}
 		}
+	}
+	// Single authoritative staging gate: reject any DRAFT-staged token the declared
+	// schemaVersion does not admit. Runs after the per-capability loop (so every
+	// condition/directive is non-nil and well-typed) rather than at each token's
+	// validation case, so a future staged token cannot slip under the published grammar
+	// by omitting a per-case gate.
+	if err := checkExperimentalTokenStaging(m); err != nil {
+		return err
 	}
 	return nil
 }
@@ -1529,17 +1529,51 @@ func validateSequenceBlock(i, j int, v *capability.SequenceBlockCondition) error
 	return nil
 }
 
-// requireFlowEffectDraft fails closed unless the manifest opts into the experimental
-// flow+effect draft grammar. The flowLabel condition and labelOutput directive are
-// staged behind schema-version negotiation: valid only under the draft revision, so a
-// published "0.1" manifest that uses one is rejected (the closed grammar stays closed)
-// rather than silently enabling an experimental predicate. The SchemaVersion is
-// compared trimmed so a quoted, whitespace-padded scalar is judged on its real value.
-func requireFlowEffectDraft(m *LocalManifest, feature string, i int) error {
-	if strings.TrimSpace(m.SchemaVersion) != ManifestSchemaVersionFlowEffectDraft {
-		return fmt.Errorf("capability at index %d: %s is experimental and requires schemaVersion %q (the flow+effect draft); this manifest declares schemaVersion %q, under which the token is not part of the grammar", i, feature, ManifestSchemaVersionFlowEffectDraft, strings.TrimSpace(m.SchemaVersion))
+// experimentalTokenVersions maps a DRAFT-staged condition/directive discriminator to the
+// manifest schemaVersion that admits it. A token absent from this map is part of the base
+// published grammar and needs no gate. It is the single source of the staging invariant:
+// a staged token is inert unless the manifest declares its introducing draft version, so
+// adding a future staged token is one map entry — not a gate call threaded through each
+// per-type validation case, which a contributor could forget, silently admitting the token
+// under the published grammar (the fail-open this gate exists to prevent). A draft token
+// requires its EXACT introducing version: a draft is a staging vehicle removed once it
+// folds into a batched grammar bump, so no later version inherits it through this map.
+var experimentalTokenVersions = map[string]string{
+	capability.ConditionTypeFlowLabel:   ManifestSchemaVersionFlowEffectDraft,
+	capability.DirectiveTypeLabelOutput: ManifestSchemaVersionFlowEffectDraft,
+}
+
+// checkExperimentalTokenStaging fails closed if any capability carries a DRAFT-staged token
+// (per experimentalTokenVersions) the declared schemaVersion does not admit — so a published
+// "0.1" manifest that uses one is rejected (the closed grammar stays closed) rather than
+// silently enabling an experimental predicate. It is the one authoritative staging gate: the
+// per-type validation cases carry no version check, so a new staged token cannot bypass the
+// gate by omitting one. It runs after the per-capability structural validation, so every
+// condition/directive is non-nil and well-typed and ConditionType()/DirectiveType() cannot
+// panic on a null or typed-nil entry. SchemaVersion is compared trimmed so a quoted,
+// whitespace-padded scalar is judged on its real value.
+func checkExperimentalTokenStaging(m *LocalManifest) error {
+	declared := strings.TrimSpace(m.SchemaVersion)
+	for i := range m.Capabilities {
+		c := &m.Capabilities[i]
+		for _, cond := range c.Conditions {
+			if req, staged := experimentalTokenVersions[cond.ConditionType()]; staged && declared != req {
+				return experimentalTokenStagingErr(i, "the "+cond.ConditionType()+" condition", req, declared)
+			}
+		}
+		for _, dir := range c.Directives {
+			if req, staged := experimentalTokenVersions[dir.DirectiveType()]; staged && declared != req {
+				return experimentalTokenStagingErr(i, "the "+dir.DirectiveType()+" directive", req, declared)
+			}
+		}
 	}
 	return nil
+}
+
+// experimentalTokenStagingErr builds the fail-closed rejection for a staged token used
+// under a schemaVersion that does not admit it.
+func experimentalTokenStagingErr(i int, feature, required, declared string) error {
+	return fmt.Errorf("capability at index %d: %s is experimental and requires schemaVersion %q (the flow+effect draft); this manifest declares schemaVersion %q, under which the token is not part of the grammar", i, feature, required, declared)
 }
 
 // requireResponseDirectiveTarget rejects a response-mutating directive (redactFields)

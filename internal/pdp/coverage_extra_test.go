@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/eunolabs/eunox/pkg/callcounter"
 	"github.com/eunolabs/eunox/pkg/capability"
 	"github.com/eunolabs/eunox/pkg/enforcement"
 	"github.com/eunolabs/eunox/pkg/killswitch"
@@ -329,24 +330,64 @@ func TestRecordAuditModeAntecedent_RecordsOnlyOnAuditDeny(t *testing.T) {
 
 	// No-op: an enforced (not audit-only) deny — the tool never ran.
 	recordAuditModeAntecedent(context.Background(), engine, nil, req, enforced,
-		capability.EnforceResponse{Decision: capability.DecisionDeny})
+		&capability.EnforceResponse{Decision: capability.DecisionDeny})
 	// No-op: audit-only but an allow — already recorded inside the engine.
 	recordAuditModeAntecedent(context.Background(), engine, nil, req, auditOnly,
-		capability.EnforceResponse{Decision: capability.DecisionAllow})
+		&capability.EnforceResponse{Decision: capability.DecisionAllow})
 	require.Equal(t, 0, counter.writes, "no antecedent must be recorded on the no-op paths")
 
 	// Recording path: an audit-mode deny still forwards and runs the tool, so the
 	// antecedent must be recorded for a later sequenceBlock Peek.
 	recordAuditModeAntecedent(context.Background(), engine, nil, req, auditOnly,
-		capability.EnforceResponse{Decision: capability.DecisionDeny})
+		&capability.EnforceResponse{Decision: capability.DecisionDeny})
 	require.Equal(t, 1, counter.writes, "an audit-mode deny must record exactly one antecedent")
 
 	// No-op: an audit-mode deny that is HARD (HardDeny) is NOT downgraded — the tool
 	// never runs — so recording it would poison history with a phantom antecedent a
 	// later sequenceBlock reads as "ran", spuriously blocking a downstream call.
 	recordAuditModeAntecedent(context.Background(), engine, nil, req, auditOnly,
-		capability.EnforceResponse{Decision: capability.DecisionDeny, Denial: &capability.DenialInfo{HardDeny: true}})
+		&capability.EnforceResponse{Decision: capability.DecisionDeny, Denial: &capability.DenialInfo{HardDeny: true}})
 	require.Equal(t, 1, counter.writes, "a HardDeny audit-mode deny must NOT record an antecedent (the tool never ran)")
+}
+
+// TestRecordAuditModeAntecedent_BackfillsFlowLabels asserts the audit-mode downgrade
+// stamps the forwarded observe record with the same flow it produced: labels_out from
+// the labelOutput this source asserts, and carried_labels from what had flowed into the
+// session before it. A structural early-return deny (evaluateMatched never ran, so
+// CarriedLabels arrives nil) is the path that would otherwise log empty labels though the
+// tool runs and the data is produced — the gap this back-fill closes.
+func TestRecordAuditModeAntecedent_BackfillsFlowLabels(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	counter := callcounter.NewInMemory()
+	engine := enforcement.New(enforcement.WithCallCounter(counter))
+
+	// Pre-taint the session: an earlier source read asserted "internal".
+	prior := &capability.Constraint{
+		Target:     "tool:a",
+		Actions:    []string{"call"},
+		Directives: []capability.Directive{capability.LabelOutputDirective{Labels: []string{capability.FlowLabelInternal}}},
+	}
+	_, err := engine.RecordLabels(ctx, &capability.EnforceRequest{SessionID: "s", ToolName: "a"}, prior)
+	require.NoError(t, err)
+
+	// An audit-only source read that labels its output "confidential", hitting a
+	// downgradable deny with no labels stamped yet (the structural early-return shape).
+	src := &capability.Constraint{
+		Target:      "tool:t",
+		Actions:     []string{"call"},
+		Enforcement: capability.EnforcementAudit,
+		Directives:  []capability.Directive{capability.LabelOutputDirective{Labels: []string{capability.FlowLabelConfidential}}},
+	}
+	req := &capability.EnforceRequest{SessionID: "s", ToolName: "t"}
+	resp := &capability.EnforceResponse{Decision: capability.DecisionDeny}
+	override := recordAuditModeAntecedent(ctx, engine, engine.Clock(), req, src, resp)
+
+	require.Nil(t, override, "a clean record must not override the downgrade")
+	assert.Equal(t, []string{capability.FlowLabelConfidential}, resp.LabelsOut,
+		"labels_out must reflect the labels this forwarded read asserts")
+	assert.Equal(t, []string{capability.FlowLabelInternal}, resp.CarriedLabels,
+		"carried_labels must reflect what flowed into the session before this read")
 }
 
 // targetOperationPhrase covers the system target (default bare-type branch) too.

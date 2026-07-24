@@ -472,6 +472,13 @@ func LoadUpstreamPDP(u *config.UpstreamConfig, hostTransport, baseDir string, co
 		// fault).
 		engineOpts = append(engineOpts, enforcement.WithoutAntecedentRecording())
 	}
+	if !merged.HasFlowLabel() {
+		// No flowLabel condition or labelOutput directive anywhere in the policy: the
+		// per-call flow-relevance scan and the peek/record path are pure overhead, and
+		// skipping them also drops the recordLabels fail-closed deny path a source-only
+		// policy would otherwise carry. Mirrors the WithoutAntecedentRecording gate above.
+		engineOpts = append(engineOpts, enforcement.WithoutFlowLabels())
+	}
 	engine := enforcement.New(engineOpts...)
 	digest, err := merged.Digest()
 	if err != nil {

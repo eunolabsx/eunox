@@ -841,7 +841,7 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 	if !containsAction(matched.Actions, required) {
 		resp := denyResponse(p.engineClock(), capability.ErrCodeCapabilityDenied, "",
 			fmt.Sprintf("constraint %q does not permit %s (actions must include %q or '*'; got: %s)", matched.Target, targetOperationPhrase(target.Type), required, strings.Join(matched.Actions, ", ")))
-		if override := recordAuditModeAntecedent(ctx, p.engine, p.engineClock(), req, matched, resp); override != nil {
+		if override := recordAuditModeAntecedent(ctx, p.engine, p.engineClock(), req, matched, &resp); override != nil {
 			return *override
 		}
 		return stamp(resp)
@@ -854,7 +854,7 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 	if matched.ArgumentSchema != nil && schema == validateSchema {
 		if err := enforcement.ValidateArgumentSchema(args, matched.ArgumentSchema); err != nil {
 			resp := denyResponse(p.engineClock(), capability.ErrCodeInvalidParams, "argumentSchema", err.Error())
-			if override := recordAuditModeAntecedent(ctx, p.engine, p.engineClock(), req, matched, resp); override != nil {
+			if override := recordAuditModeAntecedent(ctx, p.engine, p.engineClock(), req, matched, &resp); override != nil {
 				return *override
 			}
 			return stamp(resp)
@@ -873,7 +873,7 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 // channel to branch on here — a deny is always a structured EnforceResponse.
 func (p *ManifestPDP) evaluateAndRecord(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint) capability.EnforceResponse {
 	resp := p.engine.EvaluateConditions(ctx, req, matched)
-	if override := recordAuditModeAntecedent(ctx, p.engine, p.engineClock(), req, matched, resp); override != nil {
+	if override := recordAuditModeAntecedent(ctx, p.engine, p.engineClock(), req, matched, &resp); override != nil {
 		return *override
 	}
 	return resp
@@ -911,19 +911,44 @@ func targetOperationPhrase(t capability.TargetType) string {
 // under audit (see hardDenyResponse), so the read is not forwarded with unreliable
 // state. RecordSessionCall runs first so a fault there commits no labels.
 //
+// On the downgrade the labels this forwarded read carries in and asserts out are
+// stamped back onto resp (LabelsOut from RecordLabels, CarriedLabels from a pre-write
+// Peek) so the audit record of the forwarded observe-allow reflects the same flow the
+// genuine-allow path records inside EvaluateConditions — otherwise an audit-mode source
+// read would log with empty labels though it produced labeled data. The structural
+// early-return denies (action mismatch, INVALID_PARAMS) never ran conditions, so resp
+// arrives with CarriedLabels nil; a flow-relevant condition deny arrives already
+// stamped by evaluateMatched, so the Peek is skipped to avoid a redundant read. The
+// back-fill mutates resp through the pointer, so callers see the stamped labels.
+//
 // clock is p.engineClock() at every call site so the frozen test clock is honored
 // and a nil engine never reaches engine.Clock() directly.
-func recordAuditModeAntecedent(ctx context.Context, engine *enforcement.Engine, clock enforcement.Clock, req *capability.EnforceRequest, matched *capability.Constraint, resp capability.EnforceResponse) *capability.EnforceResponse {
+func recordAuditModeAntecedent(ctx context.Context, engine *enforcement.Engine, clock enforcement.Clock, req *capability.EnforceRequest, matched *capability.Constraint, resp *capability.EnforceResponse) *capability.EnforceResponse {
 	if matched.IsAuditOnly() && resp.Decision == capability.DecisionDeny && (resp.Denial == nil || !resp.Denial.HardDeny) {
+		// Capture the carried set before any write, and only when the deny did not
+		// already stamp it (a condition deny routed through evaluateMatched has). The
+		// Peek is audit reflection, not a decision, so its error is not fail-closed —
+		// the enforcement verdict is already settled.
+		var incoming []string
+		if resp.CarriedLabels == nil {
+			incoming, _ = engine.PeekSessionLabels(ctx, req)
+		}
 		if err := engine.RecordSessionCall(ctx, req); err != nil {
 			deny := hardDenyResponse(clock, capability.ErrCodeConditionFailed,
 				"audit-mode antecedent record failed: "+err.Error())
 			return &deny
 		}
-		if err := engine.RecordLabels(ctx, req, matched); err != nil {
+		labels, err := engine.RecordLabels(ctx, req, matched)
+		if err != nil {
 			deny := hardDenyResponse(clock, capability.ErrCodeConditionFailed,
 				"audit-mode flow-label record failed: "+err.Error())
 			return &deny
+		}
+		if len(labels) > 0 {
+			resp.LabelsOut = labels
+		}
+		if resp.CarriedLabels == nil {
+			resp.CarriedLabels = incoming
 		}
 	}
 	return nil
