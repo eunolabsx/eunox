@@ -357,6 +357,183 @@ func TestCommitDeferredAtomic_NilDenyCallbackFailsClosed(t *testing.T) {
 	}
 }
 
+// nilCounterCommitHandler is a custom CommittingConditionHandler whose
+// PrepareCommit returns a complete DeferredCommit WITHOUT consulting the engine's
+// call counter — unlike the built-in maxCallsBucket, which fails closed on a nil
+// counter before commitDeferredAtomic ever reaches the backend. It models a library
+// consumer that registers a committing handler on an engine built without
+// WithCallCounter, so the atomic multi-deferred commit path reaches its backend call
+// with e.counter still nil.
+type nilCounterCommitHandler struct{ e *Engine }
+
+func (h *nilCounterCommitHandler) Handle(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) *ConditionError {
+	return h.e.handleMaxCalls(ctx, cond, req)
+}
+
+func (h *nilCounterCommitHandler) PrepareCommit(_ context.Context, cond capability.Condition, _ *capability.EnforceRequest) (DeferredCommit, bool, *ConditionError) {
+	mc, condErr := castCondition[capability.MaxCallsCondition](cond)
+	if condErr != nil {
+		return DeferredCommit{}, false, condErr
+	}
+	return DeferredCommit{
+		Key:        "nil-counter-bucket",
+		WindowSecs: mc.WindowSeconds,
+		Limit:      int64(mc.Count),
+		Deny: func(int64, time.Duration) *ConditionError {
+			return &ConditionError{Code: capability.ErrCodeConditionFailed, ConditionType: capability.ConditionTypeMaxCalls, Message: "over limit"}
+		},
+	}, false, nil
+}
+
+// TestCommitDeferredAtomic_NilCounterFailsClosed pins that the atomic
+// multi-deferred commit path fails closed with a structured CONDITION_FAILED deny —
+// not a nil-pointer panic on e.counter.IncrementIfAllBelow — when a custom
+// committing handler is registered on an engine built without WithCallCounter. The
+// built-in maxCalls funnels through maxCallsBucket (whose nil guard surfaces earlier
+// as a PrepareCommit condErr), so a custom handler that skips that guard is the only
+// way this backend call is reached with a nil counter.
+func TestCommitDeferredAtomic_NilCounterFailsClosed(t *testing.T) {
+	handler := &nilCounterCommitHandler{}
+	// NB: no WithCallCounter — e.counter stays nil.
+	e := New(WithConditionHandler(capability.ConditionTypeMaxCalls, handler))
+	handler.e = e
+
+	req := &capability.EnforceRequest{SessionID: "sess-1", ToolName: "tool"}
+	caps := []capability.Constraint{{
+		Target:  "tool",
+		Actions: []string{"*"},
+		// Two committing conditions with DISTINCT windows force the multi-deferred
+		// atomic-commit path (commitDeferredAtomic) rather than the single-condition leg.
+		Conditions: []capability.Condition{
+			&capability.MaxCallsCondition{Count: 5, WindowSeconds: 60},
+			&capability.MaxCallsCondition{Count: 3, WindowSeconds: 3600},
+		},
+	}}
+
+	resp := e.ValidateAction(context.Background(), req, caps)
+	if resp.Decision != capability.DecisionDeny {
+		t.Fatalf("decision = %q, want deny (a nil call counter must fail closed, not panic)", resp.Decision)
+	}
+	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeConditionFailed {
+		t.Fatalf("denial = %+v, want CONDITION_FAILED", resp.Denial)
+	}
+}
+
+// sentinelCommitHandler is a custom CommittingConditionHandler used to exercise the
+// multi-bucket atomic-commit path's observe-mode (skipQuota) behavior. It branches on
+// MaxCallsCondition.Count so one constraint can mix bucket behaviors the built-in
+// maxCalls never mixes (maxCalls always derives skip solely from skipQuota, so its
+// buckets are uniform):
+//
+//	Count < 0  → always a validation condErr, even under skipQuota (a committing
+//	             condition whose validity is independent of the quota skip)
+//	Count == 7 → always commits, IGNORING skipQuota (violates the ctx-uniform skip
+//	             contract, producing a non-uniform skip across buckets)
+//	otherwise  → skips under skipQuota, commits otherwise (the well-behaved case)
+type sentinelCommitHandler struct{}
+
+func (sentinelCommitHandler) Handle(context.Context, capability.Condition, *capability.EnforceRequest) *ConditionError {
+	return nil
+}
+
+func (sentinelCommitHandler) PrepareCommit(ctx context.Context, cond capability.Condition, _ *capability.EnforceRequest) (DeferredCommit, bool, *ConditionError) {
+	mc, condErr := castCondition[capability.MaxCallsCondition](cond)
+	if condErr != nil {
+		return DeferredCommit{}, false, condErr
+	}
+	commit := DeferredCommit{
+		Key:        "sentinel-bucket",
+		WindowSecs: mc.WindowSeconds,
+		Limit:      int64(mc.Count),
+		Deny: func(int64, time.Duration) *ConditionError {
+			return &ConditionError{Code: capability.ErrCodeConditionFailed, ConditionType: capability.ConditionTypeMaxCalls, Message: "over limit"}
+		},
+	}
+	switch {
+	case mc.Count < 0:
+		return DeferredCommit{}, false, &ConditionError{Code: capability.ErrCodeConditionFailed, ConditionType: capability.ConditionTypeMaxCalls, Message: "invalid bucket"}
+	case mc.Count == 7:
+		return commit, false, nil // commit even under skipQuota
+	case skipQuota(ctx):
+		return DeferredCommit{}, true, nil
+	default:
+		return commit, false, nil
+	}
+}
+
+func sentinelEngine() *Engine {
+	return New(WithCallCounter(callcounter.NewInMemory()), WithConditionHandler(capability.ConditionTypeMaxCalls, sentinelCommitHandler{}))
+}
+
+// TestCommitDeferredAtomic_ObserveSurfacesLaterBucketCondErr pins that under the
+// observe (skipQuota) posture the multi-bucket commit evaluates EVERY bucket, so a later
+// bucket's validation error still denies. Returning on the first bucket's skip (the prior
+// behavior) masked it as an allow — the observe/enforce divergence this closes.
+func TestCommitDeferredAtomic_ObserveSurfacesLaterBucketCondErr(t *testing.T) {
+	e := sentinelEngine()
+	req := &capability.EnforceRequest{SessionID: "s", ToolName: "tool"}
+	caps := []capability.Constraint{{
+		Target:  "tool",
+		Actions: []string{"*"},
+		Conditions: []capability.Condition{
+			&capability.MaxCallsCondition{Count: 5, WindowSeconds: 60},    // skips under observe
+			&capability.MaxCallsCondition{Count: -1, WindowSeconds: 3600}, // invalid: condErr even under observe
+		},
+	}}
+	resp := e.ValidateAction(WithSkipQuota(context.Background()), req, caps)
+	if resp.Decision != capability.DecisionDeny {
+		t.Fatalf("decision = %q, want deny (observe must surface a later bucket's validation error, not mask it on the first skip)", resp.Decision)
+	}
+	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeConditionFailed {
+		t.Fatalf("denial = %+v, want CONDITION_FAILED", resp.Denial)
+	}
+}
+
+// TestCommitDeferredAtomic_PartialSkipFailsClosed pins that a non-uniform skip — some
+// buckets skip under skipQuota while another commits — fails closed after the loop. The
+// per-bucket assertion cannot catch it (each skipping bucket individually satisfies
+// skipQuota); admitting the committing buckets while dropping the skipped ones would be a
+// fail-open.
+func TestCommitDeferredAtomic_PartialSkipFailsClosed(t *testing.T) {
+	e := sentinelEngine()
+	req := &capability.EnforceRequest{SessionID: "s", ToolName: "tool"}
+	caps := []capability.Constraint{{
+		Target:  "tool",
+		Actions: []string{"*"},
+		Conditions: []capability.Condition{
+			&capability.MaxCallsCondition{Count: 5, WindowSeconds: 60},   // skips under observe
+			&capability.MaxCallsCondition{Count: 7, WindowSeconds: 3600}, // commits, ignoring skipQuota
+		},
+	}}
+	resp := e.ValidateAction(WithSkipQuota(context.Background()), req, caps)
+	if resp.Decision != capability.DecisionDeny {
+		t.Fatalf("decision = %q, want deny (a partial/non-uniform skip across buckets must fail closed)", resp.Decision)
+	}
+	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeConditionFailed {
+		t.Fatalf("denial = %+v, want CONDITION_FAILED", resp.Denial)
+	}
+}
+
+// TestCommitDeferredAtomic_AllSkipUnderObserveAllows is the positive control: when EVERY
+// bucket skips under skipQuota (the shipped maxCalls-only observe path), quota is not
+// consumed and the call is allowed.
+func TestCommitDeferredAtomic_AllSkipUnderObserveAllows(t *testing.T) {
+	e := sentinelEngine()
+	req := &capability.EnforceRequest{SessionID: "s", ToolName: "tool"}
+	caps := []capability.Constraint{{
+		Target:  "tool",
+		Actions: []string{"*"},
+		Conditions: []capability.Condition{
+			&capability.MaxCallsCondition{Count: 5, WindowSeconds: 60},
+			&capability.MaxCallsCondition{Count: 6, WindowSeconds: 3600},
+		},
+	}}
+	resp := e.ValidateAction(WithSkipQuota(context.Background()), req, caps)
+	if resp.Decision != capability.DecisionAllow {
+		t.Fatalf("decision = %q, want allow (all buckets skip under observe); denial %+v", resp.Decision, resp.Denial)
+	}
+}
+
 // typedNilCondition is a Condition implementation used only as a nil pointer, to
 // exercise the isTypedNil guard: as an interface value it is non-nil (it
 // carries a concrete type), but the pointer it wraps is nil.

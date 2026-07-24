@@ -983,6 +983,33 @@ capabilities:
 	}
 }
 
+// TestLoadManifest_SequenceBlock_RejectsGlobAfterTools pins that a glob in afterTools is
+// rejected at load: the runtime matches afterTools LITERALLY against the concrete tool
+// names recordSessionCall persisted, so a pattern like "read_*" never matches a real
+// recorded name and the block silently fails open.
+func TestLoadManifest_SequenceBlock_RejectsGlobAfterTools(t *testing.T) {
+	for _, glob := range []string{"read_*", "tool:list_?", "read_[abc]"} {
+		yaml := `
+name: "seq-glob"
+version: "0.1.0"
+capabilities:
+  - target: "tool:write_external"
+    actions: [call]
+    conditions:
+      - type: sequenceBlock
+        afterTools: ["` + glob + `"]
+`
+		path := writeManifestFile(t, yaml)
+		_, err := LoadManifest(path)
+		if err == nil {
+			t.Fatalf("LoadManifest accepted a sequenceBlock afterTools glob %q, want rejection (a glob is matched literally and never fires)", glob)
+		}
+		if !strings.Contains(err.Error(), "glob metacharacters") {
+			t.Errorf("afterTools glob %q: error should explain the glob rejection, got: %v", glob, err)
+		}
+	}
+}
+
 func TestLoadManifest_SequenceBlock_RejectsEntryThatStripsToEmpty(t *testing.T) {
 	// An entry that carries a recognized prefix but no name (e.g. "tool:"), or is
 	// empty outright, strips to "" and can never match session history — an

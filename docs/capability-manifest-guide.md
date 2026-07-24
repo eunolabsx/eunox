@@ -1559,7 +1559,11 @@ before in the session.
   `Tool:read_file`) at load time — only `tool:`, `resource:`, `prompt:`, and
   `system:` are recognized. This is deliberately strict: a resource antecedent
   must use the explicit `resource:` prefix, since a bare URI is indistinguishable
-  from a prefix typo at load time.
+  from a prefix typo at load time. Finally, because an entry is matched
+  **literally** against the concrete tool names recorded in session history, a
+  **glob metacharacter** (`*`, `?`, `[`, `\`) anywhere in an entry is rejected at
+  load: a pattern like `read_*` would never match a recorded name, so the block
+  would look armed yet silently fail open — name the exact tool(s) instead.
 - The rule is **directional**: with the policy above, `read_credentials` →
   `write_external` is blocked, but `write_external` → `read_credentials` is
   allowed (nothing read credentials before the write).
@@ -1567,10 +1571,11 @@ before in the session.
   activity can never gate another's. Recording happens whenever the antecedent
   **actually runs**: an allowed call arms the block, and a hard-denied call (the
   upstream is never reached) does not. The one subtlety is **audit (observe)
-  mode**: an antecedent whose own constraint is `enforcement: audit` and whose
-  condition fails is denied-but-forwarded — the tool runs — so it **does** arm
-  the block even though its decision was "deny". Without this an audit-mode
-  antecedent would silently fail the block open.
+  mode**: an antecedent that is **forwarded despite a failing condition** —
+  because its own constraint is `enforcement: audit`, *or* because the whole route
+  runs under `--audit` — still runs, so it **does** arm the block even though its
+  decision was "deny". Without this an observed antecedent would silently fail the
+  block open for a later *enforced* `sequenceBlock`.
 - **Concurrency limitation** (same-session parallel requests): the antecedent
   check and the antecedent's own recording are two separate, non-atomic
   operations across two requests. A client that deliberately fires the antecedent
