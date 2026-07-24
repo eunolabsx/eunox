@@ -18,6 +18,7 @@ import (
 	"github.com/eunolabs/eunox/pkg/callcounter"
 	"github.com/eunolabs/eunox/pkg/capability"
 	"github.com/eunolabs/eunox/pkg/enforcement"
+	"github.com/eunolabs/eunox/pkg/flowlabelstore"
 	"github.com/eunolabs/eunox/pkg/killswitch"
 )
 
@@ -360,7 +361,7 @@ func TestRecordAuditModeAntecedent_BackfillsFlowLabels(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	counter := callcounter.NewInMemory()
-	engine := enforcement.New(enforcement.WithCallCounter(counter))
+	engine := enforcement.New(enforcement.WithCallCounter(counter), enforcement.WithFlowLabelStore(flowlabelstore.NewInMemory()))
 
 	// Pre-taint the session: an earlier source read asserted "internal".
 	prior := &capability.Constraint{
@@ -400,7 +401,7 @@ func TestRecordAuditModeAntecedent_NonFlowConstraintNoLabels(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	counter := callcounter.NewInMemory()
-	engine := enforcement.New(enforcement.WithCallCounter(counter))
+	engine := enforcement.New(enforcement.WithCallCounter(counter), enforcement.WithFlowLabelStore(flowlabelstore.NewInMemory()))
 
 	// Taint the session via a real source read elsewhere.
 	src := &capability.Constraint{

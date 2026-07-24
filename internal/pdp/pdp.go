@@ -78,6 +78,16 @@ type PolicyDecisionPoint interface {
 	// this feeds is a security control, not audit-logging bookkeeping: an audit-mode route
 	// running with no sink configured must still have the poisoning defense armed.
 	RecordObservedToolHashes(ctx context.Context, result json.RawMessage) (entryCount int)
+
+	// ReleaseSession releases per-session enforcement state when the transport tears a
+	// session down (idle reap, client DELETE, kill, shutdown, or natural upstream exit),
+	// so an ended session retains no state and a reused session id starts clean. Today
+	// that is the session's accumulated flow-label set (docs/flow-label-hardening.md
+	// FR-H2); it is the one teardown seam any future per-session state reuses. It must be
+	// a safe no-op for a PDP with no such state (AlwaysAllowPDP, DenyAllPDP) and for a
+	// session that recorded none, and must never block on the upstream — teardown paths
+	// call it with a detached, bounded context.
+	ReleaseSession(ctx context.Context, sessionID string)
 }
 
 // ListFilterer filters tools/resources/prompts list results down to the entries
@@ -397,6 +407,10 @@ func (AlwaysAllowPDP) RecordObservedToolHashes(_ context.Context, result json.Ra
 	return passThroughList(result, listKeyTools).Upstream
 }
 
+// ReleaseSession is a no-op: a wiretap PDP enforces no policy and holds no per-session
+// flow state to release.
+func (AlwaysAllowPDP) ReleaseSession(_ context.Context, _ string) {}
+
 // FilterToolsList passes the tools/list result through unchanged: wiretap/audit
 // mode applies no policy. It still reports an accurate entry count (Upstream ==
 // Kept) so a JWT route layered over a wiretap inner audits the right numbers.
@@ -481,6 +495,9 @@ func (DenyAllPDP) RecordObservedToolHashes(_ context.Context, result json.RawMes
 	return passThroughList(result, listKeyTools).Upstream
 }
 
+// ReleaseSession is a no-op: the fail-closed default holds no per-session flow state.
+func (DenyAllPDP) ReleaseSession(_ context.Context, _ string) {}
+
 // FilterToolsList filters the tools/list result down to nothing (keep == false
 // for every entry), reusing the shared fail-closed envelope round-trip.
 func (DenyAllPDP) FilterToolsList(_ context.Context, result json.RawMessage) ListFilterResult {
@@ -555,6 +572,14 @@ type ManifestPDP struct {
 	// validateLocalManifest (config layer), so this map never carries a conflicting pin and a
 	// plain hash string suffices — no in-band conflict sentinel is threaded into the hot path.
 	pinnedTools map[string]string
+
+	// anyLabelOutput is true when at least one capability carries a labelOutput directive.
+	// It gates the union scan (constraintWithUnionLabelOutput): a source read's taint is
+	// the union of labelOutput across ALL entries matching the request, not only the one
+	// findConstraint scores highest — so a sibling without labelOutput cannot shadow one
+	// that has it (mirrors pinnedTools' "enforce off any matching entry"). Computed once at
+	// construction; false skips the scan entirely, so a policy with no sources pays nothing.
+	anyLabelOutput bool
 }
 
 // parsedTarget is the once-parsed form of a constraint's Target (see
@@ -592,7 +617,19 @@ func NewManifestPDP(caps []capability.Constraint, engine *enforcement.Engine, ks
 			}
 		}
 	}
-	return &ManifestPDP{caps: caps, parsedTargets: parsed, engine: engine, ks: ks, observedToolHash: make(map[string]string), pinnedTools: pinned}
+	anyLabelOutput := false
+	for i := range caps {
+		for _, dir := range caps[i].Directives {
+			if capability.IsLabelOutputDirective(dir) {
+				anyLabelOutput = true
+				break
+			}
+		}
+		if anyLabelOutput {
+			break
+		}
+	}
+	return &ManifestPDP{caps: caps, parsedTargets: parsed, engine: engine, ks: ks, observedToolHash: make(map[string]string), pinnedTools: pinned, anyLabelOutput: anyLabelOutput}
 }
 
 // engineClock returns the engine's clock so decideTarget's hand-built denies
@@ -703,6 +740,18 @@ func (*ManifestPDP) CheckAudience(_ context.Context) *capability.EnforceResponse
 	return nil
 }
 
+// ReleaseSession releases the session's accumulated flow-label state on teardown, via
+// the engine (which namespaces the store key by route). A no-op when the policy uses no
+// flow control or no store is wired (see Engine.ClearSessionLabels). Best-effort: a
+// store fault on teardown is swallowed rather than surfaced — the session is already
+// gone, and a Redis-backed store reclaims an orphaned key by idle TTL regardless.
+func (p *ManifestPDP) ReleaseSession(ctx context.Context, sessionID string) {
+	if p.engine == nil {
+		return
+	}
+	_ = p.engine.ClearSessionLabels(ctx, sessionID)
+}
+
 // Decide evaluates a tools/call against the manifest: it selects the
 // best-matching constraint, runs its conditions through the enforcement engine,
 // and returns the allow/deny decision (with any obligations).
@@ -746,6 +795,14 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 		return denyResponse(p.engineClock(), capability.ErrCodeAuthorizationFailed, "",
 			fmt.Sprintf("%s %q is not listed in the capability manifest", target.Type, target.Name))
 	}
+	// Union labelOutput across every entry matching this request, so a source read carries
+	// its taint even when the entry findConstraint scored highest (a more-specific or
+	// principal-scoped sibling) lacks labelOutput while another matching entry has it —
+	// otherwise the taint is silently dropped and a later sink fails open. A no-op for a
+	// policy with no sources, and for the common single-source case. Only the recorded
+	// labelOutput changes; conditions, actions, argumentSchema, and the descriptionHash pin
+	// below all read matched's own (unchanged) properties, and obligations skip labelOutput.
+	matched = p.constraintWithUnionLabelOutput(matched, target, claims)
 
 	// Stray-argumentSchema fail-closed guard. argumentSchema is tool-only by spec
 	// (§ 3.2.2) and the loader rejects it on resource:/prompt: targets, but a
@@ -909,7 +966,9 @@ func targetOperationPhrase(t capability.TargetType) string {
 // When either record fails the corresponding integrity guarantee cannot be upheld, so
 // the call returns a hardDenyResponse CONDITION_FAILED deny — non-downgradable even
 // under audit (see hardDenyResponse), so the read is not forwarded with unreliable
-// state. RecordSessionCall runs first so a fault there commits no labels.
+// state. RecordSourceCall commits the two namespaces atomically — flow labels first,
+// then the seq antecedent, rolling the flow write back on a seq fault (see
+// recordSourceCall) — so a fault in either leaves NEITHER committed.
 //
 // On the downgrade the labels this forwarded read carries in and asserts out are
 // stamped back onto resp (LabelsOut from RecordLabels, CarriedLabels from a pre-write
@@ -937,24 +996,42 @@ func recordAuditModeAntecedent(ctx context.Context, engine *enforcement.Engine, 
 		flowRelevant := capability.ConstraintHasFlow(matched)
 		// Capture the carried set before any write, only for a flow-relevant constraint
 		// whose deny did not already stamp it (a condition deny routed through
-		// evaluateMatched has). The Peek is audit reflection, not a decision, so its error
-		// is not fail-closed — the enforcement verdict is already settled.
+		// evaluateMatched has). This peek fails CLOSED, exactly like the genuine-allow path
+		// (evaluateMatched denies on a peek error): the captured set is not only the tape's
+		// carried_labels for this forwarded observe record — where a swallowed error would
+		// silently under-report the flow — but ALSO the rollback-delta baseline handed to
+		// RecordSourceCall, where a nil-from-error baseline would let a paired seq-write fault
+		// roll back a PRIOR source's label (a fail-open). So a peek fault here hard-denies
+		// (non-downgradable even under audit) rather than forward with unreliable state.
 		var incoming []string
 		if flowRelevant && resp.CarriedLabels == nil {
-			incoming, _ = engine.PeekSessionLabels(ctx, req)
+			var perr error
+			incoming, perr = engine.PeekSessionLabels(ctx, req)
+			if perr != nil {
+				deny := hardDenyResponse(clock, capability.ErrCodeConditionFailed,
+					"audit-mode flow-label peek failed: "+perr.Error())
+				return &deny
+			}
 		}
-		if err := engine.RecordSessionCall(ctx, req); err != nil {
-			deny := hardDenyResponse(clock, capability.ErrCodeConditionFailed,
-				"audit-mode antecedent record failed: "+err.Error())
+		// Commit the seq antecedent and the flow labels atomically (RecordSourceCall), so
+		// a fault between the two leaves neither stranded on this forwarded observe record
+		// (docs/flow-label-hardening.md FR-H5) — the same all-or-nothing the genuine-allow
+		// path uses. carried is the pre-write accumulated set for the rollback delta:
+		// resp.CarriedLabels when a flow-condition deny already stamped it, else the peek.
+		carried := resp.CarriedLabels
+		if carried == nil {
+			carried = incoming
+		}
+		labels, cerr := engine.RecordSourceCall(ctx, req, matched, flowRelevant, carried)
+		if cerr != nil {
+			msg := "audit-mode antecedent record failed: "
+			if cerr.Flow {
+				msg = "audit-mode flow-label record failed: "
+			}
+			deny := hardDenyResponse(clock, capability.ErrCodeConditionFailed, msg+cerr.Error())
 			return &deny
 		}
 		if flowRelevant {
-			labels, err := engine.RecordLabels(ctx, req, matched)
-			if err != nil {
-				deny := hardDenyResponse(clock, capability.ErrCodeConditionFailed,
-					"audit-mode flow-label record failed: "+err.Error())
-				return &deny
-			}
 			if len(labels) > 0 {
 				resp.LabelsOut = labels
 			}
@@ -1103,6 +1180,112 @@ func containsAction(actions []string, act string) bool {
 		}
 	}
 	return false
+}
+
+// constraintWithUnionLabelOutput returns matched augmented so its labelOutput carries the
+// UNION of labelOutput labels across every entry matching this request — so a source read's
+// taint is not dropped when a sibling (a more-specific or principal-scoped entry) lacking
+// labelOutput wins selection over one that has it (docs/flow-label-hardening.md; mirrors the
+// pinnedTools "enforce off any matching entry" rule). It returns matched UNCHANGED when the
+// policy declares no labelOutput, when no matching entry adds a label matched lacks, or when
+// matched already asserts the full union — so the common single-source case allocates
+// nothing. Only labelOutput changes; the shallow copy shares matched's conditions, actions,
+// argumentSchema, principal, and every other property, so selection, condition evaluation,
+// the descriptionHash pin, and obligations (which skip labelOutput) are all unaffected.
+func (p *ManifestPDP) constraintWithUnionLabelOutput(matched *capability.Constraint, target EnforceTarget, claims map[string]interface{}) *capability.Constraint {
+	if !p.anyLabelOutput {
+		return matched
+	}
+	union := p.matchingLabelOutputUnion(target, claims)
+	if len(union) == 0 || labelSetContainsAll(labelOutputLabels(matched), union) {
+		return matched
+	}
+	cp := *matched
+	cp.Directives = replaceLabelOutputDirective(matched.Directives, union)
+	return &cp
+}
+
+// matchingLabelOutputUnion collects the union of labelOutput labels from every capability
+// whose target type + pattern match target AND whose principal scoping the caller's claims
+// satisfy — the same "applies to this request" test findConstraint uses, minus the
+// specificity/action tie-break, because ANY matching source entry's taint applies. Order is
+// unspecified (the engine reorders into the canonical vocabulary). nil when nothing matches.
+func (p *ManifestPDP) matchingLabelOutputUnion(target EnforceTarget, claims map[string]interface{}) []string {
+	var set map[string]struct{}
+	useCache := len(p.parsedTargets) == len(p.caps)
+	for i := range p.caps {
+		var pt parsedTarget
+		if useCache {
+			pt = p.parsedTargets[i]
+		} else {
+			tt, bare, err := capability.ParseTarget(p.caps[i].Target)
+			pt = parsedTarget{typ: tt, bare: bare, parseErr: err != nil}
+		}
+		if pt.parseErr || pt.typ != target.Type || !matchBare(pt.bare, target.Name) {
+			continue
+		}
+		if !p.caps[i].PrincipalMatches(claims) {
+			continue
+		}
+		for _, l := range labelOutputLabels(&p.caps[i]) {
+			if set == nil {
+				set = make(map[string]struct{})
+			}
+			set[l] = struct{}{}
+		}
+	}
+	if len(set) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(set))
+	for l := range set {
+		out = append(out, l)
+	}
+	return out
+}
+
+// labelOutputLabels returns the flow labels a constraint's labelOutput directives assert
+// (across all of them; nil-safe on a typed-nil directive), or nil.
+func labelOutputLabels(c *capability.Constraint) []string {
+	var out []string
+	for _, dir := range c.Directives {
+		if lo, ok := capability.AsValueOrPointer[capability.LabelOutputDirective](dir); ok && lo != nil {
+			out = append(out, lo.Labels...)
+		}
+	}
+	return out
+}
+
+// labelSetContainsAll reports whether every element of want is present in have (small
+// closed-vocabulary slices, so a linear scan beats building a set).
+func labelSetContainsAll(have, want []string) bool {
+	for _, w := range want {
+		found := false
+		for _, h := range have {
+			if h == w {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// replaceLabelOutputDirective returns dirs with every labelOutput directive dropped and one
+// LabelOutputDirective carrying labels appended, so the constraint asserts exactly the
+// union. Non-labelOutput directives (e.g. redactFields) are preserved in order.
+func replaceLabelOutputDirective(dirs []capability.Directive, labels []string) []capability.Directive {
+	out := make([]capability.Directive, 0, len(dirs)+1)
+	for _, dir := range dirs {
+		if capability.IsLabelOutputDirective(dir) {
+			continue
+		}
+		out = append(out, dir)
+	}
+	return append(out, capability.LabelOutputDirective{Labels: labels})
 }
 
 // DecideResourceRead evaluates a resources/read against the manifest. The URI is

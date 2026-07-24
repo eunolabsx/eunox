@@ -50,6 +50,7 @@ import (
 	"github.com/eunolabs/eunox/internal/transport"
 	"github.com/eunolabs/eunox/pkg/callcounter"
 	"github.com/eunolabs/eunox/pkg/capability"
+	"github.com/eunolabs/eunox/pkg/flowlabelstore"
 	"github.com/eunolabs/eunox/pkg/killswitch"
 )
 
@@ -332,7 +333,7 @@ func registerProxyFlags(fs *flag.FlagSet) *proxyCLIFlags {
 		redisTLS:            fs.Bool("redis-tls", false, "Enable TLS for the Redis connection."),
 		killswitchFailOpen:  fs.Bool("killswitch-fail-open", false, "Redis kill-switch behaviour during a Redis outage. By default the kill switch\nfails CLOSED: while Redis is unreachable the proxy denies every request\n(KILL_SWITCH_ERROR) because a kill issued during the outage cannot be confirmed.\nSet this flag to fail OPEN instead -- serve the last-known kill state and allow\ntraffic not already known to be killed -- trading guaranteed revocation for\ndata-plane availability. Only affects --redis-addr deployments. See ADR-0003."),
 		killswitchReconcile: fs.Duration("killswitch-reconcile-interval", 0, "How often the Redis kill switch reconciles its local cache against Redis\n(default 30s). Lower values shorten the kill-propagation window and, in the\ndefault fail-closed mode, the data-plane denial window that persists after a\ntransient Redis blip recovers -- recovery is bounded by this interval, not Redis.\nVery low values increase Redis load. 0 uses the default. Only affects --redis-addr."),
-		maxCallCounterKeys:  fs.Int("max-call-counter-keys", defaultMaxCallCounterKeys, "Maximum distinct keys the in-memory maxCalls/sequenceBlock counter holds at once.\nEach live (session, tool) pair is one key, reclaimed only on the periodic cleanup;\nthis ceiling bounds the heap a flood of unique session IDs can pin between cleanups\n(a call under a new key past the limit fails closed). 0 disables the bound. Ignored\nwhen --redis-addr is set (Redis keeps counter state off the Go heap, with TTLs)."),
+		maxCallCounterKeys:  fs.Int("max-call-counter-keys", defaultMaxCallCounterKeys, "Maximum distinct keys the in-memory maxCalls/sequenceBlock counter holds at once.\nEach live (session, tool) pair is one key, reclaimed only on the periodic cleanup;\nthis ceiling bounds the heap a flood of unique session IDs can pin between cleanups\n(a call under a new key past the limit fails closed). The same bound also caps the\nin-memory flow-label store's distinct SESSIONS (one key per session, so its ceiling\nis looser and never trips first). 0 disables the bound. Ignored when --redis-addr is\nset (Redis keeps this state off the Go heap, with TTLs)."),
 
 		// Compliance flags.
 		strictDrift: fs.Bool("strict-drift", false, "Promote startup drift warnings to fatal errors that abort session startup: a new\nupstream tool matched by a manifest glob, a manifest entry that matches no live\ntool, or an upstream version that does not satisfy the manifest's serverVersion\npin. (A condition argument absent from the live schema and the uncovered-tool\nINFO stay advisory, never fatal.) A launch-time global override: applies to every\npoliced route, regardless of a per-route 'strictDrift' in the config. Routes with\nno policy are unaffected; the proxy warns if the flag matched no policed route\n(e.g. with --audit)."),
@@ -512,7 +513,7 @@ func cmdProxy() {
 
 	// Build call counter and kill-switch manager, shared across routes and the
 	// kill-switch endpoint. Backed by Redis when --redis-addr is set.
-	counter, ks, ksRedis := buildCallCounterAndKillSwitch(*f.redisAddr, resolveRedisPassword(*f.redisPassword), *f.redisTLS, *f.killswitchFailOpen, *f.killswitchReconcile, *f.maxCallCounterKeys)
+	counter, flowStore, ks, ksRedis := buildCallCounterAndKillSwitch(*f.redisAddr, resolveRedisPassword(*f.redisPassword), *f.redisTLS, *f.killswitchFailOpen, *f.killswitchReconcile, *f.maxCallCounterKeys)
 
 	// Open the shared audit sink. The config's audit block takes precedence over
 	// the CLI flags so every route shares one tape.
@@ -562,9 +563,9 @@ func cmdProxy() {
 	var serveErr error
 	switch cfg.HostTransport() {
 	case config.HostTransportStdio:
-		serveErr = serveStdioHost(ctx, cfg, sink, counter, ks, pf)
+		serveErr = serveStdioHost(ctx, cfg, sink, counter, flowStore, ks, pf)
 	default: // config.HostTransportHTTP
-		serveErr = serveHTTPGateway(ctx, cfg, sink, counter, ks, pf)
+		serveErr = serveHTTPGateway(ctx, cfg, sink, counter, flowStore, ks, pf)
 	}
 	if serveErr != nil {
 		fmt.Fprintf(os.Stderr, "[eunox] Fatal: %v\n", serveErr)
@@ -587,16 +588,24 @@ func resolveRedisPassword(flagVal string) string {
 	return os.Getenv("EUNOX_REDIS_PASSWORD")
 }
 
-// buildCallCounterAndKillSwitch builds the shared call counter and kill-switch
-// manager, Redis-backed when redisAddr is set (state survives restarts, shared
-// across instances) and in-memory otherwise. ksRedis is non-nil only in the
-// Redis case, so cmdProxy can start its reconcile loop. A Redis config or
+// buildCallCounterAndKillSwitch builds the shared call counter, flow-label store, and
+// kill-switch manager, Redis-backed when redisAddr is set (state survives restarts,
+// shared across instances) and in-memory otherwise. The flow-label store is a seam
+// distinct from the counter (session-lifetime provenance, not a sliding window; see
+// docs/flow-label-hardening.md) but is wired from the same backend so a flow policy gets
+// multi-instance parity exactly as maxCalls/sequenceBlock do. ksRedis is non-nil only in
+// the Redis case, so cmdProxy can start its reconcile loop. A Redis config or
 // connectivity error is fatal.
-func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, killswitchFailOpen bool, killswitchReconcile time.Duration, maxCallCounterKeys int) (capability.CallCounter, killswitch.Manager, *killswitch.Redis) {
+func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, killswitchFailOpen bool, killswitchReconcile time.Duration, maxCallCounterKeys int) (capability.CallCounter, capability.FlowLabelStore, killswitch.Manager, *killswitch.Redis) {
 	var (
 		counter capability.CallCounter = callcounter.NewInMemory(callcounter.WithMaxKeys(maxCallCounterKeys))
-		ks      killswitch.Manager     = killswitch.NewInMemory()
-		ksRedis *killswitch.Redis      // non-nil when --redis-addr is set
+		// The in-memory flow store has no time window (a taint lives until the session's
+		// Clear on teardown), so it needs no cleanup goroutine; WithMaxKeys is its
+		// fail-closed growth backstop for a session whose Clear never arrives, sized to
+		// the same bound as the counter.
+		flowStore capability.FlowLabelStore = flowlabelstore.NewInMemory(flowlabelstore.WithMaxKeys(maxCallCounterKeys))
+		ks        killswitch.Manager        = killswitch.NewInMemory()
+		ksRedis   *killswitch.Redis         // non-nil when --redis-addr is set
 	)
 	if redisAddr != "" {
 		rdb, err := buildRedisClient(redisAddr, redisPassword, redisTLS)
@@ -610,6 +619,10 @@ func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, ki
 		}
 		fmt.Fprintf(os.Stderr, "[eunox] Redis backend enabled (%s). State persists across restarts.\n", redisAddr)
 		counter = callcounter.NewRedis(rdb)
+		// Share the same client: a Redis flow store gives a flow policy the same
+		// multi-instance parity as the counter (a source on one instance, a sink on
+		// another), and reclaims an orphaned session's set by idle TTL if Clear never lands.
+		flowStore = flowlabelstore.NewRedis(rdb)
 		// WithReconcileInterval(0) keeps the default; a positive value tunes kill
 		// propagation and (fail-closed) the post-recovery denial window.
 		ksRedis = killswitch.NewRedis(rdb).WithFailOpen(killswitchFailOpen).WithReconcileInterval(killswitchReconcile)
@@ -623,7 +636,7 @@ func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, ki
 			fmt.Fprintf(os.Stderr, "[eunox] Kill switch: reconcile interval %s (--killswitch-reconcile-interval); bounds kill-propagation and fail-closed post-recovery denial windows.\n", killswitchReconcile)
 		}
 	}
-	return counter, ks, ksRedis
+	return counter, flowStore, ks, ksRedis
 }
 
 // openConfiguredAuditSink resolves the audit-sink settings (config's audit block
@@ -1162,7 +1175,7 @@ func resolveOAuthMetadata(cfg *config.GatewayConfig, pf proxyFlags) (*transport.
 
 // serveHTTPGateway serves cfg's upstreams over an HTTP listener, one /mcp/<name>
 // route each (the gateway shape).
-func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audit.Sink, counter capability.CallCounter, ks killswitch.Manager, pf proxyFlags) error { //nolint:gocritic // hugeParam: pf is a small flag bundle
+func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audit.Sink, counter capability.CallCounter, flowStore capability.FlowLabelStore, ks killswitch.Manager, pf proxyFlags) error { //nolint:gocritic // hugeParam: pf is a small flag bundle
 	// --session-id is a stdio-only concept (a gateway mints its own Mcp-Session-Id
 	// per client session, per-route); silently ignoring it here would let an
 	// operator believe a fixed session ID took effect. Fail closed rather than
@@ -1174,7 +1187,7 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 	}
 	// drift.MakeDriftCheck is passed as the per-route hook factory; BuildRoutes
 	// wires it inside, so this layer never reaches into route internals.
-	routes, err := transport.BuildRoutes(cfg, sink, counter, ks, pf.strictDrift, drift.MakeDriftCheck)
+	routes, err := transport.BuildRoutes(cfg, sink, counter, flowStore, ks, pf.strictDrift, drift.MakeDriftCheck)
 	if err != nil {
 		return err
 	}
@@ -1340,7 +1353,7 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 // serveStdioHost serves cfg's single upstream over stdin/stdout (the stdio host
 // shape). The upstream is a subprocess (transport: stdio) or a remote HTTP server
 // (transport: http).
-func serveStdioHost(ctx context.Context, cfg *config.GatewayConfig, sink *audit.Sink, counter capability.CallCounter, ks killswitch.Manager, pf proxyFlags) error { //nolint:gocritic // hugeParam: pf is a small flag bundle
+func serveStdioHost(ctx context.Context, cfg *config.GatewayConfig, sink *audit.Sink, counter capability.CallCounter, flowStore capability.FlowLabelStore, ks killswitch.Manager, pf proxyFlags) error { //nolint:gocritic // hugeParam: pf is a small flag bundle
 	// JWT validation and OAuth metadata are HTTP-listener concerns; a stdio host
 	// has no socket on which to serve them.
 	if pf.jwksURI != "" {
@@ -1377,7 +1390,7 @@ func serveStdioHost(ctx context.Context, cfg *config.GatewayConfig, sink *audit.
 	}
 	configStrict := cfg.ResolvedStrictDrift(u)
 
-	dp, manifest, policyVersion, policySHA256, err := transport.LoadUpstreamPDP(u, cfg.HostTransport(), cfg.BaseDir, counter, ks)
+	dp, manifest, policyVersion, policySHA256, err := transport.LoadUpstreamPDP(u, cfg.HostTransport(), cfg.BaseDir, counter, flowStore, ks)
 	if err != nil {
 		return err
 	}
@@ -1420,7 +1433,12 @@ func serveStdioHost(ctx context.Context, cfg *config.GatewayConfig, sink *audit.
 		UpstreamTimeMs:        upstreamTimeMs,
 		Audit:                 auditMode,
 		RequireAuditStrict:    pf.requireAuditStrict,
-		DriftCheck:            drift.MakeDriftCheck(manifest, strictDrift),
+		// Serialize the decision phase when the policy reads/writes per-session state a
+		// source commits and a later call reads (flow labels or sequenceBlock), so a
+		// pipelining host cannot race a sink ahead of its source (docs/flow-label-
+		// hardening.md piece B). A non-flow/non-sequence policy keeps full parallelism.
+		SerializeDecisions: manifest != nil && (manifest.HasFlowLabel() || manifest.HasSequenceBlock()),
+		DriftCheck:         drift.MakeDriftCheck(manifest, strictDrift),
 	})
 	return proxy.Start(ctx)
 }

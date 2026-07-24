@@ -2191,7 +2191,7 @@ func TestBuildRoutes_ExpectVersionMismatchIsFatal(t *testing.T) {
 		Name: "fs", Transport: "stdio", Command: "echo",
 		Policy: []string{manifest}, ExpectVersion: "9.9.9",
 	}}}
-	_, err := transport.BuildRoutes(cfg, nil, callcounter.NewInMemory(), killswitch.NewInMemory(), false, drift.MakeDriftCheck)
+	_, err := transport.BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, drift.MakeDriftCheck)
 	if err == nil || !strings.Contains(err.Error(), "does not match pinned expectVersion") {
 		t.Errorf("want version-mismatch error, got %v", err)
 	}
@@ -2205,7 +2205,7 @@ func TestBuildRoutes_ExpectVersionWithoutPolicy(t *testing.T) {
 		Name: "fs", Transport: "stdio", Command: "echo",
 		Enforcement: capability.EnforcementAudit, ExpectVersion: "1.0.0",
 	}}}
-	_, err := transport.BuildRoutes(cfg, nil, callcounter.NewInMemory(), killswitch.NewInMemory(), false, drift.MakeDriftCheck)
+	_, err := transport.BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, drift.MakeDriftCheck)
 	if err == nil || !strings.Contains(err.Error(), "expectVersion") {
 		t.Errorf("want expectVersion-without-policy error, got %v", err)
 	}
@@ -2278,7 +2278,7 @@ func TestBuildRoutes_ExpectVersionMultiPolicyRejected(t *testing.T) {
 		Name: "fs", Transport: "stdio", Command: "echo",
 		Policy: []string{m1, m2}, ExpectVersion: "1.2.3",
 	}}}
-	_, err := transport.BuildRoutes(cfg, nil, callcounter.NewInMemory(), killswitch.NewInMemory(), false, drift.MakeDriftCheck)
+	_, err := transport.BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, drift.MakeDriftCheck)
 	if err == nil || !strings.Contains(err.Error(), "multiple policy files") {
 		t.Errorf("want multiple-policy-files rejection, got %v", err)
 	}
@@ -2291,7 +2291,7 @@ func TestBuildRoutes_ExpectVersionMultiPolicyRejected(t *testing.T) {
 func TestBuildRoutes_NoPolicyEnforce_FailsClosed(t *testing.T) {
 	t.Parallel()
 	cfg := &config.GatewayConfig{Upstreams: []config.UpstreamConfig{{Name: "fs", Transport: "stdio", Command: "echo"}}}
-	routes, err := transport.BuildRoutes(cfg, nil, callcounter.NewInMemory(), killswitch.NewInMemory(), false, drift.MakeDriftCheck)
+	routes, err := transport.BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, drift.MakeDriftCheck)
 	if err == nil {
 		t.Fatalf("want startup error for policyless non-audit route, got routes=%v", routes)
 	}
@@ -2313,7 +2313,7 @@ func TestBuildRoutes_SamplingOptInOnHTTPUpstreamRejected(t *testing.T) {
 		Name: "remote", Transport: "http", UpstreamURL: "https://example.test",
 		Policy: []string{m},
 	}}}
-	_, err := transport.BuildRoutes(cfg, nil, callcounter.NewInMemory(), killswitch.NewInMemory(), false, drift.MakeDriftCheck)
+	_, err := transport.BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, drift.MakeDriftCheck)
 	if err == nil || !strings.Contains(err.Error(), "sampling") {
 		t.Fatalf("want sampling-unenforceable rejection for an http upstream, got %v", err)
 	}
@@ -2333,7 +2333,7 @@ func TestBuildRoutes_SamplingOptInOnStdioUpstreamAllowed(t *testing.T) {
 		Name: "local", Transport: "stdio", Command: "echo",
 		Policy: []string{m},
 	}}}
-	if _, err := transport.BuildRoutes(cfg, nil, callcounter.NewInMemory(), killswitch.NewInMemory(), false, drift.MakeDriftCheck); err != nil {
+	if _, err := transport.BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, drift.MakeDriftCheck); err != nil {
 		t.Fatalf("stdio upstream with a sampling opt-in should build, got %v", err)
 	}
 }
@@ -2351,7 +2351,7 @@ func TestServeHTTPGateway_AuthTokenAndJWKSMutuallyExclusive(t *testing.T) {
 	pf := proxyFlags{jwksURI: "https://idp.example/jwks", jwtAllowAnyAudience: true, jwtAllowAnyIssuer: true}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err := serveHTTPGateway(ctx, cfg, nil, callcounter.NewInMemory(), killswitch.NewInMemory(), pf)
+	err := serveHTTPGateway(ctx, cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), pf)
 	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
 		t.Fatalf("expected mutual-exclusivity error for authToken + jwks-uri, got %v", err)
 	}

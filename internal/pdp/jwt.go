@@ -1538,6 +1538,16 @@ func (p *JWTPDP) RecordObservedToolHashes(ctx context.Context, result json.RawMe
 	return passThroughList(result, listKeyTools).Upstream
 }
 
+// ReleaseSession delegates to the inner PDP so a wrapped ManifestPDP releases the
+// session's flow-label state on teardown. The JWT wrapper holds no per-session flow
+// state of its own (claims live in the request context, not per-session), so a nil inner
+// is a no-op.
+func (p *JWTPDP) ReleaseSession(ctx context.Context, sessionID string) {
+	if p.inner != nil {
+		p.inner.ReleaseSession(ctx, sessionID)
+	}
+}
+
 // innerFilter applies the inner PDP's list filter (selected by sel) to intersect
 // with the JWT claim filter. A nil inner passes the result through (counting its
 // entries via fieldName so the composed counts stay accurate), so the JWT claim

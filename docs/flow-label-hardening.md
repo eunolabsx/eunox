@@ -1,13 +1,44 @@
 # Flow-label session state — concurrency and lifetime hardening
 
-**Status:** design / requirements; not yet implemented. Captures the known
-limitations of the information-flow-control feature (the `flowLabel` condition and the
-`labelOutput` directive) that the initial implementation documented but did not close,
-and specifies how to close them. D1 and D2 stem from one root cause: flow-label state is
-stored in the `CallCounter` sliding-window seam, whose consistency and lifetime
-semantics do not match monotonic, per-session provenance, and enforcement is not
-serialized per session. D3 is a separate atomicity gap in how a single allowed call
-commits state across two counter namespaces.
+**Status:** implemented. Captures the known limitations of the information-flow-control
+feature (the `flowLabel` condition and the `labelOutput` directive) that the initial
+implementation documented but did not close, and how they were closed. D1 and D2 stemmed
+from one root cause: flow-label state lived in the `CallCounter` sliding-window seam,
+whose consistency and lifetime semantics do not match monotonic, per-session provenance,
+and enforcement was not serialized per session. D3 was a separate atomicity gap in how a
+single allowed call commits state across two namespaces.
+
+**Resolution (what shipped).** All three defects are closed; the design below is retained
+as the rationale.
+
+- **D1 → A (closed).** Flow-label state moved out of the windowed `CallCounter` into a
+  new session-scoped `capability.FlowLabelStore` seam (`pkg/flowlabelstore`, in-memory +
+  Redis backends mirroring `pkg/callcounter`). A taint now lives for the session's
+  lifetime with **no** wall-clock expiry (the Redis backend keeps only a generous *idle*
+  TTL, refreshed on every read/write, to reclaim an orphaned session). The
+  `flowLabelWindowSec` constant is retired. Wired via `enforcement.WithFlowLabelStore`;
+  the engine's `recordLabels`/`peekSessionLabels` use `Add`/`Get`.
+- **D1 → A (closed), FR-H2.** Session end reclaims the state:
+  `Engine.ClearSessionLabels` → `FlowLabelStore.Clear`, called from the transport teardown
+  via `PolicyDecisionPoint.ReleaseSession` (stdio: end of `Start`; HTTP: the cleanup
+  goroutine that runs after `<-sess.done` on every teardown, natural exit included).
+- **D2 → B (closed).** The per-session decision phase (the PDP decision + its state
+  write, *not* the upstream forward) is serialized for a flow- or `sequenceBlock`-relevant
+  session. stdio uses a FIFO `decisionSerializer` whose tickets are reserved by the serial
+  reader, giving proxy-**receipt** order; HTTP uses a per-`httpSession` mutex. Gated on
+  `manifest.HasFlowLabel() || manifest.HasSequenceBlock()`, so a non-flow policy keeps
+  full intra-session decision parallelism, and the lock is released before the forward so
+  upstream calls stay concurrent.
+- **D3 → C (closed), FR-H5.** `Engine.recordSourceCall` commits the `flow:` labels and the
+  `seq:` antecedent as one all-or-nothing unit: the flow write goes first, then the seq
+  write, and a fault on the seq write rolls the flow labels this call added back out (the
+  `FlowLabelStore.Remove` seam), so a hard-denied call leaves **neither** committed. The
+  per-session lock (B) makes the rollback race-free.
+
+The rest of this document is the original design and requirements, kept for the reasoning
+and the acceptance criteria the tests encode.
+
+---
 
 Companions: the `handleFlowLabel` / `recordLabels` doc comments in
 `pkg/enforcement/flowlabel.go` (where the limitations are noted today), the flow-exfil

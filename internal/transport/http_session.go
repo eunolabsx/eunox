@@ -99,6 +99,15 @@ type httpSession struct {
 	// evaluates against, since server-initiated sampling has no host request in scope.
 	clientIP string
 
+	// decideMu serializes this session's enforced-request decision phase when the route
+	// is flow- or sequenceBlock-relevant (route.serializeDecisions), so a source's
+	// per-session state write is not raced ahead of by a later sink's read on the same
+	// session (docs/flow-label-hardening.md piece B). HTTP has no serial reader, so it is
+	// held in arrival-at-the-lock order and released right after the decision (via the
+	// dispatch handler's finishDecision) so the upstream forward stays concurrent. Unused
+	// on a non-serialized route.
+	decideMu sync.Mutex
+
 	notifMu   sync.Mutex
 	notifSubs []chan mcp.RPCMsg
 
@@ -413,7 +422,7 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 	// the process at the same time. That is benign: both close upIn and kill the
 	// process idempotently (a double-close/double-kill just returns an ignored
 	// error), and closeOnce only guards close()'s own body, not this goroutine's.
-	go func() {
+	go func() { //nolint:contextcheck // teardown path: releaseSessionState uses a detached, bounded context by design (the session is gone; no request context), matching the other teardown steps.
 		<-sess.done
 		if sess.upIn != nil {
 			_ = sess.upIn.Close()
@@ -434,6 +443,12 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 		p.mu.Lock()
 		delete(p.sessions, sess.id)
 		p.mu.Unlock()
+		// Release this session's per-session flow-label state now it is gone from the
+		// registry (docs/flow-label-hardening.md FR-H2). This cleanup block runs on EVERY
+		// teardown — idle reap, DELETE, kill, shutdown, AND natural subprocess exit (which
+		// close() does not cover) — so it is the one place that reclaims state for all of
+		// them, co-located with the registry delete.
+		releaseSessionState(sess)
 		fmt.Fprintf(os.Stderr, "[eunox] HTTP session %s ended.\n", sess.id)
 	}()
 
@@ -1121,6 +1136,65 @@ func (s *httpSession) forwardNotification(ctx context.Context, msg mcp.RPCMsg) {
 		msg = rewritten
 	}
 	_ = s.upWriter.Write(msg)
+}
+
+// inFlightDrainPoll is how often releaseSessionState re-checks the in-flight counter
+// while waiting for enforced decisions to drain before it releases flow state.
+const inFlightDrainPoll = 2 * time.Millisecond
+
+// releaseSessionState releases a torn-down session's per-session enforcement state (its
+// accumulated flow-label set) via the route's PDP, so an ended session retains nothing
+// and a reused session id starts clean (docs/flow-label-hardening.md FR-H2). It is called
+// from the cleanup goroutine that runs after <-sess.done on EVERY teardown — idle reap,
+// DELETE, kill, shutdown, and natural subprocess exit — so it covers the paths
+// httpSession.close() alone does not (close() is skipped on a natural upstream exit).
+//
+// It first waits for in-flight enforced decisions to finish (bounded), so a teardown
+// Clear cannot empty the session's taint BETWEEN a source's committed Add and a sink
+// still deciding on the same session — the fail-open a teardown racing live decisions
+// would otherwise open (piece B). The wait is bounded by the session shutdown budget so a
+// wedged handler cannot pin teardown; a Redis store reclaims an orphaned key by idle TTL
+// if we time out. The Clear itself uses a detached, bounded context (teardown must not
+// block on a slow store). A no-op when the policy uses no flow control (ReleaseSession
+// self-guards) or the route is unset (defensive).
+func releaseSessionState(sess *httpSession) {
+	if sess.route == nil {
+		return
+	}
+	budget := msToDuration(sess.proxy.shutdownMs)
+	sess.awaitInFlightDrained(budget)
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	sess.route.pdp.ReleaseSession(ctx, sess.id)
+}
+
+// awaitInFlightDrained blocks until this session has no enforced request in flight, or
+// until timeout elapses. In-flight enforced requests may still be mid-decision when
+// teardown begins (sess.done is closed for the session, but a request that already passed
+// getSession runs to completion against its own request context), so releasing flow state
+// before they finish could drop a live taint (see releaseSessionState). Bounded and
+// poll-based: teardown is off the hot path, and the wait must never be unbounded on a
+// wedged handler.
+//
+// Residual (bounded, accepted): inFlight is incremented in handleSessionPost only AFTER
+// getSession, the session-security gates, and the request-slot acquire (http_routing.go),
+// so a request in that pre-count window is invisible here and the drain could observe zero
+// and Clear before it runs its decision. The window contains no flow read or write (the
+// PDP Decide, hence any peek/Add, happens after the increment), and it is only reachable
+// while the session is already tearing down (DELETE, idle reap, or upstream exit) — so the
+// worst case is one audit-fidelity false-allow on a session whose forward target is itself
+// going away, never a taint stranded for a live session. Closing it fully would mean
+// counting the request before the gates, entangling this with the idle reaper's inFlight
+// read; not worth that lifecycle risk for a dying-session edge. stdio has no analogue: its
+// counter is bumped in the single-threaded reader before dispatch (StdioProxy.awaitHostDecisionsDrained).
+func (s *httpSession) awaitInFlightDrained(timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for s.inFlight.Load() > 0 {
+		if !time.Now().Before(deadline) {
+			return
+		}
+		time.Sleep(inFlightDrainPoll)
+	}
 }
 
 // close shuts down the session.

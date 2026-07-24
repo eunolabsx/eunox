@@ -43,6 +43,26 @@ type dispatchParams struct {
 	// cross-cutting gate (the kill check) does not. nil only in tests that never send
 	// initialize through the dispatcher; the initialize case fails closed if unset.
 	buildInit func(mcp.RPCMsg) mcp.RPCMsg
+
+	// endDecision closes the per-session decision critical section a serialize-relevant
+	// transport opened around this enforced request (docs/flow-label-hardening.md piece
+	// B). The four Decide* handlers call it (via finishDecision) IMMEDIATELY after the PDP
+	// decision so the upstream forward runs OUTSIDE the lock — only the decision + state
+	// write serialize, not the slow round-trip. It is idempotent, so the transport also
+	// defers it as a backstop for the malformed-params path (which returns before the
+	// decision). nil for a non-serialized request (a non-flow/non-sequenceBlock policy, or
+	// a locally-answered method), where finishDecision is a no-op.
+	endDecision func()
+}
+
+// finishDecision closes the per-session decision critical section, if one is open (see
+// dispatchParams.endDecision). The Decide* handlers call it right after the PDP decision
+// and before enforcedForwardCore, so the upstream forward is never held under the
+// per-session lock. A no-op when the request is not serialized.
+func (d dispatchParams) finishDecision() {
+	if d.endDecision != nil {
+		d.endDecision()
+	}
 }
 
 // killDenied runs the session kill-switch check for a locally-answered method that
@@ -312,6 +332,10 @@ func dispatchToolsCall(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mc
 		params.Arguments = map[string]interface{}{}
 	}
 	dec := d.pdp.Decide(d.decideCtx(ctx), d.sessionID, pdp.EnforceTarget{Type: capability.TargetTypeTool, Name: params.Name}, params.Arguments, d.sourceIP)
+	// Close the per-session decision critical section here — the decision and its flow/
+	// sequence state write are done — so the upstream forward below runs concurrently
+	// (docs/flow-label-hardening.md piece B). Everything after this reads the settled dec.
+	d.finishDecision()
 
 	// In audit mode the allow record logs the full tool arguments; otherwise none.
 	// Unlike resources/prompts, tools/call's details slot holds that argument map
@@ -373,6 +397,7 @@ func dispatchResourcesRead(ctx context.Context, d dispatchParams, msg mcp.RPCMsg
 	// Interface method (not a type-assert to *pdp.ManifestPDP) so JWT-only PDPs
 	// also enforce resource reads.
 	dec := d.pdp.DecideResourceRead(d.decideCtx(ctx), d.sessionID, params.URI, d.sourceIP)
+	d.finishDecision() // release the per-session decision lock before the forward (piece B)
 	return enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodResourcesRead, params.URI, params.URI, "resource", true, upstreamErrorDetail)
 }
 
@@ -388,6 +413,7 @@ func dispatchResourcesSubscribe(ctx context.Context, d dispatchParams, msg mcp.R
 		return d.malformedDeny(ctx, msg, "resources/subscribe: uri must not be empty")
 	}
 	dec := d.pdp.DecideResourceRead(d.decideCtx(ctx), d.sessionID, params.URI, d.sourceIP)
+	d.finishDecision() // release the per-session decision lock before the forward (piece B)
 	// recordObligations is false: a subscription does not log obligation names.
 	return enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodResourcesSubscribe, params.URI, params.URI, "resource subscription", false, upstreamErrorDetail)
 }
@@ -405,6 +431,7 @@ func dispatchPromptsGet(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) m
 	}
 	// Interface method (not a type-assert to *pdp.ManifestPDP).
 	dec := d.pdp.DecidePromptGet(d.decideCtx(ctx), d.sessionID, params.Name, d.sourceIP)
+	d.finishDecision() // release the per-session decision lock before the forward (piece B)
 	// auditID carries the "prompts/" display prefix; denialTarget is the bare name.
 	return enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodPromptsGet, "prompts/"+params.Name, params.Name, "prompt", true, upstreamErrorDetail)
 }

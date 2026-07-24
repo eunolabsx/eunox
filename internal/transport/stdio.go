@@ -181,6 +181,12 @@ type StdioProxy struct {
 	// notification-heavy host. Incremented in serveHost (the sole Add site) alongside
 	// fwdHostWrites.Add, decremented in the same OnceFunc release as fwdHostWrites.Done.
 	fwdHostInFlight atomic.Int64
+
+	// decideGate serializes this session's enforced-request decisions in proxy-receipt
+	// order when the policy is flow- or sequenceBlock-relevant (docs/flow-label-hardening.md
+	// piece B); the serve loop gates on decideGate != nil. nil keeps full intra-session
+	// decision parallelism. Set from StdioProxyOptions.SerializeDecisions at construction.
+	decideGate *decisionSerializer
 }
 
 // StdioProxyOptions configures a StdioProxy. The upstream is either a local
@@ -206,6 +212,13 @@ type StdioProxyOptions struct {
 	Audit              bool // observe mode: evaluate and log, but forward instead of block
 	RequireAuditStrict bool // --require-audit=strict: deny forwards once the audit trail degrades
 
+	// SerializeDecisions serializes this session's enforced-request decisions in
+	// proxy-receipt order when the policy is flow- or sequenceBlock-relevant, so a
+	// source's flow-label write is ordered before a later sink's read even under a
+	// pipelining client (docs/flow-label-hardening.md piece B). The binary sets it from
+	// manifest.HasFlowLabel() || manifest.HasSequenceBlock().
+	SerializeDecisions bool
+
 	// DriftCheck is the injected drift hook; nil = no drift checking.
 	DriftCheck drift.CheckFunc
 }
@@ -221,7 +234,7 @@ func NewStdioProxy(opts StdioProxyOptions) *StdioProxy {
 	if opts.ShutdownMs <= 0 {
 		opts.ShutdownMs = 5000
 	}
-	return &StdioProxy{
+	p := &StdioProxy{
 		command:               opts.Command,
 		args:                  opts.Args,
 		upstreamURL:           opts.UpstreamURL,
@@ -243,6 +256,10 @@ func NewStdioProxy(opts StdioProxyOptions) *StdioProxy {
 		hostReader:            mcp.NewMsgReader(os.Stdin),
 		hostWriter:            mcp.NewMsgWriter(os.Stdout),
 	}
+	if opts.SerializeDecisions {
+		p.decideGate = newDecisionSerializer()
+	}
+	return p
 }
 
 // rec returns the auditRecorder every enforcement/notification path in this file
@@ -351,7 +368,49 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 	p.killMu.Unlock()
 	p.waitUpstream()
 
+	// ── 8. Release this session's per-session enforcement state ─────────────────
+	// Free the session's accumulated flow-label set so an ended session retains nothing
+	// and a reused session id starts clean (docs/flow-label-hardening.md FR-H2). Ordered
+	// LAST, and gated behind a bounded drain of in-flight host decisions: on the clean-EOF
+	// path serveHost already waited for every handler, but on the signal/upstream-exit
+	// paths it returns WITHOUT waiting, and draining the upstream reader does NOT cover a
+	// handler still mid-DECISION (a sink peeking the flow set touches no upstream). Without
+	// the drain a Clear could empty the taint between a source's committed Add and a sink
+	// still deciding on this session (piece B). Detached, bounded context — teardown must
+	// not block on a slow store, and a Redis store reclaims an orphaned key by idle TTL
+	// regardless. A no-op when the policy uses no flow control.
+	p.awaitHostDecisionsDrained(time.Duration(p.shutdownMs) * time.Millisecond)
+	releaseCtx, releaseCancel := context.WithTimeout(context.Background(), time.Duration(p.shutdownMs)*time.Millisecond)
+	p.pdp.ReleaseSession(releaseCtx, p.sessionID) //nolint:contextcheck // teardown path: the host is gone; a detached, bounded context is correct here as for the other teardown steps.
+	releaseCancel()
+
 	return nil
+}
+
+// awaitHostDecisionsDrained blocks until no dispatched host request is still mid-decision
+// (fwdHostInFlight == 0), or until timeout elapses, so teardown does not clear per-session
+// flow state out from under a sink still deciding. serveHost returns without waiting for its
+// handler goroutines on the signal and upstream-exit paths, and the upstream drain does not
+// cover a handler still in its PDP decision (which touches no upstream), so releasing flow
+// state before those finish could drop a live taint (docs/flow-label-hardening.md piece B;
+// the stdio analogue of httpSession.awaitInFlightDrained). It is a no-op for a
+// non-flow/non-sequenceBlock session (decideGate nil) — ReleaseSession is itself a no-op
+// there, so there is nothing to protect and no reason to add teardown latency. Bounded and
+// poll-based: teardown is off the hot path and must never hang on a wedged handler. The read
+// loop (the sole fwdHostInFlight increment site) has already exited by the time Start calls
+// this, so the counter only falls — no request can slip in uncounted, unlike the HTTP path's
+// getSession/inFlight window.
+func (p *StdioProxy) awaitHostDecisionsDrained(timeout time.Duration) {
+	if p.decideGate == nil {
+		return
+	}
+	deadline := time.Now().Add(timeout)
+	for p.fwdHostInFlight.Load() > 0 {
+		if !time.Now().Before(deadline) {
+			return
+		}
+		time.Sleep(inFlightDrainPoll)
+	}
 }
 
 // connectUpstream establishes the upstream connection and wires upWriter/upReader:
@@ -829,6 +888,18 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 				_ = p.hostWriter.Write(mcp.ErrorResponse(msg.ID, jsonRPCCodeServerBusy, "eunox: too many concurrent requests in flight; retry"))
 				continue
 			}
+			// Reserve the decision ticket HERE, in the single-threaded read loop, so it
+			// reflects proxy-RECEIPT order — the handler goroutines then run their
+			// decisions in that order regardless of scheduling (docs/flow-label-hardening.md
+			// piece B). Only enforced methods take a ticket (only they run a PDP decision +
+			// state write), and only after the hostSem acquire above, so a server-busy
+			// rejection never strands an un-begun ticket that would stall every later one.
+			// A non-serialized session (non-flow/non-sequenceBlock policy) reserves none.
+			serialized := p.decideGate != nil && isEnforcedMethod(msg.Method)
+			var ticket uint64
+			if serialized {
+				ticket = p.decideGate.take()
+			}
 			// One goroutine per request. The read loop must NOT block on a request: it
 			// is also the only path that routes the host's replies to server-initiated
 			// requests back to the upstream, so blocking dispatch here would deadlock a
@@ -844,12 +915,24 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 				p.fwdHostWrites.Done()
 			})
 			wg.Add(1)
-			go func(m mcp.RPCMsg) {
+			go func(m mcp.RPCMsg, serialized bool, ticket uint64) {
 				defer wg.Done()
 				defer func() { <-p.hostSem }()
 				defer release()
-				p.handleHostRequest(context.WithValue(ctx, fwdReleaseKey{}, release), m)
-			}(msg)
+				hctx := context.WithValue(ctx, fwdReleaseKey{}, release)
+				// For a serialized enforced request, wait this ticket's turn before the
+				// decision runs (begin blocks until the earlier tickets' decisions
+				// commit), and advance the turn afterward. The Decide* handler releases
+				// early via finishDecision (before the upstream forward); this defer is
+				// the idempotent backstop for the malformed-params path, which returns
+				// before the decision. The end func is threaded to the handler via ctx.
+				if serialized {
+					end := p.decideGate.begin(ticket)
+					defer end()
+					hctx = withDecisionEnd(hctx, end)
+				}
+				p.handleHostRequest(hctx, m)
+			}(msg, serialized, ticket)
 			continue
 		}
 		if msg.IsResponse() {
@@ -962,7 +1045,13 @@ func (p *StdioProxy) forwardHostNotification(ctx context.Context, msg mcp.RPCMsg
 // cross-cutting kill gate cannot drift from the HTTP transport. initialize's local
 // response is supplied by p.buildInitResponse (wired into dispatchParams).
 func (p *StdioProxy) handleHostRequest(ctx context.Context, msg mcp.RPCMsg) {
-	_ = p.hostWriter.Write(dispatchRequest(ctx, p.dispatchParams(), msg))
+	d := p.dispatchParams()
+	// decisionEndFromContext is the per-session decision-lock release (nil unless the
+	// serve loop threaded one for a serialized enforced request); the Decide* handlers
+	// call it right after the PDP decision so the upstream forward runs outside the lock
+	// (piece B). A direct test caller of handleHostRequest threads none, so it is nil.
+	d.endDecision = decisionEndFromContext(ctx)
+	_ = p.hostWriter.Write(dispatchRequest(ctx, d, msg))
 }
 
 // strictAudit builds the --require-audit=strict configuration from the proxy's own
@@ -1042,8 +1131,25 @@ func (p *StdioProxy) handleUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) 
 		pdp:              p.pdp,
 		forward:          func(m mcp.RPCMsg) bool { p.forwardServerRequestToHost(m); return true },
 		writeUpstream:    func(m mcp.RPCMsg) { _ = p.upWriter.Write(m) },
+		decideLock:       p.samplingDecideLock(),
 		strictAuditState: p.strictAudit(),
 	})
+}
+
+// samplingDecideLock returns the entry into this session's decision serializer for a
+// server-initiated (sampling) decision, or nil when the session is not serialize-relevant.
+// It reserves a ticket and waits its turn on the SAME decideGate the host path uses, so a
+// sampling flowLabel sink cannot read the flow set concurrently with a host source's write
+// (docs/flow-label-hardening.md piece B). Unlike a host request, a sampling request is
+// upstream-initiated with no proxy-receipt order, so it simply takes the next ticket:
+// mutual exclusion — not receipt ordering — is the property it needs. The gate is
+// leaf-level and released before the forward, so the brief block it can impose on the
+// upstream reader is bounded by the decision path, never the upstream round-trip.
+func (p *StdioProxy) samplingDecideLock() func() (end func()) {
+	if p.decideGate == nil {
+		return nil
+	}
+	return func() func() { return p.decideGate.begin(p.decideGate.take()) }
 }
 
 // withUpstreamTimeout bounds a StdioProxy upstream round-trip (see boundUpstreamCall).
