@@ -21,11 +21,22 @@ import (
 	"strings"
 )
 
+// ManifestSchemaVersionFlowEffectDraft is the DRAFT grammar revision that opts a
+// manifest into the experimental flow+effect tokens (the flowLabel condition and the
+// labelOutput directive). Those tokens are staged behind schema-version negotiation:
+// a published "0.1" manifest that uses one is refused (the closed grammar stays
+// closed), and only a manifest declaring this draft version enables them. The draft
+// is deliberately NOT mirrored into schemas/ or the capability-manifest guide — it is
+// a staging vehicle until the tokens land in a batched grammar bump.
+const ManifestSchemaVersionFlowEffectDraft = "0.2-draft"
+
 var (
 	// supportedManifestSchemaVersions enumerates the manifest grammar versions
 	// this build can parse. Keep in sync with the spec's published
-	// schemas/<version>/ directories.
-	supportedManifestSchemaVersions = map[string]bool{"0.1": true}
+	// schemas/<version>/ directories. The "0.2-draft" entry is the experimental
+	// flow+effect staging revision (ManifestSchemaVersionFlowEffectDraft), gated so
+	// its tokens are inert under the published "0.1" grammar.
+	supportedManifestSchemaVersions = map[string]bool{"0.1": true, ManifestSchemaVersionFlowEffectDraft: true}
 
 	// supportedGatewaySchemaVersions enumerates the gateway-config grammar
 	// versions this build can parse. Keep in sync with

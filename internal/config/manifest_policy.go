@@ -30,6 +30,23 @@ func (m *LocalManifest) anyCondition(pred func(capability.Condition) bool) bool 
 	return false
 }
 
+// anyDirective is the directive-side mirror of anyCondition: it reports whether any
+// directive on any capability entry satisfies pred. Predicates accept both forms a
+// directive can take (pointer from the JSON loader, value from a programmatic build).
+func (m *LocalManifest) anyDirective(pred func(capability.Directive) bool) bool {
+	if m == nil {
+		return false
+	}
+	for i := range m.Capabilities {
+		for _, dir := range m.Capabilities[i].Directives {
+			if pred(dir) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // HasMaxCalls reports whether any capability entry carries a maxCalls condition.
 // The in-memory call counter is per-process, so the multi-instance state advisory
 // uses this to warn only when sharing that state would matter.
@@ -56,6 +73,20 @@ func (m *LocalManifest) HasSequenceBlock() bool {
 		}
 		return false
 	})
+}
+
+// HasFlowLabel reports whether any capability entry uses information-flow control — a
+// flowLabel condition (sink; reads per-session label state) or a labelOutput directive
+// (source; writes it). Both rely on cross-call CallCounter state exactly like maxCalls
+// and sequenceBlock, so the multi-instance shared-state advisory must warn on them too:
+// without shared Redis, a source recording a label on one instance and a sink Peeking it
+// on another fails open silently.
+func (m *LocalManifest) HasFlowLabel() bool {
+	// Single-sourced through the capability predicates (value/pointer-safe) so this
+	// config-level advisory and the engine's constraintHasFlow gate cannot drift on
+	// what counts as flow-relevant when the type set grows.
+	return m.anyCondition(capability.IsFlowLabelCondition) ||
+		m.anyDirective(capability.IsLabelOutputDirective)
 }
 
 // HasSamplingGrant reports whether the manifest grants server-initiated sampling:

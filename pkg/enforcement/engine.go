@@ -9,7 +9,6 @@ import (
 	"context"
 	"fmt"
 	"path"
-	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -177,6 +176,13 @@ type Engine struct {
 	// slot runConditions already committed, burning quota for a marker nothing reads.
 	skipAntecedentRecording bool
 
+	// skipFlow is set when the policy provably contains no flowLabel condition and no
+	// labelOutput directive, so evaluateMatched skips the per-call flow-relevance scan
+	// and the peek/record path entirely. Mirrors skipAntecedentRecording: it spares a
+	// non-flow policy the scan on every allow, and removes the recordLabels fail-closed
+	// deny path for a source-only policy whose markers no sink reads.
+	skipFlow bool
+
 	// counterKeyNamespace is folded into every maxCalls/sequenceBlock counter key
 	// (compositeCounterKey's first component). The binary wires each route's name here
 	// so every route's engine addresses a disjoint counter namespace even when they
@@ -225,6 +231,17 @@ func WithCallCounter(counter capability.CallCounter) Option {
 func WithoutAntecedentRecording() Option {
 	return func(e *Engine) {
 		e.skipAntecedentRecording = true
+	}
+}
+
+// WithoutFlowLabels tells the engine the policy contains no flowLabel condition and no
+// labelOutput directive, so it skips the per-call flow-relevance scan and the flow
+// peek/record path. Only set this when the policy is known to use neither (see
+// config.LocalManifest.HasFlowLabel); leaving it unset preserves the always-check
+// behavior. Mirrors WithoutAntecedentRecording.
+func WithoutFlowLabels() Option {
+	return func(e *Engine) {
+		e.skipFlow = true
 	}
 }
 
@@ -291,6 +308,26 @@ func withDirectives(ctx context.Context, dirs []capability.Directive) context.Co
 func directivesFromContext(ctx context.Context) ([]capability.Directive, bool) {
 	dirs, ok := ctx.Value(ctxDirectivesKey{}).([]capability.Directive)
 	return dirs, ok
+}
+
+// ctxCarriedLabelsKey carries the session's accumulated flow-label set that
+// evaluateMatched peeked for this decision, so handleFlowLabel reads the same snapshot
+// instead of Peeking the vocabulary a second time.
+type ctxCarriedLabelsKey struct{}
+
+// withCarriedLabels threads the already-peeked accumulated flow-label set (which may be
+// nil for a clean session) so a flowLabel sink reuses it. The value is stored even when
+// nil so carriedLabelsFromContext can distinguish "threaded, empty set" (ok=true) from
+// "never threaded" (ok=false, a direct handler caller that must Peek itself).
+func withCarriedLabels(ctx context.Context, labels []string) context.Context {
+	return context.WithValue(ctx, ctxCarriedLabelsKey{}, labels)
+}
+
+// carriedLabelsFromContext returns the threaded accumulated set and whether one was
+// threaded at all.
+func carriedLabelsFromContext(ctx context.Context) ([]string, bool) {
+	labels, ok := ctx.Value(ctxCarriedLabelsKey{}).([]string)
+	return labels, ok
 }
 
 // ctxSkipQuotaKey is the unexported context key used by WithSkipQuota.
@@ -627,12 +664,12 @@ func (e *Engine) runConditions(ctx context.Context, req *capability.EnforceReque
 // or a (*RedactFieldsDirective)(nil) boxed into a capability.Directive. Such a
 // value survives a plain `v == nil` check (the interface itself is non-nil) but
 // would panic a value/pointer-receiver method that dereferences it (e.g.
-// ConditionType(), ToObligation()). The single source of truth for this guard,
-// shared by runConditions' condition check and collectObligations' directive
-// check, so the two cannot drift.
+// ConditionType(), ToObligation()). Delegates to capability.IsTypedNil, the single
+// source of truth for this guard, shared by runConditions' condition check,
+// collectObligations' directive check, and the config-loader validation guards, so
+// the copies cannot drift.
 func isTypedNil(v interface{}) bool {
-	rv := reflect.ValueOf(v)
-	return rv.Kind() == reflect.Pointer && rv.IsNil()
+	return capability.IsTypedNil(v)
 }
 
 // commitDeferredAtomic admits a constraint's deferred (quota-consuming) conditions
@@ -800,10 +837,39 @@ func (e *Engine) evalCondition(ctx context.Context, cond capability.Condition, r
 // own deny (a failing condition, an unhandled directive, or a history-write fault).
 // Shared by ValidateAction and EvaluateConditions so the two cannot diverge on this
 // security-critical ordering.
-func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, requestID, now string) capability.EnforceResponse {
+func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, requestID, now string) (resp capability.EnforceResponse) {
 	// Done before conditions run so a policy condition can inspect the obligations
 	// that will apply on allow.
 	ctx = withDirectives(ctx, matched.Directives)
+
+	// Peek the incoming accumulated flow-label set up front (only for flow-relevant
+	// constraints, and skipped entirely when the whole policy has no flow — skipFlow —
+	// so a non-flow policy pays no scan or round-trip). It reflects what flowed IN,
+	// before this call's own output is recorded below. peekSessionLabels fails closed on
+	// an unreadable state, so a source-only constraint cannot silently under-report it.
+	flowRelevant := !e.skipFlow && constraintHasFlow(matched)
+	var carriedLabels []string
+	if flowRelevant {
+		var err error
+		carriedLabels, err = e.peekSessionLabels(ctx, req)
+		if err != nil {
+			return denyResponse(requestID, now, matched.IsAuditOnly(), nil, capability.DenialInfo{
+				Code:          capability.ErrCodeConditionFailed,
+				ConditionType: capability.ConditionTypeFlowLabel,
+				Message:       fmt.Sprintf("flow-label state lookup failed: %v", err),
+			})
+		}
+		// Thread the snapshot so handleFlowLabel reuses it (one atomic read, not two),
+		// and stamp it onto EVERY deny exit below via one defer so no hand-stamped exit
+		// can be forgotten. The allow return sets CarriedLabels explicitly, so the
+		// defer's deny-only guard skips it.
+		ctx = withCarriedLabels(ctx, carriedLabels)
+		defer func() {
+			if resp.Decision == capability.DecisionDeny && resp.CarriedLabels == nil {
+				resp.CarriedLabels = carriedLabels
+			}
+		}()
+	}
 
 	if deny := e.runConditions(ctx, req, matched, requestID, now); deny != nil {
 		return *deny
@@ -818,18 +884,40 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 		return *denyResp
 	}
 
-	// Allowed and forwarding: record the call so a later sequenceBlock on a different
-	// tool can detect it. A write failure fails closed (see recordSessionCall).
+	// Record the sequenceBlock antecedent BEFORE the flow labels: a recordSessionCall
+	// fault then denies with no labels yet committed, so a blocked call never taints the
+	// session with flow labels. For a pure flow policy recordSessionCall is skipped (no
+	// sequenceBlock), so recordLabels below is the only state write and this ordering has
+	// no residual. RESIDUAL (both labelOutput AND sequenceBlock present): the two state
+	// writes span the disjoint "seq:"/"flow:" namespaces and are not atomic, so if
+	// recordSessionCall commits and recordLabels then HARD-denies, the seq marker persists
+	// for a call that never ran (a phantom antecedent). This is fail-closed (over-block,
+	// never a leak) and symmetric with the reverse ordering; the atomic-commit fix is
+	// tracked in docs/flow-label-hardening.md, mirroring the analogous sequenceBlock note.
 	if err := e.recordSessionCall(ctx, req); err != nil {
 		return recordFailureDenial(requestID, now, matched.IsAuditOnly(), obligations)
 	}
 
+	// This call's own emitted labels (from labelOutput directives). A recordLabels fault
+	// fails closed as a HARD deny (see labelRecordFailureDenial), so an audit-mode source
+	// whose label failed to persist is not forwarded unlabeled.
+	var labelsOut []string
+	if flowRelevant {
+		var err error
+		labelsOut, err = e.recordLabels(ctx, req, matched)
+		if err != nil {
+			return labelRecordFailureDenial(requestID, now, matched.IsAuditOnly(), obligations)
+		}
+	}
+
 	return capability.EnforceResponse{
-		RequestID:   requestID,
-		Decision:    capability.DecisionAllow,
-		Obligations: obligations,
-		DecidedAt:   now,
-		AuditOnly:   matched.IsAuditOnly(),
+		RequestID:     requestID,
+		Decision:      capability.DecisionAllow,
+		Obligations:   obligations,
+		DecidedAt:     now,
+		AuditOnly:     matched.IsAuditOnly(),
+		LabelsOut:     labelsOut,
+		CarriedLabels: carriedLabels,
 	}
 }
 
@@ -1053,6 +1141,13 @@ func (e *Engine) collectObligations(matched *capability.Constraint, requestID, n
 		// produces one; this preserves the prior type switch's explicit nil-pointer
 		// guard so a constructed Constraint cannot crash the engine on a fail-closed path).
 		if isTypedNil(dir) {
+			continue
+		}
+		// labelOutput is an enforce-time state directive, not a response obligation:
+		// its effect is the session-label write recordLabels performs on allow, so it
+		// produces no post-allow response action. Skip it before ToObligation so it is
+		// neither applied to the response nor tripped by the unknown-obligation guard.
+		if dir.DirectiveType() == capability.DirectiveTypeLabelOutput {
 			continue
 		}
 		ob := dir.ToObligation()

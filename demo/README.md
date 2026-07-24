@@ -9,6 +9,24 @@ Two Docker services. One manifest file. First enforced tool call in under 10 min
 > `make -C demo trifecta-audit`, keeps the signed tape across runs and shows
 > tampering with it — a rewritten verdict, a forged record — being caught live.
 
+> **Information-flow control (experimental).** `make -C demo flow-exfil` shows
+> within-scope exfil blocked by *source→sink flow policy*: reading a sensitive
+> source labels the task `confidential`, so the identical egress write that a
+> clean session is allowed to make is **denied** once that label is present —
+> the agent is inside its granted capabilities, but the flow is not permitted.
+> Deterministic and model-free; `make -C demo ci-test-flow` asserts 20 identical
+> runs with a verified tape. Uses the experimental flow+effect grammar
+> (`flowLabel` / `labelOutput`), staged behind `schemaVersion: "0.2-draft"` in
+> [`manifest-flow.yaml`](./manifest-flow.yaml) — not part of the published `0.1`
+> grammar. Go + python3, no Docker.
+>
+> Honest limits (same shape as `sequenceBlock`): the source→sink guarantee holds
+> for a compliant, serialized MCP client — a client that fires the source read and
+> the egress write concurrently on one session can race the label write past the
+> sink's check; across multiple proxy instances it requires a shared Redis call
+> counter (a startup NOTICE warns when one is missing); and a session's taint is
+> retained for the session, not forever.
+
 ## What this demo shows
 
 - `eunox` sitting between a client and an MCP server, enforcing a YAML policy

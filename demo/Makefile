@@ -10,7 +10,7 @@
 #   cd demo && make up
 
 .PHONY: up up-jwt down allow deny deny-path deny-op audit jwt jwt-allow jwt-deny logs ci-test ci-test-jwt \
-        stdio-allow stdio-deny stdio-deny-path stdio-deny-op ci-test-stdio \
+        stdio-allow stdio-deny stdio-deny-path stdio-deny-op ci-test-stdio flow-exfil ci-test-flow \
         gateway-up gateway-down gw-files-allow gw-files-deny gw-db-allow gw-db-deny gw-cross-deny gw-404 \
         gateway-audit ci-test-gateway ci-test-e2e e2e trifecta trifecta-audit help
 
@@ -262,6 +262,14 @@ stdio-deny-op:
 ci-test-stdio:
 	@mkdir -p "$(DEMO_DIR)audit"
 	@bash "$(DEMO_DIR)scripts/ci-test-stdio.sh"
+
+## flow-exfil: Demo (a) — within-scope exfil blocked by source->sink flow policy (no Docker; go + python3).
+flow-exfil:
+	@bash "$(DEMO_DIR)scripts/flow-exfil.sh"
+
+## ci-test-flow: Determinism gate for Demo (a) — 20 identical runs + verified tape (no Docker; go + python3).
+ci-test-flow:
+	@bash "$(DEMO_DIR)scripts/ci-test-flow.sh"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Full end-to-end suite (demo/e2e) — mock host + mock server drive the REAL

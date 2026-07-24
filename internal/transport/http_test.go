@@ -5406,7 +5406,7 @@ func TestHealthAndMetricsEndpoints(t *testing.T) {
 		sink, _ := newTempAuditSink(t)
 		for i := 0; i < 50 && sink.WriteFailures() == 0; i++ {
 			sink.RecordAllow(context.Background(), "sess", "tool", "tools/call",
-				map[string]interface{}{"bad": math.Inf(1)}, nil, false)
+				map[string]interface{}{"bad": math.Inf(1)}, nil, false, nil, nil)
 			time.Sleep(5 * time.Millisecond)
 		}
 		if sink.WriteFailures() == 0 {

@@ -1179,7 +1179,7 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 		return err
 	}
 
-	warnNoRedisSharedState(pf.redisConfigured, transport.AnyRouteHasMaxCalls(routes) || transport.AnyRouteHasSequenceBlock(routes))
+	warnNoRedisSharedState(pf.redisConfigured, transport.AnyRouteHasMaxCalls(routes) || transport.AnyRouteHasSequenceBlock(routes) || transport.AnyRouteHasFlowLabel(routes))
 
 	bind := cfg.Listen.Bind
 	if bind == "" {
@@ -1403,7 +1403,7 @@ func serveStdioHost(ctx context.Context, cfg *config.GatewayConfig, sink *audit.
 
 	upstreamTimeMs := transport.ResolveUpstreamTimeout(pf.upstreamTimeoutMs, cfg.Defaults.UpstreamTimeoutMs)
 
-	warnNoRedisSharedState(pf.redisConfigured, manifest.HasMaxCalls() || manifest.HasSequenceBlock())
+	warnNoRedisSharedState(pf.redisConfigured, manifest.HasMaxCalls() || manifest.HasSequenceBlock() || manifest.HasFlowLabel())
 
 	proxy := transport.NewStdioProxy(transport.StdioProxyOptions{
 		Command:               u.Command,

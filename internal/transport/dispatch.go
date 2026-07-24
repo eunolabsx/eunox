@@ -499,7 +499,7 @@ func dispatchList(ctx context.Context, d dispatchParams, msg mcp.RPCMsg, filter 
 	// same immediate boundary-call diagnostic under strict mode.
 	warnIfStrictAuditJustDegraded(d.requireAuditStrict, d.rec, msg.Method, msg.Method, func() {
 		if d.rec != nil {
-			d.rec.RecordAllow(ctx, d.sessionID, msg.Method, msg.Method, listAllowDetails(upResp, upstreamCount, filteredCount, d.audit), nil, d.audit)
+			d.rec.RecordAllow(ctx, d.sessionID, msg.Method, msg.Method, listAllowDetails(upResp, upstreamCount, filteredCount, d.audit), nil, d.audit, nil, nil)
 		}
 	})
 

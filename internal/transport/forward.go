@@ -25,7 +25,7 @@ import (
 // test; a direct assignment of a nil concrete pointer would reintroduce the typed-nil
 // interface trap.
 type auditRecorder interface {
-	RecordAllow(ctx context.Context, sessionID, identifier, method string, details map[string]interface{}, obligs []string, auditOnly bool)
+	RecordAllow(ctx context.Context, sessionID, identifier, method string, details map[string]interface{}, obligs []string, auditOnly bool, labelsOut, carriedLabels []string)
 	RecordDeny(ctx context.Context, sessionID, identifier, method, denialCode, condType string, details map[string]interface{}, observe bool)
 	// AuditDegraded reports whether the audit trail has lost coverage (a dropped or
 	// failed-to-write record). reason is a short prose note for the host-facing
@@ -396,7 +396,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 	// genuine allow. allowDetails supplies the structured details.
 	warnIfStrictAuditJustDegraded(fp.requireAuditStrict, fp.rec, kind, denialTarget, func() {
 		if fp.rec != nil {
-			fp.rec.RecordAllow(ctx, fp.sessionID, auditID, method, allowDetails(upResp), oblNames, fp.audit || dec.AuditOnly)
+			fp.rec.RecordAllow(ctx, fp.sessionID, auditID, method, allowDetails(upResp), oblNames, fp.audit || dec.AuditOnly, dec.LabelsOut, dec.CarriedLabels)
 		}
 	})
 	upResp.ID = msg.ID
@@ -529,13 +529,13 @@ func (fp serverRequestParams) strictServerRequestAuditDenial(ctx context.Context
 // Each of the three call sites gates its own forward on strictServerRequestAuditDenial
 // beforehand, the same gate-before/record-after shape as enforcedForwardCore, so this
 // record call gets the same immediate boundary-call diagnostic under strict mode.
-func recordForwardOutcome(ctx context.Context, strict bool, rec auditRecorder, sessionID, method string, delivered, auditOnly bool) {
+func recordForwardOutcome(ctx context.Context, strict bool, rec auditRecorder, sessionID, method string, delivered, auditOnly bool, labelsOut, carriedLabels []string) {
 	warnIfStrictAuditJustDegraded(strict, rec, method, method, func() {
 		if rec == nil {
 			return
 		}
 		if delivered {
-			rec.RecordAllow(ctx, sessionID, method, method, nil, nil, auditOnly)
+			rec.RecordAllow(ctx, sessionID, method, method, nil, nil, auditOnly, labelsOut, carriedLabels)
 		} else {
 			rec.RecordDeny(ctx, sessionID, method, method, capability.ErrCodeEnforcementError, "", nil, false)
 		}
@@ -586,7 +586,9 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 			return
 		}
 		delivered := fp.forward(msg)
-		recordForwardOutcome(ctx, fp.requireAuditStrict, fp.rec, fp.sessionID, msg.Method, delivered, fp.audit)
+		// Non-sampling methods are not policy-enforced, so there is no flow decision and
+		// no labels to record.
+		recordForwardOutcome(ctx, fp.requireAuditStrict, fp.rec, fp.sessionID, msg.Method, delivered, fp.audit, nil, nil)
 		return
 	}
 
@@ -606,7 +608,10 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 			return
 		}
 		delivered := fp.forward(msg)
-		recordForwardOutcome(ctx, fp.requireAuditStrict, fp.rec, fp.sessionID, samplingMethod, delivered, fp.audit)
+		// Carry the sampling decision's flow labels onto the tape: a flowLabel/labelOutput
+		// on the system:sampling constraint mutated session flow-state, so the record must
+		// show labels_out/carried_labels or the tape and state disagree for the sampling leg.
+		recordForwardOutcome(ctx, fp.requireAuditStrict, fp.rec, fp.sessionID, samplingMethod, delivered, fp.audit, dec.LabelsOut, dec.CarriedLabels)
 		return
 	}
 
@@ -629,7 +634,11 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 		// sees the actual reason (CONDITION_FAILED, MAX_CALLS_EXCEEDED, …) instead of a
 		// hardcoded "AUTHORIZATION_FAILED" that contradicts the recorded code.
 		if fp.rec != nil {
-			fp.rec.RecordDeny(ctx, fp.sessionID, samplingMethod, samplingMethod, denial.Code, denial.ConditionType, nil, false)
+			// Pass denial.Details (as the tool/resource/prompt path does): a flowLabel deny
+			// on the system:sampling constraint names the blocked provenance class there, and
+			// the deny record carries no carried_labels precisely because details does — so
+			// dropping details would leave the offending label absent from the signed tape.
+			fp.rec.RecordDeny(ctx, fp.sessionID, samplingMethod, samplingMethod, denial.Code, denial.ConditionType, denial.Details, false)
 		}
 		fp.writeUpstream(mcp.ErrorResponse(msg.ID, denialToJSONRPCCode(denial.Code), denial.Code))
 		return
@@ -645,13 +654,17 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 	// between the two can never leave a SIEM-visible alert with no corresponding
 	// tamper-evident audit record.
 	if fp.rec != nil {
-		fp.rec.RecordDeny(ctx, fp.sessionID, samplingMethod, samplingMethod, denial.Code, denial.ConditionType, nil, true)
+		// Carry denial.Details on the observe path too, for the same reason as the hard-deny
+		// branch above: the would-be flowLabel deny's blocked label must reach the tape.
+		fp.rec.RecordDeny(ctx, fp.sessionID, samplingMethod, samplingMethod, denial.Code, denial.ConditionType, denial.Details, true)
 	}
 	fmt.Fprintf(os.Stderr,
 		"[eunox] AUDIT: sampling/createMessage would be denied (%s) — forwarding (audit mode)\n",
 		denial.Code,
 	)
 	delivered := fp.forward(msg)
-	// audit=true: this is the audit-mode observe path.
-	recordForwardOutcome(ctx, fp.requireAuditStrict, fp.rec, fp.sessionID, samplingMethod, delivered, true)
+	// audit=true: this is the audit-mode observe path. dec is the (downgraded) deny, which
+	// still carries carried_labels (stamped by the engine on flow-relevant denies), so the
+	// observed-forward record shows the accumulated set of the flow that was let through.
+	recordForwardOutcome(ctx, fp.requireAuditStrict, fp.rec, fp.sessionID, samplingMethod, delivered, true, dec.LabelsOut, dec.CarriedLabels)
 }

@@ -340,7 +340,7 @@ func TestRouteSink_StampsAuditRecordAndVerifies(t *testing.T) {
 	t.Parallel()
 	sink, logPath := newTempAuditSink(t)
 	rs := &routeSink{sink: sink, upstream: "stripe", policyVersion: "2.1.0", policySHA256: "sha256:deadbeef"}
-	rs.RecordAllow(context.Background(), "sess-1", "create_charge", "tools/call", map[string]interface{}{"amount": 100}, nil, true)
+	rs.RecordAllow(context.Background(), "sess-1", "create_charge", "tools/call", map[string]interface{}{"amount": 100}, nil, true, nil, nil)
 	_ = sink.Close()
 
 	recs := readAuditRecords(t, logPath)
@@ -380,7 +380,7 @@ func TestRouteSink_EmptyUpstreamOmitsFields(t *testing.T) {
 	t.Parallel()
 	sink, logPath := newTempAuditSink(t)
 	rs := &routeSink{sink: sink} // upstream/version/hash all empty
-	rs.RecordAllow(context.Background(), "sess-1", "read_file", "tools/call", nil, nil, false)
+	rs.RecordAllow(context.Background(), "sess-1", "read_file", "tools/call", nil, nil, false, nil, nil)
 	_ = sink.Close()
 
 	recs := readAuditRecords(t, logPath)

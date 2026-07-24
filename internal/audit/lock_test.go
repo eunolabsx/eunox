@@ -36,7 +36,7 @@ func TestAuditSink_SecondOpenSamePath_FailsClosed(t *testing.T) {
 	}
 
 	// Write through the first sink and close it, releasing the lock.
-	s1.RecordAllow(context.Background(), "sess", "tool:read", "tools/call", nil, nil, false)
+	s1.RecordAllow(context.Background(), "sess", "tool:read", "tools/call", nil, nil, false, nil, nil)
 	if err := s1.Close(); err != nil {
 		t.Fatalf("first Close: %v", err)
 	}
@@ -47,7 +47,7 @@ func TestAuditSink_SecondOpenSamePath_FailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen after Close: %v", err)
 	}
-	s3.RecordAllow(context.Background(), "sess", "tool:read", "tools/call", nil, nil, false)
+	s3.RecordAllow(context.Background(), "sess", "tool:read", "tools/call", nil, nil, false, nil, nil)
 	if err := s3.Close(); err != nil {
 		t.Fatalf("third Close: %v", err)
 	}

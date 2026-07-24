@@ -60,6 +60,21 @@ func marshalDirective(directive Directive) ([]byte, error) {
 			directiveEnvelope
 			*alias
 		}{directiveEnvelope{Type: typed.DirectiveType()}, (*alias)(typed)})
+	case LabelOutputDirective:
+		type alias LabelOutputDirective
+		return json.Marshal(struct {
+			directiveEnvelope
+			alias
+		}{directiveEnvelope{Type: typed.DirectiveType()}, alias(typed)})
+	case *LabelOutputDirective:
+		if typed == nil {
+			return []byte("null"), nil
+		}
+		type alias LabelOutputDirective
+		return json.Marshal(struct {
+			directiveEnvelope
+			*alias
+		}{directiveEnvelope{Type: typed.DirectiveType()}, (*alias)(typed)})
 	default:
 		return nil, fmt.Errorf("unsupported directive payload: %T", directive)
 	}
@@ -75,7 +90,7 @@ func unmarshalDirective(data []byte) (Directive, error) {
 	}
 	target := newDirective(envelope.Type)
 	if target == nil {
-		return nil, fmt.Errorf("unknown directive type %q — valid types are: redactFields", envelope.Type)
+		return nil, fmt.Errorf("unknown directive type %q — valid types are: redactFields, labelOutput", envelope.Type)
 	}
 	if err := json.Unmarshal(data, target); err != nil {
 		return nil, err
@@ -87,6 +102,8 @@ func newDirective(directiveType string) Directive {
 	switch directiveType {
 	case DirectiveTypeRedactFields:
 		return &RedactFieldsDirective{}
+	case DirectiveTypeLabelOutput:
+		return &LabelOutputDirective{}
 	default:
 		return nil
 	}

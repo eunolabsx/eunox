@@ -94,11 +94,11 @@ type routeSink struct {
 // RecordAllow stamps the route identity and policy provenance onto an allow
 // record and forwards to the shared sink. RecordAllow/RecordDeny match
 // *audit.Sink's typed recorders so the HTTP handlers stay upstream-agnostic.
-func (r *routeSink) RecordAllow(ctx context.Context, sessionID, identifier, method string, details map[string]interface{}, obligs []string, auditOnly bool) {
+func (r *routeSink) RecordAllow(ctx context.Context, sessionID, identifier, method string, details map[string]interface{}, obligs []string, auditOnly bool, labelsOut, carriedLabels []string) {
 	if r == nil || r.sink == nil {
 		return
 	}
-	r.sink.Record(ctx, r.upstream, r.policyVersion, r.policySHA256, sessionID, identifier, method, "allow", "", "", details, obligs, auditOnly)
+	r.sink.Record(ctx, r.upstream, r.policyVersion, r.policySHA256, sessionID, identifier, method, "allow", "", "", details, obligs, auditOnly, labelsOut, carriedLabels)
 }
 
 // RecordDeny stamps route identity onto a deny record (see RecordAllow).
@@ -106,7 +106,7 @@ func (r *routeSink) RecordDeny(ctx context.Context, sessionID, identifier, metho
 	if r == nil || r.sink == nil {
 		return
 	}
-	r.sink.Record(ctx, r.upstream, r.policyVersion, r.policySHA256, sessionID, identifier, method, "deny", denialCode, condType, details, nil, observe)
+	r.sink.Record(ctx, r.upstream, r.policyVersion, r.policySHA256, sessionID, identifier, method, "deny", denialCode, condType, details, nil, observe, nil, nil)
 }
 
 // AuditDegraded delegates to the shared sink so the --require-audit=strict gate
@@ -472,6 +472,13 @@ func LoadUpstreamPDP(u *config.UpstreamConfig, hostTransport, baseDir string, co
 		// fault).
 		engineOpts = append(engineOpts, enforcement.WithoutAntecedentRecording())
 	}
+	if !merged.HasFlowLabel() {
+		// No flowLabel condition or labelOutput directive anywhere in the policy: the
+		// per-call flow-relevance scan and the peek/record path are pure overhead, and
+		// skipping them also drops the recordLabels fail-closed deny path a source-only
+		// policy would otherwise carry. Mirrors the WithoutAntecedentRecording gate above.
+		engineOpts = append(engineOpts, enforcement.WithoutFlowLabels())
+	}
 	engine := enforcement.New(engineOpts...)
 	digest, err := merged.Digest()
 	if err != nil {
@@ -585,6 +592,21 @@ func AnyRouteHasSequenceBlock(routes map[string]*UpstreamRoute) bool {
 	for _, rt := range routes {
 		// A policyless (wiretap) route has a nil manifest; guard explicitly.
 		if rt.manifest != nil && rt.manifest.HasSequenceBlock() {
+			return true
+		}
+	}
+	return false
+}
+
+// AnyRouteHasFlowLabel reports whether any route's manifest uses information-flow
+// control (a flowLabel condition or a labelOutput directive). Like maxCalls/
+// sequenceBlock, flow labels are per-session state in the shared call counter — per
+// process under the default in-memory backend — so the multi-instance advisory warns on
+// a flow policy too: without shared Redis, a source on one instance and a sink on
+// another fail open silently.
+func AnyRouteHasFlowLabel(routes map[string]*UpstreamRoute) bool {
+	for _, rt := range routes {
+		if rt.manifest != nil && rt.manifest.HasFlowLabel() {
 			return true
 		}
 	}

@@ -357,8 +357,8 @@ func TestVerifyLog_WithSinceFilterSkips(t *testing.T) {
 		clockN++
 		return t
 	}
-	sink.RecordAllow(context.Background(), "sess", "old", "tools/call", nil, nil, false)
-	sink.RecordAllow(context.Background(), "sess", "new", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess", "old", "tools/call", nil, nil, false, nil, nil)
+	sink.RecordAllow(context.Background(), "sess", "new", "tools/call", nil, nil, false, nil, nil)
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -401,10 +401,10 @@ func TestDrainFsyncSteadyState(t *testing.T) {
 	// A mix of allow and deny records through the public API so deriveTargetFields,
 	// drain, writeRecord, and the steady-state fsync all run.
 	sink.RecordAllow(context.Background(), "sess-1", "calc", "tools/call",
-		map[string]interface{}{"x": 1}, []string{"redactFields:$.secret"}, false)
+		map[string]interface{}{"x": 1}, []string{"redactFields:$.secret"}, false, nil, nil)
 	sink.RecordDeny(context.Background(), "sess-1", "rm", "tools/call",
 		"AUTHORIZATION_FAILED", "", map[string]interface{}{"reason": "not allowed"}, false)
-	sink.RecordAllow(context.Background(), "sess-1", "memory://note", "resources/read", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess-1", "memory://note", "resources/read", nil, nil, false, nil, nil)
 
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -631,7 +631,7 @@ func TestRotationViaPublicAPI(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	for i := 0; i < 8; i++ {
-		sink.RecordAllow(context.Background(), "sess", fmt.Sprintf("tool-%d", i), "tools/call", nil, nil, false)
+		sink.RecordAllow(context.Background(), "sess", fmt.Sprintf("tool-%d", i), "tools/call", nil, nil, false, nil, nil)
 	}
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -685,7 +685,7 @@ func TestReadLastAuditLine_LargeTail(t *testing.T) {
 	var lastTool string
 	for i := 0; i < 200; i++ {
 		lastTool = fmt.Sprintf("tool-%d", i)
-		sink.RecordAllow(context.Background(), "sess", lastTool, "tools/call", nil, nil, false)
+		sink.RecordAllow(context.Background(), "sess", lastTool, "tools/call", nil, nil, false, nil, nil)
 	}
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -870,7 +870,7 @@ func TestOpen_NegativeRetainNormalized(t *testing.T) {
 	if sink.retain != 0 {
 		t.Fatalf("negative retain not normalized: got %d, want 0", sink.retain)
 	}
-	sink.RecordAllow(context.Background(), "sess", "tool", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess", "tool", "tools/call", nil, nil, false, nil, nil)
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}

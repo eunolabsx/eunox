@@ -481,6 +481,20 @@ func TestRedis_KillAndReviveAgent(t *testing.T) {
 	r.Start(ctx) // ShouldBlock fails closed until the switch is started
 	defer r.Stop()
 
+	// The issuing instance applies a kill/revive to its own cache synchronously, but it
+	// ALSO consumes its own pub/sub echoes on the subscriber goroutine. A kill echo still
+	// in flight when a later ReviveAgent runs can be applied AFTER the synchronous revive
+	// delete and transiently re-add the agent — fail-closed and self-correcting in
+	// production, but a test race (the CI flake this guards). Drain the kill echo before
+	// reviving so the revive's synchronous delete is final: cacheGen bumps once for the
+	// synchronous kill (setBlock) and once more when the echo is applied
+	// (handlePubSubMessage), and nothing else mutates it here (refreshState does not bump
+	// it), so genBeforeKill+2 means the echo has been consumed. The revive echo only
+	// deletes, so it needs no such drain.
+	r.mu.RLock()
+	genBeforeKill := r.cacheGen
+	r.mu.RUnlock()
+
 	require.NoError(t, r.KillAgent(ctx, "agent-xyz"))
 	r.mu.RLock()
 	assert.True(t, r.killedAgents["agent-xyz"])
@@ -489,6 +503,12 @@ func TestRedis_KillAndReviveAgent(t *testing.T) {
 	blocked, err := r.ShouldBlock(ctx, "agent-xyz", "")
 	require.NoError(t, err)
 	assert.True(t, blocked)
+
+	require.Eventually(t, func() bool {
+		r.mu.RLock()
+		defer r.mu.RUnlock()
+		return r.cacheGen >= genBeforeKill+2
+	}, 2*time.Second, 5*time.Millisecond, "the issuer's own kill pub/sub echo must be consumed before revive")
 
 	require.NoError(t, r.ReviveAgent(ctx, "agent-xyz"))
 	r.mu.RLock()

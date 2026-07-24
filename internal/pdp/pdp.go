@@ -841,7 +841,7 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 	if !containsAction(matched.Actions, required) {
 		resp := denyResponse(p.engineClock(), capability.ErrCodeCapabilityDenied, "",
 			fmt.Sprintf("constraint %q does not permit %s (actions must include %q or '*'; got: %s)", matched.Target, targetOperationPhrase(target.Type), required, strings.Join(matched.Actions, ", ")))
-		if override := recordAuditModeAntecedent(ctx, p.engine, p.engineClock(), req, matched, resp); override != nil {
+		if override := recordAuditModeAntecedent(ctx, p.engine, p.engineClock(), req, matched, &resp); override != nil {
 			return *override
 		}
 		return stamp(resp)
@@ -854,7 +854,7 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 	if matched.ArgumentSchema != nil && schema == validateSchema {
 		if err := enforcement.ValidateArgumentSchema(args, matched.ArgumentSchema); err != nil {
 			resp := denyResponse(p.engineClock(), capability.ErrCodeInvalidParams, "argumentSchema", err.Error())
-			if override := recordAuditModeAntecedent(ctx, p.engine, p.engineClock(), req, matched, resp); override != nil {
+			if override := recordAuditModeAntecedent(ctx, p.engine, p.engineClock(), req, matched, &resp); override != nil {
 				return *override
 			}
 			return stamp(resp)
@@ -873,7 +873,7 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 // channel to branch on here — a deny is always a structured EnforceResponse.
 func (p *ManifestPDP) evaluateAndRecord(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint) capability.EnforceResponse {
 	resp := p.engine.EvaluateConditions(ctx, req, matched)
-	if override := recordAuditModeAntecedent(ctx, p.engine, p.engineClock(), req, matched, resp); override != nil {
+	if override := recordAuditModeAntecedent(ctx, p.engine, p.engineClock(), req, matched, &resp); override != nil {
 		return *override
 	}
 	return resp
@@ -894,28 +894,73 @@ func targetOperationPhrase(t capability.TargetType) string {
 	}
 }
 
-// recordAuditModeAntecedent records the call in session history when an
-// audit-mode constraint DOWNGRADES a deny to a forwarded call. On that path
-// EvaluateConditions skips recordSessionCall but the transport still forwards and
-// the tool runs, so a later sequenceBlock naming this target would Peek an empty
-// history and fail OPEN. The genuine-allow path is already recorded inside
-// EvaluateConditions, and an enforced deny means the tool never ran, so neither
-// needs this — and neither does a HardDeny audit-mode deny: it is NOT downgraded,
-// so the tool never runs, and recording it would poison history with a phantom
-// antecedent (the bug the HardDeny check below prevents).
+// recordAuditModeAntecedent records session state when an audit-mode constraint
+// DOWNGRADES a deny to a forwarded call. On that path EvaluateConditions returns the
+// deny before its allow-tail state writes run, but the transport still forwards and the
+// tool runs, so two guarantees would otherwise be broken: a later sequenceBlock naming
+// this target Peeks an empty history and fails OPEN (RecordSessionCall closes this), and
+// a later flowLabel sink Peeks the labelOutput labels this forwarded read actually
+// carried and fails OPEN (RecordLabels closes this — the data was produced, so it must
+// be labeled). The genuine-allow path already records both inside EvaluateConditions,
+// and an enforced deny means the tool never ran, so neither needs this — and neither
+// does a HardDeny audit-mode deny: it is NOT downgraded, so recording would attribute
+// state to a call that never ran (the bug the HardDeny check below prevents).
 //
-// When RecordSessionCall fails the sequenceBlock integrity guarantee cannot be
-// upheld, so the call returns a hardDenyResponse CONDITION_FAILED deny — non-
-// downgradable even under audit (see hardDenyResponse).
+// When either record fails the corresponding integrity guarantee cannot be upheld, so
+// the call returns a hardDenyResponse CONDITION_FAILED deny — non-downgradable even
+// under audit (see hardDenyResponse), so the read is not forwarded with unreliable
+// state. RecordSessionCall runs first so a fault there commits no labels.
+//
+// On the downgrade the labels this forwarded read carries in and asserts out are
+// stamped back onto resp (LabelsOut from RecordLabels, CarriedLabels from a pre-write
+// Peek) so the audit record of the forwarded observe-allow reflects the same flow the
+// genuine-allow path records inside EvaluateConditions — otherwise an audit-mode source
+// read would log with empty labels though it produced labeled data. The structural
+// early-return denies (action mismatch, INVALID_PARAMS) never ran conditions, so resp
+// arrives with CarriedLabels nil; a flow-relevant condition deny arrives already
+// stamped by evaluateMatched, so the Peek is skipped to avoid a redundant read. The
+// back-fill mutates resp through the pointer, so callers see the stamped labels.
+//
+// The flow peek/record and the label back-fill are gated on the SAME per-constraint
+// predicate the genuine-allow path uses (evaluateMatched's flowRelevant =
+// !skipFlow && constraintHasFlow), so a non-flow constraint's forwarded observe record
+// stays label-free — matching the record a genuine allow of that constraint writes,
+// rather than over-reporting the session's accumulated labels on a call that is neither a
+// flow source nor a sink — and pays none of the vocabulary Peek cost, honoring the
+// WithoutFlowLabels optimization on this path too. RecordSessionCall stays ungated: the
+// sequenceBlock antecedent must be recorded for every downgraded deny regardless of flow.
 //
 // clock is p.engineClock() at every call site so the frozen test clock is honored
 // and a nil engine never reaches engine.Clock() directly.
-func recordAuditModeAntecedent(ctx context.Context, engine *enforcement.Engine, clock enforcement.Clock, req *capability.EnforceRequest, matched *capability.Constraint, resp capability.EnforceResponse) *capability.EnforceResponse {
+func recordAuditModeAntecedent(ctx context.Context, engine *enforcement.Engine, clock enforcement.Clock, req *capability.EnforceRequest, matched *capability.Constraint, resp *capability.EnforceResponse) *capability.EnforceResponse {
 	if matched.IsAuditOnly() && resp.Decision == capability.DecisionDeny && (resp.Denial == nil || !resp.Denial.HardDeny) {
+		flowRelevant := capability.ConstraintHasFlow(matched)
+		// Capture the carried set before any write, only for a flow-relevant constraint
+		// whose deny did not already stamp it (a condition deny routed through
+		// evaluateMatched has). The Peek is audit reflection, not a decision, so its error
+		// is not fail-closed — the enforcement verdict is already settled.
+		var incoming []string
+		if flowRelevant && resp.CarriedLabels == nil {
+			incoming, _ = engine.PeekSessionLabels(ctx, req)
+		}
 		if err := engine.RecordSessionCall(ctx, req); err != nil {
 			deny := hardDenyResponse(clock, capability.ErrCodeConditionFailed,
 				"audit-mode antecedent record failed: "+err.Error())
 			return &deny
+		}
+		if flowRelevant {
+			labels, err := engine.RecordLabels(ctx, req, matched)
+			if err != nil {
+				deny := hardDenyResponse(clock, capability.ErrCodeConditionFailed,
+					"audit-mode flow-label record failed: "+err.Error())
+				return &deny
+			}
+			if len(labels) > 0 {
+				resp.LabelsOut = labels
+			}
+			if resp.CarriedLabels == nil {
+				resp.CarriedLabels = incoming
+			}
 		}
 	}
 	return nil

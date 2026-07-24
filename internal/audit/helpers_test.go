@@ -71,7 +71,7 @@ func writeChainLog(t *testing.T, dir string, tools ...string) (logPath, keyPath 
 		t.Fatalf("Open: %v", err)
 	}
 	for _, tool := range tools {
-		sink.RecordAllow(context.Background(), "sess", tool, "tools/call", nil, nil, false)
+		sink.RecordAllow(context.Background(), "sess", tool, "tools/call", nil, nil, false, nil, nil)
 	}
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)

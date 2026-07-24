@@ -44,11 +44,23 @@ func (w *ConditionWrapper) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// IsTypedNil reports whether v is a non-nil interface wrapping a nil pointer — the
+// "typed nil" that slips past a plain v == nil check yet panics on any method call whose
+// receiver it dereferences (a value-receiver ConditionType/DirectiveType on a decoded
+// condition/directive). It is the single reflect-based typed-nil predicate, so the
+// validation and marshaling guards that reject a typed nil before such a call share one
+// definition. A plain-nil interface returns false (reflect.ValueOf(nil) has Kind Invalid),
+// so callers pair it with an explicit v == nil check where a plain nil is also rejected.
+func IsTypedNil(v any) bool {
+	rv := reflect.ValueOf(v)
+	return rv.Kind() == reflect.Pointer && rv.IsNil()
+}
+
 func marshalCondition(condition Condition) ([]byte, error) {
 	// A typed-nil pointer slips past ConditionWrapper.MarshalJSON's nil-interface
 	// guard; ConditionType() has a value receiver and would dereference nil and
 	// panic. Guard it once here, mirroring directives.go's marshalDirective.
-	if rv := reflect.ValueOf(condition); rv.Kind() == reflect.Pointer && rv.IsNil() {
+	if IsTypedNil(condition) {
 		return []byte("null"), nil
 	}
 	switch typed := condition.(type) {
@@ -184,6 +196,18 @@ func marshalCondition(condition Condition) ([]byte, error) {
 			conditionEnvelope
 			*alias
 		}{conditionEnvelope{Type: typed.ConditionType()}, (*alias)(typed)})
+	case FlowLabelCondition:
+		type alias FlowLabelCondition
+		return json.Marshal(struct {
+			conditionEnvelope
+			alias
+		}{conditionEnvelope{Type: typed.ConditionType()}, alias(typed)})
+	case *FlowLabelCondition:
+		type alias FlowLabelCondition
+		return json.Marshal(struct {
+			conditionEnvelope
+			*alias
+		}{conditionEnvelope{Type: typed.ConditionType()}, (*alias)(typed)})
 	default:
 		return nil, fmt.Errorf("unsupported condition payload: %T", condition)
 	}
@@ -240,6 +264,7 @@ var knownConditionTypes = []string{
 	ConditionTypeRecipientDomain,
 	ConditionTypeAllowedValues,
 	ConditionTypeSequenceBlock,
+	ConditionTypeFlowLabel,
 	ConditionTypePolicy,
 	ConditionTypeCustom,
 }
@@ -275,6 +300,8 @@ func newCondition(conditionType string) Condition {
 		return &AllowedValuesCondition{}
 	case ConditionTypeSequenceBlock:
 		return &SequenceBlockCondition{}
+	case ConditionTypeFlowLabel:
+		return &FlowLabelCondition{}
 	default:
 		return nil
 	}

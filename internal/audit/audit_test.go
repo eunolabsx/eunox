@@ -163,7 +163,7 @@ func TestAuditChain_LegacyPreSigningRecordsExempt(t *testing.T) {
 		t.Fatalf("openAuditSink: %v", err)
 	}
 	for _, tool := range []string{"c", "d", "e"} {
-		sink.RecordAllow(context.Background(), "sess", tool, "tools/call", nil, nil, false)
+		sink.RecordAllow(context.Background(), "sess", tool, "tools/call", nil, nil, false, nil, nil)
 	}
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -427,8 +427,8 @@ func TestAuditChain_ResumesAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
-	sink.RecordAllow(context.Background(), "sess", "c", "tools/call", nil, nil, false)
-	sink.RecordAllow(context.Background(), "sess", "d", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess", "c", "tools/call", nil, nil, false, nil, nil)
+	sink.RecordAllow(context.Background(), "sess", "d", "tools/call", nil, nil, false, nil, nil)
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -472,8 +472,8 @@ func TestAuditChain_ResumesFromLegacyTail(t *testing.T) {
 			if err != nil {
 				t.Fatalf("openAuditSink: %v", err)
 			}
-			sink.RecordAllow(context.Background(), "sess", "newtool", "tools/call", nil, nil, false)
-			sink.RecordAllow(context.Background(), "sess", "newtool2", "tools/call", nil, nil, false)
+			sink.RecordAllow(context.Background(), "sess", "newtool", "tools/call", nil, nil, false, nil, nil)
+			sink.RecordAllow(context.Background(), "sess", "newtool2", "tools/call", nil, nil, false, nil, nil)
 			if err := sink.Close(); err != nil {
 				t.Fatalf("Close: %v", err)
 			}
@@ -583,7 +583,7 @@ func TestVerify_GenesisSeq1AfterLegacyHead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	s.RecordAllow(context.Background(), "sess", "tool", "tools/call", nil, nil, false)
+	s.RecordAllow(context.Background(), "sess", "tool", "tools/call", nil, nil, false, nil, nil)
 	if err := s.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -637,7 +637,7 @@ func TestVerify_ForgedLegacyPrependFailsVerdict(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	s.RecordAllow(context.Background(), "sess", "tool", "tools/call", nil, nil, false)
+	s.RecordAllow(context.Background(), "sess", "tool", "tools/call", nil, nil, false, nil, nil)
 	s.RecordDeny(context.Background(), "sess", "danger", "tools/call", "AUTHORIZATION_FAILED", "", nil, false)
 	if err := s.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -680,7 +680,7 @@ func TestWriteRecord_PartialWrite_TargetBelowZero_SetsTailOrphanPending(t *testi
 	sink.writeLine = func(_ []byte) (int, error) {
 		return 100, errors.New("partial write (ENOSPC)")
 	}
-	sink.RecordAllow(context.Background(), "sess", "tool", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess", "tool", "tools/call", nil, nil, false, nil, nil)
 	_ = sink.Close() // drains and waits for the drainer to exit
 
 	// After Close the drainer has exited, so reading these fields is race-free.
@@ -747,7 +747,7 @@ func TestAuditSink_RecordClonesDetailsAndObligations(t *testing.T) {
 	}
 
 	// Warm-up record: the drainer marshals it, then parks in writeLine.
-	sink.RecordAllow(context.Background(), "sess", "warmup", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess", "warmup", "tools/call", nil, nil, false, nil, nil)
 	<-entered
 
 	// Include nested containers (a JSON object and array, as arbitrary tool-call
@@ -762,7 +762,7 @@ func TestAuditSink_RecordClonesDetailsAndObligations(t *testing.T) {
 	obligs := []string{"redactFields"}
 
 	// Enqueued behind the parked warm-up record: not yet marshaled.
-	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", details, obligs, true)
+	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", details, obligs, true, nil, nil)
 
 	// Mutate the caller's structures, top-level and nested. With the deep clone
 	// none of these reach the queued record; without it the drainer would
@@ -849,7 +849,7 @@ func TestAuditDrain_NilFile(t *testing.T) {
 	sink.f = nil
 
 	// Write a record — drain will see s.f == nil and continue.
-	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false, nil, nil)
 
 	if err := sink.Close(); err != nil {
 		// Close may fail if f is nil; that is expected here.
@@ -891,7 +891,7 @@ func TestAuditRecord_DropsWhenQueueFull(t *testing.T) {
 		key:     key,
 		records: make(chan auditRecord), // zero-capacity → always full
 	}
-	s.RecordAllow(context.Background(), "sess", "tool", "tools/call", nil, nil, false)
+	s.RecordAllow(context.Background(), "sess", "tool", "tools/call", nil, nil, false, nil, nil)
 	if s.DroppedRecords() != 1 {
 		t.Errorf("expected 1 dropped record, got %d", s.DroppedRecords())
 	}
@@ -912,7 +912,7 @@ func TestAuditDropMarker_RecordsDropAndChainStaysValid(t *testing.T) {
 	}
 
 	// First real record establishes the chain.
-	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false, nil, nil)
 	// Simulate two records lost under back-pressure.
 	sink.dropped.Store(2)
 	// Next real record: the drainer emits a drop marker before writing it (or the
@@ -981,7 +981,7 @@ func TestAuditDropMarker_NamesAffectedMethodTarget(t *testing.T) {
 	sink.recordDropBucket("tools/call", "probe_tool")
 	sink.recordDropBucket("tools/call", "probe_tool")
 	sink.recordDropBucket("resources/read", "file:///etc/passwd")
-	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false, nil, nil)
 	sink.RecordDeny(context.Background(), "sess", "write_file", "tools/call", "CAPABILITY_DENIED", "", nil, false)
 
 	if err := sink.Close(); err != nil {
@@ -1157,7 +1157,7 @@ func TestAuditVerify_LargeIntDetailsRoundTrip(t *testing.T) {
 	}
 
 	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call",
-		map[string]interface{}{"count": bigInt}, nil, false)
+		map[string]interface{}{"count": bigInt}, nil, false, nil, nil)
 
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -1204,7 +1204,7 @@ func TestWriteRecord_SpliceMatchesDoubleMarshal(t *testing.T) {
 	}
 
 	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call",
-		map[string]interface{}{"big": bigInt, "needs\"escape": "a\tb\nc\"d"}, nil, false)
+		map[string]interface{}{"big": bigInt, "needs\"escape": "a\tb\nc\"d"}, nil, false, nil, nil)
 	sink.RecordDeny(context.Background(), "sess", "write_file", "tools/call", "CAPABILITY_DENIED", "", nil, false)
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -1266,7 +1266,7 @@ func TestAuditVerify_LargeDropCountMarker(t *testing.T) {
 	}
 
 	// First real record establishes the chain.
-	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false, nil, nil)
 	// Simulate a flood that dropped more records than float64 can count exactly.
 	sink.dropped.Store(bigInt)
 	// Next real record makes the drainer emit the drop marker before writing it
@@ -1329,7 +1329,7 @@ func TestAuditVerify_LargeDropCountTamperDetected(t *testing.T) {
 	// 9999999999999999 (~1e16) is above 2^53 and odd, so float64 cannot represent
 	// it exactly — the same precision class as the drop counts this guards.
 	const bigDrop int64 = 9999999999999999
-	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false, nil, nil)
 	sink.dropped.Store(bigDrop)
 	sink.RecordDeny(context.Background(), "sess", "write_file", "tools/call", "CAPABILITY_DENIED", "", nil, false)
 	if err := sink.Close(); err != nil {
@@ -1869,7 +1869,7 @@ func TestAuditRecord_KeyIDStampedAndVerifies(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openAuditSink: %v", err)
 	}
-	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false, nil, nil)
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -1925,7 +1925,7 @@ func TestAuditKey_RotationVerifiesAcrossKeys(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openAuditSink: %v", err)
 	}
-	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false, nil, nil)
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -2000,7 +2000,7 @@ func TestAuditChain_UnknownKeyRecordIsNotAChainBreak(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openAuditSink: %v", err)
 	}
-	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false, nil, nil)
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -2068,7 +2068,7 @@ func TestAuditKey_RotatedTailVerifiesOnRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openAuditSink: %v", err)
 	}
-	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false, nil, nil)
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -2330,10 +2330,10 @@ func TestAuditRecord_OversizedArgumentStaysVerifiable(t *testing.T) {
 	// A ~5 MiB document body, the scenario the issue describes.
 	huge := strings.Repeat("A", 5<<20)
 	sink.RecordAllow(context.Background(), "sess", "write_file", "tools/call",
-		map[string]interface{}{"path": "/tmp/doc", "body": huge}, nil, true)
+		map[string]interface{}{"path": "/tmp/doc", "body": huge}, nil, true, nil, nil)
 
 	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call",
-		map[string]interface{}{"path": "/tmp/doc"}, nil, true)
+		map[string]interface{}{"path": "/tmp/doc"}, nil, true, nil, nil)
 
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -2366,7 +2366,7 @@ func TestAuditRecord_OversizedArgumentStaysVerifiable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
-	reopened.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, true)
+	reopened.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, true, nil, nil)
 	if err := reopened.Close(); err != nil {
 		t.Fatalf("Close (reopened): %v", err)
 	}
@@ -2708,7 +2708,7 @@ func TestAuditSink_InjectedClock(t *testing.T) {
 	}
 
 	// A written record stamps the injected time in its Time field.
-	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false, nil, nil)
 	if err := sink.Close(); err != nil {
 		t.Errorf("Close: %v", err)
 	}
@@ -2743,7 +2743,7 @@ func TestRecordBoundsDetailsBeforeEnqueue(t *testing.T) {
 
 	big := strings.Repeat("x", auditDetailValueCap+1)
 	s.Record(context.Background(), "", "", "", "sess", "tool", "tools/call",
-		"allow", "", "", map[string]interface{}{"body": big}, nil, true)
+		"allow", "", "", map[string]interface{}{"body": big}, nil, true, nil, nil)
 
 	select {
 	case rec := <-s.records:
@@ -2890,7 +2890,7 @@ func TestRecordOversizedSessionIDBounded(t *testing.T) {
 
 	hugeSession := strings.Repeat("S", 4<<20) // ~4 MiB attacker-controlled session id
 	sink.RecordAllow(context.Background(), hugeSession, "read_file", "tools/call",
-		nil, nil, false)
+		nil, nil, false, nil, nil)
 
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -2986,7 +2986,7 @@ func TestRecordBoundsAgentTaskID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false, nil, nil)
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -3047,8 +3047,8 @@ func TestRecordUserID_SignAndVerifyRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false)
-	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false, nil, nil)
+	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false, nil, nil)
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -3308,7 +3308,7 @@ func TestRecordBoundsObligationsBeforeEnqueue(t *testing.T) {
 		big[i] = fmt.Sprintf("redactFields:$.deeply.nested.path.segment.%d", i)
 	}
 	s.Record(context.Background(), "", "", "", "sess", "tool", "tools/call",
-		"allow", "", "", nil, big, true)
+		"allow", "", "", nil, big, true, nil, nil)
 
 	select {
 	case rec := <-s.records:
@@ -3349,7 +3349,7 @@ func TestAuditVerify_LargeObligationsRoundTrip(t *testing.T) {
 	for i := range obligs {
 		obligs[i] = fmt.Sprintf("redactFields:$.a.b.c.d.e.f.g.h.i.j.k[%d]", i)
 	}
-	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, obligs, true)
+	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, obligs, true, nil, nil)
 
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -3394,7 +3394,7 @@ func TestAuditSink_ConcurrentRecordDuringClose(t *testing.T) {
 			<-start
 			for j := 0; j < perProducer; j++ {
 				// Some of these race Close and hit the closed-drop path.
-				sink.RecordAllow(context.Background(), "sess", "tool", "tools/call", nil, nil, false)
+				sink.RecordAllow(context.Background(), "sess", "tool", "tools/call", nil, nil, false, nil, nil)
 			}
 		}()
 	}
@@ -3490,7 +3490,7 @@ func TestAuditSink_AsyncWrite(t *testing.T) {
 	const ceiling = 250 * time.Millisecond // 250 µs/call amortized; a sync write would be orders of magnitude slower
 	start := time.Now()
 	for i := 0; i < calls; i++ {
-		sink.RecordAllow(context.Background(), "sess-1", "read_file", "tools/call", nil, nil, false)
+		sink.RecordAllow(context.Background(), "sess-1", "read_file", "tools/call", nil, nil, false, nil, nil)
 	}
 	elapsed := time.Since(start)
 	if elapsed > ceiling {
@@ -3560,7 +3560,7 @@ func TestAuditSink_RecordDoesNotBlockOnSlowWriter(t *testing.T) {
 
 	start := time.Now()
 	for i := 0; i < 20; i++ {
-		sink.RecordAllow(context.Background(), "sess-1", "read_file", "tools/call", nil, nil, false)
+		sink.RecordAllow(context.Background(), "sess-1", "read_file", "tools/call", nil, nil, false, nil, nil)
 	}
 	elapsed := time.Since(start)
 	if elapsed > ceiling {
@@ -3600,7 +3600,7 @@ func TestAuditSink_WriteFailuresCounted(t *testing.T) {
 
 	const n = 50
 	for i := 0; i < n; i++ {
-		sink.RecordAllow(context.Background(), "sess-1", "read_file", "tools/call", nil, nil, false)
+		sink.RecordAllow(context.Background(), "sess-1", "read_file", "tools/call", nil, nil, false, nil, nil)
 	}
 
 	// Close drains the queue. The backing file is real, so its Sync/Close succeed;
@@ -3649,7 +3649,7 @@ func TestAuditDegraded_Dropped(t *testing.T) {
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false, nil, nil)
 
 	degraded, reason, detail := sink.AuditDegraded()
 	if !degraded {
@@ -3681,7 +3681,7 @@ func TestAuditDegraded_WriteFailure(t *testing.T) {
 	sink.writeLine = func(b []byte) (int, error) {
 		return 0, errors.New("simulated disk failure (ENOSPC)")
 	}
-	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false)
+	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false, nil, nil)
 	_ = sink.Close() // drains the queue; the write fails and bumps writeFailures
 
 	degraded, reason, detail := sink.AuditDegraded()
@@ -3738,7 +3738,7 @@ func TestAuditSink_DroppedRecordsCounter(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			sink.RecordAllow(context.Background(), "sess", "tool", "tools/call", nil, nil, false)
+			sink.RecordAllow(context.Background(), "sess", "tool", "tools/call", nil, nil, false, nil, nil)
 		}()
 	}
 	wg.Wait() // Must complete quickly — no goroutine may be stuck.

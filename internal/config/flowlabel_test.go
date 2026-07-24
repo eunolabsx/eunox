@@ -1,0 +1,237 @@
+// Copyright 2026 Eunolabs, LLC
+// SPDX-License-Identifier: Apache-2.0
+
+package config
+
+import (
+	"strings"
+	"testing"
+)
+
+// TestFlowEffect_StagedBehindDraftSchemaVersion is the staging assertion: the
+// flowLabel condition and labelOutput directive are NOT part of the published "0.1"
+// grammar. A manifest declaring 0.1 that uses one is rejected; the same manifest under
+// the flow+effect draft schemaVersion loads. This keeps the closed 0.1 grammar closed
+// until the tokens land in a batched grammar bump.
+func TestFlowEffect_StagedBehindDraftSchemaVersion(t *testing.T) {
+	flowLabelBody := `name: p
+version: "0.1.0"
+capabilities:
+  - target: "tool:send_email"
+    actions: [call]
+    conditions:
+      - type: flowLabel
+        allow: [public, internal]
+`
+	labelOutputBody := `name: p
+version: "0.1.0"
+capabilities:
+  - target: "tool:read_secret"
+    actions: [call]
+    directives:
+      - type: labelOutput
+        labels: [confidential]
+`
+
+	cases := []struct {
+		name    string
+		version string
+		body    string
+		wantErr string // "" means it must load
+	}{
+		{"flowLabel rejected under 0.1", "0.1", flowLabelBody, "requires schemaVersion \"0.2-draft\""},
+		{"labelOutput rejected under 0.1", "0.1", labelOutputBody, "requires schemaVersion \"0.2-draft\""},
+		{"flowLabel accepted under draft", ManifestSchemaVersionFlowEffectDraft, flowLabelBody, ""},
+		{"labelOutput accepted under draft", ManifestSchemaVersionFlowEffectDraft, labelOutputBody, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			yaml := "schemaVersion: \"" + tc.version + "\"\n" + tc.body
+			path := writeManifestFile(t, yaml)
+			_, err := LoadManifest(path)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("LoadManifest rejected a draft manifest: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("LoadManifest accepted %s under schemaVersion %s, want rejection", tc.name, tc.version)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error = %q, want it to contain %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestFlowEffect_LabelVocabularyValidation drives the closed-vocabulary validation:
+// an unknown label in flowLabel.allow or labelOutput.labels is a load-time error, and
+// labelOutput requires a non-empty labels list. All under the draft schemaVersion so
+// the staging gate is already satisfied and only the vocabulary check is exercised.
+func TestFlowEffect_LabelVocabularyValidation(t *testing.T) {
+	draft := "schemaVersion: \"" + ManifestSchemaVersionFlowEffectDraft + "\"\n"
+	cases := []struct {
+		name    string
+		body    string
+		wantErr string
+	}{
+		{
+			name: "unknown flowLabel allow label",
+			body: `name: p
+version: "0.1.0"
+capabilities:
+  - target: "tool:send_email"
+    actions: [call]
+    conditions:
+      - type: flowLabel
+        allow: [public, sekret]
+`,
+			wantErr: "unknown label \"sekret\"",
+		},
+		{
+			name: "unknown labelOutput label",
+			body: `name: p
+version: "0.1.0"
+capabilities:
+  - target: "tool:read_secret"
+    actions: [call]
+    directives:
+      - type: labelOutput
+        labels: [toppublic]
+`,
+			wantErr: "unknown label \"toppublic\"",
+		},
+		{
+			name: "empty labelOutput labels",
+			body: `name: p
+version: "0.1.0"
+capabilities:
+  - target: "tool:read_secret"
+    actions: [call]
+    directives:
+      - type: labelOutput
+        labels: []
+`,
+			wantErr: "non-empty 'labels'",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeManifestFile(t, draft+tc.body)
+			_, err := LoadManifest(path)
+			if err == nil {
+				t.Fatalf("LoadManifest accepted %s, want rejection", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error = %q, want it to contain %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestLabelOutput_AllowedOnResourceTarget confirms the directive-target relaxation:
+// labelOutput is valid on a resource: source (a sensitive read is a flow source), where
+// redactFields — a response mutation — remains tool-only. An empty allow flowLabel is
+// also accepted (the strictest sink), proving empty is a valid rule, not a malformed one.
+func TestLabelOutput_AllowedOnResourceTarget(t *testing.T) {
+	draft := "schemaVersion: \"" + ManifestSchemaVersionFlowEffectDraft + "\"\n"
+
+	ok := draft + `name: p
+version: "0.1.0"
+capabilities:
+  - target: "resource:file:///secrets/*"
+    actions: [read]
+    directives:
+      - type: labelOutput
+        labels: [confidential]
+  - target: "tool:send_email"
+    actions: [call]
+    conditions:
+      - type: flowLabel
+        allow: []
+`
+	if _, err := LoadManifest(writeManifestFile(t, ok)); err != nil {
+		t.Fatalf("labelOutput on a resource: target (and empty-allow flowLabel) must load, got %v", err)
+	}
+
+	// redactFields on a resource: target is still rejected (response mutation, tool-only).
+	bad := draft + `name: p
+version: "0.1.0"
+capabilities:
+  - target: "resource:file:///secrets/*"
+    actions: [read]
+    directives:
+      - type: redactFields
+        fields: [ssn]
+`
+	_, err := LoadManifest(writeManifestFile(t, bad))
+	if err == nil || !strings.Contains(err.Error(), "apply only to tool: targets") {
+		t.Fatalf("redactFields on resource: must stay rejected, got %v", err)
+	}
+}
+
+// TestFlowEffect_UnknownKeyRejected locks in the closed-grammar guarantee for the new
+// tokens: an unrecognized key inside a flowLabel condition or a labelOutput directive is
+// a load error (conditionKeysFor/directiveKeysFor now cover them), not silently dropped
+// — so a typo like `allowed:` for `allow:` cannot silently turn a sink into deny-all.
+func TestFlowEffect_UnknownKeyRejected(t *testing.T) {
+	draft := "schemaVersion: \"" + ManifestSchemaVersionFlowEffectDraft + "\"\n"
+	cases := []struct{ name, body, wantErr string }{
+		{
+			"typo'd flowLabel key",
+			`name: p
+version: "0.1.0"
+capabilities:
+  - target: "tool:send_email"
+    actions: [call]
+    conditions:
+      - type: flowLabel
+        allowed: [public]
+`,
+			"unknown field \"allowed\"",
+		},
+		{
+			"bogus labelOutput key",
+			`name: p
+version: "0.1.0"
+capabilities:
+  - target: "tool:read_secret"
+    actions: [call]
+    directives:
+      - type: labelOutput
+        labels: [confidential]
+        onlyOn: read
+`,
+			"unknown field \"onlyOn\"",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadManifest(writeManifestFile(t, draft+tc.body))
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("want rejection containing %q, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+// TestLabelOutput_RejectedOnSystemTarget confirms labelOutput is a source directive
+// valid only on tool:/resource: targets; a system: target is rejected at load, so a
+// sampling-leg state/tape mismatch cannot be authored.
+func TestLabelOutput_RejectedOnSystemTarget(t *testing.T) {
+	draft := "schemaVersion: \"" + ManifestSchemaVersionFlowEffectDraft + "\"\n"
+	body := draft + `name: p
+version: "0.1.0"
+capabilities:
+  - target: "system:sampling/createMessage"
+    actions: [allow]
+    directives:
+      - type: labelOutput
+        labels: [confidential]
+`
+	_, err := LoadManifest(writeManifestFile(t, body))
+	if err == nil || !strings.Contains(err.Error(), "tool: or resource:") {
+		t.Fatalf("labelOutput on system: must be rejected, got %v", err)
+	}
+}
