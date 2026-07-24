@@ -175,6 +175,28 @@ func TestFlowLabel_LabelsOutCanonicalOrder(t *testing.T) {
 	assert.Equal(t, []string{capability.FlowLabelConfidential, capability.FlowLabelPII}, resp.LabelsOut)
 }
 
+// TestFlowLabel_DenyReportsAllBlockedLabels: a sink deny names EVERY offending class,
+// not only the first in vocabulary order, so an integrity (untrusted) signal is never
+// masked; and carried_labels is stamped on the deny response too, so the tape / an
+// observe-mode forward can reconstruct the accumulated set.
+func TestFlowLabel_DenyReportsAllBlockedLabels(t *testing.T) {
+	eng := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()))
+	ctx := context.Background()
+
+	require.Equal(t, capability.DecisionAllow,
+		eng.ValidateAction(ctx, req("s", "read_web"), sourceCaps("read_web", capability.FlowLabelUntrusted)).Decision)
+	require.Equal(t, capability.DecisionAllow,
+		eng.ValidateAction(ctx, req("s", "read_pii"), sourceCaps("read_pii", capability.FlowLabelPII)).Decision)
+
+	deny := eng.ValidateAction(ctx, req("s", "send_email"), sinkCaps("send_email", capability.FlowLabelPublic))
+	require.Equal(t, capability.DecisionDeny, deny.Decision)
+	blocked, _ := deny.Denial.Details["blockedLabels"].([]string)
+	assert.ElementsMatch(t, []string{capability.FlowLabelPII, capability.FlowLabelUntrusted}, blocked,
+		"the deny must name every blocked class, including the untrusted integrity signal")
+	assert.Equal(t, []string{capability.FlowLabelPII, capability.FlowLabelUntrusted}, deny.CarriedLabels,
+		"carried_labels is stamped on a flow-relevant deny for tape reconstruction")
+}
+
 // TestFlowLabel_NonFlowConstraintCarriesNoLabels: a plain constraint (no flowLabel, no
 // labelOutput) reports neither label field, so a non-flow policy pays no label cost and
 // the audit record stays lean.

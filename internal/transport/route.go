@@ -590,3 +590,18 @@ func AnyRouteHasSequenceBlock(routes map[string]*UpstreamRoute) bool {
 	}
 	return false
 }
+
+// AnyRouteHasFlowLabel reports whether any route's manifest uses information-flow
+// control (a flowLabel condition or a labelOutput directive). Like maxCalls/
+// sequenceBlock, flow labels are per-session state in the shared call counter — per
+// process under the default in-memory backend — so the multi-instance advisory warns on
+// a flow policy too: without shared Redis, a source on one instance and a sink on
+// another fail open silently.
+func AnyRouteHasFlowLabel(routes map[string]*UpstreamRoute) bool {
+	for _, rt := range routes {
+		if rt.manifest != nil && rt.manifest.HasFlowLabel() {
+			return true
+		}
+	}
+	return false
+}

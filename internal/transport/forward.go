@@ -529,13 +529,13 @@ func (fp serverRequestParams) strictServerRequestAuditDenial(ctx context.Context
 // Each of the three call sites gates its own forward on strictServerRequestAuditDenial
 // beforehand, the same gate-before/record-after shape as enforcedForwardCore, so this
 // record call gets the same immediate boundary-call diagnostic under strict mode.
-func recordForwardOutcome(ctx context.Context, strict bool, rec auditRecorder, sessionID, method string, delivered, auditOnly bool) {
+func recordForwardOutcome(ctx context.Context, strict bool, rec auditRecorder, sessionID, method string, delivered, auditOnly bool, labelsOut, carriedLabels []string) {
 	warnIfStrictAuditJustDegraded(strict, rec, method, method, func() {
 		if rec == nil {
 			return
 		}
 		if delivered {
-			rec.RecordAllow(ctx, sessionID, method, method, nil, nil, auditOnly, nil, nil)
+			rec.RecordAllow(ctx, sessionID, method, method, nil, nil, auditOnly, labelsOut, carriedLabels)
 		} else {
 			rec.RecordDeny(ctx, sessionID, method, method, capability.ErrCodeEnforcementError, "", nil, false)
 		}
@@ -586,7 +586,9 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 			return
 		}
 		delivered := fp.forward(msg)
-		recordForwardOutcome(ctx, fp.requireAuditStrict, fp.rec, fp.sessionID, msg.Method, delivered, fp.audit)
+		// Non-sampling methods are not policy-enforced, so there is no flow decision and
+		// no labels to record.
+		recordForwardOutcome(ctx, fp.requireAuditStrict, fp.rec, fp.sessionID, msg.Method, delivered, fp.audit, nil, nil)
 		return
 	}
 
@@ -606,7 +608,10 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 			return
 		}
 		delivered := fp.forward(msg)
-		recordForwardOutcome(ctx, fp.requireAuditStrict, fp.rec, fp.sessionID, samplingMethod, delivered, fp.audit)
+		// Carry the sampling decision's flow labels onto the tape: a flowLabel/labelOutput
+		// on the system:sampling constraint mutated session flow-state, so the record must
+		// show labels_out/carried_labels or the tape and state disagree for the sampling leg.
+		recordForwardOutcome(ctx, fp.requireAuditStrict, fp.rec, fp.sessionID, samplingMethod, delivered, fp.audit, dec.LabelsOut, dec.CarriedLabels)
 		return
 	}
 
@@ -652,6 +657,8 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 		denial.Code,
 	)
 	delivered := fp.forward(msg)
-	// audit=true: this is the audit-mode observe path.
-	recordForwardOutcome(ctx, fp.requireAuditStrict, fp.rec, fp.sessionID, samplingMethod, delivered, true)
+	// audit=true: this is the audit-mode observe path. dec is the (downgraded) deny, which
+	// still carries carried_labels (stamped by the engine on flow-relevant denies), so the
+	// observed-forward record shows the accumulated set of the flow that was let through.
+	recordForwardOutcome(ctx, fp.requireAuditStrict, fp.rec, fp.sessionID, samplingMethod, delivered, true, dec.LabelsOut, dec.CarriedLabels)
 }

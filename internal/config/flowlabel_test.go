@@ -170,3 +170,68 @@ capabilities:
 		t.Fatalf("redactFields on resource: must stay rejected, got %v", err)
 	}
 }
+
+// TestFlowEffect_UnknownKeyRejected locks in the closed-grammar guarantee for the new
+// tokens: an unrecognized key inside a flowLabel condition or a labelOutput directive is
+// a load error (conditionKeysFor/directiveKeysFor now cover them), not silently dropped
+// — so a typo like `allowed:` for `allow:` cannot silently turn a sink into deny-all.
+func TestFlowEffect_UnknownKeyRejected(t *testing.T) {
+	draft := "schemaVersion: \"" + ManifestSchemaVersionFlowEffectDraft + "\"\n"
+	cases := []struct{ name, body, wantErr string }{
+		{
+			"typo'd flowLabel key",
+			`name: p
+version: "0.1.0"
+capabilities:
+  - target: "tool:send_email"
+    actions: [call]
+    conditions:
+      - type: flowLabel
+        allowed: [public]
+`,
+			"unknown field \"allowed\"",
+		},
+		{
+			"bogus labelOutput key",
+			`name: p
+version: "0.1.0"
+capabilities:
+  - target: "tool:read_secret"
+    actions: [call]
+    directives:
+      - type: labelOutput
+        labels: [confidential]
+        onlyOn: read
+`,
+			"unknown field \"onlyOn\"",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadManifest(writeManifestFile(t, draft+tc.body))
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("want rejection containing %q, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+// TestLabelOutput_RejectedOnSystemTarget confirms labelOutput is a source directive
+// valid only on tool:/resource: targets; a system: target is rejected at load, so a
+// sampling-leg state/tape mismatch cannot be authored.
+func TestLabelOutput_RejectedOnSystemTarget(t *testing.T) {
+	draft := "schemaVersion: \"" + ManifestSchemaVersionFlowEffectDraft + "\"\n"
+	body := draft + `name: p
+version: "0.1.0"
+capabilities:
+  - target: "system:sampling/createMessage"
+    actions: [allow]
+    directives:
+      - type: labelOutput
+        labels: [confidential]
+`
+	_, err := LoadManifest(writeManifestFile(t, body))
+	if err == nil || !strings.Contains(err.Error(), "tool: or resource:") {
+		t.Fatalf("labelOutput on system: must be rejected, got %v", err)
+	}
+}

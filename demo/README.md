@@ -19,6 +19,13 @@ Two Docker services. One manifest file. First enforced tool call in under 10 min
 > (`flowLabel` / `labelOutput`), staged behind `schemaVersion: "0.2-draft"` in
 > [`manifest-flow.yaml`](./manifest-flow.yaml) — not part of the published `0.1`
 > grammar. Go + python3, no Docker.
+>
+> Honest limits (same shape as `sequenceBlock`): the source→sink guarantee holds
+> for a compliant, serialized MCP client — a client that fires the source read and
+> the egress write concurrently on one session can race the label write past the
+> sink's check; across multiple proxy instances it requires a shared Redis call
+> counter (a startup NOTICE warns when one is missing); and a session's taint is
+> retained for the session, not forever.
 
 ## What this demo shows
 

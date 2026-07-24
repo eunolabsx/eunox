@@ -58,6 +58,36 @@ func (m *LocalManifest) HasSequenceBlock() bool {
 	})
 }
 
+// HasFlowLabel reports whether any capability entry uses information-flow control — a
+// flowLabel condition (sink; reads per-session label state) or a labelOutput directive
+// (source; writes it). Both rely on cross-call CallCounter state exactly like maxCalls
+// and sequenceBlock, so the multi-instance shared-state advisory must warn on them too:
+// without shared Redis, a source recording a label on one instance and a sink Peeking it
+// on another fails open silently.
+func (m *LocalManifest) HasFlowLabel() bool {
+	if m == nil {
+		return false
+	}
+	if m.anyCondition(func(cond capability.Condition) bool {
+		switch cond.(type) {
+		case capability.FlowLabelCondition, *capability.FlowLabelCondition:
+			return true
+		}
+		return false
+	}) {
+		return true
+	}
+	for i := range m.Capabilities {
+		for _, dir := range m.Capabilities[i].Directives {
+			switch dir.(type) {
+			case capability.LabelOutputDirective, *capability.LabelOutputDirective:
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // HasSamplingGrant reports whether the manifest grants server-initiated sampling:
 // a system: target whose bare name matches sampling/createMessage (by the same
 // enforcement.MatchesResource glob the engine uses, so "system:*" and

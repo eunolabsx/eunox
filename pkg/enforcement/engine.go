@@ -805,7 +805,31 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 	// that will apply on allow.
 	ctx = withDirectives(ctx, matched.Directives)
 
+	// Peek the incoming accumulated flow-label set up front (only for flow-relevant
+	// constraints, so a non-flow policy pays no counter round-trips). It reflects what
+	// flowed IN, before this call's own output is recorded below, and is stamped on BOTH
+	// a deny (so the audit tape / an observe-mode downgrade-forward record still carries
+	// it) and the allow. peekSessionLabels fails closed on an unreadable state, so a
+	// source-only constraint cannot silently under-report the set.
+	flowRelevant := constraintHasFlow(matched)
+	var carriedLabels []string
+	if flowRelevant {
+		var err error
+		carriedLabels, err = e.peekSessionLabels(ctx, req)
+		if err != nil {
+			resp := denyResponse(requestID, now, matched.IsAuditOnly(), nil, capability.DenialInfo{
+				Code:          capability.ErrCodeConditionFailed,
+				ConditionType: capability.ConditionTypeFlowLabel,
+				Message:       fmt.Sprintf("flow-label state lookup failed: %v", err),
+			})
+			return resp
+		}
+	}
+
 	if deny := e.runConditions(ctx, req, matched, requestID, now); deny != nil {
+		if flowRelevant {
+			deny.CarriedLabels = carriedLabels
+		}
 		return *deny
 	}
 
@@ -815,29 +839,30 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 	// collectObligations is a pure translation, so reordering it is safe.
 	obligations, denyResp := e.collectObligations(matched, requestID, now)
 	if denyResp != nil {
+		if flowRelevant {
+			denyResp.CarriedLabels = carriedLabels
+		}
 		return *denyResp
 	}
 
-	// Information-flow bookkeeping, only for flow-relevant constraints (those with a
-	// flowLabel condition or a labelOutput directive) so a non-flow policy pays no
-	// extra counter round-trips. carriedLabels is the accumulated set observed at
-	// decision time — peeked BEFORE recordLabels writes this call's own output, so it
-	// reflects what flowed IN, not what this call adds. labelsOut is this call's added
-	// labels. A recordLabels fault fails closed (see labelRecordFailureDenial).
-	var carriedLabels, labelsOut []string
-	if constraintHasFlow(matched) {
-		carriedLabels = e.peekSessionLabels(ctx, req)
+	// Record the sequenceBlock antecedent BEFORE the flow labels: a recordSessionCall
+	// fault then denies with no labels yet committed, so a blocked call never taints the
+	// session. For a pure flow policy recordSessionCall is skipped (no sequenceBlock), so
+	// recordLabels below is the only state write.
+	if err := e.recordSessionCall(ctx, req); err != nil {
+		return recordFailureDenial(requestID, now, matched.IsAuditOnly(), obligations)
+	}
+
+	// This call's own emitted labels (from labelOutput directives). A recordLabels fault
+	// fails closed as a HARD deny (see labelRecordFailureDenial), so an audit-mode source
+	// whose label failed to persist is not forwarded unlabeled.
+	var labelsOut []string
+	if flowRelevant {
 		var err error
 		labelsOut, err = e.recordLabels(ctx, req, matched)
 		if err != nil {
 			return labelRecordFailureDenial(requestID, now, matched.IsAuditOnly(), obligations)
 		}
-	}
-
-	// Allowed and forwarding: record the call so a later sequenceBlock on a different
-	// tool can detect it. A write failure fails closed (see recordSessionCall).
-	if err := e.recordSessionCall(ctx, req); err != nil {
-		return recordFailureDenial(requestID, now, matched.IsAuditOnly(), obligations)
 	}
 
 	return capability.EnforceResponse{

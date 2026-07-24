@@ -894,19 +894,22 @@ func targetOperationPhrase(t capability.TargetType) string {
 	}
 }
 
-// recordAuditModeAntecedent records the call in session history when an
-// audit-mode constraint DOWNGRADES a deny to a forwarded call. On that path
-// EvaluateConditions skips recordSessionCall but the transport still forwards and
-// the tool runs, so a later sequenceBlock naming this target would Peek an empty
-// history and fail OPEN. The genuine-allow path is already recorded inside
-// EvaluateConditions, and an enforced deny means the tool never ran, so neither
-// needs this — and neither does a HardDeny audit-mode deny: it is NOT downgraded,
-// so the tool never runs, and recording it would poison history with a phantom
-// antecedent (the bug the HardDeny check below prevents).
+// recordAuditModeAntecedent records session state when an audit-mode constraint
+// DOWNGRADES a deny to a forwarded call. On that path EvaluateConditions returns the
+// deny before its allow-tail state writes run, but the transport still forwards and the
+// tool runs, so two guarantees would otherwise be broken: a later sequenceBlock naming
+// this target Peeks an empty history and fails OPEN (RecordSessionCall closes this), and
+// a later flowLabel sink Peeks the labelOutput labels this forwarded read actually
+// carried and fails OPEN (RecordLabels closes this — the data was produced, so it must
+// be labeled). The genuine-allow path already records both inside EvaluateConditions,
+// and an enforced deny means the tool never ran, so neither needs this — and neither
+// does a HardDeny audit-mode deny: it is NOT downgraded, so recording would attribute
+// state to a call that never ran (the bug the HardDeny check below prevents).
 //
-// When RecordSessionCall fails the sequenceBlock integrity guarantee cannot be
-// upheld, so the call returns a hardDenyResponse CONDITION_FAILED deny — non-
-// downgradable even under audit (see hardDenyResponse).
+// When either record fails the corresponding integrity guarantee cannot be upheld, so
+// the call returns a hardDenyResponse CONDITION_FAILED deny — non-downgradable even
+// under audit (see hardDenyResponse), so the read is not forwarded with unreliable
+// state. RecordSessionCall runs first so a fault there commits no labels.
 //
 // clock is p.engineClock() at every call site so the frozen test clock is honored
 // and a nil engine never reaches engine.Clock() directly.
@@ -915,6 +918,11 @@ func recordAuditModeAntecedent(ctx context.Context, engine *enforcement.Engine, 
 		if err := engine.RecordSessionCall(ctx, req); err != nil {
 			deny := hardDenyResponse(clock, capability.ErrCodeConditionFailed,
 				"audit-mode antecedent record failed: "+err.Error())
+			return &deny
+		}
+		if err := engine.RecordLabels(ctx, req, matched); err != nil {
+			deny := hardDenyResponse(clock, capability.ErrCodeConditionFailed,
+				"audit-mode flow-label record failed: "+err.Error())
 			return &deny
 		}
 	}

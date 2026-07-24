@@ -897,6 +897,13 @@ func validateLocalManifest(m *LocalManifest) error {
 			if dir == nil {
 				return fmt.Errorf("capability at index %d, directive %d: a null directive is not permitted; every directives entry must be a typed directive object", i, j)
 			}
+			// A typed-nil pointer (e.g. (*LabelOutputDirective)(nil)) is a non-nil
+			// interface, so it survives the dir==nil check above but would panic when a
+			// case below dereferences d.Fields/d.Labels. Reject it fail-closed, matching
+			// the engine's collectObligations typed-nil guard.
+			if rv := reflect.ValueOf(dir); rv.Kind() == reflect.Pointer && rv.IsNil() {
+				return fmt.Errorf("capability at index %d, directive %d: a typed-nil directive is not permitted; every directives entry must be a typed directive object", i, j)
+			}
 			switch d := dir.(type) {
 			case *capability.RedactFieldsDirective:
 				if err := requireResponseDirectiveTarget(i, c.Target, targetType); err != nil {
@@ -916,11 +923,17 @@ func validateLocalManifest(m *LocalManifest) error {
 				if err := requireFlowEffectDraft(m, "the labelOutput directive", i); err != nil {
 					return err
 				}
+				if err := requireSourceDirectiveTarget(i, c.Target, targetType); err != nil {
+					return err
+				}
 				if err := validateLabelOutput(i, j, d.Labels); err != nil {
 					return err
 				}
 			case capability.LabelOutputDirective:
 				if err := requireFlowEffectDraft(m, "the labelOutput directive", i); err != nil {
+					return err
+				}
+				if err := requireSourceDirectiveTarget(i, c.Target, targetType); err != nil {
 					return err
 				}
 				if err := validateLabelOutput(i, j, d.Labels); err != nil {
@@ -1541,6 +1554,18 @@ func requireResponseDirectiveTarget(i int, target string, targetType capability.
 	return nil
 }
 
+// requireSourceDirectiveTarget restricts labelOutput to tool: and resource: source
+// targets — the boundaries a sensitive read sits at. A prompt: or system: target is not
+// a flow source; in particular a labelOutput on system:sampling would write session
+// state on an allowed sampling call whose forward path does not record labels, so the
+// tape and state would disagree. Reject at load rather than admit that mismatch.
+func requireSourceDirectiveTarget(i int, target string, targetType capability.TargetType) error {
+	if targetType != capability.TargetTypeTool && targetType != capability.TargetTypeResource {
+		return fmt.Errorf("capability at index %d: constraint %q carries a labelOutput directive, which is valid only on tool: or resource: source targets (a %s target is not a flow source)", i, target, targetType)
+	}
+	return nil
+}
+
 // validateFlowLabel checks a flowLabel condition's Allow set against the closed native
 // vocabulary, so a misspelled label is a load-time error rather than an inert entry
 // (the closed grammar is a determinism invariant). An empty Allow is valid — it admits
@@ -1969,6 +1994,8 @@ func conditionKeysFor(condType string) (map[string]bool, bool) {
 		t = reflect.TypeOf(capability.AllowedValuesCondition{})
 	case capability.ConditionTypeSequenceBlock:
 		t = reflect.TypeOf(capability.SequenceBlockCondition{})
+	case capability.ConditionTypeFlowLabel:
+		t = reflect.TypeOf(capability.FlowLabelCondition{})
 	case capability.ConditionTypePolicy:
 		t = reflect.TypeOf(capability.PolicyCondition{})
 	case capability.ConditionTypeCustom:
@@ -1983,8 +2010,13 @@ func conditionKeysFor(condType string) (map[string]bool, bool) {
 
 // directiveKeysFor mirrors conditionKeysFor for response directives.
 func directiveKeysFor(dirType string) (map[string]bool, bool) {
-	if dirType == capability.DirectiveTypeRedactFields {
+	switch dirType {
+	case capability.DirectiveTypeRedactFields:
 		keys := jsonFieldKeys(reflect.TypeOf(capability.RedactFieldsDirective{}))
+		keys["type"] = true
+		return keys, true
+	case capability.DirectiveTypeLabelOutput:
+		keys := jsonFieldKeys(reflect.TypeOf(capability.LabelOutputDirective{}))
 		keys["type"] = true
 		return keys, true
 	}
