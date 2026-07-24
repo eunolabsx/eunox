@@ -11,6 +11,7 @@ Design and operational documentation for `eunox`.
 | [../README.md](../README.md) | Project README — value prop, quick start, commands. |
 | [repo-guide.md](./repo-guide.md) | Repository structure, build / lint / test, contributor setup. |
 | [client-integration.md](./client-integration.md) | Wiring eunox into MCP clients: Claude Desktop, Claude Code, Cursor, VS Code + Copilot, Cline, Roo Code, Windsurf. |
+| [integrations/](./integrations/) | Wiring eunox into platforms, orchestrators, and AI gateways: LiteLLM, Dify, n8n, Conductor, Temporal, Flowise — insertion patterns, shared gateway setup, and a per-platform reference each. |
 
 ## Architecture and design
 
