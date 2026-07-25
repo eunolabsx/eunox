@@ -605,16 +605,46 @@ type sessionGate struct {
 // cannot: both share the audience).
 //
 // It is CHECK-ONLY: no lock, no record — the single source of truth for WHICH gates run,
-// shared by enforceSessionGates (POST/GET: verdict + record) and handleMCPDelete (which runs
-// it under p.mu for its atomic check-and-delete, then renders its own 403 + record). A third
-// gate added here protects all three transports at once, closing the drift the previous
-// hand-mirrored DELETE copy invited. Returns the denied gate + true on failure, or
-// (_, false) when both pass (a no-pin route and an unbound no-JWT session are no-ops).
+// shared by enforceSessionGates (POST/GET: verdict + record) and handleMCPDelete (which
+// needs the two halves separately, see below, then renders its own 403 + record). A gate
+// added to the appropriate half below protects all three transports at once, closing the
+// drift the previous hand-mirrored DELETE copy invited. Returns the denied gate + true on
+// failure, or (_, false) when both pass (a no-pin route and an unbound no-JWT session are
+// no-ops).
+//
+// The gates are split by what they depend on, NOT merely for tidiness: handleMCPDelete
+// must hold the session registry lock across its check-and-delete, and contextGateVerdict
+// is the half that must not run under a lock.
 func (route *UpstreamRoute) sessionGateVerdict(ctx context.Context, sess *httpSession) (sessionGate, bool) {
+	if gate, denied := route.contextGateVerdict(ctx); denied {
+		return gate, true
+	}
+	return sessionOnlyGateVerdict(ctx, sess)
+}
+
+// contextGateVerdict runs the session gates that depend ONLY on the request context — the
+// per-route audience pin — and not on the session object.
+//
+// It is separated so a caller that must hold a lock can run this half BEFORE acquiring it.
+// CheckAudience is a PolicyDecisionPoint method, and PolicyDecisionPoint is an exported
+// seam third parties may implement: every in-tree implementation compares claims and
+// returns, but the contract cannot assume that of an out-of-tree one, and a CheckAudience
+// that touched the network while the global session-registry write lock was held would
+// stall every session lookup, registration, and reap in the proxy. Keeping this half
+// lock-free means the transport never imposes that risk regardless of implementation.
+func (route *UpstreamRoute) contextGateVerdict(ctx context.Context) (sessionGate, bool) {
 	if deny := route.pdp.CheckAudience(ctx); deny != nil {
 		d := normalizeDenial(deny.Denial)
 		return sessionGate{code: d.Code, conditionType: d.ConditionType}, true
 	}
+	return sessionGate{}, false
+}
+
+// sessionOnlyGateVerdict runs the session gates that need the session object — the
+// session-owner binding. This half is a pure in-process field comparison with no interface
+// dispatch outside the package, so it is safe to run under the registry lock, which is
+// what lets handleMCPDelete keep its check-and-delete atomic.
+func sessionOnlyGateVerdict(ctx context.Context, sess *httpSession) (sessionGate, bool) {
 	if sess.ownerMismatch(pdp.JWTClaimsPtr(ctx)) {
 		return sessionGate{code: capability.ErrCodeAuthorizationFailed, reason: "session_owner_mismatch"}, true
 	}
@@ -851,6 +881,19 @@ func (p *HTTPProxy) handleMCPDelete(w http.ResponseWriter, r *http.Request, rout
 		http.Error(w, "Mcp-Session-Id header required", http.StatusBadRequest)
 		return
 	}
+	// Run the context-only gate (the audience pin) BEFORE taking p.mu, and carry its
+	// verdict into the locked region. It depends only on the request's claims, never on
+	// the session, so evaluating it early changes no decision — but it keeps the
+	// PolicyDecisionPoint call, whose implementation is an exported seam, off the global
+	// session-registry write lock that serializes every lookup, register, and reap.
+	// The verdict is APPLIED below only once the session is confirmed to exist and to
+	// belong to this route, preserving the 403-vs-404 shape exactly.
+	var audienceGate sessionGate
+	var audienceDenied bool
+	if route != nil {
+		audienceGate, audienceDenied = route.contextGateVerdict(r.Context())
+	}
+
 	p.mu.Lock()
 	sess, ok := p.sessions[sessionID]
 	if ok && sess.route != route {
@@ -869,8 +912,7 @@ func (p *HTTPProxy) handleMCPDelete(w http.ResponseWriter, r *http.Request, rout
 		// victim's Mcp-Session-Id) could otherwise tear down another client's session — a
 		// cross-audience teardown / tenant DoS. Enforced only once the session is confirmed
 		// to exist AND belong to this route, so a refusal cannot probe which session ids
-		// exist (a not-found id still falls through to 404 below). CheckAudience and
-		// ownerMismatch are CPU-only (claims comparison), safe under p.mu; a no-pin /
+		// exist (a not-found id still falls through to 404 below); a no-pin /
 		// --jwt-allow-any-audience route and an unbound (no-JWT) session are no-ops. A DELETE
 		// carries no JSON-RPC envelope, so a refusal is an HTTP 403 plus a transport-tagged
 		// deny record (method/identifier empty), matching the GET refusal convention. The
@@ -879,11 +921,17 @@ func (p *HTTPProxy) handleMCPDelete(w http.ResponseWriter, r *http.Request, rout
 		//
 		// route is always non-nil in production (handleMCP 404s an unknown route before
 		// dispatch); the nil guard only covers the test-only construction that wires no
-		// route, matching handleMCPGet. The verdict runs under p.mu (check-only, CPU-bound),
-		// then the record + 403 render after unlocking — off the SAME sessionGateVerdict the
-		// POST/GET paths use, so a future third gate cannot silently skip DELETE.
+		// route, matching handleMCPGet. The two gate halves are applied in the same order
+		// sessionGateVerdict applies them — audience first, already computed above the lock;
+		// owner second, a pure field compare cheap enough to run here — so DELETE clears
+		// exactly the gates POST/GET clear, and a gate added to either half cannot silently
+		// skip it. Only the record + 403 render happen after unlocking.
 		if route != nil {
-			if gate, denied := route.sessionGateVerdict(r.Context(), sess); denied {
+			gate, denied := audienceGate, audienceDenied
+			if !denied {
+				gate, denied = sessionOnlyGateVerdict(r.Context(), sess)
+			}
+			if denied {
 				p.mu.Unlock()
 				route.recordSessionGateDeny(r.Context(), sessionID, "", "http-delete", gate)
 				http.Error(w, "forbidden", http.StatusForbidden)

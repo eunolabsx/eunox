@@ -928,25 +928,15 @@ func (s *httpSession) runInitHandshake() error {
 		return fmt.Errorf("sending initialize: %w", err)
 	}
 
-	for {
-		msg, err := s.upReader.Read()
-		if err != nil {
-			return fmt.Errorf("reading initialize response: %w", err)
-		}
-		if msg.IsResponse() && mcp.MsgKey(msg.ID) == mcp.MsgKey(initID) {
-			caps, sv, instructions, err := applyInitializeResult(msg)
-			if err != nil {
-				return err
-			}
-			s.upstreamCaps, s.upstreamServerVersion, s.upstreamInstructions = caps, sv, instructions
-			break
-		}
-		// A discarded server-initiated REQUEST (sampling/createMessage, roots/list,
-		// elicitation/create) arriving before the initialize response would leave the
-		// upstream blocked awaiting a response: runInitHandshake runs before
-		// readUpstream starts, so nothing else will answer it.
-		RejectPreInitServerRequest(s.upWriter, msg)
+	resp, err := awaitStartupReply(s.upReader.Read, initID, s.upWriter, nil)
+	if err != nil {
+		return fmt.Errorf("reading initialize response: %w", err)
 	}
+	caps, sv, instructions, err := applyInitializeResult(resp)
+	if err != nil {
+		return err
+	}
+	s.upstreamCaps, s.upstreamServerVersion, s.upstreamInstructions = caps, sv, instructions
 
 	notif, err := mcp.NotificationMsg(mcp.MethodNotificationsInitialized, nil)
 	if err != nil {

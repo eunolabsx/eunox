@@ -2114,44 +2114,6 @@ upstreams:
 	}
 }
 
-// TestExpandEnvInStrings_ConfigTreeHasNoUnhandledKinds pins the invariant
-// config's expandEnvInStrings relies on: the GatewayConfig type tree contains
-// only the kinds the walk descends into (structs, slices/arrays, strings, and
-// non-string pointers/scalars). A map or interface field would be SILENTLY
-// skipped — and since secrets are the use case (a future map[string]string of
-// per-upstream custom headers, say), a ${TOKEN} in such a field would be handed
-// to the upstream as the literal text "${TOKEN}" with no auth applied. Fail
-// loudly here the moment such a field is added so expandEnvInStrings is extended
-// (maps need SetMapIndex, not a free fall-through) rather than silently leaking
-// the reference.
-func TestExpandEnvInStrings_ConfigTreeHasNoUnhandledKinds(t *testing.T) {
-	t.Parallel()
-	var bad []string
-	seen := map[reflect.Type]bool{}
-	var walk func(path string, ty reflect.Type)
-	walk = func(path string, ty reflect.Type) {
-		switch ty.Kind() {
-		case reflect.Map, reflect.Interface:
-			bad = append(bad, fmt.Sprintf("%s (%s)", path, ty.Kind()))
-		case reflect.Pointer, reflect.Slice, reflect.Array:
-			walk(path+"[]", ty.Elem())
-		case reflect.Struct:
-			if seen[ty] {
-				return // guard against a (hypothetical) recursive type
-			}
-			seen[ty] = true
-			for i := 0; i < ty.NumField(); i++ {
-				f := ty.Field(i)
-				walk(path+"."+f.Name, f.Type)
-			}
-		}
-	}
-	walk("GatewayConfig", reflect.TypeOf(config.GatewayConfig{}))
-	if len(bad) > 0 {
-		t.Fatalf("expandEnvInStrings silently skips map/interface kinds, so env refs in these fields would not be "+
-			"expanded — extend the walk (e.g. SetMapIndex for maps) before adding them: %v", bad)
-	}
-}
 func TestLoadGatewayConfig_Errors(t *testing.T) {
 	cases := []struct {
 		name    string

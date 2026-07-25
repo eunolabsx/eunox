@@ -675,29 +675,26 @@ func (p *StdioProxy) initUpstream(ctx context.Context) error {
 	}
 
 	// Read messages until the initialize response arrives, discarding any
-	// notifications that precede it.
-	for {
-		msg, err := p.readProbeReply(ctx)
-		if err != nil {
-			return fmt.Errorf("reading initialize response: %w", err)
-		}
-		if msg.IsResponse() && mcp.MsgKey(msg.ID) == mcp.MsgKey(initID) {
-			caps, sv, instructions, err := applyInitializeResult(msg)
-			if err != nil {
-				return err
-			}
-			p.upstreamCaps, p.upstreamServerVersion, p.upstreamInstructions = caps, sv, instructions
-			break
-		}
-		// Anything else during the handshake is discarded; log it so a stuck init
-		// (upstream chattering notifications but never answering) is observable.
-		fmt.Fprintf(os.Stderr,
-			"[eunox] debug: discarding upstream message during initialize handshake (method=%q).\n",
-			msg.Method)
-		// A discarded server-initiated REQUEST would leave the upstream blocked
-		// awaiting a response; reply with a JSON-RPC error so it unblocks.
-		RejectPreInitServerRequest(p.upWriter, msg)
+	// notifications that precede it. Each discard is logged so a stuck init (upstream
+	// chattering notifications but never answering) is observable.
+	resp, err := awaitStartupReply(
+		func() (mcp.RPCMsg, error) { return p.readProbeReply(ctx) },
+		initID,
+		p.upWriter,
+		func(msg mcp.RPCMsg) {
+			fmt.Fprintf(os.Stderr,
+				"[eunox] debug: discarding upstream message during initialize handshake (method=%q).\n",
+				msg.Method)
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("reading initialize response: %w", err)
 	}
+	caps, sv, instructions, err := applyInitializeResult(resp)
+	if err != nil {
+		return err
+	}
+	p.upstreamCaps, p.upstreamServerVersion, p.upstreamInstructions = caps, sv, instructions
 
 	// Send `initialized` notification to upstream.
 	notif, err := mcp.NotificationMsg(mcp.MethodNotificationsInitialized, nil)
