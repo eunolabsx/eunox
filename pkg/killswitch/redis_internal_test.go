@@ -690,13 +690,27 @@ func TestRedis_ShouldBlock_BeforeStartFailsClosed(t *testing.T) {
 func TestRedis_HealthStatus(t *testing.T) {
 	t.Parallel()
 	r, _ := newTestRedis(t)
+	ctx := context.Background()
 
-	// Fresh switch with no refresh yet reports nil (healthy).
+	// A constructed-but-unstarted switch is NOT healthy: ShouldBlock fails closed with
+	// ErrNotStarted, so reporting nil here would publish "ok" through a total
+	// data-plane outage. HealthStatus must mirror ShouldBlock's gate order.
+	assert.ErrorIs(t, r.HealthStatus(), ErrNotStarted)
+	blocked, err := r.ShouldBlock(ctx, "agent-x", "sess-x")
+	assert.False(t, blocked)
+	assert.ErrorIs(t, err, ErrNotStarted, "health probe and data plane must agree")
+
+	// Started and seeded: healthy.
+	r.Start(ctx)
 	assert.NoError(t, r.HealthStatus())
 
 	// A successful refresh keeps it healthy.
-	require.NoError(t, r.refreshState(context.Background()))
+	require.NoError(t, r.refreshState(ctx))
 	assert.NoError(t, r.HealthStatus())
+
+	// Stopped: the liveness cause, not the stale refresh error, and still not nil.
+	r.Stop()
+	assert.ErrorIs(t, r.HealthStatus(), ErrStopped)
 }
 
 func TestRedis_HealthStatus_AfterFailedRefresh(t *testing.T) {
@@ -715,9 +729,17 @@ func TestRedis_HealthStatus_AfterFailedRefresh(t *testing.T) {
 	t.Cleanup(func() { _ = client.Close() })
 
 	r := NewRedis(client)
+	// Start (against the dead server) so the not-started gate is satisfied and this
+	// asserts what it means to: that a STARTED switch surfaces its refresh error
+	// rather than a liveness cause.
+	r.Start(context.Background())
+	defer r.Stop()
 	err := r.refreshState(context.Background())
 	require.Error(t, err)
-	assert.Error(t, r.HealthStatus(), "HealthStatus must surface the last refresh error")
+	status := r.HealthStatus()
+	assert.Error(t, status, "HealthStatus must surface the last refresh error")
+	assert.NotErrorIs(t, status, ErrNotStarted, "the switch is started; the error must be the refresh failure")
+	assert.NotErrorIs(t, status, ErrStopped, "the switch is running; the error must be the refresh failure")
 }
 
 func TestRedis_Reset_ClearsAllState(t *testing.T) {

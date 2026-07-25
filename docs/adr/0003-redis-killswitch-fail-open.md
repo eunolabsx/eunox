@@ -95,9 +95,17 @@ on those paths already denies.
 
 ## Lifecycle and degraded-mode semantics
 
-The fail-closed decision above governs the steady state. Three lifecycle edges
+The fail-closed decision above governs the steady state. The lifecycle edges below
 refine what "cannot confirm" means, so a health probe and the data plane agree on
 *why* a switch is not serving allows:
+
+- **Unstarted is distinct from healthy.** A switch that is constructed but never
+  `Start`ed has never seeded its cache, so it cannot tell "nothing is killed" from
+  "state never loaded" and `ShouldBlock()` denies everything with `ErrNotStarted`
+  (a wiring error, so it too ignores `--killswitch-fail-open`). `HealthStatus()`
+  reports the same cause, checked in the same order as `ShouldBlock`'s gates:
+  reporting healthy there would publish `status: "ok"` on `/healthz` through a
+  *total* data-plane outage — the state in which a green probe misleads most.
 
 - **Stopped is distinct from unreachable.** Once the kill switch's `Start` context
   is canceled (`Stop()`, or the caller's own context), the reconcile and pub/sub
@@ -119,6 +127,24 @@ refine what "cannot confirm" means, so a health probe and the data plane agree o
   confirmation read is bounded (`subscribeConfirmTimeout`); on timeout the switch
   falls back to reconcile-only convergence exactly as for an outright subscribe
   failure, and startup proceeds degraded rather than hanging.
+
+- **A missed confirmation is not permanent.** Because the confirmation bound is a
+  hard cutoff, a *slow but healthy* Redis — a failover, a load spike, a saturated
+  link — can miss it without being down. Dropping such an instance into
+  reconcile-only mode for the life of the process would stretch kill propagation
+  from milliseconds to a full reconcile interval until an operator restarted it, so
+  the subscription is retried in the background with capped exponential backoff
+  (`subscribeRetryInitialDelay`..`subscribeRetryMaxDelay`). The retry runs off the
+  startup path: blocking `Start` to retry would re-open the very lifecycle-lock
+  window the bound exists to close. A subscription lost *while running* (an
+  unexpected channel close) rejoins the same retry path rather than ending the
+  real-time path for the process's lifetime. Because pub/sub is at-most-once, every
+  event published during the gap was missed, so a successful resubscribe
+  immediately reconciles rather than waiting for the next tick — ordered after the
+  confirmed subscribe, mirroring the initial-snapshot ordering, so an event racing
+  that reconcile is delivered on the live subscription instead of falling into the
+  handoff window. Only the failure edge and the recovery edge are logged, so a
+  sustained outage does not log per attempt.
 
 - **Detection is bounded by the reconcile interval, level after the fact.** A
   partition that begins *right after* a successful refresh is invisible until the
