@@ -279,10 +279,34 @@ func TestMatchValueGlob_NoBacktrackingBlowup(t *testing.T) {
 // diverge.
 func TestValidateValueGlob(t *testing.T) {
 	t.Parallel()
-	valid := []string{"*", "**", "/reports/*", "/reports/**", "/a/b/c", "[a-z]/**", "literal", "a[1]"}
+	valid := []string{
+		"*", "**", "/reports/*", "/reports/**", "/a/b/c", "[a-z]/**", "literal", "a[1]",
+		// An encoded-separator token spelled INSIDE a bracket class is a class whose
+		// members are '%', '2' and 'f' — a live grant, not an encoded separator. The
+		// dead-grant rejection must read the pattern's literal text only.
+		"[a%2f]",
+		"logs/[a%5cb].txt",
+		// ...and eliding the class must not splice a token into existence: "%2[x]f"
+		// matches the value "%2xf", which the runtime admits (a malformed escape is a
+		// legal filename character, and it decodes to no separator).
+		"%2[x]f",
+	}
 	for _, p := range valid {
 		if err := enforcement.ValidateValueGlob(p); err != nil {
 			t.Errorf("ValidateValueGlob(%q) = %v, want nil", p, err)
+		}
+	}
+	// The accepted class patterns above are accepted because they are LIVE: pin that
+	// the runtime really matches them, so the load check and the matcher cannot drift
+	// back into rejecting a pattern that grants something.
+	live := []struct{ pattern, value string }{
+		{"[a%2f]", "a"}, {"[a%2f]", "%"}, {"[a%2f]", "f"},
+		{"logs/[a%5cb].txt", "logs/5.txt"},
+		{"%2[x]f", "%2xf"},
+	}
+	for _, c := range live {
+		if !enforcement.MatchValueGlob(c.pattern, c.value) {
+			t.Errorf("MatchValueGlob(%q, %q) = false, want true", c.pattern, c.value)
 		}
 	}
 	invalid := []string{
@@ -301,6 +325,9 @@ func TestValidateValueGlob(t *testing.T) {
 		"a%2fb",
 		"file%5cname",
 		"a%2Fb", // case-insensitive
+		// A backslash-escaped '%' is still a literal '%': path.Match matches the value
+		// "%2f", which the runtime denies, so the grant stays dead.
+		`\%2fb`,
 		// A "**" pattern exceeding the runtime segment cap matches nothing.
 		strings.Repeat("a/", 1001) + "**",
 	}

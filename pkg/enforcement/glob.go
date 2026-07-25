@@ -52,14 +52,58 @@ func decodePathForConfinement(value string) (string, error) {
 	return decoded, nil
 }
 
-// containsEncodedSeparator reports whether value contains a percent-encoded path
-// separator token (%2f for '/', %5c for '\'), case-insensitively. Used on the
-// fail-closed path when the value cannot be fully percent-decoded (a malformed
-// escape elsewhere in it), so a valid encoded separator riding alongside the bad
-// escape is still caught rather than matched as literal bytes.
-func containsEncodedSeparator(value string) bool {
-	lower := strings.ToLower(value)
+// containsEncodedSeparator reports whether s contains a percent-encoded path
+// separator token (%2f for '/', %5c for '\'), case-insensitively. Two callers:
+// on the runtime fail-closed path when a VALUE cannot be fully percent-decoded (a
+// malformed escape elsewhere in it), so a valid encoded separator riding alongside
+// the bad escape is still caught rather than matched as literal bytes; and at load
+// on a PATTERN's literal text (via patternLiteralsOutsideClasses), where such a
+// token marks a silently dead grant. Sharing one token definition keeps the load
+// rejection and the runtime denial in lock-step.
+func containsEncodedSeparator(s string) bool {
+	lower := strings.ToLower(s)
 	return strings.Contains(lower, "%2f") || strings.Contains(lower, "%5c")
+}
+
+// globClassPlaceholder stands in for an elided bracket class in
+// patternLiteralsOutsideClasses. It must be a byte that can never form part of an
+// encoded-separator token, so eliding a class cannot splice one into existence.
+const globClassPlaceholder = '\x00'
+
+// patternLiteralsOutsideClasses renders a glob pattern with every bracket class
+// replaced by a single placeholder, leaving only the characters path.Match compares
+// literally. A '%', '2' or 'f' written INSIDE a class ("[a%2f]") is a class MEMBER —
+// the class consumes one value character — so such a pattern is a live grant and
+// must not be read as an encoded separator. Mirrors path.Match's scanChunk exactly,
+// as countPatternPathSeparators does: '[' opens a class and ']' closes it (no
+// nesting), and a backslash-escaped character is a single literal unit that neither
+// opens nor closes one. The scan is deliberately literal-only: a token split by a
+// wildcard ("%2*f") still loads, matching the fail-closed direction — this rejects
+// unmatchable grants, it is not a security boundary.
+func patternLiteralsOutsideClasses(pattern string) string {
+	var b strings.Builder
+	inClass := false
+	for i := 0; i < len(pattern); i++ {
+		switch {
+		case pattern[i] == '\\' && i+1 < len(pattern):
+			i++
+			if !inClass {
+				b.WriteByte(pattern[i])
+			}
+		case pattern[i] == '[':
+			if !inClass {
+				b.WriteByte(globClassPlaceholder)
+			}
+			inClass = true
+		case pattern[i] == ']':
+			inClass = false
+		default:
+			if !inClass {
+				b.WriteByte(pattern[i])
+			}
+		}
+	}
+	return b.String()
 }
 
 // maxGlobSegments caps the '/'-separated segment count a "**" pattern matches, so
@@ -80,13 +124,14 @@ func ValidateValueGlob(pattern string) error {
 	if pattern == "*" || pattern == "**" {
 		return nil
 	}
-	// A pattern carrying an ENCODED path separator (%2f, %5c) is a silently dead grant:
-	// the runtime confinement decodes a candidate value's separators and denies any that
-	// decode to contain one, so the only value such a pattern could match is itself
-	// denied. Reject it at load (like the "."/".." segments below) so the operator sees
-	// the mistake instead of a rule that matches nothing. Write a literal '/' for a
-	// separator.
-	if containsEncodedSeparator(pattern) {
+	// A pattern carrying an ENCODED path separator (%2f, %5c) in its LITERAL text is a
+	// silently dead grant: the runtime confinement decodes a candidate value's separators
+	// and denies any that decode to contain one, so the only value such a pattern could
+	// match is itself denied. Reject it at load (like the "."/".." segments below) so the
+	// operator sees the mistake instead of a rule that matches nothing. Write a literal
+	// '/' for a separator. Bracket classes are elided first: "[a%2f]" spells a class whose
+	// members include '%', '2' and 'f', and it matches those values at runtime.
+	if containsEncodedSeparator(patternLiteralsOutsideClasses(pattern)) {
 		return fmt.Errorf("%w: pattern contains an encoded path separator (%%2f/%%5c); the runtime confinement denies any value that decodes to a separator, so the grant would match nothing", path.ErrBadPattern)
 	}
 	// A "**" pattern with more '/'-separated segments than the runtime cap is likewise a

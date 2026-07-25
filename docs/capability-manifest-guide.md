@@ -1293,10 +1293,12 @@ list of exact strings or glob patterns (e.g. `/reports/*` matches
 >   - a path-style pattern that itself contains a literal `.` or `..` segment
 >     (e.g. `/**/../x`, `/a/./b`) — the confinement scan above denies every value
 >     carrying the required `.`/`..` segment first;
->   - a pattern carrying an *encoded* path separator (`%2f` or `%5c`, e.g. `a%2fb`)
->     — the runtime confinement denies any value that decodes to contain a
->     separator, so the only value the pattern could match is itself denied (write a
->     literal `/` for a path separator);
+>   - a pattern whose *literal* text carries an *encoded* path separator (`%2f` or
+>     `%5c`, e.g. `a%2fb`) — the runtime confinement denies any value that decodes
+>     to contain a separator, so the only value the pattern could match is itself
+>     denied (write a literal `/` for a path separator). The same characters inside
+>     a bracket class are ordinary class members, so `[a%2f]` (a class matching one
+>     of `a`, `%`, `2`, `f`) stays valid;
 >   - a `**` pattern with more `/`-separated segments than the runtime match cap —
 >     the segment matcher refuses to match beyond the cap.
 > - A value you intend literally but that contains `*`, `?`, or `[` (a filename
