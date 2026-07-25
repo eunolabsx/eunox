@@ -837,15 +837,17 @@ func (cfg *GatewayConfig) validateUpstreamEntry(i int, u *UpstreamConfig, seen m
 	}
 
 	// Reject an empty or whitespace-only policy entry at load rather than deferring
-	// the failure to route start. A "" entry (a common templating accident —
-	// policy: ["${VAR}"] with VAR unset expands to [""]) has len==1, so it slips past
-	// the no-policy classification (NoPolicyStartupRejection, which keys on len==0) and
-	// masks the "this route has no policy" condition; then ResolvePolicyPath joins ""
-	// onto the config dir and the loader dies at startup with a misleading "is a
-	// directory" error. Fail closed here with a clear config diagnostic instead.
+	// the failure to route start. A "" entry — a literal policy: [""], or a
+	// policy: ["${VAR}"] where VAR is SET but empty/whitespace (expandEnvRefs leaves an
+	// UNSET ${VAR} intact as its literal text, so an unset ref is a non-empty entry that
+	// fails later at route start, not here) — has len==1, so it slips past the no-policy
+	// classification (NoPolicyStartupRejection, which keys on len==0) and masks the "this
+	// route has no policy" condition; then ResolvePolicyPath joins "" onto the config dir
+	// and the loader dies at startup with a misleading "is a directory" error. Fail closed
+	// here with a clear config diagnostic instead.
 	for _, p := range u.Policy {
 		if strings.TrimSpace(p) == "" {
-			return fmt.Errorf("upstream %q: 'policy' contains an empty entry; each policy entry must be a manifest file path (an empty entry is often an unset ${VAR} in the config)", u.Name)
+			return fmt.Errorf("upstream %q: 'policy' contains an empty entry; each policy entry must be a manifest file path (an empty entry is often a ${VAR} that expanded to empty, or a stray \"\")", u.Name)
 		}
 	}
 

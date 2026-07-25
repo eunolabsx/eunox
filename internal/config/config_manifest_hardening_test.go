@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-// TestLoadGatewayConfig_RejectsOctalCoercedNumeric is the finding-A regression: an
+// TestLoadGatewayConfig_RejectsOctalCoercedNumeric is a regression test: an
 // unquoted leading-zero numeric field YAML reads as OCTAL (port: 0755 → 493), which the
 // strict struct decode accepts silently. The loader must fail closed, and a quoted value
 // (the operator disambiguated it to a string, which then fails the range check) or a
@@ -43,8 +43,8 @@ upstreams:
 	}
 }
 
-// TestLoadGatewayConfig_RejectsEmptyPolicyEntry is the finding-C regression: a policy
-// list with an empty entry (often an unset ${VAR} → [""]) passes the old validation and
+// TestLoadGatewayConfig_RejectsEmptyPolicyEntry is a regression test: a policy
+// list with an empty entry (a literal [""], or a ${VAR} that expands to empty) passes the old validation and
 // dies at route start with a misleading "is a directory". It must be rejected at load.
 func TestLoadGatewayConfig_RejectsEmptyPolicyEntry(t *testing.T) {
 	cfg := `
@@ -65,7 +65,7 @@ upstreams:
 	}
 }
 
-// TestLoadGatewayConfig_RejectsWhitespaceAuthToken is the finding-D regression: a literal
+// TestLoadGatewayConfig_RejectsWhitespaceAuthToken is a regression test: a literal
 // whitespace-only authToken is a degenerate bearer secret that also satisfies the
 // non-loopback-bind safety gate. It must be rejected like the env-ref-expands-to-blank case.
 func TestLoadGatewayConfig_RejectsWhitespaceAuthToken(t *testing.T) {
@@ -89,7 +89,7 @@ upstreams:
 	}
 }
 
-// TestLoadManifest_RejectsEmptyServerVersionComponent is the finding-G regression: a
+// TestLoadManifest_RejectsEmptyServerVersionComponent is a regression test: a
 // serverVersion pin with an empty dot-component ("1.2.", "1..2") passes the regex but can
 // never match a real version — a self-inflicted blackout under --strict-drift. Reject at load.
 func TestLoadManifest_RejectsEmptyServerVersionComponent(t *testing.T) {
@@ -109,7 +109,7 @@ func TestLoadManifest_RejectsEmptyServerVersionComponent(t *testing.T) {
 	}
 }
 
-// TestLoadManifest_UnquotedSchemaVersion is the finding-K regression: an UNQUOTED
+// TestLoadManifest_UnquotedSchemaVersion is a regression test: an UNQUOTED
 // schemaVersion (schemaVersion: 0.1, yaml-typed as a float) must negotiate identically to
 // the quoted form and to the gateway loader, instead of failing json.Unmarshal into the
 // string field with an opaque decode error.

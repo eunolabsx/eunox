@@ -70,7 +70,7 @@ func WriteControlTokenFile(path, token string) (string, error) {
 		// breakage as root) or fail with EPERM on a dir the user doesn't own (refusing to
 		// start). MkdirAll creates any MISSING dirs at 0700 already, so a dir we create
 		// needs no chmod; a pre-existing one we leave alone and only warn about.
-		_, statErr := os.Stat(dir)
+		fi, statErr := os.Stat(dir)
 		dirPreexisted := statErr == nil
 		if err := os.MkdirAll(dir, 0o700); err != nil { //nolint:gosec // G301: 0700 is the intended restrictive mode
 			return "", fmt.Errorf("creating control-token directory: %w", err)
@@ -78,8 +78,10 @@ func WriteControlTokenFile(path, token string) (string, error) {
 		if dirPreexisted {
 			// Warn (do not mutate) if a pre-existing dir is looser than 0700, so the
 			// operator can decide — the control token gates the loopback emergency stop, so
-			// a group/world-accessible directory is worth flagging.
-			if fi, err := os.Stat(dir); err == nil && fi.Mode().Perm()&0o077 != 0 {
+			// a group/world-accessible directory is worth flagging. Reuse the FileInfo from
+			// the pre-existence stat above (MkdirAll does not touch an already-present dir),
+			// so the mode is read exactly once.
+			if fi.Mode().Perm()&0o077 != 0 {
 				fmt.Fprintf(os.Stderr, "[eunox] WARNING: control-token directory %q has mode %v (group/world-accessible); eunox does not tighten a pre-existing directory it did not create — restrict it to 0700 yourself to protect the loopback control token\n", dir, fi.Mode().Perm())
 			}
 		}

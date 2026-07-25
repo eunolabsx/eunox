@@ -91,6 +91,13 @@ The required top-level fields are `schemaVersion`, `name`, `version`, and
 `capabilities`. Optional fields are `description` and `audience`.
 Anything missing or shaped differently is rejected by `eunox validate`.
 
+> **Migration note (pre-1.0).** The `defaultTtl` field was removed — it was
+> informational only and never enforced. Because unknown keys are rejected
+> fail-closed (see below), a manifest that still carries a `defaultTtl:` line no
+> longer loads: it is refused at startup with `manifest: unknown field
+> "defaultTtl"`. Delete the line — nothing consumed it, so removing it changes no
+> enforcement behavior.
+
 **Unknown keys are rejected, fail-closed.** A misspelled field anywhere in the
 manifest — `arguments` for `argument`, `action` for `actions`, `value` for
 `values` — is refused at load with a "did you mean …?" hint, rather than
