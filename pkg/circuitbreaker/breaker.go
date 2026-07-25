@@ -15,7 +15,6 @@ package circuitbreaker
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"sync"
 	"time"
 )
@@ -56,23 +55,6 @@ func DefaultConfig() Config {
 		CooldownDuration:  30 * time.Second,
 		HalfOpenMaxProbes: 1,
 	}
-}
-
-// Validate reports whether the configuration is usable. Every field must be
-// positive (a non-positive value yields degenerate behavior: tripping on the first
-// failure, no back-pressure, or no probes). Call this to reject a degenerate config
-// rather than have New sanitize it.
-func (c Config) Validate() error {
-	if c.FailureThreshold <= 0 {
-		return fmt.Errorf("circuitbreaker: FailureThreshold must be > 0, got %d", c.FailureThreshold)
-	}
-	if c.CooldownDuration <= 0 {
-		return fmt.Errorf("circuitbreaker: CooldownDuration must be > 0, got %v", c.CooldownDuration)
-	}
-	if c.HalfOpenMaxProbes <= 0 {
-		return fmt.Errorf("circuitbreaker: HalfOpenMaxProbes must be > 0, got %d", c.HalfOpenMaxProbes)
-	}
-	return nil
 }
 
 // Breaker implements the circuit breaker pattern. Construct it with [New] and
@@ -156,8 +138,13 @@ func WithClock(fn func() time.Time) Option {
 }
 
 // New creates a new circuit breaker with the given configuration. Any non-positive
-// field is replaced by its DefaultConfig value to keep the breaker fail-safe;
-// callers that prefer to reject such a config should call cfg.Validate first.
+// field is replaced by its DefaultConfig value to keep the breaker fail-safe.
+//
+// Clamping is the package's ONE policy for a degenerate config. A second,
+// reject-instead Config.Validate used to sit alongside it with no caller: the shipped
+// proxy exposes no operator-facing breaker knobs (every construction site passes
+// DefaultConfig), so the only thing two policies bought was the chance for an embedder
+// to get a different answer from each about the same config.
 func New(cfg Config, opts ...Option) *Breaker {
 	def := DefaultConfig()
 	if cfg.FailureThreshold <= 0 {

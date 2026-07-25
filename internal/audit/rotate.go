@@ -134,28 +134,51 @@ func rotatedStampParts(name, logPath string) (ordinal uint64, hasOrdinal bool, t
 // suffix-filtered; callers apply rotatedAuditRe. A read error is returned (callers
 // treat it as "no siblings").
 func rotatedSiblings(logPath string) ([]string, error) {
+	matches, _, err := scanLogDir(logPath)
+	return matches, err
+}
+
+// scanLogDir reads logPath's directory ONCE and splits that single snapshot into every
+// regular file sharing the "<base>." prefix (returned as full paths) and whether the
+// active base itself was present in the SAME read.
+//
+// The single read is load-bearing for LogChainFiles, not just an optimization. A
+// glob-then-stat decomposition (list siblings at T1, stat the base at T2) has a TOCTOU
+// gap: a rotate() landing between T1 and T2 renames the base to a new sibling and opens
+// a fresh empty base, so the result would carry the empty base but omit the just-rotated
+// sibling holding every record up to the rotation boundary — and audit-verify would PASS
+// on an incomplete chain. os.ReadDir is a single directory read, atomic against a
+// concurrent rotate() w.r.t. the kernel's directory view: a rotation completing before
+// the read shows the new rotated name; one completing after still shows the original
+// base. Either way no file falls through the gap.
+//
+// Only regular files participate. A directory or symlink named like a rotated log would
+// otherwise reach pruneRotated (os.Remove fails on a non-empty dir, or burns a retention
+// slot on an empty one) or newestRotatedSiblingWithTail (os.Open succeeds on a dir but
+// Read fails, breaking the chain). The rotatedAuditRe name filter is applied one level
+// up, in sortedRotatedSiblingsWithBase.
+func scanLogDir(logPath string) (siblings []string, hasActive bool, err error) {
 	dir := filepath.Dir(logPath)
 	base := filepath.Base(logPath)
 	prefix := base + "."
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	var matches []string
 	for _, e := range entries {
-		// Only regular files are rotated logs. A directory named like a rotated log
-		// would otherwise reach pruneRotated (os.Remove fails on a non-empty dir, or
-		// burns a retention slot on an empty one) or newestRotatedSiblingWithTail
-		// (os.Open succeeds on a dir but Read fails, breaking the chain). Filter here.
 		if !e.Type().IsRegular() {
 			continue
 		}
 		name := e.Name()
+		if name == base {
+			hasActive = true
+			continue
+		}
 		if strings.HasPrefix(name, prefix) {
-			matches = append(matches, logPath+name[len(base):])
+			siblings = append(siblings, logPath+name[len(base):])
 		}
 	}
-	return matches, nil
+	return siblings, hasActive, nil
 }
 
 // sortedRotatedSiblings returns logPath's genuine rotated siblings
@@ -168,9 +191,17 @@ func rotatedSiblings(logPath string) ([]string, error) {
 // (audit.jsonl.bak, .lock, ...) so they can't seed the resumed chain or burn a
 // retention slot.
 func sortedRotatedSiblings(logPath string) ([]string, error) {
-	all, err := rotatedSiblings(logPath)
+	files, _, err := sortedRotatedSiblingsWithBase(logPath)
+	return files, err
+}
+
+// sortedRotatedSiblingsWithBase is sortedRotatedSiblings plus whether the active base
+// was present in the same directory read. Only LogChainFiles needs the second value,
+// and it needs it from THIS read (see scanLogDir's TOCTOU note).
+func sortedRotatedSiblingsWithBase(logPath string) ([]string, bool, error) {
+	all, hasActive, err := scanLogDir(logPath)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	// [:0:0] shares none of all's backing array, so the first append allocates fresh.
 	files := all[:0:0]
@@ -183,7 +214,7 @@ func sortedRotatedSiblings(logPath string) ([]string, error) {
 	sort.Slice(files, func(i, j int) bool {
 		return rotatedOrderLess(files[i], files[j], logPath)
 	})
-	return files, nil
+	return files, hasActive, nil
 }
 
 // newestRotatedSiblingWithTail walks logPath's rotated siblings newest-to-oldest and
@@ -246,51 +277,18 @@ func newestRotatedSiblingWithTail(logPath string) (path, line string, unreadable
 // base sorts last (rotation renames the active file and opens a fresh base), so the
 // order matches the write order across rotations.
 func LogChainFiles(logPath string) ([]string, error) {
-	// Snapshot the directory ONCE and split it into rotated siblings and the active
-	// base in a single pass. A glob-then-stat decomposition (list siblings at T1,
-	// stat the base at T2) has a TOCTOU gap: a rotate() landing between T1 and T2
-	// renames the base to a new sibling and opens a fresh empty base, so the result
-	// would carry the empty base but omit the just-rotated sibling holding every
-	// record up to the rotation boundary — and audit-verify would PASS on an
-	// incomplete chain. os.ReadDir is a single directory read atomic against a
-	// concurrent rotate() w.r.t. the kernel's directory view: a rotation completing
-	// before the read shows the new rotated name; one completing after still shows
-	// the original base. Either way no file falls through the gap.
-	dir := filepath.Dir(logPath)
-	base := filepath.Base(logPath)
-	prefix := base + "."
-	entries, err := os.ReadDir(dir)
+	// One directory read backs both halves: the ordered rotated siblings AND whether
+	// the active base exists. Splitting them into two scans would reopen the TOCTOU gap
+	// scanLogDir documents, where a rotation landing between them yields the fresh empty
+	// base without the sibling holding every record up to the rotation boundary.
+	files, hasActive, err := sortedRotatedSiblingsWithBase(logPath)
 	if err != nil {
 		return nil, err
 	}
-	var files []string
-	hasActive := false
-	for _, e := range entries {
-		// Only regular files participate (mirrors rotatedSiblings): a directory or
-		// symlink named like the base or a rotated sibling must not seed the chain.
-		if !e.Type().IsRegular() {
-			continue
-		}
-		name := e.Name()
-		// The active base, appended last below only when it exists: after a
-		// reopen-fallback it can be briefly absent (tail in the newest sibling), and a
-		// fresh install has none yet.
-		if name == base {
-			hasActive = true
-			continue
-		}
-		// Genuine rotated siblings only; rotatedAuditRe drops unrelated names sharing
-		// the "<base>." prefix (audit.jsonl.bak, .lock, ...) that would otherwise
-		// inject a spurious record or seed the cross-file link from the wrong source.
-		if strings.HasPrefix(name, prefix) && rotatedAuditRe.MatchString(name[len(base):]) {
-			files = append(files, logPath+name[len(base):])
-		}
-	}
-	// Numeric-aware order so a ".10" suffix sorts after ".2", matching the write
-	// order across rotations; the base sorts last.
-	sort.Slice(files, func(i, j int) bool {
-		return rotatedOrderLess(files[i], files[j], logPath)
-	})
+	// The base sorts last: rotation renames the active file and opens a fresh one, so
+	// appending it matches the write order across rotations. It is omitted when absent —
+	// after a reopen-fallback it can be briefly missing (tail in the newest sibling), and
+	// a fresh install has none yet.
 	if hasActive {
 		files = append(files, logPath)
 	}

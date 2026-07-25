@@ -140,7 +140,7 @@ func (c *keyCapturingCounter) IncrementIfAllBelow(_ context.Context, _ []string,
 	return true, 0, 0, 0, nil
 }
 
-// incrKeyCapturingCounter records every key recordSessionCall passes to
+// incrKeyCapturingCounter records every key RecordSessionCall passes to
 // IncrementAndGet (the sequenceBlock history write path).
 type incrKeyCapturingCounter struct {
 	keyCapturingCounter
@@ -233,7 +233,7 @@ func TestCommitDeferredAtomic_DispatchesThroughRegistry(t *testing.T) {
 }
 
 // nonUniformSkipHandler is a custom CommittingConditionHandler that reports skip=true
-// for its OWN reason (never from ctx/skipQuota), violating the contract that skip must
+// for its OWN reason (never from ctx/SkipQuota), violating the contract that skip must
 // be uniform across the constraint. On the multi-deferred path this would fail OPEN —
 // one bucket's skip shortcuts the whole set to allow without limit-checking the rest —
 // so commitDeferredAtomic must instead fail closed.
@@ -249,7 +249,7 @@ func (h nonUniformSkipHandler) PrepareCommit(_ context.Context, _ capability.Con
 }
 
 // TestCommitDeferredAtomic_NonUniformSkipFailsClosed pins that a committing handler
-// reporting skip for a reason other than the ctx (skipQuota) is rejected with a deny
+// reporting skip for a reason other than the ctx (SkipQuota) is rejected with a deny
 // rather than admitting the call. Without the guard, one bucket's non-uniform skip
 // would allow the whole deferred set without limit-checking the remaining conditions.
 func TestCommitDeferredAtomic_NonUniformSkipFailsClosed(t *testing.T) {
@@ -269,7 +269,7 @@ func TestCommitDeferredAtomic_NonUniformSkipFailsClosed(t *testing.T) {
 		},
 	}}
 
-	// No WithSkipQuota on the context, so skipQuota(ctx) is false: the handler's skip is
+	// No WithSkipQuota on the context, so SkipQuota(ctx) is false: the handler's skip is
 	// non-uniform and must fail closed.
 	resp := e.ValidateAction(context.Background(), req, caps)
 	if resp.Decision != capability.DecisionDeny {
@@ -420,16 +420,16 @@ func TestCommitDeferredAtomic_NilCounterFailsClosed(t *testing.T) {
 }
 
 // sentinelCommitHandler is a custom CommittingConditionHandler used to exercise the
-// multi-bucket atomic-commit path's observe-mode (skipQuota) behavior. It branches on
+// multi-bucket atomic-commit path's observe-mode (SkipQuota) behavior. It branches on
 // MaxCallsCondition.Count so one constraint can mix bucket behaviors the built-in
-// maxCalls never mixes (maxCalls always derives skip solely from skipQuota, so its
+// maxCalls never mixes (maxCalls always derives skip solely from SkipQuota, so its
 // buckets are uniform):
 //
-//	Count < 0  → always a validation condErr, even under skipQuota (a committing
+//	Count < 0  → always a validation condErr, even under SkipQuota (a committing
 //	             condition whose validity is independent of the quota skip)
-//	Count == 7 → always commits, IGNORING skipQuota (violates the ctx-uniform skip
+//	Count == 7 → always commits, IGNORING SkipQuota (violates the ctx-uniform skip
 //	             contract, producing a non-uniform skip across buckets)
-//	otherwise  → skips under skipQuota, commits otherwise (the well-behaved case)
+//	otherwise  → skips under SkipQuota, commits otherwise (the well-behaved case)
 type sentinelCommitHandler struct{}
 
 func (sentinelCommitHandler) Handle(context.Context, capability.Condition, *capability.EnforceRequest) *ConditionError {
@@ -457,8 +457,8 @@ func (sentinelCommitHandler) PrepareCommit(ctx context.Context, cond capability.
 		// exclusion between the two, so a handler may legitimately do this.
 		return DeferredCommit{}, true, &ConditionError{Code: capability.ErrCodeConditionFailed, ConditionType: capability.ConditionTypeMaxCalls, Message: "invalid bucket config"}
 	case mc.Count == 7:
-		return commit, false, nil // commit even under skipQuota
-	case skipQuota(ctx):
+		return commit, false, nil // commit even under SkipQuota
+	case SkipQuota(ctx):
 		return DeferredCommit{}, true, nil
 	default:
 		return commit, false, nil
@@ -470,7 +470,7 @@ func sentinelEngine() *Engine {
 }
 
 // TestCommitDeferredAtomic_ObserveSurfacesLaterBucketCondErr pins that under the
-// observe (skipQuota) posture the multi-bucket commit evaluates EVERY bucket, so a later
+// observe (SkipQuota) posture the multi-bucket commit evaluates EVERY bucket, so a later
 // bucket's validation error still denies. Returning on the first bucket's skip (the prior
 // behavior) masked it as an allow — the observe/enforce divergence this closes.
 func TestCommitDeferredAtomic_ObserveSurfacesLaterBucketCondErr(t *testing.T) {
@@ -494,9 +494,9 @@ func TestCommitDeferredAtomic_ObserveSurfacesLaterBucketCondErr(t *testing.T) {
 }
 
 // TestCommitDeferredAtomic_PartialSkipFailsClosed pins that a non-uniform skip — some
-// buckets skip under skipQuota while another commits — fails closed after the loop. The
+// buckets skip under SkipQuota while another commits — fails closed after the loop. The
 // per-bucket assertion cannot catch it (each skipping bucket individually satisfies
-// skipQuota); admitting the committing buckets while dropping the skipped ones would be a
+// SkipQuota); admitting the committing buckets while dropping the skipped ones would be a
 // fail-open.
 func TestCommitDeferredAtomic_PartialSkipFailsClosed(t *testing.T) {
 	e := sentinelEngine()
@@ -506,7 +506,7 @@ func TestCommitDeferredAtomic_PartialSkipFailsClosed(t *testing.T) {
 		Actions: []string{"*"},
 		Conditions: []capability.Condition{
 			&capability.MaxCallsCondition{Count: 5, WindowSeconds: 60},   // skips under observe
-			&capability.MaxCallsCondition{Count: 7, WindowSeconds: 3600}, // commits, ignoring skipQuota
+			&capability.MaxCallsCondition{Count: 7, WindowSeconds: 3600}, // commits, ignoring SkipQuota
 		},
 	}}
 	resp := e.ValidateAction(WithSkipQuota(context.Background()), req, caps)
@@ -517,7 +517,7 @@ func TestCommitDeferredAtomic_PartialSkipFailsClosed(t *testing.T) {
 		t.Fatalf("denial = %+v, want CONDITION_FAILED", resp.Denial)
 	}
 	// HardDeny, or the guard cannot actually block. A partial skip is only reachable when
-	// skipQuota is set, which the binary sets only on a route running --audit — and there
+	// SkipQuota is set, which the binary sets only on a route running --audit — and there
 	// the transport downgrades and FORWARDS any non-HardDeny verdict, letting the call
 	// proceed with zero quota consumed on any bucket.
 	if !resp.Denial.HardDeny {
@@ -553,7 +553,7 @@ func TestCommitDeferredAtomic_SkipDoesNotSwallowCondErr(t *testing.T) {
 }
 
 // TestCommitDeferredAtomic_AllSkipUnderObserveAllows is the positive control: when EVERY
-// bucket skips under skipQuota (the shipped maxCalls-only observe path), quota is not
+// bucket skips under SkipQuota (the shipped maxCalls-only observe path), quota is not
 // consumed and the call is allowed.
 func TestCommitDeferredAtomic_AllSkipUnderObserveAllows(t *testing.T) {
 	e := sentinelEngine()
@@ -580,7 +580,7 @@ type typedNilCondition struct{ capability.MaxCallsCondition }
 // TestRunConditions_TypedNilConditionFailsClosed pins that a Condition interface
 // value wrapping a nil pointer — which survives a plain `cond == nil` check — is
 // rejected with a structured deny instead of panicking in ConditionType(),
-// mirroring collectObligations' identical typed-nil directive guard.
+// mirroring CollectObligations' identical typed-nil directive guard.
 func TestRunConditions_TypedNilConditionFailsClosed(t *testing.T) {
 	e := New(WithCallCounter(callcounter.NewInMemory()))
 	req := &capability.EnforceRequest{SessionID: "sess-1", ToolName: "tool"}
@@ -600,7 +600,7 @@ func TestRunConditions_TypedNilConditionFailsClosed(t *testing.T) {
 	}
 }
 
-// recordSessionCall must key the sequenceBlock history WRITE under req.Target.Name
+// RecordSessionCall must key the sequenceBlock history WRITE under req.Target.Name
 // VERBATIM (only whitespace-trimmed) so the explicit afterTools spelling
 // ("resource:system:foo") matches, AND ALSO write a secondary marker keyed the way
 // the lookup parses the bare spelling ("system:foo" -> (system, foo)), so a target
@@ -642,7 +642,7 @@ func TestRecordSessionCall_TargetNameKeyedVerbatim(t *testing.T) {
 
 // recordFaultCounter admits maxCalls (IncrementIfBelow) but fails the
 // sequenceBlock-antecedent write (IncrementAndGet), reproducing the counter-fault
-// the recordSessionCall deny path is reachable through.
+// the RecordSessionCall deny path is reachable through.
 type recordFaultCounter struct {
 	incrementAndGetCalls int
 }
@@ -660,7 +660,7 @@ func (c *recordFaultCounter) IncrementIfAllBelow(_ context.Context, _ []string, 
 }
 
 // TestRecordSessionCall_NoSequenceBlock_NoQuotaBurnOnRecordFault is the regression
-// for the maxCalls slot being burned on a recordSessionCall-fault deny. For a
+// for the maxCalls slot being burned on a RecordSessionCall-fault deny. For a
 // maxCalls-only policy (no sequenceBlock), WithoutAntecedentRecording skips the
 // antecedent write entirely, so a counter fault on that write can no longer turn a
 // committed-maxCalls allow into a deny. The default engine (no option) still
@@ -989,9 +989,9 @@ func TestCollectObligationsValueDirective(t *testing.T) {
 				Actions:    []string{"call"},
 				Directives: []capability.Directive{dir},
 			}
-			obs, deny := e.collectObligations(c, "req-1", "2026-06-14T00:00:00Z")
+			obs, deny := e.CollectObligations(c, "req-1", "2026-06-14T00:00:00Z")
 			if deny != nil {
-				t.Fatalf("collectObligations denied a valid redactFields directive: %+v", deny.Denial)
+				t.Fatalf("CollectObligations denied a valid redactFields directive: %+v", deny.Denial)
 			}
 			if len(obs) != 1 || obs[0].Type != capability.DirectiveTypeRedactFields {
 				t.Fatalf("unexpected obligations: %+v", obs)

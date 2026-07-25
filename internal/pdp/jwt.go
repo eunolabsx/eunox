@@ -343,7 +343,16 @@ func NewJWTPDP(opts JWTPDPOptions) *JWTPDP {
 	if opts.Clock != nil {
 		cacheConfig.Now = opts.Clock.Now
 	}
-	return newJWTPDP(opts, capability.NewJWKSCache(cacheConfig))
+	p := newJWTPDP(opts, capability.NewJWKSCache(cacheConfig))
+	// Wire the verified-token cache to the PDP's clock so a frozen test clock stays
+	// consistent with exp/nbf validation and the cache TTL. Only a VALIDATOR gets one:
+	// the cache is written solely by ValidateToken, which the transport calls on the
+	// shared validator alone. A gateway route wrapper (NewJWTPDPWithCache) only
+	// intersects already-validated claims, so its cache could never hold an entry —
+	// N-1 caches allocated to stay empty for the process lifetime. PayloadCache's
+	// Get/Put are nil-receiver safe, so leaving it nil there is simply the miss path.
+	p.tokenCache = newJWTTokenCache(p.now)
+	return p
 }
 
 // normalizeAudience collapses a whitespace-only audience to the empty string so the
@@ -406,9 +415,6 @@ func newJWTPDP(opts JWTPDPOptions, cache *capability.JWKSCache) *JWTPDP {
 		leeway:                   effectiveLeeway(opts.Leeway),
 		experimentalCapabilities: opts.ExperimentalCapabilities,
 	}
-	// Wire the verified-token cache to the PDP's clock so a frozen test clock stays
-	// consistent with exp/nbf validation and the cache TTL.
-	p.tokenCache = newJWTTokenCache(p.now)
 	return p
 }
 
