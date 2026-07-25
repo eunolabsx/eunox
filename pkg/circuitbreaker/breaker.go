@@ -269,7 +269,9 @@ func (b *Breaker) recordSuccess(gen uint64) {
 
 	if b.state == StateHalfOpen {
 		b.halfOpenSuccess++
-		if b.halfOpenSuccess >= b.requiredHalfOpenSuccesses() {
+		// New clamps HalfOpenMaxProbes to >= 1 (and config is never reassigned), so it
+		// is the required number of successes to close from half-open directly.
+		if b.halfOpenSuccess >= b.config.HalfOpenMaxProbes {
 			b.state = StateClosed
 			b.halfOpenProbes = 0
 			b.halfOpenSuccess = 0
@@ -297,16 +299,6 @@ func (b *Breaker) recordDrop(gen uint64) {
 	if b.halfOpenProbes > 0 {
 		b.halfOpenProbes--
 	}
-}
-
-// requiredHalfOpenSuccesses is the number of successful probes needed to close
-// the breaker from half-open. It mirrors HalfOpenMaxProbes (the probes admitted
-// per window) and is clamped to at least 1 so a degenerate config still closes.
-func (b *Breaker) requiredHalfOpenSuccesses() int {
-	if b.config.HalfOpenMaxProbes < 1 {
-		return 1
-	}
-	return b.config.HalfOpenMaxProbes
 }
 
 // recordFailure records a failed request reported by a probe admitted under
