@@ -314,6 +314,12 @@ func NewJWTPDP(opts JWTPDPOptions) *JWTPDP {
 	}
 	// Pin JWT/JWKS logging to stderr: stdout is the JSON-RPC channel in stdio mode,
 	// so logging must never inherit a slog default that could corrupt the framing.
+	//
+	// This slog logger exists because JWKSCacheConfig.Logger takes one; it is not the
+	// package's general logging convention. Everything else that writes to the operator
+	// — here and across the binary, transport, and audit layers — uses the plain
+	// fmt.Fprintf(os.Stderr, "[eunox] ...") form, so a free function with no access to
+	// this local (parseCapHeads, say) is following the convention, not bypassing it.
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	if normalizeAudience(opts.Audience) == "" && len(sanitizeAudiences(opts.AcceptedAudiences)) == 0 && !opts.AllowAnyAudience {
 		// No audience pinned but not opted out: EVERY token is rejected regardless of

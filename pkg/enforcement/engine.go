@@ -558,8 +558,9 @@ func (e *Engine) RecordSessionCall(ctx context.Context, req *capability.EnforceR
 }
 
 // recordFailureDenial builds the fail-closed response returned when
-// recordSessionCall cannot persist a marker; ValidateAction and
-// EvaluateConditions both return it verbatim.
+// recordSessionCall cannot persist a marker. evaluateMatched is its only caller, and
+// the exported entry points (ValidateAction, EvaluateConditions) return that result
+// verbatim, so this denial reaches callers unchanged.
 //
 // The denial is attributed to sequenceBlock (the only feature the marker backs)
 // even though the calling tool need not carry one, with a Details
@@ -939,6 +940,49 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 	// that will apply on allow.
 	ctx = withDirectives(ctx, matched.Directives)
 
+	// Collect the matched constraint's obligations UP FRONT and stamp them onto every
+	// deny this function returns that will be FORWARDED rather than blocked.
+	//
+	// An obligation (redactFields) is a property of the matched CONSTRAINT, not of the
+	// allow decision: under an audit-mode constraint — or a route running --audit — a
+	// deny is downgraded to a forwarded call, and the transport applies redaction only
+	// when the response carries obligations. A downgradable deny built with nil
+	// obligations therefore gives a request whose condition FAILED strictly fewer
+	// protections than one that passed: the upstream response reaches the host with the
+	// fields the manifest marked for redaction intact. Stamping at the single point every
+	// matched-constraint deny funnels through is what makes that structural rather than
+	// per-site — the ManifestPDP fills the same gap one layer up, but a direct caller of
+	// the exported ValidateAction / EvaluateConditions never reaches that layer.
+	//
+	// The forward test is the same union the transport downgrades on (isObserveDeny) and
+	// the PDP's own willForwardDeny: per-constraint enforcement:audit OR the route-level
+	// --audit posture that arrives as SkipQuota on the ctx. A BLOCKING deny stays free of
+	// obligations — there is no forwarded response to redact, and per the threat model a
+	// hard deny carries none — so the presence of obligations on a deny keeps meaning
+	// "this one is really a forward".
+	//
+	// collectObligations moved ahead of the condition evaluation to make this possible.
+	// It is a pure translation of matched.Directives, so the reorder is safe; the only
+	// visible difference is that an unwired-directive ENGINE BUG now surfaces as the
+	// denial code even when a condition would also have failed — the more urgent of the
+	// two signals, and both outcomes deny either way.
+	obligations, obligDeny := e.collectObligations(matched, requestID, now)
+	if obligDeny != nil {
+		return *obligDeny
+	}
+	if matched.IsAuditOnly() || SkipQuota(ctx) {
+		defer func() {
+			if resp.Decision != capability.DecisionDeny || resp.Obligations != nil {
+				return
+			}
+			// A HardDeny is never downgraded to a forward, so it has no response to redact.
+			if resp.Denial != nil && resp.Denial.HardDeny {
+				return
+			}
+			resp.Obligations = obligations
+		}()
+	}
+
 	// Peek the incoming accumulated flow-label set up front (only for flow-relevant
 	// constraints, and skipped entirely when the whole policy has no flow — skipFlow —
 	// so a non-flow policy pays no scan or round-trip). It reflects what flowed IN,
@@ -972,14 +1016,10 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 		return *deny
 	}
 
-	// Collect obligations BEFORE recording in session history. Recording first would
-	// poison history: a later sequenceBlock Peek would see this tool as "run" even
-	// though collectObligations' hard deny means it was never forwarded.
-	// collectObligations is a pure translation, so reordering it is safe.
-	obligations, denyResp := e.collectObligations(matched, requestID, now)
-	if denyResp != nil {
-		return *denyResp
-	}
+	// obligations were collected at the top of this function (see the stamping defer
+	// there). Collecting BEFORE recording in session history is load-bearing: recording
+	// first would poison history, since a later sequenceBlock Peek would see this tool as
+	// "run" even though collectObligations' hard deny means it was never forwarded.
 
 	// Commit this call's sequenceBlock antecedent and flow labels as a single
 	// all-or-nothing unit (recordSourceCall): the flow write goes first (the
@@ -1040,9 +1080,24 @@ func (e *Engine) ValidateAction(ctx context.Context, req *capability.EnforceRequ
 	// evaluateMatched threads them (via withDirectives) after this check.
 	if matched.ArgumentSchema != nil {
 		if err := ValidateArgumentSchema(req.Arguments, matched.ArgumentSchema); err != nil {
+			// A downgradable deny is FORWARDED, so it must carry the constraint's
+			// obligations or the forwarded response reaches the host with the fields the
+			// manifest marked for redaction intact — the same rule evaluateMatched applies
+			// to every deny it produces, restated here because this site returns before
+			// reaching it. A blocking deny stays free of obligations (nothing is
+			// forwarded); an unwired directive discovered while collecting is an engine
+			// bug, so its hard deny wins rather than forwarding unredacted.
+			var obligations []capability.Obligation
+			if matched.IsAuditOnly() || SkipQuota(ctx) {
+				obs, obligDeny := e.collectObligations(matched, requestID, now)
+				if obligDeny != nil {
+					return *obligDeny
+				}
+				obligations = obs
+			}
 			// Stamp AuditOnly so a direct engine caller gets the constraint's mode
 			// without re-deriving it.
-			return denyResponse(requestID, now, matched.IsAuditOnly(), nil, capability.DenialInfo{
+			return denyResponse(requestID, now, matched.IsAuditOnly(), obligations, capability.DenialInfo{
 				Code:          capability.ErrCodeInvalidParams,
 				ConditionType: "argumentSchema",
 				Message:       err.Error(),

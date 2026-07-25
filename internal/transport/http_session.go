@@ -1038,10 +1038,16 @@ func (s *httpSession) withUpstreamTimeout(ctx context.Context) (context.Context,
 func (s *httpSession) callSubprocessUpstream(ctx context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, error) {
 	ctx, cancel := s.withUpstreamTimeout(ctx)
 	defer cancel()
-	// newSession initializes byUpstreamID, so this lazy init only fires for a session
+	// newSession initializes all three maps, so this lazy init only fires for a session
 	// assembled directly in a test; do it under pendingMu so the map-header write
-	// cannot race the off-lock read in readUpstream/deliverUpstreamResponse.
+	// cannot race the off-lock read in readUpstream/deliverUpstreamResponse. pending is
+	// initialized alongside the other two because awaitNonced writes to it
+	// unconditionally (unlike hostToUp, which it nil-guards), so omitting it would
+	// panic on exactly the session shape this guard exists to tolerate.
 	s.pendingMu.Lock()
+	if s.pending == nil {
+		s.pending = make(map[string]chan upstreamResult)
+	}
 	if s.byUpstreamID == nil {
 		s.byUpstreamID = make(map[string]chan upstreamResult)
 	}

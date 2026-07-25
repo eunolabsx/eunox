@@ -7809,3 +7809,91 @@ func TestEngine_MultiMaxCalls_AtomicUnderConcurrency(t *testing.T) {
 
 	assert.Equal(t, 1, allowCnt, "two maxCalls of limit 1 must admit exactly one concurrent call")
 }
+
+// TestDirectives_CollectedOnDowngradableDeny is the counterpart to
+// TestDirectives_NotCollectedWhenConditionFails: when a deny will be FORWARDED rather
+// than blocked, it MUST carry the matched constraint's obligations.
+//
+// Under `enforcement: audit` (or a route-level --audit) the transport downgrades a deny
+// to a forwarded call and applies redaction only when the response carries obligations.
+// A downgradable deny built with nil obligations therefore hands the host the very
+// fields the manifest marked for redaction — giving a request whose condition FAILED
+// strictly fewer protections than one that passed. This exercises the raw exported API
+// (ValidateAction / EvaluateConditions), the path an external embedder uses, which never
+// reaches the ManifestPDP layer that fills the same gap for the shipped proxy.
+func TestDirectives_CollectedOnDowngradableDeny(t *testing.T) {
+	t.Parallel()
+
+	newConstraint := func(auditOnly bool) capability.Constraint {
+		c := capability.Constraint{
+			Target:  "tool:read_file",
+			Actions: []string{"call"},
+			Conditions: []capability.Condition{
+				&capability.AllowedValuesCondition{
+					Argument: "path",
+					Values:   []interface{}{"/reports/*"},
+				},
+			},
+			Directives: []capability.Directive{
+				&capability.RedactFieldsDirective{Fields: []string{"$.user.ssn"}},
+			},
+		}
+		if auditOnly {
+			c.Enforcement = "audit"
+		}
+		return c
+	}
+	req := func() *capability.EnforceRequest {
+		return &capability.EnforceRequest{
+			SessionID: "sess-1",
+			ToolName:  "read_file",
+			Arguments: map[string]interface{}{"path": "/internal/secrets.txt"},
+		}
+	}
+	assertRedacts := func(t *testing.T, resp capability.EnforceResponse) {
+		t.Helper()
+		require.Equal(t, capability.DecisionDeny, resp.Decision)
+		require.Len(t, resp.Obligations, 1, "a forwarded deny must carry the constraint's obligations")
+		assert.Equal(t, capability.DirectiveTypeRedactFields, resp.Obligations[0].Type)
+		assert.Equal(t, []string{"$.user.ssn"}, resp.Obligations[0].Paths)
+	}
+
+	t.Run("per-constraint enforcement:audit", func(t *testing.T) {
+		t.Parallel()
+		c := newConstraint(true)
+		e := enforcement.New()
+		assertRedacts(t, e.EvaluateConditions(context.Background(), req(), &c))
+		assertRedacts(t, e.ValidateAction(context.Background(), req(), []capability.Constraint{c}))
+	})
+
+	t.Run("route-level --audit via SkipQuota", func(t *testing.T) {
+		t.Parallel()
+		c := newConstraint(false) // the CONSTRAINT enforces; the route observes
+		e := enforcement.New()
+		ctx := enforcement.WithSkipQuota(context.Background())
+		assertRedacts(t, e.EvaluateConditions(ctx, req(), &c))
+		assertRedacts(t, e.ValidateAction(ctx, req(), []capability.Constraint{c}))
+	})
+
+	// The argumentSchema deny returns from ValidateAction BEFORE evaluateMatched, so it
+	// needs the rule restated at its own site; without it this leg forwards unredacted.
+	t.Run("argumentSchema deny is downgradable too", func(t *testing.T) {
+		t.Parallel()
+		c := newConstraint(true)
+		c.Conditions = nil
+		c.ArgumentSchema = &capability.ArgumentSchema{Required: []string{"absent_field"}}
+		e := enforcement.New()
+		assertRedacts(t, e.ValidateAction(context.Background(), req(), []capability.Constraint{c}))
+	})
+
+	// The control: a BLOCKING deny is never forwarded, so it must stay free of
+	// obligations — the presence of obligations on a deny keeps meaning "really a forward".
+	t.Run("blocking deny still carries none", func(t *testing.T) {
+		t.Parallel()
+		c := newConstraint(false)
+		e := enforcement.New()
+		resp := e.ValidateAction(context.Background(), req(), []capability.Constraint{c})
+		require.Equal(t, capability.DecisionDeny, resp.Decision)
+		assert.Empty(t, resp.Obligations)
+	})
+}
