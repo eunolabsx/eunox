@@ -65,14 +65,10 @@ func (p *HTTPProxy) checkAuth(w http.ResponseWriter, r *http.Request) bool {
 	if len(auth) < len(prefix) || !strings.EqualFold(auth[:len(prefix)], prefix) ||
 		!constantTimeTokenEqual(p.authTimingKey, auth[len(prefix):], p.authToken) {
 		// Record the refusal so an off-host bearer-token brute-force leaves a trace on the
-		// tamper-evident tape, mirroring the ORIGIN_REJECTED / JWT_INVALID pre-route
-		// records. NEVER record the presented credential — only the source and the
-		// unverified claimed session id. Precedes any session lookup, so session_id stays
-		// empty and the client-supplied Mcp-Session-Id is kept as claimed_session_id.
-		if p.sink != nil {
-			details := addClaimedSessionID(map[string]interface{}{"source_ip": p.sourceIP(r)}, r)
-			p.sink.RecordDeny(r.Context(), "", "", "", codeAuthFailed, "auth", details, false)
-		}
+		// tamper-evident tape, mirroring the ORIGIN_REJECTED / JWT_INVALID pre-session
+		// records. recordPreSessionDeny never records the presented credential — only the
+		// source and the unverified claimed session id — and keeps session_id empty.
+		p.recordPreSessionDeny(r, codeAuthFailed, "auth", map[string]interface{}{"source_ip": p.sourceIP(r)})
 		w.Header().Set("WWW-Authenticate", buildWWWAuthenticate(credPresented, p.oauthMetaURL))
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return false
@@ -97,12 +93,9 @@ func (p *HTTPProxy) checkControlToken(w http.ResponseWriter, r *http.Request) bo
 	if presented == "" || !constantTimeTokenEqual(p.authTimingKey, presented, p.controlToken) {
 		// Record the refusal: /control/kill is the emergency-stop endpoint (SEC-07), so a
 		// same-host process probing it with a wrong/missing token is exactly the threat the
-		// token defends, and must not be invisible on the tape. NEVER record the presented
-		// token — only the source and the unverified claimed session id.
-		if p.sink != nil {
-			details := addClaimedSessionID(map[string]interface{}{"source_ip": p.sourceIP(r)}, r)
-			p.sink.RecordDeny(r.Context(), "", "", "", codeControlAuthFailed, "control", details, false)
-		}
+		// token defends, and must not be invisible on the tape. recordPreSessionDeny never
+		// records the presented token — only the source and the unverified claimed session id.
+		p.recordPreSessionDeny(r, codeControlAuthFailed, "control", map[string]interface{}{"source_ip": p.sourceIP(r)})
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return false
 	}
@@ -177,10 +170,7 @@ func (p *HTTPProxy) checkOrigin(w http.ResponseWriter, r *http.Request) bool {
 	if multiple {
 		recordedOrigin = strings.Join(vals, ", ")
 	}
-	if p.sink != nil {
-		details := addClaimedSessionID(map[string]interface{}{"origin": recordedOrigin}, r)
-		p.sink.RecordDeny(r.Context(), "", "", "", "ORIGIN_REJECTED", "origin", details, false)
-	}
+	p.recordPreSessionDeny(r, "ORIGIN_REJECTED", "origin", map[string]interface{}{"origin": recordedOrigin})
 	if multiple {
 		fmt.Fprintf(os.Stderr,
 			"[eunox] SECURITY: rejected request carrying %d Origin headers (%q); RFC 6454 permits only one (DNS-rebinding guard)\n",
@@ -210,6 +200,23 @@ func addClaimedSessionID(details map[string]interface{}, r *http.Request) map[st
 		details["claimed_session_id"] = claimed
 	}
 	return details
+}
+
+// recordPreSessionDeny writes a transport-level deny that fires BEFORE any session
+// lookup — a rejected Origin, JWT, static bearer, or control token. It centralizes the
+// forgery guard those four share: the structured session_id is left EMPTY (at this point
+// the client-supplied Mcp-Session-Id is unverified and attacker-controlled, so stamping
+// it as session_id would let anyone forge these records against a victim's session),
+// while the claimed value is preserved as the clearly-unverified details.claimed_session_id
+// via addClaimedSessionID. The presented credential is NEVER passed in — callers supply
+// only non-secret context (source_ip, origin, error_type) in extra. A nil sink skips the
+// record. Folding the four sites here keeps the empty-session_id rule from being
+// re-hand-rolled — and re-broken — at each new pre-session refusal path.
+func (p *HTTPProxy) recordPreSessionDeny(r *http.Request, code, category string, extra map[string]interface{}) {
+	if p.sink == nil {
+		return
+	}
+	p.sink.RecordDeny(r.Context(), "", "", "", code, category, addClaimedSessionID(extra, r), false)
 }
 
 // originAllowed reports whether a present Origin value is permitted. The origin must

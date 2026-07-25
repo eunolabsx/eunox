@@ -27,34 +27,54 @@ func containsAny(s string, subs ...string) bool {
 	return false
 }
 
-// hasAuditRecordWithCode reports whether any record carries the given deny denial_code.
-func hasAuditRecordWithCode(records []map[string]interface{}, code string) bool {
-	for _, rec := range records {
-		if dc, _ := rec["denial_code"].(string); dc == code {
-			return true
+// assertRecordsExclude fails the test if any audit record's JSON contains any of subs. It
+// proves a presented credential or a raw drift reason never reaches the tape, folding the
+// per-test marshal/scan loop into one helper.
+func assertRecordsExclude(t *testing.T, records []map[string]interface{}, subs ...string) {
+	t.Helper()
+	for _, r := range records {
+		if raw, _ := json.Marshal(r); containsAny(string(raw), subs...) {
+			t.Errorf("audit record leaked a forbidden substring %v: %s", subs, raw)
 		}
 	}
-	return false
 }
 
-// TestCheckAuth_RecordsAuthFailed is the finding-14 regression: a missing/invalid static
-// Authorization bearer token must leave an AUTH_FAILED record on the tamper-evident tape
-// (an off-host brute-force otherwise leaves zero trace), and must never record the
-// presented credential.
-func TestCheckAuth_RecordsAuthFailed(t *testing.T) {
-	sink, logPath := newTempAuditSink(t)
-	proxy := newHTTPProxy(httpProxyOptions{
-		PDP:         pdp.AlwaysAllowPDP{},
-		UpstreamURL: "http://upstream.invalid",
-		AuthToken:   "s3cret-token",
-		Sink:        sink,
-	})
+// findAuditRecordByCode returns the first record carrying the given deny denial_code, or nil.
+func findAuditRecordByCode(records []map[string]interface{}, code string) map[string]interface{} {
+	for _, rec := range records {
+		if dc, _ := rec["denial_code"].(string); dc == code {
+			return rec
+		}
+	}
+	return nil
+}
 
+// hasAuditRecordWithCode reports whether any record carries the given deny denial_code.
+func hasAuditRecordWithCode(records []map[string]interface{}, code string) bool {
+	return findAuditRecordByCode(records, code) != nil
+}
+
+// TestCheckAuth_RecordsAuthFailed pins that a missing/invalid static Authorization bearer
+// token leaves an AUTH_FAILED record on the tamper-evident tape (an off-host brute-force
+// otherwise leaves zero trace) and never records the presented credential. Each case wires
+// its OWN sink and asserts inside the subtest, so the record is attributed to that specific
+// case — a missing token and a wrong token must EACH record, not just one of them (an
+// any-match after the loop would let a missing-token regression pass on the wrong-token
+// record).
+func TestCheckAuth_RecordsAuthFailed(t *testing.T) {
 	for _, tc := range []struct{ name, authHeader string }{
 		{"missing", ""},
 		{"wrong", "Bearer wrong-token"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			sink, logPath := newTempAuditSink(t)
+			proxy := newHTTPProxy(httpProxyOptions{
+				PDP:         pdp.AlwaysAllowPDP{},
+				UpstreamURL: "http://upstream.invalid",
+				AuthToken:   "s3cret-token",
+				Sink:        sink,
+			})
+
 			req := httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody)
 			req.RemoteAddr = "203.0.113.7:5555"
 			if tc.authHeader != "" {
@@ -67,25 +87,22 @@ func TestCheckAuth_RecordsAuthFailed(t *testing.T) {
 			if rec.Code != http.StatusUnauthorized {
 				t.Errorf("status = %d, want 401", rec.Code)
 			}
-		})
-	}
 
-	_ = sink.Close()
-	records := readAuditRecords(t, logPath)
-	if !hasAuditRecordWithCode(records, "AUTH_FAILED") {
-		t.Fatal("expected an AUTH_FAILED audit record for the rejected bearer token")
-	}
-	// The presented credential must never be recorded.
-	for _, r := range records {
-		if raw, _ := json.Marshal(r); containsAny(string(raw), "wrong-token", "s3cret-token") {
-			t.Errorf("audit record leaked a token: %s", raw)
-		}
+			_ = sink.Close()
+			records := readAuditRecords(t, logPath)
+			if !hasAuditRecordWithCode(records, "AUTH_FAILED") {
+				t.Fatalf("expected an AUTH_FAILED audit record for the %s bearer token", tc.name)
+			}
+			// The presented credential must never be recorded.
+			assertRecordsExclude(t, records, "wrong-token", "s3cret-token")
+		})
 	}
 }
 
-// TestCheckControlToken_RecordsControlAuthFailed is the finding-14 regression for the
-// emergency-stop endpoint: a missing/invalid X-Eunox-Control-Token must leave a
-// CONTROL_AUTH_FAILED record, so same-host probing of /control/kill is visible.
+// TestCheckControlToken_RecordsControlAuthFailed pins that a missing/invalid
+// X-Eunox-Control-Token on the emergency-stop endpoint leaves a CONTROL_AUTH_FAILED
+// record, so same-host probing of /control/kill is visible; the presented token is never
+// recorded.
 func TestCheckControlToken_RecordsControlAuthFailed(t *testing.T) {
 	sink, logPath := newTempAuditSink(t)
 	proxy := newHTTPProxy(httpProxyOptions{
@@ -111,16 +128,13 @@ func TestCheckControlToken_RecordsControlAuthFailed(t *testing.T) {
 	if !hasAuditRecordWithCode(records, "CONTROL_AUTH_FAILED") {
 		t.Fatal("expected a CONTROL_AUTH_FAILED audit record for the rejected control token")
 	}
-	for _, r := range records {
-		if raw, _ := json.Marshal(r); containsAny(string(raw), "wrong-control", "control-s3cret") {
-			t.Errorf("audit record leaked a control token: %s", raw)
-		}
-	}
+	assertRecordsExclude(t, records, "wrong-control", "control-s3cret")
 }
 
-// TestDriftRefusal_RecordsDriftRefused is the finding-15 regression: when the startup
-// manifest-drift check refuses a session (the FM-5 tool-poisoning event), a DRIFT_REFUSED
-// record must land on the tamper-evident tape rather than only stderr + a generic 500.
+// TestDriftRefusal_RecordsDriftRefused pins that when the startup manifest-drift check
+// refuses a session (the FM-5 tool-poisoning event), a DRIFT_REFUSED record lands on the
+// tamper-evident tape rather than only stderr + a generic 500, and the raw drift reason
+// (which names the drifted tools) never reaches the signed tape.
 func TestDriftRefusal_RecordsDriftRefused(t *testing.T) {
 	sink, logPath := newTempAuditSink(t)
 	_, proxySrv := newTestRemoteProxy(t, startFakeUpstream(t, newFullFakeUpstream()), httpProxyOptions{
@@ -149,10 +163,62 @@ func TestDriftRefusal_RecordsDriftRefused(t *testing.T) {
 		t.Fatal("expected a DRIFT_REFUSED audit record when the startup drift check refuses the session")
 	}
 	// The raw drift reason (which names drifted tools) must stay off the signed tape.
-	for _, r := range records {
-		if raw, _ := json.Marshal(r); containsAny(string(raw), "descriptionHash mismatch", "tool poisoned") {
-			t.Errorf("audit record leaked the raw drift reason: %s", raw)
+	assertRecordsExclude(t, records, "descriptionHash mismatch", "tool poisoned")
+}
+
+// TestSessionSaturation_RecordsResourceExhausted covers the network-exposed transport:
+// when the HTTP per-session in-flight cap is saturated, the server-busy refusal must leave
+// a RESOURCE_EXHAUSTED record on the tape — a DoS-probe flood against the exposed transport
+// must not be invisible while its stdio twin is recorded. Sharing the stdio helper, the
+// refused method is recorded WITHOUT fabricating a target from it (the phantom-target trap).
+func TestSessionSaturation_RecordsResourceExhausted(t *testing.T) {
+	sink, logPath := newTempAuditSink(t)
+	proxy, proxySrv := newTestRemoteProxy(t, startFakeUpstream(t, newFullFakeUpstream()), httpProxyOptions{
+		PDP:        pdp.AlwaysAllowPDP{},
+		DriftCheck: drift.CheckFunc(func(json.RawMessage, string, error) error { return nil }),
+		Sink:       sink,
+	})
+	sid := initSession(t, proxySrv)
+
+	// Saturate the session's in-flight cap directly, so the next enforced request is
+	// refused by tryAcquireRequestSlot before it reaches the dispatcher — equivalent to a
+	// flood of concurrent slow calls, without blocking that many upstream round-trips.
+	sess := proxy.getSession(sid)
+	if sess == nil {
+		t.Fatal("session not found after initialize")
+	}
+	for i := 0; i < maxConcurrentSessionRequests; i++ {
+		if !sess.tryAcquireRequestSlot() {
+			t.Fatalf("acquire %d must succeed within the cap", i)
 		}
+	}
+
+	busy := decodeRPC(t, postMCP(t, proxySrv, mcp.RPCMsg{
+		JSONRPC: "2.0",
+		ID:      mcp.RawJSON(`7`),
+		Method:  "tools/call",
+		Params:  json.RawMessage(`{"name":"slow","arguments":{}}`),
+	}, sid))
+	if busy.Error == nil || busy.Error.Code != jsonRPCCodeServerBusy {
+		t.Fatalf("a saturated session must return a server-busy error, got %+v", busy.Error)
+	}
+
+	_ = sink.Close()
+	rec := findAuditRecordByCode(readAuditRecords(t, logPath), "RESOURCE_EXHAUSTED")
+	if rec == nil {
+		t.Fatal("expected a RESOURCE_EXHAUSTED record when the HTTP session pool is saturated")
+	}
+	if method, _ := rec["method"].(string); method != "tools/call" {
+		t.Errorf("record method=%q, want tools/call", method)
+	}
+	// The refused method must NOT be fabricated into a target: passing the method as the
+	// identifier would make deriveTargetFields synthesize target=="tools/call", a phantom
+	// tool that pollutes target-based audit aggregation. target stays absent instead.
+	if target, ok := rec["target"]; ok && target != "" {
+		t.Errorf("RESOURCE_EXHAUSTED must record no target, got %q (phantom target from the method)", target)
+	}
+	if got, _ := rec["session_id"].(string); got != sid {
+		t.Errorf("record session_id=%q, want the established session %q", got, sid)
 	}
 }
 

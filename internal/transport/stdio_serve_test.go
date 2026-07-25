@@ -418,6 +418,7 @@ func (w *signalingHostWriter) Write(m mcp.RPCMsg) error {
 func TestServeHost_ConcurrencyCapRejectsWhenSaturated(t *testing.T) {
 	t.Parallel()
 
+	sink, logPath := newTempAuditSink(t)
 	hostCh := make(chan mcp.RPCMsg, 4)
 	p := &StdioProxy{
 		pdp:          pdp.AlwaysAllowPDP{},
@@ -430,6 +431,7 @@ func TestServeHost_ConcurrencyCapRejectsWhenSaturated(t *testing.T) {
 		upWriter:     mcp.NewMsgWriter(io.Discard),
 		upstreamDone: make(chan struct{}),
 		hostSem:      make(chan struct{}, 1), // cap of 1 so the second request saturates it
+		sink:         sink,                   // wire the tape so the saturation refusal is recorded
 	}
 
 	input := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"slow","arguments":{}}}` + "\n" +
@@ -460,4 +462,20 @@ func TestServeHost_ConcurrencyCapRejectsWhenSaturated(t *testing.T) {
 
 	cancel()
 	<-done
+
+	// The saturation refusal must also land on the tamper-evident tape as
+	// RESOURCE_EXHAUSTED — a silent server-busy would make a stdio DoS probe invisible.
+	// The refused method is recorded, but NOT fabricated into a target (the identifier is
+	// left empty), so target stays absent rather than a phantom "tools/call".
+	_ = sink.Close()
+	rec := findAuditRecordByCode(readAuditRecords(t, logPath), "RESOURCE_EXHAUSTED")
+	if rec == nil {
+		t.Fatal("expected a RESOURCE_EXHAUSTED record for the saturating stdio request")
+	}
+	if method, _ := rec["method"].(string); method != "tools/call" {
+		t.Errorf("record method=%q, want tools/call", method)
+	}
+	if target, ok := rec["target"]; ok && target != "" {
+		t.Errorf("RESOURCE_EXHAUSTED must record no target, got %q (phantom target from the method)", target)
+	}
 }

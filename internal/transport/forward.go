@@ -115,6 +115,24 @@ func recordKillDrop(ctx context.Context, rec auditRecorder, deny *capability.Enf
 	rec.RecordDeny(ctx, sessionID, identifier, method, denial.Code, denial.ConditionType, map[string]interface{}{"transport": string(transportLeg)}, false)
 }
 
+// recordResourceExhausted records a host request refused because the concurrent-handler
+// pool was saturated — the stdio hostSem or the HTTP per-session in-flight cap — so a
+// DoS-probe flood against EITHER transport leaves a trace on the tamper-evident tape
+// rather than only a JSON-RPC server-busy reply. Shared by both saturation sites so they
+// cannot record divergent shapes, or one silently forget to record at all. The refused
+// method is recorded (which method starved), but the identifier is left EMPTY on purpose:
+// the request is refused before its arguments are parsed, so there is no target, and
+// passing the method as the identifier would make deriveTargetFields synthesize a phantom
+// target from a mapped method (tools/call -> target "tools/call", prompts/get -> "get"),
+// polluting target-based audit aggregation. rec may be nil (no sink configured); skipped
+// then, matching recordKillDrop.
+func recordResourceExhausted(ctx context.Context, rec auditRecorder, sessionID, method string) {
+	if rec == nil {
+		return
+	}
+	rec.RecordDeny(ctx, sessionID, "", method, codeResourceExhausted, "", nil, false)
+}
+
 // forwardParams bundles the per-transport bits the shared enforced-forward core
 // needs (HTTP fills these from sess.route + the session; stdio from the proxy),
 // keeping the policy/audit/forward logic in one place rather than hand-mirrored.

@@ -895,13 +895,12 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 			select {
 			case p.hostSem <- struct{}{}:
 			default:
-				// Record the refusal so a host saturating the handler pool (a DoS probe, or
-				// a runaway client) leaves a trace on the tamper-evident tape rather than a
-				// silent server-busy reply. Non-blocking, like every other stdio record.
-				// p.rec() is nil when no audit sink is configured (guard, as elsewhere).
-				if rec := p.rec(); rec != nil {
-					rec.RecordDeny(ctx, p.sessionID, msg.Method, msg.Method, codeResourceExhausted, "", nil, false)
-				}
+				// Record the refusal so a host saturating the handler pool (a DoS probe, or a
+				// runaway client) leaves a trace on the tamper-evident tape rather than only a
+				// server-busy reply, mirroring the HTTP per-session cap through the same helper
+				// (which also keeps the refused method out of the target field). p.rec() is nil
+				// when no audit sink is configured; the helper skips the record then.
+				recordResourceExhausted(ctx, p.rec(), p.sessionID, msg.Method)
 				_ = p.hostWriter.Write(mcp.ErrorResponse(msg.ID, jsonRPCCodeServerBusy, "eunox: too many concurrent requests in flight; retry"))
 				continue
 			}

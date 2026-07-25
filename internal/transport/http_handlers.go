@@ -72,9 +72,9 @@ const (
 // decision: a failed transport-auth credential, a saturated handler pool, or a
 // startup drift refusal. They are recorded so an off-host bearer/control-token
 // brute-force, a pool-saturation flood, or a tool-poisoning drift refusal leaves a
-// trace on the tamper-evident tape rather than a silent 401/503/500. All are
-// non-policy (no target to mine), so IsInfraDenialCode returns true for each and the
-// suggest subcommand skips them.
+// trace on the tamper-evident tape rather than only a silent 401 (auth), 500 (HTTP
+// drift), or JSON-RPC server-busy reply (saturation). All are non-policy (no target to
+// mine), so IsInfraDenialCode returns true for each and the suggest subcommand skips them.
 const (
 	// codeAuthFailed marks a missing/invalid static Authorization bearer token
 	// (--listen-auth-token). The presented credential is NEVER recorded.
