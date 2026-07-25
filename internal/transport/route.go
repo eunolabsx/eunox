@@ -15,6 +15,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/eunolabs/eunox/internal/audit"
@@ -524,12 +525,15 @@ func LoadUpstreamPDP(u *config.UpstreamConfig, hostTransport, baseDir string, co
 //
 // Fails closed when audience pinning is active (AllowAnyAudience is false) but a route
 // has no effective audience — neither a manifest 'audience' nor the global Audience
-// fallback. An empty effective audience would put "" into the accepted-audience union
-// (widening the shared validator to accept any pinned route's token) and give the route
-// wrapper an empty RouteAudience, which disables per-route narrowing and makes the route
-// accept-any instead of reject. The CLI never reaches this (validateJWTAudienceConfig
-// requires a non-empty --jwt-audience whenever pinning is active), so the guard protects
-// direct callers of this exported seam.
+// fallback. An empty (or whitespace-only) effective audience would put "" into the
+// accepted-audience union (widening the shared validator to accept any pinned route's
+// token) and give the route wrapper an empty RouteAudience, which disables per-route
+// narrowing and makes the route accept-any instead of reject. A whitespace-only value
+// is caught here too because the shared validator's sanitizeAudiences drops it from the
+// union, so admitting it would silently reject every token instead of surfacing the
+// misconfiguration. The CLI never reaches this (validateJWTAudienceConfig requires a
+// non-blank --jwt-audience whenever pinning is active), so the guard protects direct
+// callers of this exported seam.
 func WrapRoutesWithJWT(routes map[string]*UpstreamRoute, opts pdp.JWTPDPOptions) (*pdp.JWTPDP, error) {
 	// Effective per-route audience and the union the shared validator accepts.
 	routeAud := make(map[string]string, len(routes))
@@ -540,8 +544,8 @@ func WrapRoutesWithJWT(routes map[string]*UpstreamRoute, opts pdp.JWTPDPOptions)
 		if rt.manifest != nil && rt.manifest.Audience != "" {
 			eff = rt.manifest.Audience
 		}
-		if eff == "" && !opts.AllowAnyAudience {
-			return nil, fmt.Errorf("route %q has no effective JWT audience: set the manifest 'audience', pass a global audience, or enable AllowAnyAudience — an empty audience with pinning active would widen the shared validator and disable per-route narrowing", name)
+		if strings.TrimSpace(eff) == "" && !opts.AllowAnyAudience {
+			return nil, fmt.Errorf("route %q has no effective JWT audience: set the manifest 'audience', pass a global audience, or enable AllowAnyAudience — an empty or whitespace-only audience with pinning active would widen the shared validator and disable per-route narrowing", name)
 		}
 		routeAud[name] = eff
 		if _, dup := seen[eff]; !dup {

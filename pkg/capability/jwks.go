@@ -275,10 +275,17 @@ func VerifyWithKeyRotation[T any](
 	if kid == "" || !refreshedForKid {
 		refreshed, ferr := cache.ForceRefreshForVerify(ctx)
 		if ferr != nil {
-			// Surface the refresh error, not the cached-key signature failure, so a
-			// transient JWKS outage during rotation is distinguishable from a forged
-			// token in the fail-closed audit trail.
-			return nil, fmt.Errorf("refresh JWKS after signature failure: %w", ferr)
+			// The token has already been checked against a key we DID hold (the cached
+			// set) and failed that signature check, so this is a signature failure, not a
+			// "never checked against a key" outage. Surface lastErr (the signature failure)
+			// so the audit layer classifies it invalid_signature; carry the refresh failure
+			// only as non-wrapping (%v) context. Returning the refresh error's
+			// ErrJWKSUnavailable here instead would let a forged token presented during a
+			// JWKS blip be recorded as an infrastructure outage, masking forgery from a SIEM
+			// keyed on invalid_signature. A genuinely un-checkable token (kid absent from the
+			// cache) never reaches this point: the kid-miss branch above returns the outage
+			// error before any key comparison.
+			return nil, fmt.Errorf("verify signature (JWKS refresh after signature failure also failed: %v): %w", ferr, lastErr)
 		}
 		// Skip the retry when the refreshed candidate set is IDENTICAL to the one we
 		// already tried: re-verifying the same keys against the same token can never

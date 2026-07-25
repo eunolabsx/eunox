@@ -1180,21 +1180,21 @@ func parseV2Claim(claim string) (prefix capability.TargetType, bareName string, 
 
 	// Validate the bare target as a path.Match glob, mirroring the manifest loader
 	// (enforcement.ValidateResourcePattern, called from internal/config) so a malformed
-	// target glob is rejected identically whether it arrives in a manifest or a JWT
-	// claim. Without this a claim like "tool:read_[file" passes validation, then
-	// path.Match swallows the ErrBadPattern to a silent non-match at enforce time
-	// (matchesResource) — an inert grant that surfaces only as an opaque
-	// AUTHORIZATION_FAILED, indistinguishable from a target the token simply never
-	// listed. Validate exactly the substring matchClaimBare path.Match'es: for an
-	// http(s) resource claim carrying a query the query is compared literally (not
-	// globbed, see matchClaimBare), so only the path before '?' is the glob; every
-	// other claim globs its whole bare name.
-	globPart := bare
-	if p == capability.TargetTypeResource && isHTTPResourceValue(bare) {
-		if pathPart, _, hasQuery := strings.Cut(bare, "?"); hasQuery {
-			globPart = pathPart
-		}
-	}
+	// target glob is rejected identically whether it arrives in a manifest or a JWT claim:
+	// the manifest layer already forbids these patterns at load, and this keeps the JWT
+	// claim path at parity rather than admitting a grant the manifest could not express.
+	// For a glob-intended target (e.g. "tool:read_[*") a malformed pattern would otherwise
+	// reach enforce time and path.Match would swallow the ErrBadPattern to a silent
+	// non-match (matchesResource), an inert deny-all surfacing only as an opaque
+	// AUTHORIZATION_FAILED. (A target whose literal string merely contains a metachar —
+	// e.g. a tool named exactly "read_[file" — could instead match via matchesResource's
+	// exact-name fast path, so such a grant is not necessarily inert; rejecting it here
+	// still fails closed and preserves manifest/JWT parity, at the cost that this unusual
+	// literal is no longer grantable from a token — the manifest cannot grant it either.)
+	// claimGlobParts owns which substring is the glob (an http(s)-resource '?query' is
+	// compared literally, so only the path before '?' is validated), shared with
+	// matchClaimBare so validation and enforcement stay in lockstep.
+	globPart, _, _ := claimGlobParts(p, bare)
 	if err := enforcement.ValidateResourcePattern(globPart); err != nil {
 		return "", "", nil, fmt.Errorf("JWT capability claim %q: invalid target pattern: %w", claim, err)
 	}
@@ -1276,6 +1276,22 @@ func isHTTPResourceValue(bareName string) bool {
 	return strings.HasPrefix(v, "http://") || strings.HasPrefix(v, "https://")
 }
 
+// claimGlobParts decomposes a capability claim's bare target into the substring matched
+// as a path.Match glob and, for an http(s)-resource claim carrying a query, the literal
+// query tail. An http(s) resource's query is compared literally (there is no glob syntax
+// for a query), so there the glob is only the path before '?'; every other claim (a
+// non-resource target, a non-http resource, or a query-less one) globs its whole bare
+// name. This is the single source of the glob/literal split that parseV2Claim validates
+// and matchClaimBare enforces, so validation and enforcement cannot drift apart.
+func claimGlobParts(prefix capability.TargetType, bareName string) (globPart, query string, hasQuery bool) {
+	if prefix == capability.TargetTypeResource && isHTTPResourceValue(bareName) {
+		if pPath, pQuery, pHasQuery := strings.Cut(bareName, "?"); pHasQuery {
+			return pPath, pQuery, true
+		}
+	}
+	return bareName, "", false
+}
+
 // matchClaimBare matches a JWT capability claim's bare name (prefix stripped)
 // against a request target name with the right semantics for the namespace.
 //
@@ -1293,19 +1309,20 @@ func isHTTPResourceValue(bareName string) bool {
 // while a path-glob query-less claim (".../search/*") still absorbs a target query
 // exactly as the manifest's glob does. Every other namespace keeps plain matchBare.
 func matchClaimBare(prefix capability.TargetType, bareName, targetName string) bool {
-	if prefix == capability.TargetTypeResource && isHTTPResourceValue(bareName) {
-		if pPath, pQuery, pHasQuery := strings.Cut(bareName, "?"); pHasQuery {
-			tPath, tQuery, tHasQuery := strings.Cut(targetName, "?")
-			// A query-bearing claim pins its query: the target must carry the same one.
-			if !tHasQuery || pQuery != tQuery {
-				return false
-			}
-			return matchBare(pPath, tPath)
+	// claimGlobParts owns the glob/literal split (shared with parseV2Claim's validation),
+	// so what is globbed here is exactly what was validated at token verification.
+	globPart, claimQuery, hasQuery := claimGlobParts(prefix, bareName)
+	if hasQuery {
+		tPath, tQuery, tHasQuery := strings.Cut(targetName, "?")
+		// A query-bearing claim pins its query: the target must carry the same one.
+		if !tHasQuery || claimQuery != tQuery {
+			return false
 		}
-		// Query-less claim: whole-string match, exactly as the manifest does.
-		return matchBare(bareName, targetName)
+		return matchBare(globPart, tPath)
 	}
-	return matchBare(bareName, targetName)
+	// Query-less claim (or any non-http-resource target): whole-string match, exactly as
+	// the manifest does.
+	return matchBare(globPart, targetName)
 }
 
 // parseCondSuffix parses the condition suffix of a v0.2 shorthand entry per the

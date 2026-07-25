@@ -83,6 +83,34 @@ func TestClassifyJWTError_JWKSUnavailable(t *testing.T) {
 			t.Errorf("ClassifyJWTError = %q, want %q", got, jwtErrSignature)
 		}
 	})
+
+	// Negative control 2 — the case the healthy-JWKS control above does not exercise: a
+	// forged token whose signature fails against a WARM cached key, presented while the
+	// JWKS endpoint is unreachable for the post-failure rotation refresh, must stay
+	// invalid_signature. jwks_unavailable is reserved for a token that was never checked
+	// against a key; here the token WAS checked (against the cached key) and failed, so
+	// tagging it as an outage would let forgery hide in outage noise during an IdP blip.
+	t.Run("signature failure during JWKS outage stays invalid_signature", func(t *testing.T) {
+		outageKey := newTestKey(t, "c-outage")
+		srv := makeJWKSServer(t, outageKey)
+		p := newPDP(srv.URL)
+		// Warm the cache so kid c-outage resolves from cache on the next call (no fetch).
+		valid := "Bearer " + makeIDPToken(t, outageKey, nil, iss, aud, "user-1", time.Now().Add(time.Hour))
+		if _, err := p.ValidateToken(context.Background(), valid); err != nil {
+			t.Fatalf("warm-up validation should succeed: %v", err)
+		}
+		srv.Close() // endpoint down: the cached key is still served, but any refresh fails
+		// Forged token: same kid, different signing key → fails signature against the
+		// cached key, then the post-failure rotation refresh hits the outage.
+		forged := "Bearer " + makeIDPToken(t, newTestKey(t, "c-outage"), nil, iss, aud, "user-1", time.Now().Add(time.Hour))
+		_, err := p.ValidateToken(context.Background(), forged)
+		if err == nil {
+			t.Fatal("a forged token must be rejected")
+		}
+		if got := ClassifyJWTError(err); got != jwtErrSignature {
+			t.Errorf("ClassifyJWTError = %q, want %q: a token checked against a cached key that fails signature is invalid_signature, not jwks_unavailable, even when the rotation refresh fails", got, jwtErrSignature)
+		}
+	})
 }
 
 // TestParseV2Claim_MalformedTargetGlobRejected pins that a malformed target-name glob
@@ -172,7 +200,7 @@ func TestSanitizeAudiences(t *testing.T) {
 	}
 }
 
-// TestJWTPDP_EmptyAcceptedAudienceRejectsEmptyAud is the finding-E regression: a
+// TestJWTPDP_EmptyAcceptedAudienceRejectsEmptyAud is the empty-audience regression: a
 // JWTPDP built (via the exported options) with an accepted-audience list holding only
 // an empty entry must NOT admit a token whose own aud is the literal empty string.
 // go-jose matches audiences by set intersection, so an expected AnyAudience of [""]
