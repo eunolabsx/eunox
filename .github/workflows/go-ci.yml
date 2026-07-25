@@ -68,22 +68,33 @@ jobs:
       - name: Run tests with race detector
         run: go test -race -count=1 -coverprofile=coverage.out -covermode=atomic ./...
 
-      - name: Check coverage threshold (80% for pkg/ and cmd/)
+      - name: Check coverage threshold (80% for pkg/, internal/ and cmd/)
         run: |
           COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print substr($3, 1, length($3)-1)}')
           echo "Total coverage: ${COVERAGE}%"
           PKG_COVERAGE=$(go tool cover -func=coverage.out | grep "^github.com/eunolabs/eunox/pkg/" | awk '{sum += substr($3, 1, length($3)-1); n++} END {if (n>0) printf "%.1f", sum/n; else print "0"}')
           echo "pkg/ average coverage: ${PKG_COVERAGE}%"
-          # Gate the cmd/ binary too: it is the network-facing attack surface
-          # (transports, audit sink, PDP wiring), so a coverage floor there matters
-          # as much as the engine's. The floor is lower than pkg/ because cmd/ holds
-          # some thin process-lifecycle glue that is exercised end-to-end rather
-          # than unit-tested.
+          # Gate internal/ too. It holds the network-facing enforcement runtime -- the
+          # transports, the audit sink, the PDPs, the config/manifest loader, the drift
+          # check -- which was factored out of cmd/ behind narrow seams. The gate was
+          # written when that code lived in cmd/, so for a while the rationale below
+          # described a surface the gate no longer reached: the engine and the binary's
+          # glue were floored while everything that actually decides and records a request
+          # was not.
+          INTERNAL_COVERAGE=$(go tool cover -func=coverage.out | grep "^github.com/eunolabs/eunox/internal/" | awk '{sum += substr($3, 1, length($3)-1); n++} END {if (n>0) printf "%.1f", sum/n; else print "0"}')
+          echo "internal/ average coverage: ${INTERNAL_COVERAGE}%"
+          # Gate the cmd/ binary too: it is the CLI and process-lifecycle surface that
+          # wires the runtime together, so a coverage floor there matters as much as the
+          # engine's.
           CMD_COVERAGE=$(go tool cover -func=coverage.out | grep "^github.com/eunolabs/eunox/cmd/" | awk '{sum += substr($3, 1, length($3)-1); n++} END {if (n>0) printf "%.1f", sum/n; else print "0"}')
           echo "cmd/ average coverage: ${CMD_COVERAGE}%"
           fail=0
           if [ "$(echo "$PKG_COVERAGE < 80" | bc -l)" -eq 1 ]; then
             echo "::error::Coverage for pkg/ is below 80% threshold: ${PKG_COVERAGE}%"
+            fail=1
+          fi
+          if [ "$(echo "$INTERNAL_COVERAGE < 80" | bc -l)" -eq 1 ]; then
+            echo "::error::Coverage for internal/ is below 80% threshold: ${INTERNAL_COVERAGE}%"
             fail=1
           fi
           if [ "$(echo "$CMD_COVERAGE < 80" | bc -l)" -eq 1 ]; then

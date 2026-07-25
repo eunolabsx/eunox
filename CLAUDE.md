@@ -16,7 +16,7 @@ make fmt             # gofmt -w every .go file
 make check-fmt       # gofmt-clean check on every .go file (CI-enforced); fix with `make fmt`
 make check-license   # Apache-2.0 SPDX header on every .go file (CI-enforced)
 make check-notice    # NOTICE lists exactly the binary's third-party modules (CI-enforced)
-make coverage        # coverage.out for pkg/ — CI gates pkg/ at 80%
+make coverage        # coverage.out for all packages — CI gates pkg/, internal/ and cmd/ at 80% each
 ```
 
 Run a single test (standard Go tooling):

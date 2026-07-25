@@ -4,8 +4,14 @@
 // Package mcp holds the JSON message data-transfer types for the MCP (Model
 // Context Protocol) methods the proxy enforces: the params and result shapes of
 // initialize, tools/call, tools/list, resources/read, resources/list,
-// prompts/get, and prompts/list. They are pure JSON structs with no methods,
-// shared by the proxy's transports and policy decision points.
+// prompts/get, and prompts/list. They are pure JSON structs with no methods.
+//
+// Coverage of the protocol is deliberately complete and symmetric rather than trimmed to
+// current callers: ToolsListResult is decoded on the drift path, while its
+// ResourcesListResult and PromptsListResult siblings are exercised only by tests today.
+// Keeping the set whole is what lets a reader model a list response of any flavor the same
+// way, and lets a test decode one without hand-rolling an anonymous struct. Do not read
+// "declared here" as "on a production hot path" -- check the callers.
 package mcp
 
 import "encoding/json"

@@ -500,7 +500,7 @@ func (p *HTTPProxy) runDriftCheckOrTeardown(ctx context.Context, sess *httpSessi
 		// the tamper-evident tape (route-stamped), not only stderr and a generic 500. The
 		// raw drift reason (which names drifted tools) stays on stderr; the tape carries
 		// the stable DRIFT_REFUSED category.
-		route.sink.RecordDeny(ctx, sess.id, "initialize", "initialize", codeDriftRefused, "drift", nil, false)
+		recordDriftRefused(ctx, route.sink, sess.id)
 		sess.close(p.shutdownMs) //nolint:contextcheck // teardown path: the upstream session-termination DELETE intentionally uses a detached, bounded background context — close/reaper/signal/shutdown carry no request context.
 		p.mu.Lock()
 		delete(p.sessions, sess.id)

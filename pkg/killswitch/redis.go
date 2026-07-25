@@ -984,6 +984,17 @@ func (r *Redis) scanPrefix(ctx context.Context, prefix string, target map[string
 	// cluster-wide enumeration must visit every master and merge the scans; otherwise
 	// refreshState loads a partial snapshot, treats it as healthy, and drops kills on
 	// the other masters. ForEachMaster runs concurrently, so target needs a mutex.
+	//
+	// Reachable only by a LIBRARY consumer: the shipped binary always builds a
+	// single-node client. It is kept because deleting it would not remove the cluster
+	// case, only the handling of it -- a ClusterClient would then load a partial kill set
+	// and report healthy, which is a fail-open on the emergency stop.
+	//
+	// Note the asymmetry it exposes, since nothing else in the tree states it: pkg/
+	// callcounter has NO cluster handling, so a consumer who supplies a ClusterClient gets
+	// correct kill-switch enumeration alongside per-master maxCalls counting that silently
+	// under-counts. Redis Cluster is not a supported eunox deployment; use a single-node
+	// or replicated (non-sharded) endpoint.
 	if cc, ok := r.client.(*redis.ClusterClient); ok {
 		var mu sync.Mutex
 		return cc.ForEachMaster(ctx, func(ctx context.Context, node *redis.Client) error {

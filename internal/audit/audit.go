@@ -431,7 +431,7 @@ func recoverTailAfterReadError(logPath string, readErr error) (last string, seed
 	default:
 		// Base still non-empty but unreadable: seed past the highest seq anywhere on disk
 		// — the base's on-disk maximum AND every rotated sibling's, since after a rotation
-		// the base's size-based estimate (scanHighestSeq's open-fail fallback) can fall
+		// the base's size-based estimate (scanSeqContribution's open-fail fallback) can fall
 		// below a readable sibling's real max — so new records cannot duplicate an
 		// existing seq.
 		if highest, ok := highestSeqAcrossChain(logPath); ok {
@@ -526,7 +526,7 @@ func highestSeqAcrossChain(logPath string) (highest uint64, ok bool) {
 }
 
 // highestSeqAcrossChainCapped is highestSeqAcrossChain with the per-line scan cap injected
-// for deterministic tests (mirroring scanHighestSeqCapped). It over-estimates PAST the true
+// for deterministic tests. It over-estimates PAST the true
 // on-disk max as: the highest seq actually READ anywhere in the chain (exact) PLUS the
 // total BYTES of every file that could not be read. Each unread record occupies >= 1 byte,
 // so the unread byte total bounds how many higher seqs an unreadable file can hold beyond
@@ -540,7 +540,7 @@ func highestSeqAcrossChain(logPath string) (highest uint64, ok bool) {
 // the anchor the unread bytes extend). The one residual — a chain whose files are ALL
 // unreadable AND whose earlier history was pruned — cannot reconstruct the pruned records'
 // seq span from the surviving bytes and may restart low, but always under a
-// chain_resume_failed marker (the break is never silent). Like scanHighestSeq it never
+// chain_resume_failed marker (the break is never silent). Like scanSeqContribution it never
 // verifies HMACs or seeds prev_hmac; it only advances the monotonic counter. ok is false
 // only when nothing — no parseable record and no unread bytes — was found anywhere on disk.
 func highestSeqAcrossChainCapped(logPath string, bufCap int) (highest uint64, ok bool) {
@@ -587,7 +587,7 @@ func satAddU64(a, b uint64) uint64 {
 // HMAC mismatch, a retired/removed signing key, or an unreadable newer sibling — restarts
 // with a marker whose seq, and every record after it, is past every existing seq rather
 // than restarting at genesis and reissuing them (a duplicate-seq cascade audit-verify
-// cannot distinguish from tampering; the package's own scanHighestSeq comment calls a
+// cannot distinguish from tampering; the package's own scanSeqContribution comment calls a
 // duplicate "WORSE than a gap"). It deliberately leaves s.prevHMAC at genesis: the break
 // is real and audit-verify must see the prev_hmac discontinuity — only the seq counter is
 // advanced, monotonic and gap-detectable. A best-effort scan finding nothing leaves s.seq
@@ -1009,7 +1009,7 @@ var errAuditFileShrunk = errors.New("audit log shrank between stat and read")
 // leaving independent literals that could drift past 4 MiB.
 const auditScanBufferBytes = 4 << 20
 
-// rescanBufferBytes is the WIDE per-line buffer scanHighestSeq uses on the
+// rescanBufferBytes is the WIDE per-line buffer scanSeqContribution uses on the
 // chain-resume error path so its single pass reads PAST a record larger than the
 // ~1 MiB cap, while still bounding memory: a line longer than this is refused rather
 // than accumulated unbounded, so a corrupt or tampered log cannot drive the resume
@@ -1073,48 +1073,6 @@ func readLastAuditLine(path string) (string, error) {
 		return "", err
 	}
 	return interpretAuditTail(buf, n, err, size)
-}
-
-// scanHighestSeq returns the largest seq among the parseable records in the audit
-// log. It is used only on the chain-resume error path: when the bounded tail read
-// failed and neither a retry nor a rotated sibling yielded a usable tail, seeding
-// the resumed seq past this maximum keeps new records from duplicating existing
-// seqs — which audit-verify would otherwise report as a SEQ GAP plus a
-// duplicate-seq cascade for every record after a genesis (seq 1) restart. It does
-// NOT verify HMACs and never seeds prev_hmac from a scanned record: it only advances
-// the seq counter, so an unsigned or forged record can at worst inflate the counter
-// monotonically (harmless — seqs need only stay monotonic and gap-detectable), never
-// inject a trusted chain link. ok is false when the file cannot be opened, or holds
-// no parseable record.
-//
-// The scan is a SINGLE pass sized at the wide rescanBufferBytes cap: reading past any
-// plausibly-large record to EOF in one read recovers the TRUE high-water mark (a wider
-// per-line buffer only tolerates a longer line; it never lowers the max). It still
-// bounds memory — a line over the cap is refused (scanner.Err() != nil) rather than
-// accumulated unbounded — so a corrupt or tampered log cannot drive the resume scan to
-// OOM. On a line over the cap OR any mid-file read fault (transient or persistent) the
-// scan aborts and falls to the file-size over-estimate; the earlier two-pass form
-// retried faults with a second independent read, but the retry only ever mattered for a
-// transient fault and both outcomes are fail-SAFE (an over-estimate can never re-issue
-// an existing seq), so the single pass drops it for simplicity.
-func scanHighestSeq(path string) (highest uint64, ok bool) {
-	return scanHighestSeqCapped(path, rescanBufferBytes)
-}
-
-// scanHighestSeqCapped is scanHighestSeq with the per-line buffer cap injected, so a
-// test can trip the over-estimate fallback deterministically with a small
-// (line-just-over-cap) fixture instead of allocating a >64 MiB line. Production always
-// passes rescanBufferBytes.
-func scanHighestSeqCapped(path string, bufCap int) (highest uint64, ok bool) {
-	parsedMax, parsed, unreadBytes := scanSeqContribution(path, bufCap)
-	// Single-FILE over-estimate: the byte size bounds the max only for a file that began at
-	// genesis (seq <= bytes), so it is used as an absolute value HERE. highestSeqAcrossChain
-	// instead folds unreadBytes ADDITIVELY across the chain, where one file's byte count is
-	// not a global seq. Callers/tests of this single-file view expect the max of the two.
-	if unreadBytes > parsedMax {
-		return unreadBytes, true
-	}
-	return parsedMax, parsed
 }
 
 // scanSeqContribution reads path once and separates the two distinct ways a file can inform

@@ -152,27 +152,6 @@ func (c *PayloadCache[T]) Put(key string, payload T, expUnix int64) {
 		return
 	}
 
-	// Phase 1 (read lock): when the cache is full and its oldest entry is still live,
-	// any expired entries sit BEHIND the front where the write-locked front reclaim
-	// cannot reach them, so identify them here under the read lock — where concurrent
-	// Get proceeds in parallel — rather than in an O(n) write-locked sweep. Phase 2
-	// re-checks each key before deleting.
-	var maybeExpired []string
-	c.mu.RLock()
-	if len(c.entries) >= c.cfg.MaxSize {
-		if front := c.insertOrder.Front(); front != nil {
-			scanNow := c.cfg.Now()
-			if e, ok := c.entries[front.Value.(string)]; ok && scanNow.Before(e.expiresAt) {
-				for k, e2 := range c.entries {
-					if !scanNow.Before(e2.expiresAt) {
-						maybeExpired = append(maybeExpired, k)
-					}
-				}
-			}
-		}
-	}
-	c.mu.RUnlock()
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -228,24 +207,20 @@ func (c *PayloadCache[T]) Put(key string, payload T, expUnix int64) {
 			delete(c.entries, oldest)
 		}
 		// Per-payload TTLs are min(MaxEntryTTL, remaining), so a short-lived payload can
-		// expire while sitting BEHIND a live front the contiguous scan never reaches;
-		// without this pass the capacity loop would evict that live entry instead. Delete
-		// the phase-1 keys, re-checking each (a Put between the phases may have refreshed
-		// one). Removal is O(1) per key; the O(n) find happened under the read lock.
-		for _, ek := range maybeExpired {
-			if e, ok := c.entries[ek]; ok && !now.Before(e.expiresAt) {
-				if e.listElem != nil {
-					c.insertOrder.Remove(e.listElem)
-				}
-				delete(c.entries, ek)
-			}
-		}
-		// Fallback O(n) sweep whenever still at capacity under the write lock, so any
-		// expired middle/rear entry the earlier passes missed is reclaimed before the
-		// eviction loop displaces a live entry. This must run even when phase 1 scanned:
-		// phase 1 samples the clock under the READ lock, so an entry that was live then
-		// but expired in the read->write window is absent from maybeExpired and behind the
-		// live front, leaving the eviction loop to wrongly drop the oldest live entry.
+		// expire while sitting BEHIND a live front the contiguous reclaim never reaches;
+		// without this sweep the capacity loop would evict a LIVE entry while stale ones
+		// still occupy the cache. It runs only when the front reclaim left us at capacity,
+		// so a cache with room pays nothing.
+		//
+		// This single write-locked sweep replaced a read-locked pre-scan that collected
+		// the same keys before taking the write lock. The pre-scan could not remove this
+		// pass -- it sampled the clock under the READ lock, so an entry that was live then
+		// and expired in the read->write window was missing from its list, and the
+		// authoritative sweep had to run anyway. The result was two full O(n) scans per
+		// Put in the steady-state-full case (the common one: at capacity, nothing expired)
+		// to do the work of one, plus an extra lock round-trip and ~50 lines of two-phase
+		// reasoning. The sweep here is strictly more accurate: one pass, one clock, taken
+		// under the lock that actually mutates.
 		if c.insertOrder.Len() >= c.cfg.MaxSize {
 			for el := c.insertOrder.Front(); el != nil; {
 				next := el.Next()
