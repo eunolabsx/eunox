@@ -1319,22 +1319,22 @@ func TestLoadManifest_AudienceWhitespace(t *testing.T) {
 }
 
 // Pure-metadata fields that only label the policy (name, version, description,
-// defaultTtl, audience) are inherited from the first manifest; a later file's
-// differing value for these is intentionally dropped, since none feeds enforcement
-// or drift. The serverVersion pin and the audience here are declared only by the first
-// file, so they survive unchanged. (Two files declaring *conflicting*
+// audience) are inherited from the first manifest; a later file's differing value for
+// these is intentionally dropped, since none feeds enforcement or drift. The
+// serverVersion pin and the audience here are declared only by the first file, so they
+// survive unchanged. (Two files declaring *conflicting*
 // serverVersion/schemaVersion/audience values are a separate, rejected case — see
 // TestMergeManifests_RejectsConflicting* and TestMergeManifests_AudienceFoldsWithConflictCheck.)
 func TestMergeManifests_InheritsFirstManifestMetadata(t *testing.T) {
 	first := &LocalManifest{
 		SchemaVersion: "0.1", Name: "a", Version: "1.0.0",
-		ServerVersion: "2.0.0", Description: "d", DefaultTTL: 30, Audience: "team-a",
+		ServerVersion: "2.0.0", Description: "d", Audience: "team-a",
 	}
 	// second declares no serverVersion pin and no audience, so there is nothing to
 	// conflict with for those single-value fields.
 	second := &LocalManifest{
 		SchemaVersion: "0.1", Name: "b", Version: "3.0.0",
-		Description: "other", DefaultTTL: 99,
+		Description: "other",
 	}
 
 	merged, err := MergeManifests([]*LocalManifest{first, second})
@@ -1352,9 +1352,6 @@ func TestMergeManifests_InheritsFirstManifestMetadata(t *testing.T) {
 	}
 	if merged.Description != "d" {
 		t.Errorf("description = %q, want %q (inherited from the first manifest)", merged.Description, "d")
-	}
-	if merged.DefaultTTL != 30 {
-		t.Errorf("defaultTTL = %d, want 30 (inherited from the first manifest)", merged.DefaultTTL)
 	}
 	if merged.Audience != "team-a" {
 		t.Errorf("audience = %q, want %q (the only declared audience survives)", merged.Audience, "team-a")

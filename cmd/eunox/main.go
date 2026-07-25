@@ -417,6 +417,19 @@ func cmdProxy() {
 		fmt.Fprintf(os.Stderr, "eunox proxy: --max-call-counter-keys must be >= 0 (0 = unbounded)\n")
 		os.Exit(1)
 	}
+	// The audit knobs mirror the config's fail-closed rejection (Validate rejects a
+	// negative audit.rotateSizeBytes / audit.retainRotated). Guard the FLAG leg too so the
+	// two surfaces agree: without this a negative flag value silently coerces in audit.Open
+	// (rotate-size < 0 → the 100 MiB default, retain < 0 → keep-all), hiding the operator's
+	// misconfiguration instead of rejecting it.
+	if *f.auditRotateSize < 0 {
+		fmt.Fprintf(os.Stderr, "eunox proxy: --audit-rotate-size must be >= 0 (0 = use the default size)\n")
+		os.Exit(1)
+	}
+	if *f.auditRetainRotated < 0 {
+		fmt.Fprintf(os.Stderr, "eunox proxy: --audit-retain must be >= 0 (0 = keep all rotated files)\n")
+		os.Exit(1)
+	}
 
 	var (
 		cfg *config.GatewayConfig

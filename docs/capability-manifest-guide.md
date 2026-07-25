@@ -88,8 +88,15 @@ runnable config. The patterns below explain how to fill in either starting point
 ## 1. Required structure
 
 The required top-level fields are `schemaVersion`, `name`, `version`, and
-`capabilities`. Optional fields are `description`, `defaultTtl`, and `audience`.
+`capabilities`. Optional fields are `description` and `audience`.
 Anything missing or shaped differently is rejected by `eunox validate`.
+
+> **Migration note (pre-1.0).** The `defaultTtl` field was removed — it was
+> informational only and never enforced. Because unknown keys are rejected
+> fail-closed (see below), a manifest that still carries a `defaultTtl:` line no
+> longer loads: it is refused at startup with `manifest: unknown field
+> "defaultTtl"`. Delete the line — nothing consumed it, so removing it changes no
+> enforcement behavior.
 
 **Unknown keys are rejected, fail-closed.** A misspelled field anywhere in the
 manifest — `arguments` for `argument`, `action` for `actions`, `value` for
@@ -170,12 +177,8 @@ name: "Sales Research Bot" # human-readable, unique per logical agent
 version: "0.1.0"           # policy-content semver; recorded in every audit log entry
 capabilities: []           # see § 2 — each entry is a capability constraint
 description: "Synthesizes account-research briefings." # optional
-defaultTtl: 600            # informational only — not enforced by the proxy
 audience: "svc-research"   # gateway mode: the JWT aud required on this route
 ```
-
-The `defaultTtl` field is informational and has no effect on enforcement; JWT
-expiry is enforced by your IdP, not by eunox. See § 5 for TTL guidance.
 
 In **gateway mode** (`eunox proxy --config`), the manifest `audience` field
 pins the JWT `aud` claim required on that route: a token is authorized on the
@@ -1920,8 +1923,7 @@ A `redactFields` object found inside `conditions` is rejected at load —
 
 In JWT mode, token lifetime is controlled by the `exp` claim your IdP
 stamps on the JWT — eunox validates and rejects expired tokens but
-does not issue them. The `defaultTtl` manifest field is informational
-and available for your tooling to read; the proxy does not enforce it.
+does not issue them.
 
 | Scenario                                | Recommended JWT TTL (seconds) |
 | --------------------------------------- | ----------------------------- |
@@ -2099,7 +2101,7 @@ set in any single file still drives FM-4. Declare the pin in **at most one** fil
 `serverVersion` values are rejected at load with a clear error, rather than
 silently keeping the first file's pin and dropping the others. The same
 single-value rule applies to `schemaVersion`. (Other top-level metadata — `name`,
-`version`, `description`, `defaultTtl` — is inherited from the first file; none of
+`version`, `description` — is inherited from the first file; none of
 it drives enforcement, so a later file's differing value is simply ignored.
 `audience`, by contrast, pins the per-route JWT audience in gateway mode (see
 above), so it is folded under the same single-value rule as `serverVersion`

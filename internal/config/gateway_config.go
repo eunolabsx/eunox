@@ -124,6 +124,47 @@ func expandEnvInStrings(v reflect.Value) {
 	}
 }
 
+// gatewayNumericKeys are the gateway-config scalar fields holding a bare number that
+// yaml.v3 can auto-type away from the operator's written text — most dangerously a
+// leading-zero value read as OCTAL. The gateway-config counterpart to the manifest
+// loader's numericPolicyScalarKeys.
+var gatewayNumericKeys = map[string]bool{
+	"port":                 true, // listen.port
+	"maxSessions":          true, // listen.maxSessions
+	"sessionIdleTimeoutMs": true, // listen.sessionIdleTimeoutMs
+	"rotateSizeBytes":      true, // audit.rotateSizeBytes
+	"retainRotated":        true, // audit.retainRotated
+	"upstreamTimeoutMs":    true, // defaults.upstreamTimeoutMs
+}
+
+// rejectCoercedGatewayNumerics walks a raw gateway-config YAML node and fails closed on
+// any gatewayNumericKeys field whose unquoted value YAML silently coerced (a leading-zero
+// octal read, a float normalization, …) — the same class the manifest loader rejects via
+// checkNumericFieldNotCoerced. A quoted value (the operator disambiguated it to a string)
+// is left alone; only an unquoted number that differs textually from its canonical form
+// is rejected.
+func rejectCoercedGatewayNumerics(n *yaml.Node, path string) error {
+	if n == nil {
+		return nil
+	}
+	if n.Kind == yaml.MappingNode {
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			key := resolveYAMLAlias(n.Content[i])
+			if key.Kind == yaml.ScalarNode && gatewayNumericKeys[key.Value] {
+				if err := checkNumericFieldNotCoerced(n.Content[i+1], key.Value, false); err != nil {
+					return fmt.Errorf("invalid gateway config %q: %w", path, err)
+				}
+			}
+		}
+	}
+	for _, child := range n.Content {
+		if err := rejectCoercedGatewayNumerics(child, path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // GatewayConfig is the top-level eunox config file.
 type GatewayConfig struct {
 	// SchemaVersion is the config grammar version (e.g. "0.1"). Required: a config
@@ -326,6 +367,19 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	// tolerated.
 	if err := rejectExtraYAMLDocuments(dec, path, "gateway config"); err != nil {
 		return nil, err
+	}
+
+	// Reject an unquoted numeric field YAML silently auto-typed away from its written
+	// text — most dangerously a leading-zero value read as OCTAL (port: 0755 binds 493,
+	// not 755; upstreamTimeoutMs: 010 → an 8 ms timeout; rotateSizeBytes: 0100 → rotate
+	// every 64 bytes). The strict struct decode above accepts the coerced integer with no
+	// signal, so re-walk the raw node and fail closed, reusing the manifest loader's
+	// coercion machinery so the two operator-authored config surfaces agree on this.
+	var rawNode yaml.Node
+	if err := yaml.Unmarshal(raw, &rawNode); err == nil {
+		if err := rejectCoercedGatewayNumerics(&rawNode, path); err != nil {
+			return nil, err
+		}
 	}
 
 	// Capture the raw (pre-expansion) auth token so the post-expansion guard below
@@ -666,6 +720,15 @@ func (cfg *GatewayConfig) Validate(presentKeys []map[string]bool) error {
 			return fmt.Errorf("listen.port %d is out of range [1, 65535]", cfg.Listen.Port)
 		}
 	}
+	// A non-empty but whitespace-only authToken is a degenerate secret: it is not "" so
+	// checkAuth enforces it as the required bearer AND openNonLoopbackBind counts auth as
+	// "configured" (satisfying the non-loopback-bind safety gate), yet "Bearer   " is
+	// trivially guessable. The env-ref leg already rejects a reference that expands to
+	// whitespace (validateCredentialEnvRefs); mirror that for a LITERAL whitespace token so
+	// the two legs agree. An operator who wants no auth omits authToken entirely.
+	if cfg.HostTransport() == HostTransportHTTP && cfg.Listen.AuthToken != "" && strings.TrimSpace(cfg.Listen.AuthToken) == "" {
+		return fmt.Errorf("listen.authToken is whitespace-only, which is not a usable bearer secret — set a real token, or omit authToken to run without token auth")
+	}
 	if cfg.Listen.MaxSessions != nil && *cfg.Listen.MaxSessions < 0 {
 		return fmt.Errorf("listen.maxSessions %d must not be negative (0 = unlimited)", *cfg.Listen.MaxSessions)
 	}
@@ -771,6 +834,21 @@ func (cfg *GatewayConfig) validateUpstreamEntry(i int, u *UpstreamConfig, seen m
 		return fmt.Errorf("upstream %q: 'transport' is required (\"stdio\" or \"http\")", u.Name)
 	default:
 		return fmt.Errorf("upstream %q: transport must be \"stdio\" or \"http\", got %q", u.Name, u.Transport)
+	}
+
+	// Reject an empty or whitespace-only policy entry at load rather than deferring
+	// the failure to route start. A "" entry — a literal policy: [""], or a
+	// policy: ["${VAR}"] where VAR is SET but empty/whitespace (expandEnvRefs leaves an
+	// UNSET ${VAR} intact as its literal text, so an unset ref is a non-empty entry that
+	// fails later at route start, not here) — has len==1, so it slips past the no-policy
+	// classification (NoPolicyStartupRejection, which keys on len==0) and masks the "this
+	// route has no policy" condition; then ResolvePolicyPath joins "" onto the config dir
+	// and the loader dies at startup with a misleading "is a directory" error. Fail closed
+	// here with a clear config diagnostic instead.
+	for _, p := range u.Policy {
+		if strings.TrimSpace(p) == "" {
+			return fmt.Errorf("upstream %q: 'policy' contains an empty entry; each policy entry must be a manifest file path (an empty entry is often a ${VAR} that expanded to empty, or a stray \"\")", u.Name)
+		}
 	}
 
 	// expectVersion pins a single manifest's `version`. With multiple policy
