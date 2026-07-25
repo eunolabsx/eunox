@@ -2036,23 +2036,24 @@ upstreams:
 	if cfg.Listen.AuthToken != "s3kret" {
 		t.Errorf("braced ${VAR} not expanded: %q", cfg.Listen.AuthToken)
 	}
-	// Bare set var expands; "$5" (digit, not an identifier start) survives, and in
-	// "pa$$" the first '$' is followed by '$' (no match) and the second by end of
-	// string (no match), so the literal survives.
-	want := "Authorization: Bearer s3kret-$5-pa$$"
+	// Bare set var expands; "$5" (digit, not an identifier start) survives untouched;
+	// and the trailing "$$" is the literal-dollar ESCAPE, so it collapses to one '$'.
+	want := "Authorization: Bearer s3kret-$5-pa$"
 	if got := cfg.Upstreams[0].UpstreamAuthHeader; got != want {
 		t.Errorf("env expansion corrupted value:\n got  %q\n want %q", got, want)
 	}
 }
 
-// TestLoadGatewayConfig_EnvExpandDollarBeforeIdentifier pins the ACTUAL contract:
-// a '$' that is followed by an identifier start (a letter or '_') is always
-// treated as a reference, even mid-string and even after another '$'. So in
-// "pa$$word" the second "$word" expands when $word is set, yielding "pa$<value>".
-// There is no "$$" escape — documented behavior, not corruption. The "pa$$-" case
-// in the sibling test survives only because its '$'s are followed by non-identifier
-// characters.
-func TestLoadGatewayConfig_EnvExpandDollarBeforeIdentifier(t *testing.T) {
+// TestLoadGatewayConfig_EnvExpandDollarEscape pins the escape contract: "$$" is a
+// literal '$' and consumes both characters, so an identifier following it is NOT a
+// reference.
+//
+// Without the escape a literal '$' was inexpressible, and "pa$$word" — an ordinary
+// generated password — silently expanded its second "$word" the moment an unrelated
+// environment variable named "word" happened to be set, substituting a value the
+// operator never intended into a credential. A bare "$word" still expands; escaping is
+// what makes the two distinguishable.
+func TestLoadGatewayConfig_EnvExpandDollarEscape(t *testing.T) {
 	t.Setenv("word", "EXPANDED")
 	dir := t.TempDir()
 	cfgPath := mustWriteFile(t, dir, "gw.yaml", `
@@ -2068,9 +2069,32 @@ upstreams:
 	if err != nil {
 		t.Fatalf("config.LoadGatewayConfig: %v", err)
 	}
-	want := "pa$EXPANDED"
+	want := "pa$word"
 	if got := cfg.Listen.AuthToken; got != want {
-		t.Errorf("'$word' after '$' must be expanded:\n got  %q\n want %q", got, want)
+		t.Errorf("'$$' must escape to a literal '$' and stop the following identifier from expanding:\n got  %q\n want %q", got, want)
+	}
+}
+
+// TestLoadGatewayConfig_EnvExpandBareRefStillExpands is the negative control: escaping
+// must not have disabled ordinary expansion of an unescaped reference.
+func TestLoadGatewayConfig_EnvExpandBareRefStillExpands(t *testing.T) {
+	t.Setenv("word", "EXPANDED")
+	dir := t.TempDir()
+	cfgPath := mustWriteFile(t, dir, "gw.yaml", `
+schemaVersion: "0.1"
+listen:
+  authToken: "pa-$word"
+upstreams:
+  - name: api
+    transport: http
+    upstreamUrl: https://api.example
+`)
+	cfg, err := config.LoadGatewayConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("config.LoadGatewayConfig: %v", err)
+	}
+	if got, want := cfg.Listen.AuthToken, "pa-EXPANDED"; got != want {
+		t.Errorf("an unescaped reference must still expand:\n got  %q\n want %q", got, want)
 	}
 }
 
@@ -3618,5 +3642,36 @@ func TestAuditSink_NormalWrite_StillWorks(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "read_file") {
 		t.Errorf("expected read_file in audit log; got %q", string(data))
+	}
+}
+
+// TestBindExposesAllInterfaces pins that every spelling the RESOLVER accepts for the
+// unspecified address trips the --unsafe-bind-all guard.
+//
+// The guard used to test net.ParseIP alone, which is a narrower grammar than
+// getaddrinfo: "0" and hex/octal shorthands are not Go IP literals, so ParseIP returned
+// nil, the guard was skipped entirely, and on a cgo-resolver build the listener bound
+// every interface with no opt-in and no warning.
+func TestBindExposesAllInterfaces(t *testing.T) {
+	exposed := []string{
+		"0.0.0.0", "::", "::0", "0:0:0:0:0:0:0:0", // IP literals ParseIP already caught
+		"0", "00", "0x0", "0X0", "0o0", // inet_aton-style integer forms it did not
+		"", // empty host in "host:port" means all interfaces
+	}
+	for _, h := range exposed {
+		if !bindExposesAllInterfaces(h) {
+			t.Errorf("bind host %q resolves to the unspecified address and must require --unsafe-bind-all", h)
+		}
+	}
+	confined := []string{
+		"127.0.0.1", "::1", "localhost", "192.168.1.10", "example.com",
+		"0.0.0.1", // numerically nonzero
+		"1",       // inet_aton 0.0.0.1, not unspecified
+		"0abc",    // a name, not an integer
+	}
+	for _, h := range confined {
+		if bindExposesAllInterfaces(h) {
+			t.Errorf("bind host %q is not the unspecified address and must not trip the guard", h)
+		}
 	}
 }

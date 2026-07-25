@@ -530,3 +530,35 @@ func TestScanToolEntry_DepthBoundFailsClosed(t *testing.T) {
 		t.Fatal("a value nested past the scan bound must fail closed")
 	}
 }
+
+// TestJWTDecideSampling_ExhaustiveCapabilitiesDeniesSampling pins that the
+// exhaustive-allowlist contract holds for sampling too.
+//
+// Decide documents that a present mcp.capabilities field — even an empty array — denies
+// any target it does not list. Sampling was the one enforced method that ignored it:
+// DecideSampling delegated straight to the manifest. And because parseV2Claim refuses
+// system: claims, a token can never LIST sampling, so a deny-all token still got
+// server-initiated sampling forwarded wherever the route's manifest opted in. That is the
+// single place "the token can only restrict, never expand" failed in the deny direction.
+func TestJWTDecideSampling_ExhaustiveCapabilitiesDeniesSampling(t *testing.T) {
+	t.Parallel()
+	mdp := newTestManifestPDP(capability.Constraint{
+		Target:  "system:sampling/createMessage",
+		Actions: []string{"allow"},
+	})
+	p := NewJWTPDP(JWTPDPOptions{Inner: mdp, AllowAnyAudience: true, AllowAnyIssuer: true})
+
+	// Deny-all token: capabilities present but empty.
+	ctx := WithJWTClaims(context.Background(), &JWTClaims{HasCapabilities: true})
+	resp := p.DecideSampling(ctx, "sess", "")
+	if resp.Decision != capability.DecisionDeny {
+		t.Fatalf("a token with an exhaustive (empty) capability allowlist must not get sampling; got %q", resp.Decision)
+	}
+
+	// Negative control: an identity-only token (no capabilities claim) still defers to
+	// the manifest's explicit opt-in, so sampling is allowed.
+	ctx = WithJWTClaims(context.Background(), &JWTClaims{})
+	if resp := p.DecideSampling(ctx, "sess", ""); resp.Decision != capability.DecisionAllow {
+		t.Fatalf("an identity-only token must still defer to the manifest opt-in; got %q (%+v)", resp.Decision, resp.Denial)
+	}
+}

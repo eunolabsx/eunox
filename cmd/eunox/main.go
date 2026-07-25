@@ -1323,13 +1323,10 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 	if bind == "" {
 		bind = "127.0.0.1"
 	}
-	// Compare on the PARSED address, not the string: net.Listen accepts every
-	// spelling of the unspecified (all-interfaces) address — "0.0.0.0", "::", "::0",
-	// "0:0:0:0:0:0:0:0" — so a literal "0.0.0.0"/"::" match silently let the
-	// alternate IPv6 spellings bypass the exposure guard. IsUnspecified() catches
-	// them all uniformly.
+	// bindExposesAllInterfaces catches every spelling net.Listen resolves to the
+	// unspecified address, including the ones net.ParseIP alone does not.
 	bindHost := strings.TrimSuffix(strings.TrimPrefix(bind, "["), "]")
-	if ip := net.ParseIP(bindHost); ip != nil && ip.IsUnspecified() {
+	if bindExposesAllInterfaces(bindHost) {
 		if !pf.unsafeBindAll {
 			return fmt.Errorf("gateway bind %q exposes the proxy to all network interfaces; pass --unsafe-bind-all to proceed", bind)
 		}
@@ -1944,6 +1941,40 @@ func fetchRouteLive(ctx context.Context, u *config.UpstreamConfig) (LiveUpstream
 // -----------------------------------------------------------------
 // init subcommand
 // -----------------------------------------------------------------
+
+// bindExposesAllInterfaces reports whether bindHost (already stripped of any surrounding
+// IPv6 brackets) will make the listener accept connections on every interface.
+//
+// Comparing the PARSED address rather than the string catches every IP-literal spelling of
+// the unspecified address uniformly — "0.0.0.0", "::", "::0", "0:0:0:0:0:0:0:0" — which a
+// literal "0.0.0.0"/"::" string match does not.
+//
+// But net.ParseIP is not the whole grammar the RESOLVER accepts. "0" and hex/octal
+// shorthands like "0x0" or "00" are not Go IP literals, so ParseIP returns nil and the
+// guard was skipped entirely — yet on a cgo-resolver build getaddrinfo("0") resolves to
+// 0.0.0.0 and the listener binds every interface with no --unsafe-bind-all and no warning.
+// A host that is entirely numeric (optionally 0x/0-prefixed) is an inet_aton-style integer
+// address, not a DNS name, so it is decoded here rather than trusted to ParseIP. A value
+// of zero is the unspecified address.
+//
+// Deliberately no DNS lookup: resolving an operator-supplied name at startup would be
+// background network activity for a check that must work offline, and a NAME that resolves
+// to 0.0.0.0 is not a shape any real deployment uses.
+func bindExposesAllInterfaces(bindHost string) bool {
+	if ip := net.ParseIP(bindHost); ip != nil {
+		return ip.IsUnspecified()
+	}
+	if bindHost == "" {
+		// An empty host in "host:port" means all interfaces to net.Listen.
+		return true
+	}
+	// inet_aton-style integer form: strconv handles the 0x / 0o / leading-0 octal bases
+	// the resolver accepts. Any parse failure means this is a name, not an integer.
+	if n, err := strconv.ParseUint(bindHost, 0, 64); err == nil {
+		return n == 0
+	}
+	return false
+}
 
 // refuseNonRegularOutput fails closed unless path is a regular file or genuinely absent.
 //

@@ -914,6 +914,19 @@ func (p *JWTPDP) DecideSampling(ctx context.Context, sessionID, sourceIP string)
 	if deny := p.CheckAudience(ctx); deny != nil {
 		return *deny
 	}
+	// A present mcp.capabilities field is an EXHAUSTIVE allowlist: Decide denies any
+	// target the claim does not list, even an empty array. Sampling was the one enforced
+	// method that ignored it — DecideSampling delegated straight to the manifest — and
+	// because parseV2Claim refuses system: claims, a token can never LIST sampling. So a
+	// deny-all token ("capabilities": []) still got server-initiated sampling forwarded on
+	// its session wherever the route's manifest opted into system:sampling/createMessage:
+	// the one place "the token can only restrict, never expand" failed in the
+	// exhaustive-deny direction. Deny instead, so the claim's contract holds for every
+	// enforced method.
+	if claims, ok := jwtClaimsFromContext(ctx); ok && claims.HasCapabilities {
+		return denyResponse(p.clock, capability.ErrCodeSamplingDenied, "",
+			"the token carries an mcp.capabilities claim, which is an exhaustive allowlist, and sampling cannot be listed in it (system: targets are not expressible as capability claims); server-initiated sampling is therefore denied for this token")
+	}
 	// innerEnforces gates the delegation so an AlwaysAllowPDP inner is NOT a sampling
 	// backstop (matching the identity-only Decide path): without it
 	// AlwaysAllowPDP.DecideSampling would be reached and silently grant sampling on a
