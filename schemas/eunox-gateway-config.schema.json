@@ -75,6 +75,12 @@
             "type": "string"
           }
         },
+        "trustedProxyHops": {
+          "type": "integer",
+          "description": "How many trusted reverse proxies sit in front of eunox. Each hop appends the address it saw to X-Forwarded-For, so the right-most N entries are proxy-written and the client's real address is the N-th from the right; entries further left are client-supplied and ignored. Defaults to 1 (a single proxy, i.e. the right-most entry). Declare the real chain depth rather than relying on trustedProxyCIDRs to identify hops: an entry inside that range is indistinguishable from a client whose own address falls in it. Only valid for transport: http.",
+          "minimum": 1,
+          "default": 1
+        },
         "maxSessions": {
           "type": "integer",
           "description": "Cap on concurrent client sessions; each session owns one upstream subprocess or remote connection. A new initialize beyond the cap is refused with 503 rather than spawning unbounded upstreams. 0 means unlimited. When this key is omitted, the proxy applies a safe backstop default (see --max-sessions). Only valid for transport: http.",

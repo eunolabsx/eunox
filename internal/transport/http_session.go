@@ -344,7 +344,7 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 	defer sess.initInProgress.Store(false)
 
 	cmd := exec.Command(route.command, route.args...) //nolint:gosec,noctx // G204: args are user-supplied CLI arguments; session lifecycle managed via done channel, not ctx
-	cmd.Stderr = os.Stderr
+	ConfigureUpstreamCmd(cmd)
 
 	upIn, err := cmd.StdinPipe()
 	if err != nil {

@@ -306,6 +306,7 @@ func TestSEC04_MaxBytesReader_Kill(t *testing.T) {
 	// Simulate loopback so the IP check passes, and supply the control token so the
 	// request reaches the body-size check rather than stopping at auth.
 	req.RemoteAddr = "127.0.0.1:12345"
+	req.Host = "127.0.0.1:12345" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	req.Header.Set(ControlTokenHeader, testControlToken)
 	rr := httptest.NewRecorder()
 	proxy.handleKill(rr, req)
@@ -529,6 +530,7 @@ func TestSEC07_KillEndpoint_RequiresControlToken(t *testing.T) {
 			body := `{"all":true}`
 			req := httptest.NewRequest(http.MethodPost, "/control/kill", strings.NewReader(body))
 			req.RemoteAddr = "127.0.0.1:9999" // loopback — bypass IP check
+			req.Host = "127.0.0.1:9999"       // loopback Host so loopbackOnly's DNS-rebinding guard passes
 			if tc.token != "" {
 				req.Header.Set(ControlTokenHeader, tc.token)
 			}
@@ -553,6 +555,7 @@ func TestKillEndpoint_ControlTokenRequiredEvenWithoutAuthToken(t *testing.T) {
 	// No control-token header: rejected (was previously allowed-all).
 	req := httptest.NewRequest(http.MethodPost, "/control/kill", strings.NewReader(body))
 	req.RemoteAddr = "127.0.0.1:9999"
+	req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	rr := httptest.NewRecorder()
 	proxy.handleKill(rr, req)
 	if rr.Code != http.StatusUnauthorized {
@@ -562,6 +565,7 @@ func TestKillEndpoint_ControlTokenRequiredEvenWithoutAuthToken(t *testing.T) {
 	// Correct control-token header: accepted.
 	req = httptest.NewRequest(http.MethodPost, "/control/kill", strings.NewReader(body))
 	req.RemoteAddr = "127.0.0.1:9999"
+	req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	req.Header.Set(ControlTokenHeader, testControlToken)
 	rr = httptest.NewRecorder()
 	proxy.handleKill(rr, req)
@@ -580,6 +584,7 @@ func TestSEC07_KillEndpoint_NoControlToken_FailsClosed(t *testing.T) {
 	body := `{"all":true}`
 	req := httptest.NewRequest(http.MethodPost, "/control/kill", strings.NewReader(body))
 	req.RemoteAddr = "127.0.0.1:9999"
+	req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	req.Header.Set(ControlTokenHeader, "anything")
 	rr := httptest.NewRecorder()
 	proxy.handleKill(rr, req)
@@ -633,6 +638,7 @@ func TestKillEndpoint_TrustForwardedFor_XFFRejected(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/control/kill", strings.NewReader(`{"all":true}`))
 	req.RemoteAddr = "127.0.0.1:9999" // loopback edge (the reverse proxy)
+	req.Host = "127.0.0.1:9999"       // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	req.Header.Set("X-Forwarded-For", "203.0.113.7")
 	req.Header.Set(ControlTokenHeader, testControlToken)
 	rr := httptest.NewRecorder()
@@ -652,6 +658,7 @@ func TestKillEndpoint_TrustForwardedFor_NoXFFAllowed(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/control/kill", strings.NewReader(`{"all":true}`))
 	req.RemoteAddr = "127.0.0.1:9999"
+	req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	req.Header.Set(ControlTokenHeader, testControlToken)
 	rr := httptest.NewRecorder()
 	proxy.handleKill(rr, req)

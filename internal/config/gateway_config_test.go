@@ -45,6 +45,56 @@ upstreams:
 	}
 }
 
+// listen.trustedProxyHops must survive the strict decode as a real key (not be rejected
+// as unknown) and reach the config as a distinguishable pointer, since the transport
+// treats an absent key as the single-proxy default rather than as 0.
+func TestLoadGatewayConfig_ParsesTrustedProxyHops(t *testing.T) {
+	cfg, err := LoadGatewayConfig(writeConfig(t, `
+schemaVersion: "0.1"
+transport: http
+listen:
+  bind: 127.0.0.1
+  port: 3000
+  trustedProxyCIDRs: ["10.0.0.0/8"]
+  trustedProxyHops: 3
+upstreams:
+  - name: mock
+    transport: stdio
+    command: echo
+`))
+	if err != nil {
+		t.Fatalf("LoadGatewayConfig: %v", err)
+	}
+	if cfg.Listen.TrustedProxyHops == nil {
+		t.Fatal("listen.trustedProxyHops did not parse (nil); an absent pointer is read as the default")
+	}
+	if got := *cfg.Listen.TrustedProxyHops; got != 3 {
+		t.Errorf("listen.trustedProxyHops = %d, want 3", got)
+	}
+}
+
+// Omitting listen.trustedProxyHops must leave it nil so the transport applies the
+// single-proxy default, rather than yielding an explicit 0 (which validation rejects).
+func TestLoadGatewayConfig_TrustedProxyHopsAbsentIsNil(t *testing.T) {
+	cfg, err := LoadGatewayConfig(writeConfig(t, `
+schemaVersion: "0.1"
+transport: http
+listen:
+  bind: 127.0.0.1
+  port: 3000
+upstreams:
+  - name: mock
+    transport: stdio
+    command: echo
+`))
+	if err != nil {
+		t.Fatalf("LoadGatewayConfig: %v", err)
+	}
+	if cfg.Listen.TrustedProxyHops != nil {
+		t.Errorf("listen.trustedProxyHops = %d, want nil when the key is absent", *cfg.Listen.TrustedProxyHops)
+	}
+}
+
 // A typo'd / unknown key must be rejected (KnownFields strict decode), so a
 // misspelled security-relevant field cannot be silently ignored.
 func TestLoadGatewayConfig_RejectsUnknownKey(t *testing.T) {

@@ -165,6 +165,19 @@ type GatewayConfig struct {
 		// client that reaches the listener directly could forge X-Forwarded-For to spoof
 		// an ipRange condition's source IP. Only valid for transport: http.
 		TrustedProxyCIDRs []string `yaml:"trustedProxyCIDRs"`
+		// TrustedProxyHops is how many trusted reverse proxies sit in front of eunox.
+		// Each hop appends the address it saw to X-Forwarded-For, so the right-most N
+		// entries are the ones trusted proxies wrote and the client's real address is
+		// the N-th from the right; everything further left is client-supplied and
+		// ignored. Unset ⟹ 1 (a single proxy, i.e. the right-most entry).
+		//
+		// The count must be declared rather than inferred by testing entries against
+		// trustedProxyCIDRs: an entry inside that range is indistinguishable from a
+		// client whose own address happens to fall in it, so inferring would let such
+		// a client spoof an ipRange source with a forged left-hand entry. Only valid
+		// for transport: http. Pointer so an explicit value is distinguishable from
+		// unset, and so an out-of-range 0 is rejected rather than read as "default".
+		TrustedProxyHops *int `yaml:"trustedProxyHops"`
 		// MaxSessions caps concurrent client sessions (each owns one upstream
 		// subprocess or remote connection). 0 ⟹ unlimited; an initialize beyond the
 		// cap is refused with 503. Only valid for transport: http. Pointer so an
@@ -581,9 +594,10 @@ func (cfg *GatewayConfig) Validate(presentKeys []map[string]bool) error {
 		if cfg.Listen.Bind != "" || cfg.Listen.Port != 0 || cfg.Listen.AuthToken != "" ||
 			cfg.Listen.OAuthResource != "" || len(cfg.Listen.OAuthAuthorizationServers) > 0 ||
 			len(cfg.Listen.AllowedOrigins) > 0 || cfg.Listen.MaxSessions != nil ||
-			cfg.Listen.SessionIdleTimeoutMs != nil || len(cfg.Listen.TrustedProxyCIDRs) > 0 {
+			cfg.Listen.SessionIdleTimeoutMs != nil || len(cfg.Listen.TrustedProxyCIDRs) > 0 ||
+			cfg.Listen.TrustedProxyHops != nil {
 			return fmt.Errorf("transport: stdio has no network listener — remove the 'listen' block " +
-				"(bind/port/authToken/oauthResource/oauthAuthorizationServers/allowedOrigins/maxSessions/sessionIdleTimeoutMs/trustedProxyCIDRs)")
+				"(bind/port/authToken/oauthResource/oauthAuthorizationServers/allowedOrigins/maxSessions/sessionIdleTimeoutMs/trustedProxyCIDRs/trustedProxyHops)")
 		}
 		if len(cfg.Upstreams) != 1 {
 			return fmt.Errorf("transport: stdio fronts exactly one upstream, got %d", len(cfg.Upstreams))
@@ -601,6 +615,13 @@ func (cfg *GatewayConfig) Validate(presentKeys []map[string]bool) error {
 		if !ip.Equal(network.IP) {
 			return fmt.Errorf("listen.trustedProxyCIDRs: CIDR %q has host bits set; use the network address %q, or /32 to trust just that host", cidr, network.String())
 		}
+	}
+	// A hop count below 1 would leave no proxy-written entry to read, so the value is
+	// meaningless rather than a usable "off" switch (X-Forwarded-For is disabled by
+	// omitting --trust-forwarded-for, or by leaving trustedProxyCIDRs empty).
+	if h := cfg.Listen.TrustedProxyHops; h != nil && *h < 1 {
+		return fmt.Errorf("listen.trustedProxyHops must be at least 1, got %d; omit the key for a single proxy, "+
+			"or drop --trust-forwarded-for to stop trusting the header entirely", *h)
 	}
 	if cfg.HostTransport() == HostTransportHTTP && cfg.Listen.Port != 0 {
 		if cfg.Listen.Port < 1 || cfg.Listen.Port > 65535 {

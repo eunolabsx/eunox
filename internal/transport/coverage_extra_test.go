@@ -810,6 +810,7 @@ func TestHandleHealth_MethodNotAllowed(t *testing.T) {
 	proxy := newHTTPProxy(httpProxyOptions{PDP: pdp.AlwaysAllowPDP{}})
 	req := httptest.NewRequest(http.MethodPost, "/healthz", http.NoBody)
 	req.RemoteAddr = "127.0.0.1:9999" // loopback: passes the guard, fails the method check
+	req.Host = "127.0.0.1:9999"       // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	rr := httptest.NewRecorder()
 	proxy.handleHealth(rr, req)
 	if rr.Code != http.StatusMethodNotAllowed {
@@ -838,6 +839,7 @@ func TestHandleMetrics_MethodNotAllowed(t *testing.T) {
 	proxy := newHTTPProxy(httpProxyOptions{PDP: pdp.AlwaysAllowPDP{}})
 	req := httptest.NewRequest(http.MethodPost, "/metrics", http.NoBody)
 	req.RemoteAddr = "127.0.0.1:9999"
+	req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	rr := httptest.NewRecorder()
 	proxy.handleMetrics(rr, req)
 	if rr.Code != http.StatusMethodNotAllowed {

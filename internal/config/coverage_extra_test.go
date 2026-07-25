@@ -319,6 +319,48 @@ func TestGatewayConfig_ValidateRejections(t *testing.T) {
 			wantSubstr: "invalid CIDR",
 		},
 		{
+			name: "stdio host with listen.trustedProxyHops",
+			cfg: func() GatewayConfig {
+				c := GatewayConfig{
+					SchemaVersion: "0.1",
+					Transport:     HostTransportStdio,
+					Upstreams:     []UpstreamConfig{{Name: "a", Transport: "stdio", Command: "echo"}},
+				}
+				hops := 2
+				c.Listen.TrustedProxyHops = &hops
+				return c
+			}(),
+			wantSubstr: "transport: stdio has no network listener",
+		},
+		{
+			// 0 is not a usable "off" switch: with no proxy-written entry to read there is
+			// nothing to resolve, so it is rejected rather than silently read as the default.
+			name: "listen.trustedProxyHops of zero",
+			cfg: func() GatewayConfig {
+				c := GatewayConfig{
+					SchemaVersion: "0.1",
+					Upstreams:     []UpstreamConfig{{Name: "a", Transport: "stdio", Command: "echo"}},
+				}
+				hops := 0
+				c.Listen.TrustedProxyHops = &hops
+				return c
+			}(),
+			wantSubstr: "listen.trustedProxyHops must be at least 1",
+		},
+		{
+			name: "negative listen.trustedProxyHops",
+			cfg: func() GatewayConfig {
+				c := GatewayConfig{
+					SchemaVersion: "0.1",
+					Upstreams:     []UpstreamConfig{{Name: "a", Transport: "stdio", Command: "echo"}},
+				}
+				hops := -1
+				c.Listen.TrustedProxyHops = &hops
+				return c
+			}(),
+			wantSubstr: "listen.trustedProxyHops must be at least 1",
+		},
+		{
 			name: "stdio host with more than one upstream",
 			cfg: GatewayConfig{
 				SchemaVersion: "0.1",

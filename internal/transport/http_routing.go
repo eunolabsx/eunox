@@ -130,6 +130,33 @@ func decodeStrictJSON(w http.ResponseWriter, r *http.Request, v interface{}, inv
 	return true
 }
 
+// writeSessionCreateError maps a newSession/newRemoteSession failure to the right HTTP
+// status. The transient/retryable conditions get a 503 so a client racing a graceful
+// restart or a full/racing proxy retries rather than treating it as a hard failure:
+//   - errSessionLimit — the proxy is at its concurrent-session cap.
+//   - errRacedReap — a global kill swept the registry mid-handshake (see reapGen); the
+//     upstream this initialize started was already torn down, so a retry is safe.
+//   - errShuttingDown — registration was refused because the proxy is draining for a
+//     graceful shutdown (the upstream itself started fine).
+//
+// Anything else is an upstream-start failure: the raw error can carry the upstream
+// command path, an internal IP:port, or TLS detail, so it is logged to stderr for the
+// operator and returned to the client as a generic 500. Extracted from handleMCPPost so
+// the session-creating initialize branch stays within the nested-complexity budget.
+func writeSessionCreateError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, errSessionLimit):
+		http.Error(w, "session limit reached", http.StatusServiceUnavailable)
+	case errors.Is(err, errRacedReap):
+		http.Error(w, "session raced a kill-switch reset; retry", http.StatusServiceUnavailable)
+	case errors.Is(err, errShuttingDown):
+		http.Error(w, "server shutting down; retry", http.StatusServiceUnavailable)
+	default:
+		fmt.Fprintf(os.Stderr, "[eunox] failed to start upstream: %v\n", err)
+		http.Error(w, "upstream unavailable", http.StatusInternalServerError)
+	}
+}
+
 // handleMCPPost processes a JSON-RPC request from the MCP host for the given
 // upstream route.
 func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route *UpstreamRoute) {
@@ -236,24 +263,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 			sess, err = p.newSession(initCtx, route, clientIP)
 		}
 		if err != nil {
-			if errors.Is(err, errSessionLimit) {
-				http.Error(w, "session limit reached", http.StatusServiceUnavailable)
-				return
-			}
-			if errors.Is(err, errRacedReap) {
-				// A global kill swept the registry while this handshake was in flight
-				// (see reapGen). The upstream this initialize just started has already
-				// been torn down by the caller; retrying is safe and, once no sweep
-				// races the next attempt, will succeed normally.
-				http.Error(w, "session raced a kill-switch reset; retry", http.StatusServiceUnavailable)
-				return
-			}
-			// The raw error can carry the upstream command path, an internal IP:port,
-			// or TLS detail. Log it to stderr for the operator; return a generic
-			// message to the client (the transport's standard posture on upstream
-			// failures).
-			fmt.Fprintf(os.Stderr, "[eunox] failed to start upstream: %v\n", err)
-			http.Error(w, "upstream unavailable", http.StatusInternalServerError)
+			writeSessionCreateError(w, err)
 			return
 		}
 		w.Header().Set(SessionHeader, sess.id)
@@ -766,6 +776,24 @@ func (p *HTTPProxy) handleMCPGet(w http.ResponseWriter, r *http.Request, route *
 	keepalive := time.NewTicker(sseKeepaliveInterval)
 	defer keepalive.Stop()
 
+	// Bound the stream to the presenting token's exp. The Bearer was validated once, at
+	// stream open (in handleMCP); without this an expired — or IdP-revoked but not
+	// kill-switched — client keeps receiving server->client traffic until it disconnects
+	// or the idle reaper runs. When the token's lifetime elapses, end the stream so the
+	// client must re-open (and thus re-validate) with a fresh token. A nil channel (no
+	// JWT on this session) never fires, so the non-JWT path is unaffected;
+	// time.NewTimer fires immediately for an already-elapsed exp (fail closed). Bound to
+	// this GET's own token, matching what handleMCP validated. Kill-switch eviction
+	// (sess.evicted) already covers administrative revocation; this covers plain expiry.
+	var tokenExpiry <-chan time.Time
+	var tokenExpiresAt time.Time
+	if claims := pdp.JWTClaimsPtr(r.Context()); claims != nil && !claims.ExpiresAt.IsZero() {
+		tokenExpiresAt = claims.ExpiresAt
+		expTimer := time.NewTimer(time.Until(tokenExpiresAt))
+		defer expTimer.Stop()
+		tokenExpiry = expTimer.C
+	}
+
 	for {
 		select {
 		case msg := <-ch:
@@ -788,6 +816,15 @@ func (p *HTTPProxy) handleMCPGet(w http.ResponseWriter, r *http.Request, route *
 				return
 			}
 		case <-keepalive.C:
+			// Re-anchor the expiry bound to the wall clock. time.Until sampled the wall
+			// clock once at stream open, but the resulting timer runs on the monotonic
+			// clock, which does not advance while the host is suspended — so a laptop or
+			// VM suspended mid-stream would otherwise extend the authorized window past
+			// exp by the suspend duration. This tick already fires every few seconds, so
+			// the check is free and bounds the overshoot to one keepalive interval.
+			if !tokenExpiresAt.IsZero() && !time.Now().Before(tokenExpiresAt) {
+				return
+			}
 			if !writeSSE(sseKeepaliveFrame) {
 				return
 			}
@@ -797,6 +834,10 @@ func (p *HTTPProxy) handleMCPGet(w http.ResponseWriter, r *http.Request, route *
 			// refused by the kill-switch check at the top of handleMCPGet.
 			return
 		case <-sess.done:
+			return
+		case <-tokenExpiry:
+			// The presenting token's lifetime elapsed; end the stream so a re-open must
+			// carry a fresh token (see the tokenExpiry setup above).
 			return
 		case <-r.Context().Done():
 			return

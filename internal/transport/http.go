@@ -188,6 +188,12 @@ type HTTPProxy struct {
 	// networks before X-Forwarded-For is honored — see sourceIP. Empty means no peer
 	// can ever match, so trustFwdFor alone has no effect until CIDRs are configured.
 	trustedProxyNets []*net.IPNet
+	// trustedProxyHops is listen.trustedProxyHops: the number of trusted proxies in
+	// front of eunox, and so how many right-most X-Forwarded-For entries are
+	// proxy-written. 0 means unset; sourceIP reads it through proxyHops, which supplies
+	// the single-proxy default, so the zero value is the common production case rather
+	// than an invalid one.
+	trustedProxyHops int
 	bind             string
 	port             int
 
@@ -267,8 +273,12 @@ type HTTPGatewayOptions struct {
 	// an entry that still fails to parse here is skipped (never trusted) and logged,
 	// rather than silently narrowing the allowlist.
 	TrustedProxyCIDRs []string
-	Bind              string
-	Port              int
+	// TrustedProxyHops is listen.trustedProxyHops: how many trusted proxies sit in
+	// front of eunox, i.e. how many right-most X-Forwarded-For entries were written by
+	// trusted hops. 0 (unset) is normalized to 1. See sourceIP.
+	TrustedProxyHops int
+	Bind             string
+	Port             int
 
 	// RequireAuditStrict is the --require-audit=strict gate: deny enforced forwards
 	// (and */list enumeration) fail-closed once the shared audit trail degrades.
@@ -325,6 +335,7 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 		authTimingKey:      newAuthTimingKey(),
 		trustFwdFor:        opts.TrustFwdFor,
 		trustedProxyNets:   trustedProxyNets,
+		trustedProxyHops:   opts.TrustedProxyHops,
 		bind:               opts.Bind,
 		port:               opts.Port,
 		maxSessions:        opts.MaxSessions,
@@ -333,6 +344,55 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 		allowedOriginHosts: buildAllowedOriginHosts(opts.Bind),
 		routes:             opts.Routes,
 		sessions:           make(map[string]*httpSession),
+	}
+}
+
+// warnForwardedForPosture emits the startup SECURITY lines describing how this proxy will
+// resolve a client IP from X-Forwarded-For. Split out of Serve so the posture rules read
+// as one unit rather than as another block in the startup sequence.
+//
+// --trust-forwarded-for only honors X-Forwarded-For from a peer whose RemoteAddr matches
+// listen.trustedProxyCIDRs (see sourceIP); a request from any other peer falls back to its
+// own RemoteAddr, so a client that connects directly cannot spoof an ipRange source purely
+// by setting the header. Warn anyway: an empty allowlist makes the flag a no-op, and even
+// a configured allowlist is only as strong as how tightly it is scoped.
+func (p *HTTPProxy) warnForwardedForPosture() {
+	if !p.trustFwdFor {
+		return
+	}
+	if len(p.trustedProxyNets) == 0 {
+		fmt.Fprintf(os.Stderr,
+			"[eunox] SECURITY: --trust-forwarded-for is enabled but listen.trustedProxyCIDRs is empty, "+
+				"so no peer can ever match — X-Forwarded-For is never trusted and every request's source IP "+
+				"is its own connection address. Set listen.trustedProxyCIDRs to the reverse proxy's address(es) "+
+				"to enable X-Forwarded-For trust.\n",
+		)
+		return
+	}
+	if !bindIsLoopbackOnly(p.bind) {
+		fmt.Fprintf(os.Stderr,
+			"[eunox] SECURITY: --trust-forwarded-for is enabled on a non-loopback bind (%q). "+
+				"X-Forwarded-For is honored only from a peer matching listen.trustedProxyCIDRs; "+
+				"scope that allowlist tightly to the real reverse proxy's address; a broader range "+
+				"(e.g. a shared or NATed subnet) would let another host on it spoof an ipRange source.\n",
+			p.bind,
+		)
+	}
+	// The declared hop count is trusted verbatim, and the two ways to get it wrong are not
+	// symmetric. Under-declaring is safe (the read lands on a proxy-written entry further
+	// right, or the chain is short and fails closed); OVER-declaring points the read at a
+	// client-supplied entry, so a client behind the proxy can choose its own ipRange source
+	// with a single forged header. Nothing can validate the count at runtime without
+	// reintroducing the CIDR inference this design rejects, so state it at startup where an
+	// operator can compare it against the real topology.
+	if hops := p.proxyHops(); hops > 1 {
+		fmt.Fprintf(os.Stderr,
+			"[eunox] SECURITY: listen.trustedProxyHops is %d, so the client is read %d entries from the right "+
+				"of X-Forwarded-For. This MUST equal the number of trusted proxies that append to the header in "+
+				"front of eunox — declaring more than actually run lets a client behind them forge its own source "+
+				"IP for ipRange conditions.\n",
+			hops, hops,
+		)
 	}
 }
 
@@ -406,30 +466,7 @@ func (p *HTTPProxy) Serve(ctx context.Context) error {
 		fmt.Fprintf(os.Stderr, "[eunox] HTTP proxy listening on http://%s%s\n", ln.Addr(), path)
 	}
 
-	// --trust-forwarded-for only honors X-Forwarded-For from a peer whose RemoteAddr
-	// matches listen.trustedProxyCIDRs (see sourceIP); a request from any other peer
-	// falls back to its own RemoteAddr, so a client that connects directly can no
-	// longer spoof an ipRange source purely by setting the header. Still warn: an
-	// empty allowlist makes the flag a no-op, and even a configured allowlist is only
-	// as strong as how tightly it is scoped to the real reverse proxy's address.
-	if p.trustFwdFor {
-		if len(p.trustedProxyNets) == 0 {
-			fmt.Fprintf(os.Stderr,
-				"[eunox] SECURITY: --trust-forwarded-for is enabled but listen.trustedProxyCIDRs is empty, "+
-					"so no peer can ever match — X-Forwarded-For is never trusted and every request's source IP "+
-					"is its own connection address. Set listen.trustedProxyCIDRs to the reverse proxy's address(es) "+
-					"to enable X-Forwarded-For trust.\n",
-			)
-		} else if !bindIsLoopbackOnly(p.bind) {
-			fmt.Fprintf(os.Stderr,
-				"[eunox] SECURITY: --trust-forwarded-for is enabled on a non-loopback bind (%q). "+
-					"X-Forwarded-For is honored only from a peer matching listen.trustedProxyCIDRs; "+
-					"scope that allowlist tightly to the real reverse proxy's address; a broader range "+
-					"(e.g. a shared or NATed subnet) would let another host on it spoof an ipRange source.\n",
-				p.bind,
-			)
-		}
-	}
+	p.warnForwardedForPosture()
 
 	// A non-loopback bind with neither an auth token nor JWT leaves the enforced /mcp
 	// endpoint open to any off-host client: checkAuth is a no-op without a token/JWKS,
