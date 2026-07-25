@@ -1307,6 +1307,12 @@ const maxWildcardTiebreak = resourceSpecificityLiteralWeight - 1
 // safety pkg/callcounter already engineers for.
 const exactMatchSpecificity = 1 << 27
 
+// ResourceSpecificity scores how specifically a capability's resource pattern matches
+// toolName, so FindMatchingCapability can select the most specific of several matching
+// capabilities. An exact literal match scores exactMatchSpecificity; glob patterns rank
+// below it by how much of the name they pin. Exported alongside MatchesResource for
+// packages that need the engine's own selection ordering rather than a reimplementation
+// of it. Callers must have established a match first (see MatchesResource).
 func ResourceSpecificity(resource, toolName string) int {
 	if resource == toolName {
 		return exactMatchSpecificity

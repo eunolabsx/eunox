@@ -200,7 +200,7 @@ func sortedRotatedSiblings(logPath string) ([]string, error) {
 // sortedRotatedSiblingsWithBase is sortedRotatedSiblings plus whether the active base
 // was present in the same directory read. Only LogChainFiles needs the second value,
 // and it needs it from THIS read (see scanLogDir's TOCTOU note).
-func sortedRotatedSiblingsWithBase(logPath string) ([]string, bool, error) {
+func sortedRotatedSiblingsWithBase(logPath string) (rotated []string, hasActive bool, err error) {
 	all, hasActive, err := scanLogDir(logPath)
 	if err != nil {
 		return nil, false, err

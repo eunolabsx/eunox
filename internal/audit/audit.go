@@ -1334,7 +1334,7 @@ var errAuditTailUnbounded = errors.New("audit partial-tail exceeds the scan wind
 //
 // Returns the number of bytes truncated (0 when the tail already ends at a record
 // boundary). Runs under the exclusive audit lock, before the drainer starts.
-func truncatePartialTail(f *os.File) (int64, string, error) {
+func truncatePartialTail(f *os.File) (truncated int64, last string, err error) {
 	info, err := f.Stat()
 	if err != nil {
 		// Stat failed on the open append handle. We cannot tell whether the log is empty
