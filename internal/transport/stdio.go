@@ -29,10 +29,10 @@ import (
 	"time"
 
 	"github.com/eunolabs/eunox/internal/audit"
-	"github.com/eunolabs/eunox/internal/config"
 	"github.com/eunolabs/eunox/internal/drift"
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/pdp"
+	"github.com/eunolabs/eunox/pkg/capability"
 )
 
 const (
@@ -444,8 +444,8 @@ func (p *StdioProxy) connectUpstream(ctx context.Context) error {
 		// not left debugging a silent hang.
 		// Redact the URL: unlike the gateway caller (which passes the route NAME), the
 		// stdio host has no route name, so it labels the notice with the upstream URL —
-		// which must not carry a userinfo/query credential to stderr.
-		printRemoteUpstreamNotice(os.Stderr, config.RedactURL(p.upstreamURL), "")
+		// which must not carry a userinfo/query/path credential to stderr.
+		printRemoteUpstreamNotice(os.Stderr, capability.RedactURLForLog(p.upstreamURL), "")
 		return nil
 	}
 
@@ -498,10 +498,10 @@ func (p *StdioProxy) connectUpstream(ctx context.Context) error {
 // the remote URL.
 func (p *StdioProxy) upstreamLabel() string {
 	if p.upHTTP != nil {
-		// Redact before it reaches a log line: a remote upstreamUrl may carry a userinfo
-		// or ?api_key= credential that must not leak to stderr — the same consolidated
-		// redactor the live probe and doctor bundle use.
-		return config.RedactURL(p.upstreamURL)
+		// Redact before it reaches a log line: a remote upstreamUrl may carry a userinfo,
+		// ?api_key=, or path-embedded (webhook-style) credential that must not leak to
+		// stderr — the same log-facing redactor every other stderr URL site uses.
+		return capability.RedactURLForLog(p.upstreamURL)
 	}
 	return p.command
 }

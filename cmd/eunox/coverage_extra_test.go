@@ -1984,6 +1984,39 @@ func TestServeHTTPGateway_OAuthAuthzServerError(t *testing.T) {
 	}
 }
 
+// TestServeHTTPGateway_OAuthMetadataRequiresJWKS pins the fail-closed guard on the
+// one JWT-adjacent flag pair validateJWTFlagsRequireJWKS does not cover: publishing
+// RFC 9728 protected-resource metadata advertises "present a bearer token from these
+// authorization servers" to every unauthenticated client, but without --jwks-uri the
+// gateway verifies no token at all. Advertising a protection it does not enforce must
+// not start.
+func TestServeHTTPGateway_OAuthMetadataRequiresJWKS(t *testing.T) {
+	fake := newFakeUpstreamWithTools([]mcp.ToolEntry{{Name: "t"}})
+	srv := httptest.NewServer(http.StripPrefix("/mcp", fake))
+	t.Cleanup(srv.Close)
+
+	for _, tc := range []struct {
+		name string
+		set  func(cfg *config.GatewayConfig, pf *proxyFlags)
+	}{
+		{"flag", func(_ *config.GatewayConfig, pf *proxyFlags) { pf.oauthResource = "https://proxy.example.com/mcp" }},
+		{"config", func(cfg *config.GatewayConfig, _ *proxyFlags) {
+			cfg.Listen.OAuthResource = "https://proxy.example.com/mcp"
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := auditUpstreamHTTPConfig(t, srv.URL)
+			pf := proxyFlags{}
+			tc.set(cfg, &pf)
+
+			err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf)
+			if err == nil || !strings.Contains(err.Error(), "no bearer-token validation is configured") {
+				t.Fatalf("want a fail-closed OAuth-metadata-without-JWKS error, got %v", err)
+			}
+		})
+	}
+}
+
 func TestServeHTTPGateway_ControlTokenWriteError(t *testing.T) {
 	fake := newFakeUpstreamWithTools([]mcp.ToolEntry{{Name: "t"}})
 	srv := httptest.NewServer(http.StripPrefix("/mcp", fake))

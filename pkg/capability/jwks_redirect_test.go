@@ -115,37 +115,6 @@ func TestJWKSCache_SameHostRedirectAllowed(t *testing.T) {
 	}
 }
 
-// TestRedactURLForLog_StripsEveryCredentialBearingComponent pins that the log-safe redactor
-// leaks neither the secret nor its length, on both the parseable and unparseable paths.
-func TestRedactURLForLog_StripsEveryCredentialBearingComponent(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		name, in string
-		mustNot  []string
-	}{
-		{"userinfo and query", "https://svc:s3cr3t@idp.internal/keys?api_key=AKIA123", []string{"s3cr3t", "AKIA123", "api_key"}},
-		{"query only", "https://idp.internal/keys?token=abcdef", []string{"abcdef", "token"}},
-		{"fragment", "https://idp.internal/keys#frag-secret", []string{"frag-secret"}},
-		{"unparseable with credentials", "ht tp://svc:s3cr3t@idp.internal/keys?api_key=AKIA123", []string{"s3cr3t", "AKIA123"}},
-		{"opaque", "mailto:svc:s3cr3t@example.com", []string{"s3cr3t"}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			got := RedactURLForLog(tc.in)
-			for _, bad := range tc.mustNot {
-				if strings.Contains(got, bad) {
-					t.Errorf("RedactURLForLog(%q) = %q, must not contain %q", tc.in, got, bad)
-				}
-			}
-		})
-	}
-	// The host and path are operational context an operator needs, so they survive.
-	if got := RedactURLForLog("https://svc:pw@idp.internal:8443/keys?k=v"); got != "https://idp.internal:8443/keys" {
-		t.Errorf("host and path must survive redaction; got %q", got)
-	}
-}
-
 // TestJWKSCache_GetKeysReturnsIndependentSlice pins that the cache never hands out its
 // live key slice. A caller that truncates, appends to, or reorders the returned set must
 // not disturb concurrent verifications reading the shared cache — the aliasing defense

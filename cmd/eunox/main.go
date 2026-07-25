@@ -1107,9 +1107,9 @@ func validateJWKSURIScheme(jwksURI string, allowInsecure bool) error {
 		// redacted URL and the parse reason separately.
 		var uerr *url.Error
 		if errors.As(err, &uerr) {
-			return fmt.Errorf("--jwks-uri %s is not a valid URL: %v", config.RedactURL(jwksURI), uerr.Err)
+			return fmt.Errorf("--jwks-uri %s is not a valid URL: %v", capability.RedactURLForLog(jwksURI), uerr.Err)
 		}
-		return fmt.Errorf("--jwks-uri %s is not a valid URL: %v", config.RedactURL(jwksURI), err)
+		return fmt.Errorf("--jwks-uri %s is not a valid URL: %v", capability.RedactURLForLog(jwksURI), err)
 	}
 	switch strings.ToLower(u.Scheme) {
 	case "https":
@@ -1246,6 +1246,11 @@ func resolveOAuthMetadata(cfg *config.GatewayConfig, pf proxyFlags) (*transport.
 	if oauthResource == "" {
 		oauthResource = pf.oauthResource
 		oauthResourceLabel = "--oauth-resource"
+	} else if pf.oauthResource != "" && pf.oauthResource != oauthResource {
+		// The config wins, so the flag the operator typed has no effect. Say so rather
+		// than drop it silently — the same warning the audit-sink override emits when
+		// the config's audit block supersedes --audit-log / --audit-key-path.
+		fmt.Fprintf(os.Stderr, "[eunox] WARNING: --oauth-resource %q is overridden by the config's listen.oauthResource %q; the config takes precedence.\n", pf.oauthResource, oauthResource)
 	}
 	if err := validateOAuthURI(oauthResourceLabel, oauthResource, true); err != nil {
 		return nil, "", err
@@ -1262,6 +1267,10 @@ func resolveOAuthMetadata(cfg *config.GatewayConfig, pf proxyFlags) (*transport.
 	case len(cfg.Listen.OAuthAuthorizationServers) > 0:
 		oauthAuthzServers = cfg.Listen.OAuthAuthorizationServers
 		validateAuthz = true
+		if pf.oauthAuthzServer != "" {
+			// Same silent-override as the resource above: name the dropped flag.
+			fmt.Fprintf(os.Stderr, "[eunox] WARNING: --oauth-authz-server %q is overridden by the config's listen.oauthAuthorizationServers %v; the config takes precedence.\n", pf.oauthAuthzServer, oauthAuthzServers)
+		}
 	case pf.oauthAuthzServer != "":
 		oauthAuthzServers = []string{pf.oauthAuthzServer}
 		validateAuthz = true
@@ -1403,12 +1412,12 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 		// mcp.capabilities runs only when the experimental flag is on. With it off,
 		// identity-only tokens are validated and a token carrying mcp.capabilities is
 		// rejected, so claiming "intersecting" unconditionally would mislead operators.
-		// Redact before printing: some IdPs gate the JWKS endpoint behind a query key or
-		// basic-auth userinfo, and this banner goes to the same stderr the systemd journal,
-		// container logs, and the doctor bundle collect. config.RedactURL is the one
-		// redactor the upstream-URL log sites already use; the JWKS URI — the root of trust
-		// for token verification — must not be the exception.
-		safeJWKS := config.RedactURL(pf.jwksURI)
+		// Redact before printing: some IdPs gate the JWKS endpoint behind a query key, a
+		// path segment, or basic-auth userinfo, and this banner goes to the same stderr the
+		// systemd journal, container logs, and the doctor bundle collect.
+		// capability.RedactURLForLog is the redactor every stderr-bound URL site uses; the
+		// JWKS URI — the root of trust for token verification — must not be the exception.
+		safeJWKS := capability.RedactURLForLog(pf.jwksURI)
 		if pf.jwtExperimentalCaps {
 			fmt.Fprintf(os.Stderr, "[eunox] JWT PDP enabled (JWKS URI: %s); intersecting per-route manifests with experimental mcp.capabilities claims\n", safeJWKS)
 		} else {
@@ -1444,6 +1453,16 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 	oauthMeta, oauthMetaURL, err := resolveOAuthMetadata(cfg, pf)
 	if err != nil {
 		return err
+	}
+	// Publishing the metadata document announces "this resource is OAuth-protected;
+	// get a token from these authorization servers" — to any unauthenticated client,
+	// since the endpoint is unauthenticated by design. Without --jwks-uri the gateway
+	// validates no bearer token at all, so it would advertise a protection it does not
+	// enforce and a client would present a token that is never checked. Fail closed,
+	// the same way validateJWTFlagsRequireJWKS rejects every other JWT-adjacent flag
+	// set without a JWKS endpoint; these two --oauth-* flags were its only gap.
+	if oauthMeta != nil && gwJWTPDP == nil {
+		return fmt.Errorf("--oauth-resource / listen.oauthResource publishes RFC 9728 protected-resource metadata, but no bearer-token validation is configured: set --jwks-uri so presented tokens are actually verified, or remove the --oauth-* settings so the gateway does not advertise OAuth protection it cannot enforce")
 	}
 
 	// Generate a fresh loopback control token for POST /control/kill, written to a

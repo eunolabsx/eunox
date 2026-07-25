@@ -39,9 +39,9 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/eunolabs/eunox/internal/config"
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/pdp"
+	"github.com/eunolabs/eunox/pkg/capability"
 )
 
 // scrubURLError redacts the credentialed URL carried by a *url.Error (the error type
@@ -49,13 +49,15 @@ import (
 // formatting strips only the userinfo PASSWORD, leaving the userinfo username and the
 // entire query string (a ?api_key=/?token= credential) in the message — which then
 // reaches the live-probe's stderr and the paste-ready doctor support bundle. Replacing
-// the *url.Error with one whose URL is run through config.RedactURL closes that leak
-// while preserving the operation and the wrapped cause (so errors.Is/As still match).
-// A non-URL error is returned unchanged.
+// the *url.Error with one whose URL is run through capability.RedactURLForLog closes that
+// leak while preserving the operation and the wrapped cause (so errors.Is/As still match).
+// The log-facing redactor is the right one here rather than the bundle-facing
+// config.RedactURL: the URL is the upstream's, and for a webhook-style upstream the path
+// carries the secret. A non-URL error is returned unchanged.
 func scrubURLError(err error) error {
 	var ue *url.Error
 	if errors.As(err, &ue) {
-		return &url.Error{Op: ue.Op, URL: config.RedactURL(ue.URL), Err: ue.Err}
+		return &url.Error{Op: ue.Op, URL: capability.RedactURLForLog(ue.URL), Err: ue.Err}
 	}
 	return err
 }
@@ -282,7 +284,7 @@ func (p *HTTPProxy) newRemoteSession(ctx context.Context, route *UpstreamRoute, 
 	// and drift probe). See the matching comment in newSession.
 	sess.touchRequest()
 
-	fmt.Fprintf(os.Stderr, "[eunox] HTTP session %s started (remote: %s).\n", sess.id, config.RedactURL(route.upstreamURL))
+	fmt.Fprintf(os.Stderr, "[eunox] HTTP session %s started (remote: %s).\n", sess.id, capability.RedactURLForLog(route.upstreamURL))
 	return sess, nil
 }
 
