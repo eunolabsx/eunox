@@ -116,7 +116,10 @@ type JWKSCacheConfig struct {
 	JWKSURL string
 	// CacheTTL is how long a fetched JWKS is served from cache. Default: 5 minutes.
 	CacheTTL time.Duration
-	// Client is the HTTP client used for fetching. Default: 10s timeout.
+	// Client is the HTTP client used for fetching. Default: 10s timeout with redirects
+	// refused outright. Supplying a client replaces that redirect policy with whatever the
+	// client carries, so the cache additionally enforces the same-origin floor on the
+	// RESPONSE (see refuseCrossOriginResponse) — a supplied client cannot weaken it.
 	Client *http.Client
 	// Logger for operational messages. Default: slog.Default().
 	Logger *slog.Logger
@@ -161,7 +164,10 @@ func NewJWKSCache(cfg JWKSCacheConfig) *JWKSCache { //nolint:gocritic // hugePar
 	// mirroring the redirect refusal above), without failing construction so the CLI's
 	// explicit opt-out is not double-reported.
 	if u, err := url.Parse(cfg.JWKSURL); err == nil && u.Scheme == "http" && !IsLoopbackHost(u.Hostname()) {
-		cfg.Logger.Warn("JWKS URL uses plaintext http to a non-loopback host; the key set is the root of trust for token verification and is MITM-able over http — use https", slog.String("url", cfg.JWKSURL))
+		// Redact: some IdPs gate the JWKS endpoint behind a query key or basic-auth
+		// userinfo, and this attribute lands in whatever handler the consumer wired —
+		// commonly a JSON log shipped to a central store.
+		cfg.Logger.Warn("JWKS URL uses plaintext http to a non-loopback host; the key set is the root of trust for token verification and is MITM-able over http — use https", slog.String("url", RedactURLForLog(cfg.JWKSURL)))
 	}
 	return &JWKSCache{
 		jwksURI:  cfg.JWKSURL,
@@ -209,19 +215,40 @@ func (c *JWKSCache) GetKeys(ctx context.Context) (*jose.JSONWebKeySet, error) {
 	if c.jwks != nil && c.now().Sub(c.fetchedAt) < c.cacheTTL {
 		keys := c.jwks
 		c.mu.RUnlock()
-		return keys, nil
+		return copyKeySet(keys), nil
 	}
 	c.mu.RUnlock()
 	return c.Refresh(ctx)
 }
 
+// copyKeySet returns a set whose Keys SLICE is independent of the cached one, so a
+// caller appending to, reordering, or truncating the returned set cannot mutate the
+// shared cache other verifications are concurrently reading. Handing out the live
+// pointer made the cache's aliasing defense -- which FindKeys documents and applies --
+// bypassable by anyone who called GetKeys/Refresh directly.
+//
+// The copy is one level deep. Each jose.JSONWebKey still carries a Key interface{}
+// pointing at the same underlying *rsa.PublicKey / *ecdsa.PublicKey, so mutating a KEY'S
+// INTERNALS still reaches the cache; that is inherent to the type and is the same bound
+// FindKeys has. The realistic accident -- slice mutation -- is what this closes.
+func copyKeySet(set *jose.JSONWebKeySet) *jose.JSONWebKeySet {
+	if set == nil {
+		return nil
+	}
+	return &jose.JSONWebKeySet{Keys: append([]jose.JSONWebKey(nil), set.Keys...)}
+}
+
 // Refresh returns a fresh JWKS, respecting the cache TTL: if the cached copy is
-// still within TTL it is returned without an HTTP fetch. The returned set is the
-// cache's shared, READ-ONLY instance (see GetKeys) — copy through FindKeys before
-// holding or mutating.
+// still within TTL it is returned without an HTTP fetch.
+//
+// The returned set's Keys slice is independent of the cache's (see copyKeySet), so a
+// caller may hold, append to, or reorder it without disturbing concurrent verifications.
+// Handing out the live pointer made the aliasing defense FindKeys documents bypassable by
+// anyone calling this directly. Individual jose.JSONWebKey values still share their
+// underlying crypto key, so treat the KEYS themselves as read-only.
 func (c *JWKSCache) Refresh(ctx context.Context) (*jose.JSONWebKeySet, error) {
 	keys, _, err := c.refresh(ctx, false)
-	return keys, err
+	return copyKeySet(keys), err
 }
 
 // ForceRefreshForKID performs a rate-limited forced fetch (refresh(ctx, true)), but
@@ -605,6 +632,34 @@ type refreshResult struct {
 	changed bool
 }
 
+// refuseCrossOriginResponse fails closed unless resp was served by the host the cache was
+// configured to fetch from. net/http sets resp.Request to the LAST request in a redirect
+// chain, so this sees the final hop no matter how many redirects were followed or which
+// client followed them — which is the point: it is the one same-origin check that does not
+// depend on the caller's CheckRedirect being intact.
+//
+// The rule mirrors the CLI's redirect policy so the two layers cannot disagree: the
+// hostname must match, port and path may change (an IdP may relocate the key set within its
+// own host), and a hop between two loopback spellings (localhost <-> 127.0.0.1) is allowed
+// because it never leaves the machine and so has no on-path attacker surface.
+func (c *JWKSCache) refuseCrossOriginResponse(resp *http.Response) error {
+	if resp.Request == nil || resp.Request.URL == nil {
+		return nil // no final-URL information to compare (a stubbed transport in tests)
+	}
+	want, err := url.Parse(c.jwksURI)
+	if err != nil {
+		return fmt.Errorf("JWKS URI is not parseable: %w", err)
+	}
+	gotHost, wantHost := resp.Request.URL.Hostname(), want.Hostname()
+	if strings.EqualFold(gotHost, wantHost) {
+		return nil
+	}
+	if IsLoopbackHost(gotHost) && IsLoopbackHost(wantHost) {
+		return nil
+	}
+	return fmt.Errorf("JWKS response came from host %q, not the configured JWKS host %q; the key set is the root of trust for token verification and a redirect must not move it to another host", gotHost, wantHost)
+}
+
 func (c *JWKSCache) fetchKeys(ctx context.Context) (_ *jose.JSONWebKeySet, err error) {
 	// Every non-nil return below is a failure to obtain a usable key set; tag them all
 	// with ErrJWKSUnavailable in one place so the audit layer can tell a JWKS-infra
@@ -626,6 +681,20 @@ func (c *JWKSCache) fetchKeys(ctx context.Context) (_ *jose.JSONWebKeySet, err e
 		return nil, fmt.Errorf("JWKS request failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+
+	// Enforce the same-origin floor HERE, on the response, rather than relying on the
+	// client's CheckRedirect. The redirect refusal installed in NewJWKSCache applies only
+	// to the DEFAULT client, so any consumer supplying its own *http.Client — a natural
+	// thing to do for a proxy, a custom transport, or a different timeout — silently got
+	// Go's default redirect-following back, and an IdP open redirect could then substitute
+	// the key set and forge every token the proxy accepts. net/http rewrites
+	// resp.Request.URL to the FINAL hop, so comparing it to the configured URI catches any
+	// number of redirects regardless of which client was used, and needs no cooperation
+	// from the caller.
+	if err := c.refuseCrossOriginResponse(resp); err != nil {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+		return nil, err
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		// Drain the body before returning so net/http can reuse the keep-alive

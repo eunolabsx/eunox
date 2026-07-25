@@ -30,6 +30,13 @@ type healthSnapshot struct {
 	AuditWriteFailed  int64  `json:"auditWriteFailed"`  // records that reached the drainer but failed to write to disk
 	AuditConfigured   bool   `json:"auditConfigured"`   // false when the audit sink failed to open
 	KillSwitchHealthy bool   `json:"killSwitchHealthy"` // false when a Redis backend is degraded
+	// AuditMaintenanceStalled is true when rotation or retention pruning has stopped
+	// making progress. Records are still written and signed, so this is NOT an
+	// audit-integrity loss and does not gate traffic — it means the configured size /
+	// retention bound is currently unenforced and the log will grow until the underlying
+	// fault (an unlistable log directory, an undeletable rotated sibling) is fixed.
+	AuditMaintenanceStalled bool   `json:"auditMaintenanceStalled"`
+	AuditMaintenanceReason  string `json:"auditMaintenanceReason,omitempty"`
 }
 
 // snapshot gathers the current operational state (locked map reads plus atomic
@@ -46,6 +53,7 @@ func (p *HTTPProxy) snapshot() healthSnapshot {
 	if p.sink != nil {
 		snap.AuditDropped = p.sink.DroppedRecords()
 		snap.AuditWriteFailed = p.sink.WriteFailures()
+		snap.AuditMaintenanceStalled, snap.AuditMaintenanceReason = p.sink.MaintenanceStalled()
 	}
 	// A degraded kill switch (e.g. a Redis partition) flips status to "degraded".
 	// The operational consequence depends on the configured degraded mode, NOT a
@@ -61,6 +69,13 @@ func (p *HTTPProxy) snapshot() healthSnapshot {
 	// dropped records, or failed writes each mean the tamper-evident audit trail is
 	// incomplete — a readiness regression to alert on.
 	if !snap.AuditConfigured || snap.AuditDropped > 0 || snap.AuditWriteFailed > 0 {
+		snap.Status = "degraded"
+	}
+	// A stalled rotation/prune is a readiness regression too — the disk bound is not being
+	// enforced and the volume will fill — even though no record has been lost. It flips
+	// the reported status so an alert fires, but it is NOT part of AuditDegraded, so it
+	// never denies live traffic under --require-audit=strict.
+	if snap.AuditMaintenanceStalled {
 		snap.Status = "degraded"
 	}
 	return snap
@@ -124,4 +139,11 @@ func (p *HTTPProxy) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	wf("# HELP eunox_kill_switch_healthy Kill-switch backend health (1 = healthy, 0 = degraded).\n")
 	wf("# TYPE eunox_kill_switch_healthy gauge\n")
 	wf("eunox_kill_switch_healthy %d\n", killHealthy)
+	maintStalled := 0
+	if snap.AuditMaintenanceStalled {
+		maintStalled = 1
+	}
+	wf("# HELP eunox_audit_maintenance_stalled Audit rotation or retention pruning is not making progress (1 = stalled). No records are lost, but the configured size/retention bound is unenforced and the log will grow until the fault is fixed.\n")
+	wf("# TYPE eunox_audit_maintenance_stalled gauge\n")
+	wf("eunox_audit_maintenance_stalled %d\n", maintStalled)
 }

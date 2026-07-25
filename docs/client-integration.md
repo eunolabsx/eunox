@@ -159,12 +159,19 @@ eunox proxy --config gateway.yaml
 > not be committed. The value is substituted as literal data — never re-interpreted
 > as YAML — so a secret containing a `#`, `:`, or other YAML metacharacter is used
 > verbatim instead of silently truncating or blanking the field. A reference to an
-> unset variable is left untouched — never blanked. Note that a `$` is only literal
-> when it is *not* followed by a letter or `_`: `$-` or a trailing `$` survive, but
-> `$VAR` (and the `$word` inside `pa$$word`) is always treated as a reference, so a
-> value that must contain a literal `$name` substring should avoid an environment
-> variable of that name. There is no `$$` escape. Separately: a
-> gateway route with **no** `policy:`
+> unset variable is left untouched — never blanked. A `$` followed by anything other
+> than a letter, `_`, `{`, or `$` is already literal (`$-`, `$5`, a trailing `$`), and
+> **`$$` is the escape for a literal `$`**: write `pa$$word` to mean the eight
+> characters `pa$word`. Escaping consumes both `$` characters, so the identifier after
+> it is *not* expanded.
+>
+> *Migration:* `$$` previously had no special meaning, so `pa$$word` expanded its
+> second `$word` whenever an unrelated variable named `word` happened to be set —
+> silently substituting a value you never chose into a credential. If a config value
+> of yours contains a literal `$$`, double each one (`$$` becomes `$$$$`); if it
+> contained `$name` and relied on that variable being unset, escape it as `$$name`.
+>
+> Separately: a gateway route with **no** `policy:`
 > **fails closed at startup** — the gateway refuses to start — unless it runs in
 > `enforcement: audit` mode, where allow-and-forward (observe-only) is your
 > declared posture.

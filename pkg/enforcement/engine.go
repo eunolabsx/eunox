@@ -777,9 +777,11 @@ func (e *Engine) commitDeferredAtomic(ctx context.Context, req *capability.Enfor
 			skipped++
 			continue
 		}
-		if condErr != nil {
-			return denyFromConditionError(condErr, matched, requestID, now)
-		}
+		// No second condErr check here: the one above the skip branch already returned for
+		// every non-nil condErr, so a duplicate would be unreachable — and an unreachable
+		// twin of a load-bearing ordering rule is worse than none, because it makes the
+		// earlier check look redundant and invites a future "dedupe" that deletes the
+		// reachable one and silently restores the discarded-validation-error fail-open.
 		keys[i], windowSecs[i], limits[i], denies[i] = commit.Key, commit.WindowSecs, commit.Limit, commit.Deny
 	}
 

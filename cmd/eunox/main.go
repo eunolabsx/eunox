@@ -99,7 +99,7 @@ func run(args []string) int {
 		cmdDoctor()
 	case "version", "--version", "-version":
 		cmdVersion()
-	case "--help", "-h", "help":
+	case "--help", "-help", "-h", "help":
 		// An explicit help request is a successful query: usage to stdout, exit 0.
 		printUsage(os.Stdout)
 	default:
@@ -1002,6 +1002,15 @@ func validateJWTAudienceConfig(jwksURI, jwtAudience string, allowAnyAudience boo
 	if strings.TrimSpace(jwtAudience) == "" && !allowAnyAudience {
 		return fmt.Errorf(`--jwks-uri requires --jwt-audience (the expected "aud" claim) so a token minted for another service cannot be replayed against eunox; pass --jwt-allow-any-audience to accept any audience (not recommended)`)
 	}
+	// A PADDED audience is as broken as an empty one, and worse to diagnose: it survives
+	// the trim check above and is then stored and compared VERBATIM against a token's
+	// "aud", so it matches nothing and every call on every route is denied with an opaque
+	// AUTHORIZATION_FAILED. A trailing space is easy to acquire from a shell heredoc or a
+	// YAML block scalar. The manifest loader already refuses the same shape on its own
+	// 'audience' field; the flag must not be the looser leg.
+	if jwtAudience != strings.TrimSpace(jwtAudience) {
+		return fmt.Errorf("--jwt-audience %q has leading or trailing whitespace; the audience is matched verbatim against a token's \"aud\" claim, so this value would never match and would silently deny every call", jwtAudience)
+	}
 	return nil
 }
 
@@ -1093,7 +1102,14 @@ func validateJWKSURIScheme(jwksURI string, allowInsecure bool) error {
 	}
 	u, err := url.Parse(jwksURI)
 	if err != nil {
-		return fmt.Errorf("--jwks-uri is not a valid URL: %w", err)
+		// url.Parse returns a *url.Error whose Error() embeds the raw input, so wrapping it
+		// with %w would print a credentialed JWKS URI in full at startup. Report the
+		// redacted URL and the parse reason separately.
+		var uerr *url.Error
+		if errors.As(err, &uerr) {
+			return fmt.Errorf("--jwks-uri %s is not a valid URL: %v", config.RedactURL(jwksURI), uerr.Err)
+		}
+		return fmt.Errorf("--jwks-uri %s is not a valid URL: %v", config.RedactURL(jwksURI), err)
 	}
 	switch strings.ToLower(u.Scheme) {
 	case "https":
@@ -1307,13 +1323,10 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 	if bind == "" {
 		bind = "127.0.0.1"
 	}
-	// Compare on the PARSED address, not the string: net.Listen accepts every
-	// spelling of the unspecified (all-interfaces) address — "0.0.0.0", "::", "::0",
-	// "0:0:0:0:0:0:0:0" — so a literal "0.0.0.0"/"::" match silently let the
-	// alternate IPv6 spellings bypass the exposure guard. IsUnspecified() catches
-	// them all uniformly.
+	// bindExposesAllInterfaces catches every spelling net.Listen resolves to the
+	// unspecified address, including the ones net.ParseIP alone does not.
 	bindHost := strings.TrimSuffix(strings.TrimPrefix(bind, "["), "]")
-	if ip := net.ParseIP(bindHost); ip != nil && ip.IsUnspecified() {
+	if bindExposesAllInterfaces(bindHost) {
 		if !pf.unsafeBindAll {
 			return fmt.Errorf("gateway bind %q exposes the proxy to all network interfaces; pass --unsafe-bind-all to proceed", bind)
 		}
@@ -1390,10 +1403,16 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 		// mcp.capabilities runs only when the experimental flag is on. With it off,
 		// identity-only tokens are validated and a token carrying mcp.capabilities is
 		// rejected, so claiming "intersecting" unconditionally would mislead operators.
+		// Redact before printing: some IdPs gate the JWKS endpoint behind a query key or
+		// basic-auth userinfo, and this banner goes to the same stderr the systemd journal,
+		// container logs, and the doctor bundle collect. config.RedactURL is the one
+		// redactor the upstream-URL log sites already use; the JWKS URI — the root of trust
+		// for token verification — must not be the exception.
+		safeJWKS := config.RedactURL(pf.jwksURI)
 		if pf.jwtExperimentalCaps {
-			fmt.Fprintf(os.Stderr, "[eunox] JWT PDP enabled (JWKS URI: %s); intersecting per-route manifests with experimental mcp.capabilities claims\n", pf.jwksURI)
+			fmt.Fprintf(os.Stderr, "[eunox] JWT PDP enabled (JWKS URI: %s); intersecting per-route manifests with experimental mcp.capabilities claims\n", safeJWKS)
 		} else {
-			fmt.Fprintf(os.Stderr, "[eunox] JWT PDP enabled (JWKS URI: %s); enforcing per-route manifests (experimental mcp.capabilities intersection disabled; pass --jwt-experimental-capabilities to enable)\n", pf.jwksURI)
+			fmt.Fprintf(os.Stderr, "[eunox] JWT PDP enabled (JWKS URI: %s); enforcing per-route manifests (experimental mcp.capabilities intersection disabled; pass --jwt-experimental-capabilities to enable)\n", safeJWKS)
 		}
 		gwJWTPDP, err = transport.WrapRoutesWithJWT(routes, pdp.JWTPDPOptions{
 			JWKSURI:                  pf.jwksURI,
@@ -1818,8 +1837,9 @@ func reportRouteOutcome(wf func(string, ...interface{}), wln func(...interface{}
 // manifest(s) and — when live is set — introspecting the declared upstream and
 // reporting drift. A no-policy route the proxy would refuse to start is reported
 // FAIL and skipped (never introspected, since the upstream would never serve); a
-// valid no-policy route (audit/wiretap or allow-all passthrough) is introspected
-// under --live for visibility but contributes no drift findings.
+// valid no-policy route -- which on a gateway means audit/wiretap mode ONLY, since a
+// policyless enforce route is refused at startup -- is introspected under --live for
+// visibility but contributes no drift findings.
 //
 // Exit code is the maximum across routes: 0 clean, 1 drift, 2 parse/connection
 // failure.
@@ -1923,6 +1943,71 @@ func fetchRouteLive(ctx context.Context, u *config.UpstreamConfig) (LiveUpstream
 // init subcommand
 // -----------------------------------------------------------------
 
+// bindExposesAllInterfaces reports whether bindHost (already stripped of any surrounding
+// IPv6 brackets) will make the listener accept connections on every interface.
+//
+// Comparing the PARSED address rather than the string catches every IP-literal spelling of
+// the unspecified address uniformly — "0.0.0.0", "::", "::0", "0:0:0:0:0:0:0:0" — which a
+// literal "0.0.0.0"/"::" string match does not.
+//
+// But net.ParseIP is not the whole grammar the RESOLVER accepts. "0" and hex/octal
+// shorthands like "0x0" or "00" are not Go IP literals, so ParseIP returns nil and the
+// guard was skipped entirely — yet on a cgo-resolver build getaddrinfo("0") resolves to
+// 0.0.0.0 and the listener binds every interface with no --unsafe-bind-all and no warning.
+// A host that is entirely numeric (optionally 0x/0-prefixed) is an inet_aton-style integer
+// address, not a DNS name, so it is decoded here rather than trusted to ParseIP. A value
+// of zero is the unspecified address.
+//
+// Deliberately no DNS lookup: resolving an operator-supplied name at startup would be
+// background network activity for a check that must work offline, and a NAME that resolves
+// to 0.0.0.0 is not a shape any real deployment uses.
+func bindExposesAllInterfaces(bindHost string) bool {
+	if ip := net.ParseIP(bindHost); ip != nil {
+		return ip.IsUnspecified()
+	}
+	if bindHost == "" {
+		// An empty host in "host:port" means all interfaces to net.Listen.
+		return true
+	}
+	// inet_aton-style integer form: strconv handles the 0x / 0o / leading-0 octal bases
+	// the resolver accepts. Any parse failure means this is a name, not an integer.
+	if n, err := strconv.ParseUint(bindHost, 0, 64); err == nil {
+		return n == 0
+	}
+	return false
+}
+
+// refuseNonRegularOutput fails closed unless path is a regular file or genuinely absent.
+//
+// It guards every writer that truncates an operator-supplied destination. O_EXCL refuses to
+// follow a symlink for free, so a create-only write needs nothing; the moment a writer drops
+// O_EXCL for O_TRUNC (an --output overwrite, the doctor bundle) it will happily follow an
+// attacker-planted link at that path and truncate the link's TARGET — and any subsequent
+// fd Chmod re-modes that target too. A shared, world-writable directory is enough.
+//
+// Lstat does not follow the final path component, so this inspects the link itself. A
+// missing path is fine (the caller is about to create it). Any OTHER stat error is an
+// error, not an implicit "not a symlink": gating the refusal on "stat succeeded" would let
+// a stat fault skip the check, which is the fail-open direction this exists to prevent.
+// internal/audit's rotate.go applies the same rule to the audit log; this is its
+// cmd/eunox twin, kept separate because the audit one is unexported to that package.
+func refuseNonRegularOutput(path string) error {
+	fi, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("checking %q before overwrite: %w", path, err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%q is a symbolic link; refusing to follow it and overwrite its target — remove the link or choose a different path", path)
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("%q is not a regular file; refusing to overwrite it", path)
+	}
+	return nil
+}
+
 // writeGeneratedFile writes content to path at mode 0600, refusing to clobber a
 // pre-existing file unless force is set. It closes two gaps in a plain
 // os.WriteFile(path, …, 0o600): (1) O_CREATE applies the mode only on CREATION, so a
@@ -1935,6 +2020,9 @@ func fetchRouteLive(ctx context.Context, u *config.UpstreamConfig) (LiveUpstream
 func writeGeneratedFile(path, content string, force bool) (err error) {
 	flags := os.O_WRONLY | os.O_CREATE | os.O_EXCL
 	if force {
+		if err := refuseNonRegularOutput(path); err != nil {
+			return err
+		}
 		flags = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
 	}
 	f, err := os.OpenFile(path, flags, 0o600) //nolint:gosec // G304: path is an operator-provided --output/--config-output location, and 0600 is the intended restrictive mode
@@ -2804,7 +2892,7 @@ func writeDenialTable(w io.Writer, denials map[denialKey]int) {
 		}
 		return rows[i].code < rows[j].code
 	})
-	wf("%-30s  %-30s  %s\n", "TOOL", "CODE", "COUNT")
+	wf("%-30s  %-30s  %s\n", "TARGET", "CODE", "COUNT")
 	wln(strings.Repeat("-", 72))
 	for _, r := range rows {
 		wf("%-30s  %-30s  %d\n", r.tool, r.code, r.count)

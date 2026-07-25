@@ -52,7 +52,7 @@ func TestScanHighestSeq_ReportsMax(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	logPath, _ := writeChainLog(t, dir, "a", "b", "c") // records seq 1, 2, 3
-	got, ok := scanHighestSeq(logPath)
+	got, ok := seqViewForTest(logPath)
 	if !ok || got != 3 {
 		t.Fatalf("scanHighestSeq = (%d, %v), want (3, true)", got, ok)
 	}
@@ -64,16 +64,16 @@ func TestScanHighestSeq_AbsentOrEmpty(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 
-	if got, ok := scanHighestSeq(filepath.Join(dir, "absent.jsonl")); ok || got != 0 {
-		t.Fatalf("scanHighestSeq(absent) = (%d, %v), want (0, false)", got, ok)
+	if got, ok := seqViewForTest(filepath.Join(dir, "absent.jsonl")); ok || got != 0 {
+		t.Fatalf("seqViewForTest(absent) = (%d, %v), want (0, false)", got, ok)
 	}
 
 	empty := filepath.Join(dir, "empty.jsonl")
 	if err := os.WriteFile(empty, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if got, ok := scanHighestSeq(empty); ok || got != 0 {
-		t.Fatalf("scanHighestSeq(empty) = (%d, %v), want (0, false)", got, ok)
+	if got, ok := seqViewForTest(empty); ok || got != 0 {
+		t.Fatalf("seqViewForTest(empty) = (%d, %v), want (0, false)", got, ok)
 	}
 }
 
@@ -96,7 +96,7 @@ func TestScanHighestSeq_UnreadableBaseOverEstimates(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(logPath, 0o600) })
 
-	got, ok := scanHighestSeq(logPath)
+	got, ok := seqViewForTest(logPath)
 	if !ok {
 		t.Fatal("scanHighestSeq on an unreadable non-empty base must report ok=true (over-estimate), not (0, false)")
 	}
@@ -122,7 +122,7 @@ func TestScanHighestSeq_SkipsUnparseableLines(t *testing.T) {
 	}
 	_ = f.Close()
 
-	got, ok := scanHighestSeq(logPath)
+	got, ok := seqViewForTest(logPath)
 	if !ok || got != 2 {
 		t.Fatalf("scanHighestSeq with a corrupt tail = (%d, %v), want (2, true)", got, ok)
 	}
@@ -230,7 +230,7 @@ func TestScanHighestSeq_ReadsPastLargeLineInOnePass(t *testing.T) {
 	}
 	fileSize := uint64(info.Size())
 
-	got, ok := scanHighestSeq(logPath)
+	got, ok := seqViewForTest(logPath)
 	if !ok {
 		t.Fatalf("scanHighestSeq = (%d, false), want ok=true", got)
 	}
@@ -273,7 +273,7 @@ func TestScanHighestSeqCapped_OverCapLineOverEstimates(t *testing.T) {
 	}
 	fileSize := uint64(info.Size())
 
-	got, ok := scanHighestSeqCapped(logPath, bufCap)
+	got, ok := seqViewForTestCapped(logPath, bufCap)
 	if !ok {
 		t.Fatalf("scanHighestSeqCapped over-cap = (%d, false), want ok=true (over-estimate)", got)
 	}
@@ -297,7 +297,7 @@ func TestScanHighestSeq_CleanReadReportsTrueMax(t *testing.T) {
 	if err := os.WriteFile(logPath, []byte(`{"seq":1}`+"\n"+`{"seq":7}`+"\n"+`{"seq":4}`+"\n"), 0o600); err != nil {
 		t.Fatalf("write log: %v", err)
 	}
-	got, ok := scanHighestSeq(logPath)
+	got, ok := seqViewForTest(logPath)
 	if !ok || got != 7 {
 		t.Fatalf("scanHighestSeq = (%d, %v), want (7, true)", got, ok)
 	}
@@ -307,7 +307,32 @@ func TestScanHighestSeq_CleanReadReportsTrueMax(t *testing.T) {
 	if err := os.WriteFile(emptyPath, []byte("\n\n"), 0o600); err != nil {
 		t.Fatalf("write blank log: %v", err)
 	}
-	if h, ok := scanHighestSeq(emptyPath); ok || h != 0 {
-		t.Fatalf("scanHighestSeq(recordless) = (%d, %v), want (0, false)", h, ok)
+	if h, ok := seqViewForTest(emptyPath); ok || h != 0 {
+		t.Fatalf("seqViewForTest(recordless) = (%d, %v), want (0, false)", h, ok)
 	}
+}
+
+// seqViewForTest and seqViewForTestCapped reproduce the SINGLE-FILE "max of the highest
+// parsed seq and the file's unread byte size" view these tests were written against.
+//
+// They live here, not in the package, because production does not use that rule: it folds
+// the unread byte size ADDITIVELY across the whole chain (highestSeqAcrossChainCapped),
+// precisely because one file's byte count is not a global seq and taking a per-file
+// maximum under-seeds once the chain seq outgrows a sidecar's size. The package used to
+// ship these two wrappers with no production caller at all, kept alive only by this file
+// — dead code encoding the rule the real path rejects, with a green test suite pinning it,
+// which is exactly how a future contributor concludes max-of-file-size is the house rule
+// and reuses it for a new resume path. The scanning behavior below (parses records, skips
+// unparseable lines, over-estimates on an unreadable file, reads past an over-cap line) is
+// scanSeqContribution's and is what these tests actually cover.
+func seqViewForTest(path string) (uint64, bool) {
+	return seqViewForTestCapped(path, rescanBufferBytes)
+}
+
+func seqViewForTestCapped(path string, bufCap int) (uint64, bool) {
+	parsedMax, parsed, unreadBytes := scanSeqContribution(path, bufCap)
+	if unreadBytes > parsedMax {
+		return unreadBytes, true
+	}
+	return parsedMax, parsed
 }

@@ -399,8 +399,8 @@ boundary.
 beside `/control/kill` (same on-host-only guard — never reachable off the box):
 
 ```bash
-curl -s localhost:3000/healthz   # {"status":"ok"|"degraded", sessions, auditDropped, auditWriteFailed, killSwitchHealthy, ...}
-curl -s localhost:3000/metrics   # Prometheus text: eunox_active_sessions, eunox_audit_dropped_records_total, eunox_audit_write_failures_total, …
+curl -s localhost:3000/healthz   # {"status":"ok"|"degraded", sessions, auditDropped, auditWriteFailed, auditMaintenanceStalled, killSwitchHealthy, ...}
+curl -s localhost:3000/metrics   # Prometheus text: eunox_active_sessions, eunox_audit_dropped_records_total, eunox_audit_write_failures_total, eunox_audit_maintenance_stalled, …
 ```
 
 `eunox_audit_dropped_records_total` and `eunox_audit_write_failures_total` are the
@@ -413,6 +413,18 @@ the file itself is failing, and a persistent failure also makes the process exit
 non-zero when the audit sink closes. Either way audit coverage is being lost —
 page on it. `killSwitchHealthy` / `eunox_kill_switch_healthy` go to `0` when a
 Redis kill-switch backend is degraded (see below).
+
+`eunox_audit_maintenance_stalled` / `auditMaintenanceStalled` is a third,
+different signal: `1` means size-triggered rotation or retention pruning has
+stopped making progress — the log directory cannot be listed, or the oldest
+rotated file cannot be deleted. **No records are lost**, so this deliberately
+does not gate traffic the way the two counters above feed
+`--require-audit=strict`. What it means is that `audit.rotateSizeBytes` and
+`audit.retainRotated` are currently unenforced and the log will grow until the
+underlying fault is fixed — at which point the volume fills, writes *do* start
+failing, and strict mode denies everything. Alert on it as a disk-capacity
+warning, not an audit-integrity one; `auditMaintenanceReason` on `/healthz`
+names the file or directory to fix.
 
 **Multiple instances need Redis.** The call-counter (`maxCalls`) and kill-switch
 state are in-memory and **per-process** by default. Run more than one instance

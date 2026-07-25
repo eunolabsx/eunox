@@ -1654,6 +1654,23 @@ func filterListResult(resultBytes json.RawMessage, fieldName string, keep func(j
 // filtered */list response away from the upstream's field order. Returns an error
 // unless b is exactly one JSON object (matching json.Unmarshal, trailing data is
 // rejected) so callers fail closed on anything else.
+//
+// Top-level keys are additionally required to be unambiguous under Unicode simple
+// fold, and a fold collision is an error. This is load-bearing rather than hygiene:
+// encodeOrderedObjectWithList substitutes the pruned array for the list key alone and
+// re-emits every SIBLING key's bytes verbatim, so an envelope carrying both "tools"
+// and "Tools" would ship the unfiltered sibling array straight through the filter —
+// past every ListFilterer, including the fail-closed no-policy default. Go's decoder
+// (and any reader binding keys case-insensitively: the Go MCP SDK, .NET with
+// PropertyNameCaseInsensitive) resolves both to one field and keeps the LAST in
+// document order, i.e. the array the proxy never pruned. Refusing the envelope is a
+// denial, not a bypass, which is the direction this proxy fails.
+//
+// The fold is capability.FoldJSONKey, the same rule scanToolEntry applies to a tool
+// entry's top-level keys and rejectDuplicateJSONKeys applies to request params, so the
+// three layers cannot drift. It applies at the TOP level only: nested entry schemas
+// decode into map[string]interface{}, whose keys are exact, and sibling properties
+// "Name"/"name" inside a schema are legal and honest (see scanToolEntry).
 func decodeOrderedObject(b []byte) (keys []string, values map[string]json.RawMessage, err error) {
 	dec := json.NewDecoder(bytes.NewReader(b))
 	tok, err := dec.Token()
@@ -1664,6 +1681,9 @@ func decodeOrderedObject(b []byte) (keys []string, values map[string]json.RawMes
 		return nil, nil, fmt.Errorf("list result is not a JSON object")
 	}
 	values = make(map[string]json.RawMessage)
+	// folded maps a fold-canonical key to the first raw spelling seen under it, so a
+	// collision can name both spellings in the error.
+	folded := make(map[string]string)
 	for dec.More() {
 		keyTok, err := dec.Token()
 		if err != nil {
@@ -1677,6 +1697,11 @@ func decodeOrderedObject(b []byte) (keys []string, values map[string]json.RawMes
 		if err := dec.Decode(&raw); err != nil {
 			return nil, nil, err
 		}
+		fk := capability.FoldJSONKey(key)
+		if prior, dup := folded[fk]; dup {
+			return nil, nil, fmt.Errorf("list envelope carries ambiguous top-level keys %q and %q (they differ only by case fold, so a host may render a different value than this proxy filtered)", prior, key)
+		}
+		folded[fk] = key
 		if _, dup := values[key]; !dup {
 			keys = append(keys, key)
 		}
@@ -1801,6 +1826,11 @@ func replaceOrderedListField(envelope json.RawMessage, fieldName string, entries
 // still be advertised. Fails closed to an empty list on error.
 func filterResourcesListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims map[string]interface{}) ListFilterResult {
 	return filterListResult(resultBytes, listKeyResources, func(raw json.RawMessage) (bool, string) {
+		// Same entry-ambiguity gate tools/list applies; here the smuggled key is "uri"
+		// vs "URI", which decides which resource the host believes it is reading.
+		if entryKeysAmbiguous(raw) {
+			return false, ""
+		}
 		var entry struct {
 			URI string `json:"uri"`
 		}
@@ -1850,7 +1880,18 @@ type toolEntryScan struct {
 	// names holds every top-level name value the entry carries (more than one only when
 	// the key is duplicated). It bounds which pins the entry could impersonate, so a
 	// malformed entry poisons only those rather than every pin on the route.
+	//
+	// Only meaningful when namesComplete is set: see below.
 	names []string
+	// namesComplete reports that the scan walked the WHOLE entry, so names is the full
+	// set of names it could present. When false the scan aborted partway (malformed
+	// tokens, a non-string key, or a value nested past the depth bound) and names holds
+	// only what had been seen so far -- which may be nothing at all, since a tool entry is
+	// free to place its deep "inputSchema" BEFORE its "name". Treating that truncated list
+	// as authoritative poisons a subset of the pins the entry could impersonate, and often
+	// the empty set, so an aborted scan must poison every pin instead: the set of pins an
+	// unreadable entry could be impersonating is unknown, not empty.
+	namesComplete bool
 }
 
 // scanToolEntry decides whether a tools/list entry's bytes can be trusted, and collects
@@ -1876,8 +1917,27 @@ type toolEntryScan struct {
 // captures a value's bytes through the scanner without converting them, so a
 // float64-overflowing number (1e999) cannot error the walk and shield a later duplicate —
 // and it needs no UseNumber. Any malformed or over-deep input reports untrustworthy.
+// The walk is a SINGLE streaming pass with an explicit frame stack, not a recursion that
+// re-decodes each sub-value: decoding every value into a json.RawMessage and recursing on
+// those same bytes copies them once per level of nesting, making the scan O(bytes x depth)
+// on a path that runs for every entry of every tools/list. With maxDuplicateKeyScanDepth
+// at 512 that let one hostile entry cost hundreds of megabytes of transient garbage. The
+// stack form is O(bytes), and it mirrors mcp.rejectDuplicateJSONKeys, which walks request
+// params the same way.
 func scanToolEntry(raw json.RawMessage) toolEntryScan {
+	// frame tracks one open composite. seen is allocated lazily: most nested objects in a
+	// tool schema are small, and an empty-object-heavy payload should not cost a map
+	// header per object.
+	type frame struct {
+		object    bool
+		seen      map[string]struct{}
+		expectKey bool
+	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
+	// UseNumber so a float64-overflowing literal (1e999) inside a schema yields a
+	// json.Number instead of erroring the walk, which would otherwise report a valid
+	// entry untrustworthy (and, worse, shield a later duplicate behind that error).
+	dec.UseNumber()
 	tok, err := dec.Token()
 	if err != nil {
 		return toolEntryScan{untrustworthy: true}
@@ -1886,102 +1946,101 @@ func scanToolEntry(raw json.RawMessage) toolEntryScan {
 		return toolEntryScan{untrustworthy: true} // not a JSON object
 	}
 	var out toolEntryScan
-	seen := make(map[string]struct{})
-	for dec.More() {
-		keyTok, err := dec.Token()
-		if err != nil {
-			return toolEntryScan{untrustworthy: true}
-		}
-		key, ok := keyTok.(string)
-		if !ok {
-			return toolEntryScan{untrustworthy: true}
-		}
-		// Fold at the top level only (see the doc comment). capability.FoldJSONKey, not
-		// strings.ToLower: ToLower leaves an already-lower-case case variant such as U+017F
-		// ("deſcription") distinct from "description", so the collision the decoder makes
-		// would go unseen here and the entry would clear the scan.
-		folded := capability.FoldJSONKey(key)
-		if _, dup := seen[folded]; dup {
-			out.untrustworthy = true
-		}
-		seen[folded] = struct{}{}
-
-		var value json.RawMessage
-		if err := dec.Decode(&value); err != nil {
-			return toolEntryScan{untrustworthy: true}
-		}
-		if folded == jsonKeyNameFolded {
-			var n string
-			if err := json.Unmarshal(value, &n); err == nil && n != "" {
-				out.names = append(out.names, n)
-			}
-		}
-		if !out.untrustworthy {
-			dup, err := nestedHasDuplicateKey(value, 1)
-			if err != nil || dup {
-				out.untrustworthy = true
-			}
+	stack := []frame{{object: true, expectKey: true}}
+	// pendingName is set when the value about to be read is the ENTRY's top-level name
+	// value, so the names it could present to a host can be collected in the same pass.
+	pendingName := false
+	markValueDone := func() {
+		if n := len(stack); n > 0 && stack[n-1].object {
+			stack[n-1].expectKey = true
 		}
 	}
+	// Every abort below returns `out` rather than a fresh zero value, so names already
+	// collected survive -- and leaves namesComplete false, so the caller knows the list is
+	// truncated and widens the poison accordingly.
+	for len(stack) > 0 {
+		tok, err := dec.Token()
+		if err != nil {
+			out.untrustworthy = true
+			return out
+		}
+		if d, ok := tok.(json.Delim); ok {
+			switch d {
+			case '{', '[':
+				if len(stack) >= maxDuplicateKeyScanDepth {
+					out.untrustworthy = true // pathologically deep
+					return out
+				}
+				stack = append(stack, frame{object: d == '{', expectKey: d == '{'})
+				pendingName = false
+			default: // '}' or ']'
+				stack = stack[:len(stack)-1]
+				markValueDone()
+			}
+			continue
+		}
+		n := len(stack)
+		if stack[n-1].object && stack[n-1].expectKey {
+			key, ok := tok.(string)
+			if !ok {
+				out.untrustworthy = true
+				return out
+			}
+			// Fold at the TOP level only (see the doc comment). capability.FoldJSONKey,
+			// not strings.ToLower: ToLower leaves an already-lower-case case variant such
+			// as U+017F ("deſcription") distinct from "description", so the collision the
+			// decoder makes would go unseen and the entry would clear the scan.
+			canon := key
+			if n == 1 {
+				canon = capability.FoldJSONKey(key)
+			}
+			if stack[n-1].seen == nil {
+				stack[n-1].seen = make(map[string]struct{})
+			}
+			if _, dup := stack[n-1].seen[canon]; dup {
+				out.untrustworthy = true
+			}
+			stack[n-1].seen[canon] = struct{}{}
+			stack[n-1].expectKey = false
+			pendingName = n == 1 && canon == jsonKeyNameFolded
+			continue
+		}
+		if pendingName {
+			if s, ok := tok.(string); ok && s != "" {
+				out.names = append(out.names, s)
+			}
+			pendingName = false
+		}
+		markValueDone()
+	}
+	// The stack unwound to empty: the whole entry was walked, so names is authoritative.
+	out.namesComplete = true
 	return out
 }
 
-// nestedHasDuplicateKey reports whether raw, or anything nested within it, is an object
-// carrying the same key twice, compared EXACTLY (see scanToolEntry for why nested keys are
-// not folded). Errors are surfaced so the caller fails closed.
-func nestedHasDuplicateKey(raw json.RawMessage, depth int) (bool, error) {
-	if depth > maxDuplicateKeyScanDepth {
-		return true, nil // fail closed on a pathologically deep value
-	}
-	trimmed := bytes.TrimLeft(raw, " \t\r\n")
-	if len(trimmed) == 0 {
-		return false, nil
-	}
-	switch trimmed[0] {
-	case '{':
-		dec := json.NewDecoder(bytes.NewReader(trimmed))
-		if _, err := dec.Token(); err != nil { // consume '{'
-			return false, err
-		}
-		seen := make(map[string]struct{})
-		for dec.More() {
-			keyTok, err := dec.Token()
-			if err != nil {
-				return false, err
-			}
-			key, ok := keyTok.(string)
-			if !ok {
-				return false, nil
-			}
-			var value json.RawMessage
-			if err := dec.Decode(&value); err != nil {
-				return false, err
-			}
-			if _, dup := seen[key]; dup {
-				return true, nil
-			}
-			seen[key] = struct{}{}
-			nested, err := nestedHasDuplicateKey(value, depth+1)
-			if err != nil || nested {
-				return nested, err
-			}
-		}
-		return false, nil
-	case '[':
-		var elems []json.RawMessage
-		if err := json.Unmarshal(trimmed, &elems); err != nil {
-			return false, err
-		}
-		for _, e := range elems {
-			nested, err := nestedHasDuplicateKey(e, depth+1)
-			if err != nil || nested {
-				return nested, err
-			}
-		}
-		return false, nil
-	default:
-		return false, nil // a scalar carries no keys
-	}
+// entryKeysAmbiguous reports whether a */list entry's own bytes could decode to a
+// different surface than a host renders — the fail-closed gate every list filter applies
+// per entry, independent of whether the manifest pins a descriptionHash. It is
+// scanToolEntry's verdict without the pin-attribution names; tools, resources, and prompts
+// all share it so an entry-poisoning shape cannot be closed on one list flavor and left
+// open on the other two.
+func entryKeysAmbiguous(raw json.RawMessage) bool {
+	return scanToolEntry(raw).untrustworthy
+}
+
+// EntryKeysAmbiguous is the exported form of the per-entry ambiguity gate, for the startup
+// drift check.
+//
+// The drift comparison is the layer that verifies live tool descriptions against the
+// manifest's descriptionHash pin and refuses the session on a mismatch, so it consumes the
+// same bytes for the same security question as the runtime list filter — and decoding them
+// with a plain json.Unmarshal let exactly the shape this detects through: an entry carrying
+// "description" alongside "deſcription" (U+017F, already lower case) binds the second to
+// the struct field, hashes CLEAN against the pin, and the unconditionally-fatal startup
+// refusal never fires, while a case-sensitive host renders the injected value. Exporting
+// the check rather than restating it keeps the two layers on one rule.
+func EntryKeysAmbiguous(raw json.RawMessage) bool {
+	return entryKeysAmbiguous(raw)
 }
 
 // recordPinnedToolHash records entry's live description hash iff its NAME is pinned by
@@ -2048,9 +2107,12 @@ func (p *ManifestPDP) RecordObservedToolHashes(_ context.Context, result json.Ra
 //
 // What fails closed, and how widely:
 //   - An entry whose bytes are untrustworthy (scanToolEntry: a duplicate or case-variant
-//     top-level key, a duplicate nested in a hashed description, malformed or over-deep
-//     bytes) poisons only the pinned names THAT ENTRY could present — never the whole
-//     route, so an unrelated malformed entry cannot disable pins it never named.
+//     top-level key, or a duplicate nested in a hashed description) poisons only the pinned
+//     names THAT ENTRY could present — never the whole route, so an unrelated malformed
+//     entry cannot disable pins it never named. That narrowing holds only when the scan
+//     actually enumerated the entry's names; an entry whose bytes ABORTED the scan
+//     (malformed tokens, a non-string key, nesting past the depth bound) has an unknown
+//     name set, not an empty one, so it poisons every pin.
 //   - An entry that will not decode into the hashed surface poisons just its own pin.
 //   - An ambiguous ENVELOPE — undecodable, an undecodable tools array, or a duplicate or
 //     case-variant "tools" key (Go keeps one array while a host may render the other) —
@@ -2099,6 +2161,16 @@ func (p *ManifestPDP) armPinsFromToolsList(result json.RawMessage) (entryCount i
 	for _, raw := range entries {
 		scan := scanToolEntry(raw)
 		if scan.untrustworthy {
+			if !scan.namesComplete {
+				// The scan aborted before walking the whole entry, so its name list is
+				// truncated and may be EMPTY -- a tool entry is free to put a deep
+				// inputSchema before its name. Poisoning that subset would poison nothing
+				// for exactly the entry that defeated the scan, leaving the pin unarmed on
+				// an audit route where this pass is the only thing arming it. The pins an
+				// unreadable entry could be impersonating are unknown, not none.
+				p.poisonAllPinned()
+				continue
+			}
 			p.poisonCandidates(scan.names)
 			continue
 		}
@@ -2172,6 +2244,17 @@ func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims
 	mdp.armPinsFromToolsList(resultBytes)
 
 	return filterListResult(resultBytes, listKeyTools, func(raw json.RawMessage) (bool, string) {
+		// Drop an entry whose own bytes are ambiguous BEFORE trusting its decoded name.
+		// armPinsFromToolsList self-gates on len(pinnedTools) > 0, so without this the
+		// entire fold defense would be inert on the common manifest that pins no
+		// descriptionHash: an entry carrying both "name" and "Name" is kept under Go's
+		// decoded (last-wins) name while a case-sensitive host renders the other, so the
+		// proxy advertises a tool it never authorized and its description — the FM-5
+		// injection surface — reaches the model. Catalog integrity does not depend on
+		// whether the operator opted into pins, so the check does not either.
+		if entryKeysAmbiguous(raw) {
+			return false, ""
+		}
 		var entry toolListEntry
 		if err := json.Unmarshal(raw, &entry); err != nil {
 			return false, ""
@@ -2204,6 +2287,14 @@ func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims
 // allowedValues can still be advertised. Fails closed to an empty list on error.
 func filterPromptsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims map[string]interface{}) ListFilterResult {
 	return filterListResult(resultBytes, listKeyPrompts, func(raw json.RawMessage) (bool, string) {
+		// Same entry-ambiguity gate tools/list applies: a prompt entry carrying both
+		// "name" and "Name" would be kept under Go's decoded name while a host renders
+		// the other, and a prompt description reaches the model exactly as a tool
+		// description does. All three list flavors share the FM-5 surface, so all three
+		// share the check.
+		if entryKeysAmbiguous(raw) {
+			return false, ""
+		}
 		var entry struct {
 			Name string `json:"name"`
 		}
@@ -2448,6 +2539,28 @@ func ApplyRedactObligs(resultBytes []byte, obligs []capability.Obligation) ([]by
 		return nil, scErr // fail closed
 	}
 	if scChanged {
+		changed = true
+	}
+
+	// (3) Redact within every OTHER top-level result key. `content` and
+	// `structuredContent` are the two shapes MCP defines, but a result envelope may
+	// legally carry additional keys, and this function's own contract is that fields the
+	// proxy does not model "survive the round-trip" — which meant a named field sitting in
+	// any other top-level key was forwarded UNREDACTED even though the manifest declared
+	// it redactable. An upstream returning {"content":[...],"data":{"ssn":"..."}} defeated
+	// the obligation entirely.
+	//
+	// Redacting them (rather than failing the response closed on an unmodelled key) is the
+	// right trade here: `_meta`, `annotations`, and vendor extensions are ordinary and
+	// legitimate, so refusing them would break honest upstreams, while masking is exactly
+	// what the operator asked for. The same container walk structuredContent uses is
+	// reused, so a doubly-encoded JSON string leaf is unwrapped identically and the depth
+	// bound applies the same way.
+	sibChanged, sibErr := redactSiblingTopLevelKeys(result, paths)
+	if sibErr != nil {
+		return nil, sibErr // fail closed
+	}
+	if sibChanged {
 		changed = true
 	}
 
@@ -2760,6 +2873,51 @@ func redactJSONValue(val interface{}, paths []string) bool {
 // both funnel string leaves through the shared redactContainerString core. A change to which
 // shapes redact versus pass through must be mirrored in both, or top-level and nested values
 // of the same shape would redact differently.
+// redactSiblingTopLevelKeys applies the redaction paths to every top-level result key
+// OTHER than content and structuredContent, which ApplyRedactObligs handles with their own
+// shape-specific rigor.
+//
+// Split out of ApplyRedactObligs to keep that function within the cognitive-complexity
+// budget, not because the walk is independent of it: it is the third of the three passes
+// the doc there describes, and skipping it forwards a field the manifest declared
+// redactable simply because the upstream put it under an unmodelled key.
+//
+// Redacting unmodelled keys rather than failing the response closed on their presence is
+// deliberate: _meta, annotations, and vendor extensions are ordinary and legitimate, so
+// refusing them would break honest upstreams, while masking is exactly what the operator
+// asked for. Reuses structuredContent's container walk, so a doubly-encoded JSON string
+// leaf is unwrapped identically and the depth bound applies the same way.
+func redactSiblingTopLevelKeys(result map[string]interface{}, paths []string) (bool, error) {
+	changed := false
+	for key, val := range result {
+		if key == "content" || key == "structuredContent" {
+			continue
+		}
+		switch v := val.(type) {
+		case map[string]interface{}, []interface{}:
+			c, err := redactStructuredContentValue(v, paths, "", 0)
+			if err != nil {
+				return false, err // fail closed
+			}
+			if c {
+				changed = true
+			}
+		case string:
+			out, c, err := redactContainerString(v, paths, "", 0)
+			if err != nil {
+				return false, err // fail closed
+			}
+			if c {
+				result[key] = out
+				changed = true
+			}
+		default:
+			// A scalar (number, bool, null) carries no named field and cannot hide one.
+		}
+	}
+	return changed, nil
+}
+
 func redactStructuredContentField(result map[string]interface{}, paths []string) (bool, error) {
 	sc, ok := result["structuredContent"]
 	if !ok {

@@ -133,6 +133,24 @@ func recordResourceExhausted(ctx context.Context, rec auditRecorder, sessionID, 
 	rec.RecordDeny(ctx, sessionID, "", method, codeResourceExhausted, "", nil, false)
 }
 
+// recordDriftRefused writes the startup manifest-drift refusal record, for the same reason
+// recordResourceExhausted exists: both transports refuse a session on this condition, and
+// the record was hand-mirrored at the two sites with already-divergent nil handling (stdio
+// guarded its recorder, the HTTP path relied on routeSink's nil-receiver safety) and
+// different plumbing. Two copies of one record shape is how the same security event ends
+// up with two shapes depending on transport, which breaks any aggregation keyed on it --
+// and how one site silently forgets to record at all when a detail is added later.
+//
+// The raw drift reason (which names the drifted tools) deliberately stays on stderr; the
+// tape carries only the stable DRIFT_REFUSED category, keeping the fixed-code discipline
+// the other refusal records follow.
+func recordDriftRefused(ctx context.Context, rec auditRecorder, sessionID string) {
+	if rec == nil {
+		return
+	}
+	rec.RecordDeny(ctx, sessionID, "initialize", "initialize", codeDriftRefused, "drift", nil, false)
+}
+
 // forwardParams bundles the per-transport bits the shared enforced-forward core
 // needs (HTTP fills these from sess.route + the session; stdio from the proxy),
 // keeping the policy/audit/forward logic in one place rather than hand-mirrored.

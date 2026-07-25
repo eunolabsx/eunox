@@ -35,10 +35,15 @@ build:
 test:
 	$(GO) test $(GOFLAGS) -count=1 ./...
 
-## Run tests with coverage report
+## Run tests with coverage report (all packages; CI floors pkg/, internal/ and cmd/ at 80%)
 coverage:
-	$(GO) test $(GOFLAGS) -count=1 -coverprofile=coverage.out -covermode=atomic ./pkg/...
-	$(GO) tool cover -func=coverage.out
+	$(GO) test $(GOFLAGS) -count=1 -coverprofile=coverage.out -covermode=atomic ./...
+	$(GO) tool cover -func=coverage.out | tail -1
+	@echo "---"
+	@for p in pkg internal cmd; do \
+		$(GO) tool cover -func=coverage.out | grep "^github.com/eunolabs/eunox/$$p/" | \
+			awk -v P=$$p '{sum += substr($$3, 1, length($$3)-1); n++} END {if (n>0) printf "%s/ average: %.1f%%\n", P, sum/n}'; \
+	done
 	@echo "---"
 	@echo "Coverage report: coverage.out"
 

@@ -63,145 +63,100 @@ func marshalCondition(condition Condition) ([]byte, error) {
 	if IsTypedNil(condition) {
 		return []byte("null"), nil
 	}
+	// Normalize a VALUE to its address and re-dispatch, so each condition type's
+	// marshaling is written once (in its pointer arm) instead of twice.
+	//
+	// Every condition's MarshalJSON has a VALUE receiver, so the method is in both T's
+	// and *T's method set — which is exactly why the pointer arms need the `type alias`
+	// trick: marshaling the concrete type directly would re-enter MarshalJSON and recurse
+	// forever. Converting to *alias, a type with no methods, breaks that. Taking the
+	// address here changes nothing about that requirement, so the value arms were
+	// byte-for-byte copies of the pointer arms and the switch carried 24 cases to express
+	// 12 behaviors. Recursion is exactly one level deep: the value below is always a
+	// pointer, so it lands in a pointer arm.
+	if rv := reflect.ValueOf(condition); rv.Kind() != reflect.Pointer {
+		pv := reflect.New(rv.Type())
+		pv.Elem().Set(rv)
+		ptr, ok := pv.Interface().(Condition)
+		if !ok {
+			// Unreachable for a value receiver (a *T method set contains T's methods),
+			// but fail closed rather than panic on a future receiver change.
+			return nil, fmt.Errorf("unsupported condition payload: %T", condition)
+		}
+		return marshalCondition(ptr)
+	}
+	// The pointer arms stay an EXPLICIT, exhaustive registry rather than one reflective
+	// marshal: it is what guarantees only condition types this build knows can be
+	// serialized into a manifest (and therefore into its digest). An unrecognized
+	// implementation of the exported Condition interface must fail closed here, not be
+	// silently written out.
 	switch typed := condition.(type) {
-	case TimeWindowCondition:
-		type alias TimeWindowCondition
-		return json.Marshal(struct {
-			conditionEnvelope
-			alias
-		}{conditionEnvelope{Type: typed.ConditionType()}, alias(typed)})
 	case *TimeWindowCondition:
 		type alias TimeWindowCondition
 		return json.Marshal(struct {
 			conditionEnvelope
 			*alias
 		}{conditionEnvelope{Type: typed.ConditionType()}, (*alias)(typed)})
-	case IPRangeCondition:
-		type alias IPRangeCondition
-		return json.Marshal(struct {
-			conditionEnvelope
-			alias
-		}{conditionEnvelope{Type: typed.ConditionType()}, alias(typed)})
 	case *IPRangeCondition:
 		type alias IPRangeCondition
 		return json.Marshal(struct {
 			conditionEnvelope
 			*alias
 		}{conditionEnvelope{Type: typed.ConditionType()}, (*alias)(typed)})
-	case AllowedOperationsCondition:
-		type alias AllowedOperationsCondition
-		return json.Marshal(struct {
-			conditionEnvelope
-			alias
-		}{conditionEnvelope{Type: typed.ConditionType()}, alias(typed)})
 	case *AllowedOperationsCondition:
 		type alias AllowedOperationsCondition
 		return json.Marshal(struct {
 			conditionEnvelope
 			*alias
 		}{conditionEnvelope{Type: typed.ConditionType()}, (*alias)(typed)})
-	case AllowedExtensionsCondition:
-		type alias AllowedExtensionsCondition
-		return json.Marshal(struct {
-			conditionEnvelope
-			alias
-		}{conditionEnvelope{Type: typed.ConditionType()}, alias(typed)})
 	case *AllowedExtensionsCondition:
 		type alias AllowedExtensionsCondition
 		return json.Marshal(struct {
 			conditionEnvelope
 			*alias
 		}{conditionEnvelope{Type: typed.ConditionType()}, (*alias)(typed)})
-	case AllowedTablesCondition:
-		type alias AllowedTablesCondition
-		return json.Marshal(struct {
-			conditionEnvelope
-			alias
-		}{conditionEnvelope{Type: typed.ConditionType()}, alias(typed)})
 	case *AllowedTablesCondition:
 		type alias AllowedTablesCondition
 		return json.Marshal(struct {
 			conditionEnvelope
 			*alias
 		}{conditionEnvelope{Type: typed.ConditionType()}, (*alias)(typed)})
-	case MaxCallsCondition:
-		type alias MaxCallsCondition
-		return json.Marshal(struct {
-			conditionEnvelope
-			alias
-		}{conditionEnvelope{Type: typed.ConditionType()}, alias(typed)})
 	case *MaxCallsCondition:
 		type alias MaxCallsCondition
 		return json.Marshal(struct {
 			conditionEnvelope
 			*alias
 		}{conditionEnvelope{Type: typed.ConditionType()}, (*alias)(typed)})
-	case RecipientDomainCondition:
-		type alias RecipientDomainCondition
-		return json.Marshal(struct {
-			conditionEnvelope
-			alias
-		}{conditionEnvelope{Type: typed.ConditionType()}, alias(typed)})
 	case *RecipientDomainCondition:
 		type alias RecipientDomainCondition
 		return json.Marshal(struct {
 			conditionEnvelope
 			*alias
 		}{conditionEnvelope{Type: typed.ConditionType()}, (*alias)(typed)})
-	case PolicyCondition:
-		type alias PolicyCondition
-		return json.Marshal(struct {
-			conditionEnvelope
-			alias
-		}{conditionEnvelope{Type: typed.ConditionType()}, alias(typed)})
 	case *PolicyCondition:
 		type alias PolicyCondition
 		return json.Marshal(struct {
 			conditionEnvelope
 			*alias
 		}{conditionEnvelope{Type: typed.ConditionType()}, (*alias)(typed)})
-	case CustomCondition:
-		type alias CustomCondition
-		return json.Marshal(struct {
-			conditionEnvelope
-			alias
-		}{conditionEnvelope{Type: typed.ConditionType()}, alias(typed)})
 	case *CustomCondition:
 		type alias CustomCondition
 		return json.Marshal(struct {
 			conditionEnvelope
 			*alias
 		}{conditionEnvelope{Type: typed.ConditionType()}, (*alias)(typed)})
-	case AllowedValuesCondition:
-		type alias AllowedValuesCondition
-		return json.Marshal(struct {
-			conditionEnvelope
-			alias
-		}{conditionEnvelope{Type: typed.ConditionType()}, alias(typed)})
 	case *AllowedValuesCondition:
 		type alias AllowedValuesCondition
 		return json.Marshal(struct {
 			conditionEnvelope
 			*alias
 		}{conditionEnvelope{Type: typed.ConditionType()}, (*alias)(typed)})
-	case SequenceBlockCondition:
-		type alias SequenceBlockCondition
-		return json.Marshal(struct {
-			conditionEnvelope
-			alias
-		}{conditionEnvelope{Type: typed.ConditionType()}, alias(typed)})
 	case *SequenceBlockCondition:
 		type alias SequenceBlockCondition
 		return json.Marshal(struct {
 			conditionEnvelope
 			*alias
 		}{conditionEnvelope{Type: typed.ConditionType()}, (*alias)(typed)})
-	case FlowLabelCondition:
-		type alias FlowLabelCondition
-		return json.Marshal(struct {
-			conditionEnvelope
-			alias
-		}{conditionEnvelope{Type: typed.ConditionType()}, alias(typed)})
 	case *FlowLabelCondition:
 		type alias FlowLabelCondition
 		return json.Marshal(struct {

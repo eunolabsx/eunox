@@ -28,6 +28,23 @@ const (
 	// re-converges a replica that started degraded (Redis unreachable at boot) and
 	// bounds how long degraded mode persists after recovery.
 	defaultReconcileInterval = 30 * time.Second
+
+	// defaultSessionKillTTL bounds how long a SESSION kill tombstone lives in Redis.
+	//
+	// Session ids are ephemeral -- one MCP connection, bounded by the idle reaper and the
+	// proxy's own lifetime -- but their tombstones were written with no expiry, so a
+	// long-running deployment accumulated one dead key per killed session forever, with
+	// nothing to ever collect them. That is unbounded Redis memory growth, and every
+	// reconcile SCAN pays for it.
+	//
+	// This is a garbage-collection bound, NOT a policy expiry, and the default is chosen
+	// to make that distinction safe: 30 days is orders of magnitude longer than any
+	// session can live, so a tombstone can only expire long after the session it names is
+	// gone. Note the direction of the risk if it were set too low -- an expiring tombstone
+	// LIFTS the kill -- so a value shorter than the longest session a deployment can hold
+	// open would be a fail-open. AGENT kills are deliberately NOT expired: an agent
+	// identity is long-lived and its revocation is meant to be durable.
+	defaultSessionKillTTL = 30 * 24 * time.Hour
 )
 
 // subscribeConfirmTimeout bounds the initial pub/sub subscription-confirmation read in
@@ -106,6 +123,17 @@ type Redis struct {
 	killedAgents   map[string]bool
 	killedSessions map[string]bool
 	lastRefreshErr error // last refresh error; nil means healthy
+	// lastRefreshOK is when a refresh last CONFIRMED state against Redis. It exists
+	// because lastRefreshErr is edge-triggered: it is only set once a refresh has run
+	// AND failed. If Redis partitions immediately after a successful refresh, no refresh
+	// has failed yet, so lastRefreshErr stays nil and — in fail-CLOSED mode, whose whole
+	// promise is that an unconfirmable request is denied — every non-match was served
+	// `false, nil` from a cache that could no longer see a new kill. Pub/sub is down
+	// during the same partition, so a kill issued via a reachable replica was invisible
+	// for the entire window; a wedged reconcile loop made it indefinite. Gating on
+	// staleness makes the fail-closed guarantee time-bounded rather than
+	// failure-detection-bounded. Zero means no refresh has ever succeeded.
+	lastRefreshOK time.Time
 	// cacheGen is bumped under mu on every local-cache mutation. refreshState
 	// captures it before its lock-free Redis scan and only commits the snapshot if it
 	// is unchanged; otherwise a kill applied during the scan would be erased by the
@@ -118,6 +146,14 @@ type Redis struct {
 	reconcileErrLogged bool
 
 	reconcileInterval time.Duration
+
+	// sessionKillTTL is how long a session-kill tombstone lives; see
+	// defaultSessionKillTTL. Zero means no expiry.
+	sessionKillTTL time.Duration
+
+	// now is the clock used for the staleness gate, injectable for deterministic tests.
+	// nil means time.Now.
+	now func() time.Time
 
 	// failOpen selects the degraded-mode behaviour when Redis is unreachable. The
 	// zero value (default) is fail-CLOSED: ShouldBlock denies because a kill issued
@@ -185,6 +221,27 @@ func NewRedis(client redis.Cmdable) *Redis {
 		killedAgents:      make(map[string]bool),
 		killedSessions:    make(map[string]bool),
 		reconcileInterval: defaultReconcileInterval,
+		sessionKillTTL:    defaultSessionKillTTL,
+	}
+	return r
+}
+
+// WithSessionKillTTL overrides how long a session-kill tombstone lives in Redis. A
+// negative value disables expiry (tombstones live forever, the pre-existing behavior).
+//
+// Raise it only if sessions in your deployment can outlive the default; LOWERING it below
+// the longest session you can hold open is a fail-open, because an expiring tombstone
+// lifts the kill on a session that may still be connected. Agent kills are never expired.
+//
+// Must be called before Start.
+func (r *Redis) WithSessionKillTTL(d time.Duration) *Redis {
+	switch {
+	case d < 0:
+		r.sessionKillTTL = 0 // explicit opt-out: never expire
+	case d == 0:
+		r.sessionKillTTL = defaultSessionKillTTL
+	default:
+		r.sessionKillTTL = d
 	}
 	return r
 }
@@ -473,14 +530,26 @@ func (r *Redis) HealthStatus() error {
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	// A stopped switch (Start context canceled) can no longer converge, so report the
-	// liveness cause rather than the stale refresh error the final in-flight refresh
-	// latched as Stop canceled it (context.Canceled) — a permanently frozen switch,
-	// not a transient backend outage.
-	if r.runCtx != nil && r.runCtx.Err() != nil {
+	switch r.livenessLocked() {
+	case killStopped:
+		// A stopped switch can no longer converge, so report the liveness cause rather
+		// than the stale refresh error the final in-flight refresh latched as Stop
+		// canceled it (context.Canceled) — a permanently frozen switch, not a transient
+		// backend outage.
 		return ErrStopped
+	case killRefreshFailed:
+		// The RAW error, unlike ShouldBlock's sanitized sentinel: this is the operator's
+		// channel, and connection detail is what makes it actionable.
+		return r.lastRefreshErr
+	case killStale:
+		// No refresh has failed, but none has succeeded recently either — the reconcile
+		// loop is not converging. In fail-closed mode the data plane is already denying
+		// on this, so a probe reporting "ok" here would publish healthy through an
+		// outage.
+		return fmt.Errorf("killswitch: no successful redis refresh in over %s; the reconcile loop is not converging and cached kill state cannot be confirmed", r.staleness())
+	case killLive:
 	}
-	return r.lastRefreshErr
+	return nil
 }
 
 // ShouldBlock checks if any kill switch is active, using the local cache first.
@@ -511,27 +580,105 @@ func (r *Redis) ShouldBlock(_ context.Context, agentID, sessionID string) (bool,
 	if sessionID != "" && r.killedSessions[sessionID] {
 		return true, nil
 	}
-	// Nothing matches. Check liveness BEFORE transient health: once the Start context
-	// is canceled (Stop, or the caller's own context) the convergence loops have exited
-	// and the cache can never observe a new kill, so a non-match is PERMANENTLY
-	// unconfirmed. Stop cancels runCtx, and an in-flight refreshState then records
-	// context.Canceled as lastRefreshErr — so a stopped switch is frequently also
-	// "degraded". It must report ErrStopped (the actionable liveness cause) rather than
-	// ErrBackendUnreachable (which reads as a transient outage that will self-heal). Both
-	// fail closed, so this ordering is diagnostic accuracy, not a security change.
-	// Reading runCtx.Err() observes cancellation synchronously (no window). Fail closed
-	// regardless of failOpen — a stopped switch is a liveness failure, not an outage.
-	if r.runCtx != nil && r.runCtx.Err() != nil {
+	// Nothing matches, so the cache's confidence decides. livenessLocked defines that
+	// chain once (shared with HealthStatus); this maps it to the client-facing sentinels.
+	switch r.livenessLocked() {
+	case killStopped:
+		// Fail closed regardless of failOpen — a stopped switch is a liveness failure,
+		// not a transient outage that will self-heal.
 		return false, ErrStopped
-	}
-	// Still live, but the last refresh failed: in fail-closed mode the cache may be
-	// stale, so deny rather than admit an unconfirmed request; the reconcile loop clears
-	// lastRefreshErr on recovery, bounding the block window. Fail-open serves the cache
-	// as-is.
-	if r.lastRefreshErr != nil && !r.failOpen {
-		return false, ErrBackendUnreachable
+	case killRefreshFailed, killStale:
+		// killRefreshFailed: the last refresh ran and failed, so the cache may be stale.
+		// killStale: no refresh has FAILED, but detection is edge-triggered — a partition
+		// beginning right after a successful refresh leaves lastRefreshErr nil until a
+		// reconcile tick actually runs and errors, and pub/sub is down for the same
+		// partition, so a kill issued through a reachable replica would be invisible for
+		// that whole window while fail-closed mode promises the opposite.
+		//
+		// Fail-open deliberately serves the cache in both cases: trading guaranteed
+		// revocation for availability is exactly what it opts into.
+		if !r.failOpen {
+			return false, ErrBackendUnreachable
+		}
+	case killLive:
 	}
 	return false, nil
+}
+
+// killLiveness classifies why a NON-MATCH cannot be served as a confident all-clear.
+// It is the single definition of that gate chain, shared by the data plane
+// (ShouldBlock) and the health probe (HealthStatus) so the two cannot disagree about
+// whether the switch is serving.
+//
+// The two callers deliberately differ in the ERROR VALUE they map each state to — the
+// data plane returns sanitized sentinels so backend connection details never reach a
+// client, the health probe returns the raw refresh error for the operator — but the
+// ORDER and the set of states are defined once, here. Hand-mirroring them is how a
+// fourth state (staleness) ended up gating the data plane while a probe still reported
+// "ok" through it.
+type killLiveness int
+
+const (
+	killLive          killLiveness = iota // cache is confirmed and converging
+	killStopped                           // Start context canceled; can never converge again
+	killRefreshFailed                     // last refresh ran and failed
+	killStale                             // no refresh has failed, but none has succeeded recently either
+)
+
+// livenessLocked classifies the cache's confidence. Caller must hold at least mu.RLock.
+// The not-started case is deliberately NOT here: r.started is atomic and both callers
+// check it before taking mu, so an unstarted switch reports its wiring cause without
+// touching zero-valued fields.
+func (r *Redis) livenessLocked() killLiveness {
+	// Liveness before transient health: once the Start context is canceled the
+	// convergence loops have exited and a non-match is PERMANENTLY unconfirmed, which is
+	// a different (and more actionable) cause than a transient outage. Stop cancels
+	// runCtx and an in-flight refresh then latches context.Canceled as lastRefreshErr, so
+	// a stopped switch is frequently ALSO "degraded"; this ordering reports the real one.
+	if r.runCtx != nil && r.runCtx.Err() != nil {
+		return killStopped
+	}
+	if r.lastRefreshErr != nil {
+		return killRefreshFailed
+	}
+	if r.staleLocked() {
+		return killStale
+	}
+	return killLive
+}
+
+// clock returns the injected clock or time.Now.
+func (r *Redis) clock() time.Time {
+	if r.now != nil {
+		return r.now()
+	}
+	return time.Now()
+}
+
+// staleness returns how old a confirmed refresh may be before the cache is treated as
+// unconfirmed. Two reconcile intervals: one missed tick is ordinary jitter, two means the
+// convergence loop is not running or Redis is not answering.
+func (r *Redis) staleness() time.Duration {
+	iv := r.reconcileInterval
+	if iv <= 0 {
+		iv = defaultReconcileInterval
+	}
+	return 2 * iv
+}
+
+// staleLocked reports whether the cache has gone too long without a confirmed refresh.
+// Caller must hold at least a read lock on mu.
+//
+// A zero lastRefreshOK means no refresh has ever succeeded. That is NOT reported as stale
+// here: Start seeds the cache before started is set, so reaching this point with a zero
+// stamp means the seed itself came from a path that did not stamp — and the started/stopped
+// guards above already cover the genuinely-unseeded cases. Reporting stale on zero would
+// turn a healthy freshly-started switch into a denial.
+func (r *Redis) staleLocked() bool {
+	if r.lastRefreshOK.IsZero() {
+		return false
+	}
+	return r.clock().Sub(r.lastRefreshOK) > r.staleness()
 }
 
 // ActivateGlobal activates the global kill switch.
@@ -589,7 +736,14 @@ func (r *Redis) setBlock(ctx context.Context, kill, session bool, id string) err
 	key := keyPrefix + id
 	var err error
 	if kill {
-		err = r.client.Set(ctx, key, "1", 0).Err()
+		// Only SESSION tombstones expire; an agent kill is durable revocation of a
+		// long-lived identity. See defaultSessionKillTTL for why the expiry is a
+		// garbage-collection bound rather than a policy one.
+		ttl := time.Duration(0)
+		if session {
+			ttl = r.sessionKillTTL
+		}
+		err = r.client.Set(ctx, key, "1", ttl).Err()
 	} else {
 		err = r.client.Del(ctx, key).Err()
 	}
@@ -784,6 +938,7 @@ func (r *Redis) refreshState(ctx context.Context) error {
 			// refreshMu serializes refreshes, so no concurrent refresh can have recorded
 			// a fresher error between this scan's start and this commit.
 			r.lastRefreshErr = nil
+			r.lastRefreshOK = r.clock()
 			r.mu.Unlock()
 			return nil
 		}
@@ -811,6 +966,7 @@ func (r *Redis) refreshState(ctx context.Context) error {
 		// As in the clean-commit path, the Redis read succeeded, so clear the health
 		// stamp; refreshMu guarantees no fresher error raced this refresh.
 		r.lastRefreshErr = nil
+		r.lastRefreshOK = r.clock()
 		r.mu.Unlock()
 		return nil
 	}
@@ -828,6 +984,17 @@ func (r *Redis) scanPrefix(ctx context.Context, prefix string, target map[string
 	// cluster-wide enumeration must visit every master and merge the scans; otherwise
 	// refreshState loads a partial snapshot, treats it as healthy, and drops kills on
 	// the other masters. ForEachMaster runs concurrently, so target needs a mutex.
+	//
+	// Reachable only by a LIBRARY consumer: the shipped binary always builds a
+	// single-node client. It is kept because deleting it would not remove the cluster
+	// case, only the handling of it -- a ClusterClient would then load a partial kill set
+	// and report healthy, which is a fail-open on the emergency stop.
+	//
+	// Note the asymmetry it exposes, since nothing else in the tree states it: pkg/
+	// callcounter has NO cluster handling, so a consumer who supplies a ClusterClient gets
+	// correct kill-switch enumeration alongside per-master maxCalls counting that silently
+	// under-counts. Redis Cluster is not a supported eunox deployment; use a single-node
+	// or replicated (non-sharded) endpoint.
 	if cc, ok := r.client.(*redis.ClusterClient); ok {
 		var mu sync.Mutex
 		return cc.ForEachMaster(ctx, func(ctx context.Context, node *redis.Client) error {

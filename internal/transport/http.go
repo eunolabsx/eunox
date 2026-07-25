@@ -182,7 +182,11 @@ type HTTPProxy struct {
 	// tokens to a fixed-length MAC before the constant-time comparison in checkAuth /
 	// checkControlToken. See constantTimeTokenEqual for the timing rationale.
 	authTimingKey []byte
-	trustFwdFor   bool
+	// preSessionDenies bounds the rate of transport-level refusal records. Those are the
+	// only audit writes an unauthenticated caller can trigger, so without a bound they are
+	// a lever on --require-audit=strict; see preSessionDenyLimiter.
+	preSessionDenies *preSessionDenyLimiter
+	trustFwdFor      bool
 	// trustedProxyNets is the compiled listen.trustedProxyCIDRs allowlist: under
 	// trustFwdFor, the immediate TCP peer (RemoteAddr) must match one of these
 	// networks before X-Forwarded-For is honored — see sourceIP. Empty means no peer
@@ -206,7 +210,11 @@ type HTTPProxy struct {
 	// DNS-rebinding defense (see checkOrigin): allowedOrigins holds operator-configured
 	// full origins matched exactly; allowedOriginHosts is the set of host names always
 	// accepted (loopback names plus the non-wildcard bind host).
-	allowedOrigins     []string
+	allowedOrigins []string
+	// loopbackPinHosts holds the hostnames of allowedOrigins entries, read ONLY by the
+	// DNS-rebinding Host pin on the loopback endpoints so it is no stricter than the /mcp
+	// Origin gate. Deliberately not merged into allowedOriginHosts: see buildLoopbackPinHosts.
+	loopbackPinHosts   map[string]bool
 	allowedOriginHosts map[string]bool
 
 	// routes maps a route name (the /mcp/<name> path segment) to its upstream wiring
@@ -333,6 +341,7 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 		authToken:          opts.AuthToken,
 		controlToken:       opts.ControlToken,
 		authTimingKey:      newAuthTimingKey(),
+		preSessionDenies:   newPreSessionDenyLimiter(),
 		trustFwdFor:        opts.TrustFwdFor,
 		trustedProxyNets:   trustedProxyNets,
 		trustedProxyHops:   opts.TrustedProxyHops,
@@ -342,6 +351,7 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 		sessionIdleMs:      opts.SessionIdleMs,
 		allowedOrigins:     opts.AllowedOrigins,
 		allowedOriginHosts: buildAllowedOriginHosts(opts.Bind),
+		loopbackPinHosts:   buildLoopbackPinHosts(opts.AllowedOrigins),
 		routes:             opts.Routes,
 		sessions:           make(map[string]*httpSession),
 	}

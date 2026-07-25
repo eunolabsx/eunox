@@ -60,12 +60,28 @@ import (
 // used verbatim in the /mcp/<name> route.
 var routeNameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
-// envRefRe matches a ${NAME} or $NAME reference where NAME is a POSIX-style
-// identifier. A '$' followed by a non-identifier char (e.g. "$-", "$!", trailing
-// '$') is left intact; a '$' followed by a letter or '_' is always a reference,
-// even mid-string ("pa$$word" expands the second "$word"). There is no "$$"
-// escape.
-var envRefRe = regexp.MustCompile(`\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*`)
+// envRefRe matches an escape or a reference: "$$" (a literal '$'), "${NAME}", or
+// "$NAME", where NAME is a POSIX-style identifier. A '$' followed by a non-identifier
+// char (e.g. "$-", "$!", trailing '$') is left intact.
+//
+// The "$$" alternative is FIRST so it wins the leftmost-longest match: without it a
+// literal '$' was inexpressible, and a config value that legitimately contains one --
+// a generated password like "pa$$word" -- had its second "$word" silently expanded
+// the moment an unrelated environment variable named "word" happened to be set,
+// substituting an attacker-influencable value into a credential. Escaping is the only
+// way to make "this is a literal dollar sign" and "this is a reference" distinguishable
+// at all; callers write "$$" for a literal '$'.
+var envRefRe = regexp.MustCompile(`\$\$|\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*`)
+
+// envRefEscape is the escape sequence for a literal '$'.
+const envRefEscape = "$$"
+
+// isEnvRefEscape reports whether an envRefRe match is the "$$" escape rather than a
+// variable reference. Every consumer of envRefRe must skip escapes before treating a
+// match as a reference name -- expansion, the unset-reference guard, and the blank-
+// credential guard all route through this one predicate so they cannot disagree about
+// what counts as a reference.
+func isEnvRefEscape(match string) bool { return match == envRefEscape }
 
 // envRefName extracts the variable name from a single envRefRe match ("$VAR" or
 // "${VAR}"). Shared by expandEnvRefs and validateCredentialEnvRefs so the expansion
@@ -84,6 +100,9 @@ func envRefName(match string) string {
 // blanks it). See envRefRe for the matching rules.
 func expandEnvRefs(s string) string {
 	return envRefRe.ReplaceAllStringFunc(s, func(match string) string {
+		if isEnvRefEscape(match) {
+			return "$" // "$$" collapses to a literal '$'
+		}
 		if val, ok := os.LookupEnv(envRefName(match)); ok {
 			return val
 		}
@@ -515,7 +534,24 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 // publish the value (e.g. the OAuth authorization-server URIs) use this to fail
 // closed rather than advertise literal "${VAR}" text.
 func ContainsEnvRef(s string) bool {
-	return envRefRe.MatchString(s)
+	return len(realEnvRefs(s)) > 0
+}
+
+// realEnvRefs returns every envRefRe match in s that is an actual variable reference,
+// dropping the "$$" escapes. Every consumer that asks "which variables does this value
+// reference" goes through here so an escape can never be mistaken for a reference named
+// "$" -- which would make ContainsEnvRef report a residual reference for a value that
+// correctly expanded to a literal dollar sign, and make the unset-reference guard reject
+// a perfectly valid credential.
+func realEnvRefs(s string) []string {
+	matches := envRefRe.FindAllString(s, -1)
+	refs := matches[:0]
+	for _, m := range matches {
+		if !isEnvRefEscape(m) {
+			refs = append(refs, m)
+		}
+	}
+	return refs
 }
 
 // firstUnsetEnvRef scans rawValue's raw (pre-expansion) text for $VAR/${VAR}
@@ -527,7 +563,7 @@ func ContainsEnvRef(s string) bool {
 // residual-reference check, so the "what counts as unset" rule cannot drift
 // between them.
 func firstUnsetEnvRef(rawValue string) (name string, ok bool) {
-	for _, ref := range envRefRe.FindAllString(rawValue, -1) {
+	for _, ref := range realEnvRefs(rawValue) {
 		n := envRefName(ref)
 		if _, set := os.LookupEnv(n); !set {
 			return n, true
@@ -580,7 +616,7 @@ func validateCredentialEnvRefs(path, label, rawValue string) error {
 	}
 	// Every reference (if any) is confirmed set by firstUnsetEnvRef above, so
 	// os.LookupEnv below always succeeds; this pass only tracks blankness.
-	refs := envRefRe.FindAllString(rawValue, -1)
+	refs := realEnvRefs(rawValue)
 	sawNonEmptyRef := false
 	for _, ref := range refs {
 		val, _ := os.LookupEnv(envRefName(ref))

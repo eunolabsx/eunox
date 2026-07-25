@@ -225,6 +225,27 @@ type Sink struct {
 	// Close/exit. Atomic (read/written from any goroutine); exposed via WriteFailures.
 	writeFailures atomic.Int64
 
+	// maintenanceStalled is set when size-triggered rotation or retention pruning has
+	// stopped making progress while record writing itself is still healthy: the sibling
+	// directory cannot be listed (so an ordinal cannot be seeded and rotation defers), or
+	// the oldest rotated file cannot be unlinked (so pruning stops to keep the retained
+	// chain contiguous). Both are deliberately non-fatal — deferring is what keeps the
+	// chain verifiable — but both silently void the configured disk bound, and the log
+	// then grows until the filesystem fills, at which point writes DO fail and
+	// --require-audit=strict denies everything. That end state is far worse than the
+	// warning, so the stall is surfaced while it is still just a stall.
+	//
+	// Deliberately NOT folded into AuditDegraded: that gate denies live traffic under
+	// --require-audit=strict, and a stalled rotation has lost no records — every decision
+	// is still being written and signed. This is a maintenance/readiness signal for
+	// /healthz, metrics, and doctor, not an enforcement input. Cleared when the operation
+	// next succeeds, so a transient fault self-heals in the reporting too.
+	maintenanceStalled atomic.Bool
+	// maintenanceStallReason carries the human-readable cause of maintenanceStalled.
+	// Guarded by its own mutex rather than an atomic.Value so an empty reason is cheap.
+	maintenanceStallMu     sync.Mutex
+	maintenanceStallReason string
+
 	// wg tracks the drainer so Close can wait for it to flush.
 	wg sync.WaitGroup
 
@@ -410,7 +431,7 @@ func recoverTailAfterReadError(logPath string, readErr error) (last string, seed
 	default:
 		// Base still non-empty but unreadable: seed past the highest seq anywhere on disk
 		// — the base's on-disk maximum AND every rotated sibling's, since after a rotation
-		// the base's size-based estimate (scanHighestSeq's open-fail fallback) can fall
+		// the base's size-based estimate (scanSeqContribution's open-fail fallback) can fall
 		// below a readable sibling's real max — so new records cannot duplicate an
 		// existing seq.
 		if highest, ok := highestSeqAcrossChain(logPath); ok {
@@ -505,7 +526,7 @@ func highestSeqAcrossChain(logPath string) (highest uint64, ok bool) {
 }
 
 // highestSeqAcrossChainCapped is highestSeqAcrossChain with the per-line scan cap injected
-// for deterministic tests (mirroring scanHighestSeqCapped). It over-estimates PAST the true
+// for deterministic tests. It over-estimates PAST the true
 // on-disk max as: the highest seq actually READ anywhere in the chain (exact) PLUS the
 // total BYTES of every file that could not be read. Each unread record occupies >= 1 byte,
 // so the unread byte total bounds how many higher seqs an unreadable file can hold beyond
@@ -519,7 +540,7 @@ func highestSeqAcrossChain(logPath string) (highest uint64, ok bool) {
 // the anchor the unread bytes extend). The one residual — a chain whose files are ALL
 // unreadable AND whose earlier history was pruned — cannot reconstruct the pruned records'
 // seq span from the surviving bytes and may restart low, but always under a
-// chain_resume_failed marker (the break is never silent). Like scanHighestSeq it never
+// chain_resume_failed marker (the break is never silent). Like scanSeqContribution it never
 // verifies HMACs or seeds prev_hmac; it only advances the monotonic counter. ok is false
 // only when nothing — no parseable record and no unread bytes — was found anywhere on disk.
 func highestSeqAcrossChainCapped(logPath string, bufCap int) (highest uint64, ok bool) {
@@ -566,7 +587,7 @@ func satAddU64(a, b uint64) uint64 {
 // HMAC mismatch, a retired/removed signing key, or an unreadable newer sibling — restarts
 // with a marker whose seq, and every record after it, is past every existing seq rather
 // than restarting at genesis and reissuing them (a duplicate-seq cascade audit-verify
-// cannot distinguish from tampering; the package's own scanHighestSeq comment calls a
+// cannot distinguish from tampering; the package's own scanSeqContribution comment calls a
 // duplicate "WORSE than a gap"). It deliberately leaves s.prevHMAC at genesis: the break
 // is real and audit-verify must see the prev_hmac discontinuity — only the seq counter is
 // advanced, monotonic and gap-detectable. A best-effort scan finding nothing leaves s.seq
@@ -667,7 +688,7 @@ func (s *Sink) resumeChainFromTail(last string) tailResumeResult {
 // Open opens (or creates) the audit log and loads (or generates) the HMAC
 // signing key. logPath, keyPath, and rotateSizeBytes may be zero for defaults.
 //
-// REL-04: keyPath is configurable so the key can be injected in containerized or
+// keyPath is configurable so the key can be injected in containerized or
 // shared-host deployments. Empty uses the default (~/.eunox/audit.key), itself
 // overridable by EUNOX_AUDIT_KEY_PATH.
 func Open(logPath, keyPath string, rotateSizeBytes int64, retainRotated int, opts ...Option) (*Sink, error) {
@@ -684,8 +705,7 @@ func Open(logPath, keyPath string, rotateSizeBytes int64, retainRotated int, opt
 	}
 
 	// Resolve the key path through the single source of truth for flag/env/default
-	// precedence so the proxy never drifts from the audit-verify/doctor subcommands
-	// (REL-04).
+	// precedence so the proxy never drifts from the audit-verify/doctor subcommands.
 	expandedKeyPath, err := ResolveKeyPath(keyPath)
 	if err != nil {
 		return nil, fmt.Errorf("audit key path: %w", err)
@@ -989,7 +1009,7 @@ var errAuditFileShrunk = errors.New("audit log shrank between stat and read")
 // leaving independent literals that could drift past 4 MiB.
 const auditScanBufferBytes = 4 << 20
 
-// rescanBufferBytes is the WIDE per-line buffer scanHighestSeq uses on the
+// rescanBufferBytes is the WIDE per-line buffer scanSeqContribution uses on the
 // chain-resume error path so its single pass reads PAST a record larger than the
 // ~1 MiB cap, while still bounding memory: a line longer than this is refused rather
 // than accumulated unbounded, so a corrupt or tampered log cannot drive the resume
@@ -1053,48 +1073,6 @@ func readLastAuditLine(path string) (string, error) {
 		return "", err
 	}
 	return interpretAuditTail(buf, n, err, size)
-}
-
-// scanHighestSeq returns the largest seq among the parseable records in the audit
-// log. It is used only on the chain-resume error path: when the bounded tail read
-// failed and neither a retry nor a rotated sibling yielded a usable tail, seeding
-// the resumed seq past this maximum keeps new records from duplicating existing
-// seqs — which audit-verify would otherwise report as a SEQ GAP plus a
-// duplicate-seq cascade for every record after a genesis (seq 1) restart. It does
-// NOT verify HMACs and never seeds prev_hmac from a scanned record: it only advances
-// the seq counter, so an unsigned or forged record can at worst inflate the counter
-// monotonically (harmless — seqs need only stay monotonic and gap-detectable), never
-// inject a trusted chain link. ok is false when the file cannot be opened, or holds
-// no parseable record.
-//
-// The scan is a SINGLE pass sized at the wide rescanBufferBytes cap: reading past any
-// plausibly-large record to EOF in one read recovers the TRUE high-water mark (a wider
-// per-line buffer only tolerates a longer line; it never lowers the max). It still
-// bounds memory — a line over the cap is refused (scanner.Err() != nil) rather than
-// accumulated unbounded — so a corrupt or tampered log cannot drive the resume scan to
-// OOM. On a line over the cap OR any mid-file read fault (transient or persistent) the
-// scan aborts and falls to the file-size over-estimate; the earlier two-pass form
-// retried faults with a second independent read, but the retry only ever mattered for a
-// transient fault and both outcomes are fail-SAFE (an over-estimate can never re-issue
-// an existing seq), so the single pass drops it for simplicity.
-func scanHighestSeq(path string) (highest uint64, ok bool) {
-	return scanHighestSeqCapped(path, rescanBufferBytes)
-}
-
-// scanHighestSeqCapped is scanHighestSeq with the per-line buffer cap injected, so a
-// test can trip the over-estimate fallback deterministically with a small
-// (line-just-over-cap) fixture instead of allocating a >64 MiB line. Production always
-// passes rescanBufferBytes.
-func scanHighestSeqCapped(path string, bufCap int) (highest uint64, ok bool) {
-	parsedMax, parsed, unreadBytes := scanSeqContribution(path, bufCap)
-	// Single-FILE over-estimate: the byte size bounds the max only for a file that began at
-	// genesis (seq <= bytes), so it is used as an absolute value HERE. highestSeqAcrossChain
-	// instead folds unreadBytes ADDITIVELY across the chain, where one file's byte count is
-	// not a global seq. Callers/tests of this single-file view expect the max of the two.
-	if unreadBytes > parsedMax {
-		return unreadBytes, true
-	}
-	return parsedMax, parsed
 }
 
 // scanSeqContribution reads path once and separates the two distinct ways a file can inform
@@ -2014,6 +1992,46 @@ func (s *Sink) DroppedRecords() int64 {
 	return s.dropped.Load()
 }
 
+// markMaintenanceStalled records that rotation or retention could not make progress.
+// Called on every failed attempt; the reason is overwritten so the newest cause wins.
+func (s *Sink) markMaintenanceStalled(reason string) {
+	if s == nil {
+		return
+	}
+	s.maintenanceStalled.Store(true)
+	s.maintenanceStallMu.Lock()
+	s.maintenanceStallReason = reason
+	s.maintenanceStallMu.Unlock()
+}
+
+// clearMaintenanceStalled records that the stalled operation succeeded, so a transient
+// fault (a directory temporarily unreadable, a file briefly locked) stops being reported.
+func (s *Sink) clearMaintenanceStalled() {
+	if s == nil || !s.maintenanceStalled.Load() {
+		return
+	}
+	s.maintenanceStalled.Store(false)
+	s.maintenanceStallMu.Lock()
+	s.maintenanceStallReason = ""
+	s.maintenanceStallMu.Unlock()
+}
+
+// MaintenanceStalled reports whether size-triggered rotation or retention pruning has
+// stopped making progress, with the reason. Records are still being written and signed —
+// this is NOT an audit-integrity loss and deliberately does not feed the
+// --require-audit=strict gate (see AuditDegraded). It means the configured
+// rotateSizeBytes/retainRotated disk bound is currently not being enforced, so the log
+// will grow without limit until the underlying fault is fixed. Surfaced by /healthz,
+// /metrics, and doctor so an operator sees it before the filesystem fills.
+func (s *Sink) MaintenanceStalled() (stalled bool, reason string) {
+	if s == nil || !s.maintenanceStalled.Load() {
+		return false, ""
+	}
+	s.maintenanceStallMu.Lock()
+	defer s.maintenanceStallMu.Unlock()
+	return true, s.maintenanceStallReason
+}
+
 // WriteFailures returns the number of records that reached the drainer but could
 // not be durably written (full disk, EIO, a serialization error, or a file lost to
 // a failed rotation). Distinct from DroppedRecords: that is a "queue can't keep up"
@@ -2881,7 +2899,7 @@ func ResolveLogPath(pref string) (string, error) {
 
 // ResolveKeyPath returns the effective HMAC key path: pref when non-empty, else
 // EUNOX_AUDIT_KEY_PATH, else the built-in default, expanded. Single-sources the
-// env-var precedence across the proxy and subcommands (REL-04).
+// env-var precedence across the proxy and subcommands.
 func ResolveKeyPath(pref string) (string, error) {
 	if pref == "" {
 		if env := os.Getenv("EUNOX_AUDIT_KEY_PATH"); env != "" {

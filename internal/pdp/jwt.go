@@ -914,6 +914,19 @@ func (p *JWTPDP) DecideSampling(ctx context.Context, sessionID, sourceIP string)
 	if deny := p.CheckAudience(ctx); deny != nil {
 		return *deny
 	}
+	// A present mcp.capabilities field is an EXHAUSTIVE allowlist: Decide denies any
+	// target the claim does not list, even an empty array. Sampling was the one enforced
+	// method that ignored it — DecideSampling delegated straight to the manifest — and
+	// because parseV2Claim refuses system: claims, a token can never LIST sampling. So a
+	// deny-all token ("capabilities": []) still got server-initiated sampling forwarded on
+	// its session wherever the route's manifest opted into system:sampling/createMessage:
+	// the one place "the token can only restrict, never expand" failed in the
+	// exhaustive-deny direction. Deny instead, so the claim's contract holds for every
+	// enforced method.
+	if claims, ok := jwtClaimsFromContext(ctx); ok && claims.HasCapabilities {
+		return denyResponse(p.clock, capability.ErrCodeSamplingDenied, "",
+			"the token carries an mcp.capabilities claim, which is an exhaustive allowlist, and sampling cannot be listed in it (system: targets are not expressible as capability claims); server-initiated sampling is therefore denied for this token")
+	}
 	// innerEnforces gates the delegation so an AlwaysAllowPDP inner is NOT a sampling
 	// backstop (matching the identity-only Decide path): without it
 	// AlwaysAllowPDP.DecideSampling would be reached and silently grant sampling on a
@@ -956,6 +969,42 @@ func (p *JWTPDP) audienceDeny(message string) capability.EnforceResponse {
 	resp := denyResponse(p.clock, capability.ErrCodeAuthorizationFailed, "jwtAudience", message)
 	resp.Denial.HardDeny = true
 	return resp
+}
+
+// withInnerForwardObligations fills r with the inner manifest's redaction obligations when
+// r is one of JWTPDP's OWN denies and a route-level --audit will forward it anyway.
+//
+// This is the wrapper-shaped half of the observe-mode fail-open the ManifestPDP path closes
+// with withForwardObligations. JWTPDP short-circuits above the inner PDP on three
+// non-HardDeny paths — target absent from mcp.capabilities, a JWT condition failure, and
+// no-capabilities-with-no-backstop — so the inner PDP never runs, never collects
+// obligations, and the response reaches the transport with Obligations empty. On a route
+// running --audit the transport downgrades that deny to a forwarded call and gates
+// redaction on len(Obligations) > 0, so a manifest declaring redactFields on the target was
+// silently skipped: the identical request WITHOUT the JWT wrapper redacted, and turning JWT
+// on removed the guarantee.
+//
+// The inner is consulted through a *ManifestPDP assertion because obligation collection
+// needs the engine and the capability list, neither of which is on the PolicyDecisionPoint
+// contract. A non-manifest inner (AlwaysAllowPDP, nil, or a third-party implementation)
+// declares no directives, so there is nothing to stamp and r is returned unchanged.
+// withForwardObligations itself no-ops unless the route is running --audit, so an enforce
+// route pays a nil check.
+//
+// HardDeny responses are excluded: the transport never downgrades them, so there is no
+// forwarded response to redact.
+func (p *JWTPDP) withInnerForwardObligations(ctx context.Context, r capability.EnforceResponse, target EnforceTarget) capability.EnforceResponse {
+	if r.Decision == capability.DecisionAllow || len(r.Obligations) > 0 {
+		return r
+	}
+	if r.Denial != nil && r.Denial.HardDeny {
+		return r
+	}
+	mdp, ok := p.inner.(*ManifestPDP)
+	if !ok {
+		return r
+	}
+	return mdp.withForwardObligations(ctx, r, target)
 }
 
 // Decide reads JWT claims from the context (populated by ValidateToken), builds
@@ -1009,9 +1058,9 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 		if p.innerEnforces() {
 			return p.decideInner(ctx, sessionID, target, args, sourceIP)
 		}
-		return denyResponse(p.clock, capability.ErrCodeAuthorizationFailed, "jwtCapability",
+		return p.withInnerForwardObligations(ctx, denyResponse(p.clock, capability.ErrCodeAuthorizationFailed, "jwtCapability",
 			"token carries no mcp.capabilities claim and the route has no manifest policy to fall back on; "+
-				"JWT mode denies by default — issue a token with capability claims or add a manifest policy to the route")
+				"JWT mode denies by default — issue a token with capability claims or add a manifest policy to the route"), target)
 	}
 
 	// mcp.capabilities present → exhaustive allowlist; an unlisted target is denied
@@ -1024,8 +1073,8 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 		constraints = buildConstraintsFromClaims(claims.Capabilities, target)
 	}
 	if len(constraints) == 0 {
-		return denyResponse(p.clock, capability.ErrCodeAuthorizationFailed, "jwtCapability",
-			fmt.Sprintf("%s %q is not in the JWT capability claims", target.Type, target.Name))
+		return p.withInnerForwardObligations(ctx, denyResponse(p.clock, capability.ErrCodeAuthorizationFailed, "jwtCapability",
+			fmt.Sprintf("%s %q is not in the JWT capability claims", target.Type, target.Name)), target)
 	}
 
 	// mcp.capabilities is an OR-list: the call is permitted if ANY matching entry's
@@ -1052,7 +1101,7 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 		break
 	}
 	if lastDeny != nil {
-		return *lastDeny
+		return p.withInnerForwardObligations(ctx, *lastDeny, target)
 	}
 
 	// JWT allows — intersect with the inner manifest PDP if configured (both sides

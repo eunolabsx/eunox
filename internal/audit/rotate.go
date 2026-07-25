@@ -581,9 +581,19 @@ func (s *Sink) pruneRotated() {
 				continue
 			}
 			fmt.Fprintf(os.Stderr, "[eunox] audit retention: could not delete %q: %v; stopping prune to keep rotated files contiguous (retried on the next rotation)\n", old, err)
-			break
+			// Stopping is correct — a hole in the retained chain is indistinguishable from
+			// an attacker deleting an interior file — but the file that fails is always the
+			// OLDEST, hence always the first one tried, so a PERMANENT fault (an immutable
+			// attribute, a read-only mount, EPERM under a sticky-bit dir) means the loop
+			// breaks at index 0 on every future rotation and retention never runs again.
+			// retainRotated is then silently voided and siblings accumulate without bound.
+			// Report it rather than let the disk fill behind one stderr line per rotation.
+			s.markMaintenanceStalled(fmt.Sprintf("retention stalled: rotated audit file %q cannot be deleted (%v), and pruning stops there to keep the retained chain contiguous; the retention bound is not being enforced until this file is removable", old, err))
+			return
 		}
 	}
+	// Every over-retention sibling was removed: retention is healthy again.
+	s.clearMaintenanceStalled()
 }
 
 // rotatedPath returns the path the active log is renamed to during rotation: a
@@ -623,6 +633,14 @@ func (s *Sink) rotatedPath() (string, error) {
 	if s.ordinalSeedUncertain {
 		seed, ok := maxRotatedOrdinal(s.logPath)
 		if !ok {
+			// Surface the stall. Deferring is correct for chain integrity, but a fault that
+			// persists (a 0300 log dir, a chronic EIO/ESTALE) defers EVERY future rotation
+			// too, so rotateSizeBytes and retainRotated are silently voided and the active
+			// log grows unbounded until the filesystem fills — at which point writes fail
+			// and --require-audit=strict denies all traffic. A single stderr line before a
+			// self-inflicted outage is not enough signal; MaintenanceStalled puts it on
+			// /healthz and in doctor while it is still recoverable.
+			s.markMaintenanceStalled(fmt.Sprintf("rotation deferred: the audit log's sibling directory for %q cannot be listed, so a rotation ordinal cannot be seeded; the size bound is not being enforced and the log will grow until this is fixed", s.logPath))
 			// The same directory-read fault that set the uncertain flag still persists (e.g.
 			// a write+exec-but-not-readable log dir, where ReadDir fails while Rename/Lstat
 			// still succeed). Do NOT fall through and stamp ordinal 1: it would sort BEFORE
@@ -636,6 +654,8 @@ func (s *Sink) rotatedPath() (string, error) {
 			s.rotateOrdinal = seed
 		}
 		s.ordinalSeedUncertain = false
+		// The directory became readable again: the deferral self-healed, so stop reporting.
+		s.clearMaintenanceStalled()
 	}
 	s.rotateOrdinal++
 	base := s.logPath + "." + fmt.Sprintf("%020d", s.rotateOrdinal) + "." + s.clock().UTC().Format("20060102T150405.000000000Z")

@@ -37,7 +37,7 @@ your IdP) and enforces a fine-grained YAML policy on top of it.
 | `sampling/createMessage` *(upstream→host)* | **Enforced** (local subprocess upstream only) — denied by default; requires explicit `system:sampling/createMessage` entry in manifest, and the kill switch applies. On the allow path the host's response is routed back to the upstream so the round-trip completes | Fail-closed: absent = deny. See the transport caveats in *Known gaps* below |
 | Upstream-initiated non-sampling requests (e.g. `roots/list`) | **Forwarded** for local subprocess upstreams — not policy-enforced (no allow/deny decision), but kill-switch-checked, `--require-audit=strict`-gated, and audited (an allow record on delivery, an `ENFORCEMENT_ERROR` deny if no client received it); the host's response is routed back to the upstream | Remote HTTP upstreams have no background reader and do not consume server-initiated messages |
 | `initialize` *(host→proxy)* | **Handled by proxy** — eunox sends its own `initialize` to the upstream at startup and synthesizes the host-facing response using the upstream's declared capabilities | Host never sees the upstream's raw response |
-| `ping` *(host→proxy)* | **Denied** — no handler registered; treated as unmapped request | Upstream is never called |
+| `ping` *(host→proxy)* | **Answered locally** with the spec's empty result. It carries no arguments, names no target, and reaches no upstream, so there is nothing for a manifest to authorize; it is not forwarded, so it cannot be used to probe upstream liveness through the proxy. | Upstream is never called. Subject to the shared kill gate: a killed session gets `KILL_SWITCH`, not a pong. No audit record (a handshake-level utility, not a guarded action). |
 | Host notifications (`notifications/*`) *(host→upstream)* | **Allowlisted** — only `notifications/cancelled`, `notifications/progress`, and `notifications/roots/list_changed` are forwarded verbatim (no PDP evaluation of their contents). Any other notification-framed method is denied and recorded (`AUTHORIZATION_FAILED`), never reaching the upstream: an enforced method smuggled in as a notification (no `id`) is rejected rather than bypassing its PDP decision, and any other unmapped method gets the same fail-closed default its request-framed twin gets from `dispatchUnmapped` | Exceptions: `notifications/initialized` is swallowed (the proxy has already sent its own to the upstream); `notifications/cancelled` has its `params.requestId` rewritten to the proxy nonce the upstream saw for that request (host request ids are nonce-rewritten on the wire), so the cancel actually targets the in-flight call — a cancel for a request no longer in flight is dropped. Cancellation is best-effort on HTTP: a cancel delivered on a separate connection concurrently with its target request (before the request registered) is dropped, matching the MCP spec's inherently-racy cancellation. A killed session's notifications are dropped (ack'd) rather than forwarded. |
 | Upstream notifications (`notifications/*`) *(upstream→host)* | **Relayed** — stdio writes to the host, HTTP broadcasts to the session's SSE stream(s) | A killed session stops receiving the relay: both transports gate the relay on the kill switch (so a Redis-backed kill, which does not evict SSE streams, still shuts the server→client channel), and the drop is recorded to the audit tape. |
 | All other **host-originated request** methods | **Denied** — `AUTHORIZATION_FAILED` returned to host; upstream never called | Fail-closed default for unmapped host requests |
@@ -380,8 +380,8 @@ are otherwise untouched.
 **Locally-answered paths that DO produce records** (record-before-act on the
 tamper-evident tape):
 
-- **Denied unmapped methods** (`ping` and any method with no registered
-  handler) — denied with `AUTHORIZATION_FAILED`. A deny record is written to the
+- **Denied unmapped methods** (any method with no registered handler) — denied
+  with `AUTHORIZATION_FAILED`. A deny record is written to the
   audit tape (record-before-act), then a stderr notice is logged, and the
   upstream is never called.
 - **`*/list` filtering** (`tools/list`, `resources/list`, `prompts/list`) —
@@ -396,11 +396,29 @@ tamper-evident tape):
   `--require-audit=strict`-gated, and audited: an allow record on delivery to a
   client, or an `ENFORCEMENT_ERROR` deny if no client received it. The host's
   response is routed back to the upstream so the request completes.
+- **Transport-surface refusals** — requests turned away before (or independently
+  of) a PDP decision: a rejected `Origin` (`ORIGIN_REJECTED`), an invalid bearer
+  or control token (`AUTH_FAILED` / `CONTROL_AUTH_FAILED`), a rejected loopback
+  or DNS-rebinding `Host` on `/control/kill`, `/healthz`, `/metrics`
+  (`LOOPBACK_REJECTED`), a saturated handler pool or an exhausted concurrent
+  **session** cap (`RESOURCE_EXHAUSTED`), and a startup drift refusal
+  (`DRIFT_REFUSED`). None names a policy target, so `suggest` skips them all.
+
+  These are the only records an *unauthenticated* caller can cause, so their
+  write rate is bounded by a token bucket: within a burst each refusal is
+  recorded in full, and beyond it the next record that gets through carries a
+  `suppressed_count` of the refusals elided since. Without that bound a
+  credential-spray could overflow the audit queue, and because the sink's drop
+  counter is monotonic, that would leave `--require-audit=strict` denying every
+  legitimate request for the rest of the process's life. A non-zero
+  `suppressed_count` on one of these codes therefore means a flood, not a lost
+  decision record — no *policy* decision is ever rate-limited.
 
 The only locally-answered path with no audit record is the `initialize`
-handshake, which is not a guarded action. The `*/list` and upstream-initiated
-paths complete successfully (or pass through) but are still recorded, so absence
-of a record is not evidence that a guarded action was allowed.
+handshake, which is not a guarded action. Every other locally-answered path —
+`*/list`, upstream-initiated requests, and every transport-surface refusal —
+either completes and is recorded or is refused and is recorded, so absence of a
+record is not evidence that a guarded action was allowed.
 
 Beyond those by-design paths, records can also be lost unintentionally, in two
 ways:
