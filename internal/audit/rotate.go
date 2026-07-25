@@ -200,12 +200,24 @@ func sortedRotatedSiblings(logPath string) ([]string, error) {
 // This restores the same fail-closed stance recoverTailAfterReadError already takes for
 // an unreadable BASE log.
 //
-// Returns ("", "", false) when no sibling has a usable tail and none was unreadable.
-// Used at both chain-resume sites (Open, recoverTailAfterReadError).
+// Returns ("", "", false) when no sibling has a usable tail and none was unreadable and the
+// directory listed cleanly. An unreadable sibling FILE, or a log directory that cannot be
+// LISTED at all (any error other than a not-yet-created one), returns ("", "", true) so the
+// caller fails closed. Used at both chain-resume sites (Open, recoverTailAfterReadError).
 func newestRotatedSiblingWithTail(logPath string) (path, line string, unreadableNewer bool) {
 	files, err := sortedRotatedSiblings(logPath)
 	if err != nil {
-		return "", "", false
+		// A log directory that does not exist yet is the ordinary fresh-install case (no
+		// siblings): pass through. Any OTHER listing error (a permission bit, EIO, NFS
+		// ESTALE, or the parent not being a directory) means we cannot rule out a newer
+		// sibling holding higher seqs, so fail closed exactly as an unreadable sibling FILE
+		// does below — the empty-base caller then seeds past the on-disk max and writes a
+		// chain_resume_failed marker instead of silently rewinding to genesis and reissuing
+		// seqs with no marker.
+		if errors.Is(err, fs.ErrNotExist) {
+			return "", "", false
+		}
+		return "", "", true
 	}
 	for i := len(files) - 1; i >= 0; i-- {
 		l, lerr := readLastAuditLine(files[i])
@@ -323,10 +335,39 @@ func (s *Sink) swapToFreshBase(f *os.File, closeErrContext string) {
 // passes through to O_CREATE. On refusal the caller takes its existing reopen-failure
 // fallback (keep the renamed fd, retry later), the fail-closed direction.
 func openGuardedAppend(logPath string) (*os.File, error) {
-	if fi, statErr := os.Lstat(logPath); statErr == nil && !fi.Mode().IsRegular() {
-		return nil, fmt.Errorf("refusing a non-regular audit log path %q (mode %v): the audit log must be a regular file, not a symlink or other special file", logPath, fi.Mode())
+	if err := refuseNonRegular(logPath); err != nil {
+		return nil, err
 	}
 	return os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600) //nolint:gosec // G304: path is user-configured audit log location
+}
+
+// refuseNonRegular fails closed unless logPath is a regular file or genuinely absent. It is
+// the single implementation of the audit-log symlink/non-regular open guard, shared by the
+// startup open (openAndPrepareLog) and the two post-rotation reopen sites (via
+// openGuardedAppend) so a change to the check cannot leave one site weaker than the other.
+// os.OpenFile FOLLOWS a symlink, so opening the log through one would redirect the
+// tamper-evident tape AND drop the live log out of LogChainFiles' IsRegular() scan —
+// audit-verify would then PASS without reading a single record. Only a genuinely-absent
+// path (fs.ErrNotExist) is let through: the ordinary fresh-install and post-rename case
+// O_CREATE then fills. Any OTHER Lstat error (EIO, NFS ESTALE, ELOOP, EACCES on a path
+// component) is REFUSED, not assumed benign — gating the refusal on "stat succeeded" would
+// let a stat fault skip the check and follow a symlink, the fail-OPEN direction this guard
+// exists to prevent. Lstat inspects the path itself, not its target. A Lstat->open TOCTOU
+// remains (a symlink planted between this check and the open is still followed); closing it
+// fully needs O_NOFOLLOW-level atomicity, not portable here, so this guard closes the
+// steady-state and stat-error holes while the caller keeps the rename->reopen window narrow.
+func refuseNonRegular(logPath string) error {
+	fi, statErr := os.Lstat(logPath)
+	if statErr != nil {
+		if errors.Is(statErr, fs.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("refusing audit log path %q: cannot stat it (%v); refusing a path that may be a symlink or other non-regular file", logPath, statErr)
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("refusing a non-regular log path %q (mode %v): the audit log must be a regular file, not a symlink or other special file", logPath, fi.Mode())
+	}
+	return nil
 }
 
 func (s *Sink) rotate() {
@@ -458,8 +499,21 @@ func (s *Sink) retryRotateReopen() {
 	// first also bounds the fallback's non-durable tail on every retry, including
 	// the attempts where the reopen below still fails.
 	if serr := s.f.Sync(); serr != nil {
+		// The fallback sidecar's tail is not durable. Do NOT complete the swap on a failed
+		// sync: swapToFreshBase closes this fd for good (Close does not fsync on Linux), so a
+		// crash would permanently drop the un-synced tail and leave a tamper-shaped chain gap
+		// at the rotation boundary — the exact window rotate()'s sync-defer closes, and the
+		// "caller MUST have synced the old fd first" precondition swapToFreshBase documents.
+		// Stay in fallback (s.inFallback is still set) and retry the sync on the next bounded
+		// attempt; only complete the swap once the tail is durable. Re-syncing the SAME fd is
+		// a bounded best effort — Linux reports a writeback error to a given fd at most once,
+		// so a later nil Sync does not by itself prove the first-failed pages reached disk —
+		// but never completing the swap on a failed sync is the load-bearing half: it keeps
+		// the fd open and retryable instead of closing over a non-durable tail.
 		s.writeFailures.Add(1)
-		fmt.Fprintf(os.Stderr, "[eunox] audit rotate error (sync on fallback recovery): %v\n", serr)
+		fmt.Fprintf(os.Stderr, "[eunox] audit rotate error (sync on fallback recovery): %v; deferring the swap until the fallback tail is durable\n", serr)
+		s.written = s.rotateBackoffWritten()
+		return
 	}
 	f, err := openGuardedAppend(s.logPath)
 	if err != nil {

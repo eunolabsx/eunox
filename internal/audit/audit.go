@@ -452,19 +452,15 @@ func openAndPrepareLog(logPath string, preSize int64, lockFile *os.File) (f *os.
 	// skips partial-tail recovery and a non-clean shutdown falls into the
 	// chain-resume-failed path, same as any genuinely unreadable log. We never widen the
 	// mode to gain read access (see tightenLogMode).
-	// Refuse a non-regular log path (a symlink, most concretely) before opening it.
-	// os.OpenFile follows a symlink and would happily append through it, but
-	// LogChainFiles' directory scan filters entries to IsRegular() (matching
-	// rotatedSiblings, which must not seed the chain from a directory or symlink
-	// sharing the base's name) — so a symlinked active log is silently excluded
-	// from every audit-verify run: verify PASSES without reading a single live
-	// record instead of failing on the mismatch, and after rotation the renamed
-	// symlink-shaped sibling drops those pre-rotation records out of coverage for
-	// good. Lstat (not Stat) so the check inspects the path itself, not its target.
-	// A missing path is the ordinary fresh-install case and passes through untouched.
-	if fi, statErr := os.Lstat(logPath); statErr == nil && !fi.Mode().IsRegular() {
+	// Refuse a non-regular log path (a symlink, most concretely) — or one that cannot be
+	// Lstat'd for any reason other than genuine absence — before opening it: os.OpenFile
+	// follows a symlink and a symlinked active log is silently excluded from audit-verify's
+	// IsRegular() chain scan. The shared refuseNonRegular guard (see rotate.go) fails closed
+	// on a stat fault too, so this startup site and the two post-rotation reopen sites can
+	// never diverge on the check. Wrapping keeps the "opening audit log" provenance here.
+	if err := refuseNonRegular(logPath); err != nil {
 		_ = releaseAuditLock(lockFile)
-		return nil, 0, 0, fmt.Errorf("opening audit log %q: refusing a non-regular log path (mode %v); the audit log must be a regular file, not a symlink or other special file", logPath, fi.Mode())
+		return nil, 0, 0, fmt.Errorf("opening audit log %q: %w", logPath, err)
 	}
 
 	readable := true
@@ -500,31 +496,69 @@ func openAndPrepareLog(logPath string, preSize int64, lockFile *os.File) (f *os.
 	return f, max(0, written-recoveredPartialBytes), recoveredPartialBytes, nil
 }
 
-// highestSeqAcrossChain returns the largest seq found across the base log AND every
-// rotated sibling, so a startup path that cannot trust the tail can seed the resumed
-// counter past every seq already on disk and never reissue one. It is the cross-file
-// generalization of scanHighestSeq: after a rotation the base holds the HIGHEST seqs in
-// only a few bytes, so scanning the base alone under-estimates — and when the base itself
-// is unreadable (a write-only 0200 log) its size-based estimate can fall BELOW a readable
-// sibling's real max. Taking the max over the whole chain closes both gaps. Like
-// scanHighestSeq it never verifies HMACs or seeds prev_hmac; it only advances the
-// monotonic counter, so an unsigned or forged on-disk record can at worst inflate the
-// counter (harmless), never inject a trusted link. ok is false only when nothing
-// parseable was found anywhere on disk.
+// highestSeqAcrossChain returns the seq the resumed counter must start past, computed
+// across the base log AND every rotated sibling so a startup path that cannot trust the
+// tail never reissues an existing seq. See highestSeqAcrossChainCapped for how unreadable
+// files are folded in as a safe over-estimate.
 func highestSeqAcrossChain(logPath string) (highest uint64, ok bool) {
-	if h, o := scanHighestSeq(logPath); o {
-		highest, ok = h, true
-	}
-	sibs, err := sortedRotatedSiblings(logPath)
-	if err != nil {
-		return highest, ok
-	}
-	for _, sib := range sibs {
-		if h, o := scanHighestSeq(sib); o && h > highest {
-			highest, ok = h, true
+	return highestSeqAcrossChainCapped(logPath, rescanBufferBytes)
+}
+
+// highestSeqAcrossChainCapped is highestSeqAcrossChain with the per-line scan cap injected
+// for deterministic tests (mirroring scanHighestSeqCapped). It over-estimates PAST the true
+// on-disk max as: the highest seq actually READ anywhere in the chain (exact) PLUS the
+// total BYTES of every file that could not be read. Each unread record occupies >= 1 byte,
+// so the unread byte total bounds how many higher seqs an unreadable file can hold beyond
+// the readable max; folding those bytes ADDITIVELY — rather than taking the max of per-file
+// byte sizes, as scanning each file independently would — is what keeps a single rotated
+// sibling's byte count from masquerading as a global seq. seq is monotonic across the WHOLE
+// chain while each file's size is bounded by the rotation size, so after enough rotations
+// (or with a small configured rotate size) the global seq exceeds any one file's byte size:
+// the old per-file max then seeded BELOW the true max and reissued seqs. The additive fold
+// seeds past the true max whenever ANY file in the chain is readable (the readable max is
+// the anchor the unread bytes extend). The one residual — a chain whose files are ALL
+// unreadable AND whose earlier history was pruned — cannot reconstruct the pruned records'
+// seq span from the surviving bytes and may restart low, but always under a
+// chain_resume_failed marker (the break is never silent). Like scanHighestSeq it never
+// verifies HMACs or seeds prev_hmac; it only advances the monotonic counter. ok is false
+// only when nothing — no parseable record and no unread bytes — was found anywhere on disk.
+func highestSeqAcrossChainCapped(logPath string, bufCap int) (highest uint64, ok bool) {
+	var maxParsed, unreadBytes uint64
+	var parsedAny, sawUnread bool
+	fold := func(path string) {
+		p, parsed, ub := scanSeqContribution(path, bufCap)
+		if parsed {
+			parsedAny = true
+			if p > maxParsed {
+				maxParsed = p
+			}
+		}
+		if ub > 0 {
+			sawUnread = true
+			unreadBytes = satAddU64(unreadBytes, ub)
 		}
 	}
-	return highest, ok
+	fold(logPath)
+	// A directory-listing failure leaves only the base's contribution (best effort). The
+	// fail-closed marker for an unreadable/unlistable chain is driven separately by
+	// newestRotatedSiblingWithTail's unreadableNewer signal at the resume sites, so seeding
+	// stays best-effort here rather than double-reporting the same fault.
+	if sibs, err := sortedRotatedSiblings(logPath); err == nil {
+		for _, sib := range sibs {
+			fold(sib)
+		}
+	}
+	return satAddU64(maxParsed, unreadBytes), parsedAny || sawUnread
+}
+
+// satAddU64 adds two uint64 values, saturating at the maximum rather than wrapping, so a
+// pathologically large unread-byte total can never wrap the seed back down to a small value
+// (which would then reissue existing seqs — the very failure the seed exists to prevent).
+func satAddU64(a, b uint64) uint64 {
+	if a > ^uint64(0)-b {
+		return ^uint64(0)
+	}
+	return a + b
 }
 
 // seedSeqPastOnDiskMax advances s.seq past the highest seq already on disk (base +
@@ -1052,28 +1086,48 @@ func scanHighestSeq(path string) (highest uint64, ok bool) {
 // (line-just-over-cap) fixture instead of allocating a >64 MiB line. Production always
 // passes rescanBufferBytes.
 func scanHighestSeqCapped(path string, bufCap int) (highest uint64, ok bool) {
+	parsedMax, parsed, unreadBytes := scanSeqContribution(path, bufCap)
+	// Single-FILE over-estimate: the byte size bounds the max only for a file that began at
+	// genesis (seq <= bytes), so it is used as an absolute value HERE. highestSeqAcrossChain
+	// instead folds unreadBytes ADDITIVELY across the chain, where one file's byte count is
+	// not a global seq. Callers/tests of this single-file view expect the max of the two.
+	if unreadBytes > parsedMax {
+		return unreadBytes, true
+	}
+	return parsedMax, parsed
+}
+
+// scanSeqContribution reads path once and separates the two distinct ways a file can inform
+// the resumed seq counter, which callers combine differently:
+//
+//   - parsedMax/parsed: the largest seq actually decoded from a record (exact and
+//     authoritative). parsed is false when the file opened and read cleanly but held no
+//     parseable record (empty/blank/all-legacy).
+//   - unreadBytes: the file's byte size when it could NOT be fully read — os.Open was
+//     refused (a write-only 0200 log fails EACCES on every restart) or the scan aborted on
+//     an over-cap line (bufio.ErrTooLong) or a mid-file read fault — so the true max is
+//     unknown and bounded only by the byte count (>= 1 byte per record). Zero when the file
+//     read cleanly to EOF.
+//
+// Returning (0, false) for an unreadable non-empty file would seed the counter at genesis
+// (seq 1) and reissue every on-disk seq — a tamper-shaped duplicate-seq cascade, WORSE than
+// a gap — so an unopenable file reports its stat(2) size instead (stat needs no read
+// permission). It never verifies HMACs and never seeds prev_hmac: it only advances the
+// monotonic seq counter, so an unsigned or forged on-disk record can at worst inflate the
+// counter (harmless), never inject a trusted chain link.
+func scanSeqContribution(path string, bufCap int) (parsedMax uint64, parsed bool, unreadBytes uint64) {
 	f, err := os.Open(path) //nolint:gosec // G304: path is the user-configured audit log
 	if err != nil {
-		// The base is non-empty (a caller reached here after readLastAuditLine failed
-		// to read it) but cannot be OPENED for reading — the supported write-only
-		// (0200) audit-log deployment fails os.Open with EACCES on every restart.
-		// Returning (0, false) would seed the resumed counter at genesis (seq 1),
-		// duplicating every on-disk seq — a tamper-shaped duplicate-seq cascade, which
-		// is WORSE than a gap. Fall back to the file-size over-estimate: stat(2) does
-		// not require read permission, so this seeds PAST the on-disk maximum, turning
-		// the cascade into the detectable, already-documented SEQ-GAP over-estimate and
-		// making the "seq continues past the on-disk maximum" restart warning truthful.
 		if info, statErr := os.Stat(path); statErr == nil {
 			if sz := uint64(info.Size()); sz > 0 { //nolint:gosec // G115: file size is non-negative
-				return sz, true
+				return 0, false, sz
 			}
 		}
-		return 0, false
+		return 0, false, 0
 	}
 	defer func() { _ = f.Close() }()
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, min(64<<10, bufCap)), bufCap)
-	parsed := false
 	for scanner.Scan() {
 		line := bytes.TrimSpace(scanner.Bytes())
 		if len(line) == 0 {
@@ -1084,28 +1138,25 @@ func scanHighestSeqCapped(path string, bufCap int) (highest uint64, ok bool) {
 			continue
 		}
 		parsed = true
-		if rec.Seq > highest {
-			highest = rec.Seq
+		if rec.Seq > parsedMax {
+			parsedMax = rec.Seq
 		}
 	}
 	if scanner.Err() == nil {
-		// Clean EOF: highest is the confident true max (ok only when a record parsed).
-		return highest, parsed
+		// Clean EOF: parsedMax is the confident true max; nothing was left unread.
+		return parsedMax, parsed, 0
 	}
-	// The scan aborted — a line over the cap (bufio.ErrTooLong) or a mid-file read fault
-	// — so highest is only a LOWER bound: a higher-seq record may sit beyond the
-	// offending line, and seeding from it would re-issue existing seqs (a duplicate-seq
-	// cascade audit-verify cannot distinguish from tampering). Over-estimate from the
-	// file size, which seeds PAST the on-disk maximum. A duplicate seq is WORSE than a
-	// gap (a gap reads as "records lost"; a duplicate reads as tampering), so this
-	// inflated seed (and its detectable SEQ GAP) is the safe choice on this
-	// genuinely-undeterminable case only.
+	// The scan aborted — a line over the cap or a mid-file read fault — so parsedMax is only
+	// a LOWER bound: a higher-seq record may sit beyond the offending line. Report the file
+	// size as the unread over-estimate too, so the caller seeds past the on-disk maximum
+	// rather than from an under-count (a duplicate seq reads as tampering; a gap only as
+	// loss). This genuinely-undeterminable case is the only one that falls back to size.
 	if info, statErr := f.Stat(); statErr == nil {
-		if sz := uint64(info.Size()); sz > highest { //nolint:gosec // G115: file size is non-negative
-			return sz, true
+		if sz := uint64(info.Size()); sz > 0 { //nolint:gosec // G115: file size is non-negative
+			return parsedMax, parsed, sz
 		}
 	}
-	return highest, parsed
+	return parsedMax, parsed, 0
 }
 
 // interpretAuditTail extracts the last COMPLETE record line from the bytes ReadAt
