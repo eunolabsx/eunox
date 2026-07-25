@@ -858,12 +858,15 @@ type toolsListPage struct {
 	NextCursor string            `json:"nextCursor,omitempty"`
 }
 
-// ToolsListCursorParams builds the params for one paginated tools/list request: the
+// toolsListCursorParams builds the params for one paginated tools/list request: the
 // first page (empty cursor) carries no params; subsequent pages carry
-// {"cursor":"..."} per the MCP pagination model. Single-sourced next to
-// FetchAllToolPages so every FetchAllToolPages closure (both transport drift probes
-// and the CLI live-upstream probes) builds the pagination request identically.
-func ToolsListCursorParams(cursor string) json.RawMessage {
+// {"cursor":"..."} per the MCP pagination model.
+//
+// Unexported: ToolsListRequest is the seam every probe uses (both transport drift
+// probes and the CLI live-upstream probes), and it builds the WHOLE request, so a
+// caller assembling a bare params blob would be bypassing the id/method half of the
+// single-sourcing rather than participating in it.
+func toolsListCursorParams(cursor string) json.RawMessage {
 	if cursor == "" {
 		return nil
 	}
@@ -873,13 +876,13 @@ func ToolsListCursorParams(cursor string) json.RawMessage {
 }
 
 // ToolsListRequest builds a complete JSON-RPC tools/list request for one pagination
-// page: the given JSON-RPC id plus the cursor params from ToolsListCursorParams.
-// Single-sourced here beside ToolsListCursorParams so every drift/CLI probe (the two
+// page: the given JSON-RPC id plus the cursor params from toolsListCursorParams.
+// Single-sourced here so every drift/CLI probe (the two
 // transport session-start probes and the two CLI live-upstream probes) issues an
 // identical request, differing only in the id, instead of hand-building the same
 // literal at four sites.
 func ToolsListRequest(id *json.RawMessage, cursor string) mcp.RPCMsg {
-	return mcp.RPCMsg{JSONRPC: "2.0", ID: id, Method: capability.MethodToolsList, Params: ToolsListCursorParams(cursor)}
+	return mcp.RPCMsg{JSONRPC: "2.0", ID: id, Method: capability.MethodToolsList, Params: toolsListCursorParams(cursor)}
 }
 
 // FetchAllToolPages drives tools/list pagination to exhaustion and returns a

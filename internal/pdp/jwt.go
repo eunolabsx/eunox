@@ -245,8 +245,11 @@ type JWTPDPOptions struct {
 	Audience string
 	// AllowAnyAudience disables audience pinning (--jwt-allow-any-audience): a token
 	// is accepted regardless of aud. When false (default) the audience is always
-	// pinned to Audience — even when Audience is empty, which rejects every token
-	// with a non-empty aud (fail closed) rather than accepting cross-audience tokens.
+	// pinned to Audience — and when Audience (and AcceptedAudiences) is empty, EVERY
+	// token is rejected regardless of its aud, including one whose aud is the literal
+	// empty string. validateStandardClaims refuses outright there rather than falling
+	// back to jwt.Expected{AnyAudience: [""]}, whose set-intersection match would have
+	// admitted exactly those empty-aud tokens.
 	AllowAnyAudience bool
 	// AcceptedAudiences widens the validator's accepted-audience set beyond the single
 	// Audience: a token is valid if its aud carries AT LEAST ONE entry. Empty falls back
@@ -826,9 +829,11 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 		// verification path, so accepting one would let anyone who captured it replay it.
 		// The predicate is capability.CnfIsSenderConstrained, which decodes through
 		// Confirmation.IsSenderConstrained — the one canonical sender-constrained rule
-		// every JWT-verification path in the binary shares. A present but non-object cnf
-		// is malformed and rejected as a malformed token (not mislabeled
-		// sender_constrained); either way we fail closed.
+		// every JWT-verification path in the binary shares. A present non-object cnf is
+		// malformed and rejected as a malformed token (not mislabeled sender_constrained);
+		// either way we fail closed. An explicit `"cnf": null` is the one exception: it
+		// decodes to a nil value, which CnfIsSenderConstrained treats as absent — neither
+		// constraining nor malformed — so it passes through like a token carrying no cnf.
 		if constrained, malformed := capability.CnfIsSenderConstrained(rawClaims["cnf"]); malformed {
 			return nil, capability.Terminal(jwtErr(jwtErrMalformedToken, fmt.Errorf("cnf claim is present but not a JSON object (RFC 7800 requires an object); rejecting (fail closed)")))
 		} else if constrained {

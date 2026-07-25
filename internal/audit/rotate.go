@@ -40,7 +40,9 @@ func (s *Sink) rotateBackoffWritten() int64 {
 }
 
 // rotatedAuditRe matches the suffix rotatedPath() appends: a leading "." then an
-// OPTIONAL fixed-width 20-digit rotation seq, the nanosecond UTC layout
+// OPTIONAL fixed-width 20-digit rotation ORDINAL — not the chain seq, from which it is
+// deliberately decoupled (seq resets to genesis on tail corruption; the ordinal never
+// does; see rotatedOrderLess) — the nanosecond UTC layout
 // "20060102T150405.000000000Z", and an optional ".N" collision backstop. The
 // seq-prefixed form is the current scheme; the seq-less form is a pre-upgrade
 // legacy sibling (see rotatedOrderLess). Used to retain only genuine rotated

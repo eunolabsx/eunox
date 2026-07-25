@@ -207,8 +207,10 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 	if msg.Method == "initialize" && sessionID == "" && msg.IsRequest() {
 		// Kill-switch check BEFORE spawning anything: a session-creating initialize
 		// must not start an upstream while a global kill (emergency stop) is active.
-		// The empty session id means only the global dimension can match. Mirrors the
-		// explicit CheckKill in dispatchList for the */list path.
+		// The empty session id means only the global dimension can match. This is the one
+		// initialize answered outside dispatchRequest (there is no session or
+		// dispatchParams yet), so it repeats the kill gate dispatchRequest applies to
+		// every other locally-answered method.
 		if deny := route.pdp.CheckKill(r.Context(), ""); deny != nil {
 			resp := recordKillDenial(r.Context(), asRecorder(route.sink), deny, msg.ID, "", "initialize")
 			writeJSONMsg(w, resp)
@@ -732,10 +734,11 @@ func (p *HTTPProxy) handleMCPGet(w http.ResponseWriter, r *http.Request, route *
 			return
 		}
 		// Kill-switch check before serving: a killed (or globally emergency-stopped)
-		// session must not OPEN (or re-open) an SSE stream. This guards stream opens only
-		// — handleKill writes the kill store but does not tear down sessions, so a stream
-		// already open when the kill lands keeps delivering until the idle reaper closes
-		// it (evicting in-flight streams would change the kill switch's semantics). A
+		// session must not OPEN (or re-open) an SSE stream. This guards stream opens only.
+		// A targeted kill now tears the session down proactively (reapKilledSession, which
+		// closes the session and so ends its stream), but this check still matters for the
+		// cases teardown does not cover — a GLOBAL emergency stop, which writes the kill
+		// store without naming a session, and a re-open attempt racing that teardown. A
 		// kill-store error fails closed via CheckKill.
 		if deny := route.pdp.CheckKill(r.Context(), sessionID); deny != nil {
 			recordKillDrop(r.Context(), asRecorder(route.sink), deny, sessionID, "", "", legSSEGet)
