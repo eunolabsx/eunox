@@ -1026,6 +1026,7 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 		// sessionIdleTimeoutMs is 0 — otherwise killed-but-undead sessions would pin
 		// capacity and 503 new initializes.
 		p.reapAllKilledSessions() //nolint:contextcheck // teardown path: close()'s upstream session-termination DELETE intentionally uses a detached, bounded background context — binding it to r.Context() would cancel the teardown the instant this response is written. Same rationale as the handleMCPDelete close() site.
+		p.recordKillActivated(r, killScopeAll)
 		p.writeKillResponse(w, "all")
 		return
 	}
@@ -1044,7 +1045,43 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 	// maxSessions slot) instead of relying on the idle reaper, which does not run when
 	// sessionIdleTimeoutMs is 0 — see reapKilledSession.
 	p.reapKilledSession(body.SessionID) //nolint:contextcheck // teardown path: close()'s upstream session-termination DELETE intentionally uses a detached, bounded background context. Same rationale as the handleMCPDelete close() site.
+	p.recordKillActivated(r, body.SessionID)
 	p.writeKillResponse(w, body.SessionID)
+}
+
+// killScopeAll is the scope recorded (and returned) for a whole-proxy emergency stop,
+// distinguishing it from a targeted kill, whose scope is the killed session id.
+const killScopeAll = "all"
+
+// recordKillActivated writes the audit record for a SUCCESSFUL /control/kill
+// activation. Every refusal of this endpoint already lands on the tape
+// (CONTROL_AUTH_FAILED, LOOPBACK_REJECTED, ORIGIN_REJECTED), and every request the
+// activation goes on to block lands as a KILL_SWITCH denial — but the activation
+// itself, the single administrative act that explains the whole run of denials that
+// follows, left no trace at all. An auditor reconstructing an incident could see the
+// proxy stop serving without any signed evidence of when it was stopped or that the
+// stop was authorized.
+//
+// Recorded as an ALLOW: the request was authenticated by the control token and
+// performed, so it is a permitted action, not a refusal. It is emitted AFTER the
+// kill-store write and session teardown succeed, so the tape never claims a stop that
+// did not take effect (a failed ActivateGlobal/KillSession returns 500 before reaching
+// here). scope is the killed session id, or killScopeAll for a whole-proxy stop; it
+// goes in details rather than the structured target field, which is reserved for MCP
+// tool/resource/prompt targets this administrative action has none of.
+//
+// The record carries no credential — the control token is never recorded, matching the
+// CONTROL_AUTH_FAILED refusal path — and no session_id: a global stop addresses no
+// single session, and a targeted one names its session in details.scope, where it
+// cannot be confused with an authenticated session binding.
+func (p *HTTPProxy) recordKillActivated(r *http.Request, scope string) {
+	if p.sink == nil {
+		return
+	}
+	p.sink.RecordAllow(r.Context(), "", "", MethodControlKill, map[string]interface{}{
+		"scope":     scope,
+		"source_ip": p.sourceIP(r),
+	}, nil, false, nil, nil)
 }
 
 // writeKillResponse writes the kill endpoint's {"ok":true,"killed":<target>}

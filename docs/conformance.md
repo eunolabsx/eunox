@@ -403,6 +403,13 @@ tamper-evident tape):
   (`LOOPBACK_REJECTED`), a saturated handler pool or an exhausted concurrent
   **session** cap (`RESOURCE_EXHAUSTED`), and a startup drift refusal
   (`DRIFT_REFUSED`). None names a policy target, so `suggest` skips them all.
+- **Emergency-stop activation** — a successful `POST /control/kill` records an
+  allow with the method `control/kill` and `details.scope` (the killed session
+  id, or `all`), written only after the kill takes effect. It is the
+  administrative counterpart to the refusal codes above: the `KILL_SWITCH`
+  denials that follow an activation are recorded, so the activation itself must
+  be too. `control/kill` is not an MCP method, so it names no target and
+  `suggest` skips it.
 
   These are the only records an *unauthenticated* caller can cause, so their
   write rate is bounded by a token bucket: within a burst each refusal is

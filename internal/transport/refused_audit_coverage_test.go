@@ -4,6 +4,7 @@
 package transport
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/pdp"
 	"github.com/eunolabs/eunox/pkg/capability"
+	"github.com/eunolabs/eunox/pkg/killswitch"
 )
 
 // containsAny reports whether s contains any of subs.
@@ -235,4 +237,129 @@ func TestIsInfraDenialCode_RefusalCodes(t *testing.T) {
 	if IsInfraDenialCode(capability.ErrCodeCapabilityDenied) {
 		t.Error("CAPABILITY_DENIED must not be classified as an infra denial")
 	}
+}
+
+// TestHandleKill_RecordsSuccessfulActivation pins the other half of the /control/kill
+// audit story: every REFUSAL of the endpoint is recorded (CONTROL_AUTH_FAILED above),
+// and now the successful activation is too. Without it an auditor sees a run of
+// KILL_SWITCH denials with no signed evidence of when the stop was tripped or that it
+// was authorized. The control token must never appear on the tape.
+func TestHandleKill_RecordsSuccessfulActivation(t *testing.T) {
+	cases := []struct {
+		name      string
+		body      string
+		wantScope string
+	}{
+		{"global", `{"all":true}`, killScopeAll},
+		{"targeted", `{"sessionId":"sess-42"}`, "sess-42"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			sink, logPath := newTempAuditSink(t)
+			proxy := newHTTPProxy(httpProxyOptions{
+				PDP:          pdp.AlwaysAllowPDP{},
+				UpstreamURL:  "http://upstream.invalid",
+				ControlToken: "control-s3cret",
+				Sink:         sink,
+			})
+
+			req := httptest.NewRequest(http.MethodPost, "/control/kill", strings.NewReader(tc.body))
+			req.RemoteAddr = "127.0.0.1:6666"
+			req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
+			req.Header.Set(ControlTokenHeader, "control-s3cret")
+			rec := httptest.NewRecorder()
+			proxy.handleKill(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+			}
+
+			_ = sink.Close()
+			records := readAuditRecords(t, logPath)
+			var found map[string]interface{}
+			for _, r := range records {
+				if m, _ := r["method"].(string); m == MethodControlKill {
+					found = r
+					break
+				}
+			}
+			if found == nil {
+				t.Fatalf("expected a %q audit record for a successful activation; got %d records", MethodControlKill, len(records))
+			}
+			if d, _ := found["decision"].(string); d != "allow" {
+				t.Errorf("decision = %q, want \"allow\": the activation was authorized and performed, not refused", d)
+			}
+			details, _ := found["details"].(map[string]interface{})
+			if got, _ := details["scope"].(string); got != tc.wantScope {
+				t.Errorf("details.scope = %q, want %q", got, tc.wantScope)
+			}
+			// An administrative action addresses no MCP tool/resource/prompt, so no target
+			// may be fabricated from the method string (the phantom-target trap).
+			if tt, ok := found["target_type"].(string); ok && tt != "" {
+				t.Errorf("target_type = %q, want empty for an administrative action", tt)
+			}
+			if tgt, ok := found["target"].(string); ok && tgt != "" {
+				t.Errorf("target = %q, want empty for an administrative action", tgt)
+			}
+			assertRecordsExclude(t, records, "control-s3cret")
+		})
+	}
+}
+
+// TestHandleKill_NoRecordWhenActivationFails pins the ordering: the record is written
+// only AFTER the kill store accepts the write, so the tape never claims a stop that did
+// not take effect.
+func TestHandleKill_NoRecordWhenActivationFails(t *testing.T) {
+	sink, logPath := newTempAuditSink(t)
+	proxy := newHTTPProxy(httpProxyOptions{
+		PDP:          pdp.AlwaysAllowPDP{},
+		UpstreamURL:  "http://upstream.invalid",
+		ControlToken: "control-s3cret",
+		Sink:         sink,
+	})
+	proxy.ks = failingKillSwitch{}
+
+	req := httptest.NewRequest(http.MethodPost, "/control/kill", strings.NewReader(`{"all":true}`))
+	req.RemoteAddr = "127.0.0.1:6666"
+	req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
+	req.Header.Set(ControlTokenHeader, "control-s3cret")
+	rec := httptest.NewRecorder()
+	proxy.handleKill(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 when the kill store rejects the write", rec.Code)
+	}
+
+	_ = sink.Close()
+	for _, r := range readAuditRecords(t, logPath) {
+		if m, _ := r["method"].(string); m == MethodControlKill {
+			t.Fatalf("a failed activation must not be recorded as one: %v", r)
+		}
+	}
+}
+
+// failingKillSwitch fails every write so the activation path can be driven into its
+// fail-closed 500 without a real backend. Reads report "not blocked" so nothing else in
+// the handler short-circuits first.
+type failingKillSwitch struct{}
+
+func (failingKillSwitch) ShouldBlock(context.Context, string, string) (bool, error) {
+	return false, nil
+}
+func (failingKillSwitch) ActivateGlobal(context.Context) error   { return errors.New("backend down") }
+func (failingKillSwitch) DeactivateGlobal(context.Context) error { return errors.New("backend down") }
+func (failingKillSwitch) KillAgent(context.Context, string) error {
+	return errors.New("backend down")
+}
+func (failingKillSwitch) ReviveAgent(context.Context, string) error {
+	return errors.New("backend down")
+}
+func (failingKillSwitch) KillSession(context.Context, string) error {
+	return errors.New("backend down")
+}
+func (failingKillSwitch) ReviveSession(context.Context, string) error {
+	return errors.New("backend down")
+}
+func (failingKillSwitch) Reset(context.Context) error { return errors.New("backend down") }
+func (failingKillSwitch) Status(context.Context) (*killswitch.Status, error) {
+	return nil, errors.New("backend down")
 }
