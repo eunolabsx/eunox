@@ -145,3 +145,54 @@ func TestRedactURLForLog_StripsEveryCredentialBearingComponent(t *testing.T) {
 		t.Errorf("host and path must survive redaction; got %q", got)
 	}
 }
+
+// TestJWKSCache_GetKeysReturnsIndependentSlice pins that the cache never hands out its
+// live key slice. A caller that truncates, appends to, or reorders the returned set must
+// not disturb concurrent verifications reading the shared cache — the aliasing defense
+// FindKeys documents was bypassable by anyone calling GetKeys/Refresh directly.
+func TestJWKSCache_GetKeysReturnsIndependentSlice(t *testing.T) {
+	t.Parallel()
+	const keys = `{"keys":[{"kty":"oct","kid":"a","k":"AAAA"},{"kty":"oct","kid":"b","k":"BBBB"}]}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(keys))
+	}))
+	defer srv.Close()
+
+	c := NewJWKSCache(JWKSCacheConfig{JWKSURL: srv.URL, Client: &http.Client{Timeout: 5 * time.Second}})
+	first, err := c.GetKeys(context.Background())
+	if err != nil {
+		t.Fatalf("GetKeys: %v", err)
+	}
+	if len(first.Keys) != 2 {
+		t.Fatalf("expected 2 keys, got %d", len(first.Keys))
+	}
+	// Mutate the returned slice as a careless caller would.
+	first.Keys = first.Keys[:1]
+	first.Keys[0].KeyID = "clobbered"
+
+	second, err := c.GetKeys(context.Background())
+	if err != nil {
+		t.Fatalf("GetKeys (second): %v", err)
+	}
+	if len(second.Keys) != 2 {
+		t.Fatalf("caller mutation truncated the shared cache: got %d keys, want 2", len(second.Keys))
+	}
+	if second.Keys[0].KeyID != "a" {
+		t.Errorf("caller mutation reached the cached key id: got %q, want \"a\"", second.Keys[0].KeyID)
+	}
+}
+
+// TestNewPayloadCache_NilCloneFailsClosed pins that a missing Clone degrades the cache to
+// a no-op rather than panicking on the JWT verify hot path.
+func TestNewPayloadCache_NilCloneFailsClosed(t *testing.T) {
+	t.Parallel()
+	c := NewPayloadCache(PayloadCacheConfig[int]{}) // Clone deliberately unset
+	c.Put("k", 42, time.Now().Add(time.Hour).Unix())
+	if _, ok := c.Get("k"); ok {
+		t.Error("a cache with no Clone must not serve entries; it must fail closed to a miss")
+	}
+	if n := c.Len(); n != 0 {
+		t.Errorf("a cache with no Clone must store nothing; Len() = %d", n)
+	}
+}

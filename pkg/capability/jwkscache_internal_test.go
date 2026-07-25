@@ -336,10 +336,15 @@ func TestJWKSCache_refresh_SkippedInstallReturnsInstalledSet(t *testing.T) {
 	// set present before this fetch, so it must report no change.
 	require.False(t, changed, "changed must be computed against the returned installed set (no change)")
 
-	// And GetKeys continues to serve the installed set, confirming coherence.
+	// And GetKeys continues to serve the installed set, confirming coherence. Compared
+	// by CONTENT, not identity: GetKeys deliberately hands out a copy whose Keys slice is
+	// independent of the cache's, so a caller cannot mutate shared state other
+	// verifications are concurrently reading. Asserting pointer identity here would pin
+	// the aliasing that defense exists to remove.
 	served, err := cache.GetKeys(context.Background())
 	require.NoError(t, err)
-	require.Same(t, installed, served)
+	require.NotSame(t, installed, served, "GetKeys must not hand out the live cached set")
+	require.Equal(t, installed.Keys, served.Keys, "GetKeys must serve the installed set's contents")
 }
 
 // jwksJSONWithNKeys returns a marshaled JWKS carrying n keys, all reusing one

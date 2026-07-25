@@ -84,6 +84,17 @@ func NewPayloadCache[T any](cfg PayloadCacheConfig[T]) *PayloadCache[T] {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
+	// Clone is load-bearing, not optional: both Get and Put call it, and a nil one made
+	// every cache operation a nil-func PANIC rather than the fail-closed miss the rest of
+	// this type is written around. The panic would land on the JWT verify hot path, which
+	// turns a construction mistake in a library consumer into a crashed proxy. Substitute
+	// a clone that always reports failure: Get returns a miss and Put declines to cache,
+	// so the cache degrades into a no-op -- correct, just uncached -- exactly as it does
+	// when a real Clone fails.
+	if cfg.Clone == nil {
+		var zero T
+		cfg.Clone = func(T) (T, bool) { return zero, false }
+	}
 	return &PayloadCache[T]{
 		cfg: cfg,
 		// No size hint: an unused cache (e.g. a per-route JWTPDP wrapper that never puts)

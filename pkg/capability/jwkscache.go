@@ -215,19 +215,40 @@ func (c *JWKSCache) GetKeys(ctx context.Context) (*jose.JSONWebKeySet, error) {
 	if c.jwks != nil && c.now().Sub(c.fetchedAt) < c.cacheTTL {
 		keys := c.jwks
 		c.mu.RUnlock()
-		return keys, nil
+		return copyKeySet(keys), nil
 	}
 	c.mu.RUnlock()
 	return c.Refresh(ctx)
 }
 
+// copyKeySet returns a set whose Keys SLICE is independent of the cached one, so a
+// caller appending to, reordering, or truncating the returned set cannot mutate the
+// shared cache other verifications are concurrently reading. Handing out the live
+// pointer made the cache's aliasing defense -- which FindKeys documents and applies --
+// bypassable by anyone who called GetKeys/Refresh directly.
+//
+// The copy is one level deep. Each jose.JSONWebKey still carries a Key interface{}
+// pointing at the same underlying *rsa.PublicKey / *ecdsa.PublicKey, so mutating a KEY'S
+// INTERNALS still reaches the cache; that is inherent to the type and is the same bound
+// FindKeys has. The realistic accident -- slice mutation -- is what this closes.
+func copyKeySet(set *jose.JSONWebKeySet) *jose.JSONWebKeySet {
+	if set == nil {
+		return nil
+	}
+	return &jose.JSONWebKeySet{Keys: append([]jose.JSONWebKey(nil), set.Keys...)}
+}
+
 // Refresh returns a fresh JWKS, respecting the cache TTL: if the cached copy is
-// still within TTL it is returned without an HTTP fetch. The returned set is the
-// cache's shared, READ-ONLY instance (see GetKeys) — copy through FindKeys before
-// holding or mutating.
+// still within TTL it is returned without an HTTP fetch.
+//
+// The returned set's Keys slice is independent of the cache's (see copyKeySet), so a
+// caller may hold, append to, or reorder it without disturbing concurrent verifications.
+// Handing out the live pointer made the aliasing defense FindKeys documents bypassable by
+// anyone calling this directly. Individual jose.JSONWebKey values still share their
+// underlying crypto key, so treat the KEYS themselves as read-only.
 func (c *JWKSCache) Refresh(ctx context.Context) (*jose.JSONWebKeySet, error) {
 	keys, _, err := c.refresh(ctx, false)
-	return keys, err
+	return copyKeySet(keys), err
 }
 
 // ForceRefreshForKID performs a rate-limited forced fetch (refresh(ctx, true)), but
