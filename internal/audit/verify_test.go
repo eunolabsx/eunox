@@ -10,9 +10,6 @@ package audit
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,8 +23,10 @@ import (
 )
 
 // signTestRecord signs rec with key, stamping rec.KeyID verbatim, and returns the
-// on-disk line (body with _hmac spliced in) — mirroring writeRecord's signing so
-// VerifyRecord accepts it. Passing an empty KeyID produces a pre-key_id-era record.
+// on-disk line — via recordMAC/signedRecordLine, the same two calls writeRecord
+// itself makes, so this is not a second, independently-maintained definition of a
+// signed record's bytes that could drift from the real one. Passing an empty KeyID
+// produces a pre-key_id-era record.
 func signTestRecord(t *testing.T, key []byte, rec auditRecord) []byte {
 	t.Helper()
 	rec.HMAC = ""
@@ -35,12 +34,9 @@ func signTestRecord(t *testing.T, key []byte, rec auditRecord) []byte {
 	if err != nil {
 		t.Fatalf("marshal record: %v", err)
 	}
-	mac := hmac.New(sha256.New, key)
-	mac.Write(body)
-	rec.HMAC = "sha256:" + hex.EncodeToString(mac.Sum(nil))
-	line, err := json.Marshal(rec)
+	line, err := signedRecordLine(body, recordMAC(key, body))
 	if err != nil {
-		t.Fatalf("marshal signed record: %v", err)
+		t.Fatalf("signedRecordLine: %v", err)
 	}
 	return line
 }
@@ -912,10 +908,12 @@ func TestVerifyAuditLog_ForgedEmptyPrevSeq1_IsChainBreak(t *testing.T) {
 	}
 }
 
-// signAuditLine signs rec under key exactly as the audit sink does (HMAC over the
-// record with the _hmac field cleared) and returns the final JSON line. It lets a
-// test craft records with arbitrary seq values — including the post-wrap seq 0 —
-// that still verify, which the sink's monotonic counter cannot produce directly.
+// signAuditLine signs rec under key exactly as the audit sink does — via
+// recordMAC/signedRecordLine, the same two calls writeRecord itself makes, so this
+// is not a second, independently-maintained definition of a signed record's bytes.
+// It lets a test craft records with arbitrary seq values — including the post-wrap
+// seq 0 — that still verify, which the sink's monotonic counter cannot produce
+// directly.
 func signAuditLine(t *testing.T, key []byte, rec auditRecord) []byte {
 	t.Helper()
 	rec.HMAC = ""
@@ -923,10 +921,9 @@ func signAuditLine(t *testing.T, key []byte, rec auditRecord) []byte {
 	if err != nil {
 		t.Fatalf("marshal record body: %v", err)
 	}
-	rec.HMAC = "sha256:" + hmacHex(key, body)
-	line, err := json.Marshal(rec)
+	line, err := signedRecordLine(body, recordMAC(key, body))
 	if err != nil {
-		t.Fatalf("marshal signed record: %v", err)
+		t.Fatalf("signedRecordLine: %v", err)
 	}
 	return line
 }
@@ -1840,6 +1837,18 @@ func TestVerifyRejectsNonCanonicalRecordBytes(t *testing.T) {
 			},
 		},
 		{
+			// The same vector, but for a SLICE-typed omitempty field: a deny record
+			// never carries obligations (RecordDeny always passes nil), so writeRecord's
+			// omitempty omits the key entirely rather than emitting "obligations":[].
+			// isEncodingJSONEmptyValue (deleted with the rest of the hand-rolled guards)
+			// used to need a per-Kind case for this; the canonical-bytes comparison
+			// catches it the same way regardless of the field's type.
+			"foreign zero-valued omitempty slice field",
+			func(orig []byte) []byte {
+				return bytes.Replace(orig, []byte(`{"class_uid"`), []byte(`{"obligations":[],"class_uid"`), 1)
+			},
+		},
+		{
 			// An escape variant of a VALUE: decodes to the same "deny" string, so the
 			// HMAC matches, but a regex/grep consumer scanning for "decision":"deny"
 			// no longer matches the line. Not reachable by any per-key check — this is
@@ -1916,8 +1925,8 @@ func TestVerifyAcceptsCanonicalRecordWithTrailingNewline(t *testing.T) {
 	}
 }
 
-// TestVerifyAcceptsGenuineNonZeroOmitemptyFields guards against the zero-value
-// check above over-matching: a real, non-empty omitempty field (string, bool, and
+// TestVerifyAcceptsGenuineNonZeroOmitemptyFields guards against the canonical-form
+// check over-matching: a real, non-empty omitempty field (string, bool, and
 // non-empty slice) must still verify normally.
 func TestVerifyAcceptsGenuineNonZeroOmitemptyFields(t *testing.T) {
 	dir := t.TempDir()
@@ -1942,6 +1951,129 @@ func TestVerifyAcceptsGenuineNonZeroOmitemptyFields(t *testing.T) {
 	verifier := verifierFor(t, keyPath)
 	if ok, verr := verifier.VerifyRecord(orig); !ok || verr != nil {
 		t.Fatalf("a record with a genuine non-zero omitempty field must verify: ok=%v err=%v", ok, verr)
+	}
+}
+
+// TestVerifyAcceptsInvalidUTF8InEnvelopeFields is the regression for a false-positive
+// rejection found reviewing the canonical-form check above: encoding/json.Marshal is
+// NOT idempotent across a decode-then-re-encode round trip when a string holds
+// invalid UTF-8. The first marshal of a lone invalid byte writes the literal 6-byte
+// escape text `�`; decoding that and re-marshaling the resulting (valid) U+FFFD
+// rune instead emits its raw 3-byte UTF-8 encoding. Two different on-disk byte
+// sequences for what is nominally the same value broke both the HMAC recompute and
+// the canonical-form check for any never-tampered record whose SessionID (the
+// client-controlled Mcp-Session-Id HTTP header, never validated as UTF-8 by
+// net/http) happened to carry a stray invalid byte. boundFieldTo now normalizes to
+// valid UTF-8 before a field is ever marshaled the first time, making every later
+// marshal of it byte-identical.
+func TestVerifyAcceptsInvalidUTF8InEnvelopeFields(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+	keyPath := filepath.Join(dir, "audit.key")
+
+	sink, err := Open(logPath, keyPath, 0, 0)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	// A lone 0xc3 with no valid UTF-8 continuation byte: exactly the shape
+	// encoding/json's string encoder replaces with the `�` escape text on
+	// first marshal.
+	badSessionID := "sess-\xc3-tail"
+	sink.RecordAllow(context.Background(), badSessionID, "tool", "tools/call", nil, nil, false, nil, nil)
+	if err := sink.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	lines := logLines(t, logPath)
+	orig := lines[len(lines)-1]
+	if !bytes.Contains(orig, []byte(`"session_id":"sess-`)) {
+		t.Fatalf("expected a session_id field, got: %s", orig)
+	}
+
+	verifier := verifierFor(t, keyPath)
+	if ok, verr := verifier.VerifyRecord(orig); !ok || verr != nil {
+		t.Fatalf("a genuine record with invalid UTF-8 in its original SessionID must verify (it is normalized to valid UTF-8 before ever being signed): ok=%v err=%v", ok, verr)
+	}
+
+	// The write path (resumeChainFromTail, run on every Open) must accept this tail
+	// too — otherwise the live proxy would restart its own chain from genesis on
+	// every restart whenever the last record before shutdown carried such a field.
+	sink2, err := Open(logPath, keyPath, 0, 0)
+	if err != nil {
+		t.Fatalf("re-Open: %v", err)
+	}
+	sink2.RecordAllow(context.Background(), "sess-2", "tool2", "tools/call", nil, nil, false, nil, nil)
+	if err := sink2.Close(); err != nil {
+		t.Fatalf("Close sink2: %v", err)
+	}
+	for _, l := range logLines(t, logPath) {
+		s := string(l)
+		if strings.Contains(s, "chain_resume_failed") || strings.Contains(s, "tail_hmac_mismatch") || strings.Contains(s, "tail_key_unknown") {
+			t.Fatalf("resuming onto a genuine tail with invalid UTF-8 in SessionID must not write an integrity-failure marker: %s", l)
+		}
+	}
+}
+
+// TestVerifyAuditLog_NonCanonicalRecordPoisonsChainAnchorForSuccessor pins that
+// errNonCanonicalRecord participates in the same untrustworthy-anchor defense as a
+// plain HMAC mismatch (verify.go's `if v.prevRecordInvalid` guard, reached via the
+// shared `case err != nil` classification): a record whose bytes are rewritten to a
+// non-canonical form does not just fail on its own, it also poisons the NEXT
+// record's chain-link check, even though that next record's own prev_hmac field
+// still byte-for-byte matches the tampered record's untouched _hmac value — an
+// attacker who can rewrite bytes without the key can always make that link "match".
+func TestVerifyAuditLog_NonCanonicalRecordPoisonsChainAnchorForSuccessor(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+	keyPath := filepath.Join(dir, "audit.key")
+
+	sink, err := Open(logPath, keyPath, 0, 0)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	sink.RecordAllow(context.Background(), "sess-1", "tool1", "tools/call", nil, nil, false, nil, nil)
+	sink.RecordAllow(context.Background(), "sess-2", "tool2", "tools/call", nil, nil, false, nil, nil)
+	if err := sink.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	lines := logLines(t, logPath)
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 records, got %d", len(lines))
+	}
+
+	// Insert whitespace after a value — decodes to the identical struct (so rec1's
+	// own _hmac field is untouched), but is no longer the canonical form.
+	tampered := bytes.Replace(lines[0],
+		[]byte(`"decision":"allow"`), []byte(`"decision":"allow" `), 1)
+	if bytes.Equal(tampered, lines[0]) {
+		t.Fatal("test setup failed to alter rec1's bytes")
+	}
+
+	verifier := verifierFor(t, keyPath)
+	if ok, verr := verifier.VerifyRecord(tampered); ok || !errors.Is(verr, errNonCanonicalRecord) {
+		t.Fatalf("sanity check: tampered rec1 must be rejected as non-canonical, got ok=%v err=%v", ok, verr)
+	}
+	// rec2 is untouched: its prev_hmac field still byte-for-byte equals rec1's own
+	// (unmodified) _hmac value.
+	if !bytes.Contains(lines[1], []byte(`"prev_hmac":`)) {
+		t.Fatalf("expected rec2 to carry prev_hmac, got: %s", lines[1])
+	}
+
+	out := append(bytes.Join([][]byte{tampered, lines[1]}, []byte("\n")), '\n')
+	var sb strings.Builder
+	res, err := VerifyLog(bytes.NewReader(out), verifier, "", time.Time{}, &sb)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if res.OK() {
+		t.Fatalf("a log with a non-canonical record followed by one linking to its untouched _hmac must not pass: %+v", res)
+	}
+	if res.ChainBreaks == 0 {
+		t.Fatalf("rec2 must be flagged with a CHAIN BREAK because its predecessor's anchor is untrustworthy, even though the prev_hmac bytes literally match: %+v\noutput:\n%s", res, sb.String())
+	}
+	if !strings.Contains(sb.String(), "the preceding record failed verification") {
+		t.Fatalf("expected the untrustworthy-anchor diagnostic; output:\n%s", sb.String())
 	}
 }
 

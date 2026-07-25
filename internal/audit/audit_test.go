@@ -2876,6 +2876,52 @@ func TestBoundFieldToTruncatesOnRuneBoundary(t *testing.T) {
 	}
 }
 
+// TestBoundFieldToSanitizesInvalidUTF8 is the regression for the false-positive
+// audit-verify rejection found reviewing the canonical-form check: encoding/json's
+// Marshal is not idempotent across a decode-then-re-encode round trip for a string
+// holding invalid UTF-8 (a lone invalid byte marshals to the literal escape text
+// `�` the first time, but decoding that and re-marshaling the resulting valid
+// U+FFFD rune emits its raw UTF-8 bytes instead — two different on-disk forms for
+// what is nominally one value). Every caller of boundFieldTo passes a field that can
+// hold raw, unvalidated bytes (SessionID from the Mcp-Session-Id HTTP header,
+// Target/Method envelope fields, JWT-claim identity fields), so normalizing here,
+// before the value is ever marshaled the first time, is what restores the
+// marshal round-trip idempotency both the HMAC recompute and VerifyRecord's
+// canonical-form check depend on.
+func TestBoundFieldToSanitizesInvalidUTF8(t *testing.T) {
+	got := boundFieldTo("sess-\xc3-tail", auditSessionIDCap)
+	if !utf8.ValidString(got) {
+		t.Fatalf("boundFieldTo must always return valid UTF-8, got invalid: %q", got)
+	}
+	want := "sess-�-tail"
+	if got != want {
+		t.Fatalf("boundFieldTo(%q, %d) = %q, want %q (the invalid byte replaced with U+FFFD)", "sess-\xc3-tail", auditSessionIDCap, got, want)
+	}
+
+	// Idempotency: marshaling the sanitized value, decoding it, and marshaling again
+	// must reproduce the identical bytes — the property the whole fix exists for.
+	body1, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded string
+	if err := json.Unmarshal(body1, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	body2, err := json.Marshal(decoded)
+	if err != nil {
+		t.Fatalf("re-marshal: %v", err)
+	}
+	if !bytes.Equal(body1, body2) {
+		t.Fatalf("sanitized value is not round-trip idempotent: first marshal %s, second marshal %s", body1, body2)
+	}
+
+	// A value that is already valid UTF-8 must pass through unchanged.
+	if got := boundFieldTo("clean-session-id", auditSessionIDCap); got != "clean-session-id" {
+		t.Errorf("boundFieldTo must not alter an already-valid string, got %q", got)
+	}
+}
+
 // TestRecordOversizedSessionIDBounded: in HTTP mode the session
 // ID comes from the client-controlled Mcp-Session-Id header and is stamped on every
 // record, so a pathologically large value must be bounded like Target/Method to

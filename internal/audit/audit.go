@@ -1996,7 +1996,28 @@ func boundEnvelopeField(s string) string {
 // recording the original length. The marker is kept WITHIN the limit (the prefix
 // shortens to make room), so the result is always <= limit bytes — the invariant
 // the 4 MiB scanner buffer relies on.
+//
+// s is first normalized to valid UTF-8 (strings.ToValidUTF8, replacing any invalid
+// byte sequence with U+FFFD). Every caller of this function passes a field that can
+// hold raw attacker/IdP-supplied bytes not yet validated as UTF-8 — SessionID from
+// the client-controlled Mcp-Session-Id HTTP header, Target/Method from request
+// envelope fields, AgentID/TaskID/UserID from JWT claims — and encoding/json's
+// Marshal is NOT idempotent across a decode-then-re-encode round trip when a string
+// holds invalid UTF-8: it writes a lone invalid byte as the literal 6-byte escape
+// text `�`, but decoding that text and re-marshaling the resulting (valid)
+// U+FFFD rune instead emits its raw 3-byte UTF-8 encoding. Two different on-disk
+// byte sequences for what is nominally "the same" value break the assumption behind
+// both the HMAC recompute (decode → clear _hmac → re-marshal → re-sign) and
+// VerifyRecord's canonical-bytes check, which is not a hypothetical: a session ID
+// containing one stray invalid byte forwarded from an untrusted header round-trips
+// to different bytes than it was signed with, so a genuine, never-tampered record
+// fails verification and (via resumeChainFromTail, which runs this same check on
+// every restart) can make the live proxy restart its own chain from genesis. Normalizing
+// here, before the field is ever marshaled the first time, makes the stored value
+// already-valid UTF-8 from the start, so every later marshal of it is byte-identical —
+// restoring the round-trip idempotency both mechanisms depend on.
 func boundFieldTo(s string, limit int) string {
+	s = strings.ToValidUTF8(s, "�")
 	if len(s) <= limit {
 		return s
 	}
@@ -2462,6 +2483,32 @@ func signedRecordLine(body []byte, mac string) ([]byte, error) {
 	line = append(line, `,"_hmac":`...)
 	line = append(line, macJSON...)
 	return append(line, '}'), nil
+}
+
+// isCanonicalSignedLine reports whether line is byte-identical to what
+// signedRecordLine(body, mac) would produce, without materializing that line.
+//
+// VerifyRecord calls this for every signed record in an audit-verify pass, which
+// can scan a multi-GB log, so this avoids signedRecordLine's clone-and-append — an
+// allocation and copy proportional to the record's size, dominated by Details, up
+// to 1 MiB — in favor of a prefix/suffix comparison directly against body's own
+// backing array. Only mac (always small: "sha256:" plus a hex digest) is marshaled
+// and copied; nothing here scales with record size.
+func isCanonicalSignedLine(line, body []byte, mac string) (bool, error) {
+	if n := len(body); n == 0 || body[n-1] != '}' {
+		// Defensive: a struct marshal always ends in '}', so this is unreachable —
+		// mirrors signedRecordLine's identical guard.
+		return false, errors.New("signing body is not a JSON object")
+	}
+	macJSON, err := json.Marshal(mac)
+	if err != nil {
+		return false, err
+	}
+	prefix := body[:len(body)-1] // body minus its trailing '}'
+	suffix := append(append([]byte(`,"_hmac":`), macJSON...), '}')
+	return len(line) == len(prefix)+len(suffix) &&
+		bytes.HasPrefix(line, prefix) &&
+		bytes.HasSuffix(line, suffix), nil
 }
 
 // writeRecord stamps the chain fields, signs, and writes a single record,

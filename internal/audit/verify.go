@@ -32,12 +32,8 @@ var errKeyIDNotInRing = errors.New("audit record key_id is not in the verificati
 // verdict (fail-closed), distinct from both INVALID and UNKNOWN_KEY_ID.
 var errUnidentifiedNoMatch = errors.New("audit record names no key_id and no ring key matched its HMAC")
 
-// errNonCanonicalRecord is returned by VerifyRecord when a signed record's bytes
-// differ from the line the writer emits for the very fields that record decodes to
-// — a duplicate, re-spelled, or reordered key, an added zero-valued omitempty
-// field, an alternate string escape, or whitespace inserted inside the object. Each
-// of those survives the HMAC (which covers the re-marshaled struct, not the raw
-// bytes) while changing what a byte-oriented consumer reads, so it is tampering.
+// errNonCanonicalRecord is returned by VerifyRecord's canonical-on-disk-form check;
+// see that check's comment in VerifyRecord for what it catches and why.
 var errNonCanonicalRecord = errors.New("signed audit record is not in canonical on-disk form: its bytes are not what the writer emits for these fields (a duplicate, re-spelled, or reordered key, an added zero-valued field, an alternate escape, or inserted whitespace) — the HMAC covers the record's fields, not its bytes, so a rewrite that decodes to the same fields is rejected here")
 
 // VerifyRecord re-computes the HMAC of a raw record line and reports whether it
@@ -90,7 +86,6 @@ func (s *Sink) VerifyRecord(line []byte) (bool, error) {
 	if dec.More() {
 		return false, fmt.Errorf("trailing data after audit record")
 	}
-	signed := isSignedRecord(rec)
 	storedHMAC := rec.HMAC
 	rec.HMAC = "" // zero before re-signing, matching Record()
 
@@ -132,14 +127,12 @@ func (s *Sink) VerifyRecord(line []byte) (bool, error) {
 	// Whitespace OUTSIDE the object is trimmed rather than rejected: it cannot add,
 	// remove, or re-spell a field, so it changes no consumer's reading of the record,
 	// and callers legitimately differ on whether the terminating newline is included.
-	if signed {
-		// bytes.Clone: signedRecordLine appends through the backing array it is given,
-		// and body must stay intact for the HMAC recomputation below.
-		want, cerr := signedRecordLine(bytes.Clone(body), storedHMAC)
+	if storedHMAC != "" {
+		canonical, cerr := isCanonicalSignedLine(bytes.TrimSpace(line), body, storedHMAC)
 		if cerr != nil {
 			return false, cerr
 		}
-		if !bytes.Equal(bytes.TrimSpace(line), want) {
+		if !canonical {
 			return false, errNonCanonicalRecord
 		}
 	}
@@ -510,7 +503,7 @@ func decodeAuditRecord(line []byte) (auditRecord, bool) {
 // genuinely written record's HMAC presence is exactly what distinguishes it from a
 // pre-chain legacy record. Single source of truth for this discriminator: every
 // signed/legacy split in this file (VerifyRecord's lenient-decode fallback and
-// duplicate-key guard, and updateChain's signedSeen latch) reuses it instead of
+// canonical-form check, and updateChain's signedSeen latch) reuses it instead of
 // re-deriving the check, so a future decoy shape only needs updating here.
 func isSignedRecord(rec auditRecord) bool {
 	return rec.HMAC != ""
@@ -625,14 +618,16 @@ func (v *auditChainVerifier) updateChain(rec auditRecord) {
 			}
 		}
 	} else {
-		// If the preceding record failed HMAC verification, its _hmac value in
-		// v.prevHMAC is untrustworthy: an attacker can set an arbitrary forged _hmac
-		// on the bad record and then stitch its successor by setting prev_hmac to that
-		// same value, making the link check pass for a tampered record. Fire a CHAIN
-		// BREAK before the link check to surface the untrustworthy anchor.
+		// If the preceding record failed VerifyRecord (an HMAC mismatch, or — since
+		// this branch is reached on any non-nil error — a non-canonical-form
+		// rejection) its _hmac value in v.prevHMAC is untrustworthy: an attacker can
+		// set an arbitrary forged _hmac on the bad record and then stitch its
+		// successor by setting prev_hmac to that same value, making the link check
+		// pass for a tampered record. Fire a CHAIN BREAK before the link check to
+		// surface the untrustworthy anchor.
 		if v.prevRecordInvalid {
 			v.res.ChainBreaks++
-			_, _ = fmt.Fprintf(v.out, "CHAIN BREAK at seq %d: the preceding record failed HMAC verification; its _hmac is untrustworthy and cannot serve as a valid chain anchor\n", rec.Seq)
+			_, _ = fmt.Fprintf(v.out, "CHAIN BREAK at seq %d: the preceding record failed verification; its _hmac is untrustworthy and cannot serve as a valid chain anchor\n", rec.Seq)
 			v.prevRecordInvalid = false
 		}
 		// A genesis-sentinel seq-1 record immediately following a head legacy (unsigned)
