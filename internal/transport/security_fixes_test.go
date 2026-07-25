@@ -9,8 +9,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/eunolabs/eunox/internal/mcp"
+	"github.com/eunolabs/eunox/internal/pdp"
 )
 
 // TestLoopbackOnly_DNSRebindingHostRejected pins the DNS-rebinding guard on the
@@ -98,6 +100,80 @@ func TestLoopbackOnly_AdmitsLocalNonAllowlistedHosts(t *testing.T) {
 	}
 }
 
+// TestHandleMCPGet_EndsStreamAtTokenExpiry pins the transport-layer half of the SSE
+// expiry bound: a stream opened with a Bearer token must END when that token's lifetime
+// elapses, so a client validated once at open cannot keep receiving server->client
+// traffic indefinitely. The PDP-side test only asserts that ValidateToken captures exp
+// into JWTClaims; without this, removing the tokenExpiry select arm entirely would leave
+// the suite green while the threat model still promises the stream is bounded.
+func TestHandleMCPGet_EndsStreamAtTokenExpiry(t *testing.T) {
+	fu := newFakeUpstream()
+	fakeServer := httptest.NewServer(fu)
+	defer fakeServer.Close()
+
+	proxy, srv := newTestRemoteProxy(t, fakeServer.URL, httpProxyOptions{})
+	sessID := proxyInitSession(t, proxy, srv)
+	sess := proxy.getSession(sessID)
+	if sess == nil {
+		t.Fatal("session not found after initialize")
+	}
+
+	// Drive handleMCPGet directly with claims already in the context: handleMCP injects
+	// them via WithJWTClaims after validating the Bearer, so this is the same shape the
+	// handler sees in JWT mode, without standing up a JWKS server.
+	req := httptest.NewRequest(http.MethodGet, "/mcp", http.NoBody)
+	req.Header.Set(SessionHeader, sessID)
+	req = req.WithContext(pdp.WithJWTClaims(req.Context(), &pdp.JWTClaims{
+		Subject:   "user-1",
+		Issuer:    "https://idp.example",
+		ExpiresAt: time.Now().Add(150 * time.Millisecond),
+	}))
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		proxy.handleMCPGet(httptest.NewRecorder(), req, proxy.routes[""])
+	}()
+
+	select {
+	case <-done:
+		// Returned on its own once the token lifetime elapsed.
+	case <-time.After(10 * time.Second):
+		t.Fatal("SSE stream outlived its token: handleMCPGet did not return after exp")
+	}
+}
+
+// TestHandleMCPGet_AlreadyExpiredTokenEndsImmediately pins the fail-closed edge: the JWT
+// leeway lets a token that is already past exp validate, so the stream must end at once
+// rather than arming a negative timer that never fires.
+func TestHandleMCPGet_AlreadyExpiredTokenEndsImmediately(t *testing.T) {
+	fu := newFakeUpstream()
+	fakeServer := httptest.NewServer(fu)
+	defer fakeServer.Close()
+
+	proxy, srv := newTestRemoteProxy(t, fakeServer.URL, httpProxyOptions{})
+	sessID := proxyInitSession(t, proxy, srv)
+
+	req := httptest.NewRequest(http.MethodGet, "/mcp", http.NoBody)
+	req.Header.Set(SessionHeader, sessID)
+	req = req.WithContext(pdp.WithJWTClaims(req.Context(), &pdp.JWTClaims{
+		Subject:   "user-1",
+		ExpiresAt: time.Now().Add(-time.Hour),
+	}))
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		proxy.handleMCPGet(httptest.NewRecorder(), req, proxy.routes[""])
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("stream with an already-expired token did not end immediately")
+	}
+}
+
 // TestUpstreamEnv_FiltersEunoxSecrets pins that UpstreamEnv strips the eunox-owned
 // secrets an upstream subprocess must never inherit, while leaving every other variable
 // (including benign EUNOX_* config) intact.
@@ -107,10 +183,11 @@ func TestUpstreamEnv_FiltersEunoxSecrets(t *testing.T) {
 	t.Setenv("EUNOX_AUDIT_LOG", "/var/log/eunox/audit.jsonl") // benign eunox var: must survive
 	t.Setenv("SUBPROCESS_ENV_MARKER", "keepme")
 
-	env := UpstreamEnv()
+	env := upstreamEnv()
 	for _, kv := range env {
-		if strings.HasPrefix(kv, "EUNOX_CONTROL_TOKEN=") || strings.HasPrefix(kv, "EUNOX_REDIS_PASSWORD=") {
-			t.Fatalf("UpstreamEnv leaked an eunox-owned secret into the child env: %q", kv)
+		if strings.HasPrefix(strings.ToUpper(kv), "EUNOX_CONTROL_TOKEN=") ||
+			strings.HasPrefix(strings.ToUpper(kv), "EUNOX_REDIS_PASSWORD=") {
+			t.Fatalf("upstreamEnv leaked an eunox-owned secret into the child env: %q", kv)
 		}
 	}
 	has := func(want string) bool {
@@ -125,7 +202,43 @@ func TestUpstreamEnv_FiltersEunoxSecrets(t *testing.T) {
 		t.Error("UpstreamEnv dropped a benign non-eunox variable")
 	}
 	if !has("EUNOX_AUDIT_LOG=/var/log/eunox/audit.jsonl") {
-		t.Error("UpstreamEnv dropped a benign EUNOX_* variable that is not a secret")
+		t.Error("upstreamEnv dropped a benign EUNOX_* variable that is not a secret")
+	}
+}
+
+// TestIsSensitiveUpstreamEnv_CaseAndPrefix pins the two ways the entry match must not be
+// naive. Windows is a release target and folds environment-variable case, so a secret set
+// as "Eunox_Control_Token" is the credential the proxy actually resolves via os.Getenv
+// while os.Environ() reports the operator's casing — a case-sensitive match would hand it
+// to the upstream. Conversely, matching a bare prefix would strip an unrelated longer
+// variable that merely begins with a secret's name.
+func TestIsSensitiveUpstreamEnv_CaseAndPrefix(t *testing.T) {
+	t.Parallel()
+	strip := []string{
+		"EUNOX_CONTROL_TOKEN=abc",
+		"EUNOX_REDIS_PASSWORD=abc",
+		"Eunox_Control_Token=abc",
+		"eunox_redis_password=abc",
+		"EuNoX_CoNtRoL_ToKeN=abc",
+		"EUNOX_CONTROL_TOKEN=", // empty value is still the secret's slot
+	}
+	for _, kv := range strip {
+		if !isSensitiveUpstreamEnv(kv) {
+			t.Errorf("isSensitiveUpstreamEnv(%q) = false, want true (secret must not reach the child)", kv)
+		}
+	}
+	keep := []string{
+		"EUNOX_CONTROL_TOKEN_PATH=/etc/eunox/tok", // a different variable
+		"EUNOX_REDIS_PASSWORD_FILE=/run/secret",
+		"EUNOX_AUDIT_LOG=/var/log/eunox/audit.jsonl",
+		"MY_EUNOX_CONTROL_TOKEN=abc",
+		"PATH=/usr/bin",
+		"NOT_A_PAIR", // no "=", nothing to match
+	}
+	for _, kv := range keep {
+		if isSensitiveUpstreamEnv(kv) {
+			t.Errorf("isSensitiveUpstreamEnv(%q) = true, want false (benign variable was stripped)", kv)
+		}
 	}
 }
 
@@ -174,10 +287,19 @@ func TestSourceIP_CountsDeclaredProxyHops(t *testing.T) {
 		{"client inside the trusted CIDR is not skipped", 1, "10.0.0.1:5", []string{"192.168.1.5, 10.5.5.5"}, "10.5.5.5"},
 		{"client inside the trusted CIDR behind two hops", 2, "10.0.0.2:5", []string{"192.168.1.5, 10.5.5.5, 10.0.0.1"}, "10.5.5.5"},
 
-		// Chain shorter than declared: nothing is provably proxy-written, so fall back to
-		// the immediate peer instead of trusting a client-supplied entry.
-		{"chain shorter than declared hops falls back to RemoteAddr", 3, "10.0.0.2:5", []string{"1.2.3.4, 10.0.0.1"}, "10.0.0.2"},
-		{"single entry with two declared hops falls back", 2, "10.0.0.2:5", []string{"1.2.3.4"}, "10.0.0.2"},
+		// Chain shorter than declared: nothing is provably proxy-written. Falling back to
+		// RemoteAddr would be a fail-OPEN, because the peer is a trusted proxy and so sits
+		// inside trustedProxyCIDRs — an ipRange allowing that supernet would then match
+		// every request. An empty source IP denies with MISSING_CONTEXT instead.
+		{"chain shorter than declared hops fails closed", 3, "10.0.0.2:5", []string{"1.2.3.4, 10.0.0.1"}, ""},
+		{"single entry with two declared hops fails closed", 2, "10.0.0.2:5", []string{"1.2.3.4"}, ""},
+		// A header carrying no usable entries is just "no XFF" -> the peer address.
+		{"blank XFF header falls back to RemoteAddr", 1, "10.0.0.2:5", []string{"   "}, "10.0.0.2"},
+		{"comma-only XFF header falls back to RemoteAddr", 1, "10.0.0.2:5", []string{" , "}, "10.0.0.2"},
+		// A selected entry that normalizes to nothing must still fail closed downstream,
+		// not resolve to the trusted peer's own address.
+		{"port-only entry stays unparseable", 1, "10.0.0.2:5", []string{":8080"}, ":8080"},
+		{"empty brackets entry stays unparseable", 1, "10.0.0.2:5", []string{"[]"}, "[]"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

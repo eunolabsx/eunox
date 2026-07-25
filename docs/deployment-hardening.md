@@ -51,11 +51,21 @@ regardless of network position or device.
   `os.Environ()`. eunox filters its own emergency-stop credential
   (`EUNOX_CONTROL_TOKEN`) and shared-backend password (`EUNOX_REDIS_PASSWORD`) out
   of every spawn's environment, so a compromised upstream cannot read them from its
-  own environment. This is a denylist of eunox-owned names: a secret you reference
-  from the gateway config under an arbitrary `${VAR}` name (e.g. an
-  `upstreamAuthHeader` bearer) is **not** auto-stripped — start the proxy with only
-  the environment the upstream may legitimately see, or supply that secret to eunox
-  through a channel the child does not inherit.
+  own environment. Names are matched case-insensitively, because Windows folds
+  environment-variable case: a variable set as `Eunox_Control_Token` is the one the
+  proxy resolves, so a case-sensitive filter would hand the live credential to the
+  child. Matching is on the whole name, so a distinct variable that merely begins
+  with a secret's name (`EUNOX_CONTROL_TOKEN_PATH`) is preserved.
+
+  This is a denylist of eunox-owned names: a secret you reference from the gateway
+  config under an arbitrary `${VAR}` name is **not** auto-stripped. That includes the
+  variable behind `listen.authToken` — an upstream that reads it can authenticate to
+  the proxy's own listener on every route — as well as an `upstreamAuthHeader` bearer.
+  Start the proxy with only the environment the upstream may legitimately see, or
+  supply those secrets through a channel the child does not inherit. Note also that
+  the emergency-stop token's primary home is the 0600 file, which a subprocess running
+  as the same UID can still read; run the upstream under a distinct UID or sandbox it
+  away from that path where that matters.
 
 Credential control is enforced at the IdP and the upstream, so it does not depend
 on owning the network path or the device. It is the lever that works for remote

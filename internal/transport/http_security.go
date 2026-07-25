@@ -265,9 +265,15 @@ func (p *HTTPProxy) originAllowed(origin string) bool {
 // written) entry and return a forged one to its left, exactly the spoof the peer gate
 // exists to prevent.
 //
-// If the chain is SHORTER than N entries the request does not match the declared
-// topology, so no entry is provably proxy-written: fall through to RemoteAddr (the
-// immediate peer) rather than trusting a client-supplied value.
+// A chain that carries entries but FEWER than N does not match the declared topology, so
+// no entry is provably proxy-written. Falling back to RemoteAddr there would be a silent
+// fail-OPEN: the enclosing branch has already established the peer is a trusted proxy, so
+// RemoteAddr is by construction inside listen.trustedProxyCIDRs, and an ipRange condition
+// allowing the internal supernet those proxies sit in would then match every request
+// regardless of its real client. Such a request instead yields an empty source IP, which
+// an ipRange condition denies with MISSING_CONTEXT — the mismatch is loud rather than
+// permissive. A header that carries no entries at all is treated as "no XFF" and uses
+// RemoteAddr, exactly as a request without the header does.
 func (p *HTTPProxy) sourceIP(r *http.Request) string {
 	if p.trustFwdFor && p.peerIsTrustedProxy(r.RemoteAddr) {
 		// Flatten ALL X-Forwarded-For lines, not just the first: an intermediary that
@@ -282,14 +288,21 @@ func (p *HTTPProxy) sourceIP(r *http.Request) string {
 					}
 				}
 			}
-			// proxyHops() is always >= 1, so idx is at most len(all)-1.
-			if idx := len(all) - p.proxyHops(); idx >= 0 {
+			if len(all) > 0 {
+				// proxyHops() is always >= 1, so idx is at most len(all)-1.
+				idx := len(all) - p.proxyHops()
+				if idx < 0 {
+					return "" // chain shorter than declared: fail closed, see above
+				}
 				// Normalize like the RemoteAddr path below: proxies may append the client as
 				// IP:port or a bracketed IPv6 literal, and the downstream ipRange condition
-				// runs net.ParseIP, which returns nil for either form.
-				if host := normalizeXFFHost(all[idx]); host != "" {
+				// runs net.ParseIP, which returns nil for either form. An entry that
+				// normalizes to nothing (":8080", "[]") is returned RAW so it still fails
+				// net.ParseIP downstream and denies, rather than falling back to the peer.
+				if host := normalizeHost(all[idx]); host != "" {
 					return host
 				}
+				return all[idx]
 			}
 		}
 	}
@@ -297,10 +310,12 @@ func (p *HTTPProxy) sourceIP(r *http.Request) string {
 	return host
 }
 
-// normalizeXFFHost strips an optional port and IPv6 brackets from an X-Forwarded-For
-// entry, yielding the bare host net.ParseIP accepts (a proxy may append the client as a
-// bare address, IP:port, or a bracketed IPv6 literal). Empty in, empty out.
-func normalizeXFFHost(entry string) string {
+// normalizeHost strips an optional port and IPv6 brackets from a host-ish value, yielding
+// the bare host net.ParseIP accepts. Shared by sourceIP's X-Forwarded-For read (a proxy
+// may append the client as a bare address, IP:port, or a bracketed IPv6 literal) and
+// loopbackOnly's Host pin, so the two agree on what a host string reduces to rather than
+// each carrying its own copy of the rule. Empty in, empty out.
+func normalizeHost(entry string) string {
 	if host, _, err := net.SplitHostPort(entry); err == nil {
 		return host
 	}
@@ -411,18 +426,13 @@ func (p *HTTPProxy) loopbackOnly(w http.ResponseWriter, r *http.Request) bool {
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return false
 	}
-	// DNS-rebinding guard: also require a trusted Host. Normalize r.Host to a bare
-	// hostname (strip an optional port and IPv6 brackets, lower-case) exactly as
-	// originAllowed normalizes an Origin via url.Hostname(), then require it to be in
-	// the same allowedOriginHosts set. A rebound request carries the attacker's name
-	// (Host: attacker.com) and is rejected; a legitimate loopback scrape uses
-	// localhost / 127.0.0.1 / ::1 / the non-wildcard bind host, all of which
+	// DNS-rebinding guard: also require a trusted Host. normalizeHost reduces r.Host to
+	// a bare hostname the same way originAllowed's url.Hostname() reduces an Origin, so
+	// the two checks agree on what they are comparing. A rebound request carries the
+	// attacker's name (Host: attacker.com) and is rejected; a legitimate loopback scrape
+	// uses localhost / 127.0.0.1 / ::1 / the non-wildcard bind host, all of which
 	// buildAllowedOriginHosts seeds.
-	reqHost := r.Host
-	if h, _, err := net.SplitHostPort(reqHost); err == nil {
-		reqHost = h
-	}
-	reqHost = strings.ToLower(strings.Trim(reqHost, "[]"))
+	reqHost := strings.ToLower(normalizeHost(r.Host))
 	if !p.hostAllowedForLoopbackEndpoint(reqHost) {
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return false

@@ -786,8 +786,10 @@ func (p *HTTPProxy) handleMCPGet(w http.ResponseWriter, r *http.Request, route *
 	// this GET's own token, matching what handleMCP validated. Kill-switch eviction
 	// (sess.evicted) already covers administrative revocation; this covers plain expiry.
 	var tokenExpiry <-chan time.Time
+	var tokenExpiresAt time.Time
 	if claims := pdp.JWTClaimsPtr(r.Context()); claims != nil && !claims.ExpiresAt.IsZero() {
-		expTimer := time.NewTimer(time.Until(claims.ExpiresAt))
+		tokenExpiresAt = claims.ExpiresAt
+		expTimer := time.NewTimer(time.Until(tokenExpiresAt))
 		defer expTimer.Stop()
 		tokenExpiry = expTimer.C
 	}
@@ -814,6 +816,15 @@ func (p *HTTPProxy) handleMCPGet(w http.ResponseWriter, r *http.Request, route *
 				return
 			}
 		case <-keepalive.C:
+			// Re-anchor the expiry bound to the wall clock. time.Until sampled the wall
+			// clock once at stream open, but the resulting timer runs on the monotonic
+			// clock, which does not advance while the host is suspended — so a laptop or
+			// VM suspended mid-stream would otherwise extend the authorized window past
+			// exp by the suspend duration. This tick already fires every few seconds, so
+			// the check is free and bounds the overshoot to one keepalive interval.
+			if !tokenExpiresAt.IsZero() && !time.Now().Before(tokenExpiresAt) {
+				return
+			}
 			if !writeSSE(sseKeepaliveFrame) {
 				return
 			}

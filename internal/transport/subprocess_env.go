@@ -30,9 +30,33 @@ import (
 // passthrough allowlist, a larger design change. Until then, an operator running a
 // less-trusted upstream should start the proxy with only the environment that upstream
 // may legitimately see.
-var sensitiveUpstreamEnvPrefixes = []string{
-	"EUNOX_CONTROL_TOKEN=",
-	"EUNOX_REDIS_PASSWORD=",
+var sensitiveUpstreamEnvNames = []string{
+	"EUNOX_CONTROL_TOKEN",
+	"EUNOX_REDIS_PASSWORD",
+}
+
+// isSensitiveUpstreamEnv reports whether an os.Environ() "NAME=VALUE" entry carries one
+// of the eunox-owned secrets.
+//
+// The name is matched case-INSENSITIVELY because Windows is a release target and its
+// environment lookup folds case: a variable set as "Eunox_Control_Token" is resolved by
+// os.Getenv("EUNOX_CONTROL_TOKEN"), so the proxy uses it as the credential, but
+// os.Environ() reports it with the operator's original casing. A case-sensitive match
+// would therefore pass the live secret straight through to the upstream — the exact leak
+// this file exists to prevent. Matching on the name only (splitting at the first "=")
+// also keeps a longer variable that merely starts with a secret's name, such as
+// EUNOX_CONTROL_TOKEN_PATH, from being stripped: it is a different variable.
+func isSensitiveUpstreamEnv(kv string) bool {
+	name, _, ok := strings.Cut(kv, "=")
+	if !ok {
+		return false // not a NAME=VALUE entry; nothing to match
+	}
+	for _, secret := range sensitiveUpstreamEnvNames {
+		if strings.EqualFold(name, secret) {
+			return true
+		}
+	}
+	return false
 }
 
 // ConfigureUpstreamCmd applies the settings every upstream subprocess must have before
@@ -48,20 +72,14 @@ var sensitiveUpstreamEnvPrefixes = []string{
 // CLI probe's exec.CommandContext. Call it immediately after construction, before Start.
 func ConfigureUpstreamCmd(cmd *exec.Cmd) {
 	cmd.Stderr = os.Stderr
-	cmd.Env = UpstreamEnv()
+	cmd.Env = upstreamEnv()
 }
 
-// UpstreamEnv returns the current process environment with every eunox-owned secret
-// (sensitiveUpstreamEnvPrefixes) removed, for use as an upstream subprocess's cmd.Env.
-// Prefer ConfigureUpstreamCmd, which applies this along with the other required spawn
-// settings; this is exported for callers that need the filtered environment itself.
-func UpstreamEnv() []string {
-	return slices.DeleteFunc(os.Environ(), func(kv string) bool {
-		for _, prefix := range sensitiveUpstreamEnvPrefixes {
-			if strings.HasPrefix(kv, prefix) {
-				return true
-			}
-		}
-		return false
-	})
+// upstreamEnv returns the current process environment with every eunox-owned secret
+// removed, for use as an upstream subprocess's cmd.Env. Deliberately unexported: applying
+// it is the caller's easiest thing to forget, so ConfigureUpstreamCmd is the only way in
+// and there is no second, weaker path that sets the environment without the rest of the
+// required spawn settings.
+func upstreamEnv() []string {
+	return slices.DeleteFunc(os.Environ(), isSensitiveUpstreamEnv)
 }

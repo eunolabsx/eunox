@@ -440,6 +440,22 @@ func (p *HTTPProxy) Serve(ctx context.Context) error {
 				p.bind,
 			)
 		}
+		// The declared hop count is trusted verbatim, and the two ways to get it wrong are
+		// not symmetric. Under-declaring is safe (the read lands on a proxy-written entry
+		// further right, or the chain is short and fails closed); OVER-declaring points the
+		// read at a client-supplied entry, so a client behind the proxy can choose its own
+		// ipRange source with a single forged header. Nothing can validate the count at
+		// runtime without reintroducing the CIDR-inference this design rejects, so state it
+		// at startup where an operator can compare it against the real topology.
+		if len(p.trustedProxyNets) > 0 && p.proxyHops() > 1 {
+			fmt.Fprintf(os.Stderr,
+				"[eunox] SECURITY: listen.trustedProxyHops is %d, so the client is read %d entries from the right "+
+					"of X-Forwarded-For. This MUST equal the number of trusted proxies that append to the header in "+
+					"front of eunox — declaring more than actually run lets a client behind them forge its own source "+
+					"IP for ipRange conditions.\n",
+				p.proxyHops(), p.proxyHops(),
+			)
+		}
 	}
 
 	// A non-loopback bind with neither an auth token nor JWT leaves the enforced /mcp
