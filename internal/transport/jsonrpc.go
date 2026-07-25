@@ -305,6 +305,44 @@ func RejectPreInitServerRequest(w mcp.MsgSink, msg mcp.RPCMsg) {
 		"server-initiated request received before initialize handshake completed"))
 }
 
+// awaitStartupReply reads upstream messages until the response matching wantID arrives and
+// returns it. Every other message is discarded, and a discarded server-initiated REQUEST is
+// answered through RejectPreInitServerRequest so the upstream is not left blocked — these
+// startup paths all run before the background reader is up, so nothing else would answer
+// it. onDiscard, when non-nil, is invoked with each discarded message before it is
+// rejected (the stdio handshake uses it to log, making a chattering upstream observable).
+//
+// This is the protocol fragment the three startup read loops share —
+// StdioProxy.initUpstream, httpSession.runInitHandshake, and the stdio drift probe's
+// tools/list fetch. They previously hand-mirrored it, so a fix to the discard path (say,
+// bounding how many pre-init messages are absorbed) had to land in three places or silently
+// protect only some of them. read and the post-match handling stay with the callers: each
+// reads through a different mechanism (context-aware bridge read vs blocking pipe read) and
+// does something different with the reply, but the loop itself is now single-sourced.
+//
+// A read error is returned unwrapped so each caller can attach its own context.
+func awaitStartupReply(
+	read func() (mcp.RPCMsg, error),
+	wantID *json.RawMessage,
+	w mcp.MsgSink,
+	onDiscard func(mcp.RPCMsg),
+) (mcp.RPCMsg, error) {
+	wantKey := mcp.MsgKey(wantID)
+	for {
+		msg, err := read()
+		if err != nil {
+			return mcp.RPCMsg{}, err
+		}
+		if msg.IsResponse() && mcp.MsgKey(msg.ID) == wantKey {
+			return msg, nil
+		}
+		if onDiscard != nil {
+			onDiscard(msg)
+		}
+		RejectPreInitServerRequest(w, msg)
+	}
+}
+
 // applyInitializeResult validates an upstream's `initialize` response and
 // extracts the server capabilities, version, and instructions. Fails closed on
 // any non-success shape — a JSON-RPC error (upstream rejected initialize), a

@@ -62,6 +62,13 @@ type PolicyDecisionPoint interface {
 	// THIS route's upstream and read its serverInfo. Mirrors CheckKill's pre-spawn role.
 	// A PDP that pins no token audience (every non-JWT PDP, or a JWT route with no
 	// audience pinned / --jwt-allow-any-audience) returns nil.
+	//
+	// CONTRACT: an implementation MUST be CPU-only and non-blocking — decide from the
+	// claims already on ctx and return. Do NOT perform network I/O, acquire contended
+	// locks, or sleep. Callers evaluate this gate on latency-sensitive paths, including
+	// immediately before taking process-wide locks, so a blocking implementation would
+	// stall traffic well beyond the request that triggered it. Fetch anything you need
+	// (keys, directories, audience mappings) out of band and consult a cached view here.
 	CheckAudience(ctx context.Context) *capability.EnforceResponse
 
 	// RecordObservedToolHashes records the live description hash of each pinned tool in a
@@ -152,9 +159,16 @@ const (
 	listKeyPrompts   = capability.ListKeyPrompts
 )
 
-// jsonKeyName is the tools/list entry key the pin routes on, lowercase because the
-// duplicate-key scan compares top-level keys case-folded (see scanToolEntry).
+// jsonKeyName is the tools/list entry key the pin routes on, as it appears on the wire.
 const jsonKeyName = "name"
+
+// jsonKeyNameFolded is jsonKeyName under the same fold scanToolEntry applies to every
+// top-level key, so the two are compared in one space. It must be derived rather than
+// written out: capability.FoldJSONKey maps each rune to the SMALLEST member of its
+// simple-fold orbit, which for ASCII is the upper-case letter — a hand-written lower-case
+// literal would never match, and scanToolEntry would silently stop collecting names,
+// leaving poisonCandidates with nothing to poison on an untrustworthy entry.
+var jsonKeyNameFolded = capability.FoldJSONKey(jsonKeyName)
 
 // CountListEntries returns the number of entries in a */list method's result
 // array, or 0 for a non-list method or an empty/absent/unparseable result.
@@ -1848,7 +1862,10 @@ type toolEntryScan struct {
 //     fields by a case-folding match and keeps the LAST one, so {"description":"<INJECT>",
 //     "Description":"<CLEAN>"} decodes to <CLEAN> and hashes clean while a case-sensitive
 //     host (JSON.parse, the Python SDK) renders <INJECT>. Exact duplicates fold together
-//     too, so one rule covers both. This is why the scan folds here and nowhere else.
+//     too, so one rule covers both. This is why the scan folds here and nowhere else. The
+//     fold must be capability.FoldJSONKey (Unicode simple-fold), matching the decoder's
+//     own field matcher: strings.ToLower is strictly weaker and misses variants that are
+//     already lower case, such as U+017F in "deſcription".
 //   - NESTED, matched EXACTLY. Nested values decode into map[string]interface{}, whose
 //     keys are exact, so only a byte-identical repeat is a divergence. Folding here would
 //     be wrong: a schema with sibling properties "Name" and "name" is legal and honest.
@@ -1879,8 +1896,11 @@ func scanToolEntry(raw json.RawMessage) toolEntryScan {
 		if !ok {
 			return toolEntryScan{untrustworthy: true}
 		}
-		// Fold at the top level only (see the doc comment).
-		folded := strings.ToLower(key)
+		// Fold at the top level only (see the doc comment). capability.FoldJSONKey, not
+		// strings.ToLower: ToLower leaves an already-lower-case case variant such as U+017F
+		// ("deſcription") distinct from "description", so the collision the decoder makes
+		// would go unseen here and the entry would clear the scan.
+		folded := capability.FoldJSONKey(key)
 		if _, dup := seen[folded]; dup {
 			out.untrustworthy = true
 		}
@@ -1890,7 +1910,7 @@ func scanToolEntry(raw json.RawMessage) toolEntryScan {
 		if err := dec.Decode(&value); err != nil {
 			return toolEntryScan{untrustworthy: true}
 		}
-		if folded == jsonKeyName {
+		if folded == jsonKeyNameFolded {
 			var n string
 			if err := json.Unmarshal(value, &n); err == nil && n != "" {
 				out.names = append(out.names, n)

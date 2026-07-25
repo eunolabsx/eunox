@@ -100,7 +100,10 @@ func expandEnvRefs(s string) string {
 // GatewayConfig tree contains. A map or interface field would be silently skipped
 // (leaving a secret reference un-expanded);
 // TestExpandEnvInStrings_ConfigTreeHasNoUnhandledKinds fails the moment one is
-// added, forcing this walk to be extended first.
+// added, forcing this walk to be extended first. That guard lives in THIS package
+// so `go test ./internal/config/` alone catches it — this package is designed to
+// build and test standalone, and a guard sitting in another package's tests would
+// pass a green run over exactly the field it is meant to catch.
 func expandEnvInStrings(v reflect.Value) {
 	switch v.Kind() {
 	case reflect.String:

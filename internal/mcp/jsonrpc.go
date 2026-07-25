@@ -13,11 +13,11 @@ import (
 	"math/big"
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
-	"unicode"
 	"unicode/utf8"
+
+	"github.com/eunolabs/eunox/pkg/capability"
 )
 
 // ErrParse marks a message that framed correctly — a full newline-delimited line
@@ -484,28 +484,11 @@ func rejectDuplicateJSONKeys(raw json.RawMessage) error {
 }
 
 // foldJSONKey canonicalizes a JSON object key so that any two keys encoding/json could
-// bind to the same struct field map to the same value. Each rune is replaced by the
-// smallest member of its Unicode simple-fold orbit, which groups every case variant the
-// decoder's field matcher treats as equal.
-//
-// strings.ToLower is NOT sufficient and was the gap this closes: U+017F (LATIN SMALL
-// LETTER LONG S) is already lower case, so ToLower leaves "deſcription" distinct from
-// "description", while the decoder folds them together and keeps the last.
+// bind to the same struct field map to the same value. It delegates to
+// capability.FoldJSONKey so this scan and the tools/list entry scan in the PDP fold by
+// one shared rule — see that function for why strings.ToLower is not sufficient.
 func foldJSONKey(key string) string {
-	var b strings.Builder
-	b.Grow(len(key))
-	for _, r := range key {
-		// SimpleFold walks the orbit in a cycle back to r; take its smallest member so
-		// every equivalent rune canonicalizes identically.
-		lowest := r
-		for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
-			if f < lowest {
-				lowest = f
-			}
-		}
-		b.WriteRune(lowest)
-	}
-	return b.String()
+	return capability.FoldJSONKey(key)
 }
 
 // -----------------------------------------------------------------

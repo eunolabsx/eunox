@@ -74,10 +74,11 @@ const globClassPlaceholder = '\x00'
 // replaced by a single placeholder, leaving only the characters path.Match compares
 // literally. A '%', '2' or 'f' written INSIDE a class ("[a%2f]") is a class MEMBER —
 // the class consumes one value character — so such a pattern is a live grant and
-// must not be read as an encoded separator. Mirrors path.Match's scanChunk exactly,
-// as countPatternPathSeparators does: '[' opens a class and ']' closes it (no
-// nesting), and a backslash-escaped character is a single literal unit that neither
-// opens nor closes one. The scan is deliberately literal-only: a token split by a
+// must not be read as an encoded separator. Mirrors path.Match's scanChunk, as
+// countPatternPathSeparators does: '[' opens a class and ']' closes an OPEN one (no
+// nesting) while a ']' with no class open is an ordinary literal, and a
+// backslash-escaped character is a single literal unit that neither opens nor closes
+// one. The scan is deliberately literal-only: a token split by a
 // wildcard ("%2*f") still loads, matching the fail-closed direction — this rejects
 // unmatchable grants, it is not a security boundary.
 func patternLiteralsOutsideClasses(pattern string) string {
@@ -96,6 +97,15 @@ func patternLiteralsOutsideClasses(pattern string) string {
 			}
 			inClass = true
 		case pattern[i] == ']':
+			// A ']' only closes a class that is actually open. With no open '[' it is an
+			// ordinary literal in path.Match's grammar, so it must be EMITTED, not dropped:
+			// swallowing it splices its neighbours together, and two bytes that were never
+			// adjacent in the pattern can then read as an encoded separator ("a%2]f" would
+			// render "a%2f"), rejecting a valid, matchable grant at load.
+			if !inClass {
+				b.WriteByte(pattern[i])
+				break
+			}
 			inClass = false
 		default:
 			if !inClass {

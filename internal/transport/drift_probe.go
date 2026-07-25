@@ -73,24 +73,19 @@ func (p *StdioProxy) fetchUpstreamToolsRaw(ctx context.Context) (json.RawMessage
 		} else if err := p.upWriter.Write(req); err != nil {
 			return nil, fmt.Errorf("tools/list write: %w", err)
 		}
-		for {
-			msg, err := p.readProbeReply(probeCtx)
-			if err != nil {
-				return nil, fmt.Errorf("tools/list read: %w", err)
-			}
-			if msg.IsResponse() && mcp.MsgKey(msg.ID) == mcp.MsgKey(mcp.RawJSON(`"_drift"`)) {
-				if msg.Error != nil {
-					return nil, fmt.Errorf("tools/list: upstream error %d: %s", msg.Error.Code, msg.Error.Message)
-				}
-				return msg.Result, nil
-			}
-			// Discard notifications arriving before the response. A discarded
-			// server-initiated REQUEST (sampling/createMessage, roots/list,
-			// elicitation/create), however, would leave the upstream blocked awaiting a
-			// response: this probe runs inline before readUpstream starts, so nothing
-			// else will answer it.
-			RejectPreInitServerRequest(p.upWriter, msg)
+		msg, err := awaitStartupReply(
+			func() (mcp.RPCMsg, error) { return p.readProbeReply(probeCtx) },
+			mcp.RawJSON(`"_drift"`),
+			p.upWriter,
+			nil,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("tools/list read: %w", err)
 		}
+		if msg.Error != nil {
+			return nil, fmt.Errorf("tools/list: upstream error %d: %s", msg.Error.Code, msg.Error.Message)
+		}
+		return msg.Result, nil
 	})
 }
 
