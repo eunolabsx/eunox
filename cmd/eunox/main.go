@@ -36,6 +36,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -72,6 +73,11 @@ func main() {
 // and returns the exit code. Kept separate from main so tests can assert the
 // code without terminating the test binary; main holds the only top-level
 // os.Exit. Subcommands that need a non-zero exit still call os.Exit themselves.
+//
+// args is threaded all the way down: each subcommand receives its own flag slice
+// (args[2:]) rather than re-reading the global os.Args. Reading the global made the
+// parameter a half-truth — a test could pick the subcommand but never its flags — and
+// any future caller that is not main would silently parse the wrong process's arguments.
 func run(args []string) int {
 	if len(args) < 2 {
 		// A bare invocation prints usage and exits 0 (not a usage error): package
@@ -80,23 +86,25 @@ func run(args []string) int {
 		printUsage(os.Stdout)
 		return 0
 	}
+	// Flags for the selected subcommand: everything after the subcommand token.
+	subArgs := args[2:]
 	switch args[1] {
 	case "proxy":
-		cmdProxy()
+		cmdProxy(subArgs)
 	case "validate":
-		return cmdValidate()
+		return cmdValidate(subArgs)
 	case "init":
-		return cmdInit()
+		return cmdInit(subArgs)
 	case "suggest":
-		return cmdSuggest()
+		return cmdSuggest(subArgs)
 	case "kill":
-		return cmdKill()
+		return cmdKill(subArgs)
 	case "audit-verify":
-		return cmdAuditVerify()
+		return cmdAuditVerify(subArgs)
 	case "stats":
-		return cmdStats()
+		return cmdStats(subArgs)
 	case "doctor":
-		cmdDoctor()
+		cmdDoctor(subArgs)
 	case "version", "--version", "-version":
 		cmdVersion()
 	case "--help", "-help", "-h", "help":
@@ -372,7 +380,7 @@ Flags:
 	fs.PrintDefaults()
 }
 
-func cmdProxy() {
+func cmdProxy(args []string) {
 	// exitCode lets post-sink paths exit non-zero while still running the deferred
 	// sink.Close (an os.Exit skips defers). As the outermost (LIFO) defer it runs
 	// after sink.Close has flushed and had a chance to flag a Sync/Close failure.
@@ -391,7 +399,7 @@ func cmdProxy() {
 
 	// flag.ExitOnError: Parse exits the process on a bad flag or -help, so it never
 	// returns a non-nil error here (the old `if err != nil` branch was dead).
-	_ = fs.Parse(os.Args[2:])
+	_ = fs.Parse(args)
 
 	if *f.configPath != "" && *f.audit {
 		fmt.Fprintf(os.Stderr, "eunox proxy: --audit and --config are mutually exclusive (--audit is for the zero-config wiretap path; --config carries its own enforcement posture).\n")
@@ -1246,6 +1254,14 @@ func resolveOAuthMetadata(cfg *config.GatewayConfig, pf proxyFlags) (*transport.
 	if oauthResource == "" {
 		oauthResource = pf.oauthResource
 		oauthResourceLabel = "--oauth-resource"
+	} else if pf.oauthResource != "" && pf.oauthResource != oauthResource {
+		// Warn on a silently-overridden explicit flag, exactly as openConfiguredAuditSink
+		// does for --audit-log/--audit-key-path. The precedence is deliberate, but this
+		// value is PUBLISHED in the RFC 9728 metadata document clients use to pick an
+		// audience, so an operator who passed --oauth-resource and got a different
+		// resource URI advertised must be told rather than left to discover it through
+		// rejected tokens.
+		fmt.Fprintf(os.Stderr, "[eunox] WARNING: --oauth-resource %q is overridden by the config's listen.oauthResource %q; the config takes precedence, and the config's value is what the protected-resource metadata advertises.\n", pf.oauthResource, oauthResource)
 	}
 	if err := validateOAuthURI(oauthResourceLabel, oauthResource, true); err != nil {
 		return nil, "", err
@@ -1260,6 +1276,10 @@ func resolveOAuthMetadata(cfg *config.GatewayConfig, pf proxyFlags) (*transport.
 	var validateAuthz bool
 	switch {
 	case len(cfg.Listen.OAuthAuthorizationServers) > 0:
+		if pf.oauthAuthzServer != "" && !slices.Contains(cfg.Listen.OAuthAuthorizationServers, pf.oauthAuthzServer) {
+			// Same rule as the resource URI above: config wins, but say so.
+			fmt.Fprintf(os.Stderr, "[eunox] WARNING: --oauth-authz-server %q is overridden by the config's listen.oauthAuthorizationServers %v; the config takes precedence.\n", pf.oauthAuthzServer, cfg.Listen.OAuthAuthorizationServers)
+		}
 		oauthAuthzServers = cfg.Listen.OAuthAuthorizationServers
 		validateAuthz = true
 	case pf.oauthAuthzServer != "":
@@ -1605,7 +1625,7 @@ func parseFlagsAndPositionals(fs *flag.FlagSet, args []string) ([]string, error)
 // cmdValidate runs the `validate` subcommand and returns the process exit code
 // (rather than calling os.Exit itself), so tests can drive every branch —
 // including the fail-closed error paths — without terminating the test binary.
-func cmdValidate() int {
+func cmdValidate(args []string) int {
 	fs := flag.NewFlagSet("validate", flag.ContinueOnError)
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `Usage:
@@ -1624,10 +1644,10 @@ are merged and validated, and with --live each route's declared upstream
 (http or stdio subprocess) is introspected — no need to re-specify the
 upstream wiring. The config is the source of truth.
 
-Exit codes with --live:
+Exit codes:
   0  All manifest entries match live tools; no glob-matched tools detected.
   1  Warnings or stale entries present (operator review required).
-  2  Connection or parse error.
+  2  Connection, parse, or usage error (a bad flag never reports as drift).
 
 With --config the exit code is the maximum across all routes.
 
@@ -1646,7 +1666,7 @@ Flags:
 	// Split off a stdio subprocess command after the first standalone "--".
 	// Manifest files are positional too, so "--" is the only unambiguous boundary;
 	// Go's flag package consumes "--", so we split before parsing.
-	rawArgs := os.Args[2:]
+	rawArgs := args
 	var stdioCmd []string
 	for i, a := range rawArgs {
 		if a == "--" {
@@ -1664,7 +1684,12 @@ Flags:
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
-		return 1
+		// A malformed flag is a PARSE-class failure (2), never 1: this subcommand
+		// documents 1 as "warnings or stale entries present", so returning it for a
+		// typo'd flag makes a CI gate read a usage error as real manifest drift and
+		// (worse) makes a clean run indistinguishable from one that never validated
+		// anything. Every usage error below returns 2 for the same reason.
+		return 2
 	}
 
 	// Track whether --transport was set explicitly so we can reject it in modes
@@ -1681,11 +1706,11 @@ Flags:
 	if *configPath != "" {
 		if len(files) > 0 {
 			fmt.Fprintf(os.Stderr, "eunox validate: --config cannot be combined with positional manifest files (got %d); manifests are declared per-route in the config\n", len(files))
-			return 1
+			return 2
 		}
 		if upstreamFlagsGiven {
 			fmt.Fprintf(os.Stderr, "eunox validate: --config cannot be combined with --transport / --upstream-url / --upstream-auth-header / --upstream-tls-skip-verify / a stdio command; each route's transport and upstream wiring is declared in the config\n")
-			return 1
+			return 2
 		}
 		cfg, err := config.LoadGatewayConfig(*configPath)
 		if err != nil {
@@ -1699,7 +1724,7 @@ Flags:
 
 	if len(files) == 0 {
 		fmt.Fprintf(os.Stderr, "eunox validate: at least one manifest file is required (or use --config <eunox.yaml>)\n")
-		return 1
+		return 2
 	}
 
 	// --transport, the upstream-* flags, and a stdio command only select how to
@@ -1707,7 +1732,7 @@ Flags:
 	// front rather than silently dropping them in a syntax-only check.
 	if !*live && upstreamFlagsGiven {
 		fmt.Fprintf(os.Stderr, "eunox validate: --transport / --upstream-url / --upstream-auth-header / --upstream-tls-skip-verify and a stdio command ('-- <cmd>') only apply with --live; add --live to drift-check against the upstream\n")
-		return 1
+		return 2
 	}
 
 	// Syntax check (always runs).
@@ -2060,7 +2085,7 @@ func writeGeneratedFile(path, content string, force bool) (err error) {
 // cmdInit runs the `init` subcommand and returns the process exit code (rather
 // than calling os.Exit itself), so tests can drive every branch — including the
 // fail-closed error paths — without terminating the test binary.
-func cmdInit() int {
+func cmdInit(args []string) int {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `Usage:
@@ -2092,7 +2117,7 @@ Flags:
 	tlsSkipVerify := fs.Bool("upstream-tls-skip-verify", false, "Skip TLS certificate verification for the HTTP upstream (development only).")
 	pinDescriptions := fs.Bool("pin-descriptions", false, "Include a descriptionHash field for each tool, computed from its current live\ndescription. When set in the manifest, the proxy verifies the hash at startup\nand aborts if the description has changed — detecting upstream tool poisoning.")
 
-	if err := fs.Parse(os.Args[2:]); err != nil {
+	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
@@ -2253,7 +2278,7 @@ func openAuditChain(cmdName, logPath string) (reader io.Reader, closeAll func(),
 
 // cmdSuggest runs the `suggest` subcommand and returns the process exit code
 // (rather than calling os.Exit itself), so tests can drive every branch.
-func cmdSuggest() int {
+func cmdSuggest(args []string) int {
 	fs := flag.NewFlagSet("suggest", flag.ContinueOnError)
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `Usage: eunox suggest [flags]
@@ -2288,7 +2313,7 @@ Flags:
 	force := fs.Bool("force", false, "Overwrite --output if it already exists (default: refuse to clobber). An\noverwrite also re-tightens the file mode to 0600.")
 	maxValues := fs.Int("max-values", suggestMaxValuesDefault, "Max distinct values an argument may have before allowedValues is downgraded to a review comment.\n0 or negative falls back to the default (20).")
 
-	if err := fs.Parse(os.Args[2:]); err != nil {
+	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
@@ -2355,7 +2380,7 @@ func killControlURL(host string, port int) string {
 
 // cmdKill runs the `kill` subcommand and returns the process exit code (rather
 // than calling os.Exit itself), so tests can drive every branch.
-func cmdKill() int {
+func cmdKill(args []string) int {
 	fs := flag.NewFlagSet("kill", flag.ContinueOnError)
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `Usage: eunox kill [flags] <session-id|all>
@@ -2394,7 +2419,7 @@ Flags:
 	// (target first) while accepting "--port 3001 all" — a foot-gun on the emergency-stop
 	// path. parseFlagsAndPositionals (used by `validate` for the same reason) peels the
 	// positional and re-parses the rest, so order does not matter.
-	pos, err := parseFlagsAndPositionals(fs, os.Args[2:])
+	pos, err := parseFlagsAndPositionals(fs, args)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -2548,7 +2573,7 @@ func applyConfigAuditDefaults(cmdName, configPath string, logPath, keyPath *stri
 
 // cmdAuditVerify runs the `audit-verify` subcommand and returns the process
 // exit code (rather than calling os.Exit itself), so tests can drive every branch.
-func cmdAuditVerify() int {
+func cmdAuditVerify(args []string) int {
 	fs := flag.NewFlagSet("audit-verify", flag.ContinueOnError)
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `Usage: eunox audit-verify [flags]
@@ -2565,7 +2590,7 @@ Flags:
 	requestID := fs.String("request-id", "", "Report (count and print) only the record with this request ID. Every record\nis still HMAC-verified and the tamper-evident chain is always checked; this\nfilter narrows the report, not the verification.")
 	since := fs.String("since", "", "Report (count and print) only records after this RFC3339 timestamp. Every\nrecord is still HMAC-verified and the tamper-evident chain is always checked;\nthis filter narrows the report, not the verification.")
 
-	if err := fs.Parse(os.Args[2:]); err != nil {
+	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
@@ -2694,7 +2719,7 @@ Flags:
 
 // cmdStats runs the `stats` subcommand and returns the process exit code
 // (rather than calling os.Exit itself), so tests can drive every branch.
-func cmdStats() int {
+func cmdStats(args []string) int {
 	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `Usage: eunox stats [flags]
@@ -2712,7 +2737,7 @@ Flags:
 	configPath := fs.String("config", "", "Path to the eunox config (YAML). When set, the configured audit.log is\nused as the default for --audit-log.")
 	auditLogPath := fs.String("audit-log", "", "Path to the audit JSONL log (default: ~/.eunox/audit.jsonl).")
 
-	if err := fs.Parse(os.Args[2:]); err != nil {
+	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}

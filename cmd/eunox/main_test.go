@@ -48,6 +48,17 @@ func withArgs(args []string, fn func()) {
 	fn()
 }
 
+// subArgsForTest returns the flag slice run() would hand the selected subcommand for
+// the os.Args withArgs currently has in place. Subcommands take their arguments as a
+// parameter rather than reading the global, so this is the bridge for the tests that
+// still express a case as "these os.Args, then call cmdX".
+func subArgsForTest() []string {
+	if len(os.Args) < 2 {
+		return nil
+	}
+	return os.Args[2:]
+}
+
 // writeTempFile writes content to a temp file and returns its path.
 func writeTempFile(t *testing.T, content string) string {
 	t.Helper()
@@ -98,7 +109,7 @@ func TestRun_ExitCodes(t *testing.T) {
 func TestCmdStats_EmptyLog(t *testing.T) {
 	path := writeTempFile(t, "")
 	withArgs([]string{"eunox", "stats", "--audit-log", path}, func() {
-		cmdStats()
+		cmdStats(subArgsForTest())
 	})
 }
 
@@ -124,7 +135,7 @@ func TestCmdStats_AllowedAndDenied(t *testing.T) {
 
 	path := writeTempFile(t, content)
 	withArgs([]string{"eunox", "stats", "--audit-log", path}, func() {
-		cmdStats()
+		cmdStats(subArgsForTest())
 	})
 }
 
@@ -149,7 +160,7 @@ func TestCmdStats_WithMultipleDenials(t *testing.T) {
 
 	path := writeTempFile(t, content)
 	withArgs([]string{"eunox", "stats", "--audit-log", path}, func() {
-		cmdStats()
+		cmdStats(subArgsForTest())
 	})
 }
 
@@ -213,7 +224,7 @@ capabilities:
 	}
 
 	withArgs([]string{"eunox", "validate", path}, func() {
-		cmdValidate()
+		cmdValidate(subArgsForTest())
 	})
 }
 
@@ -416,7 +427,7 @@ func TestCmdKill_KillSession_OK(t *testing.T) {
 	}
 
 	withArgs([]string{"eunox", "kill", "--port", port, "--host", host, "--control-token", "kill-test-token", "sess-1"}, func() {
-		cmdKill()
+		cmdKill(subArgsForTest())
 	})
 }
 
@@ -439,7 +450,7 @@ func TestCmdKill_KillAll_OK(t *testing.T) {
 	}
 
 	withArgs([]string{"eunox", "kill", "--port", port, "--host", host, "--control-token", "kill-test-token", "all"}, func() {
-		cmdKill()
+		cmdKill(subArgsForTest())
 	})
 }
 
@@ -450,7 +461,7 @@ func TestCmdKill_Redis_KillSession(t *testing.T) {
 	mr := miniredis.RunT(t)
 
 	withArgs([]string{"eunox", "kill", "--redis-addr", mr.Addr(), "sess-redis"}, func() {
-		cmdKill()
+		cmdKill(subArgsForTest())
 	})
 
 	if got, err := mr.Get("killswitch:session:sess-redis"); err != nil || got != "1" {
@@ -464,7 +475,7 @@ func TestCmdKill_Redis_KillAll(t *testing.T) {
 	mr := miniredis.RunT(t)
 
 	withArgs([]string{"eunox", "kill", "--redis-addr", mr.Addr(), "all"}, func() {
-		cmdKill()
+		cmdKill(subArgsForTest())
 	})
 
 	if got, err := mr.Get("killswitch:global"); err != nil || got != "1" {
@@ -482,7 +493,7 @@ func TestCmdAuditVerify_EmptyLog(t *testing.T) {
 		"--audit-log", logPath,
 		"--audit-key-path", keyPath,
 	}, func() {
-		cmdAuditVerify()
+		cmdAuditVerify(subArgsForTest())
 	})
 }
 
@@ -508,7 +519,7 @@ func TestCmdAuditVerify_WithRecords(t *testing.T) {
 		"--audit-log", logPath,
 		"--audit-key-path", keyPath,
 	}, func() {
-		cmdAuditVerify()
+		cmdAuditVerify(subArgsForTest())
 	})
 }
 
@@ -550,7 +561,7 @@ func TestCmdAuditVerify_VerifiesRotatedSet(t *testing.T) {
 		withArgs([]string{"eunox", "audit-verify",
 			"--audit-log", logPath,
 			"--audit-key-path", keyPath,
-		}, func() { code = cmdAuditVerify() })
+		}, func() { code = cmdAuditVerify(subArgsForTest()) })
 	})
 
 	if code != 0 {
@@ -636,7 +647,7 @@ func TestCmdAuditVerify_WithRequestIDFilter(t *testing.T) {
 		"--audit-key-path", keyPath,
 		"--request-id", "nonexistent-id", // no records match → all skipped
 	}, func() {
-		cmdAuditVerify()
+		cmdAuditVerify(subArgsForTest())
 	})
 }
 
@@ -647,7 +658,7 @@ func TestCmdInit_WithFakeUpstream(t *testing.T) {
 	defer srv.Close()
 
 	withArgs([]string{"eunox", "init", "--upstream-url", srv.URL}, func() {
-		cmdInit()
+		cmdInit(subArgsForTest())
 	})
 }
 
@@ -658,7 +669,7 @@ func TestCmdInit_WithOutputFile(t *testing.T) {
 
 	outputPath := filepath.Join(t.TempDir(), "manifest.yaml")
 	withArgs([]string{"eunox", "init", "--upstream-url", srv.URL, "--output", outputPath}, func() {
-		cmdInit()
+		cmdInit(subArgsForTest())
 	})
 
 	if _, err := os.Stat(outputPath); err != nil {
@@ -687,7 +698,7 @@ func TestCmdAuditVerify_SinceFilter(t *testing.T) {
 		"--audit-key-path", keyPath,
 		"--since", "2099-01-01T00:00:00Z",
 	}, func() {
-		cmdAuditVerify()
+		cmdAuditVerify(subArgsForTest())
 	})
 }
 
@@ -3216,7 +3227,7 @@ func TestCmdInit_AuthHeader_WarnsOnStderr(t *testing.T) {
 			"--output", manifestOut,
 			"--config-output", cfgOut,
 		}, func() {
-			code = cmdInit()
+			code = cmdInit(subArgsForTest())
 		})
 	})
 	if code != 0 {

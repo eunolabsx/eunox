@@ -133,7 +133,7 @@ type doctorOptions struct {
 	live         bool
 }
 
-func cmdDoctor() {
+func cmdDoctor(args []string) {
 	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `Usage:
@@ -165,7 +165,7 @@ Flags:
 
 	// flag.ExitOnError: Parse exits the process on a bad flag or -help, so it never
 	// returns a non-nil error here (the old `if err != nil` branch was dead).
-	_ = fs.Parse(os.Args[2:])
+	_ = fs.Parse(args)
 	// All inputs are flags; reject a stray positional rather than ignore it.
 	if fs.NArg() > 0 {
 		fmt.Fprintf(os.Stderr, "eunox doctor: unexpected argument %q (all inputs are flags; see --help)\n", fs.Arg(0))

@@ -589,7 +589,7 @@ func TestCmdDoctor_OutputFileGetsWritten(t *testing.T) {
 		"--audit-log", filepath.Join(t.TempDir(), "absent.jsonl"),
 		"--audit-tail", "0",
 	}, func() {
-		cmdDoctor()
+		cmdDoctor(subArgsForTest())
 	})
 	// The bundle file should exist and contain the header sentinel.
 	got := doctorReadFile(t, outPath)
@@ -631,7 +631,7 @@ upstreams:
 		"--output", outPath,
 		"--audit-tail", "0",
 	}, func() {
-		cmdDoctor()
+		cmdDoctor(subArgsForTest())
 	})
 	got := doctorReadFile(t, outPath)
 	// Check the actual "log path:" resolution line specifically, not just any

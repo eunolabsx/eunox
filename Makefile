@@ -17,7 +17,7 @@ IMAGE_REPO    ?= ghcr.io/eunolabs/eunox
 DOCKERFILE_MCP     := deploy/docker/Dockerfile.mcp
 DOCKERFILE_MCP_WIN := deploy/docker/Dockerfile.mcp.windows
 
-.PHONY: all build test lint generate clean coverage check-license check-notice check-fmt fmt vet \
+.PHONY: all build test lint clean coverage check-license check-notice check-fmt fmt vet \
         check-go-version check-cross-compile mcpb \
         docker-build-mcp docker-build-mcp-multi docker-push-mcp
 
@@ -75,10 +75,6 @@ check-fmt:
 		exit 1; \
 	fi
 	@echo "All Go files are gofmt-formatted."
-
-## Run code generation (oapi-codegen, etc.)
-generate:
-	$(GO) generate ./...
 
 ## Check license headers — all Go files must carry Apache-2.0.
 check-license:

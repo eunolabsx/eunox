@@ -807,7 +807,7 @@ func TestCmdSuggest_WritesLoadableManifest(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "draft.yaml")
 
 	withArgs([]string{"eunox", "suggest", "--audit-log", tape, "--output", out}, func() {
-		cmdSuggest()
+		cmdSuggest(subArgsForTest())
 	})
 
 	if _, err := config.LoadManifest(out); err != nil {
@@ -818,7 +818,7 @@ func TestCmdSuggest_WritesLoadableManifest(t *testing.T) {
 func TestCmdSuggest_EmptyLogToStdout(t *testing.T) {
 	tape := writeTempFile(t, "")
 	withArgs([]string{"eunox", "suggest", "--audit-log", tape}, func() {
-		cmdSuggest()
+		cmdSuggest(subArgsForTest())
 	})
 }
 
