@@ -3955,19 +3955,18 @@ func TestMCPMethodToTargetType(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		tt, err := mcpMethodToTargetType(tc.method)
-		if err != nil {
-			t.Errorf("mcpMethodToTargetType(%q): unexpected error: %v", tc.method, err)
+		tt, ok := capability.MethodTargetType(tc.method)
+		if !ok {
+			t.Errorf("MethodTargetType(%q): unexpectedly unmapped", tc.method)
 			continue
 		}
 		if tt != tc.want {
-			t.Errorf("mcpMethodToTargetType(%q) = %q, want %q", tc.method, tt, tc.want)
+			t.Errorf("MethodTargetType(%q) = %q, want %q", tc.method, tt, tc.want)
 		}
 	}
 
-	_, err := mcpMethodToTargetType("unknown/method")
-	if err == nil {
-		t.Error("mcpMethodToTargetType(unknown) should return an error")
+	if _, ok := capability.MethodTargetType("unknown/method"); ok {
+		t.Error("MethodTargetType(unknown) should report no mapping")
 	}
 }
 func TestAuditPruneRotated(t *testing.T) {
@@ -4068,8 +4067,9 @@ func TestRotatedAuditReMatchesProducer(t *testing.T) {
 // -----------------------------------------------------------------
 
 // TestUnmappedMethod_TargetTypeMapUnknown confirms that
-// mcpMethodToTargetType — the function driving the fail-close decision — returns
-// an error for any method not in the § 5.4 table.
+// capability.MethodTargetType — the mapping driving the fail-close decision, consulted
+// directly by deriveTargetFields — reports no mapping for any method not in the
+// § 5.4 table.
 func TestUnmappedMethod_TargetTypeMapUnknown(t *testing.T) {
 	unknownMethods := []string{
 		"agents/delegate",
@@ -4081,8 +4081,8 @@ func TestUnmappedMethod_TargetTypeMapUnknown(t *testing.T) {
 	for _, m := range unknownMethods {
 		m := m
 		t.Run(m, func(t *testing.T) {
-			_, err := mcpMethodToTargetType(m)
-			assert.Error(t, err, "mcpMethodToTargetType(%q) should return an error", m)
+			_, ok := capability.MethodTargetType(m)
+			assert.False(t, ok, "MethodTargetType(%q) should report no mapping", m)
 		})
 	}
 }

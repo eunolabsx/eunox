@@ -1952,19 +1952,18 @@ func evaluateJWTConditions(clock enforcement.Clock, conditions []capability.Cond
 					fmt.Sprintf("%q: argument %q is absent", name, c.Argument))
 				return &resp
 			}
-			val, isStr := rawVal.(string)
-			if !isStr {
-				// Non-string argument: match via the shared MatchAllowedValue, where a
-				// string allowed-value (a glob) cannot match it and a non-string
-				// allowed-value matches by exact value with numeric coercion.
-				if !enforcement.MatchAllowedValue(rawVal, c.Values) {
-					resp := denyResponse(clock, capability.ErrCodeValueNotPermitted, capability.ConditionTypeAllowedValues,
-						fmt.Sprintf("%q: argument %q value is not in the permitted set", name, c.Argument))
-					return &resp
+			// One enforcement point for both shapes: the shared MatchAllowedValue treats a
+			// string allowed-value as a glob (which cannot match a non-string argument) and
+			// a non-string allowed-value as an exact match with numeric coercion, so the
+			// string and non-string cases differ only in how the DENIAL reads — a string
+			// value is quoted into the message, a non-string one is not (its Go rendering
+			// would be neither the wire form nor useful).
+			if !enforcement.MatchAllowedValue(rawVal, c.Values) {
+				detail := fmt.Sprintf("%q: argument %q value is not in the permitted set", name, c.Argument)
+				if val, isStr := rawVal.(string); isStr {
+					detail = fmt.Sprintf("%q: argument %q value %q is not permitted", name, c.Argument, val)
 				}
-			} else if !enforcement.MatchAllowedValue(val, c.Values) {
-				resp := denyResponse(clock, capability.ErrCodeValueNotPermitted, capability.ConditionTypeAllowedValues,
-					fmt.Sprintf("%q: argument %q value %q is not permitted", name, c.Argument, val))
+				resp := denyResponse(clock, capability.ErrCodeValueNotPermitted, capability.ConditionTypeAllowedValues, detail)
 				return &resp
 			}
 		default:

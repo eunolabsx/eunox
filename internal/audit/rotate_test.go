@@ -1075,16 +1075,11 @@ func TestRotateReopenFallbackStillPrunes(t *testing.T) {
 		t.Fatalf("newest historical sibling (retain=1) must survive: %v", err)
 	}
 
-	matches, err := rotatedSiblings(logPath)
+	matches, _, err := scanRotatedDir(logPath)
 	if err != nil {
-		t.Fatalf("rotatedSiblings: %v", err)
+		t.Fatalf("scanRotatedDir: %v", err)
 	}
-	var rotatedCount int
-	for _, m := range matches {
-		if rotatedAuditRe.MatchString(m[len(logPath):]) {
-			rotatedCount++
-		}
-	}
+	rotatedCount := len(matches)
 	if rotatedCount != 2 {
 		t.Fatalf("after reopen-fallback rotation, %d rotated-pattern files remain, want 2 (1 retained historical + the live fallback)", rotatedCount)
 	}

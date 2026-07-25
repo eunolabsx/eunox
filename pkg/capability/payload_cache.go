@@ -250,8 +250,13 @@ func (c *PayloadCache[T]) Put(key string, payload T, expUnix int64) {
 	c.entries[key] = entry
 }
 
-// Invalidate removes a specific key immediately, called on explicit revocation so the
-// cached entry does not outlive the revocation. Removal is O(1). Nil-receiver safe.
+// Invalidate removes a specific key immediately. Removal is O(1). Nil-receiver safe.
+//
+// NOTE: nothing in eunox calls this today — it is here for an embedder wiring the cache
+// into its own revocation path, and the shipped bearer-token cache is bounded by entry
+// TTL (min(MaxEntryTTL, the payload's own expiry)) rather than by explicit invalidation.
+// Revoking a token therefore does NOT purge it from this cache; the entry simply cannot
+// outlive its expiry. Wiring revocation to this method is the way to close that window.
 func (c *PayloadCache[T]) Invalidate(key string) {
 	if c == nil {
 		return

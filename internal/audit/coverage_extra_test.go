@@ -648,16 +648,11 @@ func TestRotationViaPublicAPI(t *testing.T) {
 	}
 
 	// At least one rotated sibling must exist, and retention must bound them to 1.
-	sibs, err := rotatedSiblings(logPath)
+	sibs, _, err := scanRotatedDir(logPath)
 	if err != nil {
-		t.Fatalf("rotatedSiblings: %v", err)
+		t.Fatalf("scanRotatedDir: %v", err)
 	}
-	var genuine int
-	for _, s := range sibs {
-		if rotatedAuditRe.MatchString(s[len(logPath):]) {
-			genuine++
-		}
-	}
+	genuine := len(sibs)
 	if genuine == 0 {
 		t.Fatal("expected at least one rotated sibling after many small-threshold writes")
 	}
