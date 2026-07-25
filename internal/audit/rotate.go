@@ -125,21 +125,6 @@ func rotatedStampParts(name, logPath string) (ordinal uint64, hasOrdinal bool, t
 	return ordinal, hasOrdinal, tsBase, n
 }
 
-// rotatedSiblings returns every file in logPath's directory whose name begins with
-// the base log name plus a literal "." — the rotated scheme "<logPath>.<ordinal>.<timestamp>Z".
-// It uses a literal os.ReadDir + HasPrefix scan rather than filepath.Glob, since a
-// logPath with glob metacharacters would make Glob match unrelated files, miss
-// siblings, or return ErrBadPattern callers treat as "no matches".
-//
-// Each path is reconstructed as logPath + <suffix> so it carries an exact logPath
-// prefix, which rotatedAuditRe and rotatedStampParts rely on. The paths are not
-// suffix-filtered; callers apply rotatedAuditRe. A read error is returned (callers
-// treat it as "no siblings").
-func rotatedSiblings(logPath string) ([]string, error) {
-	matches, _, err := scanLogDir(logPath)
-	return matches, err
-}
-
 // scanLogDir reads logPath's directory ONCE and splits that single snapshot into every
 // regular file sharing the "<base>." prefix (returned as full paths) and whether the
 // active base itself was present in the SAME read.
@@ -158,7 +143,14 @@ func rotatedSiblings(logPath string) ([]string, error) {
 // otherwise reach pruneRotated (os.Remove fails on a non-empty dir, or burns a retention
 // slot on an empty one) or newestRotatedSiblingWithTail (os.Open succeeds on a dir but
 // Read fails, breaking the chain). The rotatedAuditRe name filter is applied one level
-// up, in sortedRotatedSiblingsWithBase.
+// up, in sortedRotatedSiblingsWithBase, so the siblings returned here are only
+// prefix-matched, not yet confirmed to be genuine rotated names.
+//
+// The scan is a literal os.ReadDir + HasPrefix rather than filepath.Glob: a logPath
+// carrying glob metacharacters would make Glob match unrelated files, miss siblings, or
+// return ErrBadPattern that callers treat as "no matches". Each sibling is reconstructed
+// as logPath + <suffix> so it carries an exact logPath prefix, which rotatedAuditRe and
+// rotatedStampParts rely on.
 func scanLogDir(logPath string) (siblings []string, hasActive bool, err error) {
 	dir := filepath.Dir(logPath)
 	base := filepath.Base(logPath)
