@@ -1680,19 +1680,37 @@ const auditDetailsTotalCap = 1 << 20 // 1 MiB
 // sheds records (counted, tamper-evident) instead of OOM-ing the process.
 const auditQueueByteBudget = 256 << 20 // 256 MiB
 
-// auditRecordEnvelopeEstimate is a flat per-record allowance for the fixed envelope
-// (session id, method, target, key id, the two hex HMACs) that queueSize adds on top
-// of the variable Details/Obligations bytes. It need not be exact — queuedBytes is a
-// soft bound.
+// auditRecordEnvelopeEstimate is a flat per-record allowance for the genuinely
+// FIXED-width envelope (timestamps, request id, key id, decision/denial codes, the
+// two hex HMACs) that queueSize adds on top of the variable-length fields it counts
+// individually. It need not be exact — queuedBytes is a soft bound.
 const auditRecordEnvelopeEstimate = 512
 
 // queueSize estimates the heap a queued record retains: its already-marshaled Details
-// and Obligations bytes plus a flat envelope allowance. The drainer recomputes it from
-// the same immutable fields, so the enqueue add and the drain subtract always agree.
+// and Obligations bytes, the variable-length envelope strings, and a flat allowance
+// for the fixed remainder. The drainer recomputes it from the same immutable fields,
+// so the enqueue add and the drain subtract always agree.
+//
+// The variable strings are counted rather than folded into the flat allowance because
+// they are attacker- or IdP-influenced and individually bounded at up to
+// auditEnvelopeFieldCap (8 KiB): Target, an unrecognized raw Method, and the three
+// JWT identity claims can together retain ~40 KiB that a flat 512 did not see. Under
+// a flood of such records the queue would hold ~80x the byte budget it is sized to
+// bound — the shed-instead-of-OOM guarantee the budget exists for. Labels are drawn
+// from the closed native vocabulary and are counted for completeness, not bounds.
 func (rec *auditRecord) queueSize() int64 {
 	n := int64(len(rec.Details)) + auditRecordEnvelopeEstimate
 	for _, o := range rec.Obligations {
 		n += int64(len(o))
+	}
+	n += int64(len(rec.SessionID) + len(rec.AgentID) + len(rec.TaskID) + len(rec.UserID))
+	n += int64(len(rec.Target) + len(rec.Method) + len(rec.TargetType))
+	n += int64(len(rec.Upstream) + len(rec.PolicyVersion) + len(rec.PolicySHA256))
+	for _, l := range rec.LabelsOut {
+		n += int64(len(l))
+	}
+	for _, l := range rec.CarriedLabels {
+		n += int64(len(l))
 	}
 	return n
 }

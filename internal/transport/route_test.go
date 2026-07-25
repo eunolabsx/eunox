@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/eunolabs/eunox/internal/audit"
 	"github.com/eunolabs/eunox/internal/config"
 	"github.com/eunolabs/eunox/internal/drift"
 	"github.com/eunolabs/eunox/internal/mcp"
@@ -104,7 +105,12 @@ func TestBuildRoutes_VersionAndPDP(t *testing.T) {
 		Name: "fs", Transport: "stdio", Command: "echo",
 		Policy: []string{manifest}, ExpectVersion: "1.2.3",
 	}}}
-	routes, err := BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil })
+	sink, err := audit.Open(filepath.Join(dir, "audit.jsonl"), filepath.Join(dir, "audit.key"), 0, 0)
+	if err != nil {
+		t.Fatalf("audit.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = sink.Close() })
+	routes, err := BuildRoutes(cfg, sink, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil })
 	if err != nil {
 		t.Fatalf("BuildRoutes: %v", err)
 	}
@@ -128,6 +134,37 @@ func TestBuildRoutes_VersionAndPDP(t *testing.T) {
 		t.Errorf("routeSink not stamped: %+v", r.sink)
 	}
 }
+
+// TestBuildRoutes_NilSinkLeavesRouteSinkNil pins the typed-nil rule: with no audit
+// sink configured, a route must be left with a nil r.sink so asRecorder(route.sink)
+// yields a genuine nil INTERFACE at every call site. Wrapping nil in a &routeSink{}
+// would satisfy every `rec != nil` guard in the shared core and silently defeat its
+// "no sink configured" fast paths — dispatchList would decode and count every */list
+// catalog it has nowhere to record.
+func TestBuildRoutes_NilSinkLeavesRouteSinkNil(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	manifest := mustWriteFile(t, dir, "m.yaml", "schemaVersion: \"0.1\"\nname: test\nversion: \"1.2.3\"\ncapabilities:\n  - target: tool:read_file\n    actions: [call]\n")
+	cfg := &config.GatewayConfig{Upstreams: []config.UpstreamConfig{{
+		Name: "fs", Transport: "stdio", Command: "echo", Policy: []string{manifest},
+	}}}
+	routes, err := BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil })
+	if err != nil {
+		t.Fatalf("BuildRoutes: %v", err)
+	}
+	r := routes["fs"]
+	if r == nil {
+		t.Fatal("route fs missing")
+	}
+	if r.sink != nil {
+		t.Fatalf("r.sink = %+v, want nil for a sink-less route", r.sink)
+	}
+	// The interface conversion every call site performs must be a true nil, not a
+	// non-nil interface holding a nil pointer.
+	if rec := asRecorder(r.sink); rec != nil {
+		t.Fatalf("asRecorder(r.sink) = %#v, want a nil interface", rec)
+	}
+}
 func TestBuildRoutes_NoPolicyInheritsAudit(t *testing.T) {
 	t.Parallel()
 	cfg := &config.GatewayConfig{Upstreams: []config.UpstreamConfig{{Name: "fs", Transport: "stdio", Command: "echo"}}}
@@ -143,8 +180,26 @@ func TestBuildRoutes_NoPolicyInheritsAudit(t *testing.T) {
 	if !r.audit {
 		t.Error("enforcement: audit should be inherited from defaults")
 	}
-	if r.sink == nil || r.sink.policyVersion != "" {
-		t.Errorf("policyVersion should be empty for no-policy route, got %+v", r.sink)
+	// No audit sink was passed, so no routeSink is built at all (see
+	// TestBuildRoutes_NilSinkLeavesRouteSinkNil).
+	if r.sink != nil {
+		t.Errorf("r.sink should be nil when BuildRoutes got no sink, got %+v", r.sink)
+	}
+
+	// With a real sink the route does get a routeSink, and a policyless route stamps
+	// an empty policy version/digest on it (nothing is in force to name).
+	dir := t.TempDir()
+	sink, err := audit.Open(filepath.Join(dir, "audit.jsonl"), filepath.Join(dir, "audit.key"), 0, 0)
+	if err != nil {
+		t.Fatalf("audit.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = sink.Close() })
+	routes, err = BuildRoutes(cfg, sink, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil })
+	if err != nil {
+		t.Fatalf("BuildRoutes with sink: %v", err)
+	}
+	if s := routes["fs"].sink; s == nil || s.policyVersion != "" || s.policySHA256 != "" {
+		t.Errorf("policy provenance should be empty for a no-policy route, got %+v", s)
 	}
 }
 

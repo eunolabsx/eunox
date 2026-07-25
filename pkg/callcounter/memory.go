@@ -73,10 +73,13 @@ func WithTimeFunc(fn func() time.Time) InMemoryOption {
 	}
 }
 
-// WithMaxKeys bounds the number of distinct keys the counter holds at once,
+// WithMaxKeys bounds the number of map entries the counter holds at once,
 // capping the heap the map can consume between Cleanup cycles when unique keys
 // arrive faster than Cleanup reclaims them (the fresh-session-per-request case;
-// see NewInMemory). Once the map holds n entries, a call under a *new* key is
+// see NewInMemory). The bound is on (key, window) BUCKETS, not on distinct keys:
+// one key counted over two window lengths occupies two entries, so n is a ceiling
+// on buckets and a lower ceiling than n on the distinct keys admitted. Once the
+// map holds n entries, a call under a *new* bucket is
 // refused with an error; both callers treat that fail-closed (maxCalls denies the
 // call, and the sequenceBlock recorder surfaces it so the engine denies). The cost
 // at the ceiling is availability — a new-key call is denied (CONDITION_FAILED)

@@ -2223,8 +2223,8 @@ func TestServeStdioHost_AuditModeStartsAndFailsFast(t *testing.T) {
 func TestCmdValidate_NoFiles(t *testing.T) {
 	var code int
 	withArgs([]string{"eunox", "validate"}, func() { code = cmdValidate() })
-	if code != 1 {
-		t.Errorf("expected exit code 1 (no manifest files), got %d", code)
+	if code != 2 {
+		t.Errorf("expected exit code 2 (usage: no manifest files), got %d", code)
 	}
 }
 
@@ -2237,8 +2237,8 @@ func TestCmdValidate_ConfigAndPositional(t *testing.T) {
 	}
 	var code int
 	withArgs([]string{"eunox", "validate", "--config", cfgPath, mfPath}, func() { code = cmdValidate() })
-	if code != 1 {
-		t.Errorf("expected exit code 1 (--config+positional conflict), got %d", code)
+	if code != 2 {
+		t.Errorf("expected exit code 2 (usage: --config+positional conflict), got %d", code)
 	}
 }
 
@@ -2252,8 +2252,8 @@ func TestCmdValidate_ConfigAndUpstreamURL(t *testing.T) {
 	withArgs([]string{"eunox", "validate", "--config", cfgPath, "--upstream-url", "http://x"}, func() {
 		code = cmdValidate()
 	})
-	if code != 1 {
-		t.Errorf("expected exit code 1 (--config+--upstream-url conflict), got %d", code)
+	if code != 2 {
+		t.Errorf("expected exit code 2 (usage: --config+--upstream-url conflict), got %d", code)
 	}
 }
 
@@ -2281,8 +2281,8 @@ capabilities: []
 	withArgs([]string{"eunox", "validate", "--upstream-url", "http://x", mfPath}, func() {
 		code = cmdValidate()
 	})
-	if code != 1 {
-		t.Errorf("expected exit code 1 (transport flags without --live), got %d", code)
+	if code != 2 {
+		t.Errorf("expected exit code 2 (usage: transport flags without --live), got %d", code)
 	}
 }
 

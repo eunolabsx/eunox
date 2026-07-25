@@ -1246,6 +1246,13 @@ func resolveOAuthMetadata(cfg *config.GatewayConfig, pf proxyFlags) (*transport.
 	if oauthResource == "" {
 		oauthResource = pf.oauthResource
 		oauthResourceLabel = "--oauth-resource"
+	} else if pf.oauthResource != "" && pf.oauthResource != cfg.Listen.OAuthResource {
+		// Config wins, matching the audit-path precedence above — but say so. The
+		// resource URI is what a client's token audience is checked against, so an
+		// operator who passed --oauth-resource and got a metadata document naming a
+		// different resource would otherwise debug a token-audience mismatch with no
+		// hint that their flag was dropped.
+		fmt.Fprintf(os.Stderr, "[eunox] WARNING: --oauth-resource %q is overridden by the config's listen.oauthResource %q; the config takes precedence.\n", pf.oauthResource, cfg.Listen.OAuthResource)
 	}
 	if err := validateOAuthURI(oauthResourceLabel, oauthResource, true); err != nil {
 		return nil, "", err
@@ -1260,6 +1267,11 @@ func resolveOAuthMetadata(cfg *config.GatewayConfig, pf proxyFlags) (*transport.
 	var validateAuthz bool
 	switch {
 	case len(cfg.Listen.OAuthAuthorizationServers) > 0:
+		if pf.oauthAuthzServer != "" {
+			// Same silent-override hazard as the resource URI above: warn rather than
+			// drop the operator's flag without a word.
+			fmt.Fprintf(os.Stderr, "[eunox] WARNING: --oauth-authz-server %q is overridden by the config's listen.oauthAuthorizationServers; the config takes precedence.\n", pf.oauthAuthzServer)
+		}
 		oauthAuthzServers = cfg.Listen.OAuthAuthorizationServers
 		validateAuthz = true
 	case pf.oauthAuthzServer != "":
@@ -1624,10 +1636,12 @@ are merged and validated, and with --live each route's declared upstream
 (http or stdio subprocess) is introspected — no need to re-specify the
 upstream wiring. The config is the source of truth.
 
-Exit codes with --live:
-  0  All manifest entries match live tools; no glob-matched tools detected.
-  1  Warnings or stale entries present (operator review required).
-  2  Connection or parse error.
+Exit codes:
+  0  Manifests valid; with --live, all entries match live tools and no
+     glob-matched tools were detected.
+  1  Drift warnings or stale entries present (operator review required).
+     Reserved for findings, so CI can gate on it; never used for usage errors.
+  2  Usage error, or a manifest/config parse or upstream-connection failure.
 
 With --config the exit code is the maximum across all routes.
 
@@ -1664,7 +1678,12 @@ Flags:
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
-		return 1
+		// 2, not 1: exit 1 is reserved for "drift warnings present, operator review
+		// required", which a CI pipeline is expected to gate on. A usage error
+		// exiting 1 is indistinguishable from a clean run that found drift, so a
+		// misspelled flag reads as a policy finding. Every usage rejection below
+		// exits 2 for the same reason.
+		return 2
 	}
 
 	// Track whether --transport was set explicitly so we can reject it in modes
@@ -1681,11 +1700,11 @@ Flags:
 	if *configPath != "" {
 		if len(files) > 0 {
 			fmt.Fprintf(os.Stderr, "eunox validate: --config cannot be combined with positional manifest files (got %d); manifests are declared per-route in the config\n", len(files))
-			return 1
+			return 2
 		}
 		if upstreamFlagsGiven {
 			fmt.Fprintf(os.Stderr, "eunox validate: --config cannot be combined with --transport / --upstream-url / --upstream-auth-header / --upstream-tls-skip-verify / a stdio command; each route's transport and upstream wiring is declared in the config\n")
-			return 1
+			return 2
 		}
 		cfg, err := config.LoadGatewayConfig(*configPath)
 		if err != nil {
@@ -1699,7 +1718,7 @@ Flags:
 
 	if len(files) == 0 {
 		fmt.Fprintf(os.Stderr, "eunox validate: at least one manifest file is required (or use --config <eunox.yaml>)\n")
-		return 1
+		return 2
 	}
 
 	// --transport, the upstream-* flags, and a stdio command only select how to
@@ -1707,7 +1726,7 @@ Flags:
 	// front rather than silently dropping them in a syntax-only check.
 	if !*live && upstreamFlagsGiven {
 		fmt.Fprintf(os.Stderr, "eunox validate: --transport / --upstream-url / --upstream-auth-header / --upstream-tls-skip-verify and a stdio command ('-- <cmd>') only apply with --live; add --live to drift-check against the upstream\n")
-		return 1
+		return 2
 	}
 
 	// Syntax check (always runs).
