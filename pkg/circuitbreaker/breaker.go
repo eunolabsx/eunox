@@ -97,9 +97,14 @@ type Breaker struct {
 	lastFailureTime  time.Time
 	halfOpenProbes   int
 	halfOpenSuccess  int
-	// halfOpenGen identifies the current half-open window. It is incremented on
-	// every Open->HalfOpen transition so a probe admitted in an earlier window can
-	// be told apart from one admitted in the current window.
+	// halfOpenGen identifies the current half-open window, so a late outcome from a
+	// window that has already ended is dropped rather than counted toward the new
+	// state. It is incremented at two sites: Open->HalfOpen (opening a new window) and
+	// HalfOpen->Closed (closing the breaker after enough successes). The third window-
+	// ending transition, the HalfOpen->Open re-trip in recordFailure, deliberately does
+	// not bump it — recordFailure and recordSuccess both return early while the state
+	// is Open, which already discards every stale outcome, and the next Open->HalfOpen
+	// bump supersedes the generation before probes are admitted again.
 	halfOpenGen      uint64
 	lastTransitionAt time.Time
 	totalFailures    int64

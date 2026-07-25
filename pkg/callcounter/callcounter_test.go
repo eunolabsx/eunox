@@ -815,3 +815,51 @@ func TestInMemory_IncrementIfAllBelow_AtomicUnderConcurrency(t *testing.T) {
 
 	assert.Equal(t, 1, admittedCnt, "exactly one concurrent caller may be admitted against a limit of 1")
 }
+
+// TestInMemory_IncrementIfBelow_AtomicUnderConcurrency pins the single-bucket maxCalls
+// admission bound under concurrency: N racing callers against a limit of L admit exactly
+// L, never more — over-admission would be a maxCalls bypass. The sibling above covers the
+// multi-bucket IncrementIfAllBelow; this covers the primary single-key maxCalls path. Run
+// under -race to catch a torn read/write of the bucket counter.
+func TestInMemory_IncrementIfBelow_AtomicUnderConcurrency(t *testing.T) {
+	cases := []struct {
+		name  string
+		limit int64
+	}{
+		{"limit-1", 1},
+		{"limit-5", 5},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			counter := callcounter.NewInMemory()
+			ctx := context.Background()
+
+			const goroutines = 64
+			var (
+				mu          sync.Mutex
+				admittedCnt int
+				start       = make(chan struct{})
+				wg          sync.WaitGroup
+			)
+			wg.Add(goroutines)
+			for i := 0; i < goroutines; i++ {
+				go func() {
+					defer wg.Done()
+					<-start
+					_, admitted, _, err := counter.IncrementIfBelow(ctx, "k", 60, tc.limit)
+					if err == nil && admitted {
+						mu.Lock()
+						admittedCnt++
+						mu.Unlock()
+					}
+				}()
+			}
+			close(start)
+			wg.Wait()
+
+			assert.Equal(t, int(tc.limit), admittedCnt,
+				"exactly the limit may be admitted concurrently, never more (a higher count is a maxCalls bypass)")
+		})
+	}
+}

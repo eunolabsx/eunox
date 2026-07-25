@@ -1376,6 +1376,16 @@ field the tool omitted from one it supplied with the wrong type.
 > statement whose first token is `WITH`. Use it to constrain simple, single-verb
 > statements; for untrusted or CTE-bearing SQL, pair it with database-level
 > controls (read-only roles, grants) rather than relying on it alone.
+>
+> Statement stacking is the dangerous case. `operations: ["SELECT"]` does **not**
+> stop `SELECT 1; DROP TABLE users`: only the first token (`SELECT`) is inspected,
+> so the call is allowed and the trailing `DROP` reaches the upstream and executes
+> if the database driver permits multiple statements per call. Unlike the
+> CTE/`EXPLAIN` examples above (which cause false *denials*), this is an
+> under-block — a forbidden operation slips through. Disable multi-statement
+> execution at the driver or connection level, and treat `allowedOperations` as
+> defense-in-depth over a read-only database role, never as the sole control on
+> untrusted SQL.
 
 **`allowedExtensions`** — restricts a tool's file-path argument to an allowlist
 of file extensions. The `argument` field is required (a condition without it is
