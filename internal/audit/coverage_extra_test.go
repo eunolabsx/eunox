@@ -108,7 +108,6 @@ func TestExpandHome(t *testing.T) {
 		{"~/.eunox/audit.key", filepath.Join(home, ".eunox", "audit.key")},
 		{"/etc/eunox/audit.jsonl", "/etc/eunox/audit.jsonl"}, // absolute: passthrough
 		{"relative/path", "relative/path"},                   // no leading ~: passthrough
-		{"~tilde-not-home", "~tilde-not-home"},               // ~ not followed by / and not bare
 	}
 	for _, c := range cases {
 		got, err := expandHome(c.in)
@@ -117,6 +116,17 @@ func TestExpandHome(t *testing.T) {
 		}
 		if got != c.want {
 			t.Errorf("expandHome(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+
+	// A "~user/..." form must be REFUSED, not passed through. Go cannot resolve another
+	// user's home portably, so the old passthrough treated "~alice/audit.jsonl" as an
+	// ordinary relative path and silently created a directory literally named "~alice"
+	// under the process cwd — putting the tamper-evident tape (or its HMAC key) somewhere
+	// the operator never chose and will not think to look.
+	for _, in := range []string{"~tilde-not-home", "~alice/audit.jsonl", "~root/.eunox/audit.key"} {
+		if got, err := expandHome(in); err == nil {
+			t.Errorf("expandHome(%q) = %q with no error; a ~user form must fail closed rather than resolve against the cwd", in, got)
 		}
 	}
 }

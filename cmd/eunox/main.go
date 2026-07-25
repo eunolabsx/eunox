@@ -99,7 +99,7 @@ func run(args []string) int {
 		cmdDoctor()
 	case "version", "--version", "-version":
 		cmdVersion()
-	case "--help", "-h", "help":
+	case "--help", "-help", "-h", "help":
 		// An explicit help request is a successful query: usage to stdout, exit 0.
 		printUsage(os.Stdout)
 	default:
@@ -1837,8 +1837,9 @@ func reportRouteOutcome(wf func(string, ...interface{}), wln func(...interface{}
 // manifest(s) and — when live is set — introspecting the declared upstream and
 // reporting drift. A no-policy route the proxy would refuse to start is reported
 // FAIL and skipped (never introspected, since the upstream would never serve); a
-// valid no-policy route (audit/wiretap or allow-all passthrough) is introspected
-// under --live for visibility but contributes no drift findings.
+// valid no-policy route -- which on a gateway means audit/wiretap mode ONLY, since a
+// policyless enforce route is refused at startup -- is introspected under --live for
+// visibility but contributes no drift findings.
 //
 // Exit code is the maximum across routes: 0 clean, 1 drift, 2 parse/connection
 // failure.
@@ -2891,7 +2892,7 @@ func writeDenialTable(w io.Writer, denials map[denialKey]int) {
 		}
 		return rows[i].code < rows[j].code
 	})
-	wf("%-30s  %-30s  %s\n", "TOOL", "CODE", "COUNT")
+	wf("%-30s  %-30s  %s\n", "TARGET", "CODE", "COUNT")
 	wln(strings.Repeat("-", 72))
 	for _, r := range rows {
 		wf("%-30s  %-30s  %d\n", r.tool, r.code, r.count)

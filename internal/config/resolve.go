@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -67,6 +68,16 @@ func ExpandHome(p string) (string, error) {
 			return home, nil
 		}
 		return filepath.Join(home, p[2:]), nil
+	}
+	// A "~user/..." form is NOT expanded — Go has no portable way to resolve another
+	// user's home directory — so it used to fall through and be treated as an ordinary
+	// RELATIVE path, silently creating a directory literally named "~alice" under the
+	// process cwd. For an audit log or its HMAC key that means the tamper-evident artifact
+	// lands somewhere the operator never chose and will not think to look. Refuse instead:
+	// the operator asked for a path this function cannot honor, and fail-closed with a
+	// clear message beats a silently wrong location.
+	if strings.HasPrefix(p, "~") {
+		return "", fmt.Errorf("cannot expand %q: only %q and %q are supported (a %q form cannot be resolved portably); write the absolute path instead", p, "~", "~/...", "~user/...")
 	}
 	return p, nil
 }

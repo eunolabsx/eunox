@@ -688,7 +688,7 @@ func (s *Sink) resumeChainFromTail(last string) tailResumeResult {
 // Open opens (or creates) the audit log and loads (or generates) the HMAC
 // signing key. logPath, keyPath, and rotateSizeBytes may be zero for defaults.
 //
-// REL-04: keyPath is configurable so the key can be injected in containerized or
+// keyPath is configurable so the key can be injected in containerized or
 // shared-host deployments. Empty uses the default (~/.eunox/audit.key), itself
 // overridable by EUNOX_AUDIT_KEY_PATH.
 func Open(logPath, keyPath string, rotateSizeBytes int64, retainRotated int, opts ...Option) (*Sink, error) {
@@ -705,8 +705,7 @@ func Open(logPath, keyPath string, rotateSizeBytes int64, retainRotated int, opt
 	}
 
 	// Resolve the key path through the single source of truth for flag/env/default
-	// precedence so the proxy never drifts from the audit-verify/doctor subcommands
-	// (REL-04).
+	// precedence so the proxy never drifts from the audit-verify/doctor subcommands.
 	expandedKeyPath, err := ResolveKeyPath(keyPath)
 	if err != nil {
 		return nil, fmt.Errorf("audit key path: %w", err)
@@ -2942,7 +2941,7 @@ func ResolveLogPath(pref string) (string, error) {
 
 // ResolveKeyPath returns the effective HMAC key path: pref when non-empty, else
 // EUNOX_AUDIT_KEY_PATH, else the built-in default, expanded. Single-sources the
-// env-var precedence across the proxy and subcommands (REL-04).
+// env-var precedence across the proxy and subcommands.
 func ResolveKeyPath(pref string) (string, error) {
 	if pref == "" {
 		if env := os.Getenv("EUNOX_AUDIT_KEY_PATH"); env != "" {
