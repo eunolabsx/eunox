@@ -152,6 +152,10 @@ const (
 	listKeyPrompts   = capability.ListKeyPrompts
 )
 
+// jsonKeyName is the tools/list entry key the pin routes on, lowercase because the
+// duplicate-key scan compares top-level keys case-folded (see scanToolEntry).
+const jsonKeyName = "name"
+
 // CountListEntries returns the number of entries in a */list method's result
 // array, or 0 for a non-list method or an empty/absent/unparseable result.
 //
@@ -703,6 +707,47 @@ func (p *ManifestPDP) isToolPoisoned(name string) bool {
 	return ok
 }
 
+// markToolPoisoned sets the sticky poison mark for a pinned tool name so its call leg
+// (pinViolated) denies until the process restarts. Used when a tools/list response cannot
+// be reduced to a trustworthy hash for a pinned tool — an entry that fails to decode into
+// the hashed surface, or one carrying duplicate top-level keys a host may render
+// differently than the proxy hashed. Idempotent and safe under concurrent tools/list
+// responses; mirrors the atomic poison-set inside recordObservedToolHash.
+func (p *ManifestPDP) markToolPoisoned(name string) {
+	p.descMu.Lock()
+	if p.poisonedTools == nil {
+		p.poisonedTools = make(map[string]struct{})
+	}
+	p.poisonedTools[name] = struct{}{}
+	p.descMu.Unlock()
+}
+
+// poisonAllPinned sticky-poisons every pinned tool name. Reserved for an ambiguity that
+// taints the WHOLE response — an undecodable envelope or tools array, or a duplicate or
+// case-variant "tools" key that leaves the proxy and a host reading different arrays — so
+// no entry within it can be believed. The pin is a security control, not best-effort
+// bookkeeping, and a response the proxy cannot verify any pin against must not leave the
+// mid-session poisoning pin unarmed. A no-op when nothing is pinned.
+//
+// An ambiguity confined to ONE entry must NOT come here: poisonCandidates scopes the
+// poison to the pinned names that entry could present, so an unrelated malformed entry
+// cannot disable pins it never named. The mark is sticky to process exit and the PDP is
+// shared across every session on the route, so the blast radius is permanent — keep it as
+// narrow as the evidence.
+func (p *ManifestPDP) poisonAllPinned() {
+	if len(p.pinnedTools) == 0 {
+		return
+	}
+	p.descMu.Lock()
+	if p.poisonedTools == nil {
+		p.poisonedTools = make(map[string]struct{})
+	}
+	for name := range p.pinnedTools {
+		p.poisonedTools[name] = struct{}{}
+	}
+	p.descMu.Unlock()
+}
+
 // pinViolated reports whether a pinned tool's call leg must be denied: it was ever
 // observed poisoned (sticky), OR its most recently observed hash differs from the
 // pin. BOTH are read under a single RLock so the call leg cannot observe a torn
@@ -787,21 +832,63 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 		return *deny
 	}
 
+	// descriptionHash pin (tools/call leg). A constraint may pin a tool's
+	// description hash to defend against an upstream that rewrites the description to
+	// inject a prompt (tool poisoning, FM-5). filterToolsListResult hides a
+	// description-changed tool from tools/list, but a host calling by name (a cached
+	// tool) would otherwise bypass the pin on the call leg. Enforce it here against the
+	// most recently observed description. It denies only when the description HAS been
+	// re-observed and no longer matches — the mid-session change the session-start drift
+	// probe cannot catch. An as-yet-unobserved description is not denied (the probe
+	// already verified every pin at establishment). Returns hardDenyResponse: a
+	// tool-poisoning deny is not downgradable even under audit (see that helper for how
+	// HardDeny survives stamp() and isObserveDeny).
+	//
+	// This runs BEFORE findConstraint and the no-match return below, keyed off
+	// pinnedTools (every pinned entry for this name), never off the SELECTED constraint:
+	// the pin must fire on an observed mismatch regardless of whether — or which —
+	// constraint findConstraint selects. Running it AFTER the no-match return would let
+	// a pinned name with no constraint selected for this caller (e.g. a principal-scoped
+	// pinned entry whose claims do not satisfy it → findConstraint returns nil) fall
+	// through to a plain, downgradable AUTHORIZATION_FAILED that an audit route forwards
+	// to the poisoned upstream; running it after the action check would let an
+	// audit-mode constraint downgrade the same call. Firing here off the name keeps a
+	// genuine poisoning a hard AUTHORIZATION_FAILED; a matching or as-yet-unobserved
+	// description does not deny here and still reaches the accurate no-match/action
+	// checks below.
+	if pin, isPinned := p.pinnedTools[target.Name]; schema == validateSchema && isPinned {
+		// pinViolated reads the sticky poison mark and the observed hash under one lock
+		// (see its doc): a sticky poison from any earlier observation in any concurrent
+		// session sharing this per-route PDP, or a currently-observed mismatch, denies.
+		// The single-locked read cannot observe a torn state that an honest session's
+		// overwrite would otherwise open.
+		if p.pinViolated(target.Name, pin) {
+			return hardDenyResponse(p.engineClock(), capability.ErrCodeAuthorizationFailed,
+				fmt.Sprintf("tool %q description no longer matches the pinned descriptionHash (the upstream description changed after the session started); refusing to forward (fail closed)", target.Name))
+		}
+	}
+
 	// Find the most specific matching constraint, scoped to the target type and the
 	// caller's principal. The manifest is an allowlist: only listed targets pass.
 	claims := jwtClaimsAsMap(ctx)
 	matched := p.findConstraint(target, claims)
 	if matched == nil {
-		return denyResponse(p.engineClock(), capability.ErrCodeAuthorizationFailed, "",
-			fmt.Sprintf("%s %q is not listed in the capability manifest", target.Type, target.Name))
+		// A no-match deny is downgradable, so a route running --audit FORWARDS it and the
+		// upstream response reaches the host — carrying whatever the manifest declared
+		// redactable for this target. No constraint was selected, so the obligations come
+		// from every entry NAMING this target (see withForwardObligations); dropping them
+		// here would leak on exactly the principal-scoped-miss shape the descriptionHash pin
+		// above is positioned to catch.
+		return p.withForwardObligations(ctx, denyResponse(p.engineClock(), capability.ErrCodeAuthorizationFailed, "",
+			fmt.Sprintf("%s %q is not listed in the capability manifest", target.Type, target.Name)), target)
 	}
 	// Union labelOutput across every entry matching this request, so a source read carries
 	// its taint even when the entry findConstraint scored highest (a more-specific or
 	// principal-scoped sibling) lacks labelOutput while another matching entry has it —
 	// otherwise the taint is silently dropped and a later sink fails open. A no-op for a
 	// policy with no sources, and for the common single-source case. Only the recorded
-	// labelOutput changes; conditions, actions, argumentSchema, and the descriptionHash pin
-	// below all read matched's own (unchanged) properties, and obligations skip labelOutput.
+	// labelOutput changes; conditions, actions, and argumentSchema all read matched's own
+	// (unchanged) properties, and obligations skip labelOutput.
 	matched = p.constraintWithUnionLabelOutput(matched, target, claims)
 
 	// Stray-argumentSchema fail-closed guard. argumentSchema is tool-only by spec
@@ -819,45 +906,6 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 			fmt.Sprintf("constraint %q carries an argumentSchema, which is tool-only and not enforced on %s; refusing to forward a request guarded by an unenforced schema (fail closed)", matched.Target, targetOperationPhrase(target.Type)))
 	}
 
-	// descriptionHash pin (tools/call leg). A constraint may pin a tool's
-	// description hash to defend against an upstream that rewrites the description to
-	// inject a prompt (tool poisoning, FM-5). filterToolsListResult hides a
-	// description-changed tool from tools/list, but a host calling by name (a cached
-	// tool) would otherwise bypass the pin on the call leg. Enforce it here against
-	// the most recently observed description.
-	//
-	// Like the stray-argumentSchema guard, this MUST run BEFORE the audit-mode defer
-	// and returns hardDenyResponse: a tool-poisoning deny is not downgradable even
-	// under audit (see that helper). It denies only when the description HAS been
-	// re-observed and no
-	// longer matches — the mid-session change the session-start drift probe cannot
-	// catch. An as-yet-unobserved description is not denied (the probe already
-	// verified every pin at establishment).
-	//
-	// The pin fires on an OBSERVED description mismatch alone, independent of whether
-	// the SELECTED constraint permits the action OR is itself the pinned entry. It is
-	// keyed off pinnedTools (every pinned entry for this name), not matched: when
-	// findConstraint selects a name-only match lacking the "call" action, or a
-	// duplicate non-pinned sibling that shadows the pinned entry, an action-gated or
-	// matched-gated pin would be skipped and the request would fall through to the
-	// CAPABILITY_DENIED action check below -- which an audit-mode constraint downgrades
-	// to a forwarded allow, letting the call reach the poisoned upstream and violating
-	// the invariant that a tool-poisoning deny is never downgradable. Firing here off
-	// the name keeps a genuine poisoning (an observed mismatch) a hard
-	// AUTHORIZATION_FAILED; a matching or as-yet-unobserved description does not deny
-	// here and still reaches the accurate action check below.
-	if pin, isPinned := p.pinnedTools[target.Name]; schema == validateSchema && isPinned {
-		// pinViolated reads the sticky poison mark and the observed hash under one lock
-		// (see its doc): a sticky poison from any earlier observation in any concurrent
-		// session sharing this per-route PDP, or a currently-observed mismatch, denies.
-		// The single-locked read cannot observe a torn state that an honest session's
-		// overwrite would otherwise open.
-		if p.pinViolated(target.Name, pin) {
-			return hardDenyResponse(p.engineClock(), capability.ErrCodeAuthorizationFailed,
-				fmt.Sprintf("tool %q description no longer matches the pinned descriptionHash (the upstream description changed after the session started); refusing to forward (fail closed)", target.Name))
-		}
-	}
-
 	// A constraint in audit (observe) mode downgrades its own denial to a
 	// logged-but-forwarded allow. stamp applies that downgrade only to the verdicts
 	// returned BELOW this point: the kill-switch, no-match, stray-schema, and
@@ -866,12 +914,25 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 	// of a named return) keeps which verdicts are downgradable visible in the
 	// control flow, so a future early return added below cannot silently inherit it.
 	stamp := func(r capability.EnforceResponse) capability.EnforceResponse {
-		// Never stamp a hard deny as AuditOnly: it must block even on an audit-only
-		// constraint or a route running under --audit (e.g. antecedent record failure).
-		if matched.IsAuditOnly() && (r.Denial == nil || !r.Denial.HardDeny) {
+		// Never stamp/forward a hard deny: it blocks even on an audit-only constraint or a
+		// route running under --audit (e.g. antecedent record failure), so it reaches no
+		// host and needs no forwarded-response obligations.
+		if r.Denial != nil && r.Denial.HardDeny {
+			return r
+		}
+		// The per-entry flag records only the per-CONSTRAINT audit posture. The whole-route
+		// --audit posture is not stamped here: the transport reads that from its own flag.
+		if matched.IsAuditOnly() {
 			r.AuditOnly = true
 		}
-		return r
+		// A downgraded (observe-mode) deny is still forwarded to the host, so it must carry
+		// the same redactFields obligations a genuine allow of this constraint would — the
+		// transport applies redaction only from resp.Obligations, so leaving them empty
+		// forwards the upstream response unredacted, silently dropping the redaction the
+		// manifest declared (a condition, argumentSchema, or action-check failure all reach
+		// here without having run collectObligations). The genuine-allow path collects them
+		// in evaluateMatched; mirror it for the downgraded deny.
+		return p.withForwardObligationsFor(ctx, r, matched)
 	}
 
 	// Build the enforce request up front so every early-return deny an audit-mode
@@ -951,8 +1012,12 @@ func targetOperationPhrase(t capability.TargetType) string {
 	}
 }
 
-// recordAuditModeAntecedent records session state when an audit-mode constraint
-// DOWNGRADES a deny to a forwarded call. On that path EvaluateConditions returns the
+// recordAuditModeAntecedent records session state when an audit-mode constraint OR a
+// route running under --audit (WithSkipQuota) DOWNGRADES a deny to a forwarded call.
+// The two are gated together because the transport downgrades on the SAME union
+// (isObserveDeny fires on fp.audit OR dec.AuditOnly); gating only on the per-constraint
+// flag would miss the standard whole-route observe deployment, where constraints are
+// NOT individually marked auditOnly. On that path EvaluateConditions returns the
 // deny before its allow-tail state writes run, but the transport still forwards and the
 // tool runs, so two guarantees would otherwise be broken: a later sequenceBlock naming
 // this target Peeks an empty history and fails OPEN (RecordSessionCall closes this), and
@@ -992,7 +1057,12 @@ func targetOperationPhrase(t capability.TargetType) string {
 // clock is p.engineClock() at every call site so the frozen test clock is honored
 // and a nil engine never reaches engine.Clock() directly.
 func recordAuditModeAntecedent(ctx context.Context, engine *enforcement.Engine, clock enforcement.Clock, req *capability.EnforceRequest, matched *capability.Constraint, resp *capability.EnforceResponse) *capability.EnforceResponse {
-	if matched.IsAuditOnly() && resp.Decision == capability.DecisionDeny && (resp.Denial == nil || !resp.Denial.HardDeny) {
+	// Gate on the per-constraint enforcement:audit flag OR the whole-route --audit
+	// posture (SkipQuota), matching the transport's own downgrade union (isObserveDeny:
+	// fp.audit || dec.AuditOnly). Without the SkipQuota leg a route-level --audit deny is
+	// forwarded but its antecedent is never recorded, so a later enforced sequenceBlock
+	// naming this tool Peeks empty history and fails OPEN.
+	if willForwardDeny(ctx, matched) && resp.Decision != capability.DecisionAllow && (resp.Denial == nil || !resp.Denial.HardDeny) {
 		flowRelevant := capability.ConstraintHasFlow(matched)
 		// Capture the carried set before any write, only for a flow-relevant constraint
 		// whose deny did not already stamp it (a condition deny routed through
@@ -1205,6 +1275,91 @@ func (p *ManifestPDP) constraintWithUnionLabelOutput(matched *capability.Constra
 	return &cp
 }
 
+// willForwardDeny reports whether a deny for this constraint will be downgraded to a
+// forwarded call, so the response still reaches the host. It is the PDP-side spelling of
+// the transport's isObserveDeny — per-constraint `enforcement: audit` OR the whole-route
+// --audit posture (which arrives as SkipQuota on the ctx) — and every concern that must
+// track "this deny is really a forward" reads it from here rather than restating the
+// union. matched may be nil (a no-match deny), which only a route-level --audit forwards.
+// The kill-switch and HardDeny exclusions the transport also applies are handled at each
+// call site, which has the response in hand.
+func willForwardDeny(ctx context.Context, matched *capability.Constraint) bool {
+	if matched != nil && matched.IsAuditOnly() {
+		return true
+	}
+	return enforcement.SkipQuota(ctx)
+}
+
+// withForwardObligationsFor fills r with matched's post-allow obligations when r is a deny
+// that will be forwarded (see willForwardDeny), so the transport redacts the forwarded
+// response exactly as it would a genuine allow.
+//
+// The decision test is `!= DecisionAllow`, not `== DecisionDeny`, matching the transport's
+// own fail-closed gate: a zero-value or unset Decision is forwarded there, so gating on
+// `== DecisionDeny` here would let it through unredacted. Fills only when the response
+// carries none yet — a flow/record-fault deny already carries them. CollectObligations
+// returns a HardDeny for an unwired directive type; honor it (fail closed) rather than
+// forwarding unredacted.
+func (p *ManifestPDP) withForwardObligationsFor(ctx context.Context, r capability.EnforceResponse, matched *capability.Constraint) capability.EnforceResponse {
+	if r.Decision == capability.DecisionAllow || len(r.Obligations) > 0 {
+		return r
+	}
+	if !willForwardDeny(ctx, matched) || matched == nil {
+		return r
+	}
+	obs, deny := p.engine.CollectObligations(matched, r.RequestID, r.DecidedAt)
+	if deny != nil {
+		return *deny
+	}
+	r.Obligations = obs
+	return r
+}
+
+// withForwardObligations is the no-match counterpart of withForwardObligationsFor: no
+// constraint was selected, so the obligations come from every capability NAMING this
+// target, regardless of principal scoping. That is deliberately wider than findConstraint:
+// the response is about to be forwarded, and any entry declaring a field of this target
+// redactable is reason enough to mask it. A no-match deny is only ever forwarded by a
+// route-level --audit, so this is a no-op on an enforce route.
+func (p *ManifestPDP) withForwardObligations(ctx context.Context, r capability.EnforceResponse, target EnforceTarget) capability.EnforceResponse {
+	if r.Decision == capability.DecisionAllow || len(r.Obligations) > 0 || !enforcement.SkipQuota(ctx) {
+		return r
+	}
+	dirs := p.directivesNamingTarget(target)
+	if len(dirs) == 0 {
+		return r
+	}
+	obs, deny := p.engine.CollectObligations(&capability.Constraint{Target: string(target.Type) + ":" + target.Name, Directives: dirs}, r.RequestID, r.DecidedAt)
+	if deny != nil {
+		return *deny
+	}
+	r.Obligations = obs
+	return r
+}
+
+// directivesNamingTarget collects the directives of every capability whose target type +
+// pattern match target, ignoring principal scoping — the "what did the manifest declare
+// about this target" question, as opposed to findConstraint's "which entry governs this
+// caller". Used only to fill obligations onto a forwarded no-match deny.
+func (p *ManifestPDP) directivesNamingTarget(target EnforceTarget) []capability.Directive {
+	var dirs []capability.Directive
+	useCache := len(p.parsedTargets) == len(p.caps)
+	for i := range p.caps {
+		var pt parsedTarget
+		if useCache {
+			pt = p.parsedTargets[i]
+		} else {
+			tt, bare, err := capability.ParseTarget(p.caps[i].Target)
+			pt = parsedTarget{typ: tt, bare: bare, parseErr: err != nil}
+		}
+		if pt.parseErr || pt.typ != target.Type || !matchBare(pt.bare, target.Name) {
+			continue
+		}
+		dirs = append(dirs, p.caps[i].Directives...)
+	}
+	return dirs
+}
+
 // matchingLabelOutputUnion collects the union of labelOutput labels from every capability
 // whose target type + pattern match target AND whose principal scoping the caller's claims
 // satisfy — the same "applies to this request" test findConstraint uses, minus the
@@ -1346,9 +1501,18 @@ func (p *ManifestPDP) DecideSampling(ctx context.Context, sessionID, sourceIP st
 	}
 
 	// Sampling has no per-entry audit (observe) mode: enforcement: audit is rejected
-	// on system: targets at manifest load, so a matched sampling constraint is never
-	// audit-only. Route-level --audit still forwards sampling, but that is the
-	// transport's call, not here.
+	// on system: targets at manifest load. A manifest built in-process could still
+	// carry it, and evaluateAndRecord below would then stamp AuditOnly onto a condition
+	// deny, which the transport's observe gate (isObserveDeny) downgrades to a forwarded
+	// sampling request EVEN on an enforce route — silently defeating sampling's
+	// deny-by-default posture. Refuse with a non-downgradable ENFORCEMENT_ERROR,
+	// mirroring the stray-argumentSchema guard above (both are "the loader rejects it,
+	// but a programmatic manifest could carry it"). Route-level --audit still forwards
+	// sampling, but that is the transport's call, not a per-entry downgrade.
+	if matched.IsAuditOnly() {
+		return hardDenyResponse(p.engineClock(), capability.ErrCodeEnforcementError,
+			fmt.Sprintf("constraint %q carries enforcement:audit, which is tool/resource-only and not supported on system:sampling/createMessage; refusing to forward sampling under an unenforced observe posture (fail closed)", matched.Target))
+	}
 
 	// Conditions on the opt-in entry MUST be evaluated — skipping them is a
 	// fail-open on the only enforcement point for server-initiated sampling.
@@ -1653,6 +1817,153 @@ type toolListEntry struct {
 	OutputSchema map[string]interface{} `json:"outputSchema,omitempty"`
 }
 
+// maxDuplicateKeyScanDepth bounds how deep the duplicate-key scan recurses before it
+// fails closed, guarding the stack against an adversarially nested entry. It is set well
+// ABOVE the nesting the hashed surface itself covers (capability's parameter-description
+// walk bounds at 64 SCHEMA levels, and a schema level is two JSON levels — a "properties"
+// object plus the property object), so an honest deep schema is never reported as
+// duplicated here: past its own bound the hash walk records an overflow sentinel and the
+// resulting hash simply mismatches the pin. Keeping this bound strictly looser than the
+// hashed surface's is load-bearing — a tighter one would poison honest deeply-nested tools.
+const maxDuplicateKeyScanDepth = 512
+
+// toolEntryScan is the verdict of scanToolEntry: whether the entry's bytes can be trusted
+// to decode to the same surface a host renders, plus every name the entry could present.
+type toolEntryScan struct {
+	// untrustworthy reports that Go's decode of this entry may differ from what a host
+	// renders, so neither its name nor its hashed surface may be believed.
+	untrustworthy bool
+	// names holds every top-level name value the entry carries (more than one only when
+	// the key is duplicated). It bounds which pins the entry could impersonate, so a
+	// malformed entry poisons only those rather than every pin on the route.
+	names []string
+}
+
+// scanToolEntry decides whether a tools/list entry's bytes can be trusted, and collects
+// the names it could present to a host.
+//
+// Two distinct collision rules, because Go resolves the two levels differently:
+//
+//   - TOP level, matched case-INSENSITIVELY. encoding/json binds object keys to struct
+//     fields by a case-folding match and keeps the LAST one, so {"description":"<INJECT>",
+//     "Description":"<CLEAN>"} decodes to <CLEAN> and hashes clean while a case-sensitive
+//     host (JSON.parse, the Python SDK) renders <INJECT>. Exact duplicates fold together
+//     too, so one rule covers both. This is why the scan folds here and nowhere else.
+//   - NESTED, matched EXACTLY. Nested values decode into map[string]interface{}, whose
+//     keys are exact, so only a byte-identical repeat is a divergence. Folding here would
+//     be wrong: a schema with sibling properties "Name" and "name" is legal and honest.
+//     Nested duplicates still matter because the hash covers parameter descriptions at
+//     any depth, so a duplicate one level down is an injection surface.
+//
+// Values are consumed with Decode into a json.RawMessage rather than token-by-token: that
+// captures a value's bytes through the scanner without converting them, so a
+// float64-overflowing number (1e999) cannot error the walk and shield a later duplicate —
+// and it needs no UseNumber. Any malformed or over-deep input reports untrustworthy.
+func scanToolEntry(raw json.RawMessage) toolEntryScan {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	tok, err := dec.Token()
+	if err != nil {
+		return toolEntryScan{untrustworthy: true}
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return toolEntryScan{untrustworthy: true} // not a JSON object
+	}
+	var out toolEntryScan
+	seen := make(map[string]struct{})
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return toolEntryScan{untrustworthy: true}
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return toolEntryScan{untrustworthy: true}
+		}
+		// Fold at the top level only (see the doc comment).
+		folded := strings.ToLower(key)
+		if _, dup := seen[folded]; dup {
+			out.untrustworthy = true
+		}
+		seen[folded] = struct{}{}
+
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return toolEntryScan{untrustworthy: true}
+		}
+		if folded == jsonKeyName {
+			var n string
+			if err := json.Unmarshal(value, &n); err == nil && n != "" {
+				out.names = append(out.names, n)
+			}
+		}
+		if !out.untrustworthy {
+			dup, err := nestedHasDuplicateKey(value, 1)
+			if err != nil || dup {
+				out.untrustworthy = true
+			}
+		}
+	}
+	return out
+}
+
+// nestedHasDuplicateKey reports whether raw, or anything nested within it, is an object
+// carrying the same key twice, compared EXACTLY (see scanToolEntry for why nested keys are
+// not folded). Errors are surfaced so the caller fails closed.
+func nestedHasDuplicateKey(raw json.RawMessage, depth int) (bool, error) {
+	if depth > maxDuplicateKeyScanDepth {
+		return true, nil // fail closed on a pathologically deep value
+	}
+	trimmed := bytes.TrimLeft(raw, " \t\r\n")
+	if len(trimmed) == 0 {
+		return false, nil
+	}
+	switch trimmed[0] {
+	case '{':
+		dec := json.NewDecoder(bytes.NewReader(trimmed))
+		if _, err := dec.Token(); err != nil { // consume '{'
+			return false, err
+		}
+		seen := make(map[string]struct{})
+		for dec.More() {
+			keyTok, err := dec.Token()
+			if err != nil {
+				return false, err
+			}
+			key, ok := keyTok.(string)
+			if !ok {
+				return false, nil
+			}
+			var value json.RawMessage
+			if err := dec.Decode(&value); err != nil {
+				return false, err
+			}
+			if _, dup := seen[key]; dup {
+				return true, nil
+			}
+			seen[key] = struct{}{}
+			nested, err := nestedHasDuplicateKey(value, depth+1)
+			if err != nil || nested {
+				return nested, err
+			}
+		}
+		return false, nil
+	case '[':
+		var elems []json.RawMessage
+		if err := json.Unmarshal(trimmed, &elems); err != nil {
+			return false, err
+		}
+		for _, e := range elems {
+			nested, err := nestedHasDuplicateKey(e, depth+1)
+			if err != nil || nested {
+				return nested, err
+			}
+		}
+		return false, nil
+	default:
+		return false, nil // a scalar carries no keys
+	}
+}
+
 // recordPinnedToolHash records entry's live description hash iff its NAME is pinned by
 // any manifest entry — keyed off pinnedTools, not a selected constraint. A duplicate
 // non-pinned sibling (or a pinned sibling lacking the "call" action) can win
@@ -1660,26 +1971,26 @@ type toolListEntry struct {
 // then skip recording and leave the call leg unable to detect a mid-session description
 // rotation. Gating on the pinned set still bounds the map by the operator-controlled
 // manifest, so a name-rotating upstream cannot flood it. Recording passes the pin, so a
-// mismatch is sticky-marked poisoned atomically (record + mark under one lock). Returns
-// whether the tool was pinned so the filter can consult the sticky poison mark. Shared
-// by the enforce-mode filter and the audit-mode RecordObservedToolHashes pass so an
-// audit route records identically to an enforce route.
-func (p *ManifestPDP) recordPinnedToolHash(entry toolListEntry) (pinned bool) {
-	pin, pinned := p.pinnedTools[entry.Name]
-	if pinned {
+// mismatch is sticky-marked poisoned atomically (record + mark under one lock).
+//
+// The caller MUST have cleared the entry through scanToolEntry first: this trusts
+// entry.Name, and a duplicated or case-variant name key makes that value untrustworthy.
+func (p *ManifestPDP) recordPinnedToolHash(entry toolListEntry) {
+	if pin, pinned := p.pinnedTools[entry.Name]; pinned {
 		p.recordObservedToolHash(entry.Name, entry.Description, entry.Title, entry.Annotations, entry.InputSchema, entry.OutputSchema, pin)
 	}
-	return pinned
 }
 
-// toolListEntryName is a lightweight decode target for a single tools/list entry — its
-// name only. RecordObservedToolHashes uses it to test the pinnedTools gate BEFORE paying
-// for the full toolListEntry decode (which can include large inputSchema/outputSchema/
-// annotations maps): most catalogs are small-pinned-fraction, and the entries
-// recordPinnedToolHash would discard for being unpinned should not first be fully
-// unmarshaled just to read their name.
-type toolListEntryName struct {
-	Name string `json:"name"`
+// poisonCandidates sticky-poisons every pinned name an untrustworthy entry could present
+// to a host. Scoping the poison to the entry's own candidate names — rather than every pin
+// on the route — keeps the fail-closed property while bounding the blast radius: an
+// unrelated malformed entry elsewhere in the catalog cannot disable pins it never named.
+func (p *ManifestPDP) poisonCandidates(names []string) {
+	for _, n := range names {
+		if _, pinned := p.pinnedTools[n]; pinned {
+			p.markToolPoisoned(n)
+		}
+	}
 }
 
 // RecordObservedToolHashes walks a tools/list result and records each pinned tool's
@@ -1691,41 +2002,92 @@ type toolListEntryName struct {
 // in result (mirroring CountListEntries) so the caller — which must invoke this
 // unconditionally on the audit-mode tools/list path — gets its audit-record entry count
 // as a byproduct of this one decode, rather than a second full decode of the same bytes.
-// Fail-open on a malformed envelope (returns 0): this is best-effort bookkeeping for the
-// pin, never itself an enforcement decision.
+//
+// When any pinned tool exists this is a security control, not best-effort bookkeeping: a
+// tools/list it cannot reduce to a comparable hash for a pinned tool fails CLOSED by
+// sticky-poisoning the affected pin(s), so the call leg denies rather than leaving the
+// mid-session poisoning pin unarmed. See armPinsFromToolsList, which both this and the
+// enforce-mode filter call, for exactly which shapes fail closed and how widely. With NO
+// pinned tool there is nothing to protect, so the walk only counts entries.
 func (p *ManifestPDP) RecordObservedToolHashes(_ context.Context, result json.RawMessage) int {
+	return p.armPinsFromToolsList(result)
+}
+
+// armPinsFromToolsList walks a tools/list result, records every pinned tool's live
+// description hash, and sticky-poisons the pins it cannot verify. It is the ONE pass that
+// arms the descriptionHash pin, shared by the observe route (RecordObservedToolHashes,
+// where the catalog is forwarded verbatim and this is the only thing arming the pin) and
+// the enforce-mode filter — so the two genuinely cannot diverge, rather than mirroring each
+// other by hand. It returns the entry count (mirroring CountListEntries, so the audit
+// record needs no second decode) and whether the entry array decoded.
+//
+// It prunes nothing and mutates no catalog: filtering is the caller's job. Running it to
+// completion BEFORE any filtering is load-bearing — poisoning discovered at entry N must
+// be visible to the keep decision for entry 1, or the emitted catalog could advertise a
+// tool whose call leg then hard-denies.
+//
+// What fails closed, and how widely:
+//   - An entry whose bytes are untrustworthy (scanToolEntry: a duplicate or case-variant
+//     top-level key, a duplicate nested in a hashed description, malformed or over-deep
+//     bytes) poisons only the pinned names THAT ENTRY could present — never the whole
+//     route, so an unrelated malformed entry cannot disable pins it never named.
+//   - An entry that will not decode into the hashed surface poisons just its own pin.
+//   - An ambiguous ENVELOPE — undecodable, an undecodable tools array, or a duplicate or
+//     case-variant "tools" key (Go keeps one array while a host may render the other) —
+//     poisons every pin, because no entry in it can be believed. A plainly absent tools
+//     key is not ambiguous: a host renders no tools from it, so nothing is poisoned.
+func (p *ManifestPDP) armPinsFromToolsList(result json.RawMessage) (entryCount int) {
 	if len(result) == 0 {
 		return 0
 	}
+	pinned := len(p.pinnedTools) > 0
 	var envelope map[string]json.RawMessage
 	if err := json.Unmarshal(result, &envelope); err != nil {
+		if pinned {
+			p.poisonAllPinned()
+		}
 		return 0
 	}
 	rawArray, ok := envelope[listKeyTools]
 	if !ok {
+		// No exact "tools" key. A case-variant sibling ("Tools") still decodes for a host
+		// whose reader binds it case-insensitively, and the proxy cannot tell what that
+		// host sees, so treat it as ambiguous; a plainly absent key is not.
+		if pinned && envelopeHasFoldedToolsKey(envelope) {
+			p.poisonAllPinned()
+		}
 		return 0
 	}
 	var entries []json.RawMessage
 	if err := json.Unmarshal(rawArray, &entries); err != nil {
+		if pinned {
+			p.poisonAllPinned()
+		}
 		return 0
 	}
-	if len(p.pinnedTools) == 0 {
-		// Nothing to record: skip the per-entry decode entirely rather than fully
-		// unmarshaling every entry only to find none pinned.
+	if !pinned {
+		// Nothing to record or protect: skip the per-entry scan and decode entirely rather
+		// than walking every entry only to find none pinned.
+		return len(entries)
+	}
+	// A duplicate or case-variant "tools" key leaves Go and the host reading different
+	// arrays, so no entry below can be believed.
+	if duplicateOrFoldedToolsKey(result) {
+		p.poisonAllPinned()
 		return len(entries)
 	}
 	for _, raw := range entries {
-		var name toolListEntryName
-		if err := json.Unmarshal(raw, &name); err != nil {
-			continue
-		}
-		if _, pinned := p.pinnedTools[name.Name]; !pinned {
-			// Not pinned: skip the full toolListEntry decode (schema/annotations maps)
-			// for an entry recordPinnedToolHash would discard anyway.
+		scan := scanToolEntry(raw)
+		if scan.untrustworthy {
+			p.poisonCandidates(scan.names)
 			continue
 		}
 		var entry toolListEntry
 		if err := json.Unmarshal(raw, &entry); err != nil {
+			// The name is trustworthy (the scan cleared it) but the entry will not decode
+			// into the hashed surface: poison just this pin rather than skip, which would
+			// leave it unarmed on a poisoned entry a lenient host still renders.
+			p.poisonCandidates(scan.names)
 			continue
 		}
 		p.recordPinnedToolHash(entry)
@@ -1733,18 +2095,68 @@ func (p *ManifestPDP) RecordObservedToolHashes(_ context.Context, result json.Ra
 	return len(entries)
 }
 
+// envelopeHasFoldedToolsKey reports whether the decoded envelope carries a key that differs
+// from the tools list key only by case — a shape Go's own struct-tag decode (and any host
+// that binds keys case-insensitively) would still resolve to it.
+func envelopeHasFoldedToolsKey(envelope map[string]json.RawMessage) bool {
+	for k := range envelope {
+		if strings.EqualFold(k, listKeyTools) {
+			return true
+		}
+	}
+	return false
+}
+
+// duplicateOrFoldedToolsKey reports whether result's top-level object carries the tools
+// list key more than once, comparing case-folded. json.Unmarshal into a map silently keeps the last
+// such key, so a repeat (or a case-variant sibling) means the array the proxy walks is not
+// necessarily the one a host renders. Malformed input reports true: the caller fails closed.
+func duplicateOrFoldedToolsKey(result json.RawMessage) bool {
+	dec := json.NewDecoder(bytes.NewReader(result))
+	tok, err := dec.Token()
+	if err != nil {
+		return true
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return true
+	}
+	count := 0
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return true
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return true
+		}
+		if strings.EqualFold(key, listKeyTools) {
+			count++
+		}
+		var skip json.RawMessage
+		if err := dec.Decode(&skip); err != nil {
+			return true
+		}
+	}
+	return count > 1
+}
+
 func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims map[string]interface{}) ListFilterResult {
+	// Arm the pins over the WHOLE catalog first, then filter. Recording and poisoning
+	// happen here — in the one pass the observe route shares (armPinsFromToolsList) — so
+	// the two routes cannot drift, and so every poison discovered anywhere in the array is
+	// already visible to the keep decision for the first entry. Poisoning from inside the
+	// per-entry predicate below could not retract an entry it had already accepted, which
+	// would emit a catalog advertising a tool whose call leg hard-denies. Self-gates on
+	// len(pinnedTools) > 0, so a manifest with no pin pays nothing for this.
+	mdp.armPinsFromToolsList(resultBytes)
+
 	return filterListResult(resultBytes, listKeyTools, func(raw json.RawMessage) (bool, string) {
 		var entry toolListEntry
 		if err := json.Unmarshal(raw, &entry); err != nil {
 			return false, ""
 		}
 		c := mdp.findConstraint(EnforceTarget{Type: capability.TargetTypeTool, Name: entry.Name}, claims)
-
-		// Record the live description whenever the tool NAME is pinned (see
-		// recordPinnedToolHash), atomically sticky-marking a mismatch as poisoned BEFORE
-		// any early return below.
-		pinned := mdp.recordPinnedToolHash(entry)
 
 		// c is nil when the tool is absent from the manifest; guard every dereference
 		// below on it.
@@ -1754,7 +2166,7 @@ func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims
 		// A poisoned pinned tool stays hidden even on a later clean observation (sticky),
 		// mirroring the call-leg deny so the list a host is shown never contains a tool
 		// its call leg will reject.
-		if pinned && mdp.isToolPoisoned(entry.Name) {
+		if _, pinned := mdp.pinnedTools[entry.Name]; pinned && mdp.isToolPoisoned(entry.Name) {
 			return false, ""
 		}
 		return true, entry.Name

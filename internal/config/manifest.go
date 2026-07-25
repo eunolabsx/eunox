@@ -1525,6 +1525,28 @@ func validateSequenceBlock(i, j int, v *capability.SequenceBlockCondition) error
 		if strings.Contains(entry, ":") && stripped == entry {
 			return fmt.Errorf("capability at index %d, condition %d, afterTools entry %d: sequenceBlock entry %q is ambiguous: the text before its first ':' is not a recognized namespace prefix (tool:, resource:, prompt:, system:), so the entry is matched literally — a namespace typo like 'mcp:read_file' then silently never fires, and a resource URI must carry the explicit resource: prefix (resource:file:///secrets). Add one of tool:, resource:, prompt:, or system: to disambiguate", i, j, k, entry)
 		}
+		// afterTools is matched LITERALLY against the concrete names recordSessionCall
+		// persisted (splitEnginePrefix + an exact-key Peek), never glob-expanded, for EVERY
+		// namespace including resource:. A wildcard therefore never matches a real recorded
+		// name, so an entry like "read_*" silently fails OPEN — a sequenceBlock that looks
+		// armed but never fires. Reject at load, mirroring the target-pattern glob rejection
+		// (validateTargetPatternBreadth).
+		//
+		// The rejected set is narrower for a resource: entry. A resource URI legitimately
+		// contains '[' (an IPv6 literal host, resource:file://[::1]/x) and '?' (a query
+		// string), and those characters cannot by themselves make an entry look armed while
+		// silently never firing the way a wildcard does — but '*' is a wildcard in a resource
+		// URI exactly as in a tool name, and resource TARGETS legitimately glob, so an author
+		// who globs a target is the most likely to glob an antecedent. Rejecting '*' for
+		// resource: too is what keeps the fail-open closed; exempting only the URI-syntax
+		// characters is what keeps valid antecedents loadable.
+		reject := capability.GlobMetaChars
+		if strings.HasPrefix(entry, "resource:") {
+			reject = "*"
+		}
+		if strings.ContainsAny(stripped, reject) {
+			return fmt.Errorf("capability at index %d, condition %d, afterTools entry %d: sequenceBlock entry %q contains glob metacharacters (%s); afterTools is matched literally against recorded tool names, so a glob never fires and the block silently fails open — name the exact tool(s) instead", i, j, k, entry, reject)
+		}
 	}
 	return nil
 }

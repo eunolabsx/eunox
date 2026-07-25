@@ -375,6 +375,20 @@ func skipQuota(ctx context.Context) bool {
 	return v
 }
 
+// SkipQuota reports whether ctx carries the proxy's --audit (observe) posture set by
+// WithSkipQuota. Exported so the PDP's audit-mode antecedent recorder can gate on the
+// SAME route-level observe signal the transport's downgrade uses (isObserveDeny via
+// fp.audit): a route running under --audit forwards a would-be deny, so that call's
+// sequenceBlock antecedent must still be recorded — otherwise a later enforced
+// sequenceBlock naming the forwarded tool Peeks empty history and fails open. This
+// mirrors WithSkipQuota's own contract ("must still observe sequenceBlock denials
+// accurately, which requires ... recording the history that arms it"). A per-constraint
+// enforcement:audit is already covered by Constraint.IsAuditOnly(); this adds the
+// whole-route --audit case, which never reaches the constraint flag.
+func SkipQuota(ctx context.Context) bool {
+	return skipQuota(ctx)
+}
+
 // systemClock is the default Clock backed by the real system time.
 type systemClock struct{}
 
@@ -707,6 +721,12 @@ func (e *Engine) commitDeferredAtomic(ctx context.Context, req *capability.Enfor
 	windowSecs := make([]int, len(deferred))
 	limits := make([]int64, len(deferred))
 	denies := make([]func(count int64, retryAfter time.Duration) *ConditionError, len(deferred))
+	// Track buckets skipped under skipQuota so a PARTIAL skip (some buckets skipped, some
+	// committing) can be caught after the loop. The loop evaluates EVERY bucket so a later
+	// bucket's validation condErr surfaces even when an earlier bucket skipped — returning
+	// on the first skip (the prior behavior) let an observe-mode call mask a later
+	// committing condition's error as an allow where enforce mode would deny.
+	skipped := 0
 	for i, cond := range deferred {
 		condType := cond.ConditionType()
 		ch, ok := e.committingHandler(condType)
@@ -722,30 +742,83 @@ func (e *Engine) commitDeferredAtomic(ctx context.Context, req *capability.Enfor
 			return &resp
 		}
 		commit, skip, condErr := ch.PrepareCommit(ctx, cond, req)
+		// A condErr is checked BEFORE skip is honored. PrepareCommit's contract puts no
+		// exclusion between the two, so a handler may legitimately report both — e.g. a
+		// malformed-condition validation error discovered on a bucket that also skips under
+		// skipQuota. Honoring skip first would discard that error, and if every bucket
+		// skipped the call would then be ALLOWED under observe while enforce denies it:
+		// precisely the observe/enforce divergence this function exists to prevent.
+		if condErr != nil {
+			return denyFromConditionError(condErr, matched, requestID, now)
+		}
 		if skip {
-			// Treating one bucket's skip as skipping the whole deferred set is only sound
-			// when skip is uniform across the constraint — the contract requires it to be
+			// skip must be uniform across the constraint — the contract requires it to be
 			// derived solely from ctx (skipQuota). A handler that reports skip for some
 			// other reason (its own config/arguments) would leave the remaining committing
 			// conditions unchecked: a fail-open. Assert the contract and fail closed on a
-			// violation rather than admit the call. The built-in maxCalls always derives
-			// skip from skipQuota(ctx), so this never trips for it.
+			// per-bucket violation. The built-in maxCalls always derives skip from
+			// skipQuota(ctx), so this never trips for it.
 			if !skipQuota(ctx) {
 				resp := denyResponse(requestID, now, matched.IsAuditOnly(), nil, capability.DenialInfo{
 					Code:          capability.ErrCodeConditionFailed,
 					ConditionType: condType,
-					Message:       fmt.Sprintf("committing condition %q reported a non-uniform skip; deferred commit requires skip to be derived solely from request context", condType),
+					// HardDeny: a handler violating the skip contract is an engine/plugin bug,
+					// not a downgradable policy verdict, so it must block even under an
+					// audit-mode constraint rather than being forwarded with quota unconsumed.
+					HardDeny: true,
+					Message:  fmt.Sprintf("committing condition %q reported a non-uniform skip; deferred commit requires skip to be derived solely from request context", condType),
 				})
 				return &resp
 			}
-			// Quota must not be consumed (audit / skip-quota); the ctx-driven skip
-			// holds for every bucket, so record nothing and allow.
-			return nil
+			// Quota must not be consumed for this bucket. Keep evaluating the rest so a
+			// later bucket's PrepareCommit condErr still surfaces (observe mode must deny a
+			// call enforce mode would); the all-skip vs partial-skip decision is made after
+			// the loop.
+			skipped++
+			continue
 		}
 		if condErr != nil {
 			return denyFromConditionError(condErr, matched, requestID, now)
 		}
 		keys[i], windowSecs[i], limits[i], denies[i] = commit.Key, commit.WindowSecs, commit.Limit, commit.Deny
+	}
+
+	// Every bucket skipped under skipQuota (audit/observe): quota must not be consumed,
+	// so record nothing and allow — the ctx-driven skip held for all of them.
+	if skipped == len(deferred) {
+		return nil
+	}
+	// A PARTIAL skip — some buckets skipped, others produced a commit — is a non-uniform
+	// skip the per-bucket assertion above cannot catch (each skipping bucket individually
+	// satisfied skipQuota). Admitting the committing buckets while silently dropping the
+	// skipped ones is a fail-open, so fail closed.
+	if skipped > 0 {
+		resp := denyResponse(requestID, now, matched.IsAuditOnly(), nil, capability.DenialInfo{
+			Code: capability.ErrCodeConditionFailed,
+			// HardDeny, or this guard can never actually block: a partial skip is reachable
+			// only when skipQuota(ctx) is set, which the binary sets only on a route running
+			// --audit — and on that route the transport downgrades and FORWARDS any
+			// non-HardDeny verdict. Without this the call proceeds with zero quota consumed
+			// on any bucket, which is the fail-open the guard was written to prevent.
+			HardDeny: true,
+			Message:  "deferred commit received a non-uniform skip across buckets; skip must hold for every committing condition or none",
+		})
+		return &resp
+	}
+
+	// A committing condition needs the call-counter backend. The built-in maxCalls
+	// funnels through maxCallsBucket, whose nil-counter guard already surfaced as a
+	// PrepareCommit condErr above, but a custom CommittingConditionHandler need not,
+	// so guard here before the backend call rather than dereferencing a nil counter
+	// and panicking the enforcement goroutine. Reached only by a library consumer
+	// that registered a committing handler without WithCallCounter (the binary always
+	// wires one); the skip-quota path already returned above, so a nil counter here is
+	// a genuine misconfiguration that must fail closed. Mirrors handlers.go's guard.
+	if e.counter == nil {
+		return denyFromConditionError(&ConditionError{
+			Code:    capability.ErrCodeConditionFailed,
+			Message: "call counter not configured",
+		}, matched, requestID, now)
 	}
 
 	admitted, deniedIndex, count, retryAfter, err := e.counter.IncrementIfAllBelow(ctx, keys, windowSecs, limits)
@@ -1182,6 +1255,22 @@ func (e *Engine) collectObligations(matched *capability.Constraint, requestID, n
 		obligations = append(obligations, ob)
 	}
 	return obligations, nil
+}
+
+// CollectObligations exposes the matched constraint's post-allow obligations to an
+// external decision layer (the PDP) so it can stamp them onto an audit-mode deny it
+// downgrades to a forwarded call. A downgraded (observe-mode) deny is still forwarded
+// to the host, so it must carry the same redactFields obligations a genuine allow of
+// this constraint would — otherwise the transport forwards the upstream response
+// unredacted (redaction runs only when resp.Obligations is non-empty), silently
+// dropping the manifest's declared redaction on the deny-then-observe path. It reuses
+// collectObligations verbatim — the labelOutput skip, the typed-nil-directive skip,
+// and the fail-closed HardDeny for an unwired directive type — so the downgrade path
+// cannot drift from the allow path on which directives translate to which obligations.
+// requestID and now stamp the fail-closed response the unwired-directive guard returns,
+// so it matches the surrounding decision.
+func (e *Engine) CollectObligations(matched *capability.Constraint, requestID, now string) ([]capability.Obligation, *capability.EnforceResponse) {
+	return e.collectObligations(matched, requestID, now)
 }
 
 // matchesResource reports whether a capability resource pattern matches the tool

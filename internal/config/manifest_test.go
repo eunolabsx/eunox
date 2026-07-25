@@ -983,6 +983,69 @@ capabilities:
 	}
 }
 
+// TestLoadManifest_SequenceBlock_RejectsGlobAfterTools pins that a glob in afterTools is
+// rejected at load: the runtime matches afterTools LITERALLY against the concrete tool
+// names recordSessionCall persisted, so a pattern like "read_*" never matches a real
+// recorded name and the block silently fails open.
+func TestLoadManifest_SequenceBlock_RejectsGlobAfterTools(t *testing.T) {
+	for _, glob := range []string{"read_*", "tool:list_?", "read_[abc]"} {
+		yaml := `
+name: "seq-glob"
+version: "0.1.0"
+capabilities:
+  - target: "tool:write_external"
+    actions: [call]
+    conditions:
+      - type: sequenceBlock
+        afterTools: ["` + glob + `"]
+`
+		path := writeManifestFile(t, yaml)
+		_, err := LoadManifest(path)
+		if err == nil {
+			t.Fatalf("LoadManifest accepted a sequenceBlock afterTools glob %q, want rejection (a glob is matched literally and never fires)", glob)
+		}
+		if !strings.Contains(err.Error(), "glob metacharacters") {
+			t.Errorf("afterTools glob %q: error should explain the glob rejection, got: %v", glob, err)
+		}
+	}
+}
+
+// TestLoadManifest_SequenceBlock_ResourceURIGlobMeta pins the resource:-specific rejection
+// set. A resource URI legitimately contains '[' (an IPv6 literal host) and '?' (a query
+// string), and those cannot make a block look armed while silently never firing — so they
+// load. A '*' can: resource antecedents are matched by the same exact-key lookup as tool
+// names, and resource TARGETS legitimately glob, so an author who globs a target is the
+// most likely to glob an antecedent. It must still be rejected.
+func TestLoadManifest_SequenceBlock_ResourceURIGlobMeta(t *testing.T) {
+	manifestWith := func(entry string) string {
+		return `
+name: "seq-resource-uri"
+version: "0.1.0"
+capabilities:
+  - target: "tool:write_external"
+    actions: [call]
+    conditions:
+      - type: sequenceBlock
+        afterTools: ["` + entry + `"]
+`
+	}
+	for _, uri := range []string{"resource:file://[::1]/secret", "resource:https://h/p?a=1"} {
+		if _, err := LoadManifest(writeManifestFile(t, manifestWith(uri))); err != nil {
+			t.Errorf("LoadManifest rejected a valid resource: antecedent %q (matched literally at runtime): %v", uri, err)
+		}
+	}
+	for _, uri := range []string{"resource:file:///secrets/*", "resource:file:///a/*/b"} {
+		_, err := LoadManifest(writeManifestFile(t, manifestWith(uri)))
+		if err == nil {
+			t.Errorf("LoadManifest accepted a wildcard resource: antecedent %q; the exact-key lookup never matches it, so the block silently fails open", uri)
+			continue
+		}
+		if !strings.Contains(err.Error(), "glob metacharacters") {
+			t.Errorf("resource wildcard %q: error should explain the glob rejection, got: %v", uri, err)
+		}
+	}
+}
+
 func TestLoadManifest_SequenceBlock_RejectsEntryThatStripsToEmpty(t *testing.T) {
 	// An entry that carries a recognized prefix but no name (e.g. "tool:"), or is
 	// empty outright, strips to "" and can never match session history — an
