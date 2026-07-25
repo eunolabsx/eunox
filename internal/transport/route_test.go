@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/eunolabs/eunox/internal/audit"
 	"github.com/eunolabs/eunox/internal/config"
 	"github.com/eunolabs/eunox/internal/drift"
 	"github.com/eunolabs/eunox/internal/mcp"
@@ -104,7 +105,7 @@ func TestBuildRoutes_VersionAndPDP(t *testing.T) {
 		Name: "fs", Transport: "stdio", Command: "echo",
 		Policy: []string{manifest}, ExpectVersion: "1.2.3",
 	}}}
-	routes, err := BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil })
+	routes, err := BuildRoutes(cfg, mustOpenSink(t, dir), callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil })
 	if err != nil {
 		t.Fatalf("BuildRoutes: %v", err)
 	}
@@ -132,7 +133,7 @@ func TestBuildRoutes_NoPolicyInheritsAudit(t *testing.T) {
 	t.Parallel()
 	cfg := &config.GatewayConfig{Upstreams: []config.UpstreamConfig{{Name: "fs", Transport: "stdio", Command: "echo"}}}
 	cfg.Defaults.Enforcement = capability.EnforcementAudit
-	routes, err := BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil })
+	routes, err := BuildRoutes(cfg, mustOpenSink(t, t.TempDir()), callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil })
 	if err != nil {
 		t.Fatalf("BuildRoutes: %v", err)
 	}
@@ -146,6 +147,47 @@ func TestBuildRoutes_NoPolicyInheritsAudit(t *testing.T) {
 	if r.sink == nil || r.sink.policyVersion != "" {
 		t.Errorf("policyVersion should be empty for no-policy route, got %+v", r.sink)
 	}
+}
+
+// TestBuildRoutes_NoSinkLeavesRouteSinkNil pins the no-audit fast path: with no shared
+// audit sink there are no records to stamp route identity onto, so the route must be
+// left with a nil sink rather than a live routeSink that only discards. A non-nil
+// wrapper makes asRecorder yield a non-nil recorder, so every caller's "rec != nil"
+// fast path stops firing and a no-audit gateway pays record-building work (notably the
+// */list CountListEntries decode) for calls that write nothing.
+func TestBuildRoutes_NoSinkLeavesRouteSinkNil(t *testing.T) {
+	t.Parallel()
+	cfg := &config.GatewayConfig{Upstreams: []config.UpstreamConfig{{Name: "fs", Transport: "stdio", Command: "echo"}}}
+	cfg.Defaults.Enforcement = capability.EnforcementAudit
+	routes, err := BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil })
+	if err != nil {
+		t.Fatalf("BuildRoutes: %v", err)
+	}
+	r := routes["fs"]
+	if r.sink != nil {
+		t.Fatalf("route sink = %+v, want nil when the gateway has no audit sink", r.sink)
+	}
+	if rec := asRecorder(r.sink); rec != nil {
+		t.Errorf("asRecorder(nil route sink) = %#v, want a nil interface so the no-sink fast path fires", rec)
+	}
+	// Nil-receiver safety: the few sites that call through the concrete pointer must
+	// still be no-ops rather than panics.
+	r.sink.RecordDeny(context.Background(), "s", "id", "tools/call", "X", "", nil, false)
+	if degraded, _, _ := r.sink.AuditDegraded(); degraded {
+		t.Error("a nil route sink must report healthy")
+	}
+}
+
+// mustOpenSink opens a real audit sink under dir, for the route tests that assert
+// routeSink stamping (which only exists when there is a sink to stamp onto).
+func mustOpenSink(t *testing.T, dir string) *audit.Sink {
+	t.Helper()
+	sink, err := audit.Open(filepath.Join(dir, "audit.jsonl"), filepath.Join(dir, "audit.key"), 0, 0)
+	if err != nil {
+		t.Fatalf("audit.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = sink.Close() })
+	return sink
 }
 
 // TestBuildRoutes_ManifestWithRouteAuditEmitsBanner pins: a route with a

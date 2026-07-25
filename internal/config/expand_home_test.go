@@ -1,0 +1,86 @@
+// Copyright 2026 Eunolabs, LLC
+// SPDX-License-Identifier: Apache-2.0
+
+package config_test
+
+import (
+	"fmt"
+	"os"
+	"testing"
+
+	"github.com/eunolabs/eunox/internal/config"
+)
+
+// ExpandHome is consumed by internal/transport (the control-token path) and
+// internal/audit (the audit log path) alike, so its tests live here with the one
+// implementation rather than in whichever caller happened to grow them first.
+
+func TestExpandHome_WithTilde(t *testing.T) {
+	t.Parallel()
+	home, _ := os.UserHomeDir()
+	result, err := config.ExpandHome("~/foo/bar")
+	if err != nil {
+		t.Fatalf("config.ExpandHome(~/foo/bar) error: %v", err)
+	}
+	expected := fmt.Sprintf("%s/foo/bar", home)
+	if result != expected {
+		t.Errorf("config.ExpandHome(~/foo/bar) = %q, want %q", result, expected)
+	}
+}
+
+// TestExpandHome_BareTilde regression: a path of exactly "~" (no
+// trailing slash) must expand to the home directory, not be returned unchanged —
+// otherwise openAuditSink would MkdirAll a directory literally named "~" under the
+// CWD and silently misdirect the tamper-evident audit log there.
+func TestExpandHome_BareTilde(t *testing.T) {
+	t.Parallel()
+	home, _ := os.UserHomeDir()
+	result, err := config.ExpandHome("~")
+	if err != nil {
+		t.Fatalf("config.ExpandHome(~) error: %v", err)
+	}
+	if result != home {
+		t.Errorf("config.ExpandHome(~) = %q, want %q", result, home)
+	}
+}
+
+func TestExpandHome_NoTilde(t *testing.T) {
+	t.Parallel()
+	result, err := config.ExpandHome("/absolute/path")
+	if err != nil {
+		t.Fatalf("config.ExpandHome(/absolute/path) error: %v", err)
+	}
+	if result != "/absolute/path" {
+		t.Errorf("config.ExpandHome(/absolute/path) = %q, want /absolute/path", result)
+	}
+}
+
+func TestExpandHome_EmptyString(t *testing.T) {
+	t.Parallel()
+	result, err := config.ExpandHome("")
+	if err != nil {
+		t.Fatalf("config.ExpandHome('') error: %v", err)
+	}
+	if result != "" {
+		t.Errorf("config.ExpandHome('') = %q, want ''", result)
+	}
+}
+
+// TestExpandHome_HomeUnavailableFailsClosed regression: when the home
+// directory cannot be resolved, ExpandHome must return an error (so openAuditSink
+// refuses to start) rather than silently returning the literal "~/..." path, which
+// would misplace the tamper-evident audit log under a "~" directory in the CWD.
+func TestExpandHome_HomeUnavailableFailsClosed(t *testing.T) {
+	// os.UserHomeDir reads $HOME on unix; clearing it makes resolution fail.
+	t.Setenv("HOME", "")
+	if _, err := os.UserHomeDir(); err == nil {
+		t.Skip("os.UserHomeDir still resolves with HOME unset on this platform; cannot exercise the failure path")
+	}
+	got, err := config.ExpandHome("~/.eunox/audit.jsonl")
+	if err == nil {
+		t.Fatalf("ExpandHome returned (%q, nil); want an error when the home dir is unavailable", got)
+	}
+	if got != "" {
+		t.Errorf("ExpandHome returned path %q alongside the error; want empty so a caller cannot use a misresolved path", got)
+	}
+}

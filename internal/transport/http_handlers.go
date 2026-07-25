@@ -97,9 +97,13 @@ const (
 	codeLoopbackRejected = "LOOPBACK_REJECTED"
 )
 
-// JSON-RPC 2.0 error codes used for callUpstream-error responses.
+// JSON-RPC 2.0 error codes this package returns to the host. Named constants rather
+// than bare literals at each site: the numbers are indistinguishable from each other at
+// a glance, and a transposed digit produces a valid-looking but wrong error class that
+// no test would catch.
 const (
 	jsonRPCCodeInvalidRequest = -32600
+	jsonRPCCodeInvalidParams  = -32602
 	jsonRPCCodeInternalError  = -32603
 )
 

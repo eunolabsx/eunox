@@ -65,12 +65,49 @@ func asRecorder[T interface {
 // sub-target, so the one method name serves as the audit identifier, the method, and
 // the denial target alike (unlike the enforced path, where they can differ); id shapes
 // the response.
-func recordKillDenial(ctx context.Context, rec auditRecorder, deny *capability.EnforceResponse, id *json.RawMessage, sessionID, method string) mcp.RPCMsg {
+func recordKillDenial(ctx context.Context, rec auditRecorder, deny *capability.EnforceResponse, id *json.RawMessage, subject killSubject, method string) mcp.RPCMsg {
 	denial := normalizeDenial(deny.Denial)
 	if rec != nil {
-		rec.RecordDeny(ctx, sessionID, method, method, denial.Code, denial.ConditionType, nil, false)
+		rec.RecordDeny(ctx, subject.sessionID(), method, method, denial.Code, denial.ConditionType, subject.details(nil), false)
 	}
 	return denialResult(id, denial.Code, denial.ConditionType, method, "")
+}
+
+// killSubject names the session a kill record is attributed to, and — the point of the
+// type — whether that name has been VERIFIED. A registry-resolved id is server state and
+// belongs in the structured session_id; a client-supplied Mcp-Session-Id that did not
+// resolve is not, and belongs in details.claimed_session_id (the addClaimedSessionID
+// rule). The distinction is load-bearing on the kill paths specifically: while a GLOBAL
+// kill is active CheckKill denies EVERY id, so a registry miss still produces a record —
+// and stamping the unresolved id as session_id would let any caller mint kill-deny
+// records against a victim's (or an entirely invented) session.
+//
+// It is a type rather than a bare string for the reason killDropLeg is: the recorders
+// take it instead of a session id, so a new call site must state which kind it holds and
+// a mistake is a compile error, rather than the silent audit-hygiene regression that
+// re-appeared here once already.
+type killSubject struct {
+	verified string
+	claimed  string
+}
+
+// knownSession marks an id the proxy itself owns: minted by this proxy and resolved in
+// the session registry (or legitimately empty, on a path that carries no session yet).
+func knownSession(id string) killSubject { return killSubject{verified: id} }
+
+// claimedSession marks a client-supplied id that did NOT resolve in the session
+// registry, so nothing has verified it names a session of this proxy.
+func claimedSession(id string) killSubject { return killSubject{claimed: id} }
+
+// sessionID returns the value for the record's structured session_id field: empty for an
+// unverified id, which is carried in details instead.
+func (s killSubject) sessionID() string { return s.verified }
+
+// details folds an unverified id into base as the clearly-unverified
+// details.claimed_session_id (bounded and marked exactly as the pre-session deny paths
+// do), leaving base untouched for a verified one. base may be nil.
+func (s killSubject) details(base map[string]interface{}) map[string]interface{} {
+	return addClaimedSessionIDValue(base, s.claimed)
 }
 
 // killDropLeg identifies the transport leg a recordKillDrop call site drops a message
@@ -107,12 +144,13 @@ const (
 // the record shape (identifier/method, the "transport" detail key) from drifting apart.
 // transportLeg is recorded as a plain string (converted from killDropLeg), matching the
 // detail value's shape before this type existed.
-func recordKillDrop(ctx context.Context, rec auditRecorder, deny *capability.EnforceResponse, sessionID, identifier, method string, transportLeg killDropLeg) {
+func recordKillDrop(ctx context.Context, rec auditRecorder, deny *capability.EnforceResponse, subject killSubject, identifier, method string, transportLeg killDropLeg) {
 	if rec == nil {
 		return
 	}
 	denial := normalizeDenial(deny.Denial)
-	rec.RecordDeny(ctx, sessionID, identifier, method, denial.Code, denial.ConditionType, map[string]interface{}{"transport": string(transportLeg)}, false)
+	rec.RecordDeny(ctx, subject.sessionID(), identifier, method, denial.Code, denial.ConditionType,
+		subject.details(map[string]interface{}{"transport": string(transportLeg)}), false)
 }
 
 // recordResourceExhausted records a host request refused because the concurrent-handler
@@ -400,7 +438,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 					fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, capability.ErrCodeEnforcementError, "", nil, false)
 				}
 			})
-			return mcp.ErrorResponse(msg.ID, -32603, "internal error: response redaction failed")
+			return mcp.ErrorResponse(msg.ID, jsonRPCCodeInternalError, "internal error: response redaction failed")
 		}
 		upResp.Result = redacted
 	}

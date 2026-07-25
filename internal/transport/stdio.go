@@ -979,7 +979,7 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 					// server-response is visible on the tape, mirroring the host-notification
 					// kill record (forwardHostNotification). A response carries no method, so
 					// use a fixed "server-response" identifier.
-					recordKillDrop(ctx, p.rec(), deny, p.sessionID, "server-response", "server-response", legStdioServerResponse)
+					recordKillDrop(ctx, p.rec(), deny, knownSession(p.sessionID), "server-response", "server-response", legStdioServerResponse)
 				} else {
 					_ = p.upWriter.Write(msg)
 				}
@@ -1031,7 +1031,7 @@ func (p *StdioProxy) forwardHostNotification(ctx context.Context, msg mcp.RPCMsg
 		return false
 	}
 	if deny := p.pdp.CheckKill(ctx, p.sessionID); deny != nil {
-		recordKillDrop(ctx, p.rec(), deny, p.sessionID, msg.Method, msg.Method, legStdioNotification)
+		recordKillDrop(ctx, p.rec(), deny, knownSession(p.sessionID), msg.Method, msg.Method, legStdioNotification)
 		return false
 	}
 	// An enforced method (tools/call, resources/read, resources/subscribe,
@@ -1348,9 +1348,16 @@ func awaitNonced(
 func (p *StdioProxy) callUpstream(ctx context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, error) {
 	ctx, cancel := p.withUpstreamTimeout(ctx)
 	defer cancel()
-	// NewStdioProxy initializes byUpstreamID, so this lazy init only fires for a
+	// NewStdioProxy initializes all three maps, so this lazy init only fires for a
 	// test-assembled proxy; under pendingMu so it cannot race awaitNonced/readUpstream.
+	// pending is initialized alongside the other two: awaitNonced writes it
+	// unconditionally (byUpstreamID and hostToUp are the ones it guards), so covering
+	// only those left a bare-struct proxy panicking on the very next line — the guard
+	// looked complete while doing nothing.
 	p.pendingMu.Lock()
+	if p.pending == nil {
+		p.pending = make(map[string]chan upstreamResult)
+	}
 	if p.byUpstreamID == nil {
 		p.byUpstreamID = make(map[string]chan upstreamResult)
 	}
@@ -1428,7 +1435,7 @@ func (p *StdioProxy) readUpstream(ctx context.Context) {
 			// guard covers a test-assembled proxy that wires no PDP.
 			if p.pdp != nil {
 				if deny := p.pdp.CheckKill(ctx, p.sessionID); deny != nil {
-					recordKillDrop(ctx, p.rec(), deny, p.sessionID, msg.Method, msg.Method, legStdioUpstreamNotification)
+					recordKillDrop(ctx, p.rec(), deny, knownSession(p.sessionID), msg.Method, msg.Method, legStdioUpstreamNotification)
 					continue
 				}
 			}

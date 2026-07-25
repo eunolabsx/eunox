@@ -256,6 +256,19 @@ type HTTPProxy struct {
 	// so a raced registration is simply rejected (the caller retries) rather than the
 	// registry being closed forever. See reapAllKilledSessions and registerSession.
 	reapGen uint64
+	// establishing counts sessions that have RESERVED a maxSessions slot but have not
+	// registered into sessions yet — they are between tryReserveSessionSlot and
+	// registerSession, spending up to sessionStartTimeout on an upstream spawn,
+	// initialize handshake, and drift probe. Guarded by mu.
+	//
+	// The cap must count them: registerSession alone makes the cap authoritative over
+	// what is REGISTERED, but N concurrent initialize POSTs against an empty registry
+	// would all pass a registry-only pre-check, all spawn an upstream, and only
+	// maxSessions of them register — the rest torn down after the handshake, repeatable
+	// every window. That is PID/FD/memory exhaustion despite the cap, and it
+	// contradicts --max-sessions' documented "refused with 503 rather than spawning".
+	// Reserving before the spawn and releasing on every failure path closes the window.
+	establishing int
 }
 
 // HTTPGatewayOptions configures a multi-upstream gateway HTTPProxy: one process

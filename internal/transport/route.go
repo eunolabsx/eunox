@@ -289,11 +289,23 @@ func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability
 				u.Name, u.Name)
 		}
 
-		r.sink = &routeSink{
-			sink:          sink,
-			upstream:      r.name,
-			policyVersion: policyVersion,
-			policySHA256:  policySHA256,
+		// Only wrap when there is something to wrap. routeSink exists to stamp route
+		// identity and policy provenance onto records; with no shared sink there are no
+		// records, and a non-nil wrapper makes every asRecorder(route.sink) yield a LIVE
+		// recorder that only discards. The callers' `rec != nil` fast path then never
+		// fires, so a no-audit gateway still pays the work done to build a record —
+		// notably the */list CountListEntries decode — for calls that write nothing.
+		// Leaving it nil gives asRecorder a genuine nil interface and matches the fast
+		// path the stdio transport's rec() already documents. routeSink's methods are
+		// nil-receiver safe, so the few sites that call through the concrete pointer are
+		// unaffected.
+		if sink != nil {
+			r.sink = &routeSink{
+				sink:          sink,
+				upstream:      r.name,
+				policyVersion: policyVersion,
+				policySHA256:  policySHA256,
+			}
 		}
 		routes[u.Name] = r
 	}

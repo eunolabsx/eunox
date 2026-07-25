@@ -500,7 +500,7 @@ func (p *HTTPProxy) runDriftCheckOrTeardown(ctx context.Context, sess *httpSessi
 		// the tamper-evident tape (route-stamped), not only stderr and a generic 500. The
 		// raw drift reason (which names drifted tools) stays on stderr; the tape carries
 		// the stable DRIFT_REFUSED category.
-		recordDriftRefused(ctx, route.sink, sess.id)
+		recordDriftRefused(ctx, asRecorder(route.sink), sess.id)
 		sess.close(p.shutdownMs) //nolint:contextcheck // teardown path: the upstream session-termination DELETE intentionally uses a detached, bounded background context — close/reaper/signal/shutdown carry no request context.
 		p.mu.Lock()
 		delete(p.sessions, sess.id)
@@ -568,6 +568,14 @@ func (p *HTTPProxy) registerSession(sess *httpSession, startGen uint64) error {
 	if p.maxSessions > 0 && len(p.sessions) >= p.maxSessions {
 		return errSessionLimit
 	}
+	// Convert this session's reservation into a registry entry under the same lock hold,
+	// so the establishing+registered total never dips and a concurrent
+	// tryReserveSessionSlot can never see the slot free twice. Only the SUCCESS path
+	// converts: every error return above leaves the reservation held, and the caller's
+	// deferred releaseSessionSlot drops it (see tryReserveSessionSlot).
+	if p.maxSessions > 0 && p.establishing > 0 {
+		p.establishing--
+	}
 	now := time.Now().UnixNano()
 	sess.lastActive.Store(now)
 	// Seed lastRequest so the hard idle ceiling is measured from creation: the
@@ -592,14 +600,46 @@ func (p *HTTPProxy) sessionCount() int {
 	return len(p.sessions)
 }
 
-// atSessionCap reports whether the session cap is currently reached. Best-effort:
-// used to refuse an initialize before spawning an upstream. registerSession makes
-// the cap authoritative against races.
-func (p *HTTPProxy) atSessionCap() bool {
+// tryReserveSessionSlot reserves one maxSessions slot for a session that is about to be
+// established, counting sessions already registered PLUS those still establishing. It
+// returns false when the cap is reached, in which case the caller must refuse the
+// initialize (503) without spawning anything.
+//
+// A registry-only pre-check is not enough: establishment (upstream spawn + initialize
+// handshake + drift probe) runs for up to sessionStartTimeout before registerSession
+// makes the count authoritative, so concurrent initializes would all pass a registry-only
+// check and all spawn upstreams. See the establishing field.
+//
+// Every successful reservation must be paired with exactly one release: registerSession
+// converts it into a registry entry on success, and releaseSessionSlot drops it on every
+// other path. maxSessions <= 0 (unlimited) reserves nothing, so its release is a no-op too.
+func (p *HTTPProxy) tryReserveSessionSlot() bool {
 	if p.maxSessions <= 0 {
+		return true
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.sessions)+p.establishing >= p.maxSessions {
 		return false
 	}
-	return p.sessionCount() >= p.maxSessions
+	p.establishing++
+	return true
+}
+
+// releaseSessionSlot drops a reservation taken by tryReserveSessionSlot without
+// registering a session — the initialize failed, was refused, or raced a reap/shutdown.
+// Idempotent against an unlimited cap (which reserves nothing); the p.establishing > 0
+// guard keeps a double release from driving the counter negative and permanently
+// inflating the effective cap.
+func (p *HTTPProxy) releaseSessionSlot() {
+	if p.maxSessions <= 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.establishing > 0 {
+		p.establishing--
+	}
 }
 
 // hardIdleMultiplier sets the hard idle ceiling as a multiple of the idle window.
@@ -806,7 +846,7 @@ func (p *HTTPProxy) closeAllSessions() {
 // when sessionIdleTimeoutMs is 0 (a documented, valid config). Without this a killed
 // session's subprocess/connection and its registry slot linger until process exit, and
 // accumulated killed-but-undead sessions eventually exhaust maxSessions and make
-// atSessionCap 503 EVERY new initialize — a session-exhaustion DoS triggered by the kill
+// tryReserveSessionSlot 503 EVERY new initialize — a session-exhaustion DoS triggered by the kill
 // switch itself. Mirrors handleMCPDelete's registry-delete-then-close teardown; a
 // session already gone is a no-op. The kill store still independently blocks the session,
 // so this only reclaims resources.
@@ -978,7 +1018,7 @@ func (s *httpSession) readUpstream(ctx context.Context) {
 					killCtx = pdp.WithJWTClaims(killCtx, s.claims)
 				}
 				if deny := s.route.pdp.CheckKill(killCtx, s.id); deny != nil {
-					recordKillDrop(killCtx, asRecorder(s.route.sink), deny, s.id, msg.Method, msg.Method, legHTTPUpstreamNotification)
+					recordKillDrop(killCtx, asRecorder(s.route.sink), deny, knownSession(s.id), msg.Method, msg.Method, legHTTPUpstreamNotification)
 					continue
 				}
 			}
@@ -1038,10 +1078,15 @@ func (s *httpSession) withUpstreamTimeout(ctx context.Context) (context.Context,
 func (s *httpSession) callSubprocessUpstream(ctx context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, error) {
 	ctx, cancel := s.withUpstreamTimeout(ctx)
 	defer cancel()
-	// newSession initializes byUpstreamID, so this lazy init only fires for a session
+	// newSession initializes all three maps, so this lazy init only fires for a session
 	// assembled directly in a test; do it under pendingMu so the map-header write
-	// cannot race the off-lock read in readUpstream/deliverUpstreamResponse.
+	// cannot race the off-lock read in readUpstream/deliverUpstreamResponse. pending is
+	// covered too: awaitNonced writes it unconditionally, so guarding only the other two
+	// left a bare-struct session panicking on the very next line.
 	s.pendingMu.Lock()
+	if s.pending == nil {
+		s.pending = make(map[string]chan upstreamResult)
+	}
 	if s.byUpstreamID == nil {
 		s.byUpstreamID = make(map[string]chan upstreamResult)
 	}

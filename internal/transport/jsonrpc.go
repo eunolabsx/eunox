@@ -284,7 +284,7 @@ func buildInitializeResponse(id *json.RawMessage, caps map[string]interface{}, i
 	}
 	resp, err := mcp.SuccessResponse(id, result)
 	if err != nil {
-		return mcp.ErrorResponse(id, -32603, "internal error building initialize response")
+		return mcp.ErrorResponse(id, jsonRPCCodeInternalError, "internal error building initialize response")
 	}
 	return resp
 }

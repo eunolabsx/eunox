@@ -210,7 +210,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 		// The empty session id means only the global dimension can match. Mirrors the
 		// explicit CheckKill in dispatchList for the */list path.
 		if deny := route.pdp.CheckKill(r.Context(), ""); deny != nil {
-			resp := recordKillDenial(r.Context(), asRecorder(route.sink), deny, msg.ID, "", "initialize")
+			resp := recordKillDenial(r.Context(), asRecorder(route.sink), deny, msg.ID, knownSession(""), "initialize")
 			writeJSONMsg(w, resp)
 			return
 		}
@@ -234,10 +234,12 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 			writeJSONMsg(w, denied)
 			return
 		}
-		// Cheap pre-spawn capacity check so a full proxy refuses a new session without
-		// starting an upstream. registerSession re-checks under the lock to make the
-		// cap authoritative against concurrent initializes.
-		if p.atSessionCap() {
+		// Pre-spawn capacity RESERVATION, not just a check: the slot is taken now and held
+		// across establishment, so concurrent initializes cannot all pass a registry-only
+		// check and each spawn an upstream before any of them registers (see
+		// tryReserveSessionSlot). registerSession converts the reservation on success; the
+		// defer below drops it on every other path.
+		if !p.tryReserveSessionSlot() {
 			// Recorded for the same reason as the errSessionLimit leg of
 			// writeSessionCreateError: this is the cheap pre-spawn twin of that refusal and
 			// the surface an unauthenticated saturation flood reaches first.
@@ -248,6 +250,16 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 			http.Error(w, "session limit reached", http.StatusServiceUnavailable)
 			return
 		}
+		// Held until this handler returns or registerSession converts it. Flipped to false
+		// only after a session is actually registered, so every refusal, spawn failure,
+		// handshake failure, drift refusal, and raced reap/shutdown gives the slot back —
+		// otherwise a failing upstream would permanently consume the cap.
+		slotReserved := true
+		defer func() {
+			if slotReserved {
+				p.releaseSessionSlot()
+			}
+		}()
 		// Session establishment (initialize handshake + drift tools/list probe) runs
 		// under sessionStartTimeout, independent of --upstream-timeout. Cover the larger
 		// of the two budgets so the write deadline set above can't fire mid-handshake
@@ -277,6 +289,9 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 			p.writeSessionCreateError(w, r, err)
 			return
 		}
+		// Registered: registerSession already converted the reservation into a registry
+		// entry, so the deferred release must not run and double-free the slot.
+		slotReserved = false
 		w.Header().Set(SessionHeader, sess.id)
 		// Answered directly, not through the shared dispatchInitialize kill gate: the
 		// pre-spawn global-dimension CheckKill already ran above, and the session id
@@ -305,7 +320,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 				// successful readiness ack to a client that only checks status.
 				// Record the deny directly, exactly like the existing-session
 				// notification kill path below, and ack the drop with a bodyless 202.
-				recordKillDrop(r.Context(), asRecorder(route.sink), deny, "", msg.Method, msg.Method, legHTTPNotification)
+				recordKillDrop(r.Context(), asRecorder(route.sink), deny, knownSession(""), msg.Method, msg.Method, legHTTPNotification)
 				w.WriteHeader(http.StatusAccepted)
 				return
 			}
@@ -337,12 +352,22 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 		// itself rather than via resolveSessionForRoute (used by the GET/SSE path) because
 		// only the request/notification framing here can carry a JSON-RPC KILL_SWITCH body.
 		if deny := route.pdp.CheckKill(r.Context(), sessionID); deny != nil {
+			// claimedSession, not knownSession: the id did NOT resolve in the registry, so
+			// nothing here has verified it names a session of this proxy. Under a GLOBAL kill
+			// CheckKill denies every id, so an arbitrary Mcp-Session-Id reaches this record —
+			// stamping it as the structured session_id would let any caller forge kill-deny
+			// records against a victim's, or an invented, session. It is preserved as
+			// details.claimed_session_id instead, the same way every pre-session refusal
+			// carries an unverified header value. (A session-dimension kill match does not
+			// change this: the kill store is keyed by whatever id was handed to `eunox kill`,
+			// which is not the registry confirming the session is this proxy's.)
+			subject := claimedSession(sessionID)
 			if msg.IsRequest() {
-				writeJSONMsg(w, recordKillDenial(r.Context(), asRecorder(route.sink), deny, msg.ID, sessionID, msg.Method))
+				writeJSONMsg(w, recordKillDenial(r.Context(), asRecorder(route.sink), deny, msg.ID, subject, msg.Method))
 			} else {
 				// Fire-and-forget (notification / response): record the drop and ack with a
 				// bodyless 202, matching the existing-session notification kill path below.
-				recordKillDrop(r.Context(), asRecorder(route.sink), deny, sessionID, msg.Method, msg.Method, legHTTPNotification)
+				recordKillDrop(r.Context(), asRecorder(route.sink), deny, subject, msg.Method, msg.Method, legHTTPNotification)
 				w.WriteHeader(http.StatusAccepted)
 			}
 			return
@@ -409,7 +434,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 	if msg.IsNotification() {
 		if !isSwallowedHostNotification(msg.Method) {
 			if kill != nil {
-				recordKillDrop(r.Context(), asRecorder(route.sink), kill, sessionID, msg.Method, msg.Method, legHTTPNotification)
+				recordKillDrop(r.Context(), asRecorder(route.sink), kill, knownSession(sessionID), msg.Method, msg.Method, legHTTPNotification)
 				w.WriteHeader(http.StatusAccepted)
 				return
 			}
@@ -473,7 +498,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 				// host reply so a killed session's suppressed server-response is visible on
 				// the tape, mirroring the notification kill record above; a response carries
 				// no method, so use a fixed "server-response" identifier.
-				recordKillDrop(r.Context(), asRecorder(route.sink), kill, sessionID, "server-response", "server-response", legHTTPServerResponse)
+				recordKillDrop(r.Context(), asRecorder(route.sink), kill, knownSession(sessionID), "server-response", "server-response", legHTTPServerResponse)
 			case sess.upWriter != nil:
 				_ = sess.upWriter.Write(msg)
 			default:
@@ -738,7 +763,7 @@ func (p *HTTPProxy) handleMCPGet(w http.ResponseWriter, r *http.Request, route *
 		// it (evicting in-flight streams would change the kill switch's semantics). A
 		// kill-store error fails closed via CheckKill.
 		if deny := route.pdp.CheckKill(r.Context(), sessionID); deny != nil {
-			recordKillDrop(r.Context(), asRecorder(route.sink), deny, sessionID, "", "", legSSEGet)
+			recordKillDrop(r.Context(), asRecorder(route.sink), deny, knownSession(sessionID), "", "", legSSEGet)
 			http.Error(w, "session terminated", http.StatusForbidden)
 			return
 		}

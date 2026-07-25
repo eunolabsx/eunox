@@ -76,7 +76,7 @@ func (d dispatchParams) finishDecision() {
 // kill-store error fails closed inside CheckKill.
 func (d dispatchParams) killDenied(ctx context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, bool) {
 	if deny := d.pdp.CheckKill(ctx, d.sessionID); deny != nil {
-		return recordKillDenial(ctx, d.rec, deny, msg.ID, d.sessionID, msg.Method), true
+		return recordKillDenial(ctx, d.rec, deny, msg.ID, knownSession(d.sessionID), msg.Method), true
 	}
 	return mcp.RPCMsg{}, false
 }
@@ -278,7 +278,7 @@ func dispatchRequest(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.
 // than a nil-call panic.
 func dispatchInitialize(_ context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
 	if d.buildInit == nil {
-		return mcp.ErrorResponse(msg.ID, -32603, "internal error: initialize responder not configured")
+		return mcp.ErrorResponse(msg.ID, jsonRPCCodeInternalError, "internal error: initialize responder not configured")
 	}
 	return d.buildInit(msg)
 }
@@ -336,7 +336,7 @@ func (d dispatchParams) malformedDeny(ctx context.Context, msg mcp.RPCMsg, reaso
 	if d.rec != nil {
 		d.rec.RecordDeny(ctx, d.sessionID, msg.Method, msg.Method, codeInvalidRequest, "", nil, false)
 	}
-	return mcp.ErrorResponse(msg.ID, -32602, reason)
+	return mcp.ErrorResponse(msg.ID, jsonRPCCodeInvalidParams, reason)
 }
 
 // dispatchToolsCall applies the PDP to a tools/call request and either forwards
@@ -499,7 +499,7 @@ func dispatchList(ctx context.Context, d dispatchParams, msg mcp.RPCMsg, filter 
 				d.rec.RecordDeny(ctx, d.sessionID, msg.Method, msg.Method, capability.ErrCodeEnforcementError, "", nil, false)
 			}
 		})
-		return mcp.ErrorResponse(msg.ID, -32603, "upstream returned a malformed list response (no result and no error)")
+		return mcp.ErrorResponse(msg.ID, jsonRPCCodeInternalError, "upstream returned a malformed list response (no result and no error)")
 	}
 
 	// In audit (observe/wiretap) mode the enumeration must return the full upstream

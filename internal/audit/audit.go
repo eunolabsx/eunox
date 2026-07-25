@@ -1680,19 +1680,43 @@ const auditDetailsTotalCap = 1 << 20 // 1 MiB
 // sheds records (counted, tamper-evident) instead of OOM-ing the process.
 const auditQueueByteBudget = 256 << 20 // 256 MiB
 
-// auditRecordEnvelopeEstimate is a flat per-record allowance for the fixed envelope
-// (session id, method, target, key id, the two hex HMACs) that queueSize adds on top
-// of the variable Details/Obligations bytes. It need not be exact — queuedBytes is a
-// soft bound.
+// auditRecordEnvelopeEstimate is a flat per-record allowance for the parts of the
+// envelope queueSize does NOT sum: the struct header itself, the JSON field names and
+// punctuation, and the two hex HMACs (prev_hmac/_hmac). The HMACs are excluded from
+// the sum deliberately — writeRecord stamps them on the drainer goroutine, after the
+// enqueue reservation and before the drain release, so counting them would make the
+// two disagree. Everything else is summed field by field; see queueSize.
 const auditRecordEnvelopeEstimate = 512
 
 // queueSize estimates the heap a queued record retains: its already-marshaled Details
-// and Obligations bytes plus a flat envelope allowance. The drainer recomputes it from
-// the same immutable fields, so the enqueue add and the drain subtract always agree.
+// and Obligations bytes, its variable-length envelope strings, and a flat allowance for
+// the fixed remainder. The drainer recomputes it from the same immutable fields, so the
+// enqueue add and the drain subtract always agree.
+//
+// The envelope strings are summed rather than folded into the flat allowance because
+// several of them are not small: AgentID/TaskID/UserID (IdP-supplied) and Target/Method
+// (request-supplied) are each bounded only by auditEnvelopeFieldCap, so one record can
+// hold ~40 KiB of envelope. Charging a flat 512 B for all of it let a queue of such
+// records overshoot auditQueueByteBudget many times over — the OOM the budget exists to
+// prevent. Note the exclusions above: rec.Seq, rec.PrevHMAC, and rec.HMAC are assigned
+// by writeRecord after enqueue, so only fields Record fills are counted here.
 func (rec *auditRecord) queueSize() int64 {
 	n := int64(len(rec.Details)) + auditRecordEnvelopeEstimate
+	n += int64(len(rec.Time) + len(rec.RequestID) + len(rec.KeyID))
+	n += int64(len(rec.SessionID) + len(rec.AgentID) + len(rec.TaskID) + len(rec.UserID))
+	n += int64(len(rec.Upstream) + len(rec.PolicyVersion) + len(rec.PolicySHA256))
+	n += int64(len(rec.TargetType) + len(rec.Target) + len(rec.Method))
+	n += int64(len(rec.Decision) + len(rec.DenialCode) + len(rec.ConditionType))
 	for _, o := range rec.Obligations {
 		n += int64(len(o))
+	}
+	// Flow labels come from the closed native vocabulary (short, few), but they are
+	// retained heap like any other slice and cost nothing to count correctly.
+	for _, l := range rec.LabelsOut {
+		n += int64(len(l))
+	}
+	for _, l := range rec.CarriedLabels {
+		n += int64(len(l))
 	}
 	return n
 }
