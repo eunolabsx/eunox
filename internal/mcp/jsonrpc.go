@@ -404,31 +404,6 @@ func DecodeParams(raw json.RawMessage, v interface{}) error {
 // keys a reasonable parser could conflate is rejected. The cost is refusing an object that
 // deliberately carries case-distinct siblings ({"a":1,"A":2}) — a denial, not a bypass,
 // which is the direction this proxy fails.
-// foldJSONKey canonicalizes a JSON object key so that any two keys encoding/json could
-// bind to the same struct field map to the same value. Each rune is replaced by the
-// smallest member of its Unicode simple-fold orbit, which groups every case variant the
-// decoder's field matcher treats as equal.
-//
-// strings.ToLower is NOT sufficient and was the gap this closes: U+017F (LATIN SMALL
-// LETTER LONG S) is already lower case, so ToLower leaves "deſcription" distinct from
-// "description", while the decoder folds them together and keeps the last.
-func foldJSONKey(key string) string {
-	var b strings.Builder
-	b.Grow(len(key))
-	for _, r := range key {
-		min := r
-		// SimpleFold walks the orbit in a cycle back to r; take its smallest member so
-		// every equivalent rune canonicalizes identically.
-		for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
-			if f < min {
-				min = f
-			}
-		}
-		b.WriteRune(min)
-	}
-	return b.String()
-}
-
 func rejectDuplicateJSONKeys(raw json.RawMessage) error {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil
@@ -501,6 +476,31 @@ func rejectDuplicateJSONKeys(raw json.RawMessage) error {
 			markValueDone() // number, bool, or null value
 		}
 	}
+}
+
+// foldJSONKey canonicalizes a JSON object key so that any two keys encoding/json could
+// bind to the same struct field map to the same value. Each rune is replaced by the
+// smallest member of its Unicode simple-fold orbit, which groups every case variant the
+// decoder's field matcher treats as equal.
+//
+// strings.ToLower is NOT sufficient and was the gap this closes: U+017F (LATIN SMALL
+// LETTER LONG S) is already lower case, so ToLower leaves "deſcription" distinct from
+// "description", while the decoder folds them together and keeps the last.
+func foldJSONKey(key string) string {
+	var b strings.Builder
+	b.Grow(len(key))
+	for _, r := range key {
+		// SimpleFold walks the orbit in a cycle back to r; take its smallest member so
+		// every equivalent rune canonicalizes identically.
+		lowest := r
+		for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+			if f < lowest {
+				lowest = f
+			}
+		}
+		b.WriteRune(lowest)
+	}
+	return b.String()
 }
 
 // -----------------------------------------------------------------
