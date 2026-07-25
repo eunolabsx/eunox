@@ -158,7 +158,7 @@ func TestVerifyWithKeyRotation_Contract(t *testing.T) {
 		require.Equal(t, int32(2), fetches.Load(), "the forced refresh still runs; only the pointless re-verify is skipped")
 	})
 
-	t.Run("forced-refresh failure is surfaced over the cached-key signature error", func(t *testing.T) {
+	t.Run("cached-key signature failure is not masked as an outage when the refresh also fails", func(t *testing.T) {
 		var fetches atomic.Int32
 		cache := newCache(t, func(w http.ResponseWriter, _ *http.Request) {
 			if fetches.Add(1) >= 2 {
@@ -172,8 +172,13 @@ func TestVerifyWithKeyRotation_Contract(t *testing.T) {
 		})
 		require.Nil(t, got)
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "refresh JWKS", "a refresh failure must be surfaced as such")
-		assert.NotContains(t, err.Error(), "verify signature", "the refresh failure must not be masked as a signature failure")
+		// The token WAS checked against a key we held (the cached set) and failed, so this
+		// is a signature failure, not a "never checked against a key" outage. The failed
+		// rotation refresh is only best-effort context: it must NOT wrap ErrJWKSUnavailable,
+		// or the audit layer would record a forged token presented during a JWKS blip as an
+		// infrastructure outage and hide it from a SIEM keyed on invalid_signature.
+		assert.Contains(t, err.Error(), "verify signature", "a failed signature against a cached key stays a signature failure")
+		assert.False(t, errors.Is(err, ErrJWKSUnavailable), "the failed rotation refresh must not mask the signature failure as a JWKS outage")
 	})
 
 	t.Run("a verifier returning neither result nor error fails closed", func(t *testing.T) {

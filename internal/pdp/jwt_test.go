@@ -4278,12 +4278,14 @@ func TestJWTPDP_ValidateToken_SameKidKeyRotation(t *testing.T) {
 	}
 }
 
-// TestJWTPDP_ValidateToken_KidlessRefreshFailureSurfaced is a regression for
-// the cmd path: when a kid-less token fails every cached key and the forced JWKS
-// refresh also fails (endpoint down), ValidateToken must return the refresh error,
-// not the cached-key signature failure, so a transient JWKS outage during rotation
-// is distinguishable from a forged token.
-func TestJWTPDP_ValidateToken_KidlessRefreshFailureSurfaced(t *testing.T) {
+// TestJWTPDP_ValidateToken_KidlessSigFailureDuringOutageStaysSignature pins that when a
+// kid-less token fails every cached key and the forced JWKS refresh also fails (endpoint
+// down), ValidateToken classifies it as a signature failure, NOT a jwks_unavailable
+// outage: the token WAS checked against a key we held (the cached set) and failed, so
+// recording it as an outage would let a forged token presented during a JWKS blip hide
+// from a SIEM keyed on invalid_signature. jwks_unavailable is reserved for a token that
+// was never checked against a key (a kid absent from the cache, handled one branch up).
+func TestJWTPDP_ValidateToken_KidlessSigFailureDuringOutageStaysSignature(t *testing.T) {
 	t.Parallel()
 	oldKey := newTestKey(t, "old")
 	newKey := newTestKey(t, "new")
@@ -4319,13 +4321,12 @@ func TestJWTPDP_ValidateToken_KidlessRefreshFailureSurfaced(t *testing.T) {
 	newTok := makeIDPTokenNoKID(t, newKey, []string{"tool:read_file"}, exp)
 	_, err := pdp.ValidateToken(context.Background(), "Bearer "+newTok)
 	if err == nil {
-		t.Fatal("expected an error when the forced JWKS refresh fails")
+		t.Fatal("expected an error when the signature fails and the forced JWKS refresh is down")
 	}
-	if !strings.Contains(err.Error(), "refresh JWKS") {
-		t.Errorf("error = %q; want it to surface the JWKS-refresh failure", err)
-	}
-	if strings.Contains(err.Error(), "signature verification failed") {
-		t.Errorf("error = %q; the refresh failure must not be masked as a signature failure", err)
+	// The token was checked against a cached key and failed, so it is a signature failure,
+	// not a jwks_unavailable outage — otherwise forgery during a JWKS blip hides in the tape.
+	if got := ClassifyJWTError(err); got != jwtErrSignature {
+		t.Errorf("ClassifyJWTError = %q, want %q (a checked-and-failed token must not be masked as a JWKS outage)", got, jwtErrSignature)
 	}
 }
 

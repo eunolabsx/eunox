@@ -905,12 +905,15 @@ type proxyFlags struct {
 // validateJWTAudienceConfig enforces fail-closed audience pinning for --jwks-uri
 // mode: --jwt-audience must be set so a token minted for another relying party
 // of the same IdP cannot be replayed against eunox. Bypassed only with explicit
-// --jwt-allow-any-audience; a no-op when jwksURI is empty (JWT mode off).
+// --jwt-allow-any-audience; a no-op when jwksURI is empty (JWT mode off). A
+// whitespace-only value counts as unset: the validator collapses it to no pin
+// (sanitizeAudiences/normalizeAudience), so accepting it here would silently reject
+// every token instead of surfacing the misconfiguration.
 func validateJWTAudienceConfig(jwksURI, jwtAudience string, allowAnyAudience bool) error {
 	if jwksURI == "" {
 		return nil
 	}
-	if jwtAudience == "" && !allowAnyAudience {
+	if strings.TrimSpace(jwtAudience) == "" && !allowAnyAudience {
 		return fmt.Errorf(`--jwks-uri requires --jwt-audience (the expected "aud" claim) so a token minted for another service cannot be replayed against eunox; pass --jwt-allow-any-audience to accept any audience (not recommended)`)
 	}
 	return nil
@@ -1084,6 +1087,26 @@ func newJWKSHTTPClient(allowInsecure bool) *http.Client {
 			}
 			if err := validateJWKSURIScheme(req.URL.String(), allowInsecure); err != nil {
 				return fmt.Errorf("JWKS redirect blocked: %w", err)
+			}
+			// The JWKS is the root of trust for every token, so a redirect must not leave
+			// the configured HOST: the scheme check above still passes an https->https hop,
+			// so without this an IdP open-redirect (or a compromised redirector) could point
+			// the key fetch at an attacker host and substitute the key set, forging
+			// capability claims. via[0] is the original request (the configured --jwks-uri);
+			// require every redirect target to share its hostname. Port and path may change
+			// (an IdP may relocate the key set within its own host), but the host may not —
+			// with one exception: a hop between two loopback spellings (localhost <->
+			// 127.0.0.1) never leaves the machine, so it has no on-path attacker surface (and
+			// the scheme check above already confined any plaintext http hop to loopback).
+			// Allowing it keeps the loopback dev flow working even though the hostname string
+			// differs; every other cross-host hop is still refused.
+			if len(via) > 0 {
+				origHost := via[0].URL.Hostname()
+				targetHost := req.URL.Hostname()
+				bothLoopback := capability.IsLoopbackHost(targetHost) && capability.IsLoopbackHost(origHost)
+				if !strings.EqualFold(targetHost, origHost) && !bothLoopback {
+					return fmt.Errorf("JWKS redirect blocked: target host %q differs from the configured JWKS host %q; the key fetch must stay on the configured host", targetHost, origHost)
+				}
 			}
 			return nil
 		},

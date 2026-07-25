@@ -1892,6 +1892,62 @@ func TestJWKSClient_AllowsLoopbackRedirect(t *testing.T) {
 	}
 }
 
+// TestJWKSClient_BlocksCrossHostRedirect is the regression for the cross-host redirect
+// hole: the scheme check alone passes an https->https hop, so a valid IdP endpoint that
+// 30x's the key fetch to an ATTACKER host (an open-redirect or a compromised redirector)
+// would substitute the key set and forge capability claims. The client must refuse a
+// redirect that leaves the configured host, while still allowing a path/port change on
+// the same host.
+func TestJWKSClient_BlocksCrossHostRedirect(t *testing.T) {
+	t.Parallel()
+	client := newJWKSHTTPClient(false)
+	orig, _ := http.NewRequest(http.MethodGet, "https://idp.example.com/jwks", http.NoBody)
+	via := []*http.Request{orig}
+
+	// Same scheme (https), DIFFERENT host: must be blocked.
+	target, _ := http.NewRequest(http.MethodGet, "https://attacker.example.com/jwks", http.NoBody)
+	if err := client.CheckRedirect(target, via); err == nil {
+		t.Fatal("a same-scheme redirect to a different host must be blocked")
+	} else if !strings.Contains(err.Error(), "redirect blocked") {
+		t.Errorf("error = %v, want it to mention 'redirect blocked'", err)
+	}
+
+	// Same host, different port + path (an IdP relocating its key set): still allowed.
+	sameHost, _ := http.NewRequest(http.MethodGet, "https://idp.example.com:8443/keys", http.NoBody)
+	if err := client.CheckRedirect(sameHost, via); err != nil {
+		t.Fatalf("a same-host redirect (port/path change) must be allowed, got %v", err)
+	}
+
+	// Case-insensitive host match.
+	caseHost, _ := http.NewRequest(http.MethodGet, "https://IDP.EXAMPLE.COM/jwks", http.NoBody)
+	if err := client.CheckRedirect(caseHost, via); err != nil {
+		t.Fatalf("a same-host redirect differing only in case must be allowed, got %v", err)
+	}
+
+	// A loopback->loopback hop that changes only the host spelling (localhost <->
+	// 127.0.0.1) has no on-path attacker surface, so it is allowed even though the
+	// hostname string differs — the loopback dev flow depends on it. Loopback http passes
+	// the scheme check regardless of --jwks-allow-insecure-http.
+	loopbackOrig, _ := http.NewRequest(http.MethodGet, "http://localhost:8080/jwks", http.NoBody)
+	loopbackVia := []*http.Request{loopbackOrig}
+	loopbackAlias, _ := http.NewRequest(http.MethodGet, "http://127.0.0.1:9090/jwks", http.NoBody)
+	if err := client.CheckRedirect(loopbackAlias, loopbackVia); err != nil {
+		t.Fatalf("a loopback->loopback redirect (localhost->127.0.0.1) must be allowed, got %v", err)
+	}
+	// The reverse spelling is equally allowed.
+	revOrig, _ := http.NewRequest(http.MethodGet, "http://127.0.0.1:8080/jwks", http.NoBody)
+	rev, _ := http.NewRequest(http.MethodGet, "http://localhost:9090/jwks", http.NoBody)
+	if err := client.CheckRedirect(rev, []*http.Request{revOrig}); err != nil {
+		t.Fatalf("a loopback->loopback redirect (127.0.0.1->localhost) must be allowed, got %v", err)
+	}
+	// But a loopback origin redirecting OFF the machine is still blocked: the target host
+	// is not loopback, so it leaves the machine and must be refused.
+	offMachine, _ := http.NewRequest(http.MethodGet, "https://attacker.example.com/jwks", http.NoBody)
+	if err := client.CheckRedirect(offMachine, loopbackVia); err == nil {
+		t.Fatal("a loopback->remote redirect must be blocked (it leaves the machine)")
+	}
+}
+
 // ===== merged from gateway_test.go =====
 
 // mustWriteFile writes content to dir/name (controlling the extension, which
