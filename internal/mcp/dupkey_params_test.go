@@ -25,6 +25,19 @@ func TestDecodeParams_RejectsDuplicateKeys(t *testing.T) {
 		{"arguments object duplicated", `{"arguments":{"a":1},"arguments":{"b":2}}`},
 		{"duplicate inside array element", `{"batch":[{"path":"/a","path":"/b"}]}`},
 		{"deeply nested duplicate", `{"a":{"b":{"c":{"k":1,"k":2}}}}`},
+
+		// Case-variant siblings are the same smuggle: encoding/json binds object keys to
+		// struct fields by a case-folding match and keeps the LAST, so an exact-only check
+		// would let the proxy authorize one value while the forwarded bytes carry another.
+		{"tool-name smuggling by case fold", `{"name":"dangerous_tool","Name":"safe_tool"}`},
+		{"tool-name smuggling, fold order reversed", `{"Name":"safe_tool","name":"dangerous_tool"}`},
+		{"resource URI smuggling by case fold", `{"uri":"file:///etc/shadow","Uri":"file:///safe/ok"}`},
+		{"arguments object smuggling by case fold", `{"name":"read","arguments":{"path":"/safe"},"Arguments":{"path":"/etc/shadow"}}`},
+		{"nested argument smuggling by case fold", `{"arguments":{"path":"/safe","Path":"/etc/shadow"}}`},
+		{"all-caps variant", `{"NAME":"a","name":"b"}`},
+		// U+017F (long s) folds onto "s" for the decoder but is untouched by ToLower,
+		// so this pins that the fold is a real Unicode simple-fold, not a lower-casing.
+		{"unicode long-s fold variant", `{"description":"<INJECT>","deſcription":"<CLEAN>"}`},
 	}
 	for _, tc := range reject {
 		t.Run(tc.name, func(t *testing.T) {

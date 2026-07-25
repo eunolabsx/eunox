@@ -13,8 +13,10 @@ import (
 	"math/big"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -390,13 +392,52 @@ func DecodeParams(raw json.RawMessage, v interface{}) error {
 // to expecting a key. A top-level-only check would still leave nested-field smuggling
 // live, so the walk is fully recursive. Empty/whitespace input is not an error (absent
 // params is valid); a malformed token stream returns its decode error (also fail-closed).
+//
+// Keys collide under Unicode simple-fold, not byte equality, because a byte-exact check
+// does not close the smuggle. encoding/json binds object keys to STRUCT FIELDS by a
+// case-folding match and keeps the LAST one, so {"name":"dangerous","Name":"safe"} is two
+// distinct keys to an exact check but resolves to Name="safe" here — the proxy authorizes
+// "safe", forwards the original bytes verbatim, and a case-sensitive upstream (the
+// TypeScript/Python SDKs, any plain JSON.parse) acts on "dangerous". Folding at every
+// depth rather than only at the struct-bound root is deliberate: the forwarded bytes are
+// decoded by an upstream whose binding shape this proxy does not control, so any pair of
+// keys a reasonable parser could conflate is rejected. The cost is refusing an object that
+// deliberately carries case-distinct siblings ({"a":1,"A":2}) — a denial, not a bypass,
+// which is the direction this proxy fails.
+// foldJSONKey canonicalizes a JSON object key so that any two keys encoding/json could
+// bind to the same struct field map to the same value. Each rune is replaced by the
+// smallest member of its Unicode simple-fold orbit, which groups every case variant the
+// decoder's field matcher treats as equal.
+//
+// strings.ToLower is NOT sufficient and was the gap this closes: U+017F (LATIN SMALL
+// LETTER LONG S) is already lower case, so ToLower leaves "deſcription" distinct from
+// "description", while the decoder folds them together and keeps the last.
+func foldJSONKey(key string) string {
+	var b strings.Builder
+	b.Grow(len(key))
+	for _, r := range key {
+		min := r
+		// SimpleFold walks the orbit in a cycle back to r; take its smallest member so
+		// every equivalent rune canonicalizes identically.
+		for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+			if f < min {
+				min = f
+			}
+		}
+		b.WriteRune(min)
+	}
+	return b.String()
+}
+
 func rejectDuplicateJSONKeys(raw json.RawMessage) error {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil
 	}
 	type frame struct {
-		object    bool
-		seen      map[string]struct{}
+		object bool
+		// seen maps a fold-canonical key to the raw key first seen under it, so a
+		// collision can name both spellings in the error.
+		seen      map[string]string
 		expectKey bool
 	}
 	var stack []frame
@@ -439,13 +480,19 @@ func rejectDuplicateJSONKeys(raw json.RawMessage) error {
 			}
 		case string:
 			if n := len(stack); n > 0 && stack[n-1].object && stack[n-1].expectKey {
-				if _, dup := stack[n-1].seen[t]; dup {
-					return fmt.Errorf("%w: duplicate object key %q", ErrParse, t)
+				key := foldJSONKey(t)
+				if prior, dup := stack[n-1].seen[key]; dup {
+					if prior == t {
+						return fmt.Errorf("%w: duplicate object key %q", ErrParse, t)
+					}
+					// Not byte-identical, but encoding/json would fold both onto one
+					// struct field and keep the last — the smuggling shape.
+					return fmt.Errorf("%w: object keys %q and %q differ only by case fold", ErrParse, prior, t)
 				}
 				if stack[n-1].seen == nil {
-					stack[n-1].seen = make(map[string]struct{}, 1)
+					stack[n-1].seen = make(map[string]string, 1)
 				}
-				stack[n-1].seen[t] = struct{}{}
+				stack[n-1].seen[key] = t
 				stack[n-1].expectKey = false
 			} else {
 				markValueDone() // a string value

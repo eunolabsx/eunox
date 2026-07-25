@@ -282,7 +282,8 @@ func (p *HTTPProxy) sourceIP(r *http.Request) string {
 					}
 				}
 			}
-			if idx := len(all) - p.proxyHops(); idx >= 0 && idx < len(all) {
+			// proxyHops() is always >= 1, so idx is at most len(all)-1.
+			if idx := len(all) - p.proxyHops(); idx >= 0 {
 				// Normalize like the RemoteAddr path below: proxies may append the client as
 				// IP:port or a bracketed IPv6 literal, and the downstream ipRange condition
 				// runs net.ParseIP, which returns nil for either form.
