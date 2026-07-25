@@ -200,6 +200,13 @@ Flags:
 	if outPath == "auto" {
 		outPath = fmt.Sprintf("eunox-doctor-%s.txt", time.Now().UTC().Format("20060102T150405Z"))
 	}
+	// The bundle always truncates (there is no --force gate here), so the symlink refusal
+	// is unconditional: without it a link planted at --output would have its TARGET
+	// truncated and then re-moded 0600 by the Chmod below.
+	if err := refuseNonRegularOutput(outPath); err != nil {
+		fmt.Fprintf(os.Stderr, "eunox doctor: %v\n", err)
+		os.Exit(1)
+	}
 	f, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600) //nolint:gosec // G304: --output is an operator-supplied destination
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "eunox doctor: opening %q: %v\n", outPath, err)

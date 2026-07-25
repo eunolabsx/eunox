@@ -225,6 +225,27 @@ type Sink struct {
 	// Close/exit. Atomic (read/written from any goroutine); exposed via WriteFailures.
 	writeFailures atomic.Int64
 
+	// maintenanceStalled is set when size-triggered rotation or retention pruning has
+	// stopped making progress while record writing itself is still healthy: the sibling
+	// directory cannot be listed (so an ordinal cannot be seeded and rotation defers), or
+	// the oldest rotated file cannot be unlinked (so pruning stops to keep the retained
+	// chain contiguous). Both are deliberately non-fatal — deferring is what keeps the
+	// chain verifiable — but both silently void the configured disk bound, and the log
+	// then grows until the filesystem fills, at which point writes DO fail and
+	// --require-audit=strict denies everything. That end state is far worse than the
+	// warning, so the stall is surfaced while it is still just a stall.
+	//
+	// Deliberately NOT folded into AuditDegraded: that gate denies live traffic under
+	// --require-audit=strict, and a stalled rotation has lost no records — every decision
+	// is still being written and signed. This is a maintenance/readiness signal for
+	// /healthz, metrics, and doctor, not an enforcement input. Cleared when the operation
+	// next succeeds, so a transient fault self-heals in the reporting too.
+	maintenanceStalled atomic.Bool
+	// maintenanceStallReason carries the human-readable cause of maintenanceStalled.
+	// Guarded by its own mutex rather than an atomic.Value so an empty reason is cheap.
+	maintenanceStallMu     sync.Mutex
+	maintenanceStallReason string
+
 	// wg tracks the drainer so Close can wait for it to flush.
 	wg sync.WaitGroup
 
@@ -2012,6 +2033,46 @@ func bareTargetName(tt capability.TargetType, identifier string) string {
 // was full. Expose as a metric to detect sustained disk pressure.
 func (s *Sink) DroppedRecords() int64 {
 	return s.dropped.Load()
+}
+
+// markMaintenanceStalled records that rotation or retention could not make progress.
+// Called on every failed attempt; the reason is overwritten so the newest cause wins.
+func (s *Sink) markMaintenanceStalled(reason string) {
+	if s == nil {
+		return
+	}
+	s.maintenanceStalled.Store(true)
+	s.maintenanceStallMu.Lock()
+	s.maintenanceStallReason = reason
+	s.maintenanceStallMu.Unlock()
+}
+
+// clearMaintenanceStalled records that the stalled operation succeeded, so a transient
+// fault (a directory temporarily unreadable, a file briefly locked) stops being reported.
+func (s *Sink) clearMaintenanceStalled() {
+	if s == nil || !s.maintenanceStalled.Load() {
+		return
+	}
+	s.maintenanceStalled.Store(false)
+	s.maintenanceStallMu.Lock()
+	s.maintenanceStallReason = ""
+	s.maintenanceStallMu.Unlock()
+}
+
+// MaintenanceStalled reports whether size-triggered rotation or retention pruning has
+// stopped making progress, with the reason. Records are still being written and signed —
+// this is NOT an audit-integrity loss and deliberately does not feed the
+// --require-audit=strict gate (see AuditDegraded). It means the configured
+// rotateSizeBytes/retainRotated disk bound is currently not being enforced, so the log
+// will grow without limit until the underlying fault is fixed. Surfaced by /healthz,
+// /metrics, and doctor so an operator sees it before the filesystem fills.
+func (s *Sink) MaintenanceStalled() (stalled bool, reason string) {
+	if s == nil || !s.maintenanceStalled.Load() {
+		return false, ""
+	}
+	s.maintenanceStallMu.Lock()
+	defer s.maintenanceStallMu.Unlock()
+	return true, s.maintenanceStallReason
 }
 
 // WriteFailures returns the number of records that reached the drainer but could

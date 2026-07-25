@@ -135,9 +135,21 @@ func decodeStrictJSON(w http.ResponseWriter, r *http.Request, v interface{}, inv
 // command path, an internal IP:port, or TLS detail, so it is logged to stderr for the
 // operator and returned to the client as a generic 500. Extracted from handleMCPPost so
 // the session-creating initialize branch stays within the nested-complexity budget.
-func writeSessionCreateError(w http.ResponseWriter, err error) {
+//
+// errSessionLimit is additionally recorded on the tape. It is a saturation refusal exactly
+// like the per-session in-flight cap that recordResourceExhausted covers, but reachable
+// WITHOUT an established session, so it is the cheaper flood for an attacker and was the
+// one leaving no trace — an incident responder reconstructing an outage saw
+// RESOURCE_EXHAUSTED for in-flight floods and a blank for session-cap floods. The other
+// two legs are benign lifecycle races (a kill sweep, a graceful drain), not attack signal,
+// so they stay status-only.
+func (p *HTTPProxy) writeSessionCreateError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, errSessionLimit):
+		p.recordPreSessionDeny(r, codeResourceExhausted, "saturation", map[string]interface{}{
+			"source_ip": p.sourceIP(r),
+			"reason":    "session_limit_reached",
+		})
 		http.Error(w, "session limit reached", http.StatusServiceUnavailable)
 	case errors.Is(err, errRacedReap):
 		http.Error(w, "session raced a kill-switch reset; retry", http.StatusServiceUnavailable)
@@ -226,6 +238,13 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 		// starting an upstream. registerSession re-checks under the lock to make the
 		// cap authoritative against concurrent initializes.
 		if p.atSessionCap() {
+			// Recorded for the same reason as the errSessionLimit leg of
+			// writeSessionCreateError: this is the cheap pre-spawn twin of that refusal and
+			// the surface an unauthenticated saturation flood reaches first.
+			p.recordPreSessionDeny(r, codeResourceExhausted, "saturation", map[string]interface{}{
+				"source_ip": p.sourceIP(r),
+				"reason":    "session_limit_reached",
+			})
 			http.Error(w, "session limit reached", http.StatusServiceUnavailable)
 			return
 		}
@@ -255,7 +274,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 			sess, err = p.newSession(initCtx, route, clientIP)
 		}
 		if err != nil {
-			writeSessionCreateError(w, err)
+			p.writeSessionCreateError(w, r, err)
 			return
 		}
 		w.Header().Set(SessionHeader, sess.id)

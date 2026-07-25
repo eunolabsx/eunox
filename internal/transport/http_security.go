@@ -16,9 +16,77 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/eunolabs/eunox/pkg/capability"
 )
+
+// Pre-session denial records are the only audit writes an UNAUTHENTICATED caller can
+// trigger, so they are the only ones whose rate an attacker sets. They are bounded by a
+// token bucket rather than written one-per-refusal.
+//
+// Without a bound the refusal record is a lever on the proxy's own availability: the audit
+// queue is finite and its drop counter is monotonic, so one drop latches AuditDegraded()
+// for the process lifetime, and under the default --require-audit=strict every enforced
+// call on every route is then denied AUDIT_UNAVAILABLE. A remote attacker with no
+// credential could take the data plane down by spraying wrong bearer tokens. The flood also
+// buries genuine policy denials: at the default rotate size a few thousand records/second
+// cycles the retention window in minutes.
+//
+// The bucket keeps the evidence the record exists for — the first refusals in a burst are
+// written in full, and the next admitted record carries suppressed_count, so an operator
+// sees both that an attack happened and its scale — while capping the sustained write rate
+// at something the drainer absorbs. The counters are global rather than per-source on
+// purpose: per-source state is itself attacker-sized memory, and the suppressed count
+// already tells the operator how much was elided.
+const (
+	preSessionDenyRatePerSec = 20
+	preSessionDenyBurst      = 50
+)
+
+// preSessionDenyLimiter is a token bucket over pre-session denial records. The zero value
+// is not usable; construct with newPreSessionDenyLimiter.
+type preSessionDenyLimiter struct {
+	mu         sync.Mutex
+	tokens     float64
+	last       time.Time
+	suppressed uint64
+	now        func() time.Time // injectable for tests
+}
+
+func newPreSessionDenyLimiter() *preSessionDenyLimiter {
+	return &preSessionDenyLimiter{tokens: preSessionDenyBurst, now: time.Now}
+}
+
+// admit reports whether a refusal record may be written now, and if so how many records
+// were suppressed since the last admitted one (0 when none were). A suppressed refusal
+// still increments the counter, so nothing is lost silently — it is folded into the next
+// record that gets through.
+func (l *preSessionDenyLimiter) admit() (ok bool, suppressed uint64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	if l.last.IsZero() {
+		l.last = now
+	}
+	// Refill, clamped to the burst ceiling. A backwards clock step yields a non-positive
+	// elapsed and simply adds nothing, which is the safe direction.
+	if elapsed := now.Sub(l.last).Seconds(); elapsed > 0 {
+		l.last = now
+		l.tokens += elapsed * preSessionDenyRatePerSec
+		if l.tokens > preSessionDenyBurst {
+			l.tokens = preSessionDenyBurst
+		}
+	}
+	if l.tokens < 1 {
+		l.suppressed++
+		return false, 0
+	}
+	l.tokens--
+	suppressed, l.suppressed = l.suppressed, 0
+	return true, suppressed
+}
 
 // newAuthTimingKey returns a 32-byte per-process random key for the MAC folding in
 // constantTimeTokenEqual. crypto/rand failure is fatal: without an unpredictable key
@@ -86,6 +154,15 @@ func (p *HTTPProxy) checkAuth(w http.ResponseWriter, r *http.Request) bool {
 // closed) rather than reverting to no-auth.
 func (p *HTTPProxy) checkControlToken(w http.ResponseWriter, r *http.Request) bool {
 	if p.controlToken == "" {
+		// Record this refusal too. It is the same probe of the same emergency-stop endpoint
+		// as the wrong-token leg below, and the deployment that reaches it — one whose
+		// token was never configured or whose token-file write failed — is the one most
+		// worth probing, so leaving it as an HTTP status only meant an operator reviewing
+		// the tape saw no evidence the endpoint was ever touched.
+		p.recordPreSessionDeny(r, codeControlAuthFailed, "control", map[string]interface{}{
+			"source_ip": p.sourceIP(r),
+			"reason":    "control_token_unconfigured",
+		})
 		http.Error(w, "control endpoint not configured", http.StatusServiceUnavailable)
 		return false
 	}
@@ -195,10 +272,28 @@ func (p *HTTPProxy) checkOrigin(w http.ResponseWriter, r *http.Request) bool {
 // clearly-unverified detail for correlation, and only when present so a missing
 // header leaves no empty key. Centralizing the rule keeps every pre-session deny
 // path consistent — a new one cannot reintroduce the forgery by hand-rolling it.
+// maxClaimedSessionIDLen bounds the attacker-controlled header this stamps into a record.
+// A session id is a UUID; anything longer is not a real id, and without a bound a single
+// unauthenticated request could append most of a 1 MiB header (Go's default
+// MaxHeaderBytes) to the tape, turning the refusal record into a log-flooding primitive.
+const maxClaimedSessionIDLen = 200
+
 func addClaimedSessionID(details map[string]interface{}, r *http.Request) map[string]interface{} {
-	if claimed := r.Header.Get(SessionHeader); claimed != "" {
-		details["claimed_session_id"] = claimed
+	claimed := r.Header.Get(SessionHeader)
+	if claimed == "" {
+		return details
 	}
+	// Callers may pass nil when they have no extra context (recordResourceExhausted does),
+	// so allocate rather than assigning into a nil map and panicking inside an HTTP handler
+	// on a security-refusal path.
+	if details == nil {
+		details = make(map[string]interface{}, 1)
+	}
+	if len(claimed) > maxClaimedSessionIDLen {
+		claimed = claimed[:maxClaimedSessionIDLen]
+		details["claimed_session_id_truncated"] = true
+	}
+	details["claimed_session_id"] = claimed
 	return details
 }
 
@@ -212,9 +307,28 @@ func addClaimedSessionID(details map[string]interface{}, r *http.Request) map[st
 // only non-secret context (source_ip, origin, error_type) in extra. A nil sink skips the
 // record. Folding the four sites here keeps the empty-session_id rule from being
 // re-hand-rolled — and re-broken — at each new pre-session refusal path.
+// Writes are rate-limited (see preSessionDenyLimiter): these are the only audit records an
+// unauthenticated caller can trigger, so an unbounded one-per-refusal write lets a remote
+// attacker drive the audit queue into its monotonic drop counter and permanently trip
+// --require-audit=strict against every legitimate client. A suppressed refusal is folded
+// into the next admitted record's suppressed_count rather than vanishing.
 func (p *HTTPProxy) recordPreSessionDeny(r *http.Request, code, category string, extra map[string]interface{}) {
 	if p.sink == nil {
 		return
+	}
+	if p.preSessionDenies == nil { // defensive: a proxy built outside the constructor
+		p.sink.RecordDeny(r.Context(), "", "", "", code, category, addClaimedSessionID(extra, r), false)
+		return
+	}
+	ok, suppressed := p.preSessionDenies.admit()
+	if !ok {
+		return
+	}
+	if suppressed > 0 {
+		if extra == nil {
+			extra = make(map[string]interface{}, 1)
+		}
+		extra["suppressed_count"] = suppressed
 	}
 	p.sink.RecordDeny(r.Context(), "", "", "", code, category, addClaimedSessionID(extra, r), false)
 }
@@ -440,13 +554,28 @@ func (p *HTTPProxy) loopbackOnly(w http.ResponseWriter, r *http.Request) bool {
 	// proxy" and fail closed. This can only DENY (never admit) — an attacker who reaches a
 	// directly-exposed listener and injects a spurious X-Forwarded-For merely self-blocks
 	// these endpoints, so the failure mode is safe.
+	// Each refusal below is recorded. loopbackOnly is the FIRST gate on /control/kill,
+	// /healthz and /metrics — it runs before checkControlToken, which does record — so an
+	// OFF-HOST probe of the emergency stop was the one attack against the transport surface
+	// that left nothing on the tape, while the same-host caller who merely got the token
+	// wrong was fully logged. The more remote attacker must not be the invisible one.
 	if p.trustFwdFor && len(r.Header.Values("X-Forwarded-For")) > 0 {
+		p.recordPreSessionDeny(r, codeLoopbackRejected, "loopback", map[string]interface{}{
+			"source_ip": p.sourceIP(r),
+			"reason":    "forwarded_for_present",
+			"path":      r.URL.Path,
+		})
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return false
 	}
 	host, _, _ := net.SplitHostPort(r.RemoteAddr)
 	ip := net.ParseIP(host)
 	if ip == nil || !ip.IsLoopback() {
+		p.recordPreSessionDeny(r, codeLoopbackRejected, "loopback", map[string]interface{}{
+			"source_ip": p.sourceIP(r),
+			"reason":    "non_loopback_source",
+			"path":      r.URL.Path,
+		})
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return false
 	}
@@ -457,7 +586,12 @@ func (p *HTTPProxy) loopbackOnly(w http.ResponseWriter, r *http.Request) bool {
 	// uses localhost / 127.0.0.1 / ::1 / the non-wildcard bind host, all of which
 	// buildAllowedOriginHosts seeds.
 	reqHost := strings.ToLower(normalizeHost(r.Host))
-	if !p.hostAllowedForLoopbackEndpoint(reqHost) {
+	if !p.hostAllowedForLoopbackEndpoint(r.Host, reqHost) {
+		p.recordPreSessionDeny(r, codeLoopbackRejected, "loopback", map[string]interface{}{
+			"source_ip": p.sourceIP(r),
+			"reason":    "untrusted_host",
+			"path":      r.URL.Path,
+		})
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return false
 	}
@@ -480,15 +614,28 @@ func (p *HTTPProxy) loopbackOnly(w http.ResponseWriter, r *http.Request) bool {
 //     cannot be steered into sending a loopback LITERAL as the Host of a rebound page:
 //     fetching the literal directly is cross-origin, so it carries an Origin and
 //     requireValidOrigin (which wraps every route) rejects it first.
-//   - An absent Host. HTTP/1.1 requires the header and every browser sends it, so an
-//     empty value is a non-browser local caller (an HTTP/1.0 liveness probe, a
+//   - A genuinely ABSENT Host. HTTP/1.1 requires the header and every browser sends it, so
+//     no value at all is a non-browser local caller (an HTTP/1.0 liveness probe, a
 //     hand-rolled client) and cannot be a rebind.
+//
+// The absent-Host allowance keys off rawHost — the header as received — NOT off the
+// normalized value. normalizeHost reduces a PRESENT but host-less value to the empty
+// string: net.SplitHostPort succeeds on ":8080" and returns host "", and "[]" reduces the
+// same way. Gating on the normalized value therefore admitted `Host: :8080`, which is a
+// header that was sent, so the "no value means non-browser caller" reasoning does not hold
+// for it and the whole rebinding pin was skippable by any caller able to set a raw Host
+// line.
 //
 // The source-IP loopback check remains the primary gate; this is the rebinding layer on
 // top of it.
-func (p *HTTPProxy) hostAllowedForLoopbackEndpoint(reqHost string) bool {
-	if reqHost == "" {
+func (p *HTTPProxy) hostAllowedForLoopbackEndpoint(rawHost, reqHost string) bool {
+	if rawHost == "" {
 		return true
+	}
+	if reqHost == "" {
+		// Present but carrying no host part (":8080", "[]"): not a name we can trust, and
+		// not the absent-header case. Fail closed.
+		return false
 	}
 	if p.allowedOriginHosts[reqHost] {
 		return true

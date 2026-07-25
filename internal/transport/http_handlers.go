@@ -89,6 +89,12 @@ const (
 	// check failed (FM-5 descriptionHash rug-pull / strict-drift refusal) — the security
 	// event this feature exists to catch, otherwise invisible to the audit trail.
 	codeDriftRefused = "DRIFT_REFUSED"
+	// codeLoopbackRejected marks a request refused by the loopback-only gate fronting
+	// /control/kill, /healthz and /metrics: an off-host source, a DNS-rebinding Host, or
+	// an X-Forwarded-For arriving under --trust-forwarded-for. That gate runs BEFORE
+	// checkControlToken, so without its own code an off-host probe of the emergency stop
+	// left no trace while the same-host wrong-token caller was fully recorded.
+	codeLoopbackRejected = "LOOPBACK_REJECTED"
 )
 
 // JSON-RPC 2.0 error codes used for callUpstream-error responses.
@@ -119,11 +125,12 @@ func IsInfraDenialCode(code string) bool {
 		// suggest fabricate a deny-only allowlist suggestion for a target that policy never
 		// actually denied.
 		return true
-	case codeAuthFailed, codeControlAuthFailed, codeResourceExhausted, codeDriftRefused:
+	case codeAuthFailed, codeControlAuthFailed, codeResourceExhausted, codeDriftRefused, codeLoopbackRejected:
 		// Non-policy refusals recorded before/independent of a PDP decision: a failed
-		// transport-auth credential, a saturated handler pool, or a startup drift refusal.
-		// None names a policy target, so mining them would fabricate a phantom-target
-		// suggestion; suggest must skip them like the other infra denials.
+		// transport-auth credential, a saturated handler pool, a startup drift refusal, or
+		// a loopback/rebinding gate rejection. None names a policy target, so mining them
+		// would fabricate a phantom-target suggestion; suggest must skip them like the
+		// other infra denials.
 		return true
 	}
 	return false

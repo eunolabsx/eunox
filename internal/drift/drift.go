@@ -936,6 +936,30 @@ func ParseToolsListResult(raw json.RawMessage) ([]UpstreamTool, error) {
 	if raw == nil {
 		return nil, nil
 	}
+	// Reject an entry whose bytes are ambiguous BEFORE decoding them into the struct the
+	// descriptionHash is computed over. A plain Unmarshal binds object keys to fields by a
+	// case-folding match and keeps the LAST, so an upstream serving both "description" and
+	// "deſcription" (U+017F — already lower case, so a ToLower-based check misses it)
+	// hashes CLEAN against the pin while a case-sensitive host renders the injected value:
+	// the FM-5 startup refusal this whole comparison exists to trigger never fires. The
+	// runtime list filter applies the same gate per entry; sharing pdp.EntryKeysAmbiguous
+	// keeps the two layers from drifting apart on what "believable" means.
+	//
+	// Surfacing it as a parse error routes it through driftProbeUnavailable, which is
+	// exactly the right policy: fatal when the manifest carries descriptionHash pins
+	// (integrity cannot be verified), an observable skip otherwise.
+	var envelope struct {
+		Tools []json.RawMessage `json:"tools"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return nil, fmt.Errorf("parsing tools/list result: %w", err)
+	}
+	for i, entry := range envelope.Tools {
+		if pdp.EntryKeysAmbiguous(entry) {
+			return nil, fmt.Errorf("tools/list entry %d carries duplicate or case-variant keys, so its description cannot be verified against a descriptionHash pin", i)
+		}
+	}
+
 	var result mcp.ToolsListResult
 	if err := json.Unmarshal(raw, &result); err != nil {
 		return nil, fmt.Errorf("parsing tools/list result: %w", err)

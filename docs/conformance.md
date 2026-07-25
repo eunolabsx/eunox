@@ -396,11 +396,29 @@ tamper-evident tape):
   `--require-audit=strict`-gated, and audited: an allow record on delivery to a
   client, or an `ENFORCEMENT_ERROR` deny if no client received it. The host's
   response is routed back to the upstream so the request completes.
+- **Transport-surface refusals** — requests turned away before (or independently
+  of) a PDP decision: a rejected `Origin` (`ORIGIN_REJECTED`), an invalid bearer
+  or control token (`AUTH_FAILED` / `CONTROL_AUTH_FAILED`), a rejected loopback
+  or DNS-rebinding `Host` on `/control/kill`, `/healthz`, `/metrics`
+  (`LOOPBACK_REJECTED`), a saturated handler pool or an exhausted concurrent
+  **session** cap (`RESOURCE_EXHAUSTED`), and a startup drift refusal
+  (`DRIFT_REFUSED`). None names a policy target, so `suggest` skips them all.
+
+  These are the only records an *unauthenticated* caller can cause, so their
+  write rate is bounded by a token bucket: within a burst each refusal is
+  recorded in full, and beyond it the next record that gets through carries a
+  `suppressed_count` of the refusals elided since. Without that bound a
+  credential-spray could overflow the audit queue, and because the sink's drop
+  counter is monotonic, that would leave `--require-audit=strict` denying every
+  legitimate request for the rest of the process's life. A non-zero
+  `suppressed_count` on one of these codes therefore means a flood, not a lost
+  decision record — no *policy* decision is ever rate-limited.
 
 The only locally-answered path with no audit record is the `initialize`
-handshake, which is not a guarded action. The `*/list` and upstream-initiated
-paths complete successfully (or pass through) but are still recorded, so absence
-of a record is not evidence that a guarded action was allowed.
+handshake, which is not a guarded action. Every other locally-answered path —
+`*/list`, upstream-initiated requests, and every transport-surface refusal —
+either completes and is recorded or is refused and is recorded, so absence of a
+record is not evidence that a guarded action was allowed.
 
 Beyond those by-design paths, records can also be lost unintentionally, in two
 ways:

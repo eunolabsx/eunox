@@ -182,7 +182,11 @@ type HTTPProxy struct {
 	// tokens to a fixed-length MAC before the constant-time comparison in checkAuth /
 	// checkControlToken. See constantTimeTokenEqual for the timing rationale.
 	authTimingKey []byte
-	trustFwdFor   bool
+	// preSessionDenies bounds the rate of transport-level refusal records. Those are the
+	// only audit writes an unauthenticated caller can trigger, so without a bound they are
+	// a lever on --require-audit=strict; see preSessionDenyLimiter.
+	preSessionDenies *preSessionDenyLimiter
+	trustFwdFor      bool
 	// trustedProxyNets is the compiled listen.trustedProxyCIDRs allowlist: under
 	// trustFwdFor, the immediate TCP peer (RemoteAddr) must match one of these
 	// networks before X-Forwarded-For is honored — see sourceIP. Empty means no peer
@@ -333,6 +337,7 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 		authToken:          opts.AuthToken,
 		controlToken:       opts.ControlToken,
 		authTimingKey:      newAuthTimingKey(),
+		preSessionDenies:   newPreSessionDenyLimiter(),
 		trustFwdFor:        opts.TrustFwdFor,
 		trustedProxyNets:   trustedProxyNets,
 		trustedProxyHops:   opts.TrustedProxyHops,
