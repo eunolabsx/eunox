@@ -20,7 +20,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -932,186 +931,111 @@ func signAuditLine(t *testing.T, key []byte, rec auditRecord) []byte {
 	return line
 }
 
-// TestVerifyAuditLog_PostWrapSeq0_NotForged is the regression: after the
-// uint64 sequence counter wraps (2^64 records), the next legitimately signed
-// record carries seq 0 with a valid HMAC. Because such a record can only follow a
-// seq == math.MaxUint64 record, verifyAuditLog must treat it as legitimate rather
-// than as a forged seq-0 decoy, and the chain must verify cleanly.
-func TestVerifyAuditLog_PostWrapSeq0_NotForged(t *testing.T) {
-	dir := t.TempDir()
-	keyPath := dir + "/audit.key"
-	key, err := loadOrCreateAuditKey(keyPath)
-	if err != nil {
-		t.Fatalf("loadOrCreateAuditKey: %v", err)
+// TestVerifyAuditLog_Seq0WithHMACIsAlwaysForged pins the decoy rule: a record
+// carrying seq 0 AND a non-empty _hmac is a shape the writer cannot produce — legacy
+// records carry no _hmac, and a signed chain starts at seq 1 — so it is rejected
+// wherever it appears in the stream, and kept out of the chain state so its seq 0
+// cannot suppress the following record's SEQ GAP diagnostic.
+//
+// The rejection is unconditional. It used to carve out two exemptions for a uint64
+// counter wrap past 2^64 records: the record following a seq-MaxUint64 predecessor,
+// and a head record (which has no predecessor to establish the wrap, as a
+// wrap-then-rotate would leave). That state is unreachable — ~584,000 years at 10^6
+// records/sec, and a resume that cannot trust the tail reseeds the counter rather
+// than carrying it across a restart — while the exemptions were two positions an
+// attacker could place a decoy in to skip the check entirely. Each case below is a
+// placement those exemptions admitted; the last one also pins that a decoy whose
+// HMAC does not even verify is still caught.
+func TestVerifyAuditLog_Seq0WithHMACIsAlwaysForged(t *testing.T) {
+	tests := []struct {
+		name      string
+		build     func(t *testing.T, key []byte) [][]byte
+		wantValid int
+	}{
+		{
+			// A genuinely-signed seq-0 record at the HEAD of a file: the shape a
+			// wrap-then-rotate would have left, and the shape an attacker gets for free
+			// by placing their decoy first.
+			"head of the stream",
+			func(t *testing.T, key []byte) [][]byte {
+				rec := auditRecord{Time: "2026-06-15T10:00:01Z", Seq: 0, RequestID: "r-head", SessionID: "s", Decision: "allow", PrevHMAC: "sha256:deadbeef"}
+				return [][]byte{signAuditLine(t, key, rec)}
+			},
+			0,
+		},
+		{
+			// Following a record that claims seq MaxUint64 — the "post-wrap" position.
+			// The predecessor is genuinely signed and verifies; only the seq-0 successor
+			// is rejected.
+			"after a seq-MaxUint64 predecessor",
+			func(t *testing.T, key []byte) [][]byte {
+				rec1 := auditRecord{Time: "2026-06-15T10:00:00Z", Seq: math.MaxUint64, RequestID: "r-max", SessionID: "s", Decision: "allow", PrevHMAC: auditGenesisPrev}
+				line1 := signAuditLine(t, key, rec1)
+				var signed1 auditRecord
+				if err := json.Unmarshal(line1, &signed1); err != nil {
+					t.Fatalf("unmarshal signed rec1: %v", err)
+				}
+				rec2 := auditRecord{Time: "2026-06-15T10:00:01Z", Seq: 0, RequestID: "r-wrap", SessionID: "s", Decision: "allow", PrevHMAC: signed1.HMAC}
+				return [][]byte{line1, signAuditLine(t, key, rec2)}
+			},
+			1,
+		},
+		{
+			// A head decoy carrying an attacker-chosen _hmac never produced by the
+			// signing key: caught as a structural decoy here, and independently by the
+			// per-record HMAC check.
+			"head of the stream with a forged HMAC",
+			func(t *testing.T, _ []byte) [][]byte {
+				forged := auditRecord{
+					Time: "2026-06-15T10:00:01Z", Seq: 0, RequestID: "r-forged", SessionID: "s", Decision: "allow",
+					PrevHMAC: "sha256:deadbeef",
+					HMAC:     "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+				}
+				body, err := json.Marshal(auditRecord{
+					Time: forged.Time, Seq: forged.Seq, RequestID: forged.RequestID, SessionID: forged.SessionID,
+					Decision: forged.Decision, PrevHMAC: forged.PrevHMAC,
+				})
+				if err != nil {
+					t.Fatalf("marshal forged record: %v", err)
+				}
+				line, err := signedRecordLine(body, forged.HMAC)
+				if err != nil {
+					t.Fatalf("splice forged record: %v", err)
+				}
+				return [][]byte{line}
+			},
+			0,
+		},
 	}
 
-	// rec1: the record immediately before the wrap, seq == MaxUint64.
-	rec1 := auditRecord{
-		Time:      "2026-06-15T10:00:00Z",
-		Seq:       math.MaxUint64,
-		RequestID: "r-max",
-		SessionID: "s",
-		Decision:  "allow",
-		PrevHMAC:  auditGenesisPrev,
-	}
-	line1 := signAuditLine(t, key, rec1)
-	var signed1 auditRecord
-	if err := json.Unmarshal(line1, &signed1); err != nil {
-		t.Fatalf("unmarshal signed rec1: %v", err)
-	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			keyPath := dir + "/audit.key"
+			key, err := loadOrCreateAuditKey(keyPath)
+			if err != nil {
+				t.Fatalf("loadOrCreateAuditKey: %v", err)
+			}
 
-	// rec2: the wrapped record, seq 0, chained to rec1.
-	rec2 := auditRecord{
-		Time:      "2026-06-15T10:00:01Z",
-		Seq:       0,
-		RequestID: "r-wrap",
-		SessionID: "s",
-		Decision:  "allow",
-		PrevHMAC:  signed1.HMAC,
-	}
-	line2 := signAuditLine(t, key, rec2)
-
-	res := verifyBytes(t, [][]byte{line1, line2}, verifierFor(t, keyPath))
-	if !res.OK() {
-		t.Fatalf("a post-wrap seq-0 record (following seq MaxUint64) must verify cleanly: %+v", res)
-	}
-	if res.Invalid != 0 {
-		t.Fatalf("post-wrap seq-0 record must not be flagged forged/invalid: %+v", res)
-	}
-	if res.Valid != 2 || res.ChainBreaks != 0 {
-		t.Fatalf("expected 2 valid records, no chain breaks: %+v", res)
-	}
-}
-
-// TestVerifyAuditLog_SeqGapAfterWrap_StillReported is the regression: the
-// SEQ GAP check was gated on prevSeq > 0, but after the counter wraps the record
-// following the wrapped seq-0 record has prevSeq == 0, so a missing/renumbered
-// record right after the wrap escaped the SEQ GAP diagnostic. Gating on signedSeen
-// instead keeps the check live across the wrap. Here a record chains correctly to
-// the wrapped seq-0 record (no CHAIN BREAK) but carries seq 2, skipping seq 1 — the
-// gap must be reported.
-func TestVerifyAuditLog_SeqGapAfterWrap_StillReported(t *testing.T) {
-	dir := t.TempDir()
-	keyPath := dir + "/audit.key"
-	key, err := loadOrCreateAuditKey(keyPath)
-	if err != nil {
-		t.Fatalf("loadOrCreateAuditKey: %v", err)
-	}
-
-	// rec1: pre-wrap record at seq MaxUint64.
-	rec1 := auditRecord{Time: "2026-06-15T10:00:00Z", Seq: math.MaxUint64, RequestID: "r-max", SessionID: "s", Decision: "allow", PrevHMAC: auditGenesisPrev}
-	line1 := signAuditLine(t, key, rec1)
-	var signed1 auditRecord
-	if err := json.Unmarshal(line1, &signed1); err != nil {
-		t.Fatalf("unmarshal rec1: %v", err)
-	}
-
-	// rec2: the wrapped record, seq 0, chained to rec1.
-	rec2 := auditRecord{Time: "2026-06-15T10:00:01Z", Seq: 0, RequestID: "r-wrap", SessionID: "s", Decision: "allow", PrevHMAC: signed1.HMAC}
-	line2 := signAuditLine(t, key, rec2)
-	var signed2 auditRecord
-	if err := json.Unmarshal(line2, &signed2); err != nil {
-		t.Fatalf("unmarshal rec2: %v", err)
-	}
-
-	// rec3: chains correctly to rec2 (no CHAIN BREAK) but carries seq 2 instead of
-	// the contiguous seq 1 — i.e. seq 1 was removed/renumbered right after the wrap.
-	rec3 := auditRecord{Time: "2026-06-15T10:00:02Z", Seq: 2, RequestID: "r-gap", SessionID: "s", Decision: "allow", PrevHMAC: signed2.HMAC}
-	line3 := signAuditLine(t, key, rec3)
-
-	var sb strings.Builder
-	res, err := VerifyLog(bytes.NewReader(bytes.Join([][]byte{line1, line2, line3}, []byte("\n"))),
-		verifierFor(t, keyPath), "", time.Time{}, &sb)
-	if err != nil {
-		t.Fatalf("verifyAuditLog: %v", err)
-	}
-	if !strings.Contains(sb.String(), "SEQ GAP") {
-		t.Fatalf("a seq gap immediately after the wrap must still be reported; output:\n%s", sb.String())
-	}
-	if res.ChainBreaks == 0 {
-		t.Fatalf("the seq gap must count toward chainBreaks: %+v", res)
-	}
-}
-
-// TestVerifyAuditLog_FirstRecordSeq0_LegitChainStart covers the case: a genuinely
-// signed seq-0 record at the HEAD of a (rotated) file — the legitimate chain start
-// after the counter wrapped past math.MaxUint64 and the log then rotated — must NOT
-// be flagged as a forged seq-0 decoy when verified single-file (no --prev). With no
-// in-stream predecessor the wrap context cannot be reconstructed, but the record is
-// a real chain start and its own HMAC verifies, so it must pass.
-func TestVerifyAuditLog_FirstRecordSeq0_LegitChainStart(t *testing.T) {
-	dir := t.TempDir()
-	keyPath := dir + "/audit.key"
-	key, err := loadOrCreateAuditKey(keyPath)
-	if err != nil {
-		t.Fatalf("loadOrCreateAuditKey: %v", err)
-	}
-
-	// A genuinely-signed seq-0 record presented as the first and only record of the
-	// stream.
-	rec := auditRecord{
-		Time:      "2026-06-15T10:00:01Z",
-		Seq:       0,
-		RequestID: "r-wrap",
-		SessionID: "s",
-		Decision:  "allow",
-		PrevHMAC:  "sha256:deadbeef",
-	}
-	line := signAuditLine(t, key, rec)
-
-	var sb strings.Builder
-	res, err := VerifyLog(bytes.NewReader(line), verifierFor(t, keyPath), "", time.Time{}, &sb)
-	if err != nil {
-		t.Fatalf("verifyAuditLog: %v", err)
-	}
-	if !res.OK() {
-		t.Fatalf("a genuinely-signed seq-0 head record must verify cleanly: %+v\noutput:\n%s", res, sb.String())
-	}
-	if res.Invalid != 0 {
-		t.Fatalf("the legitimate seq-0 head record must not be flagged invalid: %+v", res)
-	}
-	if res.Valid != 1 {
-		t.Fatalf("expected the seq-0 head record to count as valid: %+v", res)
-	}
-}
-
-// TestVerifyAuditLog_FirstRecordSeq0_ForgedBadHMAC guards the other side of the
-// change: not flagging a seq-0 head record as a structural decoy must NOT mean
-// accepting an unsigned/forged one. A seq-0 head record whose HMAC does not verify
-// is still caught by the unconditional per-record HMAC check and counted invalid.
-func TestVerifyAuditLog_FirstRecordSeq0_ForgedBadHMAC(t *testing.T) {
-	dir := t.TempDir()
-	keyPath := dir + "/audit.key"
-	if _, err := loadOrCreateAuditKey(keyPath); err != nil {
-		t.Fatalf("loadOrCreateAuditKey: %v", err)
-	}
-
-	// A seq-0 head record carrying an attacker-chosen _hmac that was NOT produced by
-	// the signing key.
-	forged := auditRecord{
-		Time:      "2026-06-15T10:00:01Z",
-		Seq:       0,
-		RequestID: "r-forged",
-		SessionID: "s",
-		Decision:  "allow",
-		PrevHMAC:  "sha256:deadbeef",
-		HMAC:      "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-	}
-	line, err := json.Marshal(forged)
-	if err != nil {
-		t.Fatalf("marshal forged record: %v", err)
-	}
-
-	var sb strings.Builder
-	res, err := VerifyLog(bytes.NewReader(line), verifierFor(t, keyPath), "", time.Time{}, &sb)
-	if err != nil {
-		t.Fatalf("verifyAuditLog: %v", err)
-	}
-	if res.OK() {
-		t.Fatalf("a forged seq-0 head record with a bad HMAC must still fail: %+v", res)
-	}
-	if res.Invalid != 1 {
-		t.Fatalf("the forged seq-0 head record must be counted invalid: %+v", res)
+			var sb strings.Builder
+			res, err := VerifyLog(bytes.NewReader(bytes.Join(tc.build(t, key), []byte("\n"))),
+				verifierFor(t, keyPath), "", time.Time{}, &sb)
+			if err != nil {
+				t.Fatalf("VerifyLog: %v", err)
+			}
+			if res.OK() {
+				t.Fatalf("a seq-0 record with a non-empty HMAC must fail the verdict: %+v\noutput:\n%s", res, sb.String())
+			}
+			if res.Invalid != 1 {
+				t.Fatalf("expected exactly the seq-0 record counted invalid: %+v\noutput:\n%s", res, sb.String())
+			}
+			if res.Valid != tc.wantValid {
+				t.Fatalf("Valid = %d, want %d: %+v", res.Valid, tc.wantValid, res)
+			}
+			if !strings.Contains(sb.String(), "forged seq-0 decoy") {
+				t.Fatalf("expected the forged-seq-0-decoy diagnostic; output:\n%s", sb.String())
+			}
+		})
 	}
 }
 
@@ -1833,13 +1757,12 @@ func TestSessionID_OmittedWhenEmpty(t *testing.T) {
 	}
 }
 
-// TestVerifyRejectsDuplicateTopLevelKeyTamper: a signed record rewritten on disk
-// with a duplicate top-level key (last-wins agrees with the signed value, so the
-// recomputed HMAC still matches) must be rejected. Otherwise an attacker with
-// file-write access but no key could prepend {"decision":"allow", to a signed
-// "decision":"deny" record: the HMAC verifies (it certifies the re-marshaled
-// struct, not the raw bytes) while any first-wins JSON consumer reads "allow".
-func TestVerifyRejectsDuplicateTopLevelKeyTamper(t *testing.T) {
+// nonCanonicalFixture writes one signed deny record carrying a details subtree (so
+// a vector can target nested bytes too) and returns that record's on-disk line plus
+// a verifier holding its key. The record is asserted to verify untampered, so any
+// failure a vector produces is the vector's doing.
+func nonCanonicalFixture(t *testing.T) (orig []byte, verifier *Sink) {
+	t.Helper()
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "audit.jsonl")
 	keyPath := filepath.Join(dir, "audit.key")
@@ -1848,251 +1771,148 @@ func TestVerifyRejectsDuplicateTopLevelKeyTamper(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	sink.RecordDeny(context.Background(), "sess-1", "tool:rm_rf", "tools/call", "AUTHORIZATION_FAILED", "", nil, false)
+	sink.RecordDeny(context.Background(), "sess-1", "tool:rm_rf", "tools/call", "AUTHORIZATION_FAILED", "", map[string]interface{}{"arg": "value"}, false)
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
 	lines := logLines(t, logPath)
-	idx := len(lines) - 1
-	orig := lines[idx]
+	orig = lines[len(lines)-1]
 	if !bytes.Contains(orig, []byte(`"decision":"deny"`)) {
 		t.Fatalf("expected a deny record, got: %s", orig)
 	}
-
-	// Sanity: the untampered record verifies.
-	verifier := verifierFor(t, keyPath)
-	if ok, verr := verifier.VerifyRecord(orig); !ok || verr != nil {
-		t.Fatalf("untampered record must verify: ok=%v err=%v", ok, verr)
-	}
-
-	// Prepend a duplicate "decision":"allow" key. Last-wins decode still yields
-	// "deny", so the HMAC would match — verification must reject the duplicate.
-	tampered := append([]byte(`{"decision":"allow",`), orig[1:]...)
-	ok, verr := verifier.VerifyRecord(tampered)
-	if ok || verr == nil {
-		t.Fatalf("duplicate-top-level-key tamper must fail closed, got ok=%v err=%v", ok, verr)
-	}
-	if !strings.Contains(verr.Error(), "duplicate top-level key") {
-		t.Fatalf("expected a duplicate-key error, got: %v", verr)
-	}
-
-	// And the whole-log verdict must fail, not pass.
-	lines[idx] = tampered
-	out := append(bytes.Join(lines, []byte("\n")), '\n')
-	res, _ := VerifyLog(bytes.NewReader(out), verifier, "", time.Time{}, io.Discard)
-	if res.OK() {
-		t.Fatalf("VerifyLog must not pass a log with a duplicate-key-tampered record: %+v", res)
-	}
-}
-
-// TestVerifyRejectsCaseVariantDuplicateKeyTamper pins the case-variant vector: a
-// prepended "Decision":"allow" is a *different* raw string from the signed
-// "decision":"deny", so an exact-string duplicate check misses it — but
-// encoding/json binds both to the single Decision field (last-wins keeps "deny"),
-// so the HMAC still matches while a case-insensitive/first-wins consumer reads
-// "allow". The guard rejects any key whose spelling doesn't byte-exactly match
-// its canonical field tag, so the non-canonical "Decision" key is caught before
-// the duplicate check ever runs, failing closed like the exact-duplicate form.
-func TestVerifyRejectsCaseVariantDuplicateKeyTamper(t *testing.T) {
-	dir := t.TempDir()
-	logPath := filepath.Join(dir, "audit.jsonl")
-	keyPath := filepath.Join(dir, "audit.key")
-
-	sink, err := Open(logPath, keyPath, 0, 0)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	sink.RecordDeny(context.Background(), "sess-1", "tool:rm_rf", "tools/call", "AUTHORIZATION_FAILED", "", nil, false)
-	if err := sink.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-
-	lines := logLines(t, logPath)
-	idx := len(lines) - 1
-	orig := lines[idx]
-	if !bytes.Contains(orig, []byte(`"decision":"deny"`)) {
-		t.Fatalf("expected a deny record, got: %s", orig)
-	}
-
-	verifier := verifierFor(t, keyPath)
-	if ok, verr := verifier.VerifyRecord(orig); !ok || verr != nil {
-		t.Fatalf("untampered record must verify: ok=%v err=%v", ok, verr)
-	}
-
-	// Prepend a CASE-VARIANT of "decision". Last-wins decode still yields "deny"
-	// (both keys bind to the Decision field), so the HMAC would match.
-	tampered := append([]byte(`{"Decision":"allow",`), orig[1:]...)
-	ok, verr := verifier.VerifyRecord(tampered)
-	if ok || verr == nil {
-		t.Fatalf("case-variant duplicate-key tamper must fail closed, got ok=%v err=%v", ok, verr)
-	}
-	if !strings.Contains(verr.Error(), "canonical field spelling") {
-		t.Fatalf("expected a non-canonical-spelling error, got: %v", verr)
-	}
-
-	lines[idx] = tampered
-	out := append(bytes.Join(lines, []byte("\n")), '\n')
-	res, _ := VerifyLog(bytes.NewReader(out), verifier, "", time.Time{}, io.Discard)
-	if res.OK() {
-		t.Fatalf("VerifyLog must not pass a log with a case-variant-tampered record: %+v", res)
-	}
-}
-
-// TestVerifyRejectsLoneCaseRenamedKeyTamper is the regression for the gap the
-// duplicate-key guard alone did not cover: a SINGLE case-renamed key with no
-// colliding sibling. Rewriting "decision" to "DECISION" (with no second
-// "decision" key present) produces no collision for a duplicate check to catch,
-// yet encoding/json still binds it to the Decision field (case-insensitively,
-// even under DisallowUnknownFields) and re-marshaling re-canonicalizes it to
-// lowercase, so the recomputed HMAC still matches. A case-sensitive downstream
-// consumer (jq '.decision', a SIEM regex on "decision":"deny") silently stops
-// matching the record while eunox certifies it as untampered. This must fail
-// closed like the duplicate-key vectors.
-func TestVerifyRejectsLoneCaseRenamedKeyTamper(t *testing.T) {
-	dir := t.TempDir()
-	logPath := filepath.Join(dir, "audit.jsonl")
-	keyPath := filepath.Join(dir, "audit.key")
-
-	sink, err := Open(logPath, keyPath, 0, 0)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	sink.RecordDeny(context.Background(), "sess-1", "tool:rm_rf", "tools/call", "AUTHORIZATION_FAILED", "", nil, false)
-	if err := sink.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-
-	lines := logLines(t, logPath)
-	idx := len(lines) - 1
-	orig := lines[idx]
-	if !bytes.Contains(orig, []byte(`"decision":"deny"`)) {
-		t.Fatalf("expected a deny record, got: %s", orig)
-	}
-
-	verifier := verifierFor(t, keyPath)
-	if ok, verr := verifier.VerifyRecord(orig); !ok || verr != nil {
-		t.Fatalf("untampered record must verify: ok=%v err=%v", ok, verr)
-	}
-
-	// Respell ONLY the "decision" key's case — no duplicate, no collision.
-	tampered := bytes.Replace(orig, []byte(`"decision":"deny"`), []byte(`"DECISION":"deny"`), 1)
-	if bytes.Equal(tampered, orig) {
-		t.Fatal("test setup failed to rewrite the decision key")
-	}
-	ok, verr := verifier.VerifyRecord(tampered)
-	if ok || verr == nil {
-		t.Fatalf("lone case-renamed-key tamper must fail closed, got ok=%v err=%v", ok, verr)
-	}
-	if !strings.Contains(verr.Error(), "canonical field spelling") {
-		t.Fatalf("expected a non-canonical-spelling error, got: %v", verr)
-	}
-
-	lines[idx] = tampered
-	out := append(bytes.Join(lines, []byte("\n")), '\n')
-	res, _ := VerifyLog(bytes.NewReader(out), verifier, "", time.Time{}, io.Discard)
-	if res.OK() {
-		t.Fatalf("VerifyLog must not pass a log with a lone case-renamed-key-tampered record: %+v", res)
-	}
-}
-
-// TestIsEncodingJSONEmptyValue_CoversAllOmitemptyDroppedKinds guards against the
-// fail-open corner in the zero-value tamper check: isEncodingJSONEmptyValue must
-// recognize a zero value of EVERY kind that encoding/json's omitempty drops (not
-// just the string/bool/slice kinds auditRecord uses today), because
-// auditRecordTagSchema includes every omitempty field regardless of kind. A kind
-// that omitempty drops but this predicate failed to call empty would let an
-// attacker splice a zero-valued field of that kind into a signed record after
-// signing and still verify clean — reopening the byte-malleability gap for any
-// future numeric/pointer/interface omitempty field.
-func TestIsEncodingJSONEmptyValue_CoversAllOmitemptyDroppedKinds(t *testing.T) {
-	t.Parallel()
-
-	var nilPtr *int
-	// Every value here is one encoding/json's omitempty drops, so its on-disk
-	// presence in a signed record is a tamper signal that must be recognized.
-	empties := []interface{}{
-		"",                         // string
-		false,                      // bool
-		[]string(nil),              // nil slice
-		[]string{},                 // non-nil empty slice
-		map[string]int{},           // empty map
-		int(0), int64(0), int32(0), // signed
-		uint(0), uint64(0), // unsigned
-		float64(0), float32(0), // float
-		nilPtr, // nil pointer
-	}
-	for _, e := range empties {
-		if !isEncodingJSONEmptyValue(reflect.ValueOf(e)) {
-			t.Errorf("isEncodingJSONEmptyValue(%#v of kind %s) = false, want true (omitempty drops it, so its on-disk presence is a tamper signal)", e, reflect.ValueOf(e).Kind())
-		}
-	}
-
-	three := 3
-	nonEmpties := []interface{}{"x", true, []string{"a"}, map[string]int{"a": 1}, int(1), uint(1), float64(0.5), &three}
-	for _, e := range nonEmpties {
-		if isEncodingJSONEmptyValue(reflect.ValueOf(e)) {
-			t.Errorf("isEncodingJSONEmptyValue(%#v) = true, want false", e)
-		}
-	}
-}
-
-// TestVerifyRejectsForeignZeroValueOmitemptyFieldTamper is the sign-and-verify
-// round-trip regression for the byte-malleability fix: writeRecord's omitempty
-// NEVER emits a zero-valued field (it omits the key entirely instead — see
-// auditRecord's json tags), so a record on disk carrying, say, "agent_id":""
-// could only have gotten there by an attacker appending it AFTER signing. Because
-// VerifyRecord recomputes the HMAC over a re-marshal (which drops a zero-valued
-// omitempty field again via the same omitempty tag), the appended field is
-// invisible to the HMAC check and would otherwise verify — the exact class of
-// tamper rejectDuplicateTopLevelKeys' zero-value check exists to catch.
-func TestVerifyRejectsForeignZeroValueOmitemptyFieldTamper(t *testing.T) {
-	dir := t.TempDir()
-	logPath := filepath.Join(dir, "audit.jsonl")
-	keyPath := filepath.Join(dir, "audit.key")
-
-	sink, err := Open(logPath, keyPath, 0, 0)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	// No JWT claims are wired in this test, so the record legitimately omits
-	// agent_id entirely (omitempty drops the zero Go string value).
-	sink.RecordDeny(context.Background(), "sess-1", "tool:rm_rf", "tools/call", "AUTHORIZATION_FAILED", "", nil, false)
-	if err := sink.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-
-	lines := logLines(t, logPath)
-	idx := len(lines) - 1
-	orig := lines[idx]
+	// No JWT claims are wired here, so omitempty drops agent_id entirely — which is
+	// what makes it available as a foreign zero-valued field to splice in below.
 	if bytes.Contains(orig, []byte(`"agent_id"`)) {
-		t.Fatalf("test fixture must not already carry agent_id: %s", orig)
+		t.Fatalf("fixture must not already carry agent_id: %s", orig)
 	}
-
-	verifier := verifierFor(t, keyPath)
+	verifier = verifierFor(t, keyPath)
 	if ok, verr := verifier.VerifyRecord(orig); !ok || verr != nil {
 		t.Fatalf("untampered record must verify: ok=%v err=%v", ok, verr)
 	}
+	return orig, verifier
+}
 
-	// Splice in a foreign zero-valued omitempty field right after the opening
-	// brace — no duplicate key, byte-exact canonical spelling, HMAC untouched.
-	tampered := bytes.Replace(orig, []byte(`{"class_uid"`), []byte(`{"agent_id":"","class_uid"`), 1)
-	if bytes.Equal(tampered, orig) {
-		t.Fatal("test setup failed to splice in the foreign field")
-	}
-	ok, verr := verifier.VerifyRecord(tampered)
-	if ok || verr == nil {
-		t.Fatalf("a foreign zero-valued omitempty field must fail closed, got ok=%v err=%v", ok, verr)
-	}
-	if !strings.Contains(verr.Error(), "zero value") {
-		t.Fatalf("expected a zero-value error, got: %v", verr)
+// TestVerifyRejectsNonCanonicalRecordBytes pins the byte-malleability class. The
+// HMAC certifies the re-marshaled STRUCT, not the on-disk bytes, so EVERY rewrite
+// below leaves the signature matching — an attacker with file-write access but no
+// signing key can make it — while changing what a byte-oriented consumer (SIEM
+// ingest, jq, a grep of the raw line) reads. VerifyRecord rebuilds the canonical
+// line the writer would have emitted for the fields the record decodes to and
+// requires the bytes to match, so each vector must fail closed.
+//
+// The vectors are not a checklist the check enumerates: it rejects anything the
+// writer would not have produced, and these are the known members of that class.
+func TestVerifyRejectsNonCanonicalRecordBytes(t *testing.T) {
+	tests := []struct {
+		name   string
+		tamper func(orig []byte) []byte
+	}{
+		{
+			// Last-wins decoding still yields the signed "deny", so the HMAC matches,
+			// while a first-wins consumer reads the attacker's "allow".
+			"duplicate top-level key",
+			func(orig []byte) []byte { return append([]byte(`{"decision":"allow",`), orig[1:]...) },
+		},
+		{
+			// A different raw string from "decision", so an exact-match duplicate check
+			// misses it — but encoding/json binds both to the Decision field
+			// (case-insensitively, even under DisallowUnknownFields) and keeps the last.
+			"case-variant duplicate key",
+			func(orig []byte) []byte { return append([]byte(`{"Decision":"allow",`), orig[1:]...) },
+		},
+		{
+			// A SINGLE case-renamed key with no colliding sibling: no duplicate to
+			// detect, yet it still binds to Decision and re-marshals to lowercase, so a
+			// case-sensitive consumer silently stops matching the record.
+			"lone case-renamed key",
+			func(orig []byte) []byte {
+				return bytes.Replace(orig, []byte(`"decision":"deny"`), []byte(`"DECISION":"deny"`), 1)
+			},
+		},
+		{
+			// writeRecord's omitempty NEVER emits a zero-valued field (it omits the key
+			// entirely), and the re-marshal drops it again — so it is invisible to the
+			// recomputed HMAC, and its presence proves bytes were added after signing.
+			"foreign zero-valued omitempty field",
+			func(orig []byte) []byte {
+				return bytes.Replace(orig, []byte(`{"class_uid"`), []byte(`{"agent_id":"","class_uid"`), 1)
+			},
+		},
+		{
+			// An escape variant of a VALUE: decodes to the same "deny" string, so the
+			// HMAC matches, but a regex/grep consumer scanning for "decision":"deny"
+			// no longer matches the line. Not reachable by any per-key check — this is
+			// one of the vectors the canonical comparison closes that the previous
+			// hand-rolled key guards did not.
+			"alternate escape in a value",
+			func(orig []byte) []byte {
+				return bytes.Replace(orig, []byte(`"decision":"deny"`), []byte(`"decision":"\u0064eny"`), 1)
+			},
+		},
+		{
+			// Insignificant whitespace between top-level members: decodes identically,
+			// and likewise defeats a raw-byte consumer. Also previously unreachable.
+			"whitespace between top-level members",
+			func(orig []byte) []byte {
+				return bytes.Replace(orig, []byte(`,"decision":`), []byte(`,  "decision" : `), 1)
+			},
+		},
+		{
+			// details is carried as a signed RawMessage, so whitespace INSIDE it never
+			// reached the old top-level-only key walk at all.
+			"whitespace inside the details subtree",
+			func(orig []byte) []byte {
+				return bytes.Replace(orig, []byte(`{"arg":"value"}`), []byte(`{ "arg" : "value" }`), 1)
+			},
+		},
+		{
+			// Reordering decodes to the same struct and is the reason a byte comparison
+			// (rather than a set-of-keys comparison) is what "these are the writer's
+			// bytes" requires. No writer produces this order.
+			"reordered top-level keys",
+			func(orig []byte) []byte {
+				return bytes.Replace(orig,
+					[]byte(`"decision":"deny","denial_code":"AUTHORIZATION_FAILED"`),
+					[]byte(`"denial_code":"AUTHORIZATION_FAILED","decision":"deny"`), 1)
+			},
+		},
 	}
 
-	lines[idx] = tampered
-	out := append(bytes.Join(lines, []byte("\n")), '\n')
-	res, _ := VerifyLog(bytes.NewReader(out), verifier, "", time.Time{}, io.Discard)
-	if res.OK() {
-		t.Fatalf("VerifyLog must not pass a log with a foreign-zero-value-tampered record: %+v", res)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			orig, verifier := nonCanonicalFixture(t)
+			tampered := tc.tamper(orig)
+			if bytes.Equal(tampered, orig) {
+				t.Fatalf("test setup produced no change; the fixture record does not contain the bytes this vector rewrites: %s", orig)
+			}
+			ok, verr := verifier.VerifyRecord(tampered)
+			if ok {
+				t.Fatalf("%s must fail closed, got ok=true", tc.name)
+			}
+			if !errors.Is(verr, errNonCanonicalRecord) {
+				t.Fatalf("expected errNonCanonicalRecord, got: %v", verr)
+			}
+
+			// And the whole-log verdict must fail, not pass.
+			res, _ := VerifyLog(bytes.NewReader(append(tampered, '\n')), verifier, "", time.Time{}, io.Discard)
+			if res.OK() {
+				t.Fatalf("VerifyLog must not pass a log holding a %s: %+v", tc.name, res)
+			}
+		})
+	}
+}
+
+// TestVerifyAcceptsCanonicalRecordWithTrailingNewline pins the one whitespace
+// difference the canonical check deliberately tolerates: bytes OUTSIDE the object
+// cannot add, remove, or re-spell a field, so they change no consumer's reading of
+// the record — and callers legitimately differ on whether the terminating newline
+// is included (VerifyLog's scanner strips it; a raw read does not). Rejecting it
+// would fail every genuine record read straight off disk.
+func TestVerifyAcceptsCanonicalRecordWithTrailingNewline(t *testing.T) {
+	orig, verifier := nonCanonicalFixture(t)
+	if ok, verr := verifier.VerifyRecord(append(orig, '\n')); !ok || verr != nil {
+		t.Fatalf("a canonical record with a trailing newline must verify: ok=%v err=%v", ok, verr)
 	}
 }
 

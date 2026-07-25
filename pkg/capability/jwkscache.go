@@ -731,10 +731,16 @@ func (c *JWKSCache) fetchKeys(ctx context.Context) (_ *jose.JSONWebKeySet, err e
 }
 
 // FindKeys returns the keys matching kid from the JWKS, all keys when kid is empty.
-// A nil JWKS yields no keys rather than panicking. The returned slice is always a
-// fresh copy, never an alias into the cached set — handing out a live alias would
-// let a caller that mutates an entry corrupt the shared root-of-trust set seen by
-// every concurrent verification.
+// A nil JWKS yields no keys rather than panicking.
+//
+// The returned SLICE is always fresh — never an alias into the cached set's backing
+// array — so a caller cannot reorder or overwrite entries in the shared
+// root-of-trust set seen by every concurrent verification. Its elements are SHALLOW
+// copies of the jose.JSONWebKey structs, so the key material each one reaches
+// through its Key field (a *rsa.PublicKey / *ecdsa.PublicKey) is still shared:
+// callers must treat an entry's Key as read-only, since mutating THROUGH it would
+// corrupt the cached set for every other verification. No caller mutates today;
+// verification only reads.
 func FindKeys(jwks *jose.JSONWebKeySet, kid string) []jose.JSONWebKey {
 	if jwks == nil {
 		return nil

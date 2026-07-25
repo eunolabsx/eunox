@@ -2742,8 +2742,10 @@ func TestRecordBoundsDetailsBeforeEnqueue(t *testing.T) {
 	s := &Sink{records: make(chan auditRecord, 1)}
 
 	big := strings.Repeat("x", auditDetailValueCap+1)
-	s.Record(context.Background(), "", "", "", "sess", "tool", "tools/call",
-		"allow", "", "", map[string]interface{}{"body": big}, nil, true, nil, nil)
+	s.Record(context.Background(), RecordParams{
+		SessionID: "sess", Identifier: "tool", Method: "tools/call", Decision: "allow",
+		Details: map[string]interface{}{"body": big}, AuditOnly: true,
+	})
 
 	select {
 	case rec := <-s.records:
@@ -3307,8 +3309,10 @@ func TestRecordBoundsObligationsBeforeEnqueue(t *testing.T) {
 	for i := range big {
 		big[i] = fmt.Sprintf("redactFields:$.deeply.nested.path.segment.%d", i)
 	}
-	s.Record(context.Background(), "", "", "", "sess", "tool", "tools/call",
-		"allow", "", "", nil, big, true, nil, nil)
+	s.Record(context.Background(), RecordParams{
+		SessionID: "sess", Identifier: "tool", Method: "tools/call", Decision: "allow",
+		Obligations: big, AuditOnly: true,
+	})
 
 	select {
 	case rec := <-s.records:
