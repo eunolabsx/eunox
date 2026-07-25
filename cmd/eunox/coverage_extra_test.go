@@ -633,9 +633,6 @@ func TestRedactString_NonStringAndEmpty(t *testing.T) {
 	}
 }
 
-// TestRedactURLFallback_Cases covers redactURLFallback directly: a value with no
-// scheme but an '@' (placeholder), a value with no scheme and no '@'
-// (unchanged), and a scheme-bearing value carrying userinfo (REDACTED inserted).
 // TestTailAuditLines_RingEvictsOldest exercises the ring-buffer eviction branch
 // (more lines than n) which the existing tests' small inputs do not all hit.
 func TestTailAuditLines_RingEvictsOldest(t *testing.T) {

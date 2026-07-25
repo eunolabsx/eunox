@@ -1846,7 +1846,7 @@ func fetchRouteLive(ctx context.Context, u *config.UpstreamConfig) (LiveUpstream
 // clobbers, so without force an existing file is refused (O_EXCL) rather than
 // destroying an operator's hand-edited manifest. Mirrors how the audit key/log paths
 // are hardened (internal/audit tightenKeyFileMode + never-overwrite).
-func writeGeneratedFile(path, content string, force bool) error {
+func writeGeneratedFile(path, content string, force bool) (err error) {
 	flags := os.O_WRONLY | os.O_CREATE | os.O_EXCL
 	if force {
 		flags = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
@@ -1858,16 +1858,27 @@ func writeGeneratedFile(path, content string, force bool) error {
 		}
 		return err
 	}
-	defer func() { _ = f.Close() }()
+	// Surface the close (which flushes): an error-swallowing deferred Close would let a
+	// delayed write error (e.g. on NFS) be announced as a complete write. Keep the first
+	// error if the body already set one.
+	defer func() {
+		if cerr := f.Close(); cerr != nil && err == nil {
+			err = fmt.Errorf("closing %q: %w", path, cerr)
+		}
+	}()
 	if force {
-		// O_TRUNC kept a pre-existing file's (possibly looser) mode; re-tighten so a
-		// regenerated credential-bearing config cannot stay group/world-readable.
-		if err := os.Chmod(path, 0o600); err != nil {
-			return fmt.Errorf("tightening mode of %q to 0600: %w", path, err)
+		// O_TRUNC kept a pre-existing file's (possibly looser) mode; re-tighten it BEFORE
+		// writing so a regenerated credential-bearing config never lands at a group/world-
+		// readable mode, and tighten on the open fd rather than os.Chmod(path), which would
+		// re-resolve the path (following a symlink). On failure the (already-truncated) file
+		// is left empty and the error returned — fail closed rather than write the
+		// credential at a loose mode.
+		if cerr := f.Chmod(0o600); cerr != nil {
+			return fmt.Errorf("tightening mode of %q to 0600: %w", path, cerr)
 		}
 	}
-	if _, err := f.WriteString(content); err != nil {
-		return fmt.Errorf("writing %q: %w", path, err)
+	if _, werr := f.WriteString(content); werr != nil {
+		return fmt.Errorf("writing %q: %w", path, werr)
 	}
 	return nil
 }

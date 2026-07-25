@@ -92,7 +92,11 @@ func DeleteMCPHTTPSession(client *http.Client, endpoint, sessID, authHeaderLine 
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[eunox] upstream session DELETE failed: %v\n", err)
+		// Scrub the credentialed endpoint from the *url.Error before logging (net/http
+		// strips only the password): the same leak class scrubURLError closes on the
+		// DoMCPHTTP client.Do path, reached here from both the gateway per-session close
+		// and the stdio bridge close.
+		fmt.Fprintf(os.Stderr, "[eunox] upstream session DELETE failed: %v\n", scrubURLError(err))
 		return
 	}
 	_ = resp.Body.Close()
@@ -278,7 +282,7 @@ func (p *HTTPProxy) newRemoteSession(ctx context.Context, route *UpstreamRoute, 
 	// and drift probe). See the matching comment in newSession.
 	sess.touchRequest()
 
-	fmt.Fprintf(os.Stderr, "[eunox] HTTP session %s started (remote: %s).\n", sess.id, route.upstreamURL)
+	fmt.Fprintf(os.Stderr, "[eunox] HTTP session %s started (remote: %s).\n", sess.id, config.RedactURL(route.upstreamURL))
 	return sess, nil
 }
 
@@ -378,7 +382,12 @@ func DoMCPHTTP(ctx context.Context, client *http.Client, endpoint string, msg mc
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(data)) //nolint:gosec // G107: endpoint is operator-configured (user-supplied URL or config file)
 	if err != nil {
-		return mcp.RPCMsg{}, nil, fmt.Errorf("building request: %w", err)
+		// Scrub before surfacing: a url.Parse-fatal endpoint (bad port, bad %-escape) makes
+		// NewRequestWithContext return a *url.Error whose URL is the raw, UNstripped input,
+		// so an embedded userinfo credential — password included, unlike the client.Do path
+		// net/http partially strips below — would otherwise reach the live-probe stderr and
+		// the doctor bundle.
+		return mcp.RPCMsg{}, nil, fmt.Errorf("building request: %w", scrubURLError(err))
 	}
 	req.Header.Set("Content-Type", CTJSON)
 	// The spec requires the client to advertise both JSON and SSE content types so the

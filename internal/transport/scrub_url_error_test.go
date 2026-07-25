@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-// TestScrubURLError_RedactsCredentialedURL is the finding-A regression: the live-probe
+// TestScrubURLError_RedactsCredentialedURL verifies the live-probe
 // error surfaces a *url.Error whose URL carries a userinfo credential and a query token.
 // net/http strips only the password, so the username and query leak to stderr and the
 // doctor bundle. scrubURLError must redact the whole credentialed URL while preserving

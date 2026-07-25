@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-// TestRedactAuditLine_NonObjectDetailsFailsClosed is the finding-E regression: a record
+// TestRedactAuditLine_NonObjectDetailsFailsClosed verifies that a record
 // whose `details` is a NON-object JSON value (a string/array/number) cannot be scrubbed
 // field-by-field, so the map assertion skipped it and the raw value was re-emitted into
 // the doctor support bundle. It must now be redacted wholesale (fail closed).
@@ -41,7 +41,7 @@ func TestRedactAuditLine_NonObjectDetailsFailsClosed(t *testing.T) {
 	}
 }
 
-// TestWriteGeneratedFile_RefusesClobberAndTightens is the finding-F regression: a plain
+// TestWriteGeneratedFile_RefusesClobberAndTightens verifies that a plain
 // os.WriteFile(…, 0600) neither refuses to clobber a pre-existing file nor re-tightens a
 // pre-existing looser mode (O_CREATE applies the mode only on creation). writeGeneratedFile
 // must refuse to overwrite without force, and on a forced overwrite must re-tighten to 0600.

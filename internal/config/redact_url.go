@@ -88,10 +88,17 @@ func RedactURL(s string) string {
 	// url.Parse accepts opaque ("custom:user:pass@host") and scheme-less
 	// ("user:pass@host/path") credentialed forms, where the userinfo lands in u.Opaque
 	// rather than u.User and the query never populates u.RawQuery, so the userinfo/query
-	// scrubs above cannot reach it. Route those to the textual fallback (which also
-	// strips the query and fragment) regardless of the fragment scrub above, so dropping
-	// a fragment does not let opaque userinfo slip past.
+	// scrubs above cannot reach it. An opaque form has NO "scheme://" authority, so it must
+	// NOT be handed verbatim to redactURLFallback's authority heuristic: that anchors on
+	// the FIRST "://" and scans for the credential's '@' only AFTER it, but a "://"
+	// appearing later inside the opaque data (e.g. "scheme:user:pass@host://x") sits past
+	// the credential, so the scan would miss it and return the value unredacted. When the
+	// opaque part carries an '@' (a possible userinfo credential), redact wholesale;
+	// otherwise the textual fallback still strips any query/fragment on the raw string.
 	if u.Opaque != "" {
+		if strings.Contains(u.Opaque, "@") {
+			return "<redacted unparseable URL>"
+		}
 		return redactURLFallback(s)
 	}
 	if !changed {

@@ -9,45 +9,92 @@ import (
 	"testing"
 )
 
-// TestRedactURL_Cases pins the consolidated redactor's entry point, including the three
-// gaps the old config-side redactor (redactURLForError/coarseRedactURL) had and this
-// hoisted redactor closes: an OPAQUE credentialed URL, a PATH-embedded secret, and a
-// '?'-before-'@' ordering that leaked the credential prefix. Every case asserts the
-// property that matters — the secret substring must NOT survive into the output.
-func TestRedactURL_Cases(t *testing.T) {
-	for _, tc := range []struct {
-		name, in, mustNotContain string
-	}{
-		{"userinfo password", "https://alice:SECRETPW@example.com/p", "SECRETPW"},
-		{"query token", "https://api.example.com/data?api_key=SECRETKEY", "SECRETKEY"},
-		{"bare query token", "https://api.example.com/data?SECRETJWT", "SECRETJWT"},
-		{"fragment token", "https://example.com/#access_token=SECRETFRAG", "SECRETFRAG"},
-		// GAP 1 — opaque credentialed URL: userinfo lands in u.Opaque, so the old
-		// early-return "nothing to strip" leaked it. Now routed to the fallback.
-		{"opaque userinfo", "https:alice:SECRETOPAQUE@host", "SECRETOPAQUE"},
-		{"opaque userinfo + query", "https:alice:SECRETOPAQUE2@host?token=xyz", "SECRETOPAQUE2"},
-		// GAP 2 — '?'-before-'@' ordering: the old coarse redactor cut at '?' before
-		// scanning for '@', leaving the credential prefix visible.
-		{"query before at", "https://user:SECRETORDER?x@host/p", "SECRETORDER"},
-		// GAP 3 — secret in the query of an otherwise-normal URL is length-redacted.
-		{"path-like query secret", "https://host/webhook?tok=SECRETPATH", "SECRETPATH"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			got := RedactURL(tc.in)
-			if strings.Contains(got, tc.mustNotContain) {
-				t.Errorf("RedactURL(%q) = %q, still contains the secret %q", tc.in, got, tc.mustNotContain)
-			}
-		})
+// TestRedactURL_ExactOutputs pins the consolidated redactor's exact output for every
+// credential-carrying shape — asserting not just that the secret is gone but that the
+// scheme, host, path, and query parameter NAMES survive (a blunt over-redactor that
+// flattened every credentialed input would satisfy a mere secret-absence check but fail
+// here). The empty and clean-unchanged cases sit in the same table.
+func TestRedactURL_ExactOutputs(t *testing.T) {
+	cases := map[string]string{
+		"https://mcp.example.com/x": "https://mcp.example.com/x",
+		// Userinfo and the query value are both redacted.
+		"https://u:p@mcp.example.com/x?y=1": "https://REDACTED:REDACTED@mcp.example.com/x?y=<redacted len=1>",
+		"":                                  "",
+		"not-a-url-but-still-a-string":      "not-a-url-but-still-a-string",
+		"http://onlyuser@host":              "http://REDACTED:REDACTED@host",
+		// A credential in the query string must be scrubbed even with no userinfo.
+		"https://api.example.com/mcp?api_key=sk-live-9f3c2a": "https://api.example.com/mcp?api_key=<redacted len=14>",
+		// Multiple params: every value scrubbed, names and order preserved.
+		"https://h/p?token=abc&mode=fast": "https://h/p?token=<redacted len=3>&mode=<redacted len=4>",
+		// Percent-encoded value: the reported length is the DECODED byte count (4 bytes
+		// for the emoji), matching what redactConfigValue reports for the same secret in
+		// plain config, not the 12-byte encoded form.
+		"https://h/p?api_key=%F0%9F%90%B9": "https://h/p?api_key=<redacted len=4>",
+		// A bare query token with no '=' is a value with no name and could be a
+		// credential (e.g. ?sk_live_...), so it is redacted to a length-only
+		// placeholder rather than passed through — matching redactRawQuery's behavior
+		// on the unparseable path.
+		"https://h/p?verbose": "https://h/p?<redacted len=7>",
+		// A key= with an empty value carries no secret and is left as-is.
+		"https://h/p?flag=": "https://h/p?flag=",
+		// url.Parse fails on the trailing invalid percent escape, but the userinfo must
+		// still be stripped rather than returned verbatim in a support bundle.
+		"https://alice:super-secret@example.com/%": "https://REDACTED@example.com/%",
+		// Parse failure with no userinfo: nothing sensitive, returned unchanged.
+		"https://example.com/%": "https://example.com/%",
+		// A bare '@' in the PATH of a hierarchical URL (no authority credentials, so
+		// u.User is nil and u.Opaque is empty) is not a secret: it must be returned
+		// unchanged, not over-redacted to a "<redacted unparseable URL>" placeholder.
+		"https://example.com/path@here": "https://example.com/path@here",
+		"https://host/mcp@v1?x=1":       "https://host/mcp@v1?x=<redacted len=1>",
+		// A credential in the FRAGMENT (OAuth 2.0 implicit flow #access_token=...)
+		// must be scrubbed, just as the query-string form is.
+		"https://mcp.example.com/sse#access_token=SECRETVALUE": "https://mcp.example.com/sse",
+		// Fragment alongside a query: both go.
+		"https://h/p?x=1#token=abc": "https://h/p?x=<redacted len=1>",
+		// A bare '#' carries nothing and is preserved through u.String().
+		"https://h/p#": "https://h/p#",
 	}
+	for in, want := range cases {
+		if got := RedactURL(in); got != want {
+			t.Errorf("RedactURL(%q): got %q, want %q", in, got, want)
+		}
+	}
+}
 
-	// A credential-free URL is returned unchanged.
-	clean := "https://api.example.com/v1/data"
-	if got := RedactURL(clean); got != clean {
-		t.Errorf("RedactURL(%q) = %q, want it unchanged", clean, got)
-	}
-	// Empty stays empty.
-	if got := RedactURL(""); got != "" {
-		t.Errorf("RedactURL(\"\") = %q, want empty", got)
+// TestRedactURL_MalformedNeverLeaksPassword covers the shapes where the credential does
+// NOT land in u.User — a parse failure, or a parse-success opaque/scheme-less form — so
+// the userinfo/query scrubs do not fire and the value must be routed to a fail-safe path
+// rather than returned verbatim, regardless of how url.Parse behaves.
+func TestRedactURL_MalformedNeverLeaksPassword(t *testing.T) {
+	for _, in := range []string{
+		"https://alice:super-secret@example.com/%",
+		"ftp://user:super-secret@[bad host]/path",
+		"super-secret@host\x00",
+		// Malformed (trailing invalid percent escape) with an unescaped '/' before the
+		// '@', so the authority is cut short of the userinfo boundary and carries no
+		// '@' itself; the fallback must still not return the value verbatim and leak
+		// the embedded secret.
+		"https://alice:super-secret/x@example.com/%",
+		// url.Parse SUCCEEDS on these but yields an opaque/scheme-less form where the
+		// credential never lands in u.User, so the userinfo/query scrubs do not fire;
+		// they must not be returned verbatim.
+		"custom:user:super-secret@thing",  // opaque: Scheme="custom", Opaque="user:super-secret@thing"
+		"user:super-secret@host.com/path", // scheme-less: Scheme="user", Opaque="super-secret@host.com/path"
+		// Opaque body that ALSO contains a later "://": the credential sits BEFORE it, so
+		// an authority scan anchored on the first "://" would look past the '@' and return
+		// the value verbatim. RedactURL must redact wholesale on the opaque '@'.
+		"scheme:user:super-secret@host://path",
+		"scheme:user:super-secret@host://path?token=xyz",
+		// Opaque userinfo alongside a query.
+		"https:alice:super-secret@host?token=xyz",
+		// '?'-before-'@' ordering (url.Parse fails on the non-numeric port): the fallback
+		// must not leak the credential prefix by cutting at '?' before scanning for '@'.
+		"https://user:super-secret?x@host/p",
+	} {
+		if got := RedactURL(in); strings.Contains(got, "super-secret") {
+			t.Errorf("RedactURL(%q) leaked the password: %q", in, got)
+		}
 	}
 }
 
@@ -74,7 +121,7 @@ func TestRedactURLFallback_Cases(t *testing.T) {
 	}
 }
 
-// TestLoadGatewayConfig_UnsetEnvRefInAuditPaths is the finding-C regression: an unset
+// TestLoadGatewayConfig_UnsetEnvRefInAuditPaths verifies that an unset
 // ${VAR} in audit.log / audit.keyPath survives expansion as literal text, which would
 // silently misdirect the tamper-evident tape (or its signing key) to a path literally
 // named "${VAR}". The loader must fail closed, mirroring the upstreamUrl leg.

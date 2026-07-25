@@ -86,7 +86,7 @@ var redactedConfigFields = map[string]bool{
 	"upstreamAuthHeader": true, // upstreams[].upstreamAuthHeader
 }
 
-// urlConfigFields names the URL/URI keys whose value is routed through redactURL
+// urlConfigFields names the URL/URI keys whose value is routed through config.RedactURL
 // (userinfo, query values, and fragment scrubbed; host/path kept) rather than emitted
 // verbatim — whether the value is a single scalar URL or a sequence of them (see
 // redactURLValue). Keyed on the field name because a credential is as likely in any of
@@ -99,7 +99,7 @@ var urlConfigFields = map[string]bool{
 }
 
 // redactURLValue scrubs a URL-bearing config value of ANY shape: a scalar URL string
-// (userinfo/query/fragment stripped via redactURL), a sequence of URL strings, or
+// (userinfo/query/fragment stripped via config.RedactURL), a sequence of URL strings, or
 // (defensively) a nested map. The doctor bundle raw-parses the on-disk YAML to surface
 // a config exactly as written, so a URL field can arrive in a shape the typed loader
 // would reject — a scalar where a list was expected, or a list where a scalar was.
@@ -109,7 +109,7 @@ var urlConfigFields = map[string]bool{
 func redactURLValue(val interface{}) interface{} {
 	switch v := val.(type) {
 	case string:
-		return redactURL(v)
+		return config.RedactURL(v)
 	case []interface{}:
 		for i, it := range v {
 			v[i] = redactURLValue(it)
@@ -203,6 +203,15 @@ Flags:
 	f, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600) //nolint:gosec // G304: --output is an operator-supplied destination
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "eunox doctor: opening %q: %v\n", outPath, err)
+		os.Exit(1)
+	}
+	// Re-tighten on the open fd: O_CREATE applies 0600 only on creation, so a pre-existing
+	// looser-mode file (e.g. a prior 0644 bundle) would keep that mode. The bundle is
+	// redacted, but its operational detail still warrants owner-only access — the same
+	// re-tighten writeGeneratedFile applies to the generated manifest/config paths.
+	if err := f.Chmod(0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "eunox doctor: tightening mode of %q: %v\n", outPath, err)
+		_ = f.Close()
 		os.Exit(1)
 	}
 	// Track write errors AND the close (which flushes) so a truncated bundle is
@@ -403,14 +412,6 @@ func redactString(v interface{}) string {
 		return ""
 	}
 	return fmt.Sprintf("<redacted len=%d>", len(s))
-}
-
-// redactURL scrubs userinfo and query/fragment credentials from a URL string. It
-// delegates to config.RedactURL — the single, robust redactor shared with config
-// validation and the live-probe error path — so the doctor bundle, config errors, and
-// the live probe cannot diverge on how a credentialed upstream URL is redacted.
-func redactURL(s string) string {
-	return config.RedactURL(s)
 }
 
 // reportCfgErr writes the standard "could not load config" line when cfgErr is
@@ -654,10 +655,10 @@ func redactAuditLine(line string) string {
 	// the config section so a credential does not survive into the support bundle.
 	// Gate on target_type == "resource": tool/prompt/system targets are bare names,
 	// not URIs, and a name that happens to contain '?'/'#'/'@' would otherwise be
-	// mis-parsed by redactURL and rewritten, distorting the bundle's record relative
-	// to the signed tape.
+	// mis-parsed by config.RedactURL and rewritten, distorting the bundle's record
+	// relative to the signed tape.
 	if t, ok := rec["target"].(string); ok && t != "" && rec["target_type"] == "resource" {
-		rec["target"] = redactURL(t)
+		rec["target"] = config.RedactURL(t)
 	}
 	var buf strings.Builder
 	enc := json.NewEncoder(&buf)

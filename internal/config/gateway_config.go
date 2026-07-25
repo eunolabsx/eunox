@@ -407,8 +407,8 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	// that false positive and also lets a literal "$" with no matching env var name
 	// (e.g. "?$filter=") pass through untouched.
 	for i := range cfg.Upstreams {
-		if name, ok := firstUnsetEnvRef(rawUpstreamURL[i]); ok {
-			return nil, fmt.Errorf("invalid gateway config %q: upstream %q upstreamUrl references environment variable %q, which is unset, so it is left as literal text — set the variable or remove the reference", path, cfg.Upstreams[i].Name, name)
+		if err := failOnUnsetEnvRef(path, fmt.Sprintf("upstream %q upstreamUrl", cfg.Upstreams[i].Name), rawUpstreamURL[i]); err != nil {
+			return nil, err
 		}
 	}
 
@@ -422,8 +422,8 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 		{"audit.log", rawAuditLog},
 		{"audit.keyPath", rawAuditKeyPath},
 	} {
-		if name, ok := firstUnsetEnvRef(f.raw); ok {
-			return nil, fmt.Errorf("invalid gateway config %q: %s references environment variable %q, which is unset, so it is left as literal text — set the variable or remove the reference", path, f.label, name)
+		if err := failOnUnsetEnvRef(path, f.label, f.raw); err != nil {
+			return nil, err
 		}
 	}
 
@@ -477,6 +477,21 @@ func firstUnsetEnvRef(rawValue string) (name string, ok bool) {
 		}
 	}
 	return "", false
+}
+
+// failOnUnsetEnvRef fails closed when raw carries a $VAR/${VAR} reference whose variable
+// is unset: expandEnvRefs leaves the literal "${VAR}" text in place, so the field would
+// resolve to a path/URL literally named "${VAR}". Single source of the operator-facing
+// message for the "path-family" fields (upstreamUrl, audit.log, audit.keyPath) so they
+// cannot drift; the credential fields use validateCredentialEnvRefs, whose message differs
+// (a literal token no client/upstream sends). Detection is on the RAW pre-expansion text
+// so a set variable whose value itself contains "$" is not misdiagnosed as unset. path
+// names the config file; label names the field.
+func failOnUnsetEnvRef(path, label, raw string) error {
+	if name, ok := firstUnsetEnvRef(raw); ok {
+		return fmt.Errorf("invalid gateway config %q: %s references environment variable %q, which is unset, so it is left as literal text — set the variable or remove the reference", path, label, name)
+	}
+	return nil
 }
 
 // validateCredentialEnvRefs fails closed when a credential field whose value is built
