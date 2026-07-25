@@ -214,78 +214,6 @@ func TestRedactConfigValue_EmptyAndMissingValues(t *testing.T) {
 	}
 }
 
-func TestRedactURL_StripsUserinfoOnly(t *testing.T) {
-	cases := map[string]string{
-		"https://mcp.example.com/x": "https://mcp.example.com/x",
-		// Userinfo and the query value are both redacted.
-		"https://u:p@mcp.example.com/x?y=1": "https://REDACTED:REDACTED@mcp.example.com/x?y=<redacted len=1>",
-		"":                                  "",
-		"not-a-url-but-still-a-string":      "not-a-url-but-still-a-string",
-		"http://onlyuser@host":              "http://REDACTED:REDACTED@host",
-		// A credential in the query string must be scrubbed even with no userinfo.
-		"https://api.example.com/mcp?api_key=sk-live-9f3c2a": "https://api.example.com/mcp?api_key=<redacted len=14>",
-		// Multiple params: every value scrubbed, names and order preserved.
-		"https://h/p?token=abc&mode=fast": "https://h/p?token=<redacted len=3>&mode=<redacted len=4>",
-		// Percent-encoded value: the reported length is the DECODED byte count (4 bytes
-		// for the emoji), matching what redactConfigValue reports for the same secret in
-		// plain config, not the 12-byte encoded form.
-		"https://h/p?api_key=%F0%9F%90%B9": "https://h/p?api_key=<redacted len=4>",
-		// A bare query token with no '=' is a value with no name and could be a
-		// credential (e.g. ?sk_live_...), so it is redacted to a length-only
-		// placeholder rather than passed through — matching redactRawQuery's behavior
-		// on the unparseable path.
-		"https://h/p?verbose": "https://h/p?<redacted len=7>",
-		// A key= with an empty value carries no secret and is left as-is.
-		"https://h/p?flag=": "https://h/p?flag=",
-		// url.Parse fails on the trailing invalid percent escape, but the userinfo must
-		// still be stripped rather than returned verbatim in a support bundle.
-		"https://alice:super-secret@example.com/%": "https://REDACTED@example.com/%",
-		// Parse failure with no userinfo: nothing sensitive, returned unchanged.
-		"https://example.com/%": "https://example.com/%",
-		// A bare '@' in the PATH of a hierarchical URL (no authority credentials, so
-		// u.User is nil and u.Opaque is empty) is not a secret: it must be returned
-		// unchanged, not over-redacted to a "<redacted unparseable URL>" placeholder.
-		"https://example.com/path@here": "https://example.com/path@here",
-		"https://host/mcp@v1?x=1":       "https://host/mcp@v1?x=<redacted len=1>",
-		// A credential in the FRAGMENT (OAuth 2.0 implicit flow #access_token=...)
-		// must be scrubbed, just as the query-string form is.
-		"https://mcp.example.com/sse#access_token=SECRETVALUE": "https://mcp.example.com/sse",
-		// Fragment alongside a query: both go.
-		"https://h/p?x=1#token=abc": "https://h/p?x=<redacted len=1>",
-		// A bare '#' carries nothing and is preserved through u.String().
-		"https://h/p#": "https://h/p#",
-	}
-	for in, want := range cases {
-		if got := redactURL(in); got != want {
-			t.Errorf("redactURL(%q): got %q, want %q", in, got, want)
-		}
-	}
-}
-
-// A malformed URL whose authority carries userinfo must never disclose the
-// embedded password, regardless of how url.Parse fails.
-func TestRedactURL_MalformedNeverLeaksPassword(t *testing.T) {
-	for _, in := range []string{
-		"https://alice:super-secret@example.com/%",
-		"ftp://user:super-secret@[bad host]/path",
-		"super-secret@host\x00",
-		// Malformed (trailing invalid percent escape) with an unescaped '/' before the
-		// '@', so the authority is cut short of the userinfo boundary and carries no
-		// '@' itself; the fallback must still not return the value verbatim and leak
-		// the embedded secret.
-		"https://alice:super-secret/x@example.com/%",
-		// url.Parse SUCCEEDS on these but yields an opaque/scheme-less form where the
-		// credential never lands in u.User, so the userinfo/query scrubs do not fire;
-		// they must not be returned verbatim.
-		"custom:user:super-secret@thing",  // opaque: Scheme="custom", Opaque="user:super-secret@thing"
-		"user:super-secret@host.com/path", // scheme-less: Scheme="user", Opaque="super-secret@host.com/path"
-	} {
-		if got := redactURL(in); strings.Contains(got, "super-secret") {
-			t.Errorf("redactURL(%q) leaked the password: %q", in, got)
-		}
-	}
-}
-
 // ─── redactAuditLine ─────────────────────────────────────────────────────────
 //
 // The audit-tape redactor must scrub the `details` map (which carries tool
@@ -324,8 +252,8 @@ func TestRedactAuditLine_ScrubsCredentialedResourceURI(t *testing.T) {
 
 func TestRedactAuditLine_PreservesNonResourceTargetWithURLChars(t *testing.T) {
 	// A tool name containing URL-significant characters ('?', '@') must NOT be run
-	// through redactURL — it is not a URI and carries no credential, and mangling it
-	// would distort the bundle relative to the signed audit tape.
+	// through config.RedactURL — it is not a URI and carries no credential, and mangling
+	// it would distort the bundle relative to the signed audit tape.
 	in := `{"decision":"deny","target_type":"tool","target":"search?q@v"}`
 	out := redactAuditLine(in)
 	if !strings.Contains(out, `"target":"search?q@v"`) {

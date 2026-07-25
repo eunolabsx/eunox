@@ -21,7 +21,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"runtime"
 	"runtime/debug"
@@ -87,7 +86,7 @@ var redactedConfigFields = map[string]bool{
 	"upstreamAuthHeader": true, // upstreams[].upstreamAuthHeader
 }
 
-// urlConfigFields names the URL/URI keys whose value is routed through redactURL
+// urlConfigFields names the URL/URI keys whose value is routed through config.RedactURL
 // (userinfo, query values, and fragment scrubbed; host/path kept) rather than emitted
 // verbatim — whether the value is a single scalar URL or a sequence of them (see
 // redactURLValue). Keyed on the field name because a credential is as likely in any of
@@ -100,7 +99,7 @@ var urlConfigFields = map[string]bool{
 }
 
 // redactURLValue scrubs a URL-bearing config value of ANY shape: a scalar URL string
-// (userinfo/query/fragment stripped via redactURL), a sequence of URL strings, or
+// (userinfo/query/fragment stripped via config.RedactURL), a sequence of URL strings, or
 // (defensively) a nested map. The doctor bundle raw-parses the on-disk YAML to surface
 // a config exactly as written, so a URL field can arrive in a shape the typed loader
 // would reject — a scalar where a list was expected, or a list where a scalar was.
@@ -110,7 +109,7 @@ var urlConfigFields = map[string]bool{
 func redactURLValue(val interface{}) interface{} {
 	switch v := val.(type) {
 	case string:
-		return redactURL(v)
+		return config.RedactURL(v)
 	case []interface{}:
 		for i, it := range v {
 			v[i] = redactURLValue(it)
@@ -204,6 +203,15 @@ Flags:
 	f, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600) //nolint:gosec // G304: --output is an operator-supplied destination
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "eunox doctor: opening %q: %v\n", outPath, err)
+		os.Exit(1)
+	}
+	// Re-tighten on the open fd: O_CREATE applies 0600 only on creation, so a pre-existing
+	// looser-mode file (e.g. a prior 0644 bundle) would keep that mode. The bundle is
+	// redacted, but its operational detail still warrants owner-only access — the same
+	// re-tighten writeGeneratedFile applies to the generated manifest/config paths.
+	if err := f.Chmod(0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "eunox doctor: tightening mode of %q: %v\n", outPath, err)
+		_ = f.Close()
 		os.Exit(1)
 	}
 	// Track write errors AND the close (which flushes) so a truncated bundle is
@@ -404,165 +412,6 @@ func redactString(v interface{}) string {
 		return ""
 	}
 	return fmt.Sprintf("<redacted len=%d>", len(s))
-}
-
-// redactURL replaces userinfo (user:pass@) and every non-empty query value with a
-// placeholder, leaving scheme/host/path and query parameter names intact — a
-// credential is as likely in ?api_key=/?token= as in userinfo. A URL with neither
-// is returned unchanged. On a url.Parse failure the raw value is NOT returned
-// (a malformed URL can still carry a credential); a conservative textual
-// redaction is used instead.
-func redactURL(s string) string {
-	if s == "" {
-		return s
-	}
-	u, err := url.Parse(s)
-	if err != nil {
-		return redactURLFallback(s)
-	}
-	changed := false
-	if u.User != nil {
-		u.User = url.UserPassword("REDACTED", "REDACTED")
-		changed = true
-	}
-	if u.RawQuery != "" {
-		// Replace each non-empty query value with a length-tagged placeholder,
-		// preserving parameter order and names. url.URL.String() emits RawQuery
-		// verbatim, so the placeholder stays unencoded and matches redactConfigValue's
-		// "<redacted len=N>" form. The length is the decoded byte count (via
-		// QueryUnescape), falling back to the raw count on a malformed escape.
-		parts := strings.Split(u.RawQuery, "&")
-		queryChanged := false
-		for i, p := range parts {
-			if p == "" {
-				continue // empty segment (e.g. trailing "&"): nothing to redact
-			}
-			eq := strings.IndexByte(p, '=')
-			if eq < 0 {
-				// A bare token with no "=" is a value with no name (e.g.
-				// "?sk_live_abcdef" or "?<jwt>"); it can be a credential just as
-				// readily as a key=value pair. Redact the whole token to a
-				// length-tagged placeholder rather than passing it through (the
-				// redactURLFallback sibling drops such tokens entirely, so the
-				// parseable path must not be strictly less safe).
-				n := len(p)
-				if decoded, derr := url.QueryUnescape(p); derr == nil {
-					n = len(decoded)
-				}
-				parts[i] = fmt.Sprintf("<redacted len=%d>", n)
-				queryChanged = true
-				continue
-			}
-			if eq == len(p)-1 {
-				continue // flag-style param with empty value (key=): nothing to redact
-			}
-			val := p[eq+1:]
-			n := len(val)
-			if decoded, derr := url.QueryUnescape(val); derr == nil {
-				n = len(decoded)
-			}
-			parts[i] = p[:eq+1] + fmt.Sprintf("<redacted len=%d>", n)
-			queryChanged = true
-		}
-		if queryChanged {
-			u.RawQuery = strings.Join(parts, "&")
-			changed = true
-		}
-	}
-	// The fragment is a credential location too: the OAuth 2.0 implicit flow returns
-	// #access_token=... in the fragment, and other schemes stash bearer tokens
-	// there. u.String() re-emits it verbatim, so drop it entirely (its structure is
-	// not guaranteed key=value, so a whole-component drop is the safe scrub).
-	if u.Fragment != "" || u.RawFragment != "" {
-		u.Fragment = ""
-		u.RawFragment = ""
-		changed = true
-	}
-	// url.Parse accepts opaque ("custom:user:pass@host") and scheme-less
-	// ("user:pass@host/path") credentialed forms, where the userinfo lands in
-	// u.Opaque rather than u.User and the query never populates u.RawQuery, so the
-	// userinfo/query scrubs above cannot reach it. Route those to the textual
-	// fallback (which also strips the query and fragment) regardless of the fragment
-	// scrub above, so dropping a fragment does not let opaque userinfo slip past.
-	if u.Opaque != "" {
-		return redactURLFallback(s)
-	}
-	if !changed {
-		// A hierarchical "scheme://host/..." with authority credentials always
-		// populates u.User (handled above), so a bare '@' in the path of an
-		// opaque-free, fragment-free URL is not a credential and is correctly returned
-		// unchanged (redacting it would needlessly mangle a legitimate value).
-		return s
-	}
-	return u.String()
-}
-
-// redactURLFallback conservatively strips userinfo from a URL string url.Parse
-// could not handle. It locates the authority (after "scheme://", up to the first
-// '/', '?', or '#') and replaces anything before its last '@' with "REDACTED".
-// If an '@' still appears past the authority boundary (a malformed URL where the
-// credential cannot be located safely), or the string has no "scheme://" but
-// contains an '@', the whole value is replaced with a placeholder.
-func redactURLFallback(s string) string {
-	const sep = "://"
-	schemeEnd := strings.Index(s, sep)
-	if schemeEnd < 0 {
-		if strings.Contains(s, "@") {
-			return "<redacted unparseable URL>"
-		}
-		return redactRawQuery(s)
-	}
-	authStart := schemeEnd + len(sep)
-	rest := s[authStart:]
-	authority := rest
-	tail := ""
-	if end := strings.IndexAny(rest, "/?#"); end >= 0 {
-		authority = rest[:end]
-		tail = rest[end:]
-	}
-	at := strings.LastIndex(authority, "@")
-	if at < 0 {
-		// No userinfo in the authority — but this fallback only runs because
-		// url.Parse failed, so an '@' past the authority boundary (credentials hidden
-		// after an unescaped '/') cannot be located safely; replace the whole value.
-		if strings.Contains(tail, "@") {
-			return "<redacted unparseable URL>"
-		}
-		return redactRawQuery(s)
-	}
-	return redactRawQuery(s[:authStart] + "REDACTED@" + authority[at+1:] + tail)
-}
-
-// redactRawQuery replaces the query AND fragment components of a raw (possibly
-// unparseable) URL, so a ?api_key=/?token= or #access_token= credential cannot leak
-// through the url.Parse-failure path. The query runs from the first '?' to '#' or
-// end; scheme/host/path are preserved and an empty "?" is left as-is. A non-empty
-// fragment is DROPPED ENTIRELY (delimiter included), matching how the parse-success
-// path (redactURL) scrubs u.Fragment, so the same #fragment renders identically
-// regardless of which path handled it; a bare '#' is preserved.
-//
-// Unlike redactURL's per-value scrub, this drops the whole query including
-// parameter names: since the URL would not parse, the query cannot be safely
-// tokenized on '='/'&' (an encoded '%26' could split differently than the server
-// reads it), so wholesale redaction is the safe tradeoff. The same reasoning
-// applies to the fragment.
-func redactRawQuery(s string) string {
-	// Split the fragment off first so it is redacted whether or not a query exists.
-	fragMarker := ""
-	if h := strings.IndexByte(s, '#'); h >= 0 {
-		if h == len(s)-1 {
-			fragMarker = "#" // bare '#', nothing to redact; preserved like redactURL
-		}
-		// A non-empty fragment is dropped entirely (fragMarker stays ""), mirroring
-		// redactURL's u.Fragment = "".
-		s = s[:h]
-	}
-	q := strings.IndexByte(s, '?')
-	if q < 0 || q == len(s)-1 {
-		// No query, or an empty "?" trailer: leave the query span untouched.
-		return s + fragMarker
-	}
-	return s[:q] + "?<redacted query>" + fragMarker
 }
 
 // reportCfgErr writes the standard "could not load config" line when cfgErr is
@@ -786,9 +635,18 @@ func redactAuditLine(line string) string {
 		return fmt.Sprintf(`{"_doctor_note":"unparseable record","raw_len":%d}`, len(line))
 	}
 	delete(rec, "_hmac")
-	if d, ok := rec["details"].(map[string]interface{}); ok {
-		for k := range d {
-			d[k] = "<redacted>"
+	if raw, present := rec["details"]; present {
+		if d, ok := raw.(map[string]interface{}); ok {
+			for k := range d {
+				d[k] = "<redacted>"
+			}
+		} else {
+			// A non-object details value (a string/array/number/bool) cannot be scrubbed
+			// field-by-field, so the map assertion would skip it and the raw value would be
+			// re-emitted verbatim into the support bundle. eunox's own writer always emits an
+			// OBJECT details, so this shape can only come from a tampered or foreign record —
+			// redact the whole value rather than pass a potential secret through (fail closed).
+			rec["details"] = "<redacted>"
 		}
 	}
 	// For resource targets the `target` field holds the raw resource URI, which can
@@ -797,10 +655,10 @@ func redactAuditLine(line string) string {
 	// the config section so a credential does not survive into the support bundle.
 	// Gate on target_type == "resource": tool/prompt/system targets are bare names,
 	// not URIs, and a name that happens to contain '?'/'#'/'@' would otherwise be
-	// mis-parsed by redactURL and rewritten, distorting the bundle's record relative
-	// to the signed tape.
+	// mis-parsed by config.RedactURL and rewritten, distorting the bundle's record
+	// relative to the signed tape.
 	if t, ok := rec["target"].(string); ok && t != "" && rec["target_type"] == "resource" {
-		rec["target"] = redactURL(t)
+		rec["target"] = config.RedactURL(t)
 	}
 	var buf strings.Builder
 	enc := json.NewEncoder(&buf)

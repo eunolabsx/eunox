@@ -1837,6 +1837,52 @@ func fetchRouteLive(ctx context.Context, u *config.UpstreamConfig) (LiveUpstream
 // init subcommand
 // -----------------------------------------------------------------
 
+// writeGeneratedFile writes content to path at mode 0600, refusing to clobber a
+// pre-existing file unless force is set. It closes two gaps in a plain
+// os.WriteFile(path, …, 0o600): (1) O_CREATE applies the mode only on CREATION, so a
+// pre-existing looser-mode file (e.g. 0644 from a prior run or a restore) would keep
+// that mode and leave a generated config's cleartext upstream credential group/world-
+// readable — force overwrites re-tighten the mode to 0600; (2) O_TRUNC silently
+// clobbers, so without force an existing file is refused (O_EXCL) rather than
+// destroying an operator's hand-edited manifest. Mirrors how the audit key/log paths
+// are hardened (internal/audit tightenKeyFileMode + never-overwrite).
+func writeGeneratedFile(path, content string, force bool) (err error) {
+	flags := os.O_WRONLY | os.O_CREATE | os.O_EXCL
+	if force {
+		flags = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+	}
+	f, err := os.OpenFile(path, flags, 0o600) //nolint:gosec // G304: path is an operator-provided --output/--config-output location, and 0600 is the intended restrictive mode
+	if err != nil {
+		if !force && errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("%q already exists; refusing to overwrite it — pass --force to overwrite, or choose a different path", path)
+		}
+		return err
+	}
+	// Surface the close (which flushes): an error-swallowing deferred Close would let a
+	// delayed write error (e.g. on NFS) be announced as a complete write. Keep the first
+	// error if the body already set one.
+	defer func() {
+		if cerr := f.Close(); cerr != nil && err == nil {
+			err = fmt.Errorf("closing %q: %w", path, cerr)
+		}
+	}()
+	if force {
+		// O_TRUNC kept a pre-existing file's (possibly looser) mode; re-tighten it BEFORE
+		// writing so a regenerated credential-bearing config never lands at a group/world-
+		// readable mode, and tighten on the open fd rather than os.Chmod(path), which would
+		// re-resolve the path (following a symlink). On failure the (already-truncated) file
+		// is left empty and the error returned — fail closed rather than write the
+		// credential at a loose mode.
+		if cerr := f.Chmod(0o600); cerr != nil {
+			return fmt.Errorf("tightening mode of %q to 0600: %w", path, cerr)
+		}
+	}
+	if _, werr := f.WriteString(content); werr != nil {
+		return fmt.Errorf("writing %q: %w", path, werr)
+	}
+	return nil
+}
+
 // cmdInit runs the `init` subcommand and returns the process exit code (rather
 // than calling os.Exit itself), so tests can drive every branch — including the
 // fail-closed error paths — without terminating the test binary.
@@ -1866,6 +1912,7 @@ Flags:
 	upstreamURL := fs.String("upstream-url", "", "Base URL of the MCP HTTP server (required with --transport http).")
 	output := fs.String("output", "", "Path to write the generated manifest YAML (default: stdout).")
 	configOutput := fs.String("config-output", "", "Also write a runnable eunox config to this path that fronts the introspected\nupstream and enforces the generated manifest. Requires --output (the config references it).")
+	force := fs.Bool("force", false, "Overwrite --output / --config-output if they already exist (default: refuse to\nclobber). An overwrite also re-tightens the file mode to 0600.")
 	name := fs.String("name", "generated-manifest", "Value for the manifest name field.")
 	authHeader := fs.String("upstream-auth-header", "", `Header forwarded to the HTTP upstream in "Name: Value" format.`)
 	tlsSkipVerify := fs.Bool("upstream-tls-skip-verify", false, "Skip TLS certificate verification for the HTTP upstream (development only).")
@@ -1913,8 +1960,8 @@ Flags:
 		return 0
 	}
 
-	if err := os.WriteFile(*output, []byte(manifest), 0o600); err != nil { //nolint:gosec // G306: restrictive permissions are correct for a policy manifest
-		fmt.Fprintf(os.Stderr, "eunox init: writing %q: %v\n", *output, err)
+	if err := writeGeneratedFile(*output, manifest, *force); err != nil {
+		fmt.Fprintf(os.Stderr, "eunox init: %v\n", err)
 		return 2
 	}
 	fmt.Fprintf(os.Stderr, "Generated manifest %s — review and uncomment the capabilities you want to permit.\n", *output)
@@ -1928,8 +1975,8 @@ Flags:
 			return 2
 		}
 		cfg := generateInitConfigYAML(spec, absManifest)
-		if err := os.WriteFile(*configOutput, []byte(cfg), 0o600); err != nil { //nolint:gosec // G306: restrictive permissions (owner read/write only); a config may hold a cleartext --upstream-auth-header credential
-			fmt.Fprintf(os.Stderr, "eunox init: writing %q: %v\n", *configOutput, err)
+		if err := writeGeneratedFile(*configOutput, cfg, *force); err != nil {
+			fmt.Fprintf(os.Stderr, "eunox init: %v\n", err)
 			return 2
 		}
 		fmt.Fprintf(os.Stderr, "Generated config %s — run: eunox proxy --config %s\n", *configOutput, *configOutput)
@@ -2064,6 +2111,7 @@ Flags:
 	configPath := fs.String("config", "", "Path to the eunox config (YAML). When set, the configured audit.log is\nused as the default for --audit-log.")
 	name := fs.String("name", "suggested-manifest", "Value for the manifest name field.")
 	output := fs.String("output", "", "Path to write the draft manifest (default: stdout).")
+	force := fs.Bool("force", false, "Overwrite --output if it already exists (default: refuse to clobber). An\noverwrite also re-tightens the file mode to 0600.")
 	maxValues := fs.Int("max-values", suggestMaxValuesDefault, "Max distinct values an argument may have before allowedValues is downgraded to a review comment.\n0 or negative falls back to the default (20).")
 
 	if err := fs.Parse(os.Args[2:]); err != nil {
@@ -2111,8 +2159,8 @@ Flags:
 		fmt.Print(manifest)
 		return 0
 	}
-	if err := os.WriteFile(*output, []byte(manifest), 0o600); err != nil { //nolint:gosec // G306: restrictive permissions are correct for a policy manifest
-		fmt.Fprintf(os.Stderr, "eunox suggest: writing %q: %v\n", *output, err)
+	if err := writeGeneratedFile(*output, manifest, *force); err != nil {
+		fmt.Fprintf(os.Stderr, "eunox suggest: %v\n", err)
 		return 2
 	}
 	fmt.Fprintf(os.Stderr, "Generated draft manifest %s from %d audit record(s) — review and tighten each entry, then run: eunox validate %s\n",

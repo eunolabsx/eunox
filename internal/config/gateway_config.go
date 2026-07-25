@@ -333,6 +333,14 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	// ${VAR}/$VAR reference) from one that was legitimately omitted.
 	rawAuthToken := cfg.Listen.AuthToken
 
+	// Same for the audit log and key paths: an env ref left unset survives expansion as
+	// literal "${VAR}" text, which would silently misdirect the tamper-evident tape (and
+	// its signing key) to a directory literally named "${VAR}" — a fail-OPEN on the core
+	// integrity artifact, while the sibling credential/URL fields on this same expansion
+	// pass fail closed. Capture the raw values for the parallel guard after expansion.
+	rawAuditLog := cfg.Audit.Log
+	rawAuditKeyPath := cfg.Audit.KeyPath
+
 	// Same for each upstream's auth header: an env ref in upstreamAuthHeader carries
 	// the same unset/empty footgun, so capture the raw values for the parallel guard
 	// after expansion.
@@ -399,8 +407,23 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	// that false positive and also lets a literal "$" with no matching env var name
 	// (e.g. "?$filter=") pass through untouched.
 	for i := range cfg.Upstreams {
-		if name, ok := firstUnsetEnvRef(rawUpstreamURL[i]); ok {
-			return nil, fmt.Errorf("invalid gateway config %q: upstream %q upstreamUrl references environment variable %q, which is unset, so it is left as literal text — set the variable or remove the reference", path, cfg.Upstreams[i].Name, name)
+		if err := failOnUnsetEnvRef(path, fmt.Sprintf("upstream %q upstreamUrl", cfg.Upstreams[i].Name), rawUpstreamURL[i]); err != nil {
+			return nil, err
+		}
+	}
+
+	// Fail closed on an unset env reference in the audit log or key path (see the
+	// rawAuditLog/rawAuditKeyPath capture above): an unset ${VAR}/$VAR survives as literal
+	// text, so the tamper-evident tape — or its HMAC signing key — would be written to a
+	// path literally named "${VAR}", silently misdirecting the integrity artifact. Mirror
+	// the upstreamUrl leg, detecting on the RAW text so a set variable whose value itself
+	// contains "$" is not misdiagnosed as unset.
+	for _, f := range []struct{ label, raw string }{
+		{"audit.log", rawAuditLog},
+		{"audit.keyPath", rawAuditKeyPath},
+	} {
+		if err := failOnUnsetEnvRef(path, f.label, f.raw); err != nil {
+			return nil, err
 		}
 	}
 
@@ -454,6 +477,21 @@ func firstUnsetEnvRef(rawValue string) (name string, ok bool) {
 		}
 	}
 	return "", false
+}
+
+// failOnUnsetEnvRef fails closed when raw carries a $VAR/${VAR} reference whose variable
+// is unset: expandEnvRefs leaves the literal "${VAR}" text in place, so the field would
+// resolve to a path/URL literally named "${VAR}". Single source of the operator-facing
+// message for the "path-family" fields (upstreamUrl, audit.log, audit.keyPath) so they
+// cannot drift; the credential fields use validateCredentialEnvRefs, whose message differs
+// (a literal token no client/upstream sends). Detection is on the RAW pre-expansion text
+// so a set variable whose value itself contains "$" is not misdiagnosed as unset. path
+// names the config file; label names the field.
+func failOnUnsetEnvRef(path, label, raw string) error {
+	if name, ok := firstUnsetEnvRef(raw); ok {
+		return fmt.Errorf("invalid gateway config %q: %s references environment variable %q, which is unset, so it is left as literal text — set the variable or remove the reference", path, label, name)
+	}
+	return nil
 }
 
 // validateCredentialEnvRefs fails closed when a credential field whose value is built
@@ -772,47 +810,12 @@ func validateHTTPUpstreamURL(name, rawURL string) error {
 	}
 	parsed, err := url.Parse(rawURL)
 	if err != nil || !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
-		return fmt.Errorf("upstream %q: upstreamUrl must be an http or https URL, got %q", name, redactURLForError(rawURL))
+		return fmt.Errorf("upstream %q: upstreamUrl must be an http or https URL, got %q", name, RedactURL(rawURL))
 	}
 	if parsed.Host == "" {
-		return fmt.Errorf("upstream %q: upstreamUrl %q has no host", name, redactURLForError(rawURL))
+		return fmt.Errorf("upstream %q: upstreamUrl %q has no host", name, RedactURL(rawURL))
 	}
 	return nil
-}
-
-// redactURLForError returns a display-safe form of rawURL for error messages,
-// stripping the two standard secret carriers — userinfo (user:pass@) and the
-// query string (plus any fragment) — before the value reaches a log. upstreamUrl
-// is frequently assembled from an expanded env ref, so a token-bearing URL that
-// fails validation must not be echoed verbatim. When rawURL does not parse, a
-// coarse string-level redaction of the same components is applied so nothing
-// leaks on the parse-error path either.
-func redactURLForError(rawURL string) string {
-	if u, err := url.Parse(rawURL); err == nil {
-		if u.User == nil && u.RawQuery == "" && u.Fragment == "" {
-			return rawURL // nothing sensitive to strip; show the value as-is
-		}
-		u.User = nil
-		u.RawQuery = ""
-		u.Fragment = ""
-		return u.String()
-	}
-	return coarseRedactURL(rawURL)
-}
-
-// coarseRedactURL redacts userinfo and any query/fragment from a URL string that
-// url.Parse could not handle, using plain string operations so a malformed but
-// token-bearing value still does not leak.
-func coarseRedactURL(s string) string {
-	if i := strings.IndexAny(s, "?#"); i >= 0 {
-		s = s[:i] + "[redacted]"
-	}
-	if i := strings.Index(s, "//"); i >= 0 {
-		if at := strings.Index(s[i+2:], "@"); at >= 0 {
-			s = s[:i+2] + "[redacted]@" + s[i+2+at+1:]
-		}
-	}
-	return s
 }
 
 // validEnforcementValue reports whether s is an accepted enforcement posture:
