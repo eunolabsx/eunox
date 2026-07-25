@@ -198,13 +198,12 @@ func sortedRotatedSiblings(logPath string) ([]string, error) {
 // unreadable file's seqs — a duplicate-seq cascade audit-verify cannot tell from
 // tampering. The walk stops and returns unreadableNewer=true so the caller fails closed
 // (seed past the on-disk max + write a chain_resume_failed marker) instead of rewinding.
-// This restores the same fail-closed stance recoverTailAfterReadError already takes for
-// an unreadable BASE log.
+// This is the same fail-closed stance Open takes for an unreadable BASE log.
 //
 // Returns ("", "", false) when no sibling has a usable tail and none was unreadable and the
 // directory listed cleanly. An unreadable sibling FILE, or a log directory that cannot be
 // LISTED at all (any error other than a not-yet-created one), returns ("", "", true) so the
-// caller fails closed. Used at both chain-resume sites (Open, recoverTailAfterReadError).
+// caller fails closed. Used by Open's empty-base chain-resume path.
 func newestRotatedSiblingWithTail(logPath string) (path, line string, unreadableNewer bool) {
 	files, err := sortedRotatedSiblings(logPath)
 	if err != nil {

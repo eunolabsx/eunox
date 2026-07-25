@@ -5,41 +5,64 @@ package audit
 
 import (
 	"bytes"
-	"errors"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 )
 
-// TestRecoverTailAfterReadError_ReasonIsStructuredSentinel guards the structured
-// chain_resume_failed reason:
-// when the base log is non-empty but unreadable (the default branch), the reason
-// returned for the signed chain_resume_failed marker must be the structured,
-// OS-independent sentinel — never the raw OS error string, which varies by platform
-// and can embed the log file path in the append-only tape. Permission-based, so
-// skipped under root (mode bits are bypassed there), matching TestOpen_ChainResumeReadError.
-func TestRecoverTailAfterReadError_ReasonIsStructuredSentinel(t *testing.T) {
+// TestOpen_ChainResumeFailedReasonIsStructuredSentinel guards the structured
+// chain_resume_failed reason: when the log is non-empty but its tail cannot be read
+// (a write-only 0200 log, whose tail the held append handle cannot probe), the reason
+// written into the signed marker must be the structured, OS-independent sentinel —
+// never a raw OS error string, which varies by platform and can embed the log file
+// path in the append-only tape. Permission-based, so skipped under root (mode bits are
+// bypassed there), matching TestOpen_ChainResumeReadError.
+func TestOpen_ChainResumeFailedReasonIsStructuredSentinel(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("running as root bypasses file permission bits")
 	}
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "audit.jsonl")
-	// Non-empty, write-only (0200): the read-mode reopen inside readLastAuditLine
-	// fails with EACCES, so recoverTailAfterReadError takes its default (unreadable)
-	// branch and returns the chain_resume_failed reason.
+	keyPath := filepath.Join(dir, "audit.key")
+	// Non-empty and write-only: O_RDWR is refused, so Open falls back to O_WRONLY and
+	// the tail is unreadable — the one remaining chain-resume failure mode.
 	if err := os.WriteFile(logPath, []byte(`{"seq":5,"_hmac":"sha256:abc"}`+"\n"), 0o200); err != nil {
 		t.Fatalf("write write-only log: %v", err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(logPath, 0o600) })
 
-	// The readErr argument is a realistic OS error string with a path; it must NOT
-	// leak into the returned reason.
-	_, _, failed, reason := recoverTailAfterReadError(logPath, errors.New("read /var/log/audit.jsonl: input/output error"))
-	if !failed {
-		t.Fatalf("expected failed=true for a non-empty unreadable base")
+	sink, err := Open(logPath, keyPath, 0, 0)
+	if err != nil {
+		t.Fatalf("Open must succeed (audit-failure tradeoff), got %v", err)
 	}
-	if reason != auditReasonTailReadFailed {
-		t.Fatalf("reason = %q, want the structured sentinel %q (no OS error string in the signed record)", reason, auditReasonTailReadFailed)
+	if err := sink.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if err := os.Chmod(logPath, 0o600); err != nil {
+		t.Fatalf("chmod for readback: %v", err)
+	}
+	data, err := os.ReadFile(logPath) //nolint:gosec // G304: test-controlled path
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	var marker map[string]interface{}
+	for _, line := range bytes.Split(bytes.TrimSpace(data), []byte("\n")) {
+		var rec map[string]interface{}
+		if json.Unmarshal(line, &rec) != nil {
+			continue
+		}
+		details, _ := rec["details"].(map[string]interface{})
+		if details["kind"] == "chain_resume_failed" {
+			marker = details
+		}
+	}
+	if marker == nil {
+		t.Fatalf("no chain_resume_failed marker was appended; log:\n%s", data)
+	}
+	if marker["reason"] != auditReasonTailReadFailed {
+		t.Fatalf("reason = %v, want the structured sentinel %q (no OS error string in the signed record)", marker["reason"], auditReasonTailReadFailed)
 	}
 }
 
@@ -131,73 +154,87 @@ func TestScanHighestSeq_SkipsUnparseableLines(t *testing.T) {
 // TestRecoverTailAfterReadError_PrefersReadableBaseOverSibling is the regression for
 // a genuine (non-shrink) tail-read failure resuming from an OLDER rotated sibling:
 // rotated siblings carry lower seqs than the active base, so resuming from one and
-// appending to the base would duplicate the base's newer seqs. When a re-read shows
-// the base is readable and non-empty, recovery must resume from the base, never the
-// sibling.
-func TestRecoverTailAfterReadError_PrefersReadableBaseOverSibling(t *testing.T) {
+// TestOpen_PrefersReadableBaseTailOverSibling: an older rotated sibling exists
+// alongside a readable, non-empty base. Siblings are OLDER than the active base, so
+// resuming from one would rewind seq and reissue the base's newer numbers — a
+// duplicate-seq cascade audit-verify cannot tell from tampering. The base tail wins.
+func TestOpen_PrefersReadableBaseTailOverSibling(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	logPath, _ := writeChainLog(t, dir, "a", "b", "c") // base: seq 1..3, readable
+	logPath, keyPath := writeChainLog(t, dir, "a", "b", "c") // base: seq 1..3
 
-	// An older rotated sibling exists; it must NOT be preferred over a readable base.
+	// An older rotated sibling carrying a much HIGHER seq: if Open ever preferred it,
+	// the resumed seq would jump to 99 instead of continuing the base at 3.
 	sib := logPath + ".20250101T000000.000000000Z"
-	if err := os.WriteFile(sib, []byte(`{"seq":1}`+"\n"+`{"seq":2}`+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(sib, []byte(`{"seq":99,"_hmac":"sha256:old"}`+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	wantLast, err := readLastAuditLine(logPath)
-	if err != nil || wantLast == "" {
-		t.Fatalf("readLastAuditLine(base) = (%q, %v)", wantLast, err)
+	sink, err := Open(logPath, keyPath, 0, 0)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
 	}
-
-	last, seedSeq, failed, _ := recoverTailAfterReadError(logPath, errors.New("transient blip"))
-	if failed || seedSeq != 0 {
-		t.Fatalf("readable base: got failed=%v seedSeq=%d, want false / 0", failed, seedSeq)
-	}
-	if last != wantLast {
-		t.Fatalf("recovery must resume from the readable base tail, not the older sibling: got %q, want %q", last, wantLast)
+	t.Cleanup(func() { _ = sink.Close() })
+	if sink.seq != 3 {
+		t.Fatalf("resumed seq = %d, want 3 (the readable base tail, not the older sibling)", sink.seq)
 	}
 }
 
-// TestRecoverTailAfterReadError_EmptyBaseFallsBackToSibling: an empty base is the
-// shrink-race signature (a rotation moved the true tail into the newest sibling), so
-// recovery resumes from the sibling — new records append to the fresh base and cannot
-// collide.
-func TestRecoverTailAfterReadError_EmptyBaseFallsBackToSibling(t *testing.T) {
+// TestOpen_EmptyBaseFallsBackToSiblingTail: an empty base is the just-rotated (or
+// shrink-race) signature — the true tail lives in the newest rotated sibling. Resuming
+// from the empty base would restart at genesis and silently orphan every prior record
+// with no detectable gap, so Open resumes from the sibling's tail instead.
+func TestOpen_EmptyBaseFallsBackToSiblingTail(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	base := filepath.Join(dir, "audit.jsonl")
+	keyPath := filepath.Join(dir, "audit.key")
 	if err := os.WriteFile(base, nil, 0o600); err != nil { // empty base
 		t.Fatal(err)
 	}
-	sibLast := `{"seq":42}`
 	sib := base + ".20250101T000000.000000000Z"
-	if err := os.WriteFile(sib, []byte(`{"seq":41}`+"\n"+sibLast+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(sib, []byte(`{"seq":41}`+"\n"+`{"seq":42}`+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	last, seedSeq, failed, _ := recoverTailAfterReadError(base, errors.New("transient blip"))
-	if failed || seedSeq != 0 {
-		t.Fatalf("empty base + sibling: got failed=%v seedSeq=%d, want false / 0", failed, seedSeq)
+	sink, err := Open(base, keyPath, 0, 0)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
 	}
-	if last != sibLast {
-		t.Fatalf("empty base must resume from the sibling tail: got %q, want %q", last, sibLast)
+	t.Cleanup(func() { _ = sink.Close() })
+	// The sibling tail is unsigned (pre-chain), so the resume adopts its seq 42 and
+	// then the legacy_tail_resumed marker consumes 43. Either way the point stands:
+	// the counter continued from the sibling instead of restarting at genesis.
+	if sink.seq != 43 {
+		t.Fatalf("resumed seq = %d, want 43 (sibling tail seq 42, plus the legacy-resume marker)", sink.seq)
 	}
 }
 
-// TestRecoverTailAfterReadError_EmptyBaseNoSibling: an empty base with no sibling has
-// nothing to orphan, so recovery resumes cleanly from genesis (no marker, no seed).
-func TestRecoverTailAfterReadError_EmptyBaseNoSibling(t *testing.T) {
+// TestOpen_EmptyBaseNoSiblingStartsAtGenesis: an empty base with no sibling has
+// nothing to orphan, so the chain starts cleanly at genesis — no seed, no marker.
+func TestOpen_EmptyBaseNoSiblingStartsAtGenesis(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	base := filepath.Join(dir, "audit.jsonl")
+	keyPath := filepath.Join(dir, "audit.key")
 	if err := os.WriteFile(base, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	last, seedSeq, failed, _ := recoverTailAfterReadError(base, errors.New("transient blip"))
-	if last != "" || seedSeq != 0 || failed {
-		t.Fatalf("empty base, no sibling: got (%q, %d, %v), want (\"\", 0, false)", last, seedSeq, failed)
+	sink, err := Open(base, keyPath, 0, 0)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = sink.Close() })
+	if sink.seq != 0 {
+		t.Fatalf("resumed seq = %d, want 0 (genesis) for an empty base with no sibling", sink.seq)
+	}
+	data, err := os.ReadFile(base) //nolint:gosec // G304: test-controlled path
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if len(bytes.TrimSpace(data)) != 0 {
+		t.Fatalf("no marker should be written for a clean genesis start, got:\n%s", data)
 	}
 }
 
@@ -335,4 +372,52 @@ func seqViewForTestCapped(path string, bufCap int) (uint64, bool) {
 		return unreadBytes, true
 	}
 	return parsedMax, parsed
+}
+
+// TestOpen_ResumesFromTailAfterPartialWriteRecovery pins the single-read startup: the
+// tail is established from the very window truncatePartialTail probes through the held
+// append handle, so a non-clean shutdown that left an orphan fragment resumes from the
+// last COMPLETE record — with no second open of the log to re-fetch bytes already read.
+func TestOpen_ResumesFromTailAfterPartialWriteRecovery(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	logPath, keyPath := writeChainLog(t, dir, "a", "b", "c") // seq 1..3, signed
+
+	// Simulate a kill -9 mid-write: a newline-less fragment appended after seq 3.
+	ap, err := os.OpenFile(logPath, os.O_WRONLY|os.O_APPEND, 0o600) //nolint:gosec // G304: test-controlled path
+	if err != nil {
+		t.Fatalf("reopen for append: %v", err)
+	}
+	if _, err := ap.WriteString(`{"seq":4,"partial`); err != nil {
+		t.Fatalf("append orphan: %v", err)
+	}
+	if err := ap.Close(); err != nil {
+		t.Fatalf("close append handle: %v", err)
+	}
+
+	sink, err := Open(logPath, keyPath, 0, 0)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = sink.Close() })
+
+	// The orphan was dropped and the chain resumed from seq 3; the recovery marker
+	// then took seq 4. A resume that failed to read the tail would have restarted at
+	// genesis instead, reissuing seqs 1..3.
+	if sink.seq != 4 {
+		t.Fatalf("resumed seq = %d, want 4 (tail seq 3 plus the tail_partial_write_recovered marker)", sink.seq)
+	}
+	if sink.prevHMAC == "" || sink.prevHMAC == auditGenesisPrev {
+		t.Fatalf("prevHMAC = %q, want the resumed tail's chain link (not genesis)", sink.prevHMAC)
+	}
+	data, err := os.ReadFile(logPath) //nolint:gosec // G304: test-controlled path
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if bytes.Contains(data, []byte(`"partial`)) {
+		t.Fatal("the orphan fragment must be gone after recovery")
+	}
+	if !bytes.Contains(data, []byte("tail_partial_write_recovered")) {
+		t.Fatalf("expected a tail_partial_write_recovered marker; log:\n%s", data)
+	}
 }

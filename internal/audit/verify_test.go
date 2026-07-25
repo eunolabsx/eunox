@@ -1600,7 +1600,7 @@ func TestRecoverPartialTail_ProbeOrTruncateErrorIsPropagated(t *testing.T) {
 	// readable=true: this simulates a probe READ fault on a readable handle (the closed
 	// fd makes f.Stat/f.ReadAt fail), which must fail closed — distinct from a genuinely
 	// write-only log (readable=false), which skips the probe.
-	rb, err := recoverPartialTail(logPath, f, true)
+	rb, _, err := recoverPartialTail(logPath, f, true)
 	if err == nil {
 		t.Fatal("recoverPartialTail must return an error when the recovery cannot complete, not swallow it")
 	}
@@ -1658,7 +1658,7 @@ func TestRecoverPartialTail_ProbeReadFailureOnNonEmptyLogIsFatal(t *testing.T) {
 	// scenario under test is a transient read fault on a readable, non-empty log, which
 	// must fail closed (errAuditTailProbe). A genuinely write-only log uses readable=false
 	// and skips the probe (see TestRecoverPartialTail_WriteOnlyHandleSkipsProbe).
-	rb, err := recoverPartialTail(logPath, wf, true)
+	rb, _, err := recoverPartialTail(logPath, wf, true)
 	if err == nil {
 		t.Fatal("recoverPartialTail must fail closed when the tail read fails on a non-empty log, not proceed and let the next append fuse onto the orphan")
 	}
@@ -1702,9 +1702,15 @@ func TestRecoverPartialTail_WriteOnlyHandleSkipsProbe(t *testing.T) {
 	}
 	defer func() { _ = f.Close() }()
 
-	rb, err := recoverPartialTail(logPath, f, false)
+	rb, tail, err := recoverPartialTail(logPath, f, false)
 	if err != nil {
 		t.Fatalf("recoverPartialTail(readable=false) must skip the probe and proceed, got error: %v", err)
+	}
+	// A non-empty write-only log reports an UNREADABLE tail, which is what drives Open's
+	// fail-closed chain-resume (seed past the on-disk max + chain_resume_failed marker)
+	// instead of a genesis restart that would reissue every existing seq.
+	if tail.readable {
+		t.Fatal("tail.readable = true, want false for a non-empty write-only log")
 	}
 	if rb != 0 {
 		t.Fatalf("recovered bytes = %d, want 0 (the probe is skipped on a write-only handle)", rb)
@@ -1755,12 +1761,17 @@ func TestTruncatePartialTail_CleanTailIsTruncatedViaSingleHandle(t *testing.T) {
 	}
 	defer func() { _ = f.Close() }()
 
-	rb, err := truncatePartialTail(f)
+	rb, last, err := truncatePartialTail(f)
 	if err != nil {
 		t.Fatalf("truncatePartialTail: unexpected error %v", err)
 	}
 	if rb != int64(len(orphan)) {
 		t.Fatalf("recovered bytes = %d, want %d (the orphan fragment length)", rb, len(orphan))
+	}
+	// The resume line comes out of the window this call already read: it must be the
+	// last COMPLETE record, not the truncated orphan.
+	if last == "" || strings.Contains(last, `"partial`) {
+		t.Fatalf("returned tail line = %q, want the last complete record", last)
 	}
 	after, err := os.ReadFile(logPath) //nolint:gosec // G304: test-controlled path
 	if err != nil {
@@ -1775,8 +1786,8 @@ func TestTruncatePartialTail_CleanTailIsTruncatedViaSingleHandle(t *testing.T) {
 }
 
 // TestTruncatePartialTail_EmptyLogIsNonFatal confirms the preserved benign case: an empty
-// log (no orphan possible) returns (0, nil) rather than a probe error, so enforcement still
-// starts on a brand-new install.
+// log (no orphan possible) returns (0, "", nil) rather than a probe error, so enforcement
+// still starts on a brand-new install.
 func TestTruncatePartialTail_EmptyLogIsNonFatal(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "empty.jsonl")
@@ -1787,12 +1798,15 @@ func TestTruncatePartialTail_EmptyLogIsNonFatal(t *testing.T) {
 	}
 	defer func() { _ = f.Close() }()
 
-	rb, err := truncatePartialTail(f)
+	rb, last, err := truncatePartialTail(f)
 	if err != nil {
 		t.Fatalf("truncatePartialTail on an empty log must be non-fatal, got %v", err)
 	}
 	if rb != 0 {
 		t.Fatalf("recovered bytes = %d, want 0 on an empty log", rb)
+	}
+	if last != "" {
+		t.Fatalf("tail line = %q, want \"\" on an empty log", last)
 	}
 }
 
