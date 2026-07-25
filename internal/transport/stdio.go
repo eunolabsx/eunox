@@ -822,9 +822,15 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 	var wg sync.WaitGroup
 
 	// Run the blocking host read off the serve loop so the loop can select on
-	// ctx.Done()/upstreamDone too. The reader exits on the first read error (EOF) or
-	// when ctx is cancelled while it is parked trying to hand off a message; a reader
-	// still parked inside the syscall on os.Stdin is reclaimed when the process exits.
+	// ctx.Done()/upstreamDone too. The reader exits on the first read error (EOF), or
+	// when ctx is cancelled or the upstream exits while it is parked trying to hand off a
+	// message; a reader still parked inside the syscall on os.Stdin is reclaimed when the
+	// process exits (os.Stdin.Read is not context-cancelable, so this is the one leak the
+	// binary accepts — it is bounded because the sole caller is a one-shot leaf that then
+	// exits). The hand-off select mirrors the serve loop's arms below, including
+	// upstreamDone: without it a reader that finished a Read just as the loop returned via
+	// upstreamDone would block on the hand-off until ctx cancels (never, on the
+	// upstream-self-exit path), leaking for a long-lived library caller of NewStdioProxy.
 	type hostRead struct {
 		msg mcp.RPCMsg
 		err error
@@ -836,6 +842,8 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 			select {
 			case reads <- hostRead{msg: msg, err: err}:
 			case <-ctx.Done():
+				return
+			case <-p.upstreamDone:
 				return
 			}
 			// A malformed line (mcp.ErrParse) framed correctly, so keep reading — the

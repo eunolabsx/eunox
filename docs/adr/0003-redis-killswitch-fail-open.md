@@ -3,8 +3,11 @@
 - **Status:** Draft (reset from Accepted when the ADR review process was
   introduced — see [README](./README.md#process-and-lifecycle)). **Amended
   2026-06-16:** the default is now **fail-closed** with an opt-in fail-open flag,
-  superseding the original fail-open default recorded below.
-- **Date:** 2026-06-14 (original); 2026-06-16 (amendment)
+  superseding the original fail-open default recorded below. **Amended
+  2026-07-24:** documented the lifecycle and degraded-mode semantics (stopped vs.
+  unreachable, startup-subscription robustness, detection window, session-kill
+  durability) — see the section below.
+- **Date:** 2026-06-14 (original); 2026-06-16, 2026-07-24 (amendments)
 - **Deciders:** eunox maintainers
 
 ## Context
@@ -89,6 +92,85 @@ on those paths already denies.
   `--killswitch-fail-open` is the single documented way to get a fail-open path,
   logged at startup. Any *other* fail-open path remains a bug. New kill-switch
   backends should default to fail-closed and match this contract.
+
+## Lifecycle and degraded-mode semantics
+
+The fail-closed decision above governs the steady state. The lifecycle edges below
+refine what "cannot confirm" means, so a health probe and the data plane agree on
+*why* a switch is not serving allows:
+
+- **Unstarted is distinct from healthy.** A switch that is constructed but never
+  `Start`ed has never seeded its cache, so it cannot tell "nothing is killed" from
+  "state never loaded" and `ShouldBlock()` denies everything with `ErrNotStarted`
+  (a wiring error, so it too ignores `--killswitch-fail-open`). `HealthStatus()`
+  reports the same cause, checked in the same order as `ShouldBlock`'s gates:
+  reporting healthy there would publish `status: "ok"` on `/healthz` through a
+  *total* data-plane outage — the state in which a green probe misleads most.
+
+- **Stopped is distinct from unreachable.** Once the kill switch's `Start` context
+  is canceled (`Stop()`, or the caller's own context), the reconcile and pub/sub
+  loops exit and the local cache can never converge again — the switch is
+  permanently *frozen*, not transiently partitioned. `ShouldBlock()` reports
+  `ErrStopped` (and `HealthStatus()` matches) for a non-match in that state, ahead
+  of `ErrBackendUnreachable`, even though a final in-flight refresh may have also
+  latched a `context.Canceled` refresh error. Both fail closed, so this ordering is
+  purely diagnostic accuracy: a frozen switch is an operator wiring/liveness cause,
+  not a self-healing outage. `ErrStopped`, like `ErrBackendUnreachable`, fails
+  closed **regardless of `--killswitch-fail-open`** — a stopped emergency stop is
+  never a silent all-clear.
+
+- **A blackholed Redis cannot wedge startup.** `Start` confirms its pub/sub
+  subscription before the first snapshot, but that confirmation is a deadline-less
+  socket read: a half-open/blackholed connection (dial and `SUBSCRIBE` accepted,
+  confirmation never sent) would otherwise block `Start` — which holds the
+  lifecycle lock across the call — forever, deadlocking a concurrent `Stop`. The
+  confirmation read is bounded (`subscribeConfirmTimeout`); on timeout the switch
+  falls back to reconcile-only convergence exactly as for an outright subscribe
+  failure, and startup proceeds degraded rather than hanging.
+
+- **A missed confirmation is not permanent.** Because the confirmation bound is a
+  hard cutoff, a *slow but healthy* Redis — a failover, a load spike, a saturated
+  link — can miss it without being down. Dropping such an instance into
+  reconcile-only mode for the life of the process would stretch kill propagation
+  from milliseconds to a full reconcile interval until an operator restarted it, so
+  the subscription is retried in the background with capped exponential backoff
+  (`subscribeRetryInitialDelay`..`subscribeRetryMaxDelay`). The retry runs off the
+  startup path: blocking `Start` to retry would re-open the very lifecycle-lock
+  window the bound exists to close. A subscription lost *while running* (an
+  unexpected channel close) rejoins the same retry path rather than ending the
+  real-time path for the process's lifetime. Because pub/sub is at-most-once, every
+  event published during the gap was missed, so a successful resubscribe
+  immediately reconciles rather than waiting for the next tick — ordered after the
+  confirmed subscribe, mirroring the initial-snapshot ordering, so an event racing
+  that reconcile is delivered on the live subscription instead of falling into the
+  handoff window. Only the failure edge and the recovery edge are logged, so a
+  sustained outage does not log per attempt.
+
+- **Detection is bounded by the reconcile interval, level after the fact.** A
+  partition that begins *right after* a successful refresh is invisible until the
+  next reconcile tick's SCAN fails (`--killswitch-reconcile-interval`,
+  default 30 s), because staleness is observed when a refresh *runs and fails*, not
+  predicted. This is the inherent latency of the polling hot path (per-request
+  Redis checks were rejected above), and a kill already in the cache still blocks
+  throughout; only *newly issued* kills are delayed for at most one interval.
+  Shorten the interval to tighten the window at the cost of Redis load.
+
+- **Degraded-mode logging is wired in the binary.** The switch's outage and
+  recovery breadcrumbs (initial-refresh-failed, subscription-unconfirmed,
+  background-refresh failed/recovered) are gated on a configured logger; the proxy
+  now supplies one, so a partition is visible in the process log as well as on
+  `/healthz` and `/metrics`. A Redis-only flag (`--killswitch-fail-open`,
+  `--killswitch-reconcile-interval`, `--redis-password`, `--redis-tls`) set
+  *without* `--redis-addr` is rejected at startup rather than silently ignored —
+  the in-memory switch would apply none of them.
+
+- **Session kills are durable, not TTL'd.** `KillSession` writes a permanent Redis
+  key, like `KillAgent`. A TTL is deliberately not used: a kill that *silently
+  expired* while its subject was still live would be a fail-**open** transition,
+  contradicting the invariant above, and the proxy cannot know a session's real
+  lifetime. Killed-session keys therefore accumulate until an explicit
+  `ReviveSession` or `Reset` — the required cleanup path for automated kill tooling
+  that would otherwise leak tombstones.
 
 ## Alternatives considered
 
