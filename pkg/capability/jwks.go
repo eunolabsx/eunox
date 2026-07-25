@@ -77,11 +77,11 @@ func Terminal(err error) error { return &terminalError{err: err} }
 // carries one header today and this returns a single kid; consulting all headers
 // avoids a headers[0] foot-gun should a multi-signature JWS ever reach this path.
 //
-// With requireKID, the "" (kid-less) entry — which FindKeys expands to "try every
-// key" — is dropped and at least one explicit kid must remain. Without requireKID,
-// "" is preserved so a kid-less token still falls back to trying all keys. An
-// empty header list (or a requireKID token with no kid anywhere) is an error.
-func CandidateKIDs(headers []jose.Header, requireKID bool) ([]string, error) {
+// The "" (kid-less) entry — which FindKeys expands to "try every key" — is
+// preserved, so a kid-less token still falls back to trying all keys; the IdP-JWT
+// path (the only caller) enforces no kid-required policy. An empty header list is
+// an error.
+func CandidateKIDs(headers []jose.Header) ([]string, error) {
 	seen := make(map[string]bool, len(headers))
 	kids := make([]string, 0, len(headers))
 	for _, h := range headers {
@@ -89,24 +89,18 @@ func CandidateKIDs(headers []jose.Header, requireKID bool) ([]string, error) {
 			continue
 		}
 		seen[h.KeyID] = true
-		if requireKID && h.KeyID == "" {
-			continue
-		}
 		kids = append(kids, h.KeyID)
 	}
 	if len(kids) == 0 {
-		if requireKID {
-			return nil, fmt.Errorf("JWT missing required kid header")
-		}
 		return nil, fmt.Errorf("JWT has no headers")
 	}
 	return kids, nil
 }
 
 // VerifyWithKeyRotationMultiKID runs VerifyWithKeyRotation for each candidate kid
-// in order, returning the first success, so the capability-token and IdP-JWT paths
-// share multi-signature handling. kids must be non-empty (see CandidateKIDs); a ""
-// entry means "try every key". The verify closure is shared across kids; its
+// in order, returning the first success, so the IdP-JWT path handles a
+// multi-signature JWS without open-coding the loop. kids must be non-empty (see
+// CandidateKIDs); a "" entry means "try every key". The verify closure is shared across kids; its
 // freshKeySet argument is true for the first verify call against a key set this call
 // just fetched from the JWKS endpoint (a kid-miss refresh or a forced-refresh
 // rotation retry), false for a set served from cache. A closure that pins a
@@ -153,9 +147,9 @@ func VerifyWithKeyRotationMultiKID[T any](
 	return nil, lastErr
 }
 
-// VerifyWithKeyRotation runs the shared JWKS key-selection and rotation-retry
-// choreography around a caller-supplied per-key verifier, so the IdP-JWT and
-// capability-token paths cannot drift apart. The caller has already parsed the
+// VerifyWithKeyRotation runs the JWKS key-selection and rotation-retry choreography
+// around a caller-supplied per-key verifier, keeping that choreography in one place
+// (and out of the IdP-JWT verifier, its caller). The caller has already parsed the
 // token and extracted kid; this selects the candidate keys, forces a JWKS refresh
 // on a kid miss, and — when every candidate fails signature verification — forces
 // one rate-limited refresh and retries exactly once.

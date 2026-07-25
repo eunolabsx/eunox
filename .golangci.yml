@@ -169,12 +169,3 @@ linters:
         text: "Non-inherited new context"
         linters:
           - contextcheck
-      # pkg/capability: TokenCache.runCleanup can restart its loop with a LATER
-      # Start call's ctx (stashed in pendingCtx) instead of the ctx it was launched
-      # with, so a Start racing the outgoing goroutine's teardown is never silently
-      # lost (see the runCleanup doc comment). The "non-inherited" context is
-      # another Start call's own parameter, not an orphaned context.Background().
-      - path: pkg/capability/token_cache\.go
-        text: "Non-inherited new context"
-        linters:
-          - contextcheck

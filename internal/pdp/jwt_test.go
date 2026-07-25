@@ -22,6 +22,7 @@ import (
 	"github.com/go-jose/go-jose/v4/jwt"
 
 	"github.com/eunolabs/eunox/internal/mcp"
+	"github.com/eunolabs/eunox/internal/mcp/mcptest"
 	"github.com/eunolabs/eunox/pkg/capability"
 	"github.com/eunolabs/eunox/pkg/killswitch"
 )
@@ -2151,12 +2152,12 @@ func TestJWT_FilterResourcesAndPrompts(t *testing.T) {
 		Capabilities:    []string{"resource:file:///data/*", "prompt:code_review"},
 	})
 
-	resList := mcp.ResourcesListResult{Resources: []mcp.ResourceEntry{
+	resList := mcptest.ResourcesListResult{Resources: []mcptest.ResourceEntry{
 		{URI: "file:///data/report.pdf"},
 		{URI: "file:///secret/keys.txt"},
 	}}
 	resBytes, _ := json.Marshal(resList)
-	var gotRes mcp.ResourcesListResult
+	var gotRes mcptest.ResourcesListResult
 	if err := json.Unmarshal(pdp.FilterResourcesList(ctx, resBytes).Result, &gotRes); err != nil {
 		t.Fatalf("unmarshal resources: %v", err)
 	}
@@ -2164,12 +2165,12 @@ func TestJWT_FilterResourcesAndPrompts(t *testing.T) {
 		t.Errorf("resources filter = %+v, want only file:///data/report.pdf", gotRes.Resources)
 	}
 
-	prList := mcp.PromptsListResult{Prompts: []mcp.PromptEntry{
+	prList := mcptest.PromptsListResult{Prompts: []mcptest.PromptEntry{
 		{Name: "code_review"},
 		{Name: "secret_prompt"},
 	}}
 	prBytes, _ := json.Marshal(prList)
-	var gotPr mcp.PromptsListResult
+	var gotPr mcptest.PromptsListResult
 	if err := json.Unmarshal(pdp.FilterPromptsList(ctx, prBytes).Result, &gotPr); err != nil {
 		t.Fatalf("unmarshal prompts: %v", err)
 	}
@@ -3866,9 +3867,9 @@ func TestJWTCondChain_JWTPDP_ValidateToken_MultiConditionAccepted(t *testing.T) 
 
 func resourcesListJSON(t *testing.T, uris ...string) json.RawMessage {
 	t.Helper()
-	var list mcp.ResourcesListResult
+	var list mcptest.ResourcesListResult
 	for _, u := range uris {
-		list.Resources = append(list.Resources, mcp.ResourceEntry{URI: u})
+		list.Resources = append(list.Resources, mcptest.ResourceEntry{URI: u})
 	}
 	b, err := json.Marshal(list)
 	if err != nil {
@@ -3879,7 +3880,7 @@ func resourcesListJSON(t *testing.T, uris ...string) json.RawMessage {
 
 func resourceURIs(t *testing.T, raw json.RawMessage) []string {
 	t.Helper()
-	var list mcp.ResourcesListResult
+	var list mcptest.ResourcesListResult
 	if err := json.Unmarshal(raw, &list); err != nil {
 		t.Fatalf("unmarshal resources list: %v", err)
 	}
@@ -3892,9 +3893,9 @@ func resourceURIs(t *testing.T, raw json.RawMessage) []string {
 
 func promptsListJSON(t *testing.T, names ...string) json.RawMessage {
 	t.Helper()
-	var list mcp.PromptsListResult
+	var list mcptest.PromptsListResult
 	for _, n := range names {
-		list.Prompts = append(list.Prompts, mcp.PromptEntry{Name: n})
+		list.Prompts = append(list.Prompts, mcptest.PromptEntry{Name: n})
 	}
 	b, err := json.Marshal(list)
 	if err != nil {
@@ -3905,7 +3906,7 @@ func promptsListJSON(t *testing.T, names ...string) json.RawMessage {
 
 func promptNames(t *testing.T, raw json.RawMessage) []string {
 	t.Helper()
-	var list mcp.PromptsListResult
+	var list mcptest.PromptsListResult
 	if err := json.Unmarshal(raw, &list); err != nil {
 		t.Fatalf("unmarshal prompts list: %v", err)
 	}

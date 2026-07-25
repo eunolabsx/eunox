@@ -254,17 +254,21 @@ type SamplingAuthorizer interface {
 // the call must be blocked: an active kill matching the agent/session/global
 // dimension, or a kill-store error (fail closed).  A nil ks imposes no check
 // (JWT-only mode).  The agent dimension is taken from JWT claims in ctx.
-func killCheck(ctx context.Context, ks killswitch.Checker, sessionID string) *capability.EnforceResponse {
+//
+// clock is the caller's decision clock, passed through to denyResponse so a kill
+// deny stamps DecidedAt from the same source as every other deny (and as the allow
+// path), honoring a frozen test clock. A nil clock falls back to the wall clock.
+func killCheck(ctx context.Context, clock enforcement.Clock, ks killswitch.Checker, sessionID string) *capability.EnforceResponse {
 	if ks == nil {
 		return nil
 	}
 	blocked, err := ks.ShouldBlock(ctx, agentIDFromContext(ctx), sessionID)
 	if err != nil {
-		deny := denyResponse(nil, capability.ErrCodeKillSwitchError, "", "kill switch check failed: "+err.Error())
+		deny := denyResponse(clock, capability.ErrCodeKillSwitchError, "", "kill switch check failed: "+err.Error())
 		return &deny
 	}
 	if blocked {
-		deny := denyResponse(nil, capability.ErrCodeKillSwitch, "", "session has been terminated by a kill-switch command")
+		deny := denyResponse(clock, capability.ErrCodeKillSwitch, "", "session has been terminated by a kill-switch command")
 		return &deny
 	}
 	return nil
@@ -408,7 +412,7 @@ func (p AlwaysAllowPDP) DecideSampling(ctx context.Context, sessionID, _ string)
 // enumeration included. A zero-value AlwaysAllowPDP{} has no kill switch (nil ks),
 // and killCheck returns nil for a nil checker, preserving pure-passthrough.
 func (p AlwaysAllowPDP) CheckKill(ctx context.Context, sessionID string) *capability.EnforceResponse {
-	return killCheck(ctx, p.ks, sessionID)
+	return killCheck(ctx, p.clock, p.ks, sessionID)
 }
 
 // CheckAudience pins no token audience: a wiretap/audit-mode route forwards every call,
@@ -418,11 +422,13 @@ func (AlwaysAllowPDP) CheckAudience(_ context.Context) *capability.EnforceRespon
 }
 
 // RecordObservedToolHashes records no hashes — a wiretap PDP pins no tool
-// descriptions — but still reports an accurate entry count via the same
-// passThroughList decode FilterToolsList uses, so the caller need not decode result a
-// second time just to count entries (see CountListEntries).
+// descriptions — but still reports an entry count for the caller's audit record.
+// With no pin to arm and no catalog to carry, only the count is wanted, so this
+// takes the length-only countListEntries rather than building an ordered envelope
+// (key slice plus key-to-RawMessage map) and discarding all of it. That is the same
+// best-effort accounting the exported CountListEntries does on this very path.
 func (AlwaysAllowPDP) RecordObservedToolHashes(_ context.Context, result json.RawMessage) int {
-	return passThroughList(result, listKeyTools).Upstream
+	return countListEntries(result, listKeyTools)
 }
 
 // ReleaseSession is a no-op: a wiretap PDP enforces no policy and holds no per-session
@@ -507,10 +513,11 @@ func (DenyAllPDP) CheckAudience(_ context.Context) *capability.EnforceResponse {
 }
 
 // RecordObservedToolHashes records no hashes — the "no policy" default pins no tool
-// descriptions (and denies every call regardless) — but still reports an accurate
-// entry count, matching AlwaysAllowPDP, so a caller need not decode result again.
+// descriptions (and denies every call regardless) — but still reports an entry count
+// for the caller's audit record, via the same length-only countListEntries
+// AlwaysAllowPDP uses.
 func (DenyAllPDP) RecordObservedToolHashes(_ context.Context, result json.RawMessage) int {
-	return passThroughList(result, listKeyTools).Upstream
+	return countListEntries(result, listKeyTools)
 }
 
 // ReleaseSession is a no-op: the fail-closed default holds no per-session flow state.
@@ -790,7 +797,7 @@ func (p *ManifestPDP) pinViolated(name, pin string) bool {
 // the session is killed (or the kill store errors, fail closed). It shares
 // killCheck with the Decide* paths so the */list handlers enforce it identically.
 func (p *ManifestPDP) CheckKill(ctx context.Context, sessionID string) *capability.EnforceResponse {
-	return killCheck(ctx, p.ks, sessionID)
+	return killCheck(ctx, p.engineClock(), p.ks, sessionID)
 }
 
 // CheckAudience pins no token audience: the manifest layer enforces capabilities, not
@@ -842,7 +849,7 @@ const (
 func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target EnforceTarget, args map[string]interface{}, sourceIP string, schema schemaMode) capability.EnforceResponse {
 	// Kill switch check: per-agent (JWT agent_id from ctx), per-session, and
 	// global kills are honored; a kill-store error fails closed.
-	if deny := killCheck(ctx, p.ks, sessionID); deny != nil {
+	if deny := killCheck(ctx, p.engineClock(), p.ks, sessionID); deny != nil {
 		return *deny
 	}
 
@@ -1478,7 +1485,7 @@ func (p *ManifestPDP) DecideResourceRead(ctx context.Context, sessionID, uri, so
 // the request so an ipRange condition on the opt-in sees a real address rather
 // than failing closed with MISSING_CONTEXT.
 func (p *ManifestPDP) DecideSampling(ctx context.Context, sessionID, sourceIP string) capability.EnforceResponse {
-	if deny := killCheck(ctx, p.ks, sessionID); deny != nil {
+	if deny := killCheck(ctx, p.engineClock(), p.ks, sessionID); deny != nil {
 		return *deny
 	}
 
