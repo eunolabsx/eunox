@@ -526,9 +526,15 @@ func runStdioFull(c *stdioConn, s *suite) {
 		s.bad("prompts/list filtering", fmt.Sprintf("err=%v\n      got:  %v\n      want: %v", e, gotPrompts, wantPrompts))
 	}
 
-	// ── unmapped / pass-through methods are denied by default ──
+	// ── ping is answered locally, NOT denied ──
+	// It carries no arguments, names no target, and reaches no upstream, so there is
+	// nothing for a manifest to authorize; denying it broke the liveness probe every MCP
+	// host is entitled to send. It is answered by the proxy (never forwarded, so it cannot
+	// probe upstream liveness) and still passes through the shared kill gate.
 	m, e = c.call("ping", map[string]interface{}{})
-	s.expectDeny("ping -> DENY (unmapped method)", "AUTHORIZATION_FAILED", "", m, e)
+	s.expectAllow("ping -> ALLOW (answered locally by the proxy)", m, e)
+
+	// ── unmapped / pass-through methods are denied by default ──
 	m, e = c.call("completion/complete", map[string]interface{}{"ref": map[string]interface{}{}})
 	s.expectDeny("completion/complete -> DENY (unmapped method)", "AUTHORIZATION_FAILED", "", m, e)
 	m, e = c.call("foo/bar", map[string]interface{}{})

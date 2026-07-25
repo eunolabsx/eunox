@@ -2556,31 +2556,12 @@ func ApplyRedactObligs(resultBytes []byte, obligs []capability.Obligation) ([]by
 	// what the operator asked for. The same container walk structuredContent uses is
 	// reused, so a doubly-encoded JSON string leaf is unwrapped identically and the depth
 	// bound applies the same way.
-	for key, val := range result {
-		if key == "content" || key == "structuredContent" {
-			continue // already handled with their own shape-specific rigor above
-		}
-		switch v := val.(type) {
-		case map[string]interface{}, []interface{}:
-			c, err := redactStructuredContentValue(v, paths, "", 0)
-			if err != nil {
-				return nil, err // fail closed
-			}
-			if c {
-				changed = true
-			}
-		case string:
-			out, c, err := redactContainerString(v, paths, "", 0)
-			if err != nil {
-				return nil, err // fail closed
-			}
-			if c {
-				result[key] = out
-				changed = true
-			}
-		default:
-			// A scalar (number, bool, null) carries no named field and cannot hide one.
-		}
+	sibChanged, sibErr := redactSiblingTopLevelKeys(result, paths)
+	if sibErr != nil {
+		return nil, sibErr // fail closed
+	}
+	if sibChanged {
+		changed = true
 	}
 
 	// No path matched anything: return the original bytes verbatim so a response
@@ -2892,6 +2873,51 @@ func redactJSONValue(val interface{}, paths []string) bool {
 // both funnel string leaves through the shared redactContainerString core. A change to which
 // shapes redact versus pass through must be mirrored in both, or top-level and nested values
 // of the same shape would redact differently.
+// redactSiblingTopLevelKeys applies the redaction paths to every top-level result key
+// OTHER than content and structuredContent, which ApplyRedactObligs handles with their own
+// shape-specific rigor.
+//
+// Split out of ApplyRedactObligs to keep that function within the cognitive-complexity
+// budget, not because the walk is independent of it: it is the third of the three passes
+// the doc there describes, and skipping it forwards a field the manifest declared
+// redactable simply because the upstream put it under an unmodelled key.
+//
+// Redacting unmodelled keys rather than failing the response closed on their presence is
+// deliberate: _meta, annotations, and vendor extensions are ordinary and legitimate, so
+// refusing them would break honest upstreams, while masking is exactly what the operator
+// asked for. Reuses structuredContent's container walk, so a doubly-encoded JSON string
+// leaf is unwrapped identically and the depth bound applies the same way.
+func redactSiblingTopLevelKeys(result map[string]interface{}, paths []string) (bool, error) {
+	changed := false
+	for key, val := range result {
+		if key == "content" || key == "structuredContent" {
+			continue
+		}
+		switch v := val.(type) {
+		case map[string]interface{}, []interface{}:
+			c, err := redactStructuredContentValue(v, paths, "", 0)
+			if err != nil {
+				return false, err // fail closed
+			}
+			if c {
+				changed = true
+			}
+		case string:
+			out, c, err := redactContainerString(v, paths, "", 0)
+			if err != nil {
+				return false, err // fail closed
+			}
+			if c {
+				result[key] = out
+				changed = true
+			}
+		default:
+			// A scalar (number, bool, null) carries no named field and cannot hide one.
+		}
+	}
+	return changed, nil
+}
+
 func redactStructuredContentField(result map[string]interface{}, paths []string) (bool, error) {
 	sc, ok := result["structuredContent"]
 	if !ok {
