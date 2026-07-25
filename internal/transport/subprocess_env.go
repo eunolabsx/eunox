@@ -5,6 +5,7 @@ package transport
 
 import (
 	"os"
+	"os/exec"
 	"slices"
 	"strings"
 )
@@ -34,13 +35,26 @@ var sensitiveUpstreamEnvPrefixes = []string{
 	"EUNOX_REDIS_PASSWORD=",
 }
 
+// ConfigureUpstreamCmd applies the settings every upstream subprocess must have before
+// it is started, and is the ONLY approved way to prepare one. Centralizing the
+// application — not just the denylist — is the point: a spawn site that hand-assigns
+// cmd.Env can silently omit it, and a nil cmd.Env inherits the proxy's entire
+// os.Environ() (control token, Redis password) into the least-trusted process. That
+// failure mode is invisible, so the secure default must be un-forgettable rather than
+// re-typed per site.
+//
+// It takes an already-built *exec.Cmd so it fits both the transports' deliberate
+// exec.Command (subprocess lifecycles are managed explicitly, not by a context) and the
+// CLI probe's exec.CommandContext. Call it immediately after construction, before Start.
+func ConfigureUpstreamCmd(cmd *exec.Cmd) {
+	cmd.Stderr = os.Stderr
+	cmd.Env = UpstreamEnv()
+}
+
 // UpstreamEnv returns the current process environment with every eunox-owned secret
 // (sensitiveUpstreamEnvPrefixes) removed, for use as an upstream subprocess's cmd.Env.
-// Every subprocess spawn site — the stdio runtime upstream, the HTTP per-session
-// upstream, and the CLI init/validate --live probe — MUST set cmd.Env to this rather
-// than leaving it nil (which would inherit os.Environ() verbatim), so the proxy's
-// secrets never reach the child. Exported so the cmd/eunox live-upstream probe shares
-// the one denylist.
+// Prefer ConfigureUpstreamCmd, which applies this along with the other required spawn
+// settings; this is exported for callers that need the filtered environment itself.
 func UpstreamEnv() []string {
 	return slices.DeleteFunc(os.Environ(), func(kv string) bool {
 		for _, prefix := range sensitiveUpstreamEnvPrefixes {

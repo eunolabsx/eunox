@@ -408,6 +408,13 @@ func rejectDuplicateJSONKeys(raw json.RawMessage) error {
 		}
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
+	// Mirror the real decode's UseNumber. Without it Token() materializes every numeric
+	// value as a float64 and returns an error for any magnitude past float64 max, so a
+	// valid, duplicate-free params body carrying a large number (1e309, a 310-digit
+	// integer) would be rejected here as malformed — defeating the full-precision
+	// guarantee DecodeParams documents above. This walk only inspects object KEYS; the
+	// numeric form it yields is irrelevant beyond not erroring.
+	dec.UseNumber()
 	for {
 		tok, err := dec.Token()
 		if errors.Is(err, io.EOF) {
@@ -420,7 +427,10 @@ func rejectDuplicateJSONKeys(raw json.RawMessage) error {
 		case json.Delim:
 			switch t {
 			case '{':
-				stack = append(stack, frame{object: true, seen: map[string]struct{}{}, expectKey: true})
+				// seen is allocated lazily on the first key (a nil map reads fine), so a
+				// payload of many empty objects — [{},{},{}, ...], which a 4 MiB body can
+				// hold ~1.3M of — does not allocate a map header per object.
+				stack = append(stack, frame{object: true, expectKey: true})
 			case '[':
 				stack = append(stack, frame{object: false})
 			case '}', ']':
@@ -431,6 +441,9 @@ func rejectDuplicateJSONKeys(raw json.RawMessage) error {
 			if n := len(stack); n > 0 && stack[n-1].object && stack[n-1].expectKey {
 				if _, dup := stack[n-1].seen[t]; dup {
 					return fmt.Errorf("%w: duplicate object key %q", ErrParse, t)
+				}
+				if stack[n-1].seen == nil {
+					stack[n-1].seen = make(map[string]struct{}, 1)
 				}
 				stack[n-1].seen[t] = struct{}{}
 				stack[n-1].expectKey = false

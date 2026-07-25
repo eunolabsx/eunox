@@ -444,10 +444,7 @@ func (p *StdioProxy) connectUpstream(ctx context.Context) error {
 	// EOF), matching the HTTP transport's deliberate exec.Command choice in
 	// http_session.go's newSession.
 	p.upCmd = exec.Command(p.command, p.args...) //nolint:gosec,noctx // G204: args are user-supplied CLI arguments; lifecycle managed by signalUpstream/awaitUpstreamDrain, not ctx (matches http_session.go)
-	p.upCmd.Stderr = os.Stderr
-	// Filter eunox-owned secrets out of the child environment (see UpstreamEnv): a nil
-	// cmd.Env would inherit the proxy's entire os.Environ() into the least-trusted process.
-	p.upCmd.Env = UpstreamEnv()
+	ConfigureUpstreamCmd(p.upCmd)
 
 	upIn, err := p.upCmd.StdinPipe()
 	if err != nil {

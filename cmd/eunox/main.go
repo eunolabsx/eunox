@@ -1224,6 +1224,13 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 	// can disable a non-zero --session-idle-timeout flag; an absent key (nil) leaves the
 	// flag's value in force. Mirrors ResolveMaxSessions.
 	sessionIdleMs := transport.ResolveSessionIdleTimeout(pf.sessionIdleTimeoutMs, cfg.Listen.SessionIdleTimeoutMs)
+	// listen.trustedProxyHops is config-only (no flag): the chain depth is a property of
+	// the deployment's topology, not something to toggle per invocation. Leaving it 0 when
+	// the key is absent lets the constructor apply the single-proxy default.
+	var trustedProxyHops int
+	if h := cfg.Listen.TrustedProxyHops; h != nil {
+		trustedProxyHops = *h
+	}
 
 	// Fail closed when a route manifest declares an `audience` pin but no --jwks-uri was
 	// set: the pin is a JWT concept consulted only when the JWT PDP is stood up (below),
@@ -1340,6 +1347,7 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 		ControlToken:       controlToken,
 		TrustFwdFor:        pf.trustFwdFor,
 		TrustedProxyCIDRs:  cfg.Listen.TrustedProxyCIDRs,
+		TrustedProxyHops:   trustedProxyHops,
 		Bind:               bind,
 		Port:               cfg.Listen.Port,
 		AllowedOrigins:     cfg.Listen.AllowedOrigins,

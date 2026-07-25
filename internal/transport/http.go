@@ -188,6 +188,12 @@ type HTTPProxy struct {
 	// networks before X-Forwarded-For is honored — see sourceIP. Empty means no peer
 	// can ever match, so trustFwdFor alone has no effect until CIDRs are configured.
 	trustedProxyNets []*net.IPNet
+	// trustedProxyHops is listen.trustedProxyHops: the number of trusted proxies in
+	// front of eunox, and so how many right-most X-Forwarded-For entries are
+	// proxy-written. 0 means unset; sourceIP reads it through proxyHops, which supplies
+	// the single-proxy default, so the zero value is the common production case rather
+	// than an invalid one.
+	trustedProxyHops int
 	bind             string
 	port             int
 
@@ -267,8 +273,12 @@ type HTTPGatewayOptions struct {
 	// an entry that still fails to parse here is skipped (never trusted) and logged,
 	// rather than silently narrowing the allowlist.
 	TrustedProxyCIDRs []string
-	Bind              string
-	Port              int
+	// TrustedProxyHops is listen.trustedProxyHops: how many trusted proxies sit in
+	// front of eunox, i.e. how many right-most X-Forwarded-For entries were written by
+	// trusted hops. 0 (unset) is normalized to 1. See sourceIP.
+	TrustedProxyHops int
+	Bind             string
+	Port             int
 
 	// RequireAuditStrict is the --require-audit=strict gate: deny enforced forwards
 	// (and */list enumeration) fail-closed once the shared audit trail degrades.
@@ -325,6 +335,7 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 		authTimingKey:      newAuthTimingKey(),
 		trustFwdFor:        opts.TrustFwdFor,
 		trustedProxyNets:   trustedProxyNets,
+		trustedProxyHops:   opts.TrustedProxyHops,
 		bind:               opts.Bind,
 		port:               opts.Port,
 		maxSessions:        opts.MaxSessions,

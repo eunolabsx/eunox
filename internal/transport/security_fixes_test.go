@@ -47,6 +47,57 @@ func TestLoopbackOnly_DNSRebindingHostRejected(t *testing.T) {
 	}
 }
 
+// TestLoopbackOnly_AdmitsLocalNonAllowlistedHosts pins that the DNS-rebinding Host pin
+// does not 403 legitimate local callers whose Host is not one of the seeded allowlist
+// names. A rebind necessarily presents a NAME the attacker controls, so admitting
+// loopback literals and an absent Host costs nothing: fetching a literal directly is
+// cross-origin and requireValidOrigin rejects it before the handler, and browsers always
+// send Host. Without this, an HTTP/1.0 probe or a scrape via an alternate loopback
+// address regressed from 200 to 403.
+func TestLoopbackOnly_AdmitsLocalNonAllowlistedHosts(t *testing.T) {
+	t.Parallel()
+	// Wildcard bind: the allowlist is exactly {localhost, 127.0.0.1, ::1}, so every
+	// Host below is genuinely outside it.
+	p := &HTTPProxy{allowedOriginHosts: buildAllowedOriginHosts("0.0.0.0")}
+	check := func(remoteAddr, host string) bool {
+		r := httptest.NewRequest(http.MethodGet, "/healthz", http.NoBody)
+		r.RemoteAddr = remoteAddr
+		r.Host = host
+		return p.loopbackOnly(httptest.NewRecorder(), r)
+	}
+	allow := []struct{ name, remote, host string }{
+		{"alternate loopback literal", "127.0.0.2:5555", "127.0.0.2:3000"},
+		{"alternate loopback literal, no port", "127.0.0.2:5555", "127.0.0.2"},
+		{"another loopback literal", "127.1.2.3:5555", "127.1.2.3:3000"},
+		{"absent Host (HTTP/1.0 probe)", "127.0.0.1:5555", ""},
+		{"localhost with trailing FQDN dot", "127.0.0.1:5555", "localhost."},
+		{"uppercase localhost", "127.0.0.1:5555", "LOCALHOST:3000"},
+	}
+	for _, tc := range allow {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if !check(tc.remote, tc.host) {
+				t.Errorf("loopbackOnly(remote=%q, Host=%q) = false, want true (legitimate local caller)", tc.remote, tc.host)
+			}
+		})
+	}
+	// The guard must still hold: a foreign NAME is what a rebind presents.
+	deny := []struct{ name, remote, host string }{
+		{"rebound attacker name", "127.0.0.1:5555", "attacker.com"},
+		{"rebound attacker name with port", "127.0.0.1:5555", "attacker.com:3000"},
+		{"non-loopback literal Host", "127.0.0.1:5555", "8.8.8.8"},
+		{"name resolving nowhere", "127.0.0.1:5555", "internal.corp.example"},
+	}
+	for _, tc := range deny {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if check(tc.remote, tc.host) {
+				t.Errorf("loopbackOnly(remote=%q, Host=%q) = true, want false (rebinding guard)", tc.remote, tc.host)
+			}
+		})
+	}
+}
+
 // TestUpstreamEnv_FiltersEunoxSecrets pins that UpstreamEnv strips the eunox-owned
 // secrets an upstream subprocess must never inherit, while leaving every other variable
 // (including benign EUNOX_* config) intact.
@@ -78,17 +129,21 @@ func TestUpstreamEnv_FiltersEunoxSecrets(t *testing.T) {
 	}
 }
 
-// TestSourceIP_WalksPastTrustedProxyChain pins that sourceIP resolves the real client
-// behind a CHAIN of trusted proxies by walking X-Forwarded-For right-to-left and
-// skipping trusted-proxy hops, rather than blindly taking the right-most entry (which is
-// the inner proxy's own address when two or more trusted proxies are chained).
-func TestSourceIP_WalksPastTrustedProxyChain(t *testing.T) {
+// TestSourceIP_CountsDeclaredProxyHops pins that sourceIP resolves the client behind a
+// CHAIN of trusted proxies by counting declared hops (listen.trustedProxyHops) rather
+// than by testing entries against trustedProxyCIDRs.
+//
+// Counting is what makes the resolution unspoofable. Inferring hops from CIDR membership
+// cannot distinguish a proxy's appended entry from a client whose OWN address falls in
+// the trusted range, so it would skip the client's real entry and return a forged one to
+// its left — see the "client inside the trusted CIDR" cases, which are the regression
+// this test exists to hold.
+func TestSourceIP_CountsDeclaredProxyHops(t *testing.T) {
 	t.Parallel()
 	_, trusted, err := net.ParseCIDR("10.0.0.0/8")
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := &HTTPProxy{trustFwdFor: true, trustedProxyNets: []*net.IPNet{trusted}}
 	mk := func(remoteAddr string, xff ...string) *http.Request {
 		r := httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody)
 		r.RemoteAddr = remoteAddr
@@ -99,21 +154,39 @@ func TestSourceIP_WalksPastTrustedProxyChain(t *testing.T) {
 	}
 	cases := []struct {
 		name   string
+		hops   int
 		remote string
 		xff    []string
 		want   string
 	}{
-		{"untrusted peer ignores XFF entirely", "203.0.113.9:5", []string{"1.2.3.4"}, "203.0.113.9"},
-		{"single trusted hop -> right-most is the client", "10.0.0.1:5", []string{"1.2.3.4"}, "1.2.3.4"},
-		{"two trusted hops -> skip the inner proxy", "10.0.0.2:5", []string{"1.2.3.4, 10.0.0.1"}, "1.2.3.4"},
-		{"three trusted hops", "10.0.0.3:5", []string{"1.2.3.4, 10.0.0.1, 10.0.0.2"}, "1.2.3.4"},
-		{"multiple XFF lines are flattened", "10.0.0.2:5", []string{"1.2.3.4", "10.0.0.1"}, "1.2.3.4"},
-		{"all entries trusted -> fall through to RemoteAddr", "10.0.0.2:5", []string{"10.0.0.1"}, "10.0.0.2"},
-		{"forged left-most hop is ignored", "10.0.0.1:5", []string{"9.9.9.9, 1.2.3.4"}, "1.2.3.4"},
+		{"untrusted peer ignores XFF entirely", 1, "203.0.113.9:5", []string{"1.2.3.4"}, "203.0.113.9"},
+		{"unset hop count defaults to the single-proxy right-most read", 0, "10.0.0.1:5", []string{"1.2.3.4"}, "1.2.3.4"},
+		{"single hop -> right-most is the client", 1, "10.0.0.1:5", []string{"1.2.3.4"}, "1.2.3.4"},
+		{"two hops -> second from the right", 2, "10.0.0.2:5", []string{"1.2.3.4, 10.0.0.1"}, "1.2.3.4"},
+		{"three hops -> third from the right", 3, "10.0.0.3:5", []string{"1.2.3.4, 10.0.0.1, 10.0.0.2"}, "1.2.3.4"},
+		{"multiple XFF lines are flattened before counting", 2, "10.0.0.2:5", []string{"1.2.3.4", "10.0.0.1"}, "1.2.3.4"},
+		{"forged left-most hop is ignored", 1, "10.0.0.1:5", []string{"9.9.9.9, 1.2.3.4"}, "1.2.3.4"},
+		{"forged hops cannot lengthen the chain", 2, "10.0.0.2:5", []string{"9.9.9.9, 8.8.8.8, 1.2.3.4, 10.0.0.1"}, "1.2.3.4"},
+
+		// The regression: the client's own address is inside trustedProxyCIDRs, so a
+		// membership test would mistake its proxy-appended entry for a hop, skip it, and
+		// hand back the attacker-chosen 192.168.1.5. Counting reads the real entry.
+		{"client inside the trusted CIDR is not skipped", 1, "10.0.0.1:5", []string{"192.168.1.5, 10.5.5.5"}, "10.5.5.5"},
+		{"client inside the trusted CIDR behind two hops", 2, "10.0.0.2:5", []string{"192.168.1.5, 10.5.5.5, 10.0.0.1"}, "10.5.5.5"},
+
+		// Chain shorter than declared: nothing is provably proxy-written, so fall back to
+		// the immediate peer instead of trusting a client-supplied entry.
+		{"chain shorter than declared hops falls back to RemoteAddr", 3, "10.0.0.2:5", []string{"1.2.3.4, 10.0.0.1"}, "10.0.0.2"},
+		{"single entry with two declared hops falls back", 2, "10.0.0.2:5", []string{"1.2.3.4"}, "10.0.0.2"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
+			p := &HTTPProxy{
+				trustFwdFor:      true,
+				trustedProxyNets: []*net.IPNet{trusted},
+				trustedProxyHops: tc.hops,
+			}
 			if got := p.sourceIP(mk(tc.remote, tc.xff...)); got != tc.want {
 				t.Fatalf("sourceIP = %q, want %q", got, tc.want)
 			}

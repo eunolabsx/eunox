@@ -49,6 +49,12 @@ func TestDecodeParams_RejectsDuplicateKeys(t *testing.T) {
 		{"same key across array elements is fine", `{"batch":[{"k":1},{"k":2}]}`},
 		{"null params", `null`},
 		{"nested arrays and scalars", `{"n":1,"list":[1,2,3],"obj":{"x":true,"y":null}}`},
+		// The duplicate-key walk must not narrow what DecodeParams accepts. A number
+		// past float64 max is valid JSON with no duplicate key, and is only rejected if
+		// the walk's decoder forgets UseNumber and materializes values as float64.
+		{"number beyond float64 max", `{"name":"compute","arguments":{"scale":1e309}}`},
+		{"large mantissa", `{"arguments":{"n":2.5e308}}`},
+		{"integer beyond int64", `{"arguments":{"n":123456789012345678901234567890}}`},
 	}
 	for _, tc := range accept {
 		t.Run(tc.name, func(t *testing.T) {
@@ -58,5 +64,28 @@ func TestDecodeParams_RejectsDuplicateKeys(t *testing.T) {
 				t.Fatalf("DecodeParams(%s) = %v, want nil (no duplicate key)", tc.raw, err)
 			}
 		})
+	}
+}
+
+// TestDecodeParams_PreservesNumericPrecision pins the end-to-end guarantee DecodeParams
+// documents: a caller-supplied integer that float64 cannot represent (2^53+1 rounds down)
+// survives the decode as an exact json.Number. The duplicate-key walk runs first and has
+// its own decoder, so this also guards against that walk silently reintroducing float64
+// number handling — a numeric constraint must compare the value the caller actually sent,
+// because the upstream receives the original bytes verbatim.
+func TestDecodeParams_PreservesNumericPrecision(t *testing.T) {
+	t.Parallel()
+	const exact = "9007199254740993" // 2^53+1: not representable as a float64
+	var v struct {
+		Arguments struct {
+			N json.Number `json:"n"`
+		} `json:"arguments"`
+	}
+	raw := json.RawMessage(`{"arguments":{"n":` + exact + `}}`)
+	if err := DecodeParams(raw, &v); err != nil {
+		t.Fatalf("DecodeParams(%s) = %v, want nil", raw, err)
+	}
+	if got := v.Arguments.N.String(); got != exact {
+		t.Fatalf("decoded n = %s, want %s (precision lost)", got, exact)
 	}
 }
