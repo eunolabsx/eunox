@@ -49,6 +49,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -422,9 +423,17 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	// after expansion.
 	rawUpstreamAuth := make([]string, len(cfg.Upstreams))
 	rawUpstreamURL := make([]string, len(cfg.Upstreams))
+	// And the same for a stdio upstream's command and args, the last expanded fields
+	// with no unset-reference guard: `command: ${SERVER_BIN}` with the variable unset
+	// booted cleanly and failed per SESSION at exec time, turning a config error into a
+	// runtime one that surfaces once a client connects rather than at startup.
+	rawCommand := make([]string, len(cfg.Upstreams))
+	rawArgs := make([][]string, len(cfg.Upstreams))
 	for i := range cfg.Upstreams {
 		rawUpstreamAuth[i] = cfg.Upstreams[i].UpstreamAuthHeader
 		rawUpstreamURL[i] = cfg.Upstreams[i].UpstreamURL
+		rawCommand[i] = cfg.Upstreams[i].Command
+		rawArgs[i] = slices.Clone(cfg.Upstreams[i].Args)
 	}
 
 	// Expand on the PARSED string values, never the raw text: substituting into
@@ -485,6 +494,22 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	for i := range cfg.Upstreams {
 		if err := failOnUnsetEnvRef(path, fmt.Sprintf("upstream %q upstreamUrl", cfg.Upstreams[i].Name), rawUpstreamURL[i]); err != nil {
 			return nil, err
+		}
+	}
+
+	// Same guard for a stdio upstream's command and args. Without it, an unset
+	// ${SERVER_BIN} survives as literal text and the route boots; the failure lands at
+	// exec time on the FIRST SESSION instead of at startup, so the operator learns of a
+	// plain config typo from a client's failed handshake. Every sibling expanded field
+	// fails closed here; these were the last two that did not.
+	for i := range cfg.Upstreams {
+		if err := failOnUnsetEnvRef(path, fmt.Sprintf("upstream %q command", cfg.Upstreams[i].Name), rawCommand[i]); err != nil {
+			return nil, err
+		}
+		for j, raw := range rawArgs[i] {
+			if err := failOnUnsetEnvRef(path, fmt.Sprintf("upstream %q args[%d]", cfg.Upstreams[i].Name, j), raw); err != nil {
+				return nil, err
+			}
 		}
 	}
 

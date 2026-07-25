@@ -193,14 +193,35 @@ func unmarshalCondition(data []byte) (Condition, error) {
 		return nil, fmt.Errorf("unknown condition type: %q", envelope.Type)
 	}
 
+	// Strip the discriminator, then decode STRICTLY. A lenient decode silently drops a
+	// misspelled field, and for a condition that means a policy quietly wider than
+	// written: {"type":"timeWindow","notBefore":...,"notAfterr":...} decodes with
+	// NotAfter == "" and enforces only the lower bound. The binary's manifest loader
+	// runs its own recursive unknown-key check, but this decoder is also the exported
+	// seam (ConditionWrapper) a library consumer decodes through, and a security
+	// primitive must not depend on the caller remembering to re-validate.
+	//
+	// "type" is deleted rather than allowlisted because it belongs to the envelope, not
+	// to any condition struct — leaving it in would make every decode fail.
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return nil, err
+	}
+	delete(fields, "type")
+	body, err := json.Marshal(fields)
+	if err != nil {
+		return nil, err
+	}
+
 	// Decode with UseNumber so numeric policy literals stay json.Number rather than
 	// being widened to float64 (which rounds integers above 2^53, e.g. authorizing
 	// the neighbour of 9007199254740993). Request arguments are decoded the same
 	// way, and numericEqual compares the preserved json.Number values exactly.
-	dec := json.NewDecoder(bytes.NewReader(data))
+	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()
+	dec.DisallowUnknownFields()
 	if err := dec.Decode(target); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("condition %q: %w", envelope.Type, err)
 	}
 
 	return target, nil

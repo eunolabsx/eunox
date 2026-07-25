@@ -1104,13 +1104,8 @@ func numericEqual(a, b any) bool {
 	return aOK && bOK && fa == fb
 }
 
-// int64 bounds expressed as float64. 2^63 is exactly representable in float64, so
-// the half-open guard [minInt64Float, twoTo63Float) admits exactly the floats
-// that convert to a valid int64 without overflow.
 const (
-	minInt64Float = -9223372036854775808.0 // -2^63
-	twoTo63Float  = 9223372036854775808.0  // 2^63 (one past math.MaxInt64)
-	maxInt64Uint  = uint64(1<<63 - 1)      // math.MaxInt64
+	maxInt64Uint = uint64(1<<63 - 1) // math.MaxInt64
 )
 
 // asInt64 reports the int64 value of v when v holds an integer: any signed/unsigned
@@ -1161,19 +1156,13 @@ func asInt64(v any) (int64, bool) {
 	return 0, false
 }
 
-// floatToInt64 returns f as an int64 when f is integral and within int64 range,
-// reporting false otherwise. The range is guarded before the conversion because a
-// float outside int64 range converts to an implementation-defined value in Go.
-func floatToInt64(f float64) (int64, bool) {
-	if f < minInt64Float || f >= twoTo63Float {
-		return 0, false
-	}
-	i := int64(f)
-	if float64(i) != f { // f carried a fractional part
-		return 0, false
-	}
-	return i, true
-}
+// floatToInt64 is capability.FloatToInt64, kept as a local alias so the call sites
+// below stay unchanged. The rule itself lives in pkg/capability — the package that
+// also needs it, and that this package already imports — because a bound comparison
+// silently switching between exact-integer and float arithmetic is the difference
+// between authorizing 9007199254740993 and its neighbour, and two copies of that rule
+// is one copy too many.
+var floatToInt64 = capability.FloatToInt64
 
 // toFloat64 converts any Go numeric type to float64, reporting false for
 // non-numeric values. bool is deliberately excluded so that true/1 and false/0

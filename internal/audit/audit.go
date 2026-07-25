@@ -1912,19 +1912,6 @@ func truncatedObligations(kept []string, total int) []string {
 	}
 }
 
-// mcpMethodToTargetType maps an MCP method name to its TargetType, deriving
-// from capability.MethodTargetType — the single source of truth shared with
-// internal/transport's dispatch map — rather than keeping a second, raw-literal
-// copy of the mapping here. Returns an error for methods that have no
-// TargetType mapping.
-func mcpMethodToTargetType(method string) (capability.TargetType, error) {
-	tt, ok := capability.MethodTargetType(method)
-	if !ok {
-		return "", fmt.Errorf("unknown MCP method %q has no TargetType mapping", method)
-	}
-	return tt, nil
-}
-
 // deriveTargetFields resolves the structured target identity from the MCP method.
 // target_type is taken from the method (authoritative), never inferred from the
 // overloaded identifier, so an opaque resource URI or an oddly-named tool is
@@ -1936,8 +1923,10 @@ func deriveTargetFields(method, identifier string) (mcpMethod, targetType, targe
 	if method == "" {
 		return "", "", ""
 	}
-	tt, err := mcpMethodToTargetType(method)
-	if err != nil {
+	// capability.MethodTargetType is the single source of truth for this mapping,
+	// shared with internal/transport's dispatch map, so no second copy lives here.
+	tt, ok := capability.MethodTargetType(method)
+	if !ok {
 		// Post-dispatch: an unrecognized method string. Preserve it (bounded, since
 		// it is attacker-controlled) so SIEM and suggest can distinguish these from
 		// pre-dispatch denials.

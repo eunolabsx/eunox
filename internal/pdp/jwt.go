@@ -232,9 +232,11 @@ type JWTPDP struct {
 	experimentalCapabilities bool
 	// tokenCache memoizes verified *JWTClaims by token hash so a repeat bearer token
 	// skips signature re-verification and the two claim decodes (see newJWTTokenCache).
-	// Consulted only by ValidateToken (the shared validator); per-route wrappers call
-	// Decide, not ValidateToken, so their cache stays empty. The kill switch, route
-	// audience, and policy are still checked per call in Decide.
+	// Consulted only by ValidateToken (the shared validator), so it is allocated only by
+	// NewJWTPDP: per-route wrappers (NewJWTPDPWithCache) call Decide, not ValidateToken,
+	// and leave this nil rather than each holding a 4096-entry map that never fills. Get
+	// and Put are both nil-safe. The kill switch, route audience, and policy are still
+	// checked per call in Decide.
 	tokenCache *capability.PayloadCache[*JWTClaims]
 }
 
@@ -343,7 +345,15 @@ func NewJWTPDP(opts JWTPDPOptions) *JWTPDP {
 	if opts.Clock != nil {
 		cacheConfig.Now = opts.Clock.Now
 	}
-	return newJWTPDP(opts, capability.NewJWKSCache(cacheConfig))
+	p := newJWTPDP(opts, capability.NewJWKSCache(cacheConfig))
+	// The verified-token cache is allocated HERE, not in the shared newJWTPDP: only a
+	// validator built through this constructor calls ValidateToken. Every per-route
+	// wrapper goes through NewJWTPDPWithCache and calls Decide, so allocating there gave
+	// each route a 4096-entry cache that stays empty for the process lifetime. Wired to
+	// the PDP's clock so a frozen test clock stays consistent with exp/nbf validation and
+	// the cache TTL; a nil cache is safe (Get misses, Put is a no-op).
+	p.tokenCache = newJWTTokenCache(p.now)
+	return p
 }
 
 // normalizeAudience collapses a whitespace-only audience to the empty string so the
@@ -406,9 +416,6 @@ func newJWTPDP(opts JWTPDPOptions, cache *capability.JWKSCache) *JWTPDP {
 		leeway:                   effectiveLeeway(opts.Leeway),
 		experimentalCapabilities: opts.ExperimentalCapabilities,
 	}
-	// Wire the verified-token cache to the PDP's clock so a frozen test clock stays
-	// consistent with exp/nbf validation and the cache TTL.
-	p.tokenCache = newJWTTokenCache(p.now)
 	return p
 }
 

@@ -477,25 +477,39 @@ func exactFloatBound(n json.Number) (*float64, error) {
 }
 
 // minInt64Float and twoTo63Float bound the range of float64 values exactly
-// representable as int64, mirroring pkg/enforcement's identical constants
-// (handlers.go) — the half-open interval [minInt64Float, twoTo63Float) is exactly
-// the range int64(f) converts without wraparound.
+// representable as int64: the half-open interval [minInt64Float, twoTo63Float) is
+// exactly the range int64(f) converts without wraparound. Guarded before any
+// conversion, because a float outside int64 range converts to an
+// implementation-defined value in Go.
 const (
 	minInt64Float = -9223372036854775808.0 // -2^63
 	twoTo63Float  = 9223372036854775808.0  // 2^63 (one past math.MaxInt64)
 )
 
-// wholeInt64Float reports whether f is a whole number representable exactly as
-// an int64 — the same condition pkg/enforcement's compareToBound (via
-// floatToInt64) uses to switch a bound comparison to exact-integer precision.
-// Duplicated here rather than imported to avoid a capability -> enforcement
-// dependency; the two must be kept in sync.
-func wholeInt64Float(f float64) bool {
+// FloatToInt64 returns f as an int64 when f is integral and exactly representable as
+// one, reporting false otherwise.
+//
+// This precision rule decides whether a bound comparison runs in exact-integer or
+// float arithmetic — the difference between authorizing 9007199254740993 and its
+// neighbour — so it lives in exactly one place. pkg/enforcement (which already imports
+// this package) uses it for compareToBound, and this package uses it to decide whether
+// a JSON number round-trips through int64 losslessly.
+func FloatToInt64(f float64) (int64, bool) {
 	if f < minInt64Float || f >= twoTo63Float {
-		return false
+		return 0, false
 	}
 	i := int64(f)
-	return float64(i) == f
+	if float64(i) != f { // f carried a fractional part
+		return 0, false
+	}
+	return i, true
+}
+
+// wholeInt64Float reports whether f is a whole number representable exactly as an
+// int64 — FloatToInt64 without the converted value.
+func wholeInt64Float(f float64) bool {
+	_, ok := FloatToInt64(f)
+	return ok
 }
 
 // SchemaType can be a single type string or an array of type strings.

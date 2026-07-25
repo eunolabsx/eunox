@@ -53,8 +53,15 @@ func withTimeFunc(fn func() time.Time) redisOption {
 // Keying by window means the same key under two windows addresses two independent
 // counters. Single source for the "callcounter:<key>:<windowSec>" format so the
 // increment, admit, and peek paths cannot drift.
+//
+// Built on storageKey — the in-memory backend's identical (key, windowSec) composition
+// — rather than a second fmt.Sprintf of the same scheme. The two backends must agree on
+// how a (key, windowSec) pair collapses into one string (that is what makes their
+// window isolation "structurally equivalent"), and this path runs per enforced call, so
+// the shared spelling is both cheaper and the reason a change to one composition cannot
+// silently miss the other.
 func redisWindowKey(key string, windowSec int) string {
-	return fmt.Sprintf("callcounter:%s:%d", key, windowSec)
+	return "callcounter:" + storageKey(key, windowSec)
 }
 
 // newMember builds a unique sorted-set member for one inserted call: the instance

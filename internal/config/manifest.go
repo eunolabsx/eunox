@@ -155,6 +155,13 @@ func LoadManifest(path string) (*LocalManifest, error) {
 		return nil, fmt.Errorf("converting manifest to JSON: %w", err)
 	}
 
+	// Run the recursive unknown-key check BEFORE the typed decode. Both reject a typo'd
+	// key, but only this one names the offending path and offers a "did you mean"
+	// suggestion; the condition decoder's own strict decode (unmarshalCondition) would
+	// otherwise surface first with a blunter message for the condition case.
+	if err := checkManifestKeys(data); err != nil {
+		return nil, fmt.Errorf("invalid manifest %q: %w", path, err)
+	}
 	var m LocalManifest
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, fmt.Errorf("parsing manifest %q: %w", path, err)
@@ -169,12 +176,6 @@ func LoadManifest(path string) (*LocalManifest, error) {
 	// otherwise survives into MergeManifests' exact-string conflict check and the
 	// Digest(), causing spurious conflicts between " 0.1" and "0.1".
 	m.SchemaVersion = strings.TrimSpace(m.SchemaVersion)
-	// Reject unknown keys before required-field checks, so a typo (e.g.
-	// `arguments` for `argument`) is reported as the typo rather than a downstream
-	// "must not be empty".
-	if err := checkManifestKeys(data); err != nil {
-		return nil, fmt.Errorf("invalid manifest %q: %w", path, err)
-	}
 	if err := validateLocalManifest(&m); err != nil {
 		return nil, fmt.Errorf("invalid manifest %q: %w", path, err)
 	}

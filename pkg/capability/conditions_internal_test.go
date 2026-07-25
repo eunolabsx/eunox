@@ -204,3 +204,50 @@ func TestEveryArgumentCarryingConditionImplementsArgumentNamer(t *testing.T) {
 		}
 	}
 }
+
+// TestUnmarshalCondition_RejectsUnknownFields pins that a condition decodes STRICTLY.
+//
+// A lenient decode silently drops a misspelled field, and for a condition that means a
+// policy quietly wider than written: a typo'd "notAfterr" leaves NotAfter empty and the
+// window enforces only its lower bound. The binary's manifest loader has its own
+// recursive unknown-key check, but this decoder is also the exported seam
+// (ConditionWrapper) a library consumer decodes through, and a security primitive must
+// not depend on the caller remembering to re-validate.
+func TestUnmarshalCondition_RejectsUnknownFields(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		data string
+	}{
+		{"typo'd second bound", `{"type":"timeWindow","notBefore":"09:00","notAfterr":"17:00"}`},
+		{"typo'd argument", `{"type":"allowedValues","argumentt":"id","values":["a"]}`},
+		{"extra field", `{"type":"maxCalls","limit":5,"windowSeconds":60,"burst":100}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := unmarshalCondition([]byte(tc.data)); err == nil {
+				t.Fatalf("unmarshalCondition(%s) succeeded; an unknown field must fail closed, not silently widen the condition", tc.data)
+			}
+		})
+	}
+}
+
+// TestUnmarshalCondition_AcceptsWellFormed pins the other half: stripping the "type"
+// discriminator before the strict decode must not make a correct condition fail, and the
+// decoded value must still carry its fields.
+func TestUnmarshalCondition_AcceptsWellFormed(t *testing.T) {
+	t.Parallel()
+
+	c, err := unmarshalCondition([]byte(`{"type":"timeWindow","notBefore":"09:00","notAfter":"17:00"}`))
+	if err != nil {
+		t.Fatalf("unmarshalCondition: %v", err)
+	}
+	tw, ok := c.(*TimeWindowCondition)
+	if !ok {
+		t.Fatalf("got %T, want *TimeWindowCondition", c)
+	}
+	if tw.NotBefore != "09:00" || tw.NotAfter != "17:00" {
+		t.Errorf("decoded %+v, want both bounds preserved", tw)
+	}
+}

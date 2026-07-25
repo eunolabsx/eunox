@@ -495,11 +495,11 @@ func foldJSONKey(key string) string {
 // Framed I/O: newline-delimited JSON
 // -----------------------------------------------------------------
 
-// ErrUpstreamWriteTimeout marks a framed write that exceeded its per-write deadline
-// (see NewMsgWriterWithTimeout), or any write after such a timeout. A timed-out write
-// can flush a partial frame larger than the pipe's atomic-write size, desyncing the
-// newline framing, so the writer is POISONED and every later Write fails fast with this
-// error rather than interleaving bytes into a corrupt stream. On the poison transition the
+// ErrUpstreamWriteTimeout marks a framed write that left the stream desynced — one that
+// exceeded its per-write deadline (see NewMsgWriterWithTimeout) or otherwise flushed only
+// part of its frame — and every write after one. A partial frame larger than the pipe's
+// atomic-write size breaks the newline framing, so the writer is POISONED and every later
+// Write fails fast with this error rather than interleaving bytes into a corrupt stream. On the poison transition the
 // writer's onPoison hook fires (the transports wire it to tear the upstream session down),
 // so the desynced stream is reaped rather than reused — the recovery the deadline exists
 // to enable.
@@ -587,8 +587,8 @@ func (mw *MsgWriter) Write(msg RPCMsg) error {
 	// allocation of fmt.Fprintf on this hot path.
 	data = append(data, '\n')
 	mw.mu.Lock()
-	// A prior write timed out mid-frame: the stream is desynced, so refuse rather than
-	// append this frame after a partial one. Fails fast (no deadline wait), which is what
+	// A prior write left a partial frame on the wire: the stream is desynced, so refuse
+	// rather than append this frame after it. Fails fast (no deadline wait), which is what
 	// lets a second in-flight writer — e.g. a sampling reply queued behind a wedged
 	// request write — return instead of blocking on this mutex until the wedge clears.
 	if mw.poisoned {
@@ -599,9 +599,22 @@ func (mw *MsgWriter) Write(msg RPCMsg) error {
 		// Absolute deadline, reset per write.
 		_ = mw.deadliner.SetWriteDeadline(time.Now().Add(mw.timeout))
 	}
-	_, err = mw.w.Write(data)
+	n, err := mw.w.Write(data)
 	justPoisoned := false
-	if mw.deadliner != nil && errors.Is(err, os.ErrDeadlineExceeded) {
+	// Poison on ANY short write, not only a deadline timeout. A deadline expiry is the
+	// common way to flush a partial frame, but it is not the only one: a >PIPE_BUF frame
+	// interrupted by EPIPE, ENOSPC, or a signal returns n>0 with n<len(data) just the
+	// same, and the framing is equally desynced. Keying the poison on the deadline error
+	// left those cases appending the next frame onto half of the previous one. n==len(data)
+	// with a non-nil error (permitted by io.Writer) is NOT poison: the whole frame landed.
+	switch {
+	case err != nil && n > 0 && n < len(data):
+		mw.poisoned = true
+		justPoisoned = true
+		err = fmt.Errorf("%w: partial frame (%d of %d bytes): %w", ErrUpstreamWriteTimeout, n, len(data), err)
+	case mw.deadliner != nil && errors.Is(err, os.ErrDeadlineExceeded):
+		// A deadline expiry with n==0 wrote nothing, but the pipe may still be wedged and
+		// the session is torn down either way; keep the established behavior and message.
 		mw.poisoned = true
 		justPoisoned = true
 		err = fmt.Errorf("%w: %v", ErrUpstreamWriteTimeout, err)
