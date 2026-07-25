@@ -4,6 +4,20 @@
 name: Go CI
 
 on:
+  # main is listed deliberately: this is the only workflow that runs the Go gates
+  # (vet, golangci-lint, race tests, the coverage threshold, gofmt, license, and
+  # NOTICE), so without a push trigger nothing validates a commit that has LANDED.
+  # Two PRs can each be green against their own base and still break main together,
+  # and a direct push runs no checks at all. The README's build/coverage/benchmark/
+  # govulncheck badges also read check runs on main and have nothing to report
+  # without it.
+  #
+  # Scoped to main only. Feature branches are covered by their pull_request run, and
+  # adding branch globs here would double-run them: the concurrency group keys on
+  # github.event.pull_request.number for a PR and github.ref for a push, so the two
+  # events land in different groups and do not cancel each other.
+  push:
+    branches: [main]
   pull_request:
     branches: [main]
 
