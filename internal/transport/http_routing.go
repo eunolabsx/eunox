@@ -58,7 +58,9 @@ func (p *HTTPProxy) handleMCP(w http.ResponseWriter, r *http.Request) {
 			// to third-party SIEMs — the same disclosure the opaque-401 response below avoids.
 			// pdp.ClassifyJWTError maps the failure to one of a fixed set of codes (expired,
 			// invalid_signature, missing_claims, …). recordPreSessionDeny keeps the unverified
-			// Mcp-Session-Id out of the structured session_id (forgery guard).
+			// Mcp-Session-Id out of the structured session_id (forgery guard). The record is
+			// also unstamped by design (no route/policy fields): this gate runs before route
+			// resolution, for the oracle reason above — see recordPreSessionDeny.
 			p.recordPreSessionDeny(r, "JWT_INVALID", "jwt", map[string]interface{}{"error_type": pdp.ClassifyJWTError(err)})
 			w.Header().Set("WWW-Authenticate", buildWWWAuthenticate(authHeader != "", p.oauthMetaURL))
 			// Do not echo the JWT validation error to the caller: the library message
