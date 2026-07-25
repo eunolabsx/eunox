@@ -272,10 +272,17 @@ func mineArgs(t *observedTarget, details map[string]interface{}, auditOnly bool,
 			// exactly when the caller's real arguments already contained the reserved
 			// key — so in the true nested shape, the inner map necessarily carries its
 			// own copy of it.
+			//
+			// When the inner map does NOT carry it, this is not the nested wrapper. The
+			// far likelier producer of that shape is the ORDINARY flat merge on a call
+			// whose one real argument is a map named "arguments" (a plausible argument
+			// name) that then errored upstream; the alternative needs a caller argument
+			// literally named the reserved key, the case this comment calls vanishingly
+			// rare. So keep the flat reading: mine details as-is with the reserved key
+			// still skipped, rather than fabricating a phantom argument for it and
+			// skewing the presence accounting of the real "arguments" argument.
 			if _, innerHasCode := inner[audit.UpstreamErrorCodeKey]; innerHasCode {
 				args = inner
-				skipReserved = false
-			} else {
 				skipReserved = false
 			}
 		}
