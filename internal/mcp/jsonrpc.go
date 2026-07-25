@@ -274,10 +274,13 @@ func numericIDExponentBounded(raw []byte) bool {
 // returns its int64 value. It reports false for any other shape (a leading '+', a
 // leading zero, a float/exponent, an empty/sign-only string, or more than 18 digits)
 // so the caller falls back to the allocating decoder/big.Rat path, which keys the same
-// input identically. strconv.ParseInt alone accepts "+5"/"05"/"-0": "+5" and "05" are
-// invalid JSON, and "-0" is valid JSON but a non-canonical spelling of zero — none may
-// key the same as their canonical form; the manual scan avoids
-// both that hazard and any allocation. The 18-digit cap keeps v*10 from overflowing
+// input identically. strconv.ParseInt alone accepts "+5"/"05"/"-0", none of which this
+// fast path may claim: "+5" and "05" are invalid JSON and must reach the raw-bytes
+// fallback ("r:"), while "-0" is valid JSON but a non-canonical spelling of zero that
+// the slow path already folds onto the same "n:0" key as "0" (so a peer echoing "-0"
+// still correlates). Declining all three here keeps the fast path's answers a subset of
+// the slow path's rather than a second, divergent canonicalizer, and avoids any
+// allocation. The 18-digit cap keeps v*10 from overflowing
 // int64 (10^18 < math.MaxInt64); the rare longer or MinInt64-magnitude id falls through
 // to the slow path rather than complicating the overflow guard here.
 func parseCanonicalJSONInt(raw []byte) (int64, bool) {
@@ -291,7 +294,8 @@ func parseCanonicalJSONInt(raw []byte) (int64, bool) {
 		return 0, false
 	}
 	if d[0] == '0' {
-		// Only "0" is the canonical spelling of zero; "-0" is valid JSON but non-canonical, so reject it here.
+		// Only "0" is the canonical spelling of zero. "-0" is valid JSON but non-canonical,
+		// so decline it here and let the slow path fold it onto the same "n:0" key.
 		if len(d) > 1 || neg {
 			return 0, false
 		}
