@@ -495,6 +495,12 @@ func (p *HTTPProxy) runDriftCheckOrTeardown(ctx context.Context, sess *httpSessi
 	}
 	raw, probeErr := sess.fetchUpstreamToolsRaw(ctx)
 	if err := route.driftCheck(raw, sess.upstreamServerVersion, probeErr); err != nil {
+		// Record the refusal before teardown: a startup drift failure is the FM-5
+		// tool-poisoning / rug-pull event this check exists to catch, so it must land on
+		// the tamper-evident tape (route-stamped), not only stderr and a generic 500. The
+		// raw drift reason (which names drifted tools) stays on stderr; the tape carries
+		// the stable DRIFT_REFUSED category.
+		route.sink.RecordDeny(ctx, sess.id, "initialize", "initialize", codeDriftRefused, "drift", nil, false)
 		sess.close(p.shutdownMs) //nolint:contextcheck // teardown path: the upstream session-termination DELETE intentionally uses a detached, bounded background context — close/reaper/signal/shutdown carry no request context.
 		p.mu.Lock()
 		delete(p.sessions, sess.id)

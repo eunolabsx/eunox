@@ -52,22 +52,14 @@ func (p *HTTPProxy) handleMCP(w http.ResponseWriter, r *http.Request) {
 		authHeader := r.Header.Get("Authorization")
 		ctx, err := p.jwtPDP.ValidateToken(r.Context(), authHeader)
 		if err != nil {
-			if p.sink != nil {
-				// JWT pre-validation runs before any session lookup, so the
-				// client-supplied Mcp-Session-Id is unverified and attacker-controlled;
-				// addClaimedSessionID keeps it out of the structured session_id (which
-				// would let anyone forge JWT_INVALID records against a victim's session)
-				// and records it as the unverified claimed_session_id detail instead.
-				//
-				// Record a stable error_type CATEGORY, never the raw err.Error(): the
-				// go-jose / validation message can disclose claim values, the accepted
-				// algorithm, the configured issuer, or key-rotation state, and audit logs
-				// are commonly forwarded to third-party SIEMs — the same disclosure the
-				// opaque-401 response below avoids. pdp.ClassifyJWTError maps the failure to
-				// one of a fixed set of codes (expired, invalid_signature, missing_claims, …).
-				details := addClaimedSessionID(map[string]interface{}{"error_type": pdp.ClassifyJWTError(err)}, r)
-				p.sink.RecordDeny(r.Context(), "", "", "", "JWT_INVALID", "jwt", details, false)
-			}
+			// Record a stable error_type CATEGORY, never the raw err.Error(): the go-jose /
+			// validation message can disclose claim values, the accepted algorithm, the
+			// configured issuer, or key-rotation state, and audit logs are commonly forwarded
+			// to third-party SIEMs — the same disclosure the opaque-401 response below avoids.
+			// pdp.ClassifyJWTError maps the failure to one of a fixed set of codes (expired,
+			// invalid_signature, missing_claims, …). recordPreSessionDeny keeps the unverified
+			// Mcp-Session-Id out of the structured session_id (forgery guard).
+			p.recordPreSessionDeny(r, "JWT_INVALID", "jwt", map[string]interface{}{"error_type": pdp.ClassifyJWTError(err)})
 			w.Header().Set("WWW-Authenticate", buildWWWAuthenticate(authHeader != "", p.oauthMetaURL))
 			// Do not echo the JWT validation error to the caller: the library message
 			// can disclose claim values, the accepted algorithm, or key-rotation state,
@@ -501,6 +493,13 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 		// would allocate a reply channel and pending-map entries and block in the
 		// upstream round-trip.
 		if !sess.tryAcquireRequestSlot() {
+			// Record the saturation refusal so a pool-saturation flood against the
+			// network-exposed transport is visible on the tamper-evident tape, mirroring the
+			// stdio hostSem path through the same helper. Without it the exposed transport —
+			// the surface a DoS probe actually reaches — would leave no trace while the local
+			// stdio twin does, backwards from the threat. route.sink carries the route
+			// provenance; asRecorder yields a genuine nil interface when no sink is configured.
+			recordResourceExhausted(ctx, asRecorder(route.sink), sess.id, msg.Method)
 			writeJSONMsg(w, mcp.ErrorResponse(msg.ID, jsonRPCCodeServerBusy, "eunox: too many concurrent requests in flight; retry"))
 			return
 		}
