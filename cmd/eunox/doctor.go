@@ -131,6 +131,40 @@ type doctorOptions struct {
 	auditKeyPath string
 	auditTail    int
 	live         bool
+	// cfg and cfgErr are the ONE ${ENV}-expanded load of configPath, performed by
+	// newDoctorOptions so the audit-path defaults and the bundle's manifest (section 3)
+	// and live-drift (section 5) walks share a single parse. Both are zero when
+	// configPath is empty. Always build these through newDoctorOptions: a hand-built
+	// doctorOptions with a configPath but no cfg reports every config-derived section
+	// as unloadable.
+	cfg    *config.GatewayConfig
+	cfgErr error
+}
+
+// newDoctorOptions resolves the doctor flags into the options the bundle writer
+// consumes, loading configPath once.
+//
+// A config load failure is NOT fatal here: a broken config is precisely the scenario a
+// support bundle exists for, so cfgErr is carried into the bundle and reported in the
+// sections that need the config while every other section still renders. The audit-path
+// defaults are taken from the config only when it loaded; otherwise the built-in
+// defaults stand and section 4 reports against those.
+func newDoctorOptions(configPath, auditLogPath, auditKeyPath string, auditTail int, live bool) doctorOptions {
+	opts := doctorOptions{
+		configPath:   configPath,
+		auditLogPath: auditLogPath,
+		auditKeyPath: auditKeyPath,
+		auditTail:    auditTail,
+		live:         live,
+	}
+	if configPath == "" {
+		return opts
+	}
+	opts.cfg, opts.cfgErr = config.LoadGatewayConfig(configPath)
+	if opts.cfgErr == nil {
+		applyAuditDefaultsFromConfig(opts.cfg, &opts.auditLogPath, &opts.auditKeyPath)
+	}
+	return opts
 }
 
 func cmdDoctor() {
@@ -172,22 +206,21 @@ Flags:
 		os.Exit(1)
 	}
 
-	// If --config is provided, use its audit.log/audit.keyPath as defaults for
-	// --audit-log/--audit-key-path, matching suggest/stats/audit-verify — the other
-	// readers of the same tape. Without this, `doctor --config foo.yaml` (no
+	// Load --config once here. When it parses, its audit.log/audit.keyPath become the
+	// defaults for --audit-log/--audit-key-path, matching suggest/stats/audit-verify —
+	// the other readers of the same tape. Without this, `doctor --config foo.yaml` (no
 	// --audit-log) reported against the built-in default path even when foo.yaml
 	// pointed its audit.log elsewhere.
-	if err := applyConfigAuditDefaults("doctor", *configPath, auditLog, auditKey); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-
-	opts := doctorOptions{
-		configPath:   *configPath,
-		auditLogPath: *auditLog,
-		auditKeyPath: *auditKey,
-		auditTail:    *auditTail,
-		live:         *live,
+	//
+	// Unlike those subcommands, a load failure does not abort: doctor's whole job is to
+	// describe a broken deployment, so a config that will not parse is the case the
+	// bundle is most needed for. The error is announced on stderr and rendered in the
+	// bundle's config-derived sections; every other section still renders and the exit
+	// status stays 0 because the bundle itself was produced.
+	opts := newDoctorOptions(*configPath, *auditLog, *auditKey, *auditTail, *live)
+	if opts.cfgErr != nil {
+		fmt.Fprintf(os.Stderr, "eunox doctor: could not load config %q: %v\n", *configPath, opts.cfgErr)
+		fmt.Fprintln(os.Stderr, "The bundle is still written; the config-dependent sections report this error in place.")
 	}
 
 	// Stdout: discard write errors (a broken pipe is not actionable).
@@ -241,20 +274,17 @@ Flags:
 // writeDoctorBundle emits the support bundle to w. Sections are independent —
 // a failure in any one (missing config, unreadable audit log, …) is reported
 // in place and the remaining sections still render.
+//
+// opts carries the already-parsed gateway config (newDoctorOptions loads it once) for
+// the manifest (section 3) and live-drift (section 5) walks, which both operate on the
+// same ${ENV}-expanded config. Section 2 deliberately keeps its own RAW read (no env
+// expansion) so it can surface the config exactly as written on disk.
 func writeDoctorBundle(w io.Writer, opts doctorOptions) {
 	wln(w, "eunox doctor — support bundle")
 	wf(w, "Generated: %s\n", time.Now().UTC().Format(time.RFC3339))
 	wln(w)
 
-	// Parse the gateway config ONCE for the manifest (section 3) and live-drift
-	// (section 5) walks, which both operate on the same ${ENV}-expanded config, rather
-	// than re-loading it per section. Section 2 deliberately keeps its own RAW read
-	// (no env expansion) so it can surface the config exactly as written on disk.
-	var cfg *config.GatewayConfig
-	var cfgErr error
-	if opts.configPath != "" {
-		cfg, cfgErr = config.LoadGatewayConfig(opts.configPath)
-	}
+	cfg, cfgErr := opts.cfg, opts.cfgErr
 
 	wln(w, doctorSep)
 	wln(w, "1. Binary")
@@ -421,16 +451,25 @@ func redactString(v interface{}) string {
 	return fmt.Sprintf("<redacted len=%d>", len(s))
 }
 
-// reportCfgErr writes the standard "could not load config" line when cfgErr is
-// non-nil and reports whether it did, so writeDoctorManifests and writeDoctorLive
+// reportCfgErr writes the standard "could not load config" line when the config is
+// unusable and reports whether it did, so writeDoctorManifests and writeDoctorLive
 // report an unusable config identically instead of each keeping its own copy of the
 // same guard clause. The caller's section body must return immediately when this
-// reports true.
-func reportCfgErr(w io.Writer, cfgErr error) bool {
-	if cfgErr == nil {
+// reports true — every caller dereferences cfg right after.
+//
+// A nil cfg with a nil cfgErr cannot come from newDoctorOptions (which always sets one
+// or the other for a non-empty configPath) and means a hand-built doctorOptions skipped
+// the load. Report it as unusable rather than fall through to a nil dereference that
+// would crash the bundle mid-write.
+func reportCfgErr(w io.Writer, cfg *config.GatewayConfig, cfgErr error) bool {
+	switch {
+	case cfgErr != nil:
+		wf(w, "  could not load config: %v\n", cfgErr)
+	case cfg == nil:
+		wf(w, "  could not load config: no config was loaded\n")
+	default:
 		return false
 	}
-	wf(w, "  could not load config: %v\n", cfgErr)
 	return true
 }
 
@@ -443,7 +482,7 @@ func reportCfgErr(w io.Writer, cfgErr error) bool {
 // derived fields (Name, Transport, digest) — never UpstreamURL, UpstreamAuthHeader,
 // or other secret-bearing cfg fields. cfgErr is that load's error (config unusable).
 func writeDoctorManifests(w io.Writer, cfg *config.GatewayConfig, cfgErr error) {
-	if reportCfgErr(w, cfgErr) {
+	if reportCfgErr(w, cfg, cfgErr) {
 		return
 	}
 	wf(w, "  host transport: %s\n", cfg.HostTransport())
@@ -681,7 +720,7 @@ func redactAuditLine(line string) string {
 // ${ENV} expanded (shared with the manifest section); only the exit code is printed,
 // no secret-bearing cfg fields. cfgErr is that load's error (config unusable).
 func writeDoctorLive(w io.Writer, cfg *config.GatewayConfig, cfgErr error) {
-	if reportCfgErr(w, cfgErr) {
+	if reportCfgErr(w, cfg, cfgErr) {
 		return
 	}
 	// Base context with no deadline: fetchRouteLive applies its own per-route

@@ -339,7 +339,9 @@ func openGuardedAppend(logPath string) (*os.File, error) {
 	if err := refuseNonRegular(logPath); err != nil {
 		return nil, err
 	}
-	return os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600) //nolint:gosec // G304: path is user-configured audit log location
+	// openNoFollow (O_NOFOLLOW on unix) closes the Lstat->open race the guard above
+	// cannot; the rename->reopen window is exactly where a planted symlink would land.
+	return os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY|openNoFollow, 0o600) //nolint:gosec // G304: path is user-configured audit log location
 }
 
 // refuseNonRegular fails closed unless logPath is a regular file or genuinely absent. It is
@@ -353,10 +355,14 @@ func openGuardedAppend(logPath string) (*os.File, error) {
 // O_CREATE then fills. Any OTHER Lstat error (EIO, NFS ESTALE, ELOOP, EACCES on a path
 // component) is REFUSED, not assumed benign — gating the refusal on "stat succeeded" would
 // let a stat fault skip the check and follow a symlink, the fail-OPEN direction this guard
-// exists to prevent. Lstat inspects the path itself, not its target. A Lstat->open TOCTOU
-// remains (a symlink planted between this check and the open is still followed); closing it
-// fully needs O_NOFOLLOW-level atomicity, not portable here, so this guard closes the
-// steady-state and stat-error holes while the caller keeps the rename->reopen window narrow.
+// exists to prevent. Lstat inspects the path itself, not its target.
+//
+// The Lstat->open window itself is closed by the openNoFollow (O_NOFOLLOW) flag every
+// caller OR-s into its os.OpenFile, so a symlink planted between the two is rejected by
+// the kernel rather than followed. This guard is still the primary check: it is portable
+// (openNoFollow is 0 where the platform has no equivalent), it also refuses directories,
+// devices, and FIFOs that O_NOFOLLOW would happily open, and it produces the actionable
+// error naming the path — where the raw syscall would surface only an opaque ELOOP.
 func refuseNonRegular(logPath string) error {
 	fi, statErr := os.Lstat(logPath)
 	if statErr != nil {

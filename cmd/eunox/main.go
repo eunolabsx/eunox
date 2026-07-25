@@ -2543,11 +2543,30 @@ func killViaRedis(addr, password string, useTLS bool, target string) error {
 // audit-verify subcommand
 // -----------------------------------------------------------------
 
-// applyConfigAuditDefaults fills empty audit-log / audit-key-path flags from a
-// --config file's audit block, leaving any explicitly-set flag untouched. keyPath
-// may be nil (stats has no --audit-key-path), which skips the key default. cmdName
-// labels the load error. A no-op when configPath is empty. Shared by audit-verify
-// and stats, which both default their audit paths from the same config block.
+// applyAuditDefaultsFromConfig fills empty audit-log / audit-key-path flags from an
+// already-loaded config's audit block, leaving any explicitly-set flag untouched.
+// keyPath may be nil (stats has no --audit-key-path), which skips the key default.
+// Split from applyConfigAuditDefaults so doctor — which loads the config itself and
+// must survive a load failure — shares the defaulting rule rather than restating it.
+func applyAuditDefaultsFromConfig(cfg *config.GatewayConfig, logPath, keyPath *string) {
+	if cfg == nil {
+		return
+	}
+	if *logPath == "" && cfg.Audit.Log != "" {
+		*logPath = cfg.Audit.Log
+	}
+	if keyPath != nil && *keyPath == "" && cfg.Audit.KeyPath != "" {
+		*keyPath = cfg.Audit.KeyPath
+	}
+}
+
+// applyConfigAuditDefaults loads configPath and applies its audit block as the
+// defaults for the audit-log / audit-key-path flags. cmdName labels the load error.
+// A no-op when configPath is empty. Shared by audit-verify and stats, which both
+// default their audit paths from the same config block and have nothing to do with an
+// unloadable config, so the error is fatal for them. doctor deliberately does NOT use
+// this: a broken config is the case its bundle exists for, so it loads via
+// newDoctorOptions and reports the failure in-bundle.
 func applyConfigAuditDefaults(cmdName, configPath string, logPath, keyPath *string) error {
 	if configPath == "" {
 		return nil
@@ -2556,12 +2575,7 @@ func applyConfigAuditDefaults(cmdName, configPath string, logPath, keyPath *stri
 	if err != nil {
 		return fmt.Errorf("eunox %s: loading config: %w", cmdName, err)
 	}
-	if *logPath == "" && cfg.Audit.Log != "" {
-		*logPath = cfg.Audit.Log
-	}
-	if keyPath != nil && *keyPath == "" && cfg.Audit.KeyPath != "" {
-		*keyPath = cfg.Audit.KeyPath
-	}
+	applyAuditDefaultsFromConfig(cfg, logPath, keyPath)
 	return nil
 }
 

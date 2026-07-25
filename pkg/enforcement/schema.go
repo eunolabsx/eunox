@@ -99,6 +99,18 @@ func schemaValidateValue(jsonPath string, val interface{}, schema *capability.Ar
 		return nil
 	}
 
+	// Unwrap a NAMED scalar type (type Path string, type Port int) to its predeclared
+	// underlying type before anything inspects the value. Such a value is not assignable
+	// to interface{}.(string) / .(int), so it matches no arm of the type switches that
+	// follow — enum's DeepEqual, schemaCheckType's schemaJSONTypeOf, toFloat64's
+	// coercion, and the keyword dispatch all miss it. Under a TYPELESS schema that means
+	// every declared pattern/minLength/maxLength/minimum/maximum is silently skipped, a
+	// fail-open. Only a direct (library) caller of the exported ValidateArgumentSchema
+	// can produce one: the proxy's own JSON path yields stdlib decode types exclusively.
+	// Named COMPOSITES (a named slice or map) are normalized further down by
+	// schemaValidateNativeComposite, which needs the schema in hand.
+	val = unwrapNamedScalar(val)
+
 	// The enum check runs against the ORIGINAL, un-coerced value so a json.Number is
 	// compared at full int64 precision by numericEqual; flattening to float64 first
 	// (as the keyword checks below require) would round an integer above 2^53 into a
@@ -286,6 +298,47 @@ func schemaJSONTypeOf(val interface{}) string {
 // schemaValidateNativeComposite both classify through this single helper, so the up-front
 // type check and the validator dispatch cannot drift apart about which native value is an
 // array versus an object — the exact agreement the typed-schema fix depends on.
+// unwrapNamedScalar returns val converted to the predeclared type underlying its named
+// scalar type (type Path string -> string, type Port int -> int64), or val unchanged
+// when it is not one.
+//
+// "Named" is decided by comparing the type's own name to its kind's name: a predeclared
+// int reports Name() == "int" == Kind().String() and is left alone, while a defined
+// `type Port int` reports "Port" and is unwrapped. Unnamed types (a bare interface value
+// holding an anonymous type) report "" and are likewise left alone. json.Number is
+// excluded explicitly: it is a named string type, but it carries NUMERIC semantics that
+// the enum comparison and the float coercion downstream already model exactly, and
+// flattening it to a plain string would lose them.
+//
+// Integers unwrap to int64 (unsigned to uint64) rather than float64 so compareToBound
+// keeps its int64-exact path for values at or above 2^53.
+func unwrapNamedScalar(val interface{}) interface{} {
+	switch val.(type) {
+	case nil, string, bool, float64, json.Number:
+		return val
+	}
+	rt := reflect.TypeOf(val)
+	if rt == nil || rt.Name() == rt.Kind().String() {
+		return val // predeclared (or unnamed): nothing to unwrap
+	}
+	rv := reflect.ValueOf(val)
+	switch rv.Kind() {
+	case reflect.String:
+		return rv.String()
+	case reflect.Bool:
+		return rv.Bool()
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return rv.Int()
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return rv.Uint()
+	case reflect.Float32, reflect.Float64:
+		return rv.Float()
+	}
+	// A named composite (type Tags []string) or anything else: left for
+	// schemaValidateNativeComposite, which routes it through the array/object validators.
+	return val
+}
+
 func nativeCompositeJSONType(val interface{}) string {
 	switch rv := reflect.ValueOf(val); rv.Kind() {
 	case reflect.Slice, reflect.Array:

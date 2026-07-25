@@ -448,15 +448,17 @@ func recoverTailAfterReadError(logPath string, readErr error) (last string, seed
 // openAndPrepareLog opens the audit log for append, tightens its mode, computes the
 // byte count the rotation threshold resumes from, and recovers a trailing partial write
 // left by a non-clean shutdown. It returns the open handle, the (non-negative) resume
-// size, and the number of partial bytes recovered (which Open records in-band as a
-// tail_partial_write_recovered marker).
+// size, and the tail state: the number of partial bytes recovered (which Open records
+// in-band as a tail_partial_write_recovered marker) plus the last complete record line
+// observed in the window it already read, which Open resumes the HMAC chain from
+// instead of re-opening the log.
 //
 // Both failure modes are fatal and fail closed: the log cannot be opened, or a trailing
 // orphan cannot be truncated (leaving it would let the next O_APPEND write fuse onto it,
 // producing a line audit-verify reports as corruption). On either, it releases the audit
 // lock (and closes the handle, when one was opened) so the caller returns directly. Runs
 // under the exclusive lock, before the drainer starts. preSize is Open's pre-open probe.
-func openAndPrepareLog(logPath string, preSize int64, lockFile *os.File) (f *os.File, written, recoveredPartialBytes int64, err error) {
+func openAndPrepareLog(logPath string, preSize int64, lockFile *os.File) (f *os.File, written int64, tail auditTailState, err error) {
 	// Prefer O_RDWR (not O_WRONLY) so recoverPartialTail can probe the tail (f.Stat/
 	// f.ReadAt) through this same already-open handle rather than a second read-only
 	// os.Open. A second open can fail transiently (EIO/NFS blip) while a real orphan
@@ -481,18 +483,23 @@ func openAndPrepareLog(logPath string, preSize int64, lockFile *os.File) (f *os.
 	// never diverge on the check. Wrapping keeps the "opening audit log" provenance here.
 	if err := refuseNonRegular(logPath); err != nil {
 		_ = releaseAuditLock(lockFile)
-		return nil, 0, 0, fmt.Errorf("opening audit log %q: %w", logPath, err)
+		return nil, 0, auditTailState{}, fmt.Errorf("opening audit log %q: %w", logPath, err)
 	}
 
+	// openNoFollow (O_NOFOLLOW on unix, 0 elsewhere) makes the kernel refuse a
+	// final-component symlink atomically, closing the Lstat->OpenFile TOCTOU the
+	// refuseNonRegular check above cannot. A symlink surviving to here fails the open
+	// with ELOOP, which is neither ErrPermission nor ErrNotExist, so it falls straight
+	// into the fail-closed return below rather than the write-only fallback.
 	readable := true
-	f, err = os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // G304: path is user-configured audit log location
+	f, err = os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_RDWR|openNoFollow, 0o600) //nolint:gosec // G304: path is user-configured audit log location
 	if errors.Is(err, os.ErrPermission) {
 		readable = false
-		f, err = os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600) //nolint:gosec // G304: path is user-configured audit log location
+		f, err = os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY|openNoFollow, 0o600) //nolint:gosec // G304: path is user-configured audit log location
 	}
 	if err != nil {
 		_ = releaseAuditLock(lockFile)
-		return nil, 0, 0, fmt.Errorf("opening audit log %q: %w", logPath, err)
+		return nil, 0, auditTailState{}, fmt.Errorf("opening audit log %q: %w", logPath, err)
 	}
 	// O_CREATE applies the restrictive mode only on creation; an existing log keeps its
 	// on-disk mode. Drop any group/world access so a log left readable by a looser umask,
@@ -505,16 +512,16 @@ func openAndPrepareLog(logPath string, preSize int64, lockFile *os.File) (f *os.
 	// Recover from a non-clean shutdown that left a partial (non-newline-terminated)
 	// trailing write: drop it so the next append starts at a clean record boundary
 	// instead of concatenating onto the orphan and corrupting that line at verify time.
-	recoveredPartialBytes, err = recoverPartialTail(logPath, f, readable)
+	tail, err = recoverPartialTail(logPath, f, readable)
 	if err != nil {
 		_ = f.Close()
 		_ = releaseAuditLock(lockFile)
-		return nil, 0, 0, fmt.Errorf("opening audit log %q: %w", logPath, err)
+		return nil, 0, auditTailState{}, fmt.Errorf("opening audit log %q: %w", logPath, err)
 	}
 	// Never let the size accounting go negative: recoverWrittenSize falls back to 0 (or a
 	// possibly-stale pre-open size) when stat fails, so a partial-tail recovery larger
 	// than that fallback would otherwise leave written < 0.
-	return f, max(0, written-recoveredPartialBytes), recoveredPartialBytes, nil
+	return f, max(0, written-tail.recovered), tail, nil
 }
 
 // highestSeqAcrossChain returns the seq the resumed counter must start past, computed
@@ -749,10 +756,11 @@ func Open(logPath, keyPath string, rotateSizeBytes int64, retainRotated int, opt
 		preSize = 0
 	}
 
-	f, written, recoveredPartialBytes, err := openAndPrepareLog(logPath, preSize, lockFile)
+	f, written, tail, err := openAndPrepareLog(logPath, preSize, lockFile)
 	if err != nil {
 		return nil, err
 	}
+	recoveredPartialBytes := tail.recovered
 
 	// Seed the rotation ordinal from the existing siblings. A read failure is transient
 	// and non-fatal (the log still opens), but it must not silently fall back to 0 and let
@@ -793,7 +801,22 @@ func Open(logPath, keyPath string, rotateSizeBytes int64, retainRotated int, opt
 	// Resume the chain from the existing tail so seq stays monotonic and prev_hmac
 	// links across restarts. A pre-chain log has no seq (parses as 0) and new
 	// records begin at 1, chained to the last legacy record's _hmac.
-	last, readErr := readLastAuditLine(logPath)
+	//
+	// Prefer the tail openAndPrepareLog already read through the open O_RDWR handle. That
+	// probe uses the open handle precisely because a second open can fail transiently
+	// (EIO, an NFS blip) while a real tail is present; re-opening here to answer the same
+	// question would reinstate exactly that failure mode, taking recoverTailAfterReadError
+	// — a permanent chain_resume_failed marker plus a large seq jump — over a blip that
+	// never touched the data. readLastAuditLine remains the fallback for the cases the
+	// probe cannot answer: a write-only log (its tail was never read) and a read that
+	// raced a concurrent shrink, where re-reading surfaces the shrink explicitly.
+	var last string
+	var readErr error
+	if tail.lastOK {
+		last = tail.last
+	} else {
+		last, readErr = readLastAuditLine(logPath)
+	}
 	chainResumeFailed := false
 	var resumeFailReason string
 	switch {
@@ -1176,7 +1199,15 @@ func interpretAuditTail(buf []byte, n int, readErr error, size int64) (string, e
 	if n < len(buf) && errors.Is(readErr, io.EOF) {
 		return "", fmt.Errorf("audit tail read: file shrank from %d bytes (read %d of %d tail bytes) between stat and read: %w", size, n, len(buf), errAuditFileShrunk)
 	}
-	buf = buf[:n]
+	return lastCompleteLine(buf[:n]), nil
+}
+
+// lastCompleteLine returns the last COMPLETE (newline-terminated) record line in a tail
+// window, or "" when the window holds none. It is the extraction half of
+// interpretAuditTail, shared with truncatePartialTail so the chain-resume line taken
+// from the already-open handle's window and the one taken from a re-read of the file
+// cannot diverge.
+func lastCompleteLine(buf []byte) string {
 	// Drop a trailing incomplete (newline-less) fragment before locating the last
 	// record: such a fragment is a partial in-progress write left by a non-clean
 	// shutdown, never a complete record (writeRecord always appends '\n'). Skipping
@@ -1203,9 +1234,9 @@ func interpretAuditTail(buf []byte, n int, readErr error, size int64) (string, e
 	// through the whitespace so the extraction lands on the last real record instead.
 	trimmed := bytes.TrimRightFunc(buf, unicode.IsSpace)
 	if i := bytes.LastIndexByte(trimmed, '\n'); i >= 0 {
-		return string(bytes.TrimSpace(trimmed[i+1:])), nil
+		return string(bytes.TrimSpace(trimmed[i+1:]))
 	}
-	return string(bytes.TrimSpace(trimmed)), nil
+	return string(bytes.TrimSpace(trimmed))
 }
 
 // recoverWrittenSize recovers the byte count the rotation threshold resumes from on
@@ -1262,7 +1293,7 @@ func recoverWrittenSize(f *os.File, logPath string, preSize int64) int64 {
 //     must not stop enforcement (the documented audit-failure tradeoff). truncatePartialTail
 //     reports these as the empty/absent (0, nil) case, so they never reach this branch as an
 //     error; a bare non-probe error here is treated conservatively as a warn-and-proceed.
-func recoverPartialTail(logPath string, f *os.File, readable bool) (int64, error) {
+func recoverPartialTail(logPath string, f *os.File, readable bool) (auditTailState, error) {
 	if !readable {
 		// The log was opened append-only because O_RDWR was refused (a deliberately
 		// write-only 0200 log on a non-root process). Its tail cannot be read, so
@@ -1276,37 +1307,41 @@ func recoverPartialTail(logPath string, f *os.File, readable bool) (int64, error
 		// orphan can exist there, so the warning would be alarming and always false. f.Stat
 		// works on a write-only fd — fstat reads metadata, not the file contents.
 		if info, statErr := f.Stat(); statErr == nil && info.Size() == 0 {
-			return 0, nil
+			// Nothing was ever written, so "no tail" is authoritative even without a read.
+			return auditTailState{lastOK: true}, nil
 		}
 		fmt.Fprintf(os.Stderr, "[eunox] WARNING: audit log %q is write-only; a partial trailing write from a non-clean shutdown cannot be checked or recovered (its tail is unreadable) — run 'eunox audit-verify' if a crash is suspected\n", logPath)
-		return 0, nil
+		// lastOK stays false: the tail was never read, so Open must fall back to
+		// readLastAuditLine (which fails the same way and routes to the chain-resume-failed
+		// path, unchanged from before).
+		return auditTailState{}, nil
 	}
-	rb, err := truncatePartialTail(f)
+	tail, err := truncatePartialTail(f)
 	switch {
 	case errors.Is(err, errAuditTailTruncate):
-		return 0, fmt.Errorf("could not recover a partial audit tail in %q: %w", logPath, err)
+		return auditTailState{}, fmt.Errorf("could not recover a partial audit tail in %q: %w", logPath, err)
 	case errors.Is(err, errAuditTailProbe):
 		// The tail probe failed on a NON-EMPTY log. We could not establish that no orphan
 		// partial record is present, and on a non-empty log we cannot assume there is none
 		// — proceeding would let the first O_APPEND write fuse onto a still-present orphan.
 		// Fail closed, like the truncation-failure path, rather than corrupt the next record.
-		return 0, fmt.Errorf("could not recover a partial audit tail in %q: %w", logPath, err)
+		return auditTailState{}, fmt.Errorf("could not recover a partial audit tail in %q: %w", logPath, err)
 	case errors.Is(err, errAuditTailUnbounded):
 		// A trailing orphan larger than the scan window with no record boundary inside it:
 		// its boundary cannot be located, so it cannot be safely truncated. Fail closed —
 		// proceeding would fuse Open's parse-failure marker onto the multi-MiB orphan.
-		return 0, fmt.Errorf("could not recover a partial audit tail in %q: %w", logPath, err)
+		return auditTailState{}, fmt.Errorf("could not recover a partial audit tail in %q: %w", logPath, err)
 	case err != nil:
 		// truncatePartialTail's contract returns only the wrapped sentinels handled above
 		// or nil, so this is unreachable today. Fail CLOSED anyway (do not warn-and-proceed):
 		// if a future change ever returns a bare error here, proceeding would reopen the
 		// record-fusion window this function exists to close. An unrecognized error means we
 		// could not establish the tail is clean, so refuse to start rather than fail open.
-		return 0, fmt.Errorf("could not check the audit tail of %q for a partial trailing write: %w", logPath, err)
-	case rb > 0:
-		fmt.Fprintf(os.Stderr, "[eunox] audit log %q: recovered a %d-byte partial trailing write left by a non-clean shutdown; resuming the chain from the last complete record\n", logPath, rb)
+		return auditTailState{}, fmt.Errorf("could not check the audit tail of %q for a partial trailing write: %w", logPath, err)
+	case tail.recovered > 0:
+		fmt.Fprintf(os.Stderr, "[eunox] audit log %q: recovered a %d-byte partial trailing write left by a non-clean shutdown; resuming the chain from the last complete record\n", logPath, tail.recovered)
 	}
-	return rb, nil
+	return tail, nil
 }
 
 // errAuditTailTruncate marks a failure to ftruncate a partial tail that WAS found
@@ -1348,20 +1383,21 @@ var errAuditTailUnbounded = errors.New("audit partial-tail exceeds the scan wind
 // an empty file (no orphan possible) returns (0, nil). Returns the number of bytes
 // truncated (0 when the tail already ends at a record boundary). Runs under the
 // exclusive audit lock, before the drainer starts.
-func truncatePartialTail(f *os.File) (int64, error) {
+func truncatePartialTail(f *os.File) (auditTailState, error) {
 	info, err := f.Stat()
 	if err != nil {
 		// Stat failed on the open append handle. We cannot tell whether the log is empty
 		// (no orphan) or non-empty (a possible orphan), so fail closed: an empty log is the
 		// common brand-new case and would normally proceed, but here we cannot establish
 		// emptiness, and a stat blip on a non-empty log must not let the next append fuse.
-		return 0, fmt.Errorf("%w: stat: %v", errAuditTailProbe, err)
+		return auditTailState{}, fmt.Errorf("%w: stat: %v", errAuditTailProbe, err)
 	}
 	size := info.Size()
 	if size == 0 {
 		// Genuinely empty (e.g. just created by O_CREATE): no orphan can exist. This is the
-		// documented audit-failure tradeoff's safe case — nothing to fuse onto.
-		return 0, nil
+		// documented audit-failure tradeoff's safe case — nothing to fuse onto. An empty log
+		// has no tail to resume from, and that answer is authoritative (lastOK).
+		return auditTailState{lastOK: true}, nil
 	}
 	// A record (plus its boundary newline) always fits in this window — details are
 	// capped well below it — so the last newline, the boundary of the last complete
@@ -1376,12 +1412,19 @@ func truncatePartialTail(f *os.File) (int64, error) {
 		// ReadAt failed on a NON-EMPTY log (size > 0 here): an orphan partial record may be
 		// present and we could not look. Fail closed rather than proceed and risk a fused
 		// next append.
-		return 0, fmt.Errorf("%w: read: %v", errAuditTailProbe, err)
+		return auditTailState{}, fmt.Errorf("%w: read: %v", errAuditTailProbe, err)
 	}
+	// A short read under io.EOF means the file shrank between Stat and ReadAt (a
+	// rotation daemon racing this restart, or a stale NFS size cache). Truncation below
+	// is still safe — every offset it computes lies within the bytes actually read — but
+	// the window can no longer be trusted to hold the log's true tail, so the
+	// chain-resume line is withheld (lastOK stays false) and Open re-reads, landing on
+	// readLastAuditLine's explicit errAuditFileShrunk path exactly as before.
+	trustTail := !(errors.Is(err, io.EOF) && n < len(buf))
 	buf = buf[:n]
 	if len(buf) == 0 || buf[len(buf)-1] == '\n' {
 		// The tail ends at a record boundary: nothing to recover.
-		return 0, nil
+		return auditTailState{recovered: 0, last: lastCompleteLine(buf), lastOK: trustTail}, nil
 	}
 	// The tail does not end in '\n': the bytes after the last newline are a partial
 	// write. Drop them so the next append starts at a record boundary.
@@ -1397,19 +1440,43 @@ func truncatePartialTail(f *os.File) (int64, error) {
 			// O_APPEND directly onto the multi-MiB orphan, fusing one physical line that
 			// trips bufio.ErrTooLong in audit-verify and buries the marker's HMAC. The
 			// operator must resolve the corrupt tail.
-			return 0, fmt.Errorf("%w (%d bytes scanned from offset %d)", errAuditTailUnbounded, len(buf), start)
+			return auditTailState{}, fmt.Errorf("%w (%d bytes scanned from offset %d)", errAuditTailUnbounded, len(buf), start)
 		}
-		// The whole file is one newline-less partial record: drop it entirely.
+		// The whole file is one newline-less partial record: drop it entirely. Nothing
+		// complete was ever written, so the log is now empty and that is authoritative.
 		if err := f.Truncate(0); err != nil {
-			return 0, fmt.Errorf("%w: %v", errAuditTailTruncate, err)
+			return auditTailState{}, fmt.Errorf("%w: %v", errAuditTailTruncate, err)
 		}
-		return size, nil
+		return auditTailState{recovered: size, lastOK: true}, nil
 	}
 	newSize := start + int64(i) + 1 // keep through the final newline (inclusive)
 	if err := f.Truncate(newSize); err != nil {
-		return 0, fmt.Errorf("%w: %v", errAuditTailTruncate, err)
+		return auditTailState{}, fmt.Errorf("%w: %v", errAuditTailTruncate, err)
 	}
-	return size - newSize, nil
+	// buf[:i+1] is exactly what survives on disk within the window, so the last complete
+	// record is extracted from it rather than from a re-read of the truncated file.
+	return auditTailState{recovered: size - newSize, last: lastCompleteLine(buf[:i+1]), lastOK: trustTail}, nil
+}
+
+// auditTailState is what truncatePartialTail learned from the one bounded tail read it
+// performs through the already-open append handle: how many orphan bytes it removed,
+// and the last COMPLETE record line present in that same window.
+//
+// last/lastOK exist so Open can resume the HMAC chain from bytes it has already read
+// instead of re-opening the log. The re-open was the failure mode openAndPrepareLog
+// deliberately avoids for the probe itself: a second open can fail transiently (an EIO
+// or NFS blip) while a perfectly readable tail sits in this buffer, and Open would then
+// take recoverTailAfterReadError — a permanent chain_resume_failed marker plus a large
+// seq jump — over a blip that never touched the data. lastOK false means this window
+// could not answer the question (the log was opened write-only, or the read raced a
+// concurrent shrink), and the caller must fall back to readLastAuditLine.
+// The extraction itself is lastCompleteLine — the same one readLastAuditLine applies to
+// its own (identically sized, 4 MiB) window — so resuming from this buffer and resuming
+// from a re-read agree by construction.
+type auditTailState struct {
+	recovered int64
+	last      string
+	lastOK    bool
 }
 
 // RecordAllow enqueues an allow audit record for asynchronous serialization and

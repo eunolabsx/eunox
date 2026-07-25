@@ -346,10 +346,7 @@ func (s *shortWriter) Write(p []byte) (int, error) {
 // bundle". The errTrackingWriter must latch the first error and keep returning it.
 func TestErrTrackingWriter_CapturesShortWrite(t *testing.T) {
 	tw := &errTrackingWriter{w: &shortWriter{limit: 100}}
-	writeDoctorBundle(tw, doctorOptions{
-		auditLogPath: filepath.Join(t.TempDir(), "does-not-exist.jsonl"),
-		auditTail:    0,
-	})
+	writeDoctorBundle(tw, newDoctorOptions("", filepath.Join(t.TempDir(), "does-not-exist.jsonl"), "", 0, false))
 	if tw.err == nil {
 		t.Fatal("errTrackingWriter must capture the mid-bundle write failure so a truncated --output bundle is not announced as complete")
 	}
@@ -361,10 +358,7 @@ func TestErrTrackingWriter_CapturesShortWrite(t *testing.T) {
 
 func TestWriteDoctorBundle_NoConfigNoLog(t *testing.T) {
 	var buf bytes.Buffer
-	writeDoctorBundle(&buf, doctorOptions{
-		auditLogPath: filepath.Join(t.TempDir(), "does-not-exist.jsonl"),
-		auditTail:    0,
-	})
+	writeDoctorBundle(&buf, newDoctorOptions("", filepath.Join(t.TempDir(), "does-not-exist.jsonl"), "", 0, false))
 	out := buf.String()
 	for _, marker := range []string{
 		"eunox doctor — support bundle",
@@ -379,6 +373,59 @@ func TestWriteDoctorBundle_NoConfigNoLog(t *testing.T) {
 		if !strings.Contains(out, marker) {
 			t.Errorf("bundle missing section/marker %q\n---\n%s", marker, out)
 		}
+	}
+}
+
+// A config that will not load is exactly the deployment a support bundle is most
+// needed for, so it must be reported IN the bundle rather than abort it: every
+// section that does not depend on the config still renders, and the two that do say
+// why they could not. Previously the load error aborted cmdDoctor before a single
+// byte was written, leaving the graceful reportCfgErr paths unreachable from the CLI.
+func TestWriteDoctorBundle_RendersWithUnloadableConfig(t *testing.T) {
+	// Unknown top-level key: rejected by the loader, so cfgErr is non-nil.
+	cfgPath := filepath.Join(t.TempDir(), "broken.yaml")
+	if err := os.WriteFile(cfgPath, []byte("schemaVersion: \"0.1\"\nnotAKey: true\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	opts := newDoctorOptions(cfgPath, filepath.Join(t.TempDir(), "no.jsonl"), "", 0, true)
+	if opts.cfgErr == nil {
+		t.Fatal("expected the unknown-key config to fail loading")
+	}
+
+	var buf bytes.Buffer
+	writeDoctorBundle(&buf, opts)
+	out := buf.String()
+
+	for _, marker := range []string{
+		"eunox doctor — support bundle",
+		"1. Binary",
+		"2. Config (redacted)",
+		"3. Manifests",
+		"4. Audit log",
+		"5. Live upstream check",
+		"End of bundle",
+	} {
+		if !strings.Contains(out, marker) {
+			t.Errorf("bundle missing section/marker %q\n---\n%s", marker, out)
+		}
+	}
+	// Both config-dependent sections (manifests, live) report the failure in place.
+	if n := strings.Count(out, "could not load config:"); n != 2 {
+		t.Errorf("want the load error reported in both config-dependent sections, got %d occurrence(s)\n---\n%s", n, out)
+	}
+}
+
+// A hand-built doctorOptions that names a config but never loaded it must report the
+// section as unusable, not dereference the nil config and crash the bundle mid-write.
+func TestWriteDoctorBundle_NilConfigWithoutErrorDoesNotPanic(t *testing.T) {
+	var buf bytes.Buffer
+	writeDoctorBundle(&buf, doctorOptions{configPath: "some.yaml", live: true})
+	if n := strings.Count(buf.String(), "could not load config:"); n != 2 {
+		t.Errorf("want both config-dependent sections to report an unusable config, got %d\n---\n%s", n, buf.String())
+	}
+	if !strings.Contains(buf.String(), "End of bundle") {
+		t.Errorf("bundle must still complete:\n%s", buf.String())
 	}
 }
 
@@ -399,11 +446,7 @@ upstreams:
 	doctorWriteFile(t, cfgPath, configYAML)
 
 	var buf bytes.Buffer
-	writeDoctorBundle(&buf, doctorOptions{
-		configPath:   cfgPath,
-		auditLogPath: filepath.Join(t.TempDir(), "no.jsonl"),
-		auditTail:    0,
-	})
+	writeDoctorBundle(&buf, newDoctorOptions(cfgPath, filepath.Join(t.TempDir(), "no.jsonl"), "", 0, false))
 	out := buf.String()
 
 	for _, secret := range []string{
@@ -453,11 +496,7 @@ upstreams:
 	doctorWriteFile(t, cfgPath, configYAML)
 
 	var buf bytes.Buffer
-	writeDoctorBundle(&buf, doctorOptions{
-		configPath:   cfgPath,
-		auditLogPath: filepath.Join(t.TempDir(), "no.jsonl"),
-		auditTail:    0,
-	})
+	writeDoctorBundle(&buf, newDoctorOptions(cfgPath, filepath.Join(t.TempDir(), "no.jsonl"), "", 0, false))
 	out := buf.String()
 	if strings.Contains(out, "SENTINEL-NONSTRING-MAP-SECRET") {
 		t.Errorf("bundle leaked a secret sharing a map with a non-string key:\n%s", out)
@@ -494,11 +533,7 @@ upstreams:
 	doctorWriteFile(t, cfgPath, configYAML)
 
 	var buf bytes.Buffer
-	writeDoctorBundle(&buf, doctorOptions{
-		configPath:   cfgPath,
-		auditLogPath: filepath.Join(t.TempDir(), "no.jsonl"),
-		auditTail:    0,
-	})
+	writeDoctorBundle(&buf, newDoctorOptions(cfgPath, filepath.Join(t.TempDir(), "no.jsonl"), "", 0, false))
 	out := buf.String()
 
 	// The plain audit route is a valid wiretap.
@@ -531,10 +566,7 @@ func TestWriteDoctorBundle_AuditTailRedactsDetails(t *testing.T) {
 	doctorWriteFile(t, logPath, string(b)+"\n")
 
 	var buf bytes.Buffer
-	writeDoctorBundle(&buf, doctorOptions{
-		auditLogPath: logPath,
-		auditTail:    10,
-	})
+	writeDoctorBundle(&buf, newDoctorOptions("", logPath, "", 10, false))
 	out := buf.String()
 
 	if strings.Contains(out, "SENTINEL-DETAILS-VALUE") {
@@ -556,10 +588,7 @@ func TestWriteDoctorBundle_AuditTailRedactsDetails(t *testing.T) {
 
 func TestWriteDoctorBundle_LiveSkippedWithoutFlag(t *testing.T) {
 	var buf bytes.Buffer
-	writeDoctorBundle(&buf, doctorOptions{
-		auditTail: 0,
-		// live: false
-	})
+	writeDoctorBundle(&buf, newDoctorOptions("", "", "", 0, false))
 	if !strings.Contains(buf.String(), "pass --live") {
 		t.Errorf("expected skipped-live note in bundle:\n%s", buf.String())
 	}
@@ -567,10 +596,7 @@ func TestWriteDoctorBundle_LiveSkippedWithoutFlag(t *testing.T) {
 
 func TestWriteDoctorBundle_LiveRequiresConfig(t *testing.T) {
 	var buf bytes.Buffer
-	writeDoctorBundle(&buf, doctorOptions{
-		live:      true,
-		auditTail: 0,
-	})
+	writeDoctorBundle(&buf, newDoctorOptions("", "", "", 0, true))
 	if !strings.Contains(buf.String(), "--live requires --config") {
 		t.Errorf("expected --live-requires-config note:\n%s", buf.String())
 	}

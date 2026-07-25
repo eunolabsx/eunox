@@ -1071,12 +1071,7 @@ upstreams:
 `)
 
 	var buf bytes.Buffer
-	writeDoctorBundle(&buf, doctorOptions{
-		configPath:   cfgPath,
-		auditLogPath: filepath.Join(dir, "absent.jsonl"),
-		auditTail:    0,
-		live:         true,
-	})
+	writeDoctorBundle(&buf, newDoctorOptions(cfgPath, filepath.Join(dir, "absent.jsonl"), "", 0, true))
 	out := buf.String()
 	if !strings.Contains(out, "validate exit code:") {
 		t.Errorf("expected the live section to render a validate exit code:\n%s", out)

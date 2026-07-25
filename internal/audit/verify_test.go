@@ -1600,12 +1600,12 @@ func TestRecoverPartialTail_ProbeOrTruncateErrorIsPropagated(t *testing.T) {
 	// readable=true: this simulates a probe READ fault on a readable handle (the closed
 	// fd makes f.Stat/f.ReadAt fail), which must fail closed — distinct from a genuinely
 	// write-only log (readable=false), which skips the probe.
-	rb, err := recoverPartialTail(logPath, f, true)
+	tail, err := recoverPartialTail(logPath, f, true)
 	if err == nil {
 		t.Fatal("recoverPartialTail must return an error when the recovery cannot complete, not swallow it")
 	}
-	if rb != 0 {
-		t.Fatalf("recovered bytes = %d, want 0 on a recovery failure", rb)
+	if tail.recovered != 0 {
+		t.Fatalf("recovered bytes = %d, want 0 on a recovery failure", tail.recovered)
 	}
 	// The orphan must remain on disk (nothing was removed); Open's fail-closed caller
 	// refuses to start rather than appending onto it.
@@ -1658,15 +1658,15 @@ func TestRecoverPartialTail_ProbeReadFailureOnNonEmptyLogIsFatal(t *testing.T) {
 	// scenario under test is a transient read fault on a readable, non-empty log, which
 	// must fail closed (errAuditTailProbe). A genuinely write-only log uses readable=false
 	// and skips the probe (see TestRecoverPartialTail_WriteOnlyHandleSkipsProbe).
-	rb, err := recoverPartialTail(logPath, wf, true)
+	tail, err := recoverPartialTail(logPath, wf, true)
 	if err == nil {
 		t.Fatal("recoverPartialTail must fail closed when the tail read fails on a non-empty log, not proceed and let the next append fuse onto the orphan")
 	}
 	if !errors.Is(err, errAuditTailProbe) {
 		t.Fatalf("error = %v, want it to wrap errAuditTailProbe", err)
 	}
-	if rb != 0 {
-		t.Fatalf("recovered bytes = %d, want 0 when the probe read failed", rb)
+	if tail.recovered != 0 {
+		t.Fatalf("recovered bytes = %d, want 0 when the probe read failed", tail.recovered)
 	}
 	// The orphan must remain on disk; the operator resolves the I/O fault rather than the
 	// proxy starting and fusing the next record.
@@ -1702,12 +1702,12 @@ func TestRecoverPartialTail_WriteOnlyHandleSkipsProbe(t *testing.T) {
 	}
 	defer func() { _ = f.Close() }()
 
-	rb, err := recoverPartialTail(logPath, f, false)
+	tail, err := recoverPartialTail(logPath, f, false)
 	if err != nil {
 		t.Fatalf("recoverPartialTail(readable=false) must skip the probe and proceed, got error: %v", err)
 	}
-	if rb != 0 {
-		t.Fatalf("recovered bytes = %d, want 0 (the probe is skipped on a write-only handle)", rb)
+	if tail.recovered != 0 {
+		t.Fatalf("recovered bytes = %d, want 0 (the probe is skipped on a write-only handle)", tail.recovered)
 	}
 	// The orphan is left untouched: the write-only tradeoff cannot recover it, but it must
 	// not have failed closed either.
@@ -1755,12 +1755,12 @@ func TestTruncatePartialTail_CleanTailIsTruncatedViaSingleHandle(t *testing.T) {
 	}
 	defer func() { _ = f.Close() }()
 
-	rb, err := truncatePartialTail(f)
+	tail, err := truncatePartialTail(f)
 	if err != nil {
 		t.Fatalf("truncatePartialTail: unexpected error %v", err)
 	}
-	if rb != int64(len(orphan)) {
-		t.Fatalf("recovered bytes = %d, want %d (the orphan fragment length)", rb, len(orphan))
+	if tail.recovered != int64(len(orphan)) {
+		t.Fatalf("recovered bytes = %d, want %d (the orphan fragment length)", tail.recovered, len(orphan))
 	}
 	after, err := os.ReadFile(logPath) //nolint:gosec // G304: test-controlled path
 	if err != nil {
@@ -1787,12 +1787,12 @@ func TestTruncatePartialTail_EmptyLogIsNonFatal(t *testing.T) {
 	}
 	defer func() { _ = f.Close() }()
 
-	rb, err := truncatePartialTail(f)
+	tail, err := truncatePartialTail(f)
 	if err != nil {
 		t.Fatalf("truncatePartialTail on an empty log must be non-fatal, got %v", err)
 	}
-	if rb != 0 {
-		t.Fatalf("recovered bytes = %d, want 0 on an empty log", rb)
+	if tail.recovered != 0 {
+		t.Fatalf("recovered bytes = %d, want 0 on an empty log", tail.recovered)
 	}
 }
 
@@ -2176,4 +2176,114 @@ func TestVerifyAuditLog_AllLegacyUnderKeyIsUnanchored(t *testing.T) {
 	if !res2.OK() {
 		t.Errorf("all-legacy log under an empty keyring must pass (nothing to verify): %+v", res2)
 	}
+}
+
+// TestTruncatePartialTail_YieldsTheChainResumeLine pins the property that lets Open
+// resume the HMAC chain WITHOUT re-opening the log: the one bounded tail read performed
+// through the already-open append handle also yields the last COMPLETE record line, and
+// that line is byte-identical to what a second open (readLastAuditLine) would produce.
+//
+// The re-open is the failure mode openAndPrepareLog switched to a single handle to avoid
+// — a transient EIO/NFS blip on a second open, with a perfectly readable tail sitting in
+// the buffer, used to cost a permanent chain_resume_failed marker and a large seq jump.
+// If these two ever disagree, resuming from the buffer silently changes prev_hmac
+// linkage, so equality (not merely non-emptiness) is what this asserts.
+func TestTruncatePartialTail_YieldsTheChainResumeLine(t *testing.T) {
+	openRDWR := func(t *testing.T, logPath string) *os.File {
+		t.Helper()
+		f, err := os.OpenFile(logPath, os.O_APPEND|os.O_RDWR, 0o600) //nolint:gosec // G304: test-controlled path
+		if err != nil {
+			t.Fatalf("reopen O_RDWR: %v", err)
+		}
+		t.Cleanup(func() { _ = f.Close() })
+		return f
+	}
+
+	t.Run("clean tail", func(t *testing.T) {
+		logPath, _ := writeChainLog(t, t.TempDir(), "a", "b", "c")
+		tail, err := truncatePartialTail(openRDWR(t, logPath))
+		if err != nil {
+			t.Fatalf("truncatePartialTail: %v", err)
+		}
+		if !tail.lastOK {
+			t.Fatal("a clean, readable tail must yield a usable chain-resume line, not force a re-read")
+		}
+		want, err := readLastAuditLine(logPath)
+		if err != nil {
+			t.Fatalf("readLastAuditLine: %v", err)
+		}
+		if tail.last != want {
+			t.Fatalf("chain-resume line from the open handle differs from a re-read:\n got %q\nwant %q", tail.last, want)
+		}
+		if !strings.Contains(tail.last, `"c"`) {
+			t.Errorf("expected the last recorded tool in the resume line, got %q", tail.last)
+		}
+	})
+
+	t.Run("orphan truncated", func(t *testing.T) {
+		logPath, _ := writeChainLog(t, t.TempDir(), "a", "b", "c")
+		ap, err := os.OpenFile(logPath, os.O_WRONLY|os.O_APPEND, 0o600) //nolint:gosec // G304: test-controlled path
+		if err != nil {
+			t.Fatalf("reopen for append: %v", err)
+		}
+		if _, err := ap.WriteString(`{"seq":99,"partial`); err != nil {
+			t.Fatalf("append partial: %v", err)
+		}
+		if err := ap.Close(); err != nil {
+			t.Fatalf("close append handle: %v", err)
+		}
+
+		tail, err := truncatePartialTail(openRDWR(t, logPath))
+		if err != nil {
+			t.Fatalf("truncatePartialTail: %v", err)
+		}
+		if !tail.lastOK || tail.recovered == 0 {
+			t.Fatalf("want a recovered orphan and a usable resume line, got %+v", tail)
+		}
+		// The resume line must be the last COMPLETE record, never the dropped fragment.
+		if strings.Contains(tail.last, "partial") {
+			t.Fatalf("resume line must not be the truncated orphan fragment: %q", tail.last)
+		}
+		want, err := readLastAuditLine(logPath)
+		if err != nil {
+			t.Fatalf("readLastAuditLine after truncation: %v", err)
+		}
+		if tail.last != want {
+			t.Fatalf("post-truncation resume line differs from a re-read:\n got %q\nwant %q", tail.last, want)
+		}
+	})
+
+	t.Run("empty log resumes from genesis without a re-read", func(t *testing.T) {
+		logPath := filepath.Join(t.TempDir(), "empty.jsonl")
+		f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // G304: test-controlled path
+		if err != nil {
+			t.Fatalf("create empty log: %v", err)
+		}
+		defer func() { _ = f.Close() }()
+		tail, err := truncatePartialTail(f)
+		if err != nil {
+			t.Fatalf("truncatePartialTail on an empty log: %v", err)
+		}
+		// "no tail" is authoritative on an empty log: Open must reach its rotated-sibling
+		// fallback from this answer rather than re-reading to learn the same thing.
+		if !tail.lastOK || tail.last != "" {
+			t.Fatalf("want an authoritative empty resume line, got %+v", tail)
+		}
+	})
+
+	t.Run("write-only log defers to a re-read", func(t *testing.T) {
+		logPath, _ := writeChainLog(t, t.TempDir(), "a")
+		f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0o600) //nolint:gosec // G304: test-controlled path
+		if err != nil {
+			t.Fatalf("open write-only: %v", err)
+		}
+		defer func() { _ = f.Close() }()
+		tail, err := recoverPartialTail(logPath, f, false)
+		if err != nil {
+			t.Fatalf("recoverPartialTail(readable=false): %v", err)
+		}
+		if tail.lastOK {
+			t.Fatal("a write-only log never read its tail, so it must not claim a usable resume line")
+		}
+	})
 }

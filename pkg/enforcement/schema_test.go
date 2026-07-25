@@ -1121,3 +1121,107 @@ func TestValidateArgumentSchema_BoundLargeIntPrecision(t *testing.T) {
 		})
 	}
 }
+
+// namedPath / namedPort / namedFlag are the shapes a direct (library) caller of the
+// exported ValidateArgumentSchema can hand-build that the JSON decoder never produces.
+type namedPath string
+type namedPort int
+type namedFlag bool
+
+// TestValidateArgumentSchema_NamedScalarArguments pins that a NAMED scalar type has its
+// keyword checks enforced rather than silently skipped.
+//
+// `type namedPath string` is not assignable to interface{}.(string), so it matched no arm
+// of the type switch, fell through past every string/number keyword, and returned nil —
+// a fail-open that dropped a declared pattern/minLength/maxLength/minimum/maximum. It is
+// unreachable from the proxy's own JSON path (which yields only stdlib decode types), but
+// an embedder calling the engine directly could hit it, and the failure is silent.
+func TestValidateArgumentSchema_NamedScalarArguments(t *testing.T) {
+	t.Parallel()
+
+	t.Run("typeless: named string violating maxLength is rejected", func(t *testing.T) {
+		schema := &capability.ArgumentSchema{
+			Properties: map[string]*capability.ArgumentSchema{
+				"p": {MaxLength: intPtrC(3)},
+			},
+		}
+		err := enforcement.ValidateArgumentSchema(
+			map[string]interface{}{"p": namedPath("/etc/passwd")}, schema)
+		require.Error(t, err, "a named string type must still be length-checked")
+		assert.Contains(t, err.Error(), "maxLength")
+	})
+
+	t.Run("typeless: named string violating pattern is rejected", func(t *testing.T) {
+		schema := &capability.ArgumentSchema{
+			Properties: map[string]*capability.ArgumentSchema{
+				"p": {Pattern: `^/srv/`},
+			},
+		}
+		err := enforcement.ValidateArgumentSchema(
+			map[string]interface{}{"p": namedPath("/etc/passwd")}, schema)
+		require.Error(t, err, "a named string type must still be pattern-checked")
+		assert.Contains(t, err.Error(), "pattern")
+	})
+
+	t.Run("typed: named string is classified as a string, not unknown", func(t *testing.T) {
+		schema := &capability.ArgumentSchema{
+			Properties: map[string]*capability.ArgumentSchema{
+				"p": {Type: capability.SchemaType{Single: "string"}, MinLength: intPtrC(1)},
+			},
+		}
+		err := enforcement.ValidateArgumentSchema(
+			map[string]interface{}{"p": namedPath("/srv/data")}, schema)
+		assert.NoError(t, err, "a valid named string under type:string must not be rejected as unknown")
+	})
+
+	t.Run("typeless: named int over maximum is rejected", func(t *testing.T) {
+		schema := &capability.ArgumentSchema{
+			Properties: map[string]*capability.ArgumentSchema{
+				"port": {Maximum: floatPtrC(1024)},
+			},
+		}
+		err := enforcement.ValidateArgumentSchema(
+			map[string]interface{}{"port": namedPort(8080)}, schema)
+		require.Error(t, err, "a named integer type must still be bound-checked")
+		assert.Contains(t, err.Error(), "maximum")
+	})
+
+	t.Run("named string is compared against enum by value", func(t *testing.T) {
+		schema := &capability.ArgumentSchema{
+			Properties: map[string]*capability.ArgumentSchema{
+				"p": {Enum: []interface{}{"/srv/a", "/srv/b"}},
+			},
+		}
+		assert.NoError(t, enforcement.ValidateArgumentSchema(
+			map[string]interface{}{"p": namedPath("/srv/a")}, schema),
+			"a named string equal to an enum entry must match")
+		err := enforcement.ValidateArgumentSchema(
+			map[string]interface{}{"p": namedPath("/etc/passwd")}, schema)
+		require.Error(t, err, "a named string outside the enum must be denied")
+		assert.Contains(t, err.Error(), "enum")
+	})
+
+	t.Run("named bool carries no keyword and passes", func(t *testing.T) {
+		schema := &capability.ArgumentSchema{
+			Properties: map[string]*capability.ArgumentSchema{
+				"f": {Type: capability.SchemaType{Single: "boolean"}},
+			},
+		}
+		assert.NoError(t, enforcement.ValidateArgumentSchema(
+			map[string]interface{}{"f": namedFlag(true)}, schema))
+	})
+
+	t.Run("json.Number keeps its numeric semantics", func(t *testing.T) {
+		// json.Number is itself a named string type; unwrapping it to a plain string
+		// would lose the int64-exact bound comparison the number path depends on.
+		schema := &capability.ArgumentSchema{
+			Properties: map[string]*capability.ArgumentSchema{
+				"n": {Maximum: floatPtrC(9007199254740992)},
+			},
+		}
+		err := enforcement.ValidateArgumentSchema(
+			map[string]interface{}{"n": json.Number("9007199254740993")}, schema)
+		require.Error(t, err, "json.Number must stay on the exact numeric path")
+		assert.Contains(t, err.Error(), "maximum")
+	})
+}
