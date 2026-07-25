@@ -28,6 +28,23 @@ const (
 	// re-converges a replica that started degraded (Redis unreachable at boot) and
 	// bounds how long degraded mode persists after recovery.
 	defaultReconcileInterval = 30 * time.Second
+
+	// defaultSessionKillTTL bounds how long a SESSION kill tombstone lives in Redis.
+	//
+	// Session ids are ephemeral -- one MCP connection, bounded by the idle reaper and the
+	// proxy's own lifetime -- but their tombstones were written with no expiry, so a
+	// long-running deployment accumulated one dead key per killed session forever, with
+	// nothing to ever collect them. That is unbounded Redis memory growth, and every
+	// reconcile SCAN pays for it.
+	//
+	// This is a garbage-collection bound, NOT a policy expiry, and the default is chosen
+	// to make that distinction safe: 30 days is orders of magnitude longer than any
+	// session can live, so a tombstone can only expire long after the session it names is
+	// gone. Note the direction of the risk if it were set too low -- an expiring tombstone
+	// LIFTS the kill -- so a value shorter than the longest session a deployment can hold
+	// open would be a fail-open. AGENT kills are deliberately NOT expired: an agent
+	// identity is long-lived and its revocation is meant to be durable.
+	defaultSessionKillTTL = 30 * 24 * time.Hour
 )
 
 // subscribeConfirmTimeout bounds the initial pub/sub subscription-confirmation read in
@@ -130,6 +147,10 @@ type Redis struct {
 
 	reconcileInterval time.Duration
 
+	// sessionKillTTL is how long a session-kill tombstone lives; see
+	// defaultSessionKillTTL. Zero means no expiry.
+	sessionKillTTL time.Duration
+
 	// now is the clock used for the staleness gate, injectable for deterministic tests.
 	// nil means time.Now.
 	now func() time.Time
@@ -200,6 +221,27 @@ func NewRedis(client redis.Cmdable) *Redis {
 		killedAgents:      make(map[string]bool),
 		killedSessions:    make(map[string]bool),
 		reconcileInterval: defaultReconcileInterval,
+		sessionKillTTL:    defaultSessionKillTTL,
+	}
+	return r
+}
+
+// WithSessionKillTTL overrides how long a session-kill tombstone lives in Redis. A
+// negative value disables expiry (tombstones live forever, the pre-existing behavior).
+//
+// Raise it only if sessions in your deployment can outlive the default; LOWERING it below
+// the longest session you can hold open is a fail-open, because an expiring tombstone
+// lifts the kill on a session that may still be connected. Agent kills are never expired.
+//
+// Must be called before Start.
+func (r *Redis) WithSessionKillTTL(d time.Duration) *Redis {
+	switch {
+	case d < 0:
+		r.sessionKillTTL = 0 // explicit opt-out: never expire
+	case d == 0:
+		r.sessionKillTTL = defaultSessionKillTTL
+	default:
+		r.sessionKillTTL = d
 	}
 	return r
 }
@@ -694,7 +736,14 @@ func (r *Redis) setBlock(ctx context.Context, kill, session bool, id string) err
 	key := keyPrefix + id
 	var err error
 	if kill {
-		err = r.client.Set(ctx, key, "1", 0).Err()
+		// Only SESSION tombstones expire; an agent kill is durable revocation of a
+		// long-lived identity. See defaultSessionKillTTL for why the expiry is a
+		// garbage-collection bound rather than a policy one.
+		ttl := time.Duration(0)
+		if session {
+			ttl = r.sessionKillTTL
+		}
+		err = r.client.Set(ctx, key, "1", ttl).Err()
 	} else {
 		err = r.client.Del(ctx, key).Err()
 	}

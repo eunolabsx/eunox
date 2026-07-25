@@ -255,6 +255,8 @@ func dispatchRequest(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.
 	switch msg.Method {
 	case "initialize":
 		return dispatchInitialize(ctx, d, msg)
+	case "ping":
+		return dispatchPing(msg)
 	case capability.MethodResourcesList:
 		return dispatchList(ctx, d, msg, pdp.ListFilterer.FilterResourcesList)
 	case capability.MethodToolsList:
@@ -279,6 +281,25 @@ func dispatchInitialize(_ context.Context, d dispatchParams, msg mcp.RPCMsg) mcp
 		return mcp.ErrorResponse(msg.ID, -32603, "internal error: initialize responder not configured")
 	}
 	return d.buildInit(msg)
+}
+
+// dispatchPing answers the MCP utility ping locally with the spec's empty result.
+//
+// ping carries no arguments, names no target, and reaches no upstream, so there is
+// nothing for a manifest to authorize — but falling through to dispatchUnmapped denied it
+// with AUTHORIZATION_FAILED, which breaks the liveness probe every MCP host is entitled to
+// send and writes a policy-denial record for a call that was never a policy question. That
+// is a fail-closed default doing the wrong thing rather than a security property: nothing
+// is protected by refusing to say "I am here".
+//
+// It is answered locally rather than forwarded so a ping cannot be used to probe upstream
+// liveness through the proxy, and it sits inside the locally-answered set so the shared
+// kill gate at the dispatchRequest boundary still applies: a killed session gets
+// KILL_SWITCH, not a pong. No audit record — like initialize, this is a handshake-level
+// utility that is not a guarded action, and recording every host heartbeat would bury the
+// tape in noise.
+func dispatchPing(msg mcp.RPCMsg) mcp.RPCMsg {
+	return mcp.RPCMsg{JSONRPC: "2.0", ID: msg.ID, Result: json.RawMessage(`{}`)}
 }
 
 // malformedDeny records a fail-closed audit deny for an enforced request rejected

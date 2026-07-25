@@ -562,3 +562,47 @@ func TestJWTDecideSampling_ExhaustiveCapabilitiesDeniesSampling(t *testing.T) {
 		t.Fatalf("an identity-only token must still defer to the manifest opt-in; got %q (%+v)", resp.Decision, resp.Denial)
 	}
 }
+
+// TestApplyRedactObligs_RedactsSiblingTopLevelKeys pins that a declared redactFields path
+// is honored anywhere in the result envelope, not only inside content/structuredContent.
+//
+// The function's contract is that fields the proxy does not model "survive the round-trip",
+// which meant a named field sitting in any OTHER top-level key was forwarded UNREDACTED
+// even though the manifest declared it redactable — an upstream returning
+// {"content":[...],"data":{"ssn":"..."}} defeated the obligation entirely.
+func TestApplyRedactObligs_RedactsSiblingTopLevelKeys(t *testing.T) {
+	t.Parallel()
+	obligs := []capability.Obligation{{
+		Type:  capability.DirectiveTypeRedactFields,
+		Paths: []string{"$.ssn"},
+	}}
+	in := []byte(`{"content":[{"type":"text","text":"{\"ssn\":\"111-22-3333\"}"}],"data":{"ssn":"444-55-6666"},"_meta":{"ssn":"777-88-9999"}}`)
+	out, err := ApplyRedactObligs(in, obligs)
+	if err != nil {
+		t.Fatalf("ApplyRedactObligs: %v", err)
+	}
+	for _, leaked := range []string{"111-22-3333", "444-55-6666", "777-88-9999"} {
+		if bytes.Contains(out, []byte(leaked)) {
+			t.Errorf("a declared redactFields path must be masked in every top-level key; %q survived in %s", leaked, out)
+		}
+	}
+}
+
+// TestApplyRedactObligs_UnmatchedEnvelopePreservedVerbatim is the negative control: a
+// response no path touches must still come back byte-for-byte, so the new sibling-key walk
+// cannot start re-marshaling (and thus reordering) envelopes it did not change.
+func TestApplyRedactObligs_UnmatchedEnvelopePreservedVerbatim(t *testing.T) {
+	t.Parallel()
+	obligs := []capability.Obligation{{
+		Type:  capability.DirectiveTypeRedactFields,
+		Paths: []string{"$.ssn"},
+	}}
+	in := []byte(`{"zeta":1,"alpha":{"other":"keep"},"content":[{"type":"text","text":"plain prose"}]}`)
+	out, err := ApplyRedactObligs(in, obligs)
+	if err != nil {
+		t.Fatalf("ApplyRedactObligs: %v", err)
+	}
+	if !bytes.Equal(out, in) {
+		t.Fatalf("an untouched response must be preserved byte-for-byte:\n got  %s\n want %s", out, in)
+	}
+}

@@ -2510,6 +2510,47 @@ func ApplyRedactObligs(resultBytes []byte, obligs []capability.Obligation) ([]by
 		changed = true
 	}
 
+	// (3) Redact within every OTHER top-level result key. `content` and
+	// `structuredContent` are the two shapes MCP defines, but a result envelope may
+	// legally carry additional keys, and this function's own contract is that fields the
+	// proxy does not model "survive the round-trip" — which meant a named field sitting in
+	// any other top-level key was forwarded UNREDACTED even though the manifest declared
+	// it redactable. An upstream returning {"content":[...],"data":{"ssn":"..."}} defeated
+	// the obligation entirely.
+	//
+	// Redacting them (rather than failing the response closed on an unmodelled key) is the
+	// right trade here: `_meta`, `annotations`, and vendor extensions are ordinary and
+	// legitimate, so refusing them would break honest upstreams, while masking is exactly
+	// what the operator asked for. The same container walk structuredContent uses is
+	// reused, so a doubly-encoded JSON string leaf is unwrapped identically and the depth
+	// bound applies the same way.
+	for key, val := range result {
+		if key == "content" || key == "structuredContent" {
+			continue // already handled with their own shape-specific rigor above
+		}
+		switch v := val.(type) {
+		case map[string]interface{}, []interface{}:
+			c, err := redactStructuredContentValue(v, paths, "", 0)
+			if err != nil {
+				return nil, err // fail closed
+			}
+			if c {
+				changed = true
+			}
+		case string:
+			out, c, err := redactContainerString(v, paths, "", 0)
+			if err != nil {
+				return nil, err // fail closed
+			}
+			if c {
+				result[key] = out
+				changed = true
+			}
+		default:
+			// A scalar (number, bool, null) carries no named field and cannot hide one.
+		}
+	}
+
 	// No path matched anything: return the original bytes verbatim so a response
 	// the redaction did not touch is preserved byte-for-byte (key order, scalar
 	// formatting, and any leading BOM/whitespace all intact). The re-marshal below
