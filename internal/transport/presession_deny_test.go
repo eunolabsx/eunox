@@ -162,3 +162,60 @@ func newTestRequestWithSession(id string) *http.Request {
 	r.Header.Set(SessionHeader, id)
 	return r
 }
+
+// TestHostAllowedForLoopbackEndpoint_HonorsConfiguredOrigins pins that the loopback
+// endpoints are no STRICTER than the /mcp Origin gate they claim to mirror.
+//
+// checkOrigin admits an Origin two ways: an exact listen.allowedOrigins match, or a
+// hostname in the constructor-seeded host set. The Host pin consulted only the second, so
+// an operator who allowlisted "http://eunox.internal:8080" could reach /mcp from that
+// origin but got a 403 on /healthz, /metrics and /control/kill from the same host — the
+// more sensitive endpoint was the permissive one.
+func TestHostAllowedForLoopbackEndpoint_HonorsConfiguredOrigins(t *testing.T) {
+	t.Parallel()
+	p := &HTTPProxy{
+		allowedOriginHosts: buildAllowedOriginHosts("127.0.0.1"),
+		loopbackPinHosts: buildLoopbackPinHosts([]string{
+			"http://eunox.internal:8080",
+			"https://Scraper.Example",
+			"null",               // opaque: contributes no hostname
+			"file:///etc/passwd", // non-web scheme: contributes no hostname
+		}),
+	}
+	for _, h := range []string{"eunox.internal", "scraper.example"} {
+		if !p.hostAllowedForLoopbackEndpoint(h+":8080", h) {
+			t.Errorf("host %q is an allowlisted Origin host and must satisfy the loopback pin", h)
+		}
+	}
+	// The pin must not become a blanket pass: a name the operator never allowlisted is
+	// still the DNS-rebinding case.
+	if p.hostAllowedForLoopbackEndpoint("attacker.com", "attacker.com") {
+		t.Error("a host absent from every allowlist must still be refused")
+	}
+	// An opaque or non-web allowedOrigins entry contributes no host, so it cannot be
+	// smuggled in as a Host value.
+	for _, h := range []string{"null", "etc"} {
+		if p.hostAllowedForLoopbackEndpoint(h, h) {
+			t.Errorf("%q came from a non-web allowedOrigins entry and must not satisfy the pin", h)
+		}
+	}
+}
+
+// TestBuildLoopbackPinHosts_DoesNotWidenTheOriginGate pins the reason this is a separate
+// set: allowedOriginHosts is matched on hostname alone with ANY scheme and port, so folding
+// these names into it would widen /mcp from "exactly http://eunox.internal:8080" to
+// "eunox.internal on any scheme and port".
+func TestBuildLoopbackPinHosts_DoesNotWidenTheOriginGate(t *testing.T) {
+	t.Parallel()
+	p := &HTTPProxy{
+		allowedOrigins:     []string{"http://eunox.internal:8080"},
+		allowedOriginHosts: buildAllowedOriginHosts("127.0.0.1"),
+		loopbackPinHosts:   buildLoopbackPinHosts([]string{"http://eunox.internal:8080"}),
+	}
+	if !p.originAllowed("http://eunox.internal:8080") {
+		t.Fatal("the exact allowlisted origin must still be accepted on /mcp")
+	}
+	if p.originAllowed("https://eunox.internal:9999") {
+		t.Fatal("a different scheme/port on an allowlisted host must NOT be accepted on /mcp; the pin host set must not leak into the Origin gate")
+	}
+}

@@ -1880,7 +1880,18 @@ type toolEntryScan struct {
 	// names holds every top-level name value the entry carries (more than one only when
 	// the key is duplicated). It bounds which pins the entry could impersonate, so a
 	// malformed entry poisons only those rather than every pin on the route.
+	//
+	// Only meaningful when namesComplete is set: see below.
 	names []string
+	// namesComplete reports that the scan walked the WHOLE entry, so names is the full
+	// set of names it could present. When false the scan aborted partway (malformed
+	// tokens, a non-string key, or a value nested past the depth bound) and names holds
+	// only what had been seen so far -- which may be nothing at all, since a tool entry is
+	// free to place its deep "inputSchema" BEFORE its "name". Treating that truncated list
+	// as authoritative poisons a subset of the pins the entry could impersonate, and often
+	// the empty set, so an aborted scan must poison every pin instead: the set of pins an
+	// unreadable entry could be impersonating is unknown, not empty.
+	namesComplete bool
 }
 
 // scanToolEntry decides whether a tools/list entry's bytes can be trusted, and collects
@@ -1944,16 +1955,21 @@ func scanToolEntry(raw json.RawMessage) toolEntryScan {
 			stack[n-1].expectKey = true
 		}
 	}
+	// Every abort below returns `out` rather than a fresh zero value, so names already
+	// collected survive -- and leaves namesComplete false, so the caller knows the list is
+	// truncated and widens the poison accordingly.
 	for len(stack) > 0 {
 		tok, err := dec.Token()
 		if err != nil {
-			return toolEntryScan{untrustworthy: true}
+			out.untrustworthy = true
+			return out
 		}
 		if d, ok := tok.(json.Delim); ok {
 			switch d {
 			case '{', '[':
 				if len(stack) >= maxDuplicateKeyScanDepth {
-					return toolEntryScan{untrustworthy: true} // pathologically deep
+					out.untrustworthy = true // pathologically deep
+					return out
 				}
 				stack = append(stack, frame{object: d == '{', expectKey: d == '{'})
 				pendingName = false
@@ -1967,7 +1983,8 @@ func scanToolEntry(raw json.RawMessage) toolEntryScan {
 		if stack[n-1].object && stack[n-1].expectKey {
 			key, ok := tok.(string)
 			if !ok {
-				return toolEntryScan{untrustworthy: true}
+				out.untrustworthy = true
+				return out
 			}
 			// Fold at the TOP level only (see the doc comment). capability.FoldJSONKey,
 			// not strings.ToLower: ToLower leaves an already-lower-case case variant such
@@ -1996,6 +2013,8 @@ func scanToolEntry(raw json.RawMessage) toolEntryScan {
 		}
 		markValueDone()
 	}
+	// The stack unwound to empty: the whole entry was walked, so names is authoritative.
+	out.namesComplete = true
 	return out
 }
 
@@ -2088,9 +2107,12 @@ func (p *ManifestPDP) RecordObservedToolHashes(_ context.Context, result json.Ra
 //
 // What fails closed, and how widely:
 //   - An entry whose bytes are untrustworthy (scanToolEntry: a duplicate or case-variant
-//     top-level key, a duplicate nested in a hashed description, malformed or over-deep
-//     bytes) poisons only the pinned names THAT ENTRY could present — never the whole
-//     route, so an unrelated malformed entry cannot disable pins it never named.
+//     top-level key, or a duplicate nested in a hashed description) poisons only the pinned
+//     names THAT ENTRY could present — never the whole route, so an unrelated malformed
+//     entry cannot disable pins it never named. That narrowing holds only when the scan
+//     actually enumerated the entry's names; an entry whose bytes ABORTED the scan
+//     (malformed tokens, a non-string key, nesting past the depth bound) has an unknown
+//     name set, not an empty one, so it poisons every pin.
 //   - An entry that will not decode into the hashed surface poisons just its own pin.
 //   - An ambiguous ENVELOPE — undecodable, an undecodable tools array, or a duplicate or
 //     case-variant "tools" key (Go keeps one array while a host may render the other) —
@@ -2139,6 +2161,16 @@ func (p *ManifestPDP) armPinsFromToolsList(result json.RawMessage) (entryCount i
 	for _, raw := range entries {
 		scan := scanToolEntry(raw)
 		if scan.untrustworthy {
+			if !scan.namesComplete {
+				// The scan aborted before walking the whole entry, so its name list is
+				// truncated and may be EMPTY -- a tool entry is free to put a deep
+				// inputSchema before its name. Poisoning that subset would poison nothing
+				// for exactly the entry that defeated the scan, leaving the pin unarmed on
+				// an audit route where this pass is the only thing arming it. The pins an
+				// unreadable entry could be impersonating are unknown, not none.
+				p.poisonAllPinned()
+				continue
+			}
 			p.poisonCandidates(scan.names)
 			continue
 		}

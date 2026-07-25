@@ -210,7 +210,11 @@ type HTTPProxy struct {
 	// DNS-rebinding defense (see checkOrigin): allowedOrigins holds operator-configured
 	// full origins matched exactly; allowedOriginHosts is the set of host names always
 	// accepted (loopback names plus the non-wildcard bind host).
-	allowedOrigins     []string
+	allowedOrigins []string
+	// loopbackPinHosts holds the hostnames of allowedOrigins entries, read ONLY by the
+	// DNS-rebinding Host pin on the loopback endpoints so it is no stricter than the /mcp
+	// Origin gate. Deliberately not merged into allowedOriginHosts: see buildLoopbackPinHosts.
+	loopbackPinHosts   map[string]bool
 	allowedOriginHosts map[string]bool
 
 	// routes maps a route name (the /mcp/<name> path segment) to its upstream wiring
@@ -347,6 +351,7 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 		sessionIdleMs:      opts.SessionIdleMs,
 		allowedOrigins:     opts.AllowedOrigins,
 		allowedOriginHosts: buildAllowedOriginHosts(opts.Bind),
+		loopbackPinHosts:   buildLoopbackPinHosts(opts.AllowedOrigins),
 		routes:             opts.Routes,
 		sessions:           make(map[string]*httpSession),
 	}

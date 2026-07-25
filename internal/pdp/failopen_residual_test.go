@@ -606,3 +606,70 @@ func TestApplyRedactObligs_UnmatchedEnvelopePreservedVerbatim(t *testing.T) {
 		t.Fatalf("an untouched response must be preserved byte-for-byte:\n got  %s\n want %s", out, in)
 	}
 }
+
+// TestPin_OverDeepEntryPoisonsPinnedTool is the regression for a fail-open in the entry
+// scan's abort handling.
+//
+// scanToolEntry aborted with a FRESH zero value, discarding any names it had already
+// collected, so armPinsFromToolsList called poisonCandidates(nil) and poisoned nothing.
+// On an audit route this pass is the only thing arming the pin and the catalog is
+// forwarded verbatim, so an upstream could rotate a pinned tool's description behind
+// nesting deeper than the scan bound and the FM-5 pin never fired.
+//
+// Preserving the collected names is necessary but not sufficient: an entry is free to put
+// its deep inputSchema BEFORE its name, so the name may never have been reached. An
+// aborted scan therefore reports namesComplete=false and the caller poisons every pin —
+// the set of pins an unreadable entry could be impersonating is unknown, not empty.
+func TestPin_OverDeepEntryPoisonsPinnedTool(t *testing.T) {
+	t.Parallel()
+	deep := `{"description":"leaf"}`
+	for i := 0; i < maxDuplicateKeyScanDepth+10; i++ {
+		deep = `{"p":` + deep + `}`
+	}
+
+	// Name FIRST: the scan collects it before aborting.
+	t.Run("name before deep schema", func(t *testing.T) {
+		t.Parallel()
+		mdp := newTestManifestPDP(capability.Constraint{
+			Target: "tool:pinned_tool", Actions: []string{"call"},
+			DescriptionHash: capability.ComputeToolHash("clean", nil),
+		})
+		catalog := `{"tools":[{"name":"pinned_tool","inputSchema":` + deep + `}]}`
+		mdp.RecordObservedToolHashes(context.Background(), json.RawMessage(catalog))
+		if !mdp.isToolPoisoned("pinned_tool") {
+			t.Fatal("an entry nested past the scan bound must poison the pin it names")
+		}
+	})
+
+	// Name LAST, behind the deep value: the scan never reaches it, so the truncated name
+	// list is EMPTY and only the widened poison can save the pin.
+	t.Run("deep schema before name", func(t *testing.T) {
+		t.Parallel()
+		mdp := newTestManifestPDP(capability.Constraint{
+			Target: "tool:pinned_tool", Actions: []string{"call"},
+			DescriptionHash: capability.ComputeToolHash("clean", nil),
+		})
+		catalog := `{"tools":[{"inputSchema":` + deep + `,"name":"pinned_tool"}]}`
+		mdp.RecordObservedToolHashes(context.Background(), json.RawMessage(catalog))
+		if !mdp.isToolPoisoned("pinned_tool") {
+			t.Fatal("an entry that aborts the scan before its name is reached must still poison every pin; its name set is unknown, not empty")
+		}
+	})
+}
+
+// TestScanToolEntry_NamesCompleteOnCleanWalk is the negative control: a clean entry must
+// report namesComplete so the caller keeps the NARROW poison and an unrelated malformed
+// entry cannot disable pins it never named.
+func TestScanToolEntry_NamesCompleteOnCleanWalk(t *testing.T) {
+	t.Parallel()
+	got := scanToolEntry(json.RawMessage(`{"name":"a","description":"d","inputSchema":{"type":"object"}}`))
+	if got.untrustworthy {
+		t.Fatal("a clean entry must not be untrustworthy")
+	}
+	if !got.namesComplete {
+		t.Fatal("a fully-walked entry must report namesComplete")
+	}
+	if len(got.names) != 1 || got.names[0] != "a" {
+		t.Fatalf("names = %v, want [a]", got.names)
+	}
+}

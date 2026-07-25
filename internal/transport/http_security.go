@@ -183,6 +183,44 @@ func (p *HTTPProxy) checkControlToken(w http.ResponseWriter, r *http.Request) bo
 // accepted: the loopback names plus the configured bind host (unless it is a
 // wildcard, which is not a meaningful Origin host). Hosts are lower-cased so the
 // lookup in originAllowed is case-insensitive.
+// buildLoopbackPinHosts returns the extra host NAMES the DNS-rebinding pin on the
+// loopback-only endpoints accepts, derived from the operator's listen.allowedOrigins.
+//
+// It exists because the pin was strictly STRICTER than the /mcp gate it claims to mirror.
+// checkOrigin admits an Origin two ways: an exact allowedOrigins match, or a hostname in
+// the constructor-seeded host set. The pin consulted only the second, so an operator who
+// allowlisted "http://eunox.internal:8080" could reach /mcp from that origin but got a 403
+// on /healthz, /metrics and /control/kill from the same host — the more sensitive endpoint
+// was the permissive one.
+//
+// This is a SEPARATE set rather than more entries in allowedOriginHosts on purpose. That
+// set is matched on hostname alone with any scheme and port, so folding these names into it
+// would widen /mcp from "exactly http://eunox.internal:8080" to "eunox.internal on any
+// scheme and port" — a real weakening of the Origin check. Only the Host pin, which
+// compares bare hostnames by construction, reads this.
+//
+// A configured origin that is not a parseable http(s) web origin (the opaque "null", a
+// file:// front-end) contributes no hostname: those opt into /mcp through the exact-match
+// path only, and a Host header cannot carry a scheme to match exactly against.
+func buildLoopbackPinHosts(allowedOrigins []string) map[string]bool {
+	hosts := make(map[string]bool, len(allowedOrigins))
+	for _, o := range allowedOrigins {
+		u, err := url.Parse(strings.TrimSpace(o))
+		if err != nil {
+			continue
+		}
+		switch strings.ToLower(u.Scheme) {
+		case "http", "https":
+		default:
+			continue
+		}
+		if h := strings.ToLower(u.Hostname()); h != "" {
+			hosts[h] = true
+		}
+	}
+	return hosts
+}
+
 func buildAllowedOriginHosts(bind string) map[string]bool {
 	hosts := map[string]bool{
 		"localhost": true,
@@ -608,7 +646,8 @@ func (p *HTTPProxy) loopbackOnly(w http.ResponseWriter, r *http.Request) bool {
 // everything unlisted", and three things are admitted:
 //
 //   - The origin-host allowlist the constructor seeds (loopback names plus any
-//     non-wildcard bind host) — the same set checkOrigin applies to /mcp.
+//     non-wildcard bind host), plus the hostnames of any listen.allowedOrigins entries —
+//     together, every name checkOrigin would accept an Origin from on /mcp.
 //   - Any loopback host, name or literal. A caller reaching a loopback endpoint over
 //     127.0.0.2 or an alternate loopback alias is local by construction, and a browser
 //     cannot be steered into sending a loopback LITERAL as the Host of a rebound page:
@@ -638,6 +677,13 @@ func (p *HTTPProxy) hostAllowedForLoopbackEndpoint(rawHost, reqHost string) bool
 		return false
 	}
 	if p.allowedOriginHosts[reqHost] {
+		return true
+	}
+	// A host the operator explicitly allowlisted as a trusted Origin is, by definition, not
+	// a foreign name — it is the same trust decision checkOrigin already makes for the more
+	// sensitive /mcp route. Omitting it made these endpoints stricter than /mcp, contrary to
+	// this function's own contract.
+	if p.loopbackPinHosts[reqHost] {
 		return true
 	}
 	return capability.IsLoopbackHost(reqHost)
