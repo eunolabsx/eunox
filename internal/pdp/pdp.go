@@ -1975,12 +1975,10 @@ func nestedHasDuplicateKey(raw json.RawMessage, depth int) (bool, error) {
 //
 // The caller MUST have cleared the entry through scanToolEntry first: this trusts
 // entry.Name, and a duplicated or case-variant name key makes that value untrustworthy.
-func (p *ManifestPDP) recordPinnedToolHash(entry toolListEntry) (pinned bool) {
-	pin, pinned := p.pinnedTools[entry.Name]
-	if pinned {
+func (p *ManifestPDP) recordPinnedToolHash(entry toolListEntry) {
+	if pin, pinned := p.pinnedTools[entry.Name]; pinned {
 		p.recordObservedToolHash(entry.Name, entry.Description, entry.Title, entry.Annotations, entry.InputSchema, entry.OutputSchema, pin)
 	}
-	return pinned
 }
 
 // poisonCandidates sticky-poisons every pinned name an untrustworthy entry could present
@@ -1993,16 +1991,6 @@ func (p *ManifestPDP) poisonCandidates(names []string) {
 			p.markToolPoisoned(n)
 		}
 	}
-}
-
-// toolListEntryName is a lightweight decode target for a single tools/list entry — its
-// name only. RecordObservedToolHashes uses it to test the pinnedTools gate BEFORE paying
-// for the full toolListEntry decode (which can include large inputSchema/outputSchema/
-// annotations maps): most catalogs are small-pinned-fraction, and the entries
-// recordPinnedToolHash would discard for being unpinned should not first be fully
-// unmarshaled just to read their name.
-type toolListEntryName struct {
-	Name string `json:"name"`
 }
 
 // RecordObservedToolHashes walks a tools/list result and records each pinned tool's
@@ -2022,8 +2010,7 @@ type toolListEntryName struct {
 // enforce-mode filter call, for exactly which shapes fail closed and how widely. With NO
 // pinned tool there is nothing to protect, so the walk only counts entries.
 func (p *ManifestPDP) RecordObservedToolHashes(_ context.Context, result json.RawMessage) int {
-	count, _ := p.armPinsFromToolsList(result)
-	return count
+	return p.armPinsFromToolsList(result)
 }
 
 // armPinsFromToolsList walks a tools/list result, records every pinned tool's live
@@ -2049,9 +2036,9 @@ func (p *ManifestPDP) RecordObservedToolHashes(_ context.Context, result json.Ra
 //     case-variant "tools" key (Go keeps one array while a host may render the other) —
 //     poisons every pin, because no entry in it can be believed. A plainly absent tools
 //     key is not ambiguous: a host renders no tools from it, so nothing is poisoned.
-func (p *ManifestPDP) armPinsFromToolsList(result json.RawMessage) (entryCount int, decoded bool) {
+func (p *ManifestPDP) armPinsFromToolsList(result json.RawMessage) (entryCount int) {
 	if len(result) == 0 {
-		return 0, false
+		return 0
 	}
 	pinned := len(p.pinnedTools) > 0
 	var envelope map[string]json.RawMessage
@@ -2059,35 +2046,35 @@ func (p *ManifestPDP) armPinsFromToolsList(result json.RawMessage) (entryCount i
 		if pinned {
 			p.poisonAllPinned()
 		}
-		return 0, false
+		return 0
 	}
 	rawArray, ok := envelope[listKeyTools]
 	if !ok {
 		// No exact "tools" key. A case-variant sibling ("Tools") still decodes for a host
 		// whose reader binds it case-insensitively, and the proxy cannot tell what that
 		// host sees, so treat it as ambiguous; a plainly absent key is not.
-		if pinned && envelopeHasFoldedKey(envelope, listKeyTools) {
+		if pinned && envelopeHasFoldedToolsKey(envelope) {
 			p.poisonAllPinned()
 		}
-		return 0, false
+		return 0
 	}
 	var entries []json.RawMessage
 	if err := json.Unmarshal(rawArray, &entries); err != nil {
 		if pinned {
 			p.poisonAllPinned()
 		}
-		return 0, false
+		return 0
 	}
 	if !pinned {
 		// Nothing to record or protect: skip the per-entry scan and decode entirely rather
 		// than walking every entry only to find none pinned.
-		return len(entries), true
+		return len(entries)
 	}
 	// A duplicate or case-variant "tools" key leaves Go and the host reading different
 	// arrays, so no entry below can be believed.
-	if duplicateOrFoldedEnvelopeKey(result, listKeyTools) {
+	if duplicateOrFoldedToolsKey(result) {
 		p.poisonAllPinned()
-		return len(entries), true
+		return len(entries)
 	}
 	for _, raw := range entries {
 		scan := scanToolEntry(raw)
@@ -2105,26 +2092,26 @@ func (p *ManifestPDP) armPinsFromToolsList(result json.RawMessage) (entryCount i
 		}
 		p.recordPinnedToolHash(entry)
 	}
-	return len(entries), true
+	return len(entries)
 }
 
-// envelopeHasFoldedKey reports whether the decoded envelope carries a key that differs from
-// target only by case — a shape Go's own struct-tag decode (and any host that binds keys
-// case-insensitively) would still resolve to target.
-func envelopeHasFoldedKey(envelope map[string]json.RawMessage, target string) bool {
+// envelopeHasFoldedToolsKey reports whether the decoded envelope carries a key that differs
+// from the tools list key only by case — a shape Go's own struct-tag decode (and any host
+// that binds keys case-insensitively) would still resolve to it.
+func envelopeHasFoldedToolsKey(envelope map[string]json.RawMessage) bool {
 	for k := range envelope {
-		if strings.EqualFold(k, target) {
+		if strings.EqualFold(k, listKeyTools) {
 			return true
 		}
 	}
 	return false
 }
 
-// duplicateOrFoldedEnvelopeKey reports whether result's top-level object carries target
-// more than once, comparing case-folded. json.Unmarshal into a map silently keeps the last
+// duplicateOrFoldedToolsKey reports whether result's top-level object carries the tools
+// list key more than once, comparing case-folded. json.Unmarshal into a map silently keeps the last
 // such key, so a repeat (or a case-variant sibling) means the array the proxy walks is not
 // necessarily the one a host renders. Malformed input reports true: the caller fails closed.
-func duplicateOrFoldedEnvelopeKey(result json.RawMessage, target string) bool {
+func duplicateOrFoldedToolsKey(result json.RawMessage) bool {
 	dec := json.NewDecoder(bytes.NewReader(result))
 	tok, err := dec.Token()
 	if err != nil {
@@ -2143,7 +2130,7 @@ func duplicateOrFoldedEnvelopeKey(result json.RawMessage, target string) bool {
 		if !ok {
 			return true
 		}
-		if strings.EqualFold(key, target) {
+		if strings.EqualFold(key, listKeyTools) {
 			count++
 		}
 		var skip json.RawMessage
