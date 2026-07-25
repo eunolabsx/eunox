@@ -295,9 +295,14 @@ func warnIfStrictAuditJustDegraded(strict bool, rec auditRecorder, kind, target 
 // audit id.
 func (fp forwardParams) recordUpstreamFailure(ctx context.Context, msg mcp.RPCMsg, err error, auditID, method string) mcp.RPCMsg {
 	code, reason, rpcCode := upstreamErrInfo(err, fp.upstreamTimeMs)
-	// This deny records a call already forwarded to (and answered, however badly, by)
-	// the upstream — the same boundary-call shape warnIfStrictAuditJustDegraded exists
-	// for, so it gets the same immediate diagnostic under strict mode.
+	// This deny records a call the proxy had already ALLOWED and committed to
+	// forwarding — the boundary-call shape warnIfStrictAuditJustDegraded exists for, so
+	// it gets the same immediate diagnostic under strict mode. "Committed", not
+	// "delivered": most errors here (timeout, transport failure, upstream error) do
+	// follow bytes on the wire, but errDuplicateID is raised by awaitNonced BEFORE
+	// anything is written upstream. The record and the diagnostic are still right for it
+	// — the decision was made and its outcome must appear on the tape — so the shape is
+	// shared; only the "reached the upstream" reading of it would be wrong.
 	warnIfStrictAuditJustDegraded(fp.requireAuditStrict, fp.rec, method, auditID, func() {
 		if fp.rec != nil {
 			fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, code, "", nil, false)

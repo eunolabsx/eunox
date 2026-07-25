@@ -89,7 +89,7 @@ linters:
       #   validateLocalManifest: one switch enumerates every condition type as
       #     both value and pointer (cyclo 70 / cognit 147) -> condition registry.
       #   (*GatewayConfig).Validate: flat sequence of route guards (cyclo 48).
-      #   verifyAuditLog: audit chain-verification state machine (cyclo 37)
+      #   VerifyLog: audit chain-verification state machine (cyclo 37)
       #     -> decompose into classifier + chain-state.
       #   renderLiveReport: manifest-vs-live diff report renderer (cyclo 44) ->
       #     decompose by report section. runValidateLive itself (the prior

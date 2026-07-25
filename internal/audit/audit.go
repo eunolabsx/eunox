@@ -2294,8 +2294,12 @@ func (s *Sink) resetDropBuckets(snapshotted map[string]int64) {
 }
 
 // flushDropMarker writes a synthetic, signed record reflecting any records dropped
-// since the last marker, advancing the marked count only once that record is
-// durably written. No-op when nothing new was dropped. Alongside the aggregate
+// since the last marker, advancing the marked count only once that record's write(2)
+// has succeeded (durability follows at the drainer's next batched fsync — the same
+// distinction writeRecord documents, and the one that matters when reasoning about what
+// a crash leaves behind: an unsynced marker is lost with the records it accounted for,
+// so the loss is re-counted rather than silently forgotten). No-op when nothing new was
+// dropped. Alongside the aggregate
 // count, the marker names WHICH method/target pairs were affected (bounded by
 // auditDropBucketCap) so a reader can act on the loss without the underlying
 // record — e.g. a flood of denied tools/call probes against one tool is visible as
@@ -2315,7 +2319,7 @@ func (s *Sink) flushDropMarker() {
 		details["by_method_target"] = buckets
 	}
 	marker := s.syntheticDenyMarker("AUDIT_RECORDS_DROPPED", details)
-	// Advance the marked count only after a durable write (writeRecord advances seq
+	// Advance the marked count only after a successful write (writeRecord advances seq
 	// only on success). On a write failure the count is left behind and the next
 	// flush retries with the full accumulated count, so the drop evidence is never
 	// silently lost from the chain. flushDropMarker runs once per drained record and
@@ -2388,9 +2392,15 @@ func recordMAC(key, body []byte) string {
 	return "sha256:" + hex.EncodeToString(mac.Sum(nil))
 }
 
-// writeRecord stamps the chain fields, signs, and writes a single record,
-// advancing the chain head and seq only after a successful durable write. A
-// dropped or failed record never consumes a seq or leaves a dangling link.
+// writeRecord stamps the chain fields, signs, and writes a single record, advancing the
+// chain head and seq only after the write(2) succeeds. A dropped or failed record never
+// consumes a seq or leaves a dangling link.
+//
+// "Written" here means accepted by the OS, not yet DURABLE: the fsync that makes it
+// survive a crash is batched by the drainer (syncEveryN / syncDebounce). The chain is
+// consistent either way — a crash truncates the tail, and Open resumes from the last
+// record actually on disk — but the two properties are distinct and this file is
+// otherwise careful to say which one it means.
 func (s *Sink) writeRecord(rec *auditRecord) {
 	// Details and envelope are already bounded at Record() time, so the serialized
 	// record is provably far below the 4 MiB scanner buffer / chain-resume window.

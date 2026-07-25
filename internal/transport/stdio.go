@@ -36,9 +36,10 @@ import (
 )
 
 const (
-	// ProxyName is the clientInfo.name the proxy presents to upstreams; exported
-	// so the CLI's live-upstream probe identifies itself identically.
-	ProxyName = "eunox-proxy"
+	// proxyName is the clientInfo.name the proxy presents to upstreams. The CLI's
+	// live-upstream probe identifies itself identically by building its handshake
+	// through BuildInitializeRequestWithID rather than naming this constant.
+	proxyName = "eunox-proxy"
 
 	// MCPProtocolVersion is the MCP protocol version the proxy advertises;
 	// exported for the CLI's live-upstream probe.
