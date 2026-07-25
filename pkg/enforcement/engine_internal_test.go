@@ -452,6 +452,10 @@ func (sentinelCommitHandler) PrepareCommit(ctx context.Context, cond capability.
 	switch {
 	case mc.Count < 0:
 		return DeferredCommit{}, false, &ConditionError{Code: capability.ErrCodeConditionFailed, ConditionType: capability.ConditionTypeMaxCalls, Message: "invalid bucket"}
+	case mc.Count == 99:
+		// Reports skip AND a validation error at once. PrepareCommit's contract puts no
+		// exclusion between the two, so a handler may legitimately do this.
+		return DeferredCommit{}, true, &ConditionError{Code: capability.ErrCodeConditionFailed, ConditionType: capability.ConditionTypeMaxCalls, Message: "invalid bucket config"}
 	case mc.Count == 7:
 		return commit, false, nil // commit even under skipQuota
 	case skipQuota(ctx):
@@ -508,6 +512,40 @@ func TestCommitDeferredAtomic_PartialSkipFailsClosed(t *testing.T) {
 	resp := e.ValidateAction(WithSkipQuota(context.Background()), req, caps)
 	if resp.Decision != capability.DecisionDeny {
 		t.Fatalf("decision = %q, want deny (a partial/non-uniform skip across buckets must fail closed)", resp.Decision)
+	}
+	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeConditionFailed {
+		t.Fatalf("denial = %+v, want CONDITION_FAILED", resp.Denial)
+	}
+	// HardDeny, or the guard cannot actually block. A partial skip is only reachable when
+	// skipQuota is set, which the binary sets only on a route running --audit — and there
+	// the transport downgrades and FORWARDS any non-HardDeny verdict, letting the call
+	// proceed with zero quota consumed on any bucket.
+	if !resp.Denial.HardDeny {
+		t.Error("the partial-skip deny must be HardDeny; a downgradable verdict is forwarded on the only posture that reaches this branch, so the guard would never block")
+	}
+}
+
+// TestCommitDeferredAtomic_SkipDoesNotSwallowCondErr pins that a bucket reporting skip
+// AND a validation error still denies. PrepareCommit's contract puts no exclusion between
+// the two, so honoring skip first discarded the error — and when every bucket skipped, the
+// call was ALLOWED under observe while enforce denied it: the exact observe/enforce
+// divergence this function exists to prevent.
+func TestCommitDeferredAtomic_SkipDoesNotSwallowCondErr(t *testing.T) {
+	e := sentinelEngine()
+	req := &capability.EnforceRequest{SessionID: "s", ToolName: "tool"}
+	caps := []capability.Constraint{{
+		Target:  "tool",
+		Actions: []string{"*"},
+		Conditions: []capability.Condition{
+			// Both buckets skip under observe; both also report a validation error, so
+			// skipped == len(deferred) and the all-skip allow would mask them.
+			&capability.MaxCallsCondition{Count: 99, WindowSeconds: 60},
+			&capability.MaxCallsCondition{Count: 99, WindowSeconds: 3600},
+		},
+	}}
+	resp := e.ValidateAction(WithSkipQuota(context.Background()), req, caps)
+	if resp.Decision != capability.DecisionDeny {
+		t.Fatalf("decision = %q, want deny (a skipping bucket's own condErr must not be swallowed)", resp.Decision)
 	}
 	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeConditionFailed {
 		t.Fatalf("denial = %+v, want CONDITION_FAILED", resp.Denial)

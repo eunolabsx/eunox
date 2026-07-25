@@ -742,6 +742,15 @@ func (e *Engine) commitDeferredAtomic(ctx context.Context, req *capability.Enfor
 			return &resp
 		}
 		commit, skip, condErr := ch.PrepareCommit(ctx, cond, req)
+		// A condErr is checked BEFORE skip is honored. PrepareCommit's contract puts no
+		// exclusion between the two, so a handler may legitimately report both — e.g. a
+		// malformed-condition validation error discovered on a bucket that also skips under
+		// skipQuota. Honoring skip first would discard that error, and if every bucket
+		// skipped the call would then be ALLOWED under observe while enforce denies it:
+		// precisely the observe/enforce divergence this function exists to prevent.
+		if condErr != nil {
+			return denyFromConditionError(condErr, matched, requestID, now)
+		}
 		if skip {
 			// skip must be uniform across the constraint — the contract requires it to be
 			// derived solely from ctx (skipQuota). A handler that reports skip for some
@@ -753,7 +762,11 @@ func (e *Engine) commitDeferredAtomic(ctx context.Context, req *capability.Enfor
 				resp := denyResponse(requestID, now, matched.IsAuditOnly(), nil, capability.DenialInfo{
 					Code:          capability.ErrCodeConditionFailed,
 					ConditionType: condType,
-					Message:       fmt.Sprintf("committing condition %q reported a non-uniform skip; deferred commit requires skip to be derived solely from request context", condType),
+					// HardDeny: a handler violating the skip contract is an engine/plugin bug,
+					// not a downgradable policy verdict, so it must block even under an
+					// audit-mode constraint rather than being forwarded with quota unconsumed.
+					HardDeny: true,
+					Message:  fmt.Sprintf("committing condition %q reported a non-uniform skip; deferred commit requires skip to be derived solely from request context", condType),
 				})
 				return &resp
 			}
@@ -781,8 +794,14 @@ func (e *Engine) commitDeferredAtomic(ctx context.Context, req *capability.Enfor
 	// skipped ones is a fail-open, so fail closed.
 	if skipped > 0 {
 		resp := denyResponse(requestID, now, matched.IsAuditOnly(), nil, capability.DenialInfo{
-			Code:    capability.ErrCodeConditionFailed,
-			Message: "deferred commit received a non-uniform skip across buckets; skip must hold for every committing condition or none",
+			Code: capability.ErrCodeConditionFailed,
+			// HardDeny, or this guard can never actually block: a partial skip is reachable
+			// only when skipQuota(ctx) is set, which the binary sets only on a route running
+			// --audit — and on that route the transport downgrades and FORWARDS any
+			// non-HardDeny verdict. Without this the call proceeds with zero quota consumed
+			// on any bucket, which is the fail-open the guard was written to prevent.
+			HardDeny: true,
+			Message:  "deferred commit received a non-uniform skip across buckets; skip must hold for every committing condition or none",
 		})
 		return &resp
 	}
