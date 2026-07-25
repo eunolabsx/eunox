@@ -1060,12 +1060,14 @@ func readLastAuditLine(path string) (string, error) {
 		return "", nil
 	}
 	// Details is capped at 1 MiB and the envelope is far smaller, so a record (plus
-	// its preceding boundary newline) is always captured within this 4 MiB tail.
-	const maxTail = 4 << 20
+	// its preceding boundary newline) is always captured within this tail. Sized from
+	// auditScanBufferBytes rather than a second 4 MiB literal: the tail window and the
+	// line-scan ceiling must agree, or a record one reader accepts is one the other
+	// truncates.
 	size := info.Size()
 	start := int64(0)
-	if size > maxTail {
-		start = size - maxTail
+	if size > auditScanBufferBytes {
+		start = size - auditScanBufferBytes
 	}
 	buf := make([]byte, size-start)
 	n, err := f.ReadAt(buf, start)
@@ -2159,9 +2161,12 @@ func (s *Sink) drain() {
 			// can write two records (a drop marker via flushDropMarker, then the real
 			// record), so a per-iteration increment let the un-fsync'd tail grow to
 			// 2*syncEveryN under sustained back-pressure — twice the documented syncEveryN
-			// bound. writeRecord advances s.seq by exactly one per durable write, so the
-			// seq delta is the count of records that actually reached disk (a failed write
-			// advances neither seq nor the durability debt).
+			// bound. writeRecord advances s.seq by exactly one per SUCCESSFUL write, so the
+			// seq delta is the count of records that actually reached the file (a failed
+			// write advances neither seq nor the durability debt). "Successful", not
+			// "durable": a completed write leaves the record in the page cache, and it
+			// becomes durable only at the next fsync — the syncDebounce timer or the
+			// every-syncEveryN counter below, whichever fires first.
 			seqBefore := s.seq
 			s.flushDropMarker()
 			s.writeRecord(&rec)
@@ -2302,8 +2307,8 @@ func (s *Sink) flushDropMarker() {
 		details["by_method_target"] = buckets
 	}
 	marker := s.syntheticDenyMarker("AUDIT_RECORDS_DROPPED", details)
-	// Advance the marked count only after a durable write (writeRecord advances seq
-	// only on success). On a write failure the count is left behind and the next
+	// Advance the marked count only after a successful write (writeRecord advances seq
+	// only on success; durability follows at the next syncDebounce/syncEveryN fsync). On a write failure the count is left behind and the next
 	// flush retries with the full accumulated count, so the drop evidence is never
 	// silently lost from the chain. flushDropMarker runs once per drained record and
 	// at Close, so a broken writer cannot spin (and while broken, real records fail
@@ -2376,8 +2381,13 @@ func recordMAC(key, body []byte) string {
 }
 
 // writeRecord stamps the chain fields, signs, and writes a single record,
-// advancing the chain head and seq only after a successful durable write. A
-// dropped or failed record never consumes a seq or leaves a dangling link.
+// advancing the chain head and seq only after a successful write. A dropped or
+// failed record never consumes a seq or leaves a dangling link.
+//
+// Successful, not durable: a returned write leaves the record in the page cache.
+// Durability is the drainer's job — the debounced syncDebounce timer or the
+// every-syncEveryN counter — so a crash can lose a written-but-unsynced tail
+// without breaking the chain (the seqs are contiguous either way).
 func (s *Sink) writeRecord(rec *auditRecord) {
 	// Details and envelope are already bounded at Record() time, so the serialized
 	// record is provably far below the 4 MiB scanner buffer / chain-resume window.

@@ -1258,8 +1258,20 @@ list of exact strings or glob patterns (e.g. `/reports/*` matches
 >   `/reports/..%2f..%2fetc%2fpasswd` and `/reports/..\..\etc\passwd` are rejected
 >   too. A malformed percent-escape fails closed (deny). Only an exact `.` or `..`
 >   segment is rejected — dotfiles (`.env`) and names that merely contain dots
->   (`a..b`) are fine. This applies only to path-style patterns; in a non-path
->   `allowedValues` (no `/` in the pattern) a `..` is an ordinary literal.
+>   (`a..b`) are fine.
+> - **The same dot rule applies to a slashless pattern.** A pattern with no `/`
+>   is a *single-segment* grant, so its one segment gets the identical treatment:
+>   a value that decodes to exactly `.` or `..` is denied. Without this, a grant
+>   written to permit dotfiles in the tool's working directory — `allowedValues:
+>   [".*"]` — would also admit `{"path": ".."}`, which the upstream resolves to the
+>   **parent** directory, and `["??"]` would do the same; the `/`-count guard below
+>   cannot catch it because `..` carries no separator. Percent-encoded spellings
+>   (`%2e%2e`, `.%2e`) decode first and are denied on the same rule. Dotfiles
+>   (`.env`), dotted names (`a..b`), and `...` still match — only a whole segment
+>   equal to `.` or `..` is rejected.
+>   The one deliberate exception is the whole-pattern `*` and `**` escape hatch,
+>   documented above as matching **any** value: they short-circuit before
+>   confinement runs, so write a narrower pattern when you want confinement.
 > - **An encoded separator does not widen a single-segment scope.** A single `*`
 >   (or `?`/`[…]`) confines a value to one segment, e.g. `/reports/*` permits only
 >   direct children of `/reports`. A value that smuggles an *encoded* separator into
@@ -1290,9 +1302,9 @@ list of exact strings or glob patterns (e.g. `/reports/*` matches
 > - **An unmatchable pattern is rejected at load.** A pattern that can never match
 >   any value is a silently dead, deny-all grant, so the loader rejects it as an
 >   error rather than shipping it. Three cases:
->   - a path-style pattern that itself contains a literal `.` or `..` segment
->     (e.g. `/**/../x`, `/a/./b`) — the confinement scan above denies every value
->     carrying the required `.`/`..` segment first;
+>   - a pattern that itself contains a literal `.` or `..` segment (e.g.
+>     `/**/../x`, `/a/./b`, or the slashless `..`) — the confinement scan above
+>     denies every value carrying the required `.`/`..` segment first;
 >   - a pattern whose *literal* text carries an *encoded* path separator (`%2f` or
 >     `%5c`, e.g. `a%2fb`) — the runtime confinement denies any value that decodes
 >     to contain a separator, so the only value the pattern could match is itself
@@ -1999,6 +2011,12 @@ file's directory**, not the process working directory — so
 `eunox proxy --config /etc/eunox/gateway.yaml` finds
 `policy: ["./policies/x.yaml"]` no matter which directory it is launched from.
 Absolute paths are used unchanged.
+
+A leading `~/` is expanded to the current user's home directory first, so
+`policy: ["~/policies/x.yaml"]` resolves there rather than to a `~` directory
+under the config file's directory. The `~user/...` form has no portable
+resolution and is rejected at startup with a clear error — write the absolute
+path instead. This matches how the audit-log and control-token paths treat `~`.
 
 ### Observation mode
 

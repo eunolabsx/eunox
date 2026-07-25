@@ -451,7 +451,7 @@ func exactFloatBound(n json.Number) (*float64, error) {
 	//    out-of-precision integer bound must never load silently rounded, since
 	//    that is a "silently-shifted boundary" regardless of which comparison
 	//    path (exact-int64 or float64-fallback) later reads it.
-	//  - wholeInt64Float(f): the enforcement comparison (compareToBound) switches
+	//  - Int64FromFloat(f) reports exact: the enforcement comparison (compareToBound) switches
 	//    to EXACT int64 precision whenever the bound's float64 value f happens to
 	//    be a whole number in int64 range — regardless of whether the manifest
 	//    author wrote the literal with a decimal point. So round-trip exactness
@@ -467,7 +467,8 @@ func exactFloatBound(n json.Number) (*float64, error) {
 	// being written as an integer — is compared in float64 on both sides
 	// (compareToBound's fallback), where its float64 approximation is
 	// consistent, so it is accepted as before.
-	if orig.IsInt() || wholeInt64Float(f) {
+	_, wholeInt64 := Int64FromFloat(f)
+	if orig.IsInt() || wholeInt64 {
 		rf := new(big.Rat).SetFloat64(f)
 		if rf == nil || rf.Cmp(orig) != 0 {
 			return nil, fmt.Errorf("bound %q cannot be represented exactly as a 64-bit float; it would round to %s, silently shifting the enforced boundary away from what the manifest wrote", n.String(), strconv.FormatFloat(f, 'f', -1, 64))
@@ -477,25 +478,37 @@ func exactFloatBound(n json.Number) (*float64, error) {
 }
 
 // minInt64Float and twoTo63Float bound the range of float64 values exactly
-// representable as int64, mirroring pkg/enforcement's identical constants
-// (handlers.go) — the half-open interval [minInt64Float, twoTo63Float) is exactly
-// the range int64(f) converts without wraparound.
+// representable as int64 — the half-open interval [minInt64Float, twoTo63Float) is
+// exactly the range int64(f) converts without wraparound. Guarded before the
+// conversion because a float outside int64 range converts to an
+// implementation-defined value in Go.
 const (
 	minInt64Float = -9223372036854775808.0 // -2^63
 	twoTo63Float  = 9223372036854775808.0  // 2^63 (one past math.MaxInt64)
 )
 
-// wholeInt64Float reports whether f is a whole number representable exactly as
-// an int64 — the same condition pkg/enforcement's compareToBound (via
-// floatToInt64) uses to switch a bound comparison to exact-integer precision.
-// Duplicated here rather than imported to avoid a capability -> enforcement
-// dependency; the two must be kept in sync.
-func wholeInt64Float(f float64) bool {
+// Int64FromFloat returns f as an int64 when f is a whole number exactly
+// representable as one, reporting false otherwise (out of int64 range, or carrying
+// a fractional part).
+//
+// This is the single definition of the exact-int64 precision boundary, exported so
+// pkg/enforcement's runtime argument comparison (asInt64/compareToBound) and this
+// package's manifest-load bound acceptance (exactFloatBound) decide it with the same
+// code. The two were previously character-identical copies with a "keep in sync"
+// comment justified by avoiding a capability -> enforcement dependency — but the
+// dependency runs the other way (enforcement already imports capability), so one
+// exported helper costs nothing. Keeping them separate was actively load-bearing
+// risk: a one-sided edit would let the loader accept a bound the comparison then
+// reads at a different precision, silently shifting the enforced boundary.
+func Int64FromFloat(f float64) (int64, bool) {
 	if f < minInt64Float || f >= twoTo63Float {
-		return false
+		return 0, false
 	}
 	i := int64(f)
-	return float64(i) == f
+	if float64(i) != f { // f carried a fractional part
+		return 0, false
+	}
+	return i, true
 }
 
 // SchemaType can be a single type string or an array of type strings.

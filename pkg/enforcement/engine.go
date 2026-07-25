@@ -1054,14 +1054,59 @@ func (e *Engine) ValidateAction(ctx context.Context, req *capability.EnforceRequ
 }
 
 // FindMatchingCapability returns the most specific capability that matches the
-// request, or nil if none match. Exported so callers that need the matched
-// constraint (e.g. the validate endpoint) can reuse the engine's selection logic.
+// request, or nil if none match. Exported so a caller that needs the matched
+// constraint rather than a decision can reuse the engine's selection logic —
+// today that is pkg/enforcement's own schema/obligation helpers and external
+// embedders. The proxy does NOT route through it: internal/pdp.findConstraint
+// runs its own scan over pre-split targets, sharing only the tiebreak (see
+// ConstraintScorer) and the match/specificity primitives (MatchesResource,
+// ResourceSpecificity). Change the precedence rule in ConstraintScorer, not here.
 func (e *Engine) FindMatchingCapability(req *capability.EnforceRequest, capabilities []capability.Constraint) *capability.Constraint {
 	return e.findMatchingCapability(req, capabilities)
 }
 
 // noMatchScore is the sentinel for "no matching capability found yet".
 const noMatchScore = -1 << 30
+
+// ConstraintScorer tracks the best-scoring constraint index seen so far under the
+// project's single constraint-selection tiebreak. Selection order, most to least
+// decisive:
+//
+//  1. higher target specificity wins;
+//  2. at equal specificity, a principal-scoped entry beats a general one,
+//     regardless of declaration order;
+//  3. at equal specificity within the same principal class, declaration order wins
+//     (Offer's strict `>` keeps the incumbent). Documented in
+//     docs/capability-manifest-guide.md.
+//
+// Exported because this predicate is security-relevant and has two consumers: the
+// engine's findMatchingCapability and the proxy's internal/pdp.findConstraint. They
+// were character-for-character copies, so a precedence change applied to one would
+// have left the proxy and the engine silently selecting different constraints for
+// the same request. Scores need only be mutually comparable, not equal, across
+// consumers — the engine scales by resourceScoreWeight and the PDP does not, which
+// is a monotonic transform and so preserves every comparison this makes.
+type ConstraintScorer struct {
+	best      int
+	bestScore int
+	bestPrin  bool
+}
+
+// NewConstraintScorer returns a scorer with no candidate yet (Best() == -1).
+func NewConstraintScorer() ConstraintScorer {
+	return ConstraintScorer{best: -1, bestScore: noMatchScore}
+}
+
+// Offer submits candidate index i with the given specificity score and whether it is
+// principal-scoped, keeping it only if it wins the tiebreak above.
+func (cs *ConstraintScorer) Offer(i, score int, hasPrincipal bool) {
+	if score > cs.bestScore || (score == cs.bestScore && hasPrincipal && !cs.bestPrin) {
+		cs.bestScore, cs.best, cs.bestPrin = score, i, hasPrincipal
+	}
+}
+
+// Best returns the winning candidate index, or -1 when nothing was offered.
+func (cs *ConstraintScorer) Best() int { return cs.best }
 
 // resourceScoreWeight scales the resource-specificity score, reserving the
 // low-order range [0, resourceScoreWeight) as headroom for a possible future
@@ -1072,8 +1117,6 @@ const resourceScoreWeight = 10
 // findMatchingCapability finds the most specific matching capability. Tie-breaking
 // is stable: at equal specificity, the first in the list wins.
 func (e *Engine) findMatchingCapability(req *capability.EnforceRequest, capabilities []capability.Constraint) *capability.Constraint {
-	bestIndex := -1
-	bestScore := noMatchScore
 	// Resolve the request's namespace type and bare name: type from explicit
 	// req.Target.Type when present, else the req.ToolName prefix (bare defaults to
 	// "tool"). Splitting the prefix lets a "tool:read_file" manifest entry match a
@@ -1094,7 +1137,7 @@ func (e *Engine) findMatchingCapability(req *capability.EnforceRequest, capabili
 			bareToolName = n
 		}
 	}
-	bestPrincipal := false
+	scorer := NewConstraintScorer()
 	for i := range capabilities {
 		constraint := &capabilities[i]
 		// The namespace type must match on both sides; comparing only bare names
@@ -1115,24 +1158,14 @@ func (e *Engine) findMatchingCapability(req *capability.EnforceRequest, capabili
 		if !constraint.PrincipalMatches(req.Claims) {
 			continue
 		}
-		score := resourceSpecificity(bare, bareToolName) * resourceScoreWeight
-		hasPrincipal := constraint.HasPrincipal()
-		// Selection order, most to least decisive: (1) higher target specificity;
-		// (2) at equal specificity, a principal-scoped entry beats a general one
-		// regardless of order; (3) at equal specificity within the same principal
-		// class, declaration order wins (the `!bestPrincipal` guard keeps the first
-		// principal-scoped entry from being displaced). The first-wins rule for
-		// equal-class ties is documented in docs/capability-manifest-guide.md.
-		if score > bestScore || (score == bestScore && hasPrincipal && !bestPrincipal) {
-			bestIndex = i
-			bestScore = score
-			bestPrincipal = hasPrincipal
-		}
+		// The selection tiebreak lives in ConstraintScorer, shared with the proxy's
+		// internal/pdp.findConstraint so the two cannot disagree on precedence.
+		scorer.Offer(i, resourceSpecificity(bare, bareToolName)*resourceScoreWeight, constraint.HasPrincipal())
 	}
-	if bestIndex < 0 {
+	if scorer.Best() < 0 {
 		return nil
 	}
-	return &capabilities[bestIndex]
+	return &capabilities[scorer.Best()]
 }
 
 // splitEnginePrefix splits a constraint Target or afterTools entry into its

@@ -314,7 +314,10 @@ func parseCanonicalJSONInt(raw []byte) (int64, bool) {
 	return v, true
 }
 
-// RawJSON returns a json.RawMessage pointing at a compile-time string literal.
+// RawJSON returns a *json.RawMessage addressing a copy of s. s is NOT required to be
+// a compile-time literal — callers pass runtime-built ids (a counter formatted with
+// fmt.Sprintf, an id read off the wire) — so s must already be valid JSON; nothing
+// here validates or escapes it.
 func RawJSON(s string) *json.RawMessage {
 	r := json.RawMessage(s)
 	return &r

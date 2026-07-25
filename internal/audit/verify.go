@@ -291,6 +291,15 @@ func (s *Sink) hasVerificationKey() bool {
 // non-empty keyID absent from the ring returns errKeyIDNotInRing (fail-closed: no
 // key to try) so the caller reports UNKNOWN_KEY_ID rather than INVALID.
 func (s *Sink) keysToTry(keyID string) ([][]byte, error) {
+	// A nil receiver holds no keys, matching hasVerificationKey's nil tolerance. Both
+	// are reachable from the exported VerifyLog/VerifyLogFiles, whose verifier
+	// parameter a caller may legitimately leave nil (verify structure only, no
+	// signature check) — so the two must agree rather than one answering "no keys" and
+	// the other panicking. Returning no keys routes the record through VerifyRecord's
+	// "could not verify" branch, never its "tampered" one.
+	if s == nil {
+		return nil, nil
+	}
 	ring := s.verifyKeys
 	if ring == nil {
 		if s.key == nil {

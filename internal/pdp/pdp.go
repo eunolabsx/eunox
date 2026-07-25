@@ -187,6 +187,46 @@ func CountListEntries(method string, result json.RawMessage) int {
 	return countListEntries(result, key)
 }
 
+// listDecodeOutcome classifies how far decodeListEntries got. The failures are kept
+// DISTINCT rather than folded into one "not ok" because the two callers must react
+// differently: countListEntries reports 0 for all of them, while armPinsFromToolsList
+// treats an unreadable envelope or array as ambiguous (poison every pin) but a plainly
+// absent key as benign (a host renders no tools from it).
+type listDecodeOutcome int
+
+const (
+	listDecodeOK          listDecodeOutcome = iota // entries decoded (possibly an empty array)
+	listDecodeEmptyResult                          // no result bytes at all
+	listDecodeBadEnvelope                          // result is not a JSON object
+	listDecodeKeyAbsent                            // object decoded, but carries no fieldName key
+	listDecodeBadArray                             // fieldName present but not an array of entries
+)
+
+// decodeListEntries decodes a */list result envelope down to the entry array under
+// fieldName. It returns the entries, the decoded envelope (nil unless the envelope
+// itself parsed — armPinsFromToolsList inspects it for a case-variant sibling key),
+// and an outcome the caller switches on.
+//
+// One decode contract for both consumers: the length-only countListEntries and the
+// pin-arming walk previously spelled this same envelope→lookup→array sequence out
+// separately, so a change to how a list envelope is read had to be made twice.
+func decodeListEntries(result json.RawMessage, fieldName string) (entries []json.RawMessage, envelope map[string]json.RawMessage, outcome listDecodeOutcome) {
+	if len(result) == 0 {
+		return nil, nil, listDecodeEmptyResult
+	}
+	if err := json.Unmarshal(result, &envelope); err != nil {
+		return nil, nil, listDecodeBadEnvelope
+	}
+	rawArray, ok := envelope[fieldName]
+	if !ok {
+		return nil, envelope, listDecodeKeyAbsent
+	}
+	if err := json.Unmarshal(rawArray, &entries); err != nil {
+		return nil, envelope, listDecodeBadArray
+	}
+	return entries, envelope, listDecodeOK
+}
+
 // countListEntries returns the number of entries in the fieldName array of a
 // */list result envelope, or 0 for an empty/absent/unparseable result. It backs
 // the exported CountListEntries (the audit/wiretap best-effort entry count); the
@@ -194,22 +234,8 @@ func CountListEntries(method string, result json.RawMessage) int {
 // key-ordered envelope decode instead, so they preserve sibling fields and key
 // order, so this stays a length-only helper.
 func countListEntries(result json.RawMessage, fieldName string) int {
-	if len(result) == 0 {
-		return 0
-	}
-	var envelope map[string]json.RawMessage
-	if err := json.Unmarshal(result, &envelope); err != nil {
-		return 0
-	}
-	rawArray, ok := envelope[fieldName]
-	if !ok {
-		return 0
-	}
-	var entries []json.RawMessage
-	if err := json.Unmarshal(rawArray, &entries); err != nil {
-		return 0
-	}
-	return len(entries)
+	entries, _, _ := decodeListEntries(result, fieldName)
+	return len(entries) // nil on every failure outcome, so no branch is needed
 }
 
 // passThroughList wraps an unfiltered */list result as a ListFilterResult,
@@ -254,17 +280,25 @@ type SamplingAuthorizer interface {
 // the call must be blocked: an active kill matching the agent/session/global
 // dimension, or a kill-store error (fail closed).  A nil ks imposes no check
 // (JWT-only mode).  The agent dimension is taken from JWT claims in ctx.
-func killCheck(ctx context.Context, ks killswitch.Checker, sessionID string) *capability.EnforceResponse {
+//
+// clock is the caller's enforcement clock, threaded through to denyResponse so a
+// kill-switch denial carries the same DecidedAt source as every other denial the
+// caller emits. It used to be hardcoded nil, which made these two records read
+// wall-clock time while an injected or frozen clock governed the rest — a silent
+// divergence from denyResponse's documented contract, and one that made a
+// deterministic test unable to pin the timestamp on exactly the denials an
+// operator's emergency stop produces. A nil clock still means "use wall time".
+func killCheck(ctx context.Context, clock enforcement.Clock, ks killswitch.Checker, sessionID string) *capability.EnforceResponse {
 	if ks == nil {
 		return nil
 	}
 	blocked, err := ks.ShouldBlock(ctx, agentIDFromContext(ctx), sessionID)
 	if err != nil {
-		deny := denyResponse(nil, capability.ErrCodeKillSwitchError, "", "kill switch check failed: "+err.Error())
+		deny := denyResponse(clock, capability.ErrCodeKillSwitchError, "", "kill switch check failed: "+err.Error())
 		return &deny
 	}
 	if blocked {
-		deny := denyResponse(nil, capability.ErrCodeKillSwitch, "", "session has been terminated by a kill-switch command")
+		deny := denyResponse(clock, capability.ErrCodeKillSwitch, "", "session has been terminated by a kill-switch command")
 		return &deny
 	}
 	return nil
@@ -408,7 +442,7 @@ func (p AlwaysAllowPDP) DecideSampling(ctx context.Context, sessionID, _ string)
 // enumeration included. A zero-value AlwaysAllowPDP{} has no kill switch (nil ks),
 // and killCheck returns nil for a nil checker, preserving pure-passthrough.
 func (p AlwaysAllowPDP) CheckKill(ctx context.Context, sessionID string) *capability.EnforceResponse {
-	return killCheck(ctx, p.ks, sessionID)
+	return killCheck(ctx, p.clock, p.ks, sessionID)
 }
 
 // CheckAudience pins no token audience: a wiretap/audit-mode route forwards every call,
@@ -790,7 +824,7 @@ func (p *ManifestPDP) pinViolated(name, pin string) bool {
 // the session is killed (or the kill store errors, fail closed). It shares
 // killCheck with the Decide* paths so the */list handlers enforce it identically.
 func (p *ManifestPDP) CheckKill(ctx context.Context, sessionID string) *capability.EnforceResponse {
-	return killCheck(ctx, p.ks, sessionID)
+	return killCheck(ctx, p.engineClock(), p.ks, sessionID)
 }
 
 // CheckAudience pins no token audience: the manifest layer enforces capabilities, not
@@ -842,7 +876,7 @@ const (
 func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target EnforceTarget, args map[string]interface{}, sourceIP string, schema schemaMode) capability.EnforceResponse {
 	// Kill switch check: per-agent (JWT agent_id from ctx), per-session, and
 	// global kills are honored; a kill-store error fails closed.
-	if deny := killCheck(ctx, p.ks, sessionID); deny != nil {
+	if deny := killCheck(ctx, p.engineClock(), p.ks, sessionID); deny != nil {
 		return *deny
 	}
 
@@ -1199,39 +1233,33 @@ func (p *ManifestPDP) findConstraint(target EnforceTarget, claims map[string]int
 		}
 		s := bareSpecificity(pt.bare, target.Name)
 		hasPrincipal := c.HasPrincipal()
-		fallback.offer(i, s, hasPrincipal)
+		fallback.Offer(i, s, hasPrincipal)
 		if containsAction(c.Actions, required) {
-			primary.offer(i, s, hasPrincipal)
+			primary.Offer(i, s, hasPrincipal)
 		}
 	}
-	if primary.best >= 0 {
-		return &p.caps[primary.best]
+	if primary.Best() >= 0 {
+		return &p.caps[primary.Best()]
 	}
-	if fallback.best >= 0 {
-		return &p.caps[fallback.best]
+	if fallback.Best() >= 0 {
+		return &p.caps[fallback.Best()]
 	}
 	return nil
 }
 
-// constraintScorer tracks the best-scoring constraint index seen so far under
-// findConstraint's tiebreak: higher target specificity wins, and at equal
-// specificity a principal-scoped entry beats a general one, regardless of manifest
-// order. Shared by findConstraint's primary and fallback trackers so the tiebreak
-// lives in one place across a single scan.
-type constraintScorer struct {
-	best      int
-	bestScore int
-	bestPrin  bool
-}
-
-func newConstraintScorer() constraintScorer {
-	return constraintScorer{best: -1, bestScore: -(1 << 30)}
-}
-
-func (cs *constraintScorer) offer(i, score int, hasPrincipal bool) {
-	if score > cs.bestScore || (score == cs.bestScore && hasPrincipal && !cs.bestPrin) {
-		cs.bestScore, cs.best, cs.bestPrin = score, i, hasPrincipal
-	}
+// newConstraintScorer returns the shared constraint-selection tiebreak tracker
+// (enforcement.ConstraintScorer): higher target specificity wins, and at equal
+// specificity a principal-scoped entry beats a general one regardless of manifest
+// order. findConstraint uses one for its primary scan and one for its fallback.
+//
+// It delegates rather than reimplementing: this predicate used to be a
+// character-for-character copy of the engine's, so a precedence change made in one
+// place would have left the proxy and the engine selecting different constraints for
+// the same request — a silent policy divergence, not a cosmetic duplication. The
+// scores fed in here are unscaled while the engine scales by its resourceScoreWeight;
+// that is a monotonic transform, so every comparison the scorer makes is unaffected.
+func newConstraintScorer() enforcement.ConstraintScorer {
+	return enforcement.NewConstraintScorer()
 }
 
 // matchBare reports whether the bare pattern (namespace prefix stripped) matches
@@ -1478,7 +1506,7 @@ func (p *ManifestPDP) DecideResourceRead(ctx context.Context, sessionID, uri, so
 // the request so an ipRange condition on the opt-in sees a real address rather
 // than failing closed with MISSING_CONTEXT.
 func (p *ManifestPDP) DecideSampling(ctx context.Context, sessionID, sourceIP string) capability.EnforceResponse {
-	if deny := killCheck(ctx, p.ks, sessionID); deny != nil {
+	if deny := killCheck(ctx, p.engineClock(), p.ks, sessionID); deny != nil {
 		return *deny
 	}
 
@@ -2119,19 +2147,19 @@ func (p *ManifestPDP) RecordObservedToolHashes(_ context.Context, result json.Ra
 //     poisons every pin, because no entry in it can be believed. A plainly absent tools
 //     key is not ambiguous: a host renders no tools from it, so nothing is poisoned.
 func (p *ManifestPDP) armPinsFromToolsList(result json.RawMessage) (entryCount int) {
-	if len(result) == 0 {
-		return 0
-	}
 	pinned := len(p.pinnedTools) > 0
-	var envelope map[string]json.RawMessage
-	if err := json.Unmarshal(result, &envelope); err != nil {
+	entries, envelope, outcome := decodeListEntries(result, listKeyTools)
+	switch outcome {
+	case listDecodeEmptyResult:
+		// No bytes at all: nothing was rendered to a host, so nothing is ambiguous.
+		return 0
+	case listDecodeBadEnvelope, listDecodeBadArray:
+		// The envelope or its array is unreadable, so no entry in it can be believed.
 		if pinned {
 			p.poisonAllPinned()
 		}
 		return 0
-	}
-	rawArray, ok := envelope[listKeyTools]
-	if !ok {
+	case listDecodeKeyAbsent:
 		// No exact "tools" key. A case-variant sibling ("Tools") still decodes for a host
 		// whose reader binds it case-insensitively, and the proxy cannot tell what that
 		// host sees, so treat it as ambiguous; a plainly absent key is not.
@@ -2139,13 +2167,7 @@ func (p *ManifestPDP) armPinsFromToolsList(result json.RawMessage) (entryCount i
 			p.poisonAllPinned()
 		}
 		return 0
-	}
-	var entries []json.RawMessage
-	if err := json.Unmarshal(rawArray, &entries); err != nil {
-		if pinned {
-			p.poisonAllPinned()
-		}
-		return 0
+	case listDecodeOK:
 	}
 	if !pinned {
 		// Nothing to record or protect: skip the per-entry scan and decode entirely rather

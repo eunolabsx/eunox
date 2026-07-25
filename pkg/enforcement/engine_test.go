@@ -4048,21 +4048,33 @@ func TestIPRange_CompiledPath(t *testing.T) {
 	})
 }
 
-// TestIPRange_FallbackMatchPrecedesMalformedCIDR pins the uncompiled fallback's
-// interleaved parse-and-match: a CIDR that contains the
-// source IP allows the call even when a malformed CIDR follows it, because the
-// match is reached first. This is the behavior — the restructuring must
-// not flip it to a deny. Only a hand-built (uncompiled) condition can exercise
-// this, since the manifest loader rejects malformed CIDRs before the compiled
-// path is ever taken.
-func TestIPRange_FallbackMatchPrecedesMalformedCIDR(t *testing.T) {
+// TestIPRange_FallbackDeniesOnMalformedCIDR pins that the uncompiled fallback
+// evaluates a malformed CIDR the SAME way the compiled path does: the condition as a
+// whole is malformed, so the call is denied — even when an earlier CIDR in the list
+// contains the source IP.
+//
+// The fallback used to interleave parse-and-match, so a match reached before the bad
+// entry allowed the call. That was a second CIDR parser with its own semantics, and
+// it diverged from Compile in the fail-open direction: the manifest loader rejects
+// this list outright (Compile returns the first parse error), so a policy the
+// compiled path refuses to load was being partially honored by the hand-built path.
+// The fallback now compiles a local copy and reads it through the same accessor, so
+// there is one parser and one answer. Only a hand-built (uncompiled) condition can
+// reach this at all, since the loader rejects malformed CIDRs up front.
+func TestIPRange_FallbackDeniesOnMalformedCIDR(t *testing.T) {
 	t.Parallel()
 	cond := &capability.IPRangeCondition{CIDRs: []string{"10.0.0.0/8", "bad-cidr"}}
 	if _, ok := cond.Networks(); ok {
 		t.Fatal("precondition: condition must be uncompiled to exercise the fallback")
 	}
 	resp := runCondition(t, enforcement.New(), cond, nil, "10.1.2.3")
-	assert.Equal(t, capability.DecisionAllow, resp.Decision)
+	assert.Equal(t, capability.DecisionDeny, resp.Decision)
+	assert.Contains(t, resp.Denial.Message, "invalid CIDR in condition")
+
+	// A well-formed list still matches through the fallback, so the fix tightened only
+	// the malformed case rather than breaking uncompiled matching outright.
+	ok := &capability.IPRangeCondition{CIDRs: []string{"10.0.0.0/8"}}
+	assert.Equal(t, capability.DecisionAllow, runCondition(t, enforcement.New(), ok, nil, "10.1.2.3").Decision)
 }
 
 // TestTimeWindow_InvalidTimes covers the RFC3339 parse-error branches.

@@ -70,6 +70,19 @@ type IPRangeCondition struct {
 // query); the proxy checks its first word against Operations. Argument is
 // required in manifest policies — empty fails closed — except for the JWT v0.2
 // "op=" shorthand, which leaves it empty and scans every string argument.
+//
+// SCOPE LIMIT — this is a coarse first-token verb gate, not a SQL parser, and the
+// gap is an under-block, not a false denial: only the FIRST whitespace-delimited
+// word is inspected, so Operations ["SELECT"] admits "SELECT 1; DROP TABLE users"
+// and the trailing statement executes upstream if the driver permits multiple
+// statements per call. (A leading CTE/EXPLAIN/SET prefix is the harmless converse:
+// the first token is not the effective verb, so the call is over-denied.) Denying
+// on a bare ';' is not an option — it false-positives on any quoted literal
+// containing one — so the boundary is documented rather than widened. Treat this
+// as defense-in-depth over a read-only database role plus multi-statement
+// execution disabled at the driver, and pair it with argumentSchema or an external
+// policy evaluator for untrusted SQL; never make it the sole control. Kept in
+// lock-step with docs/capability-manifest-guide.md's allowedOperations section.
 type AllowedOperationsCondition struct {
 	Argument   string   `json:"argument,omitempty"`
 	Operations []string `json:"operations"`

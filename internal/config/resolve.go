@@ -38,11 +38,23 @@ func ResolveInt(override *int, def int) int {
 // programmatically built config), is returned verbatim. Shared by the proxy load
 // path (LoadUpstreamPDP) and validate --config so the two cannot drift into
 // resolving the same policy entry to different files.
-func ResolvePolicyPath(baseDir, policyPath string) string {
-	if baseDir != "" && !filepath.IsAbs(policyPath) {
-		return filepath.Join(baseDir, policyPath)
+//
+// A leading "~" is expanded FIRST, through the same ExpandHome the audit-log and
+// control-token paths use. Without it, "~/policies/x.yaml" is not absolute, so the
+// join below would resolve it to "<config-dir>/~/policies/x.yaml" — a path that
+// almost never exists, turning an operator's home-relative policy entry into a
+// startup failure that names a directory they never wrote. The "~user/..." form
+// ExpandHome cannot resolve portably fails closed with its message rather than
+// silently resolving to a "~user" directory under the config dir.
+func ResolvePolicyPath(baseDir, policyPath string) (string, error) {
+	expanded, err := ExpandHome(policyPath)
+	if err != nil {
+		return "", fmt.Errorf("policy path: %w", err)
 	}
-	return policyPath
+	if baseDir != "" && !filepath.IsAbs(expanded) {
+		return filepath.Join(baseDir, expanded), nil
+	}
+	return expanded, nil
 }
 
 // MaxDurationMs is the largest millisecond count that still fits in a

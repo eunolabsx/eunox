@@ -150,10 +150,16 @@ func TestMatchValueGlob(t *testing.T) {
 		{"doublestar allows dotfile name", "/reports/**", "/reports/.env", true},
 		{"doublestar allows dotted name", "/reports/**", "/reports/a..b/x", true},
 		{"doublestar allows triple-dot name", "/reports/**", "/reports/.../x", true},
-		// A non-path pattern (no '/') is a plain scalar/enum glob: a ".." value there
-		// is an ordinary literal and matches normally — the path-confinement guard
-		// must not bleed into non-path allowedValues.
-		{"non-path pattern matches dotdot literal", "..", "..", true},
+		// A slashless pattern is a single-segment grant, so the SAME dot rule applies
+		// to its one segment: ".." names the parent of whatever directory the grant
+		// scoped, and a pattern whose metacharacters can match two dots (".*", "??")
+		// would otherwise admit it. A literal ".." pattern is rejected at load as a
+		// dead grant (TestValidateValueGlob_SlashlessDotSegmentIsDead), so its runtime
+		// non-match here is the load rejection's counterpart, not a separate rule.
+		{"slashless dotdot pattern does not match the traversal value", "..", "..", false},
+		{"slashless wildcard does not match the traversal value", ".*", "..", false},
+		// Whole-pattern "*"/"**" are the documented match-ANY-value escape hatch and
+		// short-circuit before confinement runs, so they are deliberately unaffected.
 		{"non-path star matches dotdot value", "*", "..", true},
 		{"non-path star matches dot value", "*", ".", true},
 		// An encoded separator (%2f / %5c) must NOT let a single '*' span a '/' the

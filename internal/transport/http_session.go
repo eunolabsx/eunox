@@ -1038,10 +1038,17 @@ func (s *httpSession) withUpstreamTimeout(ctx context.Context) (context.Context,
 func (s *httpSession) callSubprocessUpstream(ctx context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, error) {
 	ctx, cancel := s.withUpstreamTimeout(ctx)
 	defer cancel()
-	// newSession initializes byUpstreamID, so this lazy init only fires for a session
-	// assembled directly in a test; do it under pendingMu so the map-header write
-	// cannot race the off-lock read in readUpstream/deliverUpstreamResponse.
+	// newSession initializes all three nonce-routing maps, so this lazy init only fires
+	// for a session assembled directly in a test; do it under pendingMu so the
+	// map-header write cannot race the off-lock read in
+	// readUpstream/deliverUpstreamResponse. It covers `pending` too: awaitNonced writes
+	// pending[hostKey] unconditionally, so guarding only byUpstreamID and hostToUp (as
+	// this did) defended nothing — a bare-struct session still panicked on the very next
+	// line. Either all three or none; a partial guard is just a misleading one.
 	s.pendingMu.Lock()
+	if s.pending == nil {
+		s.pending = make(map[string]chan upstreamResult)
+	}
 	if s.byUpstreamID == nil {
 		s.byUpstreamID = make(map[string]chan upstreamResult)
 	}

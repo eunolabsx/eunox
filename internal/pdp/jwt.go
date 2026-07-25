@@ -305,6 +305,14 @@ func effectiveLeeway(configured time.Duration) time.Duration {
 }
 
 // NewJWTPDP creates a JWTPDP ready to validate tokens.
+// jwtLogger pins JWT/JWKS logging to stderr: stdout is the JSON-RPC channel in stdio
+// mode, so logging must never inherit a slog default that could corrupt the framing.
+// Package-level so the constructor's misconfiguration warnings and the parser-drift
+// warnings in parseCapHeads (which has no receiver to reach a field) emit through the
+// SAME handler — those drift warnings used to be raw fmt.Fprintf lines, unstructured
+// and impossible to correlate in a SIEM alongside every other line this package emits.
+var jwtLogger = slog.New(slog.NewTextHandler(os.Stderr, nil))
+
 func NewJWTPDP(opts JWTPDPOptions) *JWTPDP {
 	// Default breaker so the shipped proxy always has JWKS-fetch protection;
 	// capability.NewJWKSCache leaves it opt-in, so apply it here.
@@ -312,9 +320,7 @@ func NewJWTPDP(opts JWTPDPOptions) *JWTPDP {
 	if breaker == nil {
 		breaker = circuitbreaker.New(circuitbreaker.DefaultConfig())
 	}
-	// Pin JWT/JWKS logging to stderr: stdout is the JSON-RPC channel in stdio mode,
-	// so logging must never inherit a slog default that could corrupt the framing.
-	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	logger := jwtLogger
 	if normalizeAudience(opts.Audience) == "" && len(sanitizeAudiences(opts.AcceptedAudiences)) == 0 && !opts.AllowAnyAudience {
 		// No audience pinned but not opted out: EVERY token is rejected regardless of
 		// its aud claim (fail closed), mirroring the issuer check below — there is no
@@ -847,7 +853,7 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 // call it before contacting the upstream so a killed session cannot enumerate the
 // catalog even in JWT mode.
 func (p *JWTPDP) CheckKill(ctx context.Context, sessionID string) *capability.EnforceResponse {
-	return killCheck(ctx, p.ks, sessionID)
+	return killCheck(ctx, p.clock, p.ks, sessionID)
 }
 
 // CheckAudience enforces this route's per-route audience pin at session creation, before
@@ -903,7 +909,7 @@ func (p *JWTPDP) DecideSampling(ctx context.Context, sessionID, sourceIP string)
 	// audience (as this method's contract states), so the check is unconditional; the
 	// possible redundant inner re-check is the accepted price of a correct, wiring-
 	// independent denial code, matching the Decide path.
-	if deny := killCheck(ctx, p.ks, sessionID); deny != nil {
+	if deny := killCheck(ctx, p.clock, p.ks, sessionID); deny != nil {
 		return *deny
 	}
 	// Per-route audience pin (mirrors Decide/filterList): a session whose token does not
@@ -1027,7 +1033,7 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 	// would leave the kill unconsulted there, denying with the wrong code and no
 	// kill-switch observability. DecideResourceRead/DecidePromptGet delegate here, so
 	// this covers all three host-initiated paths.
-	if deny := killCheck(ctx, p.ks, sessionID); deny != nil {
+	if deny := killCheck(ctx, p.clock, p.ks, sessionID); deny != nil {
 		return *deny
 	}
 
@@ -1505,21 +1511,25 @@ type capHead struct {
 // before it reaches this function. So a drop means the validator and this parser have
 // diverged (e.g. a future grammar extension landed in one but not the other), which
 // would silently grant fewer capabilities than the token encodes — fail-closed in
-// result, but invisible. Each drop is logged to stderr so that regression is observable
-// rather than surfacing only as unexplained AUTHORIZATION_FAILED denials downstream.
+// result, but invisible. Each drop is logged through jwtLogger — the same structured
+// stderr handler the rest of this package uses, so the drop is greppable and
+// correlatable in a SIEM — rather than surfacing only as unexplained
+// AUTHORIZATION_FAILED denials downstream.
 func parseCapHeads(caps []string) []capHead {
 	heads := make([]capHead, 0, len(caps))
 	for _, claim := range caps {
 		namepart, condpart, hadSep := splitV2Claim(claim)
 		if hadSep && condpart == "" {
 			// Trailing '?' with no pairs: malformed (ValidateToken already rejects it).
-			fmt.Fprintf(os.Stderr, "[eunox] JWT: capability claim %q passed validation but failed to parse (trailing '?' with no conditions); dropping (this is a bug)\n", claim)
+			jwtLogger.Warn("JWT capability claim passed validation but failed to parse; dropping (this is a bug)",
+				"claim", claim, "reason", "trailing '?' with no conditions")
 			continue
 		}
 		prefix, bareName, err := capability.ParseTarget(namepart)
 		if err != nil {
 			// Claims were validated at token-validation time; should not occur.
-			fmt.Fprintf(os.Stderr, "[eunox] JWT: capability claim %q passed validation but failed to parse (%v); dropping (this is a bug)\n", claim, err)
+			jwtLogger.Warn("JWT capability claim passed validation but failed to parse; dropping (this is a bug)",
+				"claim", claim, "reason", err.Error())
 			continue
 		}
 		heads = append(heads, capHead{prefix: prefix, bareName: bareName, condpart: condpart})

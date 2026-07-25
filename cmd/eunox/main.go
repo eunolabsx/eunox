@@ -128,6 +128,7 @@ Usage:
   eunox init         --upstream-url <url> [--output manifest.yaml] [--config-output eunox.yaml]
   eunox suggest      [--audit-log <path>] [--output manifest.yaml]
   eunox kill         [--port N] [--host H] <session-id|all>
+  eunox kill         --redis-addr <host:port> <session-id|all>
   eunox audit-verify [flags]
   eunox stats        [flags]
   eunox doctor       [flags]
@@ -141,7 +142,10 @@ Subcommands:
   init            Generate a deny-all starter manifest (and, with --config-output, a runnable config) from a live upstream's tool list.
   suggest         Generate a draft manifest from the audit log — grounds entries (and allowedValues
                   conditions) in what the agent actually did. Run a wiretap (proxy --audit) first.
-  kill            Activate the kill switch on a running HTTP proxy.
+  kill            Activate the kill switch on a running deployment — via the HTTP
+                  control endpoint, or with --redis-addr via the shared Redis
+                  kill-switch state (the only channel for a stdio proxy, and the
+                  way to revoke across every instance sharing one Redis).
   audit-verify    Verify HMAC signatures in the local audit log.
   stats           Print a denial count histogram from the audit log.
   doctor          Print a user-initiated support bundle (redacted) for bug reports.
@@ -1246,6 +1250,13 @@ func resolveOAuthMetadata(cfg *config.GatewayConfig, pf proxyFlags) (*transport.
 	if oauthResource == "" {
 		oauthResource = pf.oauthResource
 		oauthResourceLabel = "--oauth-resource"
+	} else if pf.oauthResource != "" && pf.oauthResource != oauthResource {
+		// Config wins, but say so. Silently discarding an explicitly-passed flag leaves
+		// the operator believing they published a resource URI they did not — and this
+		// one lands in the RFC 9728 metadata document and every WWW-Authenticate
+		// challenge, so the mismatch surfaces later as clients failing to discover the
+		// authorization server. Matches the audit-sink override warning.
+		fmt.Fprintf(os.Stderr, "[eunox] WARNING: --oauth-resource=%q is overridden by listen.oauthResource=%q from the config file; the config value is published.\n", pf.oauthResource, oauthResource)
 	}
 	if err := validateOAuthURI(oauthResourceLabel, oauthResource, true); err != nil {
 		return nil, "", err
@@ -1262,6 +1273,11 @@ func resolveOAuthMetadata(cfg *config.GatewayConfig, pf proxyFlags) (*transport.
 	case len(cfg.Listen.OAuthAuthorizationServers) > 0:
 		oauthAuthzServers = cfg.Listen.OAuthAuthorizationServers
 		validateAuthz = true
+		if pf.oauthAuthzServer != "" && (len(oauthAuthzServers) != 1 || oauthAuthzServers[0] != pf.oauthAuthzServer) {
+			// Same rule as the resource URI above: config wins, but an explicitly-passed
+			// flag is never discarded in silence.
+			fmt.Fprintf(os.Stderr, "[eunox] WARNING: --oauth-authz-server=%q is overridden by listen.oauthAuthorizationServers=%v from the config file; the config value is published.\n", pf.oauthAuthzServer, oauthAuthzServers)
+		}
 	case pf.oauthAuthzServer != "":
 		oauthAuthzServers = []string{pf.oauthAuthzServer}
 		validateAuthz = true

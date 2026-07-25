@@ -718,30 +718,32 @@ func (p *HTTPProxy) handleMCPGet(w http.ResponseWriter, r *http.Request, route *
 	// refusal. All three checks run before sess.touch() so a refused open does not defer
 	// the victim session's idle reaping.
 	//
-	// route is always non-nil in production; the nil guard only covers the test-only
-	// construction that wires no route. route.pdp is non-nil whenever route is (every
-	// route constructor substitutes a concrete PDP).
-	if route != nil {
-		// Per-route audience pin + session-owner binding, via the same helper the POST path
-		// uses: a token minted for a sibling route's audience (accepted by the shared union
-		// validator), or a same-audience second identity that learned the victim's
-		// Mcp-Session-Id, must not open this route's session stream and read another client's
-		// server->client traffic. An unbound, no-JWT session is a no-op.
-		if _, denied := route.enforceSessionGates(r.Context(), sess, sessionID, "", "sse-get"); denied {
-			http.Error(w, "forbidden", http.StatusForbidden)
-			return
-		}
-		// Kill-switch check before serving: a killed (or globally emergency-stopped)
-		// session must not OPEN (or re-open) an SSE stream. This guards stream opens only
-		// — handleKill writes the kill store but does not tear down sessions, so a stream
-		// already open when the kill lands keeps delivering until the idle reaper closes
-		// it (evicting in-flight streams would change the kill switch's semantics). A
-		// kill-store error fails closed via CheckKill.
-		if deny := route.pdp.CheckKill(r.Context(), sessionID); deny != nil {
-			recordKillDrop(r.Context(), asRecorder(route.sink), deny, sessionID, "", "", legSSEGet)
-			http.Error(w, "session terminated", http.StatusForbidden)
-			return
-		}
+	// route is dereferenced unconditionally: handleMCP 404s an unknown route before
+	// dispatch, so it is never nil here, and route.pdp is non-nil whenever route is
+	// (every route constructor substitutes a concrete PDP). A defensive `if route != nil`
+	// around these gates would be worse than useless — it is a fail-OPEN branch in
+	// security-gate code, silently skipping the audience pin, the owner binding, and the
+	// kill check for whatever construction managed to reach here without a route.
+	//
+	// Per-route audience pin + session-owner binding, via the same helper the POST path
+	// uses: a token minted for a sibling route's audience (accepted by the shared union
+	// validator), or a same-audience second identity that learned the victim's
+	// Mcp-Session-Id, must not open this route's session stream and read another client's
+	// server->client traffic. An unbound, no-JWT session is a no-op.
+	if _, denied := route.enforceSessionGates(r.Context(), sess, sessionID, "", "sse-get"); denied {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	// Kill-switch check before serving: a killed (or globally emergency-stopped)
+	// session must not OPEN (or re-open) an SSE stream. This guards stream opens only
+	// — handleKill writes the kill store but does not tear down sessions, so a stream
+	// already open when the kill lands keeps delivering until the idle reaper closes
+	// it (evicting in-flight streams would change the kill switch's semantics). A
+	// kill-store error fails closed via CheckKill.
+	if deny := route.pdp.CheckKill(r.Context(), sessionID); deny != nil {
+		recordKillDrop(r.Context(), asRecorder(route.sink), deny, sessionID, "", "", legSSEGet)
+		http.Error(w, "session terminated", http.StatusForbidden)
+		return
 	}
 	sess.touch() // opening/holding an SSE stream counts as activity
 
@@ -907,11 +909,7 @@ func (p *HTTPProxy) handleMCPDelete(w http.ResponseWriter, r *http.Request, rout
 	// session-registry write lock that serializes every lookup, register, and reap.
 	// The verdict is APPLIED below only once the session is confirmed to exist and to
 	// belong to this route, preserving the 403-vs-404 shape exactly.
-	var audienceGate sessionGate
-	var audienceDenied bool
-	if route != nil {
-		audienceGate, audienceDenied = route.contextGateVerdict(r.Context())
-	}
+	audienceGate, audienceDenied := route.contextGateVerdict(r.Context())
 
 	p.mu.Lock()
 	sess, ok := p.sessions[sessionID]
@@ -938,24 +936,23 @@ func (p *HTTPProxy) handleMCPDelete(w http.ResponseWriter, r *http.Request, rout
 		// kill switch is deliberately NOT consulted: tearing a session down is always
 		// permitted (cleanup of a killed session must still succeed).
 		//
-		// route is always non-nil in production (handleMCP 404s an unknown route before
-		// dispatch); the nil guard only covers the test-only construction that wires no
-		// route, matching handleMCPGet. The two gate halves are applied in the same order
-		// sessionGateVerdict applies them — audience first, already computed above the lock;
-		// owner second, a pure field compare cheap enough to run here — so DELETE clears
-		// exactly the gates POST/GET clear, and a gate added to either half cannot silently
-		// skip it. Only the record + 403 render happen after unlocking.
-		if route != nil {
-			gate, denied := audienceGate, audienceDenied
-			if !denied {
-				gate, denied = sessionOnlyGateVerdict(r.Context(), sess)
-			}
-			if denied {
-				p.mu.Unlock()
-				route.recordSessionGateDeny(r.Context(), sessionID, "", "http-delete", gate)
-				http.Error(w, "forbidden", http.StatusForbidden)
-				return
-			}
+		// route is dereferenced unconditionally: handleMCP 404s an unknown route before
+		// dispatch, so it is never nil here, matching handleMCPGet. A defensive nil guard
+		// would be a fail-OPEN branch skipping the audience pin and owner binding. The two
+		// gate halves are applied in the same order sessionGateVerdict applies them —
+		// audience first, already computed above the lock; owner second, a pure field
+		// compare cheap enough to run here — so DELETE clears exactly the gates POST/GET
+		// clear, and a gate added to either half cannot silently skip it. Only the record +
+		// 403 render happen after unlocking.
+		gate, denied := audienceGate, audienceDenied
+		if !denied {
+			gate, denied = sessionOnlyGateVerdict(r.Context(), sess)
+		}
+		if denied {
+			p.mu.Unlock()
+			route.recordSessionGateDeny(r.Context(), sessionID, "", "http-delete", gate)
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
 		}
 		delete(p.sessions, sessionID)
 	}
