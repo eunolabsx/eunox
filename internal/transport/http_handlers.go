@@ -265,7 +265,7 @@ func (p *HTTPProxy) initStrictAuditDenial(ctx context.Context, route *UpstreamRo
 	}
 	// initialize addresses no sub-target, so the audit id, method, and denial
 	// target all collapse to "initialize" (see dispatchList for the same pattern).
-	return fp.strictAuditDenial(ctx, msg, "initialize", "initialize", "initialize")
+	return fp.strictAuditDenial(ctx, msg, mcp.MethodInitialize, mcp.MethodInitialize, mcp.MethodInitialize)
 }
 
 // initAudienceDenial applies the per-route JWT audience pin to the session-creating
@@ -282,9 +282,9 @@ func (p *HTTPProxy) initAudienceDenial(ctx context.Context, route *UpstreamRoute
 	}
 	d := normalizeDenial(deny.Denial)
 	if rec := asRecorder(route.sink); rec != nil {
-		rec.RecordDeny(ctx, "", "initialize", "initialize", d.Code, d.ConditionType, d.Details, false)
+		rec.RecordDeny(ctx, "", mcp.MethodInitialize, mcp.MethodInitialize, d.Code, d.ConditionType, d.Details, false)
 	}
-	return denialResult(msg.ID, d.Code, d.ConditionType, "initialize", ""), true
+	return denialResult(msg.ID, d.Code, d.ConditionType, mcp.MethodInitialize, ""), true
 }
 
 // handleHTTPUpstreamRequest handles server-initiated JSON-RPC requests from

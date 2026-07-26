@@ -265,6 +265,7 @@ func TestHandleKill_RecordsSuccessfulActivation(t *testing.T) {
 			})
 
 			req := httptest.NewRequest(http.MethodPost, "/control/kill", strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", CTJSON)
 			req.RemoteAddr = "127.0.0.1:6666"
 			req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 			req.Header.Set(ControlTokenHeader, "control-s3cret")
@@ -320,6 +321,7 @@ func TestHandleKill_NoRecordWhenActivationFails(t *testing.T) {
 	proxy.ks = failingKillSwitch{}
 
 	req := httptest.NewRequest(http.MethodPost, "/control/kill", strings.NewReader(`{"all":true}`))
+	req.Header.Set("Content-Type", CTJSON)
 	req.RemoteAddr = "127.0.0.1:6666"
 	req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	req.Header.Set(ControlTokenHeader, "control-s3cret")

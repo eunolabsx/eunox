@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -21,6 +22,47 @@ import (
 
 	"github.com/eunolabs/eunox/pkg/capability"
 )
+
+// requireJSONContentType admits only a request body labelled application/json, failing
+// closed on an absent, unparseable, or duplicated Content-Type header. Every POST this
+// proxy serves — the /mcp JSON-RPC body and the /control/kill body — is JSON, and the
+// MCP Streamable HTTP spec already requires conformant clients to say so, so no honest
+// caller is turned away.
+//
+// It is a CSRF hardening measure, not merely conformance. checkOrigin is the primary
+// control and already rejects the cross-origin browser POST (browsers attach Origin to
+// every cross-origin POST, and both a foreign origin and the opaque "null" are refused).
+// This gate covers the class from the other side: a body sent with the default
+// text/plain (or a form/multipart) content type is a CORS SIMPLE request, dispatched
+// with no preflight, and the sessionless initialize POST is the one /mcp entry point
+// that needs no custom header — so requiring a JSON content type forces a preflight on
+// exactly the request that could otherwise reach a handler without one. Session-bound
+// POSTs are already preflighted by their Mcp-Session-Id header.
+//
+// A refusal is deliberately NOT recorded on the audit tape: it is a malformed-request
+// rejection like the 400 from decodeStrictJSON, it is reachable pre-authentication, and
+// pre-session records are the one audit write an unauthenticated caller's rate controls
+// (see preSessionDenyLimiter).
+//
+// More than one Content-Type header is rejected outright, for the reason checkOrigin
+// rejects a duplicated Origin: Header.Get would validate the first while a proxy or host
+// downstream may act on another.
+func requireJSONContentType(w http.ResponseWriter, r *http.Request) bool {
+	vals := r.Header.Values("Content-Type")
+	if len(vals) != 1 {
+		http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
+		return false
+	}
+	// ParseMediaType lower-cases the media type and strips parameters, so
+	// "Application/JSON; charset=utf-8" is admitted while a bare unparseable value
+	// ("application/json;;") errors and is refused.
+	mt, _, err := mime.ParseMediaType(vals[0])
+	if err != nil || mt != CTJSON {
+		http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
+		return false
+	}
+	return true
+}
 
 // Pre-session denial records are the only audit writes an UNAUTHENTICATED caller can
 // trigger, so they are the only ones whose rate an attacker sets. They are bounded by a

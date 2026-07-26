@@ -6,6 +6,7 @@
 package audit
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -26,7 +27,12 @@ func acquireAuditLock(logPath string) (*os.File, error) {
 	}
 	if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		_ = lf.Close()
-		if err == syscall.EWOULDBLOCK {
+		// errors.Is, not ==: Flock returns a bare syscall.Errno today, but any future
+		// wrapping would silently downgrade the "another instance holds the lock"
+		// diagnostic to the generic message below. EAGAIN is included because POSIX
+		// permits either spelling for a would-block flock (they are the same value on
+		// Linux, distinct on some platforms). The Windows variant already matches this way.
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
 			return nil, fmt.Errorf("audit log %q is already being written by another eunox instance (lock %q held); refusing to fork the tamper-evident chain", logPath, lockPath)
 		}
 		return nil, fmt.Errorf("locking audit log %q (lock %q): %w", logPath, lockPath, err)

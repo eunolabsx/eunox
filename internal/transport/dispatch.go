@@ -132,7 +132,7 @@ func isEnforcedMethod(method string) bool {
 // rather than two hand-mirrored literal lists that could silently diverge.
 var swallowedHostNotifications = map[string]struct{}{
 	mcp.MethodNotificationsInitialized: {},
-	"initialize":                       {},
+	mcp.MethodInitialize:               {},
 }
 
 // isSwallowedHostNotification reports whether a host->upstream notification of this
@@ -253,7 +253,7 @@ func dispatchRequest(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.
 		return resp
 	}
 	switch msg.Method {
-	case "initialize":
+	case mcp.MethodInitialize:
 		return dispatchInitialize(ctx, d, msg)
 	case "ping":
 		return dispatchPing(msg)

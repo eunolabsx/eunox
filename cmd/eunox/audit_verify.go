@@ -191,8 +191,8 @@ Flags:
 		return 0
 	}
 
-	fmt.Printf("Checked %d record(s): %d valid, %d invalid, %d skipped, %d legacy, %d unknown-key, %d unverifiable; %d chain break(s).\n",
-		res.Total, res.Valid, res.Invalid, res.Skipped, res.Legacy, res.UnknownKey, res.Unverifiable, res.ChainBreaks)
+	fmt.Printf("Checked %d record(s): %d valid, %d invalid, %d skipped, %d unknown-key, %d unverifiable; %d chain break(s).\n",
+		res.Total, res.Valid, res.Invalid, res.Skipped, res.UnknownKey, res.Unverifiable, res.ChainBreaks)
 	// UNKNOWN_KEY_ID is a missing-key state, not tampering — kept distinct from the
 	// INVALID tally so a key rotation is not mistaken for corruption. The verdict
 	// still fails (OK() counts it): the records can't be verified without the key.

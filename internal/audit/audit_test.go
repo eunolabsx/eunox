@@ -137,27 +137,26 @@ func TestAuditChain_InteriorDeletionReportsBothBreakAndGap(t *testing.T) {
 	}
 }
 
-// TestAuditChain_LegacyPreSigningRecordsExempt is the regression: records
-// written before HMAC signing existed carry no _hmac and no seq, so they decode
-// with HMAC=="" and Seq==0. audit-verify must NOT report them as INVALID (there
-// is no HMAC to verify) nor emit a spurious SEQ GAP between consecutive Seq=0
-// records, mirroring the exemption openAuditSink already grants when resuming a
-// legacy tail. The post-upgrade signed records must still verify and chain.
-func TestAuditChain_LegacyPreSigningRecordsExempt(t *testing.T) {
+// TestAuditChain_PreSigningRecordsAreInvalid pins the post-migration contract for a
+// log written before HMAC signing existed: its records carry no _hmac, so nothing
+// certifies them and audit-verify counts each INVALID. The writer refuses to chain
+// onto such a tail (resuming would seed seq/prev_hmac from bytes an attacker can write
+// without the key), records a tail_unsigned marker, and starts a fresh chain at
+// genesis — so the appended records verify cleanly on their own while the unsigned
+// prefix keeps the whole-log verdict FAILED until it rotates out.
+func TestAuditChain_PreSigningRecordsAreInvalid(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "audit.jsonl")
 	keyPath := filepath.Join(dir, "audit.key")
 
-	// Two pre-signing legacy records: valid JSON, but no "seq" and no "_hmac".
+	// Two pre-signing records: valid JSON, but no "seq" and no "_hmac".
 	legacy := `{"request_id":"legacy-1","activity_name":"tools/call","session_id":"s","target":"a"}` + "\n" +
 		`{"request_id":"legacy-2","activity_name":"tools/call","session_id":"s","target":"b"}` + "\n"
 	if err := os.WriteFile(logPath, []byte(legacy), 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	// Upgrade: a signing sink resumes onto the legacy tail (prev_hmac "") and
-	// appends three signed records (seq 1..3).
 	sink, err := Open(logPath, keyPath, 0, 0)
 	if err != nil {
 		t.Fatalf("openAuditSink: %v", err)
@@ -175,25 +174,24 @@ func TestAuditChain_LegacyPreSigningRecordsExempt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("verifyAuditLog: %v", err)
 	}
-	if !res.OK() {
-		t.Fatalf("a legacy+signed log must pass; output:\n%s\nresult: %+v", sb.String(), res)
+	if res.OK() {
+		t.Fatalf("unsigned records carry no signature and must fail the verdict; output:\n%s\nresult: %+v", sb.String(), res)
 	}
-	if res.Legacy != 2 {
-		t.Fatalf("expected legacy=2, got %+v", res)
+	if res.Invalid != 2 {
+		t.Fatalf("expected the 2 unsigned records counted invalid, got %+v\noutput:\n%s", res, sb.String())
 	}
 	if res.Valid != 4 {
-		// 3 appended records + the signed legacy_tail_resumed integrity marker
-		// openAuditSink now writes when it resumes onto an unsigned (legacy) tail.
-		t.Fatalf("expected valid=4 (3 signed records + 1 legacy_tail_resumed marker), got %+v", res)
+		// 3 appended records + the signed tail_unsigned integrity marker.
+		t.Fatalf("expected valid=4 (3 signed records + 1 tail_unsigned marker), got %+v", res)
 	}
-	if res.Invalid != 0 {
-		t.Fatalf("legacy records must not be counted invalid: %+v\noutput:\n%s", res, sb.String())
-	}
+	// The unsigned records never enter the chain state, so the fresh signed chain that
+	// starts after them is internally clean: no spurious break, and its genesis record
+	// is the first seq the chain reports.
 	if res.ChainBreaks != 0 {
-		t.Fatalf("no spurious chain breaks across the upgrade boundary: %+v\noutput:\n%s", res, sb.String())
+		t.Fatalf("unsigned records must not fabricate chain breaks: %+v\noutput:\n%s", res, sb.String())
 	}
-	if res.FirstSeq != 0 {
-		t.Fatalf("the first record is a legacy record (seq 0); got firstSeq=%d", res.FirstSeq)
+	if res.FirstSeq != 1 {
+		t.Fatalf("the restarted chain begins at seq 1; got firstSeq=%d", res.FirstSeq)
 	}
 }
 
@@ -442,23 +440,21 @@ func TestAuditChain_ResumesAcrossReopen(t *testing.T) {
 	}
 }
 
-// TestAuditChain_ResumesFromLegacyTail is the regression: resuming from a
-// pre-chain record (no _hmac) must chain the first appended record onto it with
-// an empty prev_hmac — not the genesis sentinel — so audit-verify sees a
-// continuous chain across the upgrade boundary instead of a spurious break. Both
-// a pre-seq legacy tail (seq 0, indistinguishable from a fresh log by seq alone)
-// and a seq-bearing legacy tail must resume cleanly. The resume also writes a
-// signed legacy_tail_resumed integrity marker as the first appended record so the
-// (unverifiable) splice point is recorded on the tamper-evident trail.
-func TestAuditChain_ResumesFromLegacyTail(t *testing.T) {
+// TestAuditChain_RefusesToResumeOntoUnsignedTail pins the fail-closed replacement for
+// the old pre-chain resume: an unsigned tail is NOT chained onto. Appending an unsigned
+// record is the one splice a write-capable attacker can make without the signing key,
+// so resuming would seed seq/prev_hmac from uncertified bytes. Instead the chain
+// restarts at genesis and a signed tail_unsigned marker records the boundary in-band.
+// Both tail shapes — a pre-seq one (seq 0, indistinguishable from a fresh log by seq
+// alone) and a seq-bearing one — are treated identically, and neither donates its seq.
+func TestAuditChain_RefusesToResumeOntoUnsignedTail(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name    string
 		withSeq bool
-		wantSeq uint64 // seq stamped on the first appended record
 	}{
-		{"pre-seq legacy tail (seq 0)", false, 1},
-		{"seq-bearing legacy tail", true, 42},
+		{"pre-seq unsigned tail (seq 0)", false},
+		{"seq-bearing unsigned tail", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -467,7 +463,6 @@ func TestAuditChain_ResumesFromLegacyTail(t *testing.T) {
 			keyPath := filepath.Join(dir, "audit.key")
 			writeLegacyTail(t, logPath, tc.withSeq)
 
-			// Resume from the legacy tail and append two signed records.
 			sink, err := Open(logPath, keyPath, 0, 0)
 			if err != nil {
 				t.Fatalf("openAuditSink: %v", err)
@@ -479,52 +474,41 @@ func TestAuditChain_ResumesFromLegacyTail(t *testing.T) {
 			}
 
 			lines := logLines(t, logPath)
-			// 1 legacy tail + 1 legacy_tail_resumed integrity marker (the first
-			// appended record, chained from the legacy tail) + 2 appended records.
+			// 1 unsigned tail + 1 tail_unsigned integrity marker + 2 appended records.
 			if len(lines) != 4 {
-				t.Fatalf("expected 4 lines (1 legacy + 1 marker + 2 appended), got %d", len(lines))
+				t.Fatalf("expected 4 lines (1 unsigned + 1 marker + 2 appended), got %d", len(lines))
 			}
 
-			// The crux of the fix: the first appended record (now the
-			// legacy_tail_resumed marker) links to the legacy tail with an empty
-			// prev_hmac, not the genesis sentinel.
+			// The crux: the first appended record starts a FRESH chain — genesis
+			// sentinel, seq 1 — rather than linking to the unsigned tail or inheriting
+			// its seq.
 			var first auditRecord
 			if err := json.Unmarshal(lines[1], &first); err != nil {
 				t.Fatalf("unmarshal first appended record: %v", err)
 			}
-			if first.PrevHMAC == auditGenesisPrev {
-				t.Fatalf("first appended record carries the genesis sentinel — the bug is present")
+			if first.PrevHMAC != auditGenesisPrev {
+				t.Fatalf("first appended record prev_hmac = %q, want the genesis sentinel %q", first.PrevHMAC, auditGenesisPrev)
 			}
-			if first.PrevHMAC != "" {
-				t.Fatalf("first appended record prev_hmac = %q, want \"\" (legacy chain continuation)", first.PrevHMAC)
+			if first.Seq != 1 {
+				t.Fatalf("first appended record seq = %d, want 1 (an unsigned tail must not donate its seq)", first.Seq)
 			}
-			if first.Seq != tc.wantSeq {
-				t.Fatalf("first appended record seq = %d, want %d", first.Seq, tc.wantSeq)
+			// It is the marker, and it names the reason in-band.
+			if !bytes.Contains(lines[1], []byte("tail_unsigned")) {
+				t.Fatalf("first appended record must be the tail_unsigned marker, got %s", lines[1])
 			}
 
-			// Verifying the full log (legacy + appended) reports no chain break.
-			// The legacy line itself lands in the Legacy bucket (not Invalid) — it
-			// predates signing and has no HMAC to verify — regardless of whether it
-			// happens to carry a seq value: the writer's own resume rule (Open) is
-			// seq-independent, so audit-verify must classify both shapes identically
-			// or the two components disagree on what the same on-disk record means.
-			// A prior regression here checked only ChainBreaks, so a seq-bearing
-			// legacy tail being wrongly counted Invalid (and flipping the whole-log
-			// verdict to FAILED) went unnoticed; assert OK()/Invalid/Legacy directly
-			// so that gap cannot reopen.
+			// Whole-log verdict: the unsigned tail is INVALID (nothing certifies it), but
+			// it fabricates no chain break — it never enters the chain state.
 			full := verifyBytes(t, lines, verifierFor(t, keyPath))
 			if full.ChainBreaks != 0 {
-				t.Fatalf("spurious chain break across the legacy boundary: %+v", full)
+				t.Fatalf("an unsigned tail must not fabricate a chain break: %+v", full)
 			}
-			if !full.OK() {
-				t.Fatalf("the legacy tail must not flip the whole-log verdict to FAILED: %+v", full)
-			}
-			if full.Legacy != 1 || full.Invalid != 0 {
-				t.Fatalf("expected exactly the legacy tail counted Legacy and nothing Invalid: %+v", full)
+			if full.OK() || full.Invalid != 1 {
+				t.Fatalf("expected exactly the unsigned tail counted Invalid and a FAILED verdict: %+v", full)
 			}
 
-			// The appended records on their own (the legacy_tail_resumed marker plus
-			// the two tool records) form a clean, verifiable chain.
+			// The appended records on their own (the marker plus the two tool records)
+			// form a clean, verifiable chain.
 			appended := verifyBytes(t, lines[1:], verifierFor(t, keyPath))
 			if !appended.OK() {
 				t.Fatalf("appended records should verify cleanly: %+v", appended)
@@ -536,43 +520,13 @@ func TestAuditChain_ResumesFromLegacyTail(t *testing.T) {
 	}
 }
 
-// TestAuditChain_ResumedLegacyTailClearedAfterOpen pins the fix binding the
-// empty-prev_hmac emission strictly to the legacy_tail_resumed marker. writeRecord's
-// resumedLegacyTail branch emits prev_hmac=="" for whatever record first finds
-// s.prevHMAC=="". If the marker write fails (seq/prevHMAC do not advance) and the
-// flag stayed set, the NEXT ordinary record would inherit seq 1 with an empty
-// prev_hmac while NOT being the marker — the shape a later audit-verify reports as a
-// spurious chain break. Clearing the flag after the marker write attempt routes any
-// such record through the genesis branch instead, so verify sees a clean seq-1
-// genesis start. This asserts the flag is cleared once Open returns.
-func TestAuditChain_ResumedLegacyTailClearedAfterOpen(t *testing.T) {
-	t.Parallel()
-	dir := t.TempDir()
-	logPath := filepath.Join(dir, "audit.jsonl")
-	keyPath := filepath.Join(dir, "audit.key")
-	writeLegacyTail(t, logPath, false)
-
-	sink, err := Open(logPath, keyPath, 0, 0)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer func() { _ = sink.Close() }()
-
-	// The clear happens in Open, before the drainer goroutine starts, so this read is
-	// not racing a writer.
-	if sink.resumedLegacyTail {
-		t.Fatal("resumedLegacyTail must be cleared after Open's marker write attempt, so a failed marker cannot hand its empty-prev_hmac seq-1 slot to an ordinary record")
-	}
-}
-
-// TestVerify_GenesisSeq1AfterLegacyHead covers the legacy->signed transition shapes:
-// a bare genesis seq-1 record following a head legacy (unsigned) record does NOT chain
-// break (the link check accepts it), but it FAILS the verdict as LegacyUnanchored,
-// because that shape is indistinguishable from fabricated unsigned records prepended by
-// a write-capable attacker without the key. A lone genesis seq-1 (legacy rotated away)
-// still verifies clean, and a genesis-sentinel seq-1 following a SIGNED record must
-// still break, so tamper detection is preserved.
-func TestVerify_GenesisSeq1AfterLegacyHead(t *testing.T) {
+// TestVerify_GenesisSeq1AfterUnsignedHead covers the shapes around a signed chain that
+// begins after unsigned records: the genesis seq-1 record does not chain break (the
+// unsigned head never enters the chain state), the unsigned head itself fails the
+// verdict as INVALID, a lone genesis seq-1 (unsigned records rotated away) verifies
+// clean, and a genesis-sentinel seq-1 following a SIGNED record must still break, so
+// tamper detection is preserved.
+func TestVerify_GenesisSeq1AfterUnsignedHead(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	keyPath := filepath.Join(dir, "audit.key")
@@ -596,37 +550,36 @@ func TestVerify_GenesisSeq1AfterLegacyHead(t *testing.T) {
 	writeLegacyTail(t, legPath, false)
 	leg := logLines(t, legPath)
 
-	// Not-yet-rotated: [legacy head, genesis seq-1 signed] does not chain break, but the
-	// verdict fails closed (LegacyUnanchored) — the marker-write-failed fallback and the
-	// prepend-forgery attack are the same shape.
+	// Not-yet-rotated: [unsigned head, genesis seq-1 signed] does not chain break, but
+	// the verdict fails closed on the unsigned record.
 	notRotated := append(append([][]byte{}, leg...), fresh...)
 	res := verifyBytes(t, notRotated, verifierFor(t, keyPath))
 	if res.ChainBreaks != 0 {
-		t.Fatalf("legacy head + genesis seq-1 must not chain break, got ChainBreaks=%d", res.ChainBreaks)
+		t.Fatalf("unsigned head + genesis seq-1 must not chain break, got ChainBreaks=%d", res.ChainBreaks)
 	}
-	if !res.LegacyUnanchored || res.OK() {
-		t.Fatalf("legacy head + genesis seq-1 must fail the verdict as LegacyUnanchored, got LegacyUnanchored=%v OK=%v", res.LegacyUnanchored, res.OK())
+	if res.OK() || res.Invalid != 1 {
+		t.Fatalf("unsigned head must fail the verdict as INVALID, got %+v", res)
 	}
 
-	// Rotated-away: [genesis seq-1 signed] alone must verify clean (no legacy head).
+	// Rotated-away: [genesis seq-1 signed] alone must verify clean.
 	if res := verifyBytes(t, fresh, verifierFor(t, keyPath)); res.ChainBreaks != 0 || !res.OK() {
 		t.Fatalf("lone genesis seq-1 must verify clean, got ChainBreaks=%d OK=%v", res.ChainBreaks, res.OK())
 	}
 
 	// Detection preserved: a genesis-sentinel seq-1 record following a SIGNED record
-	// (not a legacy head) must still be reported as a chain break.
+	// must still be reported as a chain break.
 	afterSigned := append(append([][]byte{}, fresh...), fresh...)
 	if res := verifyBytes(t, afterSigned, verifierFor(t, keyPath)); res.ChainBreaks == 0 {
 		t.Fatal("a genesis-sentinel seq-1 record following a signed record must still break")
 	}
 }
 
-// TestVerify_ForgedLegacyPrependFailsVerdict is the H1 regression: a write-capable
-// attacker WITHOUT the signing key prepends fabricated unsigned "legacy" records ahead
-// of an ordinary signed log (first record seq 1, prev_hmac = genesis sentinel). No
-// CHAIN BREAK fires (the forged legacy head links to the genuine genesis seq-1 via the
-// legacy->signed acceptance), but the verdict must NOT report PASS.
-func TestVerify_ForgedLegacyPrependFailsVerdict(t *testing.T) {
+// TestVerify_ForgedUnsignedPrependFailsVerdict is the regression for the prepend
+// forgery: a write-capable attacker WITHOUT the signing key prepends fabricated
+// unsigned records ahead of an ordinary signed log (first record seq 1, prev_hmac =
+// genesis sentinel). No CHAIN BREAK fires — the forged records never enter the chain
+// state — but every one of them is INVALID, so the verdict must NOT report PASS.
+func TestVerify_ForgedUnsignedPrependFailsVerdict(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	keyPath := filepath.Join(dir, "audit.key")
@@ -651,10 +604,10 @@ func TestVerify_ForgedLegacyPrependFailsVerdict(t *testing.T) {
 	tampered := append(append([][]byte{}, forged...), signed...)
 	res := verifyBytes(t, tampered, verifierFor(t, keyPath))
 	if res.OK() {
-		t.Fatal("a forged unsigned legacy prepend ahead of a signed log must NOT verify PASS")
+		t.Fatal("a forged unsigned prepend ahead of a signed log must NOT verify PASS")
 	}
-	if !res.LegacyUnanchored {
-		t.Fatalf("forged legacy prepend must be flagged LegacyUnanchored, got %+v", res)
+	if res.Invalid != 1 {
+		t.Fatalf("the forged unsigned record must be counted Invalid, got %+v", res)
 	}
 }
 
@@ -3955,8 +3908,10 @@ func TestSEC02_VerifyRecord_ConstantTimeHMAC(t *testing.T) {
 	t.Run("missing HMAC field fails", func(t *testing.T) {
 		noHMAC := strings.Replace(string(line), `"`+sig+`"`, `""`, 1)
 		ok, err := sink.VerifyRecord([]byte(noHMAC))
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
+		// An unsigned record is refused outright: stripping _hmac must not be a way to
+		// skip verification, so it is an error rather than a quiet false.
+		if !errors.Is(err, errUnsignedRecord) {
+			t.Fatalf("error = %v, want errUnsignedRecord", err)
 		}
 		if ok {
 			t.Error("expected VerifyRecord to return false when _hmac is empty")

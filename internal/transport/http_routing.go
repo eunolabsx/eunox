@@ -166,6 +166,13 @@ func (p *HTTPProxy) writeSessionCreateError(w http.ResponseWriter, r *http.Reque
 // handleMCPPost processes a JSON-RPC request from the MCP host for the given
 // upstream route.
 func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route *UpstreamRoute) {
+	// Refuse a body that is not labelled application/json before anything reads it. A
+	// sessionless initialize POST carries no custom header, so without this gate it is a
+	// CORS simple request a loopback page can send with no preflight; every other /mcp
+	// POST is already preflighted by its Mcp-Session-Id. See requireJSONContentType.
+	if !requireJSONContentType(w, r) {
+		return
+	}
 	// SEC-04: cap request body to prevent memory exhaustion from large payloads.
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 	var msg mcp.RPCMsg
@@ -206,7 +213,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 	// Require msg.IsRequest(): an initialize *notification* (no id) must never start
 	// an upstream or consume a session slot — a flood would otherwise spawn unbounded
 	// upstreams. It is handled as a stateless notification below.
-	if msg.Method == "initialize" && sessionID == "" && msg.IsRequest() {
+	if msg.Method == mcp.MethodInitialize && sessionID == "" && msg.IsRequest() {
 		// Kill-switch check BEFORE spawning anything: a session-creating initialize
 		// must not start an upstream while a global kill (emergency stop) is active.
 		// The empty session id means only the global dimension can match. This is the one
@@ -214,7 +221,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 		// dispatchParams yet), so it repeats the kill gate dispatchRequest applies to
 		// every other locally-answered method.
 		if deny := route.pdp.CheckKill(r.Context(), ""); deny != nil {
-			resp := recordKillDenial(r.Context(), asRecorder(route.sink), deny, msg.ID, "", "initialize")
+			resp := recordKillDenial(r.Context(), asRecorder(route.sink), deny, msg.ID, "", mcp.MethodInitialize)
 			writeJSONMsg(w, resp)
 			return
 		}
@@ -302,7 +309,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 	if sessionID == "" {
 		// An initialize notification (excluded from the session-creation branch above)
 		// expects no response: accept and drop it without allocating session state.
-		if msg.Method == "initialize" && msg.IsNotification() {
+		if msg.Method == mcp.MethodInitialize && msg.IsNotification() {
 			// Consult the kill switch BEFORE the 202 ack. Under the MCP Streamable HTTP
 			// spec a 202 to an initialize notification is a readiness acknowledgement, so
 			// returning it while a global emergency stop is active would tell the client
@@ -554,7 +561,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 
 	ctx := r.Context()
 	var resp mcp.RPCMsg
-	if msg.Method == "initialize" {
+	if msg.Method == mcp.MethodInitialize {
 		// Re-initialize is answered locally from capabilities captured at session start
 		// (the session-ownership binding was already enforced above, before touchRequest).
 		// It routes through the shared dispatcher like every other enforced method, so its
@@ -1047,6 +1054,14 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 	// auto-generated control token (written to a 0600 file at startup, independently of
 	// authToken/JWT mode) so the emergency stop is never reachable without it.
 	if !p.checkControlToken(w, r) {
+		return
+	}
+
+	// Same JSON-only body gate the /mcp POST applies, for the same reason plus symmetry:
+	// the emergency stop must not be reachable by a request shaped to skip a preflight.
+	// It runs after the control-token check, so a caller without the token learns nothing
+	// about the body this endpoint expects.
+	if !requireJSONContentType(w, r) {
 		return
 	}
 

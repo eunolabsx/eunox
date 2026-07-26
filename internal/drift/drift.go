@@ -73,8 +73,7 @@ type UpstreamTool struct {
 	Description string
 	InputSchema map[string]interface{}
 	// Title, Annotations, and OutputSchema are model-facing tool metadata folded
-	// into the FM-5 description-hash pin (see capability.ToolHashParams). Field
-	// order matches mcp.ToolEntry so ParseToolsListResult can convert by value.
+	// into the FM-5 description-hash pin (see capability.ToolHashParams).
 	Title        string
 	Annotations  map[string]interface{}
 	OutputSchema map[string]interface{}
@@ -983,7 +982,20 @@ func ParseToolsListResult(raw json.RawMessage) ([]UpstreamTool, error) {
 	}
 	tools := make([]UpstreamTool, len(result.Tools))
 	for i, t := range result.Tools {
-		tools[i] = UpstreamTool(t)
+		// Field by field, by NAME, rather than a positional UpstreamTool(t) struct
+		// conversion. The two types share three string fields and two
+		// map[string]interface{} fields, so a same-type reorder in mcp.ToolEntry would
+		// still compile as a conversion while silently transposing values into the wrong
+		// fields — and every FM-5 descriptionHash comparison is computed over exactly
+		// these fields. Named assignment makes that mapping compiler-checked.
+		tools[i] = UpstreamTool{
+			Name:         t.Name,
+			Description:  t.Description,
+			InputSchema:  t.InputSchema,
+			Title:        t.Title,
+			Annotations:  t.Annotations,
+			OutputSchema: t.OutputSchema,
+		}
 	}
 	return tools, nil
 }

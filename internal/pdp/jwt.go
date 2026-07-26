@@ -275,8 +275,19 @@ type JWTPDPOptions struct {
 	// KillSwitch is consulted at the top of every Decide so global and
 	// per-session/per-agent kills take effect even in JWT-only mode.
 	KillSwitch killswitch.Checker
-	CacheTTL   time.Duration
-	Client     *http.Client
+	// CacheTTL is how long a fetched JWKS is served from cache (default 5 minutes,
+	// see capability.JWKSCacheConfig). It governs KEY freshness only.
+	//
+	// It does NOT govern the verified-token claim cache, which memoizes an
+	// already-verified token's claims for a FIXED window (jwtTokenCacheTTL, 30s) that
+	// no option exposes — so lowering CacheTTL to tighten key-rotation latency does not
+	// tighten how long a token stays trusted. That window is deliberately not
+	// operator-tunable: it is capped by the token's own exp, and the kill switch,
+	// per-route audience, and manifest policy are re-checked on every call, so the
+	// cache skips only the signature/exp/iss/aud re-verification. Revocation latency
+	// is therefore bounded by the kill switch, not by this TTL.
+	CacheTTL time.Duration
+	Client   *http.Client
 	// Breaker optionally guards JWKS fetches. When nil, NewJWTPDP installs one with
 	// circuitbreaker.DefaultConfig; supply one to override the config or clock.
 	Breaker *circuitbreaker.Breaker
