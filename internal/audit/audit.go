@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -501,7 +502,13 @@ func highestSeqAcrossChainCapped(logPath string, bufCap int) (highest uint64, ok
 		for _, sib := range sibs {
 			fold(sib)
 		}
-	} else if !os.IsNotExist(err) {
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		// errors.Is, not os.IsNotExist: the latter does not unwrap, and this error comes
+		// from a helper chain (sortedRotatedSiblings -> scanLogDir) that returns os.ReadDir's
+		// raw *fs.PathError only by convention. The moment any layer adds context with %w,
+		// a genuinely-absent directory would stop being recognized and every fresh install
+		// would stamp seed_unbounded on the tape. rotate.go classifies the same error from
+		// the same helper this way.
 		complete = false
 	}
 	return satAddU64(maxParsed, unreadBytes), parsedAny || sawUnread, complete

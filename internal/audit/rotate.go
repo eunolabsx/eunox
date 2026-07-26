@@ -512,10 +512,12 @@ func (s *Sink) retryRotateReopen() {
 // so losing a rotated file never wedges the audit path. Drainer-only (no lock).
 func (s *Sink) pruneRotated() {
 	if s.retain <= 0 {
-		// Retention is disabled, so it cannot be stalled. A stall reason recorded while a
-		// bound was in force must not outlive it, or /healthz keeps reporting a bound that
-		// is no longer being asked for.
-		s.clearMaintenanceStalled()
+		// Retention disabled: nothing to prune, and nothing to clear either. Only the
+		// retention leg below can set the stall on this path, and it needs retain > 0, so
+		// there is no retention stall to be in. Clearing here anyway would be a
+		// cross-subsystem write — the flag is shared with the rotation-ordinal deferral,
+		// which owns its own clear — so a future rotation stall reaching this pass would
+		// be erased while the size bound went unenforced.
 		return
 	}
 	// Genuine rotated siblings only, oldest-first, via the shared helper so pruning

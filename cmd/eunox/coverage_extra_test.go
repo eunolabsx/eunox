@@ -206,7 +206,7 @@ func TestValidateConfigRoutes_LiveAllowAllRouteNoManifest(t *testing.T) {
 // kill-switch write.
 func TestKillViaRedis_PingFailure(t *testing.T) {
 	// 127.0.0.1:1 is reserved/unbound; the dial fails fast.
-	err := killViaRedis("127.0.0.1:1", "", false, "sess-x")
+	err := killViaRedis("127.0.0.1:1", "", false, 0, "sess-x")
 	if err == nil {
 		t.Fatal("expected an error pinging an unreachable redis, got nil")
 	}
@@ -214,7 +214,7 @@ func TestKillViaRedis_PingFailure(t *testing.T) {
 
 // TestKillViaRedis_EmptyAddr covers the buildRedisClient error wrapping branch.
 func TestKillViaRedis_EmptyAddr(t *testing.T) {
-	err := killViaRedis("", "", false, "all")
+	err := killViaRedis("", "", false, 0, "all")
 	if err == nil {
 		t.Fatal("expected an error for an empty redis addr, got nil")
 	}
@@ -229,14 +229,14 @@ func TestKillViaRedis_EmptyAddr(t *testing.T) {
 func TestKillViaRedis_AllAndSessionSucceed(t *testing.T) {
 	mr := miniredis.RunT(t)
 
-	if err := killViaRedis(mr.Addr(), "", false, "all"); err != nil {
+	if err := killViaRedis(mr.Addr(), "", false, 0, "all"); err != nil {
 		t.Fatalf("killViaRedis all: %v", err)
 	}
 	if got, err := mr.Get("killswitch:global"); err != nil || got != "1" {
 		t.Errorf("global kill not set: got %q err=%v", got, err)
 	}
 
-	if err := killViaRedis(mr.Addr(), "", false, "sess-direct"); err != nil {
+	if err := killViaRedis(mr.Addr(), "", false, 0, "sess-direct"); err != nil {
 		t.Fatalf("killViaRedis session: %v", err)
 	}
 	if got, err := mr.Get("killswitch:session:sess-direct"); err != nil || got != "1" {

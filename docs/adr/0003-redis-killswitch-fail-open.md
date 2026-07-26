@@ -165,6 +165,17 @@ refine what "cannot confirm" means, so a health probe and the data plane agree o
   `SCAN` loops, retried when a concurrent kill races the scan), so a perfectly
   healthy Redis could be judged stale and the data plane denied.
 
+  The floor is a **trade**, and it runs against revocation latency in one case: a
+  refresh that *hangs* rather than errors. An outright failure latches the health
+  stamp and is reported before staleness is consulted, so only the hang reaches this
+  gate — and for it, an operator running a 1 s interval now serves the last-known
+  cache for ~31 s rather than ~2 s before failing closed. That is accepted because
+  the alternative was a *certain* self-inflicted outage (a healthy backend judged
+  stale, denying everything) traded against a longer window on a rare failure mode.
+  Tuning the interval down for faster kill **propagation** — the pub/sub-miss
+  reconvergence the flag documents — is unaffected; only this hang-detection window
+  no longer shrinks with it.
+
 - **Degraded-mode logging is wired in the binary.** The switch's outage and
   recovery breadcrumbs (initial-refresh-failed, subscription-unconfirmed,
   background-refresh failed/recovered) are gated on a configured logger; the proxy

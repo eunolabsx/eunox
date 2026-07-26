@@ -386,3 +386,70 @@ func TestWriteControlTokenFile_WarnsButAllowsReadableOperatorDir(t *testing.T) {
 		t.Errorf("directory mode = %o, want 0755 left untouched — eunox must not chmod a directory the operator chose", perm)
 	}
 }
+
+// TestWriteControlTokenFile_NeverChmodsThroughSymlink: os.Chmod follows symlinks and
+// there is no portable lchmod, so tightening a symlinked ~/.eunox would rewrite the mode
+// of whatever it points at. The classic shape is an operator (or an attacker with write
+// access to a shared home) linking ~/.eunox at a directory eunox does not own; chmod'ing
+// it to 0700 would strip that directory's own access system-wide.
+func TestWriteControlTokenFile_NeverChmodsThroughSymlink(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	target := filepath.Join(home, "shared")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// 1777, the /tmp shape: sticky, so it passes the writable refusal and would reach
+	// the chmod if the symlink were not detected.
+	if err := os.Chmod(target, 0o777|os.ModeSticky); err != nil { //nolint:gosec // test fixture: deliberately loose mode
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(home, ".eunox")); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := WriteControlTokenFile("", "tok"); err != nil {
+		t.Fatalf("a symlinked control-token directory must remain usable, got %v", err)
+	}
+
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o777 {
+		t.Errorf("symlink target mode = %o, want 0777 untouched — eunox must never chmod through a link", perm)
+	}
+	if info.Mode()&os.ModeSticky == 0 {
+		t.Error("the symlink target lost its sticky bit: the chmod fired through the link")
+	}
+}
+
+// TestWriteControlTokenFile_TightensDefaultDirSpelledAbsolutely: "eunox's own directory"
+// is a location, not a spelling. A systemd unit cannot write "~", and an interactive
+// shell expands it before eunox sees the argument — so keying the upgrade repair on the
+// raw flag string skipped exactly the deployments most likely to need it.
+func TestWriteControlTokenFile_TightensDefaultDirSpelledAbsolutely(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir := filepath.Join(home, ".eunox")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil { //nolint:gosec // test fixture: deliberately loose mode
+		t.Fatal(err)
+	}
+
+	// The absolute spelling of the default path, as a unit file or an expanding shell
+	// would pass it.
+	if _, err := WriteControlTokenFile(filepath.Join(dir, "control.token"), "tok"); err != nil {
+		t.Fatalf("WriteControlTokenFile: %v", err)
+	}
+
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o700 {
+		t.Errorf("directory mode = %o, want 0700 — the upgrade repair must key on the location, not the spelling", perm)
+	}
+}

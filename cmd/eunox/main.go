@@ -729,7 +729,10 @@ func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, ki
 func sessionKillTTLNotice(ttl time.Duration) string {
 	switch {
 	case ttl < 0:
-		return "session kills never expire (--killswitch-session-ttl is negative); tombstones accumulate in Redis until removed with 'eunox kill --revive'"
+		// No CLI subcommand un-kills a session today (killswitch.ReviveSession/Reset are
+		// library-only), so do not name one: the tombstone key is what an operator has to
+		// remove, and saying so is more useful than a command that does not exist.
+		return "session kills never expire (--killswitch-session-ttl is negative); tombstones accumulate in Redis until their killswitch:session: keys are removed"
 	case ttl == 0:
 		return fmt.Sprintf("session kills expire after %s (default); a session held open longer than that is re-admitted", killswitch.DefaultSessionKillTTL)
 	default:

@@ -6,10 +6,12 @@ package pdp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/eunolabs/eunox/internal/mcp"
+	"github.com/eunolabs/eunox/pkg/callcounter"
 	"github.com/eunolabs/eunox/pkg/capability"
 	"github.com/eunolabs/eunox/pkg/enforcement"
 	"github.com/eunolabs/eunox/pkg/killswitch"
@@ -368,22 +370,25 @@ func TestFilterToolsList_NonObjectEntryStillHidden(t *testing.T) {
 // antecedent record. Under --audit a manifest-absent tool's AUTHORIZATION_FAILED is
 // downgraded and forwarded, so the tool actually runs — but its call was never recorded
 // in session history, so a later enforced sequenceBlock naming it in afterTools Peeked an
-// empty history and failed OPEN. Every other downgradable deny branch records; this one
-// must too.
+// empty history and failed OPEN. The manifest here declares exactly that shape: a
+// sequenceBlock on a listed tool whose antecedent is the unlisted one.
 func TestDecide_ManifestAbsentToolUnderAudit_RecordsSequenceAntecedent(t *testing.T) {
 	t.Parallel()
 	counter := &recordingCounter{}
 	engine := enforcement.New(enforcement.WithCallCounter(counter))
 	mdp := NewManifestPDP(
-		[]capability.Constraint{{Target: "tool:listed", Actions: []string{"call"}}},
+		[]capability.Constraint{{
+			Target:     "tool:listed",
+			Actions:    []string{"call"},
+			Conditions: []capability.Condition{capability.SequenceBlockCondition{AfterTools: []string{"absent"}}},
+		}},
 		engine,
 		killswitch.NewInMemory(),
 	)
 
 	// Enforce route: the absent tool is denied outright, it never runs, so nothing is
 	// recorded. This is the control for the audit case below.
-	enforceCtx := context.Background()
-	if resp := callTool(mdp, enforceCtx, "absent", nil); resp.Decision != capability.DecisionDeny {
+	if resp := callTool(mdp, context.Background(), "absent", nil); resp.Decision != capability.DecisionDeny {
 		t.Fatalf("a manifest-absent tool must be denied on an enforce route, got %+v", resp)
 	}
 	if counter.writes != 0 {
@@ -399,5 +404,47 @@ func TestDecide_ManifestAbsentToolUnderAudit_RecordsSequenceAntecedent(t *testin
 	}
 	if counter.writes != 1 {
 		t.Fatalf("writes = %d, want 1 — a forwarded manifest-absent call must record its sequenceBlock antecedent", counter.writes)
+	}
+}
+
+// TestDecide_ManifestAbsentToolUnderAudit_UnqueryableNameRecordsNothing bounds the record
+// above. That branch is the only antecedent site whose target name is NOT bounded by the
+// manifest, and each record costs a call-counter key for the whole history window — so
+// recording every made-up name let a caller on an observe route mint keys until the
+// counter hit its cap, at which point the record fails and the antecedent path returns a
+// HARD deny that --audit cannot downgrade. An observe route would start blocking
+// everything, listed tools included. A name no sequenceBlock lists in afterTools can never
+// be queried, so it needs no history.
+func TestDecide_ManifestAbsentToolUnderAudit_UnqueryableNameRecordsNothing(t *testing.T) {
+	t.Parallel()
+	counter := callcounter.NewInMemory(callcounter.WithMaxKeys(8))
+	engine := enforcement.New(enforcement.WithCallCounter(counter))
+	mdp := NewManifestPDP(
+		[]capability.Constraint{{
+			Target:     "tool:listed",
+			Actions:    []string{"call"},
+			Conditions: []capability.Condition{capability.SequenceBlockCondition{AfterTools: []string{"watched"}}},
+		}},
+		engine,
+		killswitch.NewInMemory(),
+	)
+	auditCtx := enforcement.WithSkipQuota(context.Background())
+
+	// Far more distinct unlisted names than the counter can hold. None is a declared
+	// antecedent, so none should consume a key.
+	for i := 0; i < 50; i++ {
+		resp := callTool(mdp, auditCtx, fmt.Sprintf("made-up-%d", i), nil)
+		if resp.Denial != nil && resp.Denial.HardDeny {
+			t.Fatalf("call %d hard-denied on an observe route: %+v", i, resp.Denial)
+		}
+	}
+
+	// The route still observes rather than blocks: a LISTED tool must still be allowed.
+	if resp := callTool(mdp, auditCtx, "listed", nil); resp.Decision != capability.DecisionAllow {
+		t.Fatalf("an observe route must still allow a listed tool after the flood, got %+v", resp)
+	}
+	// And the declared antecedent still records, so the guarantee the gate protects holds.
+	if resp := callTool(mdp, auditCtx, "watched", nil); resp.Denial != nil && resp.Denial.HardDeny {
+		t.Fatalf("the declared antecedent must still record, got %+v", resp.Denial)
 	}
 }

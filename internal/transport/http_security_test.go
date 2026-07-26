@@ -817,28 +817,55 @@ func TestAddClaimedSessionID_TruncatesOnRuneBoundary(t *testing.T) {
 	}
 }
 
-// TestTruncateRunes_Bounds pins the helper's edges: at/under the limit is returned
+// TestSanitizeClaimedID_Bounds pins the helper's edges: at/under the limit is returned
 // verbatim, an over-limit cut lands on a rune boundary, and a non-positive limit is empty.
-func TestTruncateRunes_Bounds(t *testing.T) {
+func TestSanitizeClaimedID_Bounds(t *testing.T) {
 	t.Parallel()
-	if got := truncateRunes("abc", 3); got != "abc" {
-		t.Errorf("truncateRunes(abc, 3) = %q, want abc", got)
+	if got := sanitizeClaimedID("abc", 3); got != "abc" {
+		t.Errorf("sanitizeClaimedID(abc, 3) = %q, want abc", got)
 	}
-	if got := truncateRunes("abc", 10); got != "abc" {
-		t.Errorf("truncateRunes(abc, 10) = %q, want abc", got)
+	if got := sanitizeClaimedID("abc", 10); got != "abc" {
+		t.Errorf("sanitizeClaimedID(abc, 10) = %q, want abc", got)
 	}
-	if got := truncateRunes("abc", 0); got != "" {
-		t.Errorf("truncateRunes(abc, 0) = %q, want empty", got)
-	}
-	if got := truncateRunes("abc", -1); got != "" {
-		t.Errorf("truncateRunes(abc, -1) = %q, want empty", got)
+	if got := sanitizeClaimedID("abc", 0); got != "" {
+		t.Errorf("sanitizeClaimedID(abc, 0) = %q, want empty", got)
 	}
 	// "é" is 2 bytes: a cut at 1 must drop it entirely rather than emit a half rune.
-	if got := truncateRunes("éx", 1); got != "" {
-		t.Errorf("truncateRunes(éx, 1) = %q, want empty (the only rune does not fit)", got)
+	if got := sanitizeClaimedID("éx", 1); got != "" {
+		t.Errorf("sanitizeClaimedID(éx, 1) = %q, want empty (the only rune does not fit)", got)
 	}
-	if got := truncateRunes("aéx", 2); got != "a" {
-		t.Errorf("truncateRunes(aéx, 2) = %q, want a", got)
+	if got := sanitizeClaimedID("aéx", 2); got != "a" {
+		t.Errorf("sanitizeClaimedID(aéx, 2) = %q, want a", got)
+	}
+}
+
+// TestSanitizeClaimedID_InvalidUTF8IsNotDiscarded is the regression a byte-cut-only fix
+// left open. Go's net/http admits bytes >= 0x80 in a header value, so an attacker picks
+// them: a header of all continuation bytes has no rune start anywhere, and a walk-back
+// applied to the RAW bytes retreats all the way to zero — stamping an empty
+// claimed_session_id on a request that carried a full-length header, which is strictly
+// worse than the plain byte slice it replaced. Sanitizing first bounds the walk-back to
+// one rune.
+func TestSanitizeClaimedID_InvalidUTF8IsNotDiscarded(t *testing.T) {
+	t.Parallel()
+	allContinuation := strings.Repeat("\x80", 300)
+	got := sanitizeClaimedID(allContinuation, maxClaimedSessionIDLen)
+	if got == "" {
+		t.Fatal("an all-continuation-byte header must not reduce to an empty claimed id")
+	}
+	if len(got) > maxClaimedSessionIDLen {
+		t.Errorf("length = %d bytes, want <= %d", len(got), maxClaimedSessionIDLen)
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("result is not valid UTF-8: %q", got)
+	}
+
+	// A leading invalid byte inside an otherwise-valid, UNDER-limit header is also
+	// normalized: json.Marshal would otherwise rewrite it at serialization time, so the
+	// signed value would differ from what this function returned either way.
+	short := "sess-\xff-id"
+	if got := sanitizeClaimedID(short, maxClaimedSessionIDLen); !utf8.ValidString(got) {
+		t.Errorf("short invalid header not normalized: %q", got)
 	}
 }
 

@@ -48,6 +48,14 @@ const defaultControlTokenPath = "~/.eunox/control.token" //nolint:gosec // G101:
 //     without the sticky bit is refused outright: any local user can then rename the
 //     token file away and substitute their own, which hands them the emergency stop.
 //     That is an authorization hole, and the fail-closed rule applies.
+//
+// fi is the RESOLVED directory (os.Stat, symlinks followed), because the mode that
+// matters for both the warning and the refusal is the one that actually governs the
+// directory the token lands in. eunoxOwned is false whenever the path is a symlink, so
+// the chmod never fires through one: os.Chmod follows links, and there is no portable
+// lchmod, so tightening a symlinked ~/.eunox would silently rewrite the mode of whatever
+// it points at — /tmp losing its sticky bit being the worst case. Warning about a linked
+// directory is safe; mutating one eunox did not create is not.
 func tightenTokenDir(dir string, fi os.FileInfo, eunoxOwned bool) error {
 	perm := fi.Mode().Perm()
 	if perm&0o077 == 0 {
@@ -64,6 +72,29 @@ func tightenTokenDir(dir string, fi os.FileInfo, eunoxOwned bool) error {
 	}
 	fmt.Fprintf(os.Stderr, "[eunox] WARNING: control-token directory %q has mode %v (group/world-accessible); eunox does not tighten a pre-existing directory it did not create — restrict it to 0700 yourself to protect the loopback control token\n", dir, perm)
 	return nil
+}
+
+// eunoxOwnedTokenDir reports whether dir is eunox's OWN control-token directory — the
+// one the default --control-token-path lives in, which nothing else writes — and so may
+// be tightened in place.
+//
+// It compares resolved LOCATIONS, not the spelling of the flag. Keying on the raw string
+// made the identical directory take different security treatment depending on how the
+// operator typed it: a systemd unit cannot use "~", and an interactive shell expands it
+// before eunox ever sees the argument, so the deployments most likely to be carrying a
+// 0755 ~/.eunox left by an older release were exactly the ones the upgrade repair skipped.
+//
+// A symlink is never eunox-owned however it resolves: see tightenTokenDir on why the
+// chmod must not follow one.
+func eunoxOwnedTokenDir(dir string) bool {
+	if lfi, err := os.Lstat(dir); err != nil || lfi.Mode()&os.ModeSymlink != 0 {
+		return false
+	}
+	expandedDefault, err := expandHome(defaultControlTokenPath)
+	if err != nil {
+		return false
+	}
+	return filepath.Clean(dir) == filepath.Clean(filepath.Dir(expandedDefault))
 }
 
 // GenerateControlToken returns a fresh 256-bit random token, hex-encoded. A
@@ -111,14 +142,7 @@ func WriteControlTokenFile(path, token string) (string, error) {
 		if dirPreexisted {
 			// Reuse the FileInfo from the pre-existence stat above (MkdirAll does not
 			// touch an already-present dir), so the mode is read exactly once.
-			//
-			// "eunox's own" is keyed on the UNEXPANDED path matching the default, so an
-			// operator who spells out the same location absolutely gets the
-			// operator-chosen treatment (warn, never chmod). That errs toward not
-			// touching a directory whose mode someone typed a path to reach — the
-			// conservative direction — and the upgrade case this exists for is the
-			// default path, which is what an upgrade leaves behind.
-			if err := tightenTokenDir(dir, fi, path == defaultControlTokenPath); err != nil {
+			if err := tightenTokenDir(dir, fi, eunoxOwnedTokenDir(dir)); err != nil {
 				return "", err
 			}
 		}

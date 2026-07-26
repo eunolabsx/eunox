@@ -65,7 +65,11 @@ Section conventions:
   loops, retried when a concurrent kill races the scan) is not proportional to the
   interval — so lowering the interval for faster kill propagation, which the flag's own
   help text recommends, could make that denial **more** likely against a perfectly
-  healthy Redis. At the default 30s interval the window is unchanged (60s).
+  healthy Redis. At the default 30s interval the window is unchanged (60s). The floor is
+  a trade: for a refresh that *hangs* rather than errors — the one case this gate is the
+  sole detector — a 1s interval now serves the last-known cache for ~31s instead of ~2s
+  before failing closed. Faster kill *propagation* is unaffected; only this
+  hang-detection window no longer shrinks with the interval.
 - The session-cap refusal is recorded through the same route-stamped helper as the
   per-session in-flight cap, so one `RESOURCE_EXHAUSTED` code no longer produces two
   record shapes depending on which cap a flood happened to hit. It keeps the
@@ -74,7 +78,13 @@ Section conventions:
   older version left it looser, and a control-token path pointing at a group/world-
   **writable**, non-sticky directory is refused: any local user could substitute the
   token there and take over the loopback emergency stop. An operator-chosen directory
-  is still never chmod'ed (forcing 0700 on `/tmp` would strip its sticky bit).
+  is still never chmod'ed (forcing 0700 on `/tmp` would strip its sticky bit), and
+  neither is a symlinked one — `os.Chmod` follows links and there is no portable
+  `lchmod`, so tightening a symlinked `~/.eunox` would rewrite the mode of whatever it
+  points at. "eunox's own directory" is decided by resolved location, not by how the
+  operator spelled the flag: a systemd unit cannot write `~`, and a shell expands it
+  before eunox sees it, so keying on the raw string skipped exactly the deployments the
+  upgrade repair exists for.
 - **A refused `Content-Type` is now recorded** as the non-policy denial code
   `UNSUPPORTED_MEDIA_TYPE`, carrying only `details.header_count` — never the
   attacker-supplied header value. It was the one transport-level refusal leaving no
@@ -194,9 +204,13 @@ Section conventions:
   `descriptionHash` pin was never re-armed from that listing's bytes.
 - **`RedactURL` returned a single-slash-typo URL verbatim.** `https:/user:pass@host/x`
   parses with the credential in the path, which no scrub inspected, so the raw value
-  was printed. That shape and the scheme-less `user@host/path` form now take the
-  conservative whole-value redaction; a genuine authority-less URL (`file:///a@b/x`)
-  still keeps its path.
+  was printed. The guard is anchored on `url.Parse`'s own report that the value carried
+  no authority marker, not on a substring scan: a scan for `//` (or `://`) anywhere in
+  the string is defeated by one appearing later — in a path or a query
+  (`.../x?next=https://portal`) — which echoed the credential. A genuine authority-less
+  URL (`file:///a@b/x`) keeps its path, and a scheme-less value
+  (`/var/log/eunox@prod/audit.jsonl`) is left alone: it is an ordinary path, and audit
+  targets are commonly exactly that.
 - `trustedProxyHops` joined the gateway config's numeric-coercion guard. A leading-zero
   value (`trustedProxyHops: 010`) was silently read as YAML octal 8, so `sourceIP()`
   picked the wrong X-Forwarded-For entry as the client and misattributed the IP every
@@ -207,9 +221,27 @@ Section conventions:
 - The per-session notification-pool drop is recorded on the audit tape like its
   request-pool sibling. `notifications/cancelled` is the one an incident responder most
   needs, and stderr alone is not the tamper-evident trail.
-- The unverified `claimed_session_id` truncates on a rune boundary. A byte-level cut
-  left dangling continuation bytes that `json.Marshal` rewrote to U+FFFD, so the signed
-  value no longer matched the raw header a SIEM holds for the same request.
+- The unverified `claimed_session_id` is sanitized to valid UTF-8 and then truncated on
+  a rune boundary. A byte-level cut left dangling continuation bytes that `json.Marshal`
+  rewrote to U+FFFD, so the signed value no longer matched the raw header a SIEM holds;
+  and because Go admits bytes >= 0x80 in a header value, a rune walk-back applied to the
+  raw bytes could retreat to zero and stamp an EMPTY id for a full-length header.
+- `eunox kill --redis-addr` accepts `--killswitch-session-ttl`. The tombstone's TTL is
+  applied by whichever process WRITES it, and this is the only out-of-band revocation
+  channel a stdio proxy has — so a kill issued here carried the 30-day default even
+  when the proxy ran with a longer or never-expiring value, and the session came back.
+- A manifest-absent tool forwarded under `--audit` records its `sequenceBlock`
+  antecedent only when some `sequenceBlock` actually names it in `afterTools`. That
+  branch is the one antecedent site whose target name is not bounded by the manifest,
+  and each record costs a call-counter key for the history window — so recording every
+  made-up name let a caller mint keys until the counter capped, at which point the
+  record fails and the antecedent path returns a hard deny that `--audit` cannot
+  downgrade, turning an observe route into a deny-all route.
+- `redactFields` no longer masks an MCP-reserved result component wholesale when a
+  single-segment path names it (`isError` is a bool, `contents`/`messages` are arrays,
+  so a `"[redacted]"` string made the result undecodable). A dotted path *through* one
+  — `structuredContent.ssn`, the fully-qualified spelling the manifest guide recommends
+  — now resolves to the leaf it names instead of being skipped.
 - `eunox proxy` no longer leaks its cancel function, signal registration, or a failed
   Redis client. All three were unobservable while the function ended in `os.Exit`;
   returning an exit code made them real for any in-process caller.

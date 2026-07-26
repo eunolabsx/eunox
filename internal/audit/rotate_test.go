@@ -1316,18 +1316,19 @@ func TestPruneRotated_ClearsResolvedStallWithoutADelete(t *testing.T) {
 	}
 }
 
-// TestPruneRotated_RetentionDisabledClearsStall: turning retention off (retain 0) means
-// there is no bound left to enforce, so a stall recorded while one was in force must not
-// keep being reported.
-func TestPruneRotated_RetentionDisabledClearsStall(t *testing.T) {
+// TestPruneRotated_RetentionDisabledLeavesTheFlagAlone: with retention off there is no
+// retention stall to be in (the only setter requires retain > 0), and the flag is shared
+// with the rotation-ordinal deferral — so this pass must not write it at all. Clearing
+// unconditionally would erase a rotation stall while the size bound went unenforced.
+func TestPruneRotated_RetentionDisabledLeavesTheFlagAlone(t *testing.T) {
 	t.Parallel()
 	s := &Sink{logPath: filepath.Join(t.TempDir(), "audit.jsonl"), retain: 0}
-	s.markMaintenanceStalled("retention stalled: an older sibling could not be deleted")
+	s.markMaintenanceStalled("rotation deferred: the sibling directory cannot be listed")
 
 	s.pruneRotated()
 
-	if stalled, _ := s.MaintenanceStalled(); stalled {
-		t.Fatal("a stall must not outlive the retention bound that recorded it")
+	if stalled, _ := s.MaintenanceStalled(); !stalled {
+		t.Fatal("retention pruning must not clear a stall belonging to rotation")
 	}
 }
 

@@ -190,3 +190,21 @@ func TestStaleness_LowIntervalDoesNotDenyAHealthyBackend(t *testing.T) {
 		t.Fatalf("past the floored budget the cache must still fail closed, got %v", err)
 	}
 }
+
+// TestStaleness_NeverNegative: an absurd reconcile interval near the int64 duration
+// ceiling overflows both terms of the budget. A negative result makes staleLocked true
+// forever, which in the default fail-closed mode denies every request against a perfectly
+// healthy backend — the exact outage the floor exists to prevent, arrived at from the
+// other direction.
+func TestStaleness_NeverNegative(t *testing.T) {
+	t.Parallel()
+	for _, iv := range []time.Duration{
+		time.Duration(1<<62 - 1),
+		time.Duration(1<<63 - 1),
+	} {
+		r := &Redis{reconcileInterval: iv}
+		if got := r.staleness(); got <= 0 {
+			t.Errorf("staleness(interval=%v) = %v, want a positive budget", iv, got)
+		}
+	}
+}

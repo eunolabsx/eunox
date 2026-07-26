@@ -240,3 +240,36 @@ func TestKillswitchSessionTTLFlag_IsRedisGated(t *testing.T) {
 	t.Parallel()
 	require.Contains(t, redisGatedFlags, "killswitch-session-ttl")
 }
+
+// TestKillViaRedis_HonorsSessionKillTTL: the TTL is applied by whichever process WRITES
+// the tombstone, and `eunox kill --redis-addr` is the only out-of-band revocation channel
+// a stdio proxy has — the deployment the flag exists for. Building the manager without
+// the option here stamped the 30-day default on a kill the operator had configured to
+// never expire, so the revoked session came back.
+func TestKillViaRedis_HonorsSessionKillTTL(t *testing.T) {
+	mr := miniredis.RunT(t)
+
+	// Negative: expiry disabled, so the tombstone must carry no TTL.
+	if err := killViaRedis(mr.Addr(), "", false, -1, "sess-permanent"); err != nil {
+		t.Fatalf("killViaRedis: %v", err)
+	}
+	if ttl := mr.TTL("killswitch:session:sess-permanent"); ttl != 0 {
+		t.Errorf("TTL = %v, want 0 (no expiry) for a negative --killswitch-session-ttl", ttl)
+	}
+
+	// An explicit positive value is applied verbatim, not replaced by the default.
+	if err := killViaRedis(mr.Addr(), "", false, 90*time.Minute, "sess-short"); err != nil {
+		t.Fatalf("killViaRedis: %v", err)
+	}
+	if ttl := mr.TTL("killswitch:session:sess-short"); ttl != 90*time.Minute {
+		t.Errorf("TTL = %v, want 90m", ttl)
+	}
+
+	// 0 selects the documented default.
+	if err := killViaRedis(mr.Addr(), "", false, 0, "sess-default"); err != nil {
+		t.Fatalf("killViaRedis: %v", err)
+	}
+	if ttl := mr.TTL("killswitch:session:sess-default"); ttl != killswitch.DefaultSessionKillTTL {
+		t.Errorf("TTL = %v, want the %v default", ttl, killswitch.DefaultSessionKillTTL)
+	}
+}

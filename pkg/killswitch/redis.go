@@ -679,14 +679,36 @@ const maxRefreshCycleBudget = 30 * time.Second
 // when a refresh COMPLETES: the next tick fires an interval later and then takes up to a
 // cycle to finish, so the age at the moment of the next successful stamp is legitimately
 // interval + cycle even when nothing is wrong. At the default 30s interval the floor and
-// the multiple coincide exactly (60s), so only a lowered interval — the self-DoS case —
-// sees any change.
+// the multiple coincide exactly (60s), so only a lowered interval sees any change.
+//
+// The floor is a TRADE, and it runs against revocation latency in the one case the
+// staleness gate is the sole detector: a refresh that HANGS rather than errors (a
+// blackholed or half-open connection). An outright failure latches lastRefreshErr and
+// livenessLocked reports killRefreshFailed before ever consulting staleness, so only the
+// hang reaches here. For that case an operator who set --killswitch-reconcile-interval to
+// 1s now serves the last-known cache for ~31s instead of ~2s before failing closed, so a
+// kill issued elsewhere during the hang goes unenforced for that much longer.
+//
+// It is still the right default: without the floor, the same operator's HEALTHY Redis was
+// judged stale whenever one ordinary refresh cycle outran two intervals, and fail-closed
+// mode then denied ALL traffic — a certain, self-inflicted outage traded against a longer
+// window on a rare failure mode. Tuning the interval down for faster kill PROPAGATION
+// (the pub/sub-miss reconvergence the flag's help describes) still works exactly as
+// documented; it is only this hang-detection window that no longer shrinks with it.
 func (r *Redis) staleness() time.Duration {
 	iv := r.reconcileInterval
 	if iv <= 0 {
 		iv = defaultReconcileInterval
 	}
-	return max(2*iv, iv+maxRefreshCycleBudget)
+	budget := max(2*iv, iv+maxRefreshCycleBudget)
+	if budget <= 0 {
+		// Both terms overflowed int64 (an absurd interval near the duration ceiling). A
+		// negative budget makes staleLocked true forever, which in fail-closed mode denies
+		// every request against a perfectly healthy backend — fail back to the floor
+		// rather than to a total outage.
+		return maxRefreshCycleBudget
+	}
+	return budget
 }
 
 // staleLocked reports whether the cache has gone too long without a confirmed refresh.

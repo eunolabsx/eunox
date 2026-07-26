@@ -631,6 +631,12 @@ type ManifestPDP struct {
 	// plain hash string suffices — no in-band conflict sentinel is threaded into the hot path.
 	pinnedTools map[string]string
 
+	// sequenceAntecedents is the set of bare tool names some sequenceBlock condition
+	// names in its afterTools, built once at construction and never mutated. It bounds
+	// which MANIFEST-ABSENT targets are worth recording an audit-mode antecedent for:
+	// only a name a later sequenceBlock can actually query needs history. See
+	// decideTarget's no-match branch.
+	sequenceAntecedents map[string]struct{}
 	// anyLabelOutput is true when at least one capability carries a labelOutput directive.
 	// It gates the union scan (constraintWithUnionLabelOutput): a source read's taint is
 	// the union of labelOutput across ALL entries matching the request, not only the one
@@ -687,7 +693,37 @@ func NewManifestPDP(caps []capability.Constraint, engine *enforcement.Engine, ks
 			break
 		}
 	}
-	return &ManifestPDP{caps: caps, parsedTargets: parsed, engine: engine, ks: ks, observedToolHash: make(map[string]string), pinnedTools: pinned, anyLabelOutput: anyLabelOutput}
+	return &ManifestPDP{caps: caps, parsedTargets: parsed, engine: engine, ks: ks, observedToolHash: make(map[string]string), pinnedTools: pinned, sequenceAntecedents: collectSequenceAntecedents(caps), anyLabelOutput: anyLabelOutput}
+}
+
+// collectSequenceAntecedents gathers every bare tool name any sequenceBlock condition
+// lists in afterTools, normalized the way handleSequenceBlock normalizes them so the two
+// agree on what counts as the same name. Built once, read-only thereafter.
+func collectSequenceAntecedents(caps []capability.Constraint) map[string]struct{} {
+	var names map[string]struct{}
+	for i := range caps {
+		for _, cond := range caps[i].Conditions {
+			sb, ok := cond.(capability.SequenceBlockCondition)
+			if !ok {
+				p, isPtr := cond.(*capability.SequenceBlockCondition)
+				if !isPtr || p == nil {
+					continue
+				}
+				sb = *p
+			}
+			for _, prior := range sb.AfterTools {
+				bare := strings.TrimSpace(enforcement.StripEnginePrefix(prior))
+				if bare == "" {
+					continue
+				}
+				if names == nil {
+					names = make(map[string]struct{})
+				}
+				names[bare] = struct{}{}
+			}
+		}
+	}
+	return names
 }
 
 // engineClock returns the engine's clock so decideTarget's hand-built denies
@@ -959,8 +995,21 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 		// the targets an observe run exists to discover. matched is nil, which the
 		// antecedent path handles: no constraint means no flow relevance, so only the
 		// sequenceBlock antecedent is committed.
-		if override := recordAuditModeAntecedent(ctx, p.engine, p.engineClock(), req, nil, &resp); override != nil {
-			return *override
+		//
+		// Gated on the name being one some sequenceBlock actually lists in afterTools.
+		// This branch is the ONLY antecedent site whose target name is not bounded by the
+		// manifest, and the record costs a call-counter key that lives for the history
+		// window: recording every unlisted name let a caller on an observe route mint one
+		// key per made-up tool name until the counter hit its cap, at which point the
+		// record FAILS and recordAuditModeAntecedent returns a hard deny — non-downgradable
+		// even under --audit. An observe route whose whole contract is "log, never block"
+		// would then start hard-denying every call, listed tools included. A name no
+		// sequenceBlock can query has no history worth keeping, so skipping it costs the
+		// guarantee nothing and bounds the key space to manifest-authored names.
+		if _, queryable := p.sequenceAntecedents[target.Name]; queryable {
+			if override := recordAuditModeAntecedent(ctx, p.engine, p.engineClock(), req, nil, &resp); override != nil {
+				return *override
+			}
 		}
 		return resp
 	}

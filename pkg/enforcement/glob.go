@@ -70,34 +70,41 @@ func containsEncodedSeparator(s string) bool {
 // encoded-separator token, so eliding a class cannot splice one into existence.
 const globClassPlaceholder = '\x00'
 
-// patternLiteralsOutsideClasses renders a glob pattern with every bracket class
-// replaced by a single placeholder, leaving only the characters path.Match compares
-// literally. A '%', '2' or 'f' written INSIDE a class ("[a%2f]") is a class MEMBER —
-// the class consumes one value character — so such a pattern is a live grant and
-// must not be read as an encoded separator. Mirrors path.Match's scanChunk: '[' opens a
-// class and ']' closes an OPEN one (no nesting) while a ']' with no class open is an
-// ordinary literal, and a backslash-escaped character is a single literal unit that
-// neither opens nor closes one. The scan is deliberately literal-only: a token split by a
-// wildcard ("%2*f") still loads, matching the fail-closed direction — this rejects
-// unmatchable grants, it is not a security boundary.
+// scanPatternLiterals walks a glob pattern once and hands emit each byte path.Match
+// compares LITERALLY — bracket classes elided to a single placeholder, backslash escapes
+// resolved to the character they escape.
 //
-// Two callers read this one rendering for two questions: ValidateValueGlob asks whether
-// the literal text hides an encoded separator, and confinePathStylePattern counts its '/'
-// to get the separators path.Match requires. They must agree on what counts as literal —
-// a second hand-mirrored scanChunk walk is exactly how they would drift apart.
-func patternLiteralsOutsideClasses(pattern string) string {
-	var b strings.Builder
+// It is the one definition of "what counts as a literal" in a glob pattern, driven by two
+// callers asking two different questions of the same walk: ValidateValueGlob asks whether
+// the literal text hides an encoded path separator, and confinePathStylePattern counts the
+// '/' that path.Match therefore requires. A second hand-mirrored scanChunk walk is exactly
+// how those two would drift apart — and the count enforces subtree confinement, so a drift
+// there is a security boundary moving.
+//
+// The callback form is what lets them share the walk without sharing a rendering: the
+// counter accumulates an int with no allocation (it runs per path-style allowedValues
+// pattern on every enforced call), while the validator builds a string. Materializing a
+// string for the counter's benefit put a per-request allocation on the enforcement path
+// for a question that needs none.
+//
+// Mirrors path.Match's scanChunk: '[' opens a class and ']' closes an OPEN one (no
+// nesting) while a ']' with no class open is an ordinary literal, and a backslash-escaped
+// character is a single literal unit that neither opens nor closes one. The scan is
+// deliberately literal-only: a token split by a wildcard ("%2*f") still loads, matching
+// the fail-closed direction — this rejects unmatchable grants, it is not a security
+// boundary.
+func scanPatternLiterals(pattern string, emit func(byte)) {
 	inClass := false
 	for i := 0; i < len(pattern); i++ {
 		switch {
 		case pattern[i] == '\\' && i+1 < len(pattern):
 			i++
 			if !inClass {
-				b.WriteByte(pattern[i])
+				emit(pattern[i])
 			}
 		case pattern[i] == '[':
 			if !inClass {
-				b.WriteByte(globClassPlaceholder)
+				emit(globClassPlaceholder)
 			}
 			inClass = true
 		case pattern[i] == ']':
@@ -107,17 +114,41 @@ func patternLiteralsOutsideClasses(pattern string) string {
 			// adjacent in the pattern can then read as an encoded separator ("a%2]f" would
 			// render "a%2f"), rejecting a valid, matchable grant at load.
 			if !inClass {
-				b.WriteByte(pattern[i])
+				emit(pattern[i])
 				break
 			}
 			inClass = false
 		default:
 			if !inClass {
-				b.WriteByte(pattern[i])
+				emit(pattern[i])
 			}
 		}
 	}
+}
+
+// patternLiteralsOutsideClasses renders a glob pattern with every bracket class replaced
+// by a single placeholder, leaving only the characters path.Match compares literally. A
+// '%', '2' or 'f' written INSIDE a class ("[a%2f]") is a class MEMBER — the class consumes
+// one value character — so such a pattern is a live grant and must not be read as an
+// encoded separator. See scanPatternLiterals for the walk.
+func patternLiteralsOutsideClasses(pattern string) string {
+	var b strings.Builder
+	b.Grow(len(pattern))
+	scanPatternLiterals(pattern, func(c byte) { _ = b.WriteByte(c) })
 	return b.String()
+}
+
+// countPatternPathSeparators counts the '/' characters scanPatternLiterals emits — the
+// separators path.Match treats as required. Allocation-free: it drives the shared walk
+// with a counter rather than materializing the rendered string.
+func countPatternPathSeparators(pattern string) int {
+	n := 0
+	scanPatternLiterals(pattern, func(b byte) {
+		if b == '/' {
+			n++
+		}
+	})
+	return n
 }
 
 // maxGlobSegments caps the '/'-separated segment count a "**" pattern matches, so
@@ -224,11 +255,9 @@ func confinePathStylePattern(pattern, value string) (folded string, valSpansSep 
 		// pattern-side '/' that path.Match treats as a required separator: a '/' inside a
 		// bracket class is a class MEMBER (the class consumes exactly one value
 		// character, which may or may not be '/'), and an escaped '\/' outside one is a
-		// literal separator. patternLiteralsOutsideClasses renders exactly that view —
-		// classes elided to a placeholder, escapes resolved to their literal — so
-		// counting its '/' is the whole rule, on the same scan the load-time
-		// encoded-separator check uses rather than a second hand-mirrored one.
-		if strings.Count(patternLiteralsOutsideClasses(pattern), "/") != valueSlashes {
+		// literal separator. countPatternPathSeparators drives the SAME scan the
+		// load-time encoded-separator check uses, so the two cannot drift.
+		if countPatternPathSeparators(pattern) != valueSlashes {
 			return folded, nil, false
 		}
 		return folded, nil, true

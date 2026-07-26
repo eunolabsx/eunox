@@ -419,16 +419,35 @@ func (p *HTTPProxy) checkOrigin(w http.ResponseWriter, r *http.Request) bool {
 // MaxHeaderBytes) to the tape, turning the refusal record into a log-flooding primitive.
 const maxClaimedSessionIDLen = 200
 
-// truncateRunes cuts s to at most limit BYTES without splitting a UTF-8 rune, walking
-// back to the nearest rune start (at most 3 bytes). The bound stays a byte bound — it
-// exists to cap what an attacker-controlled header can append to a record — while the
-// result stays valid UTF-8, so json.Marshal emits the retained prefix verbatim instead
-// of rewriting a dangling continuation byte to U+FFFD.
-func truncateRunes(s string, limit int) string {
-	if limit <= 0 || len(s) <= limit {
-		if limit <= 0 {
-			return ""
-		}
+// sanitizeClaimedID makes an attacker-controlled header value safe to put in a signed
+// audit field: it replaces any invalid UTF-8 with the replacement character, then cuts to
+// at most limit BYTES without splitting a rune.
+//
+// Both halves are load-bearing, and the byte cut alone is not enough. Go's net/http
+// admits bytes >= 0x80 in a header value, so the raw Mcp-Session-Id can be arbitrary
+// bytes:
+//
+//   - Without the ToValidUTF8 pass, json.Marshal silently rewrites those bytes to U+FFFD
+//     when the record is serialized, so the signed field diverges from the header a SIEM
+//     holds — with or without truncation, since a short invalid header is never cut at
+//     all. Replacing them here makes the substitution explicit and identical on both
+//     sides of the wire instead of an artifact of the encoder.
+//   - Without the rune-boundary walk, the cut lands mid-rune and produces the same
+//     silent U+FFFD rewrite for a perfectly valid multi-byte header.
+//
+// Order matters: sanitizing FIRST means the walk-back only ever skips real continuation
+// bytes and so drops at most 3, where cutting first could walk a run of attacker-chosen
+// 0x80 bytes all the way to zero and stamp an EMPTY claimed_session_id on a request that
+// carried a 300-byte header — discarding the correlation evidence the field exists for.
+//
+// The bound stays a BYTE bound: it exists to cap what an unauthenticated caller can
+// append to a record, and that is a byte budget.
+func sanitizeClaimedID(s string, limit int) string {
+	s = strings.ToValidUTF8(s, string(utf8.RuneError))
+	if limit <= 0 {
+		return ""
+	}
+	if len(s) <= limit {
 		return s
 	}
 	keep := limit
@@ -449,14 +468,11 @@ func addClaimedSessionID(details map[string]interface{}, r *http.Request) map[st
 	if details == nil {
 		details = make(map[string]interface{}, 1)
 	}
-	if len(claimed) > maxClaimedSessionIDLen {
-		// Cut back to a rune boundary. A plain byte slice can land mid-rune, and
-		// json.Marshal then silently substitutes U+FFFD for the dangling bytes — so the
-		// signed claimed_session_id no longer matches the raw header a SIEM holds for the
-		// same request, which is the one thing this field exists to support. Rune-aware
-		// bounding is what the schema MaxLength check and the audit package's own field
-		// bounding already do; this is the same rule.
-		claimed = truncateRunes(claimed, maxClaimedSessionIDLen)
+	if sanitized := sanitizeClaimedID(claimed, maxClaimedSessionIDLen); sanitized != claimed {
+		// The value was invalid UTF-8, over the bound, or both. Flag it so a reader knows
+		// the field is not the header verbatim; sanitizeClaimedID documents which
+		// substitutions it makes.
+		claimed = sanitized
 		details["claimed_session_id_truncated"] = true
 	}
 	details["claimed_session_id"] = claimed

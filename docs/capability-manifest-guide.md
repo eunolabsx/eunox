@@ -1856,9 +1856,15 @@ before it is returned to the caller: each matched field keeps its key but has it
 value replaced by the placeholder string `"[redacted]"`, so the caller can see
 that the field was present without ever seeing its value. Matching is recursive
 (nested objects and array elements) and is applied to every JSON **text** content
-item **and** to the `structuredContent` object. Binary media content the proxy
-cannot address (images, audio) and metadata (`_meta`, content annotations) are
-preserved unchanged.
+item, to the `structuredContent` object, **and to the result envelope itself** — a
+field sitting directly on a top-level result key (`{"content":[...],"ssn":"..."}`)
+is masked just like one nested inside a sibling key's value. A single-segment path
+naming an MCP-reserved component (`content`, `structuredContent`, `isError`,
+`contents`, `messages`, `_meta`) is left to that component's own handling rather
+than masking the whole component, which would hand the host a result it cannot
+decode; a dotted path *through* one (`structuredContent.ssn`) resolves normally and
+masks that leaf. Binary media content the proxy cannot address (images, audio) and
+metadata (`_meta`, content annotations) are preserved unchanged.
 
 > **`resource` / `resource_link` content fails closed under an active `redactFields`.**
 > A `resource` or `resource_link` content item nests a `resource` object that can carry

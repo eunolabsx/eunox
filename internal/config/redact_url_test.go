@@ -57,11 +57,20 @@ func TestRedactURL_ExactOutputs(t *testing.T) {
 		// Single-slash scheme typo: url.Parse puts the whole credentialed authority in
 		// u.Path, which no scrub inspects, so this used to be returned verbatim.
 		"https:/alice:SECRET@host/mcp": "<redacted unparseable URL>",
-		// Scheme-less "user@host/path": same shape, same fail-safe outcome.
-		"alice@host/mcp": "<redacted unparseable URL>",
+		// The same typo carrying "//" LATER in the value. A guard that scanned the whole
+		// string for "//" (or for "://") skipped these and echoed the credential — the
+		// authority marker has to be located positionally, not by substring.
+		"https:/svc:hunter2@mcp.internal/a//b":                    "<redacted unparseable URL>",
+		"https:/svc:hunter2@mcp.internal/sse?next=https://portal": "<redacted unparseable URL>",
 		// An authority-less hierarchical URL keeps its path: the empty authority is
 		// explicit ("//"), so the '@' really is a path character, not a typo'd credential.
 		"file:///home/a@b/x": "file:///home/a@b/x",
+		// A scheme-LESS value is an ordinary path, not a credentialed URL, and carries no
+		// password (the "user:pw@host/path" form parses as an opaque scheme and is caught
+		// above). The audit-tail targets this redactor is pointed at are commonly exactly
+		// these, so redacting them would destroy what an operator opens a bundle to read.
+		"/var/log/eunox@prod/audit.jsonl": "/var/log/eunox@prod/audit.jsonl",
+		"alice@host/mcp":                  "alice@host/mcp",
 	}
 	for in, want := range cases {
 		if got := RedactURL(in); got != want {
@@ -104,8 +113,9 @@ func TestRedactURL_MalformedNeverLeaksPassword(t *testing.T) {
 		// it — so `changed` stayed false and the raw value went straight to stderr.
 		"https:/alice:super-secret@host/mcp",
 		"http:/alice:super-secret@host/mcp?token=xyz",
-		// Scheme-less "user@host/path" with no colon: also lands wholly in u.Path.
-		"alice-super-secret@host.com/path",
+		// The single-slash typo with "//" appearing later, which a substring scan missed.
+		"https:/alice:super-secret@host/a//b",
+		"https:/alice:super-secret@host/x?next=https://portal",
 	} {
 		if got := RedactURL(in); strings.Contains(got, "super-secret") {
 			t.Errorf("RedactURL(%q) leaked the password: %q", in, got)

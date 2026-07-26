@@ -511,6 +511,44 @@ func redactJSONValue(val interface{}, paths []string) bool {
 // refusing them would break honest upstreams, while masking is exactly what the operator
 // asked for. Reuses structuredContent's container walk, so a doubly-encoded JSON string
 // leaf is unwrapped identically and the depth bound applies the same way.
+// mcpReservedRootKeys are the MCP result-envelope keys that carry protocol STRUCTURE
+// rather than tool data: the two content components, the CallToolResult error flag, the
+// ReadResourceResult and GetPromptResult payload arrays, and the metadata sidecar.
+//
+// The envelope-root redaction pass masks a named key wholesale with the string sentinel,
+// which is right for an unmodelled sibling carrying data but wrong for these: `isError` is
+// a bool and `contents`/`messages` are arrays, so replacing one with "[redacted]" yields a
+// result a spec-conformant host cannot decode at all — a hard protocol failure in place of
+// the field-level masking the operator asked for. content/structuredContent additionally
+// have their own shape-specific passes, which redact WITHIN them.
+var mcpReservedRootKeys = map[string]struct{}{
+	"content":           {},
+	"structuredContent": {},
+	"isError":           {},
+	"contents":          {},
+	"messages":          {},
+	"_meta":             {},
+}
+
+// envelopeRootExempt reports whether a redact path must not be applied at the envelope
+// root. Only a SINGLE-SEGMENT path naming a reserved component is exempt — that spelling
+// would mask the whole component.
+//
+// A dotted path is deliberately NOT exempt, and the distinction is load-bearing: the
+// manifest guide tells operators to "prefer the fully-qualified dotted path when the field
+// is nested", so `structuredContent.ssn` is the recommended spelling for a field inside
+// structuredContent. Anchored at the root it resolves exactly — result["structuredContent"]
+// ["ssn"] — and masks that leaf alone. Exempting it by its HEAD instead would have made the
+// recommended spelling redact nothing at all while the audit record still reported the
+// obligation applied, which is the fail-open this whole pass exists to close.
+func envelopeRootExempt(path string) bool {
+	if strings.Contains(path, ".") {
+		return false
+	}
+	_, reserved := mcpReservedRootKeys[path]
+	return reserved
+}
+
 func redactSiblingTopLevelKeys(result map[string]interface{}, paths []string) (bool, error) {
 	changed := false
 	// Match the paths against the ENVELOPE itself before descending into its values. The
@@ -521,11 +559,11 @@ func redactSiblingTopLevelKeys(result map[string]interface{}, paths []string) (b
 	// obligation, same field name, opposite outcome depending on how deep the upstream
 	// happened to put it.
 	//
-	// Paths rooted at content/structuredContent are skipped: those two keys have their own
-	// shape-specific passes in ApplyRedactObligs (which redact WITHIN them rather than
-	// masking the whole component), and this pass must not reach past that rigor.
+	// A path naming a protocol-reserved component OUTRIGHT is skipped: see
+	// envelopeRootExempt. A DOTTED path through one is not — it names a leaf, and masking
+	// that leaf is exactly what the operator asked for.
 	for _, p := range paths {
-		if head, _, _ := strings.Cut(p, "."); head == "content" || head == "structuredContent" {
+		if envelopeRootExempt(p) {
 			continue
 		}
 		if redactDotPathRec(result, p) {
