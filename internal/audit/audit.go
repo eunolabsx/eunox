@@ -1439,7 +1439,8 @@ func truncatePartialTail(f *os.File) (auditTailState, error) {
 	// the window can no longer be trusted to hold the log's true tail, so the
 	// chain-resume line is withheld (lastOK stays false) and Open re-reads, landing on
 	// readLastAuditLine's explicit errAuditFileShrunk path exactly as before.
-	trustTail := !(errors.Is(err, io.EOF) && n < len(buf))
+	shortRead := errors.Is(err, io.EOF) && n < len(buf)
+	trustTail := !shortRead
 	buf = buf[:n]
 	// resumeFrom packages the extracted line with the two conditions that make it
 	// trustworthy as a chain-resume point. See the atWindowStart note below.

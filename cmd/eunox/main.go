@@ -1267,7 +1267,8 @@ func resolveOAuthMetadata(cfg *config.GatewayConfig, pf proxyFlags) (*transport.
 		// Same silent-override as the resource above: name the dropped flag. Warn only
 		// when the flag actually loses something — a single config entry equal to the
 		// flag drops nothing, and warning there trains operators to ignore the message.
-		if pf.oauthAuthzServer != "" && !(len(oauthAuthzServers) == 1 && oauthAuthzServers[0] == pf.oauthAuthzServer) {
+		flagAlreadyCovered := len(oauthAuthzServers) == 1 && oauthAuthzServers[0] == pf.oauthAuthzServer
+		if pf.oauthAuthzServer != "" && !flagAlreadyCovered {
 			fmt.Fprintf(os.Stderr, "[eunox] WARNING: --oauth-authorization-server %q is overridden by the config's listen.oauthAuthorizationServers %v; the config takes precedence.\n", pf.oauthAuthzServer, oauthAuthzServers)
 		}
 	case pf.oauthAuthzServer != "":
