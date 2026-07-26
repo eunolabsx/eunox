@@ -2742,8 +2742,10 @@ func TestRecordBoundsDetailsBeforeEnqueue(t *testing.T) {
 	s := &Sink{records: make(chan auditRecord, 1)}
 
 	big := strings.Repeat("x", auditDetailValueCap+1)
-	s.Record(context.Background(), "", "", "", "sess", "tool", "tools/call",
-		"allow", "", "", map[string]interface{}{"body": big}, nil, true, nil, nil)
+	s.Record(context.Background(), RecordParams{
+		SessionID: "sess", Identifier: "tool", Method: "tools/call", Decision: "allow",
+		Details: map[string]interface{}{"body": big}, AuditOnly: true,
+	})
 
 	select {
 	case rec := <-s.records:
@@ -2871,6 +2873,52 @@ func TestBoundFieldToTruncatesOnRuneBoundary(t *testing.T) {
 		if !utf8.ValidString(got) {
 			t.Errorf("boundFieldTo(s, %d) produced invalid UTF-8: %q", limit, got)
 		}
+	}
+}
+
+// TestBoundFieldToSanitizesInvalidUTF8 is the regression for the false-positive
+// audit-verify rejection found reviewing the canonical-form check: encoding/json's
+// Marshal is not idempotent across a decode-then-re-encode round trip for a string
+// holding invalid UTF-8 (a lone invalid byte marshals to the literal escape text
+// `�` the first time, but decoding that and re-marshaling the resulting valid
+// U+FFFD rune emits its raw UTF-8 bytes instead — two different on-disk forms for
+// what is nominally one value). Every caller of boundFieldTo passes a field that can
+// hold raw, unvalidated bytes (SessionID from the Mcp-Session-Id HTTP header,
+// Target/Method envelope fields, JWT-claim identity fields), so normalizing here,
+// before the value is ever marshaled the first time, is what restores the
+// marshal round-trip idempotency both the HMAC recompute and VerifyRecord's
+// canonical-form check depend on.
+func TestBoundFieldToSanitizesInvalidUTF8(t *testing.T) {
+	got := boundFieldTo("sess-\xc3-tail", auditSessionIDCap)
+	if !utf8.ValidString(got) {
+		t.Fatalf("boundFieldTo must always return valid UTF-8, got invalid: %q", got)
+	}
+	want := "sess-�-tail"
+	if got != want {
+		t.Fatalf("boundFieldTo(%q, %d) = %q, want %q (the invalid byte replaced with U+FFFD)", "sess-\xc3-tail", auditSessionIDCap, got, want)
+	}
+
+	// Idempotency: marshaling the sanitized value, decoding it, and marshaling again
+	// must reproduce the identical bytes — the property the whole fix exists for.
+	body1, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded string
+	if err := json.Unmarshal(body1, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	body2, err := json.Marshal(decoded)
+	if err != nil {
+		t.Fatalf("re-marshal: %v", err)
+	}
+	if !bytes.Equal(body1, body2) {
+		t.Fatalf("sanitized value is not round-trip idempotent: first marshal %s, second marshal %s", body1, body2)
+	}
+
+	// A value that is already valid UTF-8 must pass through unchanged.
+	if got := boundFieldTo("clean-session-id", auditSessionIDCap); got != "clean-session-id" {
+		t.Errorf("boundFieldTo must not alter an already-valid string, got %q", got)
 	}
 }
 
@@ -3307,8 +3355,10 @@ func TestRecordBoundsObligationsBeforeEnqueue(t *testing.T) {
 	for i := range big {
 		big[i] = fmt.Sprintf("redactFields:$.deeply.nested.path.segment.%d", i)
 	}
-	s.Record(context.Background(), "", "", "", "sess", "tool", "tools/call",
-		"allow", "", "", nil, big, true, nil, nil)
+	s.Record(context.Background(), RecordParams{
+		SessionID: "sess", Identifier: "tool", Method: "tools/call", Decision: "allow",
+		Obligations: big, AuditOnly: true,
+	})
 
 	select {
 	case rec := <-s.records:

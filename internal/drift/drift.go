@@ -717,9 +717,13 @@ func anyToolMatches(resource string, tools []UpstreamTool) bool {
 // constraint for a clean tool (CheckManifestDrift surfaces no warning for one).
 func BestManifestConstraint(manifest *config.LocalManifest, toolName string) *capability.Constraint {
 	// coveringConstraints already selects the maximum-specificity tier in declaration
-	// order. Prefer a descriptionHash-pinned member on a tie: FM-5 verification only
-	// runs for the SELECTED constraint, so plain first-in-order tie-breaking would
-	// silently skip a pin. Otherwise return the first (declaration-order) member.
+	// order. Prefer a descriptionHash-pinned member on a tie purely for what the
+	// REPORT displays: the sole caller is validate --live's COVERED line, which uses
+	// the result only for its Target string, and naming the pinned entry is the more
+	// informative answer when several equally-specific constraints cover the tool.
+	// Nothing enforcement-relevant rides on this pick — CheckManifestDrift runs the
+	// FM-5 hash verification for EVERY covering constraint, not just the one chosen
+	// here, so a pin cannot be skipped by tie-breaking the other way.
 	covering := coveringConstraints(manifest, toolName)
 	if len(covering) == 0 {
 		return nil

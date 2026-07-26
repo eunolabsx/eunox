@@ -1427,7 +1427,17 @@ func truncatePartialTail(f *os.File) (int64, error) {
 // enforced allow (audit mode): the would-be verdict is logged with full arguments
 // and the call forwarded.
 func (s *Sink) RecordAllow(ctx context.Context, sessionID, identifier, method string, details map[string]interface{}, obligs []string, auditOnly bool, labelsOut, carriedLabels []string) {
-	s.Record(ctx, "", "", "", sessionID, identifier, method, "allow", "", "", details, obligs, auditOnly, labelsOut, carriedLabels)
+	s.Record(ctx, RecordParams{
+		SessionID:     sessionID,
+		Identifier:    identifier,
+		Method:        method,
+		Decision:      "allow",
+		Details:       details,
+		Obligations:   obligs,
+		AuditOnly:     auditOnly,
+		LabelsOut:     labelsOut,
+		CarriedLabels: carriedLabels,
+	})
 }
 
 // RecordDeny enqueues a deny audit record (see RecordAllow for the shared
@@ -1437,8 +1447,18 @@ func (s *Sink) RecordAllow(ctx context.Context, sessionID, identifier, method st
 func (s *Sink) RecordDeny(ctx context.Context, sessionID, identifier, method, denialCode, condType string, details map[string]interface{}, observe bool) {
 	// A deny carries no labels_out (the call produced no output) and no carried_labels:
 	// a flowLabel deny already names the offending label in its structured details, so
-	// the deny path stays on the narrow signature and passes nil for both.
-	s.Record(ctx, "", "", "", sessionID, identifier, method, "deny", denialCode, condType, details, nil, observe, nil, nil)
+	// the deny path leaves both unset. Obligations likewise stay unset — a deny never
+	// carries any.
+	s.Record(ctx, RecordParams{
+		SessionID:     sessionID,
+		Identifier:    identifier,
+		Method:        method,
+		Decision:      "deny",
+		DenialCode:    denialCode,
+		ConditionType: condType,
+		Details:       details,
+		AuditOnly:     observe,
+	})
 }
 
 // clock returns the sink's current time via the injected now func, falling back
@@ -1450,17 +1470,48 @@ func (s *Sink) clock() time.Time {
 	return time.Now()
 }
 
-// Record is the gateway-aware variant: upstream, policyVersion, and policySHA256
-// stamp the route name and in-force policy provenance. RecordAllow/RecordDeny
-// forward here with empty values for the single-upstream/stdio path; gateway
-// routeSinks call it directly.
-func (s *Sink) Record(ctx context.Context, upstream, policyVersion, policySHA256, sessionID, identifier, method, decision, denialCode, condType string, details map[string]interface{}, obligs []string, auditOnly bool, labelsOut, carriedLabels []string) {
+// RecordParams carries one audit record's fields from the call site into Record.
+//
+// It is a struct rather than a parameter list because the fields it replaced were
+// nine consecutive strings (upstream, policy version, policy digest, session,
+// identifier, method, decision, denial code, condition type): any two of them
+// transposed at a call site compiles cleanly and silently writes the wrong values
+// into structured audit fields — a corrupted trail that nothing downstream can
+// detect, since each field still holds a well-formed string. Named fields make a
+// transposition a compile error or an obvious misspelling at the call site.
+//
+// Identifier is the raw MCP target (tool name, resource URI, "prompts/<name>", or
+// "sampling/createMessage"); target_type/target are derived from it together with
+// Method. Upstream, PolicyVersion, and PolicySHA256 are the gateway route name and
+// in-force policy provenance, left empty on the single-upstream/stdio path.
+type RecordParams struct {
+	Upstream      string
+	PolicyVersion string
+	PolicySHA256  string
+	SessionID     string
+	Identifier    string
+	Method        string
+	Decision      string
+	DenialCode    string
+	ConditionType string
+	Details       map[string]interface{}
+	Obligations   []string
+	AuditOnly     bool
+	LabelsOut     []string
+	CarriedLabels []string
+}
+
+// Record is the gateway-aware variant: p.Upstream, p.PolicyVersion, and
+// p.PolicySHA256 stamp the route name and in-force policy provenance.
+// RecordAllow/RecordDeny forward here with those left empty for the
+// single-upstream/stdio path; gateway routeSinks call it directly.
+func (s *Sink) Record(ctx context.Context, p RecordParams) {
 	activityID := 1
-	if decision == "deny" {
+	if p.Decision == "deny" {
 		activityID = 2
 	}
 
-	mcpMethod, targetType, target := deriveTargetFields(method, identifier)
+	mcpMethod, targetType, target := deriveTargetFields(p.Method, p.Identifier)
 
 	// Stamp the agent/task/user identity from any validated JWT claims. Bound each
 	// to auditEnvelopeFieldCap: these IdP-supplied claims are structure-validated but
@@ -1480,20 +1531,20 @@ func (s *Sink) Record(ctx context.Context, upstream, policyVersion, policySHA256
 		ActivityID:    activityID,
 		Time:          s.clock().UTC().Format(time.RFC3339Nano),
 		RequestID:     nextRequestID(),
-		SessionID:     boundFieldTo(sessionID, auditSessionIDCap),
+		SessionID:     boundFieldTo(p.SessionID, auditSessionIDCap),
 		AgentID:       agentID,
 		TaskID:        taskID,
 		UserID:        userID,
-		Upstream:      upstream,
-		PolicyVersion: policyVersion,
-		PolicySHA256:  policySHA256,
+		Upstream:      p.Upstream,
+		PolicyVersion: p.PolicyVersion,
+		PolicySHA256:  p.PolicySHA256,
 		TargetType:    targetType,
 		Target:        target,
 		Method:        mcpMethod,
-		Decision:      decision,
-		AuditOnly:     auditOnly,
-		DenialCode:    denialCode,
-		ConditionType: condType,
+		Decision:      p.Decision,
+		AuditOnly:     p.AuditOnly,
+		DenialCode:    p.DenialCode,
+		ConditionType: p.ConditionType,
 		// Bound (and, in the same pass, deep-clone) details before enqueue, then
 		// marshal the bounded copy ONCE — here, on the caller's goroutine. The queued
 		// record therefore carries immutable bytes, not the live params.Arguments map
@@ -1503,18 +1554,18 @@ func (s *Sink) Record(ctx context.Context, upstream, policyVersion, policySHA256
 		// drainer, also keeps the 4096-slot queue from retaining 4096 un-truncated
 		// multi-MiB payloads (~16 GiB of heap); each queued Details is capped at
 		// auditDetailsTotalCap.
-		Details: marshalAndBoundDetails(details),
+		Details: marshalAndBoundDetails(p.Details),
 		// Bound obligations like Details, before enqueue. redactFields-style directives
 		// emit one obligation per match, so a crafted manifest can grow this slice past
 		// the 4 MiB scanner buffer and defeat the queue's per-record bound.
-		Obligations: boundAuditObligations(slices.Clone(obligs)),
+		Obligations: boundAuditObligations(slices.Clone(p.Obligations)),
 		// Clone the label slices so the queued record owns immutable bytes (a caller
 		// mutation after Record returns cannot reach the serialized record), mirroring
 		// Obligations. No length bound: labels are drawn from the closed native
 		// vocabulary, not caller free-form text. slices.Clone(nil) is nil, so a non-flow
 		// decision keeps both fields omitted.
-		LabelsOut:     slices.Clone(labelsOut),
-		CarriedLabels: slices.Clone(carriedLabels),
+		LabelsOut:     slices.Clone(p.LabelsOut),
+		CarriedLabels: slices.Clone(p.CarriedLabels),
 		KeyID:         s.keyID,
 	}
 
@@ -1945,7 +1996,28 @@ func boundEnvelopeField(s string) string {
 // recording the original length. The marker is kept WITHIN the limit (the prefix
 // shortens to make room), so the result is always <= limit bytes — the invariant
 // the 4 MiB scanner buffer relies on.
+//
+// s is first normalized to valid UTF-8 (strings.ToValidUTF8, replacing any invalid
+// byte sequence with U+FFFD). Every caller of this function passes a field that can
+// hold raw attacker/IdP-supplied bytes not yet validated as UTF-8 — SessionID from
+// the client-controlled Mcp-Session-Id HTTP header, Target/Method from request
+// envelope fields, AgentID/TaskID/UserID from JWT claims — and encoding/json's
+// Marshal is NOT idempotent across a decode-then-re-encode round trip when a string
+// holds invalid UTF-8: it writes a lone invalid byte as the literal 6-byte escape
+// text `�`, but decoding that text and re-marshaling the resulting (valid)
+// U+FFFD rune instead emits its raw 3-byte UTF-8 encoding. Two different on-disk
+// byte sequences for what is nominally "the same" value break the assumption behind
+// both the HMAC recompute (decode → clear _hmac → re-marshal → re-sign) and
+// VerifyRecord's canonical-bytes check, which is not a hypothetical: a session ID
+// containing one stray invalid byte forwarded from an untrusted header round-trips
+// to different bytes than it was signed with, so a genuine, never-tampered record
+// fails verification and (via resumeChainFromTail, which runs this same check on
+// every restart) can make the live proxy restart its own chain from genesis. Normalizing
+// here, before the field is ever marshaled the first time, makes the stored value
+// already-valid UTF-8 from the start, so every later marshal of it is byte-identical —
+// restoring the round-trip idempotency both mechanisms depend on.
 func boundFieldTo(s string, limit int) string {
+	s = strings.ToValidUTF8(s, "�")
 	if len(s) <= limit {
 		return s
 	}
@@ -2375,6 +2447,70 @@ func recordMAC(key, body []byte) string {
 	return "sha256:" + hex.EncodeToString(mac.Sum(nil))
 }
 
+// signedRecordLine returns the canonical on-disk bytes of a signed record (no
+// trailing newline): the signed body — the record marshaled with an empty _hmac —
+// with mac spliced in as the final _hmac field.
+//
+// Splicing rather than re-marshaling the record with its HMAC set makes the write
+// invariant structural: the written bytes ARE the signed bytes plus the one field
+// the verifier strips back off, so a second marshal cannot, after a future struct
+// change, diverge from the bytes that were signed and make a record fail its own
+// verification. body ends in '}' (rec.HMAC is empty when it is marshaled and the
+// field is tagged omitempty), so replacing that brace with `,"_hmac":"..."}` yields
+// the whole record. The spliced field name must match the struct json tag ("_hmac").
+//
+// This is the SINGLE definition of a signed record's on-disk form: writeRecord emits
+// the line with it, and VerifyRecord rebuilds the expected line with it to reject a
+// byte-level rewrite that still decodes to the same fields. One definition is what
+// makes that byte comparison safe — two hand-mirrored splices could drift, and the
+// verifier would then reject genuine records.
+//
+// It takes ownership of body (it appends through body's backing array); callers must
+// not use body afterwards.
+func signedRecordLine(body []byte, mac string) ([]byte, error) {
+	if n := len(body); n == 0 || body[n-1] != '}' {
+		// Defensive: a struct marshal always ends in '}', so this is unreachable, but
+		// splicing into a non-object would corrupt the record.
+		return nil, errors.New("signing body is not a JSON object")
+	}
+	macJSON, err := json.Marshal(mac)
+	if err != nil {
+		return nil, err
+	}
+	// No summed-length capacity (which CodeQL flags as a potential allocation
+	// overflow); append grows safely.
+	line := body[:len(body)-1] // drop the trailing '}'
+	line = append(line, `,"_hmac":`...)
+	line = append(line, macJSON...)
+	return append(line, '}'), nil
+}
+
+// isCanonicalSignedLine reports whether line is byte-identical to what
+// signedRecordLine(body, mac) would produce, without materializing that line.
+//
+// VerifyRecord calls this for every signed record in an audit-verify pass, which
+// can scan a multi-GB log, so this avoids signedRecordLine's clone-and-append — an
+// allocation and copy proportional to the record's size, dominated by Details, up
+// to 1 MiB — in favor of a prefix/suffix comparison directly against body's own
+// backing array. Only mac (always small: "sha256:" plus a hex digest) is marshaled
+// and copied; nothing here scales with record size.
+func isCanonicalSignedLine(line, body []byte, mac string) (bool, error) {
+	if n := len(body); n == 0 || body[n-1] != '}' {
+		// Defensive: a struct marshal always ends in '}', so this is unreachable —
+		// mirrors signedRecordLine's identical guard.
+		return false, errors.New("signing body is not a JSON object")
+	}
+	macJSON, err := json.Marshal(mac)
+	if err != nil {
+		return false, err
+	}
+	prefix := body[:len(body)-1] // body minus its trailing '}'
+	suffix := append(append([]byte(`,"_hmac":`), macJSON...), '}')
+	return len(line) == len(prefix)+len(suffix) &&
+		bytes.HasPrefix(line, prefix) &&
+		bytes.HasSuffix(line, suffix), nil
+}
+
 // writeRecord stamps the chain fields, signs, and writes a single record,
 // advancing the chain head and seq only after a successful durable write. A
 // dropped or failed record never consumes a seq or leaves a dangling link.
@@ -2411,34 +2547,17 @@ func (s *Sink) writeRecord(rec *auditRecord) {
 	}
 	rec.HMAC = recordMAC(s.key, body)
 
-	// Build the on-disk line by splicing _hmac into the already-signed body rather
-	// than re-marshaling. A second marshal could, after a future struct change,
-	// diverge from the bytes that were signed, making the record fail its own
-	// verification. Splicing makes the invariant structural: the written bytes ARE
-	// the signed bytes plus the one field VerifyRecord strips back off. body ends in
-	// '}' (omitempty dropped the empty _hmac), so replacing it with `,"_hmac":"..."}`
-	// reproduces what marshaling rec with HMAC set would yield. The spliced field
-	// name must match the struct json tag ("_hmac").
-	if n := len(body); n == 0 || body[n-1] != '}' {
-		// Defensive: struct marshal always ends in '}', so this is unreachable, but
-		// splicing into a non-object would corrupt the record. Count and skip.
-		s.writeFailures.Add(1)
-		fmt.Fprintf(os.Stderr, "[eunox] audit marshal error: signing body is not a JSON object\n")
-		return
-	}
-	hmacJSON, err := json.Marshal(rec.HMAC)
+	// Build the on-disk line through the shared splice (body is not reused after
+	// this, so handing off its backing array is fine). VerifyRecord rebuilds the same
+	// line from the decoded record and requires the on-disk bytes to match it, so
+	// this call is the definition both sides follow.
+	line, err := signedRecordLine(body, rec.HMAC)
 	if err != nil {
 		s.writeFailures.Add(1)
 		fmt.Fprintf(os.Stderr, "[eunox] audit marshal error: %v\n", err)
 		return
 	}
-	// Append onto the signed body (dropping its trailing '}'). No summed-length
-	// capacity (which CodeQL flags as a potential allocation overflow); append grows
-	// safely. body is not reused after this, so writing through its backing is fine.
-	line := body[:len(body)-1] // drop the trailing '}'
-	line = append(line, `,"_hmac":`...)
-	line = append(line, hmacJSON...)
-	line = append(line, '}', '\n')
+	line = append(line, '\n')
 
 	if s.f == nil {
 		// File lost during a failed rotation. Defensive: rotate() always retains a
