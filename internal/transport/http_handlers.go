@@ -97,9 +97,13 @@ const (
 	codeLoopbackRejected = "LOOPBACK_REJECTED"
 )
 
-// JSON-RPC 2.0 error codes used for callUpstream-error responses.
+// JSON-RPC 2.0 error codes this package returns to the host. Named constants rather
+// than bare literals at each site: the numbers are indistinguishable from each other at
+// a glance, and a transposed digit produces a valid-looking but wrong error class that
+// no test would catch.
 const (
 	jsonRPCCodeInvalidRequest = -32600
+	jsonRPCCodeInvalidParams  = -32602
 	jsonRPCCodeInternalError  = -32603
 )
 
@@ -158,6 +162,15 @@ func upstreamErrInfo(err error, upstreamTimeMs int) (code, reason string, rpcCod
 		// not an upstream failure. Report invalid-request so the host is not told the
 		// upstream errored (and so the record is not mined as an upstream outage).
 		return codeInvalidRequest, "duplicate JSON-RPC request id already in flight", jsonRPCCodeInvalidRequest
+	case errors.Is(err, mcp.ErrFrameDesync):
+		// A partial frame from a NON-deadline cause (EPIPE on an upstream that died
+		// mid-write, ENOSPC, an interrupted >PIPE_BUF write). The stream is unusable, but
+		// it is not a timeout: reporting it as one would stamp a fabricated
+		// "did not respond within N ms" on the tape for an upstream that crashed, and with
+		// --upstream-timeout=0 would cite a deadline that does not exist. Falls to the
+		// generic upstream-error class, which also gives the operator the stderr dump with
+		// the underlying errno.
+		return codeUpstreamError, "upstream connection failed", jsonRPCCodeInternalError
 	case errors.Is(err, mcp.ErrUpstreamWriteTimeout):
 		// The bounded upstream stdin write timed out (a subprocess that stopped draining its
 		// stdin). It is a genuine upstream timeout, so classify it as UPSTREAM_TIMEOUT rather

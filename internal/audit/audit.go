@@ -1680,19 +1680,43 @@ const auditDetailsTotalCap = 1 << 20 // 1 MiB
 // sheds records (counted, tamper-evident) instead of OOM-ing the process.
 const auditQueueByteBudget = 256 << 20 // 256 MiB
 
-// auditRecordEnvelopeEstimate is a flat per-record allowance for the fixed envelope
-// (session id, method, target, key id, the two hex HMACs) that queueSize adds on top
-// of the variable Details/Obligations bytes. It need not be exact — queuedBytes is a
-// soft bound.
+// auditRecordEnvelopeEstimate is a flat per-record allowance for the parts of the
+// envelope queueSize does NOT sum: the struct header itself, the JSON field names and
+// punctuation, and the two hex HMACs (prev_hmac/_hmac). The HMACs are excluded from
+// the sum deliberately — writeRecord stamps them on the drainer goroutine, after the
+// enqueue reservation and before the drain release, so counting them would make the
+// two disagree. Everything else is summed field by field; see queueSize.
 const auditRecordEnvelopeEstimate = 512
 
 // queueSize estimates the heap a queued record retains: its already-marshaled Details
-// and Obligations bytes plus a flat envelope allowance. The drainer recomputes it from
-// the same immutable fields, so the enqueue add and the drain subtract always agree.
+// and Obligations bytes, its variable-length envelope strings, and a flat allowance for
+// the fixed remainder. The drainer recomputes it from the same immutable fields, so the
+// enqueue add and the drain subtract always agree.
+//
+// The envelope strings are summed rather than folded into the flat allowance because
+// several of them are not small: AgentID/TaskID/UserID (IdP-supplied) and Target/Method
+// (request-supplied) are each bounded only by auditEnvelopeFieldCap, so one record can
+// hold ~40 KiB of envelope. Charging a flat 512 B for all of it let a queue of such
+// records overshoot auditQueueByteBudget many times over — the OOM the budget exists to
+// prevent. Note the exclusions above: rec.Seq, rec.PrevHMAC, and rec.HMAC are assigned
+// by writeRecord after enqueue, so only fields Record fills are counted here.
 func (rec *auditRecord) queueSize() int64 {
 	n := int64(len(rec.Details)) + auditRecordEnvelopeEstimate
+	n += int64(len(rec.Time) + len(rec.RequestID) + len(rec.KeyID))
+	n += int64(len(rec.SessionID) + len(rec.AgentID) + len(rec.TaskID) + len(rec.UserID))
+	n += int64(len(rec.Upstream) + len(rec.PolicyVersion) + len(rec.PolicySHA256))
+	n += int64(len(rec.TargetType) + len(rec.Target) + len(rec.Method))
+	n += int64(len(rec.Decision) + len(rec.DenialCode) + len(rec.ConditionType))
 	for _, o := range rec.Obligations {
 		n += int64(len(o))
+	}
+	// Flow labels come from the closed native vocabulary (short, few), but they are
+	// retained heap like any other slice and cost nothing to count correctly.
+	for _, l := range rec.LabelsOut {
+		n += int64(len(l))
+	}
+	for _, l := range rec.CarriedLabels {
+		n += int64(len(l))
 	}
 	return n
 }
@@ -1888,19 +1912,6 @@ func truncatedObligations(kept []string, total int) []string {
 	}
 }
 
-// mcpMethodToTargetType maps an MCP method name to its TargetType, deriving
-// from capability.MethodTargetType — the single source of truth shared with
-// internal/transport's dispatch map — rather than keeping a second, raw-literal
-// copy of the mapping here. Returns an error for methods that have no
-// TargetType mapping.
-func mcpMethodToTargetType(method string) (capability.TargetType, error) {
-	tt, ok := capability.MethodTargetType(method)
-	if !ok {
-		return "", fmt.Errorf("unknown MCP method %q has no TargetType mapping", method)
-	}
-	return tt, nil
-}
-
 // deriveTargetFields resolves the structured target identity from the MCP method.
 // target_type is taken from the method (authoritative), never inferred from the
 // overloaded identifier, so an opaque resource URI or an oddly-named tool is
@@ -1912,8 +1923,10 @@ func deriveTargetFields(method, identifier string) (mcpMethod, targetType, targe
 	if method == "" {
 		return "", "", ""
 	}
-	tt, err := mcpMethodToTargetType(method)
-	if err != nil {
+	// capability.MethodTargetType is the single source of truth for this mapping,
+	// shared with internal/transport's dispatch map, so no second copy lives here.
+	tt, ok := capability.MethodTargetType(method)
+	if !ok {
 		// Post-dispatch: an unrecognized method string. Preserve it (bounded, since
 		// it is attacker-controlled) so SIEM and suggest can distinguish these from
 		// pre-dispatch denials.
@@ -2281,8 +2294,12 @@ func (s *Sink) resetDropBuckets(snapshotted map[string]int64) {
 }
 
 // flushDropMarker writes a synthetic, signed record reflecting any records dropped
-// since the last marker, advancing the marked count only once that record is
-// durably written. No-op when nothing new was dropped. Alongside the aggregate
+// since the last marker, advancing the marked count only once that record's write(2)
+// has succeeded (durability follows at the drainer's next batched fsync — the same
+// distinction writeRecord documents, and the one that matters when reasoning about what
+// a crash leaves behind: an unsynced marker is lost with the records it accounted for,
+// so the loss is re-counted rather than silently forgotten). No-op when nothing new was
+// dropped. Alongside the aggregate
 // count, the marker names WHICH method/target pairs were affected (bounded by
 // auditDropBucketCap) so a reader can act on the loss without the underlying
 // record — e.g. a flood of denied tools/call probes against one tool is visible as
@@ -2302,7 +2319,7 @@ func (s *Sink) flushDropMarker() {
 		details["by_method_target"] = buckets
 	}
 	marker := s.syntheticDenyMarker("AUDIT_RECORDS_DROPPED", details)
-	// Advance the marked count only after a durable write (writeRecord advances seq
+	// Advance the marked count only after a successful write (writeRecord advances seq
 	// only on success). On a write failure the count is left behind and the next
 	// flush retries with the full accumulated count, so the drop evidence is never
 	// silently lost from the chain. flushDropMarker runs once per drained record and
@@ -2375,9 +2392,15 @@ func recordMAC(key, body []byte) string {
 	return "sha256:" + hex.EncodeToString(mac.Sum(nil))
 }
 
-// writeRecord stamps the chain fields, signs, and writes a single record,
-// advancing the chain head and seq only after a successful durable write. A
-// dropped or failed record never consumes a seq or leaves a dangling link.
+// writeRecord stamps the chain fields, signs, and writes a single record, advancing the
+// chain head and seq only after the write(2) succeeds. A dropped or failed record never
+// consumes a seq or leaves a dangling link.
+//
+// "Written" here means accepted by the OS, not yet DURABLE: the fsync that makes it
+// survive a crash is batched by the drainer (syncEveryN / syncDebounce). The chain is
+// consistent either way — a crash truncates the tail, and Open resumes from the last
+// record actually on disk — but the two properties are distinct and this file is
+// otherwise careful to say which one it means.
 func (s *Sink) writeRecord(rec *auditRecord) {
 	// Details and envelope are already bounded at Record() time, so the serialized
 	// record is provably far below the 4 MiB scanner buffer / chain-resume window.

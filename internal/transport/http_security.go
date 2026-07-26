@@ -317,7 +317,15 @@ func (p *HTTPProxy) checkOrigin(w http.ResponseWriter, r *http.Request) bool {
 const maxClaimedSessionIDLen = 200
 
 func addClaimedSessionID(details map[string]interface{}, r *http.Request) map[string]interface{} {
-	claimed := r.Header.Get(SessionHeader)
+	return addClaimedSessionIDValue(details, r.Header.Get(SessionHeader))
+}
+
+// addClaimedSessionIDValue is addClaimedSessionID's value-taking core, for the callers
+// that already hold the claimed id as a string rather than a live *http.Request (the
+// kill records for a session id that did not resolve in the registry — see killSubject).
+// One implementation so the bound, the truncation marker, and the key spelling cannot
+// diverge between the header-reading and the value-taking path.
+func addClaimedSessionIDValue(details map[string]interface{}, claimed string) map[string]interface{} {
 	if claimed == "" {
 		return details
 	}

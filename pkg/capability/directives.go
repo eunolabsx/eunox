@@ -6,6 +6,7 @@ package capability
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 type directiveEnvelope struct {
@@ -92,8 +93,26 @@ func unmarshalDirective(data []byte) (Directive, error) {
 	if target == nil {
 		return nil, fmt.Errorf("unknown directive type %q — valid types are: redactFields, labelOutput", envelope.Type)
 	}
+	// Reject unknown fields, by the same rule and for the same reason as
+	// unmarshalCondition (see jsonFieldNames): a lenient decode silently drops a
+	// misspelled key. For a directive that is worse than for a condition —
+	// {"type":"redactFields","pathss":[...]} decodes to an EMPTY path list, and an empty
+	// list means the forward path attaches the redactFields obligation (so the tape
+	// records a redaction as applied) while masking nothing. Matching is case-insensitive
+	// because that is how encoding/json binds.
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return nil, fmt.Errorf("directive %q: %w", envelope.Type, err)
+	}
+	known := jsonFieldNames(target)
+	for k := range fields {
+		if strings.EqualFold(k, "type") || known[strings.ToLower(k)] {
+			continue
+		}
+		return nil, fmt.Errorf("directive %q: unknown field %q", envelope.Type, k)
+	}
 	if err := json.Unmarshal(data, target); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("directive %q: %w", envelope.Type, err)
 	}
 	return target, nil
 }

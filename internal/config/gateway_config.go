@@ -49,6 +49,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -416,15 +417,24 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	// pass fail closed. Capture the raw values for the parallel guard after expansion.
 	rawAuditLog := cfg.Audit.Log
 	rawAuditKeyPath := cfg.Audit.KeyPath
+	rawAllowedOrigins := slices.Clone(cfg.Listen.AllowedOrigins)
 
 	// Same for each upstream's auth header: an env ref in upstreamAuthHeader carries
 	// the same unset/empty footgun, so capture the raw values for the parallel guard
 	// after expansion.
 	rawUpstreamAuth := make([]string, len(cfg.Upstreams))
 	rawUpstreamURL := make([]string, len(cfg.Upstreams))
+	// And the same for a stdio upstream's command and args, the last expanded fields
+	// with no unset-reference guard: `command: ${SERVER_BIN}` with the variable unset
+	// booted cleanly and failed per SESSION at exec time, turning a config error into a
+	// runtime one that surfaces once a client connects rather than at startup.
+	rawCommand := make([]string, len(cfg.Upstreams))
+	rawArgs := make([][]string, len(cfg.Upstreams))
 	for i := range cfg.Upstreams {
 		rawUpstreamAuth[i] = cfg.Upstreams[i].UpstreamAuthHeader
 		rawUpstreamURL[i] = cfg.Upstreams[i].UpstreamURL
+		rawCommand[i] = cfg.Upstreams[i].Command
+		rawArgs[i] = slices.Clone(cfg.Upstreams[i].Args)
 	}
 
 	// Expand on the PARSED string values, never the raw text: substituting into
@@ -486,6 +496,51 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 		if err := failOnUnsetEnvRef(path, fmt.Sprintf("upstream %q upstreamUrl", cfg.Upstreams[i].Name), rawUpstreamURL[i]); err != nil {
 			return nil, err
 		}
+	}
+
+	// Same guard for a stdio upstream's command and args, but restricted to the BRACED
+	// ${VAR} form. Without it, an unset ${SERVER_BIN} survives as literal text and the
+	// route boots; the failure lands at exec time on the FIRST SESSION instead of at
+	// startup, so the operator learns of a plain config typo from a client's failed
+	// handshake.
+	//
+	// Braced-only because these two fields are arbitrary subprocess argv, not a URL: a
+	// bare "$word" is ordinary literal text there (an OData "?$filter=", a regex "$anchor",
+	// a jq/JSONPath expression, or anything the child interpolates itself), and treating it
+	// as a reference would refuse to START a config that works today, blaming a variable
+	// the operator never wrote. "${VAR}" carries unambiguous intent to substitute, which is
+	// the case worth failing closed on and the one the flag's own example uses. The
+	// upstreamUrl guard above keeps its broader bare-$ rule: it predates this and a URL is
+	// a far narrower surface than argv.
+	//
+	// Note this guard is a hand-maintained per-field list while expandEnvInStrings rewrites
+	// EVERY string in the tree, so "covered" is not the default — a field is covered only
+	// once it is added here. Most of the rest fail at startup for their own reasons (a
+	// ${VAR} in `name` fails routeNameRe, in `bind` fails net.Listen, in `policy` fails
+	// LoadManifest, in trustedProxyCIDRs fails ParseCIDR), which is why the gaps are quiet
+	// rather than loud; listen.allowedOrigins is guarded just below for exactly that
+	// reason. Failing closed inside the expansion walk itself would need no list at all.
+	for i := range cfg.Upstreams {
+		if err := failOnUnsetBracedEnvRef(path, fmt.Sprintf("upstream %q command", cfg.Upstreams[i].Name), rawCommand[i]); err != nil {
+			return nil, err
+		}
+		for j, raw := range rawArgs[i] {
+			if err := failOnUnsetBracedEnvRef(path, fmt.Sprintf("upstream %q args[%d]", cfg.Upstreams[i].Name, j), raw); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	// Fail closed on an unset env reference in listen.allowedOrigins. This one has no
+	// other startup check to catch it: an unset ${DASHBOARD_ORIGIN} survives as literal
+	// text, the proxy boots, and the entry then matches no real Origin header — so a
+	// browser client gets a bare 403 with nothing on stderr to connect it to a config
+	// typo. Same failure shape the command/args guard above exists to eliminate.
+	for i, origin := range cfg.Listen.AllowedOrigins {
+		if err := failOnUnsetEnvRef(path, fmt.Sprintf("listen.allowedOrigins[%d]", i), rawAllowedOrigins[i]); err != nil {
+			return nil, err
+		}
+		_ = origin
 	}
 
 	// Fail closed on an unset env reference in the audit log or key path (see the
@@ -580,6 +635,25 @@ func firstUnsetEnvRef(rawValue string) (name string, ok bool) {
 // (a literal token no client/upstream sends). Detection is on the RAW pre-expansion text
 // so a set variable whose value itself contains "$" is not misdiagnosed as unset. path
 // names the config file; label names the field.
+// failOnUnsetBracedEnvRef is failOnUnsetEnvRef restricted to the unambiguous "${VAR}"
+// spelling, for fields whose text is passed verbatim to another program (a stdio
+// upstream's command and args). A bare "$word" is ordinary literal content there, so
+// treating it as a reference would refuse to start an otherwise-working config; "${VAR}"
+// is unambiguous intent to substitute. Escapes ("$$") are skipped exactly as elsewhere.
+func failOnUnsetBracedEnvRef(path, label, raw string) error {
+	for _, m := range realEnvRefs(raw) {
+		if !strings.HasPrefix(m, "${") {
+			continue
+		}
+		if name := envRefName(m); name != "" {
+			if _, set := os.LookupEnv(name); !set {
+				return fmt.Errorf("invalid gateway config %q: %s references environment variable %q, which is unset, so it is left as literal text — set the variable or remove the reference", path, label, name)
+			}
+		}
+	}
+	return nil
+}
+
 func failOnUnsetEnvRef(path, label, raw string) error {
 	if name, ok := firstUnsetEnvRef(raw); ok {
 		return fmt.Errorf("invalid gateway config %q: %s references environment variable %q, which is unset, so it is left as literal text — set the variable or remove the reference", path, label, name)

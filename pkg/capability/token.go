@@ -33,8 +33,10 @@ type Confirmation struct {
 }
 
 // UnmarshalJSON decodes the cnf claim into `members` verbatim and populates the typed
-// convenience fields. cnf is a JSON object (RFC 7800 §3.1); a non-object decode fails here so
-// the caller fails closed.
+// convenience fields. cnf is a JSON object (RFC 7800 §3.1), so a non-object value fails
+// here and the caller fails closed — with one deliberate exception: an explicit `null`
+// decodes to an empty Confirmation, which constrains nothing (CnfIsSenderConstrained
+// reports false for it), exactly as an absent cnf does.
 func (c *Confirmation) UnmarshalJSON(data []byte) error {
 	var members map[string]json.RawMessage
 	if err := json.Unmarshal(data, &members); err != nil {

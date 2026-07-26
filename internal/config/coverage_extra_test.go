@@ -665,6 +665,7 @@ func TestGatewayConfig_ValidateAcceptsWellFormedHTTP(t *testing.T) {
 func TestLoadGatewayConfig_HTTPTransportWithEnvExpansion(t *testing.T) {
 	t.Setenv("EUNOX_TEST_GW_TOKEN", "tok-123")
 	t.Setenv("EUNOX_TEST_STRIPE_KEY", "sk-live")
+	t.Setenv("EUNOX_TEST_GW_CMD", "/usr/bin/srv")
 
 	cfg, err := LoadGatewayConfig(writeConfig(t, `
 schemaVersion: "0.1"
@@ -681,7 +682,7 @@ upstreams:
     policy: ["stripe.yaml"]
   - name: fs
     transport: stdio
-    command: ${EUNOX_TEST_GW_UNSET}
+    command: ${EUNOX_TEST_GW_CMD}
     args: ["-y", "srv"]
     policy: ["fs.yaml"]
 `))
@@ -694,9 +695,85 @@ upstreams:
 	if got := cfg.Upstreams[0].UpstreamAuthHeader; got != "Authorization: Bearer sk-live" {
 		t.Errorf("upstreamAuthHeader = %q, want the key expanded", got)
 	}
-	// An unset reference is left intact (fail closed), never blanked.
-	if got := cfg.Upstreams[1].Command; got != "${EUNOX_TEST_GW_UNSET}" {
-		t.Errorf("unset ref command = %q, want the literal reference preserved", got)
+	if got := cfg.Upstreams[1].Command; got != "/usr/bin/srv" {
+		t.Errorf("command = %q, want the reference expanded", got)
+	}
+}
+
+// TestLoadGatewayConfig_UnsetEnvRefInCommandAndArgs pins that an unset ${VAR} in a stdio
+// upstream's command or args is a STARTUP failure, like every sibling expanded field.
+// An unset reference survives expansion as literal text, so without this guard the route
+// booted cleanly and failed at exec time on the first session — the operator learns of a
+// plain config typo from a client's failed handshake instead of from `proxy` refusing to
+// start.
+func TestLoadGatewayConfig_UnsetEnvRefInCommandAndArgs(t *testing.T) {
+	for _, tc := range []struct{ name, upstream, wantIn string }{
+		{
+			name: "command",
+			upstream: `    command: ${EUNOX_TEST_GW_UNSET}
+    args: ["-y", "srv"]`,
+			wantIn: `upstream "fs" command references environment variable "EUNOX_TEST_GW_UNSET"`,
+		},
+		{
+			name: "args",
+			upstream: `    command: /usr/bin/srv
+    args: ["-y", "${EUNOX_TEST_GW_UNSET}"]`,
+			wantIn: `upstream "fs" args[1] references environment variable "EUNOX_TEST_GW_UNSET"`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadGatewayConfig(writeConfig(t, `
+schemaVersion: "0.1"
+transport: http
+listen:
+  bind: 127.0.0.1
+  port: 3000
+upstreams:
+  - name: fs
+    transport: stdio
+`+tc.upstream+`
+    policy: ["fs.yaml"]
+`))
+			if err == nil {
+				t.Fatal("LoadGatewayConfig accepted an unset env reference; want a startup failure")
+			}
+			if !strings.Contains(err.Error(), tc.wantIn) {
+				t.Errorf("error = %q, want it to name %q", err, tc.wantIn)
+			}
+		})
+	}
+}
+
+// TestLoadGatewayConfig_BareDollarInCommandArgsIsLiteral pins that the unset-env-ref
+// guard on command/args accepts a bare "$word".
+//
+// These two fields are arbitrary subprocess argv, not a URL: a bare "$word" is ordinary
+// literal text there — an OData "?$filter=", a regex "$anchor", a jq expression, or
+// anything the child interpolates itself. Applying the broader bare-$ rule the
+// upstreamUrl guard uses would refuse to START a config that works today, blaming a
+// variable the operator never wrote. Only the unambiguous "${VAR}" fails closed.
+func TestLoadGatewayConfig_BareDollarInCommandArgsIsLiteral(t *testing.T) {
+	cfg, err := LoadGatewayConfig(writeConfig(t, `
+schemaVersion: "0.1"
+transport: http
+listen:
+  bind: 127.0.0.1
+  port: 3000
+upstreams:
+  - name: fs
+    transport: stdio
+    command: /usr/bin/srv
+    args: ["--query", "?$filter=name eq 'x'", "s/$anchor/x/"]
+    policy: ["fs.yaml"]
+`))
+	if err != nil {
+		t.Fatalf("LoadGatewayConfig rejected literal $ text in argv: %v", err)
+	}
+	if got := cfg.Upstreams[0].Args[1]; got != "?$filter=name eq 'x'" {
+		t.Errorf("args[1] = %q, want the literal text preserved verbatim", got)
+	}
+	if got := cfg.Upstreams[0].Args[2]; got != "s/$anchor/x/" {
+		t.Errorf("args[2] = %q, want the literal text preserved verbatim", got)
 	}
 }
 

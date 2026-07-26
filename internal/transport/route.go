@@ -289,11 +289,23 @@ func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability
 				u.Name, u.Name)
 		}
 
-		r.sink = &routeSink{
-			sink:          sink,
-			upstream:      r.name,
-			policyVersion: policyVersion,
-			policySHA256:  policySHA256,
+		// Only wrap when there is something to wrap. routeSink exists to stamp route
+		// identity and policy provenance onto records; with no shared sink there are no
+		// records, and a non-nil wrapper makes every asRecorder(route.sink) yield a LIVE
+		// recorder that only discards. The callers' `rec != nil` fast path then never
+		// fires, so a no-audit gateway still pays the work done to build a record —
+		// notably the */list CountListEntries decode — for calls that write nothing.
+		// Leaving it nil gives asRecorder a genuine nil interface and matches the fast
+		// path the stdio transport's rec() already documents. routeSink's methods are
+		// nil-receiver safe, so the few sites that call through the concrete pointer are
+		// unaffected.
+		if sink != nil {
+			r.sink = &routeSink{
+				sink:          sink,
+				upstream:      r.name,
+				policyVersion: policyVersion,
+				policySHA256:  policySHA256,
+			}
 		}
 		routes[u.Name] = r
 	}
@@ -303,7 +315,7 @@ func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability
 	return routes, nil
 }
 
-// StartupFatalManifestCheck returns the startup-fatal error for an upstream's
+// startupFatalManifestCheck returns the startup-fatal error for an upstream's
 // ALREADY-MERGED manifest — the checks that would make `proxy` refuse to boot but
 // that a plain config.LoadManifest + config.MergeManifests does not evaluate: the
 // expectVersion pin, the sampling/createMessage-on-http guard, and the stdio-host
@@ -328,7 +340,7 @@ func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability
 // merged digest) should call this directly instead of calling LoadUpstreamPDP a
 // second time just to read its error — that would re-parse and re-merge the
 // manifest files and spin up a throwaway engine/PDP purely to discard it.
-func StartupFatalManifestCheck(u *config.UpstreamConfig, hostTransport string, merged *config.LocalManifest) error {
+func startupFatalManifestCheck(u *config.UpstreamConfig, hostTransport string, merged *config.LocalManifest) error {
 	if u.ExpectVersion != "" && u.ExpectVersion != merged.Version {
 		return fmt.Errorf("upstream %q: manifest version %q does not match pinned expectVersion %q", u.Name, merged.Version, u.ExpectVersion)
 	}
@@ -362,7 +374,7 @@ type PolicyLoadResult struct {
 }
 
 // RouteManifestOutcome is the result of walking one upstream's policy files
-// through load, merge, and StartupFatalManifestCheck — the sequence `validate`
+// through load, merge, and startupFatalManifestCheck — the sequence `validate`
 // and `doctor` both reproduce to report exactly what `proxy` would do at
 // startup, without invoking LoadUpstreamPDP a second time.
 type RouteManifestOutcome struct {
@@ -375,11 +387,11 @@ type RouteManifestOutcome struct {
 
 	Merged     *config.LocalManifest // nil unless every policy file loaded and merged cleanly
 	MergeErr   error
-	StartupErr error // StartupFatalManifestCheck(u, cfg.HostTransport(), Merged)
+	StartupErr error // startupFatalManifestCheck(u, cfg.HostTransport(), Merged)
 }
 
 // WalkRouteManifests loads, resolves, and merges one upstream's policy files
-// against cfg, then runs StartupFatalManifestCheck on the merged result — the
+// against cfg, then runs startupFatalManifestCheck on the merged result — the
 // shared walk behind `validate`'s FAIL/PASS report and `doctor`'s WOULD FAIL
 // CLOSED / merged-digest report, so the two commands cannot drift apart on what
 // counts as a startup-fatal manifest.
@@ -415,7 +427,7 @@ func WalkRouteManifests(cfg *config.GatewayConfig, u *config.UpstreamConfig) Rou
 		return out
 	}
 	out.Merged = merged
-	out.StartupErr = StartupFatalManifestCheck(u, cfg.HostTransport(), merged)
+	out.StartupErr = startupFatalManifestCheck(u, cfg.HostTransport(), merged)
 	return out
 }
 
@@ -464,7 +476,7 @@ func LoadUpstreamPDP(u *config.UpstreamConfig, hostTransport, baseDir string, co
 		return nil, nil, "", "", fmt.Errorf("upstream %q: %w", u.Name, err)
 	}
 
-	if err := StartupFatalManifestCheck(u, hostTransport, merged); err != nil {
+	if err := startupFatalManifestCheck(u, hostTransport, merged); err != nil {
 		return nil, nil, "", "", err
 	}
 
