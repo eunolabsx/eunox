@@ -1440,3 +1440,84 @@ func TestApplyRedactObligs_PreservesHTMLChars(t *testing.T) {
 	assert.Contains(t, s, `\"ssn\":\"[redacted]\"`, "the redacted field is masked, not removed")
 	assert.NotContains(t, s, "SSN_SECRET_VALUE", "the original ssn value must not survive masking")
 }
+
+// TestApplyRedactObligs_TopLevelSiblingKey_Redacted: a declared field sitting DIRECTLY on
+// a top-level result key must be redacted, not just one nested inside a sibling's value.
+// The sibling pass only ever descended into each key's value, so the flat spelling
+// forwarded the secret verbatim while the equivalent nested shape was masked — same
+// obligation, same field name, opposite outcome depending on how deep the upstream put it.
+func TestApplyRedactObligs_TopLevelSiblingKey_Redacted(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{"content":[{"type":"text","text":"hi"}],"ssn":"123-45-6789","keep":"v"}`)
+	out, err := ApplyRedactObligs(body, redactSSN)
+	require.NoError(t, err)
+	s := string(out)
+	assert.NotContains(t, s, "123-45-6789", "a redactFields path naming a top-level result key must mask it")
+	assert.Contains(t, s, "keep")
+	assert.Contains(t, s, "hi")
+}
+
+// The dotted spelling rooted at the envelope must work too: "data.ssn" against
+// {"data":{"ssn":...}} names a real path through the result object.
+func TestApplyRedactObligs_TopLevelDottedPath_Redacted(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{"data":{"ssn":"SECRET-TOP","keep":"v"}}`)
+	out, err := ApplyRedactObligs(body, []capability.Obligation{
+		{Type: capability.DirectiveTypeRedactFields, Paths: []string{"data.ssn"}},
+	})
+	require.NoError(t, err)
+	s := string(out)
+	assert.NotContains(t, s, "SECRET-TOP")
+	assert.Contains(t, s, "keep")
+}
+
+// A path rooted at content/structuredContent stays with those keys' own shape-specific
+// passes: it must redact WITHIN the component, never mask the whole component (which
+// would strip a result the host needs while the operator only asked for a field).
+func TestApplyRedactObligs_ContentRootedPath_DoesNotMaskWholeComponent(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{"content":[{"type":"text","text":"visible"}]}`)
+	out, err := ApplyRedactObligs(body, []capability.Obligation{
+		{Type: capability.DirectiveTypeRedactFields, Paths: []string{"content"}},
+	})
+	require.NoError(t, err)
+	assert.Contains(t, string(out), "visible", "a content-rooted path must not mask the whole content array")
+}
+
+// TestApplyRedactObligs_DottedPathThroughReservedComponent: the manifest guide tells
+// operators to "prefer the fully-qualified dotted path when the field is nested", so
+// "structuredContent.ssn" is the RECOMMENDED spelling for a field inside
+// structuredContent. Exempting it by its path HEAD made the recommended spelling redact
+// nothing while the audit record still reported the obligation applied — a fail-open. Only
+// the single-segment spelling, which would mask the whole component, is exempt.
+func TestApplyRedactObligs_DottedPathThroughReservedComponent(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{"structuredContent":{"ssn":"SECRET-SC","keep":"v"}}`)
+	out, err := ApplyRedactObligs(body, []capability.Obligation{
+		{Type: capability.DirectiveTypeRedactFields, Paths: []string{"structuredContent.ssn"}},
+	})
+	require.NoError(t, err)
+	s := string(out)
+	assert.NotContains(t, s, "SECRET-SC", "the fully-qualified spelling the guide recommends must redact the leaf")
+	assert.Contains(t, s, "keep")
+}
+
+// TestApplyRedactObligs_ReservedRootKeyNotMaskedWholesale: the envelope pass masks with a
+// string sentinel, so masking a protocol-reserved key wholesale would hand the host a
+// result it cannot decode — isError is a bool, contents/messages are arrays. That is a
+// hard protocol failure in place of the field-level masking the operator asked for.
+func TestApplyRedactObligs_ReservedRootKeyNotMaskedWholesale(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ path, body, keep string }{
+		{"isError", `{"content":[],"isError":true}`, "true"},
+		{"contents", `{"contents":[{"uri":"file:///x","text":"hi"}]}`, "file:///x"},
+		{"messages", `{"messages":[{"role":"user"}]}`, "user"},
+	} {
+		out, err := ApplyRedactObligs([]byte(tc.body), []capability.Obligation{
+			{Type: capability.DirectiveTypeRedactFields, Paths: []string{tc.path}},
+		})
+		require.NoError(t, err)
+		assert.Contains(t, string(out), tc.keep,
+			"a single-segment path naming the protocol-reserved key %q must not mask the whole component", tc.path)
+	}
+}

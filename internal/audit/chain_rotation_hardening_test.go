@@ -93,9 +93,12 @@ func TestHighestSeqAcrossChain(t *testing.T) {
 	if err := os.WriteFile(sib, []byte(`{"seq":900}`+"\n"+`{"seq":901}`+"\n"), 0o600); err != nil {
 		t.Fatalf("write sibling: %v", err)
 	}
-	got, ok := highestSeqAcrossChain(logPath)
+	got, ok, complete := highestSeqAcrossChain(logPath)
 	if !ok || got != 901 {
 		t.Fatalf("highestSeqAcrossChain = (%d,%v), want (901,true) — the sibling's max must win over the base", got, ok)
+	}
+	if !complete {
+		t.Fatal("highestSeqAcrossChain must report complete=true when the log directory listed cleanly")
 	}
 }
 
@@ -163,8 +166,11 @@ func TestOpenGuardedAppend_RefusesSymlink(t *testing.T) {
 		_ = f.Close()
 		t.Fatal("openGuardedAppend must refuse a symlinked log path")
 	}
-	if !strings.Contains(err.Error(), "non-regular") {
-		t.Errorf("error = %v, want it to name the non-regular path", err)
+	// The shared guard names the symlink specifically rather than lumping it in with
+	// other non-regular files: an operator reading this needs to know a link is present,
+	// not just that the path is unusable.
+	if !strings.Contains(err.Error(), "symbolic link") {
+		t.Errorf("error = %v, want it to name the symbolic link", err)
 	}
 	// A plain regular path still opens.
 	plain := filepath.Join(dir, "plain.jsonl")
@@ -225,7 +231,7 @@ func TestHighestSeqAcrossChain_FoldsUnreadableSiblingAdditively(t *testing.T) {
 	}
 	sibSize := uint64(info.Size())
 
-	got, ok := highestSeqAcrossChainCapped(logPath, bufCap)
+	got, ok, _ := highestSeqAcrossChainCapped(logPath, bufCap)
 	if !ok {
 		t.Fatal("highestSeqAcrossChainCapped must report ok=true when a seq or unread bytes exist")
 	}

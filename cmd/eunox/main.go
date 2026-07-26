@@ -207,6 +207,7 @@ type proxyCLIFlags struct {
 	redisTLS             *bool
 	killswitchFailOpen   *bool
 	killswitchReconcile  *time.Duration
+	killswitchSessionTTL *time.Duration
 	maxCallCounterKeys   *int
 	requireAudit         *auditRequirement
 	strictDrift          *bool
@@ -328,12 +329,13 @@ func registerProxyFlags(fs *flag.FlagSet) *proxyCLIFlags {
 		oauthAuthzServer: fs.String("oauth-authorization-server", "", "Authorization server URI published in the RFC 9728 metadata document.\nDefaults to --jwt-issuer when not set. Requires transport: http."),
 
 		// Redis flags (optional — in-memory is used when absent).
-		redisAddr:           fs.String("redis-addr", "", "Redis address (host:port) for persistent call-counter and kill-switch state.\nWhen set, state survives proxy restarts and is shared across instances.\nExample: --redis-addr localhost:6379"),
-		redisPassword:       fs.String("redis-password", "", "Redis password (AUTH). Leave empty for unauthenticated connections. Prefer\nthe EUNOX_REDIS_PASSWORD env var: a password on the command line is visible\nin /proc/<pid>/cmdline. A non-empty flag value takes precedence over the env\nvar; leaving the flag empty does NOT override a set EUNOX_REDIS_PASSWORD."),
-		redisTLS:            fs.Bool("redis-tls", false, "Enable TLS for the Redis connection."),
-		killswitchFailOpen:  fs.Bool("killswitch-fail-open", false, "Redis kill-switch behaviour during a Redis outage. By default the kill switch\nfails CLOSED: while Redis is unreachable the proxy denies every request\n(KILL_SWITCH_ERROR) because a kill issued during the outage cannot be confirmed.\nSet this flag to fail OPEN instead -- serve the last-known kill state and allow\ntraffic not already known to be killed -- trading guaranteed revocation for\ndata-plane availability. Only affects --redis-addr deployments. See ADR-0003."),
-		killswitchReconcile: fs.Duration("killswitch-reconcile-interval", 0, "How often the Redis kill switch reconciles its local cache against Redis\n(default 30s). Lower values shorten the kill-propagation window and, in the\ndefault fail-closed mode, the data-plane denial window that persists after a\ntransient Redis blip recovers -- recovery is bounded by this interval, not Redis.\nVery low values increase Redis load. 0 uses the default. Only affects --redis-addr."),
-		maxCallCounterKeys:  fs.Int("max-call-counter-keys", defaultMaxCallCounterKeys, "Maximum distinct keys the in-memory maxCalls/sequenceBlock counter holds at once.\nEach live (session, tool) pair is one key, reclaimed only on the periodic cleanup;\nthis ceiling bounds the heap a flood of unique session IDs can pin between cleanups\n(a call under a new key past the limit fails closed). The same bound also caps the\nin-memory flow-label store's distinct SESSIONS (one key per session, so its ceiling\nis looser and never trips first). 0 disables the bound. Ignored when --redis-addr is\nset (Redis keeps this state off the Go heap, with TTLs)."),
+		redisAddr:            fs.String("redis-addr", "", "Redis address (host:port) for persistent call-counter and kill-switch state.\nWhen set, state survives proxy restarts and is shared across instances.\nExample: --redis-addr localhost:6379"),
+		redisPassword:        fs.String("redis-password", "", "Redis password (AUTH). Leave empty for unauthenticated connections. Prefer\nthe EUNOX_REDIS_PASSWORD env var: a password on the command line is visible\nin /proc/<pid>/cmdline. A non-empty flag value takes precedence over the env\nvar; leaving the flag empty does NOT override a set EUNOX_REDIS_PASSWORD."),
+		redisTLS:             fs.Bool("redis-tls", false, "Enable TLS for the Redis connection."),
+		killswitchFailOpen:   fs.Bool("killswitch-fail-open", false, "Redis kill-switch behaviour during a Redis outage. By default the kill switch\nfails CLOSED: while Redis is unreachable the proxy denies every request\n(KILL_SWITCH_ERROR) because a kill issued during the outage cannot be confirmed.\nSet this flag to fail OPEN instead -- serve the last-known kill state and allow\ntraffic not already known to be killed -- trading guaranteed revocation for\ndata-plane availability. Only affects --redis-addr deployments. See ADR-0003."),
+		killswitchReconcile:  fs.Duration("killswitch-reconcile-interval", 0, "How often the Redis kill switch reconciles its local cache against Redis\n(default 30s). Lower values shorten the kill-propagation window and, in the\ndefault fail-closed mode, the data-plane denial window that persists after a\ntransient Redis blip recovers -- recovery is bounded by this interval, not Redis.\nVery low values increase Redis load. 0 uses the default. Only affects --redis-addr."),
+		killswitchSessionTTL: fs.Duration("killswitch-session-ttl", 0, "How long a SESSION kill tombstone lives in Redis before it is garbage\ncollected (default 720h / 30 days). This is a memory bound, not a policy\nexpiry: when the tombstone expires the kill is LIFTED, so a value shorter\nthan the longest session your deployment holds open re-admits a revoked\nsession. Relevant when a stdio agent pins and reuses one --session-id for\nmonths. Negative disables expiry entirely; 0 uses the default. Agent kills\nare never expired. Only affects --redis-addr."),
+		maxCallCounterKeys:   fs.Int("max-call-counter-keys", defaultMaxCallCounterKeys, "Maximum distinct keys the in-memory maxCalls/sequenceBlock counter holds at once.\nEach live (session, tool) pair is one key, reclaimed only on the periodic cleanup;\nthis ceiling bounds the heap a flood of unique session IDs can pin between cleanups\n(a call under a new key past the limit fails closed). The same bound also caps the\nin-memory flow-label store's distinct SESSIONS (one key per session, so its ceiling\nis looser and never trips first). 0 disables the bound. Ignored when --redis-addr is\nset (Redis keeps this state off the Go heap, with TTLs)."),
 
 		// Compliance flags.
 		strictDrift: fs.Bool("strict-drift", false, "Promote startup drift warnings to fatal errors that abort session startup: a new\nupstream tool matched by a manifest glob, a manifest entry that matches no live\ntool, or an upstream version that does not satisfy the manifest's serverVersion\npin. (A condition argument absent from the live schema and the uncovered-tool\nINFO stay advisory, never fatal.) A launch-time global override: applies to every\npoliced route, regardless of a per-route 'strictDrift' in the config. Routes with\nno policy are unaffected; the proxy warns if the flag matched no policed route\n(e.g. with --audit)."),
@@ -540,7 +542,7 @@ func cmdProxy(args []string) (exitCode int) {
 
 	// Build call counter and kill-switch manager, shared across routes and the
 	// kill-switch endpoint. Backed by Redis when --redis-addr is set.
-	counter, flowStore, ks, ksRedis, err := buildCallCounterAndKillSwitch(*f.redisAddr, resolveRedisPassword(*f.redisPassword), *f.redisTLS, *f.killswitchFailOpen, *f.killswitchReconcile, *f.maxCallCounterKeys)
+	counter, flowStore, ks, ksRedis, err := buildCallCounterAndKillSwitch(*f.redisAddr, resolveRedisPassword(*f.redisPassword), *f.redisTLS, *f.killswitchFailOpen, *f.killswitchReconcile, *f.killswitchSessionTTL, *f.maxCallCounterKeys)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "eunox proxy: %v\n", err)
 		return 1
@@ -651,7 +653,7 @@ func resolveRedisPassword(flagVal string) string {
 //
 // A Redis config or connectivity error is returned rather than exited on, so the
 // caller owns the exit code and the failure path is drivable from a test.
-func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, killswitchFailOpen bool, killswitchReconcile time.Duration, maxCallCounterKeys int) (capability.CallCounter, capability.FlowLabelStore, killswitch.Manager, *killswitch.Redis, error) {
+func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, killswitchFailOpen bool, killswitchReconcile, killswitchSessionTTL time.Duration, maxCallCounterKeys int) (capability.CallCounter, capability.FlowLabelStore, killswitch.Manager, *killswitch.Redis, error) {
 	var (
 		counter capability.CallCounter = callcounter.NewInMemory(callcounter.WithMaxKeys(maxCallCounterKeys))
 		// The in-memory flow store has no time window (a taint lives until the session's
@@ -694,6 +696,13 @@ func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, ki
 		ksRedis = killswitch.NewRedis(rdb,
 			killswitch.WithFailOpen(killswitchFailOpen),
 			killswitch.WithReconcileInterval(killswitchReconcile),
+			// WithSessionKillTTL(0) keeps the 30-day default. It is wired to a flag rather
+			// than left hardwired because the expiry LIFTS the kill: a deployment that pins
+			// and reuses one --session-id (the normal way to run a long-lived stdio agent)
+			// can outlive the default, and the revoked session is then re-admitted with no
+			// operator action. Both directions need to be reachable -- raise it past the
+			// longest session, or make it permanent -- so it cannot be a constant.
+			killswitch.WithSessionKillTTL(killswitchSessionTTL),
 			killswitch.WithLogger(slog.New(slog.NewTextHandler(os.Stderr, nil))))
 		ks = ksRedis
 		if killswitchFailOpen {
@@ -704,8 +713,31 @@ func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, ki
 		if killswitchReconcile > 0 {
 			fmt.Fprintf(os.Stderr, "[eunox] Kill switch: reconcile interval %s (--killswitch-reconcile-interval); bounds kill-propagation and fail-closed post-recovery denial windows.\n", killswitchReconcile)
 		}
+		// State the session-tombstone lifetime unconditionally, including the default. It
+		// is the one kill-switch setting whose expiry LIFTS a revocation, so an operator
+		// running a pinned, reused --session-id needs to see the number without having to
+		// know the flag exists to ask for it.
+		fmt.Fprintf(os.Stderr, "[eunox] Kill switch: %s (--killswitch-session-ttl). Agent kills never expire.\n", sessionKillTTLNotice(killswitchSessionTTL))
 	}
 	return counter, flowStore, ks, ksRedis, nil
+}
+
+// sessionKillTTLNotice renders the startup line describing how long a session-kill
+// tombstone survives, resolving the flag's two sentinel values the way
+// killswitch.WithSessionKillTTL does (0 = the 30-day default, negative = never expire) so
+// the banner cannot claim one lifetime while Redis enforces another.
+func sessionKillTTLNotice(ttl time.Duration) string {
+	switch {
+	case ttl < 0:
+		// No CLI subcommand un-kills a session today (killswitch.ReviveSession/Reset are
+		// library-only), so do not name one: the tombstone key is what an operator has to
+		// remove, and saying so is more useful than a command that does not exist.
+		return "session kills never expire (--killswitch-session-ttl is negative); tombstones accumulate in Redis until their killswitch:session: keys are removed"
+	case ttl == 0:
+		return fmt.Sprintf("session kills expire after %s (default); a session held open longer than that is re-admitted", killswitch.DefaultSessionKillTTL)
+	default:
+		return fmt.Sprintf("session kills expire after %s; a session held open longer than that is re-admitted", ttl)
+	}
 }
 
 // openConfiguredAuditSink resolves the audit-sink settings (config's audit block
@@ -943,6 +975,7 @@ var redisGatedFlags = []string{
 	"redis-tls",
 	"killswitch-fail-open",
 	"killswitch-reconcile-interval",
+	"killswitch-session-ttl",
 }
 
 // validateProxyNumericFlags rejects negative values for the proxy's numeric limit flags,
@@ -1471,9 +1504,10 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 		// rejected, so claiming "intersecting" unconditionally would mislead operators.
 		// Redact before printing: some IdPs gate the JWKS endpoint behind a query key or
 		// basic-auth userinfo, and this banner goes to the same stderr the systemd journal,
-		// container logs, and the doctor bundle collect. config.RedactURL is the one
-		// redactor the upstream-URL log sites already use; the JWKS URI — the root of trust
-		// for token verification — must not be the exception.
+		// container logs, and the doctor bundle collect. That is a log surface, so it takes
+		// the strict log-facing redactor (scheme://host only) the other banner and
+		// validation-error sites use; the JWKS URI — the root of trust for token
+		// verification — must not be the exception.
 		safeJWKS := capability.RedactURLForLog(pf.jwksURI)
 		if pf.jwtExperimentalCaps {
 			fmt.Fprintf(os.Stderr, "[eunox] JWT PDP enabled (JWKS URI: %s); intersecting per-route manifests with experimental mcp.capabilities claims\n", safeJWKS)
@@ -2074,34 +2108,11 @@ func bindExposesAllInterfaces(bindHost string) bool {
 }
 
 // refuseNonRegularOutput fails closed unless path is a regular file or genuinely absent.
-//
-// It guards every writer that truncates an operator-supplied destination. O_EXCL refuses to
-// follow a symlink for free, so a create-only write needs nothing; the moment a writer drops
-// O_EXCL for O_TRUNC (an --output overwrite, the doctor bundle) it will happily follow an
-// attacker-planted link at that path and truncate the link's TARGET — and any subsequent
-// fd Chmod re-modes that target too. A shared, world-writable directory is enough.
-//
-// Lstat does not follow the final path component, so this inspects the link itself. A
-// missing path is fine (the caller is about to create it). Any OTHER stat error is an
-// error, not an implicit "not a symlink": gating the refusal on "stat succeeded" would let
-// a stat fault skip the check, which is the fail-open direction this exists to prevent.
-// internal/audit's rotate.go applies the same rule to the audit log; this is its
-// cmd/eunox twin, kept separate because the audit one is unexported to that package.
+// It is the binding of the shared guard in internal/config for the writers that truncate
+// an operator-supplied destination (--output, the doctor bundle); see
+// config.RefuseNonRegularPath for what the guard covers.
 func refuseNonRegularOutput(path string) error {
-	fi, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("checking %q before overwrite: %w", path, err)
-	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("%q is a symbolic link; refusing to follow it and overwrite its target — remove the link or choose a different path", path)
-	}
-	if !fi.Mode().IsRegular() {
-		return fmt.Errorf("%q is not a regular file; refusing to overwrite it", path)
-	}
-	return nil
+	return config.RefuseNonRegularPath(path, "output file")
 }
 
 // writeGeneratedFile writes content to path at mode 0600, refusing to clobber a

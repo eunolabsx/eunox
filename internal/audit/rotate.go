@@ -15,6 +15,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/eunolabs/eunox/internal/config"
 )
 
 // rotateBackoffWritten returns the value rotate() backs s.written off to after a
@@ -331,33 +333,14 @@ func openGuardedAppend(logPath string) (*os.File, error) {
 	return os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY|openNoFollow, 0o600) //nolint:gosec // G304: path is user-configured audit log location
 }
 
-// refuseNonRegular fails closed unless logPath is a regular file or genuinely absent. It is
-// the single implementation of the audit-log symlink/non-regular open guard, shared by the
+// refuseNonRegular fails closed unless logPath is a regular file or genuinely absent. It
+// is the audit log's binding of the shared guard in internal/config, applied by the
 // startup open (openAndPrepareLog) and the two post-rotation reopen sites (via
-// openGuardedAppend) so a change to the check cannot leave one site weaker than the other.
-// os.OpenFile FOLLOWS a symlink, so opening the log through one would redirect the
-// tamper-evident tape AND drop the live log out of LogChainFiles' IsRegular() scan —
-// audit-verify would then PASS without reading a single record. Only a genuinely-absent
-// path (fs.ErrNotExist) is let through: the ordinary fresh-install and post-rename case
-// O_CREATE then fills. Any OTHER Lstat error (EIO, NFS ESTALE, ELOOP, EACCES on a path
-// component) is REFUSED, not assumed benign — gating the refusal on "stat succeeded" would
-// let a stat fault skip the check and follow a symlink, the fail-OPEN direction this guard
-// exists to prevent. Lstat inspects the path itself, not its target. A Lstat->open TOCTOU
-// remains (a symlink planted between this check and the open is still followed); closing it
-// fully needs O_NOFOLLOW-level atomicity, not portable here, so this guard closes the
-// steady-state and stat-error holes while the caller keeps the rename->reopen window narrow.
+// openGuardedAppend) so a change to the check cannot leave one site weaker than the
+// other. See config.RefuseNonRegularPath for what the guard covers and the residual
+// Lstat->open window openNoFollow narrows here.
 func refuseNonRegular(logPath string) error {
-	fi, statErr := os.Lstat(logPath)
-	if statErr != nil {
-		if errors.Is(statErr, fs.ErrNotExist) {
-			return nil
-		}
-		return fmt.Errorf("refusing audit log path %q: cannot stat it (%v); refusing a path that may be a symlink or other non-regular file", logPath, statErr)
-	}
-	if !fi.Mode().IsRegular() {
-		return fmt.Errorf("refusing a non-regular log path %q (mode %v): the audit log must be a regular file, not a symlink or other special file", logPath, fi.Mode())
-	}
-	return nil
+	return config.RefuseNonRegularPath(logPath, "audit log path")
 }
 
 func (s *Sink) rotate() {
@@ -529,6 +512,12 @@ func (s *Sink) retryRotateReopen() {
 // so losing a rotated file never wedges the audit path. Drainer-only (no lock).
 func (s *Sink) pruneRotated() {
 	if s.retain <= 0 {
+		// Retention disabled: nothing to prune, and nothing to clear either. Only the
+		// retention leg below can set the stall on this path, and it needs retain > 0, so
+		// there is no retention stall to be in. Clearing here anyway would be a
+		// cross-subsystem write — the flag is shared with the rotation-ordinal deferral,
+		// which owns its own clear — so a future rotation stall reaching this pass would
+		// be erased while the size bound went unenforced.
 		return
 	}
 	// Genuine rotated siblings only, oldest-first, via the shared helper so pruning
@@ -554,6 +543,11 @@ func (s *Sink) pruneRotated() {
 		rotated = filtered
 	}
 	if len(rotated) <= s.retain {
+		// Retention is satisfied, so it is not stalled — however it got there. Clearing
+		// only after the delete loop below succeeded meant a stall resolved by an operator
+		// removing the undeletable file by hand stayed reported on /healthz and in doctor
+		// until the process restarted, since every later pass reached this return first.
+		s.clearMaintenanceStalled()
 		return
 	}
 	// Delete oldest-first. On the FIRST real failure, STOP rather than continue:

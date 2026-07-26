@@ -366,6 +366,90 @@ func (failingKillSwitch) Status(context.Context) (*killswitch.Status, error) {
 	return nil, errors.New("backend down")
 }
 
+// TestSessionCapDeny_CarriesRouteStamp pins the session-cap refusal's record SHAPE. It
+// shares a denial code with the per-session in-flight cap, so it must share the record
+// shape too: written through the ROUTE's sink, carrying the route name and policy stamp.
+// It previously went through the proxy-wide, route-unstamped pre-session path, leaving one
+// denial code with two shapes depending on which cap the flood happened to hit.
+func TestSessionCapDeny_CarriesRouteStamp(t *testing.T) {
+	sink, logPath := newTempAuditSink(t)
+	proxy := &HTTPProxy{sink: sink, preSessionDenies: newPreSessionDenyLimiter()}
+	route := &UpstreamRoute{
+		name: "github",
+		sink: &routeSink{sink: sink, upstream: "github", policyVersion: "1.2.3", policySHA256: "sha256:abc"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/mcp/github", http.NoBody)
+
+	proxy.recordSessionCapDeny(req, route)
+
+	_ = sink.Close()
+	rec := findAuditRecordByCode(readAuditRecords(t, logPath), "RESOURCE_EXHAUSTED")
+	if rec == nil {
+		t.Fatal("expected a RESOURCE_EXHAUSTED record for the session-cap refusal")
+	}
+	if got, _ := rec["upstream"].(string); got != "github" {
+		t.Errorf("upstream = %q, want the route name — the session-cap record must carry the same route stamp as its in-flight-cap sibling", got)
+	}
+	if got, _ := rec["policy_version"].(string); got != "1.2.3" {
+		t.Errorf("policy_version = %q, want 1.2.3", got)
+	}
+	details, _ := rec["details"].(map[string]interface{})
+	if details == nil || details["reason"] != "session_limit_reached" {
+		t.Errorf("details = %v, want reason=session_limit_reached", details)
+	}
+	// The rate limit is retained: unlike the in-flight cap, this refusal is reachable
+	// without an established session, so it must stay behind the pre-session limiter.
+	if got, _ := rec["session_id"].(string); got != "" {
+		t.Errorf("session_id = %q, want empty — no session exists at the cap refusal", got)
+	}
+}
+
+// TestNotificationSaturation_RecordsResourceExhausted: the notification pool's drop must
+// leave the same RESOURCE_EXHAUSTED record its request-pool sibling does. The notification
+// most worth having on the tape is notifications/cancelled — an incident responder asking
+// why an aborted call ran to completion cannot get that answer from stderr alone.
+func TestNotificationSaturation_RecordsResourceExhausted(t *testing.T) {
+	sink, logPath := newTempAuditSink(t)
+	proxy, proxySrv := newTestRemoteProxy(t, startFakeUpstream(t, newFullFakeUpstream()), httpProxyOptions{
+		PDP:        pdp.AlwaysAllowPDP{},
+		DriftCheck: drift.CheckFunc(func(json.RawMessage, string, error) error { return nil }),
+		Sink:       sink,
+	})
+	sid := initSession(t, proxySrv)
+
+	sess := proxy.getSession(sid)
+	if sess == nil {
+		t.Fatal("session not found after initialize")
+	}
+	for i := 0; i < maxConcurrentSessionNotifications; i++ {
+		if !sess.tryAcquireNotifySlot() {
+			t.Fatalf("acquire %d must succeed within the cap", i)
+		}
+	}
+
+	resp := postMCP(t, proxySrv, mcp.RPCMsg{
+		JSONRPC: "2.0",
+		Method:  "notifications/cancelled",
+		Params:  json.RawMessage(`{"requestId":7}`),
+	}, sid)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("dropped notification status = %d, want 202 (fire-and-forget ack)", resp.StatusCode)
+	}
+	_ = resp.Body.Close()
+
+	_ = sink.Close()
+	rec := findAuditRecordByCode(readAuditRecords(t, logPath), "RESOURCE_EXHAUSTED")
+	if rec == nil {
+		t.Fatal("expected a RESOURCE_EXHAUSTED record when the notification pool is saturated")
+	}
+	if method, _ := rec["method"].(string); method != "notifications/cancelled" {
+		t.Errorf("record method=%q, want notifications/cancelled", method)
+	}
+	if got, _ := rec["session_id"].(string); got != sid {
+		t.Errorf("record session_id=%q, want the established session %q", got, sid)
+	}
+}
+
 // TestUnsupportedMediaType_RecordsRefusal pins that a 415 lands on the tamper-evident
 // tape like every other transport-level refusal. Without it, a content-type sweep of
 // the sessionless initialize POST — the one /mcp entry point that needs no custom

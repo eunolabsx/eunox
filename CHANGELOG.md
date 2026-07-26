@@ -27,6 +27,13 @@ Section conventions:
 
 ### Added
 
+- `--killswitch-session-ttl` (Redis backend only) sets how long a **session** kill
+  tombstone survives before it is garbage-collected. The lifetime was hardwired at 30
+  days with the underlying option reachable only by a library consumer, and when a
+  tombstone expires the kill is **lifted** — so a long-lived stdio agent that pins and
+  reuses one `--session-id` silently re-admitted a revoked session. A negative value
+  restores permanent tombstones; agent kills are never expired. The effective lifetime
+  is now printed at startup even at its default, since the expiry undoes a revocation.
 - A **successful** `POST /control/kill` now writes an audit record (an allow with
   method `control/kill` and `details.scope` — the killed session id, or `all`).
   Refusals of the endpoint were already recorded and so were the `KILL_SWITCH`
@@ -52,6 +59,32 @@ Section conventions:
 
 ### Changed
 
+- **The Redis kill switch's fail-closed staleness budget is floored against a real
+  refresh-cycle cost**, instead of being a bare two reconcile intervals. The budget
+  gates a total, non-downgradable denial, and a refresh cycle (a `GET` plus two `SCAN`
+  loops, retried when a concurrent kill races the scan) is not proportional to the
+  interval — so lowering the interval for faster kill propagation, which the flag's own
+  help text recommends, could make that denial **more** likely against a perfectly
+  healthy Redis. At the default 30s interval the window is unchanged (60s). The floor is
+  a trade: for a refresh that *hangs* rather than errors — the one case this gate is the
+  sole detector — a 1s interval now serves the last-known cache for ~31s instead of ~2s
+  before failing closed. Faster kill *propagation* is unaffected; only this
+  hang-detection window no longer shrinks with the interval.
+- The session-cap refusal is recorded through the same route-stamped helper as the
+  per-session in-flight cap, so one `RESOURCE_EXHAUSTED` code no longer produces two
+  record shapes depending on which cap a flood happened to hit. It keeps the
+  pre-session rate limit, which the in-flight sibling does not need.
+- eunox's own control-token directory (`~/.eunox`) is chmod'ed back to 0700 when an
+  older version left it looser, and a control-token path pointing at a group/world-
+  **writable**, non-sticky directory is refused: any local user could substitute the
+  token there and take over the loopback emergency stop. An operator-chosen directory
+  is still never chmod'ed (forcing 0700 on `/tmp` would strip its sticky bit), and
+  neither is a symlinked one — `os.Chmod` follows links and there is no portable
+  `lchmod`, so tightening a symlinked `~/.eunox` would rewrite the mode of whatever it
+  points at. "eunox's own directory" is decided by resolved location, not by how the
+  operator spelled the flag: a systemd unit cannot write `~`, and a shell expands it
+  before eunox sees it, so keying on the raw string skipped exactly the deployments the
+  upgrade repair exists for.
 - **A refused `Content-Type` is now recorded** as the non-policy denial code
   `UNSUPPORTED_MEDIA_TYPE`, carrying only `details.header_count` — never the
   attacker-supplied header value. It was the one transport-level refusal leaving no
@@ -150,6 +183,65 @@ Section conventions:
 
 ### Fixed
 
+- **`redactFields` skipped a field sitting directly on a top-level result key.** The
+  pass descended into each non-`content`/`structuredContent` key looking for matches
+  nested inside its value but never tested the key's own name, so
+  `{"content":[...],"ssn":"..."}` forwarded the SSN verbatim while the equivalent
+  nested shape `{"data":{"ssn":"..."}}` was masked — same obligation, same field name,
+  opposite outcome depending on how deep the upstream put it.
+- **A manifest-absent tool forwarded under `--audit` recorded no `sequenceBlock`
+  antecedent.** Every other downgradable deny branch records one; this one did not, so
+  a later enforced `sequenceBlock` naming a tool an observe run had forwarded Peeked an
+  empty history and failed open — breaking "observe predicts enforce" for exactly the
+  targets an observe run exists to discover.
+- **A `null`, scalar, or array `tools/list` entry poisoned every pinned tool on the
+  route.** Such an entry carries no top-level name, so it can impersonate no pin; it
+  was nonetheless given the "names unknown" verdict reserved for an entry whose bytes
+  defeated the scan, escalating to a sticky, process-lifetime poison of every pin. It
+  is still untrustworthy and still pruned from the catalog, but now poisons nothing.
+- The JWT list filter's caller-rejecting branches (no claims, audience mismatch)
+  returned an empty listing without running the inner PDP's filter, so the
+  `descriptionHash` pin was never re-armed from that listing's bytes.
+- **`RedactURL` returned a single-slash-typo URL verbatim.** `https:/user:pass@host/x`
+  parses with the credential in the path, which no scrub inspected, so the raw value
+  was printed. The guard is anchored on `url.Parse`'s own report that the value carried
+  no authority marker, not on a substring scan: a scan for `//` (or `://`) anywhere in
+  the string is defeated by one appearing later — in a path or a query
+  (`.../x?next=https://portal`) — which echoed the credential. A genuine authority-less
+  URL (`file:///a@b/x`) keeps its path, and a scheme-less value
+  (`/var/log/eunox@prod/audit.jsonl`) is left alone: it is an ordinary path, and audit
+  targets are commonly exactly that.
+- `trustedProxyHops` joined the gateway config's numeric-coercion guard. A leading-zero
+  value (`trustedProxyHops: 010`) was silently read as YAML octal 8, so `sourceIP()`
+  picked the wrong X-Forwarded-For entry as the client and misattributed the IP every
+  `ipRange` condition on the route evaluates against.
+- A resolved audit-retention stall kept being reported on `/healthz` until process
+  restart when the sibling count dropped to the retain bound by manual cleanup rather
+  than by the delete loop itself succeeding.
+- The per-session notification-pool drop is recorded on the audit tape like its
+  request-pool sibling. `notifications/cancelled` is the one an incident responder most
+  needs, and stderr alone is not the tamper-evident trail.
+- The unverified `claimed_session_id` is sanitized to valid UTF-8 and then truncated on
+  a rune boundary. A byte-level cut left dangling continuation bytes that `json.Marshal`
+  rewrote to U+FFFD, so the signed value no longer matched the raw header a SIEM holds;
+  and because Go admits bytes >= 0x80 in a header value, a rune walk-back applied to the
+  raw bytes could retreat to zero and stamp an EMPTY id for a full-length header.
+- `eunox kill --redis-addr` accepts `--killswitch-session-ttl`. The tombstone's TTL is
+  applied by whichever process WRITES it, and this is the only out-of-band revocation
+  channel a stdio proxy has — so a kill issued here carried the 30-day default even
+  when the proxy ran with a longer or never-expiring value, and the session came back.
+- A manifest-absent tool forwarded under `--audit` records its `sequenceBlock`
+  antecedent only when some `sequenceBlock` actually names it in `afterTools`. That
+  branch is the one antecedent site whose target name is not bounded by the manifest,
+  and each record costs a call-counter key for the history window — so recording every
+  made-up name let a caller mint keys until the counter capped, at which point the
+  record fails and the antecedent path returns a hard deny that `--audit` cannot
+  downgrade, turning an observe route into a deny-all route.
+- `redactFields` no longer masks an MCP-reserved result component wholesale when a
+  single-segment path names it (`isError` is a bool, `contents`/`messages` are arrays,
+  so a `"[redacted]"` string made the result undecodable). A dotted path *through* one
+  — `structuredContent.ssn`, the fully-qualified spelling the manifest guide recommends
+  — now resolves to the leaf it names instead of being skipped.
 - `eunox proxy` no longer leaks its cancel function, signal registration, or a failed
   Redis client. All three were unobservable while the function ended in `os.Exit`;
   returning an exit code made them real for any in-process caller.

@@ -47,6 +47,11 @@ const (
 	defaultSessionKillTTL = 30 * 24 * time.Hour
 )
 
+// DefaultSessionKillTTL is the exported form of the default session-tombstone lifetime,
+// so the binary's startup banner can state the effective value rather than restating the
+// number and drifting from it.
+const DefaultSessionKillTTL = defaultSessionKillTTL
+
 // subscribeConfirmTimeout bounds the initial pub/sub subscription-confirmation read in
 // Start. pubsub.Receive issues a deadline-less socket read (go-redis passes timeout=0),
 // so a blackholed or half-open connection -- the TCP dial and SUBSCRIBE write are
@@ -652,15 +657,58 @@ func (r *Redis) clock() time.Time {
 	return time.Now()
 }
 
+// maxRefreshCycleBudget is how long one healthy refresh cycle may plausibly take
+// end-to-end: a GET plus two SCAN loops, each a series of round trips bounded only by the
+// caller-supplied client's own timeouts, and the whole thing retried up to
+// maxRefreshAttempts times when a concurrent kill keeps racing the scan. None of that is
+// a fault, and none of it is proportional to the reconcile interval.
+//
+// It exists because the staleness budget gates a TOTAL, non-downgradable denial (in the
+// default fail-closed mode a stale cache denies every request, even under --audit). A bare
+// multiple of the reconcile interval makes that denial MORE likely the lower the interval
+// goes — and lowering it is exactly what the flag's own help text recommends for faster
+// kill propagation, so tuning for responsiveness could take the data plane down against a
+// perfectly healthy Redis.
+const maxRefreshCycleBudget = 30 * time.Second
+
 // staleness returns how old a confirmed refresh may be before the cache is treated as
 // unconfirmed. Two reconcile intervals: one missed tick is ordinary jitter, two means the
 // convergence loop is not running or Redis is not answering.
+//
+// Floored at one interval plus a realistic refresh-cycle budget, because the stamp is set
+// when a refresh COMPLETES: the next tick fires an interval later and then takes up to a
+// cycle to finish, so the age at the moment of the next successful stamp is legitimately
+// interval + cycle even when nothing is wrong. At the default 30s interval the floor and
+// the multiple coincide exactly (60s), so only a lowered interval sees any change.
+//
+// The floor is a TRADE, and it runs against revocation latency in the one case the
+// staleness gate is the sole detector: a refresh that HANGS rather than errors (a
+// blackholed or half-open connection). An outright failure latches lastRefreshErr and
+// livenessLocked reports killRefreshFailed before ever consulting staleness, so only the
+// hang reaches here. For that case an operator who set --killswitch-reconcile-interval to
+// 1s now serves the last-known cache for ~31s instead of ~2s before failing closed, so a
+// kill issued elsewhere during the hang goes unenforced for that much longer.
+//
+// It is still the right default: without the floor, the same operator's HEALTHY Redis was
+// judged stale whenever one ordinary refresh cycle outran two intervals, and fail-closed
+// mode then denied ALL traffic — a certain, self-inflicted outage traded against a longer
+// window on a rare failure mode. Tuning the interval down for faster kill PROPAGATION
+// (the pub/sub-miss reconvergence the flag's help describes) still works exactly as
+// documented; it is only this hang-detection window that no longer shrinks with it.
 func (r *Redis) staleness() time.Duration {
 	iv := r.reconcileInterval
 	if iv <= 0 {
 		iv = defaultReconcileInterval
 	}
-	return 2 * iv
+	budget := max(2*iv, iv+maxRefreshCycleBudget)
+	if budget <= 0 {
+		// Both terms overflowed int64 (an absurd interval near the duration ceiling). A
+		// negative budget makes staleLocked true forever, which in fail-closed mode denies
+		// every request against a perfectly healthy backend — fail back to the floor
+		// rather than to a total outage.
+		return maxRefreshCycleBudget
+	}
+	return budget
 }
 
 // staleLocked reports whether the cache has gone too long without a confirmed refresh.
@@ -937,14 +985,7 @@ func (r *Redis) refreshState(ctx context.Context) error {
 		r.mu.Lock()
 		if r.cacheGen == startGen {
 			// No cache mutation raced the scan: the snapshot is consistent.
-			r.globalActive = newGlobal
-			r.killedAgents = newAgents
-			r.killedSessions = newSessions
-			// The scan succeeded, so the backend was reachable: clear the health stamp.
-			// refreshMu serializes refreshes, so no concurrent refresh can have recorded
-			// a fresher error between this scan's start and this commit.
-			r.lastRefreshErr = nil
-			r.lastRefreshOK = r.clock()
+			r.commitRefreshLocked(newGlobal, newAgents, newSessions)
 			r.mu.Unlock()
 			return nil
 		}
@@ -957,25 +998,38 @@ func (r *Redis) refreshState(ctx context.Context) error {
 		// Sustained mutation across every attempt (pathological): commit the scan but
 		// UNION in the kills the cache gained concurrently so none is erased. This
 		// biases fail-closed (a revoked entry is retained, not dropped); the next
-		// reconcile reconciles any raced deletion. lastRefreshErr is cleared since the
-		// Redis read succeeded.
+		// reconcile reconciles any raced deletion.
 		for a := range r.killedAgents {
 			newAgents[a] = true
 		}
 		for s := range r.killedSessions {
 			newSessions[s] = true
 		}
-		newGlobal = newGlobal || r.globalActive
-		r.globalActive = newGlobal
-		r.killedAgents = newAgents
-		r.killedSessions = newSessions
-		// As in the clean-commit path, the Redis read succeeded, so clear the health
-		// stamp; refreshMu guarantees no fresher error raced this refresh.
-		r.lastRefreshErr = nil
-		r.lastRefreshOK = r.clock()
+		r.commitRefreshLocked(newGlobal || r.globalActive, newAgents, newSessions)
 		r.mu.Unlock()
 		return nil
 	}
+}
+
+// commitRefreshLocked installs a completed scan's snapshot and stamps the refresh as
+// healthy. Caller must hold r.mu for writing.
+//
+// The two commit sites -- the clean one and the sustained-mutation fallback, twenty lines
+// apart -- ran the identical five statements. Sharing them is not cosmetic: the health
+// stamp is the pair (lastRefreshErr cleared, lastRefreshOK set), and the staleness gate
+// denies ALL traffic in fail-closed mode when it is not maintained. A future field added
+// to that stamp on one commit path and not the other would leave the fallback path
+// committing a snapshot that reads as unconfirmed.
+//
+// Clearing lastRefreshErr is correct on both: the Redis read succeeded, and refreshMu
+// serializes refreshes, so no concurrent refresh can have recorded a fresher error
+// between this scan's start and this commit.
+func (r *Redis) commitRefreshLocked(global bool, agents, sessions map[string]bool) {
+	r.globalActive = global
+	r.killedAgents = agents
+	r.killedSessions = sessions
+	r.lastRefreshErr = nil
+	r.lastRefreshOK = r.clock()
 }
 
 // scanner is the subset of a Redis node needed to enumerate keys by prefix. Both

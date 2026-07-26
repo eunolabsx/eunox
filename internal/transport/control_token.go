@@ -32,6 +32,71 @@ const ControlTokenHeader = "X-Eunox-Control-Token" //nolint:gosec // G101: heade
 // when --control-token-path is not set and EUNOX_CONTROL_TOKEN is not used.
 const defaultControlTokenPath = "~/.eunox/control.token" //nolint:gosec // G101: a file path, not a credential
 
+// tightenTokenDir enforces the mode of a PRE-EXISTING control-token directory. The
+// split is by who owns the location, not by how loose the mode is:
+//
+//   - eunoxOwned (the default ~/.eunox, which only eunox writes): chmod to 0700 and fail
+//     closed if that cannot be done. This is the upgrade path — an older version, or a
+//     packaging step, that left the directory 0755 must not leave the loopback
+//     emergency-stop token sitting in a directory the docs claim is 0700. There is no
+//     shared-use case for this directory, so tightening it cannot break anyone.
+//   - operator-chosen (--control-token-path pointing at /tmp, /var/run, /etc/eunox):
+//     never chmod. Forcing 0700 would strip /tmp's sticky bit and world access
+//     (system-wide breakage as root) or fail with EPERM on a directory the user does not
+//     own. A merely group/world-READABLE directory is warned about — the token file
+//     itself is 0600, so its bytes stay unreadable. A group/world-WRITABLE directory
+//     without the sticky bit is refused outright: any local user can then rename the
+//     token file away and substitute their own, which hands them the emergency stop.
+//     That is an authorization hole, and the fail-closed rule applies.
+//
+// fi is the RESOLVED directory (os.Stat, symlinks followed), because the mode that
+// matters for both the warning and the refusal is the one that actually governs the
+// directory the token lands in. eunoxOwned is false whenever the path is a symlink, so
+// the chmod never fires through one: os.Chmod follows links, and there is no portable
+// lchmod, so tightening a symlinked ~/.eunox would silently rewrite the mode of whatever
+// it points at — /tmp losing its sticky bit being the worst case. Warning about a linked
+// directory is safe; mutating one eunox did not create is not.
+func tightenTokenDir(dir string, fi os.FileInfo, eunoxOwned bool) error {
+	perm := fi.Mode().Perm()
+	if perm&0o077 == 0 {
+		return nil
+	}
+	if eunoxOwned {
+		if err := os.Chmod(dir, 0o700); err != nil { //nolint:gosec // G302: 0700 is the intended restrictive mode -- this call exists to REMOVE group/world access, matching the MkdirAll above
+			return fmt.Errorf("restricting control-token directory %q (mode %v) to 0700: %w", dir, perm, err)
+		}
+		return nil
+	}
+	if perm&0o022 != 0 && fi.Mode()&os.ModeSticky == 0 {
+		return fmt.Errorf("control-token directory %q has mode %v (group/world-writable, no sticky bit): another local user could replace the loopback control token and take over the emergency stop; restrict it to 0700 or point --control-token-path elsewhere", dir, perm)
+	}
+	fmt.Fprintf(os.Stderr, "[eunox] WARNING: control-token directory %q has mode %v (group/world-accessible); eunox does not tighten a pre-existing directory it did not create — restrict it to 0700 yourself to protect the loopback control token\n", dir, perm)
+	return nil
+}
+
+// eunoxOwnedTokenDir reports whether dir is eunox's OWN control-token directory — the
+// one the default --control-token-path lives in, which nothing else writes — and so may
+// be tightened in place.
+//
+// It compares resolved LOCATIONS, not the spelling of the flag. Keying on the raw string
+// made the identical directory take different security treatment depending on how the
+// operator typed it: a systemd unit cannot use "~", and an interactive shell expands it
+// before eunox ever sees the argument, so the deployments most likely to be carrying a
+// 0755 ~/.eunox left by an older release were exactly the ones the upgrade repair skipped.
+//
+// A symlink is never eunox-owned however it resolves: see tightenTokenDir on why the
+// chmod must not follow one.
+func eunoxOwnedTokenDir(dir string) bool {
+	if lfi, err := os.Lstat(dir); err != nil || lfi.Mode()&os.ModeSymlink != 0 {
+		return false
+	}
+	expandedDefault, err := expandHome(defaultControlTokenPath)
+	if err != nil {
+		return false
+	}
+	return filepath.Clean(dir) == filepath.Clean(filepath.Dir(expandedDefault))
+}
+
 // GenerateControlToken returns a fresh 256-bit random token, hex-encoded. A
 // rand.Read failure is returned (fail closed) rather than producing a weak token.
 func GenerateControlToken() (string, error) {
@@ -43,8 +108,11 @@ func GenerateControlToken() (string, error) {
 }
 
 // WriteControlTokenFile writes token to path (default defaultControlTokenPath)
-// with 0600 perms under a 0700 directory, overwriting any previous token so a
-// stale one cannot be replayed. Returns the expanded absolute path written.
+// with 0600 perms, overwriting any previous token so a stale one cannot be
+// replayed. Returns the expanded absolute path written. The containing directory
+// is created at 0700 when missing; a pre-existing one is handled by
+// tightenTokenDir, which tightens eunox's own directory and refuses an
+// operator-chosen one that any local user could write the token file into.
 //
 // It writes a fresh temp file (0600 regardless of any pre-existing file's mode)
 // and atomically renames it into place, so the secret never lands in a
@@ -63,26 +131,19 @@ func WriteControlTokenFile(path, token string) (string, error) {
 		dir = "."
 	}
 	if dir != "." {
-		// Whether the directory ALREADY exists decides if we may tighten its mode: eunox
-		// must not chmod a directory it did not create. A non-default --control-token-path
-		// can point at a shared or operator-managed dir (/tmp, /var/run, /etc/eunox), and
-		// forcing it to 0700 would strip /tmp's sticky bit + world access (system-wide
-		// breakage as root) or fail with EPERM on a dir the user doesn't own (refusing to
-		// start). MkdirAll creates any MISSING dirs at 0700 already, so a dir we create
-		// needs no chmod; a pre-existing one we leave alone and only warn about.
+		// Whether the directory ALREADY exists decides how its mode is handled: MkdirAll
+		// creates any MISSING dir at 0700, so a dir eunox creates needs nothing further.
+		// A pre-existing one splits by ownership of the location (see tightenTokenDir).
 		fi, statErr := os.Stat(dir)
 		dirPreexisted := statErr == nil
 		if err := os.MkdirAll(dir, 0o700); err != nil { //nolint:gosec // G301: 0700 is the intended restrictive mode
 			return "", fmt.Errorf("creating control-token directory: %w", err)
 		}
 		if dirPreexisted {
-			// Warn (do not mutate) if a pre-existing dir is looser than 0700, so the
-			// operator can decide — the control token gates the loopback emergency stop, so
-			// a group/world-accessible directory is worth flagging. Reuse the FileInfo from
-			// the pre-existence stat above (MkdirAll does not touch an already-present dir),
-			// so the mode is read exactly once.
-			if fi.Mode().Perm()&0o077 != 0 {
-				fmt.Fprintf(os.Stderr, "[eunox] WARNING: control-token directory %q has mode %v (group/world-accessible); eunox does not tighten a pre-existing directory it did not create — restrict it to 0700 yourself to protect the loopback control token\n", dir, fi.Mode().Perm())
+			// Reuse the FileInfo from the pre-existence stat above (MkdirAll does not
+			// touch an already-present dir), so the mode is read exactly once.
+			if err := tightenTokenDir(dir, fi, eunoxOwnedTokenDir(dir)); err != nil {
+				return "", err
 			}
 		}
 	}

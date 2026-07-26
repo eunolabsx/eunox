@@ -1660,13 +1660,13 @@ func (p *JWTPDP) filterList(ctx context.Context, result json.RawMessage, desc li
 	claims, ok := jwtClaimsFromContext(ctx)
 	if !ok {
 		// No JWT claims: mirror Decide's hard-deny by emptying the listing without
-		// deferring to the inner PDP (filterList has no error channel).
-		return emptyListing(result, desc.key)
+		// deferring to the inner PDP's OUTPUT (filterList has no error channel).
+		return p.emptyListingArmingPins(ctx, result, desc)
 	}
 	// Per-route audience pin (mirrors Decide): a token minted for a different route's
 	// audience must not enumerate this route's catalog. Fail closed to an empty listing.
 	if !p.routeAudienceSatisfied(claims) {
-		return emptyListing(result, desc.key)
+		return p.emptyListingArmingPins(ctx, result, desc)
 	}
 	if !claims.HasCapabilities {
 		if p.innerEnforces() {
@@ -1768,6 +1768,35 @@ func (p *JWTPDP) innerFilter(
 		return passThroughList(result, fieldName)
 	}
 	return sel(p.inner, ctx, result)
+}
+
+// emptyListingArmingPins is emptyListing for the two branches that reject the CALLER
+// rather than the catalog — no JWT claims, and a token minted for another route's
+// audience. The host sees the same empty listing either way; what differs is that the
+// descriptionHash pin is still armed from the bytes the upstream returned.
+//
+// Without it the pin went un-refreshed for that caller's tools/list, so a catalog the
+// upstream had already poisoned was observed by nobody. Distinct from a
+// catalog-integrity break — Decide still hard-denies the actual call — but the pin should
+// not go stale merely because the caller's token was rejected. The bytes come from the
+// UPSTREAM, not the caller, so this arms from the genuine catalog: a rejected caller
+// controls only WHEN the observation happens, never what is observed.
+//
+// It calls RecordObservedToolHashes — the contract's named method for exactly this, whose
+// whole contract is "record the pinned tools' live hashes WITHOUT filtering the catalog"
+// — rather than running the inner list filter and discarding its output. That matters for
+// more than tidiness: the filter decodes every entry and scores it against every manifest
+// constraint, so on a large catalog the discarded pass cost a rejected caller MORE than a
+// fully authorized one, on the branch whose entire purpose is cheap fail-closed rejection.
+//
+// Tools only. Pins exist for tools alone, so running the resources or prompts filter here
+// armed nothing and was pure waste. RecordObservedToolHashes self-gates on the pinned set,
+// so a manifest declaring no descriptionHash pays nothing at all.
+func (p *JWTPDP) emptyListingArmingPins(ctx context.Context, result json.RawMessage, desc listTypeDesc) ListFilterResult {
+	if desc.key == listKeyTools && p.innerEnforces() {
+		_ = p.inner.RecordObservedToolHashes(ctx, result)
+	}
+	return emptyListing(result, desc.key)
 }
 
 // emptyListing empties every entry of one list kind (listKey, e.g. "tools") while

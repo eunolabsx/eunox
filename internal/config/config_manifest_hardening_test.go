@@ -41,6 +41,21 @@ upstreams:
 	if _, err := LoadGatewayConfig(writeConfig(t, base("  port: 8080\n"))); err != nil {
 		t.Errorf("a plain decimal port must load, got %v", err)
 	}
+
+	// trustedProxyHops is the same class and was the one listen numeric left out of the
+	// guard: 010 reads as octal 8, and sourceIP() then picks the 8th X-Forwarded-For
+	// entry from the right as the client, misattributing the IP every ipRange condition
+	// on the route evaluates against.
+	_, err = LoadGatewayConfig(writeConfig(t, base("  port: 8080\n  trustedProxyHops: 010\n")))
+	if err == nil {
+		t.Fatal("expected a fail-closed error for an octal-coerced trustedProxyHops (010)")
+	}
+	if !strings.Contains(err.Error(), "unquoted YAML number") && !strings.Contains(err.Error(), "coerced") && !strings.Contains(err.Error(), "differs from the text") {
+		t.Errorf("error = %v, want it to name the numeric coercion", err)
+	}
+	if _, err := LoadGatewayConfig(writeConfig(t, base("  port: 8080\n  trustedProxyHops: 2\n"))); err != nil {
+		t.Errorf("a plain decimal trustedProxyHops must load, got %v", err)
+	}
 }
 
 // TestLoadGatewayConfig_RejectsEmptyPolicyEntry is a regression test: a policy

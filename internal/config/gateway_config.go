@@ -155,6 +155,7 @@ var gatewayNumericKeys = map[string]bool{
 	"port":                 true, // listen.port
 	"maxSessions":          true, // listen.maxSessions
 	"sessionIdleTimeoutMs": true, // listen.sessionIdleTimeoutMs
+	"trustedProxyHops":     true, // listen.trustedProxyHops
 	"rotateSizeBytes":      true, // audit.rotateSizeBytes
 	"retainRotated":        true, // audit.retainRotated
 	"upstreamTimeoutMs":    true, // defaults.upstreamTimeoutMs
