@@ -320,6 +320,37 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 	p.handleSessionPost(w, r, route, sessionID, msg)
 }
 
+// recordUnverifiedSessionKillDenial is recordKillDenial's counterpart for the one call site
+// where the session id has NOT been verified: handleSessionPost's sess == nil branch, where
+// sessionID is the raw, client-supplied Mcp-Session-Id header for a session that does not (or
+// no longer) exist. Every other recordKillDenial/recordKillDrop call site passes a session id
+// this proxy actually established, so stamping it into the structured, signed session_id
+// field is safe there. It is NOT safe here: a caller holding any valid-but-unrelated
+// credential (a route's shared bearer, or any JWT valid for this route's audience) could put
+// an arbitrary — including a real victim's — session id in the header and have it recorded as
+// fact whenever CheckKill fails closed (an active global kill, or a kill-store error).
+// Mirrors recordPreSessionDeny's addClaimedSessionID treatment instead: session_id stays
+// empty, and the claimed value survives, clearly marked unverified, as
+// details.claimed_session_id.
+func recordUnverifiedSessionKillDenial(rec auditRecorder, deny *capability.EnforceResponse, id *json.RawMessage, r *http.Request, method string) mcp.RPCMsg {
+	denial := normalizeDenial(deny.Denial)
+	if rec != nil {
+		rec.RecordDeny(r.Context(), "", method, method, denial.Code, denial.ConditionType, addClaimedSessionID(nil, r), false)
+	}
+	return denialResult(id, denial.Code, denial.ConditionType, method, "")
+}
+
+// recordUnverifiedSessionKillDrop is recordUnverifiedSessionKillDenial's notification-drop
+// counterpart, for the same unresolved-session call site.
+func recordUnverifiedSessionKillDrop(rec auditRecorder, deny *capability.EnforceResponse, r *http.Request, method string, transportLeg killDropLeg) {
+	if rec == nil {
+		return
+	}
+	denial := normalizeDenial(deny.Denial)
+	details := addClaimedSessionID(map[string]interface{}{"transport": string(transportLeg)}, r)
+	rec.RecordDeny(r.Context(), "", method, method, denial.Code, denial.ConditionType, details, false)
+}
+
 // handleSessionPost handles a host POST carrying an existing Mcp-Session-Id: it validates
 // the session/route binding and the per-route audience pin, then forwards a notification,
 // routes a host response back to the upstream, answers a re-initialize echo, or dispatches
@@ -338,13 +369,21 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 		// genuinely unknown session id (no kill) still 404s. The POST path handles this
 		// itself rather than via resolveSessionForRoute (used by the GET/SSE path) because
 		// only the request/notification framing here can carry a JSON-RPC KILL_SWITCH body.
+		//
+		// sessionID here is the raw, client-supplied header for a session that does not (or
+		// no longer) exist — unverified, unlike every other CheckKill call site's sessionID.
+		// Recording it via the shared recordKillDenial/recordKillDrop would stamp it into the
+		// signed session_id field, letting anyone whose credential merely clears
+		// CheckKill's fail-closed paths forge kill records against an arbitrary (including a
+		// real victim's) session id. Use the unverified-session counterparts instead: session_id
+		// stays empty and the claimed value survives only as details.claimed_session_id.
 		if deny := route.pdp.CheckKill(r.Context(), sessionID); deny != nil {
 			if msg.IsRequest() {
-				writeJSONMsg(w, recordKillDenial(r.Context(), asRecorder(route.sink), deny, msg.ID, sessionID, msg.Method))
+				writeJSONMsg(w, recordUnverifiedSessionKillDenial(asRecorder(route.sink), deny, msg.ID, r, msg.Method))
 			} else {
 				// Fire-and-forget (notification / response): record the drop and ack with a
 				// bodyless 202, matching the existing-session notification kill path below.
-				recordKillDrop(r.Context(), asRecorder(route.sink), deny, sessionID, msg.Method, msg.Method, legHTTPNotification)
+				recordUnverifiedSessionKillDrop(asRecorder(route.sink), deny, r, msg.Method, legHTTPNotification)
 				w.WriteHeader(http.StatusAccepted)
 			}
 			return
