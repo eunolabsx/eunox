@@ -12,12 +12,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"os"
-	"reflect"
-	"slices"
 	"strings"
-	"sync"
 	"time"
 	"unicode"
 )
@@ -35,6 +31,10 @@ var errKeyIDNotInRing = errors.New("audit record key_id is not in the verificati
 // caller reports UNVERIFIABLE rather than asserting tampering — still failing the
 // verdict (fail-closed), distinct from both INVALID and UNKNOWN_KEY_ID.
 var errUnidentifiedNoMatch = errors.New("audit record names no key_id and no ring key matched its HMAC")
+
+// errNonCanonicalRecord is returned by VerifyRecord's canonical-on-disk-form check;
+// see that check's comment in VerifyRecord for what it catches and why.
+var errNonCanonicalRecord = errors.New("signed audit record is not in canonical on-disk form: its bytes are not what the writer emits for these fields (a duplicate, re-spelled, or reordered key, an added zero-valued field, an alternate escape, or inserted whitespace) — the HMAC covers the record's fields, not its bytes, so a rewrite that decodes to the same fields is rejected here")
 
 // VerifyRecord re-computes the HMAC of a raw record line and reports whether it
 // matches. The record's key_id selects the key, so a log straddling a rotation
@@ -86,27 +86,55 @@ func (s *Sink) VerifyRecord(line []byte) (bool, error) {
 	if dec.More() {
 		return false, fmt.Errorf("trailing data after audit record")
 	}
-	// DisallowUnknownFields rejects only unknown top-level fields, NOT a duplicated
-	// KNOWN field, and encoding/json decode is last-wins. That gap is exploitable: an
-	// attacker with file-write access (but no signing key) can prepend a duplicate
-	// top-level key — {"decision":"allow",<original signed "decision":"deny" record>} —
-	// and both decodes still yield "deny", so the HMAC recomputed over the re-marshaled
-	// struct still matches and the record verifies, while any first-wins JSON consumer
-	// (SIEM ingest, jq, a human grep of the raw line) reads the attacker's "allow". The
-	// HMAC certifies the re-encoded struct, not the on-disk bytes, so reject any repeated
-	// top-level key to fail closed on this byte-level tamper. Signed records only: a
-	// legacy record carries no HMAC to contradict.
-	if isSignedRecord(rec) {
-		if err := rejectDuplicateTopLevelKeys(line); err != nil {
-			return false, err
-		}
-	}
 	storedHMAC := rec.HMAC
 	rec.HMAC = "" // zero before re-signing, matching Record()
 
 	body, err := json.Marshal(rec)
 	if err != nil {
 		return false, err
+	}
+	// The HMAC certifies the re-marshaled STRUCT, not the on-disk bytes, so every
+	// rewrite that decodes to the same fields survives it. An attacker with file-write
+	// access but no signing key can therefore rewrite a signed record's bytes and keep
+	// it verifying, while the line a byte-oriented consumer reads (SIEM ingest, jq, a
+	// grep of the raw log) says something else:
+	//
+	//   - a duplicate top-level key — {"decision":"allow",<the signed "deny" record>} —
+	//     since decoding is last-wins while many consumers are first-wins;
+	//   - a re-spelled key ("Decision", "DECISION"), since encoding/json binds fields
+	//     case-insensitively even under DisallowUnknownFields, and re-marshaling
+	//     restores the canonical spelling;
+	//   - a foreign zero-valued omitempty field ("agent_id":""), which the re-marshal
+	//     drops again, so it is invisible to the recomputed HMAC;
+	//   - an alternate escape of a value ("deny" spelled "\u0064eny"), or whitespace
+	//     inserted inside the object or the details subtree — all of which decode to
+	//     the very same value.
+	//
+	// Rather than enumerate those vectors one at a time, require the line to BE the
+	// bytes the writer emits for the fields it decoded to: rebuild the canonical line
+	// through the same splice writeRecord uses and compare. Anything the writer would
+	// not have produced is rejected, which covers the whole class rather than its
+	// currently-known members.
+	//
+	// This adds no cross-version fragility: the HMAC is already computed over
+	// json.Marshal of the struct, so any change to the field set or their order breaks
+	// old records' signatures regardless — canonical form and HMAC validity move
+	// together. Appending a new omitempty field stays compatible under both.
+	//
+	// Signed records only: a legacy (pre-HMAC) record predates the current struct and
+	// carries no signature to contradict, so it has no canonical form to compare with.
+	//
+	// Whitespace OUTSIDE the object is trimmed rather than rejected: it cannot add,
+	// remove, or re-spell a field, so it changes no consumer's reading of the record,
+	// and callers legitimately differ on whether the terminating newline is included.
+	if storedHMAC != "" {
+		canonical, cerr := isCanonicalSignedLine(bytes.TrimSpace(line), body, storedHMAC)
+		if cerr != nil {
+			return false, cerr
+		}
+		if !canonical {
+			return false, errNonCanonicalRecord
+		}
 	}
 	keys, kerr := s.keysToTry(rec.KeyID)
 	if kerr != nil {
@@ -137,142 +165,6 @@ func (s *Sink) VerifyRecord(line []byte) (bool, error) {
 		return false, errUnidentifiedNoMatch
 	}
 	return false, nil
-}
-
-// auditRecordTagSchema holds the two views of auditRecord's top-level json tags
-// that rejectDuplicateTopLevelKeys needs: exactTags is the set of canonical tag
-// spellings (for the byte-exact-spelling and case-variant checks), and
-// omitemptyFields maps each omitempty-tagged tag to its field's reflect.Type (for
-// the zero-value tamper check). Both are derived from a SINGLE reflect walk over
-// the struct so the tag-parsing rule (split off the first comma-separated segment,
-// skip "" and "-") lives once and the two views cannot drift.
-//
-// "_hmac" is deliberately absent from omitemptyFields: rejectDuplicateTopLevelKeys
-// only ever runs on a record whose decoded HMAC is already non-empty
-// (isSignedRecord), so an on-disk "_hmac":"" would have decoded to an empty HMAC
-// and never reached here — the zero-value check would be dead code for that field.
-type auditRecordTagSchemaT struct {
-	exactTags       map[string]struct{}
-	omitemptyFields map[string]reflect.Type
-}
-
-var auditRecordTagSchema = sync.OnceValue(func() auditRecordTagSchemaT {
-	t := reflect.TypeOf(auditRecord{})
-	schema := auditRecordTagSchemaT{
-		exactTags:       make(map[string]struct{}, t.NumField()),
-		omitemptyFields: make(map[string]reflect.Type),
-	}
-	for i := 0; i < t.NumField(); i++ {
-		tag := t.Field(i).Tag.Get("json")
-		name, opts, _ := strings.Cut(tag, ",")
-		if name == "" || name == "-" {
-			continue
-		}
-		schema.exactTags[name] = struct{}{}
-		if name != "_hmac" && slices.Contains(strings.Split(opts, ","), "omitempty") {
-			schema.omitemptyFields[name] = t.Field(i).Type
-		}
-	}
-	return schema
-})
-
-// isEncodingJSONEmptyValue is a faithful mirror of encoding/json's private
-// isEmptyValue predicate — the rule that decides whether an omitempty field is
-// dropped from marshaled output. It MUST cover every kind for which omitempty has
-// an effect, not just the kinds auditRecord happens to use today: a kind that
-// omitempty drops (numeric, pointer, interface, bool, string, slice/array/map) but
-// that this predicate failed to recognize as empty would silently reopen the
-// zero-value tamper gap for a future omitempty field of that kind (fail-OPEN in
-// fail-closed tamper-detection code). The final `return false` is correct only for
-// the kinds omitempty leaves untouched (struct, chan, func, complex) — a zero value
-// of those is always emitted, so its on-disk presence is not a tamper signal. Uses
-// Len()==0 for string/slice/array/map (which, unlike reflect's IsZero, also catches
-// a non-nil-but-empty slice such as a decoded "[]").
-func isEncodingJSONEmptyValue(v reflect.Value) bool {
-	switch v.Kind() {
-	case reflect.String, reflect.Slice, reflect.Array, reflect.Map:
-		return v.Len() == 0
-	case reflect.Bool:
-		return !v.Bool()
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return v.Int() == 0
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-		return v.Uint() == 0
-	case reflect.Float32, reflect.Float64:
-		return v.Float() == 0
-	case reflect.Interface, reflect.Pointer:
-		return v.IsNil()
-	default:
-		// Struct/chan/func/complex: omitempty never drops these, so a zero value is
-		// legitimately present on disk and must not be treated as a tamper signal.
-		return false
-	}
-}
-
-// rejectDuplicateTopLevelKeys fails closed if the record's top-level JSON object
-// contains a key whose byte-exact spelling does not match one of auditRecord's
-// canonical json tags, the same key twice, or an omitempty field explicitly
-// present holding its zero value. The HMAC is recomputed over the re-marshaled
-// struct (encoding/json binds fields case-insensitively even under
-// DisallowUnknownFields, and re-marshaling always emits the canonical spelling and
-// drops a zero-valued omitempty field), not the raw on-disk bytes, so any of these
-// would otherwise pass verification: a duplicate key via last-wins decoding (see
-// VerifyRecord), a LONE case-renamed key (e.g. "DECISION" for "decision") because
-// it binds to the same field with no colliding sibling to catch it, and a foreign
-// zero-valued field (e.g. "agent_id":"") because writeRecord's omitempty NEVER
-// emits one — the field is either a real non-empty value or absent — so its
-// on-disk presence with a zero value proves a byte was appended after signing.
-// Case variants and zero-valued omitempty fields are therefore rejected outright,
-// not just checked for collisions. It walks only the top-level object with a
-// token stream — nested objects inside details are the signed RawMessage and are
-// not re-inspected here.
-func rejectDuplicateTopLevelKeys(line []byte) error {
-	dec := json.NewDecoder(bytes.NewReader(line))
-	tok, err := dec.Token()
-	if err != nil {
-		return err
-	}
-	if d, ok := tok.(json.Delim); !ok || d != '{' {
-		return fmt.Errorf("audit record is not a JSON object")
-	}
-	schema := auditRecordTagSchema()
-	seen := make(map[string]struct{})
-	// After the opening '{', the token stream alternates key, value, key, value…
-	// dec.More() is false at the closing '}'. Read each key with Token(), then consume
-	// its value by decoding into a json.RawMessage — which balances a nested object or
-	// array subtree for us — leaving the decoder positioned at the next key.
-	for dec.More() {
-		tok, err := dec.Token()
-		if err != nil {
-			return err
-		}
-		key, ok := tok.(string)
-		if !ok {
-			return fmt.Errorf("audit record top-level key is not a string")
-		}
-		if _, ok := schema.exactTags[key]; !ok {
-			// The strict DisallowUnknownFields decode in VerifyRecord already rejects a
-			// key binding to NO field; reaching here means this key bound to a field
-			// via encoding/json's case-insensitive fallback, but its on-disk spelling
-			// does not byte-exactly match that field's canonical tag.
-			return fmt.Errorf("audit record top-level key %q does not match its canonical field spelling", key)
-		}
-		if _, dup := seen[key]; dup {
-			return fmt.Errorf("signed audit record contains a duplicate top-level key %q", key)
-		}
-		seen[key] = struct{}{}
-		var skip json.RawMessage
-		if err := dec.Decode(&skip); err != nil {
-			return err
-		}
-		if ft, ok := schema.omitemptyFields[key]; ok {
-			fv := reflect.New(ft)
-			if uerr := json.Unmarshal(skip, fv.Interface()); uerr == nil && isEncodingJSONEmptyValue(fv.Elem()) {
-				return fmt.Errorf("signed audit record contains field %q holding its zero value — writeRecord's omitempty never emits this field with a zero value (it omits the key entirely instead), so its presence means a byte was added after signing", key)
-			}
-		}
-	}
-	return nil
 }
 
 // hasVerificationKey reports whether this sink holds any key to verify records against
@@ -415,8 +307,9 @@ func VerifyLog(r io.Reader, verifier *Sink, requestID string, since time.Time, o
 	// certify, or a wholesale unsigned forgery by a write-capable attacker without the key
 	// (deleting the log and its rotated siblings and rewriting them in legacy shape). Treat
 	// it as unverifiable rather than silently PASS. Keyed on Total == Legacy (not signedSeen,
-	// which stays false for a legitimately-SIGNED seq-0 head record after a counter wrap):
-	// Total == Legacy holds only when every record landed in the legacy bucket. Empty logs
+	// which a stream of records the chain walk rejected as decoys leaves false even though
+	// none of them was legacy): Total == Legacy holds only when every record landed in the
+	// legacy bucket, which is the state this diagnostic describes. Empty logs
 	// are exempt (nothing to anchor); leading-truncation-to-empty needs an external
 	// high-water mark, as documented above.
 	if v.res.Legacy > 0 && v.res.Legacy == v.res.Total && verifier.hasVerificationKey() {
@@ -610,7 +503,7 @@ func decodeAuditRecord(line []byte) (auditRecord, bool) {
 // genuinely written record's HMAC presence is exactly what distinguishes it from a
 // pre-chain legacy record. Single source of truth for this discriminator: every
 // signed/legacy split in this file (VerifyRecord's lenient-decode fallback and
-// duplicate-key guard, and updateChain's signedSeen latch) reuses it instead of
+// canonical-form check, and updateChain's signedSeen latch) reuses it instead of
 // re-deriving the check, so a future decoy shape only needs updating here.
 func isSignedRecord(rec auditRecord) bool {
 	return rec.HMAC != ""
@@ -626,16 +519,17 @@ func (v *auditChainVerifier) processLine(line []byte) {
 	// records carry no HMAC; signed records start at seq 1), so it is a forged decoy,
 	// rejected below and kept out of the chain state — adopting its seq 0 as prevSeq
 	// would suppress the next record's SEQ GAP diagnostic (the `prevSeq > 0` guard).
-	// The one legitimate seq-0 case is the uint64 counter wrapping after 2^64
-	// records, which can only follow a seq==MaxUint64 record (postWrap) — exempted,
-	// and safe because that predecessor must itself verify (needs the signing key).
-	// A seq-0+HMAC record at the HEAD (firstRecord) is also exempt: it is a genuine
-	// chain start after a wrap-then-rotate, with no in-stream predecessor to
-	// establish postWrap; the mid-stream decoy still bites because firstRecord is
-	// false there.
-	postWrap := v.havePrev && v.prevSeq == math.MaxUint64
-	firstRecord := !v.havePrev
-	forgedSeq0 := rec.Seq == 0 && rec.HMAC != "" && !postWrap && !firstRecord
+	//
+	// The rejection is unconditional. The only shape that could ever be a LEGITIMATE
+	// seq-0 signed record is the uint64 counter wrapping past 2^64 records — which no
+	// deployment reaches (~584,000 years at 10^6 records/sec) and which the writer
+	// cannot even carry across a restart, since a resume that cannot trust the tail
+	// reseeds the counter. Exempting the wrap (and the head record that a
+	// wrap-then-rotate would leave with no in-stream predecessor) put two holes in the
+	// hottest piece of decoy rejection in exchange for a state that cannot occur: an
+	// attacker only had to place their seq-0 decoy at the head of a stream, or after a
+	// record claiming seq MaxUint64, to skip this check entirely.
+	forgedSeq0 := rec.Seq == 0 && rec.HMAC != ""
 	// An HMAC-less record AFTER a signed one is a forged legacy record spliced into
 	// the signed chain (a genuine legacy record — pre-signing history the writer
 	// resumed onto — only precedes the first signed one). Kept out of the chain
@@ -724,14 +618,16 @@ func (v *auditChainVerifier) updateChain(rec auditRecord) {
 			}
 		}
 	} else {
-		// If the preceding record failed HMAC verification, its _hmac value in
-		// v.prevHMAC is untrustworthy: an attacker can set an arbitrary forged _hmac
-		// on the bad record and then stitch its successor by setting prev_hmac to that
-		// same value, making the link check pass for a tampered record. Fire a CHAIN
-		// BREAK before the link check to surface the untrustworthy anchor.
+		// If the preceding record failed VerifyRecord (an HMAC mismatch, or — since
+		// this branch is reached on any non-nil error — a non-canonical-form
+		// rejection) its _hmac value in v.prevHMAC is untrustworthy: an attacker can
+		// set an arbitrary forged _hmac on the bad record and then stitch its
+		// successor by setting prev_hmac to that same value, making the link check
+		// pass for a tampered record. Fire a CHAIN BREAK before the link check to
+		// surface the untrustworthy anchor.
 		if v.prevRecordInvalid {
 			v.res.ChainBreaks++
-			_, _ = fmt.Fprintf(v.out, "CHAIN BREAK at seq %d: the preceding record failed HMAC verification; its _hmac is untrustworthy and cannot serve as a valid chain anchor\n", rec.Seq)
+			_, _ = fmt.Fprintf(v.out, "CHAIN BREAK at seq %d: the preceding record failed verification; its _hmac is untrustworthy and cannot serve as a valid chain anchor\n", rec.Seq)
 			v.prevRecordInvalid = false
 		}
 		// A genesis-sentinel seq-1 record immediately following a head legacy (unsigned)
@@ -761,10 +657,10 @@ func (v *auditChainVerifier) updateChain(rec auditRecord) {
 		// A seq gap is meaningful only in the signed era: consecutive legacy records
 		// both decode to seq 0, so "0 does not follow 0" would fire spuriously, and
 		// the legacy->first-signed transition (0 -> 1) is contiguous. Gate on
-		// signedSeen, not prevSeq > 0: after a counter wrap the record following the
-		// seq-0 record has prevSeq == 0, and a prevSeq > 0 guard would skip the check
-		// there, giving an inserter a blind spot. signedSeen stays true across the
-		// wrap while still suppressing the legacy false positives.
+		// signedSeen, not prevSeq > 0: a legacy tail can carry any stale seq, so
+		// prevSeq > 0 would both miss that suppression and, wherever prevSeq is 0,
+		// skip the check entirely and give an inserter a blind spot. signedSeen tracks
+		// the property actually being gated on — has the signed era begun.
 		if rec.Seq != v.prevSeq+1 && rec.Seq > 0 && v.signedSeen {
 			v.res.ChainBreaks++
 			_, _ = fmt.Fprintf(v.out, "SEQ GAP: record seq %d does not follow %d (a record is missing)\n", rec.Seq, v.prevSeq)
@@ -810,11 +706,9 @@ func (v *auditChainVerifier) classify(line []byte, rec auditRecord, unmarshalOK,
 		return
 	}
 
-	// A forged seq-0 decoy (Seq==0 + HMAC, mid-stream, no counter wrap) is rejected
+	// A forged seq-0 decoy (Seq==0 + HMAC, anywhere in the stream) is rejected
 	// regardless of whether its HMAC verifies, closing the substitution vector even
-	// against a signing-key holder. A head seq-0+HMAC record is NOT flagged here (a
-	// legitimate wrap-then-rotate start); it falls through to the per-record HMAC
-	// check below, which still catches a bad-signature head decoy.
+	// against a signing-key holder.
 	if forgedSeq0 {
 		v.res.Invalid++
 		_, _ = fmt.Fprintf(v.out, "INVALID  record %d: seq 0 with a non-empty HMAC is not a valid record (forged seq-0 decoy)\n", v.res.Total)

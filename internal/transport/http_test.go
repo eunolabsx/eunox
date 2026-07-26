@@ -3411,6 +3411,130 @@ func TestHandleSessionPost_KilledReapedSession_DeniesWithKillSwitch(t *testing.T
 	})
 }
 
+// TestHandleSessionPost_UnresolvedSessionKillDeny_DoesNotForgeSessionID pins that the
+// sess == nil kill-deny branch (a killed-and-reaped session, or an active global kill hit by
+// an unknown/attacker-chosen id) never stamps the raw, client-supplied Mcp-Session-Id into
+// the structured, signed session_id field: that field is populated from what THIS proxy
+// established, never from an unverified header, so a caller cannot forge a kill-switch
+// record against an arbitrary — including a real victim's — session id. The claimed value
+// must still survive, clearly marked unverified, as details.claimed_session_id.
+func TestHandleSessionPost_UnresolvedSessionKillDeny_DoesNotForgeSessionID(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	sink, err := audit.Open(dir+"/audit.jsonl", dir+"/audit.key", 0, 0)
+	if err != nil {
+		t.Fatalf("audit.Open: %v", err)
+	}
+	defer func() { _ = sink.Close() }()
+
+	ks := killswitch.NewInMemory()
+	if err := ks.ActivateGlobal(context.Background()); err != nil {
+		t.Fatalf("ActivateGlobal: %v", err)
+	}
+	route := &UpstreamRoute{
+		name: "up1",
+		pdp:  newTestManifestPDPWithKS(ks, capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
+		sink: &routeSink{sink: sink},
+	}
+	proxy := &HTTPProxy{sessions: make(map[string]*httpSession)}
+
+	const forged = "victim-real-session-id"
+	msg := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`9`), Method: "tools/call"}
+	req := httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody)
+	req.Header.Set(SessionHeader, forged)
+	w := httptest.NewRecorder()
+
+	proxy.handleSessionPost(w, req, route, forged, msg)
+
+	var resp mcp.RPCMsg
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response is not JSON-RPC: %v (body=%s)", err, w.Body.String())
+	}
+	if resp.Error == nil {
+		t.Fatalf("expected a KILL_SWITCH deny (global kill active), got %s", w.Body.String())
+	}
+
+	if err := sink.Close(); err != nil {
+		t.Fatalf("audit.Close: %v", err)
+	}
+	records := readAuditRecords(t, dir+"/audit.jsonl")
+	rec := findAuditRecordByMethod(records, "tools/call", "deny")
+	if rec == nil {
+		t.Fatalf("no deny record found for tools/call; records=%+v", records)
+	}
+	if sid, _ := rec["session_id"].(string); sid != "" {
+		t.Errorf("session_id must stay empty for an unverified session id, got %q — the raw header must never reach the signed structured field", sid)
+	}
+	details, _ := rec["details"].(map[string]interface{})
+	if details == nil {
+		t.Fatalf("expected a details map carrying claimed_session_id, got %+v", rec)
+	}
+	if claimed, _ := details["claimed_session_id"].(string); claimed != forged {
+		t.Errorf("details.claimed_session_id = %q, want %q (the unverified value, clearly marked as such)", claimed, forged)
+	}
+}
+
+// TestHandleSessionPost_UnresolvedSessionKillDrop_DoesNotForgeSessionID is the notification
+// counterpart of TestHandleSessionPost_UnresolvedSessionKillDeny_DoesNotForgeSessionID: a
+// fire-and-forget notification hitting the same sess == nil kill-deny branch must record its
+// drop the same way — session_id empty, the claimed value only in details.claimed_session_id.
+func TestHandleSessionPost_UnresolvedSessionKillDrop_DoesNotForgeSessionID(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	sink, err := audit.Open(dir+"/audit.jsonl", dir+"/audit.key", 0, 0)
+	if err != nil {
+		t.Fatalf("audit.Open: %v", err)
+	}
+	defer func() { _ = sink.Close() }()
+
+	ks := killswitch.NewInMemory()
+	if err := ks.ActivateGlobal(context.Background()); err != nil {
+		t.Fatalf("ActivateGlobal: %v", err)
+	}
+	route := &UpstreamRoute{
+		name: "up1",
+		pdp:  newTestManifestPDPWithKS(ks, capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
+		sink: &routeSink{sink: sink},
+	}
+	proxy := &HTTPProxy{sessions: make(map[string]*httpSession)}
+
+	const forged = "victim-real-session-id"
+	// notifications/cancelled: a real notification method (no id), reaching the same
+	// sess == nil branch via its else arm.
+	msg := mcp.RPCMsg{JSONRPC: "2.0", Method: "notifications/cancelled"}
+	req := httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody)
+	req.Header.Set(SessionHeader, forged)
+	w := httptest.NewRecorder()
+
+	proxy.handleSessionPost(w, req, route, forged, msg)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("notification drop status = %d, want %d (Accepted)", w.Code, http.StatusAccepted)
+	}
+
+	if err := sink.Close(); err != nil {
+		t.Fatalf("audit.Close: %v", err)
+	}
+	records := readAuditRecords(t, dir+"/audit.jsonl")
+	rec := findAuditRecordByMethod(records, "notifications/cancelled", "deny")
+	if rec == nil {
+		t.Fatalf("no deny record found for notifications/cancelled; records=%+v", records)
+	}
+	if sid, _ := rec["session_id"].(string); sid != "" {
+		t.Errorf("session_id must stay empty for an unverified session id, got %q", sid)
+	}
+	details, _ := rec["details"].(map[string]interface{})
+	if details == nil {
+		t.Fatalf("expected a details map carrying claimed_session_id, got %+v", rec)
+	}
+	if claimed, _ := details["claimed_session_id"].(string); claimed != forged {
+		t.Errorf("details.claimed_session_id = %q, want %q", claimed, forged)
+	}
+	if transport, _ := details["transport"].(string); transport != string(legHTTPNotification) {
+		t.Errorf("details.transport = %q, want %q (unchanged by the fix)", transport, legHTTPNotification)
+	}
+}
+
 // TestRegisterSession_FailsClosedAfterShutdown is the regression for a slow
 // in-flight initialize registering its session AFTER closeAllSessions has emptied the
 // registry and the reaper was canceled — a leaked upstream subprocess + goroutines that

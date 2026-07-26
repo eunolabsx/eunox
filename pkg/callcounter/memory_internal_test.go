@@ -884,7 +884,7 @@ func TestInMemory_WithMaxKeys_IncrementAndGet(t *testing.T) {
 	if count != 0 {
 		t.Errorf("refused call: count = %d, want 0", count)
 	}
-	if want := "key limit reached (2)"; !strings.Contains(err.Error(), want) {
+	if want := "entry limit reached (2)"; !strings.Contains(err.Error(), want) {
 		t.Errorf("error = %q, want it to contain %q", err.Error(), want)
 	}
 	if got := numEntries(m); got != 2 {

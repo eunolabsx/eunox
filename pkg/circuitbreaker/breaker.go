@@ -137,14 +137,13 @@ func WithClock(fn func() time.Time) Option {
 	return func(b *Breaker) { b.now = fn }
 }
 
-// New creates a new circuit breaker with the given configuration. Any non-positive
-// field is replaced by its DefaultConfig value to keep the breaker fail-safe.
-//
-// Clamping is the package's ONE policy for a degenerate config. A second,
-// reject-instead Config.Validate used to sit alongside it with no caller: the shipped
-// proxy exposes no operator-facing breaker knobs (every construction site passes
-// DefaultConfig), so the only thing two policies bought was the chance for an embedder
-// to get a different answer from each about the same config.
+// New creates a new circuit breaker with the given configuration. Sanitizing is the
+// package's single config-handling philosophy: any non-positive field is replaced by
+// its DefaultConfig value to keep the breaker fail-safe (a non-positive value would
+// otherwise be degenerate — tripping on the first failure, no back-pressure, or no
+// probes), so New never fails and cfg is immutable afterward. A caller that wants to
+// reject a degenerate config rather than have it silently corrected should compare
+// against DefaultConfig before calling.
 func New(cfg Config, opts ...Option) *Breaker {
 	def := DefaultConfig()
 	if cfg.FailureThreshold <= 0 {

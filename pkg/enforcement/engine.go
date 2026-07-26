@@ -1246,6 +1246,15 @@ func (e *Engine) CollectObligations(matched *capability.Constraint, requestID, n
 // name, using [path.Match] glob semantics (*, ?, [abc]); "*" matches any name.
 // Resources use ':' as a namespace separator (not '/'), so '*' matches across
 // colons (e.g. "file:*.csv" matches "file:data.csv").
+//
+// '/' is the one separator '*' does NOT cross: [path.Match] treats it as a path
+// separator, and there is no '**' for targets. A URI-path target therefore covers
+// exactly one level — "file:///data/*" matches "file:///data/report.csv" but NOT
+// "file:///data/2026/report.csv". That errs deny (a nested resource is refused, never
+// wrongly allowed), but it is the operator trap on the most common resource-target
+// shape: cover deeper levels with an explicit per-level entry
+// ("file:///data/*/*"). Documented for operators in
+// docs/capability-manifest-guide.md.
 func MatchesResource(resource, toolName string) bool {
 	if resource == "*" || resource == toolName {
 		return true

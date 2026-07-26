@@ -742,7 +742,7 @@ func (p *HTTPProxy) reapOnce(idle time.Duration) {
 				if s.lastActive.Load() >= cutoff || s.hasSubscribers() || s.inFlight.Load() > 0 {
 					return
 				}
-				fmt.Fprintf(os.Stderr, "[eunox] HTTP session %s reaped (idle > %s).\n", s.id, time.Duration(p.sessionIdleMs)*time.Millisecond)
+				fmt.Fprintf(os.Stderr, "[eunox] HTTP session %s reaped (idle > %s).\n", s.id, idle)
 			}
 			s.close(p.shutdownMs)
 		}()
@@ -1226,7 +1226,11 @@ func (s *httpSession) close(shutdownMs int) {
 			close(s.done)
 			return
 		}
-		_ = s.upIn.Close()
+		// nil-guarded like every sibling teardown path: a test-assembled session may
+		// carry no upstream stdin pipe.
+		if s.upIn != nil {
+			_ = s.upIn.Close()
+		}
 		t := time.NewTimer(msToDuration(shutdownMs))
 		defer t.Stop()
 		select {

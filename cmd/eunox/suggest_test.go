@@ -1169,16 +1169,21 @@ func TestMineArgs_ReservedUpstreamErrorCodeKey(t *testing.T) {
 		}
 	})
 
-	t.Run("two real top-level arguments named arguments and the reserved key's string are not misread as the nested wrapper", func(t *testing.T) {
-		// NOT the nested-collision shape: what a successful (no upstream error) call's
-		// record looks like when the tool genuinely has two top-level arguments
-		// literally named "arguments" (object-valued) and the reserved key's string.
+	t.Run("flat merge over an object-valued argument named arguments is not misread as the nested wrapper", func(t *testing.T) {
+		// NOT the nested-collision shape: the ORDINARY flat merge for a call whose one
+		// real argument is a map named "arguments" and whose upstream then errored.
 		// Structurally identical to the true nested wrapper EXCEPT the inner map does
-		// not itself carry the reserved key — the fact that must disambiguate the two.
+		// not itself carry the reserved key — the fact that disambiguates the two.
+		//
+		// Mining must read it flat: "arguments" is the one real argument and the
+		// reserved key is still the transport's injected code, not caller data. The
+		// accepted cost of preferring this (far likelier) reading is that a call
+		// genuinely carrying a top-level argument literally named the reserved key's
+		// string drops that one argument — the vanishingly rare case.
 		tgt := &observedTarget{namespace: "tool", name: "fetch", args: map[string]*observedArg{}}
 		mineArgs(tgt, map[string]interface{}{
 			"arguments": map[string]interface{}{"depth": float64(3)},
-			reserved:    "real-value",
+			reserved:    500,
 		}, true, suggestMaxValuesDefault)
 
 		if _, ok := tgt.args["depth"]; ok {
@@ -1187,8 +1192,38 @@ func TestMineArgs_ReservedUpstreamErrorCodeKey(t *testing.T) {
 		if a := tgt.args["arguments"]; a == nil || a.calls != 1 {
 			t.Errorf("the real top-level argument \"arguments\" must be mined once; got %+v", a)
 		}
-		if a := tgt.args[reserved]; a == nil || a.calls != 1 {
-			t.Errorf("the real top-level argument %q must be mined once, not skipped as reserved; got %+v", reserved, a)
+		if _, ok := tgt.args[reserved]; ok {
+			t.Errorf("the transport's injected reserved key %q must not be mined as a phantom argument; got %v", reserved, tgt.args)
+		}
+		if tgt.nonTruncatedAllow != 1 {
+			t.Errorf("the call carries a real argument and must count as a denominator; nonTruncatedAllow = %d", tgt.nonTruncatedAllow)
+		}
+	})
+
+	t.Run("flat merge over an object-valued argument named arguments does not skew presence accounting", func(t *testing.T) {
+		// The regression the flat reading protects: the same tool called twice with its
+		// one real map argument "arguments" — once cleanly, once with an upstream error.
+		// Misreading the errored record as "two real top-level arguments" would leave
+		// "arguments" at calls == 1 against nonTruncatedAllow == 2 and mislabel an
+		// always-present argument as optional, suppressing its allowedValues condition.
+		tgt := &observedTarget{namespace: "tool", name: "fetch", args: map[string]*observedArg{}}
+		mineArgs(tgt, map[string]interface{}{
+			"arguments": map[string]interface{}{"depth": float64(3)},
+		}, true, suggestMaxValuesDefault)
+		mineArgs(tgt, map[string]interface{}{
+			"arguments": map[string]interface{}{"depth": float64(3)},
+			reserved:    500,
+		}, true, suggestMaxValuesDefault)
+
+		a := tgt.args["arguments"]
+		if a == nil || a.calls != 2 {
+			t.Fatalf("the always-present argument \"arguments\" must be mined on both calls; got %+v", a)
+		}
+		if tgt.nonTruncatedAllow != 2 {
+			t.Fatalf("both records carry a real argument; nonTruncatedAllow = %d, want 2", tgt.nonTruncatedAllow)
+		}
+		if a.calls != tgt.nonTruncatedAllow {
+			t.Errorf("presence accounting skewed: calls = %d, nonTruncatedAllow = %d — the argument would be mislabeled optional", a.calls, tgt.nonTruncatedAllow)
 		}
 	})
 }

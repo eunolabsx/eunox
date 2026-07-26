@@ -254,17 +254,21 @@ type SamplingAuthorizer interface {
 // the call must be blocked: an active kill matching the agent/session/global
 // dimension, or a kill-store error (fail closed).  A nil ks imposes no check
 // (JWT-only mode).  The agent dimension is taken from JWT claims in ctx.
-func killCheck(ctx context.Context, ks killswitch.Checker, sessionID string) *capability.EnforceResponse {
+//
+// clock is the caller's decision clock, passed through to denyResponse so a kill
+// deny stamps DecidedAt from the same source as every other deny (and as the allow
+// path), honoring a frozen test clock. A nil clock falls back to the wall clock.
+func killCheck(ctx context.Context, clock enforcement.Clock, ks killswitch.Checker, sessionID string) *capability.EnforceResponse {
 	if ks == nil {
 		return nil
 	}
 	blocked, err := ks.ShouldBlock(ctx, agentIDFromContext(ctx), sessionID)
 	if err != nil {
-		deny := denyResponse(nil, capability.ErrCodeKillSwitchError, "", "kill switch check failed: "+err.Error())
+		deny := denyResponse(clock, capability.ErrCodeKillSwitchError, "", "kill switch check failed: "+err.Error())
 		return &deny
 	}
 	if blocked {
-		deny := denyResponse(nil, capability.ErrCodeKillSwitch, "", "session has been terminated by a kill-switch command")
+		deny := denyResponse(clock, capability.ErrCodeKillSwitch, "", "session has been terminated by a kill-switch command")
 		return &deny
 	}
 	return nil
@@ -408,7 +412,7 @@ func (p AlwaysAllowPDP) DecideSampling(ctx context.Context, sessionID, _ string)
 // enumeration included. A zero-value AlwaysAllowPDP{} has no kill switch (nil ks),
 // and killCheck returns nil for a nil checker, preserving pure-passthrough.
 func (p AlwaysAllowPDP) CheckKill(ctx context.Context, sessionID string) *capability.EnforceResponse {
-	return killCheck(ctx, p.ks, sessionID)
+	return killCheck(ctx, p.clock, p.ks, sessionID)
 }
 
 // CheckAudience pins no token audience: a wiretap/audit-mode route forwards every call,
@@ -418,11 +422,13 @@ func (AlwaysAllowPDP) CheckAudience(_ context.Context) *capability.EnforceRespon
 }
 
 // RecordObservedToolHashes records no hashes — a wiretap PDP pins no tool
-// descriptions — but still reports an accurate entry count via the same
-// passThroughList decode FilterToolsList uses, so the caller need not decode result a
-// second time just to count entries (see CountListEntries).
+// descriptions — but still reports an entry count for the caller's audit record.
+// With no pin to arm and no catalog to carry, only the count is wanted, so this
+// takes the length-only countListEntries rather than building an ordered envelope
+// (key slice plus key-to-RawMessage map) and discarding all of it. That is the same
+// best-effort accounting the exported CountListEntries does on this very path.
 func (AlwaysAllowPDP) RecordObservedToolHashes(_ context.Context, result json.RawMessage) int {
-	return passThroughList(result, listKeyTools).Upstream
+	return countListEntries(result, listKeyTools)
 }
 
 // ReleaseSession is a no-op: a wiretap PDP enforces no policy and holds no per-session
@@ -507,10 +513,11 @@ func (DenyAllPDP) CheckAudience(_ context.Context) *capability.EnforceResponse {
 }
 
 // RecordObservedToolHashes records no hashes — the "no policy" default pins no tool
-// descriptions (and denies every call regardless) — but still reports an accurate
-// entry count, matching AlwaysAllowPDP, so a caller need not decode result again.
+// descriptions (and denies every call regardless) — but still reports an entry count
+// for the caller's audit record, via the same length-only countListEntries
+// AlwaysAllowPDP uses.
 func (DenyAllPDP) RecordObservedToolHashes(_ context.Context, result json.RawMessage) int {
-	return passThroughList(result, listKeyTools).Upstream
+	return countListEntries(result, listKeyTools)
 }
 
 // ReleaseSession is a no-op: the fail-closed default holds no per-session flow state.
@@ -790,7 +797,7 @@ func (p *ManifestPDP) pinViolated(name, pin string) bool {
 // the session is killed (or the kill store errors, fail closed). It shares
 // killCheck with the Decide* paths so the */list handlers enforce it identically.
 func (p *ManifestPDP) CheckKill(ctx context.Context, sessionID string) *capability.EnforceResponse {
-	return killCheck(ctx, p.ks, sessionID)
+	return killCheck(ctx, p.engineClock(), p.ks, sessionID)
 }
 
 // CheckAudience pins no token audience: the manifest layer enforces capabilities, not
@@ -842,7 +849,7 @@ const (
 func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target EnforceTarget, args map[string]interface{}, sourceIP string, schema schemaMode) capability.EnforceResponse {
 	// Kill switch check: per-agent (JWT agent_id from ctx), per-session, and
 	// global kills are honored; a kill-store error fails closed.
-	if deny := killCheck(ctx, p.ks, sessionID); deny != nil {
+	if deny := killCheck(ctx, p.engineClock(), p.ks, sessionID); deny != nil {
 		return *deny
 	}
 
@@ -1478,7 +1485,7 @@ func (p *ManifestPDP) DecideResourceRead(ctx context.Context, sessionID, uri, so
 // the request so an ipRange condition on the opt-in sees a real address rather
 // than failing closed with MISSING_CONTEXT.
 func (p *ManifestPDP) DecideSampling(ctx context.Context, sessionID, sourceIP string) capability.EnforceResponse {
-	if deny := killCheck(ctx, p.ks, sessionID); deny != nil {
+	if deny := killCheck(ctx, p.engineClock(), p.ks, sessionID); deny != nil {
 		return *deny
 	}
 
@@ -2132,10 +2139,11 @@ func (p *ManifestPDP) armPinsFromToolsList(result json.RawMessage) (entryCount i
 	}
 	rawArray, ok := envelope[listKeyTools]
 	if !ok {
-		// No exact "tools" key. A case-variant sibling ("Tools") still decodes for a host
-		// whose reader binds it case-insensitively, and the proxy cannot tell what that
-		// host sees, so treat it as ambiguous; a plainly absent key is not.
-		if pinned && envelopeHasFoldedToolsKey(envelope) {
+		// No exact "tools" key. toolsKeyAmbiguous also catches a case-variant sibling
+		// ("Tools") that still decodes for a host whose reader binds it
+		// case-insensitively, and the proxy cannot tell what that host sees, so treat it
+		// as ambiguous; a plainly absent key is not.
+		if pinned && toolsKeyAmbiguous(result) {
 			p.poisonAllPinned()
 		}
 		return 0
@@ -2154,7 +2162,7 @@ func (p *ManifestPDP) armPinsFromToolsList(result json.RawMessage) (entryCount i
 	}
 	// A duplicate or case-variant "tools" key leaves Go and the host reading different
 	// arrays, so no entry below can be believed.
-	if duplicateOrFoldedToolsKey(result) {
+	if toolsKeyAmbiguous(result) {
 		p.poisonAllPinned()
 		return len(entries)
 	}
@@ -2187,24 +2195,17 @@ func (p *ManifestPDP) armPinsFromToolsList(result json.RawMessage) (entryCount i
 	return len(entries)
 }
 
-// envelopeHasFoldedToolsKey reports whether the decoded envelope carries a key that differs
-// from the tools list key only by case — a shape Go's own struct-tag decode (and any host
-// that binds keys case-insensitively) would still resolve to it.
-func envelopeHasFoldedToolsKey(envelope map[string]json.RawMessage) bool {
-	for k := range envelope {
-		if strings.EqualFold(k, listKeyTools) {
-			return true
-		}
-	}
-	return false
-}
-
-// duplicateOrFoldedToolsKey reports whether result's top-level object carries the tools
-// list key more than once, comparing case-folded. json.Unmarshal into a map silently keeps the last
-// such key, so a repeat (or a case-variant sibling) means the array the proxy walks is not
-// necessarily the one a host renders. Malformed input reports true: the caller fails closed.
-func duplicateOrFoldedToolsKey(result json.RawMessage) bool {
-	dec := json.NewDecoder(bytes.NewReader(result))
+// toolsKeyAmbiguous reports whether raw's top-level JSON object carries the tools/list
+// "tools" key ambiguously: duplicated, case-variant, or (when the exact spelling "tools" is
+// absent) shadowed by a case-variant sibling like "Tools". A plain decode into a map keeps
+// only the LAST such key, and a struct tag falls back to a case-insensitive match when the
+// exact spelling is missing — either way, a host that reads the same bytes differently (a
+// case-sensitive JSON.parse, or one that keeps a different duplicate) can see an entirely
+// different tools array than this proxy decoded. A plainly absent key is not ambiguous: a
+// host renders no tools from it either. Malformed input reports true: the caller fails
+// closed.
+func toolsKeyAmbiguous(raw json.RawMessage) bool {
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	tok, err := dec.Token()
 	if err != nil {
 		return true
@@ -2212,7 +2213,7 @@ func duplicateOrFoldedToolsKey(result json.RawMessage) bool {
 	if d, ok := tok.(json.Delim); !ok || d != '{' {
 		return true
 	}
-	count := 0
+	exact, folded := 0, 0
 	for dec.More() {
 		keyTok, err := dec.Token()
 		if err != nil {
@@ -2222,15 +2223,38 @@ func duplicateOrFoldedToolsKey(result json.RawMessage) bool {
 		if !ok {
 			return true
 		}
-		if strings.EqualFold(key, listKeyTools) {
-			count++
+		if key == listKeyTools {
+			exact++
+			folded++
+		} else if strings.EqualFold(key, listKeyTools) {
+			folded++
 		}
 		var skip json.RawMessage
 		if err := dec.Decode(&skip); err != nil {
 			return true
 		}
 	}
-	return count > 1
+	if folded == 0 {
+		return false
+	}
+	return folded > 1 || exact == 0
+}
+
+// ToolsKeyAmbiguous is the exported form of the envelope-level "tools" key ambiguity gate,
+// for the startup drift probe (FetchAllToolPages).
+//
+// armPinsFromToolsList (below) already refuses to trust an ambiguous envelope on the runtime
+// list-filter path — poisoning every pin rather than believing whichever array Go's decode
+// happened to keep. Before this export, the drift probe's own page decode
+// (internal/drift.FetchAllToolPages, into a plain toolsListPage struct) had no equivalent
+// check: a duplicate or case-variant "tools" key there silently resolved to one array with no
+// error, so a poisoned catalog could pass the unconditionally-fatal FM-5 startup refusal
+// cleanly, only to be caught later — and more disruptively, as a mid-session poisonAllPinned
+// — once the identical bytes reached the runtime path. Exporting the same check keeps both
+// layers on one rule instead of letting the drift probe silently trust a shape the runtime
+// path would refuse.
+func ToolsKeyAmbiguous(raw json.RawMessage) bool {
+	return toolsKeyAmbiguous(raw)
 }
 
 func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims map[string]interface{}) ListFilterResult {

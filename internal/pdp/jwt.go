@@ -692,16 +692,16 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 
 	// Select the signing key from EVERY header's kid, not a hard-coded headers[0],
 	// removing the foot-gun should a multi-signature token ever reach this path.
-	// Shares capability.CandidateKIDs with the capability-token path. The IdP path
-	// enforces no requireKID policy, so the "" (try-all-keys) sentinel is preserved.
-	kids, err := capability.CandidateKIDs(tok.Headers, false)
+	// A kid-less token keeps the "" (try-all-keys) sentinel: this path enforces no
+	// kid-required policy.
+	kids, err := capability.CandidateKIDs(tok.Headers)
 	if err != nil {
 		return ctx, jwtErr(jwtErrMalformedToken, err)
 	}
 
 	// The per-key verifier is the only IdP-specific part; the key-selection and
-	// rotation-retry choreography is shared with the capability-token path via
-	// capability.VerifyWithKeyRotation. Per its contract the closure returns
+	// rotation-retry choreography lives in capability.VerifyWithKeyRotation, out of
+	// this function. Per its contract the closure returns
 	// (claims, nil) on success, (nil, Terminal(err)) for a verified-but-invalid
 	// failure that must not be retried, and (nil, err) for a signature failure.
 	//
@@ -858,7 +858,7 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 // call it before contacting the upstream so a killed session cannot enumerate the
 // catalog even in JWT mode.
 func (p *JWTPDP) CheckKill(ctx context.Context, sessionID string) *capability.EnforceResponse {
-	return killCheck(ctx, p.ks, sessionID)
+	return killCheck(ctx, p.clock, p.ks, sessionID)
 }
 
 // CheckAudience enforces this route's per-route audience pin at session creation, before
@@ -914,7 +914,7 @@ func (p *JWTPDP) DecideSampling(ctx context.Context, sessionID, sourceIP string)
 	// audience (as this method's contract states), so the check is unconditional; the
 	// possible redundant inner re-check is the accepted price of a correct, wiring-
 	// independent denial code, matching the Decide path.
-	if deny := killCheck(ctx, p.ks, sessionID); deny != nil {
+	if deny := killCheck(ctx, p.clock, p.ks, sessionID); deny != nil {
 		return *deny
 	}
 	// Per-route audience pin (mirrors Decide/filterList): a session whose token does not
@@ -1038,7 +1038,7 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 	// would leave the kill unconsulted there, denying with the wrong code and no
 	// kill-switch observability. DecideResourceRead/DecidePromptGet delegate here, so
 	// this covers all three host-initiated paths.
-	if deny := killCheck(ctx, p.ks, sessionID); deny != nil {
+	if deny := killCheck(ctx, p.clock, p.ks, sessionID); deny != nil {
 		return *deny
 	}
 
@@ -1549,6 +1549,11 @@ func buildConstraintsFromClaims(caps []string, target EnforceTarget) []capabilit
 // buildConstraintsFromParsed is the matching/condition phase shared by the hot path
 // and buildConstraintsFromClaims. The expensive parseCondSuffix runs only for claims
 // that actually match this target.
+//
+// A condition-suffix parse failure here is the same validator/parser divergence
+// parseCapHeads logs for the head phase — ValidateToken already accepted the whole
+// claim, suffix included — so it is reported the same way rather than dropped
+// silently, which would surface only as an unexplained AUTHORIZATION_FAILED.
 func buildConstraintsFromParsed(heads []capHead, target EnforceTarget) []capability.Constraint {
 	var out []capability.Constraint
 	for _, h := range heads {
@@ -1560,6 +1565,8 @@ func buildConstraintsFromParsed(heads []capHead, target EnforceTarget) []capabil
 			c, err := parseCondSuffix(h.condpart)
 			if err != nil {
 				// A malformed suffix on a matching claim grants nothing (fail closed).
+				fmt.Fprintf(os.Stderr, "[eunox] JWT: capability claim %q passed validation but its condition suffix failed to parse (%v); dropping (this is a bug)\n",
+					fmt.Sprintf("%s:%s?%s", h.prefix, h.bareName, h.condpart), err)
 				continue
 			}
 			conds = c
@@ -1762,7 +1769,17 @@ func emptyListing(resultBytes json.RawMessage, listKey string) ListFilterResult 
 // decoded and the requested one selected, so an entry missing idField yields the
 // empty-name target. Used by the JWT intersection's in-memory second pass
 // (filterList) to match entries against real, non-empty parsed claim heads.
+//
+// entryKeysAmbiguous is checked first and fails closed (false) on an ambiguous entry —
+// a duplicate or case-variant top-level key (e.g. "name"/"Name", "uri"/"URI") — for the
+// same reason ManifestPDP's list filters apply it: an entry Go decodes one way here can
+// render a different name/uri to a case-sensitive host, and this path (reached whenever
+// the inner PDP is nil or AlwaysAllowPDP, i.e. its result comes from an unfiltered
+// passThroughList) is the one list-filter path that had no per-entry gate at all.
 func entryCoveredByClaims(raw json.RawMessage, parsed []capHead, idField string, targetType capability.TargetType) bool {
+	if entryKeysAmbiguous(raw) {
+		return false
+	}
 	var entry struct {
 		Name string `json:"name"`
 		URI  string `json:"uri"`

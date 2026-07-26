@@ -580,16 +580,68 @@ func TestFetchAllToolPages_FetchError(t *testing.T) {
 	}
 }
 
-// TestFetchAllToolPages_InvalidJSON covers the per-page unmarshal error path.
+// TestFetchAllToolPages_InvalidJSON covers the per-page unmarshal error path. The page is
+// syntactically valid JSON with an unambiguous single "tools" key (so it clears the
+// ToolsKeyAmbiguous pre-check below) but a value of the wrong shape, so it reaches — and is
+// rejected by — the toolsListPage unmarshal itself.
 func TestFetchAllToolPages_InvalidJSON(t *testing.T) {
 	_, err := FetchAllToolPages(func(_ string) (json.RawMessage, error) {
-		return json.RawMessage(`{not valid json`), nil
+		return json.RawMessage(`{"tools": "not-an-array"}`), nil
 	})
 	if err == nil {
 		t.Fatal("expected an error for a malformed page")
 	}
 	if !strings.Contains(err.Error(), "parsing tools/list page") {
 		t.Errorf("error should mention parsing the page, got %v", err)
+	}
+}
+
+// TestFetchAllToolPages_AmbiguousToolsKey pins that a page whose top-level "tools" key is
+// ambiguous — duplicated, or shadowed by a case-variant sibling — is refused before the
+// plain json.Unmarshal that would otherwise silently resolve it to one array with no error.
+// Without this, a poisoned catalog could pass the drift comparison (and its
+// unconditionally-fatal FM-5 descriptionHash check) cleanly at startup, only to be caught
+// later by the runtime list filter, which already refuses this same shape.
+func TestFetchAllToolPages_AmbiguousToolsKey(t *testing.T) {
+	cases := []struct {
+		name string
+		page string
+	}{
+		{"case-variant sibling", `{"Tools":[{"name":"evil"}],"tools":[{"name":"safe"}]}`},
+		{"duplicate exact key", `{"tools":[{"name":"evil"}],"tools":[{"name":"safe"}]}`},
+		{"only a case-variant spelling", `{"Tools":[{"name":"evil"}]}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := FetchAllToolPages(func(_ string) (json.RawMessage, error) {
+				return json.RawMessage(tc.page), nil
+			})
+			if err == nil {
+				t.Fatal("expected an error for an ambiguous \"tools\" key")
+			}
+			if !strings.Contains(err.Error(), "ambiguous") {
+				t.Errorf("error should name the ambiguity, got %v", err)
+			}
+		})
+	}
+}
+
+// TestFetchAllToolPages_UnambiguousToolsKeyAllowed is the negative control: a page whose
+// "tools" key appears exactly once, spelled exactly "tools", must not be rejected by the
+// ambiguity pre-check.
+func TestFetchAllToolPages_UnambiguousToolsKeyAllowed(t *testing.T) {
+	merged, err := FetchAllToolPages(func(_ string) (json.RawMessage, error) {
+		return json.RawMessage(`{"tools":[{"name":"read_file"}]}`), nil
+	})
+	if err != nil {
+		t.Fatalf("an unambiguous page must not be refused, got %v", err)
+	}
+	tools, err := ParseToolsListResult(merged)
+	if err != nil {
+		t.Fatalf("ParseToolsListResult: %v", err)
+	}
+	if len(tools) != 1 || tools[0].Name != "read_file" {
+		t.Fatalf("expected the one real tool to survive, got %+v", tools)
 	}
 }
 

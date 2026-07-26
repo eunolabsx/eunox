@@ -493,22 +493,6 @@ func (r *Redis) Stop() {
 	r.wg.Wait()
 }
 
-// getRunCtx returns runCtx under r.mu, the single accessor for a caller that
-// does NOT already hold r.mu (e.g. Reset's trailing reseed) — centralizing the
-// "runCtx is written under r.mu in Start, so it must be read under r.mu too"
-// invariant in one place rather than restating it at each call site. ShouldBlock
-// reads the field directly instead of calling this: it already holds
-// r.mu.RLock() for its whole body, and re-acquiring an RWMutex for reading from
-// the same goroutine that already holds it risks blocking behind a concurrent
-// writer that arrived in between (Go's sync.RWMutex favors writers), so a
-// self-locking accessor must never be called from inside an existing critical
-// section on the same lock.
-func (r *Redis) getRunCtx() context.Context {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.runCtx
-}
-
 // HealthStatus returns the error from the most recent state refresh, or nil if it
 // succeeded. It is the public health-probe API; embedders poll it to tell healthy
 // from degraded without an extra refreshState round-trip.
@@ -841,7 +825,16 @@ func (r *Redis) Reset(ctx context.Context) error {
 	// uses, and is nil only before Start — fall back to the caller's ctx then, since
 	// there is no longer-lived context to prefer.
 	reseedCtx := ctx //nolint:contextcheck // reseedCtx is deliberately reassigned to r.runCtx below when set: the switch's own background-lifetime context (Start), not derived from this function's ctx parameter, so a caller ctx canceled right after Reset returns cannot be misattributed as a refresh failure (see the comment above).
-	if runCtx := r.getRunCtx(); runCtx != nil {
+	// runCtx is written under r.mu in Start, so read it under r.mu too. This
+	// goroutine holds no lock here (Reset's durable work is done and its critical
+	// sections have all been released), so taking RLock is safe -- a caller that
+	// already holds r.mu must read the field directly instead, since re-acquiring an
+	// RWMutex for reading from a goroutine that already holds it risks blocking
+	// behind a writer that arrived in between (Go's sync.RWMutex favors writers).
+	r.mu.RLock()
+	runCtx := r.runCtx
+	r.mu.RUnlock()
+	if runCtx != nil {
 		reseedCtx = runCtx
 	}
 	_ = r.refreshState(reseedCtx)

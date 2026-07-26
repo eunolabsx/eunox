@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/eunolabs/eunox/internal/mcp"
+	"github.com/eunolabs/eunox/internal/mcp/mcptest"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -315,7 +316,7 @@ func TestFilterResourcesListResult_InvalidJSON(t *testing.T) {
 	pdp := newTestManifestPDP()
 	raw := json.RawMessage(`not-json`)
 	result := filterResourcesListResult(raw, pdp, nil).Result
-	var got mcp.ResourcesListResult
+	var got mcptest.ResourcesListResult
 	if err := json.Unmarshal(result, &got); err != nil {
 		t.Fatalf("expected empty resources list JSON on invalid input, got unparseable result: %v", err)
 	}
@@ -347,7 +348,7 @@ func TestFilterPromptsListResult_InvalidJSON(t *testing.T) {
 	pdp := newTestManifestPDP()
 	raw := json.RawMessage(`not-json`)
 	result := filterPromptsListResult(raw, pdp, nil).Result
-	var got mcp.PromptsListResult
+	var got mcptest.PromptsListResult
 	if err := json.Unmarshal(result, &got); err != nil {
 		t.Fatalf("expected empty prompts list JSON on invalid input, got unparseable result: %v", err)
 	}
@@ -1689,8 +1690,8 @@ func TestGap3_FilterResourcesListResult_FiltersToPermittedResources(t *testing.T
 		capability.Constraint{Target: "resource:db://warehouse/orders", Actions: []string{"read"}},
 	)
 
-	list := mcp.ResourcesListResult{
-		Resources: []mcp.ResourceEntry{
+	list := mcptest.ResourcesListResult{
+		Resources: []mcptest.ResourceEntry{
 			{URI: "file:///data/reports/q3.pdf", Name: "Q3 Report"},
 			{URI: "file:///internal/secrets.txt", Name: "Secrets"},
 			{URI: "db://warehouse/orders", Name: "Orders"},
@@ -1701,7 +1702,7 @@ func TestGap3_FilterResourcesListResult_FiltersToPermittedResources(t *testing.T
 
 	filtered := filterResourcesListResult(raw, pdp, nil).Result
 
-	var got mcp.ResourcesListResult
+	var got mcptest.ResourcesListResult
 	if err := json.Unmarshal(filtered, &got); err != nil {
 		t.Fatalf("unmarshal filtered result: %v", err)
 	}
@@ -1722,8 +1723,8 @@ func TestGap3_FilterResourcesListResult_WildcardManifest(t *testing.T) {
 		capability.Constraint{Target: "resource:*", Actions: []string{"read"}},
 	)
 
-	list := mcp.ResourcesListResult{
-		Resources: []mcp.ResourceEntry{
+	list := mcptest.ResourcesListResult{
+		Resources: []mcptest.ResourceEntry{
 			{URI: "file:///a.txt"},
 			{URI: "file:///b.txt"},
 		},
@@ -1731,7 +1732,7 @@ func TestGap3_FilterResourcesListResult_WildcardManifest(t *testing.T) {
 	raw, _ := json.Marshal(list)
 
 	filtered := filterResourcesListResult(raw, pdp, nil).Result
-	var got mcp.ResourcesListResult
+	var got mcptest.ResourcesListResult
 	_ = json.Unmarshal(filtered, &got)
 
 	if len(got.Resources) != 2 {
@@ -1745,13 +1746,13 @@ func TestGap3_FilterResourcesListResult_CallActionNotRead_Excluded(t *testing.T)
 		capability.Constraint{Target: "resource:file:///data/*", Actions: []string{"call"}},
 	)
 
-	list := mcp.ResourcesListResult{
-		Resources: []mcp.ResourceEntry{{URI: "file:///data/report.csv"}},
+	list := mcptest.ResourcesListResult{
+		Resources: []mcptest.ResourceEntry{{URI: "file:///data/report.csv"}},
 	}
 	raw, _ := json.Marshal(list)
 
 	filtered := filterResourcesListResult(raw, pdp, nil).Result
-	var got mcp.ResourcesListResult
+	var got mcptest.ResourcesListResult
 	_ = json.Unmarshal(filtered, &got)
 
 	if len(got.Resources) != 0 {
@@ -1764,10 +1765,10 @@ func TestGap3_FilterResourcesListResult_EmptyUpstreamList(t *testing.T) {
 		capability.Constraint{Target: "resource:file:///data/*", Actions: []string{"read"}},
 	)
 
-	raw, _ := json.Marshal(mcp.ResourcesListResult{Resources: []mcp.ResourceEntry{}})
+	raw, _ := json.Marshal(mcptest.ResourcesListResult{Resources: []mcptest.ResourceEntry{}})
 	filtered := filterResourcesListResult(raw, pdp, nil).Result
 
-	var got mcp.ResourcesListResult
+	var got mcptest.ResourcesListResult
 	_ = json.Unmarshal(filtered, &got)
 	if len(got.Resources) != 0 {
 		t.Errorf("expected empty result, got %v", got.Resources)
@@ -1782,7 +1783,7 @@ func TestGap3_FilterResourcesListResult_MalformedInput_ReturnsEmpty(t *testing.T
 	malformed := json.RawMessage(`not valid json`)
 	result := filterResourcesListResult(malformed, pdp, nil).Result
 
-	var got mcp.ResourcesListResult
+	var got mcptest.ResourcesListResult
 	if err := json.Unmarshal(result, &got); err != nil {
 		t.Fatalf("expected empty resources list JSON, got unparseable result: %v", err)
 	}
@@ -1796,8 +1797,8 @@ func TestGap3_FilterResourcesListResult_GlobPattern(t *testing.T) {
 		capability.Constraint{Target: "resource:file:///data/*", Actions: []string{"read"}},
 	)
 
-	list := mcp.ResourcesListResult{
-		Resources: []mcp.ResourceEntry{
+	list := mcptest.ResourcesListResult{
+		Resources: []mcptest.ResourceEntry{
 			{URI: "file:///data/report.csv"},
 			{URI: "file:///data/metrics.json"},
 			{URI: "file:///internal/secrets.txt"},
@@ -1806,7 +1807,7 @@ func TestGap3_FilterResourcesListResult_GlobPattern(t *testing.T) {
 	raw, _ := json.Marshal(list)
 	filtered := filterResourcesListResult(raw, pdp, nil).Result
 
-	var got mcp.ResourcesListResult
+	var got mcptest.ResourcesListResult
 	_ = json.Unmarshal(filtered, &got)
 
 	if len(got.Resources) != 2 {
@@ -1820,8 +1821,8 @@ func TestGap6_FilterPromptsListResult_FiltersToPermittedPrompts(t *testing.T) {
 		capability.Constraint{Target: "prompt:summarize", Actions: []string{"get"}},
 	)
 
-	list := mcp.PromptsListResult{
-		Prompts: []mcp.PromptEntry{
+	list := mcptest.PromptsListResult{
+		Prompts: []mcptest.PromptEntry{
 			{Name: "code_review", Description: "Review code"},
 			{Name: "write_email", Description: "Compose an email"},
 			{Name: "summarize", Description: "Summarize text"},
@@ -1833,7 +1834,7 @@ func TestGap6_FilterPromptsListResult_FiltersToPermittedPrompts(t *testing.T) {
 
 	filtered := filterPromptsListResult(raw, pdp, nil).Result
 
-	var got mcp.PromptsListResult
+	var got mcptest.PromptsListResult
 	if err := json.Unmarshal(filtered, &got); err != nil {
 		t.Fatalf("unmarshal filtered result: %v", err)
 	}
@@ -1854,8 +1855,8 @@ func TestGap6_FilterPromptsListResult_WildcardManifest(t *testing.T) {
 		capability.Constraint{Target: "prompt:*", Actions: []string{"get"}},
 	)
 
-	list := mcp.PromptsListResult{
-		Prompts: []mcp.PromptEntry{
+	list := mcptest.PromptsListResult{
+		Prompts: []mcptest.PromptEntry{
 			{Name: "code_review"},
 			{Name: "summarize"},
 			{Name: "generate_tests"},
@@ -1864,7 +1865,7 @@ func TestGap6_FilterPromptsListResult_WildcardManifest(t *testing.T) {
 	raw, _ := json.Marshal(list)
 
 	filtered := filterPromptsListResult(raw, pdp, nil).Result
-	var got mcp.PromptsListResult
+	var got mcptest.PromptsListResult
 	_ = json.Unmarshal(filtered, &got)
 
 	if len(got.Prompts) != 3 {
@@ -1877,13 +1878,13 @@ func TestGap6_FilterPromptsListResult_WildcardAction_PermitsGet(t *testing.T) {
 		capability.Constraint{Target: "prompt:code_review", Actions: []string{"*"}},
 	)
 
-	list := mcp.PromptsListResult{
-		Prompts: []mcp.PromptEntry{{Name: "code_review"}},
+	list := mcptest.PromptsListResult{
+		Prompts: []mcptest.PromptEntry{{Name: "code_review"}},
 	}
 	raw, _ := json.Marshal(list)
 
 	filtered := filterPromptsListResult(raw, pdp, nil).Result
-	var got mcp.PromptsListResult
+	var got mcptest.PromptsListResult
 	_ = json.Unmarshal(filtered, &got)
 
 	if len(got.Prompts) != 1 {
@@ -1897,13 +1898,13 @@ func TestGap6_FilterPromptsListResult_CallActionNotGet_Excluded(t *testing.T) {
 		capability.Constraint{Target: "prompt:code_review", Actions: []string{"call"}},
 	)
 
-	list := mcp.PromptsListResult{
-		Prompts: []mcp.PromptEntry{{Name: "code_review"}},
+	list := mcptest.PromptsListResult{
+		Prompts: []mcptest.PromptEntry{{Name: "code_review"}},
 	}
 	raw, _ := json.Marshal(list)
 
 	filtered := filterPromptsListResult(raw, pdp, nil).Result
-	var got mcp.PromptsListResult
+	var got mcptest.PromptsListResult
 	_ = json.Unmarshal(filtered, &got)
 
 	if len(got.Prompts) != 0 {
@@ -1916,10 +1917,10 @@ func TestGap6_FilterPromptsListResult_EmptyUpstreamList(t *testing.T) {
 		capability.Constraint{Target: "prompt:code_review", Actions: []string{"get"}},
 	)
 
-	raw, _ := json.Marshal(mcp.PromptsListResult{Prompts: []mcp.PromptEntry{}})
+	raw, _ := json.Marshal(mcptest.PromptsListResult{Prompts: []mcptest.PromptEntry{}})
 	filtered := filterPromptsListResult(raw, pdp, nil).Result
 
-	var got mcp.PromptsListResult
+	var got mcptest.PromptsListResult
 	_ = json.Unmarshal(filtered, &got)
 	if len(got.Prompts) != 0 {
 		t.Errorf("expected empty result, got %v", got.Prompts)
@@ -1934,7 +1935,7 @@ func TestGap6_FilterPromptsListResult_MalformedInput_ReturnsEmpty(t *testing.T) 
 	malformed := json.RawMessage(`not valid json`)
 	result := filterPromptsListResult(malformed, pdp, nil).Result
 
-	var got mcp.PromptsListResult
+	var got mcptest.PromptsListResult
 	if err := json.Unmarshal(result, &got); err != nil {
 		t.Fatalf("expected empty prompts list JSON, got unparseable result: %v", err)
 	}
@@ -1948,8 +1949,8 @@ func TestGap6_FilterPromptsListResult_GlobPattern(t *testing.T) {
 		capability.Constraint{Target: "prompt:code_*", Actions: []string{"get"}},
 	)
 
-	list := mcp.PromptsListResult{
-		Prompts: []mcp.PromptEntry{
+	list := mcptest.PromptsListResult{
+		Prompts: []mcptest.PromptEntry{
 			{Name: "code_review"},
 			{Name: "code_gen"},
 			{Name: "summarize"},
@@ -1958,7 +1959,7 @@ func TestGap6_FilterPromptsListResult_GlobPattern(t *testing.T) {
 	raw, _ := json.Marshal(list)
 	filtered := filterPromptsListResult(raw, pdp, nil).Result
 
-	var got mcp.PromptsListResult
+	var got mcptest.PromptsListResult
 	_ = json.Unmarshal(filtered, &got)
 
 	if len(got.Prompts) != 2 {
@@ -1972,13 +1973,13 @@ func TestGap6_FilterPromptsListResult_ToolEntryDoesNotExposeprompt(t *testing.T)
 		capability.Constraint{Target: "tool:code_review", Actions: []string{"call"}},
 	)
 
-	list := mcp.PromptsListResult{
-		Prompts: []mcp.PromptEntry{{Name: "code_review"}},
+	list := mcptest.PromptsListResult{
+		Prompts: []mcptest.PromptEntry{{Name: "code_review"}},
 	}
 	raw, _ := json.Marshal(list)
 
 	filtered := filterPromptsListResult(raw, pdp, nil).Result
-	var got mcp.PromptsListResult
+	var got mcptest.PromptsListResult
 	_ = json.Unmarshal(filtered, &got)
 
 	if len(got.Prompts) != 0 {
@@ -1994,15 +1995,15 @@ func TestGap6_FilterPromptsListResult_PromptMetadataPreserved(t *testing.T) {
 	args, _ := json.Marshal([]map[string]interface{}{
 		{"name": "language", "description": "Programming language", "required": true},
 	})
-	list := mcp.PromptsListResult{
-		Prompts: []mcp.PromptEntry{
+	list := mcptest.PromptsListResult{
+		Prompts: []mcptest.PromptEntry{
 			{Name: "code_review", Description: "Review code for quality", Arguments: args},
 		},
 	}
 	raw, _ := json.Marshal(list)
 
 	filtered := filterPromptsListResult(raw, pdp, nil).Result
-	var got mcp.PromptsListResult
+	var got mcptest.PromptsListResult
 	if err := json.Unmarshal(filtered, &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
