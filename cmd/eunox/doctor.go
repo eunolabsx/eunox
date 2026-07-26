@@ -133,8 +133,11 @@ type doctorOptions struct {
 	live         bool
 }
 
-func cmdDoctor() {
-	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
+// cmdDoctor runs the `doctor` subcommand and returns the process exit code (rather
+// than calling os.Exit itself), so tests can drive every branch in-process — matching
+// every other fallible subcommand.
+func cmdDoctor() int {
+	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `Usage:
   eunox doctor [flags]
@@ -163,23 +166,13 @@ Flags:
 	live := fs.Bool("live", false, "Connect to each declared upstream and include the drift report.\nRequires --config.")
 	output := fs.String("output", "", "Write the bundle to this file instead of stdout. The conventional name\nis eunox-doctor-<timestamp>.txt; --output auto picks one automatically.")
 
-	// flag.ExitOnError: Parse exits the process on a bad flag or -help, so it never
-	// returns a non-nil error here (the old `if err != nil` branch was dead).
-	_ = fs.Parse(os.Args[2:])
-	// All inputs are flags; reject a stray positional rather than ignore it.
-	if fs.NArg() > 0 {
-		fmt.Fprintf(os.Stderr, "eunox doctor: unexpected argument %q (all inputs are flags; see --help)\n", fs.Arg(0))
-		os.Exit(1)
-	}
-
-	// If --config is provided, use its audit.log/audit.keyPath as defaults for
-	// --audit-log/--audit-key-path, matching suggest/stats/audit-verify — the other
-	// readers of the same tape. Without this, `doctor --config foo.yaml` (no
-	// --audit-log) reported against the built-in default path even when foo.yaml
-	// pointed its audit.log elsewhere.
-	if err := applyConfigAuditDefaults("doctor", *configPath, auditLog, auditKey); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+	// Shared with suggest/stats/audit-verify — the other readers of the same tape — so
+	// the stray-positional rejection and the --config audit-path defaulting cannot drift
+	// between them. doctor deliberately stops here rather than resolving --audit-log: an
+	// unresolvable path is reported INSIDE the bundle, since a support bundle that prints
+	// what it can beats one that refuses to print.
+	if code, done := parseAuditReaderFlags("doctor", fs, configPath, auditLog, auditKey); done {
+		return code
 	}
 
 	opts := doctorOptions{
@@ -193,7 +186,7 @@ Flags:
 	// Stdout: discard write errors (a broken pipe is not actionable).
 	if *output == "" {
 		writeDoctorBundle(os.Stdout, opts)
-		return
+		return 0
 	}
 
 	outPath := *output
@@ -205,12 +198,12 @@ Flags:
 	// truncated and then re-moded 0600 by the Chmod below.
 	if err := refuseNonRegularOutput(outPath); err != nil {
 		fmt.Fprintf(os.Stderr, "eunox doctor: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	f, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600) //nolint:gosec // G304: --output is an operator-supplied destination
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "eunox doctor: opening %q: %v\n", outPath, err)
-		os.Exit(1)
+		return 1
 	}
 	// Re-tighten on the open fd: O_CREATE applies 0600 only on creation, so a pre-existing
 	// looser-mode file (e.g. a prior 0644 bundle) would keep that mode. The bundle is
@@ -219,7 +212,7 @@ Flags:
 	if err := f.Chmod(0o600); err != nil {
 		fmt.Fprintf(os.Stderr, "eunox doctor: tightening mode of %q: %v\n", outPath, err)
 		_ = f.Close()
-		os.Exit(1)
+		return 1
 	}
 	// Track write errors AND the close (which flushes) so a truncated bundle is
 	// reported with a non-zero exit rather than announced as complete.
@@ -228,14 +221,15 @@ Flags:
 	closeErr := f.Close()
 	if writeErr := tw.err; writeErr != nil {
 		fmt.Fprintf(os.Stderr, "eunox doctor: writing %q: %v\n", outPath, writeErr)
-		os.Exit(1)
+		return 1
 	}
 	if closeErr != nil {
 		fmt.Fprintf(os.Stderr, "eunox doctor: writing %q: %v\n", outPath, closeErr)
-		os.Exit(1)
+		return 1
 	}
 	fmt.Fprintf(os.Stderr, "Wrote support bundle to %s\n", outPath)
 	fmt.Fprintln(os.Stderr, "Review for any remaining sensitive values before sharing.")
+	return 0
 }
 
 // writeDoctorBundle emits the support bundle to w. Sections are independent —

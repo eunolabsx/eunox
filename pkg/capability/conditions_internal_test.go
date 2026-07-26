@@ -76,10 +76,10 @@ func TestConstraintUnmarshal_RejectsLossyNumericBound(t *testing.T) {
 	}{
 		{"minimum above 2^53", "minimum", "1700000000000000001"},
 		{"maximum above 2^53", "maximum", "9007199254740993"},
-		// Beyond int64 range (2^64+1): wholeInt64Float(f) alone would miss this (f is
+		// Beyond int64 range (2^64+1): FloatToInt64(f) alone would miss this (f is
 		// out of int64 range, so it is not a "whole int64" per that check), which is
 		// why exactFloatBound's exactness check must also trigger on orig.IsInt() —
-		// any integer literal, at any magnitude — not only on wholeInt64Float(f).
+		// any integer literal, at any magnitude — not only on FloatToInt64(f).
 		{"minimum beyond int64 range", "minimum", "18446744073709551617"},
 	}
 	for _, tc := range cases {

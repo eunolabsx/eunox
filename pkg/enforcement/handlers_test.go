@@ -88,7 +88,7 @@ func TestSequenceBlock_NamedBlockedToolStillReported(t *testing.T) {
 // for the silent fail-OPEN where a target whose NAME itself begins with a recognized
 // namespace token — a tool literally named "system:foo" — was recorded verbatim under
 // (tool, "system:foo") but a natural afterTools: ["system:foo"] resolves (via the
-// lookup's prefix split) to (system, foo), so the gate never fired. recordSessionCall
+// lookup's prefix split) to (system, foo), so the gate never fired. RecordSessionCall
 // now also writes a secondary marker keyed the way the bare spelling parses, so BOTH
 // the bare "system:foo" and the explicit "tool:system:foo" spellings trip the gate.
 func TestSequenceBlock_NamespacePrefixedAntecedentName_BothSpellingsMatch(t *testing.T) {

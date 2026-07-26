@@ -353,7 +353,7 @@ func schemaValidateNumber(p string, v float64, raw interface{}, s *capability.Ar
 // comparison is exact; otherwise it falls back to the float64 comparison.
 func compareToBound(raw interface{}, f, bound float64) int {
 	if ri, ok := asInt64(raw); ok {
-		if bi, ok := capability.Int64FromFloat(bound); ok {
+		if bi, ok := capability.FloatToInt64(bound); ok {
 			switch {
 			case ri < bi:
 				return -1

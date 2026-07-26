@@ -911,3 +911,69 @@ func TestIndentWriter_ShortWriteDoesNotMarkLineStart(t *testing.T) {
 		t.Error("atLineStart must stay false after a short write that did not flush the newline")
 	}
 }
+
+// TestCmdDoctor_ExitCodes drives cmdDoctor's failure branches in-process. They used to
+// call os.Exit, so none of them could be asserted without spawning a subprocess; the
+// int return makes each reachable from a test.
+func TestCmdDoctor_ExitCodes(t *testing.T) {
+	dir := t.TempDir()
+
+	t.Run("stray positional", func(t *testing.T) {
+		var code int
+		withArgs([]string{"eunox", "doctor", "unexpected.txt"}, func() { code = cmdDoctor() })
+		if code != 1 {
+			t.Errorf("exit code = %d, want 1 for a stray positional", code)
+		}
+	})
+
+	t.Run("unparseable config", func(t *testing.T) {
+		bad := filepath.Join(dir, "bad.yaml")
+		if err := os.WriteFile(bad, []byte("this: is: not: valid: yaml:\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var code int
+		withArgs([]string{"eunox", "doctor", "--config", bad, "--audit-tail", "0"}, func() { code = cmdDoctor() })
+		if code != 1 {
+			t.Errorf("exit code = %d, want 1 for an unloadable --config", code)
+		}
+	})
+
+	t.Run("unwritable output", func(t *testing.T) {
+		// --output names a path under a FILE, so the open fails with ENOTDIR.
+		notDir := filepath.Join(dir, "not-a-dir")
+		if err := os.WriteFile(notDir, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var code int
+		withArgs([]string{
+			"eunox", "doctor",
+			"--output", filepath.Join(notDir, "bundle.txt"),
+			"--audit-log", filepath.Join(dir, "absent.jsonl"),
+			"--audit-tail", "0",
+		}, func() { code = cmdDoctor() })
+		if code != 1 {
+			t.Errorf("exit code = %d, want 1 when the bundle cannot be opened for writing", code)
+		}
+	})
+
+	t.Run("bad flag", func(t *testing.T) {
+		var code int
+		withArgs([]string{"eunox", "doctor", "--no-such-flag"}, func() { code = cmdDoctor() })
+		if code != 1 {
+			t.Errorf("exit code = %d, want 1 for an unknown flag (ContinueOnError, not a process exit)", code)
+		}
+	})
+
+	t.Run("success to stdout", func(t *testing.T) {
+		var code int
+		withArgs([]string{
+			"eunox", "doctor",
+			"--output", filepath.Join(dir, "ok.txt"),
+			"--audit-log", filepath.Join(dir, "absent.jsonl"),
+			"--audit-tail", "0",
+		}, func() { code = cmdDoctor() })
+		if code != 0 {
+			t.Errorf("exit code = %d, want 0 on a clean run", code)
+		}
+	})
+}

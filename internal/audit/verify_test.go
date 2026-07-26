@@ -1521,7 +1521,7 @@ func TestRecoverPartialTail_ProbeOrTruncateErrorIsPropagated(t *testing.T) {
 	// readable=true: this simulates a probe READ fault on a readable handle (the closed
 	// fd makes f.Stat/f.ReadAt fail), which must fail closed — distinct from a genuinely
 	// write-only log (readable=false), which skips the probe.
-	rb, err := recoverPartialTail(logPath, f, true)
+	rb, _, err := recoverPartialTail(logPath, f, true)
 	if err == nil {
 		t.Fatal("recoverPartialTail must return an error when the recovery cannot complete, not swallow it")
 	}
@@ -1579,7 +1579,7 @@ func TestRecoverPartialTail_ProbeReadFailureOnNonEmptyLogIsFatal(t *testing.T) {
 	// scenario under test is a transient read fault on a readable, non-empty log, which
 	// must fail closed (errAuditTailProbe). A genuinely write-only log uses readable=false
 	// and skips the probe (see TestRecoverPartialTail_WriteOnlyHandleSkipsProbe).
-	rb, err := recoverPartialTail(logPath, wf, true)
+	rb, _, err := recoverPartialTail(logPath, wf, true)
 	if err == nil {
 		t.Fatal("recoverPartialTail must fail closed when the tail read fails on a non-empty log, not proceed and let the next append fuse onto the orphan")
 	}
@@ -1623,9 +1623,15 @@ func TestRecoverPartialTail_WriteOnlyHandleSkipsProbe(t *testing.T) {
 	}
 	defer func() { _ = f.Close() }()
 
-	rb, err := recoverPartialTail(logPath, f, false)
+	rb, tail, err := recoverPartialTail(logPath, f, false)
 	if err != nil {
 		t.Fatalf("recoverPartialTail(readable=false) must skip the probe and proceed, got error: %v", err)
+	}
+	// A non-empty write-only log reports an UNREADABLE tail, which is what drives Open's
+	// fail-closed chain-resume (seed past the on-disk max + chain_resume_failed marker)
+	// instead of a genesis restart that would reissue every existing seq.
+	if tail.readable {
+		t.Fatal("tail.readable = true, want false for a non-empty write-only log")
 	}
 	if rb != 0 {
 		t.Fatalf("recovered bytes = %d, want 0 (the probe is skipped on a write-only handle)", rb)
@@ -1676,12 +1682,17 @@ func TestTruncatePartialTail_CleanTailIsTruncatedViaSingleHandle(t *testing.T) {
 	}
 	defer func() { _ = f.Close() }()
 
-	rb, err := truncatePartialTail(f)
+	rb, last, err := truncatePartialTail(f)
 	if err != nil {
 		t.Fatalf("truncatePartialTail: unexpected error %v", err)
 	}
 	if rb != int64(len(orphan)) {
 		t.Fatalf("recovered bytes = %d, want %d (the orphan fragment length)", rb, len(orphan))
+	}
+	// The resume line comes out of the window this call already read: it must be the
+	// last COMPLETE record, not the truncated orphan.
+	if last == "" || strings.Contains(last, `"partial`) {
+		t.Fatalf("returned tail line = %q, want the last complete record", last)
 	}
 	after, err := os.ReadFile(logPath) //nolint:gosec // G304: test-controlled path
 	if err != nil {
@@ -1696,8 +1707,8 @@ func TestTruncatePartialTail_CleanTailIsTruncatedViaSingleHandle(t *testing.T) {
 }
 
 // TestTruncatePartialTail_EmptyLogIsNonFatal confirms the preserved benign case: an empty
-// log (no orphan possible) returns (0, nil) rather than a probe error, so enforcement still
-// starts on a brand-new install.
+// log (no orphan possible) returns (0, "", nil) rather than a probe error, so enforcement
+// still starts on a brand-new install.
 func TestTruncatePartialTail_EmptyLogIsNonFatal(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "empty.jsonl")
@@ -1708,12 +1719,15 @@ func TestTruncatePartialTail_EmptyLogIsNonFatal(t *testing.T) {
 	}
 	defer func() { _ = f.Close() }()
 
-	rb, err := truncatePartialTail(f)
+	rb, last, err := truncatePartialTail(f)
 	if err != nil {
 		t.Fatalf("truncatePartialTail on an empty log must be non-fatal, got %v", err)
 	}
 	if rb != 0 {
 		t.Fatalf("recovered bytes = %d, want 0 on an empty log", rb)
+	}
+	if last != "" {
+		t.Fatalf("tail line = %q, want \"\" on an empty log", last)
 	}
 }
 
@@ -2127,5 +2141,94 @@ func TestVerifyAuditLog_AllLegacyUnderKeyIsUnanchored(t *testing.T) {
 	}
 	if !res2.OK() {
 		t.Errorf("all-legacy log under an empty keyring must pass (nothing to verify): %+v", res2)
+	}
+}
+
+// TestTruncatePartialTail_ReReadsWhenWindowClipsTheLastRecord covers the one path the
+// startup tail read cannot answer from the bytes already in hand: after truncating an
+// orphan fragment, the surviving window begins PART-WAY THROUGH the last complete record,
+// so that record's leading boundary is outside it. Returning what the window holds would
+// hand Open a record clipped at the window edge, which then fails to parse and restarts
+// the chain from genesis — reissuing every existing seq, the tamper-shaped cascade the
+// resume exists to avoid. The re-read is anchored at the new EOF through the SAME handle,
+// never a second open.
+//
+// The window is injected (a few dozen bytes) rather than staged at the real 4 MiB, where
+// the record-size cap makes this geometrically unreachable; the logic is identical.
+func TestTruncatePartialTail_ReReadsWhenWindowClipsTheLastRecord(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+
+	r1 := `{"seq":1,"decision":"allow"}`
+	r2 := `{"seq":2,"decision":"allow"}`
+	orphan := `{"seq":3,"decision":"allo` // no trailing newline: a partial write
+	content := r1 + "\n" + r2 + "\n" + orphan
+	if err := os.WriteFile(logPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	// Size the window so it starts INSIDE r2: the surviving window after truncation is
+	// then r2's tail plus its newline, with r2's own leading boundary outside it.
+	winSize := int64(len(orphan) + len(r2)/2)
+	if got := int64(len(content)) - winSize; got <= int64(len(r1)) {
+		t.Fatalf("test setup: window start %d must land inside r2 (past r1's %d bytes)", got, len(r1))
+	}
+
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_RDWR, 0o600) //nolint:gosec // G304: test-controlled path
+	if err != nil {
+		t.Fatalf("open O_RDWR: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	rb, last, err := truncatePartialTailWindowed(f, winSize)
+	if err != nil {
+		t.Fatalf("truncatePartialTailWindowed: %v", err)
+	}
+	if rb != int64(len(orphan)) {
+		t.Fatalf("recovered bytes = %d, want %d (the orphan fragment)", rb, len(orphan))
+	}
+	// The whole record, not the fragment the clipped window held.
+	if last != r2 {
+		t.Fatalf("tail line = %q, want the COMPLETE record %q (a clipped record would restart the chain from genesis)", last, r2)
+	}
+	// The truncation itself must still be exact.
+	after, err := os.ReadFile(logPath) //nolint:gosec // G304: test-controlled path
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if string(after) != r1+"\n"+r2+"\n" {
+		t.Fatalf("post-truncation content = %q, want the two complete records", after)
+	}
+}
+
+// TestTruncatePartialTail_ReReadFailureFailsClosed pins that a re-read the handle cannot
+// service is not reported as a clean tail: the same fail-closed stance the initial probe
+// takes. Uses the clipping geometry above, then closes the handle so the re-read's ReadAt
+// fails.
+func TestTruncatePartialTail_ReReadFailureFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+	r1 := `{"seq":1,"decision":"allow"}`
+	r2 := `{"seq":2,"decision":"allow"}`
+	content := r1 + "\n" + r2 + "\n"
+	if err := os.WriteFile(logPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_RDWR, 0o600) //nolint:gosec // G304: test-controlled path
+	if err != nil {
+		t.Fatalf("open O_RDWR: %v", err)
+	}
+	// Read the window first (while the handle is live), then close it so only the
+	// re-read fails.
+	winSize := int64(len(r2))
+	start := int64(len(content)) - winSize
+	window := make([]byte, winSize)
+	if _, err := f.ReadAt(window, start); err != nil && err != io.EOF {
+		t.Fatalf("stage window read: %v", err)
+	}
+	_ = f.Close()
+
+	if _, err := tailLineFromWindow(f, window, start, int64(len(content)), winSize); !errors.Is(err, errAuditTailProbe) {
+		t.Fatalf("error = %v, want it to wrap errAuditTailProbe (a re-read we cannot complete is not a clean tail)", err)
 	}
 }

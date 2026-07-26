@@ -450,12 +450,8 @@ func TestInMemory_StartCleanup_FirstIntervalWins(t *testing.T) {
 	// then let the fast interval fire. If the hour-long interval had won, no tick
 	// would run in this span and the entry would survive in the map.
 	advanceClock(25 * time.Hour)
-	time.Sleep(100 * time.Millisecond)
 
-	m.mu.Lock()
-	n := len(m.entries)
-	m.mu.Unlock()
-	if n != 0 {
+	if n := waitForEntryCount(m, 0); n != 0 {
 		t.Errorf("entries = %d, want 0: the first call's fast interval must govern cleanup", n)
 	}
 }
@@ -502,12 +498,8 @@ func TestInMemory_StartCleanup_RestartsAfterContextCancel(t *testing.T) {
 		t.Fatalf("IncrementAndGet: %v", err)
 	}
 	advanceClock(25 * time.Hour)
-	time.Sleep(100 * time.Millisecond)
 
-	m.mu.Lock()
-	n := len(m.entries)
-	m.mu.Unlock()
-	if n != 0 {
+	if n := waitForEntryCount(m, 0); n != 0 {
 		t.Errorf("entries = %d, want 0: restarted cleanup goroutine must evict stale entries", n)
 	}
 }
@@ -558,11 +550,8 @@ func TestInMemory_StartCleanup_RestartRacingTeardown(t *testing.T) {
 		t.Fatalf("IncrementAndGet: %v", err)
 	}
 	advanceClock(25 * time.Hour)
-	time.Sleep(100 * time.Millisecond)
-	m.mu.Lock()
-	n := len(m.entries)
-	m.mu.Unlock()
-	if n != 0 {
+
+	if n := waitForEntryCount(m, 0); n != 0 {
 		t.Errorf("entries = %d, want 0: the restarted cleanup goroutine must evict stale entries", n)
 	}
 }
@@ -1174,5 +1163,24 @@ func TestInMemoryPeekFloorMatchesIncrement(t *testing.T) {
 	}
 	if peek != 1 {
 		t.Fatalf("Peek = %d, want 1", peek)
+	}
+}
+
+// waitForEntryCount polls m's entry count until it reaches want or the deadline
+// passes, then reports the final count. It replaces a fixed time.Sleep before a
+// positive assertion: a sleep that is too short flakes on a loaded CI box, and one
+// long enough not to flake pays that wall-clock cost on every run. Polling returns as
+// soon as the cleanup goroutine has done its work, and only spends the full budget
+// when the assertion is genuinely about to fail.
+func waitForEntryCount(m *InMemory, want int) int {
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		m.mu.Lock()
+		n := len(m.entries)
+		m.mu.Unlock()
+		if n == want || !time.Now().Before(deadline) {
+			return n
+		}
+		time.Sleep(time.Millisecond)
 	}
 }

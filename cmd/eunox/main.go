@@ -96,7 +96,7 @@ func run(args []string) int {
 	case "stats":
 		return cmdStats()
 	case "doctor":
-		cmdDoctor()
+		return cmdDoctor()
 	case "version", "--version", "-version":
 		cmdVersion()
 	case "--help", "-help", "-h", "help":
@@ -1248,13 +1248,13 @@ func resolveOAuthMetadata(cfg *config.GatewayConfig, pf proxyFlags) (*transport.
 	if oauthResource == "" {
 		oauthResource = pf.oauthResource
 		oauthResourceLabel = "--oauth-resource"
-	} else if pf.oauthResource != "" && pf.oauthResource != oauthResource {
-		// Config wins, but say so. Silently discarding an explicitly-passed flag leaves
-		// the operator believing they published a resource URI they did not — and this
-		// one lands in the RFC 9728 metadata document and every WWW-Authenticate
-		// challenge, so the mismatch surfaces later as clients failing to discover the
-		// authorization server. Matches the audit-sink override warning.
-		fmt.Fprintf(os.Stderr, "[eunox] WARNING: --oauth-resource=%q is overridden by listen.oauthResource=%q from the config file; the config value is published.\n", pf.oauthResource, oauthResource)
+	} else if pf.oauthResource != "" && pf.oauthResource != cfg.Listen.OAuthResource {
+		// Config wins, matching the audit-path precedence above — but say so. The
+		// resource URI is what a client's token audience is checked against, so an
+		// operator who passed --oauth-resource and got a metadata document naming a
+		// different resource would otherwise debug a token-audience mismatch with no
+		// hint that their flag was dropped.
+		fmt.Fprintf(os.Stderr, "[eunox] WARNING: --oauth-resource %q is overridden by the config's listen.oauthResource %q; the config takes precedence.\n", pf.oauthResource, cfg.Listen.OAuthResource)
 	}
 	if err := validateOAuthURI(oauthResourceLabel, oauthResource, true); err != nil {
 		return nil, "", err
@@ -1638,10 +1638,12 @@ are merged and validated, and with --live each route's declared upstream
 (http or stdio subprocess) is introspected — no need to re-specify the
 upstream wiring. The config is the source of truth.
 
-Exit codes with --live:
-  0  All manifest entries match live tools; no glob-matched tools detected.
-  1  Warnings or stale entries present (operator review required).
-  2  Connection or parse error.
+Exit codes:
+  0  Manifests valid; with --live, all entries match live tools and no
+     glob-matched tools were detected.
+  1  Drift warnings or stale entries present (operator review required).
+     Reserved for findings, so CI can gate on it; never used for usage errors.
+  2  Usage error, or a manifest/config parse or upstream-connection failure.
 
 With --config the exit code is the maximum across all routes.
 
@@ -1678,7 +1680,12 @@ Flags:
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
-		return 1
+		// 2, not 1: exit 1 is reserved for "drift warnings present, operator review
+		// required", which a CI pipeline is expected to gate on. A usage error
+		// exiting 1 is indistinguishable from a clean run that found drift, so a
+		// misspelled flag reads as a policy finding. Every usage rejection below
+		// exits 2 for the same reason.
+		return 2
 	}
 
 	// Track whether --transport was set explicitly so we can reject it in modes
@@ -1695,11 +1702,11 @@ Flags:
 	if *configPath != "" {
 		if len(files) > 0 {
 			fmt.Fprintf(os.Stderr, "eunox validate: --config cannot be combined with positional manifest files (got %d); manifests are declared per-route in the config\n", len(files))
-			return 1
+			return 2
 		}
 		if upstreamFlagsGiven {
 			fmt.Fprintf(os.Stderr, "eunox validate: --config cannot be combined with --transport / --upstream-url / --upstream-auth-header / --upstream-tls-skip-verify / a stdio command; each route's transport and upstream wiring is declared in the config\n")
-			return 1
+			return 2
 		}
 		cfg, err := config.LoadGatewayConfig(*configPath)
 		if err != nil {
@@ -1713,7 +1720,7 @@ Flags:
 
 	if len(files) == 0 {
 		fmt.Fprintf(os.Stderr, "eunox validate: at least one manifest file is required (or use --config <eunox.yaml>)\n")
-		return 1
+		return 2
 	}
 
 	// --transport, the upstream-* flags, and a stdio command only select how to
@@ -1721,7 +1728,7 @@ Flags:
 	// front rather than silently dropping them in a syntax-only check.
 	if !*live && upstreamFlagsGiven {
 		fmt.Fprintf(os.Stderr, "eunox validate: --transport / --upstream-url / --upstream-auth-header / --upstream-tls-skip-verify and a stdio command ('-- <cmd>') only apply with --live; add --live to drift-check against the upstream\n")
-		return 1
+		return 2
 	}
 
 	// Syntax check (always runs).
@@ -2302,29 +2309,11 @@ Flags:
 	force := fs.Bool("force", false, "Overwrite --output if it already exists (default: refuse to clobber). An\noverwrite also re-tightens the file mode to 0600.")
 	maxValues := fs.Int("max-values", suggestMaxValuesDefault, "Max distinct values an argument may have before allowedValues is downgraded to a review comment.\n0 or negative falls back to the default (20).")
 
-	if err := fs.Parse(os.Args[2:]); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return 0
-		}
-		return 1
+	if code, done := parseAuditReaderFlags("suggest", fs, configPath, auditLogPath, nil); done {
+		return code
 	}
-	// The log is chosen with --audit-log/--config, not a positional; reject a stray
-	// argument so `eunox suggest audit.jsonl` does not silently read the default log.
-	if fs.NArg() > 0 {
-		fmt.Fprintf(os.Stderr, "eunox suggest: unexpected argument %q (use --audit-log to name the log file)\n", fs.Arg(0))
-		return 1
-	}
-
-	// If --config is provided, use its audit.log as the default for --audit-log, matching
-	// stats and audit-verify — the other two readers of the same tape.
-	if err := applyConfigAuditDefaults("suggest", *configPath, auditLogPath, nil); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-
-	logPath, err := audit.ResolveLogPath(*auditLogPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "eunox suggest: %v\n", err)
+	logPath, ok := resolveAuditReaderLogPath("suggest", *auditLogPath)
+	if !ok {
 		return 1
 	}
 
@@ -2560,6 +2549,54 @@ func applyConfigAuditDefaults(cmdName, configPath string, logPath, keyPath *stri
 	return nil
 }
 
+// parseAuditReaderFlags runs the preamble every subcommand that reads the audit tape
+// (suggest, stats, audit-verify, doctor) performs identically: parse the flag set,
+// map -h/--help to a clean exit, reject a stray positional, and let a --config fill any
+// audit path the operator left empty.
+//
+// done reports that the caller must return code immediately: 0 for -h, 1 for a usage or
+// config error (already reported on stderr). When done is false, code is 0 and parsing
+// succeeded. keyPath may be nil for a reader that has no --audit-key-path.
+//
+// Every flag argument is a POINTER, configPath included: they are read after fs.Parse
+// runs here, so a by-value configPath would capture the pre-parse empty string and
+// silently skip the config defaulting entirely.
+//
+// The stray-positional rejection is the load-bearing half: the log is chosen with
+// --audit-log/--config, never positionally, so `eunox stats audit.jsonl` must not
+// silently report on the DEFAULT log while naming another file on the command line.
+func parseAuditReaderFlags(name string, fs *flag.FlagSet, configPath, logPath, keyPath *string) (code int, done bool) {
+	if err := fs.Parse(os.Args[2:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0, true
+		}
+		return 1, true
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "eunox %s: unexpected argument %q (use --audit-log to name the log file)\n", name, fs.Arg(0))
+		return 1, true
+	}
+	if err := applyConfigAuditDefaults(name, *configPath, logPath, keyPath); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1, true
+	}
+	return 0, false
+}
+
+// resolveAuditReaderLogPath expands the reader's --audit-log to a concrete path,
+// reporting a resolution failure under the subcommand's own name. ok is false when the
+// caller must return 1. Kept separate from parseAuditReaderFlags because doctor
+// deliberately does NOT resolve here: it reports an unresolvable path inside the support
+// bundle rather than refusing to print one.
+func resolveAuditReaderLogPath(name, configured string) (string, bool) {
+	logPath, err := audit.ResolveLogPath(configured)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "eunox %s: %v\n", name, err)
+		return "", false
+	}
+	return logPath, true
+}
+
 // cmdAuditVerify runs the `audit-verify` subcommand and returns the process
 // exit code (rather than calling os.Exit itself), so tests can drive every branch.
 func cmdAuditVerify() int {
@@ -2579,28 +2616,11 @@ Flags:
 	requestID := fs.String("request-id", "", "Report (count and print) only the record with this request ID. Every record\nis still HMAC-verified and the tamper-evident chain is always checked; this\nfilter narrows the report, not the verification.")
 	since := fs.String("since", "", "Report (count and print) only records after this RFC3339 timestamp. Every\nrecord is still HMAC-verified and the tamper-evident chain is always checked;\nthis filter narrows the report, not the verification.")
 
-	if err := fs.Parse(os.Args[2:]); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return 0
-		}
-		return 1
+	if code, done := parseAuditReaderFlags("audit-verify", fs, configPath, auditLogPath, auditKeyPath); done {
+		return code
 	}
-
-	// The log is chosen with --audit-log/--config, not a positional; reject strays.
-	if fs.NArg() > 0 {
-		fmt.Fprintf(os.Stderr, "eunox audit-verify: unexpected argument %q (use --audit-log to name the log file)\n", fs.Arg(0))
-		return 1
-	}
-
-	// If --config is provided, use its audit settings as defaults.
-	if err := applyConfigAuditDefaults("audit-verify", *configPath, auditLogPath, auditKeyPath); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-
-	logPath, err := audit.ResolveLogPath(*auditLogPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "eunox audit-verify: %v\n", err)
+	logPath, ok := resolveAuditReaderLogPath("audit-verify", *auditLogPath)
+	if !ok {
 		return 1
 	}
 
@@ -2726,27 +2746,11 @@ Flags:
 	configPath := fs.String("config", "", "Path to the eunox config (YAML). When set, the configured audit.log is\nused as the default for --audit-log.")
 	auditLogPath := fs.String("audit-log", "", "Path to the audit JSONL log (default: ~/.eunox/audit.jsonl).")
 
-	if err := fs.Parse(os.Args[2:]); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return 0
-		}
-		return 1
+	if code, done := parseAuditReaderFlags("stats", fs, configPath, auditLogPath, nil); done {
+		return code
 	}
-	// The log is chosen with --audit-log/--config, not a positional; reject strays.
-	if fs.NArg() > 0 {
-		fmt.Fprintf(os.Stderr, "eunox stats: unexpected argument %q (use --audit-log to name the log file)\n", fs.Arg(0))
-		return 1
-	}
-
-	// If --config is provided, use its audit.log as the default for --audit-log.
-	if err := applyConfigAuditDefaults("stats", *configPath, auditLogPath, nil); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-
-	logPath, err := audit.ResolveLogPath(*auditLogPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "eunox stats: %v\n", err)
+	logPath, ok := resolveAuditReaderLogPath("stats", *auditLogPath)
+	if !ok {
 		return 1
 	}
 

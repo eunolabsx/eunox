@@ -331,11 +331,23 @@ func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability
 				u.Name, u.Name)
 		}
 
-		r.sink = &routeSink{
-			sink:          sink,
-			upstream:      r.name,
-			policyVersion: policyVersion,
-			policySHA256:  policySHA256,
+		// Only wrap a real sink. A &routeSink{sink: nil} is never the nil pointer
+		// asRecorder's zero-value check looks for, so wrapping unconditionally would
+		// hand every call site a NON-nil auditRecorder on a sink-less route and
+		// silently defeat every "no sink configured" fast path that tests
+		// `rec != nil` — dispatchList would decode and count every */list catalog it
+		// has nowhere to record. That is the same typed-nil trap StdioProxy.rec()
+		// documents and avoids for the stdio host; leaving r.sink nil here keeps
+		// asRecorder(route.sink) a genuine nil interface at each site. routeSink's
+		// own methods no-op on a nil inner sink, so a caller that ignores the nil
+		// and records anyway stays safe either way.
+		if sink != nil {
+			r.sink = &routeSink{
+				sink:          sink,
+				upstream:      r.name,
+				policyVersion: policyVersion,
+				policySHA256:  policySHA256,
+			}
 		}
 		routes[u.Name] = r
 	}

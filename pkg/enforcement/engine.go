@@ -57,12 +57,12 @@ type DeferredCommit struct {
 // which case the condition is treated as satisfied and no bucket is committed.
 //
 // skip MUST be uniform across the whole constraint: it must be derived solely from
-// the request context (as the built-in maxCalls does via skipQuota(ctx)), never from
+// the request context (as the built-in maxCalls does via SkipQuota(ctx)), never from
 // this condition's own configuration or arguments. The atomic multi-condition commit
 // treats one bucket's skip as skipping the entire deferred set — admitting the call
 // without limit-checking the remaining committing conditions — so a per-condition skip
 // would be a fail-open for the buckets it never checked. commitDeferredAtomic asserts
-// skip == skipQuota(ctx) and fails closed on a violation, but a conforming handler must
+// skip == SkipQuota(ctx) and fails closed on a violation, but a conforming handler must
 // keep skip context-derived so the whole set skips or none does.
 //
 // A condition type is "deferred" precisely when its registered handler implements
@@ -138,7 +138,7 @@ const sequenceHistoryMaxEntries = 1
 // address disjoint history. The target type is part of the key because the bare name
 // alone is ambiguous — a tool "export" and a prompt "export" would otherwise collide
 // on one bucket and cross-trip each other's sequenceBlocks. Recording and Peek must
-// pass the same namespace and type (see recordSessionCall and handleSequenceBlock).
+// pass the same namespace and type (see RecordSessionCall and handleSequenceBlock).
 func sequenceHistoryKey(namespace, sessionID, targetType, target string) string {
 	return compositeCounterKey("seq", namespace, sessionID, targetType, target)
 }
@@ -178,9 +178,9 @@ type Engine struct {
 	flowStore capability.FlowLabelStore
 
 	// skipAntecedentRecording is set when the policy provably contains no
-	// sequenceBlock condition, so the per-call antecedent marker recordSessionCall
+	// sequenceBlock condition, so the per-call antecedent marker RecordSessionCall
 	// writes is never read. Skipping the write avoids a needless counter round-trip
-	// and, more importantly, removes the recordSessionCall fail-closed deny path —
+	// and, more importantly, removes the RecordSessionCall fail-closed deny path —
 	// which, on a counter-write fault, would otherwise deny a call whose maxCalls
 	// slot runConditions already committed, burning quota for a marker nothing reads.
 	skipAntecedentRecording bool
@@ -245,7 +245,7 @@ func WithFlowLabelStore(store capability.FlowLabelStore) Option {
 // WithoutAntecedentRecording tells the engine the policy contains no sequenceBlock
 // condition, so it skips writing the per-call sequenceBlock-history marker. The
 // marker exists only to be read by a later sequenceBlock; with none in the policy
-// the write is pure overhead, and skipping it also removes the recordSessionCall
+// the write is pure overhead, and skipping it also removes the RecordSessionCall
 // fail-closed deny path that could burn a just-committed maxCalls slot on a
 // counter-write fault. Only set this when the policy is known to use no
 // sequenceBlock (see config.LocalManifest.HasSequenceBlock); leaving it unset
@@ -357,7 +357,7 @@ type ctxSkipQuotaKey struct{}
 
 // WithSkipQuota returns a context that signals the engine to skip ONLY the
 // quota-consuming MaxCalls side effect, leaving every other condition — notably
-// sequenceBlock — fully evaluated and recordSessionCall recording as normal.
+// sequenceBlock — fully evaluated and RecordSessionCall recording as normal.
 //
 // This is the proxy's --audit (observe) mode flag: it forwards every request and
 // logs the would-be decision, so it must not consume MaxCalls quota, but it must
@@ -367,12 +367,6 @@ type ctxSkipQuotaKey struct{}
 // consume the quota it is meant to leave untouched.
 func WithSkipQuota(ctx context.Context) context.Context {
 	return context.WithValue(ctx, ctxSkipQuotaKey{}, true)
-}
-
-// skipQuota reports whether ctx was decorated with WithSkipQuota.
-func skipQuota(ctx context.Context) bool {
-	v, _ := ctx.Value(ctxSkipQuotaKey{}).(bool)
-	return v
 }
 
 // SkipQuota reports whether ctx carries the proxy's --audit (observe) posture set by
@@ -386,7 +380,8 @@ func skipQuota(ctx context.Context) bool {
 // enforcement:audit is already covered by Constraint.IsAuditOnly(); this adds the
 // whole-route --audit case, which never reaches the constraint flag.
 func SkipQuota(ctx context.Context) bool {
-	return skipQuota(ctx)
+	v, _ := ctx.Value(ctxSkipQuotaKey{}).(bool)
+	return v
 }
 
 // systemClock is the default Clock backed by the real system time.
@@ -411,7 +406,7 @@ func New(opts ...Option) *Engine {
 	return e
 }
 
-// recordSessionCall notes that an allowed call to req.ToolName occurred in this
+// RecordSessionCall notes that an allowed call to req.ToolName occurred in this
 // session, so a later sequenceBlock condition on a different tool can detect it.
 //
 // It returns a non-nil error only when the counter write itself fails, and
@@ -436,7 +431,12 @@ func New(opts ...Option) *Engine {
 // guards below are legitimate "nothing to record" states: no sequenceBlock in the
 // policy, no session ID (history would merge across anonymous callers), no counter,
 // and no derivable tool name.
-func (e *Engine) recordSessionCall(ctx context.Context, req *capability.EnforceRequest) error {
+//
+// Exported for callers that must record an antecedent on a path EvaluateConditions
+// does not reach: in audit (observe) mode a constraint with a failing condition
+// returns a deny without recording, yet the transport still forwards the request and
+// the tool runs, so a later sequenceBlock would fail OPEN.
+func (e *Engine) RecordSessionCall(ctx context.Context, req *capability.EnforceRequest) error {
 	if e.skipAntecedentRecording || e.counter == nil || req.SessionID == "" {
 		return nil
 	}
@@ -463,7 +463,7 @@ func (e *Engine) recordSessionCall(ctx context.Context, req *capability.EnforceR
 	//
 	// The secondary (bare-spelling) marker is written BEFORE the primary verbatim
 	// marker. On the Redis backend the two writes are separate round-trips that can fail
-	// independently; if the first succeeds and the second faults, recordSessionCall
+	// independently; if the first succeeds and the second faults, RecordSessionCall
 	// returns the error and the call is denied fail-closed — but whichever marker already
 	// committed survives. Writing the alias first means a partial write leaves at most the
 	// bare-spelling alias key, never the primary verbatim key (the canonical key the
@@ -515,7 +515,7 @@ func (e *Engine) recordSessionCall(ctx context.Context, req *capability.EnforceR
 // ValidateAction callers that leave req.Target nil, fall back to the
 // prefix-stripped req.ToolName.
 //
-// recordSessionCall additionally writes a secondary sequenceBlock-history marker
+// RecordSessionCall additionally writes a secondary sequenceBlock-history marker
 // keyed the way the lookup parses the bare/natural spelling (split on the leading
 // recognized token), so both the explicit "tool:system:foo" and the bare
 // "system:foo" afterTools spellings resolve. That secondary marker is confined to
@@ -527,14 +527,14 @@ func sessionTargetName(req *capability.EnforceRequest) string {
 			return n
 		}
 	}
-	return strings.TrimSpace(stripEnginePrefix(req.ToolName))
+	return strings.TrimSpace(StripEnginePrefix(req.ToolName))
 }
 
 // sessionTargetKey derives the (targetType, name) pair that identifies a target in
 // both the sequenceBlock-history and maxCalls counter buckets. The type prefers the
 // explicit req.Target.Type, falling back to the req.ToolName prefix (bare defaults to
 // "tool"); the name comes from sessionTargetName (Target.Name verbatim, else the
-// prefix-stripped ToolName). recordSessionCall and maxCallsBucket both key their
+// prefix-stripped ToolName). RecordSessionCall and maxCallsBucket both key their
 // buckets through it so a direct ValidateAction caller that leaves req.Target nil and
 // the antecedent record land on the SAME bucket under the SAME derivation.
 // handleSequenceBlock deliberately does NOT use this: it keeps a display-name fallback
@@ -547,18 +547,8 @@ func sessionTargetKey(req *capability.EnforceRequest) (targetType, name string) 
 	return targetType, sessionTargetName(req)
 }
 
-// RecordSessionCall is the exported form of recordSessionCall, for callers that
-// must record an antecedent on a path EvaluateConditions does not reach: in audit
-// (observe) mode a constraint with a failing condition returns a deny without
-// recording, yet the transport still forwards the request and the tool runs, so a
-// later sequenceBlock would fail OPEN. The audit-mode PDP calls this after such a
-// deny. It honors the same guards as recordSessionCall.
-func (e *Engine) RecordSessionCall(ctx context.Context, req *capability.EnforceRequest) error {
-	return e.recordSessionCall(ctx, req)
-}
-
 // recordFailureDenial builds the fail-closed response returned when
-// recordSessionCall cannot persist a marker; ValidateAction and
+// RecordSessionCall cannot persist a marker; ValidateAction and
 // EvaluateConditions both return it verbatim.
 //
 // The denial is attributed to sequenceBlock (the only feature the marker backs)
@@ -567,7 +557,7 @@ func (e *Engine) RecordSessionCall(ctx context.Context, req *capability.EnforceR
 // (which populates afterTool/blockedTool). auditOnly carries the constraint's
 // mode so a transient recording failure under an audit-mode constraint is
 // logged-and-forwarded rather than hard-blocked — a backend hiccup is an
-// infrastructure fault, not a policy verdict. (collectObligations deliberately
+// infrastructure fault, not a policy verdict. (CollectObligations deliberately
 // ignores AuditOnly, since an unwired directive is an engine bug, not a fault.)
 //
 // obligations (e.g. redactFields) MUST be preserved: under an audit-mode
@@ -642,12 +632,12 @@ func (e *Engine) runConditions(ctx context.Context, req *capability.EnforceReque
 	// commit is not rolled back on a later failure, so keeping commit in the second
 	// pass means a pure predicate that denies is always checked first.
 	//
-	// One residual case escapes this guarantee: recordSessionCall runs AFTER
+	// One residual case escapes this guarantee: RecordSessionCall runs AFTER
 	// runConditions (it must, so a sequenceBlock antecedent marker is not written for
-	// a call collectObligations may still hard-deny), and on a counter-write fault it
+	// a call CollectObligations may still hard-deny), and on a counter-write fault it
 	// denies a call whose maxCalls slot was already committed here. It is not rolled
 	// back, so that denied call has spent a slot. This is bounded to policies that
-	// actually use sequenceBlock: with none, recordSessionCall is skipped entirely
+	// actually use sequenceBlock: with none, RecordSessionCall is skipped entirely
 	// (WithoutAntecedentRecording), so a maxCalls-only policy never burns a slot on a
 	// record-fault deny.
 	var deferred []capability.Condition
@@ -661,7 +651,7 @@ func (e *Engine) runConditions(ctx context.Context, req *capability.EnforceReque
 		// programmatically built Constraint — is a non-nil interface, so it survives
 		// `cond == nil` above, but ConditionType() has a value/pointer receiver that
 		// would dereference the nil pointer and panic. Catch it the same way
-		// collectObligations' identical typed-nil guard does.
+		// CollectObligations' identical typed-nil guard does.
 		if cond == nil || isTypedNil(cond) {
 			resp := denyResponse(requestID, now, matched.IsAuditOnly(), nil, capability.DenialInfo{
 				Code:    capability.ErrCodeConditionFailed,
@@ -702,7 +692,7 @@ func (e *Engine) runConditions(ctx context.Context, req *capability.EnforceReque
 // would panic a value/pointer-receiver method that dereferences it (e.g.
 // ConditionType(), ToObligation()). Delegates to capability.IsTypedNil, the single
 // source of truth for this guard, shared by runConditions' condition check,
-// collectObligations' directive check, and the config-loader validation guards, so
+// CollectObligations' directive check, and the config-loader validation guards, so
 // the copies cannot drift.
 func isTypedNil(v interface{}) bool {
 	return capability.IsTypedNil(v)
@@ -721,7 +711,7 @@ func (e *Engine) commitDeferredAtomic(ctx context.Context, req *capability.Enfor
 	windowSecs := make([]int, len(deferred))
 	limits := make([]int64, len(deferred))
 	denies := make([]func(count int64, retryAfter time.Duration) *ConditionError, len(deferred))
-	// Track buckets skipped under skipQuota so a PARTIAL skip (some buckets skipped, some
+	// Track buckets skipped under SkipQuota so a PARTIAL skip (some buckets skipped, some
 	// committing) can be caught after the loop. The loop evaluates EVERY bucket so a later
 	// bucket's validation condErr surfaces even when an earlier bucket skipped — returning
 	// on the first skip (the prior behavior) let an observe-mode call mask a later
@@ -745,7 +735,7 @@ func (e *Engine) commitDeferredAtomic(ctx context.Context, req *capability.Enfor
 		// A condErr is checked BEFORE skip is honored. PrepareCommit's contract puts no
 		// exclusion between the two, so a handler may legitimately report both — e.g. a
 		// malformed-condition validation error discovered on a bucket that also skips under
-		// skipQuota. Honoring skip first would discard that error, and if every bucket
+		// SkipQuota. Honoring skip first would discard that error, and if every bucket
 		// skipped the call would then be ALLOWED under observe while enforce denies it:
 		// precisely the observe/enforce divergence this function exists to prevent.
 		if condErr != nil {
@@ -753,12 +743,12 @@ func (e *Engine) commitDeferredAtomic(ctx context.Context, req *capability.Enfor
 		}
 		if skip {
 			// skip must be uniform across the constraint — the contract requires it to be
-			// derived solely from ctx (skipQuota). A handler that reports skip for some
+			// derived solely from ctx (SkipQuota). A handler that reports skip for some
 			// other reason (its own config/arguments) would leave the remaining committing
 			// conditions unchecked: a fail-open. Assert the contract and fail closed on a
 			// per-bucket violation. The built-in maxCalls always derives skip from
-			// skipQuota(ctx), so this never trips for it.
-			if !skipQuota(ctx) {
+			// SkipQuota(ctx), so this never trips for it.
+			if !SkipQuota(ctx) {
 				resp := denyResponse(requestID, now, matched.IsAuditOnly(), nil, capability.DenialInfo{
 					Code:          capability.ErrCodeConditionFailed,
 					ConditionType: condType,
@@ -785,20 +775,20 @@ func (e *Engine) commitDeferredAtomic(ctx context.Context, req *capability.Enfor
 		keys[i], windowSecs[i], limits[i], denies[i] = commit.Key, commit.WindowSecs, commit.Limit, commit.Deny
 	}
 
-	// Every bucket skipped under skipQuota (audit/observe): quota must not be consumed,
+	// Every bucket skipped under SkipQuota (audit/observe): quota must not be consumed,
 	// so record nothing and allow — the ctx-driven skip held for all of them.
 	if skipped == len(deferred) {
 		return nil
 	}
 	// A PARTIAL skip — some buckets skipped, others produced a commit — is a non-uniform
 	// skip the per-bucket assertion above cannot catch (each skipping bucket individually
-	// satisfied skipQuota). Admitting the committing buckets while silently dropping the
+	// satisfied SkipQuota). Admitting the committing buckets while silently dropping the
 	// skipped ones is a fail-open, so fail closed.
 	if skipped > 0 {
 		resp := denyResponse(requestID, now, matched.IsAuditOnly(), nil, capability.DenialInfo{
 			Code: capability.ErrCodeConditionFailed,
 			// HardDeny, or this guard can never actually block: a partial skip is reachable
-			// only when skipQuota(ctx) is set, which the binary sets only on a route running
+			// only when SkipQuota(ctx) is set, which the binary sets only on a route running
 			// --audit — and on that route the transport downgrades and FORWARDS any
 			// non-HardDeny verdict. Without this the call proceeds with zero quota consumed
 			// on any bucket, which is the fail-open the guard was written to prevent.
@@ -930,7 +920,7 @@ func (e *Engine) evalCondition(ctx context.Context, cond capability.Condition, r
 // evaluates every condition and — on allow — collects obligations BEFORE recording the
 // call in session history. That ordering is load-bearing: recording first would let a
 // later sequenceBlock Peek treat a hard-denied (never-forwarded) call as "run".
-// runConditions, collectObligations, and recordSessionCall each short-circuit to their
+// runConditions, CollectObligations, and RecordSessionCall each short-circuit to their
 // own deny (a failing condition, an unhandled directive, or a history-write fault).
 // Shared by ValidateAction and EvaluateConditions so the two cannot diverge on this
 // security-critical ordering.
@@ -974,9 +964,9 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 
 	// Collect obligations BEFORE recording in session history. Recording first would
 	// poison history: a later sequenceBlock Peek would see this tool as "run" even
-	// though collectObligations' hard deny means it was never forwarded.
-	// collectObligations is a pure translation, so reordering it is safe.
-	obligations, denyResp := e.collectObligations(matched, requestID, now)
+	// though CollectObligations' hard deny means it was never forwarded.
+	// CollectObligations is a pure translation, so reordering it is safe.
+	obligations, denyResp := e.CollectObligations(matched, requestID, now)
 	if denyResp != nil {
 		return *denyResp
 	}
@@ -1026,7 +1016,7 @@ func (e *Engine) ValidateAction(ctx context.Context, req *capability.EnforceRequ
 	ctx = context.WithValue(ctx, ctxRequestIDKey{}, requestID)
 	ctx = context.WithValue(ctx, ctxTimestampKey{}, now)
 
-	matched := e.findMatchingCapability(req, capabilities)
+	matched := e.FindMatchingCapability(req, capabilities)
 	if matched == nil {
 		// No matched constraint, so no audit-mode posture to inherit: a plain block.
 		return denyResponse(requestID, now, false, nil, capability.DenialInfo{
@@ -1147,7 +1137,7 @@ func (e *Engine) findMatchingCapability(req *capability.EnforceRequest, capabili
 		if constraintType != reqType {
 			continue
 		}
-		if !matchesResource(bare, bareToolName) {
+		if !MatchesResource(bare, bareToolName) {
 			continue
 		}
 		if !actionPermitted(constraint.Actions, capability.TargetType(reqType)) {
@@ -1160,7 +1150,7 @@ func (e *Engine) findMatchingCapability(req *capability.EnforceRequest, capabili
 		}
 		// The selection tiebreak lives in ConstraintScorer, shared with the proxy's
 		// internal/pdp.findConstraint so the two cannot disagree on precedence.
-		scorer.Offer(i, resourceSpecificity(bare, bareToolName)*resourceScoreWeight, constraint.HasPrincipal())
+		scorer.Offer(i, ResourceSpecificity(bare, bareToolName)*resourceScoreWeight, constraint.HasPrincipal())
 	}
 	if scorer.Best() < 0 {
 		return nil
@@ -1184,33 +1174,16 @@ func splitEnginePrefix(s string) (targetType, bare string) {
 	return "tool", s
 }
 
-// stripEnginePrefix removes the leading "type:" prefix from a constraint
+// StripEnginePrefix removes the leading "type:" prefix from a constraint
 // Target field, returning the bare name/pattern. Recognized prefixes are
 // "tool", "resource", "prompt", "system". Bare patterns (no prefix) are
-// returned unchanged.
-func stripEnginePrefix(s string) string {
+// returned unchanged. Exported so manifest validation recognizes the same prefixes
+// the engine applies at runtime: an entry whose prefix is not a recognized namespace
+// is returned unchanged — the signal load-time validation uses to reject an afterTools
+// entry that would otherwise fail open at lookup.
+func StripEnginePrefix(s string) string {
 	_, bare := splitEnginePrefix(s)
 	return bare
-}
-
-// MatchesResource is the exported form of matchesResource, for packages needing
-// the engine's glob-matching semantics.
-func MatchesResource(resource, toolName string) bool {
-	return matchesResource(resource, toolName)
-}
-
-// ResourceSpecificity is the exported form of resourceSpecificity.
-func ResourceSpecificity(resource, toolName string) int {
-	return resourceSpecificity(resource, toolName)
-}
-
-// StripEnginePrefix is the exported form of stripEnginePrefix, so manifest
-// validation recognizes the same prefixes (tool:, resource:, prompt:, system:)
-// the engine applies at runtime. An entry whose prefix is not a recognized
-// namespace is returned unchanged — the signal load-time validation uses to
-// reject an afterTools entry that would otherwise fail open at lookup.
-func StripEnginePrefix(s string) string {
-	return stripEnginePrefix(s)
 }
 
 // EvaluateConditions evaluates the conditions on a pre-matched constraint without
@@ -1228,7 +1201,7 @@ func (e *Engine) EvaluateConditions(ctx context.Context, req *capability.Enforce
 	return e.evaluateMatched(ctx, req, matched, requestID, now)
 }
 
-// collectObligations turns the matched constraint's directives into the
+// CollectObligations turns the matched constraint's directives into the
 // post-allow obligations the transport applies to the upstream response. It runs
 // only on the allow path; a directive MUST NOT change the allow/deny decision.
 //
@@ -1242,7 +1215,7 @@ func (e *Engine) EvaluateConditions(ctx context.Context, req *capability.Enforce
 // an audit-mode constraint: an unwired directive is an engine bug, not a policy
 // verdict, so "fail closed on ambiguity" wins over "audit never blocks".
 // knownObligationTypes is the set of obligation types the forward core handles.
-// collectObligations fails closed (ENFORCEMENT_ERROR) for any obligation type
+// CollectObligations fails closed (ENFORCEMENT_ERROR) for any obligation type
 // not listed here, so a new directive whose ToObligation returns an unrecognized
 // type is caught at policy-evaluation time rather than silently passing through
 // to an unhandled path. Register both the obligation type AND its handler in
@@ -1251,7 +1224,22 @@ var knownObligationTypes = map[string]bool{
 	capability.DirectiveTypeRedactFields: true,
 }
 
-func (e *Engine) collectObligations(matched *capability.Constraint, requestID, now string) ([]capability.Obligation, *capability.EnforceResponse) {
+// CollectObligations turns the matched constraint's directives into the post-allow
+// obligations the transport applies to the upstream response. It runs only on the
+// allow path; a directive MUST NOT change the allow/deny decision.
+//
+// It is exported for the external decision layer (the PDP), which stamps these onto an
+// audit-mode deny it downgrades to a forwarded call. A downgraded (observe-mode) deny
+// is still forwarded to the host, so it must carry the same redactFields obligations a
+// genuine allow of this constraint would — otherwise the transport forwards the
+// upstream response unredacted (redaction runs only when resp.Obligations is non-empty),
+// silently dropping the manifest's declared redaction on the deny-then-observe path.
+// The allow path and the downgrade path therefore call the SAME function — the
+// labelOutput skip, the typed-nil-directive skip, and the fail-closed HardDeny for an
+// unwired directive type — so they cannot drift on which directives translate to which
+// obligations. requestID and now stamp the fail-closed response the unwired-directive
+// guard returns, so it matches the surrounding decision.
+func (e *Engine) CollectObligations(matched *capability.Constraint, requestID, now string) ([]capability.Obligation, *capability.EnforceResponse) {
 	var obligations []capability.Obligation
 	for _, dir := range matched.Directives {
 		if dir == nil {
@@ -1292,23 +1280,7 @@ func (e *Engine) collectObligations(matched *capability.Constraint, requestID, n
 	return obligations, nil
 }
 
-// CollectObligations exposes the matched constraint's post-allow obligations to an
-// external decision layer (the PDP) so it can stamp them onto an audit-mode deny it
-// downgrades to a forwarded call. A downgraded (observe-mode) deny is still forwarded
-// to the host, so it must carry the same redactFields obligations a genuine allow of
-// this constraint would — otherwise the transport forwards the upstream response
-// unredacted (redaction runs only when resp.Obligations is non-empty), silently
-// dropping the manifest's declared redaction on the deny-then-observe path. It reuses
-// collectObligations verbatim — the labelOutput skip, the typed-nil-directive skip,
-// and the fail-closed HardDeny for an unwired directive type — so the downgrade path
-// cannot drift from the allow path on which directives translate to which obligations.
-// requestID and now stamp the fail-closed response the unwired-directive guard returns,
-// so it matches the surrounding decision.
-func (e *Engine) CollectObligations(matched *capability.Constraint, requestID, now string) ([]capability.Obligation, *capability.EnforceResponse) {
-	return e.collectObligations(matched, requestID, now)
-}
-
-// matchesResource reports whether a capability resource pattern matches the tool
+// MatchesResource reports whether a capability resource pattern matches the tool
 // name, using [path.Match] glob semantics (*, ?, [abc]); "*" matches any name.
 // Resources use ':' as a namespace separator (not '/'), so '*' matches across
 // colons (e.g. "file:*.csv" matches "file:data.csv").
@@ -1321,7 +1293,7 @@ func (e *Engine) CollectObligations(matched *capability.Constraint, requestID, n
 // shape: cover deeper levels with an explicit per-level entry
 // ("file:///data/*/*"). Documented for operators in
 // docs/capability-manifest-guide.md.
-func matchesResource(resource, toolName string) bool {
+func MatchesResource(resource, toolName string) bool {
 	if resource == "*" || resource == toolName {
 		return true
 	}
@@ -1376,17 +1348,23 @@ const maxWildcardTiebreak = resourceSpecificityLiteralWeight - 1
 // literal-rune count, so a smaller sentinel would be beaten by a long-literal
 // glob. 1<<27 is far above any realistic literalCount*10 (a glob would need ~13M
 // literal runes to reach it) yet small enough that exactMatchSpecificity *
-// resourceScoreWeight (10) stays well within a 32-bit int — resourceSpecificity
-// returns int, so the sentinel and the findMatchingCapability multiply must both
+// resourceScoreWeight (10) stays well within a 32-bit int — ResourceSpecificity
+// returns int, so the sentinel and the FindMatchingCapability multiply must both
 // be representable on 32-bit targets (GOARCH=386, arm, mips), matching the 32-bit
 // safety pkg/callcounter already engineers for.
 const exactMatchSpecificity = 1 << 27
 
-func resourceSpecificity(resource, toolName string) int {
+// ResourceSpecificity scores how specifically a capability's resource pattern matches
+// toolName, so FindMatchingCapability can select the most specific of several matching
+// capabilities. An exact literal match scores exactMatchSpecificity; glob patterns rank
+// below it by how much of the name they pin. Exported alongside MatchesResource for
+// packages that need the engine's own selection ordering rather than a reimplementation
+// of it. Callers must have established a match first (see MatchesResource).
+func ResourceSpecificity(resource, toolName string) int {
 	if resource == toolName {
 		return exactMatchSpecificity
 	}
-	// Scoring is always guarded by a prior matchesResource check, so the formula
+	// Scoring is always guarded by a prior MatchesResource check, so the formula
 	// below effectively ranks glob patterns (an exact literal hits the case above).
 	//
 	// literalCount counts EVERY non-wildcard rune, not just the leading run: counting

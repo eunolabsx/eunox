@@ -217,7 +217,7 @@ func (e *Engine) PeekSessionLabels(ctx context.Context, req *capability.EnforceR
 // (canonical vocabulary order) for the audit record's labels_out field.
 //
 // It runs regardless of audit/observe mode: like sequenceBlock's antecedent recording
-// (recordSessionCall / recordAuditModeAntecedent), flow provenance is history that must
+// (RecordSessionCall / recordAuditModeAntecedent), flow provenance is history that must
 // stay accurate for a later ENFORCED sink, so an observed source still records its
 // labels. This differs from maxCalls, which skips its commit under --audit only because
 // observing a quota would consume it; recording provenance consumes nothing.
@@ -230,7 +230,7 @@ func (e *Engine) PeekSessionLabels(ctx context.Context, req *capability.EnforceR
 //
 // The write is a single Add of the whole label set, so — unlike the old per-label
 // counter loop — there is no mid-write partial-commit to order defensively; the store
-// commits the set atomically. The ordering of this write relative to recordSessionCall
+// commits the set atomically. The ordering of this write relative to RecordSessionCall
 // (and the atomic-commit rollback across the two namespaces) lives in recordSourceCall.
 func (e *Engine) recordLabels(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint) ([]string, error) {
 	// skipFlow short-circuits recording too, mirroring peekSessionLabels, so a skipFlow
@@ -320,7 +320,7 @@ func (e *SourceCommitError) Error() string { return e.Err.Error() }
 //
 // Both writes still fail closed on their own fault (returned as a SourceCommitError the
 // caller maps to the right deny). recordLabels is skipped when the constraint is not
-// flow-relevant; recordSessionCall self-guards when the policy has no sequenceBlock
+// flow-relevant; RecordSessionCall self-guards when the policy has no sequenceBlock
 // (skipAntecedentRecording) — so a flow-only or seq-only policy does exactly one write
 // and needs no rollback. carriedLabels is the pre-call accumulated set (peeked by the
 // caller before this commit), used to compute the rollback delta.
@@ -334,7 +334,7 @@ func (e *Engine) recordSourceCall(ctx context.Context, req *capability.EnforceRe
 		}
 		added = labelsAdded(labelsOut, carriedLabels)
 	}
-	if err := e.recordSessionCall(ctx, req); err != nil {
+	if err := e.RecordSessionCall(ctx, req); err != nil {
 		// The seq write faulted after the flow write committed: roll the flow labels this
 		// call added back out so the hard-denied call taints nothing. Best-effort — a
 		// rollback fault leaves a stranded label (fail-closed: over-blocks a later sink,

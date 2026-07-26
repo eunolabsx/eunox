@@ -5,7 +5,7 @@
 // and docs/architecture-review-2026-06.md.
 //
 //   - duplicate matching logic between pdp.go and engine.go:
-//     matchesResource and resourceSpecificity are now exported so callers share
+//     MatchesResource and ResourceSpecificity are now exported so callers share
 //     the same implementation rather than maintaining parallel copies.
 //
 //   - AllowedOperationsCondition now requires an explicit argument field;
@@ -510,7 +510,7 @@ func TestEngine_MaxCalls_EmptyToolNameDenies(t *testing.T) {
 	// call into one shared per-session bucket with an empty name component. The
 	// engine must deny with
 	// ErrCodeMissingContext rather than quota-account an unidentifiable tool,
-	// matching the empty-result guards in recordSessionCall and handleSequenceBlock
+	// matching the empty-result guards in RecordSessionCall and handleSequenceBlock
 	// and the fail-closed posture of the empty-sessionID guard.
 	counter := callcounter.NewInMemory()
 	engine := enforcement.New(enforcement.WithCallCounter(counter))
@@ -538,7 +538,7 @@ func TestEngine_MaxCalls_EmptyToolNameDenies(t *testing.T) {
 
 // TestEngine_MaxCalls_PrefixNormalizedKey is the regression test:
 // the maxCalls quota bucket must key on the prefix-stripped tool name, matching
-// recordSessionCall's sequenceBlock history. The constraint matcher strips the
+// RecordSessionCall's sequenceBlock history. The constraint matcher strips the
 // "tool:" prefix from both sides, so the same constraint matches whether the
 // request arrives as "tool:read_file" or "read_file"; both forms must consume the
 // same quota bucket. Otherwise a caller could reset its own quota by toggling the
@@ -646,7 +646,7 @@ func TestEngine_MaxCalls_TargetTypeNamespacesQuota(t *testing.T) {
 func TestEngine_MaxCalls_NilTargetResolvesToToolType(t *testing.T) {
 	// A direct ValidateAction caller that leaves req.Target nil has its maxCalls
 	// bucket type derived from the ToolName prefix (splitEnginePrefix), exactly as
-	// recordSessionCall does — an unprefixed name resolves to "tool". So a nil-Target
+	// RecordSessionCall does — an unprefixed name resolves to "tool". So a nil-Target
 	// ToolName "export" and an explicit tool:export request share ONE quota bucket,
 	// closing the keying divergence that previously put the nil-Target call in a
 	// distinct empty-type bucket.
@@ -3674,7 +3674,7 @@ func TestHandleAllowedOperations_ExplicitArg_CaseInsensitive(t *testing.T) {
 
 // TestValidateAction_PrefixedTarget_MatchesBareToolName verifies that
 // a v0.2 manifest constraint "tool:read_file" must match bare req.ToolName
-// "read_file". Before the fix, findMatchingCapability returned nil for every
+// "read_file". Before the fix, FindMatchingCapability returned nil for every
 // prefixed constraint, making ValidateAction and FindMatchingCapability dead.
 func TestValidateAction_PrefixedTarget_MatchesBareToolName(t *testing.T) {
 	t.Parallel()
@@ -4799,7 +4799,7 @@ func TestSchemaValidate_DirectBranches(t *testing.T) {
 }
 
 // TestEngine_MatchingEdgeCases covers actionPermitted (empty + unrecognized)
-// and resourceSpecificity / findMatchingCapability tie-breaking.
+// and ResourceSpecificity / FindMatchingCapability tie-breaking.
 func TestEngine_MatchingEdgeCases(t *testing.T) {
 	t.Parallel()
 	e := enforcement.New()
@@ -4886,8 +4886,8 @@ func TestEngine_MatchingEdgeCases(t *testing.T) {
 		// Exact == toolName => the dominating exact-match sentinel.
 		assert.Equal(t, 1<<27, enforcement.ResourceSpecificity("tool", "tool"))
 		// No wildcard, not equal: the general formula applies (prefixLen*10 -
-		// wildcardCount = 5*10 - 0). matchesResource filters non-matching
-		// literals before findMatchingCapability ever scores them, so this value
+		// wildcardCount = 5*10 - 0). MatchesResource filters non-matching
+		// literals before FindMatchingCapability ever scores them, so this value
 		// is unreachable in ranking; the assertion just pins the formula.
 		assert.Equal(t, 5*10, enforcement.ResourceSpecificity("other", "tool"))
 		// Has wildcard => prefixLen*10 - wildcardCount.
@@ -4896,11 +4896,11 @@ func TestEngine_MatchingEdgeCases(t *testing.T) {
 }
 
 // TestFindMatchingCapability_NonWildcardLiteralFilteredBeforeScoring guards the
-// invariant: resourceSpecificity no longer has a "literal but
+// invariant: ResourceSpecificity no longer has a "literal but
 // not equal to the tool name" branch, because such a target can never reach
-// scoring. matchesResource only admits an exact match or a glob, so a
+// scoring. MatchesResource only admits an exact match or a glob, so a
 // non-wildcard target that differs from the tool name is dropped by
-// findMatchingCapability before resourceSpecificity is called. If a future
+// FindMatchingCapability before ResourceSpecificity is called. If a future
 // change let such a literal through, this constraint would be selected and the
 // assertion below would fail.
 func TestFindMatchingCapability_NonWildcardLiteralFilteredBeforeScoring(t *testing.T) {
@@ -4912,12 +4912,12 @@ func TestFindMatchingCapability_NonWildcardLiteralFilteredBeforeScoring(t *testi
 	req := &capability.EnforceRequest{ToolName: "write_file"}
 	assert.Nil(t, e.FindMatchingCapability(req, constraints),
 		"a non-wildcard target that differs from the tool name must not match, "+
-			"so resourceSpecificity is never reached for it")
+			"so ResourceSpecificity is never reached for it")
 }
 
 // TestResourceSpecificity_BackslashEscapedLiteralReachesScoring documents the
 // one way a non-wildcard resource that differs from the tool name still reaches
-// resourceSpecificity: path.Match honors backslash escapes, so a target like
+// ResourceSpecificity: path.Match honors backslash escapes, so a target like
 // `a\b` matches tool name "ab" yet is not string-equal to it. The removed
 // score-900 branch was reachable only for this degenerate input (no manifest
 // writes it). It now scores by the general prefixLen*10 formula and still
@@ -4946,7 +4946,7 @@ func TestResourceSpecificity_BackslashEscapedLiteralReachesScoring(t *testing.T)
 
 // TestResourceSpecificity_BackslashEscapedBracket pins the fix:
 // a backslash-escaped '[' is a literal, not the opening of a character class.
-// Before the fix, resourceSpecificity fell into the '[' arm for the escaped
+// Before the fix, ResourceSpecificity fell into the '[' arm for the escaped
 // bracket, inflating wildcardCount and consuming following runes as class
 // internals, which let a broad "file*" glob tie (or beat) an exact escaped match.
 func TestResourceSpecificity_BackslashEscapedBracket(t *testing.T) {
@@ -5232,7 +5232,7 @@ func TestConditions_WrongTypeArgument_ConditionFailed(t *testing.T) {
 	}
 }
 
-// ── single-pass resourceSpecificity scoring formula ─────────────────────────────
+// ── single-pass ResourceSpecificity scoring formula ─────────────────────────────
 
 // TestResourceSpecificity_SinglePassFormula pins the specificity formula after
 // the single-pass rewrite and the post-wildcard literal fix: EVERY non-wildcard
@@ -5523,7 +5523,7 @@ func TestObligationLoop_TypedNilDirectiveSkipped(t *testing.T) {
 	})
 }
 
-// TestObligationDeny_DoesNotPoisonSessionHistory pins: when collectObligations
+// TestObligationDeny_DoesNotPoisonSessionHistory pins: when CollectObligations
 // fails closed (an unhandled directive type), the call must NOT have been recorded
 // in session history. Recording it first would let a later sequenceBlock condition
 // on a different tool see the denied tool as "run" and fire when it should not —
@@ -5570,7 +5570,7 @@ func TestObligationDeny_DoesNotPoisonSessionHistory(t *testing.T) {
 		}
 		respB := e.EvaluateConditions(ctx, reqB, matchedB)
 		assert.Equal(t, capability.DecisionAllow, respB.Decision,
-			"session history must not record a call denied by collectObligations")
+			"session history must not record a call denied by CollectObligations")
 	}
 
 	t.Run("ValidateAction", func(t *testing.T) {
@@ -7183,7 +7183,7 @@ func TestSequenceBlock_BlocksWriteAfterRead(t *testing.T) {
 }
 
 // TestSequenceBlock_BlocksAfterManyAntecedentCalls guards the cap at
-// the engine level. recordSessionCall now retains only the most-recent history
+// the engine level. RecordSessionCall now retains only the most-recent history
 // marker (maxEntries=1) instead of one per call, so a high-rate antecedent no
 // longer grows the session-history slice without bound. Presence (Peek > 0) must
 // still be preserved, so write_external is denied however many times
@@ -7206,7 +7206,7 @@ func TestSequenceBlock_BlocksAfterManyAntecedentCalls(t *testing.T) {
 
 // TestSequenceBlock_AntecedentWithTrailingWhitespaceStillBlocks is the
 // regression: when the antecedent is called with a tool name carrying trailing
-// whitespace ("read_credentials "), recordSessionCall must canonicalize the name
+// whitespace ("read_credentials "), RecordSessionCall must canonicalize the name
 // (TrimSpace) before keying session history, so the later sequenceBlock lookup —
 // which trims its afterTools entries — finds the antecedent and still DENIES the
 // gated tool. Before the fix the recording key kept the space, the lookup key did
@@ -7481,7 +7481,7 @@ func callTyped(t *testing.T, engine *enforcement.Engine, sessionID, targetType, 
 }
 
 func TestSequenceBlock_NamespacedByTargetType(t *testing.T) {
-	// Regression: recordSessionCall keys session history by target type,
+	// Regression: RecordSessionCall keys session history by target type,
 	// so a tool named "export" and a prompt named "export" record into separate
 	// seq: buckets instead of colliding on one. A sequenceBlock resolves each
 	// afterTools entry's namespace from its prefix (a bare entry defaults to the
@@ -7568,7 +7568,7 @@ func TestSequenceBlock_NamespacedByTargetType(t *testing.T) {
 
 // TestSequenceBlock_RecordsAntecedentFromTargetName is the regression: a
 // direct caller may set req.Target (Type+Name) while leaving req.ToolName empty.
-// recordSessionCall must fall back to req.Target.Name to derive the bare tool
+// RecordSessionCall must fall back to req.Target.Name to derive the bare tool
 // name; otherwise the antecedent is never recorded and a later sequenceBlock
 // Peek finds an empty key and fails OPEN.
 func TestSequenceBlock_RecordsAntecedentFromTargetName(t *testing.T) {
@@ -7605,7 +7605,7 @@ func TestSequenceBlock_RecordsAntecedentFromTargetName(t *testing.T) {
 }
 
 // recordingErrorCounter is a capability.CallCounter whose IncrementAndGet — the
-// write recordSessionCall makes to arm a sequenceBlock — always fails, while the
+// write RecordSessionCall makes to arm a sequenceBlock — always fails, while the
 // read methods succeed. It models a transient counter-backend fault (e.g. a brief
 // Redis partition or a targeted key eviction) at the moment an allowed antecedent
 // call is recorded.
