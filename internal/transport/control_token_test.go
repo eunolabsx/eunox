@@ -287,13 +287,15 @@ func TestExpandHome_HomeUnavailableFailsClosed(t *testing.T) {
 // tightened back to 0700, not merely warned about. Nothing else writes that directory, so
 // there is no shared-use case a chmod could break.
 func TestWriteControlTokenFile_TightensEunoxOwnedDir(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("running as root bypasses file permission bits")
-	}
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	dir := filepath.Join(home, ".eunox")
-	if err := os.Mkdir(dir, 0o755); err != nil { //nolint:gosec // test fixture: deliberately loose mode
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// The upgrade shape: an older version left this directory group/world-readable.
+	// Chmod explicitly, since Mkdir's mode is umask-masked.
+	if err := os.Chmod(dir, 0o755); err != nil { //nolint:gosec // test fixture: deliberately loose mode
 		t.Fatal(err)
 	}
 
@@ -315,11 +317,13 @@ func TestWriteControlTokenFile_TightensEunoxOwnedDir(t *testing.T) {
 // not drop the emergency-stop credential into a directory any local user can rename files
 // in — they could substitute their own token and take over /control/kill. Fail closed.
 func TestWriteControlTokenFile_RefusesWorldWritableOperatorDir(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("running as root bypasses file permission bits")
-	}
 	dir := filepath.Join(t.TempDir(), "shared")
-	if err := os.Mkdir(dir, 0o777); err != nil { //nolint:gosec // test fixture: deliberately loose mode
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Chmod explicitly: Mkdir's mode is masked by the process umask, so 0777 there
+	// commonly lands as 0755 and the test would assert nothing.
+	if err := os.Chmod(dir, 0o777); err != nil { //nolint:gosec // test fixture: deliberately loose mode
 		t.Fatal(err)
 	}
 
@@ -336,14 +340,12 @@ func TestWriteControlTokenFile_RefusesWorldWritableOperatorDir(t *testing.T) {
 // exactly what stops another user renaming the token file away, so a sticky directory
 // must still be usable (warned about, not refused).
 func TestWriteControlTokenFile_AllowsStickyOperatorDir(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("running as root bypasses file permission bits")
-	}
 	dir := filepath.Join(t.TempDir(), "tmplike")
-	if err := os.Mkdir(dir, 0o777); err != nil { //nolint:gosec // test fixture: deliberately loose mode
+	if err := os.Mkdir(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(dir, 0o777|os.ModeSticky); err != nil {
+	// 1777, the /tmp shape. Set via Chmod because Mkdir's mode is umask-masked.
+	if err := os.Chmod(dir, 0o777|os.ModeSticky); err != nil { //nolint:gosec // test fixture: deliberately loose mode
 		t.Fatal(err)
 	}
 
@@ -363,11 +365,12 @@ func TestWriteControlTokenFile_AllowsStickyOperatorDir(t *testing.T) {
 // TestWriteControlTokenFile_WarnsButAllowsReadableOperatorDir: a 0755 operator-chosen
 // directory leaves the 0600 token file unreadable to others, so it stays a warning.
 func TestWriteControlTokenFile_WarnsButAllowsReadableOperatorDir(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("running as root bypasses file permission bits")
-	}
 	dir := filepath.Join(t.TempDir(), "readable")
-	if err := os.Mkdir(dir, 0o755); err != nil { //nolint:gosec // test fixture: deliberately loose mode
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Chmod explicitly: Mkdir's mode is umask-masked, so the fixture must set it.
+	if err := os.Chmod(dir, 0o755); err != nil { //nolint:gosec // test fixture: deliberately loose mode
 		t.Fatal(err)
 	}
 

@@ -166,8 +166,11 @@ func TestOpenGuardedAppend_RefusesSymlink(t *testing.T) {
 		_ = f.Close()
 		t.Fatal("openGuardedAppend must refuse a symlinked log path")
 	}
-	if !strings.Contains(err.Error(), "non-regular") {
-		t.Errorf("error = %v, want it to name the non-regular path", err)
+	// The shared guard names the symlink specifically rather than lumping it in with
+	// other non-regular files: an operator reading this needs to know a link is present,
+	// not just that the path is unusable.
+	if !strings.Contains(err.Error(), "symbolic link") {
+		t.Errorf("error = %v, want it to name the symbolic link", err)
 	}
 	// A plain regular path still opens.
 	plain := filepath.Join(dir, "plain.jsonl")

@@ -1418,3 +1418,72 @@ func writeRawManifest(t *testing.T, content string) string {
 	}
 	return p
 }
+
+// TestRefuseNonRegularPath covers the shared symlink/non-regular guard the binary's
+// output writers and internal/audit's log opens both bind to. The two used to be
+// independently written and had already drifted in message granularity; the consolidated
+// rule is pinned here once.
+func TestRefuseNonRegularPath(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	// Absent: the ordinary fresh-install case the caller's O_CREATE fills.
+	if err := RefuseNonRegularPath(filepath.Join(dir, "absent"), "output file"); err != nil {
+		t.Errorf("an absent path must be allowed, got %v", err)
+	}
+
+	// Regular file: allowed.
+	regular := filepath.Join(dir, "regular")
+	if err := os.WriteFile(regular, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := RefuseNonRegularPath(regular, "output file"); err != nil {
+		t.Errorf("a regular file must be allowed, got %v", err)
+	}
+
+	// Symlink: refused, and named as a symlink rather than lumped in with other
+	// non-regular files — an operator needs to know a link is what is in the way.
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(regular, link); err != nil {
+		t.Fatal(err)
+	}
+	err := RefuseNonRegularPath(link, "output file")
+	if err == nil {
+		t.Fatal("a symlink must be refused: following it would write through to its target")
+	}
+	if !strings.Contains(err.Error(), "symbolic link") || !strings.Contains(err.Error(), "output file") {
+		t.Errorf("error = %v, want it to name both the symbolic link and the subject", err)
+	}
+
+	// Directory: refused as non-regular.
+	sub := filepath.Join(dir, "sub")
+	if err := os.Mkdir(sub, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := RefuseNonRegularPath(sub, "audit log path"); err == nil {
+		t.Fatal("a directory must be refused")
+	} else if !strings.Contains(err.Error(), "non-regular") || !strings.Contains(err.Error(), "audit log path") {
+		t.Errorf("error = %v, want it to name the non-regular path and the subject", err)
+	}
+}
+
+// TestRefuseNonRegularPath_StatErrorFailsClosed: a stat fault must REFUSE, not be assumed
+// benign. Gating the refusal on "stat succeeded" would let an EIO/ELOOP/EACCES fault skip
+// the check entirely and follow a planted symlink — the fail-open direction the guard
+// exists to prevent. A path component that is a FILE makes Lstat return ENOTDIR, which is
+// a stat error that is not ErrNotExist.
+func TestRefuseNonRegularPath_StatErrorFailsClosed(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	notADir := filepath.Join(dir, "file")
+	if err := os.WriteFile(notADir, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := RefuseNonRegularPath(filepath.Join(notADir, "child"), "output file")
+	if err == nil {
+		t.Fatal("a stat fault must fail closed, not be treated as 'not a symlink'")
+	}
+	if !strings.Contains(err.Error(), "cannot stat it") {
+		t.Errorf("error = %v, want it to report the stat failure", err)
+	}
+}

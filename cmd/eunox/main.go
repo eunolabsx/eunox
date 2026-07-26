@@ -2062,34 +2062,11 @@ func bindExposesAllInterfaces(bindHost string) bool {
 }
 
 // refuseNonRegularOutput fails closed unless path is a regular file or genuinely absent.
-//
-// It guards every writer that truncates an operator-supplied destination. O_EXCL refuses to
-// follow a symlink for free, so a create-only write needs nothing; the moment a writer drops
-// O_EXCL for O_TRUNC (an --output overwrite, the doctor bundle) it will happily follow an
-// attacker-planted link at that path and truncate the link's TARGET — and any subsequent
-// fd Chmod re-modes that target too. A shared, world-writable directory is enough.
-//
-// Lstat does not follow the final path component, so this inspects the link itself. A
-// missing path is fine (the caller is about to create it). Any OTHER stat error is an
-// error, not an implicit "not a symlink": gating the refusal on "stat succeeded" would let
-// a stat fault skip the check, which is the fail-open direction this exists to prevent.
-// internal/audit's rotate.go applies the same rule to the audit log; this is its
-// cmd/eunox twin, kept separate because the audit one is unexported to that package.
+// It is the binding of the shared guard in internal/config for the writers that truncate
+// an operator-supplied destination (--output, the doctor bundle); see
+// config.RefuseNonRegularPath for what the guard covers.
 func refuseNonRegularOutput(path string) error {
-	fi, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("checking %q before overwrite: %w", path, err)
-	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("%q is a symbolic link; refusing to follow it and overwrite its target — remove the link or choose a different path", path)
-	}
-	if !fi.Mode().IsRegular() {
-		return fmt.Errorf("%q is not a regular file; refusing to overwrite it", path)
-	}
-	return nil
+	return config.RefuseNonRegularPath(path, "output file")
 }
 
 // writeGeneratedFile writes content to path at mode 0600, refusing to clobber a

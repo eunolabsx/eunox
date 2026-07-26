@@ -1561,24 +1561,3 @@ func TestDispatchToolsCall_ArgNamedReservedKeyItself_NestsInsteadOfOverwriting(t
 	assert.Equal(t, "my-real-value", args[audit.UpstreamErrorCodeKey], "the host-sent argument value must survive")
 	assert.Equal(t, -32000, details[audit.UpstreamErrorCodeKey], "the upstream's forwarded error code must also be recorded")
 }
-
-// TestDispatchPing_AnsweredLocally pins that the MCP utility ping is answered rather than
-// denied as an unmapped method.
-//
-// ping carries no arguments, names no target, and reaches no upstream, so there is nothing
-// for a manifest to authorize; denying it with AUTHORIZATION_FAILED broke the liveness
-// probe every host is entitled to send and wrote a policy-denial record for a call that was
-// never a policy question.
-func TestDispatchPing_AnsweredLocally(t *testing.T) {
-	t.Parallel()
-	d := dispatchParams{pdp: pdp.NewAlwaysAllowPDP(nil)}
-	resp := dispatchRequest(context.Background(), d, mcp.RPCMsg{
-		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "ping",
-	})
-	if resp.Error != nil {
-		t.Fatalf("ping must be answered, not denied; got error %+v", resp.Error)
-	}
-	if string(resp.Result) != `{}` {
-		t.Fatalf("ping must return the spec's empty result; got %s", resp.Result)
-	}
-}

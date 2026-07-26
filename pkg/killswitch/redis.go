@@ -963,14 +963,7 @@ func (r *Redis) refreshState(ctx context.Context) error {
 		r.mu.Lock()
 		if r.cacheGen == startGen {
 			// No cache mutation raced the scan: the snapshot is consistent.
-			r.globalActive = newGlobal
-			r.killedAgents = newAgents
-			r.killedSessions = newSessions
-			// The scan succeeded, so the backend was reachable: clear the health stamp.
-			// refreshMu serializes refreshes, so no concurrent refresh can have recorded
-			// a fresher error between this scan's start and this commit.
-			r.lastRefreshErr = nil
-			r.lastRefreshOK = r.clock()
+			r.commitRefreshLocked(newGlobal, newAgents, newSessions)
 			r.mu.Unlock()
 			return nil
 		}
@@ -983,25 +976,38 @@ func (r *Redis) refreshState(ctx context.Context) error {
 		// Sustained mutation across every attempt (pathological): commit the scan but
 		// UNION in the kills the cache gained concurrently so none is erased. This
 		// biases fail-closed (a revoked entry is retained, not dropped); the next
-		// reconcile reconciles any raced deletion. lastRefreshErr is cleared since the
-		// Redis read succeeded.
+		// reconcile reconciles any raced deletion.
 		for a := range r.killedAgents {
 			newAgents[a] = true
 		}
 		for s := range r.killedSessions {
 			newSessions[s] = true
 		}
-		newGlobal = newGlobal || r.globalActive
-		r.globalActive = newGlobal
-		r.killedAgents = newAgents
-		r.killedSessions = newSessions
-		// As in the clean-commit path, the Redis read succeeded, so clear the health
-		// stamp; refreshMu guarantees no fresher error raced this refresh.
-		r.lastRefreshErr = nil
-		r.lastRefreshOK = r.clock()
+		r.commitRefreshLocked(newGlobal || r.globalActive, newAgents, newSessions)
 		r.mu.Unlock()
 		return nil
 	}
+}
+
+// commitRefreshLocked installs a completed scan's snapshot and stamps the refresh as
+// healthy. Caller must hold r.mu for writing.
+//
+// The two commit sites -- the clean one and the sustained-mutation fallback, twenty lines
+// apart -- ran the identical five statements. Sharing them is not cosmetic: the health
+// stamp is the pair (lastRefreshErr cleared, lastRefreshOK set), and the staleness gate
+// denies ALL traffic in fail-closed mode when it is not maintained. A future field added
+// to that stamp on one commit path and not the other would leave the fallback path
+// committing a snapshot that reads as unconfirmed.
+//
+// Clearing lastRefreshErr is correct on both: the Redis read succeeded, and refreshMu
+// serializes refreshes, so no concurrent refresh can have recorded a fresher error
+// between this scan's start and this commit.
+func (r *Redis) commitRefreshLocked(global bool, agents, sessions map[string]bool) {
+	r.globalActive = global
+	r.killedAgents = agents
+	r.killedSessions = sessions
+	r.lastRefreshErr = nil
+	r.lastRefreshOK = r.clock()
 }
 
 // scanner is the subset of a Redis node needed to enumerate keys by prefix. Both

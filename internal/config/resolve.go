@@ -4,7 +4,9 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"math"
 	"os"
 	"path/filepath"
@@ -98,4 +100,49 @@ func ExpandHome(p string) (string, error) {
 		return "", fmt.Errorf("cannot expand %q: only %q and %q are supported (a %q form cannot be resolved portably); write the absolute path instead", p, "~", "~/...", "~user/...")
 	}
 	return p, nil
+}
+
+// RefuseNonRegularPath fails closed unless path is a regular file or genuinely absent.
+// subject names what the path is, for the error message ("audit log path", "output file").
+//
+// It guards every writer that opens an operator-supplied destination without O_EXCL.
+// O_EXCL refuses to follow a symlink for free, so a create-only write needs nothing; the
+// moment a writer drops it for O_TRUNC (an --output overwrite, the doctor bundle) or
+// O_APPEND (the audit log), it will happily follow an attacker-planted link at that path
+// and write through to the link's TARGET — and any subsequent fd Chmod re-modes that
+// target too. A shared, world-writable directory is enough. For the audit log the
+// consequence is sharper still: the tape is redirected AND the live log drops out of
+// LogChainFiles' IsRegular() scan, so audit-verify passes without reading a record.
+//
+// Lstat inspects the final component itself rather than its target. Only a genuinely
+// ABSENT path (fs.ErrNotExist) is let through — the ordinary fresh-install and
+// post-rename case the caller's O_CREATE then fills. Any OTHER stat error (EIO, NFS
+// ESTALE, ELOOP, EACCES on a path component) is REFUSED, not assumed benign: gating the
+// refusal on "stat succeeded" would let a stat fault skip the check and follow a symlink,
+// the fail-OPEN direction this guard exists to prevent.
+//
+// A Lstat->open TOCTOU remains: a symlink planted between this check and the open is
+// still followed. Closing it fully needs O_NOFOLLOW-level atomicity, which is not
+// portable; internal/audit adds O_NOFOLLOW where the platform has it and keeps its
+// rename->reopen window narrow.
+//
+// It lives here, beside ExpandHome, because the binary and internal/audit each had their
+// own hand-written copy and they had already drifted — one distinguished a symlink from
+// another special file, the other did not — which is how a guard ends up weaker on one of
+// the paths it protects.
+func RefuseNonRegularPath(path, subject string) error {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("refusing %s %q: cannot stat it (%v); a path that may be a symlink or other non-regular file is not safe to open", subject, path, err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing %s %q: it is a symbolic link, and following it would write through to the link's target — remove the link or choose a different path", subject, path)
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("refusing a non-regular %s %q (mode %v): it must be a regular file, not a symlink or other special file", subject, path, fi.Mode())
+	}
+	return nil
 }

@@ -74,13 +74,17 @@ const globClassPlaceholder = '\x00'
 // replaced by a single placeholder, leaving only the characters path.Match compares
 // literally. A '%', '2' or 'f' written INSIDE a class ("[a%2f]") is a class MEMBER —
 // the class consumes one value character — so such a pattern is a live grant and
-// must not be read as an encoded separator. Mirrors path.Match's scanChunk, as
-// countPatternPathSeparators does: '[' opens a class and ']' closes an OPEN one (no
-// nesting) while a ']' with no class open is an ordinary literal, and a
-// backslash-escaped character is a single literal unit that neither opens nor closes
-// one. The scan is deliberately literal-only: a token split by a
+// must not be read as an encoded separator. Mirrors path.Match's scanChunk: '[' opens a
+// class and ']' closes an OPEN one (no nesting) while a ']' with no class open is an
+// ordinary literal, and a backslash-escaped character is a single literal unit that
+// neither opens nor closes one. The scan is deliberately literal-only: a token split by a
 // wildcard ("%2*f") still loads, matching the fail-closed direction — this rejects
 // unmatchable grants, it is not a security boundary.
+//
+// Two callers read this one rendering for two questions: ValidateValueGlob asks whether
+// the literal text hides an encoded separator, and confinePathStylePattern counts its '/'
+// to get the separators path.Match requires. They must agree on what counts as literal —
+// a second hand-mirrored scanChunk walk is exactly how they would drift apart.
 func patternLiteralsOutsideClasses(pattern string) string {
 	var b strings.Builder
 	inClass := false
@@ -181,39 +185,6 @@ func ValidateValueGlob(pattern string) error {
 	return nil
 }
 
-// countPatternPathSeparators counts the '/' characters in a non-"**" glob
-// pattern that [path.Match] treats as a required literal separator: every match
-// must reproduce it exactly as a '/' at the corresponding position in the value,
-// since neither '*' nor '?' ever consumes a '/' and every other literal
-// character must match itself exactly. A '/' written inside a bracket class
-// ("[…]", e.g. "[/x]" or "[^/]") is a class MEMBER instead — the class consumes
-// exactly one value character, which may or may not be '/' — so it is excluded.
-// Mirrors path.Match's own scanChunk exactly: '[' opens a class and ']' closes
-// it (no nesting, no "]-right-after-[ is literal" special case, matching Go's
-// implementation), and a backslash-escaped character (including an escaped '/')
-// is a single literal unit that still counts as a required separator when it
-// decodes to '/', but is never re-examined for class-boundary significance.
-func countPatternPathSeparators(pattern string) int {
-	count := 0
-	inClass := false
-	for i := 0; i < len(pattern); i++ {
-		switch {
-		case pattern[i] == '\\' && i+1 < len(pattern):
-			i++
-			if pattern[i] == '/' && !inClass {
-				count++
-			}
-		case pattern[i] == '[':
-			inClass = true
-		case pattern[i] == ']':
-			inClass = false
-		case pattern[i] == '/' && !inClass:
-			count++
-		}
-	}
-	return count
-}
-
 // confinePathStylePattern applies subtree confinement to a path-style ("/"-bearing)
 // allowedValues pattern. It decodes every separator/dot alias an upstream resolves
 // ('\' separators and percent-encoding) before a "."/".." scan, so a value like
@@ -250,9 +221,14 @@ func confinePathStylePattern(pattern, value string) (folded string, valSpansSep 
 		// that does not exclude '/' (e.g. "[^z]") matches a literal '/' already in the
 		// value via path.Match's whole-value fast path, letting one class element span
 		// TWO value segments the pattern's literal text scoped to one. Count only
-		// pattern-side '/' that path.Match treats as a required separator — one inside a
-		// bracket class is a class MEMBER, not a separator (see countPatternPathSeparators).
-		if countPatternPathSeparators(pattern) != valueSlashes {
+		// pattern-side '/' that path.Match treats as a required separator: a '/' inside a
+		// bracket class is a class MEMBER (the class consumes exactly one value
+		// character, which may or may not be '/'), and an escaped '\/' outside one is a
+		// literal separator. patternLiteralsOutsideClasses renders exactly that view —
+		// classes elided to a placeholder, escapes resolved to their literal — so
+		// counting its '/' is the whole rule, on the same scan the load-time
+		// encoded-separator check uses rather than a second hand-mirrored one.
+		if strings.Count(patternLiteralsOutsideClasses(pattern), "/") != valueSlashes {
 			return folded, nil, false
 		}
 		return folded, nil, true

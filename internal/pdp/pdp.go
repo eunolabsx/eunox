@@ -164,11 +164,16 @@ const jsonKeyName = "name"
 
 // jsonKeyNameFolded is jsonKeyName under the same fold scanToolEntry applies to every
 // top-level key, so the two are compared in one space. It must be derived rather than
-// written out: capability.FoldJSONKey maps each rune to the SMALLEST member of its
-// simple-fold orbit, which for ASCII is the upper-case letter — a hand-written lower-case
-// literal would never match, and scanToolEntry would silently stop collecting names,
-// leaving poisonCandidates with nothing to poison on an untrustworthy entry.
+// written out: capability.FoldJSONKey maps each rune to a fixed representative of its
+// simple-fold orbit, and which representative that is belongs to that function, not to
+// this literal. A hand-written spelling that stopped matching would not fail loudly —
+// scanToolEntry would silently stop collecting names, leaving poisonCandidates with
+// nothing to poison on an untrustworthy entry.
 var jsonKeyNameFolded = capability.FoldJSONKey(jsonKeyName)
+
+// listKeyToolsFolded is listKeyTools under that same fold, for toolsKeyAmbiguous's
+// case-variant sibling check. Derived for the reason above, not written out.
+var listKeyToolsFolded = capability.FoldJSONKey(listKeyTools)
 
 // CountListEntries returns the number of entries in a */list method's result
 // array, or 0 for a non-list method or an empty/absent/unparseable result.
@@ -1218,20 +1223,8 @@ func (p *ManifestPDP) findConstraint(target EnforceTarget, claims map[string]int
 	// per-tools/list matchBare/path.Match evaluations.
 	primary := newConstraintScorer()
 	fallback := newConstraintScorer()
-	// parsedTargets is built parallel to caps by NewManifestPDP, so the hot path
-	// reads the once-parsed (type, bare) instead of re-scanning the static Target.
-	// A ManifestPDP built directly (a struct literal, as some tests do) leaves it
-	// unpopulated; fall back to inline ParseTarget then, mirroring how handleIPRange
-	// parses when Networks() reports the condition was not pre-compiled.
-	useCache := len(p.parsedTargets) == len(p.caps)
 	for i := range p.caps {
-		var pt parsedTarget
-		if useCache {
-			pt = p.parsedTargets[i]
-		} else {
-			tt, bare, err := capability.ParseTarget(p.caps[i].Target)
-			pt = parsedTarget{typ: tt, bare: bare, parseErr: err != nil}
-		}
+		pt := p.parsedTargetAt(i)
 		if pt.parseErr || pt.typ != target.Type {
 			continue
 		}
@@ -1256,6 +1249,27 @@ func (p *ManifestPDP) findConstraint(target EnforceTarget, claims map[string]int
 		return &p.caps[fallback.Best()]
 	}
 	return nil
+}
+
+// parsedTargetAt returns caps[i]'s target parsed into (type, bare).
+//
+// parsedTargets is built parallel to caps by NewManifestPDP, so the hot path reads the
+// once-parsed pair instead of re-scanning the static Target string. A ManifestPDP built
+// directly (a struct literal, as some tests do) leaves it unpopulated; this falls back to
+// an inline ParseTarget then, mirroring how handleIPRange parses when Networks() reports
+// the condition was not pre-compiled.
+//
+// The three scans over caps (findConstraint, directivesNamingTarget,
+// matchingLabelOutputUnion) each opened with a byte-identical copy of this cache-or-parse
+// preamble. One copy means a change to how a target is parsed -- or to how the
+// unpopulated-cache fallback behaves -- cannot land on two of the three scans and leave
+// the third selecting against a differently-parsed target.
+func (p *ManifestPDP) parsedTargetAt(i int) parsedTarget {
+	if len(p.parsedTargets) == len(p.caps) {
+		return p.parsedTargets[i]
+	}
+	tt, bare, err := capability.ParseTarget(p.caps[i].Target)
+	return parsedTarget{typ: tt, bare: bare, parseErr: err != nil}
 }
 
 // newConstraintScorer returns the shared constraint-selection tiebreak tracker
@@ -1393,16 +1407,8 @@ func (p *ManifestPDP) withForwardObligations(ctx context.Context, r capability.E
 // caller". Used only to fill obligations onto a forwarded no-match deny.
 func (p *ManifestPDP) directivesNamingTarget(target EnforceTarget) []capability.Directive {
 	var dirs []capability.Directive
-	useCache := len(p.parsedTargets) == len(p.caps)
 	for i := range p.caps {
-		var pt parsedTarget
-		if useCache {
-			pt = p.parsedTargets[i]
-		} else {
-			tt, bare, err := capability.ParseTarget(p.caps[i].Target)
-			pt = parsedTarget{typ: tt, bare: bare, parseErr: err != nil}
-		}
-		if pt.parseErr || pt.typ != target.Type || !matchBare(pt.bare, target.Name) {
+		if pt := p.parsedTargetAt(i); pt.parseErr || pt.typ != target.Type || !matchBare(pt.bare, target.Name) {
 			continue
 		}
 		dirs = append(dirs, p.caps[i].Directives...)
@@ -1417,16 +1423,8 @@ func (p *ManifestPDP) directivesNamingTarget(target EnforceTarget) []capability.
 // unspecified (the engine reorders into the canonical vocabulary). nil when nothing matches.
 func (p *ManifestPDP) matchingLabelOutputUnion(target EnforceTarget, claims map[string]interface{}) []string {
 	var set map[string]struct{}
-	useCache := len(p.parsedTargets) == len(p.caps)
 	for i := range p.caps {
-		var pt parsedTarget
-		if useCache {
-			pt = p.parsedTargets[i]
-		} else {
-			tt, bare, err := capability.ParseTarget(p.caps[i].Target)
-			pt = parsedTarget{typ: tt, bare: bare, parseErr: err != nil}
-		}
-		if pt.parseErr || pt.typ != target.Type || !matchBare(pt.bare, target.Name) {
+		if pt := p.parsedTargetAt(i); pt.parseErr || pt.typ != target.Type || !matchBare(pt.bare, target.Name) {
 			continue
 		}
 		if !p.caps[i].PrincipalMatches(claims) {
@@ -2108,6 +2106,18 @@ func (p *ManifestPDP) recordPinnedToolHash(entry toolListEntry) {
 	}
 }
 
+// anyNamePinned reports whether any of names is pinned by the manifest. It reads
+// pinnedTools, which NewManifestPDP builds once and never mutates, so no lock is needed
+// (unlike the observed-hash and poison maps, which descMu guards).
+func (p *ManifestPDP) anyNamePinned(names []string) bool {
+	for _, n := range names {
+		if _, pinned := p.pinnedTools[n]; pinned {
+			return true
+		}
+	}
+	return false
+}
+
 // poisonCandidates sticky-poisons every pinned name an untrustworthy entry could present
 // to a host. Scoping the poison to the entry's own candidate names — rather than every pin
 // on the route — keeps the fail-closed property while bounding the blast radius: an
@@ -2219,6 +2229,16 @@ func (p *ManifestPDP) armPinsFromToolsList(result json.RawMessage) (entryCount i
 			p.poisonCandidates(scan.names)
 			continue
 		}
+		// Decide on the NAME before paying for the decode. The unmarshal below pulls in
+		// the entry's whole inputSchema -- by far the largest thing on this path -- and
+		// everything it feeds is gated on the name being pinned: recordPinnedToolHash
+		// looks the name up in pinnedTools, and the decode-failure branch poisons
+		// candidates that poisonCandidates would filter to the same empty set. The scan
+		// above already produced the name set, so an unpinned entry (the common case on
+		// any manifest that pins one tool out of fifty) can be skipped outright.
+		if !p.anyNamePinned(scan.names) {
+			continue
+		}
 		var entry toolListEntry
 		if err := json.Unmarshal(raw, &entry); err != nil {
 			// The name is trustworthy (the scan cleared it) but the entry will not decode
@@ -2260,10 +2280,17 @@ func toolsKeyAmbiguous(raw json.RawMessage) bool {
 		if !ok {
 			return true
 		}
-		if key == listKeyTools {
+		// capability.FoldJSONKey, not strings.EqualFold: EqualFold is Unicode simple
+		// folding too, so there is no live divergence today, but this scan and the
+		// JSON-RPC envelope scan exist to catch exactly the shape a weaker fold misses.
+		// Sharing the one folding rule the other layers use (rejectDuplicateJSONKeys,
+		// scanToolEntry, decodeOrderedObject) is what keeps them from drifting apart
+		// independently — which is how one of them ended up on strings.ToLower before.
+		switch {
+		case key == listKeyTools:
 			exact++
 			folded++
-		} else if strings.EqualFold(key, listKeyTools) {
+		case capability.FoldJSONKey(key) == listKeyToolsFolded:
 			folded++
 		}
 		var skip json.RawMessage
