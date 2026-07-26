@@ -177,26 +177,32 @@ func noisyUpstreamArgs() (command string, args []string) {
 	return os.Args[0], []string{"-test.run=^TestHelperStdioNoisyUpstream$", "--", stdioNoisySentinel}
 }
 
-// TestFetchLiveToolsStdio_SkipsNonJSONLines is the regression for the onboarding
-// path: an upstream that prints a banner or debug line to stdout works fine behind
-// the running proxy (whose reader skips mcp.ErrParse and keeps reading), so the CLI
-// probe backing `init`, `validate --live`, and `doctor --live` must skip them too.
-// Before the fix the first stray line ended the probe with an error and exit 2,
-// blocking the documented onboarding path against a server eunox itself can front.
-func TestFetchLiveToolsStdio_SkipsNonJSONLines(t *testing.T) {
+// TestFetchLiveToolsStdio_NonJSONLineIsTerminal pins that the CLI probe and the
+// RUNTIME agree about a stray non-JSON line on a stdio upstream's stdout.
+//
+// It is tempting to make the probe skip mcp.ErrParse so `init` / `validate --live` /
+// `doctor --live` tolerate an npx-launched server that prints a banner. That is a
+// fail-open in the reporting direction: both transports' upstream readers
+// (StdioProxy.readUpstream, httpSession.readUpstream) and the shared initialize
+// handshake (awaitStartupReply) end the session on any non-EOF read error, ErrParse
+// included — only the HOST-side reader skips one and answers -32700. A lenient probe
+// would therefore emit a manifest for, and report healthy, an upstream that
+// `eunox proxy` kills at the handshake.
+//
+// So this asserts the probe FAILS, and it is the tripwire for that coupling: if the
+// runtime upstream readers are ever made lenient, this test should be inverted in the
+// same change, never on its own.
+func TestFetchLiveToolsStdio_NonJSONLineIsTerminal(t *testing.T) {
 	if testing.Short() {
 		t.Skip("spawns a subprocess; skipped in -short")
 	}
 	cmd, args := noisyUpstreamArgs()
-	info, err := fetchLiveToolsStdio(context.Background(), cmd, args)
-	if err != nil {
-		t.Fatalf("fetchLiveToolsStdio against a banner-printing upstream: %v", err)
+	_, err := fetchLiveToolsStdio(context.Background(), cmd, args)
+	if err == nil {
+		t.Fatal("expected a banner-printing upstream to fail the probe, matching how the runtime treats it")
 	}
-	if len(info.Tools) != 2 {
-		t.Errorf("got %d tools, want 2", len(info.Tools))
-	}
-	if info.ServerVersion != "1.0.0" {
-		t.Errorf("server version: got %q, want %q", info.ServerVersion, "1.0.0")
+	if !errors.Is(err, mcp.ErrParse) {
+		t.Errorf("probe error should identify the malformed line (mcp.ErrParse), got: %v", err)
 	}
 }
 

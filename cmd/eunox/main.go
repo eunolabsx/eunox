@@ -722,6 +722,16 @@ func buildAuditWiretapConfig(positional []string, upstreamURL, authHeader string
 	if len(positional) > 0 && upstreamURL != "" {
 		return nil, fmt.Errorf("--audit: pick exactly one upstream — positional `-- <command>` OR --upstream-url, not both")
 	}
+	// Reject a whitespace-only credential HERE, as an operator flag error. The value is
+	// copied verbatim into the synthesized config below, where Validate's own
+	// whitespace-only guard would also reject it — but that failure is reported as
+	// "internal: synthesized wiretap config rejected", the marker reserved for "the
+	// binary built something invalid, file a bug". A shell-quoting slip in
+	// --upstream-auth-header is the operator's to fix, not a eunox defect, so it must
+	// not be dressed up as one.
+	if authHeader != "" && strings.TrimSpace(authHeader) == "" {
+		return nil, fmt.Errorf("--upstream-auth-header is whitespace-only, which is not a usable credential — pass a real header value, or omit the flag to forward no auth header")
+	}
 	cfg := &config.GatewayConfig{
 		SchemaVersion: "0.1",
 		Transport:     config.HostTransportStdio,

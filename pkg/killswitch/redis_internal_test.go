@@ -2004,3 +2004,21 @@ func TestRedis_ShouldBlock_FailsClosedAfterContextCanceled(t *testing.T) {
 	}, 2*time.Second, 5*time.Millisecond,
 		"after its Start context is canceled, ShouldBlock must fail closed with ErrStopped on a non-match")
 }
+
+// TestRedis_WithSessionKillTTL covers the three-way branch its own doc calls a
+// fail-open when set wrong: a negative value means "never expire", zero selects the
+// default, and a positive value is taken verbatim. An expiring tombstone lifts the
+// kill on a session that may still be connected, so an inverted branch here would
+// silently un-kill live sessions — and every sibling option is asserted, so this one
+// should be too.
+func TestRedis_WithSessionKillTTL(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, defaultSessionKillTTL, NewRedis(nil).sessionKillTTL,
+		"no option must keep the default")
+	assert.Equal(t, defaultSessionKillTTL, NewRedis(nil, WithSessionKillTTL(0)).sessionKillTTL,
+		"zero selects the default")
+	assert.Equal(t, 90*time.Minute, NewRedis(nil, WithSessionKillTTL(90*time.Minute)).sessionKillTTL,
+		"a positive value is taken verbatim")
+	assert.Equal(t, time.Duration(0), NewRedis(nil, WithSessionKillTTL(-1)).sessionKillTTL,
+		"a negative value opts out of expiry entirely (0 = no TTL stamped)")
+}

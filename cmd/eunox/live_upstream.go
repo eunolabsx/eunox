@@ -10,7 +10,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os/exec"
 	"time"
@@ -235,18 +234,22 @@ func readResponseWithID(ctx context.Context, w *mcp.MsgWriter, r *mcp.MsgReader,
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return mcp.RPCMsg{}, ctxErr
 			}
-			// A malformed line (mcp.ErrParse) framed correctly — the newline framing is
-			// intact by definition — so skip it and keep reading, exactly as the running
-			// proxy's upstream reader does. Without this, one stray non-JSON line on the
-			// server's stdout (a banner or debug print, common in npx-launched servers)
-			// fails `init` / `validate --live` / `doctor --live` against an upstream the
-			// proxy itself fronts fine. Any other error (EOF, bufio.ErrTooLong, I/O) loses
-			// framing and stays terminal. The ctx.Err() gate above still bounds the loop,
-			// so an upstream emitting nothing but garbage ends at the probe deadline
-			// rather than spinning forever.
-			if errors.Is(err, mcp.ErrParse) {
-				continue
-			}
+			// A malformed line is TERMINAL here, deliberately, and must stay in lock-step
+			// with the runtime: both transports' upstream readers (StdioProxy.readUpstream,
+			// httpSession.readUpstream) and the shared initialize handshake
+			// (awaitStartupReply) end the session on any non-EOF read error, mcp.ErrParse
+			// included. Only the HOST-side reader skips parse errors and answers -32700.
+			//
+			// So skipping here would make `init` / `validate --live` / `doctor --live`
+			// report success — and emit a manifest — for a banner-printing stdio server
+			// that `eunox proxy` then kills at the handshake, which is a worse failure than
+			// the probe error: it moves the failure later and certifies an upstream the
+			// runtime rejects. Unblocking noisy upstreams means making the runtime lenient
+			// first; this probe follows it, it does not lead it.
+			//
+			// ErrParse also carries the duplicate/case-folded-object-key rejection
+			// (rejectDuplicateJSONKeys), which is a smuggling signal an operator running
+			// these commands to vet an upstream should see, not have skipped.
 			return mcp.RPCMsg{}, err
 		}
 		if msg.IsNotification() {

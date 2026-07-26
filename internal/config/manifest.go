@@ -1255,7 +1255,14 @@ func validateAllowedTables(i, j int, v *capability.AllowedTablesCondition) error
 	}
 	seen := make(map[string]string, len(v.Columns))
 	for table, cols := range v.Columns {
-		key := strings.ToLower(table)
+		// Normalize EXACTLY as the runtime compiler does (ToLower AFTER TrimSpace).
+		// Checking collisions on the untrimmed name while the engine keys on the trimmed
+		// one let {"users", " users"} pass validation and then collapse onto one bucket,
+		// with which column allowlist survived decided by randomized map iteration order
+		// — so a manifest could enforce a narrower ACL on one process and a wider one on
+		// the next, silently. Trimming here is what makes the "case-colliding keys"
+		// rejection cover the whitespace-colliding case too.
+		key := strings.ToLower(strings.TrimSpace(table))
 		if prior, dup := seen[key]; dup {
 			return fmt.Errorf("capability at index %d, condition %d: allowedTables 'columns' has case-colliding keys %q and %q; table names are matched case-insensitively, so they address the same table and one column allowlist would non-deterministically overwrite the other — merge them under a single key", i, j, prior, table)
 		}

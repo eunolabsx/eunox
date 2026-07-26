@@ -1960,7 +1960,7 @@ func evaluateJWTConditions(clock enforcement.Clock, conditions []capability.Cond
 					if word == "" {
 						continue
 					}
-					if enforcement.MatchAllowedOperation(c.Operations, word) {
+					if capability.MatchOperation(c.Operations, word) {
 						matchedOp = word
 						continue
 					}

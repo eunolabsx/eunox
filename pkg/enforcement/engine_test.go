@@ -8053,3 +8053,82 @@ func TestNoMatchDeny_CarriesObligationsWhenForwarded(t *testing.T) {
 	require.Equal(t, capability.DecisionDeny, blocked.Decision)
 	assert.Empty(t, blocked.Obligations)
 }
+
+// ctxHonoringCounter wraps a CallCounter and fails every operation whose context is
+// already cancelled, the way the Redis backend does (its pipeline Exec propagates
+// cancellation). The in-memory backend ignores ctx entirely, so without this wrapper
+// no test can see a cancellation-sensitive bug on the counter path.
+type ctxHonoringCounter struct{ inner capability.CallCounter }
+
+func (c ctxHonoringCounter) IncrementAndGet(ctx context.Context, key string, windowSec, maxEntries int) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.inner.IncrementAndGet(ctx, key, windowSec, maxEntries)
+}
+
+func (c ctxHonoringCounter) Peek(ctx context.Context, key string, windowSec int) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.inner.Peek(ctx, key, windowSec)
+}
+
+func (c ctxHonoringCounter) IncrementIfBelow(ctx context.Context, key string, windowSec int, limit int64) (int64, bool, time.Duration, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, false, 0, err
+	}
+	return c.inner.IncrementIfBelow(ctx, key, windowSec, limit)
+}
+
+func (c ctxHonoringCounter) IncrementIfAllBelow(ctx context.Context, keys []string, windowSecs []int, limits []int64) (bool, int, int64, time.Duration, error) {
+	if err := ctx.Err(); err != nil {
+		return false, 0, 0, 0, err
+	}
+	return c.inner.IncrementIfAllBelow(ctx, keys, windowSecs, limits)
+}
+
+// TestSequenceBlock_ReArmSurvivesRequestCancellation closes the bypass in the re-arm
+// itself: the host request context is cancelled the moment a client disconnects, and
+// a backend that honors ctx (Redis does) would then drop the re-arm write. A client
+// that probes the blocked target and immediately drops the connection is still denied
+// each time, but without a detached context it never refreshes the marker — so the
+// gate reverts to expiring on pure wall clock, which is precisely the fail-open the
+// re-arm exists to close, triggerable at will.
+func TestSequenceBlock_ReArmSurvivesRequestCancellation(t *testing.T) {
+	var mu sync.Mutex
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	counter := ctxHonoringCounter{inner: callcounter.NewInMemory(callcounter.WithTimeFunc(func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return now
+	}))}
+	engine := enforcement.New(enforcement.WithCallCounter(counter))
+	caps := exfilCaps()
+
+	require.Equal(t, capability.DecisionAllow,
+		engine.ValidateAction(context.Background(),
+			&capability.EnforceRequest{SessionID: "sess-1", TargetName: "read_credentials"}, caps).Decision)
+
+	// Probe the blocked target every 20h with a context that is ALREADY cancelled,
+	// modelling a client that disconnects the instant it sends the request.
+	for i := 0; i < 3; i++ {
+		mu.Lock()
+		now = now.Add(20 * time.Hour)
+		mu.Unlock()
+
+		cancelled, cancel := context.WithCancel(context.Background())
+		cancel()
+		resp := engine.ValidateAction(cancelled,
+			&capability.EnforceRequest{SessionID: "sess-1", TargetName: "write_external"}, caps)
+		require.Equalf(t, capability.DecisionDeny, resp.Decision,
+			"probe %d must be denied even with a cancelled context", i+1)
+	}
+
+	// 60h after the antecedent, with no uncancelled traffic in between, a clean probe
+	// must STILL be blocked: the cancelled probes re-armed the marker.
+	resp := engine.ValidateAction(context.Background(),
+		&capability.EnforceRequest{SessionID: "sess-1", TargetName: "write_external"}, caps)
+	require.Equal(t, capability.DecisionDeny, resp.Decision,
+		"a client that disconnects on every probe must not be able to age the gate out")
+}

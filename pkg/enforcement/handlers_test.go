@@ -347,8 +347,8 @@ func TestMatchAllowedOperation(t *testing.T) {
 		{"leading space on entry tolerated", []string{" insert"}, "INSERT", true},
 	}
 	for _, tc := range cases {
-		if got := enforcement.MatchAllowedOperation(tc.allowed, tc.op); got != tc.want {
-			t.Errorf("%s: MatchAllowedOperation(%v, %q) = %v, want %v", tc.name, tc.allowed, tc.op, got, tc.want)
+		if got := capability.MatchOperation(tc.allowed, tc.op); got != tc.want {
+			t.Errorf("%s: MatchOperation(%v, %q) = %v, want %v", tc.name, tc.allowed, tc.op, got, tc.want)
 		}
 	}
 }

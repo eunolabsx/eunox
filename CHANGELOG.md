@@ -34,6 +34,14 @@ Section conventions:
   an incident reconstruction had no signed evidence of when the stop was tripped
   or that it was authorized. Written only after the kill takes effect; the control
   token is never recorded. See `docs/threat-model-mcp.md` §3.7.
+- `capability.MatchOperation`, plus `Compile`/`AllowsOperation`/`MatchExtensions`/
+  `TableLookup`/`MatchDomains` on the `allowedOperations`, `allowedExtensions`,
+  `allowedTables`, and `recipientDomain` conditions. `Compile` normalizes a condition's
+  allowlist once at manifest load so the hot path stops rebuilding it per request; the
+  accessors serve that cached form and fall back to normalizing on the spot for a
+  condition built programmatically. The cached form has no invalidation, so a
+  condition's allowlist fields are immutable once compiled, and the accessors' results
+  are read-only — see the doc comments in `pkg/capability/condition.go`.
 - `capability.FloatToInt64`, the single definition of "exactly representable as an
   int64" now shared by manifest-load bound validation and the runtime comparison.
 
@@ -43,9 +51,13 @@ Section conventions:
   `targetName`). The field always carried every enforced namespace — resource URIs,
   prompt names, `system:` targets — not just tool names, so the old name misread the
   data and forced every helper reconciling it with `Target` to explain the mismatch.
-  Library callers constructing an `EnforceRequest` directly must rename the field;
-  the Rego input document is unaffected (it exposes `input.target.*`, never
-  `toolName`).
+  Library callers constructing an `EnforceRequest` directly must rename the field.
+  The input document `BuildRegoInput` produces is unaffected — it exposes
+  `input.target.*` and never carried `toolName` — but a custom `PolicyEvaluator` that
+  builds its own input by marshaling the `*EnforceRequest` it is handed will now emit
+  `targetName`. A Rego rule matching on `input.toolName` would become undefined rather
+  than error, which is a silent fail-open, so audit any evaluator that marshals the
+  request itself.
 - **`killswitch.NewRedis` takes options** — `NewRedis(client, WithFailOpen(...),
   WithReconcileInterval(...), WithLogger(...), WithSessionKillTTL(...))` — replacing
   the chained `With*` setters. Every one of those fields is read by `ShouldBlock` and

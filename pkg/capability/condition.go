@@ -25,6 +25,15 @@ const (
 	ConditionTypeCustom            = "custom"
 )
 
+// Several conditions cache a normalized form of their allowlist, built once by
+// Compile at manifest load (see AllowedOperationsCondition, AllowedExtensionsCondition,
+// AllowedTablesCondition, RecipientDomainCondition, IPRangeCondition, TimeWindowCondition).
+// Those caches have NO invalidation: once Compile has run, the accessors serve the
+// cached form and never re-read the source field. The source slices/maps are therefore
+// immutable after load — mutating Operations/Extensions/Tables/Columns/Domains/CIDRs on
+// a compiled condition keeps enforcing the PRE-edit allowlist, silently and in the
+// fail-open direction if the edit was a narrowing. Build a new condition instead.
+//
 // Condition is the interface for all capability conditions.
 // All conditions have a Type() method returning the discriminator string.
 type Condition interface {
@@ -120,13 +129,14 @@ func (c *AllowedOperationsCondition) Compile() error {
 // A "*" entry is NOT a wildcard: it is rejected at manifest load
 // (validateAllowedOperations), so a literal "*" only ever matches the operation "*".
 func (c *AllowedOperationsCondition) AllowsOperation(op string) bool {
+	// One implementation for both paths: MatchOperation trims as it scans, and
+	// TrimSpace on an already-trimmed entry is a no-op, so handing it the compiled
+	// slice is exactly the uncompiled rule with the trimming already done. Open-coding
+	// the loop here would make the compiled path — the one EVERY manifest-loaded
+	// condition takes — a second copy of the matching rule that no production caller
+	// exercises against the first.
 	if c.compiled != nil {
-		for _, a := range c.compiled {
-			if strings.EqualFold(a, op) {
-				return true
-			}
-		}
-		return false
+		return MatchOperation(c.compiled, op)
 	}
 	return MatchOperation(c.Operations, op)
 }
@@ -179,6 +189,12 @@ func (c *AllowedExtensionsCondition) Compile() error {
 // dotted suffix, blanks dropped and duplicates collapsed. It prefers what Compile
 // cached and otherwise normalizes on the spot, so a programmatically built condition
 // matches exactly what a loaded one matches.
+//
+// The result is READ-ONLY. On the compiled path it is the live policy shared by every
+// session on this manifest, read concurrently by every in-flight request with no lock
+// — writing through it would silently redefine what is permitted process-wide and
+// race those readers. Capacity is clipped to length so an append is forced to copy,
+// but that only closes the accidental case; do not write to the elements.
 func (c *AllowedExtensionsCondition) MatchExtensions() []string {
 	if c.compiled != nil {
 		return c.compiled
@@ -211,7 +227,12 @@ func normalizeExtensions(exts []string) []string {
 		seen[n] = struct{}{}
 		out = append(out, n)
 	}
-	return out
+	// Clip capacity to length. Skipped blanks and collapsed duplicates leave spare
+	// capacity, so a caller doing `x := c.MatchExtensions(); x = append(x, ...)` would
+	// otherwise write into the backing array of the COMPILED, process-lifetime policy —
+	// silently widening the extension allowlist for every session, and racing every
+	// concurrent reader while doing it. With cap == len, that append always copies.
+	return out[:len(out):len(out)]
 }
 
 // AllowedTablesCondition limits database access to the listed tables and columns.
@@ -263,6 +284,14 @@ func (c *AllowedTablesCondition) Compile() error {
 //
 // allowedColumns is nil when the condition declares no column restrictions at all,
 // which the handler distinguishes from an empty restriction.
+//
+// All three results are READ-ONLY, and unlike the slice accessors these are maps, so
+// nothing structural stops a write. On the compiled path they are the live policy
+// shared by every session on this manifest: inserting one key (a table, or a column
+// on a table) permanently widens the enforced ACL for the life of the process, with
+// no manifest change and no audit trace, and doing it from a request goroutine is an
+// unsynchronized write concurrent with every other request's reads — which crashes
+// the process with "concurrent map read and map write". Copy before mutating.
 func (c *AllowedTablesCondition) TableLookup() (allowedTables map[string]bool, allowedColumns map[string][]string, columnSets map[string]map[string]bool) {
 	t := c.compiled
 	if t == nil {
@@ -329,6 +358,11 @@ func (c *RecipientDomainCondition) Compile() error {
 // MatchDomains returns the allowlist as a lowercased, trimmed lookup set. It prefers
 // what Compile cached and otherwise builds it on the spot, so a programmatically
 // built condition matches exactly what a loaded one matches.
+//
+// The result is READ-ONLY, and it is a map, so nothing structural stops a write. See
+// TableLookup: on the compiled path this is the live policy shared by every session,
+// so inserting a domain widens the enforced allowlist process-wide and races every
+// concurrent reader. Copy before mutating.
 func (c *RecipientDomainCondition) MatchDomains() map[string]bool {
 	if c.compiled != nil {
 		return c.compiled

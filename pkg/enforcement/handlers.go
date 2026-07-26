@@ -531,8 +531,9 @@ func (e *Engine) handleAllowedOperations(_ context.Context, cond capability.Cond
 	// No wildcard: the operations list is an explicit allowlist. A "*" entry is
 	// rejected at load (validateAllowedOperations); matching it here would turn the
 	// condition into a no-op permitting any verb. AllowsOperation matches against the
-	// entries Compile pre-trimmed at load, falling back to the same trim-as-you-scan
-	// rule MatchAllowedOperation applies for the JWT shorthand PDP.
+	// entries Compile pre-trimmed at load, resolving either way to
+	// capability.MatchOperation — the same matcher the JWT shorthand PDP calls with a
+	// bare claim-derived slice, so the manifest and JWT paths cannot diverge.
 	if ao.AllowsOperation(operation) {
 		return nil
 	}
@@ -1009,21 +1010,6 @@ func OperationVerb(s string) string {
 	return strings.ToUpper(fields[0])
 }
 
-// MatchAllowedOperation reports whether op is in the allowed operations set,
-// compared case-insensitively with each entry trimmed. A "*" entry is NOT a wildcard
-// here — it is rejected at manifest load (validateAllowedOperations), so a literal
-// "*" only ever matches the operation "*".
-//
-// It is the entry point for callers holding a bare operation slice with no condition
-// to compile — the JWT shorthand PDP, whose operation claims never pass through the
-// manifest validator. The manifest path goes through
-// AllowedOperationsCondition.AllowsOperation, which matches the entries Compile
-// pre-trimmed at load; both resolve to capability.MatchOperation's rule, so the two
-// cannot drift.
-func MatchAllowedOperation(allowed []string, op string) bool {
-	return capability.MatchOperation(allowed, op)
-}
-
 // numericEqual reports whether a and b are both numeric and equal in value,
 // independent of concrete Go type. Manifest values decode from YAML as int while
 // request arguments decode as float64, so a bare manifest integer would not
@@ -1243,6 +1229,22 @@ func (e *Engine) handleSequenceBlock(ctx context.Context, cond capability.Condit
 	if blockedName == "" {
 		blockedDetail = "(unknown)"
 	}
+	// Every history access below runs on a context detached from the REQUEST's
+	// cancellation. ctx is the host request context, which net/http cancels the instant
+	// the client disconnects, and a backend that honors it (the Redis pipeline does;
+	// the in-memory one ignores ctx) then fails both the lookup and the re-arm. That
+	// hands the gate's own I/O to the party the gate constrains: a client that probes
+	// the blocked target and drops the connection each time gets a fail-closed deny —
+	// from the lookup ERROR, never reaching the count > 0 branch — so the marker is
+	// never refreshed and the gate reverts to expiring on pure wall clock, the
+	// fail-open the re-arm exists to close, triggerable at will.
+	//
+	// Detaching also makes the verdict accurate rather than a spurious infrastructure
+	// denial for any genuinely cancelled request. WithoutCancel keeps the context's
+	// values (a backend reading request-scoped state still sees them) and drops only
+	// the cancellation; the Redis client's own dial/read/write timeouts still bound
+	// every call, so a partitioned backend cannot wedge this.
+	histCtx := context.WithoutCancel(ctx)
 	for _, prior := range sb.AfterTools {
 		// Resolve each antecedent's namespace from its prefix (bare defaults to
 		// "tool"), mirroring RecordSessionCall, so afterTools: [export] matches only
@@ -1256,7 +1258,7 @@ func (e *Engine) handleSequenceBlock(ctx context.Context, cond capability.Condit
 		priorTarget := priorType + ":" + priorTool
 		key := sequenceHistoryKey(e.counterKeyNamespace, req.SessionID, priorType, priorTool)
 
-		count, err := history.Peek(ctx, key, sequenceHistoryWindowSec)
+		count, err := history.Peek(histCtx, key, sequenceHistoryWindowSec)
 		if err != nil {
 			return &ConditionError{
 				Code:          capability.ErrCodeConditionFailed,
@@ -1273,7 +1275,7 @@ func (e *Engine) handleSequenceBlock(ctx context.Context, cond capability.Condit
 			// a purely wall-clock fail-OPEN of a security gate. Refreshing here makes a
 			// session that keeps attempting the blocked target keep the gate armed.
 			//
-			// Best-effort by design: this runs on a path that has ALREADY decided to
+			// Best-effort by design (histCtx is detached from request cancellation — see above): this runs on a path that has ALREADY decided to
 			// deny, so a write fault cannot turn this denial into an allow, and
 			// surfacing it as a lookup error would convert a correct, precise
 			// sequenceBlock denial into a generic backend-fault one — strictly worse
@@ -1282,7 +1284,13 @@ func (e *Engine) handleSequenceBlock(ctx context.Context, cond capability.Condit
 			// is exactly the pre-existing behavior. maxEntries is the same
 			// sequenceHistoryMaxEntries the recorder uses, and the backends retain the
 			// NEWEST entries, so this refreshes the single marker rather than growing it.
-			_, _ = history.IncrementAndGet(ctx, key, sequenceHistoryWindowSec, sequenceHistoryMaxEntries)
+			//
+			// Only the marker that MATCHED is refreshed: the loop returns here, and a
+			// target recorded under two spellings (RecordSessionCall's alias + primary)
+			// has only the probed one re-armed. That is the documented per-pair contract —
+			// retention measures inactivity of THIS (antecedent, blocked target) pair —
+			// not an oversight; a pair no call ever exercises still ages out.
+			_, _ = history.IncrementAndGet(histCtx, key, sequenceHistoryWindowSec, sequenceHistoryMaxEntries)
 			return &ConditionError{
 				Code:          capability.ErrCodeConditionFailed,
 				ConditionType: capability.ConditionTypeSequenceBlock,
