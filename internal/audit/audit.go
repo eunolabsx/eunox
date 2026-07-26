@@ -656,6 +656,62 @@ func (s *Sink) resumeChainFromTail(last string) tailResumeResult {
 	return tailResumeResult{}
 }
 
+// startupResume is resolveStartupResume's report: which tail line the chain resumes
+// from, and whether that resolution failed closed (so Open writes a chain_resume_failed
+// marker) and whether the reseed it performed could see the whole chain.
+type startupResume struct {
+	last              string
+	chainResumeFailed bool
+	seedUnbounded     bool
+	failReason        string
+}
+
+// resolveStartupResume decides which line the chain resumes from, handling the two ways
+// that resolution can fail closed: an unreadable base tail, and an empty base whose newest
+// rotated sibling is unreadable. Both seed the seq counter past the on-disk maximum rather
+// than restarting at genesis, and both report chainResumeFailed so the caller marks the
+// break in-band. Split out of Open to keep that function within the cyclomatic-complexity
+// budget; it mutates s.seq through seedSeqPastOnDiskMax, which is safe because Open is
+// single-threaded here (opt application has run, the drainer has not started).
+func (s *Sink) resolveStartupResume(tail tailResume, logPath string) startupResume {
+	r := startupResume{last: tail.last}
+	switch {
+	case !tail.readable:
+		// A write-only (0200) log opened append-only: its tail cannot be read, so the
+		// chain genuinely cannot be resumed. Restarting from genesis would renumber seq
+		// from 1 and reissue every seq already on disk — a tamper-shaped duplicate-seq
+		// cascade, worse than a gap — so seed past the highest seq anywhere in the chain
+		// and mark the break in-band instead. prev_hmac stays the genesis sentinel: the
+		// real tail could not be read, so the cryptographic link honestly cannot continue,
+		// and the marker is the single break rather than a per-record one.
+		r.seedUnbounded = !s.seedSeqPastOnDiskMax()
+		r.chainResumeFailed = true
+		r.failReason = auditReasonTailReadFailed
+		fmt.Fprintf(os.Stderr, "[eunox] WARNING: could not read audit log tail of %q (the log is write-only, so its tail cannot be probed); the chain cannot be resumed and a chain_resume_failed marker is appended (seq continues past the on-disk maximum) — run 'eunox audit-verify' and reconcile against your external sink.\n", logPath)
+	case r.last == "":
+		// logPath is empty or absent: a brand-new install, a just-rotated base, or a
+		// reopen-fallback that renamed the base away. In the latter two the chain
+		// tail lives in the newest rotated sibling. Resuming from the empty base
+		// would restart at genesis and silently orphan every prior record with no
+		// detectable gap, so fall back to the sibling's tail and warn.
+		sib, l, unreadableNewer := newestRotatedSiblingWithTail(logPath)
+		switch {
+		case sib != "":
+			r.last = l
+			fmt.Fprintf(os.Stderr, "[eunox] audit chain resumed from rotated file %q because the base log %q was empty on startup\n", sib, logPath)
+		case unreadableNewer:
+			// The newest rotated sibling exists but could not be read, so resuming from an
+			// older one (or genesis) would reissue its seqs. Fail closed exactly as a base
+			// read failure does: seed past the on-disk max and record the break in-band.
+			r.seedUnbounded = !s.seedSeqPastOnDiskMax()
+			r.chainResumeFailed = true
+			r.failReason = auditReasonTailReadFailed
+			fmt.Fprintf(os.Stderr, "[eunox] WARNING: the newest rotated audit sibling of %q could not be read; the chain cannot be safely resumed and a chain_resume_failed marker is appended (seq continues past the on-disk maximum) — run 'eunox audit-verify' and reconcile against your external sink.\n", logPath)
+		}
+	}
+	return r
+}
+
 // Open opens (or creates) the audit log and loads (or generates) the HMAC
 // signing key. logPath, keyPath, and rotateSizeBytes may be zero for defaults.
 //
@@ -769,44 +825,9 @@ func Open(logPath, keyPath string, rotateSizeBytes int64, retainRotated int, opt
 	// The tail was read once, through the open append handle, by the partial-tail
 	// recovery above (see tailResume): every way it could fail to establish the tail
 	// is already a fail-closed Open error, so only two cases remain here.
-	last := tail.last
-	chainResumeFailed := false
-	seedUnbounded := false
-	var resumeFailReason string
-	switch {
-	case !tail.readable:
-		// A write-only (0200) log opened append-only: its tail cannot be read, so the
-		// chain genuinely cannot be resumed. Restarting from genesis would renumber seq
-		// from 1 and reissue every seq already on disk — a tamper-shaped duplicate-seq
-		// cascade, worse than a gap — so seed past the highest seq anywhere in the chain
-		// and mark the break in-band instead. prev_hmac stays the genesis sentinel: the
-		// real tail could not be read, so the cryptographic link honestly cannot continue,
-		// and the marker is the single break rather than a per-record one.
-		seedUnbounded = !s.seedSeqPastOnDiskMax()
-		chainResumeFailed = true
-		resumeFailReason = auditReasonTailReadFailed
-		fmt.Fprintf(os.Stderr, "[eunox] WARNING: could not read audit log tail of %q (the log is write-only, so its tail cannot be probed); the chain cannot be resumed and a chain_resume_failed marker is appended (seq continues past the on-disk maximum) — run 'eunox audit-verify' and reconcile against your external sink.\n", logPath)
-	case last == "":
-		// logPath is empty or absent: a brand-new install, a just-rotated base, or a
-		// reopen-fallback that renamed the base away. In the latter two the chain
-		// tail lives in the newest rotated sibling. Resuming from the empty base
-		// would restart at genesis and silently orphan every prior record with no
-		// detectable gap, so fall back to the sibling's tail and warn.
-		sib, l, unreadableNewer := newestRotatedSiblingWithTail(logPath)
-		switch {
-		case sib != "":
-			last = l
-			fmt.Fprintf(os.Stderr, "[eunox] audit chain resumed from rotated file %q because the base log %q was empty on startup\n", sib, logPath)
-		case unreadableNewer:
-			// The newest rotated sibling exists but could not be read, so resuming from an
-			// older one (or genesis) would reissue its seqs. Fail closed exactly as a base
-			// read failure does: seed past the on-disk max and record the break in-band.
-			seedUnbounded = !s.seedSeqPastOnDiskMax()
-			chainResumeFailed = true
-			resumeFailReason = auditReasonTailReadFailed
-			fmt.Fprintf(os.Stderr, "[eunox] WARNING: the newest rotated audit sibling of %q could not be read; the chain cannot be safely resumed and a chain_resume_failed marker is appended (seq continues past the on-disk maximum) — run 'eunox audit-verify' and reconcile against your external sink.\n", logPath)
-		}
-	}
+	resume := s.resolveStartupResume(tail, logPath)
+	last := resume.last
+	chainResumeFailed, seedUnbounded, resumeFailReason := resume.chainResumeFailed, resume.seedUnbounded, resume.failReason
 	tr := s.resumeChainFromTail(last)
 	tailFailKind, tailParseFailure, tailParseBytes := tr.tailFailKind, tr.tailParseFailure, tr.tailParseBytes
 	tailSeq, tailHMAC := tr.tailSeq, tr.tailHMAC

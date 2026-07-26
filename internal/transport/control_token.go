@@ -54,7 +54,7 @@ func tightenTokenDir(dir string, fi os.FileInfo, eunoxOwned bool) error {
 		return nil
 	}
 	if eunoxOwned {
-		if err := os.Chmod(dir, 0o700); err != nil {
+		if err := os.Chmod(dir, 0o700); err != nil { //nolint:gosec // G302: 0700 is the intended restrictive mode -- this call exists to REMOVE group/world access, matching the MkdirAll above
 			return fmt.Errorf("restricting control-token directory %q (mode %v) to 0700: %w", dir, perm, err)
 		}
 		return nil
