@@ -365,3 +365,75 @@ func (failingKillSwitch) Reset(context.Context) error { return errors.New("backe
 func (failingKillSwitch) Status(context.Context) (*killswitch.Status, error) {
 	return nil, errors.New("backend down")
 }
+
+// TestUnsupportedMediaType_RecordsRefusal pins that a 415 lands on the tamper-evident
+// tape like every other transport-level refusal. Without it, a content-type sweep of
+// the sessionless initialize POST — the one /mcp entry point that needs no custom
+// header — and of the emergency stop was the single refusal an incident responder
+// could not see, while the same actor's wrong-Origin attempts were fully recorded.
+//
+// The attacker-controlled header VALUE must never reach the tape; only the count does.
+func TestUnsupportedMediaType_RecordsRefusal(t *testing.T) {
+	cases := []struct {
+		name        string
+		contentType []string
+		wantCount   float64
+	}{
+		{"wrong media type", []string{"text/plain"}, 1},
+		{"absent header", nil, 0},
+		{"duplicated header", []string{CTJSON, CTJSON}, 2},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			sink, logPath := newTempAuditSink(t)
+			proxy := newHTTPProxy(httpProxyOptions{
+				PDP:         pdp.AlwaysAllowPDP{},
+				UpstreamURL: "http://upstream.invalid",
+				Sink:        sink,
+			})
+			route := proxy.routes[""]
+
+			body := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{},"secret":"s3cret-body"}`
+			req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+			req.Header.Del("Content-Type")
+			for _, v := range tc.contentType {
+				req.Header.Add("Content-Type", v)
+			}
+			req.RemoteAddr = "203.0.113.7:5555"
+			rec := httptest.NewRecorder()
+			proxy.handleMCPPost(rec, req, route)
+			if rec.Code != http.StatusUnsupportedMediaType {
+				t.Fatalf("status = %d, want 415", rec.Code)
+			}
+
+			_ = sink.Close()
+			records := readAuditRecords(t, logPath)
+			if !hasAuditRecordWithCode(records, codeUnsupportedMediaType) {
+				t.Fatalf("expected an %s audit record for the refused content type; got %d records", codeUnsupportedMediaType, len(records))
+			}
+			var found map[string]interface{}
+			for _, r := range records {
+				if c, _ := r["denial_code"].(string); c == codeUnsupportedMediaType {
+					found = r
+					break
+				}
+			}
+			details, _ := found["details"].(map[string]interface{})
+			if got, _ := details["header_count"].(float64); got != tc.wantCount {
+				t.Errorf("details.header_count = %v, want %v", got, tc.wantCount)
+			}
+			// Neither the offending header value nor the request body may be recorded.
+			assertRecordsExclude(t, records, "text/plain", "s3cret-body")
+		})
+	}
+}
+
+// TestUnsupportedMediaType_IsNonPolicyCode pins that the new code joins its siblings in
+// the infra-denial set, so `suggest` skips it rather than mining a phantom policy target
+// out of a malformed request.
+func TestUnsupportedMediaType_IsNonPolicyCode(t *testing.T) {
+	if !IsInfraDenialCode(codeUnsupportedMediaType) {
+		t.Errorf("%s names no policy target, so it must be classified as an infra denial", codeUnsupportedMediaType)
+	}
+}

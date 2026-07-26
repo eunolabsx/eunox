@@ -79,6 +79,17 @@ type UpstreamTool struct {
 	OutputSchema map[string]interface{}
 }
 
+// UpstreamTool must stay field-for-field identical to mcp.ToolEntry, which is where the
+// wire decode lives. This assertion is the compiler check for that: a struct conversion
+// compiles only between types with identical fields, so ADDING a field to either one
+// without the other breaks the build here rather than silently leaving the new field
+// zero in ParseToolsListResult's named-field copy — and a zero field means every FM-5
+// descriptionHash is computed over data the upstream actually sent something for. The
+// named copy in ParseToolsListResult covers the other direction (a same-type REORDER,
+// which a conversion would accept while transposing values), so the two together make
+// both failure modes compile errors.
+var _ = UpstreamTool(mcp.ToolEntry{})
+
 // Kind classifies a drift finding.
 type Kind string
 

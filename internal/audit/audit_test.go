@@ -3910,8 +3910,8 @@ func TestSEC02_VerifyRecord_ConstantTimeHMAC(t *testing.T) {
 		ok, err := sink.VerifyRecord([]byte(noHMAC))
 		// An unsigned record is refused outright: stripping _hmac must not be a way to
 		// skip verification, so it is an error rather than a quiet false.
-		if !errors.Is(err, errUnsignedRecord) {
-			t.Fatalf("error = %v, want errUnsignedRecord", err)
+		if err == nil || !strings.Contains(err.Error(), "carries no _hmac") {
+			t.Fatalf("error = %v, want a no-_hmac refusal", err)
 		}
 		if ok {
 			t.Error("expected VerifyRecord to return false when _hmac is empty")

@@ -92,16 +92,31 @@ func (p *HTTPProxy) handleMCP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// decodeStrictJSON decodes exactly one JSON value from r.Body into v, then requires
-// io.EOF: a body carrying a second JSON value (or any other trailing non-whitespace
-// token) is malformed and must be rejected with 400 before any dispatch, rather than
-// silently truncated to its first value — otherwise a multi-token /mcp body could
-// 202-ack an invalid initialize notification, or a /control/kill body could execute
-// a narrower kill while silently ignoring a smuggled trailing {"all":true}. On a
-// decode failure or trailing data this writes the response itself (400, or 413 for a
-// body that exceeds the MaxBytesReader cap the caller installed on r.Body) and
-// returns false; the caller must return immediately without proceeding.
-func decodeStrictJSON(w http.ResponseWriter, r *http.Request, v interface{}, invalidBodyMsg string) bool {
+// decodeStrictJSON is the single safe way to read a JSON POST body in this package. It
+// gates the Content-Type (415 for anything but application/json — see
+// requireJSONContentType) and then decodes exactly one JSON value from r.Body into v,
+// requiring io.EOF after it: a body carrying a second JSON value (or any other trailing
+// non-whitespace token) is malformed and must be rejected with 400 before any dispatch,
+// rather than silently truncated to its first value — otherwise a multi-token /mcp body
+// could 202-ack an invalid initialize notification, or a /control/kill body could execute
+// a narrower kill while silently ignoring a smuggled trailing {"all":true}. On a refused
+// content type, a decode failure, or trailing data this writes the response itself (415,
+// 400, or 413 for a body that exceeds the MaxBytesReader cap the caller installed on
+// r.Body) and returns false; the caller must return immediately without proceeding.
+//
+// The content-type gate lives HERE, rather than being repeated at each handler, for the
+// reason checkOrigin is a mux-wide wrapper: it makes the control unforgettable. Every
+// JSON POST body in this package is read through this function, so a future endpoint
+// gets the gate by construction instead of by remembering a line — and forgetting that
+// line would silently restore the no-preflight CORS-simple-request path the gate closes.
+// (A mux wrapper is the wrong shape for this one: GET and DELETE carry no body.)
+//
+// It runs after the caller has installed MaxBytesReader, which only wraps the reader and
+// consumes nothing, so a refused request still has its body read zero times by us.
+func (p *HTTPProxy) decodeStrictJSON(w http.ResponseWriter, r *http.Request, v interface{}, invalidBodyMsg string) bool {
+	if !p.requireJSONContentType(w, r) {
+		return false
+	}
 	dec := json.NewDecoder(r.Body)
 	if err := dec.Decode(v); err != nil {
 		var mbe *http.MaxBytesError
@@ -166,13 +181,6 @@ func (p *HTTPProxy) writeSessionCreateError(w http.ResponseWriter, r *http.Reque
 // handleMCPPost processes a JSON-RPC request from the MCP host for the given
 // upstream route.
 func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route *UpstreamRoute) {
-	// Refuse a body that is not labelled application/json before anything reads it. A
-	// sessionless initialize POST carries no custom header, so without this gate it is a
-	// CORS simple request a loopback page can send with no preflight; every other /mcp
-	// POST is already preflighted by its Mcp-Session-Id. See requireJSONContentType.
-	if !requireJSONContentType(w, r) {
-		return
-	}
 	// SEC-04: cap request body to prevent memory exhaustion from large payloads.
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 	var msg mcp.RPCMsg
@@ -181,7 +189,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 	// token BEFORE dispatching — otherwise a multi-token body could 202-ack an invalid
 	// initialize notification or run its first request on an existing session while
 	// the trailer is silently dropped.
-	if !decodeStrictJSON(w, r, &msg, "invalid JSON-RPC body") {
+	if !p.decodeStrictJSON(w, r, &msg, "invalid JSON-RPC body") {
 		return
 	}
 
@@ -1057,14 +1065,6 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Same JSON-only body gate the /mcp POST applies, for the same reason plus symmetry:
-	// the emergency stop must not be reachable by a request shaped to skip a preflight.
-	// It runs after the control-token check, so a caller without the token learns nothing
-	// about the body this endpoint expects.
-	if !requireJSONContentType(w, r) {
-		return
-	}
-
 	// SEC-04: cap request body to prevent memory exhaustion.
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 	var body struct {
@@ -1075,7 +1075,10 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 	// {"sessionId":"..."} followed by a smuggled {"all":true}): without this, only
 	// the first value is decoded and the second is silently dropped, so the kill
 	// actually executed could differ from what a body-only reviewer would expect.
-	if !decodeStrictJSON(w, r, &body, "invalid request body") {
+	// decodeStrictJSON applies the JSON-only content-type gate too, and it runs after the
+	// control-token check above, so a caller without the token learns nothing about the
+	// body this endpoint expects.
+	if !p.decodeStrictJSON(w, r, &body, "invalid request body") {
 		return
 	}
 	if body.All {

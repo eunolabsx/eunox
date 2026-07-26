@@ -79,7 +79,7 @@ func run(args []string) int {
 	}
 	switch args[1] {
 	case "proxy":
-		return cmdProxy()
+		return cmdProxy(args)
 	case "validate":
 		return cmdValidate()
 	case "init":
@@ -383,7 +383,7 @@ Flags:
 // that flush happens at all — an os.Exit skips defers, which is why this function
 // previously needed a deferred-exit trick to get the flush and a non-zero status at
 // once.
-func cmdProxy() (exitCode int) {
+func cmdProxy(args []string) (exitCode int) {
 	// ContinueOnError, like every sibling subcommand: an ExitOnError flag set would
 	// terminate the process inside Parse, reintroducing exactly the untestable exit
 	// this function no longer has.
@@ -392,7 +392,13 @@ func cmdProxy() (exitCode int) {
 
 	f := registerProxyFlags(fs)
 
-	if err := fs.Parse(os.Args[2:]); err != nil {
+	// Parse the args run() was handed, NOT the os.Args global. Under ExitOnError a
+	// caller that forgot to set os.Args killed the process loudly; under
+	// ContinueOnError the same mistake would quietly parse the surrounding binary's
+	// own flags (a test harness's -test.timeout, say) and return a usage error for a
+	// branch that was never reached. Taking the slice makes the dispatch contract
+	// run() documents actually hold for this subcommand.
+	if err := fs.Parse(args[2:]); err != nil {
 		// Parse has already written the error and the usage text to stderr.
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -556,14 +562,31 @@ func cmdProxy() (exitCode int) {
 			// registered here, so it flushes after the kill switch has stopped.
 			if err := sink.Close(); err != nil {
 				fmt.Fprintf(os.Stderr, "[eunox] Fatal: audit sink close failed; the audit trail may be incomplete: %v\n", err)
-				exitCode = 1
+				// Only ever UPGRADE from success. A flush failure must not overwrite a
+				// more specific non-zero code the function already chose (this file
+				// already uses 2 for a usage error), which an unconditional assignment
+				// would silently rewrite to 1.
+				if exitCode == 0 {
+					exitCode = 1
+				}
 			}
 		}()
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	// Both teardowns are deferred, not left to the signal goroutine below: that
+	// goroutine only runs when a signal actually arrives, so on every ordinary return
+	// (a serve error, or a clean shutdown) the context would otherwise stay live and
+	// the SIGINT/SIGTERM relay stay registered. In the binary that is invisible because
+	// the process exits — but cmdProxy now RETURNS rather than calling os.Exit, so an
+	// in-process caller would leak the ctx-bound cleanup goroutine (StartCleanup below)
+	// and, worse, keep the OS default signal disposition disabled for the whole process
+	// once Notify has diverted it. signal.Stop is idempotent, so the goroutine's own
+	// call remains correct.
+	defer cancel()
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 	go func() {
 		<-sigCh
 		cancel()
@@ -645,6 +668,12 @@ func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, ki
 			return nil, nil, nil, nil, fmt.Errorf("Redis configuration error: %w", err) //nolint:staticcheck // ST1005: "Redis" is a proper noun, not a capitalized sentence
 		}
 		if err := pingRedis(context.Background(), rdb); err != nil {
+			// Close the client before abandoning it: buildRedisClient hands back a live
+			// connection pool with its own goroutines. This branch used to call os.Exit,
+			// which made the leak unobservable; now that it returns, an in-process caller
+			// (the tests this function was made returnable for) would accumulate one pool
+			// and its dialer per failed attempt. Mirrors the kill subcommand's client.
+			_ = rdb.Close()
 			return nil, nil, nil, nil, err
 		}
 		fmt.Fprintf(os.Stderr, "[eunox] Redis backend enabled (%s). State persists across restarts.\n", redisAddr)

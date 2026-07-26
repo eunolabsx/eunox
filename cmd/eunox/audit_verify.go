@@ -101,6 +101,12 @@ func resolveAuditReaderLogPath(name, configured string) (string, bool) {
 	return logPath, true
 }
 
+// auditVerifySummaryFormat is the one-line tally `audit-verify` prints. Hoisted to a
+// constant so the site-drift test can assert the published landing-page demo still
+// quotes tallies this command actually emits: the previous copy drifted silently when a
+// tally was removed, because nothing tied the two together.
+const auditVerifySummaryFormat = "Checked %d record(s): %d valid, %d invalid, %d skipped, %d unknown-key, %d unverifiable; %d chain break(s).\n"
+
 // cmdAuditVerify runs the `audit-verify` subcommand and returns the process
 // exit code (rather than calling os.Exit itself), so tests can drive every branch.
 func cmdAuditVerify() int {
@@ -191,7 +197,7 @@ Flags:
 		return 0
 	}
 
-	fmt.Printf("Checked %d record(s): %d valid, %d invalid, %d skipped, %d unknown-key, %d unverifiable; %d chain break(s).\n",
+	fmt.Printf(auditVerifySummaryFormat,
 		res.Total, res.Valid, res.Invalid, res.Skipped, res.UnknownKey, res.Unverifiable, res.ChainBreaks)
 	// UNKNOWN_KEY_ID is a missing-key state, not tampering — kept distinct from the
 	// INVALID tally so a key rotation is not mistaken for corruption. The verdict

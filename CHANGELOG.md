@@ -52,6 +52,24 @@ Section conventions:
 
 ### Changed
 
+- **A refused `Content-Type` is now recorded** as the non-policy denial code
+  `UNSUPPORTED_MEDIA_TYPE`, carrying only `details.header_count` — never the
+  attacker-supplied header value. It was the one transport-level refusal leaving no
+  trace, so a content-type sweep of the sessionless `initialize` POST or the emergency
+  stop was invisible while the same actor's wrong-`Origin` attempts were fully logged.
+  A *duplicated* header additionally prints an `[eunox] SECURITY:` line, since a reverse
+  proxy that re-adds `Content-Type` is the one way an operator trips the gate through no
+  fault of their client.
+- **The integrity markers' tail fields are renamed `claimed_tail_seq` /
+  `claimed_tail_hmac`** (`tail_hmac_mismatch`, `tail_key_unknown`, `tail_unsigned`).
+  Both values are read from the record the writer just declared uncertifiable, so they
+  are whatever a write-capable attacker put there; signing them under bare names had
+  eunox attest an arbitrary value as fact. Matches the `claimed_session_id` convention.
+  A SIEM rule keyed on the old names must be updated.
+- **`audit-verify` caps the per-record "unsigned record" diagnostic** at 10 lines and
+  summarizes the remainder once. The `Invalid` tally is unchanged and still exact; only
+  the printing is bounded, so a pre-signing prefix cannot bury a genuine `CHAIN BREAK`
+  under one line per record.
 - **`POST /mcp` and `POST /control/kill` now require `Content-Type: application/json`**
   and answer `415 Unsupported Media Type` otherwise, failing closed on an absent,
   unparseable, or duplicated header (parameters such as `charset` are accepted; the
@@ -132,14 +150,23 @@ Section conventions:
 
 ### Fixed
 
+- `eunox proxy` no longer leaks its cancel function, signal registration, or a failed
+  Redis client. All three were unobservable while the function ended in `os.Exit`;
+  returning an exit code made them real for any in-process caller.
+- The `audit-verify` summary format is a shared constant the site-drift test asserts
+  against, and that test now walks `.js` as well as `.html` — the landing page renders
+  its terminal demos from a script, so an HTML-only sweep left the most prominent copy
+  of eunox's own output unguarded (it had already drifted).
 - `drift.ParseToolsListResult` converts each `mcp.ToolEntry` field by NAME instead of
   through a positional struct conversion. The two types share three `string` and two
   `map[string]interface{}` fields, so a same-type reorder in `mcp.ToolEntry` would have
   compiled cleanly while silently transposing the values every `descriptionHash`
-  comparison is computed over.
+  comparison is computed over. A package-level convertibility assertion keeps the other
+  direction covered: ADDING a field to either struct without the other now fails the
+  build rather than hashing the new field as a zero value.
 - The audit lock's "another instance holds the lock" diagnostic compares the errno with
-  `errors.Is` (and accepts `EAGAIN` as well as `EWOULDBLOCK`), matching the Windows
-  variant; the previous `==` worked only because `Flock` returns a bare `Errno`.
+  `errors.Is`, matching the Windows variant; the previous `==` worked only because
+  `Flock` returns a bare `Errno`.
 - **`sequenceBlock` no longer expires purely by wall clock.** The per-(session,
   tool) antecedent marker was refreshed only by a fresh call to the antecedent, so a
   session that ran the antecedent once had its "deny B after A" guarantee fail OPEN

@@ -508,15 +508,24 @@ func satAddU64(a, b uint64) uint64 {
 }
 
 // seedSeqPastOnDiskMax advances s.seq past the highest seq already on disk (base +
-// rotated siblings) so a chain that could not resume from its tail — a parse failure, an
-// HMAC mismatch, a retired/removed signing key, or an unreadable newer sibling — restarts
-// with a marker whose seq, and every record after it, is past every existing seq rather
-// than restarting at genesis and reissuing them (a duplicate-seq cascade audit-verify
-// cannot distinguish from tampering; the package's own scanSeqContribution comment calls a
-// duplicate "WORSE than a gap"). It deliberately leaves s.prevHMAC at genesis: the break
-// is real and audit-verify must see the prev_hmac discontinuity — only the seq counter is
-// advanced, monotonic and gap-detectable. A best-effort scan finding nothing leaves s.seq
-// unchanged (a genuinely unreadable log, already handled by the read-error seed path).
+// rotated siblings) so a chain that could not READ its tail — a write-only base, or a
+// newest rotated sibling that could not be opened — restarts with a marker whose seq,
+// and every record after it, is past every existing seq rather than restarting at genesis
+// and reissuing them (a duplicate-seq cascade audit-verify cannot distinguish from
+// tampering; the package's own scanSeqContribution comment calls a duplicate "WORSE than
+// a gap"). It deliberately leaves s.prevHMAC at genesis: the break is real and
+// audit-verify must see the prev_hmac discontinuity — only the seq counter is advanced,
+// monotonic and gap-detectable. A best-effort scan finding nothing leaves s.seq unchanged
+// (a genuinely unreadable log, already handled by the read-error seed path).
+//
+// It is deliberately NOT used by the paths where the tail WAS read but could not be
+// trusted — a parse failure, an HMAC mismatch, a retired key, an unsigned tail. Those
+// restart at genesis on purpose: the seqs on disk are then attacker-influenced (both the
+// tail's own seq and, since highestSeqAcrossChain parses every line without verifying
+// any, the maximum this function would find), so seeding from them would let a forged
+// record inflate the counter. Trusting no on-disk seq is the fail-closed direction; the
+// resulting duplicate seqs against the untrusted prefix are themselves a signal
+// audit-verify surfaces. See resumeChainFromTail and the threat model's §3.4.
 func (s *Sink) seedSeqPastOnDiskMax() {
 	if highest, ok := highestSeqAcrossChain(s.logPath); ok && highest > s.seq {
 		s.seq = highest
@@ -604,7 +613,11 @@ func (s *Sink) resumeChainFromTail(last string) tailResumeResult {
 	// the event for forensics.
 	s.seq = prev.Seq
 	s.prevHMAC = prev.HMAC
-	return tailResumeResult{tailSeq: prev.Seq}
+	// Zero value: the struct's tail fields exist to tell a forensic reader WHICH record
+	// a failure marker is about, and a clean resume writes no marker. Populating them
+	// here would invite a later success-path diagnostic to read a field that is only
+	// meaningful on the failure paths.
+	return tailResumeResult{}
 }
 
 // Open opens (or creates) the audit log and loads (or generates) the HMAC
@@ -771,37 +784,38 @@ func Open(logPath, keyPath string, rotateSizeBytes int64, retainRotated int, opt
 	// continue from. The tail_partial_write_recovered marker is independent of these
 	// (it concerns the dropped fragment, not the resumed record) and may fire alongside
 	// one of them.
-	// wroteMarker tracks whether any writeIntegrityMarker call below actually
-	// appended a line, so the fsync further down only pays for a startup that put
-	// something new on disk — a clean startup (the common case: no tail failure,
-	// no partial-write recovery) has nothing to durably flush
-	// that Close (or the drain goroutine's own debounced fsync, once real traffic
-	// arrives) won't cover anyway.
-	wroteMarker := false
+	// wroteMarker says whether any writeIntegrityMarker call below appended a line, so
+	// the fsync further down only pays for a startup that put something new on disk — a
+	// clean startup (the common case: no tail failure, no partial-write recovery) has
+	// nothing to durably flush that Close (or the drain goroutine's own debounced fsync,
+	// once real traffic arrives) won't cover anyway.
+	//
+	// DERIVED from the same conditions the branches below test, rather than assigned once
+	// per branch: a hand-maintained flag has to be remembered at every new marker site,
+	// and forgetting it silently skips the fsync — so a crash right after Open loses
+	// exactly the tamper-evidence marker that fsync exists to make durable, on a path no
+	// test exercises.
+	wroteMarker := chainResumeFailed || tailParseFailure ||
+		tailFailKind != tailFailNone || recoveredPartialBytes > 0
 	if chainResumeFailed {
 		s.writeIntegrityMarker("chain_resume_failed", map[string]interface{}{"reason": resumeFailReason})
-		wroteMarker = true
 	}
 	if tailParseFailure {
 		// tail_bytes records the length; the bytes are unparseable, so not embedded.
 		s.writeIntegrityMarker("tail_parse_failure", map[string]interface{}{"tail_bytes": tailParseBytes})
-		wroteMarker = true
 	}
 	switch tailFailKind {
 	case tailFailHMACMismatch:
 		// Carry the suspect record's seq and hmac so a forensic reader can locate it.
-		s.writeIntegrityMarker("tail_hmac_mismatch", map[string]interface{}{"tail_seq": tailSeq, "tail_hmac": tailHMAC})
-		wroteMarker = true
+		s.writeIntegrityMarker("tail_hmac_mismatch", map[string]interface{}{"claimed_tail_seq": tailSeq, "claimed_tail_hmac": tailHMAC})
 	case tailFailKeyUnknown:
 		// Distinct from tail_hmac_mismatch: this tail could not be verified because its
 		// signing key was retired, not because the HMAC failed to match a known key.
-		s.writeIntegrityMarker("tail_key_unknown", map[string]interface{}{"tail_seq": tailSeq, "tail_hmac": tailHMAC})
-		wroteMarker = true
+		s.writeIntegrityMarker("tail_key_unknown", map[string]interface{}{"claimed_tail_seq": tailSeq, "claimed_tail_hmac": tailHMAC})
 	case tailFailUnsigned:
 		// The tail carries no signature at all — a pre-signing log, or a stripped
 		// signature. Carry its seq so a forensic reader can locate the boundary.
-		s.writeIntegrityMarker("tail_unsigned", map[string]interface{}{"tail_seq": tailSeq})
-		wroteMarker = true
+		s.writeIntegrityMarker("tail_unsigned", map[string]interface{}{"claimed_tail_seq": tailSeq})
 	}
 	if recoveredPartialBytes > 0 {
 		// A partial trailing write was truncated above. Record the recovery so the
@@ -811,7 +825,6 @@ func Open(logPath, keyPath string, rotateSizeBytes int64, retainRotated int, opt
 		// the COMPLETE record the chain resumes from, so both can legitimately fire. It
 		// chains from the resumed tail like any appended record.
 		s.writeIntegrityMarker("tail_partial_write_recovered", map[string]interface{}{"recovered_bytes": recoveredPartialBytes})
-		wroteMarker = true
 	}
 
 	// Sync now, before returning, but only when a marker above actually wrote a
@@ -881,20 +894,20 @@ func (s *Sink) syntheticDenyMarker(code string, details map[string]interface{}) 
 // details:
 //
 //   - tail_hmac_mismatch: the prior tail failed HMAC verification against a known
-//     key; details carry tail_seq and tail_hmac so a forensic reader can locate
-//     the suspect record.
+//     key; details carry claimed_tail_seq and claimed_tail_hmac so a forensic reader
+//     can locate the suspect record.
 //   - tail_key_unknown: the prior tail names a key_id absent from the verification
 //     ring (the expected state right after a key rotation retired the signing
 //     key), so it could not be verified either way — distinct from
 //     tail_hmac_mismatch, which implies a known key rejected it. Details carry
-//     tail_seq and tail_hmac.
+//     claimed_tail_seq and claimed_tail_hmac.
 //   - tail_parse_failure: the prior tail did not parse as JSON; details carry
 //     tail_bytes (the bytes are unparseable, so not embedded).
 //   - chain_resume_failed: an I/O error prevented reading the prior tail; details
 //     carry the reason.
 //   - tail_unsigned: the prior tail carried no _hmac (a pre-signing log, or a
 //     stripped signature — indistinguishable, so both restart the chain); details
-//     carry tail_seq.
+//     carry claimed_tail_seq.
 //   - tail_partial_write_recovered: a partial (non-newline-terminated) trailing
 //     write was truncated so the next append starts clean; details carry
 //     recovered_bytes.
@@ -904,6 +917,14 @@ func (s *Sink) syntheticDenyMarker(code string, details map[string]interface{}) 
 // AUDIT_INTEGRITY_FAILURE deny shape (no new top-level field) and are chained and
 // signed like any record, so audit-verify and any external sink surface them —
 // evidence a transient stderr warning would lose to log rotation.
+//
+// The claimed_ prefix on the tail fields is deliberate and matches the convention the
+// transport layer applies to an unverified Mcp-Session-Id: every one of those values is
+// read from the record this writer just declared UNCERTIFIABLE, so it is whatever a
+// write-capable attacker put there. Signing it under a bare name would let anyone with
+// file access have eunox attest an arbitrary seq or hmac as fact — a SIEM rule keyed on
+// tail-seq discontinuities being the obvious target. The prefix keeps the forensic hint
+// while marking, in the record itself, that nothing vouches for it.
 func (s *Sink) writeIntegrityMarker(kind string, details map[string]interface{}) {
 	// Build a fresh map rather than mutating the caller's: the marker owns its
 	// Details, and a nil details must not panic on the "kind" assignment. "kind" is

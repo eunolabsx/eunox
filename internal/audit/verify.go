@@ -32,14 +32,6 @@ var errKeyIDNotInRing = errors.New("audit record key_id is not in the verificati
 // verdict (fail-closed), distinct from both INVALID and UNKNOWN_KEY_ID.
 var errUnidentifiedNoMatch = errors.New("audit record names no key_id and no ring key matched its HMAC")
 
-// errUnsignedRecord is returned by VerifyRecord for a record carrying no _hmac.
-// writeRecord signs unconditionally, so such a line is either pre-signing history or
-// a record whose signature was stripped — indistinguishable from the record alone,
-// and the second is the one edit a write-capable attacker can make without the key.
-// Both are refused: an unsigned record is never certifiable, so audit-verify counts
-// it INVALID and the writer refuses to chain onto it (see tailFailUnsigned).
-var errUnsignedRecord = errors.New("audit record carries no _hmac, so it cannot be verified (pre-signing history, or a stripped signature)")
-
 // errNonCanonicalRecord is returned by VerifyRecord's canonical-on-disk-form check;
 // see that check's comment in VerifyRecord for what it catches and why.
 var errNonCanonicalRecord = errors.New("signed audit record is not in canonical on-disk form: its bytes are not what the writer emits for these fields (a duplicate, re-spelled, or reordered key, an added zero-valued field, an alternate escape, or inserted whitespace) — the HMAC covers the record's fields, not its bytes, so a rewrite that decodes to the same fields is rejected here")
@@ -77,13 +69,15 @@ func (s *Sink) VerifyRecord(line []byte) (bool, error) {
 		return false, fmt.Errorf("trailing data after audit record")
 	}
 	storedHMAC := rec.HMAC
-	// An unsigned record cannot be verified, and treating one as merely "skipped"
-	// would let an attacker strip _hmac to dodge verification entirely. writeRecord
-	// signs every record it emits, so an HMAC-less line is either pre-signing history
-	// (move such a log aside before upgrading) or a stripped signature — neither is
-	// certifiable, so both fail closed here.
+	// Fail closed on an unsigned record rather than proceeding to a comparison against
+	// an empty MAC. Callers classify this shape before reaching here (see classify and
+	// resumeChainFromTail), so this is the backstop, not the primary path — it exists so
+	// a reordering of those pre-filters degrades to a plain refusal instead of a
+	// silently-passing verification. It is deliberately NOT a distinct sentinel: no
+	// caller branches on the reason, and an error value nothing reads reads as a
+	// distinction that is being made somewhere.
 	if storedHMAC == "" {
-		return false, errUnsignedRecord
+		return false, fmt.Errorf("audit record carries no _hmac, so it cannot be verified")
 	}
 	rec.HMAC = "" // zero before re-signing, matching Record()
 
@@ -166,12 +160,12 @@ func (s *Sink) VerifyRecord(line []byte) (bool, error) {
 // non-empty keyID absent from the ring returns errKeyIDNotInRing (fail-closed: no
 // key to try) so the caller reports UNKNOWN_KEY_ID rather than INVALID.
 func (s *Sink) keysToTry(keyID string) ([][]byte, error) {
-	// A nil receiver holds no keys, matching hasVerificationKey's nil tolerance. Both
-	// are reachable from the exported VerifyLog/VerifyLogFiles, whose verifier
-	// parameter a caller may legitimately leave nil (verify structure only, no
-	// signature check) — so the two must agree rather than one answering "no keys" and
-	// the other panicking. Returning no keys routes the record through VerifyRecord's
-	// "could not verify" branch, never its "tampered" one.
+	// A nil receiver holds no keys rather than panicking. That tolerance is
+	// load-bearing, not defensive: VerifyLog/VerifyLogFiles document a nil verifier as
+	// the structure-only mode (verify shape and chain, no signature check), and classify
+	// calls VerifyRecord unconditionally, so deleting this branch turns that documented
+	// call into a nil dereference. Returning no keys routes the record through
+	// VerifyRecord's "could not verify" branch, never its "tampered" one.
 	if s == nil {
 		return nil, nil
 	}
@@ -206,10 +200,15 @@ type VerifyResult struct {
 	Valid        int
 	Invalid      int
 	Skipped      int
-	UnknownKey   int    // records naming a key_id absent from the verification ring (retired-key state; not tampering)
-	Unverifiable int    // records naming NO key_id that no ring key matched (signing key unidentifiable; not provably tampering)
-	ChainBreaks  int    // prev_hmac mismatches or seq gaps between consecutive records
-	FirstSeq     uint64 // seq of the first record (0 when the log is empty)
+	UnknownKey   int // records naming a key_id absent from the verification ring (retired-key state; not tampering)
+	Unverifiable int // records naming NO key_id that no ring key matched (signing key unidentifiable; not provably tampering)
+	ChainBreaks  int // prev_hmac mismatches or seq gaps between consecutive records
+	// FirstSeq is the seq of the first record that entered the chain — i.e. the first
+	// SIGNED one. It is 0 for an empty log AND for a log that carries no signed record
+	// at all (every line unsigned: pre-signing history, or a wholesale unsigned
+	// forgery), so a consumer must read it together with Total/Invalid rather than
+	// treating 0 as "empty".
+	FirstSeq uint64
 }
 
 // OK reports whether the log passed: no HMAC failure, no chain break, and every record
@@ -273,6 +272,7 @@ func VerifyLog(r io.Reader, verifier *Sink, requestID string, since time.Time, o
 	if err := scanner.Err(); err != nil {
 		return v.res, err
 	}
+	v.reportSuppressedUnsigned()
 	return v.res, nil
 }
 
@@ -419,6 +419,9 @@ type auditChainVerifier struct {
 	havePrev bool
 	prevHMAC string
 	prevSeq  uint64
+	// unsignedSeen counts HMAC-less records so their per-record diagnostic can be capped
+	// at maxUnsignedDiagnostics; the Invalid tally in res is unaffected and stays exact.
+	unsignedSeen int
 	// prevRecordInvalid is set by classify ONLY when the previous record's HMAC was
 	// provably wrong under a held key (the !ok / err cases) — i.e. its content was
 	// modified while its stored _hmac was left intact. updateChain stores rec.HMAC
@@ -430,6 +433,14 @@ type auditChainVerifier struct {
 	// chains correctly — flagging those would mislabel a routine rotation as tampering.
 	prevRecordInvalid bool
 }
+
+// maxUnsignedDiagnostics bounds how many per-record "unsigned record" lines a single
+// verify pass prints. A log with a pre-signing prefix produces one per record, and an
+// unbounded stream of them buries the CHAIN BREAK / INVALID findings the tool exists to
+// surface — the practical result being an operator who suppresses the whole check. Sized
+// to show enough to recognize the shape while leaving the output readable; the exact
+// count always survives in VerifyResult.Invalid and in the closing summary line.
+const maxUnsignedDiagnostics = 10
 
 // decodeAuditRecord decodes one line into an auditRecord, reporting whether it was
 // well-formed JSON with no trailing data. UseNumber gives parity with VerifyRecord
@@ -452,10 +463,11 @@ func decodeAuditRecord(line []byte) (auditRecord, bool) {
 // stripped by a write-capable attacker without the key. Neither can be certified, so
 // callers treat both as INVALID and keep them out of the chain state.
 //
-// Single source of truth for this discriminator — processLine's chain-state gate and
-// classify's rejection both route through it rather than re-deriving the comparison,
-// so a future change to what a signed record looks like (an added decoy shape, a
-// different empty sentinel) has one place to update.
+// Single source of truth for this discriminator: BOTH shapes processLine derives —
+// the unsigned gate and the seq-0 decoy gate — are expressed in terms of this
+// function rather than re-deriving `rec.HMAC != ""`, so a future change to what a
+// signed record looks like (an added decoy shape, a different empty sentinel) has one
+// place to update and the two gates cannot end up disagreeing about the same record.
 func isSignedRecord(rec auditRecord) bool {
 	return rec.HMAC != ""
 }
@@ -480,7 +492,10 @@ func (v *auditChainVerifier) processLine(line []byte) {
 	// hottest piece of decoy rejection in exchange for a state that cannot occur: an
 	// attacker only had to place their seq-0 decoy at the head of a stream, or after a
 	// record claiming seq MaxUint64, to skip this check entirely.
-	forgedSeq0 := rec.Seq == 0 && rec.HMAC != ""
+	// Derived from `unsigned` below rather than re-testing rec.HMAC, so the two gates
+	// share one definition of "signed" (see isSignedRecord).
+	unsigned := !isSignedRecord(rec)
+	forgedSeq0 := rec.Seq == 0 && !unsigned
 	// An HMAC-less record is never one this writer produced (writeRecord signs
 	// unconditionally): it is pre-signing history, or a signature a write-capable
 	// attacker stripped — the one edit possible without the key. Both are INVALID, and
@@ -489,8 +504,7 @@ func (v *auditChainVerifier) processLine(line []byte) {
 	// prev_hmac="" and the seq-gap check is suppressed). No seq shape is exempt: a
 	// pre-signing record can carry any stale seq inherited from before the chain
 	// existed, and none of them is certifiable.
-	unsigned := !isSignedRecord(rec)
-
+	//
 	// Chain verification runs over every decodable record (except the decoys above),
 	// independent of the filter; the reporting filter is applied only afterward.
 	// prev_hmac linkage and seq contiguity are checked as separate ifs, not switch
@@ -560,6 +574,20 @@ func (v *auditChainVerifier) updateChain(rec auditRecord) {
 	v.prevSeq = rec.Seq
 }
 
+// reportSuppressedUnsigned prints the one-line tail summary for unsigned records whose
+// individual diagnostics were capped (see maxUnsignedDiagnostics). It names the total so
+// the elided lines are accounted for rather than silently dropped — the same posture the
+// pre-session record limiter takes with suppressed_count — and repeats the remedy, since
+// a log in this state is one an operator has to act on rather than re-run.
+func (v *auditChainVerifier) reportSuppressedUnsigned() {
+	if v.unsignedSeen <= maxUnsignedDiagnostics {
+		return
+	}
+	_, _ = fmt.Fprintf(v.out,
+		"INVALID  %d unsigned record(s) in total (%d diagnostics elided): none carries an _hmac, so none can be verified. Pre-signing history must be moved aside before upgrading; otherwise reconcile against your external sink.\n",
+		v.unsignedSeen, v.unsignedSeen-maxUnsignedDiagnostics)
+}
+
 // classify counts and reports the record's verification outcome: malformed,
 // forged decoy, unsigned, or HMAC-verified (valid/invalid/skipped per the filter).
 func (v *auditChainVerifier) classify(line []byte, rec auditRecord, unmarshalOK, forgedSeq0, unsigned bool) {
@@ -589,9 +617,22 @@ func (v *auditChainVerifier) classify(line []byte, rec auditRecord, unmarshalOK,
 	// such a log aside before upgrading rather than expecting it to certify.
 	// (unsigned is computed in processLine so classify stays a pure function of its
 	// inputs.)
+	//
+	// The per-record diagnostic is CAPPED. A pre-signing log is precisely the case that
+	// produces one of these per line, and an unbounded stream of them — a 1M-record log
+	// emits well over a hundred megabytes — buries the genuine CHAIN BREAK or INVALID
+	// findings an operator is reading for, which is how a fail-closed check ends up
+	// suppressed with `|| true`. The Invalid COUNT stays exact; only the printing is
+	// bounded, and the tail is summarized once at the end (see reportSuppressedUnsigned).
 	if unsigned {
 		v.res.Invalid++
-		_, _ = fmt.Fprintf(v.out, "INVALID  record %d: unsigned record (seq=%d) carries no _hmac, so it cannot be verified (pre-signing history, or a stripped signature)\n", v.res.Total, rec.Seq)
+		v.unsignedSeen++
+		switch {
+		case v.unsignedSeen <= maxUnsignedDiagnostics:
+			_, _ = fmt.Fprintf(v.out, "INVALID  record %d: unsigned record (seq=%d) carries no _hmac, so it cannot be verified (pre-signing history, or a stripped signature)\n", v.res.Total, rec.Seq)
+		case v.unsignedSeen == maxUnsignedDiagnostics+1:
+			_, _ = fmt.Fprintf(v.out, "INVALID  ... further unsigned records reported once at the end rather than one line each\n")
+		}
 		return
 	}
 

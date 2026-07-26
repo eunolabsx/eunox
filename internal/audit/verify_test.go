@@ -385,11 +385,11 @@ func TestOpenAuditSink_WritesIntegrityMarkerOnTamperedTail(t *testing.T) {
 		t.Fatalf("marker Details[kind] = %v, want tail_hmac_mismatch", got)
 	}
 	// JSON numbers decode to float64.
-	if got, ok := markerDetails["tail_seq"].(float64); !ok || got != 2 {
-		t.Fatalf("marker Details[tail_seq] = %v, want 2", markerDetails["tail_seq"])
+	if got, ok := markerDetails["claimed_tail_seq"].(float64); !ok || got != 2 {
+		t.Fatalf("marker Details[claimed_tail_seq] = %v, want 2", markerDetails["claimed_tail_seq"])
 	}
-	if got := markerDetails["tail_hmac"]; got != tamperedHMAC {
-		t.Fatalf("marker Details[tail_hmac] = %v, want the suspect tail hmac %q", got, tamperedHMAC)
+	if got := markerDetails["claimed_tail_hmac"]; got != tamperedHMAC {
+		t.Fatalf("marker Details[claimed_tail_hmac] = %v, want the suspect tail hmac %q", got, tamperedHMAC)
 	}
 
 	// The marker is itself a properly signed record (its own _hmac verifies), so it
@@ -547,8 +547,8 @@ func TestOpenAuditSink_IntegrityFailedTail_DoesNotInheritAttackerSeq(t *testing.
 	}
 	// The suspect values are still preserved inside the marker for forensics.
 	markerDetails := recordDetails(t, marker)
-	if got, ok := markerDetails["tail_seq"].(float64); !ok || got != attackerSeq {
-		t.Fatalf("marker Details[tail_seq] = %v, want the forensic record of the suspect seq %d", markerDetails["tail_seq"], attackerSeq)
+	if got, ok := markerDetails["claimed_tail_seq"].(float64); !ok || got != attackerSeq {
+		t.Fatalf("marker Details[claimed_tail_seq] = %v, want the forensic record of the suspect seq %d", markerDetails["claimed_tail_seq"], attackerSeq)
 	}
 }
 
@@ -898,7 +898,7 @@ func TestVerifyAuditLog_ForgedEmptyPrevSeq1_IsChainBreak(t *testing.T) {
 		RequestID:  "marker",
 		Decision:   "deny",
 		DenialCode: auditIntegrityFailureCode,
-		Details:    json.RawMessage(`{"kind":"tail_unsigned","tail_seq":0}`),
+		Details:    json.RawMessage(`{"kind":"tail_unsigned","claimed_tail_seq":0}`),
 		PrevHMAC:   "",
 	})
 	res2 := verifyBytes(t, [][]byte{marker}, verifierFor(t, keyPath))
@@ -2215,5 +2215,65 @@ func TestTruncatePartialTail_ReReadFailureFailsClosed(t *testing.T) {
 
 	if _, err := tailLineFromWindow(f, window, start, int64(len(content)), winSize); !errors.Is(err, errAuditTailProbe) {
 		t.Fatalf("error = %v, want it to wrap errAuditTailProbe (a re-read we cannot complete is not a clean tail)", err)
+	}
+}
+
+// TestVerifyLog_CapsUnsignedDiagnostics pins that a pre-signing log does not flood the
+// output with one line per record. The Invalid COUNT must stay exact — the verdict is
+// what fails the log — while the per-record diagnostics are capped and the remainder
+// summarized once, so a genuine CHAIN BREAK elsewhere in the same run stays findable
+// instead of being buried under thousands of identical lines.
+func TestVerifyLog_CapsUnsignedDiagnostics(t *testing.T) {
+	t.Parallel()
+	const n = maxUnsignedDiagnostics + 25
+	lines := make([][]byte, 0, n)
+	for i := 0; i < n; i++ {
+		lines = append(lines, []byte(fmt.Sprintf(
+			`{"time":"2026-06-15T10:00:00Z","request_id":"r%d","session_id":"s","target":"tool:exec","decision":"allow"}`, i)))
+	}
+
+	var out strings.Builder
+	res, err := VerifyLog(bytes.NewReader(bytes.Join(lines, []byte("\n"))), &Sink{}, "", time.Time{}, &out)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if res.Invalid != n {
+		t.Fatalf("Invalid = %d, want %d: capping the diagnostics must not change the tally", res.Invalid, n)
+	}
+	if res.OK() {
+		t.Error("a log with no signed record must fail the verdict")
+	}
+
+	perRecord := strings.Count(out.String(), "carries no _hmac, so it cannot be verified")
+	if perRecord > maxUnsignedDiagnostics {
+		t.Errorf("printed %d per-record unsigned diagnostics, want at most %d", perRecord, maxUnsignedDiagnostics)
+	}
+	// The elided records must still be accounted for, with the true total.
+	if !strings.Contains(out.String(), fmt.Sprintf("%d unsigned record(s) in total", n)) {
+		t.Errorf("expected a closing summary naming all %d unsigned records, got:\n%s", n, out.String())
+	}
+	if !strings.Contains(out.String(), "diagnostics elided") {
+		t.Errorf("the summary must say how many diagnostics were suppressed, got:\n%s", out.String())
+	}
+}
+
+// TestVerifyLog_UnsignedDiagnosticsUncappedBelowLimit guards the other side: a handful of
+// unsigned records — the realistic tamper case, as opposed to a whole pre-signing log —
+// must still be reported individually, with no summary line implying anything was hidden.
+func TestVerifyLog_UnsignedDiagnosticsUncappedBelowLimit(t *testing.T) {
+	t.Parallel()
+	lines := [][]byte{
+		[]byte(`{"time":"2026-06-15T10:00:00Z","request_id":"a","session_id":"s","target":"tool:exec","decision":"allow"}`),
+		[]byte(`{"time":"2026-06-15T10:00:01Z","request_id":"b","session_id":"s","target":"tool:exec","decision":"allow"}`),
+	}
+	var out strings.Builder
+	if _, err := VerifyLog(bytes.NewReader(bytes.Join(lines, []byte("\n"))), &Sink{}, "", time.Time{}, &out); err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if got := strings.Count(out.String(), "carries no _hmac"); got != 2 {
+		t.Errorf("printed %d diagnostics, want one per record (2)", got)
+	}
+	if strings.Contains(out.String(), "diagnostics elided") {
+		t.Errorf("nothing was suppressed, so no summary line should appear:\n%s", out.String())
 	}
 }
