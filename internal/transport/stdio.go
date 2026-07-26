@@ -259,20 +259,8 @@ func NewStdioProxy(opts StdioProxyOptions) *StdioProxy {
 		byUpstreamID:          make(map[string]chan upstreamResult),
 		hostToUp:              make(map[string]*json.RawMessage),
 		hostReader:            mcp.NewMsgReader(os.Stdin),
+		hostWriter:            mcp.NewMsgWriter(os.Stdout),
 	}
-	// The host stdout writer carries a poison hook, not just a bare NewMsgWriter. Its
-	// writes are fire-and-forget at every call site (a dropped host reply has nowhere to
-	// return an error to), so without a hook a single partial write latches the writer and
-	// the proxy goes on enforcing policy and forwarding calls upstream while every
-	// response is silently discarded: real side effects, no replies, no diagnostic. No
-	// deadline is armed on it — a slow host is not a policy failure, and stdout may not be
-	// a pollable pipe — so this covers only the desync case. Tearing the upstream down is
-	// the same teardown the upstream writer's own hook performs: readUpstream EOFs, the
-	// serve loop unblocks, and the process exits instead of running on deaf.
-	p.hostWriter = mcp.NewMsgWriterWithPoisonHook(os.Stdout, func() {
-		fmt.Fprintf(os.Stderr, "[eunox] FATAL: host stdout framing desynced (partial write); tearing down the upstream — no further responses can be delivered.\n")
-		p.killUpstream()
-	})
 	if opts.SerializeDecisions {
 		p.decideGate = newDecisionSerializer()
 	}
@@ -310,6 +298,20 @@ func (p *StdioProxy) rec() auditRecorder {
 // Start runs the proxy until the host closes stdin or the upstream exits.
 // It returns when the session ends.
 func (p *StdioProxy) Start(ctx context.Context) error {
+	// Arm the host stdout writer's desync teardown before anything can write to it.
+	// Its writes are fire-and-forget at every call site (a dropped host reply has nowhere
+	// to return an error to), so without a hook a single partial write latches the writer
+	// and the proxy goes on enforcing policy and forwarding calls upstream while every
+	// response is silently discarded: real side effects, no replies, no diagnostic. No
+	// deadline is armed on it — a slow host is not a policy failure, and stdout may not be
+	// a pollable pipe — so this covers only the desync case. Wired here rather than in the
+	// constructor so the teardown it performs sits on a context-carrying path, like every
+	// other killUpstream call site.
+	//nolint:contextcheck // teardown path: the upstream session-termination DELETE intentionally uses a detached, bounded background context — this hook fires from inside a framed write, which carries no request context (same rule as the killUpstream call sites below).
+	p.hostWriter.SetPoisonHook(func() {
+		fmt.Fprintf(os.Stderr, "[eunox] FATAL: host stdout framing desynced (partial write); tearing down the upstream — no further responses can be delivered.\n")
+		p.killUpstream()
+	})
 	// ── 1. Connect to upstream (subprocess or remote HTTP) ─────────────────────
 	if err := p.connectUpstream(ctx); err != nil {
 		return err

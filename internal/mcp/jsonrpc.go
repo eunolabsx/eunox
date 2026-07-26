@@ -557,20 +557,30 @@ type MsgWriter struct {
 
 // NewMsgWriter returns a MsgWriter that frames messages onto w, with no per-write
 // deadline (writes block until the underlying writer accepts them) and no poison hook.
-// Use it only where the caller INSPECTS the returned error — a writer with no hook has
-// nothing to tear the stream down, so a poisoned one fails every later write silently at
-// any call site that discards the error. Where the stream's owner needs to react, use
-// NewMsgWriterWithPoisonHook (no deadline) or NewMsgWriterWithTimeout (bounded writes).
+// Use it as-is only where the caller INSPECTS the returned error — a writer with no hook
+// has nothing to tear the stream down, so a poisoned one fails every later write silently
+// at any call site that discards the error. Where the stream's owner needs to react, add
+// one with SetPoisonHook, or use NewMsgWriterWithTimeout for bounded writes.
 func NewMsgWriter(w io.Writer) *MsgWriter { return &MsgWriter{w: w} }
 
-// NewMsgWriterWithPoisonHook returns a MsgWriter with no per-write deadline but WITH a
-// teardown hook, for a stream that cannot be bounded by a deadline yet still must not be
-// left silently dead once its framing desyncs — the stdio host's stdout, whose writes are
+// SetPoisonHook installs (or replaces) the teardown hook on an already-constructed
+// writer, for a stream that cannot be bounded by a deadline yet still must not be left
+// silently dead once its framing desyncs — the stdio host's stdout, whose writes are
 // fire-and-forget at every call site. Without a hook a single partial write there latches
 // the writer and the proxy goes on enforcing policy and forwarding calls upstream while
 // every response is dropped: real side effects, no replies, no diagnostic.
-func NewMsgWriterWithPoisonHook(w io.Writer, onPoison func()) *MsgWriter {
-	return &MsgWriter{w: w, onPoison: onPoison}
+//
+// Separate from construction because the owner that performs the teardown is not always
+// available when the writer is built: the stdio host writer's hook kills the upstream, so
+// it is wired from Start (a context-carrying path) rather than the proxy constructor.
+//
+// Installing a hook on an ALREADY-poisoned writer does not retroactively fire it. The
+// hook reacts to the transition, and a caller arriving after it has, by definition, not
+// been watching; every later Write still fails fast with the latched cause.
+func (mw *MsgWriter) SetPoisonHook(onPoison func()) {
+	mw.mu.Lock()
+	defer mw.mu.Unlock()
+	mw.onPoison = onPoison
 }
 
 // NewMsgWriterWithTimeout returns a MsgWriter that bounds each write by timeout when the

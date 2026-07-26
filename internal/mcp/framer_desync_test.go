@@ -153,17 +153,40 @@ func TestMsgWriter_DeadlinePoisonKeepsTimeoutSentinel(t *testing.T) {
 }
 
 // TestMsgWriter_PoisonHookWithoutDeadline pins that a hookless-but-poisonable writer is
-// not how the stdio host stream is built: NewMsgWriterWithPoisonHook gives an unbounded
-// writer an owner, so a desync on a stream whose writes are fire-and-forget still tears
-// something down instead of dropping every later message in silence.
+// not how the stdio host stream is built: SetPoisonHook gives an unbounded writer an
+// owner, so a desync on a stream whose writes are fire-and-forget still tears something
+// down instead of dropping every later message in silence.
 func TestMsgWriter_PoisonHookWithoutDeadline(t *testing.T) {
 	t.Parallel()
 	var fired atomic.Int32
-	mw := NewMsgWriterWithPoisonHook(&shortWriter{accept: 4, err: syscall.EPIPE}, func() { fired.Add(1) })
+	mw := NewMsgWriter(&shortWriter{accept: 4, err: syscall.EPIPE})
+	mw.SetPoisonHook(func() { fired.Add(1) })
 
 	_ = mw.Write(RPCMsg{JSONRPC: "2.0", Method: "tools/call"})
 	_ = mw.Write(RPCMsg{JSONRPC: "2.0", Method: "tools/call"})
 	if got := fired.Load(); got != 1 {
 		t.Errorf("onPoison fired %d times, want exactly 1 on the poison transition", got)
+	}
+}
+
+// TestMsgWriter_SetPoisonHookOnAlreadyPoisonedWriterDoesNotFire pins the documented
+// boundary: a hook installed after the stream already desynced does not fire
+// retroactively. Firing it would run a teardown for a transition its owner never
+// observed — and on the stdio host path that teardown kills the upstream. The writer must
+// still refuse every later write with the latched cause.
+func TestMsgWriter_SetPoisonHookOnAlreadyPoisonedWriterDoesNotFire(t *testing.T) {
+	t.Parallel()
+	var fired atomic.Int32
+	mw := NewMsgWriter(&shortWriter{accept: 4, err: syscall.EPIPE})
+
+	if err := mw.Write(RPCMsg{JSONRPC: "2.0", Method: "tools/call"}); !errors.Is(err, ErrFrameDesync) {
+		t.Fatalf("first write err = %v, want ErrFrameDesync", err)
+	}
+	mw.SetPoisonHook(func() { fired.Add(1) })
+	if err := mw.Write(RPCMsg{JSONRPC: "2.0", Method: "tools/call"}); !errors.Is(err, ErrFrameDesync) {
+		t.Errorf("write after late hook install = %v, want the latched ErrFrameDesync", err)
+	}
+	if got := fired.Load(); got != 0 {
+		t.Errorf("onPoison fired %d times for a transition that predates it, want 0", got)
 	}
 }
