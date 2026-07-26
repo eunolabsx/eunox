@@ -543,7 +543,7 @@ func TestLoadUpstreamPDP_SamplingOptInOnHTTPUpstreamRejected(t *testing.T) {
 // TestStartupFatalManifestCheck_DirectlyAgainstAlreadyMergedManifest is a
 // regression for the doctor/validate reuse seam: a caller that already loaded and
 // merged a route's manifests (as doctor's writeDoctorManifests and validate's
-// validateConfigRoutes now do) must be able to call StartupFatalManifestCheck
+// validateConfigRoutes now do) must be able to call startupFatalManifestCheck
 // directly against that merged result — without re-parsing/re-merging the
 // manifest files a second time via LoadUpstreamPDP — and get the identical
 // startup-fatal verdict LoadUpstreamPDP would compute inline.
@@ -554,7 +554,7 @@ func TestStartupFatalManifestCheck_DirectlyAgainstAlreadyMergedManifest(t *testi
 		t.Parallel()
 		u := &config.UpstreamConfig{Name: "fs", Transport: "stdio", ExpectVersion: "2.0.0"}
 		merged := &config.LocalManifest{Version: "1.0.0"}
-		err := StartupFatalManifestCheck(u, config.HostTransportStdio, merged)
+		err := startupFatalManifestCheck(u, config.HostTransportStdio, merged)
 		if err == nil {
 			t.Fatal("expectVersion mismatch must fail closed")
 		}
@@ -567,7 +567,7 @@ func TestStartupFatalManifestCheck_DirectlyAgainstAlreadyMergedManifest(t *testi
 		t.Parallel()
 		u := &config.UpstreamConfig{Name: "fs", Transport: "stdio", ExpectVersion: "1.0.0"}
 		merged := &config.LocalManifest{Version: "1.0.0"}
-		if err := StartupFatalManifestCheck(u, config.HostTransportStdio, merged); err != nil {
+		if err := startupFatalManifestCheck(u, config.HostTransportStdio, merged); err != nil {
 			t.Errorf("expectVersion match should pass, got: %v", err)
 		}
 	})
@@ -582,7 +582,7 @@ func TestStartupFatalManifestCheck_DirectlyAgainstAlreadyMergedManifest(t *testi
 			t.Fatalf("LoadManifest: %v", err)
 		}
 		u := &config.UpstreamConfig{Name: "remote", Transport: config.HostTransportHTTP}
-		if err := StartupFatalManifestCheck(u, config.HostTransportHTTP, loaded); err == nil {
+		if err := startupFatalManifestCheck(u, config.HostTransportHTTP, loaded); err == nil {
 			t.Fatal("a sampling opt-in on an http upstream must fail closed")
 		} else if !strings.Contains(err.Error(), "sampling") {
 			t.Errorf("error = %q, want it to mention sampling", err.Error())
@@ -593,7 +593,7 @@ func TestStartupFatalManifestCheck_DirectlyAgainstAlreadyMergedManifest(t *testi
 		t.Parallel()
 		u := &config.UpstreamConfig{Name: "fs", Transport: "stdio"}
 		merged := &config.LocalManifest{Version: "1.0.0"}
-		if err := StartupFatalManifestCheck(u, config.HostTransportStdio, merged); err != nil {
+		if err := startupFatalManifestCheck(u, config.HostTransportStdio, merged); err != nil {
 			t.Errorf("clean manifest/upstream pair should pass, got: %v", err)
 		}
 	})
@@ -602,7 +602,7 @@ func TestStartupFatalManifestCheck_DirectlyAgainstAlreadyMergedManifest(t *testi
 		t.Parallel()
 		u := &config.UpstreamConfig{Name: "fs", Transport: "stdio"}
 		merged := &config.LocalManifest{Version: "1.0.0", Audience: "some-aud"}
-		err := StartupFatalManifestCheck(u, config.HostTransportStdio, merged)
+		err := startupFatalManifestCheck(u, config.HostTransportStdio, merged)
 		if err == nil {
 			t.Fatal("an audience pin on a stdio host must fail closed")
 		}
@@ -615,7 +615,7 @@ func TestStartupFatalManifestCheck_DirectlyAgainstAlreadyMergedManifest(t *testi
 		t.Parallel()
 		u := &config.UpstreamConfig{Name: "fs", Transport: "stdio"}
 		merged := &config.LocalManifest{Version: "1.0.0", Audience: "some-aud"}
-		if err := StartupFatalManifestCheck(u, config.HostTransportHTTP, merged); err != nil {
+		if err := startupFatalManifestCheck(u, config.HostTransportHTTP, merged); err != nil {
 			t.Errorf("an audience pin on an http gateway host should pass, got: %v", err)
 		}
 	})

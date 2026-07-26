@@ -238,7 +238,7 @@ func (h *httpUpstream) post(ctx context.Context, msg mcp.RPCMsg) {
 		// code. bound=0: the POST already carried the per-call --upstream-timeout
 		// deadline, so no separate bound applies here; a deadline expiry is attributed to
 		// the request deadline.
-		if h.reportErr != nil && msg.ID != nil && h.reportErr(mcp.MsgKey(msg.ID), err) {
+		if h.reportErr != nil && h.reportErr(mcp.MsgKey(msg.ID), err) {
 			return
 		}
 		_, reason, rpcCode := upstreamErrInfo(err, 0)
@@ -250,7 +250,7 @@ func (h *httpUpstream) post(ctx context.Context, msg mcp.RPCMsg) {
 		// Accepted to a request is turned into a non-nil error by DoMCPHTTP and taken
 		// by the err != nil arm above, so it never reaches here.) Surface what was
 		// actually observed instead of forwarding an empty result to the host.
-		resp = mcp.ErrorResponse(msg.ID, -32603, "upstream returned an empty or non-JSON-RPC response for request "+msg.Method+" (expected a JSON-RPC result or error)")
+		resp = mcp.ErrorResponse(msg.ID, jsonRPCCodeInternalError, "upstream returned an empty or non-JSON-RPC response for request "+msg.Method+" (expected a JSON-RPC result or error)")
 	default:
 		// Correlate by shape via the shared rule. A non-response reply — e.g. one
 		// carrying a `method` field, request/notification shape — must NEVER enter
@@ -263,7 +263,7 @@ func (h *httpUpstream) post(ctx context.Context, msg mcp.RPCMsg) {
 		// inject one caller's error into another's reply. On any refusal, unblock the caller
 		// with an error for THIS request instead of forwarding the bad reply onto `incoming`.
 		if correlated, cerr := correlateUpstreamReply(msg, resp); cerr != nil {
-			resp = mcp.ErrorResponse(msg.ID, -32603, cerr.Error())
+			resp = mcp.ErrorResponse(msg.ID, jsonRPCCodeInternalError, cerr.Error())
 		} else {
 			resp = correlated
 		}

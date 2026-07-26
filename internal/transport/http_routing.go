@@ -238,10 +238,11 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 			writeJSONMsg(w, denied)
 			return
 		}
-		// Cheap pre-spawn capacity check so a full proxy refuses a new session without
-		// starting an upstream. registerSession re-checks under the lock to make the
-		// cap authoritative against concurrent initializes.
-		if p.atSessionCap() {
+		// Pre-spawn capacity RESERVATION, not just a check: the slot is taken now and held
+		// across establishment, so concurrent initializes cannot all pass a registry-only
+		// check and each spawn an upstream before any of them registers (see
+		// tryReserveSessionSlot). The defer below drops it on every path.
+		if !p.tryReserveSessionSlot() {
 			// Recorded for the same reason as the errSessionLimit leg of
 			// writeSessionCreateError: this is the cheap pre-spawn twin of that refusal and
 			// the surface an unauthenticated saturation flood reaches first.
@@ -252,6 +253,13 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 			http.Error(w, "session limit reached", http.StatusServiceUnavailable)
 			return
 		}
+		// Released unconditionally when this handler returns — success included. The
+		// reservation covers ESTABLISHMENT, and establishment is over either way by then;
+		// a registered session is bounded from that point by the registry itself. One
+		// owner, one release: letting registerSession convert the reservation on success
+		// instead would double-free it on any failure AFTER registration (the drift
+		// refusal is one) and hand the freed slot to a concurrently establishing session.
+		defer p.releaseSessionSlot()
 		// Session establishment (initialize handshake + drift tools/list probe) runs
 		// under sessionStartTimeout, independent of --upstream-timeout. Cover the larger
 		// of the two budgets so the write deadline set above can't fire mid-handshake

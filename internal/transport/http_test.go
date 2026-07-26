@@ -19,6 +19,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -4876,6 +4877,29 @@ func TestUpstreamErrInfo(t *testing.T) {
 		// response body, which must not be disclosed to the MCP host.
 		{"generic upstream failure", errors.New("pipe broke"), 100, "UPSTREAM_ERROR", "upstream error", -32603},
 		{"upstream url in error", errors.New(`Post "https://internal.svc:8443/mcp": dial tcp: refused`), 100, "UPSTREAM_ERROR", "upstream error", -32603},
+		// A partial frame from a NON-deadline cause must NOT be classified as a timeout:
+		// the upstream crashed mid-write, so "did not respond within 100 ms" would be a
+		// fabricated duration on the tape and would send the operator to raise
+		// --upstream-timeout for a failure no deadline caused.
+		{
+			"partial frame from a crashed upstream",
+			fmt.Errorf("%w: 4 of 62 bytes: %w", mcp.ErrFrameDesync, syscall.EPIPE),
+			100, "UPSTREAM_ERROR", "upstream connection failed", -32603,
+		},
+		// With --upstream-timeout=0 the timeout wording would cite a deadline that does
+		// not exist at all.
+		{
+			"partial frame with no configured timeout",
+			fmt.Errorf("%w: 4 of 62 bytes: %w", mcp.ErrFrameDesync, syscall.EPIPE),
+			0, "UPSTREAM_ERROR", "upstream connection failed", -32603,
+		},
+		// The deadline sentinel keeps its timeout classification — the two must stay
+		// distinguishable, which is the whole reason ErrFrameDesync is a separate error.
+		{
+			"write deadline still classifies as a timeout",
+			fmt.Errorf("%w: deadline", mcp.ErrUpstreamWriteTimeout),
+			100, "UPSTREAM_TIMEOUT", "upstream did not respond within 100 ms", -32603,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -222,17 +222,18 @@ func correlateUpstreamReply(req, resp mcp.RPCMsg) (mcp.RPCMsg, error) {
 	return resp, nil
 }
 
-// BuildInitializeParams marshals the initialize params the proxy sends to every
+// buildInitializeParams marshals the initialize params the proxy sends to every
 // upstream: it advertises no capabilities of its own and stamps clientInfo with the
-// proxy name and build version. Exported (like ApplyInitializeResult) so the CLI's
-// live-upstream probe sends the identical handshake as the running proxy rather than
-// maintaining its own copy that could silently drift from it.
-func BuildInitializeParams() json.RawMessage {
+// proxy name and build version. Package-internal: the CLI's live-upstream probe reaches
+// this through BuildInitializeRequestWithID (the whole message), not through the params
+// alone, so the handshake stays identical to the running proxy's without a second
+// exported spelling of it.
+func buildInitializeParams() json.RawMessage {
 	params, _ := json.Marshal(map[string]interface{}{
 		"protocolVersion": MCPProtocolVersion,
 		"capabilities":    map[string]interface{}{},
 		"clientInfo": map[string]interface{}{
-			"name":    ProxyName,
+			"name":    proxyName,
 			"version": proxyVersion,
 		},
 	})
@@ -246,7 +247,7 @@ func BuildInitializeParams() json.RawMessage {
 // capabilities entry). Both the id-derived proxy handshake below and the CLI probes flow
 // through this one builder.
 func BuildInitializeRequestWithID(id *json.RawMessage) mcp.RPCMsg {
-	return mcp.RPCMsg{JSONRPC: "2.0", ID: id, Method: "initialize", Params: BuildInitializeParams()}
+	return mcp.RPCMsg{JSONRPC: "2.0", ID: id, Method: "initialize", Params: buildInitializeParams()}
 }
 
 // buildInitializeRequest constructs the MCP `initialize` request the proxy sends
@@ -277,14 +278,14 @@ func buildInitializeResponse(id *json.RawMessage, caps map[string]interface{}, i
 		ProtocolVersion: MCPProtocolVersion,
 		Capabilities:    caps,
 		ServerInfo: map[string]interface{}{
-			"name":    ProxyName,
+			"name":    proxyName,
 			"version": proxyVersion,
 		},
 		Instructions: instructions,
 	}
 	resp, err := mcp.SuccessResponse(id, result)
 	if err != nil {
-		return mcp.ErrorResponse(id, -32603, "internal error building initialize response")
+		return mcp.ErrorResponse(id, jsonRPCCodeInternalError, "internal error building initialize response")
 	}
 	return resp
 }

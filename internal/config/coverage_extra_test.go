@@ -660,8 +660,14 @@ func TestGatewayConfig_ValidateAcceptsWellFormedHTTP(t *testing.T) {
 
 // LoadGatewayConfig parses an http gateway config end to end and expands env
 // references in string-typed fields (auth token and upstream auth header),
-// leaving an unset reference intact. This exercises the env-expansion walk over
+// leaving an unset BARE reference intact. This exercises the env-expansion walk over
 // the decoded tree and the http transport branch through the file loader.
+//
+// The unset reference here is deliberately the bare "$VAR" spelling: command/args are
+// subprocess argv, where a bare "$word" is ordinary literal text, so only the
+// unambiguous braced "${VAR}" form is a load-time failure (failOnUnsetBracedEnvRef).
+// This pins that boundary — the bare form still survives expansion untouched rather
+// than being blanked.
 func TestLoadGatewayConfig_HTTPTransportWithEnvExpansion(t *testing.T) {
 	t.Setenv("EUNOX_TEST_GW_TOKEN", "tok-123")
 	t.Setenv("EUNOX_TEST_STRIPE_KEY", "sk-live")
@@ -681,7 +687,7 @@ upstreams:
     policy: ["stripe.yaml"]
   - name: fs
     transport: stdio
-    command: ${EUNOX_TEST_GW_UNSET}
+    command: $EUNOX_TEST_GW_UNSET
     args: ["-y", "srv"]
     policy: ["fs.yaml"]
 `))
@@ -694,8 +700,8 @@ upstreams:
 	if got := cfg.Upstreams[0].UpstreamAuthHeader; got != "Authorization: Bearer sk-live" {
 		t.Errorf("upstreamAuthHeader = %q, want the key expanded", got)
 	}
-	// An unset reference is left intact (fail closed), never blanked.
-	if got := cfg.Upstreams[1].Command; got != "${EUNOX_TEST_GW_UNSET}" {
+	// An unset reference is left intact, never blanked into an empty command.
+	if got := cfg.Upstreams[1].Command; got != "$EUNOX_TEST_GW_UNSET" {
 		t.Errorf("unset ref command = %q, want the literal reference preserved", got)
 	}
 }

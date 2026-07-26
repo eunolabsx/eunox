@@ -510,7 +510,7 @@ func writeDoctorManifests(w io.Writer, cfg *config.GatewayConfig, cfgErr error) 
 
 		// Reproduce the proxy's actual startup policy-load decision so the bundle
 		// cannot report OK for a route `proxy` would refuse to boot, via the shared
-		// walk both doctor and validate use (load → merge → StartupFatalManifestCheck).
+		// walk both doctor and validate use (load → merge → startupFatalManifestCheck).
 		outcome := transport.WalkRouteManifests(cfg, u)
 
 		if outcome.NoPolicy {

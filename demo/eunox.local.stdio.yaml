@@ -5,7 +5,9 @@
 # mock as a `go run` subprocess. Self-contained — no external services needed.
 #
 # Wired to the ".vscode/launch.json → proxy: stdio enforce (local)" target.
-# Paths are relative to the repo root (the debug config sets cwd there).
+# Run from the repo root (the debug config sets cwd there): the audit paths and the
+# subprocess args below are CWD-relative. `policy:` entries are the exception — they
+# resolve against THIS file's directory (demo/), so they are written bare.
 #
 #   make build && bin/eunox proxy --config demo/eunox.local.stdio.yaml
 
@@ -22,4 +24,4 @@ upstreams:
     command: go
     args: ["run", "./demo/mock-mcp-server-stdio"]
     policy:
-      - demo/manifest.yaml         # read_file under /reports/, query_db SELECT (rate-limited)
+      - manifest.yaml              # resolved against demo/; read_file under /reports/, query_db SELECT (rate-limited)

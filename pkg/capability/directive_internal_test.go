@@ -159,3 +159,74 @@ func TestRedactFieldsDirective_EmptyFields_RoundTrip(t *testing.T) {
 	assert.NotNil(t, decoded.Directive)
 	assert.Equal(t, DirectiveTypeRedactFields, decoded.DirectiveType())
 }
+
+// ── strict unknown-field decode ─────────────────────────────────────────────
+
+// unmarshalDirective rejects a field name no directive struct binds. This matters more
+// than the condition case: a misspelled redactFields path key decodes to an EMPTY path
+// list, and an empty list makes the forward path attach the redactFields obligation — so
+// the audit tape records a redaction as applied while the response is masked nowhere.
+func TestUnmarshalDirective_RejectsUnknownField(t *testing.T) {
+	cases := []struct {
+		name string
+		json string
+		want string
+	}{
+		{
+			name: "redactFields fields typo yields a silently empty path list",
+			json: `{"type":"redactFields","fieldss":["user.ssn"]}`,
+			want: `unknown field "fieldss"`,
+		},
+		{
+			name: "redactFields singular typo",
+			json: `{"type":"redactFields","field":"user.ssn"}`,
+			want: `unknown field "field"`,
+		},
+		{
+			// "paths" is the OBLIGATION's spelling (ToObligation maps fields -> Paths),
+			// not the manifest's, so it is a plausible operator mistake and must be caught
+			// rather than decoded into an empty, mask-nothing directive.
+			name: "redactFields written with the obligation's key",
+			json: `{"type":"redactFields","paths":["user.ssn"]}`,
+			want: `unknown field "paths"`,
+		},
+		{
+			name: "labelOutput typo",
+			json: `{"type":"labelOutput","labelss":["pii"]}`,
+			want: `unknown field "labelss"`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := unmarshalDirective([]byte(tc.json))
+			require.Error(t, err, "want %s rejected, not decoded to an empty directive", tc.json)
+			assert.Contains(t, err.Error(), tc.want)
+		})
+	}
+}
+
+// The check must not reject what a lenient decode would have bound: the discriminator
+// and any case variant of a real field name.
+func TestUnmarshalDirective_AcceptsDiscriminatorAndCaseVariants(t *testing.T) {
+	for _, j := range []string{
+		`{"type":"redactFields","fields":["user.ssn"]}`,
+		`{"type":"redactFields","FIELDS":["user.ssn"]}`,
+		`{"type":"labelOutput","Labels":["pii"]}`,
+	} {
+		_, err := unmarshalDirective([]byte(j))
+		assert.NoError(t, err, "want %s accepted (the decode would bind it)", j)
+	}
+}
+
+// Every directive type this build models must survive a round-trip through the strict
+// decoder, so the field-name check cannot make a valid manifest unloadable.
+func TestUnmarshalDirective_StrictCheckAcceptsEveryMarshaledDirectiveType(t *testing.T) {
+	for _, dt := range []string{DirectiveTypeRedactFields, DirectiveTypeLabelOutput} {
+		target := newDirective(dt)
+		require.NotNil(t, target, "newDirective(%q) returned nil", dt)
+		data, err := marshalDirective(target)
+		require.NoError(t, err, "marshalDirective(%q)", dt)
+		_, err = unmarshalDirective(data)
+		assert.NoError(t, err, "directive %q does not survive its own marshaling (marshaled: %s)", dt, data)
+	}
+}
