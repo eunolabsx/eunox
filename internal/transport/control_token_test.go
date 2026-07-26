@@ -281,3 +281,105 @@ func TestExpandHome_HomeUnavailableFailsClosed(t *testing.T) {
 		t.Errorf("expandHome returned path %q alongside the error; want empty so a caller cannot use a misresolved path", got)
 	}
 }
+
+// TestWriteControlTokenFile_TightensEunoxOwnedDir is the upgrade regression: eunox's own
+// control-token directory (the default ~/.eunox) left at 0755 by an older version must be
+// tightened back to 0700, not merely warned about. Nothing else writes that directory, so
+// there is no shared-use case a chmod could break.
+func TestWriteControlTokenFile_TightensEunoxOwnedDir(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root bypasses file permission bits")
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir := filepath.Join(home, ".eunox")
+	if err := os.Mkdir(dir, 0o755); err != nil { //nolint:gosec // test fixture: deliberately loose mode
+		t.Fatal(err)
+	}
+
+	if _, err := WriteControlTokenFile("", "tok"); err != nil {
+		t.Fatalf("WriteControlTokenFile: %v", err)
+	}
+
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o700 {
+		t.Errorf("directory mode = %o, want 0700 — eunox's own control-token directory must be tightened, not just warned about", perm)
+	}
+}
+
+// TestWriteControlTokenFile_RefusesWorldWritableOperatorDir: eunox must not chmod a
+// directory the operator chose (doing so would strip /tmp's sticky bit), but it must also
+// not drop the emergency-stop credential into a directory any local user can rename files
+// in — they could substitute their own token and take over /control/kill. Fail closed.
+func TestWriteControlTokenFile_RefusesWorldWritableOperatorDir(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root bypasses file permission bits")
+	}
+	dir := filepath.Join(t.TempDir(), "shared")
+	if err := os.Mkdir(dir, 0o777); err != nil { //nolint:gosec // test fixture: deliberately loose mode
+		t.Fatal(err)
+	}
+
+	_, err := WriteControlTokenFile(filepath.Join(dir, "control.token"), "tok")
+	if err == nil {
+		t.Fatal("expected a fail-closed error for a world-writable, non-sticky control-token directory")
+	}
+	if !strings.Contains(err.Error(), "writable") {
+		t.Errorf("error = %v, want it to name the writable directory", err)
+	}
+}
+
+// TestWriteControlTokenFile_AllowsStickyOperatorDir: /tmp is 1777, and the sticky bit is
+// exactly what stops another user renaming the token file away, so a sticky directory
+// must still be usable (warned about, not refused).
+func TestWriteControlTokenFile_AllowsStickyOperatorDir(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root bypasses file permission bits")
+	}
+	dir := filepath.Join(t.TempDir(), "tmplike")
+	if err := os.Mkdir(dir, 0o777); err != nil { //nolint:gosec // test fixture: deliberately loose mode
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o777|os.ModeSticky); err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(dir, "control.token")
+	if _, err := WriteControlTokenFile(path, "tok"); err != nil {
+		t.Fatalf("a sticky world-writable directory must remain usable, got %v", err)
+	}
+	got, err := ResolveControlToken("", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "tok" {
+		t.Errorf("token = %q, want tok", got)
+	}
+}
+
+// TestWriteControlTokenFile_WarnsButAllowsReadableOperatorDir: a 0755 operator-chosen
+// directory leaves the 0600 token file unreadable to others, so it stays a warning.
+func TestWriteControlTokenFile_WarnsButAllowsReadableOperatorDir(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root bypasses file permission bits")
+	}
+	dir := filepath.Join(t.TempDir(), "readable")
+	if err := os.Mkdir(dir, 0o755); err != nil { //nolint:gosec // test fixture: deliberately loose mode
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(dir, "control.token")
+	if _, err := WriteControlTokenFile(path, "tok"); err != nil {
+		t.Fatalf("a group/world-readable operator directory must remain usable, got %v", err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o755 {
+		t.Errorf("directory mode = %o, want 0755 left untouched — eunox must not chmod a directory the operator chose", perm)
+	}
+}

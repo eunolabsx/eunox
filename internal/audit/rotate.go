@@ -529,6 +529,10 @@ func (s *Sink) retryRotateReopen() {
 // so losing a rotated file never wedges the audit path. Drainer-only (no lock).
 func (s *Sink) pruneRotated() {
 	if s.retain <= 0 {
+		// Retention is disabled, so it cannot be stalled. A stall reason recorded while a
+		// bound was in force must not outlive it, or /healthz keeps reporting a bound that
+		// is no longer being asked for.
+		s.clearMaintenanceStalled()
 		return
 	}
 	// Genuine rotated siblings only, oldest-first, via the shared helper so pruning
@@ -554,6 +558,11 @@ func (s *Sink) pruneRotated() {
 		rotated = filtered
 	}
 	if len(rotated) <= s.retain {
+		// Retention is satisfied, so it is not stalled — however it got there. Clearing
+		// only after the delete loop below succeeded meant a stall resolved by an operator
+		// removing the undeletable file by hand stayed reported on /healthz and in doctor
+		// until the process restarted, since every later pass reached this return first.
+		s.clearMaintenanceStalled()
 		return
 	}
 	// Delete oldest-first. On the FIRST real failure, STOP rather than continue:

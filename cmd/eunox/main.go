@@ -1428,9 +1428,10 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 		// rejected, so claiming "intersecting" unconditionally would mislead operators.
 		// Redact before printing: some IdPs gate the JWKS endpoint behind a query key or
 		// basic-auth userinfo, and this banner goes to the same stderr the systemd journal,
-		// container logs, and the doctor bundle collect. config.RedactURL is the one
-		// redactor the upstream-URL log sites already use; the JWKS URI — the root of trust
-		// for token verification — must not be the exception.
+		// container logs, and the doctor bundle collect. That is a log surface, so it takes
+		// the strict log-facing redactor (scheme://host only) the other banner and
+		// validation-error sites use; the JWKS URI — the root of trust for token
+		// verification — must not be the exception.
 		safeJWKS := capability.RedactURLForLog(pf.jwksURI)
 		if pf.jwtExperimentalCaps {
 			fmt.Fprintf(os.Stderr, "[eunox] JWT PDP enabled (JWKS URI: %s); intersecting per-route manifests with experimental mcp.capabilities claims\n", safeJWKS)

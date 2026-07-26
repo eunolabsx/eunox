@@ -455,8 +455,11 @@ func openAndPrepareLog(logPath string, preSize int64, lockFile *os.File) (f *os.
 // highestSeqAcrossChain returns the seq the resumed counter must start past, computed
 // across the base log AND every rotated sibling so a startup path that cannot trust the
 // tail never reissues an existing seq. See highestSeqAcrossChainCapped for how unreadable
-// files are folded in as a safe over-estimate.
-func highestSeqAcrossChain(logPath string) (highest uint64, ok bool) {
+// files are folded in as a safe over-estimate. complete is false when the log directory
+// could not be listed, so the rotated siblings' seqs are unknown and the returned value
+// bounds only the base log — the caller must treat the seed as unbounded, not as a
+// confident maximum.
+func highestSeqAcrossChain(logPath string) (highest uint64, ok, complete bool) {
 	return highestSeqAcrossChainCapped(logPath, rescanBufferBytes)
 }
 
@@ -478,7 +481,9 @@ func highestSeqAcrossChain(logPath string) (highest uint64, ok bool) {
 // chain_resume_failed marker (the break is never silent). Like scanSeqContribution it never
 // verifies HMACs or seeds prev_hmac; it only advances the monotonic counter. ok is false
 // only when nothing — no parseable record and no unread bytes — was found anywhere on disk.
-func highestSeqAcrossChainCapped(logPath string, bufCap int) (highest uint64, ok bool) {
+// complete is false when the log directory could not be listed at all: the fold then saw
+// only the base log, so the result cannot be trusted as a chain-wide maximum.
+func highestSeqAcrossChainCapped(logPath string, bufCap int) (highest uint64, ok, complete bool) {
 	var maxParsed, unreadBytes uint64
 	var parsedAny, sawUnread bool
 	fold := func(path string) {
@@ -495,16 +500,21 @@ func highestSeqAcrossChainCapped(logPath string, bufCap int) (highest uint64, ok
 		}
 	}
 	fold(logPath)
-	// A directory-listing failure leaves only the base's contribution (best effort). The
-	// fail-closed marker for an unreadable/unlistable chain is driven separately by
-	// newestRotatedSiblingWithTail's unreadableNewer signal at the resume sites, so seeding
-	// stays best-effort here rather than double-reporting the same fault.
+	// A directory-listing failure leaves only the base's contribution, which does NOT
+	// bound the rotated siblings' seqs — the seed can land below the true on-disk maximum
+	// and reissue history. Report it through complete so the caller surfaces the
+	// uncertainty in-band instead of presenting a partial fold as a confident maximum.
+	// A directory that does not exist yet is the ordinary fresh-install case (no siblings
+	// to miss), so it stays complete.
+	complete = true
 	if sibs, err := sortedRotatedSiblings(logPath); err == nil {
 		for _, sib := range sibs {
 			fold(sib)
 		}
+	} else if !os.IsNotExist(err) {
+		complete = false
 	}
-	return satAddU64(maxParsed, unreadBytes), parsedAny || sawUnread
+	return satAddU64(maxParsed, unreadBytes), parsedAny || sawUnread, complete
 }
 
 // satAddU64 adds two uint64 values, saturating at the maximum rather than wrapping, so a
@@ -527,11 +537,37 @@ func satAddU64(a, b uint64) uint64 {
 // is real and audit-verify must see the prev_hmac discontinuity — only the seq counter is
 // advanced, monotonic and gap-detectable. A best-effort scan finding nothing leaves s.seq
 // unchanged (a genuinely unreadable log, already handled by the read-error seed path).
-func (s *Sink) seedSeqPastOnDiskMax() {
-	if highest, ok := highestSeqAcrossChain(s.logPath); ok && highest > s.seq {
+//
+// The on-disk values it folds are NOT HMAC-verified (deliberately: this path may run when
+// the signing key cannot verify the chain at all, and an unverified seq can only inflate a
+// counter, never inject a trusted chain link). What an unverified value must never do is
+// inflate the counter to the point where the next `s.seq + 1` wraps back to 0 and reissues
+// genesis — so the seed is clamped to maxSeedableSeq, far above any reachable real history
+// and far below the wrap. bounded is false when the fold could not see the whole chain, so
+// the caller can mark the uncertainty on the tape rather than trusting a partial seed.
+func (s *Sink) seedSeqPastOnDiskMax() (bounded bool) {
+	highest, ok, complete := highestSeqAcrossChain(s.logPath)
+	if ok && highest > maxSeedableSeq {
+		// No real deployment reaches maxSeedableSeq records; a value this large is a
+		// corrupt or planted seq, and honoring it would push the counter into the wrap
+		// zone. Clamp and say so — the clamped seed still lands past every plausible
+		// genuine record, so the monotonic guarantee holds for real history.
+		fmt.Fprintf(os.Stderr, "[eunox] WARNING: audit log %q holds an implausible sequence number (%d); it is corrupt or planted. Seeding the resumed counter at %d instead — run 'eunox audit-verify' and reconcile against your external sink.\n", s.logPath, highest, uint64(maxSeedableSeq))
+		highest = maxSeedableSeq
+	}
+	if ok && highest > s.seq {
 		s.seq = highest
 	}
+	return complete
 }
+
+// maxSeedableSeq caps the value seedSeqPastOnDiskMax will adopt from unverified on-disk
+// bytes. 2^62 is ~4.6e18 records — unreachable by any real log (millennia at a million
+// records per second) — while leaving writeRecord's `s.seq + 1` two orders of magnitude of
+// headroom below the uint64 wrap. Without the cap, a single planted
+// {"seq":18446744073709551615} line seeds the counter at the maximum and the very next
+// write reissues seq 0/1, which audit-verify cannot distinguish from tampering.
+const maxSeedableSeq uint64 = 1 << 62
 
 // tailResumeResult is resumeChainFromTail's report of how the existing tail
 // record (if any) resolved: which integrity marker Open must write, and the
@@ -734,6 +770,7 @@ func Open(logPath, keyPath string, rotateSizeBytes int64, retainRotated int, opt
 	// is already a fail-closed Open error, so only two cases remain here.
 	last := tail.last
 	chainResumeFailed := false
+	seedUnbounded := false
 	var resumeFailReason string
 	switch {
 	case !tail.readable:
@@ -744,7 +781,7 @@ func Open(logPath, keyPath string, rotateSizeBytes int64, retainRotated int, opt
 		// and mark the break in-band instead. prev_hmac stays the genesis sentinel: the
 		// real tail could not be read, so the cryptographic link honestly cannot continue,
 		// and the marker is the single break rather than a per-record one.
-		s.seedSeqPastOnDiskMax()
+		seedUnbounded = !s.seedSeqPastOnDiskMax()
 		chainResumeFailed = true
 		resumeFailReason = auditReasonTailReadFailed
 		fmt.Fprintf(os.Stderr, "[eunox] WARNING: could not read audit log tail of %q (the log is write-only, so its tail cannot be probed); the chain cannot be resumed and a chain_resume_failed marker is appended (seq continues past the on-disk maximum) — run 'eunox audit-verify' and reconcile against your external sink.\n", logPath)
@@ -763,7 +800,7 @@ func Open(logPath, keyPath string, rotateSizeBytes int64, retainRotated int, opt
 			// The newest rotated sibling exists but could not be read, so resuming from an
 			// older one (or genesis) would reissue its seqs. Fail closed exactly as a base
 			// read failure does: seed past the on-disk max and record the break in-band.
-			s.seedSeqPastOnDiskMax()
+			seedUnbounded = !s.seedSeqPastOnDiskMax()
 			chainResumeFailed = true
 			resumeFailReason = auditReasonTailReadFailed
 			fmt.Fprintf(os.Stderr, "[eunox] WARNING: the newest rotated audit sibling of %q could not be read; the chain cannot be safely resumed and a chain_resume_failed marker is appended (seq continues past the on-disk maximum) — run 'eunox audit-verify' and reconcile against your external sink.\n", logPath)
@@ -791,7 +828,18 @@ func Open(logPath, keyPath string, rotateSizeBytes int64, retainRotated int, opt
 	// arrives) won't cover anyway.
 	wroteMarker := false
 	if chainResumeFailed {
-		s.writeIntegrityMarker("chain_resume_failed", map[string]interface{}{"reason": resumeFailReason})
+		// seed_unbounded says whether the reseed could see the whole chain. When the log
+		// directory cannot be listed, the rotated siblings' seqs are unknown and the
+		// reseed bounds only the base log — so the new records may collide with seqs the
+		// unlisted siblings already hold. That is a materially different forensic state
+		// from a bounded reseed, and stating it on the signed tape is what keeps it from
+		// looking (to audit-verify, later) like an unexplained duplicate-seq cascade.
+		details := map[string]interface{}{"reason": resumeFailReason}
+		if seedUnbounded {
+			details["seed_unbounded"] = true
+			fmt.Fprintf(os.Stderr, "[eunox] WARNING: the audit log directory of %q could not be listed, so the resumed sequence number could not be bounded against the rotated siblings; new records may reissue seqs those files already hold — run 'eunox audit-verify' and reconcile against your external sink.\n", logPath)
+		}
+		s.writeIntegrityMarker("chain_resume_failed", details)
 		wroteMarker = true
 	}
 	if tailParseFailure {
@@ -2205,6 +2253,21 @@ func isCanonicalSignedLine(line, body []byte, mac string) (bool, error) {
 func (s *Sink) writeRecord(rec *auditRecord) {
 	// Details and envelope are already bounded at Record() time, so the serialized
 	// record is provably far below the 4 MiB scanner buffer / chain-resume window.
+
+	// The counter is one short of the uint64 ceiling, so the increment below would wrap
+	// to 0 and reissue the genesis seq — a duplicate-seq cascade audit-verify cannot
+	// distinguish from tampering. Refuse to write instead: a counted, warned gap is
+	// recoverable, a silently renumbered chain is not. seedSeqPastOnDiskMax clamps the
+	// untrusted on-disk seed far below this, so reaching it means the counter was driven
+	// here some other way; the guard is what makes the wrap structurally impossible.
+	if s.seq == ^uint64(0) {
+		s.writeFailures.Add(1)
+		if !s.writeErrWarned {
+			s.writeErrWarned = true
+			fmt.Fprintf(os.Stderr, "[eunox] WARNING: audit sequence number is exhausted — refusing to write further records rather than reissuing sequence numbers already on disk (further write errors are suppressed)\n")
+		}
+		return
+	}
 
 	// Stamp the chain fields before signing so the HMAC covers them: the next
 	// monotonic seq and the predecessor's _hmac. An attacker deleting or reordering

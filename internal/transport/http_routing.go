@@ -145,13 +145,10 @@ func decodeStrictJSON(w http.ResponseWriter, r *http.Request, v interface{}, inv
 // RESOURCE_EXHAUSTED for in-flight floods and a blank for session-cap floods. The other
 // two legs are benign lifecycle races (a kill sweep, a graceful drain), not attack signal,
 // so they stay status-only.
-func (p *HTTPProxy) writeSessionCreateError(w http.ResponseWriter, r *http.Request, err error) {
+func (p *HTTPProxy) writeSessionCreateError(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, err error) {
 	switch {
 	case errors.Is(err, errSessionLimit):
-		p.recordPreSessionDeny(r, codeResourceExhausted, "saturation", map[string]interface{}{
-			"source_ip": p.sourceIP(r),
-			"reason":    "session_limit_reached",
-		})
+		p.recordSessionCapDeny(r, route)
 		http.Error(w, "session limit reached", http.StatusServiceUnavailable)
 	case errors.Is(err, errRacedReap):
 		http.Error(w, "session raced a kill-switch reset; retry", http.StatusServiceUnavailable)
@@ -245,11 +242,10 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 		if !p.tryReserveSessionSlot() {
 			// Recorded for the same reason as the errSessionLimit leg of
 			// writeSessionCreateError: this is the cheap pre-spawn twin of that refusal and
-			// the surface an unauthenticated saturation flood reaches first.
-			p.recordPreSessionDeny(r, codeResourceExhausted, "saturation", map[string]interface{}{
-				"source_ip": p.sourceIP(r),
-				"reason":    "session_limit_reached",
-			})
+			// the surface an unauthenticated saturation flood reaches first. Both halves go
+			// through the one route-stamped helper, so the two ways to hit the same cap
+			// cannot produce two record shapes.
+			p.recordSessionCapDeny(r, route)
 			http.Error(w, "session limit reached", http.StatusServiceUnavailable)
 			return
 		}
@@ -286,7 +282,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 			sess, err = p.newSession(initCtx, route, clientIP)
 		}
 		if err != nil {
-			p.writeSessionCreateError(w, r, err)
+			p.writeSessionCreateError(w, r, route, err)
 			return
 		}
 		w.Header().Set(SessionHeader, sess.id)
@@ -506,6 +502,13 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 			// saturation drop the notification and log it rather than block the handler
 			// goroutine indefinitely.
 			if !sess.tryAcquireNotifySlot() {
+				// Record the drop on the tape, exactly as the enforced-request slot's
+				// saturation refusal does ~70 lines below. stderr alone is not the
+				// tamper-evident trail, and the notification most worth having there is
+				// notifications/cancelled: an incident responder asking why a call the host
+				// tried to abort ran to completion needs the drop to be a record, not a line
+				// in a container log that rotation may already have discarded.
+				recordResourceExhausted(r.Context(), asRecorder(route.sink), sessionID, msg.Method)
 				fmt.Fprintf(os.Stderr, "[eunox] HTTP session %s: notification %q dropped: too many concurrent notifications in flight\n", sessionID, msg.Method)
 				w.WriteHeader(http.StatusAccepted)
 				return

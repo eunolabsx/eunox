@@ -16,6 +16,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/pdp"
@@ -763,5 +764,71 @@ func TestSEC05_NoPolicyWarning(t *testing.T) {
 	// Just confirm the constant values are usable.
 	if httpReadTimeout == 0 {
 		t.Error("constants should be non-zero")
+	}
+}
+
+// TestAddClaimedSessionID_TruncatesOnRuneBoundary: the claimed_session_id bound is a BYTE
+// bound (it exists to cap what an attacker-controlled header appends to a record), but the
+// cut must not split a multi-byte rune. A byte-level slice leaves dangling continuation
+// bytes that json.Marshal rewrites to U+FFFD, so the signed value stops matching the raw
+// header a SIEM holds for the same request.
+func TestAddClaimedSessionID_TruncatesOnRuneBoundary(t *testing.T) {
+	t.Parallel()
+	// 3-byte runes: 200 is not a multiple of 3, so a byte-level cut at 200 lands mid-rune.
+	header := strings.Repeat("éé", maxClaimedSessionIDLen) // 2-byte runes, well over the cap
+	req := httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody)
+	req.Header.Set(SessionHeader, header)
+
+	details := addClaimedSessionID(nil, req)
+	claimed, _ := details["claimed_session_id"].(string)
+	if len(claimed) > maxClaimedSessionIDLen {
+		t.Fatalf("claimed length = %d bytes, want <= %d", len(claimed), maxClaimedSessionIDLen)
+	}
+	if !utf8.ValidString(claimed) {
+		t.Fatalf("truncated claimed_session_id is not valid UTF-8: %q", claimed)
+	}
+	if details["claimed_session_id_truncated"] != true {
+		t.Error("a truncated value must be flagged with claimed_session_id_truncated")
+	}
+	// Round-tripping through JSON must not rewrite anything: a mid-rune cut would show
+	// up here as a U+FFFD substitution, breaking correlation against the raw header.
+	encoded, err := json.Marshal(claimed)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var back string
+	if err := json.Unmarshal(encoded, &back); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if back != claimed {
+		t.Errorf("JSON round-trip changed the value: %q -> %q (a split rune was replaced)", claimed, back)
+	}
+	if !strings.HasPrefix(header, back) {
+		t.Errorf("truncated value %q is not a prefix of the raw header — correlation is broken", back)
+	}
+}
+
+// TestTruncateRunes_Bounds pins the helper's edges: at/under the limit is returned
+// verbatim, an over-limit cut lands on a rune boundary, and a non-positive limit is empty.
+func TestTruncateRunes_Bounds(t *testing.T) {
+	t.Parallel()
+	if got := truncateRunes("abc", 3); got != "abc" {
+		t.Errorf("truncateRunes(abc, 3) = %q, want abc", got)
+	}
+	if got := truncateRunes("abc", 10); got != "abc" {
+		t.Errorf("truncateRunes(abc, 10) = %q, want abc", got)
+	}
+	if got := truncateRunes("abc", 0); got != "" {
+		t.Errorf("truncateRunes(abc, 0) = %q, want empty", got)
+	}
+	if got := truncateRunes("abc", -1); got != "" {
+		t.Errorf("truncateRunes(abc, -1) = %q, want empty", got)
+	}
+	// "é" is 2 bytes: a cut at 1 must drop it entirely rather than emit a half rune.
+	if got := truncateRunes("éx", 1); got != "" {
+		t.Errorf("truncateRunes(éx, 1) = %q, want empty (the only rune does not fit)", got)
+	}
+	if got := truncateRunes("aéx", 2); got != "a" {
+		t.Errorf("truncateRunes(aéx, 2) = %q, want a", got)
 	}
 }

@@ -1287,3 +1287,74 @@ func TestRetryRotateReopenStillFailing(t *testing.T) {
 		t.Fatalf("a still-failing retry must not create a filesystem entry: before=%d after=%d", len(entriesBefore), len(entriesAfter))
 	}
 }
+
+// TestPruneRotated_ClearsResolvedStallWithoutADelete is the stuck-status regression: a
+// retention stall that an operator resolves by removing the undeletable file BY HAND
+// must stop being reported. The clear used to sit only after the delete loop, so a pass
+// that found retention already satisfied returned early and left /healthz and doctor
+// reporting the stale reason until the process restarted.
+func TestPruneRotated_ClearsResolvedStallWithoutADelete(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+	s := &Sink{logPath: logPath, activePath: logPath, retain: 2}
+
+	// One sibling, retain 2: retention is satisfied, so the delete loop never runs.
+	sib := logPath + ".00000000000000000001.20260101T000000.000000000Z"
+	if err := os.WriteFile(sib, []byte(`{"seq":1}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write sibling: %v", err)
+	}
+	s.markMaintenanceStalled("retention stalled: an older sibling could not be deleted")
+	if stalled, _ := s.MaintenanceStalled(); !stalled {
+		t.Fatal("markMaintenanceStalled did not take effect")
+	}
+
+	s.pruneRotated()
+
+	if stalled, reason := s.MaintenanceStalled(); stalled {
+		t.Fatalf("stall still reported after retention became satisfied: %q", reason)
+	}
+}
+
+// TestPruneRotated_RetentionDisabledClearsStall: turning retention off (retain 0) means
+// there is no bound left to enforce, so a stall recorded while one was in force must not
+// keep being reported.
+func TestPruneRotated_RetentionDisabledClearsStall(t *testing.T) {
+	t.Parallel()
+	s := &Sink{logPath: filepath.Join(t.TempDir(), "audit.jsonl"), retain: 0}
+	s.markMaintenanceStalled("retention stalled: an older sibling could not be deleted")
+
+	s.pruneRotated()
+
+	if stalled, _ := s.MaintenanceStalled(); stalled {
+		t.Fatal("a stall must not outlive the retention bound that recorded it")
+	}
+}
+
+// TestPruneRotated_ListFailureLeavesStallReported: a listing failure leaves retention's
+// true state unknown, so it must NOT clear a stall — only a pass that positively
+// establishes retention is satisfied may do that.
+func TestPruneRotated_ListFailureLeavesStallReported(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root bypasses file permission bits")
+	}
+	dir := t.TempDir()
+	logDir := filepath.Join(dir, "logs")
+	if err := os.Mkdir(logDir, 0o700); err != nil {
+		t.Fatalf("mkdir log dir: %v", err)
+	}
+	logPath := filepath.Join(logDir, "audit.jsonl")
+	if err := os.Chmod(logDir, 0o300); err != nil {
+		t.Fatalf("chmod log dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(logDir, 0o700) })
+
+	s := &Sink{logPath: logPath, activePath: logPath, retain: 1}
+	s.markMaintenanceStalled("retention stalled: an older sibling could not be deleted")
+
+	s.pruneRotated()
+
+	if stalled, _ := s.MaintenanceStalled(); !stalled {
+		t.Fatal("a listing failure must leave the stall reported: retention's state is unknown, not healthy")
+	}
+}

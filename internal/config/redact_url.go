@@ -1,12 +1,19 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// URL credential redaction shared by every path that surfaces an upstream URL —
-// config validation errors, the live-probe error, and the doctor support bundle —
-// so a userinfo credential or a ?token=/#access_token= secret cannot leak through any
-// of them. This is the single, robust redactor those call sites consolidate onto; it
+// URL credential redaction for the OPERATOR-FACING surfaces — today the doctor support
+// bundle's URL-bearing config fields and its audit-tail targets — so a userinfo
+// credential or a ?token=/#access_token= secret cannot leak through any of them. It
 // handles the hierarchical, opaque, scheme-less, and unparseable forms and fails safe
 // (never returns the raw value) on anything url.Parse cannot handle.
+//
+// The surface rule, stated once here: this redactor keeps the path and the query
+// parameter NAMES, which is the detail an operator reading their own bundle needs.
+// Anything that reaches a LOG — a startup banner, a validation error, a runtime warning,
+// all of which land in the systemd journal, container stdout, or a CI log — uses the
+// stricter capability.RedactURLForLog instead, which keeps only scheme://host. Neither is
+// a fallback for the other: picking by surface is what keeps one process from redacting
+// the same URL two ways.
 
 package config
 
@@ -99,6 +106,20 @@ func RedactURL(s string) string {
 		if strings.Contains(u.Opaque, "@") {
 			return "<redacted unparseable URL>"
 		}
+		return redactURLFallback(s)
+	}
+	if u.Host == "" && !strings.Contains(s, "//") && strings.Contains(u.Path, "@") {
+		// No authority marker anywhere in the value, yet the path carries an '@'. Two
+		// shapes land here, and neither can be echoed: a single-slash scheme typo
+		// ("https:/alice:SECRET@host/mcp" — url.Parse puts the WHOLE credentialed
+		// authority in u.Path, which no scrub above inspects, so `changed` stayed false
+		// and the raw credential was returned verbatim), and the scheme-less
+		// "user@host/path" form. Hand both to the conservative fallback, which cannot
+		// locate the credential boundary in either and replaces the whole value.
+		//
+		// Keyed on the ABSENT "//" rather than on u.Host alone so a genuine authority-less
+		// hierarchical URL ("file:///home/a@b/x") keeps its path: there the '@' really is a
+		// path character, and the empty authority is explicit rather than a typo.
 		return redactURLFallback(s)
 	}
 	if !changed {

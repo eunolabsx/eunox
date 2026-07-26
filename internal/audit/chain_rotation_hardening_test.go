@@ -93,9 +93,12 @@ func TestHighestSeqAcrossChain(t *testing.T) {
 	if err := os.WriteFile(sib, []byte(`{"seq":900}`+"\n"+`{"seq":901}`+"\n"), 0o600); err != nil {
 		t.Fatalf("write sibling: %v", err)
 	}
-	got, ok := highestSeqAcrossChain(logPath)
+	got, ok, complete := highestSeqAcrossChain(logPath)
 	if !ok || got != 901 {
 		t.Fatalf("highestSeqAcrossChain = (%d,%v), want (901,true) — the sibling's max must win over the base", got, ok)
+	}
+	if !complete {
+		t.Fatal("highestSeqAcrossChain must report complete=true when the log directory listed cleanly")
 	}
 }
 
@@ -225,7 +228,7 @@ func TestHighestSeqAcrossChain_FoldsUnreadableSiblingAdditively(t *testing.T) {
 	}
 	sibSize := uint64(info.Size())
 
-	got, ok := highestSeqAcrossChainCapped(logPath, bufCap)
+	got, ok, _ := highestSeqAcrossChainCapped(logPath, bufCap)
 	if !ok {
 		t.Fatal("highestSeqAcrossChainCapped must report ok=true when a seq or unread bytes exist")
 	}

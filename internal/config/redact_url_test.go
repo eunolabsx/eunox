@@ -54,6 +54,14 @@ func TestRedactURL_ExactOutputs(t *testing.T) {
 		"https://h/p?x=1#token=abc": "https://h/p?x=<redacted len=1>",
 		// A bare '#' carries nothing and is preserved through u.String().
 		"https://h/p#": "https://h/p#",
+		// Single-slash scheme typo: url.Parse puts the whole credentialed authority in
+		// u.Path, which no scrub inspects, so this used to be returned verbatim.
+		"https:/alice:SECRET@host/mcp": "<redacted unparseable URL>",
+		// Scheme-less "user@host/path": same shape, same fail-safe outcome.
+		"alice@host/mcp": "<redacted unparseable URL>",
+		// An authority-less hierarchical URL keeps its path: the empty authority is
+		// explicit ("//"), so the '@' really is a path character, not a typo'd credential.
+		"file:///home/a@b/x": "file:///home/a@b/x",
 	}
 	for in, want := range cases {
 		if got := RedactURL(in); got != want {
@@ -91,6 +99,13 @@ func TestRedactURL_MalformedNeverLeaksPassword(t *testing.T) {
 		// '?'-before-'@' ordering (url.Parse fails on the non-numeric port): the fallback
 		// must not leak the credential prefix by cutting at '?' before scanning for '@'.
 		"https://user:super-secret?x@host/p",
+		// A single-slash scheme typo parses CLEANLY, with the credential landing in
+		// u.Path where neither the userinfo, query, fragment, nor opaque scrub reaches
+		// it — so `changed` stayed false and the raw value went straight to stderr.
+		"https:/alice:super-secret@host/mcp",
+		"http:/alice:super-secret@host/mcp?token=xyz",
+		// Scheme-less "user@host/path" with no colon: also lands wholly in u.Path.
+		"alice-super-secret@host.com/path",
 	} {
 		if got := RedactURL(in); strings.Contains(got, "super-secret") {
 			t.Errorf("RedactURL(%q) leaked the password: %q", in, got)
