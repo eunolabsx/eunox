@@ -294,6 +294,56 @@ upstreams:
 	}
 }
 
+// TestLoadGatewayConfig_RejectsWhitespaceOnlyUpstreamAuthHeader closes the literal
+// leg of the same footgun. validateCredentialEnvRefs rejects "${A}" with A=" " —
+// "a credential that is only spaces/tabs is no secret" — but it only runs for values
+// that CONTAIN an env reference, so a literal whitespace header slipped through
+// entirely and the route forwarded a header carrying no credential. listen.authToken
+// already rejects its literal whitespace twin; the two credential legs must agree.
+func TestLoadGatewayConfig_RejectsWhitespaceOnlyUpstreamAuthHeader(t *testing.T) {
+	base := func(hdr string) string {
+		return `
+schemaVersion: "0.1"
+transport: http
+listen:
+  bind: 127.0.0.1
+  port: 3000
+upstreams:
+  - name: stripe
+    transport: http
+    upstreamUrl: https://mcp.example.com
+    upstreamAuthHeader: "` + hdr + `"
+    policy: ["manifest.yaml"]
+`
+	}
+
+	for _, hdr := range []string{"   ", "\\t", " \\t "} {
+		if _, err := LoadGatewayConfig(writeConfig(t, base(hdr))); err == nil {
+			t.Fatalf("expected rejection of a whitespace-only upstreamAuthHeader %q, got nil", hdr)
+		} else if !strings.Contains(err.Error(), "upstreamAuthHeader") || !strings.Contains(err.Error(), "whitespace-only") {
+			t.Errorf("error should name the whitespace-only upstreamAuthHeader, got: %v", err)
+		}
+	}
+
+	// Omitting the field entirely stays valid — that is the documented "no upstream
+	// auth" opt-out, and it must not be swept up by the guard.
+	noHeader := `
+schemaVersion: "0.1"
+transport: http
+listen:
+  bind: 127.0.0.1
+  port: 3000
+upstreams:
+  - name: stripe
+    transport: http
+    upstreamUrl: https://mcp.example.com
+    policy: ["manifest.yaml"]
+`
+	if _, err := LoadGatewayConfig(writeConfig(t, noHeader)); err != nil {
+		t.Errorf("omitting upstreamAuthHeader must stay valid, got: %v", err)
+	}
+}
+
 // An unset $VAR/${VAR} in upstreamUrl survives expansion as literal text; for the
 // no-brace, path, and query forms it can still satisfy url.Parse, so without an
 // explicit residual-reference guard the gateway would boot a route pointed at a

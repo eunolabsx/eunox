@@ -407,6 +407,26 @@ func TestCmdInit_ConfigOutputHTTP(t *testing.T) {
 	}
 }
 
+// TestFetchSpecLive_UnknownTransportFailsClosed pins the dispatcher's default arm.
+// It used to fall through to the HTTP probe for ANY transport it did not recognize,
+// so a spec carrying an empty or novel transport was silently introspected over HTTP
+// with an empty URL, while its gateway-config sibling (fetchRouteLive) named the same
+// condition as an error. Every switch in this package names its cases and fails closed
+// on the rest.
+func TestFetchSpecLive_UnknownTransportFailsClosed(t *testing.T) {
+	t.Parallel()
+	for _, tr := range []string{"", "grpc", "HTTP"} {
+		_, err := fetchSpecLive(context.Background(), initUpstreamSpec{Transport: tr})
+		if err == nil {
+			t.Errorf("transport %q: expected an error, got nil", tr)
+			continue
+		}
+		if !strings.Contains(err.Error(), "unknown upstream transport") {
+			t.Errorf("transport %q: error should name the unknown transport, got: %v", tr, err)
+		}
+	}
+}
+
 // TestGenerateInitConfigYAML_HostileScalarsRoundTrip locks that the operator-supplied
 // scalars init scaffolds into the runnable config — command, args, upstreamUrl,
 // upstreamAuthHeader, and the policy path — round-trip through the gateway-config

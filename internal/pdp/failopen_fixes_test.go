@@ -289,7 +289,7 @@ func TestRecordAuditModeAntecedent_RouteAuditRecordsEnforcedConstraint(t *testin
 	t.Parallel()
 	counter := &recordingCounter{}
 	engine := enforcement.New(enforcement.WithCallCounter(counter))
-	req := &capability.EnforceRequest{SessionID: "s", ToolName: "t"}
+	req := &capability.EnforceRequest{SessionID: "s", TargetName: "t"}
 	enforced := &capability.Constraint{Target: "tool:t", Actions: []string{"call"}}
 
 	// Enforce route (no skipQuota): an enforced-constraint deny records nothing.

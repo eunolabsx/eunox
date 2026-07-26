@@ -165,7 +165,7 @@ func TestRedis_Start_FailedSubscribe_RecoversInBackground(t *testing.T) {
 
 	// A reconcile interval far longer than the test: if globalActive ever becomes true
 	// below, pub/sub delivered it, not the reconcile loop.
-	r := NewRedis(client).WithReconcileInterval(time.Hour)
+	r := NewRedis(client, WithReconcileInterval(time.Hour))
 	r.Start(context.Background())
 	defer r.Stop()
 

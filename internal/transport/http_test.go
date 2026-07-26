@@ -1285,13 +1285,13 @@ func postMCPJSON(t *testing.T, srv *httptest.Server, body interface{}, sessionID
 
 // capturedRecord captures an audit decision for assertions.
 type capturedRecord struct {
-	SessionID string
-	ToolName  string
-	Method    string
-	Decision  string
-	Code      string
-	Details   map[string]interface{}
-	Audit     bool
+	SessionID  string
+	TargetName string
+	Method     string
+	Decision   string
+	Code       string
+	Details    map[string]interface{}
+	Audit      bool
 }
 
 // newAuditProxy returns an HTTPProxy in audit (observe) mode, backed by the
@@ -1415,10 +1415,10 @@ func TestAudit_RecordsObserveFlag(t *testing.T) {
 		inner: denyAllPDP{},
 		onDecide: func(sessionID, toolName string, resp capability.EnforceResponse) {
 			recorded = append(recorded, capturedRecord{
-				SessionID: sessionID,
-				ToolName:  toolName,
-				Decision:  string(resp.Decision),
-				Audit:     proxyWithSink.routes[""].audit,
+				SessionID:  sessionID,
+				TargetName: toolName,
+				Decision:   string(resp.Decision),
+				Audit:      proxyWithSink.routes[""].audit,
 			})
 		},
 	}
@@ -2456,6 +2456,91 @@ func TestHTTPHandleSessionPost_KilledServerResponseRecordsDeny(t *testing.T) {
 	details, _ := rec["details"].(map[string]interface{})
 	if got, _ := details["transport"].(string); got != "http-server-response" {
 		t.Errorf("deny record transport marker = %q, want http-server-response; record: %+v", got, rec)
+	}
+}
+
+// TestHTTPHandleSessionPost_ReapedKilledServerResponseTagsServerResponseLeg is the
+// registry-MISS counterpart of the test above. A killed session is torn out of the
+// session registry proactively, so its later POSTs resolve no session and take the
+// sess == nil branch, where a notification and a host response share one arm. That
+// arm used to stamp every drop as "http-notification", mislabeling a dropped server
+// response as a notification drop — corrupting the exact triage signal the transport
+// leg detail exists to provide. The leg must match what the live-session path records
+// for the same message shape.
+func TestHTTPHandleSessionPost_ReapedKilledServerResponseTagsServerResponseLeg(t *testing.T) {
+	t.Parallel()
+
+	sink, logPath := newTempAuditSink(t)
+	ks := killswitch.NewInMemory()
+	if err := ks.KillSession(context.Background(), "reaped-sess"); err != nil {
+		t.Fatalf("KillSession: %v", err)
+	}
+	policy := newTestManifestPDPWithKS(ks, capability.Constraint{Target: "tool:*", Actions: []string{"call"}})
+
+	rt := &UpstreamRoute{pdp: policy, sink: &routeSink{sink: sink, upstream: "up1"}}
+	// Empty registry: the killed session has already been reaped.
+	proxy := &HTTPProxy{sessions: make(map[string]*httpSession)}
+
+	body := `{"jsonrpc":"2.0","id":5,"result":{}}`
+	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+	req.Header.Set(SessionHeader, "reaped-sess")
+	w := httptest.NewRecorder()
+	proxy.handleMCPPost(w, req, rt)
+
+	if w.Code != http.StatusAccepted {
+		t.Errorf("expected 202, got %d", w.Code)
+	}
+	if err := sink.Close(); err != nil { // flush the drainer to disk
+		t.Fatalf("sink.Close: %v", err)
+	}
+	recs := readAuditRecords(t, logPath)
+	rec := findAuditRecordByMethod(recs, "server-response", "deny")
+	if rec == nil {
+		t.Fatalf("no deny record for the dropped server-response; records: %+v", recs)
+	}
+	details, _ := rec["details"].(map[string]interface{})
+	if got, _ := details["transport"].(string); got != "http-server-response" {
+		t.Errorf("deny record transport marker = %q, want http-server-response; record: %+v", got, rec)
+	}
+}
+
+// TestHTTPHandleSessionPost_ReapedKilledNotificationTagsNotificationLeg is the other
+// half of that branch: a genuine notification on the same reaped-session path must
+// still record the notification leg and its own method, so distinguishing the two
+// shapes did not collapse them the other way.
+func TestHTTPHandleSessionPost_ReapedKilledNotificationTagsNotificationLeg(t *testing.T) {
+	t.Parallel()
+
+	sink, logPath := newTempAuditSink(t)
+	ks := killswitch.NewInMemory()
+	if err := ks.KillSession(context.Background(), "reaped-sess2"); err != nil {
+		t.Fatalf("KillSession: %v", err)
+	}
+	policy := newTestManifestPDPWithKS(ks, capability.Constraint{Target: "tool:*", Actions: []string{"call"}})
+
+	rt := &UpstreamRoute{pdp: policy, sink: &routeSink{sink: sink, upstream: "up1"}}
+	proxy := &HTTPProxy{sessions: make(map[string]*httpSession)}
+
+	body := `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{}}`
+	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+	req.Header.Set(SessionHeader, "reaped-sess2")
+	w := httptest.NewRecorder()
+	proxy.handleMCPPost(w, req, rt)
+
+	if w.Code != http.StatusAccepted {
+		t.Errorf("expected 202, got %d", w.Code)
+	}
+	if err := sink.Close(); err != nil {
+		t.Fatalf("sink.Close: %v", err)
+	}
+	recs := readAuditRecords(t, logPath)
+	rec := findAuditRecordByMethod(recs, "notifications/cancelled", "deny")
+	if rec == nil {
+		t.Fatalf("no deny record for the dropped notification; records: %+v", recs)
+	}
+	details, _ := rec["details"].(map[string]interface{})
+	if got, _ := details["transport"].(string); got != "http-notification" {
+		t.Errorf("deny record transport marker = %q, want http-notification; record: %+v", got, rec)
 	}
 }
 

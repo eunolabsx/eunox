@@ -211,7 +211,7 @@ func TestCommitDeferredAtomic_DispatchesThroughRegistry(t *testing.T) {
 	e := New(WithCallCounter(counter), WithConditionHandler(capability.ConditionTypeMaxCalls, handler))
 	handler.e = e
 
-	req := &capability.EnforceRequest{SessionID: "sess-1", ToolName: "tool"}
+	req := &capability.EnforceRequest{SessionID: "sess-1", TargetName: "tool"}
 	caps := []capability.Constraint{{
 		Target:  "tool",
 		Actions: []string{"*"},
@@ -258,7 +258,7 @@ func TestCommitDeferredAtomic_NonUniformSkipFailsClosed(t *testing.T) {
 	e := New(WithCallCounter(counter), WithConditionHandler(capability.ConditionTypeMaxCalls, handler))
 	handler.e = e
 
-	req := &capability.EnforceRequest{SessionID: "sess-1", ToolName: "tool"}
+	req := &capability.EnforceRequest{SessionID: "sess-1", TargetName: "tool"}
 	caps := []capability.Constraint{{
 		Target:  "tool",
 		Actions: []string{"*"},
@@ -337,7 +337,7 @@ func TestCommitDeferredAtomic_NilDenyCallbackFailsClosed(t *testing.T) {
 	e := New(WithCallCounter(forceDenyAtIndexZeroCounter{}), WithConditionHandler(capability.ConditionTypeMaxCalls, handler))
 	handler.e = e
 
-	req := &capability.EnforceRequest{SessionID: "sess-1", ToolName: "tool"}
+	req := &capability.EnforceRequest{SessionID: "sess-1", TargetName: "tool"}
 	caps := []capability.Constraint{{
 		Target:  "tool",
 		Actions: []string{"*"},
@@ -398,7 +398,7 @@ func TestCommitDeferredAtomic_NilCounterFailsClosed(t *testing.T) {
 	e := New(WithConditionHandler(capability.ConditionTypeMaxCalls, handler))
 	handler.e = e
 
-	req := &capability.EnforceRequest{SessionID: "sess-1", ToolName: "tool"}
+	req := &capability.EnforceRequest{SessionID: "sess-1", TargetName: "tool"}
 	caps := []capability.Constraint{{
 		Target:  "tool",
 		Actions: []string{"*"},
@@ -475,7 +475,7 @@ func sentinelEngine() *Engine {
 // behavior) masked it as an allow — the observe/enforce divergence this closes.
 func TestCommitDeferredAtomic_ObserveSurfacesLaterBucketCondErr(t *testing.T) {
 	e := sentinelEngine()
-	req := &capability.EnforceRequest{SessionID: "s", ToolName: "tool"}
+	req := &capability.EnforceRequest{SessionID: "s", TargetName: "tool"}
 	caps := []capability.Constraint{{
 		Target:  "tool",
 		Actions: []string{"*"},
@@ -500,7 +500,7 @@ func TestCommitDeferredAtomic_ObserveSurfacesLaterBucketCondErr(t *testing.T) {
 // fail-open.
 func TestCommitDeferredAtomic_PartialSkipFailsClosed(t *testing.T) {
 	e := sentinelEngine()
-	req := &capability.EnforceRequest{SessionID: "s", ToolName: "tool"}
+	req := &capability.EnforceRequest{SessionID: "s", TargetName: "tool"}
 	caps := []capability.Constraint{{
 		Target:  "tool",
 		Actions: []string{"*"},
@@ -532,7 +532,7 @@ func TestCommitDeferredAtomic_PartialSkipFailsClosed(t *testing.T) {
 // divergence this function exists to prevent.
 func TestCommitDeferredAtomic_SkipDoesNotSwallowCondErr(t *testing.T) {
 	e := sentinelEngine()
-	req := &capability.EnforceRequest{SessionID: "s", ToolName: "tool"}
+	req := &capability.EnforceRequest{SessionID: "s", TargetName: "tool"}
 	caps := []capability.Constraint{{
 		Target:  "tool",
 		Actions: []string{"*"},
@@ -557,7 +557,7 @@ func TestCommitDeferredAtomic_SkipDoesNotSwallowCondErr(t *testing.T) {
 // consumed and the call is allowed.
 func TestCommitDeferredAtomic_AllSkipUnderObserveAllows(t *testing.T) {
 	e := sentinelEngine()
-	req := &capability.EnforceRequest{SessionID: "s", ToolName: "tool"}
+	req := &capability.EnforceRequest{SessionID: "s", TargetName: "tool"}
 	caps := []capability.Constraint{{
 		Target:  "tool",
 		Actions: []string{"*"},
@@ -583,7 +583,7 @@ type typedNilCondition struct{ capability.MaxCallsCondition }
 // mirroring CollectObligations' identical typed-nil directive guard.
 func TestRunConditions_TypedNilConditionFailsClosed(t *testing.T) {
 	e := New(WithCallCounter(callcounter.NewInMemory()))
-	req := &capability.EnforceRequest{SessionID: "sess-1", ToolName: "tool"}
+	req := &capability.EnforceRequest{SessionID: "sess-1", TargetName: "tool"}
 	var nilCond *typedNilCondition // typed nil: (*typedNilCondition)(nil)
 	constraint := &capability.Constraint{
 		Target:     "tool",
@@ -616,9 +616,9 @@ func TestRecordSessionCall_TargetNameKeyedVerbatim(t *testing.T) {
 	// entry naming this antecedent is "resource:system:foo", whose lookup key is
 	// (resource, "system:foo") — recording must match it byte-for-byte.
 	req := &capability.EnforceRequest{
-		SessionID: "s1",
-		ToolName:  "system:foo",
-		Target:    &capability.EnforceRequestTarget{Type: "resource", Name: "system:foo"},
+		SessionID:  "s1",
+		TargetName: "system:foo",
+		Target:     &capability.EnforceRequestTarget{Type: "resource", Name: "system:foo"},
 	}
 	if err := e.RecordSessionCall(context.Background(), req); err != nil {
 		t.Fatalf("RecordSessionCall: %v", err)
@@ -672,9 +672,9 @@ func TestRecordSessionCall_NoSequenceBlock_NoQuotaBurnOnRecordFault(t *testing.T
 		Conditions: []capability.Condition{capability.MaxCallsCondition{Count: 5, WindowSeconds: 60}},
 	}}
 	req := &capability.EnforceRequest{
-		SessionID: "s1",
-		ToolName:  "t",
-		Target:    &capability.EnforceRequestTarget{Type: "tool", Name: "t"},
+		SessionID:  "s1",
+		TargetName: "t",
+		Target:     &capability.EnforceRequestTarget{Type: "tool", Name: "t"},
 	}
 
 	// Default engine: records the antecedent, so the IncrementAndGet fault denies the
@@ -705,9 +705,9 @@ func TestHandleMaxCalls_LogicalKeyExcludesWindow(t *testing.T) {
 	e := New(WithCallCounter(counter))
 
 	req := &capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "export",
-		Target:    &capability.EnforceRequestTarget{Type: "tool", Name: "export"},
+		SessionID:  "sess-1",
+		TargetName: "export",
+		Target:     &capability.EnforceRequestTarget{Type: "tool", Name: "export"},
 	}
 	constraint := &capability.Constraint{
 		Target:  "tool:export",

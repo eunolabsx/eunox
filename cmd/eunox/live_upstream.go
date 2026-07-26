@@ -234,6 +234,22 @@ func readResponseWithID(ctx context.Context, w *mcp.MsgWriter, r *mcp.MsgReader,
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return mcp.RPCMsg{}, ctxErr
 			}
+			// A malformed line is TERMINAL here, deliberately, and must stay in lock-step
+			// with the runtime: both transports' upstream readers (StdioProxy.readUpstream,
+			// httpSession.readUpstream) and the shared initialize handshake
+			// (awaitStartupReply) end the session on any non-EOF read error, mcp.ErrParse
+			// included. Only the HOST-side reader skips parse errors and answers -32700.
+			//
+			// So skipping here would make `init` / `validate --live` / `doctor --live`
+			// report success — and emit a manifest — for a banner-printing stdio server
+			// that `eunox proxy` then kills at the handshake, which is a worse failure than
+			// the probe error: it moves the failure later and certifies an upstream the
+			// runtime rejects. Unblocking noisy upstreams means making the runtime lenient
+			// first; this probe follows it, it does not lead it.
+			//
+			// ErrParse also carries the duplicate/case-folded-object-key rejection
+			// (rejectDuplicateJSONKeys), which is a smuggling signal an operator running
+			// these commands to vet an upstream should see, not have skipped.
 			return mcp.RPCMsg{}, err
 		}
 		if msg.IsNotification() {

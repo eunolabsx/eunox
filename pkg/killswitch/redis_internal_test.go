@@ -160,16 +160,12 @@ func TestRedis_HandlePubSubMessage_AgentKillEmptyID(t *testing.T) {
 
 func TestRedis_WithLogger(t *testing.T) {
 	t.Parallel()
-	r := NewRedis(nil)
-	assert.Nil(t, r.logger)
+	// No option: no logger, and the degraded-mode breadcrumbs stay silent.
+	assert.Nil(t, NewRedis(nil).logger)
 
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
-	r2 := r.WithLogger(logger)
-
-	// WithLogger returns the same receiver for chaining.
-	assert.Same(t, r, r2)
-	assert.Equal(t, logger, r.logger)
+	assert.Equal(t, logger, NewRedis(nil, WithLogger(logger)).logger)
 }
 
 func TestRedis_Reset_DelError(t *testing.T) {
@@ -388,7 +384,7 @@ func TestRedis_WithLogger_LogsRefreshFailure(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
 
-	r := NewRedis(client).WithLogger(logger)
+	r := NewRedis(client, WithLogger(logger))
 
 	r.Start(t.Context())
 	defer r.Stop()
@@ -406,7 +402,7 @@ func TestRedis_ReconcileRefresh_LogsAndThrottles(t *testing.T) {
 
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	r := NewRedis(deadClient(t)).WithLogger(logger)
+	r := NewRedis(deadClient(t), WithLogger(logger))
 	ctx := context.Background()
 
 	// Two failing refreshes must log the warning only once (edge-triggered).
@@ -461,8 +457,9 @@ func TestRedis_HandlePubSubMessage_UnknownPayload_WithClient(t *testing.T) {
 	assert.False(t, globalActive)
 }
 
-// newTestRedis spins up a miniredis-backed Redis kill switch for a test.
-func newTestRedis(t *testing.T) (*Redis, *miniredis.Miniredis) {
+// newTestRedis spins up a miniredis-backed Redis kill switch for a test. Options are
+// forwarded to NewRedis, since configuration is construction-time only.
+func newTestRedis(t *testing.T, opts ...RedisOption) (*Redis, *miniredis.Miniredis) {
 	t.Helper()
 	mr := miniredis.NewMiniRedis()
 	require.NoError(t, mr.Start())
@@ -471,7 +468,7 @@ func newTestRedis(t *testing.T) (*Redis, *miniredis.Miniredis) {
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr(), DialTimeout: 200 * time.Millisecond})
 	t.Cleanup(func() { _ = client.Close() })
 
-	return NewRedis(client), mr
+	return NewRedis(client, opts...), mr
 }
 
 func TestRedis_KillAndReviveAgent(t *testing.T) {
@@ -620,9 +617,9 @@ func TestRedis_Stop_WaitsForGoroutines(t *testing.T) {
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr(), DialTimeout: 200 * time.Millisecond})
 	t.Cleanup(func() { _ = client.Close() })
 
-	r := NewRedis(client).
-		WithReconcileInterval(time.Millisecond).
-		WithLogger(slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
+	r := NewRedis(client,
+		WithReconcileInterval(time.Millisecond),
+		WithLogger(slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))))
 	r.Start(context.Background())
 	time.Sleep(10 * time.Millisecond) // let the reconcile loop tick several times
 
@@ -1348,7 +1345,7 @@ func TestRedis_Reconcile_RecoversLostPubSubEvent(t *testing.T) {
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr(), DialTimeout: 200 * time.Millisecond})
 	t.Cleanup(func() { _ = client.Close() })
 
-	r := NewRedis(client).WithReconcileInterval(50 * time.Millisecond)
+	r := NewRedis(client, WithReconcileInterval(50*time.Millisecond))
 	r.Start(t.Context())
 	defer r.Stop()
 
@@ -1639,15 +1636,11 @@ func TestRedis_ShouldBlock_Healthy_Unaffected(t *testing.T) {
 	assert.False(t, blocked)
 }
 
-func TestRedis_WithFailOpen_DefaultsClosedAndChains(t *testing.T) {
+func TestRedis_WithFailOpen_DefaultsClosed(t *testing.T) {
 	t.Parallel()
-	r := NewRedis(nil)
-	assert.False(t, r.failOpen, "NewRedis must default to fail-closed")
-
-	r2 := r.WithFailOpen(true)
-	assert.Same(t, r, r2, "WithFailOpen returns the same receiver for chaining")
-	assert.True(t, r.failOpen)
-	assert.False(t, r.WithFailOpen(false).failOpen)
+	assert.False(t, NewRedis(nil).failOpen, "NewRedis must default to fail-closed")
+	assert.True(t, NewRedis(nil, WithFailOpen(true)).failOpen)
+	assert.False(t, NewRedis(nil, WithFailOpen(false)).failOpen)
 }
 
 // TestRedis_ShouldBlock_FailClosed_AfterRealRefreshFailure drives the behaviour
@@ -1941,7 +1934,7 @@ func TestRedis_Start_KillDuringSnapshotWindowIsObserved(t *testing.T) {
 
 	// A long reconcile interval ensures the kill can only be observed via the
 	// pub/sub path established before the snapshot, not by a periodic re-read.
-	ks := NewRedis(wc).WithReconcileInterval(time.Hour)
+	ks := NewRedis(wc, WithReconcileInterval(time.Hour))
 	ks.Start(context.Background())
 	defer ks.Stop()
 
@@ -1991,8 +1984,8 @@ func TestRedis_RefreshState_ClearsErrorWhenNoFresherFailure(t *testing.T) {
 // WithFailOpen — a stopped switch is a liveness failure, not a transient outage.
 func TestRedis_ShouldBlock_FailsClosedAfterContextCanceled(t *testing.T) {
 	t.Parallel()
-	r, _ := newTestRedis(t)
-	r = r.WithFailOpen(true) // even fail-open must not serve a frozen switch as all-clear
+	// even fail-open must not serve a frozen switch as all-clear
+	r, _ := newTestRedis(t, WithFailOpen(true))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	r.Start(ctx)
@@ -2010,4 +2003,22 @@ func TestRedis_ShouldBlock_FailsClosedAfterContextCanceled(t *testing.T) {
 		return errors.Is(err, ErrStopped)
 	}, 2*time.Second, 5*time.Millisecond,
 		"after its Start context is canceled, ShouldBlock must fail closed with ErrStopped on a non-match")
+}
+
+// TestRedis_WithSessionKillTTL covers the three-way branch its own doc calls a
+// fail-open when set wrong: a negative value means "never expire", zero selects the
+// default, and a positive value is taken verbatim. An expiring tombstone lifts the
+// kill on a session that may still be connected, so an inverted branch here would
+// silently un-kill live sessions — and every sibling option is asserted, so this one
+// should be too.
+func TestRedis_WithSessionKillTTL(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, defaultSessionKillTTL, NewRedis(nil).sessionKillTTL,
+		"no option must keep the default")
+	assert.Equal(t, defaultSessionKillTTL, NewRedis(nil, WithSessionKillTTL(0)).sessionKillTTL,
+		"zero selects the default")
+	assert.Equal(t, 90*time.Minute, NewRedis(nil, WithSessionKillTTL(90*time.Minute)).sessionKillTTL,
+		"a positive value is taken verbatim")
+	assert.Equal(t, time.Duration(0), NewRedis(nil, WithSessionKillTTL(-1)).sessionKillTTL,
+		"a negative value opts out of expiry entirely (0 = no TTL stamped)")
 }

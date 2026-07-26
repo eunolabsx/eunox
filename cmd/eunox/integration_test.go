@@ -22,6 +22,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -51,6 +52,26 @@ func TestHelperStdioUpstream(t *testing.T) {
 		return
 	}
 	stdioUpstreamServe()
+}
+
+// stdioNoisySentinel is the argv marker that turns a re-exec of the test binary
+// into an MCP stdio upstream that also prints non-JSON chatter to its stdout (see
+// TestHelperStdioNoisyUpstream).
+const stdioNoisySentinel = "eunox-stdio-noisy-process"
+
+// TestHelperStdioNoisyUpstream is a re-exec entry point serving the same minimal
+// MCP session as TestHelperStdioUpstream, but with stray non-JSON lines written to
+// STDOUT — the shape an npx-launched server produces when a dependency prints a
+// banner or a debug line onto the protocol stream. Each stray line is newline
+// terminated, so the JSON-RPC framing stays intact and every one of them surfaces
+// as a recoverable mcp.ErrParse to a reader.
+func TestHelperStdioNoisyUpstream(t *testing.T) {
+	if !slices.Contains(os.Args, stdioNoisySentinel) {
+		return
+	}
+	// A banner ahead of the handshake, the common real-world case.
+	fmt.Fprintln(os.Stdout, "my-mcp-server v1.2.3 — starting up")
+	stdioUpstreamServeNoisy()
 }
 
 const stdioHangSentinel = "eunox-stdio-hang-process"
@@ -104,10 +125,85 @@ func stdioUpstreamServe() {
 	}
 }
 
+// stdioUpstreamServeNoisy serves the same session as stdioUpstreamServe but emits a
+// stray non-JSON line to stdout before each response, so a reader must skip garbage
+// interleaved with the protocol stream, not only a leading banner.
+func stdioUpstreamServeNoisy() {
+	reader := mcp.NewMsgReader(os.Stdin)
+	writer := mcp.NewMsgWriter(os.Stdout)
+	for {
+		msg, err := reader.Read()
+		if err != nil {
+			return // EOF: proxy closed our stdin.
+		}
+		if msg.ID == nil {
+			continue // notification: no response expected
+		}
+		var result interface{}
+		switch msg.Method {
+		case "initialize":
+			result = mcp.InitResult{
+				ProtocolVersion: transport.MCPProtocolVersion,
+				Capabilities:    map[string]interface{}{"tools": map[string]interface{}{}},
+				ServerInfo:      map[string]interface{}{"name": "stdio-noisy", "version": "1.0.0"},
+			}
+		case "tools/list":
+			result = map[string]interface{}{
+				"tools": []map[string]interface{}{
+					{"name": "read_file", "description": "reads a file"},
+					{"name": "write_file", "description": "writes a file"},
+				},
+			}
+		default:
+			result = map[string]interface{}{}
+		}
+		// Chatter immediately before the real reply: the reader must skip this line
+		// and go on to read the response that follows it on the same stream.
+		fmt.Fprintf(os.Stdout, "[debug] handled %s\n", msg.Method)
+		resp, _ := mcp.SuccessResponse(msg.ID, result)
+		_ = writer.Write(resp)
+	}
+}
+
 // helperUpstreamArgs returns the command + args that re-exec the test binary as
 // the stdio upstream defined by TestHelperStdioUpstream.
 func helperUpstreamArgs() (command string, args []string) {
 	return os.Args[0], []string{"-test.run=^TestHelperStdioUpstream$", "--", stdioUpstreamSentinel}
+}
+
+// noisyUpstreamArgs returns the command + args that re-exec the test binary as the
+// banner-printing stdio upstream defined by TestHelperStdioNoisyUpstream.
+func noisyUpstreamArgs() (command string, args []string) {
+	return os.Args[0], []string{"-test.run=^TestHelperStdioNoisyUpstream$", "--", stdioNoisySentinel}
+}
+
+// TestFetchLiveToolsStdio_NonJSONLineIsTerminal pins that the CLI probe and the
+// RUNTIME agree about a stray non-JSON line on a stdio upstream's stdout.
+//
+// It is tempting to make the probe skip mcp.ErrParse so `init` / `validate --live` /
+// `doctor --live` tolerate an npx-launched server that prints a banner. That is a
+// fail-open in the reporting direction: both transports' upstream readers
+// (StdioProxy.readUpstream, httpSession.readUpstream) and the shared initialize
+// handshake (awaitStartupReply) end the session on any non-EOF read error, ErrParse
+// included — only the HOST-side reader skips one and answers -32700. A lenient probe
+// would therefore emit a manifest for, and report healthy, an upstream that
+// `eunox proxy` kills at the handshake.
+//
+// So this asserts the probe FAILS, and it is the tripwire for that coupling: if the
+// runtime upstream readers are ever made lenient, this test should be inverted in the
+// same change, never on its own.
+func TestFetchLiveToolsStdio_NonJSONLineIsTerminal(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns a subprocess; skipped in -short")
+	}
+	cmd, args := noisyUpstreamArgs()
+	_, err := fetchLiveToolsStdio(context.Background(), cmd, args)
+	if err == nil {
+		t.Fatal("expected a banner-printing upstream to fail the probe, matching how the runtime treats it")
+	}
+	if !errors.Is(err, mcp.ErrParse) {
+		t.Errorf("probe error should identify the malformed line (mcp.ErrParse), got: %v", err)
+	}
 }
 
 // TestFetchLiveToolsStdio_Subprocess drives the one-shot introspection client

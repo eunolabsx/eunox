@@ -6,6 +6,7 @@ package capability
 import (
 	"fmt"
 	"net"
+	"strings"
 	"time"
 )
 
@@ -23,6 +24,15 @@ const (
 	ConditionTypePolicy            = "policy"
 	ConditionTypeCustom            = "custom"
 )
+
+// Several conditions cache a normalized form of their allowlist, built once by
+// Compile at manifest load (see AllowedOperationsCondition, AllowedExtensionsCondition,
+// AllowedTablesCondition, RecipientDomainCondition, IPRangeCondition, TimeWindowCondition).
+// Those caches have NO invalidation: once Compile has run, the accessors serve the
+// cached form and never re-read the source field. The source slices/maps are therefore
+// immutable after load — mutating Operations/Extensions/Tables/Columns/Domains/CIDRs on
+// a compiled condition keeps enforcing the PRE-edit allowlist, silently and in the
+// fail-open direction if the edit was a narrowing. Build a new condition instead.
 
 // Condition is the interface for all capability conditions.
 // All conditions have a Type() method returning the discriminator string.
@@ -86,6 +96,68 @@ type IPRangeCondition struct {
 type AllowedOperationsCondition struct {
 	Argument   string   `json:"argument,omitempty"`
 	Operations []string `json:"operations"`
+
+	// compiled holds Operations with each entry pre-trimmed by Compile at load time,
+	// so the hot path compares ready strings instead of re-trimming the whole
+	// allowlist on every enforced call. It stays a SLICE compared with EqualFold
+	// rather than a lookup set: a map would have to key on some fixed case mapping,
+	// and no such mapping reproduces EqualFold's Unicode case folding exactly (the
+	// Kelvin sign folds to "K" but does not upper- or lower-case to it), so the
+	// switch would silently narrow which manifests match. Unexported, so it never
+	// serializes; nil on an uncompiled condition (e.g. one built directly in a test),
+	// where AllowsOperation trims as it scans instead.
+	compiled []string
+}
+
+// Compile pre-trims each entry of Operations once at load, so the hot path stops
+// re-trimming the allowlist per request. It is idempotent and cannot fail; the error
+// return matches the other compiled conditions so the loader treats them alike.
+func (c *AllowedOperationsCondition) Compile() error {
+	trimmed := make([]string, len(c.Operations))
+	for i, op := range c.Operations {
+		trimmed[i] = strings.TrimSpace(op)
+	}
+	c.compiled = trimmed
+	return nil
+}
+
+// AllowsOperation reports whether op is in the allowlist, compared
+// case-insensitively against each entry with surrounding whitespace trimmed. It
+// prefers the pre-trimmed slice Compile built and otherwise trims as it scans, so a
+// programmatically built condition matches exactly what a loaded one matches.
+//
+// A "*" entry is NOT a wildcard: it is rejected at manifest load
+// (validateAllowedOperations), so a literal "*" only ever matches the operation "*".
+func (c *AllowedOperationsCondition) AllowsOperation(op string) bool {
+	// One implementation for both paths: MatchOperation trims as it scans, and
+	// TrimSpace on an already-trimmed entry is a no-op, so handing it the compiled
+	// slice is exactly the uncompiled rule with the trimming already done. Open-coding
+	// the loop here would make the compiled path — the one EVERY manifest-loaded
+	// condition takes — a second copy of the matching rule that no production caller
+	// exercises against the first.
+	if c.compiled != nil {
+		return MatchOperation(c.compiled, op)
+	}
+	return MatchOperation(c.Operations, op)
+}
+
+// MatchOperation reports whether op is in the allowed operations set, compared
+// case-insensitively after trimming each entry. Entries are trimmed because the
+// request verb arrives already whitespace-trimmed: an allowlist entry written as
+// "SELECT " would otherwise never match and would silently deny every call.
+//
+// It is the uncompiled matcher, shared by AllowedOperationsCondition.AllowsOperation's
+// fallback and by callers holding a bare operation slice with no condition to compile
+// — notably the JWT shorthand PDP, whose operation claims never pass through the
+// manifest loader. Keeping one implementation is what lets the compiled and
+// uncompiled paths stay in agreement.
+func MatchOperation(allowed []string, op string) bool {
+	for _, a := range allowed {
+		if strings.EqualFold(strings.TrimSpace(a), op) {
+			return true
+		}
+	}
+	return false
 }
 
 // AllowedExtensionsCondition limits file access to the listed extensions.
@@ -96,6 +168,71 @@ type AllowedOperationsCondition struct {
 type AllowedExtensionsCondition struct {
 	Argument   string   `json:"argument,omitempty"`
 	Extensions []string `json:"extensions"`
+
+	// compiled holds Extensions normalized by Compile at load time (lowercased,
+	// dot-prefixed, blanks dropped, duplicates collapsed), so the hot path matches a
+	// ready list instead of rebuilding it — and its dedupe map — on every enforced
+	// call. Unexported, so it never serializes; nil on an uncompiled condition, where
+	// MatchExtensions normalizes per call instead.
+	compiled []string
+}
+
+// Compile normalizes Extensions once at load so the hot path stops rebuilding the
+// list per request. It is idempotent and cannot fail; the error return matches the
+// other compiled conditions so the loader treats them alike.
+func (c *AllowedExtensionsCondition) Compile() error {
+	c.compiled = normalizeExtensions(c.Extensions)
+	return nil
+}
+
+// MatchExtensions returns the allowlist in matched form: lowercased, each entry a
+// dotted suffix, blanks dropped and duplicates collapsed. It prefers what Compile
+// cached and otherwise normalizes on the spot, so a programmatically built condition
+// matches exactly what a loaded one matches.
+//
+// The result is READ-ONLY. On the compiled path it is the live policy shared by every
+// session on this manifest, read concurrently by every in-flight request with no lock
+// — writing through it would silently redefine what is permitted process-wide and
+// race those readers. Capacity is clipped to length so an append is forced to copy,
+// but that only closes the accidental case; do not write to the elements.
+func (c *AllowedExtensionsCondition) MatchExtensions() []string {
+	if c.compiled != nil {
+		return c.compiled
+	}
+	return normalizeExtensions(c.Extensions)
+}
+
+// normalizeExtensions lowercases each entry and adds a leading dot only when the
+// entry does not already start with one, so every entry is a dotted suffix matched
+// on a dot boundary (".gz" matches "data.gz", not "datagz"). It does not collapse
+// extra leading dots an entry already carries — "..gz" stays two dots and so only
+// matches a name literally ending in "..gz". Blank entries are skipped and
+// duplicates collapsed; an empty allowlist denies every path.
+//
+// Single source of the normalization for both the compiled and uncompiled paths.
+func normalizeExtensions(exts []string) []string {
+	out := make([]string, 0, len(exts))
+	seen := make(map[string]struct{}, len(exts))
+	for _, ext := range exts {
+		n := strings.ToLower(strings.TrimSpace(ext))
+		if n == "" {
+			continue
+		}
+		if !strings.HasPrefix(n, ".") {
+			n = "." + n
+		}
+		if _, dup := seen[n]; dup {
+			continue
+		}
+		seen[n] = struct{}{}
+		out = append(out, n)
+	}
+	// Clip capacity to length. Skipped blanks and collapsed duplicates leave spare
+	// capacity, so a caller doing `x := c.MatchExtensions(); x = append(x, ...)` would
+	// otherwise write into the backing array of the COMPILED, process-lifetime policy —
+	// silently widening the extension allowlist for every session, and racing every
+	// concurrent reader while doing it. With cap == len, that append always copies.
+	return out[:len(out):len(out)]
 }
 
 // AllowedTablesCondition limits database access to the listed tables and columns.
@@ -106,6 +243,87 @@ type AllowedTablesCondition struct {
 	Argument string              `json:"argument,omitempty"`
 	Tables   []string            `json:"tables"`
 	Columns  map[string][]string `json:"columns,omitempty"`
+
+	// compiled holds the case-folded lookup structures built by Compile at load time,
+	// so the hot path indexes ready maps instead of rebuilding the table set, the
+	// column-restriction index, AND a per-table column set on every enforced call.
+	// Unexported, so it never serializes; nil on an uncompiled condition, where
+	// Lookup builds them on the spot.
+	compiled *compiledTables
+}
+
+// compiledTables caches the case-folded lookup structures of an
+// AllowedTablesCondition. Table and column names are matched case-insensitively
+// because many databases (MySQL, SQL Server) treat identifiers that way, so a
+// case-sensitive match would let "Password_Hash" slip past a column ACL written as
+// "password_hash". Entries are trimmed for the same reason the other allowlists trim:
+// request names arrive already trimmed, so a manifest entry padded with whitespace
+// (" users") would never match and would silently deny every call.
+type compiledTables struct {
+	// tables holds every allowed table name, lowercased and trimmed.
+	tables map[string]bool
+	// columnsByTable maps a lowercased, trimmed table name to its allowed columns in
+	// ORIGINAL case, so denial details echo the manifest as written.
+	columnsByTable map[string][]string
+	// columnSets maps a lowercased, trimmed table name to its allowed columns
+	// lowercased and trimmed for matching.
+	columnSets map[string]map[string]bool
+}
+
+// Compile builds the case-folded table and column lookup maps once at load, so the
+// hot path stops rebuilding them per request. It is idempotent and cannot fail; the
+// error return matches the other compiled conditions so the loader treats them alike.
+func (c *AllowedTablesCondition) Compile() error {
+	c.compiled = compileTables(c.Tables, c.Columns)
+	return nil
+}
+
+// TableLookup returns the case-folded lookup structures for matching. It prefers
+// what Compile cached and otherwise builds them on the spot, so a programmatically
+// built condition matches exactly what a loaded one matches.
+//
+// allowedColumns is nil when the condition declares no column restrictions at all,
+// which the handler distinguishes from an empty restriction.
+//
+// All three results are READ-ONLY, and unlike the slice accessors these are maps, so
+// nothing structural stops a write. On the compiled path they are the live policy
+// shared by every session on this manifest: inserting one key (a table, or a column
+// on a table) permanently widens the enforced ACL for the life of the process, with
+// no manifest change and no audit trace, and doing it from a request goroutine is an
+// unsynchronized write concurrent with every other request's reads — which crashes
+// the process with "concurrent map read and map write". Copy before mutating.
+func (c *AllowedTablesCondition) TableLookup() (allowedTables map[string]bool, allowedColumns map[string][]string, columnSets map[string]map[string]bool) {
+	t := c.compiled
+	if t == nil {
+		t = compileTables(c.Tables, c.Columns)
+	}
+	return t.tables, t.columnsByTable, t.columnSets
+}
+
+// compileTables is the single source of the table/column normalization for both the
+// compiled and uncompiled paths.
+func compileTables(tables []string, columns map[string][]string) *compiledTables {
+	out := &compiledTables{tables: make(map[string]bool, len(tables))}
+	for _, t := range tables {
+		out.tables[strings.ToLower(strings.TrimSpace(t))] = true
+	}
+	if columns == nil {
+		// Left nil deliberately: "no column restrictions declared" is a distinct state
+		// from "an empty restriction", and only the former skips the column ACL.
+		return out
+	}
+	out.columnsByTable = make(map[string][]string, len(columns))
+	out.columnSets = make(map[string]map[string]bool, len(columns))
+	for table, cols := range columns {
+		key := strings.ToLower(strings.TrimSpace(table))
+		out.columnsByTable[key] = cols
+		set := make(map[string]bool, len(cols))
+		for _, col := range cols {
+			set[strings.ToLower(strings.TrimSpace(col))] = true
+		}
+		out.columnSets[key] = set
+	}
+	return out
 }
 
 // MaxCallsCondition limits the number of calls within a rolling window.
@@ -121,6 +339,47 @@ type MaxCallsCondition struct {
 type RecipientDomainCondition struct {
 	Argument string   `json:"argument,omitempty"`
 	Domains  []string `json:"domains"`
+
+	// compiled holds Domains lowercased and trimmed into a lookup set by Compile at
+	// load time, so the hot path does a map lookup instead of rebuilding the set on
+	// every enforced call. Unexported, so it never serializes; nil on an uncompiled
+	// condition, where MatchDomains builds it on the spot.
+	compiled map[string]bool
+}
+
+// Compile builds the case-folded domain set once at load, so the hot path stops
+// rebuilding it per request. It is idempotent and cannot fail; the error return
+// matches the other compiled conditions so the loader treats them alike.
+func (c *RecipientDomainCondition) Compile() error {
+	c.compiled = normalizeDomains(c.Domains)
+	return nil
+}
+
+// MatchDomains returns the allowlist as a lowercased, trimmed lookup set. It prefers
+// what Compile cached and otherwise builds it on the spot, so a programmatically
+// built condition matches exactly what a loaded one matches.
+//
+// The result is READ-ONLY, and it is a map, so nothing structural stops a write. See
+// TableLookup: on the compiled path this is the live policy shared by every session,
+// so inserting a domain widens the enforced allowlist process-wide and races every
+// concurrent reader. Copy before mutating.
+func (c *RecipientDomainCondition) MatchDomains() map[string]bool {
+	if c.compiled != nil {
+		return c.compiled
+	}
+	return normalizeDomains(c.Domains)
+}
+
+// normalizeDomains is the single source of the domain normalization for both the
+// compiled and uncompiled paths. Entries are trimmed because recipients arrive
+// already whitespace-trimmed, so a manifest entry padded with whitespace
+// ("example.com ") would never match and would silently deny every call.
+func normalizeDomains(domains []string) map[string]bool {
+	set := make(map[string]bool, len(domains))
+	for _, d := range domains {
+		set[strings.ToLower(strings.TrimSpace(d))] = true
+	}
+	return set
 }
 
 // PolicyCondition delegates evaluation to a named policy backend.

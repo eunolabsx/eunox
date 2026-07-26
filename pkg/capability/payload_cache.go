@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// PayloadCache is an in-process, LRU-like, TTL-bounded cache for verified token
+// PayloadCache is an in-process, FIFO-with-refresh, TTL-bounded cache for verified token
 // payloads of type T, safe for concurrent use and keyed by an opaque caller-supplied
 // string (a token hash — see HashTokenKey). It is the shared engine behind the JWT
 // verified-token cache in internal/pdp (T = *JWTClaims, shared by pointer because
@@ -24,6 +24,14 @@ import (
 // Security trade-off: a payload is served for up to min(MaxEntryTTL, the payload's
 // own remaining lifetime) after its entry was populated, so set MaxEntryTTL shorter
 // than the required revocation-propagation SLA.
+//
+// Eviction order is INSERTION order, refreshed on Put, not recency of use: Get does
+// not promote the entry it hits. So a hot key that is read constantly but never
+// re-Put is evicted ahead of a colder key inserted after it. That is deliberate for
+// the verified-token use — an entry's value is bounded by MaxEntryTTL from when it
+// was populated, so keeping it alive on reads would only extend the window in which
+// a revoked token still verifies — but it is NOT an LRU, and sizing the cache as if
+// reads protected an entry will mis-predict its hit rate.
 //
 // Bounds are maintained entirely by lazy pruning on Get/Put; there is no background
 // sweep goroutine.
@@ -185,7 +193,8 @@ func (c *PayloadCache[T]) Put(key string, payload T, expUnix int64) {
 	if existing, exists := c.entries[key]; exists {
 		// Update path: reuse the existing list element (else the old node orphans and the
 		// eviction counter drifts), and move it to the back so a refreshed payload resets
-		// its eviction position per the LRU-like semantics.
+		// its eviction position. This is the ONLY promotion: Put refreshes, Get does not,
+		// which is what makes the order FIFO-with-refresh rather than LRU.
 		c.insertOrder.MoveToBack(existing.listElem)
 		entry.listElem = existing.listElem
 	} else {

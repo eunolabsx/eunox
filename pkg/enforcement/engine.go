@@ -96,6 +96,17 @@ type Clock interface {
 // session, short enough that abandoned-session state is reclaimed. Recording and
 // Peek use the same value so they address the same window bucket in windowed
 // backends. A nil counter still fails maxCalls and sequenceBlock closed.
+//
+// This retention is a REAL bound on the guarantee, not just a storage detail: it is
+// wall-clock, so a session idle past the window loses its antecedent marker and a
+// later blocked call is allowed. Two things keep that narrow. Each fresh call to the
+// antecedent re-records the marker (RecordSessionCall), and each blocked call that
+// finds the marker re-arms it (handleSequenceBlock), so the window measures
+// INACTIVITY of the whole antecedent/blocked pair rather than age since the
+// antecedent. A session that goes quiet for longer than this on both legs — a
+// multi-day agent session, say — does lose the gate; that residue is documented as a
+// sequenceBlock limitation in docs/capability-manifest-guide.md. Raising the value
+// trades a longer guarantee against retaining abandoned-session state for as long.
 const sequenceHistoryWindowSec = 86400 // 24h
 
 // compositeCounterKey joins prefix and the variadic parts into one counter key.
@@ -427,7 +438,7 @@ func New(opts ...Option) *Engine {
 	return e
 }
 
-// RecordSessionCall notes that an allowed call to req.ToolName occurred in this
+// RecordSessionCall notes that an allowed call to req.TargetName occurred in this
 // session, so a later sequenceBlock condition on a different tool can detect it.
 //
 // It returns a non-nil error only when the counter write itself fails, and
@@ -534,7 +545,7 @@ func (e *Engine) RecordSessionCall(ctx context.Context, req *capability.EnforceR
 // silently failing the sequenceBlock gate OPEN; it also collapsed two distinct
 // targets "foo" and "system:foo" onto one maxCalls bucket. For direct
 // ValidateAction callers that leave req.Target nil, fall back to the
-// prefix-stripped req.ToolName.
+// prefix-stripped req.TargetName.
 //
 // RecordSessionCall additionally writes a secondary sequenceBlock-history marker
 // keyed the way the lookup parses the bare/natural spelling (split on the leading
@@ -548,20 +559,20 @@ func sessionTargetName(req *capability.EnforceRequest) string {
 			return n
 		}
 	}
-	return strings.TrimSpace(StripEnginePrefix(req.ToolName))
+	return strings.TrimSpace(StripEnginePrefix(req.TargetName))
 }
 
 // sessionTargetKey derives the (targetType, name) pair that identifies a target in
 // both the sequenceBlock-history and maxCalls counter buckets. The type prefers the
-// explicit req.Target.Type, falling back to the req.ToolName prefix (bare defaults to
+// explicit req.Target.Type, falling back to the req.TargetName prefix (bare defaults to
 // "tool"); the name comes from sessionTargetName (Target.Name verbatim, else the
-// prefix-stripped ToolName). RecordSessionCall and maxCallsBucket both key their
+// prefix-stripped TargetName). RecordSessionCall and maxCallsBucket both key their
 // buckets through it so a direct ValidateAction caller that leaves req.Target nil and
 // the antecedent record land on the SAME bucket under the SAME derivation.
 // handleSequenceBlock deliberately does NOT use this: it keeps a display-name fallback
 // that reports "(unknown)" for an unnamed blocked target.
 func sessionTargetKey(req *capability.EnforceRequest) (targetType, name string) {
-	targetType, _ = splitEnginePrefix(req.ToolName)
+	targetType, _ = splitEnginePrefix(req.TargetName)
 	if req.Target != nil && req.Target.Type != "" {
 		targetType = req.Target.Type
 	}
@@ -1204,10 +1215,10 @@ const resourceScoreWeight = 10
 // is stable: at equal specificity, the first in the list wins.
 func (e *Engine) findMatchingCapability(req *capability.EnforceRequest, capabilities []capability.Constraint) *capability.Constraint {
 	// Resolve the request's namespace type and bare name: type from explicit
-	// req.Target.Type when present, else the req.ToolName prefix (bare defaults to
+	// req.Target.Type when present, else the req.TargetName prefix (bare defaults to
 	// "tool"). Splitting the prefix lets a "tool:read_file" manifest entry match a
-	// bare ToolName "read_file" while a prefixed ToolName still works.
-	reqType, bareToolName := splitEnginePrefix(req.ToolName)
+	// bare TargetName "read_file" while a prefixed TargetName still works.
+	reqType, bareToolName := splitEnginePrefix(req.TargetName)
 	if req.Target != nil {
 		if req.Target.Type != "" {
 			reqType = req.Target.Type
@@ -1228,7 +1239,7 @@ func (e *Engine) findMatchingCapability(req *capability.EnforceRequest, capabili
 		constraint := &capabilities[i]
 		// The namespace type must match on both sides; comparing only bare names
 		// would let a "resource:*" constraint approve any tool call. A bare untyped
-		// req.ToolName defaults to "tool".
+		// req.TargetName defaults to "tool".
 		constraintType, bare := splitEnginePrefix(constraint.Target)
 		if constraintType != reqType {
 			continue
@@ -1264,7 +1275,7 @@ func (e *Engine) findMatchingCapability(req *capability.EnforceRequest, capabili
 // The returned constraint carries no enforcement mode and no conditions: it exists only
 // to be handed to CollectObligations.
 func namingTargetConstraint(req *capability.EnforceRequest, capabilities []capability.Constraint) *capability.Constraint {
-	reqType, bareName := splitEnginePrefix(req.ToolName)
+	reqType, bareName := splitEnginePrefix(req.TargetName)
 	if req.Target != nil {
 		if req.Target.Type != "" {
 			reqType = req.Target.Type

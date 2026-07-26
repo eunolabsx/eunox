@@ -2051,6 +2051,32 @@ capabilities:
 			wantErr: "case-colliding keys",
 		},
 		{
+			// The runtime compiler keys the column-restriction index on
+			// ToLower(TrimSpace(table)), so " users" and "users" address ONE bucket and
+			// one allowlist silently overwrites the other under randomized map iteration
+			// order — the same contradiction the case-collision check above rejects, just
+			// reached through whitespace. Detecting it on the untrimmed name let this
+			// manifest load, after which which ACL survived was decided per process:
+			// roughly one start in N enforced the wider list, with nothing in the audit
+			// log to show it.
+			name: "allowedTables whitespace-colliding columns keys rejected",
+			yaml: `schemaVersion: "0.1"
+name: "p"
+version: "0.1.0"
+capabilities:
+  - target: "tool:query_sales"
+    actions: [call]
+    conditions:
+      - type: allowedTables
+        argument: table
+        tables: [users]
+        columns:
+          users: [id]
+          " users": [id, ssn_hash]
+`,
+			wantErr: "case-colliding keys",
+		},
+		{
 			// An empty column allowlist for a table is a permanently
 			// unfulfillable condition (every access to that table is denied), so it
 			// must be rejected at validate-time rather than discovered as a confusing

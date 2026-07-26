@@ -998,6 +998,14 @@ func validateLocalManifest(m *LocalManifest) error {
 				if err := validateAllowedOperations(i, j, v); err != nil {
 					return err
 				}
+				// Pre-trim the allowlist entries once at load so the hot path stops
+				// re-trimming them per request (mirrors the IPRange/TimeWindow Compile
+				// below). Only the pointer case is evaluated at runtime (the value case
+				// is a copy). Compile cannot fail; the error is still checked so a future
+				// normalization that can fail is caught here rather than silently skipped.
+				if err := v.Compile(); err != nil {
+					return fmt.Errorf("capability at index %d, condition %d: %w", i, j, err)
+				}
 			case capability.AllowedExtensionsCondition:
 				if err := validateAllowedExtensions(i, j, &v); err != nil {
 					return err
@@ -1005,6 +1013,12 @@ func validateLocalManifest(m *LocalManifest) error {
 			case *capability.AllowedExtensionsCondition:
 				if err := validateAllowedExtensions(i, j, v); err != nil {
 					return err
+				}
+				// Normalize the extension allowlist (lowercase, dot-prefix, dedupe) once
+				// at load so the hot path stops rebuilding it — and its dedupe map — per
+				// request. Only the pointer case is evaluated at runtime.
+				if err := v.Compile(); err != nil {
+					return fmt.Errorf("capability at index %d, condition %d: %w", i, j, err)
 				}
 			case capability.AllowedTablesCondition:
 				if err := validateAllowedTables(i, j, &v); err != nil {
@@ -1014,6 +1028,12 @@ func validateLocalManifest(m *LocalManifest) error {
 				if err := validateAllowedTables(i, j, v); err != nil {
 					return err
 				}
+				// Build the case-folded table set, column-restriction index, and per-table
+				// column sets once at load; the hot path rebuilt all three on every
+				// enforced call. Only the pointer case is evaluated at runtime.
+				if err := v.Compile(); err != nil {
+					return fmt.Errorf("capability at index %d, condition %d: %w", i, j, err)
+				}
 			case capability.RecipientDomainCondition:
 				if err := validateRecipientDomain(i, j, &v); err != nil {
 					return err
@@ -1021,6 +1041,11 @@ func validateLocalManifest(m *LocalManifest) error {
 			case *capability.RecipientDomainCondition:
 				if err := validateRecipientDomain(i, j, v); err != nil {
 					return err
+				}
+				// Build the case-folded domain set once at load rather than per request.
+				// Only the pointer case is evaluated at runtime.
+				if err := v.Compile(); err != nil {
+					return fmt.Errorf("capability at index %d, condition %d: %w", i, j, err)
 				}
 			case capability.AllowedValuesCondition:
 				if err := validateAllowedValues(i, j, &v); err != nil {
@@ -1230,7 +1255,14 @@ func validateAllowedTables(i, j int, v *capability.AllowedTablesCondition) error
 	}
 	seen := make(map[string]string, len(v.Columns))
 	for table, cols := range v.Columns {
-		key := strings.ToLower(table)
+		// Normalize EXACTLY as the runtime compiler does (ToLower AFTER TrimSpace).
+		// Checking collisions on the untrimmed name while the engine keys on the trimmed
+		// one let {"users", " users"} pass validation and then collapse onto one bucket,
+		// with which column allowlist survived decided by randomized map iteration order
+		// — so a manifest could enforce a narrower ACL on one process and a wider one on
+		// the next, silently. Trimming here is what makes the "case-colliding keys"
+		// rejection cover the whitespace-colliding case too.
+		key := strings.ToLower(strings.TrimSpace(table))
 		if prior, dup := seen[key]; dup {
 			return fmt.Errorf("capability at index %d, condition %d: allowedTables 'columns' has case-colliding keys %q and %q; table names are matched case-insensitively, so they address the same table and one column allowlist would non-deterministically overwrite the other — merge them under a single key", i, j, prior, table)
 		}
@@ -1325,7 +1357,8 @@ func validateAllowedValues(i, j int, v *capability.AllowedValuesCondition) error
 }
 
 // validateRedactFields rejects the structurally malformed redactFields paths the
-// runtime redactor (pdp.RedactDotPath) would silently no-op on — forwarding the
+// runtime redactor (internal/pdp's redactDotPathRec, whose root marker is stripped by
+// normalizeDotPathRoot) would silently no-op on — forwarding the
 // field unredacted while the audit record reports redaction applied, a fail-open
 // leak. The redactor splits on '.' and looks up each segment as a literal object
 // key, so array-index notation ("users[0].ssn"), an empty segment ("a..b"), or a
@@ -1352,7 +1385,7 @@ func validateRedactFields(i, j int, fields []string) error {
 			return fmt.Errorf("capability at index %d, directive %d: redactFields path %q uses array-index notation ('[N]'), which is not supported and would silently redact nothing; use a dot path such as \"users.ssn\" to redact the field from every array element, or omit the index", i, j, field)
 		}
 		// Strip the leading root marker ("$." or a lone "$") before splitting, mirroring
-		// RedactDotPath. Any OTHER "$"-prefixed form is rejected below: the runtime
+		// the redactor. Any OTHER "$"-prefixed form is rejected below: the runtime
 		// normalizeDotPathRoot strips only those two spellings, so a path like
 		// "$users.ssn" (a likely typo for "$.users.ssn") would reach the redactor
 		// unchanged, which then looks up a literal first key "$users", finds nothing, and

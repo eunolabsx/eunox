@@ -34,10 +34,40 @@ Section conventions:
   an incident reconstruction had no signed evidence of when the stop was tripped
   or that it was authorized. Written only after the kill takes effect; the control
   token is never recorded. See `docs/threat-model-mcp.md` §3.7.
+- `capability.MatchOperation`, plus `Compile`/`AllowsOperation`/`MatchExtensions`/
+  `TableLookup`/`MatchDomains` on the `allowedOperations`, `allowedExtensions`,
+  `allowedTables`, and `recipientDomain` conditions. `Compile` normalizes a condition's
+  allowlist once at manifest load so the hot path stops rebuilding it per request; the
+  accessors serve that cached form and fall back to normalizing on the spot for a
+  condition built programmatically. The cached form has no invalidation, so a
+  condition's allowlist fields are immutable once compiled, and the accessors' results
+  are read-only — see the doc comments in `pkg/capability/condition.go`.
 - `capability.FloatToInt64`, the single definition of "exactly representable as an
   int64" now shared by manifest-load bound validation and the runtime comparison.
 
 ### Changed
+
+- **`capability.EnforceRequest.ToolName` is now `TargetName`** (JSON `toolName` →
+  `targetName`). The field always carried every enforced namespace — resource URIs,
+  prompt names, `system:` targets — not just tool names, so the old name misread the
+  data and forced every helper reconciling it with `Target` to explain the mismatch.
+  Library callers constructing an `EnforceRequest` directly must rename the field.
+  The input document `BuildRegoInput` produces is unaffected — it exposes
+  `input.target.*` and never carried `toolName` — but a custom `PolicyEvaluator` that
+  builds its own input by marshaling the `*EnforceRequest` it is handed will now emit
+  `targetName`. A Rego rule matching on `input.toolName` would become undefined rather
+  than error, which is a silent fail-open, so audit any evaluator that marshals the
+  request itself.
+- **`killswitch.NewRedis` takes options** — `NewRedis(client, WithFailOpen(...),
+  WithReconcileInterval(...), WithLogger(...), WithSessionKillTTL(...))` — replacing
+  the chained `With*` setters. Every one of those fields is read by `ShouldBlock` and
+  the background loops without synchronization, so their "must be called before
+  `Start`" contract was enforceable only by doc comment. Matches `pkg/callcounter`,
+  `pkg/flowlabelstore`, and `pkg/circuitbreaker`.
+- A whitespace-only literal `upstreamAuthHeader` is rejected at config load, joining
+  the guard `listen.authToken` already had. The env-ref leg already rejected a
+  reference expanding to whitespace, but it only runs for values containing a
+  reference, so a literal one reached neither guard.
 
 - **`eunox validate` usage errors now exit 2, not 1.** Exit 1 is reserved for
   "drift warnings present, operator review required" — the code CI pipelines gate
@@ -64,6 +94,24 @@ Section conventions:
   probes use and builds the whole request.
 
 ### Fixed
+
+- **`sequenceBlock` no longer expires purely by wall clock.** The per-(session,
+  tool) antecedent marker was refreshed only by a fresh call to the antecedent, so a
+  session that ran the antecedent once had its "deny B after A" guarantee fail OPEN
+  24h later even while still live and still probing the blocked target. A blocked
+  call that finds the marker now re-arms it, so the window measures inactivity of the
+  antecedent/blocked pair. The residual limit — a session quiet on both legs for a
+  full window — is documented in the manifest guide.
+- The CLI live probe (`init`, `validate --live`, `doctor --live`) skips a stray
+  non-JSON line on a stdio upstream's stdout instead of aborting with exit 2. A
+  banner or debug print is common in npx-launched servers, and the running proxy
+  already skips them, so onboarding failed against servers eunox itself can front.
+- A host response dropped on a reaped killed session is audited as
+  `http-server-response`, not `http-notification`. That branch is the one place a
+  response and a notification share an arm, so the transport-leg detail — which
+  exists to distinguish drop sites during an incident — named the wrong site.
+- `fetchSpecLive` fails closed on an unknown upstream transport instead of probing it
+  as HTTP, matching its `fetchRouteLive` sibling.
 
 - A gateway route configured with no audit sink wrapped `nil` in a `routeSink`, so
   every "no sink configured" fast path in the shared enforcement core was dead —

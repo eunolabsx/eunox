@@ -510,10 +510,17 @@ func decodeAuditRecord(line []byte) (auditRecord, bool) {
 // isSignedRecord reports whether rec belongs to the signed era, i.e. carries a
 // non-empty HMAC — writeRecord signs every record it writes unconditionally, so a
 // genuinely written record's HMAC presence is exactly what distinguishes it from a
-// pre-chain legacy record. Single source of truth for this discriminator: every
-// signed/legacy split in this file (VerifyRecord's lenient-decode fallback and
-// canonical-form check, and updateChain's signedSeen latch) reuses it instead of
-// re-deriving the check, so a future decoy shape only needs updating here.
+// pre-chain legacy record.
+//
+// Single source of truth for this discriminator: EVERY signed/legacy split in this
+// file routes through it — VerifyRecord's lenient-decode fallback and canonical-form
+// check, updateChain's signedSeen latch and prevWasLegacyHead, processLine's
+// forgedLegacySplice, and classify's legacy bucket — rather than re-deriving the
+// comparison. That is what makes the promise load-bearing: today every spelling is
+// behaviorally identical, but a future change to what a signed record looks like
+// (an added decoy shape, a different empty sentinel) would otherwise have to find
+// and update each open-coded check, and a missed one would silently classify a
+// forged record into the legacy bucket that exists to be lenient.
 func isSignedRecord(rec auditRecord) bool {
 	return rec.HMAC != ""
 }
@@ -556,7 +563,7 @@ func (v *auditChainVerifier) processLine(line []byte) {
 	// two components would disagree on what the identical on-disk shape means. A
 	// genuine head legacy record (signedSeen false) is NOT excluded here, whatever its
 	// seq, so the legacy->first-signed transition still verifies.
-	forgedLegacySplice := rec.HMAC == "" && v.signedSeen
+	forgedLegacySplice := !isSignedRecord(rec) && v.signedSeen
 
 	// Chain verification runs over every decodable record (except the decoys above),
 	// independent of the filter; the reporting filter is applied only afterward.
@@ -688,7 +695,7 @@ func (v *auditChainVerifier) updateChain(rec auditRecord) {
 	// resume (`rec.Seq = s.seq+1`, seeded from the tail's own seq) only ever produces
 	// after a seq-0 tail — a seq-bearing tail's next record starts at tail.Seq+1, so
 	// leaving this narrower does not miss that case.
-	v.prevWasLegacyHead = rec.HMAC == "" && rec.Seq == 0
+	v.prevWasLegacyHead = !isSignedRecord(rec) && rec.Seq == 0
 	// signedSeen means "a genuinely SIGNED record has been seen" (gating both the
 	// seq-gap check above and forgedLegacySplice in processLine), which is exactly
 	// isSignedRecord: a legacy record can itself carry a non-zero seq (the
@@ -735,7 +742,7 @@ func (v *auditChainVerifier) classify(line []byte, rec auditRecord, unmarshalOK,
 	// across the upgrade boundary. The exemption holds only at the head: an
 	// HMAC-less record AFTER a signed one is a forged splice that would otherwise
 	// launder through the legacy bucket, so classify it invalid.
-	if rec.HMAC == "" {
+	if !isSignedRecord(rec) {
 		// Use the forgedLegacySplice computed in processLine rather than re-deriving
 		// it from v.signedSeen, so classify stays a pure function of its inputs.
 		if forgedLegacySplice {

@@ -1921,7 +1921,7 @@ func TestEmptyActions_ValidateAction_FailsClosed(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			engine := enforcement.New()
-			req := &capability.EnforceRequest{SessionID: "sess", ToolName: "read_file"}
+			req := &capability.EnforceRequest{SessionID: "sess", TargetName: "read_file"}
 
 			resp := engine.ValidateAction(context.Background(), req, []capability.Constraint{
 				{Target: "tool:read_file", Actions: tc.actions},

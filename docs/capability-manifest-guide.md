@@ -1638,6 +1638,18 @@ before in the session.
 - It requires a call-counter backend (the same one `maxCalls` uses); with no
   counter, or an `EnforceRequest` carrying no `sessionId`, the condition fails
   closed.
+- **Retention limitation** (long-lived sessions): session history is held for
+  **24 hours of inactivity**, after which the antecedent marker is reclaimed and a
+  later blocked call is **allowed**. The clock is reset by activity on either leg
+  of the pair — every fresh call to the antecedent re-records its marker, and every
+  blocked call that finds the marker re-arms it — so an agent that is actually
+  working keeps the block armed indefinitely. What does expire is a session that
+  goes quiet on **both** legs for a full day: an agent that called
+  `read_credentials` on Monday, did unrelated work, and first attempts
+  `write_external` on Wednesday is **not** blocked. Sessions that outlive a day of
+  such inactivity should not be relied on to carry a `sequenceBlock` guarantee
+  across the gap; end the session (or re-establish it) at a boundary you control,
+  so the guarantee's scope matches an interval you can reason about.
 - **Recording** is fail-closed too. Every allowed call is written to session
   history (so any tool can later serve as an antecedent), and if the counter
   backend errors during that write, the call that triggered it is **denied**

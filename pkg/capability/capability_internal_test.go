@@ -226,9 +226,9 @@ func TestObligationRoundTrip(t *testing.T) {
 
 func TestEnforceRequestResponseRoundTrip(t *testing.T) {
 	request := EnforceRequest{
-		SessionID: "session-1",
-		ToolName:  "sql.query",
-		Arguments: map[string]interface{}{"statement": "select 1", "limit": 10},
+		SessionID:  "session-1",
+		TargetName: "sql.query",
+		Arguments:  map[string]interface{}{"statement": "select 1", "limit": 10},
 		Context: EnforceRequestContext{
 			SourceIP: "10.0.0.10",
 			Now:      "2025-03-01T12:00:00Z",
@@ -241,7 +241,7 @@ func TestEnforceRequestResponseRoundTrip(t *testing.T) {
 	var decodedRequest EnforceRequest
 	require.NoError(t, json.Unmarshal(requestData, &decodedRequest))
 	assert.Equal(t, request.SessionID, decodedRequest.SessionID)
-	assert.Equal(t, request.ToolName, decodedRequest.ToolName)
+	assert.Equal(t, request.TargetName, decodedRequest.TargetName)
 	assert.Equal(t, request.Context.SourceIP, decodedRequest.Context.SourceIP)
 	assert.Equal(t, request.Context.Now, decodedRequest.Context.Now)
 

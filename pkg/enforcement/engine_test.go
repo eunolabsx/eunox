@@ -15,7 +15,7 @@
 //     that already found the winning constraint skip the second match pass.
 //
 //   - ValidateAction / FindMatchingCapability now strip the namespace prefix
-//     from constraint.Target so v0.2 prefixed manifests match bare req.ToolName.
+//     from constraint.Target so v0.2 prefixed manifests match bare req.TargetName.
 
 // Additional coverage for condition handlers, the as* type-assertion helpers,
 // the JSON-schema validator, and engine matching/scoring edge cases.
@@ -65,8 +65,8 @@ func TestEngine_ValidateAction_NoMatchingCapability(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "unknown-tool",
+		SessionID:  "sess-1",
+		TargetName: "unknown-tool",
 	}
 
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
@@ -81,8 +81,8 @@ func TestEngine_ValidateAction_AllowWildcard(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "any-tool",
+		SessionID:  "sess-1",
+		TargetName: "any-tool",
 	}
 
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
@@ -98,8 +98,8 @@ func TestEngine_ValidateAction_AllowExactMatch(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "email:send",
+		SessionID:  "sess-1",
+		TargetName: "email:send",
 	}
 
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
@@ -113,8 +113,8 @@ func TestEngine_ValidateAction_PrefixMatch(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "file:read",
+		SessionID:  "sess-1",
+		TargetName: "file:read",
 	}
 
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
@@ -130,8 +130,8 @@ func TestEngine_TimeWindow_Allow(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "tool",
+		SessionID:  "sess-1",
+		TargetName: "tool",
 	}
 
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
@@ -156,8 +156,8 @@ func TestEngine_TimeWindow_DenyBefore(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "tool",
+		SessionID:  "sess-1",
+		TargetName: "tool",
 	}
 
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
@@ -182,8 +182,8 @@ func TestEngine_TimeWindow_DenyAfter(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "tool",
+		SessionID:  "sess-1",
+		TargetName: "tool",
 	}
 
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
@@ -229,7 +229,7 @@ func TestEngine_TimeWindow_Boundaries(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			engine := enforcement.New(enforcement.WithClock(newFakeClock(tc.now)))
-			resp := engine.ValidateAction(context.Background(), &capability.EnforceRequest{ToolName: "tool"}, constraints)
+			resp := engine.ValidateAction(context.Background(), &capability.EnforceRequest{TargetName: "tool"}, constraints)
 			assert.Equal(t, tc.want, resp.Decision)
 		})
 	}
@@ -240,9 +240,9 @@ func TestEngine_IPRange_Allow(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "tool",
-		Context:   capability.EnforceRequestContext{SourceIP: "10.0.1.50"},
+		SessionID:  "sess-1",
+		TargetName: "tool",
+		Context:    capability.EnforceRequestContext{SourceIP: "10.0.1.50"},
 	}
 
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
@@ -262,9 +262,9 @@ func TestEngine_IPRange_Deny(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "tool",
-		Context:   capability.EnforceRequestContext{SourceIP: "192.168.1.1"},
+		SessionID:  "sess-1",
+		TargetName: "tool",
+		Context:    capability.EnforceRequestContext{SourceIP: "192.168.1.1"},
 	}
 
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
@@ -285,8 +285,8 @@ func TestEngine_IPRange_MissingSourceIP(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "tool",
+		SessionID:  "sess-1",
+		TargetName: "tool",
 	}
 
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
@@ -307,8 +307,8 @@ func TestEngine_IPRange_InvalidCIDR(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "tool",
+		SessionID:  "sess-1",
+		TargetName: "tool",
 		Context: capability.EnforceRequestContext{
 			SourceIP: "10.0.0.1",
 		},
@@ -337,17 +337,17 @@ func TestEngine_RecordSessionCall(t *testing.T) {
 	ctx := context.Background()
 
 	antecedent := &capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "read_credentials",
-		Target:    &capability.EnforceRequestTarget{Type: "tool", Name: "read_credentials"},
+		SessionID:  "sess-1",
+		TargetName: "read_credentials",
+		Target:     &capability.EnforceRequestTarget{Type: "tool", Name: "read_credentials"},
 	}
 	require.NoError(t, engine.RecordSessionCall(ctx, antecedent))
 
 	// A sequenceBlock naming the recorded tool must now fire for another tool.
 	blocked := &capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "write_external",
-		Target:    &capability.EnforceRequestTarget{Type: "tool", Name: "write_external"},
+		SessionID:  "sess-1",
+		TargetName: "write_external",
+		Target:     &capability.EnforceRequestTarget{Type: "tool", Name: "write_external"},
 	}
 	matched := &capability.Constraint{
 		Target:  "tool:write_external",
@@ -363,7 +363,7 @@ func TestEngine_RecordSessionCall(t *testing.T) {
 
 	// Guard paths return nil without recording: no session ID, and a fresh engine
 	// with no counter configured.
-	require.NoError(t, engine.RecordSessionCall(ctx, &capability.EnforceRequest{ToolName: "x"}))
+	require.NoError(t, engine.RecordSessionCall(ctx, &capability.EnforceRequest{TargetName: "x"}))
 	require.NoError(t, enforcement.New().RecordSessionCall(ctx, antecedent))
 }
 
@@ -373,8 +373,8 @@ func TestEngine_MaxCalls_Allow(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "tool",
+		SessionID:  "sess-1",
+		TargetName: "tool",
 	}
 
 	caps := []capability.Constraint{
@@ -398,8 +398,8 @@ func TestEngine_MaxCalls_Deny(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "tool",
+		SessionID:  "sess-1",
+		TargetName: "tool",
 	}
 
 	caps := []capability.Constraint{
@@ -448,7 +448,7 @@ func TestEngine_MaxCalls_NotConsumedWhenLaterConditionDenies(t *testing.T) {
 	}
 
 	bad := capability.EnforceRequest{
-		SessionID: "sess-1", ToolName: "read_file",
+		SessionID: "sess-1", TargetName: "read_file",
 		Arguments: map[string]interface{}{"path": "/etc/passwd"},
 	}
 	// Three calls that fail allowedValues; each would previously have burned a slot.
@@ -460,7 +460,7 @@ func TestEngine_MaxCalls_NotConsumedWhenLaterConditionDenies(t *testing.T) {
 	}
 
 	good := capability.EnforceRequest{
-		SessionID: "sess-1", ToolName: "read_file",
+		SessionID: "sess-1", TargetName: "read_file",
 		Arguments: map[string]interface{}{"path": "/safe/ok.txt"},
 	}
 	// The full quota of 2 must still be available — the denied calls consumed none.
@@ -487,7 +487,7 @@ func TestEngine_MaxCalls_EmptySessionIDDenies(t *testing.T) {
 
 	req := capability.EnforceRequest{
 		// SessionID intentionally blank.
-		ToolName: "tool",
+		TargetName: "tool",
 	}
 
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
@@ -517,8 +517,8 @@ func TestEngine_MaxCalls_EmptyToolNameDenies(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "tool:", // strips to ""
+		SessionID:  "sess-1",
+		TargetName: "tool:", // strips to ""
 	}
 
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
@@ -559,7 +559,7 @@ func TestEngine_MaxCalls_PrefixNormalizedKey(t *testing.T) {
 	}
 
 	// Two allowed calls with the prefixed form fill the window.
-	prefixed := capability.EnforceRequest{SessionID: "sess-1", ToolName: "tool:read_file"}
+	prefixed := capability.EnforceRequest{SessionID: "sess-1", TargetName: "tool:read_file"}
 	for i := 0; i < 2; i++ {
 		resp := engine.ValidateAction(ctx, &prefixed, caps)
 		require.Equal(t, capability.DecisionAllow, resp.Decision, "prefixed call %d should be allowed", i+1)
@@ -568,7 +568,7 @@ func TestEngine_MaxCalls_PrefixNormalizedKey(t *testing.T) {
 	// Switching to the bare form must hit the SAME exhausted bucket, not a fresh
 	// one. Before the fix this was admitted because the key was built from the raw
 	// "tool:read_file" while the bare request keyed on "read_file".
-	bare := capability.EnforceRequest{SessionID: "sess-1", ToolName: "read_file"}
+	bare := capability.EnforceRequest{SessionID: "sess-1", TargetName: "read_file"}
 	resp := engine.ValidateAction(ctx, &bare, caps)
 	assert.Equal(t, capability.DecisionDeny, resp.Decision, "bare form must share the prefixed form's quota bucket")
 	require.NotNil(t, resp.Denial)
@@ -576,7 +576,7 @@ func TestEngine_MaxCalls_PrefixNormalizedKey(t *testing.T) {
 }
 
 func TestEngine_MaxCalls_TargetTypeNamespacesQuota(t *testing.T) {
-	// Regression: req.ToolName is the bare target name, so a tool, a
+	// Regression: req.TargetName is the bare target name, so a tool, a
 	// prompt, and a resource that share a name ("export") used to produce the
 	// identical session-and-name counter key and drained one quota bucket between
 	// them. The key now includes req.Target.Type (and the window length), so each
@@ -599,9 +599,9 @@ func TestEngine_MaxCalls_TargetTypeNamespacesQuota(t *testing.T) {
 	}
 	reqFor := func(targetType string) capability.EnforceRequest {
 		return capability.EnforceRequest{
-			SessionID: sessionID,
-			ToolName:  name,
-			Target:    &capability.EnforceRequestTarget{Type: targetType, Name: name},
+			SessionID:  sessionID,
+			TargetName: name,
+			Target:     &capability.EnforceRequestTarget{Type: targetType, Name: name},
 		}
 	}
 
@@ -662,11 +662,11 @@ func TestEngine_MaxCalls_NilTargetResolvesToToolType(t *testing.T) {
 		Actions:    []string{"*"},
 		Conditions: []capability.Condition{&capability.MaxCallsCondition{Count: 2, WindowSeconds: 60}},
 	}}
-	nilTargetReq := capability.EnforceRequest{SessionID: sessionID, ToolName: name} // Target intentionally nil
+	nilTargetReq := capability.EnforceRequest{SessionID: sessionID, TargetName: name} // Target intentionally nil
 	toolReq := capability.EnforceRequest{
-		SessionID: sessionID,
-		ToolName:  name,
-		Target:    &capability.EnforceRequestTarget{Type: "tool", Name: name},
+		SessionID:  sessionID,
+		TargetName: name,
+		Target:     &capability.EnforceRequestTarget{Type: "tool", Name: name},
 	}
 
 	// Exhaust the shared bucket via the nil-Target request.
@@ -704,9 +704,9 @@ func TestEngine_MaxCalls_DistinctWindowsCountIndependently(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "export",
-		Target:    &capability.EnforceRequestTarget{Type: "tool", Name: "export"},
+		SessionID:  "sess-1",
+		TargetName: "export",
+		Target:     &capability.EnforceRequestTarget{Type: "tool", Name: "export"},
 	}
 
 	// A tight short window (10 per minute) and a loose long window (1000 per hour).
@@ -761,9 +761,9 @@ func TestEngine_MaxCalls_LongWindowNotPrunedByShortWindow(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "export",
-		Target:    &capability.EnforceRequestTarget{Type: "tool", Name: "export"},
+		SessionID:  "sess-1",
+		TargetName: "export",
+		Target:     &capability.EnforceRequestTarget{Type: "tool", Name: "export"},
 	}
 	caps := []capability.Constraint{{
 		Target:  "tool:export",
@@ -803,9 +803,9 @@ func TestEngine_AllowedOperations_Allow(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "file",
-		Arguments: map[string]interface{}{"op": "read"},
+		SessionID:  "sess-1",
+		TargetName: "file",
+		Arguments:  map[string]interface{}{"op": "read"},
 	}
 
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
@@ -825,9 +825,9 @@ func TestEngine_AllowedOperations_Deny(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "file",
-		Arguments: map[string]interface{}{"op": "delete"},
+		SessionID:  "sess-1",
+		TargetName: "file",
+		Arguments:  map[string]interface{}{"op": "delete"},
 	}
 
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
@@ -852,9 +852,9 @@ func TestEngine_AllowedOperations_WildcardDoesNotAllowAnyVerb(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "query_db",
-		Arguments: map[string]interface{}{"sql": "DROP TABLE users"},
+		SessionID:  "sess-1",
+		TargetName: "query_db",
+		Arguments:  map[string]interface{}{"sql": "DROP TABLE users"},
 	}
 
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
@@ -875,9 +875,9 @@ func TestEngine_AllowedExtensions_Allow(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "file:read",
-		Arguments: map[string]interface{}{"path": "/docs/report.pdf"},
+		SessionID:  "sess-1",
+		TargetName: "file:read",
+		Arguments:  map[string]interface{}{"path": "/docs/report.pdf"},
 	}
 
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
@@ -897,9 +897,9 @@ func TestEngine_AllowedExtensions_Deny(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "file:read",
-		Arguments: map[string]interface{}{"path": "/etc/passwords.sh"},
+		SessionID:  "sess-1",
+		TargetName: "file:read",
+		Arguments:  map[string]interface{}{"path": "/etc/passwords.sh"},
 	}
 
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
@@ -927,9 +927,9 @@ func TestEngine_AllowedExtensions_BackslashSeparator(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "file:read",
-		Arguments: map[string]interface{}{"path": `safe.pdf\malware.exe`},
+		SessionID:  "sess-1",
+		TargetName: "file:read",
+		Arguments:  map[string]interface{}{"path": `safe.pdf\malware.exe`},
 	}
 
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
@@ -959,9 +959,9 @@ func TestEngine_AllowedExtensions_BackslashAllowedFile(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "file:read",
-		Arguments: map[string]interface{}{"path": `malware.exe\report.pdf`},
+		SessionID:  "sess-1",
+		TargetName: "file:read",
+		Arguments:  map[string]interface{}{"path": `malware.exe\report.pdf`},
 	}
 
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
@@ -984,9 +984,9 @@ func TestEngine_AllowedExtensions_BackslashAllowedFile(t *testing.T) {
 func TestEngine_AllowedExtensions_BlankArrayElementFailsClosed(t *testing.T) {
 	engine := enforcement.New()
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "file:read",
-		Arguments: map[string]interface{}{"paths": []interface{}{"/data/report.pdf", "  "}},
+		SessionID:  "sess-1",
+		TargetName: "file:read",
+		Arguments:  map[string]interface{}{"paths": []interface{}{"/data/report.pdf", "  "}},
 	}
 	resp := engine.ValidateAction(context.Background(), &req, []capability.Constraint{
 		{
@@ -1009,9 +1009,9 @@ func TestEngine_AllowedExtensions_BlankArrayElementFailsClosed(t *testing.T) {
 func TestEngine_RecipientDomain_BlankArrayElementFailsClosed(t *testing.T) {
 	engine := enforcement.New()
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "tool:send_email",
-		Arguments: map[string]interface{}{"to": []interface{}{"alice@example.com", ""}},
+		SessionID:  "sess-1",
+		TargetName: "tool:send_email",
+		Arguments:  map[string]interface{}{"to": []interface{}{"alice@example.com", ""}},
 	}
 	resp := engine.ValidateAction(context.Background(), &req, []capability.Constraint{
 		{
@@ -1047,15 +1047,15 @@ func TestEngine_AllowedExtensions_NativeStringSlice(t *testing.T) {
 
 	// Allowed: every native-[]string entry has a permitted extension.
 	allow := engine.ValidateAction(context.Background(), &capability.EnforceRequest{
-		ToolName:  "file:read",
-		Arguments: map[string]interface{}{"paths": []string{"main.go", "app.ts"}},
+		TargetName: "file:read",
+		Arguments:  map[string]interface{}{"paths": []string{"main.go", "app.ts"}},
 	}, constraints)
 	assert.Equal(t, capability.DecisionAllow, allow.Decision)
 
 	// Denied on policy (not type): a disallowed extension in the native []string.
 	deny := engine.ValidateAction(context.Background(), &capability.EnforceRequest{
-		ToolName:  "file:read",
-		Arguments: map[string]interface{}{"paths": []string{"secret.pem"}},
+		TargetName: "file:read",
+		Arguments:  map[string]interface{}{"paths": []string{"secret.pem"}},
 	}, constraints)
 	require.Equal(t, capability.DecisionDeny, deny.Decision)
 	require.NotNil(t, deny.Denial)
@@ -1064,8 +1064,8 @@ func TestEngine_AllowedExtensions_NativeStringSlice(t *testing.T) {
 
 	// Blank entry in the native []string still fails closed.
 	blank := engine.ValidateAction(context.Background(), &capability.EnforceRequest{
-		ToolName:  "file:read",
-		Arguments: map[string]interface{}{"paths": []string{"main.go", "  "}},
+		TargetName: "file:read",
+		Arguments:  map[string]interface{}{"paths": []string{"main.go", "  "}},
 	}, constraints)
 	require.Equal(t, capability.DecisionDeny, blank.Decision)
 	assert.Contains(t, blank.Denial.Message, "blank element")
@@ -1085,9 +1085,9 @@ func TestEngine_AllowedExtensions_CompoundSuffixSemantics(t *testing.T) {
 	check := func(t *testing.T, allowlist []string, path string, want capability.Decision) {
 		t.Helper()
 		req := capability.EnforceRequest{
-			SessionID: "sess-1",
-			ToolName:  "file:read",
-			Arguments: map[string]interface{}{"path": path},
+			SessionID:  "sess-1",
+			TargetName: "file:read",
+			Arguments:  map[string]interface{}{"path": path},
 		}
 		resp := engine.ValidateAction(ctx, &req, []capability.Constraint{{
 			Target:  "file:read",
@@ -1115,8 +1115,8 @@ func TestEngine_AllowedTables_Allow(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "db:query",
+		SessionID:  "sess-1",
+		TargetName: "db:query",
 		Arguments: map[string]interface{}{
 			"table": map[string]interface{}{
 				"table":   "users",
@@ -1146,9 +1146,9 @@ func TestEngine_AllowedTables_DenyTable(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "db:query",
-		Arguments: map[string]interface{}{"table": "secrets"},
+		SessionID:  "sess-1",
+		TargetName: "db:query",
+		Arguments:  map[string]interface{}{"table": "secrets"},
 	}
 
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
@@ -1169,8 +1169,8 @@ func TestEngine_AllowedTables_DenyColumn(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "db:query",
+		SessionID:  "sess-1",
+		TargetName: "db:query",
 		Arguments: map[string]interface{}{
 			"table": map[string]interface{}{
 				"table":   "users",
@@ -1206,8 +1206,8 @@ func TestEngine_AllowedTables_WhitespacePaddedColumnAllowed(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "db:query",
+		SessionID:  "sess-1",
+		TargetName: "db:query",
 		Arguments: map[string]interface{}{
 			"table": map[string]interface{}{
 				"table":   "users",
@@ -1257,7 +1257,7 @@ func TestEngine_AllowedTables_BlankColumnFailsClosed(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := capability.EnforceRequest{
-				ToolName: "db:query",
+				TargetName: "db:query",
 				Arguments: map[string]interface{}{
 					"table": map[string]interface{}{
 						"table":   "users",
@@ -1298,7 +1298,7 @@ func TestEngine_AllowedTables_NativeStringColumns(t *testing.T) {
 	// A native []string requesting a forbidden column must now be denied, not
 	// silently allowed.
 	deny := engine.ValidateAction(ctx, &capability.EnforceRequest{
-		ToolName: "db:query",
+		TargetName: "db:query",
 		Arguments: map[string]interface{}{
 			"table": map[string]interface{}{
 				"table":   "users",
@@ -1312,7 +1312,7 @@ func TestEngine_AllowedTables_NativeStringColumns(t *testing.T) {
 
 	// A native []string within the allowed set is permitted.
 	allow := engine.ValidateAction(ctx, &capability.EnforceRequest{
-		ToolName: "db:query",
+		TargetName: "db:query",
 		Arguments: map[string]interface{}{
 			"table": map[string]interface{}{
 				"table":   "users",
@@ -1334,8 +1334,8 @@ func TestEngine_AllowedTables_EmptyColumnsWithRestriction(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-h3",
-		ToolName:  "db:query",
+		SessionID:  "sess-h3",
+		TargetName: "db:query",
 		Arguments: map[string]interface{}{
 			"table": map[string]interface{}{
 				"table":   "payments",
@@ -1367,8 +1367,8 @@ func TestEngine_RecipientDomain_Allow(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "email:send",
+		SessionID:  "sess-1",
+		TargetName: "email:send",
 		Arguments: map[string]interface{}{
 			"to": []interface{}{"user@example.com", "admin@example.com"},
 		},
@@ -1391,8 +1391,8 @@ func TestEngine_RecipientDomain_Deny(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "email:send",
+		SessionID:  "sess-1",
+		TargetName: "email:send",
 		Arguments: map[string]interface{}{
 			"to": []interface{}{"user@example.com", "evil@attacker.com"},
 		},
@@ -1426,9 +1426,9 @@ func TestEngine_RecipientDomain_MalformedDomain(t *testing.T) {
 		"user@example.com.",
 	} {
 		req := capability.EnforceRequest{
-			SessionID: "sess-1",
-			ToolName:  "email:send",
-			Arguments: map[string]interface{}{"to": addr},
+			SessionID:  "sess-1",
+			TargetName: "email:send",
+			Arguments:  map[string]interface{}{"to": addr},
 		}
 		resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
 			{
@@ -1453,8 +1453,8 @@ func TestEngine_RedactFields_ProducesObligation(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "tool",
+		SessionID:  "sess-1",
+		TargetName: "tool",
 	}
 
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
@@ -1479,8 +1479,8 @@ func TestEngine_PolicyCondition_DenyWhenNoEvaluatorConfigured(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "tool",
+		SessionID:  "sess-1",
+		TargetName: "tool",
 	}
 
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
@@ -1504,7 +1504,7 @@ func TestEngine_PolicyCondition_EvaluatorAllow(t *testing.T) {
 	engine := enforcement.New(enforcement.WithPolicyEvaluator(evaluator))
 	ctx := context.Background()
 
-	req := capability.EnforceRequest{SessionID: "sess-1", ToolName: "tool"}
+	req := capability.EnforceRequest{SessionID: "sess-1", TargetName: "tool"}
 
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
 		{
@@ -1530,7 +1530,7 @@ func TestEngine_PolicyCondition_EvaluatorDeny(t *testing.T) {
 	engine := enforcement.New(enforcement.WithPolicyEvaluator(evaluator))
 	ctx := context.Background()
 
-	req := capability.EnforceRequest{SessionID: "sess-1", ToolName: "tool"}
+	req := capability.EnforceRequest{SessionID: "sess-1", TargetName: "tool"}
 
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
 		{
@@ -1565,8 +1565,8 @@ func TestEngine_CustomCondition_DenyWhenNoHandlerRegistered(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "tool",
+		SessionID:  "sess-1",
+		TargetName: "tool",
 	}
 
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
@@ -1592,7 +1592,7 @@ func TestEngine_AllowedExtensions_MissingArgumentField(t *testing.T) {
 	engine := enforcement.New()
 	ctx := context.Background()
 
-	req := capability.EnforceRequest{SessionID: "sess-1", ToolName: "file:write"}
+	req := capability.EnforceRequest{SessionID: "sess-1", TargetName: "file:write"}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
 		{
 			Target:  "file:write",
@@ -1615,9 +1615,9 @@ func TestEngine_AllowedExtensions_ArgumentValueMissing(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "file:write",
-		Arguments: map[string]interface{}{"other": "value"},
+		SessionID:  "sess-1",
+		TargetName: "file:write",
+		Arguments:  map[string]interface{}{"other": "value"},
 	}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
 		{
@@ -1638,7 +1638,7 @@ func TestEngine_AllowedTables_MissingArgumentField(t *testing.T) {
 	engine := enforcement.New()
 	ctx := context.Background()
 
-	req := capability.EnforceRequest{SessionID: "sess-1", ToolName: "db:query"}
+	req := capability.EnforceRequest{SessionID: "sess-1", TargetName: "db:query"}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
 		{
 			Target:  "db:query",
@@ -1660,9 +1660,9 @@ func TestEngine_AllowedTables_ArgumentValueMissing(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "db:query",
-		Arguments: map[string]interface{}{"other": "irrelevant"},
+		SessionID:  "sess-1",
+		TargetName: "db:query",
+		Arguments:  map[string]interface{}{"other": "irrelevant"},
 	}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
 		{
@@ -1705,9 +1705,9 @@ func TestEngine_AllowedTables_WrongArgumentType(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := capability.EnforceRequest{
-				SessionID: "sess-1",
-				ToolName:  "db:query",
-				Arguments: map[string]interface{}{"table": tc.val},
+				SessionID:  "sess-1",
+				TargetName: "db:query",
+				Arguments:  map[string]interface{}{"table": tc.val},
 			}
 			resp := engine.ValidateAction(ctx, &req, caps)
 			assert.Equal(t, capability.DecisionDeny, resp.Decision)
@@ -1725,7 +1725,7 @@ func TestEngine_RecipientDomain_MissingArgumentField(t *testing.T) {
 	engine := enforcement.New()
 	ctx := context.Background()
 
-	req := capability.EnforceRequest{SessionID: "sess-1", ToolName: "email:send"}
+	req := capability.EnforceRequest{SessionID: "sess-1", TargetName: "email:send"}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
 		{
 			Target:  "email:send",
@@ -1747,9 +1747,9 @@ func TestEngine_RecipientDomain_ArgumentValueMissing(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "email:send",
-		Arguments: map[string]interface{}{"subject": "hello"},
+		SessionID:  "sess-1",
+		TargetName: "email:send",
+		Arguments:  map[string]interface{}{"subject": "hello"},
 	}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
 		{
@@ -1778,8 +1778,8 @@ func TestEngine_RegisterCustomCondition(t *testing.T) {
 	})))
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "tool",
+		SessionID:  "sess-1",
+		TargetName: "tool",
 	}
 
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
@@ -1802,8 +1802,8 @@ func TestEngine_MultipleConditions_AllMustPass(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "tool",
+		SessionID:  "sess-1",
+		TargetName: "tool",
 		Context: capability.EnforceRequestContext{
 			SourceIP: "10.0.0.5",
 		},
@@ -1834,8 +1834,8 @@ func TestEngine_MultipleConditions_FirstFailureDenies(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "tool",
+		SessionID:  "sess-1",
+		TargetName: "tool",
 		Context: capability.EnforceRequestContext{
 			SourceIP: "192.168.1.1", // Not in allowed range
 
@@ -1878,8 +1878,8 @@ func TestEngine_EmptyActions_FailsClosed(t *testing.T) {
 			ctx := context.Background()
 
 			req := capability.EnforceRequest{
-				SessionID: "sess-1",
-				ToolName:  "tool",
+				SessionID:  "sess-1",
+				TargetName: "tool",
 			}
 
 			resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
@@ -1897,9 +1897,9 @@ func TestEngine_AllowedExtensions_FromNamedArgument(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "file:write",
-		Arguments: map[string]interface{}{"filePath": "/tmp/data.csv"},
+		SessionID:  "sess-1",
+		TargetName: "file:write",
+		Arguments:  map[string]interface{}{"filePath": "/tmp/data.csv"},
 	}
 
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
@@ -1921,8 +1921,8 @@ func TestEngine_TimeWindow_IgnoresRequestContextNow(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "tool",
+		SessionID:  "sess-1",
+		TargetName: "tool",
 		Context: capability.EnforceRequestContext{
 			// Client supplies a different "now" that falls outside the window —
 			// the engine must not use it; it must use the server clock instead.
@@ -1947,8 +1947,8 @@ func TestEngine_TimeWindow_IgnoresRequestContextNow(t *testing.T) {
 
 	// Window is closed at the fixed server time (12:00) — should deny regardless of req.Context.Now
 	req2 := capability.EnforceRequest{
-		SessionID: "sess-2",
-		ToolName:  "tool",
+		SessionID:  "sess-2",
+		TargetName: "tool",
 		Context: capability.EnforceRequestContext{
 			// Client supplies a "now" inside the (future) window — must be ignored
 			Now: "2025-06-15T16:00:00Z",
@@ -2054,9 +2054,9 @@ func TestEngine_AllowedValues_Allow(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := capability.EnforceRequest{
-				SessionID: "sess-1",
-				ToolName:  "tool",
-				Arguments: tt.args,
+				SessionID:  "sess-1",
+				TargetName: "tool",
+				Arguments:  tt.args,
 			}
 			resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
 				{
@@ -2080,9 +2080,9 @@ func TestEngine_AllowedValues_Deny(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "tool",
-		Arguments: map[string]interface{}{"format": "xml"},
+		SessionID:  "sess-1",
+		TargetName: "tool",
+		Arguments:  map[string]interface{}{"format": "xml"},
 	}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
 		{
@@ -2140,9 +2140,9 @@ func TestEngine_AllowedValues_GlobDeny(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := capability.EnforceRequest{
-				SessionID: "sess-1",
-				ToolName:  "tool",
-				Arguments: tt.args,
+				SessionID:  "sess-1",
+				TargetName: "tool",
+				Arguments:  tt.args,
 			}
 			resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
 				{
@@ -2170,9 +2170,9 @@ func TestEngine_AllowedValues_MalformedGlobFallsThrough(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "tool",
-		Arguments: map[string]interface{}{"path": "/reports/q3.pdf"},
+		SessionID:  "sess-1",
+		TargetName: "tool",
+		Arguments:  map[string]interface{}{"path": "/reports/q3.pdf"},
 	}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
 		{
@@ -2196,8 +2196,8 @@ func TestEngine_ValidateAction_GlobQuestionMark(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "file:a",
+		SessionID:  "sess-1",
+		TargetName: "file:a",
 	}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
 		{Target: "file:?", Actions: []string{"*"}},
@@ -2210,8 +2210,8 @@ func TestEngine_ValidateAction_GlobQuestionMark_NoMatch(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "file:ab",
+		SessionID:  "sess-1",
+		TargetName: "file:ab",
 	}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
 		{Target: "file:?", Actions: []string{"*"}},
@@ -2224,8 +2224,8 @@ func TestEngine_ValidateAction_GlobCharacterClass(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "tool:b",
+		SessionID:  "sess-1",
+		TargetName: "tool:b",
 	}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
 		{Target: "tool:[abc]", Actions: []string{"*"}},
@@ -2238,8 +2238,8 @@ func TestEngine_ValidateAction_MidStringWildcard(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "file:data.csv",
+		SessionID:  "sess-1",
+		TargetName: "file:data.csv",
 	}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
 		{Target: "file:*.csv", Actions: []string{"*"}},
@@ -2266,7 +2266,7 @@ func TestEngine_MostSpecificMatch_NarrowCapabilityWins(t *testing.T) {
 	// Exact resource beats glob: email:send is more specific than email:*
 	engine := enforcement.New()
 	ctx := context.Background()
-	req := capability.EnforceRequest{ToolName: "email:send"}
+	req := capability.EnforceRequest{TargetName: "email:send"}
 
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
 		{Target: "email:*", Actions: []string{"call"}, Conditions: []capability.Condition{&capability.TimeWindowCondition{NotBefore: "2999-01-01T00:00:00Z"}}},
@@ -2279,7 +2279,7 @@ func TestEngine_MostSpecificMatch_ExactResourceBeatsWildcard(t *testing.T) {
 	// Exact resource entry (no conditions) wins over glob with a deny condition.
 	engine := enforcement.New()
 	ctx := context.Background()
-	req := capability.EnforceRequest{ToolName: "email:send"}
+	req := capability.EnforceRequest{TargetName: "email:send"}
 
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
 		{Target: "email:*", Actions: []string{"call"}, Conditions: []capability.Condition{&capability.TimeWindowCondition{NotBefore: "2999-01-01T00:00:00Z"}}},
@@ -2292,7 +2292,7 @@ func TestEngine_MostSpecificMatch_LongerPrefixWins(t *testing.T) {
 	// A longer literal prefix in a glob beats a shorter one.
 	engine := enforcement.New()
 	ctx := context.Background()
-	req := capability.EnforceRequest{ToolName: "tool:mail"}
+	req := capability.EnforceRequest{TargetName: "tool:mail"}
 
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
 		{Target: "tool:*", Actions: []string{"call"}, Conditions: []capability.Condition{&capability.TimeWindowCondition{NotBefore: "2999-01-01T00:00:00Z"}}},
@@ -2305,7 +2305,7 @@ func TestEngine_MostSpecificMatch_OrderingDoesNotMatter(t *testing.T) {
 	// The most-specific constraint wins regardless of its position in the list.
 	engine := enforcement.New()
 	ctx := context.Background()
-	req := capability.EnforceRequest{ToolName: "file:read"}
+	req := capability.EnforceRequest{TargetName: "file:read"}
 	constraints := []capability.Constraint{
 		{Target: "file:*", Actions: []string{"call"}, Conditions: []capability.Condition{&capability.TimeWindowCondition{NotBefore: "2999-01-01T00:00:00Z"}}},
 		{Target: "file:read", Actions: []string{"call"}},
@@ -2336,7 +2336,7 @@ func TestEngine_FindMatchingCapability_ReturnsMatch(t *testing.T) {
 	t.Parallel()
 	engine := enforcement.New()
 
-	req := &capability.EnforceRequest{ToolName: "read_file"}
+	req := &capability.EnforceRequest{TargetName: "read_file"}
 	caps := []capability.Constraint{
 		{Target: "write_file", Actions: []string{"*"}},
 		{Target: "read_file", Actions: []string{"*"}},
@@ -2351,7 +2351,7 @@ func TestEngine_FindMatchingCapability_ReturnsNilWhenNoMatch(t *testing.T) {
 	t.Parallel()
 	engine := enforcement.New()
 
-	req := &capability.EnforceRequest{ToolName: "delete_file"}
+	req := &capability.EnforceRequest{TargetName: "delete_file"}
 	caps := []capability.Constraint{
 		{Target: "read_file", Actions: []string{"*"}},
 	}
@@ -2373,7 +2373,7 @@ func TestEngine_TimeWindow_ValueForm(t *testing.T) {
 	engine := enforcement.New(enforcement.WithClock(newFakeClock(now)))
 	ctx := context.Background()
 
-	req := capability.EnforceRequest{SessionID: "sess", ToolName: "tool"}
+	req := capability.EnforceRequest{SessionID: "sess", TargetName: "tool"}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{{
 		Target:  "tool",
 		Actions: []string{"*"},
@@ -2394,9 +2394,9 @@ func TestEngine_IPRange_ValueForm(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "tool",
-		Context:   capability.EnforceRequestContext{SourceIP: "192.168.1.50"},
+		SessionID:  "sess",
+		TargetName: "tool",
+		Context:    capability.EnforceRequestContext{SourceIP: "192.168.1.50"},
 	}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{{
 		Target:  "tool",
@@ -2415,9 +2415,9 @@ func TestEngine_AllowedOperations_ValueForm(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "db",
-		Arguments: map[string]interface{}{"query": "SELECT 1"},
+		SessionID:  "sess",
+		TargetName: "db",
+		Arguments:  map[string]interface{}{"query": "SELECT 1"},
 	}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{{
 		Target:  "db",
@@ -2436,9 +2436,9 @@ func TestEngine_AllowedExtensions_ValueForm(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "file:read",
-		Arguments: map[string]interface{}{"path": "/docs/report.pdf"},
+		SessionID:  "sess",
+		TargetName: "file:read",
+		Arguments:  map[string]interface{}{"path": "/docs/report.pdf"},
 	}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{{
 		Target:  "file:read",
@@ -2457,9 +2457,9 @@ func TestEngine_AllowedTables_ValueForm(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "db:query",
-		Arguments: map[string]interface{}{"table": "reports"},
+		SessionID:  "sess",
+		TargetName: "db:query",
+		Arguments:  map[string]interface{}{"table": "reports"},
 	}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{{
 		Target:  "db:query",
@@ -2477,7 +2477,7 @@ func TestEngine_MaxCalls_ValueForm(t *testing.T) {
 	engine := enforcement.New(enforcement.WithCallCounter(counter))
 	ctx := context.Background()
 
-	req := capability.EnforceRequest{SessionID: "sess-mc-val", ToolName: "tool"}
+	req := capability.EnforceRequest{SessionID: "sess-mc-val", TargetName: "tool"}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{{
 		Target:  "tool",
 		Actions: []string{"*"},
@@ -2494,9 +2494,9 @@ func TestEngine_RecipientDomain_ValueForm(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "email:send",
-		Arguments: map[string]interface{}{"to": "alice@example.com"},
+		SessionID:  "sess",
+		TargetName: "email:send",
+		Arguments:  map[string]interface{}{"to": "alice@example.com"},
 	}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{{
 		Target:  "email:send",
@@ -2515,7 +2515,7 @@ func TestEngine_Policy_ValueForm(t *testing.T) {
 	engine := enforcement.New() // no PolicyEvaluator wired
 	ctx := context.Background()
 
-	req := capability.EnforceRequest{SessionID: "sess", ToolName: "tool"}
+	req := capability.EnforceRequest{SessionID: "sess", TargetName: "tool"}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{{
 		Target:  "tool",
 		Actions: []string{"*"},
@@ -2535,7 +2535,7 @@ func TestEngine_Custom_ValueForm(t *testing.T) {
 	engine := enforcement.New()
 	ctx := context.Background()
 
-	req := capability.EnforceRequest{SessionID: "sess", ToolName: "tool"}
+	req := capability.EnforceRequest{SessionID: "sess", TargetName: "tool"}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{{
 		Target:  "tool",
 		Actions: []string{"*"},
@@ -2554,9 +2554,9 @@ func TestEngine_AllowedValues_ValueForm(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "read_file",
-		Arguments: map[string]interface{}{"path": "/reports/q3.pdf"},
+		SessionID:  "sess",
+		TargetName: "read_file",
+		Arguments:  map[string]interface{}{"path": "/reports/q3.pdf"},
 	}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{{
 		Target:  "read_file",
@@ -2577,7 +2577,7 @@ func TestEngine_MatchesResource_BadGlobPattern(t *testing.T) {
 	t.Parallel()
 	engine := enforcement.New()
 
-	req := &capability.EnforceRequest{ToolName: "anything"}
+	req := &capability.EnforceRequest{TargetName: "anything"}
 	matched := engine.FindMatchingCapability(req, []capability.Constraint{
 		{Target: "[", Actions: []string{"*"}},
 	})
@@ -2593,9 +2593,9 @@ func TestEngine_AllowedOperations_EmptyArgument_RequiresExplicit(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "myTool",
-		Arguments: map[string]interface{}{"query": "SELECT id FROM users"},
+		SessionID:  "sess-1",
+		TargetName: "myTool",
+		Arguments:  map[string]interface{}{"query": "SELECT id FROM users"},
 	}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
 		{
@@ -2612,9 +2612,9 @@ func TestEngine_AllowedOperations_EmptyArgument_RequiresExplicit(t *testing.T) {
 
 	// With explicit argument set, the same request is allowed.
 	req2 := capability.EnforceRequest{
-		SessionID: "sess-2",
-		ToolName:  "myTool",
-		Arguments: map[string]interface{}{"query": "SELECT id FROM users"},
+		SessionID:  "sess-2",
+		TargetName: "myTool",
+		Arguments:  map[string]interface{}{"query": "SELECT id FROM users"},
 	}
 	resp2 := engine.ValidateAction(ctx, &req2, []capability.Constraint{
 		{
@@ -2633,7 +2633,7 @@ func TestEngine_TimeWindow_InvalidNotBefore(t *testing.T) {
 	engine := enforcement.New(enforcement.WithClock(newFakeClock(time.Now())))
 	ctx := context.Background()
 
-	req := capability.EnforceRequest{SessionID: "sess-1", ToolName: "tool"}
+	req := capability.EnforceRequest{SessionID: "sess-1", TargetName: "tool"}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
 		{
 			Target:  "tool",
@@ -2657,7 +2657,7 @@ func TestEngine_TimeWindow_BothBoundsEmpty(t *testing.T) {
 	engine := enforcement.New(enforcement.WithClock(newFakeClock(time.Now())))
 	ctx := context.Background()
 
-	req := capability.EnforceRequest{SessionID: "sess-1", ToolName: "tool"}
+	req := capability.EnforceRequest{SessionID: "sess-1", TargetName: "tool"}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
 		{
 			Target:  "tool",
@@ -2678,7 +2678,7 @@ func TestEngine_TimeWindow_InvalidNotAfter(t *testing.T) {
 	engine := enforcement.New(enforcement.WithClock(newFakeClock(time.Now())))
 	ctx := context.Background()
 
-	req := capability.EnforceRequest{SessionID: "sess-1", ToolName: "tool"}
+	req := capability.EnforceRequest{SessionID: "sess-1", TargetName: "tool"}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
 		{
 			Target:  "tool",
@@ -2698,7 +2698,7 @@ func TestEngine_AllowedValues_EmptyArgumentName(t *testing.T) {
 	engine := enforcement.New()
 	ctx := context.Background()
 
-	req := capability.EnforceRequest{SessionID: "sess-1", ToolName: "tool"}
+	req := capability.EnforceRequest{SessionID: "sess-1", TargetName: "tool"}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
 		{
 			Target:  "tool",
@@ -2719,9 +2719,9 @@ func TestEngine_AllowedValues_MissingArgument(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "tool",
-		Arguments: nil, // no arguments at all
+		SessionID:  "sess-1",
+		TargetName: "tool",
+		Arguments:  nil, // no arguments at all
 	}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
 		{
@@ -2743,9 +2743,9 @@ func TestEngine_AllowedValues_ExactMatchNonString(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "tool",
-		Arguments: map[string]interface{}{"count": float64(42)},
+		SessionID:  "sess-1",
+		TargetName: "tool",
+		Arguments:  map[string]interface{}{"count": float64(42)},
 	}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
 		{
@@ -2792,9 +2792,9 @@ func TestEngine_AllowedValues_NumericTypeMismatch(t *testing.T) {
 			t.Parallel()
 			engine := enforcement.New()
 			req := capability.EnforceRequest{
-				SessionID: "sess-1",
-				ToolName:  "tool",
-				Arguments: map[string]interface{}{"count": tc.arg},
+				SessionID:  "sess-1",
+				TargetName: "tool",
+				Arguments:  map[string]interface{}{"count": tc.arg},
 			}
 			resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
 				{
@@ -2819,9 +2819,9 @@ func TestEngine_AllowedValues_NoMatch(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "tool",
-		Arguments: map[string]interface{}{"color": "c"},
+		SessionID:  "sess-1",
+		TargetName: "tool",
+		Arguments:  map[string]interface{}{"color": "c"},
 	}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
 		{
@@ -2865,9 +2865,9 @@ func TestEngine_AllowedValues_LiteralPatternStringDenied(t *testing.T) {
 
 	// The literal pattern string must be denied (it is not a single digit).
 	denyReq := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "tool",
-		Arguments: map[string]interface{}{"digit": "[0-9]"},
+		SessionID:  "sess-1",
+		TargetName: "tool",
+		Arguments:  map[string]interface{}{"digit": "[0-9]"},
 	}
 	resp := engine.ValidateAction(ctx, &denyReq, build())
 	assert.Equal(t, capability.DecisionDeny, resp.Decision,
@@ -2875,9 +2875,9 @@ func TestEngine_AllowedValues_LiteralPatternStringDenied(t *testing.T) {
 
 	// A value the glob genuinely matches must be allowed.
 	allowReq := capability.EnforceRequest{
-		SessionID: "sess-2",
-		ToolName:  "tool",
-		Arguments: map[string]interface{}{"digit": "5"},
+		SessionID:  "sess-2",
+		TargetName: "tool",
+		Arguments:  map[string]interface{}{"digit": "5"},
 	}
 	resp = engine.ValidateAction(ctx, &allowReq, build())
 	assert.Equal(t, capability.DecisionAllow, resp.Decision,
@@ -2910,7 +2910,7 @@ func TestEngine_MaxCalls_CounterError(t *testing.T) {
 	engine := enforcement.New(enforcement.WithCallCounter(errorCounter{}))
 	ctx := context.Background()
 
-	req := capability.EnforceRequest{SessionID: "sess-1", ToolName: "tool"}
+	req := capability.EnforceRequest{SessionID: "sess-1", TargetName: "tool"}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
 		{
 			Target:  "tool",
@@ -2938,7 +2938,7 @@ func TestEngine_Policy_WithEvaluator_Allow(t *testing.T) {
 	engine := enforcement.New(enforcement.WithPolicyEvaluator(allowEvaluator{}))
 	ctx := context.Background()
 
-	req := capability.EnforceRequest{SessionID: "sess-1", ToolName: "tool"}
+	req := capability.EnforceRequest{SessionID: "sess-1", TargetName: "tool"}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{
 		{
 			Target:  "tool",
@@ -2965,9 +2965,9 @@ func TestEngine_AllowedOperations_NamedArgument_Allow(t *testing.T) {
 
 	// Tool uses "command" instead of "sql"/"query"/"statement".
 	req := capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "run_db",
-		Arguments: map[string]interface{}{"command": "SELECT * FROM orders"},
+		SessionID:  "sess",
+		TargetName: "run_db",
+		Arguments:  map[string]interface{}{"command": "SELECT * FROM orders"},
 	}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{{
 		Target:  "run_db",
@@ -2988,9 +2988,9 @@ func TestEngine_AllowedOperations_NamedArgument_Deny(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "run_db",
-		Arguments: map[string]interface{}{"command": "DROP TABLE orders"},
+		SessionID:  "sess",
+		TargetName: "run_db",
+		Arguments:  map[string]interface{}{"command": "DROP TABLE orders"},
 	}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{{
 		Target:  "run_db",
@@ -3012,9 +3012,9 @@ func TestEngine_AllowedOperations_NamedArgument_Missing(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "run_db",
-		Arguments: map[string]interface{}{"other": "value"},
+		SessionID:  "sess",
+		TargetName: "run_db",
+		Arguments:  map[string]interface{}{"other": "value"},
 	}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{{
 		Target:  "run_db",
@@ -3068,9 +3068,9 @@ func TestEngine_AllowedOperations_NamedArgument_WrongType(t *testing.T) {
 				args["other"] = "value"
 			}
 			req := capability.EnforceRequest{
-				SessionID: "sess",
-				ToolName:  "run_db",
-				Arguments: args,
+				SessionID:  "sess",
+				TargetName: "run_db",
+				Arguments:  args,
 			}
 			resp := engine.ValidateAction(ctx, &req, []capability.Constraint{{
 				Target:  "run_db",
@@ -3096,9 +3096,9 @@ func TestEngine_AllowedExtensions_NamedArgument_Allow(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "upload",
-		Arguments: map[string]interface{}{"filename": "/data/report.csv"},
+		SessionID:  "sess",
+		TargetName: "upload",
+		Arguments:  map[string]interface{}{"filename": "/data/report.csv"},
 	}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{{
 		Target:  "upload",
@@ -3119,9 +3119,9 @@ func TestEngine_AllowedExtensions_NamedArgument_Deny(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "upload",
-		Arguments: map[string]interface{}{"filename": "/data/malware.exe"},
+		SessionID:  "sess",
+		TargetName: "upload",
+		Arguments:  map[string]interface{}{"filename": "/data/malware.exe"},
 	}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{{
 		Target:  "upload",
@@ -3142,9 +3142,9 @@ func TestEngine_AllowedTables_NamedArgument_Allow(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "query",
-		Arguments: map[string]interface{}{"target_table": "orders"},
+		SessionID:  "sess",
+		TargetName: "query",
+		Arguments:  map[string]interface{}{"target_table": "orders"},
 	}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{{
 		Target:  "query",
@@ -3165,9 +3165,9 @@ func TestEngine_AllowedTables_NamedArgument_Deny(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "query",
-		Arguments: map[string]interface{}{"target_table": "salaries"},
+		SessionID:  "sess",
+		TargetName: "query",
+		Arguments:  map[string]interface{}{"target_table": "salaries"},
 	}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{{
 		Target:  "query",
@@ -3188,8 +3188,8 @@ func TestEngine_AllowedTables_NamedArgument_ArrayAllow(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "query",
+		SessionID:  "sess",
+		TargetName: "query",
 		Arguments: map[string]interface{}{
 			"target_table": []interface{}{"orders", "customers"},
 		},
@@ -3239,9 +3239,9 @@ func TestEngine_AllowedTables_ArrayWithEmptyElement(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			req := capability.EnforceRequest{
-				SessionID: "sess",
-				ToolName:  "query",
-				Arguments: map[string]interface{}{"target_table": tc.arr},
+				SessionID:  "sess",
+				TargetName: "query",
+				Arguments:  map[string]interface{}{"target_table": tc.arr},
 			}
 			resp := engine.ValidateAction(ctx, &req, caps)
 			assert.Equal(t, capability.DecisionDeny, resp.Decision)
@@ -3259,9 +3259,9 @@ func TestEngine_RecipientDomain_NamedArgument_Allow(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "send_notification",
-		Arguments: map[string]interface{}{"dest_email": "alice@example.com"},
+		SessionID:  "sess",
+		TargetName: "send_notification",
+		Arguments:  map[string]interface{}{"dest_email": "alice@example.com"},
 	}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{{
 		Target:  "send_notification",
@@ -3282,9 +3282,9 @@ func TestEngine_RecipientDomain_NamedArgument_Deny(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "send_notification",
-		Arguments: map[string]interface{}{"dest_email": "attacker@evil.com"},
+		SessionID:  "sess",
+		TargetName: "send_notification",
+		Arguments:  map[string]interface{}{"dest_email": "attacker@evil.com"},
 	}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{{
 		Target:  "send_notification",
@@ -3305,8 +3305,8 @@ func TestEngine_RecipientDomain_NamedArgument_ArrayAllow(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "send_notification",
+		SessionID:  "sess",
+		TargetName: "send_notification",
 		Arguments: map[string]interface{}{
 			"dest_email": []interface{}{"alice@example.com", "bob@example.com"},
 		},
@@ -3334,7 +3334,7 @@ func TestEngine_MaxCalls_DeniedCallsDoNotExtendLockout(t *testing.T) {
 	engine := enforcement.New(enforcement.WithCallCounter(counter))
 	ctx := context.Background()
 
-	req := capability.EnforceRequest{SessionID: "sess-1", ToolName: "tool"}
+	req := capability.EnforceRequest{SessionID: "sess-1", TargetName: "tool"}
 	caps := []capability.Constraint{{
 		Target:  "tool",
 		Actions: []string{"*"},
@@ -3384,7 +3384,7 @@ func TestEngine_MaxCalls_NoCounterFailsClosed(t *testing.T) {
 	engine := enforcement.New() // no call counter → no atomic rate-limit check
 	ctx := context.Background()
 
-	req := capability.EnforceRequest{SessionID: "sess-1", ToolName: "tool"}
+	req := capability.EnforceRequest{SessionID: "sess-1", TargetName: "tool"}
 	resp := engine.ValidateAction(ctx, &req, []capability.Constraint{{
 		Target:  "tool",
 		Actions: []string{"*"},
@@ -3518,9 +3518,9 @@ func TestEvaluateConditions_Allow(t *testing.T) {
 		// No conditions → always allow.
 	}
 	req := &capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "read_file",
-		Arguments: map[string]interface{}{},
+		SessionID:  "sess",
+		TargetName: "read_file",
+		Arguments:  map[string]interface{}{},
 	}
 	resp := e.EvaluateConditions(context.Background(), req, matched)
 	if resp.Decision != capability.DecisionAllow {
@@ -3546,9 +3546,9 @@ func TestEvaluateConditions_DenyOnConditionFailure(t *testing.T) {
 	}
 	_ = min5
 	req := &capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "read_file",
-		Arguments: map[string]interface{}{}, // "path" absent → deny
+		SessionID:  "sess",
+		TargetName: "read_file",
+		Arguments:  map[string]interface{}{}, // "path" absent → deny
 	}
 	resp := e.EvaluateConditions(context.Background(), req, matched)
 	if resp.Decision != capability.DecisionDeny {
@@ -3569,8 +3569,8 @@ func TestEvaluateConditions_ReturnsObligations(t *testing.T) {
 		},
 	}
 	req := &capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "read_file",
+		SessionID:  "sess",
+		TargetName: "read_file",
 	}
 	resp := e.EvaluateConditions(context.Background(), req, matched)
 	if resp.Decision != capability.DecisionAllow {
@@ -3591,7 +3591,7 @@ func TestEvaluateConditions_UnknownConditionDenies(t *testing.T) {
 			&capability.CustomCondition{Name: "unregistered"},
 		},
 	}
-	req := &capability.EnforceRequest{SessionID: "s", ToolName: "tool"}
+	req := &capability.EnforceRequest{SessionID: "s", TargetName: "tool"}
 	resp := e.EvaluateConditions(context.Background(), req, matched)
 	// CustomCondition has no registered handler → deny fail-closed.
 	if resp.Decision != capability.DecisionDeny {
@@ -3608,9 +3608,9 @@ func TestHandleAllowedOperations_ExplicitArg_Allow(t *testing.T) {
 	t.Parallel()
 	e := enforcement.New()
 	resp := e.ValidateAction(context.Background(), &capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "query_db",
-		Arguments: map[string]interface{}{"sql": "SELECT id FROM users"},
+		SessionID:  "sess",
+		TargetName: "query_db",
+		Arguments:  map[string]interface{}{"sql": "SELECT id FROM users"},
 	}, []capability.Constraint{{
 		Target:  "query_db",
 		Actions: []string{"call"},
@@ -3627,9 +3627,9 @@ func TestHandleAllowedOperations_ExplicitArg_Deny_WrongVerb(t *testing.T) {
 	t.Parallel()
 	e := enforcement.New()
 	resp := e.ValidateAction(context.Background(), &capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "query_db",
-		Arguments: map[string]interface{}{"sql": "DROP TABLE users"},
+		SessionID:  "sess",
+		TargetName: "query_db",
+		Arguments:  map[string]interface{}{"sql": "DROP TABLE users"},
 	}, []capability.Constraint{{
 		Target:  "query_db",
 		Actions: []string{"call"},
@@ -3654,9 +3654,9 @@ func TestHandleAllowedOperations_ExplicitArg_CaseInsensitive(t *testing.T) {
 
 	for _, sql := range []string{"SELECT * FROM t", "select id from t"} {
 		resp := e.ValidateAction(context.Background(), &capability.EnforceRequest{
-			SessionID: "s",
-			ToolName:  "db",
-			Arguments: map[string]interface{}{"q": sql},
+			SessionID:  "s",
+			TargetName: "db",
+			Arguments:  map[string]interface{}{"q": sql},
 		}, []capability.Constraint{{
 			Target:  "db",
 			Actions: []string{"call"},
@@ -3673,15 +3673,15 @@ func TestHandleAllowedOperations_ExplicitArg_CaseInsensitive(t *testing.T) {
 // ── ValidateAction / FindMatchingCapability with prefixed targets ─────────────
 
 // TestValidateAction_PrefixedTarget_MatchesBareToolName verifies that
-// a v0.2 manifest constraint "tool:read_file" must match bare req.ToolName
+// a v0.2 manifest constraint "tool:read_file" must match bare req.TargetName
 // "read_file". Before the fix, FindMatchingCapability returned nil for every
 // prefixed constraint, making ValidateAction and FindMatchingCapability dead.
 func TestValidateAction_PrefixedTarget_MatchesBareToolName(t *testing.T) {
 	t.Parallel()
 	e := enforcement.New()
 	resp := e.ValidateAction(context.Background(), &capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "read_file", // bare — as ManifestPDP.Decide supplies it
+		SessionID:  "sess",
+		TargetName: "read_file", // bare — as ManifestPDP.Decide supplies it
 	}, []capability.Constraint{
 		{Target: "tool:read_file", Actions: []string{"call"}},
 	})
@@ -3696,8 +3696,8 @@ func TestValidateAction_PrefixedTarget_GlobMatchesBareToolName(t *testing.T) {
 	t.Parallel()
 	e := enforcement.New()
 	resp := e.ValidateAction(context.Background(), &capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "read_file",
+		SessionID:  "sess",
+		TargetName: "read_file",
 	}, []capability.Constraint{
 		{Target: "tool:read_*", Actions: []string{"call"}},
 	})
@@ -3715,7 +3715,7 @@ func TestFindMatchingCapability_PrefixedTarget(t *testing.T) {
 		{Target: "tool:read_file", Actions: []string{"call"}},
 		{Target: "tool:write_file", Actions: []string{"call"}},
 	}
-	req := &capability.EnforceRequest{ToolName: "read_file"}
+	req := &capability.EnforceRequest{TargetName: "read_file"}
 	matched := e.FindMatchingCapability(req, caps)
 	if matched == nil {
 		t.Fatal("regression: FindMatchingCapability returned nil for prefixed constraint with bare ToolName")
@@ -3741,8 +3741,8 @@ func TestFindMatchingCapability_ColonPrefixedResourceName(t *testing.T) {
 			{Target: "resource:system:config", Actions: []string{"read"}},
 		}
 		req := &capability.EnforceRequest{
-			ToolName: "system:config",
-			Target:   &capability.EnforceRequestTarget{Type: "resource", Name: "system:config"},
+			TargetName: "system:config",
+			Target:     &capability.EnforceRequestTarget{Type: "resource", Name: "system:config"},
 		}
 		matched := e.FindMatchingCapability(req, caps)
 		if matched == nil {
@@ -3760,8 +3760,8 @@ func TestFindMatchingCapability_ColonPrefixedResourceName(t *testing.T) {
 			{Target: "prompt:tool:reboot", Actions: []string{"get"}},
 		}
 		req := &capability.EnforceRequest{
-			ToolName: "tool:reboot",
-			Target:   &capability.EnforceRequestTarget{Type: "prompt", Name: "tool:reboot"},
+			TargetName: "tool:reboot",
+			Target:     &capability.EnforceRequestTarget{Type: "prompt", Name: "tool:reboot"},
 		}
 		matched := e.FindMatchingCapability(req, caps)
 		if matched == nil {
@@ -3781,8 +3781,8 @@ func TestFindMatchingCapability_ColonPrefixedResourceName(t *testing.T) {
 			{Target: "resource:config", Actions: []string{"read"}},
 		}
 		req := &capability.EnforceRequest{
-			ToolName: "system:config",
-			Target:   &capability.EnforceRequestTarget{Type: "resource", Name: "system:config"},
+			TargetName: "system:config",
+			Target:     &capability.EnforceRequestTarget{Type: "resource", Name: "system:config"},
 		}
 		if matched := e.FindMatchingCapability(req, caps); matched != nil {
 			t.Errorf("regression: system:config wrongly matched resource:config: %s", matched.Target)
@@ -3796,8 +3796,8 @@ func TestValidateAction_PrefixedBothSides(t *testing.T) {
 	t.Parallel()
 	e := enforcement.New()
 	resp := e.ValidateAction(context.Background(), &capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "tool:read_file", // prefixed ToolName
+		SessionID:  "sess",
+		TargetName: "tool:read_file", // prefixed ToolName
 	}, []capability.Constraint{
 		{Target: "tool:read_file", Actions: []string{"call"}}, // prefixed constraint
 	})
@@ -3812,9 +3812,9 @@ func TestHandleAllowedOperations_EmptyArg_RequiresExplicit(t *testing.T) {
 	t.Parallel()
 	e := enforcement.New()
 	resp := e.ValidateAction(context.Background(), &capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "query_db",
-		Arguments: map[string]interface{}{"sql": "SELECT 1"},
+		SessionID:  "sess",
+		TargetName: "query_db",
+		Arguments:  map[string]interface{}{"sql": "SELECT 1"},
 	}, []capability.Constraint{{
 		Target:  "query_db",
 		Actions: []string{"call"},
@@ -3844,10 +3844,10 @@ func runCondition(t *testing.T, e *enforcement.Engine, cond capability.Condition
 		{Target: "tool", Actions: []string{"call"}, Conditions: []capability.Condition{cond}},
 	}
 	req := &capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "tool",
-		Arguments: args,
-		Context:   capability.EnforceRequestContext{SourceIP: sourceIP},
+		SessionID:  "sess",
+		TargetName: "tool",
+		Arguments:  args,
+		Context:    capability.EnforceRequestContext{SourceIP: sourceIP},
 	}
 	resp := e.ValidateAction(context.Background(), req, constraints)
 	return resp
@@ -3976,7 +3976,7 @@ func TestMaxCalls_ValueType(t *testing.T) {
 			capability.MaxCallsCondition{Count: 5, WindowSeconds: 60},
 		}},
 	}
-	req := &capability.EnforceRequest{SessionID: "s", ToolName: "tool"}
+	req := &capability.EnforceRequest{SessionID: "s", TargetName: "tool"}
 	// First call is within the maxCalls:5 quota → allow, exercising the value branch.
 	resp := e.ValidateAction(context.Background(), req, constraints)
 	assert.Equal(t, capability.DecisionAllow, resp.Decision)
@@ -4807,7 +4807,7 @@ func TestEngine_MatchingEdgeCases(t *testing.T) {
 	t.Run("empty actions fails closed", func(t *testing.T) {
 		t.Parallel()
 		constraints := []capability.Constraint{{Target: "tool", Actions: nil}}
-		req := &capability.EnforceRequest{ToolName: "tool"}
+		req := &capability.EnforceRequest{TargetName: "tool"}
 		resp := e.ValidateAction(context.Background(), req, constraints)
 		assert.Equal(t, capability.DecisionDeny, resp.Decision)
 		require.NotNil(t, resp.Denial)
@@ -4817,7 +4817,7 @@ func TestEngine_MatchingEdgeCases(t *testing.T) {
 	t.Run("unrecognized action skips constraint", func(t *testing.T) {
 		t.Parallel()
 		constraints := []capability.Constraint{{Target: "tool", Actions: []string{"read"}}}
-		req := &capability.EnforceRequest{ToolName: "tool"}
+		req := &capability.EnforceRequest{TargetName: "tool"}
 		resp := e.ValidateAction(context.Background(), req, constraints)
 		assert.Equal(t, capability.DecisionDeny, resp.Decision)
 		assert.Equal(t, capability.ErrCodeAuthorizationFailed, resp.Denial.Code)
@@ -4832,7 +4832,7 @@ func TestEngine_MatchingEdgeCases(t *testing.T) {
 			}},
 			{Target: "tool", Actions: []string{"call"}},
 		}
-		req := &capability.EnforceRequest{ToolName: "tool", Arguments: map[string]interface{}{"x": "other"}}
+		req := &capability.EnforceRequest{TargetName: "tool", Arguments: map[string]interface{}{"x": "other"}}
 		resp := e.ValidateAction(context.Background(), req, constraints)
 		assert.Equal(t, capability.DecisionAllow, resp.Decision, "exact target should win over wildcard")
 	})
@@ -4850,9 +4850,9 @@ func TestEngine_MatchingEdgeCases(t *testing.T) {
 			{Target: "query_db", Actions: []string{"call"}, Principal: map[string][]string{"sub": {"alice"}}},
 		}
 		req := &capability.EnforceRequest{
-			ToolName:  "query_db",
-			Arguments: map[string]interface{}{"x": "other"},
-			Claims:    map[string]interface{}{"sub": "alice"},
+			TargetName: "query_db",
+			Arguments:  map[string]interface{}{"x": "other"},
+			Claims:     map[string]interface{}{"sub": "alice"},
 		}
 		resp := e.ValidateAction(context.Background(), req, constraints)
 		assert.Equal(t, capability.DecisionAllow, resp.Decision,
@@ -4872,9 +4872,9 @@ func TestEngine_MatchingEdgeCases(t *testing.T) {
 			{Target: "query_db", Actions: []string{"call"}, Principal: map[string][]string{"sub": {"alice"}}},
 		}
 		req := &capability.EnforceRequest{
-			ToolName:  "query_db",
-			Arguments: map[string]interface{}{"x": "other"},
-			Claims:    map[string]interface{}{"sub": "alice"},
+			TargetName: "query_db",
+			Arguments:  map[string]interface{}{"x": "other"},
+			Claims:     map[string]interface{}{"sub": "alice"},
 		}
 		resp := e.ValidateAction(context.Background(), req, constraints)
 		assert.Equal(t, capability.DecisionDeny, resp.Decision,
@@ -4909,7 +4909,7 @@ func TestFindMatchingCapability_NonWildcardLiteralFilteredBeforeScoring(t *testi
 	constraints := []capability.Constraint{
 		{Target: "read_file", Actions: []string{"call"}},
 	}
-	req := &capability.EnforceRequest{ToolName: "write_file"}
+	req := &capability.EnforceRequest{TargetName: "write_file"}
 	assert.Nil(t, e.FindMatchingCapability(req, constraints),
 		"a non-wildcard target that differs from the tool name must not match, "+
 			"so ResourceSpecificity is never reached for it")
@@ -4996,7 +4996,7 @@ func (f policyEvalFunc) Evaluate(ctx context.Context, backend string, config, in
 // the fix, actionPermitted recognized only "call"/"*", so any resource/prompt/
 // system constraint with its proper verb produced a spurious "no matching
 // capability" denial even for a valid manifest. The request is typed
-// either via req.Target.Type or via the engine prefix on req.ToolName.
+// either via req.Target.Type or via the engine prefix on req.TargetName.
 func TestValidateAction_CanonicalVerbPerNamespace(t *testing.T) {
 	t.Parallel()
 	e := enforcement.New()
@@ -5013,7 +5013,7 @@ func TestValidateAction_CanonicalVerbPerNamespace(t *testing.T) {
 		{"resource:read via Target", "resource:file:///data/*", "read", "file:///data/report.csv", "resource", "file:///data/report.csv"},
 		{"prompt:get via Target", "prompt:code_review", "get", "code_review", "prompt", "code_review"},
 		{"system:allow via Target", "system:sampling/createMessage", "allow", "sampling/createMessage", "system", "sampling/createMessage"},
-		// Same grants, typed only through the engine prefix on req.ToolName.
+		// Same grants, typed only through the engine prefix on req.TargetName.
 		{"resource:read via prefix", "resource:file:///data/*", "read", "resource:file:///data/report.csv", "", ""},
 		{"prompt:get via prefix", "prompt:code_review", "get", "prompt:code_review", "", ""},
 	}
@@ -5021,7 +5021,7 @@ func TestValidateAction_CanonicalVerbPerNamespace(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			req := &capability.EnforceRequest{SessionID: "s", ToolName: tc.reqToolName}
+			req := &capability.EnforceRequest{SessionID: "s", TargetName: tc.reqToolName}
 			if tc.reqTargetType != "" {
 				req.Target = &capability.EnforceRequestTarget{Type: tc.reqTargetType, Name: tc.reqTargetName}
 			}
@@ -5038,7 +5038,7 @@ func TestValidateAction_CanonicalVerbPerNamespace(t *testing.T) {
 
 // TestFindMatchingCapability_NamespaceTypeMustMatch is the regression: a
 // constraint authored for one namespace must never match a request of
-// another even when the bare names overlap. A bare, untyped req.ToolName defaults
+// another even when the bare names overlap. A bare, untyped req.TargetName defaults
 // to the "tool" namespace, so a wildcard "resource:*" constraint can no longer
 // approve a tool call.
 func TestFindMatchingCapability_NamespaceTypeMustMatch(t *testing.T) {
@@ -5047,7 +5047,7 @@ func TestFindMatchingCapability_NamespaceTypeMustMatch(t *testing.T) {
 
 	t.Run("resource:* does not match a bare tool call", func(t *testing.T) {
 		t.Parallel()
-		req := &capability.EnforceRequest{SessionID: "s", ToolName: "delete_database"}
+		req := &capability.EnforceRequest{SessionID: "s", TargetName: "delete_database"}
 		resp := e.ValidateAction(context.Background(), req, []capability.Constraint{
 			{Target: "resource:*", Actions: []string{"*"}},
 		})
@@ -5060,9 +5060,9 @@ func TestFindMatchingCapability_NamespaceTypeMustMatch(t *testing.T) {
 	t.Run("tool constraint does not match an explicit resource request", func(t *testing.T) {
 		t.Parallel()
 		req := &capability.EnforceRequest{
-			SessionID: "s",
-			ToolName:  "export",
-			Target:    &capability.EnforceRequestTarget{Type: "resource", Name: "export"},
+			SessionID:  "s",
+			TargetName: "export",
+			Target:     &capability.EnforceRequestTarget{Type: "resource", Name: "export"},
 		}
 		resp := e.ValidateAction(context.Background(), req, []capability.Constraint{
 			{Target: "tool:export", Actions: []string{"*"}},
@@ -5073,7 +5073,7 @@ func TestFindMatchingCapability_NamespaceTypeMustMatch(t *testing.T) {
 
 	t.Run("FindMatchingCapability skips the wrong-type constraint", func(t *testing.T) {
 		t.Parallel()
-		req := &capability.EnforceRequest{ToolName: "delete_database"} // bare → tool
+		req := &capability.EnforceRequest{TargetName: "delete_database"} // bare → tool
 		matched := e.FindMatchingCapability(req, []capability.Constraint{
 			{Target: "resource:*", Actions: []string{"*"}},
 		})
@@ -5097,7 +5097,7 @@ func TestValidateAction_TimestampReachesRegoInput(t *testing.T) {
 	spy := &spyDirectiveEvaluator{out: &captured}
 	e := enforcement.New(enforcement.WithClock(newFakeClock(fixed)), enforcement.WithPolicyEvaluator(spy))
 
-	req := &capability.EnforceRequest{SessionID: "s", ToolName: "read_file"}
+	req := &capability.EnforceRequest{SessionID: "s", TargetName: "read_file"}
 	e.ValidateAction(context.Background(), req, []capability.Constraint{{
 		Target:     "tool:read_file",
 		Actions:    []string{"call"},
@@ -5127,14 +5127,14 @@ func TestValidateAction_DoesNotMutateRequestDirectives(t *testing.T) {
 		Directives: []capability.Directive{&capability.RedactFieldsDirective{Fields: []string{"ssn"}}},
 	}}
 
-	req := &capability.EnforceRequest{SessionID: "s", ToolName: "export"}
+	req := &capability.EnforceRequest{SessionID: "s", TargetName: "export"}
 	resp := e.ValidateAction(context.Background(), req, constraints)
 	require.Equal(t, capability.DecisionAllow, resp.Decision)
 	assert.Nil(t, req.Directives, "ValidateAction must not write directives onto the caller's request")
 	require.Len(t, resp.Obligations, 1, "the redactFields obligation must still be produced")
 
 	// EvaluateConditions has the same contract.
-	req2 := &capability.EnforceRequest{SessionID: "s", ToolName: "export"}
+	req2 := &capability.EnforceRequest{SessionID: "s", TargetName: "export"}
 	e.EvaluateConditions(context.Background(), req2, &constraints[0])
 	assert.Nil(t, req2.Directives, "EvaluateConditions must not write directives onto the caller's request")
 }
@@ -5152,7 +5152,7 @@ func TestValidateAction_ConcurrentSharedRequestNoRace(t *testing.T) {
 		Actions:    []string{"call"},
 		Directives: []capability.Directive{&capability.RedactFieldsDirective{Fields: []string{"ssn"}}},
 	}}
-	req := &capability.EnforceRequest{SessionID: "s", ToolName: "export"}
+	req := &capability.EnforceRequest{SessionID: "s", TargetName: "export"}
 
 	var wg sync.WaitGroup
 	for i := 0; i < 16; i++ {
@@ -5215,9 +5215,9 @@ func TestConditions_WrongTypeArgument_ConditionFailed(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			resp := e.ValidateAction(context.Background(), &capability.EnforceRequest{
-				SessionID: "s",
-				ToolName:  "do_thing",
-				Arguments: tc.arguments,
+				SessionID:  "s",
+				TargetName: "do_thing",
+				Arguments:  tc.arguments,
 			}, []capability.Constraint{{
 				Target:     "tool:do_thing",
 				Actions:    []string{"call"},
@@ -5292,8 +5292,8 @@ func TestAuditOnly_StampedByEngineOnDeny(t *testing.T) {
 		&capability.AllowedValuesCondition{Argument: "x", Values: []interface{}{"yes"}},
 	}
 	req := &capability.EnforceRequest{
-		ToolName:  "debug_exec",
-		Arguments: map[string]interface{}{"x": "no"}, // fails the allowedValues check
+		TargetName: "debug_exec",
+		Arguments:  map[string]interface{}{"x": "no"}, // fails the allowedValues check
 	}
 
 	t.Run("audit constraint deny is AuditOnly", func(t *testing.T) {
@@ -5335,7 +5335,7 @@ func TestAuditOnly_StampedByEngineOnDeny(t *testing.T) {
 		t.Parallel()
 		// A request matching no constraint is a hard deny regardless of any audit
 		// entry elsewhere in the manifest.
-		resp := e.ValidateAction(context.Background(), &capability.EnforceRequest{ToolName: "unlisted"},
+		resp := e.ValidateAction(context.Background(), &capability.EnforceRequest{TargetName: "unlisted"},
 			[]capability.Constraint{{Target: "tool:debug_exec", Actions: []string{"call"}, Enforcement: capability.EnforcementAudit}})
 		assert.Equal(t, capability.DecisionDeny, resp.Decision)
 		assert.False(t, resp.AuditOnly, "a no-match deny must stay a hard deny")
@@ -5362,7 +5362,7 @@ func TestSpecificity_PostWildcardLiteralWins(t *testing.T) {
 		"a wildcard pattern with trailing literal content must outscore the bare catch-all")
 
 	e := enforcement.New()
-	req := &capability.EnforceRequest{ToolName: "create_admin"}
+	req := &capability.EnforceRequest{TargetName: "create_admin"}
 
 	// The catch-all is listed FIRST; the more specific "*_admin" must still win.
 	caps := []capability.Constraint{
@@ -5440,7 +5440,7 @@ func TestObligationLoop_UnhandledDirectiveFailsClosed(t *testing.T) {
 		Actions:    []string{"call"},
 		Directives: []capability.Directive{unknownDirective{}},
 	}
-	req := &capability.EnforceRequest{ToolName: "export"}
+	req := &capability.EnforceRequest{TargetName: "export"}
 
 	t.Run("EvaluateConditions", func(t *testing.T) {
 		t.Parallel()
@@ -5513,7 +5513,7 @@ func TestObligationLoop_TypedNilDirectiveSkipped(t *testing.T) {
 		Actions:    []string{"call"},
 		Directives: []capability.Directive{nilDir},
 	}
-	req := &capability.EnforceRequest{ToolName: "export"}
+	req := &capability.EnforceRequest{TargetName: "export"}
 
 	require.NotPanics(t, func() {
 		resp := e.EvaluateConditions(context.Background(), req, matched)
@@ -5539,9 +5539,9 @@ func TestObligationDeny_DoesNotPoisonSessionHistory(t *testing.T) {
 		// Tool A's constraint carries an unhandled directive, so its obligation
 		// collection fails closed even though it has no failing condition.
 		reqA := &capability.EnforceRequest{
-			SessionID: "sess-1",
-			ToolName:  "read_credentials",
-			Target:    &capability.EnforceRequestTarget{Type: "tool", Name: "read_credentials"},
+			SessionID:  "sess-1",
+			TargetName: "read_credentials",
+			Target:     &capability.EnforceRequestTarget{Type: "tool", Name: "read_credentials"},
 		}
 		matchedA := &capability.Constraint{
 			Target:     "tool:read_credentials",
@@ -5557,9 +5557,9 @@ func TestObligationDeny_DoesNotPoisonSessionHistory(t *testing.T) {
 		// Because A was denied (and never forwarded), history must be clean, so the
 		// sequenceBlock must NOT fire and B is allowed.
 		reqB := &capability.EnforceRequest{
-			SessionID: "sess-1",
-			ToolName:  "write_external",
-			Target:    &capability.EnforceRequestTarget{Type: "tool", Name: "write_external"},
+			SessionID:  "sess-1",
+			TargetName: "write_external",
+			Target:     &capability.EnforceRequestTarget{Type: "tool", Name: "write_external"},
 		}
 		matchedB := &capability.Constraint{
 			Target:  "tool:write_external",
@@ -5658,9 +5658,9 @@ func TestMaxCalls_MultiWindow_DenialDoesNotBurnSiblingQuota(t *testing.T) {
 		},
 	}}
 	req := &capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "export",
-		Target:    &capability.EnforceRequestTarget{Type: "tool", Name: "export"},
+		SessionID:  "sess-1",
+		TargetName: "export",
+		Target:     &capability.EnforceRequestTarget{Type: "tool", Name: "export"},
 	}
 
 	// Exhaust the daily budget (5 allowed calls).
@@ -5723,9 +5723,9 @@ func TestEngine_MaxCalls_CheckOnlyDenialReportsTightRetryAfter(t *testing.T) {
 	ctx := context.Background()
 
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "export",
-		Target:    &capability.EnforceRequestTarget{Type: "tool", Name: "export"},
+		SessionID:  "sess-1",
+		TargetName: "export",
+		Target:     &capability.EnforceRequestTarget{Type: "tool", Name: "export"},
 	}
 	// Two maxCalls conditions force the two-pass check-only evaluation. The hourly
 	// limit (3) binds; the per-minute limit (100) never does, but its presence is
@@ -5774,9 +5774,9 @@ func decideWithAllowedValues(t *testing.T, argument string, values []interface{}
 	t.Helper()
 	engine := enforcement.New()
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "tool:do",
-		Arguments: args,
+		SessionID:  "sess-1",
+		TargetName: "tool:do",
+		Arguments:  args,
 	}
 	resp := engine.ValidateAction(context.Background(), &req, []capability.Constraint{
 		{
@@ -5965,9 +5965,9 @@ func TestDirectives_ObligationsAfterConditionsPass(t *testing.T) {
 	}
 
 	req := &capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "read_file",
-		Arguments: map[string]interface{}{"path": "/reports/q3.pdf"},
+		SessionID:  "sess-1",
+		TargetName: "read_file",
+		Arguments:  map[string]interface{}{"path": "/reports/q3.pdf"},
 	}
 
 	resp := e.EvaluateConditions(context.Background(), req, &constraint)
@@ -5999,9 +5999,9 @@ func TestDirectives_NotCollectedWhenConditionFails(t *testing.T) {
 	}
 
 	req := &capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "read_file",
-		Arguments: map[string]interface{}{"path": "/internal/secrets.txt"},
+		SessionID:  "sess-1",
+		TargetName: "read_file",
+		Arguments:  map[string]interface{}{"path": "/internal/secrets.txt"},
 	}
 
 	resp := e.EvaluateConditions(context.Background(), req, &constraint)
@@ -6022,8 +6022,8 @@ func TestDirectives_NoneProducesNoObligations(t *testing.T) {
 	}
 
 	req := &capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "read_file",
+		SessionID:  "sess-1",
+		TargetName: "read_file",
 	}
 
 	resp := e.EvaluateConditions(context.Background(), req, &constraint)
@@ -6046,7 +6046,7 @@ func TestDirectives_MultipleRedactMergeObligations(t *testing.T) {
 		},
 	}
 
-	req := &capability.EnforceRequest{SessionID: "s", ToolName: "query_db"}
+	req := &capability.EnforceRequest{SessionID: "s", TargetName: "query_db"}
 
 	resp := e.EvaluateConditions(context.Background(), req, &constraint)
 	assert.Equal(t, capability.DecisionAllow, resp.Decision)
@@ -6075,8 +6075,8 @@ func TestDirectives_ValidateActionCollectsObligations(t *testing.T) {
 	}
 
 	req := &capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "export",
+		SessionID:  "sess",
+		TargetName: "export",
 	}
 
 	resp := e.ValidateAction(context.Background(), req, constraints)
@@ -6111,7 +6111,7 @@ func TestDirectives_UnknownConditionTypeFailsClosed(t *testing.T) {
 		},
 	}
 
-	req := &capability.EnforceRequest{SessionID: "sess", ToolName: "read_file"}
+	req := &capability.EnforceRequest{SessionID: "sess", TargetName: "read_file"}
 	resp := e.EvaluateConditions(context.Background(), req, &constraint)
 	assert.Equal(t, capability.DecisionDeny, resp.Decision)
 	assert.Equal(t, capability.ErrCodeConditionFailed, resp.Denial.Code)
@@ -6126,8 +6126,8 @@ func TestBuildRegoInput_MinimalRequest(t *testing.T) {
 	// A request with only SessionID and ToolName; no Target, no Claims.
 	ctx := context.Background()
 	req := &capability.EnforceRequest{
-		SessionID: "sess-min",
-		ToolName:  "read_file",
+		SessionID:  "sess-min",
+		TargetName: "read_file",
 	}
 
 	input, err := enforcement.BuildRegoInput(ctx, req)
@@ -6171,8 +6171,8 @@ func TestBuildRegoInput_MinimalRequest(t *testing.T) {
 func TestBuildRegoInput_Arguments(t *testing.T) {
 	ctx := context.Background()
 	req := &capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "read_file",
+		SessionID:  "sess-1",
+		TargetName: "read_file",
 		Arguments: map[string]interface{}{
 			"path":     "/reports/q3.pdf",
 			"encoding": "utf-8",
@@ -6212,8 +6212,8 @@ func TestBuildRegoInput_WithTarget(t *testing.T) {
 		t.Run(tc.targetType+":"+tc.targetName, func(t *testing.T) {
 			ctx := context.Background()
 			req := &capability.EnforceRequest{
-				SessionID: "sess-1",
-				ToolName:  tc.targetName,
+				SessionID:  "sess-1",
+				TargetName: tc.targetName,
 				Target: &capability.EnforceRequestTarget{
 					Type: tc.targetType,
 					Name: tc.targetName,
@@ -6242,8 +6242,8 @@ func TestBuildRegoInput_WithTarget(t *testing.T) {
 func TestBuildRegoInput_WithClaims(t *testing.T) {
 	ctx := context.Background()
 	req := &capability.EnforceRequest{
-		SessionID: "sess-2",
-		ToolName:  "query_db",
+		SessionID:  "sess-2",
+		TargetName: "query_db",
 		Claims: map[string]interface{}{
 			"sub":      "user-abc",
 			"iss":      "https://idp.example.com",
@@ -6276,8 +6276,8 @@ func TestBuildRegoInput_WithClaims(t *testing.T) {
 func TestBuildRegoInput_Context(t *testing.T) {
 	ctx := context.Background()
 	req := &capability.EnforceRequest{
-		SessionID: "sess-ctx",
-		ToolName:  "list_files",
+		SessionID:  "sess-ctx",
+		TargetName: "list_files",
 		Context: capability.EnforceRequestContext{
 			SourceIP: "192.168.1.10",
 			Now:      "2026-06-01T12:00:00Z",
@@ -6309,9 +6309,9 @@ func TestBuildRegoInput_AllFields(t *testing.T) {
 	// Full round-trip: all policy input fields populated.
 	ctx := context.Background()
 	req := &capability.EnforceRequest{
-		SessionID: "sess-full",
-		ToolName:  "read_file",
-		Arguments: map[string]interface{}{"path": "/data/report.pdf"},
+		SessionID:  "sess-full",
+		TargetName: "read_file",
+		Arguments:  map[string]interface{}{"path": "/data/report.pdf"},
 		Context: capability.EnforceRequestContext{
 			SourceIP: "10.0.0.1",
 			Now:      "2026-06-01T00:00:00Z",
@@ -6365,9 +6365,9 @@ func TestBuildRegoInput_NilArguments_DefaultsToEmptyMap(t *testing.T) {
 	// Nil arguments must not produce nil in the Rego input (OPA would reject it).
 	ctx := context.Background()
 	req := &capability.EnforceRequest{
-		SessionID: "sess-3",
-		ToolName:  "tool",
-		Arguments: nil,
+		SessionID:  "sess-3",
+		TargetName: "tool",
+		Arguments:  nil,
 	}
 
 	input, err := enforcement.BuildRegoInput(ctx, req)
@@ -6389,9 +6389,9 @@ func TestBuildRegoInput_NilClaims_DefaultsToEmptyMap(t *testing.T) {
 	// safely reference input.claims.* without a guard.
 	ctx := context.Background()
 	req := &capability.EnforceRequest{
-		SessionID: "sess-4",
-		ToolName:  "tool",
-		Claims:    nil,
+		SessionID:  "sess-4",
+		TargetName: "tool",
+		Claims:     nil,
 	}
 
 	input, err := enforcement.BuildRegoInput(ctx, req)
@@ -6427,8 +6427,8 @@ func TestRequestIDFromContext_InjectedByValidateAction(t *testing.T) {
 	ctx := context.Background()
 
 	req := &capability.EnforceRequest{
-		SessionID: "sess-reqid",
-		ToolName:  "run_query",
+		SessionID:  "sess-reqid",
+		TargetName: "run_query",
 	}
 
 	engine.ValidateAction(ctx, req, []capability.Constraint{
@@ -6468,8 +6468,8 @@ func TestPolicyEvaluator_ReceivesTargetInRequest(t *testing.T) {
 	ctx := context.Background()
 
 	req := &capability.EnforceRequest{
-		SessionID: "sess-tgt",
-		ToolName:  "read_file",
+		SessionID:  "sess-tgt",
+		TargetName: "read_file",
 		Target: &capability.EnforceRequestTarget{
 			Type: "tool",
 			Name: "read_file",
@@ -6512,9 +6512,9 @@ func TestPolicyEvaluator_ReceivesClaimsInRequest(t *testing.T) {
 		"agent_id": "agent-99",
 	}
 	req := &capability.EnforceRequest{
-		SessionID: "sess-claims",
-		ToolName:  "send_email",
-		Claims:    claims,
+		SessionID:  "sess-claims",
+		TargetName: "send_email",
+		Claims:     claims,
 	}
 
 	engine.ValidateAction(ctx, req, []capability.Constraint{
@@ -6553,11 +6553,11 @@ func TestPolicyEvaluator_BackwardCompat_ArgumentsOnlyPolicy(t *testing.T) {
 
 	// Call with target and claims populated — evaluator only checks arguments.
 	req := &capability.EnforceRequest{
-		SessionID: "sess-bc",
-		ToolName:  "read_file",
-		Arguments: map[string]interface{}{"path": "/reports/q4.pdf"},
-		Target:    &capability.EnforceRequestTarget{Type: "tool", Name: "read_file"},
-		Claims:    map[string]interface{}{"sub": "u1"},
+		SessionID:  "sess-bc",
+		TargetName: "read_file",
+		Arguments:  map[string]interface{}{"path": "/reports/q4.pdf"},
+		Target:     &capability.EnforceRequestTarget{Type: "tool", Name: "read_file"},
+		Claims:     map[string]interface{}{"sub": "u1"},
 	}
 
 	resp := engine.ValidateAction(ctx, req, []capability.Constraint{
@@ -6575,10 +6575,10 @@ func TestPolicyEvaluator_BackwardCompat_ArgumentsOnlyPolicy(t *testing.T) {
 
 	// Same call with a path that violates the arguments-only policy.
 	req2 := &capability.EnforceRequest{
-		SessionID: "sess-bc",
-		ToolName:  "read_file",
-		Arguments: map[string]interface{}{"path": "/etc/passwd"},
-		Target:    &capability.EnforceRequestTarget{Type: "tool", Name: "read_file"},
+		SessionID:  "sess-bc",
+		TargetName: "read_file",
+		Arguments:  map[string]interface{}{"path": "/etc/passwd"},
+		Target:     &capability.EnforceRequestTarget{Type: "tool", Name: "read_file"},
 	}
 	resp2 := engine.ValidateAction(ctx, req2, []capability.Constraint{
 		{
@@ -6605,10 +6605,10 @@ func TestBuildRegoInput_RequestIDFromEngine(t *testing.T) {
 	ctx := context.Background()
 
 	req := &capability.EnforceRequest{
-		SessionID: "sess-rid",
-		ToolName:  "archive",
-		Arguments: map[string]interface{}{"target": "old-logs"},
-		Target:    &capability.EnforceRequestTarget{Type: "tool", Name: "archive"},
+		SessionID:  "sess-rid",
+		TargetName: "archive",
+		Arguments:  map[string]interface{}{"target": "old-logs"},
+		Target:     &capability.EnforceRequestTarget{Type: "tool", Name: "archive"},
 	}
 
 	engine.ValidateAction(ctx, req, []capability.Constraint{
@@ -6694,8 +6694,8 @@ func TestBuildRegoInput_DirectivesAlwaysPresent_NilDirectives(t *testing.T) {
 	// A request with no Directives field must still produce "directives": []
 	// in the Rego input so Rego policies can iterate input.directives safely.
 	req := &capability.EnforceRequest{
-		SessionID: "sess-h1",
-		ToolName:  "tool:sampling/createMessage",
+		SessionID:  "sess-h1",
+		TargetName: "tool:sampling/createMessage",
 	}
 
 	input, err := enforcement.BuildRegoInput(context.Background(), req)
@@ -6722,7 +6722,7 @@ func TestBuildRegoInput_DirectivesAlwaysPresent_NilDirectives(t *testing.T) {
 func TestBuildRegoInput_DirectivesAlwaysPresent_EmptySlice(t *testing.T) {
 	req := &capability.EnforceRequest{
 		SessionID:  "sess-h2",
-		ToolName:   "tool:read_file",
+		TargetName: "tool:read_file",
 		Directives: []capability.Directive{},
 	}
 
@@ -6744,8 +6744,8 @@ func TestBuildRegoInput_RedactFieldsDirective_Shape(t *testing.T) {
 	// A redactFields directive must appear in input.directives with the correct
 	// JSON shape: {"type": "redactFields", "fields": [...]}.
 	req := &capability.EnforceRequest{
-		SessionID: "sess-h3",
-		ToolName:  "tool:export_data",
+		SessionID:  "sess-h3",
+		TargetName: "tool:export_data",
 		Directives: []capability.Directive{
 			&capability.RedactFieldsDirective{Fields: []string{"user.ssn", "card.number"}},
 		},
@@ -6785,8 +6785,8 @@ func TestBuildRegoInput_RedactFieldsDirective_Shape(t *testing.T) {
 
 func TestBuildRegoInput_MultipleDirectives(t *testing.T) {
 	req := &capability.EnforceRequest{
-		SessionID: "sess-h4",
-		ToolName:  "tool:export_data",
+		SessionID:  "sess-h4",
+		TargetName: "tool:export_data",
 		Directives: []capability.Directive{
 			&capability.RedactFieldsDirective{Fields: []string{"secret"}},
 			&capability.RedactFieldsDirective{Fields: []string{"token"}},
@@ -6820,8 +6820,8 @@ func TestBuildRegoInput_UnserializableDirective_ReturnsError(t *testing.T) {
 	// being silently dropped from input.directives, so the caller (a
 	// PolicyEvaluator) can fail closed instead of deciding on a short slice.
 	req := &capability.EnforceRequest{
-		SessionID: "sess-bad-directive",
-		ToolName:  "tool:export_data",
+		SessionID:  "sess-bad-directive",
+		TargetName: "tool:export_data",
 		Directives: []capability.Directive{
 			&capability.RedactFieldsDirective{Fields: []string{"user.ssn"}},
 			unserializableDirective{},
@@ -6857,7 +6857,7 @@ func TestEvaluateConditions_UnserializableDirective_FailsClosed(t *testing.T) {
 			unserializableDirective{},
 		},
 	}
-	req := &capability.EnforceRequest{SessionID: "sess-fc", ToolName: "export"}
+	req := &capability.EnforceRequest{SessionID: "sess-fc", TargetName: "export"}
 
 	resp := e.EvaluateConditions(context.Background(), req, &constraint)
 	if resp.Decision != capability.DecisionDeny {
@@ -6874,9 +6874,9 @@ func TestBuildRegoInput_ArgumentsAlwaysPresent_NoArgs(t *testing.T) {
 	// system:sampling/createMessage carries no arguments. BuildRegoInput must
 	// still emit "arguments": {} so Rego policies don't need a null guard.
 	req := &capability.EnforceRequest{
-		SessionID: "sess-h5",
-		ToolName:  "system:sampling/createMessage",
-		Arguments: nil,
+		SessionID:  "sess-h5",
+		TargetName: "system:sampling/createMessage",
+		Arguments:  nil,
 	}
 
 	input, err := enforcement.BuildRegoInput(context.Background(), req)
@@ -6919,9 +6919,9 @@ func TestEvaluateConditions_PopulatesDirectivesOnReq(t *testing.T) {
 	}
 
 	req := &capability.EnforceRequest{
-		SessionID: "sess-h6",
-		ToolName:  "export",
-		Arguments: map[string]interface{}{"format": "json"},
+		SessionID:  "sess-h6",
+		TargetName: "export",
+		Arguments:  map[string]interface{}{"format": "json"},
 	}
 
 	// spy always allows; we just want to capture the input
@@ -6957,7 +6957,7 @@ func TestEvaluateConditions_NoDirectives_EmptySliceInRegoInput(t *testing.T) {
 			capability.PolicyCondition{Backend: "opa"},
 		},
 	}
-	req := &capability.EnforceRequest{ToolName: "query_db"}
+	req := &capability.EnforceRequest{TargetName: "query_db"}
 
 	e.EvaluateConditions(context.Background(), req, &constraint)
 
@@ -6994,7 +6994,7 @@ func TestValidateAction_PopulatesDirectivesOnReq(t *testing.T) {
 		},
 	}}
 
-	req := &capability.EnforceRequest{ToolName: "export"}
+	req := &capability.EnforceRequest{TargetName: "export"}
 	e.ValidateAction(context.Background(), req, constraints)
 
 	if captured == nil {
@@ -7024,8 +7024,8 @@ func TestExistingArgumentsPoliciesUnaffected(t *testing.T) {
 		},
 	}
 	req := &capability.EnforceRequest{
-		ToolName:  "read_file",
-		Arguments: map[string]interface{}{"path": "/reports/q3.pdf"},
+		TargetName: "read_file",
+		Arguments:  map[string]interface{}{"path": "/reports/q3.pdf"},
 	}
 
 	e.EvaluateConditions(context.Background(), req, &constraint)
@@ -7066,7 +7066,7 @@ func (s *spyDirectiveEvaluator) Evaluate(
 
 // TestMaxCalls_ResourceTarget_NoToolName is the regression: a maxCalls
 // condition on a non-tool capability (resources/read, prompts/get, …) carries the
-// identifier in req.Target.Name, not req.ToolName. Before the fix handleMaxCalls
+// identifier in req.Target.Name, not req.TargetName. Before the fix handleMaxCalls
 // denied every such call with a misleading "tool name is required" MISSING_CONTEXT
 // before any count check, and never keyed the counter. It must now fall back to
 // req.Target.Name and enforce the limit.
@@ -7102,7 +7102,7 @@ func TestMaxCalls_ResourceTarget_NoToolName(t *testing.T) {
 }
 
 // TestSequenceBlock_ResourceTarget_BlockedNameInDetails is the regression:
-// when the blocked target is a resource (req.ToolName empty, the URI in
+// when the blocked target is a resource (req.TargetName empty, the URI in
 // req.Target.Name), the denial audit details must carry the resource name, not a
 // bare "resource:".
 func TestSequenceBlock_ResourceTarget_BlockedNameInDetails(t *testing.T) {
@@ -7111,9 +7111,9 @@ func TestSequenceBlock_ResourceTarget_BlockedNameInDetails(t *testing.T) {
 
 	// Record the antecedent tool so the sequenceBlock fires.
 	require.NoError(t, engine.RecordSessionCall(ctx, &capability.EnforceRequest{
-		SessionID: "sess-r",
-		ToolName:  "read_credentials",
-		Target:    &capability.EnforceRequestTarget{Type: "tool", Name: "read_credentials"},
+		SessionID:  "sess-r",
+		TargetName: "read_credentials",
+		Target:     &capability.EnforceRequestTarget{Type: "tool", Name: "read_credentials"},
 	}))
 
 	blocked := &capability.EnforceRequest{
@@ -7144,7 +7144,7 @@ func TestSequenceBlock_ResourceTarget_BlockedNameInDetails(t *testing.T) {
 // capabilities and returns the decision response.
 func callOnce(t *testing.T, engine *enforcement.Engine, sessionID, tool string, caps []capability.Constraint) capability.EnforceResponse {
 	t.Helper()
-	req := capability.EnforceRequest{SessionID: sessionID, ToolName: tool}
+	req := capability.EnforceRequest{SessionID: sessionID, TargetName: tool}
 	resp := engine.ValidateAction(context.Background(), &req, caps)
 	return resp
 }
@@ -7180,6 +7180,75 @@ func TestSequenceBlock_BlocksWriteAfterRead(t *testing.T) {
 	assert.Equal(t, capability.ConditionTypeSequenceBlock, resp.Denial.ConditionType)
 	assert.Equal(t, capability.ErrCodeConditionFailed, resp.Denial.Code)
 	assert.Equal(t, "tool:read_credentials", resp.Denial.Details["afterTool"])
+}
+
+// TestSequenceBlock_BlockedCallReArmsHistory pins the retention semantics: a blocked
+// call that FINDS the antecedent marker re-arms it, so the 24h history window measures
+// inactivity of the antecedent/blocked pair rather than age since the antecedent's own
+// call. Without the re-arm the gate expired purely by wall-clock — a session that read
+// credentials once was allowed to write externally a day later, a time-based fail-OPEN
+// of a security gate.
+//
+// The counter's own clock governs the window, so the fake time func drives it.
+func TestSequenceBlock_BlockedCallReArmsHistory(t *testing.T) {
+	var mu sync.Mutex
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	advance := func(d time.Duration) {
+		mu.Lock()
+		defer mu.Unlock()
+		now = now.Add(d)
+	}
+	counter := callcounter.NewInMemory(callcounter.WithTimeFunc(func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return now
+	}))
+	engine := enforcement.New(enforcement.WithCallCounter(counter))
+	caps := exfilCaps()
+
+	require.Equal(t, capability.DecisionAllow,
+		callOnce(t, engine, "sess-1", "read_credentials", caps).Decision)
+
+	// Three probes, each 20h after the previous. The antecedent is never called again,
+	// so by the third probe 60h have passed since it ran — well past the 24h window.
+	// Each denial must re-arm the marker, keeping the next probe inside the window.
+	for i, label := range []string{"20h", "40h", "60h"} {
+		advance(20 * time.Hour)
+		resp := callOnce(t, engine, "sess-1", "write_external", caps)
+		require.Equalf(t, capability.DecisionDeny, resp.Decision,
+			"probe %d (%s after the antecedent) must stay blocked: each denial re-arms the marker", i+1, label)
+		require.NotNil(t, resp.Denial)
+		assert.Equal(t, capability.ConditionTypeSequenceBlock, resp.Denial.ConditionType)
+	}
+}
+
+// TestSequenceBlock_HistoryExpiresAfterFullInactivity is the other half of the
+// retention contract: the re-arm above extends the window on ACTIVITY, it does not
+// make the marker permanent. A session that goes quiet on both legs past the window
+// loses the gate — the documented limitation, pinned here so a change to the retention
+// semantics is deliberate rather than incidental.
+func TestSequenceBlock_HistoryExpiresAfterFullInactivity(t *testing.T) {
+	var mu sync.Mutex
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	counter := callcounter.NewInMemory(callcounter.WithTimeFunc(func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return now
+	}))
+	engine := enforcement.New(enforcement.WithCallCounter(counter))
+	caps := exfilCaps()
+
+	require.Equal(t, capability.DecisionAllow,
+		callOnce(t, engine, "sess-1", "read_credentials", caps).Decision)
+
+	// No activity on either leg for longer than the window.
+	mu.Lock()
+	now = now.Add(25 * time.Hour)
+	mu.Unlock()
+
+	assert.Equal(t, capability.DecisionAllow,
+		callOnce(t, engine, "sess-1", "write_external", caps).Decision,
+		"the marker is reclaimed after a full window of inactivity on both legs")
 }
 
 // TestSequenceBlock_BlocksAfterManyAntecedentCalls guards the cap at
@@ -7472,9 +7541,9 @@ func TestSequenceBlock_NoCounterFailsClosed(t *testing.T) {
 func callTyped(t *testing.T, engine *enforcement.Engine, sessionID, targetType, name string, caps []capability.Constraint) capability.EnforceResponse {
 	t.Helper()
 	req := capability.EnforceRequest{
-		SessionID: sessionID,
-		ToolName:  name,
-		Target:    &capability.EnforceRequestTarget{Type: targetType, Name: name},
+		SessionID:  sessionID,
+		TargetName: name,
+		Target:     &capability.EnforceRequestTarget{Type: targetType, Name: name},
 	}
 	resp := engine.ValidateAction(context.Background(), &req, caps)
 	return resp
@@ -7567,7 +7636,7 @@ func TestSequenceBlock_NamespacedByTargetType(t *testing.T) {
 }
 
 // TestSequenceBlock_RecordsAntecedentFromTargetName is the regression: a
-// direct caller may set req.Target (Type+Name) while leaving req.ToolName empty.
+// direct caller may set req.Target (Type+Name) while leaving req.TargetName empty.
 // RecordSessionCall must fall back to req.Target.Name to derive the bare tool
 // name; otherwise the antecedent is never recorded and a later sequenceBlock
 // Peek finds an empty key and fails OPEN.
@@ -7575,7 +7644,7 @@ func TestSequenceBlock_RecordsAntecedentFromTargetName(t *testing.T) {
 	engine := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()))
 	caps := []capability.Constraint{
 		// A wildcard tool allow matches the antecedent even though its bare name
-		// is carried only by Target (req.ToolName is empty).
+		// is carried only by Target (req.TargetName is empty).
 		{Target: "tool:*", Actions: []string{"*"}},
 		{
 			Target:  "tool:write_external",
@@ -7589,9 +7658,9 @@ func TestSequenceBlock_RecordsAntecedentFromTargetName(t *testing.T) {
 	// Antecedent: ToolName empty, name carried only by Target. Allowed by tool:*,
 	// and the fix records it under the read_credentials history key.
 	antecedent := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "",
-		Target:    &capability.EnforceRequestTarget{Type: "tool", Name: "read_credentials"},
+		SessionID:  "sess-1",
+		TargetName: "",
+		Target:     &capability.EnforceRequestTarget{Type: "tool", Name: "read_credentials"},
 	}
 	resp := engine.ValidateAction(context.Background(), &antecedent, caps)
 	require.Equal(t, capability.DecisionAllow, resp.Decision)
@@ -7660,7 +7729,7 @@ func TestSequenceBlock_RecordFailureFailsClosed(t *testing.T) {
 func TestSequenceBlock_RecordFailureFailsClosed_EvaluateConditions(t *testing.T) {
 	engine := enforcement.New(enforcement.WithCallCounter(recordingErrorCounter{}))
 	matched := &capability.Constraint{Target: "tool:read_credentials", Actions: []string{"call"}}
-	req := &capability.EnforceRequest{SessionID: "sess-1", ToolName: "read_credentials"}
+	req := &capability.EnforceRequest{SessionID: "sess-1", TargetName: "read_credentials"}
 
 	resp := engine.EvaluateConditions(context.Background(), req, matched)
 	require.Equal(t, capability.DecisionDeny, resp.Decision)
@@ -7683,7 +7752,7 @@ func TestSequenceBlock_RecordFailureAuditModeIsAuditOnly(t *testing.T) {
 		Actions:     []string{"call"},
 		Enforcement: capability.EnforcementAudit,
 	}
-	req := &capability.EnforceRequest{SessionID: "sess-1", ToolName: "read_credentials"}
+	req := &capability.EnforceRequest{SessionID: "sess-1", TargetName: "read_credentials"}
 
 	resp := engine.EvaluateConditions(context.Background(), req, matched)
 	require.Equal(t, capability.DecisionDeny, resp.Decision)
@@ -7709,7 +7778,7 @@ func TestSequenceBlock_RecordFailureAuditModePreservesObligations(t *testing.T) 
 			&capability.RedactFieldsDirective{Fields: []string{"$.result.secret_value"}},
 		},
 	}
-	req := &capability.EnforceRequest{SessionID: "sess-1", ToolName: "get_secret"}
+	req := &capability.EnforceRequest{SessionID: "sess-1", TargetName: "get_secret"}
 
 	resp := engine.EvaluateConditions(context.Background(), req, matched)
 	require.Equal(t, capability.DecisionDeny, resp.Decision)
@@ -7724,7 +7793,7 @@ func TestSequenceBlock_RecordFailureAuditModePreservesObligations(t *testing.T) 
 func TestSequenceBlock_RecordFailureEnforceModeHardDenies(t *testing.T) {
 	engine := enforcement.New(enforcement.WithCallCounter(recordingErrorCounter{}))
 	matched := &capability.Constraint{Target: "tool:read_credentials", Actions: []string{"call"}}
-	req := &capability.EnforceRequest{SessionID: "sess-1", ToolName: "read_credentials"}
+	req := &capability.EnforceRequest{SessionID: "sess-1", TargetName: "read_credentials"}
 
 	resp := engine.EvaluateConditions(context.Background(), req, matched)
 	require.Equal(t, capability.DecisionDeny, resp.Decision)
@@ -7737,8 +7806,8 @@ func TestSequenceBlock_RecordFailureEnforceModeHardDenies(t *testing.T) {
 // read-then-write sequence yields a DENY under WithSkipQuota.
 func TestSequenceBlock_SkipQuotaObservesDenial(t *testing.T) {
 	caps := exfilCaps()
-	readReq := &capability.EnforceRequest{SessionID: "s1", ToolName: "read_credentials"}
-	writeReq := &capability.EnforceRequest{SessionID: "s1", ToolName: "write_external"}
+	readReq := &capability.EnforceRequest{SessionID: "s1", TargetName: "read_credentials"}
+	writeReq := &capability.EnforceRequest{SessionID: "s1", TargetName: "write_external"}
 
 	// WithSkipQuota: history recorded for the antecedent, sequenceBlock observed.
 	engine := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()))
@@ -7767,7 +7836,7 @@ func TestMaxCalls_SkipQuotaDoesNotConsume(t *testing.T) {
 	}}
 	skipCtx := enforcement.WithSkipQuota(context.Background())
 	for i := 0; i < 3; i++ {
-		resp := engine.ValidateAction(skipCtx, &capability.EnforceRequest{SessionID: "s", ToolName: "x"}, caps)
+		resp := engine.ValidateAction(skipCtx, &capability.EnforceRequest{SessionID: "s", TargetName: "x"}, caps)
 		require.Equalf(t, capability.DecisionAllow, resp.Decision,
 			"WithSkipQuota must not consume maxCalls quota (call %d)", i+1)
 	}
@@ -7790,9 +7859,9 @@ func TestEngine_MultiMaxCalls_AtomicUnderConcurrency(t *testing.T) {
 		},
 	}}
 	req := capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "export",
-		Target:    &capability.EnforceRequestTarget{Type: "tool", Name: "export"},
+		SessionID:  "sess-1",
+		TargetName: "export",
+		Target:     &capability.EnforceRequestTarget{Type: "tool", Name: "export"},
 	}
 
 	const goroutines = 64
@@ -7863,9 +7932,9 @@ func TestDirectives_CollectedOnDowngradableDeny(t *testing.T) {
 	}
 	req := func() *capability.EnforceRequest {
 		return &capability.EnforceRequest{
-			SessionID: "sess-1",
-			ToolName:  "read_file",
-			Arguments: map[string]interface{}{"path": "/internal/secrets.txt"},
+			SessionID:  "sess-1",
+			TargetName: "read_file",
+			Arguments:  map[string]interface{}{"path": "/internal/secrets.txt"},
 		}
 	}
 	assertRedacts := func(t *testing.T, resp capability.EnforceResponse) {
@@ -7935,9 +8004,9 @@ func TestUnwiredDirective_DoesNotPreemptTheConditionVerdict(t *testing.T) {
 		Directives: []capability.Directive{unwiredDirective{}},
 	}
 	req := &capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "read_file",
-		Arguments: map[string]interface{}{"path": "/internal/secrets.txt"},
+		SessionID:  "sess-1",
+		TargetName: "read_file",
+		Arguments:  map[string]interface{}{"path": "/internal/secrets.txt"},
 	}
 
 	resp := enforcement.New().ValidateAction(context.Background(), req, []capability.Constraint{constraint})
@@ -7971,7 +8040,7 @@ func TestNoMatchDeny_CarriesObligationsWhenForwarded(t *testing.T) {
 		Principal:  map[string][]string{"agent_id": {"someone-else"}},
 		Directives: []capability.Directive{&capability.RedactFieldsDirective{Fields: []string{"$.user.ssn"}}},
 	}}
-	req := &capability.EnforceRequest{SessionID: "sess-1", ToolName: "read_file"}
+	req := &capability.EnforceRequest{SessionID: "sess-1", TargetName: "read_file"}
 	e := enforcement.New()
 
 	forwarded := e.ValidateAction(enforcement.WithSkipQuota(context.Background()), req, caps)
@@ -7983,4 +8052,83 @@ func TestNoMatchDeny_CarriesObligationsWhenForwarded(t *testing.T) {
 	blocked := e.ValidateAction(context.Background(), req, caps)
 	require.Equal(t, capability.DecisionDeny, blocked.Decision)
 	assert.Empty(t, blocked.Obligations)
+}
+
+// ctxHonoringCounter wraps a CallCounter and fails every operation whose context is
+// already cancelled, the way the Redis backend does (its pipeline Exec propagates
+// cancellation). The in-memory backend ignores ctx entirely, so without this wrapper
+// no test can see a cancellation-sensitive bug on the counter path.
+type ctxHonoringCounter struct{ inner capability.CallCounter }
+
+func (c ctxHonoringCounter) IncrementAndGet(ctx context.Context, key string, windowSec, maxEntries int) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.inner.IncrementAndGet(ctx, key, windowSec, maxEntries)
+}
+
+func (c ctxHonoringCounter) Peek(ctx context.Context, key string, windowSec int) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.inner.Peek(ctx, key, windowSec)
+}
+
+func (c ctxHonoringCounter) IncrementIfBelow(ctx context.Context, key string, windowSec int, limit int64) (count int64, admitted bool, retryAfter time.Duration, err error) {
+	if err := ctx.Err(); err != nil {
+		return 0, false, 0, err
+	}
+	return c.inner.IncrementIfBelow(ctx, key, windowSec, limit)
+}
+
+func (c ctxHonoringCounter) IncrementIfAllBelow(ctx context.Context, keys []string, windowSecs []int, limits []int64) (admitted bool, deniedIndex int, count int64, retryAfter time.Duration, err error) {
+	if err := ctx.Err(); err != nil {
+		return false, 0, 0, 0, err
+	}
+	return c.inner.IncrementIfAllBelow(ctx, keys, windowSecs, limits)
+}
+
+// TestSequenceBlock_ReArmSurvivesRequestCancellation closes the bypass in the re-arm
+// itself: the host request context is cancelled the moment a client disconnects, and
+// a backend that honors ctx (Redis does) would then drop the re-arm write. A client
+// that probes the blocked target and immediately drops the connection is still denied
+// each time, but without a detached context it never refreshes the marker — so the
+// gate reverts to expiring on pure wall clock, which is precisely the fail-open the
+// re-arm exists to close, triggerable at will.
+func TestSequenceBlock_ReArmSurvivesRequestCancellation(t *testing.T) {
+	var mu sync.Mutex
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	counter := ctxHonoringCounter{inner: callcounter.NewInMemory(callcounter.WithTimeFunc(func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return now
+	}))}
+	engine := enforcement.New(enforcement.WithCallCounter(counter))
+	caps := exfilCaps()
+
+	require.Equal(t, capability.DecisionAllow,
+		engine.ValidateAction(context.Background(),
+			&capability.EnforceRequest{SessionID: "sess-1", TargetName: "read_credentials"}, caps).Decision)
+
+	// Probe the blocked target every 20h with a context that is ALREADY cancelled,
+	// modelling a client that disconnects the instant it sends the request.
+	for i := 0; i < 3; i++ {
+		mu.Lock()
+		now = now.Add(20 * time.Hour)
+		mu.Unlock()
+
+		cancelled, cancel := context.WithCancel(context.Background())
+		cancel()
+		resp := engine.ValidateAction(cancelled,
+			&capability.EnforceRequest{SessionID: "sess-1", TargetName: "write_external"}, caps)
+		require.Equalf(t, capability.DecisionDeny, resp.Decision,
+			"probe %d must be denied even with a cancelled context", i+1)
+	}
+
+	// 60h after the antecedent, with no uncancelled traffic in between, a clean probe
+	// must STILL be blocked: the cancelled probes re-armed the marker.
+	resp := engine.ValidateAction(context.Background(),
+		&capability.EnforceRequest{SessionID: "sess-1", TargetName: "write_external"}, caps)
+	require.Equal(t, capability.DecisionDeny, resp.Decision,
+		"a client that disconnects on every probe must not be able to age the gate out")
 }
