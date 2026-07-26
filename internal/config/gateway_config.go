@@ -370,6 +370,26 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 		return nil, err
 	}
 
+	// Gate on the declared grammar version BEFORE the strict decode, mirroring the
+	// manifest loader's deliberate ordering (validateManifestSchemaVersion runs ahead of
+	// checkManifestKeys). The strict decode below rejects any key this binary's structs
+	// do not model, so without this pre-read a config written for a FUTURE grammar is
+	// reported as a typo ("field xyz not found") when the real problem is that the whole
+	// document is a dialect this binary does not speak. That misdirection sends an
+	// operator hunting a spelling mistake in a correctly-spelled file. The pre-read is
+	// deliberately tolerant — no KnownFields, every other field ignored — so it can reach
+	// schemaVersion in a document the strict decode would reject outright. A document
+	// that will not parse as YAML at all falls through to the strict decode, which
+	// reports the syntax error with its own path-qualified message.
+	var versionProbe struct {
+		SchemaVersion string `yaml:"schemaVersion"`
+	}
+	if err := yaml.Unmarshal(raw, &versionProbe); err == nil {
+		if err := validateGatewaySchemaVersion(versionProbe.SchemaVersion); err != nil {
+			return nil, fmt.Errorf("invalid gateway config %q: %w", path, err)
+		}
+	}
+
 	// Decode strictly: unknown keys are an error, so a typo'd field (e.g.
 	// `comand:`) fails loudly instead of being silently ignored. This mirrors
 	// the "additionalProperties": false in schemas/eunox-gateway-config.schema.json.

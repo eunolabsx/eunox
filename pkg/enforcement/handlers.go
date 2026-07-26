@@ -194,23 +194,28 @@ func (e *Engine) handleTimeWindow(_ context.Context, cond capability.Condition, 
 
 	// Manifest-loaded conditions are pre-parsed (Compile at load), so the hot path
 	// compares ready time.Time values and never calls time.Parse. An uncompiled
-	// condition (constructed directly, e.g. in a test) reports ok=false and each
-	// bound is parsed on demand below, preserving the same behavior.
-	preNotBefore, preNotAfter, compiled := tw.Window()
+	// condition (constructed directly, e.g. in a test) compiles a LOCAL copy once and
+	// reads it back through the same accessor, rather than re-implementing the RFC3339
+	// parse per bound here: one parser, so the uncompiled path cannot drift from
+	// Compile. The copy is deliberate — the engine must not cache state onto a
+	// condition it does not own. Compile reports the FIRST malformed bound, so a
+	// condition with both a violated notBefore and a malformed notAfter now denies on
+	// the malformed bound rather than the violated one; both are denials, and reporting
+	// the structural error first is the more useful of the two.
+	notBefore, notAfter, compiled := tw.Window()
+	if !compiled {
+		local := *tw
+		if err := local.Compile(); err != nil {
+			return &ConditionError{
+				Code:          capability.ErrCodeConditionFailed,
+				ConditionType: capability.ConditionTypeTimeWindow,
+				Message:       err.Error(),
+			}
+		}
+		notBefore, notAfter, _ = local.Window()
+	}
 
 	if tw.NotBefore != "" {
-		notBefore := preNotBefore
-		if !compiled {
-			parsed, err := time.Parse(time.RFC3339Nano, tw.NotBefore)
-			if err != nil {
-				return &ConditionError{
-					Code:          capability.ErrCodeConditionFailed,
-					ConditionType: capability.ConditionTypeTimeWindow,
-					Message:       fmt.Sprintf("invalid notBefore time: %s", tw.NotBefore),
-				}
-			}
-			notBefore = parsed.UTC()
-		}
 		if now.Before(notBefore) {
 			return &ConditionError{
 				Code:          capability.ErrCodeConditionFailed,
@@ -225,18 +230,6 @@ func (e *Engine) handleTimeWindow(_ context.Context, cond capability.Condition, 
 	}
 
 	if tw.NotAfter != "" {
-		notAfter := preNotAfter
-		if !compiled {
-			parsed, err := time.Parse(time.RFC3339Nano, tw.NotAfter)
-			if err != nil {
-				return &ConditionError{
-					Code:          capability.ErrCodeConditionFailed,
-					ConditionType: capability.ConditionTypeTimeWindow,
-					Message:       fmt.Sprintf("invalid notAfter time: %s", tw.NotAfter),
-				}
-			}
-			notAfter = parsed.UTC()
-		}
 		// The window is half-open: [notBefore, notAfter). notBefore is inclusive,
 		// notAfter exclusive, so !now.Before(notAfter) denies now >= notAfter —
 		// "allow until T" closes at T rather than admitting one more call at T.
@@ -281,28 +274,27 @@ func (e *Engine) handleIPRange(_ context.Context, cond capability.Condition, req
 
 	// Manifest-loaded conditions are pre-compiled, so the hot path matches against
 	// ready networks and never calls net.ParseCIDR.
-	if networks, ok := ipr.Networks(); ok {
-		for _, network := range networks {
-			if network.Contains(ip) {
-				return nil
+	networks, ok := ipr.Networks()
+	if !ok {
+		// Not pre-compiled (a programmatically constructed condition). Compile a LOCAL
+		// copy and read it back through the same accessor rather than re-implementing the
+		// CIDR loop here: one parser, so the uncompiled path cannot drift from Compile.
+		// The copy is deliberate — the engine must not cache state onto a condition it
+		// does not own. The loader rejects malformed CIDRs, so this error branch is
+		// reachable only for hand-built conditions; fail closed on it.
+		local := *ipr
+		if err := local.Compile(); err != nil {
+			return &ConditionError{
+				Code:          capability.ErrCodeConditionFailed,
+				ConditionType: capability.ConditionTypeIPRange,
+				Message:       fmt.Sprintf("invalid CIDR in condition: %v", err),
 			}
 		}
-	} else {
-		// Not pre-compiled (a programmatically constructed condition): parse and
-		// match in one pass. The loader rejects malformed CIDRs, so the parse-error
-		// branch is reachable only for hand-built conditions; fail closed on it.
-		for _, cidr := range ipr.CIDRs {
-			_, network, err := net.ParseCIDR(cidr)
-			if err != nil {
-				return &ConditionError{
-					Code:          capability.ErrCodeConditionFailed,
-					ConditionType: capability.ConditionTypeIPRange,
-					Message:       fmt.Sprintf("invalid CIDR in condition: %s", cidr),
-				}
-			}
-			if network.Contains(ip) {
-				return nil
-			}
+		networks, _ = local.Networks()
+	}
+	for _, network := range networks {
+		if network.Contains(ip) {
+			return nil
 		}
 	}
 
@@ -1051,6 +1043,13 @@ func MatchAllowedValue(argValue interface{}, allowed []interface{}) bool {
 // handleAllowedOperations and the JWT shorthand PDP, so the two cannot diverge on
 // how an operation is derived from a string argument (e.g. "SELECT * FROM t" yields
 // "SELECT").
+//
+// First token ONLY, deliberately: a compound statement ("SELECT 1; DROP TABLE users")
+// verbs as its leading word, so allowedOperations does not block the trailing
+// statement — see AllowedOperationsCondition's doc for why the boundary is documented
+// rather than widened, and what to pair the condition with. Anything more than a verb
+// gate belongs in argumentSchema, an external PolicyEvaluator, or the database's own
+// grants; do not grow a SQL parser here.
 func OperationVerb(s string) string {
 	fields := strings.Fields(s)
 	if len(fields) == 0 {

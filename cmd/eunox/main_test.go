@@ -2858,9 +2858,13 @@ func schemaNumberAt(doc map[string]any, path []string) (float64, bool) {
 // typo'd key fails loudly instead of being silently dropped.
 func TestLoadGatewayConfig_RejectsUnknownFields(t *testing.T) {
 	t.Parallel()
+	// Each fixture declares a SUPPORTED schemaVersion so the unknown-field error is
+	// what surfaces. The loader gates the declared grammar version first (mirroring the
+	// manifest loader), so a config omitting schemaVersion would be rejected for that
+	// instead — correctly, but it would stop this test from covering strictness.
 	cases := map[string]string{
-		"unknown top-level key": "bogusTopLevel: 1\nupstreams:\n  - {name: a, transport: stdio, command: echo}\n",
-		"unknown upstream key":  "upstreams:\n  - {name: a, transport: stdio, command: echo, comand: echo}\n",
+		"unknown top-level key": "schemaVersion: \"0.1\"\nbogusTopLevel: 1\nupstreams:\n  - {name: a, transport: stdio, command: echo}\n",
+		"unknown upstream key":  "schemaVersion: \"0.1\"\nupstreams:\n  - {name: a, transport: stdio, command: echo, comand: echo}\n",
 	}
 	for name, cfg := range cases {
 		t.Run(name, func(t *testing.T) {

@@ -1259,26 +1259,22 @@ func resolveOAuthMetadata(cfg *config.GatewayConfig, pf proxyFlags) (*transport.
 
 	var oauthAuthzServers []string
 	// validateAuthz is set for the two operator-supplied sources
-	// (listen.oauthAuthorizationServers and --oauth-authz-server). The --jwt-issuer
+	// (listen.oauthAuthorizationServers and --oauth-authorization-server). The --jwt-issuer
 	// fallback is exempt: it is the issuer already wired into JWT validation and may be
 	// a loopback http URL in dev (under --jwks-allow-insecure-http), so forcing https on
 	// it here would be a regression.
 	var validateAuthz bool
 	switch {
 	case len(cfg.Listen.OAuthAuthorizationServers) > 0:
-		// Same silent-override hazard as the resource URI above: warn rather than drop
-		// the operator's flag without a word. The flag is registered as
-		// --oauth-authorization-server, so name it that: an operator who greps --help for
-		// the name in this message must find it. Warn only when the flag actually loses
-		// something — a single config entry equal to the flag drops nothing, and warning
-		// there trains operators to ignore the message.
-		flagAlreadyCovered := len(cfg.Listen.OAuthAuthorizationServers) == 1 &&
-			cfg.Listen.OAuthAuthorizationServers[0] == pf.oauthAuthzServer
-		if pf.oauthAuthzServer != "" && !flagAlreadyCovered {
-			fmt.Fprintf(os.Stderr, "[eunox] WARNING: --oauth-authorization-server %q is overridden by the config's listen.oauthAuthorizationServers %v; the config takes precedence.\n", pf.oauthAuthzServer, cfg.Listen.OAuthAuthorizationServers)
-		}
 		oauthAuthzServers = cfg.Listen.OAuthAuthorizationServers
 		validateAuthz = true
+		if pf.oauthAuthzServer != "" && (len(oauthAuthzServers) != 1 || oauthAuthzServers[0] != pf.oauthAuthzServer) {
+			// Same rule as the resource URI above: config wins, but an explicitly-passed
+			// flag is never discarded in silence. Name the flag as REGISTERED
+			// (--oauth-authorization-server); an operator who greps --help for the name in
+			// this message must find it, and --oauth-authz-server does not exist.
+			fmt.Fprintf(os.Stderr, "[eunox] WARNING: --oauth-authorization-server=%q is overridden by listen.oauthAuthorizationServers=%v from the config file; the config value is published.\n", pf.oauthAuthzServer, oauthAuthzServers)
+		}
 	case pf.oauthAuthzServer != "":
 		oauthAuthzServers = []string{pf.oauthAuthzServer}
 		validateAuthz = true
