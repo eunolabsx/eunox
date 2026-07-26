@@ -60,25 +60,7 @@ func (s *Sink) VerifyRecord(line []byte) (bool, error) {
 	dec.UseNumber()
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&rec); err != nil {
-		// The strict decode failed. Re-decode leniently to disambiguate: if the lenient
-		// decode ALSO fails, the record is genuinely malformed (fatal for signed and
-		// legacy alike, matching the old lenient-first behavior). If it succeeds, the
-		// strict failure was purely an unknown field — fatal only for a SIGNED record,
-		// since a legacy (unsigned, pre-HMAC) record predates the current struct and may
-		// legitimately carry a field it no longer models. Whether the record is signed is
-		// only knowable once decoded, so this lenient fallback is what disambiguates —
-		// without any string-matching on the json error text.
-		lenient := json.NewDecoder(bytes.NewReader(line))
-		lenient.UseNumber()
-		if lerr := lenient.Decode(&rec); lerr != nil {
-			return false, lerr
-		}
-		if isSignedRecord(rec) {
-			return false, fmt.Errorf("signed audit record contains an unknown or malformed field: %w", err)
-		}
-		// Legacy record: accept the leniently-decoded rec and continue the trailing-data
-		// check on the lenient decoder (positioned after the value).
-		dec = lenient
+		return false, fmt.Errorf("audit record is malformed or contains an unknown field: %w", err)
 	}
 	// Reject trailing bytes: Decode stops at the first value and ignores the rest, so
 	// a tampered {…record…}GARBAGE line would otherwise verify (the HMAC covers the
@@ -87,6 +69,16 @@ func (s *Sink) VerifyRecord(line []byte) (bool, error) {
 		return false, fmt.Errorf("trailing data after audit record")
 	}
 	storedHMAC := rec.HMAC
+	// Fail closed on an unsigned record rather than proceeding to a comparison against
+	// an empty MAC. Callers classify this shape before reaching here (see classify and
+	// resumeChainFromTail), so this is the backstop, not the primary path — it exists so
+	// a reordering of those pre-filters degrades to a plain refusal instead of a
+	// silently-passing verification. It is deliberately NOT a distinct sentinel: no
+	// caller branches on the reason, and an error value nothing reads reads as a
+	// distinction that is being made somewhere.
+	if storedHMAC == "" {
+		return false, fmt.Errorf("audit record carries no _hmac, so it cannot be verified")
+	}
 	rec.HMAC = "" // zero before re-signing, matching Record()
 
 	body, err := json.Marshal(rec)
@@ -121,20 +113,15 @@ func (s *Sink) VerifyRecord(line []byte) (bool, error) {
 	// old records' signatures regardless — canonical form and HMAC validity move
 	// together. Appending a new omitempty field stays compatible under both.
 	//
-	// Signed records only: a legacy (pre-HMAC) record predates the current struct and
-	// carries no signature to contradict, so it has no canonical form to compare with.
-	//
 	// Whitespace OUTSIDE the object is trimmed rather than rejected: it cannot add,
 	// remove, or re-spell a field, so it changes no consumer's reading of the record,
 	// and callers legitimately differ on whether the terminating newline is included.
-	if storedHMAC != "" {
-		canonical, cerr := isCanonicalSignedLine(bytes.TrimSpace(line), body, storedHMAC)
-		if cerr != nil {
-			return false, cerr
-		}
-		if !canonical {
-			return false, errNonCanonicalRecord
-		}
+	canonical, cerr := isCanonicalSignedLine(bytes.TrimSpace(line), body, storedHMAC)
+	if cerr != nil {
+		return false, cerr
+	}
+	if !canonical {
+		return false, errNonCanonicalRecord
 	}
 	keys, kerr := s.keysToTry(rec.KeyID)
 	if kerr != nil {
@@ -159,22 +146,12 @@ func (s *Sink) VerifyRecord(line []byte) (bool, error) {
 	//   - A record that names NO key_id verified against NO keys at all (empty ring /
 	//     no configured key) could not be checked: the signing key is unidentifiable
 	//     AND absent, so calling it tampering is unjustified. Signal that distinctly
-	//     (still fail-closed) so the caller reports UNVERIFIABLE. storedHMAC is
-	//     non-empty here (empty-HMAC records are classified before VerifyRecord).
-	if rec.KeyID == "" && storedHMAC != "" && len(keys) == 0 {
+	//     (still fail-closed) so the caller reports UNVERIFIABLE. An HMAC-less record
+	//     cannot reach here: it is refused above (errUnsignedRecord).
+	if rec.KeyID == "" && len(keys) == 0 {
 		return false, errUnidentifiedNoMatch
 	}
 	return false, nil
-}
-
-// hasVerificationKey reports whether this sink holds any key to verify records against
-// — a non-empty audit-verify keyring or the single active signing key. When it does,
-// signing is expected, so an all-legacy (unsigned) log cannot be certified (see
-// VerifyResult.Unanchored). An empty (but non-nil) keyring holds no key, so it is not a
-// verification key: without a key there is nothing to verify, and an all-legacy log is
-// unverifiable rather than a failed anchor.
-func (s *Sink) hasVerificationKey() bool {
-	return s != nil && (len(s.verifyKeys) > 0 || s.key != nil)
 }
 
 // keysToTry returns the candidate keys for verifying a record carrying keyID. With
@@ -183,12 +160,12 @@ func (s *Sink) hasVerificationKey() bool {
 // non-empty keyID absent from the ring returns errKeyIDNotInRing (fail-closed: no
 // key to try) so the caller reports UNKNOWN_KEY_ID rather than INVALID.
 func (s *Sink) keysToTry(keyID string) ([][]byte, error) {
-	// A nil receiver holds no keys, matching hasVerificationKey's nil tolerance. Both
-	// are reachable from the exported VerifyLog/VerifyLogFiles, whose verifier
-	// parameter a caller may legitimately leave nil (verify structure only, no
-	// signature check) — so the two must agree rather than one answering "no keys" and
-	// the other panicking. Returning no keys routes the record through VerifyRecord's
-	// "could not verify" branch, never its "tampered" one.
+	// A nil receiver holds no keys rather than panicking. That tolerance is
+	// load-bearing, not defensive: VerifyLog/VerifyLogFiles document a nil verifier as
+	// the structure-only mode (verify shape and chain, no signature check), and classify
+	// calls VerifyRecord unconditionally, so deleting this branch turns that documented
+	// call into a nil dereference. Returning no keys routes the record through
+	// VerifyRecord's "could not verify" branch, never its "tampered" one.
 	if s == nil {
 		return nil, nil
 	}
@@ -223,42 +200,29 @@ type VerifyResult struct {
 	Valid        int
 	Invalid      int
 	Skipped      int
-	Legacy       int    // pre-signing records (no _hmac, no seq); exempt, not invalid
-	UnknownKey   int    // records naming a key_id absent from the verification ring (retired-key state; not tampering)
-	Unverifiable int    // records naming NO key_id that no ring key matched (signing key unidentifiable; not provably tampering)
-	ChainBreaks  int    // prev_hmac mismatches or seq gaps between consecutive records
-	FirstSeq     uint64 // seq of the first record (0 when the log is empty)
-	// Unanchored is set when the verifier held a signing key but the (non-empty) log
-	// carried NO signed record — every line was pre-signing legacy shape (no _hmac,
-	// seq 0). Such a log has no cryptographic anchor, so it cannot be certified: it is
-	// either genuinely pre-HMAC history the held key can say nothing about, or a
-	// wholesale unsigned forgery by a write-capable attacker without the key. A
-	// legitimate legacy->signed upgrade always leaves a signed marker (see
-	// isLegacyTailResumedMarker), so a keyed verify of an all-legacy log is not a normal
-	// state. Fails the verdict (see OK) so audit-verify cannot report PASS over it.
-	Unanchored bool
-	// LegacyUnanchored is set when a head legacy record (unsigned, seq 0) is followed by
-	// a BARE genesis seq-1 signed record rather than the legacy_tail_resumed marker. That
-	// shape is the rare marker-write-failed upgrade fallback — but it is also exactly what
-	// a write-capable attacker WITHOUT the signing key produces by prepending fabricated
-	// unsigned "legacy" records ahead of an ordinary signed log (whose first record is a
-	// genesis seq-1). The two are indistinguishable without the key, so the mixed-log case
-	// is failed closed for the same reason the all-legacy case (Unanchored) is: a genuine
-	// upgrade links its signed marker with an empty prev_hmac and never takes this path, so
-	// only the rare fallback is a false positive — the fail-closed direction.
-	LegacyUnanchored bool
+	UnknownKey   int // records naming a key_id absent from the verification ring (retired-key state; not tampering)
+	Unverifiable int // records naming NO key_id that no ring key matched (signing key unidentifiable; not provably tampering)
+	ChainBreaks  int // prev_hmac mismatches or seq gaps between consecutive records
+	// FirstSeq is the seq of the first record that entered the chain — i.e. the first
+	// SIGNED one. It is 0 for an empty log AND for a log that carries no signed record
+	// at all (every line unsigned: pre-signing history, or a wholesale unsigned
+	// forgery), so a consumer must read it together with Total/Invalid rather than
+	// treating 0 as "empty".
+	FirstSeq uint64
 }
 
-// OK reports whether the log passed: no HMAC failure, no chain break, every record
-// checkable against a held key, and (when a key was held) at least one signed record
-// anchoring the chain. UnknownKey records are not tampered but are unverified (their
-// key is absent), so counting them as a failure keeps the verdict fail-closed (a
+// OK reports whether the log passed: no HMAC failure, no chain break, and every record
+// checkable against a held key. UnknownKey records are not tampered but are unverified
+// (their key is absent), so counting them as a failure keeps the verdict fail-closed (a
 // tampered record cannot evade detection by relabelling its key_id) while the dedicated
-// count tells the operator the cause is a missing key. Unanchored fails the verdict for
-// the same fail-closed reason: an all-legacy log under a held key carries no signature
-// to verify, so it cannot be certified (see the field comment).
+// count tells the operator the cause is a missing key.
+//
+// An unsigned record has no separate bucket: it is INVALID like any other record that
+// cannot be certified, so a log with no signed records anywhere — pre-signing history,
+// or a wholesale unsigned forgery by a write-capable attacker without the key — fails
+// on the Invalid count alone.
 func (r VerifyResult) OK() bool {
-	return r.Invalid == 0 && r.ChainBreaks == 0 && r.UnknownKey == 0 && r.Unverifiable == 0 && !r.Unanchored && !r.LegacyUnanchored
+	return r.Invalid == 0 && r.ChainBreaks == 0 && r.UnknownKey == 0 && r.Unverifiable == 0
 }
 
 // SanitizeAuditField replaces every line-breaking rune with a space before an
@@ -308,23 +272,7 @@ func VerifyLog(r io.Reader, verifier *Sink, requestID string, since time.Time, o
 	if err := scanner.Err(); err != nil {
 		return v.res, err
 	}
-	// A log whose EVERY record classified as legacy (pre-signing shape: no _hmac, seq 0),
-	// while the verifier holds a key, has no cryptographic anchor — no signature to verify.
-	// A legitimate legacy->signed upgrade always leaves a signed record (the
-	// legacy_tail_resumed marker or a genesis seq-1 record), so an all-legacy log under a
-	// key is not a normal state: it is either genuine pre-HMAC history the held key cannot
-	// certify, or a wholesale unsigned forgery by a write-capable attacker without the key
-	// (deleting the log and its rotated siblings and rewriting them in legacy shape). Treat
-	// it as unverifiable rather than silently PASS. Keyed on Total == Legacy (not signedSeen,
-	// which a stream of records the chain walk rejected as decoys leaves false even though
-	// none of them was legacy): Total == Legacy holds only when every record landed in the
-	// legacy bucket, which is the state this diagnostic describes. Empty logs
-	// are exempt (nothing to anchor); leading-truncation-to-empty needs an external
-	// high-water mark, as documented above.
-	if v.res.Legacy > 0 && v.res.Legacy == v.res.Total && verifier.hasVerificationKey() {
-		v.res.Unanchored = true
-		_, _ = fmt.Fprintf(out, "UNANCHORED  the log has %d record(s) but none is signed (all pre-HMAC legacy shape) while a verification key is configured; it carries no signature to verify — either genuine pre-signing history the key cannot certify, or a wholesale unsigned forgery\n", v.res.Total)
-	}
+	v.reportSuppressedUnsigned()
 	return v.res, nil
 }
 
@@ -471,10 +419,9 @@ type auditChainVerifier struct {
 	havePrev bool
 	prevHMAC string
 	prevSeq  uint64
-	// signedSeen latches true once any signed record (isSignedRecord) is processed.
-	// After that a genuine pre-signing legacy record (HMAC=="" && Seq==0) can no
-	// longer legitimately appear, so a later one is treated as tampering.
-	signedSeen bool
+	// unsignedSeen counts HMAC-less records so their per-record diagnostic can be capped
+	// at maxUnsignedDiagnostics; the Invalid tally in res is unaffected and stays exact.
+	unsignedSeen int
 	// prevRecordInvalid is set by classify ONLY when the previous record's HMAC was
 	// provably wrong under a held key (the !ok / err cases) — i.e. its content was
 	// modified while its stored _hmac was left intact. updateChain stores rec.HMAC
@@ -485,12 +432,15 @@ type auditChainVerifier struct {
 	// records, whose _hmac is intact (a retired/absent key, not tampering) and still
 	// chains correctly — flagging those would mislabel a routine rotation as tampering.
 	prevRecordInvalid bool
-	// prevWasLegacyHead is true when the record just folded into the chain state was a
-	// head legacy record (unsigned, HMAC=="" && Seq==0, before any signed record). It
-	// lets the next record's link check accept the one legitimate legacy->signed
-	// transition that carries the genesis sentinel (see updateChain).
-	prevWasLegacyHead bool
 }
+
+// maxUnsignedDiagnostics bounds how many per-record "unsigned record" lines a single
+// verify pass prints. A log with a pre-signing prefix produces one per record, and an
+// unbounded stream of them buries the CHAIN BREAK / INVALID findings the tool exists to
+// surface — the practical result being an operator who suppresses the whole check. Sized
+// to show enough to recognize the shape while leaving the output readable; the exact
+// count always survives in VerifyResult.Invalid and in the closing summary line.
+const maxUnsignedDiagnostics = 10
 
 // decodeAuditRecord decodes one line into an auditRecord, reporting whether it was
 // well-formed JSON with no trailing data. UseNumber gives parity with VerifyRecord
@@ -507,20 +457,17 @@ func decodeAuditRecord(line []byte) (auditRecord, bool) {
 	return rec, unmarshalOK
 }
 
-// isSignedRecord reports whether rec belongs to the signed era, i.e. carries a
-// non-empty HMAC — writeRecord signs every record it writes unconditionally, so a
-// genuinely written record's HMAC presence is exactly what distinguishes it from a
-// pre-chain legacy record.
+// isSignedRecord reports whether rec carries a signature at all. writeRecord signs
+// every record it writes unconditionally, so an HMAC-less line is never one this
+// writer produced: it is pre-signing history, or a record whose signature was
+// stripped by a write-capable attacker without the key. Neither can be certified, so
+// callers treat both as INVALID and keep them out of the chain state.
 //
-// Single source of truth for this discriminator: EVERY signed/legacy split in this
-// file routes through it — VerifyRecord's lenient-decode fallback and canonical-form
-// check, updateChain's signedSeen latch and prevWasLegacyHead, processLine's
-// forgedLegacySplice, and classify's legacy bucket — rather than re-deriving the
-// comparison. That is what makes the promise load-bearing: today every spelling is
-// behaviorally identical, but a future change to what a signed record looks like
-// (an added decoy shape, a different empty sentinel) would otherwise have to find
-// and update each open-coded check, and a missed one would silently classify a
-// forged record into the legacy bucket that exists to be lenient.
+// Single source of truth for this discriminator: BOTH shapes processLine derives —
+// the unsigned gate and the seq-0 decoy gate — are expressed in terms of this
+// function rather than re-deriving `rec.HMAC != ""`, so a future change to what a
+// signed record looks like (an added decoy shape, a different empty sentinel) has one
+// place to update and the two gates cannot end up disagreeing about the same record.
 func isSignedRecord(rec auditRecord) bool {
 	return rec.HMAC != ""
 }
@@ -531,10 +478,10 @@ func (v *auditChainVerifier) processLine(line []byte) {
 	v.res.Total++
 	rec, unmarshalOK := decodeAuditRecord(line)
 
-	// A Seq==0 record with a non-empty HMAC is structurally impossible (legacy
-	// records carry no HMAC; signed records start at seq 1), so it is a forged decoy,
-	// rejected below and kept out of the chain state — adopting its seq 0 as prevSeq
-	// would suppress the next record's SEQ GAP diagnostic (the `prevSeq > 0` guard).
+	// A Seq==0 record with a non-empty HMAC is structurally impossible (a signed chain
+	// starts at seq 1), so it is a forged decoy, rejected below and kept out of the
+	// chain state — adopting its seq 0 as prevSeq would fabricate a gap against the
+	// next record and misreport where the tampering is.
 	//
 	// The rejection is unconditional. The only shape that could ever be a LEGITIMATE
 	// seq-0 signed record is the uint64 counter wrapping past 2^64 records — which no
@@ -545,55 +492,28 @@ func (v *auditChainVerifier) processLine(line []byte) {
 	// hottest piece of decoy rejection in exchange for a state that cannot occur: an
 	// attacker only had to place their seq-0 decoy at the head of a stream, or after a
 	// record claiming seq MaxUint64, to skip this check entirely.
-	forgedSeq0 := rec.Seq == 0 && rec.HMAC != ""
-	// An HMAC-less record AFTER a signed one is a forged legacy record spliced into
-	// the signed chain (a genuine legacy record — pre-signing history the writer
-	// resumed onto — only precedes the first signed one). Kept out of the chain
-	// state: adopting its "" prev_hmac would let a deletion be hidden (the next
-	// record links with prev_hmac="" and the seq-gap check is suppressed).
+	// Derived from `unsigned` below rather than re-testing rec.HMAC, so the two gates
+	// share one definition of "signed" (see isSignedRecord).
+	unsigned := !isSignedRecord(rec)
+	forgedSeq0 := rec.Seq == 0 && !unsigned
+	// An HMAC-less record is never one this writer produced (writeRecord signs
+	// unconditionally): it is pre-signing history, or a signature a write-capable
+	// attacker stripped — the one edit possible without the key. Both are INVALID, and
+	// both are kept out of the chain state, because adopting an unsigned record's ""
+	// prev_hmac and seq would let a deletion hide behind it (the next record links with
+	// prev_hmac="" and the seq-gap check is suppressed). No seq shape is exempt: a
+	// pre-signing record can carry any stale seq inherited from before the chain
+	// existed, and none of them is certifiable.
 	//
-	// This is NOT restricted to Seq==0: the writer's resume rule in Open
-	// (`s.resumedLegacyTail = prev.HMAC == ""`) is deliberately seq-independent, so a
-	// pre-chain tail can carry ANY stale seq value inherited from before the chain
-	// existed (see TestAuditChain_ResumesFromLegacyTail's "seq-bearing legacy tail"
-	// case) — not just the seq-0 shape a fresh, never-yet-chained log also produces.
-	// Gating this on Seq==0 would count a seq-bearing legacy tail INVALID (an
-	// HMAC-less record with a non-zero Seq matches neither this exemption nor any
-	// other), contradicting the writer's own documented, tested resume behavior — the
-	// two components would disagree on what the identical on-disk shape means. A
-	// genuine head legacy record (signedSeen false) is NOT excluded here, whatever its
-	// seq, so the legacy->first-signed transition still verifies.
-	forgedLegacySplice := !isSignedRecord(rec) && v.signedSeen
-
 	// Chain verification runs over every decodable record (except the decoys above),
 	// independent of the filter; the reporting filter is applied only afterward.
 	// prev_hmac linkage and seq contiguity are checked as separate ifs, not switch
 	// cases: an interior deletion trips BOTH, and a switch would emit only the first,
 	// hiding how many records were removed.
-	if unmarshalOK && !forgedSeq0 && !forgedLegacySplice {
+	if unmarshalOK && !forgedSeq0 && !unsigned {
 		v.updateChain(rec)
 	}
-	v.classify(line, rec, unmarshalOK, forgedSeq0, forgedLegacySplice)
-}
-
-// isLegacyTailResumedMarker reports whether rec is the synthetic legacy_tail_resumed
-// integrity marker — the one record that legitimately starts a signed chain with an
-// empty prev_hmac (written first after resuming onto a pre-chain unsigned tail). It
-// is identified by the integrity-failure denial code AND the details.kind shared with
-// the writer (audit.go), so the genesis check can distinguish a real legacy boundary
-// from a leading-truncation forgery wearing an empty prev_hmac. The record is signed,
-// so without the key neither field can be set on a forged record that also verifies.
-func isLegacyTailResumedMarker(rec auditRecord) bool {
-	if rec.DenialCode != auditIntegrityFailureCode || len(rec.Details) == 0 {
-		return false
-	}
-	var d struct {
-		Kind string `json:"kind"`
-	}
-	if err := json.Unmarshal(rec.Details, &d); err != nil {
-		return false
-	}
-	return d.Kind == auditKindLegacyTailResumed
+	v.classify(line, rec, unmarshalOK, forgedSeq0, unsigned)
 }
 
 // updateChain checks a legitimate record's prev_hmac linkage and seq contiguity
@@ -608,27 +528,17 @@ func (v *auditChainVerifier) updateChain(rec auditRecord) {
 		// skipped for the first record. A rotated log legitimately starts at seq > 1,
 		// so this is provable only at seq == 1.
 		//
-		// An empty prev_hmac at seq 1 is exempt ONLY when this first record is the
-		// genuine legacy_tail_resumed integrity marker. writeRecord emits an empty
-		// prev_hmac exclusively right after a resume onto a pre-chain (unsigned) tail,
-		// and that resume always writes the legacy_tail_resumed marker as its first
-		// record — so a legitimate empty-prev_hmac seq-1 record is ALWAYS that marker
-		// (recognizable, and signed, so its kind cannot be flipped without the key).
-		// The previous blanket `prev_hmac != ""` exemption instead let a key-holder
-		// truncate all leading records and forge an ORDINARY seq-1 allow/deny record
-		// with prev_hmac="" and a valid HMAC, passing verification with no chain break.
-		// Now any non-marker empty-prev_hmac seq-1 record is flagged; a key-holder can
-		// still forge the marker itself, but that pushes the forgery into a conspicuous,
-		// auditable AUDIT_INTEGRITY_FAILURE record that should appear at most once ever
-		// (the pre-chain→chain upgrade), rather than hiding as routine traffic.
-		// A genuine legacy_tail_resumed marker is the one record that legitimately
-		// starts a signed chain with an empty prev_hmac; everything else at seq 1 must
-		// carry the genesis sentinel.
-		legitLegacyBoundary := rec.PrevHMAC == "" && isLegacyTailResumedMarker(rec)
-		if rec.Seq == 1 && rec.PrevHMAC != auditGenesisPrev && !legitLegacyBoundary {
+		// There is no exemption for an empty prev_hmac: writeRecord emits either the
+		// resumed predecessor's _hmac or the genesis sentinel, never "", so an empty one
+		// at seq 1 is always a leading-truncation forgery (delete the leading records,
+		// rewrite the survivor to claim seq 1). The pre-signing upgrade path that once
+		// produced a legitimately-empty prev_hmac here is gone — an unsigned tail is no
+		// longer resumed onto, so a chain restarted after one begins at genesis like any
+		// other fresh chain.
+		if rec.Seq == 1 && rec.PrevHMAC != auditGenesisPrev {
 			v.res.ChainBreaks++
 			if rec.PrevHMAC == "" {
-				_, _ = fmt.Fprintf(v.out, "CHAIN BREAK at seq 1: prev_hmac is empty but the record is not a legacy_tail_resumed marker — a legitimate legacy-tail resume starts the signed chain with that marker, so a bare empty-prev_hmac seq-1 record indicates leading records were deleted and a replacement was forged\n")
+				_, _ = fmt.Fprintf(v.out, "CHAIN BREAK at seq 1: prev_hmac is empty, expected genesis sentinel %q — the writer never emits an empty prev_hmac, so leading records were deleted and a replacement was forged\n", auditGenesisPrev)
 			} else {
 				_, _ = fmt.Fprintf(v.out, "CHAIN BREAK at seq 1: prev_hmac is %q, expected genesis sentinel %q (a leading record was deleted or the origin was rewritten)\n", rec.PrevHMAC, auditGenesisPrev)
 			}
@@ -646,38 +556,15 @@ func (v *auditChainVerifier) updateChain(rec auditRecord) {
 			_, _ = fmt.Fprintf(v.out, "CHAIN BREAK at seq %d: the preceding record failed verification; its _hmac is untrustworthy and cannot serve as a valid chain anchor\n", rec.Seq)
 			v.prevRecordInvalid = false
 		}
-		// A genesis-sentinel seq-1 record immediately following a head legacy (unsigned)
-		// record is the legitimate legacy->signed transition when the legacy_tail_resumed
-		// marker write failed: the writer then clears resumedLegacyTail and the first
-		// appended record falls through to the genesis branch (see audit.go writeRecord),
-		// so it carries the genesis sentinel rather than the empty prev_hmac the marker
-		// would. Accept it — a lone genesis seq-1 record is already a valid fresh-chain
-		// start, and the preceding record is unsigned (carries no integrity), so this
-		// adds no forgery surface a key-holder does not already have (they could forge a
-		// lone genesis seq-1 start by truncating everything before it regardless).
-		legacyToSignedGenesis := v.prevWasLegacyHead && rec.Seq == 1 && rec.PrevHMAC == auditGenesisPrev
-		if legacyToSignedGenesis {
-			// The link check accepts this transition (no CHAIN BREAK) — but the same shape is
-			// what a write-capable attacker WITHOUT the signing key produces by prepending
-			// fabricated unsigned "legacy" records ahead of an ordinary signed log, so the
-			// VERDICT is failed closed (LegacyUnanchored). A genuine upgrade links its signed
-			// legacy_tail_resumed marker via an empty prev_hmac and never reaches this branch;
-			// only the rare marker-write-failed fallback is a false positive.
-			v.res.LegacyUnanchored = true
-			_, _ = fmt.Fprintf(v.out, "UNANCHORED  at seq 1: a bare genesis seq-1 record follows a head legacy (unsigned) record instead of the legacy_tail_resumed marker; the preceding unsigned record(s) carry no signature and cannot be certified — either a marker-write-failed upgrade or fabricated legacy records prepended by a write-capable attacker without the key\n")
-		}
-		if !legacyToSignedGenesis && rec.PrevHMAC != v.prevHMAC {
+		if rec.PrevHMAC != v.prevHMAC {
 			v.res.ChainBreaks++
 			_, _ = fmt.Fprintf(v.out, "CHAIN BREAK at seq %d: prev_hmac does not match the preceding record (a record was deleted, reordered, or inserted)\n", rec.Seq)
 		}
-		// A seq gap is meaningful only in the signed era: consecutive legacy records
-		// both decode to seq 0, so "0 does not follow 0" would fire spuriously, and
-		// the legacy->first-signed transition (0 -> 1) is contiguous. Gate on
-		// signedSeen, not prevSeq > 0: a legacy tail can carry any stale seq, so
-		// prevSeq > 0 would both miss that suppression and, wherever prevSeq is 0,
-		// skip the check entirely and give an inserter a blind spot. signedSeen tracks
-		// the property actually being gated on — has the signed era begun.
-		if rec.Seq != v.prevSeq+1 && rec.Seq > 0 && v.signedSeen {
+		// Every record reaching updateChain is signed and carries a seq > 0 (processLine
+		// keeps unsigned records and seq-0 decoys out of the chain state), so the gap
+		// check needs no era or zero-seq guard: consecutive records must simply be
+		// contiguous.
+		if rec.Seq != v.prevSeq+1 {
 			v.res.ChainBreaks++
 			_, _ = fmt.Fprintf(v.out, "SEQ GAP: record seq %d does not follow %d (a record is missing)\n", rec.Seq, v.prevSeq)
 		}
@@ -685,33 +572,25 @@ func (v *auditChainVerifier) updateChain(rec auditRecord) {
 	v.havePrev = true
 	v.prevHMAC = rec.HMAC
 	v.prevSeq = rec.Seq
-	// A head legacy record reaches updateChain only before any signed record (the
-	// forgedLegacySplice guard excludes a post-signed unsigned splice), so an
-	// HMAC-less seq-0 record here is a genuine legacy head. Record that so the next
-	// record's link check can accept the genesis-sentinel legacy->signed transition.
-	// Restricted to Seq==0 (unlike forgedLegacySplice/the classify legacy bucket,
-	// which accept any seq): the downstream legacyToSignedGenesis check this field
-	// feeds is itself gated on the FOLLOWING record's Seq==1, which writeRecord's
-	// resume (`rec.Seq = s.seq+1`, seeded from the tail's own seq) only ever produces
-	// after a seq-0 tail — a seq-bearing tail's next record starts at tail.Seq+1, so
-	// leaving this narrower does not miss that case.
-	v.prevWasLegacyHead = !isSignedRecord(rec) && rec.Seq == 0
-	// signedSeen means "a genuinely SIGNED record has been seen" (gating both the
-	// seq-gap check above and forgedLegacySplice in processLine), which is exactly
-	// isSignedRecord: a legacy record can itself carry a non-zero seq (the
-	// seq-bearing legacy tail forgedLegacySplice now accepts), so gating on Seq > 0
-	// alone would flip signedSeen true on a legacy record and misclassify the NEXT
-	// genuine legacy record — still HMAC-less, still preceding any real signed
-	// record — as a forged post-signing splice. isSignedRecord's HMAC check is what
-	// excludes that shape.
-	if isSignedRecord(rec) {
-		v.signedSeen = true
+}
+
+// reportSuppressedUnsigned prints the one-line tail summary for unsigned records whose
+// individual diagnostics were capped (see maxUnsignedDiagnostics). It names the total so
+// the elided lines are accounted for rather than silently dropped — the same posture the
+// pre-session record limiter takes with suppressed_count — and repeats the remedy, since
+// a log in this state is one an operator has to act on rather than re-run.
+func (v *auditChainVerifier) reportSuppressedUnsigned() {
+	if v.unsignedSeen <= maxUnsignedDiagnostics {
+		return
 	}
+	_, _ = fmt.Fprintf(v.out,
+		"INVALID  %d unsigned record(s) in total (%d diagnostics elided): none carries an _hmac, so none can be verified. Pre-signing history must be moved aside before upgrading; otherwise reconcile against your external sink.\n",
+		v.unsignedSeen, v.unsignedSeen-maxUnsignedDiagnostics)
 }
 
 // classify counts and reports the record's verification outcome: malformed,
-// forged decoy, legacy, or HMAC-verified (valid/invalid/skipped per the filter).
-func (v *auditChainVerifier) classify(line []byte, rec auditRecord, unmarshalOK, forgedSeq0, forgedLegacySplice bool) {
+// forged decoy, unsigned, or HMAC-verified (valid/invalid/skipped per the filter).
+func (v *auditChainVerifier) classify(line []byte, rec auditRecord, unmarshalOK, forgedSeq0, unsigned bool) {
 	// A line that failed to decode cannot be filtered or HMAC-verified, but is
 	// unambiguous corruption. Count it invalid before the filter so an active
 	// --request-id/--since cannot downgrade it to a silent skip and produce a false
@@ -731,26 +610,29 @@ func (v *auditChainVerifier) classify(line []byte, rec auditRecord, unmarshalOK,
 		return
 	}
 
-	// Pre-signing legacy records carry no _hmac. They may carry ANY seq value — the
-	// familiar seq-0 shape (HMAC=="", Seq==0) from a log that never got signed, or a
-	// seq-bearing tail inherited from before the chain existed (see
-	// forgedLegacySplice's doc comment in processLine): the writer's own resume rule
-	// treats both identically, so this check must too, or the two components disagree
-	// on what the identical on-disk shape means. Neither shape has an HMAC to verify,
-	// so VerifyRecord would count every one INVALID; count them in their own legacy
-	// bucket instead (mirroring Open's resume exemption) so audit-verify is safe
-	// across the upgrade boundary. The exemption holds only at the head: an
-	// HMAC-less record AFTER a signed one is a forged splice that would otherwise
-	// launder through the legacy bucket, so classify it invalid.
-	if !isSignedRecord(rec) {
-		// Use the forgedLegacySplice computed in processLine rather than re-deriving
-		// it from v.signedSeen, so classify stays a pure function of its inputs.
-		if forgedLegacySplice {
-			v.res.Invalid++
-			_, _ = fmt.Fprintf(v.out, "INVALID  record %d: unsigned record (seq=%d) follows a signed record (forged legacy record spliced into a signed chain)\n", v.res.Total, rec.Seq)
-			return
+	// An unsigned record carries nothing to verify. Treating one as merely skipped
+	// would hand an attacker a trivial evasion — strip _hmac and the record stops
+	// being checked — so it is INVALID, whatever its seq and wherever it sits in the
+	// stream. Pre-signing history is the same shape and gets the same verdict: move
+	// such a log aside before upgrading rather than expecting it to certify.
+	// (unsigned is computed in processLine so classify stays a pure function of its
+	// inputs.)
+	//
+	// The per-record diagnostic is CAPPED. A pre-signing log is precisely the case that
+	// produces one of these per line, and an unbounded stream of them — a 1M-record log
+	// emits well over a hundred megabytes — buries the genuine CHAIN BREAK or INVALID
+	// findings an operator is reading for, which is how a fail-closed check ends up
+	// suppressed with `|| true`. The Invalid COUNT stays exact; only the printing is
+	// bounded, and the tail is summarized once at the end (see reportSuppressedUnsigned).
+	if unsigned {
+		v.res.Invalid++
+		v.unsignedSeen++
+		switch {
+		case v.unsignedSeen <= maxUnsignedDiagnostics:
+			_, _ = fmt.Fprintf(v.out, "INVALID  record %d: unsigned record (seq=%d) carries no _hmac, so it cannot be verified (pre-signing history, or a stripped signature)\n", v.res.Total, rec.Seq)
+		case v.unsignedSeen == maxUnsignedDiagnostics+1:
+			_, _ = fmt.Fprintf(v.out, "INVALID  ... further unsigned records reported once at the end rather than one line each\n")
 		}
-		v.res.Legacy++
 		return
 	}
 

@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -21,6 +22,105 @@ import (
 
 	"github.com/eunolabs/eunox/pkg/capability"
 )
+
+// requireJSONContentType admits only a request body labelled application/json, failing
+// closed on an absent, unparseable, or duplicated Content-Type header. Every POST this
+// proxy serves — the /mcp JSON-RPC body and the /control/kill body — is JSON, and the
+// MCP Streamable HTTP spec already requires conformant clients to say so, so no honest
+// caller is turned away.
+//
+// It is a CSRF hardening measure, not merely conformance. checkOrigin is the primary
+// control and already rejects the cross-origin browser POST (browsers attach Origin to
+// every cross-origin POST, and both a foreign origin and the opaque "null" are refused).
+// This gate covers the class from the other side: a body sent with the default
+// text/plain (or a form/multipart) content type is a CORS SIMPLE request, dispatched
+// with no preflight, and the sessionless initialize POST is the one /mcp entry point
+// that needs no custom header — so requiring a JSON content type forces a preflight on
+// exactly the request that could otherwise reach a handler without one. Session-bound
+// POSTs are already preflighted by their Mcp-Session-Id header.
+//
+// A refusal IS recorded on the tape, through the same rate-limited pre-session path
+// checkOrigin uses. The gate sits behind the transport credential on both endpoints —
+// checkAuth/ValidateToken for /mcp, checkControlToken for /control/kill — so on a
+// deployment that configures either one this is an AUTHENTICATED caller's refusal, not
+// an anonymous one; and where no credential is configured, preSessionDenyLimiter is
+// exactly the bucket that makes an anonymous caller's refusals safe to write. Leaving
+// it unrecorded made a content-type sweep of the sessionless initialize POST and the
+// emergency stop the one transport refusal invisible to an incident responder, while
+// the same actor's wrong-Origin attempts were fully logged.
+//
+// More than one Content-Type header is rejected outright, for the reason checkOrigin
+// rejects a duplicated Origin: Header.Get would validate the first while a proxy or host
+// downstream may act on another. That leg also prints a stderr line, because it is the
+// one refusal an operator can hit through no fault of their client — a reverse proxy
+// that re-adds the header duplicates it — and a silent total-outage 415 is the hardest
+// possible thing to diagnose. Note the duplicate rule is a HEADER-level one: Go's mime
+// accepts a repeated *parameter* whose value is identical, so only the count check below
+// enforces it.
+func (p *HTTPProxy) requireJSONContentType(w http.ResponseWriter, r *http.Request) bool {
+	vals := r.Header.Values("Content-Type")
+	switch {
+	case len(vals) > 1:
+		fmt.Fprintf(os.Stderr,
+			"[eunox] SECURITY: rejected request carrying %d Content-Type headers (%q); exactly one is required (a reverse proxy that re-adds the header will trip this)\n",
+			len(vals), strings.Join(vals, ", "))
+	case len(vals) == 1 && isJSONMediaType(vals[0]):
+		return true
+	}
+	// Unstamped by design (no route/policy fields), like every other pre-session record:
+	// this gate can run before route resolution. The header value is NOT recorded — it is
+	// attacker-controlled free text, and the count is the only part worth keeping.
+	p.recordPreSessionDeny(r, codeUnsupportedMediaType, "content_type", map[string]interface{}{
+		"header_count": len(vals),
+	})
+	http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
+	return false
+}
+
+// isJSONMediaType reports whether a Content-Type header value denotes application/json.
+//
+// The common shapes — a bare "application/json" and any ASCII-case variant of it — are
+// answered without touching mime.ParseMediaType, which allocates its parameter map
+// unconditionally (measurably: ~290ns/48B for the bare form, ~800ns/336B with a charset
+// parameter, against ~55ns and no allocation here) on a gate that now precedes every
+// enforced MCP call. Anything carrying a parameter falls through to the real parser, so
+// the accept/reject set is unchanged.
+//
+// The fold is ASCII-only ON PURPOSE: strings.EqualFold applies Unicode simple folding,
+// under which U+017F (LATIN SMALL LETTER LONG S) folds to 's' — so "application/jſon"
+// would pass a fold-based fast path while ParseMediaType rejects it, making the fast and
+// slow paths disagree about the same header.
+func isJSONMediaType(v string) bool {
+	if !strings.Contains(v, ";") && asciiEqualFold(strings.TrimSpace(v), CTJSON) {
+		return true
+	}
+	// ParseMediaType lower-cases the media type and strips parameters, so
+	// "Application/JSON; charset=utf-8" is admitted. The error check must come FIRST and
+	// must not be dropped: a malformed parameter list ("application/json;;",
+	// `application/json; x="unterminated`) returns a NON-EMPTY media type alongside its
+	// error, so comparing mt alone would admit it.
+	mt, _, err := mime.ParseMediaType(v)
+	return err == nil && mt == CTJSON
+}
+
+// asciiEqualFold is strings.EqualFold restricted to ASCII case folding — no Unicode
+// special cases (see isJSONMediaType for why that distinction is load-bearing). want
+// must already be lower-case ASCII.
+func asciiEqualFold(got, want string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := 0; i < len(got); i++ {
+		c := got[i]
+		if 'A' <= c && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c != want[i] {
+			return false
+		}
+	}
+	return true
+}
 
 // Pre-session denial records are the only audit writes an UNAUTHENTICATED caller can
 // trigger, so they are the only ones whose rate an attacker sets. They are bounded by a

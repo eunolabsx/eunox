@@ -58,7 +58,7 @@
     { cls: 't-dim', text: '' },
     { cls: 't-info', text: '  $ eunox audit-verify' },
     { cls: 't-ok', text: '  Checked 3 record(s): 3 valid, 0 invalid, 0 skipped,' },
-    { cls: 't-ok', text: '  0 legacy, 0 unknown-key, 0 unverifiable;' },
+    { cls: 't-ok', text: '  0 unknown-key, 0 unverifiable;' },
     { cls: 't-ok', text: '  0 chain break(s).' }
   ];
 

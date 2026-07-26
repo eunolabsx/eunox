@@ -78,26 +78,24 @@ type auditRecord struct {
 const auditGenesisPrev = "sha256:genesis"
 
 // auditIntegrityFailureCode is the DenialCode on every synthetic integrity marker
-// (writeIntegrityMarker). auditKindLegacyTailResumed is the details.kind of the one
-// marker that legitimately starts a signed chain with an empty prev_hmac — the first
-// record written after resuming onto a pre-chain (unsigned) legacy tail. Both are
-// shared with verify.go so the writer and the genesis-check verifier cannot disagree
-// about which empty-prev_hmac seq-1 record is a legitimate legacy boundary versus a
-// leading-truncation forgery.
-const (
-	auditIntegrityFailureCode  = "AUDIT_INTEGRITY_FAILURE"
-	auditKindLegacyTailResumed = "legacy_tail_resumed"
-)
+// (writeIntegrityMarker).
+const auditIntegrityFailureCode = "AUDIT_INTEGRITY_FAILURE"
 
 // tailFailure enumerates the mutually exclusive ways Open's tail-verification
-// check (during resume) can fail, so the two outcomes share one variable
-// instead of two independent bools that could (incorrectly) both be set.
+// check (during resume) can fail, so the outcomes share one variable
+// instead of independent bools that could (incorrectly) all be set.
 type tailFailure int
 
 const (
 	tailFailNone tailFailure = iota
 	tailFailHMACMismatch
 	tailFailKeyUnknown
+	// tailFailUnsigned: the tail carries no _hmac at all. Either a pre-HMAC log
+	// written before signing existed, or a signed record whose signature was stripped
+	// — indistinguishable from the record alone, and the second is the one splice a
+	// write-capable attacker can make WITHOUT the key. It is therefore treated exactly
+	// like an unparseable tail: the chain is not resumed onto it.
+	tailFailUnsigned
 )
 
 // auditChannelSize bounds the queue feeding the background drainer. When full,
@@ -337,14 +335,6 @@ type Sink struct {
 	// open and carry across rotation in memory, so the chain is continuous.
 	seq      uint64
 	prevHMAC string
-
-	// resumedLegacyTail records that the chain resumed from a pre-chain (HMAC-less)
-	// record at startup. Its _hmac was "", so the first appended record chains to
-	// it with an empty prev_hmac, not the genesis sentinel — otherwise audit-verify
-	// reconstructs the predecessor link as "" and reports a spurious break. Tracked
-	// explicitly because a pre-seq legacy tail also parses as seq 0, making it
-	// indistinguishable from a brand-new log.
-	resumedLegacyTail bool
 }
 
 const (
@@ -518,15 +508,24 @@ func satAddU64(a, b uint64) uint64 {
 }
 
 // seedSeqPastOnDiskMax advances s.seq past the highest seq already on disk (base +
-// rotated siblings) so a chain that could not resume from its tail — a parse failure, an
-// HMAC mismatch, a retired/removed signing key, or an unreadable newer sibling — restarts
-// with a marker whose seq, and every record after it, is past every existing seq rather
-// than restarting at genesis and reissuing them (a duplicate-seq cascade audit-verify
-// cannot distinguish from tampering; the package's own scanSeqContribution comment calls a
-// duplicate "WORSE than a gap"). It deliberately leaves s.prevHMAC at genesis: the break
-// is real and audit-verify must see the prev_hmac discontinuity — only the seq counter is
-// advanced, monotonic and gap-detectable. A best-effort scan finding nothing leaves s.seq
-// unchanged (a genuinely unreadable log, already handled by the read-error seed path).
+// rotated siblings) so a chain that could not READ its tail — a write-only base, or a
+// newest rotated sibling that could not be opened — restarts with a marker whose seq,
+// and every record after it, is past every existing seq rather than restarting at genesis
+// and reissuing them (a duplicate-seq cascade audit-verify cannot distinguish from
+// tampering; the package's own scanSeqContribution comment calls a duplicate "WORSE than
+// a gap"). It deliberately leaves s.prevHMAC at genesis: the break is real and
+// audit-verify must see the prev_hmac discontinuity — only the seq counter is advanced,
+// monotonic and gap-detectable. A best-effort scan finding nothing leaves s.seq unchanged
+// (a genuinely unreadable log, already handled by the read-error seed path).
+//
+// It is deliberately NOT used by the paths where the tail WAS read but could not be
+// trusted — a parse failure, an HMAC mismatch, a retired key, an unsigned tail. Those
+// restart at genesis on purpose: the seqs on disk are then attacker-influenced (both the
+// tail's own seq and, since highestSeqAcrossChain parses every line without verifying
+// any, the maximum this function would find), so seeding from them would let a forged
+// record inflate the counter. Trusting no on-disk seq is the fail-closed direction; the
+// resulting duplicate seqs against the untrusted prefix are themselves a signal
+// audit-verify surfaces. See resumeChainFromTail and the threat model's §3.4.
 func (s *Sink) seedSeqPastOnDiskMax() {
 	if highest, ok := highestSeqAcrossChain(s.logPath); ok && highest > s.seq {
 		s.seq = highest
@@ -537,17 +536,16 @@ func (s *Sink) seedSeqPastOnDiskMax() {
 // record (if any) resolved: which integrity marker Open must write, and the
 // seq/hmac a forensic reader needs to locate the record in question.
 type tailResumeResult struct {
-	tailFailKind      tailFailure
-	tailParseFailure  bool
-	tailParseBytes    int
-	tailSeq           uint64
-	tailHMAC          string
-	legacyTailResumed bool
+	tailFailKind     tailFailure
+	tailParseFailure bool
+	tailParseBytes   int
+	tailSeq          uint64
+	tailHMAC         string
 }
 
 // resumeChainFromTail parses and verifies last — the most recent existing audit
 // record, or "" when the log is new/empty — and on success seeds s.seq/
-// s.prevHMAC/s.resumedLegacyTail so the chain continues from it. Split out of
+// s.prevHMAC so the chain continues from it. Split out of
 // Open to keep both functions under the complexity budget; the fields it
 // mutates on s belong to a single-threaded Open (opt application has already
 // run, the drainer has not started), so no locking is needed here either.
@@ -573,28 +571,38 @@ func (s *Sink) resumeChainFromTail(last string) tailResumeResult {
 		// audit-verify surfaces — the fail-closed choice here is to trust NO on-disk seq.
 		return tailResumeResult{tailParseFailure: true, tailParseBytes: len(last)}
 	}
+	// An unsigned tail is never chained onto. Appending an unsigned record is the one
+	// splice a write-capable attacker can make WITHOUT the signing key (truncate to a
+	// chosen record, append an unsigned record as the new tail), so resuming from it
+	// would seed seq/prev_hmac from bytes nothing certifies. A genuinely pre-HMAC log
+	// is the same shape and gets the same treatment — restart the chain from genesis
+	// and record the boundary in-band — so the migration is: move a pre-HMAC log aside
+	// before upgrading, or accept a chain restart and a permanently INVALID prefix
+	// (audit-verify counts every HMAC-less record invalid).
+	if prev.HMAC == "" {
+		fmt.Fprintf(os.Stderr, "[eunox] WARNING: audit log tail carries no _hmac, so it cannot be verified: either a pre-signing log or a record whose signature was stripped. The chain cannot be resumed and restarts from genesis — move a pre-signing log aside before upgrading, and run 'eunox audit-verify' plus a reconcile against your external sink otherwise.\n")
+		return tailResumeResult{tailFailKind: tailFailUnsigned, tailSeq: prev.Seq}
+	}
 	// Verify the tail's HMAC before chaining onto it: otherwise an attacker who
 	// truncates to a chosen record, or appends a crafted tail, seeds the resumed
-	// seq/prev_hmac from unverified bytes. Legacy records (no _hmac) are exempt.
+	// seq/prev_hmac from unverified bytes.
 	// Warn rather than abort so a corrupted local log does not block enforcement
 	// (the documented audit-failure tradeoff).
-	if prev.HMAC != "" {
-		if ok, err := s.VerifyRecord([]byte(last)); err != nil || !ok {
-			if errors.Is(err, errKeyIDNotInRing) {
-				// The tail names a key_id absent from the verification ring — the
-				// expected state right after a key rotation retired the signing key,
-				// NOT evidence of tampering. Folding this into tail_hmac_mismatch
-				// (below) would misdiagnose a routine rotation as a tamper event and
-				// point the operator at the wrong remediation. Distinguish it with its
-				// own marker and message instead.
-				fmt.Fprintf(os.Stderr, "[eunox] WARNING: audit log tail was signed by a retired key no longer in the verification ring; this is expected immediately after a key rotation. The chain cannot be resumed and restarts from genesis — run 'eunox audit-verify' with the retired key still available to confirm the tail is intact.\n")
-				return tailResumeResult{tailFailKind: tailFailKeyUnknown, tailSeq: prev.Seq, tailHMAC: prev.HMAC}
-			}
-			fmt.Fprintf(os.Stderr, "[eunox] WARNING: audit log tail failed HMAC verification; the last record may have been tampered with or truncated. The chain cannot be resumed and restarts from genesis — run 'eunox audit-verify' and reconcile against your external sink.\n")
-			// Mark it in-band too (stderr is lost to log rotation and not in the
-			// tamper-evident trail); the signed marker is written by the caller.
-			return tailResumeResult{tailFailKind: tailFailHMACMismatch, tailSeq: prev.Seq, tailHMAC: prev.HMAC}
+	if ok, err := s.VerifyRecord([]byte(last)); err != nil || !ok {
+		if errors.Is(err, errKeyIDNotInRing) {
+			// The tail names a key_id absent from the verification ring — the
+			// expected state right after a key rotation retired the signing key,
+			// NOT evidence of tampering. Folding this into tail_hmac_mismatch
+			// (below) would misdiagnose a routine rotation as a tamper event and
+			// point the operator at the wrong remediation. Distinguish it with its
+			// own marker and message instead.
+			fmt.Fprintf(os.Stderr, "[eunox] WARNING: audit log tail was signed by a retired key no longer in the verification ring; this is expected immediately after a key rotation. The chain cannot be resumed and restarts from genesis — run 'eunox audit-verify' with the retired key still available to confirm the tail is intact.\n")
+			return tailResumeResult{tailFailKind: tailFailKeyUnknown, tailSeq: prev.Seq, tailHMAC: prev.HMAC}
 		}
+		fmt.Fprintf(os.Stderr, "[eunox] WARNING: audit log tail failed HMAC verification; the last record may have been tampered with or truncated. The chain cannot be resumed and restarts from genesis — run 'eunox audit-verify' and reconcile against your external sink.\n")
+		// Mark it in-band too (stderr is lost to log rotation and not in the
+		// tamper-evident trail); the signed marker is written by the caller.
+		return tailResumeResult{tailFailKind: tailFailHMACMismatch, tailSeq: prev.Seq, tailHMAC: prev.HMAC}
 	}
 	// Chain onto the tail only when it verified (handled above by returning
 	// early on any failure). A failed tail is attacker-controllable (a
@@ -605,19 +613,11 @@ func (s *Sink) resumeChainFromTail(last string) tailResumeResult {
 	// the event for forensics.
 	s.seq = prev.Seq
 	s.prevHMAC = prev.HMAC
-	// A tail with no _hmac is a pre-chain (legacy) record. Remember it so
-	// writeRecord chains the first appended record with an empty prev_hmac rather
-	// than the genesis sentinel, keeping audit-verify's reconstructed link
-	// continuous across the upgrade boundary. Resuming onto a legacy (unsigned)
-	// tail is exempt from HMAC verification, so it is also the one splice an
-	// attacker with file-write access can make without a key (truncate to a
-	// chosen record, append an unsigned record as the new tail). It is
-	// legitimate exactly once, on the first restart after an upgrade from the
-	// pre-chain era. Record it in-band so the event is on the tamper-evident
-	// trail rather than only in stderr (which container log rotation discards);
-	// a recurring marker on a chained log is suspicious.
-	s.resumedLegacyTail = prev.HMAC == ""
-	return tailResumeResult{legacyTailResumed: s.resumedLegacyTail, tailSeq: prev.Seq}
+	// Zero value: the struct's tail fields exist to tell a forensic reader WHICH record
+	// a failure marker is about, and a clean resume writes no marker. Populating them
+	// here would invite a later success-path diagnostic to read a field that is only
+	// meaningful on the failure paths.
+	return tailResumeResult{}
 }
 
 // Open opens (or creates) the audit log and loads (or generates) the HMAC
@@ -726,8 +726,9 @@ func Open(logPath, keyPath string, rotateSizeBytes int64, retainRotated int, opt
 		opt(s)
 	}
 	// Resume the chain from the existing tail so seq stays monotonic and prev_hmac
-	// links across restarts. A pre-chain log has no seq (parses as 0) and new
-	// records begin at 1, chained to the last legacy record's _hmac.
+	// links across restarts. Only a tail that verifies under a held key is resumed
+	// onto; anything else (unparseable, HMAC mismatch, retired key, or unsigned)
+	// restarts the chain from genesis and leaves a signed marker naming the reason.
 	//
 	// The tail was read once, through the open append handle, by the partial-tail
 	// recovery above (see tailResume): every way it could fail to establish the tail
@@ -771,59 +772,50 @@ func Open(logPath, keyPath string, rotateSizeBytes int64, retainRotated int, opt
 	}
 	tr := s.resumeChainFromTail(last)
 	tailFailKind, tailParseFailure, tailParseBytes := tr.tailFailKind, tr.tailParseFailure, tr.tailParseBytes
-	tailSeq, tailHMAC, legacyTailResumed := tr.tailSeq, tr.tailHMAC, tr.legacyTailResumed
+	tailSeq, tailHMAC := tr.tailSeq, tr.tailHMAC
 	// Emit the integrity marker before the drainer starts: Open is single-threaded
 	// here, so writeRecord has no contention and the marker becomes the first
 	// appended line, chained from the resumed tail like the first real record. The
 	// first five cases are mutually exclusive (a read failure leaves last=="" so no
-	// parse/HMAC attempt; the parse must succeed before the HMAC check; the HMAC
-	// mismatch, the unknown-key tail, and the legacy resume are distinct outcomes of
-	// that same check), so at most one of THEM is written. The resume-, parse-failure,
-	// and unknown-key markers chain from genesis (no resumable seq/prev_hmac); the
-	// legacy-resume marker chains from the resumed legacy tail. The
-	// tail_partial_write_recovered marker is independent of these (it concerns the
-	// dropped fragment, not the resumed record) and may fire alongside one of them.
-	// wroteMarker tracks whether any writeIntegrityMarker call below actually
-	// appended a line, so the fsync further down only pays for a startup that put
-	// something new on disk — a clean startup (the common case: no tail failure,
-	// no legacy resume, no partial-write recovery) has nothing to durably flush
-	// that Close (or the drain goroutine's own debounced fsync, once real traffic
-	// arrives) won't cover anyway.
-	wroteMarker := false
+	// parse/HMAC attempt; the parse must succeed before the signature checks; and the
+	// unsigned tail, the HMAC mismatch, and the unknown-key tail are distinct outcomes
+	// of that same step), so at most one of THEM is written. All of them chain from
+	// genesis: none of those tails is resumable, so there is no seq/prev_hmac to
+	// continue from. The tail_partial_write_recovered marker is independent of these
+	// (it concerns the dropped fragment, not the resumed record) and may fire alongside
+	// one of them.
+	// wroteMarker says whether any writeIntegrityMarker call below appended a line, so
+	// the fsync further down only pays for a startup that put something new on disk — a
+	// clean startup (the common case: no tail failure, no partial-write recovery) has
+	// nothing to durably flush that Close (or the drain goroutine's own debounced fsync,
+	// once real traffic arrives) won't cover anyway.
+	//
+	// DERIVED from the same conditions the branches below test, rather than assigned once
+	// per branch: a hand-maintained flag has to be remembered at every new marker site,
+	// and forgetting it silently skips the fsync — so a crash right after Open loses
+	// exactly the tamper-evidence marker that fsync exists to make durable, on a path no
+	// test exercises.
+	wroteMarker := chainResumeFailed || tailParseFailure ||
+		tailFailKind != tailFailNone || recoveredPartialBytes > 0
 	if chainResumeFailed {
 		s.writeIntegrityMarker("chain_resume_failed", map[string]interface{}{"reason": resumeFailReason})
-		wroteMarker = true
 	}
 	if tailParseFailure {
 		// tail_bytes records the length; the bytes are unparseable, so not embedded.
 		s.writeIntegrityMarker("tail_parse_failure", map[string]interface{}{"tail_bytes": tailParseBytes})
-		wroteMarker = true
 	}
 	switch tailFailKind {
 	case tailFailHMACMismatch:
 		// Carry the suspect record's seq and hmac so a forensic reader can locate it.
-		s.writeIntegrityMarker("tail_hmac_mismatch", map[string]interface{}{"tail_seq": tailSeq, "tail_hmac": tailHMAC})
-		wroteMarker = true
+		s.writeIntegrityMarker("tail_hmac_mismatch", map[string]interface{}{"claimed_tail_seq": tailSeq, "claimed_tail_hmac": tailHMAC})
 	case tailFailKeyUnknown:
 		// Distinct from tail_hmac_mismatch: this tail could not be verified because its
 		// signing key was retired, not because the HMAC failed to match a known key.
-		s.writeIntegrityMarker("tail_key_unknown", map[string]interface{}{"tail_seq": tailSeq, "tail_hmac": tailHMAC})
-		wroteMarker = true
-	}
-	if legacyTailResumed {
-		// Carry the resumed tail's seq so a forensic reader can locate the boundary.
-		s.writeIntegrityMarker(auditKindLegacyTailResumed, map[string]interface{}{"tail_seq": tailSeq})
-		wroteMarker = true
-		// Bind the empty-prev_hmac emission strictly to the marker write. writeRecord's
-		// resumedLegacyTail branch emits prev_hmac == "" for whatever record first finds
-		// s.prevHMAC == "". If the marker write above succeeded, s.prevHMAC is now
-		// non-empty and the branch is moot. If it FAILED (transient ENOSPC/EIO), s.seq
-		// and s.prevHMAC did not advance, and leaving the flag set would let the NEXT
-		// ordinary record inherit seq 1 with an empty prev_hmac while not being the
-		// marker — which audit-verify would report as a spurious CHAIN BREAK at seq 1.
-		// Clearing it here routes any such record through the genesis branch instead, so
-		// verify sees a clean seq-1 genesis start rather than a false tamper alarm.
-		s.resumedLegacyTail = false
+		s.writeIntegrityMarker("tail_key_unknown", map[string]interface{}{"claimed_tail_seq": tailSeq, "claimed_tail_hmac": tailHMAC})
+	case tailFailUnsigned:
+		// The tail carries no signature at all — a pre-signing log, or a stripped
+		// signature. Carry its seq so a forensic reader can locate the boundary.
+		s.writeIntegrityMarker("tail_unsigned", map[string]interface{}{"claimed_tail_seq": tailSeq})
 	}
 	if recoveredPartialBytes > 0 {
 		// A partial trailing write was truncated above. Record the recovery so the
@@ -833,7 +825,6 @@ func Open(logPath, keyPath string, rotateSizeBytes int64, retainRotated int, opt
 		// the COMPLETE record the chain resumes from, so both can legitimately fire. It
 		// chains from the resumed tail like any appended record.
 		s.writeIntegrityMarker("tail_partial_write_recovered", map[string]interface{}{"recovered_bytes": recoveredPartialBytes})
-		wroteMarker = true
 	}
 
 	// Sync now, before returning, but only when a marker above actually wrote a
@@ -903,19 +894,20 @@ func (s *Sink) syntheticDenyMarker(code string, details map[string]interface{}) 
 // details:
 //
 //   - tail_hmac_mismatch: the prior tail failed HMAC verification against a known
-//     key; details carry tail_seq and tail_hmac so a forensic reader can locate
-//     the suspect record.
+//     key; details carry claimed_tail_seq and claimed_tail_hmac so a forensic reader
+//     can locate the suspect record.
 //   - tail_key_unknown: the prior tail names a key_id absent from the verification
 //     ring (the expected state right after a key rotation retired the signing
 //     key), so it could not be verified either way — distinct from
 //     tail_hmac_mismatch, which implies a known key rejected it. Details carry
-//     tail_seq and tail_hmac.
+//     claimed_tail_seq and claimed_tail_hmac.
 //   - tail_parse_failure: the prior tail did not parse as JSON; details carry
 //     tail_bytes (the bytes are unparseable, so not embedded).
 //   - chain_resume_failed: an I/O error prevented reading the prior tail; details
 //     carry the reason.
-//   - legacy_tail_resumed: the chain was resumed onto a pre-chain (unsigned) tail;
-//     details carry tail_seq.
+//   - tail_unsigned: the prior tail carried no _hmac (a pre-signing log, or a
+//     stripped signature — indistinguishable, so both restart the chain); details
+//     carry claimed_tail_seq.
 //   - tail_partial_write_recovered: a partial (non-newline-terminated) trailing
 //     write was truncated so the next append starts clean; details carry
 //     recovered_bytes.
@@ -925,6 +917,14 @@ func (s *Sink) syntheticDenyMarker(code string, details map[string]interface{}) 
 // AUDIT_INTEGRITY_FAILURE deny shape (no new top-level field) and are chained and
 // signed like any record, so audit-verify and any external sink surface them —
 // evidence a transient stderr warning would lose to log rotation.
+//
+// The claimed_ prefix on the tail fields is deliberate and matches the convention the
+// transport layer applies to an unverified Mcp-Session-Id: every one of those values is
+// read from the record this writer just declared UNCERTIFIABLE, so it is whatever a
+// write-capable attacker put there. Signing it under a bare name would let anyone with
+// file access have eunox attest an arbitrary seq or hmac as fact — a SIEM rule keyed on
+// tail-seq discontinuities being the obvious target. The prefix keeps the forensic hint
+// while marking, in the record itself, that nothing vouches for it.
 func (s *Sink) writeIntegrityMarker(kind string, details map[string]interface{}) {
 	// Build a fresh map rather than mutating the caller's: the marker owns its
 	// Details, and a nil details must not panic on the "kind" assignment. "kind" is
@@ -1027,7 +1027,7 @@ func readLastAuditLine(path string) (string, error) {
 //
 //   - parsedMax/parsed: the largest seq actually decoded from a record (exact and
 //     authoritative). parsed is false when the file opened and read cleanly but held no
-//     parseable record (empty/blank/all-legacy).
+//     parseable record (empty/blank/all-unparseable).
 //   - unreadBytes: the file's byte size when it could NOT be fully read — os.Open was
 //     refused (a write-only 0200 log fails EACCES on every restart) or the scan aborted on
 //     an over-cap line (bufio.ErrTooLong) or a mid-file read fault — so the true max is
@@ -2211,17 +2211,12 @@ func (s *Sink) writeRecord(rec *auditRecord) {
 	// records (without the key) breaks prev_hmac linkage and seq contiguity, both of
 	// which audit-verify detects.
 	rec.Seq = s.seq + 1
-	switch {
-	case s.prevHMAC != "":
+	if s.prevHMAC != "" {
 		rec.PrevHMAC = s.prevHMAC
-	case s.resumedLegacyTail:
-		// Continuing from a pre-chain (HMAC-less) tail: its real _hmac was "", so the
-		// link is the empty string (what audit-verify reconstructs), not the genesis
-		// sentinel (which would read as a break). Once this record is written
-		// s.prevHMAC is non-empty and the branch above takes over.
-		rec.PrevHMAC = ""
-	default:
-		// First record of a fresh log: the sentinel marks the chain's origin.
+	} else {
+		// First record of a fresh log — or of a chain restarted because the tail could
+		// not be verified. Either way the sentinel marks this chain's origin; an empty
+		// prev_hmac is never emitted, so audit-verify can treat one as a break outright.
 		rec.PrevHMAC = auditGenesisPrev
 	}
 

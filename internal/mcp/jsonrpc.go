@@ -345,6 +345,16 @@ func ErrorResponse(id *json.RawMessage, code int, message string) RPCMsg {
 	}
 }
 
+// MethodInitialize is the MCP handshake request that opens a session. It is
+// transport-level, not an enforced method (those live in pkg/capability), but it is
+// consulted at more sites than any of them — the session-creating POST, the
+// notification-shaped swallow, the re-initialize echo, the drift-refusal record, the
+// upstream handshake builder, and the protocol-version header gate — and a typo in any
+// one would silently misroute the handshake rather than fail. It sits beside
+// MethodNotificationsInitialized, the other half of the same handshake, for the same
+// single-source-of-truth reason.
+const MethodInitialize = "initialize"
+
 // MethodNotificationsInitialized is the MCP notification a client sends after a
 // successful initialize handshake. It is the single source of truth for the spelling
 // across the transports' upstream handshakes, the CLI live-upstream probes, and the

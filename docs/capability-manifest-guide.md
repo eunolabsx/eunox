@@ -1113,6 +1113,20 @@ rate-limit slot. You therefore do not need to order `maxCalls` last by hand. A
 corollary: when a call would fail both `maxCalls` and another condition, the
 other condition's denial code is reported (the rate limit is never reached).
 
+A slot **is** consumed, however, when the call clears policy and the *upstream*
+then fails — a connection error, or an upstream that stops reading within
+`--upstream-timeout`. The slot is taken at decision time, atomically with the
+decision (that atomicity is what makes the limit exact under concurrent
+requests), and by the time a forward fails the upstream may already have executed
+the call: a write timeout means the request bytes were handed over, and a read
+failure can follow a side effect that already happened. Refunding would therefore
+hand back quota for calls that did run, so eunox does not refund — the quota
+over-counts rather than under-counts, matching the fail-closed posture elsewhere.
+The practical consequence: a persistently broken upstream can burn a caller's
+`maxCalls` budget on calls that never executed. Every consumed slot is on the
+audit tape, and a failed forward is recorded as a denial carrying the upstream
+error code, so the two cases are distinguishable when reconstructing a budget.
+
 A capability may carry **several** `maxCalls` conditions to layer rate limits of
 different lengths — e.g. 30/minute *and* 500/hour — and each is counted in its
 own sliding-window bucket (keyed in part by `windowSeconds`), so the two never

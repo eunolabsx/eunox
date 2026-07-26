@@ -48,7 +48,7 @@ func TestJWTTokenCache_ExpiresOnDefaultTTL(t *testing.T) {
 
 	key := capability.HashTokenKey("tok")
 	c.Put(key, &JWTClaims{Subject: "s"}, base.Add(time.Hour).Unix())
-	now = base.Add(defaultJWTCacheTTL + time.Second)
+	now = base.Add(jwtTokenCacheTTL + time.Second)
 	if _, ok := c.Get(key); ok {
 		t.Fatal("entry must expire once the default TTL elapses on the injected clock")
 	}

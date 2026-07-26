@@ -42,13 +42,17 @@ func TestSiteDocsHaveNoValidateTokenSubcommand(t *testing.T) {
 		t.Errorf("%s still documents the removed `validate-token` subcommand", deployPath)
 	}
 
-	// Robust sweep: no published HTML page may mention the removed subcommand.
+	// Robust sweep: no published page may mention the removed subcommand. Both .html
+	// and .js are walked: the landing page renders its terminal demos from a script,
+	// so an HTML-only sweep leaves the most prominent copy of eunox's own output
+	// unguarded — which is exactly how a stale `audit-verify` summary line survived a
+	// change to that command's format string.
 	root := sitePublicDir()
 	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		if d.IsDir() || !strings.HasSuffix(path, ".html") {
+		if d.IsDir() || !isPublishedSiteSource(path) {
 			return nil
 		}
 		content, readErr := os.ReadFile(path)
@@ -57,6 +61,51 @@ func TestSiteDocsHaveNoValidateTokenSubcommand(t *testing.T) {
 		}
 		if strings.Contains(string(content), "validate-token") {
 			t.Errorf("%s still documents the removed `validate-token` subcommand", path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Skipf("published site directory not walkable (%v); run the site build", err)
+	}
+}
+
+// isPublishedSiteSource reports whether path is a published site file whose text can
+// quote eunox's own output — the rendered pages and the scripts that render terminal
+// demos into them.
+func isPublishedSiteSource(path string) bool {
+	return strings.HasSuffix(path, ".html") || strings.HasSuffix(path, ".js")
+}
+
+// TestSite_AuditVerifySummaryMatchesBinary pins the site's reproduction of the
+// `audit-verify` summary against the format string the binary actually uses. The site
+// shows this line on the landing page as the flagship tamper-evidence demo, so a tally
+// removed from (or added to) the real output must not keep being advertised. Keyed on
+// the tally NAMES rather than a full-line match, so cosmetic wording changes on either
+// side do not make this brittle.
+func TestSite_AuditVerifySummaryMatchesBinary(t *testing.T) {
+	root := sitePublicDir()
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() || !isPublishedSiteSource(path) {
+			return nil
+		}
+		content, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		text := string(content)
+		if !strings.Contains(text, "Checked ") || !strings.Contains(text, "chain break(s)") {
+			return nil
+		}
+		// Every tally the site names must still exist in the binary's format string.
+		for _, tally := range []string{"valid", "invalid", "skipped", "legacy", "unknown-key", "unverifiable"} {
+			shown := strings.Contains(text, " "+tally)
+			emitted := strings.Contains(auditVerifySummaryFormat, " %d "+tally)
+			if shown && !emitted {
+				t.Errorf("%s advertises a %q tally that `eunox audit-verify` no longer prints", path, tally)
+			}
 		}
 		return nil
 	})

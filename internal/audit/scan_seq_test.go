@@ -5,6 +5,7 @@ package audit
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -189,11 +190,25 @@ func TestOpen_EmptyBaseFallsBackToSiblingTail(t *testing.T) {
 	dir := t.TempDir()
 	base := filepath.Join(dir, "audit.jsonl")
 	keyPath := filepath.Join(dir, "audit.key")
-	if err := os.WriteFile(base, nil, 0o600); err != nil { // empty base
-		t.Fatal(err)
+
+	// Build a real signed chain (seq 1..2), then rotate it aside by hand: the sibling
+	// now holds the true, verifiable tail and the base is empty — the just-rotated
+	// signature. A hand-written unsigned sibling would not work here (and would not
+	// test the fallback): an unsigned tail is never resumed onto.
+	first, err := Open(base, keyPath, 0, 0)
+	if err != nil {
+		t.Fatalf("Open (seed): %v", err)
+	}
+	first.RecordAllow(context.Background(), "sess", "a", "tools/call", nil, nil, false, nil, nil)
+	first.RecordAllow(context.Background(), "sess", "b", "tools/call", nil, nil, false, nil, nil)
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close (seed): %v", err)
 	}
 	sib := base + ".20250101T000000.000000000Z"
-	if err := os.WriteFile(sib, []byte(`{"seq":41}`+"\n"+`{"seq":42}`+"\n"), 0o600); err != nil {
+	if err := os.Rename(base, sib); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(base, nil, 0o600); err != nil { // empty base
 		t.Fatal(err)
 	}
 
@@ -202,11 +217,10 @@ func TestOpen_EmptyBaseFallsBackToSiblingTail(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	t.Cleanup(func() { _ = sink.Close() })
-	// The sibling tail is unsigned (pre-chain), so the resume adopts its seq 42 and
-	// then the legacy_tail_resumed marker consumes 43. Either way the point stands:
-	// the counter continued from the sibling instead of restarting at genesis.
-	if sink.seq != 43 {
-		t.Fatalf("resumed seq = %d, want 43 (sibling tail seq 42, plus the legacy-resume marker)", sink.seq)
+	// The sibling tail verified, so the counter continued from it (seq 2) instead of
+	// restarting at genesis and reissuing seqs the sibling already holds.
+	if sink.seq != 2 {
+		t.Fatalf("resumed seq = %d, want 2 (the sibling's verified tail)", sink.seq)
 	}
 }
 
