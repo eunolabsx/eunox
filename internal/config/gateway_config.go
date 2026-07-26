@@ -881,6 +881,17 @@ func (cfg *GatewayConfig) validateUpstreamEntry(i int, u *UpstreamConfig, seen m
 		if err := validateHTTPUpstreamURL(u.Name, u.UpstreamURL); err != nil {
 			return err
 		}
+		// A non-empty but whitespace-only upstreamAuthHeader is the upstream leg of the
+		// degenerate-credential case listen.authToken rejects above: it is not "", so the
+		// route forwards it as a real header, yet "Authorization:   " carries no secret and
+		// every upstream call fails auth in a way that looks like an upstream fault rather
+		// than a config error. The env-ref leg already rejects a reference that expands to
+		// whitespace (validateCredentialEnvRefs); a LITERAL whitespace value reached neither
+		// guard, since that one only runs for values that contain a reference. An operator
+		// who wants no upstream auth omits the field entirely.
+		if u.UpstreamAuthHeader != "" && strings.TrimSpace(u.UpstreamAuthHeader) == "" {
+			return fmt.Errorf("upstream %q: 'upstreamAuthHeader' is whitespace-only, which is not a usable credential — set a real header value, or omit the field to forward no auth header", u.Name)
+		}
 		// stdio-only fields are rejected on key presence so an explicit zero
 		// (command: "" or args: []) is refused too, matching the schema.
 		if presentKey(i, "command") || u.Command != "" {

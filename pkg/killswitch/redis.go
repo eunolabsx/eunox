@@ -213,62 +213,57 @@ type Redis struct {
 	wg sync.WaitGroup
 }
 
-// NewRedis creates a Redis-backed kill-switch manager.
-// It subscribes to a pub/sub channel for real-time state propagation.
-func NewRedis(client redis.Cmdable) *Redis {
-	r := &Redis{
-		client:            client,
-		killedAgents:      make(map[string]bool),
-		killedSessions:    make(map[string]bool),
-		reconcileInterval: defaultReconcileInterval,
-		sessionKillTTL:    defaultSessionKillTTL,
-	}
-	return r
-}
+// RedisOption configures the Redis kill-switch manager at construction.
+//
+// Configuration is applied here rather than through chained setters on a live
+// instance because every field below is read by ShouldBlock and the background
+// loops WITHOUT synchronization. As post-construction setters their "must be called
+// before Start" contract was enforceable only by doc comment, so a caller who
+// reordered a chain past Start raced the loops with nothing to catch it. Threading
+// them through NewRedis makes the contract structural: the options run before the
+// constructor returns, so there is no instance to misconfigure later. Mirrors the
+// option shape pkg/callcounter, pkg/flowlabelstore, and pkg/circuitbreaker use.
+type RedisOption func(*Redis)
 
 // WithSessionKillTTL overrides how long a session-kill tombstone lives in Redis. A
-// negative value disables expiry (tombstones live forever, the pre-existing behavior).
+// negative value disables expiry (tombstones live forever, the pre-existing behavior);
+// zero selects the default.
 //
 // Raise it only if sessions in your deployment can outlive the default; LOWERING it below
 // the longest session you can hold open is a fail-open, because an expiring tombstone
 // lifts the kill on a session that may still be connected. Agent kills are never expired.
-//
-// Must be called before Start.
-func (r *Redis) WithSessionKillTTL(d time.Duration) *Redis {
-	switch {
-	case d < 0:
-		r.sessionKillTTL = 0 // explicit opt-out: never expire
-	case d == 0:
-		r.sessionKillTTL = defaultSessionKillTTL
-	default:
-		r.sessionKillTTL = d
+func WithSessionKillTTL(d time.Duration) RedisOption {
+	return func(r *Redis) {
+		switch {
+		case d < 0:
+			r.sessionKillTTL = 0 // explicit opt-out: never expire
+		case d == 0:
+			r.sessionKillTTL = defaultSessionKillTTL
+		default:
+			r.sessionKillTTL = d
+		}
 	}
-	return r
 }
 
 // WithReconcileInterval overrides how often the local cache is fully refreshed from
 // Redis independent of pub/sub. A non-positive value restores the default. It bounds
 // both the kill-propagation window and, in fail-closed mode, the denial window that
 // persists after a transient outage recovers. Lower values increase Redis load.
-//
-// Must be called before Start: it mutates configuration read by the background loops
-// without synchronization, so calling it on a started instance races them.
-func (r *Redis) WithReconcileInterval(d time.Duration) *Redis {
-	if d <= 0 {
-		d = defaultReconcileInterval
+func WithReconcileInterval(d time.Duration) RedisOption {
+	return func(r *Redis) {
+		if d <= 0 {
+			d = defaultReconcileInterval
+		}
+		r.reconcileInterval = d
 	}
-	r.reconcileInterval = d
-	return r
 }
 
 // WithLogger sets a structured logger on the kill-switch for operational visibility.
 // If set, initial state-refresh failures are logged as warnings rather than silently dropped.
-//
-// Must be called before Start: the logger is read by the background loops without
-// synchronization, so setting it on a started instance races them.
-func (r *Redis) WithLogger(logger *slog.Logger) *Redis {
-	r.logger = logger
-	return r
+func WithLogger(logger *slog.Logger) RedisOption {
+	return func(r *Redis) {
+		r.logger = logger
+	}
 }
 
 // WithFailOpen selects the degraded-mode behaviour when Redis is unreachable.
@@ -281,11 +276,29 @@ func (r *Redis) WithLogger(logger *slog.Logger) *Redis {
 // WithFailOpen(true) is availability-first: ShouldBlock serves the last-known cache
 // during an outage. Choose it only where availability outweighs a bounded window in
 // which a revocation may be delayed, and Redis HA is in place. See ADR-0003.
+func WithFailOpen(failOpen bool) RedisOption {
+	return func(r *Redis) {
+		r.failOpen = failOpen
+	}
+}
+
+// NewRedis creates a Redis-backed kill-switch manager.
+// It subscribes to a pub/sub channel for real-time state propagation.
 //
-// Must be called before Start: the flag is read by ShouldBlock and the background
-// loops without synchronization, so setting it on a started instance races them.
-func (r *Redis) WithFailOpen(failOpen bool) *Redis {
-	r.failOpen = failOpen
+// Every setting is supplied here (see RedisOption); the instance is fully configured
+// by the time it is returned, so no caller can mutate state the background loops
+// read once Start is running.
+func NewRedis(client redis.Cmdable, opts ...RedisOption) *Redis {
+	r := &Redis{
+		client:            client,
+		killedAgents:      make(map[string]bool),
+		killedSessions:    make(map[string]bool),
+		reconcileInterval: defaultReconcileInterval,
+		sessionKillTTL:    defaultSessionKillTTL,
+	}
+	for _, opt := range opts {
+		opt(r)
+	}
 	return r
 }
 

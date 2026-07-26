@@ -96,6 +96,17 @@ type Clock interface {
 // session, short enough that abandoned-session state is reclaimed. Recording and
 // Peek use the same value so they address the same window bucket in windowed
 // backends. A nil counter still fails maxCalls and sequenceBlock closed.
+//
+// This retention is a REAL bound on the guarantee, not just a storage detail: it is
+// wall-clock, so a session idle past the window loses its antecedent marker and a
+// later blocked call is allowed. Two things keep that narrow. Each fresh call to the
+// antecedent re-records the marker (RecordSessionCall), and each blocked call that
+// finds the marker re-arms it (handleSequenceBlock), so the window measures
+// INACTIVITY of the whole antecedent/blocked pair rather than age since the
+// antecedent. A session that goes quiet for longer than this on both legs — a
+// multi-day agent session, say — does lose the gate; that residue is documented as a
+// sequenceBlock limitation in docs/capability-manifest-guide.md. Raising the value
+// trades a longer guarantee against retaining abandoned-session state for as long.
 const sequenceHistoryWindowSec = 86400 // 24h
 
 // compositeCounterKey joins prefix and the variadic parts into one counter key.

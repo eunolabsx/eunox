@@ -22,6 +22,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -51,6 +52,26 @@ func TestHelperStdioUpstream(t *testing.T) {
 		return
 	}
 	stdioUpstreamServe()
+}
+
+// stdioNoisySentinel is the argv marker that turns a re-exec of the test binary
+// into an MCP stdio upstream that also prints non-JSON chatter to its stdout (see
+// TestHelperStdioNoisyUpstream).
+const stdioNoisySentinel = "eunox-stdio-noisy-process"
+
+// TestHelperStdioNoisyUpstream is a re-exec entry point serving the same minimal
+// MCP session as TestHelperStdioUpstream, but with stray non-JSON lines written to
+// STDOUT — the shape an npx-launched server produces when a dependency prints a
+// banner or a debug line onto the protocol stream. Each stray line is newline
+// terminated, so the JSON-RPC framing stays intact and every one of them surfaces
+// as a recoverable mcp.ErrParse to a reader.
+func TestHelperStdioNoisyUpstream(t *testing.T) {
+	if !slices.Contains(os.Args, stdioNoisySentinel) {
+		return
+	}
+	// A banner ahead of the handshake, the common real-world case.
+	fmt.Fprintln(os.Stdout, "my-mcp-server v1.2.3 — starting up")
+	stdioUpstreamServeNoisy()
 }
 
 const stdioHangSentinel = "eunox-stdio-hang-process"
@@ -104,10 +125,79 @@ func stdioUpstreamServe() {
 	}
 }
 
+// stdioUpstreamServeNoisy serves the same session as stdioUpstreamServe but emits a
+// stray non-JSON line to stdout before each response, so a reader must skip garbage
+// interleaved with the protocol stream, not only a leading banner.
+func stdioUpstreamServeNoisy() {
+	reader := mcp.NewMsgReader(os.Stdin)
+	writer := mcp.NewMsgWriter(os.Stdout)
+	for {
+		msg, err := reader.Read()
+		if err != nil {
+			return // EOF: proxy closed our stdin.
+		}
+		if msg.ID == nil {
+			continue // notification: no response expected
+		}
+		var result interface{}
+		switch msg.Method {
+		case "initialize":
+			result = mcp.InitResult{
+				ProtocolVersion: transport.MCPProtocolVersion,
+				Capabilities:    map[string]interface{}{"tools": map[string]interface{}{}},
+				ServerInfo:      map[string]interface{}{"name": "stdio-noisy", "version": "1.0.0"},
+			}
+		case "tools/list":
+			result = map[string]interface{}{
+				"tools": []map[string]interface{}{
+					{"name": "read_file", "description": "reads a file"},
+					{"name": "write_file", "description": "writes a file"},
+				},
+			}
+		default:
+			result = map[string]interface{}{}
+		}
+		// Chatter immediately before the real reply: the reader must skip this line
+		// and go on to read the response that follows it on the same stream.
+		fmt.Fprintf(os.Stdout, "[debug] handled %s\n", msg.Method)
+		resp, _ := mcp.SuccessResponse(msg.ID, result)
+		_ = writer.Write(resp)
+	}
+}
+
 // helperUpstreamArgs returns the command + args that re-exec the test binary as
 // the stdio upstream defined by TestHelperStdioUpstream.
 func helperUpstreamArgs() (command string, args []string) {
 	return os.Args[0], []string{"-test.run=^TestHelperStdioUpstream$", "--", stdioUpstreamSentinel}
+}
+
+// noisyUpstreamArgs returns the command + args that re-exec the test binary as the
+// banner-printing stdio upstream defined by TestHelperStdioNoisyUpstream.
+func noisyUpstreamArgs() (command string, args []string) {
+	return os.Args[0], []string{"-test.run=^TestHelperStdioNoisyUpstream$", "--", stdioNoisySentinel}
+}
+
+// TestFetchLiveToolsStdio_SkipsNonJSONLines is the regression for the onboarding
+// path: an upstream that prints a banner or debug line to stdout works fine behind
+// the running proxy (whose reader skips mcp.ErrParse and keeps reading), so the CLI
+// probe backing `init`, `validate --live`, and `doctor --live` must skip them too.
+// Before the fix the first stray line ended the probe with an error and exit 2,
+// blocking the documented onboarding path against a server eunox itself can front.
+func TestFetchLiveToolsStdio_SkipsNonJSONLines(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns a subprocess; skipped in -short")
+	}
+	cmd, args := noisyUpstreamArgs()
+	info, err := fetchLiveToolsStdio(context.Background(), cmd, args)
+	if err != nil {
+		t.Fatalf("fetchLiveToolsStdio against a banner-printing upstream: %v", err)
+	}
+	if len(info.Tools) != 2 {
+		t.Errorf("got %d tools, want 2", len(info.Tools))
+	}
+	if info.ServerVersion != "1.0.0" {
+		t.Errorf("server version: got %q, want %q", info.ServerVersion, "1.0.0")
+	}
 }
 
 // TestFetchLiveToolsStdio_Subprocess drives the one-shot introspection client

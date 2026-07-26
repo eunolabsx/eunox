@@ -644,10 +644,10 @@ func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, ki
 		// without this an operator watching for a Redis partition sees nothing in the log
 		// (HealthStatus on /healthz still reflects the state). Structured stderr matches
 		// where the other [eunox] startup lines already go.
-		ksRedis = killswitch.NewRedis(rdb).
-			WithFailOpen(killswitchFailOpen).
-			WithReconcileInterval(killswitchReconcile).
-			WithLogger(slog.New(slog.NewTextHandler(os.Stderr, nil)))
+		ksRedis = killswitch.NewRedis(rdb,
+			killswitch.WithFailOpen(killswitchFailOpen),
+			killswitch.WithReconcileInterval(killswitchReconcile),
+			killswitch.WithLogger(slog.New(slog.NewTextHandler(os.Stderr, nil))))
 		ks = ksRedis
 		if killswitchFailOpen {
 			fmt.Fprintf(os.Stderr, "[eunox] Kill switch: fail-OPEN during a Redis outage (--killswitch-fail-open). Kills issued while Redis is unreachable may be delayed until it recovers; the data plane stays available.\n")
@@ -1954,8 +1954,15 @@ func fetchSpecLive(ctx context.Context, spec initUpstreamSpec) (LiveUpstreamInfo
 	switch spec.Transport {
 	case config.HostTransportStdio:
 		return fetchLiveToolsStdio(ctx, spec.Command, spec.Args)
-	default:
+	case config.HostTransportHTTP:
 		return fetchLiveTools(ctx, spec.URL, spec.AuthHeader, spec.TLSSkipVerify)
+	default:
+		// Fail closed on an unrecognized transport rather than probing it as HTTP,
+		// matching fetchRouteLive and this package's every-switch-names-its-cases
+		// convention. buildInitUpstreamSpec already rejects anything else, so this
+		// is the structural guard that keeps a future third transport from silently
+		// inheriting the HTTP probe.
+		return LiveUpstreamInfo{}, fmt.Errorf("unknown upstream transport %q", spec.Transport)
 	}
 }
 

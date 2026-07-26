@@ -7182,6 +7182,75 @@ func TestSequenceBlock_BlocksWriteAfterRead(t *testing.T) {
 	assert.Equal(t, "tool:read_credentials", resp.Denial.Details["afterTool"])
 }
 
+// TestSequenceBlock_BlockedCallReArmsHistory pins the retention semantics: a blocked
+// call that FINDS the antecedent marker re-arms it, so the 24h history window measures
+// inactivity of the antecedent/blocked pair rather than age since the antecedent's own
+// call. Without the re-arm the gate expired purely by wall-clock — a session that read
+// credentials once was allowed to write externally a day later, a time-based fail-OPEN
+// of a security gate.
+//
+// The counter's own clock governs the window, so the fake time func drives it.
+func TestSequenceBlock_BlockedCallReArmsHistory(t *testing.T) {
+	var mu sync.Mutex
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	advance := func(d time.Duration) {
+		mu.Lock()
+		defer mu.Unlock()
+		now = now.Add(d)
+	}
+	counter := callcounter.NewInMemory(callcounter.WithTimeFunc(func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return now
+	}))
+	engine := enforcement.New(enforcement.WithCallCounter(counter))
+	caps := exfilCaps()
+
+	require.Equal(t, capability.DecisionAllow,
+		callOnce(t, engine, "sess-1", "read_credentials", caps).Decision)
+
+	// Three probes, each 20h after the previous. The antecedent is never called again,
+	// so by the third probe 60h have passed since it ran — well past the 24h window.
+	// Each denial must re-arm the marker, keeping the next probe inside the window.
+	for i, label := range []string{"20h", "40h", "60h"} {
+		advance(20 * time.Hour)
+		resp := callOnce(t, engine, "sess-1", "write_external", caps)
+		require.Equalf(t, capability.DecisionDeny, resp.Decision,
+			"probe %d (%s after the antecedent) must stay blocked: each denial re-arms the marker", i+1, label)
+		require.NotNil(t, resp.Denial)
+		assert.Equal(t, capability.ConditionTypeSequenceBlock, resp.Denial.ConditionType)
+	}
+}
+
+// TestSequenceBlock_HistoryExpiresAfterFullInactivity is the other half of the
+// retention contract: the re-arm above extends the window on ACTIVITY, it does not
+// make the marker permanent. A session that goes quiet on both legs past the window
+// loses the gate — the documented limitation, pinned here so a change to the retention
+// semantics is deliberate rather than incidental.
+func TestSequenceBlock_HistoryExpiresAfterFullInactivity(t *testing.T) {
+	var mu sync.Mutex
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	counter := callcounter.NewInMemory(callcounter.WithTimeFunc(func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return now
+	}))
+	engine := enforcement.New(enforcement.WithCallCounter(counter))
+	caps := exfilCaps()
+
+	require.Equal(t, capability.DecisionAllow,
+		callOnce(t, engine, "sess-1", "read_credentials", caps).Decision)
+
+	// No activity on either leg for longer than the window.
+	mu.Lock()
+	now = now.Add(25 * time.Hour)
+	mu.Unlock()
+
+	assert.Equal(t, capability.DecisionAllow,
+		callOnce(t, engine, "sess-1", "write_external", caps).Decision,
+		"the marker is reclaimed after a full window of inactivity on both legs")
+}
+
 // TestSequenceBlock_BlocksAfterManyAntecedentCalls guards the cap at
 // the engine level. RecordSessionCall now retains only the most-recent history
 // marker (maxEntries=1) instead of one per call, so a high-rate antecedent no

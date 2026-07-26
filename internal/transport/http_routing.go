@@ -385,7 +385,19 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 			} else {
 				// Fire-and-forget (notification / response): record the drop and ack with a
 				// bodyless 202, matching the existing-session notification kill path below.
-				recordUnverifiedSessionKillDrop(asRecorder(route.sink), deny, r, msg.Method, legHTTPNotification)
+				//
+				// Distinguish the two legs the way the live-session path does. The transport
+				// leg detail exists so an operator can tell drop SITES apart during an
+				// incident; collapsing a dropped host response onto "http-notification" here
+				// corrupts exactly that triage signal, and this arm is the one place a
+				// response and a notification share a branch. A response carries no method,
+				// so it is identified as "server-response", matching the live-session kill
+				// record for the same message shape.
+				label, leg := msg.Method, legHTTPNotification
+				if msg.IsResponse() {
+					label, leg = "server-response", legHTTPServerResponse
+				}
+				recordUnverifiedSessionKillDrop(asRecorder(route.sink), deny, r, label, leg)
 				w.WriteHeader(http.StatusAccepted)
 			}
 			return

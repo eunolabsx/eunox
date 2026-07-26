@@ -10,6 +10,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
 	"time"
@@ -233,6 +234,18 @@ func readResponseWithID(ctx context.Context, w *mcp.MsgWriter, r *mcp.MsgReader,
 			// "file already closed" so the caller sees why the probe ended.
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return mcp.RPCMsg{}, ctxErr
+			}
+			// A malformed line (mcp.ErrParse) framed correctly — the newline framing is
+			// intact by definition — so skip it and keep reading, exactly as the running
+			// proxy's upstream reader does. Without this, one stray non-JSON line on the
+			// server's stdout (a banner or debug print, common in npx-launched servers)
+			// fails `init` / `validate --live` / `doctor --live` against an upstream the
+			// proxy itself fronts fine. Any other error (EOF, bufio.ErrTooLong, I/O) loses
+			// framing and stays terminal. The ctx.Err() gate above still bounds the loop,
+			// so an upstream emitting nothing but garbage ends at the probe deadline
+			// rather than spinning forever.
+			if errors.Is(err, mcp.ErrParse) {
+				continue
 			}
 			return mcp.RPCMsg{}, err
 		}

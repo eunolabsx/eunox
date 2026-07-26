@@ -1318,6 +1318,24 @@ func (e *Engine) handleSequenceBlock(ctx context.Context, cond capability.Condit
 			}
 		}
 		if count > 0 {
+			// Re-arm the antecedent marker so its retention measures inactivity rather
+			// than age. The marker is only refreshed by a fresh call to the antecedent
+			// (RecordSessionCall), so without this a session that called the antecedent
+			// once has its gate expire sequenceHistoryWindowSec later even while the
+			// session is demonstrably still live and still probing the blocked target —
+			// a purely wall-clock fail-OPEN of a security gate. Refreshing here makes a
+			// session that keeps attempting the blocked target keep the gate armed.
+			//
+			// Best-effort by design: this runs on a path that has ALREADY decided to
+			// deny, so a write fault cannot turn this denial into an allow, and
+			// surfacing it as a lookup error would convert a correct, precise
+			// sequenceBlock denial into a generic backend-fault one — strictly worse
+			// operator signal for the same outcome. The failure mode of ignoring it is
+			// only that retention keeps measuring from the antecedent's own call, which
+			// is exactly the pre-existing behavior. maxEntries is the same
+			// sequenceHistoryMaxEntries the recorder uses, and the backends retain the
+			// NEWEST entries, so this refreshes the single marker rather than growing it.
+			_, _ = history.IncrementAndGet(ctx, key, sequenceHistoryWindowSec, sequenceHistoryMaxEntries)
 			return &ConditionError{
 				Code:          capability.ErrCodeConditionFailed,
 				ConditionType: capability.ConditionTypeSequenceBlock,
