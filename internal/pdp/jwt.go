@@ -1649,13 +1649,13 @@ func (p *JWTPDP) filterList(ctx context.Context, result json.RawMessage, desc li
 	claims, ok := jwtClaimsFromContext(ctx)
 	if !ok {
 		// No JWT claims: mirror Decide's hard-deny by emptying the listing without
-		// deferring to the inner PDP (filterList has no error channel).
-		return emptyListing(result, desc.key)
+		// deferring to the inner PDP's OUTPUT (filterList has no error channel).
+		return p.emptyListingArmingPins(ctx, result, desc)
 	}
 	// Per-route audience pin (mirrors Decide): a token minted for a different route's
 	// audience must not enumerate this route's catalog. Fail closed to an empty listing.
 	if !p.routeAudienceSatisfied(claims) {
-		return emptyListing(result, desc.key)
+		return p.emptyListingArmingPins(ctx, result, desc)
 	}
 	if !claims.HasCapabilities {
 		if p.innerEnforces() {
@@ -1757,6 +1757,27 @@ func (p *JWTPDP) innerFilter(
 		return passThroughList(result, fieldName)
 	}
 	return sel(p.inner, ctx, result)
+}
+
+// emptyListingArmingPins is emptyListing for the two branches that reject the CALLER
+// rather than the catalog — no JWT claims, and a token minted for another route's
+// audience. The host sees the same empty listing either way; what differs is that the
+// inner PDP's filter still runs, purely for its side effect.
+//
+// That side effect is the descriptionHash pin: the inner ManifestPDP arms it from the
+// bytes of the tools/list it filters, so a branch that returned before reaching the inner
+// filter left the pin un-refreshed for that caller's listing. Distinct from a
+// catalog-integrity break — Decide still hard-denies the actual call — but the pin should
+// not go stale merely because the caller's token was rejected. The inner's OUTPUT is
+// deliberately discarded: this caller is not authorized to see any entry.
+//
+// Skipped when the inner does not enforce (nil or AlwaysAllow): there is no pin to arm,
+// so the parse would buy nothing.
+func (p *JWTPDP) emptyListingArmingPins(ctx context.Context, result json.RawMessage, desc listTypeDesc) ListFilterResult {
+	if p.innerEnforces() {
+		_ = p.innerFilter(ctx, result, desc.filter, desc.key)
+	}
+	return emptyListing(result, desc.key)
 }
 
 // emptyListing empties every entry of one list kind (listKey, e.g. "tools") while

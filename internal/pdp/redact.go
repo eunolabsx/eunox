@@ -513,6 +513,25 @@ func redactJSONValue(val interface{}, paths []string) bool {
 // leaf is unwrapped identically and the depth bound applies the same way.
 func redactSiblingTopLevelKeys(result map[string]interface{}, paths []string) (bool, error) {
 	changed := false
+	// Match the paths against the ENVELOPE itself before descending into its values. The
+	// descent below only ever sees a sibling key's VALUE, so a declared field sitting
+	// DIRECTLY on a top-level key was never tested against its own name:
+	// {"content":[...],"ssn":"123-45-6789"} with redactFields ["ssn"] forwarded the SSN
+	// verbatim, while the nested spelling {"data":{"ssn":"..."}} redacted correctly. Same
+	// obligation, same field name, opposite outcome depending on how deep the upstream
+	// happened to put it.
+	//
+	// Paths rooted at content/structuredContent are skipped: those two keys have their own
+	// shape-specific passes in ApplyRedactObligs (which redact WITHIN them rather than
+	// masking the whole component), and this pass must not reach past that rigor.
+	for _, p := range paths {
+		if head, _, _ := strings.Cut(p, "."); head == "content" || head == "structuredContent" {
+			continue
+		}
+		if redactDotPathRec(result, p) {
+			changed = true
+		}
+	}
 	for key, val := range result {
 		if key == "content" || key == "structuredContent" {
 			continue

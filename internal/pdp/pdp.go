@@ -920,6 +920,23 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 	// Find the most specific matching constraint, scoped to the target type and the
 	// caller's principal. The manifest is an allowlist: only listed targets pass.
 	claims := jwtClaimsAsMap(ctx)
+
+	// Build the enforce request before the no-match return, not after it: EVERY
+	// downgradable deny below — the no-match one included — needs it to record the
+	// antecedent in session history. TargetName/Target carry target.Name (for
+	// input.target.* and the audit record); Claims back input.claims.agent_id/task_id/etc.
+	req := &capability.EnforceRequest{
+		SessionID:  sessionID,
+		TargetName: target.Name,
+		Arguments:  args,
+		Context:    capability.EnforceRequestContext{SourceIP: sourceIP},
+		Target: &capability.EnforceRequestTarget{
+			Type: string(target.Type),
+			Name: target.Name,
+		},
+		Claims: claims,
+	}
+
 	matched := p.findConstraint(target, claims)
 	if matched == nil {
 		// A no-match deny is downgradable, so a route running --audit FORWARDS it and the
@@ -928,8 +945,19 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 		// from every entry NAMING this target (see withForwardObligations); dropping them
 		// here would leak on exactly the principal-scoped-miss shape the descriptionHash pin
 		// above is positioned to catch.
-		return p.withForwardObligations(ctx, denyResponse(p.engineClock(), capability.ErrCodeAuthorizationFailed, "",
+		resp := p.withForwardObligations(ctx, denyResponse(p.engineClock(), capability.ErrCodeAuthorizationFailed, "",
 			fmt.Sprintf("%s %q is not listed in the capability manifest", target.Type, target.Name)), target)
+		// Record the antecedent here too, matching every other downgradable deny branch.
+		// Under --audit this deny is forwarded and the manifest-absent tool actually RUNS,
+		// so omitting the record left a later enforced sequenceBlock naming it Peeking an
+		// empty history and failing OPEN — "observe predicts enforce" broken for exactly
+		// the targets an observe run exists to discover. matched is nil, which the
+		// antecedent path handles: no constraint means no flow relevance, so only the
+		// sequenceBlock antecedent is committed.
+		if override := recordAuditModeAntecedent(ctx, p.engine, p.engineClock(), req, nil, &resp); override != nil {
+			return *override
+		}
+		return resp
 	}
 	// Union labelOutput across every entry matching this request, so a source read carries
 	// its taint even when the entry findConstraint scored highest (a more-specific or
@@ -982,24 +1010,6 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 		// here without having run collectObligations). The genuine-allow path collects them
 		// in evaluateMatched; mirror it for the downgraded deny.
 		return p.withForwardObligationsFor(ctx, r, matched)
-	}
-
-	// Build the enforce request up front so every early-return deny an audit-mode
-	// constraint downgrades to a forwarded allow can still record the antecedent in
-	// session history — otherwise a later sequenceBlock naming this target in
-	// afterTools Peeks an empty history and fails OPEN though the tool ran.
-	// TargetName/Target carry target.Name (for input.target.* and the audit record);
-	// Claims back input.claims.agent_id/task_id/etc.
-	req := &capability.EnforceRequest{
-		SessionID:  sessionID,
-		TargetName: target.Name,
-		Arguments:  args,
-		Context:    capability.EnforceRequestContext{SourceIP: sourceIP},
-		Target: &capability.EnforceRequestTarget{
-			Type: string(target.Type),
-			Name: target.Name,
-		},
-		Claims: claims,
 	}
 
 	// The constraint's actions list must contain the required action for this
@@ -1969,7 +1979,19 @@ func scanToolEntry(raw json.RawMessage) toolEntryScan {
 		return toolEntryScan{untrustworthy: true}
 	}
 	if d, ok := tok.(json.Delim); !ok || d != '{' {
-		return toolEntryScan{untrustworthy: true} // not a JSON object
+		// Not a JSON object: null, a number, a string, a bool, or an array. The entry is
+		// still untrustworthy — it cannot decode into the hashed tool surface, so the
+		// filter must drop it — but unlike an entry whose bytes ABORTED the scan, its
+		// candidate-name set is knowably EMPTY, not unknown: none of these shapes carries
+		// a top-level "name", so a host renders no tool name from it and it cannot
+		// impersonate any pin. Mark the (empty) name set complete so the caller poisons
+		// nothing, rather than escalating a single null entry to a route-wide,
+		// sticky-to-process-exit poison of every pinned tool.
+		//
+		// The entries arrive as json.RawMessage elements of an already-unmarshaled array,
+		// so each is exactly one complete, well-formed JSON value: reading its first token
+		// is enough to classify it, with no trailing bytes left to hide anything.
+		return toolEntryScan{untrustworthy: true, namesComplete: true}
 	}
 	var out toolEntryScan
 	stack := []frame{{object: true, expectKey: true}}
@@ -2138,7 +2160,9 @@ func (p *ManifestPDP) RecordObservedToolHashes(_ context.Context, result json.Ra
 //     entry cannot disable pins it never named. That narrowing holds only when the scan
 //     actually enumerated the entry's names; an entry whose bytes ABORTED the scan
 //     (malformed tokens, a non-string key, nesting past the depth bound) has an unknown
-//     name set, not an empty one, so it poisons every pin.
+//     name set, not an empty one, so it poisons every pin. A provably-non-object entry
+//     (null, a number, a string, an array) is the opposite case: it is untrustworthy and
+//     gets filtered out, but its name set is knowably EMPTY, so it poisons nothing.
 //   - An entry that will not decode into the hashed surface poisons just its own pin.
 //   - An ambiguous ENVELOPE — undecodable, an undecodable tools array, or a duplicate or
 //     case-variant "tools" key (Go keeps one array while a host may render the other) —
