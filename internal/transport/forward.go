@@ -148,7 +148,7 @@ func recordDriftRefused(ctx context.Context, rec auditRecorder, sessionID string
 	if rec == nil {
 		return
 	}
-	rec.RecordDeny(ctx, sessionID, "initialize", "initialize", codeDriftRefused, "drift", nil, false)
+	rec.RecordDeny(ctx, sessionID, mcp.MethodInitialize, mcp.MethodInitialize, codeDriftRefused, "drift", nil, false)
 }
 
 // forwardParams bundles the per-transport bits the shared enforced-forward core
@@ -381,6 +381,21 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 
 	upResp, fwdErr := fp.callUpstream(ctx, msg)
 	if fwdErr != nil {
+		// The maxCalls quota slot this call consumed is INTENTIONALLY NOT refunded here.
+		// Decide committed the counter atomically WITH the decision (that atomicity is
+		// what makes the limit exact under concurrent requests), and the upstream may
+		// have executed the call before the failure: a write timeout means the request
+		// bytes were already handed to the upstream, and a read/transport failure can
+		// follow a side effect that already happened. A compensating decrement would
+		// therefore hand back quota for calls that did run, and would itself need
+		// double-refund protection across the retry the host is free to make.
+		//
+		// The accepted cost is the converse: an upstream that stops draining stdin under
+		// a tight --upstream-timeout can burn a caller's whole maxCalls budget on calls
+		// that never executed. That is the fail-closed direction (the quota over-counts,
+		// never under-counts), and every consumed slot is on the tape — this branch
+		// records a deny carrying the upstream error code, so an operator reconstructing
+		// a budget can tell executed calls from failed forwards.
 		return fp.recordUpstreamFailure(ctx, msg, fwdErr, auditID, method)
 	}
 

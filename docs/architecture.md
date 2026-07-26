@@ -334,9 +334,10 @@ Mechanics:
   signing key, so `audit-verify` selects the right key per record and a tape that
   straddles a rotation verifies end to end (threat model §3.4).
 - Records form a tamper-evident hash chain: each carries a monotonic `seq`
-  and a `prev_hmac` (the preceding record's `_hmac`; a `sha256:genesis`
-  sentinel for the first record of a fresh log, or `""` for the first record
-  appended after resuming from a pre-chain log whose tail was never signed),
+  and a `prev_hmac` (the preceding record's `_hmac`, or a `sha256:genesis`
+  sentinel for the first record of a fresh log — and for the first record of a
+  chain restarted because the previous tail could not be verified; an empty
+  `prev_hmac` is never emitted, so `audit-verify` treats one as a break),
   both covered by the signature and resumed across restarts and rotation. So
   `audit-verify` checks chain linkage as well as per-record HMACs — deletion,
   reordering, and insertion are detectable, not just field edits — and it

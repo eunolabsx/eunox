@@ -1113,6 +1113,7 @@ func TestHTTPProxy_JWTMode_UnknownRouteReturns401NotOracle(t *testing.T) {
 	// non-existent route ("zzz") must both return 401, never 404.
 	for _, route := range []string{"", "zzz"} {
 		req := httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody)
+		req.Header.Set("Content-Type", CTJSON)
 		req.SetPathValue("upstream", route)
 		rr := httptest.NewRecorder()
 		proxy.handleMCP(rr, req)

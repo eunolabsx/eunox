@@ -2205,3 +2205,58 @@ func TestSamplingAuditRecord_NoJWT_OmitsIdentity(t *testing.T) {
 		t.Error("task_id must be omitted when the session has no JWT")
 	}
 }
+
+// TestEnforcedForward_MaxCallsSlotNotRefundedOnUpstreamFailure is the executable pin for
+// the quota invariant enforcedForwardCore documents at its upstream-failure branch: the
+// maxCalls slot a call consumed at DECISION time stays consumed when the upstream
+// forward then fails.
+//
+// Without this test the invariant is prose, and the obvious-looking "fix" — a
+// compensating decrement on that branch — ships against a fully green suite while
+// inverting maxCalls from a hard ceiling into one an attacker resets at will by inducing
+// upstream timeouts. The behavior is deliberate: the counter increment is atomic WITH the
+// decision (which is what makes the limit exact under concurrent requests), and a failed
+// forward does not prove the upstream did not execute the call — a write timeout means
+// the request bytes were already handed over. Over-counting is the fail-closed direction.
+func TestEnforcedForward_MaxCallsSlotNotRefundedOnUpstreamFailure(t *testing.T) {
+	t.Parallel()
+
+	fu := newFakeUpstream()
+	upSrv := httptest.NewServer(fu)
+	upURL := upSrv.URL
+
+	manifest := []capability.Constraint{{
+		Target:  "tool:read_file",
+		Actions: []string{"call"},
+		Conditions: []capability.Condition{
+			&capability.MaxCallsCondition{Count: 1, WindowSeconds: 60},
+		},
+	}}
+	engine := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()))
+	dp := pdp.NewManifestPDP(manifest, engine, killswitch.NewInMemory())
+	_, proxySrv := newTestRemoteProxy(t, upURL, httpProxyOptions{PDP: dp})
+	sid := initSession(t, proxySrv)
+
+	// Take the upstream away AFTER the session is established, so the next tools/call
+	// clears policy (consuming the one slot) and then fails in transport.
+	upSrv.Close()
+
+	params, err := json.Marshal(mcp.ToolCallParams{Name: "read_file", Arguments: map[string]interface{}{}})
+	require.NoError(t, err)
+
+	first := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "tools/call", Params: params}
+	firstResp := decodeRPC(t, postMCP(t, proxySrv, first, sid))
+	require.NotNil(t, firstResp.Error, "the upstream is gone, so the forward must fail")
+	require.NotContains(t, firstResp.Error.Message, capability.ErrCodeRateLimited,
+		"the first call is within the limit; it must fail on the upstream, not on policy")
+
+	// The slot is gone even though the call never demonstrably executed: the second call
+	// is denied by maxCalls, not by the upstream being unreachable.
+	second := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`2`), Method: "tools/call", Params: params}
+	secondResp := decodeRPC(t, postMCP(t, proxySrv, second, sid))
+	require.NotNil(t, secondResp.Error, "expected a denial once the quota is spent")
+	assert.Equal(t, capability.JSONRPCCodeRateLimited, secondResp.Error.Code,
+		"the failed forward must still have consumed the maxCalls slot (no compensating refund)")
+	assert.True(t, strings.HasPrefix(secondResp.Error.Message, capability.ErrCodeRateLimited),
+		"error.message must begin with the symbolic RATE_LIMITED code, got %q", secondResp.Error.Message)
+}

@@ -385,11 +385,11 @@ func TestOpenAuditSink_WritesIntegrityMarkerOnTamperedTail(t *testing.T) {
 		t.Fatalf("marker Details[kind] = %v, want tail_hmac_mismatch", got)
 	}
 	// JSON numbers decode to float64.
-	if got, ok := markerDetails["tail_seq"].(float64); !ok || got != 2 {
-		t.Fatalf("marker Details[tail_seq] = %v, want 2", markerDetails["tail_seq"])
+	if got, ok := markerDetails["claimed_tail_seq"].(float64); !ok || got != 2 {
+		t.Fatalf("marker Details[claimed_tail_seq] = %v, want 2", markerDetails["claimed_tail_seq"])
 	}
-	if got := markerDetails["tail_hmac"]; got != tamperedHMAC {
-		t.Fatalf("marker Details[tail_hmac] = %v, want the suspect tail hmac %q", got, tamperedHMAC)
+	if got := markerDetails["claimed_tail_hmac"]; got != tamperedHMAC {
+		t.Fatalf("marker Details[claimed_tail_hmac] = %v, want the suspect tail hmac %q", got, tamperedHMAC)
 	}
 
 	// The marker is itself a properly signed record (its own _hmac verifies), so it
@@ -547,8 +547,8 @@ func TestOpenAuditSink_IntegrityFailedTail_DoesNotInheritAttackerSeq(t *testing.
 	}
 	// The suspect values are still preserved inside the marker for forensics.
 	markerDetails := recordDetails(t, marker)
-	if got, ok := markerDetails["tail_seq"].(float64); !ok || got != attackerSeq {
-		t.Fatalf("marker Details[tail_seq] = %v, want the forensic record of the suspect seq %d", markerDetails["tail_seq"], attackerSeq)
+	if got, ok := markerDetails["claimed_tail_seq"].(float64); !ok || got != attackerSeq {
+		t.Fatalf("marker Details[claimed_tail_seq] = %v, want the forensic record of the suspect seq %d", markerDetails["claimed_tail_seq"], attackerSeq)
 	}
 }
 
@@ -714,8 +714,8 @@ func TestVerifyAuditLog_ForgedLegacySeq0DoesNotSuppressSeqGap(t *testing.T) {
 		t.Fatalf("a forged legacy seq-0 splice must fail verification: %+v", res)
 	}
 	out := sb.String()
-	if !strings.Contains(out, "forged legacy record spliced into a signed chain") {
-		t.Fatalf("the forged legacy decoy must be reported invalid; output:\n%s", out)
+	if !strings.Contains(out, "carries no _hmac") {
+		t.Fatalf("the unsigned decoy must be reported invalid; output:\n%s", out)
 	}
 	if !strings.Contains(out, "SEQ GAP: record seq 5 does not follow 3") {
 		t.Fatalf("the SEQ GAP for the displaced record must not be suppressed by the decoy; output:\n%s", out)
@@ -822,18 +822,15 @@ func TestVerifyAuditLog_ForgedLegacyAfterSigned_Invalid(t *testing.T) {
 	if res.OK() {
 		t.Fatalf("forged HMAC-less seq-0 record after signed records must fail verification: %+v", res)
 	}
-	if res.Legacy != 0 {
-		t.Fatalf("post-signing seq-0 record must not be classified legacy, got legacy=%d", res.Legacy)
-	}
 	if res.Invalid == 0 {
 		t.Fatalf("expected the forged record counted invalid: %+v", res)
 	}
 }
 
-// TestVerifyAuditLog_LegacyHeadStillExempt guards that the fix does not
-// break the legitimate case: genuine pre-signing legacy records at the HEAD of a
-// log (before any signed record) remain exempt.
-func TestVerifyAuditLog_LegacyHeadStillExempt(t *testing.T) {
+// TestVerifyAuditLog_UnsignedHeadIsInvalid pins that HMAC-less records at the HEAD of
+// a log get no exemption either: position does not make an unsigned record
+// certifiable, and the appended signed records must still verify around them.
+func TestVerifyAuditLog_UnsignedHeadIsInvalid(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "audit.jsonl")
 	keyPath := filepath.Join(dir, "audit.key")
@@ -843,7 +840,7 @@ func TestVerifyAuditLog_LegacyHeadStillExempt(t *testing.T) {
 	if err := os.WriteFile(logPath, []byte(legacy), 0o600); err != nil {
 		t.Fatalf("write legacy: %v", err)
 	}
-	// Resume onto the legacy tail and append signed records.
+	// The sink refuses to chain onto the unsigned tail and starts a fresh chain.
 	sink, err := Open(logPath, keyPath, 0, 0)
 	if err != nil {
 		t.Fatalf("openAuditSink: %v", err)
@@ -854,21 +851,21 @@ func TestVerifyAuditLog_LegacyHeadStillExempt(t *testing.T) {
 	}
 
 	res := verifyBytes(t, logLines(t, logPath), verifierFor(t, keyPath))
-	if !res.OK() {
-		t.Fatalf("legacy-head + signed log must still pass: %+v", res)
+	if res.OK() {
+		t.Fatalf("an unsigned head must fail the verdict: %+v", res)
 	}
-	if res.Legacy != 2 {
-		t.Fatalf("expected legacy=2 for the two head records, got %+v", res)
+	if res.Invalid != 2 {
+		t.Fatalf("expected invalid=2 for the two unsigned head records, got %+v", res)
+	}
+	if res.ChainBreaks != 0 {
+		t.Fatalf("unsigned head records must not fabricate chain breaks: %+v", res)
 	}
 }
 
 // TestVerifyAuditLog_ForgedEmptyPrevSeq1_IsChainBreak guards the genesis-sentinel
-// empty-prev_hmac bypass: a
-// signing-key holder truncates the leading records and forges an ORDINARY seq-1
-// record with prev_hmac="" and a valid HMAC. The old blanket empty-prev_hmac
-// exemption let that pass with no chain break; it must now be flagged. The genuine
-// legacy_tail_resumed marker (the only record that legitimately starts a signed
-// chain with prev_hmac="") must still verify cleanly.
+// empty-prev_hmac bypass: a signing-key holder truncates the leading records and
+// forges a seq-1 record with prev_hmac="" and a valid HMAC. It must be flagged — with
+// no exemption for any record shape, since the writer never emits an empty prev_hmac.
 func TestVerifyAuditLog_ForgedEmptyPrevSeq1_IsChainBreak(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -892,19 +889,21 @@ func TestVerifyAuditLog_ForgedEmptyPrevSeq1_IsChainBreak(t *testing.T) {
 		t.Fatalf("forged empty-prev_hmac seq-1 record must be reported as a chain break: %+v", res)
 	}
 
-	// The genuine legacy_tail_resumed marker, same seq/prev_hmac shape, is exempt.
+	// No record shape is exempt any more — not even a signed integrity marker, which
+	// the writer now emits with the genesis sentinel like any other chain-restart
+	// record. An empty prev_hmac at seq 1 is a break whatever the record says it is.
 	marker := signAuditLine(t, key, auditRecord{
 		Time:       "2026-06-15T10:00:00Z",
 		Seq:        1,
 		RequestID:  "marker",
 		Decision:   "deny",
 		DenialCode: auditIntegrityFailureCode,
-		Details:    json.RawMessage(`{"kind":"` + auditKindLegacyTailResumed + `","tail_seq":0}`),
+		Details:    json.RawMessage(`{"kind":"tail_unsigned","claimed_tail_seq":0}`),
 		PrevHMAC:   "",
 	})
 	res2 := verifyBytes(t, [][]byte{marker}, verifierFor(t, keyPath))
-	if res2.ChainBreaks != 0 {
-		t.Fatalf("a genuine legacy_tail_resumed marker must not be a chain break: %+v", res2)
+	if res2.ChainBreaks == 0 {
+		t.Fatalf("an empty-prev_hmac seq-1 record must be a chain break regardless of its kind: %+v", res2)
 	}
 }
 
@@ -1083,10 +1082,9 @@ func TestVerifyAuditLog_MissingHMACSeqGt0_DoesNotPoisonChain(t *testing.T) {
 	}
 	out := sb.String()
 
-	// The empty-_hmac record is counted invalid with the dedicated diagnostic: it
-	// follows a signed record (v.signedSeen), so it is a forged legacy splice, not a
-	// genuine legacy record — the same diagnostic a seq-bearing legacy splice gets.
-	if !strings.Contains(out, "unsigned record (seq=2) follows a signed record") {
+	// The empty-_hmac record is counted invalid with the unsigned-record diagnostic:
+	// nothing certifies it, so its position in the stream does not matter.
+	if !strings.Contains(out, "unsigned record (seq=2) carries no _hmac") {
 		t.Fatalf("expected the empty-_hmac diagnostic for the stripped record; output:\n%s", out)
 	}
 	// Exactly one invalid (rec2), and crucially NO spurious chain break: rec3 chains
@@ -1100,19 +1098,14 @@ func TestVerifyAuditLog_MissingHMACSeqGt0_DoesNotPoisonChain(t *testing.T) {
 	}
 }
 
-// TestVerifyAuditLog_MultipleSeqBearingLegacyRecords_AllCountLegacy is the
-// regression for a residual bug the forgedLegacySplice fix's own signedSeen gate
-// exposed: signedSeen was set true by ANY record with Seq > 0 (updateChain),
-// including an unsigned (HMAC=="") one. Since a genuine legacy record can itself
-// carry a non-zero seq (the seq-bearing legacy tail case), a first legacy record
-// with Seq > 0 would flip signedSeen true even though nothing was ever actually
-// signed, causing a SECOND genuine legacy record — still preceding any real signed
-// record — to be misclassified as a forged post-signing splice and counted
-// Invalid. Two consecutive HMAC-less records, both carrying non-zero seq values
-// and neither ever followed by a signed record, must both land in the Legacy
-// bucket (with the log correctly reported UNANCHORED, since it is wholly legacy
-// under a configured key — not INVALID).
-func TestVerifyAuditLog_MultipleSeqBearingLegacyRecords_AllCountLegacy(t *testing.T) {
+// TestVerifyAuditLog_SeqBearingUnsignedRecords_AllInvalid pins that an HMAC-less
+// record is INVALID whatever seq it carries and wherever it sits. A pre-signing record
+// can carry a stale non-zero seq inherited from before the chain existed, so seq shape
+// is not a discriminator — only the presence of a signature is. Two consecutive
+// unsigned records, neither followed by a signed one, must both be counted Invalid and
+// must not fabricate chain breaks between themselves (they never enter the chain
+// state).
+func TestVerifyAuditLog_SeqBearingUnsignedRecords_AllInvalid(t *testing.T) {
 	dir := t.TempDir()
 	keyPath := dir + "/audit.key"
 	lines := []string{
@@ -1128,14 +1121,14 @@ func TestVerifyAuditLog_MultipleSeqBearingLegacyRecords_AllCountLegacy(t *testin
 	}
 	out := sb.String()
 
-	if res.Invalid != 0 {
-		t.Fatalf("both seq-bearing legacy records must count Legacy, not Invalid: %+v\noutput:\n%s", res, out)
+	if res.Invalid != 2 {
+		t.Fatalf("both seq-bearing unsigned records must count Invalid: %+v\noutput:\n%s", res, out)
 	}
-	if res.Legacy != 2 {
-		t.Fatalf("expected both records counted Legacy, got %+v\noutput:\n%s", res, out)
+	if res.OK() {
+		t.Fatalf("a log with no signed record must fail the verdict: %+v\noutput:\n%s", res, out)
 	}
-	if strings.Contains(out, "forged legacy record spliced") {
-		t.Fatalf("a genuine legacy record must not be misreported as a forged splice merely because an earlier legacy record also carried a non-zero seq:\n%s", out)
+	if res.ChainBreaks != 0 {
+		t.Fatalf("unsigned records must not enter the chain state and fabricate breaks: %+v\noutput:\n%s", res, out)
 	}
 }
 
@@ -2091,14 +2084,15 @@ func TestVerifyAuditLog_NonCanonicalRecordPoisonsChainAnchorForSuccessor(t *test
 	}
 }
 
-// TestVerifyAuditLog_AllLegacyUnderKeyIsUnanchored: a log whose every record is
-// pre-signing legacy shape (no _hmac, seq 0), verified while a signing key is
-// configured, has no cryptographic anchor and must NOT pass. Otherwise a write-capable
-// attacker without the key could replace the entire log (and its rotated siblings) with
-// forged legacy-shaped records and clear audit-verify. A legitimate legacy->signed
-// upgrade always leaves a signed record, so an all-legacy log under a key is not a
-// normal state.
-func TestVerifyAuditLog_AllLegacyUnderKeyIsUnanchored(t *testing.T) {
+// TestVerifyAuditLog_AllUnsignedLogFailsVerdict: a log whose every record is
+// pre-signing shape (no _hmac) has no cryptographic anchor and must NOT pass.
+// Otherwise a write-capable attacker without the key could replace the entire log (and
+// its rotated siblings) with forged unsigned records and clear audit-verify. Since
+// every unsigned record is INVALID, this now follows from the per-record verdict alone
+// — no separate whole-log "unanchored" rule is needed, and the result is the same
+// whether or not a verification key is configured, which removes the old asymmetry
+// where a keyless verify passed the identical bytes.
+func TestVerifyAuditLog_AllUnsignedLogFailsVerdict(t *testing.T) {
 	t.Parallel()
 	key := nonZeroTestKey()
 	legacy := func(reqID string) []byte {
@@ -2106,41 +2100,32 @@ func TestVerifyAuditLog_AllLegacyUnderKeyIsUnanchored(t *testing.T) {
 	}
 	log := bytes.Join([][]byte{legacy("a"), legacy("b"), legacy("c")}, []byte("\n"))
 
-	// With a key configured, the all-legacy log is unanchored and fails the verdict.
-	var out strings.Builder
-	res, err := VerifyLog(bytes.NewReader(log), &Sink{verifyKeys: map[string][]byte{hmacKeyID(key): key}}, "", time.Time{}, &out)
-	if err != nil {
-		t.Fatalf("VerifyLog: %v", err)
-	}
-	if res.Legacy != 3 || res.Total != 3 {
-		t.Fatalf("got %+v, want Legacy=3 Total=3", res)
-	}
-	if !res.Unanchored {
-		t.Error("an all-legacy log under a held key must be flagged Unanchored")
-	}
-	if res.OK() {
-		t.Error("an unanchored log must fail the verdict (fail-closed)")
-	}
-	if res.ChainBreaks != 0 || res.Invalid != 0 {
-		t.Errorf("unanchored detection must not fabricate chain breaks/invalids: got %+v", res)
-	}
-	if !strings.Contains(out.String(), "UNANCHORED") {
-		t.Errorf("expected an UNANCHORED diagnostic, got %q", out.String())
-	}
-
-	// With an EMPTY (but non-nil) keyring there is no key to verify against, so the
-	// all-legacy log is unverified legacy — NOT a failed anchor. Unanchored must not fire
-	// (the nil-vs-empty distinction: an empty keyring holds no key).
-	var out2 strings.Builder
-	res2, err := VerifyLog(bytes.NewReader(log), &Sink{verifyKeys: map[string][]byte{}}, "", time.Time{}, &out2)
-	if err != nil {
-		t.Fatalf("VerifyLog (empty keyring): %v", err)
-	}
-	if res2.Unanchored {
-		t.Error("an empty keyring holds no key, so an all-legacy log must not be flagged Unanchored")
-	}
-	if !res2.OK() {
-		t.Errorf("all-legacy log under an empty keyring must pass (nothing to verify): %+v", res2)
+	for _, tc := range []struct {
+		name     string
+		verifier *Sink
+	}{
+		{"with a key configured", &Sink{verifyKeys: map[string][]byte{hmacKeyID(key): key}}},
+		{"with an empty keyring", &Sink{verifyKeys: map[string][]byte{}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out strings.Builder
+			res, err := VerifyLog(bytes.NewReader(log), tc.verifier, "", time.Time{}, &out)
+			if err != nil {
+				t.Fatalf("VerifyLog: %v", err)
+			}
+			if res.Total != 3 || res.Invalid != 3 {
+				t.Fatalf("got %+v, want Total=3 Invalid=3", res)
+			}
+			if res.OK() {
+				t.Error("a log carrying no signed record must fail the verdict (fail-closed)")
+			}
+			if res.ChainBreaks != 0 {
+				t.Errorf("unsigned records must not fabricate chain breaks: got %+v", res)
+			}
+			if !strings.Contains(out.String(), "carries no _hmac") {
+				t.Errorf("expected the unsigned-record diagnostic, got %q", out.String())
+			}
+		})
 	}
 }
 
@@ -2230,5 +2215,65 @@ func TestTruncatePartialTail_ReReadFailureFailsClosed(t *testing.T) {
 
 	if _, err := tailLineFromWindow(f, window, start, int64(len(content)), winSize); !errors.Is(err, errAuditTailProbe) {
 		t.Fatalf("error = %v, want it to wrap errAuditTailProbe (a re-read we cannot complete is not a clean tail)", err)
+	}
+}
+
+// TestVerifyLog_CapsUnsignedDiagnostics pins that a pre-signing log does not flood the
+// output with one line per record. The Invalid COUNT must stay exact — the verdict is
+// what fails the log — while the per-record diagnostics are capped and the remainder
+// summarized once, so a genuine CHAIN BREAK elsewhere in the same run stays findable
+// instead of being buried under thousands of identical lines.
+func TestVerifyLog_CapsUnsignedDiagnostics(t *testing.T) {
+	t.Parallel()
+	const n = maxUnsignedDiagnostics + 25
+	lines := make([][]byte, 0, n)
+	for i := 0; i < n; i++ {
+		lines = append(lines, []byte(fmt.Sprintf(
+			`{"time":"2026-06-15T10:00:00Z","request_id":"r%d","session_id":"s","target":"tool:exec","decision":"allow"}`, i)))
+	}
+
+	var out strings.Builder
+	res, err := VerifyLog(bytes.NewReader(bytes.Join(lines, []byte("\n"))), &Sink{}, "", time.Time{}, &out)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if res.Invalid != n {
+		t.Fatalf("Invalid = %d, want %d: capping the diagnostics must not change the tally", res.Invalid, n)
+	}
+	if res.OK() {
+		t.Error("a log with no signed record must fail the verdict")
+	}
+
+	perRecord := strings.Count(out.String(), "carries no _hmac, so it cannot be verified")
+	if perRecord > maxUnsignedDiagnostics {
+		t.Errorf("printed %d per-record unsigned diagnostics, want at most %d", perRecord, maxUnsignedDiagnostics)
+	}
+	// The elided records must still be accounted for, with the true total.
+	if !strings.Contains(out.String(), fmt.Sprintf("%d unsigned record(s) in total", n)) {
+		t.Errorf("expected a closing summary naming all %d unsigned records, got:\n%s", n, out.String())
+	}
+	if !strings.Contains(out.String(), "diagnostics elided") {
+		t.Errorf("the summary must say how many diagnostics were suppressed, got:\n%s", out.String())
+	}
+}
+
+// TestVerifyLog_UnsignedDiagnosticsUncappedBelowLimit guards the other side: a handful of
+// unsigned records — the realistic tamper case, as opposed to a whole pre-signing log —
+// must still be reported individually, with no summary line implying anything was hidden.
+func TestVerifyLog_UnsignedDiagnosticsUncappedBelowLimit(t *testing.T) {
+	t.Parallel()
+	lines := [][]byte{
+		[]byte(`{"time":"2026-06-15T10:00:00Z","request_id":"a","session_id":"s","target":"tool:exec","decision":"allow"}`),
+		[]byte(`{"time":"2026-06-15T10:00:01Z","request_id":"b","session_id":"s","target":"tool:exec","decision":"allow"}`),
+	}
+	var out strings.Builder
+	if _, err := VerifyLog(bytes.NewReader(bytes.Join(lines, []byte("\n"))), &Sink{}, "", time.Time{}, &out); err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if got := strings.Count(out.String(), "carries no _hmac"); got != 2 {
+		t.Errorf("printed %d diagnostics, want one per record (2)", got)
+	}
+	if strings.Contains(out.String(), "diagnostics elided") {
+		t.Errorf("nothing was suppressed, so no summary line should appear:\n%s", out.String())
 	}
 }

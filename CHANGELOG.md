@@ -51,6 +51,11 @@ Section conventions:
   are read-only — see the doc comments in `pkg/capability/condition.go`.
 - `capability.FloatToInt64`, the single definition of "exactly representable as an
   int64" now shared by manifest-load bound validation and the runtime comparison.
+- `mcp.MethodInitialize`, the single spelling of the `initialize` handshake method,
+  replacing the bare string literal at every transport site (session-creating POST,
+  the notification swallow-list, the re-initialize echo, the drift-refusal record,
+  the upstream handshake builder, the protocol-version header gate). It sits beside
+  `mcp.MethodNotificationsInitialized`, the other half of the same handshake.
 
 ### Changed
 
@@ -70,7 +75,40 @@ Section conventions:
   **writable**, non-sticky directory is refused: any local user could substitute the
   token there and take over the loopback emergency stop. An operator-chosen directory
   is still never chmod'ed (forcing 0700 on `/tmp` would strip its sticky bit).
-
+- **A refused `Content-Type` is now recorded** as the non-policy denial code
+  `UNSUPPORTED_MEDIA_TYPE`, carrying only `details.header_count` — never the
+  attacker-supplied header value. It was the one transport-level refusal leaving no
+  trace, so a content-type sweep of the sessionless `initialize` POST or the emergency
+  stop was invisible while the same actor's wrong-`Origin` attempts were fully logged.
+  A *duplicated* header additionally prints an `[eunox] SECURITY:` line, since a reverse
+  proxy that re-adds `Content-Type` is the one way an operator trips the gate through no
+  fault of their client.
+- **The integrity markers' tail fields are renamed `claimed_tail_seq` /
+  `claimed_tail_hmac`** (`tail_hmac_mismatch`, `tail_key_unknown`, `tail_unsigned`).
+  Both values are read from the record the writer just declared uncertifiable, so they
+  are whatever a write-capable attacker put there; signing them under bare names had
+  eunox attest an arbitrary value as fact. Matches the `claimed_session_id` convention.
+  A SIEM rule keyed on the old names must be updated.
+- **`audit-verify` caps the per-record "unsigned record" diagnostic** at 10 lines and
+  summarizes the remainder once. The `Invalid` tally is unchanged and still exact; only
+  the printing is bounded, so a pre-signing prefix cannot bury a genuine `CHAIN BREAK`
+  under one line per record.
+- **`POST /mcp` and `POST /control/kill` now require `Content-Type: application/json`**
+  and answer `415 Unsupported Media Type` otherwise, failing closed on an absent,
+  unparseable, or duplicated header (parameters such as `charset` are accepted; the
+  media type is matched case-insensitively). Conformant MCP clients already send it,
+  so no honest host is affected. It is defence in depth behind the `Origin` check: a
+  POST carrying `text/plain`/`application/x-www-form-urlencoded`/`multipart/form-data`
+  is a CORS *simple* request, dispatched with no preflight, and the sessionless
+  `initialize` POST — the one `/mcp` entry point with no custom header, and the one
+  that spawns an upstream — was the last shape that could reach a handler without one.
+  See `docs/threat-model-mcp.md` §3.7.
+- **`eunox proxy` returns an exit code instead of calling `os.Exit`**, like every
+  other subcommand, so its fail-closed startup rejections are testable in-process and
+  the deferred audit-sink flush always runs. Its flag set moved from `ExitOnError` to
+  `ContinueOnError` to match its siblings; a usage error still exits 2 and `-h` still
+  exits 0, so the observable behavior is unchanged. `buildCallCounterAndKillSwitch`
+  and `openConfiguredAuditSink` now return errors rather than exiting internally.
 - **`capability.EnforceRequest.ToolName` is now `TargetName`** (JSON `toolName` →
   `targetName`). The field always carried every enforced namespace — resource URIs,
   prompt names, `system:` targets — not just tool names, so the old name misread the
@@ -110,6 +148,22 @@ Section conventions:
 
 ### Removed
 
+- **The pre-HMAC ("legacy tail") audit compatibility path is gone.** An unsigned
+  record is never resumed onto and never exempted from verification: the writer
+  treats an unsigned tail exactly like an unparseable one (restart the chain from
+  genesis, plus a signed `AUDIT_INTEGRITY_FAILURE` marker with
+  `"kind":"tail_unsigned"`), and `audit-verify` counts every HMAC-less record
+  `invalid` wherever it appears. This deletes the writer's `resumedLegacyTail`
+  empty-`prev_hmac` branch and the verifier's lenient-decode fallback,
+  `legacy_tail_resumed` marker handling, and legacy/unanchored lattice — roughly 250
+  lines whose whole purpose was policing the one splice a write-capable attacker
+  could make without the signing key. `VerifyResult` loses `Legacy`, `Unanchored`,
+  and `LegacyUnanchored`, and `audit-verify`'s summary line no longer prints a
+  `legacy` count. **Migration:** move a pre-signing log aside before upgrading
+  (`mv audit.jsonl audit.jsonl.pre-hmac`) and let the proxy start a fresh chain;
+  leaving it in place is safe but makes `audit-verify` exit non-zero with one
+  `invalid` per pre-signing record until they rotate out. See
+  `docs/threat-model-mcp.md` §3.4.
 - `circuitbreaker.Config.Validate`. The package had two policies for a degenerate
   config — `New` clamps, `Validate` rejected — and no operator-facing breaker knobs
   exist, so clamping was the only reachable one. Callers relying on the rejecting
@@ -156,7 +210,23 @@ Section conventions:
 - The unverified `claimed_session_id` truncates on a rune boundary. A byte-level cut
   left dangling continuation bytes that `json.Marshal` rewrote to U+FFFD, so the signed
   value no longer matched the raw header a SIEM holds for the same request.
-
+- `eunox proxy` no longer leaks its cancel function, signal registration, or a failed
+  Redis client. All three were unobservable while the function ended in `os.Exit`;
+  returning an exit code made them real for any in-process caller.
+- The `audit-verify` summary format is a shared constant the site-drift test asserts
+  against, and that test now walks `.js` as well as `.html` — the landing page renders
+  its terminal demos from a script, so an HTML-only sweep left the most prominent copy
+  of eunox's own output unguarded (it had already drifted).
+- `drift.ParseToolsListResult` converts each `mcp.ToolEntry` field by NAME instead of
+  through a positional struct conversion. The two types share three `string` and two
+  `map[string]interface{}` fields, so a same-type reorder in `mcp.ToolEntry` would have
+  compiled cleanly while silently transposing the values every `descriptionHash`
+  comparison is computed over. A package-level convertibility assertion keeps the other
+  direction covered: ADDING a field to either struct without the other now fails the
+  build rather than hashing the new field as a zero value.
+- The audit lock's "another instance holds the lock" diagnostic compares the errno with
+  `errors.Is`, matching the Windows variant; the previous `==` worked only because
+  `Flock` returns a bare `Errno`.
 - **`sequenceBlock` no longer expires purely by wall clock.** The per-(session,
   tool) antecedent marker was refreshed only by a fresh call to the antecedent, so a
   session that ran the antecedent once had its "deny B after A" guarantee fail OPEN

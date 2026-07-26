@@ -247,7 +247,7 @@ func buildInitializeParams() json.RawMessage {
 // capabilities entry). Both the id-derived proxy handshake below and the CLI probes flow
 // through this one builder.
 func BuildInitializeRequestWithID(id *json.RawMessage) mcp.RPCMsg {
-	return mcp.RPCMsg{JSONRPC: "2.0", ID: id, Method: "initialize", Params: buildInitializeParams()}
+	return mcp.RPCMsg{JSONRPC: "2.0", ID: id, Method: mcp.MethodInitialize, Params: buildInitializeParams()}
 }
 
 // buildInitializeRequest constructs the MCP `initialize` request the proxy sends
