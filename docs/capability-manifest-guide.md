@@ -118,6 +118,18 @@ rejected at load (recursively through `properties` and `items`) rather than
 silently dropped and left unenforced. A property mapped to an explicit **null**
 subschema (`properties: {id: null}`) is likewise rejected: a null subschema would
 accept any value for the declared property — almost never what the author meant.
+
+The same rule now holds one layer down, for anyone consuming `pkg/capability`
+**as a library**. A condition or directive decoded through the exported
+`ConditionWrapper` / `DirectiveWrapper` seam used to tolerate unknown fields, so
+a caller that built a manifest without going through eunox's own loader could
+silently get a policy wider than written: a typo'd `notAfterr` left a
+`timeWindow` enforcing only its lower bound, and a typo'd `pathss` left a
+`redactFields` directive with an empty path list — which attaches the redaction
+obligation (so the audit record reports a redaction applied) while masking
+nothing. Both now fail closed at decode. Field matching stays case-insensitive,
+exactly as `encoding/json` binds, so this rejects only keys the decoder would
+have ignored outright.
 Use the empty object `{}` for an explicit "any" subschema; only the `null` form is
 refused. The `type` keyword itself must name a real JSON-Schema type (`string`,
 `number`, `integer`, `boolean`, `object`, `array`, `null`) — an empty string, an
@@ -1982,7 +1994,7 @@ degrades the security posture.
 | Draft a manifest from observed usage          | `eunox suggest --output manifest.yaml` (reads the audit tape; grounds entries and `allowedValues` in what the agent actually called — review before enforcing) |
 | Validate a manifest file                      | `eunox validate ./manifest.yaml`                 |
 | Validate multiple manifests at once           | `eunox validate ./a.yaml ./b.yaml`               |
-| Diff a manifest against a live HTTP upstream   | `eunox validate ./manifest.yaml --live --upstream-url <url>` (contract-drift report; exit 0 clean, 1 warnings/stale, 2 connection error) |
+| Diff a manifest against a live HTTP upstream   | `eunox validate ./manifest.yaml --live --upstream-url <url>` (contract-drift report; see the exit codes below) |
 | Diff a manifest against a live stdio upstream  | `eunox validate ./manifest.yaml --live --transport stdio -- <command> [args...]` (introspects a subprocess instead of an HTTP server) |
 | Validate every route in a config (syntax)     | `eunox validate --config ./eunox.yaml` (walks every route's manifest(s); exit code = max across routes) |
 | Validate every route against its live upstream | `eunox validate --config ./eunox.yaml --live` (per-route drift report; no need to re-specify the upstream wiring) |
@@ -1993,6 +2005,20 @@ degrades the security posture.
 | Verify HMAC signatures in the audit log       | `eunox audit-verify --audit-log audit.jsonl --audit-key-path audit.key` |
 | Inspect denial counts (split by posture)      | `eunox stats` (BLOCKED = enforced; OBSERVED = `enforcement: audit` denials that were forwarded — read these before flipping to `enforce`) |
 | Generate a support bundle for a bug report    | `eunox doctor --config eunox.yaml [--live]` — prints redacted binary identity, config, manifest digests, and the last 50 audit records. Nothing leaves your machine; paste the output manually. |
+
+**`eunox validate` exit codes.** Scripted gates branch on these, so they are a
+contract:
+
+| Code | Meaning |
+| ---- | ------- |
+| `0`  | Manifests valid. With `--live`, every entry also matches a live tool. |
+| `1`  | Drift warnings or stale entries — operator review required. **`--live` only**: a syntax-only run never returns 1. |
+| `2`  | Connection, parse, or **usage** error (an unreadable upstream, a malformed manifest, a bad flag, or an invalid flag combination). |
+
+The usage class deliberately shares `2` with parse failures rather than `1`: a
+typo'd flag is not drift, and a CI gate that treats `1` as "review the diff"
+must not be handed that code for a run that validated nothing at all. With
+`--config`, the exit code is the maximum across all routes.
 
 Relative `policy:` paths in a gateway config are resolved against the **config
 file's directory**, not the process working directory — so

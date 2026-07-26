@@ -24,9 +24,9 @@ import (
 func TestSessionCap_ReservationBoundsConcurrentEstablishment(t *testing.T) {
 	t.Parallel()
 
-	const cap = 3
+	const limit = 3
 	const racers = 32
-	p := &HTTPProxy{maxSessions: cap, sessions: map[string]*httpSession{}}
+	p := &HTTPProxy{maxSessions: limit, sessions: map[string]*httpSession{}}
 
 	var (
 		wg       sync.WaitGroup
@@ -46,8 +46,8 @@ func TestSessionCap_ReservationBoundsConcurrentEstablishment(t *testing.T) {
 	}
 	wg.Wait()
 
-	if admitted != cap {
-		t.Fatalf("admitted %d concurrent establishments, want exactly %d (the cap): each admission spawns an upstream", admitted, cap)
+	if admitted != limit {
+		t.Fatalf("admitted %d concurrent establishments, want exactly %d (the cap): each admission spawns an upstream", admitted, limit)
 	}
 	// Every admission is still in flight, so the proxy must refuse further ones even
 	// though the registry is empty — the property a registry-only check lacked.
@@ -133,9 +133,15 @@ func TestSessionCap_FailureAfterRegistrationReleasesExactlyOnce(t *testing.T) {
 
 	p := &HTTPProxy{maxSessions: 2, sessions: map[string]*httpSession{}}
 
-	// Session A and session B both begin establishing.
-	if !p.tryReserveSessionSlot() || !p.tryReserveSessionSlot() {
-		t.Fatal("both reservations should be admitted under cap=2")
+	// Session A and session B both begin establishing. Reserved in separate statements:
+	// `!try() || !try()` short-circuits, so the second reservation would be skipped
+	// exactly when the first failed — the assertion would pass while the state it
+	// describes was never set up.
+	if !p.tryReserveSessionSlot() {
+		t.Fatal("session A's reservation was refused on an empty proxy")
+	}
+	if !p.tryReserveSessionSlot() {
+		t.Fatal("session B's reservation was refused with one slot free under cap=2")
 	}
 	// A registers, then fails its post-registration drift check: the session is torn out
 	// of the registry and the handler returns, releasing A's reservation exactly once.

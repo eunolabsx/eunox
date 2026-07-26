@@ -367,7 +367,7 @@ layer over the config file with a matching CLI flag.
 
 | Concern | Control | Default | Set it with |
 | ------- | ------- | ------- | ----------- |
-| **Runaway sessions** — each session owns an upstream subprocess/connection; an unbounded client could spawn many. | Cap concurrent sessions; a new session past the cap gets `503`. | **512** backstop (set `0` for unlimited, via either knob) | `listen.maxSessions` / `--max-sessions` |
+| **Runaway sessions** — each session owns an upstream subprocess/connection; an unbounded client could spawn many. | Cap concurrent sessions; a new session past the cap gets `503` **before an upstream is spawned** (the slot is reserved across the whole handshake, so racing initializes cannot all spawn first). | **512** backstop (set `0` for unlimited, via either knob) | `listen.maxSessions` / `--max-sessions` |
 | **Idle sessions pinning upstreams** — a session that goes silent holds its upstream open. | Reap a session after it has sent no request for N ms. A session holding an open SSE stream is spared the normal reaper, but only up to a hard ceiling (4× the idle window with no host request), after which it is reaped regardless so a silent SSE-only client cannot pin its upstream indefinitely. | no reaping | `listen.sessionIdleTimeoutMs` / `--session-idle-timeout` |
 | **A hung upstream stalling a handler** | Per-call upstream deadline; on expiry the call returns `UPSTREAM_TIMEOUT`. | **30 s** (pass `0` to disable) | `defaults.upstreamTimeoutMs` / `--upstream-timeout` |
 | **Audit log filling the disk** | Keep at most N rotated files; the oldest are deleted on rotation. | keep all | `audit.retainRotated` / `--audit-retain` |
