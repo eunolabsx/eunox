@@ -865,6 +865,11 @@ type toolsListPage struct {
 // toolsListCursorParams builds the params for one paginated tools/list request: the
 // first page (empty cursor) carries no params; subsequent pages carry
 // {"cursor":"..."} per the MCP pagination model.
+//
+// Unexported: ToolsListRequest is the seam every probe uses (both transport drift
+// probes and the CLI live-upstream probes), and it builds the WHOLE request, so a
+// caller assembling a bare params blob would be bypassing the id/method half of the
+// single-sourcing rather than participating in it.
 func toolsListCursorParams(cursor string) json.RawMessage {
 	if cursor == "" {
 		return nil

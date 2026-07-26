@@ -333,7 +333,7 @@ func (e *Engine) maxCallsBucket(ctx context.Context, cond capability.Condition, 
 
 	// Skip the counter (treating the condition as satisfied) when quota must not be
 	// consumed: --audit observe mode (WithSkipQuota).
-	if skipQuota(ctx) {
+	if SkipQuota(ctx) {
 		return nil, "", true, nil
 	}
 
@@ -359,7 +359,7 @@ func (e *Engine) maxCallsBucket(ctx context.Context, cond capability.Condition, 
 	//
 	// The target type must be in the key because req.ToolName is only the bare name:
 	// a tool "export" and a prompt "export" would otherwise drain one budget.
-	// sessionTargetKey derives the (type, name) pair exactly as recordSessionCall does
+	// sessionTargetKey derives the (type, name) pair exactly as RecordSessionCall does
 	// — prefix from splitEnginePrefix, overridden by Target.Type when set; name from
 	// sessionTargetName — so a direct ValidateAction caller that leaves req.Target nil
 	// keys the same bucket the antecedent record uses, rather than collapsing distinct
@@ -1104,14 +1104,11 @@ func numericEqual(a, b any) bool {
 	return aOK && bOK && fa == fb
 }
 
-// int64 bounds expressed as float64. 2^63 is exactly representable in float64, so
-// the half-open guard [minInt64Float, twoTo63Float) admits exactly the floats
-// that convert to a valid int64 without overflow.
-const (
-	minInt64Float = -9223372036854775808.0 // -2^63
-	twoTo63Float  = 9223372036854775808.0  // 2^63 (one past math.MaxInt64)
-	maxInt64Uint  = uint64(1<<63 - 1)      // math.MaxInt64
-)
+// maxInt64Uint is math.MaxInt64 as a uint64, for the unsigned arms of asInt64. The
+// float64 range bounds that used to sit here live in pkg/capability alongside
+// FloatToInt64, the single definition of "exactly representable as an int64" this
+// package's comparison and that package's manifest-load validation now share.
+const maxInt64Uint = uint64(1<<63 - 1)
 
 // asInt64 reports the int64 value of v when v holds an integer: any signed/unsigned
 // integer within int64 range, a json.Number parsing as an integer, or an integral
@@ -1127,7 +1124,7 @@ func asInt64(v any) (int64, bool) {
 			return i, true
 		}
 		if f, err := n.Float64(); err == nil {
-			return floatToInt64(f)
+			return capability.FloatToInt64(f)
 		}
 	case int:
 		return int64(n), true
@@ -1154,25 +1151,11 @@ func asInt64(v any) (int64, bool) {
 			return int64(n), true
 		}
 	case float32:
-		return floatToInt64(float64(n))
+		return capability.FloatToInt64(float64(n))
 	case float64:
-		return floatToInt64(n)
+		return capability.FloatToInt64(n)
 	}
 	return 0, false
-}
-
-// floatToInt64 returns f as an int64 when f is integral and within int64 range,
-// reporting false otherwise. The range is guarded before the conversion because a
-// float outside int64 range converts to an implementation-defined value in Go.
-func floatToInt64(f float64) (int64, bool) {
-	if f < minInt64Float || f >= twoTo63Float {
-		return 0, false
-	}
-	i := int64(f)
-	if float64(i) != f { // f carried a fractional part
-		return 0, false
-	}
-	return i, true
 }
 
 // toFloat64 converts any Go numeric type to float64, reporting false for
@@ -1219,7 +1202,7 @@ func toFloat64(v any) (float64, bool) {
 //
 // Known limitation — concurrent same-session requests: the antecedent check
 // (history.Peek on the antecedent tool's key) and the recording of an antecedent's
-// call (recordSessionCall's IncrementAndGet on that tool's key, on a SEPARATE
+// call (RecordSessionCall's IncrementAndGet on that tool's key, on a SEPARATE
 // request) are not atomic, so firing the antecedent and the blocked tool
 // concurrently on one session can let the blocked tool Peek empty history and slip
 // through. This is intrinsic to two independent requests racing; only per-session
@@ -1256,7 +1239,7 @@ func (e *Engine) handleSequenceBlock(ctx context.Context, cond capability.Condit
 	// its own.
 	var emptyAfterTools []string
 	for _, prior := range sb.AfterTools {
-		if strings.TrimSpace(stripEnginePrefix(prior)) == "" {
+		if strings.TrimSpace(StripEnginePrefix(prior)) == "" {
 			emptyAfterTools = append(emptyAfterTools, prior)
 		}
 	}
@@ -1292,7 +1275,7 @@ func (e *Engine) handleSequenceBlock(ctx context.Context, cond capability.Condit
 
 	history := e.counter // non-nil: the e.counter == nil guard above already denied
 
-	// Resolve the blocked target's namespace as recordSessionCall does: prefer the
+	// Resolve the blocked target's namespace as RecordSessionCall does: prefer the
 	// explicit req.Target.Type, falling back to the req.ToolName prefix (bare
 	// defaults to "tool"), and to req.Target.Name when req.ToolName is empty
 	// (resource/prompt requests carry the identifier there). Reporting in
@@ -1316,7 +1299,7 @@ func (e *Engine) handleSequenceBlock(ctx context.Context, cond capability.Condit
 	}
 	for _, prior := range sb.AfterTools {
 		// Resolve each antecedent's namespace from its prefix (bare defaults to
-		// "tool"), mirroring recordSessionCall, so afterTools: [export] matches only
+		// "tool"), mirroring RecordSessionCall, so afterTools: [export] matches only
 		// the tool and [prompt:export] only the prompt. Trim whitespace so a padded
 		// "export " still matches the recorded name. No empty-name guard is needed —
 		// the pre-check above guaranteed priorTool is non-empty. Report by namespace

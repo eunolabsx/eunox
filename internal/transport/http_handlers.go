@@ -97,6 +97,13 @@ const (
 	codeLoopbackRejected = "LOOPBACK_REJECTED"
 )
 
+// MethodControlKill is the audit `method` stamped on the record for a successful
+// /control/kill activation. It is deliberately NOT an MCP method: the kill endpoint is
+// eunox's own administrative surface, so deriveTargetFields finds no target type for it
+// and leaves target_type/target empty rather than fabricating one. Exported so a SIEM
+// rule and the audit reader agree on the one spelling.
+const MethodControlKill = "control/kill"
+
 // JSON-RPC 2.0 error codes used for callUpstream-error responses.
 const (
 	jsonRPCCodeInvalidRequest = -32600

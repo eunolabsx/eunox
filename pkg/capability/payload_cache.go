@@ -250,8 +250,13 @@ func (c *PayloadCache[T]) Put(key string, payload T, expUnix int64) {
 	c.entries[key] = entry
 }
 
-// Invalidate removes a specific key immediately, called on explicit revocation so the
-// cached entry does not outlive the revocation. Removal is O(1). Nil-receiver safe.
+// Invalidate removes a specific key immediately. Removal is O(1). Nil-receiver safe.
+//
+// NOTE: eunox itself never calls this — nothing in the proxy learns of a revocation
+// out of band, so the only revocation bound it offers today is the entry TTL
+// (min(MaxEntryTTL, the token's own exp)). This is library API for an embedder that
+// DOES have such a signal; do not read its existence as evidence that a revocation
+// feed is wired.
 func (c *PayloadCache[T]) Invalidate(key string) {
 	if c == nil {
 		return

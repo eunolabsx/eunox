@@ -1075,9 +1075,9 @@ func TestRotateReopenFallbackStillPrunes(t *testing.T) {
 		t.Fatalf("newest historical sibling (retain=1) must survive: %v", err)
 	}
 
-	matches, err := rotatedSiblings(logPath)
+	matches, _, err := scanLogDir(logPath)
 	if err != nil {
-		t.Fatalf("rotatedSiblings: %v", err)
+		t.Fatalf("scanLogDir: %v", err)
 	}
 	var rotatedCount int
 	for _, m := range matches {

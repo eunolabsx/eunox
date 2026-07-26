@@ -663,6 +663,39 @@ func TestBreaker_StatsReportsLogicalStateAfterCooldown(t *testing.T) {
 	}
 }
 
+// TestNew_ClampsEveryDegenerateField pins the package's single config policy — New
+// clamps, nothing rejects — field by field. Each case leaves exactly one field
+// non-positive (plus an all-negative case), and the resulting breaker must carry the
+// DefaultConfig value for it while keeping the caller's positive fields untouched.
+func TestNew_ClampsEveryDegenerateField(t *testing.T) {
+	def := DefaultConfig()
+	cases := []Config{
+		{FailureThreshold: 0, CooldownDuration: time.Second, HalfOpenMaxProbes: 1},
+		{FailureThreshold: 1, CooldownDuration: 0, HalfOpenMaxProbes: 1},
+		{FailureThreshold: 1, CooldownDuration: time.Second, HalfOpenMaxProbes: 0},
+		{FailureThreshold: -1, CooldownDuration: -1, HalfOpenMaxProbes: -1},
+	}
+	for i, cfg := range cases {
+		got := New(cfg).config
+		if got.FailureThreshold <= 0 || got.CooldownDuration <= 0 || got.HalfOpenMaxProbes <= 0 {
+			t.Errorf("case %d: New(%+v) left a non-positive field: %+v", i, cfg, got)
+		}
+		if cfg.FailureThreshold <= 0 && got.FailureThreshold != def.FailureThreshold {
+			t.Errorf("case %d: FailureThreshold = %d, want the default %d", i, got.FailureThreshold, def.FailureThreshold)
+		}
+		if cfg.CooldownDuration <= 0 && got.CooldownDuration != def.CooldownDuration {
+			t.Errorf("case %d: CooldownDuration = %v, want the default %v", i, got.CooldownDuration, def.CooldownDuration)
+		}
+		if cfg.HalfOpenMaxProbes <= 0 && got.HalfOpenMaxProbes != def.HalfOpenMaxProbes {
+			t.Errorf("case %d: HalfOpenMaxProbes = %d, want the default %d", i, got.HalfOpenMaxProbes, def.HalfOpenMaxProbes)
+		}
+		// A positive field the caller chose must survive untouched.
+		if cfg.FailureThreshold > 0 && got.FailureThreshold != cfg.FailureThreshold {
+			t.Errorf("case %d: clamped a positive FailureThreshold %d to %d", i, cfg.FailureThreshold, got.FailureThreshold)
+		}
+	}
+}
+
 // TestNewSanitizesDegenerateConfig verifies that New replaces non-positive
 // fields with DefaultConfig values instead of producing a breaker that trips on
 // the first failure with no cooldown.

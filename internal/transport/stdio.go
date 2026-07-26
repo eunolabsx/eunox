@@ -1348,9 +1348,15 @@ func awaitNonced(
 func (p *StdioProxy) callUpstream(ctx context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, error) {
 	ctx, cancel := p.withUpstreamTimeout(ctx)
 	defer cancel()
-	// NewStdioProxy initializes byUpstreamID, so this lazy init only fires for a
+	// NewStdioProxy initializes these, so this lazy init only fires for a
 	// test-assembled proxy; under pendingMu so it cannot race awaitNonced/readUpstream.
+	// pending is initialized here too: awaitNonced receives the maps BY VALUE and
+	// writes pending[hostKey] unconditionally, so a nil pending panicked on exactly
+	// the test-assembled proxy this block exists to accommodate.
 	p.pendingMu.Lock()
+	if p.pending == nil {
+		p.pending = make(map[string]chan upstreamResult)
+	}
 	if p.byUpstreamID == nil {
 		p.byUpstreamID = make(map[string]chan upstreamResult)
 	}

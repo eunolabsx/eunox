@@ -20,7 +20,7 @@ import (
 )
 
 // faultOnIncrementCounter fails every IncrementAndGet — the sequenceBlock antecedent write
-// recordSessionCall performs — so the atomic source-call commit's SECOND write faults after
+// RecordSessionCall performs — so the atomic source-call commit's SECOND write faults after
 // the flow-label write has already committed. The other methods are inert (unused on this
 // path). It is the fault injector for the atomic-commit rollback test.
 type faultOnIncrementCounter struct{}
@@ -61,7 +61,7 @@ func TestFlowHardening_AtomicCommitRollsBackOnSeqFault(t *testing.T) {
 			ctx := context.Background()
 			store := tc.store(t)
 
-			// A source that labels its output (the flow write). recordSessionCall is NOT
+			// A source that labels its output (the flow write). RecordSessionCall is NOT
 			// skipped (no WithoutAntecedentRecording), so the seq antecedent write runs after
 			// the flow write and faults on the injected counter.
 			eng := New(WithCallCounter(faultOnIncrementCounter{}), WithFlowLabelStore(store))

@@ -357,6 +357,60 @@ func TestRedis_IncrementIfBelow_AdmitsUpToLimit(t *testing.T) {
 	assert.Greater(t, retry, time.Duration(0), "a denied call should report a retryAfter hint")
 }
 
+// TestRedis_IncrementIfBelow_AtomicUnderConcurrency pins the single-bucket maxCalls
+// admission bound on the Redis backend, mirroring the in-memory sibling: N racing
+// callers against a limit of L admit exactly L, never more. This is the PRIMARY maxCalls
+// path, and Redis is the backend where over-admission is most plausible — the
+// check-and-increment spans a network round trip, so it is atomic only because it runs
+// as one server-side script. A regression that split the check from the increment would
+// admit more than L here while every sequential test still passed.
+func TestRedis_IncrementIfBelow_AtomicUnderConcurrency(t *testing.T) {
+	cases := []struct {
+		name  string
+		limit int64
+	}{
+		{"limit-1", 1},
+		{"limit-5", 5},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			mr := miniredis.RunT(t)
+			client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+			t.Cleanup(func() { _ = client.Close() })
+
+			counter := callcounter.NewRedis(client)
+			ctx := context.Background()
+
+			const goroutines = 64
+			var (
+				mu          sync.Mutex
+				admittedCnt int
+				start       = make(chan struct{})
+				wg          sync.WaitGroup
+			)
+			wg.Add(goroutines)
+			for i := 0; i < goroutines; i++ {
+				go func() {
+					defer wg.Done()
+					<-start
+					_, admitted, _, err := counter.IncrementIfBelow(ctx, "k", 60, tc.limit)
+					if err == nil && admitted {
+						mu.Lock()
+						admittedCnt++
+						mu.Unlock()
+					}
+				}()
+			}
+			close(start)
+			wg.Wait()
+
+			assert.Equal(t, int(tc.limit), admittedCnt,
+				"exactly the limit may be admitted concurrently, never more (a higher count is a maxCalls bypass)")
+		})
+	}
+}
+
 func TestRedis_IncrementIfBelow_RejectsOutOfRangeWindow(t *testing.T) {
 	mr := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
