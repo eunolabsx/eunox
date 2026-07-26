@@ -152,14 +152,15 @@ func ValidateValueGlob(pattern string) error {
 	if strings.Contains(pattern, "**") && strings.Count(pattern, "/") >= maxGlobSegments {
 		return fmt.Errorf("%w: pattern has more than %d path segments, exceeding the runtime match cap; the grant would match nothing", path.ErrBadPattern, maxGlobSegments)
 	}
-	// A path-style pattern containing a "."/".." segment can never match: the
-	// runtime confinement scan rejects any value with such a segment first, so the
-	// pattern loads clean but is a silently dead, deny-all grant. Reject it.
-	if strings.Contains(pattern, "/") {
-		for _, seg := range strings.Split(pattern, "/") {
-			if seg == "." || seg == ".." {
-				return fmt.Errorf("%w: path-style pattern contains an unmatchable %q segment", path.ErrBadPattern, seg)
-			}
+	// A pattern segment that is exactly "."/".." can never match: the runtime
+	// confinement scan rejects any value whose corresponding segment decodes to one
+	// first, so the pattern loads clean but is a silently dead, deny-all grant.
+	// Applied to a slashless pattern too — it is a single segment, and
+	// confineSlashlessPattern rejects a "."/".." value the same way the path-style
+	// branch does — so load-time rejection and runtime denial stay in lock-step.
+	for _, seg := range strings.Split(pattern, "/") {
+		if seg == "." || seg == ".." {
+			return fmt.Errorf("%w: pattern contains an unmatchable %q segment", path.ErrBadPattern, seg)
 		}
 	}
 	// Without a "**" the runtime is exactly path.Match on the whole pattern.
@@ -287,6 +288,13 @@ func confinePathStylePattern(pattern, value string) (folded string, valSpansSep 
 // filename char for a non-decoding upstream, so it folds only '\' and matches the
 // literal form — but still denies when a VALID encoded separator rides alongside the
 // bad escape ("..%2f..%2fetc%zz"), which a lenient upstream would resolve.
+//
+// A bare "."/".." is denied for the same reason confinePathStylePattern denies it
+// segment-by-segment: it names the tool's working directory or its PARENT, so a
+// slashless grant an operator wrote to scope one segment (e.g. ".*" for dotfiles
+// like ".env", or "??") would otherwise also admit the traversal value "..", which
+// the upstream resolves outside the intended directory. The '/'-count guard alone
+// does not catch it — ".." carries no separator — so the dot check must be explicit.
 func confineSlashlessPattern(value string) bool {
 	scan, err := decodePathForConfinement(value)
 	if errors.Is(err, errPathNUL) {
@@ -298,7 +306,12 @@ func confineSlashlessPattern(value string) bool {
 		}
 		scan = strings.ReplaceAll(value, "\\", "/")
 	}
-	return strings.Count(scan, "/") == 0
+	if strings.Count(scan, "/") != 0 {
+		return false
+	}
+	// scan is now known to hold no '/', so it is exactly one segment: applying the
+	// path-style branch's per-segment dot rule to it is the same rule, not a new one.
+	return scan != "." && scan != ".."
 }
 
 // MatchValueGlob reports whether an argument value matches an allowedValues glob.

@@ -176,14 +176,10 @@ func scanLogDir(logPath string) (siblings []string, hasActive bool, err error) {
 }
 
 // sortedRotatedSiblings returns logPath's genuine rotated siblings
-// ("<logPath>.<ordinal>.<timestamp>Z"), filtered through rotatedAuditRe and ordered
-// by the monotonic rotation ordinal (timestamp base only as a legacy tiebreak), then
-// numeric collision suffix. Folding the
-// scan, filter, and sort here keeps newestRotatedSiblingWithTail, LogChainFiles, and
-// pruneRotated in lockstep, so a change to the rotated-naming scheme can't leave
-// one caller out of step. The filter drops unrelated "<base>." names
-// (audit.jsonl.bak, .lock, ...) so they can't seed the resumed chain or burn a
-// retention slot.
+// ("<logPath>.<ordinal>.<timestamp>Z"), filtered and ordered by the monotonic rotation
+// ordinal (timestamp base only as a legacy tiebreak), then numeric collision suffix.
+// The filter drops unrelated "<base>." names (audit.jsonl.bak, .lock, ...) so they
+// can't seed the resumed chain or burn a retention slot.
 func sortedRotatedSiblings(logPath string) ([]string, error) {
 	files, _, err := sortedRotatedSiblingsWithBase(logPath)
 	return files, err

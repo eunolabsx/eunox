@@ -57,6 +57,18 @@ func TestMsgKey_StringID(t *testing.T) {
 // existed for the old directly-constructed literals. The cancel is not registered with a
 // cleanup: a leaked cancelCtx spawns no goroutine and is reclaimed at process exit, and
 // tests exercising teardown call sess.close (which cancels it) themselves.
+// newBareTestRoute builds the minimal *UpstreamRoute a directly-constructed proxy
+// needs to drive handleMCPGet/handleMCPDelete. Those handlers dereference route
+// unconditionally — handleMCP 404s an unknown route before dispatch, so production
+// never passes nil, and a defensive nil guard there would be a fail-open branch
+// skipping the audience pin, the owner binding, and the kill check. Tests that build
+// a proxy by hand (rather than via newHTTPProxy) supply this instead: no audience
+// pin, no session-owner binding, and an allow-all PDP whose CheckKill never denies,
+// so the gates run for real and simply pass.
+func newBareTestRoute() *UpstreamRoute {
+	return &UpstreamRoute{name: "test", pdp: pdp.AlwaysAllowPDP{}}
+}
+
 func newTestSession(s *httpSession) *httpSession {
 	ctx, cancel := context.WithCancel(context.Background())
 	s.sessCtx, s.sessCancel = ctx, cancel
@@ -94,9 +106,11 @@ func TestHTTPHandleMCPGet_NoFlusher(t *testing.T) {
 	proxy := &HTTPProxy{
 		sessions: make(map[string]*httpSession),
 	}
+	route := newBareTestRoute()
 	sess := newTestSession(&httpSession{
-		id:   "known-sess",
-		done: make(chan struct{}),
+		id:    "known-sess",
+		route: route,
+		done:  make(chan struct{}),
 	})
 	proxy.mu.Lock()
 	proxy.sessions[sess.id] = sess
@@ -106,7 +120,7 @@ func TestHTTPHandleMCPGet_NoFlusher(t *testing.T) {
 	req.Header.Set(SessionHeader, "known-sess")
 	// noFlushWriter does NOT implement http.Flusher → should return 500.
 	w := newNoFlushWriter()
-	proxy.handleMCPGet(w, req, nil)
+	proxy.handleMCPGet(w, req, route)
 	if w.code != http.StatusInternalServerError {
 		t.Errorf("expected 500 for non-Flusher ResponseWriter, got %d", w.code)
 	}
@@ -120,9 +134,11 @@ func TestHTTPHandleMCPGet_KnownSession_Done(t *testing.T) {
 	}
 	done := make(chan struct{})
 	close(done) // immediately done → select picks <-sess.done
+	route := newBareTestRoute()
 	sess := newTestSession(&httpSession{
-		id:   "done-sess",
-		done: done,
+		id:    "done-sess",
+		route: route,
+		done:  done,
 	})
 	proxy.mu.Lock()
 	proxy.sessions[sess.id] = sess
@@ -131,7 +147,7 @@ func TestHTTPHandleMCPGet_KnownSession_Done(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/mcp", http.NoBody)
 	req.Header.Set(SessionHeader, "done-sess")
 	w := httptest.NewRecorder() // implements Flusher → SSE path
-	proxy.handleMCPGet(w, req, nil)
+	proxy.handleMCPGet(w, req, route)
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200 for SSE stream, got %d", w.Code)
 	}
@@ -145,8 +161,10 @@ func TestHTTPHandleMCPDelete_KnownSession(t *testing.T) {
 		sessions:   make(map[string]*httpSession),
 		shutdownMs: 50,
 	}
+	route := newBareTestRoute()
 	sess := newTestSession(&httpSession{
 		id:           "del-sess",
+		route:        route,
 		done:         make(chan struct{}),
 		upHTTPClient: &http.Client{}, // remote mode → close() just closes done
 	})
@@ -157,7 +175,7 @@ func TestHTTPHandleMCPDelete_KnownSession(t *testing.T) {
 	req := httptest.NewRequest(http.MethodDelete, "/mcp", http.NoBody)
 	req.Header.Set(SessionHeader, "del-sess")
 	w := httptest.NewRecorder()
-	proxy.handleMCPDelete(w, req, nil)
+	proxy.handleMCPDelete(w, req, route)
 	if w.Code != http.StatusNoContent {
 		t.Errorf("expected 204, got %d", w.Code)
 	}
@@ -4769,7 +4787,7 @@ func TestHTTPHandleMCPGet_NoSessionHeader(t *testing.T) {
 	}
 	req := httptest.NewRequest(http.MethodGet, "/mcp", http.NoBody)
 	w := httptest.NewRecorder()
-	proxy.handleMCPGet(w, req, nil)
+	proxy.handleMCPGet(w, req, newBareTestRoute())
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("expected 400 for missing session header, got %d", w.Code)
 	}
@@ -4783,7 +4801,7 @@ func TestHTTPHandleMCPGet_UnknownSession(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/mcp", http.NoBody)
 	req.Header.Set(SessionHeader, "no-such-session")
 	w := httptest.NewRecorder()
-	proxy.handleMCPGet(w, req, nil)
+	proxy.handleMCPGet(w, req, newBareTestRoute())
 	if w.Code != http.StatusNotFound {
 		t.Errorf("expected 404 for unknown session, got %d", w.Code)
 	}
@@ -4798,7 +4816,7 @@ func TestHTTPHandleMCPDelete_NoSessionHeader(t *testing.T) {
 	}
 	req := httptest.NewRequest(http.MethodDelete, "/mcp", http.NoBody)
 	w := httptest.NewRecorder()
-	proxy.handleMCPDelete(w, req, nil)
+	proxy.handleMCPDelete(w, req, newBareTestRoute())
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("expected 400 for missing session, got %d", w.Code)
 	}
@@ -4812,7 +4830,7 @@ func TestHTTPHandleMCPDelete_UnknownSession(t *testing.T) {
 	req := httptest.NewRequest(http.MethodDelete, "/mcp", http.NoBody)
 	req.Header.Set(SessionHeader, "no-such")
 	w := httptest.NewRecorder()
-	proxy.handleMCPDelete(w, req, nil)
+	proxy.handleMCPDelete(w, req, newBareTestRoute())
 	if w.Code != http.StatusNotFound {
 		t.Errorf("expected 404 for unknown session, got %d", w.Code)
 	}

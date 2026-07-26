@@ -307,6 +307,14 @@ func effectiveLeeway(configured time.Duration) time.Duration {
 	return capability.EffectiveLeeway(configured)
 }
 
+// jwtLogger pins JWT/JWKS logging to stderr: stdout is the JSON-RPC channel in stdio
+// mode, so logging must never inherit a slog default that could corrupt the framing.
+// Package-level so the constructor's misconfiguration warnings and the parser-drift
+// warnings in parseCapHeads (which has no receiver to reach a field) emit through the
+// SAME handler — those drift warnings used to be raw fmt.Fprintf lines, unstructured
+// and impossible to correlate in a SIEM alongside every other line this package emits.
+var jwtLogger = slog.New(slog.NewTextHandler(os.Stderr, nil))
+
 // NewJWTPDP creates a JWTPDP ready to validate tokens.
 func NewJWTPDP(opts JWTPDPOptions) *JWTPDP {
 	// Default breaker so the shipped proxy always has JWKS-fetch protection;
@@ -315,9 +323,7 @@ func NewJWTPDP(opts JWTPDPOptions) *JWTPDP {
 	if breaker == nil {
 		breaker = circuitbreaker.New(circuitbreaker.DefaultConfig())
 	}
-	// Pin JWT/JWKS logging to stderr: stdout is the JSON-RPC channel in stdio mode,
-	// so logging must never inherit a slog default that could corrupt the framing.
-	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	logger := jwtLogger
 	if normalizeAudience(opts.Audience) == "" && len(sanitizeAudiences(opts.AcceptedAudiences)) == 0 && !opts.AllowAnyAudience {
 		// No audience pinned but not opted out: EVERY token is rejected regardless of
 		// its aud claim (fail closed), mirroring the issuer check below — there is no
@@ -1516,21 +1522,25 @@ type capHead struct {
 // before it reaches this function. So a drop means the validator and this parser have
 // diverged (e.g. a future grammar extension landed in one but not the other), which
 // would silently grant fewer capabilities than the token encodes — fail-closed in
-// result, but invisible. Each drop is logged to stderr so that regression is observable
-// rather than surfacing only as unexplained AUTHORIZATION_FAILED denials downstream.
+// result, but invisible. Each drop is logged through jwtLogger — the same structured
+// stderr handler the rest of this package uses, so the drop is greppable and
+// correlatable in a SIEM — rather than surfacing only as unexplained
+// AUTHORIZATION_FAILED denials downstream.
 func parseCapHeads(caps []string) []capHead {
 	heads := make([]capHead, 0, len(caps))
 	for _, claim := range caps {
 		namepart, condpart, hadSep := splitV2Claim(claim)
 		if hadSep && condpart == "" {
 			// Trailing '?' with no pairs: malformed (ValidateToken already rejects it).
-			fmt.Fprintf(os.Stderr, "[eunox] JWT: capability claim %q passed validation but failed to parse (trailing '?' with no conditions); dropping (this is a bug)\n", claim)
+			jwtLogger.Warn("JWT capability claim passed validation but failed to parse; dropping (this is a bug)",
+				"claim", claim, "reason", "trailing '?' with no conditions")
 			continue
 		}
 		prefix, bareName, err := capability.ParseTarget(namepart)
 		if err != nil {
 			// Claims were validated at token-validation time; should not occur.
-			fmt.Fprintf(os.Stderr, "[eunox] JWT: capability claim %q passed validation but failed to parse (%v); dropping (this is a bug)\n", claim, err)
+			jwtLogger.Warn("JWT capability claim passed validation but failed to parse; dropping (this is a bug)",
+				"claim", claim, "reason", err.Error())
 			continue
 		}
 		heads = append(heads, capHead{prefix: prefix, bareName: bareName, condpart: condpart})

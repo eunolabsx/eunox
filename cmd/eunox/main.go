@@ -1269,13 +1269,13 @@ func resolveOAuthMetadata(cfg *config.GatewayConfig, pf proxyFlags) (*transport.
 	var validateAuthz bool
 	switch {
 	case len(cfg.Listen.OAuthAuthorizationServers) > 0:
-		if pf.oauthAuthzServer != "" {
-			// Same silent-override hazard as the resource URI above: warn rather than
-			// drop the operator's flag without a word.
-			fmt.Fprintf(os.Stderr, "[eunox] WARNING: --oauth-authz-server %q is overridden by the config's listen.oauthAuthorizationServers; the config takes precedence.\n", pf.oauthAuthzServer)
-		}
 		oauthAuthzServers = cfg.Listen.OAuthAuthorizationServers
 		validateAuthz = true
+		if pf.oauthAuthzServer != "" && (len(oauthAuthzServers) != 1 || oauthAuthzServers[0] != pf.oauthAuthzServer) {
+			// Same rule as the resource URI above: config wins, but an explicitly-passed
+			// flag is never discarded in silence.
+			fmt.Fprintf(os.Stderr, "[eunox] WARNING: --oauth-authz-server=%q is overridden by listen.oauthAuthorizationServers=%v from the config file; the config value is published.\n", pf.oauthAuthzServer, oauthAuthzServers)
+		}
 	case pf.oauthAuthzServer != "":
 		oauthAuthzServers = []string{pf.oauthAuthzServer}
 		validateAuthz = true

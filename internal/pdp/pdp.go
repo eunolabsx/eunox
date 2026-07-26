@@ -187,6 +187,48 @@ func CountListEntries(method string, result json.RawMessage) int {
 	return countListEntries(result, key)
 }
 
+// listDecodeOutcome classifies how far decodeListEntries got. The failures are kept
+// DISTINCT rather than folded into one "not ok" because the two callers must react
+// differently: countListEntries reports 0 for all of them, while armPinsFromToolsList
+// treats an unreadable envelope or array as ambiguous (poison every pin) but a plainly
+// absent key as benign (a host renders no tools from it).
+type listDecodeOutcome int
+
+const (
+	listDecodeOK          listDecodeOutcome = iota // entries decoded (possibly an empty array)
+	listDecodeEmptyResult                          // no result bytes at all
+	listDecodeBadEnvelope                          // result is not a JSON object
+	listDecodeKeyAbsent                            // object decoded, but carries no fieldName key
+	listDecodeBadArray                             // fieldName present but not an array of entries
+)
+
+// decodeListEntries decodes a */list result envelope down to the entry array under
+// fieldName, returning the entries and an outcome the caller switches on. Ambiguity in
+// the envelope itself (a duplicate or case-variant fieldName key) is NOT this
+// function's concern — callers that care check it separately via toolsKeyAmbiguous,
+// which re-scans the raw bytes rather than the already-folded decode below.
+//
+// One decode contract for both consumers: the length-only countListEntries and the
+// pin-arming walk previously spelled this same envelope→lookup→array sequence out
+// separately, so a change to how a list envelope is read had to be made twice.
+func decodeListEntries(result json.RawMessage, fieldName string) (entries []json.RawMessage, outcome listDecodeOutcome) {
+	if len(result) == 0 {
+		return nil, listDecodeEmptyResult
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(result, &envelope); err != nil {
+		return nil, listDecodeBadEnvelope
+	}
+	rawArray, ok := envelope[fieldName]
+	if !ok {
+		return nil, listDecodeKeyAbsent
+	}
+	if err := json.Unmarshal(rawArray, &entries); err != nil {
+		return nil, listDecodeBadArray
+	}
+	return entries, listDecodeOK
+}
+
 // countListEntries returns the number of entries in the fieldName array of a
 // */list result envelope, or 0 for an empty/absent/unparseable result. It backs
 // the exported CountListEntries (the audit/wiretap best-effort entry count); the
@@ -194,22 +236,8 @@ func CountListEntries(method string, result json.RawMessage) int {
 // key-ordered envelope decode instead, so they preserve sibling fields and key
 // order, so this stays a length-only helper.
 func countListEntries(result json.RawMessage, fieldName string) int {
-	if len(result) == 0 {
-		return 0
-	}
-	var envelope map[string]json.RawMessage
-	if err := json.Unmarshal(result, &envelope); err != nil {
-		return 0
-	}
-	rawArray, ok := envelope[fieldName]
-	if !ok {
-		return 0
-	}
-	var entries []json.RawMessage
-	if err := json.Unmarshal(rawArray, &entries); err != nil {
-		return 0
-	}
-	return len(entries)
+	entries, _ := decodeListEntries(result, fieldName)
+	return len(entries) // nil on every failure outcome, so no branch is needed
 }
 
 // passThroughList wraps an unfiltered */list result as a ListFilterResult,
@@ -1206,39 +1234,33 @@ func (p *ManifestPDP) findConstraint(target EnforceTarget, claims map[string]int
 		}
 		s := bareSpecificity(pt.bare, target.Name)
 		hasPrincipal := c.HasPrincipal()
-		fallback.offer(i, s, hasPrincipal)
+		fallback.Offer(i, s, hasPrincipal)
 		if containsAction(c.Actions, required) {
-			primary.offer(i, s, hasPrincipal)
+			primary.Offer(i, s, hasPrincipal)
 		}
 	}
-	if primary.best >= 0 {
-		return &p.caps[primary.best]
+	if primary.Best() >= 0 {
+		return &p.caps[primary.Best()]
 	}
-	if fallback.best >= 0 {
-		return &p.caps[fallback.best]
+	if fallback.Best() >= 0 {
+		return &p.caps[fallback.Best()]
 	}
 	return nil
 }
 
-// constraintScorer tracks the best-scoring constraint index seen so far under
-// findConstraint's tiebreak: higher target specificity wins, and at equal
-// specificity a principal-scoped entry beats a general one, regardless of manifest
-// order. Shared by findConstraint's primary and fallback trackers so the tiebreak
-// lives in one place across a single scan.
-type constraintScorer struct {
-	best      int
-	bestScore int
-	bestPrin  bool
-}
-
-func newConstraintScorer() constraintScorer {
-	return constraintScorer{best: -1, bestScore: -(1 << 30)}
-}
-
-func (cs *constraintScorer) offer(i, score int, hasPrincipal bool) {
-	if score > cs.bestScore || (score == cs.bestScore && hasPrincipal && !cs.bestPrin) {
-		cs.bestScore, cs.best, cs.bestPrin = score, i, hasPrincipal
-	}
+// newConstraintScorer returns the shared constraint-selection tiebreak tracker
+// (enforcement.ConstraintScorer): higher target specificity wins, and at equal
+// specificity a principal-scoped entry beats a general one regardless of manifest
+// order. findConstraint uses one for its primary scan and one for its fallback.
+//
+// It delegates rather than reimplementing: this predicate used to be a
+// character-for-character copy of the engine's, so a precedence change made in one
+// place would have left the proxy and the engine selecting different constraints for
+// the same request — a silent policy divergence, not a cosmetic duplication. The
+// scores fed in here are unscaled while the engine scales by its resourceScoreWeight;
+// that is a monotonic transform, so every comparison the scorer makes is unaffected.
+func newConstraintScorer() enforcement.ConstraintScorer {
+	return enforcement.NewConstraintScorer()
 }
 
 // matchBare reports whether the bare pattern (namespace prefix stripped) matches
@@ -2126,19 +2148,19 @@ func (p *ManifestPDP) RecordObservedToolHashes(_ context.Context, result json.Ra
 //     poisons every pin, because no entry in it can be believed. A plainly absent tools
 //     key is not ambiguous: a host renders no tools from it, so nothing is poisoned.
 func (p *ManifestPDP) armPinsFromToolsList(result json.RawMessage) (entryCount int) {
-	if len(result) == 0 {
-		return 0
-	}
 	pinned := len(p.pinnedTools) > 0
-	var envelope map[string]json.RawMessage
-	if err := json.Unmarshal(result, &envelope); err != nil {
+	entries, outcome := decodeListEntries(result, listKeyTools)
+	switch outcome {
+	case listDecodeEmptyResult:
+		// No bytes at all: nothing was rendered to a host, so nothing is ambiguous.
+		return 0
+	case listDecodeBadEnvelope, listDecodeBadArray:
+		// The envelope or its array is unreadable, so no entry in it can be believed.
 		if pinned {
 			p.poisonAllPinned()
 		}
 		return 0
-	}
-	rawArray, ok := envelope[listKeyTools]
-	if !ok {
+	case listDecodeKeyAbsent:
 		// No exact "tools" key. toolsKeyAmbiguous also catches a case-variant sibling
 		// ("Tools") that still decodes for a host whose reader binds it
 		// case-insensitively, and the proxy cannot tell what that host sees, so treat it
@@ -2147,13 +2169,7 @@ func (p *ManifestPDP) armPinsFromToolsList(result json.RawMessage) (entryCount i
 			p.poisonAllPinned()
 		}
 		return 0
-	}
-	var entries []json.RawMessage
-	if err := json.Unmarshal(rawArray, &entries); err != nil {
-		if pinned {
-			p.poisonAllPinned()
-		}
-		return 0
+	case listDecodeOK:
 	}
 	if !pinned {
 		// Nothing to record or protect: skip the per-entry scan and decode entirely rather

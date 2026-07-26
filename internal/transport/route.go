@@ -17,6 +17,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/eunolabs/eunox/internal/audit"
 	"github.com/eunolabs/eunox/internal/config"
@@ -44,7 +45,7 @@ type UpstreamRoute struct {
 	pdp        pdp.PolicyDecisionPoint
 	manifest   *config.LocalManifest // nil when no policy is configured (audit/observe only)
 	audit      bool                  // observe mode: evaluate and log, but forward instead of block
-	driftCheck drift.CheckFunc       // set from package main after BuildRoutes; nil = no drift checking
+	driftCheck drift.CheckFunc       // set inside BuildRoutes from its driftCheckFor hook; nil = no drift checking
 
 	// serializeDecisions is set when the route's policy is flow- or sequenceBlock-relevant,
 	// so each of its sessions serializes its decision phase (the PDP decision + state
@@ -65,7 +66,17 @@ type UpstreamRoute struct {
 	// fresh handshake per session. Idle-conn accumulation under session churn is bounded
 	// by the transport's IdleConnTimeout/MaxIdleConnsPerHost, not a per-session
 	// CloseIdleConnections. nil for a stdio route (and until the first remote session).
-	upstreamTransport     *http.Transport
+	//
+	// Atomic rather than a plain field because the two accessors run concurrently at
+	// shutdown: closeIdleUpstreamConns is deferred until after srv.Shutdown, which
+	// returns on TIMEOUT with straggler handlers still executing — one of which may be
+	// inside sharedUpstreamTransport's Do, mid-write. A plain field would make that a
+	// -race-detectable write/read pair with a possible torn or nil observation. The Once
+	// still guarantees exactly one build; the atomic only makes the publish visible.
+	// (Reading through the same Once would also close the race, but a shutdown that won
+	// the Do would then permanently hand every straggler a nil transport, silently
+	// demoting them to http.DefaultTransport and dropping this route's TLS settings.)
+	upstreamTransport     atomic.Pointer[http.Transport]
 	upstreamTransportOnce sync.Once
 }
 
@@ -74,17 +85,23 @@ type UpstreamRoute struct {
 // per-call budget, constant for the proxy's lifetime, so a single build is correct.
 func (r *UpstreamRoute) sharedUpstreamTransport(upstreamTimeMs int) *http.Transport {
 	r.upstreamTransportOnce.Do(func() {
-		r.upstreamTransport = buildUpstreamTransport(r.upstreamTLSSkipVerify, upstreamTimeMs)
+		r.upstreamTransport.Store(buildUpstreamTransport(r.upstreamTLSSkipVerify, upstreamTimeMs))
 	})
-	return r.upstreamTransport
+	return r.upstreamTransport.Load()
 }
 
 // closeIdleUpstreamConns releases the route's shared upstream connection pool, called at
 // proxy shutdown so idle sockets are freed promptly rather than lingering to process
 // exit. A route that never opened a remote session (nil transport) is a no-op.
+//
+// The load is atomic because this runs concurrently with sharedUpstreamTransport's
+// publish (see the field's comment): srv.Shutdown can return on timeout with a straggler
+// handler still building the transport. Losing that race is benign — a transport
+// published after this load simply keeps its idle conns until process exit, which is
+// immediate here — while reading it unsynchronized would be an actual data race.
 func (r *UpstreamRoute) closeIdleUpstreamConns() {
-	if r.upstreamTransport != nil {
-		r.upstreamTransport.CloseIdleConnections()
+	if t := r.upstreamTransport.Load(); t != nil {
+		t.CloseIdleConnections()
 	}
 }
 
@@ -433,8 +450,14 @@ func WalkRouteManifests(cfg *config.GatewayConfig, u *config.UpstreamConfig) Rou
 	manifests := make([]*config.LocalManifest, 0, len(u.Policy))
 	for _, pf := range u.Policy {
 		// Resolve a relative policy path against the config file's directory, the
-		// same way LoadUpstreamPDP (the proxy load path) does.
-		m, err := config.LoadManifest(config.ResolvePolicyPath(cfg.BaseDir, pf))
+		// same way LoadUpstreamPDP (the proxy load path) does. An unresolvable "~"
+		// form is reported as this entry's load error, so validate --config shows it
+		// against the offending policy: line like any other bad path.
+		resolved, err := config.ResolvePolicyPath(cfg.BaseDir, pf)
+		var m *config.LocalManifest
+		if err == nil {
+			m, err = config.LoadManifest(resolved)
+		}
 		out.LoadResults = append(out.LoadResults, PolicyLoadResult{Path: pf, Manifest: m, Err: err})
 		if err != nil {
 			out.LoadFailed = true
@@ -490,7 +513,11 @@ func LoadUpstreamPDP(u *config.UpstreamConfig, hostTransport, baseDir string, co
 		// manifests. An absolute path (or an empty baseDir, e.g. a programmatically
 		// built config) is used verbatim. Shared with validate --config via
 		// config.ResolvePolicyPath so the two paths cannot diverge.
-		m, err := config.LoadManifest(config.ResolvePolicyPath(baseDir, pf))
+		resolved, err := config.ResolvePolicyPath(baseDir, pf)
+		if err != nil {
+			return nil, nil, "", "", fmt.Errorf("upstream %q: %w", u.Name, err)
+		}
+		m, err := config.LoadManifest(resolved)
 		if err != nil {
 			return nil, nil, "", "", fmt.Errorf("upstream %q: %w", u.Name, err)
 		}
