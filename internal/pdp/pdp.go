@@ -1327,10 +1327,7 @@ func (p *ManifestPDP) constraintWithUnionLabelOutput(matched *capability.Constra
 // The kill-switch and HardDeny exclusions the transport also applies are handled at each
 // call site, which has the response in hand.
 func willForwardDeny(ctx context.Context, matched *capability.Constraint) bool {
-	if matched != nil && matched.IsAuditOnly() {
-		return true
-	}
-	return enforcement.SkipQuota(ctx)
+	return enforcement.WillForwardDeny(ctx, matched)
 }
 
 // withForwardObligationsFor fills r with matched's post-allow obligations when r is a deny

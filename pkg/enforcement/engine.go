@@ -384,6 +384,27 @@ func SkipQuota(ctx context.Context) bool {
 	return v
 }
 
+// WillForwardDeny reports whether a deny for this constraint will be downgraded to a
+// forwarded call rather than blocking, so the response still reaches the host.
+//
+// It is the ONE spelling of the observe-mode union — per-constraint `enforcement: audit`
+// OR the whole-route --audit posture (which arrives as SkipQuota on the ctx) — that every
+// layer reads: the engine's own obligation stamping, the PDP's willForwardDeny, and the
+// transport's isObserveDeny. Gating only on the per-constraint flag would miss the
+// standard whole-route --audit deployment, where individual constraints are NOT marked
+// audit-only; single-sourcing it here keeps three layers from drifting into three
+// slightly different answers, where the narrowest one silently forwards unredacted.
+//
+// matched may be nil (a no-match deny), which only a route-level --audit forwards. The
+// kill-switch and HardDeny exclusions the transport also applies are handled at each call
+// site, which has the response in hand.
+func WillForwardDeny(ctx context.Context, matched *capability.Constraint) bool {
+	if matched != nil && matched.IsAuditOnly() {
+		return true
+	}
+	return SkipQuota(ctx)
+}
+
 // systemClock is the default Clock backed by the real system time.
 type systemClock struct{}
 
@@ -929,6 +950,45 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 	// that will apply on allow.
 	ctx = withDirectives(ctx, matched.Directives)
 
+	// Collect the matched constraint's obligations UP FRONT and stamp them onto every
+	// deny this function returns that will be FORWARDED rather than blocked.
+	//
+	// An obligation (redactFields) is a property of the matched CONSTRAINT, not of the
+	// allow decision: under an audit-mode constraint — or a route running --audit — a
+	// deny is downgraded to a forwarded call, and the transport applies redaction only
+	// when the response carries obligations. A downgradable deny built with nil
+	// obligations therefore gives a request whose condition FAILED strictly fewer
+	// protections than one that passed: the upstream response reaches the host with the
+	// fields the manifest marked for redaction intact. Stamping at the single point every
+	// matched-constraint deny funnels through makes that structural rather than per-site —
+	// the ManifestPDP fills the same gap one layer up, but a direct caller of the exported
+	// ValidateAction / EvaluateConditions never reaches that layer.
+	//
+	// The deny CollectObligations can itself return (an unwired directive — an engine
+	// bug) is deliberately held back to the point the original ordering returned it,
+	// after runConditions below. Returning it here would preempt the condition verdict,
+	// and that deny sets HardDeny: on an audit route a call a condition would have
+	// denied-and-forwarded would instead be BLOCKED, because isObserveDeny refuses to
+	// downgrade a HardDeny. A wiretap route documented never to block must not start
+	// blocking over an engine bug in a directive it was going to apply post-allow.
+	obligations, obligDeny := e.CollectObligations(matched, requestID, now)
+	if WillForwardDeny(ctx, matched) {
+		defer func() {
+			// The test is `!= DecisionAllow`, not `== DecisionDeny`, matching the transport's
+			// own fail-closed gate and the PDP's withForwardObligationsFor: a response with an
+			// unset Decision is FORWARDED there, so gating on `== DecisionDeny` here would let
+			// exactly that shape through unredacted — the fail-open direction.
+			if resp.Decision == capability.DecisionAllow || resp.Obligations != nil {
+				return
+			}
+			// A HardDeny is never downgraded to a forward, so it has no response to redact.
+			if resp.Denial != nil && resp.Denial.HardDeny {
+				return
+			}
+			resp.Obligations = obligations
+		}()
+	}
+
 	// Peek the incoming accumulated flow-label set up front (only for flow-relevant
 	// constraints, and skipped entirely when the whole policy has no flow — skipFlow —
 	// so a non-flow policy pays no scan or round-trip). It reflects what flowed IN,
@@ -962,13 +1022,14 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 		return *deny
 	}
 
-	// Collect obligations BEFORE recording in session history. Recording first would
-	// poison history: a later sequenceBlock Peek would see this tool as "run" even
-	// though CollectObligations' hard deny means it was never forwarded.
-	// CollectObligations is a pure translation, so reordering it is safe.
-	obligations, denyResp := e.CollectObligations(matched, requestID, now)
-	if denyResp != nil {
-		return *denyResp
+	// The held-back CollectObligations deny is returned HERE, exactly where the
+	// pre-stamping ordering returned it: after the conditions, before the session-history
+	// write. Both positions are load-bearing — after the conditions so an engine bug in a
+	// directive cannot preempt (and, on an audit route, harden) a condition verdict;
+	// before the history write so a hard deny does not leave a phantom antecedent a later
+	// sequenceBlock Peek would see as "run".
+	if obligDeny != nil {
+		return *obligDeny
 	}
 
 	// Commit this call's sequenceBlock antecedent and flow labels as a single
@@ -985,7 +1046,12 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 	labelsOut, cerr := e.recordSourceCall(ctx, req, matched, flowRelevant, carriedLabels)
 	if cerr != nil {
 		if cerr.Flow {
-			return labelRecordFailureDenial(requestID, now, matched.IsAuditOnly(), obligations)
+			// No obligations: this one sets HardDeny, so it is never downgraded to a
+			// forward and has no response to redact. Passing them would break the invariant
+			// the stamping defer above upholds — that obligations on a deny mean "this one
+			// is really a forward" — and contradict the threat model's "a hard deny carries
+			// no obligations".
+			return labelRecordFailureDenial(requestID, now, matched.IsAuditOnly(), nil)
 		}
 		return recordFailureDenial(requestID, now, matched.IsAuditOnly(), obligations)
 	}
@@ -1018,8 +1084,23 @@ func (e *Engine) ValidateAction(ctx context.Context, req *capability.EnforceRequ
 
 	matched := e.FindMatchingCapability(req, capabilities)
 	if matched == nil {
-		// No matched constraint, so no audit-mode posture to inherit: a plain block.
-		return denyResponse(requestID, now, false, nil, capability.DenialInfo{
+		// No matched constraint, so no audit-mode posture to inherit: a plain block —
+		// UNLESS the route runs --audit (SkipQuota), which forwards even a no-match deny.
+		// A forwarded response must carry the redact obligations or it reaches the host
+		// unmasked, so fill them from every capability NAMING this target, regardless of
+		// principal scoping. That is deliberately wider than findMatchingCapability's
+		// selection: no entry governs this caller, and any entry declaring a field of this
+		// target redactable is reason enough to mask it on a response about to be
+		// forwarded. On an enforce route this is skipped and the deny blocks with nothing.
+		var obligations []capability.Obligation
+		if WillForwardDeny(ctx, nil) {
+			obs, obligDeny := e.CollectObligations(namingTargetConstraint(req, capabilities), requestID, now)
+			if obligDeny != nil {
+				return *obligDeny
+			}
+			obligations = obs
+		}
+		return denyResponse(requestID, now, false, obligations, capability.DenialInfo{
 			Code:    capability.ErrCodeAuthorizationFailed,
 			Message: "no matching capability for requested action",
 		})
@@ -1030,9 +1111,24 @@ func (e *Engine) ValidateAction(ctx context.Context, req *capability.EnforceRequ
 	// evaluateMatched threads them (via withDirectives) after this check.
 	if matched.ArgumentSchema != nil {
 		if err := ValidateArgumentSchema(req.Arguments, matched.ArgumentSchema); err != nil {
+			// A downgradable deny is FORWARDED, so it must carry the constraint's
+			// obligations or the forwarded response reaches the host with the fields the
+			// manifest marked for redaction intact — the same rule evaluateMatched applies
+			// to every deny it produces, restated here because this site returns before
+			// reaching it. A blocking deny stays free of obligations (nothing is
+			// forwarded); an unwired directive discovered while collecting is an engine
+			// bug, so its hard deny wins rather than forwarding unredacted.
+			var obligations []capability.Obligation
+			if WillForwardDeny(ctx, matched) {
+				obs, obligDeny := e.CollectObligations(matched, requestID, now)
+				if obligDeny != nil {
+					return *obligDeny
+				}
+				obligations = obs
+			}
 			// Stamp AuditOnly so a direct engine caller gets the constraint's mode
 			// without re-deriving it.
-			return denyResponse(requestID, now, matched.IsAuditOnly(), nil, capability.DenialInfo{
+			return denyResponse(requestID, now, matched.IsAuditOnly(), obligations, capability.DenialInfo{
 				Code:          capability.ErrCodeInvalidParams,
 				ConditionType: "argumentSchema",
 				Message:       err.Error(),
@@ -1156,6 +1252,36 @@ func (e *Engine) findMatchingCapability(req *capability.EnforceRequest, capabili
 		return nil
 	}
 	return &capabilities[scorer.Best()]
+}
+
+// namingTargetConstraint builds a synthetic constraint carrying the directives of every
+// capability whose namespace type and target pattern match the request, IGNORING
+// principal scoping and the action check.
+//
+// It answers "what did the manifest declare about this target", as opposed to
+// findMatchingCapability's "which entry governs this caller" — the right question when no
+// entry governs the caller at all yet the deny is about to be forwarded under --audit.
+// The returned constraint carries no enforcement mode and no conditions: it exists only
+// to be handed to CollectObligations.
+func namingTargetConstraint(req *capability.EnforceRequest, capabilities []capability.Constraint) *capability.Constraint {
+	reqType, bareName := splitEnginePrefix(req.ToolName)
+	if req.Target != nil {
+		if req.Target.Type != "" {
+			reqType = req.Target.Type
+		}
+		if n := strings.TrimSpace(req.Target.Name); n != "" {
+			bareName = n
+		}
+	}
+	out := &capability.Constraint{Target: reqType + ":" + bareName}
+	for i := range capabilities {
+		constraintType, bare := splitEnginePrefix(capabilities[i].Target)
+		if constraintType != reqType || !MatchesResource(bare, bareName) {
+			continue
+		}
+		out.Directives = append(out.Directives, capabilities[i].Directives...)
+	}
+	return out
 }
 
 // splitEnginePrefix splits a constraint Target or afterTools entry into its

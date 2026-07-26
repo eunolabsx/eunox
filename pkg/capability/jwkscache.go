@@ -200,6 +200,22 @@ func IsLoopbackHost(host string) bool {
 	return false
 }
 
+// freshAt reports whether a key set is installed and still inside its TTL as of now —
+// the single staleness predicate for the cache. GetKeys, refresh's pre-singleflight
+// check, and refresh's in-closure double-check all ask exactly this question at different
+// lock depths, so a change to what "fresh" means (a jitter, a soft-TTL grace) must land
+// in one place rather than three that can silently disagree about when a key set expires.
+//
+// The clock reading is the CALLER's (`c.freshAt(c.now())`) rather than taken inside:
+// c.now is an injectable func field, and an indirect call through it pushes this past the
+// inliner's budget — turning a predicate on the per-token verification path into a real
+// call frame. Passing the sampled time keeps the one predicate AND the inlining.
+//
+// The caller MUST hold c.mu (read or write): it reads jwks and fetchedAt, both guarded.
+func (c *JWKSCache) freshAt(now time.Time) bool {
+	return c.jwks != nil && now.Sub(c.fetchedAt) < c.cacheTTL
+}
+
 // GetKeys returns the cached JWKS when it is still within the TTL, otherwise it
 // fetches a fresh copy.
 //
@@ -212,7 +228,7 @@ func IsLoopbackHost(host string) bool {
 // same contract.
 func (c *JWKSCache) GetKeys(ctx context.Context) (*jose.JSONWebKeySet, error) {
 	c.mu.RLock()
-	if c.jwks != nil && c.now().Sub(c.fetchedAt) < c.cacheTTL {
+	if c.freshAt(c.now()) {
 		keys := c.jwks
 		c.mu.RUnlock()
 		return copyKeySet(keys), nil
@@ -497,7 +513,7 @@ func (c *JWKSCache) markKIDAbsent(kid string) {
 func (c *JWKSCache) refresh(ctx context.Context, force bool) (*jose.JSONWebKeySet, bool, error) {
 	if !force {
 		c.mu.RLock()
-		if c.jwks != nil && c.now().Sub(c.fetchedAt) < c.cacheTTL {
+		if c.freshAt(c.now()) {
 			keys := c.jwks
 			c.mu.RUnlock()
 			// No fetch happened (still within TTL), so the key set did not change.
@@ -522,7 +538,7 @@ func (c *JWKSCache) refresh(ctx context.Context, force bool) (*jose.JSONWebKeySe
 		// return the fresh set with no round-trip. Forced refreshes always fetch.
 		if !force {
 			c.mu.RLock()
-			if c.jwks != nil && c.now().Sub(c.fetchedAt) < c.cacheTTL {
+			if c.freshAt(c.now()) {
 				keys := c.jwks
 				c.mu.RUnlock()
 				return refreshResult{keys: keys, changed: false}, nil

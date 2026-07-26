@@ -30,6 +30,18 @@ import (
 	"github.com/eunolabs/eunox/internal/config"
 )
 
+// withLoadedConfig fills the cfg/cfgErr that parseDoctorReaderFlags supplies in
+// production, so a test exercises the same shape the CLI builds. writeDoctorBundle no
+// longer loads the config itself (one parse, shared with the audit-path defaulting), so
+// a hand-built doctorOptions naming a configPath but carrying neither cfg nor cfgErr
+// would report every config-derived section as unloadable.
+func withLoadedConfig(o doctorOptions) doctorOptions {
+	if o.configPath != "" {
+		o.cfg, o.cfgErr = config.LoadGatewayConfig(o.configPath)
+	}
+	return o
+}
+
 // ─── redactConfigValue ───────────────────────────────────────────────────────
 //
 // The redactor walks parsed YAML in place. It must scrub every field on the
@@ -346,10 +358,10 @@ func (s *shortWriter) Write(p []byte) (int, error) {
 // bundle". The errTrackingWriter must latch the first error and keep returning it.
 func TestErrTrackingWriter_CapturesShortWrite(t *testing.T) {
 	tw := &errTrackingWriter{w: &shortWriter{limit: 100}}
-	writeDoctorBundle(tw, doctorOptions{
+	writeDoctorBundle(tw, withLoadedConfig(doctorOptions{
 		auditLogPath: filepath.Join(t.TempDir(), "does-not-exist.jsonl"),
 		auditTail:    0,
-	})
+	}))
 	if tw.err == nil {
 		t.Fatal("errTrackingWriter must capture the mid-bundle write failure so a truncated --output bundle is not announced as complete")
 	}
@@ -361,10 +373,10 @@ func TestErrTrackingWriter_CapturesShortWrite(t *testing.T) {
 
 func TestWriteDoctorBundle_NoConfigNoLog(t *testing.T) {
 	var buf bytes.Buffer
-	writeDoctorBundle(&buf, doctorOptions{
+	writeDoctorBundle(&buf, withLoadedConfig(doctorOptions{
 		auditLogPath: filepath.Join(t.TempDir(), "does-not-exist.jsonl"),
 		auditTail:    0,
-	})
+	}))
 	out := buf.String()
 	for _, marker := range []string{
 		"eunox doctor — support bundle",
@@ -399,11 +411,11 @@ upstreams:
 	doctorWriteFile(t, cfgPath, configYAML)
 
 	var buf bytes.Buffer
-	writeDoctorBundle(&buf, doctorOptions{
+	writeDoctorBundle(&buf, withLoadedConfig(doctorOptions{
 		configPath:   cfgPath,
 		auditLogPath: filepath.Join(t.TempDir(), "no.jsonl"),
 		auditTail:    0,
-	})
+	}))
 	out := buf.String()
 
 	for _, secret := range []string{
@@ -420,8 +432,14 @@ upstreams:
 	if !strings.Contains(out, "<redacted len=") {
 		t.Errorf("expected at least one length-tagged redaction marker:\n%s", out)
 	}
-	if !strings.Contains(out, "REDACTED:REDACTED@mcp.stripe.com") {
-		t.Errorf("expected URL userinfo to be replaced with REDACTED placeholder:\n%s", out)
+	// upstreamUrl goes through the STRICT log-facing redactor, which drops userinfo
+	// outright rather than replacing it with a placeholder. Assert the shape, not just
+	// the absence of the sentinel, so a redactor swap cannot silently weaken this.
+	if !strings.Contains(out, "upstreamUrl: https://mcp.stripe.com") {
+		t.Errorf("expected upstreamUrl reduced to scheme://host:\n%s", out)
+	}
+	if strings.Contains(out, "uuu") || strings.Contains(out, "@mcp.stripe.com") {
+		t.Errorf("upstreamUrl userinfo must be dropped entirely:\n%s", out)
 	}
 	// Host/transport visibility — the diagnostic value of the bundle depends
 	// on these surviving.
@@ -453,11 +471,11 @@ upstreams:
 	doctorWriteFile(t, cfgPath, configYAML)
 
 	var buf bytes.Buffer
-	writeDoctorBundle(&buf, doctorOptions{
+	writeDoctorBundle(&buf, withLoadedConfig(doctorOptions{
 		configPath:   cfgPath,
 		auditLogPath: filepath.Join(t.TempDir(), "no.jsonl"),
 		auditTail:    0,
-	})
+	}))
 	out := buf.String()
 	if strings.Contains(out, "SENTINEL-NONSTRING-MAP-SECRET") {
 		t.Errorf("bundle leaked a secret sharing a map with a non-string key:\n%s", out)
@@ -494,11 +512,11 @@ upstreams:
 	doctorWriteFile(t, cfgPath, configYAML)
 
 	var buf bytes.Buffer
-	writeDoctorBundle(&buf, doctorOptions{
+	writeDoctorBundle(&buf, withLoadedConfig(doctorOptions{
 		configPath:   cfgPath,
 		auditLogPath: filepath.Join(t.TempDir(), "no.jsonl"),
 		auditTail:    0,
-	})
+	}))
 	out := buf.String()
 
 	// The plain audit route is a valid wiretap.
@@ -531,10 +549,10 @@ func TestWriteDoctorBundle_AuditTailRedactsDetails(t *testing.T) {
 	doctorWriteFile(t, logPath, string(b)+"\n")
 
 	var buf bytes.Buffer
-	writeDoctorBundle(&buf, doctorOptions{
+	writeDoctorBundle(&buf, withLoadedConfig(doctorOptions{
 		auditLogPath: logPath,
 		auditTail:    10,
-	})
+	}))
 	out := buf.String()
 
 	if strings.Contains(out, "SENTINEL-DETAILS-VALUE") {
@@ -556,10 +574,10 @@ func TestWriteDoctorBundle_AuditTailRedactsDetails(t *testing.T) {
 
 func TestWriteDoctorBundle_LiveSkippedWithoutFlag(t *testing.T) {
 	var buf bytes.Buffer
-	writeDoctorBundle(&buf, doctorOptions{
+	writeDoctorBundle(&buf, withLoadedConfig(doctorOptions{
 		auditTail: 0,
 		// live: false
-	})
+	}))
 	if !strings.Contains(buf.String(), "pass --live") {
 		t.Errorf("expected skipped-live note in bundle:\n%s", buf.String())
 	}
@@ -567,10 +585,10 @@ func TestWriteDoctorBundle_LiveSkippedWithoutFlag(t *testing.T) {
 
 func TestWriteDoctorBundle_LiveRequiresConfig(t *testing.T) {
 	var buf bytes.Buffer
-	writeDoctorBundle(&buf, doctorOptions{
+	writeDoctorBundle(&buf, withLoadedConfig(doctorOptions{
 		live:      true,
 		auditTail: 0,
-	})
+	}))
 	if !strings.Contains(buf.String(), "--live requires --config") {
 		t.Errorf("expected --live-requires-config note:\n%s", buf.String())
 	}
@@ -976,4 +994,101 @@ func TestCmdDoctor_ExitCodes(t *testing.T) {
 			t.Errorf("exit code = %d, want 0 on a clean run", code)
 		}
 	})
+}
+
+// TestWriteDoctorBundle_UpstreamURLPathIsRedacted pins the highest-exposure sink in the
+// binary against the leak class the log-facing redactor exists to close.
+//
+// The bundle's footer says "paste manually" into a bug report, so it is the LAST place a
+// webhook-style upstreamUrl may keep its path: for a Slack incoming webhook or a Telegram
+// bot URL the path IS the entire credential, and no allowlist of field names catches it
+// because the field name (upstreamUrl) is legitimate. The host must still survive — the
+// bundle exists to say which upstream is configured.
+//
+// The sibling URL fields deliberately keep their paths: an RFC 9728 resource URI and its
+// authorization servers are published unauthenticated, and telling /mcp/github from
+// /mcp/jira is the diagnostic point of reading the section.
+func TestWriteDoctorBundle_UpstreamURLPathIsRedacted(t *testing.T) {
+	configYAML := `
+schemaVersion: "0.1"
+transport: http
+listen:
+  bind: 127.0.0.1
+  port: 3000
+  oauthResource: https://proxy.example.com/mcp/github
+upstreams:
+  - name: slack
+    transport: http
+    upstreamUrl: https://hooks.slack.com/services/T0AAA/B0BBB/SENTINEL-WEBHOOK-PATH-SECRET
+`
+	cfgPath := filepath.Join(t.TempDir(), "eunox.yaml")
+	doctorWriteFile(t, cfgPath, configYAML)
+
+	var buf bytes.Buffer
+	writeDoctorBundle(&buf, withLoadedConfig(doctorOptions{
+		configPath:   cfgPath,
+		auditLogPath: filepath.Join(t.TempDir(), "no.jsonl"),
+		auditTail:    0,
+	}))
+	out := buf.String()
+
+	for _, secret := range []string{"SENTINEL-WEBHOOK-PATH-SECRET", "T0AAA", "B0BBB", "/services/"} {
+		if strings.Contains(out, secret) {
+			t.Errorf("bundle leaked the path-embedded webhook credential %q:\n%s", secret, out)
+		}
+	}
+	if !strings.Contains(out, "hooks.slack.com") {
+		t.Errorf("the upstream host must survive so the bundle still identifies it:\n%s", out)
+	}
+	// The RFC 9728 resource URI keeps its path: it is an identifier, not a secret, and
+	// which route it names is exactly what a reader needs.
+	if !strings.Contains(out, "https://proxy.example.com/mcp/github") {
+		t.Errorf("oauthResource must keep its path for diagnosis:\n%s", out)
+	}
+}
+
+// A config that will not load is exactly the deployment a support bundle is most needed
+// for, so it must be reported IN the bundle rather than abort it: every section that does
+// not depend on the config still renders, and the two that do say why they could not.
+func TestWriteDoctorBundle_RendersWithUnloadableConfig(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "broken.yaml")
+	doctorWriteFile(t, cfgPath, "schemaVersion: \"0.1\"\nnotAKey: true\n")
+
+	opts := withLoadedConfig(doctorOptions{
+		configPath:   cfgPath,
+		auditLogPath: filepath.Join(t.TempDir(), "no.jsonl"),
+		live:         true,
+	})
+	if opts.cfgErr == nil {
+		t.Fatal("expected the unknown-key config to fail loading")
+	}
+
+	var buf bytes.Buffer
+	writeDoctorBundle(&buf, opts)
+	out := buf.String()
+	for _, marker := range []string{"1. Binary", "2. Config (redacted)", "3. Manifests", "4. Audit log", "5. Live upstream check", "End of bundle"} {
+		if !strings.Contains(out, marker) {
+			t.Errorf("bundle missing section %q\n---\n%s", marker, out)
+		}
+	}
+	if n := strings.Count(out, "could not load config:"); n != 2 {
+		t.Errorf("want the load error reported in both config-dependent sections, got %d\n---\n%s", n, out)
+	}
+}
+
+// A hand-built doctorOptions that names a config but never loaded it must report the
+// section as unusable, not dereference the nil config and crash the bundle mid-write.
+func TestWriteDoctorBundle_NilConfigWithoutErrorDoesNotPanic(t *testing.T) {
+	var buf bytes.Buffer
+	writeDoctorBundle(&buf, doctorOptions{
+		configPath:   "some.yaml",
+		auditLogPath: filepath.Join(t.TempDir(), "no.jsonl"),
+		live:         true,
+	})
+	if n := strings.Count(buf.String(), "could not load config:"); n != 2 {
+		t.Errorf("want both config-dependent sections to report an unusable config, got %d\n---\n%s", n, buf.String())
+	}
+	if !strings.Contains(buf.String(), "End of bundle") {
+		t.Errorf("bundle must still complete:\n%s", buf.String())
+	}
 }
