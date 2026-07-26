@@ -387,6 +387,39 @@ upstreams:
 	}
 }
 
+// The same leak class as above, but with the secret in the PATH rather than in
+// userinfo or the query. Webhook-style upstreams (Slack /services/T/B/<secret>,
+// Telegram /bot<token>/) carry their credential there, and a scheme typo on such a
+// URL parses cleanly and lands in this validation error — so a redactor that keeps
+// the path prints the whole secret to stderr. The host must still survive so the
+// operator can tell which upstream failed.
+func TestLoadGatewayConfig_UpstreamURLErrorRedactsPathSecret(t *testing.T) {
+	cfg := `
+schemaVersion: "0.1"
+transport: http
+listen:
+  bind: 127.0.0.1
+  port: 3000
+upstreams:
+  - name: slack
+    transport: http
+    upstreamUrl: "htps://hooks.slack.com/services/T0PATHSEC/B0PATHSEC/PATHWEBHOOKSECRET"
+    policy: ["manifest.yaml"]
+`
+	_, err := LoadGatewayConfig(writeConfig(t, cfg))
+	if err == nil {
+		t.Fatal("expected rejection of a non-http upstreamUrl, got nil")
+	}
+	for _, secret := range []string{"T0PATHSEC", "B0PATHSEC", "PATHWEBHOOKSECRET"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Errorf("error must not leak the path-embedded secret %q, got: %v", secret, err)
+		}
+	}
+	if !strings.Contains(err.Error(), "hooks.slack.com") {
+		t.Errorf("error should still identify the host for the operator, got: %v", err)
+	}
+}
+
 // TestLoadGatewayConfig_RejectsEmptyVarWithLiteralText covers the gap where a
 // referenced variable is SET to the empty string inside a field that ALSO carries
 // literal text (the natural "Bearer ${VAR}" / "Authorization: Bearer ${VAR}" form).

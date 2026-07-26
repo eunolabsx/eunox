@@ -32,6 +32,7 @@ import (
 	"github.com/eunolabs/eunox/internal/audit"
 	"github.com/eunolabs/eunox/internal/config"
 	"github.com/eunolabs/eunox/internal/transport"
+	"github.com/eunolabs/eunox/pkg/capability"
 )
 
 const (
@@ -91,11 +92,23 @@ var redactedConfigFields = map[string]bool{
 // verbatim — whether the value is a single scalar URL or a sequence of them (see
 // redactURLValue). Keyed on the field name because a credential is as likely in any of
 // these as in the original upstreamUrl.
-var urlConfigFields = map[string]bool{
-	"upstreamUrl":               true, // upstreams[].upstreamUrl (scalar)
-	"oauthResource":             true, // listen.oauthResource (scalar, RFC 9728 resource URI)
-	"oauthAuthorizationServers": true, // listen.oauthAuthorizationServers (sequence of IdP URLs)
-	"allowedOrigins":            true, // listen.allowedOrigins (sequence)
+// upstreamUrl gets the strict log-facing form, which also drops the PATH. It is the one
+// field here that routinely IS a webhook endpoint (Slack /services/T…/B…/<secret>,
+// Telegram /bot<token>/…), where the path is the entire credential — and this bundle is
+// generated to be pasted into a bug report, so it is the highest-exposure sink in the
+// binary, not a place to preserve that detail. The host still identifies the upstream.
+//
+// The rest keep the bundle-facing form (path and query parameter NAMES preserved, values
+// replaced with length-tagged placeholders). They are identifiers, not secret-bearing
+// endpoints: an RFC 9728 resource URI and its authorization servers are published
+// unauthenticated at /.well-known/oauth-protected-resource, and an allowed Origin is
+// scheme://host with no path at all. Their paths are load-bearing for diagnosis — telling
+// https://proxy.example.com/mcp/github from /mcp/jira is the point of reading the section.
+var urlConfigFields = map[string]func(string) string{
+	"upstreamUrl":               capability.RedactURLForLog, // upstreams[].upstreamUrl; path can BE the credential
+	"oauthResource":             config.RedactURL,           // listen.oauthResource (scalar, RFC 9728 resource URI)
+	"oauthAuthorizationServers": config.RedactURL,           // listen.oauthAuthorizationServers (sequence of IdP URLs)
+	"allowedOrigins":            config.RedactURL,           // listen.allowedOrigins (sequence)
 }
 
 // redactURLValue scrubs a URL-bearing config value of ANY shape: a scalar URL string
@@ -106,13 +119,13 @@ var urlConfigFields = map[string]bool{
 // Scrubbing on the value's SHAPE rather than the declared schema shape means a
 // credential under any URL key is scrubbed regardless of how it was (mis)written; the
 // prior split scalar/array handling leaked a scalar written under an array-typed key.
-func redactURLValue(val interface{}) interface{} {
+func redactURLValue(val interface{}, redact func(string) string) interface{} {
 	switch v := val.(type) {
 	case string:
-		return config.RedactURL(v)
+		return redact(v)
 	case []interface{}:
 		for i, it := range v {
-			v[i] = redactURLValue(it)
+			v[i] = redactURLValue(it, redact)
 		}
 		return v
 	default:
@@ -131,6 +144,12 @@ type doctorOptions struct {
 	auditKeyPath string
 	auditTail    int
 	live         bool
+	// cfg and cfgErr are the ONE ${ENV}-expanded load of configPath, performed by
+	// parseDoctorReaderFlags so the audit-path defaults and the bundle's manifest
+	// (section 3) and live-drift (section 5) walks share a single parse. Both are zero
+	// when configPath is empty; exactly one is set otherwise.
+	cfg    *config.GatewayConfig
+	cfgErr error
 }
 
 // cmdDoctor runs the `doctor` subcommand and returns the process exit code (rather
@@ -171,8 +190,20 @@ Flags:
 	// between them. doctor deliberately stops here rather than resolving --audit-log: an
 	// unresolvable path is reported INSIDE the bundle, since a support bundle that prints
 	// what it can beats one that refuses to print.
-	if code, done := parseAuditReaderFlags("doctor", fs, configPath, auditLog, auditKey); done {
+	cfg, cfgErr, code, done := parseDoctorReaderFlags(fs, configPath, auditLog, auditKey)
+	if done {
 		return code
+	}
+	// An unloadable config is NOT fatal here (unlike suggest/stats/audit-verify): it is
+	// carried into the bundle and reported in the sections that need it, while every
+	// other section still renders. The exit status is still non-zero, though —
+	// `doctor --config X && restart` is a usable pre-flight gate, and exiting 0 would
+	// silently pass it for a config the proxy will refuse to start on.
+	exitCode := 0
+	if cfgErr != nil {
+		fmt.Fprintln(os.Stderr, cfgErr)
+		fmt.Fprintln(os.Stderr, "The bundle is still written; the config-dependent sections report this error in place.")
+		exitCode = 1
 	}
 
 	opts := doctorOptions{
@@ -181,12 +212,14 @@ Flags:
 		auditKeyPath: *auditKey,
 		auditTail:    *auditTail,
 		live:         *live,
+		cfg:          cfg,
+		cfgErr:       cfgErr,
 	}
 
 	// Stdout: discard write errors (a broken pipe is not actionable).
 	if *output == "" {
 		writeDoctorBundle(os.Stdout, opts)
-		return 0
+		return exitCode
 	}
 
 	outPath := *output
@@ -229,7 +262,9 @@ Flags:
 	}
 	fmt.Fprintf(os.Stderr, "Wrote support bundle to %s\n", outPath)
 	fmt.Fprintln(os.Stderr, "Review for any remaining sensitive values before sharing.")
-	return 0
+	// Non-zero when the config could not be loaded (see above): the bundle was still
+	// written, but the config is broken and a caller gating on this must hear about it.
+	return exitCode
 }
 
 // writeDoctorBundle emits the support bundle to w. Sections are independent —
@@ -240,15 +275,11 @@ func writeDoctorBundle(w io.Writer, opts doctorOptions) {
 	wf(w, "Generated: %s\n", time.Now().UTC().Format(time.RFC3339))
 	wln(w)
 
-	// Parse the gateway config ONCE for the manifest (section 3) and live-drift
-	// (section 5) walks, which both operate on the same ${ENV}-expanded config, rather
-	// than re-loading it per section. Section 2 deliberately keeps its own RAW read
-	// (no env expansion) so it can surface the config exactly as written on disk.
-	var cfg *config.GatewayConfig
-	var cfgErr error
-	if opts.configPath != "" {
-		cfg, cfgErr = config.LoadGatewayConfig(opts.configPath)
-	}
+	// The gateway config was parsed ONCE by parseDoctorReaderFlags and carried here for
+	// the manifest (section 3) and live-drift (section 5) walks, which both operate on
+	// the same ${ENV}-expanded config. Section 2 deliberately keeps its own RAW read (no
+	// env expansion) so it can surface the config exactly as written on disk.
+	cfg, cfgErr := opts.cfg, opts.cfgErr
 
 	wln(w, doctorSep)
 	wln(w, "1. Binary")
@@ -370,8 +401,8 @@ func redactConfigValue(v interface{}) {
 			switch {
 			case redactedConfigFields[k]:
 				x[k] = redactString(val)
-			case urlConfigFields[k]:
-				x[k] = redactURLValue(val)
+			case urlConfigFields[k] != nil:
+				x[k] = redactURLValue(val, urlConfigFields[k])
 			default:
 				redactConfigValue(val)
 			}
@@ -388,8 +419,8 @@ func redactConfigValue(v interface{}) {
 			switch {
 			case redactedConfigFields[ks]:
 				x[k] = redactString(val)
-			case urlConfigFields[ks]:
-				x[k] = redactURLValue(val)
+			case urlConfigFields[ks] != nil:
+				x[k] = redactURLValue(val, urlConfigFields[ks])
 			default:
 				redactConfigValue(val)
 			}
@@ -420,11 +451,19 @@ func redactString(v interface{}) string {
 // report an unusable config identically instead of each keeping its own copy of the
 // same guard clause. The caller's section body must return immediately when this
 // reports true.
-func reportCfgErr(w io.Writer, cfgErr error) bool {
-	if cfgErr == nil {
+// A nil cfg with a nil cfgErr cannot come from parseDoctorReaderFlags (which always sets
+// one or the other for a non-empty configPath) and means a hand-built doctorOptions
+// skipped the load. Report it as unusable rather than fall through to a nil dereference
+// that would crash the bundle mid-write.
+func reportCfgErr(w io.Writer, cfg *config.GatewayConfig, cfgErr error) bool {
+	switch {
+	case cfgErr != nil:
+		wf(w, "  could not load config: %v\n", cfgErr)
+	case cfg == nil:
+		wf(w, "  could not load config: no config was loaded\n")
+	default:
 		return false
 	}
-	wf(w, "  could not load config: %v\n", cfgErr)
 	return true
 }
 
@@ -437,7 +476,7 @@ func reportCfgErr(w io.Writer, cfgErr error) bool {
 // derived fields (Name, Transport, digest) — never UpstreamURL, UpstreamAuthHeader,
 // or other secret-bearing cfg fields. cfgErr is that load's error (config unusable).
 func writeDoctorManifests(w io.Writer, cfg *config.GatewayConfig, cfgErr error) {
-	if reportCfgErr(w, cfgErr) {
+	if reportCfgErr(w, cfg, cfgErr) {
 		return
 	}
 	wf(w, "  host transport: %s\n", cfg.HostTransport())
@@ -675,7 +714,7 @@ func redactAuditLine(line string) string {
 // ${ENV} expanded (shared with the manifest section); only the exit code is printed,
 // no secret-bearing cfg fields. cfgErr is that load's error (config unusable).
 func writeDoctorLive(w io.Writer, cfg *config.GatewayConfig, cfgErr error) {
-	if reportCfgErr(w, cfgErr) {
+	if reportCfgErr(w, cfg, cfgErr) {
 		return
 	}
 	// Base context with no deadline: fetchRouteLive applies its own per-route

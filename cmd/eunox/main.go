@@ -1109,9 +1109,9 @@ func validateJWKSURIScheme(jwksURI string, allowInsecure bool) error {
 		// redacted URL and the parse reason separately.
 		var uerr *url.Error
 		if errors.As(err, &uerr) {
-			return fmt.Errorf("--jwks-uri %s is not a valid URL: %v", config.RedactURL(jwksURI), uerr.Err)
+			return fmt.Errorf("--jwks-uri %s is not a valid URL: %v", capability.RedactURLForLog(jwksURI), uerr.Err)
 		}
-		return fmt.Errorf("--jwks-uri %s is not a valid URL: %v", config.RedactURL(jwksURI), err)
+		return fmt.Errorf("--jwks-uri %s is not a valid URL: %v", capability.RedactURLForLog(jwksURI), err)
 	}
 	switch strings.ToLower(u.Scheme) {
 	case "https":
@@ -1269,10 +1269,16 @@ func resolveOAuthMetadata(cfg *config.GatewayConfig, pf proxyFlags) (*transport.
 	var validateAuthz bool
 	switch {
 	case len(cfg.Listen.OAuthAuthorizationServers) > 0:
-		if pf.oauthAuthzServer != "" {
-			// Same silent-override hazard as the resource URI above: warn rather than
-			// drop the operator's flag without a word.
-			fmt.Fprintf(os.Stderr, "[eunox] WARNING: --oauth-authz-server %q is overridden by the config's listen.oauthAuthorizationServers; the config takes precedence.\n", pf.oauthAuthzServer)
+		// Same silent-override hazard as the resource URI above: warn rather than drop
+		// the operator's flag without a word. The flag is registered as
+		// --oauth-authorization-server, so name it that: an operator who greps --help for
+		// the name in this message must find it. Warn only when the flag actually loses
+		// something — a single config entry equal to the flag drops nothing, and warning
+		// there trains operators to ignore the message.
+		flagAlreadyCovered := len(cfg.Listen.OAuthAuthorizationServers) == 1 &&
+			cfg.Listen.OAuthAuthorizationServers[0] == pf.oauthAuthzServer
+		if pf.oauthAuthzServer != "" && !flagAlreadyCovered {
+			fmt.Fprintf(os.Stderr, "[eunox] WARNING: --oauth-authorization-server %q is overridden by the config's listen.oauthAuthorizationServers %v; the config takes precedence.\n", pf.oauthAuthzServer, cfg.Listen.OAuthAuthorizationServers)
 		}
 		oauthAuthzServers = cfg.Listen.OAuthAuthorizationServers
 		validateAuthz = true
@@ -1422,7 +1428,7 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 		// container logs, and the doctor bundle collect. config.RedactURL is the one
 		// redactor the upstream-URL log sites already use; the JWKS URI — the root of trust
 		// for token verification — must not be the exception.
-		safeJWKS := config.RedactURL(pf.jwksURI)
+		safeJWKS := capability.RedactURLForLog(pf.jwksURI)
 		if pf.jwtExperimentalCaps {
 			fmt.Fprintf(os.Stderr, "[eunox] JWT PDP enabled (JWKS URI: %s); intersecting per-route manifests with experimental mcp.capabilities claims\n", safeJWKS)
 		} else {
@@ -1458,6 +1464,22 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 	oauthMeta, oauthMetaURL, err := resolveOAuthMetadata(cfg, pf)
 	if err != nil {
 		return err
+	}
+	// Publishing the metadata document announces "this resource is protected; present a
+	// bearer token" — to any unauthenticated client, since the endpoint is
+	// unauthenticated by design. With NEITHER --jwks-uri nor listen.authToken the
+	// gateway validates no bearer token at all, so it would advertise a protection it
+	// does not enforce and a client would present a credential that is never checked.
+	// Fail closed, the same way validateJWTFlagsRequireJWKS rejects every other
+	// JWT-adjacent flag set without a JWKS endpoint; these two --oauth-* flags were its
+	// only gap.
+	//
+	// listen.authToken counts as validation even though it is a static shared secret
+	// rather than OAuth: checkAuth rejects every unauthenticated request and already
+	// serves the metadata URL as the resource_metadata hint on its 401 challenge, so
+	// that pairing is a supported deployment, not the unenforced-advertisement hole.
+	if oauthMeta != nil && gwJWTPDP == nil && cfg.Listen.AuthToken == "" {
+		return fmt.Errorf("--oauth-resource / listen.oauthResource publishes RFC 9728 protected-resource metadata, but no bearer-token validation is configured: set --jwks-uri (or listen.authToken) so presented tokens are actually verified, or remove the --oauth-* settings so the gateway does not advertise a protection it cannot enforce")
 	}
 
 	// Generate a fresh loopback control token for POST /control/kill, written to a
@@ -2527,18 +2549,24 @@ func killViaRedis(addr, password string, useTLS bool, target string) error {
 // audit-verify subcommand
 // -----------------------------------------------------------------
 
-// applyConfigAuditDefaults fills empty audit-log / audit-key-path flags from a
-// --config file's audit block, leaving any explicitly-set flag untouched. keyPath
-// may be nil (stats has no --audit-key-path), which skips the key default. cmdName
-// labels the load error. A no-op when configPath is empty. Shared by audit-verify
-// and stats, which both default their audit paths from the same config block.
-func applyConfigAuditDefaults(cmdName, configPath string, logPath, keyPath *string) error {
+// loadConfigAuditDefaults loads configPath and fills empty audit-log / audit-key-path
+// flags from its audit block, leaving any explicitly-set flag untouched. keyPath may be
+// nil (stats has no --audit-key-path), which skips the key default. cmdName labels the
+// load error. A no-op returning (nil, nil) when configPath is empty.
+//
+// The load error is RETURNED with the parsed config rather than printed, so a caller can
+// choose its own stance: every audit-log reader treats an unloadable config as fatal
+// (applyConfigAuditDefaults), while doctor carries the failure into the support bundle —
+// a config that will not parse is exactly the deployment a bundle exists to describe.
+// Returning the config as well lets that caller reuse this parse instead of loading the
+// same file a second time.
+func loadConfigAuditDefaults(cmdName, configPath string, logPath, keyPath *string) (*config.GatewayConfig, error) {
 	if configPath == "" {
-		return nil
+		return nil, nil
 	}
 	cfg, err := config.LoadGatewayConfig(configPath)
 	if err != nil {
-		return fmt.Errorf("eunox %s: loading config: %w", cmdName, err)
+		return nil, fmt.Errorf("eunox %s: loading config: %w", cmdName, err)
 	}
 	if *logPath == "" && cfg.Audit.Log != "" {
 		*logPath = cfg.Audit.Log
@@ -2546,7 +2574,15 @@ func applyConfigAuditDefaults(cmdName, configPath string, logPath, keyPath *stri
 	if keyPath != nil && *keyPath == "" && cfg.Audit.KeyPath != "" {
 		*keyPath = cfg.Audit.KeyPath
 	}
-	return nil
+	return cfg, nil
+}
+
+// applyConfigAuditDefaults is loadConfigAuditDefaults for the readers that have nothing
+// useful to do with an unloadable config — audit-verify, stats, suggest — so the error is
+// theirs to report and abort on. doctor deliberately does NOT use this.
+func applyConfigAuditDefaults(cmdName, configPath string, logPath, keyPath *string) error {
+	_, err := loadConfigAuditDefaults(cmdName, configPath, logPath, keyPath)
+	return err
 }
 
 // parseAuditReaderFlags runs the preamble every subcommand that reads the audit tape
@@ -2581,6 +2617,26 @@ func parseAuditReaderFlags(name string, fs *flag.FlagSet, configPath, logPath, k
 		return 1, true
 	}
 	return 0, false
+}
+
+// parseDoctorReaderFlags is parseAuditReaderFlags for doctor: identical flag parsing and
+// stray-positional rejection, but an unloadable --config is RETURNED (with a nil cfg)
+// instead of aborting. doctor's whole job is describing a broken deployment, so a config
+// that will not parse is the case the bundle is most needed for; it is reported inside
+// the bundle and every config-independent section still renders.
+func parseDoctorReaderFlags(fs *flag.FlagSet, configPath, logPath, keyPath *string) (cfg *config.GatewayConfig, cfgErr error, code int, done bool) {
+	if err := fs.Parse(os.Args[2:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil, nil, 0, true
+		}
+		return nil, nil, 1, true
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "eunox doctor: unexpected argument %q (use --audit-log to name the log file)\n", fs.Arg(0))
+		return nil, nil, 1, true
+	}
+	cfg, cfgErr = loadConfigAuditDefaults("doctor", *configPath, logPath, keyPath)
+	return cfg, cfgErr, 0, false
 }
 
 // resolveAuditReaderLogPath expands the reader's --audit-log to a concrete path,

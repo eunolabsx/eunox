@@ -162,7 +162,7 @@ func ResolveSessionIdleTimeout(flagVal int, cfgVal *int) int {
 // to a remote MCP HTTP server (remote mode, enabled by UpstreamURL).
 type HTTPProxy struct {
 	jwtPDP             *pdp.JWTPDP            // non-nil when --jwks-uri is configured
-	oauthMeta          *OAuthResourceMetadata // non-nil when JWT auth is configured
+	oauthMeta          *OAuthResourceMetadata // non-nil when --oauth-resource / listen.oauthResource is set (which the CLI admits only alongside bearer-token validation)
 	oauthMetaURL       string                 // absolute metadata URL for WWW-Authenticate; empty when --oauth-resource is not set
 	sink               *audit.Sink
 	ks                 killswitch.Manager
@@ -266,7 +266,7 @@ type HTTPGatewayOptions struct {
 	Sink           *audit.Sink
 	KS             killswitch.Manager
 	JWTPDP         *pdp.JWTPDP
-	OAuthMeta      *OAuthResourceMetadata // RFC 9728 metadata document; nil when JWT auth is not configured
+	OAuthMeta      *OAuthResourceMetadata // RFC 9728 metadata document; nil when no resource URI is configured
 	OAuthMetaURL   string                 // absolute URL for resource_metadata in challenges
 	ShutdownMs     int
 	UpstreamTimeMs int

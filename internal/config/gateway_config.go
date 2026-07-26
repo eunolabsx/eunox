@@ -926,11 +926,15 @@ func validateHTTPUpstreamURL(name, rawURL string) error {
 		return fmt.Errorf("upstream %q: http transport requires 'upstreamUrl'", name)
 	}
 	parsed, err := url.Parse(rawURL)
+	// capability.RedactURLForLog, not the bundle-facing RedactURL: a validation error
+	// goes to stderr (systemd journal, container logs, CI output), and for a Slack
+	// webhook or a Telegram bot URL the PATH is the credential. A scheme typo on such a
+	// URL parses fine and lands here, so keeping the path would print the whole secret.
 	if err != nil || !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
-		return fmt.Errorf("upstream %q: upstreamUrl must be an http or https URL, got %q", name, RedactURL(rawURL))
+		return fmt.Errorf("upstream %q: upstreamUrl must be an http or https URL, got %q", name, capability.RedactURLForLog(rawURL))
 	}
 	if parsed.Host == "" {
-		return fmt.Errorf("upstream %q: upstreamUrl %q has no host", name, RedactURL(rawURL))
+		return fmt.Errorf("upstream %q: upstreamUrl %q has no host", name, capability.RedactURLForLog(rawURL))
 	}
 	return nil
 }
