@@ -904,6 +904,17 @@ func FetchAllToolPages(fetchPage func(cursor string) (json.RawMessage, error)) (
 		totalBytes += len(raw)
 		var p toolsListPage
 		if len(raw) > 0 {
+			// Reject an envelope whose top-level "tools" key is ambiguous (duplicated,
+			// case-variant, or shadowed by a case-variant sibling) BEFORE the plain
+			// json.Unmarshal below, which would silently resolve it to one array with no
+			// error. Without this, a poisoned catalog could pass the drift comparison
+			// (and its unconditionally-fatal FM-5 descriptionHash check) cleanly at
+			// startup, only to be caught later — and more disruptively, as a mid-session
+			// poisonAllPinned — once the runtime list filter (which already refuses this
+			// same shape) saw the identical bytes.
+			if pdp.ToolsKeyAmbiguous(raw) {
+				return nil, fmt.Errorf("tools/list page carries an ambiguous \"tools\" key (duplicated, case-variant, or both); refusing to trust the decode")
+			}
 			if err := json.Unmarshal(raw, &p); err != nil {
 				return nil, fmt.Errorf("parsing tools/list page: %w", err)
 			}

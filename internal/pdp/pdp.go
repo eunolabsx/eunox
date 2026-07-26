@@ -2139,10 +2139,11 @@ func (p *ManifestPDP) armPinsFromToolsList(result json.RawMessage) (entryCount i
 	}
 	rawArray, ok := envelope[listKeyTools]
 	if !ok {
-		// No exact "tools" key. A case-variant sibling ("Tools") still decodes for a host
-		// whose reader binds it case-insensitively, and the proxy cannot tell what that
-		// host sees, so treat it as ambiguous; a plainly absent key is not.
-		if pinned && envelopeHasFoldedToolsKey(envelope) {
+		// No exact "tools" key. toolsKeyAmbiguous also catches a case-variant sibling
+		// ("Tools") that still decodes for a host whose reader binds it
+		// case-insensitively, and the proxy cannot tell what that host sees, so treat it
+		// as ambiguous; a plainly absent key is not.
+		if pinned && toolsKeyAmbiguous(result) {
 			p.poisonAllPinned()
 		}
 		return 0
@@ -2161,7 +2162,7 @@ func (p *ManifestPDP) armPinsFromToolsList(result json.RawMessage) (entryCount i
 	}
 	// A duplicate or case-variant "tools" key leaves Go and the host reading different
 	// arrays, so no entry below can be believed.
-	if duplicateOrFoldedToolsKey(result) {
+	if toolsKeyAmbiguous(result) {
 		p.poisonAllPinned()
 		return len(entries)
 	}
@@ -2194,24 +2195,17 @@ func (p *ManifestPDP) armPinsFromToolsList(result json.RawMessage) (entryCount i
 	return len(entries)
 }
 
-// envelopeHasFoldedToolsKey reports whether the decoded envelope carries a key that differs
-// from the tools list key only by case — a shape Go's own struct-tag decode (and any host
-// that binds keys case-insensitively) would still resolve to it.
-func envelopeHasFoldedToolsKey(envelope map[string]json.RawMessage) bool {
-	for k := range envelope {
-		if strings.EqualFold(k, listKeyTools) {
-			return true
-		}
-	}
-	return false
-}
-
-// duplicateOrFoldedToolsKey reports whether result's top-level object carries the tools
-// list key more than once, comparing case-folded. json.Unmarshal into a map silently keeps the last
-// such key, so a repeat (or a case-variant sibling) means the array the proxy walks is not
-// necessarily the one a host renders. Malformed input reports true: the caller fails closed.
-func duplicateOrFoldedToolsKey(result json.RawMessage) bool {
-	dec := json.NewDecoder(bytes.NewReader(result))
+// toolsKeyAmbiguous reports whether raw's top-level JSON object carries the tools/list
+// "tools" key ambiguously: duplicated, case-variant, or (when the exact spelling "tools" is
+// absent) shadowed by a case-variant sibling like "Tools". A plain decode into a map keeps
+// only the LAST such key, and a struct tag falls back to a case-insensitive match when the
+// exact spelling is missing — either way, a host that reads the same bytes differently (a
+// case-sensitive JSON.parse, or one that keeps a different duplicate) can see an entirely
+// different tools array than this proxy decoded. A plainly absent key is not ambiguous: a
+// host renders no tools from it either. Malformed input reports true: the caller fails
+// closed.
+func toolsKeyAmbiguous(raw json.RawMessage) bool {
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	tok, err := dec.Token()
 	if err != nil {
 		return true
@@ -2219,7 +2213,7 @@ func duplicateOrFoldedToolsKey(result json.RawMessage) bool {
 	if d, ok := tok.(json.Delim); !ok || d != '{' {
 		return true
 	}
-	count := 0
+	exact, folded := 0, 0
 	for dec.More() {
 		keyTok, err := dec.Token()
 		if err != nil {
@@ -2229,15 +2223,38 @@ func duplicateOrFoldedToolsKey(result json.RawMessage) bool {
 		if !ok {
 			return true
 		}
-		if strings.EqualFold(key, listKeyTools) {
-			count++
+		if key == listKeyTools {
+			exact++
+			folded++
+		} else if strings.EqualFold(key, listKeyTools) {
+			folded++
 		}
 		var skip json.RawMessage
 		if err := dec.Decode(&skip); err != nil {
 			return true
 		}
 	}
-	return count > 1
+	if folded == 0 {
+		return false
+	}
+	return folded > 1 || exact == 0
+}
+
+// ToolsKeyAmbiguous is the exported form of the envelope-level "tools" key ambiguity gate,
+// for the startup drift probe (FetchAllToolPages).
+//
+// armPinsFromToolsList (below) already refuses to trust an ambiguous envelope on the runtime
+// list-filter path — poisoning every pin rather than believing whichever array Go's decode
+// happened to keep. Before this export, the drift probe's own page decode
+// (internal/drift.FetchAllToolPages, into a plain toolsListPage struct) had no equivalent
+// check: a duplicate or case-variant "tools" key there silently resolved to one array with no
+// error, so a poisoned catalog could pass the unconditionally-fatal FM-5 startup refusal
+// cleanly, only to be caught later — and more disruptively, as a mid-session poisonAllPinned
+// — once the identical bytes reached the runtime path. Exporting the same check keeps both
+// layers on one rule instead of letting the drift probe silently trust a shape the runtime
+// path would refuse.
+func ToolsKeyAmbiguous(raw json.RawMessage) bool {
+	return toolsKeyAmbiguous(raw)
 }
 
 func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims map[string]interface{}) ListFilterResult {
