@@ -35,9 +35,9 @@ func sinkCaps(name string, allow ...string) []capability.Constraint {
 
 func req(session, name string) *capability.EnforceRequest {
 	return &capability.EnforceRequest{
-		SessionID: session,
-		ToolName:  name,
-		Target:    &capability.EnforceRequestTarget{Type: "tool", Name: name},
+		SessionID:  session,
+		TargetName: name,
+		Target:     &capability.EnforceRequestTarget{Type: "tool", Name: name},
 	}
 }
 
@@ -99,7 +99,7 @@ func TestFlowLabel_FailsClosedOnUnreadableState(t *testing.T) {
 	// No session: state would merge across anonymous callers -> deny (MISSING_CONTEXT). The
 	// store is wired so the empty-session guard (not the missing-store guard) is what fires.
 	withStore := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()), enforcement.WithFlowLabelStore(flowlabelstore.NewInMemory()))
-	noSession := &capability.EnforceRequest{ToolName: "send_email", Target: &capability.EnforceRequestTarget{Type: "tool", Name: "send_email"}}
+	noSession := &capability.EnforceRequest{TargetName: "send_email", Target: &capability.EnforceRequestTarget{Type: "tool", Name: "send_email"}}
 	sink = withStore.ValidateAction(ctx, noSession, sinkCaps("send_email", capability.FlowLabelPublic))
 	require.Equal(t, capability.DecisionDeny, sink.Decision)
 	assert.Equal(t, capability.ErrCodeMissingContext, sink.Denial.Code)

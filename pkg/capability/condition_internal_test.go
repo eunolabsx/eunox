@@ -340,3 +340,123 @@ func TestRedactFieldsInConditions_IsRejected(t *testing.T) {
 		t.Errorf("expected migration hint mentioning 'directives', got: %v", err)
 	}
 }
+
+// TestAllowlistConditions_CompiledMatchesUncompiled is the load-time-normalization
+// contract for the four allowlist conditions whose lookup structures moved from the
+// hot path to Compile. Every case asserts the SAME answer from a compiled condition
+// and an uncompiled one, because the uncompiled fallback is what a programmatically
+// built condition (a test, a library caller, the JWT shorthand PDP) actually runs —
+// so a normalization that lived in only one of the two paths would silently enforce a
+// different policy depending on how the condition was constructed.
+func TestAllowlistConditions_CompiledMatchesUncompiled(t *testing.T) {
+	t.Run("allowedExtensions", func(t *testing.T) {
+		// Padded, upper-case, dot-less, blank, and duplicate entries all normalize.
+		raw := []string{" .PDF ", "txt", "", "  ", ".pdf", ".TAR.GZ"}
+		uncompiled := &AllowedExtensionsCondition{Argument: "path", Extensions: raw}
+		compiled := &AllowedExtensionsCondition{Argument: "path", Extensions: raw}
+		if err := compiled.Compile(); err != nil {
+			t.Fatalf("Compile: %v", err)
+		}
+		want := []string{".pdf", ".txt", ".tar.gz"}
+		for _, got := range [][]string{uncompiled.MatchExtensions(), compiled.MatchExtensions()} {
+			if len(got) != len(want) {
+				t.Fatalf("normalized extensions = %v, want %v", got, want)
+			}
+			for i := range want {
+				if got[i] != want[i] {
+					t.Errorf("normalized extensions = %v, want %v", got, want)
+					break
+				}
+			}
+		}
+	})
+
+	t.Run("allowedTables", func(t *testing.T) {
+		raw := []string{" Users ", "orders"}
+		cols := map[string][]string{" USERS ": {" ID ", "Email"}}
+		uncompiled := &AllowedTablesCondition{Argument: "table", Tables: raw, Columns: cols}
+		compiled := &AllowedTablesCondition{Argument: "table", Tables: raw, Columns: cols}
+		if err := compiled.Compile(); err != nil {
+			t.Fatalf("Compile: %v", err)
+		}
+		for _, c := range []*AllowedTablesCondition{uncompiled, compiled} {
+			tables, byTable, sets := c.TableLookup()
+			if !tables["users"] || !tables["orders"] {
+				t.Errorf("table set = %v, want the trimmed lowercase names", tables)
+			}
+			if tables["Users"] {
+				t.Error("table set must be keyed on the folded name only")
+			}
+			// The restriction index is keyed on the folded table name but keeps the
+			// column list in original case, so denial details echo the manifest.
+			if got := byTable["users"]; len(got) != 2 || got[0] != " ID " {
+				t.Errorf("columnsByTable[users] = %v, want the original-case list", got)
+			}
+			if !sets["users"]["id"] || !sets["users"]["email"] {
+				t.Errorf("column set = %v, want the trimmed lowercase names", sets["users"])
+			}
+		}
+	})
+
+	t.Run("allowedTables with no column restrictions", func(t *testing.T) {
+		// nil Columns must stay nil through both paths: "no restrictions declared" is a
+		// distinct state from "an empty restriction", and only the former skips the ACL.
+		uncompiled := &AllowedTablesCondition{Argument: "table", Tables: []string{"users"}}
+		compiled := &AllowedTablesCondition{Argument: "table", Tables: []string{"users"}}
+		if err := compiled.Compile(); err != nil {
+			t.Fatalf("Compile: %v", err)
+		}
+		for _, c := range []*AllowedTablesCondition{uncompiled, compiled} {
+			if _, byTable, _ := c.TableLookup(); byTable != nil {
+				t.Errorf("columnsByTable = %v, want nil when no restrictions are declared", byTable)
+			}
+		}
+	})
+
+	t.Run("recipientDomain", func(t *testing.T) {
+		raw := []string{" Example.COM ", "partner.org"}
+		uncompiled := &RecipientDomainCondition{Argument: "to", Domains: raw}
+		compiled := &RecipientDomainCondition{Argument: "to", Domains: raw}
+		if err := compiled.Compile(); err != nil {
+			t.Fatalf("Compile: %v", err)
+		}
+		for _, c := range []*RecipientDomainCondition{uncompiled, compiled} {
+			set := c.MatchDomains()
+			if !set["example.com"] || !set["partner.org"] {
+				t.Errorf("domain set = %v, want the trimmed lowercase domains", set)
+			}
+			if set["evil.com"] {
+				t.Error("domain set must not admit an unlisted domain")
+			}
+		}
+	})
+
+	t.Run("allowedOperations", func(t *testing.T) {
+		raw := []string{" SELECT ", "insert"}
+		uncompiled := &AllowedOperationsCondition{Argument: "query", Operations: raw}
+		compiled := &AllowedOperationsCondition{Argument: "query", Operations: raw}
+		if err := compiled.Compile(); err != nil {
+			t.Fatalf("Compile: %v", err)
+		}
+		cases := []struct {
+			op   string
+			want bool
+		}{
+			{"SELECT", true},  // padded entry still matches
+			{"INSERT", true},  // case-insensitive
+			{"DELETE", false}, // unlisted
+			{"*", false},      // "*" is not a wildcard
+		}
+		for _, c := range []*AllowedOperationsCondition{uncompiled, compiled} {
+			for _, tc := range cases {
+				if got := c.AllowsOperation(tc.op); got != tc.want {
+					t.Errorf("AllowsOperation(%q) = %v, want %v", tc.op, got, tc.want)
+				}
+				// The bare-slice matcher the JWT shorthand PDP uses must agree.
+				if got := MatchOperation(c.Operations, tc.op); got != tc.want {
+					t.Errorf("MatchOperation(%q) = %v, want %v", tc.op, got, tc.want)
+				}
+			}
+		}
+	})
+}

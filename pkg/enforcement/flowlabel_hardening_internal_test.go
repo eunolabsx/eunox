@@ -71,9 +71,9 @@ func TestFlowHardening_AtomicCommitRollsBackOnSeqFault(t *testing.T) {
 				Directives: []capability.Directive{capability.LabelOutputDirective{Labels: []string{capability.FlowLabelConfidential}}},
 			}
 			req := &capability.EnforceRequest{
-				SessionID: "s",
-				ToolName:  "read_secret",
-				Target:    &capability.EnforceRequestTarget{Type: "tool", Name: "read_secret"},
+				SessionID:  "s",
+				TargetName: "read_secret",
+				Target:     &capability.EnforceRequestTarget{Type: "tool", Name: "read_secret"},
 			}
 			resp := eng.ValidateAction(ctx, req, []capability.Constraint{source})
 
@@ -94,9 +94,9 @@ func TestFlowHardening_AtomicCommitRollsBackOnSeqFault(t *testing.T) {
 			// sees clean state and is allowed, the concrete downstream guarantee the atomic commit makes.
 			verifier := New(WithCallCounter(callcounter.NewInMemory()), WithFlowLabelStore(store))
 			sink := verifier.ValidateAction(ctx, &capability.EnforceRequest{
-				SessionID: "s",
-				ToolName:  "send_email",
-				Target:    &capability.EnforceRequestTarget{Type: "tool", Name: "send_email"},
+				SessionID:  "s",
+				TargetName: "send_email",
+				Target:     &capability.EnforceRequestTarget{Type: "tool", Name: "send_email"},
 			}, []capability.Constraint{{
 				Target:     "tool:send_email",
 				Actions:    []string{"call"},

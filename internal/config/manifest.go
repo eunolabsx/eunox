@@ -998,6 +998,14 @@ func validateLocalManifest(m *LocalManifest) error {
 				if err := validateAllowedOperations(i, j, v); err != nil {
 					return err
 				}
+				// Pre-trim the allowlist entries once at load so the hot path stops
+				// re-trimming them per request (mirrors the IPRange/TimeWindow Compile
+				// below). Only the pointer case is evaluated at runtime (the value case
+				// is a copy). Compile cannot fail; the error is still checked so a future
+				// normalization that can fail is caught here rather than silently skipped.
+				if err := v.Compile(); err != nil {
+					return fmt.Errorf("capability at index %d, condition %d: %w", i, j, err)
+				}
 			case capability.AllowedExtensionsCondition:
 				if err := validateAllowedExtensions(i, j, &v); err != nil {
 					return err
@@ -1005,6 +1013,12 @@ func validateLocalManifest(m *LocalManifest) error {
 			case *capability.AllowedExtensionsCondition:
 				if err := validateAllowedExtensions(i, j, v); err != nil {
 					return err
+				}
+				// Normalize the extension allowlist (lowercase, dot-prefix, dedupe) once
+				// at load so the hot path stops rebuilding it — and its dedupe map — per
+				// request. Only the pointer case is evaluated at runtime.
+				if err := v.Compile(); err != nil {
+					return fmt.Errorf("capability at index %d, condition %d: %w", i, j, err)
 				}
 			case capability.AllowedTablesCondition:
 				if err := validateAllowedTables(i, j, &v); err != nil {
@@ -1014,6 +1028,12 @@ func validateLocalManifest(m *LocalManifest) error {
 				if err := validateAllowedTables(i, j, v); err != nil {
 					return err
 				}
+				// Build the case-folded table set, column-restriction index, and per-table
+				// column sets once at load; the hot path rebuilt all three on every
+				// enforced call. Only the pointer case is evaluated at runtime.
+				if err := v.Compile(); err != nil {
+					return fmt.Errorf("capability at index %d, condition %d: %w", i, j, err)
+				}
 			case capability.RecipientDomainCondition:
 				if err := validateRecipientDomain(i, j, &v); err != nil {
 					return err
@@ -1021,6 +1041,11 @@ func validateLocalManifest(m *LocalManifest) error {
 			case *capability.RecipientDomainCondition:
 				if err := validateRecipientDomain(i, j, v); err != nil {
 					return err
+				}
+				// Build the case-folded domain set once at load rather than per request.
+				// Only the pointer case is evaluated at runtime.
+				if err := v.Compile(); err != nil {
+					return fmt.Errorf("capability at index %d, condition %d: %w", i, j, err)
 				}
 			case capability.AllowedValuesCondition:
 				if err := validateAllowedValues(i, j, &v); err != nil {

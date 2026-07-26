@@ -349,7 +349,7 @@ func (e *Engine) maxCallsBucket(ctx context.Context, cond capability.Condition, 
 
 	// Build a unique key from session + target type + bare name.
 	//
-	// The target type must be in the key because req.ToolName is only the bare name:
+	// The target type must be in the key because req.TargetName is only the bare name:
 	// a tool "export" and a prompt "export" would otherwise drain one budget.
 	// sessionTargetKey derives the (type, name) pair exactly as RecordSessionCall does
 	// — prefix from splitEnginePrefix, overridden by Target.Type when set; name from
@@ -530,9 +530,10 @@ func (e *Engine) handleAllowedOperations(_ context.Context, cond capability.Cond
 
 	// No wildcard: the operations list is an explicit allowlist. A "*" entry is
 	// rejected at load (validateAllowedOperations); matching it here would turn the
-	// condition into a no-op permitting any verb. MatchAllowedOperation is the shared
-	// case-insensitive matcher the JWT shorthand PDP also uses.
-	if MatchAllowedOperation(ao.Operations, operation) {
+	// condition into a no-op permitting any verb. AllowsOperation matches against the
+	// entries Compile pre-trimmed at load, falling back to the same trim-as-you-scan
+	// rule MatchAllowedOperation applies for the JWT shorthand PDP.
+	if ao.AllowsOperation(operation) {
 		return nil
 	}
 
@@ -563,13 +564,19 @@ func (e *Engine) handleAllowedOperations(_ context.Context, cond capability.Cond
 func resolveStringOrStringArray(args map[string]interface{}, argName, condType string) ([]string, *ConditionError) {
 	var out []string
 	if v, ok := ResolveArgument(args, argName); ok {
-		switch t := v.(type) {
-		case string:
-			if s := strings.TrimSpace(t); s != "" {
-				out = []string{s}
+		s, isString := v.(string)
+		items, isArray := asInterfaceSlice(v)
+		switch {
+		case isString:
+			if trimmed := strings.TrimSpace(s); trimmed != "" {
+				out = []string{trimmed}
 			}
-		case []interface{}:
-			for _, item := range t {
+		case isArray:
+			// ONE validation arm for both array shapes (see asInterfaceSlice): the
+			// blank-element and non-string-item rules are security-relevant fail-closed
+			// checks, and keeping two hand-mirrored copies is how one of them silently
+			// loses a check.
+			for _, item := range items {
 				s, ok := item.(string)
 				if !ok {
 					return nil, &ConditionError{
@@ -579,21 +586,6 @@ func resolveStringOrStringArray(args map[string]interface{}, argName, condType s
 						Details:       map[string]interface{}{"argument": argName},
 					}
 				}
-				if strings.TrimSpace(s) == "" {
-					return nil, &ConditionError{
-						Code:          capability.ErrCodeConditionFailed,
-						ConditionType: condType,
-						Message:       fmt.Sprintf("argument %q array contains a blank element", argName),
-						Details:       map[string]interface{}{"argument": argName},
-					}
-				}
-				out = append(out, strings.TrimSpace(s))
-			}
-		case []string:
-			// A library caller can populate Arguments with a native []string (JSON
-			// decoding yields []interface{}). Accept it with the same blank-entry
-			// validation rather than failing on a misleading "got []string" error.
-			for _, s := range t {
 				if strings.TrimSpace(s) == "" {
 					return nil, &ConditionError{
 						Code:          capability.ErrCodeConditionFailed,
@@ -645,14 +637,11 @@ func (e *Engine) handleAllowedExtensions(_ context.Context, cond capability.Cond
 		return cerr
 	}
 
-	// Normalize the allowlist once: lowercased, with a leading dot added only when
-	// the entry doesn't already start with one, so every entry is a dotted suffix
-	// matched on a dot boundary via HasSuffix (".gz" matches "data.gz" not
-	// "datagz"). This does not collapse extra dots an entry already starts with —
-	// an entry written as "..gz" is left as two leading dots, not folded down to
-	// one, so it would then only match a file name literally ending in "..gz".
-	// Blank entries are skipped, duplicates collapsed; an empty allowlist denies
-	// every path.
+	// The normalized allowlist: lowercased, every entry a dotted suffix matched on a
+	// dot boundary via HasSuffix (".gz" matches "data.gz" not "datagz"), blanks
+	// dropped and duplicates collapsed. Built once at manifest load (Compile) and
+	// merely read here; a condition built programmatically, with no load pass to
+	// compile it, normalizes on the spot instead. An empty allowlist denies every path.
 	//
 	// The match is intentionally asymmetric and broader than it looks: a SINGLE
 	// entry (".gz") matches BOTH "file.gz" AND "archive.tar.gz" (".gz" is a
@@ -662,22 +651,7 @@ func (e *Engine) handleAllowedExtensions(_ context.Context, cond capability.Cond
 	// in the manifest guide; changing the runtime match here would break
 	// purpose-built compound allowlists (the single-segment WARNING lives in the
 	// validation layer, not here).
-	allowed := make([]string, 0, len(ae.Extensions))
-	seen := make(map[string]struct{}, len(ae.Extensions))
-	for _, ext := range ae.Extensions {
-		n := strings.ToLower(strings.TrimSpace(ext))
-		if n == "" {
-			continue
-		}
-		if !strings.HasPrefix(n, ".") {
-			n = "." + n
-		}
-		if _, dup := seen[n]; dup {
-			continue
-		}
-		seen[n] = struct{}{}
-		allowed = append(allowed, n)
-	}
+	allowed := ae.MatchExtensions()
 
 	for _, filePath := range paths {
 		// Normalize '\' separators to '/' and percent-decode (%2f -> '/', %2e -> '.')
@@ -810,29 +784,13 @@ func (e *Engine) handleAllowedTables(_ context.Context, cond capability.Conditio
 		}
 	}
 
-	// Table and column names are matched case-insensitively: many databases (MySQL,
-	// SQL Server) treat identifiers case-insensitively, so a case-sensitive match
-	// would let "Password_Hash" slip past a column ACL written as "password_hash".
-	// Trim each allowlist entry before lowercasing: request table names are already
-	// whitespace-trimmed (parseTableArgument), so a manifest entry carrying surrounding
-	// whitespace (" users") would never match and silently deny every call. Mirrors
-	// handleAllowedExtensions, which trims for the same reason.
-	allowedTableSet := make(map[string]bool, len(at.Tables))
-	for _, t := range at.Tables {
-		allowedTableSet[strings.ToLower(strings.TrimSpace(t))] = true
-	}
-
-	// Index the column-restriction map by lowercased table name so the per-table
-	// lookup is case-insensitive too (else a "users" restriction would miss table
-	// "USERS" and skip the column ACL). Values keep the original-case column lists
-	// so denial details echo the manifest.
-	var columnsByTable map[string][]string
-	if at.Columns != nil {
-		columnsByTable = make(map[string][]string, len(at.Columns))
-		for table, cols := range at.Columns {
-			columnsByTable[strings.ToLower(strings.TrimSpace(table))] = cols
-		}
-	}
+	// The case-folded lookup structures: the allowed-table set, the column-restriction
+	// index (keyed by lowercased table so a "users" restriction still covers table
+	// "USERS" rather than skipping the column ACL, with values in original case so
+	// denial details echo the manifest), and the per-table matching column sets. Built
+	// once at manifest load (Compile) and merely read here; a condition built
+	// programmatically, with no load pass to compile it, builds them on the spot.
+	allowedTableSet, columnsByTable, columnSets := at.TableLookup()
 
 	for _, access := range tables {
 		tableKey := strings.ToLower(access.Table)
@@ -864,10 +822,7 @@ func (e *Engine) handleAllowedTables(_ context.Context, cond capability.Conditio
 						},
 					}
 				}
-				colSet := make(map[string]bool, len(allowedCols))
-				for _, c := range allowedCols {
-					colSet[strings.ToLower(strings.TrimSpace(c))] = true
-				}
+				colSet := columnSets[tableKey]
 				for _, col := range access.Columns {
 					// Trim the request column to match the trimmed allowlist set:
 					// parseTableArgument stores column names verbatim (only blank-rejecting),
@@ -915,14 +870,10 @@ func (e *Engine) handleRecipientDomain(_ context.Context, cond capability.Condit
 		return cerr
 	}
 
-	// Trim each allowlist entry before lowercasing: recipients are already
-	// whitespace-trimmed (resolveStringOrStringArray), so a manifest entry with
-	// surrounding whitespace ("example.com ") would never match and silently deny every
-	// call. Mirrors handleAllowedExtensions, which trims for the same reason.
-	domainSet := make(map[string]bool, len(rd.Domains))
-	for _, d := range rd.Domains {
-		domainSet[strings.ToLower(strings.TrimSpace(d))] = true
-	}
+	// The lowercased, trimmed domain set. Built once at manifest load (Compile) and
+	// merely read here; a condition built programmatically, with no load pass to
+	// compile it, builds it on the spot.
+	domainSet := rd.MatchDomains()
 
 	for _, recipient := range recipients {
 		parts := strings.SplitN(recipient, "@", 2)
@@ -1059,22 +1010,18 @@ func OperationVerb(s string) string {
 }
 
 // MatchAllowedOperation reports whether op is in the allowed operations set,
-// compared case-insensitively. A "*" entry is NOT a wildcard here — it is rejected
-// at manifest load (validateAllowedOperations), so a literal "*" only ever matches
-// the operation "*". Shared by handleAllowedOperations and the JWT shorthand PDP so
-// operation-matching semantics live in one place rather than two parallel copies.
+// compared case-insensitively with each entry trimmed. A "*" entry is NOT a wildcard
+// here — it is rejected at manifest load (validateAllowedOperations), so a literal
+// "*" only ever matches the operation "*".
+//
+// It is the entry point for callers holding a bare operation slice with no condition
+// to compile — the JWT shorthand PDP, whose operation claims never pass through the
+// manifest validator. The manifest path goes through
+// AllowedOperationsCondition.AllowsOperation, which matches the entries Compile
+// pre-trimmed at load; both resolve to capability.MatchOperation's rule, so the two
+// cannot drift.
 func MatchAllowedOperation(allowed []string, op string) bool {
-	for _, a := range allowed {
-		// Trim each allowlist entry: the request verb is already whitespace-trimmed
-		// (OperationVerb), so an entry with surrounding whitespace ("SELECT ") would
-		// never EqualFold-match and silently deny every call. This path is also shared
-		// with the JWT shorthand PDP, whose operation claims never pass through the
-		// manifest validator, so the trim matters there too.
-		if strings.EqualFold(strings.TrimSpace(a), op) {
-			return true
-		}
-	}
-	return false
+	return capability.MatchOperation(allowed, op)
 }
 
 // numericEqual reports whether a and b are both numeric and equal in value,
@@ -1275,11 +1222,11 @@ func (e *Engine) handleSequenceBlock(ctx context.Context, cond capability.Condit
 	history := e.counter // non-nil: the e.counter == nil guard above already denied
 
 	// Resolve the blocked target's namespace as RecordSessionCall does: prefer the
-	// explicit req.Target.Type, falling back to the req.ToolName prefix (bare
-	// defaults to "tool"), and to req.Target.Name when req.ToolName is empty
+	// explicit req.Target.Type, falling back to the req.TargetName prefix (bare
+	// defaults to "tool"), and to req.Target.Name when req.TargetName is empty
 	// (resource/prompt requests carry the identifier there). Reporting in
 	// namespace:name form disambiguates same-named targets in the audit log.
-	blockedType, blockedName := splitEnginePrefix(req.ToolName)
+	blockedType, blockedName := splitEnginePrefix(req.TargetName)
 	if req.Target != nil {
 		if req.Target.Type != "" {
 			blockedType = req.Target.Type
@@ -1289,7 +1236,7 @@ func (e *Engine) handleSequenceBlock(ctx context.Context, cond capability.Condit
 		}
 	}
 	blockedTarget := blockedType + ":" + blockedName
-	// When no name is present (both req.ToolName and req.Target.Name absent), report
+	// When no name is present (both req.TargetName and req.Target.Name absent), report
 	// "(unknown)" rather than the misleading "tool:" sentinel, so a SIEM rule parsing
 	// blockedTool as namespace:name does not extract an empty name.
 	blockedDetail := blockedTarget
@@ -1406,14 +1353,12 @@ func (e *Engine) handleCustom(_ context.Context, cond capability.Condition, _ *c
 // deny fail-closed rather than silently evaluating the valid subset (matching
 // allowedExtensions and recipientDomain).
 func parseTableArgument(v interface{}) ([]capability.TableAccess, error) {
-	switch t := v.(type) {
-	case string:
-		if s := strings.TrimSpace(t); s != "" {
-			return []capability.TableAccess{{Table: s}}, nil
-		}
-	case []interface{}:
+	// Both array shapes share ONE arm (see asInterfaceSlice). Checked before the type
+	// switch so a native []string reaches the same blank-element and non-string-item
+	// rules as a decoded []interface{} rather than a mirrored copy of them.
+	if items, isArray := asInterfaceSlice(v); isArray {
 		var out []capability.TableAccess
-		for _, item := range t {
+		for _, item := range items {
 			switch item.(type) {
 			case string, map[string]interface{}:
 				parsed, err := parseTableArgument(item)
@@ -1434,20 +1379,12 @@ func parseTableArgument(v interface{}) ([]capability.TableAccess, error) {
 			}
 		}
 		return out, nil
-	case []string:
-		// A library caller can pass a native []string (JSON decoding yields
-		// []interface{}), which would otherwise hit default and be denied on a "got
-		// []string" error. Mirror the []interface{} arm, failing closed on a blank
-		// element in a populated array.
-		var out []capability.TableAccess
-		for _, name := range t {
-			trimmed := strings.TrimSpace(name)
-			if trimmed == "" {
-				return nil, fmt.Errorf("array element is an empty or blank table name")
-			}
-			out = append(out, capability.TableAccess{Table: trimmed})
+	}
+	switch t := v.(type) {
+	case string:
+		if s := strings.TrimSpace(t); s != "" {
+			return []capability.TableAccess{{Table: s}}, nil
 		}
-		return out, nil
 	case map[string]interface{}:
 		tableName, _ := t["table"].(string)
 		if tableName = strings.TrimSpace(tableName); tableName == "" {
@@ -1458,10 +1395,15 @@ func parseTableArgument(v interface{}) ([]capability.TableAccess, error) {
 			return nil, fmt.Errorf("is a map with no non-empty 'table' entry")
 		}
 		ta := capability.TableAccess{Table: tableName}
-		switch cols := t["columns"].(type) {
-		case nil:
-			// No "columns" entry: unrestricted column access (intentional).
-		case []interface{}:
+		// An absent "columns" entry (or an explicit JSON null) means unrestricted column
+		// access, intentionally. Anything present must be an array of strings; a silently
+		// unhandled shape would leave ta.Columns nil, which reads as "allow all columns"
+		// and turns an intended restriction into a wildcard.
+		if rawCols := t["columns"]; rawCols != nil {
+			cols, isArray := asInterfaceSlice(rawCols)
+			if !isArray {
+				return nil, fmt.Errorf("table %q columns must be an array of strings; got %T", tableName, rawCols)
+			}
 			for _, c := range cols {
 				col, ok := c.(string)
 				if !ok {
@@ -1474,18 +1416,6 @@ func parseTableArgument(v interface{}) ([]capability.TableAccess, error) {
 				}
 				ta.Columns = append(ta.Columns, col)
 			}
-		case []string:
-			// A library caller can set "columns" to a native []string. Without this
-			// case the assertion failed silently, leaving ta.Columns nil — which means
-			// "allow all columns", turning an intended restriction into a wildcard.
-			for _, col := range cols {
-				if strings.TrimSpace(col) == "" {
-					return nil, fmt.Errorf("table %q columns list contains an empty or blank column name", tableName)
-				}
-				ta.Columns = append(ta.Columns, col)
-			}
-		default:
-			return nil, fmt.Errorf("table %q columns must be an array of strings; got %T", tableName, t["columns"])
 		}
 		return []capability.TableAccess{ta}, nil
 	default:
@@ -1496,6 +1426,33 @@ func parseTableArgument(v interface{}) ([]capability.TableAccess, error) {
 		return nil, fmt.Errorf("must be a string, object, or array of strings/objects; got %T", v)
 	}
 	return nil, nil
+}
+
+// asInterfaceSlice normalizes the two shapes a JSON array argument arrives in onto
+// one slice: []interface{} from a JSON decode, and []string from a library caller
+// populating EnforceRequest.Arguments natively. ok is false for anything that is not
+// an array, which each caller reports as its own type mismatch.
+//
+// The point is that every array-validating parser then has ONE arm to get right. The
+// blank-element and non-string-item checks those parsers run are fail-closed security
+// rules (a dropped blank element quietly changes the enforced policy; an unhandled
+// []string used to leave a column restriction nil, which reads as "allow all
+// columns"), and hand-mirroring them per shape is exactly how one copy loses a check.
+// A native []string is copied into a fresh []interface{} rather than validated in
+// place; the slices are small (a tool's argument list) and this runs only for an
+// argument that is actually an array.
+func asInterfaceSlice(v interface{}) ([]interface{}, bool) {
+	switch t := v.(type) {
+	case []interface{}:
+		return t, true
+	case []string:
+		out := make([]interface{}, len(t))
+		for i, s := range t {
+			out[i] = s
+		}
+		return out, true
+	}
+	return nil, false
 }
 
 // asCondition returns cond as *T, accepting either a *T or a value T, since a

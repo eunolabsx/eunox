@@ -988,13 +988,13 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 	// constraint downgrades to a forwarded allow can still record the antecedent in
 	// session history — otherwise a later sequenceBlock naming this target in
 	// afterTools Peeks an empty history and fails OPEN though the tool ran.
-	// ToolName/Target carry target.Name (for input.target.* and the audit record);
+	// TargetName/Target carry target.Name (for input.target.* and the audit record);
 	// Claims back input.claims.agent_id/task_id/etc.
 	req := &capability.EnforceRequest{
-		SessionID: sessionID,
-		ToolName:  target.Name,
-		Arguments: args,
-		Context:   capability.EnforceRequestContext{SourceIP: sourceIP},
+		SessionID:  sessionID,
+		TargetName: target.Name,
+		Arguments:  args,
+		Context:    capability.EnforceRequestContext{SourceIP: sourceIP},
 		Target: &capability.EnforceRequestTarget{
 			Type: string(target.Type),
 			Name: target.Name,
@@ -1560,10 +1560,10 @@ func (p *ManifestPDP) DecideSampling(ctx context.Context, sessionID, sourceIP st
 	// Sampling keeps its own constraint-resolution head but shares evaluateAndRecord
 	// so its condition tail cannot drift from the other paths.
 	req := &capability.EnforceRequest{
-		SessionID: sessionID,
-		ToolName:  capability.MethodSamplingCreateMessage,
-		Arguments: map[string]interface{}{},
-		Context:   capability.EnforceRequestContext{SourceIP: sourceIP},
+		SessionID:  sessionID,
+		TargetName: capability.MethodSamplingCreateMessage,
+		Arguments:  map[string]interface{}{},
+		Context:    capability.EnforceRequestContext{SourceIP: sourceIP},
 		Target: &capability.EnforceRequestTarget{
 			Type: string(capability.TargetTypeSystem),
 			Name: capability.MethodSamplingCreateMessage,

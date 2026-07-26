@@ -29,7 +29,7 @@ func TestSequenceBlock_NilTargetEmptyName_BlockedToolIsUnknown(t *testing.T) {
 	// Peek finds it. A bare ToolName defaults to the "tool" namespace, matching how
 	// the blocked sequenceBlock entry resolves its antecedent.
 	antecedent := &capability.Constraint{Target: "tool:read_credentials", Actions: []string{"call"}}
-	antReq := &capability.EnforceRequest{SessionID: "sess-1", ToolName: "read_credentials"}
+	antReq := &capability.EnforceRequest{SessionID: "sess-1", TargetName: "read_credentials"}
 	resp := engine.EvaluateConditions(context.Background(), antReq, antecedent)
 	require.Equal(t, capability.DecisionAllow, resp.Decision)
 
@@ -43,9 +43,9 @@ func TestSequenceBlock_NilTargetEmptyName_BlockedToolIsUnknown(t *testing.T) {
 		},
 	}
 	blockedReq := &capability.EnforceRequest{
-		SessionID: "sess-1",
-		ToolName:  "", // no name on either field
-		Target:    nil,
+		SessionID:  "sess-1",
+		TargetName: "", // no name on either field
+		Target:     nil,
 	}
 	resp = engine.EvaluateConditions(context.Background(), blockedReq, blocked)
 	require.Equal(t, capability.DecisionDeny, resp.Decision)
@@ -67,7 +67,7 @@ func TestSequenceBlock_NamedBlockedToolStillReported(t *testing.T) {
 	engine := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()))
 
 	antecedent := &capability.Constraint{Target: "tool:read_credentials", Actions: []string{"call"}}
-	antReq := &capability.EnforceRequest{SessionID: "sess-1", ToolName: "read_credentials"}
+	antReq := &capability.EnforceRequest{SessionID: "sess-1", TargetName: "read_credentials"}
 	engine.EvaluateConditions(context.Background(), antReq, antecedent)
 
 	blocked := &capability.Constraint{
@@ -77,7 +77,7 @@ func TestSequenceBlock_NamedBlockedToolStillReported(t *testing.T) {
 			&capability.SequenceBlockCondition{AfterTools: []string{"read_credentials"}},
 		},
 	}
-	blockedReq := &capability.EnforceRequest{SessionID: "sess-1", ToolName: "write_external"}
+	blockedReq := &capability.EnforceRequest{SessionID: "sess-1", TargetName: "write_external"}
 	resp := engine.EvaluateConditions(context.Background(), blockedReq, blocked)
 	require.Equal(t, capability.DecisionDeny, resp.Decision)
 	require.NotNil(t, resp.Denial)
@@ -101,9 +101,9 @@ func TestSequenceBlock_NamespacePrefixedAntecedentName_BothSpellingsMatch(t *tes
 		// Antecedent: a tool literally NAMED "system:foo" (Target.Type "tool",
 		// Target.Name "system:foo"), recorded verbatim by the allow path.
 		antReq := &capability.EnforceRequest{
-			SessionID: "sess",
-			ToolName:  "system:foo",
-			Target:    &capability.EnforceRequestTarget{Type: "tool", Name: "system:foo"},
+			SessionID:  "sess",
+			TargetName: "system:foo",
+			Target:     &capability.EnforceRequestTarget{Type: "tool", Name: "system:foo"},
 		}
 		ant := &capability.Constraint{Target: "tool:system:foo", Actions: []string{"call"}}
 		resp := engine.EvaluateConditions(context.Background(), antReq, ant)
@@ -117,9 +117,9 @@ func TestSequenceBlock_NamespacePrefixedAntecedentName_BothSpellingsMatch(t *tes
 			},
 		}
 		blockedReq := &capability.EnforceRequest{
-			SessionID: "sess",
-			ToolName:  "write_external",
-			Target:    &capability.EnforceRequestTarget{Type: "tool", Name: "write_external"},
+			SessionID:  "sess",
+			TargetName: "write_external",
+			Target:     &capability.EnforceRequestTarget{Type: "tool", Name: "write_external"},
 		}
 		resp = engine.EvaluateConditions(context.Background(), blockedReq, blocked)
 		return resp.Decision
@@ -143,9 +143,9 @@ func TestSequenceBlock_PlainAntecedentName_WritesSingleMarker(t *testing.T) {
 	engine := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()))
 
 	antReq := &capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "read_file",
-		Target:    &capability.EnforceRequestTarget{Type: "tool", Name: "read_file"},
+		SessionID:  "sess",
+		TargetName: "read_file",
+		Target:     &capability.EnforceRequestTarget{Type: "tool", Name: "read_file"},
 	}
 	ant := &capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}}
 	resp := engine.EvaluateConditions(context.Background(), antReq, ant)
@@ -161,9 +161,9 @@ func TestSequenceBlock_PlainAntecedentName_WritesSingleMarker(t *testing.T) {
 		},
 	}
 	blockedReq := &capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "write_external",
-		Target:    &capability.EnforceRequestTarget{Type: "tool", Name: "write_external"},
+		SessionID:  "sess",
+		TargetName: "write_external",
+		Target:     &capability.EnforceRequestTarget{Type: "tool", Name: "write_external"},
 	}
 	resp = engine.EvaluateConditions(context.Background(), blockedReq, blocked)
 	assert.Equal(t, capability.DecisionAllow, resp.Decision, "a prompt-namespaced antecedent must not match a tool of the same bare name")
@@ -188,9 +188,9 @@ func extCaps(extensions []string) []capability.Constraint {
 func callExt(t *testing.T, engine *enforcement.Engine, caps []capability.Constraint, path string) capability.EnforceResponse {
 	t.Helper()
 	req := &capability.EnforceRequest{
-		SessionID: "s",
-		ToolName:  "read_file",
-		Arguments: map[string]interface{}{"path": path},
+		SessionID:  "s",
+		TargetName: "read_file",
+		Arguments:  map[string]interface{}{"path": path},
 	}
 	resp := engine.ValidateAction(context.Background(), req, caps)
 	return resp

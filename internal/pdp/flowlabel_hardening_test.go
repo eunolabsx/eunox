@@ -151,7 +151,7 @@ func TestFlowHardening_AuditModePeekFailsClosed(t *testing.T) {
 		Enforcement: capability.EnforcementAudit,
 		Directives:  []capability.Directive{capability.LabelOutputDirective{Labels: []string{capability.FlowLabelConfidential}}},
 	}
-	req := &capability.EnforceRequest{SessionID: "s", ToolName: "read_secret"}
+	req := &capability.EnforceRequest{SessionID: "s", TargetName: "read_secret"}
 	// A downgradable deny with no carried labels stamped yet (the structural early-return
 	// shape), so recordAuditModeAntecedent must do the pre-write peek — which faults.
 	resp := &capability.EnforceResponse{Decision: capability.DecisionDeny}

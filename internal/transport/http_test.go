@@ -1285,13 +1285,13 @@ func postMCPJSON(t *testing.T, srv *httptest.Server, body interface{}, sessionID
 
 // capturedRecord captures an audit decision for assertions.
 type capturedRecord struct {
-	SessionID string
-	ToolName  string
-	Method    string
-	Decision  string
-	Code      string
-	Details   map[string]interface{}
-	Audit     bool
+	SessionID  string
+	TargetName string
+	Method     string
+	Decision   string
+	Code       string
+	Details    map[string]interface{}
+	Audit      bool
 }
 
 // newAuditProxy returns an HTTPProxy in audit (observe) mode, backed by the
@@ -1415,10 +1415,10 @@ func TestAudit_RecordsObserveFlag(t *testing.T) {
 		inner: denyAllPDP{},
 		onDecide: func(sessionID, toolName string, resp capability.EnforceResponse) {
 			recorded = append(recorded, capturedRecord{
-				SessionID: sessionID,
-				ToolName:  toolName,
-				Decision:  string(resp.Decision),
-				Audit:     proxyWithSink.routes[""].audit,
+				SessionID:  sessionID,
+				TargetName: toolName,
+				Decision:   string(resp.Decision),
+				Audit:      proxyWithSink.routes[""].audit,
 			})
 		},
 	}

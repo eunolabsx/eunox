@@ -20,10 +20,24 @@ type EnforceRequestTarget struct {
 
 // EnforceRequest is the input payload for runtime capability enforcement.
 type EnforceRequest struct {
-	SessionID string                 `json:"sessionId"`
-	ToolName  string                 `json:"toolName"`
-	Arguments map[string]interface{} `json:"arguments"`
-	Context   EnforceRequestContext  `json:"context"`
+	SessionID string `json:"sessionId"`
+	// TargetName identifies what is being enforced, in the OPTIONALLY PREFIXED
+	// spelling the caller used: a bare tool name ("read_file"), an explicitly
+	// namespaced one ("tool:read_file"), a resource URI ("resource:file:///etc/hosts"),
+	// a prompt ("prompt:summarize"), or a system target
+	// ("system:sampling/createMessage"). A bare name defaults to the tool namespace.
+	//
+	// It is deliberately NOT tool-only — every namespace the proxy enforces arrives
+	// here — which is why it is not called ToolName: under that name the field read as
+	// a tool identifier while carrying resource URIs and system targets, so every
+	// helper reconciling it with Target had to spend a paragraph on the mismatch.
+	// Target carries the same identity already SPLIT into (type, bare name) and is set
+	// by every ManifestPDP entry point; prefer it when you have it, and treat this
+	// field as the caller-supplied spelling to be split (splitEnginePrefix) or matched
+	// verbatim.
+	TargetName string                 `json:"targetName"`
+	Arguments  map[string]interface{} `json:"arguments"`
+	Context    EnforceRequestContext  `json:"context"`
 	// Target carries the namespace type and bare name of the resource being
 	// enforced. Populated by ManifestPDP.Decide; available as input.target in
 	// Rego policy conditions. Nil when not set.

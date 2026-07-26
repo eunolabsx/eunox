@@ -325,7 +325,7 @@ func TestRecordAuditModeAntecedent_RecordsOnlyOnAuditDeny(t *testing.T) {
 	t.Parallel()
 	counter := &recordingCounter{}
 	engine := enforcement.New(enforcement.WithCallCounter(counter))
-	req := &capability.EnforceRequest{SessionID: "s", ToolName: "t"}
+	req := &capability.EnforceRequest{SessionID: "s", TargetName: "t"}
 	auditOnly := &capability.Constraint{Target: "tool:t", Actions: []string{"call"}, Enforcement: capability.EnforcementAudit}
 	enforced := &capability.Constraint{Target: "tool:t", Actions: []string{"call"}}
 
@@ -369,7 +369,7 @@ func TestRecordAuditModeAntecedent_BackfillsFlowLabels(t *testing.T) {
 		Actions:    []string{"call"},
 		Directives: []capability.Directive{capability.LabelOutputDirective{Labels: []string{capability.FlowLabelInternal}}},
 	}
-	_, err := engine.RecordLabels(ctx, &capability.EnforceRequest{SessionID: "s", ToolName: "a"}, prior)
+	_, err := engine.RecordLabels(ctx, &capability.EnforceRequest{SessionID: "s", TargetName: "a"}, prior)
 	require.NoError(t, err)
 
 	// An audit-only source read that labels its output "confidential", hitting a
@@ -380,7 +380,7 @@ func TestRecordAuditModeAntecedent_BackfillsFlowLabels(t *testing.T) {
 		Enforcement: capability.EnforcementAudit,
 		Directives:  []capability.Directive{capability.LabelOutputDirective{Labels: []string{capability.FlowLabelConfidential}}},
 	}
-	req := &capability.EnforceRequest{SessionID: "s", ToolName: "t"}
+	req := &capability.EnforceRequest{SessionID: "s", TargetName: "t"}
 	resp := &capability.EnforceResponse{Decision: capability.DecisionDeny}
 	override := recordAuditModeAntecedent(ctx, engine, engine.Clock(), req, src, resp)
 
@@ -409,12 +409,12 @@ func TestRecordAuditModeAntecedent_NonFlowConstraintNoLabels(t *testing.T) {
 		Actions:    []string{"call"},
 		Directives: []capability.Directive{capability.LabelOutputDirective{Labels: []string{capability.FlowLabelConfidential}}},
 	}
-	_, err := engine.RecordLabels(ctx, &capability.EnforceRequest{SessionID: "s", ToolName: "a"}, src)
+	_, err := engine.RecordLabels(ctx, &capability.EnforceRequest{SessionID: "s", TargetName: "a"}, src)
 	require.NoError(t, err)
 
 	// A non-flow audit-only constraint hits a downgradable deny in the SAME tainted session.
 	nonFlow := &capability.Constraint{Target: "tool:ping", Actions: []string{"call"}, Enforcement: capability.EnforcementAudit}
-	req := &capability.EnforceRequest{SessionID: "s", ToolName: "ping"}
+	req := &capability.EnforceRequest{SessionID: "s", TargetName: "ping"}
 	resp := &capability.EnforceResponse{Decision: capability.DecisionDeny}
 	override := recordAuditModeAntecedent(ctx, engine, engine.Clock(), req, nonFlow, resp)
 

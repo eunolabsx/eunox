@@ -486,7 +486,7 @@ func assertManifestAllows(t *testing.T, manifestYAML, tool string, args map[stri
 		t.Fatalf("generated manifest failed to load:\n%s\nerror: %v", manifestYAML, err)
 	}
 	resp := enforcement.New().ValidateAction(context.Background(),
-		&capability.EnforceRequest{SessionID: "s1", ToolName: tool, Arguments: args},
+		&capability.EnforceRequest{SessionID: "s1", TargetName: tool, Arguments: args},
 		m.Capabilities)
 	if resp.Decision != capability.DecisionAllow {
 		code := ""

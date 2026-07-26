@@ -218,9 +218,9 @@ func TestArgumentSchema_RequiredFieldMissing(t *testing.T) {
 	}
 
 	req := &capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "query_db",
-		Arguments: map[string]interface{}{}, // missing "sql"
+		SessionID:  "sess",
+		TargetName: "query_db",
+		Arguments:  map[string]interface{}{}, // missing "sql"
 	}
 
 	resp := e.ValidateAction(context.Background(), req, constraints)
@@ -259,9 +259,9 @@ func TestArgumentSchema_StructureWins_MalformedAndPolicyViolating(t *testing.T) 
 
 	// Missing required field "body" AND "to" value violates allowedValues.
 	req := &capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "send_email",
-		Arguments: map[string]interface{}{"to": "attacker@evil.com"},
+		SessionID:  "sess",
+		TargetName: "send_email",
+		Arguments:  map[string]interface{}{"to": "attacker@evil.com"},
 	}
 
 	resp := e.ValidateAction(context.Background(), req, constraints)
@@ -294,9 +294,9 @@ func TestArgumentSchema_SchemaPass_ConditionFail(t *testing.T) {
 
 	// Schema passes (path is present) but condition fails (path not in /reports/).
 	req := &capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "read_file",
-		Arguments: map[string]interface{}{"path": "/etc/passwd"},
+		SessionID:  "sess",
+		TargetName: "read_file",
+		Arguments:  map[string]interface{}{"path": "/etc/passwd"},
 	}
 
 	resp := e.ValidateAction(context.Background(), req, constraints)
@@ -332,9 +332,9 @@ func TestArgumentSchema_SchemaPass_ConditionPass_Allow(t *testing.T) {
 	}
 
 	req := &capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "read_file",
-		Arguments: map[string]interface{}{"path": "/reports/q3.pdf"},
+		SessionID:  "sess",
+		TargetName: "read_file",
+		Arguments:  map[string]interface{}{"path": "/reports/q3.pdf"},
 	}
 
 	resp := e.ValidateAction(context.Background(), req, constraints)
@@ -357,9 +357,9 @@ func TestArgumentSchema_NilSchema_NoInvalidParams(t *testing.T) {
 	}
 
 	req := &capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "any_tool",
-		Arguments: map[string]interface{}{"random": "data"},
+		SessionID:  "sess",
+		TargetName: "any_tool",
+		Arguments:  map[string]interface{}{"random": "data"},
 	}
 
 	resp := e.ValidateAction(context.Background(), req, constraints)
@@ -394,9 +394,9 @@ func TestArgumentSchema_PatternViolation(t *testing.T) {
 	}
 
 	req := &capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "create_report",
-		Arguments: map[string]interface{}{"title": "lowercase-start"},
+		SessionID:  "sess",
+		TargetName: "create_report",
+		Arguments:  map[string]interface{}{"title": "lowercase-start"},
 	}
 
 	resp := e.ValidateAction(context.Background(), req, constraints)
@@ -425,9 +425,9 @@ func TestArgumentSchema_MinimumViolation(t *testing.T) {
 	}
 
 	req := &capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "paginate",
-		Arguments: map[string]interface{}{"page": float64(0)},
+		SessionID:  "sess",
+		TargetName: "paginate",
+		Arguments:  map[string]interface{}{"page": float64(0)},
 	}
 
 	resp := e.ValidateAction(context.Background(), req, constraints)
@@ -456,9 +456,9 @@ func TestArgumentSchema_AdditionalPropertiesDenied(t *testing.T) {
 	}
 
 	req := &capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "strict_tool",
-		Arguments: map[string]interface{}{"name": "Alice", "role": "admin"},
+		SessionID:  "sess",
+		TargetName: "strict_tool",
+		Arguments:  map[string]interface{}{"name": "Alice", "role": "admin"},
 	}
 
 	resp := e.ValidateAction(context.Background(), req, constraints)
@@ -958,18 +958,18 @@ func TestArgumentSchema_IntegerType_DeniedThroughEngine(t *testing.T) {
 
 	// Non-integer is denied with INVALID_PARAMS.
 	resp := e.ValidateAction(context.Background(), &capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "query_db",
-		Arguments: map[string]interface{}{"limit": float64(3.14)},
+		SessionID:  "sess",
+		TargetName: "query_db",
+		Arguments:  map[string]interface{}{"limit": float64(3.14)},
 	}, constraints)
 	assert.Equal(t, capability.DecisionDeny, resp.Decision)
 	assert.Equal(t, capability.ErrCodeInvalidParams, resp.Denial.Code)
 
 	// Whole-number value passes.
 	resp = e.ValidateAction(context.Background(), &capability.EnforceRequest{
-		SessionID: "sess",
-		ToolName:  "query_db",
-		Arguments: map[string]interface{}{"limit": float64(3)},
+		SessionID:  "sess",
+		TargetName: "query_db",
+		Arguments:  map[string]interface{}{"limit": float64(3)},
 	}, constraints)
 	assert.Equal(t, capability.DecisionAllow, resp.Decision)
 }
