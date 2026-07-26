@@ -5,6 +5,7 @@ package capability
 
 import (
 	"context"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -112,6 +113,48 @@ func TestJWKSCache_SameHostRedirectAllowed(t *testing.T) {
 	}
 	if len(set.Keys) != 1 || set.Keys[0].KeyID != "real" {
 		t.Fatalf("expected the real key set, got %+v", set.Keys)
+	}
+}
+
+// nilRequestRoundTripper answers every request with a canned response whose Request field is
+// left nil, simulating a caller-supplied RoundTripper that builds its own *http.Response
+// rather than going through the standard net/http machinery that always populates it (the
+// field is documented as "only populated for Client requests" — no RoundTripper is required
+// to set it).
+type nilRequestRoundTripper struct {
+	body string
+}
+
+func (rt *nilRequestRoundTripper) RoundTrip(_ *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(rt.body)),
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		// Request is deliberately left nil.
+	}, nil
+}
+
+// TestJWKSCache_NilRequestResponseRefusedClosed pins that a response carrying no Request
+// (and so no final-URL information to compare against the configured JWKS host) is refused
+// rather than treated as an implicit allow. This is the one shape refuseCrossOriginResponse
+// cannot verify, and it is exactly what a caller-supplied client's custom RoundTripper can
+// produce — the same caller-supplied-client scenario the same-origin floor exists to cover
+// even when the client's own CheckRedirect has been overridden.
+func TestJWKSCache_NilRequestResponseRefusedClosed(t *testing.T) {
+	t.Parallel()
+
+	const attackerKeys = `{"keys":[{"kty":"oct","kid":"attacker","k":"AAAA"}]}`
+	c := NewJWKSCache(JWKSCacheConfig{
+		JWKSURL: "https://idp.example.com/.well-known/jwks.json",
+		Client:  &http.Client{Transport: &nilRequestRoundTripper{body: attackerKeys}},
+	})
+
+	_, err := c.fetchKeys(context.Background())
+	if err == nil {
+		t.Fatal("a response with no Request field must be refused, not silently trusted")
+	}
+	if !strings.Contains(err.Error(), "no final-request URL") {
+		t.Fatalf("error should name the missing-Request reason, got: %v", err)
 	}
 }
 

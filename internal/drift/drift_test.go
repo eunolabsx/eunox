@@ -2008,11 +2008,11 @@ func TestResSpecificity_MatchesEngine(t *testing.T) {
 func TestToolsListCursorParams(t *testing.T) {
 	t.Parallel()
 
-	if got := ToolsListCursorParams(""); got != nil {
+	if got := toolsListCursorParams(""); got != nil {
 		t.Errorf("empty cursor must yield nil params, got %s", got)
 	}
 
-	raw := ToolsListCursorParams("page-2")
+	raw := toolsListCursorParams("page-2")
 	if raw == nil {
 		t.Fatal("non-empty cursor must yield params")
 	}

@@ -907,11 +907,21 @@ Resource URIs contain `/`, so `*` matches within a single path segment.
 
 | `target` value | Matches URI | Does **not** match |
 |---|---|---|
-| `resource:file:///data/reports/*` | `file:///data/reports/q3.pdf` | `file:///data/q3.pdf` |
+| `resource:file:///data/reports/*` | `file:///data/reports/q3.pdf` | `file:///data/q3.pdf`, `file:///data/reports/2026/q3.pdf` |
 | `resource:db://warehouse/*` | `db://warehouse/orders`, `db://warehouse/customers` | `db://analytics/orders` |
 | `resource:file:///data/public/readme.txt` | exact URI only | any other URI |
 | `resource:*` | (rejected — too broad) | — |
 | `resource:api://*` | (rejected — too broad) | — |
+
+> **`*` never crosses `/`, and there is no `**`.** A trailing `*` covers exactly
+> one path level, so `resource:file:///data/reports/*` permits
+> `file:///data/reports/q3.pdf` but **denies** the nested
+> `file:///data/reports/2026/q3.pdf`. This errs on the safe side — a nested
+> resource is refused, never wrongly allowed — but it is a common surprise. To
+> cover a deeper level, add an entry per level
+> (`resource:file:///data/reports/*/*`), or target the concrete subtree you mean.
+> The same rule applies to `/`-bearing values elsewhere in the grammar (see the
+> glob-semantics note under condition values).
 
 ### Prompt patterns (`prompt:`)
 

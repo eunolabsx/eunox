@@ -613,6 +613,12 @@ func recordForwardOutcome(ctx context.Context, strict bool, rec auditRecorder, s
 // kill-switch denial hard-blocks even then), leaving the two-record
 // deny-then-forward pattern. The transports differ only in fp.forward,
 // fp.writeUpstream, and fp.claims.
+//
+// Caller contract: msg is a REQUEST (both id and method — mcp.RPCMsg.IsRequest).
+// Both readUpstream loops reach this only inside that gate, and upstream
+// notifications take their own broadcast path there rather than arriving here. Every
+// denial below therefore answers the initiator unconditionally, with no
+// notification arm to skip the reply.
 func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestParams) {
 	const samplingMethod = capability.MethodSamplingCreateMessage
 	// Attach the session's JWT claims BEFORE the method split so both branches'
@@ -632,9 +638,7 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 			if fp.rec != nil {
 				fp.rec.RecordDeny(ctx, fp.sessionID, msg.Method, msg.Method, denial.Code, denial.ConditionType, nil, false)
 			}
-			if msg.IsRequest() {
-				fp.writeUpstream(mcp.ErrorResponse(msg.ID, denialToJSONRPCCode(denial.Code), denial.Code))
-			}
+			fp.writeUpstream(mcp.ErrorResponse(msg.ID, denialToJSONRPCCode(denial.Code), denial.Code))
 			return
 		}
 		// --require-audit=strict gates non-sampling server-initiated requests too: a

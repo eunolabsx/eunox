@@ -127,8 +127,7 @@ Usage:
   eunox validate     --config <eunox.yaml> [--live]
   eunox init         --upstream-url <url> [--output manifest.yaml] [--config-output eunox.yaml]
   eunox suggest      [--audit-log <path>] [--output manifest.yaml]
-  eunox kill         [--port N] [--host H] <session-id|all>
-  eunox kill         --redis-addr <host:port> <session-id|all>
+  eunox kill         [--port N | --redis-addr H:P] <session-id|all>
   eunox audit-verify [flags]
   eunox stats        [flags]
   eunox doctor       [flags]
@@ -142,10 +141,9 @@ Subcommands:
   init            Generate a deny-all starter manifest (and, with --config-output, a runnable config) from a live upstream's tool list.
   suggest         Generate a draft manifest from the audit log — grounds entries (and allowedValues
                   conditions) in what the agent actually did. Run a wiretap (proxy --audit) first.
-  kill            Activate the kill switch on a running deployment — via the HTTP
+  kill            Revoke one or all sessions on a running proxy — via the HTTP
                   control endpoint, or with --redis-addr via the shared Redis
-                  kill-switch state (the only channel for a stdio proxy, and the
-                  way to revoke across every instance sharing one Redis).
+                  kill switch (the only channel for a stdio proxy).
   audit-verify    Verify HMAC signatures in the local audit log.
   stats           Print a denial count histogram from the audit log.
   doctor          Print a user-initiated support bundle (redacted) for bug reports.

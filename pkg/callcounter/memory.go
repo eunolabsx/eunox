@@ -44,8 +44,9 @@ type InMemory struct {
 	mu      sync.RWMutex
 	entries map[string]*entry
 	now     func() time.Time
-	// maxKeys bounds how many distinct keys the map may hold at once; 0 (the
-	// default) leaves it unbounded. See WithMaxKeys and admitNewKey.
+	// maxKeys bounds how many (key, window) STORAGE ENTRIES the map may hold at once
+	// -- not logical keys; 0 (the default) leaves it unbounded. See WithMaxKeys and
+	// admitNewKey.
 	maxKeys int
 
 	// cleanupMu guards the cleanup-goroutine lifecycle state below. It replaces a
@@ -73,15 +74,21 @@ func WithTimeFunc(fn func() time.Time) InMemoryOption {
 	}
 }
 
-// WithMaxKeys bounds the number of distinct keys the counter holds at once,
+// WithMaxKeys bounds the number of STORAGE ENTRIES the counter holds at once,
 // capping the heap the map can consume between Cleanup cycles when unique keys
 // arrive faster than Cleanup reclaims them (the fresh-session-per-request case;
-// see NewInMemory). Once the map holds n entries, a call under a *new* key is
+// see NewInMemory). Once the map holds n entries, a call under a *new* entry is
 // refused with an error; both callers treat that fail-closed (maxCalls denies the
 // call, and the sequenceBlock recorder surfaces it so the engine denies). The cost
-// at the ceiling is availability — a new-key call is denied (CONDITION_FAILED)
-// while the map is full — not a bypass; existing keys keep counting and a key
+// at the ceiling is availability — a new-entry call is denied (CONDITION_FAILED)
+// while the map is full — not a bypass; existing entries keep counting and one
 // reclaimed by Cleanup frees a slot. A value <= 0 (the default) is unbounded.
+//
+// The unit is the (key, window) pair the map is keyed by (see storageKey), NOT the
+// logical key: a tool counted under two distinct maxCalls windows occupies two of
+// the n slots, so the ceiling is reached after n/windows logical keys, sooner than
+// a "distinct keys" reading of n would predict. Size the bound against the entry
+// count, not the key count.
 func WithMaxKeys(n int) InMemoryOption {
 	return func(m *InMemory) {
 		m.maxKeys = n
@@ -90,12 +97,13 @@ func WithMaxKeys(n int) InMemoryOption {
 
 // NewInMemory creates an in-memory sliding-window call counter.
 //
-// The key set is unbounded by default: every distinct (session, tool) pair is one
-// map entry, reclaimed only when Cleanup runs. A deployment that mints a fresh
-// session per request (short-lived HTTP connections with UUID Mcp-Session-Id) thus
-// peaks at one entry per unique session at the cleanup boundary, which a caller
-// driving unique IDs can push arbitrarily high. For such deployments prefer the
-// Redis backend (per-key TTL, off-heap) or pass WithMaxKeys to bound the count.
+// The entry set is unbounded by default: every distinct (session, tool, window)
+// combination is one map entry, reclaimed only when Cleanup runs. A deployment that
+// mints a fresh session per request (short-lived HTTP connections with UUID
+// Mcp-Session-Id) thus peaks at one entry per unique session per window at the
+// cleanup boundary, which a caller driving unique IDs can push arbitrarily high. For
+// such deployments prefer the Redis backend (per-key TTL, off-heap) or pass
+// WithMaxKeys to bound the count.
 //
 // Quota size is a second, orthogonal heap concern: IncrementIfBelow retains up to
 // limit timestamps per (key, window), so a large maxCalls.count also favours
@@ -111,14 +119,14 @@ func NewInMemory(opts ...InMemoryOption) *InMemory {
 	return m
 }
 
-// admitNewKey returns an error when inserting a previously-unseen key would push
-// the live key count past maxKeys; nil when the set is unbounded (maxKeys <= 0) or
-// has room. Call under m.mu and only on the new-key path (an existing key grows
-// the map by nothing). This is the fail-closed backstop for the unbounded-map
-// growth described on NewInMemory.
+// admitNewKey returns an error when inserting a previously-unseen (key, window)
+// storage entry would push the live entry count past maxKeys; nil when the set is
+// unbounded (maxKeys <= 0) or has room. Call under m.mu and only on the new-entry
+// path (an existing entry grows the map by nothing). This is the fail-closed
+// backstop for the unbounded-map growth described on NewInMemory.
 func (m *InMemory) admitNewKey() error {
 	if m.maxKeys > 0 && len(m.entries) >= m.maxKeys {
-		return fmt.Errorf("callcounter: key limit reached (%d)", m.maxKeys)
+		return fmt.Errorf("callcounter: entry limit reached (%d)", m.maxKeys)
 	}
 	return nil
 }
@@ -383,8 +391,10 @@ func (m *InMemory) IncrementIfAllBelow(_ context.Context, keys []string, windowS
 		return false, blocked, b.cur, retryAfterFromPivot(b.valid, b.cur, limits[blocked], b.window, now), nil
 	}
 
-	// All buckets have headroom → commit every one. Pre-check the key cap against the
-	// number of absent buckets so the batch is all-or-nothing against maxKeys too.
+	// All buckets have headroom → commit every one. Pre-check the entry cap against
+	// the number of absent buckets so the batch is all-or-nothing against maxKeys too.
+	// Each bucket is its own (key, window) storage entry, so a multi-window increment
+	// consumes several of the maxKeys slots at once.
 	newKeys := 0
 	for i := range states {
 		if states[i].e == nil {
@@ -392,7 +402,7 @@ func (m *InMemory) IncrementIfAllBelow(_ context.Context, keys []string, windowS
 		}
 	}
 	if m.maxKeys > 0 && len(m.entries)+newKeys > m.maxKeys {
-		return false, 0, 0, 0, fmt.Errorf("callcounter: key limit reached (%d)", m.maxKeys)
+		return false, 0, 0, 0, fmt.Errorf("callcounter: entry limit reached (%d)", m.maxKeys)
 	}
 	var maxCount int64
 	for i := range states {

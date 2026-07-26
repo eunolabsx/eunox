@@ -22,12 +22,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestCandidateKIDs covers the shared kid-extraction helper that both the
-// capability-token and IdP-JWT paths use: distinct first-seen ordering, the
-// requireKID policy (drop the "" try-all sentinel, require at least one explicit
-// kid), and the empty-header error. jwt.ParseSigned is compact-only so a parsed
-// token yields a single header in practice, but the helper's contract is exercised
-// directly here so the multi-header guard cannot silently regress.
+// TestCandidateKIDs covers the kid-extraction helper the IdP-JWT path uses:
+// distinct first-seen ordering, preservation of the "" try-all sentinel, and the
+// empty-header error. jwt.ParseSigned is compact-only so a parsed token yields a
+// single header in practice, but the helper's contract is exercised directly here
+// so the multi-header guard cannot silently regress.
 func TestCandidateKIDs(t *testing.T) {
 	hdr := func(kids ...string) []jose.Header {
 		h := make([]jose.Header, len(kids))
@@ -37,24 +36,22 @@ func TestCandidateKIDs(t *testing.T) {
 		return h
 	}
 	cases := []struct {
-		name       string
-		headers    []jose.Header
-		requireKID bool
-		want       []string
-		wantErr    bool
+		name    string
+		headers []jose.Header
+		want    []string
+		wantErr bool
 	}{
-		{"single kid", hdr("k1"), false, []string{"k1"}, false},
-		{"distinct ordered", hdr("a", "b"), false, []string{"a", "b"}, false},
-		{"dedup", hdr("a", "a", "b"), false, []string{"a", "b"}, false},
-		{"empty kid preserved without requireKID", hdr(""), false, []string{""}, false},
-		{"valid kid after empty without requireKID", hdr("", "valid"), false, []string{"", "valid"}, false},
-		{"requireKID drops empty, keeps explicit", hdr("", "valid"), true, []string{"valid"}, false},
-		{"requireKID all empty errors", hdr("", ""), true, nil, true},
-		{"no headers errors", nil, false, nil, true},
+		{"single kid", hdr("k1"), []string{"k1"}, false},
+		{"distinct ordered", hdr("a", "b"), []string{"a", "b"}, false},
+		{"dedup", hdr("a", "a", "b"), []string{"a", "b"}, false},
+		{"empty kid preserved as the try-all sentinel", hdr(""), []string{""}, false},
+		{"valid kid after empty", hdr("", "valid"), []string{"", "valid"}, false},
+		{"all-empty kids dedup to the single sentinel", hdr("", ""), []string{""}, false},
+		{"no headers errors", nil, nil, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := CandidateKIDs(tc.headers, tc.requireKID)
+			got, err := CandidateKIDs(tc.headers)
 			if tc.wantErr {
 				require.Error(t, err)
 				return

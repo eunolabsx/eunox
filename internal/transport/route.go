@@ -123,7 +123,20 @@ func (r *routeSink) RecordAllow(ctx context.Context, sessionID, identifier, meth
 	if r == nil || r.sink == nil {
 		return
 	}
-	r.sink.Record(ctx, r.upstream, r.policyVersion, r.policySHA256, sessionID, identifier, method, "allow", "", "", details, obligs, auditOnly, labelsOut, carriedLabels)
+	r.sink.Record(ctx, audit.RecordParams{
+		Upstream:      r.upstream,
+		PolicyVersion: r.policyVersion,
+		PolicySHA256:  r.policySHA256,
+		SessionID:     sessionID,
+		Identifier:    identifier,
+		Method:        method,
+		Decision:      "allow",
+		Details:       details,
+		Obligations:   obligs,
+		AuditOnly:     auditOnly,
+		LabelsOut:     labelsOut,
+		CarriedLabels: carriedLabels,
+	})
 }
 
 // RecordDeny stamps route identity onto a deny record (see RecordAllow).
@@ -131,7 +144,19 @@ func (r *routeSink) RecordDeny(ctx context.Context, sessionID, identifier, metho
 	if r == nil || r.sink == nil {
 		return
 	}
-	r.sink.Record(ctx, r.upstream, r.policyVersion, r.policySHA256, sessionID, identifier, method, "deny", denialCode, condType, details, nil, observe, nil, nil)
+	r.sink.Record(ctx, audit.RecordParams{
+		Upstream:      r.upstream,
+		PolicyVersion: r.policyVersion,
+		PolicySHA256:  r.policySHA256,
+		SessionID:     sessionID,
+		Identifier:    identifier,
+		Method:        method,
+		Decision:      "deny",
+		DenialCode:    denialCode,
+		ConditionType: condType,
+		Details:       details,
+		AuditOnly:     observe,
+	})
 }
 
 // AuditDegraded delegates to the shared sink so the --require-audit=strict gate
