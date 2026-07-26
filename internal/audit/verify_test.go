@@ -2191,3 +2191,92 @@ func TestVerifyAuditLog_AllLegacyUnderKeyIsUnanchored(t *testing.T) {
 		t.Errorf("all-legacy log under an empty keyring must pass (nothing to verify): %+v", res2)
 	}
 }
+
+// TestTruncatePartialTail_ReReadsWhenWindowClipsTheLastRecord covers the one path the
+// startup tail read cannot answer from the bytes already in hand: after truncating an
+// orphan fragment, the surviving window begins PART-WAY THROUGH the last complete record,
+// so that record's leading boundary is outside it. Returning what the window holds would
+// hand Open a record clipped at the window edge, which then fails to parse and restarts
+// the chain from genesis — reissuing every existing seq, the tamper-shaped cascade the
+// resume exists to avoid. The re-read is anchored at the new EOF through the SAME handle,
+// never a second open.
+//
+// The window is injected (a few dozen bytes) rather than staged at the real 4 MiB, where
+// the record-size cap makes this geometrically unreachable; the logic is identical.
+func TestTruncatePartialTail_ReReadsWhenWindowClipsTheLastRecord(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+
+	r1 := `{"seq":1,"decision":"allow"}`
+	r2 := `{"seq":2,"decision":"allow"}`
+	orphan := `{"seq":3,"decision":"allo` // no trailing newline: a partial write
+	content := r1 + "\n" + r2 + "\n" + orphan
+	if err := os.WriteFile(logPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	// Size the window so it starts INSIDE r2: the surviving window after truncation is
+	// then r2's tail plus its newline, with r2's own leading boundary outside it.
+	winSize := int64(len(orphan) + len(r2)/2)
+	if got := int64(len(content)) - winSize; got <= int64(len(r1)) {
+		t.Fatalf("test setup: window start %d must land inside r2 (past r1's %d bytes)", got, len(r1))
+	}
+
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_RDWR, 0o600) //nolint:gosec // G304: test-controlled path
+	if err != nil {
+		t.Fatalf("open O_RDWR: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	rb, last, err := truncatePartialTailWindowed(f, winSize)
+	if err != nil {
+		t.Fatalf("truncatePartialTailWindowed: %v", err)
+	}
+	if rb != int64(len(orphan)) {
+		t.Fatalf("recovered bytes = %d, want %d (the orphan fragment)", rb, len(orphan))
+	}
+	// The whole record, not the fragment the clipped window held.
+	if last != r2 {
+		t.Fatalf("tail line = %q, want the COMPLETE record %q (a clipped record would restart the chain from genesis)", last, r2)
+	}
+	// The truncation itself must still be exact.
+	after, err := os.ReadFile(logPath) //nolint:gosec // G304: test-controlled path
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if string(after) != r1+"\n"+r2+"\n" {
+		t.Fatalf("post-truncation content = %q, want the two complete records", after)
+	}
+}
+
+// TestTruncatePartialTail_ReReadFailureFailsClosed pins that a re-read the handle cannot
+// service is not reported as a clean tail: the same fail-closed stance the initial probe
+// takes. Uses the clipping geometry above, then closes the handle so the re-read's ReadAt
+// fails.
+func TestTruncatePartialTail_ReReadFailureFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+	r1 := `{"seq":1,"decision":"allow"}`
+	r2 := `{"seq":2,"decision":"allow"}`
+	content := r1 + "\n" + r2 + "\n"
+	if err := os.WriteFile(logPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_RDWR, 0o600) //nolint:gosec // G304: test-controlled path
+	if err != nil {
+		t.Fatalf("open O_RDWR: %v", err)
+	}
+	// Read the window first (while the handle is live), then close it so only the
+	// re-read fails.
+	winSize := int64(len(r2))
+	start := int64(len(content)) - winSize
+	window := make([]byte, winSize)
+	if _, err := f.ReadAt(window, start); err != nil && err != io.EOF {
+		t.Fatalf("stage window read: %v", err)
+	}
+	_ = f.Close()
+
+	if _, err := tailLineFromWindow(f, window, start, int64(len(content)), winSize); !errors.Is(err, errAuditTailProbe) {
+		t.Fatalf("error = %v, want it to wrap errAuditTailProbe (a re-read we cannot complete is not a clean tail)", err)
+	}
+}

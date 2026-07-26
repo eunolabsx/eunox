@@ -1335,6 +1335,15 @@ var errAuditTailUnbounded = errors.New("audit partial-tail exceeds the scan wind
 // Returns the number of bytes truncated (0 when the tail already ends at a record
 // boundary). Runs under the exclusive audit lock, before the drainer starts.
 func truncatePartialTail(f *os.File) (truncated int64, last string, err error) {
+	return truncatePartialTailWindowed(f, auditScanBufferBytes)
+}
+
+// truncatePartialTailWindowed is truncatePartialTail with the tail scan window injected,
+// so a test can drive the window-boundary paths against a few dozen bytes instead of
+// staging a multi-megabyte file. Mirrors highestSeqAcrossChainCapped / scanSeqContribution,
+// which take their scan cap the same way and for the same reason. Production always passes
+// auditScanBufferBytes.
+func truncatePartialTailWindowed(f *os.File, winSize int64) (truncated int64, last string, err error) {
 	info, err := f.Stat()
 	if err != nil {
 		// Stat failed on the open append handle. We cannot tell whether the log is empty
@@ -1353,8 +1362,8 @@ func truncatePartialTail(f *os.File) (truncated int64, last string, err error) {
 	// capped well below it — so the last newline, the boundary of the last complete
 	// record, is always within the window when the file holds any complete record.
 	start := int64(0)
-	if size > auditScanBufferBytes {
-		start = size - auditScanBufferBytes
+	if size > winSize {
+		start = size - winSize
 	}
 	buf := make([]byte, size-start)
 	n, err := f.ReadAt(buf, start)
@@ -1368,7 +1377,7 @@ func truncatePartialTail(f *os.File) (truncated int64, last string, err error) {
 	if len(buf) == 0 || buf[len(buf)-1] == '\n' {
 		// The tail ends at a record boundary: nothing to recover. buf is already the
 		// window [start, EOF), so the resume line comes straight out of it.
-		line, err := tailLineFromWindow(f, buf, start, size)
+		line, err := tailLineFromWindow(f, buf, start, size, winSize)
 		if err != nil {
 			return 0, "", err
 		}
@@ -1403,7 +1412,7 @@ func truncatePartialTail(f *os.File) (truncated int64, last string, err error) {
 	}
 	// buf[:i+1] is now exactly the window [start, newSize) — the file's tail after the
 	// truncation — so the resume line comes from the bytes already in hand.
-	line, err := tailLineFromWindow(f, buf[:i+1], start, newSize)
+	line, err := tailLineFromWindow(f, buf[:i+1], start, newSize, winSize)
 	if err != nil {
 		return 0, "", err
 	}
@@ -1423,14 +1432,14 @@ func truncatePartialTail(f *os.File) (truncated int64, last string, err error) {
 // suffices: the window now ends at a record boundary and a record is capped far below
 // auditScanBufferBytes, so the preceding boundary is inside it unless the file holds
 // exactly one record, in which case the window starts at 0 and is authoritative.
-func tailLineFromWindow(f *os.File, window []byte, start, size int64) (string, error) {
+func tailLineFromWindow(f *os.File, window []byte, start, size, winSize int64) (string, error) {
 	line, bounded := lastCompleteLineFromTail(window)
 	if bounded || start == 0 || line == "" {
 		return line, nil
 	}
 	reStart := int64(0)
-	if size > auditScanBufferBytes {
-		reStart = size - auditScanBufferBytes
+	if size > winSize {
+		reStart = size - winSize
 	}
 	buf := make([]byte, size-reStart)
 	n, err := f.ReadAt(buf, reStart)
