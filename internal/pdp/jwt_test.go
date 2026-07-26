@@ -22,6 +22,7 @@ import (
 	"github.com/go-jose/go-jose/v4/jwt"
 
 	"github.com/eunolabs/eunox/internal/mcp"
+	"github.com/eunolabs/eunox/internal/mcp/mcptest"
 	"github.com/eunolabs/eunox/pkg/capability"
 	"github.com/eunolabs/eunox/pkg/killswitch"
 )
@@ -2141,6 +2142,52 @@ func TestJWT_FilterToolsList_NoClaims_WithInner_FailsClosed(t *testing.T) {
 	}
 }
 
+// TestJWT_FilterToolsList_PassThroughInner_RejectsAmbiguousEntry pins the fix for the
+// pass-through path (inner nil, or AlwaysAllowPDP): passThroughList applies no per-entry
+// ambiguity gate, so before entryCoveredByClaims checked entryKeysAmbiguous itself, an entry
+// whose top-level keys fold-collide (e.g. "name"/"Name") was decoded with a plain
+// json.Unmarshal and matched against the claims using whichever value Go's last-key-wins
+// decode kept — even though a case-sensitive host (or a duplicate-key-first-wins host) can
+// render the OTHER value. A claim covering the visible name then let the ambiguous entry
+// through verbatim, both keys intact, defeating catalog integrity rather than merely
+// forwarding a name the token didn't cover.
+func TestJWT_FilterToolsList_PassThroughInner_RejectsAmbiguousEntry(t *testing.T) {
+	t.Parallel()
+	pdp := &JWTPDP{} // nil inner: the pass-through path.
+	ctx := WithJWTClaims(context.Background(), &JWTClaims{
+		HasCapabilities: true,
+		Capabilities:    []string{"tool:safe_tool", "tool:evil_tool"},
+	})
+
+	// Both names are covered by claims, so a naive decode (which picks one via Go's
+	// last-key-wins struct-field binding) would let this entry through either way. The
+	// regression this guards is that it must be excluded ENTIRELY for being ambiguous,
+	// not merely filtered on whichever name survives the decode.
+	upstream := json.RawMessage(`{"tools":[{"name":"safe_tool","Name":"evil_tool"}]}`)
+	filtered := pdp.FilterToolsList(ctx, upstream).Result
+
+	if got := toolNames(t, filtered); len(got) != 0 {
+		t.Errorf("ambiguous entry must be excluded entirely, got %v", got)
+	}
+}
+
+// TestJWT_FilterToolsList_PassThroughInner_AllowsUnambiguousEntry is the negative control:
+// an ordinary entry with no key collision must still pass through the same nil-inner path.
+func TestJWT_FilterToolsList_PassThroughInner_AllowsUnambiguousEntry(t *testing.T) {
+	t.Parallel()
+	pdp := &JWTPDP{}
+	ctx := WithJWTClaims(context.Background(), &JWTClaims{
+		HasCapabilities: true,
+		Capabilities:    []string{"tool:read_file"},
+	})
+
+	filtered := pdp.FilterToolsList(ctx, toolsListJSON(t, "read_file", "write_file")).Result
+	got := toolNames(t, filtered)
+	if len(got) != 1 || got[0] != "read_file" {
+		t.Errorf("unambiguous entry: filtered tools = %v, want [read_file]", got)
+	}
+}
+
 // TestJWT_FilterResourcesAndPrompts verifies resource and prompt list
 // filtering also honors the JWT capabilities.
 func TestJWT_FilterResourcesAndPrompts(t *testing.T) {
@@ -2151,12 +2198,12 @@ func TestJWT_FilterResourcesAndPrompts(t *testing.T) {
 		Capabilities:    []string{"resource:file:///data/*", "prompt:code_review"},
 	})
 
-	resList := mcp.ResourcesListResult{Resources: []mcp.ResourceEntry{
+	resList := mcptest.ResourcesListResult{Resources: []mcptest.ResourceEntry{
 		{URI: "file:///data/report.pdf"},
 		{URI: "file:///secret/keys.txt"},
 	}}
 	resBytes, _ := json.Marshal(resList)
-	var gotRes mcp.ResourcesListResult
+	var gotRes mcptest.ResourcesListResult
 	if err := json.Unmarshal(pdp.FilterResourcesList(ctx, resBytes).Result, &gotRes); err != nil {
 		t.Fatalf("unmarshal resources: %v", err)
 	}
@@ -2164,12 +2211,12 @@ func TestJWT_FilterResourcesAndPrompts(t *testing.T) {
 		t.Errorf("resources filter = %+v, want only file:///data/report.pdf", gotRes.Resources)
 	}
 
-	prList := mcp.PromptsListResult{Prompts: []mcp.PromptEntry{
+	prList := mcptest.PromptsListResult{Prompts: []mcptest.PromptEntry{
 		{Name: "code_review"},
 		{Name: "secret_prompt"},
 	}}
 	prBytes, _ := json.Marshal(prList)
-	var gotPr mcp.PromptsListResult
+	var gotPr mcptest.PromptsListResult
 	if err := json.Unmarshal(pdp.FilterPromptsList(ctx, prBytes).Result, &gotPr); err != nil {
 		t.Fatalf("unmarshal prompts: %v", err)
 	}
@@ -3866,9 +3913,9 @@ func TestJWTCondChain_JWTPDP_ValidateToken_MultiConditionAccepted(t *testing.T) 
 
 func resourcesListJSON(t *testing.T, uris ...string) json.RawMessage {
 	t.Helper()
-	var list mcp.ResourcesListResult
+	var list mcptest.ResourcesListResult
 	for _, u := range uris {
-		list.Resources = append(list.Resources, mcp.ResourceEntry{URI: u})
+		list.Resources = append(list.Resources, mcptest.ResourceEntry{URI: u})
 	}
 	b, err := json.Marshal(list)
 	if err != nil {
@@ -3879,7 +3926,7 @@ func resourcesListJSON(t *testing.T, uris ...string) json.RawMessage {
 
 func resourceURIs(t *testing.T, raw json.RawMessage) []string {
 	t.Helper()
-	var list mcp.ResourcesListResult
+	var list mcptest.ResourcesListResult
 	if err := json.Unmarshal(raw, &list); err != nil {
 		t.Fatalf("unmarshal resources list: %v", err)
 	}
@@ -3892,9 +3939,9 @@ func resourceURIs(t *testing.T, raw json.RawMessage) []string {
 
 func promptsListJSON(t *testing.T, names ...string) json.RawMessage {
 	t.Helper()
-	var list mcp.PromptsListResult
+	var list mcptest.PromptsListResult
 	for _, n := range names {
-		list.Prompts = append(list.Prompts, mcp.PromptEntry{Name: n})
+		list.Prompts = append(list.Prompts, mcptest.PromptEntry{Name: n})
 	}
 	b, err := json.Marshal(list)
 	if err != nil {
@@ -3905,7 +3952,7 @@ func promptsListJSON(t *testing.T, names ...string) json.RawMessage {
 
 func promptNames(t *testing.T, raw json.RawMessage) []string {
 	t.Helper()
-	var list mcp.PromptsListResult
+	var list mcptest.PromptsListResult
 	if err := json.Unmarshal(raw, &list); err != nil {
 		t.Fatalf("unmarshal prompts list: %v", err)
 	}

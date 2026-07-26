@@ -231,7 +231,7 @@ func (f *fullFakeUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		result := f.resourcesListResult
 		f.mu.Unlock()
 		if result == nil {
-			result, _ = json.Marshal(mcp.ResourcesListResult{Resources: []mcp.ResourceEntry{}})
+			result, _ = json.Marshal(mcptest.ResourcesListResult{Resources: []mcptest.ResourceEntry{}})
 		}
 		resp := mcp.RPCMsg{JSONRPC: "2.0", ID: msg.ID, Result: result}
 		w.Header().Set("Content-Type", "application/json")
@@ -274,7 +274,7 @@ func (f *fullFakeUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		result := f.promptsListResult
 		f.mu.Unlock()
 		if result == nil {
-			result, _ = json.Marshal(mcp.PromptsListResult{Prompts: []mcp.PromptEntry{}})
+			result, _ = json.Marshal(mcptest.PromptsListResult{Prompts: []mcptest.PromptEntry{}})
 		}
 		resp := mcp.RPCMsg{JSONRPC: "2.0", ID: msg.ID, Result: result}
 		w.Header().Set("Content-Type", "application/json")
@@ -1116,18 +1116,18 @@ func TestCoherence_ResourceEntryDoesNotGrantToolCall(t *testing.T) {
 	}
 }
 
-func newFakeUpstreamWithResourcesList(resources ...mcp.ResourceEntry) *fullFakeUpstream {
+func newFakeUpstreamWithResourcesList(resources ...mcptest.ResourceEntry) *fullFakeUpstream {
 	fu := newFullFakeUpstream()
-	result, _ := json.Marshal(mcp.ResourcesListResult{Resources: resources})
+	result, _ := json.Marshal(mcptest.ResourcesListResult{Resources: resources})
 	fu.resourcesListResult = result
 	return fu
 }
 
 func TestGap3_HTTPProxy_ResourcesList_FilteredByManifest(t *testing.T) {
 	fu := newFakeUpstreamWithResourcesList(
-		mcp.ResourceEntry{URI: "file:///data/report.csv", Name: "Report"},
-		mcp.ResourceEntry{URI: "file:///internal/secrets.txt", Name: "Secrets"},
-		mcp.ResourceEntry{URI: "db://warehouse/orders", Name: "Orders"},
+		mcptest.ResourceEntry{URI: "file:///data/report.csv", Name: "Report"},
+		mcptest.ResourceEntry{URI: "file:///internal/secrets.txt", Name: "Secrets"},
+		mcptest.ResourceEntry{URI: "db://warehouse/orders", Name: "Orders"},
 	)
 	upURL := startFakeUpstream(t, fu)
 
@@ -1147,7 +1147,7 @@ func TestGap3_HTTPProxy_ResourcesList_FilteredByManifest(t *testing.T) {
 	if result.Error != nil {
 		t.Fatalf("resources/list error: %+v", result.Error)
 	}
-	var list mcp.ResourcesListResult
+	var list mcptest.ResourcesListResult
 	if err := json.Unmarshal(result.Result, &list); err != nil {
 		t.Fatalf("unmarshal resources/list result: %v", err)
 	}
@@ -1158,8 +1158,8 @@ func TestGap3_HTTPProxy_ResourcesList_FilteredByManifest(t *testing.T) {
 
 func TestGap3_HTTPProxy_ResourcesList_NoManifest_AllResourcesReturned(t *testing.T) {
 	fu := newFakeUpstreamWithResourcesList(
-		mcp.ResourceEntry{URI: "file:///data/report.csv"},
-		mcp.ResourceEntry{URI: "file:///internal/secrets.txt"},
+		mcptest.ResourceEntry{URI: "file:///data/report.csv"},
+		mcptest.ResourceEntry{URI: "file:///internal/secrets.txt"},
 	)
 	upURL := startFakeUpstream(t, fu)
 
@@ -1170,7 +1170,7 @@ func TestGap3_HTTPProxy_ResourcesList_NoManifest_AllResourcesReturned(t *testing
 	resp := postMCP(t, proxySrv, msg, sid)
 	result := decodeRPC(t, resp)
 
-	var list mcp.ResourcesListResult
+	var list mcptest.ResourcesListResult
 	if err := json.Unmarshal(result.Result, &list); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
@@ -1181,7 +1181,7 @@ func TestGap3_HTTPProxy_ResourcesList_NoManifest_AllResourcesReturned(t *testing
 
 func TestGap3_HTTPProxy_ResourcesList_ManifestDeniesAll(t *testing.T) {
 	fu := newFakeUpstreamWithResourcesList(
-		mcp.ResourceEntry{URI: "file:///data/report.csv"},
+		mcptest.ResourceEntry{URI: "file:///data/report.csv"},
 	)
 	upURL := startFakeUpstream(t, fu)
 
@@ -1194,7 +1194,7 @@ func TestGap3_HTTPProxy_ResourcesList_ManifestDeniesAll(t *testing.T) {
 	resp := postMCP(t, proxySrv, msg, sid)
 	result := decodeRPC(t, resp)
 
-	var list mcp.ResourcesListResult
+	var list mcptest.ResourcesListResult
 	if err := json.Unmarshal(result.Result, &list); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
@@ -1735,20 +1735,20 @@ func TestGap1_ResourceRead_DenialNamesTarget(t *testing.T) {
 	}
 }
 
-func newFakeUpstreamWithPromptsList(prompts ...mcp.PromptEntry) *fullFakeUpstream {
+func newFakeUpstreamWithPromptsList(prompts ...mcptest.PromptEntry) *fullFakeUpstream {
 	fu := newFullFakeUpstream()
-	result, _ := json.Marshal(mcp.PromptsListResult{Prompts: prompts})
+	result, _ := json.Marshal(mcptest.PromptsListResult{Prompts: prompts})
 	fu.promptsListResult = result
 	return fu
 }
 
 func TestGap6_HTTPProxy_PromptsList_FilteredByManifest(t *testing.T) {
 	fu := newFakeUpstreamWithPromptsList(
-		mcp.PromptEntry{Name: "code_review"},
-		mcp.PromptEntry{Name: "write_email"},
-		mcp.PromptEntry{Name: "summarize"},
-		mcp.PromptEntry{Name: "generate_tests"},
-		mcp.PromptEntry{Name: "refactor"},
+		mcptest.PromptEntry{Name: "code_review"},
+		mcptest.PromptEntry{Name: "write_email"},
+		mcptest.PromptEntry{Name: "summarize"},
+		mcptest.PromptEntry{Name: "generate_tests"},
+		mcptest.PromptEntry{Name: "refactor"},
 	)
 	upURL := startFakeUpstream(t, fu)
 
@@ -1769,7 +1769,7 @@ func TestGap6_HTTPProxy_PromptsList_FilteredByManifest(t *testing.T) {
 	if result.Error != nil {
 		t.Fatalf("prompts/list error: %+v", result.Error)
 	}
-	var list mcp.PromptsListResult
+	var list mcptest.PromptsListResult
 	if err := json.Unmarshal(result.Result, &list); err != nil {
 		t.Fatalf("unmarshal prompts/list result: %v", err)
 	}
@@ -1787,8 +1787,8 @@ func TestGap6_HTTPProxy_PromptsList_FilteredByManifest(t *testing.T) {
 
 func TestGap6_HTTPProxy_PromptsList_NoManifest_AllPromptsReturned(t *testing.T) {
 	fu := newFakeUpstreamWithPromptsList(
-		mcp.PromptEntry{Name: "code_review"},
-		mcp.PromptEntry{Name: "summarize"},
+		mcptest.PromptEntry{Name: "code_review"},
+		mcptest.PromptEntry{Name: "summarize"},
 	)
 	upURL := startFakeUpstream(t, fu)
 
@@ -1799,7 +1799,7 @@ func TestGap6_HTTPProxy_PromptsList_NoManifest_AllPromptsReturned(t *testing.T) 
 	resp := postMCP(t, proxySrv, msg, sid)
 	result := decodeRPC(t, resp)
 
-	var list mcp.PromptsListResult
+	var list mcptest.PromptsListResult
 	if err := json.Unmarshal(result.Result, &list); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
@@ -1810,8 +1810,8 @@ func TestGap6_HTTPProxy_PromptsList_NoManifest_AllPromptsReturned(t *testing.T) 
 
 func TestGap6_HTTPProxy_PromptsList_ManifestDeniesAll(t *testing.T) {
 	fu := newFakeUpstreamWithPromptsList(
-		mcp.PromptEntry{Name: "code_review"},
-		mcp.PromptEntry{Name: "summarize"},
+		mcptest.PromptEntry{Name: "code_review"},
+		mcptest.PromptEntry{Name: "summarize"},
 	)
 	upURL := startFakeUpstream(t, fu)
 
@@ -1824,7 +1824,7 @@ func TestGap6_HTTPProxy_PromptsList_ManifestDeniesAll(t *testing.T) {
 	resp := postMCP(t, proxySrv, msg, sid)
 	result := decodeRPC(t, resp)
 
-	var list mcp.PromptsListResult
+	var list mcptest.PromptsListResult
 	if err := json.Unmarshal(result.Result, &list); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
@@ -1835,9 +1835,9 @@ func TestGap6_HTTPProxy_PromptsList_ManifestDeniesAll(t *testing.T) {
 
 func TestGap6_HTTPProxy_PromptsList_WildcardManifest_AllPromptsReturned(t *testing.T) {
 	fu := newFakeUpstreamWithPromptsList(
-		mcp.PromptEntry{Name: "code_review"},
-		mcp.PromptEntry{Name: "summarize"},
-		mcp.PromptEntry{Name: "generate_tests"},
+		mcptest.PromptEntry{Name: "code_review"},
+		mcptest.PromptEntry{Name: "summarize"},
+		mcptest.PromptEntry{Name: "generate_tests"},
 	)
 	upURL := startFakeUpstream(t, fu)
 
@@ -1850,7 +1850,7 @@ func TestGap6_HTTPProxy_PromptsList_WildcardManifest_AllPromptsReturned(t *testi
 	resp := postMCP(t, proxySrv, msg, sid)
 	result := decodeRPC(t, resp)
 
-	var list mcp.PromptsListResult
+	var list mcptest.PromptsListResult
 	if err := json.Unmarshal(result.Result, &list); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
@@ -1875,7 +1875,7 @@ func TestGap6_HTTPProxy_PromptsList_UpstreamError_ReturnsError(t *testing.T) {
 	if result.Error != nil {
 		t.Fatalf("unexpected error: %+v", result.Error)
 	}
-	var list mcp.PromptsListResult
+	var list mcptest.PromptsListResult
 	if err := json.Unmarshal(result.Result, &list); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
@@ -1887,7 +1887,7 @@ func TestGap6_HTTPProxy_PromptsList_UpstreamError_ReturnsError(t *testing.T) {
 
 func TestGap6_NamespaceIsolation_ToolEntryDoesNotExposePromptInList(t *testing.T) {
 	fu := newFakeUpstreamWithPromptsList(
-		mcp.PromptEntry{Name: "code_review"},
+		mcptest.PromptEntry{Name: "code_review"},
 	)
 	upURL := startFakeUpstream(t, fu)
 
@@ -1900,7 +1900,7 @@ func TestGap6_NamespaceIsolation_ToolEntryDoesNotExposePromptInList(t *testing.T
 	resp := postMCP(t, proxySrv, msg, sid)
 	result := decodeRPC(t, resp)
 
-	var list mcp.PromptsListResult
+	var list mcptest.PromptsListResult
 	if err := json.Unmarshal(result.Result, &list); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}

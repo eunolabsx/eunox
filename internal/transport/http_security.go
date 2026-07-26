@@ -285,6 +285,8 @@ func (p *HTTPProxy) checkOrigin(w http.ResponseWriter, r *http.Request) bool {
 	if multiple {
 		recordedOrigin = strings.Join(vals, ", ")
 	}
+	// Unstamped by design (no route/policy fields): the Origin gate runs before route
+	// resolution — see recordPreSessionDeny.
 	p.recordPreSessionDeny(r, "ORIGIN_REJECTED", "origin", map[string]interface{}{"origin": recordedOrigin})
 	if multiple {
 		fmt.Fprintf(os.Stderr,
@@ -350,6 +352,13 @@ func addClaimedSessionID(details map[string]interface{}, r *http.Request) map[st
 // attacker drive the audit queue into its monotonic drop counter and permanently trip
 // --require-audit=strict against every legitimate client. A suppressed refusal is folded
 // into the next admitted record's suppressed_count rather than vanishing.
+//
+// These records deliberately carry NO route name and no policy_version/policy_sha256
+// stamp: they are written through the proxy-wide p.sink rather than a route's
+// routeSink, because every caller fires before route resolution — and stays there on
+// purpose, since resolving the route first would turn the 404-vs-401 split into an
+// oracle for enumerating route names. An auditor diffing record shapes should read
+// the missing stamp as "refused before any route was chosen", not as a stamping bug.
 func (p *HTTPProxy) recordPreSessionDeny(r *http.Request, code, category string, extra map[string]interface{}) {
 	if p.sink == nil {
 		return

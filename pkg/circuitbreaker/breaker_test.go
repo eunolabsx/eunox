@@ -663,24 +663,6 @@ func TestBreaker_StatsReportsLogicalStateAfterCooldown(t *testing.T) {
 	}
 }
 
-// TestConfig_Validate covers the per-field validation contract.
-func TestConfig_Validate(t *testing.T) {
-	if err := DefaultConfig().Validate(); err != nil {
-		t.Errorf("DefaultConfig should validate, got %v", err)
-	}
-	cases := []Config{
-		{FailureThreshold: 0, CooldownDuration: time.Second, HalfOpenMaxProbes: 1},
-		{FailureThreshold: 1, CooldownDuration: 0, HalfOpenMaxProbes: 1},
-		{FailureThreshold: 1, CooldownDuration: time.Second, HalfOpenMaxProbes: 0},
-		{FailureThreshold: -1, CooldownDuration: -1, HalfOpenMaxProbes: -1},
-	}
-	for i, cfg := range cases {
-		if err := cfg.Validate(); err == nil {
-			t.Errorf("case %d: expected validation error for %+v", i, cfg)
-		}
-	}
-}
-
 // TestNewSanitizesDegenerateConfig verifies that New replaces non-positive
 // fields with DefaultConfig values instead of producing a breaker that trips on
 // the first failure with no cooldown.

@@ -644,7 +644,13 @@ type refreshResult struct {
 // because it never leaves the machine and so has no on-path attacker surface.
 func (c *JWKSCache) refuseCrossOriginResponse(resp *http.Response) error {
 	if resp.Request == nil || resp.Request.URL == nil {
-		return nil // no final-URL information to compare (a stubbed transport in tests)
+		// Fail closed rather than exempt: resp.Request is documented as "only populated
+		// for Client requests" (net/http), so a caller-supplied *http.Client whose
+		// RoundTripper builds its own *http.Response — the same caller-supplied-client
+		// scenario this whole function exists to cover — can leave it nil. Admitting the
+		// response here would make exactly that RoundTripper the one way to bypass the
+		// floor this function is the last line of defense for.
+		return fmt.Errorf("JWKS response carries no final-request URL to verify against the configured JWKS host %q; refusing (the HTTP client's RoundTripper did not populate resp.Request)", c.jwksURI)
 	}
 	want, err := url.Parse(c.jwksURI)
 	if err != nil {

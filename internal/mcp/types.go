@@ -2,19 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package mcp holds the JSON message data-transfer types for the MCP (Model
-// Context Protocol) methods the proxy enforces: the params and result shapes of
-// initialize, tools/call, tools/list, resources/read, resources/list,
-// prompts/get, and prompts/list. They are pure JSON structs with no methods.
+// Context Protocol) shapes production code actually decodes: the params of
+// initialize, tools/call, resources/read (and its identical resources/subscribe
+// twin), and prompts/get, plus the results of initialize and tools/list. They are
+// pure JSON structs with no methods.
 //
-// Coverage of the protocol is deliberately complete and symmetric rather than trimmed to
-// current callers: ToolsListResult is decoded on the drift path, while its
-// ResourcesListResult and PromptsListResult siblings are exercised only by tests today.
-// Keeping the set whole is what lets a reader model a list response of any flavor the same
-// way, and lets a test decode one without hand-rolling an anonymous struct. Do not read
-// "declared here" as "on a production hot path" -- check the callers.
+// The set is deliberately scoped to those decoders rather than to protocol
+// symmetry. The resources/list and prompts/list result shapes are NOT here: the
+// list filters in internal/pdp decode their own inline structs by design (pdp has
+// no internal/mcp dependency) and the transports never parse those results at all,
+// so the fixture shapes tests need live in internal/mcp/mcptest alongside the other
+// test-only message types.
 package mcp
-
-import "encoding/json"
 
 // InitResult is the result field of an `initialize` response.
 type InitResult struct {
@@ -54,31 +53,6 @@ type ToolEntry struct {
 // Also used for `resources/subscribe` which has the same wire shape.
 type ResourceReadParams struct {
 	URI string `json:"uri"`
-}
-
-// ResourcesListResult is the result field of a `resources/list` response.
-type ResourcesListResult struct {
-	Resources []ResourceEntry `json:"resources"`
-}
-
-// ResourceEntry is one resource in a `resources/list` result.
-type ResourceEntry struct {
-	URI         string `json:"uri"`
-	Name        string `json:"name,omitempty"`
-	Description string `json:"description,omitempty"`
-	MIMEType    string `json:"mimeType,omitempty"`
-}
-
-// PromptsListResult is the result field of a `prompts/list` response.
-type PromptsListResult struct {
-	Prompts []PromptEntry `json:"prompts"`
-}
-
-// PromptEntry is one prompt in a `prompts/list` result.
-type PromptEntry struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description,omitempty"`
-	Arguments   json.RawMessage `json:"arguments,omitempty"`
 }
 
 // PromptGetParams is the params field of a `prompts/get` request.
