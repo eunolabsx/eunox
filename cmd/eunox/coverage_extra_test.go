@@ -3054,7 +3054,7 @@ capabilities:
 // `audience` pin can never be enforced on a stdio-HOST config (the host-facing
 // transport, distinct from an individual upstream's own subprocess-vs-remote-HTTP
 // transport) because a stdio host cannot stand up a JWT PDP — `proxy` refuses to
-// boot on it (serveStdioHost, via transport.StartupFatalManifestCheck's
+// boot on it (serveStdioHost, via transport.startupFatalManifestCheck's
 // audience-pin guard). Before that guard existed, neither `validate --config` nor
 // `doctor` reproduced this refusal, so both would report a config OK that `proxy`
 // would reject.

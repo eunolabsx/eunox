@@ -498,15 +498,24 @@ func foldJSONKey(key string) string {
 // Framed I/O: newline-delimited JSON
 // -----------------------------------------------------------------
 
-// ErrUpstreamWriteTimeout marks a framed write that exceeded its per-write deadline
-// (see NewMsgWriterWithTimeout), or any write after such a timeout. A timed-out write
-// can flush a partial frame larger than the pipe's atomic-write size, desyncing the
-// newline framing, so the writer is POISONED and every later Write fails fast with this
-// error rather than interleaving bytes into a corrupt stream. On the poison transition the
-// writer's onPoison hook fires (the transports wire it to tear the upstream session down),
-// so the desynced stream is reaped rather than reused — the recovery the deadline exists
-// to enable.
+// ErrUpstreamWriteTimeout marks a framed write that exceeded its per-write deadline (see
+// NewMsgWriterWithTimeout), and every write after one. The writer is POISONED on it: a
+// timed-out write can flush a partial frame larger than the pipe's atomic-write size, so
+// every later Write fails fast rather than interleaving bytes into a corrupt stream. On
+// the poison transition the writer's onPoison hook fires (the transports wire it to tear
+// the upstream session down), so the desynced stream is reaped rather than reused — the
+// recovery the deadline exists to enable.
 var ErrUpstreamWriteTimeout = errors.New("mcp: upstream write deadline exceeded; stream framing desynced")
+
+// ErrFrameDesync marks a write that flushed only PART of its frame for a reason other
+// than a deadline — EPIPE, ENOSPC, or a signal interrupting a write larger than the
+// pipe's atomic-write size. The framing consequence is identical to a timeout (the next
+// frame would be appended onto half of the previous one), so it poisons the writer the
+// same way, but the CAUSE is not a timeout and must not be reported as one: classifying
+// an upstream that died mid-write as UPSTREAM_TIMEOUT puts a fabricated duration on the
+// audit tape and tells the operator to raise --upstream-timeout. A distinct sentinel lets
+// the classification layer tell them apart; the underlying error is wrapped alongside it.
+var ErrFrameDesync = errors.New("mcp: partial frame written; stream framing desynced")
 
 // writeDeadliner is the subset of *os.File a subprocess stdin pipe satisfies. On
 // Linux/macOS the parent write end from cmd.StdinPipe() is a pollable *os.File, so
@@ -532,18 +541,47 @@ type MsgWriter struct {
 	// "deadliner != nil" is a true "the write is bounded" invariant. See ErrUpstreamWriteTimeout.
 	deadliner writeDeadliner
 	timeout   time.Duration
-	// onPoison, if set, is invoked exactly once (off-lock) when a write first times out and
-	// poisons the writer, so the owner can tear the upstream down regardless of which write
-	// path (request, notification, server-reply) hit the wedge. nil for non-subprocess writers.
+	// onPoison, if set, is invoked exactly once (off-lock) when a write first leaves the
+	// stream desynced and poisons the writer, so the owner can tear the session down
+	// regardless of which write path (request, notification, server-reply) hit it. A
+	// writer with no hook has no owner to react, so every later write fails silently at
+	// call sites that discard the error — set one on any writer whose stream matters.
 	onPoison func()
-	// poisoned latches once a write times out mid-frame: the stream framing is desynced,
-	// so all subsequent writes fail fast with ErrUpstreamWriteTimeout.
-	poisoned bool
+	// poisonErr latches the reason the writer was poisoned (nil = healthy): the stream
+	// framing is desynced, so all subsequent writes fail fast with this same error.
+	// Storing the reason rather than a bool keeps a later write reporting the CAUSE that
+	// broke the stream (deadline vs partial frame) instead of collapsing both onto one
+	// sentinel.
+	poisonErr error
 }
 
 // NewMsgWriter returns a MsgWriter that frames messages onto w, with no per-write
-// deadline (writes block until the underlying writer accepts them).
+// deadline (writes block until the underlying writer accepts them) and no poison hook.
+// Use it as-is only where the caller INSPECTS the returned error — a writer with no hook
+// has nothing to tear the stream down, so a poisoned one fails every later write silently
+// at any call site that discards the error. Where the stream's owner needs to react, add
+// one with SetPoisonHook, or use NewMsgWriterWithTimeout for bounded writes.
 func NewMsgWriter(w io.Writer) *MsgWriter { return &MsgWriter{w: w} }
+
+// SetPoisonHook installs (or replaces) the teardown hook on an already-constructed
+// writer, for a stream that cannot be bounded by a deadline yet still must not be left
+// silently dead once its framing desyncs — the stdio host's stdout, whose writes are
+// fire-and-forget at every call site. Without a hook a single partial write there latches
+// the writer and the proxy goes on enforcing policy and forwarding calls upstream while
+// every response is dropped: real side effects, no replies, no diagnostic.
+//
+// Separate from construction because the owner that performs the teardown is not always
+// available when the writer is built: the stdio host writer's hook kills the upstream, so
+// it is wired from Start (a context-carrying path) rather than the proxy constructor.
+//
+// Installing a hook on an ALREADY-poisoned writer does not retroactively fire it. The
+// hook reacts to the transition, and a caller arriving after it has, by definition, not
+// been watching; every later Write still fails fast with the latched cause.
+func (mw *MsgWriter) SetPoisonHook(onPoison func()) {
+	mw.mu.Lock()
+	defer mw.mu.Unlock()
+	mw.onPoison = onPoison
+}
 
 // NewMsgWriterWithTimeout returns a MsgWriter that bounds each write by timeout when the
 // underlying writer supports a write deadline (a subprocess stdin *os.File pipe). A write
@@ -590,24 +628,44 @@ func (mw *MsgWriter) Write(msg RPCMsg) error {
 	// allocation of fmt.Fprintf on this hot path.
 	data = append(data, '\n')
 	mw.mu.Lock()
-	// A prior write timed out mid-frame: the stream is desynced, so refuse rather than
-	// append this frame after a partial one. Fails fast (no deadline wait), which is what
+	// A prior write left a partial frame on the wire: the stream is desynced, so refuse
+	// rather than append this frame after it. Fails fast (no deadline wait), which is what
 	// lets a second in-flight writer — e.g. a sampling reply queued behind a wedged
 	// request write — return instead of blocking on this mutex until the wedge clears.
-	if mw.poisoned {
+	if mw.poisonErr != nil {
+		err := mw.poisonErr
 		mw.mu.Unlock()
-		return ErrUpstreamWriteTimeout
+		return err
 	}
 	if mw.deadliner != nil {
 		// Absolute deadline, reset per write.
 		_ = mw.deadliner.SetWriteDeadline(time.Now().Add(mw.timeout))
 	}
-	_, err = mw.w.Write(data)
+	n, err := mw.w.Write(data)
 	justPoisoned := false
-	if mw.deadliner != nil && errors.Is(err, os.ErrDeadlineExceeded) {
-		mw.poisoned = true
+	// Poison on ANY partial frame, not only a deadline timeout. A deadline expiry is the
+	// common way to flush half a frame, but it is not the only one: a >PIPE_BUF write
+	// interrupted by EPIPE, ENOSPC, or a signal leaves n < len(data) just the same, and
+	// the framing is equally desynced. Keyed on the byte count rather than on err, because
+	// a short write is a desync whether or not the writer honored io.Writer's contract of
+	// reporting one. n == len(data) with a non-nil error (which io.Writer permits) is NOT
+	// poison: the whole frame landed.
+	switch {
+	case n > 0 && n < len(data):
+		// A distinct sentinel from the deadline case: the framing outcome is the same, the
+		// cause is not, and the audit tape must not record a crashed upstream as a timeout.
+		if err == nil {
+			err = io.ErrShortWrite
+		}
+		err = fmt.Errorf("%w: %d of %d bytes: %w", ErrFrameDesync, n, len(data), err)
+		mw.poisonErr = err
 		justPoisoned = true
+	case mw.deadliner != nil && errors.Is(err, os.ErrDeadlineExceeded):
+		// A deadline expiry that wrote nothing left the framing intact, but the pipe is
+		// wedged and the session is torn down either way; keep the established behavior.
 		err = fmt.Errorf("%w: %v", ErrUpstreamWriteTimeout, err)
+		mw.poisonErr = err
+		justPoisoned = true
 	}
 	mw.mu.Unlock()
 	// Fire the teardown hook once, OFF the lock, on the poison transition. Off-lock so the

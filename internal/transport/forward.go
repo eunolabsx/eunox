@@ -400,7 +400,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 					fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, capability.ErrCodeEnforcementError, "", nil, false)
 				}
 			})
-			return mcp.ErrorResponse(msg.ID, -32603, "internal error: response redaction failed")
+			return mcp.ErrorResponse(msg.ID, jsonRPCCodeInternalError, "internal error: response redaction failed")
 		}
 		upResp.Result = redacted
 	}

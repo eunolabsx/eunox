@@ -7,7 +7,9 @@
 #
 # Start the upstream first (`go run ./demo/mock-mcp-server`, listens on :8080),
 # or launch the ".vscode/launch.json → proxy: HTTP enforce + mock upstream"
-# compound, which brings up both. Paths are relative to the repo root.
+# compound, which brings up both. Run it from the repo root: the audit paths below
+# are CWD-relative. `policy:` entries are the exception — they resolve against THIS
+# file's directory (demo/), so they are written bare.
 
 schemaVersion: "0.1"
 transport: http
@@ -25,4 +27,4 @@ upstreams:
     transport: http
     upstreamUrl: http://127.0.0.1:8080
     policy:
-      - demo/manifest.yaml
+      - manifest.yaml              # resolved against demo/, this file's directory

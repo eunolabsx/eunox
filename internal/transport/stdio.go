@@ -36,9 +36,11 @@ import (
 )
 
 const (
-	// ProxyName is the clientInfo.name the proxy presents to upstreams; exported
-	// so the CLI's live-upstream probe identifies itself identically.
-	ProxyName = "eunox-proxy"
+	// proxyName is the clientInfo.name the proxy presents to upstreams. The CLI's
+	// live-upstream probe identifies itself identically without a second spelling of
+	// it: it builds the whole handshake through BuildInitializeRequestWithID, which
+	// stamps this value, rather than reading the name out of this package.
+	proxyName = "eunox-proxy"
 
 	// MCPProtocolVersion is the MCP protocol version the proxy advertises;
 	// exported for the CLI's live-upstream probe.
@@ -296,6 +298,20 @@ func (p *StdioProxy) rec() auditRecorder {
 // Start runs the proxy until the host closes stdin or the upstream exits.
 // It returns when the session ends.
 func (p *StdioProxy) Start(ctx context.Context) error {
+	// Arm the host stdout writer's desync teardown before anything can write to it.
+	// Its writes are fire-and-forget at every call site (a dropped host reply has nowhere
+	// to return an error to), so without a hook a single partial write latches the writer
+	// and the proxy goes on enforcing policy and forwarding calls upstream while every
+	// response is silently discarded: real side effects, no replies, no diagnostic. No
+	// deadline is armed on it — a slow host is not a policy failure, and stdout may not be
+	// a pollable pipe — so this covers only the desync case. Wired here rather than in the
+	// constructor so the teardown it performs sits on a context-carrying path, like every
+	// other killUpstream call site.
+	//nolint:contextcheck // teardown path: the upstream session-termination DELETE intentionally uses a detached, bounded background context — this hook fires from inside a framed write, which carries no request context (same rule as the killUpstream call sites below).
+	p.hostWriter.SetPoisonHook(func() {
+		fmt.Fprintf(os.Stderr, "[eunox] FATAL: host stdout framing desynced (partial write); tearing down the upstream — no further responses can be delivered.\n")
+		p.killUpstream()
+	})
 	// ── 1. Connect to upstream (subprocess or remote HTTP) ─────────────────────
 	if err := p.connectUpstream(ctx); err != nil {
 		return err

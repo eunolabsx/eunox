@@ -209,8 +209,8 @@ func TestStdioProxy_FullLifecycle(t *testing.T) {
 	if err := json.Unmarshal(initResp.Result, &initRes); err != nil {
 		t.Fatalf("initialize result unmarshal: %v", err)
 	}
-	if initRes.ServerInfo["name"] != ProxyName {
-		t.Errorf("initialize serverInfo.name: got %v, want %q", initRes.ServerInfo["name"], ProxyName)
+	if initRes.ServerInfo["name"] != proxyName {
+		t.Errorf("initialize serverInfo.name: got %v, want %q", initRes.ServerInfo["name"], proxyName)
 	}
 
 	// tools/list (no manifest → forwarded verbatim, both tools present)

@@ -6,6 +6,7 @@ package capability
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -201,6 +202,122 @@ func TestEveryArgumentCarryingConditionImplementsArgumentNamer(t *testing.T) {
 		if _, ok := cond.(ArgumentNamer); !ok {
 			t.Errorf("condition type %q has an Argument field but does not implement ArgumentNamer; "+
 				"add an ArgumentName() method so it is covered by FM-3 drift checking", ct)
+		}
+	}
+}
+
+// ── strict unknown-field decode ─────────────────────────────────────────────
+
+// unmarshalCondition rejects a field name no condition struct binds. A lenient decode
+// silently DROPS a misspelled field, which for a condition means a policy quietly wider
+// than the operator wrote: "notAfterr" leaves NotAfter zero and enforces only the lower
+// bound of the window.
+func TestUnmarshalCondition_RejectsUnknownField(t *testing.T) {
+	cases := []struct {
+		name string
+		json string
+		want string // substring the error must name
+	}{
+		{
+			name: "timeWindow bound typo enforces only one side",
+			json: `{"type":"timeWindow","notBefore":"09:00","notAfterr":"17:00"}`,
+			want: `unknown field "notAfterr"`,
+		},
+		{
+			name: "maxCalls limit typo",
+			json: `{"type":"maxCalls","maxx":5,"windowSeconds":60}`,
+			want: `unknown field "maxx"`,
+		},
+		{
+			name: "allowedValues argument typo",
+			json: `{"type":"allowedValues","arguments":"path","values":["/tmp"]}`,
+			want: `unknown field "arguments"`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := unmarshalCondition([]byte(tc.json))
+			if err == nil {
+				t.Fatalf("unmarshalCondition(%s) = nil error, want a rejection", tc.json)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error = %q, want it to name %s", err, tc.want)
+			}
+		})
+	}
+}
+
+// The unknown-field check must not reject anything a lenient decode would have bound:
+// the "type" discriminator (no condition struct has it as a field) and any field name
+// spelled in a different case, since encoding/json binds case-insensitively.
+func TestUnmarshalCondition_AcceptsDiscriminatorAndCaseVariants(t *testing.T) {
+	cases := []string{
+		`{"type":"timeWindow","notBefore":"09:00","notAfter":"17:00"}`,
+		`{"type":"timeWindow","NOTBEFORE":"09:00","notafter":"17:00"}`,
+		`{"TYPE":"timeWindow","notBefore":"09:00"}`,
+	}
+	for _, j := range cases {
+		if _, err := unmarshalCondition([]byte(j)); err != nil {
+			t.Errorf("unmarshalCondition(%s) = %v, want it accepted (the decode would bind these)", j, err)
+		}
+	}
+}
+
+// Every condition type this build models must survive a round-trip through the strict
+// decoder. A field the check does not know about would make a perfectly valid manifest
+// unloadable, so this pins jsonFieldNames against every registered type at once rather
+// than relying on per-type cases to stay complete.
+func TestUnmarshalCondition_StrictCheckAcceptsEveryMarshaledConditionType(t *testing.T) {
+	for _, ct := range knownConditionTypes {
+		cond := newCondition(ct)
+		if cond == nil {
+			t.Fatalf("newCondition(%q) returned nil", ct)
+		}
+		data, err := marshalCondition(cond)
+		if err != nil {
+			t.Fatalf("marshalCondition(%q): %v", ct, err)
+		}
+		if _, err := unmarshalCondition(data); err != nil {
+			t.Errorf("condition %q does not survive its own marshaling under the strict decode: %v (marshaled: %s)", ct, err, data)
+		}
+	}
+}
+
+// jsonFieldNames reports the lowercased names encoding/json would bind, honoring the
+// json tag (including a renamed field and an omitempty suffix) and skipping both "-"
+// and unexported fields.
+func TestJSONFieldNames(t *testing.T) {
+	type sample struct {
+		Renamed  string `json:"wireName"`
+		Omitted  string `json:"trimmed,omitempty"`
+		Skipped  string `json:"-"`
+		NoTag    string
+		unexport string //nolint:unused // present to prove unexported fields are skipped
+	}
+	got := jsonFieldNames(&sample{})
+	for _, want := range []string{"wirename", "trimmed", "notag"} {
+		if !got[want] {
+			t.Errorf("jsonFieldNames missing %q; got %v", want, got)
+		}
+	}
+	for _, absent := range []string{"skipped", "renamed", "omitted", "unexport"} {
+		if got[absent] {
+			t.Errorf("jsonFieldNames should not contain %q; got %v", absent, got)
+		}
+	}
+}
+
+// The per-type memo must return the same content on a cache hit as on the miss that
+// populated it — a broken cache would silently start rejecting valid fields.
+func TestJSONFieldNames_CachedResultMatchesFresh(t *testing.T) {
+	first := jsonFieldNames(&TimeWindowCondition{})
+	second := jsonFieldNames(&TimeWindowCondition{})
+	if len(first) != len(second) {
+		t.Fatalf("cached result differs in size: %v vs %v", first, second)
+	}
+	for k := range first {
+		if !second[k] {
+			t.Errorf("cached result lost key %q", k)
 		}
 	}
 }

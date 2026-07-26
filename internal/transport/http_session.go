@@ -568,6 +568,17 @@ func (p *HTTPProxy) registerSession(sess *httpSession, startGen uint64) error {
 	if p.maxSessions > 0 && len(p.sessions) >= p.maxSessions {
 		return errSessionLimit
 	}
+	// Deliberately does NOT touch p.establishing. The reservation has exactly one owner
+	// — the handler that took it — and it is released exactly once, unconditionally, when
+	// that handler returns. An earlier shape converted the reservation here on success,
+	// which double-freed it whenever establishment failed AFTER registering (the drift
+	// refusal in runDriftCheckOrTeardown is such a path): the handler's release then
+	// decremented a counter this function had already decremented, silently consuming a
+	// CONCURRENT session's reservation and letting more upstreams spawn than the cap
+	// allows — the exact over-admission the counter exists to prevent. Between this
+	// insert and the handler's release the session is counted twice (registered AND
+	// establishing), which errs toward refusing one extra initialize rather than
+	// admitting one too many.
 	now := time.Now().UnixNano()
 	sess.lastActive.Store(now)
 	// Seed lastRequest so the hard idle ceiling is measured from creation: the
@@ -584,22 +595,61 @@ func (p *HTTPProxy) getSession(id string) *httpSession {
 	return p.sessions[id]
 }
 
-// sessionCount returns the number of active sessions (for the health/metrics
-// endpoints and the cheap pre-spawn capacity check).
+// sessionCount returns the number of REGISTERED sessions, for the health/metrics
+// endpoints. Deliberately not the capacity predicate: the cap also counts sessions still
+// establishing (see tryReserveSessionSlot), so a caller deciding whether to admit one
+// must not reach for this.
 func (p *HTTPProxy) sessionCount() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return len(p.sessions)
 }
 
-// atSessionCap reports whether the session cap is currently reached. Best-effort:
-// used to refuse an initialize before spawning an upstream. registerSession makes
-// the cap authoritative against races.
-func (p *HTTPProxy) atSessionCap() bool {
+// tryReserveSessionSlot reserves one maxSessions slot for a session that is about to be
+// established, counting sessions already registered PLUS those still establishing. It
+// returns false when the cap is reached, in which case the caller must refuse the
+// initialize (503) without spawning anything.
+//
+// A registry-only pre-check is not enough: establishment (upstream spawn + initialize
+// handshake + drift probe) runs for up to sessionStartTimeout before registerSession
+// makes the count authoritative, so concurrent initializes would all pass a registry-only
+// check and all spawn upstreams. See the establishing field.
+//
+// Every successful reservation is released exactly once, by the caller that took it, on
+// every path — success included. Nothing else may touch p.establishing: a second releaser
+// cannot know whether the reservation it is dropping is its own, and dropping someone
+// else's is indistinguishable from a correct release. maxSessions <= 0 (unlimited)
+// reserves nothing, so its release is a no-op too.
+func (p *HTTPProxy) tryReserveSessionSlot() bool {
 	if p.maxSessions <= 0 {
+		return true
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.sessions)+p.establishing >= p.maxSessions {
 		return false
 	}
-	return p.sessionCount() >= p.maxSessions
+	p.establishing++
+	return true
+}
+
+// releaseSessionSlot drops the reservation taken by tryReserveSessionSlot, whatever the
+// outcome of establishment was. A no-op against an unlimited cap (which reserves
+// nothing).
+//
+// The p.establishing > 0 guard is a backstop against a negative counter, NOT a licence to
+// release twice: with other sessions establishing, a spurious release does not go
+// negative — it silently consumes THEIR reservation, which is why the counter has exactly
+// one releaser (see tryReserveSessionSlot).
+func (p *HTTPProxy) releaseSessionSlot() {
+	if p.maxSessions <= 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.establishing > 0 {
+		p.establishing--
+	}
 }
 
 // hardIdleMultiplier sets the hard idle ceiling as a multiple of the idle window.
@@ -806,8 +856,8 @@ func (p *HTTPProxy) closeAllSessions() {
 // when sessionIdleTimeoutMs is 0 (a documented, valid config). Without this a killed
 // session's subprocess/connection and its registry slot linger until process exit, and
 // accumulated killed-but-undead sessions eventually exhaust maxSessions and make
-// atSessionCap 503 EVERY new initialize — a session-exhaustion DoS triggered by the kill
-// switch itself. Mirrors handleMCPDelete's registry-delete-then-close teardown; a
+// tryReserveSessionSlot 503 EVERY new initialize — a session-exhaustion DoS triggered by
+// the kill switch itself. Mirrors handleMCPDelete's registry-delete-then-close teardown; a
 // session already gone is a no-op. The kill store still independently blocks the session,
 // so this only reclaims resources.
 //
