@@ -33,7 +33,7 @@ const (
 // immutable after load — mutating Operations/Extensions/Tables/Columns/Domains/CIDRs on
 // a compiled condition keeps enforcing the PRE-edit allowlist, silently and in the
 // fail-open direction if the edit was a narrowing. Build a new condition instead.
-//
+
 // Condition is the interface for all capability conditions.
 // All conditions have a Type() method returning the discriminator string.
 type Condition interface {

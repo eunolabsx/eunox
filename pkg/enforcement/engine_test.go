@@ -8074,14 +8074,14 @@ func (c ctxHonoringCounter) Peek(ctx context.Context, key string, windowSec int)
 	return c.inner.Peek(ctx, key, windowSec)
 }
 
-func (c ctxHonoringCounter) IncrementIfBelow(ctx context.Context, key string, windowSec int, limit int64) (int64, bool, time.Duration, error) {
+func (c ctxHonoringCounter) IncrementIfBelow(ctx context.Context, key string, windowSec int, limit int64) (count int64, admitted bool, retryAfter time.Duration, err error) {
 	if err := ctx.Err(); err != nil {
 		return 0, false, 0, err
 	}
 	return c.inner.IncrementIfBelow(ctx, key, windowSec, limit)
 }
 
-func (c ctxHonoringCounter) IncrementIfAllBelow(ctx context.Context, keys []string, windowSecs []int, limits []int64) (bool, int, int64, time.Duration, error) {
+func (c ctxHonoringCounter) IncrementIfAllBelow(ctx context.Context, keys []string, windowSecs []int, limits []int64) (admitted bool, deniedIndex int, count int64, retryAfter time.Duration, err error) {
 	if err := ctx.Err(); err != nil {
 		return false, 0, 0, 0, err
 	}
