@@ -1350,7 +1350,8 @@ func validateAllowedValues(i, j int, v *capability.AllowedValuesCondition) error
 }
 
 // validateRedactFields rejects the structurally malformed redactFields paths the
-// runtime redactor (pdp.RedactDotPath) would silently no-op on — forwarding the
+// runtime redactor (internal/pdp's redactDotPathRec, whose root marker is stripped by
+// normalizeDotPathRoot) would silently no-op on — forwarding the
 // field unredacted while the audit record reports redaction applied, a fail-open
 // leak. The redactor splits on '.' and looks up each segment as a literal object
 // key, so array-index notation ("users[0].ssn"), an empty segment ("a..b"), or a
@@ -1377,7 +1378,7 @@ func validateRedactFields(i, j int, fields []string) error {
 			return fmt.Errorf("capability at index %d, directive %d: redactFields path %q uses array-index notation ('[N]'), which is not supported and would silently redact nothing; use a dot path such as \"users.ssn\" to redact the field from every array element, or omit the index", i, j, field)
 		}
 		// Strip the leading root marker ("$." or a lone "$") before splitting, mirroring
-		// RedactDotPath. Any OTHER "$"-prefixed form is rejected below: the runtime
+		// the redactor. Any OTHER "$"-prefixed form is rejected below: the runtime
 		// normalizeDotPathRoot strips only those two spellings, so a path like
 		// "$users.ssn" (a likely typo for "$.users.ssn") would reach the redactor
 		// unchanged, which then looks up a literal first key "$users", finds nothing, and
