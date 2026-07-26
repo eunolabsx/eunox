@@ -32,6 +32,7 @@ import (
 	"github.com/eunolabs/eunox/internal/audit"
 	"github.com/eunolabs/eunox/internal/config"
 	"github.com/eunolabs/eunox/internal/transport"
+	"github.com/eunolabs/eunox/pkg/capability"
 )
 
 const (
@@ -86,33 +87,45 @@ var redactedConfigFields = map[string]bool{
 	"upstreamAuthHeader": true, // upstreams[].upstreamAuthHeader
 }
 
-// urlConfigFields names the URL/URI keys whose value is routed through config.RedactURL
-// (userinfo, query values, and fragment scrubbed; host/path kept) rather than emitted
-// verbatim — whether the value is a single scalar URL or a sequence of them (see
-// redactURLValue). Keyed on the field name because a credential is as likely in any of
-// these as in the original upstreamUrl.
-var urlConfigFields = map[string]bool{
-	"upstreamUrl":               true, // upstreams[].upstreamUrl (scalar)
-	"oauthResource":             true, // listen.oauthResource (scalar, RFC 9728 resource URI)
-	"oauthAuthorizationServers": true, // listen.oauthAuthorizationServers (sequence of IdP URLs)
-	"allowedOrigins":            true, // listen.allowedOrigins (sequence)
+// urlConfigFields names the URL/URI keys whose value is scrubbed rather than emitted
+// verbatim — whether written as a single scalar URL or a sequence of them (see
+// redactURLValue) — and WHICH redactor each one gets. Keyed on the field name because a
+// credential is as likely in any of these as in the original upstreamUrl.
+//
+// upstreamUrl gets the strict log-facing form, which also drops the PATH. It is the one
+// field here that routinely IS a webhook endpoint (Slack /services/T…/B…/<secret>,
+// Telegram /bot<token>/…), where the path is the entire credential — and this bundle is
+// generated to be pasted into a bug report, so it is the highest-exposure sink in the
+// binary, not a place to preserve that detail. The host still identifies the upstream.
+//
+// The rest keep the bundle-facing form (path and query parameter NAMES preserved, values
+// replaced with length-tagged placeholders). They are identifiers, not secret-bearing
+// endpoints: an RFC 9728 resource URI and its authorization servers are published
+// unauthenticated at /.well-known/oauth-protected-resource, and an allowed Origin is
+// scheme://host with no path at all. Their paths are load-bearing for diagnosis — telling
+// https://proxy.example.com/mcp/github from /mcp/jira is the point of reading the section.
+var urlConfigFields = map[string]func(string) string{
+	"upstreamUrl":               capability.RedactURLForLog, // upstreams[].upstreamUrl (scalar); path can BE the credential
+	"oauthResource":             config.RedactURL,           // listen.oauthResource (scalar, RFC 9728 resource URI)
+	"oauthAuthorizationServers": config.RedactURL,           // listen.oauthAuthorizationServers (sequence of IdP URLs)
+	"allowedOrigins":            config.RedactURL,           // listen.allowedOrigins (sequence)
 }
 
-// redactURLValue scrubs a URL-bearing config value of ANY shape: a scalar URL string
-// (userinfo/query/fragment stripped via config.RedactURL), a sequence of URL strings, or
-// (defensively) a nested map. The doctor bundle raw-parses the on-disk YAML to surface
-// a config exactly as written, so a URL field can arrive in a shape the typed loader
-// would reject — a scalar where a list was expected, or a list where a scalar was.
-// Scrubbing on the value's SHAPE rather than the declared schema shape means a
-// credential under any URL key is scrubbed regardless of how it was (mis)written; the
-// prior split scalar/array handling leaked a scalar written under an array-typed key.
-func redactURLValue(val interface{}) interface{} {
+// redactURLValue scrubs a URL-bearing config value of ANY shape through redact: a scalar
+// URL string, a sequence of URL strings, or (defensively) a nested map. The doctor bundle
+// raw-parses the on-disk YAML to surface a config exactly as written, so a URL field can
+// arrive in a shape the typed loader would reject — a scalar where a list was expected, or
+// a list where a scalar was. Scrubbing on the value's SHAPE rather than the declared
+// schema shape means a credential under any URL key is scrubbed regardless of how it was
+// (mis)written; the prior split scalar/array handling leaked a scalar written under an
+// array-typed key.
+func redactURLValue(val interface{}, redact func(string) string) interface{} {
 	switch v := val.(type) {
 	case string:
-		return config.RedactURL(v)
+		return redact(v)
 	case []interface{}:
 		for i, it := range v {
-			v[i] = redactURLValue(it)
+			v[i] = redactURLValue(it, redact)
 		}
 		return v
 	default:
@@ -415,11 +428,11 @@ func writeDoctorConfig(w io.Writer, path string) {
 	}
 }
 
-// redactConfigValue walks a yaml.Unmarshal-shaped value in place, recursing into
-// maps and slices. A redactedConfigFields key's value becomes a length-only
-// placeholder; a urlConfigFields value is scrubbed through redactURLValue (userinfo/
-// query/fragment stripped, host/path kept) whether it is a scalar URL or a sequence
-// of them.
+// redactConfigValue walks a yaml.Unmarshal-shaped value in place, recursing into maps
+// and slices. A redactedConfigFields key's value becomes a length-only placeholder; a
+// urlConfigFields value is scrubbed through that field's own redactor (see there — the
+// strict log-facing one for upstreamUrl, the path-preserving bundle one for the rest)
+// whether it is a scalar URL or a sequence of them.
 func redactConfigValue(v interface{}) {
 	switch x := v.(type) {
 	case map[string]interface{}:
@@ -427,8 +440,8 @@ func redactConfigValue(v interface{}) {
 			switch {
 			case redactedConfigFields[k]:
 				x[k] = redactString(val)
-			case urlConfigFields[k]:
-				x[k] = redactURLValue(val)
+			case urlConfigFields[k] != nil:
+				x[k] = redactURLValue(val, urlConfigFields[k])
 			default:
 				redactConfigValue(val)
 			}
@@ -445,8 +458,8 @@ func redactConfigValue(v interface{}) {
 			switch {
 			case redactedConfigFields[ks]:
 				x[k] = redactString(val)
-			case urlConfigFields[ks]:
-				x[k] = redactURLValue(val)
+			case urlConfigFields[ks] != nil:
+				x[k] = redactURLValue(val, urlConfigFields[ks])
 			default:
 				redactConfigValue(val)
 			}

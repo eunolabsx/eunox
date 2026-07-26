@@ -65,13 +65,19 @@ func TestRedactConfigValue_ScrubsAllowlistedFields(t *testing.T) {
 	// Non-sensitive fields must survive — diagnostic value depends on them.
 	for _, keep := range []string{
 		"127.0.0.1",              // listen.bind
-		"mcp.stripe.com",         // upstream host (URL userinfo stripped, host kept)
+		"mcp.stripe.com",         // upstream host (userinfo dropped, host kept)
 		"NOT-REDACTED-BY-DESIGN", // args are explicitly NOT on the allowlist
-		"REDACTED",               // placeholder userinfo in the URL
 	} {
 		if !strings.Contains(dump, keep) {
 			t.Errorf("redactConfigValue: expected %q to survive redaction; got:\n%s", keep, dump)
 		}
+	}
+	// upstreamUrl uses the strict log-facing redactor: userinfo is dropped outright (no
+	// REDACTED placeholder) and the path goes too, since for a webhook-style upstream the
+	// path IS the credential. Asserted explicitly because a bare Contains("REDACTED")
+	// check here was satisfied by the unrelated "NOT-REDACTED-BY-DESIGN" arg above.
+	if !strings.Contains(dump, "https://mcp.stripe.com/[redacted]") {
+		t.Errorf("redactConfigValue: upstreamUrl must reduce to scheme://host + redacted path; got:\n%s", dump)
 	}
 }
 
@@ -469,8 +475,14 @@ upstreams:
 	if !strings.Contains(out, "<redacted len=") {
 		t.Errorf("expected at least one length-tagged redaction marker:\n%s", out)
 	}
-	if !strings.Contains(out, "REDACTED:REDACTED@mcp.stripe.com") {
-		t.Errorf("expected URL userinfo to be replaced with REDACTED placeholder:\n%s", out)
+	// upstreamUrl goes through the STRICT log-facing redactor, which drops userinfo
+	// outright rather than replacing it with a placeholder. Assert the shape, not just
+	// the absence of the sentinel, so a redactor swap cannot silently weaken this.
+	if !strings.Contains(out, "upstreamUrl: https://mcp.stripe.com") {
+		t.Errorf("expected upstreamUrl reduced to scheme://host:\n%s", out)
+	}
+	if strings.Contains(out, "uuu") || strings.Contains(out, "@mcp.stripe.com") {
+		t.Errorf("upstreamUrl userinfo must be dropped entirely:\n%s", out)
 	}
 	// Host/transport visibility — the diagnostic value of the bundle depends
 	// on these surviving.
@@ -941,5 +953,52 @@ func TestIndentWriter_ShortWriteDoesNotMarkLineStart(t *testing.T) {
 	}
 	if iw.atLineStart {
 		t.Error("atLineStart must stay false after a short write that did not flush the newline")
+	}
+}
+
+// TestWriteDoctorBundle_UpstreamURLPathIsRedacted pins the highest-exposure sink in the
+// binary against the leak class this repo's log-facing redactor exists to close.
+//
+// The bundle's footer says "paste manually" into a bug report, so it is the LAST place a
+// webhook-style upstreamUrl may keep its path: for a Slack incoming webhook or a Telegram
+// bot URL the path IS the entire credential, and no allowlist of field names catches it
+// because the field name (upstreamUrl) is legitimate. The host must still survive — the
+// bundle exists to say which upstream is configured.
+//
+// The sibling URL fields deliberately keep their paths: an RFC 9728 resource URI and its
+// authorization servers are published unauthenticated, and telling /mcp/github from
+// /mcp/jira is the diagnostic point of reading the section.
+func TestWriteDoctorBundle_UpstreamURLPathIsRedacted(t *testing.T) {
+	configYAML := `
+schemaVersion: "0.1"
+transport: http
+listen:
+  bind: 127.0.0.1
+  port: 3000
+  oauthResource: https://proxy.example.com/mcp/github
+upstreams:
+  - name: slack
+    transport: http
+    upstreamUrl: https://hooks.slack.com/services/T0AAA/B0BBB/SENTINEL-WEBHOOK-PATH-SECRET
+`
+	cfgPath := filepath.Join(t.TempDir(), "eunox.yaml")
+	doctorWriteFile(t, cfgPath, configYAML)
+
+	var buf bytes.Buffer
+	writeDoctorBundle(&buf, newDoctorOptions(cfgPath, filepath.Join(t.TempDir(), "no.jsonl"), "", 0, false))
+	out := buf.String()
+
+	for _, secret := range []string{"SENTINEL-WEBHOOK-PATH-SECRET", "T0AAA", "B0BBB", "/services/"} {
+		if strings.Contains(out, secret) {
+			t.Errorf("bundle leaked the path-embedded webhook credential %q:\n%s", secret, out)
+		}
+	}
+	if !strings.Contains(out, "hooks.slack.com") {
+		t.Errorf("the upstream host must survive so the bundle still identifies it:\n%s", out)
+	}
+	// The RFC 9728 resource URI keeps its path: it is an identifier, not a secret, and
+	// which route it names is exactly what a reader needs.
+	if !strings.Contains(out, "https://proxy.example.com/mcp/github") {
+		t.Errorf("oauthResource must keep its path for diagnosis:\n%s", out)
 	}
 }
