@@ -1758,7 +1758,17 @@ func emptyListing(resultBytes json.RawMessage, listKey string) ListFilterResult 
 // decoded and the requested one selected, so an entry missing idField yields the
 // empty-name target. Used by the JWT intersection's in-memory second pass
 // (filterList) to match entries against real, non-empty parsed claim heads.
+//
+// entryKeysAmbiguous is checked first and fails closed (false) on an ambiguous entry —
+// a duplicate or case-variant top-level key (e.g. "name"/"Name", "uri"/"URI") — for the
+// same reason ManifestPDP's list filters apply it: an entry Go decodes one way here can
+// render a different name/uri to a case-sensitive host, and this path (reached whenever
+// the inner PDP is nil or AlwaysAllowPDP, i.e. its result comes from an unfiltered
+// passThroughList) is the one list-filter path that had no per-entry gate at all.
 func entryCoveredByClaims(raw json.RawMessage, parsed []capHead, idField string, targetType capability.TargetType) bool {
+	if entryKeysAmbiguous(raw) {
+		return false
+	}
 	var entry struct {
 		Name string `json:"name"`
 		URI  string `json:"uri"`

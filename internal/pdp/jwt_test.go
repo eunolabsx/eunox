@@ -2142,6 +2142,52 @@ func TestJWT_FilterToolsList_NoClaims_WithInner_FailsClosed(t *testing.T) {
 	}
 }
 
+// TestJWT_FilterToolsList_PassThroughInner_RejectsAmbiguousEntry pins the fix for the
+// pass-through path (inner nil, or AlwaysAllowPDP): passThroughList applies no per-entry
+// ambiguity gate, so before entryCoveredByClaims checked entryKeysAmbiguous itself, an entry
+// whose top-level keys fold-collide (e.g. "name"/"Name") was decoded with a plain
+// json.Unmarshal and matched against the claims using whichever value Go's last-key-wins
+// decode kept — even though a case-sensitive host (or a duplicate-key-first-wins host) can
+// render the OTHER value. A claim covering the visible name then let the ambiguous entry
+// through verbatim, both keys intact, defeating catalog integrity rather than merely
+// forwarding a name the token didn't cover.
+func TestJWT_FilterToolsList_PassThroughInner_RejectsAmbiguousEntry(t *testing.T) {
+	t.Parallel()
+	pdp := &JWTPDP{} // nil inner: the pass-through path.
+	ctx := WithJWTClaims(context.Background(), &JWTClaims{
+		HasCapabilities: true,
+		Capabilities:    []string{"tool:safe_tool", "tool:evil_tool"},
+	})
+
+	// Both names are covered by claims, so a naive decode (which picks one via Go's
+	// last-key-wins struct-field binding) would let this entry through either way. The
+	// regression this guards is that it must be excluded ENTIRELY for being ambiguous,
+	// not merely filtered on whichever name survives the decode.
+	upstream := json.RawMessage(`{"tools":[{"name":"safe_tool","Name":"evil_tool"}]}`)
+	filtered := pdp.FilterToolsList(ctx, upstream).Result
+
+	if got := toolNames(t, filtered); len(got) != 0 {
+		t.Errorf("ambiguous entry must be excluded entirely, got %v", got)
+	}
+}
+
+// TestJWT_FilterToolsList_PassThroughInner_AllowsUnambiguousEntry is the negative control:
+// an ordinary entry with no key collision must still pass through the same nil-inner path.
+func TestJWT_FilterToolsList_PassThroughInner_AllowsUnambiguousEntry(t *testing.T) {
+	t.Parallel()
+	pdp := &JWTPDP{}
+	ctx := WithJWTClaims(context.Background(), &JWTClaims{
+		HasCapabilities: true,
+		Capabilities:    []string{"tool:read_file"},
+	})
+
+	filtered := pdp.FilterToolsList(ctx, toolsListJSON(t, "read_file", "write_file")).Result
+	got := toolNames(t, filtered)
+	if len(got) != 1 || got[0] != "read_file" {
+		t.Errorf("unambiguous entry: filtered tools = %v, want [read_file]", got)
+	}
+}
+
 // TestJWT_FilterResourcesAndPrompts verifies resource and prompt list
 // filtering also honors the JWT capabilities.
 func TestJWT_FilterResourcesAndPrompts(t *testing.T) {
