@@ -212,20 +212,28 @@ Flags:
 	// --audit-log) reported against the built-in default path even when foo.yaml
 	// pointed its audit.log elsewhere.
 	//
-	// Unlike those subcommands, a load failure does not abort: doctor's whole job is to
-	// describe a broken deployment, so a config that will not parse is the case the
-	// bundle is most needed for. The error is announced on stderr and rendered in the
-	// bundle's config-derived sections; every other section still renders and the exit
-	// status stays 0 because the bundle itself was produced.
+	// Unlike those subcommands, a load failure does not ABORT: doctor's whole job is to
+	// describe a broken deployment, so a config that will not parse is the case the bundle
+	// is most needed for. The error is announced on stderr and rendered in the bundle's
+	// config-derived sections, and every other section still renders.
+	//
+	// The exit status stays non-zero, though. Before the bundle rendered at all, an
+	// unloadable config exited 1, which makes `eunox doctor --config X && restart` a
+	// usable pre-flight gate; exiting 0 now would silently pass that gate for a config the
+	// proxy will refuse to start on. Rendering the bundle and reporting the failure are
+	// independent, so doctor does both.
 	opts := newDoctorOptions(*configPath, *auditLog, *auditKey, *auditTail, *live)
+	exitCode := 0
 	if opts.cfgErr != nil {
 		fmt.Fprintf(os.Stderr, "eunox doctor: could not load config %q: %v\n", *configPath, opts.cfgErr)
 		fmt.Fprintln(os.Stderr, "The bundle is still written; the config-dependent sections report this error in place.")
+		exitCode = 1
 	}
 
 	// Stdout: discard write errors (a broken pipe is not actionable).
 	if *output == "" {
 		writeDoctorBundle(os.Stdout, opts)
+		exitDoctor(exitCode)
 		return
 	}
 
@@ -269,6 +277,19 @@ Flags:
 	}
 	fmt.Fprintf(os.Stderr, "Wrote support bundle to %s\n", outPath)
 	fmt.Fprintln(os.Stderr, "Review for any remaining sensitive values before sharing.")
+	// Non-zero when the config could not be loaded (see above): the bundle was still
+	// written, but the config is broken and a caller gating on this must hear about it.
+	exitDoctor(exitCode)
+}
+
+// exitDoctor terminates with code when it is non-zero, and RETURNS on success so
+// cmdDoctor keeps its "returns normally when everything worked" shape — the shape its
+// in-process tests drive it through, and the one every other os.Exit in this function
+// already assumes (they are all failure paths).
+func exitDoctor(code int) {
+	if code != 0 {
+		os.Exit(code)
+	}
 }
 
 // writeDoctorBundle emits the support bundle to w. Sections are independent —

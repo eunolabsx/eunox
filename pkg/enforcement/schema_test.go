@@ -1201,6 +1201,42 @@ func TestValidateArgumentSchema_NamedScalarArguments(t *testing.T) {
 		assert.Contains(t, err.Error(), "enum")
 	})
 
+	// A named scalar must still MATCH an enum entry written with the same named type.
+	// unwrapNamedScalar rewrites the argument, and reflect.DeepEqual is
+	// type-identity-sensitive, so unwrapping only the argument would turn a match that
+	// held before into a denial — a silent fail-closed regression for an embedder whose
+	// enum and arguments share a domain type.
+	t.Run("named string matches a named enum entry", func(t *testing.T) {
+		t.Parallel()
+		schema := &capability.ArgumentSchema{
+			Properties: map[string]*capability.ArgumentSchema{
+				"p": {Enum: []interface{}{namedPath("/srv/a"), namedPath("/srv/b")}},
+			},
+		}
+		assert.NoError(t, enforcement.ValidateArgumentSchema(
+			map[string]interface{}{"p": namedPath("/srv/a")}, schema),
+			"a named string equal to a named enum entry must match")
+		// Cross-form too: the entry written plainly, the argument named, and vice versa.
+		assert.NoError(t, enforcement.ValidateArgumentSchema(
+			map[string]interface{}{"p": "/srv/b"}, schema))
+		require.Error(t, enforcement.ValidateArgumentSchema(
+			map[string]interface{}{"p": namedPath("/etc/passwd")}, schema),
+			"a named string outside the enum must still be denied")
+	})
+
+	t.Run("named int matches a named enum entry", func(t *testing.T) {
+		t.Parallel()
+		schema := &capability.ArgumentSchema{
+			Properties: map[string]*capability.ArgumentSchema{
+				"port": {Enum: []interface{}{namedPort(80), namedPort(443)}},
+			},
+		}
+		assert.NoError(t, enforcement.ValidateArgumentSchema(
+			map[string]interface{}{"port": namedPort(443)}, schema))
+		require.Error(t, enforcement.ValidateArgumentSchema(
+			map[string]interface{}{"port": namedPort(8080)}, schema))
+	})
+
 	t.Run("named bool carries no keyword and passes", func(t *testing.T) {
 		schema := &capability.ArgumentSchema{
 			Properties: map[string]*capability.ArgumentSchema{

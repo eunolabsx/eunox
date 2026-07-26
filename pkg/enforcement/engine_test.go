@@ -7897,3 +7897,89 @@ func TestDirectives_CollectedOnDowngradableDeny(t *testing.T) {
 		assert.Empty(t, resp.Obligations)
 	})
 }
+
+// unwiredDirective is a Directive whose obligation type the engine does not know how to
+// apply. collectObligations returns a HardDeny for it — an engine bug, not a policy
+// verdict.
+type unwiredDirective struct{}
+
+func (unwiredDirective) DirectiveType() string { return "notARealDirective" }
+func (unwiredDirective) ToObligation() capability.Obligation {
+	return capability.Obligation{Type: "notARealDirective"}
+}
+
+// TestUnwiredDirective_DoesNotPreemptTheConditionVerdict pins the ordering that keeps a
+// wiretap route from blocking.
+//
+// collectObligations runs before the conditions so its result can be stamped onto a
+// downgradable deny, but its DENY must still be returned where the original ordering
+// returned it: after runConditions. Returning it early would preempt the condition
+// verdict, and an unwired directive produces a HardDeny — which isObserveDeny refuses to
+// downgrade. An audit-mode constraint that is documented never to block would then start
+// BLOCKING live traffic over a directive it was only going to apply post-allow, and the
+// audit record's denial code would change from CONDITION_FAILED to ENFORCEMENT_ERROR.
+func TestUnwiredDirective_DoesNotPreemptTheConditionVerdict(t *testing.T) {
+	t.Parallel()
+	constraint := capability.Constraint{
+		Target:      "tool:read_file",
+		Actions:     []string{"call"},
+		Enforcement: "audit",
+		Conditions: []capability.Condition{
+			&capability.AllowedValuesCondition{Argument: "path", Values: []interface{}{"/reports/*"}},
+		},
+		Directives: []capability.Directive{unwiredDirective{}},
+	}
+	req := &capability.EnforceRequest{
+		SessionID: "sess-1",
+		ToolName:  "read_file",
+		Arguments: map[string]interface{}{"path": "/internal/secrets.txt"},
+	}
+
+	resp := enforcement.New().ValidateAction(context.Background(), req, []capability.Constraint{constraint})
+	require.Equal(t, capability.DecisionDeny, resp.Decision)
+	require.NotNil(t, resp.Denial)
+	// The failing CONDITION is the verdict, and it stays downgradable so the wiretap
+	// route forwards it rather than blocking.
+	assert.Equal(t, capability.ErrCodeValueNotPermitted, resp.Denial.Code,
+		"the condition verdict must win; an unwired directive must not preempt it")
+	assert.False(t, resp.Denial.HardDeny, "an audit-mode route must not be made to block")
+
+	// With the conditions PASSING, the unwired directive is still caught — it is a real
+	// engine bug and must hard-deny rather than be silently skipped.
+	req.Arguments["path"] = "/reports/q3.txt"
+	bug := enforcement.New().ValidateAction(context.Background(), req, []capability.Constraint{constraint})
+	require.Equal(t, capability.DecisionDeny, bug.Decision)
+	require.NotNil(t, bug.Denial)
+	assert.Equal(t, capability.ErrCodeEnforcementError, bug.Denial.Code)
+	assert.True(t, bug.Denial.HardDeny, "an unwired directive must block even under audit mode")
+	assert.Empty(t, bug.Obligations, "a hard deny carries no obligations")
+}
+
+// TestNoMatchDeny_CarriesObligationsWhenForwarded covers the last downgradable deny the
+// engine produces: no constraint was selected for this caller, yet a route running
+// --audit forwards the call anyway. The obligations come from every capability NAMING the
+// target, regardless of principal scoping — no entry governs this caller, and any entry
+// declaring a field of this target redactable is reason enough to mask it on a response
+// about to be forwarded.
+func TestNoMatchDeny_CarriesObligationsWhenForwarded(t *testing.T) {
+	t.Parallel()
+	// Principal-scoped, so it does not match a claimless request — but it names the target.
+	caps := []capability.Constraint{{
+		Target:     "tool:read_*",
+		Actions:    []string{"call"},
+		Principal:  map[string][]string{"agent_id": {"someone-else"}},
+		Directives: []capability.Directive{&capability.RedactFieldsDirective{Fields: []string{"$.user.ssn"}}},
+	}}
+	req := &capability.EnforceRequest{SessionID: "sess-1", ToolName: "read_file"}
+	e := enforcement.New()
+
+	forwarded := e.ValidateAction(enforcement.WithSkipQuota(context.Background()), req, caps)
+	require.Equal(t, capability.DecisionDeny, forwarded.Decision)
+	require.Len(t, forwarded.Obligations, 1, "a forwarded no-match deny must still redact")
+	assert.Equal(t, []string{"$.user.ssn"}, forwarded.Obligations[0].Paths)
+
+	// On an enforce route the same deny BLOCKS, so it carries nothing.
+	blocked := e.ValidateAction(context.Background(), req, caps)
+	require.Equal(t, capability.DecisionDeny, blocked.Decision)
+	assert.Empty(t, blocked.Obligations)
+}

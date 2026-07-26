@@ -1054,6 +1054,12 @@ func (s *httpSession) callSubprocessUpstream(ctx context.Context, msg mcp.RPCMsg
 	if s.hostToUp == nil {
 		s.hostToUp = make(map[string]*json.RawMessage)
 	}
+	// Capture the three map headers while still holding the lock. Reading them after the
+	// Unlock to build the awaitNonced call would be an unsynchronized read of a field a
+	// concurrent caller may be initializing right here — a data race -race reports, and
+	// one that can hand awaitNonced a nil map to write into, the exact panic these guards
+	// exist to prevent.
+	pending, byUpstreamID, hostToUp := s.pending, s.byUpstreamID, s.hostToUp
 	s.pendingMu.Unlock()
 	// A write timeout (ErrUpstreamWriteTimeout) has already killed the subprocess via the
 	// writer's onPoison hook (killSubprocess), which EOFs readUpstream and reaps the session;
@@ -1061,7 +1067,7 @@ func (s *httpSession) callSubprocessUpstream(ctx context.Context, msg mcp.RPCMsg
 	// delivery path (deliverUpstreamError) is stdio-bridge-only and simply never fires here:
 	// an HTTP session's remote-upstream failures already surface as callUpstream errors
 	// (callRemoteUpstream), recorded as deny/UPSTREAM_ERROR.
-	return awaitNonced(ctx, &s.pendingMu, s.pending, s.byUpstreamID, s.hostToUp, &s.upstreamSeq, s.teardownDone(), mcp.MsgKey(msg.ID),
+	return awaitNonced(ctx, &s.pendingMu, pending, byUpstreamID, hostToUp, &s.upstreamSeq, s.teardownDone(), mcp.MsgKey(msg.ID),
 		func(id *json.RawMessage) { msg.ID = id },
 		func() error { return s.upWriter.Write(msg) })
 }

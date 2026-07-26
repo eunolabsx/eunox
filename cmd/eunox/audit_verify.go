@@ -4,8 +4,10 @@
 // audit-verify: re-verify the local audit log's per-record HMAC signatures and its
 // tamper-evident chain, across the base log and every rotated sibling.
 //
-// The shared --config audit-path defaulting lives here because audit-verify and stats
-// are its only users.
+// The shared --config audit-path defaulting also lives here, beside its first caller.
+// It is used by every subcommand that READS the tape — audit-verify, stats, suggest, and
+// (through applyAuditDefaultsFromConfig) doctor — so treat it as shared CLI plumbing
+// rather than audit-verify's own.
 
 package main
 
@@ -39,7 +41,7 @@ func applyAuditDefaultsFromConfig(cfg *config.GatewayConfig, logPath, keyPath *s
 
 // applyConfigAuditDefaults loads configPath and applies its audit block as the
 // defaults for the audit-log / audit-key-path flags. cmdName labels the load error.
-// A no-op when configPath is empty. Shared by audit-verify and stats, which both
+// A no-op when configPath is empty. Shared by audit-verify, stats, and suggest, which all
 // default their audit paths from the same config block and have nothing to do with an
 // unloadable config, so the error is fatal for them. doctor deliberately does NOT use
 // this: a broken config is the case its bundle exists for, so it loads via

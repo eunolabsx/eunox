@@ -67,3 +67,54 @@ func TestRedactURLForLog_KeepsEnoughToIdentifyTheEndpoint(t *testing.T) {
 		})
 	}
 }
+
+// TestRedactURLForLog_UnlocatableCredentialFallsBackToPlaceholder pins the fail-safe
+// that catches a credential the userinfo strip cannot locate.
+//
+// A userinfo containing "/" (a generated password, most often) puts the authority
+// boundary INSIDE the credential, so the "last @ before the first /" strip finds
+// nothing. The residual-"@" check must therefore run BEFORE the path replacement: the
+// replacement drops everything from the first "/" onward, which for this shape deletes
+// the very "@" the check keys on, and a half-stripped credential would sail through.
+func TestRedactURLForLog_UnlocatableCredentialFallsBackToPlaceholder(t *testing.T) {
+	t.Parallel()
+	for _, in := range []string{
+		"http://svc:pw/1@10.0.0.5:8080/mcp",
+		"https://admin:s3cr3t/x@mcp.internal/mcp",
+		"https://user:pa%zz/ss@hooks.example.com/x",
+	} {
+		t.Run(in, func(t *testing.T) {
+			t.Parallel()
+			got := RedactURLForLog(in)
+			if got != "<redacted url>" {
+				t.Errorf("RedactURLForLog(%q) = %q, want the fixed placeholder", in, got)
+			}
+		})
+	}
+}
+
+// TestRedactURLForLog_AuthorityLessInput pins that a value with no "//" authority still
+// gets its path redacted AND keeps whatever identifies the endpoint.
+//
+// A scheme-less upstreamUrl is the commonest form of the mistake this redactor meets
+// (url.Parse ACCEPTS it, putting host and path together in u.Path), so replacing u.Path
+// wholesale would reduce the message to a bare "/[redacted]" — no host, nothing for the
+// operator to act on. A genuinely path-only value has no host to keep and reduces fully.
+func TestRedactURLForLog_AuthorityLessInput(t *testing.T) {
+	t.Parallel()
+	cases := []struct{ name, in, want string }{
+		{"scheme-less keeps the host", "hooks.slack.com/services/T0/B0/SECRET", "hooks.slack.com" + redactedPath},
+		{"scheme-less, no path", "hooks.slack.com", "hooks.slack.com"},
+		{"path-only reduces fully", "/services/T0/B0/SECRET", redactedPath},
+		{"path-only, malformed escape", "/services/T0/B0/SECRET%zz", redactedPath},
+		{"scheme with empty authority", "https://", "https://"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := RedactURLForLog(tc.in); got != tc.want {
+				t.Errorf("RedactURLForLog(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}

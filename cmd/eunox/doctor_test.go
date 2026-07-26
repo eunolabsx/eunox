@@ -420,7 +420,13 @@ func TestWriteDoctorBundle_RendersWithUnloadableConfig(t *testing.T) {
 // section as unusable, not dereference the nil config and crash the bundle mid-write.
 func TestWriteDoctorBundle_NilConfigWithoutErrorDoesNotPanic(t *testing.T) {
 	var buf bytes.Buffer
-	writeDoctorBundle(&buf, doctorOptions{configPath: "some.yaml", live: true})
+	// A temp audit-log path, like every sibling test: an empty one resolves to the
+	// built-in ~/.eunox/audit.jsonl default and would read the developer's real tape.
+	writeDoctorBundle(&buf, doctorOptions{
+		configPath:   "some.yaml",
+		auditLogPath: filepath.Join(t.TempDir(), "no.jsonl"),
+		live:         true,
+	})
 	if n := strings.Count(buf.String(), "could not load config:"); n != 2 {
 		t.Errorf("want both config-dependent sections to report an unusable config, got %d\n---\n%s", n, buf.String())
 	}

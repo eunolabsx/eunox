@@ -1264,9 +1264,11 @@ func resolveOAuthMetadata(cfg *config.GatewayConfig, pf proxyFlags) (*transport.
 	case len(cfg.Listen.OAuthAuthorizationServers) > 0:
 		oauthAuthzServers = cfg.Listen.OAuthAuthorizationServers
 		validateAuthz = true
-		if pf.oauthAuthzServer != "" {
-			// Same silent-override as the resource above: name the dropped flag.
-			fmt.Fprintf(os.Stderr, "[eunox] WARNING: --oauth-authz-server %q is overridden by the config's listen.oauthAuthorizationServers %v; the config takes precedence.\n", pf.oauthAuthzServer, oauthAuthzServers)
+		// Same silent-override as the resource above: name the dropped flag. Warn only
+		// when the flag actually loses something — a single config entry equal to the
+		// flag drops nothing, and warning there trains operators to ignore the message.
+		if pf.oauthAuthzServer != "" && !(len(oauthAuthzServers) == 1 && oauthAuthzServers[0] == pf.oauthAuthzServer) {
+			fmt.Fprintf(os.Stderr, "[eunox] WARNING: --oauth-authorization-server %q is overridden by the config's listen.oauthAuthorizationServers %v; the config takes precedence.\n", pf.oauthAuthzServer, oauthAuthzServers)
 		}
 	case pf.oauthAuthzServer != "":
 		oauthAuthzServers = []string{pf.oauthAuthzServer}
@@ -1451,15 +1453,21 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 	if err != nil {
 		return err
 	}
-	// Publishing the metadata document announces "this resource is OAuth-protected;
-	// get a token from these authorization servers" — to any unauthenticated client,
-	// since the endpoint is unauthenticated by design. Without --jwks-uri the gateway
-	// validates no bearer token at all, so it would advertise a protection it does not
-	// enforce and a client would present a token that is never checked. Fail closed,
-	// the same way validateJWTFlagsRequireJWKS rejects every other JWT-adjacent flag
-	// set without a JWKS endpoint; these two --oauth-* flags were its only gap.
-	if oauthMeta != nil && gwJWTPDP == nil {
-		return fmt.Errorf("--oauth-resource / listen.oauthResource publishes RFC 9728 protected-resource metadata, but no bearer-token validation is configured: set --jwks-uri so presented tokens are actually verified, or remove the --oauth-* settings so the gateway does not advertise OAuth protection it cannot enforce")
+	// Publishing the metadata document announces "this resource is protected; present a
+	// bearer token" — to any unauthenticated client, since the endpoint is
+	// unauthenticated by design. With NEITHER --jwks-uri nor listen.authToken the
+	// gateway validates no bearer token at all, so it would advertise a protection it
+	// does not enforce and a client would present a credential that is never checked.
+	// Fail closed, the same way validateJWTFlagsRequireJWKS rejects every other
+	// JWT-adjacent flag set without a JWKS endpoint; these two --oauth-* flags were its
+	// only gap.
+	//
+	// listen.authToken counts as validation even though it is a static shared secret
+	// rather than OAuth: checkAuth rejects every unauthenticated request and already
+	// serves the metadata URL as the resource_metadata hint on its 401 challenge, so
+	// that pairing is a supported deployment, not the unenforced-advertisement hole.
+	if oauthMeta != nil && gwJWTPDP == nil && cfg.Listen.AuthToken == "" {
+		return fmt.Errorf("--oauth-resource / listen.oauthResource publishes RFC 9728 protected-resource metadata, but no bearer-token validation is configured: set --jwks-uri (or listen.authToken) so presented tokens are actually verified, or remove the --oauth-* settings so the gateway does not advertise a protection it cannot enforce")
 	}
 
 	// Generate a fresh loopback control token for POST /control/kill, written to a

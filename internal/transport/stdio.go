@@ -1363,8 +1363,14 @@ func (p *StdioProxy) callUpstream(ctx context.Context, msg mcp.RPCMsg) (mcp.RPCM
 	if p.hostToUp == nil {
 		p.hostToUp = make(map[string]*json.RawMessage)
 	}
+	// Capture the three map headers while still holding the lock. Reading them after the
+	// Unlock to build the awaitNonced call would be an unsynchronized read of a field a
+	// concurrent caller may be initializing right here — a data race -race reports, and
+	// one that can hand awaitNonced a nil map to write into, the exact panic these guards
+	// exist to prevent.
+	pending, byUpstreamID, hostToUp := p.pending, p.byUpstreamID, p.hostToUp
 	p.pendingMu.Unlock()
-	return awaitNonced(ctx, &p.pendingMu, p.pending, p.byUpstreamID, p.hostToUp, &p.upstreamSeq, p.upstreamDone, mcp.MsgKey(msg.ID),
+	return awaitNonced(ctx, &p.pendingMu, pending, byUpstreamID, hostToUp, &p.upstreamSeq, p.upstreamDone, mcp.MsgKey(msg.ID),
 		func(id *json.RawMessage) { msg.ID = id },
 		func() error {
 			// For HTTP upstreams, use the per-call ctx so --upstream-timeout cancels

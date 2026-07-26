@@ -1290,18 +1290,14 @@ func (p *ManifestPDP) constraintWithUnionLabelOutput(matched *capability.Constra
 }
 
 // willForwardDeny reports whether a deny for this constraint will be downgraded to a
-// forwarded call, so the response still reaches the host. It is the PDP-side spelling of
-// the transport's isObserveDeny — per-constraint `enforcement: audit` OR the whole-route
-// --audit posture (which arrives as SkipQuota on the ctx) — and every concern that must
-// track "this deny is really a forward" reads it from here rather than restating the
-// union. matched may be nil (a no-match deny), which only a route-level --audit forwards.
-// The kill-switch and HardDeny exclusions the transport also applies are handled at each
-// call site, which has the response in hand.
+// forwarded call, so the response still reaches the host. It delegates to
+// enforcement.WillForwardDeny, the single spelling of that union shared with the engine's
+// own obligation stamping and mirrored by the transport's isObserveDeny — every concern
+// that must track "this deny is really a forward" reads it from there rather than
+// restating it. The kill-switch and HardDeny exclusions the transport also applies are
+// handled at each call site, which has the response in hand.
 func willForwardDeny(ctx context.Context, matched *capability.Constraint) bool {
-	if matched != nil && matched.IsAuditOnly() {
-		return true
-	}
-	return enforcement.SkipQuota(ctx)
+	return enforcement.WillForwardDeny(ctx, matched)
 }
 
 // withForwardObligationsFor fills r with matched's post-allow obligations when r is a deny

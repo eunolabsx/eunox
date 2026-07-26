@@ -50,6 +50,15 @@ func RedactURLForLog(raw string) string {
 	if u.Opaque != "" {
 		return u.Scheme + ":<redacted>"
 	}
+	// No authority (u.Host == "") — most often a scheme-less value such as
+	// "hooks.slack.com/services/…", the commonest upstreamUrl mistake. url.Parse puts
+	// the operator's HOST and path together in u.Path, so replacing u.Path wholesale
+	// would erase the one identifying detail the message exists to carry, leaving a
+	// bare "/[redacted]". Hand it to the textual splitter, which cuts at the first "/"
+	// and so keeps the host while still redacting everything after it.
+	if u.Host == "" {
+		return coarseRedactURLForLog(raw)
+	}
 	u.User = nil
 	u.RawQuery = ""
 	u.ForceQuery = false
@@ -70,41 +79,48 @@ func RedactURLForLog(raw string) string {
 	return u.String()
 }
 
-// coarseRedactURLForLog handles input url.Parse rejected. It keeps only the portion before
-// the first query/fragment delimiter, strips any "user:pass@" authority segment, and
-// replaces any path with "/[redacted]" for the reasons on RedactURLForLog.
+// coarseRedactURLForLog handles input url.Parse rejected, and the parse-succeeded but
+// authority-less case above. It keeps only the portion before the first query/fragment
+// delimiter, strips any "user:pass@" authority segment, and replaces the path with
+// "/[redacted]" for the reasons on RedactURLForLog.
 func coarseRedactURLForLog(raw string) string {
 	cut := raw
 	if i := strings.IndexAny(cut, "?#"); i >= 0 {
 		cut = cut[:i]
 	}
-	// Strip userinfo: everything between "//" and the last "@" of the authority, then
-	// replace whatever path follows the authority.
+	// Split off the "scheme://" prefix, if any, so the rest is the authority plus path.
+	prefix, rest := "", cut
 	if i := strings.Index(cut, "//"); i >= 0 {
-		authStart := i + 2
-		rest := cut[authStart:]
+		prefix, rest = cut[:i+2], cut[i+2:]
+		// Strip userinfo: everything up to the last "@" of the authority, where the
+		// authority ends at the first "/".
 		end := len(rest)
 		if s := strings.IndexByte(rest, '/'); s >= 0 {
 			end = s
 		}
 		if at := strings.LastIndexByte(rest[:end], '@'); at >= 0 {
 			rest = rest[at+1:]
-			end -= at + 1
 		}
-		authority := rest[:end]
-		// rest[end:] is the path (empty, or "/..."). A bare "/" is kept verbatim: it
-		// carries nothing to leak.
-		if path := rest[end:]; path != "" && path != "/" {
-			cut = cut[:authStart] + authority + redactedPath
-		} else {
-			cut = cut[:authStart] + authority + path
-		}
-	} else if i := strings.IndexByte(cut, '/'); i > 0 {
-		// Scheme-less/authority-less input ("hooks.slack.com/services/T/B/secret"):
-		// there is no "//" to anchor on, so treat the first "/" as the path boundary.
-		cut = cut[:i] + redactedPath
 	}
-	if strings.ContainsAny(cut, "@") || cut == "" {
+	// A residual "@" means a credential we could NOT locate — most concretely a userinfo
+	// containing "/" ("//svc:pa/ss@host/x"), which puts the authority boundary inside the
+	// password so the strip above finds no "@" before it. Bail to the fixed placeholder.
+	//
+	// This must run BEFORE the path replacement below, not after: that replacement drops
+	// everything from the first "/" onward, which for this shape DELETES the very "@" the
+	// check keys on — so a post-replacement check passes a half-stripped credential
+	// ("//svc:pa/[redacted]") straight through to stderr.
+	if strings.ContainsAny(rest, "@") {
+		return "<redacted url>"
+	}
+	// Replace the path. A bare "/" is kept verbatim: it carries nothing to leak. The
+	// boundary is the first "/", which also covers scheme-less input
+	// ("hooks.slack.com/services/T/B/secret") and a path-only value ("/services/T/B/…"),
+	// where the whole string is the path and the result is a bare "/[redacted]".
+	if i := strings.IndexByte(rest, '/'); i >= 0 && rest[i:] != "/" {
+		rest = rest[:i] + redactedPath
+	}
+	if cut = prefix + rest; cut == "" {
 		return "<redacted url>"
 	}
 	return cut

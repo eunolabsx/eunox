@@ -2287,3 +2287,88 @@ func TestTruncatePartialTail_YieldsTheChainResumeLine(t *testing.T) {
 		}
 	})
 }
+
+// TestTruncatePartialTail_LargeOrphanWithholdsTheResumeLine is the boundary case the
+// fast-path chain resume must NOT get wrong.
+//
+// truncatePartialTail's window is anchored to the log's PRE-truncation end, so a large
+// trailing orphan pushes the window's start forward into — or past — the last complete
+// record. The extraction then yields a mid-record FRAGMENT, or "" when the only newline
+// in range is that record's own terminator. Resuming from either restarts the chain at
+// genesis and reissues seqs the log already holds: the tamper-shaped duplicate-seq
+// cascade, and in the "" case it happens silently, with no integrity marker at all.
+//
+// readLastAuditLine's window is anchored to the POST-truncation end and so still holds
+// the record, which is why withholding the line (lastOK=false) and letting Open re-read
+// is correct rather than merely conservative. This asserts both halves: the fast path
+// never claims a line that disagrees with the re-read, and the truncation itself still
+// happens.
+func TestTruncatePartialTail_LargeOrphanWithholdsTheResumeLine(t *testing.T) {
+	const recordPad = 1 << 20 // a large but legal record (details are capped below this)
+
+	for _, tc := range []struct {
+		name      string
+		orphanLen int
+	}{
+		// Window start lands exactly on the record's terminating newline: the extraction
+		// sees only "\n" and returns "", which Open would read as "the log is empty".
+		{"window start lands on the record terminator", auditScanBufferBytes - 1},
+		// Window start lands inside the record: the extraction returns a fragment.
+		{"window start lands mid-record", auditScanBufferBytes - (recordPad / 2)},
+		// Control: a small orphan leaves the whole record inside the window.
+		{"small orphan keeps the record in range", 32},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			logPath := filepath.Join(dir, "audit.jsonl")
+			record := `{"seq":42,"pad":"` + strings.Repeat("x", recordPad) + `"}`
+			if err := os.WriteFile(logPath, []byte(record+"\n"), 0o600); err != nil {
+				t.Fatalf("write log: %v", err)
+			}
+			ap, err := os.OpenFile(logPath, os.O_WRONLY|os.O_APPEND, 0o600) //nolint:gosec // G304: test-controlled path
+			if err != nil {
+				t.Fatalf("reopen for append: %v", err)
+			}
+			if _, err := ap.WriteString(strings.Repeat("Z", tc.orphanLen)); err != nil {
+				t.Fatalf("append orphan: %v", err)
+			}
+			if err := ap.Close(); err != nil {
+				t.Fatalf("close append handle: %v", err)
+			}
+
+			f, err := os.OpenFile(logPath, os.O_APPEND|os.O_RDWR, 0o600) //nolint:gosec // G304: test-controlled path
+			if err != nil {
+				t.Fatalf("reopen O_RDWR: %v", err)
+			}
+			defer func() { _ = f.Close() }()
+
+			tail, err := truncatePartialTail(f)
+			if err != nil {
+				t.Fatalf("truncatePartialTail: %v", err)
+			}
+			if tail.recovered != int64(tc.orphanLen) {
+				t.Errorf("recovered = %d, want %d (the orphan must still be truncated)", tail.recovered, tc.orphanLen)
+			}
+			// Whatever the fast path claims, it must agree with the re-read Open falls
+			// back to — a disagreement silently changes prev_hmac linkage.
+			want, rerr := readLastAuditLine(logPath)
+			if rerr != nil {
+				t.Fatalf("readLastAuditLine: %v", rerr)
+			}
+			if want != record {
+				t.Fatalf("re-read must recover the whole record; got %d bytes", len(want))
+			}
+			if tail.lastOK && tail.last != want {
+				t.Errorf("fast path claimed a resume line the re-read disagrees with:\n got %d bytes (%q...)\nwant %d bytes",
+					len(tail.last), firstRunes(tail.last, 24), len(want))
+			}
+		})
+	}
+}
+
+func firstRunes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
+}

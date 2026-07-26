@@ -1065,7 +1065,10 @@ func NewLineScanner(r io.Reader) *bufio.Scanner {
 //     is the normal brand-new-install case.
 //   - (line, nil): the extracted last record line.
 func readLastAuditLine(path string) (string, error) {
-	f, err := os.Open(path) //nolint:gosec // G304: path is the user-configured audit log
+	// openNoFollow here too, not just on the append opens: this read is Open's
+	// chain-resume FALLBACK, so a symlink planted at the log path would otherwise seed
+	// the resumed chain from an attacker-chosen file.
+	f, err := os.OpenFile(path, os.O_RDONLY|openNoFollow, 0) //nolint:gosec // G304: path is the user-configured audit log
 	if err != nil {
 		if os.IsNotExist(err) {
 			// Absent file: the normal brand-new-install / freshly-rotated case, not an
@@ -1082,13 +1085,18 @@ func readLastAuditLine(path string) (string, error) {
 	if info.Size() == 0 {
 		return "", nil
 	}
-	// Details is capped at 1 MiB and the envelope is far smaller, so a record (plus
-	// its preceding boundary newline) is always captured within this 4 MiB tail.
-	const maxTail = 4 << 20
+	// Details is capped at 1 MiB and the envelope is far smaller, so a record (plus its
+	// preceding boundary newline) is always captured within this tail.
+	//
+	// auditScanBufferBytes, NOT a local literal: truncatePartialTail's fast-path chain
+	// resume is only equivalent to this re-read because the two windows are the same
+	// size, and a second 4 MiB literal here would let someone change one and silently
+	// desynchronize them — leaving the fast path returning a mid-record fragment while
+	// this path still found the boundary.
 	size := info.Size()
 	start := int64(0)
-	if size > maxTail {
-		start = size - maxTail
+	if size > auditScanBufferBytes {
+		start = size - auditScanBufferBytes
 	}
 	buf := make([]byte, size-start)
 	n, err := f.ReadAt(buf, start)
@@ -1199,7 +1207,8 @@ func interpretAuditTail(buf []byte, n int, readErr error, size int64) (string, e
 	if n < len(buf) && errors.Is(readErr, io.EOF) {
 		return "", fmt.Errorf("audit tail read: file shrank from %d bytes (read %d of %d tail bytes) between stat and read: %w", size, n, len(buf), errAuditFileShrunk)
 	}
-	return lastCompleteLine(buf[:n]), nil
+	line, _ := lastCompleteLine(buf[:n])
+	return line, nil
 }
 
 // lastCompleteLine returns the last COMPLETE (newline-terminated) record line in a tail
@@ -1207,7 +1216,15 @@ func interpretAuditTail(buf []byte, n int, readErr error, size int64) (string, e
 // interpretAuditTail, shared with truncatePartialTail so the chain-resume line taken
 // from the already-open handle's window and the one taken from a re-read of the file
 // cannot diverge.
-func lastCompleteLine(buf []byte) string {
+//
+// delimited reports whether the returned line was bounded on BOTH sides inside buf — a
+// newline before it as well as after. A line that is not delimited began before the
+// window, so what is returned is a FRAGMENT of a record rather than a record, and only a
+// caller that knows the window starts at byte 0 may treat it as complete. Callers that
+// re-read the file from a known offset ignore this; truncatePartialTail must not, since
+// its window is anchored to the PRE-truncation end and can therefore begin part-way
+// through the last complete record.
+func lastCompleteLine(buf []byte) (line string, delimited bool) {
 	// Drop a trailing incomplete (newline-less) fragment before locating the last
 	// record: such a fragment is a partial in-progress write left by a non-clean
 	// shutdown, never a complete record (writeRecord always appends '\n'). Skipping
@@ -1234,9 +1251,11 @@ func lastCompleteLine(buf []byte) string {
 	// through the whitespace so the extraction lands on the last real record instead.
 	trimmed := bytes.TrimRightFunc(buf, unicode.IsSpace)
 	if i := bytes.LastIndexByte(trimmed, '\n'); i >= 0 {
-		return string(bytes.TrimSpace(trimmed[i+1:]))
+		// A newline precedes the returned run, so it is a whole record within the window.
+		return string(bytes.TrimSpace(trimmed[i+1:])), true
 	}
-	return string(bytes.TrimSpace(trimmed))
+	// No preceding newline: whatever is here started before the window began.
+	return string(bytes.TrimSpace(trimmed)), false
 }
 
 // recoverWrittenSize recovers the byte count the rotation threshold resumes from on
@@ -1422,9 +1441,27 @@ func truncatePartialTail(f *os.File) (auditTailState, error) {
 	// readLastAuditLine's explicit errAuditFileShrunk path exactly as before.
 	trustTail := !(errors.Is(err, io.EOF) && n < len(buf))
 	buf = buf[:n]
+	// resumeFrom packages the extracted line with the two conditions that make it
+	// trustworthy as a chain-resume point. See the atWindowStart note below.
+	atWindowStart := start == 0
+	resumeFrom := func(window []byte, recovered int64) auditTailState {
+		line, delimited := lastCompleteLine(window)
+		// A line the window did not DELIMIT began before the window, so it is a fragment
+		// of a record, not a record — unless the window starts at byte 0, where "began
+		// before the window" is impossible. This matters here and not in readLastAuditLine
+		// because THIS window is anchored to the PRE-truncation end: a large trailing
+		// orphan pushes its start forward into (or past) the last complete record, so the
+		// extraction can yield a mid-record fragment, or "" when the only newline in range
+		// is the record's own terminator. Resuming from either would restart the chain at
+		// genesis and reissue seqs the log already holds — the tamper-shaped duplicate-seq
+		// cascade this file warns about. Withholding the line (lastOK false) sends Open to
+		// readLastAuditLine, whose window is anchored to the POST-truncation end and so
+		// still contains the record.
+		return auditTailState{recovered: recovered, last: line, lastOK: trustTail && (delimited || atWindowStart)}
+	}
 	if len(buf) == 0 || buf[len(buf)-1] == '\n' {
 		// The tail ends at a record boundary: nothing to recover.
-		return auditTailState{recovered: 0, last: lastCompleteLine(buf), lastOK: trustTail}, nil
+		return resumeFrom(buf, 0), nil
 	}
 	// The tail does not end in '\n': the bytes after the last newline are a partial
 	// write. Drop them so the next append starts at a record boundary.
@@ -1455,7 +1492,7 @@ func truncatePartialTail(f *os.File) (auditTailState, error) {
 	}
 	// buf[:i+1] is exactly what survives on disk within the window, so the last complete
 	// record is extracted from it rather than from a re-read of the truncated file.
-	return auditTailState{recovered: size - newSize, last: lastCompleteLine(buf[:i+1]), lastOK: trustTail}, nil
+	return resumeFrom(buf[:i+1], size-newSize), nil
 }
 
 // auditTailState is what truncatePartialTail learned from the one bounded tail read it
