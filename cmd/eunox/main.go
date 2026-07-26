@@ -1269,7 +1269,7 @@ func resolveOAuthMetadata(cfg *config.GatewayConfig, pf proxyFlags) (*transport.
 
 	var oauthAuthzServers []string
 	// validateAuthz is set for the two operator-supplied sources
-	// (listen.oauthAuthorizationServers and --oauth-authz-server). The --jwt-issuer
+	// (listen.oauthAuthorizationServers and --oauth-authorization-server). The --jwt-issuer
 	// fallback is exempt: it is the issuer already wired into JWT validation and may be
 	// a loopback http URL in dev (under --jwks-allow-insecure-http), so forcing https on
 	// it here would be a regression.
@@ -1278,7 +1278,7 @@ func resolveOAuthMetadata(cfg *config.GatewayConfig, pf proxyFlags) (*transport.
 	case len(cfg.Listen.OAuthAuthorizationServers) > 0:
 		if pf.oauthAuthzServer != "" && !slices.Contains(cfg.Listen.OAuthAuthorizationServers, pf.oauthAuthzServer) {
 			// Same rule as the resource URI above: config wins, but say so.
-			fmt.Fprintf(os.Stderr, "[eunox] WARNING: --oauth-authz-server %q is overridden by the config's listen.oauthAuthorizationServers %v; the config takes precedence.\n", pf.oauthAuthzServer, cfg.Listen.OAuthAuthorizationServers)
+			fmt.Fprintf(os.Stderr, "[eunox] WARNING: --oauth-authorization-server %q is overridden by the config's listen.oauthAuthorizationServers %v; the config takes precedence.\n", pf.oauthAuthzServer, cfg.Listen.OAuthAuthorizationServers)
 		}
 		oauthAuthzServers = cfg.Listen.OAuthAuthorizationServers
 		validateAuthz = true
@@ -1645,8 +1645,8 @@ are merged and validated, and with --live each route's declared upstream
 upstream wiring. The config is the source of truth.
 
 Exit codes:
-  0  All manifest entries match live tools; no glob-matched tools detected.
-  1  Warnings or stale entries present (operator review required).
+  0  Manifests valid; with --live, every entry matches live tools.
+  1  Drift warnings or stale entries present (--live only; operator review required).
   2  Connection, parse, or usage error (a bad flag never reports as drift).
 
 With --config the exit code is the maximum across all routes.

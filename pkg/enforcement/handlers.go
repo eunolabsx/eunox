@@ -1156,13 +1156,17 @@ func asInt64(v any) (int64, bool) {
 	return 0, false
 }
 
-// floatToInt64 is capability.FloatToInt64, kept as a local alias so the call sites
-// below stay unchanged. The rule itself lives in pkg/capability — the package that
-// also needs it, and that this package already imports — because a bound comparison
-// silently switching between exact-integer and float arithmetic is the difference
-// between authorizing 9007199254740993 and its neighbour, and two copies of that rule
-// is one copy too many.
-var floatToInt64 = capability.FloatToInt64
+// floatToInt64 forwards to capability.FloatToInt64, which owns the rule: a bound
+// comparison silently switching between exact-integer and float arithmetic is the
+// difference between authorizing 9007199254740993 and its neighbour, so it has one
+// definition, in the package that also needs it and that this one already imports.
+//
+// A function, deliberately, not a `var floatToInt64 = capability.FloatToInt64`. A
+// package-level func value would be reassignable by anything in this package — a
+// process-global switch on the precision rule, with no restore discipline — and the
+// compiler cannot inline through it, which costs an indirect call on every numeric bound
+// check (asInt64 runs twice per numericEqual, once per allowedValues/enum entry).
+func floatToInt64(f float64) (int64, bool) { return capability.FloatToInt64(f) }
 
 // toFloat64 converts any Go numeric type to float64, reporting false for
 // non-numeric values. bool is deliberately excluded so that true/1 and false/0

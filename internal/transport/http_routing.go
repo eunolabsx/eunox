@@ -250,16 +250,14 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 			http.Error(w, "session limit reached", http.StatusServiceUnavailable)
 			return
 		}
-		// Held until this handler returns or registerSession converts it. Flipped to false
-		// only after a session is actually registered, so every refusal, spawn failure,
-		// handshake failure, drift refusal, and raced reap/shutdown gives the slot back —
-		// otherwise a failing upstream would permanently consume the cap.
-		slotReserved := true
-		defer func() {
-			if slotReserved {
-				p.releaseSessionSlot()
-			}
-		}()
+		// Released unconditionally when this handler returns — success included. The
+		// reservation covers ESTABLISHMENT, and establishment is over either way by then;
+		// a registered session is bounded from that point by the registry itself. An
+		// earlier version released only on failure and let registerSession convert the
+		// reservation on success, which double-freed it on any failure AFTER registration
+		// (the drift refusal is one) and handed the freed slot to a concurrently
+		// establishing session. One owner, one release, no flag to get wrong.
+		defer p.releaseSessionSlot()
 		// Session establishment (initialize handshake + drift tools/list probe) runs
 		// under sessionStartTimeout, independent of --upstream-timeout. Cover the larger
 		// of the two budgets so the write deadline set above can't fire mid-handshake
@@ -289,9 +287,6 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 			p.writeSessionCreateError(w, r, err)
 			return
 		}
-		// Registered: registerSession already converted the reservation into a registry
-		// entry, so the deferred release must not run and double-free the slot.
-		slotReserved = false
 		w.Header().Set(SessionHeader, sess.id)
 		// Answered directly, not through the shared dispatchInitialize kill gate: the
 		// pre-spawn global-dimension CheckKill already ran above, and the session id

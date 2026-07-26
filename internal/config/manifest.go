@@ -155,21 +155,31 @@ func LoadManifest(path string) (*LocalManifest, error) {
 		return nil, fmt.Errorf("converting manifest to JSON: %w", err)
 	}
 
-	// Run the recursive unknown-key check BEFORE the typed decode. Both reject a typo'd
+	// Gate on the declared grammar version FIRST, before interpreting any content: refuse
+	// an unknown dialect rather than parse it under the wrong grammar. Read from a lenient
+	// decode of just this field, because both checks below interpret content under the
+	// 0.1 grammar — a manifest declaring a future version would otherwise be reported as
+	// carrying an "unknown key" that is perfectly valid in the dialect it declares,
+	// burying the actionable "unsupported schemaVersion" the operator needs.
+	var version struct {
+		SchemaVersion string `json:"schemaVersion"`
+	}
+	if err := json.Unmarshal(data, &version); err != nil {
+		return nil, fmt.Errorf("parsing manifest %q: %w", path, err)
+	}
+	if err := validateManifestSchemaVersion(version.SchemaVersion); err != nil {
+		return nil, fmt.Errorf("invalid manifest %q: %w", path, err)
+	}
+	// Then the recursive unknown-key check, BEFORE the typed decode. Both reject a typo'd
 	// key, but only this one names the offending path and offers a "did you mean"
-	// suggestion; the condition decoder's own strict decode (unmarshalCondition) would
-	// otherwise surface first with a blunter message for the condition case.
+	// suggestion; the condition decoder's own unknown-field check (unmarshalCondition)
+	// would otherwise surface first with a blunter message for the condition case.
 	if err := checkManifestKeys(data); err != nil {
 		return nil, fmt.Errorf("invalid manifest %q: %w", path, err)
 	}
 	var m LocalManifest
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, fmt.Errorf("parsing manifest %q: %w", path, err)
-	}
-	// Gate on the declared grammar version before interpreting content: refuse an
-	// unknown dialect rather than parse it under the wrong grammar.
-	if err := validateManifestSchemaVersion(m.SchemaVersion); err != nil {
-		return nil, fmt.Errorf("invalid manifest %q: %w", path, err)
 	}
 	// Canonicalize to the trimmed form validation accepted: an explicitly quoted
 	// padded scalar (e.g. " 0.1") validates by trimming a copy, but the padding
@@ -1719,16 +1729,22 @@ func validatePrincipal(principal map[string][]string) error {
 
 // checkManifestKeys rejects unknown keys anywhere in the manifest. The typed
 // json.Unmarshal in LoadManifest is intentionally lenient (it is shared with
-// IdP-issued JWT capability claims, which tolerate unknown fields), so without
-// this a typo'd key (`arguments` for `argument`) would be silently dropped. The
+// IdP-issued JWT capability claims at the type level), so without
+// this a typo'd key (`arguments` for `argument`) would be silently dropped. Conditions are
+// the exception — unmarshalCondition rejects an unknown field itself — but this walk still
+// runs first, because only it can name the offending path and suggest the intended key. The
 // manifest is the security-critical surface, so fail closed on any unrecognized
 // key. argumentSchema keywords are checked recursively by
 // checkArgumentSchemaKeywords.
 func checkManifestKeys(data []byte) error {
 	var root map[string]interface{}
 	if err := json.Unmarshal(data, &root); err != nil {
-		// Shape was already validated by the typed decode; nothing to walk.
-		return nil //nolint:nilerr // a non-object manifest is caught upstream
+		// Not a JSON object, so there are no keys to walk. Returning nil here is NOT a
+		// judgement that the manifest is acceptable — LoadManifest's typed decode, which
+		// runs immediately after this check, rejects a non-object document. Do not read
+		// this as "some other check owns it": if this function is ever called from a path
+		// with no following typed decode, that path must reject a non-object itself.
+		return nil //nolint:nilerr // a non-object document has no key structure to validate
 	}
 	if err := checkObjectKeys("", root, jsonFieldKeys(reflect.TypeOf(LocalManifest{}))); err != nil {
 		return err

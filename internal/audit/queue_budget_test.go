@@ -5,6 +5,7 @@ package audit
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -139,5 +140,59 @@ func TestQueuedBytes_BudgetDropsOversizedBacklog(t *testing.T) {
 	sink.RecordDeny(t.Context(), "sess-1", "read_file", "tools/call", "AUTHORIZATION_FAILED", "", nil, false)
 	if got := sink.DroppedRecords(); got != 1 {
 		t.Errorf("DroppedRecords = %d, want 1: a record over the byte budget must be shed and counted", got)
+	}
+}
+
+// TestQueueSize_CoversEveryRetainedField is the staleness guard the value-based tests
+// above cannot provide: it walks auditRecord by reflection and asserts that EVERY
+// variable-length field either contributes to queueSize or is on the explicit exclusion
+// list, so a field added later fails this test until someone decides which it is.
+//
+// Without it, a new IdP- or request-sourced envelope string — exactly the 8 KiB-capped
+// class this accounting exists for — would be charged 0 bytes, auditQueueByteBudget would
+// stop tracking retained heap, and the OOM it guards against would return silently with
+// every other test still green.
+func TestQueueSize_CoversEveryRetainedField(t *testing.T) {
+	t.Parallel()
+
+	// Assigned by writeRecord on the drainer AFTER the enqueue reservation and BEFORE the
+	// drain release, so counting them would make the two disagree. Seq is a uint64 and
+	// retains nothing beyond the struct either way.
+	excluded := map[string]bool{"Seq": true, "PrevHMAC": true, "HMAC": true}
+
+	const filler = 64
+	rt := reflect.TypeOf(auditRecord{})
+	for i := range rt.NumField() {
+		f := rt.Field(i)
+		if excluded[f.Name] {
+			continue
+		}
+
+		// Build a record carrying content in exactly this one field.
+		rv := reflect.New(rt).Elem()
+		fv := rv.Field(i)
+		switch f.Type.Kind() {
+		case reflect.String:
+			fv.SetString(strings.Repeat("x", filler))
+		case reflect.Slice:
+			switch f.Type.Elem().Kind() {
+			case reflect.String: // []string (Obligations, LabelsOut, CarriedLabels)
+				fv.Set(reflect.ValueOf([]string{strings.Repeat("x", filler)}))
+			case reflect.Uint8: // json.RawMessage (Details)
+				fv.SetBytes([]byte(strings.Repeat("x", filler)))
+			default:
+				t.Fatalf("field %s: unhandled slice element kind %s — decide whether it is retained heap and extend this test", f.Name, f.Type.Elem().Kind())
+			}
+		case reflect.Int, reflect.Bool, reflect.Uint64:
+			continue // fixed-size, covered by the flat allowance
+		default:
+			t.Fatalf("field %s: unhandled kind %s — decide whether it is retained heap and extend this test", f.Name, f.Type.Kind())
+		}
+
+		rec := rv.Interface().(auditRecord)
+		got := rec.queueSize() - auditRecordEnvelopeEstimate
+		if got != filler {
+			t.Errorf("field %s contributes %d bytes to queueSize, want %d: an uncounted field escapes the queue byte budget entirely", f.Name, got, filler)
+		}
 	}
 }

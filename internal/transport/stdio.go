@@ -258,8 +258,17 @@ func NewStdioProxy(opts StdioProxyOptions) *StdioProxy {
 		byUpstreamID:          make(map[string]chan upstreamResult),
 		hostToUp:              make(map[string]*json.RawMessage),
 		hostReader:            mcp.NewMsgReader(os.Stdin),
-		hostWriter:            mcp.NewMsgWriter(os.Stdout),
 	}
+	// The host writer gets a poison hook, not a bare NewMsgWriter. Its writes are
+	// fire-and-forget at every call site (`_ = p.hostWriter.Write(...)`), so once a partial
+	// write desyncs the framing and latches the writer, nothing would notice: the proxy
+	// would keep reading host requests, keep deciding, and keep FORWARDING allowed calls
+	// upstream — real side effects — while every response was silently dropped and the host
+	// hung forever. Killing the upstream ends the serve loop instead, so a host stream we
+	// can no longer answer stops us doing privileged work on its behalf. Assigned after the
+	// literal because the hook is a method on p. No deadline: stdout is not a pipe we own,
+	// and --upstream-timeout bounds the UPSTREAM leg, not this one.
+	p.hostWriter = mcp.NewMsgWriterWithPoisonHook(os.Stdout, p.killUpstream)
 	if opts.SerializeDecisions {
 		p.decideGate = newDecisionSerializer()
 	}

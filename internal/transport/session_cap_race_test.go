@@ -80,8 +80,9 @@ func TestSessionCap_ReservationLifecycle(t *testing.T) {
 		t.Fatalf("establishing = %d after a double release, want 0 (never negative)", p.establishing)
 	}
 
-	// Success path: registerSession converts the reservation into a registry entry, so
-	// the establishing+registered total stays at 1 rather than counting the session twice.
+	// Success path: registerSession must NOT touch the reservation. The caller still
+	// holds it and still releases it, so the session is briefly counted twice
+	// (registered AND establishing) — the conservative direction.
 	if !p.tryReserveSessionSlot() {
 		t.Fatal("reservation refused after the released slot returned")
 	}
@@ -89,11 +90,16 @@ func TestSessionCap_ReservationLifecycle(t *testing.T) {
 	if err := p.registerSession(sess, p.currentReapGen()); err != nil {
 		t.Fatalf("registerSession: %v", err)
 	}
-	if p.establishing != 0 {
-		t.Fatalf("establishing = %d after registration, want 0 (converted, not still held)", p.establishing)
+	if p.establishing != 1 {
+		t.Fatalf("establishing = %d after registration, want 1 (the caller still owns the reservation)", p.establishing)
 	}
 	if len(p.sessions) != 1 {
 		t.Fatalf("sessions = %d, want 1", len(p.sessions))
+	}
+	// The handler's unconditional release then ends establishment.
+	p.releaseSessionSlot()
+	if p.establishing != 0 {
+		t.Fatalf("establishing = %d after the caller released, want 0", p.establishing)
 	}
 
 	// One slot left: take it, then confirm the cap is reached across both kinds.
@@ -104,14 +110,51 @@ func TestSessionCap_ReservationLifecycle(t *testing.T) {
 		t.Error("reserved a third slot with cap=2 (one registered + one establishing)")
 	}
 
-	// A failed registration must NOT convert the reservation: the caller's deferred
-	// release is what gives the slot back, and converting here too would double-free it.
+	// A failed registration must not touch the reservation either — the caller's
+	// unconditional release is the only thing that ever drops it.
 	p.shuttingDown = true
 	if err := p.registerSession(&httpSession{id: "s2"}, p.currentReapGen()); err == nil {
 		t.Fatal("registerSession succeeded during shutdown; want errShuttingDown")
 	}
 	if p.establishing != 1 {
 		t.Errorf("establishing = %d after a failed registration, want 1 (still held for the caller to release)", p.establishing)
+	}
+}
+
+// TestSessionCap_FailureAfterRegistrationReleasesExactlyOnce pins the regression that
+// made the cap defeatable: establishment can fail AFTER registerSession succeeds (the
+// startup drift refusal is such a path — it registers, probes, then tears down). When
+// registerSession also "converted" the reservation, the caller's release then decremented
+// a second time, silently consuming a CONCURRENTLY establishing session's reservation and
+// admitting more upstream spawns than the cap allows — the exact over-admission the
+// counter exists to prevent. A drift-refusing upstream makes that repeat on every attempt.
+func TestSessionCap_FailureAfterRegistrationReleasesExactlyOnce(t *testing.T) {
+	t.Parallel()
+
+	p := &HTTPProxy{maxSessions: 2, sessions: map[string]*httpSession{}}
+
+	// Session A and session B both begin establishing.
+	if !p.tryReserveSessionSlot() || !p.tryReserveSessionSlot() {
+		t.Fatal("both reservations should be admitted under cap=2")
+	}
+	// A registers, then fails its post-registration drift check: the session is torn out
+	// of the registry and the handler returns, releasing A's reservation exactly once.
+	if err := p.registerSession(&httpSession{id: "A"}, p.currentReapGen()); err != nil {
+		t.Fatalf("registerSession: %v", err)
+	}
+	delete(p.sessions, "A") // runDriftCheckOrTeardown's synchronous delete
+	p.releaseSessionSlot()  // the handler's deferred release
+
+	// B is still establishing and still holds its slot.
+	if p.establishing != 1 {
+		t.Fatalf("establishing = %d after A failed post-registration, want 1: B's reservation must survive", p.establishing)
+	}
+	// Only ONE further establishment may be admitted (cap 2, B holds one).
+	if !p.tryReserveSessionSlot() {
+		t.Fatal("the free slot was not admitted")
+	}
+	if p.tryReserveSessionSlot() {
+		t.Error("cap defeated: a third concurrent establishment was admitted under maxSessions=2")
 	}
 }
 

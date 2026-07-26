@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"strings"
+	"sync"
 )
 
 type conditionEnvelope struct {
@@ -193,38 +195,87 @@ func unmarshalCondition(data []byte) (Condition, error) {
 		return nil, fmt.Errorf("unknown condition type: %q", envelope.Type)
 	}
 
-	// Strip the discriminator, then decode STRICTLY. A lenient decode silently drops a
-	// misspelled field, and for a condition that means a policy quietly wider than
-	// written: {"type":"timeWindow","notBefore":...,"notAfterr":...} decodes with
-	// NotAfter == "" and enforces only the lower bound. The binary's manifest loader
-	// runs its own recursive unknown-key check, but this decoder is also the exported
-	// seam (ConditionWrapper) a library consumer decodes through, and a security
-	// primitive must not depend on the caller remembering to re-validate.
+	// Reject unknown fields BEFORE decoding. A lenient decode silently drops a misspelled
+	// field, and for a condition that means a policy quietly wider than written:
+	// {"type":"timeWindow","notBefore":...,"notAfterr":...} decodes with NotAfter == ""
+	// and enforces only the lower bound. The binary's manifest loader runs its own
+	// recursive unknown-key check, but this decoder is also the exported seam
+	// (ConditionWrapper) a library consumer decodes through, and a security primitive must
+	// not depend on the caller remembering to re-validate.
 	//
-	// "type" is deleted rather than allowlisted because it belongs to the envelope, not
-	// to any condition struct — leaving it in would make every decode fail.
+	// Checked by key MEMBERSHIP against the target's field set rather than by handing a
+	// discriminator-stripped copy to DisallowUnknownFields. Stripping meant decoding to a
+	// map and re-marshaling, and that round-trip is not identity: it sorts keys and
+	// collapses duplicates, so which of two case-variant siblings won changed from JSON's
+	// last-wins to byte order — a parser differential introduced by the very check meant
+	// to tighten things. Matching is case-insensitive because that is how encoding/json
+	// binds, so this rejects exactly the keys the decode would have ignored, no more.
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(data, &fields); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("condition %q: %w", envelope.Type, err)
 	}
-	delete(fields, "type")
-	body, err := json.Marshal(fields)
-	if err != nil {
-		return nil, err
+	known := jsonFieldNames(target)
+	for k := range fields {
+		// "type" is the envelope's discriminator, not a field of any condition struct.
+		if strings.EqualFold(k, "type") || known[strings.ToLower(k)] {
+			continue
+		}
+		return nil, fmt.Errorf("condition %q: unknown field %q", envelope.Type, k)
 	}
 
-	// Decode with UseNumber so numeric policy literals stay json.Number rather than
-	// being widened to float64 (which rounds integers above 2^53, e.g. authorizing
-	// the neighbour of 9007199254740993). Request arguments are decoded the same
-	// way, and numericEqual compares the preserved json.Number values exactly.
-	dec := json.NewDecoder(bytes.NewReader(body))
+	// Decode the ORIGINAL bytes, so duplicate-key and case-variant binding stay exactly
+	// what encoding/json does everywhere else. UseNumber keeps numeric policy literals as
+	// json.Number rather than widening them to float64 (which rounds integers above 2^53,
+	// e.g. authorizing the neighbour of 9007199254740993). Request arguments are decoded
+	// the same way, and numericEqual compares the preserved json.Number values exactly.
+	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
-	dec.DisallowUnknownFields()
 	if err := dec.Decode(target); err != nil {
 		return nil, fmt.Errorf("condition %q: %w", envelope.Type, err)
 	}
 
 	return target, nil
+}
+
+// jsonFieldNamesCache memoizes jsonFieldNames per concrete type. Conditions are decoded
+// on the manifest-load path (every condition of every constraint, again on every
+// `validate`/`doctor` run), and the reflect walk is identical for a given type.
+var jsonFieldNamesCache sync.Map // reflect.Type -> map[string]bool
+
+// jsonFieldNames returns the lowercased JSON field names encoding/json would bind on v,
+// for the unknown-field check above. Lowercased because encoding/json matches field names
+// case-insensitively; an embedded or unexported field contributes nothing here, matching
+// what the decoder itself would accept.
+func jsonFieldNames(v any) map[string]bool {
+	t := reflect.TypeOf(v)
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if cached, ok := jsonFieldNamesCache.Load(t); ok {
+		return cached.(map[string]bool)
+	}
+	names := make(map[string]bool, t.NumField())
+	for i := range t.NumField() {
+		f := t.Field(i)
+		if f.PkgPath != "" { // unexported
+			continue
+		}
+		name := f.Name
+		if tag := f.Tag.Get("json"); tag != "" {
+			if tag == "-" {
+				continue
+			}
+			if comma := strings.Index(tag, ","); comma >= 0 {
+				tag = tag[:comma]
+			}
+			if tag != "" {
+				name = tag
+			}
+		}
+		names[strings.ToLower(name)] = true
+	}
+	jsonFieldNamesCache.Store(t, names)
+	return names
 }
 
 // knownConditionTypes lists every condition discriminator this build models. It

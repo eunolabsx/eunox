@@ -417,6 +417,7 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	// pass fail closed. Capture the raw values for the parallel guard after expansion.
 	rawAuditLog := cfg.Audit.Log
 	rawAuditKeyPath := cfg.Audit.KeyPath
+	rawAllowedOrigins := slices.Clone(cfg.Listen.AllowedOrigins)
 
 	// Same for each upstream's auth header: an env ref in upstreamAuthHeader carries
 	// the same unset/empty footgun, so capture the raw values for the parallel guard
@@ -500,8 +501,15 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	// Same guard for a stdio upstream's command and args. Without it, an unset
 	// ${SERVER_BIN} survives as literal text and the route boots; the failure lands at
 	// exec time on the FIRST SESSION instead of at startup, so the operator learns of a
-	// plain config typo from a client's failed handshake. Every sibling expanded field
-	// fails closed here; these were the last two that did not.
+	// plain config typo from a client's failed handshake.
+	//
+	// Note this guard is a hand-maintained per-field list while expandEnvInStrings rewrites
+	// EVERY string in the tree, so "covered" is not the default — a field is covered only
+	// once it is added here. Most of the rest fail at startup for their own reasons (a
+	// ${VAR} in `name` fails routeNameRe, in `bind` fails net.Listen, in `policy` fails
+	// LoadManifest, in trustedProxyCIDRs fails ParseCIDR), which is why the gaps are quiet
+	// rather than loud; listen.allowedOrigins is guarded just below for exactly that
+	// reason. Failing closed inside the expansion walk itself would need no list at all.
 	for i := range cfg.Upstreams {
 		if err := failOnUnsetEnvRef(path, fmt.Sprintf("upstream %q command", cfg.Upstreams[i].Name), rawCommand[i]); err != nil {
 			return nil, err
@@ -511,6 +519,18 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 				return nil, err
 			}
 		}
+	}
+
+	// Fail closed on an unset env reference in listen.allowedOrigins. This one has no
+	// other startup check to catch it: an unset ${DASHBOARD_ORIGIN} survives as literal
+	// text, the proxy boots, and the entry then matches no real Origin header — so a
+	// browser client gets a bare 403 with nothing on stderr to connect it to a config
+	// typo. Same failure shape the command/args guard above exists to eliminate.
+	for i, origin := range cfg.Listen.AllowedOrigins {
+		if err := failOnUnsetEnvRef(path, fmt.Sprintf("listen.allowedOrigins[%d]", i), rawAllowedOrigins[i]); err != nil {
+			return nil, err
+		}
+		_ = origin
 	}
 
 	// Fail closed on an unset env reference in the audit log or key path (see the

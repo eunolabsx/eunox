@@ -162,6 +162,15 @@ func upstreamErrInfo(err error, upstreamTimeMs int) (code, reason string, rpcCod
 		// not an upstream failure. Report invalid-request so the host is not told the
 		// upstream errored (and so the record is not mined as an upstream outage).
 		return codeInvalidRequest, "duplicate JSON-RPC request id already in flight", jsonRPCCodeInvalidRequest
+	case errors.Is(err, mcp.ErrFrameDesync):
+		// A partial frame from a NON-deadline cause (EPIPE on an upstream that died
+		// mid-write, ENOSPC, an interrupted >PIPE_BUF write). The stream is unusable, but
+		// it is not a timeout: reporting it as one would stamp a fabricated
+		// "did not respond within N ms" on the tape for an upstream that crashed, and with
+		// --upstream-timeout=0 would cite a deadline that does not exist. Falls to the
+		// generic upstream-error class, which also gives the operator the stderr dump with
+		// the underlying errno.
+		return codeUpstreamError, "upstream connection failed", jsonRPCCodeInternalError
 	case errors.Is(err, mcp.ErrUpstreamWriteTimeout):
 		// The bounded upstream stdin write timed out (a subprocess that stopped draining its
 		// stdin). It is a genuine upstream timeout, so classify it as UPSTREAM_TIMEOUT rather

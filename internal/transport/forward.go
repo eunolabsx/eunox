@@ -86,28 +86,41 @@ func recordKillDenial(ctx context.Context, rec auditRecorder, deny *capability.E
 // take it instead of a session id, so a new call site must state which kind it holds and
 // a mistake is a compile error, rather than the silent audit-hygiene regression that
 // re-appeared here once already.
+//
+// One id plus one flag, not two id fields: a two-field encoding makes
+// killSubject{verified: id, claimed: id} representable, and that value would put the id in
+// BOTH the structured session_id and details.claimed_session_id — the shape the type
+// exists to prevent. Here it cannot be spelled.
 type killSubject struct {
-	verified string
-	claimed  string
+	id       string
+	verified bool
 }
 
 // knownSession marks an id the proxy itself owns: minted by this proxy and resolved in
 // the session registry (or legitimately empty, on a path that carries no session yet).
-func knownSession(id string) killSubject { return killSubject{verified: id} }
+func knownSession(id string) killSubject { return killSubject{id: id, verified: true} }
 
 // claimedSession marks a client-supplied id that did NOT resolve in the session
 // registry, so nothing has verified it names a session of this proxy.
-func claimedSession(id string) killSubject { return killSubject{claimed: id} }
+func claimedSession(id string) killSubject { return killSubject{id: id} }
 
 // sessionID returns the value for the record's structured session_id field: empty for an
 // unverified id, which is carried in details instead.
-func (s killSubject) sessionID() string { return s.verified }
+func (s killSubject) sessionID() string {
+	if !s.verified {
+		return ""
+	}
+	return s.id
+}
 
 // details folds an unverified id into base as the clearly-unverified
 // details.claimed_session_id (bounded and marked exactly as the pre-session deny paths
 // do), leaving base untouched for a verified one. base may be nil.
 func (s killSubject) details(base map[string]interface{}) map[string]interface{} {
-	return addClaimedSessionIDValue(base, s.claimed)
+	if s.verified {
+		return base
+	}
+	return addClaimedSessionIDValue(base, s.id)
 }
 
 // killDropLeg identifies the transport leg a recordKillDrop call site drops a message

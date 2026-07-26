@@ -251,3 +251,59 @@ func TestUnmarshalCondition_AcceptsWellFormed(t *testing.T) {
 		t.Errorf("decoded %+v, want both bounds preserved", tw)
 	}
 }
+
+// TestUnmarshalCondition_PreservesJSONBindingSemantics pins that the unknown-field check
+// rejects exactly what encoding/json would have ignored — no more, no less.
+//
+// An earlier form stripped the discriminator by decoding to a map and re-marshaling, then
+// used DisallowUnknownFields. That round-trip is not identity: it sorts keys and collapses
+// duplicates, so a case-variant duplicate resolved by byte order instead of JSON's
+// last-wins, and a case-variant discriminator ("Type") — which encoding/json binds
+// happily — became a hard failure. A check meant to tighten policy parsing must not
+// introduce a parser differential of its own.
+func TestUnmarshalCondition_PreservesJSONBindingSemantics(t *testing.T) {
+	t.Parallel()
+
+	t.Run("duplicate case-variant keys keep last-wins", func(t *testing.T) {
+		t.Parallel()
+		c, err := unmarshalCondition([]byte(`{"type":"maxCalls","count":5,"COUNT":9}`))
+		if err != nil {
+			t.Fatalf("unmarshalCondition: %v", err)
+		}
+		mc, ok := c.(*MaxCallsCondition)
+		if !ok {
+			t.Fatalf("got %T, want *MaxCallsCondition", c)
+		}
+		// encoding/json binds case-insensitively and the last key wins; the decode must
+		// agree with that, not with a re-marshaled key order.
+		if mc.Count != 9 {
+			t.Errorf("Count = %d, want 9 (JSON last-wins binding, not re-marshaled key order)", mc.Count)
+		}
+	})
+
+	t.Run("case-variant discriminator still binds", func(t *testing.T) {
+		t.Parallel()
+		c, err := unmarshalCondition([]byte(`{"Type":"timeWindow","notBefore":"09:00","notAfter":"17:00"}`))
+		if err != nil {
+			t.Fatalf("unmarshalCondition: %v (encoding/json binds \"Type\" to the envelope)", err)
+		}
+		tw, ok := c.(*TimeWindowCondition)
+		if !ok {
+			t.Fatalf("got %T, want *TimeWindowCondition", c)
+		}
+		if tw.NotBefore != "09:00" || tw.NotAfter != "17:00" {
+			t.Errorf("decoded %+v, want both bounds preserved", tw)
+		}
+	})
+
+	t.Run("case-variant field name still binds", func(t *testing.T) {
+		t.Parallel()
+		c, err := unmarshalCondition([]byte(`{"type":"timeWindow","NotBefore":"09:00","notAfter":"17:00"}`))
+		if err != nil {
+			t.Fatalf("unmarshalCondition: %v (encoding/json binds field names case-insensitively)", err)
+		}
+		if tw := c.(*TimeWindowCondition); tw.NotBefore != "09:00" {
+			t.Errorf("NotBefore = %q, want it bound from the case-variant key", tw.NotBefore)
+		}
+	})
+}
