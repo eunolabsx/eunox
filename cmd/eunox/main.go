@@ -69,6 +69,11 @@ func main() {
 // and returns the exit code. Kept separate from main so tests can assert the
 // code without terminating the test binary; main holds the only top-level
 // os.Exit. Subcommands that need a non-zero exit still call os.Exit themselves.
+//
+// Every subcommand takes its own arguments (args[2:]) as a parameter rather than
+// re-reading the global os.Args: the dispatch and the flag parsing then read the
+// same argument vector, so a caller that is not main cannot pick a subcommand
+// while its flags come from the real process arguments.
 func run(args []string) int {
 	if len(args) < 2 {
 		// A bare invocation prints usage and exits 0 (not a usage error): package
@@ -77,23 +82,24 @@ func run(args []string) int {
 		printUsage(os.Stdout)
 		return 0
 	}
+	subArgs := args[2:]
 	switch args[1] {
 	case "proxy":
-		cmdProxy()
+		cmdProxy(subArgs)
 	case "validate":
-		return cmdValidate()
+		return cmdValidate(subArgs)
 	case "init":
-		return cmdInit()
+		return cmdInit(subArgs)
 	case "suggest":
-		return cmdSuggest()
+		return cmdSuggest(subArgs)
 	case "kill":
-		return cmdKill()
+		return cmdKill(subArgs)
 	case "audit-verify":
-		return cmdAuditVerify()
+		return cmdAuditVerify(subArgs)
 	case "stats":
-		return cmdStats()
+		return cmdStats(subArgs)
 	case "doctor":
-		return cmdDoctor()
+		return cmdDoctor(subArgs)
 	case "version", "--version", "-version":
 		cmdVersion()
 	case "--help", "-help", "-h", "help":
@@ -371,7 +377,9 @@ Flags:
 	fs.PrintDefaults()
 }
 
-func cmdProxy() {
+// cmdProxy runs the `proxy` subcommand. args carries the subcommand's own
+// arguments (os.Args[2:] in a real invocation), threaded from run.
+func cmdProxy(args []string) {
 	// exitCode lets post-sink paths exit non-zero while still running the deferred
 	// sink.Close (an os.Exit skips defers). As the outermost (LIFO) defer it runs
 	// after sink.Close has flushed and had a chance to flag a Sync/Close failure.
@@ -390,7 +398,7 @@ func cmdProxy() {
 
 	// flag.ExitOnError: Parse exits the process on a bad flag or -help, so it never
 	// returns a non-nil error here (the old `if err != nil` branch was dead).
-	_ = fs.Parse(os.Args[2:])
+	_ = fs.Parse(args)
 
 	if *f.configPath != "" && *f.audit {
 		fmt.Fprintf(os.Stderr, "eunox proxy: --audit and --config are mutually exclusive (--audit is for the zero-config wiretap path; --config carries its own enforcement posture).\n")
@@ -1644,7 +1652,9 @@ func parseFlagsAndPositionals(fs *flag.FlagSet, args []string) ([]string, error)
 // cmdValidate runs the `validate` subcommand and returns the process exit code
 // (rather than calling os.Exit itself), so tests can drive every branch —
 // including the fail-closed error paths — without terminating the test binary.
-func cmdValidate() int {
+// args carries the subcommand's own arguments (os.Args[2:] in a real
+// invocation), threaded from run.
+func cmdValidate(args []string) int {
 	fs := flag.NewFlagSet("validate", flag.ContinueOnError)
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `Usage:
@@ -1687,7 +1697,7 @@ Flags:
 	// Split off a stdio subprocess command after the first standalone "--".
 	// Manifest files are positional too, so "--" is the only unambiguous boundary;
 	// Go's flag package consumes "--", so we split before parsing.
-	rawArgs := os.Args[2:]
+	rawArgs := args
 	var stdioCmd []string
 	for i, a := range rawArgs {
 		if a == "--" {
@@ -2112,8 +2122,10 @@ func writeGeneratedFile(path, content string, force bool) (err error) {
 
 // cmdInit runs the `init` subcommand and returns the process exit code (rather
 // than calling os.Exit itself), so tests can drive every branch — including the
-// fail-closed error paths — without terminating the test binary.
-func cmdInit() int {
+// fail-closed error paths — without terminating the test binary. args carries
+// the subcommand's own arguments (os.Args[2:] in a real invocation), threaded
+// from run.
+func cmdInit(args []string) int {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `Usage:
@@ -2145,7 +2157,7 @@ Flags:
 	tlsSkipVerify := fs.Bool("upstream-tls-skip-verify", false, "Skip TLS certificate verification for the HTTP upstream (development only).")
 	pinDescriptions := fs.Bool("pin-descriptions", false, "Include a descriptionHash field for each tool, computed from its current live\ndescription. When set in the manifest, the proxy verifies the hash at startup\nand aborts if the description has changed — detecting upstream tool poisoning.")
 
-	if err := fs.Parse(os.Args[2:]); err != nil {
+	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
@@ -2305,8 +2317,10 @@ func openAuditChain(cmdName, logPath string) (reader io.Reader, closeAll func(),
 // -----------------------------------------------------------------
 
 // cmdSuggest runs the `suggest` subcommand and returns the process exit code
-// (rather than calling os.Exit itself), so tests can drive every branch.
-func cmdSuggest() int {
+// (rather than calling os.Exit itself), so tests can drive every branch. args
+// carries the subcommand's own arguments (os.Args[2:] in a real invocation),
+// threaded from run.
+func cmdSuggest(args []string) int {
 	fs := flag.NewFlagSet("suggest", flag.ContinueOnError)
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `Usage: eunox suggest [flags]
@@ -2341,7 +2355,7 @@ Flags:
 	force := fs.Bool("force", false, "Overwrite --output if it already exists (default: refuse to clobber). An\noverwrite also re-tightens the file mode to 0600.")
 	maxValues := fs.Int("max-values", suggestMaxValuesDefault, "Max distinct values an argument may have before allowedValues is downgraded to a review comment.\n0 or negative falls back to the default (20).")
 
-	if code, done := parseAuditReaderFlags("suggest", fs, configPath, auditLogPath, nil); done {
+	if code, done := parseAuditReaderFlags("suggest", fs, args, configPath, auditLogPath, nil); done {
 		return code
 	}
 	logPath, ok := resolveAuditReaderLogPath("suggest", *auditLogPath)

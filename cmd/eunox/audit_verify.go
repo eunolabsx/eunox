@@ -54,7 +54,8 @@ func applyConfigAuditDefaults(cmdName, configPath string, logPath, keyPath *stri
 }
 
 // parseAuditReaderFlags runs the preamble every subcommand that reads the audit tape
-// (suggest, stats, audit-verify, doctor) performs identically: parse the flag set,
+// (suggest, stats, audit-verify, doctor) performs identically: parse args (the
+// subcommand's own arguments, os.Args[2:] in a real invocation) into the flag set,
 // map -h/--help to a clean exit, reject a stray positional, and let a --config fill any
 // audit path the operator left empty.
 //
@@ -69,8 +70,8 @@ func applyConfigAuditDefaults(cmdName, configPath string, logPath, keyPath *stri
 // The stray-positional rejection is the load-bearing half: the log is chosen with
 // --audit-log/--config, never positionally, so `eunox stats audit.jsonl` must not
 // silently report on the DEFAULT log while naming another file on the command line.
-func parseAuditReaderFlags(name string, fs *flag.FlagSet, configPath, logPath, keyPath *string) (code int, done bool) {
-	if err := fs.Parse(os.Args[2:]); err != nil {
+func parseAuditReaderFlags(name string, fs *flag.FlagSet, args []string, configPath, logPath, keyPath *string) (code int, done bool) {
+	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0, true
 		}
@@ -103,7 +104,9 @@ func resolveAuditReaderLogPath(name, configured string) (string, bool) {
 
 // cmdAuditVerify runs the `audit-verify` subcommand and returns the process
 // exit code (rather than calling os.Exit itself), so tests can drive every branch.
-func cmdAuditVerify() int {
+// args carries the subcommand's own arguments (os.Args[2:] in a real
+// invocation), threaded from run.
+func cmdAuditVerify(args []string) int {
 	fs := flag.NewFlagSet("audit-verify", flag.ContinueOnError)
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `Usage: eunox audit-verify [flags]
@@ -120,7 +123,7 @@ Flags:
 	requestID := fs.String("request-id", "", "Report (count and print) only the record with this request ID. Every record\nis still HMAC-verified and the tamper-evident chain is always checked; this\nfilter narrows the report, not the verification.")
 	since := fs.String("since", "", "Report (count and print) only records after this RFC3339 timestamp. Every\nrecord is still HMAC-verified and the tamper-evident chain is always checked;\nthis filter narrows the report, not the verification.")
 
-	if code, done := parseAuditReaderFlags("audit-verify", fs, configPath, auditLogPath, auditKeyPath); done {
+	if code, done := parseAuditReaderFlags("audit-verify", fs, args, configPath, auditLogPath, auditKeyPath); done {
 		return code
 	}
 	logPath, ok := resolveAuditReaderLogPath("audit-verify", *auditLogPath)

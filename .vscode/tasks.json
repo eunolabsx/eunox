@@ -57,13 +57,6 @@
       "problemMatcher": ["$go"]
     },
     {
-      "label": "Generate",
-      "type": "shell",
-      "command": "make generate",
-      "group": "build",
-      "problemMatcher": ["$go"]
-    },
-    {
       "label": "Check License Headers",
       "type": "shell",
       "command": "make check-license",

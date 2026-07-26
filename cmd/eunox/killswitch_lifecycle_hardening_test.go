@@ -113,7 +113,7 @@ func TestCmdKill_FlagsAfterPositional_RedisPath(t *testing.T) {
 
 	var code int
 	// Positional FIRST, then the flag — the ordering a single fs.Parse rejects.
-	withArgs([]string{"eunox", "kill", "all", "--redis-addr", mr.Addr()}, func() { code = cmdKill() })
+	code = cmdKill([]string{"all", "--redis-addr", mr.Addr()})
 	if code != 0 {
 		t.Fatalf("kill all --redis-addr <addr> (positional first): exit %d, want 0 (flags after the positional must parse)", code)
 	}
@@ -124,7 +124,7 @@ func TestCmdKill_FlagsAfterPositional_RedisPath(t *testing.T) {
 
 	// The conventional flag-first order must still work (no regression).
 	mr.FlushAll()
-	withArgs([]string{"eunox", "kill", "--redis-addr", mr.Addr(), "all"}, func() { code = cmdKill() })
+	code = cmdKill([]string{"--redis-addr", mr.Addr(), "all"})
 	if code != 0 {
 		t.Fatalf("kill --redis-addr <addr> all (flag first): exit %d, want 0", code)
 	}

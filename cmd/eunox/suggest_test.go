@@ -806,9 +806,7 @@ func TestCmdSuggest_WritesLoadableManifest(t *testing.T) {
 		auditLine("allow", "tool", "query_db", map[string]any{"session_id": "s1", "details": map[string]any{"sql": "SELECT 1"}}))
 	out := filepath.Join(t.TempDir(), "draft.yaml")
 
-	withArgs([]string{"eunox", "suggest", "--audit-log", tape, "--output", out}, func() {
-		cmdSuggest()
-	})
+	cmdSuggest([]string{"--audit-log", tape, "--output", out})
 
 	if _, err := config.LoadManifest(out); err != nil {
 		t.Fatalf("suggest output did not load as a valid manifest: %v", err)
@@ -817,9 +815,7 @@ func TestCmdSuggest_WritesLoadableManifest(t *testing.T) {
 
 func TestCmdSuggest_EmptyLogToStdout(t *testing.T) {
 	tape := writeTempFile(t, "")
-	withArgs([]string{"eunox", "suggest", "--audit-log", tape}, func() {
-		cmdSuggest()
-	})
+	cmdSuggest([]string{"--audit-log", tape})
 }
 
 // ─── commonPrefixGlob ─────────────────────────────────────────────────────────
