@@ -129,3 +129,64 @@ func TestStaleness_UsesDefaultWhenIntervalUnset(t *testing.T) {
 		t.Fatalf("staleness() = %v, want %v", got, want)
 	}
 }
+
+// TestStaleness_FlooredAgainstRefreshCycleCost is the self-DoS regression. The staleness
+// budget gates a TOTAL, non-downgradable denial in fail-closed mode, and a bare 2x the
+// reconcile interval shrinks it without bound — so lowering the interval for faster kill
+// propagation, which the flag's own help text recommends, could make a healthy Redis look
+// stale purely because one refresh cycle (GET + two SCAN loops, retried on a cache-gen
+// race) outlasts the budget.
+func TestStaleness_FlooredAgainstRefreshCycleCost(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		interval time.Duration
+		want     time.Duration
+	}{
+		// The default is unchanged: 2x30s and 30s+30s are the same 60s.
+		{defaultReconcileInterval, 2 * defaultReconcileInterval},
+		// Lowered intervals take the floor: one interval (the wait for the next tick)
+		// plus one plausible refresh cycle.
+		{time.Second, time.Second + maxRefreshCycleBudget},
+		{5 * time.Second, 5*time.Second + maxRefreshCycleBudget},
+		// A raised interval keeps the multiple: it already exceeds the floor.
+		{5 * time.Minute, 10 * time.Minute},
+	} {
+		r := &Redis{reconcileInterval: tc.interval}
+		if got := r.staleness(); got != tc.want {
+			t.Errorf("staleness(interval=%v) = %v, want %v", tc.interval, got, tc.want)
+		}
+		if got := r.staleness(); got <= tc.interval {
+			t.Errorf("staleness(interval=%v) = %v, must exceed one interval or every tick looks late", tc.interval, got)
+		}
+	}
+}
+
+// TestStaleness_LowIntervalDoesNotDenyAHealthyBackend is the behavioral half: with a 1s
+// reconcile interval, a refresh that completed a few seconds ago must still count as
+// confirmed. Under the old 2x rule that cache was stale after 2s and fail-closed mode
+// denied every request against a perfectly healthy Redis.
+func TestStaleness_LowIntervalDoesNotDenyAHealthyBackend(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	now := base
+	r := &Redis{
+		killedAgents:      map[string]bool{},
+		killedSessions:    map[string]bool{},
+		reconcileInterval: time.Second,
+		now:               func() time.Time { return now },
+	}
+	r.started.Store(true)
+	r.lastRefreshOK = base
+
+	// A slow-but-successful refresh cycle: well past 2 intervals, well inside the floor.
+	now = base.Add(10 * time.Second)
+	if blocked, err := r.ShouldBlock(context.Background(), "a", "s"); blocked || err != nil {
+		t.Fatalf("a healthy backend must not be denied on a lowered reconcile interval; blocked=%v err=%v", blocked, err)
+	}
+
+	// Past the floor, the gate still fires: this bounds the window, it does not remove it.
+	now = base.Add(time.Second + maxRefreshCycleBudget + time.Second)
+	if _, err := r.ShouldBlock(context.Background(), "a", "s"); !errors.Is(err, ErrBackendUnreachable) {
+		t.Fatalf("past the floored budget the cache must still fail closed, got %v", err)
+	}
+}

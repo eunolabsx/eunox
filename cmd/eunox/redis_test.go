@@ -209,3 +209,34 @@ func TestRedisKillSwitch_GlobalActivate(t *testing.T) {
 		return err == nil && blocked
 	}, 2*time.Second, 10*time.Millisecond, "all sessions must be blocked under the global kill switch")
 }
+
+// TestSessionKillTTLNotice_ResolvesTheSameSentinelsAsTheOption pins the startup banner
+// against the option it describes: 0 means the 30-day default and a negative means "never
+// expire", so the line must resolve both rather than print the raw flag value. A banner
+// claiming one lifetime while Redis enforces another is worse than no banner — the whole
+// point is that this expiry LIFTS a revocation.
+func TestSessionKillTTLNotice_ResolvesTheSameSentinelsAsTheOption(t *testing.T) {
+	t.Parallel()
+
+	def := sessionKillTTLNotice(0)
+	require.Contains(t, def, killswitch.DefaultSessionKillTTL.String(),
+		"the default notice must state the effective lifetime, not the literal 0")
+	require.Contains(t, def, "re-admitted")
+
+	never := sessionKillTTLNotice(-1)
+	require.Contains(t, never, "never expire")
+	require.NotContains(t, never, "re-admitted",
+		"with expiry disabled there is no re-admission to warn about")
+
+	explicit := sessionKillTTLNotice(90 * time.Minute)
+	require.Contains(t, explicit, "1h30m0s")
+	require.NotContains(t, explicit, "default")
+}
+
+// TestKillswitchSessionTTLFlag_IsRedisGated: the flag only takes effect inside the
+// --redis-addr branch, so it must be listed with the other Redis-gated flags or an
+// operator who sets it without Redis gets no diagnostic.
+func TestKillswitchSessionTTLFlag_IsRedisGated(t *testing.T) {
+	t.Parallel()
+	require.Contains(t, redisGatedFlags, "killswitch-session-ttl")
+}

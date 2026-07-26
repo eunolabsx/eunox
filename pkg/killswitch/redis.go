@@ -47,6 +47,11 @@ const (
 	defaultSessionKillTTL = 30 * 24 * time.Hour
 )
 
+// DefaultSessionKillTTL is the exported form of the default session-tombstone lifetime,
+// so the binary's startup banner can state the effective value rather than restating the
+// number and drifting from it.
+const DefaultSessionKillTTL = defaultSessionKillTTL
+
 // subscribeConfirmTimeout bounds the initial pub/sub subscription-confirmation read in
 // Start. pubsub.Receive issues a deadline-less socket read (go-redis passes timeout=0),
 // so a blackholed or half-open connection -- the TCP dial and SUBSCRIBE write are
@@ -652,15 +657,36 @@ func (r *Redis) clock() time.Time {
 	return time.Now()
 }
 
+// maxRefreshCycleBudget is how long one healthy refresh cycle may plausibly take
+// end-to-end: a GET plus two SCAN loops, each a series of round trips bounded only by the
+// caller-supplied client's own timeouts, and the whole thing retried up to
+// maxRefreshAttempts times when a concurrent kill keeps racing the scan. None of that is
+// a fault, and none of it is proportional to the reconcile interval.
+//
+// It exists because the staleness budget gates a TOTAL, non-downgradable denial (in the
+// default fail-closed mode a stale cache denies every request, even under --audit). A bare
+// multiple of the reconcile interval makes that denial MORE likely the lower the interval
+// goes — and lowering it is exactly what the flag's own help text recommends for faster
+// kill propagation, so tuning for responsiveness could take the data plane down against a
+// perfectly healthy Redis.
+const maxRefreshCycleBudget = 30 * time.Second
+
 // staleness returns how old a confirmed refresh may be before the cache is treated as
 // unconfirmed. Two reconcile intervals: one missed tick is ordinary jitter, two means the
 // convergence loop is not running or Redis is not answering.
+//
+// Floored at one interval plus a realistic refresh-cycle budget, because the stamp is set
+// when a refresh COMPLETES: the next tick fires an interval later and then takes up to a
+// cycle to finish, so the age at the moment of the next successful stamp is legitimately
+// interval + cycle even when nothing is wrong. At the default 30s interval the floor and
+// the multiple coincide exactly (60s), so only a lowered interval — the self-DoS case —
+// sees any change.
 func (r *Redis) staleness() time.Duration {
 	iv := r.reconcileInterval
 	if iv <= 0 {
 		iv = defaultReconcileInterval
 	}
-	return 2 * iv
+	return max(2*iv, iv+maxRefreshCycleBudget)
 }
 
 // staleLocked reports whether the cache has gone too long without a confirmed refresh.
