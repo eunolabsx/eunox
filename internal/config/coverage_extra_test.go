@@ -744,6 +744,39 @@ upstreams:
 	}
 }
 
+// TestLoadGatewayConfig_BareDollarInCommandArgsIsLiteral pins that the unset-env-ref
+// guard on command/args accepts a bare "$word".
+//
+// These two fields are arbitrary subprocess argv, not a URL: a bare "$word" is ordinary
+// literal text there — an OData "?$filter=", a regex "$anchor", a jq expression, or
+// anything the child interpolates itself. Applying the broader bare-$ rule the
+// upstreamUrl guard uses would refuse to START a config that works today, blaming a
+// variable the operator never wrote. Only the unambiguous "${VAR}" fails closed.
+func TestLoadGatewayConfig_BareDollarInCommandArgsIsLiteral(t *testing.T) {
+	cfg, err := LoadGatewayConfig(writeConfig(t, `
+schemaVersion: "0.1"
+transport: http
+listen:
+  bind: 127.0.0.1
+  port: 3000
+upstreams:
+  - name: fs
+    transport: stdio
+    command: /usr/bin/srv
+    args: ["--query", "?$filter=name eq 'x'", "s/$anchor/x/"]
+    policy: ["fs.yaml"]
+`))
+	if err != nil {
+		t.Fatalf("LoadGatewayConfig rejected literal $ text in argv: %v", err)
+	}
+	if got := cfg.Upstreams[0].Args[1]; got != "?$filter=name eq 'x'" {
+		t.Errorf("args[1] = %q, want the literal text preserved verbatim", got)
+	}
+	if got := cfg.Upstreams[0].Args[2]; got != "s/$anchor/x/" {
+		t.Errorf("args[2] = %q, want the literal text preserved verbatim", got)
+	}
+}
+
 // LoadGatewayConfig surfaces a read error for a path that does not exist.
 func TestLoadGatewayConfig_MissingFile(t *testing.T) {
 	_, err := LoadGatewayConfig(filepath.Join(t.TempDir(), "does-not-exist.yaml"))
