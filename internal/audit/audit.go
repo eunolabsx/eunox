@@ -552,7 +552,7 @@ func (s *Sink) seedSeqPastOnDiskMax() (bounded bool) {
 		// corrupt or planted seq, and honoring it would push the counter into the wrap
 		// zone. Clamp and say so — the clamped seed still lands past every plausible
 		// genuine record, so the monotonic guarantee holds for real history.
-		fmt.Fprintf(os.Stderr, "[eunox] WARNING: audit log %q holds an implausible sequence number (%d); it is corrupt or planted. Seeding the resumed counter at %d instead — run 'eunox audit-verify' and reconcile against your external sink.\n", s.logPath, highest, uint64(maxSeedableSeq))
+		fmt.Fprintf(os.Stderr, "[eunox] WARNING: audit log %q holds an implausible sequence number (%d); it is corrupt or planted. Seeding the resumed counter at %d instead — run 'eunox audit-verify' and reconcile against your external sink.\n", s.logPath, highest, maxSeedableSeq)
 		highest = maxSeedableSeq
 	}
 	if ok && highest > s.seq {

@@ -138,13 +138,15 @@ func decodeStrictJSON(w http.ResponseWriter, r *http.Request, v interface{}, inv
 // operator and returned to the client as a generic 500. Extracted from handleMCPPost so
 // the session-creating initialize branch stays within the nested-complexity budget.
 //
-// errSessionLimit is additionally recorded on the tape. It is a saturation refusal exactly
-// like the per-session in-flight cap that recordResourceExhausted covers, but reachable
-// WITHOUT an established session, so it is the cheaper flood for an attacker and was the
-// one leaving no trace — an incident responder reconstructing an outage saw
-// RESOURCE_EXHAUSTED for in-flight floods and a blank for session-cap floods. The other
-// two legs are benign lifecycle races (a kill sweep, a graceful drain), not attack signal,
-// so they stay status-only.
+// errSessionLimit is additionally recorded on the tape, through recordSessionCapDeny —
+// the same helper the pre-spawn slot reservation uses, so the two ways to hit one cap
+// cannot produce two record shapes. It is a saturation refusal exactly like the
+// per-session in-flight cap that recordResourceExhausted covers, but reachable WITHOUT an
+// established session, so it is the cheaper flood for an attacker (hence the rate limit
+// recordSessionCapDeny keeps) and was the one leaving no trace — an incident responder
+// reconstructing an outage saw RESOURCE_EXHAUSTED for in-flight floods and a blank for
+// session-cap floods. The other two legs are benign lifecycle races (a kill sweep, a
+// graceful drain), not attack signal, so they stay status-only.
 func (p *HTTPProxy) writeSessionCreateError(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, err error) {
 	switch {
 	case errors.Is(err, errSessionLimit):

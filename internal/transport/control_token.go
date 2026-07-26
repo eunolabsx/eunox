@@ -111,6 +111,13 @@ func WriteControlTokenFile(path, token string) (string, error) {
 		if dirPreexisted {
 			// Reuse the FileInfo from the pre-existence stat above (MkdirAll does not
 			// touch an already-present dir), so the mode is read exactly once.
+			//
+			// "eunox's own" is keyed on the UNEXPANDED path matching the default, so an
+			// operator who spells out the same location absolutely gets the
+			// operator-chosen treatment (warn, never chmod). That errs toward not
+			// touching a directory whose mode someone typed a path to reach — the
+			// conservative direction — and the upgrade case this exists for is the
+			// default path, which is what an upgrade leaves behind.
 			if err := tightenTokenDir(dir, fi, path == defaultControlTokenPath); err != nil {
 				return "", err
 			}
