@@ -30,7 +30,7 @@ func TestResolvePolicyPath_ExpandsTilde(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolvePolicyPath with a ~/ policy path: %v", err)
 	}
-	want := filepath.Join(home, "policies/x.yaml")
+	want := filepath.Join(home, "policies", "x.yaml")
 	if got != want {
 		t.Errorf("ResolvePolicyPath = %q, want %q (a home-relative path must not be joined under the config dir)", got, want)
 	}

@@ -304,7 +304,6 @@ func effectiveLeeway(configured time.Duration) time.Duration {
 	return capability.EffectiveLeeway(configured)
 }
 
-// NewJWTPDP creates a JWTPDP ready to validate tokens.
 // jwtLogger pins JWT/JWKS logging to stderr: stdout is the JSON-RPC channel in stdio
 // mode, so logging must never inherit a slog default that could corrupt the framing.
 // Package-level so the constructor's misconfiguration warnings and the parser-drift
@@ -313,6 +312,7 @@ func effectiveLeeway(configured time.Duration) time.Duration {
 // and impossible to correlate in a SIEM alongside every other line this package emits.
 var jwtLogger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 
+// NewJWTPDP creates a JWTPDP ready to validate tokens.
 func NewJWTPDP(opts JWTPDPOptions) *JWTPDP {
 	// Default breaker so the shipped proxy always has JWKS-fetch protection;
 	// capability.NewJWKSCache leaves it opt-in, so apply it here.
