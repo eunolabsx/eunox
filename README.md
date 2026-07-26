@@ -742,8 +742,15 @@ Additional JWT/OAuth flags (all HTTP transport, all optional):
 | `--jwt-allow-any-audience` | Accept tokens regardless of `aud` (disables audience pinning — not recommended). `--jwt-audience` is otherwise **required** with `--jwks-uri`. | off |
 | `--jwt-allow-any-issuer` | Accept tokens regardless of `iss` (disables issuer pinning — not recommended). `--jwt-issuer` is otherwise **required** with `--jwks-uri`. | off |
 | `--jwks-allow-insecure-http` | Permit a plaintext `http://` `--jwks-uri` to a non-loopback host (development only). | off |
-| `--oauth-resource` | RFC 9728 resource-server URI published at `/.well-known/oauth-protected-resource` and in `WWW-Authenticate`. | unset |
+| `--oauth-resource` | RFC 9728 resource-server URI published at `/.well-known/oauth-protected-resource` and in `WWW-Authenticate`. Requires bearer-token validation — see below. | unset |
 | `--oauth-authorization-server` | Authorization-server URI in the RFC 9728 metadata (defaults to `--jwt-issuer`). | `--jwt-issuer` |
+
+The two `--oauth-*` flags require bearer-token validation (`--jwks-uri`, or
+`listen.authToken`): the metadata document is unauthenticated by design and tells any
+client "this resource is protected, get a token from these authorization servers", so
+without validation the gateway would advertise a protection it does not enforce. Setting
+either `--oauth-*` flag (or the equivalent `listen.*` key) without one is rejected at
+startup.
 
 See the JWT mode walkthrough in [`demo/README.md`](./demo/README.md#step-3--jwt-mode-manifest--idp-claims).
 For integration examples with Auth0, Okta, WorkOS, and Cloudflare Access, see

@@ -418,10 +418,15 @@ func openAndPrepareLog(logPath string, preSize int64, lockFile *os.File) (f *os.
 	}
 
 	readable := true
-	f, err = os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // G304: path is user-configured audit log location
+	// openNoFollow (O_NOFOLLOW on unix, 0 elsewhere) makes the kernel refuse a
+	// final-component symlink atomically, closing the Lstat->OpenFile TOCTOU the
+	// refuseNonRegular check above cannot. A symlink surviving to here fails the open
+	// with ELOOP, which is neither ErrPermission nor ErrNotExist, so it falls straight
+	// into the fail-closed return below rather than the write-only fallback.
+	f, err = os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_RDWR|openNoFollow, 0o600) //nolint:gosec // G304: path is user-configured audit log location
 	if errors.Is(err, os.ErrPermission) {
 		readable = false
-		f, err = os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600) //nolint:gosec // G304: path is user-configured audit log location
+		f, err = os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY|openNoFollow, 0o600) //nolint:gosec // G304: path is user-configured audit log location
 	}
 	if err != nil {
 		_ = releaseAuditLock(lockFile)
@@ -982,7 +987,10 @@ func NewLineScanner(r io.Reader) *bufio.Scanner {
 //     is the normal brand-new-install case.
 //   - (line, nil): the extracted last record line.
 func readLastAuditLine(path string) (string, error) {
-	f, err := os.Open(path) //nolint:gosec // G304: path is the user-configured audit log
+	// openNoFollow here too, not just on the append opens: this read is Open's
+	// chain-resume path, so a symlink planted at the log path would otherwise seed the
+	// resumed chain from an attacker-chosen file.
+	f, err := os.OpenFile(path, os.O_RDONLY|openNoFollow, 0) //nolint:gosec // G304: path is the user-configured audit log
 	if err != nil {
 		if os.IsNotExist(err) {
 			// Absent file: the normal brand-new-install / freshly-rotated case, not an

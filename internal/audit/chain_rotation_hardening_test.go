@@ -279,3 +279,51 @@ func TestOpenGuardedAppend_RefusesUnstattablePath(t *testing.T) {
 		t.Fatal("openGuardedAppend must refuse a path it cannot Lstat (a non-NotExist error), failing closed")
 	}
 }
+
+// TestOpenNoFollow_RefusesSymlinkWithoutTheLstatGuard pins the defense-in-depth half of
+// the symlink refusal: the openNoFollow flag every audit-log open OR-s in must make the
+// KERNEL reject a final-component symlink, independently of refuseNonRegular's Lstat.
+// That is what closes the Lstat->OpenFile TOCTOU — a symlink planted between the check
+// and the open would otherwise be followed, redirecting the tamper-evident tape and
+// dropping the live log out of audit-verify's IsRegular() chain scan.
+//
+// The Lstat guard is deliberately bypassed here (the raw os.OpenFile is what
+// openAndPrepareLog and openGuardedAppend perform after it passes), so this fails if the
+// flag is ever dropped from an open even while the guard keeps the higher-level tests
+// green. On a platform with no O_NOFOLLOW equivalent openNoFollow is 0 and the portable
+// guard is the only check, so there is nothing to assert.
+func TestOpenNoFollow_RefusesSymlinkWithoutTheLstatGuard(t *testing.T) {
+	if openNoFollow == 0 {
+		t.Skip("platform has no O_NOFOLLOW equivalent; refuseNonRegular is the only guard there")
+	}
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	if err := os.WriteFile(target, []byte("attacker\n"), 0o600); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	link := filepath.Join(dir, "audit.jsonl")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	f, err := os.OpenFile(link, os.O_APPEND|os.O_CREATE|os.O_RDWR|openNoFollow, 0o600) //nolint:gosec // G304: test-controlled path
+	if err == nil {
+		_ = f.Close()
+		t.Fatal("openNoFollow must make the kernel refuse a symlinked audit-log path")
+	}
+	data, rerr := os.ReadFile(target) //nolint:gosec // G304: test-controlled path
+	if rerr != nil {
+		t.Fatalf("read target: %v", rerr)
+	}
+	if string(data) != "attacker\n" {
+		t.Fatalf("symlink target was written through: %q", data)
+	}
+
+	// A regular path still opens with the flag set — the flag must not break normal use.
+	plain := filepath.Join(dir, "plain.jsonl")
+	g, err := os.OpenFile(plain, os.O_APPEND|os.O_CREATE|os.O_RDWR|openNoFollow, 0o600) //nolint:gosec // G304: test-controlled path
+	if err != nil {
+		t.Fatalf("openNoFollow must not block a regular path: %v", err)
+	}
+	_ = g.Close()
+}

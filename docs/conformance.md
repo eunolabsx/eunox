@@ -107,7 +107,7 @@ semantics section below.
 | **JWKS endpoint** | No (consumes) | Yes — publish JWKS at `--jwks-uri` |
 | **JWT signature + expiry validation** | Yes — when `--jwks-uri` is set | |
 | **JWT claims intersection with manifest** | **Experimental (opt-in)** — enabled with `--jwt-experimental-capabilities`; off by default, where a token carrying `mcp.capabilities` is rejected (HTTP 401). When on, JWT claims can only restrict the route's manifest, never expand it. Every enforcing route has a manifest: a policy-less gateway route fails closed at startup unless it sets `enforcement: audit`, in which case it is a wiretap that records the JWT decision but forwards every call (see JWT semantics below) | |
-| **RFC 9728 protected-resource metadata** | Yes — serves `/.well-known/oauth-protected-resource`; issues `WWW-Authenticate` challenges on 401 responses | |
+| **RFC 9728 protected-resource metadata** | Yes — serves `/.well-known/oauth-protected-resource`; issues `WWW-Authenticate` challenges on 401 responses. Requires bearer-token validation (`--jwks-uri` or `listen.authToken`): publishing the document without it would advertise a protection the gateway does not enforce, so it is rejected at startup| |
 | **Per-route resource metadata paths** (gateway) | Yes — `/.well-known/oauth-protected-resource/mcp/<name>` is registered for each route, but all paths serve the same global document (configured via `listen.oauthResource` + `listen.oauthAuthorizationServers`) | |
 | **Fine-grained capability enforcement** | Yes — per-tool, per-resource, per-prompt, per-parameter conditions | |
 | **Audit log** | Yes — append-only OCSF JSONL, HMAC-SHA256 signed | |

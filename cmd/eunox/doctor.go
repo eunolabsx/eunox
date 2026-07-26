@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -155,6 +156,26 @@ type doctorOptions struct {
 // cmdDoctor runs the `doctor` subcommand and returns the process exit code (rather
 // than calling os.Exit itself), so tests can drive every branch in-process — matching
 // every other fallible subcommand.
+// parseDoctorReaderFlags is parseAuditReaderFlags for doctor: identical flag parsing and
+// stray-positional rejection, but an unloadable --config is RETURNED (with a nil cfg)
+// instead of aborting. doctor's whole job is describing a broken deployment, so a config
+// that will not parse is the case the bundle is most needed for; it is reported inside
+// the bundle and every config-independent section still renders.
+func parseDoctorReaderFlags(fs *flag.FlagSet, configPath, logPath, keyPath *string) (cfg *config.GatewayConfig, code int, done bool, cfgErr error) {
+	if err := fs.Parse(os.Args[2:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil, 0, true, nil
+		}
+		return nil, 1, true, nil
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "eunox doctor: unexpected argument %q (use --audit-log to name the log file)\n", fs.Arg(0))
+		return nil, 1, true, nil
+	}
+	cfg, cfgErr = loadConfigAuditDefaults("doctor", *configPath, logPath, keyPath)
+	return cfg, 0, false, cfgErr
+}
+
 func cmdDoctor() int {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	fs.Usage = func() {
@@ -190,7 +211,7 @@ Flags:
 	// between them. doctor deliberately stops here rather than resolving --audit-log: an
 	// unresolvable path is reported INSIDE the bundle, since a support bundle that prints
 	// what it can beats one that refuses to print.
-	cfg, cfgErr, code, done := parseDoctorReaderFlags(fs, configPath, auditLog, auditKey)
+	cfg, code, done, cfgErr := parseDoctorReaderFlags(fs, configPath, auditLog, auditKey)
 	if done {
 		return code
 	}

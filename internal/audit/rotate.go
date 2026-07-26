@@ -330,7 +330,9 @@ func openGuardedAppend(logPath string) (*os.File, error) {
 	if err := refuseNonRegular(logPath); err != nil {
 		return nil, err
 	}
-	return os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600) //nolint:gosec // G304: path is user-configured audit log location
+	// openNoFollow (O_NOFOLLOW on unix) closes the Lstat->open race the guard above
+	// cannot; the rename->reopen window is exactly where a planted symlink would land.
+	return os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY|openNoFollow, 0o600) //nolint:gosec // G304: path is user-configured audit log location
 }
 
 // refuseNonRegular fails closed unless logPath is a regular file or genuinely absent. It is
