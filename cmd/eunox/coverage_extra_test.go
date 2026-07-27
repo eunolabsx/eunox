@@ -206,7 +206,7 @@ func TestValidateConfigRoutes_LiveAllowAllRouteNoManifest(t *testing.T) {
 // kill-switch write.
 func TestKillViaRedis_PingFailure(t *testing.T) {
 	// 127.0.0.1:1 is reserved/unbound; the dial fails fast.
-	err := killViaRedis("127.0.0.1:1", "", false, "sess-x")
+	err := killViaRedis("127.0.0.1:1", "", false, 0, "sess-x")
 	if err == nil {
 		t.Fatal("expected an error pinging an unreachable redis, got nil")
 	}
@@ -214,7 +214,7 @@ func TestKillViaRedis_PingFailure(t *testing.T) {
 
 // TestKillViaRedis_EmptyAddr covers the buildRedisClient error wrapping branch.
 func TestKillViaRedis_EmptyAddr(t *testing.T) {
-	err := killViaRedis("", "", false, "all")
+	err := killViaRedis("", "", false, 0, "all")
 	if err == nil {
 		t.Fatal("expected an error for an empty redis addr, got nil")
 	}
@@ -230,14 +230,14 @@ func TestKillViaRedis_EmptyAddr(t *testing.T) {
 func TestKillViaRedis_AllAndSessionSucceed(t *testing.T) {
 	mr := miniredis.RunT(t)
 
-	if err := killViaRedis(mr.Addr(), "", false, "all"); err != nil {
+	if err := killViaRedis(mr.Addr(), "", false, 0, "all"); err != nil {
 		t.Fatalf("killViaRedis all: %v", err)
 	}
 	if got, err := mr.Get("killswitch:global"); err != nil || got != "1" {
 		t.Errorf("global kill not set: got %q err=%v", got, err)
 	}
 
-	if err := killViaRedis(mr.Addr(), "", false, "sess-direct"); err != nil {
+	if err := killViaRedis(mr.Addr(), "", false, 0, "sess-direct"); err != nil {
 		t.Fatalf("killViaRedis session: %v", err)
 	}
 	if got, err := mr.Get("killswitch:session:sess-direct"); err != nil || got != "1" {
@@ -1594,7 +1594,10 @@ func TestPrintProxyUsage(t *testing.T) {
 // ───────────────────────── buildCallCounterAndKillSwitch ───────────────────
 
 func TestBuildCallCounterAndKillSwitch_InMemory(t *testing.T) {
-	counter, _, ks, ksRedis := buildCallCounterAndKillSwitch("", "", false, false, 0, 0)
+	counter, _, ks, ksRedis, err := buildCallCounterAndKillSwitch("", "", false, false, 0, 0, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if counter == nil || ks == nil {
 		t.Fatal("want non-nil in-memory counter and kill-switch")
 	}
@@ -1605,12 +1608,15 @@ func TestBuildCallCounterAndKillSwitch_InMemory(t *testing.T) {
 
 // TestBuildCallCounterAndKillSwitch_Redis exercises the Redis success path —
 // fail-open and a positive reconcile interval, so both warning branches run —
-// without hitting the os.Exit(1) error branches (a real miniredis instance
-// answers PING, so buildRedisClient/pingRedis succeed).
+// without hitting the error branches (a real miniredis instance answers PING, so
+// buildRedisClient/pingRedis succeed).
 func TestBuildCallCounterAndKillSwitch_Redis(t *testing.T) {
 	mr := miniredis.RunT(t)
 
-	counter, _, ks, ksRedis := buildCallCounterAndKillSwitch(mr.Addr(), "", false, true, 5*time.Second, 0)
+	counter, _, ks, ksRedis, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, true, 5*time.Second, 0, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if counter == nil || ks == nil {
 		t.Fatal("want non-nil counter and kill-switch")
 	}
@@ -1624,7 +1630,10 @@ func TestBuildCallCounterAndKillSwitch_Redis(t *testing.T) {
 func TestBuildCallCounterAndKillSwitch_RedisFailClosed(t *testing.T) {
 	mr := miniredis.RunT(t)
 
-	counter, _, ks, ksRedis := buildCallCounterAndKillSwitch(mr.Addr(), "", false, false, 0, 0)
+	counter, _, ks, ksRedis, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, false, 0, 0, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if counter == nil || ks == nil || ksRedis == nil {
 		t.Fatal("want non-nil counter, kill-switch, and Redis kill-switch")
 	}
@@ -1645,9 +1654,13 @@ func TestOpenConfiguredAuditSink_ConfigOverridesFlags(t *testing.T) {
 	cfg.Audit.RetainRotated = &retain
 
 	var sink *audit.Sink
+	var openErr error
 	stderr := captureStderr(t, func() {
-		sink = openConfiguredAuditSink("/flag-log.jsonl", "/flag-key", 1, 1, cfg, false)
+		sink, openErr = openConfiguredAuditSink("/flag-log.jsonl", "/flag-key", 1, 1, cfg, false)
 	})
+	if openErr != nil {
+		t.Fatalf("unexpected error: %v", openErr)
+	}
 	if sink == nil {
 		t.Fatal("expected a non-nil sink")
 	}
@@ -1678,9 +1691,13 @@ func TestOpenConfiguredAuditSink_NoWarningWhenFlagUnset(t *testing.T) {
 	cfg.Audit.Log = cfgLogPath
 
 	var sink *audit.Sink
+	var openErr error
 	stderr := captureStderr(t, func() {
-		sink = openConfiguredAuditSink("", "", 0, 0, cfg, false)
+		sink, openErr = openConfiguredAuditSink("", "", 0, 0, cfg, false)
 	})
+	if openErr != nil {
+		t.Fatalf("unexpected error: %v", openErr)
+	}
 	if sink == nil {
 		t.Fatal("expected a non-nil sink")
 	}
@@ -1695,7 +1712,10 @@ func TestOpenConfiguredAuditSink_Success(t *testing.T) {
 	logPath := filepath.Join(dir, "audit.jsonl")
 	keyPath := filepath.Join(dir, "audit.key")
 
-	sink := openConfiguredAuditSink(logPath, keyPath, 0, 0, &config.GatewayConfig{}, true)
+	sink, err := openConfiguredAuditSink(logPath, keyPath, 0, 0, &config.GatewayConfig{}, true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if sink == nil {
 		t.Fatal("expected a non-nil sink")
 	}
@@ -1712,10 +1732,37 @@ func TestOpenConfiguredAuditSink_NonFatalFailure(t *testing.T) {
 	}
 	logPath := filepath.Join(blocker, "subdir", "audit.jsonl")
 
-	sink := openConfiguredAuditSink(logPath, "", 0, 0, &config.GatewayConfig{}, false)
+	sink, err := openConfiguredAuditSink(logPath, "", 0, 0, &config.GatewayConfig{}, false)
+	if err != nil {
+		t.Fatalf("an open failure without --require-audit must not be an error: %v", err)
+	}
 	if sink != nil {
 		t.Error("expected a nil sink on a non-fatal open failure")
 		_ = sink.Close()
+	}
+}
+
+// TestOpenConfiguredAuditSink_FatalFailureReturnsError covers the --require-audit leg
+// of the same open failure: rather than exiting the process from inside the helper, it
+// returns the error so cmdProxy owns the exit code and the branch is drivable here.
+func TestOpenConfiguredAuditSink_FatalFailureReturnsError(t *testing.T) {
+	dir := t.TempDir()
+	blocker := filepath.Join(dir, "blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write blocker: %v", err)
+	}
+	logPath := filepath.Join(blocker, "subdir", "audit.jsonl")
+
+	sink, err := openConfiguredAuditSink(logPath, "", 0, 0, &config.GatewayConfig{}, true)
+	if err == nil {
+		t.Fatal("expected an error when the sink cannot be opened under --require-audit")
+	}
+	if sink != nil {
+		t.Error("expected a nil sink alongside the error")
+		_ = sink.Close()
+	}
+	if !strings.Contains(err.Error(), "--require-audit") {
+		t.Errorf("error should name the flag that made this fatal, got: %v", err)
 	}
 }
 

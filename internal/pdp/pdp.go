@@ -164,11 +164,16 @@ const jsonKeyName = "name"
 
 // jsonKeyNameFolded is jsonKeyName under the same fold scanToolEntry applies to every
 // top-level key, so the two are compared in one space. It must be derived rather than
-// written out: capability.FoldJSONKey maps each rune to the SMALLEST member of its
-// simple-fold orbit, which for ASCII is the upper-case letter — a hand-written lower-case
-// literal would never match, and scanToolEntry would silently stop collecting names,
-// leaving poisonCandidates with nothing to poison on an untrustworthy entry.
+// written out: capability.FoldJSONKey maps each rune to a fixed representative of its
+// simple-fold orbit, and which representative that is belongs to that function, not to
+// this literal. A hand-written spelling that stopped matching would not fail loudly —
+// scanToolEntry would silently stop collecting names, leaving poisonCandidates with
+// nothing to poison on an untrustworthy entry.
 var jsonKeyNameFolded = capability.FoldJSONKey(jsonKeyName)
+
+// listKeyToolsFolded is listKeyTools under that same fold, for toolsKeyAmbiguous's
+// case-variant sibling check. Derived for the reason above, not written out.
+var listKeyToolsFolded = capability.FoldJSONKey(listKeyTools)
 
 // CountListEntries returns the number of entries in a */list method's result
 // array, or 0 for a non-list method or an empty/absent/unparseable result.
@@ -626,6 +631,12 @@ type ManifestPDP struct {
 	// plain hash string suffices — no in-band conflict sentinel is threaded into the hot path.
 	pinnedTools map[string]string
 
+	// sequenceAntecedents is the set of bare tool names some sequenceBlock condition
+	// names in its afterTools, built once at construction and never mutated. It bounds
+	// which MANIFEST-ABSENT targets are worth recording an audit-mode antecedent for:
+	// only a name a later sequenceBlock can actually query needs history. See
+	// decideTarget's no-match branch.
+	sequenceAntecedents map[string]struct{}
 	// anyLabelOutput is true when at least one capability carries a labelOutput directive.
 	// It gates the union scan (constraintWithUnionLabelOutput): a source read's taint is
 	// the union of labelOutput across ALL entries matching the request, not only the one
@@ -682,7 +693,37 @@ func NewManifestPDP(caps []capability.Constraint, engine *enforcement.Engine, ks
 			break
 		}
 	}
-	return &ManifestPDP{caps: caps, parsedTargets: parsed, engine: engine, ks: ks, observedToolHash: make(map[string]string), pinnedTools: pinned, anyLabelOutput: anyLabelOutput}
+	return &ManifestPDP{caps: caps, parsedTargets: parsed, engine: engine, ks: ks, observedToolHash: make(map[string]string), pinnedTools: pinned, sequenceAntecedents: collectSequenceAntecedents(caps), anyLabelOutput: anyLabelOutput}
+}
+
+// collectSequenceAntecedents gathers every bare tool name any sequenceBlock condition
+// lists in afterTools, normalized the way handleSequenceBlock normalizes them so the two
+// agree on what counts as the same name. Built once, read-only thereafter.
+func collectSequenceAntecedents(caps []capability.Constraint) map[string]struct{} {
+	var names map[string]struct{}
+	for i := range caps {
+		for _, cond := range caps[i].Conditions {
+			sb, ok := cond.(capability.SequenceBlockCondition)
+			if !ok {
+				p, isPtr := cond.(*capability.SequenceBlockCondition)
+				if !isPtr || p == nil {
+					continue
+				}
+				sb = *p
+			}
+			for _, prior := range sb.AfterTools {
+				bare := strings.TrimSpace(enforcement.StripEnginePrefix(prior))
+				if bare == "" {
+					continue
+				}
+				if names == nil {
+					names = make(map[string]struct{})
+				}
+				names[bare] = struct{}{}
+			}
+		}
+	}
+	return names
 }
 
 // engineClock returns the engine's clock so decideTarget's hand-built denies
@@ -920,6 +961,23 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 	// Find the most specific matching constraint, scoped to the target type and the
 	// caller's principal. The manifest is an allowlist: only listed targets pass.
 	claims := jwtClaimsAsMap(ctx)
+
+	// Build the enforce request before the no-match return, not after it: EVERY
+	// downgradable deny below — the no-match one included — needs it to record the
+	// antecedent in session history. TargetName/Target carry target.Name (for
+	// input.target.* and the audit record); Claims back input.claims.agent_id/task_id/etc.
+	req := &capability.EnforceRequest{
+		SessionID:  sessionID,
+		TargetName: target.Name,
+		Arguments:  args,
+		Context:    capability.EnforceRequestContext{SourceIP: sourceIP},
+		Target: &capability.EnforceRequestTarget{
+			Type: string(target.Type),
+			Name: target.Name,
+		},
+		Claims: claims,
+	}
+
 	matched := p.findConstraint(target, claims)
 	if matched == nil {
 		// A no-match deny is downgradable, so a route running --audit FORWARDS it and the
@@ -928,8 +986,32 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 		// from every entry NAMING this target (see withForwardObligations); dropping them
 		// here would leak on exactly the principal-scoped-miss shape the descriptionHash pin
 		// above is positioned to catch.
-		return p.withForwardObligations(ctx, denyResponse(p.engineClock(), capability.ErrCodeAuthorizationFailed, "",
+		resp := p.withForwardObligations(ctx, denyResponse(p.engineClock(), capability.ErrCodeAuthorizationFailed, "",
 			fmt.Sprintf("%s %q is not listed in the capability manifest", target.Type, target.Name)), target)
+		// Record the antecedent here too, matching every other downgradable deny branch.
+		// Under --audit this deny is forwarded and the manifest-absent tool actually RUNS,
+		// so omitting the record left a later enforced sequenceBlock naming it Peeking an
+		// empty history and failing OPEN — "observe predicts enforce" broken for exactly
+		// the targets an observe run exists to discover. matched is nil, which the
+		// antecedent path handles: no constraint means no flow relevance, so only the
+		// sequenceBlock antecedent is committed.
+		//
+		// Gated on the name being one some sequenceBlock actually lists in afterTools.
+		// This branch is the ONLY antecedent site whose target name is not bounded by the
+		// manifest, and the record costs a call-counter key that lives for the history
+		// window: recording every unlisted name let a caller on an observe route mint one
+		// key per made-up tool name until the counter hit its cap, at which point the
+		// record FAILS and recordAuditModeAntecedent returns a hard deny — non-downgradable
+		// even under --audit. An observe route whose whole contract is "log, never block"
+		// would then start hard-denying every call, listed tools included. A name no
+		// sequenceBlock can query has no history worth keeping, so skipping it costs the
+		// guarantee nothing and bounds the key space to manifest-authored names.
+		if _, queryable := p.sequenceAntecedents[target.Name]; queryable {
+			if override := recordAuditModeAntecedent(ctx, p.engine, p.engineClock(), req, nil, &resp); override != nil {
+				return *override
+			}
+		}
+		return resp
 	}
 	// Union labelOutput across every entry matching this request, so a source read carries
 	// its taint even when the entry findConstraint scored highest (a more-specific or
@@ -982,24 +1064,6 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 		// here without having run collectObligations). The genuine-allow path collects them
 		// in evaluateMatched; mirror it for the downgraded deny.
 		return p.withForwardObligationsFor(ctx, r, matched)
-	}
-
-	// Build the enforce request up front so every early-return deny an audit-mode
-	// constraint downgrades to a forwarded allow can still record the antecedent in
-	// session history — otherwise a later sequenceBlock naming this target in
-	// afterTools Peeks an empty history and fails OPEN though the tool ran.
-	// TargetName/Target carry target.Name (for input.target.* and the audit record);
-	// Claims back input.claims.agent_id/task_id/etc.
-	req := &capability.EnforceRequest{
-		SessionID:  sessionID,
-		TargetName: target.Name,
-		Arguments:  args,
-		Context:    capability.EnforceRequestContext{SourceIP: sourceIP},
-		Target: &capability.EnforceRequestTarget{
-			Type: string(target.Type),
-			Name: target.Name,
-		},
-		Claims: claims,
 	}
 
 	// The constraint's actions list must contain the required action for this
@@ -1208,20 +1272,8 @@ func (p *ManifestPDP) findConstraint(target EnforceTarget, claims map[string]int
 	// per-tools/list matchBare/path.Match evaluations.
 	primary := newConstraintScorer()
 	fallback := newConstraintScorer()
-	// parsedTargets is built parallel to caps by NewManifestPDP, so the hot path
-	// reads the once-parsed (type, bare) instead of re-scanning the static Target.
-	// A ManifestPDP built directly (a struct literal, as some tests do) leaves it
-	// unpopulated; fall back to inline ParseTarget then, mirroring how handleIPRange
-	// parses when Networks() reports the condition was not pre-compiled.
-	useCache := len(p.parsedTargets) == len(p.caps)
 	for i := range p.caps {
-		var pt parsedTarget
-		if useCache {
-			pt = p.parsedTargets[i]
-		} else {
-			tt, bare, err := capability.ParseTarget(p.caps[i].Target)
-			pt = parsedTarget{typ: tt, bare: bare, parseErr: err != nil}
-		}
+		pt := p.parsedTargetAt(i)
 		if pt.parseErr || pt.typ != target.Type {
 			continue
 		}
@@ -1246,6 +1298,27 @@ func (p *ManifestPDP) findConstraint(target EnforceTarget, claims map[string]int
 		return &p.caps[fallback.Best()]
 	}
 	return nil
+}
+
+// parsedTargetAt returns caps[i]'s target parsed into (type, bare).
+//
+// parsedTargets is built parallel to caps by NewManifestPDP, so the hot path reads the
+// once-parsed pair instead of re-scanning the static Target string. A ManifestPDP built
+// directly (a struct literal, as some tests do) leaves it unpopulated; this falls back to
+// an inline ParseTarget then, mirroring how handleIPRange parses when Networks() reports
+// the condition was not pre-compiled.
+//
+// The three scans over caps (findConstraint, directivesNamingTarget,
+// matchingLabelOutputUnion) each opened with a byte-identical copy of this cache-or-parse
+// preamble. One copy means a change to how a target is parsed -- or to how the
+// unpopulated-cache fallback behaves -- cannot land on two of the three scans and leave
+// the third selecting against a differently-parsed target.
+func (p *ManifestPDP) parsedTargetAt(i int) parsedTarget {
+	if len(p.parsedTargets) == len(p.caps) {
+		return p.parsedTargets[i]
+	}
+	tt, bare, err := capability.ParseTarget(p.caps[i].Target)
+	return parsedTarget{typ: tt, bare: bare, parseErr: err != nil}
 }
 
 // newConstraintScorer returns the shared constraint-selection tiebreak tracker
@@ -1383,16 +1456,8 @@ func (p *ManifestPDP) withForwardObligations(ctx context.Context, r capability.E
 // caller". Used only to fill obligations onto a forwarded no-match deny.
 func (p *ManifestPDP) directivesNamingTarget(target EnforceTarget) []capability.Directive {
 	var dirs []capability.Directive
-	useCache := len(p.parsedTargets) == len(p.caps)
 	for i := range p.caps {
-		var pt parsedTarget
-		if useCache {
-			pt = p.parsedTargets[i]
-		} else {
-			tt, bare, err := capability.ParseTarget(p.caps[i].Target)
-			pt = parsedTarget{typ: tt, bare: bare, parseErr: err != nil}
-		}
-		if pt.parseErr || pt.typ != target.Type || !matchBare(pt.bare, target.Name) {
+		if pt := p.parsedTargetAt(i); pt.parseErr || pt.typ != target.Type || !matchBare(pt.bare, target.Name) {
 			continue
 		}
 		dirs = append(dirs, p.caps[i].Directives...)
@@ -1407,16 +1472,8 @@ func (p *ManifestPDP) directivesNamingTarget(target EnforceTarget) []capability.
 // unspecified (the engine reorders into the canonical vocabulary). nil when nothing matches.
 func (p *ManifestPDP) matchingLabelOutputUnion(target EnforceTarget, claims map[string]interface{}) []string {
 	var set map[string]struct{}
-	useCache := len(p.parsedTargets) == len(p.caps)
 	for i := range p.caps {
-		var pt parsedTarget
-		if useCache {
-			pt = p.parsedTargets[i]
-		} else {
-			tt, bare, err := capability.ParseTarget(p.caps[i].Target)
-			pt = parsedTarget{typ: tt, bare: bare, parseErr: err != nil}
-		}
-		if pt.parseErr || pt.typ != target.Type || !matchBare(pt.bare, target.Name) {
+		if pt := p.parsedTargetAt(i); pt.parseErr || pt.typ != target.Type || !matchBare(pt.bare, target.Name) {
 			continue
 		}
 		if !p.caps[i].PrincipalMatches(claims) {
@@ -1969,7 +2026,19 @@ func scanToolEntry(raw json.RawMessage) toolEntryScan {
 		return toolEntryScan{untrustworthy: true}
 	}
 	if d, ok := tok.(json.Delim); !ok || d != '{' {
-		return toolEntryScan{untrustworthy: true} // not a JSON object
+		// Not a JSON object: null, a number, a string, a bool, or an array. The entry is
+		// still untrustworthy — it cannot decode into the hashed tool surface, so the
+		// filter must drop it — but unlike an entry whose bytes ABORTED the scan, its
+		// candidate-name set is knowably EMPTY, not unknown: none of these shapes carries
+		// a top-level "name", so a host renders no tool name from it and it cannot
+		// impersonate any pin. Mark the (empty) name set complete so the caller poisons
+		// nothing, rather than escalating a single null entry to a route-wide,
+		// sticky-to-process-exit poison of every pinned tool.
+		//
+		// The entries arrive as json.RawMessage elements of an already-unmarshaled array,
+		// so each is exactly one complete, well-formed JSON value: reading its first token
+		// is enough to classify it, with no trailing bytes left to hide anything.
+		return toolEntryScan{untrustworthy: true, namesComplete: true}
 	}
 	var out toolEntryScan
 	stack := []frame{{object: true, expectKey: true}}
@@ -2086,6 +2155,18 @@ func (p *ManifestPDP) recordPinnedToolHash(entry toolListEntry) {
 	}
 }
 
+// anyNamePinned reports whether any of names is pinned by the manifest. It reads
+// pinnedTools, which NewManifestPDP builds once and never mutates, so no lock is needed
+// (unlike the observed-hash and poison maps, which descMu guards).
+func (p *ManifestPDP) anyNamePinned(names []string) bool {
+	for _, n := range names {
+		if _, pinned := p.pinnedTools[n]; pinned {
+			return true
+		}
+	}
+	return false
+}
+
 // poisonCandidates sticky-poisons every pinned name an untrustworthy entry could present
 // to a host. Scoping the poison to the entry's own candidate names — rather than every pin
 // on the route — keeps the fail-closed property while bounding the blast radius: an
@@ -2138,7 +2219,9 @@ func (p *ManifestPDP) RecordObservedToolHashes(_ context.Context, result json.Ra
 //     entry cannot disable pins it never named. That narrowing holds only when the scan
 //     actually enumerated the entry's names; an entry whose bytes ABORTED the scan
 //     (malformed tokens, a non-string key, nesting past the depth bound) has an unknown
-//     name set, not an empty one, so it poisons every pin.
+//     name set, not an empty one, so it poisons every pin. A provably-non-object entry
+//     (null, a number, a string, an array) is the opposite case: it is untrustworthy and
+//     gets filtered out, but its name set is knowably EMPTY, so it poisons nothing.
 //   - An entry that will not decode into the hashed surface poisons just its own pin.
 //   - An ambiguous ENVELOPE — undecodable, an undecodable tools array, or a duplicate or
 //     case-variant "tools" key (Go keeps one array while a host may render the other) —
@@ -2195,6 +2278,16 @@ func (p *ManifestPDP) armPinsFromToolsList(result json.RawMessage) (entryCount i
 			p.poisonCandidates(scan.names)
 			continue
 		}
+		// Decide on the NAME before paying for the decode. The unmarshal below pulls in
+		// the entry's whole inputSchema -- by far the largest thing on this path -- and
+		// everything it feeds is gated on the name being pinned: recordPinnedToolHash
+		// looks the name up in pinnedTools, and the decode-failure branch poisons
+		// candidates that poisonCandidates would filter to the same empty set. The scan
+		// above already produced the name set, so an unpinned entry (the common case on
+		// any manifest that pins one tool out of fifty) can be skipped outright.
+		if !p.anyNamePinned(scan.names) {
+			continue
+		}
 		var entry toolListEntry
 		if err := json.Unmarshal(raw, &entry); err != nil {
 			// The name is trustworthy (the scan cleared it) but the entry will not decode
@@ -2236,10 +2329,17 @@ func toolsKeyAmbiguous(raw json.RawMessage) bool {
 		if !ok {
 			return true
 		}
-		if key == listKeyTools {
+		// capability.FoldJSONKey, not strings.EqualFold: EqualFold is Unicode simple
+		// folding too, so there is no live divergence today, but this scan and the
+		// JSON-RPC envelope scan exist to catch exactly the shape a weaker fold misses.
+		// Sharing the one folding rule the other layers use (rejectDuplicateJSONKeys,
+		// scanToolEntry, decodeOrderedObject) is what keeps them from drifting apart
+		// independently — which is how one of them ended up on strings.ToLower before.
+		switch {
+		case key == listKeyTools:
 			exact++
 			folded++
-		} else if strings.EqualFold(key, listKeyTools) {
+		case capability.FoldJSONKey(key) == listKeyToolsFolded:
 			folded++
 		}
 		var skip json.RawMessage

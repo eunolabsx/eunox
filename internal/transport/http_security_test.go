@@ -11,11 +11,13 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/pdp"
@@ -303,6 +305,7 @@ func TestSEC04_MaxBytesReader_Kill(t *testing.T) {
 	body := fmt.Sprintf(`{"sessionId":%q}`, big)
 
 	req := httptest.NewRequest(http.MethodPost, "/control/kill", strings.NewReader(body))
+	req.Header.Set("Content-Type", CTJSON)
 	// Simulate loopback so the IP check passes, and supply the control token so the
 	// request reaches the body-size check rather than stopping at auth.
 	req.RemoteAddr = "127.0.0.1:12345"
@@ -529,6 +532,7 @@ func TestSEC07_KillEndpoint_RequiresControlToken(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			body := `{"all":true}`
 			req := httptest.NewRequest(http.MethodPost, "/control/kill", strings.NewReader(body))
+			req.Header.Set("Content-Type", CTJSON)
 			req.RemoteAddr = "127.0.0.1:9999" // loopback — bypass IP check
 			req.Host = "127.0.0.1:9999"       // loopback Host so loopbackOnly's DNS-rebinding guard passes
 			if tc.token != "" {
@@ -554,6 +558,7 @@ func TestKillEndpoint_ControlTokenRequiredEvenWithoutAuthToken(t *testing.T) {
 
 	// No control-token header: rejected (was previously allowed-all).
 	req := httptest.NewRequest(http.MethodPost, "/control/kill", strings.NewReader(body))
+	req.Header.Set("Content-Type", CTJSON)
 	req.RemoteAddr = "127.0.0.1:9999"
 	req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	rr := httptest.NewRecorder()
@@ -564,6 +569,7 @@ func TestKillEndpoint_ControlTokenRequiredEvenWithoutAuthToken(t *testing.T) {
 
 	// Correct control-token header: accepted.
 	req = httptest.NewRequest(http.MethodPost, "/control/kill", strings.NewReader(body))
+	req.Header.Set("Content-Type", CTJSON)
 	req.RemoteAddr = "127.0.0.1:9999"
 	req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	req.Header.Set(ControlTokenHeader, testControlToken)
@@ -583,6 +589,7 @@ func TestSEC07_KillEndpoint_NoControlToken_FailsClosed(t *testing.T) {
 
 	body := `{"all":true}`
 	req := httptest.NewRequest(http.MethodPost, "/control/kill", strings.NewReader(body))
+	req.Header.Set("Content-Type", CTJSON)
 	req.RemoteAddr = "127.0.0.1:9999"
 	req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	req.Header.Set(ControlTokenHeader, "anything")
@@ -600,6 +607,7 @@ func TestSEC07_KillEndpoint_RemoteIP_Blocked(t *testing.T) {
 
 	body := `{"all":true}`
 	req := httptest.NewRequest(http.MethodPost, "/control/kill", strings.NewReader(body))
+	req.Header.Set("Content-Type", CTJSON)
 	req.RemoteAddr = "203.0.113.1:9999" // non-loopback
 	req.Header.Set(ControlTokenHeader, testControlToken)
 	rr := httptest.NewRecorder()
@@ -637,6 +645,7 @@ func TestKillEndpoint_TrustForwardedFor_XFFRejected(t *testing.T) {
 	proxy := newHTTPProxy(httpProxyOptions{Port: 3000, ControlToken: testControlToken, TrustFwdFor: true})
 
 	req := httptest.NewRequest(http.MethodPost, "/control/kill", strings.NewReader(`{"all":true}`))
+	req.Header.Set("Content-Type", CTJSON)
 	req.RemoteAddr = "127.0.0.1:9999" // loopback edge (the reverse proxy)
 	req.Host = "127.0.0.1:9999"       // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	req.Header.Set("X-Forwarded-For", "203.0.113.7")
@@ -657,6 +666,7 @@ func TestKillEndpoint_TrustForwardedFor_NoXFFAllowed(t *testing.T) {
 	proxy := newHTTPProxy(httpProxyOptions{Port: 3000, ControlToken: testControlToken, TrustFwdFor: true})
 
 	req := httptest.NewRequest(http.MethodPost, "/control/kill", strings.NewReader(`{"all":true}`))
+	req.Header.Set("Content-Type", CTJSON)
 	req.RemoteAddr = "127.0.0.1:9999"
 	req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	req.Header.Set(ControlTokenHeader, testControlToken)
@@ -764,4 +774,251 @@ func TestSEC05_NoPolicyWarning(t *testing.T) {
 	if httpReadTimeout == 0 {
 		t.Error("constants should be non-zero")
 	}
+}
+
+// TestAddClaimedSessionID_TruncatesOnRuneBoundary: the claimed_session_id bound is a BYTE
+// bound (it exists to cap what an attacker-controlled header appends to a record), but the
+// cut must not split a multi-byte rune. A byte-level slice leaves dangling continuation
+// bytes that json.Marshal rewrites to U+FFFD, so the signed value stops matching the raw
+// header a SIEM holds for the same request.
+func TestAddClaimedSessionID_TruncatesOnRuneBoundary(t *testing.T) {
+	t.Parallel()
+	// 3-byte runes: 200 is not a multiple of 3, so a byte-level cut at 200 lands mid-rune.
+	header := strings.Repeat("éé", maxClaimedSessionIDLen) // 2-byte runes, well over the cap
+	req := httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody)
+	req.Header.Set(SessionHeader, header)
+
+	details := addClaimedSessionID(nil, req)
+	claimed, _ := details["claimed_session_id"].(string)
+	if len(claimed) > maxClaimedSessionIDLen {
+		t.Fatalf("claimed length = %d bytes, want <= %d", len(claimed), maxClaimedSessionIDLen)
+	}
+	if !utf8.ValidString(claimed) {
+		t.Fatalf("truncated claimed_session_id is not valid UTF-8: %q", claimed)
+	}
+	if details["claimed_session_id_truncated"] != true {
+		t.Error("a truncated value must be flagged with claimed_session_id_truncated")
+	}
+	// Round-tripping through JSON must not rewrite anything: a mid-rune cut would show
+	// up here as a U+FFFD substitution, breaking correlation against the raw header.
+	encoded, err := json.Marshal(claimed)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var back string
+	if err := json.Unmarshal(encoded, &back); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if back != claimed {
+		t.Errorf("JSON round-trip changed the value: %q -> %q (a split rune was replaced)", claimed, back)
+	}
+	if !strings.HasPrefix(header, back) {
+		t.Errorf("truncated value %q is not a prefix of the raw header — correlation is broken", back)
+	}
+}
+
+// TestSanitizeClaimedID_Bounds pins the helper's edges: at/under the limit is returned
+// verbatim, an over-limit cut lands on a rune boundary, and a non-positive limit is empty.
+func TestSanitizeClaimedID_Bounds(t *testing.T) {
+	t.Parallel()
+	if got := sanitizeClaimedID("abc", 3); got != "abc" {
+		t.Errorf("sanitizeClaimedID(abc, 3) = %q, want abc", got)
+	}
+	if got := sanitizeClaimedID("abc", 10); got != "abc" {
+		t.Errorf("sanitizeClaimedID(abc, 10) = %q, want abc", got)
+	}
+	if got := sanitizeClaimedID("abc", 0); got != "" {
+		t.Errorf("sanitizeClaimedID(abc, 0) = %q, want empty", got)
+	}
+	// "é" is 2 bytes: a cut at 1 must drop it entirely rather than emit a half rune.
+	if got := sanitizeClaimedID("éx", 1); got != "" {
+		t.Errorf("sanitizeClaimedID(éx, 1) = %q, want empty (the only rune does not fit)", got)
+	}
+	if got := sanitizeClaimedID("aéx", 2); got != "a" {
+		t.Errorf("sanitizeClaimedID(aéx, 2) = %q, want a", got)
+	}
+}
+
+// TestSanitizeClaimedID_InvalidUTF8IsNotDiscarded is the regression a byte-cut-only fix
+// left open. Go's net/http admits bytes >= 0x80 in a header value, so an attacker picks
+// them: a header of all continuation bytes has no rune start anywhere, and a walk-back
+// applied to the RAW bytes retreats all the way to zero — stamping an empty
+// claimed_session_id on a request that carried a full-length header, which is strictly
+// worse than the plain byte slice it replaced. Sanitizing first bounds the walk-back to
+// one rune.
+func TestSanitizeClaimedID_InvalidUTF8IsNotDiscarded(t *testing.T) {
+	t.Parallel()
+	allContinuation := strings.Repeat("\x80", 300)
+	got := sanitizeClaimedID(allContinuation, maxClaimedSessionIDLen)
+	if got == "" {
+		t.Fatal("an all-continuation-byte header must not reduce to an empty claimed id")
+	}
+	if len(got) > maxClaimedSessionIDLen {
+		t.Errorf("length = %d bytes, want <= %d", len(got), maxClaimedSessionIDLen)
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("result is not valid UTF-8: %q", got)
+	}
+
+	// A leading invalid byte inside an otherwise-valid, UNDER-limit header is also
+	// normalized: json.Marshal would otherwise rewrite it at serialization time, so the
+	// signed value would differ from what this function returned either way.
+	short := "sess-\xff-id"
+	if got := sanitizeClaimedID(short, maxClaimedSessionIDLen); !utf8.ValidString(got) {
+		t.Errorf("short invalid header not normalized: %q", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// JSON-only body gate on the two POST endpoints
+// ---------------------------------------------------------------------------
+
+// TestRequireJSONContentType_MCPPost pins the Content-Type gate on POST /mcp.
+//
+// The property under test is that a body which is NOT labelled application/json never
+// reaches a handler — most importantly the sessionless initialize, which is the one
+// /mcp entry point carrying no custom header and therefore the one a browser can send
+// as a CORS simple request with no preflight. A rejected request must also leave no
+// upstream session behind: the refusal has to land before session establishment, not
+// after.
+func TestRequireJSONContentType_MCPPost(t *testing.T) {
+	initBody := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "initialize"}
+
+	cases := []struct {
+		name        string
+		contentType []string // one entry per header value; nil sends no header at all
+		wantStatus  int
+	}{
+		{"absent header fails closed", nil, http.StatusUnsupportedMediaType},
+		{"empty value", []string{""}, http.StatusUnsupportedMediaType},
+		// The CORS simple-request content types: none may reach a handler.
+		{"text/plain (simple request)", []string{"text/plain"}, http.StatusUnsupportedMediaType},
+		{"form-urlencoded (simple request)", []string{"application/x-www-form-urlencoded"}, http.StatusUnsupportedMediaType},
+		{"multipart/form-data (simple request)", []string{"multipart/form-data; boundary=x"}, http.StatusUnsupportedMediaType},
+		{"unparseable media type", []string{"application/json;;"}, http.StatusUnsupportedMediaType},
+		{"near-miss subtype", []string{"application/json-rpc"}, http.StatusUnsupportedMediaType},
+		{"duplicated header", []string{"text/plain", CTJSON}, http.StatusUnsupportedMediaType},
+		{"json", []string{CTJSON}, http.StatusOK},
+		{"json with charset parameter", []string{"application/json; charset=utf-8"}, http.StatusOK},
+		{"json case-variant", []string{"Application/JSON"}, http.StatusOK},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fu := newFakeUpstream()
+			fakeServer := httptest.NewServer(fu)
+			defer fakeServer.Close()
+			proxy, srv := newTestRemoteProxy(t, fakeServer.URL, httpProxyOptions{})
+
+			data, err := json.Marshal(initBody)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL+"/mcp", bytes.NewReader(data))
+			if err != nil {
+				t.Fatalf("build request: %v", err)
+			}
+			req.Header.Del("Content-Type")
+			for _, v := range tc.contentType {
+				req.Header.Add("Content-Type", v)
+			}
+			resp, err := testHTTPClient.Do(req)
+			if err != nil {
+				t.Fatalf("do request: %v", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+
+			if resp.StatusCode != tc.wantStatus {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want %d (body=%q)", resp.StatusCode, tc.wantStatus, body)
+			}
+			// A refused POST must not have spawned an upstream session: the gate runs
+			// ahead of session establishment, so a blind-spawn attempt costs nothing.
+			proxy.mu.Lock()
+			sessions := len(proxy.sessions)
+			proxy.mu.Unlock()
+			wantSessions := 0
+			if tc.wantStatus == http.StatusOK {
+				wantSessions = 1
+			}
+			if sessions != wantSessions {
+				t.Errorf("session count = %d, want %d", sessions, wantSessions)
+			}
+		})
+	}
+}
+
+// TestRequireJSONContentType_Kill pins the same gate on the emergency-stop endpoint,
+// and its ORDER relative to the control-token check: a caller without the token must
+// still get 401, so the 415 never becomes an oracle for what the endpoint accepts.
+func TestRequireJSONContentType_Kill(t *testing.T) {
+	t.Parallel()
+
+	newKillRequest := func(contentType string) *http.Request {
+		req := httptest.NewRequest(http.MethodPost, "/control/kill", strings.NewReader(`{"all":true}`))
+		req.Header.Del("Content-Type")
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
+		}
+		req.RemoteAddr = "127.0.0.1:9999"
+		req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
+		return req
+	}
+
+	t.Run("non-JSON body is refused", func(t *testing.T) {
+		proxy := newHTTPProxy(httpProxyOptions{Port: 3000, ControlToken: testControlToken})
+		req := newKillRequest("text/plain")
+		req.Header.Set(ControlTokenHeader, testControlToken)
+		rr := httptest.NewRecorder()
+		proxy.handleKill(rr, req)
+		if rr.Code != http.StatusUnsupportedMediaType {
+			t.Errorf("status = %d, want 415 (body=%q)", rr.Code, rr.Body.String())
+		}
+		status, err := proxy.ks.Status(context.Background())
+		if err != nil {
+			t.Fatalf("Status: %v", err)
+		}
+		if status.GlobalActive {
+			t.Error("a refused /control/kill must not have activated the global kill switch")
+		}
+	})
+
+	t.Run("missing header fails closed", func(t *testing.T) {
+		proxy := newHTTPProxy(httpProxyOptions{Port: 3000, ControlToken: testControlToken})
+		req := newKillRequest("")
+		req.Header.Set(ControlTokenHeader, testControlToken)
+		rr := httptest.NewRecorder()
+		proxy.handleKill(rr, req)
+		if rr.Code != http.StatusUnsupportedMediaType {
+			t.Errorf("status = %d, want 415", rr.Code)
+		}
+	})
+
+	t.Run("control token is checked first", func(t *testing.T) {
+		proxy := newHTTPProxy(httpProxyOptions{Port: 3000, ControlToken: testControlToken})
+		req := newKillRequest("text/plain") // would 415, but carries no control token
+		rr := httptest.NewRecorder()
+		proxy.handleKill(rr, req)
+		if rr.Code != http.StatusUnauthorized {
+			t.Errorf("status = %d, want 401 (the control-token gate must run before the body gate)", rr.Code)
+		}
+	})
+
+	t.Run("json is accepted", func(t *testing.T) {
+		proxy := newHTTPProxy(httpProxyOptions{Port: 3000, ControlToken: testControlToken})
+		req := newKillRequest("application/json; charset=utf-8")
+		req.Header.Set(ControlTokenHeader, testControlToken)
+		rr := httptest.NewRecorder()
+		proxy.handleKill(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (body=%q)", rr.Code, rr.Body.String())
+		}
+		status, err := proxy.ks.Status(context.Background())
+		if err != nil {
+			t.Fatalf("Status: %v", err)
+		}
+		if !status.GlobalActive {
+			t.Error("an accepted /control/kill {\"all\":true} must activate the global kill switch")
+		}
+	})
 }

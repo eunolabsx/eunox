@@ -207,6 +207,7 @@ func TestHTTPHandleKill_InvalidJSON(t *testing.T) {
 	t.Parallel()
 	proxy := &HTTPProxy{sessions: make(map[string]*httpSession), controlToken: testControlToken}
 	req := httptest.NewRequest(http.MethodPost, "/control/kill", bytes.NewBufferString("bad json"))
+	req.Header.Set("Content-Type", CTJSON)
 	req.RemoteAddr = "127.0.0.1:9999"
 	req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	req.Header.Set(ControlTokenHeader, testControlToken)
@@ -222,6 +223,7 @@ func TestHTTPHandleKill_NoSessionIDOrAll(t *testing.T) {
 	proxy := &HTTPProxy{sessions: make(map[string]*httpSession), controlToken: testControlToken}
 	body := `{"sessionId":"","all":false}`
 	req := httptest.NewRequest(http.MethodPost, "/control/kill", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", CTJSON)
 	req.RemoteAddr = "127.0.0.1:9999"
 	req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	req.Header.Set(ControlTokenHeader, testControlToken)
@@ -242,6 +244,7 @@ func TestHTTPHandleKill_RejectsTrailingJSONTokens(t *testing.T) {
 	proxy := &HTTPProxy{sessions: make(map[string]*httpSession), controlToken: testControlToken, ks: killswitch.NewInMemory()}
 	body := `{"sessionId":"s1"} {"all":true}`
 	req := httptest.NewRequest(http.MethodPost, "/control/kill", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", CTJSON)
 	req.RemoteAddr = "127.0.0.1:9999"
 	req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	req.Header.Set(ControlTokenHeader, testControlToken)
@@ -290,6 +293,7 @@ func TestHTTPHandleKill_ActivateGlobalErrorPropagated(t *testing.T) {
 	t.Parallel()
 	proxy := &HTTPProxy{sessions: make(map[string]*httpSession), ks: killWriteErrSwitch{}, controlToken: testControlToken}
 	req := httptest.NewRequest(http.MethodPost, "/control/kill", bytes.NewBufferString(`{"all":true}`))
+	req.Header.Set("Content-Type", CTJSON)
 	req.RemoteAddr = "127.0.0.1:9999"
 	req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	req.Header.Set(ControlTokenHeader, testControlToken)
@@ -312,6 +316,7 @@ func TestHTTPHandleKill_KillSessionErrorPropagated(t *testing.T) {
 	t.Parallel()
 	proxy := &HTTPProxy{sessions: make(map[string]*httpSession), ks: killWriteErrSwitch{}, controlToken: testControlToken}
 	req := httptest.NewRequest(http.MethodPost, "/control/kill", bytes.NewBufferString(`{"sessionId":"s1"}`))
+	req.Header.Set("Content-Type", CTJSON)
 	req.RemoteAddr = "127.0.0.1:9999"
 	req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	req.Header.Set(ControlTokenHeader, testControlToken)
@@ -336,6 +341,7 @@ func TestHTTPHandleKill_GlobalKill_NoWiretapCaveat(t *testing.T) {
 		routes:       map[string]*UpstreamRoute{"wiretap": {name: "wiretap", pdp: pdp.NewAlwaysAllowPDP(ks)}},
 	}
 	req := httptest.NewRequest(http.MethodPost, "/control/kill", bytes.NewBufferString(`{"all":true}`))
+	req.Header.Set("Content-Type", CTJSON)
 	req.RemoteAddr = "127.0.0.1:9999"
 	req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	req.Header.Set(ControlTokenHeader, testControlToken)
@@ -380,6 +386,7 @@ func TestHTTPHandleKill_ReclaimsSlotWithIdleReapingDisabled(t *testing.T) {
 			maxSessions:   1,
 		}
 		req := httptest.NewRequest(http.MethodPost, "/control/kill", bytes.NewBufferString(`{"sessionId":"s1"}`))
+		req.Header.Set("Content-Type", CTJSON)
 		req.RemoteAddr = "127.0.0.1:9999"
 		req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 		req.Header.Set(ControlTokenHeader, testControlToken)
@@ -402,6 +409,7 @@ func TestHTTPHandleKill_ReclaimsSlotWithIdleReapingDisabled(t *testing.T) {
 			sessionIdleMs: 0,
 		}
 		req := httptest.NewRequest(http.MethodPost, "/control/kill", bytes.NewBufferString(`{"all":true}`))
+		req.Header.Set("Content-Type", CTJSON)
 		req.RemoteAddr = "127.0.0.1:9999"
 		req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 		req.Header.Set(ControlTokenHeader, testControlToken)
@@ -428,6 +436,7 @@ func TestHTTPHandleKill_PerSession_NoWiretapCaveat(t *testing.T) {
 		routes:       map[string]*UpstreamRoute{"wiretap": {name: "wiretap", pdp: pdp.NewAlwaysAllowPDP(ks)}},
 	}
 	req := httptest.NewRequest(http.MethodPost, "/control/kill", bytes.NewBufferString(`{"sessionId":"sess-7"}`))
+	req.Header.Set("Content-Type", CTJSON)
 	req.RemoteAddr = "127.0.0.1:9999"
 	req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	req.Header.Set(ControlTokenHeader, testControlToken)
@@ -781,6 +790,7 @@ func TestHTTPHandleKill_NonLoopback(t *testing.T) {
 	proxy := &HTTPProxy{sessions: make(map[string]*httpSession)}
 	body := `{"all":true}`
 	req := httptest.NewRequest(http.MethodPost, "/control/kill", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", CTJSON)
 	req.RemoteAddr = "192.168.1.100:9999" // non-loopback → forbidden
 	w := httptest.NewRecorder()
 	proxy.handleKill(w, req)
@@ -2268,6 +2278,7 @@ func TestHTTPSamplingRoundTrip_HostResponseRoutedToUpstream(t *testing.T) {
 	// Host POSTs its response (same ID) back to /mcp.
 	body := `{"jsonrpc":"2.0","id":5,"result":{"role":"assistant","content":{"type":"text","text":"hi"}}}`
 	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+	req.Header.Set("Content-Type", CTJSON)
 	req.Header.Set(SessionHeader, "rt-sess")
 	w := httptest.NewRecorder()
 	proxy.handleMCPPost(w, req, rt)
@@ -2391,6 +2402,7 @@ func TestHTTPHandleMCPPost_UntrackedResponseIgnored(t *testing.T) {
 
 	body := `{"jsonrpc":"2.0","id":999,"result":{}}`
 	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+	req.Header.Set("Content-Type", CTJSON)
 	req.Header.Set(SessionHeader, "rt-sess2")
 	w := httptest.NewRecorder()
 	proxy.handleMCPPost(w, req, rt)
@@ -2436,6 +2448,7 @@ func TestHTTPHandleSessionPost_KilledServerResponseRecordsDeny(t *testing.T) {
 
 	body := `{"jsonrpc":"2.0","id":5,"result":{}}`
 	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+	req.Header.Set("Content-Type", CTJSON)
 	req.Header.Set(SessionHeader, "kill-sess")
 	w := httptest.NewRecorder()
 	proxy.handleMCPPost(w, req, rt)
@@ -2484,6 +2497,7 @@ func TestHTTPHandleSessionPost_ReapedKilledServerResponseTagsServerResponseLeg(t
 
 	body := `{"jsonrpc":"2.0","id":5,"result":{}}`
 	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+	req.Header.Set("Content-Type", CTJSON)
 	req.Header.Set(SessionHeader, "reaped-sess")
 	w := httptest.NewRecorder()
 	proxy.handleMCPPost(w, req, rt)
@@ -2524,6 +2538,7 @@ func TestHTTPHandleSessionPost_ReapedKilledNotificationTagsNotificationLeg(t *te
 
 	body := `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{}}`
 	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+	req.Header.Set("Content-Type", CTJSON)
 	req.Header.Set(SessionHeader, "reaped-sess2")
 	w := httptest.NewRecorder()
 	proxy.handleMCPPost(w, req, rt)
@@ -2705,6 +2720,7 @@ func TestHTTPHandleMCPPost_RemoteModeServerResponseWarnsAndUntracks(t *testing.T
 
 	body := `{"jsonrpc":"2.0","id":42,"result":{}}`
 	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+	req.Header.Set("Content-Type", CTJSON)
 	req.Header.Set(SessionHeader, "remote-sess")
 	rec := httptest.NewRecorder()
 	proxy.handleMCPPost(rec, req, rt)
@@ -3235,6 +3251,7 @@ func TestHTTPInitialize_GlobalKill_RefusesSessionCreation(t *testing.T) {
 
 	body := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`
 	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+	req.Header.Set("Content-Type", CTJSON)
 	w := httptest.NewRecorder()
 	proxy.handleMCPPost(w, req, route)
 
@@ -3879,6 +3896,7 @@ func TestHTTPInitialize_StrictAuditDegraded_RefusesSessionCreation(t *testing.T)
 
 	body := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`
 	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+	req.Header.Set("Content-Type", CTJSON)
 	w := httptest.NewRecorder()
 	proxy.handleMCPPost(w, req, route)
 
@@ -4270,6 +4288,7 @@ func TestHTTPHandleSessionPost_EnforcedMethodNotificationDenied(t *testing.T) {
 
 			body := fmt.Sprintf(`{"jsonrpc":"2.0","method":%q,"params":{"name":"delete_all","arguments":{},"uri":"file:///x"}}`, method)
 			req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+			req.Header.Set("Content-Type", CTJSON)
 			req.Header.Set(SessionHeader, "notif-bypass-sess")
 			w := httptest.NewRecorder()
 			proxy.handleMCPPost(w, req, rt)
@@ -4321,6 +4340,7 @@ func TestHTTPHandleSessionPost_UnmappedNotificationDeniedAndRecorded(t *testing.
 	const method = "tools/uninstall"
 	body := fmt.Sprintf(`{"jsonrpc":"2.0","method":%q,"params":{}}`, method)
 	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+	req.Header.Set("Content-Type", CTJSON)
 	req.Header.Set(SessionHeader, "unmapped-notif-sess")
 	w := httptest.NewRecorder()
 	proxy.handleMCPPost(w, req, rt)
@@ -4372,6 +4392,7 @@ func TestHTTPHandleSessionPost_MidSessionInitializeSwallowed(t *testing.T) {
 
 	body := `{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2025-06-18"}}`
 	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+	req.Header.Set("Content-Type", CTJSON)
 	req.Header.Set(SessionHeader, "mid-session-init-sess")
 	w := httptest.NewRecorder()
 	proxy.handleMCPPost(w, req, rt)

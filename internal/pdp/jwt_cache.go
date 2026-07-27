@@ -9,14 +9,22 @@ import (
 	"github.com/eunolabs/eunox/pkg/capability"
 )
 
-// Verified-token cache defaults. The TTL bounds how long a token's already-verified
-// claims are reused before full re-verification; the 30s default matches the
-// Redis kill-switch propagation window, so a revoked token is not trusted from
-// cache materially longer than a kill takes to propagate. The max size bounds
-// memory under a churn of distinct tokens.
+// Verified-token cache bounds. The TTL bounds how long a token's already-verified
+// claims are reused before full re-verification; 30s matches the Redis kill-switch
+// propagation window, so a revoked token is not trusted from cache materially longer
+// than a kill takes to propagate. The max size bounds memory under a churn of distinct
+// tokens.
+//
+// These are FIXED, not defaults: no JWTPDPOptions field overrides them, unlike the
+// JWKS cache's operator-settable CacheTTL. The asymmetry is deliberate — this window
+// is what extends trust in an already-verified token, and it is already bounded from
+// both ends (capped by the token's own exp, and the kill switch, per-route audience,
+// and manifest policy are re-checked on every call regardless of a cache hit). See the
+// CacheTTL doc in jwt.go, which points here so the distinction is visible from the
+// option an operator actually sets.
 const (
-	defaultJWTCacheTTL     = 30 * time.Second
-	defaultJWTCacheMaxSize = 4096
+	jwtTokenCacheTTL     = 30 * time.Second
+	jwtTokenCacheMaxSize = 4096
 )
 
 // newJWTTokenCache builds the verified-token cache for a JWTPDP validator: the shared
@@ -41,8 +49,8 @@ const (
 // lifetime.
 func newJWTTokenCache(now func() time.Time) *capability.PayloadCache[*JWTClaims] {
 	return capability.NewPayloadCache(capability.PayloadCacheConfig[*JWTClaims]{
-		MaxEntryTTL: defaultJWTCacheTTL,
-		MaxSize:     defaultJWTCacheMaxSize,
+		MaxEntryTTL: jwtTokenCacheTTL,
+		MaxSize:     jwtTokenCacheMaxSize,
 		Now:         now,
 		Clone:       func(c *JWTClaims) (*JWTClaims, bool) { return c, c != nil },
 	})

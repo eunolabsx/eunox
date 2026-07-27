@@ -5,6 +5,7 @@ package audit
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -189,11 +190,25 @@ func TestOpen_EmptyBaseFallsBackToSiblingTail(t *testing.T) {
 	dir := t.TempDir()
 	base := filepath.Join(dir, "audit.jsonl")
 	keyPath := filepath.Join(dir, "audit.key")
-	if err := os.WriteFile(base, nil, 0o600); err != nil { // empty base
-		t.Fatal(err)
+
+	// Build a real signed chain (seq 1..2), then rotate it aside by hand: the sibling
+	// now holds the true, verifiable tail and the base is empty — the just-rotated
+	// signature. A hand-written unsigned sibling would not work here (and would not
+	// test the fallback): an unsigned tail is never resumed onto.
+	first, err := Open(base, keyPath, 0, 0)
+	if err != nil {
+		t.Fatalf("Open (seed): %v", err)
+	}
+	first.RecordAllow(context.Background(), "sess", "a", "tools/call", nil, nil, false, nil, nil)
+	first.RecordAllow(context.Background(), "sess", "b", "tools/call", nil, nil, false, nil, nil)
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close (seed): %v", err)
 	}
 	sib := base + ".20250101T000000.000000000Z"
-	if err := os.WriteFile(sib, []byte(`{"seq":41}`+"\n"+`{"seq":42}`+"\n"), 0o600); err != nil {
+	if err := os.Rename(base, sib); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(base, nil, 0o600); err != nil { // empty base
 		t.Fatal(err)
 	}
 
@@ -202,11 +217,10 @@ func TestOpen_EmptyBaseFallsBackToSiblingTail(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	t.Cleanup(func() { _ = sink.Close() })
-	// The sibling tail is unsigned (pre-chain), so the resume adopts its seq 42 and
-	// then the legacy_tail_resumed marker consumes 43. Either way the point stands:
-	// the counter continued from the sibling instead of restarting at genesis.
-	if sink.seq != 43 {
-		t.Fatalf("resumed seq = %d, want 43 (sibling tail seq 42, plus the legacy-resume marker)", sink.seq)
+	// The sibling tail verified, so the counter continued from it (seq 2) instead of
+	// restarting at genesis and reissuing seqs the sibling already holds.
+	if sink.seq != 2 {
+		t.Fatalf("resumed seq = %d, want 2 (the sibling's verified tail)", sink.seq)
 	}
 }
 
@@ -419,5 +433,130 @@ func TestOpen_ResumesFromTailAfterPartialWriteRecovery(t *testing.T) {
 	}
 	if !bytes.Contains(data, []byte("tail_partial_write_recovered")) {
 		t.Fatalf("expected a tail_partial_write_recovered marker; log:\n%s", data)
+	}
+}
+
+// TestSeedSeqPastOnDiskMax_ClampsImplausibleOnDiskSeq is the seq-wrap regression: the
+// reseed folds on-disk seq values that were never HMAC-verified, so a planted maximal
+// seq must not be adopted verbatim. Honoring it would leave the counter one short of the
+// uint64 ceiling, and the very next write would wrap to 0 and reissue the genesis seq — a
+// duplicate-seq cascade audit-verify cannot distinguish from tampering.
+func TestSeedSeqPastOnDiskMax_ClampsImplausibleOnDiskSeq(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+	if err := os.WriteFile(logPath, []byte(`{"seq":18446744073709551615}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write planted log: %v", err)
+	}
+	s := &Sink{logPath: logPath}
+	if bounded := s.seedSeqPastOnDiskMax(); !bounded {
+		t.Fatal("seedSeqPastOnDiskMax must report bounded=true when the log directory listed cleanly")
+	}
+	if s.seq != maxSeedableSeq {
+		t.Fatalf("seeded seq = %d, want the clamp %d — an unverified on-disk seq must never seed the counter into the wrap zone", s.seq, maxSeedableSeq)
+	}
+	if s.seq+1 == 0 {
+		t.Fatal("the seeded counter must leave headroom for the next seq without wrapping")
+	}
+}
+
+// TestWriteRecord_RefusesToWrapSeq: with the counter one short of the uint64 ceiling,
+// writeRecord must refuse and count the loss rather than stamp seq 0 onto the record. A
+// counted, warned gap is recoverable; a silently renumbered chain is not.
+func TestWriteRecord_RefusesToWrapSeq(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+	keyPath := filepath.Join(dir, "audit.key")
+	sink, err := Open(logPath, keyPath, 0, 0)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = sink.Close() })
+
+	// Open is single-threaded here and the drainer only touches seq from writeRecord,
+	// so driving the counter directly is safe before any record is enqueued.
+	sink.seq = ^uint64(0)
+	before := sink.WriteFailures()
+	sink.writeRecord(&auditRecord{Decision: "allow", RequestID: "wrap-guard"})
+	if sink.seq != ^uint64(0) {
+		t.Fatalf("seq = %d, want the counter left untouched at the ceiling", sink.seq)
+	}
+	if got := sink.WriteFailures(); got != before+1 {
+		t.Fatalf("WriteFailures = %d, want %d — the refused record must be counted as a loss", got, before+1)
+	}
+	data, err := os.ReadFile(logPath) //nolint:gosec // G304: test-controlled path
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if bytes.Contains(data, []byte(`"seq":0`)) {
+		t.Fatalf("a wrapped seq 0 record was written; log:\n%s", data)
+	}
+}
+
+// TestOpen_UnlistableLogDirMarksSeedUnbounded: when the log directory cannot be listed,
+// the reseed sees only the base log and cannot bound the rotated siblings' seqs, so new
+// records may collide with seqs those files already hold. That uncertainty must reach the
+// signed tape as seed_unbounded rather than being presented as a confident reseed.
+// Permission-based, so skipped under root.
+func TestOpen_UnlistableLogDirMarksSeedUnbounded(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root bypasses file permission bits")
+	}
+	dir := t.TempDir()
+	logDir := filepath.Join(dir, "logs")
+	if err := os.Mkdir(logDir, 0o700); err != nil {
+		t.Fatalf("mkdir log dir: %v", err)
+	}
+	logPath := filepath.Join(logDir, "audit.jsonl")
+	keyPath := filepath.Join(dir, "audit.key")
+	// Write-only base: the tail cannot be probed, so Open takes the reseed path.
+	if err := os.WriteFile(logPath, []byte(`{"seq":5,"_hmac":"sha256:abc"}`+"\n"), 0o200); err != nil {
+		t.Fatalf("write write-only log: %v", err)
+	}
+	// Write+execute but not read: files in the directory can still be opened and
+	// created by name, but the directory itself cannot be listed.
+	if err := os.Chmod(logDir, 0o300); err != nil {
+		t.Fatalf("chmod log dir: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(logDir, 0o700)
+		_ = os.Chmod(logPath, 0o600)
+	})
+
+	sink, err := Open(logPath, keyPath, 0, 0)
+	if err != nil {
+		t.Fatalf("Open must succeed (audit-failure tradeoff), got %v", err)
+	}
+	if err := sink.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if err := os.Chmod(logDir, 0o700); err != nil {
+		t.Fatalf("chmod log dir for readback: %v", err)
+	}
+	if err := os.Chmod(logPath, 0o600); err != nil {
+		t.Fatalf("chmod for readback: %v", err)
+	}
+	data, err := os.ReadFile(logPath) //nolint:gosec // G304: test-controlled path
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	var marker map[string]interface{}
+	for _, line := range bytes.Split(bytes.TrimSpace(data), []byte("\n")) {
+		var rec map[string]interface{}
+		if json.Unmarshal(line, &rec) != nil {
+			continue
+		}
+		details, _ := rec["details"].(map[string]interface{})
+		if details["kind"] == "chain_resume_failed" {
+			marker = details
+		}
+	}
+	if marker == nil {
+		t.Fatalf("no chain_resume_failed marker was appended; log:\n%s", data)
+	}
+	if marker["seed_unbounded"] != true {
+		t.Fatalf("marker details = %v, want seed_unbounded=true when the log directory cannot be listed", marker)
 	}
 }

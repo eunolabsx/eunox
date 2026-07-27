@@ -67,6 +67,7 @@ Flags:
 	redisAddr := fs.String("redis-addr", "", "Redis address (host:port). When set, the kill is written to the shared\nRedis kill-switch state instead of an HTTP endpoint — the only way to\nrevoke a stdio proxy started with --redis-addr.")
 	redisPassword := fs.String("redis-password", "", "Password for the Redis server (used with --redis-addr). Prefer the\nEUNOX_REDIS_PASSWORD env var; a non-empty flag value takes precedence over\nit, but leaving the flag empty does NOT override a set env var.")
 	redisTLS := fs.Bool("redis-tls", false, "Use TLS for the Redis connection (used with --redis-addr).")
+	sessionKillTTL := fs.Duration("killswitch-session-ttl", 0, "How long this SESSION kill survives in Redis before it is garbage collected\n(default 720h / 30 days). MUST match the value the proxy runs with: the TTL is\napplied by whichever process writes the tombstone, so a proxy started with a\nlonger (or negative, never-expiring) value does not extend a kill issued here.\nWhen the tombstone expires the kill is LIFTED. Negative disables expiry.\nIgnored for the 'all' target and without --redis-addr.")
 	controlToken := fs.String("control-token", "", "Control token for the HTTP /control/kill endpoint. If empty, read from\nEUNOX_CONTROL_TOKEN or --control-token-path (default ~/.eunox/control.token),\nwhere the running proxy wrote it.")
 	controlTokenPath := fs.String("control-token-path", "", "Path to the control-token file the proxy wrote (default ~/.eunox/control.token).\nUsed when --control-token and EUNOX_CONTROL_TOKEN are unset.")
 
@@ -108,7 +109,7 @@ Flags:
 				return 1
 			}
 		}
-		if err := killViaRedis(*redisAddr, resolveRedisPassword(*redisPassword), *redisTLS, target); err != nil {
+		if err := killViaRedis(*redisAddr, resolveRedisPassword(*redisPassword), *redisTLS, *sessionKillTTL, target); err != nil {
 			fmt.Fprintf(os.Stderr, "eunox kill: %v\n", err)
 			return 1
 		}
@@ -172,7 +173,7 @@ Flags:
 // notified via pub/sub, and any instance that missed the at-most-once message
 // converges on its next reconcile tick. The only out-of-band revocation channel
 // for a stdio proxy.
-func killViaRedis(addr, password string, useTLS bool, target string) error {
+func killViaRedis(addr, password string, useTLS bool, sessionKillTTL time.Duration, target string) error {
 	rdb, err := buildRedisClient(addr, password, useTLS)
 	if err != nil {
 		return fmt.Errorf("redis client: %w", err)
@@ -185,7 +186,13 @@ func killViaRedis(addr, password string, useTLS bool, target string) error {
 		return err
 	}
 
-	ks := killswitch.NewRedis(rdb)
+	// The tombstone's TTL is set by whichever process WRITES the key, and this command is
+	// the only out-of-band revocation channel a stdio proxy has — the very deployment
+	// --killswitch-session-ttl exists for. Building the manager without the option here
+	// would silently stamp the 30-day default on a kill an operator running the proxy with
+	// a longer or never-expiring TTL believes is permanent, and the session would be
+	// re-admitted the day it expired.
+	ks := killswitch.NewRedis(rdb, killswitch.WithSessionKillTTL(sessionKillTTL))
 	if target == "all" {
 		if err := ks.ActivateGlobal(ctx); err != nil {
 			return fmt.Errorf("activate global kill switch: %w", err)

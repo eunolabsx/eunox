@@ -210,3 +210,175 @@ func TestResolveControlToken_EmptyFile_Errors(t *testing.T) {
 		t.Fatal("expected error for empty token file")
 	}
 }
+
+// TestWriteControlTokenFile_TightensEunoxOwnedDir is the upgrade regression: eunox's own
+// control-token directory (the default ~/.eunox) left at 0755 by an older version must be
+// tightened back to 0700, not merely warned about. Nothing else writes that directory, so
+// there is no shared-use case a chmod could break.
+func TestWriteControlTokenFile_TightensEunoxOwnedDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir := filepath.Join(home, ".eunox")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// The upgrade shape: an older version left this directory group/world-readable.
+	// Chmod explicitly, since Mkdir's mode is umask-masked.
+	if err := os.Chmod(dir, 0o755); err != nil { //nolint:gosec // test fixture: deliberately loose mode
+		t.Fatal(err)
+	}
+
+	if _, err := WriteControlTokenFile("", "tok"); err != nil {
+		t.Fatalf("WriteControlTokenFile: %v", err)
+	}
+
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o700 {
+		t.Errorf("directory mode = %o, want 0700 — eunox's own control-token directory must be tightened, not just warned about", perm)
+	}
+}
+
+// TestWriteControlTokenFile_RefusesWorldWritableOperatorDir: eunox must not chmod a
+// directory the operator chose (doing so would strip /tmp's sticky bit), but it must also
+// not drop the emergency-stop credential into a directory any local user can rename files
+// in — they could substitute their own token and take over /control/kill. Fail closed.
+func TestWriteControlTokenFile_RefusesWorldWritableOperatorDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "shared")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Chmod explicitly: Mkdir's mode is masked by the process umask, so 0777 there
+	// commonly lands as 0755 and the test would assert nothing.
+	if err := os.Chmod(dir, 0o777); err != nil { //nolint:gosec // test fixture: deliberately loose mode
+		t.Fatal(err)
+	}
+
+	_, err := WriteControlTokenFile(filepath.Join(dir, "control.token"), "tok")
+	if err == nil {
+		t.Fatal("expected a fail-closed error for a world-writable, non-sticky control-token directory")
+	}
+	if !strings.Contains(err.Error(), "writable") {
+		t.Errorf("error = %v, want it to name the writable directory", err)
+	}
+}
+
+// TestWriteControlTokenFile_AllowsStickyOperatorDir: /tmp is 1777, and the sticky bit is
+// exactly what stops another user renaming the token file away, so a sticky directory
+// must still be usable (warned about, not refused).
+func TestWriteControlTokenFile_AllowsStickyOperatorDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "tmplike")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// 1777, the /tmp shape. Set via Chmod because Mkdir's mode is umask-masked.
+	if err := os.Chmod(dir, 0o777|os.ModeSticky); err != nil { //nolint:gosec // test fixture: deliberately loose mode
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(dir, "control.token")
+	if _, err := WriteControlTokenFile(path, "tok"); err != nil {
+		t.Fatalf("a sticky world-writable directory must remain usable, got %v", err)
+	}
+	got, err := ResolveControlToken("", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "tok" {
+		t.Errorf("token = %q, want tok", got)
+	}
+}
+
+// TestWriteControlTokenFile_WarnsButAllowsReadableOperatorDir: a 0755 operator-chosen
+// directory leaves the 0600 token file unreadable to others, so it stays a warning.
+func TestWriteControlTokenFile_WarnsButAllowsReadableOperatorDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "readable")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Chmod explicitly: Mkdir's mode is umask-masked, so the fixture must set it.
+	if err := os.Chmod(dir, 0o755); err != nil { //nolint:gosec // test fixture: deliberately loose mode
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(dir, "control.token")
+	if _, err := WriteControlTokenFile(path, "tok"); err != nil {
+		t.Fatalf("a group/world-readable operator directory must remain usable, got %v", err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o755 {
+		t.Errorf("directory mode = %o, want 0755 left untouched — eunox must not chmod a directory the operator chose", perm)
+	}
+}
+
+// TestWriteControlTokenFile_NeverChmodsThroughSymlink: os.Chmod follows symlinks and
+// there is no portable lchmod, so tightening a symlinked ~/.eunox would rewrite the mode
+// of whatever it points at. The classic shape is an operator (or an attacker with write
+// access to a shared home) linking ~/.eunox at a directory eunox does not own; chmod'ing
+// it to 0700 would strip that directory's own access system-wide.
+func TestWriteControlTokenFile_NeverChmodsThroughSymlink(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	target := filepath.Join(home, "shared")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// 1777, the /tmp shape: sticky, so it passes the writable refusal and would reach
+	// the chmod if the symlink were not detected.
+	if err := os.Chmod(target, 0o777|os.ModeSticky); err != nil { //nolint:gosec // test fixture: deliberately loose mode
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(home, ".eunox")); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := WriteControlTokenFile("", "tok"); err != nil {
+		t.Fatalf("a symlinked control-token directory must remain usable, got %v", err)
+	}
+
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o777 {
+		t.Errorf("symlink target mode = %o, want 0777 untouched — eunox must never chmod through a link", perm)
+	}
+	if info.Mode()&os.ModeSticky == 0 {
+		t.Error("the symlink target lost its sticky bit: the chmod fired through the link")
+	}
+}
+
+// TestWriteControlTokenFile_TightensDefaultDirSpelledAbsolutely: "eunox's own directory"
+// is a location, not a spelling. A systemd unit cannot write "~", and an interactive
+// shell expands it before eunox sees the argument — so keying the upgrade repair on the
+// raw flag string skipped exactly the deployments most likely to need it.
+func TestWriteControlTokenFile_TightensDefaultDirSpelledAbsolutely(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir := filepath.Join(home, ".eunox")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil { //nolint:gosec // test fixture: deliberately loose mode
+		t.Fatal(err)
+	}
+
+	// The absolute spelling of the default path, as a unit file or an expanding shell
+	// would pass it.
+	if _, err := WriteControlTokenFile(filepath.Join(dir, "control.token"), "tok"); err != nil {
+		t.Fatalf("WriteControlTokenFile: %v", err)
+	}
+
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o700 {
+		t.Errorf("directory mode = %o, want 0700 — the upgrade repair must key on the location, not the spelling", perm)
+	}
+}

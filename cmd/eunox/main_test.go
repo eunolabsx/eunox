@@ -56,6 +56,46 @@ func writeTempFile(t *testing.T, content string) string {
 
 // ── run (top-level dispatch) ────────────────────────────────────────────────
 
+// TestCmdProxy_ExitCodes drives cmdProxy's startup-rejection branches IN-PROCESS.
+// It is only possible because cmdProxy returns an exit code instead of calling
+// os.Exit: every one of these cases used to terminate the test binary, so the
+// fail-closed startup guards had no direct coverage at all. Routed through run() so
+// the dispatch wiring (which must propagate the code, not discard it) is pinned too.
+func TestCmdProxy_ExitCodes(t *testing.T) {
+	// A VALID config, so the guards that run after the config loads (the
+	// JWT-without-JWKS and Redis-without-addr fail-closed checks) are reached at their
+	// own branch rather than short-circuiting on a config parse error.
+	cfgPath := writeTempFile(t, "schemaVersion: \"0.1\"\ntransport: stdio\nupstreams:\n  - name: u1\n    transport: stdio\n    command: echo\n")
+	cases := []struct {
+		name string
+		args []string
+		want int
+	}{
+		// A usage error keeps the exit code the flag package's ExitOnError mode used.
+		{"unknown flag", []string{"eunox", "proxy", "--no-such-flag"}, 2},
+		{"help", []string{"eunox", "proxy", "-h"}, 0},
+		{"no mode selected", []string{"eunox", "proxy"}, 1},
+		{"audit and config are exclusive", []string{"eunox", "proxy", "--audit", "--config", cfgPath}, 1},
+		{"negative rotate size", []string{"eunox", "proxy", "--config", cfgPath, "--audit-rotate-size", "-1"}, 1},
+		{"negative audit retain", []string{"eunox", "proxy", "--config", cfgPath, "--audit-retain", "-1"}, 1},
+		{"negative session cap", []string{"eunox", "proxy", "--config", cfgPath, "--max-sessions", "-1"}, 1},
+		{"positional args under --config", []string{"eunox", "proxy", "--config", cfgPath, "stray"}, 1},
+		{"wiretap flags under --config", []string{"eunox", "proxy", "--config", cfgPath, "--upstream-url", "http://x.invalid"}, 1},
+		{"jwt flag without --jwks-uri", []string{"eunox", "proxy", "--config", cfgPath, "--jwt-issuer", "https://idp.invalid"}, 1},
+		{"redis flag without --redis-addr", []string{"eunox", "proxy", "--config", cfgPath, "--killswitch-fail-open"}, 1},
+		{"unparseable config", []string{"eunox", "proxy", "--config", writeTempFile(t, "\tnot: [yaml")}, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var got int
+			_ = captureStderr(t, func() { got = run(tc.args) })
+			if got != tc.want {
+				t.Errorf("run(%v): exit code = %d, want %d", tc.args[1:], got, tc.want)
+			}
+		})
+	}
+}
+
 // TestRun_ExitCodes pins the process exit code of the dispatch-level paths that
 // do not themselves call os.Exit. The bare-invocation case is load-bearing for
 // package validation: winget's automatic validation launches the installed

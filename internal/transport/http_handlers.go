@@ -95,6 +95,12 @@ const (
 	// checkControlToken, so without its own code an off-host probe of the emergency stop
 	// left no trace while the same-host wrong-token caller was fully recorded.
 	codeLoopbackRejected = "LOOPBACK_REJECTED"
+	// codeUnsupportedMediaType marks a POST body refused because its Content-Type was
+	// absent, duplicated, or not application/json (requireJSONContentType). Recorded for
+	// the same reason as its siblings: a content-type sweep probing the sessionless
+	// initialize POST or the emergency stop is attack signal, and it was the one
+	// transport refusal that left no trace.
+	codeUnsupportedMediaType = "UNSUPPORTED_MEDIA_TYPE"
 )
 
 // MethodControlKill is the audit `method` stamped on the record for a successful
@@ -136,7 +142,7 @@ func IsInfraDenialCode(code string) bool {
 		// suggest fabricate a deny-only allowlist suggestion for a target that policy never
 		// actually denied.
 		return true
-	case codeAuthFailed, codeControlAuthFailed, codeResourceExhausted, codeDriftRefused, codeLoopbackRejected:
+	case codeAuthFailed, codeControlAuthFailed, codeResourceExhausted, codeDriftRefused, codeLoopbackRejected, codeUnsupportedMediaType:
 		// Non-policy refusals recorded before/independent of a PDP decision: a failed
 		// transport-auth credential, a saturated handler pool, a startup drift refusal, or
 		// a loopback/rebinding gate rejection. None names a policy target, so mining them
@@ -265,7 +271,7 @@ func (p *HTTPProxy) initStrictAuditDenial(ctx context.Context, route *UpstreamRo
 	}
 	// initialize addresses no sub-target, so the audit id, method, and denial
 	// target all collapse to "initialize" (see dispatchList for the same pattern).
-	return fp.strictAuditDenial(ctx, msg, "initialize", "initialize", "initialize")
+	return fp.strictAuditDenial(ctx, msg, mcp.MethodInitialize, mcp.MethodInitialize, mcp.MethodInitialize)
 }
 
 // initAudienceDenial applies the per-route JWT audience pin to the session-creating
@@ -282,9 +288,9 @@ func (p *HTTPProxy) initAudienceDenial(ctx context.Context, route *UpstreamRoute
 	}
 	d := normalizeDenial(deny.Denial)
 	if rec := asRecorder(route.sink); rec != nil {
-		rec.RecordDeny(ctx, "", "initialize", "initialize", d.Code, d.ConditionType, d.Details, false)
+		rec.RecordDeny(ctx, "", mcp.MethodInitialize, mcp.MethodInitialize, d.Code, d.ConditionType, d.Details, false)
 	}
-	return denialResult(msg.ID, d.Code, d.ConditionType, "initialize", ""), true
+	return denialResult(msg.ID, d.Code, d.ConditionType, mcp.MethodInitialize, ""), true
 }
 
 // handleHTTPUpstreamRequest handles server-initiated JSON-RPC requests from

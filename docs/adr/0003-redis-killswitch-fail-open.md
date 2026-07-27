@@ -6,8 +6,10 @@
   superseding the original fail-open default recorded below. **Amended
   2026-07-24:** documented the lifecycle and degraded-mode semantics (stopped vs.
   unreachable, startup-subscription robustness, detection window, session-kill
-  durability) — see the section below.
-- **Date:** 2026-06-14 (original); 2026-06-16, 2026-07-24 (amendments)
+  durability) — see the section below. **Amended 2026-07-26:** session-kill
+  tombstones now carry an operator-tunable garbage-collection TTL, and the
+  staleness budget is floored against a real refresh cycle.
+- **Date:** 2026-06-14 (original); 2026-06-16, 2026-07-24, 2026-07-26 (amendments)
 - **Deciders:** eunox maintainers
 
 ## Context
@@ -155,22 +157,53 @@ refine what "cannot confirm" means, so a health probe and the data plane agree o
   throughout; only *newly issued* kills are delayed for at most one interval.
   Shorten the interval to tighten the window at the cost of Redis load.
 
+  Shortening it does **not** tighten the staleness budget proportionally. That
+  budget — how old a confirmed refresh may be before fail-closed mode denies
+  everything — is two reconcile intervals, floored at one interval plus a realistic
+  refresh-cycle cost. Without the floor, tuning for faster propagation shrank the
+  budget below the time one healthy refresh legitimately takes (a `GET` plus two
+  `SCAN` loops, retried when a concurrent kill races the scan), so a perfectly
+  healthy Redis could be judged stale and the data plane denied.
+
+  The floor is a **trade**, and it runs against revocation latency in one case: a
+  refresh that *hangs* rather than errors. An outright failure latches the health
+  stamp and is reported before staleness is consulted, so only the hang reaches this
+  gate — and for it, an operator running a 1 s interval now serves the last-known
+  cache for ~31 s rather than ~2 s before failing closed. That is accepted because
+  the alternative was a *certain* self-inflicted outage (a healthy backend judged
+  stale, denying everything) traded against a longer window on a rare failure mode.
+  Tuning the interval down for faster kill **propagation** — the pub/sub-miss
+  reconvergence the flag documents — is unaffected; only this hang-detection window
+  no longer shrinks with it.
+
 - **Degraded-mode logging is wired in the binary.** The switch's outage and
   recovery breadcrumbs (initial-refresh-failed, subscription-unconfirmed,
   background-refresh failed/recovered) are gated on a configured logger; the proxy
   now supplies one, so a partition is visible in the process log as well as on
   `/healthz` and `/metrics`. A Redis-only flag (`--killswitch-fail-open`,
-  `--killswitch-reconcile-interval`, `--redis-password`, `--redis-tls`) set
-  *without* `--redis-addr` is rejected at startup rather than silently ignored —
-  the in-memory switch would apply none of them.
+  `--killswitch-reconcile-interval`, `--killswitch-session-ttl`,
+  `--redis-password`, `--redis-tls`) set *without* `--redis-addr` is rejected at
+  startup rather than silently ignored — the in-memory switch would apply none of
+  them.
 
-- **Session kills are durable, not TTL'd.** `KillSession` writes a permanent Redis
-  key, like `KillAgent`. A TTL is deliberately not used: a kill that *silently
-  expired* while its subject was still live would be a fail-**open** transition,
-  contradicting the invariant above, and the proxy cannot know a session's real
-  lifetime. Killed-session keys therefore accumulate until an explicit
-  `ReviveSession` or `Reset` — the required cleanup path for automated kill tooling
-  that would otherwise leak tombstones.
+- **Session kills carry a garbage-collection TTL; agent kills do not.**
+  `KillSession` writes a key with a long expiry (default 30 days,
+  `--killswitch-session-ttl`); `KillAgent` writes a permanent one. The asymmetry
+  follows the identities: an agent identity is long-lived and its revocation is
+  meant to be durable, while session ids are unbounded in number, so permanent
+  session tombstones grew Redis memory without limit and made every reconcile SCAN
+  pay for the accumulation.
+
+  The TTL is a memory bound, **not** a policy expiry, and the risk runs one way: a
+  tombstone that expires while its session is still live *lifts* the kill — a
+  fail-**open** transition against the invariant above. The default is chosen to be
+  orders of magnitude longer than any ordinary session, but a deployment that pins
+  and reuses one `--session-id` (the normal way to run a long-lived stdio agent)
+  can outlive it. That is why the lifetime is a flag rather than a constant, why it
+  is stated on stderr at startup even at its default, and why a negative value
+  restores permanent tombstones. Never lower it below the longest session the
+  deployment can hold open. Cleanup before expiry is still `ReviveSession` or
+  `Reset`.
 
 ## Alternatives considered
 

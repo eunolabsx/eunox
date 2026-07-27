@@ -2506,3 +2506,96 @@ func TestStdioHandleToolsCall_EmptyName_InvalidParams(t *testing.T) {
 		t.Errorf("error code = %d, want -32602 (INVALID_PARAMS), not an upstream error", hw.messages[0].Error.Code)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// ping: a locally-answered MCP method, so its coverage lives here with the rest
+// of the per-method enforcement matrix rather than beside the dispatch plumbing.
+// ---------------------------------------------------------------------------
+
+// TestPing_AnsweredLocally_NotDeniedAsUnmapped pins that the MCP utility ping is answered
+// rather than denied as an unmapped method.
+//
+// ping carries no arguments, names no target, and reaches no upstream, so there is nothing
+// for a manifest to authorize; denying it with AUTHORIZATION_FAILED broke the liveness
+// probe every host is entitled to send and wrote a policy-denial record for a call that was
+// never a policy question. A deny-all manifest is used deliberately: the answer must not
+// depend on policy at all.
+func TestPing_AnsweredLocally_NotDeniedAsUnmapped(t *testing.T) {
+	t.Parallel()
+	rec := &fwdRecorder{}
+	d := dispatchParams{
+		forwardParams: forwardParams{rec: rec, sessionID: "sess"},
+		pdp:           newTestManifestPDP(), // empty manifest: nothing is authorized
+	}
+
+	resp := dispatchRequest(context.Background(), d, mcp.RPCMsg{
+		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "ping",
+	})
+
+	if resp.Error != nil {
+		t.Fatalf("ping must be answered, not denied; got error %+v", resp.Error)
+	}
+	if string(resp.Result) != `{}` {
+		t.Fatalf("ping must return the spec's empty result; got %s", resp.Result)
+	}
+	// No audit record: a handshake-level utility is not a guarded action, and recording
+	// every host heartbeat would bury the tape in noise.
+	if len(rec.records) != 0 {
+		t.Errorf("ping must write no audit record; got %+v", rec.records)
+	}
+}
+
+// TestPing_NeverReachesUpstream: ping is answered locally rather than forwarded, so it
+// cannot be used to probe upstream liveness through the proxy.
+func TestPing_NeverReachesUpstream(t *testing.T) {
+	t.Parallel()
+	forwarded := false
+	d := dispatchParams{
+		forwardParams: forwardParams{
+			rec:       &fwdRecorder{},
+			sessionID: "sess",
+			callUpstream: func(_ context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, error) {
+				forwarded = true
+				return mcp.RPCMsg{JSONRPC: "2.0", ID: msg.ID, Result: json.RawMessage(`{}`)}, nil
+			},
+		},
+		pdp: pdp.AlwaysAllowPDP{},
+	}
+
+	dispatchRequest(context.Background(), d, mcp.RPCMsg{
+		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "ping",
+	})
+
+	if forwarded {
+		t.Fatal("ping must be answered locally; forwarding it turns the proxy into an upstream liveness oracle")
+	}
+}
+
+// TestPing_KilledSessionGetsKillSwitchNotPong: being locally answered does not exempt ping
+// from revocation. It sits inside the locally-answered set, behind the shared kill gate at
+// the dispatchRequest boundary, so a killed session gets KILL_SWITCH — every other action
+// on that session is already refused, and a pong would tell a revoked client it is still
+// live.
+func TestPing_KilledSessionGetsKillSwitchNotPong(t *testing.T) {
+	t.Parallel()
+	ks := killswitch.NewInMemory()
+	if err := ks.KillSession(context.Background(), "sess-killed"); err != nil {
+		t.Fatalf("KillSession: %v", err)
+	}
+	rec := &fwdRecorder{}
+	d := dispatchParams{
+		forwardParams: forwardParams{rec: rec, sessionID: "sess-killed"},
+		pdp:           newTestManifestPDPWithKS(ks),
+	}
+
+	resp := dispatchRequest(context.Background(), d, mcp.RPCMsg{
+		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "ping",
+	})
+
+	if resp.Error == nil {
+		t.Fatalf("a killed session must not get a pong; got result %s", resp.Result)
+	}
+	if len(rec.records) != 1 || rec.records[0].code != capability.ErrCodeKillSwitch {
+		t.Fatalf("want a single KILL_SWITCH record for the refused ping, got %+v", rec.records)
+	}
+}

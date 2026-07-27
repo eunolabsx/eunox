@@ -395,7 +395,7 @@ func DoMCPHTTP(ctx context.Context, client *http.Client, endpoint string, msg mc
 	req.Header.Set("Accept", CTJSON+", "+ctSSE)
 	// Every post-handshake request must carry the negotiated protocol version; the
 	// initialize request precedes negotiation and must not.
-	if msg.Method != "initialize" {
+	if msg.Method != mcp.MethodInitialize {
 		req.Header.Set("MCP-Protocol-Version", MCPProtocolVersion)
 	}
 	if sessID != "" {

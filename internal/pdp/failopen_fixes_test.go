@@ -6,12 +6,15 @@ package pdp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/eunolabs/eunox/internal/mcp"
+	"github.com/eunolabs/eunox/pkg/callcounter"
 	"github.com/eunolabs/eunox/pkg/capability"
 	"github.com/eunolabs/eunox/pkg/enforcement"
+	"github.com/eunolabs/eunox/pkg/killswitch"
 )
 
 // -----------------------------------------------------------------
@@ -313,5 +316,135 @@ func TestRecordAuditModeAntecedent_RouteAuditRecordsEnforcedConstraint(t *testin
 		&capability.EnforceResponse{Decision: capability.DecisionDeny, Denial: &capability.DenialInfo{HardDeny: true}})
 	if counter.writes != 1 {
 		t.Fatalf("writes = %d, want 1 (a HardDeny must not record even under route audit)", counter.writes)
+	}
+}
+
+// TestRecordObservedToolHashes_NonObjectEntryDoesNotPoisonUnrelatedPins: a
+// provably-non-object entry (null, a number, a string, an array) carries no top-level
+// name, so a host renders no tool name from it and it cannot impersonate any pin. It must
+// therefore poison NOTHING, rather than escalating to the route-wide, sticky-to-exit
+// poison reserved for an entry whose name set is genuinely unknown. The honest sibling
+// entry in the same catalog must still arm its pin.
+func TestRecordObservedToolHashes_NonObjectEntryDoesNotPoisonUnrelatedPins(t *testing.T) {
+	t.Parallel()
+	for _, entry := range []string{`null`, `42`, `"weather"`, `[]`, `true`} {
+		t.Run(entry, func(t *testing.T) {
+			t.Parallel()
+			pin := capability.ComputeToolHash("Safe original description.", nil)
+			mdp := newTestManifestPDP(
+				capability.Constraint{Target: "tool:pinned_tool", Actions: []string{"call"}, DescriptionHash: pin},
+				capability.Constraint{Target: "tool:other_pinned", Actions: []string{"call"}, DescriptionHash: pin},
+			)
+			catalog := `{"tools":[` + entry + `,{"name":"pinned_tool","description":"Safe original description."}]}`
+			mdp.RecordObservedToolHashes(context.Background(), json.RawMessage(catalog))
+			if mdp.isToolPoisoned("pinned_tool") || mdp.isToolPoisoned("other_pinned") {
+				t.Fatalf("a %s entry names no tool, so it must poison no pin", entry)
+			}
+		})
+	}
+}
+
+// TestFilterToolsList_NonObjectEntryStillHidden is the other half: not poisoning must not
+// mean trusting. The non-object entry itself is still untrustworthy and must be pruned
+// from the enforce-mode catalog, while the honest pinned sibling survives.
+func TestFilterToolsList_NonObjectEntryStillHidden(t *testing.T) {
+	t.Parallel()
+	pin := capability.ComputeToolHash("Safe original description.", nil)
+	mdp := newTestManifestPDP(
+		capability.Constraint{Target: "tool:list_dir", Actions: []string{"call"}, DescriptionHash: pin},
+	)
+	catalog := `{"tools":[null,{"name":"list_dir","description":"Safe original description."}]}`
+	out := filterToolsListResult(json.RawMessage(catalog), mdp, nil).Result
+	var list mcp.ToolsListResult
+	_ = json.Unmarshal(out, &list)
+	if len(list.Tools) != 1 || list.Tools[0].Name != "list_dir" {
+		t.Fatalf("want just the honest pinned tool to survive, got %+v", list.Tools)
+	}
+	if mdp.isToolPoisoned("list_dir") {
+		t.Fatal("an unrelated null entry must not poison a pin it could never have named")
+	}
+}
+
+// TestDecide_ManifestAbsentToolUnderAudit_RecordsSequenceAntecedent is the
+// "observe predicts enforce" regression for the ONE deny branch that skipped the
+// antecedent record. Under --audit a manifest-absent tool's AUTHORIZATION_FAILED is
+// downgraded and forwarded, so the tool actually runs — but its call was never recorded
+// in session history, so a later enforced sequenceBlock naming it in afterTools Peeked an
+// empty history and failed OPEN. The manifest here declares exactly that shape: a
+// sequenceBlock on a listed tool whose antecedent is the unlisted one.
+func TestDecide_ManifestAbsentToolUnderAudit_RecordsSequenceAntecedent(t *testing.T) {
+	t.Parallel()
+	counter := &recordingCounter{}
+	engine := enforcement.New(enforcement.WithCallCounter(counter))
+	mdp := NewManifestPDP(
+		[]capability.Constraint{{
+			Target:     "tool:listed",
+			Actions:    []string{"call"},
+			Conditions: []capability.Condition{capability.SequenceBlockCondition{AfterTools: []string{"absent"}}},
+		}},
+		engine,
+		killswitch.NewInMemory(),
+	)
+
+	// Enforce route: the absent tool is denied outright, it never runs, so nothing is
+	// recorded. This is the control for the audit case below.
+	if resp := callTool(mdp, context.Background(), "absent", nil); resp.Decision != capability.DecisionDeny {
+		t.Fatalf("a manifest-absent tool must be denied on an enforce route, got %+v", resp)
+	}
+	if counter.writes != 0 {
+		t.Fatalf("writes = %d, want 0 — an enforced deny means the tool never ran", counter.writes)
+	}
+
+	// Whole-route --audit: the same deny is downgraded and forwarded, so the tool DOES
+	// run and its antecedent must land in session history.
+	auditCtx := enforcement.WithSkipQuota(context.Background())
+	resp := callTool(mdp, auditCtx, "absent", nil)
+	if resp.Decision != capability.DecisionDeny || resp.Denial == nil || resp.Denial.HardDeny {
+		t.Fatalf("want a downgradable AUTHORIZATION_FAILED deny under --audit, got %+v", resp)
+	}
+	if counter.writes != 1 {
+		t.Fatalf("writes = %d, want 1 — a forwarded manifest-absent call must record its sequenceBlock antecedent", counter.writes)
+	}
+}
+
+// TestDecide_ManifestAbsentToolUnderAudit_UnqueryableNameRecordsNothing bounds the record
+// above. That branch is the only antecedent site whose target name is NOT bounded by the
+// manifest, and each record costs a call-counter key for the whole history window — so
+// recording every made-up name let a caller on an observe route mint keys until the
+// counter hit its cap, at which point the record fails and the antecedent path returns a
+// HARD deny that --audit cannot downgrade. An observe route would start blocking
+// everything, listed tools included. A name no sequenceBlock lists in afterTools can never
+// be queried, so it needs no history.
+func TestDecide_ManifestAbsentToolUnderAudit_UnqueryableNameRecordsNothing(t *testing.T) {
+	t.Parallel()
+	counter := callcounter.NewInMemory(callcounter.WithMaxKeys(8))
+	engine := enforcement.New(enforcement.WithCallCounter(counter))
+	mdp := NewManifestPDP(
+		[]capability.Constraint{{
+			Target:     "tool:listed",
+			Actions:    []string{"call"},
+			Conditions: []capability.Condition{capability.SequenceBlockCondition{AfterTools: []string{"watched"}}},
+		}},
+		engine,
+		killswitch.NewInMemory(),
+	)
+	auditCtx := enforcement.WithSkipQuota(context.Background())
+
+	// Far more distinct unlisted names than the counter can hold. None is a declared
+	// antecedent, so none should consume a key.
+	for i := 0; i < 50; i++ {
+		resp := callTool(mdp, auditCtx, fmt.Sprintf("made-up-%d", i), nil)
+		if resp.Denial != nil && resp.Denial.HardDeny {
+			t.Fatalf("call %d hard-denied on an observe route: %+v", i, resp.Denial)
+		}
+	}
+
+	// The route still observes rather than blocks: a LISTED tool must still be allowed.
+	if resp := callTool(mdp, auditCtx, "listed", nil); resp.Decision != capability.DecisionAllow {
+		t.Fatalf("an observe route must still allow a listed tool after the flood, got %+v", resp)
+	}
+	// And the declared antecedent still records, so the guarantee the gate protects holds.
+	if resp := callTool(mdp, auditCtx, "watched", nil); resp.Denial != nil && resp.Denial.HardDeny {
+		t.Fatalf("the declared antecedent must still record, got %+v", resp.Denial)
 	}
 }

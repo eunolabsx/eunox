@@ -73,12 +73,22 @@ type UpstreamTool struct {
 	Description string
 	InputSchema map[string]interface{}
 	// Title, Annotations, and OutputSchema are model-facing tool metadata folded
-	// into the FM-5 description-hash pin (see capability.ToolHashParams). Field
-	// order matches mcp.ToolEntry so ParseToolsListResult can convert by value.
+	// into the FM-5 description-hash pin (see capability.ToolHashParams).
 	Title        string
 	Annotations  map[string]interface{}
 	OutputSchema map[string]interface{}
 }
+
+// UpstreamTool must stay field-for-field identical to mcp.ToolEntry, which is where the
+// wire decode lives. This assertion is the compiler check for that: a struct conversion
+// compiles only between types with identical fields, so ADDING a field to either one
+// without the other breaks the build here rather than silently leaving the new field
+// zero in ParseToolsListResult's named-field copy — and a zero field means every FM-5
+// descriptionHash is computed over data the upstream actually sent something for. The
+// named copy in ParseToolsListResult covers the other direction (a same-type REORDER,
+// which a conversion would accept while transposing values), so the two together make
+// both failure modes compile errors.
+var _ = UpstreamTool(mcp.ToolEntry{})
 
 // Kind classifies a drift finding.
 type Kind string
@@ -983,7 +993,20 @@ func ParseToolsListResult(raw json.RawMessage) ([]UpstreamTool, error) {
 	}
 	tools := make([]UpstreamTool, len(result.Tools))
 	for i, t := range result.Tools {
-		tools[i] = UpstreamTool(t)
+		// Field by field, by NAME, rather than a positional UpstreamTool(t) struct
+		// conversion. The two types share three string fields and two
+		// map[string]interface{} fields, so a same-type reorder in mcp.ToolEntry would
+		// still compile as a conversion while silently transposing values into the wrong
+		// fields — and every FM-5 descriptionHash comparison is computed over exactly
+		// these fields. Named assignment makes that mapping compiler-checked.
+		tools[i] = UpstreamTool{
+			Name:         t.Name,
+			Description:  t.Description,
+			InputSchema:  t.InputSchema,
+			Title:        t.Title,
+			Annotations:  t.Annotations,
+			OutputSchema: t.OutputSchema,
+		}
 	}
 	return tools, nil
 }

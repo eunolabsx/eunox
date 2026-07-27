@@ -67,8 +67,8 @@ func main() {
 
 // run dispatches the subcommand in args (program name at args[0], like os.Args)
 // and returns the exit code. Kept separate from main so tests can assert the
-// code without terminating the test binary; main holds the only top-level
-// os.Exit. Subcommands that need a non-zero exit still call os.Exit themselves.
+// code without terminating the test binary; main holds the only os.Exit in the
+// binary — every subcommand returns its code rather than exiting.
 //
 // Every subcommand takes its own arguments (args[2:]) as a parameter rather than
 // re-reading the global os.Args: the dispatch and the flag parsing then read the
@@ -85,7 +85,7 @@ func run(args []string) int {
 	subArgs := args[2:]
 	switch args[1] {
 	case "proxy":
-		cmdProxy(subArgs)
+		return cmdProxy(subArgs)
 	case "validate":
 		return cmdValidate(subArgs)
 	case "init":
@@ -213,6 +213,7 @@ type proxyCLIFlags struct {
 	redisTLS             *bool
 	killswitchFailOpen   *bool
 	killswitchReconcile  *time.Duration
+	killswitchSessionTTL *time.Duration
 	maxCallCounterKeys   *int
 	requireAudit         *auditRequirement
 	strictDrift          *bool
@@ -334,12 +335,13 @@ func registerProxyFlags(fs *flag.FlagSet) *proxyCLIFlags {
 		oauthAuthzServer: fs.String("oauth-authorization-server", "", "Authorization server URI published in the RFC 9728 metadata document.\nDefaults to --jwt-issuer when not set. Requires transport: http."),
 
 		// Redis flags (optional — in-memory is used when absent).
-		redisAddr:           fs.String("redis-addr", "", "Redis address (host:port) for persistent call-counter and kill-switch state.\nWhen set, state survives proxy restarts and is shared across instances.\nExample: --redis-addr localhost:6379"),
-		redisPassword:       fs.String("redis-password", "", "Redis password (AUTH). Leave empty for unauthenticated connections. Prefer\nthe EUNOX_REDIS_PASSWORD env var: a password on the command line is visible\nin /proc/<pid>/cmdline. A non-empty flag value takes precedence over the env\nvar; leaving the flag empty does NOT override a set EUNOX_REDIS_PASSWORD."),
-		redisTLS:            fs.Bool("redis-tls", false, "Enable TLS for the Redis connection."),
-		killswitchFailOpen:  fs.Bool("killswitch-fail-open", false, "Redis kill-switch behaviour during a Redis outage. By default the kill switch\nfails CLOSED: while Redis is unreachable the proxy denies every request\n(KILL_SWITCH_ERROR) because a kill issued during the outage cannot be confirmed.\nSet this flag to fail OPEN instead -- serve the last-known kill state and allow\ntraffic not already known to be killed -- trading guaranteed revocation for\ndata-plane availability. Only affects --redis-addr deployments. See ADR-0003."),
-		killswitchReconcile: fs.Duration("killswitch-reconcile-interval", 0, "How often the Redis kill switch reconciles its local cache against Redis\n(default 30s). Lower values shorten the kill-propagation window and, in the\ndefault fail-closed mode, the data-plane denial window that persists after a\ntransient Redis blip recovers -- recovery is bounded by this interval, not Redis.\nVery low values increase Redis load. 0 uses the default. Only affects --redis-addr."),
-		maxCallCounterKeys:  fs.Int("max-call-counter-keys", defaultMaxCallCounterKeys, "Maximum distinct keys the in-memory maxCalls/sequenceBlock counter holds at once.\nEach live (session, tool) pair is one key, reclaimed only on the periodic cleanup;\nthis ceiling bounds the heap a flood of unique session IDs can pin between cleanups\n(a call under a new key past the limit fails closed). The same bound also caps the\nin-memory flow-label store's distinct SESSIONS (one key per session, so its ceiling\nis looser and never trips first). 0 disables the bound. Ignored when --redis-addr is\nset (Redis keeps this state off the Go heap, with TTLs)."),
+		redisAddr:            fs.String("redis-addr", "", "Redis address (host:port) for persistent call-counter and kill-switch state.\nWhen set, state survives proxy restarts and is shared across instances.\nExample: --redis-addr localhost:6379"),
+		redisPassword:        fs.String("redis-password", "", "Redis password (AUTH). Leave empty for unauthenticated connections. Prefer\nthe EUNOX_REDIS_PASSWORD env var: a password on the command line is visible\nin /proc/<pid>/cmdline. A non-empty flag value takes precedence over the env\nvar; leaving the flag empty does NOT override a set EUNOX_REDIS_PASSWORD."),
+		redisTLS:             fs.Bool("redis-tls", false, "Enable TLS for the Redis connection."),
+		killswitchFailOpen:   fs.Bool("killswitch-fail-open", false, "Redis kill-switch behaviour during a Redis outage. By default the kill switch\nfails CLOSED: while Redis is unreachable the proxy denies every request\n(KILL_SWITCH_ERROR) because a kill issued during the outage cannot be confirmed.\nSet this flag to fail OPEN instead -- serve the last-known kill state and allow\ntraffic not already known to be killed -- trading guaranteed revocation for\ndata-plane availability. Only affects --redis-addr deployments. See ADR-0003."),
+		killswitchReconcile:  fs.Duration("killswitch-reconcile-interval", 0, "How often the Redis kill switch reconciles its local cache against Redis\n(default 30s). Lower values shorten the kill-propagation window and, in the\ndefault fail-closed mode, the data-plane denial window that persists after a\ntransient Redis blip recovers -- recovery is bounded by this interval, not Redis.\nVery low values increase Redis load. 0 uses the default. Only affects --redis-addr."),
+		killswitchSessionTTL: fs.Duration("killswitch-session-ttl", 0, "How long a SESSION kill tombstone lives in Redis before it is garbage\ncollected (default 720h / 30 days). This is a memory bound, not a policy\nexpiry: when the tombstone expires the kill is LIFTED, so a value shorter\nthan the longest session your deployment holds open re-admits a revoked\nsession. Relevant when a stdio agent pins and reuses one --session-id for\nmonths. Negative disables expiry entirely; 0 uses the default. Agent kills\nare never expired. Only affects --redis-addr."),
+		maxCallCounterKeys:   fs.Int("max-call-counter-keys", defaultMaxCallCounterKeys, "Maximum distinct keys the in-memory maxCalls/sequenceBlock counter holds at once.\nEach live (session, tool) pair is one key, reclaimed only on the periodic cleanup;\nthis ceiling bounds the heap a flood of unique session IDs can pin between cleanups\n(a call under a new key past the limit fails closed). The same bound also caps the\nin-memory flow-label store's distinct SESSIONS (one key per session, so its ceiling\nis looser and never trips first). 0 disables the bound. Ignored when --redis-addr is\nset (Redis keeps this state off the Go heap, with TTLs)."),
 
 		// Compliance flags.
 		strictDrift: fs.Bool("strict-drift", false, "Promote startup drift warnings to fatal errors that abort session startup: a new\nupstream tool matched by a manifest glob, a manifest entry that matches no live\ntool, or an upstream version that does not satisfy the manifest's serverVersion\npin. (A condition argument absent from the live schema and the uncovered-tool\nINFO stay advisory, never fatal.) A launch-time global override: applies to every\npoliced route, regardless of a per-route 'strictDrift' in the config. Routes with\nno policy are unaffected; the proxy warns if the flag matched no policed route\n(e.g. with --audit)."),
@@ -377,40 +379,56 @@ Flags:
 	fs.PrintDefaults()
 }
 
-// cmdProxy runs the `proxy` subcommand. args carries the subcommand's own
-// arguments (os.Args[2:] in a real invocation), threaded from run.
-func cmdProxy(args []string) {
-	// exitCode lets post-sink paths exit non-zero while still running the deferred
-	// sink.Close (an os.Exit skips defers). As the outermost (LIFO) defer it runs
-	// after sink.Close has flushed and had a chance to flag a Sync/Close failure.
-	// Early os.Exit(1) calls below run before the sink opens, so they bypass this.
-	exitCode := 0
-	defer func() {
-		if exitCode != 0 {
-			os.Exit(exitCode)
-		}
-	}()
-
-	fs := flag.NewFlagSet("proxy", flag.ExitOnError)
+// cmdProxy runs the `proxy` subcommand and returns the process exit code (rather than
+// calling os.Exit itself), matching every other subcommand so tests can drive its
+// branches — including the fail-closed startup rejections — without terminating the
+// test binary. args carries the subcommand's own arguments (os.Args[2:] in a real
+// invocation), threaded from run.
+//
+// The return value is NAMED so the deferred audit-sink Close can fail the command: it
+// is the last thing to run, and a Close error means buffered records may not have
+// reached disk, which for an audit tool is the failure the product exists to prevent.
+// Returning normally (rather than calling os.Exit anywhere in here) is what guarantees
+// that flush happens at all — an os.Exit skips defers, which is why this function
+// previously needed a deferred-exit trick to get the flush and a non-zero status at
+// once.
+func cmdProxy(args []string) (exitCode int) {
+	// ContinueOnError, like every sibling subcommand: an ExitOnError flag set would
+	// terminate the process inside Parse, reintroducing exactly the untestable exit
+	// this function no longer has.
+	fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
 	fs.Usage = func() { printProxyUsage(fs) }
 
 	f := registerProxyFlags(fs)
 
-	// flag.ExitOnError: Parse exits the process on a bad flag or -help, so it never
-	// returns a non-nil error here (the old `if err != nil` branch was dead).
-	_ = fs.Parse(args)
+	// Parse the args run() threaded down, NOT the os.Args global. Under ExitOnError a
+	// caller that forgot to set os.Args killed the process loudly; under
+	// ContinueOnError the same mistake would quietly parse the surrounding binary's
+	// own flags (a test harness's -test.timeout, say) and return a usage error for a
+	// branch that was never reached. Taking the slice makes the dispatch contract
+	// run() documents actually hold for this subcommand.
+	if err := fs.Parse(args); err != nil {
+		// Parse has already written the error and the usage text to stderr.
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		// 2 for a usage error, matching what the flag package's ExitOnError mode exited
+		// with before and `validate`'s documented convention: it keeps a misspelled flag
+		// distinguishable from a startup rejection (1).
+		return 2
+	}
 
 	if *f.configPath != "" && *f.audit {
 		fmt.Fprintf(os.Stderr, "eunox proxy: --audit and --config are mutually exclusive (--audit is for the zero-config wiretap path; --config carries its own enforcement posture).\n")
-		os.Exit(1)
+		return 1
 	}
 
 	// Reject negative numeric limit flags at the flag leg, matching the config validator
-	// (gateway_config.go). Extracted into a pure helper so each guard is unit-testable;
-	// cmdProxy itself must os.Exit, which a test cannot capture in-process.
+	// (gateway_config.go). Extracted into a pure helper so each guard is independently
+	// unit-testable.
 	if err := validateProxyNumericFlags(f); err != nil {
 		fmt.Fprintf(os.Stderr, "eunox proxy: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	// The audit knobs mirror the config's fail-closed rejection (Validate rejects a
 	// negative audit.rotateSizeBytes / audit.retainRotated). Guard the FLAG leg too so the
@@ -419,11 +437,11 @@ func cmdProxy(args []string) {
 	// misconfiguration instead of rejecting it.
 	if *f.auditRotateSize < 0 {
 		fmt.Fprintf(os.Stderr, "eunox proxy: --audit-rotate-size must be >= 0 (0 = use the default size)\n")
-		os.Exit(1)
+		return 1
 	}
 	if *f.auditRetainRotated < 0 {
 		fmt.Fprintf(os.Stderr, "eunox proxy: --audit-retain must be >= 0 (0 = keep all rotated files)\n")
-		os.Exit(1)
+		return 1
 	}
 
 	var (
@@ -435,7 +453,7 @@ func cmdProxy(args []string) {
 		cfg, err = buildAuditWiretapConfig(fs.Args(), *f.wiretapURL, *f.wiretapAuthHeader, *f.wiretapTLSSkipVerify)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "eunox proxy: %v\n", err)
-			os.Exit(1)
+			return 1
 		}
 		fmt.Fprintf(os.Stderr, "[eunox] WIRETAP MODE: audit-only, no policy — enforced-method calls are forwarded and recorded (…/list calls forwarded unfiltered and recorded as enumeration events). Use 'eunox stats' to inspect the tape.\n")
 	case *f.configPath != "":
@@ -444,23 +462,23 @@ func cmdProxy(args []string) {
 		// than let the operator believe they took effect.
 		if fs.NArg() > 0 {
 			fmt.Fprintf(os.Stderr, "eunox proxy: unexpected argument %q (--config takes the upstream from the config file; positional commands are only for --audit mode)\n", fs.Arg(0))
-			os.Exit(1)
+			return 1
 		}
 		// The wiretap-only upstream flags describe the --audit upstream; under --config the
 		// upstream (and its auth/TLS posture) comes from the file, so these would be
 		// silently dropped. Reject them for the same reason as a stray positional.
 		if *f.wiretapURL != "" || *f.wiretapAuthHeader != "" || *f.wiretapTLSSkipVerify {
 			fmt.Fprintf(os.Stderr, "eunox proxy: --upstream-url/--upstream-auth-header/--upstream-tls-skip-verify apply only to --audit wiretap mode; under --config the upstream and its auth/TLS posture come from the config file\n")
-			os.Exit(1)
+			return 1
 		}
 		cfg, err = config.LoadGatewayConfig(*f.configPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "eunox proxy: %v\n", err)
-			os.Exit(1)
+			return 1
 		}
 	default:
 		fmt.Fprintf(os.Stderr, "eunox proxy: one of --config <file> or --audit is required.\n\n  --config <eunox.yaml>           policy enforcement (or audit posture) declared in a file\n  --audit -- <command> [args...]  zero-config wiretap: forward everything, log everything\n\nRun 'eunox init --upstream-url <url>' to scaffold a starter config + manifest.\n")
-		os.Exit(1)
+		return 1
 	}
 
 	sid := *f.sessionID
@@ -515,8 +533,7 @@ func cmdProxy(args []string) {
 	// touched, not after.
 	if err := validateJWTFlagsRequireJWKS(pf); err != nil {
 		fmt.Fprintf(os.Stderr, "[eunox] Fatal: %v\n", err)
-		exitCode = 1
-		return
+		return 1
 	}
 
 	// Fail closed if a Redis-only flag (--killswitch-fail-open, --redis-password, …) was
@@ -527,32 +544,58 @@ func cmdProxy(args []string) {
 	// side effects (a Redis dial, minting an audit key) runs.
 	if err := validateRedisFlagsRequireRedisAddr(fs, *f.redisAddr); err != nil {
 		fmt.Fprintf(os.Stderr, "[eunox] Fatal: %v\n", err)
-		exitCode = 1
-		return
+		return 1
 	}
 
 	// Build call counter and kill-switch manager, shared across routes and the
 	// kill-switch endpoint. Backed by Redis when --redis-addr is set.
-	counter, flowStore, ks, ksRedis := buildCallCounterAndKillSwitch(*f.redisAddr, resolveRedisPassword(*f.redisPassword), *f.redisTLS, *f.killswitchFailOpen, *f.killswitchReconcile, *f.maxCallCounterKeys)
+	counter, flowStore, ks, ksRedis, err := buildCallCounterAndKillSwitch(*f.redisAddr, resolveRedisPassword(*f.redisPassword), *f.redisTLS, *f.killswitchFailOpen, *f.killswitchReconcile, *f.killswitchSessionTTL, *f.maxCallCounterKeys)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "eunox proxy: %v\n", err)
+		return 1
+	}
 
 	// Open the shared audit sink. The config's audit block takes precedence over
 	// the CLI flags so every route shares one tape.
-	sink := openConfiguredAuditSink(*f.auditLog, *f.auditKeyPath, *f.auditRotateSize, *f.auditRetainRotated, cfg, f.requireAudit.required())
+	sink, err := openConfiguredAuditSink(*f.auditLog, *f.auditKeyPath, *f.auditRotateSize, *f.auditRetainRotated, cfg, f.requireAudit.required())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[eunox] Fatal: %v\n", err)
+		return 1
+	}
 	if sink != nil {
 		defer func() {
 			// A Close failure means buffered records may not have reached disk. For
 			// an audit tool that silent loss is the failure mode the product exists
-			// to prevent, so surface it as a non-zero exit.
+			// to prevent, so surface it as a non-zero exit. This runs on every return
+			// path below (that is why the return is named), and last among the defers
+			// registered here, so it flushes after the kill switch has stopped.
 			if err := sink.Close(); err != nil {
 				fmt.Fprintf(os.Stderr, "[eunox] Fatal: audit sink close failed; the audit trail may be incomplete: %v\n", err)
-				exitCode = 1
+				// Only ever UPGRADE from success. A flush failure must not overwrite a
+				// more specific non-zero code the function already chose (this file
+				// already uses 2 for a usage error), which an unconditional assignment
+				// would silently rewrite to 1.
+				if exitCode == 0 {
+					exitCode = 1
+				}
 			}
 		}()
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	// Both teardowns are deferred, not left to the signal goroutine below: that
+	// goroutine only runs when a signal actually arrives, so on every ordinary return
+	// (a serve error, or a clean shutdown) the context would otherwise stay live and
+	// the SIGINT/SIGTERM relay stay registered. In the binary that is invisible because
+	// the process exits — but cmdProxy now RETURNS rather than calling os.Exit, so an
+	// in-process caller would leak the ctx-bound cleanup goroutine (StartCleanup below)
+	// and, worse, keep the OS default signal disposition disabled for the whole process
+	// once Notify has diverted it. signal.Stop is idempotent, so the goroutine's own
+	// call remains correct.
+	defer cancel()
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 	go func() {
 		<-sigCh
 		cancel()
@@ -589,10 +632,9 @@ func cmdProxy(args []string) {
 	}
 	if serveErr != nil {
 		fmt.Fprintf(os.Stderr, "[eunox] Fatal: %v\n", serveErr)
-		// Return rather than os.Exit so the deferred sink.Close still flushes.
-		exitCode = 1
-		return
+		return 1
 	}
+	return 0
 }
 
 // resolveRedisPassword returns the Redis AUTH password with flag > env precedence:
@@ -614,9 +656,11 @@ func resolveRedisPassword(flagVal string) string {
 // distinct from the counter (session-lifetime provenance, not a sliding window) but is
 // wired from the same backend so a flow policy gets multi-instance parity exactly as
 // maxCalls/sequenceBlock do. ksRedis is non-nil only in
-// the Redis case, so cmdProxy can start its reconcile loop. A Redis config or
-// connectivity error is fatal.
-func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, killswitchFailOpen bool, killswitchReconcile time.Duration, maxCallCounterKeys int) (capability.CallCounter, capability.FlowLabelStore, killswitch.Manager, *killswitch.Redis) {
+// the Redis case, so cmdProxy can start its reconcile loop.
+//
+// A Redis config or connectivity error is returned rather than exited on, so the
+// caller owns the exit code and the failure path is drivable from a test.
+func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, killswitchFailOpen bool, killswitchReconcile, killswitchSessionTTL time.Duration, maxCallCounterKeys int) (capability.CallCounter, capability.FlowLabelStore, killswitch.Manager, *killswitch.Redis, error) {
 	var (
 		counter capability.CallCounter = callcounter.NewInMemory(callcounter.WithMaxKeys(maxCallCounterKeys))
 		// The in-memory flow store has no time window (a taint lives until the session's
@@ -630,12 +674,16 @@ func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, ki
 	if redisAddr != "" {
 		rdb, err := buildRedisClient(redisAddr, redisPassword, redisTLS)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "eunox proxy: Redis configuration error: %v\n", err)
-			os.Exit(1)
+			return nil, nil, nil, nil, fmt.Errorf("Redis configuration error: %w", err) //nolint:staticcheck // ST1005: "Redis" is a proper noun, not a capitalized sentence
 		}
 		if err := pingRedis(context.Background(), rdb); err != nil {
-			fmt.Fprintf(os.Stderr, "eunox proxy: %v\n", err)
-			os.Exit(1)
+			// Close the client before abandoning it: buildRedisClient hands back a live
+			// connection pool with its own goroutines. This branch used to call os.Exit,
+			// which made the leak unobservable; now that it returns, an in-process caller
+			// (the tests this function was made returnable for) would accumulate one pool
+			// and its dialer per failed attempt. Mirrors the kill subcommand's client.
+			_ = rdb.Close()
+			return nil, nil, nil, nil, err
 		}
 		fmt.Fprintf(os.Stderr, "[eunox] Redis backend enabled (%s). State persists across restarts.\n", redisAddr)
 		counter = callcounter.NewRedis(rdb)
@@ -655,6 +703,13 @@ func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, ki
 		ksRedis = killswitch.NewRedis(rdb,
 			killswitch.WithFailOpen(killswitchFailOpen),
 			killswitch.WithReconcileInterval(killswitchReconcile),
+			// WithSessionKillTTL(0) keeps the 30-day default. It is wired to a flag rather
+			// than left hardwired because the expiry LIFTS the kill: a deployment that pins
+			// and reuses one --session-id (the normal way to run a long-lived stdio agent)
+			// can outlive the default, and the revoked session is then re-admitted with no
+			// operator action. Both directions need to be reachable -- raise it past the
+			// longest session, or make it permanent -- so it cannot be a constant.
+			killswitch.WithSessionKillTTL(killswitchSessionTTL),
 			killswitch.WithLogger(slog.New(slog.NewTextHandler(os.Stderr, nil))))
 		ks = ksRedis
 		if killswitchFailOpen {
@@ -665,15 +720,39 @@ func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, ki
 		if killswitchReconcile > 0 {
 			fmt.Fprintf(os.Stderr, "[eunox] Kill switch: reconcile interval %s (--killswitch-reconcile-interval); bounds kill-propagation and fail-closed post-recovery denial windows.\n", killswitchReconcile)
 		}
+		// State the session-tombstone lifetime unconditionally, including the default. It
+		// is the one kill-switch setting whose expiry LIFTS a revocation, so an operator
+		// running a pinned, reused --session-id needs to see the number without having to
+		// know the flag exists to ask for it.
+		fmt.Fprintf(os.Stderr, "[eunox] Kill switch: %s (--killswitch-session-ttl). Agent kills never expire.\n", sessionKillTTLNotice(killswitchSessionTTL))
 	}
-	return counter, flowStore, ks, ksRedis
+	return counter, flowStore, ks, ksRedis, nil
+}
+
+// sessionKillTTLNotice renders the startup line describing how long a session-kill
+// tombstone survives, resolving the flag's two sentinel values the way
+// killswitch.WithSessionKillTTL does (0 = the 30-day default, negative = never expire) so
+// the banner cannot claim one lifetime while Redis enforces another.
+func sessionKillTTLNotice(ttl time.Duration) string {
+	switch {
+	case ttl < 0:
+		// No CLI subcommand un-kills a session today (killswitch.ReviveSession/Reset are
+		// library-only), so do not name one: the tombstone key is what an operator has to
+		// remove, and saying so is more useful than a command that does not exist.
+		return "session kills never expire (--killswitch-session-ttl is negative); tombstones accumulate in Redis until their killswitch:session: keys are removed"
+	case ttl == 0:
+		return fmt.Sprintf("session kills expire after %s (default); a session held open longer than that is re-admitted", killswitch.DefaultSessionKillTTL)
+	default:
+		return fmt.Sprintf("session kills expire after %s; a session held open longer than that is re-admitted", ttl)
+	}
 }
 
 // openConfiguredAuditSink resolves the audit-sink settings (config's audit block
 // takes precedence over the CLI flags so every route shares one tape) and opens
-// the sink. Open failure is fatal under --require-audit; otherwise it warns and
-// returns nil so the proxy continues unaudited.
-func openConfiguredAuditSink(auditLog, auditKeyPath string, auditRotateSize int64, auditRetainRotated int, cfg *config.GatewayConfig, requireAudit bool) *audit.Sink {
+// the sink. Under --require-audit an open failure is returned as an error for the
+// caller to exit on (fail closed); otherwise it warns and returns a nil sink with a
+// nil error, so the proxy continues unaudited.
+func openConfiguredAuditSink(auditLog, auditKeyPath string, auditRotateSize int64, auditRetainRotated int, cfg *config.GatewayConfig, requireAudit bool) (*audit.Sink, error) {
 	auditLogPath, auditKey, auditRotate := auditLog, auditKeyPath, auditRotateSize
 	auditRetain := auditRetainRotated
 	// The config's audit block takes precedence over an explicit --audit-log/
@@ -705,20 +784,15 @@ func openConfiguredAuditSink(auditLog, auditKeyPath string, auditRotateSize int6
 	// (shared with maxSessions/sessionIdleTimeout), so the audit-retention path cannot
 	// drift from the other resolved options.
 	auditRetain = config.ResolveInt(cfg.Audit.RetainRotated, auditRetain)
-	var sink *audit.Sink
-	{
-		var err error
-		sink, err = audit.Open(auditLogPath, auditKey, auditRotate, auditRetain, audit.WithIdentity(pdp.AuditIdentityFromContext))
-		if err != nil {
-			if requireAudit {
-				fmt.Fprintf(os.Stderr, "[eunox] Fatal: audit sink could not be opened and --require-audit is not 'off' (it defaults to 'strict'); set a writable audit path or pass --require-audit=off to run unaudited: %v\n", err)
-				os.Exit(1)
-			}
-			fmt.Fprintf(os.Stderr, "[eunox] Warning: could not open audit log: %v\n", err)
-			sink = nil
+	sink, err := audit.Open(auditLogPath, auditKey, auditRotate, auditRetain, audit.WithIdentity(pdp.AuditIdentityFromContext))
+	if err != nil {
+		if requireAudit {
+			return nil, fmt.Errorf("audit sink could not be opened and --require-audit is not 'off' (it defaults to 'strict'); set a writable audit path or pass --require-audit=off to run unaudited: %w", err)
 		}
+		fmt.Fprintf(os.Stderr, "[eunox] Warning: could not open audit log: %v\n", err)
+		return nil, nil
 	}
-	return sink
+	return sink, nil
 }
 
 // buildAuditWiretapConfig synthesizes a zero-config `transport: stdio` gateway
@@ -908,6 +982,7 @@ var redisGatedFlags = []string{
 	"redis-tls",
 	"killswitch-fail-open",
 	"killswitch-reconcile-interval",
+	"killswitch-session-ttl",
 }
 
 // validateProxyNumericFlags rejects negative values for the proxy's numeric limit flags,
@@ -921,8 +996,8 @@ var redisGatedFlags = []string{
 //     default, so a negative silently becomes the opposite of a "shorter grace" intent.
 //
 // Returns the first offending flag's error (without the "eunox proxy: " prefix the caller
-// adds), or nil. A pure function so every guard is unit-testable; cmdProxy calls os.Exit(1)
-// on a non-nil return, which a test cannot observe in-process. 0 stays a valid
+// adds), or nil. A pure function so every guard is unit-testable independently of
+// cmdProxy, which reports it and returns exit code 1. 0 stays a valid
 // "unlimited / disabled / default" spelling for every flag.
 func validateProxyNumericFlags(f *proxyCLIFlags) error {
 	switch {
@@ -1436,9 +1511,10 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 		// rejected, so claiming "intersecting" unconditionally would mislead operators.
 		// Redact before printing: some IdPs gate the JWKS endpoint behind a query key or
 		// basic-auth userinfo, and this banner goes to the same stderr the systemd journal,
-		// container logs, and the doctor bundle collect. config.RedactURL is the one
-		// redactor the upstream-URL log sites already use; the JWKS URI — the root of trust
-		// for token verification — must not be the exception.
+		// container logs, and the doctor bundle collect. That is a log surface, so it takes
+		// the strict log-facing redactor (scheme://host only) the other banner and
+		// validation-error sites use; the JWKS URI — the root of trust for token
+		// verification — must not be the exception.
 		safeJWKS := capability.RedactURLForLog(pf.jwksURI)
 		if pf.jwtExperimentalCaps {
 			fmt.Fprintf(os.Stderr, "[eunox] JWT PDP enabled (JWKS URI: %s); intersecting per-route manifests with experimental mcp.capabilities claims\n", safeJWKS)
@@ -2041,34 +2117,11 @@ func bindExposesAllInterfaces(bindHost string) bool {
 }
 
 // refuseNonRegularOutput fails closed unless path is a regular file or genuinely absent.
-//
-// It guards every writer that truncates an operator-supplied destination. O_EXCL refuses to
-// follow a symlink for free, so a create-only write needs nothing; the moment a writer drops
-// O_EXCL for O_TRUNC (an --output overwrite, the doctor bundle) it will happily follow an
-// attacker-planted link at that path and truncate the link's TARGET — and any subsequent
-// fd Chmod re-modes that target too. A shared, world-writable directory is enough.
-//
-// Lstat does not follow the final path component, so this inspects the link itself. A
-// missing path is fine (the caller is about to create it). Any OTHER stat error is an
-// error, not an implicit "not a symlink": gating the refusal on "stat succeeded" would let
-// a stat fault skip the check, which is the fail-open direction this exists to prevent.
-// internal/audit's rotate.go applies the same rule to the audit log; this is its
-// cmd/eunox twin, kept separate because the audit one is unexported to that package.
+// It is the binding of the shared guard in internal/config for the writers that truncate
+// an operator-supplied destination (--output, the doctor bundle); see
+// config.RefuseNonRegularPath for what the guard covers.
 func refuseNonRegularOutput(path string) error {
-	fi, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("checking %q before overwrite: %w", path, err)
-	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("%q is a symbolic link; refusing to follow it and overwrite its target — remove the link or choose a different path", path)
-	}
-	if !fi.Mode().IsRegular() {
-		return fmt.Errorf("%q is not a regular file; refusing to overwrite it", path)
-	}
-	return nil
+	return config.RefuseNonRegularPath(path, "output file")
 }
 
 // writeGeneratedFile writes content to path at mode 0600, refusing to clobber a

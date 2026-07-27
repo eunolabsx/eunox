@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -18,9 +19,109 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/eunolabs/eunox/pkg/capability"
 )
+
+// requireJSONContentType admits only a request body labelled application/json, failing
+// closed on an absent, unparseable, or duplicated Content-Type header. Every POST this
+// proxy serves — the /mcp JSON-RPC body and the /control/kill body — is JSON, and the
+// MCP Streamable HTTP spec already requires conformant clients to say so, so no honest
+// caller is turned away.
+//
+// It is a CSRF hardening measure, not merely conformance. checkOrigin is the primary
+// control and already rejects the cross-origin browser POST (browsers attach Origin to
+// every cross-origin POST, and both a foreign origin and the opaque "null" are refused).
+// This gate covers the class from the other side: a body sent with the default
+// text/plain (or a form/multipart) content type is a CORS SIMPLE request, dispatched
+// with no preflight, and the sessionless initialize POST is the one /mcp entry point
+// that needs no custom header — so requiring a JSON content type forces a preflight on
+// exactly the request that could otherwise reach a handler without one. Session-bound
+// POSTs are already preflighted by their Mcp-Session-Id header.
+//
+// A refusal IS recorded on the tape, through the same rate-limited pre-session path
+// checkOrigin uses. The gate sits behind the transport credential on both endpoints —
+// checkAuth/ValidateToken for /mcp, checkControlToken for /control/kill — so on a
+// deployment that configures either one this is an AUTHENTICATED caller's refusal, not
+// an anonymous one; and where no credential is configured, preSessionDenyLimiter is
+// exactly the bucket that makes an anonymous caller's refusals safe to write. Leaving
+// it unrecorded made a content-type sweep of the sessionless initialize POST and the
+// emergency stop the one transport refusal invisible to an incident responder, while
+// the same actor's wrong-Origin attempts were fully logged.
+//
+// More than one Content-Type header is rejected outright, for the reason checkOrigin
+// rejects a duplicated Origin: Header.Get would validate the first while a proxy or host
+// downstream may act on another. That leg also prints a stderr line, because it is the
+// one refusal an operator can hit through no fault of their client — a reverse proxy
+// that re-adds the header duplicates it — and a silent total-outage 415 is the hardest
+// possible thing to diagnose. Note the duplicate rule is a HEADER-level one: Go's mime
+// accepts a repeated *parameter* whose value is identical, so only the count check below
+// enforces it.
+func (p *HTTPProxy) requireJSONContentType(w http.ResponseWriter, r *http.Request) bool {
+	vals := r.Header.Values("Content-Type")
+	switch {
+	case len(vals) > 1:
+		fmt.Fprintf(os.Stderr,
+			"[eunox] SECURITY: rejected request carrying %d Content-Type headers (%q); exactly one is required (a reverse proxy that re-adds the header will trip this)\n",
+			len(vals), strings.Join(vals, ", "))
+	case len(vals) == 1 && isJSONMediaType(vals[0]):
+		return true
+	}
+	// Unstamped by design (no route/policy fields), like every other pre-session record:
+	// this gate can run before route resolution. The header value is NOT recorded — it is
+	// attacker-controlled free text, and the count is the only part worth keeping.
+	p.recordPreSessionDeny(r, codeUnsupportedMediaType, "content_type", map[string]interface{}{
+		"header_count": len(vals),
+	})
+	http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
+	return false
+}
+
+// isJSONMediaType reports whether a Content-Type header value denotes application/json.
+//
+// The common shapes — a bare "application/json" and any ASCII-case variant of it — are
+// answered without touching mime.ParseMediaType, which allocates its parameter map
+// unconditionally (measurably: ~290ns/48B for the bare form, ~800ns/336B with a charset
+// parameter, against ~55ns and no allocation here) on a gate that now precedes every
+// enforced MCP call. Anything carrying a parameter falls through to the real parser, so
+// the accept/reject set is unchanged.
+//
+// The fold is ASCII-only ON PURPOSE: strings.EqualFold applies Unicode simple folding,
+// under which U+017F (LATIN SMALL LETTER LONG S) folds to 's' — so "application/jſon"
+// would pass a fold-based fast path while ParseMediaType rejects it, making the fast and
+// slow paths disagree about the same header.
+func isJSONMediaType(v string) bool {
+	if !strings.Contains(v, ";") && asciiEqualFold(strings.TrimSpace(v), CTJSON) {
+		return true
+	}
+	// ParseMediaType lower-cases the media type and strips parameters, so
+	// "Application/JSON; charset=utf-8" is admitted. The error check must come FIRST and
+	// must not be dropped: a malformed parameter list ("application/json;;",
+	// `application/json; x="unterminated`) returns a NON-EMPTY media type alongside its
+	// error, so comparing mt alone would admit it.
+	mt, _, err := mime.ParseMediaType(v)
+	return err == nil && mt == CTJSON
+}
+
+// asciiEqualFold is strings.EqualFold restricted to ASCII case folding — no Unicode
+// special cases (see isJSONMediaType for why that distinction is load-bearing). want
+// must already be lower-case ASCII.
+func asciiEqualFold(got, want string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := 0; i < len(got); i++ {
+		c := got[i]
+		if 'A' <= c && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c != want[i] {
+			return false
+		}
+	}
+	return true
+}
 
 // Pre-session denial records are the only audit writes an UNAUTHENTICATED caller can
 // trigger, so they are the only ones whose rate an attacker sets. They are bounded by a
@@ -318,6 +419,44 @@ func (p *HTTPProxy) checkOrigin(w http.ResponseWriter, r *http.Request) bool {
 // MaxHeaderBytes) to the tape, turning the refusal record into a log-flooding primitive.
 const maxClaimedSessionIDLen = 200
 
+// sanitizeClaimedID makes an attacker-controlled header value safe to put in a signed
+// audit field: it replaces any invalid UTF-8 with the replacement character, then cuts to
+// at most limit BYTES without splitting a rune.
+//
+// Both halves are load-bearing, and the byte cut alone is not enough. Go's net/http
+// admits bytes >= 0x80 in a header value, so the raw Mcp-Session-Id can be arbitrary
+// bytes:
+//
+//   - Without the ToValidUTF8 pass, json.Marshal silently rewrites those bytes to U+FFFD
+//     when the record is serialized, so the signed field diverges from the header a SIEM
+//     holds — with or without truncation, since a short invalid header is never cut at
+//     all. Replacing them here makes the substitution explicit and identical on both
+//     sides of the wire instead of an artifact of the encoder.
+//   - Without the rune-boundary walk, the cut lands mid-rune and produces the same
+//     silent U+FFFD rewrite for a perfectly valid multi-byte header.
+//
+// Order matters: sanitizing FIRST means the walk-back only ever skips real continuation
+// bytes and so drops at most 3, where cutting first could walk a run of attacker-chosen
+// 0x80 bytes all the way to zero and stamp an EMPTY claimed_session_id on a request that
+// carried a 300-byte header — discarding the correlation evidence the field exists for.
+//
+// The bound stays a BYTE bound: it exists to cap what an unauthenticated caller can
+// append to a record, and that is a byte budget.
+func sanitizeClaimedID(s string, limit int) string {
+	s = strings.ToValidUTF8(s, string(utf8.RuneError))
+	if limit <= 0 {
+		return ""
+	}
+	if len(s) <= limit {
+		return s
+	}
+	keep := limit
+	for keep > 0 && !utf8.RuneStart(s[keep]) {
+		keep--
+	}
+	return s[:keep]
+}
+
 func addClaimedSessionID(details map[string]interface{}, r *http.Request) map[string]interface{} {
 	claimed := r.Header.Get(SessionHeader)
 	if claimed == "" {
@@ -329,8 +468,11 @@ func addClaimedSessionID(details map[string]interface{}, r *http.Request) map[st
 	if details == nil {
 		details = make(map[string]interface{}, 1)
 	}
-	if len(claimed) > maxClaimedSessionIDLen {
-		claimed = claimed[:maxClaimedSessionIDLen]
+	if sanitized := sanitizeClaimedID(claimed, maxClaimedSessionIDLen); sanitized != claimed {
+		// The value was invalid UTF-8, over the bound, or both. Flag it so a reader knows
+		// the field is not the header verbatim; sanitizeClaimedID documents which
+		// substitutions it makes.
+		claimed = sanitized
 		details["claimed_session_id_truncated"] = true
 	}
 	details["claimed_session_id"] = claimed
@@ -355,16 +497,47 @@ func addClaimedSessionID(details map[string]interface{}, r *http.Request) map[st
 //
 // These records deliberately carry NO route name and no policy_version/policy_sha256
 // stamp: they are written through the proxy-wide p.sink rather than a route's
-// routeSink, because every caller fires before route resolution — and stays there on
+// routeSink, because these callers fire before route resolution — and stay there on
 // purpose, since resolving the route first would turn the 404-vs-401 split into an
 // oracle for enumerating route names. An auditor diffing record shapes should read
 // the missing stamp as "refused before any route was chosen", not as a stamping bug.
+// The one refusal that DOES know its route by the time it fires — the session cap —
+// goes through recordSessionCapDeny instead, which keeps this rate limiter and this
+// claimed_session_id rule but writes through the route's sink so its record carries the
+// same route stamp as its in-flight-cap sibling.
 func (p *HTTPProxy) recordPreSessionDeny(r *http.Request, code, category string, extra map[string]interface{}) {
-	if p.sink == nil {
+	p.recordRefusal(r, nil, code, category, extra)
+}
+
+// recordSessionCapDeny records a session-cap refusal — the pre-spawn slot reservation and
+// the errSessionLimit leg of writeSessionCreateError, the two halves of one condition.
+//
+// It writes RESOURCE_EXHAUSTED through the ROUTE's sink, so the record carries the route
+// name and policy stamp exactly like the per-session in-flight cap's record: one denial
+// code, one record shape, whichever cap the flood hit. What it does NOT drop is the rate
+// limit — unlike the in-flight cap, this refusal is reachable WITHOUT an established
+// session, so an unbounded write here would hand a remote caller the audit-queue flooding
+// primitive preSessionDenyLimiter exists to deny.
+func (p *HTTPProxy) recordSessionCapDeny(r *http.Request, route *UpstreamRoute) {
+	p.recordRefusal(r, route, codeResourceExhausted, "saturation", map[string]interface{}{
+		"source_ip": p.sourceIP(r),
+		"reason":    "session_limit_reached",
+	})
+}
+
+// recordRefusal is the shared body of the two above: rate-limit, fold any suppressed
+// count in, stamp the unverified claimed_session_id, and write through route's sink when
+// the route is already known (nil ⟹ the proxy-wide sink).
+func (p *HTTPProxy) recordRefusal(r *http.Request, route *UpstreamRoute, code, category string, extra map[string]interface{}) {
+	rec := asRecorder(p.sink)
+	if route != nil {
+		rec = asRecorder(route.sink)
+	}
+	if rec == nil {
 		return
 	}
 	if p.preSessionDenies == nil { // defensive: a proxy built outside the constructor
-		p.sink.RecordDeny(r.Context(), "", "", "", code, category, addClaimedSessionID(extra, r), false)
+		rec.RecordDeny(r.Context(), "", "", "", code, category, addClaimedSessionID(extra, r), false)
 		return
 	}
 	ok, suppressed := p.preSessionDenies.admit()
@@ -377,7 +550,7 @@ func (p *HTTPProxy) recordPreSessionDeny(r *http.Request, code, category string,
 		}
 		extra["suppressed_count"] = suppressed
 	}
-	p.sink.RecordDeny(r.Context(), "", "", "", code, category, addClaimedSessionID(extra, r), false)
+	rec.RecordDeny(r.Context(), "", "", "", code, category, addClaimedSessionID(extra, r), false)
 }
 
 // originAllowed reports whether a present Origin value is permitted. The origin must

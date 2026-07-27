@@ -265,6 +265,7 @@ func TestHandleKill_RecordsSuccessfulActivation(t *testing.T) {
 			})
 
 			req := httptest.NewRequest(http.MethodPost, "/control/kill", strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", CTJSON)
 			req.RemoteAddr = "127.0.0.1:6666"
 			req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 			req.Header.Set(ControlTokenHeader, "control-s3cret")
@@ -320,6 +321,7 @@ func TestHandleKill_NoRecordWhenActivationFails(t *testing.T) {
 	proxy.ks = failingKillSwitch{}
 
 	req := httptest.NewRequest(http.MethodPost, "/control/kill", strings.NewReader(`{"all":true}`))
+	req.Header.Set("Content-Type", CTJSON)
 	req.RemoteAddr = "127.0.0.1:6666"
 	req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	req.Header.Set(ControlTokenHeader, "control-s3cret")
@@ -362,4 +364,160 @@ func (failingKillSwitch) ReviveSession(context.Context, string) error {
 func (failingKillSwitch) Reset(context.Context) error { return errors.New("backend down") }
 func (failingKillSwitch) Status(context.Context) (*killswitch.Status, error) {
 	return nil, errors.New("backend down")
+}
+
+// TestSessionCapDeny_CarriesRouteStamp pins the session-cap refusal's record SHAPE. It
+// shares a denial code with the per-session in-flight cap, so it must share the record
+// shape too: written through the ROUTE's sink, carrying the route name and policy stamp.
+// It previously went through the proxy-wide, route-unstamped pre-session path, leaving one
+// denial code with two shapes depending on which cap the flood happened to hit.
+func TestSessionCapDeny_CarriesRouteStamp(t *testing.T) {
+	sink, logPath := newTempAuditSink(t)
+	proxy := &HTTPProxy{sink: sink, preSessionDenies: newPreSessionDenyLimiter()}
+	route := &UpstreamRoute{
+		name: "github",
+		sink: &routeSink{sink: sink, upstream: "github", policyVersion: "1.2.3", policySHA256: "sha256:abc"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/mcp/github", http.NoBody)
+
+	proxy.recordSessionCapDeny(req, route)
+
+	_ = sink.Close()
+	rec := findAuditRecordByCode(readAuditRecords(t, logPath), "RESOURCE_EXHAUSTED")
+	if rec == nil {
+		t.Fatal("expected a RESOURCE_EXHAUSTED record for the session-cap refusal")
+	}
+	if got, _ := rec["upstream"].(string); got != "github" {
+		t.Errorf("upstream = %q, want the route name — the session-cap record must carry the same route stamp as its in-flight-cap sibling", got)
+	}
+	if got, _ := rec["policy_version"].(string); got != "1.2.3" {
+		t.Errorf("policy_version = %q, want 1.2.3", got)
+	}
+	details, _ := rec["details"].(map[string]interface{})
+	if details == nil || details["reason"] != "session_limit_reached" {
+		t.Errorf("details = %v, want reason=session_limit_reached", details)
+	}
+	// The rate limit is retained: unlike the in-flight cap, this refusal is reachable
+	// without an established session, so it must stay behind the pre-session limiter.
+	if got, _ := rec["session_id"].(string); got != "" {
+		t.Errorf("session_id = %q, want empty — no session exists at the cap refusal", got)
+	}
+}
+
+// TestNotificationSaturation_RecordsResourceExhausted: the notification pool's drop must
+// leave the same RESOURCE_EXHAUSTED record its request-pool sibling does. The notification
+// most worth having on the tape is notifications/cancelled — an incident responder asking
+// why an aborted call ran to completion cannot get that answer from stderr alone.
+func TestNotificationSaturation_RecordsResourceExhausted(t *testing.T) {
+	sink, logPath := newTempAuditSink(t)
+	proxy, proxySrv := newTestRemoteProxy(t, startFakeUpstream(t, newFullFakeUpstream()), httpProxyOptions{
+		PDP:        pdp.AlwaysAllowPDP{},
+		DriftCheck: drift.CheckFunc(func(json.RawMessage, string, error) error { return nil }),
+		Sink:       sink,
+	})
+	sid := initSession(t, proxySrv)
+
+	sess := proxy.getSession(sid)
+	if sess == nil {
+		t.Fatal("session not found after initialize")
+	}
+	for i := 0; i < maxConcurrentSessionNotifications; i++ {
+		if !sess.tryAcquireNotifySlot() {
+			t.Fatalf("acquire %d must succeed within the cap", i)
+		}
+	}
+
+	resp := postMCP(t, proxySrv, mcp.RPCMsg{
+		JSONRPC: "2.0",
+		Method:  "notifications/cancelled",
+		Params:  json.RawMessage(`{"requestId":7}`),
+	}, sid)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("dropped notification status = %d, want 202 (fire-and-forget ack)", resp.StatusCode)
+	}
+	_ = resp.Body.Close()
+
+	_ = sink.Close()
+	rec := findAuditRecordByCode(readAuditRecords(t, logPath), "RESOURCE_EXHAUSTED")
+	if rec == nil {
+		t.Fatal("expected a RESOURCE_EXHAUSTED record when the notification pool is saturated")
+	}
+	if method, _ := rec["method"].(string); method != "notifications/cancelled" {
+		t.Errorf("record method=%q, want notifications/cancelled", method)
+	}
+	if got, _ := rec["session_id"].(string); got != sid {
+		t.Errorf("record session_id=%q, want the established session %q", got, sid)
+	}
+}
+
+// TestUnsupportedMediaType_RecordsRefusal pins that a 415 lands on the tamper-evident
+// tape like every other transport-level refusal. Without it, a content-type sweep of
+// the sessionless initialize POST — the one /mcp entry point that needs no custom
+// header — and of the emergency stop was the single refusal an incident responder
+// could not see, while the same actor's wrong-Origin attempts were fully recorded.
+//
+// The attacker-controlled header VALUE must never reach the tape; only the count does.
+func TestUnsupportedMediaType_RecordsRefusal(t *testing.T) {
+	cases := []struct {
+		name        string
+		contentType []string
+		wantCount   float64
+	}{
+		{"wrong media type", []string{"text/plain"}, 1},
+		{"absent header", nil, 0},
+		{"duplicated header", []string{CTJSON, CTJSON}, 2},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			sink, logPath := newTempAuditSink(t)
+			proxy := newHTTPProxy(httpProxyOptions{
+				PDP:         pdp.AlwaysAllowPDP{},
+				UpstreamURL: "http://upstream.invalid",
+				Sink:        sink,
+			})
+			route := proxy.routes[""]
+
+			body := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{},"secret":"s3cret-body"}`
+			req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+			req.Header.Del("Content-Type")
+			for _, v := range tc.contentType {
+				req.Header.Add("Content-Type", v)
+			}
+			req.RemoteAddr = "203.0.113.7:5555"
+			rec := httptest.NewRecorder()
+			proxy.handleMCPPost(rec, req, route)
+			if rec.Code != http.StatusUnsupportedMediaType {
+				t.Fatalf("status = %d, want 415", rec.Code)
+			}
+
+			_ = sink.Close()
+			records := readAuditRecords(t, logPath)
+			if !hasAuditRecordWithCode(records, codeUnsupportedMediaType) {
+				t.Fatalf("expected an %s audit record for the refused content type; got %d records", codeUnsupportedMediaType, len(records))
+			}
+			var found map[string]interface{}
+			for _, r := range records {
+				if c, _ := r["denial_code"].(string); c == codeUnsupportedMediaType {
+					found = r
+					break
+				}
+			}
+			details, _ := found["details"].(map[string]interface{})
+			if got, _ := details["header_count"].(float64); got != tc.wantCount {
+				t.Errorf("details.header_count = %v, want %v", got, tc.wantCount)
+			}
+			// Neither the offending header value nor the request body may be recorded.
+			assertRecordsExclude(t, records, "text/plain", "s3cret-body")
+		})
+	}
+}
+
+// TestUnsupportedMediaType_IsNonPolicyCode pins that the new code joins its siblings in
+// the infra-denial set, so `suggest` skips it rather than mining a phantom policy target
+// out of a malformed request.
+func TestUnsupportedMediaType_IsNonPolicyCode(t *testing.T) {
+	if !IsInfraDenialCode(codeUnsupportedMediaType) {
+		t.Errorf("%s names no policy target, so it must be classified as an infra denial", codeUnsupportedMediaType)
+	}
 }

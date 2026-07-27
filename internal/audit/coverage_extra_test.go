@@ -1150,8 +1150,8 @@ func TestOpen_RefusesSymlinkLogPath(t *testing.T) {
 	keyPath := filepath.Join(dir, "audit.key")
 	if _, err := Open(logPath, keyPath, 0, 0); err == nil {
 		t.Fatal("Open must refuse a symlinked log path")
-	} else if !strings.Contains(err.Error(), "non-regular log path") {
-		t.Fatalf("error = %v, want a 'non-regular log path' rejection", err)
+	} else if !strings.Contains(err.Error(), "symbolic link") || !strings.Contains(err.Error(), "audit log path") {
+		t.Fatalf("error = %v, want a rejection naming both the symbolic link and the audit log path", err)
 	}
 	// The symlink itself must be left untouched (not replaced by a regular file).
 	if fi, err := os.Lstat(logPath); err != nil {

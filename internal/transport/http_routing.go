@@ -92,16 +92,31 @@ func (p *HTTPProxy) handleMCP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// decodeStrictJSON decodes exactly one JSON value from r.Body into v, then requires
-// io.EOF: a body carrying a second JSON value (or any other trailing non-whitespace
-// token) is malformed and must be rejected with 400 before any dispatch, rather than
-// silently truncated to its first value — otherwise a multi-token /mcp body could
-// 202-ack an invalid initialize notification, or a /control/kill body could execute
-// a narrower kill while silently ignoring a smuggled trailing {"all":true}. On a
-// decode failure or trailing data this writes the response itself (400, or 413 for a
-// body that exceeds the MaxBytesReader cap the caller installed on r.Body) and
-// returns false; the caller must return immediately without proceeding.
-func decodeStrictJSON(w http.ResponseWriter, r *http.Request, v interface{}, invalidBodyMsg string) bool {
+// decodeStrictJSON is the single safe way to read a JSON POST body in this package. It
+// gates the Content-Type (415 for anything but application/json — see
+// requireJSONContentType) and then decodes exactly one JSON value from r.Body into v,
+// requiring io.EOF after it: a body carrying a second JSON value (or any other trailing
+// non-whitespace token) is malformed and must be rejected with 400 before any dispatch,
+// rather than silently truncated to its first value — otherwise a multi-token /mcp body
+// could 202-ack an invalid initialize notification, or a /control/kill body could execute
+// a narrower kill while silently ignoring a smuggled trailing {"all":true}. On a refused
+// content type, a decode failure, or trailing data this writes the response itself (415,
+// 400, or 413 for a body that exceeds the MaxBytesReader cap the caller installed on
+// r.Body) and returns false; the caller must return immediately without proceeding.
+//
+// The content-type gate lives HERE, rather than being repeated at each handler, for the
+// reason checkOrigin is a mux-wide wrapper: it makes the control unforgettable. Every
+// JSON POST body in this package is read through this function, so a future endpoint
+// gets the gate by construction instead of by remembering a line — and forgetting that
+// line would silently restore the no-preflight CORS-simple-request path the gate closes.
+// (A mux wrapper is the wrong shape for this one: GET and DELETE carry no body.)
+//
+// It runs after the caller has installed MaxBytesReader, which only wraps the reader and
+// consumes nothing, so a refused request still has its body read zero times by us.
+func (p *HTTPProxy) decodeStrictJSON(w http.ResponseWriter, r *http.Request, v interface{}, invalidBodyMsg string) bool {
+	if !p.requireJSONContentType(w, r) {
+		return false
+	}
 	dec := json.NewDecoder(r.Body)
 	if err := dec.Decode(v); err != nil {
 		var mbe *http.MaxBytesError
@@ -138,20 +153,19 @@ func decodeStrictJSON(w http.ResponseWriter, r *http.Request, v interface{}, inv
 // operator and returned to the client as a generic 500. Extracted from handleMCPPost so
 // the session-creating initialize branch stays within the nested-complexity budget.
 //
-// errSessionLimit is additionally recorded on the tape. It is a saturation refusal exactly
-// like the per-session in-flight cap that recordResourceExhausted covers, but reachable
-// WITHOUT an established session, so it is the cheaper flood for an attacker and was the
-// one leaving no trace — an incident responder reconstructing an outage saw
-// RESOURCE_EXHAUSTED for in-flight floods and a blank for session-cap floods. The other
-// two legs are benign lifecycle races (a kill sweep, a graceful drain), not attack signal,
-// so they stay status-only.
-func (p *HTTPProxy) writeSessionCreateError(w http.ResponseWriter, r *http.Request, err error) {
+// errSessionLimit is additionally recorded on the tape, through recordSessionCapDeny —
+// the same helper the pre-spawn slot reservation uses, so the two ways to hit one cap
+// cannot produce two record shapes. It is a saturation refusal exactly like the
+// per-session in-flight cap that recordResourceExhausted covers, but reachable WITHOUT an
+// established session, so it is the cheaper flood for an attacker (hence the rate limit
+// recordSessionCapDeny keeps) and was the one leaving no trace — an incident responder
+// reconstructing an outage saw RESOURCE_EXHAUSTED for in-flight floods and a blank for
+// session-cap floods. The other two legs are benign lifecycle races (a kill sweep, a
+// graceful drain), not attack signal, so they stay status-only.
+func (p *HTTPProxy) writeSessionCreateError(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, err error) {
 	switch {
 	case errors.Is(err, errSessionLimit):
-		p.recordPreSessionDeny(r, codeResourceExhausted, "saturation", map[string]interface{}{
-			"source_ip": p.sourceIP(r),
-			"reason":    "session_limit_reached",
-		})
+		p.recordSessionCapDeny(r, route)
 		http.Error(w, "session limit reached", http.StatusServiceUnavailable)
 	case errors.Is(err, errRacedReap):
 		http.Error(w, "session raced a kill-switch reset; retry", http.StatusServiceUnavailable)
@@ -174,7 +188,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 	// token BEFORE dispatching — otherwise a multi-token body could 202-ack an invalid
 	// initialize notification or run its first request on an existing session while
 	// the trailer is silently dropped.
-	if !decodeStrictJSON(w, r, &msg, "invalid JSON-RPC body") {
+	if !p.decodeStrictJSON(w, r, &msg, "invalid JSON-RPC body") {
 		return
 	}
 
@@ -206,7 +220,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 	// Require msg.IsRequest(): an initialize *notification* (no id) must never start
 	// an upstream or consume a session slot — a flood would otherwise spawn unbounded
 	// upstreams. It is handled as a stateless notification below.
-	if msg.Method == "initialize" && sessionID == "" && msg.IsRequest() {
+	if msg.Method == mcp.MethodInitialize && sessionID == "" && msg.IsRequest() {
 		// Kill-switch check BEFORE spawning anything: a session-creating initialize
 		// must not start an upstream while a global kill (emergency stop) is active.
 		// The empty session id means only the global dimension can match. This is the one
@@ -214,7 +228,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 		// dispatchParams yet), so it repeats the kill gate dispatchRequest applies to
 		// every other locally-answered method.
 		if deny := route.pdp.CheckKill(r.Context(), ""); deny != nil {
-			resp := recordKillDenial(r.Context(), asRecorder(route.sink), deny, msg.ID, "", "initialize")
+			resp := recordKillDenial(r.Context(), asRecorder(route.sink), deny, msg.ID, "", mcp.MethodInitialize)
 			writeJSONMsg(w, resp)
 			return
 		}
@@ -245,11 +259,10 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 		if !p.tryReserveSessionSlot() {
 			// Recorded for the same reason as the errSessionLimit leg of
 			// writeSessionCreateError: this is the cheap pre-spawn twin of that refusal and
-			// the surface an unauthenticated saturation flood reaches first.
-			p.recordPreSessionDeny(r, codeResourceExhausted, "saturation", map[string]interface{}{
-				"source_ip": p.sourceIP(r),
-				"reason":    "session_limit_reached",
-			})
+			// the surface an unauthenticated saturation flood reaches first. Both halves go
+			// through the one route-stamped helper, so the two ways to hit the same cap
+			// cannot produce two record shapes.
+			p.recordSessionCapDeny(r, route)
 			http.Error(w, "session limit reached", http.StatusServiceUnavailable)
 			return
 		}
@@ -286,7 +299,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 			sess, err = p.newSession(initCtx, route, clientIP)
 		}
 		if err != nil {
-			p.writeSessionCreateError(w, r, err)
+			p.writeSessionCreateError(w, r, route, err)
 			return
 		}
 		w.Header().Set(SessionHeader, sess.id)
@@ -302,7 +315,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 	if sessionID == "" {
 		// An initialize notification (excluded from the session-creation branch above)
 		// expects no response: accept and drop it without allocating session state.
-		if msg.Method == "initialize" && msg.IsNotification() {
+		if msg.Method == mcp.MethodInitialize && msg.IsNotification() {
 			// Consult the kill switch BEFORE the 202 ack. Under the MCP Streamable HTTP
 			// spec a 202 to an initialize notification is a readiness acknowledgement, so
 			// returning it while a global emergency stop is active would tell the client
@@ -506,6 +519,13 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 			// saturation drop the notification and log it rather than block the handler
 			// goroutine indefinitely.
 			if !sess.tryAcquireNotifySlot() {
+				// Record the drop on the tape, exactly as the enforced-request slot's
+				// saturation refusal does ~70 lines below. stderr alone is not the
+				// tamper-evident trail, and the notification most worth having there is
+				// notifications/cancelled: an incident responder asking why a call the host
+				// tried to abort ran to completion needs the drop to be a record, not a line
+				// in a container log that rotation may already have discarded.
+				recordResourceExhausted(r.Context(), asRecorder(route.sink), sessionID, msg.Method)
 				fmt.Fprintf(os.Stderr, "[eunox] HTTP session %s: notification %q dropped: too many concurrent notifications in flight\n", sessionID, msg.Method)
 				w.WriteHeader(http.StatusAccepted)
 				return
@@ -554,7 +574,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 
 	ctx := r.Context()
 	var resp mcp.RPCMsg
-	if msg.Method == "initialize" {
+	if msg.Method == mcp.MethodInitialize {
 		// Re-initialize is answered locally from capabilities captured at session start
 		// (the session-ownership binding was already enforced above, before touchRequest).
 		// It routes through the shared dispatcher like every other enforced method, so its
@@ -1060,7 +1080,10 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 	// {"sessionId":"..."} followed by a smuggled {"all":true}): without this, only
 	// the first value is decoded and the second is silently dropped, so the kill
 	// actually executed could differ from what a body-only reviewer would expect.
-	if !decodeStrictJSON(w, r, &body, "invalid request body") {
+	// decodeStrictJSON applies the JSON-only content-type gate too, and it runs after the
+	// control-token check above, so a caller without the token learns nothing about the
+	// body this endpoint expects.
+	if !p.decodeStrictJSON(w, r, &body, "invalid request body") {
 		return
 	}
 	if body.All {

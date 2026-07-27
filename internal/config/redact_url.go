@@ -1,12 +1,19 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// URL credential redaction shared by every path that surfaces an upstream URL —
-// config validation errors, the live-probe error, and the doctor support bundle —
-// so a userinfo credential or a ?token=/#access_token= secret cannot leak through any
-// of them. This is the single, robust redactor those call sites consolidate onto; it
+// URL credential redaction for the OPERATOR-FACING surfaces — today the doctor support
+// bundle's URL-bearing config fields and its audit-tail targets — so a userinfo
+// credential or a ?token=/#access_token= secret cannot leak through any of them. It
 // handles the hierarchical, opaque, scheme-less, and unparseable forms and fails safe
 // (never returns the raw value) on anything url.Parse cannot handle.
+//
+// The surface rule, stated once here: this redactor keeps the path and the query
+// parameter NAMES, which is the detail an operator reading their own bundle needs.
+// Anything that reaches a LOG — a startup banner, a validation error, a runtime warning,
+// all of which land in the systemd journal, container stdout, or a CI log — uses the
+// stricter capability.RedactURLForLog instead, which keeps only scheme://host. Neither is
+// a fallback for the other: picking by surface is what keeps one process from redacting
+// the same URL two ways.
 
 package config
 
@@ -100,6 +107,36 @@ func RedactURL(s string) string {
 			return "<redacted unparseable URL>"
 		}
 		return redactURLFallback(s)
+	}
+	if u.Scheme != "" && u.OmitHost && strings.Contains(u.Path, "@") {
+		// A single-slash scheme typo: "https:/alice:SECRET@host/mcp". url.Parse puts the
+		// WHOLE credentialed authority in u.Path, which none of the scrubs above inspect,
+		// so `changed` stayed false and the raw credential was returned verbatim.
+		//
+		// Redact wholesale rather than deferring to redactURLFallback, for the same reason
+		// the opaque branch above does: this value has no authority of its own, and the
+		// fallback's heuristic anchors on the FIRST "://" in the string. A "://" occurring
+		// later — in a query, as in "https:/user:pw@host/x?next=https://portal" — sits PAST
+		// the credential, so the fallback would scan for the userinfo boundary beyond it,
+		// find none, and hand the credential back verbatim.
+		//
+		// The test is positional, taken from url.Parse's own structural verdict rather
+		// than from a substring scan: OmitHost reports that the value carried NO authority
+		// marker at all, which is what makes an '@' in the path suspect. Two shapes must
+		// NOT be caught, and a scan for "//" (or even "://") anywhere in the string gets
+		// both wrong:
+		//
+		//   - "file:///home/a@b/x" has an explicit, empty authority, so OmitHost is false
+		//     and the '@' really is a path character. Its path is preserved.
+		//   - "https:/user:pw@host/x?next=https://portal" and ".../a//b" DO contain "//",
+		//     just not as their own authority marker — a scan would skip them and echo the
+		//     credential, which is exactly the hole this guard was first written with.
+		//
+		// A scheme-LESS value is left alone: "/var/log/eunox@prod/audit.jsonl" is an
+		// ordinary path, and the audit-tail targets this redactor is pointed at are
+		// commonly exactly that. The scheme-less credentialed form "user:pw@host/path"
+		// parses as scheme "user" with an opaque body and is caught by the branch above.
+		return "<redacted unparseable URL>"
 	}
 	if !changed {
 		// A hierarchical "scheme://host/..." with authority credentials always populates
