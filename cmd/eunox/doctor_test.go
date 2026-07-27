@@ -923,8 +923,7 @@ func TestCmdDoctor_ExitCodes(t *testing.T) {
 	dir := t.TempDir()
 
 	t.Run("stray positional", func(t *testing.T) {
-		var code int
-		code = cmdDoctor([]string{"unexpected.txt"})
+		code := cmdDoctor([]string{"unexpected.txt"})
 		if code != 1 {
 			t.Errorf("exit code = %d, want 1 for a stray positional", code)
 		}
@@ -935,8 +934,7 @@ func TestCmdDoctor_ExitCodes(t *testing.T) {
 		if err := os.WriteFile(bad, []byte("this: is: not: valid: yaml:\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		var code int
-		code = cmdDoctor([]string{"--config", bad, "--audit-tail", "0"})
+		code := cmdDoctor([]string{"--config", bad, "--audit-tail", "0"})
 		if code != 1 {
 			t.Errorf("exit code = %d, want 1 for an unloadable --config", code)
 		}
@@ -948,24 +946,21 @@ func TestCmdDoctor_ExitCodes(t *testing.T) {
 		if err := os.WriteFile(notDir, []byte("x"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		var code int
-		code = cmdDoctor([]string{"--output", filepath.Join(notDir, "bundle.txt"), "--audit-log", filepath.Join(dir, "absent.jsonl"), "--audit-tail", "0"})
+		code := cmdDoctor([]string{"--output", filepath.Join(notDir, "bundle.txt"), "--audit-log", filepath.Join(dir, "absent.jsonl"), "--audit-tail", "0"})
 		if code != 1 {
 			t.Errorf("exit code = %d, want 1 when the bundle cannot be opened for writing", code)
 		}
 	})
 
 	t.Run("bad flag", func(t *testing.T) {
-		var code int
-		code = cmdDoctor([]string{"--no-such-flag"})
+		code := cmdDoctor([]string{"--no-such-flag"})
 		if code != 1 {
 			t.Errorf("exit code = %d, want 1 for an unknown flag (ContinueOnError, not a process exit)", code)
 		}
 	})
 
 	t.Run("success to stdout", func(t *testing.T) {
-		var code int
-		code = cmdDoctor([]string{"--output", filepath.Join(dir, "ok.txt"), "--audit-log", filepath.Join(dir, "absent.jsonl"), "--audit-tail", "0"})
+		code := cmdDoctor([]string{"--output", filepath.Join(dir, "ok.txt"), "--audit-log", filepath.Join(dir, "absent.jsonl"), "--audit-tail", "0"})
 		if code != 0 {
 			t.Errorf("exit code = %d, want 0 on a clean run", code)
 		}

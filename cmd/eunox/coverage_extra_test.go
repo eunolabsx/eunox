@@ -2254,8 +2254,7 @@ func TestServeStdioHost_AuditModeStartsAndFailsFast(t *testing.T) {
 // ───────────────────────── cmdValidate error branches ───────────────────────
 
 func TestCmdValidate_NoFiles(t *testing.T) {
-	var code int
-	code = cmdValidate(nil)
+	code := cmdValidate(nil)
 	if code != 2 {
 		t.Errorf("expected exit code 2 (usage: no manifest files), got %d", code)
 	}
@@ -2268,8 +2267,7 @@ func TestCmdValidate_ConfigAndPositional(t *testing.T) {
 	if err := os.WriteFile(cfgPath, []byte("transport: stdio\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	var code int
-	code = cmdValidate([]string{"--config", cfgPath, mfPath})
+	code := cmdValidate([]string{"--config", cfgPath, mfPath})
 	if code != 2 {
 		t.Errorf("expected exit code 2 (usage: --config+positional conflict), got %d", code)
 	}
@@ -2281,16 +2279,14 @@ func TestCmdValidate_ConfigAndUpstreamURL(t *testing.T) {
 	if err := os.WriteFile(cfgPath, []byte("transport: stdio\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	var code int
-	code = cmdValidate([]string{"--config", cfgPath, "--upstream-url", "http://x"})
+	code := cmdValidate([]string{"--config", cfgPath, "--upstream-url", "http://x"})
 	if code != 2 {
 		t.Errorf("expected exit code 2 (usage: --config+--upstream-url conflict), got %d", code)
 	}
 }
 
 func TestCmdValidate_ConfigLoadError(t *testing.T) {
-	var code int
-	code = cmdValidate([]string{"--config", "/no/such/eunox.yaml"})
+	code := cmdValidate([]string{"--config", "/no/such/eunox.yaml"})
 	if code != 2 {
 		t.Errorf("expected exit code 2 (config load error), got %d", code)
 	}
@@ -2306,16 +2302,14 @@ capabilities: []
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	var code int
-	code = cmdValidate([]string{"--upstream-url", "http://x", mfPath})
+	code := cmdValidate([]string{"--upstream-url", "http://x", mfPath})
 	if code != 2 {
 		t.Errorf("expected exit code 2 (usage: transport flags without --live), got %d", code)
 	}
 }
 
 func TestCmdValidate_ManifestLoadError(t *testing.T) {
-	var code int
-	code = cmdValidate([]string{"/no/such/manifest.yaml"})
+	code := cmdValidate([]string{"/no/such/manifest.yaml"})
 	if code != 2 {
 		t.Errorf("expected exit code 2 (parse error, matching the documented codes and --config mode), got %d", code)
 	}
@@ -2376,8 +2370,7 @@ capabilities: []
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	var code int
-	code = cmdValidate([]string{"--live", mfPath})
+	code := cmdValidate([]string{"--live", mfPath})
 	if code != 2 {
 		t.Errorf("expected exit code 2 (connection error: --live without --upstream-url), got %d", code)
 	}
@@ -2393,8 +2386,7 @@ capabilities: []
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	var code int
-	code = cmdValidate([]string{"--live", "--upstream-url", "http://127.0.0.1:1", mfPath})
+	code := cmdValidate([]string{"--live", "--upstream-url", "http://127.0.0.1:1", mfPath})
 	if code != 2 {
 		t.Errorf("expected exit code 2 (connect failure), got %d", code)
 	}
@@ -2403,16 +2395,14 @@ capabilities: []
 // ───────────────────────── cmdInit error branches ───────────────────────────
 
 func TestCmdInit_MissingUpstreamURL(t *testing.T) {
-	var code int
-	code = cmdInit(nil)
+	code := cmdInit(nil)
 	if code != 1 {
 		t.Errorf("expected exit code 1 (missing --upstream-url), got %d", code)
 	}
 }
 
 func TestCmdInit_ConnectError(t *testing.T) {
-	var code int
-	code = cmdInit([]string{"--upstream-url", "http://127.0.0.1:1"})
+	code := cmdInit([]string{"--upstream-url", "http://127.0.0.1:1"})
 	if code != 2 {
 		t.Errorf("expected exit code 2 (connect failure), got %d", code)
 	}
@@ -2425,8 +2415,7 @@ func TestCmdInit_ConfigOutputWithoutOutput(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	var code int
-	code = cmdInit([]string{"--upstream-url", srv.URL, "--config-output", "/tmp/cfg.yaml"})
+	code := cmdInit([]string{"--upstream-url", srv.URL, "--config-output", "/tmp/cfg.yaml"})
 	if code != 1 {
 		t.Errorf("expected exit code 1 (--config-output without --output), got %d", code)
 	}
@@ -2435,8 +2424,7 @@ func TestCmdInit_ConfigOutputWithoutOutput(t *testing.T) {
 // ───────────────────────── cmdKill error branches ───────────────────────────
 
 func TestCmdKill_NoTarget(t *testing.T) {
-	var code int
-	code = cmdKill(nil)
+	code := cmdKill(nil)
 	if code != 1 {
 		t.Errorf("expected exit code 1 (no target arg), got %d", code)
 	}
@@ -2445,8 +2433,7 @@ func TestCmdKill_NoTarget(t *testing.T) {
 func TestCmdKill_NoControlToken(t *testing.T) {
 	dir := t.TempDir()
 	tokenPath := filepath.Join(dir, "no-such-token")
-	var code int
-	code = cmdKill([]string{"--port", "3001", "--control-token-path", tokenPath, "all"})
+	code := cmdKill([]string{"--port", "3001", "--control-token-path", tokenPath, "all"})
 	if code != 1 {
 		t.Errorf("expected exit code 1 (no control token), got %d", code)
 	}
@@ -2466,8 +2453,7 @@ func TestCmdKill_ProxyReturnsError(t *testing.T) {
 
 	addr := srv.Listener.Addr().String()
 	portStr := addr[strings.LastIndex(addr, ":")+1:]
-	var code int
-	code = cmdKill([]string{"--port", portStr, "--control-token", tok, "all"})
+	code := cmdKill([]string{"--port", portStr, "--control-token", tok, "all"})
 	if code != 1 {
 		t.Errorf("expected exit code 1 (proxy returned 403), got %d", code)
 	}
@@ -2477,8 +2463,7 @@ func TestCmdKill_ProxyReturnsError(t *testing.T) {
 
 func TestCmdAuditVerify_NoAuditLog(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "audit.jsonl")
-	var code int
-	code = cmdAuditVerify([]string{"--audit-log", logPath})
+	code := cmdAuditVerify([]string{"--audit-log", logPath})
 	if code != 1 {
 		t.Errorf("expected exit code 1 (no audit log), got %d", code)
 	}
@@ -2497,16 +2482,14 @@ func TestCmdAuditVerify_InvalidSince(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	var code int
-	code = cmdAuditVerify([]string{"--audit-log", logPath, "--audit-key-path", keyPath, "--since", "not-a-timestamp"})
+	code := cmdAuditVerify([]string{"--audit-log", logPath, "--audit-key-path", keyPath, "--since", "not-a-timestamp"})
 	if code != 1 {
 		t.Errorf("expected exit code 1 (invalid --since), got %d", code)
 	}
 }
 
 func TestCmdAuditVerify_ConfigLoadError(t *testing.T) {
-	var code int
-	code = cmdAuditVerify([]string{"--config", "/no/such/config.yaml"})
+	code := cmdAuditVerify([]string{"--config", "/no/such/config.yaml"})
 	if code != 1 {
 		t.Errorf("expected exit code 1 (config load error), got %d", code)
 	}
@@ -2516,16 +2499,14 @@ func TestCmdAuditVerify_ConfigLoadError(t *testing.T) {
 
 func TestCmdStats_NoAuditLog(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "audit.jsonl")
-	var code int
-	code = cmdStats([]string{"--audit-log", logPath})
+	code := cmdStats([]string{"--audit-log", logPath})
 	if code != 1 {
 		t.Errorf("expected exit code 1 (no audit log), got %d", code)
 	}
 }
 
 func TestCmdStats_ConfigLoadError(t *testing.T) {
-	var code int
-	code = cmdStats([]string{"--config", "/no/such/config.yaml"})
+	code := cmdStats([]string{"--config", "/no/such/config.yaml"})
 	if code != 1 {
 		t.Errorf("expected exit code 1 (config load error), got %d", code)
 	}
@@ -2535,8 +2516,7 @@ func TestCmdStats_ConfigLoadError(t *testing.T) {
 
 func TestCmdSuggest_NoAuditLog(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "audit.jsonl")
-	var code int
-	code = cmdSuggest([]string{"--audit-log", logPath})
+	code := cmdSuggest([]string{"--audit-log", logPath})
 	if code != 1 {
 		t.Errorf("expected exit code 1 (no audit log), got %d", code)
 	}
@@ -2699,8 +2679,7 @@ func TestRunValidateLive_FM2PinnedAndFM6_Plural(t *testing.T) {
 // TestCmdKill_RedisKillError covers the cmdKill branch where --redis-addr is
 // provided but the kill fails (unreachable Redis → ping refused).
 func TestCmdKill_RedisKillError(t *testing.T) {
-	var code int
-	code = cmdKill([]string{"--redis-addr", "127.0.0.1:1", "sess-x"})
+	code := cmdKill([]string{"--redis-addr", "127.0.0.1:1", "sess-x"})
 	if code != 1 {
 		t.Errorf("expected exit code 1 (redis kill failed), got %d", code)
 	}
@@ -2721,8 +2700,7 @@ func TestCmdKill_HttpDoFails(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var code int
-	code = cmdKill([]string{"--port", portStr, "--control-token", tok, "all"})
+	code := cmdKill([]string{"--port", portStr, "--control-token", tok, "all"})
 	if code != 1 {
 		t.Errorf("expected exit code 1 (http.Do connection refused), got %d", code)
 	}
@@ -2742,8 +2720,7 @@ func TestCmdAuditVerify_LoadOrCreateKeysError(t *testing.T) {
 	logPath := filepath.Join(dir, "audit.jsonl")
 	badKeyPath := filepath.Join(blocker, "subdir", "audit.key")
 
-	var code int
-	code = cmdAuditVerify([]string{"--audit-log", logPath, "--audit-key-path", badKeyPath})
+	code := cmdAuditVerify([]string{"--audit-log", logPath, "--audit-key-path", badKeyPath})
 	if code != 1 {
 		t.Errorf("expected exit code 1 (LoadOrCreateKeys failed), got %d", code)
 	}
@@ -2761,8 +2738,7 @@ func TestCmdAuditVerify_LogChainFilesError(t *testing.T) {
 	logPath := filepath.Join(blocker, "audit.jsonl")
 	keyPath := filepath.Join(dir, "audit.key")
 
-	var code int
-	code = cmdAuditVerify([]string{"--audit-log", logPath, "--audit-key-path", keyPath})
+	code := cmdAuditVerify([]string{"--audit-log", logPath, "--audit-key-path", keyPath})
 	if code != 1 {
 		t.Errorf("expected exit code 1 (LogChainFiles failed), got %d", code)
 	}
@@ -2788,8 +2764,7 @@ func TestCmdAuditVerify_UnknownKeyID(t *testing.T) {
 	}
 
 	// Verify with a completely different key (keyB is freshly generated).
-	var code int
-	code = cmdAuditVerify([]string{"--audit-log", logPath, "--audit-key-path", keyPathB})
+	code := cmdAuditVerify([]string{"--audit-log", logPath, "--audit-key-path", keyPathB})
 	if code != 1 {
 		t.Errorf("expected exit code 1 (UNKNOWN_KEY_ID), got %d", code)
 	}
@@ -2811,8 +2786,7 @@ func TestCmdSuggest_WriteFileError(t *testing.T) {
 	}
 	badOutput := filepath.Join(blocker, "manifest.yaml")
 
-	var code int
-	code = cmdSuggest([]string{"--audit-log", logPath, "--output", badOutput})
+	code := cmdSuggest([]string{"--audit-log", logPath, "--output", badOutput})
 	if code != 2 {
 		t.Errorf("expected exit code 2 (WriteFile failed), got %d", code)
 	}
