@@ -17,28 +17,16 @@
 package config
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 )
-
-// writeGatewayConfig writes cfg to a temp file and returns its path.
-func writeGatewayConfig(t *testing.T, cfg string) string {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "eunox.yaml")
-	if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-	return path
-}
 
 // loadGatewayConfigErr loads cfg from a temp file and returns the load error with
 // the (per-test-temp-dir, therefore incomparable) config path elided, so two
 // configs' diagnostics can be compared directly.
 func loadGatewayConfigErr(t *testing.T, cfg string) string {
 	t.Helper()
-	path := writeGatewayConfig(t, cfg)
+	path := writeConfig(t, cfg)
 	_, err := LoadGatewayConfig(path)
 	if err == nil {
 		return ""
@@ -150,7 +138,7 @@ upstreams:
     upstreamUrl: http://127.0.0.1:9001
     <<: *shared
 `
-	loaded, err := LoadGatewayConfig(writeGatewayConfig(t, cfg))
+	loaded, err := LoadGatewayConfig(writeConfig(t, cfg))
 	if err != nil {
 		t.Fatalf("LoadGatewayConfig: %v", err)
 	}

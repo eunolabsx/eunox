@@ -1,9 +1,10 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// Tests for CLI-level functions that can be exercised by manipulating os.Args
-// and providing temporary files.  These tests are NOT parallel because they
-// modify package-level state (os.Args).
+// Tests for CLI-level functions, driven by passing each subcommand its own
+// argument slice and temporary files. The subcommand tests here are NOT parallel:
+// captureStdout/captureStderr swap the process-global os.Stdout/os.Stderr for the
+// duration of the call, and several tests use t.Chdir or t.Setenv.
 
 package main
 
@@ -638,36 +639,20 @@ func TestCmdAuditVerify_SinceFilter(t *testing.T) {
 	cmdAuditVerify([]string{"--audit-log", logPath, "--audit-key-path", keyPath, "--since", "2099-01-01T00:00:00Z"})
 }
 
-// ── run() safe branches ────────────────────────────────────────────────────
-// These exercise dispatch branches whose subcommand returns without os.Exit, so
+// ── run() subcommand dispatch ──────────────────────────────────────────────
+// These exercise the dispatch arms whose subcommand returns without os.Exit, so
 // they call run() directly (main() always calls os.Exit and would kill the test
-// binary). Dispatch exit codes are pinned in TestRun_ExitCodes.
-
-// TestMain_VersionBranch exercises the "version" branch which dispatches to
-// cmdVersion() and returns without os.Exit.
-func TestMain_VersionBranch(t *testing.T) {
-	run([]string{"eunox", "version"})
-}
-
-func TestMain_DashDashVersionBranch(t *testing.T) {
-	run([]string{"eunox", "--version"})
-}
-
-func TestMain_HelpBranch(t *testing.T) {
-	run([]string{"eunox", "--help"})
-}
-
-func TestMain_HelpShortBranch(t *testing.T) {
-	run([]string{"eunox", "-h"})
-}
-
-func TestMain_HelpWordBranch(t *testing.T) {
-	run([]string{"eunox", "help"})
-}
+// binary). Each asserts exit 0, which is what makes them load-bearing: run picks
+// the subcommand from args[1] and hands it args[2:], so an arm that threaded the
+// wrong slice would leave the subcommand name parsed as a stray positional and
+// return non-zero — silently, if the code went unchecked. The argument-less arms
+// (help, version, unknown) are pinned by TestRun_ExitCodes instead.
 
 func TestMain_StatsBranch(t *testing.T) {
 	path := writeTempFile(t, "")
-	run([]string{"eunox", "stats", "--audit-log", path})
+	if code := run([]string{"eunox", "stats", "--audit-log", path}); code != 0 {
+		t.Errorf("run stats: exit %d, want 0", code)
+	}
 }
 
 func TestMain_ValidateBranch(t *testing.T) {
@@ -683,7 +668,9 @@ capabilities:
 	if err := os.WriteFile(path, []byte(manifest), 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	run([]string{"eunox", "validate", path})
+	if code := run([]string{"eunox", "validate", path}); code != 0 {
+		t.Errorf("run validate: exit %d, want 0", code)
+	}
 }
 
 func TestMain_KillBranch(t *testing.T) {
@@ -702,22 +689,42 @@ func TestMain_KillBranch(t *testing.T) {
 			break
 		}
 	}
-	run([]string{"eunox", "kill", "--port", port, "--host", host, "--control-token", "kill-test-token", "all"})
+	if code := run([]string{"eunox", "kill", "--port", port, "--host", host, "--control-token", "kill-test-token", "all"}); code != 0 {
+		t.Errorf("run kill: exit %d, want 0", code)
+	}
 }
 
 func TestMain_AuditVerifyBranch(t *testing.T) {
-	logPath := writeTempFile(t, "")
-	keyPath := filepath.Join(t.TempDir(), "audit.key")
-	run([]string{"eunox", "audit-verify",
+	// Open a real sink first so the key exists and the log carries a signed record:
+	// verifying an absent key exits 1 no matter how the arguments were threaded, so
+	// only a genuinely verifiable log makes the exit-0 assertion discriminating.
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+	keyPath := filepath.Join(dir, "audit.key")
+	sink, err := audit.Open(logPath, keyPath, 0, 0)
+	if err != nil {
+		t.Fatalf("audit.Open: %v", err)
+	}
+	sink.RecordAllow(context.Background(), "sess-1", "read_file", "tools/call", nil, nil, false, nil, nil)
+	if err := sink.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	code := run([]string{"eunox", "audit-verify",
 		"--audit-log", logPath,
 		"--audit-key-path", keyPath,
 	})
+	if code != 0 {
+		t.Errorf("run audit-verify: exit %d, want 0", code)
+	}
 }
 
 func TestMain_InitBranch(t *testing.T) {
 	srv := httptest.NewServer(newFakeUpstream())
 	defer srv.Close()
-	run([]string{"eunox", "init", "--upstream-url", srv.URL})
+	if code := run([]string{"eunox", "init", "--upstream-url", srv.URL}); code != 0 {
+		t.Errorf("run init: exit %d, want 0", code)
+	}
 }
 
 // ── expandHome ────────────────────────────────────────────────────────────

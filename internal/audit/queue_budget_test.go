@@ -86,7 +86,8 @@ func TestQueueSize_CountsEveryVariableFieldTogether(t *testing.T) {
 		LabelsOut:     []string{strings.Repeat("l", fill)},
 		CarriedLabels: []string{strings.Repeat("c", fill)},
 	}
-	// 11 single-valued fields + 2 obligations + 1 label out + 1 carried label.
+	// 10 envelope strings + Details + 2 obligations + 1 label out + 1 carried label,
+	// each of length fill.
 	want := int64(15*fill) + auditRecordEnvelopeEstimate
 	if got := rec.queueSize(); got != want {
 		t.Errorf("queueSize = %d, want %d", got, want)
@@ -121,6 +122,7 @@ func TestQueueSize_IsStableAcrossCalls(t *testing.T) {
 // between the add and the subtract accumulates silently until the budget is
 // exhausted and a healthy proxy starts shedding audit records.
 func TestQueuedBytes_ReturnsToZeroAfterDrain(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	sink, err := Open(filepath.Join(dir, "audit.jsonl"), filepath.Join(dir, "audit.key"), 0, 0)
 	if err != nil {

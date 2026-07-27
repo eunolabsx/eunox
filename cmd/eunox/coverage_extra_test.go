@@ -5,7 +5,7 @@
 // and success branches of the CLI subcommands and their pure helpers, driving
 // the exported-by-package-main functions directly (validateConfigRoutes,
 // killViaRedis, the doctor section writers, the suggest/init pure helpers) and
-// the os.Args-wired subcommands through their return-without-os.Exit paths.
+// the subcommands through their return-without-os.Exit paths.
 
 package main
 
@@ -224,8 +224,9 @@ func TestKillViaRedis_EmptyAddr(t *testing.T) {
 }
 
 // TestKillViaRedis_AllAndSessionSucceed re-covers the success branches through
-// the function under test (the cmdKill redis tests go via os.Args; this exercises
-// killViaRedis directly so the "all" and per-session legs are both hit).
+// the function under test: the cmdKill redis tests reach it via flag parsing, so
+// this drives killViaRedis directly and hits the "all" and per-session legs
+// without depending on how the flags are spelled.
 func TestKillViaRedis_AllAndSessionSucceed(t *testing.T) {
 	mr := miniredis.RunT(t)
 
@@ -952,8 +953,7 @@ func TestCmdInit_StdioToStdout(t *testing.T) {
 	t.Cleanup(func() { liveUpstreamTimeout = orig })
 
 	cmd, args := helperUpstreamArgs()
-	argv := append([]string{"eunox", "init", "--transport", "stdio", "--", cmd}, args...)
-	cmdInit(argv[2:])
+	cmdInit(append([]string{"--transport", "stdio", "--", cmd}, args...))
 }
 
 // ───────────────────────── runValidateLive (plural summaries) ───────────────
@@ -2788,6 +2788,7 @@ func TestSubcommands_HelpReturnsZero(t *testing.T) {
 		{"kill", cmdKill},
 		{"audit-verify", cmdAuditVerify},
 		{"stats", cmdStats},
+		{"doctor", cmdDoctor},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

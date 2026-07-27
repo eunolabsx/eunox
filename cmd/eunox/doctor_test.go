@@ -596,8 +596,8 @@ func TestWriteDoctorBundle_LiveRequiresConfig(t *testing.T) {
 
 // ─── cmdDoctor (CLI surface) ─────────────────────────────────────────────────
 //
-// Exercises the os.Args wiring + --output path. Not parallel — toggles global
-// os.Args.
+// Exercises cmdDoctor's flag parsing + --output path. Not parallel — the
+// exit-code cases capture the process-global os.Stderr, and some chdir.
 
 func TestCmdDoctor_OutputFileGetsWritten(t *testing.T) {
 	outPath := filepath.Join(t.TempDir(), "doctor.txt")

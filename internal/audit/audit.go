@@ -351,7 +351,7 @@ const (
 	// defaultAuditLog and defaultAuditKeyPath store the UNEXPANDED "~" form. The OS
 	// does not resolve "~", so using either path verbatim would create a literal
 	// "~" directory in the CWD. Resolve only through ResolveLogPath/ResolveKeyPath,
-	// which run expandHome (fails closed when the home directory is unknown).
+	// which run config.ExpandHome (fails closed when the home directory is unknown).
 	defaultAuditLog        = "~/.eunox/audit.jsonl"
 	defaultAuditKeyPath    = "~/.eunox/audit.key"
 	defaultRotateSizeBytes = 100 << 20 // 100 MiB
