@@ -33,8 +33,10 @@ func killControlURL(host string, port int) string {
 }
 
 // cmdKill runs the `kill` subcommand and returns the process exit code (rather
-// than calling os.Exit itself), so tests can drive every branch.
-func cmdKill() int {
+// than calling os.Exit itself), so tests can drive every branch. args carries
+// the subcommand's own arguments (os.Args[2:] in a real invocation), threaded
+// from run.
+func cmdKill(args []string) int {
 	fs := flag.NewFlagSet("kill", flag.ContinueOnError)
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `Usage: eunox kill [flags] <session-id|all>
@@ -74,7 +76,7 @@ Flags:
 	// (target first) while accepting "--port 3001 all" — a foot-gun on the emergency-stop
 	// path. parseFlagsAndPositionals (used by `validate` for the same reason) peels the
 	// positional and re-parses the rest, so order does not matter.
-	pos, err := parseFlagsAndPositionals(fs, os.Args[2:])
+	pos, err := parseFlagsAndPositionals(fs, args)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0

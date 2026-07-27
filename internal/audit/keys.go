@@ -310,30 +310,25 @@ func isAllZeroKey(key []byte) bool {
 	return true
 }
 
-// expandHome expands a leading "~/" or a bare "~" in p to the user's home
-// directory, via config.ExpandHome (the shared implementation internal/transport
-// also calls, so the two packages cannot silently re-diverge on "~" expansion).
-// When home cannot be resolved (HOME unset, a container UID with no /etc/passwd
-// entry, DynamicUser=yes) it returns an error rather than the literal "~" string:
-// otherwise Open would MkdirAll a directory named "~" under the CWD and silently
-// write the audit log there. Fail closed instead.
-func expandHome(p string) (string, error) {
-	return config.ExpandHome(p)
-}
-
 // ResolveLogPath returns the effective audit-log path: pref when non-empty, else
-// the built-in default, expanded via expandHome. As the sole consumer of
+// the built-in default, expanded via config.ExpandHome. As the sole consumer of
 // defaultAuditLog, it makes Open and the subcommands resolve "~" identically.
+//
+// ExpandHome fails closed when home cannot be resolved (HOME unset, a container
+// UID with no /etc/passwd entry, DynamicUser=yes) rather than returning the
+// literal "~" string: otherwise Open would MkdirAll a directory named "~" under
+// the CWD and silently write the tamper-evident log there.
 func ResolveLogPath(pref string) (string, error) {
 	if pref == "" {
 		pref = defaultAuditLog
 	}
-	return expandHome(pref)
+	return config.ExpandHome(pref)
 }
 
 // ResolveKeyPath returns the effective HMAC key path: pref when non-empty, else
-// EUNOX_AUDIT_KEY_PATH, else the built-in default, expanded. Single-sources the
-// env-var precedence across the proxy and subcommands.
+// EUNOX_AUDIT_KEY_PATH, else the built-in default, expanded (fail-closed, as in
+// ResolveLogPath). Single-sources the env-var precedence across the proxy and
+// subcommands.
 func ResolveKeyPath(pref string) (string, error) {
 	if pref == "" {
 		if env := os.Getenv("EUNOX_AUDIT_KEY_PATH"); env != "" {
@@ -342,5 +337,5 @@ func ResolveKeyPath(pref string) (string, error) {
 			pref = defaultAuditKeyPath
 		}
 	}
-	return expandHome(pref)
+	return config.ExpandHome(pref)
 }

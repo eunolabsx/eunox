@@ -92,66 +92,6 @@ func TestNewVerifier_BuildsKeyringAndVerifies(t *testing.T) {
 	}
 }
 
-// TestExpandHome covers expandHome's branches (previously 25%): a bare "~"
-// resolves to HOME, a "~/sub" joins under HOME, an absolute path and a relative
-// non-tilde path pass through untouched, and an unresolvable home fails closed.
-func TestExpandHome(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-
-	cases := []struct {
-		in   string
-		want string
-	}{
-		{"~", home},
-		{"~/audit.jsonl", filepath.Join(home, "audit.jsonl")},
-		{"~/.eunox/audit.key", filepath.Join(home, ".eunox", "audit.key")},
-		{"/etc/eunox/audit.jsonl", "/etc/eunox/audit.jsonl"}, // absolute: passthrough
-		{"relative/path", "relative/path"},                   // no leading ~: passthrough
-	}
-	for _, c := range cases {
-		got, err := expandHome(c.in)
-		if err != nil {
-			t.Fatalf("expandHome(%q): unexpected error %v", c.in, err)
-		}
-		if got != c.want {
-			t.Errorf("expandHome(%q) = %q, want %q", c.in, got, c.want)
-		}
-	}
-
-	// A "~user/..." form must be REFUSED, not passed through. Go cannot resolve another
-	// user's home portably, so the old passthrough treated "~alice/audit.jsonl" as an
-	// ordinary relative path and silently created a directory literally named "~alice"
-	// under the process cwd — putting the tamper-evident tape (or its HMAC key) somewhere
-	// the operator never chose and will not think to look.
-	for _, in := range []string{"~tilde-not-home", "~alice/audit.jsonl", "~root/.eunox/audit.key"} {
-		if got, err := expandHome(in); err == nil {
-			t.Errorf("expandHome(%q) = %q with no error; a ~user form must fail closed rather than resolve against the cwd", in, got)
-		}
-	}
-}
-
-// TestExpandHome_HomeUnavailable_FailsClosed verifies that when the home
-// directory cannot be resolved, expandHome returns an error rather than the
-// literal "~" form — so Open never writes the audit log into a directory named
-// "~" under the CWD.
-func TestExpandHome_HomeUnavailable_FailsClosed(t *testing.T) {
-	// os.UserHomeDir reads $HOME on unix; an empty value makes it fail.
-	t.Setenv("HOME", "")
-
-	if _, err := expandHome("~"); err == nil {
-		t.Fatal("expandHome(\"~\") must fail closed when the home directory is unavailable")
-	}
-	if _, err := expandHome("~/.eunox/audit.jsonl"); err == nil {
-		t.Fatal("expandHome(\"~/...\") must fail closed when the home directory is unavailable")
-	}
-	// A non-tilde path must still resolve even with no home, since it never
-	// consults UserHomeDir.
-	if got, err := expandHome("/tmp/x"); err != nil || got != "/tmp/x" {
-		t.Fatalf("expandHome(absolute) = (%q, %v), want (/tmp/x, nil) with no home", got, err)
-	}
-}
-
 // TestResolveLogPath covers ResolveLogPath (previously 66.7%): an empty pref
 // falls back to the built-in default (expanded under HOME), and a non-empty pref
 // is honored verbatim after expansion.
@@ -182,7 +122,7 @@ func TestResolveLogPath(t *testing.T) {
 // TestResolveKeyPath covers ResolveKeyPath's flag/env/default precedence
 // (previously 40%): an explicit pref wins, an empty pref falls back to
 // EUNOX_AUDIT_KEY_PATH when set, and to the built-in default otherwise — each
-// expanded through expandHome.
+// expanded through config.ExpandHome.
 func TestResolveKeyPath(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

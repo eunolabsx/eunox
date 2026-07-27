@@ -20,8 +20,10 @@ import (
 )
 
 // cmdStats runs the `stats` subcommand and returns the process exit code
-// (rather than calling os.Exit itself), so tests can drive every branch.
-func cmdStats() int {
+// (rather than calling os.Exit itself), so tests can drive every branch. args
+// carries the subcommand's own arguments (os.Args[2:] in a real invocation),
+// threaded from run.
+func cmdStats(args []string) int {
 	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `Usage: eunox stats [flags]
@@ -39,7 +41,7 @@ Flags:
 	configPath := fs.String("config", "", "Path to the eunox config (YAML). When set, the configured audit.log is\nused as the default for --audit-log.")
 	auditLogPath := fs.String("audit-log", "", "Path to the audit JSONL log (default: ~/.eunox/audit.jsonl).")
 
-	if code, done := parseAuditReaderFlags("stats", fs, configPath, auditLogPath, nil); done {
+	if code, done := parseAuditReaderFlags("stats", fs, args, configPath, auditLogPath, nil); done {
 		return code
 	}
 	logPath, ok := resolveAuditReaderLogPath("stats", *auditLogPath)

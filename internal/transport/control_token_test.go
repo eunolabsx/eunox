@@ -4,7 +4,6 @@
 package transport
 
 import (
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -209,76 +208,6 @@ func TestResolveControlToken_EmptyFile_Errors(t *testing.T) {
 	}
 	if _, err := ResolveControlToken("", path); err == nil {
 		t.Fatal("expected error for empty token file")
-	}
-}
-
-func TestExpandHome_WithTilde(t *testing.T) {
-	t.Parallel()
-	home, _ := os.UserHomeDir()
-	result, err := expandHome("~/foo/bar")
-	if err != nil {
-		t.Fatalf("expandHome(~/foo/bar) error: %v", err)
-	}
-	expected := fmt.Sprintf("%s/foo/bar", home)
-	if result != expected {
-		t.Errorf("expandHome(~/foo/bar) = %q, want %q", result, expected)
-	}
-}
-
-// TestExpandHome_BareTilde regression: a path of exactly "~" (no
-// trailing slash) must expand to the home directory, not be returned unchanged —
-// otherwise openAuditSink would MkdirAll a directory literally named "~" under the
-// CWD and silently misdirect the tamper-evident audit log there.
-func TestExpandHome_BareTilde(t *testing.T) {
-	t.Parallel()
-	home, _ := os.UserHomeDir()
-	result, err := expandHome("~")
-	if err != nil {
-		t.Fatalf("expandHome(~) error: %v", err)
-	}
-	if result != home {
-		t.Errorf("expandHome(~) = %q, want %q", result, home)
-	}
-}
-
-func TestExpandHome_NoTilde(t *testing.T) {
-	t.Parallel()
-	result, err := expandHome("/absolute/path")
-	if err != nil {
-		t.Fatalf("expandHome(/absolute/path) error: %v", err)
-	}
-	if result != "/absolute/path" {
-		t.Errorf("expandHome(/absolute/path) = %q, want /absolute/path", result)
-	}
-}
-
-func TestExpandHome_EmptyString(t *testing.T) {
-	t.Parallel()
-	result, err := expandHome("")
-	if err != nil {
-		t.Fatalf("expandHome('') error: %v", err)
-	}
-	if result != "" {
-		t.Errorf("expandHome('') = %q, want ''", result)
-	}
-}
-
-// TestExpandHome_HomeUnavailableFailsClosed regression: when the home
-// directory cannot be resolved, expandHome must return an error (so openAuditSink
-// refuses to start) rather than silently returning the literal "~/..." path, which
-// would misplace the tamper-evident audit log under a "~" directory in the CWD.
-func TestExpandHome_HomeUnavailableFailsClosed(t *testing.T) {
-	// os.UserHomeDir reads $HOME on unix; clearing it makes resolution fail.
-	t.Setenv("HOME", "")
-	if _, err := os.UserHomeDir(); err == nil {
-		t.Skip("os.UserHomeDir still resolves with HOME unset on this platform; cannot exercise the failure path")
-	}
-	got, err := expandHome("~/.eunox/audit.jsonl")
-	if err == nil {
-		t.Fatalf("expandHome returned (%q, nil); want an error when the home dir is unavailable", got)
-	}
-	if got != "" {
-		t.Errorf("expandHome returned path %q alongside the error; want empty so a caller cannot use a misresolved path", got)
 	}
 }
 

@@ -138,7 +138,7 @@ func redactURLValue(val interface{}, redact func(string) string) interface{} {
 }
 
 // doctorOptions bundles the parsed CLI flags for cmdDoctor so the bundle
-// writer can be unit-tested without going through os.Args.
+// writer can be unit-tested without going through flag parsing.
 type doctorOptions struct {
 	configPath   string
 	auditLogPath string
@@ -153,16 +153,13 @@ type doctorOptions struct {
 	cfgErr error
 }
 
-// cmdDoctor runs the `doctor` subcommand and returns the process exit code (rather
-// than calling os.Exit itself), so tests can drive every branch in-process — matching
-// every other fallible subcommand.
 // parseDoctorReaderFlags is parseAuditReaderFlags for doctor: identical flag parsing and
 // stray-positional rejection, but an unloadable --config is RETURNED (with a nil cfg)
 // instead of aborting. doctor's whole job is describing a broken deployment, so a config
 // that will not parse is the case the bundle is most needed for; it is reported inside
 // the bundle and every config-independent section still renders.
-func parseDoctorReaderFlags(fs *flag.FlagSet, configPath, logPath, keyPath *string) (cfg *config.GatewayConfig, code int, done bool, cfgErr error) {
-	if err := fs.Parse(os.Args[2:]); err != nil {
+func parseDoctorReaderFlags(fs *flag.FlagSet, args []string, configPath, logPath, keyPath *string) (cfg *config.GatewayConfig, code int, done bool, cfgErr error) {
+	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil, 0, true, nil
 		}
@@ -176,7 +173,11 @@ func parseDoctorReaderFlags(fs *flag.FlagSet, configPath, logPath, keyPath *stri
 	return cfg, 0, false, cfgErr
 }
 
-func cmdDoctor() int {
+// cmdDoctor runs the `doctor` subcommand and returns the process exit code (rather
+// than calling os.Exit itself), so tests can drive every branch in-process — matching
+// every other fallible subcommand. args carries the subcommand's own arguments
+// (os.Args[2:] in a real invocation), threaded from run.
+func cmdDoctor(args []string) int {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `Usage:
@@ -211,7 +212,7 @@ Flags:
 	// between them. doctor deliberately stops here rather than resolving --audit-log: an
 	// unresolvable path is reported INSIDE the bundle, since a support bundle that prints
 	// what it can beats one that refuses to print.
-	cfg, code, done, cfgErr := parseDoctorReaderFlags(fs, configPath, auditLog, auditKey)
+	cfg, code, done, cfgErr := parseDoctorReaderFlags(fs, args, configPath, auditLog, auditKey)
 	if done {
 		return code
 	}

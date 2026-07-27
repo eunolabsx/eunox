@@ -596,19 +596,12 @@ func TestWriteDoctorBundle_LiveRequiresConfig(t *testing.T) {
 
 // ─── cmdDoctor (CLI surface) ─────────────────────────────────────────────────
 //
-// Exercises the os.Args wiring + --output path. Not parallel — toggles global
-// os.Args.
+// Exercises cmdDoctor's flag parsing + --output path. Not parallel — the
+// exit-code cases capture the process-global os.Stderr, and some chdir.
 
 func TestCmdDoctor_OutputFileGetsWritten(t *testing.T) {
 	outPath := filepath.Join(t.TempDir(), "doctor.txt")
-	withArgs([]string{
-		"eunox", "doctor",
-		"--output", outPath,
-		"--audit-log", filepath.Join(t.TempDir(), "absent.jsonl"),
-		"--audit-tail", "0",
-	}, func() {
-		cmdDoctor()
-	})
+	cmdDoctor([]string{"--output", outPath, "--audit-log", filepath.Join(t.TempDir(), "absent.jsonl"), "--audit-tail", "0"})
 	// The bundle file should exist and contain the header sentinel.
 	got := doctorReadFile(t, outPath)
 	if !strings.Contains(got, "eunox doctor — support bundle") {
@@ -643,14 +636,7 @@ upstreams:
 	}
 
 	outPath := filepath.Join(dir, "doctor.txt")
-	withArgs([]string{
-		"eunox", "doctor",
-		"--config", cfgPath,
-		"--output", outPath,
-		"--audit-tail", "0",
-	}, func() {
-		cmdDoctor()
-	})
+	cmdDoctor([]string{"--config", cfgPath, "--output", outPath, "--audit-tail", "0"})
 	got := doctorReadFile(t, outPath)
 	// Check the actual "log path:" resolution line specifically, not just any
 	// occurrence of configuredLog in the bundle — the bundle separately dumps the
@@ -937,8 +923,7 @@ func TestCmdDoctor_ExitCodes(t *testing.T) {
 	dir := t.TempDir()
 
 	t.Run("stray positional", func(t *testing.T) {
-		var code int
-		withArgs([]string{"eunox", "doctor", "unexpected.txt"}, func() { code = cmdDoctor() })
+		code := cmdDoctor([]string{"unexpected.txt"})
 		if code != 1 {
 			t.Errorf("exit code = %d, want 1 for a stray positional", code)
 		}
@@ -949,8 +934,7 @@ func TestCmdDoctor_ExitCodes(t *testing.T) {
 		if err := os.WriteFile(bad, []byte("this: is: not: valid: yaml:\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		var code int
-		withArgs([]string{"eunox", "doctor", "--config", bad, "--audit-tail", "0"}, func() { code = cmdDoctor() })
+		code := cmdDoctor([]string{"--config", bad, "--audit-tail", "0"})
 		if code != 1 {
 			t.Errorf("exit code = %d, want 1 for an unloadable --config", code)
 		}
@@ -962,34 +946,21 @@ func TestCmdDoctor_ExitCodes(t *testing.T) {
 		if err := os.WriteFile(notDir, []byte("x"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		var code int
-		withArgs([]string{
-			"eunox", "doctor",
-			"--output", filepath.Join(notDir, "bundle.txt"),
-			"--audit-log", filepath.Join(dir, "absent.jsonl"),
-			"--audit-tail", "0",
-		}, func() { code = cmdDoctor() })
+		code := cmdDoctor([]string{"--output", filepath.Join(notDir, "bundle.txt"), "--audit-log", filepath.Join(dir, "absent.jsonl"), "--audit-tail", "0"})
 		if code != 1 {
 			t.Errorf("exit code = %d, want 1 when the bundle cannot be opened for writing", code)
 		}
 	})
 
 	t.Run("bad flag", func(t *testing.T) {
-		var code int
-		withArgs([]string{"eunox", "doctor", "--no-such-flag"}, func() { code = cmdDoctor() })
+		code := cmdDoctor([]string{"--no-such-flag"})
 		if code != 1 {
 			t.Errorf("exit code = %d, want 1 for an unknown flag (ContinueOnError, not a process exit)", code)
 		}
 	})
 
 	t.Run("success to stdout", func(t *testing.T) {
-		var code int
-		withArgs([]string{
-			"eunox", "doctor",
-			"--output", filepath.Join(dir, "ok.txt"),
-			"--audit-log", filepath.Join(dir, "absent.jsonl"),
-			"--audit-tail", "0",
-		}, func() { code = cmdDoctor() })
+		code := cmdDoctor([]string{"--output", filepath.Join(dir, "ok.txt"), "--audit-log", filepath.Join(dir, "absent.jsonl"), "--audit-tail", "0"})
 		if code != 0 {
 			t.Errorf("exit code = %d, want 0 on a clean run", code)
 		}

@@ -5,7 +5,7 @@
 // and success branches of the CLI subcommands and their pure helpers, driving
 // the exported-by-package-main functions directly (validateConfigRoutes,
 // killViaRedis, the doctor section writers, the suggest/init pure helpers) and
-// the os.Args-wired subcommands through their return-without-os.Exit paths.
+// the subcommands through their return-without-os.Exit paths.
 
 package main
 
@@ -224,8 +224,9 @@ func TestKillViaRedis_EmptyAddr(t *testing.T) {
 }
 
 // TestKillViaRedis_AllAndSessionSucceed re-covers the success branches through
-// the function under test (the cmdKill redis tests go via os.Args; this exercises
-// killViaRedis directly so the "all" and per-session legs are both hit).
+// the function under test: the cmdKill redis tests reach it via flag parsing, so
+// this drives killViaRedis directly and hits the "all" and per-session legs
+// without depending on how the flags are spelled.
 func TestKillViaRedis_AllAndSessionSucceed(t *testing.T) {
 	mr := miniredis.RunT(t)
 
@@ -263,9 +264,7 @@ upstreams:
     transport: stdio
     command: echo
 `)
-	withArgs([]string{"eunox", "stats", "--config", cfgPath}, func() {
-		cmdStats()
-	})
+	cmdStats([]string{"--config", cfgPath})
 }
 
 // TestCmdAuditVerify_ConfigProvidesDefaults drives cmdAuditVerify with --config
@@ -296,9 +295,7 @@ upstreams:
     transport: stdio
     command: echo
 `)
-	withArgs([]string{"eunox", "audit-verify", "--config", cfgPath}, func() {
-		cmdAuditVerify()
-	})
+	cmdAuditVerify([]string{"--config", cfgPath})
 }
 
 // ───────────────────────── cmdSuggest (output paths) ───────────────────────
@@ -329,9 +326,7 @@ func TestCmdSuggest_WithRecordsToStdout(t *testing.T) {
 		auditAllowToolLine(t, "read_file", map[string]interface{}{"path": "/tmp/b"})
 	logPath := writeTempFile(t, content)
 
-	withArgs([]string{"eunox", "suggest", "--audit-log", logPath}, func() {
-		cmdSuggest()
-	})
+	cmdSuggest([]string{"--audit-log", logPath})
 }
 
 // TestCmdSuggest_WithOutputAndMaxValues exercises the --output write branch and
@@ -341,15 +336,7 @@ func TestCmdSuggest_WithOutputAndMaxValues(t *testing.T) {
 	logPath := writeTempFile(t, content)
 	outPath := filepath.Join(t.TempDir(), "suggested.yaml")
 
-	withArgs([]string{
-		"eunox", "suggest",
-		"--audit-log", logPath,
-		"--output", outPath,
-		"--max-values", "5",
-		"--name", "drafted",
-	}, func() {
-		cmdSuggest()
-	})
+	cmdSuggest([]string{"--audit-log", logPath, "--output", outPath, "--max-values", "5", "--name", "drafted"})
 
 	got := doctorReadFile(t, outPath)
 	// yamlScalar emits a plain unquoted scalar for a simple name (it only quotes / uses
@@ -378,14 +365,7 @@ func TestCmdInit_ConfigOutputHTTP(t *testing.T) {
 	manifestPath := filepath.Join(dir, "manifest.yaml")
 	configPath := filepath.Join(dir, "eunox.yaml")
 
-	withArgs([]string{
-		"eunox", "init",
-		"--upstream-url", srv.URL,
-		"--output", manifestPath,
-		"--config-output", configPath,
-	}, func() {
-		cmdInit()
-	})
+	cmdInit([]string{"--upstream-url", srv.URL, "--output", manifestPath, "--config-output", configPath})
 
 	if _, err := os.Stat(manifestPath); err != nil {
 		t.Errorf("manifest not written: %v", err)
@@ -973,10 +953,7 @@ func TestCmdInit_StdioToStdout(t *testing.T) {
 	t.Cleanup(func() { liveUpstreamTimeout = orig })
 
 	cmd, args := helperUpstreamArgs()
-	argv := append([]string{"eunox", "init", "--transport", "stdio", "--", cmd}, args...)
-	withArgs(argv, func() {
-		cmdInit()
-	})
+	cmdInit(append([]string{"--transport", "stdio", "--", cmd}, args...))
 }
 
 // ───────────────────────── runValidateLive (plural summaries) ───────────────
@@ -1049,14 +1026,7 @@ func TestRunValidateLive_PluralFM5AndFM3(t *testing.T) {
 // file inside a temp directory.
 func TestCmdDoctor_OutputAuto(t *testing.T) {
 	t.Chdir(t.TempDir())
-	withArgs([]string{
-		"eunox", "doctor",
-		"--output", "auto",
-		"--audit-log", filepath.Join(t.TempDir(), "absent.jsonl"),
-		"--audit-tail", "0",
-	}, func() {
-		cmdDoctor()
-	})
+	cmdDoctor([]string{"--output", "auto", "--audit-log", filepath.Join(t.TempDir(), "absent.jsonl"), "--audit-tail", "0"})
 	matches, _ := filepath.Glob("eunox-doctor-*.txt")
 	if len(matches) != 1 {
 		t.Fatalf("expected exactly one auto-named bundle file, got %v", matches)
@@ -1532,24 +1502,20 @@ func TestRunStdioHandshake_MalformedToolsResult(t *testing.T) {
 // ───────────────────────── run dispatch (suggest / doctor) ──────────────────
 
 // TestRun_DispatchesSuggestAndDoctor covers the run() dispatch cases for the
-// subcommands that return without os.Exit on success. run reads args[1] but the
-// subcommands read os.Args, so both must be set in lockstep via withArgs.
+// subcommands that return without os.Exit on success. run picks the subcommand
+// from args[1] and threads args[2:] to it, so one argument vector drives both.
 func TestRun_DispatchesSuggestAndDoctor(t *testing.T) {
 	logPath := writeTempFile(t, auditAllowToolLine(t, "read_file", map[string]interface{}{"path": "/x"}))
 	suggestArgs := []string{"eunox", "suggest", "--audit-log", logPath}
-	withArgs(suggestArgs, func() {
-		if code := run(suggestArgs); code != 0 {
-			t.Errorf("run suggest: exit %d, want 0", code)
-		}
-	})
+	if code := run(suggestArgs); code != 0 {
+		t.Errorf("run suggest: exit %d, want 0", code)
+	}
 
 	t.Chdir(t.TempDir())
 	doctorArgs := []string{"eunox", "doctor", "--audit-tail", "0", "--audit-log", filepath.Join(t.TempDir(), "absent.jsonl")}
-	withArgs(doctorArgs, func() {
-		if code := run(doctorArgs); code != 0 {
-			t.Errorf("run doctor: exit %d, want 0", code)
-		}
-	})
+	if code := run(doctorArgs); code != 0 {
+		t.Errorf("run doctor: exit %d, want 0", code)
+	}
 }
 
 // ───────────────────────── scanner errors (line too long) ──────────────────
@@ -2288,8 +2254,7 @@ func TestServeStdioHost_AuditModeStartsAndFailsFast(t *testing.T) {
 // ───────────────────────── cmdValidate error branches ───────────────────────
 
 func TestCmdValidate_NoFiles(t *testing.T) {
-	var code int
-	withArgs([]string{"eunox", "validate"}, func() { code = cmdValidate() })
+	code := cmdValidate(nil)
 	if code != 2 {
 		t.Errorf("expected exit code 2 (usage: no manifest files), got %d", code)
 	}
@@ -2302,8 +2267,7 @@ func TestCmdValidate_ConfigAndPositional(t *testing.T) {
 	if err := os.WriteFile(cfgPath, []byte("transport: stdio\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	var code int
-	withArgs([]string{"eunox", "validate", "--config", cfgPath, mfPath}, func() { code = cmdValidate() })
+	code := cmdValidate([]string{"--config", cfgPath, mfPath})
 	if code != 2 {
 		t.Errorf("expected exit code 2 (usage: --config+positional conflict), got %d", code)
 	}
@@ -2315,20 +2279,14 @@ func TestCmdValidate_ConfigAndUpstreamURL(t *testing.T) {
 	if err := os.WriteFile(cfgPath, []byte("transport: stdio\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	var code int
-	withArgs([]string{"eunox", "validate", "--config", cfgPath, "--upstream-url", "http://x"}, func() {
-		code = cmdValidate()
-	})
+	code := cmdValidate([]string{"--config", cfgPath, "--upstream-url", "http://x"})
 	if code != 2 {
 		t.Errorf("expected exit code 2 (usage: --config+--upstream-url conflict), got %d", code)
 	}
 }
 
 func TestCmdValidate_ConfigLoadError(t *testing.T) {
-	var code int
-	withArgs([]string{"eunox", "validate", "--config", "/no/such/eunox.yaml"}, func() {
-		code = cmdValidate()
-	})
+	code := cmdValidate([]string{"--config", "/no/such/eunox.yaml"})
 	if code != 2 {
 		t.Errorf("expected exit code 2 (config load error), got %d", code)
 	}
@@ -2344,20 +2302,14 @@ capabilities: []
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	var code int
-	withArgs([]string{"eunox", "validate", "--upstream-url", "http://x", mfPath}, func() {
-		code = cmdValidate()
-	})
+	code := cmdValidate([]string{"--upstream-url", "http://x", mfPath})
 	if code != 2 {
 		t.Errorf("expected exit code 2 (usage: transport flags without --live), got %d", code)
 	}
 }
 
 func TestCmdValidate_ManifestLoadError(t *testing.T) {
-	var code int
-	withArgs([]string{"eunox", "validate", "/no/such/manifest.yaml"}, func() {
-		code = cmdValidate()
-	})
+	code := cmdValidate([]string{"/no/such/manifest.yaml"})
 	if code != 2 {
 		t.Errorf("expected exit code 2 (parse error, matching the documented codes and --config mode), got %d", code)
 	}
@@ -2401,9 +2353,7 @@ capabilities:
 
 	var code int
 	stderr := captureStderr(t, func() {
-		withArgs([]string{"eunox", "validate", aPath, bPath}, func() {
-			code = cmdValidate()
-		})
+		code = cmdValidate([]string{aPath, bPath})
 	})
 	if code != 2 {
 		t.Errorf("expected exit code 2 (merge conflict) for conflicting positional manifests without --live, got %d\nstderr:\n%s", code, stderr)
@@ -2420,10 +2370,7 @@ capabilities: []
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	var code int
-	withArgs([]string{"eunox", "validate", "--live", mfPath}, func() {
-		code = cmdValidate()
-	})
+	code := cmdValidate([]string{"--live", mfPath})
 	if code != 2 {
 		t.Errorf("expected exit code 2 (connection error: --live without --upstream-url), got %d", code)
 	}
@@ -2439,10 +2386,7 @@ capabilities: []
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	var code int
-	withArgs([]string{"eunox", "validate", "--live", "--upstream-url", "http://127.0.0.1:1", mfPath}, func() {
-		code = cmdValidate()
-	})
+	code := cmdValidate([]string{"--live", "--upstream-url", "http://127.0.0.1:1", mfPath})
 	if code != 2 {
 		t.Errorf("expected exit code 2 (connect failure), got %d", code)
 	}
@@ -2451,18 +2395,14 @@ capabilities: []
 // ───────────────────────── cmdInit error branches ───────────────────────────
 
 func TestCmdInit_MissingUpstreamURL(t *testing.T) {
-	var code int
-	withArgs([]string{"eunox", "init"}, func() { code = cmdInit() })
+	code := cmdInit(nil)
 	if code != 1 {
 		t.Errorf("expected exit code 1 (missing --upstream-url), got %d", code)
 	}
 }
 
 func TestCmdInit_ConnectError(t *testing.T) {
-	var code int
-	withArgs([]string{"eunox", "init", "--upstream-url", "http://127.0.0.1:1"}, func() {
-		code = cmdInit()
-	})
+	code := cmdInit([]string{"--upstream-url", "http://127.0.0.1:1"})
 	if code != 2 {
 		t.Errorf("expected exit code 2 (connect failure), got %d", code)
 	}
@@ -2475,10 +2415,7 @@ func TestCmdInit_ConfigOutputWithoutOutput(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	var code int
-	withArgs([]string{"eunox", "init", "--upstream-url", srv.URL, "--config-output", "/tmp/cfg.yaml"}, func() {
-		code = cmdInit()
-	})
+	code := cmdInit([]string{"--upstream-url", srv.URL, "--config-output", "/tmp/cfg.yaml"})
 	if code != 1 {
 		t.Errorf("expected exit code 1 (--config-output without --output), got %d", code)
 	}
@@ -2487,8 +2424,7 @@ func TestCmdInit_ConfigOutputWithoutOutput(t *testing.T) {
 // ───────────────────────── cmdKill error branches ───────────────────────────
 
 func TestCmdKill_NoTarget(t *testing.T) {
-	var code int
-	withArgs([]string{"eunox", "kill"}, func() { code = cmdKill() })
+	code := cmdKill(nil)
 	if code != 1 {
 		t.Errorf("expected exit code 1 (no target arg), got %d", code)
 	}
@@ -2497,10 +2433,7 @@ func TestCmdKill_NoTarget(t *testing.T) {
 func TestCmdKill_NoControlToken(t *testing.T) {
 	dir := t.TempDir()
 	tokenPath := filepath.Join(dir, "no-such-token")
-	var code int
-	withArgs([]string{"eunox", "kill", "--port", "3001", "--control-token-path", tokenPath, "all"}, func() {
-		code = cmdKill()
-	})
+	code := cmdKill([]string{"--port", "3001", "--control-token-path", tokenPath, "all"})
 	if code != 1 {
 		t.Errorf("expected exit code 1 (no control token), got %d", code)
 	}
@@ -2520,10 +2453,7 @@ func TestCmdKill_ProxyReturnsError(t *testing.T) {
 
 	addr := srv.Listener.Addr().String()
 	portStr := addr[strings.LastIndex(addr, ":")+1:]
-	var code int
-	withArgs([]string{"eunox", "kill", "--port", portStr, "--control-token", tok, "all"}, func() {
-		code = cmdKill()
-	})
+	code := cmdKill([]string{"--port", portStr, "--control-token", tok, "all"})
 	if code != 1 {
 		t.Errorf("expected exit code 1 (proxy returned 403), got %d", code)
 	}
@@ -2533,10 +2463,7 @@ func TestCmdKill_ProxyReturnsError(t *testing.T) {
 
 func TestCmdAuditVerify_NoAuditLog(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "audit.jsonl")
-	var code int
-	withArgs([]string{"eunox", "audit-verify", "--audit-log", logPath}, func() {
-		code = cmdAuditVerify()
-	})
+	code := cmdAuditVerify([]string{"--audit-log", logPath})
 	if code != 1 {
 		t.Errorf("expected exit code 1 (no audit log), got %d", code)
 	}
@@ -2555,20 +2482,14 @@ func TestCmdAuditVerify_InvalidSince(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	var code int
-	withArgs([]string{"eunox", "audit-verify", "--audit-log", logPath, "--audit-key-path", keyPath, "--since", "not-a-timestamp"}, func() {
-		code = cmdAuditVerify()
-	})
+	code := cmdAuditVerify([]string{"--audit-log", logPath, "--audit-key-path", keyPath, "--since", "not-a-timestamp"})
 	if code != 1 {
 		t.Errorf("expected exit code 1 (invalid --since), got %d", code)
 	}
 }
 
 func TestCmdAuditVerify_ConfigLoadError(t *testing.T) {
-	var code int
-	withArgs([]string{"eunox", "audit-verify", "--config", "/no/such/config.yaml"}, func() {
-		code = cmdAuditVerify()
-	})
+	code := cmdAuditVerify([]string{"--config", "/no/such/config.yaml"})
 	if code != 1 {
 		t.Errorf("expected exit code 1 (config load error), got %d", code)
 	}
@@ -2578,20 +2499,14 @@ func TestCmdAuditVerify_ConfigLoadError(t *testing.T) {
 
 func TestCmdStats_NoAuditLog(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "audit.jsonl")
-	var code int
-	withArgs([]string{"eunox", "stats", "--audit-log", logPath}, func() {
-		code = cmdStats()
-	})
+	code := cmdStats([]string{"--audit-log", logPath})
 	if code != 1 {
 		t.Errorf("expected exit code 1 (no audit log), got %d", code)
 	}
 }
 
 func TestCmdStats_ConfigLoadError(t *testing.T) {
-	var code int
-	withArgs([]string{"eunox", "stats", "--config", "/no/such/config.yaml"}, func() {
-		code = cmdStats()
-	})
+	code := cmdStats([]string{"--config", "/no/such/config.yaml"})
 	if code != 1 {
 		t.Errorf("expected exit code 1 (config load error), got %d", code)
 	}
@@ -2601,10 +2516,7 @@ func TestCmdStats_ConfigLoadError(t *testing.T) {
 
 func TestCmdSuggest_NoAuditLog(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "audit.jsonl")
-	var code int
-	withArgs([]string{"eunox", "suggest", "--audit-log", logPath}, func() {
-		code = cmdSuggest()
-	})
+	code := cmdSuggest([]string{"--audit-log", logPath})
 	if code != 1 {
 		t.Errorf("expected exit code 1 (no audit log), got %d", code)
 	}
@@ -2767,10 +2679,7 @@ func TestRunValidateLive_FM2PinnedAndFM6_Plural(t *testing.T) {
 // TestCmdKill_RedisKillError covers the cmdKill branch where --redis-addr is
 // provided but the kill fails (unreachable Redis → ping refused).
 func TestCmdKill_RedisKillError(t *testing.T) {
-	var code int
-	withArgs([]string{"eunox", "kill", "--redis-addr", "127.0.0.1:1", "sess-x"}, func() {
-		code = cmdKill()
-	})
+	code := cmdKill([]string{"--redis-addr", "127.0.0.1:1", "sess-x"})
 	if code != 1 {
 		t.Errorf("expected exit code 1 (redis kill failed), got %d", code)
 	}
@@ -2791,10 +2700,7 @@ func TestCmdKill_HttpDoFails(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var code int
-	withArgs([]string{"eunox", "kill", "--port", portStr, "--control-token", tok, "all"}, func() {
-		code = cmdKill()
-	})
+	code := cmdKill([]string{"--port", portStr, "--control-token", tok, "all"})
 	if code != 1 {
 		t.Errorf("expected exit code 1 (http.Do connection refused), got %d", code)
 	}
@@ -2814,10 +2720,7 @@ func TestCmdAuditVerify_LoadOrCreateKeysError(t *testing.T) {
 	logPath := filepath.Join(dir, "audit.jsonl")
 	badKeyPath := filepath.Join(blocker, "subdir", "audit.key")
 
-	var code int
-	withArgs([]string{"eunox", "audit-verify", "--audit-log", logPath, "--audit-key-path", badKeyPath}, func() {
-		code = cmdAuditVerify()
-	})
+	code := cmdAuditVerify([]string{"--audit-log", logPath, "--audit-key-path", badKeyPath})
 	if code != 1 {
 		t.Errorf("expected exit code 1 (LoadOrCreateKeys failed), got %d", code)
 	}
@@ -2835,10 +2738,7 @@ func TestCmdAuditVerify_LogChainFilesError(t *testing.T) {
 	logPath := filepath.Join(blocker, "audit.jsonl")
 	keyPath := filepath.Join(dir, "audit.key")
 
-	var code int
-	withArgs([]string{"eunox", "audit-verify", "--audit-log", logPath, "--audit-key-path", keyPath}, func() {
-		code = cmdAuditVerify()
-	})
+	code := cmdAuditVerify([]string{"--audit-log", logPath, "--audit-key-path", keyPath})
 	if code != 1 {
 		t.Errorf("expected exit code 1 (LogChainFiles failed), got %d", code)
 	}
@@ -2864,10 +2764,7 @@ func TestCmdAuditVerify_UnknownKeyID(t *testing.T) {
 	}
 
 	// Verify with a completely different key (keyB is freshly generated).
-	var code int
-	withArgs([]string{"eunox", "audit-verify", "--audit-log", logPath, "--audit-key-path", keyPathB}, func() {
-		code = cmdAuditVerify()
-	})
+	code := cmdAuditVerify([]string{"--audit-log", logPath, "--audit-key-path", keyPathB})
 	if code != 1 {
 		t.Errorf("expected exit code 1 (UNKNOWN_KEY_ID), got %d", code)
 	}
@@ -2889,14 +2786,7 @@ func TestCmdSuggest_WriteFileError(t *testing.T) {
 	}
 	badOutput := filepath.Join(blocker, "manifest.yaml")
 
-	var code int
-	withArgs([]string{
-		"eunox", "suggest",
-		"--audit-log", logPath,
-		"--output", badOutput,
-	}, func() {
-		code = cmdSuggest()
-	})
+	code := cmdSuggest([]string{"--audit-log", logPath, "--output", badOutput})
 	if code != 2 {
 		t.Errorf("expected exit code 2 (WriteFile failed), got %d", code)
 	}
@@ -2911,7 +2801,7 @@ func TestCmdSuggest_WriteFileError(t *testing.T) {
 func TestSubcommands_HelpReturnsZero(t *testing.T) {
 	cases := []struct {
 		name string
-		run  func() int
+		run  func([]string) int
 	}{
 		{"validate", cmdValidate},
 		{"init", cmdInit},
@@ -2919,12 +2809,13 @@ func TestSubcommands_HelpReturnsZero(t *testing.T) {
 		{"kill", cmdKill},
 		{"audit-verify", cmdAuditVerify},
 		{"stats", cmdStats},
+		{"doctor", cmdDoctor},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var code int
 			out := captureStderr(t, func() {
-				withArgs([]string{"eunox", tc.name, "--help"}, func() { code = tc.run() })
+				code = tc.run([]string{"--help"})
 			})
 			if code != 0 {
 				t.Errorf("%s --help: want exit code 0, got %d", tc.name, code)

@@ -14,15 +14,6 @@ import (
 	"github.com/eunolabs/eunox/internal/config"
 )
 
-// expandHome expands a leading "~/" or bare "~" in p to the user's home
-// directory, via config.ExpandHome (the shared implementation internal/audit
-// also calls, so the two packages cannot silently re-diverge on "~" expansion),
-// failing closed when home cannot be resolved rather than writing to a literal
-// "~" path.
-func expandHome(p string) (string, error) {
-	return config.ExpandHome(p)
-}
-
 // ControlTokenHeader carries the loopback control token on POST /control/kill. A
 // dedicated header keeps the emergency-stop endpoint authenticated independently
 // of the host-facing Authorization header (listen.authToken / JWT) on /mcp.
@@ -90,7 +81,7 @@ func eunoxOwnedTokenDir(dir string) bool {
 	if lfi, err := os.Lstat(dir); err != nil || lfi.Mode()&os.ModeSymlink != 0 {
 		return false
 	}
-	expandedDefault, err := expandHome(defaultControlTokenPath)
+	expandedDefault, err := config.ExpandHome(defaultControlTokenPath)
 	if err != nil {
 		return false
 	}
@@ -122,7 +113,7 @@ func WriteControlTokenFile(path, token string) (string, error) {
 	if path == "" {
 		path = defaultControlTokenPath
 	}
-	expanded, err := expandHome(path)
+	expanded, err := config.ExpandHome(path)
 	if err != nil {
 		return "", err
 	}
@@ -214,7 +205,7 @@ func ResolveControlToken(flagToken, path string) (string, error) {
 	if path == "" {
 		path = defaultControlTokenPath
 	}
-	expanded, err := expandHome(path)
+	expanded, err := config.ExpandHome(path)
 	if err != nil {
 		return "", err
 	}

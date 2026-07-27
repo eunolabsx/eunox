@@ -1,9 +1,10 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// Tests for CLI-level functions that can be exercised by manipulating os.Args
-// and providing temporary files.  These tests are NOT parallel because they
-// modify package-level state (os.Args).
+// Tests for CLI-level functions, driven by passing each subcommand its own
+// argument slice and temporary files. The subcommand tests here are NOT parallel:
+// captureStdout/captureStderr swap the process-global os.Stdout/os.Stderr for the
+// duration of the call, and several tests use t.Chdir or t.Setenv.
 
 package main
 
@@ -38,15 +39,6 @@ import (
 
 	"github.com/alicebob/miniredis/v2"
 )
-
-// withArgs temporarily replaces os.Args for the duration of fn, then restores.
-// Must not be called from parallel tests.
-func withArgs(args []string, fn func()) {
-	orig := os.Args
-	os.Args = args
-	defer func() { os.Args = orig }()
-	fn()
-}
 
 // writeTempFile writes content to a temp file and returns its path.
 func writeTempFile(t *testing.T, content string) string {
@@ -96,9 +88,7 @@ func TestCmdProxy_ExitCodes(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var got int
-			withArgs(tc.args, func() {
-				_ = captureStderr(t, func() { got = run(tc.args) })
-			})
+			_ = captureStderr(t, func() { got = run(tc.args) })
 			if got != tc.want {
 				t.Errorf("run(%v): exit code = %d, want %d", tc.args[1:], got, tc.want)
 			}
@@ -139,9 +129,7 @@ func TestRun_ExitCodes(t *testing.T) {
 
 func TestCmdStats_EmptyLog(t *testing.T) {
 	path := writeTempFile(t, "")
-	withArgs([]string{"eunox", "stats", "--audit-log", path}, func() {
-		cmdStats()
-	})
+	cmdStats([]string{"--audit-log", path})
 }
 
 func TestCmdStats_AllowedAndDenied(t *testing.T) {
@@ -165,9 +153,7 @@ func TestCmdStats_AllowedAndDenied(t *testing.T) {
 		makeRec(rec{Decision: "allow", TargetType: "tool", Target: "read_file", Method: "tools/call"})
 
 	path := writeTempFile(t, content)
-	withArgs([]string{"eunox", "stats", "--audit-log", path}, func() {
-		cmdStats()
-	})
+	cmdStats([]string{"--audit-log", path})
 }
 
 // TestCmdStats_WithMultipleDenials exercises the sort / print path.
@@ -190,9 +176,7 @@ func TestCmdStats_WithMultipleDenials(t *testing.T) {
 		makeRec(rec{Decision: "deny", TargetType: "tool", Target: "tool_c", Method: "tools/call", DenialCode: "CODE_1"})
 
 	path := writeTempFile(t, content)
-	withArgs([]string{"eunox", "stats", "--audit-log", path}, func() {
-		cmdStats()
-	})
+	cmdStats([]string{"--audit-log", path})
 }
 
 // ── audit-log empty-state hint ─────────────────────────────────────────────
@@ -254,9 +238,7 @@ capabilities:
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	withArgs([]string{"eunox", "validate", path}, func() {
-		cmdValidate()
-	})
+	cmdValidate([]string{path})
 }
 
 // TestParseFlagsAndPositionals pins the interspersed-argument behavior that lets
@@ -457,9 +439,7 @@ func TestCmdKill_KillSession_OK(t *testing.T) {
 		}
 	}
 
-	withArgs([]string{"eunox", "kill", "--port", port, "--host", host, "--control-token", "kill-test-token", "sess-1"}, func() {
-		cmdKill()
-	})
+	cmdKill([]string{"--port", port, "--host", host, "--control-token", "kill-test-token", "sess-1"})
 }
 
 func TestCmdKill_KillAll_OK(t *testing.T) {
@@ -480,9 +460,7 @@ func TestCmdKill_KillAll_OK(t *testing.T) {
 		}
 	}
 
-	withArgs([]string{"eunox", "kill", "--port", port, "--host", host, "--control-token", "kill-test-token", "all"}, func() {
-		cmdKill()
-	})
+	cmdKill([]string{"--port", port, "--host", host, "--control-token", "kill-test-token", "all"})
 }
 
 // TestCmdKill_Redis_KillSession verifies the --redis-addr transport writes the
@@ -491,9 +469,7 @@ func TestCmdKill_KillAll_OK(t *testing.T) {
 func TestCmdKill_Redis_KillSession(t *testing.T) {
 	mr := miniredis.RunT(t)
 
-	withArgs([]string{"eunox", "kill", "--redis-addr", mr.Addr(), "sess-redis"}, func() {
-		cmdKill()
-	})
+	cmdKill([]string{"--redis-addr", mr.Addr(), "sess-redis"})
 
 	if got, err := mr.Get("killswitch:session:sess-redis"); err != nil || got != "1" {
 		t.Errorf("expected session kill key set to \"1\" in redis; got %q err=%v (keys=%v)", got, err, mr.Keys())
@@ -505,9 +481,7 @@ func TestCmdKill_Redis_KillSession(t *testing.T) {
 func TestCmdKill_Redis_KillAll(t *testing.T) {
 	mr := miniredis.RunT(t)
 
-	withArgs([]string{"eunox", "kill", "--redis-addr", mr.Addr(), "all"}, func() {
-		cmdKill()
-	})
+	cmdKill([]string{"--redis-addr", mr.Addr(), "all"})
 
 	if got, err := mr.Get("killswitch:global"); err != nil || got != "1" {
 		t.Errorf("expected global kill key set to \"1\" in redis; got %q err=%v (keys=%v)", got, err, mr.Keys())
@@ -520,12 +494,7 @@ func TestCmdAuditVerify_EmptyLog(t *testing.T) {
 	logPath := writeTempFile(t, "")
 	keyPath := filepath.Join(t.TempDir(), "audit.key")
 
-	withArgs([]string{"eunox", "audit-verify",
-		"--audit-log", logPath,
-		"--audit-key-path", keyPath,
-	}, func() {
-		cmdAuditVerify()
-	})
+	cmdAuditVerify([]string{"--audit-log", logPath, "--audit-key-path", keyPath})
 }
 
 // TestCmdAuditVerify_WithRecords exercises the scanner loop in cmdAuditVerify
@@ -546,12 +515,7 @@ func TestCmdAuditVerify_WithRecords(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	withArgs([]string{"eunox", "audit-verify",
-		"--audit-log", logPath,
-		"--audit-key-path", keyPath,
-	}, func() {
-		cmdAuditVerify()
-	})
+	cmdAuditVerify([]string{"--audit-log", logPath, "--audit-key-path", keyPath})
 }
 
 // TestCmdAuditVerify_VerifiesRotatedSet locks in the multi-file fix at the CLI
@@ -589,10 +553,7 @@ func TestCmdAuditVerify_VerifiesRotatedSet(t *testing.T) {
 
 	var code int
 	out := captureStdout(t, func() {
-		withArgs([]string{"eunox", "audit-verify",
-			"--audit-log", logPath,
-			"--audit-key-path", keyPath,
-		}, func() { code = cmdAuditVerify() })
+		code = cmdAuditVerify([]string{"--audit-log", logPath, "--audit-key-path", keyPath})
 	})
 
 	if code != 0 {
@@ -673,13 +634,8 @@ func TestCmdAuditVerify_WithRequestIDFilter(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	withArgs([]string{"eunox", "audit-verify",
-		"--audit-log", logPath,
-		"--audit-key-path", keyPath,
-		"--request-id", "nonexistent-id", // no records match → all skipped
-	}, func() {
-		cmdAuditVerify()
-	})
+	// --request-id names no record in the log: every record is skipped by the filter.
+	cmdAuditVerify([]string{"--audit-log", logPath, "--audit-key-path", keyPath, "--request-id", "nonexistent-id"})
 }
 
 // TestCmdInit_WithFakeUpstream exercises cmdInit with a fake upstream that
@@ -688,9 +644,7 @@ func TestCmdInit_WithFakeUpstream(t *testing.T) {
 	srv := httptest.NewServer(newFakeUpstream())
 	defer srv.Close()
 
-	withArgs([]string{"eunox", "init", "--upstream-url", srv.URL}, func() {
-		cmdInit()
-	})
+	cmdInit([]string{"--upstream-url", srv.URL})
 }
 
 // TestCmdInit_WithOutputFile exercises the --output flag path of cmdInit.
@@ -699,9 +653,7 @@ func TestCmdInit_WithOutputFile(t *testing.T) {
 	defer srv.Close()
 
 	outputPath := filepath.Join(t.TempDir(), "manifest.yaml")
-	withArgs([]string{"eunox", "init", "--upstream-url", srv.URL, "--output", outputPath}, func() {
-		cmdInit()
-	})
+	cmdInit([]string{"--upstream-url", srv.URL, "--output", outputPath})
 
 	if _, err := os.Stat(outputPath); err != nil {
 		t.Errorf("expected output file to exist: %v", err)
@@ -724,57 +676,23 @@ func TestCmdAuditVerify_SinceFilter(t *testing.T) {
 	}
 
 	// Use a far-future timestamp so all records are before it → all skipped
-	withArgs([]string{"eunox", "audit-verify",
-		"--audit-log", logPath,
-		"--audit-key-path", keyPath,
-		"--since", "2099-01-01T00:00:00Z",
-	}, func() {
-		cmdAuditVerify()
-	})
+	cmdAuditVerify([]string{"--audit-log", logPath, "--audit-key-path", keyPath, "--since", "2099-01-01T00:00:00Z"})
 }
 
-// ── run() safe branches ────────────────────────────────────────────────────
-// These exercise dispatch branches whose subcommand returns without os.Exit, so
+// ── run() subcommand dispatch ──────────────────────────────────────────────
+// These exercise the dispatch arms whose subcommand returns without os.Exit, so
 // they call run() directly (main() always calls os.Exit and would kill the test
-// binary). Dispatch exit codes are pinned in TestRun_ExitCodes.
-
-// TestMain_VersionBranch exercises the "version" branch which dispatches to
-// cmdVersion() and returns without os.Exit.
-func TestMain_VersionBranch(t *testing.T) {
-	withArgs([]string{"eunox", "version"}, func() {
-		run(os.Args)
-	})
-}
-
-func TestMain_DashDashVersionBranch(t *testing.T) {
-	withArgs([]string{"eunox", "--version"}, func() {
-		run(os.Args)
-	})
-}
-
-func TestMain_HelpBranch(t *testing.T) {
-	withArgs([]string{"eunox", "--help"}, func() {
-		run(os.Args)
-	})
-}
-
-func TestMain_HelpShortBranch(t *testing.T) {
-	withArgs([]string{"eunox", "-h"}, func() {
-		run(os.Args)
-	})
-}
-
-func TestMain_HelpWordBranch(t *testing.T) {
-	withArgs([]string{"eunox", "help"}, func() {
-		run(os.Args)
-	})
-}
+// binary). Each asserts exit 0, which is what makes them load-bearing: run picks
+// the subcommand from args[1] and hands it args[2:], so an arm that threaded the
+// wrong slice would leave the subcommand name parsed as a stray positional and
+// return non-zero — silently, if the code went unchecked. The argument-less arms
+// (help, version, unknown) are pinned by TestRun_ExitCodes instead.
 
 func TestMain_StatsBranch(t *testing.T) {
 	path := writeTempFile(t, "")
-	withArgs([]string{"eunox", "stats", "--audit-log", path}, func() {
-		run(os.Args)
-	})
+	if code := run([]string{"eunox", "stats", "--audit-log", path}); code != 0 {
+		t.Errorf("run stats: exit %d, want 0", code)
+	}
 }
 
 func TestMain_ValidateBranch(t *testing.T) {
@@ -790,9 +708,9 @@ capabilities:
 	if err := os.WriteFile(path, []byte(manifest), 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	withArgs([]string{"eunox", "validate", path}, func() {
-		run(os.Args)
-	})
+	if code := run([]string{"eunox", "validate", path}); code != 0 {
+		t.Errorf("run validate: exit %d, want 0", code)
+	}
 }
 
 func TestMain_KillBranch(t *testing.T) {
@@ -811,28 +729,42 @@ func TestMain_KillBranch(t *testing.T) {
 			break
 		}
 	}
-	withArgs([]string{"eunox", "kill", "--port", port, "--host", host, "--control-token", "kill-test-token", "all"}, func() {
-		run(os.Args)
-	})
+	if code := run([]string{"eunox", "kill", "--port", port, "--host", host, "--control-token", "kill-test-token", "all"}); code != 0 {
+		t.Errorf("run kill: exit %d, want 0", code)
+	}
 }
 
 func TestMain_AuditVerifyBranch(t *testing.T) {
-	logPath := writeTempFile(t, "")
-	keyPath := filepath.Join(t.TempDir(), "audit.key")
-	withArgs([]string{"eunox", "audit-verify",
+	// Open a real sink first so the key exists and the log carries a signed record:
+	// verifying an absent key exits 1 no matter how the arguments were threaded, so
+	// only a genuinely verifiable log makes the exit-0 assertion discriminating.
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+	keyPath := filepath.Join(dir, "audit.key")
+	sink, err := audit.Open(logPath, keyPath, 0, 0)
+	if err != nil {
+		t.Fatalf("audit.Open: %v", err)
+	}
+	sink.RecordAllow(context.Background(), "sess-1", "read_file", "tools/call", nil, nil, false, nil, nil)
+	if err := sink.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	code := run([]string{"eunox", "audit-verify",
 		"--audit-log", logPath,
 		"--audit-key-path", keyPath,
-	}, func() {
-		run(os.Args)
 	})
+	if code != 0 {
+		t.Errorf("run audit-verify: exit %d, want 0", code)
+	}
 }
 
 func TestMain_InitBranch(t *testing.T) {
 	srv := httptest.NewServer(newFakeUpstream())
 	defer srv.Close()
-	withArgs([]string{"eunox", "init", "--upstream-url", srv.URL}, func() {
-		run(os.Args)
-	})
+	if code := run([]string{"eunox", "init", "--upstream-url", srv.URL}); code != 0 {
+		t.Errorf("run init: exit %d, want 0", code)
+	}
 }
 
 // ── expandHome ────────────────────────────────────────────────────────────
@@ -3255,15 +3187,7 @@ func TestCmdInit_AuthHeader_WarnsOnStderr(t *testing.T) {
 
 	var code int
 	stderr := captureStderr(t, func() {
-		withArgs([]string{
-			"eunox", "init",
-			"--upstream-url", srv.URL,
-			"--upstream-auth-header", "Authorization: Bearer sk-live-secret",
-			"--output", manifestOut,
-			"--config-output", cfgOut,
-		}, func() {
-			code = cmdInit()
-		})
+		code = cmdInit([]string{"--upstream-url", srv.URL, "--upstream-auth-header", "Authorization: Bearer sk-live-secret", "--output", manifestOut, "--config-output", cfgOut})
 	})
 	if code != 0 {
 		t.Fatalf("cmdInit exit code = %d, want 0\nstderr:\n%s", code, stderr)
