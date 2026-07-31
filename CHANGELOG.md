@@ -34,6 +34,33 @@ Section conventions:
   reuses one `--session-id` silently re-admitted a revoked session. A negative value
   restores permanent tombstones; agent kills are never expired. The effective lifetime
   is now printed at startup even at its default, since the expiry undoes a revocation.
+  The proxy **publishes** that lifetime to Redis at startup
+  (`killswitch:config:session-kill-ttl`) and `eunox kill --redis-addr` adopts it, so
+  the value no longer has to be set identically in two places: the tombstone's expiry
+  is stamped by whichever process writes it, and the CLI is the only out-of-band
+  revocation channel a stdio proxy has, so its own 30-day default used to expire a kill
+  the operator had configured to last longer — silently re-admitting the session. Pass
+  `--killswitch-session-ttl` to `eunox kill` only to override, or for a Redis no proxy
+  has started against yet; a disagreement resolves to the longer-lived of the two and
+  is reported on stderr, and a proxy that replaces a differing published value warns.
+- `eunox kill --revive <session-id|all> --redis-addr <addr>` lifts a revocation:
+  it removes one session's kill tombstone, or (with `all`) deactivates the global
+  kill switch, leaving per-session kills in place. `killswitch.ReviveSession` and
+  `DeactivateGlobal` existed but had **no caller** anywhere in the CLI, so with a
+  negative `--killswitch-session-ttl` — where tombstones are permanent — the only
+  remediation was deleting `killswitch:session:` keys in `redis-cli`. The startup
+  banner now names the command. Redis-only by design: the loopback `/control/kill`
+  endpoint stays a one-way emergency stop (a same-host caller holding the control
+  token must not be able to lift the revocation issued against it), and an in-memory
+  kill switch is cleared by restarting the proxy.
+- `killswitch.NormalizeSessionKillTTL`, `WithSessionKillTTLEffective`,
+  `(*Redis).SessionKillTTL`, `(*Redis).PublishSessionKillTTL`,
+  `ReadPublishedSessionKillTTL`, and `DescribeSessionKillTTL` — the shared-TTL seam
+  behind the above. `WithSessionKillTTL` keeps the operator-facing sentinels (0 = the
+  default, negative = never expire) and now resolves them through the one normalizer;
+  `WithSessionKillTTLEffective` takes an already-resolved lifetime, where 0 means
+  never expire, so a value read back from Redis cannot be funnelled through the other
+  option's sentinels and quietly become a 30-day tombstone.
 - A **successful** `POST /control/kill` now writes an audit record (an allow with
   method `control/kill` and `details.scope` — the killed session id, or `all`).
   Refusals of the endpoint were already recorded and so were the `KILL_SWITCH`
@@ -279,6 +306,33 @@ Section conventions:
 
 ### Fixed
 
+- **`eunox_audit_maintenance_stalled` stayed `0` through several faults that stopped
+  rotation or retention entirely.** If the audit log's directory became unlistable *after*
+  startup, rotation kept working (it needs only an `Lstat` once its ordinal seed is
+  certain) while every prune pass failed to enumerate the rotated siblings — that exit
+  logged one line to stderr and returned without reporting anything, so retention never
+  ran again, siblings accumulated until the volume filled, and `/healthz`, `/metrics` and
+  `doctor` showed green through exactly the condition the signal exists to surface. A
+  rotation that could not establish a free rotated name at all (an `Lstat` that fails for
+  any reason other than "absent" counts the candidate as occupied, so a directory
+  returning `EACCES`/`EIO` on every probe defers rotation as durably as an unseedable
+  ordinal) was equally unreported, and so — found in a follow-up pass — were a failed
+  rename of the active log, a failed sync of the just-renamed sidecar, and a failed reopen
+  of the fresh base, both immediately after a clean rename and on every bounded
+  fallback-recovery retry: any of these leaves the active log growing past
+  `rotateSizeBytes` with nothing on `/healthz` to show it. Every one of these exits now
+  reports through the maintenance status; `rotate()` and `pruneRotated()` are each a thin
+  wrapper that computes its own outcome and records it once, at a single exit, so a future
+  branch added to either can no longer skip reporting the way these did.
+- **A healthy retention pass could clear a live rotation stall.** Rotation and retention
+  wrote one shared stall flag, so every report of health was a cross-subsystem write and
+  the leg that finished last decided what the operator saw. The status is now two
+  independent fields, one per subsystem, and each leg publishes its own once, at the
+  single exit above — so a recovery in one never erases the other's stall.
+  `auditMaintenanceReason` on `/healthz` correspondingly reports every stalled subsystem,
+  prefixed `rotation deferred:` or `retention stalled:` and joined with `; ` when both are,
+  in a fixed order rather than "whichever failed most recently" — so an operator sees
+  which of the two disk bounds is unenforced.
 - **`redactFields` missed a declared field inside a doubly-encoded blob under an
   unmodelled result key.** The walk over such a key anchored every dot-path at that
   key's *value*, so a multi-segment path never reached the blob the key names:

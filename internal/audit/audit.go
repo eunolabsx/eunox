@@ -222,12 +222,15 @@ type Sink struct {
 	// Close/exit. Atomic (read/written from any goroutine); exposed via WriteFailures.
 	writeFailures atomic.Int64
 
-	// maintenanceStalled is set when size-triggered rotation or retention pruning has
-	// stopped making progress while record writing itself is still healthy: the sibling
-	// directory cannot be listed (so an ordinal cannot be seeded and rotation defers), or
-	// the oldest rotated file cannot be unlinked (so pruning stops to keep the retained
-	// chain contiguous). Both are deliberately non-fatal — deferring is what keeps the
-	// chain verifiable — but both silently void the configured disk bound, and the log
+	// rotationStallReason and retentionStallReason record why size-triggered rotation or
+	// retention pruning has stopped making progress, while record writing itself is still
+	// healthy: rotation stalls when the sibling directory cannot be listed (so a rotation
+	// ordinal cannot be seeded), when the active log cannot be renamed or reopened after a
+	// rename, or when no free rotated name can be established; retention stalls when the
+	// rotated siblings cannot be listed, or the oldest cannot be unlinked so pruning stops
+	// to keep the retained chain contiguous. An empty string means that subsystem is
+	// healthy. Both failure classes are deliberately non-fatal — deferring is what keeps
+	// the chain verifiable — but both silently void the configured disk bound, and the log
 	// then grows until the filesystem fills, at which point writes DO fail and
 	// --require-audit=strict denies everything. That end state is far worse than the
 	// warning, so the stall is surfaced while it is still just a stall.
@@ -235,13 +238,23 @@ type Sink struct {
 	// Deliberately NOT folded into AuditDegraded: that gate denies live traffic under
 	// --require-audit=strict, and a stalled rotation has lost no records — every decision
 	// is still being written and signed. This is a maintenance/readiness signal for
-	// /healthz, metrics, and doctor, not an enforcement input. Cleared when the operation
-	// next succeeds, so a transient fault self-heals in the reporting too.
-	maintenanceStalled atomic.Bool
-	// maintenanceStallReason carries the human-readable cause of maintenanceStalled.
-	// Guarded by its own mutex rather than an atomic.Value so an empty reason is cheap.
-	maintenanceStallMu     sync.Mutex
-	maintenanceStallReason string
+	// /healthz, metrics, and doctor, not an enforcement input.
+	//
+	// The two fields are separate — not a shared flag, and not a generic per-subsystem map
+	// or array — because there are exactly two log-maintenance passes and no plausible
+	// third: each owns its own field so a healthy retention pass can never overwrite a live
+	// rotation stall (and vice versa), and MaintenanceStalled can name which of the two
+	// bounds is unenforced. Each is written by exactly one place — setRotationStalled by
+	// rotate(), setRetentionStalled by pruneRotated() — at the single exit that has decided
+	// that pass's outcome, so no branch inside either can leave its subsystem's status
+	// stale by forgetting to report. Guarded by maintenanceStallMu (written only by the
+	// drainer, since rotation and pruning are drainer-only; read by any goroutine via
+	// MaintenanceStalled) rather than kept lock-free: MaintenanceStalled's only caller is
+	// /healthz, /metrics, and doctor — never the request hot path — so an uncontended lock
+	// on every read costs nothing worth optimizing away.
+	maintenanceStallMu   sync.Mutex
+	rotationStallReason  string
+	retentionStallReason string
 
 	// wg tracks the drainer so Close can wait for it to flush.
 	wg sync.WaitGroup
@@ -1845,27 +1858,31 @@ func (s *Sink) DroppedRecords() int64 {
 	return s.dropped.Load()
 }
 
-// markMaintenanceStalled records that rotation or retention could not make progress.
-// Called on every failed attempt; the reason is overwritten so the newest cause wins.
-func (s *Sink) markMaintenanceStalled(reason string) {
+// setRotationStalled records why size-triggered rotation has stopped making progress (a
+// non-empty reason), or that it is healthy again (""), overwriting whatever was there —
+// the newest report always wins, so a transient fault (a directory briefly unreadable)
+// stops being reported the moment a rotation next succeeds. rotate() calls this exactly
+// once per invocation, at its single exit, with whatever the attempt established — never
+// from inside the branching itself — so no branch can leave rotation's status stale by
+// forgetting to report, and a call reporting rotation's own outcome can never touch
+// retention's field.
+func (s *Sink) setRotationStalled(reason string) {
 	if s == nil {
 		return
 	}
-	s.maintenanceStalled.Store(true)
 	s.maintenanceStallMu.Lock()
-	s.maintenanceStallReason = reason
+	s.rotationStallReason = reason
 	s.maintenanceStallMu.Unlock()
 }
 
-// clearMaintenanceStalled records that the stalled operation succeeded, so a transient
-// fault (a directory temporarily unreadable, a file briefly locked) stops being reported.
-func (s *Sink) clearMaintenanceStalled() {
-	if s == nil || !s.maintenanceStalled.Load() {
+// setRetentionStalled is setRotationStalled's mirror for retention pruning:
+// pruneRotated() calls this exactly once per pass, with whatever the pass established.
+func (s *Sink) setRetentionStalled(reason string) {
+	if s == nil {
 		return
 	}
-	s.maintenanceStalled.Store(false)
 	s.maintenanceStallMu.Lock()
-	s.maintenanceStallReason = ""
+	s.retentionStallReason = reason
 	s.maintenanceStallMu.Unlock()
 }
 
@@ -1876,13 +1893,28 @@ func (s *Sink) clearMaintenanceStalled() {
 // rotateSizeBytes/retainRotated disk bound is currently not being enforced, so the log
 // will grow without limit until the underlying fault is fixed. Surfaced by /healthz,
 // /metrics, and doctor so an operator sees it before the filesystem fills.
+//
+// Rotation and retention stall independently, so both can be reported at once: the
+// reason names each stalled subsystem, in a fixed rotation-then-retention order (never
+// "whichever failed most recently") so the reported text depends only on what is
+// currently wrong, not on the order the faults appeared in.
 func (s *Sink) MaintenanceStalled() (stalled bool, reason string) {
-	if s == nil || !s.maintenanceStalled.Load() {
+	if s == nil {
 		return false, ""
 	}
 	s.maintenanceStallMu.Lock()
 	defer s.maintenanceStallMu.Unlock()
-	return true, s.maintenanceStallReason
+	var parts []string
+	if s.rotationStallReason != "" {
+		parts = append(parts, "rotation deferred: "+s.rotationStallReason)
+	}
+	if s.retentionStallReason != "" {
+		parts = append(parts, "retention stalled: "+s.retentionStallReason)
+	}
+	if len(parts) == 0 {
+		return false, ""
+	}
+	return true, strings.Join(parts, "; ")
 }
 
 // WriteFailures returns the number of records that reached the drainer but could

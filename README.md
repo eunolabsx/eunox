@@ -374,7 +374,7 @@ layer over the config file with a matching CLI flag.
 | **An unprotected upstream slipping in** — a route with no `policy:` would allow every call. | The gateway (`transport: http`) refuses to start a policyless route; opt into observe-only with `enforcement: audit` to acknowledge. (A `stdio` host warns instead.) | fail closed (gateway) | built in |
 | **A unique-key flood pinning heap** — the in-memory `maxCalls`/`sequenceBlock` counter holds one key per live `(session, tool)` pair. | Cap distinct counter keys; a call under a new key past the limit fails closed. Ignored with `--redis-addr` (Redis holds counter state off-heap with TTLs). | **1,000,000** (`0` disables) | `--max-call-counter-keys` |
 | **Slow kill propagation after a Redis blip** | How often the Redis kill switch reconciles its local cache against Redis. Lower shortens the kill-propagation (and fail-closed denial) window; very low raises Redis load. Only affects `--redis-addr`. | **30 s** | `--killswitch-reconcile-interval` |
-| **A revoked session quietly re-admitted** — a session-kill tombstone is garbage-collected on a TTL, and when it expires the kill is *lifted*. A long-lived stdio agent that pins and reuses one `--session-id` can outlive the default. | How long a session kill survives in Redis. Raise it past the longest session you hold open, or pass a negative value to make session kills permanent. Agent kills never expire. Only affects `--redis-addr`. | **30 days** | `--killswitch-session-ttl` |
+| **A revoked session quietly re-admitted** — a session-kill tombstone is garbage-collected on a TTL, and when it expires the kill is *lifted*. A long-lived stdio agent that pins and reuses one `--session-id` can outlive the default. | How long a session kill survives in Redis. Raise it past the longest session you hold open, or pass a negative value to make session kills permanent. Agent kills never expire. The proxy publishes the value it runs with to Redis, and `eunox kill --redis-addr` — which writes tombstones of its own — adopts it, so the lifetime cannot be set differently in two places. Only affects `--redis-addr`. | **30 days** | `--killswitch-session-ttl` |
 | **Shutdown hanging on an unresponsive upstream** | Graceful-shutdown budget before the upstream is `SIGKILL`ed. | **5 s** | `--shutdown-timeout` |
 
 A single JSON-RPC message from either upstream is capped at **4 MiB** — a
@@ -417,15 +417,26 @@ Redis kill-switch backend is degraded (see below).
 
 `eunox_audit_maintenance_stalled` / `auditMaintenanceStalled` is a third,
 different signal: `1` means size-triggered rotation or retention pruning has
-stopped making progress — the log directory cannot be listed, or the oldest
-rotated file cannot be deleted. **No records are lost**, so this deliberately
-does not gate traffic the way the two counters above feed
-`--require-audit=strict`. What it means is that `audit.rotateSizeBytes` and
-`audit.retainRotated` are currently unenforced and the log will grow until the
-underlying fault is fixed — at which point the volume fills, writes *do* start
-failing, and strict mode denies everything. Alert on it as a disk-capacity
-warning, not an audit-integrity one; `auditMaintenanceReason` on `/healthz`
-names the file or directory to fix.
+stopped making progress — on the rotation side, the log directory cannot be
+listed, no free rotated name can be established, the active log cannot be
+renamed or reopened, or a just-renamed sidecar cannot be synced before the
+reopen; on the retention side, the rotated siblings cannot be listed, or the
+oldest cannot be deleted. **No records are lost**, so this deliberately does not
+gate traffic the way the two counters above feed `--require-audit=strict`. What
+it means is that `audit.rotateSizeBytes` and/or `audit.retainRotated` are
+currently unenforced and the log will grow until the underlying fault is fixed —
+at which point the volume fills, writes *do* start failing, and strict mode
+denies everything. Alert on it as a disk-capacity warning, not an
+audit-integrity one.
+
+Rotation and retention stall **independently** — one can be wedged while the
+other runs normally — so `auditMaintenanceReason` on `/healthz` reports each
+stalled subsystem separately, prefixed `rotation deferred:` or `retention
+stalled:` and joined with `; ` when both are. Each reason names the file or
+directory to fix and which bound (size or retention) is going unenforced. A
+subsystem stops being reported as soon as one of its own passes succeeds, so a
+transient fault — or one an operator fixes by hand — clears itself without a
+restart, and a recovery in one subsystem never clears the other's stall.
 
 **Multiple instances need Redis.** The call-counter (`maxCalls`) and kill-switch
 state are in-memory and **per-process** by default. Run more than one instance
@@ -587,6 +598,7 @@ session shapes MCP servers actually expose.
 | `eunox init --upstream-url <url> [--config-output eunox.yaml]`      | Generate a deny-all starter manifest (and, with `--config-output`, a runnable config) from a live upstream's tool list |
 | `eunox suggest [--output manifest.yaml]`                            | Generate a **draft** manifest from the audit log — one entry per observed target, with `allowedValues` conditions grounded in the argument values the agent actually used. Review and tighten before enforcing. |
 | `eunox kill [--port N] [--host H] <session-id\|all>`                | Revoke one or all active sessions. POSTs to an HTTP proxy's loopback control endpoint by default — authenticated with the control token the proxy writes to `~/.eunox/control.token` (0600) at startup, which `kill` reads automatically (override with `--control-token` / `--control-token-path` / `EUNOX_CONTROL_TOKEN`). With `--redis-addr` it writes the kill to shared Redis state instead — the way to revoke a stdio proxy started with `--redis-addr`, and the fan-out switch across every instance on that Redis. A plain in-memory stdio proxy has no out-of-band kill: stop the process. |
+| `eunox kill --revive --redis-addr <addr> <session-id\|all>`         | Lift a revocation: remove one session's kill tombstone, or (with `all`) deactivate the global kill switch, leaving per-session kills in place. Redis-only — the loopback control endpoint is a one-way emergency stop, and an in-memory kill switch is cleared by restarting the proxy. |
 | `eunox stats`                                                       | Print a denial histogram from the audit log                  |
 | `eunox audit-verify`                                              | Verify HMAC-SHA256 signatures in the audit log               |
 | `eunox doctor [--config <eunox.yaml>] [--live]`                    | Print a redacted support bundle (binary identity, config, manifests, audit tail) for bug reports. Nothing is uploaded. |
