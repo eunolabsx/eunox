@@ -4,6 +4,7 @@
 package enforcement
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -173,7 +174,7 @@ func TestBoundDenialDetails_IsDeterministic(t *testing.T) {
 		if err != nil {
 			t.Fatalf("marshal: %v", err)
 		}
-		if string(next) != string(first) {
+		if !bytes.Equal(next, first) {
 			t.Fatal("bounding the same details twice produced different records")
 		}
 	}

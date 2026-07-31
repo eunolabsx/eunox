@@ -179,10 +179,10 @@ func (w Warning) IsFatal() bool {
 // and the one line an operator greps for after a refused boot must not sit at the same
 // level as advisory FM-3.
 func (w Warning) severity() string {
-	switch {
-	case w.Kind == Uncovered:
+	switch w.Kind {
+	case Uncovered:
 		return "INFO"
-	case w.Kind == Fm5 || w.Kind == Fm2Pinned:
+	case Fm5, Fm2Pinned:
 		return "ERROR"
 	default:
 		return "WARN"
