@@ -4,8 +4,10 @@
 package transport
 
 import (
+	"bytes"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 )
@@ -112,23 +114,26 @@ func TestRefusalRollup_NamesItsScopeOnARouteStampedRecord(t *testing.T) {
 	if _, collides := details["suppressed_count"]; collides {
 		t.Errorf("the refusal rollup must not reuse suppressed_count, which names the */list filter statistic; got details %v", details)
 	}
-}
 
-// TestPreSessionDenyLimiter_SuppressedScopeIsReadFromTheCounter pins that the scope stamped
-// on a record comes from the limiter that owns the counter, not a literal at the record
-// site — so a limiter given a narrower reach cannot leave a stale scope behind on the
-// records it feeds. A limiter built outside the constructor reports the proxy scope rather
-// than writing an empty string into a signed field.
-func TestPreSessionDenyLimiter_SuppressedScopeIsReadFromTheCounter(t *testing.T) {
-	t.Parallel()
-	if got := newPreSessionDenyLimiter().suppressedScope(); got != suppressedScopeProxy {
-		t.Errorf("constructed limiter scope = %q, want %q", got, suppressedScopeProxy)
+	// Every written record must still pass its per-record HMAC under the sink's own key —
+	// the new count/scope details are signed like any other field. CLAUDE.md requires a
+	// sign-and-verify round trip for a new audit-record field; the assertions above alone
+	// only confirm the decoded shape, not that the shape survives verification.
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
 	}
-	if got := (&preSessionDenyLimiter{}).suppressedScope(); got != suppressedScopeProxy {
-		t.Errorf("zero-value limiter scope = %q, want %q — an empty scope must never reach a signed record", got, suppressedScopeProxy)
-	}
-	if got := (&preSessionDenyLimiter{scope: "route"}).suppressedScope(); got != "route" {
-		t.Errorf("scope = %q, want it read from the limiter so a narrower counter reports its own reach", got)
+	for _, line := range bytes.Split(bytes.TrimRight(data, "\n"), []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		ok, verr := sink.VerifyRecord(line)
+		if verr != nil {
+			t.Fatalf("VerifyRecord: %v", verr)
+		}
+		if !ok {
+			t.Errorf("record failed HMAC verification: %s", line)
+		}
 	}
 }
 

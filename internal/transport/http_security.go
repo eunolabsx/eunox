@@ -50,6 +50,13 @@ import (
 // emergency stop the one transport refusal invisible to an incident responder, while
 // the same actor's wrong-Origin attempts were fully logged.
 //
+// route is whichever route the caller has already resolved — the gateway's /mcp path
+// always has one by the time it reaches here (handleMCP 404s first), /control/kill has
+// none — and is passed straight to recordRefusal, mirroring recordSessionCapDeny: the
+// record is route-stamped exactly when a route is already known, never inferred. The
+// header value is NOT recorded either way — it is attacker-controlled free text, and the
+// count is the only part worth keeping.
+//
 // More than one Content-Type header is rejected outright, for the reason checkOrigin
 // rejects a duplicated Origin: Header.Get would validate the first while a proxy or host
 // downstream may act on another. That leg also prints a stderr line, because it is the
@@ -58,7 +65,7 @@ import (
 // possible thing to diagnose. Note the duplicate rule is a HEADER-level one: Go's mime
 // accepts a repeated *parameter* whose value is identical, so only the count check below
 // enforces it.
-func (p *HTTPProxy) requireJSONContentType(w http.ResponseWriter, r *http.Request) bool {
+func (p *HTTPProxy) requireJSONContentType(w http.ResponseWriter, r *http.Request, route *UpstreamRoute) bool {
 	vals := r.Header.Values("Content-Type")
 	switch {
 	case len(vals) > 1:
@@ -68,10 +75,7 @@ func (p *HTTPProxy) requireJSONContentType(w http.ResponseWriter, r *http.Reques
 	case len(vals) == 1 && isJSONMediaType(vals[0]):
 		return true
 	}
-	// Unstamped by design (no route/policy fields), like every other pre-session record:
-	// this gate can run before route resolution. The header value is NOT recorded — it is
-	// attacker-controlled free text, and the count is the only part worth keeping.
-	p.recordPreSessionDeny(r, codeUnsupportedMediaType, "content_type", map[string]interface{}{
+	p.recordRefusal(r, route, codeUnsupportedMediaType, "content_type", map[string]interface{}{
 		"header_count": len(vals),
 	})
 	http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
@@ -183,34 +187,24 @@ const (
 
 // preSessionDenyLimiter is a token bucket over pre-session denial records. The zero value
 // is not usable; construct with newPreSessionDenyLimiter.
+//
+// There is exactly one of these per proxy (HTTPProxy.preSessionDenies), so its suppressed
+// tally has exactly one scope: the whole proxy. The record site writes suppressedScopeProxy
+// directly rather than reading a scope off the limiter — a per-scope field would be
+// generality with a single caller, since nothing in this codebase constructs a
+// narrower-reach limiter (see the rate-vs-attribution trade-off recordRefusal documents).
+// If a second limiter with a different reach is ever introduced, the constant at the write
+// site is exactly what should become a field again.
 type preSessionDenyLimiter struct {
 	mu         sync.Mutex
 	tokens     float64
 	last       time.Time
 	suppressed uint64
 	now        func() time.Time // injectable for tests
-	// scope names what this limiter's suppressed tally covers, stamped onto every record
-	// that reports one. It lives on the limiter because the counter is what defines the
-	// scope; see suppressedScope. Written once at construction and never mutated, so
-	// unlike the fields above it is read without holding mu.
-	scope string
 }
 
 func newPreSessionDenyLimiter() *preSessionDenyLimiter {
-	return &preSessionDenyLimiter{tokens: preSessionDenyBurst, now: time.Now, scope: suppressedScopeProxy}
-}
-
-// suppressedScope names the scope of the tally admit returns. The record site reads it from
-// the limiter rather than asserting it independently, because the counter is what defines
-// the scope: a limiter given a narrower reach must not leave a stale literal behind on the
-// records it feeds. The zero value (a limiter built outside the constructor) reports the
-// proxy scope — the only limiter that exists is proxy-wide, so that is the honest answer,
-// and writing an empty scope into a signed field would be strictly worse than the constant.
-func (l *preSessionDenyLimiter) suppressedScope() string {
-	if l.scope == "" {
-		return suppressedScopeProxy
-	}
-	return l.scope
+	return &preSessionDenyLimiter{tokens: preSessionDenyBurst, now: time.Now}
 }
 
 // admit reports whether a refusal record may be written now, and if so how many records
@@ -642,7 +636,7 @@ func (p *HTTPProxy) recordRefusal(r *http.Request, route *UpstreamRoute, code, c
 		// from the stamp beside it, and this record may well carry a route stamp the count
 		// does not respect. See the key constants for the misreading this closes.
 		extra[detailSuppressedRefusalCount] = suppressed
-		extra[detailSuppressedRefusalScope] = p.preSessionDenies.suppressedScope()
+		extra[detailSuppressedRefusalScope] = suppressedScopeProxy
 	}
 	rec.RecordDeny(r.Context(), "", "", "", code, category, p.addRefusalContext(extra, r), false)
 }

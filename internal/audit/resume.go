@@ -367,10 +367,7 @@ func truncatePartialTailWindowed(f *os.File, winSize int64) (truncated int64, la
 // Drift between them would silently change which bytes each considers the tail, and the
 // re-read's no-op short-circuit is stated in terms of the probe's answer.
 func tailWindowStart(size, win int64) int64 {
-	if size > win {
-		return size - win
-	}
-	return 0
+	return max(0, size-win)
 }
 
 // tailLineFromWindow returns the last complete record of a log whose current size is

@@ -747,11 +747,6 @@ func sessionKillTTLNotice(ttl time.Duration) string {
 	}
 }
 
-// openConfiguredAuditSink resolves the audit-sink settings (config's audit block
-// takes precedence over the CLI flags so every route shares one tape) and opens
-// the sink. Under --require-audit an open failure is returned as an error for the
-// caller to exit on (fail closed); otherwise it warns and returns a nil sink with a
-// nil error, so the proxy continues unaudited.
 // warnAuditFlagOverridden prints the shared "config wins over an explicit --audit-* flag"
 // warning for `proxy`, where the audit block always takes precedence so every route
 // shares one tape. flagRepr/cfgRepr are the already-formatted (%q for strings, %d for
@@ -760,6 +755,11 @@ func warnAuditFlagOverridden(flagName, flagRepr, cfgField, cfgRepr string) {
 	fmt.Fprintf(os.Stderr, "[eunox] WARNING: %s %s is overridden by the config's %s %s; the config's audit block always takes precedence for `proxy` so every route shares one tape.\n", flagName, flagRepr, cfgField, cfgRepr)
 }
 
+// openConfiguredAuditSink resolves the audit-sink settings (config's audit block
+// takes precedence over the CLI flags so every route shares one tape) and opens
+// the sink. Under --require-audit an open failure is returned as an error for the
+// caller to exit on (fail closed); otherwise it warns and returns a nil sink with a
+// nil error, so the proxy continues unaudited.
 func openConfiguredAuditSink(auditLog, auditKeyPath string, auditRotateSize int64, auditRetainRotated int, auditRetainSet bool, cfg *config.GatewayConfig, requireAudit bool) (*audit.Sink, error) {
 	auditLogPath, auditKey, auditRotate := auditLog, auditKeyPath, auditRotateSize
 	auditRetain := auditRetainRotated

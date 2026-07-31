@@ -427,15 +427,20 @@ tamper-evident tape):
   single shared audit queue — splitting it per route would multiply the rate an
   attacker can drive by the size of the route table — so a suppressed refusal is
   folded into whichever record is admitted next, regardless of its route or
-  category. That matters for exactly one record shape: the **session cap** is
-  both rate-limited and written through the route's sink, so it can carry an
-  `upstream` / `policy_version` / `policy_sha256` stamp alongside a tally that
-  spans every route. A bearer-token spray against `/mcp/routeA` (refused before
-  route resolution, so attributable to no route) can therefore surface on a
-  `RESOURCE_EXHAUSTED` record reading `upstream: routeB`. Every rolled-up record
-  states its scope in `suppressed_refusal_scope` (`"proxy"`) so nothing has to be
-  inferred from the stamp beside it: a rule keyed on route + code must not treat
-  the number as route-scoped.
+  category. That matters whenever the admitted record happens to be route-stamped:
+  the **session cap** always is (it is written through the route's sink so it
+  matches its in-flight-cap sibling's shape), and the **malformed-`Content-Type`**
+  (`UNSUPPORTED_MEDIA_TYPE`) and **malformed-body** (`INVALID_REQUEST`) refusals
+  are too whenever they are hit via `/mcp/<route>` rather than `/control/kill` — in
+  each case the record can carry an `upstream` / `policy_version` / `policy_sha256`
+  stamp alongside a tally that spans every route. A bearer-token spray against
+  `/mcp/routeA` (refused before route resolution, so attributable to no route) can
+  therefore surface on a `RESOURCE_EXHAUSTED` record reading `upstream: routeB` —
+  or equally on an `INVALID_REQUEST` record for a malformed body routeB's own
+  client happened to send. Every rolled-up record states its scope in
+  `suppressed_refusal_scope` (`"proxy"`) so nothing has to be inferred from the
+  stamp beside it: a rule keyed on route + code must not treat the number as
+  route-scoped.
 
   The key is `suppressed_refusal_count`, not a bare `suppressed_count` — that
   name belongs to the unrelated `*/list` filter statistic above (entries the
