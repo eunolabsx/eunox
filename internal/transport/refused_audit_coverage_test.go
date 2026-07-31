@@ -522,12 +522,12 @@ func TestUnsupportedMediaType_IsNonPolicyCode(t *testing.T) {
 	}
 }
 
-// TestDecodeStrictJSON_RecordsMalformedBody pins the eunox #74 follow-on: the two 400
-// legs of decodeStrictJSON (malformed JSON, a trailing token after the JSON value) land
-// on the tamper-evident tape under INVALID_REQUEST, the same way the sibling 415 already
-// does — a malformed body on the same shared decode path must not be the one refusal
-// that leaves no trace. Covers both call sites (the /mcp body and the /control/kill
-// body) since they share this one function.
+// TestDecodeStrictJSON_RecordsMalformedBody pins that the two 400 legs of
+// decodeStrictJSON (malformed JSON, a trailing token after the JSON value) land on the
+// tamper-evident tape under INVALID_REQUEST, the same way the sibling 415 already does —
+// a malformed body on the same shared decode path must not be the one refusal that
+// leaves no trace. Covers both call sites (the /mcp body and the /control/kill body)
+// since they share this one function.
 func TestDecodeStrictJSON_RecordsMalformedBody(t *testing.T) {
 	cases := []struct {
 		name   string

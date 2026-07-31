@@ -208,10 +208,10 @@ func TestHTTPHandleKill_NonPOST(t *testing.T) {
 	}
 }
 
-// TestHTTPHandleKill_NonPOST_NoToken pins the fix for eunox #74: a non-POST request
-// presenting no (or a wrong) control token must be indistinguishable from any other
-// unauthenticated /control/kill probe — a recorded 401, not an unrecorded 405 that
-// confirms the endpoint exists before the caller has proven they hold the token.
+// TestHTTPHandleKill_NonPOST_NoToken pins that a non-POST request presenting no (or a
+// wrong) control token must be indistinguishable from any other unauthenticated
+// /control/kill probe — a recorded 401, not an unrecorded 405 that confirms the
+// endpoint exists before the caller has proven they hold the token.
 func TestHTTPHandleKill_NonPOST_NoToken(t *testing.T) {
 	t.Parallel()
 	sink, logPath := newTempAuditSink(t)
