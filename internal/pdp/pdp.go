@@ -2378,9 +2378,25 @@ func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims
 	// the two routes cannot drift, and so every poison discovered anywhere in the array is
 	// already visible to the keep decision for the first entry. Poisoning from inside the
 	// per-entry predicate below could not retract an entry it had already accepted, which
-	// would emit a catalog advertising a tool whose call leg hard-denies. Self-gates on
-	// len(pinnedTools) > 0, so a manifest with no pin pays nothing for this.
-	mdp.armPinsFromToolsList(resultBytes)
+	// would emit a catalog advertising a tool whose call leg hard-denies.
+	//
+	// The pin gate is repeated HERE, at the call site, even though armPinsFromToolsList
+	// self-gates: its gate sits AFTER decodeListEntries, so an unpinned manifest — the
+	// common shape — otherwise paid a full envelope decode plus a tools-array decode
+	// whose result this caller discards. With no pin the function has no other effect
+	// (every poison branch and the per-entry loop are behind the same gate) and its
+	// return value is unused here, so skipping the call is semantics-preserving by
+	// construction.
+	//
+	// RecordObservedToolHashes, the other caller, must keep calling unguarded: it returns
+	// the entry count for its audit record, which is the one thing the function still
+	// computes when nothing is pinned. That asymmetry is inherent to the two callers'
+	// needs, not an oversight here.
+	if len(mdp.pinnedTools) > 0 {
+		// pinnedTools is built once by NewManifestPDP and never mutated, so reading it
+		// outside descMu is safe — same rationale as anyNamePinned.
+		mdp.armPinsFromToolsList(resultBytes)
+	}
 
 	return filterListResult(resultBytes, listKeyTools, func(raw json.RawMessage) (bool, string) {
 		// Drop an entry whose own bytes are ambiguous BEFORE trusting its decoded name.

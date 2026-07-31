@@ -83,18 +83,29 @@ func asRecorder[T interface {
 // could still write the unexported fields directly (killSubject{verified: someHeaderRead})
 // and defeat this, same as it could hand a raw header to verifiedSession's string
 // parameter. Neither is a compiler-checked impossibility, both are visibly wrong at the
-// call site instead of a plausible-looking choice between two same-shaped helpers, and no
-// call site in the tree does either — grep for `killSubject{` finds only the two
-// constructors below.
+// call site instead of a plausible-looking choice between two same-shaped helpers. That
+// residual is now guarded rather than merely observed: an AST test over the package's own
+// sources (see guardedStructs) fails if a composite literal of this type appears outside
+// the file holding its constructors, so adding a construction site takes a deliberate edit
+// to a security-invariant test rather than passing unnoticed.
 //
 // Scope: this closes the gap for the kill-record recorders specifically, the ~10 call
 // sites recordKillDenial/recordKillDrop had. It does not extend to the general
 // auditRecorder.RecordAllow/RecordDeny surface (enforcedForwardCore, dispatchList,
 // dispatchUnmapped, forwardServerRequest, …), whose forwardParams.sessionID /
 // serverRequestParams.sessionID stay plain strings — "verified" there remains a
-// control-flow fact (never constructed before a session lookup succeeds), not a type
-// guarantee, matching killDropLeg's identical scope caveat below for the "transport"
-// detail.
+// control-flow fact, not a type guarantee, matching killDropLeg's identical scope caveat
+// below for the "transport" detail.
+//
+// That control-flow fact is stronger than it looks, which is why those two are guarded by
+// the same AST test rather than converted: neither dispatchParams constructor can even
+// RECEIVE a raw header. (*HTTPProxy).dispatchParams takes a resolved *httpSession and
+// reads sess.id; (*StdioProxy).dispatchParams takes no arguments at all. The wrong value
+// is not in scope at either constructor, so the only way to introduce one is the literal
+// the test now catches. Revisit the type conversion if a third dispatchParams-shaped
+// constructor appears, or — the signal that actually matters — if any of them grows a
+// bare sessionID string parameter, since that is the moment the wrong value becomes
+// assignable.
 type killSubject struct {
 	// verified is the registry-resolved session id, stamped into session_id. Empty for a
 	// claimed subject.

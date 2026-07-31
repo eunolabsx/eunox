@@ -9,7 +9,9 @@ package killswitch
 
 import (
 	"context"
+	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -301,4 +303,251 @@ func TestDescribeSessionKillTTL(t *testing.T) {
 	require.Equal(t, "never expires", DescribeSessionKillTTL(0))
 	require.Equal(t, "never expires", DescribeSessionKillTTL(-time.Hour))
 	require.Equal(t, "1h30m0s", DescribeSessionKillTTL(90*time.Minute))
+}
+
+// ── published-key freshness ────────────────────────────────────────────────
+
+// countingHandler is a slog.Handler that records the messages it is asked to emit, so a
+// test can assert not just THAT a diagnostic fired but how many times — which is the
+// whole point of deduping a warning that otherwise reprints every reconcile interval.
+type countingHandler struct {
+	mu   sync.Mutex
+	msgs []string
+}
+
+func (h *countingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *countingHandler) Handle(_ context.Context, rec slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.msgs = append(h.msgs, rec.Message)
+	return nil
+}
+
+func (h *countingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *countingHandler) WithGroup(string) slog.Handler      { return h }
+
+// countMatching returns how many recorded messages contain substr.
+func (h *countingHandler) countMatching(substr string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	n := 0
+	for _, m := range h.msgs {
+		if strings.Contains(m, substr) {
+			n++
+		}
+	}
+	return n
+}
+
+// disagreementMsg is the distinguishing fragment of the periodic mismatch warning.
+const disagreementMsg = "advertises a different session-kill TTL"
+
+// TestPublishSessionKillTTL_KeyCarriesExpiry: the published value must not be persistent.
+// A key with no expiry is indistinguishable from one a decommissioned instance left
+// behind months ago, and `eunox kill` adopts it outright in the common no-flag case —
+// silently writing a tombstone that can expire earlier than the running proxy's own.
+func TestPublishSessionKillTTL_KeyCarriesExpiry(t *testing.T) {
+	t.Parallel()
+	r, mr, _ := newTTLTestRedis(t, WithSessionKillTTL(24*time.Hour), WithReconcileInterval(30*time.Second))
+
+	_, _, err := r.PublishSessionKillTTL(context.Background())
+	require.NoError(t, err)
+
+	ttl := mr.TTL(redisSessionTTLKey)
+	require.NotZero(t, ttl, "the published key must carry a Redis expiry, not be persistent")
+	require.Equal(t, r.sessionTTLKeyExpiry(), ttl)
+	require.Equal(t, sessionTTLKeyExpiryFactor*30*time.Second, ttl,
+		"the expiry must be derived from the reconcile interval, so lengthening one cannot silently invalidate the other")
+}
+
+// TestPublishSessionKillTTL_ExpiryFollowsReconcileInterval: an operator who lengthens
+// --killswitch-reconcile-interval must not end up with a key that expires between ticks.
+func TestPublishSessionKillTTL_ExpiryFollowsReconcileInterval(t *testing.T) {
+	t.Parallel()
+	for _, interval := range []time.Duration{time.Second, 30 * time.Second, 10 * time.Minute} {
+		r, mr, _ := newTTLTestRedis(t, WithSessionKillTTL(time.Hour), WithReconcileInterval(interval))
+		_, _, err := r.PublishSessionKillTTL(context.Background())
+		require.NoError(t, err)
+		got := mr.TTL(redisSessionTTLKey)
+		require.Greater(t, got, interval, "expiry %v must outlast at least one reconcile interval %v", got, interval)
+		require.Equal(t, sessionTTLKeyExpiryFactor*interval, got)
+	}
+}
+
+// TestReadPublishedSessionKillTTL_AfterExpiryReportsAbsent is the property the expiry
+// buys: a value left behind by a proxy that is no longer running stops being readable, so
+// a STALE lifetime becomes an ABSENT one. The reader side already handles absence
+// correctly and loudly, so this routes the failure into a path that is already written.
+func TestReadPublishedSessionKillTTL_AfterExpiryReportsAbsent(t *testing.T) {
+	t.Parallel()
+	r, mr, client := newTTLTestRedis(t, WithSessionKillTTL(time.Hour), WithReconcileInterval(30*time.Second))
+	ctx := context.Background()
+
+	_, _, err := r.PublishSessionKillTTL(ctx)
+	require.NoError(t, err)
+
+	// Still readable while fresh.
+	got, ok, err := ReadPublishedSessionKillTTL(ctx, client)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, time.Hour, got)
+
+	// Past the expiry, the decommissioned instance's value is simply gone.
+	mr.FastForward(r.sessionTTLKeyExpiry() + time.Second)
+
+	got, ok, err = ReadPublishedSessionKillTTL(ctx, client)
+	require.NoError(t, err, "an expired key is a fallback-to-local condition, not an error")
+	require.False(t, ok, "an expired value must report absent, not a stale duration")
+	require.Zero(t, got)
+}
+
+// TestRefreshPublishedSessionKillTTL_ExtendsExpiry: a RUNNING proxy's value must never
+// expire under it. The reconcile tick re-publishes, which resets the key's expiry.
+func TestRefreshPublishedSessionKillTTL_ExtendsExpiry(t *testing.T) {
+	t.Parallel()
+	r, mr, client := newTTLTestRedis(t, WithSessionKillTTL(time.Hour), WithReconcileInterval(30*time.Second))
+	ctx := context.Background()
+
+	_, _, err := r.PublishSessionKillTTL(ctx)
+	require.NoError(t, err)
+
+	// Advance most of the way to expiry, then run the tick's re-publish.
+	mr.FastForward(2 * 30 * time.Second)
+	require.Less(t, mr.TTL(redisSessionTTLKey), r.sessionTTLKeyExpiry(), "precondition: the key should have aged")
+
+	r.refreshPublishedSessionKillTTL(ctx)
+	require.Equal(t, r.sessionTTLKeyExpiry(), mr.TTL(redisSessionTTLKey), "a reconcile tick must reset the expiry")
+
+	// And the value is still readable past the point it would have expired without it.
+	mr.FastForward(2 * 30 * time.Second)
+	_, ok, err := ReadPublishedSessionKillTTL(ctx, client)
+	require.NoError(t, err)
+	require.True(t, ok, "a running proxy's value must survive across reconcile ticks")
+}
+
+// TestRefreshPublishedSessionKillTTL_WarnsOncePerDistinctPrior covers both halves of the
+// dedupe. A persistent disagreement warns ONCE — without that it prints every reconcile
+// interval for the life of the process, which trains operators to ignore it — while a
+// prior value that CHANGES warns again, because that is new information.
+func TestRefreshPublishedSessionKillTTL_WarnsOncePerDistinctPrior(t *testing.T) {
+	t.Parallel()
+	h := &countingHandler{}
+	r, _, client := newTTLTestRedis(t,
+		WithSessionKillTTL(24*time.Hour),
+		WithReconcileInterval(30*time.Second),
+		WithLogger(slog.New(h)))
+	ctx := context.Background()
+
+	// Another instance published a different lifetime.
+	require.NoError(t, client.Set(ctx, redisSessionTTLKey, "48h0m0s", 0).Err())
+
+	r.refreshPublishedSessionKillTTL(ctx)
+	require.Equal(t, 1, h.countMatching(disagreementMsg), "the first disagreement must be reported")
+
+	// The other instance keeps overwriting with the SAME value: still one warning.
+	for i := 0; i < 3; i++ {
+		require.NoError(t, client.Set(ctx, redisSessionTTLKey, "48h0m0s", 0).Err())
+		r.refreshPublishedSessionKillTTL(ctx)
+	}
+	require.Equal(t, 1, h.countMatching(disagreementMsg), "a persistent disagreement must not reprint every tick")
+
+	// A DIFFERENT prior value is new information and warns again.
+	require.NoError(t, client.Set(ctx, redisSessionTTLKey, "12h0m0s", 0).Err())
+	r.refreshPublishedSessionKillTTL(ctx)
+	require.Equal(t, 2, h.countMatching(disagreementMsg), "a changed prior value must warn again")
+
+	// Once the disagreement resolves (this proxy's own value is what it reads back), the
+	// dedupe resets so a recurrence is reported rather than suppressed forever.
+	r.refreshPublishedSessionKillTTL(ctx)
+	require.Equal(t, 2, h.countMatching(disagreementMsg), "agreement must not warn")
+	require.NoError(t, client.Set(ctx, redisSessionTTLKey, "48h0m0s", 0).Err())
+	r.refreshPublishedSessionKillTTL(ctx)
+	require.Equal(t, 3, h.countMatching(disagreementMsg), "a disagreement that returns must warn again")
+}
+
+// TestRefreshPublishedSessionKillTTL_TwoInstancesEachReport: the case a startup-only
+// check structurally cannot catch — two proxies whose starts do not overlap. With a
+// periodic re-publish they overwrite each other continuously, so each learns of the other
+// on its next tick.
+func TestRefreshPublishedSessionKillTTL_TwoInstancesEachReport(t *testing.T) {
+	t.Parallel()
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	ctx := context.Background()
+
+	hA, hB := &countingHandler{}, &countingHandler{}
+	a := NewRedis(client, WithSessionKillTTL(24*time.Hour), WithReconcileInterval(30*time.Second), WithLogger(slog.New(hA)))
+	b := NewRedis(client, WithSessionKillTTL(48*time.Hour), WithReconcileInterval(30*time.Second), WithLogger(slog.New(hB)))
+
+	// A starts alone: nothing to disagree with.
+	_, differs, err := a.PublishSessionKillTTL(ctx)
+	require.NoError(t, err)
+	require.False(t, differs)
+
+	// B starts an hour later and sees A's value; then A's next tick sees B's.
+	_, differs, err = b.PublishSessionKillTTL(ctx)
+	require.NoError(t, err)
+	require.True(t, differs, "the later-starting instance sees the earlier one at startup")
+
+	a.refreshPublishedSessionKillTTL(ctx)
+	require.Equal(t, 1, hA.countMatching(disagreementMsg),
+		"the earlier instance must learn of the later one on its next tick, which no startup-only check can do")
+}
+
+// TestRefreshPublishedSessionKillTTL_GetFailureStillPublishes matches the startup
+// contract: the read only feeds the diagnostic, so a GET failure must not stop the write.
+// A WRONGTYPE at the key makes GET fail while SET still succeeds (SET replaces any type).
+func TestRefreshPublishedSessionKillTTL_GetFailureStillPublishes(t *testing.T) {
+	t.Parallel()
+	h := &countingHandler{}
+	r, mr, client := newTTLTestRedis(t,
+		WithSessionKillTTL(24*time.Hour),
+		WithReconcileInterval(30*time.Second),
+		WithLogger(slog.New(h)))
+	ctx := context.Background()
+
+	require.NoError(t, client.LPush(ctx, redisSessionTTLKey, "not-a-string").Err())
+	require.Error(t, client.Get(ctx, redisSessionTTLKey).Err(), "precondition: GET must fail on this key")
+
+	r.refreshPublishedSessionKillTTL(ctx)
+
+	got, ok, err := ReadPublishedSessionKillTTL(ctx, client)
+	require.NoError(t, err)
+	require.True(t, ok, "a failed GET must not stop the publish")
+	require.Equal(t, 24*time.Hour, got)
+	require.Equal(t, r.sessionTTLKeyExpiry(), mr.TTL(redisSessionTTLKey), "the re-published key still carries its expiry")
+}
+
+// TestRefreshPublishedSessionKillTTL_PublishFailureIsNotFatal: publishing is advisory —
+// this proxy applies its own configured lifetime to the tombstones it writes regardless —
+// so a failing Redis must be logged and the loop must continue. The failure log is
+// edge-triggered for the same reason the disagreement one is.
+func TestRefreshPublishedSessionKillTTL_PublishFailureIsNotFatal(t *testing.T) {
+	t.Parallel()
+	h := &countingHandler{}
+	mr := miniredis.RunT(t)
+	// Short, non-retrying timeouts: the point of this test is the LOG behaviour on a
+	// failing publish, and the client's default retry/backoff would otherwise spend
+	// seconds per call proving a server that is already gone is still gone.
+	client := redis.NewClient(&redis.Options{
+		Addr:         mr.Addr(),
+		DialTimeout:  50 * time.Millisecond,
+		ReadTimeout:  50 * time.Millisecond,
+		WriteTimeout: 50 * time.Millisecond,
+		MaxRetries:   -1,
+	})
+	t.Cleanup(func() { _ = client.Close() })
+	r := NewRedis(client, WithSessionKillTTL(time.Hour), WithReconcileInterval(30*time.Second), WithLogger(slog.New(h)))
+
+	mr.Close() // every command now fails
+
+	const failMsg = "could not refresh the session-kill TTL"
+	require.NotPanics(t, func() {
+		for i := 0; i < 3; i++ {
+			r.refreshPublishedSessionKillTTL(context.Background())
+		}
+	})
+	require.Equal(t, 1, h.countMatching(failMsg), "a sustained publish failure must warn once, not every tick")
 }

@@ -157,15 +157,41 @@ func ResolveSessionIdleTimeout(flagVal int, cfgVal *int) int {
 	return config.ResolveInt(cfgVal, flagVal)
 }
 
+// killActivator is the one-way half of the kill switch: the loopback control endpoint
+// can ISSUE a revocation and can never lift one. It exists to make that invariant
+// structural rather than documentary.
+//
+// The reason is the endpoint's own threat model. A same-host process that reaches the
+// loopback endpoint holding the control token can already halt this proxy — a documented
+// residual. Giving that same reach an undo would let it lift the very revocation issued
+// against it, which is why `eunox kill --revive` is deliberately Redis-only. With the
+// handle typed as the full killswitch.Manager, "generalize /control/kill for symmetry
+// with the CLI" is a three-line additive diff that compiles and runs with no resistance
+// from the type system or the existing tests. Narrowed, it does not compile.
+//
+// Keep this interface narrow. Widening it back to killswitch.Manager is not a tidy-up:
+// it re-opens the undo path this type exists to keep shut. The CLI side already holds
+// itself to the same bar — reviveViaRedis takes the concrete *killswitch.Redis rather
+// than the Manager interface, for exactly this reason.
+type killActivator interface {
+	// ActivateGlobal stops the whole deployment. There is no DeactivateGlobal here.
+	ActivateGlobal(ctx context.Context) error
+	// KillSession revokes one session. There is no ReviveSession here.
+	KillSession(ctx context.Context, sessionID string) error
+}
+
 // HTTPProxy implements the MCP Streamable HTTP transport.
 // Each client session gets its own upstream subprocess (local mode) or connects
 // to a remote MCP HTTP server (remote mode, enabled by UpstreamURL).
 type HTTPProxy struct {
-	jwtPDP             *pdp.JWTPDP            // non-nil when --jwks-uri is configured
-	oauthMeta          *OAuthResourceMetadata // non-nil when --oauth-resource / listen.oauthResource is set (which the CLI admits only alongside bearer-token validation)
-	oauthMetaURL       string                 // absolute metadata URL for WWW-Authenticate; empty when --oauth-resource is not set
-	sink               *audit.Sink
-	ks                 killswitch.Manager
+	jwtPDP       *pdp.JWTPDP            // non-nil when --jwks-uri is configured
+	oauthMeta    *OAuthResourceMetadata // non-nil when --oauth-resource / listen.oauthResource is set (which the CLI admits only alongside bearer-token validation)
+	oauthMetaURL string                 // absolute metadata URL for WWW-Authenticate; empty when --oauth-resource is not set
+	sink         *audit.Sink
+	// ks is deliberately the kill-ONLY interface, not killswitch.Manager: see
+	// killActivator. health.go's healthReporter assertion is on the dynamic type and is
+	// unaffected by the narrowing.
+	ks                 killActivator
 	shutdownMs         int
 	upstreamTimeMs     int
 	requireAuditStrict bool // --require-audit=strict: deny forwards once the audit trail degrades
@@ -180,7 +206,7 @@ type HTTPProxy struct {
 	controlToken string
 	// afterListen runs once the listener has bound and before any request is served,
 	// for startup work that must not happen when the bind fails. See HTTPGatewayOptions.
-	afterListen func() error
+	afterListen func(context.Context) error
 	// authTimingKey is a per-process random HMAC key folding presented/expected
 	// tokens to a fixed-length MAC before the constant-time comparison in checkAuth /
 	// checkControlToken. See constantTimeTokenEqual for the timing rationale.
@@ -297,7 +323,15 @@ type HTTPGatewayOptions struct {
 	// already in use" replace the RUNNING proxy's token on disk and break `eunox kill`
 	// against it. Returning an error closes the listener and fails Serve, so a hook that
 	// cannot complete does not leave a half-started proxy serving.
-	AfterListen func() error
+	//
+	// The context it receives is bounded (afterListenTimeout) and cancels on Serve's own
+	// ctx. A hook MUST honour it: the socket is already bound and accepting into the
+	// kernel backlog while this runs, but nothing is answering yet, so every second spent
+	// here is a second a client racing startup spends hung rather than being cleanly
+	// refused. Expiry is expected to abort the hook's effect, not merely be reported —
+	// see WriteControlTokenFile, which checks it immediately before its publishing rename
+	// so an abandoned write cannot land later.
+	AfterListen func(ctx context.Context) error
 	TrustFwdFor bool
 	// TrustedProxyCIDRs is listen.trustedProxyCIDRs: the reverse-proxy peer addresses
 	// trusted to set X-Forwarded-For under TrustFwdFor. Entries must already be valid
@@ -504,7 +538,18 @@ func (p *HTTPProxy) Serve(ctx context.Context) error {
 		// string, or whatever a future caller captures — in the heap for no further
 		// purpose once this one-shot startup effect has fired.
 		p.afterListen = nil
-		if err := hook(); err != nil {
+		// Bound the hook. Between net.Listen returning and srv.Serve starting the accept
+		// loop, the kernel completes handshakes into the backlog for a socket no userspace
+		// is reading, so a request arriving in this window HANGS rather than being refused.
+		// Without a bound that window is only as short as the slowest syscall inside the
+		// hook — an fsync on a stalled volume has no upper bound at all. Failing Serve on
+		// expiry is the right direction on the merits, not just the convenient one: the
+		// hook persists the control token, and a proxy whose emergency stop cannot be
+		// authenticated should not come up.
+		hookCtx, cancelHook := context.WithTimeout(ctx, afterListenTimeout)
+		err := hook(hookCtx)
+		cancelHook()
+		if err != nil {
 			_ = ln.Close()
 			return err
 		}

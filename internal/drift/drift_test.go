@@ -1443,6 +1443,59 @@ func TestParseToolsListResult_AmbiguousToolsKey(t *testing.T) {
 	}
 }
 
+// TestParseToolsListResult_MalformedEntry pins that a non-object entry still fails the
+// parse now that entries are decoded one at a time rather than through a second whole-
+// envelope unmarshal: a catalog is either fully believable or it is refused, and the
+// error names the offending index so an operator can find it.
+func TestParseToolsListResult_MalformedEntry(t *testing.T) {
+	t.Parallel()
+	for _, body := range []string{
+		`{"tools":[{"name":"ok"},42]}`,
+		`{"tools":[{"name":"ok"},"not-an-object"]}`,
+		`{"tools":[{"name":"ok"},{"name":123}]}`,
+	} {
+		_, err := ParseToolsListResult(json.RawMessage(body))
+		if err == nil {
+			t.Errorf("a malformed entry must fail the parse, not be skipped: %s", body)
+			continue
+		}
+		if !strings.Contains(err.Error(), "entry 1") {
+			t.Errorf("error should name the offending entry index, got %q for %s", err, body)
+		}
+	}
+}
+
+// TestParseToolsListResult_EntriesDecodeIndependently pins that the per-entry decode
+// carries every hashed field through, so folding the second envelope decode into the
+// entry loop cannot silently drop one — a zeroed field hashes clean against a pin that
+// would otherwise have caught an injected value.
+func TestParseToolsListResult_EntriesDecodeIndependently(t *testing.T) {
+	t.Parallel()
+	raw := json.RawMessage(`{"tools":[{
+		"name":"read_file",
+		"title":"Read File",
+		"description":"reads a file",
+		"inputSchema":{"type":"object","properties":{"path":{"type":"string"}}},
+		"outputSchema":{"type":"object"},
+		"annotations":{"readOnlyHint":true}
+	}]}`)
+	tools, err := ParseToolsListResult(raw)
+	if err != nil {
+		t.Fatalf("ParseToolsListResult: %v", err)
+	}
+	if len(tools) != 1 {
+		t.Fatalf("want 1 tool, got %d", len(tools))
+	}
+	got := tools[0]
+	if got.Name != "read_file" || got.Title != "Read File" || got.Description != "reads a file" {
+		t.Errorf("string fields not carried through: %+v", got)
+	}
+	if got.InputSchema == nil || got.OutputSchema == nil || got.Annotations == nil {
+		t.Errorf("map fields not carried through: inputSchema=%v outputSchema=%v annotations=%v",
+			got.InputSchema, got.OutputSchema, got.Annotations)
+	}
+}
+
 // TestDriftWarning_LogLine_Default covers the default case in LogLine().
 func TestDriftWarning_LogLine_Default(t *testing.T) {
 	t.Parallel()

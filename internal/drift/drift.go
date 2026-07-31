@@ -959,30 +959,35 @@ func FetchAllToolPages(fetchPage func(cursor string) (json.RawMessage, error)) (
 }
 
 // ParseToolsListResult decodes the raw JSON result from a tools/list response.
+//
+// It screens the envelope and every entry itself rather than assuming a screened
+// caller. Every in-tree caller today feeds it the merged output of FetchAllToolPages,
+// which already rejected an ambiguous envelope per page and then re-marshaled the
+// result — so for those callers the envelope gate below can never fire. It is kept
+// anyway, and the tradeoff was made deliberately rather than by omission: this is an
+// exported function documented as taking "the raw JSON result from a tools/list
+// response", so the precondition a caller would have to satisfy is invisible at the
+// call site, and getting it wrong reopens a catalog-substitution bypass rather than
+// producing an obvious failure. A guard whose absence is silent belongs on the
+// boundary, not in a comment telling future callers to pre-screen.
+//
+// The cost that made this worth revisiting was paid for elsewhere instead: the decode
+// below walks the envelope once and decodes each entry from the RawMessage the same
+// pass produced, rather than re-unmarshaling the whole result a second time into
+// mcp.ToolsListResult. That removes a redundant full pass rather than a check.
 func ParseToolsListResult(raw json.RawMessage) ([]UpstreamTool, error) {
 	if raw == nil {
 		return nil, nil
 	}
-	// Reject an entry whose bytes are ambiguous BEFORE decoding them into the struct the
-	// descriptionHash is computed over. A plain Unmarshal binds object keys to fields by a
-	// case-folding match and keeps the LAST, so an upstream serving both "description" and
-	// "deſcription" (U+017F — already lower case, so a ToLower-based check misses it)
-	// hashes CLEAN against the pin while a case-sensitive host renders the injected value:
-	// the FM-5 startup refusal this whole comparison exists to trigger never fires. The
-	// runtime list filter applies the same gate per entry; sharing pdp.EntryKeysAmbiguous
-	// keeps the two layers from drifting apart on what "believable" means.
+	// The ENVELOPE is screened before it is decoded, for the reason given at the function:
+	// raw bytes carrying a case-variant "Tools" or a duplicated "tools" decode silently to
+	// ONE array here — Go binds by a case-folding match and keeps the last — which is the
+	// same catalog-substitution bypass ToolsKeyAmbiguous was exported to close on the
+	// runtime list path. The per-entry gate is applied below, on each entry's own bytes.
 	//
-	// Surfacing it as a parse error routes it through driftProbeUnavailable, which is
+	// Surfacing either as a parse error routes it through driftProbeUnavailable, which is
 	// exactly the right policy: fatal when the manifest carries descriptionHash pins
 	// (integrity cannot be verified), an observable skip otherwise.
-	//
-	// The ENVELOPE gets the same treatment as the entries, and not only because its one
-	// in-tree producer already pre-screens: this function is exported and documented as
-	// decoding "the raw JSON result from a tools/list response", so a caller added later
-	// hands it bytes nothing has screened. Raw bytes carrying a case-variant "Tools" or a
-	// duplicated "tools" decode silently to ONE array here — Go binds by a case-folding
-	// match and keeps the last — which is the same catalog-substitution bypass
-	// ToolsKeyAmbiguous was exported to close on the runtime list path.
 	//
 	// ToolsKeyAmbiguous also reports true on bytes it cannot even walk (truncated JSON, a
 	// non-object top level) — deliberately: this gate must fail closed on uncertainty, not
@@ -998,18 +1003,29 @@ func ParseToolsListResult(raw json.RawMessage) ([]UpstreamTool, error) {
 	if err := json.Unmarshal(raw, &envelope); err != nil {
 		return nil, fmt.Errorf("parsing tools/list result: %w", err)
 	}
+	// One pass: screen each entry and decode it from the SAME bytes that were screened.
+	// Re-unmarshaling raw into an mcp.ToolsListResult here instead would walk the whole
+	// envelope a second time to reach entries this loop already holds, and would decode
+	// each entry from bytes a second decoder re-derived rather than from the ones
+	// EntryKeysAmbiguous actually inspected.
+	tools := make([]UpstreamTool, len(envelope.Tools))
 	for i, entry := range envelope.Tools {
+		// Reject an entry whose bytes are ambiguous BEFORE decoding them into the struct
+		// the descriptionHash is computed over. A plain Unmarshal binds object keys to
+		// fields by a case-folding match and keeps the LAST, so an upstream serving both
+		// "description" and "deſcription" (U+017F — already lower case, so a ToLower-based
+		// check misses it) hashes CLEAN against the pin while a case-sensitive host renders
+		// the injected value: the FM-5 startup refusal this whole comparison exists to
+		// trigger never fires. The runtime list filter applies the same gate per entry;
+		// sharing pdp.EntryKeysAmbiguous keeps the two layers from drifting apart on what
+		// "believable" means.
 		if pdp.EntryKeysAmbiguous(entry) {
 			return nil, fmt.Errorf("tools/list entry %d carries duplicate or case-variant keys, so its description cannot be verified against a descriptionHash pin", i)
 		}
-	}
-
-	var result mcp.ToolsListResult
-	if err := json.Unmarshal(raw, &result); err != nil {
-		return nil, fmt.Errorf("parsing tools/list result: %w", err)
-	}
-	tools := make([]UpstreamTool, len(result.Tools))
-	for i, t := range result.Tools {
+		var t mcp.ToolEntry
+		if err := json.Unmarshal(entry, &t); err != nil {
+			return nil, fmt.Errorf("parsing tools/list result: entry %d: %w", i, err)
+		}
 		// Field by field, by NAME, rather than a positional UpstreamTool(t) struct
 		// conversion. The two types share three string fields and two
 		// map[string]interface{} fields, so a same-type reorder in mcp.ToolEntry would

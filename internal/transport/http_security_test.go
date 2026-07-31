@@ -974,10 +974,7 @@ func TestRequireJSONContentType_Kill(t *testing.T) {
 		if rr.Code != http.StatusUnsupportedMediaType {
 			t.Errorf("status = %d, want 415 (body=%q)", rr.Code, rr.Body.String())
 		}
-		status, err := proxy.ks.Status(context.Background())
-		if err != nil {
-			t.Fatalf("Status: %v", err)
-		}
+		status := killStatusForTest(t, proxy)
 		if status.GlobalActive {
 			t.Error("a refused /control/kill must not have activated the global kill switch")
 		}
@@ -1013,10 +1010,7 @@ func TestRequireJSONContentType_Kill(t *testing.T) {
 		if rr.Code != http.StatusOK {
 			t.Fatalf("status = %d, want 200 (body=%q)", rr.Code, rr.Body.String())
 		}
-		status, err := proxy.ks.Status(context.Background())
-		if err != nil {
-			t.Fatalf("Status: %v", err)
-		}
+		status := killStatusForTest(t, proxy)
 		if !status.GlobalActive {
 			t.Error("an accepted /control/kill {\"all\":true} must activate the global kill switch")
 		}

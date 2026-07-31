@@ -282,10 +282,7 @@ func TestHTTPHandleKill_RejectsTrailingJSONTokens(t *testing.T) {
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("trailing JSON token: status = %d, want 400 (body=%q)", w.Code, w.Body.String())
 	}
-	status, err := proxy.ks.Status(context.Background())
-	if err != nil {
-		t.Fatalf("Status: %v", err)
-	}
+	status := killStatusForTest(t, proxy)
 	if status.GlobalActive {
 		t.Error("malformed body with a smuggled {\"all\":true} must not activate the global kill")
 	}
@@ -4888,7 +4885,7 @@ func TestServe_AfterListenNotRunWhenBindFails(t *testing.T) {
 		Routes:      map[string]*UpstreamRoute{},
 		Bind:        "127.0.0.1",
 		Port:        port,
-		AfterListen: func() error { ran.Store(true); return nil },
+		AfterListen: func(context.Context) error { ran.Store(true); return nil },
 	})
 	err = proxy.Serve(t.Context())
 	if err == nil {
@@ -4913,7 +4910,7 @@ func TestServe_AfterListenErrorAbortsServe(t *testing.T) {
 		Routes:      map[string]*UpstreamRoute{},
 		Bind:        "127.0.0.1",
 		Port:        freeTCPPort(t),
-		AfterListen: func() error { return hookErr },
+		AfterListen: func(context.Context) error { return hookErr },
 	})
 	if err := proxy.Serve(t.Context()); !errors.Is(err, hookErr) {
 		t.Fatalf("Serve error = %v, want %v", err, hookErr)
@@ -4931,7 +4928,7 @@ func TestServe_AfterListenRunsBeforeServing(t *testing.T) {
 		Routes:      map[string]*UpstreamRoute{},
 		Bind:        "127.0.0.1",
 		Port:        port,
-		AfterListen: func() error { close(ran); return nil },
+		AfterListen: func(context.Context) error { close(ran); return nil },
 	})
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -4947,6 +4944,80 @@ func TestServe_AfterListenRunsBeforeServing(t *testing.T) {
 	waitForServer(t, fmt.Sprintf("http://127.0.0.1:%d/healthz", port))
 	cancel()
 	<-done
+}
+
+// TestServe_AfterListenHookIsBounded pins that the hook receives a context carrying a
+// deadline rather than a bare one. Between the bind and the accept loop the socket is
+// already completing handshakes nothing answers, so a hook with no bound turns a
+// slow-startup race from a clean connection-refused into a client-side hang.
+func TestServe_AfterListenHookIsBounded(t *testing.T) {
+	t.Parallel()
+	port := freeTCPPort(t)
+	deadlines := make(chan time.Duration, 1)
+	proxy := NewHTTPProxyGateway(HTTPGatewayOptions{
+		Routes: map[string]*UpstreamRoute{},
+		Bind:   "127.0.0.1",
+		Port:   port,
+		AfterListen: func(ctx context.Context) error {
+			dl, ok := ctx.Deadline()
+			if !ok {
+				deadlines <- 0
+				return nil
+			}
+			deadlines <- time.Until(dl)
+			return nil
+		},
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- proxy.Serve(ctx) }()
+	select {
+	case d := <-deadlines:
+		if d <= 0 {
+			t.Fatal("AfterListen must receive a context with a deadline; an unbounded hook can hang the accept loop indefinitely")
+		}
+		if d > afterListenTimeout {
+			t.Errorf("hook deadline %v exceeds afterListenTimeout %v", d, afterListenTimeout)
+		}
+	case err := <-done:
+		t.Fatalf("Serve returned before running AfterListen: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("AfterListen did not run")
+	}
+	cancel()
+	<-done
+}
+
+// TestServe_AfterListenExpiryClosesListener: when the hook fails (the shape an expired
+// write takes), Serve closes the listener and returns. The observable property is that a
+// follow-up dial is REFUSED rather than hanging — which is the whole point of bounding
+// the hook, since an unbounded one leaves the socket bound with nothing accepting.
+func TestServe_AfterListenExpiryClosesListener(t *testing.T) {
+	t.Parallel()
+	port := freeTCPPort(t)
+	proxy := NewHTTPProxyGateway(HTTPGatewayOptions{
+		Routes: map[string]*UpstreamRoute{},
+		Bind:   "127.0.0.1",
+		Port:   port,
+		AfterListen: func(ctx context.Context) error {
+			// Stand in for a write that outran its budget: the hook observes an expired
+			// context and reports it, exactly as WriteControlTokenFile does.
+			expired, cancel := context.WithCancel(ctx)
+			cancel()
+			return expired.Err()
+		},
+	})
+	if err := proxy.Serve(t.Context()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Serve error = %v, want a context error", err)
+	}
+	// The listener must be gone: a proxy that could not complete its post-bind startup
+	// must not leave a bound socket behind for a client to hang against.
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 2*time.Second)
+	if err == nil {
+		_ = conn.Close()
+		t.Error("listener still accepting after the post-bind hook failed; a racing client would hang instead of being refused")
+	}
 }
 
 // ── sourceIP ──────────────────────────────────────────────────────────────
@@ -6035,4 +6106,34 @@ func TestAddSlack_SaturatesInsteadOfOverflowing(t *testing.T) {
 	if got := addSlack(time.Duration(math.MaxInt64) - writeSlack); got != time.Duration(math.MaxInt64) {
 		t.Errorf("addSlack(MaxInt64-writeSlack) = %v, want MaxInt64", got)
 	}
+}
+
+// Build-time proof that the full kill-switch Manager still satisfies the narrowed,
+// kill-only handle the control endpoint holds (see killActivator). Without this, a
+// future rename or signature change in killswitch.Manager would break the wiring in
+// NewHTTPProxyGateway rather than here, where the reason is written down.
+//
+// This is the one thing worth keeping from "assert a revive-shaped body has no effect":
+// a test asserting the endpoint ignores an unknown body key would enshrine the lenient
+// decode as promised behavior, which is not a promise worth making. Removing the METHOD
+// strictly dominates rejecting a body key — with no ReviveSession reachable through
+// p.ks, a "revive" key has nothing to call whether it is rejected or ignored.
+var _ killActivator = (killswitch.Manager)(nil)
+
+// killStatusForTest reads the proxy's kill-switch state in a test. p.ks is the narrowed,
+// kill-only killActivator (see its doc comment), which deliberately exposes no reader — so
+// a test that needs to assert what a /control/kill call actually wrote reaches the backend
+// through its dynamic type here, in ONE place, rather than widening the production field
+// to make an assertion convenient.
+func killStatusForTest(t *testing.T, p *HTTPProxy) *killswitch.Status {
+	t.Helper()
+	mgr, ok := p.ks.(killswitch.Manager)
+	if !ok {
+		t.Fatalf("test kill switch %T does not implement killswitch.Manager", p.ks)
+	}
+	st, err := mgr.Status(context.Background())
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	return st
 }

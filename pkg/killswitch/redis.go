@@ -152,6 +152,18 @@ type Redis struct {
 	// operator log breadcrumb.
 	reconcileErrLogged bool
 
+	// sessionTTLWarnedPrior / sessionTTLWarnedSet dedupe the periodic session-kill-TTL
+	// disagreement warning on the PRIOR VALUE rather than on a bare "already warned"
+	// flag, so a persistent disagreement warns once while a changed one warns again.
+	// Without the dedupe this line prints every reconcile interval for the life of the
+	// process, which is how a real diagnostic gets tuned out. See
+	// refreshPublishedSessionKillTTL.
+	sessionTTLWarnedPrior string
+	sessionTTLWarnedSet   bool
+	// sessionTTLPublishErrLogged edge-triggers the re-publish failure warning, exactly
+	// as reconcileErrLogged does for the cache refresh on the same loop.
+	sessionTTLPublishErrLogged bool
+
 	reconcileInterval time.Duration
 
 	// sessionKillTTL is how long a session-kill tombstone lives; see
@@ -438,6 +450,13 @@ func (r *Redis) Start(ctx context.Context) {
 // reconcileLoop periodically refreshes the local cache from Redis so that kill
 // events lost by pub/sub, and fail-open state from a cold start during a Redis
 // outage, converge to the authoritative Redis state within one interval.
+//
+// It also re-publishes the session-kill TTL, which is what keeps that key's expiry from
+// outliving the process that set it. The re-publish rides this tick on purpose rather
+// than owning a timer: it is the same connection on a schedule the operator already
+// configured, so it adds a command, not background activity of its own. It is deliberately
+// NOT folded into reconcileRefresh, which a pub/sub resync also calls -- a kill event
+// arriving should converge the cache, not trigger a config write.
 func (r *Redis) reconcileLoop(ctx context.Context) {
 	interval := r.reconcileInterval
 	if interval <= 0 {
@@ -451,6 +470,7 @@ func (r *Redis) reconcileLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			r.reconcileRefresh(ctx)
+			r.refreshPublishedSessionKillTTL(ctx)
 		}
 	}
 }

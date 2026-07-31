@@ -251,7 +251,7 @@ func TestRunRedisKill_HonorsSessionKillTTL(t *testing.T) {
 	mr := miniredis.RunT(t)
 
 	// Negative: expiry disabled, so the tombstone must carry no TTL.
-	if err := runRedisKill(redisKillRequest{addr: mr.Addr(), target: "sess-permanent", sessionKillTTL: -1, ttlFlagSet: true}); err != nil {
+	if err := runRedisKill(redisKillRequest{addr: mr.Addr(), target: killTarget{kind: killTargetSession, id: "sess-permanent"}, sessionKillTTL: -1, ttlFlagSet: true}); err != nil {
 		t.Fatalf("runRedisKill: %v", err)
 	}
 	if ttl := mr.TTL("killswitch:session:sess-permanent"); ttl != 0 {
@@ -259,7 +259,7 @@ func TestRunRedisKill_HonorsSessionKillTTL(t *testing.T) {
 	}
 
 	// An explicit positive value is applied verbatim, not replaced by the default.
-	if err := runRedisKill(redisKillRequest{addr: mr.Addr(), target: "sess-short", sessionKillTTL: 90 * time.Minute, ttlFlagSet: true}); err != nil {
+	if err := runRedisKill(redisKillRequest{addr: mr.Addr(), target: killTarget{kind: killTargetSession, id: "sess-short"}, sessionKillTTL: 90 * time.Minute, ttlFlagSet: true}); err != nil {
 		t.Fatalf("runRedisKill: %v", err)
 	}
 	if ttl := mr.TTL("killswitch:session:sess-short"); ttl != 90*time.Minute {
@@ -267,7 +267,7 @@ func TestRunRedisKill_HonorsSessionKillTTL(t *testing.T) {
 	}
 
 	// 0 selects the documented default.
-	if err := runRedisKill(redisKillRequest{addr: mr.Addr(), target: "sess-default"}); err != nil {
+	if err := runRedisKill(redisKillRequest{addr: mr.Addr(), target: killTarget{kind: killTargetSession, id: "sess-default"}}); err != nil {
 		t.Fatalf("runRedisKill: %v", err)
 	}
 	if ttl := mr.TTL("killswitch:session:sess-default"); ttl != killswitch.DefaultSessionKillTTL {

@@ -1065,6 +1065,13 @@ func (p *HTTPProxy) handleMCPDelete(w http.ResponseWriter, r *http.Request, rout
 }
 
 // handleKill processes POST /control/kill (loopback only).
+//
+// Kill-only, deliberately: this endpoint issues revocations and has no undo. Lifting one
+// is done where the kill state lives (`eunox kill --revive`, Redis-only), because a
+// same-host process that reaches this endpoint holding the control token can already halt
+// the proxy, and an undo here would let it lift the revocation issued against it. The
+// handle it calls through (p.ks) is typed to make that structural rather than a promise —
+// see killActivator, which is where to read before adding a verb to this handler.
 func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 	// Loopback guard runs first — before the control-token check — so an off-host
 	// caller is rejected by the security boundary rather than learning the endpoint
