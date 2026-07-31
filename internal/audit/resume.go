@@ -49,13 +49,15 @@ func interpretAuditTail(buf []byte, n int, readErr error, size int64) (string, e
 	// daemon racing a restart, or a stale NFS size cache. Reporting this as ("", nil)
 	// would let the caller start a fresh chain and leave an unmarked gap, so return a
 	// distinguishable error and let Open write an in-band marker.
-	if n == 0 && errors.Is(readErr, io.EOF) {
-		return "", fmt.Errorf("audit tail read: file shrank from %d bytes between stat and read: %w", size, errAuditFileShrunk)
-	}
-	// A partial read with io.EOF (0 < n < len(buf)) is also a shrink: buf was sized
+	// A short read with io.EOF (n < len(buf), zero included) is a shrink: buf was sized
 	// to exactly the bytes Stat reported, so fewer means truncation between Stat and
 	// ReadAt. Processing buf[:n] would validate a stale or fragmentary record as the
-	// tail and mask the shrink, so treat it like the n==0 case.
+	// tail and mask the shrink.
+	//
+	// One branch, not two: an n == 0 arm ahead of this one was a strict subset of it
+	// (both callers guarantee len(buf) >= 1, so 0 < len(buf) always holds) differing
+	// only in the wording of an error nothing branches on — two exits to keep in step
+	// for one condition.
 	if n < len(buf) && errors.Is(readErr, io.EOF) {
 		return "", fmt.Errorf("audit tail read: file shrank from %d bytes (read %d of %d tail bytes) between stat and read: %w", size, n, len(buf), errAuditFileShrunk)
 	}

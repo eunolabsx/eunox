@@ -123,8 +123,10 @@ type StdioProxy struct {
 	pendingMu sync.Mutex
 	// pending is keyed by the host's JSON-RPC ID and exists solely to reject a
 	// duplicate in-flight host ID. It does NOT route upstream responses; that is
-	// byUpstreamID's job.
-	pending map[string]chan upstreamResult
+	// byUpstreamID's job — so it is a SET, not a channel map. Storing channels here
+	// invited exactly the misreading its own doc had to disclaim, and nothing ever
+	// delivered through them.
+	pending map[string]struct{}
 	// byUpstreamID routes upstream responses (and remote-HTTP-bridge transport
 	// failures — see deliverUpstreamError) back to the waiting caller, keyed by the
 	// proxy-generated upstream ID (the nonce). A result carrying a stale nonce (its
@@ -262,7 +264,7 @@ func NewStdioProxy(opts StdioProxyOptions) *StdioProxy {
 		audit:                 opts.Audit,
 		requireAuditStrict:    opts.RequireAuditStrict,
 		driftCheck:            opts.DriftCheck,
-		pending:               make(map[string]chan upstreamResult),
+		pending:               make(map[string]struct{}),
 		byUpstreamID:          make(map[string]chan upstreamResult),
 		hostToUp:              make(map[string]*json.RawMessage),
 		hostReader:            mcp.NewMsgReader(os.Stdin),
@@ -527,13 +529,20 @@ func (p *StdioProxy) upstreamLabel() string {
 
 // killUpstream forcibly stops the upstream, used when startup (initialize or
 // drift) fails.
+//
+// The whole process GROUP is killed, not just the direct child: an upstream launched
+// through a wrapper (`npx`, `uvx`, a shell script) execs or forks the real server as a
+// grandchild holding the same stdout pipe, and killing only the wrapper leaves that
+// pipe open forever — so the EOF every post-kill wait here is waiting for never
+// arrives. killUpstreamGroup falls back to the direct child when no group was
+// established (see procgroup_unix.go).
 func (p *StdioProxy) killUpstream() {
 	if p.upHTTP != nil {
 		p.upHTTP.close()
 		return
 	}
-	if p.upCmd != nil && p.upCmd.Process != nil {
-		_ = p.upCmd.Process.Kill()
+	if p.upCmd != nil {
+		killUpstreamProcess(p.upCmd.Process)
 	}
 }
 
@@ -545,13 +554,13 @@ func (p *StdioProxy) signalUpstream(sig os.Signal) {
 		p.upHTTP.close()
 		return
 	}
-	if p.upCmd.Process != nil {
-		_ = p.upCmd.Process.Signal(sig)
-	}
+	// The whole tree, so a wrapper's grandchild gets the chance to shut down gracefully
+	// too rather than only being reaped by the SIGKILL fallback below.
+	signalUpstreamProcess(p.upCmd.Process, sig)
 	t := time.AfterFunc(p.killDelay(), func() {
 		if p.upCmd.Process != nil {
 			fmt.Fprintf(os.Stderr, "[eunox] Upstream did not exit; sending SIGKILL.\n")
-			_ = p.upCmd.Process.Kill()
+			killUpstreamProcess(p.upCmd.Process)
 		}
 	})
 	p.killMu.Lock()
@@ -574,7 +583,20 @@ func (p *StdioProxy) awaitUpstreamDrain() {
 	case <-time.After(p.killDelay()):
 		fmt.Fprintf(os.Stderr, "[eunox] Upstream did not exit after host disconnect; forcing shutdown.\n")
 		p.killUpstream()
-		<-p.upstreamDone
+		// Bound the post-kill wait independently, exactly as httpSession.close does.
+		// The kill EOFs the pipe almost immediately in the ordinary case, but "almost
+		// immediately" is not "always": a descendant that escaped the process group
+		// (a double-fork, an explicit setsid) still holds the pipe, and on a platform
+		// with no process-group teardown at all every wrapper-launched grandchild does.
+		// An unbounded wait here turns that into a proxy that never exits and never
+		// flushes its audit sink — the opposite of what this bounded teardown exists
+		// for. The subprocess is already killed; abandoning the wait leaves only the
+		// reader goroutine, which drains and exits on its own if the pipe ever closes.
+		select {
+		case <-p.upstreamDone:
+		case <-time.After(p.killDelay()):
+			fmt.Fprintf(os.Stderr, "[eunox] Upstream output stream still open after SIGKILL (a descendant may have escaped the process group); abandoning the drain and continuing shutdown.\n")
+		}
 	}
 }
 
@@ -661,7 +683,16 @@ func (p *StdioProxy) runBoundedStartup(ctx context.Context, fn func() error) err
 		return err
 	case <-startCtx.Done():
 		p.killUpstream() //nolint:contextcheck // teardown path: the upstream session-termination DELETE intentionally uses a detached, bounded background context — close/reaper/signal/shutdown carry no request context.
-		<-done           // fn observes the pipe EOF the kill produced and returns
+		// fn observes the pipe EOF the kill produced and returns — bounded, because a
+		// descendant that escaped the process group (or a platform without one) can hold
+		// that pipe open indefinitely, and an unbounded wait here would hang the very
+		// startup watchdog whose whole job is to bound a wedged upstream. Mirrors
+		// awaitUpstreamDrain's second bound.
+		select {
+		case <-done:
+		case <-time.After(p.killDelay()):
+			fmt.Fprintf(os.Stderr, "[eunox] Upstream output stream still open after the startup watchdog SIGKILL (a descendant may have escaped the process group); abandoning the wait.\n")
+		}
 		return fmt.Errorf("upstream did not complete startup within %s: %w", timeout, startCtx.Err())
 	}
 }
@@ -1200,8 +1231,17 @@ func (p *StdioProxy) forwardServerRequestToHost(msg mcp.RPCMsg) {
 // requests are forwarded to the host.
 func (p *StdioProxy) handleUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) {
 	// The stdio transport has no network client: no source IP to gate sampling on
-	// (an ipRange condition fails closed here) and no JWT identity. The host writer
-	// cannot fail to deliver, so forward always reports true.
+	// (an ipRange condition fails closed here) and no JWT identity.
+	//
+	// forward always reports true, which is an honest inaccuracy rather than a
+	// guarantee: writes to the host writer are fire-and-forget (a dropped host reply
+	// has nowhere to return an error to), so a poisoned stdout — a partial frame that
+	// latched the writer — discards the request while the audit record still says
+	// delivered=true. The HTTP transport can report the failure because its forward has
+	// a response writer to fail against. What bounds the stdio window is the writer's
+	// poison hook, armed in Start: the FIRST desync tears the upstream down and ends the
+	// session, so at most the frames already in flight are misrecorded rather than an
+	// open-ended stream of them.
 	forwardServerRequest(ctx, msg, serverRequestParams{
 		rec:              p.rec(),
 		audit:            p.audit,
@@ -1317,7 +1357,8 @@ func rewriteCancelToNonce(mu *sync.Mutex, hostToUp map[string]*json.RawMessage, 
 func awaitNonced(
 	ctx context.Context,
 	mu *sync.Mutex,
-	pending, byUpstreamID map[string]chan upstreamResult,
+	pending map[string]struct{},
+	byUpstreamID map[string]chan upstreamResult,
 	hostToUp map[string]*json.RawMessage,
 	seq *uint64,
 	done <-chan struct{},
@@ -1333,7 +1374,7 @@ func awaitNonced(
 	}
 	*seq++
 	upID, upKey := upstreamNonceID(*seq)
-	pending[hostKey] = ch
+	pending[hostKey] = struct{}{}
 	byUpstreamID[upKey] = ch
 	// Record host-id -> nonce so a later notifications/cancelled can translate its
 	// params.requestId to the id the upstream actually saw. hostToUp is nil only
@@ -1405,7 +1446,7 @@ func (p *StdioProxy) callUpstream(ctx context.Context, msg mcp.RPCMsg) (mcp.RPCM
 	// the test-assembled proxy this block exists to accommodate.
 	p.pendingMu.Lock()
 	if p.pending == nil {
-		p.pending = make(map[string]chan upstreamResult)
+		p.pending = make(map[string]struct{})
 	}
 	if p.byUpstreamID == nil {
 		p.byUpstreamID = make(map[string]chan upstreamResult)
@@ -1480,13 +1521,13 @@ func (p *StdioProxy) readUpstream(ctx context.Context) {
 			// Recording the drop keeps a killed session's suppressed notifications visible
 			// on the tape, mirroring serveHost's host-notification kill record (so a
 			// transient store outage drops-and-records rather than silently swallowing).
-			// p.pdp is non-nil in production (NewStdioProxy defaults an omitted PDP); the
-			// guard covers a test-assembled proxy that wires no PDP.
-			if p.pdp != nil {
-				if deny := p.pdp.CheckKill(ctx, p.sessionID); deny != nil {
-					recordKillDrop(ctx, p.rec(), deny, verifiedSession(p.sessionID), msg.Method, msg.Method, legStdioUpstreamNotification)
-					continue
-				}
+			// Unguarded, like the two sibling kill checks: NewStdioProxy defaults an
+			// omitted PDP, so p.pdp is never nil in production and a nil-PDP proxy is a
+			// construction bug better surfaced than skipped — skipping the kill check is
+			// the fail-OPEN direction.
+			if deny := p.pdp.CheckKill(ctx, p.sessionID); deny != nil {
+				recordKillDrop(ctx, p.rec(), deny, verifiedSession(p.sessionID), msg.Method, msg.Method, legStdioUpstreamNotification)
+				continue
 			}
 			_ = p.hostWriter.Write(msg)
 			continue

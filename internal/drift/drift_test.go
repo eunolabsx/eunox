@@ -370,6 +370,93 @@ func TestCheckManifestDrift_FM3_PrincipalVariantAtEqualSpecificityChecked(t *tes
 	}
 }
 
+// TestCheckManifestDrift_FM3_LowerSpecificityReachableBehindScopedEntryChecked is the
+// regression for the covering-set cutoff. The engine filters by principal BEFORE it
+// scores, so a MORE-specific entry shadows a less-specific one only when it applies to
+// every caller — that is, only when it is unscoped. Here the exact entry is scoped to
+// alice, so every other caller is governed by the unscoped glob, whose pinned argument
+// the live schema lacks. A maximum-specificity covering set saw only the exact entry
+// and never ran the glob's checks — and FM-1/FM-2/FM-6 are fatal under --strict-drift,
+// so a strict deployment would boot believing it verified drift it had not.
+func TestCheckManifestDrift_FM3_LowerSpecificityReachableBehindScopedEntryChecked(t *testing.T) {
+	manifest := manifestWith(
+		capability.Constraint{
+			Target:    "tool:read_file", // MORE specific, but scoped: governs alice only
+			Actions:   []string{"call"},
+			Principal: map[string][]string{"sub": {"alice"}},
+		},
+		capability.Constraint{
+			Target:  "tool:read_*", // less specific, UNSCOPED: governs everyone else
+			Actions: []string{"call"},
+			Conditions: []capability.Condition{
+				capability.AllowedValuesCondition{Argument: "scope", Values: []interface{}{"x"}},
+			},
+		},
+	)
+	tools := []UpstreamTool{{
+		Name: "read_file",
+		InputSchema: map[string]interface{}{
+			"type":       "object",
+			"properties": map[string]interface{}{"path": map[string]interface{}{"type": "string"}},
+		},
+	}}
+	fm3 := findKind(CheckManifestDrift(manifest, tools, ""), Fm3)
+	if fm3 == nil || fm3.Argument != "scope" {
+		t.Errorf("FM-3 must flag the pinned 'scope' arg on the unscoped glob every non-alice caller is governed by; got %+v", fm3)
+	}
+}
+
+// TestCheckManifestDrift_FM3_UnscopedMoreSpecificStillShadows is the other side: the
+// widened covering set must not start reporting genuinely unreachable entries. An
+// UNSCOPED more-specific entry applies to every caller, so the glob beneath it really
+// is dead for this tool and its pin must stay unflagged — the behavior
+// TestCheckManifestDrift_FM3_ShadowedConstraintNotFlagged pins, restated here with the
+// declaration order reversed so the cutoff cannot pass by accident of ordering.
+func TestCheckManifestDrift_FM3_UnscopedMoreSpecificStillShadows(t *testing.T) {
+	manifest := manifestWith(
+		capability.Constraint{
+			Target:  "tool:read_file", // MORE specific and unscoped: shadows the glob outright
+			Actions: []string{"call"},
+		},
+		capability.Constraint{
+			Target:  "tool:read_*",
+			Actions: []string{"call"},
+			Conditions: []capability.Condition{
+				capability.AllowedValuesCondition{Argument: "scope", Values: []interface{}{"x"}},
+			},
+		},
+	)
+	tools := []UpstreamTool{{
+		Name: "read_file",
+		InputSchema: map[string]interface{}{
+			"type":       "object",
+			"properties": map[string]interface{}{"path": map[string]interface{}{"type": "string"}},
+		},
+	}}
+	if fm3 := findKind(CheckManifestDrift(manifest, tools, ""), Fm3); fm3 != nil {
+		t.Errorf("FM-3 must not fire for a constraint an unscoped more-specific entry shadows for every caller; got %+v", fm3)
+	}
+}
+
+// TestBestManifestConstraint_PrefersTopTierAcrossAWidenedCoveringSet: coveringConstraints
+// now spans more than one specificity tier, so validate --live's COVERED line must narrow
+// to the top tier itself rather than reporting whichever reachable entry was declared
+// first.
+func TestBestManifestConstraint_PrefersTopTierAcrossAWidenedCoveringSet(t *testing.T) {
+	manifest := manifestWith(
+		capability.Constraint{Target: "tool:read_*", Actions: []string{"call"}},
+		capability.Constraint{
+			Target:    "tool:read_file",
+			Actions:   []string{"call"},
+			Principal: map[string][]string{"sub": {"alice"}},
+		},
+	)
+	best := BestManifestConstraint(manifest, "read_file")
+	if best == nil || best.Target != "tool:read_file" {
+		t.Errorf("BestManifestConstraint = %+v, want the most specific covering entry tool:read_file", best)
+	}
+}
+
 // TestCheckManifestDrift_FM3_DuplicateToolNameDeduped is the regression: a tool
 // name appearing twice in the probed tools/list must not double-report the same
 // FM-3 finding.

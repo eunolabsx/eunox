@@ -1737,13 +1737,17 @@ func (p *JWTPDP) FilterPromptsList(ctx context.Context, result json.RawMessage) 
 
 // RecordObservedToolHashes delegates to the inner PDP, which holds any description-hash
 // pins — the JWT layer pins no tool descriptions of its own. A nil inner records nothing
-// but still reports an accurate entry count (mirroring innerFilter's nil-inner
-// passthrough), so the caller need not decode result again.
+// but still reports an accurate entry count, so the caller need not decode result again.
+//
+// The count comes from the length-only countListEntries rather than passThroughList: the
+// caller wants a NUMBER, and passThroughList builds an ordered envelope nothing here
+// reads. AlwaysAllowPDP's twin already documents choosing countListEntries for exactly
+// this case.
 func (p *JWTPDP) RecordObservedToolHashes(ctx context.Context, result json.RawMessage) int {
 	if p.inner != nil {
 		return p.inner.RecordObservedToolHashes(ctx, result)
 	}
-	return passThroughList(result, listKeyTools).Upstream
+	return countListEntries(result, listKeyTools)
 }
 
 // ReleaseSession delegates to the inner PDP so a wrapped ManifestPDP releases the

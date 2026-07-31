@@ -1594,10 +1594,11 @@ func TestPrintProxyUsage(t *testing.T) {
 // ───────────────────────── buildCallCounterAndKillSwitch ───────────────────
 
 func TestBuildCallCounterAndKillSwitch_InMemory(t *testing.T) {
-	counter, _, ks, ksRedis, err := buildCallCounterAndKillSwitch("", "", false, false, 0, 0, 0)
+	backends, err := buildCallCounterAndKillSwitch("", "", false, false, 0, 0, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	counter, ks, ksRedis := backends.counter, backends.killSwitch, backends.ksRedis
 	if counter == nil || ks == nil {
 		t.Fatal("want non-nil in-memory counter and kill-switch")
 	}
@@ -1613,10 +1614,11 @@ func TestBuildCallCounterAndKillSwitch_InMemory(t *testing.T) {
 func TestBuildCallCounterAndKillSwitch_Redis(t *testing.T) {
 	mr := miniredis.RunT(t)
 
-	counter, _, ks, ksRedis, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, true, 5*time.Second, 0, 0)
+	backends, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, true, 5*time.Second, 0, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	counter, ks, ksRedis := backends.counter, backends.killSwitch, backends.ksRedis
 	if counter == nil || ks == nil {
 		t.Fatal("want non-nil counter and kill-switch")
 	}
@@ -1630,10 +1632,11 @@ func TestBuildCallCounterAndKillSwitch_Redis(t *testing.T) {
 func TestBuildCallCounterAndKillSwitch_RedisFailClosed(t *testing.T) {
 	mr := miniredis.RunT(t)
 
-	counter, _, ks, ksRedis, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, false, 0, 0, 0)
+	backends, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, false, 0, 0, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	counter, ks, ksRedis := backends.counter, backends.killSwitch, backends.ksRedis
 	if counter == nil || ks == nil || ksRedis == nil {
 		t.Fatal("want non-nil counter, kill-switch, and Redis kill-switch")
 	}

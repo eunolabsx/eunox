@@ -223,6 +223,14 @@ func TestMatchValueGlob(t *testing.T) {
 		// resolve the good %2f, so the guard must not fall back to a literal match.
 		{"slashless star denies encoded-slash with trailing bad escape", "*.csv", "..%2f..%2fetc%2fpasswd%zz.csv", false},
 		{"slashless star denies encoded-backslash with bad escape", "*.csv", "..%5c..%5csecret%zz.csv", false},
+		// An encoded NUL riding alongside a malformed escape is the same shape, and the
+		// token the confinement rules say must ALWAYS deny. The decode fails whole on the
+		// "%zz", so the pre-decode check never saw a literal NUL and the post-decode check
+		// never ran — the lenient fallback then read "%00" as three ordinary filename
+		// characters and matched "*.csv", while a NUL-truncating upstream opens
+		// "evil.exe". The separator token got this rides-alongside guard; the NUL did not.
+		{"slashless star denies encoded NUL with bad escape", "*.csv", "evil.exe%00x%zz.csv", false},
+		{"slashless star denies uppercase encoded NUL with bad escape", "*.csv", "evil.exe%00X%ZZ.csv", false},
 		// A slashless character class must not absorb a LITERAL '/' already present in
 		// the value: Go's path.Match applies no '/'-exclusion inside "[…]", so a
 		// negated class ("[^0-9]", "[^z]") or a range straddling 0x2f matches the

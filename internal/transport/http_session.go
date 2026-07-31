@@ -59,8 +59,10 @@ type httpSession struct {
 	// pendingMu guards pending, byUpstreamID, hostToUp, and upstreamSeq.
 	pendingMu sync.Mutex
 	// pending is keyed by the host's JSON-RPC ID solely to reject a duplicate
-	// in-flight host ID. It does NOT route upstream responses (byUpstreamID's job).
-	pending map[string]chan upstreamResult
+	// in-flight host ID. It does NOT route upstream responses (byUpstreamID's job), so
+	// it is a SET: storing channels here invited exactly the misreading this comment
+	// had to disclaim, and nothing ever delivered through them.
+	pending map[string]struct{}
 	// byUpstreamID routes subprocess-upstream responses back to the waiting caller,
 	// keyed by the proxy-generated nonce. A response with a stale nonce (its caller
 	// already timed out and removed the entry) has nowhere to land, so a late
@@ -153,13 +155,16 @@ type httpSession struct {
 	evicted   chan struct{}
 
 	// lastActive is the Unix-nanosecond time of the most recent host interaction,
-	// updated on every POST and on opening/holding a GET (SSE) stream. The idle
-	// reaper compares it against sessionIdleMs. Atomic so the reaper reads it without
-	// the proxy lock.
+	// updated on every POST and when a GET (SSE) stream is OPENED — not while one is
+	// held. A long-lived stream is spared by the reaper's hasSubscribers() check
+	// instead, so an editor who "fixed" the reaper to trust lastActive alone would tear
+	// down every held stream after one idle window. The reaper compares it against
+	// sessionIdleMs. Atomic so the reaper reads it without the proxy lock.
 	lastActive atomic.Int64
 
 	// lastRequest is the Unix-nanosecond time of the most recent host *request* (an
-	// /mcp POST), unlike lastActive which also advances on SSE liveness. It backs the
+	// /mcp POST), unlike lastActive which also advances when an SSE stream is opened.
+	// It backs the
 	// hard idle ceiling: a session holding an SSE stream open but sending no host
 	// request is still reaped once lastRequest is older than hardIdleMultiplier x the
 	// idle window, so an initialize + GET client that goes silent cannot pin its
@@ -276,9 +281,11 @@ func (s *httpSession) tryAcquireRequestSlot() bool {
 // tryAcquireRequestSlot. Must be called exactly once per successful acquire.
 func (s *httpSession) releaseRequestSlot() { <-s.reqSem }
 
-// touch records host interaction (e.g. opening or holding an SSE stream),
-// deferring the normal idle reaper. It advances lastActive only, NOT lastRequest,
-// so SSE liveness alone cannot defer the hard idle ceiling. Goroutine-safe.
+// touch records host interaction — today, opening an SSE stream — deferring the normal
+// idle reaper. It fires once per open, NOT continuously while a stream is held; a held
+// stream is kept alive by the reaper's hasSubscribers() spare instead. It advances
+// lastActive only, NOT lastRequest, so SSE liveness alone cannot defer the hard idle
+// ceiling. Goroutine-safe.
 func (s *httpSession) touch() {
 	s.lastActive.Store(time.Now().UnixNano())
 }
@@ -341,7 +348,7 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 		id:           uuid.New().String(),
 		proxy:        p,
 		route:        route,
-		pending:      make(map[string]chan upstreamResult),
+		pending:      make(map[string]struct{}),
 		byUpstreamID: make(map[string]chan upstreamResult),
 		hostToUp:     make(map[string]*json.RawMessage),
 		done:         make(chan struct{}),
@@ -392,7 +399,7 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 	}
 
 	if err := sess.initUpstream(ctx); err != nil {
-		_ = cmd.Process.Kill()
+		killUpstreamProcess(cmd.Process)
 		// Reap so a failed initialize leaves no zombie. initUpstream has joined its
 		// handshake goroutine, so all pipe reads are done and Wait is safe.
 		_ = cmd.Wait()
@@ -409,7 +416,7 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 	// never close) and surface the limit error; Wait reaps it (safe — the cleanup
 	// goroutine starts only after registration, and initUpstream has joined).
 	if err := p.registerSession(sess, startGen); err != nil {
-		_ = cmd.Process.Kill()
+		killUpstreamProcess(cmd.Process)
 		_ = cmd.Wait()
 		return nil, err
 	}
@@ -449,9 +456,7 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 		select {
 		case <-waited:
 		case <-time.After(msToDuration(p.shutdownMs)):
-			if sess.upCmd.Process != nil {
-				_ = sess.upCmd.Process.Kill()
-			}
+			killUpstreamProcess(sess.upCmd.Process)
 			<-waited
 		}
 		p.mu.Lock()
@@ -975,8 +980,8 @@ func (s *httpSession) initUpstream(ctx context.Context) error {
 	case err := <-done:
 		return err
 	case <-ctx.Done():
-		if s.upCmd != nil && s.upCmd.Process != nil {
-			_ = s.upCmd.Process.Kill()
+		if s.upCmd != nil {
+			killUpstreamProcess(s.upCmd.Process)
 		}
 		<-done // join the handshake goroutine; its pipe read fails after the kill
 		return fmt.Errorf("upstream did not complete initialize: %w", ctx.Err())
@@ -1110,7 +1115,7 @@ func (s *httpSession) callSubprocessUpstream(ctx context.Context, msg mcp.RPCMsg
 	// the test-assembled session this block exists to accommodate.
 	s.pendingMu.Lock()
 	if s.pending == nil {
-		s.pending = make(map[string]chan upstreamResult)
+		s.pending = make(map[string]struct{})
 	}
 	if s.byUpstreamID == nil {
 		s.byUpstreamID = make(map[string]chan upstreamResult)
@@ -1135,11 +1140,12 @@ func (s *httpSession) callSubprocessUpstream(ctx context.Context, msg mcp.RPCMsg
 // stdin), the desynced stream cannot be reused, so killing the subprocess EOFs readUpstream,
 // fires close(done), and lets the cleanup goroutine reap the session (sessCancel, via
 // readUpstream's defer, then unblocks any other in-flight call). A no-op for a remote-HTTP
-// session (nil upCmd) or a not-yet-started one; idempotent (Process.Kill on a reaped process
-// just returns an ignored error).
+// session (nil upCmd) or a not-yet-started one; idempotent, because killUpstreamProcess
+// signals the direct child through os.Process first and aborts if that reports the process
+// already reaped — so a call racing a completed Wait sends nothing at all.
 func (s *httpSession) killSubprocess() {
-	if s.upCmd != nil && s.upCmd.Process != nil {
-		_ = s.upCmd.Process.Kill()
+	if s.upCmd != nil {
+		killUpstreamProcess(s.upCmd.Process)
 	}
 }
 
@@ -1300,8 +1306,8 @@ func (s *httpSession) close(shutdownMs int) {
 		select {
 		case <-s.done:
 		case <-t.C:
-			if s.upCmd != nil && s.upCmd.Process != nil {
-				_ = s.upCmd.Process.Kill()
+			if s.upCmd != nil {
+				killUpstreamProcess(s.upCmd.Process)
 			}
 			// Bound the post-kill wait independently. readUpstream closes done on pipe
 			// EOF, which follows the SIGKILL almost immediately — unless it is wedged in

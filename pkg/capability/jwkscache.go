@@ -219,13 +219,16 @@ func (c *JWKSCache) freshAt(now time.Time) bool {
 // GetKeys returns the cached JWKS when it is still within the TTL, otherwise it
 // fetches a fresh copy.
 //
-// The returned *jose.JSONWebKeySet is the cache's own shared instance, handed
-// concurrently to every verification in flight — it is READ-ONLY. Never mutate it or
-// its Keys slice; to obtain keys you can hold or reorder, copy them through FindKeys
-// (which always returns a fresh slice) as the production consumer (VerifyWithKeyRotation)
-// does. Mutating the returned set would corrupt the root-of-trust key material seen by
-// all concurrent token validations. Refresh and the ForceRefresh* methods carry the
-// same contract.
+// The returned set's Keys SLICE is independent of the cache's (see copyKeySet), so a
+// caller may hold, append to, or reorder it without disturbing the verifications running
+// concurrently. Refresh and both ForceRefresh* methods carry the same contract — every
+// exported accessor copies, so no caller holds the live instance.
+//
+// The copy is one level deep: each jose.JSONWebKey still carries a Key interface{}
+// pointing at the same underlying *rsa.PublicKey / *ecdsa.PublicKey, so the KEYS
+// THEMSELVES remain read-only. Mutating one would corrupt the root-of-trust material
+// seen by every concurrent token validation. FindKeys has the same bound and is how the
+// production consumer (VerifyWithKeyRotation) selects by kid.
 func (c *JWKSCache) GetKeys(ctx context.Context) (*jose.JSONWebKeySet, error) {
 	c.mu.RLock()
 	if c.freshAt(c.now()) {
@@ -290,9 +293,12 @@ func (c *JWKSCache) Refresh(ctx context.Context) (*jose.JSONWebKeySet, error) {
 // When the cache holds no set at all the fetch is not suppressed, so a cold start
 // never denies purely for lack of a cached copy.
 //
-// The returned set is the cache's shared, READ-ONLY instance (see GetKeys): a
-// suppressed call hands back the live cached pointer directly, so copy through
-// FindKeys before holding or mutating it.
+// The returned set's Keys slice is independent of the cache's (see copyKeySet), like
+// Refresh's and GetKeys'. Both of this function's returns pass through it: the
+// suppressed arm handed back the live cached pointer, and the fetched arm handed back
+// refresh's own reference to it, so a caller appending to or reordering the result
+// mutated the set concurrent verifications read — re-opening the aliasing hole
+// copyKeySet exists to close, on the two paths a caller reaches during a key rotation.
 func (c *JWKSCache) ForceRefreshForKID(ctx context.Context, kid string) (*jose.JSONWebKeySet, error) {
 	if kid == "" {
 		// A kid-less lookup is not an unknown-kid lookup. The suppression block below
@@ -306,7 +312,7 @@ func (c *JWKSCache) ForceRefreshForKID(ctx context.Context, kid string) (*jose.J
 		cached := c.jwks
 		c.mu.RUnlock()
 		if cached != nil {
-			return cached, nil
+			return copyKeySet(cached), nil
 		}
 	}
 	// changed reports whether THIS fetch altered the key set, computed atomically
@@ -326,7 +332,7 @@ func (c *JWKSCache) ForceRefreshForKID(ctx context.Context, kid string) (*jose.J
 			c.markKIDAbsent(sharedRefreshSentinel)
 		}
 	}
-	return keys, nil
+	return copyKeySet(keys), nil
 }
 
 // sharedRefreshSentinel is the negKIDs key for a SHARED forced-refresh budget
@@ -348,16 +354,15 @@ const sharedRefreshSentinel = ""
 // charges too, so the two paths share one budget). The caller fails closed when
 // suppressed.
 //
-// The returned set is the cache's shared, READ-ONLY instance (see GetKeys): a
-// suppressed call hands back the live cached pointer directly, so copy through
-// FindKeys before holding or mutating it.
+// The returned set's Keys slice is independent of the cache's (see copyKeySet), on
+// both the suppressed and the fetched path, for the same reason as ForceRefreshForKID.
 func (c *JWKSCache) ForceRefreshForVerify(ctx context.Context) (*jose.JSONWebKeySet, error) {
 	if c.kidRecentlyAbsent(sharedRefreshSentinel) {
 		c.mu.RLock()
 		cached := c.jwks
 		c.mu.RUnlock()
 		if cached != nil {
-			return cached, nil
+			return copyKeySet(cached), nil
 		}
 	}
 	// refresh reports whether this fetch changed the set atomically inside the
@@ -375,7 +380,7 @@ func (c *JWKSCache) ForceRefreshForVerify(ctx context.Context) (*jose.JSONWebKey
 	if !changed {
 		c.markKIDAbsent(sharedRefreshSentinel)
 	}
-	return keys, nil
+	return copyKeySet(keys), nil
 }
 
 // jwksKeysUnchanged reports whether two key sets hold the same keys by RFC 7638

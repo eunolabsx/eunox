@@ -22,12 +22,12 @@ func TestPreSessionDenyLimiter_BoundsBurstAndCountsSuppressed(t *testing.T) {
 	base := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
 	now := base
 	l := newPreSessionDenyLimiter()
-	l.now = func() time.Time { return now }
+	l.setNow(func() time.Time { return now })
 
 	admitted := 0
 	const attempts = 5000
 	for i := 0; i < attempts; i++ {
-		if ok, _ := l.admit(); ok {
+		if ok, _ := l.admit(catAuth); ok {
 			admitted++
 		}
 	}
@@ -38,7 +38,7 @@ func TestPreSessionDenyLimiter_BoundsBurstAndCountsSuppressed(t *testing.T) {
 	// The suppressed refusals are not lost: the next admitted record carries the count, so
 	// an operator sees both that the attack happened and its scale.
 	now = base.Add(time.Second)
-	ok, suppressed := l.admit()
+	ok, suppressed := l.admit(catAuth)
 	if !ok {
 		t.Fatal("a refill second must admit again")
 	}
@@ -47,61 +47,66 @@ func TestPreSessionDenyLimiter_BoundsBurstAndCountsSuppressed(t *testing.T) {
 	}
 
 	// And the count resets, so the following record does not double-report.
-	if ok, s := l.admit(); !ok || s != 0 {
+	if ok, s := l.admit(catAuth); !ok || s != 0 {
 		t.Fatalf("after reporting, the suppressed counter must reset; ok=%v suppressed=%d", ok, s)
 	}
 }
 
-// TestRefusalRollup_NamesItsScopeOnARouteStampedRecord pins the fix for the one record
-// shape where the rollup's scope and the record's own stamp disagree.
+// TestRefusalRollup_NamesItsScopeOnARouteStampedRecord pins the record shape where the
+// rollup's scope and the record's own stamp disagree.
 //
-// The tally is proxy-wide: one bucket bounds the write rate into the single shared audit
-// queue, so a suppressed refusal is folded into whichever record is admitted next,
-// whatever its route or category. Exactly one refusal is BOTH route-stamped and fed by
-// that bucket — the session cap — so a bearer-token spray refused before route resolution
-// (attributable to no route at all) can surface as a five-figure count on a record reading
-// `upstream: github`, `denial_code: RESOURCE_EXHAUSTED`. A SIEM rule or an operator keyed
-// on route + code then reads thousands of saturation refusals against github's policy
-// digest when github saw one. The count now names its own scope, so nothing is inferred
-// from the stamp beside it.
+// A category's tally is proxy-wide: one bucket per category bounds the write rate into the
+// single shared audit queue across every route, so a suppressed refusal is folded into
+// whichever record of that category is admitted next, whatever route it belongs to. The
+// session cap is the one refusal that is BOTH route-stamped and fed by such a bucket, so a
+// saturation flood against route A can surface as a five-figure count on a record reading
+// `upstream: github`. A SIEM rule or an operator keyed on route + code then reads thousands
+// of saturation refusals against github's policy digest when github saw one. The count
+// names its own scope, so nothing is inferred from the stamp beside it.
 func TestRefusalRollup_NamesItsScopeOnARouteStampedRecord(t *testing.T) {
 	sink, logPath := newTempAuditSink(t)
 	base := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
 	now := base
 	lim := newPreSessionDenyLimiter()
-	lim.now = func() time.Time { return now }
+	lim.setNow(func() time.Time { return now })
 	proxy := &HTTPProxy{sink: sink, preSessionDenies: lim}
+	other := &UpstreamRoute{
+		name: "internal",
+		sink: &routeSink{sink: sink, upstream: "internal", policyVersion: "9.9.9", policySHA256: "sha256:zzz"},
+	}
 	route := &UpstreamRoute{
 		name: "github",
 		sink: &routeSink{sink: sink, upstream: "github", policyVersion: "1.2.3", policySHA256: "sha256:abc"},
 	}
-	req := httptest.NewRequest(http.MethodPost, "/mcp/github", http.NoBody)
+	req := httptest.NewRequest(http.MethodPost, "/mcp/internal", http.NoBody)
 
-	// Spray the UNROUTED path. A bad bearer token is refused before route resolution, so
-	// none of this is attributable to github — or to any route.
+	// Saturate a DIFFERENT route. None of this is attributable to github.
 	const attempts = 5000
 	for i := 0; i < attempts; i++ {
-		proxy.recordPreSessionDeny(req, codeAuthFailed, "auth", nil)
+		proxy.recordSessionCapDeny(req, other)
 	}
-	// Refill one second of tokens, then let the session cap be the next record admitted.
+	// Refill one second of tokens, then let github's session cap be the next admitted.
 	now = base.Add(time.Second)
-	proxy.recordSessionCapDeny(req, route)
+	proxy.recordSessionCapDeny(httptest.NewRequest(http.MethodPost, "/mcp/github", http.NoBody), route)
 
 	_ = sink.Close()
-	rec := findAuditRecordByCode(readAuditRecords(t, logPath), codeResourceExhausted)
+	recs := readAuditRecords(t, logPath)
+	var rec map[string]interface{}
+	for _, r := range recs {
+		if d, _ := r["details"].(map[string]interface{}); d != nil && d[detailSuppressedRefusalCount] != nil {
+			rec = r
+		}
+	}
 	if rec == nil {
-		t.Fatal("expected a RESOURCE_EXHAUSTED record for the session-cap refusal")
+		t.Fatal("expected an admitted record carrying the rollup")
 	}
 	details, _ := rec["details"].(map[string]interface{})
-	if details == nil {
-		t.Fatal("the session-cap record must carry details")
-	}
 	want := float64(attempts - preSessionDenyBurst)
 	if got := details[detailSuppressedRefusalCount]; got != want {
 		t.Fatalf("%s = %v, want %v — the suppressed refusals must be folded into the next admitted record", detailSuppressedRefusalCount, got, want)
 	}
-	if got := details[detailSuppressedRefusalScope]; got != suppressedScopeProxy {
-		t.Errorf("%s = %v, want %q — a route-stamped record must state that its tally spans the proxy, not the route it names", detailSuppressedRefusalScope, got, suppressedScopeProxy)
+	if got := details[detailSuppressedRefusalScope]; got != suppressedScopeProxyCategory {
+		t.Errorf("%s = %v, want %q — a route-stamped record must state that its tally spans every route, not just the one it names", detailSuppressedRefusalScope, got, suppressedScopeProxyCategory)
 	}
 	// The record still carries its route stamp: naming the scope is what makes the two
 	// coexist, so this must not have been "fixed" by dropping the attribution instead.
@@ -116,7 +121,7 @@ func TestRefusalRollup_NamesItsScopeOnARouteStampedRecord(t *testing.T) {
 	}
 
 	// Every written record must still pass its per-record HMAC under the sink's own key —
-	// the new count/scope details are signed like any other field. CLAUDE.md requires a
+	// the count/scope details are signed like any other field. CLAUDE.md requires a
 	// sign-and-verify round trip for a new audit-record field; the assertions above alone
 	// only confirm the decoded shape, not that the shape survives verification.
 	data, err := os.ReadFile(logPath)
@@ -137,6 +142,80 @@ func TestRefusalRollup_NamesItsScopeOnARouteStampedRecord(t *testing.T) {
 	}
 }
 
+// TestRefusalLimiter_OneCategoryFloodDoesNotEraseAnother is the regression. Under a single
+// proxy-wide bucket, an unauthenticated Origin probe — one cheap request, no credential —
+// absorbed the whole refusal budget, so a CONCURRENT control-token brute force wrote no
+// record of its own and survived only as a number folded onto somebody else's. That is the
+// record an incident responder reads first, elided by the cheapest possible flood.
+func TestRefusalLimiter_OneCategoryFloodDoesNotEraseAnother(t *testing.T) {
+	sink, logPath := newTempAuditSink(t)
+	base := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	lim := newPreSessionDenyLimiter()
+	lim.setNow(func() time.Time { return base })
+	proxy := &HTTPProxy{sink: sink, preSessionDenies: lim}
+	req := httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody)
+
+	// Exhaust the origin budget many times over, with no clock movement.
+	for i := 0; i < 5000; i++ {
+		proxy.recordPreSessionDeny(req, "ORIGIN_REJECTED", catOrigin, nil)
+	}
+	// The control-token attempts that follow must still be recorded in full.
+	const controlAttempts = 10
+	for i := 0; i < controlAttempts; i++ {
+		proxy.recordPreSessionDeny(req, codeControlAuthFailed, catControl, nil)
+	}
+
+	_ = sink.Close()
+	control := 0
+	for _, r := range readAuditRecords(t, logPath) {
+		if code, _ := r["denial_code"].(string); code == codeControlAuthFailed {
+			control++
+		}
+	}
+	if control != controlAttempts {
+		t.Errorf("wrote %d control-token refusal records, want %d — a cheap flood in another category absorbed the evidence an incident responder reads first", control, controlAttempts)
+	}
+	// The flooding category is still bounded: the point is fairness between categories,
+	// not removing the bound.
+	origin := 0
+	for _, r := range readAuditRecords(t, logPath) {
+		if code, _ := r["denial_code"].(string); code == "ORIGIN_REJECTED" {
+			origin++
+		}
+	}
+	if origin != preSessionDenyBurst {
+		t.Errorf("wrote %d origin refusal records, want the burst size %d — the flood must still be bounded", origin, preSessionDenyBurst)
+	}
+}
+
+// TestRefusalCategories_AllHaveTheirOwnBucket pins the enumerated table against the
+// declared constants: a category constant added without being registered in
+// refusalCategories would silently share the unknown bucket with every other unregistered
+// one, quietly re-creating the cross-category suppression the split exists to remove.
+func TestRefusalCategories_AllHaveTheirOwnBucket(t *testing.T) {
+	t.Parallel()
+	lim := newPreSessionDenyLimiter()
+	seen := map[*recordRateLimiter]refusalCategory{}
+	for _, cat := range refusalCategories {
+		b := lim.bucket(cat)
+		if b == lim.unknown {
+			t.Errorf("category %q fell through to the shared unknown bucket", cat)
+			continue
+		}
+		if other, dup := seen[b]; dup {
+			t.Errorf("categories %q and %q share a bucket", cat, other)
+		}
+		seen[b] = cat
+	}
+	// Every constant declared in this package must be in the list the table is built
+	// from. Checked by value so a new constant that is never registered is caught.
+	for _, cat := range []refusalCategory{catOrigin, catJWT, catAuth, catControl, catLoopback, catBody, catContentType, catSaturation} {
+		if _, registered := lim.buckets[cat]; !registered {
+			t.Errorf("category constant %q is not in refusalCategories", cat)
+		}
+	}
+}
+
 // TestPreSessionDenyLimiter_RefillIsRateBounded pins that sustained pressure is served at
 // the configured rate rather than the caller's rate.
 func TestPreSessionDenyLimiter_RefillIsRateBounded(t *testing.T) {
@@ -144,15 +223,15 @@ func TestPreSessionDenyLimiter_RefillIsRateBounded(t *testing.T) {
 	base := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
 	now := base
 	l := newPreSessionDenyLimiter()
-	l.now = func() time.Time { return now }
+	l.setNow(func() time.Time { return now })
 
 	// Drain the burst.
 	for i := 0; i < preSessionDenyBurst; i++ {
-		if ok, _ := l.admit(); !ok {
+		if ok, _ := l.admit(catAuth); !ok {
 			t.Fatalf("burst token %d should have been admitted", i)
 		}
 	}
-	if ok, _ := l.admit(); ok {
+	if ok, _ := l.admit(catAuth); ok {
 		t.Fatal("the bucket must be empty after the burst is drained")
 	}
 
@@ -160,7 +239,7 @@ func TestPreSessionDenyLimiter_RefillIsRateBounded(t *testing.T) {
 	now = base.Add(time.Second)
 	admitted := 0
 	for i := 0; i < preSessionDenyRatePerSec*10; i++ {
-		if ok, _ := l.admit(); ok {
+		if ok, _ := l.admit(catAuth); ok {
 			admitted++
 		}
 	}
@@ -176,12 +255,12 @@ func TestPreSessionDenyLimiter_BackwardsClockDoesNotGrantTokens(t *testing.T) {
 	base := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
 	now := base
 	l := newPreSessionDenyLimiter()
-	l.now = func() time.Time { return now }
+	l.setNow(func() time.Time { return now })
 	for i := 0; i < preSessionDenyBurst; i++ {
-		l.admit()
+		l.admit(catAuth)
 	}
 	now = base.Add(-time.Hour)
-	if ok, _ := l.admit(); ok {
+	if ok, _ := l.admit(catAuth); ok {
 		t.Fatal("a backwards clock step must not refill the bucket")
 	}
 }

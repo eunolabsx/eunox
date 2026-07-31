@@ -539,7 +539,7 @@ func TestNotificationSaturation_CollapsesEpisodeAndRollsUpSuppressed(t *testing.
 	}
 	// The scope names the pool's own reach, never the proxy-wide bucket's: sharing that
 	// bucket would let this session's flood elide an unrelated AUTH_FAILED/ORIGIN_REJECTED
-	// record, so a saturation rollup must never claim suppressedScopeProxy.
+	// record, so a saturation rollup must never claim suppressedScopeProxyCategory.
 	if got := details[detailSuppressedRefusalScope]; got != suppressedScopeSession {
 		t.Errorf("%s = %v, want %q", detailSuppressedRefusalScope, got, suppressedScopeSession)
 	}

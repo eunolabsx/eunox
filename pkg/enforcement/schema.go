@@ -418,8 +418,9 @@ func schemaValidateNumber(p string, v float64, raw interface{}, s *capability.Ar
 
 // compareToBound orders a numeric argument against a minimum/maximum bound,
 // returning -1, 0, or 1. raw is the un-coerced argument and f its float64 coercion.
-// When raw is an exact int64 and bound is a whole int64-representable value the
-// comparison is exact; otherwise it falls back to the float64 comparison.
+// When both the argument and the bound are integers the comparison is exact at any
+// magnitude — int64 within that range, an exact rational beyond it. Only a genuinely
+// FRACTIONAL operand falls back to the float64 comparison.
 func compareToBound(raw interface{}, f, bound float64) int {
 	if ri, ok := asInt64(raw); ok {
 		if bi, ok := capability.FloatToInt64(bound); ok {
@@ -431,6 +432,20 @@ func compareToBound(raw interface{}, f, bound float64) int {
 			default:
 				return 0
 			}
+		}
+	}
+	// Both sides are integers but at least one is outside int64 range, so the arm
+	// above did not fire and the float64 fallback would round them together: an
+	// argument of 9223372036854775809 coerces to float64(2^63), compares EQUAL to a
+	// maximum of 9223372036854775808, and passes a bound it strictly exceeds. Exact
+	// rationals keep the boundary where the manifest put it.
+	//
+	// Integers only, for the same reason numericEqual restricts its exact arm: a
+	// fractional bound and its float64 coercion are different rationals, and comparing
+	// those exactly would move a working fractional boundary rather than fix one.
+	if rr, ok := exactIntegerRat(raw); ok {
+		if br, ok := exactIntegerRat(bound); ok {
+			return rr.Cmp(br)
 		}
 	}
 	switch {

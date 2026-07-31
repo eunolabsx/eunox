@@ -664,10 +664,30 @@ func (mw *MsgWriter) Write(msg RPCMsg) error {
 	case n > 0 && n < len(data):
 		// A distinct sentinel from the deadline case: the framing outcome is the same, the
 		// cause is not, and the audit tape must not record a crashed upstream as a timeout.
+		//
+		// Except when the cause IS the deadline. On a pollable pipe, a frame larger than
+		// the free buffer against an upstream that stopped draining stdin returns
+		// (n > 0, os.ErrDeadlineExceeded): the same physical failure as the n == 0 arm
+		// below, differing only in whether the frame happened to fit. Keying the sentinel
+		// purely on byte count recorded that one failure as UPSTREAM_TIMEOUT for a small
+		// frame and UPSTREAM_ERROR for a large one — precisely the split classification
+		// these two sentinels exist to prevent. The framing is desynced either way (the
+		// poison below is unconditional); only the recorded CAUSE differs, and the cause
+		// here is the deadline.
 		if err == nil {
 			err = io.ErrShortWrite
 		}
-		err = fmt.Errorf("%w: %d of %d bytes: %w", ErrFrameDesync, n, len(data), err)
+		if mw.deadliner != nil && errors.Is(err, os.ErrDeadlineExceeded) {
+			// %w on the cause too, matching the desync arm below: %v would drop
+			// os.ErrDeadlineExceeded (and the net.Error the poller returns) out of the
+			// chain, so errors.Is/As for a deadline would go false on this value — and it
+			// is latched as poisonErr and returned verbatim from every later Write.
+			// upstreamErrInfo matches the sentinel first today, but its default arm has a
+			// net.Error timeout fallback this error must stay able to satisfy.
+			err = fmt.Errorf("%w: %d of %d bytes: %w", ErrUpstreamWriteTimeout, n, len(data), err)
+		} else {
+			err = fmt.Errorf("%w: %d of %d bytes: %w", ErrFrameDesync, n, len(data), err)
+		}
 		mw.poisonErr = err
 		justPoisoned = true
 	case n == 0 && mw.deadliner != nil && errors.Is(err, os.ErrDeadlineExceeded):

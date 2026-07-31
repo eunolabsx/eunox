@@ -61,7 +61,7 @@ func (p *HTTPProxy) handleMCP(w http.ResponseWriter, r *http.Request) {
 			// Mcp-Session-Id out of the structured session_id (forgery guard). The record is
 			// also unstamped by design (no route/policy fields): this gate runs before route
 			// resolution, for the oracle reason above — see recordPreSessionDeny.
-			p.recordPreSessionDeny(r, "JWT_INVALID", "jwt", map[string]interface{}{"error_type": pdp.ClassifyJWTError(err)})
+			p.recordPreSessionDeny(r, "JWT_INVALID", catJWT, map[string]interface{}{"error_type": pdp.ClassifyJWTError(err)})
 			w.Header().Set("WWW-Authenticate", buildWWWAuthenticate(authHeader != "", p.oauthMetaURL))
 			// Do not echo the JWT validation error to the caller: the library message
 			// can disclose claim values, the accepted algorithm, or key-rotation state,
@@ -142,7 +142,7 @@ func (p *HTTPProxy) decodeStrictJSON(w http.ResponseWriter, r *http.Request, v i
 		}
 		// The raw decode error and body are NOT recorded — either can carry
 		// attacker-controlled free text; only the fixed reason string is kept.
-		p.recordRefusal(r, route, codeInvalidRequest, "body", map[string]interface{}{
+		p.recordRefusal(r, route, codeInvalidRequest, catBody, map[string]interface{}{
 			"reason": "malformed_json",
 		})
 		http.Error(w, invalidBodyMsg, http.StatusBadRequest)
@@ -154,7 +154,7 @@ func (p *HTTPProxy) decodeStrictJSON(w http.ResponseWriter, r *http.Request, v i
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			return false
 		}
-		p.recordRefusal(r, route, codeInvalidRequest, "body", map[string]interface{}{
+		p.recordRefusal(r, route, codeInvalidRequest, catBody, map[string]interface{}{
 			"reason": "trailing_data",
 		})
 		http.Error(w, invalidBodyMsg+": trailing data after JSON message", http.StatusBadRequest)
@@ -192,7 +192,7 @@ func (p *HTTPProxy) writeSessionCreateError(w http.ResponseWriter, r *http.Reque
 		p.recordSessionCapDeny(r, route)
 		http.Error(w, "session limit reached", http.StatusServiceUnavailable)
 	case errors.Is(err, errRacedReap):
-		http.Error(w, "session raced a kill-switch reset; retry", http.StatusServiceUnavailable)
+		http.Error(w, "session raced a kill-switch reap; retry", http.StatusServiceUnavailable)
 	case errors.Is(err, errShuttingDown):
 		http.Error(w, "server shutting down; retry", http.StatusServiceUnavailable)
 	default:
@@ -640,7 +640,10 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 		// releases it via finishDecision right after the decision, so the upstream forward
 		// runs outside it, and this defer is the idempotent backstop for the
 		// malformed-params path (which returns before the decision).
-		if sess.route != nil && sess.route.serializeDecisions && isEnforcedMethod(msg.Method) {
+		// sess.route is dereferenced unconditionally by dispatchParams eight lines above,
+		// so a nil-route session cannot reach here — a nil check would only mislead a
+		// reader into believing one can.
+		if sess.route.serializeDecisions && isEnforcedMethod(msg.Method) {
 			sess.decideMu.Lock()
 			// sync.OnceFunc so the handler's release-after-decision (finishDecision) and this
 			// deferred backstop unlock exactly once between them.
@@ -1027,8 +1030,14 @@ func (p *HTTPProxy) handleMCPDelete(w http.ResponseWriter, r *http.Request, rout
 		// sibling-audience token (or a same-audience different identity that learned the
 		// victim's Mcp-Session-Id) could otherwise tear down another client's session — a
 		// cross-audience teardown / tenant DoS. Enforced only once the session is confirmed
-		// to exist AND belong to this route, so a refusal cannot probe which session ids
-		// exist (a not-found id still falls through to 404 below); a no-pin /
+		// to exist AND belong to this route, which orders the responses 404 (unknown id) /
+		// 409 (wrong route) / 403 (gate refused). That IS a weak existence oracle rather
+		// than the absence of one: a caller holding any accepted token learns from a 403
+		// that the id it presented names a live session on this route. It is accepted
+		// because session ids are server-minted UUIDs — unguessable, so the oracle
+		// confirms only ids the caller already has — and because the alternative,
+		// applying the gates before the existence check, would let an UNAUTHENTICATED
+		// caller drive the audience PDP once per probe. A no-pin /
 		// --jwt-allow-any-audience route and an unbound (no-JWT) session are no-ops. A DELETE
 		// carries no JSON-RPC envelope, so a refusal is an HTTP 403 plus a transport-tagged
 		// deny record (method/identifier empty), matching the GET refusal convention. The

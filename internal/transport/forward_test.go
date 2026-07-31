@@ -1655,7 +1655,7 @@ func TestAuditOnly_StdioProxy_SamplingForwarded_DenyAllPDP(t *testing.T) {
 	p := &StdioProxy{
 		pdp:        denyAllPDP{},
 		sessionID:  "test-sess",
-		pending:    make(map[string]chan upstreamResult),
+		pending:    make(map[string]struct{}),
 		hostWriter: mcp.NewMsgWriter(&writerAdapter{hw}),
 		upWriter:   mcp.NewMsgWriter(&writerAdapter{uw}),
 		audit:      true,
@@ -1686,7 +1686,7 @@ func TestAuditOnly_StdioProxy_SamplingForwarded_ManifestNoSamplingEntry(t *testi
 	p := &StdioProxy{
 		pdp:        dp,
 		sessionID:  "test-sess",
-		pending:    make(map[string]chan upstreamResult),
+		pending:    make(map[string]struct{}),
 		hostWriter: mcp.NewMsgWriter(&writerAdapter{hw}),
 		upWriter:   mcp.NewMsgWriter(&writerAdapter{uw}),
 		audit:      true,
@@ -1756,7 +1756,7 @@ func TestAuditOnly_StdioProxy_DeniedToolForwarded(t *testing.T) {
 	p := &StdioProxy{
 		pdp:        dp,
 		sessionID:  "sess",
-		pending:    make(map[string]chan upstreamResult),
+		pending:    make(map[string]struct{}),
 		hostWriter: mcp.NewMsgWriter(&writerAdapter{hw}),
 		audit:      true,
 	}

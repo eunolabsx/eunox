@@ -20,11 +20,16 @@ import (
 
 // auditRecorder is the subset of the audit sink the enforced-forward path needs.
 // Both *audit.Sink (stdio) and *routeSink (HTTP/gateway) satisfy it, letting the
-// shared forward core record without knowing its transport. Construct it ONLY via
-// asRecorder, never by assigning a concrete sink pointer directly: asRecorder maps a
-// nil pointer to a nil interface, so the core's `rec != nil` stays a true "no sink"
-// test; a direct assignment of a nil concrete pointer would reintroduce the typed-nil
-// interface trap.
+// shared forward core record without knowing its transport.
+//
+// The invariant is that a missing sink yields a genuine nil INTERFACE, never a non-nil
+// interface wrapping a nil pointer — the typed-nil trap that would turn the core's
+// `rec != nil` "no sink" test into a lie. Two constructions uphold it: asRecorder, which
+// maps a nil concrete pointer to a nil interface, and StdioProxy.rec, which builds its
+// routeSink wrapper only when the underlying sink is non-nil and otherwise returns the
+// untyped nil directly (a &routeSink{} is never the nil pointer asRecorder looks for, so
+// wrapping unconditionally would defeat the check). Never assign a concrete sink pointer
+// to this interface at a call site.
 type auditRecorder interface {
 	RecordAllow(ctx context.Context, sessionID, identifier, method string, details map[string]interface{}, obligs []string, auditOnly bool, labelsOut, carriedLabels []string)
 	RecordDeny(ctx context.Context, sessionID, identifier, method, denialCode, condType string, details map[string]interface{}, observe bool)
@@ -237,7 +242,7 @@ func recordKillDrop(ctx context.Context, rec auditRecorder, deny *capability.Enf
 // per-refusal record is a lever on the proxy's own availability under --require-audit=strict,
 // and why the gate is scoped to the pool rather than shared. suppressedScopeSession pairs
 // with it: unlike the pre-session bucket's detailSuppressedRefusalScope value
-// (suppressedScopeProxy, spanning every route and category), this count describes exactly
+// (suppressedScopeProxyCategory, spanning every route within one refusal category), this count describes exactly
 // the session whose id sits beside it on the same record — the write site's own scope
 // constant, matching how the pre-session bucket's scope is written at ITS site rather than
 // read off a field (see the const block in record_limiter.go).
@@ -262,7 +267,7 @@ func recordResourceExhausted(ctx context.Context, rec auditRecorder, gate *satur
 // suppressedScopeSession qualifies a saturation gate's rollup (see recordResourceExhausted):
 // the count spans only the one session — indeed only the one pool within it — whose refusals
 // fed the gate, never other sessions or the other pool. Written at this one call site rather
-// than carried on saturationGate itself, for the same reason suppressedScopeProxy is written
+// than carried on saturationGate itself, for the same reason suppressedScopeProxyCategory is written
 // at recordRefusal rather than carried on the pre-session limiter: a per-scope field would be
 // generality with a single caller.
 const suppressedScopeSession = "session"

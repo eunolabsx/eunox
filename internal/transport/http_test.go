@@ -498,7 +498,7 @@ func TestHTTPForwardNotification_RemoteMode(t *testing.T) {
 	sess := newTestSession(&httpSession{
 		done:         make(chan struct{}),
 		route:        &UpstreamRoute{transport: "http", upstreamURL: srv.URL},
-		pending:      make(map[string]chan upstreamResult),
+		pending:      make(map[string]struct{}),
 		upHTTPClient: &http.Client{Timeout: 5 * time.Second},
 		proxy:        proxy,
 	})
@@ -514,7 +514,7 @@ func TestHTTPForwardNotification_RemoteMode(t *testing.T) {
 func TestCallSubprocessUpstream_WriteError(t *testing.T) {
 	t.Parallel()
 	sess := newTestSession(&httpSession{
-		pending:  make(map[string]chan upstreamResult),
+		pending:  make(map[string]struct{}),
 		done:     make(chan struct{}),                // NOT closed so done doesn't interfere
 		upWriter: mcp.NewMsgWriter(&failingWriter{}), // fails on write
 	})
@@ -532,7 +532,7 @@ func TestCallSubprocessUpstream_SessionDone(t *testing.T) {
 	done := make(chan struct{})
 	close(done)
 	sess := newClosedTestSession(&httpSession{
-		pending:  make(map[string]chan upstreamResult),
+		pending:  make(map[string]struct{}),
 		done:     done,
 		upWriter: mcp.NewMsgWriter(io.Discard),
 	})
@@ -568,7 +568,7 @@ func TestRunInitHandshake_CapturesServerVersion(t *testing.T) {
 	}
 
 	sess := newTestSession(&httpSession{
-		pending:  make(map[string]chan upstreamResult),
+		pending:  make(map[string]struct{}),
 		done:     make(chan struct{}),
 		upWriter: mcp.NewMsgWriter(io.Discard),
 		upReader: mcp.NewMsgReader(bytes.NewReader(append(line, '\n'))),
@@ -601,7 +601,7 @@ func TestRunInitHandshake_RejectsUpstreamErrorResponse(t *testing.T) {
 
 	var hostOut bytes.Buffer // captures what the proxy writes to the upstream
 	sess := newTestSession(&httpSession{
-		pending:  make(map[string]chan upstreamResult),
+		pending:  make(map[string]struct{}),
 		done:     make(chan struct{}),
 		upWriter: mcp.NewMsgWriter(&hostOut),
 		upReader: mcp.NewMsgReader(bytes.NewReader(append(line, '\n'))),
@@ -631,7 +631,7 @@ func TestHTTPCallUpstream_LocalMode_SessionDone(t *testing.T) {
 	done := make(chan struct{})
 	close(done)
 	sess := newClosedTestSession(&httpSession{
-		pending:  make(map[string]chan upstreamResult),
+		pending:  make(map[string]struct{}),
 		done:     done,
 		upWriter: mcp.NewMsgWriter(io.Discard),
 		// upHTTPClient nil → local mode → routes to callSubprocessUpstream
@@ -2481,7 +2481,7 @@ func TestHTTPReadUpstream_KilledSessionDropsNotificationRelay(t *testing.T) {
 			id:       id,
 			route:    rt,
 			done:     make(chan struct{}),
-			pending:  make(map[string]chan upstreamResult),
+			pending:  make(map[string]struct{}),
 			upWriter: mcp.NewMsgWriter(io.Discard),
 			upReader: mcp.NewMsgReader(strings.NewReader(input)),
 		})
@@ -4715,7 +4715,7 @@ func TestHTTPReadUpstream_Paths(t *testing.T) {
 		done:     make(chan struct{}),
 		upReader: mcp.NewMsgReader(pr),
 		upWriter: mcp.NewMsgWriter(io.Discard),
-		pending:  make(map[string]chan upstreamResult),
+		pending:  make(map[string]struct{}),
 	})
 	ch := make(chan mcp.RPCMsg, 4)
 	sess.addSub(ch)
@@ -5091,6 +5091,43 @@ func TestServe_AfterListenShutdownDuringStartupIsClean(t *testing.T) {
 	defer cancel()
 	if err := proxy.Serve(ctx); err != nil {
 		t.Errorf("a hook cut short by shutdown must not fail Serve, got %v", err)
+	}
+}
+
+// TestServe_ShutdownDuringStartupStopsBeforeServing pins the ordering half of the
+// property above, which the clean-return assertion alone cannot see. A hook cut short by
+// shutdown leaves runAfterListen having already closed the listener, so startup has to
+// STOP there. Continuing hands srv.Serve a closed listener, which fails instantly with
+// "use of closed network connection" into errCh; Serve's final select then has BOTH that
+// arm and ctx.Done() ready and picks between them uniformly, turning a graceful stop into
+// a fatal error and a non-zero exit about half the time. Which way that coin lands is
+// pure goroutine scheduling, so the assertion above only catches it under load. The
+// observable pinned here is the deterministic one, and is what an operator actually reads
+// in the log: a proxy stopped during startup never reaches the serving stage, and so
+// never announces itself as listening.
+func TestServe_ShutdownDuringStartupStopsBeforeServing(t *testing.T) {
+	// captureStderr swaps the process-global os.Stderr, so no t.Parallel() here.
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	proxy := NewHTTPProxyGateway(HTTPGatewayOptions{
+		// A named route gives the startup banner something to print; the zero value
+		// covers everything the teardown path would touch on the regressed ordering.
+		Routes: map[string]*UpstreamRoute{"fs": {name: "fs"}},
+		Bind:   "127.0.0.1",
+		Port:   freeTCPPort(t),
+		AfterListen: func(hookCtx context.Context) error {
+			cancel()
+			<-hookCtx.Done()
+			return hookCtx.Err()
+		},
+	})
+	var err error
+	out := captureStderr(t, func() { err = proxy.Serve(ctx) })
+	if err != nil {
+		t.Errorf("a hook cut short by shutdown must not fail Serve, got %v", err)
+	}
+	if strings.Contains(out, "listening on") {
+		t.Errorf("startup ran on past the shutdown and announced itself as listening, so srv.Serve got the closed listener and races ctx.Done(); stderr:\n%s", out)
 	}
 }
 
@@ -5541,11 +5578,11 @@ func TestWithUpstreamTimeout_MarkerBypasses(t *testing.T) {
 
 // TestCallSubprocessUpstream_DuplicateID_HTTP verifies that registering a second
 // pending entry with the same JSON-RPC message ID returns an error instead of
-// silently overwriting the first goroutine's channel.
+// silently evicting the first goroutine's in-flight registration.
 func TestCallSubprocessUpstream_DuplicateID_HTTP(t *testing.T) {
 	t.Parallel()
 	sess := newTestSession(&httpSession{
-		pending:  make(map[string]chan upstreamResult),
+		pending:  make(map[string]struct{}),
 		done:     make(chan struct{}),
 		upWriter: mcp.NewMsgWriter(io.Discard),
 		// upHTTPClient nil → local mode
@@ -5554,9 +5591,8 @@ func TestCallSubprocessUpstream_DuplicateID_HTTP(t *testing.T) {
 	msg := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`42`), Method: "tools/call"}
 	key := mcp.MsgKey(msg.ID)
 
-	firstCh := make(chan upstreamResult, 1)
 	sess.pendingMu.Lock()
-	sess.pending[key] = firstCh
+	sess.pending[key] = struct{}{}
 	sess.pendingMu.Unlock()
 
 	_, err := sess.callSubprocessUpstream(context.Background(), msg)
@@ -5565,10 +5601,10 @@ func TestCallSubprocessUpstream_DuplicateID_HTTP(t *testing.T) {
 	}
 
 	sess.pendingMu.Lock()
-	remaining := sess.pending[key]
+	_, stillHeld := sess.pending[key]
 	sess.pendingMu.Unlock()
-	if remaining != firstCh {
-		t.Error("regression: duplicate ID request must not overwrite the existing pending channel")
+	if !stillHeld {
+		t.Error("regression: duplicate ID request must not evict the existing in-flight host ID")
 	}
 }
 

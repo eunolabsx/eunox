@@ -73,7 +73,7 @@ func (p *HTTPProxy) requireJSONContentType(w http.ResponseWriter, r *http.Reques
 	case len(vals) == 1 && isJSONMediaType(vals[0]):
 		return true
 	}
-	p.recordRefusal(r, route, codeUnsupportedMediaType, "content_type", map[string]interface{}{
+	p.recordRefusal(r, route, codeUnsupportedMediaType, catContentType, map[string]interface{}{
 		"header_count": len(vals),
 	})
 	http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
@@ -173,7 +173,7 @@ func (p *HTTPProxy) checkAuth(w http.ResponseWriter, r *http.Request) bool {
 		// tamper-evident tape, mirroring the ORIGIN_REJECTED / JWT_INVALID pre-session
 		// records. recordPreSessionDeny never records the presented credential — only the
 		// source and the unverified claimed session id — and keeps session_id empty.
-		p.recordPreSessionDeny(r, codeAuthFailed, "auth", nil)
+		p.recordPreSessionDeny(r, codeAuthFailed, catAuth, nil)
 		w.Header().Set("WWW-Authenticate", buildWWWAuthenticate(credPresented, p.oauthMetaURL))
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return false
@@ -196,7 +196,7 @@ func (p *HTTPProxy) checkControlToken(w http.ResponseWriter, r *http.Request) bo
 		// token was never configured or whose token-file write failed — is the one most
 		// worth probing, so leaving it as an HTTP status only meant an operator reviewing
 		// the tape saw no evidence the endpoint was ever touched.
-		p.recordPreSessionDeny(r, codeControlAuthFailed, "control", map[string]interface{}{
+		p.recordPreSessionDeny(r, codeControlAuthFailed, catControl, map[string]interface{}{
 			"reason": "control_token_unconfigured",
 		})
 		http.Error(w, "control endpoint not configured", http.StatusServiceUnavailable)
@@ -208,7 +208,7 @@ func (p *HTTPProxy) checkControlToken(w http.ResponseWriter, r *http.Request) bo
 		// same-host process probing it with a wrong/missing token is exactly the threat the
 		// token defends, and must not be invisible on the tape. recordPreSessionDeny never
 		// records the presented token — only the source and the unverified claimed session id.
-		p.recordPreSessionDeny(r, codeControlAuthFailed, "control", nil)
+		p.recordPreSessionDeny(r, codeControlAuthFailed, catControl, nil)
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return false
 	}
@@ -335,7 +335,7 @@ func (p *HTTPProxy) checkOrigin(w http.ResponseWriter, r *http.Request) bool {
 	recordedOrigin = bounded
 	// Unstamped by design (no route/policy fields): the Origin gate runs before route
 	// resolution — see recordPreSessionDeny.
-	p.recordPreSessionDeny(r, "ORIGIN_REJECTED", "origin", details)
+	p.recordPreSessionDeny(r, "ORIGIN_REJECTED", catOrigin, details)
 	if multiple {
 		fmt.Fprintf(os.Stderr,
 			"[eunox] SECURITY: rejected request carrying %d Origin headers (%q); RFC 6454 permits only one (DNS-rebinding guard)\n",
@@ -467,8 +467,8 @@ func addClaimedSessionIDValue(details map[string]interface{}, claimed string) ma
 // attacker drive the audit queue into its monotonic drop counter and permanently trip
 // --require-audit=strict against every legitimate client. A suppressed refusal is folded
 // into the next admitted record's suppressed_refusal_count rather than vanishing — into
-// whichever record is admitted next, which need not be of the same category or route,
-// hence the suppressed_refusal_scope that ships beside it.
+// whichever record of the SAME category is admitted next, which need not be on the same
+// route, hence the suppressed_refusal_scope that ships beside it.
 //
 // These records deliberately carry NO route name and no policy_version/policy_sha256
 // stamp: they are written through the proxy-wide p.sink rather than a route's
@@ -480,7 +480,7 @@ func addClaimedSessionIDValue(details map[string]interface{}, claimed string) ma
 // goes through recordSessionCapDeny instead, which keeps this rate limiter and this
 // claimed_session_id rule but writes through the route's sink so its record carries the
 // same route stamp as its in-flight-cap sibling.
-func (p *HTTPProxy) recordPreSessionDeny(r *http.Request, code, category string, extra map[string]interface{}) {
+func (p *HTTPProxy) recordPreSessionDeny(r *http.Request, code string, category refusalCategory, extra map[string]interface{}) {
 	p.recordRefusal(r, nil, code, category, extra)
 }
 
@@ -494,13 +494,16 @@ func (p *HTTPProxy) recordPreSessionDeny(r *http.Request, code, category string,
 // session, so an unbounded write here would hand a remote caller the audit-queue flooding
 // primitive the pre-session bucket exists to deny.
 //
-// It is therefore the one refusal that can be route-stamped AND carry a rollup from the
-// shared bucket, whose tally spans every route and category. The rollup names its own scope
-// (detailSuppressedRefusalScope: suppressedScopeProxy) precisely so this record's stamp is
-// not read as qualifying the number: `upstream: github` with a count of 5000 means 5000
-// refusals proxy-wide, not 5000 against github.
+// It is therefore the one refusal that can be route-stamped AND carry a rollup from a
+// bucket whose tally spans every route. The rollup names its own scope
+// (detailSuppressedRefusalScope: suppressedScopeProxyCategory) precisely so this record's
+// stamp is not read as qualifying the number: `upstream: github` with a count of 5000
+// means 5000 saturation refusals across every route, not 5000 against github. The count
+// covers only this record's own CATEGORY, which is what the per-category buckets made
+// true — it is not a tally of the Origin/JWT/auth floods a reader of the old shared-bucket
+// wording would have folded in.
 func (p *HTTPProxy) recordSessionCapDeny(r *http.Request, route *UpstreamRoute) {
-	p.recordRefusal(r, route, codeResourceExhausted, "saturation", map[string]interface{}{
+	p.recordRefusal(r, route, codeResourceExhausted, catSaturation, map[string]interface{}{
 		"reason": "session_limit_reached",
 	})
 }
@@ -508,7 +511,7 @@ func (p *HTTPProxy) recordSessionCapDeny(r *http.Request, route *UpstreamRoute) 
 // recordRefusal is the shared body of the two above: rate-limit, fold any suppressed
 // count in, stamp the source IP and the unverified claimed_session_id, and write through
 // route's sink when the route is already known (nil ⟹ the proxy-wide sink).
-func (p *HTTPProxy) recordRefusal(r *http.Request, route *UpstreamRoute, code, category string, extra map[string]interface{}) {
+func (p *HTTPProxy) recordRefusal(r *http.Request, route *UpstreamRoute, code string, category refusalCategory, extra map[string]interface{}) {
 	rec := asRecorder(p.sink)
 	if route != nil {
 		rec = asRecorder(route.sink)
@@ -516,11 +519,12 @@ func (p *HTTPProxy) recordRefusal(r *http.Request, route *UpstreamRoute, code, c
 	if rec == nil {
 		return
 	}
-	if p.preSessionDenies == nil { // defensive: a proxy built outside the constructor
-		rec.RecordDeny(r.Context(), "", "", "", code, category, p.addRefusalContext(extra, r), false)
-		return
-	}
-	ok, suppressed := p.preSessionDenies.admit()
+	// No nil-limiter fallback: a "defensive" branch here wrote the refusal record with
+	// NO rate limit at all, which is a fail-open on the exact DoS bound this file exists
+	// to enforce — and it was reachable only from an in-package test literal, since
+	// NewHTTPProxyGateway always builds the limiter. A nil here is a construction bug and
+	// panics like one.
+	ok, suppressed := p.preSessionDenies.admit(category)
 	if !ok {
 		return
 	}
@@ -532,9 +536,9 @@ func (p *HTTPProxy) recordRefusal(r *http.Request, route *UpstreamRoute, code, c
 		// from the stamp beside it, and this record may well carry a route stamp the count
 		// does not respect. See the key constants for the misreading this closes.
 		extra[detailSuppressedRefusalCount] = suppressed
-		extra[detailSuppressedRefusalScope] = suppressedScopeProxy
+		extra[detailSuppressedRefusalScope] = suppressedScopeProxyCategory
 	}
-	rec.RecordDeny(r.Context(), "", "", "", code, category, p.addRefusalContext(extra, r), false)
+	rec.RecordDeny(r.Context(), "", "", "", code, string(category), p.addRefusalContext(extra, r), false)
 }
 
 // addRefusalContext stamps the two details EVERY refusal record carries about its caller:
@@ -781,7 +785,7 @@ func (p *HTTPProxy) loopbackOnly(w http.ResponseWriter, r *http.Request) bool {
 	// that left nothing on the tape, while the same-host caller who merely got the token
 	// wrong was fully logged. The more remote attacker must not be the invisible one.
 	if p.trustFwdFor && len(r.Header.Values("X-Forwarded-For")) > 0 {
-		p.recordPreSessionDeny(r, codeLoopbackRejected, "loopback", map[string]interface{}{
+		p.recordPreSessionDeny(r, codeLoopbackRejected, catLoopback, map[string]interface{}{
 			"reason": "forwarded_for_present",
 			"path":   boundedRefusalDetail(r.URL.Path),
 		})
@@ -791,7 +795,7 @@ func (p *HTTPProxy) loopbackOnly(w http.ResponseWriter, r *http.Request) bool {
 	host, _, _ := net.SplitHostPort(r.RemoteAddr)
 	ip := net.ParseIP(host)
 	if ip == nil || !ip.IsLoopback() {
-		p.recordPreSessionDeny(r, codeLoopbackRejected, "loopback", map[string]interface{}{
+		p.recordPreSessionDeny(r, codeLoopbackRejected, catLoopback, map[string]interface{}{
 			"reason": "non_loopback_source",
 			"path":   boundedRefusalDetail(r.URL.Path),
 		})
@@ -806,7 +810,7 @@ func (p *HTTPProxy) loopbackOnly(w http.ResponseWriter, r *http.Request) bool {
 	// buildAllowedOriginHosts seeds.
 	reqHost := strings.ToLower(normalizeHost(r.Host))
 	if !p.hostAllowedForLoopbackEndpoint(r.Host, reqHost) {
-		p.recordPreSessionDeny(r, codeLoopbackRejected, "loopback", map[string]interface{}{
+		p.recordPreSessionDeny(r, codeLoopbackRejected, catLoopback, map[string]interface{}{
 			"reason": "untrusted_host",
 			"path":   boundedRefusalDetail(r.URL.Path),
 		})

@@ -220,7 +220,7 @@ type HTTPProxy struct {
 	// preSessionDenies bounds the rate of transport-level refusal records. Those are the
 	// only audit writes an unauthenticated caller can trigger, so without a bound they are
 	// a lever on --require-audit=strict; see newPreSessionDenyLimiter.
-	preSessionDenies *recordRateLimiter
+	preSessionDenies *categoryRecordLimiter
 	trustFwdFor      bool
 	// trustedProxyNets is the compiled listen.trustedProxyCIDRs allowlist: under
 	// trustFwdFor, the immediate TCP peer (RemoteAddr) must match one of these
@@ -604,6 +604,20 @@ func (p *HTTPProxy) Serve(ctx context.Context) error {
 	// instance's on-disk state alone; a hook failure closes the listener and aborts.
 	if err := p.runAfterListen(ctx, ln); err != nil {
 		return err
+	}
+	// A shutdown that lands in the post-bind window ends startup here. runAfterListen
+	// reports a hook cut short by shutdown as success (it is a stop, not a startup
+	// failure) but has already closed the listener on that path, and a hook that
+	// finished just before the signal leaves the listener open with nothing left to
+	// close it. Both need this return: without it srv.Serve gets a listener that is
+	// closed or about to be, and its immediate "use of closed network connection" races
+	// the ctx.Done() arm of the select below -- select picks uniformly among ready
+	// cases, so a graceful stop surfaces a fatal error and a non-zero exit roughly half
+	// the time. Close is idempotent enough for the already-closed arm (it just reports
+	// ErrClosed, which has no bearing on a shutdown path).
+	if ctx.Err() != nil {
+		_ = ln.Close()
+		return nil
 	}
 
 	for name := range p.routes {

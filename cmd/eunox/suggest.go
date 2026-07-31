@@ -414,7 +414,7 @@ func renderSuggestedManifest(s suggestionSet, manifestName string, maxValues int
 		sb.WriteString("  # The agent attempted these but a policy blocked them. Uncomment only the\n")
 		sb.WriteString("  # ones you deliberately intend to permit.\n")
 		for _, t := range denyOnly {
-			fmt.Fprintf(&sb, "  # - target: %q\n", t.namespace+":"+t.name)
+			fmt.Fprintf(&sb, "  # - target: %s\n", yamlScalar(t.namespace+":"+t.name))
 			fmt.Fprintf(&sb, "  #   actions: [%s]   # observed %d denial(s)\n", actionForNamespace(t.namespace), t.deny)
 		}
 	}
@@ -448,12 +448,12 @@ func writeTargetEntry(sb *strings.Builder, t *observedTarget, maxValues int) {
 	// The sampling opt-in is a deliberate, security-relevant channel: never emit
 	// it as an active entry even when the tape shows it. Surface it commented.
 	if t.namespace == "system" {
-		fmt.Fprintf(sb, "  # - target: %q\n", "system:"+t.name)
+		fmt.Fprintf(sb, "  # - target: %s\n", yamlScalar("system:"+t.name))
 		sb.WriteString("  #   actions: [allow]   # server-initiated sampling observed — uncomment ONLY if you intend to permit it (sensitive)\n")
 		return
 	}
 
-	fmt.Fprintf(sb, "  - target: %q\n", t.namespace+":"+t.name)
+	fmt.Fprintf(sb, "  - target: %s\n", yamlScalar(t.namespace+":"+t.name))
 	fmt.Fprintf(sb, "    actions: [%s]\n", actionForNamespace(t.namespace))
 
 	if t.namespace != "tool" {
@@ -602,19 +602,26 @@ func writeTargetEntry(sb *strings.Builder, t *observedTarget, maxValues int) {
 // glob the operator can swap in. The caller only reaches here for an argument
 // observed solely as strings on every call.
 //
-// Argument name and values are emitted as %q double-quoted scalars so a
-// YAML-significant character (colon-space, leading "*"/"&", bare "null") cannot
-// produce an invalid or misparsed manifest.
+// Argument name and values are emitted through yamlScalar, the same renderer the init
+// scaffolder uses, so a YAML-significant character (colon-space, leading "*"/"&", bare
+// "null") cannot produce an invalid or misparsed manifest.
+//
+// Not Go's %q: these strings are mined from the audit TAPE, so they can carry bytes
+// that are not valid UTF-8, and %q renders such a byte as \xNN — which Go reads back
+// as that raw byte but YAML reads as the code point U+00NN. The draft entry would then
+// target a string that is not the one observed, i.e. a nonexistent tool or argument,
+// and the operator would see a rule that silently matches nothing. yamlScalar detects
+// exactly that non-round-trip and falls back to a !!binary scalar.
 func renderAllowedValues(argument string, values []string) string {
 	var sb strings.Builder
 	sb.WriteString("      - type: allowedValues\n")
-	fmt.Fprintf(&sb, "        argument: %q\n", argument)
+	fmt.Fprintf(&sb, "        argument: %s\n", yamlScalar(argument))
 	sb.WriteString("        values:\n")
 	for _, v := range values {
-		fmt.Fprintf(&sb, "          - %q\n", v)
+		fmt.Fprintf(&sb, "          - %s\n", yamlScalar(v))
 	}
 	if glob := commonPrefixGlob(values); glob != "" {
-		fmt.Fprintf(&sb, "        # consider generalizing the values above to: [%q]\n", glob)
+		fmt.Fprintf(&sb, "        # consider generalizing the values above to: [%s]\n", yamlScalar(glob))
 	}
 	return sb.String()
 }

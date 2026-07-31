@@ -127,9 +127,16 @@ silently get a policy wider than written: a typo'd `notAfterr` left a
 `timeWindow` enforcing only its lower bound, and a typo'd `fieldss` left a
 `redactFields` directive with an empty path list — which attaches the redaction
 obligation (so the audit record reports a redaction applied) while masking
-nothing. Both now fail closed at decode. Field matching stays case-insensitive,
-exactly as `encoding/json` binds, so this rejects only keys the decoder would
-have ignored outright. Loading through `eunox` itself is unchanged: the
+nothing. Both now fail closed at decode.
+
+`Constraint` and `ArgumentSchema` take the same rule, for the same reason: they
+decoded leniently too, so `{"target": …, "principals": {…}}` — a misspelled
+`principal` — bound nothing, left `Principal` nil, and silently widened the
+constraint to **every** caller, while `{"type": "string", "maxLen": 8}` validated
+length not at all. The check recurses through nested `properties` / `items`, so a
+typo buried in a sub-schema is caught where it was written. Field matching stays
+case-insensitive, exactly as `encoding/json` binds, so this rejects only keys the
+decoder would have ignored outright. Loading through `eunox` itself is unchanged: the
 manifest loader's recursive unknown-key walk still runs first, so a typo is
 still reported with its path and a "did you mean" suggestion.
 
@@ -158,6 +165,14 @@ against the *rounded* bound), silently weakening the constraint; the load-time c
 prevents that fail-open. Keep large integer bounds at or below 2^53
 (`9007199254740992`), or enforce them with an `allowedValues` condition, which
 preserves the literal exactly.
+
+A bound that *is* exactly representable but sits above int64 range — `2^63`
+(`9223372036854775808`) is a power of two, so it loads — is now compared **exactly**
+rather than through a 64-bit float. `9223372036854775809` no longer passes a
+`maximum` of `9223372036854775808` by rounding onto the same float, and the same
+exactness applies to `allowedValues` / `enum` membership at any magnitude. Only
+genuinely **fractional** operands still compare as floats, where a decimal literal
+and its 64-bit approximation are consistent on both sides.
 
 Like `directives` (§ 5a), `argumentSchema` applies to **`tool:` targets only**
 (SPEC § 3.2.2): it validates the shape of a tool call's argument map, which
@@ -1596,7 +1611,12 @@ an exact value or a per-segment pattern when a single `*` is too narrow.
 >   literal (separator-folded) form instead of denying. `report_50%_off.csv` clears
 >   an `[".csv"]` allowlist. (This is unlike the `allowedValues` confinement guard,
 >   which fails closed on a malformed escape — extension matching is not a
->   confinement feature.)
+>   confinement feature.) The one exception is a value that pairs a malformed escape
+>   with a **valid** `%00` or `%2f`/`%5c` token: the whole value then fails to
+>   percent-decode, so neither token was ever resolved, and matching the literal form
+>   would read `evil.exe%00x%zz.csv` as a permitted `.csv` file while a NUL-truncating
+>   upstream opens `evil.exe`. Both tokens are scanned for on the literal fallback and
+>   deny, on this path and on the `allowedValues` confinement guard alike.
 
 **`sequenceBlock`** — denies the call when any tool named in `afterTools` has
 already been called (and allowed) earlier in the **same session**. This is
@@ -2152,7 +2172,7 @@ Findings are emitted as structured log lines to stderr:
 [eunox] WARN drift=fm2 resource="query_db" — manifest entry matches no live upstream tool (tool removed or renamed?)
 [eunox] WARN drift=fm3 resource="read_file" tool="read_file" argument="path" — pinned argument not in live inputSchema; the pin may not enforce if the upstream renamed it
 [eunox] WARN drift=fm4 serverVersion="1.4.*" actual="1.5.2" — server version does not satisfy manifest pin; server may have been updated
-[eunox] WARN drift=fm5 resource="read_file" tool="read_file" — description hash mismatch; tool description may have been modified (expected sha256:9f86d0…, got sha256:2c2640…)
+[eunox] ERROR drift=fm5 resource="read_file" tool="read_file" — description hash mismatch; tool description may have been modified (expected sha256:9f86d0…, got sha256:2c2640…)
 [eunox] WARN drift=fm6 resource="send_email" tool="send_email" argument="bcc" — live parameter is not declared by the closed argumentSchema (additionalProperties:false) — a new, unreviewed tool argument; review whether the argumentSchema still constrains this tool as intended
 [eunox] WARN drift=schema_absent resource="read_file" tool="read_file" argument="path" — tool published no inputSchema, so pinned arguments could not be verified this session (request-time enforcement is unaffected)
 [eunox] INFO drift=uncovered tool="summarize_text" — not covered by manifest; no allowlist entry matches it (denied in enforce mode)

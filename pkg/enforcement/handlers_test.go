@@ -235,6 +235,21 @@ func TestAllowedExtensions_PercentEncodingDecodedView(t *testing.T) {
 		// a NUL-truncating upstream opens "evil.exe". The pre-decode NUL check now
 		// wins, so this denies.
 		{"literal NUL with malformed escape denied", "evil.exe\x00report%.pdf", capability.DecisionDeny},
+		// The ENCODED NUL paired with a malformed escape is the case the pre-decode
+		// check cannot reach: url.PathUnescape fails whole on the "%zz", so "%00" was
+		// never decoded to a NUL and the post-decode check never ran either. The lenient
+		// literal fallback then saw an allowed ".pdf" suffix on a path a NUL-truncating
+		// upstream resolves as "evil.exe". MatchValueGlob's slashless fallback carries
+		// the identical guard, so the two stay in lock-step.
+		{"encoded NUL with malformed escape denied", "evil.exe%00x%zz.pdf", capability.DecisionDeny},
+		// Same for an encoded SEPARATOR alongside a bad escape: the decoded view would
+		// have made "evil" the final segment (no extension), so the literal fallback
+		// admitting it on the ".pdf" directory component is the same misread.
+		{"encoded separator with malformed escape denied", "report.pdf%2fevil%zz", capability.DecisionDeny},
+		// The literal-'%' allowance must survive: a '%' that forms no encoded token is a
+		// legal filename character for a non-decoding upstream, and the extension
+		// allowlist is not a confinement guard.
+		{"literal percent with bad escape still allowed", "report_50%_off%zz.pdf", capability.DecisionAllow},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

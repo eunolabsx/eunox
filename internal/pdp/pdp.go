@@ -1910,24 +1910,56 @@ func replaceOrderedListField(envelope json.RawMessage, fieldName string, entries
 // trade-off is that a resource whose read always denies on a uri allowedValues can
 // still be advertised. Fails closed to an empty list on error.
 func filterResourcesListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims map[string]interface{}) ListFilterResult {
-	return filterListResult(resultBytes, listKeyResources, func(raw json.RawMessage) (bool, string) {
-		// Same entry-ambiguity gate tools/list applies; here the smuggled key is "uri"
-		// vs "URI", which decides which resource the host believes it is reading.
+	// The entry-ambiguity gate, the constraint lookup and the action check live in
+	// keepByManifestEntry, shared with prompts/list; only the id field differs. Here the
+	// smuggled key would be "uri" vs "URI", which decides which resource the host
+	// believes it is reading.
+	return filterListResult(resultBytes, listKeyResources,
+		keepByManifestEntry(mdp, claims, capability.TargetTypeResource, "read", func(raw json.RawMessage) (string, bool) {
+			var entry struct {
+				URI string `json:"uri"`
+			}
+			if err := json.Unmarshal(raw, &entry); err != nil {
+				return "", false
+			}
+			return entry.URI, true
+		}))
+}
+
+// keepByManifestEntry builds the per-entry keep predicate that resources/list and
+// prompts/list share. The two filters were near-verbatim copies differing only in the id
+// field, the target type and the required action — and what they duplicated was the
+// security-relevant part: the fail-closed ambiguity gate, the constraint lookup, and the
+// action check. A copy is how one flavor gets a gate the other does not, which is exactly
+// what entryKeysAmbiguous exists to prevent across list flavors.
+//
+// tools/list keeps its own predicate: it additionally verifies a descriptionHash pin and
+// consults the sticky poisoned set, so folding it in would parameterize away the very
+// logic that makes it different.
+//
+// entryID decodes the entry's identity and reports false when the entry cannot be
+// decoded — the fail-closed direction, dropping the entry from the catalog.
+func keepByManifestEntry(
+	mdp *ManifestPDP,
+	claims map[string]interface{},
+	targetType capability.TargetType,
+	requiredAction string,
+	entryID func(json.RawMessage) (string, bool),
+) func(json.RawMessage) (bool, string) {
+	return func(raw json.RawMessage) (bool, string) {
 		if entryKeysAmbiguous(raw) {
 			return false, ""
 		}
-		var entry struct {
-			URI string `json:"uri"`
-		}
-		if err := json.Unmarshal(raw, &entry); err != nil {
+		id, ok := entryID(raw)
+		if !ok {
 			return false, ""
 		}
-		c := mdp.findConstraint(EnforceTarget{Type: capability.TargetTypeResource, Name: entry.URI}, claims)
-		if c != nil && containsAction(c.Actions, "read") {
-			return true, entry.URI
+		c := mdp.findConstraint(EnforceTarget{Type: targetType, Name: id}, claims)
+		if c != nil && containsAction(c.Actions, requiredAction) {
+			return true, id
 		}
 		return false, ""
-	})
+	}
 }
 
 // filterToolsListResult keeps only tools whose names match a manifest capability
@@ -2452,27 +2484,21 @@ func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims
 // call leg; the trade-off is that a prompt whose get always denies on a name
 // allowedValues can still be advertised. Fails closed to an empty list on error.
 func filterPromptsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims map[string]interface{}) ListFilterResult {
-	return filterListResult(resultBytes, listKeyPrompts, func(raw json.RawMessage) (bool, string) {
-		// Same entry-ambiguity gate tools/list applies: a prompt entry carrying both
-		// "name" and "Name" would be kept under Go's decoded name while a host renders
-		// the other, and a prompt description reaches the model exactly as a tool
-		// description does. All three list flavors share the FM-5 surface, so all three
-		// share the check.
-		if entryKeysAmbiguous(raw) {
-			return false, ""
-		}
-		var entry struct {
-			Name string `json:"name"`
-		}
-		if err := json.Unmarshal(raw, &entry); err != nil {
-			return false, ""
-		}
-		c := mdp.findConstraint(EnforceTarget{Type: capability.TargetTypePrompt, Name: entry.Name}, claims)
-		if c != nil && containsAction(c.Actions, "get") {
-			return true, entry.Name
-		}
-		return false, ""
-	})
+	// Shares keepByManifestEntry with resources/list, so the entry-ambiguity gate cannot
+	// be present on one flavor and missing on the other: a prompt entry carrying both
+	// "name" and "Name" would otherwise be kept under Go's decoded name while a host
+	// renders the other, and a prompt description reaches the model exactly as a tool
+	// description does. All three list flavors share the FM-5 surface.
+	return filterListResult(resultBytes, listKeyPrompts,
+		keepByManifestEntry(mdp, claims, capability.TargetTypePrompt, "get", func(raw json.RawMessage) (string, bool) {
+			var entry struct {
+				Name string `json:"name"`
+			}
+			if err := json.Unmarshal(raw, &entry); err != nil {
+				return "", false
+			}
+			return entry.Name, true
+		}))
 }
 
 // JWTClaimsPtr returns the *JWTClaims stored in ctx, or nil when none is

@@ -34,25 +34,125 @@ import (
 // per-source on purpose: per-source state is itself attacker-sized memory, and the
 // suppressed count already tells the operator how much was elided.
 //
-// The pre-session bucket specifically is ONE bucket for the whole proxy, not one per route.
-// That is what bounds the sustained write rate into the single shared audit queue, which is
-// the property this limiter exists to hold: splitting it per route would multiply the rate
-// an attacker can drive by the size of the route table, re-opening the flood from the
-// direction the per-source-memory argument above closes. The cost is that its tally spans
-// routes and categories while a record reporting it may be route-stamped (recordSessionCapDeny
-// writes RESOURCE_EXHAUSTED through the route's sink) — detailSuppressedRefusalScope states
-// that outright rather than leaving it to inference. saturationGate below makes the opposite
-// trade for the opposite reason: it is scoped per pool per session specifically so a flood on
-// one session cannot elide another's record, so its own scope value says as much.
+// The pre-session bucket is one bucket per refusal CATEGORY, proxy-wide within each.
+//
+// Not one per route: that would multiply the rate an attacker can drive by the size of the
+// route table, re-opening the flood from the direction the per-source-memory argument above
+// closes. But not one for everything either, which is what it used to be. Categories differ
+// enormously in what it costs an attacker to trigger them and in what their records are
+// worth to an incident responder: an unauthenticated Origin probe is one cheap request, and
+// under a single bucket a spray of them absorbed the entire budget — so a concurrent
+// control-token brute force, the record an incident responder reads first, was suppressed
+// into a number on somebody else's record. That is precisely the failure recordRateLimiter's
+// own doc names ("a single shared bucket would let a flood of one refusal silence another")
+// and holds for every OTHER class by giving each its own instance; the pre-session classes
+// were the one place it did not hold internally.
+//
+// Per-category state is a fixed handful of counters — the categories are an ENUMERATED
+// set of typed constants (refusalCategory), not free strings — so unlike per-source
+// state it is not attacker-sized, and it cannot grow by accident. The same string is
+// also the record's structured condition_type field, which the threat model and
+// conformance doc describe as a closed enumeration; an untyped parameter let one typo
+// at a new refusal site both mint a private full-budget bucket and write a bogus value
+// into that field, with no compile error and nothing to catch it.
+//
+// The aggregate sustained ceiling rises to categories x preSessionDenyRatePerSec, a few
+// hundred records/second in the worst case. That is well inside what the drainer absorbs
+// (it is the queue OVERFLOW that latches AuditDegraded, and the queue holds 4096), so the
+// availability property the bound exists for is unchanged while the evidence property is
+// restored.
+//
+// The tally still spans routes within a category, and a record reporting it may be
+// route-stamped (recordSessionCapDeny writes RESOURCE_EXHAUSTED through the route's sink) —
+// detailSuppressedRefusalScope states that outright rather than leaving it to inference.
+// saturationGate below is scoped per pool per session, for the same
+// one-flood-must-not-elide-another reason, and its own scope value says as much.
 const (
 	preSessionDenyRatePerSec = 20
 	preSessionDenyBurst      = 50
 )
 
-// newPreSessionDenyLimiter builds the proxy-wide bucket over pre-session refusal records
+// refusalCategory names one pre-session refusal class. It is a distinct type, and the
+// constants below are its only values, because this string is used for two things at
+// once: it keys the rate-limit bucket AND it is written to the audit record's structured
+// condition_type field. The sibling `code` argument at every call site was already a
+// named constant; this is the other half of that pair.
+type refusalCategory string
+
+// The refusal categories. Every recordPreSessionDeny / recordSessionCapDeny call site
+// passes one of these.
+const (
+	catOrigin      refusalCategory = "origin"
+	catJWT         refusalCategory = "jwt"
+	catAuth        refusalCategory = "auth"
+	catControl     refusalCategory = "control"
+	catLoopback    refusalCategory = "loopback"
+	catBody        refusalCategory = "body"
+	catContentType refusalCategory = "content_type"
+	catSaturation  refusalCategory = "saturation"
+)
+
+// refusalCategories is the authoritative list the bucket table is built from. A constant
+// added above but omitted here would fall to the shared unknown bucket rather than
+// getting its own; TestRefusalCategories_AllHaveTheirOwnBucket pins that they match.
+var refusalCategories = []refusalCategory{
+	catOrigin, catJWT, catAuth, catControl, catLoopback, catBody, catContentType, catSaturation,
+}
+
+// newPreSessionDenyLimiter builds the per-category buckets over pre-session refusal records
 // (see the constants above for the rationale and the chosen rate).
-func newPreSessionDenyLimiter() *recordRateLimiter {
-	return newRecordRateLimiter(preSessionDenyRatePerSec, preSessionDenyBurst)
+func newPreSessionDenyLimiter() *categoryRecordLimiter {
+	c := &categoryRecordLimiter{
+		buckets: make(map[refusalCategory]*recordRateLimiter, len(refusalCategories)),
+		unknown: newRecordRateLimiter(preSessionDenyRatePerSec, preSessionDenyBurst),
+	}
+	for _, cat := range refusalCategories {
+		c.buckets[cat] = newRecordRateLimiter(preSessionDenyRatePerSec, preSessionDenyBurst)
+	}
+	return c
+}
+
+// categoryRecordLimiter holds one recordRateLimiter per refusal category, so a flood of
+// cheap refusals in one category cannot suppress the records of another.
+//
+// The table is built ONCE, at construction, from the enumerated category list — not
+// lazily on first use. That is what lets admit run without a lock of its own: the map is
+// read-only for the process lifetime, so a refusal takes exactly one mutex (its bucket's),
+// as it did before the split, rather than serializing every refusing goroutine on a second
+// proxy-global lock on the one path this file exists to keep cheap under attack. It also
+// removes the lazy path's ordering trap, where a bucket created before a test set the
+// clock silently kept the wall clock.
+type categoryRecordLimiter struct {
+	buckets map[refusalCategory]*recordRateLimiter
+	// unknown serves a category not in the table. Unreachable from the call sites (all
+	// pass constants) and bounded either way; it exists so an unregistered constant
+	// degrades to a shared bucket rather than to no bound at all.
+	unknown *recordRateLimiter
+}
+
+// admit reports whether a refusal record in category may be written now, and how many
+// records IN THAT CATEGORY were suppressed since the last admitted one.
+func (c *categoryRecordLimiter) admit(category refusalCategory) (ok bool, suppressed uint64) {
+	return c.bucket(category).admit()
+}
+
+// bucket returns category's token bucket. No lock: the table is immutable after
+// construction.
+func (c *categoryRecordLimiter) bucket(category refusalCategory) *recordRateLimiter {
+	if b, exists := c.buckets[category]; exists {
+		return b
+	}
+	return c.unknown
+}
+
+// setNow points every bucket at an injectable clock. Test-facing, and a method rather
+// than a settable field precisely because the buckets are separate token buckets: an
+// assignment to a parent field could only ever reach some of them.
+func (c *categoryRecordLimiter) setNow(now func() time.Time) {
+	for _, b := range c.buckets {
+		b.now = now
+	}
+	c.unknown.now = now
 }
 
 // The details keys a rolled-up refusal record carries, and the scope values that qualify the
@@ -78,15 +178,18 @@ func newPreSessionDenyLimiter() *recordRateLimiter {
 const (
 	detailSuppressedRefusalCount = "suppressed_refusal_count"
 	detailSuppressedRefusalScope = "suppressed_refusal_scope"
-	// suppressedScopeProxy qualifies the pre-session bucket's rollup: the tally spans every
-	// route and category, written directly at the one call site that needs it (recordRefusal)
-	// rather than read off a field on the limiter — a per-scope field would be generality
-	// with a single caller, since the pre-session bucket is the only proxy-wide one. If a
-	// second proxy-wide limiter is ever introduced, the constant at that write site is
-	// exactly what should become a field again; saturationGate below is a narrower-reach
-	// limiter, but a distinct type with its own scope constant, not a second caller of this
-	// one.
-	suppressedScopeProxy = "proxy"
+	// suppressedScopeProxyCategory qualifies the pre-session buckets' rollup: the tally
+	// spans every ROUTE but covers only this record's own refusal category, which is what
+	// the per-category buckets made true. It is written directly at the one call site that
+	// needs it (recordRefusal) rather than read off a field on the limiter — a per-scope
+	// field would be generality with a single caller. saturationGate below is a
+	// narrower-reach limiter, but a distinct type with its own scope constant, not a second
+	// caller of this one.
+	//
+	// The value changed from the earlier "proxy" when the bucket was split by category:
+	// under one shared bucket the count really did span categories, and a reader keyed on
+	// the old value would now under-read the number's precision rather than over-read it.
+	suppressedScopeProxyCategory = "proxy_category"
 )
 
 // recordRateLimiter is a token bucket over one CLASS of caller-driven audit refusal
@@ -194,7 +297,7 @@ const (
 // bounded independently by the session cap. The attacker's cost scales with the record
 // rate, which is exactly the property the pre-session case lacks.
 //
-// Its rollup carries detailSuppressedRefusalScope too, but never suppressedScopeProxy: a
+// Its rollup carries detailSuppressedRefusalScope too, but never suppressedScopeProxyCategory: a
 // saturation record's count is exactly as narrow as the session_id beside it, the opposite
 // of the pre-session bucket's proxy-wide tally, and the constant it writes (see
 // recordResourceExhausted) says so.

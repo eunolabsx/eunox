@@ -466,7 +466,7 @@ func TestJSONRPCCode_SamplingDenial_ReturnsAuthorizationFailed(t *testing.T) {
 	p := &StdioProxy{
 		pdp:        dp,
 		sessionID:  "test-sess",
-		pending:    make(map[string]chan upstreamResult),
+		pending:    make(map[string]struct{}),
 		hostWriter: mcp.NewMsgWriter(&writerAdapter{&mockHostWriter{}}),
 		upWriter:   mcp.NewMsgWriter(&writerAdapter{uw}),
 	}

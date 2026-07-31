@@ -321,3 +321,114 @@ func TestJSONFieldNames_CachedResultMatchesFresh(t *testing.T) {
 		}
 	}
 }
+
+// Constraint.UnmarshalJSON applies the same rule one level up. It decoded leniently,
+// so a misspelled "principal" — the field that decides WHO a constraint governs —
+// bound nothing and left Principal nil, which applies the constraint to every caller.
+// Same silent-widening class the condition check closes, on the field where widening
+// costs the most.
+func TestConstraintUnmarshalJSON_RejectsUnknownField(t *testing.T) {
+	cases := []struct {
+		name string
+		json string
+		want string
+	}{
+		{
+			name: "misspelled principal silently widens to every caller",
+			json: `{"target":"tool:read_file","actions":["call"],"principals":{"sub":["alice"]}}`,
+			want: `unknown field "principals"`,
+		},
+		{
+			name: "misspelled conditions drops the whole restriction",
+			json: `{"target":"tool:read_file","actions":["call"],"condition":[{"type":"maxCalls","count":1,"windowSeconds":60}]}`,
+			want: `unknown field "condition"`,
+		},
+		{
+			name: "misspelled descriptionHash drops the pin",
+			json: `{"target":"tool:read_file","actions":["call"],"descriptionhashh":"sha256:abc"}`,
+			want: `unknown field "descriptionhashh"`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var c Constraint
+			err := c.UnmarshalJSON([]byte(tc.json))
+			if err == nil {
+				t.Fatalf("UnmarshalJSON(%s) = nil error, want a rejection", tc.json)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error = %q, want it to name %s", err, tc.want)
+			}
+		})
+	}
+}
+
+// ArgumentSchema.UnmarshalJSON likewise, including at nesting depth: every
+// properties/items value decodes through the same method, so the check recurses for
+// free and a typo buried in a nested object is caught where it was written.
+func TestArgumentSchemaUnmarshalJSON_RejectsUnknownField(t *testing.T) {
+	cases := []struct {
+		name string
+		json string
+		want string
+	}{
+		{
+			name: "misspelled maxLength validates length not at all",
+			json: `{"type":"string","maxLen":8}`,
+			want: `unknown field "maxLen"`,
+		},
+		{
+			name: "typo nested under properties",
+			json: `{"type":"object","properties":{"path":{"type":"string","patern":"^/tmp/"}}}`,
+			want: `unknown field "patern"`,
+		},
+		{
+			name: "typo nested under items",
+			json: `{"type":"array","items":{"type":"string","enumm":["a"]}}`,
+			want: `unknown field "enumm"`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var s ArgumentSchema
+			err := s.UnmarshalJSON([]byte(tc.json))
+			if err == nil {
+				t.Fatalf("UnmarshalJSON(%s) = nil error, want a rejection", tc.json)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error = %q, want it to name %s", err, tc.want)
+			}
+		})
+	}
+}
+
+// Neither strict decoder may reject what a lenient decode would have bound: every real
+// field, in any case spelling, and a full round-trip of what MarshalJSON emits.
+func TestStrictDecoders_AcceptEveryRealField(t *testing.T) {
+	full := `{"target":"tool:read_file","actions":["call"],"enforcement":"audit",` +
+		`"descriptionHash":"sha256:abc","principal":{"sub":["alice"]},` +
+		`"argumentSchema":{"type":"object","properties":{"path":{"type":"string","pattern":"^/tmp/",` +
+		`"minLength":1,"maxLength":64}},"required":["path"],"additionalProperties":false,` +
+		`"items":null,"minItems":0,"maxItems":4,"minimum":1,"maximum":8,"enum":[1,2],"description":"d"},` +
+		`"conditions":[{"type":"maxCalls","count":1,"windowSeconds":60}],` +
+		`"directives":[{"type":"redactFields","fields":["$.ssn"]}]}`
+	var c Constraint
+	if err := c.UnmarshalJSON([]byte(full)); err != nil {
+		t.Fatalf("a constraint using every field must decode: %v", err)
+	}
+	// Case variants: encoding/json binds case-insensitively, so the check must too.
+	if err := (&Constraint{}).UnmarshalJSON([]byte(`{"TARGET":"tool:x","Actions":["call"],"PRINCIPAL":{"sub":["a"]}}`)); err != nil {
+		t.Errorf("case-variant field names must be accepted: %v", err)
+	}
+	if err := (&ArgumentSchema{}).UnmarshalJSON([]byte(`{"TYPE":"string","MaxLength":4}`)); err != nil {
+		t.Errorf("case-variant schema field names must be accepted: %v", err)
+	}
+	// Round-trip: whatever MarshalJSON emits must decode back.
+	out, err := json.Marshal(c)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if err := (&Constraint{}).UnmarshalJSON(out); err != nil {
+		t.Fatalf("round-trip of MarshalJSON output must decode: %v (%s)", err, out)
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 )
@@ -211,17 +212,9 @@ func unmarshalCondition(data []byte) (Condition, error) {
 	// meant to tighten things. Matching is case-insensitive because that is how
 	// encoding/json binds, so this rejects exactly the keys the decode would have ignored,
 	// no more.
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(data, &fields); err != nil {
-		return nil, fmt.Errorf("condition %q: %w", envelope.Type, err)
-	}
-	known := jsonFieldNames(target)
-	for k := range fields {
-		// "type" is the envelope's discriminator, not a field of any condition struct.
-		if strings.EqualFold(k, "type") || known[strings.ToLower(k)] {
-			continue
-		}
-		return nil, fmt.Errorf("condition %q: unknown field %q", envelope.Type, k)
+	// "type" is the envelope's discriminator, not a field of any condition struct.
+	if err := rejectUnknownJSONFields(data, target, fmt.Sprintf("condition %q", envelope.Type), "type"); err != nil {
+		return nil, err
 	}
 
 	// Decode the ORIGINAL bytes, so duplicate-key and case-variant binding stay exactly
@@ -243,6 +236,43 @@ func unmarshalCondition(data []byte) (Condition, error) {
 // again on every `validate`/`doctor` run), and the reflect walk is identical for a given
 // type.
 var jsonFieldNamesCache sync.Map // reflect.Type -> map[string]bool
+
+// rejectUnknownJSONFields fails when data carries a top-level key encoding/json would
+// not bind on target, naming the offender. context prefixes the error ("condition
+// \"timeWindow\"", "constraint", …); allowExtra names keys that are legitimate on the
+// wire but absent from target's field set, such as a polymorphic envelope's "type"
+// discriminator.
+//
+// It is the shared body of every strict decoder in this package, so the rule cannot
+// hold in one and lapse in another. See unmarshalCondition for the full rationale; in
+// brief, a lenient decode silently drops a MISSPELLED key, and for a policy object that
+// means a policy quietly wider than written — a widening the author cannot see, because
+// the file they wrote loaded without complaint.
+//
+// Checked by key MEMBERSHIP rather than by handing a discriminator-stripped copy to
+// DisallowUnknownFields: stripping means decoding to a map and re-marshaling, and that
+// round-trip is not identity (it sorts keys and collapses duplicates), so which of two
+// case-variant siblings won would change from JSON's last-wins to byte order — a parser
+// differential introduced by the very check meant to tighten things. Matching is
+// case-insensitive because that is how encoding/json binds, so this rejects exactly the
+// keys the decode would have ignored, no more.
+func rejectUnknownJSONFields(data []byte, target any, context string, allowExtra ...string) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return fmt.Errorf("%s: %w", context, err)
+	}
+	known := jsonFieldNames(target)
+	for k := range fields {
+		if known[strings.ToLower(k)] {
+			continue
+		}
+		if slices.ContainsFunc(allowExtra, func(e string) bool { return strings.EqualFold(k, e) }) {
+			continue
+		}
+		return fmt.Errorf("%s: unknown field %q", context, k)
+	}
+	return nil
+}
 
 // jsonFieldNames returns the lowercased JSON field names encoding/json would bind on v,
 // for the unknown-field checks in unmarshalCondition and unmarshalDirective. Lowercased
