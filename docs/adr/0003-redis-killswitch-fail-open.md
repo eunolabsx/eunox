@@ -219,17 +219,31 @@ refine what "cannot confirm" means, so a health probe and the data plane agree o
   last-writer-wins across instances, which the publisher reports when it replaces a
   differing value.
 
-- **A revocation can be lifted from the CLI.** `eunox kill --revive
-  <session-id|all> --redis-addr <addr>` removes a session tombstone, or
-  deactivates the global switch, wiring the `ReviveSession` / `DeactivateGlobal`
-  manager methods that were previously reachable only by a library consumer. It
-  matters most in the permanent-tombstone mode above, where nothing expires and the
-  only remediation was deleting keys in `redis-cli`. It is deliberately Redis-only:
+- **A revocation can be lifted from the CLI, though not every dimension has a
+  command yet.** `eunox kill --revive <session-id|all> --redis-addr <addr>`
+  removes a session tombstone, or deactivates the global switch, wiring the
+  `ReviveSession` / `DeactivateGlobal` manager methods that were previously
+  reachable only by a library consumer. It matters most in the
+  permanent-tombstone mode above, where nothing expires and the only
+  remediation was deleting keys in `redis-cli`. It is deliberately Redis-only:
   the loopback `/control/kill` endpoint is a one-way emergency stop, and giving a
   same-host caller that reaches it an undo would let it lift the very revocation
   issued against it. Lifting the global switch leaves per-session tombstones in
   place — they are separate kill dimensions, and clearing both would be a
-  fail-open.
+  fail-open. Two gaps remain, both library-only: `ReviveAgent` has no CLI path
+  at all (an agent kill has no undo command, permanent by design or not), and
+  bulk-clearing many session tombstones at once still means `Reset` (which
+  also clears the global switch and every agent kill) or manual `redis-cli`
+  deletion — `--revive` only takes one id at a time.
+  On an HTTP proxy/gateway, `--revive` also cannot undo the LOCAL effect of a
+  kill issued via the loopback endpoint: `handleKill` synchronously tears down
+  the killed session's registry entry and upstream connection, and a
+  Redis-side revive has no visibility into that teardown. The tombstone still
+  clears, so a *new* connection reusing that session id is no longer blocked,
+  but the original connection is gone either way. This matters only for the
+  HTTP transport; a stdio proxy pinning one long-lived `--session-id` — the
+  primary motivation for `--revive` — is never locally reaped by a kill, so
+  reviving it does restore that connection.
 
 ## Alternatives considered
 

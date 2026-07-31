@@ -98,8 +98,14 @@ func (r *Redis) PublishSessionKillTTL(ctx context.Context) (prior time.Duration,
 			prior, differs = parsed, true
 		}
 	}
-	if err := r.client.Set(ctx, redisSessionTTLKey, formatSessionKillTTL(mine), 0).Err(); err != nil {
-		return 0, false, fmt.Errorf("killswitch: publish session-kill TTL: %w", err)
+	// setErr, not err: the named return err is never otherwise assigned in this
+	// function (both paths use an explicit return triple), so shadowing it here would
+	// be harmless today but a future edit that merges this branch into a shared error
+	// path (e.g. "err = ...; return") could silently start returning the outer,
+	// never-assigned err (nil) instead of this one -- the caller would then believe
+	// the publish succeeded when the SET actually failed.
+	if setErr := r.client.Set(ctx, redisSessionTTLKey, formatSessionKillTTL(mine), 0).Err(); setErr != nil {
+		return 0, false, fmt.Errorf("killswitch: publish session-kill TTL: %w", setErr)
 	}
 	return prior, differs, nil
 }
@@ -130,6 +136,37 @@ func ReadPublishedSessionKillTTL(ctx context.Context, client redis.Cmdable) (tim
 	return ttl, true, nil
 }
 
+// ResolveSessionKillTTLConflict decides which of two EFFECTIVE session-kill lifetimes a
+// tombstone write should use when a value this writer would use on its own (local,
+// already normalized -- e.g. through NormalizeSessionKillTTL) disagrees with a value
+// published by a proxy on the same Redis (published, from ReadPublishedSessionKillTTL).
+// It returns the longer-lived of the two -- zero (never expires) beats every positive
+// value -- and whether the two actually disagreed.
+//
+// Preferring the LONGER lifetime, not the published one outright, matters because the
+// tombstone this decision governs is itself an emergency-stop write: refusing to write
+// it because two lifetimes disagree fails in the one direction that matters, while a
+// too-long tombstone only ever over-blocks a session id that is already gone. This is
+// exported, not folded into the CLI, so a future non-CLI writer of session tombstones
+// can reuse the decision rather than re-derive it -- naively preferring its own local
+// value over the published one is exactly the fail-open direction this coordination
+// exists to close.
+func ResolveSessionKillTTLConflict(local, published time.Duration) (effective time.Duration, mismatch bool) {
+	if local == published {
+		return local, false
+	}
+	return longerTombstone(local, published), true
+}
+
+// longerTombstone returns whichever effective lifetime keeps a tombstone alive longer,
+// where zero means it never expires and therefore outlives every finite value.
+func longerTombstone(a, b time.Duration) time.Duration {
+	if a <= 0 || b <= 0 {
+		return 0
+	}
+	return max(a, b)
+}
+
 // DescribeSessionKillTTL renders an effective lifetime for an operator-facing message,
 // spelling the zero value as "never expires" rather than "0s" -- the one value whose
 // numeric form says the opposite of what it means.
@@ -153,10 +190,15 @@ func formatSessionKillTTL(effective time.Duration) string {
 // the two spellings of never would then differ by a sign that no writer intends, and a
 // "0s" that actually meant "expire immediately" would be read as a permanent tombstone.
 func parseSessionKillTTL(raw string) (time.Duration, error) {
-	s := strings.TrimSpace(raw)
-	if len(s) > maxSessionTTLValueBytes {
-		return 0, fmt.Errorf("killswitch: published session-kill TTL is %d bytes; expected a duration or %q", len(s), sessionKillTTLNever)
+	// Bound the RAW length before any processing, including TrimSpace: checking the
+	// trimmed string instead would let arbitrary whitespace padding around a short,
+	// well-formed value (e.g. a few hundred KB of spaces around "24h") trim down to
+	// something under the limit and sail through as valid -- exactly the "handed to
+	// time.ParseDuration" outcome this bound exists to prevent for a value this large.
+	if len(raw) > maxSessionTTLValueBytes {
+		return 0, fmt.Errorf("killswitch: published session-kill TTL is %d bytes; expected a duration or %q", len(raw), sessionKillTTLNever)
 	}
+	s := strings.TrimSpace(raw)
 	if strings.EqualFold(s, sessionKillTTLNever) {
 		return 0, nil
 	}

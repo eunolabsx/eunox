@@ -9,6 +9,7 @@ package killswitch
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -75,6 +76,37 @@ func TestWithSessionKillTTLEffective_KeepsNeverExpiring(t *testing.T) {
 	require.Equal(t, defaultSessionKillTTL, r.SessionKillTTL())
 	r = NewRedis(nil, WithSessionKillTTL(-1))
 	require.Zero(t, r.SessionKillTTL())
+}
+
+// TestResolveSessionKillTTLConflict pins the exported conflict-resolution policy: the
+// longer-lived of the two effective lifetimes wins (zero, "never expires", beats every
+// positive value), and equal values report no mismatch. This is the decision
+// cmd/eunox/kill.go's resolveSessionKillTTL used to make inline; it now lives here so a
+// future non-CLI writer of session tombstones can reuse the direction instead of
+// re-deriving it -- naively preferring its own local value would be the fail-open one.
+func TestResolveSessionKillTTLConflict(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name          string
+		local         time.Duration
+		published     time.Duration
+		wantEffective time.Duration
+		wantMismatch  bool
+	}{
+		{"equal values agree", time.Hour, time.Hour, time.Hour, false},
+		{"local is longer", 24 * time.Hour, time.Hour, 24 * time.Hour, true},
+		{"published is longer", time.Hour, 24 * time.Hour, 24 * time.Hour, true},
+		{"local never beats any finite published", 0, 24 * time.Hour, 0, true},
+		{"published never beats any finite local", 24 * time.Hour, 0, 0, true},
+		{"both never agree", 0, 0, 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			effective, mismatch := ResolveSessionKillTTLConflict(tc.local, tc.published)
+			require.Equal(t, tc.wantEffective, effective)
+			require.Equal(t, tc.wantMismatch, mismatch)
+		})
+	}
 }
 
 // TestPublishAndReadSessionKillTTL_RoundTrip covers the whole point of the key: what the
@@ -178,6 +210,27 @@ func TestReadPublishedSessionKillTTL_MalformedIsAnError(t *testing.T) {
 			require.Zero(t, ttl)
 		})
 	}
+}
+
+// TestParseSessionKillTTL_BoundsRawLengthBeforeTrimming is the regression for checking
+// the size guard against the TRIMMED string instead of the raw one: whitespace padding
+// around a short, well-formed value would trim down to something under the limit and be
+// accepted as a valid duration, even though the raw value is exactly the "garbage or
+// hostile" size the bound exists to reject outright -- something other than a proxy
+// wrote this key, and TrimSpace should not be able to launder that past the length check.
+func TestParseSessionKillTTL_BoundsRawLengthBeforeTrimming(t *testing.T) {
+	t.Parallel()
+	padded := strings.Repeat(" ", maxSessionTTLValueBytes*4) + "24h" + strings.Repeat(" ", maxSessionTTLValueBytes*4)
+	require.Greater(t, len(padded), maxSessionTTLValueBytes, "the raw value must exceed the bound")
+
+	ttl, err := parseSessionKillTTL(padded)
+	require.Error(t, err, "oversized padding around a valid duration must still be rejected")
+	require.Zero(t, ttl)
+
+	// A value that is short even before trimming is unaffected by the ordering.
+	ttl, err = parseSessionKillTTL("  24h  ")
+	require.NoError(t, err)
+	require.Equal(t, 24*time.Hour, ttl)
 }
 
 // TestPublishSessionKillTTL_IgnoresAnUnparseablePriorValue: the read only feeds the

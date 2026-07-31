@@ -11,6 +11,8 @@ package main
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -30,7 +32,10 @@ const publishedTTLKey = "killswitch:config:session-kill-ttl"
 
 // TestProxyPublishesSessionKillTTL_ForTheKillCLI: the proxy's startup wiring must
 // advertise its effective lifetime, since `eunox kill --redis-addr` writes tombstones
-// itself and would otherwise stamp its own default on them.
+// itself and would otherwise stamp its own default on them. publishSessionKillTTL is
+// called separately from buildCallCounterAndKillSwitch (see cmdProxy: the publish is
+// deliberately deferred until every step that can still fail startup has succeeded), so
+// this test drives the same two-call sequence cmdProxy does.
 func TestProxyPublishesSessionKillTTL_ForTheKillCLI(t *testing.T) {
 	mr := miniredis.RunT(t)
 
@@ -38,6 +43,7 @@ func TestProxyPublishesSessionKillTTL_ForTheKillCLI(t *testing.T) {
 		_, _, _, ksRedis, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, false, 0, 90*time.Minute, 0)
 		require.NoError(t, err)
 		require.NotNil(t, ksRedis)
+		publishSessionKillTTL(ksRedis)
 	})
 
 	got, err := mr.Get(publishedTTLKey)
@@ -47,8 +53,9 @@ func TestProxyPublishesSessionKillTTL_ForTheKillCLI(t *testing.T) {
 	// A never-expiring proxy publishes the word, not a bare 0 — the CLI reads it back as
 	// a permanent tombstone rather than as "unset, use the default".
 	_ = captureStderr(t, func() {
-		_, _, _, _, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, false, 0, -1, 0)
+		_, _, _, ksRedis, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, false, 0, -1, 0)
 		require.NoError(t, err)
+		publishSessionKillTTL(ksRedis)
 	})
 	got, err = mr.Get(publishedTTLKey)
 	require.NoError(t, err)
@@ -63,18 +70,59 @@ func TestProxyPublishSessionKillTTL_WarnsOnADifferingPriorValue(t *testing.T) {
 	require.NoError(t, mr.Set(publishedTTLKey, "24h0m0s"))
 
 	stderr := captureStderr(t, func() {
-		_, _, _, _, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, false, 0, 90*time.Minute, 0)
+		_, _, _, ksRedis, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, false, 0, 90*time.Minute, 0)
 		require.NoError(t, err)
+		publishSessionKillTTL(ksRedis)
 	})
 	require.Contains(t, stderr, "24h0m0s", "the warning must name the value being replaced")
 	require.Contains(t, stderr, "1h30m0s", "and the value replacing it")
 
 	// Republishing the same value is agreement, not a conflict.
 	stderr = captureStderr(t, func() {
-		_, _, _, _, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, false, 0, 90*time.Minute, 0)
+		_, _, _, ksRedis, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, false, 0, 90*time.Minute, 0)
 		require.NoError(t, err)
+		publishSessionKillTTL(ksRedis)
 	})
 	require.NotContains(t, stderr, "already advertised")
+}
+
+// TestCmdProxy_PublishesSessionKillTTLOnlyAfterAuditSinkOpens is the regression for the
+// publish-before-startup-can-fail ordering bug: publishSessionKillTTL used to run inside
+// buildCallCounterAndKillSwitch, before openConfiguredAuditSink -- which can still fail
+// and exit the process -- had even run. A second, differently-configured instance with,
+// say, a bad --audit-key-path would overwrite a running proxy's published TTL and then
+// die before serving a single request, leaving `eunox kill` (and the first proxy's own
+// diagnostics) trusting a lifetime nothing was actually enforcing. Drives cmdProxy itself
+// with a bad --audit-key-path so the real failure path runs, and asserts the previously
+// published value survives it untouched.
+func TestCmdProxy_PublishesSessionKillTTLOnlyAfterAuditSinkOpens(t *testing.T) {
+	mr := miniredis.RunT(t)
+	require.NoError(t, mr.Set(publishedTTLKey, "1h30m0s"))
+
+	dir := t.TempDir()
+	// An existing directory at the audit-key path makes key-file creation fail deep
+	// inside openConfiguredAuditSink, after buildCallCounterAndKillSwitch has already
+	// returned successfully -- exactly the ordering this test needs to exercise.
+	badKeyPath := filepath.Join(dir, "not-a-file")
+	require.NoError(t, os.Mkdir(badKeyPath, 0o700))
+	logPath := filepath.Join(dir, "audit.jsonl")
+
+	var code int
+	_ = captureStderr(t, func() {
+		code = cmdProxy([]string{
+			"--redis-addr", mr.Addr(),
+			"--killswitch-session-ttl", "-1s", // this instance wants "never expires"
+			"--require-audit",
+			"--audit-log", logPath,
+			"--audit-key-path", badKeyPath,
+			"--audit", "--", "cat",
+		})
+	})
+	require.Equal(t, 1, code, "the bad audit-key-path must still fail startup")
+
+	got, err := mr.Get(publishedTTLKey)
+	require.NoError(t, err)
+	require.Equal(t, "1h30m0s", got, "a proxy that never reached the audit-sink success point must not have overwritten the published TTL")
 }
 
 // TestCmdKill_AdoptsPublishedSessionKillTTL is the fix for the two-flag split: with a
@@ -309,6 +357,37 @@ func TestCmdKill_ReviveRejectsSessionTTLFlag(t *testing.T) {
 	})
 	require.Equal(t, 1, code)
 	require.Contains(t, stderr, "--killswitch-session-ttl has no effect with --revive")
+}
+
+// TestCmdKill_AllTargetRejectsSessionTTLFlag: "all" activates the global kill switch,
+// which carries no per-session expiry at all (setBlock only reads sessionKillTTL on the
+// KillSession path) -- so the flag is exactly as meaningless there as it is with
+// --revive, which this command already treats as a hard error rather than a silent
+// no-op.
+func TestCmdKill_AllTargetRejectsSessionTTLFlag(t *testing.T) {
+	mr := miniredis.RunT(t)
+	var code int
+	stderr := captureStderr(t, func() {
+		code = cmdKill([]string{"--redis-addr", mr.Addr(), "--killswitch-session-ttl", "1h", "all"})
+	})
+	require.Equal(t, 1, code)
+	require.Contains(t, stderr, "--killswitch-session-ttl has no effect on the 'all' target")
+	require.False(t, mr.Exists("killswitch:global"), "a rejected flag combination must not still perform the kill")
+}
+
+// TestCmdKill_SessionTTLFlag_RequiresRedisAddr is the regression for the flag silently
+// no-op'ing without --redis-addr: before this fix, `eunox kill --killswitch-session-ttl
+// 1h --port 1 <id>` fell straight through to the HTTP control-endpoint path with the TTL
+// flag discarded and no diagnostic at all -- contradicting the flag's own help text
+// ("the two cannot silently disagree") and the sibling --redis-password/--redis-tls
+// checks a few lines below, which already reject exactly this mix.
+func TestCmdKill_SessionTTLFlag_RequiresRedisAddr(t *testing.T) {
+	var code int
+	stderr := captureStderr(t, func() {
+		code = cmdKill([]string{"--killswitch-session-ttl", "1h", "--port", "1", "sess-1"})
+	})
+	require.Equal(t, 1, code)
+	require.Contains(t, stderr, "--killswitch-session-ttl requires --redis-addr")
 }
 
 // TestPublishSessionKillTTL_WarnsButDoesNotAbortStartup: the published key is a

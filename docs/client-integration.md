@@ -759,14 +759,27 @@ out-of-band kill channel (stop the process), so this only changes behavior for a
 ### Lifting a revocation
 
 `eunox kill --revive <session-id|all> --redis-addr <host:port>` undoes a kill:
-a session id may connect again, and `all` deactivates the global kill switch.
-Lifting the global switch leaves per-session kills in place — they are separate
-dimensions, so revive those by id.
+`<session-id>` removes that session's kill tombstone, and `all` deactivates
+the global kill switch. Lifting the global switch leaves per-session kills in
+place — they are separate dimensions, so revive those by id.
 
 It is Redis-only. The loopback `/control/kill` endpoint is a one-way emergency
 stop with no undo (a same-host caller holding the control token must not be able
 to lift the revocation issued against it), and a proxy on the default in-memory
 kill switch is cleared by restarting it.
+
+What removing the tombstone actually restores depends on the proxy shape:
+
+- **stdio proxy pinning one `--session-id`** — the primary case `--revive`
+  exists for. The proxy never locally reaps that session on a kill (there's
+  nothing to reap; it's the one connection the process wraps), so lifting the
+  tombstone immediately un-blocks it — the same id may connect again.
+- **HTTP proxy/gateway** — a session killed via the loopback `/control/kill`
+  endpoint is torn down locally at kill time (its registry entry and upstream
+  connection are closed), and a Redis-side `--revive` has no visibility into
+  that. The tombstone still clears, so a client is no longer blocked from
+  establishing a *new* session, but the original connection and its
+  `Mcp-Session-Id` are gone regardless of the revive.
 
 Revive matters most with a negative `--killswitch-session-ttl`, where tombstones
 never expire and would otherwise have to be deleted by hand in `redis-cli`.

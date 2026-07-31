@@ -70,8 +70,8 @@ Flags:
 	redisAddr := fs.String("redis-addr", "", "Redis address (host:port). When set, the kill is written to the shared\nRedis kill-switch state instead of an HTTP endpoint — the only way to\nrevoke a stdio proxy started with --redis-addr.")
 	redisPassword := fs.String("redis-password", "", "Password for the Redis server (used with --redis-addr). Prefer the\nEUNOX_REDIS_PASSWORD env var; a non-empty flag value takes precedence over\nit, but leaving the flag empty does NOT override a set env var.")
 	redisTLS := fs.Bool("redis-tls", false, "Use TLS for the Redis connection (used with --redis-addr).")
-	sessionKillTTL := fs.Duration("killswitch-session-ttl", 0, "How long this SESSION kill survives in Redis before it is garbage collected.\nRarely needed: the proxy publishes its own value to Redis at startup and this\ncommand adopts it, so the two cannot silently disagree. Pass this only to\noverride that, or when no proxy has published one yet (default 720h / 30 days).\nWhen the tombstone expires the kill is LIFTED. Negative disables expiry. If it\ndisagrees with the published value, the longer-lived of the two is used and the\nmismatch is reported. Ignored for the 'all' target, with --revive, and without\n--redis-addr.")
-	revive := fs.Bool("revive", false, "Lift a revocation instead of issuing one: <session-id> removes that session's\nkill tombstone (the id may connect again), 'all' deactivates the global kill\nswitch (per-session tombstones are left in place — revive those by id).\nRequires --redis-addr: the HTTP control endpoint is an emergency stop with no\nundo, and an in-memory kill switch is cleared by restarting the proxy.")
+	sessionKillTTL := fs.Duration("killswitch-session-ttl", 0, "How long this SESSION kill survives in Redis before it is garbage collected.\nRarely needed: the proxy publishes its own value to Redis at startup and this\ncommand adopts it, so the two cannot silently disagree. Pass this only to\noverride that, or when no proxy has published one yet (default 720h / 30 days).\nWhen the tombstone expires the kill is LIFTED. Negative disables expiry. If it\ndisagrees with the published value, the longer-lived of the two is used and the\nmismatch is reported. Rejected together with the 'all' target, --revive, or\nwithout --redis-addr: none of the three writes a session tombstone, so the\nflag would have no effect.")
+	revive := fs.Bool("revive", false, "Lift a revocation instead of issuing one: <session-id> removes that session's\nkill tombstone, so a new connection reusing that id is no longer blocked. The\nprimary case is a stdio proxy pinning one long-lived --session-id; for an HTTP\nproxy/gateway, a session killed via the loopback endpoint was already torn\ndown locally, and reviving its tombstone here does not restore that\nconnection. 'all' deactivates the global kill switch (per-session tombstones\nare left in place — revive those by id). Requires --redis-addr: the HTTP\ncontrol endpoint is an emergency stop with no undo, and an in-memory kill\nswitch is cleared by restarting the proxy.")
 	controlToken := fs.String("control-token", "", "Control token for the HTTP /control/kill endpoint. If empty, read from\nEUNOX_CONTROL_TOKEN or --control-token-path (default ~/.eunox/control.token),\nwhere the running proxy wrote it.")
 	controlTokenPath := fs.String("control-token-path", "", "Path to the control-token file the proxy wrote (default ~/.eunox/control.token).\nUsed when --control-token and EUNOX_CONTROL_TOKEN are unset.")
 
@@ -110,11 +110,20 @@ Flags:
 				return 1
 			}
 		}
-		// A tombstone lifetime is meaningless when the tombstone is being DELETED, and
-		// accepting it silently would suggest --revive writes something with an expiry.
-		if *revive && flagWasSet(fs, "killswitch-session-ttl") {
-			fmt.Fprintf(os.Stderr, "eunox kill: --killswitch-session-ttl has no effect with --revive, which removes a tombstone rather than writing one; drop one of the two\n")
-			return 1
+		// A tombstone lifetime is meaningless where no tombstone is written: --revive
+		// deletes one instead of creating it, and "all" activates the global switch,
+		// which carries no per-session expiry at all (setBlock only reads sessionKillTTL
+		// on its kill&&session path — see pkg/killswitch/redis.go). Accepting the flag
+		// silently in either case would suggest it did something it didn't.
+		if flagWasSet(fs, "killswitch-session-ttl") {
+			switch {
+			case *revive:
+				fmt.Fprintf(os.Stderr, "eunox kill: --killswitch-session-ttl has no effect with --revive, which removes a tombstone rather than writing one; drop one of the two\n")
+				return 1
+			case target == killTargetAll:
+				fmt.Fprintf(os.Stderr, "eunox kill: --killswitch-session-ttl has no effect on the 'all' target, which activates the global kill switch with no per-session expiry; drop one of the two\n")
+				return 1
+			}
 		}
 		if err := runRedisKill(redisKillRequest{
 			addr:           *redisAddr,
@@ -130,7 +139,7 @@ Flags:
 		}
 		return 0
 	}
-	for _, name := range []string{"redis-password", "redis-tls"} {
+	for _, name := range []string{"redis-password", "redis-tls", "killswitch-session-ttl"} {
 		if flagWasSet(fs, name) {
 			fmt.Fprintf(os.Stderr, "eunox kill: --%s requires --redis-addr; without it the kill silently uses the HTTP control endpoint instead of Redis\n", name)
 			return 1
@@ -248,7 +257,18 @@ func runRedisKill(req redisKillRequest) error {
 	// revive deletes rather than writes.
 	var opts []killswitch.RedisOption
 	if !req.revive && req.target != killTargetAll {
-		opts = append(opts, killswitch.WithSessionKillTTLEffective(resolveSessionKillTTL(ctx, rdb, req)))
+		// The published-TTL lookup gets its own, shorter budget carved out of the outer
+		// 10s: it is a coordination nicety, not the kill itself, and if it shared the
+		// full context a slow-but-not-down Redis could let the lookup consume most of
+		// the budget before the actual write below ever runs — turning a kill that
+		// would have succeeded pre-lookup into a timeout. On expiry
+		// ReadPublishedSessionKillTTL returns a context error, which resolveSessionKillTTL
+		// already treats like any other read failure: fall back to the local value and
+		// warn, never block the write.
+		ttlCtx, ttlCancel := context.WithTimeout(ctx, sessionKillTTLLookupTimeout)
+		effective := resolveSessionKillTTL(ttlCtx, rdb, req.sessionKillTTL, req.ttlFlagSet)
+		ttlCancel()
+		opts = append(opts, killswitch.WithSessionKillTTLEffective(effective))
 	}
 	ks := killswitch.NewRedis(rdb, opts...)
 
@@ -259,7 +279,7 @@ func runRedisKill(req redisKillRequest) error {
 		if err := ks.ActivateGlobal(ctx); err != nil {
 			return fmt.Errorf("activate global kill switch: %w", err)
 		}
-		fmt.Println(`{"ok":true,"killed":"all","via":"redis"}`)
+		printRedisResult("killed", killTargetAll)
 		return nil
 	}
 	if err := ks.KillSession(ctx, req.target); err != nil {
@@ -269,6 +289,10 @@ func runRedisKill(req redisKillRequest) error {
 	return nil
 }
 
+// sessionKillTTLLookupTimeout bounds the published-TTL GET inside runRedisKill's shared
+// 10s budget; see the call site for why it must be shorter than the outer context.
+const sessionKillTTLLookupTimeout = 3 * time.Second
+
 // reviveViaRedis lifts a revocation: for killTargetAll it deactivates the global switch
 // (the exact inverse of `kill all`), and otherwise removes one session's tombstone.
 //
@@ -276,7 +300,14 @@ func runRedisKill(req redisKillRequest) error {
 // the two are separate kill dimensions, and clearing sessions an operator revoked
 // individually while they only meant to lift the deployment-wide stop would be a
 // fail-open. Those are revived one id at a time.
-func reviveViaRedis(ctx context.Context, ks killswitch.Manager, target string) error {
+//
+// Takes the concrete *killswitch.Redis rather than the killswitch.Manager interface on
+// purpose: the "revive is reachable only via the Redis transport" invariant this PR's
+// other checks enforce at the CLI-flag layer (cmdKill's --redis-addr gate above) should
+// also hold structurally, so a future refactor cannot reuse this helper against an
+// in-memory or HTTP-proxy-held Manager and silently reintroduce an undo on the loopback
+// /control/kill path — which must never exist (see the --revive rejection in cmdKill).
+func reviveViaRedis(ctx context.Context, ks *killswitch.Redis, target string) error {
 	if target == killTargetAll {
 		if err := ks.DeactivateGlobal(ctx); err != nil {
 			return fmt.Errorf("deactivate global kill switch: %w", err)
@@ -304,53 +335,43 @@ func printRedisResult(verb, target string) {
 
 // resolveSessionKillTTL decides the lifetime this session tombstone is written with,
 // preferring the value the proxy published to Redis at startup over this command's own
-// flag.
+// flag. Takes only the two fields of redisKillRequest it actually reads (rather than the
+// whole struct) so a reader of the signature does not have to check the body to learn
+// this is independent of target/revive/addr/password/useTLS.
 //
 // The TTL is applied by whichever process writes the tombstone, and this command is one
 // of the two writers — the only out-of-band revocation channel a stdio proxy has. As two
 // independent flags they could disagree with no diagnostic, and the failure runs one
 // way: an expiring tombstone LIFTS the kill, re-admitting a session an operator revoked.
 // Adopting the published value removes the disagreement entirely for the common case
-// (no flag passed here at all).
-//
-// Where the two still disagree — an explicit flag against a published value — the
-// longer-lived of the two wins, with the mismatch reported. Erroring out would be the
-// wrong trade on an emergency-stop path: refusing to revoke because two lifetimes
-// disagree fails in the one direction that matters, while a too-long tombstone only ever
-// over-blocks a session id that is already gone. Every fallback is announced on stderr
-// so the resolved lifetime is never silent, and stdout stays the machine-readable
-// result line.
-func resolveSessionKillTTL(ctx context.Context, rdb goredis.Cmdable, req redisKillRequest) time.Duration {
-	local := killswitch.NormalizeSessionKillTTL(req.sessionKillTTL)
+// (no flag passed here at all). Where the two still disagree, the conflict itself is
+// resolved by killswitch.ResolveSessionKillTTLConflict — the exported decision policy, so
+// a future non-CLI writer of tombstones can reuse it rather than re-derive the direction.
+// Every fallback is announced on stderr so the resolved lifetime is never silent, and
+// stdout stays the machine-readable result line.
+func resolveSessionKillTTL(ctx context.Context, rdb goredis.Cmdable, sessionKillTTL time.Duration, ttlFlagSet bool) time.Duration {
+	local := killswitch.NormalizeSessionKillTTL(sessionKillTTL)
 	published, ok, err := killswitch.ReadPublishedSessionKillTTL(ctx, rdb)
 	switch {
 	case err != nil:
 		fmt.Fprintf(os.Stderr, "eunox kill: could not read the session-kill TTL published by the proxy (%v); writing this tombstone with %s. If the proxy runs a different --killswitch-session-ttl, this kill expires on its own schedule.\n", err, killswitch.DescribeSessionKillTTL(local))
 		return local
-	case !ok && !req.ttlFlagSet:
-		fmt.Fprintf(os.Stderr, "eunox kill: no proxy on this Redis has published a session-kill TTL; writing this tombstone with the default (%s). Restart the proxy to publish its value, or pass --killswitch-session-ttl to match it.\n", killswitch.DescribeSessionKillTTL(local))
-		return local
 	case !ok:
-		fmt.Fprintf(os.Stderr, "eunox kill: no proxy on this Redis has published a session-kill TTL; using --killswitch-session-ttl (%s), which must match the proxy's.\n", killswitch.DescribeSessionKillTTL(local))
+		if ttlFlagSet {
+			fmt.Fprintf(os.Stderr, "eunox kill: no proxy on this Redis has published a session-kill TTL; using --killswitch-session-ttl (%s), which must match the proxy's.\n", killswitch.DescribeSessionKillTTL(local))
+		} else {
+			fmt.Fprintf(os.Stderr, "eunox kill: no proxy on this Redis has published a session-kill TTL; writing this tombstone with the default (%s). Restart the proxy to publish its value, or pass --killswitch-session-ttl to match it.\n", killswitch.DescribeSessionKillTTL(local))
+		}
 		return local
-	case !req.ttlFlagSet:
+	case !ttlFlagSet:
 		fmt.Fprintf(os.Stderr, "eunox kill: session-kill TTL %s (published by the proxy on this Redis).\n", killswitch.DescribeSessionKillTTL(published))
 		return published
-	case published == local:
-		return local
 	default:
-		effective := longerTombstone(published, local)
-		fmt.Fprintf(os.Stderr, "eunox kill: session-kill TTL mismatch — the proxy published %s, --killswitch-session-ttl says %s; writing this tombstone with %s, the longer-lived of the two, so it cannot expire before the proxy's own kills. Align the two values.\n",
-			killswitch.DescribeSessionKillTTL(published), killswitch.DescribeSessionKillTTL(local), killswitch.DescribeSessionKillTTL(effective))
+		effective, mismatch := killswitch.ResolveSessionKillTTLConflict(local, published)
+		if mismatch {
+			fmt.Fprintf(os.Stderr, "eunox kill: session-kill TTL mismatch — the proxy published %s, --killswitch-session-ttl says %s; writing this tombstone with %s, the longer-lived of the two, so it cannot expire before the proxy's own kills. Align the two values.\n",
+				killswitch.DescribeSessionKillTTL(published), killswitch.DescribeSessionKillTTL(local), killswitch.DescribeSessionKillTTL(effective))
+		}
 		return effective
 	}
-}
-
-// longerTombstone returns whichever effective lifetime keeps a tombstone alive longer,
-// where zero means it never expires and therefore outlives every finite value.
-func longerTombstone(a, b time.Duration) time.Duration {
-	if a <= 0 || b <= 0 {
-		return 0
-	}
-	return max(a, b)
 }

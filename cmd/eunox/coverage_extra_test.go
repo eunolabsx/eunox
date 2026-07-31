@@ -4,7 +4,7 @@
 // Additional subcommand coverage. These tests target the under-covered error
 // and success branches of the CLI subcommands and their pure helpers, driving
 // the exported-by-package-main functions directly (validateConfigRoutes,
-// killViaRedis, the doctor section writers, the suggest/init pure helpers) and
+// runRedisKill, the doctor section writers, the suggest/init pure helpers) and
 // the subcommands through their return-without-os.Exit paths.
 
 package main

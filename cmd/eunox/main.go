@@ -612,6 +612,16 @@ func cmdProxy(args []string) (exitCode int) {
 	}()
 
 	if ksRedis != nil {
+		// Publish the effective session-kill TTL here, not from
+		// buildCallCounterAndKillSwitch: everything that can still fail this process's
+		// startup and exit it (JWT/Redis flag validation, the Redis ping, opening the
+		// audit sink) has already run and succeeded by this point. Publishing any
+		// earlier risks the same bug already fixed once for the control-token file — a
+		// second, differently-configured instance overwrites a running proxy's
+		// published value and then dies before serving a single request, leaving
+		// `eunox kill` and this proxy's own diagnostics trusting a lifetime nothing is
+		// actually enforcing.
+		publishSessionKillTTL(ksRedis)
 		ksRedis.Start(ctx)
 		// Join the Redis kill-switch's pub/sub listener and reconcile loop on
 		// shutdown; otherwise they outlive cmdProxy and may touch the shared Redis
@@ -725,7 +735,8 @@ func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, ki
 		// running a pinned, reused --session-id needs to see the number without having to
 		// know the flag exists to ask for it.
 		fmt.Fprintf(os.Stderr, "[eunox] Kill switch: %s (--killswitch-session-ttl). Agent kills never expire.\n", sessionKillTTLNotice(killswitchSessionTTL))
-		publishSessionKillTTL(ksRedis)
+		// The TTL is published later, from cmdProxy, once startup is past every step
+		// that can still fail and exit the process — see that call site.
 	}
 	return counter, flowStore, ks, ksRedis, nil
 }
