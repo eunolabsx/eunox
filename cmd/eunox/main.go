@@ -557,7 +557,7 @@ func cmdProxy(args []string) (exitCode int) {
 
 	// Open the shared audit sink. The config's audit block takes precedence over
 	// the CLI flags so every route shares one tape.
-	sink, err := openConfiguredAuditSink(*f.auditLog, *f.auditKeyPath, *f.auditRotateSize, *f.auditRetainRotated, cfg, f.requireAudit.required())
+	sink, err := openConfiguredAuditSink(*f.auditLog, *f.auditKeyPath, *f.auditRotateSize, *f.auditRetainRotated, flagWasSet(fs, "audit-retain"), cfg, f.requireAudit.required())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[eunox] Fatal: %v\n", err)
 		return 1
@@ -752,7 +752,7 @@ func sessionKillTTLNotice(ttl time.Duration) string {
 // the sink. Under --require-audit an open failure is returned as an error for the
 // caller to exit on (fail closed); otherwise it warns and returns a nil sink with a
 // nil error, so the proxy continues unaudited.
-func openConfiguredAuditSink(auditLog, auditKeyPath string, auditRotateSize int64, auditRetainRotated int, cfg *config.GatewayConfig, requireAudit bool) (*audit.Sink, error) {
+func openConfiguredAuditSink(auditLog, auditKeyPath string, auditRotateSize int64, auditRetainRotated int, auditRetainSet bool, cfg *config.GatewayConfig, requireAudit bool) (*audit.Sink, error) {
 	auditLogPath, auditKey, auditRotate := auditLog, auditKeyPath, auditRotateSize
 	auditRetain := auditRetainRotated
 	// The config's audit block takes precedence over an explicit --audit-log/
@@ -775,7 +775,17 @@ func openConfiguredAuditSink(auditLog, auditKeyPath string, auditRotateSize int6
 		}
 		auditKey = cfg.Audit.KeyPath
 	}
+	// Warn on a silently-overridden explicit flag here too. These two are overridden by
+	// the same config-wins rule as --audit-log/--audit-key-path above, and an operator who
+	// passed a rotation size or retention count and got the config's instead has exactly
+	// the same "why wasn't my flag honored" question — it was only the two string flags
+	// that said so.
 	if cfg.Audit.RotateSizeBytes > 0 {
+		// 0 is this flag's "use the built-in default" spelling, so a non-zero value is an
+		// explicit one (same test the string flags use against "").
+		if auditRotateSize > 0 && auditRotateSize != cfg.Audit.RotateSizeBytes {
+			fmt.Fprintf(os.Stderr, "[eunox] WARNING: --audit-rotate-size %d is overridden by the config's audit.rotateSizeBytes %d; the config's audit block always takes precedence for `proxy` so every route shares one tape.\n", auditRotateSize, cfg.Audit.RotateSizeBytes)
+		}
 		auditRotate = cfg.Audit.RotateSizeBytes
 	}
 	// A present config value wins, including an explicit 0 ("keep all rotated files"),
@@ -783,6 +793,13 @@ func openConfiguredAuditSink(auditLog, auditKeyPath string, auditRotateSize int6
 	// the flag's value in force. config.ResolveInt holds exactly this precedence rule
 	// (shared with maxSessions/sessionIdleTimeout), so the audit-retention path cannot
 	// drift from the other resolved options.
+	//
+	// Explicitness comes from auditRetainSet (flagWasSet), not from a non-zero value: 0 is
+	// a MEANINGFUL setting here ("keep all"), so an operator can be overridden while
+	// passing the flag's zero value.
+	if cfg.Audit.RetainRotated != nil && auditRetainSet && *cfg.Audit.RetainRotated != auditRetain {
+		fmt.Fprintf(os.Stderr, "[eunox] WARNING: --audit-retain %d is overridden by the config's audit.retainRotated %d; the config's audit block always takes precedence for `proxy` so every route shares one tape.\n", auditRetain, *cfg.Audit.RetainRotated)
+	}
 	auditRetain = config.ResolveInt(cfg.Audit.RetainRotated, auditRetain)
 	sink, err := audit.Open(auditLogPath, auditKey, auditRotate, auditRetain, audit.WithIdentity(pdp.AuditIdentityFromContext))
 	if err != nil {
@@ -994,6 +1011,11 @@ var redisGatedFlags = []string{
 //     silently disables the documented cap (a fail-open the config leg refuses).
 //   - --shutdown-timeout: the transports clamp a non-positive value to the 5000ms
 //     default, so a negative silently becomes the opposite of a "shorter grace" intent.
+//   - --upstream-timeout: this one has a legitimate NEGATIVE sentinel
+//     (transport.UpstreamTimeoutUnset, -1) meaning "defer to the config", so only values
+//     BELOW it are rejected. ResolveUpstreamTimeout defers on any negative, so a sign typo
+//     for a 5s bound (--upstream-timeout -5000) silently became the 30s default — the
+//     same silent-opposite-of-intent the other three guards exist to catch.
 //
 // Returns the first offending flag's error (without the "eunox proxy: " prefix the caller
 // adds), or nil. A pure function so every guard is unit-testable independently of
@@ -1009,6 +1031,8 @@ func validateProxyNumericFlags(f *proxyCLIFlags) error {
 		return errors.New("--max-call-counter-keys must be >= 0 (0 = unbounded)")
 	case *f.shutdownTimeout < 0:
 		return errors.New("--shutdown-timeout must be >= 0 (0 = use the default)")
+	case *f.upstreamTimeout < transport.UpstreamTimeoutUnset:
+		return fmt.Errorf("--upstream-timeout must be >= %d (0 disables the timeout, %d defers to the config); a value below that is not a sentinel and would silently defer instead of setting the bound you meant", transport.UpstreamTimeoutUnset, transport.UpstreamTimeoutUnset)
 	}
 	return nil
 }

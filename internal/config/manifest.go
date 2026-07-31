@@ -134,6 +134,20 @@ func LoadManifest(path string) (*LocalManifest, error) {
 	if err := rejectExtraYAMLDocuments(dec, path, what); err != nil {
 		return nil, err
 	}
+	// Gate on the declared grammar version FIRST, before any guard that INTERPRETS the
+	// content, mirroring LoadGatewayConfig's pre-decode probe. The scalar-coercion guard
+	// below reads condition values under the 0.1 grammar, so a manifest declaring a future
+	// version was reported as (say) a scalar that must be quoted — sending the operator to
+	// fix a spelling in a correctly-spelled file while the real problem is that the whole
+	// document is a dialect this binary does not speak. Read straight off the parsed node,
+	// which is tolerant of everything else in the document; a document with no top-level
+	// schemaVersion scalar simply falls through to the authoritative post-decode check
+	// below, which stays the one that decides.
+	if v, ok := schemaVersionFromNode(&node); ok {
+		if err := validateManifestSchemaVersion(v); err != nil {
+			return nil, fmt.Errorf("invalid manifest %q: %w", path, err)
+		}
+	}
 	forceTimestampsToStrings(&node)
 	forceSchemaVersionToString(&node)
 	// Reject a scalar in a condition values:/enum: list that auto-typed away from
@@ -221,6 +235,31 @@ func rejectCoercedScalarsForFormat(node *yaml.Node, isJSON bool, path string) er
 // keeps the verbatim text, so "0.10" stays "0.10" (≠ "0.1") rather than renormalizing;
 // an unsupported unquoted value (e.g. 1) then reaches the version check and is rejected
 // with a clear "unsupported version" error instead of a decode error.
+// schemaVersionFromNode reads the top-level schemaVersion scalar's SOURCE TEXT off the
+// parsed document, reporting whether the key was present as a scalar. It exists so the
+// grammar-version gate can run before any guard that interprets the document's content
+// under the current grammar (see LoadManifest); it reads Value, so it is independent of
+// the !!int/!!float retag forceSchemaVersionToString applies.
+func schemaVersionFromNode(node *yaml.Node) (string, bool) {
+	doc := node
+	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 {
+		doc = doc.Content[0]
+	}
+	if doc.Kind != yaml.MappingNode {
+		return "", false
+	}
+	for i := 0; i+1 < len(doc.Content); i += 2 {
+		key, val := doc.Content[i], doc.Content[i+1]
+		if key.Kind == yaml.ScalarNode && key.Value == "schemaVersion" {
+			if val.Kind != yaml.ScalarNode {
+				return "", false
+			}
+			return val.Value, true
+		}
+	}
+	return "", false
+}
+
 func forceSchemaVersionToString(node *yaml.Node) {
 	doc := node
 	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 {

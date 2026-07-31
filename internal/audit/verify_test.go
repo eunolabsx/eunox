@@ -96,6 +96,34 @@ func TestVerifyAuditLog_EmptyKeyIDNoKeysIsUnverifiable(t *testing.T) {
 	}
 }
 
+// TestVerifyAuditLog_MalformedTimeReportedOnUnverifiableRecord: the signed `time` field is
+// validated for every signed record, but the UNKNOWN_KEY_ID and UNVERIFIABLE arms return
+// before classify's own malformed-time case runs, so a record that was BOTH signed with an
+// absent key AND carries an unparseable time lost the second finding entirely. The
+// diagnostic is emitted on those arms too — without counting, since the record is already
+// tallied in its own bucket.
+func TestVerifyAuditLog_MalformedTimeReportedOnUnverifiableRecord(t *testing.T) {
+	t.Parallel()
+	key := nonZeroTestKey()
+	line := signTestRecord(t, key, auditRecord{
+		ClassUID: 6003, CategoryUID: 6, ActivityID: 1,
+		Time: "not-a-timestamp", Seq: 1, RequestID: "r",
+		Decision: "allow", PrevHMAC: auditGenesisPrev,
+	})
+
+	var out strings.Builder
+	res, err := VerifyLog(bytes.NewReader(line), &Sink{verifyKeys: map[string][]byte{}}, "", time.Time{}, &out)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if res.Unverifiable != 1 || res.Invalid != 0 {
+		t.Fatalf("got %+v, want Unverifiable=1 Invalid=0 (the time diagnostic must not double-count)", res)
+	}
+	if !strings.Contains(out.String(), "unparseable time field") {
+		t.Errorf("expected the unparseable-time diagnostic alongside UNVERIFIABLE, got %q", out.String())
+	}
+}
+
 // TestInterpretAuditTail_FileShrinkReportsError: when Stat
 // saw a non-empty file but ReadAt returns zero bytes with io.EOF (the file was
 // truncated/rotated out from under us between the two syscalls), interpretAuditTail

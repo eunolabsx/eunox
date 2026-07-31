@@ -975,6 +975,17 @@ func ParseToolsListResult(raw json.RawMessage) ([]UpstreamTool, error) {
 	// Surfacing it as a parse error routes it through driftProbeUnavailable, which is
 	// exactly the right policy: fatal when the manifest carries descriptionHash pins
 	// (integrity cannot be verified), an observable skip otherwise.
+	//
+	// The ENVELOPE gets the same treatment as the entries, and not only because its one
+	// in-tree producer already pre-screens: this function is exported and documented as
+	// decoding "the raw JSON result from a tools/list response", so a caller added later
+	// hands it bytes nothing has screened. Raw bytes carrying a case-variant "Tools" or a
+	// duplicated "tools" decode silently to ONE array here — Go binds by a case-folding
+	// match and keeps the last — which is the same catalog-substitution bypass
+	// ToolsKeyAmbiguous was exported to close on the runtime list path.
+	if pdp.ToolsKeyAmbiguous(raw) {
+		return nil, fmt.Errorf("tools/list result carries an ambiguous \"tools\" key (duplicated, case-variant, or both); refusing to trust the decode")
+	}
 	var envelope struct {
 		Tools []json.RawMessage `json:"tools"`
 	}

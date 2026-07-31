@@ -1426,6 +1426,23 @@ func TestParseToolsListResult_InvalidJSON(t *testing.T) {
 	}
 }
 
+// TestParseToolsListResult_AmbiguousToolsKey: an envelope carrying two spellings of the
+// list key decodes silently to ONE array (Go binds by a case-folding match and keeps the
+// last), so an upstream can serve a benign catalog to the decoder while a case-sensitive
+// host renders the other. The function is exported and takes raw bytes, so it refuses the
+// shape itself rather than trusting every caller to pre-screen it.
+func TestParseToolsListResult_AmbiguousToolsKey(t *testing.T) {
+	t.Parallel()
+	for _, body := range []string{
+		`{"tools":[{"name":"safe"}],"Tools":[{"name":"evil"}]}`,
+		`{"tools":[{"name":"safe"}],"tools":[{"name":"evil"}]}`,
+	} {
+		if _, err := ParseToolsListResult(json.RawMessage(body)); err == nil {
+			t.Errorf("an ambiguous tools key must be refused, not decoded: %s", body)
+		}
+	}
+}
+
 // TestDriftWarning_LogLine_Default covers the default case in LogLine().
 func TestDriftWarning_LogLine_Default(t *testing.T) {
 	t.Parallel()
