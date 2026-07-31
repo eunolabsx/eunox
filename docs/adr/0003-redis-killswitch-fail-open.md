@@ -202,8 +202,34 @@ refine what "cannot confirm" means, so a health probe and the data plane agree o
   can outlive it. That is why the lifetime is a flag rather than a constant, why it
   is stated on stderr at startup even at its default, and why a negative value
   restores permanent tombstones. Never lower it below the longest session the
-  deployment can hold open. Cleanup before expiry is still `ReviveSession` or
-  `Reset`.
+  deployment can hold open.
+
+- **The lifetime has one source of truth, published by the proxy.** The proxy is
+  not the only process that writes tombstones: `eunox kill --redis-addr` writes
+  them directly, because that is the sole out-of-band revocation channel a stdio
+  proxy has. The TTL is stamped by whichever process performs the write, so as two
+  independently configured flags the pair could disagree with no diagnostic — and
+  the disagreement failed one way, with the CLI's own default expiring a kill the
+  operator had configured to outlast it. The proxy now publishes its effective
+  lifetime to a `killswitch:config:` key at startup and the CLI adopts it, so no
+  flag has to be repeated. A remaining explicit disagreement resolves to the
+  longer-lived of the two and is reported: refusing to revoke over a lifetime
+  mismatch would fail in the one direction that matters, while an over-long
+  tombstone only over-blocks a session id that is already gone. The key is
+  last-writer-wins across instances, which the publisher reports when it replaces a
+  differing value.
+
+- **A revocation can be lifted from the CLI.** `eunox kill --revive
+  <session-id|all> --redis-addr <addr>` removes a session tombstone, or
+  deactivates the global switch, wiring the `ReviveSession` / `DeactivateGlobal`
+  manager methods that were previously reachable only by a library consumer. It
+  matters most in the permanent-tombstone mode above, where nothing expires and the
+  only remediation was deleting keys in `redis-cli`. It is deliberately Redis-only:
+  the loopback `/control/kill` endpoint is a one-way emergency stop, and giving a
+  same-host caller that reaches it an undo would let it lift the very revocation
+  issued against it. Lifting the global switch leaves per-session tombstones in
+  place — they are separate kill dimensions, and clearing both would be a
+  fail-open.
 
 ## Alternatives considered
 

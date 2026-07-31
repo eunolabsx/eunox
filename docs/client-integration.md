@@ -389,8 +389,9 @@ eunox proxy --config gateway.yaml --unsafe-bind-all --redis-addr redis.internal:
 single command fans a kill out to **every** instance on that Redis:
 
 ```bash
-eunox kill --redis-addr redis.internal:6379 all          # revoke every live session
-eunox kill --redis-addr redis.internal:6379 <session-id> # revoke one
+eunox kill --redis-addr redis.internal:6379 all             # revoke every live session
+eunox kill --redis-addr redis.internal:6379 <session-id>    # revoke one
+eunox kill --redis-addr redis.internal:6379 --revive <id>   # lift a revocation
 ```
 
 (A single-instance gateway can instead use the loopback `/control/kill`
@@ -754,6 +755,45 @@ reaching it — for stdio that means the `--redis-addr` row above — hard-block
 wiretap session too. A stdio proxy on the default in-memory switch has no
 out-of-band kill channel (stop the process), so this only changes behavior for a
 `--redis-addr` deployment.
+
+### Lifting a revocation
+
+`eunox kill --revive <session-id|all> --redis-addr <host:port>` undoes a kill:
+a session id may connect again, and `all` deactivates the global kill switch.
+Lifting the global switch leaves per-session kills in place — they are separate
+dimensions, so revive those by id.
+
+It is Redis-only. The loopback `/control/kill` endpoint is a one-way emergency
+stop with no undo (a same-host caller holding the control token must not be able
+to lift the revocation issued against it), and a proxy on the default in-memory
+kill switch is cleared by restarting it.
+
+Revive matters most with a negative `--killswitch-session-ttl`, where tombstones
+never expire and would otherwise have to be deleted by hand in `redis-cli`.
+Note that a kill or revive written over Redis is *not* recorded on the proxy's
+audit tape — the CLI is a separate process with no sink, and the kill's effect
+shows up as the `KILL_SWITCH` denials that follow it. Only the HTTP
+`/control/kill` endpoint records the activation itself. Treat write access to
+the shared Redis as equivalent to control of the kill switch.
+
+### One TTL, one place
+
+Both the proxy and `eunox kill --redis-addr` write session tombstones, and the
+expiry is stamped by whichever one performs the write. The proxy publishes the
+lifetime it runs with to Redis at startup and `eunox kill` adopts it, so
+`--killswitch-session-ttl` belongs on `eunox proxy` and does not need to be
+repeated on the kill command:
+
+```bash
+eunox proxy --config gateway.yaml --redis-addr redis.internal:6379 \
+  --killswitch-session-ttl -1s                         # tombstones never expire
+eunox kill --redis-addr redis.internal:6379 <id>       # adopts it; no flag needed
+```
+
+Passing the flag to `eunox kill` anyway still works — for a Redis no proxy has
+started against yet, or to override deliberately. If it disagrees with the
+published value, the longer-lived of the two is used (a revocation must never
+expire early) and the mismatch is printed on stderr.
 
 ---
 

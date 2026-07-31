@@ -199,22 +199,22 @@ func TestValidateConfigRoutes_LiveAllowAllRouteNoManifest(t *testing.T) {
 	}
 }
 
-// ───────────────────────── killViaRedis (error paths) ──────────────────────
+// ───────────────────────── runRedisKill (error paths) ──────────────────────
 
-// TestKillViaRedis_PingFailure covers the ping-failure return: the Redis client
+// TestRunRedisKill_PingFailure covers the ping-failure return: the Redis client
 // is built, but the address is unreachable so pingRedis errors out before any
 // kill-switch write.
-func TestKillViaRedis_PingFailure(t *testing.T) {
+func TestRunRedisKill_PingFailure(t *testing.T) {
 	// 127.0.0.1:1 is reserved/unbound; the dial fails fast.
-	err := killViaRedis("127.0.0.1:1", "", false, 0, "sess-x")
+	err := runRedisKill(redisKillRequest{addr: "127.0.0.1:1", target: "sess-x"})
 	if err == nil {
 		t.Fatal("expected an error pinging an unreachable redis, got nil")
 	}
 }
 
-// TestKillViaRedis_EmptyAddr covers the buildRedisClient error wrapping branch.
-func TestKillViaRedis_EmptyAddr(t *testing.T) {
-	err := killViaRedis("", "", false, 0, "all")
+// TestRunRedisKill_EmptyAddr covers the buildRedisClient error wrapping branch.
+func TestRunRedisKill_EmptyAddr(t *testing.T) {
+	err := runRedisKill(redisKillRequest{target: "all"})
 	if err == nil {
 		t.Fatal("expected an error for an empty redis addr, got nil")
 	}
@@ -223,22 +223,22 @@ func TestKillViaRedis_EmptyAddr(t *testing.T) {
 	}
 }
 
-// TestKillViaRedis_AllAndSessionSucceed re-covers the success branches through
+// TestRunRedisKill_AllAndSessionSucceed re-covers the success branches through
 // the function under test: the cmdKill redis tests reach it via flag parsing, so
-// this drives killViaRedis directly and hits the "all" and per-session legs
+// this drives runRedisKill directly and hits the "all" and per-session legs
 // without depending on how the flags are spelled.
-func TestKillViaRedis_AllAndSessionSucceed(t *testing.T) {
+func TestRunRedisKill_AllAndSessionSucceed(t *testing.T) {
 	mr := miniredis.RunT(t)
 
-	if err := killViaRedis(mr.Addr(), "", false, 0, "all"); err != nil {
-		t.Fatalf("killViaRedis all: %v", err)
+	if err := runRedisKill(redisKillRequest{addr: mr.Addr(), target: "all"}); err != nil {
+		t.Fatalf("runRedisKill all: %v", err)
 	}
 	if got, err := mr.Get("killswitch:global"); err != nil || got != "1" {
 		t.Errorf("global kill not set: got %q err=%v", got, err)
 	}
 
-	if err := killViaRedis(mr.Addr(), "", false, 0, "sess-direct"); err != nil {
-		t.Fatalf("killViaRedis session: %v", err)
+	if err := runRedisKill(redisKillRequest{addr: mr.Addr(), target: "sess-direct"}); err != nil {
+		t.Fatalf("runRedisKill session: %v", err)
 	}
 	if got, err := mr.Get("killswitch:session:sess-direct"); err != nil || got != "1" {
 		t.Errorf("session kill not set: got %q err=%v", got, err)
