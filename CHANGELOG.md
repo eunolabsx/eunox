@@ -59,6 +59,25 @@ Section conventions:
 
 ### Changed
 
+- **`eunox audit-verify` is roughly 40% faster per record**, with no change to what it
+  accepts or rejects. It is the tool an incident responder points at a full retained
+  archive, so its per-record cost is paid exactly when the record count is largest and
+  the answer is most time-sensitive. Every line was being JSON-decoded **twice** — once
+  leniently, to count it and place it in the tamper-evident chain, and again strictly
+  inside the HMAC recompute — which alone was ~35-39% of the per-record cost. The two
+  are now one decode on the path every well-formed record takes; the lenient decode is
+  reached only by a line the strict pass rejects, so the leniency difference is
+  preserved on purpose (a record carrying an unknown top-level field is still counted
+  and still holds its place in the chain, while still being one no verifier may accept)
+  rather than as a side effect of two decoders existing. Two smaller allocations in the
+  same loop went with it: each key tried used to re-derive the digest through a fresh
+  hex string and convert it back to bytes to compare, where the comparison now refills
+  one buffer per record (3 allocations per key per record, multiplied by the ring size
+  for a record naming no `key_id`), and the canonical-on-disk-form check no longer
+  rebuilds a constant-shaped `_hmac` suffix per record. A line that is not a record at
+  all — a truncated or padded one — is still decoded once rather than twice, so a
+  corrupted archive does not pay for the split. End to end over a signed log:
+  58 -> 32 allocations per record.
 - The `/control/kill` activation record is written after the kill-store write but
   **before** the SSE eviction and session teardown, which reclaim resources rather than
   effect the stop. The kill is in force the moment the store write returns, while the
