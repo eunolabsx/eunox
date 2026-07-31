@@ -99,10 +99,14 @@ type killSubject struct {
 	// verified is the registry-resolved session id, stamped into session_id. Empty for a
 	// claimed subject.
 	verified string
-	// req carries the Mcp-Session-Id header a client CLAIMED, for a claimed subject; nil
-	// for a verified one. Held as the request rather than the extracted header string so
-	// the bounding/sanitizing rule stays with its single owner, addClaimedSessionID.
-	req *http.Request
+	// claimed is the (not yet sanitized) Mcp-Session-Id header value for a claimed
+	// subject, read once at construction; empty for a verified subject AND for a claimed
+	// one whose header was absent — auditDetails treats both identically (no detail
+	// added), so the two cases need no separate tag. Held as the already-extracted string
+	// rather than the *http.Request: every claimedSession(r) call site already reads this
+	// exact header into its own local sessionID before constructing the subject, so
+	// storing the request would only defer a second, redundant read to record time.
+	claimed string
 }
 
 // verifiedSession names a session THIS proxy established, whose id is therefore safe to
@@ -114,22 +118,26 @@ func verifiedSession(id string) killSubject { return killSubject{verified: id} }
 // claimedSession names the session id a client claimed in r's Mcp-Session-Id header at a
 // call site that has NOT resolved it against the registry — including one where no session
 // exists at all (a session-creating initialize), where the header is absent and this
-// contributes no detail. Its id never reaches session_id; see killSubject.
-func claimedSession(r *http.Request) killSubject { return killSubject{req: r} }
+// contributes no detail. Its id never reaches session_id; see killSubject. r is read
+// immediately (not retained): the constructor still takes *http.Request rather than a
+// bare string, so a call site cannot spell "this header is verified" by handing
+// claimedSession something that merely looks like a session id.
+func claimedSession(r *http.Request) killSubject {
+	return killSubject{claimed: r.Header.Get(SessionHeader)}
+}
 
 // auditSessionID is the value for the record's structured, signed session_id field: the
 // verified id, or empty for a claimed subject.
 func (k killSubject) auditSessionID() string { return k.verified }
 
 // auditDetails folds a claimed subject's unverified id into base as
-// details.claimed_session_id (bounded and sanitized by addClaimedSessionID), and returns
-// base untouched for a verified subject, whose id is already in session_id. base may be
-// nil; addClaimedSessionID allocates only when there is something to record.
+// details.claimed_session_id (bounded and sanitized by addClaimedSessionIDValue), and
+// returns base untouched for a verified subject (k.claimed is always "" there) or a
+// claimed subject whose header was empty — both are a no-op through the same call, so
+// this needs no branch distinguishing them. base may be nil; addClaimedSessionIDValue
+// allocates only when there is something to record.
 func (k killSubject) auditDetails(base map[string]interface{}) map[string]interface{} {
-	if k.req == nil {
-		return base
-	}
-	return addClaimedSessionID(base, k.req)
+	return addClaimedSessionIDValue(base, k.claimed)
 }
 
 // recordKillDenial records a kill-switch denial and builds the host-facing denial

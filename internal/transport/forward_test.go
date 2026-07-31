@@ -2270,45 +2270,19 @@ func killDeny() *capability.EnforceResponse {
 	}
 }
 
-// TestKillSubject_VerifiedVsClaimed pins the whole point of the killSubject type: which
-// field of a kill-switch audit record a session id is allowed to reach. A verified subject
-// (an id this proxy established) populates the structured, signed session_id; a claimed one
-// (the raw Mcp-Session-Id header of a request whose session was never resolved) leaves
-// session_id EMPTY and survives only as the unverified details.claimed_session_id. The two
-// constructors are the only way to build one, so a call site cannot spell "this header is
-// verified" — and the zero value degrades to recording less, never to asserting more.
+// TestKillSubject_VerifiedVsClaimed pins killSubject's two edge cases that no other test
+// covers: a claimed subject built from a request that never carried the header at all
+// (the session-creating-initialize shape), and a hand-built zero value bypassing both
+// constructors. The routing fact itself — verified populates the signed session_id,
+// claimed leaves it EMPTY and survives only as the unverified details.claimed_session_id
+// — is pinned one layer up, against the real recorders, by
+// TestRecordKillDenial_SubjectRoutesTheSessionID and TestRecordKillDrop_SubjectRoutesTheSessionID
+// (and, end-to-end through handleSessionPost, by
+// TestHandleSessionPost_UnresolvedSessionKillDeny_DoesNotForgeSessionID and its Drop
+// counterpart in http_test.go); asserting it a third time here against the bare methods
+// would just be the same fact under a third name.
 func TestKillSubject_VerifiedVsClaimed(t *testing.T) {
 	t.Parallel()
-
-	claimedReq := newTestRequestWithSession("victim-real-session-id")
-
-	t.Run("verified stamps session_id and adds no claim", func(t *testing.T) {
-		t.Parallel()
-		subj := verifiedSession("sess-1")
-		assert.Equal(t, "sess-1", subj.auditSessionID())
-		assert.Nil(t, subj.auditDetails(nil), "a verified subject invents no details")
-		base := map[string]interface{}{"transport": "http-notification"}
-		assert.Equal(t, base, subj.auditDetails(base),
-			"a verified id belongs in session_id only; it must not be duplicated into details")
-	})
-
-	t.Run("claimed leaves session_id empty", func(t *testing.T) {
-		t.Parallel()
-		subj := claimedSession(claimedReq)
-		assert.Empty(t, subj.auditSessionID(),
-			"an unverified header must never reach the signed session_id field")
-		details := subj.auditDetails(nil)
-		require.NotNil(t, details, "the claimed value must survive for correlation")
-		assert.Equal(t, "victim-real-session-id", details["claimed_session_id"])
-	})
-
-	t.Run("claimed preserves the caller's details", func(t *testing.T) {
-		t.Parallel()
-		details := claimedSession(claimedReq).auditDetails(map[string]interface{}{"transport": "http-notification"})
-		assert.Equal(t, "http-notification", details["transport"],
-			"folding in the claim must not displace the transport leg")
-		assert.Equal(t, "victim-real-session-id", details["claimed_session_id"])
-	})
 
 	t.Run("claimed with no header contributes nothing", func(t *testing.T) {
 		t.Parallel()

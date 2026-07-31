@@ -492,7 +492,15 @@ func boundedRefusalDetail(s string) string {
 }
 
 func addClaimedSessionID(details map[string]interface{}, r *http.Request) map[string]interface{} {
-	claimed := r.Header.Get(SessionHeader)
+	return addClaimedSessionIDValue(details, r.Header.Get(SessionHeader))
+}
+
+// addClaimedSessionIDValue is addClaimedSessionID's request-independent core: every rule
+// (empty-header no-op, nil-details allocation, sanitize/bound, the truncated flag) lives
+// here once, so a caller that already holds the extracted header value — killSubject,
+// which stores the string rather than the *http.Request precisely to avoid re-deriving it
+// — gets the identical treatment through one call instead of a second implementation.
+func addClaimedSessionIDValue(details map[string]interface{}, claimed string) map[string]interface{} {
 	if claimed == "" {
 		return details
 	}
