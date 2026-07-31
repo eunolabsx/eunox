@@ -317,7 +317,9 @@ type countingHandler struct {
 
 func (h *countingHandler) Enabled(context.Context, slog.Level) bool { return true }
 
-func (h *countingHandler) Handle(_ context.Context, rec slog.Record) error {
+// The by-value slog.Record is mandated by the slog.Handler interface, so gocritic's
+// hugeParam advice cannot be taken here.
+func (h *countingHandler) Handle(_ context.Context, rec slog.Record) error { //nolint:gocritic // hugeParam: slog.Handler fixes this signature
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.msgs = append(h.msgs, rec.Message)

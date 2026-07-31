@@ -473,6 +473,72 @@ func (p *HTTPProxy) warnForwardedForPosture() {
 
 // Serve starts the HTTP server and blocks until ctx is canceled or a fatal
 // error occurs.
+// Serve starts the HTTP server and blocks until ctx is canceled or a fatal
+// error occurs.
+// runAfterListen runs the post-bind startup hook under a bound, closing ln and returning
+// an error if it cannot complete. Split out of Serve so the bound and its abandonment
+// rules sit together in one readable unit rather than as a block in the middle of server
+// assembly.
+//
+// Between net.Listen returning and srv.Serve starting the accept loop, the kernel
+// completes handshakes into the backlog for a socket no userspace is reading, so a request
+// arriving in this window HANGS rather than being refused. The hook's slowest step is an
+// fsync, which has no upper bound on a contended volume or a stalled mount.
+//
+// The hook therefore runs on its own goroutine and the select ABANDONS it on expiry.
+// Passing the bounded context and calling the hook synchronously would not bound anything:
+// Go cannot interrupt a blocked fsync, so the deadline would only be observed after the
+// stall had already ended -- the same hang, plus a new startup failure. Abandoning is what
+// makes the window finite, and it is safe precisely because WriteControlTokenFile
+// re-checks the context immediately before its publishing rename: an abandoned write
+// cannot land later and clobber the token of whatever proxy is actually serving.
+func (p *HTTPProxy) runAfterListen(ctx context.Context, ln net.Listener) error {
+	if p.afterListen == nil {
+		return nil
+	}
+	hook := p.afterListen
+	// Drop the reference before running it, not after: Serve blocks for the life of the
+	// process, so a hook that never returns (or the p itself outliving this call) would
+	// otherwise pin the hook's closed-over state -- e.g. a control-token path string, or
+	// whatever a future caller captures -- in the heap for no further purpose once this
+	// one-shot startup effect has fired.
+	p.afterListen = nil
+
+	budget := p.afterListenBudget
+	if budget <= 0 {
+		budget = afterListenTimeout
+	}
+	hookCtx, cancelHook := context.WithTimeout(ctx, budget)
+	defer cancelHook()
+	hookDone := make(chan error, 1) // buffered: an abandoned hook must never block on send
+	go func() { hookDone <- hook(hookCtx) }()
+
+	var hookErr error
+	select {
+	case hookErr = <-hookDone:
+	case <-hookCtx.Done():
+		hookErr = fmt.Errorf("post-bind startup did not complete within %s: %w", budget, hookCtx.Err())
+	}
+	if hookErr == nil {
+		return nil
+	}
+	_ = ln.Close()
+	// A hook cut short by SHUTDOWN is not a startup failure. Serve's ctx is cancelled by
+	// the signal handler, and hookCtx inherits that, so without this an operator who stops
+	// the proxy during startup would get a fatal error and a non-zero exit where the
+	// process previously shut down cleanly -- enough to make a restart-on-failure
+	// supervisor loop during a rollout. A genuine expiry (ctx still live, deadline hit)
+	// still fails Serve, which is the right direction on the merits: the hook persists the
+	// control token, and a proxy whose emergency stop cannot be authenticated should not
+	// come up.
+	if ctx.Err() != nil {
+		return nil
+	}
+	return hookErr
+}
+
+// Serve starts the HTTP server and blocks until ctx is canceled or a fatal
+// error occurs.
 func (p *HTTPProxy) Serve(ctx context.Context) error {
 	// Publish the serve-lifetime context under p.mu so the concurrent reads in
 	// serveCtx (from session reader goroutines) are synchronized. The write happens
@@ -536,58 +602,10 @@ func (p *HTTPProxy) Serve(ctx context.Context) error {
 	// Post-bind startup effects (see HTTPGatewayOptions.AfterListen). Runs only once the
 	// address is actually held, so a proxy that loses the bind race leaves the running
 	// instance's on-disk state alone; a hook failure closes the listener and aborts.
-	if p.afterListen != nil {
-		hook := p.afterListen
-		// Drop the reference before running it, not after: Serve blocks for the life of
-		// the process, so a hook that never returns (or the p itself outliving this call)
-		// would otherwise pin the hook's closed-over state — e.g. a control-token path
-		// string, or whatever a future caller captures — in the heap for no further
-		// purpose once this one-shot startup effect has fired.
-		p.afterListen = nil
-		// Bound the hook. Between net.Listen returning and srv.Serve starting the accept
-		// loop, the kernel completes handshakes into the backlog for a socket no userspace
-		// is reading, so a request arriving in this window HANGS rather than being refused.
-		// The hook's slowest step is an fsync, which has no upper bound on a contended
-		// volume or a stalled mount.
-		//
-		// The hook therefore runs on its own goroutine and this select ABANDONS it on
-		// expiry. Passing the bounded context and calling the hook synchronously would not
-		// bound anything: Go cannot interrupt a blocked fsync, so the deadline would only
-		// be observed after the stall had already ended — the same hang, plus a new
-		// startup failure. Abandoning is what makes the window finite, and it is safe
-		// precisely because WriteControlTokenFile re-checks the context immediately before
-		// its publishing rename: an abandoned write cannot land later and clobber the
-		// token of whatever proxy is actually serving.
-		budget := p.afterListenBudget
-		if budget <= 0 {
-			budget = afterListenTimeout
-		}
-		hookCtx, cancelHook := context.WithTimeout(ctx, budget)
-		hookDone := make(chan error, 1) // buffered: an abandoned hook must never block on send
-		go func() { hookDone <- hook(hookCtx) }()
-		var hookErr error
-		select {
-		case hookErr = <-hookDone:
-		case <-hookCtx.Done():
-			hookErr = fmt.Errorf("post-bind startup did not complete within %s: %w", budget, hookCtx.Err())
-		}
-		cancelHook()
-		if hookErr != nil {
-			_ = ln.Close()
-			// A hook cut short by SHUTDOWN is not a startup failure. Serve's ctx is
-			// cancelled by the signal handler, and hookCtx inherits that, so without this
-			// an operator who stops the proxy during startup would get a fatal error and a
-			// non-zero exit where the process previously shut down cleanly — enough to make
-			// a restart-on-failure supervisor loop during a rollout. A genuine expiry
-			// (ctx still live, deadline hit) still fails Serve, which is the right
-			// direction on the merits: the hook persists the control token, and a proxy
-			// whose emergency stop cannot be authenticated should not come up.
-			if ctx.Err() != nil {
-				return nil
-			}
-			return hookErr
-		}
+	if err := p.runAfterListen(ctx, ln); err != nil {
+		return err
 	}
+
 	for name := range p.routes {
 		path := "/mcp"
 		if name != "" {

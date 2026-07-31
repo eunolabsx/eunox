@@ -7,7 +7,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"io/fs"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -71,35 +71,49 @@ func TestGuardedCompositeLiterals(t *testing.T) {
 	t.Parallel()
 
 	fset := token.NewFileSet()
-	// Non-test sources only: tests legitimately build these structs directly to drive a
-	// path, and holding test files to the rule would say nothing about production
-	// provenance while making every new table-driven test edit this allowlist.
-	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool {
-		return !strings.HasSuffix(fi.Name(), "_test.go")
-	}, 0)
+	// Enumerate and parse the files directly rather than through parser.ParseDir. Two
+	// reasons, and the second is the one that matters: ParseDir is deprecated, and it
+	// associates files with packages WITHOUT considering build tags — so a literal in a
+	// file behind a build tag could be dropped from the walk and pass the guard unseen. A
+	// guard that silently skips files is worse than no guard. Every .go file in the
+	// package directory is parsed here regardless of its tags.
+	entries, err := os.ReadDir(".")
 	if err != nil {
-		t.Fatalf("parsing package sources: %v", err)
+		t.Fatalf("listing package sources: %v", err)
 	}
-	if len(pkgs) == 0 {
-		t.Fatal("no package parsed; the guard would pass vacuously")
+	var sources []string
+	for _, e := range entries {
+		name := e.Name()
+		// Non-test sources only: tests legitimately build these structs directly to drive
+		// a path, and holding test files to the rule would say nothing about production
+		// provenance while making every new table-driven test edit this allowlist.
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		sources = append(sources, name)
+	}
+	if len(sources) == 0 {
+		t.Fatal("no package sources found; the guard would pass vacuously")
 	}
 
 	found := map[string][]string{} // type name -> files containing a literal
-	for _, pkg := range pkgs {
-		for path, file := range pkg.Files {
-			base := filepath.Base(path)
-			// A literal of a guarded type reaches this walk in two spellings, and matching
-			// only the first is how a guard passes while the thing it guards is bypassed:
-			// `killSubject{...}` names its type directly, while an element of
-			// `[]killSubject{{...}}` or `map[string]forwardParams{"k": {…}}` ELIDES it
-			// (lit.Type == nil) and inherits it from the enclosing literal's element type.
-			// ast.Inspect gives no parent link, so the walk threads that context itself.
-			walkLiterals(file, "", func(name string) {
-				if _, guarded := guardedStructs[name]; guarded {
-					found[name] = append(found[name], base)
-				}
-			})
+	for _, path := range sources {
+		file, perr := parser.ParseFile(fset, path, nil, 0)
+		if perr != nil {
+			t.Fatalf("parsing %s: %v", path, perr)
 		}
+		base := filepath.Base(path)
+		// A literal of a guarded type reaches this walk in two spellings, and matching only
+		// the first is how a guard passes while the thing it guards is bypassed:
+		// `killSubject{...}` names its type directly, while an element of
+		// `[]killSubject{{...}}` or `map[string]forwardParams{"k": {…}}` ELIDES it
+		// (lit.Type == nil) and inherits it from the enclosing literal's element type.
+		// ast.Inspect gives no parent link, so the walk threads that context itself.
+		walkLiterals(file, "", func(name string) {
+			if _, guarded := guardedStructs[name]; guarded {
+				found[name] = append(found[name], base)
+			}
+		})
 	}
 
 	for name, rule := range guardedStructs {

@@ -125,36 +125,7 @@ Flags:
 	// for the other, matching the package's fail-loud posture on conflicting flags
 	// elsewhere (e.g. cmdProxy's --audit/--config check).
 	if *redisAddr != "" {
-		for _, name := range []string{"port", "host", "control-token", "control-token-path"} {
-			// flagWasSet reports only flags the operator actually passed (unlike comparing
-			// against defaults, which cannot distinguish an explicit --port=3000 from the
-			// unset default), so it detects a flag mix that would otherwise be silently
-			// dropped.
-			if flagWasSet(fs, name) {
-				fmt.Fprintf(os.Stderr, "eunox kill: --%s is an HTTP-transport flag and has no effect with --redis-addr set; remove --%s or drop --redis-addr\n", name, name)
-				return 1
-			}
-		}
-		// A tombstone lifetime is meaningless where no tombstone is written: --revive
-		// deletes one instead of creating it, "all" activates the global switch, which
-		// carries no per-session expiry at all (setBlock only reads sessionKillTTL on its
-		// kill&&session path — see pkg/killswitch/redis.go), and an agent kill is
-		// permanent by design. Accepting the flag silently in any of the three would
-		// suggest it did something it didn't.
-		if flagWasSet(fs, "killswitch-session-ttl") {
-			switch {
-			case *revive:
-				fmt.Fprintf(os.Stderr, "eunox kill: --killswitch-session-ttl has no effect with --revive, which removes a tombstone rather than writing one; drop one of the two\n")
-				return 1
-			case target.kind == killTargetGlobal:
-				fmt.Fprintf(os.Stderr, "eunox kill: --killswitch-session-ttl has no effect on the 'all' target, which activates the global kill switch with no per-session expiry; drop one of the two\n")
-				return 1
-			case target.kind == killTargetAgent:
-				fmt.Fprintf(os.Stderr, "eunox kill: --killswitch-session-ttl has no effect with --agent; agent kills never expire, so there is no lifetime to set; drop one of the two\n")
-				return 1
-			}
-		}
-		if err := runRedisKill(redisKillRequest{
+		return runRedisKillTransport(fs, redisKillRequest{
 			addr:           *redisAddr,
 			password:       resolveRedisPassword(*redisPassword),
 			useTLS:         *redisTLS,
@@ -162,11 +133,7 @@ Flags:
 			revive:         *revive,
 			sessionKillTTL: *sessionKillTTL,
 			ttlFlagSet:     flagWasSet(fs, "killswitch-session-ttl"),
-		}); err != nil {
-			fmt.Fprintf(os.Stderr, "eunox kill: %v\n", err)
-			return 1
-		}
-		return 0
+		})
 	}
 	for _, name := range []string{"redis-password", "redis-tls", "killswitch-session-ttl"} {
 		if flagWasSet(fs, name) {
@@ -186,6 +153,51 @@ Flags:
 		return 1
 	}
 	return killViaControlEndpoint(*host, *port, *controlToken, *controlTokenPath, target)
+}
+
+// runRedisKillTransport handles the --redis-addr branch of `eunox kill`: it rejects the
+// flag combinations that would be silently dropped on this transport, then performs the
+// write. Split out of cmdKill so the subcommand's body stays the flag surface plus a
+// two-way transport choice; the rejection rules are the part that grows with every new
+// dimension, and they are easier to review as one block than interleaved with parsing.
+func runRedisKillTransport(fs *flag.FlagSet, req redisKillRequest) int {
+	// Reject a mix of Redis and HTTP-transport flags rather than silently picking one
+	// transport and ignoring flags meant for the other, matching the package's fail-loud
+	// posture on conflicting flags elsewhere (e.g. cmdProxy's --audit/--config check).
+	for _, name := range []string{"port", "host", "control-token", "control-token-path"} {
+		// flagWasSet reports only flags the operator actually passed (unlike comparing
+		// against defaults, which cannot distinguish an explicit --port=3000 from the
+		// unset default), so it detects a flag mix that would otherwise be silently
+		// dropped.
+		if flagWasSet(fs, name) {
+			fmt.Fprintf(os.Stderr, "eunox kill: --%s is an HTTP-transport flag and has no effect with --redis-addr set; remove --%s or drop --redis-addr\n", name, name)
+			return 1
+		}
+	}
+	// A tombstone lifetime is meaningless where no tombstone is written: --revive deletes
+	// one instead of creating it, "all" activates the global switch, which carries no
+	// per-session expiry at all (setBlock only reads sessionKillTTL on its kill&&session
+	// path -- see pkg/killswitch/redis.go), and an agent kill is permanent by design.
+	// Accepting the flag silently in any of the three would suggest it did something it
+	// didn't.
+	if req.ttlFlagSet {
+		switch {
+		case req.revive:
+			fmt.Fprintf(os.Stderr, "eunox kill: --killswitch-session-ttl has no effect with --revive, which removes a tombstone rather than writing one; drop one of the two\n")
+			return 1
+		case req.target.kind == killTargetGlobal:
+			fmt.Fprintf(os.Stderr, "eunox kill: --killswitch-session-ttl has no effect on the 'all' target, which activates the global kill switch with no per-session expiry; drop one of the two\n")
+			return 1
+		case req.target.kind == killTargetAgent:
+			fmt.Fprintf(os.Stderr, "eunox kill: --killswitch-session-ttl has no effect with --agent; agent kills never expire, so there is no lifetime to set; drop one of the two\n")
+			return 1
+		}
+	}
+	if err := runRedisKill(req); err != nil {
+		fmt.Fprintf(os.Stderr, "eunox kill: %v\n", err)
+		return 1
+	}
+	return 0
 }
 
 // killViaControlEndpoint POSTs the kill to a running HTTP proxy's loopback

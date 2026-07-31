@@ -6192,7 +6192,7 @@ func TestAddSlack_SaturatesInsteadOfOverflowing(t *testing.T) {
 // decode as promised behavior, which is not a promise worth making. Removing the METHOD
 // strictly dominates rejecting a body key — with no ReviveSession reachable through
 // p.ks, a "revive" key has nothing to call whether it is rejected or ignored.
-var _ killActivator = (killswitch.Manager)(nil)
+var _ killActivator = killswitch.Manager(nil)
 
 // killStatusForTest reads the proxy's kill-switch state in a test. p.ks is the narrowed,
 // kill-only killActivator (see its doc comment), which deliberately exposes no reader — so
