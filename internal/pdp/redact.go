@@ -485,32 +485,6 @@ func redactJSONValue(val interface{}, paths []string) bool {
 	}
 }
 
-// redactStructuredContentField redacts result["structuredContent"] in place (if present)
-// and reports whether it changed. A JSON object or array is redacted directly; a JSON-string
-// body is run through redactContainerString (a clean JSON container is unwrapped and
-// redacted; prose, malformed JSON, or JSON embedded in prose passes through). A JSON null,
-// number, or bool carries no named field and passes through. redactFields never fails the
-// whole response closed over a structuredContent shape it cannot redact.
-//
-// This is the TOP-LEVEL value dispatch; redactNestedJSONStrings applies the same
-// object/array-vs-string-vs-pass-through policy to NESTED values during the unwrap walk, and
-// both funnel string leaves through the shared redactContainerString core. A change to which
-// shapes redact versus pass through must be mirrored in both, or top-level and nested values
-// of the same shape would redact differently.
-// redactSiblingTopLevelKeys applies the redaction paths to every top-level result key
-// OTHER than content and structuredContent, which ApplyRedactObligs handles with their own
-// shape-specific rigor.
-//
-// Split out of ApplyRedactObligs to keep that function within the cognitive-complexity
-// budget, not because the walk is independent of it: it is the third of the three passes
-// the doc there describes, and skipping it forwards a field the manifest declared
-// redactable simply because the upstream put it under an unmodelled key.
-//
-// Redacting unmodelled keys rather than failing the response closed on their presence is
-// deliberate: _meta, annotations, and vendor extensions are ordinary and legitimate, so
-// refusing them would break honest upstreams, while masking is exactly what the operator
-// asked for. Reuses structuredContent's container walk, so a doubly-encoded JSON string
-// leaf is unwrapped identically and the depth bound applies the same way.
 // mcpReservedRootKeys are the MCP result-envelope keys that carry protocol STRUCTURE
 // rather than tool data: the two content components, the CallToolResult error flag, the
 // ReadResourceResult and GetPromptResult payload arrays, and the metadata sidecar.
@@ -549,6 +523,20 @@ func envelopeRootExempt(path string) bool {
 	return reserved
 }
 
+// redactSiblingTopLevelKeys applies the redaction paths to every top-level result key
+// OTHER than content and structuredContent, which ApplyRedactObligs handles with their own
+// shape-specific rigor.
+//
+// Split out of ApplyRedactObligs to keep that function within the cognitive-complexity
+// budget, not because the walk is independent of it: it is the third of the three passes
+// the doc there describes, and skipping it forwards a field the manifest declared
+// redactable simply because the upstream put it under an unmodelled key.
+//
+// Redacting unmodelled keys rather than failing the response closed on their presence is
+// deliberate: _meta, annotations, and vendor extensions are ordinary and legitimate, so
+// refusing them would break honest upstreams, while masking is exactly what the operator
+// asked for. Reuses structuredContent's container walk, so a doubly-encoded JSON string
+// leaf is unwrapped identically and the depth bound applies the same way.
 func redactSiblingTopLevelKeys(result map[string]interface{}, paths []string) (bool, error) {
 	changed := false
 	// Match the paths against the ENVELOPE itself before descending into its values. The
@@ -639,33 +627,43 @@ func redactSiblingValue(key string, val interface{}, paths []string) (replacemen
 	return val, changed, nil
 }
 
+// redactStructuredContentField redacts the structuredContent key's own value under BOTH
+// anchorings redactSiblingValue applies to an unmodelled sibling key — envelope-relative
+// (prefix "structuredContent", so "structuredContent.ssn" reaches an ssn a doubly-encoded
+// blob AT that key carries) and value-relative (empty prefix, treating the value as its
+// own root). It delegates to redactSiblingValue itself rather than re-deriving the same
+// two-anchoring walk: a hand-copied second implementation is exactly how this drifted once
+// already — the container case (a direct structuredContent object) got only the
+// value-relative pass here while the doubly-encoded-string case needed the envelope-relative
+// one too, so "structuredContent.ssn" — the fully-qualified spelling the manifest guide
+// recommends — silently failed to redact an ssn smuggled as a JSON string AT structuredContent
+// itself, even though the identical shape under a sibling key already redacted correctly.
+//
+// The container case now also runs the envelope-relative anchoring, which is redundant with
+// (but harmless alongside) redactSiblingTopLevelKeys' own top-level redactDotPathRec pass over
+// the whole envelope — masking an already-masked leaf a second time changes nothing.
+//
+// A scalar structuredContent (JSON null, number, or bool) carries no named field, so there is
+// nothing to redact and nothing that could hide one — redactSiblingValue's default case
+// already passes it through unchanged. This is deliberately MORE lenient than the
+// content-array path in ApplyRedactObligs, which fails closed on a structurally anomalous
+// shape: a malformed content item can conceal a text body carrying the field, whereas a bare
+// scalar cannot. Do not reconcile the two — failing closed here would needlessly block valid
+// scalar results, and passing anomalous content shapes through there would fail open on a
+// real hiding place.
 func redactStructuredContentField(result map[string]interface{}, paths []string) (bool, error) {
 	sc, ok := result["structuredContent"]
 	if !ok {
 		return false, nil
 	}
-	switch scv := sc.(type) {
-	case map[string]interface{}, []interface{}:
-		return redactStructuredContentValue(scv, paths, "", 0)
-	case string:
-		out, c, err := redactContainerString(scv, paths, "", 0)
-		if err != nil {
-			return false, err // depth-limit guard or an internal re-marshal error
-		}
-		if c {
-			result["structuredContent"] = out
-		}
-		return c, nil
-	default:
-		// JSON null, number, or bool: a scalar structuredContent carries no named field, so
-		// there is nothing to redact and nothing that could hide one — pass it through. This
-		// is deliberately MORE lenient than the content-array path in ApplyRedactObligs, which
-		// fails closed on a structurally anomalous shape: a malformed content item can conceal
-		// a text body carrying the field, whereas a bare scalar cannot. Do not reconcile the
-		// two — failing closed here would needlessly block valid scalar results, and passing
-		// anomalous content shapes through there would fail open on a real hiding place.
-		return false, nil
+	replacement, changed, err := redactSiblingValue("structuredContent", sc, paths)
+	if err != nil {
+		return false, err // depth-limit guard or an internal re-marshal error; fail closed
 	}
+	if changed {
+		result["structuredContent"] = replacement
+	}
+	return changed, nil
 }
 
 // redactStructuredContentValue redacts an already-decoded structuredContent container

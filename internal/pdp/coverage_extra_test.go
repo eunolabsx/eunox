@@ -815,6 +815,28 @@ func TestApplyRedactObligs_StructuredContentTopLevelString_DeepRedacted(t *testi
 	assert.True(t, json.Valid(out), "redacted output must remain well-formed JSON")
 }
 
+// The manifest guide's RECOMMENDED spelling for a nested field — "structuredContent.ssn",
+// fully qualified from the envelope root — must also redact when structuredContent itself is
+// a doubly-encoded JSON string, in parity with the bare "ssn" spelling the previous test
+// covers. redactStructuredContentField once anchored only value-relative (empty prefix),
+// which the bare spelling matches directly; the envelope-relative anchoring (prefix
+// "structuredContent", stripping down to "ssn" the same way a sibling key's identically-shaped
+// blob already does) was missing, so the fully-qualified path silently redacted nothing while
+// the audit record still reported the obligation applied — the exact fail-open the sibling-key
+// dual-anchoring fix closed one call site over.
+func TestApplyRedactObligs_StructuredContentTopLevelString_QualifiedPath_Redacted(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{"structuredContent":"{\"ssn\":\"LEAKED_SSN_VALUE\",\"keep\":\"survives\"}"}`)
+	out, err := ApplyRedactObligs(body, []capability.Obligation{
+		{Type: capability.DirectiveTypeRedactFields, Paths: []string{"structuredContent.ssn"}},
+	})
+	require.NoError(t, err)
+	s := string(out)
+	assert.NotContains(t, s, "LEAKED_SSN_VALUE", "the fully-qualified spelling must redact ssn inside a doubly-encoded top-level structuredContent string")
+	assert.Contains(t, s, "survives", "the sibling value must be preserved, not dropped or garbled")
+	assert.True(t, json.Valid(out), "redacted output must remain well-formed JSON")
+}
+
 // A text content body that is a clean JSON OBJECT carrying a doubly-encoded string value
 // must have the smuggled field redacted, in parity with structuredContent — the text path
 // now recurses through the same shared core (closing the prior content[].text fail-open).

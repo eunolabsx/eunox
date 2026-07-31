@@ -497,7 +497,14 @@ func (p *HTTPProxy) Serve(ctx context.Context) error {
 	// address is actually held, so a proxy that loses the bind race leaves the running
 	// instance's on-disk state alone; a hook failure closes the listener and aborts.
 	if p.afterListen != nil {
-		if err := p.afterListen(); err != nil {
+		hook := p.afterListen
+		// Drop the reference before running it, not after: Serve blocks for the life of
+		// the process, so a hook that never returns (or the p itself outliving this call)
+		// would otherwise pin the hook's closed-over state — e.g. a control-token path
+		// string, or whatever a future caller captures — in the heap for no further
+		// purpose once this one-shot startup effect has fired.
+		p.afterListen = nil
+		if err := hook(); err != nil {
 			_ = ln.Close()
 			return err
 		}

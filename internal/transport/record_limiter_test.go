@@ -5,6 +5,7 @@ package transport
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -12,11 +13,26 @@ import (
 // withFakeClock pins a gate's bucket to a caller-driven clock and returns the setter, so a
 // test drives refill deterministically instead of sleeping. It also forces the lazy bucket
 // into existence before any concurrent use.
+//
+// The clock itself is guarded by its own mutex (independent of the gate's), rather than a
+// bare captured variable: bucket.now is invoked from inside admit() while the gate's lock is
+// held, but a later setNow call runs from the test goroutine with no lock of its own, so an
+// unsynchronized read/write pair here would itself be the kind of TOCTOU this file's
+// production fix (see saturationGate.admit) exists to close one layer down.
 func withFakeClock(g *saturationGate, base time.Time) func(time.Time) {
+	var mu sync.Mutex
 	now := base
 	bucket := g.bucket()
-	bucket.now = func() time.Time { return now }
-	return func(t time.Time) { now = t }
+	bucket.now = func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return now
+	}
+	return func(t time.Time) {
+		mu.Lock()
+		defer mu.Unlock()
+		now = t
+	}
 }
 
 // TestSaturationGate_CollapsesEpisodeToOneRecord pins the primary rule: a pool that stays
@@ -152,6 +168,113 @@ func TestSaturationGate_ZeroValueIsUsableAndConcurrencySafe(t *testing.T) {
 	}
 	if g.limiter == nil {
 		t.Fatal("the zero-value gate must have lazily built its bucket; an inert gate is an unbounded gate")
+	}
+}
+
+// TestSaturationGate_DeclinedLeadingEdgeRetriesRatherThanBlackout is the regression test for
+// a bug a code review found in the prior implementation: admit() latched an episode's leading
+// edge as "recorded" via a CompareAndSwap BEFORE knowing whether the token bucket would admit
+// it. If the bucket then declined (drained by an earlier flip-flop burst), the episode was
+// marked spoken-for anyway — and since clear() is the only other path back to "not
+// recorded", and it fires solely on a successful pool acquire, a CONTINUOUS saturation
+// (which by definition never acquires) would produce ZERO records for its entire remaining
+// duration. That is worse than the per-refusal flood the gate exists to bound: a real,
+// sustained incident could leave no trace on the tape at all.
+//
+// The fix (see saturationGate.admit) latches recorded only AFTER a successful bucket.admit(),
+// so a decline leaves the gate open to retry on the next refusal once the bucket refills.
+func TestSaturationGate_DeclinedLeadingEdgeRetriesRatherThanBlackout(t *testing.T) {
+	t.Parallel()
+	var g saturationGate
+	base := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	setNow := withFakeClock(&g, base)
+
+	// Drain the bucket via the flip-flop pattern — admit immediately followed by clear,
+	// mirroring an attacker cycling the pool before settling into a continuous saturation —
+	// with no clock movement, so nothing refills.
+	for i := 0; i < saturationRecordBurst; i++ {
+		if ok, _ := g.admit(); !ok {
+			t.Fatalf("iteration %d: the burst should not be exhausted yet", i)
+		}
+		g.clear()
+	}
+
+	// Now simulate the continuous saturation itself: repeated refusals with NO clear() in
+	// between (the pool never hands out a slot again). The leading edge of this episode
+	// finds the bucket empty and must decline WITHOUT latching recorded — a buggy latch-on
+	// CAS would make every one of these silently vanish for as long as the saturation lasts.
+	for i := 0; i < 100; i++ {
+		if ok, _ := g.admit(); ok {
+			t.Fatalf("iteration %d: the bucket is drained and the clock has not moved; nothing should admit yet", i)
+		}
+	}
+
+	// The bucket refills over time even though the pool is STILL saturated (no clear() has
+	// run since the drain). A correct gate retries the leading edge on every refusal while
+	// recorded stays false, so once the bucket has a token, the very next refusal in this
+	// still-ongoing, still-unacknowledged saturation must get a record — proving the
+	// incident is not permanently silenced.
+	setNow(base.Add(time.Second))
+	ok, suppressed := g.admit()
+	if !ok {
+		t.Fatal("a sustained saturation must eventually produce a record once the bucket refills — a declined leading edge must never permanently silence the episode")
+	}
+	if suppressed == 0 {
+		t.Error("the 100 refusals declined while the bucket was drained must be folded into this record's suppressed_count, not dropped")
+	}
+}
+
+// TestSaturationGate_ConcurrentAdmitClearNoDataRace stresses admit()/clear() from many
+// goroutines simultaneously — the shape a session's pool sees under real contention (the
+// acquire path calling clear() on every success, the refusal path calling admit() on every
+// saturation). It is regression coverage for a second bug the same code review found: the
+// prior lock-free implementation's clear() (an unsynchronized Load-then-Store) could race a
+// DIFFERENT goroutine's admit() that had just opened a new episode via CompareAndSwap,
+// closing that fresh episode before any later refusal folded into it and splitting one
+// continuous saturation into spurious extra records — a logical TOCTOU invisible to the race
+// detector, since every individual operation was itself a genuine atomic op.
+//
+// The fix makes admit() and clear() fully mutually exclusive under one mutex (see
+// saturationGate.admit), which does not just narrow that window but removes it — there is no
+// point during either call where the other can observe a partially-applied state. Run under
+// `go test -race`, this also guards against a future refactor reintroducing unsynchronized
+// access to recorded.
+func TestSaturationGate_ConcurrentAdmitClearNoDataRace(t *testing.T) {
+	t.Parallel()
+	var g saturationGate
+
+	const goroutines = 32
+	const iterations = 2000
+	var wg sync.WaitGroup
+	var admitted atomic.Int64
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				if ok, _ := g.admit(); ok {
+					admitted.Add(1)
+				}
+				// Every iteration clears — the shape of a pool that is saturated on
+				// essentially every refusal but hands out a slot again immediately after,
+				// which is the pattern most likely to expose a torn check-then-act.
+				g.clear()
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Every clear() in this test runs immediately after its own goroutine's admit(), so
+	// each goroutine can open at most one episode per iteration and the gate never sees a
+	// TRUE continuous saturation — under correct mutual exclusion this keeps the admitted
+	// count small and roughly bucket-refill-bound, not anywhere near the goroutines*iterations
+	// refusal volume. A torn check-then-act would let far more concurrent leading edges slip
+	// past the episode check, so a count near the total iteration volume signals exactly the
+	// class of bug this test guards against, without asserting an exact number true
+	// concurrency cannot make deterministic.
+	const implausibleThreshold = goroutines * iterations / 10
+	if got := admitted.Load(); got == 0 || got > implausibleThreshold {
+		t.Fatalf("admitted = %d, want in (0, %d] — an implausible count suggests recorded was latched without genuine mutual exclusion", got, implausibleThreshold)
 	}
 }
 

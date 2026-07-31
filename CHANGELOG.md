@@ -240,7 +240,12 @@ Section conventions:
   the value verbatim. Each sibling value is now walked under both anchorings
   (envelope-relative, so a dotted path reaches into the blob its key names, and
   value-relative, so a container relocated under some other key is still masked) and
-  the union is redacted.
+  the union is redacted. `structuredContent` itself had the identical gap one call site
+  over: its own value was walked value-relative only, so the manifest guide's
+  recommended fully-qualified spelling — `structuredContent.ssn` — silently redacted
+  nothing when `structuredContent` was *itself* delivered as a doubly-encoded JSON
+  string, while the bare `ssn` spelling against the same blob already worked. It now
+  shares the sibling walk's both-anchorings logic instead of a second, hand-copied one.
 - **A failed second `eunox proxy` start broke `eunox kill` against the running one.**
   The control token is written to a shared default path and deliberately overwrites
   what is there, and that write ran *before* `net.Listen` — so an operator who

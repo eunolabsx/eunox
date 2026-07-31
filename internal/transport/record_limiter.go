@@ -12,7 +12,6 @@ package transport
 
 import (
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -149,10 +148,13 @@ const (
 // bounded independently by the session cap. The attacker's cost scales with the record
 // rate, which is exactly the property the pre-session case lacks.
 type saturationGate struct {
-	// recorded marks that the CURRENT saturation episode has already been offered to the
-	// bucket. Read — not written — on the hot acquire path, so an unsaturated pool costs
-	// one atomic load per acquire and never dirties the cache line.
-	recorded atomic.Bool
+	// mu guards recorded and makes the check-bucket-then-latch sequence in admit() one
+	// critical section with clear()'s reset — see admit's doc for why a lock-free
+	// atomic.Bool cannot provide that even via CompareAndSwap. The gate sits on the
+	// refusal path (admit) and the successful-acquire path (clear), neither the
+	// happy-path request handling itself, so a mutex here is not a hot-path cost.
+	mu       sync.Mutex
+	recorded bool
 
 	once    sync.Once
 	limiter *recordRateLimiter
@@ -169,26 +171,48 @@ func (g *saturationGate) bucket() *recordRateLimiter {
 // refusals were elided since the last admitted one. A refusal inside an episode already
 // spoken for, or one the bucket declines, is counted rather than written.
 //
-// Note the episode is marked spoken-for even when the bucket then declines its leading
-// edge: that episode produces no record at all, and its refusals surface as the
-// suppressed_count on whichever record the bucket admits next. That is the deliberate
-// direction — the alternative is retrying the leading edge on every subsequent refusal,
-// which reinstates exactly the per-refusal bucket pressure the collapsing removes.
+// The episode-open check, the bucket call, and the latch are one critical section under
+// g.mu — not three independently-atomic steps — because splitting them reintroduces two
+// distinct bugs a prior lock-free version (a bare CompareAndSwap on an atomic.Bool) had:
+//
+//  1. Latching the episode as recorded on the CAS alone, before knowing whether the
+//     bucket admits it, is wrong: if the bucket then DECLINES the leading edge (drained by
+//     an earlier flip-flop burst), the episode is marked spoken-for anyway, and only
+//     clear() — fired solely by a successful pool acquire — can reopen it. A continuous
+//     saturation never acquires, so the entire rest of that incident would produce ZERO
+//     records: worse than the per-refusal flood this gate exists to bound. Latching only
+//     AFTER a successful bucket.admit() means a decline leaves recorded false, so the next
+//     refusal retries the bucket rather than being silently swallowed by an episode that
+//     never actually got a record out.
+//  2. An unsynchronized clear() (Load-then-Store) can race a DIFFERENT goroutine's
+//     admit() that just opened a new episode: clear() observes the stale "true" from the
+//     episode that just ended, then stores false over the new episode's still-fresh latch,
+//     before any later refusal has a chance to fold into it — splitting one continuous
+//     saturation into two-plus records. Serializing admit() and clear() on one lock removes
+//     the window entirely.
 func (g *saturationGate) admit() (ok bool, suppressed uint64) {
 	bucket := g.bucket()
-	if !g.recorded.CompareAndSwap(false, true) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.recorded {
 		bucket.suppress()
 		return false, 0
 	}
-	return bucket.admit()
+	// Leading edge of a (possibly new) episode: latch it as recorded ONLY once the bucket
+	// actually admits a record for it (see point 1 above).
+	ok, suppressed = bucket.admit()
+	if ok {
+		g.recorded = true
+	}
+	return ok, suppressed
 }
 
 // clear ends the current saturation episode: the pool just handed out a slot, so the next
-// refusal is a new episode and is recorded again. Called from every successful acquire, so
-// it takes no lock and skips the store on the overwhelmingly common path where no episode
-// is open.
+// refusal is a new episode and is recorded again. Called from every successful acquire.
+// Locked — see admit's doc for why clear() and admit() must be mutually exclusive rather
+// than each independently atomic.
 func (g *saturationGate) clear() {
-	if g.recorded.Load() {
-		g.recorded.Store(false)
-	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.recorded = false
 }
