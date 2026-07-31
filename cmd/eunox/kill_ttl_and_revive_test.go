@@ -427,27 +427,24 @@ func TestReviveViaRedis_BackendErrorsAreReported(t *testing.T) {
 	require.Contains(t, err.Error(), "deactivate global kill switch")
 }
 
-// publishFailCmdable is a redis.Cmdable whose SET/DEL succeed but whose PUBLISH
-// always fails, modeling a Redis ACL that permits key writes but not PUBLISH (or a
-// transient error in the follow-up call). The embedded nil interface satisfies the
-// rest of the Cmdable surface; nothing else here should be called.
+// publishFailCmdable is a redis.Cmdable whose DEL succeeds but whose PUBLISH always
+// fails, modeling a Redis ACL that permits key writes but not PUBLISH (or a transient
+// error in the follow-up call). reviveViaRedis's two paths (DeactivateGlobal,
+// ReviveSession) only ever call Del, never Set, so only Del is overridden; the
+// embedded nil interface satisfies the rest of the Cmdable surface and would panic if
+// anything else were called. Mirrors pkg/killswitch's publishFailFake.
 type publishFailCmdable struct {
 	goredis.Cmdable
+	pubErr error
 }
 
-func (publishFailCmdable) Set(_ context.Context, _ string, _ interface{}, _ time.Duration) *goredis.StatusCmd {
-	return goredis.NewStatusResult("OK", nil)
-}
-
-func (publishFailCmdable) Del(_ context.Context, keys ...string) *goredis.IntCmd {
+func (f publishFailCmdable) Del(_ context.Context, keys ...string) *goredis.IntCmd {
 	return goredis.NewIntResult(int64(len(keys)), nil)
 }
 
-func (publishFailCmdable) Publish(_ context.Context, _ string, _ interface{}) *goredis.IntCmd {
-	return goredis.NewIntResult(0, errPublishOnly)
+func (f publishFailCmdable) Publish(_ context.Context, _ string, _ interface{}) *goredis.IntCmd {
+	return goredis.NewIntResult(0, f.pubErr)
 }
-
-var errPublishOnly = errors.New("publish-only failure")
 
 // TestReviveViaRedis_PublishOnlyFailureIsReportedAsError pins the CURRENT behavior
 // when the durable write already landed but the follow-up PUBLISH fails: reviveViaRedis
@@ -459,7 +456,8 @@ var errPublishOnly = errors.New("publish-only failure")
 // future change to how reviveViaRedis reports this split (e.g. distinguishing it from a
 // genuine failed write) is a deliberate test update, not a silent behavior change.
 func TestReviveViaRedis_PublishOnlyFailureIsReportedAsError(t *testing.T) {
-	ks := killswitch.NewRedis(publishFailCmdable{})
+	errPublishOnly := errors.New("publish-only failure")
+	ks := killswitch.NewRedis(publishFailCmdable{pubErr: errPublishOnly})
 
 	err := reviveViaRedis(context.Background(), ks, "sess-1")
 	require.Error(t, err)

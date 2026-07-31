@@ -1199,8 +1199,8 @@ func TestRedis_DeactivateGlobal_PublishErrorPropagates(t *testing.T) {
 }
 
 // TestRedis_ReviveSession_PublishErrorPropagates covers the DEL leg of setBlock
-// (kill=false), which #98 newly routes through cmd/eunox's --revive flag — the write
-// half of that same write-succeeds/publish-fails split KillSession already pins, but
+// (kill=false), which cmd/eunox's --revive flag newly routes through — the write half
+// of that same write-succeeds/publish-fails split KillSession already pins, but
 // unexercised for revive until now.
 func TestRedis_ReviveSession_PublishErrorPropagates(t *testing.T) {
 	t.Parallel()

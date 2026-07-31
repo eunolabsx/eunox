@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/eunolabs/eunox/pkg/durationsentinel"
 )
 
 const (
@@ -254,10 +256,12 @@ func WithSessionKillTTL(d time.Duration) RedisOption {
 // as never expiring, the same as zero, since no other reading of it is safe.
 func WithSessionKillTTLEffective(d time.Duration) RedisOption {
 	return func(r *Redis) {
-		if d < 0 {
-			d = 0
-		}
-		r.sessionKillTTL = d
+		// durationsentinel.Resolve's zero-case and this option's "already resolved"
+		// zero happen to coincide (both mean "never expires" here, since 0 is passed
+		// as the default), so the same negative-clamps-to-zero helper applies even
+		// though this option's zero does not mean "use a default" the way
+		// NormalizeSessionKillTTL's does.
+		r.sessionKillTTL = durationsentinel.Resolve(d, 0)
 	}
 }
 
