@@ -1861,7 +1861,9 @@ func TruncateUTF8(s string, limit int) string {
 // UTF-8 rune, so a byte-length truncation never leaves an orphaned continuation byte
 // that json.Marshal would silently rewrite to the replacement character. Walks back
 // from limit to the nearest rune start (drops at most 3 bytes). Callers must have
-// already normalized s to valid UTF-8.
+// already normalized s to valid UTF-8 and must pass limit < len(s) (both current
+// callers only reach this after their own len(s) <= limit early return); it indexes
+// s[limit] directly and panics on an out-of-range limit.
 func runeBoundaryCut(s string, limit int) int {
 	keep := limit
 	for keep > 0 && !utf8.RuneStart(s[keep]) {
