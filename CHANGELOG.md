@@ -59,6 +59,27 @@ Section conventions:
 
 ### Changed
 
+- **`RESOURCE_EXHAUSTED` records are now written once per saturation *episode*, not once
+  per refused request**, at both established-session caps: the concurrent-handler pool
+  (the stdio `hostSem` and the HTTP per-session in-flight cap) and the HTTP per-session
+  notification pool. The first refusal after the pool last had a free slot is recorded;
+  every further refusal while it stays saturated is folded into the next record's
+  `details.suppressed_count`; and a successful acquire ends the episode, so a later
+  saturation is recorded again. A per-pool token bucket sits underneath, so a caller
+  cycling a pool between saturated and drained cannot open episodes faster than the audit
+  drainer absorbs them. What an operator wants from these records is that a pool saturated
+  and by how much, not one record per refused frame — and the per-refusal form was a lever
+  on the proxy's own availability: the audit queue is bounded and its drop counter
+  monotonic, so enough records latch a degraded trail and, under the default
+  `--require-audit=strict`, deny every enforced call on **every** route for the rest of
+  the process's life. The notification pool was the cheapest way to drive that, since a
+  dropped notification costs its sender no upstream round trip and is answered
+  `202 Accepted`, byte-identical to a successful forward, so a flooding client gets no
+  signal to back off. The gates are per pool and per session, so a notification flood
+  cannot elide the request pool's record, and a `suppressed_count` on one of these records
+  describes only the pool that wrote it. The proxy-wide session cap's `RESOURCE_EXHAUSTED`
+  is unchanged: it is reachable without an established session, so it stays on the
+  pre-session rate limiter it already shared.
 - **`eunox audit-verify` is roughly 40% faster per record**, with no change to what it
   accepts or rejects. It is the tool an incident responder points at a full retained
   archive, so its per-record cost is paid exactly when the record count is largest and

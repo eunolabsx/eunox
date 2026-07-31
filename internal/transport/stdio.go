@@ -172,6 +172,13 @@ type StdioProxy struct {
 	// sized by the time a request is handled.
 	hostSem chan struct{}
 
+	// hostSaturation gates the RESOURCE_EXHAUSTED record hostSem writes when it refuses a
+	// request, the stdio counterpart of the two per-session gates the HTTP transport keeps.
+	// It collapses an episode of saturation into a single record carrying the count of
+	// refusals elided since; see saturationGate. Zero value usable, so a proxy built by a
+	// struct literal is gated too.
+	hostSaturation saturationGate
+
 	// fwdHostWrites preserves host wire order across the request/notification
 	// boundary. It counts host requests that have been dispatched but not yet written
 	// to the upstream; serveHost waits on it before forwarding a host notification, so
@@ -945,13 +952,17 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 			// retryable error instead of spawning an unbounded goroutine.
 			select {
 			case p.hostSem <- struct{}{}:
+				// The pool had a free slot, so any saturation episode is over: re-arm the
+				// gate so the next refusal is recorded as a new episode rather than folded
+				// into the last one. Mirrors the HTTP pools' acquire helpers.
+				p.hostSaturation.clear()
 			default:
 				// Record the refusal so a host saturating the handler pool (a DoS probe, or a
 				// runaway client) leaves a trace on the tamper-evident tape rather than only a
 				// server-busy reply, mirroring the HTTP per-session cap through the same helper
 				// (which also keeps the refused method out of the target field). p.rec() is nil
 				// when no audit sink is configured; the helper skips the record then.
-				recordResourceExhausted(ctx, p.rec(), p.sessionID, msg.Method)
+				recordResourceExhausted(ctx, p.rec(), &p.hostSaturation, p.sessionID, msg.Method)
 				_ = p.hostWriter.Write(mcp.ErrorResponse(msg.ID, jsonRPCCodeServerBusy, "eunox: too many concurrent requests in flight; retry"))
 				continue
 			}

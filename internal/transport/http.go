@@ -187,8 +187,8 @@ type HTTPProxy struct {
 	authTimingKey []byte
 	// preSessionDenies bounds the rate of transport-level refusal records. Those are the
 	// only audit writes an unauthenticated caller can trigger, so without a bound they are
-	// a lever on --require-audit=strict; see preSessionDenyLimiter.
-	preSessionDenies *preSessionDenyLimiter
+	// a lever on --require-audit=strict; see newPreSessionDenyLimiter.
+	preSessionDenies *recordRateLimiter
 	trustFwdFor      bool
 	// trustedProxyNets is the compiled listen.trustedProxyCIDRs allowlist: under
 	// trustFwdFor, the immediate TCP peer (RemoteAddr) must match one of these

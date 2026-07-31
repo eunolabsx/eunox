@@ -210,6 +210,15 @@ type httpSession struct {
 	// load can never starve notification delivery. Lazily created, mirroring reqSem.
 	notifySemOnce sync.Once
 	notifySem     chan struct{}
+
+	// reqSaturation / notifySaturation gate the RESOURCE_EXHAUSTED record each pool writes
+	// when it refuses — one gate per pool, so a notification flood cannot elide the request
+	// pool's saturation record or the reverse. Each collapses an episode of saturation into
+	// a single record carrying the count of refusals elided since; see saturationGate. Zero
+	// value usable, so a session built by a struct literal is gated too — the same reason
+	// the semaphores they guard are created lazily.
+	reqSaturation    saturationGate
+	notifySaturation saturationGate
 }
 
 // maxConcurrentSessionRequests bounds in-flight enforced-request handlers per HTTP
@@ -234,6 +243,9 @@ func (s *httpSession) tryAcquireNotifySlot() bool {
 	s.notifySemOnce.Do(func() { s.notifySem = make(chan struct{}, maxConcurrentSessionNotifications) })
 	select {
 	case s.notifySem <- struct{}{}:
+		// The pool had a free slot, so any saturation episode is over: re-arm the gate so
+		// the next drop is recorded as a new episode rather than folded into the last one.
+		s.notifySaturation.clear()
 		return true
 	default:
 		return false
@@ -252,6 +264,8 @@ func (s *httpSession) tryAcquireRequestSlot() bool {
 	s.reqSemOnce.Do(func() { s.reqSem = make(chan struct{}, maxConcurrentSessionRequests) })
 	select {
 	case s.reqSem <- struct{}{}:
+		// Ends any saturation episode, exactly as the notification pool's acquire does.
+		s.reqSaturation.clear()
 		return true
 	default:
 		return false

@@ -434,8 +434,12 @@ func TestServeHost_ConcurrencyCapRejectsWhenSaturated(t *testing.T) {
 		sink:         sink,                   // wire the tape so the saturation refusal is recorded
 	}
 
+	// Three requests against a cap of 1: the first holds the sole slot on a silent
+	// upstream, and the next two are both refused without the pool ever draining — one
+	// saturation episode, so exactly one record (asserted below).
 	input := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"slow","arguments":{}}}` + "\n" +
-		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"slow","arguments":{}}}` + "\n"
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"slow","arguments":{}}}` + "\n" +
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"slow","arguments":{}}}` + "\n"
 	p.hostReader = mcp.NewMsgReader(strings.NewReader(input))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -460,6 +464,17 @@ func TestServeHost_ConcurrencyCapRejectsWhenSaturated(t *testing.T) {
 		t.Fatal("the saturating request was not rejected (the in-flight cap did not engage)")
 	}
 
+	// The third request is refused the same way; drain its reply so the assertions below
+	// run after both refusals have been recorded (or elided).
+	select {
+	case m := <-hostCh:
+		if m.Error == nil || m.Error.Code != jsonRPCCodeServerBusy {
+			t.Fatalf("the second saturating request must also be refused server-busy, got %+v", m)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the second saturating request was not rejected")
+	}
+
 	cancel()
 	<-done
 
@@ -467,15 +482,30 @@ func TestServeHost_ConcurrencyCapRejectsWhenSaturated(t *testing.T) {
 	// RESOURCE_EXHAUSTED — a silent server-busy would make a stdio DoS probe invisible.
 	// The refused method is recorded, but NOT fabricated into a target (the identifier is
 	// left empty), so target stays absent rather than a phantom "tools/call".
+	//
+	// Exactly ONE record for the two refusals: stdio's pool is gated by the same
+	// saturationGate its HTTP siblings use, so a host hammering a saturated pool writes one
+	// record per saturation EPISODE (with the elided count rolled into the next one) rather
+	// than one per refused request, which would otherwise let a host drive the audit sink's
+	// bounded queue into its monotonic drop counter.
 	_ = sink.Close()
-	rec := findAuditRecordByCode(readAuditRecords(t, logPath), "RESOURCE_EXHAUSTED")
-	if rec == nil {
-		t.Fatal("expected a RESOURCE_EXHAUSTED record for the saturating stdio request")
+	recs := findAuditRecordsByCode(readAuditRecords(t, logPath), "RESOURCE_EXHAUSTED")
+	if len(recs) != 1 {
+		t.Fatalf("got %d RESOURCE_EXHAUSTED records for one saturation episode, want 1", len(recs))
 	}
+	rec := recs[0]
 	if method, _ := rec["method"].(string); method != "tools/call" {
 		t.Errorf("record method=%q, want tools/call", method)
 	}
 	if target, ok := rec["target"]; ok && target != "" {
 		t.Errorf("RESOURCE_EXHAUSTED must record no target, got %q (phantom target from the method)", target)
+	}
+	// The gate the serve loop records through is the proxy's own, and it is re-armable:
+	// serveHost clears it on every successful hostSem acquire, so a LATER saturation is a
+	// new episode and records again. Without that re-arm the transport would report its
+	// first saturation ever and then stay silent for the process lifetime.
+	p.hostSaturation.clear()
+	if ok, suppressed := p.hostSaturation.admit(); !ok || suppressed != 1 {
+		t.Fatalf("the proxy's gate must re-arm and carry the elided refusal; ok=%v suppressed=%d, want true/1", ok, suppressed)
 	}
 }

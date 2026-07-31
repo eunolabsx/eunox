@@ -411,15 +411,24 @@ tamper-evident tape):
   be too. `control/kill` is not an MCP method, so it names no target and
   `suggest` skips it.
 
-  These are the only records an *unauthenticated* caller can cause, so their
-  write rate is bounded by a token bucket: within a burst each refusal is
-  recorded in full, and beyond it the next record that gets through carries a
-  `suppressed_count` of the refusals elided since. Without that bound a
-  credential-spray could overflow the audit queue, and because the sink's drop
-  counter is monotonic, that would leave `--require-audit=strict` denying every
-  legitimate request for the rest of the process's life. A non-zero
-  `suppressed_count` on one of these codes therefore means a flood, not a lost
-  decision record — no *policy* decision is ever rate-limited.
+  A caller sets the rate of every refusal above, so every one of them is
+  admission-controlled. The pre-session refusals — the only records an
+  *unauthenticated* caller can cause, including the proxy-wide session cap — are
+  bounded by one token bucket: within a burst each refusal is recorded in full,
+  and beyond it the next record that gets through carries a `suppressed_count`
+  of the refusals elided since. The two saturation refusals that need an
+  established session (the handler pool and the notification pool) are recorded
+  once per saturation **episode** instead: the first refusal after the pool last
+  had a free slot is recorded, further refusals while it stays saturated roll
+  into the next record's `suppressed_count`, and a successful acquire ends the
+  episode — with a per-pool token bucket underneath so a caller cycling a pool
+  between saturated and drained cannot outpace it. Without those bounds a
+  credential-spray or a notification flood could overflow the audit queue, and
+  because the sink's drop counter is monotonic, that would leave
+  `--require-audit=strict` denying every legitimate request for the rest of the
+  process's life. A non-zero `suppressed_count` on one of these codes therefore
+  means a flood, not a lost decision record — no *policy* decision is ever
+  rate-limited.
 
 The only locally-answered path with no audit record is the `initialize`
 handshake, which is not a guarded action. Every other locally-answered path —

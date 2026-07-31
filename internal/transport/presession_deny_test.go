@@ -129,10 +129,10 @@ func TestHostAllowedForLoopbackEndpoint_PresentButHostlessIsRefused(t *testing.T
 }
 
 // TestAddClaimedSessionID_NilMapAndOversizedHeader pins the two hazards in the shared
-// pre-session detail helper: a nil details map (which recordResourceExhausted passes) must
-// not panic inside an HTTP handler on a security-refusal path, and the attacker-controlled
-// header must be bounded so a single unauthenticated request cannot append most of a 1 MiB
-// header to the tamper-evident tape.
+// pre-session detail helper: a nil details map (what a refusal with no extra context
+// passes) must not panic inside an HTTP handler on a security-refusal path, and the
+// attacker-controlled header must be bounded so a single unauthenticated request cannot
+// append most of a 1 MiB header to the tamper-evident tape.
 func TestAddClaimedSessionID_NilMapAndOversizedHeader(t *testing.T) {
 	t.Parallel()
 	r := newTestRequestWithSession("abc")

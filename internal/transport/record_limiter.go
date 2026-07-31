@@ -1,0 +1,194 @@
+// Copyright 2026 Eunolabs, LLC
+// SPDX-License-Identifier: Apache-2.0
+
+// Admission control over the audit records whose write rate a caller — rather than the
+// policy — sets: the transport-level refusals an unauthenticated caller triggers
+// (recordRateLimiter, instantiated as the pre-session bucket) and the concurrency-pool
+// saturation refusals an established session triggers (saturationGate). No POLICY
+// decision record is ever admission-controlled; only refusals, whose rate is the
+// caller's to choose.
+
+package transport
+
+import (
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// Pre-session denial records are the only audit writes an UNAUTHENTICATED caller can
+// trigger, so they are the only ones whose rate an attacker sets at zero cost. They are
+// bounded by a token bucket rather than written one-per-refusal.
+//
+// Without a bound the refusal record is a lever on the proxy's own availability: the audit
+// queue is finite and its drop counter is monotonic, so one drop latches AuditDegraded()
+// for the process lifetime, and under the default --require-audit=strict every enforced
+// call on every route is then denied AUDIT_UNAVAILABLE. A remote attacker with no
+// credential could take the data plane down by spraying wrong bearer tokens. The flood also
+// buries genuine policy denials: at the default rotate size a few thousand records/second
+// cycles the retention window in minutes.
+//
+// The bucket keeps the evidence the record exists for — the first refusals in a burst are
+// written in full, and the next admitted record carries suppressed_count, so an operator
+// sees both that an attack happened and its scale — while capping the sustained write rate
+// at something the drainer absorbs. The counters are global rather than per-source on
+// purpose: per-source state is itself attacker-sized memory, and the suppressed count
+// already tells the operator how much was elided.
+const (
+	preSessionDenyRatePerSec = 20
+	preSessionDenyBurst      = 50
+)
+
+// newPreSessionDenyLimiter builds the proxy-wide bucket over pre-session refusal records
+// (see the constants above for the rationale and the chosen rate).
+func newPreSessionDenyLimiter() *recordRateLimiter {
+	return newRecordRateLimiter(preSessionDenyRatePerSec, preSessionDenyBurst)
+}
+
+// recordRateLimiter is a token bucket over one CLASS of caller-driven audit refusal
+// records, with a rollup counter so a suppressed write is folded into the next admitted
+// record instead of vanishing. The zero value is not usable; construct with
+// newRecordRateLimiter.
+//
+// Each class holds its own instance on purpose. A single shared bucket would let a flood
+// of one refusal silence another — a notification-pool flood on one session eliding the
+// AUTH_FAILED and ORIGIN_REJECTED records an incident responder reads first — and would
+// make the suppressed_count stamped on any one record a tally of refusals it has nothing
+// to do with, which is not a number an auditor can act on.
+type recordRateLimiter struct {
+	mu         sync.Mutex
+	tokens     float64
+	last       time.Time
+	suppressed uint64
+	ratePerSec float64
+	burst      float64
+	now        func() time.Time // injectable for tests
+}
+
+func newRecordRateLimiter(ratePerSec, burst float64) *recordRateLimiter {
+	return &recordRateLimiter{tokens: burst, ratePerSec: ratePerSec, burst: burst, now: time.Now}
+}
+
+// admit reports whether a refusal record may be written now, and if so how many records
+// were suppressed since the last admitted one (0 when none were). A suppressed refusal
+// still increments the counter, so nothing is lost silently — it is folded into the next
+// record that gets through.
+func (l *recordRateLimiter) admit() (ok bool, suppressed uint64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	if l.last.IsZero() {
+		l.last = now
+	}
+	// Refill, clamped to the burst ceiling. A backwards clock step yields a non-positive
+	// elapsed and simply adds nothing, which is the safe direction.
+	if elapsed := now.Sub(l.last).Seconds(); elapsed > 0 {
+		l.last = now
+		l.tokens += elapsed * l.ratePerSec
+		if l.tokens > l.burst {
+			l.tokens = l.burst
+		}
+	}
+	if l.tokens < 1 {
+		l.suppressed++
+		return false, 0
+	}
+	l.tokens--
+	suppressed, l.suppressed = l.suppressed, 0
+	return true, suppressed
+}
+
+// suppress counts a refusal elided by an OUTER gate — one that never reached admit, so it
+// spends no token — keeping the rollup complete whichever layer did the eliding. Without
+// it, saturationGate's episode collapsing would drop its elided refusals off the tape
+// entirely, which is the accounting hole the suppressed_count rollup exists to prevent.
+func (l *recordRateLimiter) suppress() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.suppressed++
+}
+
+// A saturation refusal (RESOURCE_EXHAUSTED) needs a far smaller sustained rate than a
+// pre-session refusal. It is written once per saturation EPISODE rather than once per
+// refused request (see saturationGate), so on a healthy proxy the steady-state rate is
+// zero and even a genuine incident produces a handful of records — a burst of 20 captures
+// the leading edge of a real one, and 5/s bounds a flip-flop pattern (saturate, drain,
+// re-saturate) that would otherwise open an unbounded number of episodes per second.
+const (
+	saturationRecordRatePerSec = 5
+	saturationRecordBurst      = 20
+)
+
+// saturationGate is the admission control over ONE concurrency pool's RESOURCE_EXHAUSTED
+// records: the stdio host-handler pool, or an HTTP session's request or notification pool.
+// The zero value is usable and is how every pool holds one (lazily initialized, mirroring
+// the semaphores it guards, so a directly constructed session/proxy still gets a real
+// gate).
+//
+// Two layers, because the record's problem is not only its rate:
+//
+//   - Episode collapsing (the primary rule). An operator wants to know that a pool
+//     saturated, not to count every frame refused while it stayed that way. The first
+//     refusal after the pool last had a free slot is recorded; every further refusal in
+//     that same episode is folded into suppressed_count, and a successful acquire (clear)
+//     ends the episode so the next saturation records again. One record per episode is
+//     the signal; the count is its magnitude.
+//
+//   - A token bucket underneath (the backstop). Collapsing alone is not a rate bound: a
+//     caller that holds a pool exactly at capacity can cycle saturate/drain/re-saturate as
+//     fast as the pool drains, opening a fresh episode each time. The bucket makes the
+//     sustained record rate independent of how fast an attacker can cycle it.
+//
+// Scope is per pool, per session — NOT proxy-wide. A proxy-wide bucket would let one
+// session's notification flood elide another session's genuine saturation record, the same
+// cross-talk that makes a shared bucket the wrong home for these. The residual is that N
+// sessions can each write at the per-pool rate, and that is the right shape here: unlike a
+// pre-session refusal, which costs an unauthenticated caller one request, saturating a
+// pool costs an ESTABLISHED session per-pool-capacity concurrent in-flight forwards, and
+// each additional session costs a full authenticated handshake plus its own upstream —
+// bounded independently by the session cap. The attacker's cost scales with the record
+// rate, which is exactly the property the pre-session case lacks.
+type saturationGate struct {
+	// recorded marks that the CURRENT saturation episode has already been offered to the
+	// bucket. Read — not written — on the hot acquire path, so an unsaturated pool costs
+	// one atomic load per acquire and never dirties the cache line.
+	recorded atomic.Bool
+
+	once    sync.Once
+	limiter *recordRateLimiter
+}
+
+// bucket returns the gate's token bucket, creating it on first use so a zero-value gate
+// (a session or proxy built by a struct literal, as tests do) is still rate-bounded.
+func (g *saturationGate) bucket() *recordRateLimiter {
+	g.once.Do(func() { g.limiter = newRecordRateLimiter(saturationRecordRatePerSec, saturationRecordBurst) })
+	return g.limiter
+}
+
+// admit reports whether this refusal may be written as a record, and if so how many
+// refusals were elided since the last admitted one. A refusal inside an episode already
+// spoken for, or one the bucket declines, is counted rather than written.
+//
+// Note the episode is marked spoken-for even when the bucket then declines its leading
+// edge: that episode produces no record at all, and its refusals surface as the
+// suppressed_count on whichever record the bucket admits next. That is the deliberate
+// direction — the alternative is retrying the leading edge on every subsequent refusal,
+// which reinstates exactly the per-refusal bucket pressure the collapsing removes.
+func (g *saturationGate) admit() (ok bool, suppressed uint64) {
+	bucket := g.bucket()
+	if !g.recorded.CompareAndSwap(false, true) {
+		bucket.suppress()
+		return false, 0
+	}
+	return bucket.admit()
+}
+
+// clear ends the current saturation episode: the pool just handed out a slot, so the next
+// refusal is a new episode and is recorded again. Called from every successful acquire, so
+// it takes no lock and skips the store on the overwhelmingly common path where no episode
+// is open.
+func (g *saturationGate) clear() {
+	if g.recorded.Load() {
+		g.recorded.Store(false)
+	}
+}
