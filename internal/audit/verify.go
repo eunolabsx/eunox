@@ -18,13 +18,13 @@ import (
 	"unicode"
 )
 
-// errKeyIDNotInRing is returned by keysToTry (and propagated by VerifyRecord) when
+// errKeyIDNotInRing is returned by keysToTry (and propagated by the signature check) when
 // a record names a key_id absent from the verification ring — a missing key (the
 // expected state after a rotation retired the signing key), NOT an HMAC mismatch.
 // Signalling it distinctly lets VerifyLog report UNKNOWN_KEY_ID rather than INVALID.
 var errKeyIDNotInRing = errors.New("audit record key_id is not in the verification ring")
 
-// errUnidentifiedNoMatch is returned by VerifyRecord when a record names NO key_id
+// errUnidentifiedNoMatch is returned by the signature check when a record names NO key_id
 // (a pre-key_id-era signed record) and no key in the ring matched its HMAC. Unlike
 // a named-key-in-ring mismatch (genuine tampering → INVALID), an unidentified
 // record offers no way to tell a retired/absent signing key from tampering, so the
@@ -32,8 +32,8 @@ var errKeyIDNotInRing = errors.New("audit record key_id is not in the verificati
 // verdict (fail-closed), distinct from both INVALID and UNKNOWN_KEY_ID.
 var errUnidentifiedNoMatch = errors.New("audit record names no key_id and no ring key matched its HMAC")
 
-// errNonCanonicalRecord is returned by VerifyRecord's canonical-on-disk-form check;
-// see that check's comment in VerifyRecord for what it catches and why.
+// errNonCanonicalRecord is returned by the canonical-on-disk-form check; see that
+// check's comment in verifyDecodedRecord for what it catches and why.
 var errNonCanonicalRecord = errors.New("signed audit record is not in canonical on-disk form: its bytes are not what the writer emits for these fields (a duplicate, re-spelled, or reordered key, an added zero-valued field, an alternate escape, or inserted whitespace) — the HMAC covers the record's fields, not its bytes, so a rewrite that decodes to the same fields is rejected here")
 
 // VerifyRecord re-computes the HMAC of a raw record line and reports whether it
@@ -46,27 +46,27 @@ var errNonCanonicalRecord = errors.New("signed audit record is not in canonical 
 // verifyDecodedRecord instead, so a verify pass decodes each line once.
 func (s *Sink) VerifyRecord(line []byte) (bool, error) {
 	rec, err := strictDecodeAuditRecord(line)
-	return s.verifyDecodedRecord(line, rec, err)
+	if err != nil {
+		return false, err
+	}
+	return s.verifyDecodedRecord(line, rec)
 }
 
-// verifyDecodedRecord is VerifyRecord's body over a line whose strict decode the
-// caller already performed, passing the resulting record and the decode's error
-// (nil when it succeeded). Splitting it this way is what lets VerifyLog verify
-// without decoding a second time; decodeErr is reported verbatim, so the
-// pre-decoded path and the standalone one cannot diverge on a malformed or
-// unknown-field line.
+// verifyDecodedRecord is VerifyRecord's body over a line the caller has already
+// strict-decoded. Splitting it this way is what lets VerifyLog verify without
+// decoding a second time.
 //
-// rec MUST be the product of strictDecodeAuditRecord, never of a lenient decode:
-// the HMAC is recomputed below over the re-marshaled struct, and a lenient decode
-// silently DROPS unknown fields, so an injected field (e.g.
+// rec MUST be the product of a SUCCESSFUL strictDecodeAuditRecord, never of a
+// lenient decode: the HMAC is recomputed below over the re-marshaled struct, and a
+// lenient decode silently DROPS unknown fields, so an injected field (e.g.
 // "operator_override":"approved") would not be covered by the recomputed HMAC yet
-// the modified on-disk line would still verify. A non-nil decodeErr returns before
-// rec is read at all, which is what makes it safe for a caller holding a lenient
-// record for its own reporting to pass that record alongside the strict error.
-func (s *Sink) verifyDecodedRecord(line []byte, rec auditRecord, decodeErr error) (bool, error) {
-	if decodeErr != nil {
-		return false, decodeErr
-	}
+// the modified on-disk line would still verify. Taking no error parameter is what
+// enforces that — a caller holding a lenient record holds it precisely because the
+// strict decode FAILED, and it has an error to report instead of a record to pass
+// here, so the unsafe pairing cannot be spelled.
+//
+// A nil receiver is tolerated (see keysToTry): it is the structure-only verify mode.
+func (s *Sink) verifyDecodedRecord(line []byte, rec auditRecord) (bool, error) {
 	storedHMAC := rec.HMAC
 	// Fail closed on an unsigned record rather than proceeding to a comparison against
 	// an empty MAC. Callers classify this shape before reaching here (see classify and
@@ -131,11 +131,13 @@ func (s *Sink) verifyDecodedRecord(line []byte, rec auditRecord, decodeErr error
 	// Constant-time comparison to prevent a timing side channel that could
 	// let an attacker forge an HMAC byte-by-byte.
 	//
-	// Both operands are converted to bytes ONCE, outside the loop: storedHMAC does not
-	// vary by key, and macBuf is refilled in place per key. Inside the loop each would
-	// be a fresh allocation per key per record — with a K-key rotation ring and records
-	// carrying no key_id (which are tried against every key), 2K throwaway allocations
-	// on a path that runs once per record of a multi-GB archive.
+	// macBuf is refilled in place per key rather than each key allocating its own
+	// digest: appendRecordMAC writes into it, where recordMAC would hex-encode into a
+	// fresh string and then convert that back to bytes to compare — 3 allocations per
+	// key per record, on a path that runs once per record of a multi-GB archive.
+	// (The storedHMAC conversion is hoisted for clarity, not for allocation: the
+	// compiler already keeps a non-escaping []byte(string) off the heap, measurably so
+	// both before and after this hoist.)
 	storedMAC := []byte(storedHMAC)
 	var macBuf []byte
 	for _, key := range keys {
@@ -170,9 +172,9 @@ func (s *Sink) keysToTry(keyID string) ([][]byte, error) {
 	// A nil receiver holds no keys rather than panicking. That tolerance is
 	// load-bearing, not defensive: VerifyLog/VerifyLogFiles document a nil verifier as
 	// the structure-only mode (verify shape and chain, no signature check), and classify
-	// calls VerifyRecord unconditionally, so deleting this branch turns that documented
-	// call into a nil dereference. Returning no keys routes the record through
-	// VerifyRecord's "could not verify" branch, never its "tampered" one.
+	// reaches it through verifyDecodedRecord on every signed record, so deleting this
+	// branch turns that pass into a nil dereference. Returning no keys routes the
+	// record through the "could not verify" branch, never the "tampered" one.
 	if s == nil {
 		return nil, nil
 	}
@@ -470,30 +472,57 @@ type recordDecode struct {
 // which drives the signature check.
 //
 // The two are deliberately different — a line with an unknown top-level field is a
-// record the chain must account for AND a line no verifier may accept — but they
-// come from ONE decode on the path that matters. The strict pass runs first and, on
-// the overwhelmingly common good line, is the only pass: a record with no unknown
-// field decodes identically under both tolerances, so the strict result IS the
-// lenient one. Only a line the strict pass rejects needs the lenient view, and
-// paying a second decode there costs nothing on a healthy log while keeping the
-// leniency difference explicit rather than implied by having two decoders.
+// record the chain must account for AND a line no verifier may accept — but no line
+// is ever decoded twice. The strict pass runs first and answers both questions on
+// its own for every line except one shape: a record with no unknown field decodes
+// identically under both tolerances (so the strict result IS the lenient one), and a
+// line broken in any way a lenient decode would also reject is simply not a record.
+// The unknown-field line is the sole case where the verdicts genuinely differ, and
+// it alone pays the second decode — see strictRejectionIsFatal.
 //
-// wellFormed — NOT the returned record's contents — is what gates the chain: a line
-// rejected for a syntax error leaves rec at its zero value, but one rejected for
-// trailing data ({…record…}GARBAGE) decodes its leading object first and so comes
-// back populated. The caller must keep every !wellFormed line out of the chain state
-// on the flag alone, or such a record poisons prevHMAC/prevSeq and fabricates
-// spurious breaks.
+// wellFormed — NOT the returned record's contents — is what gates the chain. A
+// rejected line comes back with the zero record, but the caller must key on the flag
+// rather than on rec looking empty, or a shape that decodes partially would poison
+// prevHMAC/prevSeq and fabricate spurious breaks.
 func decodeAuditRecord(line []byte) (auditRecord, recordDecode) {
 	rec, err := strictDecodeAuditRecord(line)
 	if err == nil {
 		return rec, recordDecode{wellFormed: true}
 	}
-	// Strictly rejected. Whether it is still a record for counting and chain purposes
-	// is exactly the lenient question, so ask it — the strict pass cannot answer it,
-	// since it refuses an unknown-field line and a syntactically broken one alike.
+	if strictRejectionIsFatal(err) {
+		// Not a record under any tolerance, so there is nothing the lenient decode
+		// could add: it would re-parse the same broken bytes to reach the same
+		// verdict. Skipping it matters because a corrupted or attacker-padded archive
+		// is precisely the log an incident responder runs this over — the case that
+		// must not get slower than a single decode.
+		return auditRecord{}, recordDecode{verifyErr: err}
+	}
+	// The strict pass refused an otherwise well-formed line for carrying an unknown
+	// top-level field. That is still a record for counting and chain purposes, and
+	// only a lenient decode can produce it — this is the one line shape in the log
+	// that is parsed twice.
 	lenient, wellFormed := lenientDecodeAuditRecord(line)
 	return lenient, recordDecode{wellFormed: wellFormed, verifyErr: err}
+}
+
+// strictRejectionIsFatal reports whether a strictDecodeAuditRecord error means the
+// line is not a well-formed JSON record at all — in which case a lenient decode is
+// guaranteed to reject it too and is not worth running.
+//
+// The enumerated errors are the ones encoding/json raises for bytes that are not one
+// complete JSON value, plus this package's own trailing-data rejection. Everything
+// else — today, only the unknown-field rejection, which carries no sentinel of its
+// own — falls through to the lenient decode. That default is the safe direction: an
+// unrecognized error costs one extra decode of one line, whereas mistaking a
+// still-decodable line for a fatal one would silently drop it out of the chain.
+func strictRejectionIsFatal(err error) bool {
+	var syntaxErr *json.SyntaxError
+	var typeErr *json.UnmarshalTypeError
+	return errors.Is(err, errTrailingRecordData) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, io.EOF) ||
+		errors.As(err, &syntaxErr) ||
+		errors.As(err, &typeErr)
 }
 
 // strictDecodeAuditRecord decodes one line into an auditRecord, refusing everything
@@ -521,12 +550,21 @@ func strictDecodeAuditRecord(line []byte) (auditRecord, error) {
 	}
 	// Reject trailing bytes: Decode stops at the first value and ignores the rest, so
 	// a tampered {…record…}GARBAGE line would otherwise verify (the HMAC covers the
-	// re-marshaled fields, not the raw line). More() flags any trailing token.
+	// re-marshaled fields, not the raw line). More() flags a trailing token. It is not
+	// the only guard against a padded line — a stray closing brace slips past it, and
+	// the canonical-form check is what rejects that — so this narrows the shapes that
+	// reach verification rather than being the last word on them.
 	if dec.More() {
-		return auditRecord{}, errors.New("trailing data after audit record")
+		return auditRecord{}, errTrailingRecordData
 	}
 	return rec, nil
 }
+
+// errTrailingRecordData is strictDecodeAuditRecord's rejection of bytes after the
+// record. It is a sentinel so strictRejectionIsFatal can recognize it (a line with
+// trailing data is not a record under any tolerance); no caller branches on it
+// otherwise, and it is reported like any other decode error.
+var errTrailingRecordData = errors.New("trailing data after audit record")
 
 // lenientDecodeAuditRecord decodes one line into an auditRecord, TOLERATING an
 // unknown top-level field, and reports whether the line was well-formed JSON with
@@ -746,11 +784,15 @@ func (v *auditChainVerifier) classify(line []byte, rec auditRecord, dec recordDe
 		inReportWindow = false
 	}
 
-	// The strict decode processLine already performed is handed straight through, so
-	// this pass decodes each line once. dec.verifyErr carries the strict verdict for
-	// the line — including the unknown-field rejection rec itself cannot express,
-	// since rec is the lenient decode whenever the strict one failed.
-	ok, err := v.verifier.verifyDecodedRecord(line, rec, dec.verifyErr)
+	// A line the strict decode refused is reported on that error alone: rec is the
+	// LENIENT record in exactly that case (it is what the chain walk needed), and
+	// handing it to the signature check would recompute the HMAC over a struct missing
+	// the very field that made the line unverifiable. Otherwise rec is the strict
+	// decode processLine already performed, reused so this pass decodes each line once.
+	ok, err := false, dec.verifyErr
+	if err == nil {
+		ok, err = v.verifier.verifyDecodedRecord(line, rec)
+	}
 	switch {
 	case errors.Is(err, errKeyIDNotInRing):
 		// Key absent from the ring (retired-key state, not tampering). Report and count

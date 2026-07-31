@@ -48,7 +48,10 @@ func benchCorpus(b *testing.B, n int) ([][]byte, *Sink) {
 	if err != nil {
 		b.Fatalf("loadOrCreateAuditKey: %v", err)
 	}
-	return lines, &Sink{key: key, keyID: hmacKeyID(key)}
+	// NewVerifier, not a hand-built Sink: it is what `eunox audit-verify` constructs,
+	// and it populates verifyKeys, so keysToTry takes the keyring branch the CLI takes
+	// rather than the single-active-key fallback.
+	return lines, NewVerifier([][]byte{key})
 }
 
 // BenchmarkDecodeAuditRecord measures the per-line decode VerifyLog's chain pass
@@ -79,11 +82,19 @@ func BenchmarkVerifyRecord(b *testing.B) {
 }
 
 // BenchmarkVerifyRecordKeyRing measures the same check against a multi-key
-// verification ring on a record naming no key_id, which is the shape that tries
-// every key in turn — the loop whose per-key allocations dominate a rotated log.
+// verification ring on a record naming no key_id — the shape that walks the ring
+// instead of selecting one key, so the per-key work in the comparison loop is what
+// varies.
+//
+// It measures the AVERAGE case, not the worst one: keysToTry builds its candidate
+// list by ranging a map, and Go randomizes map iteration order, so the matching key
+// lands in a uniformly random position and roughly half the ring is hashed per
+// record. Read it against BenchmarkVerifyRecord (single key) for the per-key delta
+// rather than as a K-key worst case.
 func BenchmarkVerifyRecordKeyRing(b *testing.B) {
 	lines, verifier := benchCorpus(b, 64)
-	ring := map[string][]byte{verifier.keyID: verifier.key}
+	key := mustSingleRingKey(b, verifier)
+	ring := map[string][]byte{hmacKeyID(key): key}
 	for i := 0; i < 3; i++ {
 		k := make([]byte, 32)
 		for j := range k {
@@ -93,7 +104,7 @@ func BenchmarkVerifyRecordKeyRing(b *testing.B) {
 	}
 	verifier.verifyKeys = ring
 
-	// Strip key_id and re-sign so every ring key is tried before the match.
+	// Strip key_id and re-sign, so the record names no key and the ring is walked.
 	unidentified := make([][]byte, 0, len(lines))
 	for _, line := range lines {
 		rec, dec := decodeAuditRecord(line)
@@ -105,7 +116,7 @@ func BenchmarkVerifyRecordKeyRing(b *testing.B) {
 		if err != nil {
 			b.Fatalf("marshal: %v", err)
 		}
-		signed, err := signedRecordLine(body, recordMAC(verifier.key, body))
+		signed, err := signedRecordLine(body, recordMAC(key, body))
 		if err != nil {
 			b.Fatalf("signedRecordLine: %v", err)
 		}
@@ -122,8 +133,14 @@ func BenchmarkVerifyRecordKeyRing(b *testing.B) {
 	}
 }
 
-// BenchmarkVerifyLog measures the end-to-end per-record cost of an audit-verify
-// pass: the chain walk plus the signature check over every line.
+// BenchmarkVerifyLog measures the end-to-end cost of an audit-verify pass: the chain
+// walk plus the signature check over every line.
+//
+// One op is one full pass over the corpus, so ns/op and allocs/op are per PASS; the
+// per-record figures — the ones worth quoting — are reported as custom metrics.
+// Striding b.N by the record count instead would run a whole pass on the framework's
+// b.N=1 calibration and charge it to a single op, leaving every reported number a
+// function of how far -benchtime happened to ramp.
 func BenchmarkVerifyLog(b *testing.B) {
 	const records = 512
 	lines, verifier := benchCorpus(b, records)
@@ -131,7 +148,7 @@ func BenchmarkVerifyLog(b *testing.B) {
 
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i += records {
+	for i := 0; i < b.N; i++ {
 		res, err := VerifyLog(bytes.NewReader(joined), verifier, "", time.Time{}, io.Discard)
 		if err != nil {
 			b.Fatalf("VerifyLog: %v", err)
@@ -140,4 +157,20 @@ func BenchmarkVerifyLog(b *testing.B) {
 			b.Fatalf("VerifyLog: %+v", res)
 		}
 	}
+	b.StopTimer()
+	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*records), "ns/record")
+}
+
+// mustSingleRingKey returns the one key benchCorpus's verifier holds. NewVerifier
+// keys its ring by key id, which the caller may not have, so this pulls the value
+// back out rather than duplicating that derivation.
+func mustSingleRingKey(b *testing.B, verifier *Sink) []byte {
+	b.Helper()
+	if len(verifier.verifyKeys) != 1 {
+		b.Fatalf("verifier holds %d keys, want 1", len(verifier.verifyKeys))
+	}
+	for _, k := range verifier.verifyKeys {
+		return k
+	}
+	return nil
 }

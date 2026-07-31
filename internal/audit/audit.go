@@ -2231,14 +2231,20 @@ func recordMAC(key, body []byte) string {
 // field is tagged omitempty), so replacing that brace with `,"_hmac":"..."}` yields
 // the whole record. The spliced field name must match the struct json tag ("_hmac").
 //
-// This is the SINGLE definition of a signed record's on-disk form: writeRecord emits
-// the line with it, and VerifyRecord rebuilds the expected line with it to reject a
-// byte-level rewrite that still decodes to the same fields. One definition is what
-// makes that byte comparison safe — two hand-mirrored splices could drift, and the
-// verifier would then reject genuine records.
+// This is the writer's half of a signed record's on-disk form; isCanonicalSignedLine
+// is the verifier's, comparing a line against these bytes to reject a byte-level
+// rewrite that still decodes to the same fields. The two do NOT share this function
+// — the verifier deliberately avoids materializing a line per record — so they share
+// the pieces instead: macFieldPrefix for the field name and appendJSONString for the
+// value. Anything about the SHAPE of the splice changed here (a second field, a
+// different separator, an _hmac that is no longer last) must be mirrored there, or
+// every genuine record starts failing as non-canonical, which reads as a tampered
+// archive. TestIsCanonicalSignedLine_AgreesWithSignedRecordLine is what catches a
+// one-sided change.
 //
-// It takes ownership of body (it appends through body's backing array); callers must
-// not use body afterwards.
+// It takes ownership of body (it appends through body's backing array) — including
+// on the error path, which splices before it can fail; callers must not use body
+// afterwards either way.
 func signedRecordLine(body []byte, mac string) ([]byte, error) {
 	if n := len(body); n == 0 || body[n-1] != '}' {
 		// Defensive: a struct marshal always ends in '}', so this is unreachable, but
@@ -2307,13 +2313,13 @@ func isPlainJSONString(s string) bool {
 // isCanonicalSignedLine reports whether line is byte-identical to what
 // signedRecordLine(body, mac) would produce, without materializing that line.
 //
-// VerifyRecord calls this for every signed record in an audit-verify pass, which
-// can scan a multi-GB log, so this avoids signedRecordLine's clone-and-append — an
-// allocation and copy proportional to the record's size, dominated by Details, up
-// to 1 MiB — in favor of comparing line directly against body's own backing array
-// and then against the mac field the writer would have spliced on. Nothing here
-// scales with record size, and on the path every genuine record takes (a "sha256:"
-// hex mac, which needs no escaping) nothing is allocated at all.
+// The verify pass runs this for every signed record and can scan a multi-GB log, so
+// it avoids signedRecordLine's clone-and-append — an allocation and copy
+// proportional to the record's size, dominated by Details, up to 1 MiB — in favor of
+// comparing line directly against body's own backing array and then against the mac
+// field the writer would have spliced on. Nothing here scales with record size, and
+// a mac of the size this writer emits is encoded into stack scratch, so a genuine
+// record costs no allocation at all.
 func isCanonicalSignedLine(line, body []byte, mac string) (bool, error) {
 	if n := len(body); n == 0 || body[n-1] != '}' {
 		// Defensive: a struct marshal always ends in '}', so this is unreachable —
@@ -2333,20 +2339,27 @@ func isCanonicalSignedLine(line, body []byte, mac string) (bool, error) {
 		tail[len(tail)-1] != '}' {
 		return false, nil
 	}
-	encodedMAC := tail[len(macFieldPrefix) : len(tail)-1]
-	if isPlainJSONString(mac) {
-		// Same branch appendJSONString takes for this mac, so the two agree by
-		// construction: the encoding is the mac's own bytes in quotes.
-		return len(encodedMAC) == len(mac)+2 &&
-			encodedMAC[0] == '"' && encodedMAC[len(encodedMAC)-1] == '"' &&
-			string(encodedMAC[1:len(encodedMAC)-1]) == mac, nil
-	}
-	macJSON, err := json.Marshal(mac)
+	// The mac's encoding comes from appendJSONString — the SAME call signedRecordLine
+	// makes — rather than a comparison that re-derives what that function would have
+	// produced. Re-deriving it is the drift this check cannot tolerate: the writer's
+	// spelling and the verifier's expectation would then be two implementations, and
+	// a one-sided edit would make every genuine record fail as non-canonical, i.e.
+	// audit-verify calling an untampered archive tampered. Only the mac is
+	// materialized (bounded and small), never the record.
+	var scratch [macScratchBytes]byte
+	wantMAC, err := appendJSONString(scratch[:0], mac)
 	if err != nil {
 		return false, err
 	}
-	return bytes.Equal(encodedMAC, macJSON), nil
+	return bytes.Equal(tail[len(macFieldPrefix):len(tail)-1], wantMAC), nil
 }
+
+// macScratchBytes sizes the stack buffer isCanonicalSignedLine encodes the mac into.
+// Every mac this writer produces is "sha256:" plus a 64-char hex digest, which quotes
+// to 73 bytes; the slack covers a modestly-escaped tampered one. A mac too long for
+// it still encodes correctly — append grows onto the heap — so this bounds the
+// allocation-free path, not the input.
+const macScratchBytes = 96
 
 // writeRecord stamps the chain fields, signs, and writes a single record,
 // advancing the chain head and seq only after a successful write. A dropped or
@@ -2400,9 +2413,9 @@ func (s *Sink) writeRecord(rec *auditRecord) {
 	rec.HMAC = recordMAC(s.key, body)
 
 	// Build the on-disk line through the shared splice (body is not reused after
-	// this, so handing off its backing array is fine). VerifyRecord rebuilds the same
-	// line from the decoded record and requires the on-disk bytes to match it, so
-	// this call is the definition both sides follow.
+	// this, so handing off its backing array is fine). The verify pass compares each
+	// line against these same bytes (isCanonicalSignedLine) and requires a match, so
+	// this call fixes the form both sides are held to.
 	line, err := signedRecordLine(body, rec.HMAC)
 	if err != nil {
 		s.writeFailures.Add(1)

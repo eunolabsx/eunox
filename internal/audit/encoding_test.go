@@ -6,6 +6,7 @@ package audit
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -53,25 +54,53 @@ func TestAppendJSONString_MatchesJSONMarshal(t *testing.T) {
 	}
 }
 
-// TestIsPlainJSONString_NeverOverclaims sweeps every byte value: whenever the
-// predicate says a string needs no escaping, encoding/json must in fact encode it as
-// its own bytes in quotes. A false positive here would have isCanonicalSignedLine
-// compare against a spelling the writer never emits, so the direction that matters
-// is checked exhaustively rather than by example.
+// TestIsPlainJSONString_NeverOverclaims sweeps every byte value AND the multi-byte
+// sequences encoding/json escapes: whenever the predicate says a string needs no
+// escaping, json.Marshal must in fact encode it as its own bytes in quotes. A false
+// positive would have isCanonicalSignedLine compare against a spelling the writer
+// never emits, so the direction that matters is checked exhaustively.
+//
+// The multi-byte cases are not decoration. A byte-at-a-time sweep alone cannot catch
+// the natural relaxation of this predicate — "accept any valid UTF-8 outside the
+// escape set" — because U+2028 and U+2029, which json.Marshal DOES escape, are three
+// bytes each and every one of those bytes fails the predicate in isolation. The
+// accepted-something assertion closes the other hole: a predicate that returned false
+// for everything would satisfy a sweep made only of skips.
 func TestIsPlainJSONString_NeverOverclaims(t *testing.T) {
 	t.Parallel()
+	cases := make([]string, 0, 256)
 	for c := 0; c < 256; c++ {
-		s := "sha256:" + string([]byte{byte(c)}) + "ab"
+		cases = append(cases, "sha256:"+string([]byte{byte(c)})+"ab")
+	}
+	cases = append(cases,
+		"sha256:\u2028split",                       // LINE SEPARATOR: escaped by encoding/json
+		"sha256:\u2029split",                       // PARAGRAPH SEPARATOR: likewise
+		"sha256:\u00a0nbsp",                        // two-byte, not escaped, but not ASCII either
+		"sha256:\ufffdreplacement",                 // the rune an invalid byte decodes to
+		"sha256:caf\u00e9",                         // ordinary multi-byte text
+		"sha256:\U0001f600",                        // four-byte rune
+		"sha256:"+string([]byte{0xed, 0xa0, 0x80}), // lone surrogate: becomes U+FFFD
+		"sha256:"+string([]byte{0xc0, 0x80}),       // overlong encoding
+	)
+
+	accepted := 0
+	for _, s := range cases {
 		if !isPlainJSONString(s) {
 			continue
 		}
+		accepted++
 		want, err := json.Marshal(s)
 		if err != nil {
-			t.Fatalf("json.Marshal(byte %d): %v", c, err)
+			t.Fatalf("json.Marshal(%q): %v", s, err)
 		}
 		if string(want) != `"`+s+`"` {
-			t.Errorf("isPlainJSONString says byte %d needs no escaping, but json.Marshal produced %s", c, want)
+			t.Errorf("isPlainJSONString accepted %q, but json.Marshal produced %s", s, want)
 		}
+	}
+	// Without this the sweep is satisfiable by a predicate that always returns false,
+	// which would silently retire the fast path this test exists to certify.
+	if accepted == 0 {
+		t.Fatal("isPlainJSONString accepted nothing, so the sweep asserted nothing")
 	}
 }
 
@@ -97,17 +126,23 @@ func TestAppendRecordMAC_MatchesGoldenDigest(t *testing.T) {
 		t.Errorf("appendRecordMAC(dst) = %q, want %q", got, "prefix:"+want)
 	}
 	// Refilling one buffer across keys is how the verifier's per-key loop avoids an
-	// allocation per key; a stale suffix left behind by a shorter digest would make a
-	// later key's comparison read bytes from an earlier one.
-	buf := appendRecordMAC(nil, key, body)
+	// allocation per key. What must hold is that a refill yields exactly the digest and
+	// nothing trailing: the loop compares the WHOLE returned slice, so a refill that
+	// left an earlier key's bytes past the digest would fail a legitimate record. Start
+	// from a longer buffer so leftover capacity is actually present to be exposed.
+	buf := append([]byte("padding that is longer than any digest this produces"), 0)
+	buf = appendRecordMAC(buf[:0], key, body)
+	if string(buf) != want {
+		t.Errorf("refill over a longer buffer = %q, want %q", buf, want)
+	}
+	if len(buf) != len(want) {
+		t.Errorf("refill length = %d, want %d (a stale suffix would survive the compare)", len(buf), len(want))
+	}
+	// A second refill with a different key must not read back any of the first.
 	other := append([]byte(nil), key...)
 	other[0] ^= 0xff
-	buf = appendRecordMAC(buf[:0], other, body)
-	if string(buf) == want {
+	if got := string(appendRecordMAC(buf[:0], other, body)); got == want {
 		t.Error("refilled buffer still holds the first key's digest")
-	}
-	if got := string(appendRecordMAC(buf[:0], key, body)); got != want {
-		t.Errorf("refilled buffer = %q, want %q", got, want)
 	}
 }
 
@@ -145,16 +180,29 @@ func TestIsCanonicalSignedLine_AgreesWithSignedRecordLine(t *testing.T) {
 			// A record whose _hmac decodes to the same string but is spelled another
 			// way is exactly what the check exists to reject, so the encodings must not
 			// be interchangeable.
+			encoded, mErr := json.Marshal(mac)
+			if mErr != nil {
+				t.Fatalf("json.Marshal: %v", mErr)
+			}
+			head := line[:len(line)-len(encoded)-1] // everything up to the encoded mac
 			if isPlainJSONString(mac) {
-				escaped, mErr := json.Marshal(mac)
-				if mErr != nil {
-					t.Fatalf("json.Marshal: %v", mErr)
-				}
-				alt := append(append([]byte(nil), line[:len(line)-len(escaped)-1]...),
-					append([]byte(`"\u0073`+mac[1:]+`"`), '}')...)
+				// Re-escape the mac's FIRST byte as \uXXXX: it decodes to the same
+				// string, so only a byte comparison rejects it. The escape is derived
+				// from the mac rather than hard-coded, so adding a mac that starts with
+				// another byte cannot turn this into a vacuous pass (a different string
+				// would be rejected for the wrong reason).
+				alt := fmt.Appendf(append([]byte(nil), head...), `"\u%04x%s"}`, mac[0], mac[1:])
 				if ok, _ := isCanonicalSignedLine(alt, body, mac); ok {
 					t.Errorf("an alternate escaping of the mac was accepted: %s", alt)
 				}
+			}
+			// Junk appended INSIDE the mac field, after the encoded value. This runs for
+			// every mac, plain or escaped, so the comparison must be an equality and not
+			// a prefix match — the branch a plain-only assertion leaves unguarded is
+			// exactly the one an escaped mac takes.
+			padded := fmt.Appendf(append([]byte(nil), head...), `%sZZ}`, encoded)
+			if ok, _ := isCanonicalSignedLine(padded, body, mac); ok {
+				t.Errorf("trailing junk inside the mac field was accepted: %s", padded)
 			}
 		})
 	}
@@ -176,11 +224,18 @@ func TestIsCanonicalSignedLine_RejectsNearMisses(t *testing.T) {
 		"truncated before the mac field": line[:len(body)],
 		"truncated inside the mac":       line[:len(line)-8],
 		"missing closing brace":          line[:len(line)-1],
-		"extra trailing byte":            append(append([]byte(nil), line...), 'x'),
-		"body prefix altered":            bytes.Replace(line, []byte(`"allow"`), []byte(`"deNy!"`), 1),
-		"mac field renamed":              bytes.Replace(line, []byte(`"_hmac"`), []byte(`"_HMAC"`), 1),
-		"whitespace before the mac":      bytes.Replace(line, []byte(`,"_hmac"`), []byte(`, "_hmac"`), 1),
-		"empty line":                     {},
+		// Length-preserving: every other case here shifts the line's length, so the
+		// closing-brace guard is reached only by substituting that byte in place.
+		"closing brace substituted": func() []byte {
+			b := append([]byte(nil), line...)
+			b[len(b)-1] = 'X'
+			return b
+		}(),
+		"extra trailing byte":       append(append([]byte(nil), line...), 'x'),
+		"body prefix altered":       bytes.Replace(line, []byte(`"allow"`), []byte(`"deNy!"`), 1),
+		"mac field renamed":         bytes.Replace(line, []byte(`"_hmac"`), []byte(`"_HMAC"`), 1),
+		"whitespace before the mac": bytes.Replace(line, []byte(`,"_hmac"`), []byte(`, "_hmac"`), 1),
+		"empty line":                {},
 	}
 	for name, tampered := range tests {
 		t.Run(name, func(t *testing.T) {

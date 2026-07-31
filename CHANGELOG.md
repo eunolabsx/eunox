@@ -70,11 +70,14 @@ Section conventions:
   preserved on purpose (a record carrying an unknown top-level field is still counted
   and still holds its place in the chain, while still being one no verifier may accept)
   rather than as a side effect of two decoders existing. Two smaller allocations in the
-  same loop went with it: the stored `_hmac` is converted to bytes once per record
-  instead of once per key tried (with a K-key rotation ring and records naming no
-  `key_id`, that was 2K throwaway allocations per record), and the canonical-on-disk-form
-  check no longer rebuilds a constant-shaped `_hmac` suffix per record. End to end over
-  a signed log: 58 -> 32 allocations per record.
+  same loop went with it: each key tried used to re-derive the digest through a fresh
+  hex string and convert it back to bytes to compare, where the comparison now refills
+  one buffer per record (3 allocations per key per record, multiplied by the ring size
+  for a record naming no `key_id`), and the canonical-on-disk-form check no longer
+  rebuilds a constant-shaped `_hmac` suffix per record. A line that is not a record at
+  all — a truncated or padded one — is still decoded once rather than twice, so a
+  corrupted archive does not pay for the split. End to end over a signed log:
+  58 -> 32 allocations per record.
 
 - **The Redis kill switch's fail-closed staleness budget is floored against a real
   refresh-cycle cost**, instead of being a bare two reconcile intervals. The budget
