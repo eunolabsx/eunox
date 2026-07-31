@@ -59,6 +59,16 @@ Section conventions:
 
 ### Changed
 
+- **A kill-switch audit record's session id is now a type-level distinction**, not a
+  convention. The recorders took a plain session-id string, so keeping an unverified,
+  client-supplied `Mcp-Session-Id` out of the signed `session_id` field rested on the
+  author of each call site reaching for the right one of two near-identical helpers — and
+  the wrong choice fails silently, producing a well-formed, HMAC-chained record asserting
+  a session the proxy never established. They now take a subject value constructible only
+  from an id this proxy established (recorded as `session_id`) or from the request itself
+  (recorded as the unverified `details.claimed_session_id`), so a call site added later
+  must state which it holds and the wrong choice does not compile. No record changes
+  shape. See `docs/threat-model-mcp.md` §3.7.
 - **The refusal-record rate limiter's rollup now names its own scope**, and moved off a
   key it shared with an unrelated statistic. Transport-surface refusals (`AUTH_FAILED`,
   `ORIGIN_REJECTED`, `JWT_INVALID`, `LOOPBACK_REJECTED`, …) are the only audit writes an
