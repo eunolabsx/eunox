@@ -416,14 +416,18 @@ func (p *HTTPProxy) checkOrigin(w http.ResponseWriter, r *http.Request) bool {
 }
 
 // addClaimedSessionID records the client-supplied Mcp-Session-Id header into a
-// pre-session deny's details under claimed_session_id, never as the structured
-// session_id. The transport-level denials that use it (origin rejection, JWT
-// rejection) fire BEFORE any session lookup, so the header is unverified and
-// attacker-controlled; stamping it as session_id would let an unauthenticated caller
-// forge those records against a victim's session. The claimed value is kept as a
-// clearly-unverified detail for correlation, and only when present so a missing
-// header leaves no empty key. Centralizing the rule keeps every pre-session deny
-// path consistent — a new one cannot reintroduce the forgery by hand-rolling it.
+// deny's details under claimed_session_id, never as the structured session_id. The
+// transport-level denials that use it directly (origin rejection, JWT rejection) fire
+// BEFORE any session lookup, so the header is unverified and attacker-controlled;
+// stamping it as session_id would let an unauthenticated caller forge those records
+// against a victim's session. killSubject's claimedSession (forward.go) is the other
+// caller family, reached via auditDetails for a kill-switch record: there a lookup DID
+// run — against the session registry — and failed to resolve, which is a different
+// lifecycle stage but the identical unverified-header risk, so the same treatment
+// applies. The claimed value is kept as a clearly-unverified detail for correlation,
+// and only when present so a missing header leaves no empty key. Centralizing the rule
+// keeps every claimed-but-unresolved-session path consistent — a new one cannot
+// reintroduce the forgery by hand-rolling it.
 // maxClaimedSessionIDLen bounds the attacker-controlled header this stamps into a record.
 // A session id is a UUID; anything longer is not a real id, and without a bound a single
 // unauthenticated request could append most of a 1 MiB header (Go's default
@@ -488,7 +492,15 @@ func boundedRefusalDetail(s string) string {
 }
 
 func addClaimedSessionID(details map[string]interface{}, r *http.Request) map[string]interface{} {
-	claimed := r.Header.Get(SessionHeader)
+	return addClaimedSessionIDValue(details, r.Header.Get(SessionHeader))
+}
+
+// addClaimedSessionIDValue is addClaimedSessionID's request-independent core: every rule
+// (empty-header no-op, nil-details allocation, sanitize/bound, the truncated flag) lives
+// here once, so a caller that already holds the extracted header value — killSubject,
+// which stores the string rather than the *http.Request precisely to avoid re-deriving it
+// — gets the identical treatment through one call instead of a second implementation.
+func addClaimedSessionIDValue(details map[string]interface{}, claimed string) map[string]interface{} {
 	if claimed == "" {
 		return details
 	}
