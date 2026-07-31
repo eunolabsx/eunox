@@ -89,13 +89,6 @@ Flags:
 	}
 	target := pos[0]
 
-	// fs.Visit only reports flags the operator actually passed (unlike comparing
-	// against defaults, which cannot distinguish an explicit --port=3000 from the
-	// unset default), so it detects a flag mix that would otherwise be silently
-	// dropped below.
-	explicit := map[string]bool{}
-	fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
-
 	// Redis transport: write the kill directly to the shared kill-switch state —
 	// the only revocation path for a stdio proxy launched with --redis-addr, which
 	// has no HTTP /control/kill endpoint. Reject a mix of Redis and HTTP-transport
@@ -104,7 +97,11 @@ Flags:
 	// elsewhere (e.g. cmdProxy's --audit/--config check).
 	if *redisAddr != "" {
 		for _, name := range []string{"port", "host", "control-token", "control-token-path"} {
-			if explicit[name] {
+			// flagWasSet reports only flags the operator actually passed (unlike comparing
+			// against defaults, which cannot distinguish an explicit --port=3000 from the
+			// unset default), so it detects a flag mix that would otherwise be silently
+			// dropped.
+			if flagWasSet(fs, name) {
 				fmt.Fprintf(os.Stderr, "eunox kill: --%s is an HTTP-transport flag and has no effect with --redis-addr set; remove --%s or drop --redis-addr\n", name, name)
 				return 1
 			}
@@ -116,7 +113,7 @@ Flags:
 		return 0
 	}
 	for _, name := range []string{"redis-password", "redis-tls"} {
-		if explicit[name] {
+		if flagWasSet(fs, name) {
 			fmt.Fprintf(os.Stderr, "eunox kill: --%s requires --redis-addr; without it the kill silently uses the HTTP control endpoint instead of Redis\n", name)
 			return 1
 		}

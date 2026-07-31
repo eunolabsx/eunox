@@ -299,6 +299,11 @@ func (p *HTTPProxy) initAudienceDenial(ctx context.Context, route *UpstreamRoute
 // explicitly permits it and the session is not killed; all other
 // server-initiated requests are broadcast to SSE subscribers.
 func (p *HTTPProxy) handleHTTPUpstreamRequest(ctx context.Context, sess *httpSession, msg mcp.RPCMsg) {
+	// rt is dereferenced unconditionally (rt.sink/audit/pdp below), matching
+	// dispatchParams and the GET/DELETE paths: a session always carries the route it was
+	// established on. The half-guard this replaced tested rt != nil on one field and then
+	// dereferenced rt three lines later anyway, so it bought nothing except the impression
+	// that a nil route is survivable here.
 	rt := sess.route
 	// Serialize the sampling decision against this session's host-path decisions for a
 	// flow-/sequenceBlock-relevant route, so a flowLabel sink on system:sampling cannot
@@ -306,7 +311,7 @@ func (p *HTTPProxy) handleHTTPUpstreamRequest(ctx context.Context, sess *httpSes
 	// decideMu the host path uses; released before
 	// the forward. nil (no serialization) for a non-flow route.
 	var decideLock func() (end func())
-	if rt != nil && rt.serializeDecisions {
+	if rt.serializeDecisions {
 		decideLock = func() func() {
 			sess.decideMu.Lock()
 			return sync.OnceFunc(sess.decideMu.Unlock)

@@ -80,6 +80,12 @@ func TestValidateProxyNumericFlags(t *testing.T) {
 		{"negative max-sessions", []string{"--max-sessions", "-1"}, true, "--max-sessions"},
 		{"negative session-idle-timeout", []string{"--session-idle-timeout", "-5"}, true, "--session-idle-timeout"},
 		{"negative max-call-counter-keys", []string{"--max-call-counter-keys", "-1"}, true, "--max-call-counter-keys"},
+		// --upstream-timeout owns a legitimate negative sentinel (-1, "defer to the
+		// config"), so -1 and 0 stay valid while anything below the sentinel is a typo
+		// that would silently defer instead of setting the bound the operator meant.
+		{"sentinel upstream-timeout ok", []string{"--upstream-timeout", "-1"}, false, ""},
+		{"zero upstream-timeout ok", []string{"--upstream-timeout", "0"}, false, ""},
+		{"sub-sentinel upstream-timeout", []string{"--upstream-timeout", "-5000"}, true, "--upstream-timeout"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

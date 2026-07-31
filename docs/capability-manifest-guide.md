@@ -1902,12 +1902,15 @@ metadata (`_meta`, content annotations) are preserved unchanged.
 > fields. (Redacting JSON embedded in surrounding prose is not currently supported.)
 >
 > **Exception — doubly-encoded JSON.** A `structuredContent` value or array element —
-> **and, identically, a text content item** — that is itself a serialized JSON object or
-> array (e.g. `{"data": "{\"ssn\": \"…\"}"}` or `["{\"ssn\": \"…\"}"]`) is unwrapped,
+> **and, identically, a text content item or any other top-level result key** — that is
+> itself a serialized JSON object or array (e.g. `{"data": "{\"ssn\": \"…\"}"}` or
+> `["{\"ssn\": \"…\"}"]`) is unwrapped,
 > redacted, and re-serialized, so an upstream cannot smuggle a named field past redaction
 > by double-encoding it. A dotted path is **rebased** to the leaf's position, so the same
 > path that redacts the honest `{"data": {"ssn": "…"}}` (`data.ssn`) also redacts the
-> double-encoded `{"data": "{\"ssn\": \"…\"}"}`.
+> double-encoded `{"data": "{\"ssn\": \"…\"}"}` — and it does so wherever in the result
+> envelope that key sits, so which top-level key the upstream chose to carry the blob
+> under does not change the outcome.
 >
 > **Path matching across encoding boundaries.** Each unwrapped container is matched from
 > its own root, so a **bare** path (`ssn`) also redacts a doubly-encoded `ssn` wherever it

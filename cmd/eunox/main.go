@@ -316,7 +316,7 @@ func registerProxyFlags(fs *flag.FlagSet) *proxyCLIFlags {
 		auditRetainRotated: fs.Int("audit-retain", 0, "Keep at most this many rotated audit files (audit.jsonl.<timestamp>); the oldest\nbeyond this count are deleted after each rotation so the log directory cannot grow\nwithout bound. 0 = keep all. Overridden by the config's audit.retainRotated."),
 		sessionID:          fs.String("session-id", "", "Session ID to use (default: random UUID). (transport: stdio only — a gateway\nmints its own Mcp-Session-Id per client session.)"),
 		shutdownTimeout:    fs.Int("shutdown-timeout", 5000, "Milliseconds to wait for graceful upstream shutdown before SIGKILL."),
-		upstreamTimeout:    fs.Int("upstream-timeout", transport.UpstreamTimeoutUnset, "Milliseconds to wait for the upstream to respond. An explicit value takes\nprecedence over the config's defaults.upstreamTimeoutMs: 0 disables the timeout,\na positive value sets it. Negative (the default) defers to the config, or to the\nbuilt-in default (30000) when the config does not set one either. For a remote\nHTTP upstream (gateway upstreamUrl), a forwarded host notification (e.g.\nnotifications/cancelled) is independently capped at 30s regardless of this flag,\nso a stalling upstream cannot pin the notification's in-flight slot indefinitely;\nfor a subprocess (command) upstream, notification writes share this flag's bound\nlike any other write to that upstream, so 0 leaves them unbounded too."),
+		upstreamTimeout:    fs.Int("upstream-timeout", transport.UpstreamTimeoutUnset, "Milliseconds to wait for the upstream to respond. An explicit value takes\nprecedence over the config's defaults.upstreamTimeoutMs: 0 disables the timeout,\na positive value sets it. -1 (the default) defers to the config, or to the\nbuilt-in default (30000) when the config does not set one either; any other\nnegative value is rejected rather than silently deferring. For a remote\nHTTP upstream (gateway upstreamUrl), a forwarded host notification (e.g.\nnotifications/cancelled) is independently capped at 30s regardless of this flag,\nso a stalling upstream cannot pin the notification's in-flight slot indefinitely;\nfor a subprocess (command) upstream, notification writes share this flag's bound\nlike any other write to that upstream, so 0 leaves them unbounded too."),
 		maxSessions:        fs.Int("max-sessions", defaultMaxSessions, "Cap on concurrent client sessions (transport: http). A new session beyond the cap\nis refused with 503 rather than spawning an unbounded number of upstreams.\nDefaults to a safe backstop (512); pass 0 to disable the cap (unlimited).\nAny listen.maxSessions in the config overrides this flag, including 0, which\ndisables the backstop: a present config value always wins."),
 		sessionIdleTimeout: fs.Int("session-idle-timeout", 0, "Close a session whose host has sent no request for this many milliseconds\n(transport: http), so idle sessions cannot pin upstream processes.\n0 = no idle reaping. Overridden by the config's listen.sessionIdleTimeoutMs."),
 
@@ -557,7 +557,7 @@ func cmdProxy(args []string) (exitCode int) {
 
 	// Open the shared audit sink. The config's audit block takes precedence over
 	// the CLI flags so every route shares one tape.
-	sink, err := openConfiguredAuditSink(*f.auditLog, *f.auditKeyPath, *f.auditRotateSize, *f.auditRetainRotated, cfg, f.requireAudit.required())
+	sink, err := openConfiguredAuditSink(*f.auditLog, *f.auditKeyPath, *f.auditRotateSize, *f.auditRetainRotated, flagWasSet(fs, "audit-retain"), cfg, f.requireAudit.required())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[eunox] Fatal: %v\n", err)
 		return 1
@@ -752,7 +752,15 @@ func sessionKillTTLNotice(ttl time.Duration) string {
 // the sink. Under --require-audit an open failure is returned as an error for the
 // caller to exit on (fail closed); otherwise it warns and returns a nil sink with a
 // nil error, so the proxy continues unaudited.
-func openConfiguredAuditSink(auditLog, auditKeyPath string, auditRotateSize int64, auditRetainRotated int, cfg *config.GatewayConfig, requireAudit bool) (*audit.Sink, error) {
+// warnAuditFlagOverridden prints the shared "config wins over an explicit --audit-* flag"
+// warning for `proxy`, where the audit block always takes precedence so every route
+// shares one tape. flagRepr/cfgRepr are the already-formatted (%q for strings, %d for
+// ints) values, since the four callers' fields differ in type.
+func warnAuditFlagOverridden(flagName, flagRepr, cfgField, cfgRepr string) {
+	fmt.Fprintf(os.Stderr, "[eunox] WARNING: %s %s is overridden by the config's %s %s; the config's audit block always takes precedence for `proxy` so every route shares one tape.\n", flagName, flagRepr, cfgField, cfgRepr)
+}
+
+func openConfiguredAuditSink(auditLog, auditKeyPath string, auditRotateSize int64, auditRetainRotated int, auditRetainSet bool, cfg *config.GatewayConfig, requireAudit bool) (*audit.Sink, error) {
 	auditLogPath, auditKey, auditRotate := auditLog, auditKeyPath, auditRotateSize
 	auditRetain := auditRetainRotated
 	// The config's audit block takes precedence over an explicit --audit-log/
@@ -765,17 +773,27 @@ func openConfiguredAuditSink(auditLog, auditKeyPath string, auditRotateSize int6
 	// why it wasn't.
 	if cfg.Audit.Log != "" {
 		if auditLog != "" && auditLog != cfg.Audit.Log {
-			fmt.Fprintf(os.Stderr, "[eunox] WARNING: --audit-log %q is overridden by the config's audit.log %q; the config's audit block always takes precedence for `proxy` so every route shares one tape.\n", auditLog, cfg.Audit.Log)
+			warnAuditFlagOverridden("--audit-log", fmt.Sprintf("%q", auditLog), "audit.log", fmt.Sprintf("%q", cfg.Audit.Log))
 		}
 		auditLogPath = cfg.Audit.Log
 	}
 	if cfg.Audit.KeyPath != "" {
 		if auditKeyPath != "" && auditKeyPath != cfg.Audit.KeyPath {
-			fmt.Fprintf(os.Stderr, "[eunox] WARNING: --audit-key-path %q is overridden by the config's audit.keyPath %q; the config's audit block always takes precedence for `proxy` so every route shares one tape.\n", auditKeyPath, cfg.Audit.KeyPath)
+			warnAuditFlagOverridden("--audit-key-path", fmt.Sprintf("%q", auditKeyPath), "audit.keyPath", fmt.Sprintf("%q", cfg.Audit.KeyPath))
 		}
 		auditKey = cfg.Audit.KeyPath
 	}
+	// Warn on a silently-overridden explicit flag here too. These two are overridden by
+	// the same config-wins rule as --audit-log/--audit-key-path above, and an operator who
+	// passed a rotation size or retention count and got the config's instead has exactly
+	// the same "why wasn't my flag honored" question — it was only the two string flags
+	// that said so.
 	if cfg.Audit.RotateSizeBytes > 0 {
+		// 0 is this flag's "use the built-in default" spelling, so a non-zero value is an
+		// explicit one (same test the string flags use against "").
+		if auditRotateSize > 0 && auditRotateSize != cfg.Audit.RotateSizeBytes {
+			warnAuditFlagOverridden("--audit-rotate-size", fmt.Sprintf("%d", auditRotateSize), "audit.rotateSizeBytes", fmt.Sprintf("%d", cfg.Audit.RotateSizeBytes))
+		}
 		auditRotate = cfg.Audit.RotateSizeBytes
 	}
 	// A present config value wins, including an explicit 0 ("keep all rotated files"),
@@ -783,6 +801,13 @@ func openConfiguredAuditSink(auditLog, auditKeyPath string, auditRotateSize int6
 	// the flag's value in force. config.ResolveInt holds exactly this precedence rule
 	// (shared with maxSessions/sessionIdleTimeout), so the audit-retention path cannot
 	// drift from the other resolved options.
+	//
+	// Explicitness comes from auditRetainSet (flagWasSet), not from a non-zero value: 0 is
+	// a MEANINGFUL setting here ("keep all"), so an operator can be overridden while
+	// passing the flag's zero value.
+	if cfg.Audit.RetainRotated != nil && auditRetainSet && *cfg.Audit.RetainRotated != auditRetain {
+		warnAuditFlagOverridden("--audit-retain", fmt.Sprintf("%d", auditRetain), "audit.retainRotated", fmt.Sprintf("%d", *cfg.Audit.RetainRotated))
+	}
 	auditRetain = config.ResolveInt(cfg.Audit.RetainRotated, auditRetain)
 	sink, err := audit.Open(auditLogPath, auditKey, auditRotate, auditRetain, audit.WithIdentity(pdp.AuditIdentityFromContext))
 	if err != nil {
@@ -994,6 +1019,11 @@ var redisGatedFlags = []string{
 //     silently disables the documented cap (a fail-open the config leg refuses).
 //   - --shutdown-timeout: the transports clamp a non-positive value to the 5000ms
 //     default, so a negative silently becomes the opposite of a "shorter grace" intent.
+//   - --upstream-timeout: this one has a legitimate NEGATIVE sentinel
+//     (transport.UpstreamTimeoutUnset, -1) meaning "defer to the config", so only values
+//     BELOW it are rejected. ResolveUpstreamTimeout defers on any negative, so a sign typo
+//     for a 5s bound (--upstream-timeout -5000) silently became the 30s default — the
+//     same silent-opposite-of-intent the other three guards exist to catch.
 //
 // Returns the first offending flag's error (without the "eunox proxy: " prefix the caller
 // adds), or nil. A pure function so every guard is unit-testable independently of
@@ -1009,6 +1039,8 @@ func validateProxyNumericFlags(f *proxyCLIFlags) error {
 		return errors.New("--max-call-counter-keys must be >= 0 (0 = unbounded)")
 	case *f.shutdownTimeout < 0:
 		return errors.New("--shutdown-timeout must be >= 0 (0 = use the default)")
+	case *f.upstreamTimeout < transport.UpstreamTimeoutUnset:
+		return fmt.Errorf("--upstream-timeout must be >= %d (0 disables the timeout, %d defers to the config); a value below that is not a sentinel and would silently defer instead of setting the bound you meant", transport.UpstreamTimeoutUnset, transport.UpstreamTimeoutUnset)
 	}
 	return nil
 }
@@ -1578,11 +1610,21 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 	if err != nil {
 		return fmt.Errorf("kill control endpoint: %w", err)
 	}
-	controlTokenFile, err := transport.WriteControlTokenFile(pf.controlTokenPath, controlToken)
-	if err != nil {
-		return fmt.Errorf("kill control endpoint: %w", err)
+	// Persist it only AFTER the listener binds (AfterListen). The write deliberately
+	// overwrites whatever token sits at the shared default path, so doing it here —
+	// before the bind — meant an operator who accidentally started a second proxy got a
+	// clean "address already in use" failure from the doomed process that had already
+	// replaced the RUNNING proxy's token on disk: `eunox kill` then presents a token the
+	// live proxy rejects, and the loopback emergency stop stays broken until restart, in
+	// exactly the confused-deployment situation where it matters most.
+	writeControlToken := func() error {
+		controlTokenFile, werr := transport.WriteControlTokenFile(pf.controlTokenPath, controlToken)
+		if werr != nil {
+			return fmt.Errorf("kill control endpoint: %w", werr)
+		}
+		fmt.Fprintf(os.Stderr, "[eunox] Control token for POST /control/kill written to %s (0600). 'eunox kill' reads it from there; override with --control-token-path / --control-token / EUNOX_CONTROL_TOKEN.\n", controlTokenFile)
+		return nil
 	}
-	fmt.Fprintf(os.Stderr, "[eunox] Control token for POST /control/kill written to %s (0600). 'eunox kill' reads it from there; override with --control-token-path / --control-token / EUNOX_CONTROL_TOKEN.\n", controlTokenFile)
 
 	proxy := transport.NewHTTPProxyGateway(transport.HTTPGatewayOptions{
 		Routes:             routes,
@@ -1596,6 +1638,7 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 		RequireAuditStrict: pf.requireAuditStrict,
 		AuthToken:          cfg.Listen.AuthToken,
 		ControlToken:       controlToken,
+		AfterListen:        writeControlToken,
 		TrustFwdFor:        pf.trustFwdFor,
 		TrustedProxyCIDRs:  cfg.Listen.TrustedProxyCIDRs,
 		TrustedProxyHops:   trustedProxyHops,
@@ -2139,7 +2182,12 @@ func writeGeneratedFile(path, content string, force bool) (err error) {
 		if err := refuseNonRegularOutput(path); err != nil {
 			return err
 		}
-		flags = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+		// config.OpenNoFollow (O_NOFOLLOW on unix, 0 elsewhere) closes the Lstat->open
+		// race the guard above cannot: the guard inspects the path, then OpenFile resolves
+		// it again, and a link planted in that window would be followed — truncating the
+		// TARGET, which the Chmod below would then re-mode to 0600 as well. O_EXCL already
+		// refuses a symlink for free, which is why only the force path needs the flag.
+		flags = os.O_WRONLY | os.O_CREATE | os.O_TRUNC | config.OpenNoFollow
 	}
 	f, err := os.OpenFile(path, flags, 0o600) //nolint:gosec // G304: path is an operator-provided --output/--config-output location, and 0600 is the intended restrictive mode
 	if err != nil {

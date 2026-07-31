@@ -433,6 +433,14 @@ func TestStdioProxy_ConnectUpstream_SubprocessLifecycle(t *testing.T) {
 	// SIGTERM should terminate `sleep`; waitUpstream then reaps it.
 	p.signalUpstream(syscall.SIGTERM)
 	p.waitUpstream()
+	// Perform the same teardown Start does once the upstream has exited. Skipping it
+	// left signalUpstream's AfterFunc armed with nothing to cancel it, so its goroutine
+	// fired shutdownMs after this test returned and read os.Stderr while an unrelated
+	// test was swapping that process-global through captureStderr — a data race the
+	// detector then attributed to whatever test happened to be running.
+	if !p.stopKillTimer() {
+		t.Error("the SIGKILL fallback fired before teardown could cancel it; its goroutine outlives this test")
+	}
 }
 
 // TestStdioProxy_SignalUpstream_KillTimerStoppable pins the fix: the
@@ -466,7 +474,10 @@ func TestStdioProxy_SignalUpstream_KillTimerStoppable(t *testing.T) {
 	if timer == nil {
 		t.Fatal("signalUpstream did not capture the SIGKILL fallback timer (regression)")
 	}
-	if !timer.Stop() {
+	// Through stopKillTimer, the same call Start's teardown makes: a true return is the
+	// timer being cancelled in time, which is what suppresses the spurious SIGKILL log
+	// path and keeps the fallback goroutine from outliving the shutdown.
+	if !p.stopKillTimer() {
 		t.Error("kill timer already fired or was stopped; teardown cannot suppress the spurious SIGKILL log path")
 	}
 

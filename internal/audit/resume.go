@@ -304,10 +304,7 @@ func truncatePartialTailWindowed(f *os.File, winSize int64) (truncated int64, la
 	// A record (plus its boundary newline) always fits in this window — details are
 	// capped well below it — so the last newline, the boundary of the last complete
 	// record, is always within the window when the file holds any complete record.
-	start := int64(0)
-	if size > winSize {
-		start = size - winSize
-	}
+	start := tailWindowStart(size, winSize)
 	buf := make([]byte, size-start)
 	n, err := f.ReadAt(buf, start)
 	if err != nil && err != io.EOF {
@@ -362,6 +359,20 @@ func truncatePartialTailWindowed(f *os.File, winSize int64) (truncated int64, la
 	return size - newSize, line, nil
 }
 
+// tailWindowStart returns the offset a size-byte log's trailing win-byte scan window
+// begins at: the last win bytes, or the whole file when it is shorter.
+//
+// One definition, because the three places that compute it must agree on what "the tail
+// window" IS — the resume probe, the resume line re-read, and the seq-contribution scan.
+// Drift between them would silently change which bytes each considers the tail, and the
+// re-read's no-op short-circuit is stated in terms of the probe's answer.
+func tailWindowStart(size, win int64) int64 {
+	if size > win {
+		return size - win
+	}
+	return 0
+}
+
 // tailLineFromWindow returns the last complete record of a log whose current size is
 // size, given window — the bytes of the range [start, size) already read from f.
 //
@@ -380,9 +391,13 @@ func tailLineFromWindow(f *os.File, window []byte, start, size, winSize int64) (
 	if bounded || start == 0 || line == "" {
 		return line, nil
 	}
-	reStart := int64(0)
-	if size > winSize {
-		reStart = size - winSize
+	reStart := tailWindowStart(size, winSize)
+	// Re-read only when the truncation actually moved the window's start. reStart is
+	// derived from the POST-truncation size, so when nothing was dropped it lands on the
+	// same offset as start and the read returns the bytes already in hand — the same
+	// answer, one syscall later. It can never land LATER than start: the file only shrinks.
+	if reStart >= start {
+		return line, nil
 	}
 	buf := make([]byte, size-reStart)
 	n, err := f.ReadAt(buf, reStart)

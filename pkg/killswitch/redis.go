@@ -920,15 +920,13 @@ func (r *Redis) Status(_ context.Context) (*Status, error) {
 // publish broadcasts msg on the kill-switch channel and returns any publish error.
 // The durable write and cache update already happened, so a publish failure does NOT
 // undo the kill on the issuing instance — it only delays remote convergence to the
-// next reconcile; returning the error lets the caller report partial propagation. A
-// client without Publish (e.g. a test fake) is a successful no-op.
+// next reconcile; returning the error lets the caller report partial propagation.
+//
+// Called directly on r.client: Publish is part of redis.Cmdable, so every client this
+// type can hold has it. (Subscribe, which the pub/sub receive path guards for, is NOT on
+// Cmdable — that assertion is live, this one never was.)
 func (r *Redis) publish(ctx context.Context, msg string) error {
-	if pub, ok := r.client.(interface {
-		Publish(ctx context.Context, channel string, message interface{}) *redis.IntCmd
-	}); ok {
-		return pub.Publish(ctx, redisPubSubChan, msg).Err()
-	}
-	return nil
+	return r.client.Publish(ctx, redisPubSubChan, msg).Err()
 }
 
 // recordRefreshErr stores err as the last refresh error under the lock and returns
@@ -1032,9 +1030,10 @@ func (r *Redis) commitRefreshLocked(global bool, agents, sessions map[string]boo
 	r.lastRefreshOK = r.clock()
 }
 
-// scanner is the subset of a Redis node needed to enumerate keys by prefix. Both
-// *redis.Client and *redis.ClusterClient satisfy it; a client that does not is a
-// fail-closed error, not a silent no-op.
+// scanner is the subset of a Redis node needed to enumerate keys by prefix. It is a
+// PARAMETER type for the per-node helpers, which are called both with r.client and with
+// an individual master from ForEachMaster; it is not a capability test, since redis.Cmdable
+// (the only type r.client can hold) statically carries Scan.
 type scanner interface {
 	Scan(ctx context.Context, cursor uint64, match string, count int64) *redis.ScanCmd
 }
@@ -1061,14 +1060,8 @@ func (r *Redis) scanPrefix(ctx context.Context, prefix string, target map[string
 			return scanNode(ctx, node, prefix, target, &mu)
 		})
 	}
-	sc, ok := r.client.(scanner)
-	if !ok {
-		// Fail closed: a client that cannot SCAN would load an EMPTY kill set, making
-		// every killed subject appear alive (a silent fail-open). Return an error so
-		// the refresh is recorded as failed instead.
-		return fmt.Errorf("killswitch: redis client %T does not implement Scan; cannot enumerate kill-switch keys", r.client)
-	}
-	return scanNode(ctx, sc, prefix, target, nil)
+	// r.client satisfies scanner by construction: Scan is part of redis.Cmdable.
+	return scanNode(ctx, r.client, prefix, target, nil)
 }
 
 // scanNode SCANs a single node for keys matching prefix and records the stripped
@@ -1113,13 +1106,9 @@ func (r *Redis) deleteByPrefix(ctx context.Context, prefix string) error {
 			return deleteNodeKeys(ctx, node, prefix)
 		})
 	}
-	sd, ok := r.client.(scanDeleter)
-	if !ok {
-		// Fail closed: returning nil would make Reset() report success while leaving
-		// every kill key in Redis, corrupting state for all replicas.
-		return fmt.Errorf("killswitch: redis client %T does not implement Scan/Del; cannot delete kill-switch keys by prefix %q", r.client, prefix)
-	}
-	return deleteNodeKeys(ctx, sd, prefix)
+	// r.client satisfies scanDeleter by construction: Scan and Del are both part of
+	// redis.Cmdable.
+	return deleteNodeKeys(ctx, r.client, prefix)
 }
 
 // deleteNodeKeys SCANs a single node for keys matching prefix and deletes them one

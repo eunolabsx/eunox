@@ -19,6 +19,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -2111,6 +2112,132 @@ func TestJWTInvalid_AuditRecordSeparatesClaimedSessionID(t *testing.T) {
 	}
 	if got, _ := details["claimed_session_id"].(string); got != claimedSessionID {
 		t.Errorf("details.claimed_session_id = %q, want %q", got, claimedSessionID)
+	}
+}
+
+// TestPreSessionDeny_StampsSourceIP: every pre-session refusal must name where it came
+// from. source_ip used to be hand-added by each caller, and the two that omitted it were
+// the unauthenticated Origin probe and the JWT rejection — the two records an incident
+// responder reads first. It is stamped centrally now, so both carry it.
+func TestPreSessionDeny_StampsSourceIP(t *testing.T) {
+	jwksServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"keys":[]}`))
+	}))
+	defer jwksServer.Close()
+	jwtPDP := pdp.NewJWTPDP(pdp.JWTPDPOptions{JWKSURI: jwksServer.URL, Audience: "test-aud"})
+
+	for _, tc := range []struct {
+		name string
+		code string
+		call func(t *testing.T, proxy *HTTPProxy)
+	}{
+		{
+			name: "origin",
+			code: "ORIGIN_REJECTED",
+			call: func(t *testing.T, proxy *HTTPProxy) {
+				t.Helper()
+				req := httptest.NewRequest(http.MethodGet, "/mcp", http.NoBody)
+				req.Header.Set("Origin", "https://evil.example.com")
+				req.RemoteAddr = "203.0.113.7:1234"
+				if proxy.checkOrigin(httptest.NewRecorder(), req) {
+					t.Fatal("checkOrigin allowed a foreign Origin")
+				}
+			},
+		},
+		{
+			name: "jwt",
+			code: "JWT_INVALID",
+			call: func(t *testing.T, proxy *HTTPProxy) {
+				t.Helper()
+				req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize"}`))
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("Authorization", "Bearer not-a-valid-token")
+				req.RemoteAddr = "203.0.113.7:1234"
+				rec := httptest.NewRecorder()
+				proxy.handleMCP(rec, req)
+				if rec.Code != http.StatusUnauthorized {
+					t.Fatalf("status = %d, want 401", rec.Code)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sink, logPath := newTempAuditSink(t)
+			opts := httpProxyOptions{Bind: "127.0.0.1", Sink: sink}
+			if tc.code == "JWT_INVALID" {
+				opts.JWTPDP = jwtPDP
+			}
+			tc.call(t, newHTTPProxy(opts))
+			_ = sink.Close()
+
+			r := findAuditRecordByMethod(readAuditRecords(t, logPath), "", "deny")
+			if r == nil {
+				t.Fatalf("no %s deny record written", tc.code)
+			}
+			if code, _ := r["denial_code"].(string); code != tc.code {
+				t.Fatalf("denial_code = %q, want %s", code, tc.code)
+			}
+			details, _ := r["details"].(map[string]interface{})
+			if got, _ := details["source_ip"].(string); got != "203.0.113.7" {
+				t.Errorf("details.source_ip = %q, want the requesting address", got)
+			}
+		})
+	}
+}
+
+// TestOriginRejection_BoundsRecordedOrigin: the rejected Origin is attacker-controlled and
+// can be ~1 MiB (Go's default MaxHeaderBytes). Writing it whole made every refused request
+// a lever on signed-log growth from a caller holding no credential, so the recorded value
+// is cut and flagged as not-verbatim.
+func TestOriginRejection_BoundsRecordedOrigin(t *testing.T) {
+	sink, logPath := newTempAuditSink(t)
+	proxy := newHTTPProxy(httpProxyOptions{Bind: "127.0.0.1", Sink: sink})
+
+	huge := "https://evil.example.com/" + strings.Repeat("A", 64*1024)
+	req := httptest.NewRequest(http.MethodGet, "/mcp", http.NoBody)
+	req.Header.Set("Origin", huge)
+	if proxy.checkOrigin(httptest.NewRecorder(), req) {
+		t.Fatal("checkOrigin allowed a foreign Origin")
+	}
+	_ = sink.Close()
+
+	r := findAuditRecordByMethod(readAuditRecords(t, logPath), "", "deny")
+	if r == nil {
+		t.Fatal("no ORIGIN_REJECTED deny record written")
+	}
+	details, _ := r["details"].(map[string]interface{})
+	got, _ := details["origin"].(string)
+	if len(got) > maxRefusalDetailLen {
+		t.Errorf("details.origin is %d bytes, want at most %d", len(got), maxRefusalDetailLen)
+	}
+	if !strings.HasPrefix(got, "https://evil.example.com/") {
+		t.Errorf("details.origin = %q, want the leading bytes of the rejected value", got)
+	}
+	if truncated, _ := details["origin_truncated"].(bool); !truncated {
+		t.Error("a cut origin must be flagged origin_truncated so a reader knows it is not verbatim")
+	}
+}
+
+// TestLoopbackRejection_BoundsRecordedPath is the same bound on the other
+// client-controlled string a refusal records.
+func TestLoopbackRejection_BoundsRecordedPath(t *testing.T) {
+	sink, logPath := newTempAuditSink(t)
+	proxy := newHTTPProxy(httpProxyOptions{Bind: "127.0.0.1", Sink: sink})
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics/"+strings.Repeat("p", 32*1024), http.NoBody)
+	req.RemoteAddr = "203.0.113.9:5555"
+	if proxy.loopbackOnly(httptest.NewRecorder(), req) {
+		t.Fatal("loopbackOnly admitted a non-loopback source")
+	}
+	_ = sink.Close()
+
+	r := findAuditRecordByMethod(readAuditRecords(t, logPath), "", "deny")
+	if r == nil {
+		t.Fatal("no LOOPBACK_REJECTED deny record written")
+	}
+	details, _ := r["details"].(map[string]interface{})
+	if got, _ := details["path"].(string); len(got) > maxRefusalDetailLen {
+		t.Errorf("details.path is %d bytes, want at most %d", len(got), maxRefusalDetailLen)
 	}
 }
 
@@ -4719,6 +4846,88 @@ func TestNewHTTPProxyGateway_MalformedTrustedProxyCIDREntryWarns(t *testing.T) {
 	if got := proxy.trustedProxyNets[0].String(); got != "10.0.0.0/8" {
 		t.Errorf("trustedProxyNets[0] = %q, want \"10.0.0.0/8\"", got)
 	}
+}
+
+// ── AfterListen ───────────────────────────────────────────────────────────
+
+// TestServe_AfterListenNotRunWhenBindFails pins the ordering the control-token write
+// depends on: a proxy that loses the bind race must not run its post-bind hook at all.
+// The hook persists the control token to a path shared with the RUNNING proxy and
+// deliberately overwrites what is there, so running it on the way to "address already in
+// use" would leave the live proxy's `eunox kill` credential replaced by a dead process's.
+func TestServe_AfterListenNotRunWhenBindFails(t *testing.T) {
+	t.Parallel()
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("occupy port: %v", err)
+	}
+	defer func() { _ = occupied.Close() }()
+	port := occupied.Addr().(*net.TCPAddr).Port
+
+	var ran atomic.Bool
+	proxy := NewHTTPProxyGateway(HTTPGatewayOptions{
+		Routes:      map[string]*UpstreamRoute{},
+		Bind:        "127.0.0.1",
+		Port:        port,
+		AfterListen: func() error { ran.Store(true); return nil },
+	})
+	err = proxy.Serve(t.Context())
+	if err == nil {
+		t.Fatal("Serve must fail when the address is already in use")
+	}
+	if !strings.Contains(err.Error(), "listening on") {
+		t.Errorf("Serve error = %v, want the bind failure", err)
+	}
+	if ran.Load() {
+		t.Error("AfterListen must not run when the bind fails: it would clobber the running proxy's state")
+	}
+}
+
+// TestServe_AfterListenErrorAbortsServe: a post-bind hook that cannot complete must fail
+// the proxy rather than leave it serving. The control token is what authenticates
+// /control/kill, so a proxy that came up without persisting it would answer requests while
+// no operator can reach its emergency stop.
+func TestServe_AfterListenErrorAbortsServe(t *testing.T) {
+	t.Parallel()
+	hookErr := errors.New("cannot persist control token")
+	proxy := NewHTTPProxyGateway(HTTPGatewayOptions{
+		Routes:      map[string]*UpstreamRoute{},
+		Bind:        "127.0.0.1",
+		Port:        freeTCPPort(t),
+		AfterListen: func() error { return hookErr },
+	})
+	if err := proxy.Serve(t.Context()); !errors.Is(err, hookErr) {
+		t.Fatalf("Serve error = %v, want %v", err, hookErr)
+	}
+}
+
+// TestServe_AfterListenRunsBeforeServing: the hook runs once the address is held, and
+// before any request is accepted, so the token file is on disk by the time /control/kill
+// can be called.
+func TestServe_AfterListenRunsBeforeServing(t *testing.T) {
+	t.Parallel()
+	port := freeTCPPort(t)
+	ran := make(chan struct{})
+	proxy := NewHTTPProxyGateway(HTTPGatewayOptions{
+		Routes:      map[string]*UpstreamRoute{},
+		Bind:        "127.0.0.1",
+		Port:        port,
+		AfterListen: func() error { close(ran); return nil },
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- proxy.Serve(ctx) }()
+	select {
+	case <-ran:
+	case err := <-done:
+		t.Fatalf("Serve returned before running AfterListen: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("AfterListen did not run")
+	}
+	waitForServer(t, fmt.Sprintf("http://127.0.0.1:%d/healthz", port))
+	cancel()
+	<-done
 }
 
 // ── sourceIP ──────────────────────────────────────────────────────────────

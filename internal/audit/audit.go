@@ -32,6 +32,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/eunolabs/eunox/internal/config"
 	"github.com/eunolabs/eunox/pkg/capability"
 )
 
@@ -406,15 +407,15 @@ func openAndPrepareLog(logPath string, preSize int64, lockFile *os.File) (f *os.
 	}
 
 	readable := true
-	// openNoFollow (O_NOFOLLOW on unix, 0 elsewhere) makes the kernel refuse a
+	// config.OpenNoFollow (O_NOFOLLOW on unix, 0 elsewhere) makes the kernel refuse a
 	// final-component symlink atomically, closing the Lstat->OpenFile TOCTOU the
 	// refuseNonRegular check above cannot. A symlink surviving to here fails the open
 	// with ELOOP, which is neither ErrPermission nor ErrNotExist, so it falls straight
 	// into the fail-closed return below rather than the write-only fallback.
-	f, err = os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_RDWR|openNoFollow, 0o600) //nolint:gosec // G304: path is user-configured audit log location
+	f, err = os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_RDWR|config.OpenNoFollow, 0o600) //nolint:gosec // G304: path is user-configured audit log location
 	if errors.Is(err, os.ErrPermission) {
 		readable = false
-		f, err = os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY|openNoFollow, 0o600) //nolint:gosec // G304: path is user-configured audit log location
+		f, err = os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY|config.OpenNoFollow, 0o600) //nolint:gosec // G304: path is user-configured audit log location
 	}
 	if err != nil {
 		_ = releaseAuditLock(lockFile)
@@ -1060,10 +1061,10 @@ func NewLineScanner(r io.Reader) *bufio.Scanner {
 //     is the normal brand-new-install case.
 //   - (line, nil): the extracted last record line.
 func readLastAuditLine(path string) (string, error) {
-	// openNoFollow here too, not just on the append opens: this read is Open's
+	// config.OpenNoFollow here too, not just on the append opens: this read is Open's
 	// chain-resume path, so a symlink planted at the log path would otherwise seed the
 	// resumed chain from an attacker-chosen file.
-	f, err := os.OpenFile(path, os.O_RDONLY|openNoFollow, 0) //nolint:gosec // G304: path is the user-configured audit log
+	f, err := os.OpenFile(path, os.O_RDONLY|config.OpenNoFollow, 0) //nolint:gosec // G304: path is the user-configured audit log
 	if err != nil {
 		if os.IsNotExist(err) {
 			// Absent file: the normal brand-new-install / freshly-rotated case, not an
@@ -1086,10 +1087,7 @@ func readLastAuditLine(path string) (string, error) {
 	// line-scan ceiling must agree, or a record one reader accepts is one the other
 	// truncates.
 	size := info.Size()
-	start := int64(0)
-	if size > auditScanBufferBytes {
-		start = size - auditScanBufferBytes
-	}
+	start := tailWindowStart(size, auditScanBufferBytes)
 	buf := make([]byte, size-start)
 	n, err := f.ReadAt(buf, start)
 	if err != nil && err != io.EOF {
@@ -1317,10 +1315,26 @@ func (s *Sink) Record(ctx context.Context, p RecordParams) {
 		KeyID:         s.keyID,
 	}
 
-	// Non-blocking enqueue: drop and count if the channel is full. The read lock
-	// excludes Close's channel close for the span of the send, so the send never
-	// races close(s.records); once closed, the send is skipped and the record is
-	// counted as dropped rather than panicking on a closed channel.
+	// The drop warnings are emitted OUTSIDE the lock. stderr can block indefinitely — a
+	// log collector that died with its pipe full is the ordinary case — and these lines
+	// fire precisely during a drop storm, which is when Close (which needs the WRITE lock)
+	// most needs to make progress. Writing them inside the read-locked span put a blocking
+	// syscall in front of it; the rate limit bounds how OFTEN they are written, not how
+	// long one write can stall.
+	if warn := s.enqueue(rec, mcpMethod, target); warn != "" {
+		fmt.Fprint(os.Stderr, warn)
+	}
+}
+
+// enqueue is the locked half of Record: the shutdown check, the byte-budget check, and the
+// non-blocking send. The read lock excludes Close's channel close for the span of the send,
+// so the send never races close(s.records); once closed, the send is skipped and the record
+// is counted as dropped rather than panicking on a closed channel.
+//
+// It returns the drop-warning line for the caller to write after releasing the lock (empty
+// when there is nothing to warn about); formatting the message is cheap and lock-safe, only
+// the write to stderr is not.
+func (s *Sink) enqueue(rec auditRecord, mcpMethod, target string) string {
 	size := rec.queueSize()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1330,27 +1344,31 @@ func (s *Sink) Record(ctx context.Context, p RecordParams) {
 		// would misattribute the cause.
 		s.dropped.Add(1)
 		s.recordDropBucket(mcpMethod, target)
-		return
+		return ""
 	}
 	if s.queuedBytes.Load()+size > auditQueueByteBudget {
 		// Over the aggregate byte budget even though a slot may still be free: a slow
 		// disk plus large-argument records would otherwise retain gigabytes of heap and
 		// OOM the proxy. Drop and count like a full queue — the drop marker keeps the
 		// loss tamper-evident.
+		warn := ""
 		if n := s.dropped.Add(1); n == 1 || n%100 == 0 {
-			fmt.Fprintf(os.Stderr, "[eunox] WARNING: audit record dropped (%d total) — write queue over its %d-byte memory budget; check disk I/O\n", n, int64(auditQueueByteBudget))
+			warn = fmt.Sprintf("[eunox] WARNING: audit record dropped (%d total) — write queue over its %d-byte memory budget; check disk I/O\n", n, int64(auditQueueByteBudget))
 		}
 		s.recordDropBucket(mcpMethod, target)
-		return
+		return warn
 	}
 	select {
 	case s.records <- rec:
 		s.queuedBytes.Add(size)
+		return ""
 	default:
+		warn := ""
 		if n := s.dropped.Add(1); n == 1 || n%100 == 0 {
-			fmt.Fprintf(os.Stderr, "[eunox] WARNING: audit record dropped (%d total) — write queue is full; check disk I/O\n", n)
+			warn = fmt.Sprintf("[eunox] WARNING: audit record dropped (%d total) — write queue is full; check disk I/O\n", n)
 		}
 		s.recordDropBucket(mcpMethod, target)
+		return warn
 	}
 }
 

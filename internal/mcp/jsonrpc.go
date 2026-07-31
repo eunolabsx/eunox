@@ -670,9 +670,16 @@ func (mw *MsgWriter) Write(msg RPCMsg) error {
 		err = fmt.Errorf("%w: %d of %d bytes: %w", ErrFrameDesync, n, len(data), err)
 		mw.poisonErr = err
 		justPoisoned = true
-	case mw.deadliner != nil && errors.Is(err, os.ErrDeadlineExceeded):
+	case n == 0 && mw.deadliner != nil && errors.Is(err, os.ErrDeadlineExceeded):
 		// A deadline expiry that wrote nothing left the framing intact, but the pipe is
 		// wedged and the session is torn down either way; keep the established behavior.
+		//
+		// Gated on n == 0 for the same reason the partial-write arm is keyed on the byte
+		// count: a deadline error accompanying a COMPLETE write (n == len(data), which
+		// io.Writer permits) means the frame landed, so poisoning the writer would tear
+		// down a healthy stream and put a fabricated UPSTREAM_TIMEOUT on the tape for a
+		// call that was delivered — the misclassification the ErrFrameDesync /
+		// ErrUpstreamWriteTimeout split exists to prevent, in the other direction.
 		err = fmt.Errorf("%w: %v", ErrUpstreamWriteTimeout, err)
 		mw.poisonErr = err
 		justPoisoned = true

@@ -237,7 +237,7 @@ func (p *HTTPProxy) checkAuth(w http.ResponseWriter, r *http.Request) bool {
 		// tamper-evident tape, mirroring the ORIGIN_REJECTED / JWT_INVALID pre-session
 		// records. recordPreSessionDeny never records the presented credential — only the
 		// source and the unverified claimed session id — and keeps session_id empty.
-		p.recordPreSessionDeny(r, codeAuthFailed, "auth", map[string]interface{}{"source_ip": p.sourceIP(r)})
+		p.recordPreSessionDeny(r, codeAuthFailed, "auth", nil)
 		w.Header().Set("WWW-Authenticate", buildWWWAuthenticate(credPresented, p.oauthMetaURL))
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return false
@@ -261,8 +261,7 @@ func (p *HTTPProxy) checkControlToken(w http.ResponseWriter, r *http.Request) bo
 		// worth probing, so leaving it as an HTTP status only meant an operator reviewing
 		// the tape saw no evidence the endpoint was ever touched.
 		p.recordPreSessionDeny(r, codeControlAuthFailed, "control", map[string]interface{}{
-			"source_ip": p.sourceIP(r),
-			"reason":    "control_token_unconfigured",
+			"reason": "control_token_unconfigured",
 		})
 		http.Error(w, "control endpoint not configured", http.StatusServiceUnavailable)
 		return false
@@ -273,7 +272,7 @@ func (p *HTTPProxy) checkControlToken(w http.ResponseWriter, r *http.Request) bo
 		// same-host process probing it with a wrong/missing token is exactly the threat the
 		// token defends, and must not be invisible on the tape. recordPreSessionDeny never
 		// records the presented token — only the source and the unverified claimed session id.
-		p.recordPreSessionDeny(r, codeControlAuthFailed, "control", map[string]interface{}{"source_ip": p.sourceIP(r)})
+		p.recordPreSessionDeny(r, codeControlAuthFailed, "control", nil)
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return false
 	}
@@ -386,9 +385,21 @@ func (p *HTTPProxy) checkOrigin(w http.ResponseWriter, r *http.Request) bool {
 	if multiple {
 		recordedOrigin = strings.Join(vals, ", ")
 	}
+	// Bound it before it reaches either the tape or stderr: an unauthenticated client can
+	// put ~1 MiB (Go's default MaxHeaderBytes) in an Origin header, and both destinations
+	// wrote it whole. That made every rejected request a kilobyte-per-byte amplifier for
+	// signed-log growth and for a stderr line the rate limiter does not gate.
+	bounded := boundedRefusalDetail(recordedOrigin)
+	details := map[string]interface{}{"origin": bounded}
+	if bounded != recordedOrigin {
+		// Flag it so a reader knows the field is not the header verbatim, mirroring
+		// claimed_session_id_truncated.
+		details["origin_truncated"] = true
+	}
+	recordedOrigin = bounded
 	// Unstamped by design (no route/policy fields): the Origin gate runs before route
 	// resolution — see recordPreSessionDeny.
-	p.recordPreSessionDeny(r, "ORIGIN_REJECTED", "origin", map[string]interface{}{"origin": recordedOrigin})
+	p.recordPreSessionDeny(r, "ORIGIN_REJECTED", "origin", details)
 	if multiple {
 		fmt.Fprintf(os.Stderr,
 			"[eunox] SECURITY: rejected request carrying %d Origin headers (%q); RFC 6454 permits only one (DNS-rebinding guard)\n",
@@ -397,7 +408,7 @@ func (p *HTTPProxy) checkOrigin(w http.ResponseWriter, r *http.Request) bool {
 	} else {
 		fmt.Fprintf(os.Stderr,
 			"[eunox] SECURITY: rejected request with disallowed Origin %q (DNS-rebinding guard)\n",
-			origin,
+			recordedOrigin,
 		)
 	}
 	http.Error(w, "Forbidden: Origin not allowed", http.StatusForbidden)
@@ -455,6 +466,25 @@ func sanitizeClaimedID(s string, limit int) string {
 		keep--
 	}
 	return s[:keep]
+}
+
+// maxRefusalDetailLen bounds the OTHER attacker-controlled strings a pre-session refusal
+// stamps into its details: the rejected Origin and the requested path. Both are
+// client-chosen and, unlike a session id, have no fixed shape to bound them by — but no
+// legitimate value approaches 512 bytes, while Go's default MaxHeaderBytes lets an
+// unauthenticated caller put ~1 MiB in either. Unbounded, one refused request per
+// connection is a multi-megabyte-per-second lever on both signed-log growth and the
+// stderr stream, from a caller holding no credential. Larger than the session-id bound
+// because a URL or an allowlist-adjacent origin can legitimately be a few hundred bytes.
+const maxRefusalDetailLen = 512
+
+// boundedRefusalDetail sanitizes and cuts an attacker-controlled refusal detail to
+// maxRefusalDetailLen, using the same rune-safe, valid-UTF-8 treatment the claimed session
+// id gets (see sanitizeClaimedID) so the signed field matches what the caller actually sent
+// rather than an encoder artifact. Compare the result against the input to detect that a
+// value was altered.
+func boundedRefusalDetail(s string) string {
+	return sanitizeClaimedID(s, maxRefusalDetailLen)
 }
 
 func addClaimedSessionID(details map[string]interface{}, r *http.Request) map[string]interface{} {
@@ -520,14 +550,13 @@ func (p *HTTPProxy) recordPreSessionDeny(r *http.Request, code, category string,
 // primitive preSessionDenyLimiter exists to deny.
 func (p *HTTPProxy) recordSessionCapDeny(r *http.Request, route *UpstreamRoute) {
 	p.recordRefusal(r, route, codeResourceExhausted, "saturation", map[string]interface{}{
-		"source_ip": p.sourceIP(r),
-		"reason":    "session_limit_reached",
+		"reason": "session_limit_reached",
 	})
 }
 
 // recordRefusal is the shared body of the two above: rate-limit, fold any suppressed
-// count in, stamp the unverified claimed_session_id, and write through route's sink when
-// the route is already known (nil ⟹ the proxy-wide sink).
+// count in, stamp the source IP and the unverified claimed_session_id, and write through
+// route's sink when the route is already known (nil ⟹ the proxy-wide sink).
 func (p *HTTPProxy) recordRefusal(r *http.Request, route *UpstreamRoute, code, category string, extra map[string]interface{}) {
 	rec := asRecorder(p.sink)
 	if route != nil {
@@ -537,7 +566,7 @@ func (p *HTTPProxy) recordRefusal(r *http.Request, route *UpstreamRoute, code, c
 		return
 	}
 	if p.preSessionDenies == nil { // defensive: a proxy built outside the constructor
-		rec.RecordDeny(r.Context(), "", "", "", code, category, addClaimedSessionID(extra, r), false)
+		rec.RecordDeny(r.Context(), "", "", "", code, category, p.addRefusalContext(extra, r), false)
 		return
 	}
 	ok, suppressed := p.preSessionDenies.admit()
@@ -550,7 +579,24 @@ func (p *HTTPProxy) recordRefusal(r *http.Request, route *UpstreamRoute, code, c
 		}
 		extra["suppressed_count"] = suppressed
 	}
-	rec.RecordDeny(r.Context(), "", "", "", code, category, addClaimedSessionID(extra, r), false)
+	rec.RecordDeny(r.Context(), "", "", "", code, category, p.addRefusalContext(extra, r), false)
+}
+
+// addRefusalContext stamps the two details EVERY refusal record carries about its caller:
+// the resolved source IP and the unverified claimed_session_id.
+//
+// source_ip lives here rather than at each call site because that is how it got lost. It
+// was hand-added by each of the eight callers, and the two that forgot were an
+// unauthenticated Origin probe and a JWT rejection — precisely the records an incident
+// responder reads to find where an attack came from. Centralizing it makes a refusal path
+// added later carry the source by construction, the same way it inherits the empty
+// session_id rule and the rate limit.
+func (p *HTTPProxy) addRefusalContext(details map[string]interface{}, r *http.Request) map[string]interface{} {
+	if details == nil {
+		details = make(map[string]interface{}, 2)
+	}
+	details["source_ip"] = p.sourceIP(r)
+	return addClaimedSessionID(details, r)
 }
 
 // originAllowed reports whether a present Origin value is permitted. The origin must
@@ -781,9 +827,8 @@ func (p *HTTPProxy) loopbackOnly(w http.ResponseWriter, r *http.Request) bool {
 	// wrong was fully logged. The more remote attacker must not be the invisible one.
 	if p.trustFwdFor && len(r.Header.Values("X-Forwarded-For")) > 0 {
 		p.recordPreSessionDeny(r, codeLoopbackRejected, "loopback", map[string]interface{}{
-			"source_ip": p.sourceIP(r),
-			"reason":    "forwarded_for_present",
-			"path":      r.URL.Path,
+			"reason": "forwarded_for_present",
+			"path":   boundedRefusalDetail(r.URL.Path),
 		})
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return false
@@ -792,9 +837,8 @@ func (p *HTTPProxy) loopbackOnly(w http.ResponseWriter, r *http.Request) bool {
 	ip := net.ParseIP(host)
 	if ip == nil || !ip.IsLoopback() {
 		p.recordPreSessionDeny(r, codeLoopbackRejected, "loopback", map[string]interface{}{
-			"source_ip": p.sourceIP(r),
-			"reason":    "non_loopback_source",
-			"path":      r.URL.Path,
+			"reason": "non_loopback_source",
+			"path":   boundedRefusalDetail(r.URL.Path),
 		})
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return false
@@ -808,9 +852,8 @@ func (p *HTTPProxy) loopbackOnly(w http.ResponseWriter, r *http.Request) bool {
 	reqHost := strings.ToLower(normalizeHost(r.Host))
 	if !p.hostAllowedForLoopbackEndpoint(r.Host, reqHost) {
 		p.recordPreSessionDeny(r, codeLoopbackRejected, "loopback", map[string]interface{}{
-			"source_ip": p.sourceIP(r),
-			"reason":    "untrusted_host",
-			"path":      r.URL.Path,
+			"reason": "untrusted_host",
+			"path":   boundedRefusalDetail(r.URL.Path),
 		})
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return false

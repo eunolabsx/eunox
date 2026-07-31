@@ -5,6 +5,7 @@ package mcp
 
 import (
 	"errors"
+	"os"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -149,6 +150,41 @@ func TestMsgWriter_DeadlinePoisonKeepsTimeoutSentinel(t *testing.T) {
 	}
 	if err := mw.Write(RPCMsg{JSONRPC: "2.0", Method: "tools/call"}); !errors.Is(err, ErrUpstreamWriteTimeout) {
 		t.Errorf("poisoned write err = %v, want the latched cause preserved", err)
+	}
+}
+
+// completeWriteDeadlineWriter reports the whole frame written AND a deadline error, the
+// combination io.Writer permits ("callers must not assume a non-nil error means nothing
+// was written") and which a pipe can produce when the deadline fires as the final bytes
+// land.
+type completeWriteDeadlineWriter struct{ writes atomic.Int32 }
+
+func (w *completeWriteDeadlineWriter) SetWriteDeadline(time.Time) error { return nil }
+
+func (w *completeWriteDeadlineWriter) Write(p []byte) (int, error) {
+	w.writes.Add(1)
+	return len(p), os.ErrDeadlineExceeded
+}
+
+// TestMsgWriter_CompleteWriteWithDeadlineErrorDoesNotPoison is the other side of the
+// byte-count rule the partial-write arm already follows: the frame LANDED, so the framing
+// is intact and the writer must stay usable. Poisoning here would tear down a healthy
+// stream and stamp a fabricated UPSTREAM_TIMEOUT on the tape for a call that was actually
+// delivered.
+func TestMsgWriter_CompleteWriteWithDeadlineErrorDoesNotPoison(t *testing.T) {
+	t.Parallel()
+	w := &completeWriteDeadlineWriter{}
+	mw := NewMsgWriterWithTimeout(w, 20*time.Millisecond, nil)
+
+	if err := mw.Write(RPCMsg{JSONRPC: "2.0", Method: "tools/call"}); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("first write err = %v, want the writer's error surfaced", err)
+	} else if errors.Is(err, ErrUpstreamWriteTimeout) {
+		t.Errorf("a complete write must not be reported as a write timeout: %v", err)
+	}
+	// The writer is not latched: a second frame still reaches the underlying writer.
+	_ = mw.Write(RPCMsg{JSONRPC: "2.0", Method: "tools/call"})
+	if got := w.writes.Load(); got != 2 {
+		t.Errorf("underlying writer saw %d writes, want 2 (the writer must not be poisoned)", got)
 	}
 }
 
