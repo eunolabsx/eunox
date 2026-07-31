@@ -102,7 +102,16 @@ func (p *HTTPProxy) handleMCP(w http.ResponseWriter, r *http.Request) {
 // a narrower kill while silently ignoring a smuggled trailing {"all":true}. On a refused
 // content type, a decode failure, or trailing data this writes the response itself (415,
 // 400, or 413 for a body that exceeds the MaxBytesReader cap the caller installed on
-// r.Body) and returns false; the caller must return immediately without proceeding.
+// r.Body) and returns false; the caller must return immediately without proceeding. The
+// 400 legs (malformed JSON, trailing data) are recorded via recordPreSessionDeny under
+// codeInvalidRequest — the same host-protocol-fault code dispatchRequest already uses for
+// a malformed body once a session exists — through the shared rate-limited pre-session
+// path requireJSONContentType's 415 leg already uses just above. A malformed /mcp or
+// /control/kill body is the same class of probe this package's other transport-level
+// refusals (415, wrong Origin, bad control token) already leave a trace for; a decode
+// failure must not be the one gate that doesn't. The 413 leg is not recorded:
+// MaxBytesReader already bounds the cost of that flood, so it carries no additional
+// attack signal worth a rate-limited write.
 //
 // The content-type gate lives HERE, rather than being repeated at each handler, for the
 // reason checkOrigin is a mux-wide wrapper: it makes the control unforgettable. Every
@@ -124,6 +133,12 @@ func (p *HTTPProxy) decodeStrictJSON(w http.ResponseWriter, r *http.Request, v i
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			return false
 		}
+		// Unstamped by design, like every other pre-session record: this can fire before
+		// route resolution. The raw decode error and body are NOT recorded — either can
+		// carry attacker-controlled free text; only the fixed reason string is kept.
+		p.recordPreSessionDeny(r, codeInvalidRequest, "body", map[string]interface{}{
+			"reason": "malformed_json",
+		})
 		http.Error(w, invalidBodyMsg, http.StatusBadRequest)
 		return false
 	}
@@ -133,6 +148,9 @@ func (p *HTTPProxy) decodeStrictJSON(w http.ResponseWriter, r *http.Request, v i
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			return false
 		}
+		p.recordPreSessionDeny(r, codeInvalidRequest, "body", map[string]interface{}{
+			"reason": "trailing_data",
+		})
 		http.Error(w, invalidBodyMsg+": trailing data after JSON message", http.StatusBadRequest)
 		return false
 	}
@@ -1051,14 +1069,10 @@ func (p *HTTPProxy) handleMCPDelete(w http.ResponseWriter, r *http.Request, rout
 
 // handleKill processes POST /control/kill (loopback only).
 func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
-	// Loopback guard runs first — before the method check — so an off-host caller is
-	// rejected by the security boundary rather than learning the endpoint exists via a
-	// 405. Matches handleHealth/handleMetrics.
+	// Loopback guard runs first — before the control-token check — so an off-host
+	// caller is rejected by the security boundary rather than learning the endpoint
+	// exists via a 401. Matches handleHealth/handleMetrics.
 	if !p.loopbackOnly(w, r) {
-		return
-	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -1066,7 +1080,23 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 	// compromised tool subprocess) could reach this endpoint over loopback. Require the
 	// auto-generated control token (written to a 0600 file at startup, independently of
 	// authToken/JWT mode) so the emergency stop is never reachable without it.
+	//
+	// This runs BEFORE the method check on purpose. A method check that ran first
+	// would answer a bare GET/PUT/whatever with an unrecorded 405 — confirming the
+	// emergency-stop endpoint exists and is enabled to a caller who never proved they
+	// hold the token, while the same caller sending POST with a wrong token is fully
+	// recorded via CONTROL_AUTH_FAILED below. That is exactly the asymmetry SEC-07
+	// exists to close: a same-host attacker probing this endpoint must not have a
+	// cheaper, invisible way in than the one that's already logged. Checking the
+	// token first collapses every unauthenticated verb to the same recorded 401, so
+	// the endpoint's existence costs nothing extra to confirm; a legitimate operator
+	// who both holds the token and typos the verb gets a less specific error, which is
+	// an acceptable trade against shrinking the endpoint's information surface.
 	if !p.checkControlToken(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
 

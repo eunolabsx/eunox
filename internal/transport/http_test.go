@@ -191,16 +191,44 @@ func TestHTTPHandleMCPDelete_KnownSession(t *testing.T) {
 
 // ── handleKill ────────────────────────────────────────────────────────────
 
+// TestHTTPHandleKill_NonPOST pins that the method check runs AFTER checkControlToken:
+// a caller presenting the valid control token but the wrong verb still gets the specific
+// 405, distinguishing it from the unauthenticated case (TestHTTPHandleKill_NonPOST_NoToken
+// below), which must not learn even that much.
 func TestHTTPHandleKill_NonPOST(t *testing.T) {
 	t.Parallel()
-	proxy := &HTTPProxy{sessions: make(map[string]*httpSession)}
+	proxy := &HTTPProxy{sessions: make(map[string]*httpSession), controlToken: testControlToken}
+	req := httptest.NewRequest(http.MethodGet, "/control/kill", http.NoBody)
+	req.RemoteAddr = "127.0.0.1:9999"
+	req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
+	req.Header.Set(ControlTokenHeader, testControlToken)
+	w := httptest.NewRecorder()
+	proxy.handleKill(w, req)
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405, got %d", w.Code)
+	}
+}
+
+// TestHTTPHandleKill_NonPOST_NoToken pins that a non-POST request presenting no (or a
+// wrong) control token must be indistinguishable from any other unauthenticated
+// /control/kill probe — a recorded 401, not an unrecorded 405 that confirms the
+// endpoint exists before the caller has proven they hold the token.
+func TestHTTPHandleKill_NonPOST_NoToken(t *testing.T) {
+	t.Parallel()
+	sink, logPath := newTempAuditSink(t)
+	proxy := &HTTPProxy{sessions: make(map[string]*httpSession), controlToken: testControlToken, sink: sink, preSessionDenies: newPreSessionDenyLimiter()}
 	req := httptest.NewRequest(http.MethodGet, "/control/kill", http.NoBody)
 	req.RemoteAddr = "127.0.0.1:9999"
 	req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
 	w := httptest.NewRecorder()
 	proxy.handleKill(w, req)
-	if w.Code != http.StatusMethodNotAllowed {
-		t.Errorf("expected 405, got %d", w.Code)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d", w.Code)
+	}
+
+	_ = sink.Close()
+	if !hasAuditRecordWithCode(readAuditRecords(t, logPath), "CONTROL_AUTH_FAILED") {
+		t.Fatal("expected a CONTROL_AUTH_FAILED audit record for the unauthenticated wrong-method probe")
 	}
 }
 
