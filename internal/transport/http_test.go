@@ -5094,6 +5094,43 @@ func TestServe_AfterListenShutdownDuringStartupIsClean(t *testing.T) {
 	}
 }
 
+// TestServe_ShutdownDuringStartupStopsBeforeServing pins the ordering half of the
+// property above, which the clean-return assertion alone cannot see. A hook cut short by
+// shutdown leaves runAfterListen having already closed the listener, so startup has to
+// STOP there. Continuing hands srv.Serve a closed listener, which fails instantly with
+// "use of closed network connection" into errCh; Serve's final select then has BOTH that
+// arm and ctx.Done() ready and picks between them uniformly, turning a graceful stop into
+// a fatal error and a non-zero exit about half the time. Which way that coin lands is
+// pure goroutine scheduling, so the assertion above only catches it under load. The
+// observable pinned here is the deterministic one, and is what an operator actually reads
+// in the log: a proxy stopped during startup never reaches the serving stage, and so
+// never announces itself as listening.
+func TestServe_ShutdownDuringStartupStopsBeforeServing(t *testing.T) {
+	// captureStderr swaps the process-global os.Stderr, so no t.Parallel() here.
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	proxy := NewHTTPProxyGateway(HTTPGatewayOptions{
+		// A named route gives the startup banner something to print; the zero value
+		// covers everything the teardown path would touch on the regressed ordering.
+		Routes: map[string]*UpstreamRoute{"fs": {name: "fs"}},
+		Bind:   "127.0.0.1",
+		Port:   freeTCPPort(t),
+		AfterListen: func(hookCtx context.Context) error {
+			cancel()
+			<-hookCtx.Done()
+			return hookCtx.Err()
+		},
+	})
+	var err error
+	out := captureStderr(t, func() { err = proxy.Serve(ctx) })
+	if err != nil {
+		t.Errorf("a hook cut short by shutdown must not fail Serve, got %v", err)
+	}
+	if strings.Contains(out, "listening on") {
+		t.Errorf("startup ran on past the shutdown and announced itself as listening, so srv.Serve got the closed listener and races ctx.Done(); stderr:\n%s", out)
+	}
+}
+
 // ── sourceIP ──────────────────────────────────────────────────────────────
 
 // trustedProxyNetsForTest compiles CIDRs into the []*net.IPNet shape sourceIP
