@@ -103,7 +103,7 @@ func (p *HTTPProxy) handleMCP(w http.ResponseWriter, r *http.Request) {
 // content type, a decode failure, or trailing data this writes the response itself (415,
 // 400, or 413 for a body that exceeds the MaxBytesReader cap the caller installed on
 // r.Body) and returns false; the caller must return immediately without proceeding. The
-// 400 legs (malformed JSON, trailing data) are recorded via recordPreSessionDeny under
+// 400 legs (malformed JSON, trailing data) are recorded via recordRefusal under
 // codeInvalidRequest — the same host-protocol-fault code dispatchRequest already uses for
 // a malformed body once a session exists — through the shared rate-limited pre-session
 // path requireJSONContentType's 415 leg already uses just above. A malformed /mcp or
@@ -112,6 +112,13 @@ func (p *HTTPProxy) handleMCP(w http.ResponseWriter, r *http.Request) {
 // failure must not be the one gate that doesn't. The 413 leg is not recorded:
 // MaxBytesReader already bounds the cost of that flood, so it carries no additional
 // attack signal worth a rate-limited write.
+//
+// route is threaded straight to requireJSONContentType and recordRefusal: the /mcp caller
+// (handleMCPPost) already has one resolved by the time it reaches here, so its 415/400
+// records carry that route's stamp exactly like the session-cap refusal, rather than
+// being written through the unstamped proxy-wide sink despite the route being known. The
+// /control/kill caller has no route concept and passes nil, which recordRefusal treats as
+// "write through the proxy-wide sink" — unchanged from before this parameter existed.
 //
 // The content-type gate lives HERE, rather than being repeated at each handler, for the
 // reason checkOrigin is a mux-wide wrapper: it makes the control unforgettable. Every
@@ -122,8 +129,8 @@ func (p *HTTPProxy) handleMCP(w http.ResponseWriter, r *http.Request) {
 //
 // It runs after the caller has installed MaxBytesReader, which only wraps the reader and
 // consumes nothing, so a refused request still has its body read zero times by us.
-func (p *HTTPProxy) decodeStrictJSON(w http.ResponseWriter, r *http.Request, v interface{}, invalidBodyMsg string) bool {
-	if !p.requireJSONContentType(w, r) {
+func (p *HTTPProxy) decodeStrictJSON(w http.ResponseWriter, r *http.Request, v interface{}, invalidBodyMsg string, route *UpstreamRoute) bool {
+	if !p.requireJSONContentType(w, r, route) {
 		return false
 	}
 	dec := json.NewDecoder(r.Body)
@@ -133,10 +140,9 @@ func (p *HTTPProxy) decodeStrictJSON(w http.ResponseWriter, r *http.Request, v i
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			return false
 		}
-		// Unstamped by design, like every other pre-session record: this can fire before
-		// route resolution. The raw decode error and body are NOT recorded — either can
-		// carry attacker-controlled free text; only the fixed reason string is kept.
-		p.recordPreSessionDeny(r, codeInvalidRequest, "body", map[string]interface{}{
+		// The raw decode error and body are NOT recorded — either can carry
+		// attacker-controlled free text; only the fixed reason string is kept.
+		p.recordRefusal(r, route, codeInvalidRequest, "body", map[string]interface{}{
 			"reason": "malformed_json",
 		})
 		http.Error(w, invalidBodyMsg, http.StatusBadRequest)
@@ -148,7 +154,7 @@ func (p *HTTPProxy) decodeStrictJSON(w http.ResponseWriter, r *http.Request, v i
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			return false
 		}
-		p.recordPreSessionDeny(r, codeInvalidRequest, "body", map[string]interface{}{
+		p.recordRefusal(r, route, codeInvalidRequest, "body", map[string]interface{}{
 			"reason": "trailing_data",
 		})
 		http.Error(w, invalidBodyMsg+": trailing data after JSON message", http.StatusBadRequest)
@@ -206,7 +212,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 	// token BEFORE dispatching — otherwise a multi-token body could 202-ack an invalid
 	// initialize notification or run its first request on an existing session while
 	// the trailer is silently dropped.
-	if !p.decodeStrictJSON(w, r, &msg, "invalid JSON-RPC body") {
+	if !p.decodeStrictJSON(w, r, &msg, "invalid JSON-RPC body", route) {
 		return
 	}
 
@@ -1090,8 +1096,9 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 	// actually executed could differ from what a body-only reviewer would expect.
 	// decodeStrictJSON applies the JSON-only content-type gate too, and it runs after the
 	// control-token check above, so a caller without the token learns nothing about the
-	// body this endpoint expects.
-	if !p.decodeStrictJSON(w, r, &body, "invalid request body") {
+	// body this endpoint expects. /control/kill has no route concept, so nil: its refusal
+	// stays on the proxy-wide sink, unchanged from before decodeStrictJSON took a route.
+	if !p.decodeStrictJSON(w, r, &body, "invalid request body", nil) {
 		return
 	}
 	if body.All {

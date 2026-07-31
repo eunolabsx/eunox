@@ -2216,6 +2216,25 @@ func TestOriginRejection_BoundsRecordedOrigin(t *testing.T) {
 	if truncated, _ := details["origin_truncated"].(bool); !truncated {
 		t.Error("a cut origin must be flagged origin_truncated so a reader knows it is not verbatim")
 	}
+
+	// The bounded/flagged value must still pass its per-record HMAC — a new audit-record
+	// field needs a sign-and-verify round trip (CLAUDE.md), not just a decoded-shape check.
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	for _, line := range bytes.Split(bytes.TrimRight(data, "\n"), []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		ok, verr := sink.VerifyRecord(line)
+		if verr != nil {
+			t.Fatalf("VerifyRecord: %v", verr)
+		}
+		if !ok {
+			t.Errorf("record failed HMAC verification: %s", line)
+		}
+	}
 }
 
 // TestLoopbackRejection_BoundsRecordedPath is the same bound on the other

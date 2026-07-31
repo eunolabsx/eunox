@@ -50,6 +50,13 @@ import (
 // emergency stop the one transport refusal invisible to an incident responder, while
 // the same actor's wrong-Origin attempts were fully logged.
 //
+// route is whichever route the caller has already resolved — the gateway's /mcp path
+// always has one by the time it reaches here (handleMCP 404s first), /control/kill has
+// none — and is passed straight to recordRefusal, mirroring recordSessionCapDeny: the
+// record is route-stamped exactly when a route is already known, never inferred. The
+// header value is NOT recorded either way — it is attacker-controlled free text, and the
+// count is the only part worth keeping.
+//
 // More than one Content-Type header is rejected outright, for the reason checkOrigin
 // rejects a duplicated Origin: Header.Get would validate the first while a proxy or host
 // downstream may act on another. That leg also prints a stderr line, because it is the
@@ -58,7 +65,7 @@ import (
 // possible thing to diagnose. Note the duplicate rule is a HEADER-level one: Go's mime
 // accepts a repeated *parameter* whose value is identical, so only the count check below
 // enforces it.
-func (p *HTTPProxy) requireJSONContentType(w http.ResponseWriter, r *http.Request) bool {
+func (p *HTTPProxy) requireJSONContentType(w http.ResponseWriter, r *http.Request, route *UpstreamRoute) bool {
 	vals := r.Header.Values("Content-Type")
 	switch {
 	case len(vals) > 1:
@@ -68,10 +75,7 @@ func (p *HTTPProxy) requireJSONContentType(w http.ResponseWriter, r *http.Reques
 	case len(vals) == 1 && isJSONMediaType(vals[0]):
 		return true
 	}
-	// Unstamped by design (no route/policy fields), like every other pre-session record:
-	// this gate can run before route resolution. The header value is NOT recorded — it is
-	// attacker-controlled free text, and the count is the only part worth keeping.
-	p.recordPreSessionDeny(r, codeUnsupportedMediaType, "content_type", map[string]interface{}{
+	p.recordRefusal(r, route, codeUnsupportedMediaType, "content_type", map[string]interface{}{
 		"header_count": len(vals),
 	})
 	http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
@@ -136,18 +140,61 @@ func asciiEqualFold(got, want string) bool {
 // cycles the retention window in minutes.
 //
 // The bucket keeps the evidence the record exists for — the first refusals in a burst are
-// written in full, and the next admitted record carries suppressed_count, so an operator
-// sees both that an attack happened and its scale — while capping the sustained write rate
-// at something the drainer absorbs. The counters are global rather than per-source on
-// purpose: per-source state is itself attacker-sized memory, and the suppressed count
-// already tells the operator how much was elided.
+// written in full, and the next admitted record carries suppressed_refusal_count, so an
+// operator sees both that an attack happened and its scale — while capping the sustained
+// write rate at something the drainer absorbs. The counters are global rather than
+// per-source on purpose: per-source state is itself attacker-sized memory, and the
+// suppressed count already tells the operator how much was elided.
+//
+// Global also means ONE bucket for the whole proxy, not one per route. That is what bounds
+// the sustained write rate into the single shared audit queue, which is the property this
+// limiter exists to hold: splitting it per route would multiply the rate an attacker can
+// drive by the size of the route table, re-opening the flood from the direction the memory
+// argument above closes. The cost is that the tally spans routes and categories while a
+// record reporting it may be route-stamped, which suppressed_refusal_scope states outright
+// rather than leaving to inference.
 const (
 	preSessionDenyRatePerSec = 20
 	preSessionDenyBurst      = 50
 )
 
+// The details keys a rolled-up refusal record carries, and the scope value that qualifies
+// the count.
+//
+// The count is deliberately SELF-DESCRIBING about its scope, because the record it rides
+// on is not. Most refusals fire before route resolution and are written unstamped through
+// the proxy-wide sink, but the session cap knows its route by the time it fires and is
+// written through the route's sink — so a single admitted record can carry an `upstream` /
+// `policy_version` / `policy_sha256` stamp while the tally folded into it counts refusals
+// from every route and every category. A flood of bad bearer tokens against route A, whose
+// next admitted record happens to be a session-cap refusal on route B, would otherwise read
+// as thousands of saturation refusals against route B's policy digest — a SIEM rule or an
+// operator keyed on route + code draws a conclusion the record's own stamp contradicts.
+// Naming the scope removes the inference: the reader is told the number spans the proxy
+// rather than left to assume it matches the stamp beside it.
+//
+// The key is `suppressed_refusal_count` rather than a bare `suppressed_count` because that
+// name is already taken, in the same `details` object, by an unrelated statistic: a `*/list`
+// ALLOW record reports `suppressed_count` as the entries the manifest hid from the catalog.
+// The two are disjoint by decision and method, but a query written against the bare key
+// matches both — routine policy filtering and an unauthenticated refusal flood — which are
+// opposite signals. Each now says what it counted.
+const (
+	detailSuppressedRefusalCount = "suppressed_refusal_count"
+	detailSuppressedRefusalScope = "suppressed_refusal_scope"
+	suppressedScopeProxy         = "proxy"
+)
+
 // preSessionDenyLimiter is a token bucket over pre-session denial records. The zero value
 // is not usable; construct with newPreSessionDenyLimiter.
+//
+// There is exactly one of these per proxy (HTTPProxy.preSessionDenies), so its suppressed
+// tally has exactly one scope: the whole proxy. The record site writes suppressedScopeProxy
+// directly rather than reading a scope off the limiter — a per-scope field would be
+// generality with a single caller, since nothing in this codebase constructs a
+// narrower-reach limiter (see the rate-vs-attribution trade-off recordRefusal documents).
+// If a second limiter with a different reach is ever introduced, the constant at the write
+// site is exactly what should become a field again.
 type preSessionDenyLimiter struct {
 	mu         sync.Mutex
 	tokens     float64
@@ -535,7 +582,9 @@ func addClaimedSessionIDValue(details map[string]interface{}, claimed string) ma
 // unauthenticated caller can trigger, so an unbounded one-per-refusal write lets a remote
 // attacker drive the audit queue into its monotonic drop counter and permanently trip
 // --require-audit=strict against every legitimate client. A suppressed refusal is folded
-// into the next admitted record's suppressed_count rather than vanishing.
+// into the next admitted record's suppressed_refusal_count rather than vanishing — into
+// whichever record is admitted next, which need not be of the same category or route,
+// hence the suppressed_refusal_scope that ships beside it.
 //
 // These records deliberately carry NO route name and no policy_version/policy_sha256
 // stamp: they are written through the proxy-wide p.sink rather than a route's
@@ -560,6 +609,12 @@ func (p *HTTPProxy) recordPreSessionDeny(r *http.Request, code, category string,
 // limit — unlike the in-flight cap, this refusal is reachable WITHOUT an established
 // session, so an unbounded write here would hand a remote caller the audit-queue flooding
 // primitive preSessionDenyLimiter exists to deny.
+//
+// It is therefore the one refusal that can be route-stamped AND carry a rollup from the
+// shared bucket, whose tally spans every route and category. The rollup names its own scope
+// (suppressed_refusal_scope) precisely so this record's stamp is not read as qualifying the
+// number: `upstream: github` with a count of 5000 means 5000 refusals proxy-wide, not 5000
+// against github.
 func (p *HTTPProxy) recordSessionCapDeny(r *http.Request, route *UpstreamRoute) {
 	p.recordRefusal(r, route, codeResourceExhausted, "saturation", map[string]interface{}{
 		"reason": "session_limit_reached",
@@ -587,9 +642,13 @@ func (p *HTTPProxy) recordRefusal(r *http.Request, route *UpstreamRoute, code, c
 	}
 	if suppressed > 0 {
 		if extra == nil {
-			extra = make(map[string]interface{}, 1)
+			extra = make(map[string]interface{}, 2)
 		}
-		extra["suppressed_count"] = suppressed
+		// Always paired: the count is meaningless to a reader who has to infer its scope
+		// from the stamp beside it, and this record may well carry a route stamp the count
+		// does not respect. See the key constants for the misreading this closes.
+		extra[detailSuppressedRefusalCount] = suppressed
+		extra[detailSuppressedRefusalScope] = suppressedScopeProxy
 	}
 	rec.RecordDeny(r.Context(), "", "", "", code, category, p.addRefusalContext(extra, r), false)
 }

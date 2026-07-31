@@ -699,8 +699,8 @@ func (v *auditChainVerifier) updateChain(rec auditRecord) {
 // reportSuppressedUnsigned prints the one-line tail summary for unsigned records whose
 // individual diagnostics were capped (see maxUnsignedDiagnostics). It names the total so
 // the elided lines are accounted for rather than silently dropped — the same posture the
-// pre-session record limiter takes with suppressed_count — and repeats the remedy, since
-// a log in this state is one an operator has to act on rather than re-run.
+// pre-session record limiter takes with suppressed_refusal_count — and repeats the remedy,
+// since a log in this state is one an operator has to act on rather than re-run.
 func (v *auditChainVerifier) reportSuppressedUnsigned() {
 	if v.unsignedSeen <= maxUnsignedDiagnostics {
 		return
