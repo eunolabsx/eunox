@@ -203,23 +203,55 @@ func recordKillDrop(ctx context.Context, rec auditRecorder, deny *capability.Enf
 	rec.RecordDeny(ctx, subj.auditSessionID(), identifier, method, denial.Code, denial.ConditionType, details, false)
 }
 
-// recordResourceExhausted records a host request refused because the concurrent-handler
-// pool was saturated — the stdio hostSem or the HTTP per-session in-flight cap — so a
-// DoS-probe flood against EITHER transport leaves a trace on the tamper-evident tape
-// rather than only a JSON-RPC server-busy reply. Shared by both saturation sites so they
-// cannot record divergent shapes, or one silently forget to record at all. The refused
-// method is recorded (which method starved), but the identifier is left EMPTY on purpose:
-// the request is refused before its arguments are parsed, so there is no target, and
-// passing the method as the identifier would make deriveTargetFields synthesize a phantom
-// target from a mapped method (tools/call -> target "tools/call", prompts/get -> "get"),
-// polluting target-based audit aggregation. rec may be nil (no sink configured); skipped
-// then, matching recordKillDrop.
-func recordResourceExhausted(ctx context.Context, rec auditRecorder, sessionID, method string) {
+// recordResourceExhausted records a host request refused because a concurrency pool was
+// saturated — the stdio hostSem, the HTTP per-session in-flight cap, or the HTTP
+// per-session notification pool — so a DoS-probe flood against EITHER transport leaves a
+// trace on the tamper-evident tape rather than only a JSON-RPC server-busy reply (or, for
+// a dropped notification, only a line on stderr). Shared by all three saturation sites so
+// they cannot record divergent shapes, or one silently forget to record at all. The
+// refused method is recorded (which method starved), but the identifier is left EMPTY on
+// purpose: the request is refused before its arguments are parsed, so there is no target,
+// and passing the method as the identifier would make deriveTargetFields synthesize a
+// phantom target from a mapped method (tools/call -> target "tools/call", prompts/get ->
+// "get"), polluting target-based audit aggregation. rec may be nil (no sink configured);
+// skipped then, matching recordKillDrop.
+//
+// gate is the saturated pool's own admission control, and is required (every call site
+// passes the address of a zero-value-usable field on the session or proxy that owns the
+// pool). It collapses an episode of saturation to one record carrying a
+// detailSuppressedRefusalCount of the refusals elided since — see saturationGate for why a
+// per-refusal record is a lever on the proxy's own availability under --require-audit=strict,
+// and why the gate is scoped to the pool rather than shared. suppressedScopeSession pairs
+// with it: unlike the pre-session bucket's detailSuppressedRefusalScope value
+// (suppressedScopeProxy, spanning every route and category), this count describes exactly
+// the session whose id sits beside it on the same record — the write site's own scope
+// constant, matching how the pre-session bucket's scope is written at ITS site rather than
+// read off a field (see the const block in record_limiter.go).
+func recordResourceExhausted(ctx context.Context, rec auditRecorder, gate *saturationGate, sessionID, method string) {
 	if rec == nil {
 		return
 	}
-	rec.RecordDeny(ctx, sessionID, "", method, codeResourceExhausted, "", nil, false)
+	ok, suppressed := gate.admit()
+	if !ok {
+		return
+	}
+	var details map[string]interface{}
+	if suppressed > 0 {
+		details = map[string]interface{}{
+			detailSuppressedRefusalCount: suppressed,
+			detailSuppressedRefusalScope: suppressedScopeSession,
+		}
+	}
+	rec.RecordDeny(ctx, sessionID, "", method, codeResourceExhausted, "", details, false)
 }
+
+// suppressedScopeSession qualifies a saturation gate's rollup (see recordResourceExhausted):
+// the count spans only the one session — indeed only the one pool within it — whose refusals
+// fed the gate, never other sessions or the other pool. Written at this one call site rather
+// than carried on saturationGate itself, for the same reason suppressedScopeProxy is written
+// at recordRefusal rather than carried on the pre-session limiter: a per-scope field would be
+// generality with a single caller.
+const suppressedScopeSession = "session"
 
 // recordDriftRefused writes the startup manifest-drift refusal record, for the same reason
 // recordResourceExhausted exists: both transports refuse a session on this condition, and

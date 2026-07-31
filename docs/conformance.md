@@ -413,34 +413,54 @@ tamper-evident tape):
   be too. `control/kill` is not an MCP method, so it names no target and
   `suggest` skips it.
 
-  These are the only records an *unauthenticated* caller can cause, so their
-  write rate is bounded by a token bucket: within a burst each refusal is
-  recorded in full, and beyond it the next record that gets through carries a
-  `suppressed_refusal_count` of the refusals elided since. Without that bound a
-  credential-spray could overflow the audit queue, and because the sink's drop
-  counter is monotonic, that would leave `--require-audit=strict` denying every
-  legitimate request for the rest of the process's life. A non-zero
-  `suppressed_refusal_count` on one of these codes therefore means a flood, not a
-  lost decision record — no *policy* decision is ever rate-limited.
+  A caller sets the rate of every refusal above, so every one of them is
+  admission-controlled, through one of two token buckets depending on what it
+  costs to trigger.
 
-  **Read the count as proxy-wide.** One bucket bounds the write rate into the
-  single shared audit queue — splitting it per route would multiply the rate an
-  attacker can drive by the size of the route table — so a suppressed refusal is
-  folded into whichever record is admitted next, regardless of its route or
-  category. That matters whenever the admitted record happens to be route-stamped:
-  the **session cap** always is (it is written through the route's sink so it
-  matches its in-flight-cap sibling's shape), and the **malformed-`Content-Type`**
-  (`UNSUPPORTED_MEDIA_TYPE`) and **malformed-body** (`INVALID_REQUEST`) refusals
-  are too whenever they are hit via `/mcp/<route>` rather than `/control/kill` — in
-  each case the record can carry an `upstream` / `policy_version` / `policy_sha256`
-  stamp alongside a tally that spans every route. A bearer-token spray against
-  `/mcp/routeA` (refused before route resolution, so attributable to no route) can
-  therefore surface on a `RESOURCE_EXHAUSTED` record reading `upstream: routeB` —
-  or equally on an `INVALID_REQUEST` record for a malformed body routeB's own
+  The pre-session refusals — the only records an *unauthenticated* caller can
+  cause — share one proxy-wide bucket: within a burst each refusal is recorded
+  in full, and beyond it the next record that gets through carries a
+  `suppressed_refusal_count` of the refusals elided since. **Read that count as
+  proxy-wide.** One bucket bounds the write rate into the single shared audit
+  queue — splitting it per route would multiply the rate an attacker can drive
+  by the size of the route table — so a suppressed refusal is folded into
+  whichever record is admitted next, regardless of its route or category. That
+  matters whenever the admitted record happens to be route-stamped: the
+  **session cap** always is (it is written through the route's sink so it
+  matches its in-flight-cap sibling's shape), and the
+  **malformed-`Content-Type`** (`UNSUPPORTED_MEDIA_TYPE`) and
+  **malformed-body** (`INVALID_REQUEST`) refusals are too whenever they are hit
+  via `/mcp/<route>` rather than `/control/kill` — in each case the record can
+  carry an `upstream` / `policy_version` / `policy_sha256` stamp alongside a
+  tally that spans every route. A bearer-token spray against `/mcp/routeA`
+  (refused before route resolution, so attributable to no route) can therefore
+  surface on a `RESOURCE_EXHAUSTED` record reading `upstream: routeB` — or
+  equally on an `INVALID_REQUEST` record for a malformed body routeB's own
   client happened to send. Every rolled-up record states its scope in
   `suppressed_refusal_scope` (`"proxy"`) so nothing has to be inferred from the
   stamp beside it: a rule keyed on route + code must not treat the number as
   route-scoped.
+
+  The two saturation refusals that need an established session (the handler
+  pool and the notification pool) are on their OWN, separate buckets instead —
+  one per pool per session, never the proxy-wide one above — and are recorded
+  once per saturation **episode** rather than per refusal: the first refusal
+  after the pool last had a free slot is recorded, further refusals while it
+  stays saturated roll into the next record's `suppressed_refusal_count`, and a
+  successful acquire ends the episode, with a per-pool token bucket underneath
+  so a caller cycling one pool between saturated and drained cannot outpace it.
+  Sharing the proxy-wide bucket would let a notification flood on ONE session
+  elide the `AUTH_FAILED` / `ORIGIN_REJECTED` records an incident responder
+  reads first, so every record one of these buckets rolls up states
+  `suppressed_refusal_scope: "session"` instead of `"proxy"` — the count never
+  spans more than the one session_id beside it.
+
+  Without these bounds a credential-spray or a notification flood could
+  overflow the audit queue, and because the sink's drop counter is monotonic,
+  that would leave `--require-audit=strict` denying every legitimate request
+  for the rest of the process's life. A non-zero `suppressed_refusal_count` on
+  one of these codes therefore means a flood, not a lost decision record — no
+  *policy* decision is ever rate-limited.
 
   The key is `suppressed_refusal_count`, not a bare `suppressed_count` — that
   name belongs to the unrelated `*/list` filter statistic above (entries the

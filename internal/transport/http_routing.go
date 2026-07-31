@@ -527,7 +527,17 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 				// notifications/cancelled: an incident responder asking why a call the host
 				// tried to abort ran to completion needs the drop to be a record, not a line
 				// in a container log that rotation may already have discarded.
-				recordResourceExhausted(r.Context(), asRecorder(route.sink), sessionID, msg.Method)
+				//
+				// Gated on this pool's own saturationGate, so an established session
+				// flooding notifications writes one record per saturation EPISODE (carrying
+				// the count elided since) rather than one per dropped frame. Ungated, this
+				// was the cheapest audit-write primitive the proxy offers — no upstream
+				// round trip, no response body to await, and a 202 back that is
+				// byte-identical to a successful forward, so a flooding client gets no
+				// signal to back off — and enough records latch AuditDegraded(), which
+				// under --require-audit=strict denies every enforced call on every route.
+				// The stderr line below stays per-drop: it is not the bounded queue.
+				recordResourceExhausted(r.Context(), asRecorder(route.sink), &sess.notifySaturation, sessionID, msg.Method)
 				fmt.Fprintf(os.Stderr, "[eunox] HTTP session %s: notification %q dropped: too many concurrent notifications in flight\n", sessionID, msg.Method)
 				w.WriteHeader(http.StatusAccepted)
 				return
@@ -603,7 +613,10 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 			// the surface a DoS probe actually reaches — would leave no trace while the local
 			// stdio twin does, backwards from the threat. route.sink carries the route
 			// provenance; asRecorder yields a genuine nil interface when no sink is configured.
-			recordResourceExhausted(ctx, asRecorder(route.sink), sess.id, msg.Method)
+			// Episode-gated on this pool's own gate, like its notification sibling above: the
+			// two pools saturate independently, so one flooding must not elide the other's
+			// record.
+			recordResourceExhausted(ctx, asRecorder(route.sink), &sess.reqSaturation, sess.id, msg.Method)
 			writeJSONMsg(w, mcp.ErrorResponse(msg.ID, jsonRPCCodeServerBusy, "eunox: too many concurrent requests in flight; retry"))
 			return
 		}

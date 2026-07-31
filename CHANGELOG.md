@@ -131,6 +131,29 @@ Section conventions:
   since both codes can also carry a rollup from the proxy-wide rate limiter. `/control/kill`
   (no route concept) is unaffected — its refusals stay unstamped. See
   `docs/threat-model-mcp.md` §3.7 and `docs/conformance.md`.
+- **`RESOURCE_EXHAUSTED` records are now written once per saturation *episode*, not once
+  per refused request**, at both established-session caps: the concurrent-handler pool
+  (the stdio `hostSem` and the HTTP per-session in-flight cap) and the HTTP per-session
+  notification pool. The first refusal after the pool last had a free slot is recorded;
+  every further refusal while it stays saturated is folded into the next record's
+  `details.suppressed_refusal_count`; and a successful acquire ends the episode, so a later
+  saturation is recorded again. A per-pool token bucket sits underneath, so a caller
+  cycling a pool between saturated and drained cannot open episodes faster than the audit
+  drainer absorbs them. What an operator wants from these records is that a pool saturated
+  and by how much, not one record per refused frame — and the per-refusal form was a lever
+  on the proxy's own availability: the audit queue is bounded and its drop counter
+  monotonic, so enough records latch a degraded trail and, under the default
+  `--require-audit=strict`, deny every enforced call on **every** route for the rest of
+  the process's life. The notification pool was the cheapest way to drive that, since a
+  dropped notification costs its sender no upstream round trip and is answered
+  `202 Accepted`, byte-identical to a successful forward, so a flooding client gets no
+  signal to back off. The gates are per pool and per session, each on its **own** bucket —
+  never the proxy-wide one above — so a notification flood cannot elide the request pool's
+  record or either of the other bucket's records; every record one of these gates rolls up
+  states `details.suppressed_refusal_scope: "session"`, never `"proxy"`. The proxy-wide
+  session cap's `RESOURCE_EXHAUSTED` is unchanged: it is reachable without an established
+  session, so it stays on the pre-session rate limiter it already shared. See
+  `docs/threat-model-mcp.md` §3.7 and `docs/conformance.md`.
 - **`eunox audit-verify` is roughly 40% faster per record**, with no change to what it
   accepts or rejects. It is the tool an incident responder points at a full retained
   archive, so its per-record cost is paid exactly when the record count is largest and
@@ -318,7 +341,12 @@ Section conventions:
   the value verbatim. Each sibling value is now walked under both anchorings
   (envelope-relative, so a dotted path reaches into the blob its key names, and
   value-relative, so a container relocated under some other key is still masked) and
-  the union is redacted.
+  the union is redacted. `structuredContent` itself had the identical gap one call site
+  over: its own value was walked value-relative only, so the manifest guide's
+  recommended fully-qualified spelling — `structuredContent.ssn` — silently redacted
+  nothing when `structuredContent` was *itself* delivered as a doubly-encoded JSON
+  string, while the bare `ssn` spelling against the same blob already worked. It now
+  shares the sibling walk's both-anchorings logic instead of a second, hand-copied one.
 - **A failed second `eunox proxy` start broke `eunox kill` against the running one.**
   The control token is written to a shared default path and deliberately overwrites
   what is there, and that write ran *before* `net.Listen` — so an operator who

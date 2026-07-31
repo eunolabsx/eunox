@@ -17,8 +17,6 @@ import (
 	"net/url"
 	"os"
 	"strings"
-	"sync"
-	"time"
 	"unicode/utf8"
 
 	"github.com/eunolabs/eunox/pkg/capability"
@@ -44,7 +42,7 @@ import (
 // checkOrigin uses. The gate sits behind the transport credential on both endpoints —
 // checkAuth/ValidateToken for /mcp, checkControlToken for /control/kill — so on a
 // deployment that configures either one this is an AUTHENTICATED caller's refusal, not
-// an anonymous one; and where no credential is configured, preSessionDenyLimiter is
+// an anonymous one; and where no credential is configured, the pre-session bucket is
 // exactly the bucket that makes an anonymous caller's refusals safe to write. Leaving
 // it unrecorded made a content-type sweep of the sessionless initialize POST and the
 // emergency stop the one transport refusal invisible to an incident responder, while
@@ -125,115 +123,6 @@ func asciiEqualFold(got, want string) bool {
 		}
 	}
 	return true
-}
-
-// Pre-session denial records are the only audit writes an UNAUTHENTICATED caller can
-// trigger, so they are the only ones whose rate an attacker sets. They are bounded by a
-// token bucket rather than written one-per-refusal.
-//
-// Without a bound the refusal record is a lever on the proxy's own availability: the audit
-// queue is finite and its drop counter is monotonic, so one drop latches AuditDegraded()
-// for the process lifetime, and under the default --require-audit=strict every enforced
-// call on every route is then denied AUDIT_UNAVAILABLE. A remote attacker with no
-// credential could take the data plane down by spraying wrong bearer tokens. The flood also
-// buries genuine policy denials: at the default rotate size a few thousand records/second
-// cycles the retention window in minutes.
-//
-// The bucket keeps the evidence the record exists for — the first refusals in a burst are
-// written in full, and the next admitted record carries suppressed_refusal_count, so an
-// operator sees both that an attack happened and its scale — while capping the sustained
-// write rate at something the drainer absorbs. The counters are global rather than
-// per-source on purpose: per-source state is itself attacker-sized memory, and the
-// suppressed count already tells the operator how much was elided.
-//
-// Global also means ONE bucket for the whole proxy, not one per route. That is what bounds
-// the sustained write rate into the single shared audit queue, which is the property this
-// limiter exists to hold: splitting it per route would multiply the rate an attacker can
-// drive by the size of the route table, re-opening the flood from the direction the memory
-// argument above closes. The cost is that the tally spans routes and categories while a
-// record reporting it may be route-stamped, which suppressed_refusal_scope states outright
-// rather than leaving to inference.
-const (
-	preSessionDenyRatePerSec = 20
-	preSessionDenyBurst      = 50
-)
-
-// The details keys a rolled-up refusal record carries, and the scope value that qualifies
-// the count.
-//
-// The count is deliberately SELF-DESCRIBING about its scope, because the record it rides
-// on is not. Most refusals fire before route resolution and are written unstamped through
-// the proxy-wide sink, but the session cap knows its route by the time it fires and is
-// written through the route's sink — so a single admitted record can carry an `upstream` /
-// `policy_version` / `policy_sha256` stamp while the tally folded into it counts refusals
-// from every route and every category. A flood of bad bearer tokens against route A, whose
-// next admitted record happens to be a session-cap refusal on route B, would otherwise read
-// as thousands of saturation refusals against route B's policy digest — a SIEM rule or an
-// operator keyed on route + code draws a conclusion the record's own stamp contradicts.
-// Naming the scope removes the inference: the reader is told the number spans the proxy
-// rather than left to assume it matches the stamp beside it.
-//
-// The key is `suppressed_refusal_count` rather than a bare `suppressed_count` because that
-// name is already taken, in the same `details` object, by an unrelated statistic: a `*/list`
-// ALLOW record reports `suppressed_count` as the entries the manifest hid from the catalog.
-// The two are disjoint by decision and method, but a query written against the bare key
-// matches both — routine policy filtering and an unauthenticated refusal flood — which are
-// opposite signals. Each now says what it counted.
-const (
-	detailSuppressedRefusalCount = "suppressed_refusal_count"
-	detailSuppressedRefusalScope = "suppressed_refusal_scope"
-	suppressedScopeProxy         = "proxy"
-)
-
-// preSessionDenyLimiter is a token bucket over pre-session denial records. The zero value
-// is not usable; construct with newPreSessionDenyLimiter.
-//
-// There is exactly one of these per proxy (HTTPProxy.preSessionDenies), so its suppressed
-// tally has exactly one scope: the whole proxy. The record site writes suppressedScopeProxy
-// directly rather than reading a scope off the limiter — a per-scope field would be
-// generality with a single caller, since nothing in this codebase constructs a
-// narrower-reach limiter (see the rate-vs-attribution trade-off recordRefusal documents).
-// If a second limiter with a different reach is ever introduced, the constant at the write
-// site is exactly what should become a field again.
-type preSessionDenyLimiter struct {
-	mu         sync.Mutex
-	tokens     float64
-	last       time.Time
-	suppressed uint64
-	now        func() time.Time // injectable for tests
-}
-
-func newPreSessionDenyLimiter() *preSessionDenyLimiter {
-	return &preSessionDenyLimiter{tokens: preSessionDenyBurst, now: time.Now}
-}
-
-// admit reports whether a refusal record may be written now, and if so how many records
-// were suppressed since the last admitted one (0 when none were). A suppressed refusal
-// still increments the counter, so nothing is lost silently — it is folded into the next
-// record that gets through.
-func (l *preSessionDenyLimiter) admit() (ok bool, suppressed uint64) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	now := l.now()
-	if l.last.IsZero() {
-		l.last = now
-	}
-	// Refill, clamped to the burst ceiling. A backwards clock step yields a non-positive
-	// elapsed and simply adds nothing, which is the safe direction.
-	if elapsed := now.Sub(l.last).Seconds(); elapsed > 0 {
-		l.last = now
-		l.tokens += elapsed * preSessionDenyRatePerSec
-		if l.tokens > preSessionDenyBurst {
-			l.tokens = preSessionDenyBurst
-		}
-	}
-	if l.tokens < 1 {
-		l.suppressed++
-		return false, 0
-	}
-	l.tokens--
-	suppressed, l.suppressed = l.suppressed, 0
-	return true, suppressed
 }
 
 // newAuthTimingKey returns a 32-byte per-process random key for the MAC folding in
@@ -551,9 +440,8 @@ func addClaimedSessionIDValue(details map[string]interface{}, claimed string) ma
 	if claimed == "" {
 		return details
 	}
-	// Callers may pass nil when they have no extra context (recordResourceExhausted does),
-	// so allocate rather than assigning into a nil map and panicking inside an HTTP handler
-	// on a security-refusal path.
+	// A caller with no extra context may pass nil, so allocate rather than assigning into a
+	// nil map and panicking inside an HTTP handler on a security-refusal path.
 	if details == nil {
 		details = make(map[string]interface{}, 1)
 	}
@@ -578,7 +466,7 @@ func addClaimedSessionIDValue(details map[string]interface{}, claimed string) ma
 // only non-secret context (source_ip, origin, error_type) in extra. A nil sink skips the
 // record. Folding the four sites here keeps the empty-session_id rule from being
 // re-hand-rolled — and re-broken — at each new pre-session refusal path.
-// Writes are rate-limited (see preSessionDenyLimiter): these are the only audit records an
+// Writes are rate-limited (see newPreSessionDenyLimiter): these are the only audit records an
 // unauthenticated caller can trigger, so an unbounded one-per-refusal write lets a remote
 // attacker drive the audit queue into its monotonic drop counter and permanently trip
 // --require-audit=strict against every legitimate client. A suppressed refusal is folded
@@ -608,13 +496,13 @@ func (p *HTTPProxy) recordPreSessionDeny(r *http.Request, code, category string,
 // code, one record shape, whichever cap the flood hit. What it does NOT drop is the rate
 // limit — unlike the in-flight cap, this refusal is reachable WITHOUT an established
 // session, so an unbounded write here would hand a remote caller the audit-queue flooding
-// primitive preSessionDenyLimiter exists to deny.
+// primitive the pre-session bucket exists to deny.
 //
 // It is therefore the one refusal that can be route-stamped AND carry a rollup from the
 // shared bucket, whose tally spans every route and category. The rollup names its own scope
-// (suppressed_refusal_scope) precisely so this record's stamp is not read as qualifying the
-// number: `upstream: github` with a count of 5000 means 5000 refusals proxy-wide, not 5000
-// against github.
+// (detailSuppressedRefusalScope: suppressedScopeProxy) precisely so this record's stamp is
+// not read as qualifying the number: `upstream: github` with a count of 5000 means 5000
+// refusals proxy-wide, not 5000 against github.
 func (p *HTTPProxy) recordSessionCapDeny(r *http.Request, route *UpstreamRoute) {
 	p.recordRefusal(r, route, codeResourceExhausted, "saturation", map[string]interface{}{
 		"reason": "session_limit_reached",

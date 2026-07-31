@@ -56,6 +56,19 @@ func hasAuditRecordWithCode(records []map[string]interface{}, code string) bool 
 	return findAuditRecordByCode(records, code) != nil
 }
 
+// findAuditRecordsByCode returns every record carrying the given deny denial_code, in log
+// order. The singular form answers "was it recorded"; this one answers "how many", which
+// is the question the saturation gate's episode collapsing turns into a behavior.
+func findAuditRecordsByCode(records []map[string]interface{}, code string) []map[string]interface{} {
+	var out []map[string]interface{}
+	for _, rec := range records {
+		if dc, _ := rec["denial_code"].(string); dc == code {
+			out = append(out, rec)
+		}
+	}
+	return out
+}
+
 // TestCheckAuth_RecordsAuthFailed pins that a missing/invalid static Authorization bearer
 // token leaves an AUTH_FAILED record on the tamper-evident tape (an off-host brute-force
 // otherwise leaves zero trace) and never records the presented credential. Each case wires
@@ -446,6 +459,95 @@ func TestNotificationSaturation_RecordsResourceExhausted(t *testing.T) {
 		t.Errorf("record method=%q, want notifications/cancelled", method)
 	}
 	if got, _ := rec["session_id"].(string); got != sid {
+		t.Errorf("record session_id=%q, want the established session %q", got, sid)
+	}
+}
+
+// TestNotificationSaturation_CollapsesEpisodeAndRollsUpSuppressed is the end-to-end half of
+// the saturation gate: a session that keeps a pool saturated writes ONE record for the
+// episode, and the elided drops surface as suppressed_refusal_count on the NEXT episode's
+// record rather than vanishing.
+//
+// The notification path is the one that needed this most. It costs an established session
+// nothing per drop — no upstream round trip, no response body to await — and it answers 202
+// Accepted, byte-identical to a successful forward, so a flooding client gets no signal to
+// back off and simply keeps going. One record per dropped frame therefore made this the
+// cheapest way to push the audit sink's bounded queue into its MONOTONIC drop counter,
+// which latches AuditDegraded() for the process lifetime and, under the default
+// --require-audit=strict, denies every enforced call on every route: a saturation condition
+// on one session becoming a proxy-wide outage.
+func TestNotificationSaturation_CollapsesEpisodeAndRollsUpSuppressed(t *testing.T) {
+	sink, logPath := newTempAuditSink(t)
+	proxy, proxySrv := newTestRemoteProxy(t, startFakeUpstream(t, newFullFakeUpstream()), httpProxyOptions{
+		PDP:        pdp.AlwaysAllowPDP{},
+		DriftCheck: drift.CheckFunc(func(json.RawMessage, string, error) error { return nil }),
+		Sink:       sink,
+	})
+	sid := initSession(t, proxySrv)
+
+	sess := proxy.getSession(sid)
+	if sess == nil {
+		t.Fatal("session not found after initialize")
+	}
+	saturate := func() {
+		t.Helper()
+		for i := 0; i < maxConcurrentSessionNotifications; i++ {
+			if !sess.tryAcquireNotifySlot() {
+				t.Fatalf("acquire %d must succeed within the cap", i)
+			}
+		}
+	}
+	dropOne := func() {
+		resp := postMCP(t, proxySrv, mcp.RPCMsg{
+			JSONRPC: "2.0",
+			Method:  "notifications/cancelled",
+			Params:  json.RawMessage(`{"requestId":7}`),
+		}, sid)
+		if resp.StatusCode != http.StatusAccepted {
+			t.Fatalf("dropped notification status = %d, want 202 (fire-and-forget ack)", resp.StatusCode)
+		}
+		_ = resp.Body.Close()
+	}
+
+	// Episode one: three drops against a saturated pool.
+	saturate()
+	const firstEpisodeDrops = 3
+	for i := 0; i < firstEpisodeDrops; i++ {
+		dropOne()
+	}
+
+	// Episode two: a slot frees and is re-taken (the acquire is what ends an episode — a
+	// release alone does not, since nothing was admitted through the pool), then one more
+	// drop. That record must carry the two drops elided from episode one.
+	sess.releaseNotifySlot()
+	if !sess.tryAcquireNotifySlot() {
+		t.Fatal("the freed slot must be re-acquirable")
+	}
+	dropOne()
+
+	_ = sink.Close()
+	recs := findAuditRecordsByCode(readAuditRecords(t, logPath), "RESOURCE_EXHAUSTED")
+	if len(recs) != 2 {
+		t.Fatalf("got %d RESOURCE_EXHAUSTED records, want 2 — one per saturation episode, not one per dropped frame", len(recs))
+	}
+	if details, _ := recs[0]["details"].(map[string]interface{}); details[detailSuppressedRefusalCount] != nil {
+		t.Errorf("the first record of an episode elides nothing, so it must omit %s; got %v", detailSuppressedRefusalCount, details[detailSuppressedRefusalCount])
+	}
+	details, _ := recs[1]["details"].(map[string]interface{})
+	if got := details[detailSuppressedRefusalCount]; got != float64(firstEpisodeDrops-1) {
+		t.Errorf("%s = %v, want %d — the drops elided by episode collapsing must still reach the tape", detailSuppressedRefusalCount, got, firstEpisodeDrops-1)
+	}
+	// The scope names the pool's own reach, never the proxy-wide bucket's: sharing that
+	// bucket would let this session's flood elide an unrelated AUTH_FAILED/ORIGIN_REJECTED
+	// record, so a saturation rollup must never claim suppressedScopeProxy.
+	if got := details[detailSuppressedRefusalScope]; got != suppressedScopeSession {
+		t.Errorf("%s = %v, want %q", detailSuppressedRefusalScope, got, suppressedScopeSession)
+	}
+	// The gate changes admission only: the record keeps the shape its sibling has.
+	if method, _ := recs[1]["method"].(string); method != "notifications/cancelled" {
+		t.Errorf("record method=%q, want notifications/cancelled", method)
+	}
+	if got, _ := recs[1]["session_id"].(string); got != sid {
 		t.Errorf("record session_id=%q, want the established session %q", got, sid)
 	}
 }

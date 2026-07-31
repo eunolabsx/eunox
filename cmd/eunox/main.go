@@ -1659,8 +1659,14 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 	// replaced the RUNNING proxy's token on disk: `eunox kill` then presents a token the
 	// live proxy rejects, and the loopback emergency stop stays broken until restart, in
 	// exactly the confused-deployment situation where it matters most.
+	//
+	// Close over the one field this needs, not pf itself: capturing pf would heap-promote
+	// the whole flag bundle (every string/slice field) for as long as the proxy runs — this
+	// closure fires once, at startup, and Serve() drops the reference right after (see
+	// HTTPGatewayOptions.AfterListen), so only the needed path should outlive that.
+	controlTokenPath := pf.controlTokenPath
 	writeControlToken := func() error {
-		controlTokenFile, werr := transport.WriteControlTokenFile(pf.controlTokenPath, controlToken)
+		controlTokenFile, werr := transport.WriteControlTokenFile(controlTokenPath, controlToken)
 		if werr != nil {
 			return fmt.Errorf("kill control endpoint: %w", werr)
 		}
