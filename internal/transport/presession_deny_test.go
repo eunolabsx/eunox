@@ -4,8 +4,10 @@
 package transport
 
 import (
+	"bytes"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 )
@@ -47,6 +49,91 @@ func TestPreSessionDenyLimiter_BoundsBurstAndCountsSuppressed(t *testing.T) {
 	// And the count resets, so the following record does not double-report.
 	if ok, s := l.admit(); !ok || s != 0 {
 		t.Fatalf("after reporting, the suppressed counter must reset; ok=%v suppressed=%d", ok, s)
+	}
+}
+
+// TestRefusalRollup_NamesItsScopeOnARouteStampedRecord pins the fix for the one record
+// shape where the rollup's scope and the record's own stamp disagree.
+//
+// The tally is proxy-wide: one bucket bounds the write rate into the single shared audit
+// queue, so a suppressed refusal is folded into whichever record is admitted next,
+// whatever its route or category. Exactly one refusal is BOTH route-stamped and fed by
+// that bucket — the session cap — so a bearer-token spray refused before route resolution
+// (attributable to no route at all) can surface as a five-figure count on a record reading
+// `upstream: github`, `denial_code: RESOURCE_EXHAUSTED`. A SIEM rule or an operator keyed
+// on route + code then reads thousands of saturation refusals against github's policy
+// digest when github saw one. The count now names its own scope, so nothing is inferred
+// from the stamp beside it.
+func TestRefusalRollup_NamesItsScopeOnARouteStampedRecord(t *testing.T) {
+	sink, logPath := newTempAuditSink(t)
+	base := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	now := base
+	lim := newPreSessionDenyLimiter()
+	lim.now = func() time.Time { return now }
+	proxy := &HTTPProxy{sink: sink, preSessionDenies: lim}
+	route := &UpstreamRoute{
+		name: "github",
+		sink: &routeSink{sink: sink, upstream: "github", policyVersion: "1.2.3", policySHA256: "sha256:abc"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/mcp/github", http.NoBody)
+
+	// Spray the UNROUTED path. A bad bearer token is refused before route resolution, so
+	// none of this is attributable to github — or to any route.
+	const attempts = 5000
+	for i := 0; i < attempts; i++ {
+		proxy.recordPreSessionDeny(req, codeAuthFailed, "auth", nil)
+	}
+	// Refill one second of tokens, then let the session cap be the next record admitted.
+	now = base.Add(time.Second)
+	proxy.recordSessionCapDeny(req, route)
+
+	_ = sink.Close()
+	rec := findAuditRecordByCode(readAuditRecords(t, logPath), codeResourceExhausted)
+	if rec == nil {
+		t.Fatal("expected a RESOURCE_EXHAUSTED record for the session-cap refusal")
+	}
+	details, _ := rec["details"].(map[string]interface{})
+	if details == nil {
+		t.Fatal("the session-cap record must carry details")
+	}
+	want := float64(attempts - preSessionDenyBurst)
+	if got := details[detailSuppressedRefusalCount]; got != want {
+		t.Fatalf("%s = %v, want %v — the suppressed refusals must be folded into the next admitted record", detailSuppressedRefusalCount, got, want)
+	}
+	if got := details[detailSuppressedRefusalScope]; got != suppressedScopeProxy {
+		t.Errorf("%s = %v, want %q — a route-stamped record must state that its tally spans the proxy, not the route it names", detailSuppressedRefusalScope, got, suppressedScopeProxy)
+	}
+	// The record still carries its route stamp: naming the scope is what makes the two
+	// coexist, so this must not have been "fixed" by dropping the attribution instead.
+	if got, _ := rec["upstream"].(string); got != "github" {
+		t.Errorf("upstream = %q, want the route name — the stamp must survive alongside the rollup", got)
+	}
+	// The bare key belongs to an unrelated statistic: a */list ALLOW record reports
+	// suppressed_count as the entries the manifest hid. A query written against it must not
+	// also match an unauthenticated refusal flood.
+	if _, collides := details["suppressed_count"]; collides {
+		t.Errorf("the refusal rollup must not reuse suppressed_count, which names the */list filter statistic; got details %v", details)
+	}
+
+	// Every written record must still pass its per-record HMAC under the sink's own key —
+	// the new count/scope details are signed like any other field. CLAUDE.md requires a
+	// sign-and-verify round trip for a new audit-record field; the assertions above alone
+	// only confirm the decoded shape, not that the shape survives verification.
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	for _, line := range bytes.Split(bytes.TrimRight(data, "\n"), []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		ok, verr := sink.VerifyRecord(line)
+		if verr != nil {
+			t.Fatalf("VerifyRecord: %v", verr)
+		}
+		if !ok {
+			t.Errorf("record failed HMAC verification: %s", line)
+		}
 	}
 }
 

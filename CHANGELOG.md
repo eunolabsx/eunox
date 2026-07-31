@@ -86,6 +86,51 @@ Section conventions:
 
 ### Changed
 
+- **A kill-switch audit record's session id is now a type-level distinction**, not a
+  convention. The recorders took a plain session-id string, so keeping an unverified,
+  client-supplied `Mcp-Session-Id` out of the signed `session_id` field rested on the
+  author of each call site reaching for the right one of two near-identical helpers — and
+  the wrong choice fails silently, producing a well-formed, HMAC-chained record asserting
+  a session the proxy never established. They now take a subject value constructible only
+  from an id this proxy established (recorded as `session_id`) or from the request itself
+  (recorded as the unverified `details.claimed_session_id`), so a call site added later
+  must state which it holds and the wrong choice does not compile. No record changes
+  shape. See `docs/threat-model-mcp.md` §3.7.
+- **The refusal-record rate limiter's rollup now names its own scope**, and moved off a
+  key it shared with an unrelated statistic. Transport-surface refusals (`AUTH_FAILED`,
+  `ORIGIN_REJECTED`, `JWT_INVALID`, `LOOPBACK_REJECTED`, …) are the only audit writes an
+  unauthenticated caller can trigger, so their rate is bounded by a token bucket and the
+  next admitted record carries the count elided since. That bucket is **proxy-wide by
+  design** — one bucket is what bounds the sustained write rate into the single shared
+  audit queue, and a per-route split would multiply the rate an attacker can drive by the
+  size of the route table — so its tally is folded into whichever record is admitted next,
+  whatever that record's route or category. The **session cap** is both rate-limited and
+  written through the route's sink, so it can pair an `upstream`/`policy_version`/
+  `policy_sha256` stamp with a count spanning every route: a bearer-token spray against
+  `/mcp/routeA` (refused before route resolution, attributable to no route) surfaced as a
+  five-figure count on a `RESOURCE_EXHAUSTED` record reading `upstream: routeB`, which a
+  SIEM rule keyed on route + code reads as saturation against routeB's policy digest. Every
+  rolled-up record now carries `details.suppressed_refusal_scope: "proxy"`, so the number
+  is never inferred from the stamp beside it.
+  **Breaking for log consumers:** the count itself moved from `details.suppressed_count`
+  to `details.suppressed_refusal_count`. The bare key names the unrelated `*/list` filter
+  statistic (catalog entries the manifest hid) in the same `details` object, so a query
+  written against it matched both routine policy filtering on an `allow` and an
+  unauthenticated refusal flood on a `deny`. Update any rule that reads the refusal rollup;
+  a rule that reads the `*/list` statistic is unaffected. See `docs/threat-model-mcp.md`
+  §3.7 and `docs/conformance.md`.
+- **The `/mcp` malformed-`Content-Type` (`UNSUPPORTED_MEDIA_TYPE`) and malformed-body
+  (`INVALID_REQUEST`) refusals are now route-stamped when the route is already known**,
+  instead of always being written through the proxy-wide sink like the codes that genuinely
+  fire before route resolution (`ORIGIN_REJECTED`, `JWT_INVALID`, …). `handleMCP` 404s an
+  unknown upstream before either gate ever runs, so by the time a `/mcp/<route>` body
+  reaches them the route is not merely knowable but already known; leaving the record
+  unstamped anyway understated what the tape could attribute. This is the same treatment
+  the session cap already got, and turns out to matter for the same reason: it is now a
+  second record shape the refusal rollup's `suppressed_refusal_scope` field has to qualify,
+  since both codes can also carry a rollup from the proxy-wide rate limiter. `/control/kill`
+  (no route concept) is unaffected — its refusals stay unstamped. See
+  `docs/threat-model-mcp.md` §3.7 and `docs/conformance.md`.
 - **`eunox audit-verify` is roughly 40% faster per record**, with no change to what it
   accepts or rejects. It is the tool an incident responder points at a full retained
   archive, so its per-record cost is paid exactly when the record count is largest and
