@@ -1578,11 +1578,21 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 	if err != nil {
 		return fmt.Errorf("kill control endpoint: %w", err)
 	}
-	controlTokenFile, err := transport.WriteControlTokenFile(pf.controlTokenPath, controlToken)
-	if err != nil {
-		return fmt.Errorf("kill control endpoint: %w", err)
+	// Persist it only AFTER the listener binds (AfterListen). The write deliberately
+	// overwrites whatever token sits at the shared default path, so doing it here —
+	// before the bind — meant an operator who accidentally started a second proxy got a
+	// clean "address already in use" failure from the doomed process that had already
+	// replaced the RUNNING proxy's token on disk: `eunox kill` then presents a token the
+	// live proxy rejects, and the loopback emergency stop stays broken until restart, in
+	// exactly the confused-deployment situation where it matters most.
+	writeControlToken := func() error {
+		controlTokenFile, werr := transport.WriteControlTokenFile(pf.controlTokenPath, controlToken)
+		if werr != nil {
+			return fmt.Errorf("kill control endpoint: %w", werr)
+		}
+		fmt.Fprintf(os.Stderr, "[eunox] Control token for POST /control/kill written to %s (0600). 'eunox kill' reads it from there; override with --control-token-path / --control-token / EUNOX_CONTROL_TOKEN.\n", controlTokenFile)
+		return nil
 	}
-	fmt.Fprintf(os.Stderr, "[eunox] Control token for POST /control/kill written to %s (0600). 'eunox kill' reads it from there; override with --control-token-path / --control-token / EUNOX_CONTROL_TOKEN.\n", controlTokenFile)
 
 	proxy := transport.NewHTTPProxyGateway(transport.HTTPGatewayOptions{
 		Routes:             routes,
@@ -1596,6 +1606,7 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 		RequireAuditStrict: pf.requireAuditStrict,
 		AuthToken:          cfg.Listen.AuthToken,
 		ControlToken:       controlToken,
+		AfterListen:        writeControlToken,
 		TrustFwdFor:        pf.trustFwdFor,
 		TrustedProxyCIDRs:  cfg.Listen.TrustedProxyCIDRs,
 		TrustedProxyHops:   trustedProxyHops,
@@ -2139,7 +2150,12 @@ func writeGeneratedFile(path, content string, force bool) (err error) {
 		if err := refuseNonRegularOutput(path); err != nil {
 			return err
 		}
-		flags = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+		// config.OpenNoFollow (O_NOFOLLOW on unix, 0 elsewhere) closes the Lstat->open
+		// race the guard above cannot: the guard inspects the path, then OpenFile resolves
+		// it again, and a link planted in that window would be followed — truncating the
+		// TARGET, which the Chmod below would then re-mode to 0600 as well. O_EXCL already
+		// refuses a symlink for free, which is why only the force path needs the flag.
+		flags = os.O_WRONLY | os.O_CREATE | os.O_TRUNC | config.OpenNoFollow
 	}
 	f, err := os.OpenFile(path, flags, 0o600) //nolint:gosec // G304: path is an operator-provided --output/--config-output location, and 0600 is the intended restrictive mode
 	if err != nil {

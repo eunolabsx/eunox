@@ -178,6 +178,9 @@ type HTTPProxy struct {
 	// process merely because it is on loopback (SEC-07). Empty ⟹ refuse all requests
 	// (fail closed).
 	controlToken string
+	// afterListen runs once the listener has bound and before any request is served,
+	// for startup work that must not happen when the bind fails. See HTTPGatewayOptions.
+	afterListen func() error
 	// authTimingKey is a per-process random HMAC key folding presented/expected
 	// tokens to a fixed-length MAC before the constant-time comparison in checkAuth /
 	// checkControlToken. See constantTimeTokenEqual for the timing rationale.
@@ -287,7 +290,15 @@ type HTTPGatewayOptions struct {
 	// ControlToken authenticates POST /control/kill (loopback only). Generated at
 	// startup by the proxy command; required independently of AuthToken/JWT mode.
 	ControlToken string
-	TrustFwdFor  bool
+	// AfterListen, when non-nil, runs inside Serve immediately after the listener binds
+	// and before the server accepts anything. It exists for startup effects that must not
+	// happen when the bind fails: persisting the control token overwrites the shared
+	// default path, so doing it before the bind lets a second proxy that dies on "address
+	// already in use" replace the RUNNING proxy's token on disk and break `eunox kill`
+	// against it. Returning an error closes the listener and fails Serve, so a hook that
+	// cannot complete does not leave a half-started proxy serving.
+	AfterListen func() error
+	TrustFwdFor bool
 	// TrustedProxyCIDRs is listen.trustedProxyCIDRs: the reverse-proxy peer addresses
 	// trusted to set X-Forwarded-For under TrustFwdFor. Entries must already be valid
 	// CIDRs (GatewayConfig.Validate parses and rejects malformed ones at config load);
@@ -353,6 +364,7 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 		requireAuditStrict: opts.RequireAuditStrict,
 		authToken:          opts.AuthToken,
 		controlToken:       opts.ControlToken,
+		afterListen:        opts.AfterListen,
 		authTimingKey:      newAuthTimingKey(),
 		preSessionDenies:   newPreSessionDenyLimiter(),
 		trustFwdFor:        opts.TrustFwdFor,
@@ -480,6 +492,15 @@ func (p *HTTPProxy) Serve(ctx context.Context) error {
 	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", addr)
 	if err != nil {
 		return fmt.Errorf("listening on %s: %w", addr, err)
+	}
+	// Post-bind startup effects (see HTTPGatewayOptions.AfterListen). Runs only once the
+	// address is actually held, so a proxy that loses the bind race leaves the running
+	// instance's on-disk state alone; a hook failure closes the listener and aborts.
+	if p.afterListen != nil {
+		if err := p.afterListen(); err != nil {
+			_ = ln.Close()
+			return err
+		}
 	}
 	for name := range p.routes {
 		path := "/mcp"

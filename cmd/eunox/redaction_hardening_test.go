@@ -84,3 +84,32 @@ func TestWriteGeneratedFile_RefusesClobberAndTightens(t *testing.T) {
 		t.Errorf("force did not re-tighten mode, got %v", fi.Mode().Perm())
 	}
 }
+
+// TestWriteGeneratedFile_NeverWritesThroughASymlink pins the guarantee both halves of the
+// symlink guard exist for: a link planted at the destination must never have its TARGET
+// truncated (and then re-moded 0600 by the fd Chmod). The Lstat refusal names the path,
+// and config.OpenNoFollow makes the kernel refuse it too, so the guarantee survives losing
+// either one — the open resolves the path a second time, and a link planted in that window
+// is what the flag is there to catch.
+func TestWriteGeneratedFile_NeverWritesThroughASymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "victim")
+	if err := os.WriteFile(target, []byte("victim contents"), 0o600); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	link := filepath.Join(dir, "out.yaml")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable on this platform: %v", err)
+	}
+
+	// force is the path that drops O_EXCL (which refuses a symlink for free) for O_TRUNC.
+	if err := writeGeneratedFile(link, "attacker", true); err == nil {
+		t.Fatal("a forced overwrite of a symlinked destination must be refused")
+	}
+	if b, _ := os.ReadFile(target); string(b) != "victim contents" {
+		t.Fatalf("the symlink target was written through: %q", b)
+	}
+	if fi, err := os.Stat(target); err == nil && fi.Mode().Perm() != 0o600 {
+		t.Errorf("the symlink target was re-moded to %v", fi.Mode().Perm())
+	}
+}

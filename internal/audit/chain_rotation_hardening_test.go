@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/eunolabs/eunox/internal/config"
 )
 
 // TestInterpretAuditTail_WhitespaceOnlyFinalLine is the whitespace-tail unit regression:
@@ -287,7 +289,7 @@ func TestOpenGuardedAppend_RefusesUnstattablePath(t *testing.T) {
 }
 
 // TestOpenNoFollow_RefusesSymlinkWithoutTheLstatGuard pins the defense-in-depth half of
-// the symlink refusal: the openNoFollow flag every audit-log open OR-s in must make the
+// the symlink refusal: the config.OpenNoFollow flag every audit-log open OR-s in must make the
 // KERNEL reject a final-component symlink, independently of refuseNonRegular's Lstat.
 // That is what closes the Lstat->OpenFile TOCTOU — a symlink planted between the check
 // and the open would otherwise be followed, redirecting the tamper-evident tape and
@@ -296,10 +298,10 @@ func TestOpenGuardedAppend_RefusesUnstattablePath(t *testing.T) {
 // The Lstat guard is deliberately bypassed here (the raw os.OpenFile is what
 // openAndPrepareLog and openGuardedAppend perform after it passes), so this fails if the
 // flag is ever dropped from an open even while the guard keeps the higher-level tests
-// green. On a platform with no O_NOFOLLOW equivalent openNoFollow is 0 and the portable
+// green. On a platform with no O_NOFOLLOW equivalent config.OpenNoFollow is 0 and the portable
 // guard is the only check, so there is nothing to assert.
 func TestOpenNoFollow_RefusesSymlinkWithoutTheLstatGuard(t *testing.T) {
-	if openNoFollow == 0 {
+	if config.OpenNoFollow == 0 {
 		t.Skip("platform has no O_NOFOLLOW equivalent; refuseNonRegular is the only guard there")
 	}
 	dir := t.TempDir()
@@ -312,10 +314,10 @@ func TestOpenNoFollow_RefusesSymlinkWithoutTheLstatGuard(t *testing.T) {
 		t.Fatalf("symlink: %v", err)
 	}
 
-	f, err := os.OpenFile(link, os.O_APPEND|os.O_CREATE|os.O_RDWR|openNoFollow, 0o600) //nolint:gosec // G304: test-controlled path
+	f, err := os.OpenFile(link, os.O_APPEND|os.O_CREATE|os.O_RDWR|config.OpenNoFollow, 0o600) //nolint:gosec // G304: test-controlled path
 	if err == nil {
 		_ = f.Close()
-		t.Fatal("openNoFollow must make the kernel refuse a symlinked audit-log path")
+		t.Fatal("config.OpenNoFollow must make the kernel refuse a symlinked audit-log path")
 	}
 	data, rerr := os.ReadFile(target) //nolint:gosec // G304: test-controlled path
 	if rerr != nil {
@@ -327,9 +329,9 @@ func TestOpenNoFollow_RefusesSymlinkWithoutTheLstatGuard(t *testing.T) {
 
 	// A regular path still opens with the flag set — the flag must not break normal use.
 	plain := filepath.Join(dir, "plain.jsonl")
-	g, err := os.OpenFile(plain, os.O_APPEND|os.O_CREATE|os.O_RDWR|openNoFollow, 0o600) //nolint:gosec // G304: test-controlled path
+	g, err := os.OpenFile(plain, os.O_APPEND|os.O_CREATE|os.O_RDWR|config.OpenNoFollow, 0o600) //nolint:gosec // G304: test-controlled path
 	if err != nil {
-		t.Fatalf("openNoFollow must not block a regular path: %v", err)
+		t.Fatalf("config.OpenNoFollow must not block a regular path: %v", err)
 	}
 	_ = g.Close()
 }

@@ -1097,6 +1097,12 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "kill switch activation failed", http.StatusInternalServerError)
 			return
 		}
+		// Record BEFORE the teardown: the stop takes effect the moment the store write
+		// returns, and the teardown below waits on every session's close (bounded by the
+		// shutdown budget, which a wedged upstream reader consumes in full). Recording
+		// after it left a window where a crash produced a tape showing KILL_SWITCH denials
+		// with no activation record to explain them — the exact gap this record closes.
+		p.recordKillActivated(r, killScopeAll)
 		// Evict every open SSE stream: writing the kill state stops future operations,
 		// but a stream opened before the kill is long-lived and would keep delivering
 		// notifications until the idle ceiling. This makes the stop total for the
@@ -1107,7 +1113,6 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 		// sessionIdleTimeoutMs is 0 — otherwise killed-but-undead sessions would pin
 		// capacity and 503 new initializes.
 		p.reapAllKilledSessions() //nolint:contextcheck // teardown path: close()'s upstream session-termination DELETE intentionally uses a detached, bounded background context — binding it to r.Context() would cancel the teardown the instant this response is written. Same rationale as the handleMCPDelete close() site.
-		p.recordKillActivated(r, killScopeAll)
 		p.writeKillResponse(w, "all")
 		return
 	}
@@ -1120,13 +1125,14 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "kill switch session kill failed", http.StatusInternalServerError)
 		return
 	}
+	// Recorded before the teardown, same ordering as the global path above.
+	p.recordKillActivated(r, body.SessionID)
 	// End this session's open SSE stream(s), same reason as the global path above.
 	p.evictSessionStreams(body.SessionID)
 	// Proactively tear the killed session down (close its upstream, free its
 	// maxSessions slot) instead of relying on the idle reaper, which does not run when
 	// sessionIdleTimeoutMs is 0 — see reapKilledSession.
 	p.reapKilledSession(body.SessionID) //nolint:contextcheck // teardown path: close()'s upstream session-termination DELETE intentionally uses a detached, bounded background context. Same rationale as the handleMCPDelete close() site.
-	p.recordKillActivated(r, body.SessionID)
 	p.writeKillResponse(w, body.SessionID)
 }
 
@@ -1144,12 +1150,17 @@ const killScopeAll = "all"
 // stop was authorized.
 //
 // Recorded as an ALLOW: the request was authenticated by the control token and
-// performed, so it is a permitted action, not a refusal. It is emitted AFTER the
-// kill-store write and session teardown succeed, so the tape never claims a stop that
-// did not take effect (a failed ActivateGlobal/KillSession returns 500 before reaching
-// here). scope is the killed session id, or killScopeAll for a whole-proxy stop; it
-// goes in details rather than the structured target field, which is reserved for MCP
-// tool/resource/prompt targets this administrative action has none of.
+// performed, so it is a permitted action, not a refusal. It is emitted after the
+// kill-store write succeeds — so the tape never claims a stop that did not take effect (a
+// failed ActivateGlobal/KillSession returns 500 before reaching here) — and BEFORE the
+// stream eviction and session teardown, which are resource reclamation rather than part
+// of the stop. The kill is in force the moment the store write returns, while the
+// teardown waits on every session's close and is bounded only by the shutdown budget, so
+// recording after it left a window in which a crash produced a tape full of KILL_SWITCH
+// denials with no activation record to explain them. scope is the killed session id, or
+// killScopeAll for a whole-proxy stop; it goes in details rather than the structured
+// target field, which is reserved for MCP tool/resource/prompt targets this
+// administrative action has none of.
 //
 // The record carries no credential — the control token is never recorded, matching the
 // CONTROL_AUTH_FAILED refusal path — and no session_id: a global stop addresses no

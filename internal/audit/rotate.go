@@ -328,9 +328,9 @@ func openGuardedAppend(logPath string) (*os.File, error) {
 	if err := refuseNonRegular(logPath); err != nil {
 		return nil, err
 	}
-	// openNoFollow (O_NOFOLLOW on unix) closes the Lstat->open race the guard above
+	// config.OpenNoFollow (O_NOFOLLOW on unix) closes the Lstat->open race the guard above
 	// cannot; the rename->reopen window is exactly where a planted symlink would land.
-	return os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY|openNoFollow, 0o600) //nolint:gosec // G304: path is user-configured audit log location
+	return os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY|config.OpenNoFollow, 0o600) //nolint:gosec // G304: path is user-configured audit log location
 }
 
 // refuseNonRegular fails closed unless logPath is a regular file or genuinely absent. It
@@ -338,7 +338,7 @@ func openGuardedAppend(logPath string) (*os.File, error) {
 // startup open (openAndPrepareLog) and the two post-rotation reopen sites (via
 // openGuardedAppend) so a change to the check cannot leave one site weaker than the
 // other. See config.RefuseNonRegularPath for what the guard covers and the residual
-// Lstat->open window openNoFollow narrows here.
+// Lstat->open window config.OpenNoFollow narrows here.
 func refuseNonRegular(logPath string) error {
 	return config.RefuseNonRegularPath(logPath, "audit log path")
 }
