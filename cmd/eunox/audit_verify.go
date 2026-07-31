@@ -53,6 +53,38 @@ func applyConfigAuditDefaults(cmdName, configPath string, logPath, keyPath *stri
 	return err
 }
 
+// parseReaderArgs is the stance-free half of the preamble every subcommand that reads
+// the audit tape (suggest, stats, audit-verify, doctor) performs identically: parse args
+// (the subcommand's own arguments, os.Args[2:] in a real invocation) into the flag set,
+// map -h/--help to a clean exit, and reject a stray positional.
+//
+// done reports that the caller must return code immediately: 0 for -h, 1 for a usage
+// error (already reported on stderr). When done is false, code is 0 and parsing
+// succeeded.
+//
+// The stray-positional rejection is the load-bearing half: the log is chosen with
+// --audit-log/--config, never positionally, so `eunox stats audit.jsonl` must not
+// silently report on the DEFAULT log while naming another file on the command line.
+//
+// Config defaulting is deliberately NOT this function's job: audit-verify/stats/suggest
+// abort on an unloadable --config (applyConfigAuditDefaults) while doctor carries the
+// failure into its bundle (loadConfigAuditDefaults) — that stance belongs at the caller,
+// which is why parseAuditReaderFlags and parseDoctorReaderFlags each add their own step
+// after calling this one.
+func parseReaderArgs(name string, fs *flag.FlagSet, args []string) (code int, done bool) {
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0, true
+		}
+		return 1, true
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "eunox %s: unexpected argument %q (use --audit-log to name the log file)\n", name, fs.Arg(0))
+		return 1, true
+	}
+	return 0, false
+}
+
 // parseAuditReaderFlags runs the preamble every subcommand that reads the audit tape
 // (suggest, stats, audit-verify, doctor) performs identically: parse args (the
 // subcommand's own arguments, os.Args[2:] in a real invocation) into the flag set,
@@ -66,20 +98,9 @@ func applyConfigAuditDefaults(cmdName, configPath string, logPath, keyPath *stri
 // Every flag argument is a POINTER, configPath included: they are read after fs.Parse
 // runs here, so a by-value configPath would capture the pre-parse empty string and
 // silently skip the config defaulting entirely.
-//
-// The stray-positional rejection is the load-bearing half: the log is chosen with
-// --audit-log/--config, never positionally, so `eunox stats audit.jsonl` must not
-// silently report on the DEFAULT log while naming another file on the command line.
 func parseAuditReaderFlags(name string, fs *flag.FlagSet, args []string, configPath, logPath, keyPath *string) (code int, done bool) {
-	if err := fs.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return 0, true
-		}
-		return 1, true
-	}
-	if fs.NArg() > 0 {
-		fmt.Fprintf(os.Stderr, "eunox %s: unexpected argument %q (use --audit-log to name the log file)\n", name, fs.Arg(0))
-		return 1, true
+	if code, done := parseReaderArgs(name, fs, args); done {
+		return code, done
 	}
 	if err := applyConfigAuditDefaults(name, *configPath, logPath, keyPath); err != nil {
 		fmt.Fprintln(os.Stderr, err)
