@@ -40,33 +40,32 @@ var errNonCanonicalRecord = errors.New("signed audit record is not in canonical 
 // matches. The record's key_id selects the key, so a log straddling a rotation
 // still verifies: a known key_id is checked against that key, and a record with no
 // key_id (pre-rotation or single-key) against every key in the ring.
+//
+// It is the entry point for a caller holding only the line. A caller that has
+// already strict-decoded it (VerifyLog's chain walk) hands the record straight to
+// verifyDecodedRecord instead, so a verify pass decodes each line once.
 func (s *Sink) VerifyRecord(line []byte) (bool, error) {
-	var rec auditRecord
-	// Decode strictly (DisallowUnknownFields) in a SINGLE pass: this both populates the
-	// record and rejects any unknown top-level field. A signed record must contain no
-	// field the auditRecord struct does not model — the HMAC is recomputed below over
-	// the re-marshaled struct, and a lenient decode silently DROPS unknown fields, so an
-	// injected field (e.g. "operator_override":"approved") would not be covered by the
-	// recomputed HMAC yet the modified on-disk line would still verify. The disallowed
-	// set is derived from the struct tags automatically, so it cannot drift from
-	// auditRecord the way a hand-maintained field list would.
-	//
-	// UseNumber decodes any JSON number landing on an interface{} as json.Number (exact
-	// text) rather than float64, which cannot round-trip integers above 2^53. Details is
-	// a json.RawMessage (preserved verbatim, so unaffected) and no other auditRecord
-	// field is interface{}-typed, so this is currently a no-op — retained as a guard so a
-	// future interface{}/map field cannot silently break the decode→re-marshal round-trip.
-	dec := json.NewDecoder(bytes.NewReader(line))
-	dec.UseNumber()
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&rec); err != nil {
-		return false, fmt.Errorf("audit record is malformed or contains an unknown field: %w", err)
-	}
-	// Reject trailing bytes: Decode stops at the first value and ignores the rest, so
-	// a tampered {…record…}GARBAGE line would otherwise verify (the HMAC covers the
-	// re-marshaled fields, not the raw line). More() flags any trailing token.
-	if dec.More() {
-		return false, fmt.Errorf("trailing data after audit record")
+	rec, err := strictDecodeAuditRecord(line)
+	return s.verifyDecodedRecord(line, rec, err)
+}
+
+// verifyDecodedRecord is VerifyRecord's body over a line whose strict decode the
+// caller already performed, passing the resulting record and the decode's error
+// (nil when it succeeded). Splitting it this way is what lets VerifyLog verify
+// without decoding a second time; decodeErr is reported verbatim, so the
+// pre-decoded path and the standalone one cannot diverge on a malformed or
+// unknown-field line.
+//
+// rec MUST be the product of strictDecodeAuditRecord, never of a lenient decode:
+// the HMAC is recomputed below over the re-marshaled struct, and a lenient decode
+// silently DROPS unknown fields, so an injected field (e.g.
+// "operator_override":"approved") would not be covered by the recomputed HMAC yet
+// the modified on-disk line would still verify. A non-nil decodeErr returns before
+// rec is read at all, which is what makes it safe for a caller holding a lenient
+// record for its own reporting to pass that record alongside the strict error.
+func (s *Sink) verifyDecodedRecord(line []byte, rec auditRecord, decodeErr error) (bool, error) {
+	if decodeErr != nil {
+		return false, decodeErr
 	}
 	storedHMAC := rec.HMAC
 	// Fail closed on an unsigned record rather than proceeding to a comparison against
@@ -103,10 +102,10 @@ func (s *Sink) VerifyRecord(line []byte) (bool, error) {
 	//     the very same value.
 	//
 	// Rather than enumerate those vectors one at a time, require the line to BE the
-	// bytes the writer emits for the fields it decoded to: rebuild the canonical line
-	// through the same splice writeRecord uses and compare. Anything the writer would
-	// not have produced is rejected, which covers the whole class rather than its
-	// currently-known members.
+	// bytes the writer emits for the fields it decoded to: compare it against the same
+	// splice writeRecord uses (in place, without materializing that line). Anything the
+	// writer would not have produced is rejected, which covers the whole class rather
+	// than its currently-known members.
 	//
 	// This adds no cross-version fragility: the HMAC is already computed over
 	// json.Marshal of the struct, so any change to the field set or their order breaks
@@ -131,9 +130,17 @@ func (s *Sink) VerifyRecord(line []byte) (bool, error) {
 	}
 	// Constant-time comparison to prevent a timing side channel that could
 	// let an attacker forge an HMAC byte-by-byte.
+	//
+	// Both operands are converted to bytes ONCE, outside the loop: storedHMAC does not
+	// vary by key, and macBuf is refilled in place per key. Inside the loop each would
+	// be a fresh allocation per key per record — with a K-key rotation ring and records
+	// carrying no key_id (which are tried against every key), 2K throwaway allocations
+	// on a path that runs once per record of a multi-GB archive.
+	storedMAC := []byte(storedHMAC)
+	var macBuf []byte
 	for _, key := range keys {
-		want := recordMAC(key, body)
-		if hmac.Equal([]byte(storedHMAC), []byte(want)) {
+		macBuf = appendRecordMAC(macBuf[:0], key, body)
+		if hmac.Equal(storedMAC, macBuf) {
 			return true, nil
 		}
 	}
@@ -442,19 +449,96 @@ type auditChainVerifier struct {
 // count always survives in VerifyResult.Invalid and in the closing summary line.
 const maxUnsignedDiagnostics = 10
 
-// decodeAuditRecord decodes one line into an auditRecord, reporting whether it was
-// well-formed JSON with no trailing data. UseNumber gives parity with VerifyRecord
-// (a guard for any future interface{}-typed field; see there), and the !More() guard
-// rejects a tampered {…record…}GARBAGE line the !unmarshalOK gate would otherwise
-// accept. A malformed line leaves rec at its zero value (HMAC="", Seq=0); the caller
-// must keep it out of the chain state so it does not poison prevHMAC/prevSeq and
-// fabricate spurious breaks.
-func decodeAuditRecord(line []byte) (auditRecord, bool) {
+// recordDecode is what decodeAuditRecord's pass over a line yields for the two
+// consumers that read it with different tolerances. Holding both verdicts in one
+// value is what lets a verify pass decode each line once rather than twice.
+type recordDecode struct {
+	// wellFormed is the LENIENT verdict: the line parsed as one complete JSON value
+	// with no trailing data. It stays true for a line carrying an unknown top-level
+	// field — such a record is still a record for counting and chain-state purposes,
+	// even though it can never verify. The chain walk reads this one.
+	wellFormed bool
+	// verifyErr is the STRICT verdict: non-nil when the line is anything a verifier
+	// must refuse — malformed JSON, trailing data, or an unknown top-level field.
+	// verifyDecodedRecord reads this one, and reports it verbatim.
+	verifyErr error
+}
+
+// decodeAuditRecord decodes one line into an auditRecord and reports both verdicts
+// a verify pass needs (see recordDecode): the lenient "is this a record at all",
+// which drives counting and chain state, and the strict "may this be verified",
+// which drives the signature check.
+//
+// The two are deliberately different — a line with an unknown top-level field is a
+// record the chain must account for AND a line no verifier may accept — but they
+// come from ONE decode on the path that matters. The strict pass runs first and, on
+// the overwhelmingly common good line, is the only pass: a record with no unknown
+// field decodes identically under both tolerances, so the strict result IS the
+// lenient one. Only a line the strict pass rejects needs the lenient view, and
+// paying a second decode there costs nothing on a healthy log while keeping the
+// leniency difference explicit rather than implied by having two decoders.
+//
+// wellFormed — NOT the returned record's contents — is what gates the chain: a line
+// rejected for a syntax error leaves rec at its zero value, but one rejected for
+// trailing data ({…record…}GARBAGE) decodes its leading object first and so comes
+// back populated. The caller must keep every !wellFormed line out of the chain state
+// on the flag alone, or such a record poisons prevHMAC/prevSeq and fabricates
+// spurious breaks.
+func decodeAuditRecord(line []byte) (auditRecord, recordDecode) {
+	rec, err := strictDecodeAuditRecord(line)
+	if err == nil {
+		return rec, recordDecode{wellFormed: true}
+	}
+	// Strictly rejected. Whether it is still a record for counting and chain purposes
+	// is exactly the lenient question, so ask it — the strict pass cannot answer it,
+	// since it refuses an unknown-field line and a syntactically broken one alike.
+	lenient, wellFormed := lenientDecodeAuditRecord(line)
+	return lenient, recordDecode{wellFormed: wellFormed, verifyErr: err}
+}
+
+// strictDecodeAuditRecord decodes one line into an auditRecord, refusing everything
+// a verifier must refuse. It returns the ZERO record alongside any error, so a
+// caller cannot accidentally build on a half-populated struct.
+//
+// DisallowUnknownFields rejects any top-level field the auditRecord struct does not
+// model: the HMAC is recomputed over the re-marshaled struct, so a field the decode
+// drops would not be covered by it (see verifyDecodedRecord). The disallowed set is
+// derived from the struct tags automatically, so it cannot drift from auditRecord
+// the way a hand-maintained field list would.
+//
+// UseNumber decodes any JSON number landing on an interface{} as json.Number (exact
+// text) rather than float64, which cannot round-trip integers above 2^53. Details is
+// a json.RawMessage (preserved verbatim, so unaffected) and no other auditRecord
+// field is interface{}-typed, so this is currently a no-op — retained as a guard so a
+// future interface{}/map field cannot silently break the decode→re-marshal round-trip.
+func strictDecodeAuditRecord(line []byte) (auditRecord, error) {
 	var rec auditRecord
 	dec := json.NewDecoder(bytes.NewReader(line))
 	dec.UseNumber()
-	unmarshalOK := dec.Decode(&rec) == nil && !dec.More()
-	return rec, unmarshalOK
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&rec); err != nil {
+		return auditRecord{}, fmt.Errorf("audit record is malformed or contains an unknown field: %w", err)
+	}
+	// Reject trailing bytes: Decode stops at the first value and ignores the rest, so
+	// a tampered {…record…}GARBAGE line would otherwise verify (the HMAC covers the
+	// re-marshaled fields, not the raw line). More() flags any trailing token.
+	if dec.More() {
+		return auditRecord{}, errors.New("trailing data after audit record")
+	}
+	return rec, nil
+}
+
+// lenientDecodeAuditRecord decodes one line into an auditRecord, TOLERATING an
+// unknown top-level field, and reports whether the line was well-formed JSON with
+// no trailing data. It answers "is this a record at all" for counting and chain
+// state — questions an unknown field does not change — and is never the decode a
+// signature check is built on (see strictDecodeAuditRecord for why).
+func lenientDecodeAuditRecord(line []byte) (auditRecord, bool) {
+	var rec auditRecord
+	dec := json.NewDecoder(bytes.NewReader(line))
+	dec.UseNumber()
+	wellFormed := dec.Decode(&rec) == nil && !dec.More()
+	return rec, wellFormed
 }
 
 // isSignedRecord reports whether rec carries a signature at all. writeRecord signs
@@ -476,7 +560,7 @@ func isSignedRecord(rec auditRecord) bool {
 // across legitimate records (updateChain), then classifies and reports it.
 func (v *auditChainVerifier) processLine(line []byte) {
 	v.res.Total++
-	rec, unmarshalOK := decodeAuditRecord(line)
+	rec, dec := decodeAuditRecord(line)
 
 	// A Seq==0 record with a non-empty HMAC is structurally impossible (a signed chain
 	// starts at seq 1), so it is a forged decoy, rejected below and kept out of the
@@ -510,10 +594,10 @@ func (v *auditChainVerifier) processLine(line []byte) {
 	// prev_hmac linkage and seq contiguity are checked as separate ifs, not switch
 	// cases: an interior deletion trips BOTH, and a switch would emit only the first,
 	// hiding how many records were removed.
-	if unmarshalOK && !forgedSeq0 && !unsigned {
+	if dec.wellFormed && !forgedSeq0 && !unsigned {
 		v.updateChain(rec)
 	}
-	v.classify(line, rec, unmarshalOK, forgedSeq0, unsigned)
+	v.classify(line, rec, dec, forgedSeq0, unsigned)
 }
 
 // updateChain checks a legitimate record's prev_hmac linkage and seq contiguity
@@ -590,12 +674,12 @@ func (v *auditChainVerifier) reportSuppressedUnsigned() {
 
 // classify counts and reports the record's verification outcome: malformed,
 // forged decoy, unsigned, or HMAC-verified (valid/invalid/skipped per the filter).
-func (v *auditChainVerifier) classify(line []byte, rec auditRecord, unmarshalOK, forgedSeq0, unsigned bool) {
+func (v *auditChainVerifier) classify(line []byte, rec auditRecord, dec recordDecode, forgedSeq0, unsigned bool) {
 	// A line that failed to decode cannot be filtered or HMAC-verified, but is
 	// unambiguous corruption. Count it invalid before the filter so an active
 	// --request-id/--since cannot downgrade it to a silent skip and produce a false
 	// PASS over a corrupted log.
-	if !unmarshalOK {
+	if !dec.wellFormed {
 		v.res.Invalid++
 		_, _ = fmt.Fprintf(v.out, "INVALID  malformed record %d: not valid JSON\n", v.res.Total)
 		return
@@ -662,7 +746,11 @@ func (v *auditChainVerifier) classify(line []byte, rec auditRecord, unmarshalOK,
 		inReportWindow = false
 	}
 
-	ok, err := v.verifier.VerifyRecord(line)
+	// The strict decode processLine already performed is handed straight through, so
+	// this pass decodes each line once. dec.verifyErr carries the strict verdict for
+	// the line — including the unknown-field rejection rec itself cannot express,
+	// since rec is the lenient decode whenever the strict one failed.
+	ok, err := v.verifier.verifyDecodedRecord(line, rec, dec.verifyErr)
 	switch {
 	case errors.Is(err, errKeyIDNotInRing):
 		// Key absent from the ring (retired-key state, not tampering). Report and count

@@ -2194,16 +2194,29 @@ func (s *Sink) repairTailOrphan() bool {
 	return true
 }
 
-// recordMAC computes the tamper-evidence digest over an HMAC-stripped marshaled record
-// body: HMAC-SHA256 under key, hex-encoded with the "sha256:" algorithm prefix. The
-// signer (writeRecord) and the verifier (verify.go) MUST produce byte-identical digest
-// strings for the chain to hold, so both call this one helper — a one-sided change to
-// the algorithm, prefix, or encoding would otherwise make every existing record verify
-// as tampered.
-func recordMAC(key, body []byte) string {
+// macAlgPrefix names the digest algorithm in every record MAC. It is part of the
+// signed on-disk form, so changing it invalidates every record already written.
+const macAlgPrefix = "sha256:"
+
+// appendRecordMAC appends the tamper-evidence digest over an HMAC-stripped marshaled
+// record body to dst: HMAC-SHA256 under key, hex-encoded with the "sha256:" algorithm
+// prefix. The signer (writeRecord) and the verifier (verify.go) MUST produce
+// byte-identical digests for the chain to hold, so both reach this one helper — a
+// one-sided change to the algorithm, prefix, or encoding would otherwise make every
+// existing record verify as tampered.
+//
+// Appending (rather than returning a fresh string) is what lets the verifier's
+// per-key loop refill one buffer instead of allocating a digest per key per record.
+func appendRecordMAC(dst, key, body []byte) []byte {
 	mac := hmac.New(sha256.New, key)
 	mac.Write(body)
-	return "sha256:" + hex.EncodeToString(mac.Sum(nil))
+	return hex.AppendEncode(append(dst, macAlgPrefix...), mac.Sum(nil))
+}
+
+// recordMAC is appendRecordMAC's string form, for the writer, which stamps the digest
+// on the record as a string field.
+func recordMAC(key, body []byte) string {
+	return string(appendRecordMAC(nil, key, body))
 }
 
 // signedRecordLine returns the canonical on-disk bytes of a signed record (no
@@ -2232,16 +2245,63 @@ func signedRecordLine(body []byte, mac string) ([]byte, error) {
 		// splicing into a non-object would corrupt the record.
 		return nil, errors.New("signing body is not a JSON object")
 	}
-	macJSON, err := json.Marshal(mac)
-	if err != nil {
-		return nil, err
-	}
 	// No summed-length capacity (which CodeQL flags as a potential allocation
 	// overflow); append grows safely.
 	line := body[:len(body)-1] // drop the trailing '}'
-	line = append(line, `,"_hmac":`...)
-	line = append(line, macJSON...)
+	line = append(line, macFieldPrefix...)
+	line, err := appendJSONString(line, mac)
+	if err != nil {
+		return nil, err
+	}
 	return append(line, '}'), nil
+}
+
+// macFieldPrefix is the `,"_hmac":` splice that turns a signed body into the full
+// on-disk line. The field name must match the auditRecord json tag ("_hmac").
+const macFieldPrefix = `,"_hmac":`
+
+// appendJSONString appends the JSON encoding of s to dst. It is the single
+// definition of how a MAC is spelled inside a record line — shared by the writer
+// (signedRecordLine) and the verifier's canonical-form check (isCanonicalSignedLine)
+// so the two cannot disagree about what the canonical bytes are.
+//
+// A string with nothing to escape encodes to its own bytes in quotes, so that case
+// is appended directly and json.Marshal is reached only by a string that needs
+// escaping. Every MAC this writer produces is "sha256:" plus hex and takes the
+// direct path; the marshal path exists for the verifier, which is handed whatever
+// _hmac an attacker left on disk.
+func appendJSONString(dst []byte, s string) ([]byte, error) {
+	if isPlainJSONString(s) {
+		dst = append(dst, '"')
+		dst = append(dst, s...)
+		return append(dst, '"'), nil
+	}
+	encoded, err := json.Marshal(s)
+	if err != nil {
+		return nil, err
+	}
+	return append(dst, encoded...), nil
+}
+
+// isPlainJSONString reports whether json.Marshal(s) is exactly s wrapped in quotes.
+// It is deliberately conservative — a false negative only costs a marshal, while a
+// false positive would mis-spell the canonical form — so it admits printable ASCII
+// only, minus every byte encoding/json rewrites: the quote and backslash it escapes,
+// and the three characters it HTML-escapes by default (less-than, greater-than,
+// ampersand, each emitted as a numeric escape). Control bytes, DEL, and every
+// non-ASCII byte (which brings in UTF-8 validation and the U+2028/U+2029 escapes)
+// take the marshal path. TestIsPlainJSONString_NeverOverclaims sweeps every byte
+// value against encoding/json to keep this in step with it.
+func isPlainJSONString(s string) bool {
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c < 0x20 || c > 0x7e:
+			return false
+		case c == '"' || c == '\\' || c == '<' || c == '>' || c == '&':
+			return false
+		}
+	}
+	return true
 }
 
 // isCanonicalSignedLine reports whether line is byte-identical to what
@@ -2250,24 +2310,42 @@ func signedRecordLine(body []byte, mac string) ([]byte, error) {
 // VerifyRecord calls this for every signed record in an audit-verify pass, which
 // can scan a multi-GB log, so this avoids signedRecordLine's clone-and-append — an
 // allocation and copy proportional to the record's size, dominated by Details, up
-// to 1 MiB — in favor of a prefix/suffix comparison directly against body's own
-// backing array. Only mac (always small: "sha256:" plus a hex digest) is marshaled
-// and copied; nothing here scales with record size.
+// to 1 MiB — in favor of comparing line directly against body's own backing array
+// and then against the mac field the writer would have spliced on. Nothing here
+// scales with record size, and on the path every genuine record takes (a "sha256:"
+// hex mac, which needs no escaping) nothing is allocated at all.
 func isCanonicalSignedLine(line, body []byte, mac string) (bool, error) {
 	if n := len(body); n == 0 || body[n-1] != '}' {
 		// Defensive: a struct marshal always ends in '}', so this is unreachable —
 		// mirrors signedRecordLine's identical guard.
 		return false, errors.New("signing body is not a JSON object")
 	}
+	prefix := body[:len(body)-1] // body minus its trailing '}'
+	if !bytes.HasPrefix(line, prefix) {
+		return false, nil
+	}
+	// What remains must be exactly what signedRecordLine appends: the mac field, the
+	// JSON encoding of mac, and the closing brace. Comparing the remainder in place
+	// keeps the check byte-identical to the splice without materializing it.
+	tail := line[len(prefix):]
+	if len(tail) < len(macFieldPrefix)+1 ||
+		string(tail[:len(macFieldPrefix)]) != macFieldPrefix ||
+		tail[len(tail)-1] != '}' {
+		return false, nil
+	}
+	encodedMAC := tail[len(macFieldPrefix) : len(tail)-1]
+	if isPlainJSONString(mac) {
+		// Same branch appendJSONString takes for this mac, so the two agree by
+		// construction: the encoding is the mac's own bytes in quotes.
+		return len(encodedMAC) == len(mac)+2 &&
+			encodedMAC[0] == '"' && encodedMAC[len(encodedMAC)-1] == '"' &&
+			string(encodedMAC[1:len(encodedMAC)-1]) == mac, nil
+	}
 	macJSON, err := json.Marshal(mac)
 	if err != nil {
 		return false, err
 	}
-	prefix := body[:len(body)-1] // body minus its trailing '}'
-	suffix := append(append([]byte(`,"_hmac":`), macJSON...), '}')
-	return len(line) == len(prefix)+len(suffix) &&
-		bytes.HasPrefix(line, prefix) &&
-		bytes.HasSuffix(line, suffix), nil
+	return bytes.Equal(encodedMAC, macJSON), nil
 }
 
 // writeRecord stamps the chain fields, signs, and writes a single record,

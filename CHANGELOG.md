@@ -59,6 +59,23 @@ Section conventions:
 
 ### Changed
 
+- **`eunox audit-verify` is roughly 40% faster per record**, with no change to what it
+  accepts or rejects. It is the tool an incident responder points at a full retained
+  archive, so its per-record cost is paid exactly when the record count is largest and
+  the answer is most time-sensitive. Every line was being JSON-decoded **twice** — once
+  leniently, to count it and place it in the tamper-evident chain, and again strictly
+  inside the HMAC recompute — which alone was ~35-39% of the per-record cost. The two
+  are now one decode on the path every well-formed record takes; the lenient decode is
+  reached only by a line the strict pass rejects, so the leniency difference is
+  preserved on purpose (a record carrying an unknown top-level field is still counted
+  and still holds its place in the chain, while still being one no verifier may accept)
+  rather than as a side effect of two decoders existing. Two smaller allocations in the
+  same loop went with it: the stored `_hmac` is converted to bytes once per record
+  instead of once per key tried (with a K-key rotation ring and records naming no
+  `key_id`, that was 2K throwaway allocations per record), and the canonical-on-disk-form
+  check no longer rebuilds a constant-shaped `_hmac` suffix per record. End to end over
+  a signed log: 58 -> 32 allocations per record.
+
 - **The Redis kill switch's fail-closed staleness budget is floored against a real
   refresh-cycle cost**, instead of being a bare two reconcile intervals. The budget
   gates a total, non-downgradable denial, and a refresh cycle (a `GET` plus two `SCAN`
