@@ -1443,6 +1443,64 @@ func TestParseToolsListResult_AmbiguousToolsKey(t *testing.T) {
 	}
 }
 
+// TestParseToolsListResult_MalformedEntry pins the fail-closed property on a catalog
+// carrying an entry that is not a well-formed tool object: the whole parse is refused
+// rather than the entry being skipped. A skipped entry would silently shrink the live
+// tool set the drift comparison runs against, which is how a pinned tool goes missing
+// without an FM-2 finding.
+func TestParseToolsListResult_MalformedEntry(t *testing.T) {
+	t.Parallel()
+	for _, body := range []string{
+		`{"tools":[{"name":"ok"},42]}`,
+		`{"tools":[{"name":"ok"},"not-an-object"]}`,
+		`{"tools":[{"name":"ok"},{"name":123}]}`,
+	} {
+		tools, err := ParseToolsListResult(json.RawMessage(body))
+		if err == nil {
+			t.Errorf("a malformed entry must fail the parse, not be skipped: %s (got %d tools)", body, len(tools))
+			continue
+		}
+		// A non-object entry is refused by the per-entry screen (which fails closed on
+		// bytes it cannot walk); a well-formed object with a wrong-typed field is refused
+		// by the decode. Either way the whole catalog is rejected and the message names
+		// tools/list — the property that matters is that nothing is silently dropped.
+		if !strings.Contains(err.Error(), "tools/list") {
+			t.Errorf("error should name what failed to parse, got %q for %s", err, body)
+		}
+	}
+}
+
+// TestParseToolsListResult_EntriesDecodeIndependently pins that the per-entry decode
+// carries every hashed field through, so folding the second envelope decode into the
+// entry loop cannot silently drop one — a zeroed field hashes clean against a pin that
+// would otherwise have caught an injected value.
+func TestParseToolsListResult_EntriesDecodeIndependently(t *testing.T) {
+	t.Parallel()
+	raw := json.RawMessage(`{"tools":[{
+		"name":"read_file",
+		"title":"Read File",
+		"description":"reads a file",
+		"inputSchema":{"type":"object","properties":{"path":{"type":"string"}}},
+		"outputSchema":{"type":"object"},
+		"annotations":{"readOnlyHint":true}
+	}]}`)
+	tools, err := ParseToolsListResult(raw)
+	if err != nil {
+		t.Fatalf("ParseToolsListResult: %v", err)
+	}
+	if len(tools) != 1 {
+		t.Fatalf("want 1 tool, got %d", len(tools))
+	}
+	got := tools[0]
+	if got.Name != "read_file" || got.Title != "Read File" || got.Description != "reads a file" {
+		t.Errorf("string fields not carried through: %+v", got)
+	}
+	if got.InputSchema == nil || got.OutputSchema == nil || got.Annotations == nil {
+		t.Errorf("map fields not carried through: inputSchema=%v outputSchema=%v annotations=%v",
+			got.InputSchema, got.OutputSchema, got.Annotations)
+	}
+}
+
 // TestDriftWarning_LogLine_Default covers the default case in LogLine().
 func TestDriftWarning_LogLine_Default(t *testing.T) {
 	t.Parallel()

@@ -53,6 +53,36 @@ Section conventions:
   endpoint stays a one-way emergency stop (a same-host caller holding the control
   token must not be able to lift the revocation issued against it), and an in-memory
   kill switch is cleared by restarting the proxy.
+- `eunox kill --agent <agent-id>` and `eunox kill --revive --agent <agent-id>` target
+  the **agent** kill dimension: revoking a JWT `agent_id` stops every session that
+  identity holds, which is the natural granularity when one compromised agent spans
+  many sessions — previously the choice was killing each session id individually or
+  reaching for the global switch. `killswitch.KillAgent` / `ReviveAgent` existed but
+  had no caller anywhere in the binary, so an agent kill was not merely un-remediable
+  from the CLI, it was unreachable. Both halves ship together deliberately: agent kills
+  never expire, so a kill without an undo would be a permanent revocation with no CLI
+  remediation at all. Redis-only, like `--revive`: there is no agent dimension on the
+  loopback `/control/kill` endpoint, and adding one would widen what a same-host caller
+  holding the control token can reach. `--killswitch-session-ttl` is rejected alongside
+  `--agent` rather than silently ignored, since an agent kill carries no expiry.
+- `eunox kill --session <session-id>` targets a session id **verbatim**. The positional
+  `all` means the whole deployment, which left a session whose id is literally `all` —
+  possible, since `--session-id` is operator-settable on a stdio proxy — impossible to
+  kill or revive individually; `--session all` is that escape hatch. Exactly one target
+  may be given (a positional, `--session`, or `--agent`) and supplying more is rejected
+  rather than resolved by precedence: on the emergency-stop path a silently ignored
+  target is the difference between a revocation an operator believes landed and one
+  that did not. Both transports' success lines now carry the dimension
+  (`{"ok":true,"killed":"x","dimension":"agent","via":"redis"}`), and so does the control
+  endpoint's audit record, since with two id dimensions the id alone no longer says which
+  store moved — without it, revoking a session named `all` and halting the whole deployment
+  produce an identical response and an identical signed record.
+- `eunox kill --reset` was considered and **declined**. `killswitch.Reset` clears the
+  global flag, every agent kill, and every session tombstone in one call — the same
+  cross-dimension fail-open that `--revive all` deliberately avoids, with a wider
+  radius, and a confirmation prompt in front of it is not a design. If bulk revive
+  becomes a real operational need, the shape to build is a session-scoped sweep over
+  the session-kill prefix. Recorded in `docs/adr/0003-redis-killswitch-fail-open.md`.
 - `killswitch.NormalizeSessionKillTTL`, `WithSessionKillTTLEffective`,
   `(*Redis).SessionKillTTL`, `(*Redis).PublishSessionKillTTL`,
   `ReadPublishedSessionKillTTL`, and `DescribeSessionKillTTL` — the shared-TTL seam
@@ -86,6 +116,88 @@ Section conventions:
 
 ### Changed
 
+- **The session-kill TTL the proxy publishes to Redis now expires, and is refreshed
+  while the proxy runs.** The key (`killswitch:config:session-kill-ttl`) carried no
+  expiry, timestamp, or writer identity, so nothing distinguished a value a running
+  proxy had just published from one left behind by a decommissioned or since-
+  reconfigured instance — and `eunox kill --redis-addr`, which adopts it outright in
+  the common no-flag case, could therefore write a tombstone that expires (and
+  re-admits the session) earlier than the running proxy's own kills. The key now
+  carries an expiry of three reconcile intervals, refreshed from the reconcile loop
+  the Redis backend already runs, so a value that is readable at all belongs to a
+  proxy running now and a *stale* value becomes an *absent* one — which the CLI
+  already handles correctly and loudly, falling back to its own lifetime and naming
+  it on stderr. No new goroutine, ticker, or connection: the refresh rides the
+  existing tick. It also makes the disagreement diagnostic reliable rather than
+  startup-only — two differently-configured proxies overwrite each other continuously
+  and each reports the other on its next tick, including the case where the second
+  started long after the first, which no one-shot comparison can catch. The warning is
+  deduplicated on the prior value, so a persistent disagreement is reported once and a
+  changed one again — and the dedupe is deliberately not re-armed by an intervening
+  agreement, since two proxies ticking at different rates would otherwise alternate and
+  print it forever. A **permanent** lifetime (`--killswitch-session-ttl -1s`) is published
+  with no key expiry at all: the freshness bound exists to stop a stale value *shortening*
+  a revocation, a permanent value cannot shorten anything, and letting it lapse would drop
+  `eunox kill` back to its 30-day default on a deployment configured for permanent
+  revocations — the fail-open the mechanism exists to prevent. The re-publish is bounded
+  and is skipped when the refresh that just ran could not reach Redis, so an advisory
+  write can never delay the convergence the reconcile interval bounds. Nothing here is on
+  the enforcement path: a proxy always applies its own configured lifetime to the
+  tombstones it writes.
+- **The control-token file write is now bounded and aborts before publishing.** It runs
+  after the listener binds — deliberately, so a second proxy that dies on "address
+  already in use" cannot clobber the running proxy's token — but between the bind and
+  the accept loop the socket is already completing handshakes nothing answers, so a slow
+  write turned a startup race from an immediate connection-refused into a client-side
+  hang. The write is not the "small create/rename" it looks like: it stats and possibly
+  chmods the directory, creates a temp file, and **fsyncs** it, and that fsync has no
+  upper bound on a contended volume or a stalled mount. `AfterListen` now runs under a
+  10-second deadline (matching the budget `eunox kill` already gives its own request),
+  and the hook runs on its own goroutine so expiry **abandons** it. A bounded context
+  alone would not have bounded anything: Go cannot interrupt a blocked fsync, so the
+  deadline would only be observed after the stall had already ended — the same hang, plus
+  a new startup failure. Abandoning is safe precisely because the writer re-checks the
+  context immediately before its publishing rename, so an abandoned write cannot land
+  later and clobber the token of whatever proxy is actually serving. On a genuine expiry
+  `Serve` fails and closes the listener, so a racing client is refused rather than left
+  hanging: a proxy that could not persist its control token has an unusable emergency stop
+  and should not come up. A hook cut short by *shutdown* (Serve's own context cancelled by
+  a signal) is not a startup failure, so stopping a proxy mid-startup still exits cleanly.
+  `transport.WriteControlTokenFile` and `HTTPGatewayOptions.AfterListen` both take a
+  `context.Context` (pre-1.0 signature change, no shim).
+- **The `/control/kill` handle on the kill switch is now a kill-only interface.** The
+  field was typed as the full `killswitch.Manager` — the same interface whose
+  `ReviveSession`/`DeactivateGlobal` the CLI reaches — so the invariant that makes the
+  endpoint safe (it can issue a revocation and never lift one) was enforced nowhere in
+  the package that owns it: "generalize `/control/kill` for symmetry with the CLI" would
+  have landed as a three-line additive diff that compiles and passes. It now holds a
+  two-method interface exposing `ActivateGlobal` and `KillSession` and nothing else, so
+  that change does not compile. No behavior change; the CLI side already held itself to
+  the same bar. See `docs/threat-model-mcp.md` §3.3.
+- **`tools/list` filtering skips the pin-arming pass when the manifest pins nothing.**
+  `filterToolsListResult` called `armPinsFromToolsList` and discarded the result, on the
+  strength of a comment claiming the callee self-gates for free — but that gate sits
+  *after* the envelope and tools-array decodes, so an unpinned manifest (the common
+  shape) paid two full `json.Unmarshal` passes for a value nobody read. With no pin the
+  function has no other effect, so the call-site gate is semantics-preserving by
+  construction: measured **-19% time and -159 KB/op** on a realistically-shaped 50-tool
+  catalog. `RecordObservedToolHashes` keeps calling unguarded — it needs the entry count
+  for its audit record — and that asymmetry is now stated at the call site. The package
+  benchmark, which built bare `mcp.ToolEntry{Name: ...}` values with no description or
+  `inputSchema` and so measured almost none of the per-entry work that dominates the
+  path, was replaced with a realistic catalog rather than supplemented.
+- **`drift.ParseToolsListResult` keeps its envelope ambiguous-key guard**, deliberately,
+  even though every in-tree caller feeds it the pre-screened output of
+  `FetchAllToolPages` so the check cannot fire for them today. It is an exported function
+  documented as taking raw `tools/list` bytes: the precondition a caller would have to
+  satisfy is invisible at the call site, and getting it wrong reopens a
+  catalog-substitution bypass rather than failing loudly. A guard whose absence is silent
+  belongs on the boundary. Folding the entry screen and the decode into one per-entry pass
+  to offset its cost was tried and **reverted** after measurement — encoding/json validates
+  before it decodes, so per-entry decodes re-scan the same bytes and add a decoder setup
+  and a heap-escaping value each (~380 more allocations and ~10 KB more per call on a
+  50-tool catalog, no time saving). The cost is accepted and stated instead.
+
 - **A kill-switch audit record's session id is now a type-level distinction**, not a
   convention. The recorders took a plain session-id string, so keeping an unverified,
   client-supplied `Mcp-Session-Id` out of the signed `session_id` field rested on the
@@ -95,7 +207,19 @@ Section conventions:
   from an id this proxy established (recorded as `session_id`) or from the request itself
   (recorded as the unverified `details.claimed_session_id`), so a call site added later
   must state which it holds and the wrong choice does not compile. No record changes
-  shape. See `docs/threat-model-mcp.md` §3.7.
+  shape. See `docs/threat-model-mcp.md` §3.7. The residual that type alone cannot close
+  — Go's encapsulation is package-scoped, so a composite literal inside the package can
+  write the unexported fields directly — is now guarded by a test that parses the
+  package's own sources and fails if a literal of that type (or of the two
+  session-carrying dispatch params structs) appears outside the files allowed to
+  construct one — including a literal whose type is elided inside a slice, array or map.
+  Adding a construction site therefore takes a deliberate edit to a security-invariant
+  test. It does not cover a zero value mutated field by field, which is not a literal at
+  all; the type's doc comment says so rather than implying the residual is fully closed. The broader `forwardParams`/`serverRequestParams` surface was
+  deliberately **not** converted to the same type: neither `dispatchParams` constructor
+  can receive a raw header at all (one takes a resolved session, the other no arguments),
+  so the wrong value is not in scope — revisit if either grows a bare session-id string
+  parameter.
 - **The refusal-record rate limiter's rollup now names its own scope**, and moved off a
   key it shared with an unrelated statistic. Transport-surface refusals (`AUTH_FAILED`,
   `ORIGIN_REJECTED`, `JWT_INVALID`, `LOOPBACK_REJECTED`, …) are the only audit writes an
@@ -487,3 +611,21 @@ Section conventions:
   under the exclusive audit lock. The second open was the transient-failure mode the
   first was rewritten to eliminate.
 
+### Security
+
+- **The audit log's sidecar lock file now carries the same symlink guard as every other
+  audit-path open.** Every truncating or appending open on an operator-configured audit
+  path pairs a portable `Lstat` refusal with `O_NOFOLLOW`; `acquireAuditLock` carried
+  neither. Nothing is ever written through that handle, which is presumably why it was
+  missed — but the lock's *exclusivity* is the payload, not its bytes: `flock` /
+  `LockFileEx` applies to whatever the open resolved to, so a symlink planted at
+  `.<log>.lock` ahead of first use sends a second instance's lock to a different inode.
+  Both instances then believe they hold the audit log and append to it, forking the
+  tamper-evident HMAC chain — the exact outcome the lock exists to prevent — without
+  ever touching the log file. The audit directory is not trusted enough to make this
+  theoretical: `MkdirAll` sets `0700` only on a directory it *creates*, so a log path
+  pointed at a pre-existing group- or world-writable location carries no mode guarantee,
+  and that is precisely where another uid can plant the link. Windows gets the portable
+  half only, as elsewhere in the package. **Behavior change:** a deployment that
+  deliberately symlinks the lock file (no reason to, but it was silently permitted) now
+  fails startup with an error naming the lock file.

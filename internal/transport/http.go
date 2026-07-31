@@ -157,15 +157,41 @@ func ResolveSessionIdleTimeout(flagVal int, cfgVal *int) int {
 	return config.ResolveInt(cfgVal, flagVal)
 }
 
+// killActivator is the one-way half of the kill switch: the loopback control endpoint
+// can ISSUE a revocation and can never lift one. It exists to make that invariant
+// structural rather than documentary.
+//
+// The reason is the endpoint's own threat model. A same-host process that reaches the
+// loopback endpoint holding the control token can already halt this proxy — a documented
+// residual. Giving that same reach an undo would let it lift the very revocation issued
+// against it, which is why `eunox kill --revive` is deliberately Redis-only. With the
+// handle typed as the full killswitch.Manager, "generalize /control/kill for symmetry
+// with the CLI" is a three-line additive diff that compiles and runs with no resistance
+// from the type system or the existing tests. Narrowed, it does not compile.
+//
+// Keep this interface narrow. Widening it back to killswitch.Manager is not a tidy-up:
+// it re-opens the undo path this type exists to keep shut. The CLI side already holds
+// itself to the same bar — reviveViaRedis takes the concrete *killswitch.Redis rather
+// than the Manager interface, for exactly this reason.
+type killActivator interface {
+	// ActivateGlobal stops the whole deployment. There is no DeactivateGlobal here.
+	ActivateGlobal(ctx context.Context) error
+	// KillSession revokes one session. There is no ReviveSession here.
+	KillSession(ctx context.Context, sessionID string) error
+}
+
 // HTTPProxy implements the MCP Streamable HTTP transport.
 // Each client session gets its own upstream subprocess (local mode) or connects
 // to a remote MCP HTTP server (remote mode, enabled by UpstreamURL).
 type HTTPProxy struct {
-	jwtPDP             *pdp.JWTPDP            // non-nil when --jwks-uri is configured
-	oauthMeta          *OAuthResourceMetadata // non-nil when --oauth-resource / listen.oauthResource is set (which the CLI admits only alongside bearer-token validation)
-	oauthMetaURL       string                 // absolute metadata URL for WWW-Authenticate; empty when --oauth-resource is not set
-	sink               *audit.Sink
-	ks                 killswitch.Manager
+	jwtPDP       *pdp.JWTPDP            // non-nil when --jwks-uri is configured
+	oauthMeta    *OAuthResourceMetadata // non-nil when --oauth-resource / listen.oauthResource is set (which the CLI admits only alongside bearer-token validation)
+	oauthMetaURL string                 // absolute metadata URL for WWW-Authenticate; empty when --oauth-resource is not set
+	sink         *audit.Sink
+	// ks is deliberately the kill-ONLY interface, not killswitch.Manager: see
+	// killActivator. health.go's healthReporter assertion is on the dynamic type and is
+	// unaffected by the narrowing.
+	ks                 killActivator
 	shutdownMs         int
 	upstreamTimeMs     int
 	requireAuditStrict bool // --require-audit=strict: deny forwards once the audit trail degrades
@@ -180,7 +206,13 @@ type HTTPProxy struct {
 	controlToken string
 	// afterListen runs once the listener has bound and before any request is served,
 	// for startup work that must not happen when the bind fails. See HTTPGatewayOptions.
-	afterListen func() error
+	afterListen func(context.Context) error
+	// afterListenBudget bounds that hook. Per-proxy rather than read from the package
+	// constant at the call site so a test can shorten it without mutating shared state —
+	// the property worth testing (a stalled hook is abandoned) is only observable over a
+	// window measured in seconds otherwise, and a package-level knob would race across
+	// parallel tests. Zero means afterListenTimeout.
+	afterListenBudget time.Duration
 	// authTimingKey is a per-process random HMAC key folding presented/expected
 	// tokens to a fixed-length MAC before the constant-time comparison in checkAuth /
 	// checkControlToken. See constantTimeTokenEqual for the timing rationale.
@@ -297,7 +329,15 @@ type HTTPGatewayOptions struct {
 	// already in use" replace the RUNNING proxy's token on disk and break `eunox kill`
 	// against it. Returning an error closes the listener and fails Serve, so a hook that
 	// cannot complete does not leave a half-started proxy serving.
-	AfterListen func() error
+	//
+	// The context it receives is bounded (afterListenTimeout) and cancels on Serve's own
+	// ctx. A hook MUST honour it: the socket is already bound and accepting into the
+	// kernel backlog while this runs, but nothing is answering yet, so every second spent
+	// here is a second a client racing startup spends hung rather than being cleanly
+	// refused. Expiry is expected to abort the hook's effect, not merely be reported —
+	// see WriteControlTokenFile, which checks it immediately before its publishing rename
+	// so an abandoned write cannot land later.
+	AfterListen func(ctx context.Context) error
 	TrustFwdFor bool
 	// TrustedProxyCIDRs is listen.trustedProxyCIDRs: the reverse-proxy peer addresses
 	// trusted to set X-Forwarded-For under TrustFwdFor. Entries must already be valid
@@ -433,6 +473,72 @@ func (p *HTTPProxy) warnForwardedForPosture() {
 
 // Serve starts the HTTP server and blocks until ctx is canceled or a fatal
 // error occurs.
+// Serve starts the HTTP server and blocks until ctx is canceled or a fatal
+// error occurs.
+// runAfterListen runs the post-bind startup hook under a bound, closing ln and returning
+// an error if it cannot complete. Split out of Serve so the bound and its abandonment
+// rules sit together in one readable unit rather than as a block in the middle of server
+// assembly.
+//
+// Between net.Listen returning and srv.Serve starting the accept loop, the kernel
+// completes handshakes into the backlog for a socket no userspace is reading, so a request
+// arriving in this window HANGS rather than being refused. The hook's slowest step is an
+// fsync, which has no upper bound on a contended volume or a stalled mount.
+//
+// The hook therefore runs on its own goroutine and the select ABANDONS it on expiry.
+// Passing the bounded context and calling the hook synchronously would not bound anything:
+// Go cannot interrupt a blocked fsync, so the deadline would only be observed after the
+// stall had already ended -- the same hang, plus a new startup failure. Abandoning is what
+// makes the window finite, and it is safe precisely because WriteControlTokenFile
+// re-checks the context immediately before its publishing rename: an abandoned write
+// cannot land later and clobber the token of whatever proxy is actually serving.
+func (p *HTTPProxy) runAfterListen(ctx context.Context, ln net.Listener) error {
+	if p.afterListen == nil {
+		return nil
+	}
+	hook := p.afterListen
+	// Drop the reference before running it, not after: Serve blocks for the life of the
+	// process, so a hook that never returns (or the p itself outliving this call) would
+	// otherwise pin the hook's closed-over state -- e.g. a control-token path string, or
+	// whatever a future caller captures -- in the heap for no further purpose once this
+	// one-shot startup effect has fired.
+	p.afterListen = nil
+
+	budget := p.afterListenBudget
+	if budget <= 0 {
+		budget = afterListenTimeout
+	}
+	hookCtx, cancelHook := context.WithTimeout(ctx, budget)
+	defer cancelHook()
+	hookDone := make(chan error, 1) // buffered: an abandoned hook must never block on send
+	go func() { hookDone <- hook(hookCtx) }()
+
+	var hookErr error
+	select {
+	case hookErr = <-hookDone:
+	case <-hookCtx.Done():
+		hookErr = fmt.Errorf("post-bind startup did not complete within %s: %w", budget, hookCtx.Err())
+	}
+	if hookErr == nil {
+		return nil
+	}
+	_ = ln.Close()
+	// A hook cut short by SHUTDOWN is not a startup failure. Serve's ctx is cancelled by
+	// the signal handler, and hookCtx inherits that, so without this an operator who stops
+	// the proxy during startup would get a fatal error and a non-zero exit where the
+	// process previously shut down cleanly -- enough to make a restart-on-failure
+	// supervisor loop during a rollout. A genuine expiry (ctx still live, deadline hit)
+	// still fails Serve, which is the right direction on the merits: the hook persists the
+	// control token, and a proxy whose emergency stop cannot be authenticated should not
+	// come up.
+	if ctx.Err() != nil {
+		return nil
+	}
+	return hookErr
+}
+
+// Serve starts the HTTP server and blocks until ctx is canceled or a fatal
+// error occurs.
 func (p *HTTPProxy) Serve(ctx context.Context) error {
 	// Publish the serve-lifetime context under p.mu so the concurrent reads in
 	// serveCtx (from session reader goroutines) are synchronized. The write happens
@@ -496,19 +602,10 @@ func (p *HTTPProxy) Serve(ctx context.Context) error {
 	// Post-bind startup effects (see HTTPGatewayOptions.AfterListen). Runs only once the
 	// address is actually held, so a proxy that loses the bind race leaves the running
 	// instance's on-disk state alone; a hook failure closes the listener and aborts.
-	if p.afterListen != nil {
-		hook := p.afterListen
-		// Drop the reference before running it, not after: Serve blocks for the life of
-		// the process, so a hook that never returns (or the p itself outliving this call)
-		// would otherwise pin the hook's closed-over state — e.g. a control-token path
-		// string, or whatever a future caller captures — in the heap for no further
-		// purpose once this one-shot startup effect has fired.
-		p.afterListen = nil
-		if err := hook(); err != nil {
-			_ = ln.Close()
-			return err
-		}
+	if err := p.runAfterListen(ctx, ln); err != nil {
+		return err
 	}
+
 	for name := range p.routes {
 		path := "/mcp"
 		if name != "" {

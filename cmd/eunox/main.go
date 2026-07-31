@@ -1665,8 +1665,8 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 	// closure fires once, at startup, and Serve() drops the reference right after (see
 	// HTTPGatewayOptions.AfterListen), so only the needed path should outlive that.
 	controlTokenPath := pf.controlTokenPath
-	writeControlToken := func() error {
-		controlTokenFile, werr := transport.WriteControlTokenFile(controlTokenPath, controlToken)
+	writeControlToken := func(ctx context.Context) error {
+		controlTokenFile, werr := transport.WriteControlTokenFile(ctx, controlTokenPath, controlToken)
 		if werr != nil {
 			return fmt.Errorf("kill control endpoint: %w", werr)
 		}

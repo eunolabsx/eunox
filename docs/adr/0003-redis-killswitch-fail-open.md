@@ -219,22 +219,78 @@ refine what "cannot confirm" means, so a health probe and the data plane agree o
   last-writer-wins across instances, which the publisher reports when it replaces a
   differing value.
 
-- **A revocation can be lifted from the CLI, though not every dimension has a
-  command yet.** `eunox kill --revive <session-id|all> --redis-addr <addr>`
-  removes a session tombstone, or deactivates the global switch, wiring the
-  `ReviveSession` / `DeactivateGlobal` manager methods that were previously
-  reachable only by a library consumer. It matters most in the
-  permanent-tombstone mode above, where nothing expires and the only
-  remediation was deleting keys in `redis-cli`. It is deliberately Redis-only:
-  the loopback `/control/kill` endpoint is a one-way emergency stop, and giving a
-  same-host caller that reaches it an undo would let it lift the very revocation
-  issued against it. Lifting the global switch leaves per-session tombstones in
-  place — they are separate kill dimensions, and clearing both would be a
-  fail-open. Two gaps remain, both library-only: `ReviveAgent` has no CLI path
-  at all (an agent kill has no undo command, permanent by design or not), and
-  bulk-clearing many session tombstones at once still means `Reset` (which
-  also clears the global switch and every agent kill) or manual `redis-cli`
-  deletion — `--revive` only takes one id at a time.
+  The published key carries its own expiry, refreshed by the running proxy from the
+  reconcile loop it already runs (no new goroutine, ticker, or connection). That
+  bounds freshness rather than adding provenance: a value readable at all belongs
+  to a proxy that is running now, so a *stale* value — left by a decommissioned or
+  since-reconfigured instance, and otherwise indistinguishable from a live one
+  since the key carries no timestamp or writer identity — becomes an *absent* one,
+  which the CLI already handles correctly and loudly by falling back to its own
+  lifetime and naming it. That is why the value needs no version, nonce, or
+  reader-side staleness check: the bad state is unrepresentable rather than merely
+  detectable. Periodic re-publishing also makes the disagreement diagnostic
+  reliable — two differently-configured proxies overwrite each other continuously
+  and each sees the other on its next tick, including the case where the second
+  started an hour later, which no startup-only comparison can catch. The warning is
+  deduplicated on the prior value, so a persistent disagreement is reported once
+  and a changed one is reported again.
+
+  Residual: a running, correctly-configured proxy that loses Redis connectivity for
+  longer than the expiry leaves the key absent until it reconnects. The CLI then
+  falls back to its own default and says so — the safe direction. A hostile writer
+  with Redis write access can still plant a fresh-looking value; that is unchanged
+  and already covered by treating Redis write access as equivalent to control of
+  the kill switch. Neither the publish nor the refresh is on the enforcement path:
+  a proxy always applies its own configured lifetime to the tombstones it writes.
+
+- **A revocation can be lifted from the CLI, in every dimension that has one.**
+  `eunox kill --revive <session-id|all> --redis-addr <addr>` removes a session
+  tombstone or deactivates the global switch, and `--revive --agent <agent-id>`
+  removes an agent kill, wiring the `ReviveSession` / `DeactivateGlobal` /
+  `ReviveAgent` manager methods that were previously reachable only by a library
+  consumer. It matters most in the permanent-tombstone mode above, where nothing
+  expires and the only remediation was deleting keys in `redis-cli`. It is
+  deliberately Redis-only: the loopback `/control/kill` endpoint is a one-way
+  emergency stop, and giving a same-host caller that reaches it an undo would let
+  it lift the very revocation issued against it. That constraint is now enforced by
+  the type of the handle the endpoint holds — a kill-only interface exposing
+  `ActivateGlobal` and `KillSession` and nothing else — rather than by CLI-flag
+  rejection alone, so "generalize the endpoint for symmetry with the CLI" does not
+  compile. Lifting the global switch leaves per-session and per-agent kills in
+  place — they are separate kill dimensions, and clearing all three would be a
+  fail-open.
+
+- **`--agent` is a targeting dimension, not a repair.** Nothing in the shipped
+  binary could previously *create* an agent kill either, so an operator using only
+  the CLI could never reach a state needing remediation; the kill and revive halves
+  ship together precisely so that stays true. An agent kill is the natural
+  granularity when one compromised JWT identity spans many sessions, where the
+  alternative was killing each session id individually or reaching for the global
+  switch. It is Redis-only for the same reason `--revive` is: there is no agent
+  dimension on the loopback endpoint, and adding one would widen its blast radius.
+  Agent kills never expire, so `--killswitch-session-ttl` is rejected alongside
+  `--agent` rather than silently ignored.
+
+- **One gap remains, deliberately: `Reset` has no CLI path, and should not get
+  one.** It clears the global flag, every agent kill, and every session tombstone
+  in a single call — the same cross-dimension fail-open the `--revive all`
+  semantics above exist to avoid, with a wider radius. A confirmation prompt in
+  front of it is not a design. The accumulation scenario it would address is also
+  self-inflicted by an opt-in setting that already warns about itself: a negative
+  `--killswitch-session-ttl` prints a startup line naming the exact `--revive`
+  command that removes the tombstones it will accumulate. If bulk revive later
+  turns out to be a real operational pain, the shape to build is a session-*scoped*
+  sweep backed by a `SCAN` over the session-kill prefix, never `Reset`. Recorded
+  here so the next reader does not re-litigate toward the blunter tool.
+
+- **A session whose id is literally `all` is addressable.** The positional `all`
+  means the deployment-wide switch, which left such a session — possible, since
+  `--session-id` is operator-settable on a stdio proxy — impossible to kill or
+  revive individually. `--session <id>` addresses a session id verbatim and is the
+  escape hatch; `--agent <id>` is its counterpart in the agent dimension. Exactly
+  one target may be given, and supplying more is rejected rather than resolved by
+  precedence: on the emergency-stop path a silently ignored target is the
+  difference between a revocation an operator believes landed and one that did not.
   On an HTTP proxy/gateway, `--revive` also cannot undo the LOCAL effect of a
   kill issued via the loopback endpoint: `handleKill` synchronously tears down
   the killed session's registry entry and upstream connection, and a

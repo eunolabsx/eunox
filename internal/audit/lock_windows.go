@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"golang.org/x/sys/windows"
 )
@@ -21,11 +20,21 @@ import (
 // rotation without a release window, named ".<base>.lock" so it stays out of the
 // rotation glob and retention pruning. golang.org/x/sys is already in the module
 // graph, so this adds no new dependency.
+//
+// The open carries the portable half of the package's symlink guard, and only that
+// half: config.OpenNoFollow is 0 here, same as every other Windows path in the package,
+// so RefuseNonRegularPath alone is the Windows story. What it protects is the lock's
+// EXCLUSIVITY rather than any content — nothing is ever written through this handle —
+// because LockFileEx locks whatever the open resolved to, and a link planted at this
+// path sends a second instance's lock to a different object. Both instances then
+// believe they hold the audit log and append to it, forking the HMAC chain. Kept
+// deliberately symmetric with the unix variant so the platform difference reads as
+// intended rather than as one file having been missed.
 func acquireAuditLock(logPath string) (*os.File, error) {
-	lockPath := filepath.Join(filepath.Dir(logPath), "."+filepath.Base(logPath)+".lock")
-	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // G304: derived from the user-configured audit log path
+	lockPath := auditLockPath(logPath)
+	lf, err := openAuditLockFile(lockPath)
 	if err != nil {
-		return nil, fmt.Errorf("opening audit lock file %q: %w", lockPath, err)
+		return nil, err
 	}
 	// Lock a single byte; the range is arbitrary as long as every writer agrees.
 	if err := windows.LockFileEx(

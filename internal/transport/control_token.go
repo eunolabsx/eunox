@@ -4,15 +4,24 @@
 package transport
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/eunolabs/eunox/internal/config"
 )
+
+// afterListenTimeout bounds the post-bind startup hook (see HTTPGatewayOptions.AfterListen),
+// whose one production job is persisting the control token. Generous enough that a merely
+// loaded filesystem still completes, short enough to sit well inside any supervisor's
+// startup patience — and it matches the budget `eunox kill` already gives its own request,
+// so the client racing this window cannot wait longer than the window itself.
+const afterListenTimeout = 10 * time.Second
 
 // ControlTokenHeader carries the loopback control token on POST /control/kill. A
 // dedicated header keeps the emergency-stop endpoint authenticated independently
@@ -109,7 +118,17 @@ func GenerateControlToken() (string, error) {
 // and atomically renames it into place, so the secret never lands in a
 // looser-mode file and a concurrent reader observes the old or new token, never a
 // partial one.
-func WriteControlTokenFile(path, token string) (string, error) {
+//
+// ctx bounds the write. The sequence is not the "single small create/rename" it looks
+// like — it stats and possibly chmods the directory, creates a temp file, and fsyncs it
+// before the rename — and that fsync has no upper bound on a contended volume or a
+// stalled network mount. Serve runs this after the listener binds and before the accept
+// loop starts, so an unbounded write leaves the socket accepting connections that nothing
+// answers: a client racing startup hangs until its own timeout instead of getting the
+// immediate connection-refused it would have got a moment earlier. `eunox kill` is the
+// client most likely to be in that race, and fast unambiguous feedback matters more on
+// the emergency-stop path than almost anywhere else.
+func WriteControlTokenFile(ctx context.Context, path, token string) (string, error) {
 	if path == "" {
 		path = defaultControlTokenPath
 	}
@@ -166,6 +185,21 @@ func WriteControlTokenFile(path, token string) (string, error) {
 	}
 	if err := tmp.Close(); err != nil {
 		return "", fmt.Errorf("closing control-token temp file: %w", err)
+	}
+	// The deadline is enforced HERE, immediately before the rename, and not by a watchdog
+	// around the call. A caller that abandoned a slow write would leave this function still
+	// running, and its os.Rename could still land seconds later — overwriting the token of
+	// whatever proxy is actually serving. That is the exact clobber the post-bind ordering
+	// exists to prevent, just with a longer fuse, and it is strictly worse than the hang it
+	// would be trying to fix. Checking at the last point before publication means an expired
+	// deadline aborts WITHOUT publishing, which is the property that matters: the token of
+	// whatever proxy is serving is left exactly as it was. The deferred os.Remove cleans up
+	// the temp file. Directory work already done (MkdirAll, and tightenTokenDir's chmod to
+	// 0700 on eunox's own directory) is deliberately NOT undone -- both only ever restrict,
+	// so reverting them on an abort would loosen a directory holding an emergency-stop
+	// token, which is the wrong direction to fail in.
+	if err := ctx.Err(); err != nil {
+		return "", fmt.Errorf("control token not published to %s: %w (the write did not complete in time; any existing token file is left untouched)", expanded, err)
 	}
 	if err := os.Rename(tmpName, expanded); err != nil {
 		return "", fmt.Errorf("publishing control token to %s: %w", expanded, err)

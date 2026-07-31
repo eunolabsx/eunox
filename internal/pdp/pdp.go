@@ -825,7 +825,7 @@ func (p *ManifestPDP) markToolPoisoned(name string) {
 // shared across every session on the route, so the blast radius is permanent — keep it as
 // narrow as the evidence.
 func (p *ManifestPDP) poisonAllPinned() {
-	if len(p.pinnedTools) == 0 {
+	if !p.hasPinnedTools() {
 		return
 	}
 	p.descMu.Lock()
@@ -2157,6 +2157,16 @@ func (p *ManifestPDP) recordPinnedToolHash(entry toolListEntry) {
 	}
 }
 
+// hasPinnedTools reports whether the manifest pins any tool's descriptionHash. It is the
+// ONE authority on "is there anything to arm": armPinsFromToolsList gates its whole body
+// on it, filterToolsListResult gates the CALL on it (see there for why the caller needs
+// its own gate), and poisonAllPinned short-circuits on it. Writing the predicate once is
+// what keeps those three from drifting into disagreement about when the pass may be
+// skipped.
+//
+// pinnedTools is built once by NewManifestPDP and never mutated, so this needs no lock.
+func (p *ManifestPDP) hasPinnedTools() bool { return len(p.pinnedTools) > 0 }
+
 // anyNamePinned reports whether any of names is pinned by the manifest. It reads
 // pinnedTools, which NewManifestPDP builds once and never mutates, so no lock is needed
 // (unlike the observed-hash and poison maps, which descMu guards).
@@ -2230,7 +2240,7 @@ func (p *ManifestPDP) RecordObservedToolHashes(_ context.Context, result json.Ra
 //     poisons every pin, because no entry in it can be believed. A plainly absent tools
 //     key is not ambiguous: a host renders no tools from it, so nothing is poisoned.
 func (p *ManifestPDP) armPinsFromToolsList(result json.RawMessage) (entryCount int) {
-	pinned := len(p.pinnedTools) > 0
+	pinned := p.hasPinnedTools()
 	entries, outcome := decodeListEntries(result, listKeyTools)
 	switch outcome {
 	case listDecodeEmptyResult:
@@ -2378,9 +2388,26 @@ func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims
 	// the two routes cannot drift, and so every poison discovered anywhere in the array is
 	// already visible to the keep decision for the first entry. Poisoning from inside the
 	// per-entry predicate below could not retract an entry it had already accepted, which
-	// would emit a catalog advertising a tool whose call leg hard-denies. Self-gates on
-	// len(pinnedTools) > 0, so a manifest with no pin pays nothing for this.
-	mdp.armPinsFromToolsList(resultBytes)
+	// would emit a catalog advertising a tool whose call leg hard-denies.
+	//
+	// The gate is repeated HERE, at the call site, even though armPinsFromToolsList
+	// self-gates on the same predicate: its gate sits AFTER decodeListEntries, so an
+	// unpinned manifest — the common shape — otherwise paid a full envelope decode plus a
+	// tools-array decode whose result this caller discards. Moving the early-out inside
+	// the callee cannot help, because the OTHER caller (RecordObservedToolHashes) needs
+	// the entry count that decode produces; only a caller that discards the count can
+	// skip the work, and only the caller knows that.
+	//
+	// Skipping is semantics-preserving because every effect of the function — each poison
+	// branch and the per-entry loop — is behind hasPinnedTools, and this caller ignores the
+	// return value. That is a property of the callee, not a coincidence: if
+	// armPinsFromToolsList ever gains an effect on the UNPINNED path, this gate silently
+	// skips it on the enforce route while the observe route still runs it, so this gate
+	// must be removed in the same change. Both sides read one predicate so the pairing is
+	// at least visible.
+	if mdp.hasPinnedTools() {
+		mdp.armPinsFromToolsList(resultBytes)
+	}
 
 	return filterListResult(resultBytes, listKeyTools, func(raw json.RawMessage) (bool, string) {
 		// Drop an entry whose own bytes are ambiguous BEFORE trusting its decoded name.

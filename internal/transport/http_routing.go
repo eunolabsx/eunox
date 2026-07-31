@@ -1065,6 +1065,13 @@ func (p *HTTPProxy) handleMCPDelete(w http.ResponseWriter, r *http.Request, rout
 }
 
 // handleKill processes POST /control/kill (loopback only).
+//
+// Kill-only, deliberately: this endpoint issues revocations and has no undo. Lifting one
+// is done where the kill state lives (`eunox kill --revive`, Redis-only), because a
+// same-host process that reaches this endpoint holding the control token can already halt
+// the proxy, and an undo here would let it lift the revocation issued against it. The
+// handle it calls through (p.ks) is typed to make that structural rather than a promise —
+// see killActivator, which is where to read before adding a verb to this handler.
 func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 	// Loopback guard runs first — before the control-token check — so an off-host
 	// caller is rejected by the security boundary rather than learning the endpoint
@@ -1130,7 +1137,7 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 		// shutdown budget, which a wedged upstream reader consumes in full). Recording
 		// after it left a window where a crash produced a tape showing KILL_SWITCH denials
 		// with no activation record to explain them — the exact gap this record closes.
-		p.recordKillActivated(r, killScopeAll)
+		p.recordKillActivated(r, killScopeAll, killDimensionGlobal)
 		// Evict every open SSE stream: writing the kill state stops future operations,
 		// but a stream opened before the kill is long-lived and would keep delivering
 		// notifications until the idle ceiling. This makes the stop total for the
@@ -1141,7 +1148,7 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 		// sessionIdleTimeoutMs is 0 — otherwise killed-but-undead sessions would pin
 		// capacity and 503 new initializes.
 		p.reapAllKilledSessions() //nolint:contextcheck // teardown path: close()'s upstream session-termination DELETE intentionally uses a detached, bounded background context — binding it to r.Context() would cancel the teardown the instant this response is written. Same rationale as the handleMCPDelete close() site.
-		p.writeKillResponse(w, "all")
+		p.writeKillResponse(w, killScopeAll, killDimensionGlobal)
 		return
 	}
 	if body.SessionID == "" {
@@ -1154,14 +1161,14 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Recorded before the teardown, same ordering as the global path above.
-	p.recordKillActivated(r, body.SessionID)
+	p.recordKillActivated(r, body.SessionID, killDimensionSession)
 	// End this session's open SSE stream(s), same reason as the global path above.
 	p.evictSessionStreams(body.SessionID)
 	// Proactively tear the killed session down (close its upstream, free its
 	// maxSessions slot) instead of relying on the idle reaper, which does not run when
 	// sessionIdleTimeoutMs is 0 — see reapKilledSession.
 	p.reapKilledSession(body.SessionID) //nolint:contextcheck // teardown path: close()'s upstream session-termination DELETE intentionally uses a detached, bounded background context. Same rationale as the handleMCPDelete close() site.
-	p.writeKillResponse(w, body.SessionID)
+	p.writeKillResponse(w, body.SessionID, killDimensionSession)
 }
 
 // killScopeAll is the scope recorded (and returned) for a whole-proxy emergency stop,
@@ -1194,22 +1201,44 @@ const killScopeAll = "all"
 // CONTROL_AUTH_FAILED refusal path — and no session_id: a global stop addresses no
 // single session, and a targeted one names its session in details.scope, where it
 // cannot be confused with an authenticated session binding.
-func (p *HTTPProxy) recordKillActivated(r *http.Request, scope string) {
+// dimension distinguishes the two kills this endpoint can issue. It is a separate field
+// from scope because their VALUES collide: a session id is operator-settable, so one can
+// literally be "all", and `{"sessionId":"all"}` would otherwise produce a record
+// byte-identical to a deployment-wide stop. An incident responder reading the signed tape
+// has to be able to tell "one session was revoked" from "everything was halted", and a
+// structured field with two possible meanings cannot answer that.
+func (p *HTTPProxy) recordKillActivated(r *http.Request, scope, dimension string) {
 	if p.sink == nil {
 		return
 	}
 	p.sink.RecordAllow(r.Context(), "", "", MethodControlKill, map[string]interface{}{
 		"scope":     scope,
+		"dimension": dimension,
 		"source_ip": p.sourceIP(r),
 	}, nil, false, nil, nil)
 }
 
-// writeKillResponse writes the kill endpoint's {"ok":true,"killed":<target>}
-// success body. Every route honors the kill switch (including wiretap), so the
-// response carries no partial-coverage caveat.
-func (p *HTTPProxy) writeKillResponse(w http.ResponseWriter, killed string) {
+// writeKillResponse writes the kill endpoint's
+// {"ok":true,"killed":<target>,"dimension":<global|session>} success body. Every route
+// honors the kill switch (including wiretap), so the response carries no
+// partial-coverage caveat.
+//
+// The dimension is reported for the same reason the audit record carries it: a session
+// whose id is "all" would otherwise produce a response indistinguishable from the
+// deployment-wide stop, and `eunox kill` prints this body verbatim, so the operator would
+// have no signal either. It matches the field the Redis transport's own result line uses,
+// so one output shape describes both transports.
+func (p *HTTPProxy) writeKillResponse(w http.ResponseWriter, killed, dimension string) {
 	w.Header().Set("Content-Type", CTJSON)
-	resp := map[string]interface{}{"ok": true, "killed": killed}
+	resp := map[string]interface{}{"ok": true, "killed": killed, "dimension": dimension}
 	b, _ := json.Marshal(resp)
 	_, _ = w.Write(b)
 }
+
+// Kill dimensions as they appear in the control endpoint's audit record and response.
+// Spelled the same as the CLI's Redis-transport result line so one vocabulary describes
+// both transports.
+const (
+	killDimensionGlobal  = "global"
+	killDimensionSession = "session"
+)

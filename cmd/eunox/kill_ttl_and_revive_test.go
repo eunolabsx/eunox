@@ -231,6 +231,45 @@ func TestCmdKill_NoPublishedTTL_SaysSo(t *testing.T) {
 	require.Equal(t, 2*time.Hour, mr.TTL("killswitch:session:sess-flagged"))
 }
 
+// TestCmdKill_ExpiredPublishedTTL_FallsBackAndSaysSo is the operator-visible surface of
+// the published key's expiry. A value left behind by a proxy that is no longer running
+// stops being readable, so this command must fall back to its own lifetime and SAY so,
+// rather than adopting a lifetime nothing is enforcing — which is the whole failure the
+// expiry exists to remove. Absence is a state the CLI already handles correctly and
+// loudly; the expiry's job is to route staleness into it.
+func TestCmdKill_ExpiredPublishedTTL_FallsBackAndSaysSo(t *testing.T) {
+	mr := miniredis.RunT(t)
+
+	// A proxy publishes a short lifetime, then goes away without refreshing the key.
+	_ = captureStderr(t, func() {
+		_, _, _, ksRedis, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, false, 0, 30*time.Minute, 0)
+		require.NoError(t, err)
+		require.NotNil(t, ksRedis)
+		publishSessionKillTTL(ksRedis)
+	})
+	require.NotZero(t, mr.TTL(publishedTTLKey), "precondition: the published key must carry an expiry")
+
+	// While it is fresh, the CLI adopts it.
+	stderr := captureStderr(t, func() {
+		require.Zero(t, cmdKill([]string{"--redis-addr", mr.Addr(), "sess-fresh"}))
+	})
+	require.Contains(t, stderr, "published by the proxy")
+	require.Equal(t, 30*time.Minute, mr.TTL("killswitch:session:sess-fresh"))
+
+	// Past the expiry the decommissioned instance's value is gone, so the CLI writes its
+	// own default and names it, instead of silently shortening every revocation to 30m.
+	mr.FastForward(2 * time.Hour)
+
+	stderr = captureStderr(t, func() {
+		require.Zero(t, cmdKill([]string{"--redis-addr", mr.Addr(), "sess-after-expiry"}))
+	})
+	require.Contains(t, stderr, "no proxy on this Redis has published",
+		"an expired value must route into the already-correct absent path, not be adopted as stale")
+	require.Contains(t, stderr, "Restart the proxy to publish its value")
+	require.Equal(t, killswitch.DefaultSessionKillTTL, mr.TTL("killswitch:session:sess-after-expiry"),
+		"the tombstone must use this command's own lifetime, not the expired one")
+}
+
 // TestCmdKill_GlobalAndReviveSkipTTLResolution: only a session tombstone carries a
 // lifetime. A global kill has no expiry and a revive deletes, so neither should consult
 // the published value — and neither should emit a TTL diagnostic about a lifetime it
@@ -418,11 +457,11 @@ func TestReviveViaRedis_BackendErrorsAreReported(t *testing.T) {
 	ks := killswitch.NewRedis(client)
 	mr.Close()
 
-	err := reviveViaRedis(context.Background(), ks, "sess-1")
+	err := reviveViaRedis(context.Background(), ks, killTarget{kind: killTargetSession, id: "sess-1"})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "revive session")
 
-	err = reviveViaRedis(context.Background(), ks, "all")
+	err = reviveViaRedis(context.Background(), ks, killTarget{kind: killTargetGlobal})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "deactivate global kill switch")
 }
@@ -459,12 +498,12 @@ func TestReviveViaRedis_PublishOnlyFailureIsReportedAsError(t *testing.T) {
 	errPublishOnly := errors.New("publish-only failure")
 	ks := killswitch.NewRedis(publishFailCmdable{pubErr: errPublishOnly})
 
-	err := reviveViaRedis(context.Background(), ks, "sess-1")
+	err := reviveViaRedis(context.Background(), ks, killTarget{kind: killTargetSession, id: "sess-1"})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "revive session")
 	require.ErrorIs(t, err, errPublishOnly)
 
-	err = reviveViaRedis(context.Background(), ks, "all")
+	err = reviveViaRedis(context.Background(), ks, killTarget{kind: killTargetGlobal})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "deactivate global kill switch")
 	require.ErrorIs(t, err, errPublishOnly)

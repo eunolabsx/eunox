@@ -468,7 +468,7 @@ func TestWriteControlTokenFile_BareFilenameUsesCurrentDir(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
 
-	written, err := WriteControlTokenFile("relative.token", "tok-bare")
+	written, err := WriteControlTokenFile(context.Background(), "relative.token", "tok-bare")
 	if err != nil {
 		t.Fatalf("WriteControlTokenFile: %v", err)
 	}

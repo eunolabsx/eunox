@@ -2367,3 +2367,46 @@ func TestTrimLeadingSpaceAndBOM(t *testing.T) {
 		})
 	}
 }
+
+// TestFilterToolsListResult_UnpinnedArmIsNoOp pins the semantics-preserving property
+// behind skipping the pin-arming pass when the manifest pins no descriptionHash:
+// running the pass by hand first must produce a byte-identical filtered catalog. If it
+// ever does not, the call-site gate in filterToolsListResult is dropping an effect the
+// filter depends on, and this test is the thing that says so.
+func TestFilterToolsListResult_UnpinnedArmIsNoOp(t *testing.T) {
+	t.Parallel()
+
+	caps := []capability.Constraint{
+		{Target: "tool:allowed_a", Actions: []string{"call"}},
+		{Target: "tool:allowed_b", Actions: []string{"call"}},
+	}
+	catalog := json.RawMessage(`{"tools":[
+		{"name":"allowed_a","description":"first","inputSchema":{"type":"object"}},
+		{"name":"denied","description":"second","inputSchema":{"type":"object"}},
+		{"name":"allowed_b","description":"third","inputSchema":{"type":"object"}}
+	]}`)
+
+	// Guarded path: exactly what production runs on an unpinned manifest.
+	guarded := filterToolsListResult(catalog, newTestManifestPDP(caps...), nil)
+
+	// Unguarded reference: the pass the gate skips, run explicitly first.
+	ref := newTestManifestPDP(caps...)
+	ref.armPinsFromToolsList(catalog)
+	unguarded := filterToolsListResult(catalog, ref, nil)
+
+	if !bytes.Equal(guarded.Result, unguarded.Result) {
+		t.Errorf("unpinned filtered result differs when the arm pass runs:\n guarded: %s\nunguarded: %s", guarded.Result, unguarded.Result)
+	}
+	if guarded.Kept() != unguarded.Kept() || guarded.Upstream != unguarded.Upstream {
+		t.Errorf("counts differ: guarded kept=%d upstream=%d, unguarded kept=%d upstream=%d",
+			guarded.Kept(), guarded.Upstream, unguarded.Kept(), unguarded.Upstream)
+	}
+	// Sanity: the filter did its actual job, so a byte-identical match above is not
+	// two identically-empty results agreeing with each other.
+	if guarded.Kept() != 2 || guarded.Upstream != 3 {
+		t.Fatalf("expected 2 of 3 tools kept, got kept=%d upstream=%d (%s)", guarded.Kept(), guarded.Upstream, guarded.Result)
+	}
+	if strings.Contains(string(guarded.Result), "denied") {
+		t.Errorf("denied tool leaked into the filtered catalog: %s", guarded.Result)
+	}
+}

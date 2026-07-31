@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"syscall"
 )
 
@@ -19,11 +18,31 @@ import (
 // chain tail and forking the HMAC chain. The lock is on a separate file (not the log
 // fd) so it survives rotation without a release window, named ".<base>.lock" so it
 // stays out of the rotation glob and retention pruning.
+//
+// The open carries BOTH halves of the package's symlink guard, exactly like every
+// other open on an audit-derived path (see refuseNonRegular in rotate.go). It is not
+// the lock file's CONTENT that needs protecting — nothing is ever written through this
+// handle — it is the lock's EXCLUSIVITY. flock operates on whatever the open resolved
+// to, so a link planted at this path ahead of first use sends a second instance's lock
+// to a different inode: both instances then believe they hold the audit log and append
+// to it, which forks the HMAC chain — the one outcome this file exists to prevent.
+// Redirecting the lock to a device or FIFO is the availability version of the same bug.
+//
+// The directory is not trusted enough to skip this: MkdirAll sets 0700 only on a
+// directory it CREATES, so an audit path pointed at a pre-existing group- or
+// world-writable location carries no mode guarantee, and that is precisely where a
+// symlink planted by another uid is reachable.
+//
+// Scope, so the claim is not read as wider than it is: this covers the lock PATH's final
+// component. It does not make the lock inode-identified -- two spellings of one log (a
+// hardlink, or two paths resolving to the same file) still derive two different lock
+// paths, and neither excludes the other. That is a pre-existing property of deriving the
+// lock name textually from the log path, not something the guard claims to fix.
 func acquireAuditLock(logPath string) (*os.File, error) {
-	lockPath := filepath.Join(filepath.Dir(logPath), "."+filepath.Base(logPath)+".lock")
-	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // G304: derived from the user-configured audit log path
+	lockPath := auditLockPath(logPath)
+	lf, err := openAuditLockFile(lockPath)
 	if err != nil {
-		return nil, fmt.Errorf("opening audit lock file %q: %w", lockPath, err)
+		return nil, err
 	}
 	if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		_ = lf.Close()

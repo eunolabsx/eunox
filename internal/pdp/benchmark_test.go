@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -65,26 +66,78 @@ func BenchmarkJWTPDP(b *testing.B) {
 	})
 }
 
-// BenchmarkListFilter measures the cost of filtering a tools/list response
-// against a manifest — the work done on every tools/list passing through the
-// proxy. Sized at 50 upstream tools with a 25-entry allowlist (half permitted).
+// BenchmarkListFilter measures the cost of filtering a tools/list response against a
+// manifest — the work done on every tools/list passing through the proxy. Sized at 50
+// upstream tools with a 25-entry allowlist (half permitted).
+//
+// The catalog carries a description and a populated inputSchema per entry, because that
+// is what the path actually costs: the per-entry decode into toolListEntry deep-parses
+// inputSchema, and it dominates every envelope-level pass. A catalog of bare
+// mcp.ToolEntry{Name: ...} values measures almost none of the real work and made a
+// whole-envelope decode on the unpinned path look free.
+//
+// The two sub-benchmarks split on the one thing that changes the shape of the path: an
+// unpinned manifest skips pin-arming entirely, while a pinned one walks the catalog a
+// second time to hash the pinned entries.
 func BenchmarkListFilter(b *testing.B) {
+	tools := benchToolCatalog(50)
 	caps := make([]capability.Constraint, 25)
-	tools := make([]mcp.ToolEntry, 50)
-	for i := range tools {
-		tools[i] = mcp.ToolEntry{Name: fmt.Sprintf("tool_%02d", i)}
-	}
 	for i := range caps {
 		caps[i] = capability.Constraint{Target: fmt.Sprintf("tool:tool_%02d", i), Actions: []string{"call"}}
 	}
-	mpdp := newTestManifestPDP(caps...)
-	raw, _ := json.Marshal(mcp.ToolsListResult{Tools: tools})
-
-	b.ResetTimer()
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		_ = filterToolsListResult(raw, mpdp, nil)
+	raw, err := json.Marshal(mcp.ToolsListResult{Tools: tools})
+	if err != nil {
+		b.Fatalf("marshal catalog: %v", err)
 	}
+
+	b.Run("Unpinned", func(b *testing.B) {
+		mpdp := newTestManifestPDP(caps...)
+		b.ResetTimer()
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_ = filterToolsListResult(raw, mpdp, nil)
+		}
+	})
+
+	b.Run("Pinned", func(b *testing.B) {
+		pinned := make([]capability.Constraint, len(caps))
+		copy(pinned, caps)
+		// One pin is enough to arm the whole pass: the gate is len(pinnedTools) > 0.
+		pinned[0].DescriptionHash = "sha256:" + strings.Repeat("00", 32)
+		mpdp := newTestManifestPDP(pinned...)
+		b.ResetTimer()
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_ = filterToolsListResult(raw, mpdp, nil)
+		}
+	})
+}
+
+// benchToolCatalog builds n tools shaped like a real upstream catalog: a prose
+// description plus an 8-property inputSchema carrying enums, so the per-entry decode
+// the filter path performs is measured rather than skipped.
+func benchToolCatalog(n int) []mcp.ToolEntry {
+	tools := make([]mcp.ToolEntry, n)
+	for i := range tools {
+		props := make(map[string]interface{}, 8)
+		for p := 0; p < 8; p++ {
+			props[fmt.Sprintf("param_%d", p)] = map[string]interface{}{
+				"type":        "string",
+				"description": fmt.Sprintf("The %d%s parameter, supplied by the caller and validated upstream.", p, "th"),
+				"enum":        []string{"alpha", "beta", "gamma", "delta"},
+			}
+		}
+		tools[i] = mcp.ToolEntry{
+			Name:        fmt.Sprintf("tool_%02d", i),
+			Description: "Performs a bounded operation against the upstream service and returns a structured result. Arguments are validated before dispatch.",
+			InputSchema: map[string]interface{}{
+				"type":       "object",
+				"properties": props,
+				"required":   []string{"param_0", "param_1"},
+			},
+		}
+	}
+	return tools
 }
 
 // benchJWTPDPContext builds a JWTPDP backed by an in-process JWKS server, mints a
