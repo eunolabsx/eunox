@@ -338,7 +338,7 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 				// the tape carries the stable DRIFT_REFUSED category, matching the
 				// JWT_INVALID fixed-code-not-free-form-prose discipline. p.rec() is nil when
 				// no audit sink is configured (guard, as elsewhere).
-				recordDriftRefused(ctx, asRecorder(p.rec()), p.sessionID)
+				recordDriftRefused(ctx, p.rec(), p.sessionID)
 				return err
 			}
 		}
@@ -388,11 +388,7 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 	p.awaitUpstreamDrain() //nolint:contextcheck // teardown path: the force-kill's upstream session-termination DELETE intentionally uses a detached, bounded background context — close/reaper/signal/shutdown carry no request context.
 	// Upstream has exited: stop the SIGKILL fallback (if armed) so a clean shutdown
 	// emits no spurious "sending SIGKILL" line and the timer is freed promptly.
-	p.killMu.Lock()
-	if p.killTimer != nil {
-		p.killTimer.Stop()
-	}
-	p.killMu.Unlock()
+	p.stopKillTimer()
 	p.waitUpstream()
 
 	// ── 8. Release this session's per-session enforcement state ─────────────────
@@ -573,6 +569,33 @@ func (p *StdioProxy) awaitUpstreamDrain() {
 		p.killUpstream()
 		<-p.upstreamDone
 	}
+}
+
+// stopKillTimer cancels the SIGKILL fallback signalUpstream armed, if any, and reports
+// whether it was cancelled before firing. Every teardown that has already reaped the
+// upstream must call it: the fallback is a time.AfterFunc, so an uncancelled one runs its
+// goroutine — logging a spurious "sending SIGKILL" and signalling an already-reaped
+// process — at an arbitrary point after the shutdown it was meant to bound.
+//
+// It is a method rather than an inline block in Start so a caller that drives the upstream
+// lifecycle directly performs the same teardown Start does. A test that skipped it left a
+// goroutine outliving the test, which then read os.Stderr while another test swapped that
+// process-global (see captureStderr) — a data race the race detector attributes to
+// whichever test happened to be running.
+//
+// A false return means the timer had already fired; Stop does NOT wait for a started
+// AfterFunc, and this deliberately does not either. Waiting would make teardown block on
+// that goroutine's stderr write, which is exactly the stall the audit sink avoids by
+// keeping stderr writes off its lock — a dead log collector's full pipe must not be able
+// to wedge a shutdown.
+func (p *StdioProxy) stopKillTimer() bool {
+	p.killMu.Lock()
+	t := p.killTimer
+	p.killMu.Unlock()
+	if t == nil {
+		return true
+	}
+	return t.Stop()
 }
 
 // killDelay is the grace period before a graceful upstream shutdown escalates to a

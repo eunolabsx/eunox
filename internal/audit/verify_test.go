@@ -96,6 +96,34 @@ func TestVerifyAuditLog_EmptyKeyIDNoKeysIsUnverifiable(t *testing.T) {
 	}
 }
 
+// TestVerifyAuditLog_MalformedTimeReportedOnUnverifiableRecord: the signed `time` field is
+// validated for every signed record, but the UNKNOWN_KEY_ID and UNVERIFIABLE arms return
+// before classify's own malformed-time case runs, so a record that was BOTH signed with an
+// absent key AND carries an unparseable time lost the second finding entirely. The
+// diagnostic is emitted on those arms too — without counting, since the record is already
+// tallied in its own bucket.
+func TestVerifyAuditLog_MalformedTimeReportedOnUnverifiableRecord(t *testing.T) {
+	t.Parallel()
+	key := nonZeroTestKey()
+	line := signTestRecord(t, key, auditRecord{
+		ClassUID: 6003, CategoryUID: 6, ActivityID: 1,
+		Time: "not-a-timestamp", Seq: 1, RequestID: "r",
+		Decision: "allow", PrevHMAC: auditGenesisPrev,
+	})
+
+	var out strings.Builder
+	res, err := VerifyLog(bytes.NewReader(line), &Sink{verifyKeys: map[string][]byte{}}, "", time.Time{}, &out)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if res.Unverifiable != 1 || res.Invalid != 0 {
+		t.Fatalf("got %+v, want Unverifiable=1 Invalid=0 (the time diagnostic must not double-count)", res)
+	}
+	if !strings.Contains(out.String(), "unparseable time field") {
+		t.Errorf("expected the unparseable-time diagnostic alongside UNVERIFIABLE, got %q", out.String())
+	}
+}
+
 // TestInterpretAuditTail_FileShrinkReportsError: when Stat
 // saw a non-empty file but ReadAt returns zero bytes with io.EOF (the file was
 // truncated/rotated out from under us between the two syscalls), interpretAuditTail
@@ -2188,14 +2216,20 @@ func TestTruncatePartialTail_ReReadsWhenWindowClipsTheLastRecord(t *testing.T) {
 
 // TestTruncatePartialTail_ReReadFailureFailsClosed pins that a re-read the handle cannot
 // service is not reported as a clean tail: the same fail-closed stance the initial probe
-// takes. Uses the clipping geometry above, then closes the handle so the re-read's ReadAt
-// fails.
+// takes. Stages the post-truncation geometry the clipping test above produces — a window
+// SHORTER than the scan window, with the last record's leading boundary outside it — then
+// closes the handle so the re-read's ReadAt fails.
+//
+// The window must be shorter than winSize, because that is the only shape that re-reads:
+// a full-size window re-anchors at the offset it already starts at, so the "re-read" would
+// return the bytes already in hand.
 func TestTruncatePartialTail_ReReadFailureFailsClosed(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "audit.jsonl")
 	r1 := `{"seq":1,"decision":"allow"}`
 	r2 := `{"seq":2,"decision":"allow"}`
-	content := r1 + "\n" + r2 + "\n"
+	orphan := `{"seq":3,"decision":"allo` // no trailing newline: a partial write
+	content := r1 + "\n" + r2 + "\n" + orphan
 	if err := os.WriteFile(logPath, []byte(content), 0o600); err != nil {
 		t.Fatalf("write log: %v", err)
 	}
@@ -2203,17 +2237,15 @@ func TestTruncatePartialTail_ReReadFailureFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open O_RDWR: %v", err)
 	}
-	// Read the window first (while the handle is live), then close it so only the
-	// re-read fails.
-	winSize := int64(len(r2))
+	// Same geometry as the clipping test: the window starts inside r2, and the truncation
+	// drops the orphan, leaving a window that ends at r2's newline.
+	winSize := int64(len(orphan) + len(r2)/2)
 	start := int64(len(content)) - winSize
-	window := make([]byte, winSize)
-	if _, err := f.ReadAt(window, start); err != nil && err != io.EOF {
-		t.Fatalf("stage window read: %v", err)
-	}
+	newSize := int64(len(r1) + 1 + len(r2) + 1)
+	window := []byte(content[start:newSize])
 	_ = f.Close()
 
-	if _, err := tailLineFromWindow(f, window, start, int64(len(content)), winSize); !errors.Is(err, errAuditTailProbe) {
+	if _, err := tailLineFromWindow(f, window, start, newSize, winSize); !errors.Is(err, errAuditTailProbe) {
 		t.Fatalf("error = %v, want it to wrap errAuditTailProbe (a re-read we cannot complete is not a clean tail)", err)
 	}
 }

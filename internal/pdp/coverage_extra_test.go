@@ -1471,6 +1471,65 @@ func TestApplyRedactObligs_TopLevelDottedPath_Redacted(t *testing.T) {
 	assert.Contains(t, s, "keep")
 }
 
+// TestApplyRedactObligs_SiblingKeyAnchoring is the matrix the sibling walk must satisfy for
+// EVERY spelling of the same field, because the outcome used to depend on which top-level
+// key held the payload and on how many segments the path had.
+//
+// A multi-segment path names a position relative to the RESULT ENVELOPE. The walk over an
+// unmodelled sibling key once anchored every path at that key's VALUE instead, so
+// structuredContent and a sibling key disagreed about the identical shape: with "data.ssn",
+// {"structuredContent":{"data":"{\"ssn\":...}"}} masked while
+// {"content":[],"data":"{\"ssn\":...}"} forwarded the value verbatim. The rows below pin
+// both anchorings at once — envelope-relative (so a dotted path reaches into the blob the
+// key names) and value-relative (so a container RELOCATED under some other key is still
+// masked) — since either one alone leaves a spelling of this leaking.
+func TestApplyRedactObligs_SiblingKeyAnchoring(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		body string
+		path string
+	}{
+		// Plain containers, both anchorings.
+		{"structuredContent nested, dotted", `{"structuredContent":{"data":{"ssn":"SECRET"}}}`, "data.ssn"},
+		{"sibling nested, dotted", `{"content":[],"data":{"ssn":"SECRET"}}`, "data.ssn"},
+		{"sibling relocated, dotted", `{"content":[],"output":{"data":{"ssn":"SECRET"}}}`, "data.ssn"},
+		{"sibling nested, bare", `{"content":[],"data":{"ssn":"SECRET"}}`, "ssn"},
+		{"sibling top-level scalar, bare", `{"content":[],"ssn":"SECRET"}`, "ssn"},
+		// The same shapes with the payload doubly encoded as a JSON string, which is how an
+		// upstream smuggles a named field past a structural key walk.
+		{"sibling encoded blob, dotted", `{"content":[],"data":"{\"ssn\":\"SECRET\"}"}`, "data.ssn"},
+		{"sibling encoded blob nested, dotted", `{"content":[],"data":{"inner":"{\"ssn\":\"SECRET\"}"}}`, "data.inner.ssn"},
+		{"structuredContent encoded blob, dotted", `{"structuredContent":{"data":"{\"ssn\":\"SECRET\"}"}}`, "data.ssn"},
+		{"sibling encoded blob, bare", `{"content":[],"data":"{\"ssn\":\"SECRET\"}"}`, "ssn"},
+		{"sibling relocated encoded blob, dotted", `{"content":[],"output":"{\"data\":{\"ssn\":\"SECRET\"}}"}`, "data.ssn"},
+	} {
+		out, err := ApplyRedactObligs([]byte(tc.body), []capability.Obligation{
+			{Type: capability.DirectiveTypeRedactFields, Paths: []string{tc.path}},
+		})
+		require.NoError(t, err, tc.name)
+		assert.NotContains(t, string(out), "SECRET",
+			"%s: path %q must mask the declared field wherever the envelope carries it", tc.name, tc.path)
+	}
+}
+
+// TestApplyRedactObligs_SiblingKeyAnchoring_NoOverReach is the negative control for the
+// envelope-relative anchoring: rebasing a dotted path onto a sibling key must mask only
+// what that path names. A field the manifest never named, and a same-named field under a
+// key the path does not traverse, both survive.
+func TestApplyRedactObligs_SiblingKeyAnchoring_NoOverReach(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{"content":[],"data":{"ssn":"SECRET","keep":"KEEP-SIBLING"},"other":{"keep":"KEEP-OTHER"}}`)
+	out, err := ApplyRedactObligs(body, []capability.Obligation{
+		{Type: capability.DirectiveTypeRedactFields, Paths: []string{"data.ssn"}},
+	})
+	require.NoError(t, err)
+	s := string(out)
+	assert.NotContains(t, s, "SECRET")
+	assert.Contains(t, s, "KEEP-SIBLING", "an unnamed field beside the masked one must survive")
+	assert.Contains(t, s, "KEEP-OTHER", "a field under a key the path does not name must survive")
+}
+
 // A path rooted at content/structuredContent stays with those keys' own shape-specific
 // passes: it must redact WITHIN the component, never mask the whole component (which
 // would strip a result the host needs while the operator only asked for a field).

@@ -102,7 +102,16 @@ func (p *HTTPProxy) handleMCP(w http.ResponseWriter, r *http.Request) {
 // a narrower kill while silently ignoring a smuggled trailing {"all":true}. On a refused
 // content type, a decode failure, or trailing data this writes the response itself (415,
 // 400, or 413 for a body that exceeds the MaxBytesReader cap the caller installed on
-// r.Body) and returns false; the caller must return immediately without proceeding.
+// r.Body) and returns false; the caller must return immediately without proceeding. The
+// 400 legs (malformed JSON, trailing data) are recorded via recordPreSessionDeny under
+// codeInvalidRequest — the same host-protocol-fault code dispatchRequest already uses for
+// a malformed body once a session exists — through the shared rate-limited pre-session
+// path requireJSONContentType's 415 leg already uses just above. A malformed /mcp or
+// /control/kill body is the same class of probe this package's other transport-level
+// refusals (415, wrong Origin, bad control token) already leave a trace for; a decode
+// failure must not be the one gate that doesn't. The 413 leg is not recorded:
+// MaxBytesReader already bounds the cost of that flood, so it carries no additional
+// attack signal worth a rate-limited write.
 //
 // The content-type gate lives HERE, rather than being repeated at each handler, for the
 // reason checkOrigin is a mux-wide wrapper: it makes the control unforgettable. Every
@@ -124,6 +133,12 @@ func (p *HTTPProxy) decodeStrictJSON(w http.ResponseWriter, r *http.Request, v i
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			return false
 		}
+		// Unstamped by design, like every other pre-session record: this can fire before
+		// route resolution. The raw decode error and body are NOT recorded — either can
+		// carry attacker-controlled free text; only the fixed reason string is kept.
+		p.recordPreSessionDeny(r, codeInvalidRequest, "body", map[string]interface{}{
+			"reason": "malformed_json",
+		})
 		http.Error(w, invalidBodyMsg, http.StatusBadRequest)
 		return false
 	}
@@ -133,6 +148,9 @@ func (p *HTTPProxy) decodeStrictJSON(w http.ResponseWriter, r *http.Request, v i
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			return false
 		}
+		p.recordPreSessionDeny(r, codeInvalidRequest, "body", map[string]interface{}{
+			"reason": "trailing_data",
+		})
 		http.Error(w, invalidBodyMsg+": trailing data after JSON message", http.StatusBadRequest)
 		return false
 	}
@@ -1051,14 +1069,10 @@ func (p *HTTPProxy) handleMCPDelete(w http.ResponseWriter, r *http.Request, rout
 
 // handleKill processes POST /control/kill (loopback only).
 func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
-	// Loopback guard runs first — before the method check — so an off-host caller is
-	// rejected by the security boundary rather than learning the endpoint exists via a
-	// 405. Matches handleHealth/handleMetrics.
+	// Loopback guard runs first — before the control-token check — so an off-host
+	// caller is rejected by the security boundary rather than learning the endpoint
+	// exists via a 401. Matches handleHealth/handleMetrics.
 	if !p.loopbackOnly(w, r) {
-		return
-	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -1066,7 +1080,23 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 	// compromised tool subprocess) could reach this endpoint over loopback. Require the
 	// auto-generated control token (written to a 0600 file at startup, independently of
 	// authToken/JWT mode) so the emergency stop is never reachable without it.
+	//
+	// This runs BEFORE the method check on purpose. A method check that ran first
+	// would answer a bare GET/PUT/whatever with an unrecorded 405 — confirming the
+	// emergency-stop endpoint exists and is enabled to a caller who never proved they
+	// hold the token, while the same caller sending POST with a wrong token is fully
+	// recorded via CONTROL_AUTH_FAILED below. That is exactly the asymmetry SEC-07
+	// exists to close: a same-host attacker probing this endpoint must not have a
+	// cheaper, invisible way in than the one that's already logged. Checking the
+	// token first collapses every unauthenticated verb to the same recorded 401, so
+	// the endpoint's existence costs nothing extra to confirm; a legitimate operator
+	// who both holds the token and typos the verb gets a less specific error, which is
+	// an acceptable trade against shrinking the endpoint's information surface.
 	if !p.checkControlToken(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -1097,6 +1127,12 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "kill switch activation failed", http.StatusInternalServerError)
 			return
 		}
+		// Record BEFORE the teardown: the stop takes effect the moment the store write
+		// returns, and the teardown below waits on every session's close (bounded by the
+		// shutdown budget, which a wedged upstream reader consumes in full). Recording
+		// after it left a window where a crash produced a tape showing KILL_SWITCH denials
+		// with no activation record to explain them — the exact gap this record closes.
+		p.recordKillActivated(r, killScopeAll)
 		// Evict every open SSE stream: writing the kill state stops future operations,
 		// but a stream opened before the kill is long-lived and would keep delivering
 		// notifications until the idle ceiling. This makes the stop total for the
@@ -1107,7 +1143,6 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 		// sessionIdleTimeoutMs is 0 — otherwise killed-but-undead sessions would pin
 		// capacity and 503 new initializes.
 		p.reapAllKilledSessions() //nolint:contextcheck // teardown path: close()'s upstream session-termination DELETE intentionally uses a detached, bounded background context — binding it to r.Context() would cancel the teardown the instant this response is written. Same rationale as the handleMCPDelete close() site.
-		p.recordKillActivated(r, killScopeAll)
 		p.writeKillResponse(w, "all")
 		return
 	}
@@ -1120,13 +1155,14 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "kill switch session kill failed", http.StatusInternalServerError)
 		return
 	}
+	// Recorded before the teardown, same ordering as the global path above.
+	p.recordKillActivated(r, body.SessionID)
 	// End this session's open SSE stream(s), same reason as the global path above.
 	p.evictSessionStreams(body.SessionID)
 	// Proactively tear the killed session down (close its upstream, free its
 	// maxSessions slot) instead of relying on the idle reaper, which does not run when
 	// sessionIdleTimeoutMs is 0 — see reapKilledSession.
 	p.reapKilledSession(body.SessionID) //nolint:contextcheck // teardown path: close()'s upstream session-termination DELETE intentionally uses a detached, bounded background context. Same rationale as the handleMCPDelete close() site.
-	p.recordKillActivated(r, body.SessionID)
 	p.writeKillResponse(w, body.SessionID)
 }
 
@@ -1144,12 +1180,17 @@ const killScopeAll = "all"
 // stop was authorized.
 //
 // Recorded as an ALLOW: the request was authenticated by the control token and
-// performed, so it is a permitted action, not a refusal. It is emitted AFTER the
-// kill-store write and session teardown succeed, so the tape never claims a stop that
-// did not take effect (a failed ActivateGlobal/KillSession returns 500 before reaching
-// here). scope is the killed session id, or killScopeAll for a whole-proxy stop; it
-// goes in details rather than the structured target field, which is reserved for MCP
-// tool/resource/prompt targets this administrative action has none of.
+// performed, so it is a permitted action, not a refusal. It is emitted after the
+// kill-store write succeeds — so the tape never claims a stop that did not take effect (a
+// failed ActivateGlobal/KillSession returns 500 before reaching here) — and BEFORE the
+// stream eviction and session teardown, which are resource reclamation rather than part
+// of the stop. The kill is in force the moment the store write returns, while the
+// teardown waits on every session's close and is bounded only by the shutdown budget, so
+// recording after it left a window in which a crash produced a tape full of KILL_SWITCH
+// denials with no activation record to explain them. scope is the killed session id, or
+// killScopeAll for a whole-proxy stop; it goes in details rather than the structured
+// target field, which is reserved for MCP tool/resource/prompt targets this
+// administrative action has none of.
 //
 // The record carries no credential — the control token is never recorded, matching the
 // CONTROL_AUTH_FAILED refusal path — and no session_id: a global stop addresses no

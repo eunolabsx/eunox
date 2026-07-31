@@ -78,7 +78,15 @@ Section conventions:
   all — a truncated or padded one — is still decoded once rather than twice, so a
   corrupted archive does not pay for the split. End to end over a signed log:
   58 -> 32 allocations per record.
-
+- The `/control/kill` activation record is written after the kill-store write but
+  **before** the SSE eviction and session teardown, which reclaim resources rather than
+  effect the stop. The kill is in force the moment the store write returns, while the
+  teardown is bounded only by the shutdown budget, so recording after it left a window
+  in which a crash produced a tape full of `KILL_SWITCH` denials with no activation
+  record to explain them.
+- The audit sink's record-dropped warnings are written outside its read lock. They fire
+  during a drop storm — precisely when `Close`, which needs the write lock, must make
+  progress — and stderr can block indefinitely behind a dead log collector.
 - **The Redis kill switch's fail-closed staleness budget is floored against a real
   refresh-cycle cost**, instead of being a bare two reconcile intervals. The budget
   gates a total, non-downgradable denial, and a refresh cycle (a `GET` plus two `SCAN`
@@ -203,6 +211,50 @@ Section conventions:
 
 ### Fixed
 
+- **`redactFields` missed a declared field inside a doubly-encoded blob under an
+  unmodelled result key.** The walk over such a key anchored every dot-path at that
+  key's *value*, so a multi-segment path never reached the blob the key names:
+  `{"structuredContent":{"data":"{\"ssn\":\"…\"}"}}` masked while
+  `{"content":[],"data":"{\"ssn\":\"…\"}"}` — the same shape one key over — forwarded
+  the value verbatim. Each sibling value is now walked under both anchorings
+  (envelope-relative, so a dotted path reaches into the blob its key names, and
+  value-relative, so a container relocated under some other key is still masked) and
+  the union is redacted.
+- **A failed second `eunox proxy` start broke `eunox kill` against the running one.**
+  The control token is written to a shared default path and deliberately overwrites
+  what is there, and that write ran *before* `net.Listen` — so an operator who
+  accidentally started a second proxy got a clean "address already in use" failure
+  from a process that had already replaced the live proxy's token on disk. The
+  loopback emergency stop then 401'd until restart, in exactly the confused-deployment
+  situation where it matters most. The token is now persisted only after the listener
+  binds; a failure at that point closes the listener rather than serving without an
+  authenticated control endpoint.
+- **`--upstream-timeout` accepted any negative value as "defer to the config".** Only
+  `-1` is a sentinel, so a sign typo meant for a 5s bound (`--upstream-timeout -5000`)
+  silently produced the 30s default instead. Values below the sentinel are now
+  rejected, matching the guard the other numeric proxy flags already carry.
+- **An explicit `--audit-rotate-size` / `--audit-retain` overridden by the config's
+  audit block was dropped silently**, while the two string flags beside them warned.
+  Both now emit the same WARNING. (`--audit-retain`'s explicitness is detected from
+  whether the flag was passed, since its `0` is a meaningful "keep all".)
+- **A manifest declaring an unsupported `schemaVersion` was reported as a scalar that
+  needs quoting.** The content-interpreting guards ran ahead of the version gate, so a
+  future-grammar manifest sent the operator hunting a spelling mistake in a
+  correctly-spelled file. The version is now probed first, as the gateway-config
+  loader already did.
+- A pre-session refusal record now always carries `details.source_ip` (it was
+  hand-added per call site, and the two that omitted it were the unauthenticated
+  Origin probe and the JWT rejection), and the attacker-controlled `Origin` and
+  loopback `path` details are length-bounded before reaching the tape or stderr.
+- `audit-verify` now reports an unparseable `time` field on `UNKNOWN_KEY_ID` and
+  `UNVERIFIABLE` records too; those arms returned before the diagnostic could run, so
+  a retired-key record lost its time-drift signal.
+- A complete upstream write that returned a deadline error alongside `n == len(frame)`
+  poisoned the framed writer and recorded a fabricated `UPSTREAM_TIMEOUT` for a call
+  that was in fact delivered. The deadline arm now keys on the byte count like the
+  partial-write arm beside it.
+- `drift.ParseToolsListResult` refuses an ambiguous `tools` key (duplicated or
+  case-variant) itself rather than relying on callers to pre-screen it.
 - **`redactFields` skipped a field sitting directly on a top-level result key.** The
   pass descended into each non-`content`/`structuredContent` key looking for matches
   nested inside its value but never tested the key's own name, so

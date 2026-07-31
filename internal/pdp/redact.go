@@ -574,29 +574,69 @@ func redactSiblingTopLevelKeys(result map[string]interface{}, paths []string) (b
 		if key == "content" || key == "structuredContent" {
 			continue
 		}
+		out, c, err := redactSiblingValue(key, val, paths)
+		if err != nil {
+			return false, err // fail closed
+		}
+		if c {
+			// Containers are mutated in place, so this write only matters for a string
+			// leaf (which is replaced by value); assigning to an already-present key
+			// during the range is safe.
+			result[key] = out
+			changed = true
+		}
+	}
+	return changed, nil
+}
+
+// redactSiblingValue applies the redaction paths to ONE unmodelled top-level key's value,
+// under both anchorings, and reports whether anything changed. A string leaf is replaced by
+// value (the caller writes the returned replacement back); containers are mutated in place.
+//
+// A dot-path is applied under TWO anchorings, and the union of the two is what gets masked:
+//
+//   - Envelope-relative (prefix = key). A multi-segment path names a position relative to
+//     the RESULT ENVELOPE, so "data.ssn" must reach an ssn that a doubly-encoded blob at
+//     key "data" carries: with the key as prefix, rebaseLeafPaths maps "data.ssn" to "ssn"
+//     at the blob's own root, exactly as it already does for the identical shape under
+//     structuredContent. Anchoring only at the value's root (as this walk once did) made
+//     the two spellings of the same result disagree — structuredContent holding
+//     {"data":"{\"ssn\":...}"} masked while a sibling key holding it forwarded the value
+//     verbatim, defeating a declared obligation on the shape the envelope pass above
+//     handles for the un-encoded spelling.
+//   - Value-relative (empty prefix). Keeps masking a container an upstream RELOCATED under
+//     some other unmodelled key: for "data.ssn", {"output":{"data":{"ssn":...}}} names
+//     nothing envelope-relative, and rebaseLeafPaths drops paths anchored elsewhere, so the
+//     first anchoring alone would forward it. Deliberate over-redaction: masking a field
+//     the manifest named, at a position it did not name, is the safe direction for a DLP
+//     obligation, whereas the reverse leaks.
+func redactSiblingValue(key string, val interface{}, paths []string) (replacement interface{}, changed bool, err error) {
+	// Envelope-relative first: a string leaf redacted under one anchoring is fed to the
+	// next, so both apply to the same (possibly already re-serialized) blob.
+	for _, prefix := range []string{key, ""} {
 		switch v := val.(type) {
 		case map[string]interface{}, []interface{}:
-			c, err := redactStructuredContentValue(v, paths, "", 0)
-			if err != nil {
-				return false, err // fail closed
+			c, cerr := redactStructuredContentValue(v, paths, prefix, 0)
+			if cerr != nil {
+				return nil, false, cerr // fail closed
 			}
 			if c {
 				changed = true
 			}
 		case string:
-			out, c, err := redactContainerString(v, paths, "", 0)
-			if err != nil {
-				return false, err // fail closed
+			out, c, cerr := redactContainerString(v, paths, prefix, 0)
+			if cerr != nil {
+				return nil, false, cerr // fail closed
 			}
 			if c {
-				result[key] = out
+				val = out
 				changed = true
 			}
 		default:
 			// A scalar (number, bool, null) carries no named field and cannot hide one.
 		}
 	}
-	return changed, nil
+	return val, changed, nil
 }
 
 func redactStructuredContentField(result map[string]interface{}, paths []string) (bool, error) {

@@ -1586,8 +1586,11 @@ func buildConstraintsFromParsed(heads []capHead, target EnforceTarget) []capabil
 			c, err := parseCondSuffix(h.condpart)
 			if err != nil {
 				// A malformed suffix on a matching claim grants nothing (fail closed).
-				fmt.Fprintf(os.Stderr, "[eunox] JWT: capability claim %q passed validation but its condition suffix failed to parse (%v); dropping (this is a bug)\n",
-					fmt.Sprintf("%s:%s?%s", h.prefix, h.bareName, h.condpart), err)
+				// Logged through jwtLogger, like its head-phase twin in parseCapHeads: the
+				// two halves report the same validator/parser divergence, so they must be
+				// greppable and correlatable the same way in a SIEM.
+				jwtLogger.Warn("JWT capability claim passed validation but its condition suffix failed to parse; dropping (this is a bug)",
+					"claim", fmt.Sprintf("%s:%s?%s", h.prefix, h.bareName, h.condpart), "reason", err.Error())
 				continue
 			}
 			conds = c

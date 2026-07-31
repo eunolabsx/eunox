@@ -710,6 +710,23 @@ func (v *auditChainVerifier) reportSuppressedUnsigned() {
 		v.unsignedSeen, v.unsignedSeen-maxUnsignedDiagnostics)
 }
 
+// reportMalformedTime emits the unparseable-`time` diagnostic on the arms that return
+// before classify's own malformed-time case can run — UNKNOWN_KEY_ID and UNVERIFIABLE.
+// The time field is signed and required, so an unparseable one is format drift or
+// tampering on those records exactly as it is on an HMAC-valid one, and losing the signal
+// because the record ALSO named a retired key hides two findings behind one.
+//
+// It deliberately counts nothing: the record is already tallied in its own bucket and the
+// verdict already fails (OK() treats both as unverified), so adding to Invalid here would
+// double-count one record. Diagnostic completeness only.
+func (v *auditChainVerifier) reportMalformedTime(rec auditRecord, malformed bool) {
+	if !malformed {
+		return
+	}
+	_, _ = fmt.Fprintf(v.out, "         also: seq=%d has an unparseable time field %q (already counted above)\n",
+		rec.Seq, SanitizeAuditField(rec.Time))
+}
+
 // classify counts and reports the record's verification outcome: malformed,
 // forged decoy, unsigned, or HMAC-verified (valid/invalid/skipped per the filter).
 func (v *auditChainVerifier) classify(line []byte, rec auditRecord, dec recordDecode, forgedSeq0, unsigned bool) {
@@ -808,6 +825,7 @@ func (v *auditChainVerifier) classify(line []byte, rec auditRecord, dec recordDe
 		// prev_hmac still links correctly. Flagging a chain break would mislabel a benign
 		// rotation as tampering. Only a provable HMAC mismatch under a held key (the !ok /
 		// err cases below) invalidates the anchor.
+		v.reportMalformedTime(rec, malformedTime)
 	case errors.Is(err, errUnidentifiedNoMatch):
 		// The record names no key_id and no ring key matched it: the signing key is
 		// unidentifiable, so this cannot be proven to be tampering rather than a
@@ -822,6 +840,7 @@ func (v *auditChainVerifier) classify(line []byte, rec auditRecord, dec recordDe
 		// fabricate a chain break on the successor. OK() already fails the verdict on any
 		// Unverifiable record; only a provable HMAC mismatch (the !ok / err cases below)
 		// invalidates the anchor.
+		v.reportMalformedTime(rec, malformedTime)
 	case err != nil:
 		// A verification error or HMAC mismatch is tampering: count it regardless of
 		// the filter.

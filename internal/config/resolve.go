@@ -121,10 +121,12 @@ func ExpandHome(p string) (string, error) {
 // refusal on "stat succeeded" would let a stat fault skip the check and follow a symlink,
 // the fail-OPEN direction this guard exists to prevent.
 //
-// A Lstat->open TOCTOU remains: a symlink planted between this check and the open is
-// still followed. Closing it fully needs O_NOFOLLOW-level atomicity, which is not
-// portable; internal/audit adds O_NOFOLLOW where the platform has it and keeps its
-// rename->reopen window narrow.
+// This check alone leaves a Lstat->open TOCTOU: a symlink planted between it and the open
+// is still followed. Closing that needs O_NOFOLLOW-level atomicity, which is not portable,
+// so it is a SEPARATE, build-tagged flag rather than something this function can do —
+// OpenNoFollow, which every truncating/appending caller ORs into its open. Both halves are
+// needed: this one is portable and also refuses directories, devices and FIFOs; that one
+// closes the race where the platform supports it.
 //
 // It lives here, beside ExpandHome, because the binary and internal/audit each had their
 // own hand-written copy and they had already drifted — one distinguished a symlink from

@@ -1656,7 +1656,7 @@ func TestOpenConfiguredAuditSink_ConfigOverridesFlags(t *testing.T) {
 	var sink *audit.Sink
 	var openErr error
 	stderr := captureStderr(t, func() {
-		sink, openErr = openConfiguredAuditSink("/flag-log.jsonl", "/flag-key", 1, 1, cfg, false)
+		sink, openErr = openConfiguredAuditSink("/flag-log.jsonl", "/flag-key", 1, 1, true, cfg, false)
 	})
 	if openErr != nil {
 		t.Fatalf("unexpected error: %v", openErr)
@@ -1678,6 +1678,38 @@ func TestOpenConfiguredAuditSink_ConfigOverridesFlags(t *testing.T) {
 	if !strings.Contains(stderr, "/flag-key") || !strings.Contains(stderr, cfgKeyPath) {
 		t.Errorf("expected a WARNING naming both the overridden --audit-key-path flag and the config's audit.keyPath, got:\n%s", stderr)
 	}
+	// The two numeric flags in the same function are overridden by the same rule and were
+	// the ones dropping it silently.
+	if !strings.Contains(stderr, "--audit-rotate-size") {
+		t.Errorf("expected a WARNING for the overridden --audit-rotate-size, got:\n%s", stderr)
+	}
+	if !strings.Contains(stderr, "--audit-retain") {
+		t.Errorf("expected a WARNING for the overridden --audit-retain, got:\n%s", stderr)
+	}
+}
+
+// TestOpenConfiguredAuditSink_NoRetainWarningWhenFlagUnset: --audit-retain's 0 is a
+// MEANINGFUL value ("keep all"), so explicitness cannot be inferred from the value —
+// an unset flag must stay silent even though the config overrides its zero.
+func TestOpenConfiguredAuditSink_NoRetainWarningWhenFlagUnset(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.GatewayConfig{}
+	cfg.Audit.Log = filepath.Join(dir, "config-audit.jsonl")
+	retain := 3
+	cfg.Audit.RetainRotated = &retain
+
+	var sink *audit.Sink
+	var openErr error
+	stderr := captureStderr(t, func() {
+		sink, openErr = openConfiguredAuditSink("", "", 0, 0, false, cfg, false)
+	})
+	if openErr != nil {
+		t.Fatalf("unexpected error: %v", openErr)
+	}
+	t.Cleanup(func() { _ = sink.Close() })
+	if strings.Contains(stderr, "--audit-retain") {
+		t.Errorf("no --audit-retain flag was set; expected no override warning, got:\n%s", stderr)
+	}
 }
 
 // TestOpenConfiguredAuditSink_NoWarningWhenFlagUnset confirms the WARNING added
@@ -1693,7 +1725,7 @@ func TestOpenConfiguredAuditSink_NoWarningWhenFlagUnset(t *testing.T) {
 	var sink *audit.Sink
 	var openErr error
 	stderr := captureStderr(t, func() {
-		sink, openErr = openConfiguredAuditSink("", "", 0, 0, cfg, false)
+		sink, openErr = openConfiguredAuditSink("", "", 0, 0, false, cfg, false)
 	})
 	if openErr != nil {
 		t.Fatalf("unexpected error: %v", openErr)
@@ -1712,7 +1744,7 @@ func TestOpenConfiguredAuditSink_Success(t *testing.T) {
 	logPath := filepath.Join(dir, "audit.jsonl")
 	keyPath := filepath.Join(dir, "audit.key")
 
-	sink, err := openConfiguredAuditSink(logPath, keyPath, 0, 0, &config.GatewayConfig{}, true)
+	sink, err := openConfiguredAuditSink(logPath, keyPath, 0, 0, false, &config.GatewayConfig{}, true)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1732,7 +1764,7 @@ func TestOpenConfiguredAuditSink_NonFatalFailure(t *testing.T) {
 	}
 	logPath := filepath.Join(blocker, "subdir", "audit.jsonl")
 
-	sink, err := openConfiguredAuditSink(logPath, "", 0, 0, &config.GatewayConfig{}, false)
+	sink, err := openConfiguredAuditSink(logPath, "", 0, 0, false, &config.GatewayConfig{}, false)
 	if err != nil {
 		t.Fatalf("an open failure without --require-audit must not be an error: %v", err)
 	}
@@ -1753,7 +1785,7 @@ func TestOpenConfiguredAuditSink_FatalFailureReturnsError(t *testing.T) {
 	}
 	logPath := filepath.Join(blocker, "subdir", "audit.jsonl")
 
-	sink, err := openConfiguredAuditSink(logPath, "", 0, 0, &config.GatewayConfig{}, true)
+	sink, err := openConfiguredAuditSink(logPath, "", 0, 0, false, &config.GatewayConfig{}, true)
 	if err == nil {
 		t.Fatal("expected an error when the sink cannot be opened under --require-audit")
 	}

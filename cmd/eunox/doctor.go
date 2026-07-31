@@ -255,7 +255,10 @@ Flags:
 		fmt.Fprintf(os.Stderr, "eunox doctor: %v\n", err)
 		return 1
 	}
-	f, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600) //nolint:gosec // G304: --output is an operator-supplied destination
+	// config.OpenNoFollow (O_NOFOLLOW on unix, 0 elsewhere) closes the Lstat->open race the
+	// refusal above cannot; see writeGeneratedFile for the same pairing on the --output
+	// overwrite path.
+	f, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|config.OpenNoFollow, 0o600) //nolint:gosec // G304: --output is an operator-supplied destination
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "eunox doctor: opening %q: %v\n", outPath, err)
 		return 1

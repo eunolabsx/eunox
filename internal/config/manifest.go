@@ -134,6 +134,20 @@ func LoadManifest(path string) (*LocalManifest, error) {
 	if err := rejectExtraYAMLDocuments(dec, path, what); err != nil {
 		return nil, err
 	}
+	// Gate on the declared grammar version FIRST, before any guard that INTERPRETS the
+	// content, mirroring LoadGatewayConfig's pre-decode probe. The scalar-coercion guard
+	// below reads condition values under the 0.1 grammar, so a manifest declaring a future
+	// version was reported as (say) a scalar that must be quoted — sending the operator to
+	// fix a spelling in a correctly-spelled file while the real problem is that the whole
+	// document is a dialect this binary does not speak. Read straight off the parsed node,
+	// which is tolerant of everything else in the document; a document with no top-level
+	// schemaVersion scalar simply falls through to the authoritative post-decode check
+	// below, which stays the one that decides.
+	if v, ok := schemaVersionFromNode(&node); ok {
+		if err := validateManifestSchemaVersion(v); err != nil {
+			return nil, fmt.Errorf("invalid manifest %q: %w", path, err)
+		}
+	}
 	forceTimestampsToStrings(&node)
 	forceSchemaVersionToString(&node)
 	// Reject a scalar in a condition values:/enum: list that auto-typed away from
@@ -221,22 +235,44 @@ func rejectCoercedScalarsForFormat(node *yaml.Node, isJSON bool, path string) er
 // keeps the verbatim text, so "0.10" stays "0.10" (≠ "0.1") rather than renormalizing;
 // an unsupported unquoted value (e.g. 1) then reaches the version check and is rejected
 // with a clear "unsupported version" error instead of a decode error.
-func forceSchemaVersionToString(node *yaml.Node) {
+// topLevelValueNode returns the value node of a top-level mapping key, unwrapping a
+// DocumentNode wrapper first. Returns nil if the document isn't a mapping or the key is
+// absent, shared by schemaVersionFromNode and forceSchemaVersionToString so the top-level
+// walk exists once.
+func topLevelValueNode(node *yaml.Node, key string) *yaml.Node {
 	doc := node
 	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 {
 		doc = doc.Content[0]
 	}
 	if doc.Kind != yaml.MappingNode {
-		return
+		return nil
 	}
 	for i := 0; i+1 < len(doc.Content); i += 2 {
-		key, val := doc.Content[i], doc.Content[i+1]
-		if key.Kind == yaml.ScalarNode && key.Value == "schemaVersion" {
-			if val.Kind == yaml.ScalarNode && (val.Tag == "!!int" || val.Tag == "!!float") {
-				val.Tag = "!!str"
-			}
-			return
+		k, v := doc.Content[i], doc.Content[i+1]
+		if k.Kind == yaml.ScalarNode && k.Value == key {
+			return v
 		}
+	}
+	return nil
+}
+
+// schemaVersionFromNode reads the top-level schemaVersion scalar's SOURCE TEXT off the
+// parsed document, reporting whether the key was present as a scalar. It exists so the
+// grammar-version gate can run before any guard that interprets the document's content
+// under the current grammar (see LoadManifest); it reads Value, so it is independent of
+// the !!int/!!float retag forceSchemaVersionToString applies.
+func schemaVersionFromNode(node *yaml.Node) (string, bool) {
+	val := topLevelValueNode(node, "schemaVersion")
+	if val == nil || val.Kind != yaml.ScalarNode {
+		return "", false
+	}
+	return val.Value, true
+}
+
+func forceSchemaVersionToString(node *yaml.Node) {
+	val := topLevelValueNode(node, "schemaVersion")
+	if val != nil && val.Kind == yaml.ScalarNode && (val.Tag == "!!int" || val.Tag == "!!float") {
+		val.Tag = "!!str"
 	}
 }
 
@@ -1001,127 +1037,41 @@ func validateLocalManifest(m *LocalManifest) error {
 			if capability.IsTypedNil(cond) {
 				return fmt.Errorf("capability at index %d, condition %d: a typed-nil condition is not permitted; every conditions entry must be a typed condition object", i, j)
 			}
-			switch v := cond.(type) {
-			case capability.AllowedOperationsCondition:
-				if err := validateAllowedOperations(i, j, &v); err != nil {
-					return err
-				}
-			case *capability.AllowedOperationsCondition:
-				if err := validateAllowedOperations(i, j, v); err != nil {
-					return err
-				}
-				// Pre-trim the allowlist entries once at load so the hot path stops
-				// re-trimming them per request (mirrors the IPRange/TimeWindow Compile
-				// below). Only the pointer case is evaluated at runtime (the value case
-				// is a copy). Compile cannot fail; the error is still checked so a future
-				// normalization that can fail is caught here rather than silently skipped.
-				if err := v.Compile(); err != nil {
-					return fmt.Errorf("capability at index %d, condition %d: %w", i, j, err)
-				}
-			case capability.AllowedExtensionsCondition:
-				if err := validateAllowedExtensions(i, j, &v); err != nil {
-					return err
-				}
-			case *capability.AllowedExtensionsCondition:
-				if err := validateAllowedExtensions(i, j, v); err != nil {
-					return err
-				}
-				// Normalize the extension allowlist (lowercase, dot-prefix, dedupe) once
-				// at load so the hot path stops rebuilding it — and its dedupe map — per
-				// request. Only the pointer case is evaluated at runtime.
-				if err := v.Compile(); err != nil {
-					return fmt.Errorf("capability at index %d, condition %d: %w", i, j, err)
-				}
-			case capability.AllowedTablesCondition:
-				if err := validateAllowedTables(i, j, &v); err != nil {
-					return err
-				}
-			case *capability.AllowedTablesCondition:
-				if err := validateAllowedTables(i, j, v); err != nil {
-					return err
-				}
-				// Build the case-folded table set, column-restriction index, and per-table
-				// column sets once at load; the hot path rebuilt all three on every
-				// enforced call. Only the pointer case is evaluated at runtime.
-				if err := v.Compile(); err != nil {
-					return fmt.Errorf("capability at index %d, condition %d: %w", i, j, err)
-				}
-			case capability.RecipientDomainCondition:
-				if err := validateRecipientDomain(i, j, &v); err != nil {
-					return err
-				}
-			case *capability.RecipientDomainCondition:
-				if err := validateRecipientDomain(i, j, v); err != nil {
-					return err
-				}
-				// Build the case-folded domain set once at load rather than per request.
-				// Only the pointer case is evaluated at runtime.
-				if err := v.Compile(); err != nil {
-					return fmt.Errorf("capability at index %d, condition %d: %w", i, j, err)
-				}
-			case capability.AllowedValuesCondition:
-				if err := validateAllowedValues(i, j, &v); err != nil {
-					return err
-				}
-			case *capability.AllowedValuesCondition:
-				if err := validateAllowedValues(i, j, v); err != nil {
-					return err
-				}
-			case capability.MaxCallsCondition:
-				if err := validateMaxCalls(i, j, &v); err != nil {
-					return err
-				}
-			case *capability.MaxCallsCondition:
-				if err := validateMaxCalls(i, j, v); err != nil {
-					return err
-				}
-			case capability.IPRangeCondition:
-				if err := validateIPRange(i, j, &v); err != nil {
-					return err
-				}
-			case *capability.IPRangeCondition:
-				if err := validateIPRange(i, j, v); err != nil {
-					return err
-				}
-				// Pre-compile the CIDRs into *net.IPNet once at load so the hot path
-				// never re-parses them. Only the pointer case is evaluated at runtime
-				// (the value case is a copy). validateIPRange already confirmed they
-				// parse; fail closed if Compile somehow errors.
-				if err := v.Compile(); err != nil {
-					return fmt.Errorf("capability at index %d, condition %d: %w", i, j, err)
-				}
-			case capability.TimeWindowCondition:
-				if err := validateTimeWindow(i, j, &v); err != nil {
-					return err
-				}
-			case *capability.TimeWindowCondition:
-				if err := validateTimeWindow(i, j, v); err != nil {
-					return err
-				}
-				// Pre-parse notBefore/notAfter into time.Time once at load so the hot
-				// path never re-parses RFC3339 (mirrors the IPRange Compile above). Only
-				// the pointer case is evaluated at runtime (the value case is a copy).
-				// validateTimeWindow already confirmed they parse; fail closed if Compile
-				// somehow errors.
-				if err := v.Compile(); err != nil {
-					return fmt.Errorf("capability at index %d, condition %d: %w", i, j, err)
-				}
-			case capability.SequenceBlockCondition:
-				if err := validateSequenceBlock(i, j, &v); err != nil {
-					return err
-				}
-			case *capability.SequenceBlockCondition:
-				if err := validateSequenceBlock(i, j, v); err != nil {
-					return err
-				}
-			case capability.FlowLabelCondition:
-				if err := validateFlowLabel(i, j, v.Allow); err != nil {
-					return err
-				}
-			case *capability.FlowLabelCondition:
-				if err := validateFlowLabel(i, j, v.Allow); err != nil {
-					return err
-				}
+			// One arm per condition type, each pairing the value and pointer decode forms
+			// (validateTypedCondition normalizes to *T and runs the pointer-only Compile).
+			// Hand-writing the two forms as separate arms meant ~22 near-identical arms whose
+			// only asymmetry - Compile on the pointer arm alone - had to be remembered at every
+			// one, and getting one arm of a new pair wrong is invisible: the value form is a
+			// copy, so a missed Compile silently leaves the runtime state unbuilt. Mirrors the
+			// directive loop above. An unrecognized type falls through unvalidated exactly as
+			// before; the loader admits only these, and the engine fails closed on anything else.
+			var err error
+			switch cond.(type) {
+			case capability.AllowedOperationsCondition, *capability.AllowedOperationsCondition:
+				err = validateTypedCondition(i, j, cond, validateAllowedOperations)
+			case capability.AllowedExtensionsCondition, *capability.AllowedExtensionsCondition:
+				err = validateTypedCondition(i, j, cond, validateAllowedExtensions)
+			case capability.AllowedTablesCondition, *capability.AllowedTablesCondition:
+				err = validateTypedCondition(i, j, cond, validateAllowedTables)
+			case capability.RecipientDomainCondition, *capability.RecipientDomainCondition:
+				err = validateTypedCondition(i, j, cond, validateRecipientDomain)
+			case capability.AllowedValuesCondition, *capability.AllowedValuesCondition:
+				err = validateTypedCondition(i, j, cond, validateAllowedValues)
+			case capability.MaxCallsCondition, *capability.MaxCallsCondition:
+				err = validateTypedCondition(i, j, cond, validateMaxCalls)
+			case capability.IPRangeCondition, *capability.IPRangeCondition:
+				err = validateTypedCondition(i, j, cond, validateIPRange)
+			case capability.TimeWindowCondition, *capability.TimeWindowCondition:
+				err = validateTypedCondition(i, j, cond, validateTimeWindow)
+			case capability.SequenceBlockCondition, *capability.SequenceBlockCondition:
+				err = validateTypedCondition(i, j, cond, validateSequenceBlock)
+			case capability.FlowLabelCondition, *capability.FlowLabelCondition:
+				err = validateTypedCondition(i, j, cond, func(i, j int, c *capability.FlowLabelCondition) error {
+					return validateFlowLabel(i, j, c.Allow)
+				})
+			}
+			if err != nil {
+				return err
 			}
 		}
 	}
@@ -1132,6 +1082,35 @@ func validateLocalManifest(m *LocalManifest) error {
 	// by omitting a per-case gate.
 	if err := checkExperimentalTokenStaging(m); err != nil {
 		return err
+	}
+	return nil
+}
+
+// validateTypedCondition folds one condition type's value and pointer decode forms into a
+// single validation arm: it normalizes cond to *T for the type's validator, then runs the
+// type's load-time Compile.
+//
+// The "Compile only on the POINTER form" rule is enforced by the type system rather than
+// remembered per arm. Compile has a pointer receiver on every condition that defines one,
+// so a cond holding the VALUE form does not satisfy this interface at all — while
+// AsValueOrPointer's *T is a pointer to a COPY for that form, and compiling it would build
+// state the engine never reads. A condition type with no Compile simply does not match.
+func validateTypedCondition[T any](i, j int, cond capability.Condition, validate func(int, int, *T) error) error {
+	v, ok := capability.AsValueOrPointer[T](cond)
+	if !ok {
+		// Unreachable: the caller's type switch already matched T or *T.
+		return fmt.Errorf("capability at index %d, condition %d: internal: condition is not %T", i, j, v)
+	}
+	if err := validate(i, j, v); err != nil {
+		return err
+	}
+	if c, compilable := cond.(interface{ Compile() error }); compilable {
+		// Compile cannot fail for any condition in tree (each validator already confirmed
+		// its inputs parse); the error is still checked so a future normalization that CAN
+		// fail is caught at load rather than silently skipped.
+		if err := c.Compile(); err != nil {
+			return fmt.Errorf("capability at index %d, condition %d: %w", i, j, err)
+		}
 	}
 	return nil
 }
