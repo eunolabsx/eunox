@@ -59,6 +59,30 @@ Section conventions:
 
 ### Changed
 
+- **The refusal-record rate limiter's rollup now names its own scope**, and moved off a
+  key it shared with an unrelated statistic. Transport-surface refusals (`AUTH_FAILED`,
+  `ORIGIN_REJECTED`, `JWT_INVALID`, `LOOPBACK_REJECTED`, …) are the only audit writes an
+  unauthenticated caller can trigger, so their rate is bounded by a token bucket and the
+  next admitted record carries the count elided since. That bucket is **proxy-wide by
+  design** — one bucket is what bounds the sustained write rate into the single shared
+  audit queue, and a per-route split would multiply the rate an attacker can drive by the
+  size of the route table — so its tally is folded into whichever record is admitted next,
+  whatever that record's route or category. The **session cap** is both rate-limited and
+  written through the route's sink, making it the one record that could pair an
+  `upstream`/`policy_version`/`policy_sha256` stamp with a count spanning every route: a
+  bearer-token spray against `/mcp/routeA` (refused before route resolution, attributable
+  to no route) surfaced as a five-figure count on a `RESOURCE_EXHAUSTED` record reading
+  `upstream: routeB`, which a SIEM rule keyed on route + code reads as saturation against
+  routeB's policy digest. Every rolled-up record now carries
+  `details.suppressed_refusal_scope: "proxy"`, so the number is never inferred from the
+  stamp beside it.
+  **Breaking for log consumers:** the count itself moved from `details.suppressed_count`
+  to `details.suppressed_refusal_count`. The bare key names the unrelated `*/list` filter
+  statistic (catalog entries the manifest hid) in the same `details` object, so a query
+  written against it matched both routine policy filtering on an `allow` and an
+  unauthenticated refusal flood on a `deny`. Update any rule that reads the refusal rollup;
+  a rule that reads the `*/list` statistic is unaffected. See `docs/threat-model-mcp.md`
+  §3.7 and `docs/conformance.md`.
 - **`eunox audit-verify` is roughly 40% faster per record**, with no change to what it
   accepts or rejects. It is the tool an incident responder points at a full retained
   archive, so its per-record cost is paid exactly when the record count is largest and

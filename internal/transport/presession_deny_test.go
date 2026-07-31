@@ -50,6 +50,88 @@ func TestPreSessionDenyLimiter_BoundsBurstAndCountsSuppressed(t *testing.T) {
 	}
 }
 
+// TestRefusalRollup_NamesItsScopeOnARouteStampedRecord pins the fix for the one record
+// shape where the rollup's scope and the record's own stamp disagree.
+//
+// The tally is proxy-wide: one bucket bounds the write rate into the single shared audit
+// queue, so a suppressed refusal is folded into whichever record is admitted next,
+// whatever its route or category. Exactly one refusal is BOTH route-stamped and fed by
+// that bucket — the session cap — so a bearer-token spray refused before route resolution
+// (attributable to no route at all) can surface as a five-figure count on a record reading
+// `upstream: github`, `denial_code: RESOURCE_EXHAUSTED`. A SIEM rule or an operator keyed
+// on route + code then reads thousands of saturation refusals against github's policy
+// digest when github saw one. The count now names its own scope, so nothing is inferred
+// from the stamp beside it.
+func TestRefusalRollup_NamesItsScopeOnARouteStampedRecord(t *testing.T) {
+	sink, logPath := newTempAuditSink(t)
+	base := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	now := base
+	lim := newPreSessionDenyLimiter()
+	lim.now = func() time.Time { return now }
+	proxy := &HTTPProxy{sink: sink, preSessionDenies: lim}
+	route := &UpstreamRoute{
+		name: "github",
+		sink: &routeSink{sink: sink, upstream: "github", policyVersion: "1.2.3", policySHA256: "sha256:abc"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/mcp/github", http.NoBody)
+
+	// Spray the UNROUTED path. A bad bearer token is refused before route resolution, so
+	// none of this is attributable to github — or to any route.
+	const attempts = 5000
+	for i := 0; i < attempts; i++ {
+		proxy.recordPreSessionDeny(req, codeAuthFailed, "auth", nil)
+	}
+	// Refill one second of tokens, then let the session cap be the next record admitted.
+	now = base.Add(time.Second)
+	proxy.recordSessionCapDeny(req, route)
+
+	_ = sink.Close()
+	rec := findAuditRecordByCode(readAuditRecords(t, logPath), codeResourceExhausted)
+	if rec == nil {
+		t.Fatal("expected a RESOURCE_EXHAUSTED record for the session-cap refusal")
+	}
+	details, _ := rec["details"].(map[string]interface{})
+	if details == nil {
+		t.Fatal("the session-cap record must carry details")
+	}
+	want := float64(attempts - preSessionDenyBurst)
+	if got := details[detailSuppressedRefusalCount]; got != want {
+		t.Fatalf("%s = %v, want %v — the suppressed refusals must be folded into the next admitted record", detailSuppressedRefusalCount, got, want)
+	}
+	if got := details[detailSuppressedRefusalScope]; got != suppressedScopeProxy {
+		t.Errorf("%s = %v, want %q — a route-stamped record must state that its tally spans the proxy, not the route it names", detailSuppressedRefusalScope, got, suppressedScopeProxy)
+	}
+	// The record still carries its route stamp: naming the scope is what makes the two
+	// coexist, so this must not have been "fixed" by dropping the attribution instead.
+	if got, _ := rec["upstream"].(string); got != "github" {
+		t.Errorf("upstream = %q, want the route name — the stamp must survive alongside the rollup", got)
+	}
+	// The bare key belongs to an unrelated statistic: a */list ALLOW record reports
+	// suppressed_count as the entries the manifest hid. A query written against it must not
+	// also match an unauthenticated refusal flood.
+	if _, collides := details["suppressed_count"]; collides {
+		t.Errorf("the refusal rollup must not reuse suppressed_count, which names the */list filter statistic; got details %v", details)
+	}
+}
+
+// TestPreSessionDenyLimiter_SuppressedScopeIsReadFromTheCounter pins that the scope stamped
+// on a record comes from the limiter that owns the counter, not a literal at the record
+// site — so a limiter given a narrower reach cannot leave a stale scope behind on the
+// records it feeds. A limiter built outside the constructor reports the proxy scope rather
+// than writing an empty string into a signed field.
+func TestPreSessionDenyLimiter_SuppressedScopeIsReadFromTheCounter(t *testing.T) {
+	t.Parallel()
+	if got := newPreSessionDenyLimiter().suppressedScope(); got != suppressedScopeProxy {
+		t.Errorf("constructed limiter scope = %q, want %q", got, suppressedScopeProxy)
+	}
+	if got := (&preSessionDenyLimiter{}).suppressedScope(); got != suppressedScopeProxy {
+		t.Errorf("zero-value limiter scope = %q, want %q — an empty scope must never reach a signed record", got, suppressedScopeProxy)
+	}
+	if got := (&preSessionDenyLimiter{scope: "route"}).suppressedScope(); got != "route" {
+		t.Errorf("scope = %q, want it read from the limiter so a narrower counter reports its own reach", got)
+	}
+}
+
 // TestPreSessionDenyLimiter_RefillIsRateBounded pins that sustained pressure is served at
 // the configured rate rather than the caller's rate.
 func TestPreSessionDenyLimiter_RefillIsRateBounded(t *testing.T) {

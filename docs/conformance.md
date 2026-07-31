@@ -389,7 +389,9 @@ tamper-evident tape):
   entries. The enumeration is recorded as an allow record carrying filter
   statistics (`upstream_count`, `filtered_count`, `suppressed_count`) so an
   auditor can tell an empty client view caused by policy filtering from a
-  genuinely empty upstream.
+  genuinely empty upstream. Here `suppressed_count` means catalog entries the
+  manifest hid; the refusal rate limiter's unrelated rollup is spelled
+  `suppressed_refusal_count` (below) so a query cannot match both.
 - **Upstream-initiated non-sampling requests** (e.g. `roots/list`,
   `elicitation/create`, upstream-initiated `tasks/*`; local subprocess upstreams)
   — not policy-enforced (no allow/deny decision), but kill-switch-checked,
@@ -414,12 +416,32 @@ tamper-evident tape):
   These are the only records an *unauthenticated* caller can cause, so their
   write rate is bounded by a token bucket: within a burst each refusal is
   recorded in full, and beyond it the next record that gets through carries a
-  `suppressed_count` of the refusals elided since. Without that bound a
+  `suppressed_refusal_count` of the refusals elided since. Without that bound a
   credential-spray could overflow the audit queue, and because the sink's drop
   counter is monotonic, that would leave `--require-audit=strict` denying every
   legitimate request for the rest of the process's life. A non-zero
-  `suppressed_count` on one of these codes therefore means a flood, not a lost
-  decision record — no *policy* decision is ever rate-limited.
+  `suppressed_refusal_count` on one of these codes therefore means a flood, not a
+  lost decision record — no *policy* decision is ever rate-limited.
+
+  **Read the count as proxy-wide.** One bucket bounds the write rate into the
+  single shared audit queue — splitting it per route would multiply the rate an
+  attacker can drive by the size of the route table — so a suppressed refusal is
+  folded into whichever record is admitted next, regardless of its route or
+  category. That matters for exactly one record shape: the **session cap** is
+  both rate-limited and written through the route's sink, so it can carry an
+  `upstream` / `policy_version` / `policy_sha256` stamp alongside a tally that
+  spans every route. A bearer-token spray against `/mcp/routeA` (refused before
+  route resolution, so attributable to no route) can therefore surface on a
+  `RESOURCE_EXHAUSTED` record reading `upstream: routeB`. Every rolled-up record
+  states its scope in `suppressed_refusal_scope` (`"proxy"`) so nothing has to be
+  inferred from the stamp beside it: a rule keyed on route + code must not treat
+  the number as route-scoped.
+
+  The key is `suppressed_refusal_count`, not a bare `suppressed_count` — that
+  name belongs to the unrelated `*/list` filter statistic above (entries the
+  manifest hid), which rides in the same `details` object on `allow` records. The
+  two are disjoint by decision and method, but a query written against the bare
+  key matches both routine policy filtering and an unauthenticated refusal flood.
 
 The only locally-answered path with no audit record is the `initialize`
 handshake, which is not a guarded action. Every other locally-answered path —
