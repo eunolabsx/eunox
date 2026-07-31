@@ -417,15 +417,26 @@ Redis kill-switch backend is degraded (see below).
 
 `eunox_audit_maintenance_stalled` / `auditMaintenanceStalled` is a third,
 different signal: `1` means size-triggered rotation or retention pruning has
-stopped making progress — the log directory cannot be listed, or the oldest
-rotated file cannot be deleted. **No records are lost**, so this deliberately
-does not gate traffic the way the two counters above feed
-`--require-audit=strict`. What it means is that `audit.rotateSizeBytes` and
-`audit.retainRotated` are currently unenforced and the log will grow until the
-underlying fault is fixed — at which point the volume fills, writes *do* start
-failing, and strict mode denies everything. Alert on it as a disk-capacity
-warning, not an audit-integrity one; `auditMaintenanceReason` on `/healthz`
-names the file or directory to fix.
+stopped making progress — on the rotation side, the log directory cannot be
+listed, no free rotated name can be established, the active log cannot be
+renamed or reopened, or a just-renamed sidecar cannot be synced before the
+reopen; on the retention side, the rotated siblings cannot be listed, or the
+oldest cannot be deleted. **No records are lost**, so this deliberately does not
+gate traffic the way the two counters above feed `--require-audit=strict`. What
+it means is that `audit.rotateSizeBytes` and/or `audit.retainRotated` are
+currently unenforced and the log will grow until the underlying fault is fixed —
+at which point the volume fills, writes *do* start failing, and strict mode
+denies everything. Alert on it as a disk-capacity warning, not an
+audit-integrity one.
+
+Rotation and retention stall **independently** — one can be wedged while the
+other runs normally — so `auditMaintenanceReason` on `/healthz` reports each
+stalled subsystem separately, prefixed `rotation deferred:` or `retention
+stalled:` and joined with `; ` when both are. Each reason names the file or
+directory to fix and which bound (size or retention) is going unenforced. A
+subsystem stops being reported as soon as one of its own passes succeeds, so a
+transient fault — or one an operator fixes by hand — clears itself without a
+restart, and a recovery in one subsystem never clears the other's stall.
 
 **Multiple instances need Redis.** The call-counter (`maxCalls`) and kill-switch
 state are in-memory and **per-process** by default. Run more than one instance
