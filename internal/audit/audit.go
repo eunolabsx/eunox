@@ -1087,10 +1087,7 @@ func readLastAuditLine(path string) (string, error) {
 	// line-scan ceiling must agree, or a record one reader accepts is one the other
 	// truncates.
 	size := info.Size()
-	start := int64(0)
-	if size > auditScanBufferBytes {
-		start = size - auditScanBufferBytes
-	}
+	start := tailWindowStart(size, auditScanBufferBytes)
 	buf := make([]byte, size-start)
 	n, err := f.ReadAt(buf, start)
 	if err != nil && err != io.EOF {

@@ -1338,25 +1338,18 @@ func (e *Engine) EvaluateConditions(ctx context.Context, req *capability.Enforce
 	return e.evaluateMatched(ctx, req, matched, requestID, now)
 }
 
-// CollectObligations turns the matched constraint's directives into the
-// post-allow obligations the transport applies to the upstream response. It runs
-// only on the allow path; a directive MUST NOT change the allow/deny decision.
-//
-// It returns a fail-closed deny when it meets a directive type it cannot translate
-// into an obligation, since silently dropping it would forward the response
-// without a declared post-processing step (e.g. an un-applied redaction leaks the
-// field). redactFields is the only type today and the loader rejects any other,
-// so this is a maintenance guard surfacing a new unwired directive as a hard deny.
-//
-// The deny is a hard ENFORCEMENT_ERROR and deliberately NOT AuditOnly even under
-// an audit-mode constraint: an unwired directive is an engine bug, not a policy
-// verdict, so "fail closed on ambiguity" wins over "audit never blocks".
 // knownObligationTypes is the set of obligation types the forward core handles.
-// CollectObligations fails closed (ENFORCEMENT_ERROR) for any obligation type
-// not listed here, so a new directive whose ToObligation returns an unrecognized
-// type is caught at policy-evaluation time rather than silently passing through
-// to an unhandled path. Register both the obligation type AND its handler in
-// ApplyRedactObligs (or the analogous consumer) when adding a new directive.
+// CollectObligations fails closed (ENFORCEMENT_ERROR) for any obligation type not
+// listed here, so a new directive whose ToObligation returns an unrecognized type is
+// caught at policy-evaluation time rather than silently passing through to an
+// unhandled path — silently dropping it would forward the response without a declared
+// post-processing step (e.g. an un-applied redaction leaks the field). Register both
+// the obligation type AND its handler in ApplyRedactObligs (or the analogous consumer)
+// when adding a new directive.
+//
+// That deny is a hard ENFORCEMENT_ERROR and deliberately NOT AuditOnly even under an
+// audit-mode constraint: an unwired directive is an engine bug, not a policy verdict,
+// so "fail closed on ambiguity" wins over "audit never blocks".
 var knownObligationTypes = map[string]bool{
 	capability.DirectiveTypeRedactFields: true,
 }

@@ -1785,10 +1785,12 @@ func decodeOrderedObject(b []byte) (keys []string, values map[string]json.RawMes
 			return nil, nil, fmt.Errorf("list envelope carries ambiguous top-level keys %q and %q (they differ only by case fold, so a host may render a different value than this proxy filtered)", prior, key)
 		}
 		folded[fk] = key
-		if _, dup := values[key]; !dup {
-			keys = append(keys, key)
-		}
-		values[key] = raw // last value wins on a duplicate key, matching encoding/json
+		// No duplicate check on `values` here: an EXACT duplicate necessarily collides in
+		// `folded` two lines above (a key folds to itself) and has already been rejected,
+		// so every key that reaches this point is new. Guarding it would suggest duplicates
+		// are tolerated, when refusing them is the load-bearing behavior.
+		keys = append(keys, key)
+		values[key] = raw
 	}
 	if _, err := dec.Token(); err != nil { // closing '}'
 		return nil, nil, err

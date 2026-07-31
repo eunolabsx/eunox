@@ -117,8 +117,11 @@ func resolveTarget(targetType, target string) (namespace, bare string) {
 }
 
 // computeSuggestions scans an audit JSONL stream and aggregates per-target
-// observations. Malformed and blank lines are skipped (consistent with
-// computeAuditStats) so a partial or schema-drifted tape still yields a draft.
+// observations. Malformed and blank lines are SKIPPED so a partial or schema-drifted
+// tape still yields a draft. That is deliberately not what computeAuditStats does with
+// a malformed line — stats counts it in its "other" bucket, because its job is to make
+// the totals reconcile against the tape, while this one's job is to propose policy and
+// a line it cannot decode names no target to propose anything about.
 // maxValues bounds how many distinct values mineArgs retains per argument
 // during collection (see resolveMaxValues); it must match the value later
 // passed to renderSuggestedManifest so the collection cap and the render-time

@@ -338,7 +338,7 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 				// the tape carries the stable DRIFT_REFUSED category, matching the
 				// JWT_INVALID fixed-code-not-free-form-prose discipline. p.rec() is nil when
 				// no audit sink is configured (guard, as elsewhere).
-				recordDriftRefused(ctx, asRecorder(p.rec()), p.sessionID)
+				recordDriftRefused(ctx, p.rec(), p.sessionID)
 				return err
 			}
 		}

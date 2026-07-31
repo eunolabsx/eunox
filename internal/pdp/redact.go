@@ -610,24 +610,23 @@ func redactSiblingTopLevelKeys(result map[string]interface{}, paths []string) (b
 //     first anchoring alone would forward it. Deliberate over-redaction: masking a field
 //     the manifest named, at a position it did not name, is the safe direction for a DLP
 //     obligation, whereas the reverse leaks.
-func redactSiblingValue(key string, val interface{}, paths []string) (interface{}, bool, error) {
-	changed := false
+func redactSiblingValue(key string, val interface{}, paths []string) (replacement interface{}, changed bool, err error) {
 	// Envelope-relative first: a string leaf redacted under one anchoring is fed to the
 	// next, so both apply to the same (possibly already re-serialized) blob.
 	for _, prefix := range []string{key, ""} {
 		switch v := val.(type) {
 		case map[string]interface{}, []interface{}:
-			c, err := redactStructuredContentValue(v, paths, prefix, 0)
-			if err != nil {
-				return nil, false, err // fail closed
+			c, cerr := redactStructuredContentValue(v, paths, prefix, 0)
+			if cerr != nil {
+				return nil, false, cerr // fail closed
 			}
 			if c {
 				changed = true
 			}
 		case string:
-			out, c, err := redactContainerString(v, paths, prefix, 0)
-			if err != nil {
-				return nil, false, err // fail closed
+			out, c, cerr := redactContainerString(v, paths, prefix, 0)
+			if cerr != nil {
+				return nil, false, cerr // fail closed
 			}
 			if c {
 				val = out
