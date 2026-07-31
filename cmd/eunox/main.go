@@ -752,6 +752,14 @@ func sessionKillTTLNotice(ttl time.Duration) string {
 // the sink. Under --require-audit an open failure is returned as an error for the
 // caller to exit on (fail closed); otherwise it warns and returns a nil sink with a
 // nil error, so the proxy continues unaudited.
+// warnAuditFlagOverridden prints the shared "config wins over an explicit --audit-* flag"
+// warning for `proxy`, where the audit block always takes precedence so every route
+// shares one tape. flagRepr/cfgRepr are the already-formatted (%q for strings, %d for
+// ints) values, since the four callers' fields differ in type.
+func warnAuditFlagOverridden(flagName, flagRepr, cfgField, cfgRepr string) {
+	fmt.Fprintf(os.Stderr, "[eunox] WARNING: %s %s is overridden by the config's %s %s; the config's audit block always takes precedence for `proxy` so every route shares one tape.\n", flagName, flagRepr, cfgField, cfgRepr)
+}
+
 func openConfiguredAuditSink(auditLog, auditKeyPath string, auditRotateSize int64, auditRetainRotated int, auditRetainSet bool, cfg *config.GatewayConfig, requireAudit bool) (*audit.Sink, error) {
 	auditLogPath, auditKey, auditRotate := auditLog, auditKeyPath, auditRotateSize
 	auditRetain := auditRetainRotated
@@ -765,13 +773,13 @@ func openConfiguredAuditSink(auditLog, auditKeyPath string, auditRotateSize int6
 	// why it wasn't.
 	if cfg.Audit.Log != "" {
 		if auditLog != "" && auditLog != cfg.Audit.Log {
-			fmt.Fprintf(os.Stderr, "[eunox] WARNING: --audit-log %q is overridden by the config's audit.log %q; the config's audit block always takes precedence for `proxy` so every route shares one tape.\n", auditLog, cfg.Audit.Log)
+			warnAuditFlagOverridden("--audit-log", fmt.Sprintf("%q", auditLog), "audit.log", fmt.Sprintf("%q", cfg.Audit.Log))
 		}
 		auditLogPath = cfg.Audit.Log
 	}
 	if cfg.Audit.KeyPath != "" {
 		if auditKeyPath != "" && auditKeyPath != cfg.Audit.KeyPath {
-			fmt.Fprintf(os.Stderr, "[eunox] WARNING: --audit-key-path %q is overridden by the config's audit.keyPath %q; the config's audit block always takes precedence for `proxy` so every route shares one tape.\n", auditKeyPath, cfg.Audit.KeyPath)
+			warnAuditFlagOverridden("--audit-key-path", fmt.Sprintf("%q", auditKeyPath), "audit.keyPath", fmt.Sprintf("%q", cfg.Audit.KeyPath))
 		}
 		auditKey = cfg.Audit.KeyPath
 	}
@@ -784,7 +792,7 @@ func openConfiguredAuditSink(auditLog, auditKeyPath string, auditRotateSize int6
 		// 0 is this flag's "use the built-in default" spelling, so a non-zero value is an
 		// explicit one (same test the string flags use against "").
 		if auditRotateSize > 0 && auditRotateSize != cfg.Audit.RotateSizeBytes {
-			fmt.Fprintf(os.Stderr, "[eunox] WARNING: --audit-rotate-size %d is overridden by the config's audit.rotateSizeBytes %d; the config's audit block always takes precedence for `proxy` so every route shares one tape.\n", auditRotateSize, cfg.Audit.RotateSizeBytes)
+			warnAuditFlagOverridden("--audit-rotate-size", fmt.Sprintf("%d", auditRotateSize), "audit.rotateSizeBytes", fmt.Sprintf("%d", cfg.Audit.RotateSizeBytes))
 		}
 		auditRotate = cfg.Audit.RotateSizeBytes
 	}
@@ -798,7 +806,7 @@ func openConfiguredAuditSink(auditLog, auditKeyPath string, auditRotateSize int6
 	// a MEANINGFUL setting here ("keep all"), so an operator can be overridden while
 	// passing the flag's zero value.
 	if cfg.Audit.RetainRotated != nil && auditRetainSet && *cfg.Audit.RetainRotated != auditRetain {
-		fmt.Fprintf(os.Stderr, "[eunox] WARNING: --audit-retain %d is overridden by the config's audit.retainRotated %d; the config's audit block always takes precedence for `proxy` so every route shares one tape.\n", auditRetain, *cfg.Audit.RetainRotated)
+		warnAuditFlagOverridden("--audit-retain", fmt.Sprintf("%d", auditRetain), "audit.retainRotated", fmt.Sprintf("%d", *cfg.Audit.RetainRotated))
 	}
 	auditRetain = config.ResolveInt(cfg.Audit.RetainRotated, auditRetain)
 	sink, err := audit.Open(auditLogPath, auditKey, auditRotate, auditRetain, audit.WithIdentity(pdp.AuditIdentityFromContext))
