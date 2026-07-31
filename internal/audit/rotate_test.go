@@ -1290,9 +1290,9 @@ func TestRetryRotateReopenStillFailing(t *testing.T) {
 
 // TestPruneRotated_ClearsResolvedStallWithoutADelete is the stuck-status regression: a
 // retention stall that an operator resolves by removing the undeletable file BY HAND
-// must stop being reported. The clear used to sit only after the delete loop, so a pass
-// that found retention already satisfied returned early and left /healthz and doctor
-// reporting the stale reason until the process restarted.
+// must stop being reported. The healthy report used to sit only after the delete loop, so
+// a pass that found retention already satisfied returned early and left /healthz and
+// doctor reporting the stale reason until the process restarted.
 func TestPruneRotated_ClearsResolvedStallWithoutADelete(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -1304,9 +1304,9 @@ func TestPruneRotated_ClearsResolvedStallWithoutADelete(t *testing.T) {
 	if err := os.WriteFile(sib, []byte(`{"seq":1}`+"\n"), 0o600); err != nil {
 		t.Fatalf("write sibling: %v", err)
 	}
-	s.markMaintenanceStalled("retention stalled: an older sibling could not be deleted")
+	s.setMaintenanceStatus(maintenanceRetention, "an older sibling could not be deleted")
 	if stalled, _ := s.MaintenanceStalled(); !stalled {
-		t.Fatal("markMaintenanceStalled did not take effect")
+		t.Fatal("setMaintenanceStatus did not take effect")
 	}
 
 	s.pruneRotated()
@@ -1316,46 +1316,214 @@ func TestPruneRotated_ClearsResolvedStallWithoutADelete(t *testing.T) {
 	}
 }
 
-// TestPruneRotated_RetentionDisabledLeavesTheFlagAlone: with retention off there is no
-// retention stall to be in (the only setter requires retain > 0), and the flag is shared
-// with the rotation-ordinal deferral — so this pass must not write it at all. Clearing
-// unconditionally would erase a rotation stall while the size bound went unenforced.
-func TestPruneRotated_RetentionDisabledLeavesTheFlagAlone(t *testing.T) {
+// TestPruneRotated_RetentionDisabledLeavesRotationStalled: with retention off there is no
+// retention bound to enforce, so this pass reports retention healthy — and that report
+// must not touch the rotation status. When the status was one shared flag this was the
+// cross-subsystem write that would erase a live rotation stall while the size bound went
+// unenforced; keying the status by subsystem is what makes it structurally impossible.
+func TestPruneRotated_RetentionDisabledLeavesRotationStalled(t *testing.T) {
 	t.Parallel()
 	s := &Sink{logPath: filepath.Join(t.TempDir(), "audit.jsonl"), retain: 0}
-	s.markMaintenanceStalled("rotation deferred: the sibling directory cannot be listed")
+	s.setMaintenanceStatus(maintenanceRotation, "the sibling directory cannot be listed")
 
 	s.pruneRotated()
 
-	if stalled, _ := s.MaintenanceStalled(); !stalled {
+	stalled, reason := s.MaintenanceStalled()
+	if !stalled {
 		t.Fatal("retention pruning must not clear a stall belonging to rotation")
+	}
+	if !strings.Contains(reason, "rotation deferred") {
+		t.Errorf("reason = %q, want it to still name the rotation stall", reason)
 	}
 }
 
-// TestPruneRotated_ListFailureLeavesStallReported: a listing failure leaves retention's
-// true state unknown, so it must NOT clear a stall — only a pass that positively
-// establishes retention is satisfied may do that.
-func TestPruneRotated_ListFailureLeavesStallReported(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("running as root bypasses file permission bits")
+// TestPruneRotated_HealthyPassLeavesRotationStalled is the same cross-subsystem guarantee
+// on the path that actually establishes retention health: a prune that finds its own
+// bound satisfied reports retention healthy, and the rotation stall beside it must
+// survive. Under the shared flag this pass silently cleared it, and /healthz went green
+// while rotation was still deferred and the log still growing.
+func TestPruneRotated_HealthyPassLeavesRotationStalled(t *testing.T) {
+	t.Parallel()
+	logPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	s := &Sink{logPath: logPath, activePath: logPath, retain: 2}
+	sib := logPath + ".00000000000000000001.20260101T000000.000000000Z"
+	if err := os.WriteFile(sib, []byte(`{"seq":1}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write sibling: %v", err)
 	}
-	dir := t.TempDir()
-	logDir := filepath.Join(dir, "logs")
-	if err := os.Mkdir(logDir, 0o700); err != nil {
-		t.Fatalf("mkdir log dir: %v", err)
-	}
-	logPath := filepath.Join(logDir, "audit.jsonl")
-	if err := os.Chmod(logDir, 0o300); err != nil {
-		t.Fatalf("chmod log dir: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(logDir, 0o700) })
-
-	s := &Sink{logPath: logPath, activePath: logPath, retain: 1}
-	s.markMaintenanceStalled("retention stalled: an older sibling could not be deleted")
+	s.setMaintenanceStatus(maintenanceRotation, "the sibling directory cannot be listed")
 
 	s.pruneRotated()
 
-	if stalled, _ := s.MaintenanceStalled(); !stalled {
-		t.Fatal("a listing failure must leave the stall reported: retention's state is unknown, not healthy")
+	stalled, reason := s.MaintenanceStalled()
+	if !stalled {
+		t.Fatal("a healthy retention pass must not clear a stall belonging to rotation")
+	}
+	if !strings.Contains(reason, "rotation deferred") {
+		t.Errorf("reason = %q, want it to still name the rotation stall", reason)
+	}
+}
+
+// TestPruneRotated_ListFailureMarksRetentionStall is the never-marked-at-all regression.
+// If the log directory becomes unlistable AFTER Open, rotation keeps working (rotatedPath
+// needs only Lstat once the ordinal seed is certain) while every prune pass fails to
+// enumerate: retention never runs, rotated siblings accumulate until the volume fills, and
+// this exit used to return after one stderr line without reporting anything — so /healthz,
+// /metrics and doctor all stayed green through exactly the condition the mechanism exists
+// to surface. The pass must mark a retention stall from a clean status, not merely leave a
+// pre-existing one standing.
+func TestPruneRotated_ListFailureMarksRetentionStall(t *testing.T) {
+	t.Parallel()
+	// A log directory that does not exist makes the listing fail deterministically, as
+	// root too (a missing dir, not a permission bit).
+	logPath := filepath.Join(t.TempDir(), "gone", "audit.jsonl")
+	s := &Sink{logPath: logPath, activePath: logPath, retain: 1}
+
+	s.pruneRotated()
+
+	stalled, reason := s.MaintenanceStalled()
+	if !stalled {
+		t.Fatal("a listing failure must be reported: retention cannot run, so its bound is going unenforced")
+	}
+	if !strings.Contains(reason, "retention stalled") {
+		t.Errorf("reason = %q, want it to name the retention subsystem", reason)
+	}
+	if !strings.Contains(reason, logPath) {
+		t.Errorf("reason = %q, want it to name the log path an operator has to fix", reason)
+	}
+}
+
+// TestPruneRotated_ListFailureLeavesRotationStalled: the newly-added retention mark must
+// stay keyed to retention. A listing failure reported as a bare "maintenance stalled"
+// would be indistinguishable from the rotation stall it can coexist with, and both
+// bounds are unenforced here, so both must be named.
+func TestPruneRotated_ListFailureLeavesRotationStalled(t *testing.T) {
+	t.Parallel()
+	logPath := filepath.Join(t.TempDir(), "gone", "audit.jsonl")
+	s := &Sink{logPath: logPath, activePath: logPath, retain: 1}
+	s.setMaintenanceStatus(maintenanceRotation, "the sibling directory cannot be listed")
+
+	s.pruneRotated()
+
+	stalled, reason := s.MaintenanceStalled()
+	if !stalled {
+		t.Fatal("both subsystems are stalled, so the status must report stalled")
+	}
+	for _, want := range []string{"rotation deferred", "retention stalled"} {
+		if !strings.Contains(reason, want) {
+			t.Errorf("reason = %q, want it to name %q: both bounds are unenforced", reason, want)
+		}
+	}
+}
+
+// TestMaintenanceStatus_KeyedPerSubsystem pins the contract the two legs rely on: each
+// subsystem's status is independent, a healthy report clears only its own key, and the
+// combined reason is ordered by subsystem rather than by which fault landed last (so
+// /healthz text depends on what is wrong, not on the order it went wrong in).
+func TestMaintenanceStatus_KeyedPerSubsystem(t *testing.T) {
+	t.Parallel()
+	s := &Sink{}
+
+	if stalled, reason := s.MaintenanceStalled(); stalled || reason != "" {
+		t.Fatalf("a fresh sink must be healthy: stalled=%v reason=%q", stalled, reason)
+	}
+
+	// Retention stalls second, rotation first: the report must still order them
+	// rotation-then-retention.
+	s.setMaintenanceStatus(maintenanceRetention, "a sibling cannot be deleted")
+	s.setMaintenanceStatus(maintenanceRotation, "the ordinal cannot be seeded")
+	stalled, reason := s.MaintenanceStalled()
+	if !stalled {
+		t.Fatal("two stalled subsystems must report stalled")
+	}
+	rotIdx := strings.Index(reason, "rotation deferred")
+	retIdx := strings.Index(reason, "retention stalled")
+	if rotIdx < 0 || retIdx < 0 {
+		t.Fatalf("reason = %q, want both subsystems named", reason)
+	}
+	if rotIdx > retIdx {
+		t.Errorf("reason = %q, want a fixed rotation-then-retention order, not newest-first", reason)
+	}
+
+	// Clearing one leaves the other exactly as it was.
+	s.setMaintenanceStatus(maintenanceRotation, "")
+	stalled, reason = s.MaintenanceStalled()
+	if !stalled {
+		t.Fatal("clearing rotation must not clear retention")
+	}
+	if strings.Contains(reason, "rotation deferred") {
+		t.Errorf("reason = %q, want the cleared rotation stall gone", reason)
+	}
+	if !strings.Contains(reason, "a sibling cannot be deleted") {
+		t.Errorf("reason = %q, want retention's reason preserved verbatim", reason)
+	}
+
+	// Clearing the last one returns the sink to healthy, summary flag included.
+	s.setMaintenanceStatus(maintenanceRetention, "")
+	if stalled, reason := s.MaintenanceStalled(); stalled || reason != "" {
+		t.Fatalf("clearing every subsystem must report healthy: stalled=%v reason=%q", stalled, reason)
+	}
+	if s.maintenanceStalled.Load() {
+		t.Error("the lock-free summary flag must be recomputed to false when no subsystem is stalled")
+	}
+}
+
+// TestRotatedPath_ClearsRotationStallLeavingRetentionStalled is the mirror of the prune
+// tests: a rotation that recovers reports rotation healthy at its single exit, and must
+// leave a retention stall standing. Retention is the leg that is still failing there —
+// clearing it would hide an accumulating-sibling fault behind an unrelated success.
+func TestRotatedPath_ClearsRotationStallLeavingRetentionStalled(t *testing.T) {
+	t.Parallel()
+	logPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	fixed := time.Date(2026, 6, 22, 12, 0, 0, 0, time.UTC)
+	s := &Sink{logPath: logPath, now: func() time.Time { return fixed }}
+	s.setMaintenanceStatus(maintenanceRotation, "the ordinal cannot be seeded")
+	s.setMaintenanceStatus(maintenanceRetention, "a sibling cannot be deleted")
+
+	if _, err := s.rotatedPath(); err != nil {
+		t.Fatalf("rotatedPath: %v", err)
+	}
+
+	stalled, reason := s.MaintenanceStalled()
+	if !stalled {
+		t.Fatal("a successful rotation must not clear a stall belonging to retention")
+	}
+	if strings.Contains(reason, "rotation deferred") {
+		t.Errorf("reason = %q, want the recovered rotation stall cleared", reason)
+	}
+	if !strings.Contains(reason, "retention stalled") {
+		t.Errorf("reason = %q, want the retention stall still named", reason)
+	}
+}
+
+// TestRotatedPath_UnnameableTargetMarksRotationStall covers the other exit that used to
+// leave rotation's status stale: when no free rotated name can be established, rotate()
+// backs off and retries forever. Exhaustion by genuine collision is unreachable, but the
+// probe treats an Lstat failing for any reason other than "absent" as occupied, so a log
+// directory returning EACCES/EIO on every probe defers rotation as durably as an
+// unseedable ordinal while the seed itself looks fine.
+func TestRotatedPath_UnnameableTargetMarksRotationStall(t *testing.T) {
+	t.Parallel()
+	// A logPath whose parent is a regular FILE makes every Lstat probe fail with ENOTDIR
+	// rather than "absent", which is exactly how the ambiguous-probe fault presents: the
+	// backstop treats each candidate as occupied and exhausts. This reproduces it in
+	// microseconds and as root, without seeding maxRotateSuffix real files.
+	notADir := filepath.Join(t.TempDir(), "notadir")
+	if err := os.WriteFile(notADir, nil, 0o600); err != nil {
+		t.Fatalf("write blocking file: %v", err)
+	}
+	logPath := filepath.Join(notADir, "audit.jsonl")
+	fixed := time.Date(2026, 6, 22, 12, 0, 0, 0, time.UTC)
+	s := &Sink{logPath: logPath, now: func() time.Time { return fixed }}
+
+	if _, err := s.rotatedPath(); err == nil {
+		t.Fatal("rotatedPath must fail when no candidate name can be established as free")
+	}
+
+	stalled, reason := s.MaintenanceStalled()
+	if !stalled {
+		t.Fatal("a rotation that cannot name a target must be reported: the size bound is going unenforced")
+	}
+	if !strings.Contains(reason, "rotation deferred") {
+		t.Errorf("reason = %q, want it to name the rotation subsystem", reason)
 	}
 }

@@ -211,6 +211,26 @@ Section conventions:
 
 ### Fixed
 
+- **`eunox_audit_maintenance_stalled` stayed `0` through a retention fault that stopped
+  pruning entirely.** If the audit log's directory became unlistable *after* startup,
+  rotation kept working (it needs only an `Lstat` once its ordinal seed is certain) while
+  every prune pass failed to enumerate the rotated siblings — that exit logged one line to
+  stderr and returned without reporting anything, so retention never ran again, siblings
+  accumulated until the volume filled, and `/healthz`, `/metrics` and `doctor` showed
+  green through exactly the condition the signal exists to surface. It now reports a
+  retention stall, as does a rotation that cannot establish a free rotated name at all (an
+  `Lstat` that fails for any reason other than "absent" counts the candidate as occupied,
+  so a directory returning `EACCES`/`EIO` on every probe defers rotation as durably as an
+  unseedable ordinal while the ordinal seed itself looks healthy).
+- **A healthy retention pass could clear a live rotation stall.** Rotation and retention
+  wrote one shared stall flag, so every report of health was a cross-subsystem write and
+  the leg that finished last decided what the operator saw. The status is now keyed by
+  subsystem and each leg publishes it once, at the single exit that decided that pass's
+  outcome — so a recovery in one never erases the other's stall, and no early return can
+  leave a status stale. `auditMaintenanceReason` on `/healthz` correspondingly reports
+  every stalled subsystem, prefixed `rotation deferred:` or `retention stalled:` and
+  joined with `; ` when both are, in a fixed order rather than "whichever failed most
+  recently" — so an operator sees which of the two disk bounds is unenforced.
 - **`redactFields` missed a declared field inside a doubly-encoded blob under an
   unmodelled result key.** The walk over such a key anchored every dot-path at that
   key's *value*, so a multi-segment path never reached the blob the key names:

@@ -128,6 +128,39 @@ func hmacKeyID(key []byte) string {
 	return hex.EncodeToString(sum[:8])
 }
 
+// maintenanceSubsystem identifies which log-maintenance leg a stall belongs to.
+// Rotation and retention fail independently — one can be wedged while the other runs
+// normally — so each owns its own status slot rather than sharing one flag. A shared
+// flag made every clear a cross-subsystem write: whichever leg finished last decided
+// what the operator saw, so a healthy retention pass could erase a live rotation stall
+// (leaving the size bound unenforced and /healthz green) purely as an artifact of which
+// early return ran first.
+type maintenanceSubsystem int
+
+const (
+	// maintenanceRotation is size-triggered rotation. It stalls when the sibling
+	// directory cannot be listed, so a rotation ordinal cannot be seeded and rotation
+	// defers rather than stamp a stale-low ordinal (see rotatedPath).
+	maintenanceRotation maintenanceSubsystem = iota
+	// maintenanceRetention is retention pruning. It stalls when the rotated siblings
+	// cannot be listed, or when the oldest one cannot be unlinked and pruning stops to
+	// keep the retained chain contiguous (see pruneRotated).
+	maintenanceRetention
+	// numMaintenanceSubsystems sizes the per-subsystem reason array. Keep last.
+	numMaintenanceSubsystems
+)
+
+// maintenanceSubsystemLabels prefixes each subsystem's operator-facing reason, so which
+// bound is unenforced is named structurally rather than by every call site remembering to
+// say so in its own prose. Indexed by maintenanceSubsystem, so it MUST stay in lockstep
+// with the constants above. Rotation's label says "deferred" because deferring the
+// rotation is the deliberate, chain-preserving response to an unseedable ordinal; it is a
+// stall only once the fault persists.
+var maintenanceSubsystemLabels = [numMaintenanceSubsystems]string{
+	maintenanceRotation:  "rotation deferred",
+	maintenanceRetention: "retention stalled",
+}
+
 // Sink writes OCSF audit records to a JSONL file, signing each record with
 // HMAC-SHA256 using a per-installation key. Record does only struct
 // initialization and a non-blocking channel send; all serialization, signing,
@@ -225,23 +258,35 @@ type Sink struct {
 	// maintenanceStalled is set when size-triggered rotation or retention pruning has
 	// stopped making progress while record writing itself is still healthy: the sibling
 	// directory cannot be listed (so an ordinal cannot be seeded and rotation defers), or
-	// the oldest rotated file cannot be unlinked (so pruning stops to keep the retained
-	// chain contiguous). Both are deliberately non-fatal — deferring is what keeps the
-	// chain verifiable — but both silently void the configured disk bound, and the log
-	// then grows until the filesystem fills, at which point writes DO fail and
-	// --require-audit=strict denies everything. That end state is far worse than the
-	// warning, so the stall is surfaced while it is still just a stall.
+	// the rotated siblings cannot be listed / the oldest cannot be unlinked (so pruning
+	// stops to keep the retained chain contiguous). Both are deliberately non-fatal —
+	// deferring is what keeps the chain verifiable — but both silently void the configured
+	// disk bound, and the log then grows until the filesystem fills, at which point writes
+	// DO fail and --require-audit=strict denies everything. That end state is far worse
+	// than the warning, so the stall is surfaced while it is still just a stall.
 	//
 	// Deliberately NOT folded into AuditDegraded: that gate denies live traffic under
 	// --require-audit=strict, and a stalled rotation has lost no records — every decision
 	// is still being written and signed. This is a maintenance/readiness signal for
 	// /healthz, metrics, and doctor, not an enforcement input. Cleared when the operation
 	// next succeeds, so a transient fault self-heals in the reporting too.
+	//
+	// This field is the lock-free "at least one subsystem is stalled" summary of
+	// maintenanceStallReasons, so the /healthz and /metrics read costs one atomic load in
+	// the healthy case. It is DERIVED, never set on its own: setMaintenanceStatus is its
+	// only writer and recomputes it from the per-subsystem reasons while holding
+	// maintenanceStallMu, so it cannot disagree with what it summarizes.
 	maintenanceStalled atomic.Bool
-	// maintenanceStallReason carries the human-readable cause of maintenanceStalled.
-	// Guarded by its own mutex rather than an atomic.Value so an empty reason is cheap.
-	maintenanceStallMu     sync.Mutex
-	maintenanceStallReason string
+	// maintenanceStallReasons carries one human-readable stall reason per maintenance
+	// subsystem, indexed by maintenanceSubsystem; an empty entry means that subsystem is
+	// healthy. Keyed rather than shared so each leg owns its own status: a healthy
+	// retention pass cannot erase a live rotation stall, and an operator reading /healthz
+	// sees which of the two bounds is unenforced (both, when both are stalled). Guarded by
+	// its own mutex rather than an atomic.Value so a healthy status stays cheap. Written
+	// only by the drainer (rotation and pruning are drainer-only), read by any goroutine
+	// via MaintenanceStalled.
+	maintenanceStallMu      sync.Mutex
+	maintenanceStallReasons [numMaintenanceSubsystems]string
 
 	// wg tracks the drainer so Close can wait for it to flush.
 	wg sync.WaitGroup
@@ -1838,28 +1883,39 @@ func (s *Sink) DroppedRecords() int64 {
 	return s.dropped.Load()
 }
 
-// markMaintenanceStalled records that rotation or retention could not make progress.
-// Called on every failed attempt; the reason is overwritten so the newest cause wins.
-func (s *Sink) markMaintenanceStalled(reason string) {
-	if s == nil {
+// setMaintenanceStatus records sub's maintenance status: a non-empty reason marks that
+// subsystem stalled (overwriting any earlier reason, so the newest cause wins), and an
+// empty reason marks it healthy again, so a transient fault (a directory temporarily
+// unreadable, a file briefly locked) stops being reported.
+//
+// It is the ONLY writer of the maintenance status, and it writes exactly one subsystem's
+// slot, so a pass reporting its own health can never clear the other subsystem's stall.
+// Each maintenance pass calls it once, at a single exit that has decided that pass's
+// outcome, rather than sprinkling marks and clears across early returns where the next
+// return added will forget one. The lock-free summary flag is recomputed here from every
+// slot, never assigned independently.
+func (s *Sink) setMaintenanceStatus(sub maintenanceSubsystem, reason string) {
+	if s == nil || sub < 0 || sub >= numMaintenanceSubsystems {
 		return
 	}
-	s.maintenanceStalled.Store(true)
-	s.maintenanceStallMu.Lock()
-	s.maintenanceStallReason = reason
-	s.maintenanceStallMu.Unlock()
-}
-
-// clearMaintenanceStalled records that the stalled operation succeeded, so a transient
-// fault (a directory temporarily unreadable, a file briefly locked) stops being reported.
-func (s *Sink) clearMaintenanceStalled() {
-	if s == nil || !s.maintenanceStalled.Load() {
+	// Reporting health while nothing is stalled is the overwhelmingly common call (every
+	// successful rotation and prune), so skip the mutex for it.
+	if reason == "" && !s.maintenanceStalled.Load() {
 		return
 	}
-	s.maintenanceStalled.Store(false)
 	s.maintenanceStallMu.Lock()
-	s.maintenanceStallReason = ""
-	s.maintenanceStallMu.Unlock()
+	defer s.maintenanceStallMu.Unlock()
+	s.maintenanceStallReasons[sub] = reason
+	any := false
+	for _, r := range s.maintenanceStallReasons {
+		if r != "" {
+			any = true
+			break
+		}
+	}
+	// Store inside the lock so the summary and the reasons it derives from are published
+	// together: a reader that sees stalled==true always finds the reason that set it.
+	s.maintenanceStalled.Store(any)
 }
 
 // MaintenanceStalled reports whether size-triggered rotation or retention pruning has
@@ -1869,13 +1925,28 @@ func (s *Sink) clearMaintenanceStalled() {
 // rotateSizeBytes/retainRotated disk bound is currently not being enforced, so the log
 // will grow without limit until the underlying fault is fixed. Surfaced by /healthz,
 // /metrics, and doctor so an operator sees it before the filesystem fills.
+//
+// Rotation and retention stall independently, so both can be reported at once: the
+// reason names each stalled subsystem, joined in a fixed subsystem order (never
+// "whichever failed most recently") so the reported text depends only on what is
+// currently wrong, not on the order the faults appeared in.
 func (s *Sink) MaintenanceStalled() (stalled bool, reason string) {
 	if s == nil || !s.maintenanceStalled.Load() {
 		return false, ""
 	}
 	s.maintenanceStallMu.Lock()
 	defer s.maintenanceStallMu.Unlock()
-	return true, s.maintenanceStallReason
+	var parts []string
+	for sub, r := range s.maintenanceStallReasons {
+		if r != "" {
+			parts = append(parts, maintenanceSubsystemLabels[sub]+": "+r)
+		}
+	}
+	if len(parts) == 0 {
+		// The summary flag was cleared between the unlocked load above and the lock.
+		return false, ""
+	}
+	return true, strings.Join(parts, "; ")
 }
 
 // WriteFailures returns the number of records that reached the drainer but could

@@ -510,24 +510,42 @@ func (s *Sink) retryRotateReopen() {
 // pruneRotated deletes the oldest rotated files so at most s.retain are kept; a
 // retain of 0 keeps everything. Best-effort: a failed unlink is logged, not fatal,
 // so losing a rotated file never wedges the audit path. Drainer-only (no lock).
+//
+// The retention status is published here and only here: prunePass runs the pass and
+// returns what it established, and this one line records it. Keeping the single write at
+// the single exit is what makes the status total — an early return added inside prunePass
+// cannot leave retention's status un-updated the way scattered mark/clear calls could,
+// and because the write is keyed to retention it cannot touch a rotation stall.
 func (s *Sink) pruneRotated() {
+	s.setMaintenanceStatus(maintenanceRetention, s.prunePass())
+}
+
+// prunePass performs one retention pass and returns the retention stall reason it
+// established: empty when retention is healthy (satisfied, disabled, or brought back
+// within bounds by this pass), non-empty when the retention bound is going unenforced.
+// It never writes the maintenance status itself; pruneRotated does that once with
+// whatever this returns.
+func (s *Sink) prunePass() string {
 	if s.retain <= 0 {
-		// Retention disabled: nothing to prune, and nothing to clear either. Only the
-		// retention leg below can set the stall on this path, and it needs retain > 0, so
-		// there is no retention stall to be in. Clearing here anyway would be a
-		// cross-subsystem write — the flag is shared with the rotation-ordinal deferral,
-		// which owns its own clear — so a future rotation stall reaching this pass would
-		// be erased while the size bound went unenforced.
-		return
+		// Retention disabled: there is no bound to enforce, so retention cannot be
+		// stalled. (Nor could it have been: every reason below needs retain > 0, and
+		// retain is fixed at Open.)
+		return ""
 	}
 	// Genuine rotated siblings only, oldest-first, via the shared helper so pruning
 	// stays in lockstep with the chain walk over exactly the same files.
 	rotated, err := sortedRotatedSiblings(s.logPath)
 	if err != nil {
-		// A persistent listing failure would silently stop pruning and let siblings
-		// accumulate, so log it like the per-file failures below.
+		// Report it, not just log it. This exit is reachable while rotation keeps working
+		// — rotatedPath needs only Lstat, and its own ReadDir runs only while the ordinal
+		// seed is uncertain — so a log directory that becomes unlistable AFTER Open leaves
+		// rotation stamping siblings that every prune pass then fails to enumerate.
+		// Retention silently never runs again, siblings accumulate until the volume fills,
+		// and without this the operator's only signal is one stderr line per rotation while
+		// /healthz, /metrics, and doctor all stay green through exactly the condition this
+		// mechanism exists to surface.
 		fmt.Fprintf(os.Stderr, "[eunox] audit retention: could not list rotated siblings of %q: %v\n", s.logPath, err)
-		return
+		return fmt.Sprintf("the rotated siblings of %q cannot be listed (%v), so over-retention files cannot be found or deleted; the retention bound is not being enforced and rotated files will accumulate until this is fixed", s.logPath, err)
 	}
 	// In fallback mode (a reopen failure left activePath pointing at a rotated-pattern
 	// file that is still being written to) that active file matches the rotated
@@ -543,12 +561,12 @@ func (s *Sink) pruneRotated() {
 		rotated = filtered
 	}
 	if len(rotated) <= s.retain {
-		// Retention is satisfied, so it is not stalled — however it got there. Clearing
-		// only after the delete loop below succeeded meant a stall resolved by an operator
-		// removing the undeletable file by hand stayed reported on /healthz and in doctor
-		// until the process restarted, since every later pass reached this return first.
-		s.clearMaintenanceStalled()
-		return
+		// Retention is satisfied, so it is not stalled — however it got there. Reporting
+		// health only after the delete loop below succeeded meant a stall resolved by an
+		// operator removing the undeletable file by hand stayed reported on /healthz and in
+		// doctor until the process restarted, since every later pass reached this return
+		// first.
+		return ""
 	}
 	// Delete oldest-first. On the FIRST real failure, STOP rather than continue:
 	// retention is only safe because it removes a contiguous OLDEST prefix, leaving the
@@ -571,12 +589,11 @@ func (s *Sink) pruneRotated() {
 			// breaks at index 0 on every future rotation and retention never runs again.
 			// retainRotated is then silently voided and siblings accumulate without bound.
 			// Report it rather than let the disk fill behind one stderr line per rotation.
-			s.markMaintenanceStalled(fmt.Sprintf("retention stalled: rotated audit file %q cannot be deleted (%v), and pruning stops there to keep the retained chain contiguous; the retention bound is not being enforced until this file is removable", old, err))
-			return
+			return fmt.Sprintf("rotated audit file %q cannot be deleted (%v), and pruning stops there to keep the retained chain contiguous; the retention bound is not being enforced until this file is removable", old, err)
 		}
 	}
 	// Every over-retention sibling was removed: retention is healthy again.
-	s.clearMaintenanceStalled()
+	return ""
 }
 
 // rotatedPath returns the path the active log is renamed to during rotation: a
@@ -608,7 +625,25 @@ func (s *Sink) pruneRotated() {
 // no other writer creating that target in between. That holds only because rotate()
 // runs solely on the drain() goroutine; a concurrent rotate() would reintroduce the
 // overwrite.
+//
+// The rotation status is published here and only here, mirroring pruneRotated:
+// nameNextRotated decides whether this rotation can proceed and returns the stall reason
+// ("" when it can), and this one line records it. Every exit of the naming attempt therefore updates
+// rotation's status — including the ones that predate the status and used to leave it
+// stale — and because the write is keyed to rotation it cannot disturb a retention stall.
 func (s *Sink) rotatedPath() (string, error) {
+	path, stallReason, err := s.nameNextRotated()
+	s.setMaintenanceStatus(maintenanceRotation, stallReason)
+	return path, err
+}
+
+// nameNextRotated is rotatedPath's body: it picks the next rotated name and reports, via
+// stallReason, whether rotation is currently deferred ("" when this rotation proceeds).
+// It never writes the maintenance status itself; rotatedPath does that once with whatever
+// this returns. A non-empty stallReason always accompanies an error — rotation's status
+// tracks exactly "can a rotation still be stamped", so every failure to name a target is
+// a deferral of the size bound, whatever caused it.
+func (s *Sink) nameNextRotated() (path, stallReason string, err error) {
 	// If Open could not read the siblings to seed the ordinal, re-derive it now (rotation
 	// is rare, so the scan cost is negligible) so this rotation is stamped ABOVE any
 	// existing sibling rather than restarting from 1 and mis-ordering retention. Only
@@ -618,12 +653,12 @@ func (s *Sink) rotatedPath() (string, error) {
 		if !ok {
 			// Surface the stall. Deferring is correct for chain integrity, but a fault that
 			// persists (a 0300 log dir, a chronic EIO/ESTALE) defers EVERY future rotation
-			// too, so rotateSizeBytes and retainRotated are silently voided and the active
-			// log grows unbounded until the filesystem fills — at which point writes fail
-			// and --require-audit=strict denies all traffic. A single stderr line before a
+			// too, so rotateSizeBytes is silently voided and the active log grows unbounded
+			// until the filesystem fills — at which point writes fail and
+			// --require-audit=strict denies all traffic. A single stderr line before a
 			// self-inflicted outage is not enough signal; MaintenanceStalled puts it on
 			// /healthz and in doctor while it is still recoverable.
-			s.markMaintenanceStalled(fmt.Sprintf("rotation deferred: the audit log's sibling directory for %q cannot be listed, so a rotation ordinal cannot be seeded; the size bound is not being enforced and the log will grow until this is fixed", s.logPath))
+			//
 			// The same directory-read fault that set the uncertain flag still persists (e.g.
 			// a write+exec-but-not-readable log dir, where ReadDir fails while Rename/Lstat
 			// still succeed). Do NOT fall through and stamp ordinal 1: it would sort BEFORE
@@ -631,18 +666,30 @@ func (s *Sink) rotatedPath() (string, error) {
 			// file first and LogChainFiles would feed verify out of order (a spurious CHAIN
 			// BREAK / SEQ GAP). Defer this rotation instead — rotate()'s target-error branch
 			// backs off and retries — keeping the uncertain flag set for the next attempt.
-			return "", fmt.Errorf("cannot seed the rotation ordinal for %q (sibling directory still unreadable); deferring rotation to avoid stamping a stale-low ordinal", s.logPath)
+			return "", fmt.Sprintf("the audit log's sibling directory for %q cannot be listed, so a rotation ordinal cannot be seeded; the size bound is not being enforced and the log will grow until this is fixed", s.logPath),
+				fmt.Errorf("cannot seed the rotation ordinal for %q (sibling directory still unreadable); deferring rotation to avoid stamping a stale-low ordinal", s.logPath)
 		}
 		if seed > s.rotateOrdinal {
 			s.rotateOrdinal = seed
 		}
 		s.ordinalSeedUncertain = false
-		// The directory became readable again: the deferral self-healed, so stop reporting.
-		s.clearMaintenanceStalled()
 	}
 	s.rotateOrdinal++
 	base := s.logPath + "." + fmt.Sprintf("%020d", s.rotateOrdinal) + "." + s.clock().UTC().Format("20060102T150405.000000000Z")
-	return uniqueRotatedPath(base)
+	target, err := uniqueRotatedPath(base)
+	if err != nil {
+		// Every candidate name was taken or ambiguous. Exhaustion by genuine collisions is
+		// unreachable in normal operation, but the loop also treats an Lstat that fails for
+		// any reason other than "absent" as occupied — so a log directory that returns
+		// EACCES/EIO on every probe exhausts it on EVERY rotation, deferring rotation
+		// exactly as durably as an unseedable ordinal while the ordinal seed itself looks
+		// fine. Report it as the same rotation stall rather than let the active log grow
+		// behind one stderr line per attempt.
+		return "", fmt.Sprintf("no free rotated name for %q could be established (%v), so the active log cannot be renamed; the size bound is not being enforced and the log will grow until this is fixed", s.logPath, err), err
+	}
+	// A target is in hand and this rotation proceeds, so rotation is not deferred: a
+	// deferral that self-healed (the directory became readable again) stops being reported.
+	return target, "", nil
 }
 
 // maxRotatedOrdinal returns the highest rotation ordinal embedded in logPath's
