@@ -343,9 +343,23 @@ func refuseNonRegular(logPath string) error {
 	return config.RefuseNonRegularPath(logPath, "audit log path")
 }
 
+// rotate is size-triggered rotation's entry point, called from writeRecord once the
+// active log crosses maxBytes. It is a thin wrapper: rotateAttempt (or, while in the
+// reopen-fallback state, retryRotateReopen) does the actual work and returns the
+// rotation stall reason it established, and this one line records it — mirroring
+// pruneRotated, so no branch inside either helper, present or future, can leave
+// rotation's status stale by forgetting to report.
 func (s *Sink) rotate() {
+	s.setRotationStalled(s.rotateAttempt())
+}
+
+// rotateAttempt performs one rotation attempt and returns the rotation stall reason it
+// established: empty when rotation is healthy (nothing to do, or a fresh base is now
+// active), non-empty when the size bound is currently going unenforced. It never writes
+// the maintenance status itself; rotate() does that once with whatever this returns.
+func (s *Sink) rotateAttempt() string {
 	if s.f == nil {
-		return
+		return ""
 	}
 	// Already in the reopen-fallback state: a prior rotation renamed the log but could
 	// not open a fresh base, so the fd is appending to the renamed (already-rotated,
@@ -358,8 +372,7 @@ func (s *Sink) rotate() {
 	// off to 0 for a very small maxBytes — that must still retry the reopen, not be
 	// mistaken for a fresh empty base.
 	if s.inFallback {
-		s.retryRotateReopen()
-		return
+		return s.retryRotateReopen()
 	}
 	// A record whose serialized line alone exceeds maxBytes trips the size trigger
 	// (s.written+len(line) > s.maxBytes) while s.written is still 0 on a freshly
@@ -368,7 +381,7 @@ func (s *Sink) rotate() {
 	// historical sibling to keep it. Nothing to rotate; leave the empty base in
 	// place for the oversized record to land in.
 	if s.written == 0 {
-		return
+		return ""
 	}
 	// Rename first (non-destructive), then open the new file. The old fd stays valid
 	// after rename (the inode is still open), so we can fall back to it if reopen
@@ -378,11 +391,14 @@ func (s *Sink) rotate() {
 	// rotated files are always "<base>.<ts>" regardless of any earlier fallback.
 	rotated, pathErr := s.rotatedPath()
 	if pathErr != nil {
-		// No collision-free name found. Fail closed like the rename branch: keep the
-		// existing fd and back off rather than risk clobbering a sibling.
+		// No collision-free name found, or the rotation ordinal could not be seeded. Fail
+		// closed like the rename branch below: keep the existing fd and back off rather
+		// than risk clobbering a sibling. rotatedPath's own error already names what is
+		// wrong, so reuse it as the stall reason instead of re-deriving a second
+		// description of the same fault.
 		fmt.Fprintf(os.Stderr, "[eunox] audit rotate error (target): %v; continuing with existing file\n", pathErr)
 		s.written = s.rotateBackoffWritten()
-		return
+		return pathErr.Error()
 	}
 	// Rename activePath (the file the fd actually writes to), which differs from
 	// logPath only after a prior fallback; logPath would be "source missing" then.
@@ -393,7 +409,7 @@ func (s *Sink) rotate() {
 		// grew ~maxBytes per failure. This still avoids a tight loop but caps growth
 		// to ~10% of maxBytes per failed attempt.
 		s.written = s.rotateBackoffWritten()
-		return
+		return fmt.Sprintf("could not rename the active log %q to %q: %v", s.activePath, rotated, err)
 	}
 	// Sync the rotated file BEFORE opening the new one. Close does not fsync on
 	// Linux, so a crash could otherwise leave the rotated file missing its tail — an
@@ -413,14 +429,17 @@ func (s *Sink) rotate() {
 		// successor lives in the fresh base. Instead enter the reopen-fallback state,
 		// keeping this fd as the active path so retryRotateReopen re-Syncs it on the
 		// bounded backoff cadence and only completes the swap once the tail is durable.
-		// Account for it in writeFailures so the degradation stays visible to operators.
+		// Account for it in writeFailures so the degradation stays visible to operators —
+		// a distinct signal from the rotation stall returned below: writeFailures flags a
+		// durability risk, while the fallback state entered here ALSO means the size bound
+		// goes unenforced until a later retry succeeds.
 		s.writeFailures.Add(1)
 		fmt.Fprintf(os.Stderr, "[eunox] audit rotate error (sync): %v; deferring reopen until the rotated tail is durable\n", err)
 		s.activePath = rotated
 		s.inFallback = true
 		s.written = s.rotateBackoffWritten()
 		s.pruneRotated()
-		return
+		return fmt.Sprintf("could not sync the rotated file %q before reopening a fresh base: %v", rotated, err)
 	}
 	f, err := openGuardedAppend(s.logPath)
 	if err != nil {
@@ -443,24 +462,31 @@ func (s *Sink) rotate() {
 		// persistent reopen fault. Pruning is independent of whether the fresh file
 		// opened, so it is safe here.
 		s.pruneRotated()
-		return
+		return fmt.Sprintf("could not reopen a fresh base log at %q after rotation: %v", s.logPath, err)
 	}
 	// A clean rotation always lands on the configured base. Fallback recovery is
 	// handled separately by retryRotateReopen, so this path never runs while in
-	// fallback (the guard at the top of rotate() routes there first).
+	// fallback (the guard at the top of rotateAttempt routes there first).
 	s.swapToFreshBase(f, "rotated fd")
+	return ""
 }
 
-// retryRotateReopen runs when rotate() fires while the Sink is in the reopen-fallback
-// state: a prior rotation renamed the active log to a timestamped sibling but could
-// not open a fresh base, so the fd is still appending to that (already-rotated,
-// over-size) file. The fd keeps the same inode, so renaming it again would only churn
-// a new sibling per size trigger without reclaiming any space — the sole way to bound
-// the file is a successful reopen. So this retries ONLY the reopen, on the bounded
-// cadence the size trigger provides (~every 10% of maxBytes via rotateBackoffWritten);
-// it never renames. On success it completes the deferred rotation by switching to the
-// fresh base, leaving the over-size fallback file as a normal rotated sibling.
-func (s *Sink) retryRotateReopen() {
+// retryRotateReopen runs when rotateAttempt fires while the Sink is in the
+// reopen-fallback state: a prior rotation renamed the active log to a timestamped
+// sibling but could not open a fresh base, so the fd is still appending to that
+// (already-rotated, over-size) file. The fd keeps the same inode, so renaming it again
+// would only churn a new sibling per size trigger without reclaiming any space — the
+// sole way to bound the file is a successful reopen. So this retries ONLY the reopen, on
+// the bounded cadence the size trigger provides (~every 10% of maxBytes via
+// rotateBackoffWritten); it never renames. On success it completes the deferred rotation
+// by switching to the fresh base, leaving the over-size fallback file as a normal
+// rotated sibling.
+//
+// Returns the rotation stall reason for this retry, exactly like rotateAttempt: empty
+// once the swap to a fresh base completes, non-empty while the fallback persists. It
+// never writes the maintenance status itself; rotate() does that once with whatever the
+// call chain (rotateAttempt, or this) returns.
+func (s *Sink) retryRotateReopen() string {
 	// Sync the over-size fallback file (already a rotated sibling, so shippers and
 	// resume find it) BEFORE creating the fresh base, mirroring rotate()'s
 	// sync-before-reopen ordering. Doing it after os.OpenFile would invert the
@@ -486,7 +512,7 @@ func (s *Sink) retryRotateReopen() {
 		s.writeFailures.Add(1)
 		fmt.Fprintf(os.Stderr, "[eunox] audit rotate error (sync on fallback recovery): %v; deferring the swap until the fallback tail is durable\n", serr)
 		s.written = s.rotateBackoffWritten()
-		return
+		return fmt.Sprintf("could not sync the fallback file %q: %v", s.activePath, serr)
 	}
 	f, err := openGuardedAppend(s.logPath)
 	if err != nil {
@@ -498,13 +524,14 @@ func (s *Sink) retryRotateReopen() {
 		// instead of the prior ~2x-then-rename behavior.
 		fmt.Fprintf(os.Stderr, "[eunox] audit rotate error (reopen retry): %v; still appending to fallback file %q\n", err, s.activePath)
 		s.written = s.rotateBackoffWritten()
-		return
+		return fmt.Sprintf("still could not reopen a fresh base log at %q: %v", s.logPath, err)
 	}
 	// Clear fallback state before the shared tail swaps the fresh base in: the
 	// deferred rotation is now completing, leaving the over-size fallback file as a
 	// normal rotated sibling.
 	s.inFallback = false
 	s.swapToFreshBase(f, "fallback fd")
+	return ""
 }
 
 // pruneRotated deletes the oldest rotated files so at most s.retain are kept; a
@@ -517,7 +544,7 @@ func (s *Sink) retryRotateReopen() {
 // cannot leave retention's status un-updated the way scattered mark/clear calls could,
 // and because the write is keyed to retention it cannot touch a rotation stall.
 func (s *Sink) pruneRotated() {
-	s.setMaintenanceStatus(maintenanceRetention, s.prunePass())
+	s.setRetentionStalled(s.prunePass())
 }
 
 // prunePass performs one retention pass and returns the retention stall reason it
@@ -545,7 +572,7 @@ func (s *Sink) prunePass() string {
 		// /healthz, /metrics, and doctor all stay green through exactly the condition this
 		// mechanism exists to surface.
 		fmt.Fprintf(os.Stderr, "[eunox] audit retention: could not list rotated siblings of %q: %v\n", s.logPath, err)
-		return fmt.Sprintf("the rotated siblings of %q cannot be listed (%v), so over-retention files cannot be found or deleted; the retention bound is not being enforced and rotated files will accumulate until this is fixed", s.logPath, err)
+		return fmt.Sprintf("could not list the rotated siblings of %q: %v", s.logPath, err)
 	}
 	// In fallback mode (a reopen failure left activePath pointing at a rotated-pattern
 	// file that is still being written to) that active file matches the rotated
@@ -589,7 +616,7 @@ func (s *Sink) prunePass() string {
 			// breaks at index 0 on every future rotation and retention never runs again.
 			// retainRotated is then silently voided and siblings accumulate without bound.
 			// Report it rather than let the disk fill behind one stderr line per rotation.
-			return fmt.Sprintf("rotated audit file %q cannot be deleted (%v), and pruning stops there to keep the retained chain contiguous; the retention bound is not being enforced until this file is removable", old, err)
+			return fmt.Sprintf("could not delete %q: %v; pruning stopped there to keep the retained chain contiguous", old, err)
 		}
 	}
 	// Every over-retention sibling was removed: retention is healthy again.
@@ -626,24 +653,12 @@ func (s *Sink) prunePass() string {
 // runs solely on the drain() goroutine; a concurrent rotate() would reintroduce the
 // overwrite.
 //
-// The rotation status is published here and only here, mirroring pruneRotated:
-// nameNextRotated decides whether this rotation can proceed and returns the stall reason
-// ("" when it can), and this one line records it. Every exit of the naming attempt therefore updates
-// rotation's status — including the ones that predate the status and used to leave it
-// stale — and because the write is keyed to rotation it cannot disturb a retention stall.
+// A failure to produce a target — an unseedable rotation ordinal, or an exhausted
+// collision backstop — always returns a non-nil error naming the cause. This stays a
+// pure naming step with no maintenance-status side effect of its own: rotateAttempt
+// folds the error into rotation's overall stall reason at its own single exit, the same
+// way it folds in a later rename or reopen failure.
 func (s *Sink) rotatedPath() (string, error) {
-	path, stallReason, err := s.nameNextRotated()
-	s.setMaintenanceStatus(maintenanceRotation, stallReason)
-	return path, err
-}
-
-// nameNextRotated is rotatedPath's body: it picks the next rotated name and reports, via
-// stallReason, whether rotation is currently deferred ("" when this rotation proceeds).
-// It never writes the maintenance status itself; rotatedPath does that once with whatever
-// this returns. A non-empty stallReason always accompanies an error — rotation's status
-// tracks exactly "can a rotation still be stamped", so every failure to name a target is
-// a deferral of the size bound, whatever caused it.
-func (s *Sink) nameNextRotated() (path, stallReason string, err error) {
 	// If Open could not read the siblings to seed the ordinal, re-derive it now (rotation
 	// is rare, so the scan cost is negligible) so this rotation is stamped ABOVE any
 	// existing sibling rather than restarting from 1 and mis-ordering retention. Only
@@ -651,13 +666,13 @@ func (s *Sink) nameNextRotated() (path, stallReason string, err error) {
 	if s.ordinalSeedUncertain {
 		seed, ok := maxRotatedOrdinal(s.logPath)
 		if !ok {
-			// Surface the stall. Deferring is correct for chain integrity, but a fault that
+			// Fail closed. Deferring is correct for chain integrity, but a fault that
 			// persists (a 0300 log dir, a chronic EIO/ESTALE) defers EVERY future rotation
 			// too, so rotateSizeBytes is silently voided and the active log grows unbounded
 			// until the filesystem fills — at which point writes fail and
-			// --require-audit=strict denies all traffic. A single stderr line before a
-			// self-inflicted outage is not enough signal; MaintenanceStalled puts it on
-			// /healthz and in doctor while it is still recoverable.
+			// --require-audit=strict denies all traffic. rotateAttempt reports this as a
+			// rotation stall (on /healthz and in doctor) while it is still recoverable, not
+			// just this stderr line.
 			//
 			// The same directory-read fault that set the uncertain flag still persists (e.g.
 			// a write+exec-but-not-readable log dir, where ReadDir fails while Rename/Lstat
@@ -666,8 +681,7 @@ func (s *Sink) nameNextRotated() (path, stallReason string, err error) {
 			// file first and LogChainFiles would feed verify out of order (a spurious CHAIN
 			// BREAK / SEQ GAP). Defer this rotation instead — rotate()'s target-error branch
 			// backs off and retries — keeping the uncertain flag set for the next attempt.
-			return "", fmt.Sprintf("the audit log's sibling directory for %q cannot be listed, so a rotation ordinal cannot be seeded; the size bound is not being enforced and the log will grow until this is fixed", s.logPath),
-				fmt.Errorf("cannot seed the rotation ordinal for %q (sibling directory still unreadable); deferring rotation to avoid stamping a stale-low ordinal", s.logPath)
+			return "", fmt.Errorf("cannot seed the rotation ordinal for %q (sibling directory still unreadable); deferring rotation to avoid stamping a stale-low ordinal", s.logPath)
 		}
 		if seed > s.rotateOrdinal {
 			s.rotateOrdinal = seed
@@ -676,20 +690,12 @@ func (s *Sink) nameNextRotated() (path, stallReason string, err error) {
 	}
 	s.rotateOrdinal++
 	base := s.logPath + "." + fmt.Sprintf("%020d", s.rotateOrdinal) + "." + s.clock().UTC().Format("20060102T150405.000000000Z")
-	target, err := uniqueRotatedPath(base)
-	if err != nil {
-		// Every candidate name was taken or ambiguous. Exhaustion by genuine collisions is
-		// unreachable in normal operation, but the loop also treats an Lstat that fails for
-		// any reason other than "absent" as occupied — so a log directory that returns
-		// EACCES/EIO on every probe exhausts it on EVERY rotation, deferring rotation
-		// exactly as durably as an unseedable ordinal while the ordinal seed itself looks
-		// fine. Report it as the same rotation stall rather than let the active log grow
-		// behind one stderr line per attempt.
-		return "", fmt.Sprintf("no free rotated name for %q could be established (%v), so the active log cannot be renamed; the size bound is not being enforced and the log will grow until this is fixed", s.logPath, err), err
-	}
-	// A target is in hand and this rotation proceeds, so rotation is not deferred: a
-	// deferral that self-healed (the directory became readable again) stops being reported.
-	return target, "", nil
+	// A failure here (every candidate name taken or ambiguous) is exhaustion by genuine
+	// collision — unreachable in normal operation — or the backstop treating an Lstat that
+	// fails for any reason other than "absent" as occupied, so a log directory that returns
+	// EACCES/EIO on every probe exhausts it on EVERY rotation, deferring rotation exactly
+	// as durably as an unseedable ordinal while the ordinal seed itself looks fine.
+	return uniqueRotatedPath(base)
 }
 
 // maxRotatedOrdinal returns the highest rotation ordinal embedded in logPath's
@@ -749,5 +755,5 @@ func uniqueRotatedPathBounded(base string, maxSuffix int) (string, error) {
 			return candidate, nil
 		}
 	}
-	return "", fmt.Errorf("uniqueRotatedPath: no free rotated name for %q after %d attempts", base, maxSuffix+1)
+	return "", fmt.Errorf("no free rotated name for %q after %d attempts", base, maxSuffix+1)
 }

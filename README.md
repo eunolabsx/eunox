@@ -417,14 +417,17 @@ Redis kill-switch backend is degraded (see below).
 
 `eunox_audit_maintenance_stalled` / `auditMaintenanceStalled` is a third,
 different signal: `1` means size-triggered rotation or retention pruning has
-stopped making progress — the log directory cannot be listed, no free rotated
-name can be established, or the oldest rotated file cannot be deleted. **No
-records are lost**, so this deliberately does not gate traffic the way the two
-counters above feed `--require-audit=strict`. What it means is that
-`audit.rotateSizeBytes` and/or `audit.retainRotated` are currently unenforced and
-the log will grow until the underlying fault is fixed — at which point the volume
-fills, writes *do* start failing, and strict mode denies everything. Alert on it
-as a disk-capacity warning, not an audit-integrity one.
+stopped making progress — on the rotation side, the log directory cannot be
+listed, no free rotated name can be established, the active log cannot be
+renamed or reopened, or a just-renamed sidecar cannot be synced before the
+reopen; on the retention side, the rotated siblings cannot be listed, or the
+oldest cannot be deleted. **No records are lost**, so this deliberately does not
+gate traffic the way the two counters above feed `--require-audit=strict`. What
+it means is that `audit.rotateSizeBytes` and/or `audit.retainRotated` are
+currently unenforced and the log will grow until the underlying fault is fixed —
+at which point the volume fills, writes *do* start failing, and strict mode
+denies everything. Alert on it as a disk-capacity warning, not an
+audit-integrity one.
 
 Rotation and retention stall **independently** — one can be wedged while the
 other runs normally — so `auditMaintenanceReason` on `/healthz` reports each

@@ -1155,6 +1155,13 @@ func TestRotateReopenFallbackRespectsSizeBound(t *testing.T) {
 	if s.written == 0 {
 		t.Fatalf("reopen-fallback reset s.written to 0; the renamed ~maxBytes file could grow toward 2x maxBytes before the next check")
 	}
+	// A failed reopen leaves rotation deferred until the next retry recovers, exactly
+	// like the ordinal-seed and rename failures — it must be reported the same way.
+	if stalled, reason := s.MaintenanceStalled(); !stalled {
+		t.Error("a failed reopen must report a rotation stall: the size bound is going unenforced")
+	} else if !strings.Contains(reason, "rotation deferred") {
+		t.Errorf("reason = %q, want it to name the rotation subsystem", reason)
+	}
 }
 
 // TestRetryRotateReopenRecovers pins the recovery side of the reopen-fallback state:
@@ -1224,6 +1231,11 @@ func TestRetryRotateReopenRecovers(t *testing.T) {
 	if string(got) != "probe\n" {
 		t.Fatalf("recovered fd wrote %q to the base; want it to write to the fresh base log", string(got))
 	}
+	// The deferred rotation completed, so rotation is no longer stalled — a reopen that
+	// recovers via retryRotateReopen must clear the stall exactly like a clean rotation.
+	if stalled, reason := s.MaintenanceStalled(); stalled {
+		t.Errorf("a recovered reopen must clear rotation's stall: stalled=%v reason=%q", stalled, reason)
+	}
 }
 
 // TestRetryRotateReopenStillFailing covers the persistent-fault branch of
@@ -1286,6 +1298,13 @@ func TestRetryRotateReopenStillFailing(t *testing.T) {
 	if len(entriesAfter) != len(entriesBefore) {
 		t.Fatalf("a still-failing retry must not create a filesystem entry: before=%d after=%d", len(entriesBefore), len(entriesAfter))
 	}
+	// The fallback persists, so the size bound is still going unenforced — this must stay
+	// reported on every retry, not just the first one that entered fallback.
+	if stalled, reason := s.MaintenanceStalled(); !stalled {
+		t.Error("a still-failing reopen retry must keep reporting a rotation stall")
+	} else if !strings.Contains(reason, "rotation deferred") {
+		t.Errorf("reason = %q, want it to name the rotation subsystem", reason)
+	}
 }
 
 // TestPruneRotated_ClearsResolvedStallWithoutADelete is the stuck-status regression: a
@@ -1304,9 +1323,9 @@ func TestPruneRotated_ClearsResolvedStallWithoutADelete(t *testing.T) {
 	if err := os.WriteFile(sib, []byte(`{"seq":1}`+"\n"), 0o600); err != nil {
 		t.Fatalf("write sibling: %v", err)
 	}
-	s.setMaintenanceStatus(maintenanceRetention, "an older sibling could not be deleted")
+	s.setRetentionStalled("an older sibling could not be deleted")
 	if stalled, _ := s.MaintenanceStalled(); !stalled {
-		t.Fatal("setMaintenanceStatus did not take effect")
+		t.Fatal("setRetentionStalled did not take effect")
 	}
 
 	s.pruneRotated()
@@ -1324,7 +1343,7 @@ func TestPruneRotated_ClearsResolvedStallWithoutADelete(t *testing.T) {
 func TestPruneRotated_RetentionDisabledLeavesRotationStalled(t *testing.T) {
 	t.Parallel()
 	s := &Sink{logPath: filepath.Join(t.TempDir(), "audit.jsonl"), retain: 0}
-	s.setMaintenanceStatus(maintenanceRotation, "the sibling directory cannot be listed")
+	s.setRotationStalled("the sibling directory cannot be listed")
 
 	s.pruneRotated()
 
@@ -1350,7 +1369,7 @@ func TestPruneRotated_HealthyPassLeavesRotationStalled(t *testing.T) {
 	if err := os.WriteFile(sib, []byte(`{"seq":1}`+"\n"), 0o600); err != nil {
 		t.Fatalf("write sibling: %v", err)
 	}
-	s.setMaintenanceStatus(maintenanceRotation, "the sibling directory cannot be listed")
+	s.setRotationStalled("the sibling directory cannot be listed")
 
 	s.pruneRotated()
 
@@ -1400,7 +1419,7 @@ func TestPruneRotated_ListFailureLeavesRotationStalled(t *testing.T) {
 	t.Parallel()
 	logPath := filepath.Join(t.TempDir(), "gone", "audit.jsonl")
 	s := &Sink{logPath: logPath, activePath: logPath, retain: 1}
-	s.setMaintenanceStatus(maintenanceRotation, "the sibling directory cannot be listed")
+	s.setRotationStalled("the sibling directory cannot be listed")
 
 	s.pruneRotated()
 
@@ -1416,7 +1435,7 @@ func TestPruneRotated_ListFailureLeavesRotationStalled(t *testing.T) {
 }
 
 // TestMaintenanceStatus_KeyedPerSubsystem pins the contract the two legs rely on: each
-// subsystem's status is independent, a healthy report clears only its own key, and the
+// subsystem's status is independent, a healthy report clears only its own field, and the
 // combined reason is ordered by subsystem rather than by which fault landed last (so
 // /healthz text depends on what is wrong, not on the order it went wrong in).
 func TestMaintenanceStatus_KeyedPerSubsystem(t *testing.T) {
@@ -1429,8 +1448,8 @@ func TestMaintenanceStatus_KeyedPerSubsystem(t *testing.T) {
 
 	// Retention stalls second, rotation first: the report must still order them
 	// rotation-then-retention.
-	s.setMaintenanceStatus(maintenanceRetention, "a sibling cannot be deleted")
-	s.setMaintenanceStatus(maintenanceRotation, "the ordinal cannot be seeded")
+	s.setRetentionStalled("a sibling cannot be deleted")
+	s.setRotationStalled("the ordinal cannot be seeded")
 	stalled, reason := s.MaintenanceStalled()
 	if !stalled {
 		t.Fatal("two stalled subsystems must report stalled")
@@ -1445,7 +1464,7 @@ func TestMaintenanceStatus_KeyedPerSubsystem(t *testing.T) {
 	}
 
 	// Clearing one leaves the other exactly as it was.
-	s.setMaintenanceStatus(maintenanceRotation, "")
+	s.setRotationStalled("")
 	stalled, reason = s.MaintenanceStalled()
 	if !stalled {
 		t.Fatal("clearing rotation must not clear retention")
@@ -1457,71 +1476,201 @@ func TestMaintenanceStatus_KeyedPerSubsystem(t *testing.T) {
 		t.Errorf("reason = %q, want retention's reason preserved verbatim", reason)
 	}
 
-	// Clearing the last one returns the sink to healthy, summary flag included.
-	s.setMaintenanceStatus(maintenanceRetention, "")
+	// Clearing the last one returns the sink to healthy.
+	s.setRetentionStalled("")
 	if stalled, reason := s.MaintenanceStalled(); stalled || reason != "" {
 		t.Fatalf("clearing every subsystem must report healthy: stalled=%v reason=%q", stalled, reason)
 	}
-	if s.maintenanceStalled.Load() {
-		t.Error("the lock-free summary flag must be recomputed to false when no subsystem is stalled")
+	if s.rotationStallReason != "" || s.retentionStallReason != "" {
+		t.Error("both raw reason fields must be empty once every subsystem is cleared")
 	}
 }
 
-// TestRotatedPath_ClearsRotationStallLeavingRetentionStalled is the mirror of the prune
-// tests: a rotation that recovers reports rotation healthy at its single exit, and must
-// leave a retention stall standing. Retention is the leg that is still failing there —
-// clearing it would hide an accumulating-sibling fault behind an unrelated success.
-func TestRotatedPath_ClearsRotationStallLeavingRetentionStalled(t *testing.T) {
+// TestRotate_CleanSuccessClearsRotationStall is the rotation-side mirror of the prune
+// tests: a clean rotation that completes reports rotation healthy at rotate()'s single
+// exit, without needing an intervening reopen-fallback. retain:0 keeps the prune pass
+// swapToFreshBase triggers out of the picture (retention disabled has nothing to report),
+// so only rotation's own outcome is under test.
+func TestRotate_CleanSuccessClearsRotationStall(t *testing.T) {
 	t.Parallel()
-	logPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open active: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+	const activeContent = "existing-record\n"
+	if _, err := f.WriteString(activeContent); err != nil {
+		t.Fatalf("seed active file: %v", err)
+	}
+
 	fixed := time.Date(2026, 6, 22, 12, 0, 0, 0, time.UTC)
-	s := &Sink{logPath: logPath, now: func() time.Time { return fixed }}
-	s.setMaintenanceStatus(maintenanceRotation, "the ordinal cannot be seeded")
-	s.setMaintenanceStatus(maintenanceRetention, "a sibling cannot be deleted")
+	s := &Sink{
+		logPath:    logPath,
+		activePath: logPath,
+		maxBytes:   1 << 20,
+		retain:     0,
+		f:          f,
+		written:    int64(len(activeContent)),
+		now:        func() time.Time { return fixed },
+	}
+	s.setRotationStalled("a prior attempt could not seed the ordinal")
 
-	if _, err := s.rotatedPath(); err != nil {
-		t.Fatalf("rotatedPath: %v", err)
-	}
+	s.rotate()
 
-	stalled, reason := s.MaintenanceStalled()
-	if !stalled {
-		t.Fatal("a successful rotation must not clear a stall belonging to retention")
+	if s.f == f {
+		t.Fatal("test precondition: rotate() must have swapped to a fresh base fd")
 	}
-	if strings.Contains(reason, "rotation deferred") {
-		t.Errorf("reason = %q, want the recovered rotation stall cleared", reason)
-	}
-	if !strings.Contains(reason, "retention stalled") {
-		t.Errorf("reason = %q, want the retention stall still named", reason)
+	if stalled, reason := s.MaintenanceStalled(); stalled {
+		t.Fatalf("a successful rotation must clear its own stall: stalled=%v reason=%q", stalled, reason)
 	}
 }
 
-// TestRotatedPath_UnnameableTargetMarksRotationStall covers the other exit that used to
-// leave rotation's status stale: when no free rotated name can be established, rotate()
-// backs off and retries forever. Exhaustion by genuine collision is unreachable, but the
-// probe treats an Lstat failing for any reason other than "absent" as occupied, so a log
-// directory returning EACCES/EIO on every probe defers rotation as durably as an
-// unseedable ordinal while the seed itself looks fine.
-func TestRotatedPath_UnnameableTargetMarksRotationStall(t *testing.T) {
+// TestRotate_UnnameableTargetMarksRotationStall covers an exit that used to leave
+// rotation's status stale even before this PR (rotatedPath itself did not report it prior
+// to the subsystem-keying fix, and now rotatedPath reports nothing at all — rotate() folds
+// its error in): when no free rotated name can be established, rotate() backs off and
+// retries forever. Exhaustion by genuine collision is unreachable, but the probe treats an
+// Lstat failing for any reason other than "absent" as occupied, so a log directory
+// returning EACCES/EIO on every probe defers rotation as durably as an unseedable ordinal
+// while the seed itself looks fine.
+func TestRotate_UnnameableTargetMarksRotationStall(t *testing.T) {
 	t.Parallel()
+	dir := t.TempDir()
 	// A logPath whose parent is a regular FILE makes every Lstat probe fail with ENOTDIR
 	// rather than "absent", which is exactly how the ambiguous-probe fault presents: the
 	// backstop treats each candidate as occupied and exhausts. This reproduces it in
 	// microseconds and as root, without seeding maxRotateSuffix real files.
-	notADir := filepath.Join(t.TempDir(), "notadir")
+	notADir := filepath.Join(dir, "notadir")
 	if err := os.WriteFile(notADir, nil, 0o600); err != nil {
 		t.Fatalf("write blocking file: %v", err)
 	}
 	logPath := filepath.Join(notADir, "audit.jsonl")
-	fixed := time.Date(2026, 6, 22, 12, 0, 0, 0, time.UTC)
-	s := &Sink{logPath: logPath, now: func() time.Time { return fixed }}
 
-	if _, err := s.rotatedPath(); err == nil {
-		t.Fatal("rotatedPath must fail when no candidate name can be established as free")
+	// s.f only needs to be a valid, open file: rotateAttempt fails inside rotatedPath()
+	// before ever touching activePath or s.f on disk.
+	f, err := os.OpenFile(filepath.Join(dir, "active.tmp"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open active: %v", err)
 	}
+	defer func() { _ = f.Close() }()
+
+	fixed := time.Date(2026, 6, 22, 12, 0, 0, 0, time.UTC)
+	s := &Sink{
+		logPath:    logPath,
+		activePath: logPath,
+		maxBytes:   1 << 20,
+		f:          f,
+		written:    10,
+		now:        func() time.Time { return fixed },
+	}
+
+	s.rotate()
 
 	stalled, reason := s.MaintenanceStalled()
 	if !stalled {
 		t.Fatal("a rotation that cannot name a target must be reported: the size bound is going unenforced")
+	}
+	if !strings.Contains(reason, "rotation deferred") {
+		t.Errorf("reason = %q, want it to name the rotation subsystem", reason)
+	}
+}
+
+// TestRotate_RenameFailureMarksRotationStall covers a previously-unreported rotate()
+// exit found in review: when os.Rename itself fails (a persistent fault distinct from a
+// failed reopen — the target directory is fine, but the source cannot be moved), the
+// active log keeps growing past maxBytes with nothing on /healthz, /metrics or doctor to
+// show it, exactly like the ordinal-seed and name-exhaustion gaps above.
+func TestRotate_RenameFailureMarksRotationStall(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+	// activePath names a file that does not exist, so os.Rename(activePath, rotated)
+	// fails deterministically (ENOENT) without a permission-bit trick that would not be
+	// root-safe.
+	activePath := filepath.Join(dir, "gone-active.tmp")
+
+	f, err := os.OpenFile(filepath.Join(dir, "placeholder.tmp"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open placeholder: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	fixed := time.Date(2026, 6, 22, 12, 0, 0, 0, time.UTC)
+	s := &Sink{
+		logPath:    logPath,
+		activePath: activePath,
+		maxBytes:   1 << 20,
+		f:          f,
+		written:    10,
+		now:        func() time.Time { return fixed },
+	}
+
+	s.rotate()
+
+	if s.inFallback {
+		t.Fatal("a rename failure must not enter the reopen-fallback state (nothing was renamed)")
+	}
+	stalled, reason := s.MaintenanceStalled()
+	if !stalled {
+		t.Fatal("a rotation that cannot rename the active log must be reported: the size bound is going unenforced")
+	}
+	if !strings.Contains(reason, "rotation deferred") {
+		t.Errorf("reason = %q, want it to name the rotation subsystem", reason)
+	}
+	if !strings.Contains(reason, activePath) {
+		t.Errorf("reason = %q, want it to name the file that could not be renamed", reason)
+	}
+}
+
+// TestRotate_SyncFailureMarksRotationStall covers rotateAttempt's sync-before-reopen
+// branch: a failed fsync of the just-renamed sidecar defers the reopen (entering the
+// fallback state) rather than risk closing over a non-durable tail, and that deferral
+// must be reported as a rotation stall alongside the pre-existing writeFailures signal.
+func TestRotate_SyncFailureMarksRotationStall(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open active: %v", err)
+	}
+	const activeContent = "existing-record\n"
+	if _, err := f.WriteString(activeContent); err != nil {
+		t.Fatalf("seed active file: %v", err)
+	}
+	// Close the fd out from under the Sink so the later s.f.Sync() call fails
+	// deterministically ("file already closed"), without a platform-specific way to fail
+	// fsync(2) itself. os.Rename operates on the path, not the fd, so it still succeeds:
+	// the file's content on disk survives the Close.
+	if err := f.Close(); err != nil {
+		t.Fatalf("close active: %v", err)
+	}
+
+	fixed := time.Date(2026, 6, 22, 12, 0, 0, 0, time.UTC)
+	s := &Sink{
+		logPath:    logPath,
+		activePath: logPath,
+		maxBytes:   1 << 20,
+		f:          f,
+		written:    int64(len(activeContent)),
+		now:        func() time.Time { return fixed },
+	}
+
+	before := s.writeFailures.Load()
+	s.rotate()
+
+	if !s.inFallback {
+		t.Fatal("a sync failure must enter the reopen-fallback state")
+	}
+	if got := s.writeFailures.Load(); got != before+1 {
+		t.Errorf("writeFailures = %d, want %d (the pre-existing durability signal)", got, before+1)
+	}
+	stalled, reason := s.MaintenanceStalled()
+	if !stalled {
+		t.Fatal("a rotation deferred on a sync failure must be reported: the size bound is going unenforced")
 	}
 	if !strings.Contains(reason, "rotation deferred") {
 		t.Errorf("reason = %q, want it to name the rotation subsystem", reason)
