@@ -1156,6 +1156,71 @@ func TestRedis_KillSession_PublishErrorPropagates(t *testing.T) {
 	}
 }
 
+// TestRedis_ActivateGlobal_PublishErrorPropagates mirrors
+// TestRedis_KillSession_PublishErrorPropagates for ActivateGlobal: the durable SET
+// lands, but the caller still sees the publish error since ActivateGlobal returns
+// whatever publish returns.
+func TestRedis_ActivateGlobal_PublishErrorPropagates(t *testing.T) {
+	t.Parallel()
+	r := NewRedis(&publishFailFake{pubErr: errBoom})
+
+	err := r.ActivateGlobal(context.Background())
+	if !errors.Is(err, errBoom) {
+		t.Errorf("ActivateGlobal should surface the publish error, got %v", err)
+	}
+	r.mu.RLock()
+	active := r.globalActive
+	r.mu.RUnlock()
+	if !active {
+		t.Error("local cache must still record the activation even when propagation fails")
+	}
+}
+
+// TestRedis_DeactivateGlobal_PublishErrorPropagates mirrors
+// TestRedis_KillSession_PublishErrorPropagates for DeactivateGlobal — the DEL leg of
+// the same write-then-publish pattern.
+func TestRedis_DeactivateGlobal_PublishErrorPropagates(t *testing.T) {
+	t.Parallel()
+	r := NewRedis(&publishFailFake{pubErr: errBoom})
+	r.mu.Lock()
+	r.globalActive = true
+	r.mu.Unlock()
+
+	err := r.DeactivateGlobal(context.Background())
+	if !errors.Is(err, errBoom) {
+		t.Errorf("DeactivateGlobal should surface the publish error, got %v", err)
+	}
+	r.mu.RLock()
+	active := r.globalActive
+	r.mu.RUnlock()
+	if active {
+		t.Error("local cache must still record the deactivation even when propagation fails")
+	}
+}
+
+// TestRedis_ReviveSession_PublishErrorPropagates covers the DEL leg of setBlock
+// (kill=false), which cmd/eunox's --revive flag newly routes through — the write half
+// of that same write-succeeds/publish-fails split KillSession already pins, but
+// unexercised for revive until now.
+func TestRedis_ReviveSession_PublishErrorPropagates(t *testing.T) {
+	t.Parallel()
+	r := NewRedis(&publishFailFake{pubErr: errBoom})
+	r.mu.Lock()
+	r.killedSessions["sess-1"] = true
+	r.mu.Unlock()
+
+	err := r.ReviveSession(context.Background(), "sess-1")
+	if !errors.Is(err, errBoom) {
+		t.Errorf("ReviveSession should surface the publish error, got %v", err)
+	}
+	r.mu.RLock()
+	_, stillKilled := r.killedSessions["sess-1"]
+	r.mu.RUnlock()
+	if stillKilled {
+		t.Error("local cache must still record the revive even when propagation fails")
+	}
+}
+
 func TestRedis_RefreshState_GetError(t *testing.T) {
 	t.Parallel()
 	r := NewRedis(&fakeCmdable{getErr: errBoom})

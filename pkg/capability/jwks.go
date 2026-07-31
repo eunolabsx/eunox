@@ -11,6 +11,8 @@ import (
 	"time"
 
 	jose "github.com/go-jose/go-jose/v4"
+
+	"github.com/eunolabs/eunox/pkg/durationsentinel"
 )
 
 // DefaultTokenLeeway is the clock-skew grace applied to standard JWT claim
@@ -24,14 +26,7 @@ const DefaultTokenLeeway = 10 * time.Second
 // (clamped to zero, requiring exp strictly in the future), and a positive value is
 // used as-is.
 func EffectiveLeeway(configured time.Duration) time.Duration {
-	switch {
-	case configured == 0:
-		return DefaultTokenLeeway
-	case configured < 0:
-		return 0
-	default:
-		return configured
-	}
+	return durationsentinel.Resolve(configured, DefaultTokenLeeway)
 }
 
 // jwksAlgorithms is the asymmetric-only allowlist of signature algorithms accepted

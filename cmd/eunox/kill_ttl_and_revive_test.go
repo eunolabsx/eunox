@@ -11,6 +11,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -424,6 +425,49 @@ func TestReviveViaRedis_BackendErrorsAreReported(t *testing.T) {
 	err = reviveViaRedis(context.Background(), ks, "all")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "deactivate global kill switch")
+}
+
+// publishFailCmdable is a redis.Cmdable whose DEL succeeds but whose PUBLISH always
+// fails, modeling a Redis ACL that permits key writes but not PUBLISH (or a transient
+// error in the follow-up call). reviveViaRedis's two paths (DeactivateGlobal,
+// ReviveSession) only ever call Del, never Set, so only Del is overridden; the
+// embedded nil interface satisfies the rest of the Cmdable surface and would panic if
+// anything else were called. Mirrors pkg/killswitch's publishFailFake.
+type publishFailCmdable struct {
+	goredis.Cmdable
+	pubErr error
+}
+
+func (f publishFailCmdable) Del(_ context.Context, keys ...string) *goredis.IntCmd {
+	return goredis.NewIntResult(int64(len(keys)), nil)
+}
+
+func (f publishFailCmdable) Publish(_ context.Context, _ string, _ interface{}) *goredis.IntCmd {
+	return goredis.NewIntResult(0, f.pubErr)
+}
+
+// TestReviveViaRedis_PublishOnlyFailureIsReportedAsError pins the CURRENT behavior
+// when the durable write already landed but the follow-up PUBLISH fails: reviveViaRedis
+// still returns a hard error, even though killswitch.Redis has already applied the
+// revive/deactivation and every live proxy will observe it (immediately via a healthy
+// subscriber, or at the latest on the next reconcile tick). This split has no dedicated
+// coverage at the CLI layer — TestReviveViaRedis_BackendErrorsAreReported only exercises
+// a connection failure, where the write itself also fails. Pinning it here means a
+// future change to how reviveViaRedis reports this split (e.g. distinguishing it from a
+// genuine failed write) is a deliberate test update, not a silent behavior change.
+func TestReviveViaRedis_PublishOnlyFailureIsReportedAsError(t *testing.T) {
+	errPublishOnly := errors.New("publish-only failure")
+	ks := killswitch.NewRedis(publishFailCmdable{pubErr: errPublishOnly})
+
+	err := reviveViaRedis(context.Background(), ks, "sess-1")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "revive session")
+	require.ErrorIs(t, err, errPublishOnly)
+
+	err = reviveViaRedis(context.Background(), ks, "all")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "deactivate global kill switch")
+	require.ErrorIs(t, err, errPublishOnly)
 }
 
 // mustGet reads a key that the test requires to exist.

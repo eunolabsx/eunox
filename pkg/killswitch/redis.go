@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/eunolabs/eunox/pkg/durationsentinel"
 )
 
 const (
@@ -254,10 +256,12 @@ func WithSessionKillTTL(d time.Duration) RedisOption {
 // as never expiring, the same as zero, since no other reading of it is safe.
 func WithSessionKillTTLEffective(d time.Duration) RedisOption {
 	return func(r *Redis) {
-		if d < 0 {
-			d = 0
-		}
-		r.sessionKillTTL = d
+		// durationsentinel.Resolve's zero-case and this option's "already resolved"
+		// zero happen to coincide (both mean "never expires" here, since 0 is passed
+		// as the default), so the same negative-clamps-to-zero helper applies even
+		// though this option's zero does not mean "use a default" the way
+		// NormalizeSessionKillTTL's does.
+		r.sessionKillTTL = durationsentinel.Resolve(d, 0)
 	}
 }
 
@@ -922,6 +926,16 @@ func (r *Redis) Reset(ctx context.Context) error {
 // enumeration of Redis; HealthStatus is the authoritative freshness signal, and a
 // kill issued during an outage becomes visible here once Redis recovers (at the latest
 // on the next reconcile tick).
+//
+// That self-correcting framing assumes Start eventually runs. It does NOT hold for an
+// instance that is never Started: Status then returns the zero snapshot
+// (GlobalActive:false, no killed agents or sessions) forever, with a nil error,
+// indistinguishable from "confirmed: nothing is killed". This is safe for every
+// current caller — the one-shot un-Started idiom this package's callers use
+// (killswitch.NewRedis(rdb), skip Start, one write, rdb.Close()) only ever performs
+// writes, never a Status read — but a future caller that copies that idiom and adds a
+// Status() call must Start first, or treat the result as meaningless rather than as an
+// all-clear.
 func (r *Redis) Status(_ context.Context) (*Status, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

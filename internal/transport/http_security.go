@@ -17,8 +17,8 @@ import (
 	"net/url"
 	"os"
 	"strings"
-	"unicode/utf8"
 
+	"github.com/eunolabs/eunox/internal/audit"
 	"github.com/eunolabs/eunox/pkg/capability"
 )
 
@@ -393,19 +393,15 @@ const maxClaimedSessionIDLen = 200
 //
 // The bound stays a BYTE bound: it exists to cap what an unauthenticated caller can
 // append to a record, and that is a byte budget.
+//
+// The normalize-then-rune-safe-cut logic itself lives in audit.TruncateUTF8 (this
+// package already depends on internal/audit for SanitizeAuditField, a different,
+// control-character-stripping helper) so it exists once rather than as an
+// independently-maintained second copy of internal/audit's identical boundFieldTo
+// logic; this wrapper keeps the threat-model documentation above local to the callers
+// that need it.
 func sanitizeClaimedID(s string, limit int) string {
-	s = strings.ToValidUTF8(s, string(utf8.RuneError))
-	if limit <= 0 {
-		return ""
-	}
-	if len(s) <= limit {
-		return s
-	}
-	keep := limit
-	for keep > 0 && !utf8.RuneStart(s[keep]) {
-		keep--
-	}
-	return s[:keep]
+	return audit.TruncateUTF8(s, limit)
 }
 
 // maxRefusalDetailLen bounds the OTHER attacker-controlled strings a pre-session refusal

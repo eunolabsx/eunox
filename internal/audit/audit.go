@@ -1832,13 +1832,44 @@ func boundFieldTo(s string, limit int) string {
 		}
 		return shortMarker
 	}
-	// Truncate on a UTF-8 rune boundary: a byte-level s[:keep] can split a multi-byte
-	// rune, leaving orphaned continuation bytes that json.Marshal rewrites to the
-	// replacement character. Walk back to the rune start (drops at most 3 bytes).
+	return s[:runeBoundaryCut(s, keep)] + marker
+}
+
+// TruncateUTF8 normalizes s to valid UTF-8 (replacing any invalid byte sequence with
+// U+FFFD, same as boundFieldTo) and cuts it to at most limit bytes without splitting a
+// rune. A non-positive limit truncates to "". Unlike boundFieldTo, the result carries
+// no visible truncation marker — callers that need one build it themselves.
+//
+// Exported so a caller outside this package (internal/transport's sanitizeClaimedID,
+// which makes an attacker-controlled HTTP header safe for a signed refusal-record
+// field) shares this exact normalize-then-rune-safe-cut logic rather than
+// re-deriving it: both calls exist to make an attacker string safe to log, and letting
+// them drift apart on the boundary-walk or normalization details would be a
+// maintenance trap neither copy's own tests would catch.
+func TruncateUTF8(s string, limit int) string {
+	s = strings.ToValidUTF8(s, "�")
+	if limit <= 0 {
+		return ""
+	}
+	if len(s) <= limit {
+		return s
+	}
+	return s[:runeBoundaryCut(s, limit)]
+}
+
+// runeBoundaryCut returns the largest n <= limit such that s[:n] does not split a
+// UTF-8 rune, so a byte-length truncation never leaves an orphaned continuation byte
+// that json.Marshal would silently rewrite to the replacement character. Walks back
+// from limit to the nearest rune start (drops at most 3 bytes). Callers must have
+// already normalized s to valid UTF-8 and must pass limit < len(s) (both current
+// callers only reach this after their own len(s) <= limit early return); it indexes
+// s[limit] directly and panics on an out-of-range limit.
+func runeBoundaryCut(s string, limit int) int {
+	keep := limit
 	for keep > 0 && !utf8.RuneStart(s[keep]) {
 		keep--
 	}
-	return s[:keep] + marker
+	return keep
 }
 
 // bareTargetName returns the canonical bare target value. Every method except
