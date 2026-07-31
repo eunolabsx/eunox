@@ -430,6 +430,72 @@ Section conventions:
 
 ### Fixed
 
+- **A wrapper-launched upstream (`npx`, `uvx`, a shell script) could hang shutdown
+  forever.** Both bounded teardown paths — the startup watchdog and the host-EOF
+  shutdown — end by waiting for the upstream's stdout to reach EOF, but the kill
+  signalled only the direct child. An MCP server started through a wrapper runs as a
+  *grandchild* holding the same pipe, so SIGKILL-ing the wrapper left the pipe open, the
+  EOF never arrived, and the mechanisms built to *bound* a wedged upstream hung
+  indefinitely — skipping the audit-sink flush graceful shutdown performs, and leaking
+  the orphan besides. Upstream subprocesses are now started in their own process group
+  and torn down as a group (unix; a no-op elsewhere), and both post-kill waits are
+  bounded independently so a descendant that escapes the group delays nothing. The HTTP
+  transport's per-session subprocess gets the same treatment, where the leak was one
+  orphan per session.
+- **The audit write queue's byte budget did not bound what it claimed.** The budget
+  exists so a slow disk sheds audit records — counted and marked — instead of OOM-ing
+  the proxy, and three things undercut it. The enqueue charged its bytes *after* handing
+  the record to the channel, so the drainer could credit a record before it was charged
+  and the counter went transiently negative, under-reporting in-flight heap under
+  exactly the burst-plus-slow-disk conditions the budget exists for; the charge is now
+  reserved before the send, which also makes the check atomic across concurrent
+  enqueuers. The drain *recomputed* the record's size after `writeRecord` had stamped
+  `seq`/`prev_hmac`/`_hmac` through it, balancing only by the unenforced coincidence
+  that none of those three was counted — the charge is now stored on the record and
+  credited back exactly. And two attacker- or operator-influenced fields were neither
+  bounded nor counted (see Security).
+- **A malformed audit tail was recorded as an HMAC mismatch.** Verification
+  strict-decodes a record before computing any MAC, so a tail with an unknown top-level
+  field, trailing bytes, or malformed JSON is refused before a key ever sees it — yet
+  the chain resume wrote a `tail_hmac_mismatch` marker, asserting a comparison that
+  never ran and pointing an operator at a tampering remediation for what is usually a
+  malformed or forward-versioned line. It now writes `tail_strict_decode_refused`. The
+  fail-closed behavior (restart the chain from genesis, mark it in band) is unchanged.
+- **A strict-drift session could miss the checks it was strict about.** The covering-set
+  used by the startup drift comparison kept only the maximum-specificity manifest entry,
+  on the premise that a less specific one is always shadowed — but the engine filters by
+  principal *before* it scores. With a principal-scoped exact `tool:read_file` beside an
+  unscoped `tool:read_*` glob, every caller who is not that principal is governed by the
+  glob, yet the drift pass saw only the exact entry and never ran the glob's FM-1/FM-3/
+  FM-6 checks. Since FM-1/FM-2/FM-6 abort startup under strict drift, a strict
+  deployment booted believing it had verified drift it had not. The cutoff is now the
+  highest specificity among the *unscoped* matches, which is the point below which an
+  entry is genuinely shadowed for every caller.
+- **A partial write that timed out was recorded as an upstream error, not a timeout.**
+  The framed writer split its two sentinels purely on byte count, so "the subprocess
+  stopped draining stdin" landed as `UPSTREAM_TIMEOUT` when the frame fit the pipe
+  buffer and `UPSTREAM_ERROR` when it did not — the classification turning on payload
+  size rather than on what failed. A partial write accompanied by a deadline expiry now
+  carries the timeout sentinel; the framing is desynced and the writer poisoned either
+  way.
+- **`eunox kill --killswitch-session-ttl` is no longer silently dropped without
+  `--redis-addr`.** (Landed alongside the flag itself; noted here because the guard is
+  what makes the flag's own documentation true.)
+- **The `suggest` subcommand emitted mined manifest entries with Go quoting.** Target
+  names, argument names and observed values were rendered with `%q` rather than the
+  YAML-safe renderer `init` already used for the same job. Go and YAML disagree on
+  `\xNN` — a raw byte to one, the code point U+00NN to the other — so a draft could load
+  cleanly while naming a string that is not the one observed. Both now share one
+  renderer; the drafts are also more readable, since values that need no quoting no
+  longer get any.
+- **The JWKS cache handed out its live key set from the forced-refresh paths.**
+  `ForceRefreshForKID` and `ForceRefreshForVerify` returned the cached pointer directly
+  on both their suppressed and fetched arms, re-opening the slice-aliasing hole
+  `copyKeySet` was added to close — on the two paths a caller reaches during a key
+  rotation. Both now copy, like `Refresh` and `GetKeys`.
+- **`eunox proxy` never released its Redis connection pool** on the paths that succeed
+  and later return; only the ping-failure branch closed it, on a rationale that applies
+  to every exit.
 - **`eunox_audit_maintenance_stalled` stayed `0` through several faults that stopped
   rotation or retention entirely.** If the audit log's directory became unlistable *after*
   startup, rotation kept working (it needs only an `Lstat` once its ordinal seed is
@@ -613,6 +679,82 @@ Section conventions:
 
 ### Security
 
+- **A single denied tool call could write an unbounded amount into the HMAC-signed
+  audit tape.** Most condition handlers echo the caller-controlled value that failed
+  their check into `denial.Details` — the argument that missed an `allowedValues`
+  allowlist, the path whose extension was refused — because that echo is what makes a
+  deny actionable to the operator reading it back. Nothing bounds a tool-call argument
+  before the condition check runs, so an agent that can trigger repeated condition
+  denials with large arguments inflated the signed log at whatever rate it could issue
+  calls: the same kilobyte-per-byte amplifier already closed for the rejected `Origin`
+  header and the loopback endpoints' `path`, reached post-authentication through an
+  argument instead of pre-authentication through a header. Every denial's `details` are
+  now bounded — 512 bytes per string value, an 8 KiB budget charged across the whole
+  map (which bounds an argument that decoded to a large *container* whose elements are
+  each individually small), and 8 levels of nesting (which bounds a chain of empty
+  containers that costs nothing against the byte budget). Elided values carry fixed
+  marker codes rather than prose, and keys are walked in sorted order so two identical
+  denied calls write identical records rather than differing by Go's randomized map
+  iteration. The bound is applied at the single point every enforcement deny passes
+  through, not at each handler's own `Details` literal, so a handler added later
+  inherits it by construction — the ~20 sites could not otherwise be kept in sync. This
+  is a log-growth and log-poisoning-scale fix: no policy decision, HMAC, or chain
+  property was affected.
+- **The audit record's denial taxonomy and route provenance were stamped without a
+  length bound.** `denial_code` and `condition_type` are compile-time constants for the
+  built-in engine, but a deployment wiring an external policy evaluator (OPA, Cedar) or
+  a custom condition handler receives them as operator-supplied strings that reached
+  the record verbatim — unbounded, they could push a record past the 4 MiB scanner
+  buffer every other envelope field is bounded to stay under, and they were not counted
+  against the write queue's byte budget either. `upstream`, `policy_version` and
+  `policy_sha256` were likewise stamped raw, skipping the UTF-8 normalization the HMAC
+  round-trip depends on. All five now take the same 8 KiB bound as `target` and
+  `session_id`, and the two denial fields are counted by the queue budget.
+- **A cheap refusal flood could erase the evidence of an expensive one.** The
+  pre-session refusal records — the only audit writes an unauthenticated caller can
+  trigger — shared one proxy-wide token bucket across every refusal category, so a
+  spray of `Origin` probes (one request each, no credential) absorbed the entire budget
+  and suppressed a *concurrent control-token brute force* into a number folded onto
+  somebody else's record. That is the record an incident responder reads first. Each
+  refusal category now has its own bucket, spanning every route, so a flood in one
+  cannot elide another; `details.suppressed_refusal_scope` reads `"proxy_category"` in
+  place of `"proxy"`. Per-category state is a fixed handful of counters (categories are
+  code-supplied literals, and the map is capped regardless), unlike the per-source
+  state the global counter was chosen to avoid.
+- **An encoded `%00` riding alongside a malformed percent-escape bypassed the
+  fail-closed NUL rule.** The path decoder catches an encoded NUL only *after* a
+  successful unescape, so any other bad escape in the value made the unescape fail
+  whole — and both lenient fallbacks then matched the literal form without scanning for
+  the token. `evil.exe%00x%zz.csv` therefore cleared an `allowedExtensions: [".csv"]`
+  check and a slashless `"*.csv"` glob while a NUL-truncating upstream opens
+  `evil.exe`. The encoded separator got this rides-alongside guard when the lenient
+  fallback was introduced; the NUL token — which the confinement rules say must always
+  deny — did not, and the `allowedExtensions` fallback scanned for neither. Both are
+  now checked on both fallbacks.
+- **Exact numeric matching lapsed to lossy `float64` above 2^63.** Numbers are
+  preserved as `json.Number` end to end specifically so two distinct integers sharing a
+  `float64` are never conflated, but the comparison fell back to `float64` whenever
+  *neither* side was `int64`-representable. `allowedValues: [9223372036854775808]`
+  then admitted the argument `9223372036854775809`, and an argument strictly above
+  `maximum: 9223372036854775808` passed the bound — a fail-open on a boundary, above
+  int64 instead of above 2^53. Both comparisons now use exact rationals when both
+  operands are integers, at any magnitude. Genuinely fractional operands still compare
+  as floats, where a decimal literal and its 64-bit approximation are consistent on
+  both sides.
+- **A constraint carrying a null or typed-nil condition was downgradable under audit
+  mode.** The engine fails closed on a condition it cannot evaluate, but the deny did
+  not set `HardDeny`, so an audit-only constraint (or a route under `--audit`) forwarded
+  the call — with a restriction the policy declared but the engine never checked even
+  once. Its two sibling engine-bug denials both set the flag; this one now does too.
+- **`Constraint` and `ArgumentSchema` decoded JSON leniently, silently widening a
+  policy.** The condition decoder rejects unknown fields because a lenient decode drops
+  a *misspelled* key and leaves a policy quietly wider than written. The same applies
+  one level up: `{"target":…,"principals":{…}}` — a misspelled `principal` — decoded
+  with `Principal == nil`, which applies the constraint to **every** caller, and
+  `{"type":"string","maxLen":8}` validated length not at all. Both decoders now apply
+  the same key-membership check, which recurses through nested `properties`/`items` for
+  free. The binary's manifest loader ran its own recursive check already; these are the
+  exported Go seams a library consumer reaches without it.
 - **The audit log's sidecar lock file now carries the same symlink guard as every other
   audit-path open.** Every truncating or appending open on an operator-configured audit
   path pairs a portable `Lstat` refusal with `O_NOFOLLOW`; `acquireAuditLock` carried

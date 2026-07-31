@@ -169,12 +169,24 @@ func (w Warning) IsFatal() bool {
 	return w.Kind == Fm1 || w.Kind == Fm2 || w.Kind == Fm4 || w.Kind == Fm6 || w.Kind == Fm2Pinned
 }
 
-// severity returns the log-level label for this finding.
+// severity returns the log-level label for this finding. Every LogLine case routes
+// through it, so a change to the mapping cannot silently skip a kind — two cases used to
+// hardcode "WARN" instead, and they were the two UNCONDITIONALLY fatal ones.
+//
+// FM-5 and Fm2Pinned are ERROR precisely because they abort startup on their own (see
+// hasCriticalDrift, which is not gated by --strict-drift): a mismatched or unverifiable
+// tool description may carry steering instructions injected into what the model reads,
+// and the one line an operator greps for after a refused boot must not sit at the same
+// level as advisory FM-3.
 func (w Warning) severity() string {
-	if w.Kind == Uncovered {
+	switch {
+	case w.Kind == Uncovered:
 		return "INFO"
+	case w.Kind == Fm5 || w.Kind == Fm2Pinned:
+		return "ERROR"
+	default:
+		return "WARN"
 	}
-	return "WARN"
 }
 
 // LogLine formats the finding as a single structured stderr line.
@@ -192,8 +204,8 @@ func (w Warning) LogLine() string {
 		)
 	case Fm2Pinned:
 		return fmt.Sprintf(
-			`[eunox] WARN drift=fm2_pinned resource=%q — description-pinned tool is absent from the live tools/list; its descriptionHash could not be verified (upstream may be hiding a poisoned tool, or %s; this session saw %d live tool name(s) against %d exact tool(s) named in the manifest)`,
-			w.Resource, truncatedPaginationHint, w.LiveToolCount, w.ExpectedToolCount,
+			`[eunox] %s drift=fm2_pinned resource=%q — description-pinned tool is absent from the live tools/list; its descriptionHash could not be verified (upstream may be hiding a poisoned tool, or %s; this session saw %d live tool name(s) against %d exact tool(s) named in the manifest)`,
+			w.severity(), w.Resource, truncatedPaginationHint, w.LiveToolCount, w.ExpectedToolCount,
 		)
 	case Fm3:
 		return fmt.Sprintf(
@@ -211,8 +223,8 @@ func (w Warning) LogLine() string {
 		)
 	case Fm5:
 		return fmt.Sprintf(
-			`[eunox] WARN drift=fm5 resource=%q tool=%q — description hash mismatch; tool description may have been modified (expected %s, got %s)`,
-			w.Resource, w.Tool, w.HashExpected, w.HashActual,
+			`[eunox] %s drift=fm5 resource=%q tool=%q — description hash mismatch; tool description may have been modified (expected %s, got %s)`,
+			w.severity(), w.Resource, w.Tool, w.HashExpected, w.HashActual,
 		)
 	case Fm6:
 		return fmt.Sprintf(
@@ -230,7 +242,9 @@ func (w Warning) LogLine() string {
 			w.severity(), w.Resource, w.Tool, w.Argument,
 		)
 	default:
-		return fmt.Sprintf(`[eunox] WARN drift=%s tool=%q resource=%q`, w.Kind, w.Tool, w.Resource)
+		// A Kind with no case of its own: still route the level through severity() so an
+		// unmapped kind cannot be the one line that hardcodes a level.
+		return fmt.Sprintf(`[eunox] %s drift=%s tool=%q resource=%q`, w.severity(), w.Kind, w.Tool, w.Resource)
 	}
 }
 
@@ -699,7 +713,11 @@ func evaluateDrift(manifest *config.LocalManifest, tools []UpstreamTool, serverV
 		return fmt.Errorf("startup aborted: description integrity check failed — a pinned description mismatched or a description-pinned tool is missing from the live tool list (see warnings above)")
 	}
 	if strict && hasFatalDrift(warnings) {
-		return fmt.Errorf("startup aborted by --strict-drift: manifest drift detected (see warnings above)")
+		// "strict drift", not "--strict-drift": strictness can come from the flag OR
+		// from `strictDrift:` in a gateway config (per route or under defaults), and an
+		// operator who set it in YAML should not be sent looking for a flag they never
+		// passed.
+		return fmt.Errorf("startup aborted by strict drift checking: manifest drift detected (see warnings above)")
 	}
 	return nil
 }
@@ -726,37 +744,73 @@ func anyToolMatches(resource string, tools []UpstreamTool) bool {
 // Exported for the validate --live COVERED report, which needs the covering
 // constraint for a clean tool (CheckManifestDrift surfaces no warning for one).
 func BestManifestConstraint(manifest *config.LocalManifest, toolName string) *capability.Constraint {
-	// coveringConstraints already selects the maximum-specificity tier in declaration
-	// order. Prefer a descriptionHash-pinned member on a tie purely for what the
-	// REPORT displays: the sole caller is validate --live's COVERED line, which uses
-	// the result only for its Target string, and naming the pinned entry is the more
-	// informative answer when several equally-specific constraints cover the tool.
-	// Nothing enforcement-relevant rides on this pick — CheckManifestDrift runs the
-	// FM-5 hash verification for EVERY covering constraint, not just the one chosen
-	// here, so a pin cannot be skipped by tie-breaking the other way.
+	// coveringConstraints returns every REACHABLE match, which since the principal-scope
+	// fix can span more than one specificity tier — so narrow to the top tier here
+	// rather than assuming the caller did it. Prefer a descriptionHash-pinned member on
+	// a tie purely for what the REPORT displays: the sole caller is validate --live's
+	// COVERED line, which uses the result only for its Target string, and naming the
+	// pinned entry is the more informative answer when several equally-specific
+	// constraints cover the tool. Nothing enforcement-relevant rides on this pick —
+	// CheckManifestDrift runs the FM-5 hash verification for EVERY covering constraint,
+	// not just the one chosen here, so a pin cannot be skipped by tie-breaking the other
+	// way.
 	covering := coveringConstraints(manifest, toolName)
 	if len(covering) == 0 {
 		return nil
 	}
+	best := -(1 << 30)
+	var top []*capability.Constraint
 	for _, c := range covering {
+		switch s := resSpecificity(c.Target, toolName); {
+		case s > best:
+			best = s
+			top = append(top[:0], c)
+		case s == best:
+			top = append(top, c)
+		}
+	}
+	for _, c := range top {
 		if c.IsPinnedExactTool() {
 			return c
 		}
 	}
-	return covering[0]
+	return top[0]
 }
 
-// coveringConstraints returns every tool: constraint matching toolName at the
-// MAXIMUM specificity among the matches — the tier the engine selects from.
-// Specificity dominates engine selection (findMatchingCapability), so a strictly
-// less-specific entry is shadowed and excluded (it never enforces for this tool);
-// but at equal top specificity the engine breaks ties by principal scope then
-// declaration order, so each equal-top entry is reachable for some caller. FM-3
-// uses this (rather than a single best pick) so a pinned-argument drift on any
-// reachable variant is caught. Returns nil when nothing matches.
+// coveringConstraints returns every tool: constraint matching toolName that some
+// caller can actually be governed by — the set whose drift must be checked. FM-3 uses
+// it (rather than a single best pick) so a pinned-argument drift on any reachable
+// variant is caught, and FM-1/FM-2/FM-6 are fatal under strict drift, so a reachable
+// entry left out of this set is a strict deployment believing it verified drift it did
+// not. Returns nil when nothing matches.
+//
+// Reachability is NOT "maximum specificity", because the engine filters by principal
+// BEFORE it scores (findMatchingCapability skips a principal-scoped constraint whose
+// claims do not match, exactly like a target mismatch). A more-specific entry
+// therefore shadows a less-specific one only when it applies to every caller — that
+// is, only when it is UNSCOPED. Given
+//
+//	tool:read_file  {principal: {sub: [alice]}}   (exact, scoped)
+//	tool:read_*                                   (glob, unscoped)
+//
+// every caller who is not alice is governed by the glob, yet a maximum-specificity
+// rule sees only the exact entry and never runs the glob's checks.
+//
+// So the cutoff is the highest specificity among the UNSCOPED matches: anything below
+// it is shadowed for every caller and genuinely unreachable, and everything at or
+// above it is reachable for some caller. With no unscoped match at all nothing
+// universally shadows anything, so every match is kept. Over-inclusion here costs at
+// most an extra warning about an entry that turns out to be unreachable; under-
+// inclusion silently skips a fatal check.
 func coveringConstraints(manifest *config.LocalManifest, toolName string) []*capability.Constraint {
-	bestScore := -(1 << 30)
-	var out []*capability.Constraint
+	type match struct {
+		c     *capability.Constraint
+		score int
+	}
+	var matches []match
+	// Sentinel below every real specificity score, so "no unscoped match" keeps
+	// everything rather than filtering against an unset cutoff.
+	cutoff := -(1 << 30)
 	for i := range manifest.Capabilities {
 		c := &manifest.Capabilities[i]
 		if targetType, _, err := capability.ParseTarget(c.Target); err != nil || targetType != capability.TargetTypeTool {
@@ -765,12 +819,16 @@ func coveringConstraints(manifest *config.LocalManifest, toolName string) []*cap
 		if !matchResource(c.Target, toolName) {
 			continue
 		}
-		switch s := resSpecificity(c.Target, toolName); {
-		case s > bestScore:
-			bestScore = s
-			out = append(out[:0], c)
-		case s == bestScore:
-			out = append(out, c)
+		s := resSpecificity(c.Target, toolName)
+		matches = append(matches, match{c: c, score: s})
+		if !c.HasPrincipal() && s > cutoff {
+			cutoff = s
+		}
+	}
+	var out []*capability.Constraint
+	for _, m := range matches {
+		if m.score >= cutoff {
+			out = append(out, m.c)
 		}
 	}
 	return out
@@ -1094,7 +1152,8 @@ func driftProbeUnavailable(manifest *config.LocalManifest, strict bool, err erro
 		return fmt.Errorf("tools/list unavailable and manifest has descriptionHash pins: cannot verify description integrity: %w", err)
 	}
 	if strict {
-		return fmt.Errorf("tools/list unavailable under --strict-drift: cannot verify manifest drift; an unreachable probe is indistinguishable from drift: %w", err)
+		// Names the mode, not the flag: strictDrift: in a gateway config sets it too.
+		return fmt.Errorf("tools/list unavailable under strict drift checking: cannot verify manifest drift; an unreachable probe is indistinguishable from drift: %w", err)
 	}
 	// Glob-only manifest, non-strict: the skip stays non-blocking, but make it
 	// OBSERVABLE so an operator never mistakes "probe skipped, drift unknown" for

@@ -598,6 +598,37 @@ func TestRunConditions_TypedNilConditionFailsClosed(t *testing.T) {
 	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeConditionFailed {
 		t.Fatalf("denial = %+v, want CONDITION_FAILED", resp.Denial)
 	}
+	// HardDeny, like the two sibling engine-bug denies in runConditions. Without it an
+	// audit-only constraint (or a route under --audit) downgrades this verdict and
+	// FORWARDS the call — so a restriction the policy declared but the engine could not
+	// evaluate even once would let the call through, which is the fail-open the guard
+	// exists to prevent.
+	if !resp.Denial.HardDeny {
+		t.Error("denial.HardDeny = false; an unevaluable condition is a construction fault, not a downgradable policy verdict")
+	}
+}
+
+// TestRunConditions_NullConditionIsNotDowngradedUnderAuditMode is the reachable half:
+// the guard above only actually blocks if the verdict survives audit-mode downgrading,
+// and an audit-only constraint is exactly where a null condition would otherwise be
+// forwarded with its declared restriction never checked.
+func TestRunConditions_NullConditionIsNotDowngradedUnderAuditMode(t *testing.T) {
+	e := New(WithCallCounter(callcounter.NewInMemory()))
+	req := &capability.EnforceRequest{SessionID: "sess-1", TargetName: "tool"}
+	constraint := &capability.Constraint{
+		Target:      "tool",
+		Actions:     []string{"*"},
+		Enforcement: "audit",
+		Conditions:  []capability.Condition{nil},
+	}
+
+	resp := e.EvaluateConditions(context.Background(), req, constraint)
+	if resp.Decision != capability.DecisionDeny {
+		t.Fatalf("decision = %q, want deny", resp.Decision)
+	}
+	if resp.Denial == nil || !resp.Denial.HardDeny {
+		t.Fatalf("denial = %+v, want HardDeny so the audit-only constraint cannot downgrade it to a forward", resp.Denial)
+	}
 }
 
 // RecordSessionCall must key the sequenceBlock history WRITE under req.Target.Name
@@ -1051,6 +1082,28 @@ func TestNumericEqual(t *testing.T) {
 		{"json.Number negative vs int", json.Number("-3"), -3, true},
 		{"json.Number large int distinct", json.Number("9007199254740993"), int64(9007199254740992), false},
 		{"json.Number large int equal", json.Number("9007199254740993"), int64(9007199254740993), true},
+
+		// Above 2^63 NEITHER operand is int64-representable, so the exact int64 arm
+		// and the one-side-only guard both fall through and the float64 fallback
+		// rounds distinct integers onto a shared value. allowedValues:
+		// [9223372036854775808] then admitted the argument 9223372036854775809 — a
+		// value outside the declared set, the fail-open direction, on a boundary.
+		{"distinct integers above 2^63", json.Number("9223372036854775808"), json.Number("9223372036854775809"), false},
+		{"equal integers above 2^63", json.Number("9223372036854775808"), json.Number("9223372036854775808"), true},
+		{"distinct integers far above 2^63", json.Number("100000000000000000000000"), json.Number("100000000000000000000001"), false},
+		{"exponent form equals its expansion", json.Number("1e30"), json.Number("1000000000000000000000000000000"), true},
+		// A float64 operand IS its exact binary value: one that reads as 2^63 is 2^63,
+		// and is genuinely distinct from the decimal literal 2^63+1.
+		{"float64 2^63 vs the next integer", float64(9223372036854775808), json.Number("9223372036854775809"), false},
+		{"float64 2^63 vs its own literal", float64(9223372036854775808), json.Number("9223372036854775808"), true},
+
+		// The exact arm is restricted to INTEGERS on purpose. A fractional decimal
+		// literal and its float64 coercion are different rationals (0.1 is not the
+		// binary double nearest 0.1), so comparing those exactly would break working
+		// policies for no security gain — the approximation is consistent on both sides.
+		{"fractional literal vs its float64 coercion", json.Number("0.1"), 0.1, true},
+		{"fractional literal vs its own text", json.Number("0.1"), json.Number("0.1"), true},
+		{"distinct fractionals stay distinct", json.Number("0.1"), json.Number("0.2"), false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

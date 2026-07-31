@@ -382,13 +382,17 @@ func TestRenderSuggestedManifest_StringArgBecomesAllowedValues(t *testing.T) {
 	s, _ := computeSuggestions(strings.NewReader(log), suggestMaxValuesDefault)
 	out := renderSuggestedManifest(s, "m", suggestMaxValuesDefault)
 
+	// Expectations are built through yamlScalar, the renderer itself, rather than
+	// frozen to one quoting style: what the draft must guarantee is that each mined
+	// string round-trips back to the value the tape observed, and yamlScalar is the
+	// single place that decides how (bare, quoted, or !!binary).
 	for _, want := range []string{
-		`- target: "tool:read_file"`, // target token is emitted as a quoted scalar
+		"- target: " + yamlScalar("tool:read_file"),
 		"- type: allowedValues",
-		`argument: "path"`, // argument name is emitted as a quoted scalar
-		`"/reports/q3.pdf"`,
-		`"/reports/q4.pdf"`,
-		`["/reports/*"]`, // glob generalization hint
+		"argument: " + yamlScalar("path"),
+		yamlScalar("/reports/q3.pdf"),
+		yamlScalar("/reports/q4.pdf"),
+		"[" + yamlScalar("/reports/*") + "]", // glob generalization hint
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output missing %q\n---\n%s", want, out)
@@ -529,8 +533,8 @@ func TestRenderSuggestedManifest_YAMLSignificantArgNameRoundTrips(t *testing.T) 
 	s, _ := computeSuggestions(strings.NewReader(log), suggestMaxValuesDefault)
 	out := renderSuggestedManifest(s, "m", suggestMaxValuesDefault)
 
-	if !strings.Contains(out, `argument: "header: name"`) {
-		t.Errorf("argument name with YAML-significant characters must be emitted quoted\n%s", out)
+	if !strings.Contains(out, "argument: "+yamlScalar(arg)) {
+		t.Errorf("argument name with YAML-significant characters must be emitted through yamlScalar\n%s", out)
 	}
 	// The draft must load, and the loaded condition must name the exact argument
 	// rather than a fragment left by a YAML misparse.
@@ -561,13 +565,13 @@ func TestRenderSuggestedManifest_OptionalArgNotConstrained(t *testing.T) {
 	s, _ := computeSuggestions(strings.NewReader(log), suggestMaxValuesDefault)
 	out := renderSuggestedManifest(s, "m", suggestMaxValuesDefault)
 
-	if strings.Contains(out, `argument: "path"`) {
+	if strings.Contains(out, "argument: "+yamlScalar("path")+"\n") {
 		t.Errorf("optional argument \"path\" was emitted as an active condition; it must be left unconstrained\n%s", out)
 	}
 	if !strings.Contains(out, `# argument "path"`) {
 		t.Errorf("expected a review comment for the unconstrained optional argument \"path\"\n%s", out)
 	}
-	if !strings.Contains(out, `argument: "encoding"`) {
+	if !strings.Contains(out, "argument: "+yamlScalar("encoding")) {
 		t.Errorf("the always-present argument \"encoding\" should still be constrained\n%s", out)
 	}
 	// Both observed calls — including the one that omitted "path" — must still be
@@ -771,13 +775,13 @@ func TestRenderSuggestedManifest_SamplingAlwaysCommented(t *testing.T) {
 	s, _ := computeSuggestions(strings.NewReader(log), suggestMaxValuesDefault)
 	out := renderSuggestedManifest(s, "m", suggestMaxValuesDefault)
 
-	if !strings.Contains(out, `# - target: "system:sampling/createMessage"`) {
+	if !strings.Contains(out, "# - target: "+yamlScalar("system:sampling/createMessage")) {
 		t.Errorf("sampling opt-in must be emitted commented out\n%s", out)
 	}
 	// And there must be no active (uncommented) system entry.
 	for _, line := range strings.Split(out, "\n") {
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, `- target: "system:`) {
+		if strings.HasPrefix(trimmed, "- target: system:") || strings.HasPrefix(trimmed, `- target: "system:`) {
 			t.Errorf("found active sampling entry; must stay commented: %q", line)
 		}
 	}
@@ -869,8 +873,8 @@ func TestRenderSuggestedManifest_YAMLHostileTargetNameRoundTrips(t *testing.T) {
 	s, _ := computeSuggestions(strings.NewReader(log), suggestMaxValuesDefault)
 	out := renderSuggestedManifest(s, "m", suggestMaxValuesDefault)
 
-	if !strings.Contains(out, `- target: "tool:weird: tool *name"`) {
-		t.Errorf("YAML-hostile target name must be emitted as a quoted token\n%s", out)
+	if !strings.Contains(out, "- target: "+yamlScalar("tool:"+tool)) {
+		t.Errorf("YAML-hostile target name must be emitted through yamlScalar\n%s", out)
 	}
 	path := filepath.Join(t.TempDir(), "draft.yaml")
 	if err := os.WriteFile(path, []byte(out), 0o600); err != nil {
@@ -888,6 +892,58 @@ func TestRenderSuggestedManifest_YAMLHostileTargetNameRoundTrips(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("loaded manifest does not carry the exact target %q\n%s", "tool:"+tool, out)
+	}
+}
+
+// TestRenderSuggestedManifest_ValuesRenderThroughTheSharedYAMLRenderer pins that the
+// mined VALUES — not only the target and argument names the tests above cover — are
+// emitted through yamlScalar, the same renderer `init` uses for its scaffold, rather
+// than through Go's %q.
+//
+// Go quoting and YAML quoting agree on almost everything, and where they diverge is on
+// \xNN: Go reads it as a raw byte, YAML as the code point U+00NN. A draft built with %q
+// would therefore load cleanly while naming a DIFFERENT string than the tape observed —
+// a rule against a tool or value that does not exist, silently matching nothing.
+//
+// That divergence is not reachable through the tape today: the audit writer normalizes
+// its envelope fields to valid UTF-8 and encoding/json replaces any remaining invalid
+// byte with U+FFFD, so a mined string is always valid UTF-8 by the time it arrives.
+// Sharing the renderer is what keeps it unreachable if a future producer changes, and
+// the direct assertion below pins the fallback that makes it so.
+func TestRenderSuggestedManifest_ValuesRenderThroughTheSharedYAMLRenderer(t *testing.T) {
+	// Values chosen to be YAML-hostile in different ways: a colon-space, a comment
+	// marker, a bare "null" that would decode as nil, and a leading "&" anchor sigil.
+	// Deliberately no glob metacharacter — suggest leaves such an argument
+	// unconstrained on its own (see the glob-widening note), which would emit no
+	// values at all and vacuously pass this test.
+	vals := []string{"a: b", "x #c", "null", "&anchor"}
+	var lines []string
+	for _, v := range vals {
+		lines = append(lines, auditLine("allow", "tool", "fetch", map[string]any{"details": map[string]any{"path": v}}))
+	}
+	sset, _ := computeSuggestions(strings.NewReader(strings.Join(lines, "\n")), suggestMaxValuesDefault)
+	out := renderSuggestedManifest(sset, "m", suggestMaxValuesDefault)
+
+	for _, v := range vals {
+		if !strings.Contains(out, "- "+yamlScalar(v)) {
+			t.Errorf("value %q was not emitted through yamlScalar\n%s", v, out)
+		}
+	}
+	path := filepath.Join(t.TempDir(), "draft.yaml")
+	if err := os.WriteFile(path, []byte(out), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	m, err := config.LoadManifest(path)
+	if err != nil {
+		t.Fatalf("draft with YAML-hostile mined values failed to load:\n%s\nerror: %v", out, err)
+	}
+	// Every observed call must still be admitted by the draft: a value that decoded to
+	// something else would deny the very call it was mined from.
+	for _, v := range vals {
+		assertManifestAllows(t, out, "fetch", map[string]any{"path": v})
+	}
+	if len(m.Capabilities) == 0 {
+		t.Fatalf("draft carries no capabilities\n%s", out)
 	}
 }
 
@@ -1079,7 +1135,7 @@ func TestMineArgs_NilDetailsIsNotADenominator(t *testing.T) {
 	if strings.Contains(out, "left unconstrained, since a condition would deny the calls that omit it") {
 		t.Errorf("always-present argument must not be mislabeled optional by a nil-details enforce allow\n%s", out)
 	}
-	if !strings.Contains(out, `argument: "path"`) {
+	if !strings.Contains(out, "argument: "+yamlScalar("path")) {
 		t.Errorf("always-present argument \"path\" should be constrained, not suppressed\n%s", out)
 	}
 	assertManifestAllows(t, out, "read_file", map[string]any{"path": "/reports/q3.pdf"})
@@ -1245,7 +1301,7 @@ func TestRenderSuggestedManifest_PerValueTruncationNoToolLevelNote(t *testing.T)
 		t.Errorf("draft missing argument-specific truncation note for \"body\"\n%s", out)
 	}
 	// The other argument must still be constrained.
-	if !strings.Contains(out, `argument: "encoding"`) {
+	if !strings.Contains(out, "argument: "+yamlScalar("encoding")) {
 		t.Errorf("a per-value truncation of one argument must not suppress conditions for others\n%s", out)
 	}
 	assertManifestAllows(t, out, "write_file", map[string]any{"body": "anything", "encoding": "utf8"})

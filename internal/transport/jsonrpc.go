@@ -115,16 +115,21 @@ type upstreamResult struct {
 }
 
 // sendUpstreamResult is the shared non-blocking delivery core for
-// deliverUpstreamResponse and deliverUpstreamError: it looks up key in pending
+// deliverUpstreamResponse and deliverUpstreamError: it looks up key in byID
 // (guarded by mu) and, if a caller is still waiting, sends result on its
-// buffered(1) channel. The send never blocks, so the reader/bridge goroutine
+// buffered(1) channel.
+//
+// The map is byUpstreamID — the nonce-keyed ROUTER — never the host-id-keyed
+// `pending` set, which exists only to reject a duplicate in-flight host ID. The
+// parameter was named `pending`, which read as though delivery went through that
+// map; it never did. The send never blocks, so the reader/bridge goroutine
 // delivering it never wedges: an untracked, already-served, or abandoned key is
 // simply dropped (there is nothing to deliver to). Returns whether a registered
 // caller was found — callers that need a fallback when nobody was waiting (the
 // stdio-to-HTTP bridge's in-band synthesized response) key it off this.
-func sendUpstreamResult(mu *sync.Mutex, pending map[string]chan upstreamResult, key string, result upstreamResult) bool {
+func sendUpstreamResult(mu *sync.Mutex, byID map[string]chan upstreamResult, key string, result upstreamResult) bool {
 	mu.Lock()
-	ch, ok := pending[key]
+	ch, ok := byID[key]
 	mu.Unlock()
 	if !ok {
 		return false
@@ -137,10 +142,10 @@ func sendUpstreamResult(mu *sync.Mutex, pending map[string]chan upstreamResult, 
 }
 
 // deliverUpstreamResponse routes a genuine upstream response to the caller in
-// pending awaiting its ID, if any. Both transports' readUpstream loops deliver
+// byUpstreamID awaiting its nonce, if any. Both transports' readUpstream loops deliver
 // through here.
-func deliverUpstreamResponse(mu *sync.Mutex, pending map[string]chan upstreamResult, msg mcp.RPCMsg) {
-	sendUpstreamResult(mu, pending, mcp.MsgKey(msg.ID), upstreamResult{msg: msg})
+func deliverUpstreamResponse(mu *sync.Mutex, byID map[string]chan upstreamResult, msg mcp.RPCMsg) {
+	sendUpstreamResult(mu, byID, mcp.MsgKey(msg.ID), upstreamResult{msg: msg})
 }
 
 // deliverUpstreamError routes a transport-level failure (connection refused, DNS,
@@ -152,8 +157,8 @@ func deliverUpstreamResponse(mu *sync.Mutex, pending map[string]chan upstreamRes
 // error lifecycle to leak — and the bridge falls back to its in-band synthesized
 // response instead (the handshake/probe path never registers in byUpstreamID at
 // all, since it reads the bridge directly rather than through callUpstream).
-func deliverUpstreamError(mu *sync.Mutex, pending map[string]chan upstreamResult, upKey string, err error) bool {
-	return sendUpstreamResult(mu, pending, upKey, upstreamResult{err: err})
+func deliverUpstreamError(mu *sync.Mutex, byID map[string]chan upstreamResult, upKey string, err error) bool {
+	return sendUpstreamResult(mu, byID, upKey, upstreamResult{err: err})
 }
 
 // isMalformedResponse reports whether resp violates the JSON-RPC 2.0 invariant

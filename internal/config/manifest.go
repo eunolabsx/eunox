@@ -225,16 +225,6 @@ func rejectCoercedScalarsForFormat(node *yaml.Node, isJSON bool, path string) er
 	return nil
 }
 
-// forceSchemaVersionToString retags an unquoted top-level `schemaVersion` scalar to
-// !!str so the natural `schemaVersion: 0.1` (which yaml.v3 auto-types as a float)
-// decodes as the string "0.1" and negotiates identically to the quoted form — and to
-// the gateway-config loader, which already preserves the verbatim source text. Without
-// this the number flows through node.Decode → json.Marshal → json.Unmarshal into the
-// string SchemaVersion field and fails with an opaque "cannot unmarshal number into ...
-// string" before validateManifestSchemaVersion can emit its friendly message. Retagging
-// keeps the verbatim text, so "0.10" stays "0.10" (≠ "0.1") rather than renormalizing;
-// an unsupported unquoted value (e.g. 1) then reaches the version check and is rejected
-// with a clear "unsupported version" error instead of a decode error.
 // topLevelValueNode returns the value node of a top-level mapping key, unwrapping a
 // DocumentNode wrapper first. Returns nil if the document isn't a mapping or the key is
 // absent, shared by schemaVersionFromNode and forceSchemaVersionToString so the top-level
@@ -269,6 +259,16 @@ func schemaVersionFromNode(node *yaml.Node) (string, bool) {
 	return val.Value, true
 }
 
+// forceSchemaVersionToString retags an unquoted top-level `schemaVersion` scalar to
+// !!str so the natural `schemaVersion: 0.1` (which yaml.v3 auto-types as a float)
+// decodes as the string "0.1" and negotiates identically to the quoted form — and to
+// the gateway-config loader, which already preserves the verbatim source text. Without
+// this the number flows through node.Decode → json.Marshal → json.Unmarshal into the
+// string SchemaVersion field and fails with an opaque "cannot unmarshal number into ...
+// string" before validateManifestSchemaVersion can emit its friendly message. Retagging
+// keeps the verbatim text, so "0.10" stays "0.10" (≠ "0.1") rather than renormalizing;
+// an unsupported unquoted value (e.g. 1) then reaches the version check and is rejected
+// with a clear "unsupported version" error instead of a decode error.
 func forceSchemaVersionToString(node *yaml.Node) {
 	val := topLevelValueNode(node, "schemaVersion")
 	if val != nil && val.Kind == yaml.ScalarNode && (val.Tag == "!!int" || val.Tag == "!!float") {

@@ -431,6 +431,57 @@ func TestOpenAuditSink_WritesIntegrityMarkerOnTamperedTail(t *testing.T) {
 	}
 }
 
+// TestOpenAuditSink_StrictDecodeRefusedTailIsNotLabelledHMACMismatch pins the forensic
+// taxonomy. VerifyRecord strict-decodes BEFORE it computes any MAC, so a tail carrying an
+// unknown top-level field is refused with no HMAC comparison ever having run — yet the
+// resume recorded it as tail_hmac_mismatch, a marker that asserts a key rejected the
+// record and points an operator at a tampering remediation for what is usually a
+// malformed or forward-versioned line. The fail-closed behavior (restart from genesis) is
+// the same either way; only the label was wrong.
+func TestOpenAuditSink_StrictDecodeRefusedTailIsNotLabelledHMACMismatch(t *testing.T) {
+	dir := t.TempDir()
+	logPath, keyPath := writeChainLog(t, dir, "read_file", "write_file")
+
+	// Inject a field auditRecord does not model. The line stays well-formed JSON with a
+	// syntactically valid _hmac, so it reaches VerifyRecord — which refuses it at the
+	// strict decode, before any MAC is computed.
+	lines := logLines(t, logPath)
+	tampered := bytes.Replace(lines[1], []byte(`{`), []byte(`{"operator_override":"approved",`), 1)
+	if bytes.Equal(tampered, lines[1]) {
+		t.Fatal("injection did not change the tail line")
+	}
+	rewriteLines(t, logPath, [][]byte{lines[0], tampered})
+
+	sink, err := Open(logPath, keyPath, 0, 0)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := sink.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	out := logLines(t, logPath)
+	var marker auditRecord
+	if err := json.Unmarshal(out[len(out)-1], &marker); err != nil {
+		t.Fatalf("unmarshal marker: %v", err)
+	}
+	details := recordDetails(t, marker)
+	if got := details["kind"]; got != "tail_strict_decode_refused" {
+		t.Errorf("marker kind = %v, want tail_strict_decode_refused — no HMAC comparison ran, so the marker must not claim one failed", got)
+	}
+	// Fail-closed behavior is unchanged: the unverified tail never seeds the chain.
+	if marker.PrevHMAC != auditGenesisPrev {
+		t.Errorf("marker PrevHMAC = %q, want the genesis sentinel %q", marker.PrevHMAC, auditGenesisPrev)
+	}
+	if marker.DenialCode != "AUDIT_INTEGRITY_FAILURE" {
+		t.Errorf("marker DenialCode = %q, want AUDIT_INTEGRITY_FAILURE", marker.DenialCode)
+	}
+	ok, verr := verifierFor(t, keyPath).VerifyRecord(out[len(out)-1])
+	if verr != nil || !ok {
+		t.Errorf("the integrity marker must be individually HMAC-valid: ok=%v err=%v", ok, verr)
+	}
+}
+
 // TestOpenAuditSink_WritesMarkerOnUnparseableTail is the regression: when
 // the audit log tail fails to parse as JSON (truncated/corrupt last record),
 // openAuditSink must write a signed, structured AUDIT_INTEGRITY_FAILURE record —

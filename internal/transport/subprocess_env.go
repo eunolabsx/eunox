@@ -70,9 +70,36 @@ func isSensitiveUpstreamEnv(kv string) bool {
 // It takes an already-built *exec.Cmd so it fits both the transports' deliberate
 // exec.Command (subprocess lifecycles are managed explicitly, not by a context) and the
 // CLI probe's exec.CommandContext. Call it immediately after construction, before Start.
+//
+// The process-group placement belongs here for the same un-forgettable-default reason
+// as the environment: a spawn site that omits it produces an upstream whose
+// wrapper-spawned grandchildren cannot be reaped, and the symptom (a shutdown that
+// hangs) shows up far from the spawn.
 func ConfigureUpstreamCmd(cmd *exec.Cmd) {
 	cmd.Stderr = os.Stderr
 	cmd.Env = upstreamEnv()
+	setUpstreamProcessGroup(cmd)
+}
+
+// killUpstreamProcess forcibly stops an upstream subprocess AND everything it spawned,
+// falling back to the direct child on a platform (or a failed Setpgid) with no process
+// group to signal.
+//
+// It lives beside ConfigureUpstreamCmd for the same reason the group placement does:
+// spawn and teardown are one contract. Every kill site in the package goes through it,
+// so a site that reached for proc.Kill() directly would reap the wrapper and orphan the
+// real server — leaking a process per session in HTTP mode, and on the stdio startup
+// and shutdown paths leaving the grandchild holding the stdout pipe whose EOF the
+// bounded teardowns wait for. proc may be nil (a session torn down before its
+// subprocess started); killing an already-reaped process is a no-op whose error is
+// ignored, so this is idempotent.
+func killUpstreamProcess(proc *os.Process) {
+	if proc == nil {
+		return
+	}
+	if !killUpstreamGroup(proc) {
+		_ = proc.Kill()
+	}
 }
 
 // upstreamEnv returns the current process environment with every eunox-owned secret

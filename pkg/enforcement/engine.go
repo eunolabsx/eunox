@@ -615,6 +615,11 @@ func recordFailureDenial(requestID, now string, auditOnly bool, obligations []ca
 // new field means checking this one constructor, not six call sites. obligations may
 // be nil (only recordFailureDenial passes any today).
 func denyResponse(requestID, now string, auditOnly bool, obligations []capability.Obligation, denial capability.DenialInfo) capability.EnforceResponse {
+	// Every deny the engine produces passes through here, and denial.Details is what
+	// the transport hands verbatim to RecordDeny — so this is the one place that can
+	// bound the caller-controlled values condition handlers echo without asking each
+	// handler's Details literal to remember. See boundDenialDetails.
+	denial.Details = boundDenialDetails(denial.Details)
 	return capability.EnforceResponse{
 		RequestID:   requestID,
 		Decision:    capability.DecisionDeny,
@@ -686,8 +691,15 @@ func (e *Engine) runConditions(ctx context.Context, req *capability.EnforceReque
 		// CollectObligations' identical typed-nil guard does.
 		if cond == nil || isTypedNil(cond) {
 			resp := denyResponse(requestID, now, matched.IsAuditOnly(), nil, capability.DenialInfo{
-				Code:    capability.ErrCodeConditionFailed,
-				Message: "constraint carries a null condition that cannot be evaluated",
+				Code: capability.ErrCodeConditionFailed,
+				// HardDeny, matching the two sibling engine-bug denies in this function: an
+				// unevaluable condition is a construction fault, not a downgradable policy
+				// verdict. Without it an audit-mode constraint (or a route under --audit)
+				// forwards a call whose declared restriction was never checked even once —
+				// the same fail-open shape as admitting a committing bucket unchecked,
+				// which is precisely why those two carry the flag.
+				HardDeny: true,
+				Message:  "constraint carries a null condition that cannot be evaluated",
 			})
 			return &resp
 		}
@@ -1150,16 +1162,33 @@ func (e *Engine) ValidateAction(ctx context.Context, req *capability.EnforceRequ
 	return e.evaluateMatched(ctx, req, matched, requestID, now)
 }
 
-// FindMatchingCapability returns the most specific capability that matches the
-// request, or nil if none match. Exported so a caller that needs the matched
-// constraint rather than a decision can reuse the engine's selection logic —
-// today that is pkg/enforcement's own schema/obligation helpers and external
-// embedders. The proxy does NOT route through it: internal/pdp.findConstraint
-// runs its own scan over pre-split targets, sharing only the tiebreak (see
-// ConstraintScorer) and the match/specificity primitives (MatchesResource,
-// ResourceSpecificity). Change the precedence rule in ConstraintScorer, not here.
-func (e *Engine) FindMatchingCapability(req *capability.EnforceRequest, capabilities []capability.Constraint) *capability.Constraint {
-	return e.findMatchingCapability(req, capabilities)
+// resolveRequestTarget resolves a request's namespace type and bare target name: the
+// type from an explicit req.Target.Type when present, else from the req.TargetName
+// prefix (a bare name defaults to "tool"). Splitting the prefix lets a
+// "tool:read_file" manifest entry match a bare TargetName "read_file" while a prefixed
+// TargetName still works.
+//
+// The verbatim Target.Name is preferred over the prefix-split bare name, and that rule
+// is the reason this is a function rather than eight inline lines repeated per caller.
+// A resource or prompt may itself be named with a leading recognized token (a resource
+// "system:config", a prompt "tool:reboot"): splitEnginePrefix would wrongly strip the
+// token and leave "config", so the covering "resource:system:config" constraint (bare
+// name "system:config") never matches and legitimate access is denied. The PDP
+// selection path derives the bare name from Target.Name verbatim; this mirrors it so
+// the engine and proxy agree on what a policy means. It was copy-pasted at two call
+// sites with the rationale written out at only one of them.
+func resolveRequestTarget(req *capability.EnforceRequest) (reqType, bareName string) {
+	reqType, bareName = splitEnginePrefix(req.TargetName)
+	if req.Target == nil {
+		return reqType, bareName
+	}
+	if req.Target.Type != "" {
+		reqType = req.Target.Type
+	}
+	if n := strings.TrimSpace(req.Target.Name); n != "" {
+		bareName = n
+	}
+	return reqType, bareName
 }
 
 // noMatchScore is the sentinel for "no matching capability found yet".
@@ -1211,29 +1240,19 @@ func (cs *ConstraintScorer) Best() int { return cs.best }
 // capabilities, never reorder ones whose specificity already differs.
 const resourceScoreWeight = 10
 
-// findMatchingCapability finds the most specific matching capability. Tie-breaking
-// is stable: at equal specificity, the first in the list wins.
-func (e *Engine) findMatchingCapability(req *capability.EnforceRequest, capabilities []capability.Constraint) *capability.Constraint {
-	// Resolve the request's namespace type and bare name: type from explicit
-	// req.Target.Type when present, else the req.TargetName prefix (bare defaults to
-	// "tool"). Splitting the prefix lets a "tool:read_file" manifest entry match a
-	// bare TargetName "read_file" while a prefixed TargetName still works.
-	reqType, bareToolName := splitEnginePrefix(req.TargetName)
-	if req.Target != nil {
-		if req.Target.Type != "" {
-			reqType = req.Target.Type
-		}
-		// Prefer the verbatim target name over the prefix-split bare name. A
-		// resource/prompt may itself be named with a leading recognized token (e.g. a
-		// resource "system:config" or a prompt "tool:reboot"): splitEnginePrefix would
-		// wrongly strip the token and leave "config", so the covering
-		// "resource:system:config" constraint (bare name "system:config") never matches
-		// and legitimate access is denied. The PDP selection path derives the bare name
-		// from Target.Name verbatim; mirror it so the engine and proxy agree.
-		if n := strings.TrimSpace(req.Target.Name); n != "" {
-			bareToolName = n
-		}
-	}
+// FindMatchingCapability returns the most specific capability that matches the
+// request, or nil if none match. Tie-breaking is stable: at equal specificity, the
+// first in the list wins.
+//
+// Exported so a caller that needs the matched constraint rather than a decision can
+// reuse the engine's selection logic — today that is pkg/enforcement's own
+// schema/obligation helpers and external embedders. The proxy does NOT route through
+// it: internal/pdp.findConstraint runs its own scan over pre-split targets, sharing
+// only the tiebreak (see ConstraintScorer) and the match/specificity primitives
+// (MatchesResource, ResourceSpecificity). Change the precedence rule in
+// ConstraintScorer, not here.
+func (e *Engine) FindMatchingCapability(req *capability.EnforceRequest, capabilities []capability.Constraint) *capability.Constraint {
+	reqType, bareToolName := resolveRequestTarget(req)
 	scorer := NewConstraintScorer()
 	for i := range capabilities {
 		constraint := &capabilities[i]
@@ -1275,15 +1294,7 @@ func (e *Engine) findMatchingCapability(req *capability.EnforceRequest, capabili
 // The returned constraint carries no enforcement mode and no conditions: it exists only
 // to be handed to CollectObligations.
 func namingTargetConstraint(req *capability.EnforceRequest, capabilities []capability.Constraint) *capability.Constraint {
-	reqType, bareName := splitEnginePrefix(req.TargetName)
-	if req.Target != nil {
-		if req.Target.Type != "" {
-			reqType = req.Target.Type
-		}
-		if n := strings.TrimSpace(req.Target.Name); n != "" {
-			bareName = n
-		}
-	}
+	reqType, bareName := resolveRequestTarget(req)
 	out := &capability.Constraint{Target: reqType + ":" + bareName}
 	for i := range capabilities {
 		constraintType, bare := splitEnginePrefix(capabilities[i].Target)

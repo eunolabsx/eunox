@@ -72,6 +72,25 @@ type auditRecord struct {
 	KeyID         string   `json:"key_id,omitempty"` // id of the HMAC key that signed this record; lets audit-verify select the right key after rotation (§ 3.4)
 	PrevHMAC      string   `json:"prev_hmac"`        // _hmac of the preceding record (genesis sentinel for the first); chains records together
 	HMAC          string   `json:"_hmac,omitempty"`
+
+	// queuedSize is the byte reservation this record holds against
+	// auditQueueByteBudget: queueSize() evaluated ONCE at enqueue, carried on the
+	// record itself so the drainer credits back exactly what the enqueue charged.
+	//
+	// Recomputing it at drain time was the alternative, and it balanced only by an
+	// unenforced coincidence — writeRecord stamps Seq, PrevHMAC and HMAC through the
+	// record pointer before the credit, so the two calls agreed only while queueSize
+	// counted none of those three. The first field queueSize learns to count that
+	// writeRecord also stamps would make every record credit back a different amount
+	// than it charged, and queuedBytes is a process-lifetime accumulator: any
+	// per-record skew drifts monotonically until the budget check is permanently true
+	// and a healthy proxy with an idle disk drops every audit record. Charging a
+	// stored size makes that drift structurally impossible (and removes a second full
+	// field walk per record).
+	//
+	// Unexported, so encoding/json omits it from the signed body with no tag needed,
+	// and it rides the by-value channel copy to the drainer.
+	queuedSize int64
 }
 
 // auditGenesisPrev is the prev_hmac stamped on the first record of a brand-new
@@ -98,6 +117,11 @@ const (
 	// write-capable attacker can make WITHOUT the key. It is therefore treated exactly
 	// like an unparseable tail: the chain is not resumed onto it.
 	tailFailUnsigned
+	// tailFailUndecodable: the tail was refused by the strict decoder (malformed, an
+	// unknown top-level field, or trailing bytes), so no HMAC comparison ever ran. It
+	// restarts the chain exactly like a mismatch does; it is a distinct kind purely so
+	// the marker on the tape names what actually happened.
+	tailFailUndecodable
 )
 
 // auditChannelSize bounds the queue feeding the background drainer. When full,
@@ -180,11 +204,17 @@ type Sink struct {
 	// retained heap when a slow disk meets audit-mode large-argument logging — enough
 	// to OOM the proxy, taking down enforcement and the audit trail together. This
 	// counter adds an aggregate BYTE bound (auditQueueByteBudget): the enqueue path
-	// drops over-budget records like a full queue (the drop marker keeps the loss
-	// tamper-evident) and the drainer subtracts each record's size as it is consumed.
-	// The check-then-add is not atomic with the send, so the bound is soft (a few
-	// concurrent enqueuers may overshoot by a record each) — that is fine; the goal is
-	// bounding gigabytes, not exact accounting.
+	// reserves a record's size before handing it to the channel and drops over-budget
+	// records like a full queue (the drop marker keeps the loss tamper-evident), and the
+	// drainer credits back that same reservation as it consumes each record.
+	//
+	// Reserve-before-send, not add-after-send: the drainer can receive a record and run
+	// its credit before the producing goroutine reaches the charge, which drove this
+	// counter transiently negative and made it under-report in-flight heap for as long
+	// as the skew lasted. It is never negative now, and the reservation is exact rather
+	// than recomputed (see auditRecord.queuedSize). The estimate itself is still soft —
+	// queueSize approximates per-record heap and the flat envelope allowance is not
+	// exact — but the accounting around it no longer drifts.
 	queuedBytes atomic.Int64
 
 	// lastDroppedMarked is the dropped count already reflected by a written
@@ -663,6 +693,15 @@ func (s *Sink) resumeChainFromTail(last string) tailResumeResult {
 			fmt.Fprintf(os.Stderr, "[eunox] WARNING: audit log tail was signed by a retired key no longer in the verification ring; this is expected immediately after a key rotation. The chain cannot be resumed and restarts from genesis — run 'eunox audit-verify' with the retired key still available to confirm the tail is intact.\n")
 			return tailResumeResult{tailFailKind: tailFailKeyUnknown, tailSeq: prev.Seq, tailHMAC: prev.HMAC}
 		}
+		if errors.Is(err, errStrictDecodeRefused) {
+			// The strict decoder refused the line, so VerifyRecord returned BEFORE
+			// computing any MAC. Recording this as tail_hmac_mismatch asserted a
+			// comparison that never ran and pointed the operator at a tampering
+			// remediation for what is usually a malformed or forward-versioned record.
+			// The chain still restarts from genesis — only the label differs.
+			fmt.Fprintf(os.Stderr, "[eunox] WARNING: audit log tail could not be decoded for verification (malformed, an unknown field, or trailing bytes), so its signature was never checked. The chain cannot be resumed and restarts from genesis — run 'eunox audit-verify' and reconcile against your external sink.\n")
+			return tailResumeResult{tailFailKind: tailFailUndecodable, tailSeq: prev.Seq, tailHMAC: prev.HMAC}
+		}
 		fmt.Fprintf(os.Stderr, "[eunox] WARNING: audit log tail failed HMAC verification; the last record may have been tampered with or truncated. The chain cannot be resumed and restarts from genesis — run 'eunox audit-verify' and reconcile against your external sink.\n")
 		// Mark it in-band too (stderr is lost to log rotation and not in the
 		// tamper-evident trail); the signed marker is written by the caller.
@@ -913,6 +952,11 @@ func Open(logPath, keyPath string, rotateSizeBytes int64, retainRotated int, opt
 		// The tail carries no signature at all — a pre-signing log, or a stripped
 		// signature. Carry its seq so a forensic reader can locate the boundary.
 		s.writeIntegrityMarker("tail_unsigned", map[string]interface{}{"claimed_tail_seq": tailSeq})
+	case tailFailUndecodable:
+		// Distinct from tail_hmac_mismatch: the strict decoder refused the line, so no
+		// HMAC comparison ever ran. Carry the claimed seq/hmac anyway — they are the
+		// lenient decode's view and still locate the record.
+		s.writeIntegrityMarker("tail_strict_decode_refused", map[string]interface{}{"claimed_tail_seq": tailSeq, "claimed_tail_hmac": tailHMAC})
 	}
 	if recoveredPartialBytes > 0 {
 		// A partial trailing write was truncated above. Record the recovery so the
@@ -1005,6 +1049,10 @@ func (s *Sink) syntheticDenyMarker(code string, details map[string]interface{}) 
 //   - tail_unsigned: the prior tail carried no _hmac (a pre-signing log, or a
 //     stripped signature — indistinguishable, so both restart the chain); details
 //     carry claimed_tail_seq.
+//   - tail_strict_decode_refused: the prior tail was refused by the strict decoder
+//     (malformed, an unknown top-level field, or trailing bytes), so its signature
+//     was never checked — distinct from tail_hmac_mismatch, which asserts a key
+//     rejected it. Details carry claimed_tail_seq and claimed_tail_hmac.
 //   - tail_partial_write_recovered: a partial (non-newline-terminated) trailing
 //     write was truncated so the next append starts clean; details carry
 //     recovered_bytes.
@@ -1292,25 +1340,39 @@ func (s *Sink) Record(ctx context.Context, p RecordParams) {
 	}
 
 	rec := auditRecord{
-		ClassUID:      6003,
-		CategoryUID:   6,
-		ActivityID:    activityID,
-		Time:          s.clock().UTC().Format(time.RFC3339Nano),
-		RequestID:     nextRequestID(),
-		SessionID:     boundFieldTo(p.SessionID, auditSessionIDCap),
-		AgentID:       agentID,
-		TaskID:        taskID,
-		UserID:        userID,
-		Upstream:      p.Upstream,
-		PolicyVersion: p.PolicyVersion,
-		PolicySHA256:  p.PolicySHA256,
+		ClassUID:    6003,
+		CategoryUID: 6,
+		ActivityID:  activityID,
+		Time:        s.clock().UTC().Format(time.RFC3339Nano),
+		RequestID:   nextRequestID(),
+		SessionID:   boundFieldTo(p.SessionID, auditSessionIDCap),
+		AgentID:     agentID,
+		TaskID:      taskID,
+		UserID:      userID,
+		// Route provenance is operator-supplied (config route name, manifest version,
+		// computed digest) rather than attacker-supplied, so these are bounds of last
+		// resort — but writeRecord's "already bounded at Record() time" invariant covers
+		// the whole envelope, not the attacker-influenced subset, and boundFieldTo is
+		// also where invalid UTF-8 is normalized to U+FFFD. Skipping it here left three
+		// fields whose bytes could round-trip differently through the HMAC than they
+		// arrived. Bound them like the rest so the invariant holds by construction.
+		Upstream:      boundFieldTo(p.Upstream, auditEnvelopeFieldCap),
+		PolicyVersion: boundFieldTo(p.PolicyVersion, auditEnvelopeFieldCap),
+		PolicySHA256:  boundFieldTo(p.PolicySHA256, auditEnvelopeFieldCap),
 		TargetType:    targetType,
 		Target:        target,
 		Method:        mcpMethod,
 		Decision:      p.Decision,
 		AuditOnly:     p.AuditOnly,
-		DenialCode:    p.DenialCode,
-		ConditionType: p.ConditionType,
+		// Bound the denial taxonomy like every other variable envelope string. For the
+		// built-in engine both are compile-time constants, but an external PDP wired
+		// through PolicyEvaluator (OPA/Cedar) — or a custom ConditionHandler — returns a
+		// *ConditionError whose Code and ConditionType are operator-supplied strings that
+		// reach here verbatim. Unbounded they could push a record past the 4 MiB scanner
+		// buffer boundFieldTo exists to keep records under; uncounted (queueSize now sums
+		// both) they would be heap the queue budget cannot see.
+		DenialCode:    boundFieldTo(p.DenialCode, auditEnvelopeFieldCap),
+		ConditionType: boundFieldTo(p.ConditionType, auditEnvelopeFieldCap),
 		// Bound (and, in the same pass, deep-clone) details before enqueue, then
 		// marshal the bounded copy ONCE — here, on the caller's goroutine. The queued
 		// record therefore carries immutable bytes, not the live params.Arguments map
@@ -1355,7 +1417,9 @@ func (s *Sink) Record(ctx context.Context, p RecordParams) {
 // when there is nothing to warn about); formatting the message is cheap and lock-safe, only
 // the write to stderr is not.
 func (s *Sink) enqueue(rec auditRecord) string {
-	size := rec.queueSize()
+	// Size the record once and carry the charge on the record itself, so the drainer
+	// credits back exactly this number (see auditRecord.queuedSize).
+	rec.queuedSize = rec.queueSize()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.closed {
@@ -1366,7 +1430,18 @@ func (s *Sink) enqueue(rec auditRecord) string {
 		s.recordDropBucket(rec.Method, rec.Target)
 		return ""
 	}
-	if s.queuedBytes.Load()+size > auditQueueByteBudget {
+	// RESERVE before the send, and release on either drop arm. Adding the bytes after a
+	// successful send let the drainer receive the record and run its credit first, so
+	// queuedBytes went transiently negative and systematically under-reported in-flight
+	// heap — admitting more than the budget accounts for under exactly the burst-plus-
+	// slow-disk conditions the budget exists for. Reserving first also makes the check
+	// atomic across concurrent enqueuers: a check-then-add let every goroutine that read
+	// the same under-budget value proceed, where the single Add lets exactly one cross
+	// the line. The refund below can transiently deny a concurrent enqueuer that would
+	// have fit; that is the fail-closed direction (a counted, marked drop) and lasts two
+	// atomic ops.
+	if s.queuedBytes.Add(rec.queuedSize) > auditQueueByteBudget {
+		s.queuedBytes.Add(-rec.queuedSize)
 		// Over the aggregate byte budget even though a slot may still be free: a slow
 		// disk plus large-argument records would otherwise retain gigabytes of heap and
 		// OOM the proxy. Drop and count like a full queue — the drop marker keeps the
@@ -1380,9 +1455,9 @@ func (s *Sink) enqueue(rec auditRecord) string {
 	}
 	select {
 	case s.records <- rec:
-		s.queuedBytes.Add(size)
 		return ""
 	default:
+		s.queuedBytes.Add(-rec.queuedSize)
 		warn := ""
 		if n := s.dropped.Add(1); n == 1 || n%100 == 0 {
 			warn = fmt.Sprintf("[eunox] WARNING: audit record dropped (%d total) — write queue is full; check disk I/O\n", n)
@@ -1518,23 +1593,31 @@ const auditDetailsTotalCap = 1 << 20 // 1 MiB
 const auditQueueByteBudget = 256 << 20 // 256 MiB
 
 // auditRecordEnvelopeEstimate is a flat per-record allowance for the genuinely
-// FIXED-width envelope (timestamps, request id, key id, decision/denial codes, the
-// two hex HMACs) that queueSize adds on top of the variable-length fields it counts
-// individually. It need not be exact — queuedBytes is a soft bound.
+// FIXED-width envelope (timestamps, request id, key id, the decision string, the two
+// hex HMACs) that queueSize adds on top of the variable-length fields it counts
+// individually. It need not be exact — queuedBytes is a soft bound. The denial code
+// and condition type moved OUT of this allowance and into the individual walk: they
+// are fixed-width only for the built-in engine, and operator-supplied for an external
+// PolicyEvaluator.
 const auditRecordEnvelopeEstimate = 512
 
 // queueSize estimates the heap a queued record retains: its already-marshaled Details
 // and Obligations bytes, the variable-length envelope strings, and a flat allowance
-// for the fixed remainder. The drainer recomputes it from the same immutable fields,
-// so the enqueue add and the drain subtract always agree.
+// for the fixed remainder. It is evaluated ONCE, at enqueue, and stored on the record
+// (auditRecord.queuedSize) so the drain credit cannot diverge from the enqueue charge.
 //
 // The variable strings are counted rather than folded into the flat allowance because
-// they are attacker- or IdP-influenced and individually bounded at up to
-// auditEnvelopeFieldCap (8 KiB): Target, an unrecognized raw Method, and the three
-// JWT identity claims can together retain ~40 KiB that a flat 512 did not see. Under
-// a flood of such records the queue would hold ~80x the byte budget it is sized to
+// they are attacker-, IdP- or external-PDP-influenced and individually bounded at up
+// to auditEnvelopeFieldCap (8 KiB): Target, an unrecognized raw Method, the three JWT
+// identity claims, the route provenance triple, and the denial taxonomy an external
+// PolicyEvaluator supplies can together retain far more than a flat 512 saw. Under a
+// flood of such records the queue would hold many times the byte budget it is sized to
 // bound — the shed-instead-of-OOM guarantee the budget exists for. Labels are drawn
 // from the closed native vocabulary and are counted for completeness, not bounds.
+//
+// Fields writeRecord stamps (Seq, PrevHMAC, HMAC) must stay inside the flat
+// auditRecordEnvelopeEstimate and out of this walk; the stored charge makes that a
+// performance nicety rather than the load-bearing rule it used to be.
 func (rec *auditRecord) queueSize() int64 {
 	n := int64(len(rec.Details)) + auditRecordEnvelopeEstimate
 	for _, o := range rec.Obligations {
@@ -1543,6 +1626,7 @@ func (rec *auditRecord) queueSize() int64 {
 	n += int64(len(rec.SessionID) + len(rec.AgentID) + len(rec.TaskID) + len(rec.UserID))
 	n += int64(len(rec.Target) + len(rec.Method) + len(rec.TargetType))
 	n += int64(len(rec.Upstream) + len(rec.PolicyVersion) + len(rec.PolicySHA256))
+	n += int64(len(rec.DenialCode) + len(rec.ConditionType))
 	for _, l := range rec.LabelsOut {
 		n += int64(len(l))
 	}
@@ -2084,9 +2168,11 @@ func (s *Sink) drain() {
 			seqBefore := s.seq
 			s.flushDropMarker()
 			s.writeRecord(&rec)
-			// Release this record's reserved bytes now that it has been drained, mirroring
-			// the enqueue reservation (recomputed from the same immutable fields).
-			s.queuedBytes.Add(-rec.queueSize())
+			// Release exactly the reservation the enqueue charged. Read from the record
+			// rather than recomputed: writeRecord has just stamped Seq/PrevHMAC/HMAC
+			// through the pointer, so a recomputed size is a size taken of a DIFFERENT
+			// record than the one that was charged (see auditRecord.queuedSize).
+			s.queuedBytes.Add(-rec.queuedSize)
 			// The delta is 0-2: writeRecord advances s.seq by at most 1 per call, and an
 			// iteration makes at most two calls (drop marker + real record), so the
 			// uint64->int conversion can never overflow.
@@ -2588,7 +2674,10 @@ func (s *Sink) writeRecord(rec *auditRecord) {
 		}
 		return
 	}
-	// Record durably written: advance the chain head and sequence number.
+	// Write SUCCEEDED — not yet durable: the record is in the page cache until the next
+	// fsync (the syncDebounce timer or the every-syncEveryN counter in the drainer),
+	// exactly as this function's own doc states. Advance the chain head and sequence
+	// number, which track what has been WRITTEN.
 	s.seq = rec.Seq
 	s.prevHMAC = rec.HMAC
 }

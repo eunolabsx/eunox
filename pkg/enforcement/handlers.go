@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"net"
 	"path"
 	"reflect"
@@ -681,6 +682,23 @@ func (e *Engine) handleAllowedExtensions(_ context.Context, cond capability.Cond
 				},
 			}
 		case errors.Is(decodeErr, errPathMalformedEscape):
+			// A valid encoded NUL or separator riding alongside the bad escape must still
+			// deny. PathUnescape failed on the WHOLE value, so neither token was decoded
+			// and the errPathNUL arm above never saw the %00 — matching the literal form
+			// treats "evil.exe%00x%zz.csv" as a permitted ".csv" file while a
+			// NUL-truncating upstream opens "evil.exe". confineSlashlessPattern applies
+			// the identical pair of guards on its own lenient fallback.
+			if containsEncodedNUL(filePath) || containsEncodedSeparator(filePath) {
+				return &ConditionError{
+					Code:          capability.ErrCodeConditionFailed,
+					ConditionType: capability.ConditionTypeAllowedExtensions,
+					Message:       "file path contains an undecodable percent-escape alongside an encoded NUL or path separator",
+					Details: map[string]interface{}{
+						"filePath":          filePath,
+						"allowedExtensions": ae.Extensions,
+					},
+				}
+			}
 			// Literal '%' (not a valid escape): match on the separator-folded literal
 			// form, since a literal-path upstream opens the file verbatim.
 			normalizedPath = strings.ReplaceAll(filePath, "\\", "/")
@@ -1016,9 +1034,10 @@ func OperationVerb(s string) string {
 // reflect.DeepEqual-match the same request number without this bridge. Non-numeric
 // values return false (handled by the caller's exact-match path).
 //
-// When both represent an integer they are compared exactly as int64, so two
-// distinct integers above 2^53 (sharing a float64) are not conflated. Genuinely
-// fractional or out-of-int64-range values fall back to the float64 comparison.
+// When both represent an integer they are compared exactly — as int64 within that
+// range, and as an exact rational beyond it — so two distinct integers that share a
+// float64 are never conflated at any magnitude. Only genuinely FRACTIONAL values fall
+// back to the float64 comparison.
 func numericEqual(a, b any) bool {
 	ia, aInt := asInt64(a)
 	ib, bInt := asInt64(b)
@@ -1031,9 +1050,73 @@ func numericEqual(a, b any) bool {
 	if aInt != bInt {
 		return false
 	}
+	// Neither is int64-representable. When BOTH are still integers, compare them
+	// exactly: the float64 fallback below rounds distinct integers above 2^63 onto a
+	// shared value, so allowedValues: [9223372036854775808] would admit the argument
+	// 9223372036854775809 — a value outside the declared set, which is the fail-open
+	// direction. The int64 arm above cannot cover this because neither side fits.
+	//
+	// Restricted to integers on purpose. A fractional decimal literal and its float64
+	// coercion are genuinely different rationals (0.1 is not the binary double nearest
+	// 0.1), so comparing those exactly would make an argument of 0.1 stop matching a
+	// manifest value of 0.1 — breaking working policies to no security benefit, since
+	// the float64 approximation is consistent on both sides.
+	if ra, ok := exactIntegerRat(a); ok {
+		if rb, ok := exactIntegerRat(b); ok {
+			return ra.Cmp(rb) == 0
+		}
+	}
 	fa, aOK := toFloat64(a)
 	fb, bOK := toFloat64(b)
 	return aOK && bOK && fa == fb
+}
+
+// exactIntegerRat returns v's exact value as a *big.Rat when v holds an INTEGER of any
+// magnitude, reporting false for a fractional value, a non-numeric, or a non-finite
+// float. It is the beyond-int64 companion to asInt64: the two together let a numeric
+// comparison stay exact across the whole integer range instead of lapsing to float64
+// (and its rounding) at 2^63.
+//
+// A float64 operand converts through its exact binary value, which is what that
+// operand actually is — a float64 that reads as 9223372036854775808 IS 2^63 exactly,
+// and comparing it against the decimal literal 9223372036854775809 correctly reports
+// them distinct.
+func exactIntegerRat(v any) (*big.Rat, bool) {
+	r, ok := exactRat(v)
+	if !ok || !r.IsInt() {
+		return nil, false
+	}
+	return r, true
+}
+
+// exactRat returns v's exact value as a *big.Rat, without the float64 round-trip
+// asInt64/toFloat64 take. Only the types that can carry a value outside int64 range
+// are handled — everything else reaches a comparison through asInt64 first.
+func exactRat(v any) (*big.Rat, bool) {
+	switch n := v.(type) {
+	case json.Number:
+		// SetString parses the decimal literal exactly, including the digits a float64
+		// coercion would round away. It also accepts exponent forms ("1e30"), which is
+		// what makes this the right parse for an argument decoded in UseNumber mode.
+		return new(big.Rat).SetString(string(n))
+	case uint64:
+		return new(big.Rat).SetInt(new(big.Int).SetUint64(n)), true
+	case uint:
+		return new(big.Rat).SetInt(new(big.Int).SetUint64(uint64(n))), true
+	case float32:
+		return ratFromFloat(float64(n))
+	case float64:
+		return ratFromFloat(n)
+	}
+	return nil, false
+}
+
+// ratFromFloat is exactRat's float arm: big.Rat cannot represent Inf or NaN, and
+// SetFloat64 returns nil for both, so report those as having no exact value rather
+// than dereferencing nil.
+func ratFromFloat(f float64) (*big.Rat, bool) {
+	r := new(big.Rat).SetFloat64(f)
+	return r, r != nil
 }
 
 // maxInt64Uint is math.MaxInt64 as a uint64, for the unsigned arms of asInt64. The

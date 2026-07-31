@@ -546,7 +546,7 @@ func strictDecodeAuditRecord(line []byte) (auditRecord, error) {
 	dec.UseNumber()
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&rec); err != nil {
-		return auditRecord{}, fmt.Errorf("audit record is malformed or contains an unknown field: %w", err)
+		return auditRecord{}, fmt.Errorf("%w: audit record is malformed or contains an unknown field: %w", errStrictDecodeRefused, err)
 	}
 	// Reject trailing bytes: Decode stops at the first value and ignores the rest, so
 	// a tampered {…record…}GARBAGE line would otherwise verify (the HMAC covers the
@@ -555,7 +555,7 @@ func strictDecodeAuditRecord(line []byte) (auditRecord, error) {
 	// the canonical-form check is what rejects that — so this narrows the shapes that
 	// reach verification rather than being the last word on them.
 	if dec.More() {
-		return auditRecord{}, errTrailingRecordData
+		return auditRecord{}, fmt.Errorf("%w: %w", errStrictDecodeRefused, errTrailingRecordData)
 	}
 	return rec, nil
 }
@@ -565,6 +565,15 @@ func strictDecodeAuditRecord(line []byte) (auditRecord, error) {
 // trailing data is not a record under any tolerance); no caller branches on it
 // otherwise, and it is reported like any other decode error.
 var errTrailingRecordData = errors.New("trailing data after audit record")
+
+// errStrictDecodeRefused wraps every strictDecodeAuditRecord rejection, so a caller can
+// tell "this line never reached a signature check" from "a key rejected this line's
+// HMAC". VerifyRecord returns the decode error before computing any MAC, and the chain
+// resume used to record that outcome as tail_hmac_mismatch — a marker asserting a
+// comparison that never ran, pointing an operator investigating a malformed tail at a
+// tampering remediation. The fail-closed BEHAVIOR was right either way; only the
+// forensic label was wrong.
+var errStrictDecodeRefused = errors.New("audit record was refused by the strict decoder")
 
 // lenientDecodeAuditRecord decodes one line into an auditRecord, TOLERATING an
 // unknown top-level field, and reports whether the line was well-formed JSON with

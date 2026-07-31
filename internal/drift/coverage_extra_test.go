@@ -214,8 +214,14 @@ func TestMakeDriftCheck_ProbeError_StrictNoPinsFatal(t *testing.T) {
 	if err == nil {
 		t.Fatal("strict mode + unpinned manifest + failing probe must abort startup")
 	}
-	if !strings.Contains(err.Error(), "strict-drift") {
-		t.Errorf("strict abort error should mention strict-drift, got %v", err)
+	// Names the strict-drift MODE, not the --strict-drift flag: strictness can also come
+	// from `strictDrift:` in a gateway config, and an operator who set it there should
+	// not be sent looking for a flag they never passed.
+	if !strings.Contains(err.Error(), "strict drift") {
+		t.Errorf("strict abort error should name strict drift checking, got %v", err)
+	}
+	if strings.Contains(err.Error(), "--strict-drift") {
+		t.Errorf("strict abort error must not blame the flag specifically, got %v", err)
 	}
 	if !strings.Contains(err.Error(), "upstream timeout") {
 		t.Errorf("fatal error must wrap the probe error, got %v", err)
@@ -498,8 +504,14 @@ func TestDriftProbeUnavailable_StrictNoPinsFatal(t *testing.T) {
 	if !errors.Is(err, wrapped) {
 		t.Errorf("fatal error must wrap the original error, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "strict-drift") {
-		t.Errorf("strict abort error should mention strict-drift, got %v", err)
+	// Names the strict-drift MODE, not the --strict-drift flag: strictness can also come
+	// from `strictDrift:` in a gateway config, and an operator who set it there should
+	// not be sent looking for a flag they never passed.
+	if !strings.Contains(err.Error(), "strict drift") {
+		t.Errorf("strict abort error should name strict drift checking, got %v", err)
+	}
+	if strings.Contains(err.Error(), "--strict-drift") {
+		t.Errorf("strict abort error must not blame the flag specifically, got %v", err)
 	}
 }
 
@@ -533,8 +545,14 @@ func TestEvaluateDrift_StrictFatalAborts(t *testing.T) {
 	if err == nil {
 		t.Fatal("strict mode must abort on a fatal (FM-1) finding")
 	}
-	if !strings.Contains(err.Error(), "strict-drift") {
-		t.Errorf("strict abort error should mention strict-drift, got %v", err)
+	// Names the strict-drift MODE, not the --strict-drift flag: strictness can also come
+	// from `strictDrift:` in a gateway config, and an operator who set it there should
+	// not be sent looking for a flag they never passed.
+	if !strings.Contains(err.Error(), "strict drift") {
+		t.Errorf("strict abort error should name strict drift checking, got %v", err)
+	}
+	if strings.Contains(err.Error(), "--strict-drift") {
+		t.Errorf("strict abort error must not blame the flag specifically, got %v", err)
 	}
 }
 

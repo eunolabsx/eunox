@@ -41,7 +41,7 @@ func TestProxyPublishesSessionKillTTL_ForTheKillCLI(t *testing.T) {
 	mr := miniredis.RunT(t)
 
 	_ = captureStderr(t, func() {
-		_, _, _, ksRedis, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, false, 0, 90*time.Minute, 0)
+		_, _, _, ksRedis, _, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, false, 0, 90*time.Minute, 0)
 		require.NoError(t, err)
 		require.NotNil(t, ksRedis)
 		publishSessionKillTTL(ksRedis)
@@ -54,7 +54,7 @@ func TestProxyPublishesSessionKillTTL_ForTheKillCLI(t *testing.T) {
 	// A never-expiring proxy publishes the word, not a bare 0 — the CLI reads it back as
 	// a permanent tombstone rather than as "unset, use the default".
 	_ = captureStderr(t, func() {
-		_, _, _, ksRedis, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, false, 0, -1, 0)
+		_, _, _, ksRedis, _, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, false, 0, -1, 0)
 		require.NoError(t, err)
 		publishSessionKillTTL(ksRedis)
 	})
@@ -71,7 +71,7 @@ func TestProxyPublishSessionKillTTL_WarnsOnADifferingPriorValue(t *testing.T) {
 	require.NoError(t, mr.Set(publishedTTLKey, "24h0m0s"))
 
 	stderr := captureStderr(t, func() {
-		_, _, _, ksRedis, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, false, 0, 90*time.Minute, 0)
+		_, _, _, ksRedis, _, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, false, 0, 90*time.Minute, 0)
 		require.NoError(t, err)
 		publishSessionKillTTL(ksRedis)
 	})
@@ -80,7 +80,7 @@ func TestProxyPublishSessionKillTTL_WarnsOnADifferingPriorValue(t *testing.T) {
 
 	// Republishing the same value is agreement, not a conflict.
 	stderr = captureStderr(t, func() {
-		_, _, _, ksRedis, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, false, 0, 90*time.Minute, 0)
+		_, _, _, ksRedis, _, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, false, 0, 90*time.Minute, 0)
 		require.NoError(t, err)
 		publishSessionKillTTL(ksRedis)
 	})
@@ -242,7 +242,7 @@ func TestCmdKill_ExpiredPublishedTTL_FallsBackAndSaysSo(t *testing.T) {
 
 	// A proxy publishes a short lifetime, then goes away without refreshing the key.
 	_ = captureStderr(t, func() {
-		_, _, _, ksRedis, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, false, 0, 30*time.Minute, 0)
+		_, _, _, ksRedis, _, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, false, 0, 30*time.Minute, 0)
 		require.NoError(t, err)
 		require.NotNil(t, ksRedis)
 		publishSessionKillTTL(ksRedis)

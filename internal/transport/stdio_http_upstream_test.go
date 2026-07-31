@@ -74,7 +74,7 @@ func TestStdioProxy_HTTPUpstream_CallRoundTrip(t *testing.T) {
 	p := &StdioProxy{
 		sessionID:   "s1",
 		upstreamURL: up.srv.URL,
-		pending:     make(map[string]chan upstreamResult),
+		pending:     make(map[string]struct{}),
 	}
 
 	// Mirror Start's upstream sequence: connect, initialize, then start the
@@ -347,7 +347,7 @@ func TestStdioProxy_HTTPUpstream_UnreachableSurfacesError(t *testing.T) {
 	p := &StdioProxy{
 		sessionID:   "s1",
 		upstreamURL: "http://127.0.0.1:1", // nothing listening
-		pending:     make(map[string]chan upstreamResult),
+		pending:     make(map[string]struct{}),
 	}
 	if err := p.connectUpstream(context.Background()); err != nil {
 		t.Fatalf("connectUpstream: %v", err)
@@ -386,7 +386,7 @@ func TestStdioProxy_HTTPUpstream_InfraFailureRecordsDeny(t *testing.T) {
 	p := &StdioProxy{
 		sessionID:   "s1",
 		upstreamURL: "http://127.0.0.1:1", // nothing listening
-		pending:     make(map[string]chan upstreamResult),
+		pending:     make(map[string]struct{}),
 	}
 	if err := p.connectUpstream(context.Background()); err != nil {
 		t.Fatalf("connectUpstream: %v", err)

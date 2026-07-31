@@ -153,6 +153,49 @@ func TestMsgWriter_DeadlinePoisonKeepsTimeoutSentinel(t *testing.T) {
 	}
 }
 
+// partialDeadlineWriter accepts part of a frame and then reports the deadline expiry, the
+// combination a pollable pipe produces when the frame is larger than the free buffer and
+// the upstream has stopped draining stdin: the kernel copies what fits, then the write
+// blocks and the deadline fires.
+type partialDeadlineWriter struct{ accept int }
+
+func (w *partialDeadlineWriter) SetWriteDeadline(time.Time) error { return nil }
+
+func (w *partialDeadlineWriter) Write(p []byte) (int, error) {
+	n := w.accept
+	if n > len(p) {
+		n = len(p)
+	}
+	return n, os.ErrDeadlineExceeded
+}
+
+// TestMsgWriter_PartialWriteFromDeadlineKeepsTimeoutSentinel closes the split the two
+// sentinels exist to prevent. "The subprocess stopped draining stdin" is ONE failure, but
+// it surfaces as (n == 0, deadline) when the frame fits in the pipe buffer and as
+// (n > 0, deadline) when it does not — so keying the sentinel purely on byte count
+// recorded the same wedged upstream as UPSTREAM_TIMEOUT for a small call and
+// UPSTREAM_ERROR for a large one, with the classification turning on payload size rather
+// than on what went wrong.
+//
+// The framing is desynced either way, so the poison is unconditional; only the recorded
+// cause is at stake, and the cause here is the deadline.
+func TestMsgWriter_PartialWriteFromDeadlineKeepsTimeoutSentinel(t *testing.T) {
+	t.Parallel()
+	mw := NewMsgWriterWithTimeout(&partialDeadlineWriter{accept: 4}, 20*time.Millisecond, nil)
+
+	err := mw.Write(RPCMsg{JSONRPC: "2.0", Method: "tools/call"})
+	if !errors.Is(err, ErrUpstreamWriteTimeout) {
+		t.Fatalf("partial write from a deadline expiry err = %v, want ErrUpstreamWriteTimeout — the same physical failure as the zero-byte deadline case, differing only in whether the frame fit the pipe buffer", err)
+	}
+	if errors.Is(err, ErrFrameDesync) {
+		t.Errorf("err = %v, want it distinct from a non-deadline partial frame (a crashed upstream)", err)
+	}
+	// Still poisoned: a half-written frame desyncs the stream whatever cut it off.
+	if err := mw.Write(RPCMsg{JSONRPC: "2.0", Method: "tools/call"}); !errors.Is(err, ErrUpstreamWriteTimeout) {
+		t.Errorf("second write err = %v, want the latched ErrUpstreamWriteTimeout (poisoned)", err)
+	}
+}
+
 // completeWriteDeadlineWriter reports the whole frame written AND a deadline error, the
 // combination io.Writer permits ("callers must not assume a non-nil error means nothing
 // was written") and which a pipe can produce when the deadline fires as the final bytes

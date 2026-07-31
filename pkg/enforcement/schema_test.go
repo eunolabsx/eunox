@@ -790,6 +790,59 @@ func TestValidateArgumentSchema_EnumLargeIntPrecision(t *testing.T) {
 	}
 }
 
+// TestValidateArgumentSchema_BoundPrecisionAboveInt64 extends the precision rule past
+// int64. compareToBound's exact arm needs BOTH the argument and the bound to be
+// int64-representable; above 2^63 neither is, so both sides collapsed to float64 and an
+// argument strictly above `maximum: 9223372036854775808` compared EQUAL to it and
+// passed. Same fail-open shape as the enum case above, one range further out — and on a
+// boundary, which is the whole point of the keyword.
+func TestValidateArgumentSchema_BoundPrecisionAboveInt64(t *testing.T) {
+	t.Parallel()
+
+	// 2^63 is exactly representable as a float64 (a power of two), so it loads through
+	// exactFloatBound's round-trip check rather than being rejected at load.
+	const twoPow63 = float64(9223372036854775808)
+	bounded := func(field string) *capability.ArgumentSchema {
+		s := &capability.ArgumentSchema{}
+		if field == "maximum" {
+			s.Maximum = ptr(twoPow63)
+		} else {
+			s.Minimum = ptr(twoPow63)
+		}
+		return &capability.ArgumentSchema{
+			Properties: map[string]*capability.ArgumentSchema{"id": s},
+		}
+	}
+
+	cases := []struct {
+		name    string
+		field   string
+		value   interface{}
+		wantErr string
+	}{
+		{name: "at the maximum passes", field: "maximum", value: json.Number("9223372036854775808")},
+		{name: "one above the maximum denied", field: "maximum", value: json.Number("9223372036854775809"), wantErr: "maximum"},
+		{name: "far above the maximum denied", field: "maximum", value: json.Number("99999999999999999999999"), wantErr: "maximum"},
+		{name: "at the minimum passes", field: "minimum", value: json.Number("9223372036854775808")},
+		{name: "one below the minimum denied", field: "minimum", value: json.Number("9223372036854775807"), wantErr: "minimum"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := enforcement.ValidateArgumentSchema(map[string]interface{}{"id": tc.value}, bounded(tc.field))
+			if tc.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantErr)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+// ptr returns a pointer to v, for the *float64 bound fields.
+func ptr[T any](v T) *T { return &v }
+
 func TestValidateArgumentSchema_IntegerType(t *testing.T) {
 	t.Parallel()
 

@@ -34,25 +34,107 @@ import (
 // per-source on purpose: per-source state is itself attacker-sized memory, and the
 // suppressed count already tells the operator how much was elided.
 //
-// The pre-session bucket specifically is ONE bucket for the whole proxy, not one per route.
-// That is what bounds the sustained write rate into the single shared audit queue, which is
-// the property this limiter exists to hold: splitting it per route would multiply the rate
-// an attacker can drive by the size of the route table, re-opening the flood from the
-// direction the per-source-memory argument above closes. The cost is that its tally spans
-// routes and categories while a record reporting it may be route-stamped (recordSessionCapDeny
-// writes RESOURCE_EXHAUSTED through the route's sink) — detailSuppressedRefusalScope states
-// that outright rather than leaving it to inference. saturationGate below makes the opposite
-// trade for the opposite reason: it is scoped per pool per session specifically so a flood on
-// one session cannot elide another's record, so its own scope value says as much.
+// The pre-session bucket is one bucket per refusal CATEGORY, proxy-wide within each.
+//
+// Not one per route: that would multiply the rate an attacker can drive by the size of the
+// route table, re-opening the flood from the direction the per-source-memory argument above
+// closes. But not one for everything either, which is what it used to be. Categories differ
+// enormously in what it costs an attacker to trigger them and in what their records are
+// worth to an incident responder: an unauthenticated Origin probe is one cheap request, and
+// under a single bucket a spray of them absorbed the entire budget — so a concurrent
+// control-token brute force, the record an incident responder reads first, was suppressed
+// into a number on somebody else's record. That is precisely the failure recordRateLimiter's
+// own doc names ("a single shared bucket would let a flood of one refusal silence another")
+// and holds for every OTHER class by giving each its own instance; the pre-session classes
+// were the one place it did not hold internally.
+//
+// Per-category state is a fixed handful of counters — categories are code-supplied literals
+// at the call sites (origin, jwt, auth, control, loopback, body, content_type, saturation),
+// never caller-derived — so unlike per-source state it is not attacker-sized. The map is
+// capped anyway (maxRefusalCategories), so the bound is structural rather than a property
+// of today's call sites.
+//
+// The aggregate sustained ceiling rises to categories x preSessionDenyRatePerSec, a few
+// hundred records/second in the worst case. That is well inside what the drainer absorbs
+// (it is the queue OVERFLOW that latches AuditDegraded, and the queue holds 4096), so the
+// availability property the bound exists for is unchanged while the evidence property is
+// restored.
+//
+// The tally still spans routes within a category, and a record reporting it may be
+// route-stamped (recordSessionCapDeny writes RESOURCE_EXHAUSTED through the route's sink) —
+// detailSuppressedRefusalScope states that outright rather than leaving it to inference.
+// saturationGate below is scoped per pool per session, for the same
+// one-flood-must-not-elide-another reason, and its own scope value says as much.
 const (
 	preSessionDenyRatePerSec = 20
 	preSessionDenyBurst      = 50
+	// maxRefusalCategories caps how many distinct category buckets are kept. Categories
+	// are compile-time literals, so this is not reached in practice; it is the structural
+	// guarantee that per-category state can never become attacker-sized if a category ever
+	// came to be derived from a request. Categories past the cap share one overflow bucket
+	// — still bounded, just back to the old pooled behavior for the excess.
+	maxRefusalCategories = 16
 )
 
-// newPreSessionDenyLimiter builds the proxy-wide bucket over pre-session refusal records
+// newPreSessionDenyLimiter builds the per-category buckets over pre-session refusal records
 // (see the constants above for the rationale and the chosen rate).
-func newPreSessionDenyLimiter() *recordRateLimiter {
-	return newRecordRateLimiter(preSessionDenyRatePerSec, preSessionDenyBurst)
+func newPreSessionDenyLimiter() *categoryRecordLimiter {
+	return &categoryRecordLimiter{
+		byCategory: make(map[string]*recordRateLimiter, maxRefusalCategories),
+		ratePerSec: preSessionDenyRatePerSec,
+		burst:      preSessionDenyBurst,
+		now:        time.Now,
+	}
+}
+
+// categoryRecordLimiter holds one recordRateLimiter per refusal category, so a flood of
+// cheap refusals in one category cannot suppress the records of another. Buckets are
+// created on first use rather than from a hardcoded category list: a refusal path added
+// later inherits its own bucket by construction instead of silently sharing whichever list
+// nobody updated.
+type categoryRecordLimiter struct {
+	mu         sync.Mutex
+	byCategory map[string]*recordRateLimiter
+	// overflow serves every category past maxRefusalCategories, pooled.
+	overflow   *recordRateLimiter
+	ratePerSec float64
+	burst      float64
+	// now is the injectable clock, propagated to each bucket as it is created so a test
+	// setting it on the parent controls every category.
+	now func() time.Time
+}
+
+// admit reports whether a refusal record in category may be written now, and how many
+// records IN THAT CATEGORY were suppressed since the last admitted one.
+func (c *categoryRecordLimiter) admit(category string) (ok bool, suppressed uint64) {
+	return c.bucket(category).admit()
+}
+
+// bucket returns category's token bucket, creating it on first use.
+func (c *categoryRecordLimiter) bucket(category string) *recordRateLimiter {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if b, exists := c.byCategory[category]; exists {
+		return b
+	}
+	if len(c.byCategory) >= maxRefusalCategories {
+		if c.overflow == nil {
+			c.overflow = c.newBucketLocked()
+		}
+		return c.overflow
+	}
+	b := c.newBucketLocked()
+	c.byCategory[category] = b
+	return b
+}
+
+// newBucketLocked builds one bucket carrying the parent's clock. Caller holds c.mu.
+func (c *categoryRecordLimiter) newBucketLocked() *recordRateLimiter {
+	b := newRecordRateLimiter(c.ratePerSec, c.burst)
+	if c.now != nil {
+		b.now = c.now
+	}
+	return b
 }
 
 // The details keys a rolled-up refusal record carries, and the scope values that qualify the
@@ -78,15 +160,18 @@ func newPreSessionDenyLimiter() *recordRateLimiter {
 const (
 	detailSuppressedRefusalCount = "suppressed_refusal_count"
 	detailSuppressedRefusalScope = "suppressed_refusal_scope"
-	// suppressedScopeProxy qualifies the pre-session bucket's rollup: the tally spans every
-	// route and category, written directly at the one call site that needs it (recordRefusal)
-	// rather than read off a field on the limiter — a per-scope field would be generality
-	// with a single caller, since the pre-session bucket is the only proxy-wide one. If a
-	// second proxy-wide limiter is ever introduced, the constant at that write site is
-	// exactly what should become a field again; saturationGate below is a narrower-reach
-	// limiter, but a distinct type with its own scope constant, not a second caller of this
-	// one.
-	suppressedScopeProxy = "proxy"
+	// suppressedScopeProxyCategory qualifies the pre-session buckets' rollup: the tally
+	// spans every ROUTE but covers only this record's own refusal category, which is what
+	// the per-category buckets made true. It is written directly at the one call site that
+	// needs it (recordRefusal) rather than read off a field on the limiter — a per-scope
+	// field would be generality with a single caller. saturationGate below is a
+	// narrower-reach limiter, but a distinct type with its own scope constant, not a second
+	// caller of this one.
+	//
+	// The value changed from the earlier "proxy" when the bucket was split by category:
+	// under one shared bucket the count really did span categories, and a reader keyed on
+	// the old value would now under-read the number's precision rather than over-read it.
+	suppressedScopeProxyCategory = "proxy_category"
 )
 
 // recordRateLimiter is a token bucket over one CLASS of caller-driven audit refusal

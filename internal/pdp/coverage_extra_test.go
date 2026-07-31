@@ -837,6 +837,27 @@ func TestApplyRedactObligs_StructuredContentTopLevelString_QualifiedPath_Redacte
 	assert.True(t, json.Valid(out), "redacted output must remain well-formed JSON")
 }
 
+// The other half of the fully-qualified spelling: structuredContent is a plain object, but
+// the leaf named by the path sits inside a string-encoded blob at an INNER key
+// ("structuredContent.data.ssn" against {"structuredContent":{"data":"{\"ssn\":…}"}}). The
+// envelope-relative anchoring must rebase the path past BOTH the structuredContent segment
+// and the inner key to reach the leaf at the blob's own root; a walk that stripped only the
+// first segment, or that anchored value-relative alone, forwards the value verbatim while
+// the audit record still reports the obligation applied. Sibling to the top-level-string
+// case above, which pins the same spelling against a string AT structuredContent itself.
+func TestApplyRedactObligs_StructuredContentInnerKeyString_QualifiedPath_Redacted(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{"structuredContent":{"data":"{\"ssn\":\"INNER_LEAK_VALUE\",\"keep\":\"survives\"}"}}`)
+	out, err := ApplyRedactObligs(body, []capability.Obligation{
+		{Type: capability.DirectiveTypeRedactFields, Paths: []string{"structuredContent.data.ssn"}},
+	})
+	require.NoError(t, err)
+	s := string(out)
+	assert.NotContains(t, s, "INNER_LEAK_VALUE", "the fully-qualified spelling must reach a leaf inside a string-encoded blob at an inner structuredContent key")
+	assert.Contains(t, s, "survives", "the sibling value must be preserved, not dropped or garbled")
+	assert.True(t, json.Valid(out), "redacted output must remain well-formed JSON")
+}
+
 // A text content body that is a clean JSON OBJECT carrying a doubly-encoded string value
 // must have the smuggled field redacted, in parity with structuredContent — the text path
 // now recurses through the same shared core (closing the prior content[].text fail-open).

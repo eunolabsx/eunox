@@ -159,6 +159,14 @@ prevents that fail-open. Keep large integer bounds at or below 2^53
 (`9007199254740992`), or enforce them with an `allowedValues` condition, which
 preserves the literal exactly.
 
+A bound that *is* exactly representable but sits above int64 range — `2^63`
+(`9223372036854775808`) is a power of two, so it loads — is now compared **exactly**
+rather than through a 64-bit float. `9223372036854775809` no longer passes a
+`maximum` of `9223372036854775808` by rounding onto the same float, and the same
+exactness applies to `allowedValues` / `enum` membership at any magnitude. Only
+genuinely **fractional** operands still compare as floats, where a decimal literal
+and its 64-bit approximation are consistent on both sides.
+
 Like `directives` (§ 5a), `argumentSchema` applies to **`tool:` targets only**
 (SPEC § 3.2.2): it validates the shape of a tool call's argument map, which
 `resource:`, `prompt:`, and `system:` requests do not carry — `resources/read`
@@ -1596,7 +1604,12 @@ an exact value or a per-segment pattern when a single `*` is too narrow.
 >   literal (separator-folded) form instead of denying. `report_50%_off.csv` clears
 >   an `[".csv"]` allowlist. (This is unlike the `allowedValues` confinement guard,
 >   which fails closed on a malformed escape — extension matching is not a
->   confinement feature.)
+>   confinement feature.) The one exception is a value that pairs a malformed escape
+>   with a **valid** `%00` or `%2f`/`%5c` token: the whole value then fails to
+>   percent-decode, so neither token was ever resolved, and matching the literal form
+>   would read `evil.exe%00x%zz.csv` as a permitted `.csv` file while a NUL-truncating
+>   upstream opens `evil.exe`. Both tokens are scanned for on the literal fallback and
+>   deny, on this path and on the `allowedValues` confinement guard alike.
 
 **`sequenceBlock`** — denies the call when any tool named in `afterTools` has
 already been called (and allowed) earlier in the **same session**. This is

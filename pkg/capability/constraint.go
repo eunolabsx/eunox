@@ -407,6 +407,16 @@ func (a *ArgumentSchema) UnmarshalJSON(data []byte) error {
 		Maximum json.Number `json:"maximum,omitempty"`
 		*alias
 	}{alias: (*alias)(a)}
+	// Reject unknown keys, as Constraint.UnmarshalJSON and unmarshalCondition do. A
+	// misspelled keyword here is the same silent widening: {"type":"string","maxLen":8}
+	// decodes with MaxLength nil and validates length not at all, so the argument
+	// constraint the author wrote is simply absent. The check runs against the alias
+	// (ArgumentSchema's own field set); the shadowing json.Number Minimum/Maximum carry
+	// the same names, so they need no exemption. It recurses for free — every nested
+	// properties/items value decodes through this same method.
+	if err := rejectUnknownJSONFields(data, alias{}, "argumentSchema"); err != nil {
+		return err
+	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	// UseNumber so enum literals above 2^53 stay json.Number here too, matching the
 	// Constraint decoder that would otherwise have provided it.
@@ -563,6 +573,18 @@ func (c *Constraint) UnmarshalJSON(data []byte) error {
 	// Decode with UseNumber so numeric literals in argumentSchema.enum stay
 	// json.Number rather than being widened to float64 (which rounds integers above
 	// 2^53). The enum check in pkg/enforcement compares the preserved value exactly.
+	// Reject unknown keys before decoding, by the same rule and for the same reason as
+	// unmarshalCondition (see rejectUnknownJSONFields). It applies verbatim one level
+	// up: {"target":…,"principals":{…}} — a misspelled "principal" — decodes leniently
+	// with Principal == nil, and an absent Principal applies to EVERY caller. So the
+	// silent widening the condition check closes for a condition's own fields is
+	// reachable here for the field that decides who a constraint governs at all, and the
+	// author sees a manifest that loaded clean. The binary's own loader runs a recursive
+	// unknown-key check, but this decoder is an exported seam a library consumer reaches
+	// without it.
+	if err := rejectUnknownJSONFields(data, constraintJSON{}, "constraint"); err != nil {
+		return err
+	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
 	if err := dec.Decode(&aux); err != nil {

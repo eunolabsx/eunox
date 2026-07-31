@@ -26,6 +26,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	goredis "github.com/redis/go-redis/v9"
 	"io"
 	"log/slog"
 	"net"
@@ -549,10 +550,17 @@ func cmdProxy(args []string) (exitCode int) {
 
 	// Build call counter and kill-switch manager, shared across routes and the
 	// kill-switch endpoint. Backed by Redis when --redis-addr is set.
-	counter, flowStore, ks, ksRedis, err := buildCallCounterAndKillSwitch(*f.redisAddr, resolveRedisPassword(*f.redisPassword), *f.redisTLS, *f.killswitchFailOpen, *f.killswitchReconcile, *f.killswitchSessionTTL, *f.maxCallCounterKeys)
+	counter, flowStore, ks, ksRedis, rdb, err := buildCallCounterAndKillSwitch(*f.redisAddr, resolveRedisPassword(*f.redisPassword), *f.redisTLS, *f.killswitchFailOpen, *f.killswitchReconcile, *f.killswitchSessionTTL, *f.maxCallCounterKeys)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "eunox proxy: %v\n", err)
 		return 1
+	}
+	if rdb != nil {
+		// Release the connection pool on every exit below, not only the ping-failure
+		// path that already did it. Registered before the audit sink's defer so it runs
+		// AFTER that flush: the sink's close must not race a pool teardown the kill
+		// switch could still be reading through.
+		defer func() { _ = rdb.Close() }()
 	}
 
 	// Open the shared audit sink. The config's audit block takes precedence over
@@ -668,9 +676,17 @@ func resolveRedisPassword(flagVal string) string {
 // maxCalls/sequenceBlock do. ksRedis is non-nil only in
 // the Redis case, so cmdProxy can start its reconcile loop.
 //
+// The *goredis.Client is returned too (nil without --redis-addr) so the caller can
+// release the connection pool on EVERY exit path. Only the ping-failure branch closed
+// it before, on a rationale — "buildRedisClient hands back a live pool with its own
+// goroutines" — that applies just as much to the paths that succeed and later return.
+// In a long-running proxy the process exit collects it either way; for the in-process
+// callers this function was made returnable FOR, one pool and its dialer accumulated
+// per call.
+//
 // A Redis config or connectivity error is returned rather than exited on, so the
 // caller owns the exit code and the failure path is drivable from a test.
-func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, killswitchFailOpen bool, killswitchReconcile, killswitchSessionTTL time.Duration, maxCallCounterKeys int) (capability.CallCounter, capability.FlowLabelStore, killswitch.Manager, *killswitch.Redis, error) {
+func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, killswitchFailOpen bool, killswitchReconcile, killswitchSessionTTL time.Duration, maxCallCounterKeys int) (capability.CallCounter, capability.FlowLabelStore, killswitch.Manager, *killswitch.Redis, *goredis.Client, error) {
 	var (
 		counter capability.CallCounter = callcounter.NewInMemory(callcounter.WithMaxKeys(maxCallCounterKeys))
 		// The in-memory flow store has no time window (a taint lives until the session's
@@ -681,10 +697,12 @@ func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, ki
 		ks        killswitch.Manager        = killswitch.NewInMemory()
 		ksRedis   *killswitch.Redis         // non-nil when --redis-addr is set
 	)
+	var rdb *goredis.Client
 	if redisAddr != "" {
-		rdb, err := buildRedisClient(redisAddr, redisPassword, redisTLS)
+		var err error
+		rdb, err = buildRedisClient(redisAddr, redisPassword, redisTLS)
 		if err != nil {
-			return nil, nil, nil, nil, fmt.Errorf("Redis configuration error: %w", err) //nolint:staticcheck // ST1005: "Redis" is a proper noun, not a capitalized sentence
+			return nil, nil, nil, nil, nil, fmt.Errorf("Redis configuration error: %w", err) //nolint:staticcheck // ST1005: "Redis" is a proper noun, not a capitalized sentence
 		}
 		if err := pingRedis(context.Background(), rdb); err != nil {
 			// Close the client before abandoning it: buildRedisClient hands back a live
@@ -693,7 +711,7 @@ func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, ki
 			// (the tests this function was made returnable for) would accumulate one pool
 			// and its dialer per failed attempt. Mirrors the kill subcommand's client.
 			_ = rdb.Close()
-			return nil, nil, nil, nil, err
+			return nil, nil, nil, nil, nil, err
 		}
 		fmt.Fprintf(os.Stderr, "[eunox] Redis backend enabled (%s). State persists across restarts.\n", redisAddr)
 		counter = callcounter.NewRedis(rdb)
@@ -738,7 +756,7 @@ func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, ki
 		// The TTL is published later, from cmdProxy, once startup is past every step
 		// that can still fail and exit the process — see that call site.
 	}
-	return counter, flowStore, ks, ksRedis, nil
+	return counter, flowStore, ks, ksRedis, rdb, nil
 }
 
 // publishSessionKillTTL advertises the effective session-tombstone lifetime on the

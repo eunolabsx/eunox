@@ -516,11 +516,12 @@ func (p *HTTPProxy) recordRefusal(r *http.Request, route *UpstreamRoute, code, c
 	if rec == nil {
 		return
 	}
-	if p.preSessionDenies == nil { // defensive: a proxy built outside the constructor
-		rec.RecordDeny(r.Context(), "", "", "", code, category, p.addRefusalContext(extra, r), false)
-		return
-	}
-	ok, suppressed := p.preSessionDenies.admit()
+	// No nil-limiter fallback: a "defensive" branch here wrote the refusal record with
+	// NO rate limit at all, which is a fail-open on the exact DoS bound this file exists
+	// to enforce — and it was reachable only from an in-package test literal, since
+	// NewHTTPProxyGateway always builds the limiter. A nil here is a construction bug and
+	// panics like one.
+	ok, suppressed := p.preSessionDenies.admit(category)
 	if !ok {
 		return
 	}
@@ -532,7 +533,7 @@ func (p *HTTPProxy) recordRefusal(r *http.Request, route *UpstreamRoute, code, c
 		// from the stamp beside it, and this record may well carry a route stamp the count
 		// does not respect. See the key constants for the misreading this closes.
 		extra[detailSuppressedRefusalCount] = suppressed
-		extra[detailSuppressedRefusalScope] = suppressedScopeProxy
+		extra[detailSuppressedRefusalScope] = suppressedScopeProxyCategory
 	}
 	rec.RecordDeny(r.Context(), "", "", "", code, category, p.addRefusalContext(extra, r), false)
 }

@@ -683,10 +683,11 @@ func failOnUnsetBracedEnvRef(path, label, raw string) error {
 		if !strings.HasPrefix(ref, "${") {
 			continue
 		}
+		// envRefRe guarantees at least one identifier character, so envRefName cannot
+		// return "" — and if it ever could, skipping would be the fail-OPEN direction
+		// (an unset reference left as literal text is exactly what this guard exists to
+		// refuse), so a "defensive" continue defended the wrong way.
 		name := envRefName(ref)
-		if name == "" {
-			continue
-		}
 		if _, set := os.LookupEnv(name); !set {
 			return unsetEnvRefError(path, label, name)
 		}

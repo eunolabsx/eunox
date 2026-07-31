@@ -20,11 +20,16 @@ import (
 
 // auditRecorder is the subset of the audit sink the enforced-forward path needs.
 // Both *audit.Sink (stdio) and *routeSink (HTTP/gateway) satisfy it, letting the
-// shared forward core record without knowing its transport. Construct it ONLY via
-// asRecorder, never by assigning a concrete sink pointer directly: asRecorder maps a
-// nil pointer to a nil interface, so the core's `rec != nil` stays a true "no sink"
-// test; a direct assignment of a nil concrete pointer would reintroduce the typed-nil
-// interface trap.
+// shared forward core record without knowing its transport.
+//
+// The invariant is that a missing sink yields a genuine nil INTERFACE, never a non-nil
+// interface wrapping a nil pointer — the typed-nil trap that would turn the core's
+// `rec != nil` "no sink" test into a lie. Two constructions uphold it: asRecorder, which
+// maps a nil concrete pointer to a nil interface, and StdioProxy.rec, which builds its
+// routeSink wrapper only when the underlying sink is non-nil and otherwise returns the
+// untyped nil directly (a &routeSink{} is never the nil pointer asRecorder looks for, so
+// wrapping unconditionally would defeat the check). Never assign a concrete sink pointer
+// to this interface at a call site.
 type auditRecorder interface {
 	RecordAllow(ctx context.Context, sessionID, identifier, method string, details map[string]interface{}, obligs []string, auditOnly bool, labelsOut, carriedLabels []string)
 	RecordDeny(ctx context.Context, sessionID, identifier, method, denialCode, condType string, details map[string]interface{}, observe bool)

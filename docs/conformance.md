@@ -414,18 +414,23 @@ tamper-evident tape):
   `suggest` skips it.
 
   A caller sets the rate of every refusal above, so every one of them is
-  admission-controlled, through one of two token buckets depending on what it
-  costs to trigger.
+  admission-controlled, through one of two families of token bucket
+  depending on what it costs to trigger.
 
   The pre-session refusals — the only records an *unauthenticated* caller can
-  cause — share one proxy-wide bucket: within a burst each refusal is recorded
-  in full, and beyond it the next record that gets through carries a
-  `suppressed_refusal_count` of the refusals elided since. **Read that count as
-  proxy-wide.** One bucket bounds the write rate into the single shared audit
-  queue — splitting it per route would multiply the rate an attacker can drive
-  by the size of the route table — so a suppressed refusal is folded into
-  whichever record is admitted next, regardless of its route or category. That
-  matters whenever the admitted record happens to be route-stamped: the
+  cause — get one bucket per refusal **category** (`origin`, `jwt`, `auth`,
+  `control`, `loopback`, `body`, `content_type`, `saturation`), each spanning
+  every route: within a burst each refusal is recorded in full, and beyond it
+  the next record of that category carries a `suppressed_refusal_count` of the
+  refusals elided since. **Read that count as spanning every route, for this
+  record's category only.** Not one bucket per route — that would multiply the
+  rate an attacker can drive by the size of the route table — and no longer one
+  bucket for everything, because a spray of unauthenticated Origin probes then
+  absorbed the whole budget and suppressed a concurrent control-token brute
+  force into a number on somebody else's record. A suppressed refusal is folded
+  into whichever record of its own category is admitted next, regardless of
+  route. That matters whenever the admitted record happens to be route-stamped:
+  the
   **session cap** always is (it is written through the route's sink so it
   matches its in-flight-cap sibling's shape), and the
   **malformed-`Content-Type`** (`UNSUPPORTED_MEDIA_TYPE`) and
@@ -437,9 +442,9 @@ tamper-evident tape):
   surface on a `RESOURCE_EXHAUSTED` record reading `upstream: routeB` — or
   equally on an `INVALID_REQUEST` record for a malformed body routeB's own
   client happened to send. Every rolled-up record states its scope in
-  `suppressed_refusal_scope` (`"proxy"`) so nothing has to be inferred from the
-  stamp beside it: a rule keyed on route + code must not treat the number as
-  route-scoped.
+  `suppressed_refusal_scope` (`"proxy_category"`) so nothing has to be inferred
+  from the stamp beside it: a rule keyed on route + code must not treat the
+  number as route-scoped.
 
   The two saturation refusals that need an established session (the handler
   pool and the notification pool) are on their OWN, separate buckets instead —
@@ -449,11 +454,11 @@ tamper-evident tape):
   stays saturated roll into the next record's `suppressed_refusal_count`, and a
   successful acquire ends the episode, with a per-pool token bucket underneath
   so a caller cycling one pool between saturated and drained cannot outpace it.
-  Sharing the proxy-wide bucket would let a notification flood on ONE session
+  Sharing a pre-session bucket would let a notification flood on ONE session
   elide the `AUTH_FAILED` / `ORIGIN_REJECTED` records an incident responder
   reads first, so every record one of these buckets rolls up states
-  `suppressed_refusal_scope: "session"` instead of `"proxy"` — the count never
-  spans more than the one session_id beside it.
+  `suppressed_refusal_scope: "session"` instead of `"proxy_category"` — the
+  count never spans more than the one session_id beside it.
 
   Without these bounds a credential-spray or a notification flood could
   overflow the audit queue, and because the sink's drop counter is monotonic,
