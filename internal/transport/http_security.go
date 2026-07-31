@@ -48,6 +48,13 @@ import (
 // emergency stop the one transport refusal invisible to an incident responder, while
 // the same actor's wrong-Origin attempts were fully logged.
 //
+// route is whichever route the caller has already resolved — the gateway's /mcp path
+// always has one by the time it reaches here (handleMCP 404s first), /control/kill has
+// none — and is passed straight to recordRefusal, mirroring recordSessionCapDeny: the
+// record is route-stamped exactly when a route is already known, never inferred. The
+// header value is NOT recorded either way — it is attacker-controlled free text, and the
+// count is the only part worth keeping.
+//
 // More than one Content-Type header is rejected outright, for the reason checkOrigin
 // rejects a duplicated Origin: Header.Get would validate the first while a proxy or host
 // downstream may act on another. That leg also prints a stderr line, because it is the
@@ -56,7 +63,7 @@ import (
 // possible thing to diagnose. Note the duplicate rule is a HEADER-level one: Go's mime
 // accepts a repeated *parameter* whose value is identical, so only the count check below
 // enforces it.
-func (p *HTTPProxy) requireJSONContentType(w http.ResponseWriter, r *http.Request) bool {
+func (p *HTTPProxy) requireJSONContentType(w http.ResponseWriter, r *http.Request, route *UpstreamRoute) bool {
 	vals := r.Header.Values("Content-Type")
 	switch {
 	case len(vals) > 1:
@@ -66,10 +73,7 @@ func (p *HTTPProxy) requireJSONContentType(w http.ResponseWriter, r *http.Reques
 	case len(vals) == 1 && isJSONMediaType(vals[0]):
 		return true
 	}
-	// Unstamped by design (no route/policy fields), like every other pre-session record:
-	// this gate can run before route resolution. The header value is NOT recorded — it is
-	// attacker-controlled free text, and the count is the only part worth keeping.
-	p.recordPreSessionDeny(r, codeUnsupportedMediaType, "content_type", map[string]interface{}{
+	p.recordRefusal(r, route, codeUnsupportedMediaType, "content_type", map[string]interface{}{
 		"header_count": len(vals),
 	})
 	http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
@@ -348,14 +352,18 @@ func (p *HTTPProxy) checkOrigin(w http.ResponseWriter, r *http.Request) bool {
 }
 
 // addClaimedSessionID records the client-supplied Mcp-Session-Id header into a
-// pre-session deny's details under claimed_session_id, never as the structured
-// session_id. The transport-level denials that use it (origin rejection, JWT
-// rejection) fire BEFORE any session lookup, so the header is unverified and
-// attacker-controlled; stamping it as session_id would let an unauthenticated caller
-// forge those records against a victim's session. The claimed value is kept as a
-// clearly-unverified detail for correlation, and only when present so a missing
-// header leaves no empty key. Centralizing the rule keeps every pre-session deny
-// path consistent — a new one cannot reintroduce the forgery by hand-rolling it.
+// deny's details under claimed_session_id, never as the structured session_id. The
+// transport-level denials that use it directly (origin rejection, JWT rejection) fire
+// BEFORE any session lookup, so the header is unverified and attacker-controlled;
+// stamping it as session_id would let an unauthenticated caller forge those records
+// against a victim's session. killSubject's claimedSession (forward.go) is the other
+// caller family, reached via auditDetails for a kill-switch record: there a lookup DID
+// run — against the session registry — and failed to resolve, which is a different
+// lifecycle stage but the identical unverified-header risk, so the same treatment
+// applies. The claimed value is kept as a clearly-unverified detail for correlation,
+// and only when present so a missing header leaves no empty key. Centralizing the rule
+// keeps every claimed-but-unresolved-session path consistent — a new one cannot
+// reintroduce the forgery by hand-rolling it.
 // maxClaimedSessionIDLen bounds the attacker-controlled header this stamps into a record.
 // A session id is a UUID; anything longer is not a real id, and without a bound a single
 // unauthenticated request could append most of a 1 MiB header (Go's default
@@ -420,7 +428,15 @@ func boundedRefusalDetail(s string) string {
 }
 
 func addClaimedSessionID(details map[string]interface{}, r *http.Request) map[string]interface{} {
-	claimed := r.Header.Get(SessionHeader)
+	return addClaimedSessionIDValue(details, r.Header.Get(SessionHeader))
+}
+
+// addClaimedSessionIDValue is addClaimedSessionID's request-independent core: every rule
+// (empty-header no-op, nil-details allocation, sanitize/bound, the truncated flag) lives
+// here once, so a caller that already holds the extracted header value — killSubject,
+// which stores the string rather than the *http.Request precisely to avoid re-deriving it
+// — gets the identical treatment through one call instead of a second implementation.
+func addClaimedSessionIDValue(details map[string]interface{}, claimed string) map[string]interface{} {
 	if claimed == "" {
 		return details
 	}
@@ -454,7 +470,9 @@ func addClaimedSessionID(details map[string]interface{}, r *http.Request) map[st
 // unauthenticated caller can trigger, so an unbounded one-per-refusal write lets a remote
 // attacker drive the audit queue into its monotonic drop counter and permanently trip
 // --require-audit=strict against every legitimate client. A suppressed refusal is folded
-// into the next admitted record's suppressed_count rather than vanishing.
+// into the next admitted record's suppressed_refusal_count rather than vanishing — into
+// whichever record is admitted next, which need not be of the same category or route,
+// hence the suppressed_refusal_scope that ships beside it.
 //
 // These records deliberately carry NO route name and no policy_version/policy_sha256
 // stamp: they are written through the proxy-wide p.sink rather than a route's
@@ -479,6 +497,12 @@ func (p *HTTPProxy) recordPreSessionDeny(r *http.Request, code, category string,
 // limit — unlike the in-flight cap, this refusal is reachable WITHOUT an established
 // session, so an unbounded write here would hand a remote caller the audit-queue flooding
 // primitive the pre-session bucket exists to deny.
+//
+// It is therefore the one refusal that can be route-stamped AND carry a rollup from the
+// shared bucket, whose tally spans every route and category. The rollup names its own scope
+// (detailSuppressedRefusalScope: suppressedScopeProxy) precisely so this record's stamp is
+// not read as qualifying the number: `upstream: github` with a count of 5000 means 5000
+// refusals proxy-wide, not 5000 against github.
 func (p *HTTPProxy) recordSessionCapDeny(r *http.Request, route *UpstreamRoute) {
 	p.recordRefusal(r, route, codeResourceExhausted, "saturation", map[string]interface{}{
 		"reason": "session_limit_reached",
@@ -506,9 +530,13 @@ func (p *HTTPProxy) recordRefusal(r *http.Request, route *UpstreamRoute, code, c
 	}
 	if suppressed > 0 {
 		if extra == nil {
-			extra = make(map[string]interface{}, 1)
+			extra = make(map[string]interface{}, 2)
 		}
-		extra["suppressed_count"] = suppressed
+		// Always paired: the count is meaningless to a reader who has to infer its scope
+		// from the stamp beside it, and this record may well carry a route stamp the count
+		// does not respect. See the key constants for the misreading this closes.
+		extra[detailSuppressedRefusalCount] = suppressed
+		extra[detailSuppressedRefusalScope] = suppressedScopeProxy
 	}
 	rec.RecordDeny(r.Context(), "", "", "", code, category, p.addRefusalContext(extra, r), false)
 }

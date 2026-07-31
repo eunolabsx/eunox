@@ -28,11 +28,22 @@ import (
 // cycles the retention window in minutes.
 //
 // The bucket keeps the evidence the record exists for — the first refusals in a burst are
-// written in full, and the next admitted record carries suppressed_count, so an operator
-// sees both that an attack happened and its scale — while capping the sustained write rate
-// at something the drainer absorbs. The counters are global rather than per-source on
-// purpose: per-source state is itself attacker-sized memory, and the suppressed count
-// already tells the operator how much was elided.
+// written in full, and the next admitted record carries suppressed_refusal_count, so an
+// operator sees both that an attack happened and its scale — while capping the sustained
+// write rate at something the drainer absorbs. The counters are global rather than
+// per-source on purpose: per-source state is itself attacker-sized memory, and the
+// suppressed count already tells the operator how much was elided.
+//
+// The pre-session bucket specifically is ONE bucket for the whole proxy, not one per route.
+// That is what bounds the sustained write rate into the single shared audit queue, which is
+// the property this limiter exists to hold: splitting it per route would multiply the rate
+// an attacker can drive by the size of the route table, re-opening the flood from the
+// direction the per-source-memory argument above closes. The cost is that its tally spans
+// routes and categories while a record reporting it may be route-stamped (recordSessionCapDeny
+// writes RESOURCE_EXHAUSTED through the route's sink) — detailSuppressedRefusalScope states
+// that outright rather than leaving it to inference. saturationGate below makes the opposite
+// trade for the opposite reason: it is scoped per pool per session specifically so a flood on
+// one session cannot elide another's record, so its own scope value says as much.
 const (
 	preSessionDenyRatePerSec = 20
 	preSessionDenyBurst      = 50
@@ -44,6 +55,40 @@ func newPreSessionDenyLimiter() *recordRateLimiter {
 	return newRecordRateLimiter(preSessionDenyRatePerSec, preSessionDenyBurst)
 }
 
+// The details keys a rolled-up refusal record carries, and the scope values that qualify the
+// count.
+//
+// The count is deliberately SELF-DESCRIBING about its scope, because the record it rides on
+// is not. Most pre-session refusals fire before route resolution and are written unstamped
+// through the proxy-wide sink, but the session cap knows its route by the time it fires and is
+// written through the route's sink — so a single admitted record can carry an `upstream` /
+// `policy_version` / `policy_sha256` stamp while the proxy-wide tally folded into it counts
+// refusals from every route and every category. A flood of bad bearer tokens against route A,
+// whose next admitted record happens to be a session-cap refusal on route B, would otherwise
+// read as thousands of saturation refusals against route B's policy digest — a SIEM rule or an
+// operator keyed on route + code draws a conclusion the record's own stamp contradicts. Naming
+// the scope removes the inference.
+//
+// The key is `suppressed_refusal_count` rather than a bare `suppressed_count` because that
+// name is already taken, in the same `details` object, by an unrelated statistic: a `*/list`
+// ALLOW record reports `suppressed_count` as the entries the manifest hid from the catalog.
+// The two are disjoint by decision and method, but a query written against the bare key
+// matches both — routine policy filtering and an unauthenticated refusal flood — which are
+// opposite signals. Each now says what it counted.
+const (
+	detailSuppressedRefusalCount = "suppressed_refusal_count"
+	detailSuppressedRefusalScope = "suppressed_refusal_scope"
+	// suppressedScopeProxy qualifies the pre-session bucket's rollup: the tally spans every
+	// route and category, written directly at the one call site that needs it (recordRefusal)
+	// rather than read off a field on the limiter — a per-scope field would be generality
+	// with a single caller, since the pre-session bucket is the only proxy-wide one. If a
+	// second proxy-wide limiter is ever introduced, the constant at that write site is
+	// exactly what should become a field again; saturationGate below is a narrower-reach
+	// limiter, but a distinct type with its own scope constant, not a second caller of this
+	// one.
+	suppressedScopeProxy = "proxy"
+)
+
 // recordRateLimiter is a token bucket over one CLASS of caller-driven audit refusal
 // records, with a rollup counter so a suppressed write is folded into the next admitted
 // record instead of vanishing. The zero value is not usable; construct with
@@ -52,8 +97,8 @@ func newPreSessionDenyLimiter() *recordRateLimiter {
 // Each class holds its own instance on purpose. A single shared bucket would let a flood
 // of one refusal silence another — a notification-pool flood on one session eliding the
 // AUTH_FAILED and ORIGIN_REJECTED records an incident responder reads first — and would
-// make the suppressed_count stamped on any one record a tally of refusals it has nothing
-// to do with, which is not a number an auditor can act on.
+// make the suppressed_refusal_count stamped on any one record a tally of refusals it has
+// nothing to do with, which is not a number an auditor can act on.
 type recordRateLimiter struct {
 	mu         sync.Mutex
 	tokens     float64
@@ -100,7 +145,8 @@ func (l *recordRateLimiter) admit() (ok bool, suppressed uint64) {
 // suppress counts a refusal elided by an OUTER gate — one that never reached admit, so it
 // spends no token — keeping the rollup complete whichever layer did the eliding. Without
 // it, saturationGate's episode collapsing would drop its elided refusals off the tape
-// entirely, which is the accounting hole the suppressed_count rollup exists to prevent.
+// entirely, which is the accounting hole the suppressed_refusal_count rollup exists to
+// prevent.
 func (l *recordRateLimiter) suppress() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -129,9 +175,9 @@ const (
 //   - Episode collapsing (the primary rule). An operator wants to know that a pool
 //     saturated, not to count every frame refused while it stayed that way. The first
 //     refusal after the pool last had a free slot is recorded; every further refusal in
-//     that same episode is folded into suppressed_count, and a successful acquire (clear)
-//     ends the episode so the next saturation records again. One record per episode is
-//     the signal; the count is its magnitude.
+//     that same episode is folded into suppressed_refusal_count, and a successful acquire
+//     (clear) ends the episode so the next saturation records again. One record per episode
+//     is the signal; the count is its magnitude.
 //
 //   - A token bucket underneath (the backstop). Collapsing alone is not a rate bound: a
 //     caller that holds a pool exactly at capacity can cycle saturate/drain/re-saturate as
@@ -147,6 +193,11 @@ const (
 // each additional session costs a full authenticated handshake plus its own upstream —
 // bounded independently by the session cap. The attacker's cost scales with the record
 // rate, which is exactly the property the pre-session case lacks.
+//
+// Its rollup carries detailSuppressedRefusalScope too, but never suppressedScopeProxy: a
+// saturation record's count is exactly as narrow as the session_id beside it, the opposite
+// of the pre-session bucket's proxy-wide tally, and the constant it writes (see
+// recordResourceExhausted) says so.
 type saturationGate struct {
 	// mu guards recorded and makes the check-bucket-then-latch sequence in admit() one
 	// critical section with clear()'s reset — see admit's doc for why a lock-free

@@ -59,12 +59,57 @@ Section conventions:
 
 ### Changed
 
+- **A kill-switch audit record's session id is now a type-level distinction**, not a
+  convention. The recorders took a plain session-id string, so keeping an unverified,
+  client-supplied `Mcp-Session-Id` out of the signed `session_id` field rested on the
+  author of each call site reaching for the right one of two near-identical helpers — and
+  the wrong choice fails silently, producing a well-formed, HMAC-chained record asserting
+  a session the proxy never established. They now take a subject value constructible only
+  from an id this proxy established (recorded as `session_id`) or from the request itself
+  (recorded as the unverified `details.claimed_session_id`), so a call site added later
+  must state which it holds and the wrong choice does not compile. No record changes
+  shape. See `docs/threat-model-mcp.md` §3.7.
+- **The refusal-record rate limiter's rollup now names its own scope**, and moved off a
+  key it shared with an unrelated statistic. Transport-surface refusals (`AUTH_FAILED`,
+  `ORIGIN_REJECTED`, `JWT_INVALID`, `LOOPBACK_REJECTED`, …) are the only audit writes an
+  unauthenticated caller can trigger, so their rate is bounded by a token bucket and the
+  next admitted record carries the count elided since. That bucket is **proxy-wide by
+  design** — one bucket is what bounds the sustained write rate into the single shared
+  audit queue, and a per-route split would multiply the rate an attacker can drive by the
+  size of the route table — so its tally is folded into whichever record is admitted next,
+  whatever that record's route or category. The **session cap** is both rate-limited and
+  written through the route's sink, so it can pair an `upstream`/`policy_version`/
+  `policy_sha256` stamp with a count spanning every route: a bearer-token spray against
+  `/mcp/routeA` (refused before route resolution, attributable to no route) surfaced as a
+  five-figure count on a `RESOURCE_EXHAUSTED` record reading `upstream: routeB`, which a
+  SIEM rule keyed on route + code reads as saturation against routeB's policy digest. Every
+  rolled-up record now carries `details.suppressed_refusal_scope: "proxy"`, so the number
+  is never inferred from the stamp beside it.
+  **Breaking for log consumers:** the count itself moved from `details.suppressed_count`
+  to `details.suppressed_refusal_count`. The bare key names the unrelated `*/list` filter
+  statistic (catalog entries the manifest hid) in the same `details` object, so a query
+  written against it matched both routine policy filtering on an `allow` and an
+  unauthenticated refusal flood on a `deny`. Update any rule that reads the refusal rollup;
+  a rule that reads the `*/list` statistic is unaffected. See `docs/threat-model-mcp.md`
+  §3.7 and `docs/conformance.md`.
+- **The `/mcp` malformed-`Content-Type` (`UNSUPPORTED_MEDIA_TYPE`) and malformed-body
+  (`INVALID_REQUEST`) refusals are now route-stamped when the route is already known**,
+  instead of always being written through the proxy-wide sink like the codes that genuinely
+  fire before route resolution (`ORIGIN_REJECTED`, `JWT_INVALID`, …). `handleMCP` 404s an
+  unknown upstream before either gate ever runs, so by the time a `/mcp/<route>` body
+  reaches them the route is not merely knowable but already known; leaving the record
+  unstamped anyway understated what the tape could attribute. This is the same treatment
+  the session cap already got, and turns out to matter for the same reason: it is now a
+  second record shape the refusal rollup's `suppressed_refusal_scope` field has to qualify,
+  since both codes can also carry a rollup from the proxy-wide rate limiter. `/control/kill`
+  (no route concept) is unaffected — its refusals stay unstamped. See
+  `docs/threat-model-mcp.md` §3.7 and `docs/conformance.md`.
 - **`RESOURCE_EXHAUSTED` records are now written once per saturation *episode*, not once
   per refused request**, at both established-session caps: the concurrent-handler pool
   (the stdio `hostSem` and the HTTP per-session in-flight cap) and the HTTP per-session
   notification pool. The first refusal after the pool last had a free slot is recorded;
   every further refusal while it stays saturated is folded into the next record's
-  `details.suppressed_count`; and a successful acquire ends the episode, so a later
+  `details.suppressed_refusal_count`; and a successful acquire ends the episode, so a later
   saturation is recorded again. A per-pool token bucket sits underneath, so a caller
   cycling a pool between saturated and drained cannot open episodes faster than the audit
   drainer absorbs them. What an operator wants from these records is that a pool saturated
@@ -75,11 +120,13 @@ Section conventions:
   the process's life. The notification pool was the cheapest way to drive that, since a
   dropped notification costs its sender no upstream round trip and is answered
   `202 Accepted`, byte-identical to a successful forward, so a flooding client gets no
-  signal to back off. The gates are per pool and per session, so a notification flood
-  cannot elide the request pool's record, and a `suppressed_count` on one of these records
-  describes only the pool that wrote it. The proxy-wide session cap's `RESOURCE_EXHAUSTED`
-  is unchanged: it is reachable without an established session, so it stays on the
-  pre-session rate limiter it already shared.
+  signal to back off. The gates are per pool and per session, each on its **own** bucket —
+  never the proxy-wide one above — so a notification flood cannot elide the request pool's
+  record or either of the other bucket's records; every record one of these gates rolls up
+  states `details.suppressed_refusal_scope: "session"`, never `"proxy"`. The proxy-wide
+  session cap's `RESOURCE_EXHAUSTED` is unchanged: it is reachable without an established
+  session, so it stays on the pre-session rate limiter it already shared. See
+  `docs/threat-model-mcp.md` §3.7 and `docs/conformance.md`.
 - **`eunox audit-verify` is roughly 40% faster per record**, with no change to what it
   accepts or rejects. It is the tool an incident responder points at a full retained
   archive, so its per-record cost is paid exactly when the record count is largest and

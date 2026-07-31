@@ -76,7 +76,7 @@ func (d dispatchParams) finishDecision() {
 // kill-store error fails closed inside CheckKill.
 func (d dispatchParams) killDenied(ctx context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, bool) {
 	if deny := d.pdp.CheckKill(ctx, d.sessionID); deny != nil {
-		return recordKillDenial(ctx, d.rec, deny, msg.ID, d.sessionID, msg.Method), true
+		return recordKillDenial(ctx, d.rec, deny, msg.ID, verifiedSession(d.sessionID), msg.Method), true
 	}
 	return mcp.RPCMsg{}, false
 }

@@ -465,8 +465,8 @@ func TestNotificationSaturation_RecordsResourceExhausted(t *testing.T) {
 
 // TestNotificationSaturation_CollapsesEpisodeAndRollsUpSuppressed is the end-to-end half of
 // the saturation gate: a session that keeps a pool saturated writes ONE record for the
-// episode, and the elided drops surface as suppressed_count on the NEXT episode's record
-// rather than vanishing.
+// episode, and the elided drops surface as suppressed_refusal_count on the NEXT episode's
+// record rather than vanishing.
 //
 // The notification path is the one that needed this most. It costs an established session
 // nothing per drop — no upstream round trip, no response body to await — and it answers 202
@@ -530,12 +530,18 @@ func TestNotificationSaturation_CollapsesEpisodeAndRollsUpSuppressed(t *testing.
 	if len(recs) != 2 {
 		t.Fatalf("got %d RESOURCE_EXHAUSTED records, want 2 — one per saturation episode, not one per dropped frame", len(recs))
 	}
-	if details, _ := recs[0]["details"].(map[string]interface{}); details["suppressed_count"] != nil {
-		t.Errorf("the first record of an episode elides nothing, so it must omit suppressed_count; got %v", details["suppressed_count"])
+	if details, _ := recs[0]["details"].(map[string]interface{}); details[detailSuppressedRefusalCount] != nil {
+		t.Errorf("the first record of an episode elides nothing, so it must omit %s; got %v", detailSuppressedRefusalCount, details[detailSuppressedRefusalCount])
 	}
 	details, _ := recs[1]["details"].(map[string]interface{})
-	if got := details["suppressed_count"]; got != float64(firstEpisodeDrops-1) {
-		t.Errorf("suppressed_count = %v, want %d — the drops elided by episode collapsing must still reach the tape", got, firstEpisodeDrops-1)
+	if got := details[detailSuppressedRefusalCount]; got != float64(firstEpisodeDrops-1) {
+		t.Errorf("%s = %v, want %d — the drops elided by episode collapsing must still reach the tape", detailSuppressedRefusalCount, got, firstEpisodeDrops-1)
+	}
+	// The scope names the pool's own reach, never the proxy-wide bucket's: sharing that
+	// bucket would let this session's flood elide an unrelated AUTH_FAILED/ORIGIN_REJECTED
+	// record, so a saturation rollup must never claim suppressedScopeProxy.
+	if got := details[detailSuppressedRefusalScope]; got != suppressedScopeSession {
+		t.Errorf("%s = %v, want %q", detailSuppressedRefusalScope, got, suppressedScopeSession)
 	}
 	// The gate changes admission only: the record keeps the shape its sibling has.
 	if method, _ := recs[1]["method"].(string); method != "notifications/cancelled" {
@@ -629,8 +635,6 @@ func TestDecodeStrictJSON_RecordsMalformedBody(t *testing.T) {
 		name   string
 		path   string
 		body   string
-		method string
-		setup  func(*httpProxyOptions)
 		header func(*http.Request)
 		reason string
 	}{
@@ -703,5 +707,51 @@ func TestDecodeStrictJSON_RecordsMalformedBody(t *testing.T) {
 			// Neither the raw body nor the presented control token may reach the tape.
 			assertRecordsExclude(t, records, tc.body, testControlToken)
 		})
+	}
+}
+
+// TestDecodeStrictJSON_RouteStampedWhenRouteIsKnown pins that the /mcp malformed-body
+// refusal carries the same route stamp as its session-cap sibling once a route is
+// resolved, rather than being written through the unstamped proxy-wide sink despite the
+// route already being known. decodeStrictJSON's own doc comment used to claim this record
+// "can fire before route resolution" for BOTH its callers; that was only ever true for
+// /control/kill (no route concept) — handleMCP already 404s an unknown upstream before
+// handleMCPPost, and hence decodeStrictJSON, ever runs, so the /mcp leg always has one.
+func TestDecodeStrictJSON_RouteStampedWhenRouteIsKnown(t *testing.T) {
+	sink, logPath := newTempAuditSink(t)
+	route := &UpstreamRoute{
+		name: "github",
+		pdp:  pdp.AlwaysAllowPDP{},
+		sink: &routeSink{sink: sink, upstream: "github", policyVersion: "1.2.3", policySHA256: "sha256:abc"},
+	}
+	proxy := &HTTPProxy{
+		sessions:           make(map[string]*httpSession),
+		sink:               sink,
+		preSessionDenies:   newPreSessionDenyLimiter(),
+		allowedOriginHosts: buildAllowedOriginHosts(""),
+		routes:             map[string]*UpstreamRoute{"github": route},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp/github", strings.NewReader(`not json`))
+	req.Header.Set("Content-Type", CTJSON)
+	rec := httptest.NewRecorder()
+	proxy.handleMCPPost(rec, req, route)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body: %s", rec.Code, rec.Body.String())
+	}
+
+	_ = sink.Close()
+	found := findAuditRecordByCode(readAuditRecords(t, logPath), codeInvalidRequest)
+	if found == nil {
+		t.Fatal("expected an INVALID_REQUEST audit record for the malformed body")
+	}
+	if got, _ := found["upstream"].(string); got != "github" {
+		t.Errorf("upstream = %q, want %q — the route was already resolved when decodeStrictJSON ran", got, "github")
+	}
+	if got, _ := found["policy_version"].(string); got != "1.2.3" {
+		t.Errorf("policy_version = %q, want 1.2.3", got)
+	}
+	if got, _ := found["policy_sha256"].(string); got != "sha256:abc" {
+		t.Errorf("policy_sha256 = %q, want sha256:abc", got)
 	}
 }

@@ -18,7 +18,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -154,20 +153,13 @@ type doctorOptions struct {
 }
 
 // parseDoctorReaderFlags is parseAuditReaderFlags for doctor: identical flag parsing and
-// stray-positional rejection, but an unloadable --config is RETURNED (with a nil cfg)
-// instead of aborting. doctor's whole job is describing a broken deployment, so a config
-// that will not parse is the case the bundle is most needed for; it is reported inside
-// the bundle and every config-independent section still renders.
+// stray-positional rejection (shared via parseReaderArgs), but an unloadable --config is
+// RETURNED (with a nil cfg) instead of aborting. doctor's whole job is describing a broken
+// deployment, so a config that will not parse is the case the bundle is most needed for; it
+// is reported inside the bundle and every config-independent section still renders.
 func parseDoctorReaderFlags(fs *flag.FlagSet, args []string, configPath, logPath, keyPath *string) (cfg *config.GatewayConfig, code int, done bool, cfgErr error) {
-	if err := fs.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return nil, 0, true, nil
-		}
-		return nil, 1, true, nil
-	}
-	if fs.NArg() > 0 {
-		fmt.Fprintf(os.Stderr, "eunox doctor: unexpected argument %q (use --audit-log to name the log file)\n", fs.Arg(0))
-		return nil, 1, true, nil
+	if code, done := parseReaderArgs("doctor", fs, args); done {
+		return nil, code, done, nil
 	}
 	cfg, cfgErr = loadConfigAuditDefaults("doctor", *configPath, logPath, keyPath)
 	return cfg, 0, false, cfgErr

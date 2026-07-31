@@ -103,7 +103,7 @@ func (p *HTTPProxy) handleMCP(w http.ResponseWriter, r *http.Request) {
 // content type, a decode failure, or trailing data this writes the response itself (415,
 // 400, or 413 for a body that exceeds the MaxBytesReader cap the caller installed on
 // r.Body) and returns false; the caller must return immediately without proceeding. The
-// 400 legs (malformed JSON, trailing data) are recorded via recordPreSessionDeny under
+// 400 legs (malformed JSON, trailing data) are recorded via recordRefusal under
 // codeInvalidRequest — the same host-protocol-fault code dispatchRequest already uses for
 // a malformed body once a session exists — through the shared rate-limited pre-session
 // path requireJSONContentType's 415 leg already uses just above. A malformed /mcp or
@@ -112,6 +112,13 @@ func (p *HTTPProxy) handleMCP(w http.ResponseWriter, r *http.Request) {
 // failure must not be the one gate that doesn't. The 413 leg is not recorded:
 // MaxBytesReader already bounds the cost of that flood, so it carries no additional
 // attack signal worth a rate-limited write.
+//
+// route is threaded straight to requireJSONContentType and recordRefusal: the /mcp caller
+// (handleMCPPost) already has one resolved by the time it reaches here, so its 415/400
+// records carry that route's stamp exactly like the session-cap refusal, rather than
+// being written through the unstamped proxy-wide sink despite the route being known. The
+// /control/kill caller has no route concept and passes nil, which recordRefusal treats as
+// "write through the proxy-wide sink" — unchanged from before this parameter existed.
 //
 // The content-type gate lives HERE, rather than being repeated at each handler, for the
 // reason checkOrigin is a mux-wide wrapper: it makes the control unforgettable. Every
@@ -122,8 +129,8 @@ func (p *HTTPProxy) handleMCP(w http.ResponseWriter, r *http.Request) {
 //
 // It runs after the caller has installed MaxBytesReader, which only wraps the reader and
 // consumes nothing, so a refused request still has its body read zero times by us.
-func (p *HTTPProxy) decodeStrictJSON(w http.ResponseWriter, r *http.Request, v interface{}, invalidBodyMsg string) bool {
-	if !p.requireJSONContentType(w, r) {
+func (p *HTTPProxy) decodeStrictJSON(w http.ResponseWriter, r *http.Request, v interface{}, invalidBodyMsg string, route *UpstreamRoute) bool {
+	if !p.requireJSONContentType(w, r, route) {
 		return false
 	}
 	dec := json.NewDecoder(r.Body)
@@ -133,10 +140,9 @@ func (p *HTTPProxy) decodeStrictJSON(w http.ResponseWriter, r *http.Request, v i
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			return false
 		}
-		// Unstamped by design, like every other pre-session record: this can fire before
-		// route resolution. The raw decode error and body are NOT recorded — either can
-		// carry attacker-controlled free text; only the fixed reason string is kept.
-		p.recordPreSessionDeny(r, codeInvalidRequest, "body", map[string]interface{}{
+		// The raw decode error and body are NOT recorded — either can carry
+		// attacker-controlled free text; only the fixed reason string is kept.
+		p.recordRefusal(r, route, codeInvalidRequest, "body", map[string]interface{}{
 			"reason": "malformed_json",
 		})
 		http.Error(w, invalidBodyMsg, http.StatusBadRequest)
@@ -148,7 +154,7 @@ func (p *HTTPProxy) decodeStrictJSON(w http.ResponseWriter, r *http.Request, v i
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			return false
 		}
-		p.recordPreSessionDeny(r, codeInvalidRequest, "body", map[string]interface{}{
+		p.recordRefusal(r, route, codeInvalidRequest, "body", map[string]interface{}{
 			"reason": "trailing_data",
 		})
 		http.Error(w, invalidBodyMsg+": trailing data after JSON message", http.StatusBadRequest)
@@ -206,7 +212,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 	// token BEFORE dispatching — otherwise a multi-token body could 202-ack an invalid
 	// initialize notification or run its first request on an existing session while
 	// the trailer is silently dropped.
-	if !p.decodeStrictJSON(w, r, &msg, "invalid JSON-RPC body") {
+	if !p.decodeStrictJSON(w, r, &msg, "invalid JSON-RPC body", route) {
 		return
 	}
 
@@ -246,7 +252,11 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 		// dispatchParams yet), so it repeats the kill gate dispatchRequest applies to
 		// every other locally-answered method.
 		if deny := route.pdp.CheckKill(r.Context(), ""); deny != nil {
-			resp := recordKillDenial(r.Context(), asRecorder(route.sink), deny, msg.ID, "", mcp.MethodInitialize)
+			// No session exists yet, so there is nothing to vouch for: claimedSession is
+			// the honest subject. The header is empty on this branch (its absence is what
+			// routed the request here), so it contributes no detail today — but should the
+			// branch ever admit one, it lands as an unverified claim rather than as fact.
+			resp := recordKillDenial(r.Context(), asRecorder(route.sink), deny, msg.ID, claimedSession(r), mcp.MethodInitialize)
 			writeJSONMsg(w, resp)
 			return
 		}
@@ -348,7 +358,9 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 				// successful readiness ack to a client that only checks status.
 				// Record the deny directly, exactly like the existing-session
 				// notification kill path below, and ack the drop with a bodyless 202.
-				recordKillDrop(r.Context(), asRecorder(route.sink), deny, "", msg.Method, msg.Method, legHTTPNotification)
+				// claimedSession for the same reason as the session-creating branch above:
+				// no session was established, so nothing here is verified.
+				recordKillDrop(r.Context(), asRecorder(route.sink), deny, claimedSession(r), msg.Method, msg.Method, legHTTPNotification)
 				w.WriteHeader(http.StatusAccepted)
 				return
 			}
@@ -359,37 +371,6 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 		return
 	}
 	p.handleSessionPost(w, r, route, sessionID, msg)
-}
-
-// recordUnverifiedSessionKillDenial is recordKillDenial's counterpart for the one call site
-// where the session id has NOT been verified: handleSessionPost's sess == nil branch, where
-// sessionID is the raw, client-supplied Mcp-Session-Id header for a session that does not (or
-// no longer) exist. Every other recordKillDenial/recordKillDrop call site passes a session id
-// this proxy actually established, so stamping it into the structured, signed session_id
-// field is safe there. It is NOT safe here: a caller holding any valid-but-unrelated
-// credential (a route's shared bearer, or any JWT valid for this route's audience) could put
-// an arbitrary — including a real victim's — session id in the header and have it recorded as
-// fact whenever CheckKill fails closed (an active global kill, or a kill-store error).
-// Mirrors recordPreSessionDeny's addClaimedSessionID treatment instead: session_id stays
-// empty, and the claimed value survives, clearly marked unverified, as
-// details.claimed_session_id.
-func recordUnverifiedSessionKillDenial(rec auditRecorder, deny *capability.EnforceResponse, id *json.RawMessage, r *http.Request, method string) mcp.RPCMsg {
-	denial := normalizeDenial(deny.Denial)
-	if rec != nil {
-		rec.RecordDeny(r.Context(), "", method, method, denial.Code, denial.ConditionType, addClaimedSessionID(nil, r), false)
-	}
-	return denialResult(id, denial.Code, denial.ConditionType, method, "")
-}
-
-// recordUnverifiedSessionKillDrop is recordUnverifiedSessionKillDenial's notification-drop
-// counterpart, for the same unresolved-session call site.
-func recordUnverifiedSessionKillDrop(rec auditRecorder, deny *capability.EnforceResponse, r *http.Request, method string, transportLeg killDropLeg) {
-	if rec == nil {
-		return
-	}
-	denial := normalizeDenial(deny.Denial)
-	details := addClaimedSessionID(map[string]interface{}{"transport": string(transportLeg)}, r)
-	rec.RecordDeny(r.Context(), "", method, method, denial.Code, denial.ConditionType, details, false)
 }
 
 // handleSessionPost handles a host POST carrying an existing Mcp-Session-Id: it validates
@@ -412,15 +393,18 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 		// only the request/notification framing here can carry a JSON-RPC KILL_SWITCH body.
 		//
 		// sessionID here is the raw, client-supplied header for a session that does not (or
-		// no longer) exist — unverified, unlike every other CheckKill call site's sessionID.
-		// Recording it via the shared recordKillDenial/recordKillDrop would stamp it into the
-		// signed session_id field, letting anyone whose credential merely clears
-		// CheckKill's fail-closed paths forge kill records against an arbitrary (including a
-		// real victim's) session id. Use the unverified-session counterparts instead: session_id
-		// stays empty and the claimed value survives only as details.claimed_session_id.
+		// no longer) exist — unverified, unlike every other CheckKill call site's sessionID,
+		// which comes from an established sess.id/p.sessionID via verifiedSession. Stamping
+		// it into the signed session_id field would let anyone whose credential merely
+		// clears CheckKill's fail-closed paths forge kill records against an arbitrary
+		// (including a real victim's) session id. claimedSession(r) below (and at its sibling
+		// call two lines down) is what keeps session_id empty and preserves the claimed value
+		// only as details.claimed_session_id — the same treatment the session-creating and
+		// sessionless-notification initialize branches above give a header that was never
+		// even looked up.
 		if deny := route.pdp.CheckKill(r.Context(), sessionID); deny != nil {
 			if msg.IsRequest() {
-				writeJSONMsg(w, recordUnverifiedSessionKillDenial(asRecorder(route.sink), deny, msg.ID, r, msg.Method))
+				writeJSONMsg(w, recordKillDenial(r.Context(), asRecorder(route.sink), deny, msg.ID, claimedSession(r), msg.Method))
 			} else {
 				// Fire-and-forget (notification / response): record the drop and ack with a
 				// bodyless 202, matching the existing-session notification kill path below.
@@ -436,7 +420,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 				if msg.IsResponse() {
 					label, leg = "server-response", legHTTPServerResponse
 				}
-				recordUnverifiedSessionKillDrop(asRecorder(route.sink), deny, r, label, leg)
+				recordKillDrop(r.Context(), asRecorder(route.sink), deny, claimedSession(r), label, label, leg)
 				w.WriteHeader(http.StatusAccepted)
 			}
 			return
@@ -503,7 +487,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 	if msg.IsNotification() {
 		if !isSwallowedHostNotification(msg.Method) {
 			if kill != nil {
-				recordKillDrop(r.Context(), asRecorder(route.sink), kill, sessionID, msg.Method, msg.Method, legHTTPNotification)
+				recordKillDrop(r.Context(), asRecorder(route.sink), kill, verifiedSession(sess.id), msg.Method, msg.Method, legHTTPNotification)
 				w.WriteHeader(http.StatusAccepted)
 				return
 			}
@@ -584,7 +568,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 				// host reply so a killed session's suppressed server-response is visible on
 				// the tape, mirroring the notification kill record above; a response carries
 				// no method, so use a fixed "server-response" identifier.
-				recordKillDrop(r.Context(), asRecorder(route.sink), kill, sessionID, "server-response", "server-response", legHTTPServerResponse)
+				recordKillDrop(r.Context(), asRecorder(route.sink), kill, verifiedSession(sess.id), "server-response", "server-response", legHTTPServerResponse)
 			case sess.upWriter != nil:
 				_ = sess.upWriter.Write(msg)
 			default:
@@ -856,7 +840,7 @@ func (p *HTTPProxy) handleMCPGet(w http.ResponseWriter, r *http.Request, route *
 	// store without naming a session, and a re-open attempt racing that teardown. A
 	// kill-store error fails closed via CheckKill.
 	if deny := route.pdp.CheckKill(r.Context(), sessionID); deny != nil {
-		recordKillDrop(r.Context(), asRecorder(route.sink), deny, sessionID, "", "", legSSEGet)
+		recordKillDrop(r.Context(), asRecorder(route.sink), deny, verifiedSession(sess.id), "", "", legSSEGet)
 		http.Error(w, "session terminated", http.StatusForbidden)
 		return
 	}
@@ -1125,8 +1109,9 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 	// actually executed could differ from what a body-only reviewer would expect.
 	// decodeStrictJSON applies the JSON-only content-type gate too, and it runs after the
 	// control-token check above, so a caller without the token learns nothing about the
-	// body this endpoint expects.
-	if !p.decodeStrictJSON(w, r, &body, "invalid request body") {
+	// body this endpoint expects. /control/kill has no route concept, so nil: its refusal
+	// stays on the proxy-wide sink, unchanged from before decodeStrictJSON took a route.
+	if !p.decodeStrictJSON(w, r, &body, "invalid request body", nil) {
 		return
 	}
 	if body.All {
