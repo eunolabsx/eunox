@@ -242,7 +242,7 @@ func recordKillDrop(ctx context.Context, rec auditRecorder, deny *capability.Enf
 // per-refusal record is a lever on the proxy's own availability under --require-audit=strict,
 // and why the gate is scoped to the pool rather than shared. suppressedScopeSession pairs
 // with it: unlike the pre-session bucket's detailSuppressedRefusalScope value
-// (suppressedScopeProxy, spanning every route and category), this count describes exactly
+// (suppressedScopeProxyCategory, spanning every route within one refusal category), this count describes exactly
 // the session whose id sits beside it on the same record — the write site's own scope
 // constant, matching how the pre-session bucket's scope is written at ITS site rather than
 // read off a field (see the const block in record_limiter.go).
@@ -267,7 +267,7 @@ func recordResourceExhausted(ctx context.Context, rec auditRecorder, gate *satur
 // suppressedScopeSession qualifies a saturation gate's rollup (see recordResourceExhausted):
 // the count spans only the one session — indeed only the one pool within it — whose refusals
 // fed the gate, never other sessions or the other pool. Written at this one call site rather
-// than carried on saturationGate itself, for the same reason suppressedScopeProxy is written
+// than carried on saturationGate itself, for the same reason suppressedScopeProxyCategory is written
 // at recordRefusal rather than carried on the pre-session limiter: a per-scope field would be
 // generality with a single caller.
 const suppressedScopeSession = "session"

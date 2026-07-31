@@ -1140,8 +1140,9 @@ func (s *httpSession) callSubprocessUpstream(ctx context.Context, msg mcp.RPCMsg
 // stdin), the desynced stream cannot be reused, so killing the subprocess EOFs readUpstream,
 // fires close(done), and lets the cleanup goroutine reap the session (sessCancel, via
 // readUpstream's defer, then unblocks any other in-flight call). A no-op for a remote-HTTP
-// session (nil upCmd) or a not-yet-started one; idempotent (Process.Kill on a reaped process
-// just returns an ignored error).
+// session (nil upCmd) or a not-yet-started one; idempotent, because killUpstreamProcess
+// signals the direct child through os.Process first and aborts if that reports the process
+// already reaped — so a call racing a completed Wait sends nothing at all.
 func (s *httpSession) killSubprocess() {
 	if s.upCmd != nil {
 		killUpstreamProcess(s.upCmd.Process)

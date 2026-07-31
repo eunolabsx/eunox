@@ -554,13 +554,9 @@ func (p *StdioProxy) signalUpstream(sig os.Signal) {
 		p.upHTTP.close()
 		return
 	}
-	if p.upCmd.Process != nil {
-		// Group first, so a wrapper's grandchild gets the chance to shut down gracefully
-		// too rather than only being reaped by the SIGKILL fallback below.
-		if !signalUpstreamGroup(p.upCmd.Process, sig) {
-			_ = p.upCmd.Process.Signal(sig)
-		}
-	}
+	// The whole tree, so a wrapper's grandchild gets the chance to shut down gracefully
+	// too rather than only being reaped by the SIGKILL fallback below.
+	signalUpstreamProcess(p.upCmd.Process, sig)
 	t := time.AfterFunc(p.killDelay(), func() {
 		if p.upCmd.Process != nil {
 			fmt.Fprintf(os.Stderr, "[eunox] Upstream did not exit; sending SIGKILL.\n")

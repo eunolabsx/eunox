@@ -26,7 +26,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	goredis "github.com/redis/go-redis/v9"
 	"io"
 	"log/slog"
 	"net"
@@ -41,6 +40,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	goredis "github.com/redis/go-redis/v9"
 
 	"github.com/eunolabs/eunox/internal/audit"
 	"github.com/eunolabs/eunox/internal/config"

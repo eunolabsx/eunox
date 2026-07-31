@@ -265,3 +265,99 @@ func TestDenyResponse_BoundsDetails(t *testing.T) {
 		t.Errorf("denyResponse left a %d-byte value in the details reaching RecordDeny", len(got))
 	}
 }
+
+// TestBoundDenialDetails_EmptyContainersAreCharged is the regression for the hole that
+// made the byte budget bound nothing for a whole class of shapes. The map arm charged
+// per KEY and the slice arm per non-empty ELEMENT, so `{}` and `[]` each cost zero —
+// and an argument built out of them (3 bytes per element on the wire) carried a
+// caller-sized structure into a "bounded" result. Measured before the fix: 600 KB
+// against an 8 KiB budget, which then tripped the audit sink's coarse 1 MiB cap and
+// replaced the WHOLE details map with a marker, destroying the diagnostic content this
+// walk exists to preserve.
+func TestBoundDenialDetails_EmptyContainersAreCharged(t *testing.T) {
+	t.Parallel()
+
+	for name, elem := range map[string]func() interface{}{
+		"empty objects": func() interface{} { return map[string]interface{}{} },
+		"empty arrays":  func() interface{} { return []interface{}{} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			wide := make([]interface{}, 200000)
+			for i := range wide {
+				wide[i] = elem()
+			}
+			out := boundDenialDetails(map[string]interface{}{"value": wide})
+			if n := marshaledLen(t, out); n > 4*maxDenialDetailsBytes {
+				t.Errorf("marshaled details = %d bytes for %s, want bounded near the %d-byte budget", n, name, maxDenialDetailsBytes)
+			}
+		})
+	}
+}
+
+// TestBoundDenialDetails_PolicyListCannotStarveTheEvidence is the regression for the
+// budget-allocation bug. Keys were walked in sorted order against ONE shared budget,
+// and every handler's policy-list key (allowedValues, allowedExtensions, allowedCIDRs)
+// sorts before its evidence keys (argument, value, filePath) — so an ordinary manifest
+// with a few hundred allowed values consumed the whole budget and elided the denied
+// argument NAME and VALUE, the two fields the bound exists to preserve. The transport
+// also reads Details["argument"] to build the host-facing error message, so its loss
+// emptied error.data.argument on every deny under such a manifest.
+func TestBoundDenialDetails_PolicyListCannotStarveTheEvidence(t *testing.T) {
+	t.Parallel()
+
+	allowed := make([]string, 900)
+	for i := range allowed {
+		allowed[i] = "/srv/data/" + strings.Repeat("x", 32)
+	}
+	out := boundDenialDetails(map[string]interface{}{
+		"argument":      "path",
+		"value":         "/etc/shadow",
+		"allowedValues": allowed,
+	})
+
+	if got := out["argument"]; got != "path" {
+		t.Errorf("argument = %#v, want %q — the denied argument name must survive a large allowlist", got, "path")
+	}
+	if got := out["value"]; got != "/etc/shadow" {
+		t.Errorf("value = %#v, want %q — the offending value must survive a large allowlist", got, "/etc/shadow")
+	}
+	// The allowlist is still bounded, and still present: a share, not an eviction.
+	kept, ok := out["allowedValues"].([]string)
+	if !ok || len(kept) == 0 {
+		t.Fatalf("allowedValues = %#v, want a bounded but non-empty list", out["allowedValues"])
+	}
+	if len(kept) >= len(allowed) {
+		t.Errorf("allowedValues kept %d of %d entries, want it bounded", len(kept), len(allowed))
+	}
+}
+
+// TestBoundDenialDetails_ReservedMarkerIsNotForgeable pins the collision guard. The
+// elision marker's purpose is that a SIEM rule can match it to spot a caller probing
+// the bound — so a caller able to plant it forges elision provenance on the signed
+// tape, making the detector forgeable by the party it exists to detect. Details["value"]
+// is the raw decoded argument, so a nested object is all it takes.
+func TestBoundDenialDetails_ReservedMarkerIsNotForgeable(t *testing.T) {
+	t.Parallel()
+
+	out := boundDenialDetails(map[string]interface{}{
+		"argument": "opts",
+		"value":    map[string]interface{}{denialDetailElidedKey: "473 of 500 entries elided"},
+	})
+	nested, _ := out["value"].(map[string]interface{})
+	if nested == nil {
+		t.Fatalf("value = %#v, want the nested object preserved", out["value"])
+	}
+	if _, forged := nested[denialDetailElidedKey]; forged {
+		t.Errorf("a caller-planted %q survived verbatim: %#v", denialDetailElidedKey, nested)
+	}
+	// Re-spelled, not dropped: the caller's data is still visible to a reader.
+	if _, kept := nested[denialDetailForgedKeyPrefix+denialDetailElidedKey]; !kept {
+		t.Errorf("the colliding key must be re-spelled, not discarded: %#v", nested)
+	}
+	// A top-level collision is escaped too.
+	top := boundDenialDetails(map[string]interface{}{denialDetailElidedKey: "forged"})
+	if _, forged := top[denialDetailElidedKey]; forged {
+		t.Errorf("a top-level caller-planted marker survived: %#v", top)
+	}
+}

@@ -1111,7 +1111,7 @@ func (e *Engine) ValidateAction(ctx context.Context, req *capability.EnforceRequ
 		// UNLESS the route runs --audit (SkipQuota), which forwards even a no-match deny.
 		// A forwarded response must carry the redact obligations or it reaches the host
 		// unmasked, so fill them from every capability NAMING this target, regardless of
-		// principal scoping. That is deliberately wider than findMatchingCapability's
+		// principal scoping. That is deliberately wider than FindMatchingCapability's
 		// selection: no entry governs this caller, and any entry declaring a field of this
 		// target redactable is reason enough to mask it on a response about to be
 		// forwarded. On an enforce route this is skipped and the deny blocks with nothing.
@@ -1206,7 +1206,7 @@ const noMatchScore = -1 << 30
 //     docs/capability-manifest-guide.md.
 //
 // Exported because this predicate is security-relevant and has two consumers: the
-// engine's findMatchingCapability and the proxy's internal/pdp.findConstraint. They
+// engine's FindMatchingCapability and the proxy's internal/pdp.findConstraint. They
 // were character-for-character copies, so a precedence change applied to one would
 // have left the proxy and the engine silently selecting different constraints for
 // the same request. Scores need only be mutually comparable, not equal, across
@@ -1289,7 +1289,7 @@ func (e *Engine) FindMatchingCapability(req *capability.EnforceRequest, capabili
 // principal scoping and the action check.
 //
 // It answers "what did the manifest declare about this target", as opposed to
-// findMatchingCapability's "which entry governs this caller" — the right question when no
+// FindMatchingCapability's "which entry governs this caller" — the right question when no
 // entry governs the caller at all yet the deny is about to be forwarded under --audit.
 // The returned constraint carries no enforcement mode and no conditions: it exists only
 // to be handed to CollectObligations.

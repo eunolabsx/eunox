@@ -219,13 +219,16 @@ func (c *JWKSCache) freshAt(now time.Time) bool {
 // GetKeys returns the cached JWKS when it is still within the TTL, otherwise it
 // fetches a fresh copy.
 //
-// The returned *jose.JSONWebKeySet is the cache's own shared instance, handed
-// concurrently to every verification in flight — it is READ-ONLY. Never mutate it or
-// its Keys slice; to obtain keys you can hold or reorder, copy them through FindKeys
-// (which always returns a fresh slice) as the production consumer (VerifyWithKeyRotation)
-// does. Mutating the returned set would corrupt the root-of-trust key material seen by
-// all concurrent token validations. Refresh and the ForceRefresh* methods carry the
-// same contract.
+// The returned set's Keys SLICE is independent of the cache's (see copyKeySet), so a
+// caller may hold, append to, or reorder it without disturbing the verifications running
+// concurrently. Refresh and both ForceRefresh* methods carry the same contract — every
+// exported accessor copies, so no caller holds the live instance.
+//
+// The copy is one level deep: each jose.JSONWebKey still carries a Key interface{}
+// pointing at the same underlying *rsa.PublicKey / *ecdsa.PublicKey, so the KEYS
+// THEMSELVES remain read-only. Mutating one would corrupt the root-of-trust material
+// seen by every concurrent token validation. FindKeys has the same bound and is how the
+// production consumer (VerifyWithKeyRotation) selects by kid.
 func (c *JWKSCache) GetKeys(ctx context.Context) (*jose.JSONWebKeySet, error) {
 	c.mu.RLock()
 	if c.freshAt(c.now()) {

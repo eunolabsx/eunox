@@ -11,7 +11,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/eunolabs/eunox/internal/drift"
@@ -120,6 +123,38 @@ func fetchLiveToolsStdio(ctx context.Context, command string, args []string) (Li
 	defer cancel()                                        // always release the context (covers the early-return error paths)
 	cmd := exec.CommandContext(procCtx, command, args...) //nolint:gosec // G204: command and args are user-supplied CLI arguments
 	transport.ConfigureUpstreamCmd(cmd)
+	// Tear down the whole process group on context cancel, not just the direct child.
+	// os/exec's default Cancel is Process.Kill() on the wrapper alone, which orphans the
+	// real server an `npx`/`uvx` command spawns — the leak ConfigureUpstreamCmd's process
+	// group placement exists to close. os/exec joins its cancel goroutine before Wait
+	// returns, so this stays serialized with the reap the comment above relies on.
+	cmd.Cancel = func() error {
+		transport.KillUpstreamProcess(cmd.Process)
+		return nil
+	}
+
+	// Forward an operator's Ctrl-C to the probe subprocess. ConfigureUpstreamCmd puts
+	// the upstream in its OWN process group, which is what lets a wrapper-launched
+	// grandchild be reaped as a unit — but it also detaches the subprocess from this
+	// CLI's foreground group, so the terminal's SIGINT no longer reaches it. Without a
+	// handler the CLI would die on the default disposition, the deferred teardown below
+	// would never run, and a daemon-style MCP server would be orphaned. Cancelling
+	// procCtx runs cmd.Cancel, which tears down the whole group. The proxy subcommand
+	// installs its own handler for the same reason; these three subcommands
+	// (init / validate --live / doctor) had none because they used to inherit the
+	// terminal's group delivery.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	stopSigWatch := make(chan struct{})
+	defer close(stopSigWatch)
+	go func() {
+		select {
+		case <-sigCh:
+			cancel()
+		case <-stopSigWatch:
+		}
+	}()
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

@@ -61,7 +61,7 @@ func (p *HTTPProxy) handleMCP(w http.ResponseWriter, r *http.Request) {
 			// Mcp-Session-Id out of the structured session_id (forgery guard). The record is
 			// also unstamped by design (no route/policy fields): this gate runs before route
 			// resolution, for the oracle reason above — see recordPreSessionDeny.
-			p.recordPreSessionDeny(r, "JWT_INVALID", "jwt", map[string]interface{}{"error_type": pdp.ClassifyJWTError(err)})
+			p.recordPreSessionDeny(r, "JWT_INVALID", catJWT, map[string]interface{}{"error_type": pdp.ClassifyJWTError(err)})
 			w.Header().Set("WWW-Authenticate", buildWWWAuthenticate(authHeader != "", p.oauthMetaURL))
 			// Do not echo the JWT validation error to the caller: the library message
 			// can disclose claim values, the accepted algorithm, or key-rotation state,
@@ -142,7 +142,7 @@ func (p *HTTPProxy) decodeStrictJSON(w http.ResponseWriter, r *http.Request, v i
 		}
 		// The raw decode error and body are NOT recorded — either can carry
 		// attacker-controlled free text; only the fixed reason string is kept.
-		p.recordRefusal(r, route, codeInvalidRequest, "body", map[string]interface{}{
+		p.recordRefusal(r, route, codeInvalidRequest, catBody, map[string]interface{}{
 			"reason": "malformed_json",
 		})
 		http.Error(w, invalidBodyMsg, http.StatusBadRequest)
@@ -154,7 +154,7 @@ func (p *HTTPProxy) decodeStrictJSON(w http.ResponseWriter, r *http.Request, v i
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			return false
 		}
-		p.recordRefusal(r, route, codeInvalidRequest, "body", map[string]interface{}{
+		p.recordRefusal(r, route, codeInvalidRequest, catBody, map[string]interface{}{
 			"reason": "trailing_data",
 		})
 		http.Error(w, invalidBodyMsg+": trailing data after JSON message", http.StatusBadRequest)

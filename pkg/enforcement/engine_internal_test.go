@@ -1147,3 +1147,47 @@ func TestRetryAfterSeconds(t *testing.T) {
 		})
 	}
 }
+
+// TestExactRat_BoundsTheParse is the regression for the DoS the exact-comparison arm
+// introduced. big.Rat.SetString's mantissa scan is superlinear and its exponent handling
+// materializes 10^N, so handing it an unbounded caller literal turned one tool-call
+// argument into seconds of CPU on the pre-forward enforcement path: a 1M-digit
+// fractional literal cost ~1.8 s, and the nine-byte "1e1000000" ~25 ms and ~1 MiB, each
+// multiplied by the number of allowedValues/enum entries. Arguments decode in UseNumber
+// mode, so they arrive here as their verbatim literal text.
+func TestExactRat_BoundsTheParse(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		lit  string
+	}{
+		{"over-long fractional", "0." + strings.Repeat("7", maxExactNumericLen*4)},
+		{"over-long integer", strings.Repeat("9", maxExactNumericLen+1)},
+		{"huge positive exponent", "1e1000000"},
+		{"huge negative exponent", "1e-1000000"},
+		{"unparseable exponent", "1e" + strings.Repeat("9", 40)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, ok := exactRat(json.Number(tc.lit)); ok {
+				t.Errorf("exactRat accepted a literal past the parse bounds (%d bytes); it must decline so the caller takes the float64 path", len(tc.lit))
+			}
+		})
+	}
+
+	// Declining must not cost exactness where the arm actually matters: integers around
+	// and above 2^63 need tens of digits, far inside the bound.
+	for _, tc := range []struct {
+		name string
+		a, b string
+		want bool
+	}{
+		{"2^63 vs its successor", "9223372036854775808", "9223372036854775809", false},
+		{"2^63 vs itself", "9223372036854775808", "9223372036854775808", true},
+		{"exponent form vs expansion", "1e30", "1000000000000000000000000000000", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := numericEqual(json.Number(tc.a), json.Number(tc.b)); got != tc.want {
+				t.Errorf("numericEqual(%s, %s) = %v, want %v", tc.a, tc.b, got, tc.want)
+			}
+		})
+	}
+}

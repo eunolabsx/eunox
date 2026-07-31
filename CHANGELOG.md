@@ -430,6 +430,18 @@ Section conventions:
 
 ### Fixed
 
+- **The process-group teardown signals the direct child first, and only then the
+  group.** `os.Process.Kill` consults Go's own reaped-process state, so a call racing a
+  completed `cmd.Wait` sends no signal at all; a raw `kill(-pid)` has no such guard and
+  the kernel resolves it against whatever holds that pid *now*. Several teardown paths
+  genuinely race a `Wait` — the stdio SIGKILL timer that `stopKillTimer` deliberately
+  does not join, the HTTP session's close timer against its cleanup goroutine, the
+  writer-poison hook — and since every upstream is a group leader, the likeliest holder
+  of a recycled pid is another session's upstream. Killing the leader first restores the
+  idempotence those call sites document, and keeps the pid reserved so the group id
+  stays valid for the call that follows. The group signal also refuses `pid <= 1`:
+  `kill(-1, …)` is "every process the caller may signal", not "the group led by pid 1",
+  and an upstream can legitimately land on pid 1 inside a PID namespace.
 - **A wrapper-launched upstream (`npx`, `uvx`, a shell script) could hang shutdown
   forever.** Both bounded teardown paths — the startup watchdog and the host-EOF
   shutdown — end by waiting for the upstream's stdout to reach EOF, but the kill
@@ -679,6 +691,18 @@ Section conventions:
 
 ### Security
 
+- **Exact numeric comparison bounds the literal it parses.** The fix that made
+  integer comparison exact above 2^63 (below) reaches `big.Rat.SetString`, whose
+  mantissa scan is superlinear and whose exponent handling materializes 10^N — so an
+  unbounded parse would have been a CPU/memory denial of service on the pre-forward
+  enforcement path, reachable with a single tool-call argument (arguments decode in
+  UseNumber mode and arrive as verbatim literal text). Measured un-guarded: a 1M-digit
+  fractional literal cost ~1.8 s of one core and the nine-byte `1e1000000` ~25 ms and
+  ~1 MiB, each multiplied by the number of `allowedValues`/`enum` entries. A literal
+  length cap and an exponent-magnitude cap now gate the parse, matching the bounds
+  `internal/mcp` already applies to the same parse for the same reason; anything past
+  them takes the float64 path, exactly as before the exact arm existed. The exactness
+  the arm exists for is unaffected — integers around 2^63 need tens of digits.
 - **A single denied tool call could write an unbounded amount into the HMAC-signed
   audit tape.** Most condition handlers echo the caller-controlled value that failed
   their check into `denial.Details` — the argument that missed an `allowedValues`

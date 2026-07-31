@@ -758,9 +758,13 @@ func BestManifestConstraint(manifest *config.LocalManifest, toolName string) *ca
 	if len(covering) == 0 {
 		return nil
 	}
-	best := -(1 << 30)
-	var top []*capability.Constraint
-	for _, c := range covering {
+	// Seeded from the first candidate rather than a sentinel, so `top` is non-empty for
+	// ANY scoring resSpecificity could return. A sentinel seed made the non-empty
+	// precondition of the top[0] below depend on every future score staying above it —
+	// an unguarded index resting on a property nothing states.
+	top := []*capability.Constraint{covering[0]}
+	best := resSpecificity(covering[0].Target, toolName)
+	for _, c := range covering[1:] {
 		switch s := resSpecificity(c.Target, toolName); {
 		case s > best:
 			best = s
@@ -785,7 +789,7 @@ func BestManifestConstraint(manifest *config.LocalManifest, toolName string) *ca
 // not. Returns nil when nothing matches.
 //
 // Reachability is NOT "maximum specificity", because the engine filters by principal
-// BEFORE it scores (findMatchingCapability skips a principal-scoped constraint whose
+// BEFORE it scores (FindMatchingCapability skips a principal-scoped constraint whose
 // claims do not match, exactly like a target mismatch). A more-specific entry
 // therefore shadows a less-specific one only when it applies to every caller — that
 // is, only when it is UNSCOPED. Given

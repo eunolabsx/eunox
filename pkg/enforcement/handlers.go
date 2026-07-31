@@ -12,6 +12,7 @@ import (
 	"net"
 	"path"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -1089,6 +1090,27 @@ func exactIntegerRat(v any) (*big.Rat, bool) {
 	return r, true
 }
 
+// Bounds on the decimal literal exactRat will hand to big.Rat.SetString. Both are
+// REQUIRED, not defensive: SetString's mantissa scan is superlinear, and its exponent
+// handling materializes 10^N, so an unbounded parse is a CPU/memory denial of service
+// on the pre-forward enforcement path — reachable with one tool-call argument, since
+// arguments decode in UseNumber mode and arrive here as their verbatim literal text.
+// Measured on the un-guarded form: a 1M-digit fractional literal cost 1.8 s of one
+// core, and the 9-byte "1e1000000" cost ~25 ms and ~1 MiB, both per comparison and
+// multiplied by the number of allowedValues/enum entries.
+//
+// internal/mcp's MsgKey bounds its own big.Rat parse the same way and for the same
+// reason; the values match it deliberately. They are generous relative to the job:
+// this arm exists to compare integers around and above 2^63 exactly, which needs
+// tens of digits, so 1024 leaves orders of magnitude of headroom while making the
+// worst case sub-millisecond. A literal past either bound falls through to the
+// float64 comparison, which is what happened for every such value before the exact
+// arm existed — no new fail-open, just no exactness for a literal no policy writes.
+const (
+	maxExactNumericLen = 1024
+	maxExactNumericExp = 1024
+)
+
 // exactRat returns v's exact value as a *big.Rat, without the float64 round-trip
 // asInt64/toFloat64 take. Only the types that can carry a value outside int64 range
 // are handled — everything else reaches a comparison through asInt64 first.
@@ -1097,7 +1119,11 @@ func exactRat(v any) (*big.Rat, bool) {
 	case json.Number:
 		// SetString parses the decimal literal exactly, including the digits a float64
 		// coercion would round away. It also accepts exponent forms ("1e30"), which is
-		// what makes this the right parse for an argument decoded in UseNumber mode.
+		// what makes this the right parse for an argument decoded in UseNumber mode —
+		// and what makes the exponent bound necessary.
+		if len(n) > maxExactNumericLen || !exactNumericExponentBounded(string(n)) {
+			return nil, false
+		}
 		return new(big.Rat).SetString(string(n))
 	case uint64:
 		return new(big.Rat).SetInt(new(big.Int).SetUint64(n)), true
@@ -1113,10 +1139,31 @@ func exactRat(v any) (*big.Rat, bool) {
 
 // ratFromFloat is exactRat's float arm: big.Rat cannot represent Inf or NaN, and
 // SetFloat64 returns nil for both, so report those as having no exact value rather
-// than dereferencing nil.
+// than dereferencing nil. A float64 needs no length bound — it is already 8 bytes.
 func ratFromFloat(f float64) (*big.Rat, bool) {
 	r := new(big.Rat).SetFloat64(f)
 	return r, r != nil
+}
+
+// exactNumericExponentBounded reports whether a decimal literal's exponent (if any) is
+// small enough that big.Rat.SetString will not materialize a huge 10^N value: the
+// length cap alone does not bound "1e1000000", nine bytes that expand to ~1 MiB. An
+// unparseable or over-bound exponent reports false, so the caller takes the float64
+// path. Mirrors internal/mcp's numericIDExponentBounded, which guards the same parse
+// against the same input class one layer up.
+func exactNumericExponentBounded(s string) bool {
+	i := strings.IndexAny(s, "eE")
+	if i < 0 {
+		return true // no exponent: only the length cap applies
+	}
+	v, err := strconv.Atoi(strings.TrimPrefix(s[i+1:], "+"))
+	if err != nil {
+		return false
+	}
+	if v < 0 {
+		v = -v
+	}
+	return v <= maxExactNumericExp
 }
 
 // maxInt64Uint is math.MaxInt64 as a uint64, for the unsigned arms of asInt64. The

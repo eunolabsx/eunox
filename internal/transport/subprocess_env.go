@@ -79,7 +79,26 @@ func ConfigureUpstreamCmd(cmd *exec.Cmd) {
 	cmd.Stderr = os.Stderr
 	cmd.Env = upstreamEnv()
 	setUpstreamProcessGroup(cmd)
+	// cmd.Cancel is deliberately NOT set here. os/exec refuses to Start a command that
+	// has a Cancel but no context, and both transports build their upstream with a plain
+	// exec.Command on purpose (subprocess lifecycles are managed explicitly, not by a
+	// context) — so wiring it here fails every subprocess session outright. A
+	// CommandContext caller wires KillUpstreamProcess itself; see its doc.
 }
+
+// KillUpstreamProcess forcibly stops an upstream subprocess and everything it spawned.
+// Exported for the one spawn site outside this package, the CLI's live-upstream probe
+// (init / validate --live / doctor), which builds its command with exec.CommandContext
+// and must set it as cmd.Cancel:
+//
+//	cmd.Cancel = func() error { transport.KillUpstreamProcess(cmd.Process); return nil }
+//
+// os/exec's DEFAULT Cancel is Process.Kill() on the direct child, which reaps a wrapper
+// (`npx`, `uvx`) and orphans the real server — the leak ConfigureUpstreamCmd's process
+// group exists to close, so a context-bound caller that keeps the default gets the
+// detach with none of the teardown. This cannot be folded into ConfigureUpstreamCmd
+// because Cancel is invalid on the context-free commands the transports use.
+func KillUpstreamProcess(proc *os.Process) { killUpstreamProcess(proc) }
 
 // killUpstreamProcess forcibly stops an upstream subprocess AND everything it spawned,
 // falling back to the direct child on a platform (or a failed Setpgid) with no process
@@ -90,16 +109,46 @@ func ConfigureUpstreamCmd(cmd *exec.Cmd) {
 // so a site that reached for proc.Kill() directly would reap the wrapper and orphan the
 // real server — leaking a process per session in HTTP mode, and on the stdio startup
 // and shutdown paths leaving the grandchild holding the stdout pipe whose EOF the
-// bounded teardowns wait for. proc may be nil (a session torn down before its
-// subprocess started); killing an already-reaped process is a no-op whose error is
-// ignored, so this is idempotent.
+// bounded teardowns wait for.
+//
+// The direct child is signalled FIRST, and a failure there aborts the group kill. That
+// ordering is what preserves the idempotence every caller relies on. os.Process.Kill
+// consults Go's own reaped-process state (ErrProcessDone, and a pidfd where the kernel
+// provides one), so a call racing a completed cmd.Wait sends no signal at all — whereas
+// the group kill is a raw kill(-pid) that the kernel resolves against whatever holds
+// that pid NOW. Several callers genuinely race a Wait: the stdio SIGKILL AfterFunc that
+// stopKillTimer deliberately does not join, httpSession.close's timer arm against the
+// per-session cleanup goroutine, and the writer-poison hook. Every eunox upstream is a
+// group LEADER (pgid == pid) since ConfigureUpstreamCmd sets Setpgid, so under pid reuse
+// the likeliest holder of a recycled pid is another session's upstream — session A's
+// stale kill would SIGKILL session B's whole tree. Killing the leader before the group
+// also keeps the pid reserved (a zombie is not recycled until reaped), so the group id
+// stays valid for the call that follows.
+//
+// proc may be nil (a session torn down before its subprocess started).
 func killUpstreamProcess(proc *os.Process) {
 	if proc == nil {
 		return
 	}
-	if !killUpstreamGroup(proc) {
-		_ = proc.Kill()
+	if err := proc.Kill(); err != nil {
+		// Already reaped, or gone. Do NOT issue a raw group signal against a pid that
+		// may since have been recycled — that is the whole hazard above.
+		return
 	}
+	killUpstreamGroup(proc)
+}
+
+// signalUpstreamProcess sends a graceful signal to an upstream subprocess and the tree
+// it spawned, so a wrapper's grandchild gets the same chance to shut down cleanly. It
+// takes killUpstreamProcess's leader-first ordering for the same reaped-pid reason.
+func signalUpstreamProcess(proc *os.Process, sig os.Signal) {
+	if proc == nil {
+		return
+	}
+	if err := proc.Signal(sig); err != nil {
+		return
+	}
+	signalUpstreamGroup(proc, sig)
 }
 
 // upstreamEnv returns the current process environment with every eunox-owned secret

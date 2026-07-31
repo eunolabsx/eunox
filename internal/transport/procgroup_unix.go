@@ -50,7 +50,12 @@ func setUpstreamProcessGroup(cmd *exec.Cmd) {
 // group leader, so no group with its pid exists and the call fails with ESRCH rather
 // than signalling the proxy's group.
 func signalUpstreamGroup(proc *os.Process, sig os.Signal) bool {
-	if proc == nil || proc.Pid <= 0 {
+	// Pid <= 1, not <= 0: POSIX defines kill(-1, sig) as "every process the caller may
+	// signal", NOT "the group led by pid 1". In a PID namespace where eunox spawns the
+	// first process the upstream can legitimately land on pid 1, and the ESRCH argument
+	// below does not cover -1 because -1 is not a group id at all — the call would
+	// succeed and broadcast SIGKILL across the container.
+	if proc == nil || proc.Pid <= 1 {
 		return false
 	}
 	sysSig, ok := sig.(syscall.Signal)

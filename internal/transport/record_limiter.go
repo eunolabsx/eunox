@@ -48,11 +48,13 @@ import (
 // and holds for every OTHER class by giving each its own instance; the pre-session classes
 // were the one place it did not hold internally.
 //
-// Per-category state is a fixed handful of counters — categories are code-supplied literals
-// at the call sites (origin, jwt, auth, control, loopback, body, content_type, saturation),
-// never caller-derived — so unlike per-source state it is not attacker-sized. The map is
-// capped anyway (maxRefusalCategories), so the bound is structural rather than a property
-// of today's call sites.
+// Per-category state is a fixed handful of counters — the categories are an ENUMERATED
+// set of typed constants (refusalCategory), not free strings — so unlike per-source
+// state it is not attacker-sized, and it cannot grow by accident. The same string is
+// also the record's structured condition_type field, which the threat model and
+// conformance doc describe as a closed enumeration; an untyped parameter let one typo
+// at a new refusal site both mint a private full-budget bucket and write a bogus value
+// into that field, with no compile error and nothing to catch it.
 //
 // The aggregate sustained ceiling rises to categories x preSessionDenyRatePerSec, a few
 // hundred records/second in the worst case. That is well inside what the drainer absorbs
@@ -68,73 +70,89 @@ import (
 const (
 	preSessionDenyRatePerSec = 20
 	preSessionDenyBurst      = 50
-	// maxRefusalCategories caps how many distinct category buckets are kept. Categories
-	// are compile-time literals, so this is not reached in practice; it is the structural
-	// guarantee that per-category state can never become attacker-sized if a category ever
-	// came to be derived from a request. Categories past the cap share one overflow bucket
-	// — still bounded, just back to the old pooled behavior for the excess.
-	maxRefusalCategories = 16
 )
+
+// refusalCategory names one pre-session refusal class. It is a distinct type, and the
+// constants below are its only values, because this string is used for two things at
+// once: it keys the rate-limit bucket AND it is written to the audit record's structured
+// condition_type field. The sibling `code` argument at every call site was already a
+// named constant; this is the other half of that pair.
+type refusalCategory string
+
+// The refusal categories. Every recordPreSessionDeny / recordSessionCapDeny call site
+// passes one of these.
+const (
+	catOrigin      refusalCategory = "origin"
+	catJWT         refusalCategory = "jwt"
+	catAuth        refusalCategory = "auth"
+	catControl     refusalCategory = "control"
+	catLoopback    refusalCategory = "loopback"
+	catBody        refusalCategory = "body"
+	catContentType refusalCategory = "content_type"
+	catSaturation  refusalCategory = "saturation"
+)
+
+// refusalCategories is the authoritative list the bucket table is built from. A constant
+// added above but omitted here would fall to the shared unknown bucket rather than
+// getting its own; TestRefusalCategories_AllHaveTheirOwnBucket pins that they match.
+var refusalCategories = []refusalCategory{
+	catOrigin, catJWT, catAuth, catControl, catLoopback, catBody, catContentType, catSaturation,
+}
 
 // newPreSessionDenyLimiter builds the per-category buckets over pre-session refusal records
 // (see the constants above for the rationale and the chosen rate).
 func newPreSessionDenyLimiter() *categoryRecordLimiter {
-	return &categoryRecordLimiter{
-		byCategory: make(map[string]*recordRateLimiter, maxRefusalCategories),
-		ratePerSec: preSessionDenyRatePerSec,
-		burst:      preSessionDenyBurst,
-		now:        time.Now,
+	c := &categoryRecordLimiter{
+		buckets: make(map[refusalCategory]*recordRateLimiter, len(refusalCategories)),
+		unknown: newRecordRateLimiter(preSessionDenyRatePerSec, preSessionDenyBurst),
 	}
+	for _, cat := range refusalCategories {
+		c.buckets[cat] = newRecordRateLimiter(preSessionDenyRatePerSec, preSessionDenyBurst)
+	}
+	return c
 }
 
 // categoryRecordLimiter holds one recordRateLimiter per refusal category, so a flood of
-// cheap refusals in one category cannot suppress the records of another. Buckets are
-// created on first use rather than from a hardcoded category list: a refusal path added
-// later inherits its own bucket by construction instead of silently sharing whichever list
-// nobody updated.
+// cheap refusals in one category cannot suppress the records of another.
+//
+// The table is built ONCE, at construction, from the enumerated category list — not
+// lazily on first use. That is what lets admit run without a lock of its own: the map is
+// read-only for the process lifetime, so a refusal takes exactly one mutex (its bucket's),
+// as it did before the split, rather than serializing every refusing goroutine on a second
+// proxy-global lock on the one path this file exists to keep cheap under attack. It also
+// removes the lazy path's ordering trap, where a bucket created before a test set the
+// clock silently kept the wall clock.
 type categoryRecordLimiter struct {
-	mu         sync.Mutex
-	byCategory map[string]*recordRateLimiter
-	// overflow serves every category past maxRefusalCategories, pooled.
-	overflow   *recordRateLimiter
-	ratePerSec float64
-	burst      float64
-	// now is the injectable clock, propagated to each bucket as it is created so a test
-	// setting it on the parent controls every category.
-	now func() time.Time
+	buckets map[refusalCategory]*recordRateLimiter
+	// unknown serves a category not in the table. Unreachable from the call sites (all
+	// pass constants) and bounded either way; it exists so an unregistered constant
+	// degrades to a shared bucket rather than to no bound at all.
+	unknown *recordRateLimiter
 }
 
 // admit reports whether a refusal record in category may be written now, and how many
 // records IN THAT CATEGORY were suppressed since the last admitted one.
-func (c *categoryRecordLimiter) admit(category string) (ok bool, suppressed uint64) {
+func (c *categoryRecordLimiter) admit(category refusalCategory) (ok bool, suppressed uint64) {
 	return c.bucket(category).admit()
 }
 
-// bucket returns category's token bucket, creating it on first use.
-func (c *categoryRecordLimiter) bucket(category string) *recordRateLimiter {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if b, exists := c.byCategory[category]; exists {
+// bucket returns category's token bucket. No lock: the table is immutable after
+// construction.
+func (c *categoryRecordLimiter) bucket(category refusalCategory) *recordRateLimiter {
+	if b, exists := c.buckets[category]; exists {
 		return b
 	}
-	if len(c.byCategory) >= maxRefusalCategories {
-		if c.overflow == nil {
-			c.overflow = c.newBucketLocked()
-		}
-		return c.overflow
-	}
-	b := c.newBucketLocked()
-	c.byCategory[category] = b
-	return b
+	return c.unknown
 }
 
-// newBucketLocked builds one bucket carrying the parent's clock. Caller holds c.mu.
-func (c *categoryRecordLimiter) newBucketLocked() *recordRateLimiter {
-	b := newRecordRateLimiter(c.ratePerSec, c.burst)
-	if c.now != nil {
-		b.now = c.now
+// setNow points every bucket at an injectable clock. Test-facing, and a method rather
+// than a settable field precisely because the buckets are separate token buckets: an
+// assignment to a parent field could only ever reach some of them.
+func (c *categoryRecordLimiter) setNow(now func() time.Time) {
+	for _, b := range c.buckets {
+		b.now = now
 	}
-	return b
+	c.unknown.now = now
 }
 
 // The details keys a rolled-up refusal record carries, and the scope values that qualify the
@@ -279,7 +297,7 @@ const (
 // bounded independently by the session cap. The attacker's cost scales with the record
 // rate, which is exactly the property the pre-session case lacks.
 //
-// Its rollup carries detailSuppressedRefusalScope too, but never suppressedScopeProxy: a
+// Its rollup carries detailSuppressedRefusalScope too, but never suppressedScopeProxyCategory: a
 // saturation record's count is exactly as narrow as the session_id beside it, the opposite
 // of the pre-session bucket's proxy-wide tally, and the constant it writes (see
 // recordResourceExhausted) says so.

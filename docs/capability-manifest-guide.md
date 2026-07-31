@@ -127,9 +127,16 @@ silently get a policy wider than written: a typo'd `notAfterr` left a
 `timeWindow` enforcing only its lower bound, and a typo'd `fieldss` left a
 `redactFields` directive with an empty path list — which attaches the redaction
 obligation (so the audit record reports a redaction applied) while masking
-nothing. Both now fail closed at decode. Field matching stays case-insensitive,
-exactly as `encoding/json` binds, so this rejects only keys the decoder would
-have ignored outright. Loading through `eunox` itself is unchanged: the
+nothing. Both now fail closed at decode.
+
+`Constraint` and `ArgumentSchema` take the same rule, for the same reason: they
+decoded leniently too, so `{"target": …, "principals": {…}}` — a misspelled
+`principal` — bound nothing, left `Principal` nil, and silently widened the
+constraint to **every** caller, while `{"type": "string", "maxLen": 8}` validated
+length not at all. The check recurses through nested `properties` / `items`, so a
+typo buried in a sub-schema is caught where it was written. Field matching stays
+case-insensitive, exactly as `encoding/json` binds, so this rejects only keys the
+decoder would have ignored outright. Loading through `eunox` itself is unchanged: the
 manifest loader's recursive unknown-key walk still runs first, so a typo is
 still reported with its path and a "did you mean" suggestion.
 
@@ -2165,7 +2172,7 @@ Findings are emitted as structured log lines to stderr:
 [eunox] WARN drift=fm2 resource="query_db" — manifest entry matches no live upstream tool (tool removed or renamed?)
 [eunox] WARN drift=fm3 resource="read_file" tool="read_file" argument="path" — pinned argument not in live inputSchema; the pin may not enforce if the upstream renamed it
 [eunox] WARN drift=fm4 serverVersion="1.4.*" actual="1.5.2" — server version does not satisfy manifest pin; server may have been updated
-[eunox] WARN drift=fm5 resource="read_file" tool="read_file" — description hash mismatch; tool description may have been modified (expected sha256:9f86d0…, got sha256:2c2640…)
+[eunox] ERROR drift=fm5 resource="read_file" tool="read_file" — description hash mismatch; tool description may have been modified (expected sha256:9f86d0…, got sha256:2c2640…)
 [eunox] WARN drift=fm6 resource="send_email" tool="send_email" argument="bcc" — live parameter is not declared by the closed argumentSchema (additionalProperties:false) — a new, unreviewed tool argument; review whether the argumentSchema still constrains this tool as intended
 [eunox] WARN drift=schema_absent resource="read_file" tool="read_file" argument="path" — tool published no inputSchema, so pinned arguments could not be verified this session (request-time enforcement is unaffected)
 [eunox] INFO drift=uncovered tool="summarize_text" — not covered by manifest; no allowlist entry matches it (denied in enforce mode)

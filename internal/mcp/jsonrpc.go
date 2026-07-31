@@ -678,7 +678,13 @@ func (mw *MsgWriter) Write(msg RPCMsg) error {
 			err = io.ErrShortWrite
 		}
 		if mw.deadliner != nil && errors.Is(err, os.ErrDeadlineExceeded) {
-			err = fmt.Errorf("%w: %d of %d bytes: %v", ErrUpstreamWriteTimeout, n, len(data), err)
+			// %w on the cause too, matching the desync arm below: %v would drop
+			// os.ErrDeadlineExceeded (and the net.Error the poller returns) out of the
+			// chain, so errors.Is/As for a deadline would go false on this value — and it
+			// is latched as poisonErr and returned verbatim from every later Write.
+			// upstreamErrInfo matches the sentinel first today, but its default arm has a
+			// net.Error timeout fallback this error must stay able to satisfy.
+			err = fmt.Errorf("%w: %d of %d bytes: %w", ErrUpstreamWriteTimeout, n, len(data), err)
 		} else {
 			err = fmt.Errorf("%w: %d of %d bytes: %w", ErrFrameDesync, n, len(data), err)
 		}

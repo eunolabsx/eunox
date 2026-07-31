@@ -5,7 +5,6 @@ package transport
 
 import (
 	"bytes"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -23,12 +22,12 @@ func TestPreSessionDenyLimiter_BoundsBurstAndCountsSuppressed(t *testing.T) {
 	base := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
 	now := base
 	l := newPreSessionDenyLimiter()
-	l.now = func() time.Time { return now }
+	l.setNow(func() time.Time { return now })
 
 	admitted := 0
 	const attempts = 5000
 	for i := 0; i < attempts; i++ {
-		if ok, _ := l.admit("auth"); ok {
+		if ok, _ := l.admit(catAuth); ok {
 			admitted++
 		}
 	}
@@ -39,7 +38,7 @@ func TestPreSessionDenyLimiter_BoundsBurstAndCountsSuppressed(t *testing.T) {
 	// The suppressed refusals are not lost: the next admitted record carries the count, so
 	// an operator sees both that the attack happened and its scale.
 	now = base.Add(time.Second)
-	ok, suppressed := l.admit("auth")
+	ok, suppressed := l.admit(catAuth)
 	if !ok {
 		t.Fatal("a refill second must admit again")
 	}
@@ -48,7 +47,7 @@ func TestPreSessionDenyLimiter_BoundsBurstAndCountsSuppressed(t *testing.T) {
 	}
 
 	// And the count resets, so the following record does not double-report.
-	if ok, s := l.admit("auth"); !ok || s != 0 {
+	if ok, s := l.admit(catAuth); !ok || s != 0 {
 		t.Fatalf("after reporting, the suppressed counter must reset; ok=%v suppressed=%d", ok, s)
 	}
 }
@@ -69,7 +68,7 @@ func TestRefusalRollup_NamesItsScopeOnARouteStampedRecord(t *testing.T) {
 	base := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
 	now := base
 	lim := newPreSessionDenyLimiter()
-	lim.now = func() time.Time { return now }
+	lim.setNow(func() time.Time { return now })
 	proxy := &HTTPProxy{sink: sink, preSessionDenies: lim}
 	other := &UpstreamRoute{
 		name: "internal",
@@ -152,18 +151,18 @@ func TestRefusalLimiter_OneCategoryFloodDoesNotEraseAnother(t *testing.T) {
 	sink, logPath := newTempAuditSink(t)
 	base := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
 	lim := newPreSessionDenyLimiter()
-	lim.now = func() time.Time { return base }
+	lim.setNow(func() time.Time { return base })
 	proxy := &HTTPProxy{sink: sink, preSessionDenies: lim}
 	req := httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody)
 
 	// Exhaust the origin budget many times over, with no clock movement.
 	for i := 0; i < 5000; i++ {
-		proxy.recordPreSessionDeny(req, "ORIGIN_REJECTED", "origin", nil)
+		proxy.recordPreSessionDeny(req, "ORIGIN_REJECTED", catOrigin, nil)
 	}
 	// The control-token attempts that follow must still be recorded in full.
 	const controlAttempts = 10
 	for i := 0; i < controlAttempts; i++ {
-		proxy.recordPreSessionDeny(req, codeControlAuthFailed, "control", nil)
+		proxy.recordPreSessionDeny(req, codeControlAuthFailed, catControl, nil)
 	}
 
 	_ = sink.Close()
@@ -189,21 +188,31 @@ func TestRefusalLimiter_OneCategoryFloodDoesNotEraseAnother(t *testing.T) {
 	}
 }
 
-// TestRefusalLimiter_CategoryBucketsAreCapped pins the structural bound. Categories are
-// compile-time literals today, so the cap is never reached; it is what guarantees the
-// per-category state cannot become attacker-sized if a category ever came to be derived
-// from a request.
-func TestRefusalLimiter_CategoryBucketsAreCapped(t *testing.T) {
+// TestRefusalCategories_AllHaveTheirOwnBucket pins the enumerated table against the
+// declared constants: a category constant added without being registered in
+// refusalCategories would silently share the unknown bucket with every other unregistered
+// one, quietly re-creating the cross-category suppression the split exists to remove.
+func TestRefusalCategories_AllHaveTheirOwnBucket(t *testing.T) {
 	t.Parallel()
 	lim := newPreSessionDenyLimiter()
-	for i := 0; i < maxRefusalCategories*4; i++ {
-		lim.admit(fmt.Sprintf("category-%d", i))
+	seen := map[*recordRateLimiter]refusalCategory{}
+	for _, cat := range refusalCategories {
+		b := lim.bucket(cat)
+		if b == lim.unknown {
+			t.Errorf("category %q fell through to the shared unknown bucket", cat)
+			continue
+		}
+		if other, dup := seen[b]; dup {
+			t.Errorf("categories %q and %q share a bucket", cat, other)
+		}
+		seen[b] = cat
 	}
-	lim.mu.Lock()
-	n := len(lim.byCategory)
-	lim.mu.Unlock()
-	if n > maxRefusalCategories {
-		t.Errorf("kept %d category buckets, want at most %d", n, maxRefusalCategories)
+	// Every constant declared in this package must be in the list the table is built
+	// from. Checked by value so a new constant that is never registered is caught.
+	for _, cat := range []refusalCategory{catOrigin, catJWT, catAuth, catControl, catLoopback, catBody, catContentType, catSaturation} {
+		if _, registered := lim.buckets[cat]; !registered {
+			t.Errorf("category constant %q is not in refusalCategories", cat)
+		}
 	}
 }
 
@@ -214,15 +223,15 @@ func TestPreSessionDenyLimiter_RefillIsRateBounded(t *testing.T) {
 	base := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
 	now := base
 	l := newPreSessionDenyLimiter()
-	l.now = func() time.Time { return now }
+	l.setNow(func() time.Time { return now })
 
 	// Drain the burst.
 	for i := 0; i < preSessionDenyBurst; i++ {
-		if ok, _ := l.admit("auth"); !ok {
+		if ok, _ := l.admit(catAuth); !ok {
 			t.Fatalf("burst token %d should have been admitted", i)
 		}
 	}
-	if ok, _ := l.admit("auth"); ok {
+	if ok, _ := l.admit(catAuth); ok {
 		t.Fatal("the bucket must be empty after the burst is drained")
 	}
 
@@ -230,7 +239,7 @@ func TestPreSessionDenyLimiter_RefillIsRateBounded(t *testing.T) {
 	now = base.Add(time.Second)
 	admitted := 0
 	for i := 0; i < preSessionDenyRatePerSec*10; i++ {
-		if ok, _ := l.admit("auth"); ok {
+		if ok, _ := l.admit(catAuth); ok {
 			admitted++
 		}
 	}
@@ -246,12 +255,12 @@ func TestPreSessionDenyLimiter_BackwardsClockDoesNotGrantTokens(t *testing.T) {
 	base := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
 	now := base
 	l := newPreSessionDenyLimiter()
-	l.now = func() time.Time { return now }
+	l.setNow(func() time.Time { return now })
 	for i := 0; i < preSessionDenyBurst; i++ {
-		l.admit("auth")
+		l.admit(catAuth)
 	}
 	now = base.Add(-time.Hour)
-	if ok, _ := l.admit("auth"); ok {
+	if ok, _ := l.admit(catAuth); ok {
 		t.Fatal("a backwards clock step must not refill the bucket")
 	}
 }
