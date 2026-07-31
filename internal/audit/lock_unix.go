@@ -9,10 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"syscall"
-
-	"github.com/eunolabs/eunox/internal/config"
 )
 
 // acquireAuditLock takes a non-blocking exclusive flock on a sidecar lock file tied
@@ -35,17 +32,17 @@ import (
 // directory it CREATES, so an audit path pointed at a pre-existing group- or
 // world-writable location carries no mode guarantee, and that is precisely where a
 // symlink planted by another uid is reachable.
+//
+// Scope, so the claim is not read as wider than it is: this covers the lock PATH's final
+// component. It does not make the lock inode-identified -- two spellings of one log (a
+// hardlink, or two paths resolving to the same file) still derive two different lock
+// paths, and neither excludes the other. That is a pre-existing property of deriving the
+// lock name textually from the log path, not something the guard claims to fix.
 func acquireAuditLock(logPath string) (*os.File, error) {
-	lockPath := filepath.Join(filepath.Dir(logPath), "."+filepath.Base(logPath)+".lock")
-	// The shared guard is called directly rather than through refuseNonRegular so the
-	// operator-facing error names the LOCK file, not the audit log path; the two are on
-	// the same rule and must stay that way.
-	if err := config.RefuseNonRegularPath(lockPath, "audit lock file"); err != nil {
-		return nil, err
-	}
-	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR|config.OpenNoFollow, 0o600) //nolint:gosec // G304: derived from the user-configured audit log path
+	lockPath := auditLockPath(logPath)
+	lf, err := openAuditLockFile(lockPath)
 	if err != nil {
-		return nil, fmt.Errorf("opening audit lock file %q: %w", lockPath, err)
+		return nil, err
 	}
 	if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		_ = lf.Close()

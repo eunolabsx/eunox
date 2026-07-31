@@ -457,13 +457,74 @@ func TestRefreshPublishedSessionKillTTL_WarnsOncePerDistinctPrior(t *testing.T) 
 	r.refreshPublishedSessionKillTTL(ctx)
 	require.Equal(t, 2, h.countMatching(disagreementMsg), "a changed prior value must warn again")
 
-	// Once the disagreement resolves (this proxy's own value is what it reads back), the
-	// dedupe resets so a recurrence is reported rather than suppressed forever.
-	r.refreshPublishedSessionKillTTL(ctx)
-	require.Equal(t, 2, h.countMatching(disagreementMsg), "agreement must not warn")
-	require.NoError(t, client.Set(ctx, redisSessionTTLKey, "48h0m0s", 0).Err())
-	r.refreshPublishedSessionKillTTL(ctx)
-	require.Equal(t, 3, h.countMatching(disagreementMsg), "a disagreement that returns must warn again")
+	// Alternating between agreement and the SAME disagreement must stay quiet. Two proxies
+	// ticking at different rates make the faster one read its own value on some ticks and
+	// the other's on the rest; re-arming the dedupe on agreement would print the warning on
+	// roughly every other tick forever, which is the outcome the dedupe exists to prevent.
+	for i := 0; i < 4; i++ {
+		r.refreshPublishedSessionKillTTL(ctx) // reads back its own value: agreement
+		require.NoError(t, client.Set(ctx, redisSessionTTLKey, "12h0m0s", 0).Err())
+		r.refreshPublishedSessionKillTTL(ctx) // reads the same prior value again
+	}
+	require.Equal(t, 2, h.countMatching(disagreementMsg),
+		"alternating agreement and the same disagreement must not re-arm the warning")
+}
+
+// TestPublishSessionKillTTL_PermanentValueNeverExpires: the freshness bound exists to stop
+// a stale value SHORTENING a revocation. A published "never expires" cannot shorten
+// anything, and letting it lapse is the fail-open the whole mechanism exists to prevent —
+// the CLI would fall back to its 30-day default on a deployment configured for permanent
+// revocations, so the kill lifts a month later.
+func TestPublishSessionKillTTL_PermanentValueNeverExpires(t *testing.T) {
+	t.Parallel()
+	// WithSessionKillTTLEffective(0) is "never expires" in effective form.
+	r, mr, client := newTTLTestRedis(t, WithSessionKillTTLEffective(0), WithReconcileInterval(30*time.Second))
+	ctx := context.Background()
+
+	_, _, err := r.PublishSessionKillTTL(ctx)
+	require.NoError(t, err)
+	require.Equal(t, sessionKillTTLNever, mustRawTTLValue(t, mr))
+	require.Zero(t, mr.TTL(redisSessionTTLKey), "a permanent lifetime must be published with no key expiry")
+
+	// It is still readable long after a finite value would have lapsed, so the CLI adopts
+	// the permanent lifetime instead of silently falling back to its own default.
+	mr.FastForward(100 * 24 * time.Hour)
+	got, ok, err := ReadPublishedSessionKillTTL(ctx, client)
+	require.NoError(t, err)
+	require.True(t, ok, "a permanent published value must not lapse")
+	require.Zero(t, got, "and must still read back as 'never expires'")
+
+	// A finite lifetime is the contrasting case: it does carry an expiry.
+	finite, mrF, _ := newTTLTestRedis(t, WithSessionKillTTL(time.Hour), WithReconcileInterval(30*time.Second))
+	_, _, err = finite.PublishSessionKillTTL(ctx)
+	require.NoError(t, err)
+	require.NotZero(t, mrF.TTL(redisSessionTTLKey), "a finite lifetime must carry the freshness bound")
+}
+
+// TestSessionTTLKeyExpiry_OverflowFallsBack: an absurd reconcile interval must not make
+// the multiply wrap negative. go-redis treats a negative expiration as "no expiry at all",
+// so the SET would succeed with a PERSISTENT key — silently the exact opposite of the
+// freshness guarantee, and invisible from outside.
+func TestSessionTTLKeyExpiry_OverflowFallsBack(t *testing.T) {
+	t.Parallel()
+	r := NewRedis(nil, WithReconcileInterval(1000000*time.Hour))
+	got := r.sessionTTLKeyExpiry()
+	require.Positive(t, got, "an overflowing interval must not yield a negative expiry")
+	require.Equal(t, sessionTTLKeyExpiryFactor*defaultReconcileInterval, got)
+
+	// And the published key really does get an expiry in that configuration.
+	pub, mr, _ := newTTLTestRedis(t, WithSessionKillTTL(time.Hour), WithReconcileInterval(1000000*time.Hour))
+	_, _, err := pub.PublishSessionKillTTL(context.Background())
+	require.NoError(t, err)
+	require.NotZero(t, mr.TTL(redisSessionTTLKey), "an overflowing interval must still publish a bounded key")
+}
+
+// mustRawTTLValue reads the published key's raw wire value.
+func mustRawTTLValue(t *testing.T, mr *miniredis.Miniredis) string {
+	t.Helper()
+	v, err := mr.Get(redisSessionTTLKey)
+	require.NoError(t, err)
+	return v
 }
 
 // TestRefreshPublishedSessionKillTTL_TwoInstancesEachReport: the case a startup-only

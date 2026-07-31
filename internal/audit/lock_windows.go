@@ -9,11 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"golang.org/x/sys/windows"
-
-	"github.com/eunolabs/eunox/internal/config"
 )
 
 // acquireAuditLock takes a non-blocking exclusive lock on a sidecar lock file tied
@@ -34,15 +31,10 @@ import (
 // deliberately symmetric with the unix variant so the platform difference reads as
 // intended rather than as one file having been missed.
 func acquireAuditLock(logPath string) (*os.File, error) {
-	lockPath := filepath.Join(filepath.Dir(logPath), "."+filepath.Base(logPath)+".lock")
-	// Called directly rather than through refuseNonRegular so the operator-facing error
-	// names the LOCK file, not the audit log path; the two are on the same rule.
-	if err := config.RefuseNonRegularPath(lockPath, "audit lock file"); err != nil {
-		return nil, err
-	}
-	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR|config.OpenNoFollow, 0o600) //nolint:gosec // G304: derived from the user-configured audit log path
+	lockPath := auditLockPath(logPath)
+	lf, err := openAuditLockFile(lockPath)
 	if err != nil {
-		return nil, fmt.Errorf("opening audit lock file %q: %w", lockPath, err)
+		return nil, err
 	}
 	// Lock a single byte; the range is arbitrary as long as every writer agrees.
 	if err := windows.LockFileEx(

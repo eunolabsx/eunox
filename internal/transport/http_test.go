@@ -5020,6 +5020,80 @@ func TestServe_AfterListenExpiryClosesListener(t *testing.T) {
 	}
 }
 
+// TestServe_AfterListenStalledHookIsAbandoned is the property the bound exists for, and
+// the one a deadline-only implementation does NOT have: a hook that blocks past its
+// budget must not hold the accept loop for as long as it blocks. Go cannot interrupt a
+// blocked syscall, so the hook has to be abandoned rather than merely told to stop —
+// otherwise the socket keeps completing handshakes nothing answers for the full stall.
+func TestServe_AfterListenStalledHookIsAbandoned(t *testing.T) {
+	t.Parallel()
+	port := freeTCPPort(t)
+	// Stands in for a stalled fsync: a syscall no context can interrupt. It outlives the
+	// budget by a wide margin, so a synchronous implementation would hold Serve for the
+	// whole sleep.
+	const stall = 2 * time.Second
+	released := make(chan struct{})
+	proxy := NewHTTPProxyGateway(HTTPGatewayOptions{
+		Routes: map[string]*UpstreamRoute{},
+		Bind:   "127.0.0.1",
+		Port:   port,
+		AfterListen: func(context.Context) error {
+			defer close(released)
+			time.Sleep(stall)
+			return nil
+		},
+	})
+	// A budget far shorter than the stall, so expiry is what ends the wait. Set on the
+	// proxy before Serve, so nothing shared between parallel tests is mutated.
+	proxy.afterListenBudget = 100 * time.Millisecond
+
+	start := time.Now()
+	err := proxy.Serve(t.Context())
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("a hook that never completes within its budget must fail Serve")
+	}
+	if elapsed >= stall {
+		t.Errorf("Serve waited %v for a stalled hook: the hook was not abandoned, so the bound does not bound anything", elapsed)
+	}
+	if !strings.Contains(err.Error(), "did not complete within") {
+		t.Errorf("error should name the expired budget, got %v", err)
+	}
+	// And the listener is gone, so a racing client is refused rather than left hanging.
+	if conn, derr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 2*time.Second); derr == nil {
+		_ = conn.Close()
+		t.Error("listener still accepting after the hook was abandoned")
+	}
+	<-released // let the abandoned goroutine finish before the test exits
+}
+
+// TestServe_AfterListenShutdownDuringStartupIsClean pins that a shutdown signal arriving
+// in the post-bind window is a shutdown, not a startup failure. Serve's ctx is what the
+// signal handler cancels and the hook's budget inherits it, so without the distinction an
+// operator stopping the proxy during startup would get a fatal error and a non-zero exit
+// — enough to make a restart-on-failure supervisor loop during a rollout.
+func TestServe_AfterListenShutdownDuringStartupIsClean(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+	proxy := NewHTTPProxyGateway(HTTPGatewayOptions{
+		Routes: map[string]*UpstreamRoute{},
+		Bind:   "127.0.0.1",
+		Port:   freeTCPPort(t),
+		AfterListen: func(hookCtx context.Context) error {
+			// Shutdown lands mid-hook; the hook observes it and reports it, exactly as
+			// WriteControlTokenFile does at its pre-rename check.
+			cancel()
+			<-hookCtx.Done()
+			return hookCtx.Err()
+		},
+	})
+	defer cancel()
+	if err := proxy.Serve(ctx); err != nil {
+		t.Errorf("a hook cut short by shutdown must not fail Serve, got %v", err)
+	}
+}
+
 // ── sourceIP ──────────────────────────────────────────────────────────────
 
 // trustedProxyNetsForTest compiles CIDRs into the []*net.IPNet shape sourceIP

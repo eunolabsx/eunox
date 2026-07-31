@@ -152,14 +152,13 @@ type Redis struct {
 	// operator log breadcrumb.
 	reconcileErrLogged bool
 
-	// sessionTTLWarnedPrior / sessionTTLWarnedSet dedupe the periodic session-kill-TTL
-	// disagreement warning on the PRIOR VALUE rather than on a bare "already warned"
-	// flag, so a persistent disagreement warns once while a changed one warns again.
+	// sessionTTLWarnedPrior dedupes the periodic session-kill-TTL disagreement warning on
+	// the PRIOR VALUE rather than on a bare "already warned" flag, so a persistent
+	// disagreement warns once while a changed one warns again.
 	// Without the dedupe this line prints every reconcile interval for the life of the
 	// process, which is how a real diagnostic gets tuned out. See
 	// refreshPublishedSessionKillTTL.
 	sessionTTLWarnedPrior string
-	sessionTTLWarnedSet   bool
 	// sessionTTLPublishErrLogged edge-triggers the re-publish failure warning, exactly
 	// as reconcileErrLogged does for the cache refresh on the same loop.
 	sessionTTLPublishErrLogged bool
@@ -470,7 +469,15 @@ func (r *Redis) reconcileLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			r.reconcileRefresh(ctx)
-			r.refreshPublishedSessionKillTTL(ctx)
+			// Skip the advisory re-publish when the refresh that just ran could not reach
+			// Redis: two more round trips are guaranteed to fail the same way, and each
+			// burns its own timeout on the goroutine that has to converge kill state the
+			// moment Redis returns. The key's expiry tolerates the missed ticks; if the
+			// outage outlasts it, the CLI's absent-value fallback is the documented and
+			// loud behaviour.
+			if !r.lastRefreshFailed() {
+				r.refreshPublishedSessionKillTTL(ctx)
+			}
 		}
 	}
 }
@@ -521,6 +528,15 @@ func (r *Redis) reconcileRefresh(ctx context.Context) {
 	case lastErr == nil && wasLogged:
 		r.logger.Info("kill switch: background state refresh from Redis recovered; local cache reconciled")
 	}
+}
+
+// lastRefreshFailed reports whether the most recent background refresh could not confirm
+// state against Redis. Read under the same lock that commits it, so the reconcile loop
+// sees the outcome of the refresh it just ran rather than a torn value.
+func (r *Redis) lastRefreshFailed() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.lastRefreshErr != nil
 }
 
 // Stop cancels the pub/sub subscription and blocks until all background goroutines

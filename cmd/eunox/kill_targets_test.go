@@ -31,30 +31,55 @@ func TestResolveKillTarget(t *testing.T) {
 		name        string
 		pos         []string
 		session     string
+		sessionSet  bool
 		agent       string
+		agentSet    bool
 		want        killTarget
 		wantErrPart string
 	}{
 		{name: "positional session", pos: []string{"sess-1"}, want: killTarget{kind: killTargetSession, id: "sess-1"}},
 		{name: "positional all is the global switch", pos: []string{"all"}, want: killTarget{kind: killTargetGlobal}},
-		{name: "session flag", session: "sess-2", want: killTarget{kind: killTargetSession, id: "sess-2"}},
+		{name: "session flag", session: "sess-2", sessionSet: true, want: killTarget{kind: killTargetSession, id: "sess-2"}},
 		{
-			name:    "session flag addresses a session named all",
-			session: "all",
-			want:    killTarget{kind: killTargetSession, id: "all"},
+			name:       "session flag addresses a session named all",
+			session:    "all",
+			sessionSet: true,
+			want:       killTarget{kind: killTargetSession, id: "all"},
 		},
-		{name: "agent flag", agent: "agent-7", want: killTarget{kind: killTargetAgent, id: "agent-7"}},
+		{name: "agent flag", agent: "agent-7", agentSet: true, want: killTarget{kind: killTargetAgent, id: "agent-7"}},
 		{name: "no target", wantErrPart: "no target given"},
-		{name: "positional and session", pos: []string{"sess-1"}, session: "sess-2", wantErrPart: "more than one target"},
-		{name: "positional and agent", pos: []string{"sess-1"}, agent: "agent-7", wantErrPart: "more than one target"},
-		{name: "session and agent", session: "sess-2", agent: "agent-7", wantErrPart: "more than one target"},
-		{name: "all three", pos: []string{"x"}, session: "y", agent: "z", wantErrPart: "more than one target"},
+		{name: "positional and session", pos: []string{"sess-1"}, session: "sess-2", sessionSet: true, wantErrPart: "more than one target"},
+		{name: "positional and agent", pos: []string{"sess-1"}, agent: "agent-7", agentSet: true, wantErrPart: "more than one target"},
+		{name: "session and agent", session: "sess-2", sessionSet: true, agent: "agent-7", agentSet: true, wantErrPart: "more than one target"},
+		{name: "all three", pos: []string{"x"}, session: "y", sessionSet: true, agent: "z", agentSet: true, wantErrPart: "more than one target"},
 		{name: "two positionals", pos: []string{"a", "b"}, wantErrPart: "exactly one argument"},
+		// An explicitly-passed but empty flag is a SUPPLIED target, not an absent one:
+		// counting it as absent would silently drop a target the operator typed.
+		{
+			name:       "explicitly empty session flag still counts as a target",
+			session:    "",
+			sessionSet: true,
+			want:       killTarget{kind: killTargetSession},
+		},
+		{
+			name:        "explicitly empty session flag conflicts with a positional",
+			pos:         []string{"sess-1"},
+			session:     "",
+			sessionSet:  true,
+			wantErrPart: "more than one target",
+		},
+		{
+			name:        "explicitly empty agent flag conflicts with a positional",
+			pos:         []string{"sess-1"},
+			agent:       "",
+			agentSet:    true,
+			wantErrPart: "more than one target",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := resolveKillTarget(tc.pos, tc.session, tc.agent)
+			got, err := resolveKillTarget(tc.pos, tc.session, tc.sessionSet, tc.agent, tc.agentSet)
 			if tc.wantErrPart != "" {
 				require.Error(t, err)
 				require.Contains(t, err.Error(), tc.wantErrPart)
@@ -218,4 +243,74 @@ func TestKillUsage_DocumentsTargetingFlags(t *testing.T) {
 	require.Contains(t, out, "-agent")
 	require.Contains(t, out, "-session")
 	require.Contains(t, out, "Agent kills never expire")
+}
+
+// TestKillTargetZeroValueIsUnset pins that the most destructive dimension is not what a
+// caller gets by writing nothing. resolveKillTarget returns a zero killTarget alongside
+// every error, and a redisKillRequest literal can omit the field, so a zero value meaning
+// "halt the entire deployment" would turn any dropped error or missed field into a
+// deployment-wide stop.
+func TestKillTargetZeroValueIsUnset(t *testing.T) {
+	t.Parallel()
+	var zero killTarget
+	if zero.kind != killTargetUnset {
+		t.Fatalf("the zero killTarget must be killTargetUnset, got kind %d (%s)", zero.kind, zero.dimension())
+	}
+	if zero.kind == killTargetGlobal {
+		t.Error("the zero value must never be the deployment-wide switch")
+	}
+	// Every error path hands back the zero value; none of them may be actionable.
+	if got, err := resolveKillTarget(nil, "", false, "", false); err == nil || got.kind != killTargetUnset {
+		t.Errorf("no-target error must return an unset target, got kind %d err %v", got.kind, err)
+	}
+}
+
+// TestRunRedisKill_UnhandledKindFailsClosed pins the fail-closed default: a kind no arm
+// handles must be refused, not quietly routed to the session store while the result line
+// reports some other dimension.
+func TestRunRedisKill_UnhandledKindFailsClosed(t *testing.T) {
+	mr := miniredis.RunT(t)
+	err := runRedisKill(redisKillRequest{addr: mr.Addr(), target: killTarget{kind: killTargetUnset, id: "x"}})
+	if err == nil {
+		t.Fatal("an unhandled kill target kind must be refused")
+	}
+	if !strings.Contains(err.Error(), "unhandled kill target kind") {
+		t.Errorf("error should name the unhandled kind, got %v", err)
+	}
+	if mr.Exists(sessionKey("x")) {
+		t.Error("an unhandled kind must not fall through to a session write")
+	}
+	if mr.Exists("killswitch:global") {
+		t.Error("an unhandled kind must not fall through to a global activation")
+	}
+}
+
+// TestCmdKill_AgentWarnsItIsInertWithoutJWT: the agent kill lands in Redis whatever the
+// proxy is running, but it is only CONSULTED where the proxy has a JWT identity to match
+// it against — and a stdio proxy cannot take --jwks-uri at all. Reporting a clean success
+// while the revocation is inert is the failure this warning exists to prevent, since this
+// command cannot see how the proxy was started.
+func TestCmdKill_AgentWarnsItIsInertWithoutJWT(t *testing.T) {
+	mr := miniredis.RunT(t)
+
+	var out string
+	stderr := captureStderr(t, func() {
+		out = captureStdout(t, func() {
+			require.Zero(t, cmdKill([]string{"--redis-addr", mr.Addr(), "--agent", "agent-7"}))
+		})
+	})
+	require.Contains(t, stderr, "--jwks-uri", "the warning must name what makes an agent kill effective")
+	require.Contains(t, stderr, "stdio")
+	// The machine-readable success line stays on stdout, unpolluted: a script parsing it
+	// must not have to strip an advisory.
+	require.Contains(t, out, `"killed":"agent-7"`)
+	require.NotContains(t, out, "jwks")
+
+	// A session kill carries no such caveat — it is enforced on every transport.
+	stderr = captureStderr(t, func() {
+		_ = captureStdout(t, func() {
+			require.Zero(t, cmdKill([]string{"--redis-addr", mr.Addr(), "--session", "sess-1"}))
+		})
+	})
+	require.NotContains(t, stderr, "--jwks-uri", "a session kill needs no JWT caveat")
 }

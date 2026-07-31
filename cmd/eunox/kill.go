@@ -55,7 +55,8 @@ There are three kill dimensions, and exactly one target must be given:
                      literally "all" (the positional "all" means the whole
                      deployment).
   all                Activate the deployment-wide kill switch. With --revive,
-                     deactivate it; per-session tombstones are left in place.
+                     deactivate it; per-session and per-agent kills are left
+                     in place -- revive those by id.
   --agent <agent-id> Revoke a JWT agent identity across every session it holds.
                      Agent kills never expire, so --revive --agent is how one
                      is lifted. Requires --redis-addr.
@@ -85,7 +86,7 @@ Flags:
 	redisPassword := fs.String("redis-password", "", "Password for the Redis server (used with --redis-addr). Prefer the\nEUNOX_REDIS_PASSWORD env var; a non-empty flag value takes precedence over\nit, but leaving the flag empty does NOT override a set env var.")
 	redisTLS := fs.Bool("redis-tls", false, "Use TLS for the Redis connection (used with --redis-addr).")
 	sessionKillTTL := fs.Duration("killswitch-session-ttl", 0, "How long this SESSION kill survives in Redis before it is garbage collected.\nRarely needed: the proxy publishes its own value to Redis at startup and this\ncommand adopts it, so the two cannot silently disagree. Pass this only to\noverride that, or when no proxy has published one yet (default 720h / 30 days).\nWhen the tombstone expires the kill is LIFTED. Negative disables expiry. If it\ndisagrees with the published value, the longer-lived of the two is used and the\nmismatch is reported. Rejected together with the 'all' target, --agent,\n--revive, or without --redis-addr: none of those writes a session tombstone\n(an agent kill never expires at all), so the flag would have no effect.")
-	revive := fs.Bool("revive", false, "Lift a revocation instead of issuing one: <session-id> removes that session's\nkill tombstone, so a new connection reusing that id is no longer blocked. The\nprimary case is a stdio proxy pinning one long-lived --session-id; for an HTTP\nproxy/gateway, a session killed via the loopback endpoint was already torn\ndown locally, and reviving its tombstone here does not restore that\nconnection. With --agent it removes an agent kill, which is the only way to\nlift one since agent kills never expire. 'all' deactivates the global kill\nswitch (per-session and per-agent kills are left in place — revive those by\nid). Requires --redis-addr: the HTTP\ncontrol endpoint is an emergency stop with no undo, and an in-memory kill\nswitch is cleared by restarting the proxy.")
+	revive := fs.Bool("revive", false, "Lift a revocation instead of issuing one: <session-id> removes that session's\nkill tombstone, so a new connection reusing that id is no longer blocked. The\nprimary case is a stdio proxy pinning one long-lived --session-id; for an HTTP\nproxy/gateway, a session killed via the loopback endpoint was already torn\ndown locally, and reviving its tombstone here does not restore that\nconnection. With --agent it removes an agent kill, which is the only way to\nlift one since agent kills never expire. 'all' deactivates the global kill\nswitch (per-session and per-agent kills are left in place — revive those by\nid). Requires --redis-addr: the HTTP control endpoint is an emergency stop\nwith no undo, and an in-memory kill switch is cleared by restarting the proxy.")
 	sessionTarget := fs.String("session", "", "Target this SESSION id, instead of passing it as the positional argument.\nEquivalent in every way except one: the positional 'all' means the whole\ndeployment, so --session all is the only way to address a session whose id is\nliterally \"all\" (possible, since --session-id is operator-settable on a stdio\nproxy). Cannot be combined with the positional or --agent.")
 	agentTarget := fs.String("agent", "", "Target this AGENT id (the JWT agent_id) instead of a session: revokes every\nsession that identity holds, and with --revive lifts that revocation. Agent\nkills never expire, so --revive is the only way to lift one. Requires\n--redis-addr — there is no agent dimension on the HTTP control endpoint, and\nadding one would widen what a same-host caller holding the control token can\nreach. Cannot be combined with the positional or --session.")
 	controlToken := fs.String("control-token", "", "Control token for the HTTP /control/kill endpoint. If empty, read from\nEUNOX_CONTROL_TOKEN or --control-token-path (default ~/.eunox/control.token),\nwhere the running proxy wrote it.")
@@ -103,7 +104,7 @@ Flags:
 		}
 		return 1
 	}
-	target, err := resolveKillTarget(pos, *sessionTarget, *agentTarget)
+	target, err := resolveKillTarget(pos, *sessionTarget, flagWasSet(fs, "session"), *agentTarget, flagWasSet(fs, "agent"))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "eunox kill: %v\n", err)
 		return 1
@@ -256,8 +257,16 @@ const killTargetAll = "all"
 type killTargetKind int
 
 const (
+	// killTargetUnset is the ZERO value, and is never a valid target. It is first on
+	// purpose: with the global switch in this slot, a killTarget nobody filled in — the
+	// value returned alongside every resolveKillTarget error, or a redisKillRequest
+	// literal that omits the field — would mean "halt the entire deployment". The most
+	// destructive dimension must not be what you get by writing nothing, least of all on
+	// the emergency-stop path. Every consumer rejects this kind explicitly rather than
+	// letting it fall through a default arm.
+	killTargetUnset killTargetKind = iota
 	// killTargetGlobal is the deployment-wide switch. It carries no id.
-	killTargetGlobal killTargetKind = iota
+	killTargetGlobal
 	killTargetSession
 	killTargetAgent
 )
@@ -273,23 +282,23 @@ type killTarget struct {
 // dimension renders the target's kind for the machine-readable result line. Once two id
 // dimensions exist, {"ok":true,"killed":"x"} alone is ambiguous — an operator (or a
 // script) cannot tell which store moved.
+// Every arm is explicit and the default fails loudly rather than inventing a plausible
+// value: an unmapped kind that rendered as "global" while the switches below performed a
+// session write would put a wrong dimension on the one line an operator reads to confirm
+// what an emergency stop actually did.
 func (t killTarget) dimension() string {
 	switch t.kind {
 	case killTargetAgent:
 		return "agent"
 	case killTargetSession:
 		return "session"
-	default:
+	case killTargetGlobal:
 		return "global"
+	case killTargetUnset:
+		return "unset"
+	default:
+		return "unknown"
 	}
-}
-
-// describe renders the target for an error message.
-func (t killTarget) describe() string {
-	if t.kind == killTargetGlobal {
-		return "the global kill switch"
-	}
-	return fmt.Sprintf("%s %q", t.dimension(), t.id)
 }
 
 // resolveKillTarget turns the positional argument and the two targeting flags into
@@ -299,35 +308,42 @@ func (t killTarget) describe() string {
 // precedence would mean an operator on the emergency-stop path can type two targets and
 // have one silently ignored — the same fail-loud posture the transport-flag checks in
 // cmdKill already take.
-func resolveKillTarget(pos []string, sessionFlag, agentFlag string) (killTarget, error) {
-	supplied := 0
-	if len(pos) > 0 {
-		supplied++
-	}
-	if sessionFlag != "" {
-		supplied++
-	}
-	if agentFlag != "" {
-		supplied++
-	}
+// sessionSet/agentSet report whether the operator actually PASSED each flag, rather than
+// whether its value is non-empty. `--session "$SID"` with SID unset is a supplied target
+// whose id happens to be empty, not an absent one: counting it as absent would silently
+// drop a target the operator typed (and, with a positional also present, resolve to the
+// other one) — the very outcome the exactly-one rule exists to prevent. An explicitly
+// empty id instead reaches the store's own empty-id guard and fails with a precise error.
+func resolveKillTarget(pos []string, sessionFlag string, sessionSet bool, agentFlag string, agentSet bool) (killTarget, error) {
 	if len(pos) > 1 {
 		return killTarget{}, fmt.Errorf("expected exactly one argument: <session-id|all>")
 	}
-	switch {
-	case supplied == 0:
-		return killTarget{}, fmt.Errorf("no target given: pass <session-id|all>, --session <session-id>, or --agent <agent-id>")
-	case supplied > 1:
-		return killTarget{}, fmt.Errorf("more than one target given: pass exactly one of <session-id|all>, --session, or --agent, and drop the others")
-	case agentFlag != "":
-		return killTarget{kind: killTargetAgent, id: agentFlag}, nil
-	case sessionFlag != "":
+	// Build the candidate list once, so the count and the selection cannot disagree: a
+	// fourth dimension added later is one append plus one arm, not a counter that can
+	// drift from the arms it guards.
+	var found []killTarget
+	if len(pos) == 1 {
+		if pos[0] == killTargetAll {
+			found = append(found, killTarget{kind: killTargetGlobal})
+		} else {
+			found = append(found, killTarget{kind: killTargetSession, id: pos[0]})
+		}
+	}
+	if sessionSet {
 		// No killTargetAll special case on purpose: --session addresses a session id
 		// verbatim, which is what makes it the escape hatch for one named "all".
-		return killTarget{kind: killTargetSession, id: sessionFlag}, nil
-	case pos[0] == killTargetAll:
-		return killTarget{kind: killTargetGlobal}, nil
+		found = append(found, killTarget{kind: killTargetSession, id: sessionFlag})
+	}
+	if agentSet {
+		found = append(found, killTarget{kind: killTargetAgent, id: agentFlag})
+	}
+	switch len(found) {
+	case 0:
+		return killTarget{}, fmt.Errorf("no target given: pass <session-id|all>, --session <session-id>, or --agent <agent-id>")
+	case 1:
+		return found[0], nil
 	default:
-		return killTarget{kind: killTargetSession, id: pos[0]}, nil
+		return killTarget{}, fmt.Errorf("more than one target given: pass exactly one of <session-id|all>, --session, or --agent, and drop the others")
 	}
 }
 
@@ -401,7 +417,12 @@ func runRedisKill(req redisKillRequest) error {
 		if err := ks.ActivateGlobal(ctx); err != nil {
 			return fmt.Errorf("activate global kill switch: %w", err)
 		}
-		printRedisResult("killed", killTarget{kind: killTargetGlobal, id: killTargetAll})
+		printRedisResult("killed", req.target)
+	case killTargetSession:
+		if err := ks.KillSession(ctx, req.target.id); err != nil {
+			return fmt.Errorf("kill session %q: %w", req.target.id, err)
+		}
+		printRedisResult("killed", req.target)
 	case killTargetAgent:
 		// Agent kills never expire. That is deliberate — an identity revoked for cause
 		// should not be re-admitted by a clock — and it is why --revive --agent ships in
@@ -411,11 +432,19 @@ func runRedisKill(req redisKillRequest) error {
 			return fmt.Errorf("kill agent %q: %w", req.target.id, err)
 		}
 		printRedisResult("killed", req.target)
+		// An agent kill lands in Redis whatever the proxy is running, but it is only
+		// CONSULTED where the proxy has a JWT identity to match it against: a stdio proxy
+		// has no HTTP listener and so cannot take --jwks-uri at all, and an HTTP proxy
+		// without it never populates an agent id either. Reporting a clean success while
+		// the revocation is inert is the failure this warning exists to prevent -- the
+		// operator has to know to check, since this command cannot see how the proxy was
+		// started.
+		fmt.Fprintf(os.Stderr, "eunox kill: the agent kill is written, but a proxy only consults agent identity when it validates JWTs (--jwks-uri, HTTP transport). A stdio proxy, or an HTTP proxy without --jwks-uri, will not match it -- kill the session ids instead there.\n")
 	default:
-		if err := ks.KillSession(ctx, req.target.id); err != nil {
-			return fmt.Errorf("kill session %q: %w", req.target.id, err)
-		}
-		printRedisResult("killed", req.target)
+		// Fail closed on a kind no arm handles rather than defaulting to a session write:
+		// a dimension added to the enum without updating this switch would otherwise
+		// revoke the wrong store while reporting success.
+		return fmt.Errorf("internal: unhandled kill target kind %d (%s); refusing to guess which kill dimension was meant", req.target.kind, req.target.dimension())
 	}
 	return nil
 }
@@ -452,7 +481,7 @@ func reviveViaRedis(ctx context.Context, ks *killswitch.Redis, target killTarget
 		if err := ks.DeactivateGlobal(ctx); err != nil {
 			return fmt.Errorf("deactivate global kill switch: %w", err)
 		}
-		printRedisResultWithNote("revived", killTarget{kind: killTargetGlobal, id: killTargetAll},
+		printRedisResultWithNote("revived", target,
 			"per-session and per-agent kills are unaffected; revive those by id")
 	case killTargetAgent:
 		// The undo for a kill that never expires. Without it an agent revocation would be
@@ -461,7 +490,7 @@ func reviveViaRedis(ctx context.Context, ks *killswitch.Redis, target killTarget
 			return fmt.Errorf("revive agent %q: %w", target.id, err)
 		}
 		printRedisResult("revived", target)
-	default:
+	case killTargetSession:
 		// ReviveSession is idempotent: an id that was never killed (or whose tombstone
 		// already expired) deletes nothing and still succeeds, so the command is safe to
 		// re-run and reports the state the operator asked for either way. ReviveAgent
@@ -470,6 +499,9 @@ func reviveViaRedis(ctx context.Context, ks *killswitch.Redis, target killTarget
 			return fmt.Errorf("revive session %q: %w", target.id, err)
 		}
 		printRedisResult("revived", target)
+	default:
+		// Fail closed on an unmapped kind, same as the kill switch above.
+		return fmt.Errorf("internal: unhandled kill target kind %d (%s); refusing to guess which kill dimension was meant", target.kind, target.dimension())
 	}
 	return nil
 }
@@ -488,7 +520,15 @@ func printRedisResult(verb string, target killTarget) {
 // printRedisResultWithNote is printRedisResult plus an operator-facing note, used where
 // the result needs a caveat about what it deliberately did NOT do.
 func printRedisResultWithNote(verb string, target killTarget, note string) {
-	out := map[string]interface{}{"ok": true, verb: target.id, "dimension": target.dimension(), "via": "redis"}
+	// The global switch addresses no individual entity, so killTarget carries no id for
+	// it (see the field's doc). Deriving the reported "all" here rather than having each
+	// global call site hand-build a killTarget that violates that invariant keeps one
+	// spelling of the global target in the program.
+	id := target.id
+	if target.kind == killTargetGlobal {
+		id = killTargetAll
+	}
+	out := map[string]interface{}{"ok": true, verb: id, "dimension": target.dimension(), "via": "redis"}
 	if note != "" {
 		out["note"] = note
 	}

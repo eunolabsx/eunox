@@ -10,7 +10,6 @@ import (
 	"io/fs"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strings"
 	"testing"
 )
@@ -89,22 +88,16 @@ func TestGuardedCompositeLiterals(t *testing.T) {
 	for _, pkg := range pkgs {
 		for path, file := range pkg.Files {
 			base := filepath.Base(path)
-			ast.Inspect(file, func(n ast.Node) bool {
-				lit, ok := n.(*ast.CompositeLit)
-				if !ok {
-					return true
+			// A literal of a guarded type reaches this walk in two spellings, and matching
+			// only the first is how a guard passes while the thing it guards is bypassed:
+			// `killSubject{...}` names its type directly, while an element of
+			// `[]killSubject{{...}}` or `map[string]forwardParams{"k": {…}}` ELIDES it
+			// (lit.Type == nil) and inherits it from the enclosing literal's element type.
+			// ast.Inspect gives no parent link, so the walk threads that context itself.
+			walkLiterals(file, "", func(name string) {
+				if _, guarded := guardedStructs[name]; guarded {
+					found[name] = append(found[name], base)
 				}
-				// Only bare type names: these three are package-local, so a literal of one
-				// is always spelled without a package qualifier.
-				ident, ok := lit.Type.(*ast.Ident)
-				if !ok {
-					return true
-				}
-				if _, guarded := guardedStructs[ident.Name]; !guarded {
-					return true
-				}
-				found[ident.Name] = append(found[ident.Name], base)
-				return true
 			})
 		}
 	}
@@ -142,21 +135,70 @@ func TestGuardedCompositeLiterals(t *testing.T) {
 	}
 }
 
+// walkLiterals visits every composite literal under n, reporting the named type of each.
+// elem is the type name an ELIDED literal inherits from its enclosing slice/array/map
+// literal ("" when there is none), which is what makes `[]killSubject{{...}}` visible.
+func walkLiterals(n ast.Node, elem string, report func(name string)) {
+	ast.Inspect(n, func(node ast.Node) bool {
+		lit, ok := node.(*ast.CompositeLit)
+		if !ok {
+			return true
+		}
+		name := elem
+		if lit.Type != nil {
+			// Package-local types are always spelled bare; anything else (a qualified
+			// type, a generic instantiation) is not one of the guarded three.
+			if ident, isIdent := lit.Type.(*ast.Ident); isIdent {
+				name = ident.Name
+			} else {
+				name = ""
+			}
+		}
+		if name != "" {
+			report(name)
+		}
+		// Descend with THIS literal's element type in scope, so its elided children
+		// resolve. Recurse explicitly rather than returning true, because the child
+		// literals need the context ast.Inspect does not carry.
+		child := elementTypeName(lit.Type)
+		for _, e := range lit.Elts {
+			// A map/struct element is a KeyValueExpr; only its value can be an elided
+			// literal of the element type.
+			if kv, isKV := e.(*ast.KeyValueExpr); isKV {
+				walkLiterals(kv.Value, child, report)
+				continue
+			}
+			walkLiterals(e, child, report)
+		}
+		return false
+	})
+}
+
+// elementTypeName returns the bare element type name of a slice, array, or map type, or
+// "" when the type is not a container of a package-local named type. It is what an elided
+// element literal inherits.
+func elementTypeName(t ast.Expr) string {
+	var elt ast.Expr
+	switch typ := t.(type) {
+	case *ast.ArrayType:
+		elt = typ.Elt
+	case *ast.MapType:
+		elt = typ.Value
+	default:
+		return ""
+	}
+	// A pointer element (&T{} spelled as []*T{{…}}) elides the same way.
+	if star, ok := elt.(*ast.StarExpr); ok {
+		elt = star.X
+	}
+	if ident, ok := elt.(*ast.Ident); ok {
+		return ident.Name
+	}
+	return ""
+}
+
 // dedupeSorted returns the unique entries of in, sorted, so failures name files in a
 // stable order regardless of map iteration.
 func dedupeSorted(in []string) []string {
-	if len(in) == 0 {
-		return nil
-	}
-	seen := make(map[string]bool, len(in))
-	out := make([]string, 0, len(in))
-	for _, s := range in {
-		if seen[s] {
-			continue
-		}
-		seen[s] = true
-		out = append(out, s)
-	}
-	sort.Strings(out)
-	return out
+	return slices.Compact(slices.Sorted(slices.Values(in)))
 }

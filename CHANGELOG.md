@@ -72,9 +72,11 @@ Section conventions:
   may be given (a positional, `--session`, or `--agent`) and supplying more is rejected
   rather than resolved by precedence: on the emergency-stop path a silently ignored
   target is the difference between a revocation an operator believes landed and one
-  that did not. The Redis transport's success line now also carries the dimension
-  (`{"ok":true,"killed":"x","dimension":"agent","via":"redis"}`), since with two id
-  dimensions the id alone no longer says which store moved.
+  that did not. Both transports' success lines now carry the dimension
+  (`{"ok":true,"killed":"x","dimension":"agent","via":"redis"}`), and so does the control
+  endpoint's audit record, since with two id dimensions the id alone no longer says which
+  store moved — without it, revoking a session named `all` and halting the whole deployment
+  produce an identical response and an identical signed record.
 - `eunox kill --reset` was considered and **declined**. `killswitch.Reset` clears the
   global flag, every agent kill, and every session tombstone in one call — the same
   cross-dimension fail-open that `--revive all` deliberately avoids, with a wider
@@ -131,8 +133,17 @@ Section conventions:
   and each reports the other on its next tick, including the case where the second
   started long after the first, which no one-shot comparison can catch. The warning is
   deduplicated on the prior value, so a persistent disagreement is reported once and a
-  changed one again. Nothing here is on the enforcement path: a proxy always applies
-  its own configured lifetime to the tombstones it writes.
+  changed one again — and the dedupe is deliberately not re-armed by an intervening
+  agreement, since two proxies ticking at different rates would otherwise alternate and
+  print it forever. A **permanent** lifetime (`--killswitch-session-ttl -1s`) is published
+  with no key expiry at all: the freshness bound exists to stop a stale value *shortening*
+  a revocation, a permanent value cannot shorten anything, and letting it lapse would drop
+  `eunox kill` back to its 30-day default on a deployment configured for permanent
+  revocations — the fail-open the mechanism exists to prevent. The re-publish is bounded
+  and is skipped when the refresh that just ran could not reach Redis, so an advisory
+  write can never delay the convergence the reconcile interval bounds. Nothing here is on
+  the enforcement path: a proxy always applies its own configured lifetime to the
+  tombstones it writes.
 - **The control-token file write is now bounded and aborts before publishing.** It runs
   after the listener binds — deliberately, so a second proxy that dies on "address
   already in use" cannot clobber the running proxy's token — but between the bind and
@@ -142,13 +153,18 @@ Section conventions:
   chmods the directory, creates a temp file, and **fsyncs** it, and that fsync has no
   upper bound on a contended volume or a stalled mount. `AfterListen` now runs under a
   10-second deadline (matching the budget `eunox kill` already gives its own request),
-  and the deadline is enforced *inside* the writer, immediately before the publishing
-  rename — an abandoned write whose rename still landed would be the token clobber the
-  post-bind ordering exists to prevent, just with a longer fuse. On expiry `Serve` fails
-  and closes the listener: a proxy that could not persist its control token has an
-  unusable emergency stop and should not come up. `transport.WriteControlTokenFile` and
-  `HTTPGatewayOptions.AfterListen` both take a `context.Context` (pre-1.0 signature
-  change, no shim).
+  and the hook runs on its own goroutine so expiry **abandons** it. A bounded context
+  alone would not have bounded anything: Go cannot interrupt a blocked fsync, so the
+  deadline would only be observed after the stall had already ended — the same hang, plus
+  a new startup failure. Abandoning is safe precisely because the writer re-checks the
+  context immediately before its publishing rename, so an abandoned write cannot land
+  later and clobber the token of whatever proxy is actually serving. On a genuine expiry
+  `Serve` fails and closes the listener, so a racing client is refused rather than left
+  hanging: a proxy that could not persist its control token has an unusable emergency stop
+  and should not come up. A hook cut short by *shutdown* (Serve's own context cancelled by
+  a signal) is not a startup failure, so stopping a proxy mid-startup still exits cleanly.
+  `transport.WriteControlTokenFile` and `HTTPGatewayOptions.AfterListen` both take a
+  `context.Context` (pre-1.0 signature change, no shim).
 - **The `/control/kill` handle on the kill switch is now a kill-only interface.** The
   field was typed as the full `killswitch.Manager` — the same interface whose
   `ReviveSession`/`DeactivateGlobal` the CLI reaches — so the invariant that makes the
@@ -170,15 +186,17 @@ Section conventions:
   benchmark, which built bare `mcp.ToolEntry{Name: ...}` values with no description or
   `inputSchema` and so measured almost none of the per-entry work that dominates the
   path, was replaced with a realistic catalog rather than supplemented.
-- **`drift.ParseToolsListResult` decodes the catalog in one pass.** It unmarshaled the
-  envelope to get each entry's raw bytes, screened them, and then re-unmarshaled the
-  *whole* result a second time to decode them; entries are now decoded from the same
-  bytes the screen inspected. The envelope's ambiguous-key guard is deliberately kept
-  even though every in-tree caller feeds it pre-screened output of `FetchAllToolPages`:
-  it is an exported function documented as taking raw `tools/list` bytes, the
-  precondition would be invisible at a future call site, and getting it wrong reopens a
-  catalog-substitution bypass rather than failing loudly. Removing the redundant pass
-  pays for the guard instead of dropping it. A malformed entry now names its index.
+- **`drift.ParseToolsListResult` keeps its envelope ambiguous-key guard**, deliberately,
+  even though every in-tree caller feeds it the pre-screened output of
+  `FetchAllToolPages` so the check cannot fire for them today. It is an exported function
+  documented as taking raw `tools/list` bytes: the precondition a caller would have to
+  satisfy is invisible at the call site, and getting it wrong reopens a
+  catalog-substitution bypass rather than failing loudly. A guard whose absence is silent
+  belongs on the boundary. Folding the entry screen and the decode into one per-entry pass
+  to offset its cost was tried and **reverted** after measurement — encoding/json validates
+  before it decodes, so per-entry decodes re-scan the same bytes and add a decoder setup
+  and a heap-escaping value each (~380 more allocations and ~10 KB more per call on a
+  50-tool catalog, no time saving). The cost is accepted and stated instead.
 
 - **A kill-switch audit record's session id is now a type-level distinction**, not a
   convention. The recorders took a plain session-id string, so keeping an unverified,
@@ -194,8 +212,10 @@ Section conventions:
   write the unexported fields directly — is now guarded by a test that parses the
   package's own sources and fails if a literal of that type (or of the two
   session-carrying dispatch params structs) appears outside the files allowed to
-  construct one. Adding a construction site therefore takes a deliberate edit to a
-  security-invariant test. The broader `forwardParams`/`serverRequestParams` surface was
+  construct one — including a literal whose type is elided inside a slice, array or map.
+  Adding a construction site therefore takes a deliberate edit to a security-invariant
+  test. It does not cover a zero value mutated field by field, which is not a literal at
+  all; the type's doc comment says so rather than implying the residual is fully closed. The broader `forwardParams`/`serverRequestParams` surface was
   deliberately **not** converted to the same type: neither `dispatchParams` constructor
   can receive a raw header at all (one takes a resolved session, the other no arguments),
   so the wrong value is not in scope — revisit if either grows a bare session-id string

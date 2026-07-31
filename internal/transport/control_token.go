@@ -192,8 +192,12 @@ func WriteControlTokenFile(ctx context.Context, path, token string) (string, err
 	// whatever proxy is actually serving. That is the exact clobber the post-bind ordering
 	// exists to prevent, just with a longer fuse, and it is strictly worse than the hang it
 	// would be trying to fix. Checking at the last point before publication means an expired
-	// deadline aborts WITHOUT publishing; the deferred os.Remove already cleans the temp
-	// file up, so the abort path needs nothing further.
+	// deadline aborts WITHOUT publishing, which is the property that matters: the token of
+	// whatever proxy is serving is left exactly as it was. The deferred os.Remove cleans up
+	// the temp file. Directory work already done (MkdirAll, and tightenTokenDir's chmod to
+	// 0700 on eunox's own directory) is deliberately NOT undone -- both only ever restrict,
+	// so reverting them on an abort would loosen a directory holding an emergency-stop
+	// token, which is the wrong direction to fail in.
 	if err := ctx.Err(); err != nil {
 		return "", fmt.Errorf("control token not published to %s: %w (the write did not complete in time; any existing token file is left untouched)", expanded, err)
 	}

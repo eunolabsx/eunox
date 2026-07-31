@@ -1443,10 +1443,11 @@ func TestParseToolsListResult_AmbiguousToolsKey(t *testing.T) {
 	}
 }
 
-// TestParseToolsListResult_MalformedEntry pins that a non-object entry still fails the
-// parse now that entries are decoded one at a time rather than through a second whole-
-// envelope unmarshal: a catalog is either fully believable or it is refused, and the
-// error names the offending index so an operator can find it.
+// TestParseToolsListResult_MalformedEntry pins the fail-closed property on a catalog
+// carrying an entry that is not a well-formed tool object: the whole parse is refused
+// rather than the entry being skipped. A skipped entry would silently shrink the live
+// tool set the drift comparison runs against, which is how a pinned tool goes missing
+// without an FM-2 finding.
 func TestParseToolsListResult_MalformedEntry(t *testing.T) {
 	t.Parallel()
 	for _, body := range []string{
@@ -1454,13 +1455,17 @@ func TestParseToolsListResult_MalformedEntry(t *testing.T) {
 		`{"tools":[{"name":"ok"},"not-an-object"]}`,
 		`{"tools":[{"name":"ok"},{"name":123}]}`,
 	} {
-		_, err := ParseToolsListResult(json.RawMessage(body))
+		tools, err := ParseToolsListResult(json.RawMessage(body))
 		if err == nil {
-			t.Errorf("a malformed entry must fail the parse, not be skipped: %s", body)
+			t.Errorf("a malformed entry must fail the parse, not be skipped: %s (got %d tools)", body, len(tools))
 			continue
 		}
-		if !strings.Contains(err.Error(), "entry 1") {
-			t.Errorf("error should name the offending entry index, got %q for %s", err, body)
+		// A non-object entry is refused by the per-entry screen (which fails closed on
+		// bytes it cannot walk); a well-formed object with a wrong-typed field is refused
+		// by the decode. Either way the whole catalog is rejected and the message names
+		// tools/list — the property that matters is that nothing is silently dropped.
+		if !strings.Contains(err.Error(), "tools/list") {
+			t.Errorf("error should name what failed to parse, got %q for %s", err, body)
 		}
 	}
 }

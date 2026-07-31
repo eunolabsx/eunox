@@ -760,13 +760,43 @@ out-of-band kill channel (stop the process), so this only changes behavior for a
 
 `eunox kill --revive <session-id|all> --redis-addr <host:port>` undoes a kill:
 `<session-id>` removes that session's kill tombstone, and `all` deactivates
-the global kill switch. Lifting the global switch leaves per-session kills in
-place — they are separate dimensions, so revive those by id.
+the global kill switch. Lifting the global switch leaves per-session **and
+per-agent** kills in place — they are separate dimensions, so revive those by id.
+
+`--revive --agent <agent-id>` lifts an agent kill. Agent kills never expire, so
+this is the only way to remove one.
 
 It is Redis-only. The loopback `/control/kill` endpoint is a one-way emergency
 stop with no undo (a same-host caller holding the control token must not be able
 to lift the revocation issued against it), and a proxy on the default in-memory
 kill switch is cleared by restarting it.
+
+### Targeting a specific dimension
+
+There are three kill dimensions, and exactly one target may be given — passing
+more than one is rejected rather than resolved by precedence:
+
+```bash
+eunox kill <session-id>                                   # revoke one session
+eunox kill all                                            # halt the deployment
+eunox kill --session <session-id> --redis-addr <addr>     # same as the positional
+eunox kill --agent <agent-id>  --redis-addr <addr>        # revoke a JWT identity
+```
+
+`--agent` targets the JWT `agent_id`, which stops every session that identity
+holds — the right granularity when one compromised agent spans many sessions,
+instead of killing each session id or reaching for the global switch. It is
+Redis-only: there is no agent dimension on the loopback control endpoint. An
+agent kill is only *consulted* where the proxy validates JWTs (`--jwks-uri`, HTTP
+transport); on a stdio proxy, which cannot take `--jwks-uri`, kill the session
+ids instead. The command warns about this on stderr.
+
+`--session` addresses a session id verbatim. That matters in one case: the
+positional `all` means the whole deployment, so `--session all` is the only way
+to reach a session whose id is literally `all` — possible, since `--session-id`
+is operator-settable on a stdio proxy. The control endpoint's response and audit
+record carry a `dimension` field (`global` or `session`) so the two cannot be
+confused after the fact.
 
 What removing the tombstone actually restores depends on the proxy shape:
 
@@ -807,6 +837,16 @@ Passing the flag to `eunox kill` anyway still works — for a Redis no proxy has
 started against yet, or to override deliberately. If it disagrees with the
 published value, the longer-lived of the two is used (a revocation must never
 expire early) and the mismatch is printed on stderr.
+
+The published value carries its own expiry, refreshed by the running proxy, so a
+value left behind by a stopped or decommissioned instance stops being readable
+rather than being adopted as if it were live. When nothing is published — a fresh
+Redis, or a fleet that has been down longer than the refresh window — `eunox
+kill` falls back to its own default and says so on stderr; restart the proxy, or
+pass `--killswitch-session-ttl`, to make the two agree again. A proxy configured
+for *permanent* tombstones (`--killswitch-session-ttl -1s`) publishes a value
+with no expiry at all, so that setting is never silently downgraded to the
+30-day default by a fleet restart.
 
 ---
 

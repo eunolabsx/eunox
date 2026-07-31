@@ -84,10 +84,13 @@ func asRecorder[T interface {
 // and defeat this, same as it could hand a raw header to verifiedSession's string
 // parameter. Neither is a compiler-checked impossibility, both are visibly wrong at the
 // call site instead of a plausible-looking choice between two same-shaped helpers. That
-// residual is now guarded rather than merely observed: an AST test over the package's own
-// sources (see guardedStructs) fails if a composite literal of this type appears outside
-// the file holding its constructors, so adding a construction site takes a deliberate edit
-// to a security-invariant test rather than passing unnoticed.
+// residual is now partly guarded rather than merely observed: an AST test over the
+// package's own sources (see guardedStructs) fails if a composite literal of this type —
+// including one whose type is elided inside a slice, array or map literal — appears
+// outside the file holding its constructors, so adding one takes a deliberate edit to a
+// security-invariant test. It does NOT cover a zero value mutated field by field
+// (`var k killSubject; k.verified = ...`), which is not a literal at all; that spelling
+// stays visibly wrong at the call site rather than compiler- or test-checked.
 //
 // Scope: this closes the gap for the kill-record recorders specifically, the ~10 call
 // sites recordKillDenial/recordKillDrop had. It does not extend to the general
