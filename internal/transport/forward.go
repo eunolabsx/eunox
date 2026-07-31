@@ -75,10 +75,26 @@ func asRecorder[T interface {
 // never established, which is exactly what the tape is supposed to be trustworthy about.
 // With a plain string the guarantee rested on every future author of a recordKillDenial /
 // recordKillDrop call site knowing the rule; here a call site must STATE which kind of id
-// it holds, and there is no way to spell "this header is verified" — claimedSession takes
-// the *http.Request and never an id, so an unverified value has no route to the verified
+// it holds, and claimedSession takes the *http.Request and never an id, so an unverified
+// value reached the normal way — via the constructors — has no route to the verified
 // field. The zero value is the safe one (empty session_id, no claimed detail), so a
 // hand-written composite literal degrades to recording less, never to forging more.
+// Encapsulation is package-scoped, not file-scoped: a call site inside internal/transport
+// could still write the unexported fields directly (killSubject{verified: someHeaderRead})
+// and defeat this, same as it could hand a raw header to verifiedSession's string
+// parameter. Neither is a compiler-checked impossibility, both are visibly wrong at the
+// call site instead of a plausible-looking choice between two same-shaped helpers, and no
+// call site in the tree does either — grep for `killSubject{` finds only the two
+// constructors below.
+//
+// Scope: this closes the gap for the kill-record recorders specifically, the ~10 call
+// sites recordKillDenial/recordKillDrop had. It does not extend to the general
+// auditRecorder.RecordAllow/RecordDeny surface (enforcedForwardCore, dispatchList,
+// dispatchUnmapped, forwardServerRequest, …), whose forwardParams.sessionID /
+// serverRequestParams.sessionID stay plain strings — "verified" there remains a
+// control-flow fact (never constructed before a session lookup succeeds), not a type
+// guarantee, matching killDropLeg's identical scope caveat below for the "transport"
+// detail.
 type killSubject struct {
 	// verified is the registry-resolved session id, stamped into session_id. Empty for a
 	// claimed subject.

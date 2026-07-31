@@ -2280,8 +2280,7 @@ func killDeny() *capability.EnforceResponse {
 func TestKillSubject_VerifiedVsClaimed(t *testing.T) {
 	t.Parallel()
 
-	claimedReq := httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody)
-	claimedReq.Header.Set(SessionHeader, "victim-real-session-id")
+	claimedReq := newTestRequestWithSession("victim-real-session-id")
 
 	t.Run("verified stamps session_id and adds no claim", func(t *testing.T) {
 		t.Parallel()
@@ -2338,8 +2337,7 @@ func TestKillSubject_VerifiedVsClaimed(t *testing.T) {
 func TestRecordKillDenial_SubjectRoutesTheSessionID(t *testing.T) {
 	t.Parallel()
 
-	req := httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody)
-	req.Header.Set(SessionHeader, "victim-real-session-id")
+	req := newTestRequestWithSession("victim-real-session-id")
 
 	verifiedRec := &fwdRecorder{}
 	resp := recordKillDenial(context.Background(), verifiedRec, killDeny(), mcp.RawJSON(`1`), verifiedSession("sess-1"), "tools/call")
@@ -2363,8 +2361,7 @@ func TestRecordKillDenial_SubjectRoutesTheSessionID(t *testing.T) {
 func TestRecordKillDrop_SubjectRoutesTheSessionID(t *testing.T) {
 	t.Parallel()
 
-	req := httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody)
-	req.Header.Set(SessionHeader, "victim-real-session-id")
+	req := newTestRequestWithSession("victim-real-session-id")
 
 	verifiedRec := &fwdRecorder{}
 	recordKillDrop(context.Background(), verifiedRec, killDeny(), verifiedSession("sess-1"),

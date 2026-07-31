@@ -387,12 +387,15 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 		// only the request/notification framing here can carry a JSON-RPC KILL_SWITCH body.
 		//
 		// sessionID here is the raw, client-supplied header for a session that does not (or
-		// no longer) exist — unverified, unlike every other CheckKill call site's sessionID.
-		// Stamping it into the signed session_id field would let anyone whose credential
-		// merely clears CheckKill's fail-closed paths forge kill records against an arbitrary
-		// (including a real victim's) session id. This is the one kill-record call site that
-		// passes claimedSession rather than verifiedSession, which is what keeps session_id
-		// empty and preserves the claimed value only as details.claimed_session_id.
+		// no longer) exist — unverified, unlike every other CheckKill call site's sessionID,
+		// which comes from an established sess.id/p.sessionID via verifiedSession. Stamping
+		// it into the signed session_id field would let anyone whose credential merely
+		// clears CheckKill's fail-closed paths forge kill records against an arbitrary
+		// (including a real victim's) session id. claimedSession(r) below (and at its sibling
+		// call two lines down) is what keeps session_id empty and preserves the claimed value
+		// only as details.claimed_session_id — the same treatment the session-creating and
+		// sessionless-notification initialize branches above give a header that was never
+		// even looked up.
 		if deny := route.pdp.CheckKill(r.Context(), sessionID); deny != nil {
 			if msg.IsRequest() {
 				writeJSONMsg(w, recordKillDenial(r.Context(), asRecorder(route.sink), deny, msg.ID, claimedSession(r), msg.Method))
