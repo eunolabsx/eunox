@@ -612,6 +612,16 @@ func cmdProxy(args []string) (exitCode int) {
 	}()
 
 	if ksRedis != nil {
+		// Publish the effective session-kill TTL here, not from
+		// buildCallCounterAndKillSwitch: everything that can still fail this process's
+		// startup and exit it (JWT/Redis flag validation, the Redis ping, opening the
+		// audit sink) has already run and succeeded by this point. Publishing any
+		// earlier risks the same bug already fixed once for the control-token file — a
+		// second, differently-configured instance overwrites a running proxy's
+		// published value and then dies before serving a single request, leaving
+		// `eunox kill` and this proxy's own diagnostics trusting a lifetime nothing is
+		// actually enforcing.
+		publishSessionKillTTL(ksRedis)
 		ksRedis.Start(ctx)
 		// Join the Redis kill-switch's pub/sub listener and reconcile loop on
 		// shutdown; otherwise they outlive cmdProxy and may touch the shared Redis
@@ -725,33 +735,60 @@ func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, ki
 		// running a pinned, reused --session-id needs to see the number without having to
 		// know the flag exists to ask for it.
 		fmt.Fprintf(os.Stderr, "[eunox] Kill switch: %s (--killswitch-session-ttl). Agent kills never expire.\n", sessionKillTTLNotice(killswitchSessionTTL))
+		// The TTL is published later, from cmdProxy, once startup is past every step
+		// that can still fail and exit the process — see that call site.
 	}
 	return counter, flowStore, ks, ksRedis, nil
 }
 
-// sessionKillTTLNotice renders the startup line describing how long a session-kill
-// tombstone survives, resolving the flag's two sentinel values the way
-// killswitch.WithSessionKillTTL does (0 = the 30-day default, negative = never expire) so
-// the banner cannot claim one lifetime while Redis enforces another.
-func sessionKillTTLNotice(ttl time.Duration) string {
-	switch {
-	case ttl < 0:
-		// No CLI subcommand un-kills a session today (killswitch.ReviveSession/Reset are
-		// library-only), so do not name one: the tombstone key is what an operator has to
-		// remove, and saying so is more useful than a command that does not exist.
-		return "session kills never expire (--killswitch-session-ttl is negative); tombstones accumulate in Redis until their killswitch:session: keys are removed"
-	case ttl == 0:
-		return fmt.Sprintf("session kills expire after %s (default); a session held open longer than that is re-admitted", killswitch.DefaultSessionKillTTL)
-	default:
-		return fmt.Sprintf("session kills expire after %s; a session held open longer than that is re-admitted", ttl)
+// publishSessionKillTTL advertises the effective session-tombstone lifetime on the
+// shared Redis so `eunox kill --redis-addr` writes tombstones with the SAME lifetime.
+// That command is the only out-of-band revocation channel a stdio proxy has, so it
+// writes tombstones itself; as two independent flags the pair could disagree with no
+// diagnostic, and the disagreement fails one way — the CLI's shorter default expires a
+// kill the operator configured to outlast it, silently re-admitting the session.
+//
+// Advisory, so a failure warns rather than aborts startup: this proxy enforces its own
+// configured value regardless, and the CLI falls back to its flag exactly as it did
+// before the key existed. A prior value that differs is reported too — the key is
+// last-writer-wins, so two differently configured proxies on one Redis leave `eunox
+// kill` adopting whichever started last.
+func publishSessionKillTTL(ksRedis *killswitch.Redis) {
+	// Bounded and detached: this runs during startup wiring, before the proxy's own
+	// run context exists, and must not hang the boot on a Redis that answered PING and
+	// then stalled.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	prior, differs, err := ksRedis.PublishSessionKillTTL(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[eunox] WARNING: could not publish the session-kill TTL to Redis (%v); `eunox kill --redis-addr` will fall back to its own --killswitch-session-ttl, which must then match this proxy's.\n", err)
+		return
+	}
+	if differs {
+		fmt.Fprintf(os.Stderr, "[eunox] WARNING: this Redis already advertised a session-kill TTL of %s, now replaced by %s. If another proxy instance is running with the old value, the two disagree and `eunox kill` applies whichever was published last; align --killswitch-session-ttl across instances.\n",
+			killswitch.DescribeSessionKillTTL(prior), killswitch.DescribeSessionKillTTL(ksRedis.SessionKillTTL()))
 	}
 }
 
-// openConfiguredAuditSink resolves the audit-sink settings (config's audit block
-// takes precedence over the CLI flags so every route shares one tape) and opens
-// the sink. Under --require-audit an open failure is returned as an error for the
-// caller to exit on (fail closed); otherwise it warns and returns a nil sink with a
-// nil error, so the proxy continues unaudited.
+// sessionKillTTLNotice renders the startup line describing how long a session-kill
+// tombstone survives, resolving the flag's two sentinel values through the same
+// killswitch.NormalizeSessionKillTTL the option applies (0 = the 30-day default,
+// negative = never expire) so the banner cannot claim one lifetime while Redis
+// enforces another.
+func sessionKillTTLNotice(ttl time.Duration) string {
+	effective := killswitch.NormalizeSessionKillTTL(ttl)
+	if effective == 0 {
+		return "session kills never expire; tombstones accumulate in Redis until `eunox kill --revive <session-id> --redis-addr <addr>` removes them"
+	}
+	// Only an unset flag is "(default)": an explicit value that happens to equal the
+	// default was still chosen by the operator.
+	suffix := ""
+	if ttl == 0 {
+		suffix = " (default)"
+	}
+	return fmt.Sprintf("session kills expire after %s%s; a session held open longer than that is re-admitted", effective, suffix)
+}
+
 // warnAuditFlagOverridden prints the shared "config wins over an explicit --audit-* flag"
 // warning for `proxy`, where the audit block always takes precedence so every route
 // shares one tape. flagRepr/cfgRepr are the already-formatted (%q for strings, %d for
@@ -760,6 +797,11 @@ func warnAuditFlagOverridden(flagName, flagRepr, cfgField, cfgRepr string) {
 	fmt.Fprintf(os.Stderr, "[eunox] WARNING: %s %s is overridden by the config's %s %s; the config's audit block always takes precedence for `proxy` so every route shares one tape.\n", flagName, flagRepr, cfgField, cfgRepr)
 }
 
+// openConfiguredAuditSink resolves the audit-sink settings (config's audit block
+// takes precedence over the CLI flags so every route shares one tape) and opens
+// the sink. Under --require-audit an open failure is returned as an error for the
+// caller to exit on (fail closed); otherwise it warns and returns a nil sink with a
+// nil error, so the proxy continues unaudited.
 func openConfiguredAuditSink(auditLog, auditKeyPath string, auditRotateSize int64, auditRetainRotated int, auditRetainSet bool, cfg *config.GatewayConfig, requireAudit bool) (*audit.Sink, error) {
 	auditLogPath, auditKey, auditRotate := auditLog, auditKeyPath, auditRotateSize
 	auditRetain := auditRetainRotated

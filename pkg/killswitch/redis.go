@@ -232,21 +232,32 @@ type RedisOption func(*Redis)
 
 // WithSessionKillTTL overrides how long a session-kill tombstone lives in Redis. A
 // negative value disables expiry (tombstones live forever, the pre-existing behavior);
-// zero selects the default.
+// zero selects the default. This is the OPERATOR-FACING spelling, matching the
+// --killswitch-session-ttl flag; NormalizeSessionKillTTL resolves its two sentinels.
 //
 // Raise it only if sessions in your deployment can outlive the default; LOWERING it below
 // the longest session you can hold open is a fail-open, because an expiring tombstone
 // lifts the kill on a session that may still be connected. Agent kills are never expired.
 func WithSessionKillTTL(d time.Duration) RedisOption {
+	return WithSessionKillTTLEffective(NormalizeSessionKillTTL(d))
+}
+
+// WithSessionKillTTLEffective sets the tombstone lifetime from an ALREADY-RESOLVED
+// effective value, the form ReadPublishedSessionKillTTL and (*Redis).SessionKillTTL
+// return: zero means the tombstone never expires, and any positive value is the
+// lifetime verbatim.
+//
+// It exists so a caller adopting a lifetime resolved elsewhere does not have to funnel
+// it back through WithSessionKillTTL's sentinels, where zero means "use the 30-day
+// default" instead -- passing a permanent lifetime to that option would quietly convert
+// it into an expiring one, which is the fail-open direction. A negative value is treated
+// as never expiring, the same as zero, since no other reading of it is safe.
+func WithSessionKillTTLEffective(d time.Duration) RedisOption {
 	return func(r *Redis) {
-		switch {
-		case d < 0:
-			r.sessionKillTTL = 0 // explicit opt-out: never expire
-		case d == 0:
-			r.sessionKillTTL = defaultSessionKillTTL
-		default:
-			r.sessionKillTTL = d
+		if d < 0 {
+			d = 0
 		}
+		r.sessionKillTTL = d
 	}
 }
 

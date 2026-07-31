@@ -368,7 +368,10 @@ opaque resource URI or an oddly-named tool maps to the right namespace — and
 - **Kill switch** (`pkg/killswitch`) — immediately blocks a session, an
   agent (by JWT `agent_id`), or everything. Checked first on every decision;
   a backend error denies. Activated via `eunox kill` against the HTTP
-  proxy's loopback control endpoint, or directly through Redis.
+  proxy's loopback control endpoint, or directly through Redis. The Redis
+  transport also carries the undo (`eunox kill --revive`) and the session-
+  tombstone lifetime the proxy publishes at startup so the CLI stamps the
+  same expiry the proxy would; the loopback endpoint is kill-only.
 - **Call counter** (`pkg/callcounter`) — backs `maxCalls` rate conditions
   (`IncrementIfBelow`/`IncrementIfAllBelow`) and `sequenceBlock` session-history
   lookups (`Peek`).

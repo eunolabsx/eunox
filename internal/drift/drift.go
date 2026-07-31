@@ -983,8 +983,14 @@ func ParseToolsListResult(raw json.RawMessage) ([]UpstreamTool, error) {
 	// duplicated "tools" decode silently to ONE array here — Go binds by a case-folding
 	// match and keeps the last — which is the same catalog-substitution bypass
 	// ToolsKeyAmbiguous was exported to close on the runtime list path.
+	//
+	// ToolsKeyAmbiguous also reports true on bytes it cannot even walk (truncated JSON, a
+	// non-object top level) — deliberately: this gate must fail closed on uncertainty, not
+	// just on a confirmed duplicate. The message below is worded to match that: it says the
+	// key "could not be verified", not "is ambiguous", so a truncated upstream response is
+	// not misreported to an operator as a duplicate-key attack when it is a transport fault.
 	if pdp.ToolsKeyAmbiguous(raw) {
-		return nil, fmt.Errorf("tools/list result carries an ambiguous \"tools\" key (duplicated, case-variant, or both); refusing to trust the decode")
+		return nil, fmt.Errorf("tools/list result's \"tools\" key could not be verified as unambiguous (malformed JSON, or a duplicated/case-variant key); refusing to trust the decode")
 	}
 	var envelope struct {
 		Tools []json.RawMessage `json:"tools"`

@@ -241,33 +241,34 @@ func TestKillswitchSessionTTLFlag_IsRedisGated(t *testing.T) {
 	require.Contains(t, redisGatedFlags, "killswitch-session-ttl")
 }
 
-// TestKillViaRedis_HonorsSessionKillTTL: the TTL is applied by whichever process WRITES
+// TestRunRedisKill_HonorsSessionKillTTL: the TTL is applied by whichever process WRITES
 // the tombstone, and `eunox kill --redis-addr` is the only out-of-band revocation channel
 // a stdio proxy has — the deployment the flag exists for. Building the manager without
 // the option here stamped the 30-day default on a kill the operator had configured to
-// never expire, so the revoked session came back.
-func TestKillViaRedis_HonorsSessionKillTTL(t *testing.T) {
+// never expire, so the revoked session came back. No proxy has published a TTL to this
+// Redis, so the flag is what resolves.
+func TestRunRedisKill_HonorsSessionKillTTL(t *testing.T) {
 	mr := miniredis.RunT(t)
 
 	// Negative: expiry disabled, so the tombstone must carry no TTL.
-	if err := killViaRedis(mr.Addr(), "", false, -1, "sess-permanent"); err != nil {
-		t.Fatalf("killViaRedis: %v", err)
+	if err := runRedisKill(redisKillRequest{addr: mr.Addr(), target: "sess-permanent", sessionKillTTL: -1, ttlFlagSet: true}); err != nil {
+		t.Fatalf("runRedisKill: %v", err)
 	}
 	if ttl := mr.TTL("killswitch:session:sess-permanent"); ttl != 0 {
 		t.Errorf("TTL = %v, want 0 (no expiry) for a negative --killswitch-session-ttl", ttl)
 	}
 
 	// An explicit positive value is applied verbatim, not replaced by the default.
-	if err := killViaRedis(mr.Addr(), "", false, 90*time.Minute, "sess-short"); err != nil {
-		t.Fatalf("killViaRedis: %v", err)
+	if err := runRedisKill(redisKillRequest{addr: mr.Addr(), target: "sess-short", sessionKillTTL: 90 * time.Minute, ttlFlagSet: true}); err != nil {
+		t.Fatalf("runRedisKill: %v", err)
 	}
 	if ttl := mr.TTL("killswitch:session:sess-short"); ttl != 90*time.Minute {
 		t.Errorf("TTL = %v, want 90m", ttl)
 	}
 
 	// 0 selects the documented default.
-	if err := killViaRedis(mr.Addr(), "", false, 0, "sess-default"); err != nil {
-		t.Fatalf("killViaRedis: %v", err)
+	if err := runRedisKill(redisKillRequest{addr: mr.Addr(), target: "sess-default"}); err != nil {
+		t.Fatalf("runRedisKill: %v", err)
 	}
 	if ttl := mr.TTL("killswitch:session:sess-default"); ttl != killswitch.DefaultSessionKillTTL {
 		t.Errorf("TTL = %v, want the %v default", ttl, killswitch.DefaultSessionKillTTL)

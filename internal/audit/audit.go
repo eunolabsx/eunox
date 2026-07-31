@@ -274,6 +274,13 @@ type Sink struct {
 	// mid-flight when close(s.records) runs (which would panic). A read lock lets
 	// concurrent producers still enqueue in parallel. closed, once set, turns any
 	// later send into a counted drop.
+	//
+	// No blocking I/O under either lock, held for read or write: Close needs the write
+	// lock to make progress during a drop storm — exactly when a stderr write is most
+	// likely to be the one blocked on a dead log collector's full pipe — so a write here
+	// would stall shutdown behind it. enqueue already follows this (its drop-warning
+	// string is built under the read lock, but only fmt.Fprint'd by its caller after
+	// releasing it); keep any future critical section under mu to the same rule.
 	mu     sync.RWMutex
 	closed bool
 
@@ -1334,7 +1341,7 @@ func (s *Sink) Record(ctx context.Context, p RecordParams) {
 	// most needs to make progress. Writing them inside the read-locked span put a blocking
 	// syscall in front of it; the rate limit bounds how OFTEN they are written, not how
 	// long one write can stall.
-	if warn := s.enqueue(rec, mcpMethod, target); warn != "" {
+	if warn := s.enqueue(rec); warn != "" {
 		fmt.Fprint(os.Stderr, warn)
 	}
 }
@@ -1347,7 +1354,7 @@ func (s *Sink) Record(ctx context.Context, p RecordParams) {
 // It returns the drop-warning line for the caller to write after releasing the lock (empty
 // when there is nothing to warn about); formatting the message is cheap and lock-safe, only
 // the write to stderr is not.
-func (s *Sink) enqueue(rec auditRecord, mcpMethod, target string) string {
+func (s *Sink) enqueue(rec auditRecord) string {
 	size := rec.queueSize()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1356,7 +1363,7 @@ func (s *Sink) enqueue(rec auditRecord, mcpMethod, target string) string {
 		// Close's warning and DroppedRecords) without the queue-full message, which
 		// would misattribute the cause.
 		s.dropped.Add(1)
-		s.recordDropBucket(mcpMethod, target)
+		s.recordDropBucket(rec.Method, rec.Target)
 		return ""
 	}
 	if s.queuedBytes.Load()+size > auditQueueByteBudget {
@@ -1368,7 +1375,7 @@ func (s *Sink) enqueue(rec auditRecord, mcpMethod, target string) string {
 		if n := s.dropped.Add(1); n == 1 || n%100 == 0 {
 			warn = fmt.Sprintf("[eunox] WARNING: audit record dropped (%d total) — write queue over its %d-byte memory budget; check disk I/O\n", n, int64(auditQueueByteBudget))
 		}
-		s.recordDropBucket(mcpMethod, target)
+		s.recordDropBucket(rec.Method, rec.Target)
 		return warn
 	}
 	select {
@@ -1380,7 +1387,7 @@ func (s *Sink) enqueue(rec auditRecord, mcpMethod, target string) string {
 		if n := s.dropped.Add(1); n == 1 || n%100 == 0 {
 			warn = fmt.Sprintf("[eunox] WARNING: audit record dropped (%d total) — write queue is full; check disk I/O\n", n)
 		}
-		s.recordDropBucket(mcpMethod, target)
+		s.recordDropBucket(rec.Method, rec.Target)
 		return warn
 	}
 }
