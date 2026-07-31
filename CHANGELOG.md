@@ -34,6 +34,33 @@ Section conventions:
   reuses one `--session-id` silently re-admitted a revoked session. A negative value
   restores permanent tombstones; agent kills are never expired. The effective lifetime
   is now printed at startup even at its default, since the expiry undoes a revocation.
+  The proxy **publishes** that lifetime to Redis at startup
+  (`killswitch:config:session-kill-ttl`) and `eunox kill --redis-addr` adopts it, so
+  the value no longer has to be set identically in two places: the tombstone's expiry
+  is stamped by whichever process writes it, and the CLI is the only out-of-band
+  revocation channel a stdio proxy has, so its own 30-day default used to expire a kill
+  the operator had configured to last longer — silently re-admitting the session. Pass
+  `--killswitch-session-ttl` to `eunox kill` only to override, or for a Redis no proxy
+  has started against yet; a disagreement resolves to the longer-lived of the two and
+  is reported on stderr, and a proxy that replaces a differing published value warns.
+- `eunox kill --revive <session-id|all> --redis-addr <addr>` lifts a revocation:
+  it removes one session's kill tombstone, or (with `all`) deactivates the global
+  kill switch, leaving per-session kills in place. `killswitch.ReviveSession` and
+  `DeactivateGlobal` existed but had **no caller** anywhere in the CLI, so with a
+  negative `--killswitch-session-ttl` — where tombstones are permanent — the only
+  remediation was deleting `killswitch:session:` keys in `redis-cli`. The startup
+  banner now names the command. Redis-only by design: the loopback `/control/kill`
+  endpoint stays a one-way emergency stop (a same-host caller holding the control
+  token must not be able to lift the revocation issued against it), and an in-memory
+  kill switch is cleared by restarting the proxy.
+- `killswitch.NormalizeSessionKillTTL`, `WithSessionKillTTLEffective`,
+  `(*Redis).SessionKillTTL`, `(*Redis).PublishSessionKillTTL`,
+  `ReadPublishedSessionKillTTL`, and `DescribeSessionKillTTL` — the shared-TTL seam
+  behind the above. `WithSessionKillTTL` keeps the operator-facing sentinels (0 = the
+  default, negative = never expire) and now resolves them through the one normalizer;
+  `WithSessionKillTTLEffective` takes an already-resolved lifetime, where 0 means
+  never expire, so a value read back from Redis cannot be funnelled through the other
+  option's sentinels and quietly become a 30-day tombstone.
 - A **successful** `POST /control/kill` now writes an audit record (an allow with
   method `control/kill` and `details.scope` — the killed session id, or `all`).
   Refusals of the endpoint were already recorded and so were the `KILL_SWITCH`
