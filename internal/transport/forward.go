@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"sync/atomic"
 
@@ -55,6 +56,66 @@ func asRecorder[T interface {
 	return s
 }
 
+// killSubject names WHOSE session a kill-switch record describes and — the load-bearing
+// part — whether this proxy can VOUCH for that name. Only two things can produce one:
+//
+//   - verifiedSession: an id this proxy actually established (a registry-resolved HTTP
+//     session, or the stdio proxy's own). Safe to stamp as fact, so it populates the
+//     structured, signed session_id field.
+//   - claimedSession: the raw, client-supplied Mcp-Session-Id header of a request whose
+//     session was NOT resolved. Not safe: a caller holding any valid-but-unrelated
+//     credential (a route's shared bearer, or any JWT valid for that route's audience)
+//     could put an arbitrary — including a real victim's — id in the header and have it
+//     recorded as fact whenever CheckKill fails closed (an active global kill, or a
+//     kill-store error). session_id stays EMPTY and the claimed value survives, clearly
+//     marked unverified, as details.claimed_session_id.
+//
+// This is a type rather than a `sessionID string` parameter because picking wrong fails
+// SILENTLY: it yields a well-formed, HMAC-chained record asserting a session this proxy
+// never established, which is exactly what the tape is supposed to be trustworthy about.
+// With a plain string the guarantee rested on every future author of a recordKillDenial /
+// recordKillDrop call site knowing the rule; here a call site must STATE which kind of id
+// it holds, and there is no way to spell "this header is verified" — claimedSession takes
+// the *http.Request and never an id, so an unverified value has no route to the verified
+// field. The zero value is the safe one (empty session_id, no claimed detail), so a
+// hand-written composite literal degrades to recording less, never to forging more.
+type killSubject struct {
+	// verified is the registry-resolved session id, stamped into session_id. Empty for a
+	// claimed subject.
+	verified string
+	// req carries the Mcp-Session-Id header a client CLAIMED, for a claimed subject; nil
+	// for a verified one. Held as the request rather than the extracted header string so
+	// the bounding/sanitizing rule stays with its single owner, addClaimedSessionID.
+	req *http.Request
+}
+
+// verifiedSession names a session THIS proxy established, whose id is therefore safe to
+// stamp into the signed session_id field. Pass an id that came from session state (an
+// *httpSession's id, the StdioProxy's) rather than one read back off the request: the
+// point of the type is that provenance is visible at the call site.
+func verifiedSession(id string) killSubject { return killSubject{verified: id} }
+
+// claimedSession names the session id a client claimed in r's Mcp-Session-Id header at a
+// call site that has NOT resolved it against the registry — including one where no session
+// exists at all (a session-creating initialize), where the header is absent and this
+// contributes no detail. Its id never reaches session_id; see killSubject.
+func claimedSession(r *http.Request) killSubject { return killSubject{req: r} }
+
+// auditSessionID is the value for the record's structured, signed session_id field: the
+// verified id, or empty for a claimed subject.
+func (k killSubject) auditSessionID() string { return k.verified }
+
+// auditDetails folds a claimed subject's unverified id into base as
+// details.claimed_session_id (bounded and sanitized by addClaimedSessionID), and returns
+// base untouched for a verified subject, whose id is already in session_id. base may be
+// nil; addClaimedSessionID allocates only when there is something to record.
+func (k killSubject) auditDetails(base map[string]interface{}) map[string]interface{} {
+	if k.req == nil {
+		return base
+	}
+	return addClaimedSessionID(base, k.req)
+}
+
 // recordKillDenial records a kill-switch denial and builds the host-facing denial
 // response. The non-enforced paths — */list, the unmapped-method default, and each
 // transport's local initialize answer — call CheckKill themselves (they do not flow
@@ -64,11 +125,12 @@ func asRecorder[T interface {
 // rec may be nil (no sink configured); the record is skipped then. A kill addresses no
 // sub-target, so the one method name serves as the audit identifier, the method, and
 // the denial target alike (unlike the enforced path, where they can differ); id shapes
-// the response.
-func recordKillDenial(ctx context.Context, rec auditRecorder, deny *capability.EnforceResponse, id *json.RawMessage, sessionID, method string) mcp.RPCMsg {
+// the response. subj decides whether the session id is recorded as fact (session_id) or
+// as an unverified claim (details.claimed_session_id) — see killSubject.
+func recordKillDenial(ctx context.Context, rec auditRecorder, deny *capability.EnforceResponse, id *json.RawMessage, subj killSubject, method string) mcp.RPCMsg {
 	denial := normalizeDenial(deny.Denial)
 	if rec != nil {
-		rec.RecordDeny(ctx, sessionID, method, method, denial.Code, denial.ConditionType, nil, false)
+		rec.RecordDeny(ctx, subj.auditSessionID(), method, method, denial.Code, denial.ConditionType, subj.auditDetails(nil), false)
 	}
 	return denialResult(id, denial.Code, denial.ConditionType, method, "")
 }
@@ -106,13 +168,15 @@ const (
 // genuine nil interface. Folding the ~8 hand-mirrored drop-and-record sites here keeps
 // the record shape (identifier/method, the "transport" detail key) from drifting apart.
 // transportLeg is recorded as a plain string (converted from killDropLeg), matching the
-// detail value's shape before this type existed.
-func recordKillDrop(ctx context.Context, rec auditRecorder, deny *capability.EnforceResponse, sessionID, identifier, method string, transportLeg killDropLeg) {
+// detail value's shape before this type existed. subj decides how the session id is
+// recorded, exactly as in recordKillDenial — see killSubject.
+func recordKillDrop(ctx context.Context, rec auditRecorder, deny *capability.EnforceResponse, subj killSubject, identifier, method string, transportLeg killDropLeg) {
 	if rec == nil {
 		return
 	}
 	denial := normalizeDenial(deny.Denial)
-	rec.RecordDeny(ctx, sessionID, identifier, method, denial.Code, denial.ConditionType, map[string]interface{}{"transport": string(transportLeg)}, false)
+	details := subj.auditDetails(map[string]interface{}{"transport": string(transportLeg)})
+	rec.RecordDeny(ctx, subj.auditSessionID(), identifier, method, denial.Code, denial.ConditionType, details, false)
 }
 
 // recordResourceExhausted records a host request refused because the concurrent-handler

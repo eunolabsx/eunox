@@ -1018,7 +1018,7 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 					// server-response is visible on the tape, mirroring the host-notification
 					// kill record (forwardHostNotification). A response carries no method, so
 					// use a fixed "server-response" identifier.
-					recordKillDrop(ctx, p.rec(), deny, p.sessionID, "server-response", "server-response", legStdioServerResponse)
+					recordKillDrop(ctx, p.rec(), deny, verifiedSession(p.sessionID), "server-response", "server-response", legStdioServerResponse)
 				} else {
 					_ = p.upWriter.Write(msg)
 				}
@@ -1070,7 +1070,7 @@ func (p *StdioProxy) forwardHostNotification(ctx context.Context, msg mcp.RPCMsg
 		return false
 	}
 	if deny := p.pdp.CheckKill(ctx, p.sessionID); deny != nil {
-		recordKillDrop(ctx, p.rec(), deny, p.sessionID, msg.Method, msg.Method, legStdioNotification)
+		recordKillDrop(ctx, p.rec(), deny, verifiedSession(p.sessionID), msg.Method, msg.Method, legStdioNotification)
 		return false
 	}
 	// An enforced method (tools/call, resources/read, resources/subscribe,
@@ -1473,7 +1473,7 @@ func (p *StdioProxy) readUpstream(ctx context.Context) {
 			// guard covers a test-assembled proxy that wires no PDP.
 			if p.pdp != nil {
 				if deny := p.pdp.CheckKill(ctx, p.sessionID); deny != nil {
-					recordKillDrop(ctx, p.rec(), deny, p.sessionID, msg.Method, msg.Method, legStdioUpstreamNotification)
+					recordKillDrop(ctx, p.rec(), deny, verifiedSession(p.sessionID), msg.Method, msg.Method, legStdioUpstreamNotification)
 					continue
 				}
 			}

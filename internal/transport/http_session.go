@@ -1028,7 +1028,7 @@ func (s *httpSession) readUpstream(ctx context.Context) {
 					killCtx = pdp.WithJWTClaims(killCtx, s.claims)
 				}
 				if deny := s.route.pdp.CheckKill(killCtx, s.id); deny != nil {
-					recordKillDrop(killCtx, asRecorder(s.route.sink), deny, s.id, msg.Method, msg.Method, legHTTPUpstreamNotification)
+					recordKillDrop(killCtx, asRecorder(s.route.sink), deny, verifiedSession(s.id), msg.Method, msg.Method, legHTTPUpstreamNotification)
 					continue
 				}
 			}

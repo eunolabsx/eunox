@@ -41,6 +41,7 @@ type fwdCapturedRecord struct {
 	labelsOut     []string
 	carriedLabels []string
 	identifier    string
+	sessionID     string
 }
 
 type fwdRecorder struct {
@@ -59,9 +60,9 @@ type fwdRecorder struct {
 	degradeOnRecord bool
 }
 
-func (f *fwdRecorder) RecordAllow(_ context.Context, _, identifier, _ string, details map[string]interface{}, obligs []string, auditOnly bool, labelsOut, carriedLabels []string) {
+func (f *fwdRecorder) RecordAllow(_ context.Context, sessionID, identifier, _ string, details map[string]interface{}, obligs []string, auditOnly bool, labelsOut, carriedLabels []string) {
 	f.records = append(f.records, fwdCapturedRecord{
-		decision: "allow", details: details, obligs: obligs, auditOnly: auditOnly, identifier: identifier, labelsOut: labelsOut, carriedLabels: carriedLabels,
+		decision: "allow", details: details, obligs: obligs, auditOnly: auditOnly, identifier: identifier, labelsOut: labelsOut, carriedLabels: carriedLabels, sessionID: sessionID,
 	})
 	if f.degradeOnRecord {
 		f.degraded = true
@@ -69,9 +70,9 @@ func (f *fwdRecorder) RecordAllow(_ context.Context, _, identifier, _ string, de
 	}
 }
 
-func (f *fwdRecorder) RecordDeny(_ context.Context, _, identifier, _, denialCode, _ string, details map[string]interface{}, observe bool) {
+func (f *fwdRecorder) RecordDeny(_ context.Context, sessionID, identifier, _, denialCode, _ string, details map[string]interface{}, observe bool) {
 	f.records = append(f.records, fwdCapturedRecord{
-		decision: "deny", code: denialCode, details: details, auditOnly: observe, identifier: identifier,
+		decision: "deny", code: denialCode, details: details, auditOnly: observe, identifier: identifier, sessionID: sessionID,
 	})
 	if f.degradeOnRecord {
 		f.degraded = true
@@ -2259,4 +2260,126 @@ func TestEnforcedForward_MaxCallsSlotNotRefundedOnUpstreamFailure(t *testing.T) 
 		"the failed forward must still have consumed the maxCalls slot (no compensating refund)")
 	assert.True(t, strings.HasPrefix(secondResp.Error.Message, capability.ErrCodeRateLimited),
 		"error.message must begin with the symbolic RATE_LIMITED code, got %q", secondResp.Error.Message)
+}
+
+// killDeny is the kill-switch deny decision the kill recorders are handed.
+func killDeny() *capability.EnforceResponse {
+	return &capability.EnforceResponse{
+		Decision: capability.DecisionDeny,
+		Denial:   &capability.DenialInfo{Code: capability.ErrCodeKillSwitch},
+	}
+}
+
+// TestKillSubject_VerifiedVsClaimed pins the whole point of the killSubject type: which
+// field of a kill-switch audit record a session id is allowed to reach. A verified subject
+// (an id this proxy established) populates the structured, signed session_id; a claimed one
+// (the raw Mcp-Session-Id header of a request whose session was never resolved) leaves
+// session_id EMPTY and survives only as the unverified details.claimed_session_id. The two
+// constructors are the only way to build one, so a call site cannot spell "this header is
+// verified" — and the zero value degrades to recording less, never to asserting more.
+func TestKillSubject_VerifiedVsClaimed(t *testing.T) {
+	t.Parallel()
+
+	claimedReq := httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody)
+	claimedReq.Header.Set(SessionHeader, "victim-real-session-id")
+
+	t.Run("verified stamps session_id and adds no claim", func(t *testing.T) {
+		t.Parallel()
+		subj := verifiedSession("sess-1")
+		assert.Equal(t, "sess-1", subj.auditSessionID())
+		assert.Nil(t, subj.auditDetails(nil), "a verified subject invents no details")
+		base := map[string]interface{}{"transport": "http-notification"}
+		assert.Equal(t, base, subj.auditDetails(base),
+			"a verified id belongs in session_id only; it must not be duplicated into details")
+	})
+
+	t.Run("claimed leaves session_id empty", func(t *testing.T) {
+		t.Parallel()
+		subj := claimedSession(claimedReq)
+		assert.Empty(t, subj.auditSessionID(),
+			"an unverified header must never reach the signed session_id field")
+		details := subj.auditDetails(nil)
+		require.NotNil(t, details, "the claimed value must survive for correlation")
+		assert.Equal(t, "victim-real-session-id", details["claimed_session_id"])
+	})
+
+	t.Run("claimed preserves the caller's details", func(t *testing.T) {
+		t.Parallel()
+		details := claimedSession(claimedReq).auditDetails(map[string]interface{}{"transport": "http-notification"})
+		assert.Equal(t, "http-notification", details["transport"],
+			"folding in the claim must not displace the transport leg")
+		assert.Equal(t, "victim-real-session-id", details["claimed_session_id"])
+	})
+
+	t.Run("claimed with no header contributes nothing", func(t *testing.T) {
+		t.Parallel()
+		// The session-creating initialize path takes this shape: no session exists and the
+		// header is absent, so the record is identical to the verified-empty-id one.
+		subj := claimedSession(httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody))
+		assert.Empty(t, subj.auditSessionID())
+		assert.Nil(t, subj.auditDetails(nil), "a missing header must leave no empty key")
+	})
+
+	t.Run("zero value fails safe", func(t *testing.T) {
+		t.Parallel()
+		// A hand-written composite literal bypassing the constructors must degrade toward
+		// recording less, not toward asserting an id as fact.
+		var subj killSubject
+		assert.Empty(t, subj.auditSessionID())
+		assert.Nil(t, subj.auditDetails(nil))
+	})
+}
+
+// TestRecordKillDenial_SubjectRoutesTheSessionID pins that the recorders honour the subject
+// rather than stamping whatever string they were handed: the same denial recorded for a
+// verified and a claimed subject must differ in exactly that one respect. Together with the
+// end-to-end tests over handleSessionPost this covers both halves — the wiring here, the
+// live HTTP path there.
+func TestRecordKillDenial_SubjectRoutesTheSessionID(t *testing.T) {
+	t.Parallel()
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody)
+	req.Header.Set(SessionHeader, "victim-real-session-id")
+
+	verifiedRec := &fwdRecorder{}
+	resp := recordKillDenial(context.Background(), verifiedRec, killDeny(), mcp.RawJSON(`1`), verifiedSession("sess-1"), "tools/call")
+	require.NotNil(t, resp.Error, "the host still gets a structured denial either way")
+	require.Len(t, verifiedRec.records, 1)
+	assert.Equal(t, "sess-1", verifiedRec.records[0].sessionID)
+	assert.Nil(t, verifiedRec.records[0].details)
+
+	claimedRec := &fwdRecorder{}
+	resp = recordKillDenial(context.Background(), claimedRec, killDeny(), mcp.RawJSON(`1`), claimedSession(req), "tools/call")
+	require.NotNil(t, resp.Error)
+	require.Len(t, claimedRec.records, 1)
+	assert.Empty(t, claimedRec.records[0].sessionID,
+		"a claimed id must not be forgeable into the signed session_id field")
+	assert.Equal(t, "victim-real-session-id", claimedRec.records[0].details["claimed_session_id"])
+}
+
+// TestRecordKillDrop_SubjectRoutesTheSessionID is the dropped-message counterpart of
+// TestRecordKillDenial_SubjectRoutesTheSessionID, and additionally pins that folding a
+// claimed id into the details does not cost the transport-leg tag an operator triages by.
+func TestRecordKillDrop_SubjectRoutesTheSessionID(t *testing.T) {
+	t.Parallel()
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody)
+	req.Header.Set(SessionHeader, "victim-real-session-id")
+
+	verifiedRec := &fwdRecorder{}
+	recordKillDrop(context.Background(), verifiedRec, killDeny(), verifiedSession("sess-1"),
+		"notifications/cancelled", "notifications/cancelled", legHTTPNotification)
+	require.Len(t, verifiedRec.records, 1)
+	assert.Equal(t, "sess-1", verifiedRec.records[0].sessionID)
+	assert.Equal(t, string(legHTTPNotification), verifiedRec.records[0].details["transport"])
+	assert.NotContains(t, verifiedRec.records[0].details, "claimed_session_id")
+
+	claimedRec := &fwdRecorder{}
+	recordKillDrop(context.Background(), claimedRec, killDeny(), claimedSession(req),
+		"notifications/cancelled", "notifications/cancelled", legHTTPNotification)
+	require.Len(t, claimedRec.records, 1)
+	assert.Empty(t, claimedRec.records[0].sessionID,
+		"a claimed id must not be forgeable into the signed session_id field")
+	assert.Equal(t, string(legHTTPNotification), claimedRec.records[0].details["transport"])
+	assert.Equal(t, "victim-real-session-id", claimedRec.records[0].details["claimed_session_id"])
 }
