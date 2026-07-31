@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/eunolabs/eunox/pkg/durationsentinel"
 )
 
 const (
@@ -54,14 +56,7 @@ const (
 // re-derived it (a startup banner, a CLI comparing its flag against the published
 // value) could state one lifetime while Redis enforced another.
 func NormalizeSessionKillTTL(flagValue time.Duration) time.Duration {
-	switch {
-	case flagValue < 0:
-		return 0 // explicit opt-out: never expire
-	case flagValue == 0:
-		return defaultSessionKillTTL
-	default:
-		return flagValue
-	}
+	return durationsentinel.Resolve(flagValue, defaultSessionKillTTL)
 }
 
 // SessionKillTTL returns the EFFECTIVE session-kill tombstone lifetime this manager
