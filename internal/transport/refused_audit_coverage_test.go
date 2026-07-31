@@ -521,3 +521,91 @@ func TestUnsupportedMediaType_IsNonPolicyCode(t *testing.T) {
 		t.Errorf("%s names no policy target, so it must be classified as an infra denial", codeUnsupportedMediaType)
 	}
 }
+
+// TestDecodeStrictJSON_RecordsMalformedBody pins the eunox #74 follow-on: the two 400
+// legs of decodeStrictJSON (malformed JSON, a trailing token after the JSON value) land
+// on the tamper-evident tape under INVALID_REQUEST, the same way the sibling 415 already
+// does — a malformed body on the same shared decode path must not be the one refusal
+// that leaves no trace. Covers both call sites (the /mcp body and the /control/kill
+// body) since they share this one function.
+func TestDecodeStrictJSON_RecordsMalformedBody(t *testing.T) {
+	cases := []struct {
+		name   string
+		path   string
+		body   string
+		method string
+		setup  func(*httpProxyOptions)
+		header func(*http.Request)
+		reason string
+	}{
+		{
+			name:   "mcp malformed json",
+			path:   "/mcp",
+			body:   `{"jsonrpc":"2.0`,
+			reason: "malformed_json",
+		},
+		{
+			name:   "mcp trailing data",
+			path:   "/mcp",
+			body:   `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}{"all":true}`,
+			reason: "trailing_data",
+		},
+		{
+			name:   "control/kill malformed json",
+			path:   "/control/kill",
+			body:   `not json`,
+			reason: "malformed_json",
+			header: func(r *http.Request) { r.Header.Set(ControlTokenHeader, testControlToken) },
+		},
+		{
+			name:   "control/kill trailing data",
+			path:   "/control/kill",
+			body:   `{"all":true}{"all":false}`,
+			reason: "trailing_data",
+			header: func(r *http.Request) { r.Header.Set(ControlTokenHeader, testControlToken) },
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			sink, logPath := newTempAuditSink(t)
+			proxy := newHTTPProxy(httpProxyOptions{
+				PDP:          pdp.AlwaysAllowPDP{},
+				UpstreamURL:  "http://upstream.invalid",
+				ControlToken: testControlToken,
+				Sink:         sink,
+			})
+
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", CTJSON)
+			req.RemoteAddr = "127.0.0.1:9999"
+			req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
+			if tc.header != nil {
+				tc.header(req)
+			}
+			rec := httptest.NewRecorder()
+			switch tc.path {
+			case "/mcp":
+				proxy.handleMCPPost(rec, req, proxy.routes[""])
+			case "/control/kill":
+				proxy.handleKill(rec, req)
+			}
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body: %s", rec.Code, rec.Body.String())
+			}
+
+			_ = sink.Close()
+			records := readAuditRecords(t, logPath)
+			found := findAuditRecordByCode(records, codeInvalidRequest)
+			if found == nil {
+				t.Fatalf("expected an %s audit record for the malformed body; got %d records", codeInvalidRequest, len(records))
+			}
+			details, _ := found["details"].(map[string]interface{})
+			if got, _ := details["reason"].(string); got != tc.reason {
+				t.Errorf("details.reason = %q, want %q", got, tc.reason)
+			}
+			// Neither the raw body nor the presented control token may reach the tape.
+			assertRecordsExclude(t, records, tc.body, testControlToken)
+		})
+	}
+}
