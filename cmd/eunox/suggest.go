@@ -326,7 +326,7 @@ func mineArgs(t *observedTarget, details map[string]interface{}, auditOnly bool,
 		// always-present-but-truncated argument as optional.
 		a.calls++
 
-		if s, ok := raw.(string); ok && audit.IsOverCapValuePlaceholder(s) {
+		if s, ok := raw.(string); ok && (audit.IsOverCapValuePlaceholder(s) || enforcement.IsDenialDetailElided(s) || enforcement.IsDenialDetailSliceElided(s)) {
 			// Just this value was replaced (not the whole map). The real value is
 			// lost: mining the placeholder would trip the glob-metacharacter note
 			// instead of the honest truncation note. Flag only the per-argument
@@ -334,11 +334,18 @@ func mineArgs(t *observedTarget, details map[string]interface{}, auditOnly bool,
 			// (presence already counted) so writeTargetEntry emits an
 			// argument-specific note rather than the generic whole-tool NOTE.
 			//
-			// Detect via the audit layer's own matcher (audit.IsOverCapValuePlaceholder),
-			// which matches the placeholder's FULL structured form. A genuine argument
-			// value that merely begins with "[eunox: omitted " is therefore mined as the
-			// real value it is, not misread as truncated — so a legitimate value is never
-			// suppressed from the allowedValues draft by a prefix collision.
+			// Detect via each producer's own matcher — audit.IsOverCapValuePlaceholder
+			// for the sink's per-value truncation, enforcement.IsDenialDetailElided/
+			// IsDenialDetailSliceElided for pkg/enforcement's denial-details bound — each
+			// matching its placeholder's FULL structured form. A genuine argument value
+			// that merely begins with "[eunox: omitted " or "[eunox: elided" is therefore
+			// mined as the real value it is, not misread as truncated — so a legitimate
+			// value is never suppressed from the allowedValues draft by a prefix
+			// collision. The enforcement-layer markers are a defense-in-depth match:
+			// mineArgs is reached only from an allow record's details today (a deny
+			// record's, where these markers actually originate, is never mined at all —
+			// see computeSuggestions), but recognizing them here means a future change to
+			// what gets mined cannot silently propose an unsent placeholder value.
 			a.truncated = true
 			continue
 		}

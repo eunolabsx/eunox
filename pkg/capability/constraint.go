@@ -407,21 +407,42 @@ func (a *ArgumentSchema) UnmarshalJSON(data []byte) error {
 		Maximum json.Number `json:"maximum,omitempty"`
 		*alias
 	}{alias: (*alias)(a)}
-	// Reject unknown keys, as Constraint.UnmarshalJSON and unmarshalCondition do. A
-	// misspelled keyword here is the same silent widening: {"type":"string","maxLen":8}
-	// decodes with MaxLength nil and validates length not at all, so the argument
-	// constraint the author wrote is simply absent. The check runs against the alias
-	// (ArgumentSchema's own field set); the shadowing json.Number Minimum/Maximum carry
-	// the same names, so they need no exemption. It recurses for free — every nested
-	// properties/items value decodes through this same method.
-	if err := rejectUnknownJSONFields(data, alias{}, "argumentSchema"); err != nil {
-		return err
-	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	// UseNumber so enum literals above 2^53 stay json.Number here too, matching the
 	// Constraint decoder that would otherwise have provided it.
 	dec.UseNumber()
+	// Reject unknown keys, as Constraint.UnmarshalJSON and unmarshalCondition do. A
+	// misspelled keyword here is the same silent widening: {"type":"string","maxLen":8}
+	// decodes with MaxLength nil and validates length not at all, so the argument
+	// constraint the author wrote is simply absent.
+	//
+	// Unlike those two, this uses dec.DisallowUnknownFields() on THIS decode rather
+	// than the shared rejectUnknownJSONFields(data, alias{}, ...) helper every other
+	// UnmarshalJSON in this package calls. That helper decodes data into
+	// map[string]json.RawMessage first to enumerate keys — a second full scan of the
+	// same bytes, since encoding/json must walk every byte to find each value's span
+	// even though it only copies rather than parses them. Constraint.UnmarshalJSON and
+	// unmarshalCondition each decode a flat, non-recursive struct, so that extra scan
+	// costs them once. THIS method recurses into every nested properties/items
+	// ArgumentSchema value — each such value's own UnmarshalJSON call runs this same
+	// code again — and because each level's captured "data" spans its own full
+	// (shrinking) subtree, paying the extra scan at every level compounds with nesting
+	// depth into an O(depth^2) cost that internal/config imposes no ceiling on (no
+	// manifest-size or schema-depth cap). Folding the check into dec's own pass via
+	// DisallowUnknownFields keeps the identical field-set semantics (Go's decoder
+	// already resolves a key case-insensitively before deciding it is unknown, matching
+	// jsonFieldNames' lowercased comparison) at no extra scanning cost: measured on a
+	// depth-400/16.8KB chain-nested schema, this single-pass form costs the same
+	// ~41ms as a plain dec.Decode with no unknown-field check at all, versus ~89ms for
+	// the two-pass form.
+	dec.DisallowUnknownFields()
 	if err := dec.Decode(&aux); err != nil {
+		// Reformat encoding/json's own `json: unknown field "x"` into this package's
+		// established "<context>: unknown field %q" wording, matching what
+		// rejectUnknownJSONFields would have reported for the same input.
+		if field, ok := strings.CutPrefix(err.Error(), "json: unknown field "); ok {
+			return fmt.Errorf("argumentSchema: unknown field %s", field)
+		}
 		return err
 	}
 	lower, err := exactFloatBound(aux.Minimum)

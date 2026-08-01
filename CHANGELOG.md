@@ -402,6 +402,21 @@ Section conventions:
   matching the audit-path resolver. Config still wins.
 - `~` expansion accepts the native `~\...` spelling on Windows (the separator test
   is `os.IsPathSeparator`, not a literal `/`), which was previously refused.
+- **Perf, no behavior change.** The JWKS cache no longer copies its key set on a
+  `GetKeys` cache hit or the negative-kid suppressed arm (`ForceRefreshForKID` /
+  `ForceRefreshForVerify`) when reached from the in-tree token verifier: it
+  immediately narrows the result through `FindKeys`, which already returns its own
+  independent slice, so the whole-set copy was transient garbage on a pre-auth path —
+  up to ~14.4 KB per token at the 100-key cap. The exported cache methods still copy
+  for every other caller, whose contract still promises an independent set. Route
+  provenance (`upstream`/`policy_version`/`policy_sha256`) is now length-bounded and
+  UTF-8-normalized once, when a route (or the stdio proxy's single-route equivalent)
+  is constructed, rather than on every audit record — these three are fixed for the
+  route's lifetime, so the per-record re-bound was ~100-150 ns of pure waste. And the
+  recursive `argumentSchema` unknown-field check folds its check into the same decode
+  pass instead of a second full byte-scan at every nesting level, closing an O(depth²)
+  manifest-load cost (internal/config imposes no depth or size cap): unmeasurable at a
+  realistic depth-3 manifest, but ~89ms -> ~41ms on a synthetic depth-400/16.8KB one.
 
 ### Removed
 
@@ -688,6 +703,30 @@ Section conventions:
   chain-resume line: the tail is read once, through the already-held append handle,
   under the exclusive audit lock. The second open was the transient-failure mode the
   first was rewritten to eliminate.
+- **The per-category refusal-record budget raised the unauthenticated audit-write
+  ceiling ~8x.** Splitting the pre-session bucket by refusal category (see Security,
+  above) gave every category the FULL pre-split rate/burst instead of a share of it,
+  so the sustained ceiling an unauthenticated caller could drive rose from 20/s
+  (burst 50) to as much as ~160/s (burst ~400) with no measurement behind the new
+  number — the same aggregate the bound was introduced to hold. Categories now
+  divide one aggregate budget instead of each replicating it, restoring the original
+  ceiling while keeping the no-cross-category-suppression property the split exists
+  for. See `docs/threat-model-mcp.md` §3.7.
+- **An encoded NUL (`%00`) riding alongside some other malformed `%` escape in a
+  path-confinement value produced one of two different denial messages depending on
+  what else in the value failed to decode**, splitting one smuggling attempt's
+  taxonomy in two for an operator or SIEM rule watching for the NUL-truncation
+  denial specifically. The decoder that already arbitrates NUL-vs-malformed-escape
+  precedence now owns both spellings of NUL (literal and encoded), so the two
+  lenient-fallback call sites that used to each carry their own encoded-NUL check no
+  longer need to.
+- **A startup-watchdog-killed HTTP session could hang indefinitely instead of
+  failing closed.** The three other bounded-wait-after-kill sites (stdio's host-EOF
+  drain and startup watchdog, the HTTP session's `close`) each bound their post-kill
+  wait independently, so a descendant that escaped its process group could not hang
+  them past that bound — but the HTTP session's own startup watchdog (`initUpstream`)
+  was never given the same bound, so the identical escaped-descendant case could hang
+  session establishment forever. All four now share one helper.
 
 ### Security
 

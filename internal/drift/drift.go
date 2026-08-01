@@ -744,33 +744,35 @@ func anyToolMatches(resource string, tools []UpstreamTool) bool {
 // Exported for the validate --live COVERED report, which needs the covering
 // constraint for a clean tool (CheckManifestDrift surfaces no warning for one).
 func BestManifestConstraint(manifest *config.LocalManifest, toolName string) *capability.Constraint {
-	// coveringConstraints returns every REACHABLE match, which since the principal-scope
-	// fix can span more than one specificity tier — so narrow to the top tier here
-	// rather than assuming the caller did it. Prefer a descriptionHash-pinned member on
-	// a tie purely for what the REPORT displays: the sole caller is validate --live's
-	// COVERED line, which uses the result only for its Target string, and naming the
-	// pinned entry is the more informative answer when several equally-specific
-	// constraints cover the tool. Nothing enforcement-relevant rides on this pick —
-	// CheckManifestDrift runs the FM-5 hash verification for EVERY covering constraint,
-	// not just the one chosen here, so a pin cannot be skipped by tie-breaking the other
-	// way.
-	covering := coveringConstraints(manifest, toolName)
-	if len(covering) == 0 {
+	// coveringMatches returns every REACHABLE match with its score already computed,
+	// which since the principal-scope fix can span more than one specificity tier — so
+	// narrow to the top tier here rather than assuming the caller did it, and read the
+	// score off the match instead of re-running resSpecificity for the same
+	// (constraint, tool) pair coveringMatches already scored. Prefer a
+	// descriptionHash-pinned member on a tie purely for what the REPORT displays: the
+	// sole caller is validate --live's COVERED line, which uses the result only for its
+	// Target string, and naming the pinned entry is the more informative answer when
+	// several equally-specific constraints cover the tool. Nothing enforcement-relevant
+	// rides on this pick — CheckManifestDrift runs the FM-5 hash verification for EVERY
+	// covering constraint, not just the one chosen here, so a pin cannot be skipped by
+	// tie-breaking the other way.
+	matches := coveringMatches(manifest, toolName)
+	if len(matches) == 0 {
 		return nil
 	}
 	// Seeded from the first candidate rather than a sentinel, so `top` is non-empty for
 	// ANY scoring resSpecificity could return. A sentinel seed made the non-empty
 	// precondition of the top[0] below depend on every future score staying above it —
 	// an unguarded index resting on a property nothing states.
-	top := []*capability.Constraint{covering[0]}
-	best := resSpecificity(covering[0].Target, toolName)
-	for _, c := range covering[1:] {
-		switch s := resSpecificity(c.Target, toolName); {
-		case s > best:
-			best = s
-			top = append(top[:0], c)
-		case s == best:
-			top = append(top, c)
+	top := []*capability.Constraint{matches[0].c}
+	best := matches[0].score
+	for _, m := range matches[1:] {
+		switch {
+		case m.score > best:
+			best = m.score
+			top = append(top[:0], m.c)
+		case m.score == best:
+			top = append(top, m.c)
 		}
 	}
 	for _, c := range top {
@@ -781,18 +783,45 @@ func BestManifestConstraint(manifest *config.LocalManifest, toolName string) *ca
 	return top[0]
 }
 
+// coveringMatch pairs a covering constraint with its already-computed resSpecificity
+// score against the tool, so coveringMatches' one scan feeds both coveringConstraints
+// (which needs only the constraints) and BestManifestConstraint (which needs the
+// scores too, to find the top tier) without either recomputing resSpecificity for a
+// pair the other already scored.
+type coveringMatch struct {
+	c     *capability.Constraint
+	score int
+}
+
 // coveringConstraints returns every tool: constraint matching toolName that some
 // caller can actually be governed by — the set whose drift must be checked. FM-3 uses
 // it (rather than a single best pick) so a pinned-argument drift on any reachable
 // variant is caught, and FM-1/FM-2/FM-6 are fatal under strict drift, so a reachable
 // entry left out of this set is a strict deployment believing it verified drift it did
-// not. Returns nil when nothing matches.
+// not. Returns nil when nothing matches. A one-line projection over coveringMatches,
+// which owns the reachability computation.
+func coveringConstraints(manifest *config.LocalManifest, toolName string) []*capability.Constraint {
+	matches := coveringMatches(manifest, toolName)
+	if len(matches) == 0 {
+		return nil
+	}
+	out := make([]*capability.Constraint, len(matches))
+	for i, m := range matches {
+		out[i] = m.c
+	}
+	return out
+}
+
+// coveringMatches computes the reachable set behind coveringConstraints, and hands
+// back each entry's score alongside it so BestManifestConstraint's top-tier scan
+// reads scores that already exist instead of re-deriving them.
 //
 // Reachability is NOT "maximum specificity", because the engine filters by principal
 // BEFORE it scores (FindMatchingCapability skips a principal-scoped constraint whose
-// claims do not match, exactly like a target mismatch). A more-specific entry
-// therefore shadows a less-specific one only when it applies to every caller — that
-// is, only when it is UNSCOPED. Given
+// claims do not match, exactly like a target mismatch; see enforcement.ConstraintScorer
+// for the shared precedence rule this mirrors on the reachability question). A
+// more-specific entry therefore shadows a less-specific one only when it applies to
+// every caller — that is, only when it is UNSCOPED. Given
 //
 //	tool:read_file  {principal: {sub: [alice]}}   (exact, scoped)
 //	tool:read_*                                   (glob, unscoped)
@@ -803,18 +832,14 @@ func BestManifestConstraint(manifest *config.LocalManifest, toolName string) *ca
 // So the cutoff is the highest specificity among the UNSCOPED matches: anything below
 // it is shadowed for every caller and genuinely unreachable, and everything at or
 // above it is reachable for some caller. With no unscoped match at all nothing
-// universally shadows anything, so every match is kept. Over-inclusion here costs at
-// most an extra warning about an entry that turns out to be unreachable; under-
-// inclusion silently skips a fatal check.
-func coveringConstraints(manifest *config.LocalManifest, toolName string) []*capability.Constraint {
-	type match struct {
-		c     *capability.Constraint
-		score int
-	}
-	var matches []match
-	// Sentinel below every real specificity score, so "no unscoped match" keeps
-	// everything rather than filtering against an unset cutoff.
-	cutoff := -(1 << 30)
+// universally shadows anything, so every match is kept — hence the cutoff seeds from
+// enforcement.NoMatchScore, the same sentinel ConstraintScorer seeds a fresh scan
+// with, rather than a separately hand-derived one. Over-inclusion here costs at most
+// an extra warning about an entry that turns out to be unreachable; under-inclusion
+// silently skips a fatal check.
+func coveringMatches(manifest *config.LocalManifest, toolName string) []coveringMatch {
+	var matches []coveringMatch
+	cutoff := enforcement.NoMatchScore
 	for i := range manifest.Capabilities {
 		c := &manifest.Capabilities[i]
 		if targetType, _, err := capability.ParseTarget(c.Target); err != nil || targetType != capability.TargetTypeTool {
@@ -824,15 +849,15 @@ func coveringConstraints(manifest *config.LocalManifest, toolName string) []*cap
 			continue
 		}
 		s := resSpecificity(c.Target, toolName)
-		matches = append(matches, match{c: c, score: s})
+		matches = append(matches, coveringMatch{c: c, score: s})
 		if !c.HasPrincipal() && s > cutoff {
 			cutoff = s
 		}
 	}
-	var out []*capability.Constraint
+	var out []coveringMatch
 	for _, m := range matches {
 		if m.score >= cutoff {
-			out = append(out, m.c)
+			out = append(out, m)
 		}
 	}
 	return out

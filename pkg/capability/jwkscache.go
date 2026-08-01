@@ -227,17 +227,40 @@ func (c *JWKSCache) freshAt(now time.Time) bool {
 // The copy is one level deep: each jose.JSONWebKey still carries a Key interface{}
 // pointing at the same underlying *rsa.PublicKey / *ecdsa.PublicKey, so the KEYS
 // THEMSELVES remain read-only. Mutating one would corrupt the root-of-trust material
-// seen by every concurrent token validation. FindKeys has the same bound and is how the
-// production consumer (VerifyWithKeyRotation) selects by kid.
+// seen by every concurrent token validation. FindKeys has the same bound.
+//
+// The production consumer (VerifyWithKeyRotation) does not call this: it uses
+// getKeysLive, the uncopied core below, since it narrows the result through FindKeys
+// immediately, which already returns its own fresh slice — see getKeysLive's doc.
 func (c *JWKSCache) GetKeys(ctx context.Context) (*jose.JSONWebKeySet, error) {
+	keys, err := c.getKeysLive(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return copyKeySet(keys), nil
+}
+
+// getKeysLive is GetKeys' uncopied core: it returns the cache's live
+// *jose.JSONWebKeySet (or a fresh one just fetched), never a copy.
+//
+// Unexported, and reached only from VerifyWithKeyRotation, which immediately narrows
+// whatever this returns through FindKeys — itself always allocating a fresh slice
+// independent of the cache — so copyKeySet's whole-set copy on this path is pure
+// transient garbage: measured at up to ~14.4 KB per call at maxJWKSKeys keys, paid on
+// every token verification including the common cache-hit case. GetKeys wraps this
+// with copyKeySet for every other caller (out-of-package, or any future in-package one
+// that does not immediately narrow the result the way FindKeys does), whose contract
+// still promises an independent set.
+func (c *JWKSCache) getKeysLive(ctx context.Context) (*jose.JSONWebKeySet, error) {
 	c.mu.RLock()
 	if c.freshAt(c.now()) {
 		keys := c.jwks
 		c.mu.RUnlock()
-		return copyKeySet(keys), nil
+		return keys, nil
 	}
 	c.mu.RUnlock()
-	return c.Refresh(ctx)
+	keys, _, err := c.refresh(ctx, false)
+	return keys, err
 }
 
 // copyKeySet returns a set whose Keys SLICE is independent of the cached one, so a
@@ -294,25 +317,39 @@ func (c *JWKSCache) Refresh(ctx context.Context) (*jose.JSONWebKeySet, error) {
 // never denies purely for lack of a cached copy.
 //
 // The returned set's Keys slice is independent of the cache's (see copyKeySet), like
-// Refresh's and GetKeys'. Both of this function's returns pass through it: the
-// suppressed arm handed back the live cached pointer, and the fetched arm handed back
-// refresh's own reference to it, so a caller appending to or reordering the result
-// mutated the set concurrent verifications read — re-opening the aliasing hole
-// copyKeySet exists to close, on the two paths a caller reaches during a key rotation.
+// Refresh's and GetKeys'. copyKeySet wraps forceRefreshForKIDLive, the uncopied core,
+// on both the suppressed and fetched arm — see that method's doc for why the copy is
+// skipped there.
 func (c *JWKSCache) ForceRefreshForKID(ctx context.Context, kid string) (*jose.JSONWebKeySet, error) {
+	keys, err := c.forceRefreshForKIDLive(ctx, kid)
+	if err != nil {
+		return nil, err
+	}
+	return copyKeySet(keys), nil
+}
+
+// forceRefreshForKIDLive is ForceRefreshForKID's uncopied core: like getKeysLive, it
+// returns the cache's live *jose.JSONWebKeySet on both the suppressed arm (the cached
+// pointer) and the fetched arm (refresh's own reference), never a copy. Unexported and
+// reached only from VerifyWithKeyRotation, which immediately narrows whatever this
+// returns through FindKeys — always a fresh, independent slice — so ForceRefreshForKID's
+// copy would be pure allocation on a pre-auth path a flood of distinct unknown-kid
+// tokens can drive at will (up to ~14.4 KB per token at maxJWKSKeys keys, on the
+// suppressed arm that exists specifically to cost nothing beyond a map probe).
+func (c *JWKSCache) forceRefreshForKIDLive(ctx context.Context, kid string) (*jose.JSONWebKeySet, error) {
 	if kid == "" {
 		// A kid-less lookup is not an unknown-kid lookup. The suppression block below
 		// is gated on kid != "", so routing it here would skip the rate-limit and let
 		// a flood of kid-less tokens hammer the endpoint. Delegate to the rate-limited
 		// kid-less path.
-		return c.ForceRefreshForVerify(ctx)
+		return c.forceRefreshForVerifyLive(ctx)
 	}
 	if c.kidRecentlyAbsent(kid) || c.kidRecentlyAbsent(sharedRefreshSentinel) {
 		c.mu.RLock()
 		cached := c.jwks
 		c.mu.RUnlock()
 		if cached != nil {
-			return copyKeySet(cached), nil
+			return cached, nil
 		}
 	}
 	// changed reports whether THIS fetch altered the key set, computed atomically
@@ -332,7 +369,7 @@ func (c *JWKSCache) ForceRefreshForKID(ctx context.Context, kid string) (*jose.J
 			c.markKIDAbsent(sharedRefreshSentinel)
 		}
 	}
-	return copyKeySet(keys), nil
+	return keys, nil
 }
 
 // sharedRefreshSentinel is the negKIDs key for a SHARED forced-refresh budget
@@ -355,14 +392,29 @@ const sharedRefreshSentinel = ""
 // suppressed.
 //
 // The returned set's Keys slice is independent of the cache's (see copyKeySet), on
-// both the suppressed and the fetched path, for the same reason as ForceRefreshForKID.
+// both the suppressed and the fetched path. copyKeySet wraps forceRefreshForVerifyLive,
+// the uncopied core — see that method's doc, and forceRefreshForKIDLive's, for why the
+// copy is skipped there.
 func (c *JWKSCache) ForceRefreshForVerify(ctx context.Context) (*jose.JSONWebKeySet, error) {
+	keys, err := c.forceRefreshForVerifyLive(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return copyKeySet(keys), nil
+}
+
+// forceRefreshForVerifyLive is ForceRefreshForVerify's uncopied core, unexported and
+// reached only from VerifyWithKeyRotation for the same reason as
+// forceRefreshForKIDLive: the caller immediately narrows the result through FindKeys,
+// which always allocates its own fresh slice, so copying here first is wasted work on
+// a pre-auth path a flood of bad-signature kid-less tokens can drive.
+func (c *JWKSCache) forceRefreshForVerifyLive(ctx context.Context) (*jose.JSONWebKeySet, error) {
 	if c.kidRecentlyAbsent(sharedRefreshSentinel) {
 		c.mu.RLock()
 		cached := c.jwks
 		c.mu.RUnlock()
 		if cached != nil {
-			return copyKeySet(cached), nil
+			return cached, nil
 		}
 	}
 	// refresh reports whether this fetch changed the set atomically inside the
@@ -380,7 +432,7 @@ func (c *JWKSCache) ForceRefreshForVerify(ctx context.Context) (*jose.JSONWebKey
 	if !changed {
 		c.markKIDAbsent(sharedRefreshSentinel)
 	}
-	return copyKeySet(keys), nil
+	return keys, nil
 }
 
 // jwksKeysUnchanged reports whether two key sets hold the same keys by RFC 7638

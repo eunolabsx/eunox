@@ -683,17 +683,19 @@ func (e *Engine) handleAllowedExtensions(_ context.Context, cond capability.Cond
 				},
 			}
 		case errors.Is(decodeErr, errPathMalformedEscape):
-			// A valid encoded NUL or separator riding alongside the bad escape must still
-			// deny. PathUnescape failed on the WHOLE value, so neither token was decoded
-			// and the errPathNUL arm above never saw the %00 — matching the literal form
-			// treats "evil.exe%00x%zz.csv" as a permitted ".csv" file while a
-			// NUL-truncating upstream opens "evil.exe". confineSlashlessPattern applies
-			// the identical pair of guards on its own lenient fallback.
-			if containsEncodedNUL(filePath) || containsEncodedSeparator(filePath) {
+			// A valid encoded separator riding alongside the bad escape must still deny.
+			// PathUnescape failed on the WHOLE value, so the token was never decoded —
+			// matching the literal form treats "evil.exe%2f..%2fx.csv" as a permitted
+			// ".csv" file while a lenient upstream resolves the separator into a
+			// directory component. (An encoded NUL riding alongside the bad escape
+			// already took the errPathNUL arm above, inside decodePathForConfinement, so
+			// it cannot reach here.) confineSlashlessPattern applies the identical guard
+			// on its own lenient fallback.
+			if containsEncodedSeparator(filePath) {
 				return &ConditionError{
 					Code:          capability.ErrCodeConditionFailed,
 					ConditionType: capability.ConditionTypeAllowedExtensions,
-					Message:       "file path contains an undecodable percent-escape alongside an encoded NUL or path separator",
+					Message:       "file path contains an undecodable percent-escape alongside an encoded path separator",
 					Details: map[string]interface{}{
 						"filePath":          filePath,
 						"allowedExtensions": ae.Extensions,

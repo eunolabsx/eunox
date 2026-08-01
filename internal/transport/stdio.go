@@ -298,7 +298,15 @@ func NewStdioProxy(opts StdioProxyOptions) *StdioProxy {
 func (p *StdioProxy) rec() auditRecorder {
 	p.recOnce.Do(func() {
 		if p.sink != nil {
-			p.recCached = &routeSink{sink: p.sink, policyVersion: p.policyVersion, policySHA256: p.policySHA256}
+			// Bound once here, matching BuildRoutes' gateway routeSink construction:
+			// policyVersion/policySHA256 are fixed for the process's lifetime, so
+			// per-record re-bounding (as Sink.Record used to do) was pure per-request
+			// waste. See audit.BoundEnvelopeField's doc.
+			p.recCached = &routeSink{
+				sink:          p.sink,
+				policyVersion: audit.BoundEnvelopeField(p.policyVersion),
+				policySHA256:  audit.BoundEnvelopeField(p.policySHA256),
+			}
 		}
 	})
 	return p.recCached
@@ -541,9 +549,7 @@ func (p *StdioProxy) killUpstream() {
 		p.upHTTP.close()
 		return
 	}
-	if p.upCmd != nil {
-		killUpstreamProcess(p.upCmd.Process)
-	}
+	killUpstreamCmd(p.upCmd)
 }
 
 // signalUpstream begins a graceful upstream shutdown in response to sig: a
@@ -592,11 +598,7 @@ func (p *StdioProxy) awaitUpstreamDrain() {
 		// flushes its audit sink — the opposite of what this bounded teardown exists
 		// for. The subprocess is already killed; abandoning the wait leaves only the
 		// reader goroutine, which drains and exits on its own if the pipe ever closes.
-		select {
-		case <-p.upstreamDone:
-		case <-time.After(p.killDelay()):
-			fmt.Fprintf(os.Stderr, "[eunox] Upstream output stream still open after SIGKILL (a descendant may have escaped the process group); abandoning the drain and continuing shutdown.\n")
-		}
+		waitBounded(p.upstreamDone, p.killDelay(), "upstream output stream")
 	}
 }
 
@@ -688,11 +690,7 @@ func (p *StdioProxy) runBoundedStartup(ctx context.Context, fn func() error) err
 		// that pipe open indefinitely, and an unbounded wait here would hang the very
 		// startup watchdog whose whole job is to bound a wedged upstream. Mirrors
 		// awaitUpstreamDrain's second bound.
-		select {
-		case <-done:
-		case <-time.After(p.killDelay()):
-			fmt.Fprintf(os.Stderr, "[eunox] Upstream output stream still open after the startup watchdog SIGKILL (a descendant may have escaped the process group); abandoning the wait.\n")
-		}
+		waitBounded(done, p.killDelay(), "upstream startup output stream")
 		return fmt.Errorf("upstream did not complete startup within %s: %w", timeout, startCtx.Err())
 	}
 }

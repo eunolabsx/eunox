@@ -4,10 +4,12 @@
 package transport
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"slices"
 	"strings"
+	"time"
 )
 
 // sensitiveUpstreamEnvPrefixes are the eunox-owned environment variables that must
@@ -149,6 +151,44 @@ func signalUpstreamProcess(proc *os.Process, sig os.Signal) {
 		return
 	}
 	signalUpstreamGroup(proc, sig)
+}
+
+// killUpstreamCmd force-kills cmd's process, tolerating cmd == nil (a remote-HTTP
+// session, or one torn down before its subprocess started, has no *exec.Cmd at
+// all). killUpstreamProcess's own nil guard is on *os.Process, one field access
+// too late to help here: cmd.Process on a nil *exec.Cmd panics before that guard
+// ever runs. Every stdio/HTTP teardown site that kills a session's subprocess goes
+// through this rather than hand-repeating "if cmd != nil { killUpstreamProcess(cmd.Process) }",
+// so a future addition to the guard (a log line, a metric) lands at every call site
+// at once instead of in however many of them got updated.
+func killUpstreamCmd(cmd *exec.Cmd) {
+	if cmd != nil {
+		killUpstreamProcess(cmd.Process)
+	}
+}
+
+// waitBounded blocks until ch fires or d elapses, reporting whether ch fired first.
+// On timeout it logs a stderr notice naming what (a short noun phrase, e.g.
+// "upstream output stream") it was waiting for, so an operator sees why teardown
+// gave up rather than the session silently hanging. It is the bounded post-kill
+// wait every teardown path needs: a subprocess has just been force-killed, and the
+// caller is waiting for that to unblock a pipe read (readUpstream's EOF) or a
+// handshake goroutine (runInitHandshake) — but a descendant that escaped the
+// process group (a double-fork, an explicit setsid, or a platform with no
+// process-group teardown at all) can hold that pipe open indefinitely, and an
+// unbounded wait here would turn a BOUNDED teardown into an unbounded one,
+// defeating the reason the caller bounded it in the first place. The caller is
+// expected to give up and continue teardown regardless of the return value; ch's
+// underlying goroutine (if any) is left to drain and exit on its own once the pipe
+// it is blocked on eventually closes.
+func waitBounded[T any](ch <-chan T, d time.Duration, what string) bool {
+	select {
+	case <-ch:
+		return true
+	case <-time.After(d):
+		fmt.Fprintf(os.Stderr, "[eunox] %s still open after a forced kill (a descendant may have escaped the process group); abandoning the wait.\n", what)
+		return false
+	}
 }
 
 // upstreamEnv returns the current process environment with every eunox-owned secret

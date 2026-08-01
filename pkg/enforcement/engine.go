@@ -1191,8 +1191,12 @@ func resolveRequestTarget(req *capability.EnforceRequest) (reqType, bareName str
 	return reqType, bareName
 }
 
-// noMatchScore is the sentinel for "no matching capability found yet".
-const noMatchScore = -1 << 30
+// NoMatchScore is the sentinel for "no matching capability found yet" — below
+// any real resSpecificity/ResourceSpecificity score. Exported so a caller that
+// needs the same "nothing has matched" floor for its own scan (internal/drift's
+// coveringMatches, computing the unscoped-match cutoff) uses this value rather
+// than re-deriving its own sentinel literal.
+const NoMatchScore = -1 << 30
 
 // ConstraintScorer tracks the best-scoring constraint index seen so far under the
 // project's single constraint-selection tiebreak. Selection order, most to least
@@ -1220,7 +1224,7 @@ type ConstraintScorer struct {
 
 // NewConstraintScorer returns a scorer with no candidate yet (Best() == -1).
 func NewConstraintScorer() ConstraintScorer {
-	return ConstraintScorer{best: -1, bestScore: noMatchScore}
+	return ConstraintScorer{best: -1, bestScore: NoMatchScore}
 }
 
 // Offer submits candidate index i with the given specificity score and whether it is

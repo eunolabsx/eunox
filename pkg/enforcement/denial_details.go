@@ -9,9 +9,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"regexp"
 	"sort"
-	"strings"
-	"unicode/utf8"
+
+	"github.com/eunolabs/eunox/pkg/capability"
 )
 
 // A condition denial's Details map is the one place caller-controlled bytes cross
@@ -81,13 +82,13 @@ const denialDetailContainerCost = 8
 // is rather than passing through free.
 const denialDetailScalarCost = 8
 
-// denialDetailElided replaces a value dropped for exceeding the byte budget or
+// DenialDetailElided replaces a value dropped for exceeding the byte budget or
 // maxDenialDetailDepth. A marker rather than an omitted key: a reader must be able to
 // tell "this handler recorded nothing here" from "this was recorded and then cut",
 // and a SIEM rule can match the marker to spot a caller probing the bound.
-const denialDetailElided = "[eunox: elided]"
+const DenialDetailElided = "[eunox: elided]"
 
-// denialDetailElidedKey names the marker entry boundDetailMap adds when a key's share
+// DenialDetailElidedKey names the marker entry boundDetailMap adds when a key's share
 // ran out partway through an object. The underscore prefix follows the audit package's
 // reserved-key convention — but the convention alone is not a guarantee, because a
 // caller-supplied argument key is just a string and nothing rejects this spelling. A
@@ -96,12 +97,43 @@ const denialDetailElided = "[eunox: elided]"
 // noise that buries genuine elisions). escapeReservedDetailKey is what closes that,
 // mirroring the collision guard internal/transport/dispatch.go applies to its own
 // reserved key.
-const denialDetailElidedKey = "_eunox_elided"
+const DenialDetailElidedKey = "_eunox_elided"
 
 // denialDetailForgedKeyPrefix re-spells a caller key that collides with the reserved
 // marker. The result is still visible to a reader — nothing is dropped — but it can no
 // longer be mistaken for a marker eunox wrote.
 const denialDetailForgedKeyPrefix = "_eunox_caller_"
+
+// denialDetailSliceElidedRe matches the marker boundDetailSlice appends in place of
+// the slice elements it drops: "[eunox: N elements elided]" when the whole slice was
+// already over budget before any element ("[eunox: %d elements elided]", len(in)),
+// "[eunox: N of M elements elided]" when only the tail was ("[eunox: %d of %d
+// elements elided]", len(in)-i, len(in)). IsDenialDetailSliceElided recognizes both
+// spellings as one marker family rather than the caller needing to know there are two.
+var denialDetailSliceElidedRe = regexp.MustCompile(`^\[eunox: \d+( of \d+)? elements elided\]$`)
+
+// IsDenialDetailElided reports whether s is exactly DenialDetailElided, the marker
+// boundDetailValue substitutes for a scalar value dropped for exceeding the byte
+// budget or maxDenialDetailDepth.
+//
+// Exported alongside the marker (like DenialDetailElided/DenialDetailElidedKey
+// themselves) so a consumer mining a denial's Details for real caller-supplied
+// values — cmd/eunox's suggest miner is the only one today — can recognize this
+// layer's elision placeholder instead of mining it as a literal value no caller ever
+// sent. Mirrors internal/audit.IsOverCapValuePlaceholder, which exists so the same
+// miner does not mistake THAT layer's differently-shaped truncation convention for a
+// literal value either; producer and detector living apart (as these three markers
+// did before this) is exactly how a miner drifts out of sync with what it mines.
+func IsDenialDetailElided(s string) bool {
+	return s == DenialDetailElided
+}
+
+// IsDenialDetailSliceElided reports whether s is exactly one of the markers
+// boundDetailSlice substitutes for one or more slice elements dropped for exceeding
+// the byte budget. See IsDenialDetailElided.
+func IsDenialDetailSliceElided(s string) bool {
+	return denialDetailSliceElidedRe.MatchString(s)
+}
 
 // boundDenialDetails returns a bounded deep copy of a denial's details map, or nil
 // when there is nothing to bound.
@@ -143,7 +175,7 @@ func boundDenialDetails(in map[string]interface{}) map[string]interface{} {
 // escapeReservedDetailKey re-spells a caller key that collides with the reserved
 // elision marker, so a marker on a record always means eunox elided something.
 func escapeReservedDetailKey(k string) string {
-	if k == denialDetailElidedKey {
+	if k == DenialDetailElidedKey {
 		return denialDetailForgedKeyPrefix + k
 	}
 	return k
@@ -154,7 +186,7 @@ func escapeReservedDetailKey(k string) string {
 func boundDetailMap(in map[string]interface{}, budget *int, depth int) map[string]interface{} {
 	*budget -= denialDetailContainerCost
 	if *budget < 0 {
-		return map[string]interface{}{denialDetailElidedKey: fmt.Sprintf("%d entries elided", len(in))}
+		return map[string]interface{}{DenialDetailElidedKey: fmt.Sprintf("%d entries elided", len(in))}
 	}
 	keys := make([]string, 0, boundedPrealloc(len(in), *budget))
 	for k := range in {
@@ -181,13 +213,13 @@ func boundDetailMap(in map[string]interface{}, budget *int, depth int) map[strin
 		if *budget < 0 {
 			// Budget exhausted mid-map. ONE marker naming the elision, not one per
 			// dropped key — a per-key marker would itself be proportional to the input.
-			out[denialDetailElidedKey] = fmt.Sprintf("%d of %d entries elided", len(in)-i, len(in))
+			out[DenialDetailElidedKey] = fmt.Sprintf("%d of %d entries elided", len(in)-i, len(in))
 			return out
 		}
 		out[bk] = boundDetailValue(in[k], budget, depth)
 	}
 	if len(keys) < len(in) {
-		out[denialDetailElidedKey] = fmt.Sprintf("%d of %d entries elided", len(in)-len(keys), len(in))
+		out[DenialDetailElidedKey] = fmt.Sprintf("%d of %d entries elided", len(in)-len(keys), len(in))
 	}
 	return out
 }
@@ -209,13 +241,13 @@ func boundedPrealloc(n, budget int) int {
 // boundDetailValue bounds one value of any JSON shape, charging budget as it goes.
 func boundDetailValue(v interface{}, budget *int, depth int) interface{} {
 	if depth >= maxDenialDetailDepth {
-		return denialDetailElided
+		return DenialDetailElided
 	}
 	switch t := v.(type) {
 	case string:
 		b, ok := chargeBoundedString(t, budget)
 		if !ok {
-			return denialDetailElided
+			return DenialDetailElided
 		}
 		return b
 	case json.Number:
@@ -226,7 +258,7 @@ func boundDetailValue(v interface{}, budget *int, depth int) interface{} {
 		// it still sees a number.
 		b, ok := chargeBoundedString(string(t), budget)
 		if !ok {
-			return denialDetailElided
+			return DenialDetailElided
 		}
 		return json.Number(b)
 	case []byte:
@@ -237,7 +269,7 @@ func boundDetailValue(v interface{}, budget *int, depth int) interface{} {
 		// motivates bounding the denial taxonomy at the sink.
 		b, ok := chargeBoundedString(string(t), budget)
 		if !ok {
-			return denialDetailElided
+			return DenialDetailElided
 		}
 		return []byte(b)
 	case map[string]interface{}:
@@ -259,7 +291,7 @@ func boundDetailValue(v interface{}, budget *int, depth int) interface{} {
 			func(e string) string {
 				b, ok := chargeBoundedString(e, budget)
 				if !ok {
-					return denialDetailElided
+					return DenialDetailElided
 				}
 				return b
 			})
@@ -270,7 +302,7 @@ func boundDetailValue(v interface{}, budget *int, depth int) interface{} {
 		if rv := reflect.ValueOf(v); rv.IsValid() && rv.Kind() == reflect.String {
 			b, ok := chargeBoundedString(rv.String(), budget)
 			if !ok {
-				return denialDetailElided
+				return DenialDetailElided
 			}
 			return b
 		}
@@ -279,7 +311,7 @@ func boundDetailValue(v interface{}, budget *int, depth int) interface{} {
 		// so a large array of them still exhausts the budget.
 		*budget -= denialDetailScalarCost
 		if *budget < 0 {
-			return denialDetailElided
+			return DenialDetailElided
 		}
 		return v
 	}
@@ -328,27 +360,16 @@ func boundDetailSlice[T any](in []T, budget *int, marker func(string) T, bound f
 // marker recording the original length, keeping the marker WITHIN the cap so the
 // result never exceeds it.
 //
-// It first normalizes to valid UTF-8. Every string reaching here can hold raw
-// caller-supplied bytes (a tool argument is decoded from the wire, not validated as
-// UTF-8 beyond JSON's own rules), and encoding/json is not idempotent across a
-// decode-then-re-encode round trip for invalid UTF-8 — the audit chain's HMAC
-// recompute and canonical-bytes check both depend on that idempotency, and the sink's
-// own boundFieldTo normalizes the envelope for exactly this reason. Details take the
-// same treatment so a denial echo cannot be the field that makes a genuine record
-// fail verification.
+// Delegates to capability.BoundString, which first normalizes to valid UTF-8. Every
+// string reaching here can hold raw caller-supplied bytes (a tool argument is decoded
+// from the wire, not validated as UTF-8 beyond JSON's own rules), and encoding/json is
+// not idempotent across a decode-then-re-encode round trip for invalid UTF-8 — the
+// audit chain's HMAC recompute and canonical-bytes check both depend on that
+// idempotency, and the audit sink's own boundFieldTo normalizes the envelope for
+// exactly this reason (capability.BoundString is their shared home: pkg/ cannot
+// import internal/audit, so the primitive lives one level down instead of being
+// re-derived here). Details take the same treatment so a denial echo cannot be the
+// field that makes a genuine record fail verification.
 func boundDetailString(s string) string {
-	s = strings.ToValidUTF8(s, "�")
-	if len(s) <= maxDenialDetailStringLen {
-		return s
-	}
-	marker := fmt.Sprintf("...[eunox: truncated, %d bytes]", len(s))
-	keep := maxDenialDetailStringLen - len(marker)
-	if keep < 0 {
-		return "..."
-	}
-	// Cut on a rune boundary so the truncated value is still valid UTF-8.
-	for keep > 0 && !utf8.RuneStart(s[keep]) {
-		keep--
-	}
-	return s[:keep] + marker
+	return capability.BoundString(s, maxDenialDetailStringLen)
 }

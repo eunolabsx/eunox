@@ -78,17 +78,17 @@ func TestBoundEnvelopeField_StaysWithinCap(t *testing.T) {
 	t.Parallel()
 
 	// Short strings pass through unchanged.
-	if got := boundEnvelopeField("hello"); got != "hello" {
+	if got := BoundEnvelopeField("hello"); got != "hello" {
 		t.Fatalf("short string altered: %q", got)
 	}
 	// A string exactly at the cap passes through unchanged.
 	atCap := strings.Repeat("a", auditEnvelopeFieldCap)
-	if got := boundEnvelopeField(atCap); got != atCap {
+	if got := BoundEnvelopeField(atCap); got != atCap {
 		t.Fatalf("at-cap string altered: len %d", len(got))
 	}
 	// An over-cap string is truncated to <= cap, marker included.
 	long := strings.Repeat("a", auditEnvelopeFieldCap*2)
-	got := boundEnvelopeField(long)
+	got := BoundEnvelopeField(long)
 	if len(got) > auditEnvelopeFieldCap {
 		t.Fatalf("result is %d bytes, exceeds cap %d", len(got), auditEnvelopeFieldCap)
 	}

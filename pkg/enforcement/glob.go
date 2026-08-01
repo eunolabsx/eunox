@@ -32,6 +32,15 @@ var (
 // (CWE-158/CWE-626). The single decode pass mirrors an upstream that decodes once,
 // so a doubly-encoded %252e stays %2e. Shared by MatchValueGlob and
 // handleAllowedExtensions so they normalize the same smuggling class in lock-step.
+//
+// errPathNUL wins over errPathMalformedEscape for BOTH spellings of NUL, not just
+// the literal byte: an encoded %00 riding alongside some OTHER malformed escape
+// ("evil.exe%00x%zz.csv") makes url.PathUnescape fail on the whole value, so
+// without this the lenient malformed-escape fallback a caller applies would match
+// the literal form and treat "%00" as three ordinary filename characters while a
+// NUL-truncating upstream opens "evil.exe". Deciding it here, once, means every
+// caller's malformed-escape branch inherits the precedence instead of re-deriving
+// it.
 func decodePathForConfinement(value string) (string, error) {
 	folded := strings.ReplaceAll(value, "\\", "/")
 	// Reject an embedded NUL BEFORE decoding so a literal NUL fails closed
@@ -43,6 +52,9 @@ func decodePathForConfinement(value string) (string, error) {
 	}
 	decoded, err := url.PathUnescape(folded)
 	if err != nil {
+		if containsEncodedNUL(folded) {
+			return "", errPathNUL
+		}
 		return "", errPathMalformedEscape
 	}
 	decoded = strings.ReplaceAll(decoded, "\\", "/")
@@ -66,18 +78,14 @@ func containsEncodedSeparator(s string) bool {
 }
 
 // containsEncodedNUL reports whether s contains a percent-encoded NUL token (%00),
-// case-insensitively. It is the NUL counterpart of containsEncodedSeparator and
-// exists for the same reason, on the same path: decodePathForConfinement can only
-// catch an encoded %00 AFTER a successful url.PathUnescape, so any OTHER malformed
-// escape in the value ("evil.exe%00x%zz.csv") makes the unescape fail whole and
-// returns errPathMalformedEscape — and the lenient fallbacks that then match the
-// literal form saw the %00 as three ordinary filename characters.
+// case-insensitively. decodePathForConfinement is its only caller: it can only
+// catch an encoded %00 by inspection AFTER a successful url.PathUnescape, so on the
+// failure arm (some OTHER malformed escape made the unescape fail whole) it uses
+// this to decide whether errPathNUL must still win over errPathMalformedEscape.
 //
 // That is the one token the confinement rules say must ALWAYS deny: a NUL-truncating
 // upstream (CWE-158/CWE-626) opens "evil.exe" while the guard inspected
-// "evil.exe%00x%zz.csv" and found a permitted ".csv" suffix. The separator token got
-// its rides-alongside guard when the lenient fallback was introduced; the NUL token
-// did not.
+// "evil.exe%00x%zz.csv" and found a permitted ".csv" suffix.
 //
 // Deliberately NOT folded into containsEncodedSeparator despite the identical shape:
 // they answer different questions (a separator means "this value leaves the confined
@@ -315,7 +323,10 @@ func confinePathStylePattern(pattern, value string) (folded string, valSpansSep 
 // confines. An embedded NUL always fails closed; a merely malformed '%' is a legal
 // filename char for a non-decoding upstream, so it folds only '\' and matches the
 // literal form — but still denies when a VALID encoded separator rides alongside the
-// bad escape ("..%2f..%2fetc%zz"), which a lenient upstream would resolve.
+// bad escape ("..%2f..%2fetc%zz"), which a lenient upstream would resolve. (An
+// encoded NUL riding alongside a bad escape is caught inside decodePathForConfinement
+// itself, which returns errPathNUL for that case, so this fallback need not re-check
+// it.)
 //
 // A bare "."/".." is denied for the same reason confinePathStylePattern denies it
 // segment-by-segment: it names the tool's working directory or its PARENT, so a
@@ -329,11 +340,11 @@ func confineSlashlessPattern(value string) bool {
 		return false
 	}
 	if errors.Is(err, errPathMalformedEscape) {
-		// A valid encoded separator or encoded NUL riding alongside the bad escape is
-		// still caught here: url.PathUnescape failed on the whole value, so neither
-		// token was ever decoded, and matching the literal form would treat "%2f"/"%00"
-		// as ordinary filename characters while a lenient upstream resolves them.
-		if containsEncodedSeparator(value) || containsEncodedNUL(value) {
+		// A valid encoded separator riding alongside the bad escape is still caught
+		// here: url.PathUnescape failed on the whole value, so the token was never
+		// decoded, and matching the literal form would treat "%2f" as an ordinary
+		// filename character while a lenient upstream resolves it as a separator.
+		if containsEncodedSeparator(value) {
 			return false
 		}
 		scan = strings.ReplaceAll(value, "\\", "/")
