@@ -494,10 +494,6 @@ func (p *HTTPProxy) warnForwardedForPosture() {
 	}
 }
 
-// Serve starts the HTTP server and blocks until ctx is canceled or a fatal
-// error occurs.
-// Serve starts the HTTP server and blocks until ctx is canceled or a fatal
-// error occurs.
 // runAfterListen runs the post-bind startup hook under a bound, closing ln and returning
 // an error if it cannot complete. Split out of Serve so the bound and its abandonment
 // rules sit together in one readable unit rather than as a block in the middle of server

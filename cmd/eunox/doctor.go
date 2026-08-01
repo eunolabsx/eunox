@@ -607,6 +607,14 @@ func writeDoctorAudit(w io.Writer, logPath, keyPath string, tail int) {
 	} else {
 		wf(w, "  totals:    records=%d allowed=%d blocked=%d observed=%d",
 			summary.total, summary.allowed, summary.blocked, summary.observed)
+		// escalated is a SUBSET of blocked (an escalation is a refusal), so it is
+		// additional detail rather than a missing addend — but it is the one bucket that
+		// says "a human was asked", and `eunox stats` over the same tape reports it. A
+		// support bundle that silently drops it makes the two views of one log disagree
+		// for whoever is reading the bundle instead of the machine.
+		if summary.escalated > 0 {
+			wf(w, " escalated=%d", summary.escalated)
+		}
 		if summary.other > 0 {
 			wf(w, " other=%d", summary.other)
 		}
@@ -615,7 +623,14 @@ func writeDoctorAudit(w io.Writer, logPath, keyPath string, tail int) {
 
 	if tail <= 0 {
 		wln(w)
-		wln(w, "  (--audit-tail=0 — record tail skipped)")
+		// A NEGATIVE tail is a different operator mistake from an explicit 0, and
+		// reporting both as "=0" told someone who typed -50 that the skip was their own
+		// choice. Echo what they actually passed.
+		if tail < 0 {
+			wf(w, "  (--audit-tail=%d is negative — record tail skipped; pass a positive count, or 0 to skip deliberately)\n", tail)
+		} else {
+			wln(w, "  (--audit-tail=0 — record tail skipped)")
+		}
 		return
 	}
 

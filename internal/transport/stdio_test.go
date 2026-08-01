@@ -35,7 +35,6 @@ func TestStdioRunBoundedStartup_KillsHungSubprocess(t *testing.T) {
 		command:        "sleep",
 		args:           []string{"30"},
 		startupTimeout: 200 * time.Millisecond,
-		pending:        make(map[string]struct{}),
 		byUpstreamID:   make(map[string]chan upstreamResult),
 	}
 	if err := p.connectUpstream(context.Background()); err != nil {
@@ -75,7 +74,6 @@ func TestAwaitUpstreamDrain_HostEOFBoundedThenKill(t *testing.T) {
 		args:         []string{"30"},
 		shutdownMs:   50,
 		upstreamDone: make(chan struct{}),
-		pending:      make(map[string]struct{}),
 		byUpstreamID: make(map[string]chan upstreamResult),
 	}
 	if err := p.connectUpstream(context.Background()); err != nil {
@@ -324,7 +322,6 @@ func TestStdioHandleResourcesRead_DenyDryRun(t *testing.T) {
 		pdp:          denyAllPDP{},
 		sessionID:    "dr-sess",
 		audit:        true,
-		pending:      make(map[string]struct{}),
 		hostWriter:   mcp.NewMsgWriter(&writerAdapter{hw}),
 		upstreamDone: done,
 	}
@@ -375,7 +372,6 @@ func TestStdioHandleResourcesSubscribe_DenyDryRun(t *testing.T) {
 		pdp:          denyAllPDP{},
 		sessionID:    "dr-sub",
 		audit:        true,
-		pending:      make(map[string]struct{}),
 		hostWriter:   mcp.NewMsgWriter(&writerAdapter{hw}),
 		upstreamDone: done,
 	}
@@ -425,7 +421,6 @@ func TestStdioHandleResourcesSubscribe_AuditOnlyDeny(t *testing.T) {
 		pdp:          denyAllPDP{},
 		sessionID:    "ao-sub",
 		audit:        true,
-		pending:      make(map[string]struct{}),
 		hostWriter:   mcp.NewMsgWriter(&writerAdapter{hw}),
 		upstreamDone: done,
 	}
@@ -687,7 +682,6 @@ func TestStdioCallUpstream_WriteError(t *testing.T) {
 	t.Parallel()
 	done := make(chan struct{})
 	p := &StdioProxy{
-		pending:      make(map[string]struct{}),
 		upstreamDone: done,
 		upWriter:     mcp.NewMsgWriter(&failingWriter{}), // always fails
 	}
@@ -842,7 +836,6 @@ func TestCallUpstream_TimedOutResponseNotMisrouted(t *testing.T) {
 
 	capSink := &idCapturingSink{}
 	p := &StdioProxy{
-		pending:      make(map[string]struct{}),
 		byUpstreamID: make(map[string]chan upstreamResult),
 		upstreamDone: make(chan struct{}),
 		upWriter:     capSink,
@@ -959,7 +952,6 @@ func TestCallUpstream_MalformedResponseRejected(t *testing.T) {
 
 			capSink := &idCapturingSink{}
 			p := &StdioProxy{
-				pending:      make(map[string]struct{}),
 				byUpstreamID: make(map[string]chan upstreamResult),
 				upstreamDone: make(chan struct{}),
 				upWriter:     capSink,
@@ -1022,7 +1014,6 @@ func TestReadUpstream_MethodBearingReplyOnLiveNonceNotForwarded(t *testing.T) {
 	p := &StdioProxy{
 		pdp:          pdp.AlwaysAllowPDP{},
 		sessionID:    "unit-test-sess",
-		pending:      make(map[string]struct{}),
 		byUpstreamID: map[string]chan upstreamResult{mcp.MsgKey(nonce): ch},
 		hostWriter:   mcp.NewMsgWriter(&writerAdapter{hw}),
 		upReader:     mcp.NewMsgReader(upR),
@@ -1079,7 +1070,6 @@ func closedUpstream(t *testing.T) (*StdioProxy, *mockHostWriter) {
 	p := &StdioProxy{
 		pdp:          pdp.AlwaysAllowPDP{},
 		sessionID:    "unit-test-sess",
-		pending:      make(map[string]struct{}),
 		hostWriter:   mcp.NewMsgWriter(&writerAdapter{hw}),
 		upWriter:     mcp.NewMsgWriter(io.Discard),
 		upstreamDone: done,
@@ -1099,7 +1089,6 @@ func respondingProxy(t *testing.T, resp mcp.RPCMsg) (*StdioProxy, *mockHostWrite
 	p := &StdioProxy{
 		pdp:          pdp.AlwaysAllowPDP{},
 		sessionID:    "unit-test-sess",
-		pending:      make(map[string]struct{}),
 		hostWriter:   mcp.NewMsgWriter(&writerAdapter{hw}),
 		upWriter:     mcp.NewMsgWriter(upW),
 		upstreamDone: done,
@@ -1149,8 +1138,8 @@ func TestNewStdioProxy_Defaults(t *testing.T) {
 	if _, ok := p.pdp.(pdp.DenyAllPDP); !ok {
 		t.Errorf("pdp should default to fail-closed pdp.DenyAllPDP{}, got %T", p.pdp)
 	}
-	if p.pending == nil {
-		t.Error("pending map should be initialized")
+	if p.hostToUp == nil {
+		t.Error("hostToUp map (the in-flight host-ID set) should be initialized")
 	}
 }
 
@@ -1203,7 +1192,6 @@ func TestStdioHandleToolsCall_DenyNotDryRun(t *testing.T) {
 	p := &StdioProxy{
 		pdp:          denyAllPDP{},
 		sessionID:    "deny-sess",
-		pending:      make(map[string]struct{}),
 		hostWriter:   mcp.NewMsgWriter(&writerAdapter{hw}),
 		upWriter:     mcp.NewMsgWriter(io.Discard),
 		upstreamDone: done,
@@ -1369,7 +1357,6 @@ func TestStdioHandleResourcesRead_Deny(t *testing.T) {
 	p := &StdioProxy{
 		pdp:          denyAllPDP{},
 		sessionID:    "deny-sess",
-		pending:      make(map[string]struct{}),
 		hostWriter:   mcp.NewMsgWriter(&writerAdapter{hw}),
 		upWriter:     mcp.NewMsgWriter(io.Discard),
 		upstreamDone: done,
@@ -1429,7 +1416,6 @@ func TestStdioHandleResourcesSubscribe_Deny(t *testing.T) {
 	p := &StdioProxy{
 		pdp:          denyAllPDP{},
 		sessionID:    "deny-sub",
-		pending:      make(map[string]struct{}),
 		hostWriter:   mcp.NewMsgWriter(&writerAdapter{hw}),
 		upWriter:     mcp.NewMsgWriter(io.Discard),
 		upstreamDone: done,
@@ -1524,7 +1510,6 @@ func TestStdioReadUpstream_Paths(t *testing.T) {
 	p := &StdioProxy{
 		pdp:          pdp.AlwaysAllowPDP{},
 		sessionID:    "read-sess",
-		pending:      make(map[string]struct{}),
 		hostWriter:   mcp.NewMsgWriter(&writerAdapter{hw}),
 		upWriter:     mcp.NewMsgWriter(io.Discard),
 		upReader:     mcp.NewMsgReader(pr),
@@ -1585,7 +1570,6 @@ func TestStdioReadUpstream_KilledSessionDropsNotification(t *testing.T) {
 		p := &StdioProxy{
 			pdp:          pdp.NewAlwaysAllowPDP(ks),
 			sessionID:    "sess",
-			pending:      make(map[string]struct{}),
 			hostWriter:   mcp.NewMsgWriter(&writerAdapter{hw}),
 			upWriter:     mcp.NewMsgWriter(io.Discard),
 			upReader:     mcp.NewMsgReader(strings.NewReader(input)),
@@ -1667,7 +1651,6 @@ func TestWithUpstreamTimeout_StdioProxy_NoTimeout(t *testing.T) {
 func TestCallUpstream_DuplicateID_Stdio(t *testing.T) {
 	t.Parallel()
 	proxy := &StdioProxy{
-		pending:      make(map[string]struct{}),
 		upstreamDone: make(chan struct{}),
 		upWriter:     mcp.NewMsgWriter(io.Discard),
 	}
@@ -1675,8 +1658,9 @@ func TestCallUpstream_DuplicateID_Stdio(t *testing.T) {
 	msg := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`99`), Method: "tools/call"}
 	key := mcp.MsgKey(msg.ID)
 
+	// hostToUp IS the in-flight host-ID set; seeding it makes this ID look in-flight.
 	proxy.pendingMu.Lock()
-	proxy.pending[key] = struct{}{}
+	proxy.hostToUp = map[string]*json.RawMessage{key: nil}
 	proxy.pendingMu.Unlock()
 
 	_, err := proxy.callUpstream(context.Background(), msg)
@@ -1685,7 +1669,7 @@ func TestCallUpstream_DuplicateID_Stdio(t *testing.T) {
 	}
 
 	proxy.pendingMu.Lock()
-	_, stillHeld := proxy.pending[key]
+	_, stillHeld := proxy.hostToUp[key]
 	proxy.pendingMu.Unlock()
 	if !stillHeld {
 		t.Error("regression: the existing in-flight host ID must not be evicted")
@@ -1698,7 +1682,6 @@ func TestCallUpstream_DuplicateID_Stdio(t *testing.T) {
 // returns promptly with a non-nil error when p.upstreamDone is closed.
 func TestStdioProxy_CallUpstreamExitsOnUpstreamDone(t *testing.T) {
 	proxy := &StdioProxy{
-		pending:      make(map[string]struct{}),
 		upstreamDone: make(chan struct{}),
 		upWriter:     mcp.NewMsgWriter(io.Discard),
 	}
@@ -1731,7 +1714,6 @@ func TestStdioProxy_CallUpstreamExitsOnUpstreamDoneWhilePending(t *testing.T) {
 	upstreamDone := make(chan struct{})
 
 	proxy := &StdioProxy{
-		pending:      make(map[string]struct{}),
 		upstreamDone: upstreamDone,
 		upWriter:     mcp.NewMsgWriter(io.Discard),
 	}
@@ -1800,7 +1782,6 @@ func TestCallUpstream_WriteWedgeTearsDownUpstream(t *testing.T) {
 	p := &StdioProxy{
 		command:      "sleep",
 		args:         []string{"60"},
-		pending:      make(map[string]struct{}),
 		byUpstreamID: make(map[string]chan upstreamResult),
 		hostToUp:     make(map[string]*json.RawMessage),
 	}

@@ -891,12 +891,11 @@ func Open(logPath, keyPath string, rotateSizeBytes int64, retainRotated int, opt
 	// The tail was read once, through the open append handle, by the partial-tail
 	// recovery above (see tailResume): every way it could fail to establish the tail
 	// is already a fail-closed Open error, so only two cases remain here.
+	// Both results are read through their structs. The eight single-use locals that used
+	// to unpack them here predate the two helpers being factored out and only restated
+	// field names the structs already carry.
 	resume := s.resolveStartupResume(tail, logPath)
-	last := resume.last
-	chainResumeFailed, seedUnbounded, resumeFailReason := resume.chainResumeFailed, resume.seedUnbounded, resume.failReason
-	tr := s.resumeChainFromTail(last)
-	tailFailKind, tailParseFailure, tailParseBytes := tr.tailFailKind, tr.tailParseFailure, tr.tailParseBytes
-	tailSeq, tailHMAC := tr.tailSeq, tr.tailHMAC
+	tr := s.resumeChainFromTail(resume.last)
 	// Emit the integrity marker before the drainer starts: Open is single-threaded
 	// here, so writeRecord has no contention and the marker becomes the first
 	// appended line, chained from the resumed tail like the first real record. The
@@ -919,43 +918,43 @@ func Open(logPath, keyPath string, rotateSizeBytes int64, retainRotated int, opt
 	// and forgetting it silently skips the fsync — so a crash right after Open loses
 	// exactly the tamper-evidence marker that fsync exists to make durable, on a path no
 	// test exercises.
-	wroteMarker := chainResumeFailed || tailParseFailure ||
-		tailFailKind != tailFailNone || recoveredPartialBytes > 0
-	if chainResumeFailed {
+	wroteMarker := resume.chainResumeFailed || tr.tailParseFailure ||
+		tr.tailFailKind != tailFailNone || recoveredPartialBytes > 0
+	if resume.chainResumeFailed {
 		// seed_unbounded says whether the reseed could see the whole chain. When the log
 		// directory cannot be listed, the rotated siblings' seqs are unknown and the
 		// reseed bounds only the base log — so the new records may collide with seqs the
 		// unlisted siblings already hold. That is a materially different forensic state
 		// from a bounded reseed, and stating it on the signed tape is what keeps it from
 		// looking (to audit-verify, later) like an unexplained duplicate-seq cascade.
-		details := map[string]interface{}{"reason": resumeFailReason}
-		if seedUnbounded {
+		details := map[string]interface{}{"reason": resume.failReason}
+		if resume.seedUnbounded {
 			details["seed_unbounded"] = true
 			fmt.Fprintf(os.Stderr, "[eunox] WARNING: the audit log directory of %q could not be listed, so the resumed sequence number could not be bounded against the rotated siblings; new records may reissue seqs those files already hold — run 'eunox audit-verify' and reconcile against your external sink.\n", logPath)
 		}
 		s.writeIntegrityMarker("chain_resume_failed", details)
 	}
-	if tailParseFailure {
+	if tr.tailParseFailure {
 		// tail_bytes records the length; the bytes are unparseable, so not embedded.
-		s.writeIntegrityMarker("tail_parse_failure", map[string]interface{}{"tail_bytes": tailParseBytes})
+		s.writeIntegrityMarker("tail_parse_failure", map[string]interface{}{"tail_bytes": tr.tailParseBytes})
 	}
-	switch tailFailKind {
+	switch tr.tailFailKind {
 	case tailFailHMACMismatch:
 		// Carry the suspect record's seq and hmac so a forensic reader can locate it.
-		s.writeIntegrityMarker("tail_hmac_mismatch", map[string]interface{}{"claimed_tail_seq": tailSeq, "claimed_tail_hmac": tailHMAC})
+		s.writeIntegrityMarker("tail_hmac_mismatch", map[string]interface{}{"claimed_tail_seq": tr.tailSeq, "claimed_tail_hmac": tr.tailHMAC})
 	case tailFailKeyUnknown:
 		// Distinct from tail_hmac_mismatch: this tail could not be verified because its
 		// signing key was retired, not because the HMAC failed to match a known key.
-		s.writeIntegrityMarker("tail_key_unknown", map[string]interface{}{"claimed_tail_seq": tailSeq, "claimed_tail_hmac": tailHMAC})
+		s.writeIntegrityMarker("tail_key_unknown", map[string]interface{}{"claimed_tail_seq": tr.tailSeq, "claimed_tail_hmac": tr.tailHMAC})
 	case tailFailUnsigned:
 		// The tail carries no signature at all — a pre-signing log, or a stripped
 		// signature. Carry its seq so a forensic reader can locate the boundary.
-		s.writeIntegrityMarker("tail_unsigned", map[string]interface{}{"claimed_tail_seq": tailSeq})
+		s.writeIntegrityMarker("tail_unsigned", map[string]interface{}{"claimed_tail_seq": tr.tailSeq})
 	case tailFailUndecodable:
 		// Distinct from tail_hmac_mismatch: the strict decoder refused the line, so no
 		// HMAC comparison ever ran. Carry the claimed seq/hmac anyway — they are the
 		// lenient decode's view and still locate the record.
-		s.writeIntegrityMarker("tail_strict_decode_refused", map[string]interface{}{"claimed_tail_seq": tailSeq, "claimed_tail_hmac": tailHMAC})
+		s.writeIntegrityMarker("tail_strict_decode_refused", map[string]interface{}{"claimed_tail_seq": tr.tailSeq, "claimed_tail_hmac": tr.tailHMAC})
 	}
 	if recoveredPartialBytes > 0 {
 		// A partial trailing write was truncated above. Record the recovery so the
@@ -1082,10 +1081,10 @@ func (s *Sink) writeIntegrityMarker(kind string, details map[string]interface{})
 	s.writeRecord(&marker)
 }
 
-// errAuditFileShrunk reports that the audit log was non-empty at Stat but returned
+// errAuditFileShrunk reports that an audit log file was non-empty at Stat but returned
 // zero bytes at ReadAt — truncated/rotated out between the two syscalls. Wrapped in
-// readLastAuditLine's error so the caller can recognize the race; the chain-resume
-// path treats it like any other tail-read error.
+// readLastAuditLine's error so the caller can recognize the race; the sibling scan treats
+// it like any other tail-read error.
 var errAuditFileShrunk = errors.New("audit log shrank between stat and read")
 
 // auditScanBufferBytes is the line-buffer ceiling every audit-JSONL reader uses.
@@ -1115,9 +1114,15 @@ func NewLineScanner(r io.Reader) *bufio.Scanner {
 	return scanner
 }
 
-// readLastAuditLine returns the last non-blank line of the audit log, reading only
-// a bounded tail so startup resume does not scan a large log. Its returns let the
-// caller distinguish three cases:
+// readLastAuditLine returns the last non-blank line of an audit log file, reading only
+// a bounded tail rather than scanning a large log.
+//
+// Its one caller is the rotated-sibling scan (newestRotatedSiblingWithTail): the ACTIVE
+// log's tail is read through the already-open append handle at startup (see tailResume),
+// which is what removed this function's original chain-resume role and the second open
+// that came with it. The three-case contract below is still what that caller needs — an
+// unreadable sibling must not be mistaken for an empty one — so it is stated, not
+// inherited:
 //
 //   - ("", nil): the file is genuinely empty or absent — the chain resumes from a
 //     rotated sibling or the genesis sentinel.

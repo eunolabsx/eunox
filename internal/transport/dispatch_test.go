@@ -934,7 +934,6 @@ func newTestStdioProxy(t *testing.T, dp pdp.PolicyDecisionPoint, sink *audit.Sin
 		pdp:        dp,
 		sessionID:  "test-sess",
 		hostWriter: mcp.NewMsgWriter(hostW),
-		pending:    make(map[string]struct{}),
 		sink:       sink,
 	}
 	ch := make(chan mcp.RPCMsg, 8)
@@ -1379,7 +1378,6 @@ func TestStdioNotification_KilledSession_DroppedAndRecorded(t *testing.T) {
 		sink:       sink,
 		hostReader: mcp.NewMsgReader(hostR),
 		upWriter:   mcp.NewMsgWriter(&upBuf),
-		pending:    make(map[string]struct{}),
 	}
 
 	// Feed a single host notification, then close stdin so serveHost returns.

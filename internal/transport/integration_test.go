@@ -417,7 +417,6 @@ func TestStdioProxy_ConnectUpstream_SubprocessLifecycle(t *testing.T) {
 	p := &StdioProxy{
 		command:    "sleep",
 		args:       []string{"30"},
-		pending:    make(map[string]struct{}),
 		shutdownMs: 200,
 	}
 	if err := p.connectUpstream(context.Background()); err != nil {
@@ -458,7 +457,6 @@ func TestStdioProxy_SignalUpstream_KillTimerStoppable(t *testing.T) {
 	p := &StdioProxy{
 		command:    "sleep",
 		args:       []string{"30"},
-		pending:    make(map[string]struct{}),
 		shutdownMs: 60000, // 60s: far longer than the test, so the timer never fires
 	}
 	if err := p.connectUpstream(context.Background()); err != nil {
@@ -494,7 +492,6 @@ func TestStdioProxy_KillUpstream_Subprocess(t *testing.T) {
 	p := &StdioProxy{
 		command: "sleep",
 		args:    []string{"30"},
-		pending: make(map[string]struct{}),
 	}
 	if err := p.connectUpstream(context.Background()); err != nil {
 		t.Fatalf("connectUpstream: %v", err)
@@ -509,7 +506,6 @@ func TestStdioProxy_ConnectUpstream_BadCommand(t *testing.T) {
 	t.Parallel()
 	p := &StdioProxy{
 		command: "this-command-does-not-exist-eunox",
-		pending: make(map[string]struct{}),
 	}
 	if err := p.connectUpstream(context.Background()); err == nil {
 		t.Fatal("expected connectUpstream to fail for a nonexistent command")
@@ -523,7 +519,6 @@ func TestStdioProxy_HTTPUpstreamWiring(t *testing.T) {
 	t.Parallel()
 	p := &StdioProxy{
 		upstreamURL: "https://upstream.example.com",
-		pending:     make(map[string]struct{}),
 		shutdownMs:  200,
 	}
 	if err := p.connectUpstream(context.Background()); err != nil {
@@ -552,7 +547,6 @@ func TestStdioProxy_HTTPUpstreamWiring(t *testing.T) {
 func TestStdioProxy_ConnectUpstream_HTTPEmitsServerInitiatedNotice(t *testing.T) {
 	p := &StdioProxy{
 		upstreamURL: "https://upstream.example.com",
-		pending:     make(map[string]struct{}),
 		shutdownMs:  200,
 	}
 	var connErr error
@@ -583,7 +577,6 @@ func TestRunStdioDriftCheck_SkippedWhenNoPins(t *testing.T) {
 	// → fetchUpstreamToolsRaw fails → drift check is skipped (no pins, non-strict).
 	p := &StdioProxy{
 		command: "true",
-		pending: make(map[string]struct{}),
 	}
 	if err := p.connectUpstream(context.Background()); err != nil {
 		t.Fatalf("connectUpstream: %v", err)
@@ -614,7 +607,6 @@ func TestRunStdioDriftCheck_StrictFatalWhenNoPins(t *testing.T) {
 	}
 	p := &StdioProxy{
 		command: "true",
-		pending: make(map[string]struct{}),
 	}
 	if err := p.connectUpstream(context.Background()); err != nil {
 		t.Fatalf("connectUpstream: %v", err)
@@ -641,7 +633,6 @@ func TestRunStdioDriftCheck_FatalWhenPinsAndNoToolsList(t *testing.T) {
 	}
 	p := &StdioProxy{
 		command: "true",
-		pending: make(map[string]struct{}),
 	}
 	if err := p.connectUpstream(context.Background()); err != nil {
 		t.Fatalf("connectUpstream: %v", err)

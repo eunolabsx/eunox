@@ -638,7 +638,6 @@ func newStdioProxyForSamplingTest(t *testing.T, dp pdp.PolicyDecisionPoint) (*St
 	p := &StdioProxy{
 		pdp:        dp,
 		sessionID:  "test-sess",
-		pending:    make(map[string]struct{}),
 		hostWriter: mcp.NewMsgWriter(&writerAdapter{hw}),
 		upWriter:   mcp.NewMsgWriter(&writerAdapter{uw}),
 	}
@@ -1063,7 +1062,6 @@ func TestGap5_HTTPProxy_SamplingDenied_ErrorResponse(t *testing.T) {
 	p := &StdioProxy{
 		pdp:        dp,
 		sessionID:  "test-sess",
-		pending:    make(map[string]struct{}),
 		hostWriter: mcp.NewMsgWriter(&writerAdapter{hw}),
 		upWriter:   mcp.NewMsgWriter(&writerAdapter{uw}),
 	}

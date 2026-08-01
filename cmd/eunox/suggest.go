@@ -108,7 +108,11 @@ type suggestionSet struct {
 	allow    int
 	deny     int
 	escalate int
-	sessions map[string]struct{}
+	// unknownDecision counts mined records carrying a decision this build does not
+	// model. They are in records but in no bucket, so without this the banner's
+	// breakdown silently fails to add up to the total it prints beside it.
+	unknownDecision int
+	sessions        map[string]struct{}
 }
 
 // resolveTarget determines an audit record's enforcement namespace and bare
@@ -222,6 +226,14 @@ func computeSuggestions(r io.Reader, maxValues int) (suggestionSet, error) {
 			// exactly the consequential actions an operator most needs to see.
 			out.escalate++
 			t.escalate++
+		default:
+			// A decision value this build does not model — a tape written by a newer
+			// eunox, or a hand-edited record. It was mined (it named a capability
+			// target) and counted in out.records, so dropping it from every bucket made
+			// the banner's own arithmetic fail to reconcile: an operator adding
+			// allow+deny+escalate got fewer than the record total, with nothing saying
+			// why. Count it, and say so in the banner when it is non-zero.
+			out.unknownDecision++
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -473,6 +485,13 @@ func writeSuggestBanner(sb *strings.Builder, s suggestionSet) {
 	// `eunox stats` would see a smaller number here with no explanation.
 	fmt.Fprintf(sb, "# Source: %d mined audit record(s) — %d allow, %d deny, %d escalate — across %d session(s).\n",
 		s.records, s.allow, s.deny, s.escalate, len(s.sessions))
+	if s.unknownDecision > 0 {
+		// Stated rather than folded into a bucket: these records name a capability target
+		// but carry a decision this build does not model (a tape from a newer eunox, or a
+		// hand-edited record), so they shape nothing in the draft — and an unexplained gap
+		// between the total and the breakdown reads as a counting bug in the tool.
+		fmt.Fprintf(sb, "#   (%d of those carry a decision this build does not model and shaped no entry below.)\n", s.unknownDecision)
+	}
 	sb.WriteString("# (Records that name no capability target — infrastructure denials, unmapped\n")
 	sb.WriteString("#  methods — are not mined and are not counted above.)\n")
 	sb.WriteString("#\n")

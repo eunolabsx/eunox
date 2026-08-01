@@ -122,8 +122,9 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 	// makes the engine fail closed before this handler runs, so a threaded set is
 	// trustworthy; the fallback reuses peekSessionLabels (the same vocab scan the audit
 	// path runs, single-sourced so the two cannot drift) for a direct caller that did not
-	// thread one. The counter==nil / empty-session guards above already fired, so
-	// peekSessionLabels' own short-circuit is unreachable here — it runs the full scan.
+	// thread one. The flowStore==nil / empty-session guards above already fired (the
+	// store is what peekSessionLabels short-circuits on, not the call counter), so its
+	// own short-circuit is unreachable here and it runs the full scan.
 	present, threaded := carriedLabelsFromContext(ctx)
 	if !threaded {
 		peeked, err := e.peekSessionLabels(ctx, req)

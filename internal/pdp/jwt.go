@@ -1122,8 +1122,16 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 		constraints = buildConstraintsFromClaims(claims.Capabilities, target)
 	}
 	if len(constraints) == 0 {
-		return p.withInnerForwardObligations(ctx, sessionID, denyResponse(p.clock, capability.ErrCodeAuthorizationFailed, "jwtCapability",
-			fmt.Sprintf("%s %q is not in the JWT capability claims", target.Type, target.Name)), target)
+		// "Not in the claims" is the usual reason and the only one an operator can act on
+		// by editing the token. A claim that NAMES this target but whose condition suffix
+		// failed to parse also lands here (it grants nothing, fail closed), and reporting
+		// that as absent sends the operator looking for a claim that is right in front of
+		// them. Say which case it is; the parse failure itself is already logged in full.
+		msg := fmt.Sprintf("%s %q is not in the JWT capability claims", target.Type, target.Name)
+		if claimNamesTargetButFailedToParse(claims, target) {
+			msg = fmt.Sprintf("a JWT capability claim names %s %q, but its condition suffix could not be parsed, so it grants nothing (see the eunox log for the parse error)", target.Type, target.Name)
+		}
+		return p.withInnerForwardObligations(ctx, sessionID, denyResponse(p.clock, capability.ErrCodeAuthorizationFailed, "jwtCapability", msg), target)
 	}
 
 	// mcp.capabilities is an OR-list: the call is permitted if ANY matching entry's
@@ -1596,6 +1604,35 @@ func buildConstraintsFromClaims(caps []string, target EnforceTarget) []capabilit
 // parseCapHeads logs for the head phase — ValidateToken already accepted the whole
 // claim, suffix included — so it is reported the same way rather than dropped
 // silently, which would surface only as an unexplained AUTHORIZATION_FAILED.
+// claimNamesTargetButFailedToParse reports whether some capability claim MATCHES target
+// but contributed no constraint because its condition suffix would not parse.
+//
+// It exists so the deny message can distinguish "your token does not list this target"
+// from "your token lists it, but the claim is malformed" — two different operator actions
+// behind one identical denial. It re-walks the heads only on the deny path (the allow path
+// never reaches it) and re-parses only the suffixes of claims that match this target, which
+// is the same bounded work buildConstraintsFromParsed already did for them.
+func claimNamesTargetButFailedToParse(claims *JWTClaims, target EnforceTarget) bool {
+	heads := claims.parsedCaps
+	if heads == nil {
+		heads = parseCapHeads(claims.Capabilities)
+	}
+	for _, h := range heads {
+		if h.prefix != target.Type || !matchClaimBare(h.prefix, h.bareName, target.Name) {
+			continue
+		}
+		if h.condpart == "" {
+			// A matching claim with no suffix always yields a constraint, so reaching here
+			// with none built at all is impossible; treat it as the ordinary case.
+			continue
+		}
+		if _, err := parseCondSuffix(h.condpart); err != nil {
+			return true
+		}
+	}
+	return false
+}
+
 func buildConstraintsFromParsed(heads []capHead, target EnforceTarget) []capability.Constraint {
 	var out []capability.Constraint
 	for _, h := range heads {

@@ -22,6 +22,7 @@ The proxy enforces policy on the following MCP methods:
 | `resources/read` | PDP decision — allow or deny based on manifest + conditions |
 | `resources/list` | Filter response to permitted resources only (`read` / `*` action) |
 | `resources/subscribe` | Gate initial subscription with the same read-access policy |
+| `resources/unsubscribe` | Gate cancellation with the same read-access policy |
 | `prompts/get` | PDP decision — allow or deny based on manifest + conditions |
 | `prompts/list` | Filter response to permitted prompts only (`get` / `*` action) |
 | `sampling/createMessage` | Denied by default; opt-in with `allow` / `*` action (see §2b for HTTP-mode limitation) |
@@ -41,6 +42,7 @@ eunox stats
 ```
 
 Every enforced-method call (`tools/call`, `resources/read`, `resources/subscribe`,
+`resources/unsubscribe`,
 `prompts/get`, `sampling/createMessage`) is forwarded and recorded to `~/.eunox/audit.jsonl`
 with `audit_only: true`; `tools/call` records also include the full tool argument map.
 (`…/list` calls forward the full upstream catalog unfiltered and are recorded as enumeration events.) `eunox stats` prints a
@@ -280,7 +282,7 @@ pattern against the target using `path.Match` glob semantics.
 | Action | Permits |
 |--------|---------|
 | `call` | `tools/call` for the matched tool name (also shown in `tools/list`) |
-| `read` | `resources/read` for the matched URI (also shown in `resources/list`); gates `resources/subscribe` |
+| `read` | `resources/read` for the matched URI (also shown in `resources/list`); gates `resources/subscribe` and `resources/unsubscribe` |
 | `get` | `prompts/get` for the matched prompt name (also shown in `prompts/list`) |
 | `allow` | `sampling/createMessage` from the upstream (opt-in) |
 | `*` | every action valid for the constraint's own target type only |
@@ -412,7 +414,7 @@ stop, not a policy verdict.
 > is not forwarded back to the upstream.  Full sampling round-trip
 > support in HTTP mode is a known gap.
 
-## 2c. Resource subscriptions (`resources/subscribe`)
+## 2c. Resource subscriptions (`resources/subscribe`, `resources/unsubscribe`)
 
 `resources/subscribe` opens a live update channel for a specific resource
 URI. The proxy enforces the same read-access policy as `resources/read`:
@@ -421,14 +423,20 @@ manifest capability with `read` or `*` action.
 
 ```yaml
 capabilities:
-  # Permit reading and subscribing to live metrics.
+  # Permit reading, subscribing to, and unsubscribing from live metrics.
   - target: "resource:file:///data/live/*"
-    actions: [read]   # covers both resources/read and resources/subscribe
+    actions: [read]   # covers resources/read, resources/subscribe, resources/unsubscribe
 ```
 
 If the URI does not match any manifest entry, the subscription is denied
 before any channel is established.  Kill-switch and audit-mode semantics
 apply.
+
+`resources/unsubscribe` is enforced under the same `read` action. Cancelling a
+subscription only ever *reduces* data flow, so it is not a separate permission — but it
+is enforced rather than blanket-forwarded so the tape stays symmetric (every subscribe has
+its matching unsubscribe) and so a URI the manifest never permitted, and which therefore
+was never subscribable, cannot be named here either.
 
 > **Note:** Ongoing `notifications/resources/updated` messages (pushed by
 > the server after a subscription is established) are currently forwarded
@@ -1885,6 +1893,20 @@ than masking the whole component, which would hand the host a result it cannot
 decode; a dotted path *through* one (`structuredContent.ssn`) resolves normally and
 masks that leaf. Binary media content the proxy cannot address (images, audio) and
 metadata (`_meta`, content annotations) are preserved unchanged.
+
+> **Ambiguous JSON keys fail closed under an active `redactFields`.** A response whose
+> object keys the proxy and the host can resolve differently cannot be verified, so it is
+> **denied fail-closed** rather than forwarded. Two shapes qualify: a **duplicate** key at
+> any depth (Go keeps the last, a first-wins host parser keeps the first, so a response
+> like `{"content":[…],"data":{"ssn":"…"},"data":{}}` would redact nothing and be forwarded
+> byte-for-byte while the host renders the ssn), and a **case-variant collision** among the
+> result envelope's own top-level keys (`data` alongside `Data`), which any consumer binding
+> keys case-insensitively resolves to one field and the host to two. Case-distinct keys
+> *nested* below the envelope root stay legal — a payload carrying both `Name` and `name`
+> inside an object is ordinary and is not refused. The same check applies to a JSON blob
+> unwrapped from a text item or a doubly-encoded string, since its keys only become keys
+> once the proxy decodes it. This is the same rule the request path and the `*/list`
+> filters already apply.
 
 > **`resource` / `resource_link` content fails closed under an active `redactFields`.**
 > A `resource` or `resource_link` content item nests a `resource` object that can carry

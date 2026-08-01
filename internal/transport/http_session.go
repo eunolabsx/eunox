@@ -56,13 +56,8 @@ type httpSession struct {
 	upHTTPClient   *http.Client
 	upstreamSessID string // Mcp-Session-Id returned by the remote upstream
 
-	// pendingMu guards pending, byUpstreamID, hostToUp, and upstreamSeq.
+	// pendingMu guards byUpstreamID, hostToUp, and upstreamSeq.
 	pendingMu sync.Mutex
-	// pending is keyed by the host's JSON-RPC ID solely to reject a duplicate
-	// in-flight host ID. It does NOT route upstream responses (byUpstreamID's job), so
-	// it is a SET: storing channels here invited exactly the misreading this comment
-	// had to disclaim, and nothing ever delivered through them.
-	pending map[string]struct{}
 	// byUpstreamID routes subprocess-upstream responses back to the waiting caller,
 	// keyed by the proxy-generated nonce. A response with a stale nonce (its caller
 	// already timed out and removed the entry) has nowhere to land, so a late
@@ -359,7 +354,6 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 		id:           uuid.New().String(),
 		proxy:        p,
 		route:        route,
-		pending:      make(map[string]struct{}),
 		byUpstreamID: make(map[string]chan upstreamResult),
 		hostToUp:     make(map[string]*json.RawMessage),
 		done:         make(chan struct{}),
@@ -1177,13 +1171,10 @@ func (s *httpSession) callSubprocessUpstream(ctx context.Context, msg mcp.RPCMsg
 	// newSession initializes these, so this lazy init only fires for a session
 	// assembled directly in a test; do it under pendingMu so the map-header write
 	// cannot race the off-lock read in readUpstream/deliverUpstreamResponse.
-	// pending is initialized here too: awaitNonced receives the maps BY VALUE and
-	// writes pending[hostKey] unconditionally, so a nil pending panicked on exactly
-	// the test-assembled session this block exists to accommodate.
+	// hostToUp is initialized here too: awaitNonced receives the maps BY VALUE, and it
+	// now both writes the correlation and reads the duplicate-ID set from it, so a nil
+	// map would panic on exactly the test-assembled session this block accommodates.
 	s.pendingMu.Lock()
-	if s.pending == nil {
-		s.pending = make(map[string]struct{})
-	}
 	if s.byUpstreamID == nil {
 		s.byUpstreamID = make(map[string]chan upstreamResult)
 	}
@@ -1197,7 +1188,7 @@ func (s *httpSession) callSubprocessUpstream(ctx context.Context, msg mcp.RPCMsg
 	// delivery path (deliverUpstreamError) is stdio-bridge-only and simply never fires here:
 	// an HTTP session's remote-upstream failures already surface as callUpstream errors
 	// (callRemoteUpstream), recorded as deny/UPSTREAM_ERROR.
-	return awaitNonced(ctx, &s.pendingMu, s.pending, s.byUpstreamID, s.hostToUp, &s.upstreamSeq, s.teardownDone(), mcp.MsgKey(msg.ID),
+	return awaitNonced(ctx, &s.pendingMu, s.byUpstreamID, s.hostToUp, &s.upstreamSeq, s.teardownDone(), mcp.MsgKey(msg.ID),
 		func(id *json.RawMessage) { msg.ID = id },
 		func() error { return s.upWriter.Write(msg) })
 }

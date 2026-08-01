@@ -12,7 +12,7 @@ see [threat-model-mcp.md](./threat-model-mcp.md).
 [Model Context Protocol](https://spec.modelcontextprotocol.io/). It sits
 between an MCP host (Claude Desktop, Claude Code, Cursor, ...) and one or more
 upstream MCP servers. Every enforced MCP method — `tools/call`,
-`resources/read`, `resources/subscribe`, `prompts/get`,
+`resources/read`, `resources/subscribe`, `resources/unsubscribe`, `prompts/get`,
 `sampling/createMessage` — is checked against a YAML capability manifest
 before it is forwarded. `*/list` responses are filtered down to permitted
 entries, so the host never even sees tools it cannot call. Every decision,

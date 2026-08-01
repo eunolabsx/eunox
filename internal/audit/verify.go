@@ -156,7 +156,8 @@ func (s *Sink) verifyDecodedRecord(line []byte, rec auditRecord) (bool, error) {
 	//     no configured key) could not be checked: the signing key is unidentifiable
 	//     AND absent, so calling it tampering is unjustified. Signal that distinctly
 	//     (still fail-closed) so the caller reports UNVERIFIABLE. An HMAC-less record
-	//     cannot reach here: it is refused above (errUnsignedRecord).
+	//     cannot reach here: it is refused above with a plain error, deliberately NOT a
+	//     sentinel (nothing branches on the reason).
 	if rec.KeyID == "" && len(keys) == 0 {
 		return false, errUnidentifiedNoMatch
 	}

@@ -2186,41 +2186,17 @@ func jsonFieldKeys(t reflect.Type) map[string]bool {
 // discriminator type (always including "type"). The second result is false for a
 // type this build does not model; the caller then skips key checking (the unknown
 // type is already rejected by the typed decode).
+//
+// The prototype comes from pkg/capability's ONE condition registry rather than a
+// reflect.TypeOf switch mirrored here. The mirror was a second table to update per new
+// condition type, and one that failed silently: a type missing from it returned "not
+// known", so its keys went unchecked and a typo in it loaded clean.
 func conditionKeysFor(condType string) (map[string]bool, bool) {
-	var t reflect.Type
-	switch condType {
-	case capability.ConditionTypeTimeWindow:
-		t = reflect.TypeOf(capability.TimeWindowCondition{})
-	case capability.ConditionTypeIPRange:
-		t = reflect.TypeOf(capability.IPRangeCondition{})
-	case capability.ConditionTypeAllowedOperations:
-		t = reflect.TypeOf(capability.AllowedOperationsCondition{})
-	case capability.ConditionTypeAllowedExtensions:
-		t = reflect.TypeOf(capability.AllowedExtensionsCondition{})
-	case capability.ConditionTypeAllowedTables:
-		t = reflect.TypeOf(capability.AllowedTablesCondition{})
-	case capability.ConditionTypeMaxCalls:
-		t = reflect.TypeOf(capability.MaxCallsCondition{})
-	case capability.ConditionTypeRecipientDomain:
-		t = reflect.TypeOf(capability.RecipientDomainCondition{})
-	case capability.ConditionTypeAllowedValues:
-		t = reflect.TypeOf(capability.AllowedValuesCondition{})
-	case capability.ConditionTypeSequenceBlock:
-		t = reflect.TypeOf(capability.SequenceBlockCondition{})
-	case capability.ConditionTypeFlowLabel:
-		t = reflect.TypeOf(capability.FlowLabelCondition{})
-	case capability.ConditionTypeEffectClass:
-		t = reflect.TypeOf(capability.EffectClassCondition{})
-	case capability.ConditionTypeBlastRadius:
-		t = reflect.TypeOf(capability.BlastRadiusCondition{})
-	case capability.ConditionTypePolicy:
-		t = reflect.TypeOf(capability.PolicyCondition{})
-	case capability.ConditionTypeCustom:
-		t = reflect.TypeOf(capability.CustomCondition{})
-	default:
+	proto, known := capability.NewConditionPrototype(condType)
+	if !known {
 		return nil, false
 	}
-	keys := jsonFieldKeys(t)
+	keys := jsonFieldKeys(reflect.TypeOf(proto))
 	keys["type"] = true
 	return keys, true
 }

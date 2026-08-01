@@ -785,7 +785,6 @@ func benchStdioProxy(b *testing.B, dp pdp.PolicyDecisionPoint) *StdioProxy {
 	proxy := &StdioProxy{
 		pdp:          dp,
 		sessionID:    "bench-stdio",
-		pending:      make(map[string]struct{}),
 		hostWriter:   mcp.NewMsgWriter(io.Discard),
 		upWriter:     mcp.NewMsgWriter(upW),
 		upReader:     mcp.NewMsgReader(downR),

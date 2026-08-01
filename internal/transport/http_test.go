@@ -498,7 +498,6 @@ func TestHTTPForwardNotification_RemoteMode(t *testing.T) {
 	sess := newTestSession(&httpSession{
 		done:         make(chan struct{}),
 		route:        &UpstreamRoute{transport: "http", upstreamURL: srv.URL},
-		pending:      make(map[string]struct{}),
 		upHTTPClient: &http.Client{Timeout: 5 * time.Second},
 		proxy:        proxy,
 	})
@@ -514,7 +513,6 @@ func TestHTTPForwardNotification_RemoteMode(t *testing.T) {
 func TestCallSubprocessUpstream_WriteError(t *testing.T) {
 	t.Parallel()
 	sess := newTestSession(&httpSession{
-		pending:  make(map[string]struct{}),
 		done:     make(chan struct{}),                // NOT closed so done doesn't interfere
 		upWriter: mcp.NewMsgWriter(&failingWriter{}), // fails on write
 	})
@@ -532,7 +530,6 @@ func TestCallSubprocessUpstream_SessionDone(t *testing.T) {
 	done := make(chan struct{})
 	close(done)
 	sess := newClosedTestSession(&httpSession{
-		pending:  make(map[string]struct{}),
 		done:     done,
 		upWriter: mcp.NewMsgWriter(io.Discard),
 	})
@@ -568,7 +565,6 @@ func TestRunInitHandshake_CapturesServerVersion(t *testing.T) {
 	}
 
 	sess := newTestSession(&httpSession{
-		pending:  make(map[string]struct{}),
 		done:     make(chan struct{}),
 		upWriter: mcp.NewMsgWriter(io.Discard),
 		upReader: mcp.NewMsgReader(bytes.NewReader(append(line, '\n'))),
@@ -601,7 +597,6 @@ func TestRunInitHandshake_RejectsUpstreamErrorResponse(t *testing.T) {
 
 	var hostOut bytes.Buffer // captures what the proxy writes to the upstream
 	sess := newTestSession(&httpSession{
-		pending:  make(map[string]struct{}),
 		done:     make(chan struct{}),
 		upWriter: mcp.NewMsgWriter(&hostOut),
 		upReader: mcp.NewMsgReader(bytes.NewReader(append(line, '\n'))),
@@ -631,7 +626,6 @@ func TestHTTPCallUpstream_LocalMode_SessionDone(t *testing.T) {
 	done := make(chan struct{})
 	close(done)
 	sess := newClosedTestSession(&httpSession{
-		pending:  make(map[string]struct{}),
 		done:     done,
 		upWriter: mcp.NewMsgWriter(io.Discard),
 		// upHTTPClient nil → local mode → routes to callSubprocessUpstream
@@ -2481,7 +2475,6 @@ func TestHTTPReadUpstream_KilledSessionDropsNotificationRelay(t *testing.T) {
 			id:       id,
 			route:    rt,
 			done:     make(chan struct{}),
-			pending:  make(map[string]struct{}),
 			upWriter: mcp.NewMsgWriter(io.Discard),
 			upReader: mcp.NewMsgReader(strings.NewReader(input)),
 		})
@@ -4721,7 +4714,6 @@ func TestHTTPReadUpstream_Paths(t *testing.T) {
 		done:     make(chan struct{}),
 		upReader: mcp.NewMsgReader(pr),
 		upWriter: mcp.NewMsgWriter(io.Discard),
-		pending:  make(map[string]struct{}),
 	})
 	ch := make(chan mcp.RPCMsg, 4)
 	sess.addSub(ch)
@@ -5588,7 +5580,6 @@ func TestWithUpstreamTimeout_MarkerBypasses(t *testing.T) {
 func TestCallSubprocessUpstream_DuplicateID_HTTP(t *testing.T) {
 	t.Parallel()
 	sess := newTestSession(&httpSession{
-		pending:  make(map[string]struct{}),
 		done:     make(chan struct{}),
 		upWriter: mcp.NewMsgWriter(io.Discard),
 		// upHTTPClient nil → local mode
@@ -5597,17 +5588,20 @@ func TestCallSubprocessUpstream_DuplicateID_HTTP(t *testing.T) {
 	msg := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`42`), Method: "tools/call"}
 	key := mcp.MsgKey(msg.ID)
 
+	// hostToUp IS the in-flight host-ID set (it carries the host-id -> upstream-nonce
+	// correlation for exactly that window), so seeding it is what makes this ID look
+	// in-flight.
 	sess.pendingMu.Lock()
-	sess.pending[key] = struct{}{}
+	sess.hostToUp = map[string]*json.RawMessage{key: nil}
 	sess.pendingMu.Unlock()
 
 	_, err := sess.callSubprocessUpstream(context.Background(), msg)
 	if err == nil {
-		t.Error("regression: duplicate ID must return an error, not overwrite the pending entry")
+		t.Error("regression: duplicate ID must return an error, not overwrite the in-flight entry")
 	}
 
 	sess.pendingMu.Lock()
-	_, stillHeld := sess.pending[key]
+	_, stillHeld := sess.hostToUp[key]
 	sess.pendingMu.Unlock()
 	if !stillHeld {
 		t.Error("regression: duplicate ID request must not evict the existing in-flight host ID")

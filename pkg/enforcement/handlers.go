@@ -1231,7 +1231,7 @@ func toFloat64(v any) (float64, bool) {
 // was previously recorded in this session.
 //
 // Known limitation — concurrent same-session requests: the antecedent check
-// (history.Peek on the antecedent tool's key) and the recording of an antecedent's
+// (a counter Peek on the antecedent tool's key) and the recording of an antecedent's
 // call (RecordSessionCall's IncrementAndGet on that tool's key, on a SEPARATE
 // request) are not atomic, so firing the antecedent and the blocked tool
 // concurrently on one session can let the blocked tool Peek empty history and slip
@@ -1303,8 +1303,6 @@ func (e *Engine) handleSequenceBlock(ctx context.Context, cond capability.Condit
 		}
 	}
 
-	history := e.counter // non-nil: the e.counter == nil guard above already denied
-
 	// Resolve the blocked target's namespace as RecordSessionCall does: prefer the
 	// explicit req.Target.Type, falling back to the req.TargetName prefix (bare
 	// defaults to "tool"), and to req.Target.Name when req.TargetName is empty
@@ -1356,7 +1354,7 @@ func (e *Engine) handleSequenceBlock(ctx context.Context, cond capability.Condit
 		priorTarget := priorType + ":" + priorTool
 		key := sequenceHistoryKey(e.counterKeyNamespace, req.SessionID, priorType, priorTool)
 
-		count, err := history.Peek(histCtx, key, sequenceHistoryWindowSec)
+		count, err := e.counter.Peek(histCtx, key, sequenceHistoryWindowSec)
 		if err != nil {
 			return &ConditionError{
 				Code:          capability.ErrCodeConditionFailed,
@@ -1388,7 +1386,7 @@ func (e *Engine) handleSequenceBlock(ctx context.Context, cond capability.Condit
 			// has only the probed one re-armed. That is the documented per-pair contract —
 			// retention measures inactivity of THIS (antecedent, blocked target) pair —
 			// not an oversight; a pair no call ever exercises still ages out.
-			_, _ = history.IncrementAndGet(histCtx, key, sequenceHistoryWindowSec, sequenceHistoryMaxEntries)
+			_, _ = e.counter.IncrementAndGet(histCtx, key, sequenceHistoryWindowSec, sequenceHistoryMaxEntries)
 			return &ConditionError{
 				Code:          capability.ErrCodeConditionFailed,
 				ConditionType: capability.ConditionTypeSequenceBlock,

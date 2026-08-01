@@ -100,6 +100,14 @@ Tier-2 is **pure metadata comparison**. It catches:
   rewritten to inject instructions), and
 - silent interface drift (schemas or names changing under a session).
 
+It covers **tools only**. Prompt and resource descriptions reach the model by the same
+route a tool description does, and neither Tier-2 nor the manifest's `descriptionHash`
+pins them; the two other `*/list` flavors carry only the per-entry ambiguity gate (an
+entry whose bytes could decode differently for the proxy than for the host is dropped).
+The baseline machinery is generic over `(name, hash)`, so extending it is a design
+decision rather than a rewrite — but until that decision is made, do not describe eunox
+as pinning "the advertised surface" without saying which surface.
+
 It does **not** catch a rug pull where the **advertised interface is unchanged** but
 the upstream's *behavior* changes — a server that returns the same tool metadata while
 doing something different on the wire. That is behavioral, not metadata, and Tier-2

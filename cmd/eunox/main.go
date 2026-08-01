@@ -431,20 +431,6 @@ func cmdProxy(args []string) (exitCode int) {
 		fmt.Fprintf(os.Stderr, "eunox proxy: %v\n", err)
 		return 1
 	}
-	// The audit knobs mirror the config's fail-closed rejection (Validate rejects a
-	// negative audit.rotateSizeBytes / audit.retainRotated). Guard the FLAG leg too so the
-	// two surfaces agree: without this a negative flag value silently coerces in audit.Open
-	// (rotate-size < 0 → the 100 MiB default, retain < 0 → keep-all), hiding the operator's
-	// misconfiguration instead of rejecting it.
-	if *f.auditRotateSize < 0 {
-		fmt.Fprintf(os.Stderr, "eunox proxy: --audit-rotate-size must be >= 0 (0 = use the default size)\n")
-		return 1
-	}
-	if *f.auditRetainRotated < 0 {
-		fmt.Fprintf(os.Stderr, "eunox proxy: --audit-retain must be >= 0 (0 = keep all rotated files)\n")
-		return 1
-	}
-
 	var (
 		cfg *config.GatewayConfig
 		err error
@@ -1195,6 +1181,16 @@ func validateProxyNumericFlags(f *proxyCLIFlags) error {
 		return errors.New("--shutdown-timeout must be >= 0 (0 = use the default)")
 	case *f.upstreamTimeout < transport.UpstreamTimeoutUnset:
 		return fmt.Errorf("--upstream-timeout must be >= %d (0 disables the timeout, %d defers to the config); a value below that is not a sentinel and would silently defer instead of setting the bound you meant", transport.UpstreamTimeoutUnset, transport.UpstreamTimeoutUnset)
+	// The two audit knobs mirror the config's fail-closed rejection (Validate rejects a
+	// negative audit.rotateSizeBytes / audit.retainRotated). They live HERE, with every
+	// other numeric flag guard, rather than as a second pair of inline checks in cmdProxy
+	// with their own error-printing: a negative value silently coerces in audit.Open
+	// (rotate-size < 0 -> the 100 MiB default, retain < 0 -> keep-all), which hides the
+	// operator's misconfiguration, and that is the same class this function exists for.
+	case *f.auditRotateSize < 0:
+		return errors.New("--audit-rotate-size must be >= 0 (0 = use the default size)")
+	case *f.auditRetainRotated < 0:
+		return errors.New("--audit-retain must be >= 0 (0 = keep all rotated files)")
 	}
 	return nil
 }
@@ -1840,11 +1836,8 @@ func serveStdioHost(ctx context.Context, cfg *config.GatewayConfig, sink *audit.
 	// banner, TLS-skip WARNING) go through the shared transport helper so the stdio host
 	// and the gateway routes cannot drift on wording. routePath is "" — a stdio host runs
 	// a single upstream on stdin/stdout with no /mcp mount.
-	auditOnlyCount := 0
-	if manifest != nil {
-		auditOnlyCount = manifest.AuditOnlyCount()
-	}
-	transport.PrintRoutePolicyNotices(os.Stderr, u.Name, "", auditOnlyCount, auditMode, u.UpstreamTLSSkipVerify)
+	// AuditOnlyCount is nil-safe (a policyless upstream has none), so no guard here.
+	transport.PrintRoutePolicyNotices(os.Stderr, u.Name, "", manifest.AuditOnlyCount(), auditMode, u.UpstreamTLSSkipVerify)
 	// The remote-HTTP-upstream "server-initiated requests are not serviced" NOTICE is
 	// emitted once, in the transport layer (StdioProxy.connectUpstream via
 	// printRemoteUpstreamNotice), so it is not duplicated here.

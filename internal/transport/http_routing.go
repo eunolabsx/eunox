@@ -1051,9 +1051,12 @@ func (p *HTTPProxy) handleMCPDelete(w http.ResponseWriter, r *http.Request, rout
 		// than the absence of one: a caller holding any accepted token learns from a 403
 		// that the id it presented names a live session on this route. It is accepted
 		// because session ids are server-minted UUIDs — unguessable, so the oracle
-		// confirms only ids the caller already has — and because the alternative,
-		// applying the gates before the existence check, would let an UNAUTHENTICATED
-		// caller drive the audience PDP once per probe. A no-pin /
+		// confirms only ids the caller already has. What bounds the probe cost is not the
+		// ordering of the PDP call — the context-only audience verdict is computed BEFORE
+		// the registry lookup, to keep an exported-seam call off the session lock — but the
+		// auth check upstream of this handler, which an unauthenticated caller never gets
+		// past. The ordering that survives here is where the verdict is APPLIED: only once
+		// the session is confirmed to exist and to belong to this route. A no-pin /
 		// --jwt-allow-any-audience route and an unbound (no-JWT) session are no-ops. A DELETE
 		// carries no JSON-RPC envelope, so a refusal is an HTTP 403 plus a transport-tagged
 		// deny record (method/identifier empty), matching the GET refusal convention. The

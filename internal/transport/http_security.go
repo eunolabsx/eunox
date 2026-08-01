@@ -215,10 +215,6 @@ func (p *HTTPProxy) checkControlToken(w http.ResponseWriter, r *http.Request) bo
 	return true
 }
 
-// buildAllowedOriginHosts returns the set of host names whose Origin is always
-// accepted: the loopback names plus the configured bind host (unless it is a
-// wildcard, which is not a meaningful Origin host). Hosts are lower-cased so the
-// lookup in originAllowed is case-insensitive.
 // buildLoopbackPinHosts returns the extra host NAMES the DNS-rebinding pin on the
 // loopback-only endpoints accepts, derived from the operator's listen.allowedOrigins.
 //
@@ -257,6 +253,10 @@ func buildLoopbackPinHosts(allowedOrigins []string) map[string]bool {
 	return hosts
 }
 
+// buildAllowedOriginHosts returns the set of host names whose Origin is always
+// accepted: the loopback names plus the configured bind host (unless it is a
+// wildcard, which is not a meaningful Origin host). Hosts are lower-cased so the
+// lookup in originAllowed is case-insensitive.
 func buildAllowedOriginHosts(bind string) map[string]bool {
 	hosts := map[string]bool{
 		"localhost": true,
