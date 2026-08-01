@@ -1,0 +1,579 @@
+// Copyright 2026 Eunolabs, LLC
+// SPDX-License-Identifier: Apache-2.0
+
+package capability
+
+import (
+	"encoding/json"
+	"fmt"
+	"math/big"
+	"sort"
+	"strings"
+)
+
+// Effect contracts — the "what may break" axis.
+//
+// Information-flow control answers *who may know*: a labelOutput source asserts
+// provenance and a flowLabel sink refuses a class that must not reach it. Effect
+// contracts answer the other half, *what may break*: how consequential an action is,
+// independent of who is allowed to take it. Same enforcement point, same manifest, two
+// axes.
+//
+// The vocabulary is a CLOSED, typed set — three effect classes, a numeric blast radius,
+// an idempotency flag, a compensating action — precisely because a portable
+// effect-contract registry has to hash-pin what a contract MEANS. A registry of general
+// policy-language blobs is neither reviewable nor pinnable ("what does this do" would
+// need executing it), so a general policy language and a portable effect standard are
+// mutually exclusive. That is why effect stays a schema and not a program, while a
+// partner's complex escalation PREDICATE can still be delegated through the `policy`
+// condition.
+//
+// Nothing here infers effect from a payload. A contract is asserted by policy (or by a
+// registry entry an operator pinned), exactly as a flow label is; the argument-
+// parameterized form (ByArgument) is a static decision table resolved from the call's
+// own arguments, never a runtime callout. Genuinely server-state-dependent effect is
+// carried after the fact by a signed receipt, and defaulted conservatively before the
+// call.
+
+// Effect class discriminators — the closed reversibility vocabulary, ordered from least
+// to most consequential. Flat and totally ordered on purpose: three classes an operator
+// can hold in their head, with no lattice until a partner forces a partial order.
+const (
+	// EffectReversible — the action can be undone by the caller with no external
+	// coordination (a read, an idempotent write, a soft-delete with an undo).
+	EffectReversible = "reversible"
+	// EffectCompensable — the action cannot be undone directly, but a declared
+	// compensating action reverses its business effect (a refund reverses a charge).
+	// Compensable is NOT the same as safe: the compensation may itself be visible,
+	// costly, or delayed, and a compensated action still happened.
+	EffectCompensable = "compensable"
+	// EffectIrreversible — nothing the caller can do reverses it (an outbound email, a
+	// wire transfer, a hard delete). This is also the FAIL-CLOSED default for any action
+	// with no contract at all: unannotated means unknown, and unknown must not read as
+	// harmless.
+	EffectIrreversible = "irreversible"
+)
+
+// effectClassOrder ranks the closed vocabulary from least to most consequential. A
+// ceiling of "compensable" therefore admits reversible and compensable and stops
+// irreversible. Order is fixed so a derived report is deterministic.
+var effectClassOrder = []string{EffectReversible, EffectCompensable, EffectIrreversible}
+
+// effectClassRank indexes effectClassOrder for the comparisons.
+var effectClassRank = func() map[string]int {
+	m := make(map[string]int, len(effectClassOrder))
+	for i, c := range effectClassOrder {
+		m[c] = i
+	}
+	return m
+}()
+
+// EffectClassVocabulary returns a fresh copy of the ordered effect-class set, so
+// validation messages and any derived report enumerate the same closed vocabulary
+// without being able to mutate it.
+func EffectClassVocabulary() []string {
+	return append([]string(nil), effectClassOrder...)
+}
+
+// IsEffectClass reports whether s is a recognized effect class. Validation and the
+// engine both consult it, so the closed set is enforced identically at load and at
+// runtime.
+func IsEffectClass(s string) bool {
+	_, ok := effectClassRank[s]
+	return ok
+}
+
+// EffectClassAtMost reports whether class is no more consequential than limit. An
+// unrecognized class on either side reports false — fail closed, since an unknown class
+// cannot be shown to sit under a bound.
+func EffectClassAtMost(class, limit string) bool {
+	c, okC := effectClassRank[class]
+	l, okL := effectClassRank[limit]
+	return okC && okL && c <= l
+}
+
+// Condition and directive type discriminators for the effect layer.
+const (
+	// ConditionTypeEffectClass gates a call on the effect class its contract resolves to.
+	ConditionTypeEffectClass = "effectClass"
+	// ConditionTypeBlastRadius bounds the quantitative size of one call's effect.
+	ConditionTypeBlastRadius = "blastRadius"
+)
+
+// EffectContract declares what a call DOES, as PDP-addressable policy input. It replaces
+// MCP's self-declared, unauthenticated tool hints: a hint travels with the thing being
+// judged, while a contract is asserted by the operator's manifest or pinned from a
+// reviewed registry entry.
+//
+// A constraint with no contract resolves to the fail-closed default (irreversible, blast
+// radius unknown), which is the registry flywheel: annotating a tool is what buys it out
+// of maximum friction.
+type EffectContract struct {
+	// Class is the reversibility class (EffectReversible / EffectCompensable /
+	// EffectIrreversible). Empty means unannotated and resolves to irreversible.
+	Class string `json:"class,omitempty"`
+	// Idempotent marks a call that can be safely repeated with no additional effect.
+	// It does not by itself make an action reversible — a repeatable outbound email is
+	// still irreversible — but it is what lets a retry be treated as one action.
+	Idempotent bool `json:"idempotent,omitempty"`
+	// CompensatingAction names the target that reverses this one (e.g.
+	// "tool:reverse_refund"). Required for a compensable class and rejected on any other
+	// — "compensable with nothing to compensate with" is irreversible wearing a softer
+	// label, which is exactly the mislabel the consequence gate must not accept.
+	CompensatingAction string `json:"compensatingAction,omitempty"`
+	// BlastRadius quantifies how much this call affects: a fixed magnitude, or the value
+	// of a named argument (rows, spend, recipients). Nil means unquantified, which is
+	// treated as exceeding any finite bound.
+	BlastRadius *BlastRadiusSpec `json:"blastRadius,omitempty"`
+	// ByArgument is the argument-parameterized form: the effect of a call is a function
+	// of one of its arguments, expressed as a STATIC decision table (db.query is
+	// reversible for SELECT and irreversible for DROP; a transfer's blast radius is its
+	// amount). It is resolved from the call's own arguments on the decision path — no
+	// callout, no inference — and its matched case overlays the fields above.
+	ByArgument *EffectByArgument `json:"byArgument,omitempty"`
+	// Ref optionally records the registry contract this block was authored from, as
+	// "<contract-id>@sha256:<hex>". eunox does not fetch it: the pin is provenance for a
+	// human reviewing the manifest and for the audit record, so the decision path stays
+	// local (no network on the decision path) and a registry outage cannot change a
+	// verdict.
+	Ref string `json:"ref,omitempty"`
+}
+
+// BlastRadiusSpec quantifies a call's effect magnitude. Exactly one of Value or Argument
+// is set; the loader rejects both and neither.
+type BlastRadiusSpec struct {
+	// Value is a fixed magnitude for every call to this target.
+	Value *json.Number `json:"value,omitempty"`
+	// Argument names the call argument carrying the magnitude (an amount, a row count, a
+	// recipient list — a list contributes its LENGTH). A missing or unusable argument
+	// resolves to unquantified, which exceeds any finite bound: an action whose size
+	// cannot be established must not be treated as small.
+	Argument string `json:"argument,omitempty"`
+	// Unit is a free-form label for reports and audit records ("usd", "rows",
+	// "recipients"). It is never compared — eunox does not model unit algebra — so two
+	// contracts on the same target must agree on a unit by convention, not by check.
+	Unit string `json:"unit,omitempty"`
+}
+
+// EffectByArgument is a static decision table keyed on one argument's value: the
+// argument-parameterized contract form. Cases are matched against the argument's string
+// form, case-insensitively for a string argument, with Default applying when nothing
+// matches.
+//
+// It is deliberately a TABLE and not an expression. A table is reviewable and pinnable —
+// the two properties the registry needs — where an expression would have to be executed
+// to be understood.
+type EffectByArgument struct {
+	// Argument names the call argument the table keys on.
+	Argument string `json:"argument"`
+	// Cases maps an argument value to the contract fields that overlay the base contract
+	// when it matches. For an operation-style argument the FIRST whitespace-delimited
+	// token is matched too, so a case of "DROP" matches "DROP TABLE users" — the same
+	// coarse first-verb rule allowedOperations uses, with the same documented limit that
+	// it is not a SQL parser.
+	Cases map[string]EffectCase `json:"cases"`
+	// Default applies when no case matches. Absent means the fail-closed default
+	// (irreversible, unquantified) rather than the base contract: a table that does not
+	// cover a value has not said the value is safe.
+	Default *EffectCase `json:"default,omitempty"`
+}
+
+// EffectCase is one row of an argument-parameterized contract.
+type EffectCase struct {
+	Class              string           `json:"class,omitempty"`
+	Idempotent         *bool            `json:"idempotent,omitempty"`
+	CompensatingAction string           `json:"compensatingAction,omitempty"`
+	BlastRadius        *BlastRadiusSpec `json:"blastRadius,omitempty"`
+}
+
+// ResolvedEffect is a contract reduced against one call's arguments: the values the
+// conditions and the ceiling actually compare. Quantified is false when no blast radius
+// could be established, which every numeric bound treats as exceeded.
+type ResolvedEffect struct {
+	Class              string
+	Idempotent         bool
+	CompensatingAction string
+	BlastRadius        *big.Float
+	Quantified         bool
+	Unit               string
+	Ref                string
+	// Annotated is false when the constraint carried no contract at all, so a caller can
+	// distinguish "declared irreversible" from "unannotated, defaulted to irreversible"
+	// in an audit record or an operator message. Both deny the same way; only the
+	// remediation differs (review the action vs. annotate the tool).
+	Annotated bool
+}
+
+// UnannotatedEffect is the fail-closed resolution for a target with no contract:
+// irreversible, unquantified, nothing to compensate with. It is what makes the registry
+// a flywheel rather than a nice-to-have — an unannotated tool exceeds any ceiling and so
+// escalates, and the way out is to annotate it.
+func UnannotatedEffect() ResolvedEffect {
+	return ResolvedEffect{Class: EffectIrreversible}
+}
+
+// EffectClassCondition denies a call whose resolved effect class is not in Allow. It is
+// the per-target gate ("this target may only ever do reversible things"), the coarse
+// sibling of the tool-agnostic effectCeiling.
+//
+// An empty Allow admits nothing — the strictest, fail-closed reading, matching
+// flowLabel's empty allow set.
+type EffectClassCondition struct {
+	Allow []string `json:"allow"`
+}
+
+// ConditionType returns the effectClass discriminator.
+func (EffectClassCondition) ConditionType() string { return ConditionTypeEffectClass }
+
+// MarshalJSON serializes EffectClassCondition with its discriminator.
+func (c EffectClassCondition) MarshalJSON() ([]byte, error) { return marshalCondition(c) }
+
+// BlastRadiusCondition bounds the quantitative size of one call's effect ("no refund over
+// $500") — the magnitude an argument-level allowlist cannot express, because the argument
+// is legal at every value and only its SIZE is the problem.
+//
+// A call whose blast radius cannot be quantified — no contract, or a contract naming an
+// argument the call did not supply — FAILS the condition. An action whose size cannot be
+// established must not be treated as small.
+//
+// CUMULATIVE velocity ("no more than $2,000 of refunds an hour" — the four hundred
+// individually-permitted $10 refunds per-call authorization structurally cannot see) is
+// NOT expressible here yet. It needs a weighted sliding-window sum, which the CallCounter
+// contract (a count of timestamps) does not provide, and adding a second accounting
+// system rather than generalizing that one would be the wrong shape. The grammar
+// deliberately carries no half-working key for it: an authored `maxTotal` that silently
+// bounded nothing would be worse than its absence.
+type BlastRadiusCondition struct {
+	// Max bounds one call's magnitude. Required — a condition with no bound bounds
+	// nothing.
+	Max *json.Number `json:"max"`
+}
+
+// ConditionType returns the blastRadius discriminator.
+func (BlastRadiusCondition) ConditionType() string { return ConditionTypeBlastRadius }
+
+// MarshalJSON serializes BlastRadiusCondition with its discriminator.
+func (c BlastRadiusCondition) MarshalJSON() ([]byte, error) { return marshalCondition(c) }
+
+// EffectCeiling is the tool-agnostic consequence bound: a top-level policy statement
+// that EVERY allowed action is additionally checked against, keyed on the action's effect
+// properties rather than on which tool it is.
+//
+// This is the purest form of consequence-gated escalation. A per-target condition has to
+// be written for each target, so the tool nobody thought about is the one with no gate;
+// the ceiling inverts that — a new or unannotated tool has no contract, therefore exceeds
+// the ceiling, therefore escalates. Approval is triggered by irreversibility plus blast
+// radius plus the absence of a compensating action, never by tool identity.
+//
+// The ceiling can only ever narrow: it is applied after a constraint has already allowed
+// the call, so it never admits anything the manifest denied.
+type EffectCeiling struct {
+	// MaxEffectClass is the most consequential class that passes without escalation.
+	// Empty leaves the class dimension unbounded.
+	MaxEffectClass string `json:"maxEffectClass,omitempty"`
+	// MaxBlastRadius is the largest magnitude that passes. Nil leaves the magnitude
+	// dimension unbounded. An unquantified action exceeds any set bound.
+	MaxBlastRadius *json.Number `json:"maxBlastRadius,omitempty"`
+	// RequireCompensation, when set, additionally demands a compensating action for any
+	// action above MaxEffectClass — the third input of the consequence gate. It is what
+	// distinguishes "irreversible but undoable in business terms" from "irreversible full
+	// stop".
+	RequireCompensation bool `json:"requireCompensation,omitempty"`
+	// OnExceed selects the outcome for an action over the ceiling: OnExceedEscalate (the
+	// default) marks it as needing human approval, OnExceedDeny refuses it outright.
+	// Empty means escalate.
+	OnExceed string `json:"onExceed,omitempty"`
+}
+
+// Ceiling outcomes for EffectCeiling.OnExceed.
+const (
+	// OnExceedEscalate routes an over-ceiling action to human approval. With no approval
+	// integration wired it is a refusal that says WHY — the fail-closed reading of
+	// "escalate" is deny, never allow.
+	OnExceedEscalate = "escalate"
+	// OnExceedDeny refuses an over-ceiling action outright, with no approval path.
+	OnExceedDeny = "deny"
+)
+
+// Outcome returns the ceiling's effective OnExceed, defaulting to escalate.
+func (c *EffectCeiling) Outcome() string {
+	if c == nil || c.OnExceed == "" {
+		return OnExceedEscalate
+	}
+	return c.OnExceed
+}
+
+// IsSet reports whether the ceiling bounds anything. A ceiling that bounds nothing is
+// treated as absent rather than as a ceiling every action passes, so a half-written block
+// cannot read as "checked and fine".
+func (c *EffectCeiling) IsSet() bool {
+	return c != nil && (c.MaxEffectClass != "" || c.MaxBlastRadius != nil || c.RequireCompensation)
+}
+
+// Exceeds reports whether a resolved effect is over the ceiling, and why. reasons are
+// stable, machine-readable tokens for the audit record; the human message is built by the
+// caller. A nil or unset ceiling never exceeds.
+func (c *EffectCeiling) Exceeds(eff ResolvedEffect) (bool, []string) {
+	if !c.IsSet() {
+		return false, nil
+	}
+	var reasons []string
+	overClass := c.MaxEffectClass != "" && !EffectClassAtMost(eff.Class, c.MaxEffectClass)
+	if overClass {
+		reasons = append(reasons, "effect_class")
+	}
+	if c.MaxBlastRadius != nil {
+		switch {
+		case !eff.Quantified:
+			// Unquantified is over ANY finite bound: an action whose size cannot be
+			// established must not be treated as small.
+			reasons = append(reasons, "blast_radius_unknown")
+		case exceedsNumber(eff.BlastRadius, *c.MaxBlastRadius):
+			reasons = append(reasons, "blast_radius")
+		}
+	}
+	// The compensation leg is the third input of the consequence gate and applies only to
+	// an action already over the class bound: demanding a compensating action for a
+	// reversible read would be noise, and the gate is about consequence, not paperwork.
+	if c.RequireCompensation && overClass && eff.CompensatingAction == "" {
+		reasons = append(reasons, "no_compensating_action")
+	}
+	return len(reasons) > 0, reasons
+}
+
+// exceedsNumber reports whether value is strictly greater than limit. An unparseable
+// limit reports true (fail closed: a bound that cannot be read bounds nothing, and
+// treating it as satisfied would silently disable the check). A nil value is handled by
+// the caller's Quantified test and never reaches here.
+func exceedsNumber(value *big.Float, limit json.Number) bool {
+	lim, ok := new(big.Float).SetString(limit.String())
+	if !ok {
+		return true
+	}
+	return value != nil && value.Cmp(lim) > 0
+}
+
+// ParseBlastRadiusNumber converts a manifest numeric literal to an exact big.Float, so a
+// bound above 2^53 is compared exactly rather than through a lossy float64 widening (the
+// same reason condition literals are decoded with UseNumber). ok is false for a literal
+// that is not a number.
+func ParseBlastRadiusNumber(n json.Number) (*big.Float, bool) {
+	f, ok := new(big.Float).SetString(n.String())
+	return f, ok
+}
+
+// ResolveEffect reduces a constraint's contract against one call's arguments. It is the
+// single resolution path, so the effectClass condition, the blastRadius condition, the
+// ceiling, and the audit record all judge exactly the same values — a second resolver
+// would be a place for them to silently disagree.
+//
+// A nil contract resolves to UnannotatedEffect (irreversible, unquantified): the
+// fail-closed default that makes an unannotated tool escalate under any ceiling.
+func ResolveEffect(contract *EffectContract, args map[string]interface{}) ResolvedEffect {
+	if contract == nil {
+		return UnannotatedEffect()
+	}
+	eff := ResolvedEffect{
+		Class:              contract.Class,
+		Idempotent:         contract.Idempotent,
+		CompensatingAction: contract.CompensatingAction,
+		Ref:                contract.Ref,
+		Annotated:          true,
+	}
+	spec := contract.BlastRadius
+
+	// The argument-parameterized table overlays the base contract. A table that matches
+	// nothing and declares no default resolves to the fail-closed default rather than to
+	// the base contract: a table that does not cover a value has not said it is safe.
+	if tbl := contract.ByArgument; tbl != nil {
+		matched, found := tbl.match(args)
+		switch {
+		case found:
+			if matched.Class != "" {
+				eff.Class = matched.Class
+			}
+			if matched.Idempotent != nil {
+				eff.Idempotent = *matched.Idempotent
+			}
+			if matched.CompensatingAction != "" {
+				eff.CompensatingAction = matched.CompensatingAction
+			}
+			if matched.BlastRadius != nil {
+				spec = matched.BlastRadius
+			}
+		default:
+			eff.Class = EffectIrreversible
+			eff.CompensatingAction = ""
+			spec = nil
+		}
+	}
+
+	if eff.Class == "" {
+		// Declared a contract but no class: unknown, so irreversible. Annotated stays
+		// true — the operator wrote a contract, they just did not say how reversible it
+		// is, which is a different remediation from "no contract at all".
+		eff.Class = EffectIrreversible
+	}
+	if spec != nil {
+		eff.Unit = spec.Unit
+		if v, ok := spec.resolve(args); ok {
+			eff.BlastRadius, eff.Quantified = v, true
+		}
+	}
+	return eff
+}
+
+// match finds the case for the call's argument value. found is false when the argument is
+// absent or unusable and no default is declared.
+func (t *EffectByArgument) match(args map[string]interface{}) (EffectCase, bool) {
+	raw, ok := args[t.Argument]
+	if !ok {
+		if t.Default != nil {
+			return *t.Default, true
+		}
+		return EffectCase{}, false
+	}
+	key := argumentMatchKey(raw)
+	if c, hit := t.lookup(key); hit {
+		return c, true
+	}
+	// Operation-style arguments carry the verb as the first token ("DROP TABLE users").
+	// Matching it is the same coarse first-verb rule allowedOperations applies, with the
+	// same documented limit: it is not a SQL parser, and a case never matches a verb
+	// buried after a leading CTE. The conservative direction is the safe one here — an
+	// unmatched value falls to Default, which is fail-closed when absent.
+	if first, _, cut := strings.Cut(key, " "); cut {
+		if c, hit := t.lookup(first); hit {
+			return c, true
+		}
+	}
+	if t.Default != nil {
+		return *t.Default, true
+	}
+	return EffectCase{}, false
+}
+
+// lookup matches a case key case-insensitively, the way an operator writes SQL verbs and
+// enum-ish argument values.
+func (t *EffectByArgument) lookup(key string) (EffectCase, bool) {
+	for k, c := range t.Cases {
+		if strings.EqualFold(strings.TrimSpace(k), key) {
+			return c, true
+		}
+	}
+	return EffectCase{}, false
+}
+
+// argumentMatchKey renders an argument value as the string the decision table matches on.
+// Numbers keep their literal form (json.Number is preserved through decoding), booleans
+// render as true/false, and anything else renders through fmt so a table can key on it
+// without the resolver having to model every JSON shape.
+func argumentMatchKey(raw interface{}) string {
+	switch v := raw.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case json.Number:
+		return v.String()
+	case bool:
+		if v {
+			return "true"
+		}
+		return "false"
+	default:
+		return fmt.Sprintf("%v", raw)
+	}
+}
+
+// resolve computes the call's blast-radius magnitude. ok is false when it cannot be
+// established, which every numeric bound treats as exceeded.
+func (s *BlastRadiusSpec) resolve(args map[string]interface{}) (*big.Float, bool) {
+	if s.Value != nil {
+		return ParseBlastRadiusNumber(*s.Value)
+	}
+	if s.Argument == "" {
+		return nil, false
+	}
+	raw, ok := args[s.Argument]
+	if !ok {
+		return nil, false
+	}
+	switch v := raw.(type) {
+	case json.Number:
+		return ParseBlastRadiusNumber(v)
+	case float64:
+		// A caller that decoded arguments without UseNumber. Exactness is already lost
+		// upstream; carry the value through rather than reporting it unquantified, which
+		// would over-block every such caller.
+		return new(big.Float).SetFloat64(v), true
+	case string:
+		// A numeric string ("250") is a magnitude; anything else is not. This does NOT
+		// fall through to counting characters — a free-form string has no magnitude, and
+		// inventing one would be exactly the inference this layer refuses to do.
+		return new(big.Float).SetString(strings.TrimSpace(v))
+	case []interface{}:
+		// A list argument (recipients, row ids) contributes its LENGTH: "how many things
+		// does this touch" is the quantity a recipient-count or row-count bound means.
+		return new(big.Float).SetInt64(int64(len(v))), true
+	default:
+		return nil, false
+	}
+}
+
+// String renders a resolved effect for an operator-facing message.
+func (e ResolvedEffect) String() string {
+	parts := []string{"class=" + e.Class}
+	if e.Quantified {
+		br := "blastRadius=" + e.BlastRadius.Text('f', -1)
+		if e.Unit != "" {
+			br += " " + e.Unit
+		}
+		parts = append(parts, br)
+	} else {
+		parts = append(parts, "blastRadius=unquantified")
+	}
+	if e.CompensatingAction != "" {
+		parts = append(parts, "compensatingAction="+e.CompensatingAction)
+	}
+	if !e.Annotated {
+		parts = append(parts, "unannotated")
+	}
+	return strings.Join(parts, " ")
+}
+
+// AuditDetails renders a resolved effect as the structured fields an audit record and a
+// denial detail carry. Sorted, scalar values only — never free-form prose in a structured
+// field.
+func (e ResolvedEffect) AuditDetails() map[string]interface{} {
+	d := map[string]interface{}{
+		"effect_class": e.Class,
+		"annotated":    e.Annotated,
+	}
+	if e.Quantified {
+		d["blast_radius"] = e.BlastRadius.Text('f', -1)
+		if e.Unit != "" {
+			d["blast_radius_unit"] = e.Unit
+		}
+	}
+	if e.CompensatingAction != "" {
+		d["compensating_action"] = e.CompensatingAction
+	}
+	if e.Ref != "" {
+		d["effect_contract"] = e.Ref
+	}
+	return d
+}
+
+// SortedEffectClasses returns classes in vocabulary order, for deterministic messages
+// and audit details built from a manifest-authored set.
+func SortedEffectClasses(classes []string) []string {
+	out := append([]string(nil), classes...)
+	sort.SliceStable(out, func(i, j int) bool {
+		ri, oki := effectClassRank[out[i]]
+		rj, okj := effectClassRank[out[j]]
+		if oki && okj {
+			return ri < rj
+		}
+		return out[i] < out[j]
+	})
+	return out
+}

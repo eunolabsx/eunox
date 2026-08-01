@@ -561,6 +561,12 @@ func LoadUpstreamPDP(u *config.UpstreamConfig, hostTransport, baseDir string, co
 		// fault).
 		engineOpts = append(engineOpts, enforcement.WithoutAntecedentRecording())
 	}
+	if merged.HasEffectCeiling() {
+		// The tool-agnostic consequence bound, checked on every allow. Wired only when the
+		// policy declares one: the ceiling can only narrow, so an absent one changes
+		// nothing, and leaving it unset skips the per-allow check entirely.
+		engineOpts = append(engineOpts, enforcement.WithEffectCeiling(merged.EffectCeiling))
+	}
 	if !merged.HasFlowLabel() {
 		// No flowLabel condition or labelOutput directive anywhere in the policy: the
 		// per-call flow-relevance scan and the peek/record path are pure overhead, and

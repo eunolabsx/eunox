@@ -170,6 +170,8 @@ func (e *Engine) registerBuiltins() {
 	e.handlers[capability.ConditionTypeAllowedValues] = ConditionHandlerFunc(e.handleAllowedValues)
 	e.handlers[capability.ConditionTypeSequenceBlock] = ConditionHandlerFunc(e.handleSequenceBlock)
 	e.handlers[capability.ConditionTypeFlowLabel] = ConditionHandlerFunc(e.handleFlowLabel)
+	e.handlers[capability.ConditionTypeEffectClass] = ConditionHandlerFunc(e.handleEffectClass)
+	e.handlers[capability.ConditionTypeBlastRadius] = ConditionHandlerFunc(e.handleBlastRadius)
 	e.handlers[capability.ConditionTypePolicy] = ConditionHandlerFunc(e.handlePolicy)
 	e.handlers[capability.ConditionTypeCustom] = ConditionHandlerFunc(e.handleCustom)
 }

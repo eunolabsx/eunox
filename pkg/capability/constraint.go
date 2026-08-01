@@ -222,8 +222,16 @@ type Constraint struct {
 	// principal-scoped constraint is skipped during selection like a target
 	// mismatch (fail closed). Needs a validated token, so it only takes effect
 	// under JWT mode (--jwks-uri).
-	Principal  map[string][]string `json:"principal,omitempty"`
-	Conditions []Condition         `json:"conditions,omitempty"`
+	Principal map[string][]string `json:"principal,omitempty"`
+	// Effect declares what a call to this target DOES — its reversibility class, blast
+	// radius, idempotency, and compensating action — as PDP-addressable policy input
+	// (see EffectContract). It is a declaration, never an inference from the payload,
+	// and a constraint without one resolves to the fail-closed default (irreversible,
+	// unquantified), which is what makes an unannotated tool escalate under an
+	// effectCeiling. Consumed by the effectClass and blastRadius conditions and by the
+	// top-level ceiling; all three read the SAME ResolveEffect result.
+	Effect     *EffectContract `json:"effect,omitempty"`
+	Conditions []Condition     `json:"conditions,omitempty"`
 	// Directives are post-allow obligations applied to the upstream response.
 	// Unlike Conditions (boolean predicates), directives mutate the response
 	// and MUST NOT affect the allow/deny decision.
@@ -552,9 +560,14 @@ type constraintJSON struct {
 	ArgumentSchema  *ArgumentSchema `json:"argumentSchema,omitempty"`
 	// Principal must round-trip: dropping it silently widens the constraint to match
 	// every caller rather than only the intended sub/iss/agent_id/task_id.
-	Principal  map[string][]string `json:"principal,omitempty"`
-	Conditions []ConditionWrapper  `json:"conditions,omitempty"`
-	Directives []DirectiveWrapper  `json:"directives,omitempty"`
+	Principal map[string][]string `json:"principal,omitempty"`
+	// Effect must round-trip for the same reason Principal must: dropping it silently
+	// re-resolves the target to the UNANNOTATED default (irreversible, unquantified),
+	// which under a ceiling turns every call to it into an escalation the author never
+	// wrote — a policy that loaded clean and behaves differently than the file says.
+	Effect     *EffectContract    `json:"effect,omitempty"`
+	Conditions []ConditionWrapper `json:"conditions,omitempty"`
+	Directives []DirectiveWrapper `json:"directives,omitempty"`
 }
 
 // MarshalJSON serializes Constraint while preserving polymorphic conditions and directives.
@@ -583,6 +596,7 @@ func (c Constraint) MarshalJSON() ([]byte, error) { //nolint:gocritic // hugePar
 		DescriptionHash: c.DescriptionHash,
 		ArgumentSchema:  c.ArgumentSchema,
 		Principal:       c.Principal,
+		Effect:          c.Effect,
 		Conditions:      conditions,
 		Directives:      directives,
 	})
@@ -618,6 +632,7 @@ func (c *Constraint) UnmarshalJSON(data []byte) error {
 	c.DescriptionHash = aux.DescriptionHash
 	c.ArgumentSchema = aux.ArgumentSchema
 	c.Principal = aux.Principal
+	c.Effect = aux.Effect
 
 	// Always reassign Conditions and Directives so unmarshalling into a reused
 	// Constraint cannot retain stale policy objects: a reload that clears them

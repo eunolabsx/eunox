@@ -105,6 +105,17 @@ type Decision string
 const (
 	DecisionAllow Decision = "allow"
 	DecisionDeny  Decision = "deny"
+	// DecisionEscalate marks an action the policy would permit but whose CONSEQUENCE
+	// exceeds the effectCeiling: it needs human approval, not a policy verdict.
+	//
+	// It is not a third forwarding state. Every forward gate in the proxy tests
+	// `!= DecisionAllow`, so an escalation is NOT forwarded — the fail-closed reading
+	// of "escalate" with no approval integration wired is "deny, and say why". What it
+	// changes is the RECORD and the reason: the tape carries decision=escalate and the
+	// consequence inputs (class, blast radius, compensating action), so an auditor —
+	// or a control plane driving an approval workflow — can tell an action awaiting a
+	// human from one policy forbids outright.
+	DecisionEscalate Decision = "escalate"
 )
 
 // DenialInfo describes why enforcement denied a request.

@@ -87,7 +87,8 @@ type auditStatsSummary struct {
 	allowed         int
 	blocked         int // denials with audit_only=false (call was rejected)
 	observed        int // denials with audit_only=true  (call was forwarded)
-	other           int // records with a decision that is neither "allow" nor "deny"
+	escalated       int // decision=escalate: refused pending human approval (never forwarded)
+	other           int // records with a decision outside "allow" | "deny" | "escalate"
 	blockedDenials  map[denialKey]int
 	observedDenials map[denialKey]int
 }
@@ -133,6 +134,14 @@ func computeAuditStats(r io.Reader) (auditStatsSummary, error) {
 				out.blocked++
 				out.blockedDenials[k]++
 			}
+		case audit.DecisionEscalate:
+			// An escalation is a refusal — the upstream was never called — so it is
+			// tallied with the blocked denials AND counted separately, because "needs a
+			// human" is the operator's queue of work while a plain deny is not.
+			k := denialKey{tool: statsTarget(rec.TargetType, rec.Target, rec.Method), code: rec.DenialCode}
+			out.escalated++
+			out.blocked++
+			out.blockedDenials[k]++
 		default:
 			// Unknown decision value — count in "other" so the total reconciles.
 			out.other++
@@ -153,10 +162,16 @@ func printAuditStats(w io.Writer, s auditStatsSummary) {
 
 	wf("Total records: %d  (allowed: %d, blocked: %d, observed: %d",
 		s.total, s.allowed, s.blocked, s.observed)
+	if s.escalated > 0 {
+		wf(", of which escalated: %d", s.escalated)
+	}
 	if s.other > 0 {
 		wf(", other: %d", s.other)
 	}
 	wln(")")
+	if s.escalated > 0 {
+		wln("  (escalated = refused because the action's consequence exceeds the effect ceiling: the call was NOT forwarded and needs human approval, not a policy fix.)")
+	}
 	if s.observed > 0 {
 		wln("  (observed = audit-mode denials: the call was forwarded; the verdict is recorded but was not enforced.)")
 	}

@@ -53,7 +53,7 @@ type auditRecord struct {
 	TargetType    string          `json:"target_type,omitempty"`    // "tool" | "resource" | "prompt" | "system"; namespace taken from the MCP method, not the raw identifier
 	Target        string          `json:"target,omitempty"`         // canonical bare target: tool name, resource URI, prompt name, or "sampling/createMessage"
 	Method        string          `json:"method,omitempty"`         // MCP method that produced the decision, e.g. "tools/call"
-	Decision      string          `json:"decision"`                 // "allow" | "deny"
+	Decision      string          `json:"decision"`                 // "allow" | "deny" | "escalate"
 	AuditOnly     bool            `json:"audit_only,omitempty"`     // true when the decision was observed, not enforced (audit mode)
 	DenialCode    string          `json:"denial_code,omitempty"`
 	ConditionType string          `json:"condition_type,omitempty"`
@@ -1283,6 +1283,12 @@ func (s *Sink) clock() time.Time {
 	return time.Now()
 }
 
+// DecisionEscalate is the audit tape's decision value for an action refused because its
+// CONSEQUENCE exceeds the policy's effect ceiling and needs human approval. It is a
+// refusal (the upstream is never called), distinguished from decision=deny so an auditor
+// can separate "awaiting a human" from "forbidden by policy".
+const DecisionEscalate = "escalate"
+
 // RecordParams carries one audit record's fields from the call site into Record.
 //
 // It is a struct rather than a parameter list because the fields it replaced were
@@ -1319,8 +1325,23 @@ type RecordParams struct {
 // RecordAllow/RecordDeny forward here with those left empty for the
 // single-upstream/stdio path; gateway routeSinks call it directly.
 func (s *Sink) Record(ctx context.Context, p RecordParams) {
+	// An ESCALATION_REQUIRED refusal is recorded as decision=escalate rather than
+	// decision=deny: the call was NOT forwarded either way, but "a human must approve
+	// this" and "policy forbids this" are different facts for an auditor, and a control
+	// plane driving an approval workflow keys on exactly this distinction.
+	//
+	// It is DERIVED from the denial code rather than passed alongside it, so the two
+	// cannot disagree — there is no call site that can stamp decision=escalate on a
+	// non-escalation code, or record an escalation as a plain deny. The recorders keep
+	// one deny entrypoint; this is the single place the taxonomy widens.
+	if p.DenialCode == capability.ErrCodeEscalationRequired && p.Decision == "deny" {
+		p.Decision = DecisionEscalate
+	}
 	activityID := 1
-	if p.Decision == "deny" {
+	if p.Decision == "deny" || p.Decision == DecisionEscalate {
+		// OCSF activity_id 2 is "denied". An escalation is a refusal on the wire — the
+		// upstream was never called — so it maps there too; the decision field is what
+		// carries the finer distinction.
 		activityID = 2
 	}
 
