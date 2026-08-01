@@ -27,6 +27,26 @@ Section conventions:
 
 ### Added
 
+- **Interface pinning Tier-2** — every session now auto-baselines the advertised surface
+  of **every** tool the upstream reports and re-diffs it on **every** `tools/list`. A tool
+  whose surface changes mid-session is denied on the `tools/call` leg and hidden from
+  `tools/list`, so the catalog a host is shown never advertises a tool its call leg will
+  reject. **On by default: no manifest key, no flag.** This closes the two gaps
+  `descriptionHash` leaves — that pin covers only tools an operator wrote one for, and it
+  only ran at session init, while MCP lets a server change its tool list mid-session.
+  - The deny is **hard**: a route running `--audit` cannot downgrade it to a forward,
+    because forwarding to the upstream whose interface was just rewritten is the outcome
+    the check exists to prevent. Operators running an observe/wiretap route should know
+    this is the one refusal such a route will block.
+  - The break is **sticky** and **per session**: reverting the surface does not re-open
+    the tool (a host may still hold the rewritten copy), so recovery from a false positive
+    is a **new session**, not a proxy restart. The blast radius of a wrong verdict is one
+    session, which is why it ships without an off switch.
+  - **Honest limit, do not overstate:** this is pure metadata comparison. It catches
+    tool-description poisoning and silent interface drift. It does **not** catch a rug pull
+    where the advertised interface is unchanged and only the server's behavior differs —
+    that is behavioral, and out of scope by design. See
+    [`docs/interface-pinning-tier2.md`](./docs/interface-pinning-tier2.md).
 - `--killswitch-session-ttl` (Redis backend only) sets how long a **session** kill
   tombstone survives before it is garbage-collected. The lifetime was hardwired at 30
   days with the underlying option reachable only by a library consumer, and when a
