@@ -56,13 +56,8 @@ type httpSession struct {
 	upHTTPClient   *http.Client
 	upstreamSessID string // Mcp-Session-Id returned by the remote upstream
 
-	// pendingMu guards pending, byUpstreamID, hostToUp, and upstreamSeq.
+	// pendingMu guards byUpstreamID, hostToUp, and upstreamSeq.
 	pendingMu sync.Mutex
-	// pending is keyed by the host's JSON-RPC ID solely to reject a duplicate
-	// in-flight host ID. It does NOT route upstream responses (byUpstreamID's job), so
-	// it is a SET: storing channels here invited exactly the misreading this comment
-	// had to disclaim, and nothing ever delivered through them.
-	pending map[string]struct{}
 	// byUpstreamID routes subprocess-upstream responses back to the waiting caller,
 	// keyed by the proxy-generated nonce. A response with a stale nonce (its caller
 	// already timed out and removed the entry) has nowhere to land, so a late
@@ -194,7 +189,7 @@ type httpSession struct {
 	// reqSem bounds concurrent in-flight enforced-request handlers on this session,
 	// the HTTP analogue of the stdio transport's hostSem. Without it a pipelining
 	// host — or a silent upstream under --upstream-timeout=0, where handlers never
-	// return — grows goroutines and the pending / byUpstreamID maps without bound on
+	// return — grows goroutines and the byUpstreamID / hostToUp maps without bound on
 	// the network-exposed transport. Lazily created (reqSemOnce) so directly
 	// constructed sessions (tests) get a real cap on first use; acquired non-blocking
 	// in handleSessionPost, rejected with a retryable busy error on saturation.
@@ -342,11 +337,11 @@ func (s *httpSession) ownerMismatch(cur *pdp.JWTClaims) bool {
 // newSession spawns an upstream subprocess and performs the MCP initialize
 // handshake. The session is registered in p.sessions before readUpstream starts so
 // the cleanup goroutine finds it even if the subprocess exits immediately.
-func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, clientIP string) (*httpSession, error) {
-	// Captured BEFORE the (possibly slow) subprocess spawn + handshake below, so
-	// registerSession can detect a global kill's reapAllKilledSessions sweeping the
-	// registry during that window — see the reapGen field comment.
-	startGen := p.currentReapGen()
+// startGen is the reap generation the CALLER observed before its pre-spawn kill gate (see
+// handleMCPPost); it is not captured here, because everything between that gate and this
+// point — the gate's own kill-store round-trip included — is inside the window
+// registerSession has to detect.
+func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, clientIP string, startGen uint64) (*httpSession, error) {
 	// Session-scoped teardown context, mirroring newRemoteSession so both transports share
 	// one cancellation primitive. Built into the struct literal BEFORE registerSession
 	// publishes the session into p.sessions, so a concurrent close() (server shutdown / kill)
@@ -359,7 +354,6 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 		id:           uuid.New().String(),
 		proxy:        p,
 		route:        route,
-		pending:      make(map[string]struct{}),
 		byUpstreamID: make(map[string]chan upstreamResult),
 		hostToUp:     make(map[string]*json.RawMessage),
 		done:         make(chan struct{}),
@@ -1177,13 +1171,10 @@ func (s *httpSession) callSubprocessUpstream(ctx context.Context, msg mcp.RPCMsg
 	// newSession initializes these, so this lazy init only fires for a session
 	// assembled directly in a test; do it under pendingMu so the map-header write
 	// cannot race the off-lock read in readUpstream/deliverUpstreamResponse.
-	// pending is initialized here too: awaitNonced receives the maps BY VALUE and
-	// writes pending[hostKey] unconditionally, so a nil pending panicked on exactly
-	// the test-assembled session this block exists to accommodate.
+	// hostToUp is initialized here too: awaitNonced receives the maps BY VALUE, and it
+	// now both writes the correlation and reads the duplicate-ID set from it, so a nil
+	// map would panic on exactly the test-assembled session this block accommodates.
 	s.pendingMu.Lock()
-	if s.pending == nil {
-		s.pending = make(map[string]struct{})
-	}
 	if s.byUpstreamID == nil {
 		s.byUpstreamID = make(map[string]chan upstreamResult)
 	}
@@ -1197,7 +1188,7 @@ func (s *httpSession) callSubprocessUpstream(ctx context.Context, msg mcp.RPCMsg
 	// delivery path (deliverUpstreamError) is stdio-bridge-only and simply never fires here:
 	// an HTTP session's remote-upstream failures already surface as callUpstream errors
 	// (callRemoteUpstream), recorded as deny/UPSTREAM_ERROR.
-	return awaitNonced(ctx, &s.pendingMu, s.pending, s.byUpstreamID, s.hostToUp, &s.upstreamSeq, s.teardownDone(), mcp.MsgKey(msg.ID),
+	return awaitNonced(ctx, &s.pendingMu, s.byUpstreamID, s.hostToUp, &s.upstreamSeq, s.teardownDone(), mcp.MsgKey(msg.ID),
 		func(id *json.RawMessage) { msg.ID = id },
 		func() error { return s.upWriter.Write(msg) })
 }
@@ -1298,7 +1289,12 @@ func releaseSessionState(sess *httpSession) {
 	if sess.route == nil {
 		return
 	}
-	budget := msToDuration(sess.proxy.shutdownMs)
+	// shutdownBudget, not a second inline derivation: it is the nil-proxy-safe,
+	// zero-means-default clamp this file already defines, and re-deriving it here
+	// dereferenced sess.proxy unconditionally (a nil-proxy test session panics) and read
+	// shutdownMs <= 0 as "wait zero time" — a teardown that skips the in-flight drain
+	// entirely, which is the fail-open the drain exists to close.
+	budget := sess.shutdownBudget()
 	sess.awaitInFlightDrained(budget)
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()

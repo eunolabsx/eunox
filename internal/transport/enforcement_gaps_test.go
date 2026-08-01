@@ -20,6 +20,7 @@ import (
 	"github.com/eunolabs/eunox/internal/mcp/mcptest"
 
 	"github.com/eunolabs/eunox/internal/pdp"
+	"github.com/eunolabs/eunox/pkg/callcounter"
 	"github.com/eunolabs/eunox/pkg/capability"
 	"github.com/eunolabs/eunox/pkg/enforcement"
 	"github.com/eunolabs/eunox/pkg/killswitch"
@@ -638,7 +639,6 @@ func newStdioProxyForSamplingTest(t *testing.T, dp pdp.PolicyDecisionPoint) (*St
 	p := &StdioProxy{
 		pdp:        dp,
 		sessionID:  "test-sess",
-		pending:    make(map[string]struct{}),
 		hostWriter: mcp.NewMsgWriter(&writerAdapter{hw}),
 		upWriter:   mcp.NewMsgWriter(&writerAdapter{uw}),
 	}
@@ -737,7 +737,7 @@ func TestGap5_StdioProxy_Sampling_ManifestHasSamplingEntry(t *testing.T) {
 
 // TestStdioForwardHostNotification_EnforcedMethodDenied is the regression for
 // each enforced method (tools/call, resources/read, resources/subscribe,
-// prompts/get) framed as a host->upstream notification (no id): IsNotification's
+// resources/unsubscribe, prompts/get) framed as a host->upstream notification (no id): IsNotification's
 // classification is purely structural, so before the fix nothing stopped a
 // notification-shaped enforced call from being forwarded to the upstream
 // verbatim, bypassing both the PDP decision and the audit log. Each must
@@ -825,6 +825,7 @@ func TestStdioForwardHostNotification_EnforcedMethodDenied(t *testing.T) {
 		capability.MethodToolsCall,
 		capability.MethodResourcesRead,
 		capability.MethodResourcesSubscribe,
+		capability.MethodResourcesUnsubscribe,
 		capability.MethodPromptsGet,
 	}
 	for _, method := range methods {
@@ -1062,7 +1063,6 @@ func TestGap5_HTTPProxy_SamplingDenied_ErrorResponse(t *testing.T) {
 	p := &StdioProxy{
 		pdp:        dp,
 		sessionID:  "test-sess",
-		pending:    make(map[string]struct{}),
 		hostWriter: mcp.NewMsgWriter(&writerAdapter{hw}),
 		upWriter:   mcp.NewMsgWriter(&writerAdapter{uw}),
 	}
@@ -1335,6 +1335,211 @@ func TestGap3_HTTPProxy_ResourcesSubscribe_EmptyURI_Error(t *testing.T) {
 	}
 	if fu.CountByMethod("resources/subscribe") != 0 {
 		t.Error("upstream must not be called for an empty resource URI")
+	}
+}
+
+// resources/unsubscribe is enforced against the same manifest entry as its subscribe twin,
+// but through the PDP's CANCEL decision rather than its READ decision. Before it was mapped
+// it appeared nowhere in the repo, so it fell to dispatchUnmapped's fail-closed default and
+// was denied in EVERY mode, with no manifest spelling able to allow it: a host that
+// subscribed could never cancel through the proxy, and the upstream kept pushing
+// resource-updated notifications for the rest of the session. Denying it protected
+// nothing — cancelling a subscription only reduces data flow. Routing it through the read
+// decision would have reintroduced that same dead end through the back door (a spent
+// maxCalls budget denying the cancel), which is what the cancel entry point avoids; see the
+// DecideResourceCancel tests in internal/pdp for the per-condition pins.
+
+func TestGap3_HTTPProxy_ResourcesUnsubscribe_Allowed(t *testing.T) {
+	fu := newFullFakeUpstream()
+	upURL := startFakeUpstream(t, fu)
+
+	_, proxySrv := newManifestProxy(t, upURL,
+		capability.Constraint{Target: "resource:file:///data/live/*", Actions: []string{"read"}},
+	)
+	sid := initSession(t, proxySrv)
+
+	params, _ := json.Marshal(mcp.ResourceReadParams{URI: "file:///data/live/metrics"})
+	msg := mcp.RPCMsg{
+		JSONRPC: "2.0",
+		ID:      mcp.RawJSON(`60`),
+		Method:  "resources/unsubscribe",
+		Params:  params,
+	}
+	result := decodeRPC(t, postMCP(t, proxySrv, msg, sid))
+
+	if result.Error != nil {
+		t.Fatalf("expected no error; got %+v", result.Error)
+	}
+	if fu.CountByMethod("resources/unsubscribe") != 1 {
+		t.Error("resources/unsubscribe was not forwarded to upstream")
+	}
+}
+
+func TestGap3_HTTPProxy_ResourcesUnsubscribe_Denied_AbsentFromManifest(t *testing.T) {
+	fu := newFullFakeUpstream()
+	upURL := startFakeUpstream(t, fu)
+
+	_, proxySrv := newManifestProxy(t, upURL,
+		capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}},
+	)
+	sid := initSession(t, proxySrv)
+
+	params, _ := json.Marshal(mcp.ResourceReadParams{URI: "file:///data/live/metrics"})
+	msg := mcp.RPCMsg{
+		JSONRPC: "2.0",
+		ID:      mcp.RawJSON(`61`),
+		Method:  "resources/unsubscribe",
+		Params:  params,
+	}
+	result := decodeRPC(t, postMCP(t, proxySrv, msg, sid))
+
+	if result.Error == nil {
+		t.Fatal("expected JSON-RPC error for denied resources/unsubscribe")
+	}
+	if result.Error.Code != capability.JSONRPCCodeAuthorizationFailed {
+		t.Errorf("error.code = %d, want %d (AUTHORIZATION_FAILED)", result.Error.Code, capability.JSONRPCCodeAuthorizationFailed)
+	}
+	if fu.CountByMethod("resources/unsubscribe") != 0 {
+		t.Error("upstream must not receive a denied resources/unsubscribe")
+	}
+}
+
+func TestGap3_HTTPProxy_ResourcesUnsubscribe_EmptyURI_Error(t *testing.T) {
+	fu := newFullFakeUpstream()
+	upURL := startFakeUpstream(t, fu)
+
+	_, proxySrv := newManifestProxy(t, upURL,
+		capability.Constraint{Target: "resource:file:///data/*", Actions: []string{"read"}},
+	)
+	sid := initSession(t, proxySrv)
+
+	params, _ := json.Marshal(mcp.ResourceReadParams{URI: ""})
+	msg := mcp.RPCMsg{
+		JSONRPC: "2.0",
+		ID:      mcp.RawJSON(`62`),
+		Method:  "resources/unsubscribe",
+		Params:  params,
+	}
+	result := decodeRPC(t, postMCP(t, proxySrv, msg, sid))
+
+	if result.Error == nil {
+		t.Fatal("expected JSON-RPC error for empty URI")
+	}
+	if result.Error.Code != -32602 {
+		t.Errorf("error code = %d, want -32602 (INVALID_PARAMS)", result.Error.Code)
+	}
+	if fu.CountByMethod("resources/unsubscribe") != 0 {
+		t.Error("upstream must not be called for an empty resource URI")
+	}
+}
+
+// The end-to-end shape of the cancel decision: a one-call budget spent by the SUBSCRIBE
+// must still leave the host able to unsubscribe, and the cancel must reach the upstream —
+// otherwise the proxy hands the host a subscription it can open but never close, which is
+// the exact dead end mapping the method was meant to remove.
+func TestGap3_HTTPProxy_ResourcesUnsubscribe_AllowedAfterQuotaExhausted(t *testing.T) {
+	fu := newFullFakeUpstream()
+	upURL := startFakeUpstream(t, fu)
+
+	manifest := &config.LocalManifest{
+		Name:    "test-policy",
+		Version: "1.0.0",
+		Capabilities: []capability.Constraint{{
+			Target:     "resource:file:///data/live/*",
+			Actions:    []string{"read"},
+			Conditions: []capability.Condition{capability.MaxCallsCondition{Count: 1, WindowSeconds: 3600}},
+		}},
+	}
+	dp := pdp.NewManifestPDP(manifest.Capabilities,
+		enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory())),
+		killswitch.NewInMemory())
+	_, proxySrv := newTestRemoteProxy(t, upURL, httpProxyOptions{
+		PDP:        dp,
+		DriftCheck: drift.CheckFunc(func(json.RawMessage, string, error) error { return nil }),
+	})
+	sid := initSession(t, proxySrv)
+
+	params, _ := json.Marshal(mcp.ResourceReadParams{URI: "file:///data/live/metrics"})
+	send := func(id, method string) mcp.RPCMsg {
+		return decodeRPC(t, postMCP(t, proxySrv, mcp.RPCMsg{
+			JSONRPC: "2.0", ID: mcp.RawJSON(id), Method: method, Params: params,
+		}, sid))
+	}
+
+	// The subscribe spends the resource's single slot.
+	if sub := send(`70`, "resources/subscribe"); sub.Error != nil {
+		t.Fatalf("resources/subscribe should be allowed; got %+v", sub.Error)
+	}
+
+	// A second read IS rate limited, so the budget really is spent.
+	read := send(`71`, "resources/read")
+	if read.Error == nil {
+		t.Fatal("a second read must be rate limited; the test's premise is that the budget is spent")
+	}
+
+	// The unsubscribe still goes through, and reaches the upstream.
+	if unsub := send(`72`, "resources/unsubscribe"); unsub.Error != nil {
+		t.Fatalf("resources/unsubscribe must not be denied by a spent read budget; got %+v", unsub.Error)
+	}
+	if fu.CountByMethod("resources/unsubscribe") != 1 {
+		t.Error("the allowed resources/unsubscribe was not forwarded to the upstream")
+	}
+}
+
+// The enforced set is what both transports' notification guards derive from, so a
+// notification-framed unsubscribe must be rejected like every other enforced method
+// rather than forwarded verbatim.
+func TestGap3_ResourcesUnsubscribe_IsEnforcedMethod(t *testing.T) {
+	if !isEnforcedMethod(capability.MethodResourcesUnsubscribe) {
+		t.Error("resources/unsubscribe must be in the enforced (Decide*) set")
+	}
+	if tt, ok := capability.MethodTargetType(capability.MethodResourcesUnsubscribe); !ok || tt != capability.TargetTypeResource {
+		t.Errorf("MethodTargetType(resources/unsubscribe) = %q, %v; want resource, true (audit records need the target namespace)", tt, ok)
+	}
+}
+
+// The audit-mode banner must name exactly the ENFORCED set — the methods that reach the
+// upstream AND leave a decision record — and its list is derived from decideMethodHandlers,
+// so a newly enforced method shows up automatically. The locally-answered half must NOT be
+// advertised as "forwarded and logged": initialize and ping never touch the upstream and
+// write no record, and the …/list flavors are recorded as enumeration events, not decisions.
+func TestEnforcedMethodSummary_DerivedFromTheDecideTable(t *testing.T) {
+	for _, m := range []string{
+		capability.MethodToolsCall,
+		capability.MethodResourcesRead,
+		capability.MethodResourcesSubscribe,
+		capability.MethodResourcesUnsubscribe,
+		capability.MethodPromptsGet,
+	} {
+		if !strings.Contains(enforcedMethodSummary, m) {
+			t.Errorf("enforced method %q missing from the audit-mode banner summary %q", m, enforcedMethodSummary)
+		}
+	}
+	for _, m := range []string{
+		capability.MethodToolsList,
+		capability.MethodResourcesList,
+		capability.MethodPromptsList,
+		mcp.MethodInitialize,
+		methodPing,
+	} {
+		if strings.Contains(enforcedMethodSummary, m) {
+			t.Errorf("locally-answered method %q must not be advertised as forwarded and logged: %q", m, enforcedMethodSummary)
+		}
+		if _, ok := locallyAnsweredHandlers[m]; !ok {
+			t.Errorf("%q is expected to be locally answered, but is not in the table", m)
+		}
+	}
+	// The banner's caveat names these as NOT dispatched, so neither table may claim them.
+	for _, m := range []string{"completion/complete", "logging/setLevel", "resources/templates/list"} {
+		if strings.Contains(enforcedMethodSummary, m) {
+			t.Errorf("method %q is NOT dispatched (it hits the fail-closed default) but the banner advertises it", m)
+		}
+		if _, ok := decideMethodHandlers[m]; ok {
+			t.Errorf("%q unexpectedly became an enforced method; the banner caveat names it as unmapped", m)
+		}
+		if _, ok := locallyAnsweredHandlers[m]; ok {
+			t.Errorf("%q unexpectedly became locally answered; the banner caveat names it as unmapped", m)
+		}
 	}
 }
 

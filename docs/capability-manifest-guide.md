@@ -22,6 +22,7 @@ The proxy enforces policy on the following MCP methods:
 | `resources/read` | PDP decision — allow or deny based on manifest + conditions |
 | `resources/list` | Filter response to permitted resources only (`read` / `*` action) |
 | `resources/subscribe` | Gate initial subscription with the same read-access policy |
+| `resources/unsubscribe` | Gate cancellation against the same `read` entry, by match alone — no conditions, no session state (see §2c) |
 | `prompts/get` | PDP decision — allow or deny based on manifest + conditions |
 | `prompts/list` | Filter response to permitted prompts only (`get` / `*` action) |
 | `sampling/createMessage` | Denied by default; opt-in with `allow` / `*` action (see §2b for HTTP-mode limitation) |
@@ -41,6 +42,7 @@ eunox stats
 ```
 
 Every enforced-method call (`tools/call`, `resources/read`, `resources/subscribe`,
+`resources/unsubscribe`,
 `prompts/get`, `sampling/createMessage`) is forwarded and recorded to `~/.eunox/audit.jsonl`
 with `audit_only: true`; `tools/call` records also include the full tool argument map.
 (`…/list` calls forward the full upstream catalog unfiltered and are recorded as enumeration events.) `eunox stats` prints a
@@ -280,7 +282,7 @@ pattern against the target using `path.Match` glob semantics.
 | Action | Permits |
 |--------|---------|
 | `call` | `tools/call` for the matched tool name (also shown in `tools/list`) |
-| `read` | `resources/read` for the matched URI (also shown in `resources/list`); gates `resources/subscribe` |
+| `read` | `resources/read` for the matched URI (also shown in `resources/list`); gates `resources/subscribe`, and gates `resources/unsubscribe` by match alone (§2c) |
 | `get` | `prompts/get` for the matched prompt name (also shown in `prompts/list`) |
 | `allow` | `sampling/createMessage` from the upstream (opt-in) |
 | `*` | every action valid for the constraint's own target type only |
@@ -412,7 +414,7 @@ stop, not a policy verdict.
 > is not forwarded back to the upstream.  Full sampling round-trip
 > support in HTTP mode is a known gap.
 
-## 2c. Resource subscriptions (`resources/subscribe`)
+## 2c. Resource subscriptions (`resources/subscribe`, `resources/unsubscribe`)
 
 `resources/subscribe` opens a live update channel for a specific resource
 URI. The proxy enforces the same read-access policy as `resources/read`:
@@ -421,14 +423,31 @@ manifest capability with `read` or `*` action.
 
 ```yaml
 capabilities:
-  # Permit reading and subscribing to live metrics.
+  # Permit reading, subscribing to, and unsubscribing from live metrics.
   - target: "resource:file:///data/live/*"
-    actions: [read]   # covers both resources/read and resources/subscribe
+    actions: [read]   # covers resources/read, resources/subscribe, resources/unsubscribe
 ```
 
 If the URI does not match any manifest entry, the subscription is denied
 before any channel is established.  Kill-switch and audit-mode semantics
 apply.
+
+`resources/unsubscribe` is enforced against the same `read` entry, but it is checked by
+**match alone**: the URI must resolve to a `resource:` entry with `read` or `*`, and that is
+the whole decision. Cancelling a subscription only ever *reduces* data flow, so it is not a
+separate permission — but it is enforced rather than blanket-forwarded so the tape stays
+symmetric (every subscribe has its matching unsubscribe) and so a URI the manifest never
+permitted, and which therefore was never subscribable, cannot be named here either.
+
+**Conditions on the entry are not evaluated for an unsubscribe, and it consumes no session
+state.** Metering a cancellation would strand the very channel the grant opened: with
+`maxCalls: {count: 1}` on the entry above, the `subscribe` spends the single slot and the
+matching `unsubscribe` would then be denied `RATE_LIMITED` — the host could open the stream
+but never close it, and the server would keep pushing updates for the rest of the session.
+The same reasoning applies to the other stateful entries: an unsubscribe records no
+`sequenceBlock` antecedent and applies no `labelOutput` taint, because it carries no data
+for either to be about. Kill-switch and audit-mode semantics still apply, as does principal
+scoping and — in JWT mode — the token's own `mcp.capabilities` allowlist.
 
 > **Note:** Ongoing `notifications/resources/updated` messages (pushed by
 > the server after a subscription is established) are currently forwarded
@@ -1180,6 +1199,13 @@ denied fail-closed in the stock binary), and the `custom` escape hatch
 `WithConditionHandler(capability.ConditionTypeCustom, …)` that dispatches on the
 condition's `name`; denied fail-closed in the stock binary).
 
+Both library-only hooks require the field that names what they dispatch to —
+`backend` for `policy`, `name` for `custom` — and a missing, empty, or
+whitespace-only value is **rejected at load**. Neither could dispatch anywhere,
+so it would deny every matching call at request time with nothing pointing at the
+manifest; naming an evaluator or handler that is not (yet) registered is a
+different case and still loads, denying fail-closed at request time.
+
 > **`redactFields` is a directive, not a condition.** It mutates the
 > response rather than allowing or denying, so it lives under `directives`
 > (§ 5a), and `conditions` is strictly boolean predicates.
@@ -1840,6 +1866,17 @@ When no evaluator is wired — the default, and the only state the prebuilt
 binary can be in — any `policy` condition is denied fail-closed. Use this for
 logic that cannot be expressed with the other typed conditions.
 
+> **`backend` is required and must be non-blank.** A `policy` condition with no
+> `backend` (or one that is empty or whitespace) names no evaluator, so it could
+> only ever deny every matching call at request time — a deny-all with no
+> diagnostic pointing at the manifest. It is **rejected at load** instead, like
+> every other condition whose misconfiguration would deny at runtime. The check
+> is for a *name*, not for registration: an evaluator is registered by the
+> embedding program, possibly after the manifest loads, so naming one that is not
+> (yet) wired still loads and denies fail-closed at request time as documented
+> above. `config` and `input` stay optional and opaque — they are author-defined
+> payloads handed verbatim to your evaluator, and eunox does not interpret them.
+
 > If a condition type you need does not exist, **add a new typed shape
 > to `pkg/capability/condition.go` first**, register its handler in
 > `pkg/enforcement/handlers.go`, and ship a test.
@@ -1885,6 +1922,34 @@ than masking the whole component, which would hand the host a result it cannot
 decode; a dotted path *through* one (`structuredContent.ssn`) resolves normally and
 masks that leaf. Binary media content the proxy cannot address (images, audio) and
 metadata (`_meta`, content annotations) are preserved unchanged.
+
+> **Ambiguous JSON keys fail closed under an active `redactFields`.** A response whose
+> object keys the proxy and the host can resolve differently cannot be verified, so it is
+> **denied fail-closed** rather than forwarded. Two shapes qualify:
+>
+> - A **duplicate** key, at any depth. Go keeps the last, a first-wins host parser keeps
+>   the first, so a response like `{"content":[…],"data":{"ssn":"…"},"data":{}}` would
+>   redact nothing and be forwarded byte-for-byte while the host renders the ssn.
+> - A **case-variant collision** on a key this redaction depends on resolving — a segment
+>   of one of your redact paths (`data` alongside `Data` under `redactFields:
+>   ["data.ssn"]`), or one of the keys the proxy matches exactly when deciding which pass to
+>   apply: the result envelope's protocol keys (`content` alongside `Content`) and a content
+>   item's own `type` / `text`. A consumer that binds keys case-insensitively folds such a
+>   pair to one field where the proxy saw two, so `{"type":"text","text":"benign","Text":
+>   "<secret>"}` would leave the proxy inspecting the benign body while the host renders the
+>   sibling. Naming `text` in a redact path is unaffected — it still masks a field called
+>   `text` wherever one appears.
+>
+> Case variants of names your obligation does not touch are ordinary data and are **not**
+> refused: a payload carrying both `Report` and `report` under `redactFields: ["data.ssn"]`
+> redacts normally. The same check applies to a JSON blob unwrapped from a text item or a
+> doubly-encoded string, since its keys only become keys once the proxy decodes it.
+>
+> The duplicate-key half of this rule is the same one the request path and the `*/list`
+> filters apply. The case-variant half is narrower here on purpose: those two surfaces
+> decode into Go structs, where the decoder's own case-insensitive field matching makes
+> *every* case-variant sibling a divergence; the redaction walk decodes into a generic map,
+> where only the names above are resolved by matching.
 
 > **`resource` / `resource_link` content fails closed under an active `redactFields`.**
 > A `resource` or `resource_link` content item nests a `resource` object that can carry

@@ -892,7 +892,7 @@ func TestRedactJSONText_BOMPrefixedObjectFailsClosedOrRedacts(t *testing.T) {
 	bom := string([]byte{0xEF, 0xBB, 0xBF})
 	text := bom + `{"ssn":"123-45-6789","keep":"ok"}`
 
-	out, err := redactJSONText(text, []string{"ssn"})
+	out, err := redactJSONText(text, specFor("ssn"))
 	if err != nil {
 		// Acceptable: failed closed rather than forwarding the field.
 		return
@@ -928,7 +928,7 @@ func TestRedactJSONText_RepeatedBOMPrefixFailsClosedOrRedacts(t *testing.T) {
 	bom := string([]byte{0xEF, 0xBB, 0xBF})
 	for _, n := range []int{2, 3, 5} {
 		text := strings.Repeat(bom, n) + `{"ssn":"123-45-6789","keep":"ok"}`
-		out, err := redactJSONText(text, []string{"ssn"})
+		out, err := redactJSONText(text, specFor("ssn"))
 		if err != nil {
 			// Acceptable: failed closed rather than forwarding the field.
 			continue
@@ -971,7 +971,7 @@ func TestRedactJSONText_LeadingWhitespaceThenBOM(t *testing.T) {
 		"\t" + bom + bom, // whitespace then two BOMs
 	} {
 		text := prefix + `{"ssn":"` + secret + `","keep":"ok"}`
-		out, err := redactJSONText(text, []string{"ssn"})
+		out, err := redactJSONText(text, specFor("ssn"))
 		if err != nil {
 			continue // acceptable: failed closed rather than forwarding the field
 		}
@@ -988,7 +988,7 @@ func TestRedactJSONText_LeadingWhitespaceThenBOM(t *testing.T) {
 func TestRedactJSONText_WhitespaceBOMMalformedPassesThrough(t *testing.T) {
 	bom := string([]byte{0xEF, 0xBB, 0xBF})
 	in := "\t" + bom + `{"ssn":"123-45-6789"`
-	out, err := redactJSONText(in, []string{"ssn"})
+	out, err := redactJSONText(in, specFor("ssn"))
 	require.NoError(t, err, "a truncated object behind whitespace+BOM passes through, not fail closed")
 	assert.Equal(t, in, out, "malformed JSON is forwarded byte-for-byte")
 }
@@ -1002,7 +1002,7 @@ func TestRedactJSONText_ProsePreservedByteForByte(t *testing.T) {
 		bom + "plain log line, not json",
 		"\t[ERROR] disk full",
 	} {
-		out, err := redactJSONText(in, []string{"ssn"})
+		out, err := redactJSONText(in, specFor("ssn"))
 		require.NoError(t, err)
 		assert.Equal(t, in, out, "non-redacted prose must be forwarded byte-for-byte")
 	}

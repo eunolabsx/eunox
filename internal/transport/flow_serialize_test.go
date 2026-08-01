@@ -117,7 +117,6 @@ func newSerializedFlowProxy(t *testing.T, store capability.FlowLabelStore, sessi
 		pdp:          dp,
 		sessionID:    sessionID,
 		decideGate:   newDecisionSerializer(), // per-session decision serialization ON
-		pending:      make(map[string]struct{}),
 		byUpstreamID: make(map[string]chan upstreamResult),
 		hostToUp:     make(map[string]*json.RawMessage),
 		hostWriter:   mcp.NewMsgWriter(&writerAdapter{hw}),

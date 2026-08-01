@@ -42,6 +42,26 @@ type PolicyDecisionPoint interface {
 	DecideResourceRead(ctx context.Context, sessionID, uri, sourceIP string) capability.EnforceResponse
 	DecidePromptGet(ctx context.Context, sessionID, promptName, sourceIP string) capability.EnforceResponse
 
+	// DecideResourceCancel authorizes a resources/unsubscribe: the CANCELLATION of a
+	// subscription this session already holds. It is a separate entry point from
+	// DecideResourceRead, not a synonym, because cancelling moves no data — it only ever
+	// REDUCES flow — and the read decision is a committing one.
+	//
+	// Routing a cancel through DecideResourceRead made it consume the resource's maxCalls
+	// quota, record a sequenceBlock antecedent, and apply the entry's labelOutput taint,
+	// all for a call that transfers nothing. Worse, once that quota was spent (or a
+	// timeWindow closed, or the client roamed out of an ipRange) the cancel was itself
+	// DENIED — so the host could not stop a stream it had legitimately started, which is
+	// the exact failure mapping the method was meant to remove.
+	//
+	// The decision is therefore name-and-action only: the URI must match a resource entry
+	// this caller may `read`, evaluated with the same matcher the resources/list filter
+	// uses, and no condition is evaluated and no session state is committed. That is the
+	// right authority question for a cancel — a URI the manifest never permitted was never
+	// subscribable, so naming it here is a host talking about a channel it does not have —
+	// and it is strictly narrower than the subscribe it undoes.
+	DecideResourceCancel(ctx context.Context, sessionID, uri, sourceIP string) capability.EnforceResponse
+
 	// Folded into the contract so every PDP implements them and the transport
 	// calls them directly (no optional-interface type assertion).
 	ListFilterer
@@ -420,6 +440,15 @@ func (p AlwaysAllowPDP) DecideResourceRead(ctx context.Context, sessionID, _, _ 
 	return p.wiretapAllow()
 }
 
+// DecideResourceCancel returns a wiretap allow for every resources/unsubscribe, unless a
+// kill is active.
+func (p AlwaysAllowPDP) DecideResourceCancel(ctx context.Context, sessionID, _, _ string) capability.EnforceResponse {
+	if deny := p.CheckKill(ctx, sessionID); deny != nil {
+		return *deny
+	}
+	return p.wiretapAllow()
+}
+
 // DecidePromptGet returns a wiretap allow for every prompts/get, unless a kill is
 // active.
 func (p AlwaysAllowPDP) DecidePromptGet(ctx context.Context, sessionID, _, _ string) capability.EnforceResponse {
@@ -513,8 +542,15 @@ func (p DenyAllPDP) Decide(_ context.Context, _ string, _ EnforceTarget, _ map[s
 	return p.deny()
 }
 
-// DecideResourceRead denies every resources/read and resources/subscribe.
+// DecideResourceRead denies every resources/read, resources/subscribe, and
+// resources/unsubscribe.
 func (p DenyAllPDP) DecideResourceRead(_ context.Context, _, _, _ string) capability.EnforceResponse {
+	return p.deny()
+}
+
+// DecideResourceCancel denies every resources/unsubscribe. A no-policy route authorizes
+// nothing, so it has authorized no subscription to cancel either.
+func (p DenyAllPDP) DecideResourceCancel(_ context.Context, _, _, _ string) capability.EnforceResponse {
 	return p.deny()
 }
 
@@ -817,7 +853,7 @@ func (p *ManifestPDP) isToolPoisoned(name string) bool {
 // be reduced to a trustworthy hash for a pinned tool — an entry that fails to decode into
 // the hashed surface, or one carrying duplicate top-level keys a host may render
 // differently than the proxy hashed. Idempotent and safe under concurrent tools/list
-// responses; mirrors the atomic poison-set inside recordObservedToolHash.
+// responses; mirrors the atomic poison-set inside recordObservedHash.
 func (p *ManifestPDP) markToolPoisoned(name string) {
 	p.descMu.Lock()
 	if p.poisonedTools == nil {
@@ -857,7 +893,7 @@ func (p *ManifestPDP) poisonAllPinned() {
 // observed poisoned (sticky), OR its most recently observed hash differs from the
 // pin. BOTH are read under a single RLock so the call leg cannot observe a torn
 // state (poison not yet set AND a just-overwritten clean hash) that would let a
-// poisoned call through. With recordObservedToolHash marking poison atomically on a
+// poisoned call through. With recordObservedHash marking poison atomically on a
 // mismatch, the poison check alone is authoritative; the observed-hash comparison
 // is retained as defense-in-depth for a direct (non-filter) caller that recorded a
 // hash without a pin.
@@ -1529,9 +1565,18 @@ func (p *ManifestPDP) hardenOnBrokenInterface(sessionID string, r capability.Enf
 	// Only the forwardability changes, which is the one property the pin governs.
 	denial := *r.Denial
 	denial.HardDeny = true
+	// The two pins fail for different reasons and have different remedies, so the message
+	// must say which one fired. The FM-5 pin compares the live surface against the
+	// MANIFEST's descriptionHash (remedy: re-review the tool and re-pin); Tier-2 compares
+	// it against what THIS SESSION saw at its start (remedy: a new session re-baselines).
+	// One combined sentence sent an operator hitting a manifest-pin break to restart a
+	// session, which changes nothing.
+	reason := "advertised a different interface surface than when this session started (interface pin), so a new session is needed to re-baseline it"
+	if fm5Broken {
+		reason = "no longer matches the descriptionHash this manifest pins for it, so the pinned surface must be re-reviewed and re-pinned"
+	}
 	denial.Message = denial.Message + " (additionally: tool " + strconv.Quote(target.Name) +
-		" advertised a different interface surface than when this session started, so this call is refused" +
-		" outright and cannot be forwarded by an audit-mode route)"
+		" " + reason + "; this call is refused outright and cannot be forwarded by an audit-mode route)"
 	r.Denial = &denial
 	// Obligations describe how to redact a FORWARDED response. This one is not forwarded.
 	r.Obligations = nil
@@ -1637,6 +1682,52 @@ func (p *ManifestPDP) DecideResourceRead(ctx context.Context, sessionID, uri, so
 	return p.decideTarget(ctx, sessionID,
 		EnforceTarget{Type: capability.TargetTypeResource, Name: uri},
 		map[string]interface{}{"uri": uri}, sourceIP, rejectSchema)
+}
+
+// DecideResourceCancel authorizes a resources/unsubscribe by MATCH ALONE: the URI must
+// name a resource entry this caller may read. No condition is evaluated and nothing is
+// committed — see the contract for why a cancellation is not a read.
+//
+// It reuses findConstraint + containsAction, the same pair the resources/list filter
+// applies, so what a session may cancel is exactly what it may see listed. A poisoned or
+// otherwise unreadable entry is not a consideration here: a cancel names a URI, not a
+// catalog entry, and carries no description a host renders.
+//
+// The matched entry's per-constraint observe posture (enforcement: audit) IS carried onto
+// the response, exactly as decideTarget's stamp does for a read. Building the response
+// directly here skips that stamp, and dropping it broke the method in both directions on
+// an observe entry: the read deny was downgraded and FORWARDED (the subscription really
+// opened) while the cancel deny stayed hard, restoring the very dead end this entry point
+// removes — and on the allowing spelling the tape recorded audit_only=true for the read and
+// audit_only=false for the unsubscribe, claiming an observe-only entry enforced the cancel.
+// A no-match deny carries no entry and so no posture, which is right: there is nothing
+// declaring observe mode for a URI the manifest never names.
+func (p *ManifestPDP) DecideResourceCancel(ctx context.Context, sessionID, uri, _ string) capability.EnforceResponse {
+	if deny := p.CheckKill(ctx, sessionID); deny != nil {
+		return *deny
+	}
+	c := p.findConstraint(EnforceTarget{Type: capability.TargetTypeResource, Name: uri},
+		jwtClaimsAsMap(ctx))
+	if c == nil {
+		return denyResponse(p.engineClock(), capability.ErrCodeAuthorizationFailed, "",
+			fmt.Sprintf("resource %q is not permitted by the capability manifest, so there is no subscription to it to cancel", uri))
+	}
+	if !containsAction(c.Actions, requiredActionFor(capability.TargetTypeResource)) {
+		return withCancelAuditPosture(denyResponse(p.engineClock(), capability.ErrCodeCapabilityDenied, "",
+			fmt.Sprintf("resource %q is present in the manifest but not with the %q action, so there is no subscription to it to cancel", uri, requiredActionFor(capability.TargetTypeResource))), c)
+	}
+	return withCancelAuditPosture(newAllowResponse(p.engineClock()), c)
+}
+
+// withCancelAuditPosture stamps the matched constraint's enforcement: audit posture onto a
+// cancel response, the one field decideTarget's stamp contributes that a match-only
+// decision still needs. Everything else stamp does (obligations, flow labels, condition
+// details) describes work a cancel deliberately does not perform.
+func withCancelAuditPosture(r capability.EnforceResponse, matched *capability.Constraint) capability.EnforceResponse {
+	if matched.IsAuditOnly() {
+		r.AuditOnly = true
+	}
+	return r
 }
 
 // DecideSampling implements SamplingAuthorizer. The kill switch is checked first
@@ -2130,6 +2221,49 @@ type toolEntryScan struct {
 // stack form is O(bytes), and it mirrors mcp.rejectDuplicateJSONKeys, which walks request
 // params the same way.
 func scanToolEntry(raw json.RawMessage) toolEntryScan {
+	return scanJSONKeys(raw, jsonKeyScanOpts{})
+}
+
+// jsonKeyScanOpts configures scanJSONKeys for one of its two callers. Both ask the same
+// security question — can Go's decode of these bytes differ from what a consumer renders?
+// — but they hand the bytes to DIFFERENT decoders, and the fold rule follows the decoder,
+// so it is a per-caller policy rather than a caller-independent constant.
+type jsonKeyScanOpts struct {
+	// allowArrayRoot admits a JSON array as the root value. A tools/list entry must be an
+	// object, so scanToolEntry leaves this false and a non-object root is untrustworthy
+	// with a knowably-empty name set. The redaction path scans values that are legally
+	// either shape — structuredContent and any doubly-encoded leaf may be an array of
+	// objects — so it sets this, and the array root simply opens the walk like any other
+	// composite.
+	allowArrayRoot bool
+
+	// foldKeys, when non-nil, REPLACES the struct-binding fold rule below with a scoped
+	// one: a key is folded (so a case variant of it collides with it) only when its folded
+	// form is in this set, and then at EVERY depth. The redaction path sets it; see
+	// redactionFoldKeys for which names go in and why the unscoped rule is wrong there.
+	//
+	// nil keeps the tools/list rule: fold the ROOT object's keys, match exactly below.
+	// That rule is derived from encoding/json binding an entry's top-level keys to the
+	// mcp.ToolEntry STRUCT by a case-folding match (so {"description":"<INJECT>",
+	// "Description":"<CLEAN>"} decodes to <CLEAN> and hashes clean while a case-sensitive
+	// host renders <INJECT>), while nested values decode into map[string]interface{} with
+	// exact keys (so a schema carrying sibling properties "Name" and "name" is legal and
+	// honest, and folding there would refuse it). See the scanToolEntry doc for the full
+	// derivation.
+	foldKeys map[string]struct{}
+}
+
+// scanJSONKeys is the shared streaming walk behind every duplicate-key gate in this
+// package: the */list entry gate (scanToolEntry, and entryKeysAmbiguous through it) and
+// the redaction path's envelope/leaf gate (redactionKeysAmbiguous). Sharing one
+// implementation keeps them from drifting on the depth bound, the number handling, or the
+// EXACT-duplicate rule — which is caller-independent: a byte-identical repeated key is a
+// divergence at every depth for every consumer (Go keeps the last, a first-wins parser
+// keeps the first), so it is untrustworthy regardless of opts.
+//
+// What the callers do NOT share is which keys are additionally folded; that is
+// opts.foldKeys, documented on jsonKeyScanOpts.
+func scanJSONKeys(raw json.RawMessage, opts jsonKeyScanOpts) toolEntryScan {
 	// frame tracks one open composite. seen is allocated lazily: most nested objects in a
 	// tool schema are small, and an empty-object-heavy payload should not cost a map
 	// header per object.
@@ -2147,8 +2281,12 @@ func scanToolEntry(raw json.RawMessage) toolEntryScan {
 	if err != nil {
 		return toolEntryScan{untrustworthy: true}
 	}
-	if d, ok := tok.(json.Delim); !ok || d != '{' {
-		// Not a JSON object: null, a number, a string, a bool, or an array. The entry is
+	rootDelim, rootIsDelim := tok.(json.Delim)
+	rootObject := rootIsDelim && rootDelim == '{'
+	rootAdmittedArray := opts.allowArrayRoot && rootIsDelim && rootDelim == '['
+	if !rootObject && !rootAdmittedArray {
+		// Not a JSON object: null, a number, a string, a bool, or (unless the caller admits
+		// one) an array. The entry is
 		// still untrustworthy — it cannot decode into the hashed tool surface, so the
 		// filter must drop it — but unlike an entry whose bytes ABORTED the scan, its
 		// candidate-name set is knowably EMPTY, not unknown: none of these shapes carries
@@ -2163,9 +2301,12 @@ func scanToolEntry(raw json.RawMessage) toolEntryScan {
 		return toolEntryScan{untrustworthy: true, namesComplete: true}
 	}
 	var out toolEntryScan
-	stack := []frame{{object: true, expectKey: true}}
+	stack := []frame{{object: rootObject, expectKey: rootObject}}
 	// pendingName is set when the value about to be read is the ENTRY's top-level name
 	// value, so the names it could present to a host can be collected in the same pass.
+	// Only the struct-binding caller (opts.foldKeys == nil, i.e. the tools/list entry gate)
+	// reads out.names; the redaction gate consults untrustworthy alone, so it never arms
+	// this and never pays for the name collection.
 	pendingName := false
 	markValueDone := func() {
 		if n := len(stack); n > 0 && stack[n-1].object {
@@ -2203,12 +2344,32 @@ func scanToolEntry(raw json.RawMessage) toolEntryScan {
 				out.untrustworthy = true
 				return out
 			}
-			// Fold at the TOP level only (see the doc comment). capability.FoldJSONKey,
-			// not strings.ToLower: ToLower leaves an already-lower-case case variant such
-			// as U+017F ("deſcription") distinct from "description", so the collision the
-			// decoder makes would go unseen and the entry would clear the scan.
+			// Canonicalize per the caller's fold policy (see jsonKeyScanOpts). Everything
+			// not folded is compared byte-exactly, which is what catches the
+			// caller-independent exact duplicate. capability.FoldJSONKey, not
+			// strings.ToLower: ToLower leaves an already-lower-case case variant such as
+			// U+017F ("deſcription") distinct from "description", so the collision the
+			// decoder makes would go unseen and the bytes would clear the scan.
 			canon := key
-			if n == 1 {
+			switch {
+			case opts.foldKeys != nil:
+				// Scoped fold, at every depth: only a name whose case variant could change
+				// what a consumer resolves. Depth-uniform on purpose -- an unscoped rule
+				// keyed to depth made the verdict depend on whether the value happened to
+				// be wrapped in an array, since the bracket occupies a level of its own.
+				//
+				// A key already equal to its folded form needs no rewrite (canon is that
+				// form), so only the variant spelling is redirected onto it -- which is what
+				// makes the two collide in `seen`.
+				if folded := capability.FoldJSONKey(key); folded != key {
+					if _, scoped := opts.foldKeys[folded]; scoped {
+						canon = folded
+					}
+				}
+			case n == 1:
+				// Struct-binding fold, root object only. n == 1 IS the root object here:
+				// this arm is reached only when opts.foldKeys is nil, and that caller does
+				// not admit an array root, so the root frame is always the object.
 				canon = capability.FoldJSONKey(key)
 			}
 			if stack[n-1].seen == nil {
@@ -2219,7 +2380,7 @@ func scanToolEntry(raw json.RawMessage) toolEntryScan {
 			}
 			stack[n-1].seen[canon] = struct{}{}
 			stack[n-1].expectKey = false
-			pendingName = n == 1 && canon == jsonKeyNameFolded
+			pendingName = opts.foldKeys == nil && n == 1 && canon == jsonKeyNameFolded
 			continue
 		}
 		if pendingName {
@@ -2328,7 +2489,10 @@ func (p *ManifestPDP) poisonCandidates(names []string) {
 // enforce-mode filter call, for exactly which shapes fail closed and how widely. With NO
 // pinned tool there is nothing to protect, so the walk only counts entries.
 func (p *ManifestPDP) RecordObservedToolHashes(ctx context.Context, result json.RawMessage) int {
-	return p.armPinsFromToolsList(sessionIDFromContext(ctx), result, completeToolListing(ctx))
+	// The per-entry verdicts are for a caller that goes on to FILTER the same bytes; this
+	// route forwards the catalog verbatim, so there is nothing to hand them to.
+	count, _ := p.armPinsFromToolsList(sessionIDFromContext(ctx), result, completeToolListing(ctx))
+	return count
 }
 
 // armPinsFromToolsList walks a tools/list result, records every pinned tool's live
@@ -2359,7 +2523,7 @@ func (p *ManifestPDP) RecordObservedToolHashes(ctx context.Context, result json.
 //     case-variant "tools" key (Go keeps one array while a host may render the other) —
 //     poisons every pin, because no entry in it can be believed. A plainly absent tools
 //     key is not ambiguous: a host renders no tools from it, so nothing is poisoned.
-func (p *ManifestPDP) armPinsFromToolsList(sessionID string, result json.RawMessage, completeListing bool) (entryCount int) {
+func (p *ManifestPDP) armPinsFromToolsList(sessionID string, result json.RawMessage, completeListing bool) (entryCount int, verdicts []toolEntryVerdict) {
 	pinned := p.hasPinnedTools()
 	// Tier-2 arms off the same pass, so the two pins read one decode of one response and
 	// cannot disagree about what the upstream advertised. It applies to EVERY tool, so
@@ -2371,12 +2535,12 @@ func (p *ManifestPDP) armPinsFromToolsList(sessionID string, result json.RawMess
 		// No bytes at all: nothing was rendered to a host, so nothing is ambiguous. No
 		// Tier-2 baseline is taken either — an absent response must not become the
 		// session's idea of the advertised surface.
-		return 0
+		return 0, nil
 	case listDecodeBadEnvelope, listDecodeBadArray:
 		// The envelope or its array is unreadable, so no entry in it can be believed.
 		p.poisonAllPinned()
 		p.surface.BreakAll(sessionID)
-		return 0
+		return 0, nil
 	case listDecodeKeyAbsent:
 		// No exact "tools" key. toolsKeyAmbiguous also catches a case-variant sibling
 		// ("Tools") that still decodes for a host whose reader binds it
@@ -2386,28 +2550,35 @@ func (p *ManifestPDP) armPinsFromToolsList(sessionID string, result json.RawMess
 			p.poisonAllPinned()
 			p.surface.BreakAll(sessionID)
 		}
-		return 0
+		return 0, nil
 	case listDecodeOK:
 	}
 	if !pinned && !tier2 {
 		// Nothing to record or protect: skip the per-entry scan and decode entirely rather
-		// than walking every entry only to find none pinned.
-		return len(entries)
+		// than walking every entry only to find none pinned. No verdicts either: a filter
+		// running over the same bytes must reach its own conclusions.
+		return len(entries), nil
 	}
 	// A duplicate or case-variant "tools" key leaves Go and the host reading different
 	// arrays, so no entry below can be believed.
 	if toolsKeyAmbiguous(result) {
 		p.poisonAllPinned()
 		p.surface.BreakAll(sessionID)
-		return len(entries)
+		// No verdicts: the array these entries came from is not the array a host
+		// necessarily reads, so nothing here may be handed to the filter as settled.
+		return len(entries), nil
 	}
 	var surfaces []ToolSurface
 	if tier2 {
 		surfaces = make([]ToolSurface, 0, len(entries))
 	}
+	// One verdict per entry, in document order, so a filter walking the same array can
+	// reuse this pass's scan and decode instead of repeating both. See toolEntryVerdict.
+	verdicts = make([]toolEntryVerdict, 0, len(entries))
 	for _, raw := range entries {
 		scan := scanToolEntry(raw)
 		if scan.untrustworthy {
+			verdicts = append(verdicts, toolEntryVerdict{known: true, drop: true})
 			if !scan.namesComplete {
 				// The scan aborted before walking the whole entry, so its name list is
 				// truncated and may be EMPTY -- a tool entry is free to put a deep
@@ -2438,10 +2609,14 @@ func (p *ManifestPDP) armPinsFromToolsList(sessionID string, result json.RawMess
 		// decode is unavoidable -- that is the cost of covering tools nobody pinned, and it
 		// is paid on */list, not on the call leg.
 		if !tier2 && !p.anyNamePinned(scan.names) {
+			// Skipped without decoding, so this pass concluded nothing about the entry: the
+			// filter must reach its own verdict rather than read an absence as a keep.
+			verdicts = append(verdicts, toolEntryVerdict{})
 			continue
 		}
 		var entry toolListEntry
 		if err := json.Unmarshal(raw, &entry); err != nil {
+			verdicts = append(verdicts, toolEntryVerdict{known: true, drop: true})
 			// The name is trustworthy (the scan cleared it) but the entry will not decode
 			// into the hashed surface: poison just this pin rather than skip, which would
 			// leave it unarmed on a poisoned entry a lenient host still renders.
@@ -2454,6 +2629,7 @@ func (p *ManifestPDP) armPinsFromToolsList(sessionID string, result json.RawMess
 		// inputSchema was being hashed twice per tools/list before this.
 		surface := SurfaceHash(entry.Description, entry.Title, entry.Annotations, entry.InputSchema, entry.OutputSchema)
 		p.recordPinnedToolHash(entry.Name, surface)
+		verdicts = append(verdicts, toolEntryVerdict{known: true, name: entry.Name})
 		if tier2 {
 			surfaces = append(surfaces, ToolSurface{Name: entry.Name, Hash: surface})
 		}
@@ -2464,7 +2640,57 @@ func (p *ManifestPDP) armPinsFromToolsList(sessionID string, result json.RawMess
 	if tier2 {
 		emitSurfaceChanges(p.surface.Observe(sessionID, surfaces, completeListing))
 	}
-	return len(entries)
+	return len(entries), verdicts
+}
+
+// toolEntryVerdict is armPinsFromToolsList's per-entry conclusion, handed to the list
+// filter so ONE pass scans and decodes each entry.
+//
+// The two passes asked the same two questions of every entry — are its bytes ambiguous
+// (scanToolEntry), and what does it decode to (json.Unmarshal, which pulls in the whole
+// inputSchema, by far the largest thing here) — and answered them separately, per entry,
+// on every tools/list. With Tier-2 pinning every advertised tool that is the hottest
+// catalog path there is.
+//
+// Sharing verdicts does NOT relax the ordering the two passes need: arming still runs to
+// completion before any keep decision, because a break discovered at entry N must be
+// visible to the keep decision for entry 1.
+//
+// known=false means "this pass concluded nothing" — arming bailed before the entry, or
+// skipped decoding it — and the filter falls back to deciding for itself. Absence is never
+// read as a keep: every state that could hide a drop is either known+drop or unknown.
+type toolEntryVerdict struct {
+	// known reports that arming actually evaluated this entry.
+	known bool
+	// drop reports that the entry must not be advertised: ambiguous bytes, or bytes that
+	// will not decode into the hashed surface.
+	drop bool
+	// name is the decoded tool name, meaningful only when known && !drop.
+	name string
+}
+
+// verdictAt returns the arming pass's verdict for entry index i, or the zero (unknown)
+// verdict when arming produced none — a short or nil slice can only mean arming bailed
+// early, and an out-of-range read must not be mistaken for a settled keep.
+func verdictAt(verdicts []toolEntryVerdict, i int) toolEntryVerdict {
+	if i < 0 || i >= len(verdicts) {
+		return toolEntryVerdict{}
+	}
+	return verdicts[i]
+}
+
+// evaluateToolEntry is the fallback the filter uses for an entry arming did not conclude
+// on: the same ambiguity scan and decode, in the same order, so a fallback verdict is
+// indistinguishable from an armed one.
+func evaluateToolEntry(raw json.RawMessage) toolEntryVerdict {
+	if entryKeysAmbiguous(raw) {
+		return toolEntryVerdict{known: true, drop: true}
+	}
+	var entry toolListEntry
+	if err := json.Unmarshal(raw, &entry); err != nil {
+		return toolEntryVerdict{known: true, drop: true}
+	}
+	return toolEntryVerdict{known: true, name: entry.Name}
 }
 
 // toolsKeyAmbiguous reports whether raw's top-level JSON object carries the tools/list
@@ -2563,11 +2789,19 @@ func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims
 	// Tier-2 widens the gate: it pins every advertised tool, so there is always something
 	// to arm and the skip applies only to a PDP with neither pin active (a directly
 	// constructed one, where surface is nil).
+	var verdicts []toolEntryVerdict
 	if mdp.hasPinnedTools() || mdp.surface != nil {
-		mdp.armPinsFromToolsList(sessionID, resultBytes, completeListing)
+		_, verdicts = mdp.armPinsFromToolsList(sessionID, resultBytes, completeListing)
 	}
 
+	// Entry index within the array, advanced once per keep call. filterListResult walks
+	// the array it decoded from these same bytes in document order, single-threaded, and
+	// arming returns verdicts only for an unambiguous envelope carrying exactly one
+	// "tools" array — the one case where both passes provably see the same array — so the
+	// index aligns. Any misalignment degrades to an unknown verdict, which re-derives.
+	entryIdx := -1
 	return filterListResult(resultBytes, listKeyTools, func(raw json.RawMessage) (bool, string) {
+		entryIdx++
 		// Drop an entry whose own bytes are ambiguous BEFORE trusting its decoded name.
 		// armPinsFromToolsList self-gates on len(pinnedTools) > 0, so without this the
 		// entire fold defense would be inert on the common manifest that pins no
@@ -2576,14 +2810,18 @@ func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims
 		// proxy advertises a tool it never authorized and its description — the FM-5
 		// injection surface — reaches the model. Catalog integrity does not depend on
 		// whether the operator opted into pins, so the check does not either.
-		if entryKeysAmbiguous(raw) {
+		//
+		// The scan and the decode happen ONCE per entry: arming already performed both and
+		// handed over its conclusion (see toolEntryVerdict). An entry it did not conclude
+		// on is evaluated here, by the same rules in the same order.
+		v := verdictAt(verdicts, entryIdx)
+		if !v.known {
+			v = evaluateToolEntry(raw)
+		}
+		if v.drop {
 			return false, ""
 		}
-		var entry toolListEntry
-		if err := json.Unmarshal(raw, &entry); err != nil {
-			return false, ""
-		}
-		c := mdp.findConstraint(EnforceTarget{Type: capability.TargetTypeTool, Name: entry.Name}, claims)
+		c := mdp.findConstraint(EnforceTarget{Type: capability.TargetTypeTool, Name: v.name}, claims)
 
 		// c is nil when the tool is absent from the manifest; guard every dereference
 		// below on it.
@@ -2593,17 +2831,24 @@ func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims
 		// A poisoned pinned tool stays hidden even on a later clean observation (sticky),
 		// mirroring the call-leg deny so the list a host is shown never contains a tool
 		// its call leg will reject.
-		if _, pinned := mdp.pinnedTools[entry.Name]; pinned && mdp.isToolPoisoned(entry.Name) {
+		if _, pinned := mdp.pinnedTools[v.name]; pinned && mdp.isToolPoisoned(v.name) {
 			return false, ""
 		}
 		// Same rule for the Tier-2 pin, which needs no manifest entry: a tool whose
 		// advertised surface changed mid-session is hidden here as well as denied on the
 		// call leg, so the catalog a host is shown never advertises a tool the call leg
 		// will reject.
-		if mdp.surface.Broken(sessionID, entry.Name) {
+		//
+		// TOOLS ONLY, deliberately stated: neither this pin nor the manifest's
+		// descriptionHash covers prompt or resource descriptions, which reach the model
+		// the same way a tool description does. The machinery is generic over (name,
+		// hash), so extending it is a design decision rather than a rewrite — but until
+		// that is made, the two other list flavors carry only the per-entry ambiguity
+		// gate, not a surface pin.
+		if mdp.surface.Broken(sessionID, v.name) {
 			return false, ""
 		}
-		return true, entry.Name
+		return true, v.name
 	})
 }
 

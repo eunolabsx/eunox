@@ -33,7 +33,6 @@ func TestServeHost_ReturnsOnContextCancel(t *testing.T) {
 
 	p := &StdioProxy{
 		pdp:          pdp.AlwaysAllowPDP{},
-		pending:      make(map[string]struct{}),
 		hostReader:   mcp.NewMsgReader(pr),
 		hostWriter:   mcp.NewMsgWriter(io.Discard),
 		upWriter:     mcp.NewMsgWriter(io.Discard),
@@ -66,7 +65,6 @@ func TestServeHost_ReturnsOnUpstreamExit(t *testing.T) {
 
 	p := &StdioProxy{
 		pdp:          pdp.AlwaysAllowPDP{},
-		pending:      make(map[string]struct{}),
 		hostReader:   mcp.NewMsgReader(pr),
 		hostWriter:   mcp.NewMsgWriter(io.Discard),
 		upWriter:     mcp.NewMsgWriter(io.Discard),
@@ -132,7 +130,6 @@ func TestServeHost_NotificationPreservesWireOrder(t *testing.T) {
 	p := &StdioProxy{
 		pdp:          pdp.AlwaysAllowPDP{},
 		sessionID:    "order-sess",
-		pending:      make(map[string]struct{}),
 		byUpstreamID: make(map[string]chan upstreamResult),
 		hostWriter:   mcp.NewMsgWriter(io.Discard),
 		upWriter:     up,
@@ -194,7 +191,6 @@ func TestServeHost_CancelRequestIDRewrittenToNonce(t *testing.T) {
 	p := &StdioProxy{
 		pdp:          pdp.AlwaysAllowPDP{},
 		sessionID:    "cancel-sess",
-		pending:      make(map[string]struct{}),
 		byUpstreamID: make(map[string]chan upstreamResult),
 		hostToUp:     make(map[string]*json.RawMessage),
 		hostWriter:   mcp.NewMsgWriter(io.Discard),
@@ -307,7 +303,6 @@ func TestServeHost_NotificationBarrierInterruptibleByCancel(t *testing.T) {
 	p := &StdioProxy{
 		pdp:          pdp.AlwaysAllowPDP{},
 		sessionID:    "barrier-sess",
-		pending:      make(map[string]struct{}),
 		byUpstreamID: make(map[string]chan upstreamResult),
 		hostWriter:   mcp.NewMsgWriter(io.Discard),
 		upWriter:     up,
@@ -362,7 +357,6 @@ func TestServeHost_KilledServerResponseRecordsDeny(t *testing.T) {
 		pdp:          policy,
 		sessionID:    "kill-sess",
 		sink:         sink,
-		pending:      make(map[string]struct{}),
 		byUpstreamID: make(map[string]chan upstreamResult),
 		hostWriter:   mcp.NewMsgWriter(io.Discard),
 		upWriter:     up,
@@ -423,7 +417,6 @@ func TestServeHost_ConcurrencyCapRejectsWhenSaturated(t *testing.T) {
 	p := &StdioProxy{
 		pdp:          pdp.AlwaysAllowPDP{},
 		sessionID:    "cap-sess",
-		pending:      make(map[string]struct{}),
 		byUpstreamID: make(map[string]chan upstreamResult),
 		hostWriter:   mcp.NewMsgWriter(&writerAdapter{dest: &signalingHostWriter{ch: hostCh}}),
 		// The upstream accepts the write but never responds; with upstreamTimeMs=0 the

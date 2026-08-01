@@ -119,14 +119,8 @@ type StdioProxy struct {
 
 	upWriter mcp.MsgSink // subprocess pipe or HTTP bridge; concurrency-safe
 
-	// pendingMu guards pending, byUpstreamID, hostToUp, and upstreamSeq.
+	// pendingMu guards byUpstreamID, hostToUp, and upstreamSeq.
 	pendingMu sync.Mutex
-	// pending is keyed by the host's JSON-RPC ID and exists solely to reject a
-	// duplicate in-flight host ID. It does NOT route upstream responses; that is
-	// byUpstreamID's job — so it is a SET, not a channel map. Storing channels here
-	// invited exactly the misreading its own doc had to disclaim, and nothing ever
-	// delivered through them.
-	pending map[string]struct{}
 	// byUpstreamID routes upstream responses (and remote-HTTP-bridge transport
 	// failures — see deliverUpstreamError) back to the waiting caller, keyed by the
 	// proxy-generated upstream ID (the nonce). A result carrying a stale nonce (its
@@ -138,7 +132,11 @@ type StdioProxy struct {
 	// nonce the proxy put on the wire, so a host notifications/cancelled can have
 	// its params.requestId translated to the nonce the upstream actually saw --
 	// otherwise the cancel names an id the upstream never received and is a no-op.
-	// Populated and cleared alongside pending/byUpstreamID under pendingMu.
+	// Populated and cleared alongside byUpstreamID under pendingMu.
+	//
+	// It doubles as the in-flight host-ID SET the duplicate-ID rejection reads (see
+	// awaitNonced): a key is present for exactly the window a request is in flight, which
+	// is precisely what a separate `pending` set held.
 	hostToUp map[string]*json.RawMessage
 	// upstreamSeq is the monotonically increasing nonce source for upstream IDs.
 	upstreamSeq uint64
@@ -205,6 +203,10 @@ type StdioProxy struct {
 	// honorAttribution admits the client-supplied attribution interface. Set from
 	// StdioProxyOptions.HonorAttribution at construction; see that field.
 	honorAttribution bool
+
+	// onReady is the post-startup hook, run once the session is live. Set from
+	// StdioProxyOptions.OnReady at construction; see that field.
+	onReady func(ctx context.Context)
 }
 
 // StdioProxyOptions configures a StdioProxy. The upstream is either a local
@@ -246,6 +248,27 @@ type StdioProxyOptions struct {
 
 	// DriftCheck is the injected drift hook; nil = no drift checking.
 	DriftCheck drift.CheckFunc
+
+	// OnReady, when non-nil, runs inside Start once the session is live — the upstream is
+	// connected, the initialize handshake has answered, and the drift check has passed —
+	// and before the host serve loop begins. It is the stdio analogue of
+	// HTTPGatewayOptions.AfterListen and exists for the same reason: startup effects that
+	// overwrite SHARED, last-writer-wins state other processes then trust (the
+	// session-kill TTL this proxy publishes for `eunox kill`) must not be performed by a
+	// process that never comes up. The stdio host has no bind step, so the fallible steps
+	// it must clear instead are its own — a missing upstream binary, an upstream that
+	// never answers initialize, a refused drift check — each of which returns straight out
+	// of Start. Running the hook before them let a doomed process clobber a RUNNING
+	// proxy's published state on its way to dying.
+	//
+	// It receives Start's context so an effect that talks to a network service bounds its
+	// round-trip by the proxy's own lifetime rather than running detached — the gateway
+	// hook's contract too, and what keeps a cancelled startup from landing a write.
+	//
+	// Unlike AfterListen it returns no error: its callers are advisory (a failure warns and
+	// the proxy runs on), and there is no useful "abort startup" for an effect whose whole
+	// contract is best-effort. It is called exactly once, on the success path only.
+	OnReady func(ctx context.Context)
 }
 
 // NewStdioProxy creates a StdioProxy ready to call Start.
@@ -276,7 +299,7 @@ func NewStdioProxy(opts StdioProxyOptions) *StdioProxy {
 		requireAuditStrict:    opts.RequireAuditStrict,
 		driftCheck:            opts.DriftCheck,
 		honorAttribution:      opts.HonorAttribution,
-		pending:               make(map[string]struct{}),
+		onReady:               opts.OnReady,
 		byUpstreamID:          make(map[string]chan upstreamResult),
 		hostToUp:              make(map[string]*json.RawMessage),
 		hostReader:            mcp.NewMsgReader(os.Stdin),
@@ -378,6 +401,23 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 				// JWT_INVALID fixed-code-not-free-form-prose discipline. p.rec() is nil when
 				// no audit sink is configured (guard, as elsewhere).
 				recordDriftRefused(ctx, p.rec(), p.sessionID)
+				// Release the per-session Tier-2 state the baseline above just recorded.
+				// The inline comment there says "ReleaseSession clears it on teardown
+				// either way", and on THIS path it did not: a startup refusal returns
+				// straight out of Start, so nothing ever released it. Harmless for the
+				// binary (the process exits), but StdioProxy is an exported seam, and an
+				// embedder that recovers from a refused start and retries would accumulate
+				// baselines keyed by session id for the life of its process.
+				//
+				// Detached and bounded, like the teardown release below and for the same
+				// reason: a drift refusal is routinely REACHED with ctx already done (an
+				// operator's Ctrl-C during startup, or a probe deadline, is itself one of
+				// the ways the probe fails), and ReleaseSession does a flow-store round
+				// trip whose error it discards — so releasing on the dead request context
+				// would silently skip the Redis clear this line exists to perform.
+				releaseCtx, releaseCancel := context.WithTimeout(context.Background(), time.Duration(p.shutdownMs)*time.Millisecond)
+				p.pdp.ReleaseSession(releaseCtx, p.sessionID) //nolint:contextcheck // startup-refusal teardown: detached and bounded, matching Start's own release path.
+				releaseCancel()
 				return err
 			}
 		}
@@ -416,6 +456,16 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 	}()
 
 	fmt.Fprintf(os.Stderr, "[eunox] Session %s initialized; proxying to %q.\n", p.sessionID, p.upstreamLabel())
+
+	// Post-startup effects (see StdioProxyOptions.OnReady). This is the stdio host's ready
+	// point — the analogue of the HTTP transport's post-bind hook — and it is placed HERE,
+	// after every fallible startup step, rather than before Start: connectUpstream, the
+	// initialize handshake, and the drift check each return straight out of Start, so a
+	// hook run ahead of them would let a proxy that never comes up overwrite shared state a
+	// running one owns. Nothing between this line and the serve loop can fail.
+	if p.onReady != nil {
+		p.onReady(ctx)
+	}
 
 	// ── 6. Serve host until stdin closes ───────────────────────────────────────
 	p.serveHost(ctx)
@@ -982,6 +1032,14 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 				_ = p.hostWriter.Write(mcp.ErrorResponse(mcp.RawJSON("null"), jsonRPCCodeParseError, "Parse error"))
 				continue
 			}
+			// A terminal host read error ends the session. EOF is the ordinary
+			// host-closed-stdin case and stays silent; anything else — a 4 MiB
+			// bufio.ErrTooLong, an I/O fault — is a session that died mid-stream for a
+			// reason the operator cannot otherwise see, since this leg wrote nothing at
+			// all. readUpstream already logs the same class from the other direction.
+			if !errors.Is(r.err, io.EOF) {
+				fmt.Fprintf(os.Stderr, "[eunox] host read error: %v; ending session\n", r.err)
+			}
 			break // host stdin closed (EOF) or an unrecoverable read error
 		}
 		msg := r.msg
@@ -1136,7 +1194,7 @@ func (p *StdioProxy) forwardHostNotification(ctx context.Context, msg mcp.RPCMsg
 		return false
 	}
 	// An enforced method (tools/call, resources/read, resources/subscribe,
-	// prompts/get) framed as a notification (no id) is a fail-closed reject —
+	// resources/unsubscribe, prompts/get) framed as a notification (no id) is a fail-closed reject —
 	// see denyEnforcedMethodNotification, shared with the HTTP transport's
 	// equivalent guard so the check and its audit record cannot drift between
 	// the two transports.
@@ -1378,7 +1436,6 @@ func rewriteCancelToNonce(mu *sync.Mutex, hostToUp map[string]*json.RawMessage, 
 func awaitNonced(
 	ctx context.Context,
 	mu *sync.Mutex,
-	pending map[string]struct{},
 	byUpstreamID map[string]chan upstreamResult,
 	hostToUp map[string]*json.RawMessage,
 	seq *uint64,
@@ -1389,25 +1446,26 @@ func awaitNonced(
 ) (mcp.RPCMsg, error) {
 	ch := make(chan upstreamResult, 1)
 	mu.Lock()
-	if _, exists := pending[hostKey]; exists {
+	// hostToUp IS the in-flight host-ID set: an entry exists for exactly the window a
+	// request is in flight, added and removed here under this mutex. A separate `pending`
+	// set held the same keys, under the same lock, mutated at the same three points — a
+	// second copy of one fact, which is the shape that eventually disagrees with itself.
+	if _, exists := hostToUp[hostKey]; exists {
 		mu.Unlock()
 		return mcp.RPCMsg{}, fmt.Errorf("%w %q: request already pending", errDuplicateID, hostKey)
 	}
 	*seq++
 	upID, upKey := upstreamNonceID(*seq)
-	pending[hostKey] = struct{}{}
 	byUpstreamID[upKey] = ch
 	// Record host-id -> nonce so a later notifications/cancelled can translate its
-	// params.requestId to the id the upstream actually saw. hostToUp is nil only
-	// for a legacy test-assembled proxy; guard so the correlation degrades to the
-	// pre-fix verbatim forward rather than panicking.
-	if hostToUp != nil {
-		hostToUp[hostKey] = upID
-	}
+	// params.requestId to the id the upstream actually saw. Both callers initialize
+	// hostToUp before calling (lazily, for a directly-assembled proxy/session), and it
+	// now carries the duplicate-ID rejection as well, so it must not be nil: a nil map
+	// would silently admit a duplicate host ID rather than degrade a correlation.
+	hostToUp[hostKey] = upID
 	mu.Unlock()
 	defer func() {
 		mu.Lock()
-		delete(pending, hostKey)
 		delete(byUpstreamID, upKey)
 		delete(hostToUp, hostKey)
 		mu.Unlock()
@@ -1462,13 +1520,10 @@ func (p *StdioProxy) callUpstream(ctx context.Context, msg mcp.RPCMsg) (mcp.RPCM
 	defer cancel()
 	// NewStdioProxy initializes these, so this lazy init only fires for a
 	// test-assembled proxy; under pendingMu so it cannot race awaitNonced/readUpstream.
-	// pending is initialized here too: awaitNonced receives the maps BY VALUE and
-	// writes pending[hostKey] unconditionally, so a nil pending panicked on exactly
-	// the test-assembled proxy this block exists to accommodate.
+	// hostToUp is initialized here too: awaitNonced receives the maps BY VALUE, and it
+	// now both writes the correlation and reads the duplicate-ID set from it, so a nil
+	// map would panic on exactly the test-assembled proxy this block accommodates.
 	p.pendingMu.Lock()
-	if p.pending == nil {
-		p.pending = make(map[string]struct{})
-	}
 	if p.byUpstreamID == nil {
 		p.byUpstreamID = make(map[string]chan upstreamResult)
 	}
@@ -1476,7 +1531,7 @@ func (p *StdioProxy) callUpstream(ctx context.Context, msg mcp.RPCMsg) (mcp.RPCM
 		p.hostToUp = make(map[string]*json.RawMessage)
 	}
 	p.pendingMu.Unlock()
-	return awaitNonced(ctx, &p.pendingMu, p.pending, p.byUpstreamID, p.hostToUp, &p.upstreamSeq, p.upstreamDone, mcp.MsgKey(msg.ID),
+	return awaitNonced(ctx, &p.pendingMu, p.byUpstreamID, p.hostToUp, &p.upstreamSeq, p.upstreamDone, mcp.MsgKey(msg.ID),
 		func(id *json.RawMessage) { msg.ID = id },
 		func() error {
 			// For HTTP upstreams, use the per-call ctx so --upstream-timeout cancels

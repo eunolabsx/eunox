@@ -1912,7 +1912,7 @@ func TestServeHTTPGateway_BuildRoutesError(t *testing.T) {
 			// no Policy and enforcement is not audit -> BuildRoutes fails fail-closed.
 		}},
 	}
-	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, proxyFlags{})
+	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, proxyFlags{}, func(context.Context) {})
 	if err == nil {
 		t.Fatal("expected a BuildRoutes error for a policyless enforce-mode route")
 	}
@@ -1926,7 +1926,7 @@ func TestServeHTTPGateway_BindAllRejected(t *testing.T) {
 	cfg := auditUpstreamHTTPConfig(t, srv.URL)
 	cfg.Listen.Bind = "0.0.0.0"
 
-	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, proxyFlags{})
+	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, proxyFlags{}, func(context.Context) {})
 	if err == nil || !strings.Contains(err.Error(), "--unsafe-bind-all") {
 		t.Fatalf("want a bind-all-rejected error, got %v", err)
 	}
@@ -1940,7 +1940,7 @@ func TestServeHTTPGateway_JWTAudienceError(t *testing.T) {
 	cfg := auditUpstreamHTTPConfig(t, srv.URL)
 	pf := proxyFlags{jwksURI: "https://idp.example.com/jwks.json"}
 
-	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf)
+	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf, func(context.Context) {})
 	if err == nil || !strings.Contains(err.Error(), "--jwt-audience") {
 		t.Fatalf("want a jwt-audience error, got %v", err)
 	}
@@ -1957,7 +1957,7 @@ func TestServeHTTPGateway_JWTIssuerError(t *testing.T) {
 		jwtAudience: "eunox",
 	}
 
-	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf)
+	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf, func(context.Context) {})
 	if err == nil || !strings.Contains(err.Error(), "--jwt-issuer") {
 		t.Fatalf("want a jwt-issuer error, got %v", err)
 	}
@@ -1975,7 +1975,7 @@ func TestServeHTTPGateway_JWKSSchemeError(t *testing.T) {
 		jwtIssuer:   "https://idp.example.com",
 	}
 
-	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf)
+	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf, func(context.Context) {})
 	if err == nil || !strings.Contains(err.Error(), "http or https") {
 		t.Fatalf("want a JWKS scheme error, got %v", err)
 	}
@@ -1996,7 +1996,7 @@ func TestServeHTTPGateway_AuthTokenJWTConflict(t *testing.T) {
 		jwtExperimentalCaps: true,
 	}
 
-	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf)
+	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf, func(context.Context) {})
 	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
 		t.Fatalf("want an authToken/jwks-uri conflict error, got %v", err)
 	}
@@ -2010,7 +2010,7 @@ func TestServeHTTPGateway_OAuthResourceError(t *testing.T) {
 	cfg := auditUpstreamHTTPConfig(t, srv.URL)
 	pf := proxyFlags{oauthResource: "not-a-url"}
 
-	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf)
+	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf, func(context.Context) {})
 	if err == nil || !strings.Contains(err.Error(), "--oauth-resource") {
 		t.Fatalf("want an oauth-resource error, got %v", err)
 	}
@@ -2028,7 +2028,7 @@ func TestServeHTTPGateway_OAuthResourceError_ConfigSourced(t *testing.T) {
 	cfg.Listen.OAuthResource = "not-a-url"
 	pf := proxyFlags{}
 
-	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf)
+	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf, func(context.Context) {})
 	if err == nil || !strings.Contains(err.Error(), "listen.oauthResource") {
 		t.Fatalf("want an error labeled listen.oauthResource, got %v", err)
 	}
@@ -2046,7 +2046,7 @@ func TestServeHTTPGateway_OAuthAuthzServerError(t *testing.T) {
 	cfg.Listen.OAuthAuthorizationServers = []string{"${ISSUER}"}
 	pf := proxyFlags{}
 
-	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf)
+	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf, func(context.Context) {})
 	if err == nil || !strings.Contains(err.Error(), "unexpanded") {
 		t.Fatalf("want an unexpanded-env-ref authz-server error, got %v", err)
 	}
@@ -2067,7 +2067,7 @@ func TestServeHTTPGateway_ControlTokenWriteError(t *testing.T) {
 	cfg := auditUpstreamHTTPConfig(t, srv.URL)
 	pf := proxyFlags{controlTokenPath: filepath.Join(blocker, "subdir", "token")}
 
-	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf)
+	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf, func(context.Context) {})
 	if err == nil || !strings.Contains(err.Error(), "kill control endpoint") {
 		t.Fatalf("want a control-token write error, got %v", err)
 	}
@@ -2101,7 +2101,7 @@ func TestServeHTTPGateway_FullSuccess(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
-	go func() { errCh <- serveHTTPGateway(ctx, cfg, nil, nil, nil, nil, pf) }()
+	go func() { errCh <- serveHTTPGateway(ctx, cfg, nil, nil, nil, nil, pf, func(context.Context) {}) }()
 
 	// Poll for the listener instead of a fixed sleep, so this doesn't flake
 	// under a loaded CI runner: cancel() must not fire until Serve has bound,
@@ -2138,19 +2138,39 @@ func stdioHostConfig(u config.UpstreamConfig) *config.GatewayConfig {
 	return singleUpstreamConfig(config.HostTransportStdio, config.RouteDefaults{Enforcement: "audit"}, u)
 }
 
-func TestServeStdioHost_JWKSURIRejected(t *testing.T) {
-	cfg := stdioHostConfig(config.UpstreamConfig{Name: "u1"})
-	err := serveStdioHost(context.Background(), cfg, nil, nil, nil, nil, proxyFlags{jwksURI: "https://idp.example.com/jwks.json"})
+// The transport-conditional rejections live in validateTransportConditionalFlags, which
+// cmdProxy runs with the rest of the flag validation — before the Redis dial, the audit
+// key/log creation, and the session-kill TTL publish. They used to sit inside the serve
+// functions, i.e. after every one of those side effects had already happened.
+
+func TestValidateTransportConditionalFlags_JWKSURIRejectedOnStdio(t *testing.T) {
+	err := validateTransportConditionalFlags(config.HostTransportStdio, proxyFlags{jwksURI: "https://idp.example.com/jwks.json"})
 	if err == nil || !strings.Contains(err.Error(), "transport: http") {
 		t.Fatalf("want a transport-http-required error, got %v", err)
 	}
 }
 
-func TestServeStdioHost_OAuthResourceRejected(t *testing.T) {
-	cfg := stdioHostConfig(config.UpstreamConfig{Name: "u1"})
-	err := serveStdioHost(context.Background(), cfg, nil, nil, nil, nil, proxyFlags{oauthResource: "https://proxy.example.com"})
+func TestValidateTransportConditionalFlags_OAuthResourceRejectedOnStdio(t *testing.T) {
+	err := validateTransportConditionalFlags(config.HostTransportStdio, proxyFlags{oauthResource: "https://proxy.example.com"})
 	if err == nil || !strings.Contains(err.Error(), "transport: http") {
 		t.Fatalf("want a transport-http-required error, got %v", err)
+	}
+}
+
+func TestValidateTransportConditionalFlags_OAuthAuthzServerRejectedOnStdio(t *testing.T) {
+	err := validateTransportConditionalFlags(config.HostTransportStdio, proxyFlags{oauthAuthzServer: "https://idp.example.com"})
+	if err == nil || !strings.Contains(err.Error(), "transport: http") {
+		t.Fatalf("want a transport-http-required error, got %v", err)
+	}
+}
+
+// A gateway must not inherit the stdio-only rejections, and vice versa.
+func TestValidateTransportConditionalFlags_CleanFlagsAccepted(t *testing.T) {
+	if err := validateTransportConditionalFlags(config.HostTransportHTTP, proxyFlags{jwksURI: "https://idp.example.com/jwks.json"}); err != nil {
+		t.Errorf("--jwks-uri is an HTTP-transport flag and must be accepted there, got %v", err)
+	}
+	if err := validateTransportConditionalFlags(config.HostTransportStdio, proxyFlags{sessionIDSet: true}); err != nil {
+		t.Errorf("--session-id is a stdio-only flag and must be accepted there, got %v", err)
 	}
 }
 
@@ -2159,7 +2179,7 @@ func TestServeStdioHost_OAuthResourceRejected(t *testing.T) {
 // --max-sessions, --unsafe-bind-all, and --trust-forwarded-for were silently
 // accepted (and ignored) on a stdio host instead of being rejected like
 // --jwks-uri/--oauth-resource/--oauth-authorization-server above.
-func TestServeStdioHost_HTTPOnlyFlagsRejected(t *testing.T) {
+func TestValidateTransportConditionalFlags_HTTPOnlyFlagsRejected(t *testing.T) {
 	cases := []struct {
 		name string
 		pf   proxyFlags
@@ -2172,8 +2192,7 @@ func TestServeStdioHost_HTTPOnlyFlagsRejected(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := stdioHostConfig(config.UpstreamConfig{Name: "u1"})
-			err := serveStdioHost(context.Background(), cfg, nil, nil, nil, nil, tc.pf)
+			err := validateTransportConditionalFlags(config.HostTransportStdio, tc.pf)
 			if err == nil || !strings.Contains(err.Error(), "transport: http") {
 				t.Fatalf("want a transport-http-required error, got %v", err)
 			}
@@ -2232,9 +2251,8 @@ func TestHTTPOnlyFlagsSetOnStdio_EmptyWhenUnset(t *testing.T) {
 // stdio-only concept (a gateway mints its own Mcp-Session-Id per client session),
 // so it must be rejected on an http-transport config rather than silently
 // ignored.
-func TestServeHTTPGateway_SessionIDRejected(t *testing.T) {
-	cfg := singleUpstreamConfig(config.HostTransportHTTP, config.RouteDefaults{Enforcement: "audit"}, config.UpstreamConfig{Name: "u1", UpstreamURL: "http://example.invalid"})
-	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, proxyFlags{sessionIDSet: true})
+func TestValidateTransportConditionalFlags_SessionIDRejectedOnGateway(t *testing.T) {
+	err := validateTransportConditionalFlags(config.HostTransportHTTP, proxyFlags{sessionIDSet: true})
 	if err == nil || !strings.Contains(err.Error(), "transport: stdio") {
 		t.Fatalf("want a transport-stdio-required error, got %v", err)
 	}
@@ -2243,7 +2261,7 @@ func TestServeHTTPGateway_SessionIDRejected(t *testing.T) {
 func TestServeStdioHost_StrictDriftRequiresPolicy(t *testing.T) {
 	strict := true
 	cfg := stdioHostConfig(config.UpstreamConfig{Name: "u1", StrictDrift: &strict})
-	err := serveStdioHost(context.Background(), cfg, nil, nil, nil, nil, proxyFlags{})
+	err := serveStdioHost(context.Background(), cfg, nil, nil, nil, nil, proxyFlags{}, func(context.Context) {})
 	if err == nil || !strings.Contains(err.Error(), "strictDrift requires a policy") {
 		t.Fatalf("want a strictDrift-requires-policy error, got %v", err)
 	}
@@ -2254,7 +2272,7 @@ func TestServeStdioHost_NoPolicyNotAuditRejected(t *testing.T) {
 		Transport: config.HostTransportStdio,
 		Upstreams: []config.UpstreamConfig{{Name: "u1"}},
 	}
-	err := serveStdioHost(context.Background(), cfg, nil, nil, nil, nil, proxyFlags{})
+	err := serveStdioHost(context.Background(), cfg, nil, nil, nil, nil, proxyFlags{}, func(context.Context) {})
 	if err == nil || !strings.Contains(err.Error(), "no policy configured") {
 		t.Fatalf("want a no-policy-configured error, got %v", err)
 	}
@@ -2280,7 +2298,7 @@ func TestServeStdioHost_AuditModeStartsAndFailsFast(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	serveErr := serveStdioHost(ctx, cfg, sink, nil, nil, nil, proxyFlags{})
+	serveErr := serveStdioHost(ctx, cfg, sink, nil, nil, nil, proxyFlags{}, func(context.Context) {})
 	if serveErr == nil {
 		t.Fatal("expected a spawn error for a non-existent upstream command")
 	}

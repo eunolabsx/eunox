@@ -11,7 +11,7 @@
 
 <p align="center">
   <strong>MCP capability firewall</strong><br>
-  Sits between your MCP host and any MCP server — local subprocess or remote HTTPS. Every <code>tools/call</code>, <code>resources/read</code>, <code>resources/subscribe</code>, <code>prompts/get</code>, and <code>sampling/createMessage</code> is checked against a YAML capability manifest before it is forwarded; <code>tools/list</code>, <code>resources/list</code>, and <code>prompts/list</code> are filtered to permitted entries only. Every decision on a checked method is recorded to a tamper-evident OCSF audit log (asynchronous, with documented <a href="./docs/conformance.md#audit-log-and-compliance">delivery caveats</a>; <code>--require-audit</code> defaults to <code>strict</code>, so the proxy fails fast at startup if the log cannot be opened and denies forwards fail-closed once the trail degrades — pass <code>--require-audit=on</code> for startup-fatal only, or <code>--require-audit=off</code> to run unaudited).
+  Sits between your MCP host and any MCP server — local subprocess or remote HTTPS. Every <code>tools/call</code>, <code>resources/read</code>, <code>resources/subscribe</code>, <code>resources/unsubscribe</code>, <code>prompts/get</code>, and <code>sampling/createMessage</code> is checked against a YAML capability manifest before it is forwarded; <code>tools/list</code>, <code>resources/list</code>, and <code>prompts/list</code> are filtered to permitted entries only. Every decision on a checked method is recorded to a tamper-evident OCSF audit log (asynchronous, with documented <a href="./docs/conformance.md#audit-log-and-compliance">delivery caveats</a>; <code>--require-audit</code> defaults to <code>strict</code>, so the proxy fails fast at startup if the log cannot be opened and denies forwards fail-closed once the trail degrades — pass <code>--require-audit=on</code> for startup-fatal only, or <code>--require-audit=off</code> to run unaudited).
 </p>
 
 <p align="center">
@@ -80,7 +80,7 @@ eunox proxy --audit -- npx -y @modelcontextprotocol/server-filesystem /data
 
 (The example wraps the npm `server-filesystem`, so it needs Node / `npx` on `PATH` — the one-liner wraps **any** MCP server, e.g. a Python one via `uvx`, or a local binary. No toolchain at all? See the Docker / no-Docker trials below.)
 
-Every enforced-method call (`tools/call`, `resources/read`, `resources/subscribe`, `prompts/get`, `sampling/createMessage`) is forwarded and recorded to `~/.eunox/audit.jsonl` with an HMAC signature; `tools/call` records also include the full argument map. (`…/list` calls forward the full upstream catalog unfiltered and are recorded as enumeration events — without a per-entry argument map.)
+Every enforced-method call (`tools/call`, `resources/read`, `resources/subscribe`, `resources/unsubscribe`, `prompts/get`, `sampling/createMessage`) is forwarded and recorded to `~/.eunox/audit.jsonl` with an HMAC signature; `tools/call` records also include the full argument map. (`…/list` calls forward the full upstream catalog unfiltered and are recorded as enumeration events — without a per-entry argument map.)
 
 > **Security note:** In audit/wiretap mode the log contains full tool call argument values for every call. Treat `audit.jsonl` as sensitive regardless of mode — even in enforce mode, denial records include condition-specific argument excerpts (e.g., the rejected value that triggered an `allowedValues` check). Apply appropriate access controls and retention policy to this file.
 

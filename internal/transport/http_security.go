@@ -215,10 +215,6 @@ func (p *HTTPProxy) checkControlToken(w http.ResponseWriter, r *http.Request) bo
 	return true
 }
 
-// buildAllowedOriginHosts returns the set of host names whose Origin is always
-// accepted: the loopback names plus the configured bind host (unless it is a
-// wildcard, which is not a meaningful Origin host). Hosts are lower-cased so the
-// lookup in originAllowed is case-insensitive.
 // buildLoopbackPinHosts returns the extra host NAMES the DNS-rebinding pin on the
 // loopback-only endpoints accepts, derived from the operator's listen.allowedOrigins.
 //
@@ -257,6 +253,10 @@ func buildLoopbackPinHosts(allowedOrigins []string) map[string]bool {
 	return hosts
 }
 
+// buildAllowedOriginHosts returns the set of host names whose Origin is always
+// accepted: the loopback names plus the configured bind host (unless it is a
+// wildcard, which is not a meaningful Origin host). Hosts are lower-cased so the
+// lookup in originAllowed is case-insensitive.
 func buildAllowedOriginHosts(bind string) map[string]bool {
 	hosts := map[string]bool{
 		"localhost": true,
@@ -335,17 +335,23 @@ func (p *HTTPProxy) checkOrigin(w http.ResponseWriter, r *http.Request) bool {
 	recordedOrigin = bounded
 	// Unstamped by design (no route/policy fields): the Origin gate runs before route
 	// resolution — see recordPreSessionDeny.
-	p.recordPreSessionDeny(r, "ORIGIN_REJECTED", catOrigin, details)
-	if multiple {
-		fmt.Fprintf(os.Stderr,
-			"[eunox] SECURITY: rejected request carrying %d Origin headers (%q); RFC 6454 permits only one (DNS-rebinding guard)\n",
-			len(vals), recordedOrigin,
-		)
-	} else {
-		fmt.Fprintf(os.Stderr,
-			"[eunox] SECURITY: rejected request with disallowed Origin %q (DNS-rebinding guard)\n",
-			recordedOrigin,
-		)
+	// The stderr line is gated on the SAME admission verdict as the record. It is ~600
+	// bytes per rejected request and reachable with no credential at all, so leaving it
+	// ungated left the cheapest half of the flooding primitive open while the tape beside
+	// it was carefully bounded; a suppressed burst is still visible, as the rollup count
+	// on the next admitted record.
+	if admitted := p.recordPreSessionDeny(r, "ORIGIN_REJECTED", catOrigin, details); admitted {
+		if multiple {
+			fmt.Fprintf(os.Stderr,
+				"[eunox] SECURITY: rejected request carrying %d Origin headers (%q); RFC 6454 permits only one (DNS-rebinding guard)\n",
+				len(vals), recordedOrigin,
+			)
+		} else {
+			fmt.Fprintf(os.Stderr,
+				"[eunox] SECURITY: rejected request with disallowed Origin %q (DNS-rebinding guard)\n",
+				recordedOrigin,
+			)
+		}
 	}
 	http.Error(w, "Forbidden: Origin not allowed", http.StatusForbidden)
 	return false
@@ -480,8 +486,10 @@ func addClaimedSessionIDValue(details map[string]interface{}, claimed string) ma
 // goes through recordSessionCapDeny instead, which keeps this rate limiter and this
 // claimed_session_id rule but writes through the route's sink so its record carries the
 // same route stamp as its in-flight-cap sibling.
-func (p *HTTPProxy) recordPreSessionDeny(r *http.Request, code string, category refusalCategory, extra map[string]interface{}) {
-	p.recordRefusal(r, nil, code, category, extra)
+// It returns the rate limiter's verdict (see recordRefusal), which a caller pairs its own
+// stderr diagnostic with so both halves of a refusal are bounded by one decision.
+func (p *HTTPProxy) recordPreSessionDeny(r *http.Request, code string, category refusalCategory, extra map[string]interface{}) bool {
+	return p.recordRefusal(r, nil, code, category, extra)
 }
 
 // recordSessionCapDeny records a session-cap refusal — the pre-spawn slot reservation and
@@ -511,22 +519,41 @@ func (p *HTTPProxy) recordSessionCapDeny(r *http.Request, route *UpstreamRoute) 
 // recordRefusal is the shared body of the two above: rate-limit, fold any suppressed
 // count in, stamp the source IP and the unverified claimed_session_id, and write through
 // route's sink when the route is already known (nil ⟹ the proxy-wide sink).
-func (p *HTTPProxy) recordRefusal(r *http.Request, route *UpstreamRoute, code string, category refusalCategory, extra map[string]interface{}) {
+// It returns whether the refusal was ADMITTED by the rate limiter, so a caller whose own
+// stderr diagnostic is part of the same flood (checkOrigin's ~600-byte SECURITY line) can
+// gate it on the same verdict. Rate-limiting the tape while leaving the log line per-request
+// left the cheapest half of the primitive open: an unauthenticated caller could still drive
+// unbounded log volume through a rejected Origin.
+func (p *HTTPProxy) recordRefusal(r *http.Request, route *UpstreamRoute, code string, category refusalCategory, extra map[string]interface{}) bool {
 	rec := asRecorder(p.sink)
 	if route != nil {
 		rec = asRecorder(route.sink)
 	}
-	if rec == nil {
-		return
+	// The bucket is charged BEFORE the sink is consulted, so the verdict this returns
+	// bounds the caller's stderr line whether or not a tape exists. A nil sink is
+	// reachable in production — --require-audit=off with an unopenable audit path leaves
+	// openConfiguredAuditSink returning (nil, nil) — and short-circuiting to "admitted"
+	// there left the log-volume half of the flooding primitive completely unbounded in
+	// exactly the deployment where stderr is the ONLY refusal signal. There is nothing to
+	// charge the bucket against but the refusal itself, which is the thing being bounded.
+	//
+	// No nil-limiter fallback for a proxy that HAS a tape: a "defensive" branch there
+	// wrote the refusal record with NO rate limit at all, which is a fail-open on the
+	// exact DoS bound this file exists to enforce. NewHTTPProxyGateway always builds the
+	// limiter, so a nil one alongside a sink is a construction bug and panics like one.
+	// Neither a sink nor a limiter can only be an in-package test literal: there is
+	// nothing to write and nothing to charge.
+	if rec == nil && p.preSessionDenies == nil {
+		return true
 	}
-	// No nil-limiter fallback: a "defensive" branch here wrote the refusal record with
-	// NO rate limit at all, which is a fail-open on the exact DoS bound this file exists
-	// to enforce — and it was reachable only from an in-package test literal, since
-	// NewHTTPProxyGateway always builds the limiter. A nil here is a construction bug and
-	// panics like one.
 	ok, suppressed := p.preSessionDenies.admit(category)
 	if !ok {
-		return
+		return false
+	}
+	if rec == nil {
+		// No sink configured: nothing to write, but the caller's stderr line is admitted
+		// (and rate-limited) as the refusal's only surviving signal.
+		return true
 	}
 	if suppressed > 0 {
 		if extra == nil {
@@ -539,6 +566,7 @@ func (p *HTTPProxy) recordRefusal(r *http.Request, route *UpstreamRoute, code st
 		extra[detailSuppressedRefusalScope] = suppressedScopeProxyCategory
 	}
 	rec.RecordDeny(r.Context(), "", "", "", code, string(category), p.addRefusalContext(extra, r), false)
+	return true
 }
 
 // addRefusalContext stamps the two details EVERY refusal record carries about its caller:

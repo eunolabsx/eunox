@@ -525,8 +525,9 @@ func (e *Engine) RecordSessionCall(ctx context.Context, req *capability.EnforceR
 	// antecedent; only an atomic multi-key write would close the window fully. Both keys
 	// are sequenceBlock history ("seq:"-namespaced) and never touch a maxCalls bucket
 	// (those are "maxcalls:"-namespaced, committed separately), so maxCalls accounting is
-	// unaffected by this ordering. The in-memory backend runs both writes under one lock,
-	// so both commit or neither does.
+	// unaffected by this ordering. This holds on EVERY backend, in-memory included: the
+	// two writes are two separate calls, each taking the backend's lock on its own, so
+	// nothing makes the pair atomic — the ordering above is the whole mitigation.
 	//
 	// Cross-namespace false-trip caveat: this alias key is derived by splitting the
 	// target's NAME on its leading recognized token, which discards the target's REAL

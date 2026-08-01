@@ -12,7 +12,6 @@ package config
 
 import (
 	"bytes"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -271,8 +270,10 @@ func schemaVersionFromNode(node *yaml.Node) (string, bool) {
 
 // forceSchemaVersionToString retags an unquoted top-level `schemaVersion` scalar to
 // !!str so the natural `schemaVersion: 0.1` (which yaml.v3 auto-types as a float)
-// decodes as the string "0.1" and negotiates identically to the quoted form — and to
-// the gateway-config loader, which already preserves the verbatim source text. Without
+// decodes as the string "0.1" and negotiates identically to the quoted form. The
+// gateway-config loader does NOT do this — it decodes strictly from the raw bytes for
+// KnownFields, so it cannot retag in place — and instead rejects a bare-number
+// schemaVersion with an explicit "quote it" error. Without
 // this the number flows through node.Decode → json.Marshal → json.Unmarshal into the
 // string SchemaVersion field and fails with an opaque "cannot unmarshal number into ...
 // string" before validateManifestSchemaVersion can emit its friendly message. Retagging
@@ -336,7 +337,41 @@ var numericPolicyScalarKeys = map[string]bool{
 	"maxItems":      true, // argumentSchema
 }
 
+// scopedNumericPolicyScalarKeys are the effect layer's numeric bounds, which carry the
+// identical coercion risk (an authored `max: 0600` loads as an enforced bound of 384) but
+// whose SPELLINGS are generic. They are keyed by the block they must appear in, because
+// the walk below visits every mapping in the document: matching a bare "max"/"value"
+// anywhere would also reject an opaque `policy`/`custom` condition payload (both are
+// `interface{}` — author-defined input handed verbatim to an external evaluator, where
+// eunox enforces nothing and so cannot "silently change the enforced policy"), and any
+// future field that happens to share the name. Every other entry in
+// numericPolicyScalarKeys is specific enough that the name IS the field.
+var scopedNumericPolicyScalarKeys = map[string]map[string]bool{
+	"blastRadius":   {"value": true},          // effect contract's / a byArgument case's magnitude
+	"conditions":    {"max": true},            // the blastRadius condition's bound
+	"effectCeiling": {"maxBlastRadius": true}, // the top-level ceiling's magnitude bound
+}
+
+// numericPolicyScalarKeyApplies reports whether key names an enforced number at this point
+// in the document: an unscoped policy field, or a scoped one sitting in the block it
+// belongs to. enclosingKey is the mapping key the containing node hangs off ("" at the
+// document root).
+func numericPolicyScalarKeyApplies(enclosingKey, key string) bool {
+	if numericPolicyScalarKeys[key] {
+		return true
+	}
+	return scopedNumericPolicyScalarKeys[enclosingKey][key]
+}
+
 func rejectCoercedValueScalars(n *yaml.Node, isJSON bool) error {
+	return rejectCoercedScalarsUnder(n, isJSON, "")
+}
+
+// rejectCoercedScalarsUnder is rejectCoercedValueScalars' walk, carrying the mapping key
+// the current node hangs off so a scoped numeric key can be recognized only inside its own
+// block. A sequence passes its own enclosing key down to each element, so a condition
+// object inside `conditions:` is scoped to "conditions".
+func rejectCoercedScalarsUnder(n *yaml.Node, isJSON bool, enclosingKey string) error {
 	if n == nil {
 		return nil
 	}
@@ -362,15 +397,31 @@ func rejectCoercedValueScalars(n *yaml.Node, isJSON bool) error {
 						return err
 					}
 				}
-			case key.Kind == yaml.ScalarNode && numericPolicyScalarKeys[key.Value] && val.Kind == yaml.ScalarNode:
+			case key.Kind == yaml.ScalarNode && numericPolicyScalarKeyApplies(enclosingKey, key.Value) && val.Kind == yaml.ScalarNode:
 				if err := checkNumericFieldNotCoerced(val, key.Value, isJSON); err != nil {
 					return err
 				}
 			}
 		}
+		// Recurse pairwise so each value carries the key it hangs off. A key node is
+		// walked too (with no enclosing key): a complex YAML key is a legal, if exotic,
+		// composite the pre-scoping walk also descended into.
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			if err := rejectCoercedScalarsUnder(n.Content[i], isJSON, ""); err != nil {
+				return err
+			}
+			childKey := ""
+			if k := resolveYAMLAlias(n.Content[i]); k.Kind == yaml.ScalarNode {
+				childKey = k.Value
+			}
+			if err := rejectCoercedScalarsUnder(n.Content[i+1], isJSON, childKey); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	for _, child := range n.Content {
-		if err := rejectCoercedValueScalars(child, isJSON); err != nil {
+		if err := rejectCoercedScalarsUnder(child, isJSON, enclosingKey); err != nil {
 			return err
 		}
 	}
@@ -1100,6 +1151,10 @@ func validateLocalManifest(m *LocalManifest) error {
 				})
 			case capability.BlastRadiusCondition, *capability.BlastRadiusCondition:
 				err = validateTypedCondition(i, j, cond, validateBlastRadius)
+			case capability.PolicyCondition, *capability.PolicyCondition:
+				err = validateTypedCondition(i, j, cond, validatePolicyCondition)
+			case capability.CustomCondition, *capability.CustomCondition:
+				err = validateTypedCondition(i, j, cond, validateCustomCondition)
 			}
 			if err != nil {
 				return err
@@ -1580,6 +1635,33 @@ func validateTimeWindow(i, j int, v *capability.TimeWindowCondition) error {
 	}
 	if v.NotBefore != "" && v.NotAfter != "" && !notBefore.Before(notAfter) {
 		return fmt.Errorf("capability at index %d, condition %d: timeWindow notBefore %q is not before notAfter %q; the window is empty and denies every call", i, j, v.NotBefore, v.NotAfter)
+	}
+	return nil
+}
+
+// validatePolicyCondition rejects a policy condition with no backend name. The engine
+// resolves the evaluator by name at request time and denies (fail closed) when nothing is
+// registered under it, so a blank or whitespace-only backend is a silent deny-all with no
+// load-time signal at all — the author sees a valid-looking policy and a runtime where
+// every matching call is refused. Every other condition whose misconfiguration denies at
+// runtime is rejected at load; policy and custom were the only two with no arm.
+//
+// The backend's EXISTENCE is deliberately not checked: evaluators are registered by the
+// embedding program, possibly after the manifest loads, so requiring registration here
+// would reject a legitimate wiring order. Requiring a NAME does not.
+func validatePolicyCondition(i, j int, v *capability.PolicyCondition) error {
+	if strings.TrimSpace(v.Backend) == "" {
+		return fmt.Errorf("capability at index %d, condition %d: policy requires a non-empty 'backend' naming the external policy evaluator (e.g. opa, cedar); an unnamed backend resolves to no evaluator and denies every matching call at request time", i, j)
+	}
+	return nil
+}
+
+// validateCustomCondition rejects a custom condition with no handler name, for the same
+// reason as validatePolicyCondition: the name is the key the handler registry is looked up
+// by, so a blank one denies every matching call at request time with nothing said at load.
+func validateCustomCondition(i, j int, v *capability.CustomCondition) error {
+	if strings.TrimSpace(v.Name) == "" {
+		return fmt.Errorf("capability at index %d, condition %d: custom requires a non-empty 'name' naming the registered condition handler; an unnamed handler resolves to nothing and denies every matching call at request time", i, j)
 	}
 	return nil
 }
@@ -2147,41 +2229,17 @@ func jsonFieldKeys(t reflect.Type) map[string]bool {
 // discriminator type (always including "type"). The second result is false for a
 // type this build does not model; the caller then skips key checking (the unknown
 // type is already rejected by the typed decode).
+//
+// The prototype comes from pkg/capability's ONE condition registry rather than a
+// reflect.TypeOf switch mirrored here. The mirror was a second table to update per new
+// condition type, and one that failed silently: a type missing from it returned "not
+// known", so its keys went unchecked and a typo in it loaded clean.
 func conditionKeysFor(condType string) (map[string]bool, bool) {
-	var t reflect.Type
-	switch condType {
-	case capability.ConditionTypeTimeWindow:
-		t = reflect.TypeOf(capability.TimeWindowCondition{})
-	case capability.ConditionTypeIPRange:
-		t = reflect.TypeOf(capability.IPRangeCondition{})
-	case capability.ConditionTypeAllowedOperations:
-		t = reflect.TypeOf(capability.AllowedOperationsCondition{})
-	case capability.ConditionTypeAllowedExtensions:
-		t = reflect.TypeOf(capability.AllowedExtensionsCondition{})
-	case capability.ConditionTypeAllowedTables:
-		t = reflect.TypeOf(capability.AllowedTablesCondition{})
-	case capability.ConditionTypeMaxCalls:
-		t = reflect.TypeOf(capability.MaxCallsCondition{})
-	case capability.ConditionTypeRecipientDomain:
-		t = reflect.TypeOf(capability.RecipientDomainCondition{})
-	case capability.ConditionTypeAllowedValues:
-		t = reflect.TypeOf(capability.AllowedValuesCondition{})
-	case capability.ConditionTypeSequenceBlock:
-		t = reflect.TypeOf(capability.SequenceBlockCondition{})
-	case capability.ConditionTypeFlowLabel:
-		t = reflect.TypeOf(capability.FlowLabelCondition{})
-	case capability.ConditionTypeEffectClass:
-		t = reflect.TypeOf(capability.EffectClassCondition{})
-	case capability.ConditionTypeBlastRadius:
-		t = reflect.TypeOf(capability.BlastRadiusCondition{})
-	case capability.ConditionTypePolicy:
-		t = reflect.TypeOf(capability.PolicyCondition{})
-	case capability.ConditionTypeCustom:
-		t = reflect.TypeOf(capability.CustomCondition{})
-	default:
+	proto, known := capability.NewConditionPrototype(condType)
+	if !known {
 		return nil, false
 	}
-	keys := jsonFieldKeys(t)
+	keys := jsonFieldKeys(reflect.TypeOf(proto))
 	keys["type"] = true
 	return keys, true
 }
@@ -2202,23 +2260,12 @@ func directiveKeysFor(dirType string) (map[string]bool, bool) {
 }
 
 // validateDescriptionHashFormat reports an error if s is not a valid
-// "sha256:<64 lowercase hex chars>" description hash value.
+// "sha256:<64 lowercase hex chars>" description hash value. It delegates to
+// capability.ValidateSHA256Pin, which the effect layer's ref pin also uses, so the two
+// pins cannot drift on what a valid digest is — the package that owns the digest owns
+// its format.
 func validateDescriptionHashFormat(s string) error {
-	const prefix = "sha256:"
-	if !strings.HasPrefix(s, prefix) {
-		return fmt.Errorf("descriptionHash %q must start with \"sha256:\"", s)
-	}
-	hexPart := s[len(prefix):]
-	if len(hexPart) != 64 {
-		return fmt.Errorf("descriptionHash %q: hex part must be exactly 64 characters (got %d)", s, len(hexPart))
-	}
-	if _, err := hex.DecodeString(hexPart); err != nil {
-		return fmt.Errorf("descriptionHash %q: hex part is not valid hex: %w", s, err)
-	}
-	if hexPart != strings.ToLower(hexPart) {
-		return fmt.Errorf("descriptionHash %q: hex part must be lowercase", s)
-	}
-	return nil
+	return capability.ValidateSHA256Pin("descriptionHash", s)
 }
 
 // nearestKey returns the allowed key nearest to unknown, or "" if none is close

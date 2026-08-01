@@ -3,8 +3,8 @@
 
 // Package mcp holds the JSON message data-transfer types for the MCP (Model
 // Context Protocol) shapes production code actually decodes: the params of
-// initialize, tools/call, resources/read (and its identical resources/subscribe
-// twin), and prompts/get, plus the results of initialize and tools/list. They are
+// initialize, tools/call, resources/read (and its identical resources/subscribe and
+// resources/unsubscribe twins), and prompts/get, plus the results of initialize and tools/list. They are
 // pure JSON structs with no methods.
 //
 // The set is deliberately scoped to those decoders rather than to protocol
@@ -58,7 +58,8 @@ type ToolEntry struct {
 }
 
 // ResourceReadParams is the params field of a `resources/read` request.
-// Also used for `resources/subscribe` which has the same wire shape.
+// Also used for `resources/subscribe` and `resources/unsubscribe`, which have the
+// same wire shape.
 type ResourceReadParams struct {
 	URI string `json:"uri"`
 }

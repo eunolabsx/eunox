@@ -32,6 +32,7 @@ your IdP) and enforces a fine-grained YAML policy on top of it.
 | `resources/read` | **Enforced** — PDP decision per manifest entry | URI matched against `allowedValues` or pattern |
 | `resources/list` | **Filtered** — only resources with `action: read` (or `*`) in manifest are returned | |
 | `resources/subscribe` | **Enforced** — same policy path as `resources/read` | |
+| `resources/unsubscribe` | **Enforced** — same manifest entry as `resources/read`, matched by name + `read` action alone | Cancelling reduces data flow, so the `read` grant that permitted the subscription permits its cancellation. Conditions on the entry are not evaluated and no session state is consumed: metering a cancel would let a spent `maxCalls` budget deny the unsubscribe that closes the stream the subscribe opened. Kill switch, principal scoping, JWT capability claims, and the entry's own `enforcement: audit` posture still apply — the last so an observe-mode entry downgrades the cancel exactly as it downgrades the read |
 | `prompts/get` | **Enforced** — PDP decision per manifest entry | |
 | `prompts/list` | **Filtered** — only prompts with `action: get` (or `*`) in manifest are returned | |
 | `sampling/createMessage` *(upstream→host)* | **Enforced** (local subprocess upstream only) — denied by default; requires explicit `system:sampling/createMessage` entry in manifest, and the kill switch applies. On the allow path the host's response is routed back to the upstream so the round-trip completes | Fail-closed: absent = deny. See the transport caveats in *Known gaps* below |
@@ -508,7 +509,7 @@ unauditable privileged call is worse than a denied one, run with
 `--require-audit=strict`. In addition to the startup check above, it gates the
 *forward* path at runtime: once a record has been dropped or a write has failed,
 every subsequent enforced call (`tools/call`, `resources/read`,
-`resources/subscribe`, `prompts/get`, `sampling/createMessage`) and `*/list`
+`resources/subscribe`, `resources/unsubscribe`, `prompts/get`, `sampling/createMessage`) and `*/list`
 enumeration is denied with `AUDIT_UNAVAILABLE` (JSON-RPC `-32603`) and the
 upstream is not contacted. The gate is **retrospective**: because the loss
 counters reflect only already-completed calls, the boundary call whose own record

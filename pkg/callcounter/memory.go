@@ -126,9 +126,17 @@ func NewInMemory(opts ...InMemoryOption) *InMemory {
 // backstop for the unbounded-map growth described on NewInMemory.
 func (m *InMemory) admitNewKey() error {
 	if m.maxKeys > 0 && len(m.entries) >= m.maxKeys {
-		return fmt.Errorf("callcounter: entry limit reached (%d)", m.maxKeys)
+		return m.errEntryLimit()
 	}
 	return nil
+}
+
+// errEntryLimit is the one entry-limit refusal, shared by the single-key admission above
+// and the multi-bucket atomic commit's own count check — which needs a different
+// PREDICATE (it admits several new keys at once) but must not grow a second spelling of
+// the same refusal for a caller to have to match on.
+func (m *InMemory) errEntryLimit() error {
+	return fmt.Errorf("callcounter: entry limit reached (%d)", m.maxKeys)
 }
 
 // IncrementAndGet records a call and returns the number of calls within the
@@ -402,7 +410,7 @@ func (m *InMemory) IncrementIfAllBelow(_ context.Context, keys []string, windowS
 		}
 	}
 	if m.maxKeys > 0 && len(m.entries)+newKeys > m.maxKeys {
-		return false, 0, 0, 0, fmt.Errorf("callcounter: entry limit reached (%d)", m.maxKeys)
+		return false, 0, 0, 0, m.errEntryLimit()
 	}
 	var maxCount int64
 	for i := range states {

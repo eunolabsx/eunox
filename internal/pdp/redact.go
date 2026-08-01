@@ -35,7 +35,10 @@ import (
 // object key and passes through unchanged; redactFields redacts cleanly-parseable JSON
 // only and does NOT fail the response closed over string content it cannot parse. It
 // fails closed on a structural/resource guard: an unparseable (or trailing-data)
-// envelope, a structurally unverifiable content array/item shape, the depth bound, or a
+// envelope, an envelope or unwrapped JSON leaf whose object keys duplicate — or case-collide
+// on a name this redaction resolves by matching — so that its decode may differ from what a
+// host renders (see redactionKeysAmbiguous and redactionFoldKeys), a
+// structurally unverifiable content array/item shape, the depth bound, or a
 // resource/resource_link content item (whose embedded text/blob body this redactor
 // cannot inspect) — the last so an upstream cannot evade a declared redactFields
 // obligation by embedding the named field inside a resource. image/audio items, which
@@ -63,6 +66,10 @@ func ApplyRedactObligs(resultBytes []byte, obligs []capability.Obligation) ([]by
 	for i := range paths {
 		paths[i] = normalizeDotPathRoot(paths[i])
 	}
+	// Resolve the paths and their case-variant fold scope once, and thread the pair
+	// through the whole walk: every leaf scan needs both, and re-deriving the fold set per
+	// leaf would re-fold the same handful of names for every string in the response.
+	spec := redactSpec{paths: paths, fold: redactionFoldKeys(paths)}
 
 	// Preserve the original bytes so a response no path actually matches can be
 	// returned verbatim (byte-for-byte), rather than re-marshaled — encoding/json
@@ -97,6 +104,17 @@ func ApplyRedactObligs(resultBytes []byte, obligs []capability.Obligation) ([]by
 	// drop the trailing data on re-marshal.
 	if dec.More() {
 		return nil, fmt.Errorf("redactFields: trailing data after response envelope; cannot verify redaction (fail closed)")
+	}
+	// The decode above resolved every duplicate object key LAST-WINS, and a host is free
+	// to resolve it first-wins. That divergence is a redaction bypass on its own:
+	// {"content":[...],"data":{"ssn":"..."},"data":{}} decodes to an empty `data`, so no
+	// path matches, `changed` stays false, and the ORIGINAL bytes — carrying the ssn — are
+	// returned verbatim below while the audit record reports the obligation applied. The
+	// same rule the request path (mcp.rejectDuplicateJSONKeys) and the list filters
+	// (entryKeysAmbiguous) already apply closes it here: bytes whose decode cannot be
+	// trusted to match what a host renders cannot verify a redaction, so they fail closed.
+	if redactionKeysAmbiguous(resultBytes, spec.fold) {
+		return nil, fmt.Errorf("redactFields: response envelope carries a duplicate or case-variant object key, so its decode may differ from what a host renders; cannot verify redaction (fail closed)")
 	}
 
 	// (1) Redact within each text content item. Any structurally unverifiable shape
@@ -144,7 +162,7 @@ func ApplyRedactObligs(resultBytes []byte, obligs []capability.Obligation) ([]by
 			if !ok {
 				return nil, fmt.Errorf("redactFields: text content item has a non-string 'text' body (%T); cannot verify redaction (fail closed)", obj["text"])
 			}
-			redacted, err := redactJSONText(text, paths)
+			redacted, err := redactJSONText(text, spec)
 			if err != nil {
 				return nil, err // fail closed
 			}
@@ -158,7 +176,7 @@ func ApplyRedactObligs(resultBytes []byte, obligs []capability.Obligation) ([]by
 	// (2) Redact within structuredContent (MCP 2025-06+ structured result), in place,
 	// with the same fail-closed rigor as the content path above. See
 	// redactStructuredContentField.
-	scChanged, scErr := redactStructuredContentField(result, paths)
+	scChanged, scErr := redactStructuredContentField(result, spec)
 	if scErr != nil {
 		return nil, scErr // fail closed
 	}
@@ -180,7 +198,7 @@ func ApplyRedactObligs(resultBytes []byte, obligs []capability.Obligation) ([]by
 	// what the operator asked for. The same container walk structuredContent uses is
 	// reused, so a doubly-encoded JSON string leaf is unwrapped identically and the depth
 	// bound applies the same way.
-	sibChanged, sibErr := redactSiblingTopLevelKeys(result, paths)
+	sibChanged, sibErr := redactSiblingTopLevelKeys(result, spec)
 	if sibErr != nil {
 		return nil, sibErr // fail closed
 	}
@@ -206,6 +224,88 @@ func ApplyRedactObligs(resultBytes []byte, obligs []capability.Obligation) ([]by
 		return nil, fmt.Errorf("redactFields: failed to re-marshal redacted response: %w", err)
 	}
 	return out, nil
+}
+
+// redactionKeysAmbiguous reports whether raw — a result envelope, or a JSON container
+// unwrapped from a string leaf — carries an object key whose decode this redactor cannot
+// trust to match what a host renders. Either way the value the redaction walk inspected is
+// not the value the host sees, so an active obligation cannot be verified over these bytes.
+//
+// Two rules, and unlike the */list entry gate the second is SCOPED (see spec.fold and
+// redactionFoldKeys):
+//
+//   - An EXACT duplicate key, at any depth, is always untrustworthy: Go keeps the last and
+//     a first-wins host parser renders the first. This is the whole of the bypass this gate
+//     was added for — {"data":{"ssn":…},"data":{}} decodes to an empty `data`, so no path
+//     matches, nothing is marked changed, and the ORIGINAL bytes carrying the ssn are
+//     returned verbatim while the record reports the obligation applied.
+//   - A CASE-VARIANT collision is untrustworthy only for a name this redaction actually
+//     depends on resolving. The */list gate folds every root key because an entry is bound
+//     to a STRUCT by encoding/json's case-insensitive field match; nothing on this path is.
+//     Both the envelope and every unwrapped leaf decode into map[string]interface{}, whose
+//     keys are exact — so {"Data":…,"data":…} yields two distinct entries here exactly as it
+//     does for any host that renders JSON as data, with no divergence to refuse over.
+//
+// It runs the SAME scan as the */list entry gate (scanJSONKeys, shared with scanToolEntry),
+// with array roots admitted: structuredContent, a sibling key's value, and any
+// doubly-encoded leaf are all legally an array of objects, where a tools/list entry is not.
+func redactionKeysAmbiguous(raw []byte, fold map[string]struct{}) bool {
+	return scanJSONKeys(raw, jsonKeyScanOpts{allowArrayRoot: true, foldKeys: fold}).untrustworthy
+}
+
+// redactSpec is one redactFields obligation set, resolved once per response: the normalized
+// dot-paths to mask, plus the folded key names whose case variants make a decode
+// untrustworthy. They travel together because every leaf of the walk needs both, and
+// deriving fold at each leaf would re-fold the same handful of names per string scanned.
+type redactSpec struct {
+	// paths are the dot-paths to mask, with the optional "$."/"$" JSONPath root marker
+	// already stripped exactly once (see normalizeDotPathRoot). Downstream consumers take
+	// them as-is and never re-strip.
+	paths []string
+	// fold is the scoped case-variant set redactionKeysAmbiguous applies; see
+	// redactionFoldKeys.
+	fold map[string]struct{}
+}
+
+// redactionFoldKeys returns the folded key names a case variant of which would change what
+// this redaction resolves — the scope of redactionKeysAmbiguous's case-variant rule. Two
+// sources, both about resolution rather than about case as such:
+//
+//   - Every SEGMENT of every redact path. The masking walk looks its segments up exactly
+//     (redactDotPathRec does obj[key]), so with paths ["ssn"] a response carrying both
+//     "ssn" and "SSN" has two candidate fields where the obligation named one. A host that
+//     binds the result into a struct resolves that pair case-insensitively and may render
+//     the sibling this walk did not mask, so the bytes cannot verify the obligation.
+//   - Every key ApplyRedactObligs itself DISPATCHES on exactly — the protocol-reserved
+//     envelope keys (mcpReservedRootKeys) and the content-item keys (mcpContentItemKeys).
+//     An exact-match dispatch is a resolution: result["content"] gets the content-array
+//     treatment, with its fail-closed guards on resource items and anomalous shapes, while
+//     anything else falls to the weaker generic sibling walk. So {"content":[],"Content":
+//     [{"type":"resource",…}]} passes the strict pass over an empty array and the lenient
+//     one over the payload, while a case-insensitive host binds the payload as its content.
+//     One level down, obj["text"] is the same story: {"type":"text","text":"benign",
+//     "Text":"<secret>"} leaves the redactor inspecting the benign body while such a host
+//     renders the sibling, and since nothing matched, the ORIGINAL bytes are forwarded with
+//     the record reporting the obligation applied. Both variant spellings have to be
+//     refused, not silently routed to a weaker pass.
+//
+// Segments are collected from the whole path (not just its head) because a leaf scan sees
+// the blob's own root, where "data.ssn" is looked up as "ssn". Folding at every depth costs
+// only over-refusal on a nested case-variant pair, which is a denial, never a bypass.
+func redactionFoldKeys(paths []string) map[string]struct{} {
+	fold := make(map[string]struct{}, len(paths)+len(mcpReservedRootKeys)+len(mcpContentItemKeys))
+	for k := range mcpReservedRootKeys {
+		fold[capability.FoldJSONKey(k)] = struct{}{}
+	}
+	for k := range mcpContentItemKeys {
+		fold[capability.FoldJSONKey(k)] = struct{}{}
+	}
+	for _, p := range paths {
+		for _, seg := range strings.Split(p, ".") {
+			fold[capability.FoldJSONKey(seg)] = struct{}{}
+		}
+	}
+	return fold
 }
 
 // recognizedContentTypes is the set of MCP content-item types this build models.
@@ -285,8 +385,8 @@ func marshalNoHTMLEscape(v interface{}) ([]byte, error) {
 // including doubly-encoded JSON-container string values nested inside it); anything else —
 // prose, a scalar, malformed JSON, or JSON embedded in prose — is returned unchanged.
 // redactFields never fails the response closed over string content it cannot parse.
-func redactJSONText(text string, paths []string) (string, error) {
-	out, _, err := redactContainerString(text, paths, "", 0)
+func redactJSONText(text string, spec redactSpec) (string, error) {
+	out, _, err := redactContainerString(text, spec, "", 0)
 	return out, err
 }
 
@@ -308,17 +408,17 @@ func redactJSONText(text string, paths []string) (string, error) {
 // position; depth bounds the recursion (both the container-key walk AND the string-layer
 // unwrap share this one counter, so the total encoding depth an adversarial upstream can
 // force is still capped at maxRedactionDepth).
-func redactContainerString(s string, paths []string, prefix string, depth int) (redacted string, changed bool, err error) {
+func redactContainerString(s string, spec redactSpec, prefix string, depth int) (redacted string, changed bool, err error) {
 	if depth > maxRedactionDepth {
 		return "", false, fmt.Errorf("redactFields: nested JSON content exceeds the redaction depth limit %d; cannot verify redaction (fail closed)", maxRedactionDepth)
 	}
-	decoded, kind := classifyRedactableLeaf(s)
+	decoded, kind := classifyRedactableLeaf(s, spec.fold)
 	switch kind {
 	case leafKindString:
 		// A further string-encoding layer: recurse into the decoded inner string so a
 		// container hidden under multiple layers of JSON-string encoding is still
 		// reached, instead of treating the one-decode-away scalar as terminal.
-		inner, innerChanged, ierr := redactContainerString(decoded.(string), paths, prefix, depth+1)
+		inner, innerChanged, ierr := redactContainerString(decoded.(string), spec, prefix, depth+1)
 		if ierr != nil {
 			return "", false, ierr
 		}
@@ -326,8 +426,17 @@ func redactContainerString(s string, paths []string, prefix string, depth int) (
 			return s, false, nil // nothing matched at any layer: preserve the original bytes
 		}
 		return finalizeRedactedLeaf(inner)
+	case leafKindAmbiguous:
+		// The leaf decodes to a container whose keys Go and a host can resolve differently
+		// (see redactionKeysAmbiguous). The envelope-level gate cannot see this one: inside
+		// the envelope the leaf is a single JSON string token, so its duplicate keys only
+		// become keys when this function decodes them. Without the check here the identical
+		// smuggle works one layer down — a text item carrying
+		// "{\"data\":{\"ssn\":\"...\"},\"data\":{}}" leaves `changed` false, so the original
+		// string, and then the original envelope, is forwarded verbatim.
+		return "", false, fmt.Errorf("redactFields: nested JSON content carries a duplicate or case-variant object key, so its decode may differ from what a host renders; cannot verify redaction (fail closed)")
 	case leafKindContainer:
-		changed, err = redactStructuredContentValue(decoded, paths, prefix, depth)
+		changed, err = redactStructuredContentValue(decoded, spec, prefix, depth)
 		if err != nil {
 			return "", false, err // depth-limit guard or an internal re-marshal error
 		}
@@ -384,14 +493,22 @@ const (
 	// itself decode to a container (or another string layer) and must be recursed into,
 	// not treated as terminal — the fix for the double-encoding fail-open.
 	leafKindString
+	// leafKindAmbiguous is a JSON container whose object keys duplicate, or case-collide on
+	// a name this redaction resolves by matching (see redactionFoldKeys), so that this
+	// redactor's decode of it may differ from what a host renders. It is NOT a
+	// pass-through shape like leafKindOther: the caller fails the whole response closed,
+	// because a container the redactor cannot read the way the host will could be hiding
+	// the very field the obligation names.
+	leafKindAmbiguous
 )
 
 // classifyRedactableLeaf decodes ONE JSON layer of the string s and reports what it found:
 // a redactable container (leafKindContainer, the decoded object/array), a further
 // string-encoding layer (leafKindString, the decoded inner string — the caller must decode
-// it again to reach any container it wraps), or a terminal value (leafKindOther: prose, a
-// genuine scalar, malformed JSON, or JSON embedded in prose) the caller passes through
-// unchanged. redactFields never fails the response closed over string content it cannot
+// it again to reach any container it wraps), a container whose duplicate/case-colliding
+// keys make the decode untrustworthy (leafKindAmbiguous, which the caller fails closed on),
+// or a terminal value (leafKindOther: prose, a genuine scalar, malformed JSON, or JSON
+// embedded in prose) the caller passes through unchanged. redactFields never fails the response closed over string content it cannot
 // parse — it redacts named fields of valid JSON only (see docs/threat-model-mcp.md).
 //
 // Fast-path guard: a string with no '{', no leading '"', and no leading '[' cannot name an
@@ -412,7 +529,7 @@ const (
 // array of non-container elements still terminates safely as leafKindOther after one
 // bounded recursion (depth capped at maxRedactionDepth), so accepting these two extra
 // prefixes costs no extra fail-closed risk.
-func classifyRedactableLeaf(s string) (decoded interface{}, kind leafRedactionKind) {
+func classifyRedactableLeaf(s string, fold map[string]struct{}) (decoded interface{}, kind leafRedactionKind) {
 	trimmed := trimLeadingSpaceAndBOM(s)
 	// '"' and '[' use HasPrefix (position-0 only) deliberately: under JSON grammar a
 	// container's or a further string layer's start token must be the first
@@ -437,8 +554,18 @@ func classifyRedactableLeaf(s string) (decoded interface{}, kind leafRedactionKi
 	}
 	switch v := val.(type) {
 	case map[string]interface{}, []interface{}:
+		// The decode above collapsed any duplicate key last-wins. Scan the leaf's own bytes
+		// for that (and for a root-level case-variant collision) before the caller acts on
+		// the decoded value: this is the only point where a string becomes a container, so
+		// it is the one place the leaf's raw bytes and their decode are both in hand.
+		if redactionKeysAmbiguous([]byte(trimmed), fold) {
+			return nil, leafKindAmbiguous
+		}
 		return val, leafKindContainer
 	case string:
+		// A further string-encoding layer carries no keys of its own yet; the recursion
+		// re-enters here with the decoded inner string and scans whatever container it
+		// finally unwraps to.
 		return v, leafKindString
 	default:
 		return nil, leafKindOther // a genuine JSON scalar (number/bool/null): no object key
@@ -495,6 +622,21 @@ func redactJSONValue(val interface{}, paths []string) bool {
 // result a spec-conformant host cannot decode at all — a hard protocol failure in place of
 // the field-level masking the operator asked for. content/structuredContent additionally
 // have their own shape-specific passes, which redact WITHIN them.
+// mcpContentItemKeys are the keys ApplyRedactObligs reads EXACTLY off a `content` item:
+// obj["type"] selects the per-type treatment (text redacted, image/audio passed through,
+// resource/resource_link failed closed), and obj["text"] is the body it then walks.
+//
+// They are in the case-variant fold scope for the same reason the reserved ROOT keys are:
+// an exact-match dispatch is a resolution, so a case variant routes the redactor to one
+// value while a case-insensitive consumer binds the other. Unlike the root keys they are
+// NOT exempted from path matching (envelopeRootExempt) — a redact path may legitimately
+// name a field called "text" nested in some payload, and masking it is what the operator
+// asked for.
+var mcpContentItemKeys = map[string]struct{}{
+	"type": {},
+	"text": {},
+}
+
 var mcpReservedRootKeys = map[string]struct{}{
 	"content":           {},
 	"structuredContent": {},
@@ -537,7 +679,7 @@ func envelopeRootExempt(path string) bool {
 // refusing them would break honest upstreams, while masking is exactly what the operator
 // asked for. Reuses structuredContent's container walk, so a doubly-encoded JSON string
 // leaf is unwrapped identically and the depth bound applies the same way.
-func redactSiblingTopLevelKeys(result map[string]interface{}, paths []string) (bool, error) {
+func redactSiblingTopLevelKeys(result map[string]interface{}, spec redactSpec) (bool, error) {
 	changed := false
 	// Match the paths against the ENVELOPE itself before descending into its values. The
 	// descent below only ever sees a sibling key's VALUE, so a declared field sitting
@@ -550,7 +692,7 @@ func redactSiblingTopLevelKeys(result map[string]interface{}, paths []string) (b
 	// A path naming a protocol-reserved component OUTRIGHT is skipped: see
 	// envelopeRootExempt. A DOTTED path through one is not — it names a leaf, and masking
 	// that leaf is exactly what the operator asked for.
-	for _, p := range paths {
+	for _, p := range spec.paths {
 		if envelopeRootExempt(p) {
 			continue
 		}
@@ -562,7 +704,7 @@ func redactSiblingTopLevelKeys(result map[string]interface{}, paths []string) (b
 		if key == "content" || key == "structuredContent" {
 			continue
 		}
-		out, c, err := redactSiblingValue(key, val, paths)
+		out, c, err := redactSiblingValue(key, val, spec)
 		if err != nil {
 			return false, err // fail closed
 		}
@@ -598,13 +740,13 @@ func redactSiblingTopLevelKeys(result map[string]interface{}, paths []string) (b
 //     first anchoring alone would forward it. Deliberate over-redaction: masking a field
 //     the manifest named, at a position it did not name, is the safe direction for a DLP
 //     obligation, whereas the reverse leaks.
-func redactSiblingValue(key string, val interface{}, paths []string) (replacement interface{}, changed bool, err error) {
+func redactSiblingValue(key string, val interface{}, spec redactSpec) (replacement interface{}, changed bool, err error) {
 	// Envelope-relative first: a string leaf redacted under one anchoring is fed to the
 	// next, so both apply to the same (possibly already re-serialized) blob.
 	for _, prefix := range []string{key, ""} {
 		switch v := val.(type) {
 		case map[string]interface{}, []interface{}:
-			c, cerr := redactStructuredContentValue(v, paths, prefix, 0)
+			c, cerr := redactStructuredContentValue(v, spec, prefix, 0)
 			if cerr != nil {
 				return nil, false, cerr // fail closed
 			}
@@ -612,7 +754,7 @@ func redactSiblingValue(key string, val interface{}, paths []string) (replacemen
 				changed = true
 			}
 		case string:
-			out, c, cerr := redactContainerString(v, paths, prefix, 0)
+			out, c, cerr := redactContainerString(v, spec, prefix, 0)
 			if cerr != nil {
 				return nil, false, cerr // fail closed
 			}
@@ -651,12 +793,12 @@ func redactSiblingValue(key string, val interface{}, paths []string) (replacemen
 // scalar cannot. Do not reconcile the two — failing closed here would needlessly block valid
 // scalar results, and passing anomalous content shapes through there would fail open on a
 // real hiding place.
-func redactStructuredContentField(result map[string]interface{}, paths []string) (bool, error) {
+func redactStructuredContentField(result map[string]interface{}, spec redactSpec) (bool, error) {
 	sc, ok := result["structuredContent"]
 	if !ok {
 		return false, nil
 	}
-	replacement, changed, err := redactSiblingValue("structuredContent", sc, paths)
+	replacement, changed, err := redactSiblingValue("structuredContent", sc, spec)
 	if err != nil {
 		return false, err // depth-limit guard or an internal re-marshal error; fail closed
 	}
@@ -673,9 +815,9 @@ func redactStructuredContentField(result map[string]interface{}, paths []string)
 // depth (redactNestedJSONStrings, whose string case calls back here for each unwrapped
 // layer). It reports whether anything changed. A string that is not a clean JSON container
 // passes through unchanged; only the depth guard fails closed.
-func redactStructuredContentValue(v interface{}, paths []string, prefix string, depth int) (changed bool, err error) {
-	keysChanged := redactJSONValue(v, rebaseLeafPaths(paths, prefix))
-	_, stringsChanged, serr := redactNestedJSONStrings(v, paths, prefix, depth)
+func redactStructuredContentValue(v interface{}, spec redactSpec, prefix string, depth int) (changed bool, err error) {
+	keysChanged := redactJSONValue(v, rebaseLeafPaths(spec.paths, prefix))
+	_, stringsChanged, serr := redactNestedJSONStrings(v, spec, prefix, depth)
 	if serr != nil {
 		return false, serr
 	}
@@ -700,7 +842,7 @@ func redactStructuredContentValue(v interface{}, paths []string, prefix string, 
 // are transparent to dot-paths and inherit it. Maps and slices are mutated in place; the
 // string case returns its replacement (which the parent writes back), so the first
 // return is load-bearing only for a leaf.
-func redactNestedJSONStrings(v interface{}, paths []string, prefix string, depth int) (redacted interface{}, changed bool, err error) {
+func redactNestedJSONStrings(v interface{}, spec redactSpec, prefix string, depth int) (redacted interface{}, changed bool, err error) {
 	if depth > maxRedactionDepth {
 		return nil, false, fmt.Errorf("redactFields: nested JSON content exceeds the redaction depth limit %d; cannot verify redaction (fail closed)", maxRedactionDepth)
 	}
@@ -717,7 +859,7 @@ func redactNestedJSONStrings(v interface{}, paths []string, prefix string, depth
 			if prefix != "" {
 				childPrefix = prefix + "." + k
 			}
-			nv, c, cerr := redactNestedJSONStrings(child, paths, childPrefix, depth+1)
+			nv, c, cerr := redactNestedJSONStrings(child, spec, childPrefix, depth+1)
 			if cerr != nil {
 				return nil, false, cerr
 			}
@@ -731,7 +873,7 @@ func redactNestedJSONStrings(v interface{}, paths []string, prefix string, depth
 		for i, child := range val {
 			// Array elements are transparent to dot-paths (a path applies to every
 			// element), so the prefix is inherited unchanged.
-			nv, c, cerr := redactNestedJSONStrings(child, paths, prefix, depth+1)
+			nv, c, cerr := redactNestedJSONStrings(child, spec, prefix, depth+1)
 			if cerr != nil {
 				return nil, false, cerr
 			}
@@ -746,7 +888,7 @@ func redactNestedJSONStrings(v interface{}, paths []string, prefix string, depth
 		// as any container string; redactContainerString recurses back through
 		// redactStructuredContentValue, so a field under a further encoding layer is reached
 		// too. A non-container string (prose, malformed, embedded-in-prose) passes through.
-		out, c, cerr := redactContainerString(val, paths, prefix, depth+1)
+		out, c, cerr := redactContainerString(val, spec, prefix, depth+1)
 		if cerr != nil {
 			return nil, false, cerr
 		}

@@ -189,7 +189,11 @@ func fetchLiveToolsStdio(ctx context.Context, command string, args []string) (Li
 		killTimer.Stop()
 	}()
 
-	info, err := runStdioHandshake(ctx, w, r)
+	// procCtx, not the outer ctx: the handshake must observe the SAME cancellation the
+	// subprocess does. With the outer ctx, an operator's Ctrl-C surfaced as
+	// "initialize: read: EOF" — the downstream symptom of the reaped child — instead of
+	// the cancellation that actually happened, sending them to debug a healthy upstream.
+	info, err := runStdioHandshake(procCtx, w, r)
 	if err != nil {
 		return LiveUpstreamInfo{}, err
 	}

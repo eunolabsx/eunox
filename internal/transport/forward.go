@@ -456,7 +456,7 @@ func isObserveDeny(denial *capability.DenialInfo, auditMode, auditOnly bool) boo
 
 // enforcedForwardCore is the shared deny/observe/forward/record decision both
 // transports apply to every enforced method (tools/call, resources/read,
-// resources/subscribe, prompts/get). It returns the JSON-RPC message to deliver
+// resources/subscribe, resources/unsubscribe, prompts/get). It returns the JSON-RPC message to deliver
 // to the host — a denial, an upstream transport error, or the upstream's
 // (possibly redacted) response. The transports differ only in delivery.
 //
@@ -469,8 +469,8 @@ func isObserveDeny(denial *capability.DenialInfo, auditMode, auditOnly bool) boo
 //
 // allowDetails computes the allow record's structured details (resources/prompts
 // pass upstreamErrorDetail; tools/call passes its audit-mode argument map).
-// recordObligations controls whether obligation tokens are recorded (resources/subscribe
-// records none).
+// recordObligations controls whether obligation tokens are recorded (the two
+// resources/(un)subscribe legs record none).
 func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, dec capability.EnforceResponse, method, auditID, denialTarget, kind string, recordObligations bool, allowDetails func(mcp.RPCMsg) map[string]interface{}) mcp.RPCMsg {
 	observe := false
 	var denial *capability.DenialInfo // set on the deny path; reused by the observe branch below
@@ -535,6 +535,14 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 		// never under-counts), and every consumed slot is on the tape — this branch
 		// records a deny carrying the upstream error code, so an operator reconstructing
 		// a budget can tell executed calls from failed forwards.
+		//
+		// One failure in this branch does NOT fit that rationale: errDuplicateID is
+		// rejected before any byte reaches the upstream, so the call provably did not run
+		// and its slot is a pure over-count. It is accepted rather than special-cased: a
+		// refund path here would have to prove, per error, that nothing was sent — a
+		// property only this one error has today — and getting that wrong in the other
+		// direction hands back quota for a call that DID execute. An over-count on a host
+		// that reuses an in-flight JSON-RPC id is the safe side of that trade.
 		return fp.recordUpstreamFailure(ctx, msg, fwdErr, auditID, method)
 	}
 

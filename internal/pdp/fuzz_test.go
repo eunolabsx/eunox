@@ -44,7 +44,11 @@ func FuzzClassifyRedactableLeaf_GuardMatchesFullDecode(f *testing.F) {
 	f.Add(`a footnote[1] aside`)
 
 	f.Fuzz(func(t *testing.T, s string) {
-		_, kind := classifyRedactableLeaf(s)
+		// The fold scope is irrelevant to this property: it can only turn a container into
+		// leafKindAmbiguous (which fails closed), never into leafKindOther, which is the
+		// one verdict this target is hunting for. An empty non-nil set keeps the scoped
+		// policy selected while folding nothing.
+		_, kind := classifyRedactableLeaf(s, map[string]struct{}{})
 
 		// Independently decode s the same way classifyRedactableLeaf does internally,
 		// but WITHOUT the fast-path byte guard, to see what an unconditional decode

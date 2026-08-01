@@ -23,8 +23,10 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -417,7 +419,6 @@ func TestStdioProxy_ConnectUpstream_SubprocessLifecycle(t *testing.T) {
 	p := &StdioProxy{
 		command:    "sleep",
 		args:       []string{"30"},
-		pending:    make(map[string]struct{}),
 		shutdownMs: 200,
 	}
 	if err := p.connectUpstream(context.Background()); err != nil {
@@ -458,7 +459,6 @@ func TestStdioProxy_SignalUpstream_KillTimerStoppable(t *testing.T) {
 	p := &StdioProxy{
 		command:    "sleep",
 		args:       []string{"30"},
-		pending:    make(map[string]struct{}),
 		shutdownMs: 60000, // 60s: far longer than the test, so the timer never fires
 	}
 	if err := p.connectUpstream(context.Background()); err != nil {
@@ -494,7 +494,6 @@ func TestStdioProxy_KillUpstream_Subprocess(t *testing.T) {
 	p := &StdioProxy{
 		command: "sleep",
 		args:    []string{"30"},
-		pending: make(map[string]struct{}),
 	}
 	if err := p.connectUpstream(context.Background()); err != nil {
 		t.Fatalf("connectUpstream: %v", err)
@@ -509,7 +508,6 @@ func TestStdioProxy_ConnectUpstream_BadCommand(t *testing.T) {
 	t.Parallel()
 	p := &StdioProxy{
 		command: "this-command-does-not-exist-eunox",
-		pending: make(map[string]struct{}),
 	}
 	if err := p.connectUpstream(context.Background()); err == nil {
 		t.Fatal("expected connectUpstream to fail for a nonexistent command")
@@ -523,7 +521,6 @@ func TestStdioProxy_HTTPUpstreamWiring(t *testing.T) {
 	t.Parallel()
 	p := &StdioProxy{
 		upstreamURL: "https://upstream.example.com",
-		pending:     make(map[string]struct{}),
 		shutdownMs:  200,
 	}
 	if err := p.connectUpstream(context.Background()); err != nil {
@@ -552,7 +549,6 @@ func TestStdioProxy_HTTPUpstreamWiring(t *testing.T) {
 func TestStdioProxy_ConnectUpstream_HTTPEmitsServerInitiatedNotice(t *testing.T) {
 	p := &StdioProxy{
 		upstreamURL: "https://upstream.example.com",
-		pending:     make(map[string]struct{}),
 		shutdownMs:  200,
 	}
 	var connErr error
@@ -583,7 +579,6 @@ func TestRunStdioDriftCheck_SkippedWhenNoPins(t *testing.T) {
 	// → fetchUpstreamToolsRaw fails → drift check is skipped (no pins, non-strict).
 	p := &StdioProxy{
 		command: "true",
-		pending: make(map[string]struct{}),
 	}
 	if err := p.connectUpstream(context.Background()); err != nil {
 		t.Fatalf("connectUpstream: %v", err)
@@ -614,7 +609,6 @@ func TestRunStdioDriftCheck_StrictFatalWhenNoPins(t *testing.T) {
 	}
 	p := &StdioProxy{
 		command: "true",
-		pending: make(map[string]struct{}),
 	}
 	if err := p.connectUpstream(context.Background()); err != nil {
 		t.Fatalf("connectUpstream: %v", err)
@@ -641,7 +635,6 @@ func TestRunStdioDriftCheck_FatalWhenPinsAndNoToolsList(t *testing.T) {
 	}
 	p := &StdioProxy{
 		command: "true",
-		pending: make(map[string]struct{}),
 	}
 	if err := p.connectUpstream(context.Background()); err != nil {
 		t.Fatalf("connectUpstream: %v", err)
@@ -665,5 +658,108 @@ func TestRunStdioDriftCheck_FatalWhenPinsAndNoToolsList(t *testing.T) {
 	// description integrity without the live list).
 	if err := drift.MakeDriftCheck(manifest, true)(raw, p.upstreamServerVersion, probeErr); err == nil {
 		t.Error("expected fatal drift error when pins set and tools/list unavailable")
+	}
+}
+
+// ── OnReady ordering ──────────────────────────────────────────────────────
+
+// TestStdioProxy_OnReadyNotRunWhenStartupFails pins the ordering the session-kill TTL
+// publish depends on, the stdio analogue of TestServe_AfterListenNotRunWhenBindFails. The
+// hook overwrites shared, last-writer-wins Redis state that `eunox kill` then trusts, so a
+// proxy that never comes up must not run it — otherwise starting a second, doomed proxy
+// leaves the RUNNING one's advertised lifetime replaced by one nothing enforces.
+//
+// The stdio host has no bind step, so the steps it has to clear instead are its own, inside
+// Start: spawning the upstream, the initialize handshake, and the drift check.
+func TestStdioProxy_OnReadyNotRunWhenStartupFails(t *testing.T) {
+	if testing.Short() {
+		t.Skip("re-execs the test binary as an upstream subprocess; skipped in -short")
+	}
+
+	// An FM-5 descriptionHash pin that cannot match, so the drift check refuses the
+	// session — the LAST of Start's fallible steps, and the one furthest from the
+	// constructor, so clearing it means the hook cleared all three.
+	manifest := &config.LocalManifest{
+		Name:    "integ",
+		Version: "1.0.0",
+		Capabilities: []capability.Constraint{{
+			Target:          "tool:read_file",
+			Actions:         []string{"call"},
+			DescriptionHash: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+		}},
+	}
+
+	for _, tc := range []struct {
+		name    string
+		command string
+		args    []string
+		drift   drift.CheckFunc
+	}{
+		{
+			name:    "upstream binary does not exist",
+			command: filepath.Join(t.TempDir(), "no-such-upstream"),
+		},
+		{
+			name:    "drift check refuses the session",
+			command: os.Args[0],
+			args:    []string{"-test.run=^TestHelperStdioUpstream$", "--", stdioUpstreamSentinel},
+			drift:   drift.MakeDriftCheck(manifest, true),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var ready atomic.Bool
+			p := NewStdioProxy(StdioProxyOptions{
+				Command:    tc.command,
+				Args:       tc.args,
+				PDP:        pdp.NewManifestPDP(manifest.Capabilities, enforcement.New(), killswitch.NewInMemory()),
+				SessionID:  "integ-onready-fail",
+				ShutdownMs: 2000,
+				DriftCheck: tc.drift,
+				OnReady:    func(context.Context) { ready.Store(true) },
+			})
+			// Genuinely CLOSED stdin, so Start cannot block in serveHost if startup
+			// unexpectedly succeeds. Discarding the write end instead leaves the read end
+			// blocking forever (a GC'd *io.PipeWriter closes nothing), which would turn a
+			// regression in the ordering this test pins into a package-wide timeout rather
+			// than a failed assertion.
+			inR, inW := io.Pipe()
+			_ = inW.Close()
+			p.hostReader = mcp.NewMsgReader(inR)
+			outR, outW := io.Pipe()
+			go func() { _, _ = io.Copy(io.Discard, outR) }()
+			p.hostWriter = mcp.NewMsgWriter(outW)
+
+			if err := p.Start(context.Background()); err == nil {
+				t.Fatal("Start must fail for this case; the test's premise is a failed startup")
+			}
+			if ready.Load() {
+				t.Error("OnReady must not run when startup fails: it would clobber a running proxy's published state")
+			}
+		})
+	}
+}
+
+// The companion: on a session that does come up, the hook must actually run — before the
+// host serve loop, so a proxy standing and serving has published its state.
+func TestStdioProxy_OnReadyRunsOnceSessionIsLive(t *testing.T) {
+	if testing.Short() {
+		t.Skip("re-execs the test binary as an upstream subprocess; skipped in -short")
+	}
+
+	var ready atomic.Bool
+	h := newStdioHostHarness(t, StdioProxyOptions{
+		PDP:        pdp.AlwaysAllowPDP{},
+		SessionID:  "integ-onready-ok",
+		ShutdownMs: 2000,
+		OnReady:    func(context.Context) { ready.Store(true) },
+	})
+	// Drive one request through so the serve loop has demonstrably started, which places
+	// the hook strictly before it rather than merely somewhere inside Start.
+	h.roundTrip(t, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "tools/list"})
+	if !ready.Load() {
+		t.Error("OnReady must run once the session is live, before the host serve loop")
+	}
+	if err := h.shutdown(t); err != nil {
+		t.Fatalf("shutdown: %v", err)
 	}
 }

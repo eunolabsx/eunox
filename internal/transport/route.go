@@ -242,9 +242,22 @@ func PrintRoutePolicyNotices(w io.Writer, name, routePath string, auditOnlyCount
 			name, auditOnlyCount, mount)
 	}
 	if auditMode {
+		// Name the ENFORCED set, not the whole dispatch table: initialize and ping are
+		// answered locally and never reach the upstream or the tape, and the …/list
+		// flavors forward the catalog unfiltered and are recorded as enumeration events,
+		// so a banner that swept all of them into "forwarded and logged" traded one
+		// over-claim for another.
 		_, _ = fmt.Fprintf(w,
-			"[eunox] AUDIT MODE: upstream %q%s runs in observe mode — its policy is evaluated but NOT enforced; ALL calls are forwarded and logged.\n",
-			name, mount)
+			"[eunox] AUDIT MODE: upstream %q%s runs in observe mode — its policy is evaluated but NOT enforced; every enforced call (%s) is forwarded and logged, and …/list forwards the full upstream catalog unfiltered.\n",
+			name, mount, enforcedMethodSummary)
+		// "Denied" is scoped to a host REQUEST. A method outside the dispatch table that
+		// arrives as a host notification, or as a server-initiated request from the
+		// upstream, is not routed through dispatchRequest at all — saying otherwise would
+		// tell an operator that sampling/createMessage (an enforced method that observe
+		// mode downgrades and FORWARDS) is blocked on this route.
+		_, _ = fmt.Fprintf(w,
+			"[eunox] AUDIT MODE: upstream %q%s — observe mode does NOT lift the fail-closed default: a host REQUEST naming a method eunox does not dispatch (%s) is still denied and recorded, and the kill switch still hard-blocks. Server-initiated requests are decided separately (see sampling/createMessage).\n",
+			name, mount, unmappedMethodExamples)
 	}
 }
 
@@ -332,12 +345,13 @@ func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability
 
 		if manifest == nil {
 			// No policy but explicit enforcement: audit (the guard above rejected
-			// no-policy-without-audit). Wiretap mode: every call forwarded and
-			// logged, none blocked. Surface the open posture loudly (the AUDIT MODE
-			// banner already fired above; this adds the "no policy / wiretap" specifics).
+			// no-policy-without-audit). Wiretap mode: every DISPATCHED call forwarded and
+			// logged, none blocked on policy grounds. Surface the open posture loudly (the
+			// AUDIT MODE banner already fired above, including the fail-closed-default
+			// caveat; this adds the "no policy / wiretap" specifics).
 			fmt.Fprintf(os.Stderr,
 				"[eunox] NOTICE: upstream %q has no policy and runs in AUDIT mode on /mcp/%s — "+
-					"ALL calls are forwarded and logged but NOT blocked (wiretap).\n",
+					"every dispatched call is forwarded and logged, none blocked by policy (wiretap).\n",
 				u.Name, u.Name)
 		}
 

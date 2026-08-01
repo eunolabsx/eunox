@@ -11,6 +11,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
+	"strings"
 
 	"github.com/eunolabs/eunox/internal/audit"
 	"github.com/eunolabs/eunox/internal/mcp"
@@ -102,8 +104,8 @@ func (d dispatchParams) decideCtx(ctx context.Context) context.Context {
 }
 
 // decideMethodHandlers maps each Decide*-method (tools/call, resources/read,
-// resources/subscribe, prompts/get) to its dispatch handler. It is the single
-// source of truth for "is this an enforced method requiring a PDP decision":
+// resources/subscribe, resources/unsubscribe, prompts/get) to its dispatch handler.
+// It is the single source of truth for "is this an enforced method requiring a PDP decision":
 // dispatchRequest routes through it below, and isEnforcedMethod (consulted by
 // both transports' notification paths, since IsNotification's classification
 // is purely structural with no method allowlist) derives its answer from the
@@ -111,10 +113,11 @@ func (d dispatchParams) decideCtx(ctx context.Context) context.Context {
 // and "is this method enforced" — cannot silently diverge the way two
 // independently-maintained case lists could.
 var decideMethodHandlers = map[string]func(context.Context, dispatchParams, mcp.RPCMsg) mcp.RPCMsg{
-	capability.MethodToolsCall:          dispatchToolsCall,
-	capability.MethodResourcesRead:      dispatchResourcesRead,
-	capability.MethodResourcesSubscribe: dispatchResourcesSubscribe,
-	capability.MethodPromptsGet:         dispatchPromptsGet,
+	capability.MethodToolsCall:            dispatchToolsCall,
+	capability.MethodResourcesRead:        dispatchResourcesRead,
+	capability.MethodResourcesSubscribe:   dispatchResourcesSubscribe,
+	capability.MethodResourcesUnsubscribe: dispatchResourcesUnsubscribe,
+	capability.MethodPromptsGet:           dispatchPromptsGet,
 }
 
 // isEnforcedMethod reports whether method is one of the Decide* methods above,
@@ -241,7 +244,8 @@ func denyEnforcedMethodNotification(ctx context.Context, rec auditRecorder, sess
 // The kill gate is applied STRUCTURALLY, by which arm of the split a method lands in,
 // rather than per-handler:
 //
-//   - Decide* methods (tools/call, resources/read, resources/subscribe, prompts/get)
+//   - Decide* methods (tools/call, resources/read, resources/subscribe,
+//     resources/unsubscribe, prompts/get)
 //     embed a richer kill record inside enforcedForwardCore, so they are dispatched
 //     WITHOUT the boundary gate. Their malformed-params sub-path — reached before the
 //     PDP — gates separately inside malformedDeny.
@@ -262,20 +266,69 @@ func dispatchRequest(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.
 	if resp, killed := d.killDenied(ctx, msg); killed {
 		return resp
 	}
-	switch msg.Method {
-	case mcp.MethodInitialize:
-		return dispatchInitialize(ctx, d, msg)
-	case "ping":
-		return dispatchPing(msg)
-	case capability.MethodResourcesList:
-		return dispatchList(ctx, d, msg, pdp.ListFilterer.FilterResourcesList)
-	case capability.MethodToolsList:
-		return dispatchList(ctx, d, msg, pdp.ListFilterer.FilterToolsList)
-	case capability.MethodPromptsList:
-		return dispatchList(ctx, d, msg, pdp.ListFilterer.FilterPromptsList)
-	default:
-		return dispatchUnmapped(ctx, d, msg)
+	if handler, ok := locallyAnsweredHandlers[msg.Method]; ok {
+		return handler(ctx, d, msg)
 	}
+	return dispatchUnmapped(ctx, d, msg)
+}
+
+// methodPing is the MCP liveness probe, answered locally without contacting the upstream.
+const methodPing = "ping"
+
+// locallyAnsweredHandlers maps each method dispatchRequest answers WITHOUT a PDP Decide*
+// call — the handshake, the liveness probe, and the three */list flavors — to its handler.
+// It is a table rather than a switch for the same reason decideMethodHandlers is: routing
+// and "is this method dispatched at all" are then one fact rather than two hand-maintained
+// lists that can disagree. The audit-mode banner asks the SECOND question — it names the
+// enforced set (enforcedMethodSummary) and says an undispatched method is still denied — and
+// this table is what makes that claim checkable instead of prose.
+//
+// Everything NOT in this table or in decideMethodHandlers falls to dispatchUnmapped's
+// fail-closed deny, in every mode.
+var locallyAnsweredHandlers = map[string]func(context.Context, dispatchParams, mcp.RPCMsg) mcp.RPCMsg{
+	mcp.MethodInitialize: dispatchInitialize,
+	methodPing: func(_ context.Context, _ dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
+		return dispatchPing(msg)
+	},
+	capability.MethodResourcesList: func(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
+		return dispatchList(ctx, d, msg, pdp.ListFilterer.FilterResourcesList)
+	},
+	capability.MethodToolsList: func(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
+		return dispatchList(ctx, d, msg, pdp.ListFilterer.FilterToolsList)
+	},
+	capability.MethodPromptsList: func(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
+		return dispatchList(ctx, d, msg, pdp.ListFilterer.FilterPromptsList)
+	},
+}
+
+// enforcedMethodSummary is the subset the audit-mode banner's "forwarded and logged"
+// sentence may name: only the Decide* methods actually reach the upstream AND leave a
+// decision record. The locally-answered half of the dispatch table does not — initialize
+// and ping never touch the upstream and write no record, and the …/list flavors forward
+// the catalog unfiltered and are recorded as enumeration events, not decisions — so
+// sweeping them into one "every dispatched call is forwarded and logged" claim replaced
+// the old "ALL calls" over-claim with a narrower false one.
+var enforcedMethodSummary = sortedMethods(decideMethodHandlers)
+
+// unmappedMethodExamples names MCP methods this build does NOT dispatch, so the banner's
+// caveat is concrete rather than abstract. They are examples, not an exhaustive list:
+// anything outside the two routing tables is denied the same way.
+const unmappedMethodExamples = "e.g. completion/complete, logging/setLevel, resources/templates/list"
+
+// sortedMethods joins the given routing tables' keys in sorted order, so a banner derived
+// from a table cannot drift from what the dispatcher does (and a map's iteration order
+// cannot make the text unstable). Variadic because it once joined both tables for a
+// whole-dispatch-table summary; the banner now names only the enforced half, and the tests
+// still exercise the multi-table form.
+func sortedMethods(tables ...map[string]func(context.Context, dispatchParams, mcp.RPCMsg) mcp.RPCMsg) string {
+	var methods []string
+	for _, t := range tables {
+		for m := range t {
+			methods = append(methods, m)
+		}
+	}
+	sort.Strings(methods)
+	return strings.Join(methods, ", ")
 }
 
 // dispatchInitialize answers a host initialize request by delegating to the
@@ -468,6 +521,46 @@ func dispatchResourcesSubscribe(ctx context.Context, d dispatchParams, msg mcp.R
 	d.finishDecision() // release the per-session decision lock before the forward
 	// recordObligations is false: a subscription does not log obligation names.
 	return enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodResourcesSubscribe, params.URI, params.URI, "resource subscription", false, upstreamErrorDetail)
+}
+
+// dispatchResourcesUnsubscribe enforces resources/unsubscribe against the SAME manifest
+// entry as resources/read and resources/subscribe (identical wire shape: a single uri), but
+// through DecideResourceCancel rather than DecideResourceRead — the URI must still be
+// permitted, and no consumable policy state is charged for cancelling.
+//
+// It is mapped rather than left to the fail-closed default deliberately. Unmapped is the
+// right default for a method whose effect the proxy cannot reason about, but this one is
+// the exact inverse of a method that IS enforced and forwarded: a host that subscribed to
+// a permitted resource could never cancel through the proxy, so the upstream kept pushing
+// resource-updated notifications for the rest of the session. Denying it protected
+// nothing — it only ever REDUCES data flow — while costing the host the one way to stop a
+// stream it already established.
+//
+// Routing it through the cancel decision instead of the read decision is what makes that
+// argument hold in practice. A read decision is metered: it spends the URI's maxCalls
+// budget, records a sequenceBlock antecedent, and applies the entry's labelOutput taint.
+// Charging a cancellation that way reintroduces the very failure this handler exists to
+// remove — a one-call budget spent by the subscribe leaves the unsubscribe denied
+// RATE_LIMITED, so the stream can never be stopped — and taints the session for a request
+// that transfers no data. DecideResourceCancel keeps the match requirement (a URI the
+// manifest never permitted was never subscribable, so an unsubscribe naming it is a host
+// talking about a channel it does not have) and drops the metering, which also keeps the
+// audit trail symmetric: every subscribe on the tape has its matching unsubscribe.
+//
+// d.decideCtx is deliberately NOT applied: its only effect is the observe-mode quota skip,
+// and this path consumes no quota in either mode.
+func dispatchResourcesUnsubscribe(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
+	var params mcp.ResourceReadParams
+	if err := mcp.DecodeParams(msg.Params, &params); err != nil {
+		return d.malformedDeny(ctx, msg, "invalid resources/unsubscribe params")
+	}
+	if params.URI == "" {
+		return d.malformedDeny(ctx, msg, "resources/unsubscribe: uri must not be empty")
+	}
+	dec := d.pdp.DecideResourceCancel(ctx, d.sessionID, params.URI, d.sourceIP)
+	d.finishDecision() // release the per-session decision lock before the forward
+	// recordObligations is false: cancelling a subscription does not log obligation names.
+	return enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodResourcesUnsubscribe, params.URI, params.URI, "resource subscription", false, upstreamErrorDetail)
 }
 
 // dispatchPromptsGet enforces the capability manifest for prompts/get requests.

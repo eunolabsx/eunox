@@ -268,7 +268,6 @@ func TestFetchHTTPSessionTools_UpstreamError(t *testing.T) {
 	done := make(chan struct{})
 	close(done)
 	sess := newClosedTestSession(&httpSession{
-		pending:  make(map[string]struct{}),
 		done:     done,
 		upWriter: mcp.NewMsgWriter(io.Discard),
 	})
@@ -285,7 +284,6 @@ func TestFetchHTTPSessionTools_UpstreamRPCError(t *testing.T) {
 
 	upR, upW := io.Pipe()
 	sess := newTestSession(&httpSession{
-		pending:  make(map[string]struct{}),
 		done:     done,
 		upWriter: mcp.NewMsgWriter(upW),
 		upReader: mcp.NewMsgReader(upR),
@@ -357,7 +355,6 @@ func cannedToolsSession(t *testing.T, serverVersion string, toolNames ...string)
 	upR, upW := io.Pipe()
 
 	sess = newTestSession(&httpSession{
-		pending:               make(map[string]struct{}),
 		done:                  make(chan struct{}),
 		upWriter:              mcp.NewMsgWriter(upW),
 		upstreamServerVersion: serverVersion,
@@ -417,7 +414,6 @@ func TestRunHTTPDriftCheck_SkippedWhenNoPins(t *testing.T) {
 	done := make(chan struct{})
 	close(done)
 	sess := newClosedTestSession(&httpSession{
-		pending:  make(map[string]struct{}),
 		done:     done,
 		upWriter: mcp.NewMsgWriter(io.Discard),
 	})
@@ -441,7 +437,6 @@ func TestRunHTTPDriftCheck_StrictFatalWhenNoPins(t *testing.T) {
 	done := make(chan struct{})
 	close(done)
 	sess := newClosedTestSession(&httpSession{
-		pending:  make(map[string]struct{}),
 		done:     done,
 		upWriter: mcp.NewMsgWriter(io.Discard),
 	})
@@ -463,7 +458,6 @@ func TestRunHTTPDriftCheck_FatalWhenPinsAndNoToolsList(t *testing.T) {
 	done := make(chan struct{})
 	close(done)
 	sess := newClosedTestSession(&httpSession{
-		pending:  make(map[string]struct{}),
 		done:     done,
 		upWriter: mcp.NewMsgWriter(io.Discard),
 	})

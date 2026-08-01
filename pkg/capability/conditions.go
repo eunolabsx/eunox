@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -322,24 +323,64 @@ func jsonFieldNames(v any) map[string]bool {
 	return names
 }
 
-// knownConditionTypes lists every condition discriminator this build models. It
-// drives the "did you mean" hint for an unrecognized type. redactFields is
-// deliberately excluded — it has its own migration error pointing at directives.
-var knownConditionTypes = []string{
-	ConditionTypeTimeWindow,
-	ConditionTypeIPRange,
-	ConditionTypeAllowedOperations,
-	ConditionTypeAllowedExtensions,
-	ConditionTypeAllowedTables,
-	ConditionTypeMaxCalls,
-	ConditionTypeRecipientDomain,
-	ConditionTypeAllowedValues,
-	ConditionTypeSequenceBlock,
-	ConditionTypeFlowLabel,
-	ConditionTypeEffectClass,
-	ConditionTypeBlastRadius,
-	ConditionTypePolicy,
-	ConditionTypeCustom,
+// conditionPrototypes is THE registry of condition discriminators this build models:
+// each maps to a constructor for its zero value. Everything else that needs to enumerate
+// or instantiate condition types derives from it — newCondition, the "did you mean" hint
+// (knownConditionTypes), and the manifest loader's per-type permitted-key sets
+// (ConditionJSONKeys) — so adding a condition type means adding it HERE, not in three
+// hand-maintained tables that drift one entry at a time.
+//
+// redactFields is deliberately absent — it is a directive, and has its own migration error
+// pointing at directives.
+var conditionPrototypes = map[string]func() Condition{
+	ConditionTypeTimeWindow:        func() Condition { return &TimeWindowCondition{} },
+	ConditionTypeIPRange:           func() Condition { return &IPRangeCondition{} },
+	ConditionTypeAllowedOperations: func() Condition { return &AllowedOperationsCondition{} },
+	ConditionTypeAllowedExtensions: func() Condition { return &AllowedExtensionsCondition{} },
+	ConditionTypeAllowedTables:     func() Condition { return &AllowedTablesCondition{} },
+	ConditionTypeMaxCalls:          func() Condition { return &MaxCallsCondition{} },
+	ConditionTypeRecipientDomain:   func() Condition { return &RecipientDomainCondition{} },
+	ConditionTypeAllowedValues:     func() Condition { return &AllowedValuesCondition{} },
+	ConditionTypeSequenceBlock:     func() Condition { return &SequenceBlockCondition{} },
+	ConditionTypeFlowLabel:         func() Condition { return &FlowLabelCondition{} },
+	ConditionTypeEffectClass:       func() Condition { return &EffectClassCondition{} },
+	ConditionTypeBlastRadius:       func() Condition { return &BlastRadiusCondition{} },
+	ConditionTypePolicy:            func() Condition { return &PolicyCondition{} },
+	ConditionTypeCustom:            func() Condition { return &CustomCondition{} },
+}
+
+// knownConditionTypes is every discriminator in the registry, sorted so the "did you mean"
+// hint resolves ties deterministically (a map's iteration order would not).
+var knownConditionTypes = sortedConditionTypes()
+
+// sortedConditionTypes returns the registry's discriminators in lexical order.
+func sortedConditionTypes() []string {
+	out := make([]string, 0, len(conditionPrototypes))
+	for t := range conditionPrototypes {
+		out = append(out, t)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// NewConditionPrototype returns a zero value of the named condition type, and whether this
+// build models that discriminator at all.
+//
+// It exists so a caller outside this package can ask the SAME registry the decoder
+// instantiates from what a condition type looks like — concretely, the manifest loader's
+// unknown-key check, which derives each type's permitted key set by reflecting over the
+// prototype. That check used to carry its own reflect.TypeOf switch over all fourteen
+// types: one more table to keep in step, and one that fails SILENTLY when it falls behind
+// (a type missing from it is simply not key-checked).
+//
+// The prototype is freshly constructed per call, so a caller cannot mutate the registry's
+// idea of a type.
+func NewConditionPrototype(condType string) (Condition, bool) {
+	proto, ok := conditionPrototypes[condType]
+	if !ok {
+		return nil, false
+	}
+	return proto(), true
 }
 
 // suggestConditionType returns the known condition type nearest to unknown, or
@@ -349,37 +390,11 @@ func suggestConditionType(unknown string) string {
 	return NearestString(unknown, knownConditionTypes)
 }
 
+// newCondition returns a zero value of the condition type named by conditionType, or nil
+// for a discriminator this build does not model. It is the in-package spelling of
+// NewConditionPrototype — same registry, nil rather than a second (Condition, bool) return,
+// because the decoder's next step is a type switch that handles nil anyway.
 func newCondition(conditionType string) Condition {
-	switch conditionType {
-	case ConditionTypeTimeWindow:
-		return &TimeWindowCondition{}
-	case ConditionTypeIPRange:
-		return &IPRangeCondition{}
-	case ConditionTypeAllowedOperations:
-		return &AllowedOperationsCondition{}
-	case ConditionTypeAllowedExtensions:
-		return &AllowedExtensionsCondition{}
-	case ConditionTypeAllowedTables:
-		return &AllowedTablesCondition{}
-	case ConditionTypeMaxCalls:
-		return &MaxCallsCondition{}
-	case ConditionTypeRecipientDomain:
-		return &RecipientDomainCondition{}
-	case ConditionTypePolicy:
-		return &PolicyCondition{}
-	case ConditionTypeCustom:
-		return &CustomCondition{}
-	case ConditionTypeAllowedValues:
-		return &AllowedValuesCondition{}
-	case ConditionTypeSequenceBlock:
-		return &SequenceBlockCondition{}
-	case ConditionTypeFlowLabel:
-		return &FlowLabelCondition{}
-	case ConditionTypeEffectClass:
-		return &EffectClassCondition{}
-	case ConditionTypeBlastRadius:
-		return &BlastRadiusCondition{}
-	default:
-		return nil
-	}
+	proto, _ := NewConditionPrototype(conditionType)
+	return proto
 }

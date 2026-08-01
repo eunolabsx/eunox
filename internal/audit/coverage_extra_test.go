@@ -441,7 +441,7 @@ func TestSyncDir_OpenFailureTolerated(t *testing.T) {
 	os.Stderr = w
 
 	// Must not panic; the open failure is swallowed with a warning.
-	syncDir(missing)
+	syncDir(missing, "audit key")
 
 	_ = w.Close()
 	os.Stderr = old
@@ -466,7 +466,7 @@ func TestSyncDir_Success(t *testing.T) {
 	}
 	os.Stderr = w
 
-	syncDir(dir)
+	syncDir(dir, "audit key")
 
 	_ = w.Close()
 	os.Stderr = old
@@ -1214,7 +1214,12 @@ func TestTightenKeyFileMode_AlreadyTight(t *testing.T) {
 	if err := os.WriteFile(keyPath, []byte(strings.Repeat("ab", 32)+"\n"), 0o600); err != nil {
 		t.Fatalf("create key file: %v", err)
 	}
-	tightenKeyFileMode(keyPath)
+	f, err := os.Open(keyPath)
+	if err != nil {
+		t.Fatalf("open key file: %v", err)
+	}
+	tightenKeyFileMode(f, keyPath)
+	_ = f.Close()
 	info, err := os.Stat(keyPath)
 	if err != nil {
 		t.Fatalf("stat after tighten: %v", err)
@@ -1224,11 +1229,16 @@ func TestTightenKeyFileMode_AlreadyTight(t *testing.T) {
 	}
 }
 
-// TestTightenKeyFileMode_StatError covers the os.Stat error path: a non-existent
-// path causes os.Stat to fail, so tightenKeyFileMode logs a warning and returns
-// without panicking.
+// TestTightenKeyFileMode_StatError covers the f.Stat error path: stat on a closed
+// handle fails, so tightenKeyFileMode logs a warning and returns without panicking.
 func TestTightenKeyFileMode_StatError(t *testing.T) {
-	tightenKeyFileMode(filepath.Join(t.TempDir(), "nonexistent.key"))
+	keyPath := filepath.Join(t.TempDir(), "audit.key")
+	f, err := os.Create(keyPath)
+	if err != nil {
+		t.Fatalf("create key file: %v", err)
+	}
+	_ = f.Close()
+	tightenKeyFileMode(f, keyPath)
 }
 
 // TestTightenLogMode_StatError covers the f.Stat() error path: calling Stat on a

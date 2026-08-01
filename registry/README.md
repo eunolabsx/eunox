@@ -105,6 +105,25 @@ excluded (a contract cannot contain its own digest). Two entries whose contracts
 - `attestation.review` starts at `pending`. It is not a correctness guarantee at any value.
 - Recompute `digest` after any edit to `effect`. `go test ./internal/registry/` fails
   otherwise, and so does any manifest that pinned the old value.
+- The corpus test also checks each entry's `effect` block **semantically**, not just for
+  digest consistency — a digest over nonsense is still a stable digest. It runs the same
+  validators the manifest loader applies (they live in `pkg/capability`, which owns both
+  the vocabulary and the digest, so the two layers cannot disagree about what a valid
+  contract is). An entry fails the test when it:
+  - names a `class` outside the closed vocabulary (a typo, or a plausible-sounding
+    invention such as `safe`);
+  - is `compensable` but names no `compensatingAction`, or names one under a
+    non-compensable class — including in a `byArgument` row, judged against the class and
+    action the row *effectively* has after inheriting from the base block;
+  - declares a `blastRadius` with both a fixed `value` and an `argument`, or with neither;
+  - declares a `byArgument` table with no `argument`, with neither `cases` nor `default`,
+    or with two case keys that match the same argument value (matching is case-insensitive
+    after trimming, so `DROP` and `drop` are one key);
+  - carries its own `effect.ref` — a corpus entry *is* the thing a ref points at.
+
+  Previously only the digest was checked, so a mistake in an entry survived review and
+  surfaced later as a confusing manifest-load error about a block the author had copied
+  verbatim from here.
 - **Be conservative.** `compensable` means *a declared action reverses this*, and it is the
   class most easily mislabeled — "there is an undo" is how an irreversible action gets waved
   through a consequence gate. Compensable is not safe: the compensation may be visible,

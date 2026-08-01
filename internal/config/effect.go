@@ -67,201 +67,25 @@ func validateBlastRadiusNumber(i, j int, field string, n *json.Number) error {
 
 // validateEffectContract checks a constraint's effect block. The contract is the input
 // every effect check reads, so a malformed one would make all of them wrong at once.
+//
+// The rules themselves live in pkg/capability (capability.ValidateEffectContract), which
+// owns the reversibility vocabulary and the contract digest. This layer only adds the
+// manifest-positional framing, so the registry corpus loader can apply the SAME semantic
+// rules to a corpus entry — before, they were unexported here and unreachable from there,
+// which let an entry with a class typo or a compensable-with-no-action contract validate
+// and digest cleanly, then fail confusingly at manifest load.
 func validateEffectContract(i int, e *capability.EffectContract) error {
-	if e == nil {
-		return nil
-	}
-	if e.Class != "" && !capability.IsEffectClass(e.Class) {
-		return fmt.Errorf("capability at index %d: effect 'class' is %q — valid effect classes are %s", i, e.Class, strings.Join(capability.EffectClassVocabulary(), ", "))
-	}
-	if err := validateCompensation(i, "effect", e.Class, e.CompensatingAction); err != nil {
-		return err
-	}
-	if err := validateBlastRadiusSpec(i, "effect.blastRadius", e.BlastRadius); err != nil {
-		return err
-	}
-	if err := validateEffectRef(i, e); err != nil {
-		return err
-	}
-	return validateEffectByArgument(i, e.ByArgument)
-}
-
-// validateCompensation enforces the one invariant that keeps the compensable class
-// meaningful: compensable means "there is a declared action that reverses this", and
-// anything else means there is not.
-//
-// Without it, "compensable" degrades into a softer word for irreversible — an author
-// labels a wire transfer compensable, the consequence gate reads a compensating action
-// as present, and the exact case the gate exists to escalate passes through it.
-func validateCompensation(i int, where, class, compensating string) error {
-	switch {
-	case class == capability.EffectCompensable && compensating == "":
-		return fmt.Errorf("capability at index %d: %s declares class %q but no 'compensatingAction'; compensable means a declared action reverses this one, so without it the class is irreversible wearing a softer label", i, where, capability.EffectCompensable)
-	case class != capability.EffectCompensable && compensating != "":
-		return fmt.Errorf("capability at index %d: %s declares 'compensatingAction' with class %q; a compensating action is what makes an action %q, so declare that class or drop the field", i, where, classOrUnset(class), capability.EffectCompensable)
+	if err := capability.ValidateEffectContract(e); err != nil {
+		return fmt.Errorf("capability at index %d: %w", i, err)
 	}
 	return nil
 }
 
-// classOrUnset renders a class for an error message, naming an absent one explicitly
-// rather than printing empty quotes.
-func classOrUnset(class string) string {
-	if class == "" {
-		return "(unset, which resolves to irreversible)"
-	}
-	return class
-}
-
-// validateBlastRadiusSpec checks a blast-radius declaration: exactly one of a fixed
-// value or an argument reference. Both is ambiguous (which wins?) and neither declares
-// nothing while looking like a declaration — the shape most likely to leave an operator
-// believing an action is quantified when it is not.
-func validateBlastRadiusSpec(i int, where string, s *capability.BlastRadiusSpec) error {
-	if s == nil {
-		return nil
-	}
-	hasValue, hasArg := s.Value != nil, strings.TrimSpace(s.Argument) != ""
-	switch {
-	case hasValue && hasArg:
-		return fmt.Errorf("capability at index %d: %s declares both 'value' and 'argument'; a blast radius is either a fixed magnitude or the value of one argument, not both", i, where)
-	case !hasValue && !hasArg:
-		return fmt.Errorf("capability at index %d: %s declares neither 'value' nor 'argument', so it quantifies nothing; drop the block (which resolves to unquantified, exceeding any bound) or name one", i, where)
-	}
-	if hasValue {
-		v, ok := capability.ParseBlastRadiusNumber(*s.Value)
-		if !ok {
-			return fmt.Errorf("capability at index %d: %s 'value' is not a number (got %q)", i, where, s.Value.String())
-		}
-		if v.Sign() < 0 {
-			return fmt.Errorf("capability at index %d: %s 'value' must not be negative (got %q)", i, where, s.Value.String())
-		}
-	}
-	return nil
-}
-
-// validateEffectByArgument checks an argument-parameterized contract: a named argument,
-// a non-empty table, and a valid contract in every row.
-func validateEffectByArgument(i int, t *capability.EffectByArgument) error {
-	if t == nil {
-		return nil
-	}
-	if strings.TrimSpace(t.Argument) == "" {
-		return fmt.Errorf("capability at index %d: effect.byArgument requires 'argument' naming the call argument the decision table keys on", i)
-	}
-	if len(t.Cases) == 0 && t.Default == nil {
-		return fmt.Errorf("capability at index %d: effect.byArgument declares neither 'cases' nor 'default', so it decides nothing", i)
-	}
-	// Two keys that match the SAME argument value are an ambiguous table. Matching is
-	// case-insensitive after trimming (an operator writes "DROP" or "drop"), so
-	// {"DROP": irreversible, "drop": reversible} would leave which row wins to map
-	// iteration order — a nondeterministic effect class, which is disqualifying for a
-	// layer whose whole claim is determinism. Reject it here, the way every other
-	// case-variant ambiguity in this codebase is rejected rather than resolved.
-	folded := make(map[string]string, len(t.Cases))
-	for value := range t.Cases {
-		key := strings.ToLower(strings.TrimSpace(value))
-		if prev, dup := folded[key]; dup {
-			return fmt.Errorf("capability at index %d: effect.byArgument declares cases %q and %q, which match the same argument value (matching is case-insensitive after trimming); a single value cannot resolve to two effects, so remove or reconcile one", i, prev, value)
-		}
-		folded[key] = value
-	}
-	for value, c := range t.Cases {
-		if err := validateEffectCase(i, fmt.Sprintf("effect.byArgument.cases[%q]", value), c); err != nil {
-			return err
-		}
-	}
-	if t.Default != nil {
-		return validateEffectCase(i, "effect.byArgument.default", *t.Default)
-	}
-	return nil
-}
-
-// validateEffectCase checks one row of an argument-parameterized contract, applying the
-// same class and compensation rules the base contract obeys — a row is a contract.
-func validateEffectCase(i int, where string, c capability.EffectCase) error {
-	if c.Class != "" && !capability.IsEffectClass(c.Class) {
-		return fmt.Errorf("capability at index %d: %s 'class' is %q — valid effect classes are %s", i, where, c.Class, strings.Join(capability.EffectClassVocabulary(), ", "))
-	}
-	// A row that names a compensating action but no class inherits the base contract's
-	// class, so the compensable pairing is only checkable when the row states one. A row
-	// stating neither is fine (it overlays nothing on those axes).
-	if c.Class != "" {
-		if err := validateCompensation(i, where, c.Class, c.CompensatingAction); err != nil {
-			return err
-		}
-	}
-	return validateBlastRadiusSpec(i, where+".blastRadius", c.BlastRadius)
-}
-
-// validateEffectRef verifies the registry pin: its shape
-// ("<contract-id>@sha256:<64 lowercase hex>") AND that the digest matches the inline
-// contract it is attached to.
-//
-// eunox never fetches the registry — the decision path stays local, so a registry outage
-// cannot change a verdict — but the pin is still fully checkable here, because the digest
-// is over the contract's own content. Verifying it is what makes `ref` an integrity pin
-// rather than a comment: without the check, a manifest could carry the reviewed
-// contract's id while enforcing something else entirely, which is the one thing a
-// hash-pinned registry exists to prevent. Editing a pinned contract therefore fails at
-// load until the author re-pins — the review step, enforced rather than requested.
-func validateEffectRef(i int, e *capability.EffectContract) error {
-	if e.Ref == "" {
-		return nil
-	}
-	_, digest, ok := capability.SplitEffectRef(e.Ref)
-	if !ok {
-		return fmt.Errorf("capability at index %d: effect 'ref' %q must be \"<contract-id>@sha256:<hex>\" — the registry contract this block was authored from", i, e.Ref)
-	}
-	if err := validateDescriptionHashFormat(digest); err != nil {
-		return fmt.Errorf("capability at index %d: effect 'ref' %q: %w", i, e.Ref, err)
-	}
-	actual, err := capability.EffectContractDigest(e)
-	if err != nil {
-		return fmt.Errorf("capability at index %d: effect 'ref' %q: %w", i, e.Ref, err)
-	}
-	if actual != digest {
-		return fmt.Errorf("capability at index %d: effect 'ref' %q pins digest %s but this contract's content digests to %s — the block was edited after it was pinned; re-review it and update the pin (eunox never fetches the registry, so the pin is only worth anything if it matches what is enforced)", i, e.Ref, digest, actual)
-	}
-	return nil
-}
-
-// validateEffectCeiling checks the top-level ceiling. A ceiling that bounds nothing is
-// rejected rather than treated as satisfied by every action: a half-written ceiling that
-// loads cleanly is a policy an operator believes is in force and is not.
+// validateEffectCeiling checks the top-level ceiling. Delegates to pkg/capability for the
+// same reason validateEffectContract does; the ceiling is manifest-level, so there is no
+// capability index to prefix.
 func validateEffectCeiling(c *capability.EffectCeiling) error {
-	if c == nil {
-		return nil
-	}
-	if c.MaxEffectClass != "" && !capability.IsEffectClass(c.MaxEffectClass) {
-		return fmt.Errorf("effectCeiling 'maxEffectClass' is %q — valid effect classes are %s", c.MaxEffectClass, strings.Join(capability.EffectClassVocabulary(), ", "))
-	}
-	if c.MaxBlastRadius != nil {
-		v, ok := capability.ParseBlastRadiusNumber(*c.MaxBlastRadius)
-		if !ok {
-			return fmt.Errorf("effectCeiling 'maxBlastRadius' is not a number (got %q)", c.MaxBlastRadius.String())
-		}
-		if v.Sign() < 0 {
-			return fmt.Errorf("effectCeiling 'maxBlastRadius' must not be negative (got %q)", c.MaxBlastRadius.String())
-		}
-	}
-	switch c.OnExceed {
-	case "", capability.OnExceedEscalate, capability.OnExceedDeny:
-	default:
-		return fmt.Errorf("effectCeiling 'onExceed' is %q — valid outcomes are %s (the default) and %s", c.OnExceed, capability.OnExceedEscalate, capability.OnExceedDeny)
-	}
-	// RequireCompensation only ever applies to an action already over the class bound
-	// (see EffectCeiling.Exceeds), so on its own it is inert — and inert-but-present is
-	// exactly the shape that reads as a control when it is not. Checked BEFORE the
-	// bounds-nothing test below so the author gets the specific diagnosis ("this key needs
-	// that one") rather than the generic one, which would send them to add a key they
-	// already wrote.
-	if c.RequireCompensation && c.MaxEffectClass == "" {
-		return fmt.Errorf("effectCeiling 'requireCompensation' needs 'maxEffectClass': it demands a compensating action only for an action ABOVE the class bound, so without one it never fires")
-	}
-	if !c.IsSet() {
-		return fmt.Errorf("effectCeiling bounds nothing: set 'maxEffectClass' or 'maxBlastRadius' (a ceiling with only 'onExceed' never fires, which reads as \"checked and fine\")")
-	}
-	return nil
+	return capability.ValidateEffectCeiling(c)
 }
 
 // mergeEffectCeiling folds a file's ceiling into the merged manifest with a conflict

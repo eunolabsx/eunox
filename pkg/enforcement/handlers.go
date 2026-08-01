@@ -307,12 +307,6 @@ func (e *Engine) maxCallsBucket(ctx context.Context, cond capability.Condition, 
 		return nil, "", false, condErr
 	}
 
-	// Skip the counter (treating the condition as satisfied) when quota must not be
-	// consumed: --audit observe mode (WithSkipQuota).
-	if SkipQuota(ctx) {
-		return nil, "", true, nil
-	}
-
 	if e.counter == nil {
 		return nil, "", false, &ConditionError{
 			Code:          capability.ErrCodeConditionFailed,
@@ -356,6 +350,21 @@ func (e *Engine) maxCallsBucket(ctx context.Context, cond capability.Condition, 
 			ConditionType: capability.ConditionTypeMaxCalls,
 			Message:       "tool or resource name is required for maxCalls condition",
 		}
+	}
+
+	// Skip the counter (treating the condition as satisfied) when quota must not be
+	// consumed: --audit observe mode (WithSkipQuota).
+	//
+	// Deliberately AFTER the structural guards above, not before them. Observe mode exists
+	// to predict what enforcement would do, and only the counter INCREMENT is what it must
+	// not perform; a nil counter, an empty session, or an unidentifiable target are
+	// misconfigurations that deny in enforce mode no matter what the quota is. Skipping
+	// first hid exactly those from the audit log — the run an operator makes precisely to
+	// find them — and reported ALLOW where enforce mode would have written
+	// MISSING_CONTEXT/CONDITION_FAILED. Same rationale as commitDeferredAtomic's
+	// validate-then-skip ordering (engine.go), which this now matches.
+	if SkipQuota(ctx) {
+		return nil, "", true, nil
 	}
 	return mc, compositeCounterKey("maxcalls", e.counterKeyNamespace, req.SessionID, targetType, toolName), false, nil
 }
@@ -1222,7 +1231,7 @@ func toFloat64(v any) (float64, bool) {
 // was previously recorded in this session.
 //
 // Known limitation — concurrent same-session requests: the antecedent check
-// (history.Peek on the antecedent tool's key) and the recording of an antecedent's
+// (a counter Peek on the antecedent tool's key) and the recording of an antecedent's
 // call (RecordSessionCall's IncrementAndGet on that tool's key, on a SEPARATE
 // request) are not atomic, so firing the antecedent and the blocked tool
 // concurrently on one session can let the blocked tool Peek empty history and slip
@@ -1294,8 +1303,6 @@ func (e *Engine) handleSequenceBlock(ctx context.Context, cond capability.Condit
 		}
 	}
 
-	history := e.counter // non-nil: the e.counter == nil guard above already denied
-
 	// Resolve the blocked target's namespace as RecordSessionCall does: prefer the
 	// explicit req.Target.Type, falling back to the req.TargetName prefix (bare
 	// defaults to "tool"), and to req.Target.Name when req.TargetName is empty
@@ -1347,7 +1354,7 @@ func (e *Engine) handleSequenceBlock(ctx context.Context, cond capability.Condit
 		priorTarget := priorType + ":" + priorTool
 		key := sequenceHistoryKey(e.counterKeyNamespace, req.SessionID, priorType, priorTool)
 
-		count, err := history.Peek(histCtx, key, sequenceHistoryWindowSec)
+		count, err := e.counter.Peek(histCtx, key, sequenceHistoryWindowSec)
 		if err != nil {
 			return &ConditionError{
 				Code:          capability.ErrCodeConditionFailed,
@@ -1379,7 +1386,7 @@ func (e *Engine) handleSequenceBlock(ctx context.Context, cond capability.Condit
 			// has only the probed one re-armed. That is the documented per-pair contract —
 			// retention measures inactivity of THIS (antecedent, blocked target) pair —
 			// not an oversight; a pair no call ever exercises still ages out.
-			_, _ = history.IncrementAndGet(histCtx, key, sequenceHistoryWindowSec, sequenceHistoryMaxEntries)
+			_, _ = e.counter.IncrementAndGet(histCtx, key, sequenceHistoryWindowSec, sequenceHistoryMaxEntries)
 			return &ConditionError{
 				Code:          capability.ErrCodeConditionFailed,
 				ConditionType: capability.ConditionTypeSequenceBlock,

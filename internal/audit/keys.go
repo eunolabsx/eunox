@@ -14,6 +14,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -46,13 +47,21 @@ func tightenLogMode(f *os.File, logPath string) {
 }
 
 // tightenKeyFileMode drops any group/world access from a pre-existing HMAC key
-// file, preserving owner bits (the preceding ReadFile proves owner read). Unlike
+// file, preserving owner bits (the successful open proves owner read). Unlike
 // the log, a key found group/world-accessible is a possible prior-exposure signal
 // (anyone who could read it may have copied it and can forge verifiable records),
 // so the loose->tight transition is surfaced as a SECURITY warning recommending
 // rotation rather than fixed silently. Best-effort (see tightenLogMode).
-func tightenKeyFileMode(keyPath string) {
-	info, err := os.Stat(keyPath) //nolint:gosec // G304: keyPath is the user-configured audit key location
+//
+// It works through the OPEN HANDLE (f.Stat/f.Chmod), not the path. A path-based
+// stat+chmod pair is two fresh resolutions of an operator-supplied path: it follows a
+// symlink, so it re-modes the link's TARGET, and it re-resolves between the two calls, so
+// a path swapped in that window is chmod'd instead of the file just read. Dropping o+r
+// from an arbitrary file a symlink points at is a local denial-of-service primitive that
+// has nothing to do with the audit key. The handle names the exact inode readAuditKeyFile
+// admitted, so neither is reachable.
+func tightenKeyFileMode(f *os.File, keyPath string) {
+	info, err := f.Stat()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[eunox] WARNING: could not stat audit key file %q to tighten its mode: %v\n", keyPath, err)
 		return
@@ -61,7 +70,7 @@ func tightenKeyFileMode(keyPath string) {
 	if perm&0o077 == 0 {
 		return
 	}
-	if cerr := os.Chmod(keyPath, perm&^0o077); cerr != nil { //nolint:gosec // G302: clearing group/world bits is the intended restriction
+	if cerr := f.Chmod(perm &^ 0o077); cerr != nil { //nolint:gosec // G302: clearing group/world bits is the intended restriction
 		fmt.Fprintf(os.Stderr, "[eunox] WARNING: could not tighten audit key file %q (drop group/world access): %v\n", keyPath, cerr)
 		return
 	}
@@ -88,13 +97,12 @@ func LoadOrCreateKeys(keyPath string) ([][]byte, error) {
 	// targets deployments where the key often lives in a shared/read-only secret
 	// mount the operator manages. The load-bearing fix is the key FILE mode below.
 
-	data, err := os.ReadFile(keyPath) //nolint:gosec // G304: path is user-configured audit key location (--audit-key-path or EUNOX_AUDIT_KEY_PATH)
+	// Drop any group/world access from a pre-existing key file: a readable HMAC key lets
+	// any local user forge records. Freshly generated keys are written 0600, so this only
+	// affects keys created outside that path. readAuditKeyFile tightens through the open
+	// handle and warns, since a loose key is a possible prior-exposure signal.
+	data, err := readAuditKeyFile(keyPath, true)
 	if err == nil {
-		// Drop any group/world access from a pre-existing key file: a readable HMAC
-		// key lets any local user forge records. Freshly generated keys are written
-		// 0600, so this only affects keys created outside that path. tightenKeyFileMode
-		// warns, since a loose key is a possible prior-exposure signal.
-		tightenKeyFileMode(keyPath)
 		keys, parseErr := parseAuditKeys(data)
 		if parseErr != nil {
 			return nil, fmt.Errorf("audit key file %q: %w", keyPath, parseErr)
@@ -102,7 +110,7 @@ func LoadOrCreateKeys(keyPath string) ([][]byte, error) {
 		return keys, nil
 	}
 	if !os.IsNotExist(err) {
-		return nil, fmt.Errorf("reading audit key file %q: %w", keyPath, err)
+		return nil, err
 	}
 
 	// Key file does not exist — generate, persist, and return a fresh key.
@@ -117,14 +125,13 @@ func LoadOrCreateKeys(keyPath string) ([][]byte, error) {
 // wrong machine as a key rotation. Format and retired-key semantics match
 // LoadOrCreateKeys.
 func LoadKeys(keyPath string) ([][]byte, error) {
-	data, err := os.ReadFile(keyPath) //nolint:gosec // G304: path is user-configured audit key location (--audit-key-path or EUNOX_AUDIT_KEY_PATH)
+	data, err := readAuditKeyFile(keyPath, true)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, fmt.Errorf("audit key file %q not found — pass --audit-key-path pointing at the key that signed this log", keyPath)
 		}
-		return nil, fmt.Errorf("reading audit key file %q: %w", keyPath, err)
+		return nil, err
 	}
-	tightenKeyFileMode(keyPath)
 	keys, parseErr := parseAuditKeys(data)
 	if parseErr != nil {
 		return nil, fmt.Errorf("audit key file %q: %w", keyPath, parseErr)
@@ -205,7 +212,7 @@ func generateAndPersistAuditKey(keyPath string) ([][]byte, error) {
 			if renameErr := os.Rename(tmpName, keyPath); renameErr != nil { //nolint:gosec // G304: keyPath is user-configured via --audit-key-path; taint is intentional
 				return nil, fmt.Errorf("publishing audit key file %q: %w", keyPath, renameErr)
 			}
-			syncDir(dir)
+			syncDir(dir, "audit key")
 			return readPublishedAuditKeys(keyPath, "after rename publish")
 		}
 		return nil, fmt.Errorf("publishing audit key file %q: %w", keyPath, err)
@@ -214,23 +221,27 @@ func generateAndPersistAuditKey(keyPath string) ([][]byte, error) {
 	// rename(2) only updates the directory inode in cache, so a power loss before the
 	// next flush can leave the key absent on restart, rendering every prior record
 	// unverifiable.
-	syncDir(dir)
+	syncDir(dir, "audit key")
 	return [][]byte{key}, nil
 }
 
-// syncDir fsyncs a directory so a just-published directory entry (from link or
-// rename) survives a crash. Best-effort: a directory that cannot be opened or
-// synced (some filesystems reject directory fsync) is logged and tolerated
-// rather than failing audit-key creation — the durability gap it closes is a
-// crash-recovery edge case, not a normal-operation correctness issue.
-func syncDir(dir string) {
-	d, err := os.Open(dir) //nolint:gosec // G304: dir derives from the user-configured key path
+// syncDir fsyncs a directory so a just-published directory entry (from link, rename, or
+// create) survives a crash. subject names what the directory holds, for the warning
+// ("audit key", "audit log") — both the key publish and log rotation depend on it, and a
+// warning that named only the key would misdirect an operator debugging a lost rotation.
+//
+// Best-effort: a directory that cannot be opened or synced (some filesystems reject
+// directory fsync) is logged and tolerated rather than failing the operation — the
+// durability gap it closes is a crash-recovery edge case, not a normal-operation
+// correctness issue.
+func syncDir(dir, subject string) {
+	d, err := os.Open(dir) //nolint:gosec // G304: dir derives from the user-configured key/log path
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[eunox] WARNING: cannot open audit key dir %q to fsync: %v\n", dir, err)
+		fmt.Fprintf(os.Stderr, "[eunox] WARNING: cannot open %s dir %q to fsync: %v\n", subject, dir, err)
 		return
 	}
 	if err := d.Sync(); err != nil {
-		fmt.Fprintf(os.Stderr, "[eunox] WARNING: cannot fsync audit key dir %q: %v\n", dir, err)
+		fmt.Fprintf(os.Stderr, "[eunox] WARNING: cannot fsync %s dir %q: %v\n", subject, dir, err)
 	}
 	_ = d.Close()
 }
@@ -247,12 +258,101 @@ var osLink = os.Link
 // targets (e.g. plan9), so referencing them in this shared file would break the
 // cross-platform build.
 
+// EnvAuditKeyAllowSymlink opts the HMAC key file out of the symlink refusal below, for the
+// one deployment shape where a symlinked key is normal rather than an attack: a
+// Kubernetes-style projected secret mount, which materializes each key as a symlink into a
+// timestamped ..data directory so the whole set can be swapped atomically. Set it to 1/
+// true/yes when the key comes from such a mount.
+//
+// It is a deliberate downgrade with a narrow blast radius, not a general escape hatch. The
+// non-regular-file refusal still applies to the RESOLVED file (checked through the open
+// handle, so no re-resolution race), which keeps a FIFO or device out; what it gives up is
+// the guarantee that the final path component was not redirected. Prefer mounting the
+// secret's ..data directory directly, or copying the key to a regular file at startup, and
+// keep this unset.
+const EnvAuditKeyAllowSymlink = "EUNOX_AUDIT_KEY_ALLOW_SYMLINK"
+
+// maxAuditKeyFileBytes bounds a key-file read. The format is one 64-hex-char key per line,
+// so even a long rotation history is a few kilobytes; 1 MiB is orders of magnitude of
+// headroom while still refusing to buffer a file that is not a key file at all.
+const maxAuditKeyFileBytes = 1 << 20
+
+// auditKeySymlinkAllowed reports whether EnvAuditKeyAllowSymlink opts this process out of
+// the key-file symlink refusal (see the const doc).
+func auditKeySymlinkAllowed() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(EnvAuditKeyAllowSymlink))) {
+	case "1", "true", "yes":
+		return true
+	}
+	return false
+}
+
+// readAuditKeyFile reads the HMAC key file under the same symlink guard every other audit
+// file already uses, optionally tightening its mode through the open handle.
+//
+// The key is the one audit file whose redirection is unrecoverable: the log is
+// HMAC-protected, so redirecting it is detectable, but whoever chooses the KEY chooses
+// what verifies — a key read through an attacker-planted symlink signs a tape the attacker
+// can forge at will, and audit-verify confirms it. Every other file in this package (the
+// log open, both rotation reopens, the tail read, even the never-written lock file) pairs
+// config.RefuseNonRegularPath with config.OpenNoFollow; this one was read with a plain
+// os.ReadFile, which follows symlinks. The guard is applied here, once, for all three
+// readers rather than at each call site.
+//
+// A genuinely absent file is returned as an os.IsNotExist error so LoadOrCreateKeys can
+// still mint a key; the caller distinguishes the two.
+func readAuditKeyFile(keyPath string, tighten bool) ([]byte, error) {
+	allowSymlink := auditKeySymlinkAllowed()
+	flags := os.O_RDONLY
+	if !allowSymlink {
+		// Lstat first for the actionable error (it names the path and the opt-out); the
+		// O_NOFOLLOW below closes the Lstat->open window the check itself cannot.
+		if err := config.RefuseNonRegularPath(keyPath, "audit key file"); err != nil {
+			return nil, fmt.Errorf("%w — if this key comes from a projected secret mount that publishes it as a symlink, set %s=1 to accept it", err, EnvAuditKeyAllowSymlink)
+		}
+		flags |= config.OpenNoFollow
+	}
+	f, err := os.OpenFile(keyPath, flags, 0) //nolint:gosec // G304: path is user-configured audit key location (--audit-key-path or EUNOX_AUDIT_KEY_PATH)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, err // the caller decides whether absence is fatal or a create trigger
+		}
+		return nil, fmt.Errorf("reading audit key file %q: %w", keyPath, err)
+	}
+	defer func() { _ = f.Close() }()
+
+	// Re-check regularity through the HANDLE. On the opt-out path this is the only
+	// non-regular guard left (a symlink to a FIFO would otherwise block the read here
+	// forever, wedging startup); on the default path it is a cheap confirmation that the
+	// inode opened is the kind Lstat saw.
+	info, statErr := f.Stat()
+	if statErr != nil {
+		return nil, fmt.Errorf("stat audit key file %q: %w", keyPath, statErr)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("refusing audit key file %q: it resolves to a non-regular file (mode %v); the HMAC key must be a regular file", keyPath, info.Mode())
+	}
+	if tighten {
+		tightenKeyFileMode(f, keyPath)
+	}
+
+	data, readErr := io.ReadAll(io.LimitReader(f, maxAuditKeyFileBytes+1))
+	if readErr != nil {
+		return nil, fmt.Errorf("reading audit key file %q: %w", keyPath, readErr)
+	}
+	if len(data) > maxAuditKeyFileBytes {
+		return nil, fmt.Errorf("audit key file %q exceeds %d bytes; that is not a key file (one 64-hex-char key per line)", keyPath, maxAuditKeyFileBytes)
+	}
+	return data, nil
+}
+
 // readPublishedAuditKeys re-reads keyPath after another writer may have published
 // it — a lost create race, or our own rename fallback — and returns the parsed
 // keys on disk so every process converges on the single persisted key rather than
-// its own in-memory copy. phase labels the call site in any error.
+// its own in-memory copy. phase labels the call site in any error. No mode
+// tightening: the file was just written 0600 by whichever starter won.
 func readPublishedAuditKeys(keyPath, phase string) ([][]byte, error) {
-	data, readErr := os.ReadFile(keyPath) //nolint:gosec // G304: path is user-configured audit key location
+	data, readErr := readAuditKeyFile(keyPath, false)
 	if readErr != nil {
 		return nil, fmt.Errorf("reading audit key file %q %s: %w", keyPath, phase, readErr)
 	}

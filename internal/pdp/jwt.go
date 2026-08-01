@@ -905,6 +905,63 @@ func (p *JWTPDP) DecideResourceRead(ctx context.Context, sessionID, uri, sourceI
 	return p.Decide(ctx, sessionID, EnforceTarget{Type: capability.TargetTypeResource, Name: uri}, nil, sourceIP)
 }
 
+// DecideResourceCancel authorizes a resources/unsubscribe through the JWT layer without
+// routing it into Decide, because Decide is the READ decision and a cancel must not be
+// metered by it (see the contract). The token can still only RESTRICT: kill, the per-route
+// audience pin, and — when the token carries an exhaustive mcp.capabilities claim — the
+// requirement that some claim cover this resource, all apply before the inner PDP's own
+// match-only decision.
+//
+// Unlike Decide, the denials here are not routed through withInnerForwardObligations.
+// Neither half of that helper applies to a cancel: the interface-pin hardening it carries
+// is tool-only (hardenOnBrokenInterface returns unchanged for a resource target), and
+// obligations describe how to redact a FORWARDED response — an unsubscribe result carries
+// no data to redact even when an --audit route downgrades the denial to a forward.
+func (p *JWTPDP) DecideResourceCancel(ctx context.Context, sessionID, uri, sourceIP string) capability.EnforceResponse {
+	if deny := killCheck(ctx, p.clock, p.ks, sessionID); deny != nil {
+		return *deny
+	}
+	claims, ok := jwtClaimsFromContext(ctx)
+	if !ok {
+		// An authentication boundary, exactly as in Decide: the token was never validated.
+		return hardDenyResponse(p.clock, capability.ErrCodeNoJWTClaims, "no JWT claims in context — token was not validated")
+	}
+	if !p.routeAudienceSatisfied(claims) {
+		return p.audienceDeny(fmt.Sprintf("token audience %v does not satisfy the route's required audience %q", claims.Audiences, p.routeAudience))
+	}
+	target := EnforceTarget{Type: capability.TargetTypeResource, Name: uri}
+	if claims.HasCapabilities {
+		// The claim is an exhaustive allowlist, so a resource it does not name is not
+		// cancellable through this token either. Matching (not condition evaluation) is
+		// the whole question here, which is what anyCapCovers answers — the same
+		// predicate the JWT list filter uses.
+		if !anyCapCovers(parsedCapHeads(claims), target) {
+			return denyResponse(p.clock, capability.ErrCodeAuthorizationFailed, "jwtCapability",
+				fmt.Sprintf("resource %q is not in the JWT capability claims, so this token holds no subscription to it to cancel", uri))
+		}
+		// The plain nil check, matching the same branch in Decide and for the same reason:
+		// the token has ALREADY authorized this URI against its exhaustive allowlist, so
+		// delegating to a permissive inner can only re-affirm — a weaker gate cannot fail
+		// open here. Using innerEnforces() instead made the two legs of one subscription
+		// disagree on a wiretap route: the same token was allowed the subscribe (Decide's
+		// nil check reaches AlwaysAllowPDP) and denied the unsubscribe.
+		if p.inner != nil {
+			return p.inner.DecideResourceCancel(ctx, sessionID, uri, sourceIP)
+		}
+		return newAllowResponse(p.clock)
+	}
+	// No mcp.capabilities claim: the JWT ABSTAINS, so a permissive inner would fail open
+	// and only a real policy can authorize. That is the stricter innerEnforces() gate, the
+	// same asymmetry Decide documents.
+	if p.innerEnforces() {
+		return p.inner.DecideResourceCancel(ctx, sessionID, uri, sourceIP)
+	}
+	// Identity-only token on a route with no policy: the same posture Decide takes for an
+	// unpoliced JWT route — the token authenticates, it does not authorize.
+	return denyResponse(p.clock, capability.ErrCodeAuthorizationFailed, "",
+		"no capability policy is configured for this route, so no subscription was authorized to cancel")
+}
+
 // DecidePromptGet delegates to Decide with a prompt target so JWT claims gate
 // prompt gets like tool calls.
 func (p *JWTPDP) DecidePromptGet(ctx context.Context, sessionID, promptName, sourceIP string) capability.EnforceResponse {
@@ -933,6 +990,17 @@ func (p *JWTPDP) DecideSampling(ctx context.Context, sessionID, sourceIP string)
 	// independent denial code, matching the Decide path.
 	if deny := killCheck(ctx, p.clock, p.ks, sessionID); deny != nil {
 		return *deny
+	}
+	// No validated claims in scope at all: hard-deny, mirroring Decide and filterList.
+	// This is an authentication boundary — the token was never validated — so it must not
+	// be downgraded to a logged forward under a route running --audit, and it must not be
+	// silently delegated past. Today the transport wiring only reaches DecideSampling with
+	// claims attached (forwardServerRequest attaches them), so this is a mirror of an
+	// invariant rather than a live hole; stating it here is what keeps it one, since the
+	// asymmetry — two of the three Decide* entry points checking and the third not — is
+	// exactly the kind of gap a later wiring change turns into a bypass.
+	if _, ok := jwtClaimsFromContext(ctx); !ok {
+		return hardDenyResponse(p.clock, capability.ErrCodeNoJWTClaims, "no JWT claims in context — token was not validated")
 	}
 	// Per-route audience pin (mirrors Decide/filterList): a session whose token does not
 	// carry this route's audience gets NO enforced action on the route, including a
@@ -1111,8 +1179,16 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 		constraints = buildConstraintsFromClaims(claims.Capabilities, target)
 	}
 	if len(constraints) == 0 {
-		return p.withInnerForwardObligations(ctx, sessionID, denyResponse(p.clock, capability.ErrCodeAuthorizationFailed, "jwtCapability",
-			fmt.Sprintf("%s %q is not in the JWT capability claims", target.Type, target.Name)), target)
+		// "Not in the claims" is the usual reason and the only one an operator can act on
+		// by editing the token. A claim that NAMES this target but whose condition suffix
+		// failed to parse also lands here (it grants nothing, fail closed), and reporting
+		// that as absent sends the operator looking for a claim that is right in front of
+		// them. Say which case it is; the parse failure itself is already logged in full.
+		msg := fmt.Sprintf("%s %q is not in the JWT capability claims", target.Type, target.Name)
+		if claimNamesTargetButFailedToParse(claims, target) {
+			msg = fmt.Sprintf("a JWT capability claim names %s %q, but its condition suffix could not be parsed, so it grants nothing (see the eunox log for the parse error)", target.Type, target.Name)
+		}
+		return p.withInnerForwardObligations(ctx, sessionID, denyResponse(p.clock, capability.ErrCodeAuthorizationFailed, "jwtCapability", msg), target)
 	}
 
 	// mcp.capabilities is an OR-list: the call is permitted if ANY matching entry's
@@ -1577,6 +1653,31 @@ func buildConstraintsFromClaims(caps []string, target EnforceTarget) []capabilit
 	return buildConstraintsFromParsed(parseCapHeads(caps), target)
 }
 
+// claimNamesTargetButFailedToParse reports whether some capability claim MATCHES target
+// but contributed no constraint because its condition suffix would not parse.
+//
+// It exists so the deny message can distinguish "your token does not list this target"
+// from "your token lists it, but the claim is malformed" — two different operator actions
+// behind one identical denial. It re-walks the heads only on the deny path (the allow path
+// never reaches it) and re-parses only the suffixes of claims that match this target, which
+// is the same bounded work buildConstraintsFromParsed already did for them.
+func claimNamesTargetButFailedToParse(claims *JWTClaims, target EnforceTarget) bool {
+	for _, h := range parsedCapHeads(claims) {
+		if h.prefix != target.Type || !matchClaimBare(h.prefix, h.bareName, target.Name) {
+			continue
+		}
+		if h.condpart == "" {
+			// A matching claim with no suffix always yields a constraint, so reaching here
+			// with none built at all is impossible; treat it as the ordinary case.
+			continue
+		}
+		if _, err := parseCondSuffix(h.condpart); err != nil {
+			return true
+		}
+	}
+	return false
+}
+
 // buildConstraintsFromParsed is the matching/condition phase shared by the hot path
 // and buildConstraintsFromClaims. The expensive parseCondSuffix runs only for claims
 // that actually match this target.
@@ -1610,11 +1711,25 @@ func buildConstraintsFromParsed(heads []capHead, target EnforceTarget) []capabil
 	return out
 }
 
+// parsedCapHeads returns the claim heads parsed once at token validation, falling back to
+// parsing them here for a JWTClaims built directly (tests, and any caller that set
+// Capabilities without going through ValidateToken). Four paths need the same fallback —
+// the capability decision, the list filter, the malformed-claim diagnosis, and the
+// resources/unsubscribe cancel check — so it is written once rather than re-spelled at each.
+func parsedCapHeads(claims *JWTClaims) []capHead {
+	if claims.parsedCaps != nil {
+		return claims.parsedCaps
+	}
+	return parseCapHeads(claims.Capabilities)
+}
+
 // anyCapCovers reports whether any pre-parsed claim head covers target. Conditions
-// are not consulted — a list response carries no arguments — so a target is retained
-// whenever a claim matches its namespace and bare name. It takes the same []capHead
-// the Decide path caches (JWTClaims.parsedCaps) so list filtering and Decide share
-// one claim parser instead of maintaining a second name-only variant.
+// are not consulted — a list response carries no arguments, and a cancel names only a URI —
+// so a target is retained whenever a claim matches its namespace and bare name. That
+// condition-blindness is exactly what makes it the right predicate for DecideResourceCancel,
+// which is a match-only decision by design. It takes the same []capHead the Decide path
+// caches (JWTClaims.parsedCaps) so list filtering, cancellation, and Decide share one claim
+// parser instead of maintaining a second name-only variant.
 func anyCapCovers(parsed []capHead, target EnforceTarget) bool {
 	for _, c := range parsed {
 		if c.prefix == target.Type && matchClaimBare(c.prefix, c.bareName, target.Name) {
@@ -1691,10 +1806,7 @@ func (p *JWTPDP) filterList(ctx context.Context, result json.RawMessage, desc li
 	// Reuse the claim heads parsed once at token validation (parsedCaps); fall back to
 	// parsing here for a test-built JWTClaims that set Capabilities directly. Mirrors
 	// Decide's use of parsedCaps so list filtering never re-parses on the hot path.
-	parsed := claims.parsedCaps
-	if parsed == nil {
-		parsed = parseCapHeads(claims.Capabilities)
-	}
+	parsed := parsedCapHeads(claims)
 	kept := make([]json.RawMessage, 0, len(innerRes.Entries))
 	for i, raw := range innerRes.Entries {
 		var covered bool

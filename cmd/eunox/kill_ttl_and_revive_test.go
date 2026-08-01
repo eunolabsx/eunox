@@ -45,7 +45,7 @@ func TestProxyPublishesSessionKillTTL_ForTheKillCLI(t *testing.T) {
 		require.NoError(t, err)
 		ksRedis := backends.ksRedis
 		require.NotNil(t, ksRedis)
-		publishSessionKillTTL(ksRedis)
+		publishSessionKillTTL(context.Background(), ksRedis)
 	})
 
 	got, err := mr.Get(publishedTTLKey)
@@ -58,7 +58,7 @@ func TestProxyPublishesSessionKillTTL_ForTheKillCLI(t *testing.T) {
 		backends, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, false, 0, -1, 0)
 		require.NoError(t, err)
 		ksRedis := backends.ksRedis
-		publishSessionKillTTL(ksRedis)
+		publishSessionKillTTL(context.Background(), ksRedis)
 	})
 	got, err = mr.Get(publishedTTLKey)
 	require.NoError(t, err)
@@ -76,7 +76,7 @@ func TestProxyPublishSessionKillTTL_WarnsOnADifferingPriorValue(t *testing.T) {
 		backends, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, false, 0, 90*time.Minute, 0)
 		require.NoError(t, err)
 		ksRedis := backends.ksRedis
-		publishSessionKillTTL(ksRedis)
+		publishSessionKillTTL(context.Background(), ksRedis)
 	})
 	require.Contains(t, stderr, "24h0m0s", "the warning must name the value being replaced")
 	require.Contains(t, stderr, "1h30m0s", "and the value replacing it")
@@ -86,7 +86,7 @@ func TestProxyPublishSessionKillTTL_WarnsOnADifferingPriorValue(t *testing.T) {
 		backends, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, false, 0, 90*time.Minute, 0)
 		require.NoError(t, err)
 		ksRedis := backends.ksRedis
-		publishSessionKillTTL(ksRedis)
+		publishSessionKillTTL(context.Background(), ksRedis)
 	})
 	require.NotContains(t, stderr, "already advertised")
 }
@@ -128,6 +128,49 @@ func TestCmdProxy_PublishesSessionKillTTLOnlyAfterAuditSinkOpens(t *testing.T) {
 	got, err := mr.Get(publishedTTLKey)
 	require.NoError(t, err)
 	require.Equal(t, "1h30m0s", got, "a proxy that never reached the audit-sink success point must not have overwritten the published TTL")
+}
+
+// TestCmdProxy_TransportConditionalFlagRejectionPrecedesEverySideEffect closes the second
+// half of the same ordering bug. Moving the publish after openConfiguredAuditSink was not
+// enough: the transport-conditional flag rejections (--jwks-uri and friends on a stdio
+// host, --session-id on a gateway) still lived inside the serve functions, which run
+// AFTER the Redis dial, the audit key/log creation, and the publish. So a proxy started
+// with one stray flag — the most trivially-fixable startup error there is — still
+// clobbered a running instance's published TTL and minted an audit key/log on its way to
+// dying. Validation now runs with the rest of the flag checks, before any of it.
+func TestCmdProxy_TransportConditionalFlagRejectionPrecedesEverySideEffect(t *testing.T) {
+	mr := miniredis.RunT(t)
+	require.NoError(t, mr.Set(publishedTTLKey, "1h30m0s"))
+
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+	keyPath := filepath.Join(dir, "audit.key")
+
+	var code int
+	stderr := captureStderr(t, func() {
+		code = cmdProxy([]string{
+			"--redis-addr", mr.Addr(),
+			"--killswitch-session-ttl", "-1s", // this instance wants "never expires"
+			"--audit-log", logPath,
+			"--audit-key-path", keyPath,
+			// A stdio host (--audit wiretap) with an HTTP-listener-only flag: rejected.
+			"--jwks-uri", "https://idp.example.com/jwks.json",
+			"--audit", "--", "cat",
+		})
+	})
+
+	require.Equal(t, 1, code, "a flag that cannot take effect under this transport must fail startup")
+	require.Contains(t, stderr, "transport: http")
+
+	got, err := mr.Get(publishedTTLKey)
+	require.NoError(t, err)
+	require.Equal(t, "1h30m0s", got, "a doomed process must not overwrite a running proxy's published session-kill TTL")
+
+	for _, p := range []string{logPath, keyPath} {
+		if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%q was created before the flag rejection fired; validation must precede every side effect (stat err: %v)", p, err)
+		}
+	}
 }
 
 // TestCmdKill_AdoptsPublishedSessionKillTTL is the fix for the two-flag split: with a
@@ -250,7 +293,7 @@ func TestCmdKill_ExpiredPublishedTTL_FallsBackAndSaysSo(t *testing.T) {
 		require.NoError(t, err)
 		ksRedis := backends.ksRedis
 		require.NotNil(t, ksRedis)
-		publishSessionKillTTL(ksRedis)
+		publishSessionKillTTL(context.Background(), ksRedis)
 	})
 	require.NotZero(t, mr.TTL(publishedTTLKey), "precondition: the published key must carry an expiry")
 
@@ -447,7 +490,7 @@ func TestPublishSessionKillTTL_WarnsButDoesNotAbortStartup(t *testing.T) {
 	ksRedis := killswitch.NewRedis(client, killswitch.WithSessionKillTTL(0))
 	mr.Close()
 
-	stderr := captureStderr(t, func() { publishSessionKillTTL(ksRedis) })
+	stderr := captureStderr(t, func() { publishSessionKillTTL(context.Background(), ksRedis) })
 	require.Contains(t, stderr, "WARNING")
 	require.Contains(t, stderr, "--killswitch-session-ttl", "the warning must say what the CLI falls back to")
 }

@@ -245,6 +245,17 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 	// an upstream or consume a session slot — a flood would otherwise spawn unbounded
 	// upstreams. It is handled as a stateless notification below.
 	if msg.Method == mcp.MethodInitialize && sessionID == "" && msg.IsRequest() {
+		// Captured BEFORE the kill gate below, not inside newSession/newRemoteSession.
+		// registerSession rejects a session whose generation is stale, which is what stops a
+		// session established across a global kill's registry sweep from registering into the
+		// fresh map with an upstream the sweep never saw. Capturing it after this gate left a
+		// window — the gate itself does a kill-store round-trip that may do I/O, and a kill
+		// activating and sweeping inside that window yields a startGen EQUAL to the post-sweep
+		// generation, so registerSession sees nothing wrong and admits the session. With no
+		// idle reaper configured (sessionIdleTimeoutMs: 0 is valid) that kill-denied session
+		// then pins a subprocess and a maxSessions slot until the process exits: exactly the
+		// leak the mechanism exists to close.
+		startGen := p.currentReapGen()
 		// Kill-switch check BEFORE spawning anything: a session-creating initialize
 		// must not start an upstream while a global kill (emergency stop) is active.
 		// The empty session id means only the global dimension can match. This is the one
@@ -322,9 +333,9 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 		// this address. Setting it after creation would race the reader goroutine.
 		clientIP := p.sourceIP(r)
 		if route.transport == "http" {
-			sess, err = p.newRemoteSession(initCtx, route, clientIP)
+			sess, err = p.newRemoteSession(initCtx, route, clientIP, startGen)
 		} else {
-			sess, err = p.newSession(initCtx, route, clientIP)
+			sess, err = p.newSession(initCtx, route, clientIP, startGen)
 		}
 		if err != nil {
 			p.writeSessionCreateError(w, r, route, err)
@@ -492,7 +503,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 				return
 			}
 			// An enforced method (tools/call, resources/read, resources/subscribe,
-			// prompts/get) framed as a notification (no id) is a fail-closed reject —
+			// resources/unsubscribe, prompts/get) framed as a notification (no id) is a fail-closed reject —
 			// see denyEnforcedMethodNotification, shared with the stdio transport's
 			// equivalent guard so the check and its audit record cannot drift between
 			// the two transports. Checked before the notify-slot acquisition below: no
@@ -547,6 +558,11 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 			// so the defer fires effectively immediately, without the allocation of an
 			// immediately-invoked closure to scope an inner defer.
 			defer sess.releaseNotifySlot()
+			// Re-arm before the forward, mirroring the enforced-request path: forwarding a
+			// notification to the upstream runs against the entry deadline, so a slow
+			// upstream can leave it past by the time the 202 is written and the client sees
+			// a dropped connection for a notification that was in fact delivered.
+			rearmWriteDeadline(w, p.upstreamTimeMs)
 			sess.forwardNotification(r.Context(), msg)
 		}
 		w.WriteHeader(http.StatusAccepted)
@@ -1035,9 +1051,12 @@ func (p *HTTPProxy) handleMCPDelete(w http.ResponseWriter, r *http.Request, rout
 		// than the absence of one: a caller holding any accepted token learns from a 403
 		// that the id it presented names a live session on this route. It is accepted
 		// because session ids are server-minted UUIDs — unguessable, so the oracle
-		// confirms only ids the caller already has — and because the alternative,
-		// applying the gates before the existence check, would let an UNAUTHENTICATED
-		// caller drive the audience PDP once per probe. A no-pin /
+		// confirms only ids the caller already has. What bounds the probe cost is not the
+		// ordering of the PDP call — the context-only audience verdict is computed BEFORE
+		// the registry lookup, to keep an exported-seam call off the session lock — but the
+		// auth check upstream of this handler, which an unauthenticated caller never gets
+		// past. The ordering that survives here is where the verdict is APPLIED: only once
+		// the session is confirmed to exist and to belong to this route. A no-pin /
 		// --jwt-allow-any-audience route and an unbound (no-JWT) session are no-ops. A DELETE
 		// carries no JSON-RPC envelope, so a refusal is an HTTP 403 plus a transport-tagged
 		// deny record (method/identifier empty), matching the GET refusal convention. The
@@ -1069,6 +1088,13 @@ func (p *HTTPProxy) handleMCPDelete(w http.ResponseWriter, r *http.Request, rout
 		http.Error(w, "session not found", http.StatusNotFound)
 		return
 	}
+	// Re-arm the write deadline around the teardown, mirroring the enforced-request path.
+	// The deadline armed at handler entry is measured from entry, and sess.close waits on
+	// the upstream's termination bounded by --shutdown-timeout: with a budget above the
+	// entry window (~15s and up) the deadline is already past by the time the 204 is
+	// written, so the client sees a dropped connection for a teardown that in fact
+	// succeeded. A fresh window bounds only the client-facing write.
+	rearmWriteDeadlineForTeardown(w, p.shutdownMs)
 	sess.close(p.shutdownMs) //nolint:contextcheck // teardown path: close()'s upstream session-termination DELETE intentionally runs on a detached, bounded background context — binding it to r.Context() would cancel the teardown the instant this 204 is written, leaking the upstream session. Same rationale as the handleMCPDelete dispatch site.
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1151,6 +1177,12 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 		// but a stream opened before the kill is long-lived and would keep delivering
 		// notifications until the idle ceiling. This makes the stop total for the
 		// server->client channel too.
+		// Re-arm the write deadline before the sweep: it waits on EVERY session's close,
+		// each bounded by --shutdown-timeout, so with a non-trivial budget the entry
+		// deadline is long past by the time the success body is written. The operator then
+		// sees `eunox kill` fail on a stop that actually took effect — the worst possible
+		// moment for a misleading result.
+		rearmWriteDeadlineForTeardown(w, p.shutdownMs)
 		p.evictAllSessionStreams()
 		// Proactively tear every session down (close upstreams, free maxSessions slots)
 		// rather than leaving reclamation to the idle reaper, which does not run when
@@ -1172,6 +1204,9 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 	// Recorded before the teardown, same ordering as the global path above.
 	p.recordKillActivated(r, body.SessionID, killDimensionSession)
 	// End this session's open SSE stream(s), same reason as the global path above.
+	// Write deadline re-armed for the same reason as the global path: the teardown below
+	// waits on the session's close, bounded by --shutdown-timeout.
+	rearmWriteDeadlineForTeardown(w, p.shutdownMs)
 	p.evictSessionStreams(body.SessionID)
 	// Proactively tear the killed session down (close its upstream, free its
 	// maxSessions slot) instead of relying on the idle reaper, which does not run when

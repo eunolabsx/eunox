@@ -527,8 +527,15 @@ func ResolveEffect(contract *EffectContract, args map[string]interface{}) *Resol
 				spec = matched.BlastRadius
 			}
 		default:
+			// No case matched and no default row: the fail-closed reading. Every
+			// assertion the base contract made about this call is void, INCLUDING
+			// idempotence — a table that does not cover a value has not said the value is
+			// safe to repeat any more than it has said it is reversible. Leaving
+			// Idempotent set would let a retry-safety claim survive precisely where the
+			// contract stopped describing the call.
 			eff.Class = EffectIrreversible
 			eff.CompensatingAction = ""
+			eff.Idempotent = false
 			spec = nil
 		}
 	}

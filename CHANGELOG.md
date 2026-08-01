@@ -465,6 +465,74 @@ Section conventions:
 
 ### Fixed
 
+- **`resources/unsubscribe` is enforced instead of denied.** It was mapped nowhere, so it
+  fell to the fail-closed default in every mode and no manifest spelling could allow it: a
+  host that subscribed to a permitted resource could never cancel through the proxy, and
+  the upstream kept pushing `notifications/resources/updated` for the rest of the session.
+  Denying it protected nothing — cancelling only reduces data flow. It is now authorized
+  against the same manifest entry as `resources/subscribe` (the `read` action that
+  permitted the subscription permits its cancellation), through a new
+  `PolicyDecisionPoint.DecideResourceCancel` that matches by **name and action alone**:
+  conditions on the entry are not evaluated and no session state is committed. Metering a
+  cancellation would have reintroduced the same dead end through the back door — with
+  `maxCalls: {count: 1}` the subscribe spends the slot and the unsubscribe is then denied
+  `RATE_LIMITED`, so the stream can be opened but never closed — besides recording a
+  `sequenceBlock` antecedent and applying `labelOutput` taint for a request that transfers
+  no data. Kill switch, principal scoping, per-route JWT audience, a token's
+  `mcp.capabilities` allowlist, and the matched entry's own `enforcement: audit` posture all
+  still apply — the last so an observe-mode entry downgrades the cancel exactly as it
+  downgrades the read, rather than hard-blocking the one leg that closes the stream the
+  other leg opened. **Third-party `PolicyDecisionPoint` implementations must add
+  `DecideResourceCancel`.**
+- **The audit-mode banners no longer promise more than the dispatcher delivers.** They
+  claimed "ALL calls are forwarded and logged but NOT blocked", while MCP methods outside
+  the mapped set (`completion/complete`, `logging/setLevel`,
+  `resources/templates/list`, …) stayed hard-denied by the fail-closed default. The
+  banner now names the dispatched set — derived from the routing tables, so it cannot
+  overpromise — and states the caveat. Behavior is unchanged: unmapped-means-deny is
+  load-bearing.
+- **A transport-conditional flag no longer clobbers a running proxy's state on its way to
+  dying.** `--jwks-uri`/`--oauth-*` on a stdio host and `--session-id` on a gateway were
+  rejected inside the serve functions, i.e. after the Redis dial, the audit key/log
+  creation, and the session-kill TTL publish had all happened. One stray flag therefore
+  overwrote another instance's published TTL — the clobber-then-die bug already fixed for
+  the control-token file — and minted an audit key/log for a process about to exit. The
+  rejections now run with the rest of flag validation, before any side effect, and the TTL
+  publish moved into the transports' own ready hooks — the two remaining places a proxy can
+  still fail to come up after that validation passes:
+  - **Gateway:** the publish runs in the post-bind hook, and now runs *after* the
+    control-token write rather than before it. A failed token write aborts startup, so
+    publishing first meant the one startup failure that survives the bind still clobbered a
+    running proxy's TTL. The hook also re-checks its context, so a shutdown landing in the
+    post-bind window publishes nothing.
+  - **Stdio:** the publish runs through the new `StdioProxyOptions.OnReady`, fired inside
+    `Start` once the session is live. It previously ran just *before* `Start`, ahead of that
+    function's own fallible steps — spawning the upstream, the initialize handshake, the
+    drift check — so a missing upstream binary or a refused `descriptionHash` pin still
+    overwrote a running proxy's TTL on the way to exiting.
+- **The effect layer's numeric bounds are covered by the YAML coercion guard.**
+  `blastRadius.max`, a `byArgument` case's `value`, and `effectCeiling.maxBlastRadius`
+  were outside the check that rejects a literal YAML auto-typed away from its written
+  text, so `max: 0600` loaded as an enforced bound of 384.
+- **`policy` and `custom` conditions are validated at load.** A blank or whitespace-only
+  `backend`/`name` resolves to no evaluator and denies every matching call at request
+  time; every other condition whose misconfiguration denies at runtime is rejected at
+  load, and these two had no validation arm at all.
+- **The contract corpus is checked for semantic validity, not just digest consistency.** A
+  digest over nonsense is still a stable digest: an entry with a class outside the closed
+  vocabulary (`safe`), a `compensable` contract naming no compensating action, or a blast
+  radius declaring both a `value` and an `argument` validated and digested cleanly, then
+  failed later at manifest load about a block the author had copied verbatim from the
+  corpus. The effect-contract validators moved to `pkg/capability` (which owns the
+  vocabulary and the digest) and both layers call them.
+- **A `byArgument` case's `compensatingAction` is validated against the inherited class.**
+  A row declaring one under a non-compensable base class loaded clean and then had the
+  field silently scrubbed at resolution, so the author's declared reversal did not exist.
+- **A bare-number `schemaVersion` in a gateway config is diagnosed.** The tolerant version
+  pre-read was string-typed, so `schemaVersion: 0.1` (YAML auto-types it `!!float`) failed
+  it, the error was swallowed, the version gate never ran, and the strict decode reported
+  the whole document with an opaque `cannot unmarshal !!float into string`. The gate now
+  reads the scalar's verbatim text and the error says to quote it.
 - **The process-group teardown signals the direct child first, and only then the
   group.** `os.Process.Kill` consults Go's own reaped-process state, so a call racing a
   completed `cmd.Wait` sends no signal at all; a raw `kill(-pid)` has no such guard and
@@ -751,6 +819,64 @@ Section conventions:
   session establishment forever. All four now share one helper.
 
 ### Security
+
+- **`redactFields` fails closed on a result whose object keys are ambiguous.** The
+  redaction path was the one JSON surface in the codebase without a duplicate-key gate:
+  it decodes an upstream result with `encoding/json` (last key wins) and, when no path
+  matched anything, returns the **original bytes verbatim**. So an upstream answering
+  `{"content":[…],"data":{"ssn":"…"},"data":{}}` under `redactFields: ["data.ssn"]`
+  presented the proxy an empty `data`, redacted nothing, and was forwarded byte-for-byte
+  — rendering the ssn on any first-wins host parser (`JSON.parse`, the Python SDK) while
+  the audit record reported the obligation applied. The same smuggle worked one layer
+  down, inside a JSON text content item, where the envelope never sees those keys at all.
+  Both now run the same streaming key scan the request path and the `*/list` filters
+  apply, and deny the response when it fires: a duplicate key at any depth, or a
+  case-variant collision on a key the redaction depends on resolving — a segment of a
+  redact path (the masking walk looks its segments up exactly) or one of the envelope's
+  protocol-reserved keys (`ApplyRedactObligs` dispatches on those exactly, so `Content`
+  alongside `content` would take the lenient generic walk instead of the content-array
+  pass and its fail-closed resource guard). Case variants of names the obligation does not
+  touch are ordinary data and are not refused; the fold is narrower here than on the
+  request and `*/list` paths because those decode into Go structs, where the decoder's own
+  case-insensitive field matching makes every case-variant sibling a divergence, while the
+  redaction walk decodes into a generic map. The exactly-dispatched set includes a content
+  ITEM's `type` and `text`, not only the envelope keys: `{"type":"text","text":"benign",
+  "Text":"<secret>"}` otherwise left the redactor inspecting the benign body while a
+  case-insensitive consumer rendered the sibling, with nothing matched and the original
+  bytes forwarded.
+- **The audit HMAC key is opened under the symlink guard, and chmod'd through the
+  handle.** The key is the one audit file whose redirection is unrecoverable — the log is
+  HMAC-protected, but whoever chooses the key chooses what verifies — and it was the only
+  audit path read with a plain `os.ReadFile` (which follows symlinks) and re-moded by
+  path (which follows one to its target, with a re-resolution race between the stat and
+  the chmod). It now opens with `RefuseNonRegularPath` + `O_NOFOLLOW` and tightens
+  through the open handle. **Migration:** a key delivered through a projected secret
+  mount (Kubernetes materializes each key as a symlink into a timestamped `..data`
+  directory) must now set `EUNOX_AUDIT_KEY_ALLOW_SYMLINK=1`; the resolved file must still
+  be a regular file either way.
+- **Rotation makes its directory entries durable.** `rotateAttempt` fsynced the rotated
+  file's *data* but neither the rename nor the fresh base's creation, both of which only
+  dirty the parent directory inode in cache. A power loss in that window replays the
+  directory to its pre-rotation state, so the records the fresh base already fsynced sit
+  in blocks nothing references: restart resumes cleanly from the old tail and
+  `audit-verify` passes over a log that silently lost every post-rotation record. No
+  attacker required.
+- **An out-of-vocabulary flow label is an error, not something to drop.**
+  `peekSessionLabels` filtered a stored label outside this build's vocabulary and called
+  it fail-safe. The sink rule is *present and not in `allow` ⇒ deny*, so removing a
+  present label can only **suppress** a denial — reachable when two proxy versions with
+  different vocabularies share one Redis flow store. It now fails closed, matching every
+  sibling path.
+- **`--audit` no longer hides the misconfigurations it exists to find.** `maxCalls`
+  honored the observe-mode quota skip *before* its nil-counter / empty-session /
+  empty-target-name guards, so an audit run recorded ALLOW exactly where enforce mode
+  writes `MISSING_CONTEXT` / `CONDITION_FAILED`. Only the counter increment is skipped
+  now; the structural validation runs in both modes.
+- **A session established across a global kill sweep can no longer register.** The reap
+  generation was captured *after* the pre-spawn kill gate — a gate that itself does a
+  kill-store round-trip — so a kill activating inside that window produced a generation
+  equal to the post-sweep one, and the session registered anyway, pinning an upstream and
+  a `maxSessions` slot with no reaper to collect it when `sessionIdleTimeoutMs` is 0.
 
 - **Exact numeric comparison bounds the literal it parses.** The fix that made
   integer comparison exact above 2^63 (below) reaches `big.Rat.SetString`, whose
