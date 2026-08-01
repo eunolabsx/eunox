@@ -35,7 +35,9 @@ import (
 // object key and passes through unchanged; redactFields redacts cleanly-parseable JSON
 // only and does NOT fail the response closed over string content it cannot parse. It
 // fails closed on a structural/resource guard: an unparseable (or trailing-data)
-// envelope, a structurally unverifiable content array/item shape, the depth bound, or a
+// envelope, an envelope or unwrapped JSON leaf whose object keys duplicate or case-collide
+// (so its decode may differ from what a host renders; see redactionKeysAmbiguous), a
+// structurally unverifiable content array/item shape, the depth bound, or a
 // resource/resource_link content item (whose embedded text/blob body this redactor
 // cannot inspect) — the last so an upstream cannot evade a declared redactFields
 // obligation by embedding the named field inside a resource. image/audio items, which
@@ -97,6 +99,17 @@ func ApplyRedactObligs(resultBytes []byte, obligs []capability.Obligation) ([]by
 	// drop the trailing data on re-marshal.
 	if dec.More() {
 		return nil, fmt.Errorf("redactFields: trailing data after response envelope; cannot verify redaction (fail closed)")
+	}
+	// The decode above resolved every duplicate object key LAST-WINS, and a host is free
+	// to resolve it first-wins. That divergence is a redaction bypass on its own:
+	// {"content":[...],"data":{"ssn":"..."},"data":{}} decodes to an empty `data`, so no
+	// path matches, `changed` stays false, and the ORIGINAL bytes — carrying the ssn — are
+	// returned verbatim below while the audit record reports the obligation applied. The
+	// same rule the request path (mcp.rejectDuplicateJSONKeys) and the list filters
+	// (entryKeysAmbiguous) already apply closes it here: bytes whose decode cannot be
+	// trusted to match what a host renders cannot verify a redaction, so they fail closed.
+	if redactionKeysAmbiguous(resultBytes) {
+		return nil, fmt.Errorf("redactFields: response envelope carries a duplicate or case-variant object key, so its decode may differ from what a host renders; cannot verify redaction (fail closed)")
 	}
 
 	// (1) Redact within each text content item. Any structurally unverifiable shape
@@ -206,6 +219,23 @@ func ApplyRedactObligs(resultBytes []byte, obligs []capability.Obligation) ([]by
 		return nil, fmt.Errorf("redactFields: failed to re-marshal redacted response: %w", err)
 	}
 	return out, nil
+}
+
+// redactionKeysAmbiguous reports whether raw — a result envelope, or a JSON container
+// unwrapped from a string leaf — carries an object key whose decode this redactor cannot
+// trust to match what a host renders: a duplicate key at any depth (Go keeps the last, a
+// first-wins host parser renders the first) or a case-variant collision among the root
+// object's own keys. Either way the value the redaction walk inspected is not the value the
+// host sees, so an active obligation cannot be verified over these bytes.
+//
+// It is the SAME scan the */list entry gate runs (scanJSONKeys, shared with scanToolEntry),
+// with array roots admitted: structuredContent, a sibling key's value, and any
+// doubly-encoded leaf are all legally an array of objects, where a tools/list entry is not.
+// Sharing the scan keeps the fold-vs-exact scoping single-sourced — folding the root
+// object's keys, matching nested keys exactly — so legal case-distinct nested siblings
+// (a schema with both "Name" and "name") stay acceptable on every surface at once.
+func redactionKeysAmbiguous(raw []byte) bool {
+	return scanJSONKeys(raw, true).untrustworthy
 }
 
 // recognizedContentTypes is the set of MCP content-item types this build models.
@@ -326,6 +356,15 @@ func redactContainerString(s string, paths []string, prefix string, depth int) (
 			return s, false, nil // nothing matched at any layer: preserve the original bytes
 		}
 		return finalizeRedactedLeaf(inner)
+	case leafKindAmbiguous:
+		// The leaf decodes to a container whose keys Go and a host can resolve differently
+		// (see redactionKeysAmbiguous). The envelope-level gate cannot see this one: inside
+		// the envelope the leaf is a single JSON string token, so its duplicate keys only
+		// become keys when this function decodes them. Without the check here the identical
+		// smuggle works one layer down — a text item carrying
+		// "{\"data\":{\"ssn\":\"...\"},\"data\":{}}" leaves `changed` false, so the original
+		// string, and then the original envelope, is forwarded verbatim.
+		return "", false, fmt.Errorf("redactFields: nested JSON content carries a duplicate or case-variant object key, so its decode may differ from what a host renders; cannot verify redaction (fail closed)")
 	case leafKindContainer:
 		changed, err = redactStructuredContentValue(decoded, paths, prefix, depth)
 		if err != nil {
@@ -384,14 +423,21 @@ const (
 	// itself decode to a container (or another string layer) and must be recursed into,
 	// not treated as terminal — the fix for the double-encoding fail-open.
 	leafKindString
+	// leafKindAmbiguous is a JSON container whose object keys duplicate or case-collide, so
+	// this redactor's decode of it may differ from what a host renders. It is NOT a
+	// pass-through shape like leafKindOther: the caller fails the whole response closed,
+	// because a container the redactor cannot read the way the host will could be hiding
+	// the very field the obligation names.
+	leafKindAmbiguous
 )
 
 // classifyRedactableLeaf decodes ONE JSON layer of the string s and reports what it found:
 // a redactable container (leafKindContainer, the decoded object/array), a further
 // string-encoding layer (leafKindString, the decoded inner string — the caller must decode
-// it again to reach any container it wraps), or a terminal value (leafKindOther: prose, a
-// genuine scalar, malformed JSON, or JSON embedded in prose) the caller passes through
-// unchanged. redactFields never fails the response closed over string content it cannot
+// it again to reach any container it wraps), a container whose duplicate/case-colliding
+// keys make the decode untrustworthy (leafKindAmbiguous, which the caller fails closed on),
+// or a terminal value (leafKindOther: prose, a genuine scalar, malformed JSON, or JSON
+// embedded in prose) the caller passes through unchanged. redactFields never fails the response closed over string content it cannot
 // parse — it redacts named fields of valid JSON only (see docs/threat-model-mcp.md).
 //
 // Fast-path guard: a string with no '{', no leading '"', and no leading '[' cannot name an
@@ -437,8 +483,18 @@ func classifyRedactableLeaf(s string) (decoded interface{}, kind leafRedactionKi
 	}
 	switch v := val.(type) {
 	case map[string]interface{}, []interface{}:
+		// The decode above collapsed any duplicate key last-wins. Scan the leaf's own bytes
+		// for that (and for a root-level case-variant collision) before the caller acts on
+		// the decoded value: this is the only point where a string becomes a container, so
+		// it is the one place the leaf's raw bytes and their decode are both in hand.
+		if redactionKeysAmbiguous([]byte(trimmed)) {
+			return nil, leafKindAmbiguous
+		}
 		return val, leafKindContainer
 	case string:
+		// A further string-encoding layer carries no keys of its own yet; the recursion
+		// re-enters here with the decoded inner string and scans whatever container it
+		// finally unwraps to.
 		return v, leafKindString
 	default:
 		return nil, leafKindOther // a genuine JSON scalar (number/bool/null): no object key

@@ -271,8 +271,10 @@ func schemaVersionFromNode(node *yaml.Node) (string, bool) {
 
 // forceSchemaVersionToString retags an unquoted top-level `schemaVersion` scalar to
 // !!str so the natural `schemaVersion: 0.1` (which yaml.v3 auto-types as a float)
-// decodes as the string "0.1" and negotiates identically to the quoted form — and to
-// the gateway-config loader, which already preserves the verbatim source text. Without
+// decodes as the string "0.1" and negotiates identically to the quoted form. The
+// gateway-config loader does NOT do this — it decodes strictly from the raw bytes for
+// KnownFields, so it cannot retag in place — and instead rejects a bare-number
+// schemaVersion with an explicit "quote it" error. Without
 // this the number flows through node.Decode → json.Marshal → json.Unmarshal into the
 // string SchemaVersion field and fails with an opaque "cannot unmarshal number into ...
 // string" before validateManifestSchemaVersion can emit its friendly message. Retagging
@@ -334,6 +336,12 @@ var numericPolicyScalarKeys = map[string]bool{
 	"maxLength":     true, // argumentSchema
 	"minItems":      true, // argumentSchema
 	"maxItems":      true, // argumentSchema
+	// The effect layer's three numeric bounds. They carry the identical risk — an
+	// authored `max: 0600` loads as an enforced bound of 384 — and were the only
+	// enforced numbers the walk did not cover.
+	"max":            true, // blastRadius condition bound
+	"value":          true, // blastRadius magnitude (an effect contract's, or a byArgument case's)
+	"maxBlastRadius": true, // effectCeiling magnitude bound
 }
 
 func rejectCoercedValueScalars(n *yaml.Node, isJSON bool) error {
@@ -1100,6 +1108,10 @@ func validateLocalManifest(m *LocalManifest) error {
 				})
 			case capability.BlastRadiusCondition, *capability.BlastRadiusCondition:
 				err = validateTypedCondition(i, j, cond, validateBlastRadius)
+			case capability.PolicyCondition, *capability.PolicyCondition:
+				err = validateTypedCondition(i, j, cond, validatePolicyCondition)
+			case capability.CustomCondition, *capability.CustomCondition:
+				err = validateTypedCondition(i, j, cond, validateCustomCondition)
 			}
 			if err != nil {
 				return err
@@ -1580,6 +1592,33 @@ func validateTimeWindow(i, j int, v *capability.TimeWindowCondition) error {
 	}
 	if v.NotBefore != "" && v.NotAfter != "" && !notBefore.Before(notAfter) {
 		return fmt.Errorf("capability at index %d, condition %d: timeWindow notBefore %q is not before notAfter %q; the window is empty and denies every call", i, j, v.NotBefore, v.NotAfter)
+	}
+	return nil
+}
+
+// validatePolicyCondition rejects a policy condition with no backend name. The engine
+// resolves the evaluator by name at request time and denies (fail closed) when nothing is
+// registered under it, so a blank or whitespace-only backend is a silent deny-all with no
+// load-time signal at all — the author sees a valid-looking policy and a runtime where
+// every matching call is refused. Every other condition whose misconfiguration denies at
+// runtime is rejected at load; policy and custom were the only two with no arm.
+//
+// The backend's EXISTENCE is deliberately not checked: evaluators are registered by the
+// embedding program, possibly after the manifest loads, so requiring registration here
+// would reject a legitimate wiring order. Requiring a NAME does not.
+func validatePolicyCondition(i, j int, v *capability.PolicyCondition) error {
+	if strings.TrimSpace(v.Backend) == "" {
+		return fmt.Errorf("capability at index %d, condition %d: policy requires a non-empty 'backend' naming the external policy evaluator (e.g. opa, cedar); an unnamed backend resolves to no evaluator and denies every matching call at request time", i, j)
+	}
+	return nil
+}
+
+// validateCustomCondition rejects a custom condition with no handler name, for the same
+// reason as validatePolicyCondition: the name is the key the handler registry is looked up
+// by, so a blank one denies every matching call at request time with nothing said at load.
+func validateCustomCondition(i, j int, v *capability.CustomCondition) error {
+	if strings.TrimSpace(v.Name) == "" {
+		return fmt.Errorf("capability at index %d, condition %d: custom requires a non-empty 'name' naming the registered condition handler; an unnamed handler resolves to nothing and denies every matching call at request time", i, j)
 	}
 	return nil
 }

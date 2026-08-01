@@ -302,7 +302,7 @@ func registerProxyFlags(fs *flag.FlagSet) *proxyCLIFlags {
 		"Set with '=': --require-audit=off (a bare --require-audit means 'strict').")
 	f := &proxyCLIFlags{
 		configPath:           fs.String("config", "", "Path to the eunox config file (YAML). Declares the host transport,\nupstream(s), per-route policy, listen settings, and audit tape.\nSee schemas/eunox-gateway-config.schema.json."),
-		audit:                fs.Bool("audit", false, "Zero-config wiretap mode: bridge stdin/stdout to the upstream named after `--`\n(or to --upstream-url). Enforced-method calls (tools/call, resources/read, resources/subscribe,\nprompts/get, sampling/createMessage) are forwarded and recorded without applying policy.\n…/list calls forward the full upstream catalog unfiltered (no policy is applied) and\nare recorded as enumeration events; only the kill switch still hard-blocks.\nRecorded tool-call arguments may contain secrets; treat the audit log as sensitive.\nMutually exclusive with --config."),
+		audit:                fs.Bool("audit", false, "Zero-config wiretap mode: bridge stdin/stdout to the upstream named after `--`\n(or to --upstream-url). Enforced-method calls (tools/call, resources/read,\nresources/subscribe, resources/unsubscribe, prompts/get, sampling/createMessage) are forwarded and recorded without applying policy.\n…/list calls forward the full upstream catalog unfiltered (no policy is applied) and\nare recorded as enumeration events; only the kill switch still hard-blocks.\nRecorded tool-call arguments may contain secrets; treat the audit log as sensitive.\nMutually exclusive with --config."),
 		wiretapURL:           fs.String("upstream-url", "", "HTTP upstream URL for --audit mode (alternative to a `--` subprocess)."),
 		wiretapAuthHeader:    fs.String("upstream-auth-header", "", `HTTP upstream auth header for --audit mode, "Name: Value".`),
 		wiretapTLSSkipVerify: fs.Bool("upstream-tls-skip-verify", false, "Skip TLS verification for --audit --upstream-url (development only)."),
@@ -537,6 +537,18 @@ func cmdProxy(args []string) (exitCode int) {
 		return 1
 	}
 
+	// Reject a flag that cannot take effect under the configured host transport
+	// (--jwks-uri/--oauth-* and the HTTP-listener flags on stdio; --session-id on a
+	// gateway). Checked HERE, with the rest of the flag validation and before the first
+	// side effect, for the same reason as the two guards around it — cfg.HostTransport()
+	// is already known, and these rejections previously sat inside the serve functions,
+	// where they only fired after the Redis dial, the audit key/log creation, and the
+	// session-kill TTL publish had all already happened.
+	if err := validateTransportConditionalFlags(cfg.HostTransport(), pf); err != nil {
+		fmt.Fprintf(os.Stderr, "[eunox] Fatal: %v\n", err)
+		return 1
+	}
+
 	// Fail closed if a Redis-only flag (--killswitch-fail-open, --redis-password, …) was
 	// set without --redis-addr: those configure the Redis-backed counter/kill switch that
 	// is never built without the backend, so the operator's intent would silently
@@ -605,8 +617,19 @@ func cmdProxy(args []string) (exitCode int) {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
+	// stopSigWatch releases the relay goroutine on a signal-LESS return. It blocks on a
+	// channel nothing will ever send to once signal.Stop has un-registered the relay, so
+	// without this every in-process cmdProxy call leaks one goroutine for the life of the
+	// process — invisible in the binary (which exits), not in a host embedding this. Same
+	// pattern the live-upstream probe already uses for its own relay.
+	stopSigWatch := make(chan struct{})
+	defer close(stopSigWatch)
 	go func() {
-		<-sigCh
+		select {
+		case <-sigCh:
+		case <-stopSigWatch:
+			return
+		}
 		cancel()
 		// Stop relaying SIGINT/SIGTERM into sigCh once the first one has triggered
 		// graceful shutdown: this goroutine only ever reads once, so without this a
@@ -620,17 +643,18 @@ func cmdProxy(args []string) (exitCode int) {
 		signal.Stop(sigCh)
 	}()
 
+	// The effective session-kill TTL is published to shared Redis by the ready hook the
+	// serve functions invoke once their transport is standing (post-bind for the gateway,
+	// immediately pre-Start for stdio), NOT here. The write overwrites whatever another
+	// instance published, so a process that dies during construction — a rejected flag, a
+	// BuildRoutes failure, a bind collision — must not have written it: `eunox kill` and
+	// this proxy's own diagnostics would be left trusting a lifetime nothing enforces.
+	// That is the same clobber-then-die bug already fixed once for the control-token file,
+	// and it is why this deliberately runs LAST rather than merely after the fallible
+	// startup steps that happen to precede this line.
+	onServeReady := func() {}
 	if ksRedis != nil {
-		// Publish the effective session-kill TTL here, not from
-		// buildCallCounterAndKillSwitch: everything that can still fail this process's
-		// startup and exit it (JWT/Redis flag validation, the Redis ping, opening the
-		// audit sink) has already run and succeeded by this point. Publishing any
-		// earlier risks the same bug already fixed once for the control-token file — a
-		// second, differently-configured instance overwrites a running proxy's
-		// published value and then dies before serving a single request, leaving
-		// `eunox kill` and this proxy's own diagnostics trusting a lifetime nothing is
-		// actually enforcing.
-		publishSessionKillTTL(ksRedis)
+		onServeReady = func() { publishSessionKillTTL(ksRedis) }
 		ksRedis.Start(ctx)
 		// Join the Redis kill-switch's pub/sub listener and reconcile loop on
 		// shutdown; otherwise they outlive cmdProxy and may touch the shared Redis
@@ -645,9 +669,9 @@ func cmdProxy(args []string) (exitCode int) {
 	var serveErr error
 	switch cfg.HostTransport() {
 	case config.HostTransportStdio:
-		serveErr = serveStdioHost(ctx, cfg, sink, counter, flowStore, ks, pf)
+		serveErr = serveStdioHost(ctx, cfg, sink, counter, flowStore, ks, pf, onServeReady)
 	default: // config.HostTransportHTTP
-		serveErr = serveHTTPGateway(ctx, cfg, sink, counter, flowStore, ks, pf)
+		serveErr = serveHTTPGateway(ctx, cfg, sink, counter, flowStore, ks, pf, onServeReady)
 	}
 	if serveErr != nil {
 		fmt.Fprintf(os.Stderr, "[eunox] Fatal: %v\n", serveErr)
@@ -1066,10 +1090,60 @@ var httpOnlyProxyFlags = []string{
 }
 
 // httpOnlyFlagsSetOnStdio returns the "--"-prefixed names of every
-// httpOnlyProxyFlags flag the operator activated, for serveStdioHost's rejection
-// guard.
+// httpOnlyProxyFlags flag the operator activated, for the transport-conditional
+// rejection guard.
 func httpOnlyFlagsSetOnStdio(fs *flag.FlagSet) []string {
 	return explicitlyActiveFlags(fs, httpOnlyProxyFlags)
+}
+
+// validateTransportConditionalFlags rejects flags that cannot take effect under the
+// configured host transport. Every one of them is a silent no-op otherwise, which would
+// let an operator believe a security-relevant setting (JWT validation, a fixed session ID,
+// a control-token path) took effect when nothing reads it.
+//
+// It runs from cmdProxy the moment the transport is known — right after the config loads,
+// BEFORE the Redis dial, the audit key/log creation, and the session-kill TTL publish.
+// These checks used to live inside the serve functions, i.e. after all of that: a doomed
+// process (one stray flag) still dialed Redis, minted or opened an audit log, and
+// published its TTL over a running proxy's value before failing. Validation belongs before
+// side effects; cmdProxy's own comment already claimed this ordering, and this is what
+// makes the claim true for the transport-conditional half.
+func validateTransportConditionalFlags(hostTransport string, pf proxyFlags) error { //nolint:gocritic // hugeParam: pf is a small flag bundle
+	if hostTransport == config.HostTransportHTTP {
+		// --session-id is a stdio-only concept (a gateway mints its own Mcp-Session-Id
+		// per client session, per-route). pf.sessionIDSet (not pf.sessionID, which is
+		// never empty — cmdProxy falls back to a fresh UUID when the flag is unset)
+		// tracks whether the operator actually passed it.
+		if pf.sessionIDSet {
+			return fmt.Errorf("--session-id requires transport: stdio (a gateway mints its own Mcp-Session-Id per client session)")
+		}
+		return nil
+	}
+	// JWT validation and OAuth metadata are HTTP-listener concerns; a stdio host
+	// has no socket on which to serve them.
+	if pf.jwksURI != "" {
+		return fmt.Errorf("--jwks-uri requires transport: http (a stdio host has no HTTP listener)")
+	}
+	if pf.oauthResource != "" {
+		return fmt.Errorf("--oauth-resource requires transport: http (a stdio host has no HTTP listener)")
+	}
+	// --oauth-authorization-server only feeds the RFC 9728 metadata document, which is
+	// served on the HTTP listener; on stdio it would be a silent no-op, so fail closed
+	// like its siblings above rather than ignore it.
+	if pf.oauthAuthzServer != "" {
+		return fmt.Errorf("--oauth-authorization-server requires transport: http (a stdio host has no HTTP listener)")
+	}
+	// Every other HTTP-only flag (--control-token-path, --session-idle-timeout,
+	// --max-sessions, --unsafe-bind-all, --trust-forwarded-for): all configure the
+	// HTTP listener this stdio host does not stand up, so — like --jwks-uri and
+	// the --oauth-* flags above — silently accepting them would let an operator
+	// believe they took effect. httpOnlyFlagsSetOnStdio (precomputed into
+	// pf.httpOnlyFlagsSet) is the single source of truth for this list, so a
+	// future HTTP-only flag added there is covered automatically.
+	if len(pf.httpOnlyFlagsSet) > 0 {
+		return fmt.Errorf("%s requires transport: http (a stdio host has no HTTP listener)", strings.Join(pf.httpOnlyFlagsSet, ", "))
+	}
+	return nil
 }
 
 // redisGatedFlags is the single authoritative list of proxy flags that take effect
@@ -1518,16 +1592,7 @@ func resolveOAuthMetadata(cfg *config.GatewayConfig, pf proxyFlags) (*transport.
 
 // serveHTTPGateway serves cfg's upstreams over an HTTP listener, one /mcp/<name>
 // route each (the gateway shape).
-func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audit.Sink, counter capability.CallCounter, flowStore capability.FlowLabelStore, ks killswitch.Manager, pf proxyFlags) error { //nolint:gocritic // hugeParam: pf is a small flag bundle
-	// --session-id is a stdio-only concept (a gateway mints its own Mcp-Session-Id
-	// per client session, per-route); silently ignoring it here would let an
-	// operator believe a fixed session ID took effect. Fail closed rather than
-	// no-op, mirroring serveStdioHost's HTTP-only-flag rejections. pf.sessionIDSet
-	// (not pf.sessionID, which is never empty — cmdProxy falls back to a fresh
-	// UUID when the flag is unset) tracks whether the operator actually passed it.
-	if pf.sessionIDSet {
-		return fmt.Errorf("--session-id requires transport: stdio (a gateway mints its own Mcp-Session-Id per client session)")
-	}
+func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audit.Sink, counter capability.CallCounter, flowStore capability.FlowLabelStore, ks killswitch.Manager, pf proxyFlags, onServeReady func()) error { //nolint:gocritic // hugeParam: pf is a small flag bundle
 	// drift.MakeDriftCheck is passed as the per-route hook factory; BuildRoutes
 	// wires it inside, so this layer never reaches into route internals.
 	routes, err := transport.BuildRoutes(cfg, sink, counter, flowStore, ks, pf.strictDrift, drift.MakeDriftCheck)
@@ -1704,6 +1769,13 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 	// HTTPGatewayOptions.AfterListen), so only the needed path should outlive that.
 	controlTokenPath := pf.controlTokenPath
 	writeControlToken := func(ctx context.Context) error {
+		// The session-kill TTL publish shares this hook for the same reason the token
+		// write is in it: both overwrite shared, last-writer-wins state that `eunox kill`
+		// then trusts, so neither may be performed by a process that never reaches the
+		// accept loop (a bind collision being the concrete case). Published first because
+		// it only warns on failure, so the token write still runs; a failed token write
+		// aborts startup, and this proxy's TTL is the one actually in force by then.
+		onServeReady()
 		controlTokenFile, werr := transport.WriteControlTokenFile(ctx, controlTokenPath, controlToken)
 		if werr != nil {
 			return fmt.Errorf("kill control endpoint: %w", werr)
@@ -1741,32 +1813,7 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 // serveStdioHost serves cfg's single upstream over stdin/stdout (the stdio host
 // shape). The upstream is a subprocess (transport: stdio) or a remote HTTP server
 // (transport: http).
-func serveStdioHost(ctx context.Context, cfg *config.GatewayConfig, sink *audit.Sink, counter capability.CallCounter, flowStore capability.FlowLabelStore, ks killswitch.Manager, pf proxyFlags) error { //nolint:gocritic // hugeParam: pf is a small flag bundle
-	// JWT validation and OAuth metadata are HTTP-listener concerns; a stdio host
-	// has no socket on which to serve them.
-	if pf.jwksURI != "" {
-		return fmt.Errorf("--jwks-uri requires transport: http (a stdio host has no HTTP listener)")
-	}
-	if pf.oauthResource != "" {
-		return fmt.Errorf("--oauth-resource requires transport: http (a stdio host has no HTTP listener)")
-	}
-	// --oauth-authorization-server only feeds the RFC 9728 metadata document, which is
-	// served on the HTTP listener; on stdio it would be a silent no-op, so fail closed
-	// like its siblings above rather than ignore it.
-	if pf.oauthAuthzServer != "" {
-		return fmt.Errorf("--oauth-authorization-server requires transport: http (a stdio host has no HTTP listener)")
-	}
-	// Every other HTTP-only flag (--control-token-path, --session-idle-timeout,
-	// --max-sessions, --unsafe-bind-all, --trust-forwarded-for): all configure the
-	// HTTP listener this stdio host does not stand up, so — like --jwks-uri and
-	// the --oauth-* flags above — silently accepting them would let an operator
-	// believe they took effect. httpOnlyFlagsSetOnStdio (precomputed into
-	// pf.httpOnlyFlagsSet) is the single source of truth for this list, so a
-	// future HTTP-only flag added there is covered automatically.
-	if len(pf.httpOnlyFlagsSet) > 0 {
-		return fmt.Errorf("%s requires transport: http (a stdio host has no HTTP listener)", strings.Join(pf.httpOnlyFlagsSet, ", "))
-	}
-
+func serveStdioHost(ctx context.Context, cfg *config.GatewayConfig, sink *audit.Sink, counter capability.CallCounter, flowStore capability.FlowLabelStore, ks killswitch.Manager, pf proxyFlags, onServeReady func()) error { //nolint:gocritic // hugeParam: pf is a small flag bundle
 	u := &cfg.Upstreams[0] // validate() guarantees exactly one upstream for transport: stdio
 	auditMode := cfg.AuditModeFor(u)
 
@@ -1831,6 +1878,10 @@ func serveStdioHost(ctx context.Context, cfg *config.GatewayConfig, sink *audit.
 		HonorAttribution: manifest.HonorsAttributionInterface(),
 		DriftCheck:       drift.MakeDriftCheck(manifest, strictDrift),
 	})
+	// The stdio host has no bind step, so its ready point is here: every fallible
+	// construction step (policy load, PDP wiring, drift-check setup) has run, and nothing
+	// between this line and Start can fail. See cmdProxy's onServeReady.
+	onServeReady()
 	return proxy.Start(ctx)
 }
 

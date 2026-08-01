@@ -206,11 +206,9 @@ func (s *httpSession) mcpEndpointURL() string {
 // newRemoteSession creates a client session backed by the configured remote HTTP
 // upstream: it performs the initialize handshake, stores the upstream session ID,
 // and registers the session in p.sessions.
-func (p *HTTPProxy) newRemoteSession(ctx context.Context, route *UpstreamRoute, clientIP string) (*httpSession, error) {
-	// Captured BEFORE the (possibly slow) remote handshake below, so registerSession
-	// can detect a global kill's reapAllKilledSessions sweeping the registry during
-	// that window — see the reapGen field comment.
-	startGen := p.currentReapGen()
+// startGen is the reap generation the CALLER observed before its pre-spawn kill gate (see
+// handleMCPPost and newSession).
+func (p *HTTPProxy) newRemoteSession(ctx context.Context, route *UpstreamRoute, clientIP string, startGen uint64) (*httpSession, error) {
 	// Share the route's single *http.Transport (connection pool) across sessions so a
 	// session-creating initialize reuses a warm TCP/TLS connection instead of paying a
 	// fresh handshake; the *http.Client wrapper is per-session but cheap.

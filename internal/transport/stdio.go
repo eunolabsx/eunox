@@ -378,6 +378,14 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 				// JWT_INVALID fixed-code-not-free-form-prose discipline. p.rec() is nil when
 				// no audit sink is configured (guard, as elsewhere).
 				recordDriftRefused(ctx, p.rec(), p.sessionID)
+				// Release the per-session Tier-2 state the baseline above just recorded.
+				// The inline comment there says "ReleaseSession clears it on teardown
+				// either way", and on THIS path it did not: a startup refusal returns
+				// straight out of Start, so nothing ever released it. Harmless for the
+				// binary (the process exits), but StdioProxy is an exported seam, and an
+				// embedder that recovers from a refused start and retries would accumulate
+				// baselines keyed by session id for the life of its process.
+				p.pdp.ReleaseSession(ctx, p.sessionID)
 				return err
 			}
 		}
@@ -982,6 +990,14 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 				_ = p.hostWriter.Write(mcp.ErrorResponse(mcp.RawJSON("null"), jsonRPCCodeParseError, "Parse error"))
 				continue
 			}
+			// A terminal host read error ends the session. EOF is the ordinary
+			// host-closed-stdin case and stays silent; anything else — a 4 MiB
+			// bufio.ErrTooLong, an I/O fault — is a session that died mid-stream for a
+			// reason the operator cannot otherwise see, since this leg wrote nothing at
+			// all. readUpstream already logs the same class from the other direction.
+			if !errors.Is(r.err, io.EOF) {
+				fmt.Fprintf(os.Stderr, "[eunox] host read error: %v; ending session\n", r.err)
+			}
 			break // host stdin closed (EOF) or an unrecoverable read error
 		}
 		msg := r.msg
@@ -1136,7 +1152,7 @@ func (p *StdioProxy) forwardHostNotification(ctx context.Context, msg mcp.RPCMsg
 		return false
 	}
 	// An enforced method (tools/call, resources/read, resources/subscribe,
-	// prompts/get) framed as a notification (no id) is a fail-closed reject —
+	// resources/unsubscribe, prompts/get) framed as a notification (no id) is a fail-closed reject —
 	// see denyEnforcedMethodNotification, shared with the HTTP transport's
 	// equivalent guard so the check and its audit record cannot drift between
 	// the two transports.

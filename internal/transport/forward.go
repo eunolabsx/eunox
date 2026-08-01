@@ -456,7 +456,7 @@ func isObserveDeny(denial *capability.DenialInfo, auditMode, auditOnly bool) boo
 
 // enforcedForwardCore is the shared deny/observe/forward/record decision both
 // transports apply to every enforced method (tools/call, resources/read,
-// resources/subscribe, prompts/get). It returns the JSON-RPC message to deliver
+// resources/subscribe, resources/unsubscribe, prompts/get). It returns the JSON-RPC message to deliver
 // to the host — a denial, an upstream transport error, or the upstream's
 // (possibly redacted) response. The transports differ only in delivery.
 //
@@ -469,8 +469,8 @@ func isObserveDeny(denial *capability.DenialInfo, auditMode, auditOnly bool) boo
 //
 // allowDetails computes the allow record's structured details (resources/prompts
 // pass upstreamErrorDetail; tools/call passes its audit-mode argument map).
-// recordObligations controls whether obligation tokens are recorded (resources/subscribe
-// records none).
+// recordObligations controls whether obligation tokens are recorded (the two
+// resources/(un)subscribe legs record none).
 func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, dec capability.EnforceResponse, method, auditID, denialTarget, kind string, recordObligations bool, allowDetails func(mcp.RPCMsg) map[string]interface{}) mcp.RPCMsg {
 	observe := false
 	var denial *capability.DenialInfo // set on the deny path; reused by the observe branch below

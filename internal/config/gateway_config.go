@@ -358,6 +358,25 @@ func errIfBinaryConfig(kind, path string, data []byte) error {
 	return nil
 }
 
+// gatewaySchemaVersionFromRaw reads the top-level schemaVersion scalar's VERBATIM text
+// from raw, plus whether it was written as a bare number (an unquoted 0.1, which YAML
+// auto-types !!float). Verbatim matters: "0.10" must stay "0.10" and not renormalize to
+// "0.1", which is a different grammar version. Returns "" when the document does not parse
+// as YAML at all or carries no schemaVersion — the caller's strict decode then reports the
+// syntax error with its own path-qualified message, and an absent version is handled by
+// the version validator.
+func gatewaySchemaVersionFromRaw(raw []byte) (version string, numeric, parsed bool) {
+	var node yaml.Node
+	if err := yaml.Unmarshal(raw, &node); err != nil {
+		return "", false, false
+	}
+	val := topLevelValueNode(&node, "schemaVersion")
+	if val == nil || val.Kind != yaml.ScalarNode {
+		return "", false, true
+	}
+	return val.Value, val.Tag == "!!int" || val.Tag == "!!float", true
+}
+
 // LoadGatewayConfig reads, parses, env-expands, and validates a gateway config.
 // ${VAR}/$VAR references are expanded from the environment AFTER parsing — on the
 // decoded string values, not the raw text — so secrets need not be committed yet
@@ -383,13 +402,28 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	// schemaVersion in a document the strict decode would reject outright. A document
 	// that will not parse as YAML at all falls through to the strict decode, which
 	// reports the syntax error with its own path-qualified message.
-	var versionProbe struct {
-		SchemaVersion string `yaml:"schemaVersion"`
-	}
-	if err := yaml.Unmarshal(raw, &versionProbe); err == nil {
-		if err := validateGatewaySchemaVersion(versionProbe.SchemaVersion); err != nil {
+	// Read the value from the NODE, not through a `string`-typed probe struct. An
+	// unquoted `schemaVersion: 0.1` is auto-typed !!float by YAML, so a string-typed
+	// decode of it fails — and the tolerant probe then swallowed that error, skipping the
+	// version gate entirely and leaving the strict decode below to report the whole
+	// document with an opaque "cannot unmarshal !!float into string". The node carries the
+	// scalar's verbatim text regardless of tag, so the gate runs either way.
+	version, numericVersion, parsed := gatewaySchemaVersionFromRaw(raw)
+	if parsed {
+		if err := validateGatewaySchemaVersion(version); err != nil {
 			return nil, fmt.Errorf("invalid gateway config %q: %w", path, err)
 		}
+	}
+	// A document that does not parse as YAML at all falls through to the strict decode,
+	// which reports the syntax error with its own path-qualified message.
+	if numericVersion {
+		// The version is one this binary speaks, but it is spelled as a bare number, which
+		// the strict decode below cannot put in a string field. Say so here rather than
+		// letting that decode report a type error about a line the operator wrote in the
+		// most natural way. (The manifest loader instead retags the scalar in place; it
+		// decodes through a yaml.Node, where this loader needs the Decoder's KnownFields
+		// strictness and so must decode from the raw bytes.)
+		return nil, fmt.Errorf("invalid gateway config %q: schemaVersion %s must be quoted (schemaVersion: %q) — YAML reads a bare %s as a number, which is not a version string", path, version, version, version)
 	}
 
 	// Decode strictly: unknown keys are an error, so a typo'd field (e.g.

@@ -243,8 +243,11 @@ func PrintRoutePolicyNotices(w io.Writer, name, routePath string, auditOnlyCount
 	}
 	if auditMode {
 		_, _ = fmt.Fprintf(w,
-			"[eunox] AUDIT MODE: upstream %q%s runs in observe mode — its policy is evaluated but NOT enforced; ALL calls are forwarded and logged.\n",
-			name, mount)
+			"[eunox] AUDIT MODE: upstream %q%s runs in observe mode — its policy is evaluated but NOT enforced; every call eunox dispatches (%s) is forwarded and logged.\n",
+			name, mount, dispatchedMethodSummary)
+		_, _ = fmt.Fprintf(w,
+			"[eunox] AUDIT MODE: upstream %q%s — observe mode does NOT lift the fail-closed default: an MCP method outside that set (%s) is still denied and recorded, and the kill switch still hard-blocks.\n",
+			name, mount, unmappedMethodExamples)
 	}
 }
 
@@ -332,12 +335,13 @@ func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability
 
 		if manifest == nil {
 			// No policy but explicit enforcement: audit (the guard above rejected
-			// no-policy-without-audit). Wiretap mode: every call forwarded and
-			// logged, none blocked. Surface the open posture loudly (the AUDIT MODE
-			// banner already fired above; this adds the "no policy / wiretap" specifics).
+			// no-policy-without-audit). Wiretap mode: every DISPATCHED call forwarded and
+			// logged, none blocked on policy grounds. Surface the open posture loudly (the
+			// AUDIT MODE banner already fired above, including the fail-closed-default
+			// caveat; this adds the "no policy / wiretap" specifics).
 			fmt.Fprintf(os.Stderr,
 				"[eunox] NOTICE: upstream %q has no policy and runs in AUDIT mode on /mcp/%s — "+
-					"ALL calls are forwarded and logged but NOT blocked (wiretap).\n",
+					"every dispatched call is forwarded and logged, none blocked by policy (wiretap).\n",
 				u.Name, u.Name)
 		}
 

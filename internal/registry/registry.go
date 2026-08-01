@@ -157,6 +157,18 @@ func (c *Contract) Validate() error {
 	if c.Effect.Ref != "" {
 		return fmt.Errorf("contract %q: the 'effect' block must not carry its own 'ref' — a corpus entry IS the thing a ref points at, and a self-reference is excluded from the digest", c.ID)
 	}
+	// The contract must be SEMANTICALLY valid, not merely digest-consistent. A digest over
+	// nonsense is still a stable digest: an entry with a class typo ("reversable"), a
+	// compensable contract naming no compensating action, or a blast radius declaring both
+	// a value and an argument used to validate and digest cleanly here, so the corpus — the
+	// artifact whose whole purpose is to be reviewable and pinnable — was not
+	// machine-reviewable at all, and the mistake surfaced later as a confusing manifest-load
+	// error about a block the author had copied verbatim from it. These are the SAME rules
+	// the manifest loader applies (they live in pkg/capability, which owns the vocabulary
+	// and the digest), so the two layers cannot disagree about what a valid contract is.
+	if err := capability.ValidateEffectContract(c.Effect); err != nil {
+		return fmt.Errorf("contract %q: %w", c.ID, err)
+	}
 	actual, err := capability.EffectContractDigest(c.Effect)
 	if err != nil {
 		return fmt.Errorf("contract %q: %w", c.ID, err)

@@ -342,11 +342,11 @@ func (s *httpSession) ownerMismatch(cur *pdp.JWTClaims) bool {
 // newSession spawns an upstream subprocess and performs the MCP initialize
 // handshake. The session is registered in p.sessions before readUpstream starts so
 // the cleanup goroutine finds it even if the subprocess exits immediately.
-func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, clientIP string) (*httpSession, error) {
-	// Captured BEFORE the (possibly slow) subprocess spawn + handshake below, so
-	// registerSession can detect a global kill's reapAllKilledSessions sweeping the
-	// registry during that window — see the reapGen field comment.
-	startGen := p.currentReapGen()
+// startGen is the reap generation the CALLER observed before its pre-spawn kill gate (see
+// handleMCPPost); it is not captured here, because everything between that gate and this
+// point — the gate's own kill-store round-trip included — is inside the window
+// registerSession has to detect.
+func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, clientIP string, startGen uint64) (*httpSession, error) {
 	// Session-scoped teardown context, mirroring newRemoteSession so both transports share
 	// one cancellation primitive. Built into the struct literal BEFORE registerSession
 	// publishes the session into p.sessions, so a concurrent close() (server shutdown / kill)
@@ -1298,7 +1298,12 @@ func releaseSessionState(sess *httpSession) {
 	if sess.route == nil {
 		return
 	}
-	budget := msToDuration(sess.proxy.shutdownMs)
+	// shutdownBudget, not a second inline derivation: it is the nil-proxy-safe,
+	// zero-means-default clamp this file already defines, and re-deriving it here
+	// dereferenced sess.proxy unconditionally (a nil-proxy test session panics) and read
+	// shutdownMs <= 0 as "wait zero time" — a teardown that skips the in-flight drain
+	// entirely, which is the fail-open the drain exists to close.
+	budget := sess.shutdownBudget()
 	sess.awaitInFlightDrained(budget)
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()

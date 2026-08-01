@@ -2367,7 +2367,7 @@ func TestServeHTTPGateway_AuthTokenAndJWKSMutuallyExclusive(t *testing.T) {
 	pf := proxyFlags{jwksURI: "https://idp.example/jwks", jwtAllowAnyAudience: true, jwtAllowAnyIssuer: true}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err := serveHTTPGateway(ctx, cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), pf)
+	err := serveHTTPGateway(ctx, cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), pf, func() {})
 	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
 		t.Fatalf("expected mutual-exclusivity error for authToken + jwks-uri, got %v", err)
 	}

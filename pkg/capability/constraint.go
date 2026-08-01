@@ -52,10 +52,11 @@ const (
 // method names above, so every consumer (internal/audit, internal/transport,
 // internal/pdp) switches on the SAME constants and cannot silently diverge.
 const (
-	MethodToolsCall          = "tools/call"
-	MethodResourcesRead      = "resources/read"
-	MethodResourcesSubscribe = "resources/subscribe"
-	MethodPromptsGet         = "prompts/get"
+	MethodToolsCall            = "tools/call"
+	MethodResourcesRead        = "resources/read"
+	MethodResourcesSubscribe   = "resources/subscribe"
+	MethodResourcesUnsubscribe = "resources/unsubscribe"
+	MethodPromptsGet           = "prompts/get"
 )
 
 // MethodTargetType maps an MCP method name to its TargetType. It is the single
@@ -68,7 +69,7 @@ func MethodTargetType(method string) (TargetType, bool) {
 	switch method {
 	case MethodToolsCall, MethodToolsList:
 		return TargetTypeTool, true
-	case MethodResourcesRead, MethodResourcesSubscribe, MethodResourcesList:
+	case MethodResourcesRead, MethodResourcesSubscribe, MethodResourcesUnsubscribe, MethodResourcesList:
 		return TargetTypeResource, true
 	case MethodPromptsGet, MethodPromptsList:
 		return TargetTypePrompt, true

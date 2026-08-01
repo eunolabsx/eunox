@@ -304,6 +304,16 @@ func LogChainFiles(logPath string) ([]string, error) {
 // ("rotated fd" vs "fallback fd").
 func (s *Sink) swapToFreshBase(f *os.File, closeErrContext string) {
 	tightenLogMode(f, s.logPath)
+	// Make the fresh base's DIRECTORY ENTRY durable, not just its (empty) data. Creating
+	// a file only dirties the parent directory inode in cache, so a power loss here can
+	// replay the directory back to its pre-rotation state: the records this fd goes on to
+	// fsync land in blocks nothing references, restart resumes cleanly from the old tail,
+	// and audit-verify passes over a log that silently lost every post-rotation record.
+	// This is the same hazard, and the same fix, the key-file publish documents — the
+	// rotation path was simply the one place that fsynced data without ever fsyncing the
+	// directory. Best-effort with a warning: a filesystem that refuses directory fsync
+	// must not wedge rotation.
+	syncDirFn(filepath.Dir(s.logPath), "audit log")
 	if cerr := s.f.Close(); cerr != nil {
 		s.writeFailures.Add(1)
 		fmt.Fprintf(os.Stderr, "[eunox] audit rotate error (close of %s): %v\n", closeErrContext, cerr)
@@ -411,6 +421,13 @@ func (s *Sink) rotateAttempt() string {
 		s.written = s.rotateBackoffWritten()
 		return fmt.Sprintf("could not rename the active log %q to %q: %v", s.activePath, rotated, err)
 	}
+	// Make the rename durable before anything is written under the old name again.
+	// rename(2) updates the directory inode in cache only, so a crash here can replay the
+	// directory to its pre-rotation state while the fresh base's records are already on
+	// disk under blocks the reverted directory no longer references. Ordered BEFORE the
+	// data sync below for the same reason that sync precedes the reopen: each step must be
+	// durable before the next one can depend on it.
+	syncDirFn(filepath.Dir(s.logPath), "audit log")
 	// Sync the rotated file BEFORE opening the new one. Close does not fsync on
 	// Linux, so a crash could otherwise leave the rotated file missing its tail — an
 	// undetectable chain gap, since the HMAC-linked successor lives in the new file.

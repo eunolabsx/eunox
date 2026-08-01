@@ -934,6 +934,17 @@ func (p *JWTPDP) DecideSampling(ctx context.Context, sessionID, sourceIP string)
 	if deny := killCheck(ctx, p.clock, p.ks, sessionID); deny != nil {
 		return *deny
 	}
+	// No validated claims in scope at all: hard-deny, mirroring Decide and filterList.
+	// This is an authentication boundary — the token was never validated — so it must not
+	// be downgraded to a logged forward under a route running --audit, and it must not be
+	// silently delegated past. Today the transport wiring only reaches DecideSampling with
+	// claims attached (forwardServerRequest attaches them), so this is a mirror of an
+	// invariant rather than a live hole; stating it here is what keeps it one, since the
+	// asymmetry — two of the three Decide* entry points checking and the third not — is
+	// exactly the kind of gap a later wiring change turns into a bypass.
+	if _, ok := jwtClaimsFromContext(ctx); !ok {
+		return hardDenyResponse(p.clock, capability.ErrCodeNoJWTClaims, "no JWT claims in context — token was not validated")
+	}
 	// Per-route audience pin (mirrors Decide/filterList): a session whose token does not
 	// carry this route's audience gets NO enforced action on the route, including a
 	// server-initiated sampling forward to the host. Reuse CheckAudience so the pin

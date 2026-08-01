@@ -135,6 +135,29 @@ func addSlack(d time.Duration) time.Duration {
 	return d + writeSlack
 }
 
+// rearmWriteDeadline resets the connection's write deadline to a fresh window before a
+// handler leg does slow work and then writes its response.
+//
+// The deadline armed at handler entry is measured FROM entry, so any leg whose work can
+// approach it — a teardown bounded by --shutdown-timeout, a notification forwarded to a
+// slow upstream — can reach its own write with the deadline already past. The response is
+// then dropped for an operation that in fact succeeded, which is at its worst on the kill
+// endpoint: `eunox kill` prints a failure for an emergency stop that took effect.
+//
+// budgetMs is the leg's own budget in milliseconds (0 means "no configured budget"); the
+// window is that budget plus writeSlack, floored at httpWriteTimeout so a small or absent
+// budget still leaves a usable window for the write itself. Best-effort, matching every
+// other SetWriteDeadline site: a ResponseWriter that does not support it changes nothing.
+func rearmWriteDeadline(w http.ResponseWriter, budgetMs int) {
+	window := httpWriteTimeout
+	if budgetMs > 0 {
+		if b := addSlack(msToDuration(budgetMs)); b > window {
+			window = b
+		}
+	}
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(window))
+}
+
 // ResolveMaxSessions folds the --max-sessions flag and the config's
 // listen.maxSessions into the effective concurrent-session cap.
 //

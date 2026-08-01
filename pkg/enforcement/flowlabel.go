@@ -215,8 +215,18 @@ func unionLabels(present, declared []string) []string {
 // Returns (nil, nil) when there is nothing to read. The store returns the set in
 // unspecified order, so this reorders it into the fixed vocabulary order (public..
 // untrusted) — the single ordering both the enforced subset check and the audit field
-// rely on — dropping any member outside the closed vocabulary (fail-safe; recordLabels
-// rejects such a label at the source, so this only guards a directly-poked store).
+// rely on.
+//
+// A stored label OUTSIDE the closed vocabulary is an ERROR, not something to reorder past.
+// Dropping it was labelled "fail-safe" and is the opposite: the sink rule is "present and
+// not in Allow => deny", so removing a present label can only SUPPRESS a denial. A store
+// holding a label this build does not know — two proxy versions with different
+// vocabularies sharing one Redis flow store, or a store written out-of-band — would then
+// have its unknown (and, by construction, un-allowlistable) labels silently forgiven at
+// every sink. Every sibling path already fails closed on an unknown label (recordLabels at
+// the source, handleFlowLabel at the sink); returning an error here makes the read agree
+// with them, and the caller denies. Over-denying during a mixed-version rollout is the
+// point: the alternative is enforcing a policy against a label set this build cannot see.
 func (e *Engine) peekSessionLabels(ctx context.Context, req *capability.EnforceRequest) ([]string, error) {
 	// skipFlow (the whole policy carries no flow token) short-circuits here as well as at
 	// the evaluateMatched gate, so the engine stays internally consistent even if a caller
@@ -235,6 +245,9 @@ func (e *Engine) peekSessionLabels(ctx context.Context, req *capability.EnforceR
 	}
 	inSet := make(map[string]bool, len(present))
 	for _, l := range present {
+		if !capability.IsFlowLabel(l) {
+			return nil, fmt.Errorf("session flow-label store holds %q, which is not in this build's flow-label vocabulary; refusing to evaluate an information-flow policy against a label set this build cannot interpret", l)
+		}
 		inSet[l] = true
 	}
 	var out []string

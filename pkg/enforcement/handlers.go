@@ -307,12 +307,6 @@ func (e *Engine) maxCallsBucket(ctx context.Context, cond capability.Condition, 
 		return nil, "", false, condErr
 	}
 
-	// Skip the counter (treating the condition as satisfied) when quota must not be
-	// consumed: --audit observe mode (WithSkipQuota).
-	if SkipQuota(ctx) {
-		return nil, "", true, nil
-	}
-
 	if e.counter == nil {
 		return nil, "", false, &ConditionError{
 			Code:          capability.ErrCodeConditionFailed,
@@ -356,6 +350,21 @@ func (e *Engine) maxCallsBucket(ctx context.Context, cond capability.Condition, 
 			ConditionType: capability.ConditionTypeMaxCalls,
 			Message:       "tool or resource name is required for maxCalls condition",
 		}
+	}
+
+	// Skip the counter (treating the condition as satisfied) when quota must not be
+	// consumed: --audit observe mode (WithSkipQuota).
+	//
+	// Deliberately AFTER the structural guards above, not before them. Observe mode exists
+	// to predict what enforcement would do, and only the counter INCREMENT is what it must
+	// not perform; a nil counter, an empty session, or an unidentifiable target are
+	// misconfigurations that deny in enforce mode no matter what the quota is. Skipping
+	// first hid exactly those from the audit log — the run an operator makes precisely to
+	// find them — and reported ALLOW where enforce mode would have written
+	// MISSING_CONTEXT/CONDITION_FAILED. Same rationale as commitDeferredAtomic's
+	// validate-then-skip ordering (engine.go), which this now matches.
+	if SkipQuota(ctx) {
+		return nil, "", true, nil
 	}
 	return mc, compositeCounterKey("maxcalls", e.counterKeyNamespace, req.SessionID, targetType, toolName), false, nil
 }

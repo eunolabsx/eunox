@@ -513,7 +513,8 @@ func (p DenyAllPDP) Decide(_ context.Context, _ string, _ EnforceTarget, _ map[s
 	return p.deny()
 }
 
-// DecideResourceRead denies every resources/read and resources/subscribe.
+// DecideResourceRead denies every resources/read, resources/subscribe, and
+// resources/unsubscribe.
 func (p DenyAllPDP) DecideResourceRead(_ context.Context, _, _, _ string) capability.EnforceResponse {
 	return p.deny()
 }
@@ -2130,6 +2131,28 @@ type toolEntryScan struct {
 // stack form is O(bytes), and it mirrors mcp.rejectDuplicateJSONKeys, which walks request
 // params the same way.
 func scanToolEntry(raw json.RawMessage) toolEntryScan {
+	return scanJSONKeys(raw, false)
+}
+
+// scanJSONKeys is the shared streaming walk behind every duplicate-key gate in this
+// package: the */list entry gate (scanToolEntry, and entryKeysAmbiguous through it) and
+// the redaction path's envelope/leaf gate (redactionKeysAmbiguous). Both ask the same
+// security question — can Go's decode of these bytes differ from what a host renders? —
+// so they share one implementation rather than two hand-mirrored walks that can drift on
+// the fold rule, the depth bound, or the number handling.
+//
+// allowArrayRoot admits a JSON array as the root value. A tools/list entry must be an
+// object, so scanToolEntry passes false and a non-object root is untrustworthy with a
+// knowably-empty name set (see below). The redaction path scans values that are legally
+// either shape — structuredContent and any doubly-encoded leaf may be an array of objects
+// — so it passes true, and the array root simply opens the walk like any other composite.
+//
+// The fold-vs-exact scoping is the caller-independent part: keys are folded at depth 1
+// (the root object's own keys, where encoding/json's case-insensitive struct-field match
+// makes a case variant collide) and matched EXACTLY below it (where values decode into
+// map[string]interface{} with exact keys, and legal sibling schema properties "Name" and
+// "name" must not be refused). See the scanToolEntry doc for the full derivation.
+func scanJSONKeys(raw json.RawMessage, allowArrayRoot bool) toolEntryScan {
 	// frame tracks one open composite. seen is allocated lazily: most nested objects in a
 	// tool schema are small, and an empty-object-heavy payload should not cost a map
 	// header per object.
@@ -2147,8 +2170,11 @@ func scanToolEntry(raw json.RawMessage) toolEntryScan {
 	if err != nil {
 		return toolEntryScan{untrustworthy: true}
 	}
-	if d, ok := tok.(json.Delim); !ok || d != '{' {
-		// Not a JSON object: null, a number, a string, a bool, or an array. The entry is
+	rootDelim, rootIsDelim := tok.(json.Delim)
+	rootObject := rootIsDelim && rootDelim == '{'
+	if !rootObject && !(allowArrayRoot && rootIsDelim && rootDelim == '[') {
+		// Not a JSON object: null, a number, a string, a bool, or (unless the caller admits
+		// one) an array. The entry is
 		// still untrustworthy — it cannot decode into the hashed tool surface, so the
 		// filter must drop it — but unlike an entry whose bytes ABORTED the scan, its
 		// candidate-name set is knowably EMPTY, not unknown: none of these shapes carries
@@ -2163,7 +2189,7 @@ func scanToolEntry(raw json.RawMessage) toolEntryScan {
 		return toolEntryScan{untrustworthy: true, namesComplete: true}
 	}
 	var out toolEntryScan
-	stack := []frame{{object: true, expectKey: true}}
+	stack := []frame{{object: rootObject, expectKey: rootObject}}
 	// pendingName is set when the value about to be read is the ENTRY's top-level name
 	// value, so the names it could present to a host can be collected in the same pass.
 	pendingName := false

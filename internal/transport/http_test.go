@@ -3286,9 +3286,15 @@ func TestHTTPHandleUpstreamRequest_SamplingThroughJWTWrapper(t *testing.T) {
 		sessions: make(map[string]*httpSession),
 	}
 	sess := newTestSession(&httpSession{
-		id:       "sess-jwt-sampling",
-		route:    route,
-		done:     make(chan struct{}),
+		id:    "sess-jwt-sampling",
+		route: route,
+		done:  make(chan struct{}),
+		// A JWT route's session always carries the claims validated at initialize;
+		// forwardServerRequest attaches them to the sampling decision's context. Without
+		// them DecideSampling hard-denies NO_JWT_CLAIMS, exactly as Decide already does for
+		// a tools/call on the same session — so a claim-less session on a JWT route is not
+		// a state this test can stand in for.
+		claims:   &pdp.JWTClaims{Subject: "user-1", Issuer: "https://idp.example.com"},
 		upWriter: mcp.NewMsgWriter(&writerAdapter{uw}),
 	})
 	ch := make(chan mcp.RPCMsg, 1)
@@ -5508,7 +5514,7 @@ func TestHTTPProxy_NewSessionInitializeHonorsContext(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	_, err := proxy.newSession(ctx, proxy.routes[""], "")
+	_, err := proxy.newSession(ctx, proxy.routes[""], "", proxy.currentReapGen())
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -5668,7 +5674,7 @@ func TestHTTPProxy_InitializeDeadline(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	_, err := proxy.newRemoteSession(ctx, route, "")
+	_, err := proxy.newRemoteSession(ctx, route, "", proxy.currentReapGen())
 	elapsed := time.Since(start)
 
 	if err == nil {

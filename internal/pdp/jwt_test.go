@@ -2769,13 +2769,41 @@ func TestJWTPDP_Decide_JWTOnlyAllow_UsesInjectedClock(t *testing.T) {
 	}
 }
 
+// samplingClaimsCtx is the production shape for a server-initiated sampling decision: the
+// session's validated identity-only claims, attached by forwardServerRequest. DecideSampling
+// hard-denies without them (mirroring Decide and filterList — an unvalidated token is an
+// authentication boundary), so a test exercising the capability logic must supply them.
+func samplingClaimsCtx() context.Context {
+	return WithJWTClaims(context.Background(), &JWTClaims{Subject: "user-1", Issuer: "https://idp.example.com"})
+}
+
+// TestJWTPDP_DecideSampling_NoClaims_HardDenied pins the mirror check: two of the three
+// Decide* entry points refused an unvalidated token and the third delegated straight past
+// it. Bounded by transport wiring today (forwardServerRequest always attaches claims), which
+// is exactly why the asymmetry needed closing rather than documenting.
+func TestJWTPDP_DecideSampling_NoClaims_HardDenied(t *testing.T) {
+	t.Parallel()
+	inner := newTestManifestPDP(
+		capability.Constraint{Target: "system:sampling/createMessage", Actions: []string{"allow"}},
+	)
+	pdp := NewJWTPDP(JWTPDPOptions{Inner: inner})
+
+	dec := pdp.DecideSampling(context.Background(), "sess", "")
+	if dec.Decision != capability.DecisionDeny || dec.Denial == nil || dec.Denial.Code != capability.ErrCodeNoJWTClaims {
+		t.Fatalf("sampling with no validated claims must hard-deny NO_JWT_CLAIMS; got %+v", dec)
+	}
+	if !dec.Denial.HardDeny {
+		t.Error("an authentication-boundary denial must be a HardDeny so --audit cannot downgrade it to a logged forward")
+	}
+}
+
 func TestJWTPDP_DecideSampling_DelegatesToInnerManifest(t *testing.T) {
 	t.Parallel()
 	inner := newTestManifestPDP(
 		capability.Constraint{Target: "system:sampling/createMessage", Actions: []string{"allow"}},
 	)
 	pdp := NewJWTPDP(JWTPDPOptions{Inner: inner})
-	dec := pdp.DecideSampling(context.Background(), "sess", "")
+	dec := pdp.DecideSampling(samplingClaimsCtx(), "sess", "")
 	if dec.Decision != capability.DecisionAllow {
 		t.Errorf("DecideSampling should allow when the inner manifest opts in to sampling; got deny: %+v", dec.Denial)
 	}
@@ -2796,10 +2824,10 @@ func TestJWTPDP_DecideSampling_ThreadsSourceIPToInner(t *testing.T) {
 		)
 		return NewJWTPDP(JWTPDPOptions{Inner: inner})
 	}
-	if dec := mk().DecideSampling(context.Background(), "sess", "10.1.2.3"); dec.Decision != capability.DecisionAllow {
+	if dec := mk().DecideSampling(samplingClaimsCtx(), "sess", "10.1.2.3"); dec.Decision != capability.DecisionAllow {
 		t.Errorf("in-range source IP must allow sampling through the JWT wrapper; got %+v", dec)
 	}
-	if dec := mk().DecideSampling(context.Background(), "sess", "192.168.1.1"); dec.Decision != capability.DecisionDeny {
+	if dec := mk().DecideSampling(samplingClaimsCtx(), "sess", "192.168.1.1"); dec.Decision != capability.DecisionDeny {
 		t.Errorf("out-of-range source IP must deny sampling through the JWT wrapper; got %+v", dec)
 	}
 }
@@ -2810,7 +2838,7 @@ func TestJWTPDP_DecideSampling_InnerManifestWithoutEntry_Denied(t *testing.T) {
 		capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}},
 	)
 	pdp := NewJWTPDP(JWTPDPOptions{Inner: inner})
-	dec := pdp.DecideSampling(context.Background(), "sess", "")
+	dec := pdp.DecideSampling(samplingClaimsCtx(), "sess", "")
 	if dec.Decision != capability.DecisionDeny || dec.Denial.Code != capability.ErrCodeSamplingDenied {
 		t.Errorf("expected SAMPLING_DENIED when the inner manifest has no sampling entry; got %+v", dec)
 	}
@@ -2819,7 +2847,7 @@ func TestJWTPDP_DecideSampling_InnerManifestWithoutEntry_Denied(t *testing.T) {
 func TestJWTPDP_DecideSampling_NoInner_Denied(t *testing.T) {
 	t.Parallel()
 	pdp := NewJWTPDP(JWTPDPOptions{})
-	dec := pdp.DecideSampling(context.Background(), "sess", "")
+	dec := pdp.DecideSampling(samplingClaimsCtx(), "sess", "")
 	if dec.Decision != capability.DecisionDeny || dec.Denial.Code != capability.ErrCodeSamplingDenied {
 		t.Errorf("expected SAMPLING_DENIED in JWT-only mode (no inner PDP); got %+v", dec)
 	}
@@ -2829,7 +2857,7 @@ func TestJWTPDP_DecideSampling_InnerAlwaysAllow_Denied(t *testing.T) {
 	t.Parallel()
 
 	pdp := NewJWTPDP(JWTPDPOptions{Inner: AlwaysAllowPDP{}})
-	dec := pdp.DecideSampling(context.Background(), "sess", "")
+	dec := pdp.DecideSampling(samplingClaimsCtx(), "sess", "")
 	if dec.Decision != capability.DecisionDeny || dec.Denial.Code != capability.ErrCodeSamplingDenied {
 		t.Errorf("expected SAMPLING_DENIED when the inner PDP is AlwaysAllowPDP (unpoliced route); got %+v", dec)
 	}
