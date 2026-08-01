@@ -2262,7 +2262,8 @@ func scanJSONKeys(raw json.RawMessage, opts jsonKeyScanOpts) toolEntryScan {
 	}
 	rootDelim, rootIsDelim := tok.(json.Delim)
 	rootObject := rootIsDelim && rootDelim == '{'
-	if !rootObject && !(opts.allowArrayRoot && rootIsDelim && rootDelim == '[') {
+	rootAdmittedArray := opts.allowArrayRoot && rootIsDelim && rootDelim == '['
+	if !rootObject && !rootAdmittedArray {
 		// Not a JSON object: null, a number, a string, a bool, or (unless the caller admits
 		// one) an array. The entry is
 		// still untrustworthy — it cannot decode into the hashed tool surface, so the

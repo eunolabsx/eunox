@@ -11,6 +11,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// paddedCaseKey returns value surrounded by the whitespace a real manifest can carry
+// around a byArgument case key. It exists as a function so the padding is stated rather
+// than hidden inside a string literal, where it reads as a typo to both a human and to
+// gocritic's mapKey check.
+func paddedCaseKey(value string) string { return " " + value + " " }
+
 // The effect-contract rules live here, in the package that owns the reversibility
 // vocabulary and the contract digest, so the manifest loader and the registry corpus
 // loader apply exactly the same ones. These are the rules themselves; the two callers'
@@ -27,7 +33,7 @@ func TestValidateEffectContract(t *testing.T) {
 		{name: "unset class", effect: &EffectContract{}},
 		{
 			name:    "class outside the vocabulary",
-			effect:  &EffectContract{Class: "reversable"},
+			effect:  &EffectContract{Class: "safe"},
 			wantErr: "valid effect classes are",
 		},
 		{
@@ -84,10 +90,18 @@ func TestValidateEffectContract(t *testing.T) {
 			wantErr: "decides nothing",
 		},
 		{
+			// The padded key is the point: matching trims and folds case, so " drop " and
+			// "DROP" select the same row and which one wins would be map-iteration order.
+			// (gocritic's mapKey check reads padding as a typo; here it is the input under
+			// test.)
 			name: "byArgument case-variant keys",
 			effect: &EffectContract{ByArgument: &EffectByArgument{
 				Argument: "sql",
-				Cases:    map[string]EffectCase{"DROP": {Class: EffectIrreversible}, " drop ": {Class: EffectReversible}},
+				Cases: map[string]EffectCase{
+					"DROP":                        {Class: EffectIrreversible},
+					paddedCaseKey("drop"):         {Class: EffectReversible},
+					"delete_from_audit_immutable": {Class: EffectIrreversible},
+				},
 			}},
 			wantErr: "match the same argument value",
 		},

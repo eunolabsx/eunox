@@ -7,7 +7,8 @@
 // The rules lived in internal/config, reachable only from the manifest loader. That left
 // the registry corpus — the "reviewable, pinnable" artifact the whole effect layer is
 // anchored on — able to validate and digest an entry that is semantically nonsense: a
-// class typo ("reversable"), a compensable contract with no compensating action, a blast
+// class outside the closed vocabulary ("safe"), a compensable contract with no
+// compensating action, a blast
 // radius declaring both a fixed value and an argument. The entry then passed its own
 // checks and failed later, at manifest load, as a confusing error about a block the author
 // had copied verbatim from a corpus that told them it was fine.

@@ -43,7 +43,7 @@ func TestConditionRegistry_DrivesEveryDerivedTable(t *testing.T) {
 			var back ConditionWrapper
 			require.NoError(t, json.Unmarshal(b, &back), "and unmarshal: %s", b)
 			require.NotNil(t, back.Condition)
-			assert.Equal(t, condType, back.Condition.ConditionType())
+			assert.Equal(t, condType, back.ConditionType())
 		})
 	}
 }

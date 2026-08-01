@@ -158,9 +158,10 @@ func (c *Contract) Validate() error {
 		return fmt.Errorf("contract %q: the 'effect' block must not carry its own 'ref' — a corpus entry IS the thing a ref points at, and a self-reference is excluded from the digest", c.ID)
 	}
 	// The contract must be SEMANTICALLY valid, not merely digest-consistent. A digest over
-	// nonsense is still a stable digest: an entry with a class typo ("reversable"), a
-	// compensable contract naming no compensating action, or a blast radius declaring both
-	// a value and an argument used to validate and digest cleanly here, so the corpus — the
+	// nonsense is still a stable digest: an entry with a class outside the closed vocabulary
+	// ("safe"), a compensable contract naming no compensating action, or a blast radius
+	// declaring both a value and an argument used to validate and digest cleanly here, so the
+	// corpus — the
 	// artifact whose whole purpose is to be reviewable and pinnable — was not
 	// machine-reviewable at all, and the mistake surfaced later as a confusing manifest-load
 	// error about a block the author had copied verbatim from it. These are the SAME rules

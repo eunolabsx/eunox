@@ -516,8 +516,8 @@ Section conventions:
   time; every other condition whose misconfiguration denies at runtime is rejected at
   load, and these two had no validation arm at all.
 - **The contract corpus is checked for semantic validity, not just digest consistency.** A
-  digest over nonsense is still a stable digest: an entry with a class typo
-  (`reversable`), a `compensable` contract naming no compensating action, or a blast
+  digest over nonsense is still a stable digest: an entry with a class outside the closed
+  vocabulary (`safe`), a `compensable` contract naming no compensating action, or a blast
   radius declaring both a `value` and an `argument` validated and digested cleanly, then
   failed later at manifest load about a block the author had copied verbatim from the
   corpus. The effect-contract validators moved to `pkg/capability` (which owns the

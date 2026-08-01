@@ -31,7 +31,7 @@ func assertRedactionFailsClosed(t *testing.T, body []byte, obligs []capability.O
 	out, err := ApplyRedactObligs(body, obligs)
 	require.Error(t, err, "an unverifiable response must fail closed, got %q", string(out))
 	assert.Nil(t, out, "a fail-closed redaction must return no bytes at all")
-	assert.NotContains(t, string(err.Error()), secret, "the error must not itself carry the secret")
+	assert.NotContains(t, err.Error(), secret, "the error must not itself carry the secret")
 }
 
 // The headline smuggle: the second `data` wins for Go (an empty object, nothing to

@@ -110,7 +110,8 @@ excluded (a contract cannot contain its own digest). Two entries whose contracts
   validators the manifest loader applies (they live in `pkg/capability`, which owns both
   the vocabulary and the digest, so the two layers cannot disagree about what a valid
   contract is). An entry fails the test when it:
-  - names a `class` outside the closed vocabulary (a typo such as `reversable`);
+  - names a `class` outside the closed vocabulary (a typo, or a plausible-sounding
+    invention such as `safe`);
   - is `compensable` but names no `compensatingAction`, or names one under a
     non-compensable class — including in a `byArgument` row, judged against the class and
     action the row *effectively* has after inheriting from the base block;

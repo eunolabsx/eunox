@@ -40,8 +40,8 @@ func TestValidateRejectsASemanticallyInvalidContract(t *testing.T) {
 		wantErr string
 	}{
 		{
-			name:    "class typo",
-			effect:  &capability.EffectContract{Class: "reversable"},
+			name:    "class outside the vocabulary",
+			effect:  &capability.EffectContract{Class: "safe"},
 			wantErr: "valid effect classes are",
 		},
 		{
