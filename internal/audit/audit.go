@@ -1699,6 +1699,38 @@ const TruncatedKey = "_eunox_truncated"
 // and cannot drift.
 const UpstreamErrorCodeKey = "_eunox_upstream_error_code"
 
+// EffectReceiptKey is the reserved detail key the transport merges into an ALLOW record's
+// Details carrying the verdict for a signed effect receipt the upstream published in the
+// tool result's `_meta`. Its value is an OBJECT (the verdict plus the attested values), not
+// a scalar, because a receipt describes several dimensions and flattening them into the
+// same map as the caller's arguments is exactly the mistake this key exists to prevent.
+//
+// The reserved underscore prefix is load-bearing, not cosmetic. A tools/call allow record's
+// Details IS the caller's argument map in audit mode, and `eunox suggest` mines every key
+// of it as an argument name — so receipt fields merged in bare would be drafted as
+// allowedValues conditions on arguments no call carries, producing a manifest that denies
+// every real call to that tool with MISSING_CONTEXT. Kept here so the producer
+// (internal/transport) and the miner (cmd/eunox/suggest) share one spelling.
+const EffectReceiptKey = "_eunox_effect_receipt"
+
+// reservedDetailKeys is the set of Details keys eunox itself injects into an allow record.
+// None is ever a caller-supplied tool argument.
+var reservedDetailKeys = map[string]bool{
+	TruncatedKey:         true,
+	UpstreamErrorCodeKey: true,
+	EffectReceiptKey:     true,
+}
+
+// IsReservedDetailKey reports whether a Details key is one eunox injects rather than one a
+// caller supplied. Consumers mining Details for real tool arguments (the suggest
+// subcommand) must exclude every one of them.
+//
+// It is a SET rather than a per-key comparison because the set grows: each new annotation
+// added to an allow record's details is another key a miner keyed on one literal would
+// silently treat as an argument, and the failure is a drafted manifest that denies every
+// call to the tool. One predicate means a new key is excluded by construction.
+func IsReservedDetailKey(name string) bool { return reservedDetailKeys[name] }
+
 // Reason codes for the TruncatedKey marker's structured value. The marker carries a
 // {"reason": <code>, ...} object rather than a free-form prose sentence, so SIEM
 // rules can match details._eunox_truncated.reason across versions instead of parsing

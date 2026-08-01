@@ -6,6 +6,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"reflect"
 	"strings"
 
@@ -91,11 +92,14 @@ func validateBlastRadiusTotalRange(i, j int, n *json.Number) error {
 		// Already reported by validateBlastRadiusNumber; nothing to add.
 		return nil
 	}
-	f, _ := v.Float64()
-	if f > callcounter.MaxWeightedTotal {
+	// Compare the arbitrary-precision value, NOT its float64 narrowing. Rounding first let
+	// 2^53+1 pass — it narrows to exactly 2^53 — so a bound one unit above the
+	// representable maximum loaded clean and was then enforced as a threshold the operator
+	// never authored, which is the failure this check exists to prevent.
+	if v.Cmp(new(big.Float).SetFloat64(callcounter.MaxWeightedTotal)) > 0 {
 		return fmt.Errorf("capability at index %d, condition %d: blastRadius 'maxTotal' must be <= %v (the largest total both counter backends sum exactly), got %q", i, j, callcounter.MaxWeightedTotal, n.String())
 	}
-	if f <= 0 {
+	if v.Sign() <= 0 {
 		// Zero admits nothing with a positive magnitude and would deny every quantified
 		// call in the window — a limit that looks generous and refuses everything, the same
 		// trap validateBlastRadiusNumber rejects a negative bound for.

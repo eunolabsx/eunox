@@ -189,9 +189,14 @@ is catastrophic.
   never consumes cumulative budget that the permitted calls would then be denied.
 - `maxTotal` must be at most 2^53, the largest total both counter backends sum exactly. The
   Redis backend evaluates its admission in Lua, whose numbers are IEEE-754 doubles; a larger
-  bound would be enforced as a threshold nobody authored, so it is refused at load. A
-  magnitude the double would have to round is likewise treated as unquantified rather than
-  summed approximately.
+  bound would be enforced as a threshold nobody authored, so it is refused at load — compared
+  in arbitrary precision, so a bound one unit above the maximum cannot round its way in. A
+  **fractional** magnitude is summable and expected: currency is the motivating case, and
+  both backends accumulate in double precision by contract, so `$19.99` differs from an exact
+  decimal sum only in the last bits, far below any bound an operator authors.
+- A call whose weight cannot move the running total — zero, or anything too small to register
+  in double precision — is admitted **without being recorded**. It can never affect a future
+  decision, and recording it was the one case with no bound on how much a key could grow.
 - Under `--audit` the budget is **not** consumed, exactly as `maxCalls` quota is not:
   observing it accurately would spend the thing observation exists to leave alone.
 
@@ -306,6 +311,10 @@ consequential reading* (annotate the tool).
   observes whether a server behaves as its contract says. The runtime counterpart is the
   effect-receipt surface below, and it too verifies attestations rather than watching
   servers.
+- **Ordering.** The cumulative bound COMMITS, so it is evaluated after every pure predicate
+  *and* after the effect ceiling: a call the ceiling escalates is never forwarded, so it must
+  not have spent budget the calls that follow then lack. That is the same rule the
+  `sequenceBlock` antecedent and the flow label already obeyed, in a third currency.
 - **One committing bound per capability.** A cumulative `blastRadius` bound cannot share a
   capability with a `maxCalls` (or a second cumulative bound). A weighted budget and a call
   count cannot be admitted in one atomic commit — a count is O(1) in every backend while a
@@ -377,7 +386,10 @@ Four properties are load-bearing:
 
 Consistency is one-directional: a server reporting a **smaller or less consequential**
 action than declared is honoring the contract, since the declaration is the upper bound the
-decision was made against. Only exceeding it contradicts. A contract that could not be
+decision was made against. Only exceeding it contradicts. Silence, though, is not agreement:
+a receipt that omits a dimension the contract **quantified** records as `inconsistent`
+(`blast_radius_unstated`), because an attestation that never covered the bounded dimension
+must not earn `verified` — the strongest signal this surface emits. A contract that could not be
 resolved before the call — genuinely runtime-dynamic effect — has no bound to exceed, and
 the receipt is then the only account of what happened, which is the case receipts uniquely
 serve.

@@ -4,10 +4,9 @@
 package capability
 
 import (
-	"crypto/subtle"
+	"bytes"
 	"encoding/json"
 	"fmt"
-	"math/big"
 	"sort"
 	"strings"
 	"time"
@@ -129,6 +128,12 @@ const (
 	// it cannot be shown to sit within the declaration. Fail closed: an unrecognized class
 	// is not a small one.
 	ReceiptReasonUnknownClass = "unknown_effect_class"
+	// ReceiptReasonBlastRadiusUnstated — the contract quantified this call's magnitude and
+	// the receipt says nothing about it. Silence is not agreement: a server that moved a
+	// million dollars against a $10 declaration and simply omitted the field would
+	// otherwise record as `verified`, the strongest signal this surface emits, for an
+	// attestation that never covered the one dimension the contract bounded.
+	ReceiptReasonBlastRadiusUnstated = "blast_radius_unstated"
 )
 
 // ReceiptResult is one receipt's outcome. A nil *ReceiptResult means the server published
@@ -206,6 +211,9 @@ type EffectReceiptVerifier struct {
 const (
 	DefaultReceiptMaxAge = 5 * time.Minute
 	DefaultReceiptLeeway = 60 * time.Second
+	// MaxReceiptKeys bounds the key set a receipt may be trialled against; see
+	// NewEffectReceiptVerifier. It matches the JWKS cache's own per-response cap.
+	MaxReceiptKeys = 100
 )
 
 // NewEffectReceiptVerifier builds a verifier from a JWKS document — the upstream's own
@@ -231,12 +239,21 @@ func NewEffectReceiptVerifier(jwksJSON []byte, maxAge, leeway time.Duration) (*E
 			return nil, fmt.Errorf("effect-receipt JWKS key %q is not a public key; a receipt is an attestation, and a key that can verify one must not be able to sign it", ks.Keys[i].KeyID)
 		}
 	}
+	if len(ks.Keys) > MaxReceiptKeys {
+		// The kid-less fan-out bound, mirroring the JWKS cache's own cap and for the same
+		// reason: a receipt carrying no kid is trialled against every key, so an unbounded
+		// key set is an unbounded amount of signature verification an upstream can force
+		// on the response path of every call.
+		return nil, fmt.Errorf("effect-receipt JWKS carries %d keys, more than the %d a kid-less receipt may be trialled against", len(ks.Keys), MaxReceiptKeys)
+	}
 	if maxAge <= 0 {
 		maxAge = DefaultReceiptMaxAge
 	}
-	if leeway < 0 {
-		leeway = DefaultReceiptLeeway
-	}
+	// EffectiveLeeway is the shared sentinel resolver: 0 means "default", negative means
+	// "disabled". Hand-rolling it here inverted that — negative meant default and 0 meant
+	// disabled — so an operator disabling skew tolerance would have got 60 seconds of it,
+	// the fail-open direction for a replay bound.
+	leeway = EffectiveLeeway(leeway)
 	return &EffectReceiptVerifier{keys: &ks, maxAge: maxAge, leeway: leeway}, nil
 }
 
@@ -263,7 +280,12 @@ func ParseEffectReceipt(meta map[string]json.RawMessage) (raw json.RawMessage, o
 // class vocabulary. It never upgrades a verdict: an absent declaration cannot make an
 // inconsistent receipt consistent, it can only leave less to compare against.
 func (v *EffectReceiptVerifier) Verify(rawMeta json.RawMessage, tool string, declared *ResolvedEffect, now time.Time) *ReceiptResult {
-	if v == nil || len(rawMeta) == 0 {
+	// A nil verifier is the documented "receipts not configured" value. A non-nil one with
+	// no key set can only come from a zero-value literal (the fields are unexported, so an
+	// embedder or test double reaching for &EffectReceiptVerifier{} is the natural way) —
+	// it can verify nothing, and must fail CLOSED rather than panic the dispatch goroutine
+	// on attacker-influenced upstream output.
+	if v == nil || v.keys == nil || len(rawMeta) == 0 {
 		return nil
 	}
 	var env EffectReceipt
@@ -300,17 +322,17 @@ func (v *EffectReceiptVerifier) verifySignature(compact string, now time.Time) (
 	}
 	kid := sig.Signatures[0].Header.KeyID
 
+	// FindKeys is the shared selector every JWS path in this package uses: it returns the
+	// keys matching kid, or ALL keys when the receipt carries none. Reusing it (rather than
+	// inlining the same loop) is what keeps the kid-less fan-out identical to the one the
+	// IdP path bounds — and the fan-out is why NewEffectReceiptVerifier caps the key count:
+	// a hostile upstream publishing a kid-less JWS in every result would otherwise force one
+	// signature verification per configured key, synchronously, on every tools/call.
+	candidates := FindKeys(v.keys, kid)
 	var payload []byte
 	var verifyErr error
-	for i := range v.keys.Keys {
-		k := &v.keys.Keys[i]
-		// A kid-less receipt is tried against every key; a kid selects its key. The
-		// comparison is constant-time out of habit rather than necessity — a key id is not
-		// a secret — so this site does not become the template a future secret comparison
-		// is copied from.
-		if kid != "" && subtle.ConstantTimeCompare([]byte(kid), []byte(k.KeyID)) != 1 {
-			continue
-		}
+	for i := range candidates {
+		k := &candidates[i]
 		p, err := sig.Verify(k)
 		if err != nil {
 			verifyErr = err
@@ -328,12 +350,12 @@ func (v *EffectReceiptVerifier) verifySignature(compact string, now time.Time) (
 	}
 
 	var claims EffectReceiptClaims
-	dec := json.NewDecoder(strings.NewReader(string(payload)))
-	// UseNumber keeps a magnitude exact, for the same reason a manifest literal is decoded
-	// this way: a receipt for a large row count widened through float64 would be compared
-	// against a value the server never signed.
-	dec.UseNumber()
-	if err := dec.Decode(&claims); err != nil {
+	// BlastRadius is a typed *json.Number, so the literal's exact text is preserved by the
+	// declared type — a magnitude for a large row count is never widened through float64 and
+	// compared against a value the server never signed. (UseNumber would add nothing here:
+	// it governs decoding into interface{} only.) bytes.NewReader avoids the []byte -> string
+	// -> Reader copy of the whole payload on every verification.
+	if err := json.NewDecoder(bytes.NewReader(payload)).Decode(&claims); err != nil {
 		return nil, fmt.Errorf("decoding effect receipt claims: %w", err)
 	}
 	if claims.IssuedAt == 0 {
@@ -378,8 +400,13 @@ func receiptInconsistencies(claims *EffectReceiptClaims, tool string, declared *
 	if claims.Class != "" && IsEffectClass(claims.Class) && !EffectClassAtMost(claims.Class, declared.Class) {
 		reasons = append(reasons, ReceiptReasonClass)
 	}
+	if declared.Quantified() && claims.BlastRadius == nil {
+		// The same rule claimsLessConsequentialThanDeclared applies to an unstated CLASS:
+		// an attestation that omits a declared dimension has not attested to it.
+		reasons = append(reasons, ReceiptReasonBlastRadiusUnstated)
+	}
 	if claims.BlastRadius != nil && declared.Quantified() {
-		if actual, ok := ParseBlastRadiusNumber(*claims.BlastRadius); !ok || exceedsDeclared(actual, declared.BlastRadius) {
+		if actual, ok := ParseBlastRadiusNumber(*claims.BlastRadius); !ok || actual.Cmp(declared.BlastRadius) > 0 {
 			// An unparseable magnitude counts as exceeding: a size that cannot be read
 			// cannot be shown to be within the declaration, which is the same fail-closed
 			// rule the blastRadius condition applies to a call's own arguments.
@@ -410,11 +437,4 @@ func claimsLessConsequentialThanDeclared(claims *EffectReceiptClaims, declared *
 	return claims.Class != "" &&
 		claims.Class != declared.Class &&
 		EffectClassAtMost(claims.Class, declared.Class)
-}
-
-// exceedsDeclared reports whether an actual magnitude is strictly greater than the
-// declared one. A nil declared value never exceeds — the caller's Quantified() test
-// already screens that case.
-func exceedsDeclared(actual, declared *big.Float) bool {
-	return actual != nil && declared != nil && actual.Cmp(declared) > 0
 }

@@ -163,11 +163,20 @@ func writeContractCorpus(out io.Writer, dir string, contracts []registry.Contrac
 // my policy is annotated" is the question that predicts the approval queue. Without this it
 // was answerable only by reading YAML.
 //
+// listTargets governs whether the worklist NAMES the capabilities or only counts them: the
+// operator-facing `validate` path names them (that is the point), while the doctor bundle —
+// which is written to be pasted into a public bug report — counts them, since a capability
+// target is a resource URI or a tool name and every other line of that bundle is
+// deliberately a count or a digest.
+//
 // Printed for every manifest, ceiling or not. A policy with no ceiling still benefits from
 // knowing the ratio before it adds one — that is precisely when the answer changes what
 // happens — so the line states which regime it is reporting under rather than staying
 // silent until a ceiling exists.
-func writeEffectCoverage(out io.Writer, prefix string, m *config.LocalManifest) {
+func writeEffectCoverage(out io.Writer, prefix string, m *config.LocalManifest, listTargets bool) {
+	if m == nil {
+		return
+	}
 	total := len(m.Capabilities)
 	if total == 0 {
 		return
@@ -176,6 +185,15 @@ func writeEffectCoverage(out io.Writer, prefix string, m *config.LocalManifest) 
 	wf(out, "%seffect coverage: %d/%d capabilities annotated\n", prefix, annotated, total)
 	unannotated := m.EffectUnannotatedTargets()
 	if len(unannotated) == 0 {
+		return
+	}
+	if !listTargets {
+		// The doctor bundle is generated to be pasted into a public bug report, and every
+		// other manifest line there is a count or a digest — never a target. A capability
+		// target is a resource URI or a tool name ("resource:postgres://prod-billing/*"),
+		// so listing them here would make this the one place the bundle leaks manifest
+		// contents. The ratio still tells the reader what they need.
+		wf(out, "%s  unannotated: %d (run `eunox validate` locally to list them)\n", prefix, len(unannotated))
 		return
 	}
 	consequence := "these would escalate if an effectCeiling were added"

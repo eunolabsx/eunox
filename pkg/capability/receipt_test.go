@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -335,4 +336,57 @@ func TestNewEffectReceiptVerifierRejectsUnusableKeySets(t *testing.T) {
 	require.NoError(t, err)
 	_, err = capability.NewEffectReceiptVerifier(privJWKS, 0, 0)
 	require.ErrorContains(t, err, "not a public key")
+}
+
+// TestEffectReceiptSilentAboutAQuantifiedDimension pins that silence is not agreement. A
+// contract that quantified the call's magnitude and a receipt that says nothing about it do
+// not agree — they simply never met. Recording `verified` there, the strongest signal this
+// surface emits, would let a server that moved a million dollars against a $10 declaration
+// earn the same verdict as one that reported honestly, just by omitting a field.
+func TestEffectReceiptSilentAboutAQuantifiedDimension(t *testing.T) {
+	s := newReceiptSigner(t, "k")
+	v := newVerifier(t, s)
+	now := time.Now()
+
+	block := s.sign(t, capability.EffectReceiptClaims{
+		Tool: "refund", Class: capability.EffectCompensable,
+		CompensatingAction: "tool:reverse_refund", IssuedAt: now.Unix(),
+	})
+	got := v.Verify(block, "refund", declaredRefund(), now)
+	require.NotNil(t, got)
+	assert.Equal(t, capability.ReceiptInconsistent, got.Verdict)
+	assert.Contains(t, got.Reasons, capability.ReceiptReasonBlastRadiusUnstated)
+
+	// With no quantified declaration there is nothing the silence fails to cover.
+	unquantified := &capability.ResolvedEffect{Class: capability.EffectCompensable, CompensatingAction: "tool:reverse_refund", Annotated: true}
+	got = v.Verify(block, "refund", unquantified, now)
+	require.NotNil(t, got)
+	assert.Equal(t, capability.ReceiptVerified, got.Verdict)
+}
+
+// TestEffectReceiptKeySetIsBounded pins the kid-less fan-out bound. A receipt carrying no
+// kid is trialled against every configured key, so an unbounded key set is an unbounded
+// amount of signature verification a hostile upstream can force on the response path of
+// every single call — the same reason the JWKS cache caps a fetched key set.
+func TestEffectReceiptKeySetIsBounded(t *testing.T) {
+	keys := make([]jose.JSONWebKey, 0, capability.MaxReceiptKeys+1)
+	for i := 0; i <= capability.MaxReceiptKeys; i++ {
+		pub, _, err := ed25519.GenerateKey(rand.Reader)
+		require.NoError(t, err)
+		keys = append(keys, jose.JSONWebKey{Key: pub, KeyID: fmt.Sprintf("k%d", i), Algorithm: string(jose.EdDSA), Use: "sig"})
+	}
+	jwks, err := json.Marshal(jose.JSONWebKeySet{Keys: keys})
+	require.NoError(t, err)
+	_, err = capability.NewEffectReceiptVerifier(jwks, 0, 0)
+	require.ErrorContains(t, err, "more than the")
+}
+
+// TestEffectReceiptZeroValueVerifierFailsClosed pins that a verifier built as a zero value
+// — the natural spelling for an embedder or a test double, since the fields are unexported
+// — refuses rather than panicking the dispatch goroutine on attacker-influenced upstream
+// output.
+func TestEffectReceiptZeroValueVerifierFailsClosed(t *testing.T) {
+	s := newReceiptSigner(t, "k")
+	block := s.sign(t, capability.EffectReceiptClaims{Tool: "refund", IssuedAt: time.Now().Unix()})
+	assert.Nil(t, (&capability.EffectReceiptVerifier{}).Verify(block, "refund", nil, time.Now()))
 }

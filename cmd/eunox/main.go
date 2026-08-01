@@ -1609,7 +1609,7 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 		return err
 	}
 
-	warnNoRedisSharedState(pf.redisConfigured, transport.AnyRouteHasMaxCalls(routes) || transport.AnyRouteHasSequenceBlock(routes) || transport.AnyRouteHasFlowLabel(routes))
+	warnNoRedisSharedState(pf.redisConfigured, transport.AnyRouteHasMaxCalls(routes) || transport.AnyRouteHasBlastRadiusVelocity(routes) || transport.AnyRouteHasSequenceBlock(routes) || transport.AnyRouteHasFlowLabel(routes))
 
 	bind := cfg.Listen.Bind
 	if bind == "" {
@@ -1872,14 +1872,14 @@ func serveStdioHost(ctx context.Context, cfg *config.GatewayConfig, sink *audit.
 
 	upstreamTimeMs := transport.ResolveUpstreamTimeout(pf.upstreamTimeoutMs, cfg.Defaults.UpstreamTimeoutMs)
 
-	warnNoRedisSharedState(pf.redisConfigured, manifest.HasMaxCalls() || manifest.HasSequenceBlock() || manifest.HasFlowLabel())
+	warnNoRedisSharedState(pf.redisConfigured, manifest.HasMaxCalls() || manifest.HasBlastRadiusVelocity() || manifest.HasSequenceBlock() || manifest.HasFlowLabel())
 
 	// This upstream's own receipt-signing key domain, from the same local-file loader the
 	// gateway routes use. Absent (the default) leaves the verifier nil and the whole
 	// surface disabled; a configured-but-unreadable key set is fatal, since an operator
 	// who wired one asked for the check and a path typo that degraded to "no receipt ever
 	// verifies" is indistinguishable from a server that stopped signing.
-	receipts, err := transport.LoadEffectReceiptVerifier(u.EffectReceiptKeys)
+	receipts, err := transport.LoadEffectReceiptVerifier(cfg.BaseDir, u.EffectReceiptKeys)
 	if err != nil {
 		return fmt.Errorf("upstream %q: %w", u.Name, err)
 	}
@@ -2101,7 +2101,7 @@ Flags:
 	// annotating is what buys a capability out of maximum friction, so the ratio (and the
 	// names) is the operator's progress meter. Advisory — it never affects the exit code,
 	// since an unannotated capability is a conservative default, not a defect.
-	writeEffectCoverage(os.Stdout, "", merged)
+	writeEffectCoverage(os.Stdout, "", merged, true)
 
 	if !*live {
 		return 0
@@ -2192,7 +2192,7 @@ func reportRouteOutcome(wf func(string, ...interface{}), wln func(...interface{}
 	// Advisory, and never part of the exit code: an unannotated capability is the
 	// fail-closed default working as intended, not a config defect. Per route, because
 	// the ceiling and the capabilities it governs are both per route.
-	writeEffectCoverage(routeCoverageWriter{wf}, "  ", outcome.Merged)
+	writeEffectCoverage(routeCoverageWriter{wf}, "  ", outcome.Merged, true)
 	return 0, false
 }
 

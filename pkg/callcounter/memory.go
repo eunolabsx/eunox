@@ -35,16 +35,14 @@ type entry struct {
 	weights []float64
 }
 
-// weightedTotal sums live weights. A nil weights slice means every live timestamp is a
-// plain call, so the total is the count — which is exactly the sense in which a weighted
-// bound generalizes maxCalls.
+// weightedTotal sums live weights, oldest-first — matching the Redis backend's
+// score-ordered scan, so the two backends accumulate the same IEEE-754 double from the same
+// sequence. An empty set totals zero.
 //
-// Summation order is oldest-first, matching the Redis backend's score-ordered scan, so the
-// two backends accumulate the same IEEE-754 double from the same sequence.
-func weightedTotal(live []time.Time, liveWeights []float64) float64 {
-	if len(liveWeights) == 0 {
-		return float64(len(live))
-	}
+// It takes only the weights: AddIfTotalBelow materializes an implicit 1 per counted call
+// before calling this, so the "no weights means every entry weighs one" fallback could
+// never be reached and advertised a contract no caller exercised.
+func weightedTotal(liveWeights []float64) float64 {
 	total := 0.0
 	for _, w := range liveWeights {
 		total += w
@@ -210,8 +208,7 @@ func (m *InMemory) IncrementAndGet(_ context.Context, key string, windowSec, max
 	// Remove expired timestamps, reusing the existing backing array in place.
 	// The slice stays in oldest-first order. A weighted key's magnitudes are pruned in
 	// lockstep (pruneInWindow); a counting key has none.
-	weighted := isWeighted(e)
-	valid, validWeights := pruneInWindow(e, cutoff)
+	valid, validWeights, weighted := pruneInWindow(e, cutoff)
 
 	// Add current timestamp (still the newest, so order is preserved). A counting call
 	// against a key that ALSO carries magnitudes contributes weight 1 — the weight at
@@ -298,30 +295,6 @@ func storeEntry(e *entry, ts []time.Time, weights []float64, weighted bool) {
 // only add churn to the common case of a key that never bursts.
 const compactMinCap = 64
 
-// compactTimestamps returns ts unchanged unless its backing array is both large
-// (cap > compactMinCap) and mostly empty (live length below a quarter of
-// capacity), in which case it copies the live timestamps into a right-sized slice
-// so the oversized array can be garbage collected.
-//
-// IncrementAndGet prunes via [:0] reslicing, which keeps appends amortised O(1)
-// but never shrinks capacity: without this, a burst of N calls that drains to a
-// handful would pin an N-element array for as long as the key stays live (Cleanup
-// only deletes whole stale entries, never shrinks a live one).
-//
-// The 25% threshold keeps the copy off the steady-state hot path: append leaves a
-// grow-only slice at ~50% utilisation (~80% above 1024 elements) climbing toward
-// 100% as the window fills, so ordinary churn never dips to 25% — only a real drop
-// in live count does. The copy is thus paid once per burst-then-drain cycle, and
-// each copy is of the small live set, dwarfed by the regrowth it would do anyway.
-func compactTimestamps(ts []time.Time) []time.Time {
-	if shouldCompact(cap(ts), len(ts)) {
-		compact := make([]time.Time, len(ts))
-		copy(compact, ts)
-		return compact
-	}
-	return ts
-}
-
 // shouldCompact is the reclamation predicate, factored out so the timestamp-only path and
 // the weighted pair reclaim on exactly the same condition — a pair that compacted one
 // slice and not the other would break the parallel-length invariant.
@@ -346,8 +319,8 @@ func shouldCompact(capacity, length int) bool {
 // would over-count a total (denying calls a window has already freed), and one that lost a
 // live entry's would under-count it (the fail-open direction). nil in, nil out, so a
 // counting key pays nothing.
-func pruneInWindow(e *entry, cutoff time.Time) ([]time.Time, []float64) {
-	weighted := isWeighted(e)
+func pruneInWindow(e *entry, cutoff time.Time) (ts []time.Time, weights []float64, weighted bool) {
+	weighted = isWeighted(e)
 	valid := e.timestamps[:0]
 	var validWeights []float64
 	if weighted {
@@ -362,7 +335,7 @@ func pruneInWindow(e *entry, cutoff time.Time) ([]time.Time, []float64) {
 			validWeights = append(validWeights, e.weights[i])
 		}
 	}
-	return valid, validWeights
+	return valid, validWeights, weighted
 }
 
 // floorToMicro floors t to microsecond precision so a recorded timestamp encodes
@@ -426,8 +399,7 @@ func (m *InMemory) IncrementIfBelow(_ context.Context, key string, windowSec int
 
 	// Drop expired timestamps. Writing the pruned slice back on every call (admitted
 	// or denied) is what bounds a rate-limited key's storage.
-	weighted := isWeighted(e)
-	valid, validWeights := pruneInWindow(e, cutoff)
+	valid, validWeights, weighted := pruneInWindow(e, cutoff)
 
 	cur := int64(len(valid))
 	if cur >= limit {
@@ -489,7 +461,7 @@ func (m *InMemory) AddIfTotalBelow(_ context.Context, key string, windowSec int,
 		m.entries[sk] = e
 	}
 
-	valid, validWeights := pruneInWindow(e, cutoff)
+	valid, validWeights, _ := pruneInWindow(e, cutoff)
 	// This key is weighted from here on, whether or not it was before: a key that had
 	// only counted calls has an implicit weight of 1 for each, which materializing now
 	// makes explicit so later prunes and sums stay exact.
@@ -500,7 +472,19 @@ func (m *InMemory) AddIfTotalBelow(_ context.Context, key string, windowSec int,
 		}
 	}
 
-	cur := weightedTotal(valid, validWeights)
+	cur := weightedTotal(validWeights)
+	// A weight that cannot move the total is admitted WITHOUT being recorded. Zero is the
+	// motivating case and it is unbounded: `cur + 0 > limit` is never true, so a
+	// zero-magnitude call was admitted and appended forever, growing one key without limit
+	// and making every later call re-sum the whole window under the counter's lock (and,
+	// on Redis, re-scan the whole sorted set). Every non-zero weight is self-bounding at
+	// limit/weight entries, exactly as a maxCalls key is bounded by its limit; zero — and
+	// any weight so small that adding it is a no-op in double precision — was the one case
+	// with no bound. Recording it buys nothing either: it can never affect a future total.
+	if cur+weight == cur {
+		storeEntry(e, valid, validWeights, true)
+		return cur, true, 0, nil
+	}
 	if cur+weight > limit {
 		// Write the pruned state back on the denied path too (bounding storage exactly as
 		// IncrementIfBelow does), but record NOTHING of this call.
@@ -528,11 +512,7 @@ func retryAfterForWeight(valid []time.Time, weights []float64, needed float64, w
 	}
 	freed := 0.0
 	for i, ts := range valid {
-		if len(weights) > 0 {
-			freed += weights[i]
-		} else {
-			freed++
-		}
+		freed += weights[i]
 		if freed >= needed {
 			if r := ts.Add(window).Sub(now); r > 0 {
 				return r
@@ -589,9 +569,9 @@ func (m *InMemory) IncrementIfAllBelow(_ context.Context, keys []string, windowS
 			// Prune expired timestamps and write back now: idempotent maintenance the
 			// single-key path also does on every call, so doing it before the admit
 			// decision (and on the deny path) is safe and bounds storage.
-			st.weighted = isWeighted(e)
-			valid, validWeights := pruneInWindow(e, cutoff)
-			storeEntry(e, valid, validWeights, st.weighted)
+			valid, validWeights, weighted := pruneInWindow(e, cutoff)
+			st.weighted = weighted
+			storeEntry(e, valid, validWeights, weighted)
 			st.e = e
 			st.valid = e.timestamps
 			st.cur = int64(len(e.timestamps))

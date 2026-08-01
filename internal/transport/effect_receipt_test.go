@@ -18,6 +18,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/eunolabs/eunox/internal/audit"
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/pkg/capability"
 )
@@ -47,7 +48,7 @@ func newReceiptFixture(t *testing.T) *receiptFixture {
 	require.NoError(t, os.WriteFile(path, jwks, 0o600))
 	// Built through the production loader, so the test exercises the same path a route
 	// takes rather than a second construction that could accept what that one refuses.
-	v, err := LoadEffectReceiptVerifier(path)
+	v, err := LoadEffectReceiptVerifier("", path)
 	require.NoError(t, err)
 	require.NotNil(t, v)
 	return &receiptFixture{signer: signer, verifier: v, jwksPath: path}
@@ -97,14 +98,24 @@ func runToolCall(t *testing.T, rec *fwdRecorder, verifier *capability.EffectRece
 	return out
 }
 
-// receiptRecord returns the audit record carrying a receipt verdict, or nil.
-func receiptRecord(rec *fwdRecorder) map[string]interface{} {
-	for i := range rec.records {
-		if _, ok := rec.records[i].details["effect_receipt"]; ok {
-			return rec.records[i].details
-		}
+// receiptRecord returns the receipt verdict from the call's audit record, or nil. It also
+// asserts the single-record invariant: the verdict rides the SAME allow record as the call
+// it describes, because a second `decision: allow` for one tools/call double-counts allows
+// in `eunox stats` and is mined by `eunox suggest` as the caller's argument map.
+func receiptRecord(t *testing.T, rec *fwdRecorder) map[string]interface{} {
+	t.Helper()
+	if len(rec.records) != 1 {
+		t.Fatalf("one tools/call must produce exactly one record, got %d", len(rec.records))
 	}
-	return nil
+	nested, ok := rec.records[0].details[audit.EffectReceiptKey]
+	if !ok {
+		return nil
+	}
+	details, ok := nested.(map[string]interface{})
+	if !ok {
+		t.Fatalf("the receipt verdict must be an object under one reserved key, got %T", nested)
+	}
+	return details
 }
 
 // TestEffectReceiptVerdictReachesTheTape is the wiring case: a verified receipt is recorded
@@ -118,7 +129,7 @@ func TestEffectReceiptVerdictReachesTheTape(t *testing.T) {
 	})
 	runToolCall(t, rec, f.verifier, result)
 
-	details := receiptRecord(rec)
+	details := receiptRecord(t, rec)
 	require.NotNil(t, details, "the receipt verdict must land on the tape")
 	assert.Equal(t, "verified", details["effect_receipt"])
 }
@@ -138,7 +149,7 @@ func TestEffectReceiptIsPostHocNeverRetroactive(t *testing.T) {
 	})
 	out := runToolCall(t, rec, f.verifier, result)
 
-	details := receiptRecord(rec)
+	details := receiptRecord(t, rec)
 	require.NotNil(t, details)
 	assert.Equal(t, "inconsistent", details["effect_receipt"])
 	assert.Contains(t, details["effect_receipt_inconsistent"], capability.ReceiptReasonTool)
@@ -161,7 +172,7 @@ func TestEffectReceiptForgedEarnsNothingOnTheTape(t *testing.T) {
 	})
 	runToolCall(t, rec, real.verifier, result)
 
-	details := receiptRecord(rec)
+	details := receiptRecord(t, rec)
 	require.NotNil(t, details)
 	assert.Equal(t, "unverified", details["effect_receipt"])
 	assert.NotContains(t, details, "effect_receipt_class",
@@ -177,13 +188,13 @@ func TestEffectReceiptCostsNothingWhenUnconfigured(t *testing.T) {
 	result := f.toolResult(t, capability.EffectReceiptClaims{Tool: "refund", IssuedAt: time.Now().Unix()})
 
 	runToolCall(t, rec, nil, result)
-	assert.Nil(t, receiptRecord(rec), "an unconfigured route must record no receipt verdict at all")
+	assert.Nil(t, receiptRecord(t, rec), "an unconfigured route must record no receipt verdict at all")
 
 	// And a configured route whose upstream simply does not participate records nothing
 	// either — the surface needs no ecosystem coordination.
 	rec2 := &fwdRecorder{}
 	runToolCall(t, rec2, f.verifier, json.RawMessage(`{"content":[]}`))
-	assert.Nil(t, receiptRecord(rec2), "a server that publishes no receipt produces no verdict")
+	assert.Nil(t, receiptRecord(t, rec2), "a server that publishes no receipt produces no verdict")
 }
 
 // TestLoadEffectReceiptVerifier covers the loader's contract: an empty path disables the
@@ -191,16 +202,16 @@ func TestEffectReceiptCostsNothingWhenUnconfigured(t *testing.T) {
 // silently records every receipt as unverifiable — which would be indistinguishable from a
 // server that stopped signing.
 func TestLoadEffectReceiptVerifier(t *testing.T) {
-	v, err := LoadEffectReceiptVerifier("")
+	v, err := LoadEffectReceiptVerifier("", "")
 	require.NoError(t, err)
 	assert.Nil(t, v, "an unconfigured key domain disables the surface")
 
-	_, err = LoadEffectReceiptVerifier(filepath.Join(t.TempDir(), "absent.json"))
+	_, err = LoadEffectReceiptVerifier("", filepath.Join(t.TempDir(), "absent.json"))
 	require.Error(t, err, "a configured-but-missing key set must be fatal")
 
 	bad := filepath.Join(t.TempDir(), "bad.json")
 	require.NoError(t, os.WriteFile(bad, []byte(`{"keys":[]}`), 0o600))
-	_, err = LoadEffectReceiptVerifier(bad)
+	_, err = LoadEffectReceiptVerifier("", bad)
 	require.ErrorContains(t, err, "no keys")
 
 	// A symlinked key set is refused: a key set is a trust anchor, and following a link to
@@ -210,7 +221,7 @@ func TestLoadEffectReceiptVerifier(t *testing.T) {
 	require.NoError(t, os.WriteFile(realPath, []byte(`{"keys":[]}`), 0o600))
 	link := filepath.Join(dir, "link.json")
 	if err := os.Symlink(realPath, link); err == nil {
-		_, err = LoadEffectReceiptVerifier(link)
+		_, err = LoadEffectReceiptVerifier("", link)
 		require.Error(t, err)
 		assert.True(t, strings.Contains(err.Error(), "symbolic link"), "want a symlink refusal, got %v", err)
 	}
@@ -220,4 +231,34 @@ func TestLoadEffectReceiptVerifier(t *testing.T) {
 func receiptNum(s string) *json.Number {
 	n := json.Number(s)
 	return &n
+}
+
+// TestEffectReceiptDetailsAreNotMinedAsArguments pins the reason the verdict lives under a
+// reserved key. A tools/call allow record's details IS the caller's argument map in audit
+// mode, and `eunox suggest` mines every key of it as an argument name — so receipt fields
+// merged in bare would be drafted as allowedValues conditions on arguments no call carries,
+// producing a manifest that denies every real call to that tool.
+func TestEffectReceiptDetailsAreNotMinedAsArguments(t *testing.T) {
+	f := newReceiptFixture(t)
+	rec := &fwdRecorder{}
+	result := f.toolResult(t, capability.EffectReceiptClaims{Tool: "refund", IssuedAt: time.Now().Unix()})
+	runToolCall(t, rec, f.verifier, result)
+
+	require.Len(t, rec.records, 1)
+	for name := range rec.records[0].details {
+		assert.True(t, audit.IsReservedDetailKey(name),
+			"detail key %q would be mined as a caller-supplied tool argument", name)
+	}
+}
+
+// TestLoadEffectReceiptVerifierResolvesAgainstTheConfigDir pins that a relative key path
+// means the same thing however the proxy was launched — the same rule `policy:` follows.
+// Resolving against the process cwd instead either failed startup outright or silently
+// adopted a different file as the receipt trust anchor, under which forged receipts verify
+// and genuine ones record as unverified.
+func TestLoadEffectReceiptVerifierResolvesAgainstTheConfigDir(t *testing.T) {
+	f := newReceiptFixture(t)
+	v, err := LoadEffectReceiptVerifier(filepath.Dir(f.jwksPath), filepath.Base(f.jwksPath))
+	require.NoError(t, err)
+	require.NotNil(t, v, "a relative key path must resolve beside the config, not the cwd")
 }

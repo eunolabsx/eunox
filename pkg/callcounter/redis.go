@@ -482,9 +482,6 @@ local entries = redis.call('ZRANGE', KEYS[1], 0, -1, 'WITHSCORES')
 local weight = tonumber(ARGV[4])
 local limit = tonumber(ARGV[5])
 local total = 0
-local n = 0
-local w = {}
-local s = {}
 for i = 1, #entries, 2 do
   local m = entries[i]
   local sep = string.find(m, '|', 1, true)
@@ -492,10 +489,17 @@ for i = 1, #entries, 2 do
   if sep then
     ew = tonumber(string.sub(m, sep + 1)) or 1
   end
-  n = n + 1
-  w[n] = ew
-  s[n] = tonumber(entries[i + 1])
   total = total + ew
+end
+if total + weight == total then
+  -- A weight that cannot move the total is admitted but NOT recorded, matching the
+  -- in-memory backend: zero (and any weight too small to register in double precision) is
+  -- otherwise admitted forever and grows the sorted set without bound, making every later
+  -- call re-scan it. It can never affect a future total, so there is nothing to record.
+  if redis.call('EXISTS', KEYS[1]) == 1 then
+    redis.call('EXPIRE', KEYS[1], ARGV[6])
+  end
+  return {1, string.format('%.17g', total), 0}
 end
 if total + weight > limit then
   -- Refresh the TTL on the denied path too: a key held at its bound is never admitted, so
@@ -505,13 +509,24 @@ if total + weight > limit then
   if redis.call('EXISTS', KEYS[1]) == 1 then
     redis.call('EXPIRE', KEYS[1], ARGV[6])
   end
+  -- The retry estimate re-walks the entries array (already in memory, member and score
+  -- interleaved) rather than the script building two parallel tables of size n on EVERY
+  -- call to serve a branch only the deny path reaches. On the admit path — the common one
+  -- — that was 2n wasted table stores per call inside Redis's single-threaded execution,
+  -- growing with the window.
   local needed = (total + weight) - limit
   local retry = 0
   local freed = 0
-  for i = 1, n do
-    freed = freed + w[i]
+  for i = 1, #entries, 2 do
+    local m = entries[i]
+    local sep = string.find(m, '|', 1, true)
+    local ew = 1
+    if sep then
+      ew = tonumber(string.sub(m, sep + 1)) or 1
+    end
+    freed = freed + ew
     if freed >= needed then
-      retry = (s[i] + tonumber(ARGV[7])) - tonumber(ARGV[2])
+      retry = (tonumber(entries[i + 1]) + tonumber(ARGV[7])) - tonumber(ARGV[2])
       if retry < 0 then retry = 0 end
       break
     end

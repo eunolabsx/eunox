@@ -1582,35 +1582,42 @@ func validateMaxCallsWindowsDistinct(i int, conditions []capability.Condition) e
 // two bounds on separate capabilities, or to express the rate limit as a cumulative bound
 // with weight-like magnitudes.
 func validateOneCommittingCondition(i int, conditions []capability.Condition) error {
-	velocity := -1
+	// Index of the first cumulative bound and of the first maxCalls, remembered as the one
+	// pass goes. Remembering is exactly as order-independent as re-scanning backwards was,
+	// and it keeps the maxCalls arm of the type switch in ONE place — a third committing
+	// condition type would otherwise have to be added twice, and forgetting the second copy
+	// silently re-admits the shape this function exists to refuse.
+	velocity, maxCalls := -1, -1
 	for j, cond := range conditions {
-		var isVelocity, isMaxCalls bool
 		switch v := cond.(type) {
 		case capability.BlastRadiusCondition:
-			isVelocity = v.HasVelocity()
+			if !v.HasVelocity() {
+				continue
+			}
 		case *capability.BlastRadiusCondition:
-			isVelocity = v.HasVelocity()
+			if !v.HasVelocity() {
+				continue
+			}
 		case capability.MaxCallsCondition, *capability.MaxCallsCondition:
-			isMaxCalls = true
-		}
-		if isMaxCalls && velocity >= 0 {
-			return committingConditionConflictErr(i, velocity, j)
-		}
-		if !isVelocity {
+			if velocity >= 0 {
+				return committingConditionConflictErr(i, velocity, j)
+			}
+			if maxCalls < 0 {
+				maxCalls = j
+			}
+			continue
+		default:
 			continue
 		}
+		// A cumulative blastRadius bound: it may not join another quota-consuming
+		// condition, whichever was declared first.
 		if velocity >= 0 {
 			return committingConditionConflictErr(i, velocity, j)
 		}
-		velocity = j
-		// A maxCalls declared BEFORE the cumulative bound is caught by re-scanning rather
-		// than by remembering it: order must not decide whether the shape is legal.
-		for k, prior := range conditions[:j] {
-			switch prior.(type) {
-			case capability.MaxCallsCondition, *capability.MaxCallsCondition:
-				return committingConditionConflictErr(i, k, j)
-			}
+		if maxCalls >= 0 {
+			return committingConditionConflictErr(i, maxCalls, j)
 		}
+		velocity = j
 	}
 	return nil
 }

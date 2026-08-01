@@ -300,3 +300,30 @@ func TestAddIfTotalBelow_BackendsAgree(t *testing.T) {
 		assert.Equal(t, memTotal, rdsTotal, "step %d (weight %v): backends disagreed on the total", i, w)
 	}
 }
+
+// TestAddIfTotalBelow_WeightlessCallsAreNotRecorded pins the one weight class that had no
+// bound. `cur + 0 > limit` is never true, so a zero-magnitude call was admitted AND
+// appended every time — one key growing without limit for the whole window, with every
+// later call re-summing it under the counter's lock (and, on Redis, re-scanning the whole
+// sorted set). A weight that cannot move the total can never affect a future decision, so
+// it is admitted without being recorded.
+func TestAddIfTotalBelow_WeightlessCallsAreNotRecorded(t *testing.T) {
+	fixed := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	for name, c := range weightedBackends(t, func() time.Time { return fixed }) {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			for i := 0; i < 5000; i++ {
+				total, admitted, _, err := c.AddIfTotalBelow(ctx, "free", 3600, 0, 100)
+				require.NoError(t, err)
+				require.True(t, admitted, "a weightless action consumes no budget and must be admitted")
+				require.Zero(t, total)
+			}
+			// The budget is untouched and, crucially, nothing accumulated: a real call of
+			// the full budget still fits.
+			total, admitted, _, err := c.AddIfTotalBelow(ctx, "free", 3600, 100, 100)
+			require.NoError(t, err)
+			assert.True(t, admitted)
+			assert.InDelta(t, 100.0, total, 1e-9)
+		})
+	}
+}

@@ -306,7 +306,7 @@ func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability
 		// degraded to "no receipt ever verifies" is indistinguishable from a server that
 		// stopped signing. Absent (the default) leaves the verifier nil, and the whole
 		// surface costs nothing.
-		receipts, err := LoadEffectReceiptVerifier(u.EffectReceiptKeys)
+		receipts, err := LoadEffectReceiptVerifier(cfg.BaseDir, u.EffectReceiptKeys)
 		if err != nil {
 			return nil, fmt.Errorf("upstream %q: %w", u.Name, err)
 		}
@@ -709,6 +709,19 @@ func AnyRouteHasMaxCalls(routes map[string]*UpstreamRoute) bool {
 	return false
 }
 
+// AnyRouteHasBlastRadiusVelocity reports whether any route's policy carries a cumulative
+// blastRadius bound — the weighted sibling of AnyRouteHasMaxCalls, and per-process state
+// under the in-memory counter for the same reason, so the shared-state advisory covers both.
+func AnyRouteHasBlastRadiusVelocity(routes map[string]*UpstreamRoute) bool {
+	for _, rt := range routes {
+		// A policyless (wiretap) route has a nil manifest; guard explicitly.
+		if rt.manifest != nil && rt.manifest.HasBlastRadiusVelocity() {
+			return true
+		}
+	}
+	return false
+}
+
 // FirstRouteAudiencePin returns the name of a route whose manifest declares an
 // `audience` pin, and true, or ("", false) if none does. A manifest audience is a
 // JWT concept: it is consulted only by WrapRoutesWithJWT, which the binary wires
@@ -769,11 +782,16 @@ func AnyRouteHasFlowLabel(routes map[string]*UpstreamRoute) bool {
 //
 // Exported so the CLI can build the same verifier for the single-upstream stdio host from
 // its own flag, rather than a second loader that could drift on what it accepts.
-func LoadEffectReceiptVerifier(path string) (*capability.EffectReceiptVerifier, error) {
+func LoadEffectReceiptVerifier(baseDir, path string) (*capability.EffectReceiptVerifier, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, nil
 	}
-	resolved, err := config.ExpandHome(path)
+	// Resolved against the CONFIG's directory, exactly as `policy:` is (ResolvePolicyPath):
+	// a relative path beside the config must mean the same thing however the proxy was
+	// launched. Resolving against the process cwd instead either failed startup outright or
+	// — worse — silently adopted a different file as the receipt trust anchor, under which
+	// forged receipts verify and genuine ones record as unverified.
+	resolved, err := config.ResolvePolicyPath(baseDir, path)
 	if err != nil {
 		return nil, fmt.Errorf("resolving effectReceiptKeys path: %w", err)
 	}

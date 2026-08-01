@@ -627,18 +627,26 @@ func TestCompactTimestamps(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			in := makeSlice(tc.length, tc.capacity)
-			got := compactTimestamps(in)
+			// Driven through storeEntry, the one production path that reclaims — the
+			// standalone compactTimestamps it used to call is gone, and a table exercising
+			// a function no decision path reaches is coverage that does not exist.
+			e := &entry{timestamps: in, windowSec: 60}
+			storeEntry(e, in, nil, false)
+			got := e.timestamps
 
 			// Live contents must always survive unchanged.
 			if len(got) != tc.length {
 				t.Fatalf("len(got) = %d, want %d", len(got), tc.length)
 			}
 			for i := range got {
-				if !got[i].Equal(in[i]) {
-					t.Fatalf("element %d = %v, want %v", i, got[i], in[i])
+				if !got[i].Equal(makeSlice(tc.length, tc.capacity)[i]) {
+					t.Fatalf("element %d = %v, want %v", i, got[i], makeSlice(tc.length, tc.capacity)[i])
 				}
 			}
 
+			if want := shouldCompact(tc.capacity, tc.length); want != tc.wantShrunk {
+				t.Fatalf("shouldCompact(%d, %d) = %v, want %v", tc.capacity, tc.length, want, tc.wantShrunk)
+			}
 			if tc.wantShrunk {
 				if cap(got) != tc.length {
 					t.Errorf("expected reclaim to exact length: cap(got) = %d, want %d", cap(got), tc.length)

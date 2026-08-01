@@ -311,19 +311,72 @@ func TestBlastRadiusVelocity_BoundlessConditionFailsClosed(t *testing.T) {
 	}
 }
 
-// TestBlastRadiusVelocity_UnsummableMagnitudeFailsClosed pins the precision rule: a
-// magnitude the counter's IEEE-754 accumulator would have to ROUND is refused rather than
-// summed approximately. A budget spent in approximated units is not the budget the operator
-// authored.
+// TestBlastRadiusVelocity_FractionalMagnitudesAreSummable is the regression for the
+// feature's own headline case. The magnitude is parsed at 64-bit precision, so narrowing it
+// to a float64 mantissa reports "inexact" for any decimal that is not dyadic — which is
+// most currency amounts. Requiring exactness therefore DENIED a $19.99 refund under a
+// $2,000-an-hour bound, with a message calling it "too large". A rounded fractional
+// magnitude is summable; both counter backends accumulate in double precision by contract.
+func TestBlastRadiusVelocity_FractionalMagnitudesAreSummable(t *testing.T) {
+	e := effectEngine(nil)
+	caps := []capability.Constraint{refundConstraint("", "2000", 3600)}
+
+	for _, amount := range []string{"19.99", "0.1", "3.7", "1234.56"} {
+		resp := refund(t, e, caps, amount)
+		require.Equal(t, capability.DecisionAllow, resp.Decision,
+			"a $%s refund is well inside a $2,000 bound and must be summable", amount)
+	}
+	// And the bound still binds: the accumulated fractional total is real.
+	assert.Equal(t, capability.DecisionDeny, refund(t, e, caps, "1000").Decision,
+		"19.99 + 0.1 + 3.7 + 1234.56 + 1000 exceeds 2000")
+}
+
+// TestBlastRadiusVelocity_UnsummableMagnitudeFailsClosed pins the range rule that survives:
+// a magnitude the accumulator cannot represent AT ALL — above the 2^53 bound where the
+// Redis backend's Lua arithmetic stops being exact — is refused rather than summed.
 func TestBlastRadiusVelocity_UnsummableMagnitudeFailsClosed(t *testing.T) {
 	e := effectEngine(nil)
 	caps := []capability.Constraint{refundConstraint("", "9007199254740992", 3600)}
 
-	// 2^53 + 1: representable as a decimal literal and as a big.Float, not as a float64.
 	resp := e.ValidateAction(context.Background(),
-		effectReq("refund", map[string]interface{}{"amount": jsonNumber("9007199254740993")}), caps)
+		effectReq("refund", map[string]interface{}{"amount": jsonNumber("1e30")}), caps)
 	require.Equal(t, capability.DecisionDeny, resp.Decision)
-	assert.Contains(t, resp.Denial.Message, "too large to sum exactly")
+	assert.Contains(t, resp.Denial.Message, "outside the range")
+}
+
+// TestBlastRadiusVelocity_CeilingRefusalSpendsNoBudget pins the ordering the two-pass
+// evaluation exists for: the effect ceiling refuses a call that is never forwarded, so it
+// must not have charged that call's magnitude to the window. With the commit inside the
+// first pass, four over-ceiling escalations exhausted a session's whole hourly budget and
+// denied the legal calls that followed — an injected agent locking out the budget with
+// calls it was never allowed to make.
+func TestBlastRadiusVelocity_CeilingRefusalSpendsNoBudget(t *testing.T) {
+	e := effectEngine(&capability.EffectCeiling{MaxBlastRadius: effNum("100")})
+	caps := []capability.Constraint{refundConstraint("", "2000", 3600)}
+
+	for i := 0; i < 4; i++ {
+		resp := refund(t, e, caps, "500")
+		require.Equal(t, capability.DecisionEscalate, resp.Decision, "over-ceiling call %d", i+1)
+	}
+	resp := refund(t, e, caps, "10")
+	require.Equal(t, capability.DecisionAllow, resp.Decision,
+		"refusals that were never forwarded must not have spent the budget; got %+v", resp.Denial)
+}
+
+// TestBlastRadiusVelocity_RetryHintIsUsable pins that the retry estimate goes through the
+// shared helper: a sub-second wait must round UP rather than truncate to 0 (which tells a
+// caller to retry immediately into a guaranteed denial), and an unavailable estimate must
+// fall back to the window rather than omitting the hint.
+func TestBlastRadiusVelocity_RetryHintIsUsable(t *testing.T) {
+	e := effectEngine(nil)
+	caps := []capability.Constraint{refundConstraint("", "100", 3600)}
+	require.Equal(t, capability.DecisionAllow, refund(t, e, caps, "100").Decision)
+
+	resp := refund(t, e, caps, "100")
+	require.Equal(t, capability.DecisionDeny, resp.Decision)
+	hint, ok := resp.Denial.Details["retry_after_seconds"].(int64)
+	require.True(t, ok, "a cumulative denial must always carry a retry hint, got %v", resp.Denial.Details)
+	assert.Positive(t, hint, "a retry hint of 0 sends the caller straight back into a denial")
 }
 
 // TestBlastRadiusVelocity_BackendFaultDenies pins the fail-closed posture on an

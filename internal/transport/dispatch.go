@@ -7,6 +7,7 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -475,71 +476,89 @@ func dispatchToolsCall(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mc
 			// the new reserved name: on the vanishingly rare call whose real argument is
 			// literally named "_eunox_upstream_error_code", nest instead of overwriting it.
 			extra := upstreamErrorDetail(upResp)
-			if extra == nil {
+			// The signed effect receipt, verified here so its verdict rides the SAME allow
+			// record as the call it describes rather than a second one. A separate record
+			// was a second `decision: allow` for one tools/call: it double-counted allows in
+			// `eunox stats`, and `eunox suggest` mined its details as the caller's argument
+			// map — drafting allowedValues conditions on arguments no call carries, which
+			// denies every real call to that tool. nil when receipts are unconfigured or the
+			// server published none, which is the default and costs nothing.
+			receipt := d.effectReceiptDetail(upResp, dec, params.Name)
+			if extra == nil && receipt == nil {
 				return toolDetails
 			}
 			if _, collide := toolDetails[audit.UpstreamErrorCodeKey]; collide {
-				return map[string]interface{}{
-					"arguments":                toolDetails,
-					audit.UpstreamErrorCodeKey: extra[audit.UpstreamErrorCodeKey],
+				nested := map[string]interface{}{"arguments": toolDetails}
+				if extra != nil {
+					nested[audit.UpstreamErrorCodeKey] = extra[audit.UpstreamErrorCodeKey]
 				}
+				if receipt != nil {
+					nested[audit.EffectReceiptKey] = receipt
+				}
+				return nested
 			}
-			details := make(map[string]interface{}, len(toolDetails)+len(extra))
+			details := make(map[string]interface{}, len(toolDetails)+len(extra)+1)
 			for k, v := range toolDetails {
 				details[k] = v
 			}
 			for k, v := range extra {
 				details[k] = v
 			}
+			if receipt != nil {
+				// Under ONE reserved, underscore-prefixed key whose value is an object, so
+				// the verdict's several dimensions never flatten into the argument map a
+				// miner reads (see audit.EffectReceiptKey).
+				details[audit.EffectReceiptKey] = receipt
+			}
 			return details
 		})
-	return d.withEffectReceipt(ctx, out, dec, params.Name)
+	return out
 }
 
-// withEffectReceipt verifies the signed effect receipt an upstream published in the tool
-// result's `_meta`, and folds the verdict into the response the host receives — which it
-// never alters — by way of the record that was already written for this call.
+// effectReceiptDetail verifies the signed effect receipt an upstream published in the tool
+// result's `_meta` and returns the structured verdict for this call's audit record, or nil
+// when there is nothing to record.
 //
 // It is POST-HOC by construction and must stay so. The call has already been forwarded and
 // answered; a receipt cannot un-forward it, so an inconsistency is evidence on the tape and
-// an input to future friction, never a late denial. Making it one would be a decision taken
-// after the side effect, which is the one thing the enforcement point exists to precede.
+// an input to future friction, never a late denial. Nothing here touches the response the
+// host receives.
 //
-// It is also VERIFICATION ONLY: the declared `_meta` block is read and nothing else. No
+// It is also VERIFICATION ONLY: the declared block is read and nothing else. No
 // server-egress watching, no inference from the payload.
 //
-// Zero cost when unconfigured: with no key domain for this upstream (the default) the
-// verifier is nil and this returns immediately, before decoding a single byte of the result.
-func (d dispatchParams) withEffectReceipt(ctx context.Context, out mcp.RPCMsg, dec capability.EnforceResponse, tool string) mcp.RPCMsg {
-	if d.receipts == nil || out.Result == nil {
-		return out
+// Zero cost when unconfigured: with no key domain for this upstream (the default) this
+// returns before touching a single byte of the result.
+func (d dispatchParams) effectReceiptDetail(upResp mcp.RPCMsg, dec capability.EnforceResponse, tool string) map[string]interface{} {
+	if d.receipts == nil || upResp.Result == nil {
+		return nil
 	}
-	// Only an ALLOW carries a resolved contract to check the attestation against, and only
-	// an allowed call reached the upstream in the first place. An observe-mode forward is
-	// deliberately included: the call ran, so the server's account of it is worth the same
-	// scrutiny — it just has no declaration to compare against, which Verify handles.
+	// A substring probe before the full decode. A tool result is the largest body on the
+	// wire — base64 image content, file reads, query dumps — and almost none of them carry
+	// a receipt, so paying a whole JSON scan per call to discover its absence is the cost
+	// this avoids. A miss is safe in the only direction that matters: an escaped or
+	// otherwise unrecognizable key reads as "no receipt", which earns nothing, exactly as
+	// the default does.
+	if !bytes.Contains(upResp.Result, []byte(capability.MetaKeyEffectReceipt)) {
+		return nil
+	}
 	var meta struct {
 		Meta map[string]json.RawMessage `json:"_meta"`
 	}
-	if err := json.Unmarshal(out.Result, &meta); err != nil || len(meta.Meta) == 0 {
-		return out
+	if err := json.Unmarshal(upResp.Result, &meta); err != nil || len(meta.Meta) == 0 {
+		return nil
 	}
 	raw, present := capability.ParseEffectReceipt(meta.Meta)
 	if !present {
-		return out
+		return nil
 	}
+	// Only an allowed call reached the upstream, and only an allow carries a resolved
+	// contract to check the attestation against. An observe-mode forward is deliberately
+	// included: the call ran, so the server's account of it is worth the same scrutiny —
+	// it just has no declaration to compare against, which Verify handles.
 	result := d.receipts.Verify(raw, tool, dec.Effect, time.Now())
 	if result == nil {
-		return out
-	}
-	// The verdict rides its own record rather than being merged into the allow record
-	// written moments ago: that record was enqueued before the upstream answered this
-	// question, and an append-only tape is never rewritten. A separate record keeps both
-	// facts — what was authorized, and what the server then said it did — each stamped at
-	// the moment it was known.
-	if d.rec != nil {
-		d.rec.RecordAllow(ctx, d.sessionID, tool, capability.MethodToolsCall,
-			result.AuditDetails(), nil, true, nil, nil)
+		return nil
 	}
 	if result.Verdict == capability.ReceiptInconsistent {
 		// The one verdict that is a finding rather than bookkeeping: a server whose own
@@ -550,7 +569,7 @@ func (d dispatchParams) withEffectReceipt(ctx context.Context, out mcp.RPCMsg, d
 			"[eunox] WARN effect-receipt tool=%q — the upstream's signed receipt contradicts the effect contract this policy declares (%s); the call already ran, so this is evidence, not a refusal\n",
 			audit.SanitizeAuditField(tool), strings.Join(result.Reasons, ", "))
 	}
-	return out
+	return result.AuditDetails()
 }
 
 // dispatchResourcesRead applies the PDP to a resources/read request and either
@@ -812,7 +831,13 @@ func completeToolsListing(params, result json.RawMessage) bool {
 		var req struct {
 			Cursor *string `json:"cursor"`
 		}
-		if err := json.Unmarshal(params, &req); err != nil {
+		// mcp.DecodeParams, not a bare json.Unmarshal: it rejects a duplicate or
+		// case-folded object key before decoding. Go keeps the LAST value on a duplicate,
+		// so `{"cursor":"page2","cursor":null}` would otherwise decode to "no cursor" and
+		// mark a single-page fetch COMPLETE — after which Tier-2 reports every tool on the
+		// remaining pages as removed. Every other params decode in this file already goes
+		// through it; this is the same parser differential, reached through a new door.
+		if err := mcp.DecodeParams(params, &req); err != nil {
 			return false
 		}
 		if req.Cursor != nil && *req.Cursor != "" {

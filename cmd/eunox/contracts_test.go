@@ -181,7 +181,7 @@ func TestEffectCoverageNamesTheWorklist(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	writeEffectCoverage(&buf, "", m)
+	writeEffectCoverage(&buf, "", m, true)
 	got := buf.String()
 	if !strings.Contains(got, "effect coverage: 1/3 capabilities annotated") {
 		t.Errorf("want the annotated ratio, got:\n%s", got)
@@ -198,7 +198,7 @@ func TestEffectCoverageNamesTheWorklist(t *testing.T) {
 
 	m.EffectCeiling = &capability.EffectCeiling{MaxEffectClass: capability.EffectReversible}
 	buf.Reset()
-	writeEffectCoverage(&buf, "  ", m)
+	writeEffectCoverage(&buf, "  ", m, true)
 	got = buf.String()
 	if !strings.Contains(got, "ESCALATE under this policy's effectCeiling") {
 		t.Errorf("under a ceiling the consequence is present tense, got:\n%s", got)
@@ -212,7 +212,7 @@ func TestEffectCoverageNamesTheWorklist(t *testing.T) {
 // prints nothing: "0/0 annotated" is noise, not a progress meter.
 func TestEffectCoverageSilentOnAnEmptyManifest(t *testing.T) {
 	var buf bytes.Buffer
-	writeEffectCoverage(&buf, "", &config.LocalManifest{})
+	writeEffectCoverage(&buf, "", &config.LocalManifest{}, true)
 	if buf.Len() != 0 {
 		t.Errorf("want no output for an empty manifest, got %q", buf.String())
 	}
@@ -248,5 +248,32 @@ capabilities:
 	}
 	if !strings.Contains(out, "tool:send_email") {
 		t.Errorf("validate must name the unannotated capability, got:\n%s", out)
+	}
+}
+
+// TestEffectCoverageWithheldTargetsForTheBundle pins the doctor posture. That bundle is
+// written to be pasted into a public bug report, and a capability target is a resource URI
+// or a tool name ("resource:postgres://prod-billing/*"); every other manifest line there is
+// deliberately a count or a digest, so this must not become the one place it leaks contents.
+func TestEffectCoverageWithheldTargetsForTheBundle(t *testing.T) {
+	m := &config.LocalManifest{
+		Capabilities: []capability.Constraint{
+			{Target: "resource:postgres://prod-billing/*"},
+			{Target: "tool:transfer_funds_prod"},
+		},
+	}
+	var buf bytes.Buffer
+	writeEffectCoverage(&buf, "", m, false)
+	got := buf.String()
+	if !strings.Contains(got, "effect coverage: 0/2 capabilities annotated") {
+		t.Errorf("the ratio must still be reported, got:\n%s", got)
+	}
+	if !strings.Contains(got, "unannotated: 2") {
+		t.Errorf("the count must still be reported, got:\n%s", got)
+	}
+	for _, secret := range []string{"prod-billing", "transfer_funds_prod"} {
+		if strings.Contains(got, secret) {
+			t.Errorf("the redacted bundle must not name capability targets; found %q in:\n%s", secret, got)
+		}
 	}
 }

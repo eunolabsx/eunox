@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"math/big"
 	"strconv"
 	"strings"
 	"time"
@@ -201,12 +200,9 @@ func (e *Engine) commitBlastRadiusVelocity(ctx context.Context, br *capability.B
 		// The same rule the per-call bound applies, for the same reason: an action whose
 		// size cannot be established must not contribute 0 to a sum. Treating it as
 		// weightless would make the unannotated call the one way to spend nothing.
-		details := eff.AuditDetails()
-		details["blast_radius_max_total"] = br.MaxTotal.String()
-		details["blast_radius_window_seconds"] = br.WindowSeconds
 		return effectDenial(capability.ConditionTypeBlastRadius, fmt.Sprintf(
 			"this call's blast radius could not be quantified, so it cannot be summed against the cumulative bound of %s per %ds%s",
-			br.MaxTotal.String(), br.WindowSeconds, unannotatedHint(eff)), details)
+			br.MaxTotal.String(), br.WindowSeconds, unannotatedHint(eff)), velocityDetails(eff, br))
 	}
 
 	key, skip, condErr := e.blastRadiusBucket(ctx, req)
@@ -224,14 +220,12 @@ func (e *Engine) commitBlastRadiusVelocity(ctx context.Context, br *capability.B
 	// double cannot represent (above 2^53, or non-finite) resolves as UNQUANTIFIED rather
 	// than being rounded into the sum: a budget spent in approximated units is not the
 	// budget the operator authored.
-	weight, wExact := eff.BlastRadius.Float64()
+	weight, _ := eff.BlastRadius.Float64()
 	limitF, _ := limit.Float64()
-	if !weightSummable(weight, wExact) {
-		details := eff.AuditDetails()
-		details["blast_radius_max_total"] = br.MaxTotal.String()
+	if !weightSummable(weight) {
 		return effectDenial(capability.ConditionTypeBlastRadius, fmt.Sprintf(
-			"this call's blast radius %s is too large to sum exactly against a cumulative bound, so it cannot be shown to be within %s",
-			eff.BlastRadius.Text('f', -1), br.MaxTotal.String()), details)
+			"this call's blast radius %s is outside the range a cumulative bound can sum, so it cannot be shown to be within %s",
+			eff.BlastRadius.Text('f', -1), br.MaxTotal.String()), velocityDetails(eff, br))
 	}
 
 	total, admitted, retryAfter, err := e.counter.AddIfTotalBelow(ctx, key, br.WindowSeconds, weight, limitF)
@@ -244,35 +238,49 @@ func (e *Engine) commitBlastRadiusVelocity(ctx context.Context, br *capability.B
 	if admitted {
 		return nil
 	}
-	details := eff.AuditDetails()
-	details["blast_radius_max_total"] = br.MaxTotal.String()
-	details["blast_radius_window_seconds"] = br.WindowSeconds
+	details := velocityDetails(eff, br)
 	details["blast_radius_total"] = total
-	if retryAfter > 0 {
-		details["retry_after_seconds"] = int64(retryAfter.Seconds())
-	}
+	// The SHARED helper every other quota condition uses: it rounds a fractional estimate
+	// UP (a truncating int64 conversion reported a 900ms wait as 0, telling the caller to
+	// retry immediately into a guaranteed denial) and falls back to the full window when no
+	// estimate could be made, rather than omitting the hint entirely.
+	details["retry_after_seconds"] = retryAfterSeconds(retryAfter, br.WindowSeconds)
 	return effectDenial(capability.ConditionTypeBlastRadius, fmt.Sprintf(
 		"this call's blast radius %s would take this session's cumulative total for the target past the permitted %s per %ds (already %s within the window)",
 		eff.BlastRadius.Text('f', -1), br.MaxTotal.String(), br.WindowSeconds, formatTotal(total)), details)
 }
 
-// weightSummable reports whether a resolved magnitude can join a weighted total exactly
-// enough to enforce the authored bound. Float64 reports inexactness for a value that
-// needed rounding; a rounded magnitude is refused rather than summed, because a budget
-// spent in approximated units is not the budget the operator authored. A non-finite value
-// is refused for the same reason the counter refuses it: NaN makes every later comparison
-// admit, and an infinity exhausts the budget permanently.
-func weightSummable(weight float64, exact big.Accuracy) bool {
+// weightSummable reports whether a resolved magnitude can join a weighted total at all.
+//
+// It tests REPRESENTABILITY, not exactness. Requiring big.Exact here was wrong and broke
+// the feature's own headline case: ParseBlastRadiusNumber builds the magnitude at 64-bit
+// precision, so narrowing to a float64's 53-bit mantissa reports Below/Above for any
+// decimal that is not dyadic — which is most currency amounts. A $19.99 refund was denied
+// under a $2,000-an-hour bound, with a message calling it "too large".
+//
+// A rounded fractional magnitude IS summable, and the counter contract already says so:
+// both backends accumulate in IEEE-754 double precision, and a fractional value can differ
+// from an exact decimal sum in the last bits, far below any bound an operator authors. What
+// is genuinely unsummable is a value the double cannot hold at all — non-finite, negative,
+// or above the 2^53 bound where the Redis backend's Lua arithmetic stops being exact —
+// and each of those is refused, matching the counter's own guard.
+func weightSummable(weight float64) bool {
 	if math.IsNaN(weight) || math.IsInf(weight, 0) {
 		return false
 	}
-	if weight < 0 || weight > capability.MaxWeightedTotal {
-		return false
-	}
-	// Exact means the double IS the value. Below/Above mean it was rounded — tolerable for
-	// a comparison, but not for a running sum whose whole point is that the operator's
-	// number is the number enforced.
-	return exact == big.Exact
+	return weight >= 0 && weight <= capability.MaxWeightedTotal
+}
+
+// velocityDetails builds the structured denial details every cumulative-bound refusal
+// carries: the effect's own fields plus the bound that was not met. One builder, because
+// the three refusal sites had hand-copied it and one copy had already dropped
+// blast_radius_window_seconds — leaving a SIEM rule keyed on that field silently blind to
+// one whole class of velocity denial.
+func velocityDetails(eff *capability.ResolvedEffect, br *capability.BlastRadiusCondition) map[string]interface{} {
+	details := eff.AuditDetails()
+	details["blast_radius_max_total"] = br.MaxTotal.String()
+	details["blast_radius_window_seconds"] = br.WindowSeconds
+	return details
 }
 
 // formatTotal renders a running weighted total for an operator-facing denial without

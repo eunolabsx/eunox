@@ -714,13 +714,14 @@ func WithConditionHandler(name string, handler ConditionHandler) Option {
 	}
 }
 
-// runConditions evaluates every condition on matched in order. It returns a
-// non-nil deny response on the first condition with an unknown type or a Handle
-// failure (fail closed), and nil when all conditions pass. requestID and now
+// runPureConditions evaluates every PURE (non-committing) condition on matched in order
+// and returns the deferred (quota-consuming) ones for the caller to commit later. It
+// returns a non-nil deny response on the first condition with an unknown type or a Handle
+// failure (fail closed). requestID and now
 // stamp the returned response so it matches the surrounding decision; AuditOnly
 // mirrors the matched constraint. Extracted so ValidateAction and
 // EvaluateConditions share one dispatch path and cannot diverge.
-func (e *Engine) runConditions(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, requestID, now string) *capability.EnforceResponse {
+func (e *Engine) runPureConditions(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, requestID, now string) ([]capability.Condition, *capability.EnforceResponse) {
 	// Two passes over matched.Conditions so a consuming condition never burns its
 	// quota for a call a later condition denies. The loop just below is the first
 	// pass: it walks matched.Conditions once, evaluating every pure-predicate
@@ -766,17 +767,25 @@ func (e *Engine) runConditions(ctx context.Context, req *capability.EnforceReque
 				HardDeny: true,
 				Message:  "constraint carries a null condition that cannot be evaluated",
 			})
-			return &resp
+			return nil, &resp
 		}
 		if e.isDeferredCondition(cond.ConditionType()) {
 			deferred = append(deferred, cond)
 			continue
 		}
 		if deny := e.evalCondition(ctx, cond, req, matched, requestID, now); deny != nil {
-			return deny
+			return nil, deny
 		}
 	}
 
+	return deferred, nil
+}
+
+// commitDeferredConditions runs the SECOND pass: it evaluates (and commits) the deferred
+// conditions runPureConditions collected. It is called only after every check that can
+// refuse the call without state — the pure predicates, the obligation collection, and the
+// EFFECT CEILING — has passed, so nothing here is charged to a call that is then refused.
+func (e *Engine) commitDeferredConditions(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, deferred []capability.Condition, requestID, now string) *capability.EnforceResponse {
 	// More than one consuming condition: commit atomically across all buckets so
 	// two concurrent same-session requests cannot both observe headroom and both
 	// commit (a per-bucket commit leaves a check→commit TOCTOU). A single deferred
@@ -1095,8 +1104,11 @@ func (e *Engine) evalCondition(ctx context.Context, cond capability.Condition, r
 // evaluates every condition and — on allow — collects obligations BEFORE recording the
 // call in session history. That ordering is load-bearing: recording first would let a
 // later sequenceBlock Peek treat a hard-denied (never-forwarded) call as "run".
-// runConditions, CollectObligations, and RecordSessionCall each short-circuit to their
-// own deny (a failing condition, an unhandled directive, or a history-write fault).
+// The condition evaluation is TWO passes with the ceiling between them: every pure
+// predicate runs first, then the ceiling, then the quota-consuming commits — so no budget,
+// slot or label is charged to a call that a later check still refuses. runPureConditions,
+// CollectObligations, checkEffectCeiling, commitDeferredConditions and RecordSessionCall
+// each short-circuit to their own deny.
 // Shared by ValidateAction and EvaluateConditions so the two cannot diverge on this
 // security-critical ordering.
 func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, requestID, now string) (resp capability.EnforceResponse) {
@@ -1184,7 +1196,11 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 		}()
 	}
 
-	if deny := e.runConditions(ctx, req, matched, requestID, now); deny != nil {
+	// PASS ONE: the pure predicates. The deferred (quota-consuming) conditions are
+	// collected but NOT committed here — the ceiling below has to be able to refuse the
+	// call before anything is charged to it.
+	deferred, deny := e.runPureConditions(ctx, req, matched, requestID, now)
+	if deny != nil {
 		return *deny
 	}
 
@@ -1204,6 +1220,16 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 	// neither a phantom sequenceBlock antecedent nor a stranded flow label behind.
 	if ceilingDeny := e.checkEffectCeiling(effect, matched, carriedLabels, requestID, now); ceilingDeny != nil {
 		return *ceilingDeny
+	}
+
+	// PASS TWO: commit the deferred conditions, now that nothing left can refuse the call
+	// without state. This ordering is load-bearing and was wrong: with the commit inside
+	// the first pass, an over-ceiling call spent its cumulative blastRadius budget before
+	// the ceiling ever ran, so four never-forwarded escalations could exhaust a session's
+	// whole hourly budget and deny the legal calls that followed — the same phantom state
+	// the antecedent and flow-label ordering below exists to prevent, in a third currency.
+	if deny := e.commitDeferredConditions(ctx, req, matched, deferred, requestID, now); deny != nil {
+		return *deny
 	}
 
 	// Commit this call's sequenceBlock antecedent and flow labels as a single

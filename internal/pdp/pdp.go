@@ -1657,11 +1657,26 @@ func (p *ManifestPDP) hardenOnEffectCeiling(ctx context.Context, sessionID strin
 			" (this call was also refused by the wrapping authorization layer: " + r.Denial.Message + ")"
 		out.Denial = &denial
 	}
-	// Obligations describe how to redact a FORWARDED response. Neither ceiling outcome is
-	// forwarded on this path — the escalate arm sets HardDeny, and the deny arm replaces a
-	// refusal that was already not going to be an allow.
-	out.Obligations = nil
-	return out, true
+	// The composed refusal must never be SOFTER than the one it replaces. The ceiling's
+	// onExceed:deny arm is built with the matched constraint's own audit posture, so a
+	// constraint marked `enforcement: audit` handed back AuditOnly=true — which the
+	// transport's isObserveDeny reads as "downgrade and forward". Inheriting it turned a
+	// JWT refusal that BLOCKED on an enforce route into a forwarded, executed call: a
+	// hardening path making an over-ceiling, token-refused action run. Taking the AND
+	// keeps the composed posture at least as hard as both inputs.
+	out.AuditOnly = out.AuditOnly && r.AuditOnly
+	if out.Denial != nil && out.Denial.HardDeny {
+		// Never forwarded (the escalate arm), so there is no response to redact and
+		// obligations would be a claim that a redaction ran.
+		out.Obligations = nil
+		return out, true
+	}
+	// Still downgradable (onExceed: deny), so a route running --audit WILL forward it — and
+	// a forwarded response must carry the manifest's redactFields obligations or it reaches
+	// the host unmasked. Stripping them here re-opened the exact fail-open this whole seam
+	// exists to close: adding an effect ceiling silently removed redaction that the same
+	// request got without one.
+	return p.withForwardObligationsFor(ctx, out, matched), true
 }
 
 // directivesNamingTarget collects the directives of every capability whose target type +

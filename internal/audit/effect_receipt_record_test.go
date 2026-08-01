@@ -112,3 +112,62 @@ func receiptNumber(s string) *json.Number {
 	n := json.Number(s)
 	return &n
 }
+
+// TestVelocityDenialFieldsSignAndVerifyRoundTrip is the same audit-discipline check for the
+// cumulative blastRadius denial's four fields. They are the only NUMERIC detail values the
+// effect layer produces (a window in int, a running total in float64, a retry hint in
+// int64), and numeric details are exactly where the chain has bitten before: VerifyRecord's
+// JSON round trip decodes them back as float64, so a correctly-signed record can fail its
+// own HMAC unless the verifier re-encodes them the way the signer did.
+func TestVelocityDenialFieldsSignAndVerifyRoundTrip(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+	keyPath := filepath.Join(dir, "audit.key")
+
+	sink, err := Open(logPath, keyPath, 0, 0)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	details := map[string]interface{}{
+		"effect":                      true,
+		"effect_class":                capability.EffectCompensable,
+		"annotated":                   true,
+		"blast_radius":                "1999.99",
+		"blast_radius_unit":           "usd",
+		"blast_radius_max_total":      "2000",
+		"blast_radius_window_seconds": 3600,
+		"blast_radius_total":          1999.99,
+		"retry_after_seconds":         int64(2718),
+	}
+	sink.RecordDeny(context.Background(), "sess", "refund", capability.MethodToolsCall,
+		capability.ErrCodeConditionFailed, capability.ConditionTypeBlastRadius, details, false)
+	if err := sink.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	lines := logLines(t, logPath)
+	if len(lines) != 1 {
+		t.Fatalf("want 1 record, got %d", len(lines))
+	}
+	var sb strings.Builder
+	res, err := VerifyLog(bytes.NewReader(bytes.Join(lines, []byte("\n"))), verifierFor(t, keyPath), "", time.Time{}, &sb)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if !res.OK() {
+		t.Fatalf("a cumulative blastRadius denial must verify cleanly; output:\n%s\nresult: %+v", sb.String(), res)
+	}
+
+	var rec struct {
+		Details map[string]interface{} `json:"details"`
+	}
+	if err := json.Unmarshal(lines[0], &rec); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, key := range []string{"blast_radius_max_total", "blast_radius_window_seconds", "blast_radius_total", "retry_after_seconds"} {
+		if _, present := rec.Details[key]; !present {
+			t.Fatalf("the signed record must carry %q; got details %v", key, rec.Details)
+		}
+	}
+}
