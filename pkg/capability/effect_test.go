@@ -5,6 +5,7 @@ package capability
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -387,4 +388,126 @@ func TestResolvedEffectAuditDetailsAreStructured(t *testing.T) {
 // zeroHex is a well-formed 64-char lowercase hex digest for a fixture ref.
 func zeroHex() string {
 	return "0000000000000000000000000000000000000000000000000000000000000000"
+}
+
+// TestEffectVocabularyAccessors pins the closed-set accessors and that the exported
+// vocabulary cannot be mutated through the copy callers receive — an exported mutable
+// vocabulary would let any code in the process widen what counts as a valid class.
+func TestEffectVocabularyAccessors(t *testing.T) {
+	for _, c := range []string{EffectReversible, EffectCompensable, EffectIrreversible} {
+		if !IsEffectClass(c) {
+			t.Errorf("IsEffectClass(%q) must be true", c)
+		}
+	}
+	for _, c := range []string{"", "safe", "REVERSIBLE"} {
+		if IsEffectClass(c) {
+			t.Errorf("IsEffectClass(%q) must be false — the vocabulary is closed and case-exact", c)
+		}
+	}
+	v := EffectClassVocabulary()
+	v[0] = "tampered"
+	if EffectClassVocabulary()[0] != EffectReversible {
+		t.Fatal("EffectClassVocabulary must hand out a copy, not the package's own slice")
+	}
+	if got := SortedEffectClasses([]string{EffectIrreversible, EffectReversible, "unknown"}); got[0] != EffectReversible {
+		t.Fatalf("SortedEffectClasses must order by consequence, got %v", got)
+	}
+}
+
+// TestEffectContractDigestIsStableAndExcludesItsOwnRef pins the two properties the
+// registry pin depends on: the digest is a pure function of the contract's content
+// (independent of how a source document ordered its keys, because encoding/json sorts map
+// keys), and a contract carrying its own ref digests to that same ref — a self-reference
+// cannot be inside its own digest.
+func TestEffectContractDigestIsStableAndExcludesItsOwnRef(t *testing.T) {
+	build := func(cases map[string]EffectCase) *EffectContract {
+		return &EffectContract{
+			Class:      EffectReversible,
+			ByArgument: &EffectByArgument{Argument: "op", Cases: cases},
+		}
+	}
+	a := build(map[string]EffectCase{"SELECT": {Class: EffectReversible}, "DROP": {Class: EffectIrreversible}})
+	b := build(map[string]EffectCase{"DROP": {Class: EffectIrreversible}, "SELECT": {Class: EffectReversible}})
+	da, err := EffectContractDigest(a)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	db, err := EffectContractDigest(b)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	if da != db {
+		t.Fatalf("map-key order must not change the digest: %s vs %s", da, db)
+	}
+
+	withRef := *a
+	withRef.Ref = "acme/server.tool@" + da
+	dr, err := EffectContractDigest(&withRef)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	if dr != da {
+		t.Fatalf("ref must be excluded from the digest: %s vs %s", dr, da)
+	}
+
+	if _, err := EffectContractDigest(nil); err == nil {
+		t.Fatal("a nil contract must not digest to something")
+	}
+
+	id, digest, ok := SplitEffectRef(withRef.Ref)
+	if !ok || id != "acme/server.tool" || digest != da {
+		t.Fatalf("SplitEffectRef(%q) = (%q, %q, %v)", withRef.Ref, id, digest, ok)
+	}
+	for _, bad := range []string{"", "no-at-sign", "@sha256:x", "id@"} {
+		if _, _, ok := SplitEffectRef(bad); ok {
+			t.Errorf("SplitEffectRef(%q) must not report ok", bad)
+		}
+	}
+}
+
+// TestEffectByArgumentMatchesNonStringKeys pins that a decision table can key on a numeric
+// or boolean argument, not only a string — an effect that turns on a flag or a tier number
+// is as ordinary as one that turns on a SQL verb.
+func TestEffectByArgumentMatchesNonStringKeys(t *testing.T) {
+	contract := &EffectContract{
+		Class: EffectReversible,
+		ByArgument: &EffectByArgument{
+			Argument: "permanent",
+			Cases: map[string]EffectCase{
+				"true":  {Class: EffectIrreversible},
+				"false": {Class: EffectReversible},
+			},
+		},
+	}
+	if got := ResolveEffect(contract, map[string]interface{}{"permanent": true}); got.Class != EffectIrreversible {
+		t.Fatalf("a boolean argument must match its case, got %q", got.Class)
+	}
+	numeric := &EffectContract{
+		Class:      EffectReversible,
+		ByArgument: &EffectByArgument{Argument: "tier", Cases: map[string]EffectCase{"3": {Class: EffectIrreversible}}},
+	}
+	if got := ResolveEffect(numeric, map[string]interface{}{"tier": json.Number("3")}); got.Class != EffectIrreversible {
+		t.Fatalf("a numeric argument must match its case, got %q", got.Class)
+	}
+}
+
+// TestResolvedEffectStringNamesTheUnquantifiedCase pins the operator-facing rendering:
+// an unquantified effect must SAY so rather than print a misleading zero, and an
+// unannotated one must be distinguishable from one that was declared irreversible.
+func TestResolvedEffectStringNamesTheUnquantifiedCase(t *testing.T) {
+	bare := UnannotatedEffect().String()
+	if !strings.Contains(bare, "blastRadius=unquantified") || !strings.Contains(bare, "unannotated") {
+		t.Fatalf("unannotated rendering must name both facts, got %q", bare)
+	}
+	v, _ := ParseBlastRadiusNumber(json.Number("7"))
+	full := ResolvedEffect{Class: EffectCompensable, BlastRadius: v, Quantified: true, Unit: "rows",
+		CompensatingAction: "tool:restore", Annotated: true}.String()
+	for _, want := range []string{"class=compensable", "blastRadius=7 rows", "compensatingAction=tool:restore"} {
+		if !strings.Contains(full, want) {
+			t.Fatalf("rendering must contain %q, got %q", want, full)
+		}
+	}
+	if strings.Contains(full, "unannotated") {
+		t.Fatalf("an annotated effect must not render as unannotated: %q", full)
+	}
 }
