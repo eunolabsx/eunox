@@ -42,6 +42,16 @@ func ctxWithAgent(agentID string) context.Context {
 	return WithJWTClaims(context.Background(), &JWTClaims{AgentID: agentID})
 }
 
+// specFor builds the redactSpec the redaction walk threads, from raw dot-paths, so a
+// white-box test can call an inner redaction function the way ApplyRedactObligs does
+// (paths root-normalized once, fold scope derived from them once).
+func specFor(paths ...string) redactSpec {
+	for i := range paths {
+		paths[i] = normalizeDotPathRoot(paths[i])
+	}
+	return redactSpec{paths: paths, fold: redactionFoldKeys(paths)}
+}
+
 // callTool runs a tools/call decision through the ManifestPDP.
 func callTool(p *ManifestPDP, ctx context.Context, name string, args map[string]interface{}) capability.EnforceResponse {
 	return p.Decide(ctx, "sess-1", EnforceTarget{Type: capability.TargetTypeTool, Name: name}, args, "")
@@ -67,6 +77,13 @@ func (denyAllPDP) Decide(_ context.Context, _ string, target EnforceTarget, _ ma
 }
 
 func (denyAllPDP) DecideResourceRead(_ context.Context, _, uri, _ string) capability.EnforceResponse {
+	return capability.EnforceResponse{
+		Decision: capability.DecisionDeny,
+		Denial:   &capability.DenialInfo{Code: "CAPABILITY_DENIED", Message: "denied by test policy: " + uri},
+	}
+}
+
+func (denyAllPDP) DecideResourceCancel(_ context.Context, _, uri, _ string) capability.EnforceResponse {
 	return capability.EnforceResponse{
 		Decision: capability.DecisionDeny,
 		Denial:   &capability.DenialInfo{Code: "CAPABILITY_DENIED", Message: "denied by test policy: " + uri},
@@ -118,6 +135,10 @@ func (s *staticPDP) Decide(_ context.Context, _ string, _ EnforceTarget, _ map[s
 }
 
 func (s *staticPDP) DecideResourceRead(_ context.Context, _, _, _ string) capability.EnforceResponse {
+	return s.decision
+}
+
+func (s *staticPDP) DecideResourceCancel(_ context.Context, _, _, _ string) capability.EnforceResponse {
 	return s.decision
 }
 

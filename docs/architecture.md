@@ -116,8 +116,8 @@ The path of a single enforced request (e.g. `tools/call`):
    name, and arguments. Methods with no enforcement mapping are rejected —
    never forwarded by default.
 2. **PDP decision.** The transport calls `PolicyDecisionPoint.Decide` (or
-   `DecideResourceRead` / `DecidePromptGet`). For the manifest PDP the
-   decision order is:
+   `DecideResourceRead` / `DecideResourceCancel` / `DecidePromptGet`). For the
+   manifest PDP the decision order is:
    1. *Kill switch* — a blocked session or agent is denied (`KILL_SWITCH`);
       a backend error also denies (`KILL_SWITCH_ERROR`), never fails open.
    2. *Constraint lookup* — the most specific manifest entry whose namespace
@@ -147,6 +147,14 @@ The path of a single enforced request (e.g. `tools/call`):
    decision, denial code, condition type, and any obligations applied
    (each `redactFields` obligation recorded as one `type:path` token per
    masked field, so the trail names which fields were redacted).
+
+`resources/unsubscribe` stops after step 3. `DecideResourceCancel` runs the kill
+switch, the constraint lookup, and the action check, then allows: cancelling a
+subscription only reduces data flow, so it is authorized by *match alone* and
+commits no session state. Charging it the entry's conditions would let a spent
+`maxCalls` budget deny the unsubscribe that closes the stream the subscribe
+opened, and would record a `sequenceBlock` antecedent and `labelOutput` taint for
+a request that transfers nothing.
 
 A constraint marked audit-only ("observe mode") computes the same verdict but
 downgrades its own denial to a logged-but-forwarded allow; the record carries
@@ -233,9 +241,13 @@ route — consistent with the proxy-wide fail-closed invariant.
 `internal/pdp/pdp.go` defines the one contract the transports program against:
 
 - **`PolicyDecisionPoint`** — `Decide` / `DecideResourceRead` /
-  `DecidePromptGet`, each returning a `capability.EnforceResponse` (the same
-  type the enforcement engine produces), plus a `CheckKill` entry point the
-  `*/list` handlers consult before contacting the upstream. It embeds two named
+  `DecideResourceCancel` / `DecidePromptGet`, each returning a
+  `capability.EnforceResponse` (the same type the enforcement engine produces),
+  plus a `CheckKill` entry point the `*/list` handlers consult before contacting
+  the upstream. `DecideResourceCancel` is `resources/unsubscribe`'s own entry
+  point rather than a synonym for the read: a cancellation is authorized by match
+  alone and commits no session state, because metering it would let a spent quota
+  deny the only way to close a stream the policy allowed opening. It embeds two named
   facets — **`ListFilterer`** (`FilterToolsList` / `FilterResourcesList` /
   `FilterPromptsList`) and **`SamplingAuthorizer`** (`DecideSampling`) — folded
   into the single contract rather than detected by type assertion, so every PDP

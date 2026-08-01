@@ -20,6 +20,7 @@ import (
 	"github.com/eunolabs/eunox/internal/mcp/mcptest"
 
 	"github.com/eunolabs/eunox/internal/pdp"
+	"github.com/eunolabs/eunox/pkg/callcounter"
 	"github.com/eunolabs/eunox/pkg/capability"
 	"github.com/eunolabs/eunox/pkg/enforcement"
 	"github.com/eunolabs/eunox/pkg/killswitch"
@@ -1337,12 +1338,16 @@ func TestGap3_HTTPProxy_ResourcesSubscribe_EmptyURI_Error(t *testing.T) {
 	}
 }
 
-// resources/unsubscribe is enforced under the same read-access policy as its subscribe
-// twin. Before it was mapped it appeared nowhere in the repo, so it fell to
-// dispatchUnmapped's fail-closed default and was denied in EVERY mode, with no manifest
-// spelling able to allow it: a host that subscribed could never cancel through the proxy,
-// and the upstream kept pushing resource-updated notifications for the rest of the
-// session. Denying it protected nothing — cancelling a subscription only reduces data flow.
+// resources/unsubscribe is enforced against the same manifest entry as its subscribe twin,
+// but through the PDP's CANCEL decision rather than its READ decision. Before it was mapped
+// it appeared nowhere in the repo, so it fell to dispatchUnmapped's fail-closed default and
+// was denied in EVERY mode, with no manifest spelling able to allow it: a host that
+// subscribed could never cancel through the proxy, and the upstream kept pushing
+// resource-updated notifications for the rest of the session. Denying it protected
+// nothing — cancelling a subscription only reduces data flow. Routing it through the read
+// decision would have reintroduced that same dead end through the back door (a spent
+// maxCalls budget denying the cancel), which is what the cancel entry point avoids; see the
+// DecideResourceCancel tests in internal/pdp for the per-condition pins.
 
 func TestGap3_HTTPProxy_ResourcesUnsubscribe_Allowed(t *testing.T) {
 	fu := newFullFakeUpstream()
@@ -1425,6 +1430,59 @@ func TestGap3_HTTPProxy_ResourcesUnsubscribe_EmptyURI_Error(t *testing.T) {
 	}
 	if fu.CountByMethod("resources/unsubscribe") != 0 {
 		t.Error("upstream must not be called for an empty resource URI")
+	}
+}
+
+// The end-to-end shape of the cancel decision: a one-call budget spent by the SUBSCRIBE
+// must still leave the host able to unsubscribe, and the cancel must reach the upstream —
+// otherwise the proxy hands the host a subscription it can open but never close, which is
+// the exact dead end mapping the method was meant to remove.
+func TestGap3_HTTPProxy_ResourcesUnsubscribe_AllowedAfterQuotaExhausted(t *testing.T) {
+	fu := newFullFakeUpstream()
+	upURL := startFakeUpstream(t, fu)
+
+	manifest := &config.LocalManifest{
+		Name:    "test-policy",
+		Version: "1.0.0",
+		Capabilities: []capability.Constraint{{
+			Target:     "resource:file:///data/live/*",
+			Actions:    []string{"read"},
+			Conditions: []capability.Condition{capability.MaxCallsCondition{Count: 1, WindowSeconds: 3600}},
+		}},
+	}
+	dp := pdp.NewManifestPDP(manifest.Capabilities,
+		enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory())),
+		killswitch.NewInMemory())
+	_, proxySrv := newTestRemoteProxy(t, upURL, httpProxyOptions{
+		PDP:        dp,
+		DriftCheck: drift.CheckFunc(func(json.RawMessage, string, error) error { return nil }),
+	})
+	sid := initSession(t, proxySrv)
+
+	params, _ := json.Marshal(mcp.ResourceReadParams{URI: "file:///data/live/metrics"})
+	send := func(id, method string) mcp.RPCMsg {
+		return decodeRPC(t, postMCP(t, proxySrv, mcp.RPCMsg{
+			JSONRPC: "2.0", ID: mcp.RawJSON(id), Method: method, Params: params,
+		}, sid))
+	}
+
+	// The subscribe spends the resource's single slot.
+	if sub := send(`70`, "resources/subscribe"); sub.Error != nil {
+		t.Fatalf("resources/subscribe should be allowed; got %+v", sub.Error)
+	}
+
+	// A second read IS rate limited, so the budget really is spent.
+	read := send(`71`, "resources/read")
+	if read.Error == nil {
+		t.Fatal("a second read must be rate limited; the test's premise is that the budget is spent")
+	}
+
+	// The unsubscribe still goes through, and reaches the upstream.
+	if unsub := send(`72`, "resources/unsubscribe"); unsub.Error != nil {
+		t.Fatalf("resources/unsubscribe must not be denied by a spent read budget; got %+v", unsub.Error)
+	}
+	if fu.CountByMethod("resources/unsubscribe") != 1 {
+		t.Error("the allowed resources/unsubscribe was not forwarded to the upstream")
 	}
 }
 

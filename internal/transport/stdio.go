@@ -382,7 +382,16 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 				// binary (the process exits), but StdioProxy is an exported seam, and an
 				// embedder that recovers from a refused start and retries would accumulate
 				// baselines keyed by session id for the life of its process.
-				p.pdp.ReleaseSession(ctx, p.sessionID)
+				//
+				// Detached and bounded, like the teardown release below and for the same
+				// reason: a drift refusal is routinely REACHED with ctx already done (an
+				// operator's Ctrl-C during startup, or a probe deadline, is itself one of
+				// the ways the probe fails), and ReleaseSession does a flow-store round
+				// trip whose error it discards — so releasing on the dead request context
+				// would silently skip the Redis clear this line exists to perform.
+				releaseCtx, releaseCancel := context.WithTimeout(context.Background(), time.Duration(p.shutdownMs)*time.Millisecond)
+				p.pdp.ReleaseSession(releaseCtx, p.sessionID) //nolint:contextcheck // startup-refusal teardown: detached and bounded, matching Start's own release path.
+				releaseCancel()
 				return err
 			}
 		}

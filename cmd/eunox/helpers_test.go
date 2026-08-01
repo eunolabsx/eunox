@@ -352,6 +352,13 @@ func (denyAllPDP) DecideResourceRead(_ context.Context, _, uri, _ string) capabi
 	}
 }
 
+func (denyAllPDP) DecideResourceCancel(_ context.Context, _, uri, _ string) capability.EnforceResponse {
+	return capability.EnforceResponse{
+		Decision: capability.DecisionDeny,
+		Denial:   &capability.DenialInfo{Code: "CAPABILITY_DENIED", Message: "denied by test policy: " + uri},
+	}
+}
+
 func (denyAllPDP) DecidePromptGet(_ context.Context, _, promptName, _ string) capability.EnforceResponse {
 	return capability.EnforceResponse{
 		Decision: capability.DecisionDeny,
@@ -448,6 +455,10 @@ func (s *staticPDP) Decide(_ context.Context, _ string, _ pdp.EnforceTarget, _ m
 }
 
 func (s *staticPDP) DecideResourceRead(_ context.Context, _, _, _ string) capability.EnforceResponse {
+	return s.decision
+}
+
+func (s *staticPDP) DecideResourceCancel(_ context.Context, _, _, _ string) capability.EnforceResponse {
 	return s.decision
 }
 

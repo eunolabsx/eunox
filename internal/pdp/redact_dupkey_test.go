@@ -4,6 +4,7 @@
 package pdp
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 
@@ -158,16 +159,106 @@ func TestApplyRedactObligs_ProseLeafWithBracesStillPassesThrough(t *testing.T) {
 func TestScanJSONKeys_ArrayRootScopedToRedactionCaller(t *testing.T) {
 	t.Parallel()
 	arr := []byte(`[{"a":1,"a":2}]`)
+	fold := redactionFoldKeys([]string{"a"})
 
-	entry := scanJSONKeys(arr, false)
+	entry := scanJSONKeys(arr, jsonKeyScanOpts{})
 	assert.True(t, entry.untrustworthy, "a tools/list entry may not be an array")
 	assert.True(t, entry.namesComplete, "a non-object entry root poisons nothing")
 
-	assert.True(t, redactionKeysAmbiguous(arr), "a duplicate key inside an array root must be caught")
-	assert.False(t, redactionKeysAmbiguous([]byte(`[{"a":1},{"a":2}]`)),
+	assert.True(t, redactionKeysAmbiguous(arr, fold), "a duplicate key inside an array root must be caught")
+	assert.False(t, redactionKeysAmbiguous([]byte(`[{"a":1},{"a":2}]`), fold),
 		"the same key in two sibling array elements is not a duplicate")
-	assert.False(t, redactionKeysAmbiguous([]byte(`{"a":{"b":1},"c":{"b":2}}`)),
+	assert.False(t, redactionKeysAmbiguous([]byte(`{"a":{"b":1},"c":{"b":2}}`), fold),
 		"the same key under two different parents is not a duplicate")
-	assert.True(t, redactionKeysAmbiguous([]byte(strings.Repeat(`{"a":`, maxDuplicateKeyScanDepth+2))),
+	assert.True(t, redactionKeysAmbiguous([]byte(strings.Repeat(`{"a":`, maxDuplicateKeyScanDepth+2)), fold),
 		"a pathologically deep value fails closed")
+}
+
+// The case-variant rule on the redaction path is SCOPED to names the redaction depends on
+// resolving (redactionFoldKeys), and applies at every depth. Two properties fall out, and
+// both are the point:
+//
+//   - One `[` cannot turn the gate off. Keying the fold to raw stack depth made the verdict
+//     depend on whether the value happened to be wrapped in an array, since the bracket
+//     occupies a level of its own — so `{"Name":..,"name":..}` was refused while the
+//     byte-identical `[{"Name":..,"name":..}]` was not.
+//   - An unrelated case-variant pair is NOT refused. The unscoped rule folded every root
+//     key, which is derived from encoding/json binding a tools/list entry to a STRUCT;
+//     nothing on the redaction path is struct-bound (envelope and leaves alike decode into
+//     map[string]interface{}, whose keys are exact), so refusing an honest
+//     {"Data":..,"data":..} under an obligation naming neither was a pure false positive.
+func TestRedactionKeysAmbiguous_FoldIsScopedAndDepthUniform(t *testing.T) {
+	// The obligation names `data.ssn`, so `data` and `ssn` are the names whose case
+	// variants matter. `name` is named by nothing.
+	scoped := redactionFoldKeys([]string{"data.ssn"})
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		// An exact duplicate is caller-independent: any depth, any key, any root shape.
+		{"object root, exact duplicate", `{"n":1,"n":2}`, true},
+		{"array root, exact duplicate", `[{"n":1,"n":2}]`, true},
+		{"nested exact duplicate", `{"o":{"n":1,"n":2}}`, true},
+		{"array root, distinct keys", `[{"a":1,"b":2}]`, false},
+
+		// A case variant of a NAMED segment is refused wherever it appears — the array
+		// wrapper and the nesting depth are both irrelevant.
+		{"object root, named case variant", `{"Data":"a","data":"b"}`, true},
+		{"array root, named case variant", `[{"Data":"a","data":"b"}]`, true},
+		{"nested named case variant", `{"o":{"SSN":"a","ssn":"b"}}`, true},
+
+		// A case variant of a name the obligation does not touch is honest data.
+		{"object root, unnamed case variant", `{"Name":"a","name":"b"}`, false},
+		{"array root, unnamed case variant", `[{"Name":"a","name":"b"}]`, false},
+		{"nested unnamed case variant", `{"o":{"Name":"a","name":"b"}}`, false},
+
+		// The protocol-reserved envelope keys are always in scope: ApplyRedactObligs
+		// dispatches on them exactly, so a variant spelling would silently take the
+		// weaker generic walk instead of the content-array one.
+		{"reserved key case variant", `{"Content":[],"content":[]}`, true},
+	} {
+		if got := redactionKeysAmbiguous([]byte(tc.raw), scoped); got != tc.want {
+			t.Errorf("%s: redactionKeysAmbiguous(%s) = %v, want %v", tc.name, tc.raw, got, tc.want)
+		}
+	}
+}
+
+// The reserved-key scope is not cosmetic. ApplyRedactObligs reads result["content"]
+// EXACTLY, so the content-array pass — with its fail-closed guard on a resource item whose
+// embedded body this redactor cannot walk — runs over the canonical spelling only, while a
+// case variant falls to the lenient generic sibling walk. A consumer that binds the result
+// case-insensitively resolves the variant as its content and renders the payload the strict
+// pass never saw.
+func TestApplyRedactObligs_CaseVariantOfReservedEnvelopeKeyFailsClosed(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{"content":[],"Content":[{"type":"resource","resource":{"text":"123-45-6789"}}]}`)
+	assertRedactionFailsClosed(t, body, redactDataSSN, "123-45-6789")
+}
+
+// The companion honest case: an unmodelled sibling key whose case variant the obligation
+// never names must keep redacting rather than fail the whole response closed.
+func TestApplyRedactObligs_UnnamedCaseVariantSiblingsStillRedact(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{"Report":"A","report":"b","data":{"ssn":"123-45-6789"}}`)
+	out, err := ApplyRedactObligs(body, redactDataSSN)
+	require.NoError(t, err, "case variants of names the obligation does not touch are honest data")
+	s := string(out)
+	assert.NotContains(t, s, "123-45-6789")
+	assert.Contains(t, s, `"Report":"A"`)
+	assert.Contains(t, s, `"report":"b"`)
+}
+
+// End-to-end: the array wrapper must not let a case-variant sibling carry the obligated
+// field past the redactor.
+func TestApplyRedactObligs_ArrayLeafCaseVariantFailsClosed(t *testing.T) {
+	obl := []capability.Obligation{{Type: capability.DirectiveTypeRedactFields, Paths: []string{"data.ssn"}}}
+	arrLeaf := `{"content":[{"type":"text","text":"[{\"data\":{\"ssn\":\"SECRET\"},\"Data\":{\"ssn\":\"SECRET\"}}]"}]}`
+	out, err := ApplyRedactObligs([]byte(arrLeaf), obl)
+	if err == nil {
+		t.Fatalf("an array-rooted leaf with a case-variant sibling must fail closed; got %s", out)
+	}
+	if bytes.Contains(out, []byte("SECRET")) {
+		t.Errorf("the obligated field must not be forwarded; got %s", out)
+	}
 }

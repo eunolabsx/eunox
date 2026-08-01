@@ -469,9 +469,18 @@ Section conventions:
   fell to the fail-closed default in every mode and no manifest spelling could allow it: a
   host that subscribed to a permitted resource could never cancel through the proxy, and
   the upstream kept pushing `notifications/resources/updated` for the rest of the session.
-  Denying it protected nothing — cancelling only reduces data flow. It now takes the same
-  read-access policy as `resources/subscribe` (the `read` action that permitted the
-  subscription permits its cancellation).
+  Denying it protected nothing — cancelling only reduces data flow. It is now authorized
+  against the same manifest entry as `resources/subscribe` (the `read` action that
+  permitted the subscription permits its cancellation), through a new
+  `PolicyDecisionPoint.DecideResourceCancel` that matches by **name and action alone**:
+  conditions on the entry are not evaluated and no session state is committed. Metering a
+  cancellation would have reintroduced the same dead end through the back door — with
+  `maxCalls: {count: 1}` the subscribe spends the slot and the unsubscribe is then denied
+  `RATE_LIMITED`, so the stream can be opened but never closed — besides recording a
+  `sequenceBlock` antecedent and applying `labelOutput` taint for a request that transfers
+  no data. Kill switch, principal scoping, per-route JWT audience, and a token's
+  `mcp.capabilities` allowlist all still apply. **Third-party `PolicyDecisionPoint`
+  implementations must add `DecideResourceCancel`.**
 - **The audit-mode banners no longer promise more than the dispatcher delivers.** They
   claimed "ALL calls are forwarded and logged but NOT blocked", while MCP methods outside
   the mapped set (`completion/complete`, `logging/setLevel`,

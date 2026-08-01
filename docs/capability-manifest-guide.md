@@ -22,7 +22,7 @@ The proxy enforces policy on the following MCP methods:
 | `resources/read` | PDP decision — allow or deny based on manifest + conditions |
 | `resources/list` | Filter response to permitted resources only (`read` / `*` action) |
 | `resources/subscribe` | Gate initial subscription with the same read-access policy |
-| `resources/unsubscribe` | Gate cancellation with the same read-access policy |
+| `resources/unsubscribe` | Gate cancellation against the same `read` entry, by match alone — no conditions, no session state (see §2c) |
 | `prompts/get` | PDP decision — allow or deny based on manifest + conditions |
 | `prompts/list` | Filter response to permitted prompts only (`get` / `*` action) |
 | `sampling/createMessage` | Denied by default; opt-in with `allow` / `*` action (see §2b for HTTP-mode limitation) |
@@ -282,7 +282,7 @@ pattern against the target using `path.Match` glob semantics.
 | Action | Permits |
 |--------|---------|
 | `call` | `tools/call` for the matched tool name (also shown in `tools/list`) |
-| `read` | `resources/read` for the matched URI (also shown in `resources/list`); gates `resources/subscribe` and `resources/unsubscribe` |
+| `read` | `resources/read` for the matched URI (also shown in `resources/list`); gates `resources/subscribe`, and gates `resources/unsubscribe` by match alone (§2c) |
 | `get` | `prompts/get` for the matched prompt name (also shown in `prompts/list`) |
 | `allow` | `sampling/createMessage` from the upstream (opt-in) |
 | `*` | every action valid for the constraint's own target type only |
@@ -432,11 +432,22 @@ If the URI does not match any manifest entry, the subscription is denied
 before any channel is established.  Kill-switch and audit-mode semantics
 apply.
 
-`resources/unsubscribe` is enforced under the same `read` action. Cancelling a
-subscription only ever *reduces* data flow, so it is not a separate permission — but it
-is enforced rather than blanket-forwarded so the tape stays symmetric (every subscribe has
-its matching unsubscribe) and so a URI the manifest never permitted, and which therefore
-was never subscribable, cannot be named here either.
+`resources/unsubscribe` is enforced against the same `read` entry, but it is checked by
+**match alone**: the URI must resolve to a `resource:` entry with `read` or `*`, and that is
+the whole decision. Cancelling a subscription only ever *reduces* data flow, so it is not a
+separate permission — but it is enforced rather than blanket-forwarded so the tape stays
+symmetric (every subscribe has its matching unsubscribe) and so a URI the manifest never
+permitted, and which therefore was never subscribable, cannot be named here either.
+
+**Conditions on the entry are not evaluated for an unsubscribe, and it consumes no session
+state.** Metering a cancellation would strand the very channel the grant opened: with
+`maxCalls: {count: 1}` on the entry above, the `subscribe` spends the single slot and the
+matching `unsubscribe` would then be denied `RATE_LIMITED` — the host could open the stream
+but never close it, and the server would keep pushing updates for the rest of the session.
+The same reasoning applies to the other stateful entries: an unsubscribe records no
+`sequenceBlock` antecedent and applies no `labelOutput` taint, because it carries no data
+for either to be about. Kill-switch and audit-mode semantics still apply, as does principal
+scoping and — in JWT mode — the token's own `mcp.capabilities` allowlist.
 
 > **Note:** Ongoing `notifications/resources/updated` messages (pushed by
 > the server after a subscription is established) are currently forwarded

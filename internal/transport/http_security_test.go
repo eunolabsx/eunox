@@ -691,6 +691,10 @@ func (s *staticPDP) DecideResourceRead(_ context.Context, _, _, _ string) capabi
 	return s.decision
 }
 
+func (s *staticPDP) DecideResourceCancel(_ context.Context, _, _, _ string) capability.EnforceResponse {
+	return s.decision
+}
+
 func (s *staticPDP) DecidePromptGet(_ context.Context, _, _, _ string) capability.EnforceResponse {
 	return s.decision
 }

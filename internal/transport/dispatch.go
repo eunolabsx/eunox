@@ -301,25 +301,35 @@ var locallyAnsweredHandlers = map[string]func(context.Context, dispatchParams, m
 }
 
 // dispatchedMethodSummary is the comma-separated, sorted set of host request methods this
-// build dispatches, derived from the two routing tables themselves. The audit-mode banner
-// prints it: observe mode downgrades a POLICY denial to a logged forward, and says so, but
-// it cannot downgrade the fail-closed default for a method that reaches no policy at all —
-// so the banner names the set it actually covers instead of promising "ALL calls".
-var dispatchedMethodSummary = buildDispatchedMethodSummary()
+// build dispatches, derived from the two routing tables themselves. Observe mode
+// downgrades a POLICY denial to a logged forward, but it cannot downgrade the fail-closed
+// default for a method that reaches no policy at all — so a caller describing the posture
+// names the set it actually covers instead of promising "ALL calls".
+var dispatchedMethodSummary = sortedMethods(decideMethodHandlers, locallyAnsweredHandlers)
+
+// enforcedMethodSummary is the subset the audit-mode banner's "forwarded and logged"
+// sentence may name: only the Decide* methods actually reach the upstream AND leave a
+// decision record. The locally-answered half of the dispatch table does not — initialize
+// and ping never touch the upstream and write no record, and the …/list flavors forward
+// the catalog unfiltered and are recorded as enumeration events, not decisions — so
+// sweeping them into one "every dispatched call is forwarded and logged" claim replaced
+// the old "ALL calls" over-claim with a narrower false one.
+var enforcedMethodSummary = sortedMethods(decideMethodHandlers)
 
 // unmappedMethodExamples names MCP methods this build does NOT dispatch, so the banner's
 // caveat is concrete rather than abstract. They are examples, not an exhaustive list:
 // anything outside the two routing tables is denied the same way.
 const unmappedMethodExamples = "e.g. completion/complete, logging/setLevel, resources/templates/list"
 
-// buildDispatchedMethodSummary joins both routing tables' keys in sorted order.
-func buildDispatchedMethodSummary() string {
-	methods := make([]string, 0, len(decideMethodHandlers)+len(locallyAnsweredHandlers))
-	for m := range decideMethodHandlers {
-		methods = append(methods, m)
-	}
-	for m := range locallyAnsweredHandlers {
-		methods = append(methods, m)
+// sortedMethods joins the given routing tables' keys in sorted order, so a banner derived
+// from a table cannot drift from what the dispatcher does (and a map's iteration order
+// cannot make the text unstable).
+func sortedMethods(tables ...map[string]func(context.Context, dispatchParams, mcp.RPCMsg) mcp.RPCMsg) string {
+	var methods []string
+	for _, t := range tables {
+		for m := range t {
+			methods = append(methods, m)
+		}
 	}
 	sort.Strings(methods)
 	return strings.Join(methods, ", ")
@@ -517,8 +527,10 @@ func dispatchResourcesSubscribe(ctx context.Context, d dispatchParams, msg mcp.R
 	return enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodResourcesSubscribe, params.URI, params.URI, "resource subscription", false, upstreamErrorDetail)
 }
 
-// dispatchResourcesUnsubscribe enforces resources/unsubscribe under the same read-access
-// policy as resources/read and resources/subscribe (identical wire shape: a single uri).
+// dispatchResourcesUnsubscribe enforces resources/unsubscribe against the SAME manifest
+// entry as resources/read and resources/subscribe (identical wire shape: a single uri), but
+// through DecideResourceCancel rather than DecideResourceRead — the URI must still be
+// permitted, and no consumable policy state is charged for cancelling.
 //
 // It is mapped rather than left to the fail-closed default deliberately. Unmapped is the
 // right default for a method whose effect the proxy cannot reason about, but this one is
@@ -528,10 +540,19 @@ func dispatchResourcesSubscribe(ctx context.Context, d dispatchParams, msg mcp.R
 // nothing — it only ever REDUCES data flow — while costing the host the one way to stop a
 // stream it already established.
 //
-// Enforcing rather than blanket-forwarding keeps the audit trail symmetric (every
-// subscribe on the tape has its matching unsubscribe) and keeps the decision on the same
-// policy: a URI the manifest never permitted was never subscribable in the first place, so
-// an unsubscribe naming it is a host talking about a channel it does not have.
+// Routing it through the cancel decision instead of the read decision is what makes that
+// argument hold in practice. A read decision is metered: it spends the URI's maxCalls
+// budget, records a sequenceBlock antecedent, and applies the entry's labelOutput taint.
+// Charging a cancellation that way reintroduces the very failure this handler exists to
+// remove — a one-call budget spent by the subscribe leaves the unsubscribe denied
+// RATE_LIMITED, so the stream can never be stopped — and taints the session for a request
+// that transfers no data. DecideResourceCancel keeps the match requirement (a URI the
+// manifest never permitted was never subscribable, so an unsubscribe naming it is a host
+// talking about a channel it does not have) and drops the metering, which also keeps the
+// audit trail symmetric: every subscribe on the tape has its matching unsubscribe.
+//
+// d.decideCtx is deliberately NOT applied: its only effect is the observe-mode quota skip,
+// and this path consumes no quota in either mode.
 func dispatchResourcesUnsubscribe(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
 	var params mcp.ResourceReadParams
 	if err := mcp.DecodeParams(msg.Params, &params); err != nil {
@@ -540,7 +561,7 @@ func dispatchResourcesUnsubscribe(ctx context.Context, d dispatchParams, msg mcp
 	if params.URI == "" {
 		return d.malformedDeny(ctx, msg, "resources/unsubscribe: uri must not be empty")
 	}
-	dec := d.pdp.DecideResourceRead(d.decideCtx(ctx), d.sessionID, params.URI, d.sourceIP)
+	dec := d.pdp.DecideResourceCancel(ctx, d.sessionID, params.URI, d.sourceIP)
 	d.finishDecision() // release the per-session decision lock before the forward
 	// recordObligations is false: cancelling a subscription does not log obligation names.
 	return enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodResourcesUnsubscribe, params.URI, params.URI, "resource subscription", false, upstreamErrorDetail)

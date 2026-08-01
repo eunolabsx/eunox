@@ -42,6 +42,26 @@ type PolicyDecisionPoint interface {
 	DecideResourceRead(ctx context.Context, sessionID, uri, sourceIP string) capability.EnforceResponse
 	DecidePromptGet(ctx context.Context, sessionID, promptName, sourceIP string) capability.EnforceResponse
 
+	// DecideResourceCancel authorizes a resources/unsubscribe: the CANCELLATION of a
+	// subscription this session already holds. It is a separate entry point from
+	// DecideResourceRead, not a synonym, because cancelling moves no data — it only ever
+	// REDUCES flow — and the read decision is a committing one.
+	//
+	// Routing a cancel through DecideResourceRead made it consume the resource's maxCalls
+	// quota, record a sequenceBlock antecedent, and apply the entry's labelOutput taint,
+	// all for a call that transfers nothing. Worse, once that quota was spent (or a
+	// timeWindow closed, or the client roamed out of an ipRange) the cancel was itself
+	// DENIED — so the host could not stop a stream it had legitimately started, which is
+	// the exact failure mapping the method was meant to remove.
+	//
+	// The decision is therefore name-and-action only: the URI must match a resource entry
+	// this caller may `read`, evaluated with the same matcher the resources/list filter
+	// uses, and no condition is evaluated and no session state is committed. That is the
+	// right authority question for a cancel — a URI the manifest never permitted was never
+	// subscribable, so naming it here is a host talking about a channel it does not have —
+	// and it is strictly narrower than the subscribe it undoes.
+	DecideResourceCancel(ctx context.Context, sessionID, uri, sourceIP string) capability.EnforceResponse
+
 	// Folded into the contract so every PDP implements them and the transport
 	// calls them directly (no optional-interface type assertion).
 	ListFilterer
@@ -420,6 +440,15 @@ func (p AlwaysAllowPDP) DecideResourceRead(ctx context.Context, sessionID, _, _ 
 	return p.wiretapAllow()
 }
 
+// DecideResourceCancel returns a wiretap allow for every resources/unsubscribe, unless a
+// kill is active.
+func (p AlwaysAllowPDP) DecideResourceCancel(ctx context.Context, sessionID, _, _ string) capability.EnforceResponse {
+	if deny := p.CheckKill(ctx, sessionID); deny != nil {
+		return *deny
+	}
+	return p.wiretapAllow()
+}
+
 // DecidePromptGet returns a wiretap allow for every prompts/get, unless a kill is
 // active.
 func (p AlwaysAllowPDP) DecidePromptGet(ctx context.Context, sessionID, _, _ string) capability.EnforceResponse {
@@ -516,6 +545,12 @@ func (p DenyAllPDP) Decide(_ context.Context, _ string, _ EnforceTarget, _ map[s
 // DecideResourceRead denies every resources/read, resources/subscribe, and
 // resources/unsubscribe.
 func (p DenyAllPDP) DecideResourceRead(_ context.Context, _, _, _ string) capability.EnforceResponse {
+	return p.deny()
+}
+
+// DecideResourceCancel denies every resources/unsubscribe. A no-policy route authorizes
+// nothing, so it has authorized no subscription to cancel either.
+func (p DenyAllPDP) DecideResourceCancel(_ context.Context, _, _, _ string) capability.EnforceResponse {
 	return p.deny()
 }
 
@@ -1649,6 +1684,31 @@ func (p *ManifestPDP) DecideResourceRead(ctx context.Context, sessionID, uri, so
 		map[string]interface{}{"uri": uri}, sourceIP, rejectSchema)
 }
 
+// DecideResourceCancel authorizes a resources/unsubscribe by MATCH ALONE: the URI must
+// name a resource entry this caller may read. No condition is evaluated and nothing is
+// committed — see the contract for why a cancellation is not a read.
+//
+// It reuses findConstraint + containsAction, the same pair the resources/list filter
+// applies, so what a session may cancel is exactly what it may see listed. A poisoned or
+// otherwise unreadable entry is not a consideration here: a cancel names a URI, not a
+// catalog entry, and carries no description a host renders.
+func (p *ManifestPDP) DecideResourceCancel(ctx context.Context, sessionID, uri, _ string) capability.EnforceResponse {
+	if deny := p.CheckKill(ctx, sessionID); deny != nil {
+		return *deny
+	}
+	c := p.findConstraint(EnforceTarget{Type: capability.TargetTypeResource, Name: uri},
+		jwtClaimsAsMap(ctx))
+	if c == nil {
+		return denyResponse(p.engineClock(), capability.ErrCodeAuthorizationFailed, "",
+			fmt.Sprintf("resource %q is not permitted by the capability manifest, so there is no subscription to it to cancel", uri))
+	}
+	if !containsAction(c.Actions, requiredActionFor(capability.TargetTypeResource)) {
+		return denyResponse(p.engineClock(), capability.ErrCodeCapabilityDenied, "",
+			fmt.Sprintf("resource %q is present in the manifest but not with the %q action, so there is no subscription to it to cancel", uri, requiredActionFor(capability.TargetTypeResource)))
+	}
+	return newAllowResponse(p.engineClock())
+}
+
 // DecideSampling implements SamplingAuthorizer. The kill switch is checked first
 // (fail closed). The capability decision requires the manifest's explicit
 // system:sampling/createMessage opt-in AND that every condition on that entry
@@ -2140,28 +2200,49 @@ type toolEntryScan struct {
 // stack form is O(bytes), and it mirrors mcp.rejectDuplicateJSONKeys, which walks request
 // params the same way.
 func scanToolEntry(raw json.RawMessage) toolEntryScan {
-	return scanJSONKeys(raw, false)
+	return scanJSONKeys(raw, jsonKeyScanOpts{})
+}
+
+// jsonKeyScanOpts configures scanJSONKeys for one of its two callers. Both ask the same
+// security question — can Go's decode of these bytes differ from what a consumer renders?
+// — but they hand the bytes to DIFFERENT decoders, and the fold rule follows the decoder,
+// so it is a per-caller policy rather than a caller-independent constant.
+type jsonKeyScanOpts struct {
+	// allowArrayRoot admits a JSON array as the root value. A tools/list entry must be an
+	// object, so scanToolEntry leaves this false and a non-object root is untrustworthy
+	// with a knowably-empty name set. The redaction path scans values that are legally
+	// either shape — structuredContent and any doubly-encoded leaf may be an array of
+	// objects — so it sets this, and the array root simply opens the walk like any other
+	// composite.
+	allowArrayRoot bool
+
+	// foldKeys, when non-nil, REPLACES the struct-binding fold rule below with a scoped
+	// one: a key is folded (so a case variant of it collides with it) only when its folded
+	// form is in this set, and then at EVERY depth. The redaction path sets it; see
+	// redactionFoldKeys for which names go in and why the unscoped rule is wrong there.
+	//
+	// nil keeps the tools/list rule: fold the ROOT object's keys, match exactly below.
+	// That rule is derived from encoding/json binding an entry's top-level keys to the
+	// mcp.ToolEntry STRUCT by a case-folding match (so {"description":"<INJECT>",
+	// "Description":"<CLEAN>"} decodes to <CLEAN> and hashes clean while a case-sensitive
+	// host renders <INJECT>), while nested values decode into map[string]interface{} with
+	// exact keys (so a schema carrying sibling properties "Name" and "name" is legal and
+	// honest, and folding there would refuse it). See the scanToolEntry doc for the full
+	// derivation.
+	foldKeys map[string]struct{}
 }
 
 // scanJSONKeys is the shared streaming walk behind every duplicate-key gate in this
 // package: the */list entry gate (scanToolEntry, and entryKeysAmbiguous through it) and
-// the redaction path's envelope/leaf gate (redactionKeysAmbiguous). Both ask the same
-// security question — can Go's decode of these bytes differ from what a host renders? —
-// so they share one implementation rather than two hand-mirrored walks that can drift on
-// the fold rule, the depth bound, or the number handling.
+// the redaction path's envelope/leaf gate (redactionKeysAmbiguous). Sharing one
+// implementation keeps them from drifting on the depth bound, the number handling, or the
+// EXACT-duplicate rule — which is caller-independent: a byte-identical repeated key is a
+// divergence at every depth for every consumer (Go keeps the last, a first-wins parser
+// keeps the first), so it is untrustworthy regardless of opts.
 //
-// allowArrayRoot admits a JSON array as the root value. A tools/list entry must be an
-// object, so scanToolEntry passes false and a non-object root is untrustworthy with a
-// knowably-empty name set (see below). The redaction path scans values that are legally
-// either shape — structuredContent and any doubly-encoded leaf may be an array of objects
-// — so it passes true, and the array root simply opens the walk like any other composite.
-//
-// The fold-vs-exact scoping is the caller-independent part: keys are folded at depth 1
-// (the root object's own keys, where encoding/json's case-insensitive struct-field match
-// makes a case variant collide) and matched EXACTLY below it (where values decode into
-// map[string]interface{} with exact keys, and legal sibling schema properties "Name" and
-// "name" must not be refused). See the scanToolEntry doc for the full derivation.
-func scanJSONKeys(raw json.RawMessage, allowArrayRoot bool) toolEntryScan {
+// What the callers do NOT share is which keys are additionally folded; that is
+// opts.foldKeys, documented on jsonKeyScanOpts.
+func scanJSONKeys(raw json.RawMessage, opts jsonKeyScanOpts) toolEntryScan {
 	// frame tracks one open composite. seen is allocated lazily: most nested objects in a
 	// tool schema are small, and an empty-object-heavy payload should not cost a map
 	// header per object.
@@ -2181,7 +2262,7 @@ func scanJSONKeys(raw json.RawMessage, allowArrayRoot bool) toolEntryScan {
 	}
 	rootDelim, rootIsDelim := tok.(json.Delim)
 	rootObject := rootIsDelim && rootDelim == '{'
-	if !rootObject && !(allowArrayRoot && rootIsDelim && rootDelim == '[') {
+	if !rootObject && !(opts.allowArrayRoot && rootIsDelim && rootDelim == '[') {
 		// Not a JSON object: null, a number, a string, a bool, or (unless the caller admits
 		// one) an array. The entry is
 		// still untrustworthy — it cannot decode into the hashed tool surface, so the
@@ -2201,6 +2282,9 @@ func scanJSONKeys(raw json.RawMessage, allowArrayRoot bool) toolEntryScan {
 	stack := []frame{{object: rootObject, expectKey: rootObject}}
 	// pendingName is set when the value about to be read is the ENTRY's top-level name
 	// value, so the names it could present to a host can be collected in the same pass.
+	// Only the struct-binding caller (opts.foldKeys == nil, i.e. the tools/list entry gate)
+	// reads out.names; the redaction gate consults untrustworthy alone, so it never arms
+	// this and never pays for the name collection.
 	pendingName := false
 	markValueDone := func() {
 		if n := len(stack); n > 0 && stack[n-1].object {
@@ -2238,12 +2322,32 @@ func scanJSONKeys(raw json.RawMessage, allowArrayRoot bool) toolEntryScan {
 				out.untrustworthy = true
 				return out
 			}
-			// Fold at the TOP level only (see the doc comment). capability.FoldJSONKey,
-			// not strings.ToLower: ToLower leaves an already-lower-case case variant such
-			// as U+017F ("deſcription") distinct from "description", so the collision the
-			// decoder makes would go unseen and the entry would clear the scan.
+			// Canonicalize per the caller's fold policy (see jsonKeyScanOpts). Everything
+			// not folded is compared byte-exactly, which is what catches the
+			// caller-independent exact duplicate. capability.FoldJSONKey, not
+			// strings.ToLower: ToLower leaves an already-lower-case case variant such as
+			// U+017F ("deſcription") distinct from "description", so the collision the
+			// decoder makes would go unseen and the bytes would clear the scan.
 			canon := key
-			if n == 1 {
+			switch {
+			case opts.foldKeys != nil:
+				// Scoped fold, at every depth: only a name whose case variant could change
+				// what a consumer resolves. Depth-uniform on purpose -- an unscoped rule
+				// keyed to depth made the verdict depend on whether the value happened to
+				// be wrapped in an array, since the bracket occupies a level of its own.
+				//
+				// A key already equal to its folded form needs no rewrite (canon is that
+				// form), so only the variant spelling is redirected onto it -- which is what
+				// makes the two collide in `seen`.
+				if folded := capability.FoldJSONKey(key); folded != key {
+					if _, scoped := opts.foldKeys[folded]; scoped {
+						canon = folded
+					}
+				}
+			case n == 1:
+				// Struct-binding fold, root object only. n == 1 IS the root object here:
+				// this arm is reached only when opts.foldKeys is nil, and that caller does
+				// not admit an array root, so the root frame is always the object.
 				canon = capability.FoldJSONKey(key)
 			}
 			if stack[n-1].seen == nil {
@@ -2254,7 +2358,7 @@ func scanJSONKeys(raw json.RawMessage, allowArrayRoot bool) toolEntryScan {
 			}
 			stack[n-1].seen[canon] = struct{}{}
 			stack[n-1].expectKey = false
-			pendingName = n == 1 && canon == jsonKeyNameFolded
+			pendingName = opts.foldKeys == nil && n == 1 && canon == jsonKeyNameFolded
 			continue
 		}
 		if pendingName {

@@ -1583,6 +1583,10 @@ func (r recordingDecisionPoint) DecideResourceRead(ctx context.Context, sessionI
 	return r.inner.DecideResourceRead(ctx, sessionID, uri, sourceIP)
 }
 
+func (r recordingDecisionPoint) DecideResourceCancel(ctx context.Context, sessionID, uri, sourceIP string) capability.EnforceResponse {
+	return r.inner.DecideResourceCancel(ctx, sessionID, uri, sourceIP)
+}
+
 func (r recordingDecisionPoint) DecidePromptGet(ctx context.Context, sessionID, promptName, sourceIP string) capability.EnforceResponse {
 	return r.inner.DecidePromptGet(ctx, sessionID, promptName, sourceIP)
 }

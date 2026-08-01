@@ -158,6 +158,21 @@ func rearmWriteDeadline(w http.ResponseWriter, budgetMs int) {
 	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(window))
 }
 
+// rearmWriteDeadlineForTeardown re-arms for a leg that waits on httpSession.close, whose
+// worst case is TWO sequential --shutdown-timeout bounds, not one: close waits that long
+// for the subprocess to exit, then SIGKILLs it and calls waitBounded for the SAME budget
+// again. Arming a single budget therefore left the deadline past at exactly the setting
+// the re-arm exists for (--shutdown-timeout of 30s: a 35s window against a 60s worst
+// case), so the operator still saw `eunox kill` or a DELETE fail on a teardown that in
+// fact succeeded. The global kill sweeps sessions in parallel, so its wall clock is that
+// same per-session worst case rather than N times it.
+func rearmWriteDeadlineForTeardown(w http.ResponseWriter, shutdownMs int) {
+	if shutdownMs > 0 && shutdownMs <= math.MaxInt/2 {
+		shutdownMs *= 2
+	}
+	rearmWriteDeadline(w, shutdownMs)
+}
+
 // ResolveMaxSessions folds the --max-sessions flag and the config's
 // listen.maxSessions into the effective concurrent-session cap.
 //

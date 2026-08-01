@@ -245,7 +245,7 @@ func validateEffectRefPin(e *EffectContract) error {
 	if !ok {
 		return fmt.Errorf("effect 'ref' %q must be \"<contract-id>@sha256:<hex>\" — the registry contract this block was authored from", e.Ref)
 	}
-	if err := validateSHA256Pin(digest); err != nil {
+	if err := ValidateSHA256Pin("digest", digest); err != nil {
 		return fmt.Errorf("effect 'ref' %q: %w", e.Ref, err)
 	}
 	actual, err := EffectContractDigest(e)
@@ -258,22 +258,26 @@ func validateEffectRefPin(e *EffectContract) error {
 	return nil
 }
 
-// validateSHA256Pin checks the "sha256:<64 lowercase hex>" shape shared by the effect ref
-// digest and the manifest's descriptionHash.
-func validateSHA256Pin(s string) error {
+// ValidateSHA256Pin checks the "sha256:<64 lowercase hex>" shape shared by the effect
+// ref's digest and the manifest's descriptionHash. field names the pin for the error, so
+// one rule serves both spellings instead of each layer carrying its own copy of the four
+// checks — which is how a tightening (a second algorithm prefix, a relaxed case rule) ends
+// up applied to one pin and not the other while both claim to be "the sha256 pin format".
+// It lives here because this package owns the digest the pin is over.
+func ValidateSHA256Pin(field, s string) error {
 	const prefix = "sha256:"
 	if !strings.HasPrefix(s, prefix) {
-		return fmt.Errorf("digest %q must start with %q", s, prefix)
+		return fmt.Errorf("%s %q must start with %q", field, s, prefix)
 	}
 	hexPart := s[len(prefix):]
 	if len(hexPart) != 64 {
-		return fmt.Errorf("digest %q: hex part must be exactly 64 characters (got %d)", s, len(hexPart))
+		return fmt.Errorf("%s %q: hex part must be exactly 64 characters (got %d)", field, s, len(hexPart))
 	}
 	if _, err := hex.DecodeString(hexPart); err != nil {
-		return fmt.Errorf("digest %q: hex part is not valid hex: %w", s, err)
+		return fmt.Errorf("%s %q: hex part is not valid hex: %w", field, s, err)
 	}
 	if hexPart != strings.ToLower(hexPart) {
-		return fmt.Errorf("digest %q: hex part must be lowercase", s)
+		return fmt.Errorf("%s %q: hex part must be lowercase", field, s)
 	}
 	return nil
 }

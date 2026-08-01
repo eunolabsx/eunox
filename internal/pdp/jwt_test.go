@@ -3047,6 +3047,9 @@ func (c condPDP) Decide(_ context.Context, _ string, _ EnforceTarget, args map[s
 func (c condPDP) DecideResourceRead(_ context.Context, _, _, _ string) capability.EnforceResponse {
 	return capability.EnforceResponse{Decision: capability.DecisionAllow}
 }
+func (c condPDP) DecideResourceCancel(_ context.Context, _, _, _ string) capability.EnforceResponse {
+	return capability.EnforceResponse{Decision: capability.DecisionAllow}
+}
 func (c condPDP) DecidePromptGet(_ context.Context, _, _, _ string) capability.EnforceResponse {
 	return capability.EnforceResponse{Decision: capability.DecisionAllow}
 }

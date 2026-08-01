@@ -529,20 +529,31 @@ func (p *HTTPProxy) recordRefusal(r *http.Request, route *UpstreamRoute, code st
 	if route != nil {
 		rec = asRecorder(route.sink)
 	}
-	if rec == nil {
-		// No sink configured: there is no tape to flood and no bucket to charge, and the
-		// caller's stderr line is the only surviving signal of the refusal, so it is
-		// admitted. (The record-side limit is equally inert here for the same reason.)
+	// The bucket is charged BEFORE the sink is consulted, so the verdict this returns
+	// bounds the caller's stderr line whether or not a tape exists. A nil sink is
+	// reachable in production — --require-audit=off with an unopenable audit path leaves
+	// openConfiguredAuditSink returning (nil, nil) — and short-circuiting to "admitted"
+	// there left the log-volume half of the flooding primitive completely unbounded in
+	// exactly the deployment where stderr is the ONLY refusal signal. There is nothing to
+	// charge the bucket against but the refusal itself, which is the thing being bounded.
+	//
+	// No nil-limiter fallback for a proxy that HAS a tape: a "defensive" branch there
+	// wrote the refusal record with NO rate limit at all, which is a fail-open on the
+	// exact DoS bound this file exists to enforce. NewHTTPProxyGateway always builds the
+	// limiter, so a nil one alongside a sink is a construction bug and panics like one.
+	// Neither a sink nor a limiter can only be an in-package test literal: there is
+	// nothing to write and nothing to charge.
+	if rec == nil && p.preSessionDenies == nil {
 		return true
 	}
-	// No nil-limiter fallback: a "defensive" branch here wrote the refusal record with
-	// NO rate limit at all, which is a fail-open on the exact DoS bound this file exists
-	// to enforce — and it was reachable only from an in-package test literal, since
-	// NewHTTPProxyGateway always builds the limiter. A nil here is a construction bug and
-	// panics like one.
 	ok, suppressed := p.preSessionDenies.admit(category)
 	if !ok {
 		return false
+	}
+	if rec == nil {
+		// No sink configured: nothing to write, but the caller's stderr line is admitted
+		// (and rate-limited) as the refusal's only surviving signal.
+		return true
 	}
 	if suppressed > 0 {
 		if extra == nil {

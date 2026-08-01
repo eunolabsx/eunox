@@ -32,7 +32,7 @@ your IdP) and enforces a fine-grained YAML policy on top of it.
 | `resources/read` | **Enforced** — PDP decision per manifest entry | URI matched against `allowedValues` or pattern |
 | `resources/list` | **Filtered** — only resources with `action: read` (or `*`) in manifest are returned | |
 | `resources/subscribe` | **Enforced** — same policy path as `resources/read` | |
-| `resources/unsubscribe` | **Enforced** — same policy path as `resources/read` | Cancelling reduces data flow, so the `read` grant that permitted the subscription permits its cancellation |
+| `resources/unsubscribe` | **Enforced** — same manifest entry as `resources/read`, matched by name + `read` action alone | Cancelling reduces data flow, so the `read` grant that permitted the subscription permits its cancellation. Conditions on the entry are not evaluated and no session state is consumed: metering a cancel would let a spent `maxCalls` budget deny the unsubscribe that closes the stream the subscribe opened. Kill switch, principal scoping, and JWT capability claims still apply |
 | `prompts/get` | **Enforced** — PDP decision per manifest entry | |
 | `prompts/list` | **Filtered** — only prompts with `action: get` (or `*`) in manifest are returned | |
 | `sampling/createMessage` *(upstream→host)* | **Enforced** (local subprocess upstream only) — denied by default; requires explicit `system:sampling/createMessage` entry in manifest, and the kill switch applies. On the allow path the host's response is routed back to the upstream so the round-trip completes | Fail-closed: absent = deny. See the transport caveats in *Known gaps* below |

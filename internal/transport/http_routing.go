@@ -1094,7 +1094,7 @@ func (p *HTTPProxy) handleMCPDelete(w http.ResponseWriter, r *http.Request, rout
 	// entry window (~15s and up) the deadline is already past by the time the 204 is
 	// written, so the client sees a dropped connection for a teardown that in fact
 	// succeeded. A fresh window bounds only the client-facing write.
-	rearmWriteDeadline(w, p.shutdownMs)
+	rearmWriteDeadlineForTeardown(w, p.shutdownMs)
 	sess.close(p.shutdownMs) //nolint:contextcheck // teardown path: close()'s upstream session-termination DELETE intentionally runs on a detached, bounded background context — binding it to r.Context() would cancel the teardown the instant this 204 is written, leaking the upstream session. Same rationale as the handleMCPDelete dispatch site.
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1182,7 +1182,7 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 		// deadline is long past by the time the success body is written. The operator then
 		// sees `eunox kill` fail on a stop that actually took effect — the worst possible
 		// moment for a misleading result.
-		rearmWriteDeadline(w, p.shutdownMs)
+		rearmWriteDeadlineForTeardown(w, p.shutdownMs)
 		p.evictAllSessionStreams()
 		// Proactively tear every session down (close upstreams, free maxSessions slots)
 		// rather than leaving reclamation to the idle reaper, which does not run when
@@ -1206,7 +1206,7 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 	// End this session's open SSE stream(s), same reason as the global path above.
 	// Write deadline re-armed for the same reason as the global path: the teardown below
 	// waits on the session's close, bounded by --shutdown-timeout.
-	rearmWriteDeadline(w, p.shutdownMs)
+	rearmWriteDeadlineForTeardown(w, p.shutdownMs)
 	p.evictSessionStreams(body.SessionID)
 	// Proactively tear the killed session down (close its upstream, free its
 	// maxSessions slot) instead of relying on the idle reaper, which does not run when

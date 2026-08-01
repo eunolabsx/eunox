@@ -1313,49 +1313,49 @@ func TestRedactJSONText_Paths(t *testing.T) {
 	paths := []string{"ssn"}
 
 	// Free-form prose: returned unchanged.
-	out, err := redactJSONText("just a log line, not JSON", paths)
+	out, err := redactJSONText("just a log line, not JSON", specFor(paths...))
 	require.NoError(t, err)
 	assert.Equal(t, "just a log line, not JSON", out)
 
 	// Bracketed log prefix is prose, not a container.
-	out, err = redactJSONText("[ERROR] something failed", paths)
+	out, err = redactJSONText("[ERROR] something failed", specFor(paths...))
 	require.NoError(t, err)
 	assert.Equal(t, "[ERROR] something failed", out)
 
 	// A JSON scalar string: no structured field, unchanged.
-	out, err = redactJSONText(`"hello"`, paths)
+	out, err = redactJSONText(`"hello"`, specFor(paths...))
 	require.NoError(t, err)
 	assert.Equal(t, `"hello"`, out)
 
 	// A JSON object: ssn redacted, other fields preserved.
-	out, err = redactJSONText(`{"ssn":"123","keep":"yes"}`, paths)
+	out, err = redactJSONText(`{"ssn":"123","keep":"yes"}`, specFor(paths...))
 	require.NoError(t, err)
 	assert.NotContains(t, out, "123")
 	assert.Contains(t, out, "keep")
 
 	// A top-level array of objects: masked element-by-element (key kept, value sentinel).
-	out, err = redactJSONText(`[{"ssn":"a"},{"ssn":"b","keep":1}]`, paths)
+	out, err = redactJSONText(`[{"ssn":"a"},{"ssn":"b","keep":1}]`, specFor(paths...))
 	require.NoError(t, err)
 	assert.Equal(t, `[{"ssn":"[redacted]"},{"keep":1,"ssn":"[redacted]"}]`, out)
 
 	// A malformed object container is not clean JSON: passes through unchanged.
-	out, err = redactJSONText(`{"ssn":"x"`, paths)
+	out, err = redactJSONText(`{"ssn":"x"`, specFor(paths...))
 	require.NoError(t, err)
 	assert.Equal(t, `{"ssn":"x"`, out)
 
 	// Trailing data after a complete value is not a single clean JSON value: unchanged.
-	out, err = redactJSONText(`{"ssn":"x"} trailing`, paths)
+	out, err = redactJSONText(`{"ssn":"x"} trailing`, specFor(paths...))
 	require.NoError(t, err)
 	assert.Equal(t, `{"ssn":"x"} trailing`, out)
 
 	// A status-word prefix before a JSON object is not clean JSON either: unchanged
 	// (accepted residual — embedded JSON in prose is out of scope; redact upstream).
-	out, err = redactJSONText(`OK {"ssn":"x"}`, paths)
+	out, err = redactJSONText(`OK {"ssn":"x"}`, specFor(paths...))
 	require.NoError(t, err)
 	assert.Equal(t, `OK {"ssn":"x"}`, out)
 
 	// A scalar array (no object) is prose-like: unchanged.
-	out, err = redactJSONText(`[1,2,3]`, paths)
+	out, err = redactJSONText(`[1,2,3]`, specFor(paths...))
 	require.NoError(t, err)
 	assert.Equal(t, `[1,2,3]`, out)
 }

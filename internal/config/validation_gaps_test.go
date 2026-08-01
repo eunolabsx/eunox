@@ -222,3 +222,28 @@ func TestLoadManifest_AcceptsCaseCompensationSpellings(t *testing.T) {
 		}
 	})
 }
+
+// The effect layer's numeric bounds have GENERIC spellings (`max`, `value`), and the
+// coercion walk visits every mapping in the document. Scoping them to their own blocks is
+// what keeps the guard from rejecting an opaque `policy`/`custom` condition payload — both
+// are `interface{}`, author-defined input handed verbatim to an external evaluator, where
+// eunox enforces nothing and so cannot "silently change the enforced policy".
+func TestLoadManifest_NumericGuardIsScopedToTheEffectLayer(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cond string
+	}{
+		{"custom config value", "      - type: custom\n        name: geofence\n        config: {value: 0600}\n"},
+		{"custom config max", "      - type: custom\n        name: geofence\n        config: {max: 010}\n"},
+		{"policy input value", "      - type: policy\n        backend: opa\n        input: {value: 1.0}\n"},
+		{"policy config max", "      - type: policy\n        backend: opa\n        config: {max: 010}\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := "schemaVersion: \"0.1\"\nname: t\nversion: 1.0.0\ncapabilities:\n" +
+				"  - target: tool:x\n    actions: [call]\n    conditions:\n" + tc.cond
+			if _, err := writeEffectManifest(t, body); err != nil {
+				t.Fatalf("an opaque evaluator payload is not an enforced number and must load: %v", err)
+			}
+		})
+	}
+}

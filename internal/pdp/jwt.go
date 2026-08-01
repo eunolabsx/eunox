@@ -905,6 +905,50 @@ func (p *JWTPDP) DecideResourceRead(ctx context.Context, sessionID, uri, sourceI
 	return p.Decide(ctx, sessionID, EnforceTarget{Type: capability.TargetTypeResource, Name: uri}, nil, sourceIP)
 }
 
+// DecideResourceCancel authorizes a resources/unsubscribe through the JWT layer without
+// routing it into Decide, because Decide is the READ decision and a cancel must not be
+// metered by it (see the contract). The token can still only RESTRICT: kill, the per-route
+// audience pin, and — when the token carries an exhaustive mcp.capabilities claim — the
+// requirement that some claim cover this resource, all apply before the inner PDP's own
+// match-only decision.
+//
+// Unlike Decide, the denials here are not routed through withInnerForwardObligations.
+// Neither half of that helper applies to a cancel: the interface-pin hardening it carries
+// is tool-only (hardenOnBrokenInterface returns unchanged for a resource target), and
+// obligations describe how to redact a FORWARDED response — an unsubscribe result carries
+// no data to redact even when an --audit route downgrades the denial to a forward.
+func (p *JWTPDP) DecideResourceCancel(ctx context.Context, sessionID, uri, sourceIP string) capability.EnforceResponse {
+	if deny := killCheck(ctx, p.clock, p.ks, sessionID); deny != nil {
+		return *deny
+	}
+	claims, ok := jwtClaimsFromContext(ctx)
+	if !ok {
+		// An authentication boundary, exactly as in Decide: the token was never validated.
+		return hardDenyResponse(p.clock, capability.ErrCodeNoJWTClaims, "no JWT claims in context — token was not validated")
+	}
+	if !p.routeAudienceSatisfied(claims) {
+		return p.audienceDeny(fmt.Sprintf("token audience %v does not satisfy the route's required audience %q", claims.Audiences, p.routeAudience))
+	}
+	target := EnforceTarget{Type: capability.TargetTypeResource, Name: uri}
+	if claims.HasCapabilities {
+		// The claim is an exhaustive allowlist, so a resource it does not name is not
+		// cancellable through this token either. Matching (not condition evaluation) is
+		// the whole question here, which is what anyCapCovers answers — the same
+		// predicate the JWT list filter uses.
+		if !anyCapCovers(parsedCapHeads(claims), target) {
+			return denyResponse(p.clock, capability.ErrCodeAuthorizationFailed, "jwtCapability",
+				fmt.Sprintf("resource %q is not in the JWT capability claims, so this token holds no subscription to it to cancel", uri))
+		}
+	}
+	if p.innerEnforces() {
+		return p.inner.DecideResourceCancel(ctx, sessionID, uri, sourceIP)
+	}
+	// Identity-only token on a route with no policy: the same posture Decide takes for an
+	// unpoliced JWT route — the token authenticates, it does not authorize.
+	return denyResponse(p.clock, capability.ErrCodeAuthorizationFailed, "",
+		"no capability policy is configured for this route, so no subscription was authorized to cancel")
+}
+
 // DecidePromptGet delegates to Decide with a prompt target so JWT claims gate
 // prompt gets like tool calls.
 func (p *JWTPDP) DecidePromptGet(ctx context.Context, sessionID, promptName, sourceIP string) capability.EnforceResponse {
@@ -1596,14 +1640,6 @@ func buildConstraintsFromClaims(caps []string, target EnforceTarget) []capabilit
 	return buildConstraintsFromParsed(parseCapHeads(caps), target)
 }
 
-// buildConstraintsFromParsed is the matching/condition phase shared by the hot path
-// and buildConstraintsFromClaims. The expensive parseCondSuffix runs only for claims
-// that actually match this target.
-//
-// A condition-suffix parse failure here is the same validator/parser divergence
-// parseCapHeads logs for the head phase — ValidateToken already accepted the whole
-// claim, suffix included — so it is reported the same way rather than dropped
-// silently, which would surface only as an unexplained AUTHORIZATION_FAILED.
 // claimNamesTargetButFailedToParse reports whether some capability claim MATCHES target
 // but contributed no constraint because its condition suffix would not parse.
 //
@@ -1613,11 +1649,7 @@ func buildConstraintsFromClaims(caps []string, target EnforceTarget) []capabilit
 // never reaches it) and re-parses only the suffixes of claims that match this target, which
 // is the same bounded work buildConstraintsFromParsed already did for them.
 func claimNamesTargetButFailedToParse(claims *JWTClaims, target EnforceTarget) bool {
-	heads := claims.parsedCaps
-	if heads == nil {
-		heads = parseCapHeads(claims.Capabilities)
-	}
-	for _, h := range heads {
+	for _, h := range parsedCapHeads(claims) {
 		if h.prefix != target.Type || !matchClaimBare(h.prefix, h.bareName, target.Name) {
 			continue
 		}
@@ -1633,6 +1665,14 @@ func claimNamesTargetButFailedToParse(claims *JWTClaims, target EnforceTarget) b
 	return false
 }
 
+// buildConstraintsFromParsed is the matching/condition phase shared by the hot path
+// and buildConstraintsFromClaims. The expensive parseCondSuffix runs only for claims
+// that actually match this target.
+//
+// A condition-suffix parse failure here is the same validator/parser divergence
+// parseCapHeads logs for the head phase — ValidateToken already accepted the whole
+// claim, suffix included — so it is reported the same way rather than dropped
+// silently, which would surface only as an unexplained AUTHORIZATION_FAILED.
 func buildConstraintsFromParsed(heads []capHead, target EnforceTarget) []capability.Constraint {
 	var out []capability.Constraint
 	for _, h := range heads {
@@ -1663,6 +1703,18 @@ func buildConstraintsFromParsed(heads []capHead, target EnforceTarget) []capabil
 // whenever a claim matches its namespace and bare name. It takes the same []capHead
 // the Decide path caches (JWTClaims.parsedCaps) so list filtering and Decide share
 // one claim parser instead of maintaining a second name-only variant.
+// parsedCapHeads returns the claim heads parsed once at token validation, falling back to
+// parsing them here for a JWTClaims built directly (tests, and any caller that set
+// Capabilities without going through ValidateToken). Three paths need the same fallback —
+// the capability decision, the list filter, and the malformed-claim diagnosis — so it is
+// written once rather than re-spelled at each.
+func parsedCapHeads(claims *JWTClaims) []capHead {
+	if claims.parsedCaps != nil {
+		return claims.parsedCaps
+	}
+	return parseCapHeads(claims.Capabilities)
+}
+
 func anyCapCovers(parsed []capHead, target EnforceTarget) bool {
 	for _, c := range parsed {
 		if c.prefix == target.Type && matchClaimBare(c.prefix, c.bareName, target.Name) {
@@ -1739,10 +1791,7 @@ func (p *JWTPDP) filterList(ctx context.Context, result json.RawMessage, desc li
 	// Reuse the claim heads parsed once at token validation (parsedCaps); fall back to
 	// parsing here for a test-built JWTClaims that set Capabilities directly. Mirrors
 	// Decide's use of parsedCaps so list filtering never re-parses on the hot path.
-	parsed := claims.parsedCaps
-	if parsed == nil {
-		parsed = parseCapHeads(claims.Capabilities)
-	}
+	parsed := parsedCapHeads(claims)
 	kept := make([]json.RawMessage, 0, len(innerRes.Entries))
 	for i, raw := range innerRes.Entries {
 		var covered bool

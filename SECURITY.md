@@ -45,7 +45,7 @@ they are the proxy's core security promise:
 
 | Area | Examples of in-scope findings |
 | --- | --- |
-| **Policy bypass** | A `tools/call`, `resources/read`, `resources/subscribe`, `prompts/get`, or `sampling/createMessage` that the manifest should have denied but did not. Argument-condition bypasses (e.g. `allowedValues`, `allowedOperations`, `maxCalls`, `timeWindow`, `argumentSchema`) are explicitly in scope. |
+| **Policy bypass** | A `tools/call`, `resources/read`, `resources/subscribe`, `resources/unsubscribe`, `prompts/get`, or `sampling/createMessage` that the manifest should have denied but did not. Argument-condition bypasses (e.g. `allowedValues`, `allowedOperations`, `maxCalls`, `timeWindow`, `argumentSchema`) are explicitly in scope. |
 | **List leakage** | `tools/list`, `resources/list`, or `prompts/list` returning entries the manifest forbids. |
 | **JWT / claims** | Token-validation flaws, claim-intersection errors (JWT widening the manifest), JWKS-handling issues. |
 | **Audit integrity** | Any path that produces a record the HMAC chain accepts but that misrepresents the underlying call, silent rotation that loses records, or recovery from a corrupted key file that re-keys without operator action. |
