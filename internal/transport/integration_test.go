@@ -23,8 +23,10 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -656,5 +658,104 @@ func TestRunStdioDriftCheck_FatalWhenPinsAndNoToolsList(t *testing.T) {
 	// description integrity without the live list).
 	if err := drift.MakeDriftCheck(manifest, true)(raw, p.upstreamServerVersion, probeErr); err == nil {
 		t.Error("expected fatal drift error when pins set and tools/list unavailable")
+	}
+}
+
+// ── OnReady ordering ──────────────────────────────────────────────────────
+
+// TestStdioProxy_OnReadyNotRunWhenStartupFails pins the ordering the session-kill TTL
+// publish depends on, the stdio analogue of TestServe_AfterListenNotRunWhenBindFails. The
+// hook overwrites shared, last-writer-wins Redis state that `eunox kill` then trusts, so a
+// proxy that never comes up must not run it — otherwise starting a second, doomed proxy
+// leaves the RUNNING one's advertised lifetime replaced by one nothing enforces.
+//
+// The stdio host has no bind step, so the steps it has to clear instead are its own, inside
+// Start: spawning the upstream, the initialize handshake, and the drift check.
+func TestStdioProxy_OnReadyNotRunWhenStartupFails(t *testing.T) {
+	if testing.Short() {
+		t.Skip("re-execs the test binary as an upstream subprocess; skipped in -short")
+	}
+
+	// An FM-5 descriptionHash pin that cannot match, so the drift check refuses the
+	// session — the LAST of Start's fallible steps, and the one furthest from the
+	// constructor, so clearing it means the hook cleared all three.
+	manifest := &config.LocalManifest{
+		Name:    "integ",
+		Version: "1.0.0",
+		Capabilities: []capability.Constraint{{
+			Target:          "tool:read_file",
+			Actions:         []string{"call"},
+			DescriptionHash: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+		}},
+	}
+
+	for _, tc := range []struct {
+		name    string
+		command string
+		args    []string
+		drift   drift.CheckFunc
+	}{
+		{
+			name:    "upstream binary does not exist",
+			command: filepath.Join(t.TempDir(), "no-such-upstream"),
+		},
+		{
+			name:    "drift check refuses the session",
+			command: os.Args[0],
+			args:    []string{"-test.run=^TestHelperStdioUpstream$", "--", stdioUpstreamSentinel},
+			drift:   drift.MakeDriftCheck(manifest, true),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var ready atomic.Bool
+			p := NewStdioProxy(StdioProxyOptions{
+				Command:    tc.command,
+				Args:       tc.args,
+				PDP:        pdp.NewManifestPDP(manifest.Capabilities, enforcement.New(), killswitch.NewInMemory()),
+				SessionID:  "integ-onready-fail",
+				ShutdownMs: 2000,
+				DriftCheck: tc.drift,
+				OnReady:    func() { ready.Store(true) },
+			})
+			// Closed stdin so Start cannot block in serveHost if startup unexpectedly
+			// succeeds; the host side is never exercised.
+			inR, _ := io.Pipe()
+			p.hostReader = mcp.NewMsgReader(inR)
+			outR, outW := io.Pipe()
+			go func() { _, _ = io.Copy(io.Discard, outR) }()
+			p.hostWriter = mcp.NewMsgWriter(outW)
+
+			if err := p.Start(context.Background()); err == nil {
+				t.Fatal("Start must fail for this case; the test's premise is a failed startup")
+			}
+			if ready.Load() {
+				t.Error("OnReady must not run when startup fails: it would clobber a running proxy's published state")
+			}
+		})
+	}
+}
+
+// The companion: on a session that does come up, the hook must actually run — before the
+// host serve loop, so a proxy standing and serving has published its state.
+func TestStdioProxy_OnReadyRunsOnceSessionIsLive(t *testing.T) {
+	if testing.Short() {
+		t.Skip("re-execs the test binary as an upstream subprocess; skipped in -short")
+	}
+
+	var ready atomic.Bool
+	h := newStdioHostHarness(t, StdioProxyOptions{
+		PDP:        pdp.AlwaysAllowPDP{},
+		SessionID:  "integ-onready-ok",
+		ShutdownMs: 2000,
+		OnReady:    func() { ready.Store(true) },
+	})
+	// Drive one request through so the serve loop has demonstrably started, which places
+	// the hook strictly before it rather than merely somewhere inside Start.
+	h.roundTrip(t, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "tools/list"})
+	if !ready.Load() {
+		t.Error("OnReady must run once the session is live, before the host serve loop")
+	}
+	if err := h.shutdown(t); err != nil {
+		t.Fatalf("shutdown: %v", err)
 	}
 }

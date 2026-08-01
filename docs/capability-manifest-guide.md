@@ -1907,17 +1907,28 @@ metadata (`_meta`, content annotations) are preserved unchanged.
 
 > **Ambiguous JSON keys fail closed under an active `redactFields`.** A response whose
 > object keys the proxy and the host can resolve differently cannot be verified, so it is
-> **denied fail-closed** rather than forwarded. Two shapes qualify: a **duplicate** key at
-> any depth (Go keeps the last, a first-wins host parser keeps the first, so a response
-> like `{"content":[…],"data":{"ssn":"…"},"data":{}}` would redact nothing and be forwarded
-> byte-for-byte while the host renders the ssn), and a **case-variant collision** among the
-> result envelope's own top-level keys (`data` alongside `Data`), which any consumer binding
-> keys case-insensitively resolves to one field and the host to two. Case-distinct keys
-> *nested* below the envelope root stay legal — a payload carrying both `Name` and `name`
-> inside an object is ordinary and is not refused. The same check applies to a JSON blob
-> unwrapped from a text item or a doubly-encoded string, since its keys only become keys
-> once the proxy decodes it. This is the same rule the request path and the `*/list`
-> filters already apply.
+> **denied fail-closed** rather than forwarded. Two shapes qualify:
+>
+> - A **duplicate** key, at any depth. Go keeps the last, a first-wins host parser keeps
+>   the first, so a response like `{"content":[…],"data":{"ssn":"…"},"data":{}}` would
+>   redact nothing and be forwarded byte-for-byte while the host renders the ssn.
+> - A **case-variant collision** on a key this redaction depends on resolving — a segment
+>   of one of your redact paths (`data` alongside `Data` under `redactFields:
+>   ["data.ssn"]`), or one of the result envelope's protocol keys (`content` alongside
+>   `Content`), which the proxy matches exactly when deciding which pass to apply. A
+>   consumer that binds keys case-insensitively folds such a pair to one field where the
+>   proxy saw two.
+>
+> Case variants of names your obligation does not touch are ordinary data and are **not**
+> refused: a payload carrying both `Report` and `report` under `redactFields: ["data.ssn"]`
+> redacts normally. The same check applies to a JSON blob unwrapped from a text item or a
+> doubly-encoded string, since its keys only become keys once the proxy decodes it.
+>
+> The duplicate-key half of this rule is the same one the request path and the `*/list`
+> filters apply. The case-variant half is narrower here on purpose: those two surfaces
+> decode into Go structs, where the decoder's own case-insensitive field matching makes
+> *every* case-variant sibling a divergence; the redaction walk decodes into a generic map,
+> where only the names above are resolved by matching.
 
 > **`resource` / `resource_link` content fails closed under an active `redactFields`.**
 > A `resource` or `resource_link` content item nests a `resource` object that can carry

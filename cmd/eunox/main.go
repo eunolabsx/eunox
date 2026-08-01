@@ -629,15 +629,16 @@ func cmdProxy(args []string) (exitCode int) {
 		signal.Stop(sigCh)
 	}()
 
-	// The effective session-kill TTL is published to shared Redis by the ready hook the
-	// serve functions invoke once their transport is standing (post-bind for the gateway,
-	// immediately pre-Start for stdio), NOT here. The write overwrites whatever another
-	// instance published, so a process that dies during construction — a rejected flag, a
-	// BuildRoutes failure, a bind collision — must not have written it: `eunox kill` and
-	// this proxy's own diagnostics would be left trusting a lifetime nothing enforces.
-	// That is the same clobber-then-die bug already fixed once for the control-token file,
-	// and it is why this deliberately runs LAST rather than merely after the fallible
-	// startup steps that happen to precede this line.
+	// The effective session-kill TTL is published to shared Redis by the ready hook each
+	// transport invokes once it is actually standing — after the bind AND the control-token
+	// write for the gateway, after the upstream handshake and drift check for stdio — NOT
+	// here. The write overwrites whatever another instance published, so a process that dies
+	// on the way up — a rejected flag, a BuildRoutes failure, a bind collision, a missing
+	// upstream binary, a refused drift check — must not have written it: `eunox kill` and
+	// this proxy's own diagnostics would be left trusting a lifetime nothing enforces. That
+	// is the same clobber-then-die bug already fixed once for the control-token file, and it
+	// is why the hook is threaded all the way into the transports rather than called after
+	// the fallible startup steps that happen to precede this line.
 	onServeReady := func() {}
 	if ksRedis != nil {
 		onServeReady = func() { publishSessionKillTTL(ksRedis) }
@@ -1765,18 +1766,31 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 	// HTTPGatewayOptions.AfterListen), so only the needed path should outlive that.
 	controlTokenPath := pf.controlTokenPath
 	writeControlToken := func(ctx context.Context) error {
-		// The session-kill TTL publish shares this hook for the same reason the token
-		// write is in it: both overwrite shared, last-writer-wins state that `eunox kill`
-		// then trusts, so neither may be performed by a process that never reaches the
-		// accept loop (a bind collision being the concrete case). Published first because
-		// it only warns on failure, so the token write still runs; a failed token write
-		// aborts startup, and this proxy's TTL is the one actually in force by then.
-		onServeReady()
 		controlTokenFile, werr := transport.WriteControlTokenFile(ctx, controlTokenPath, controlToken)
 		if werr != nil {
 			return fmt.Errorf("kill control endpoint: %w", werr)
 		}
 		fmt.Fprintf(os.Stderr, "[eunox] Control token for POST /control/kill written to %s (0600). 'eunox kill' reads it from there; override with --control-token-path / --control-token / EUNOX_CONTROL_TOKEN.\n", controlTokenFile)
+		// The session-kill TTL publish shares this hook for the same reason the token write
+		// is in it: both overwrite shared, last-writer-wins state that `eunox kill` then
+		// trusts, so neither may be performed by a process that never reaches the accept
+		// loop (a bind collision being the concrete case).
+		//
+		// Published LAST, after the token write has succeeded. A failed token write aborts
+		// startup — this proxy is going down — so publishing first meant the one startup
+		// failure that survives the bind still clobbered a running proxy's TTL, the exact
+		// failure moving these effects behind the bind was meant to end. Nothing needs to
+		// run after the publish, so ordering it second costs nothing.
+		//
+		// The ctx re-check covers the other way this hook reaches its end without the proxy
+		// coming up: it runs under a bounded post-bind context that a shutdown landing in
+		// that window cancels. Aborting there returns nil rather than an error — a
+		// cancelled startup is not a token-write failure, and Serve treats the shutdown
+		// itself as the outcome.
+		if ctx.Err() != nil {
+			return nil
+		}
+		onServeReady()
 		return nil
 	}
 
@@ -1870,11 +1884,15 @@ func serveStdioHost(ctx context.Context, cfg *config.GatewayConfig, sink *audit.
 		// schemaVersion that contains it; a published-grammar policy ignores the block.
 		HonorAttribution: manifest.HonorsAttributionInterface(),
 		DriftCheck:       drift.MakeDriftCheck(manifest, strictDrift),
+		// The stdio host has no bind step, so the transport fires the ready hook itself,
+		// from inside Start once the session is live. Calling it here instead would put it
+		// ahead of Start's own fallible steps — spawning the upstream, the initialize
+		// handshake, the drift check — so a proxy that never came up (a missing upstream
+		// binary is the ordinary case) would still have overwritten the session-kill TTL a
+		// RUNNING proxy published, which is the clobber-then-die failure the gateway's
+		// post-bind hook exists to prevent. See cmdProxy's onServeReady.
+		OnReady: onServeReady,
 	})
-	// The stdio host has no bind step, so its ready point is here: every fallible
-	// construction step (policy load, PDP wiring, drift-check setup) has run, and nothing
-	// between this line and Start can fail. See cmdProxy's onServeReady.
-	onServeReady()
 	return proxy.Start(ctx)
 }
 

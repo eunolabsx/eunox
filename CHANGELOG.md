@@ -495,7 +495,18 @@ Section conventions:
   overwrote another instance's published TTL — the clobber-then-die bug already fixed for
   the control-token file — and minted an audit key/log for a process about to exit. The
   rejections now run with the rest of flag validation, before any side effect, and the TTL
-  publish moved to the post-bind hook beside the control-token write.
+  publish moved into the transports' own ready hooks — the two remaining places a proxy can
+  still fail to come up after that validation passes:
+  - **Gateway:** the publish runs in the post-bind hook, and now runs *after* the
+    control-token write rather than before it. A failed token write aborts startup, so
+    publishing first meant the one startup failure that survives the bind still clobbered a
+    running proxy's TTL. The hook also re-checks its context, so a shutdown landing in the
+    post-bind window publishes nothing.
+  - **Stdio:** the publish runs through the new `StdioProxyOptions.OnReady`, fired inside
+    `Start` once the session is live. It previously ran just *before* `Start`, ahead of that
+    function's own fallible steps — spawning the upstream, the initialize handshake, the
+    drift check — so a missing upstream binary or a refused `descriptionHash` pin still
+    overwrote a running proxy's TTL on the way to exiting.
 - **The effect layer's numeric bounds are covered by the YAML coercion guard.**
   `blastRadius.max`, a `byArgument` case's `value`, and `effectCeiling.maxBlastRadius`
   were outside the check that rejects a literal YAML auto-typed away from its written
@@ -815,10 +826,17 @@ Section conventions:
   — rendering the ssn on any first-wins host parser (`JSON.parse`, the Python SDK) while
   the audit record reported the obligation applied. The same smuggle worked one layer
   down, inside a JSON text content item, where the envelope never sees those keys at all.
-  Both now run the fold-aware duplicate-key scan the request path and the `*/list`
-  filters already apply — a duplicate key at any depth, or a case-variant collision among
-  the result envelope's own top-level keys — and deny the response when it fires.
-  Case-distinct keys *nested* below the envelope root stay legal.
+  Both now run the same streaming key scan the request path and the `*/list` filters
+  apply, and deny the response when it fires: a duplicate key at any depth, or a
+  case-variant collision on a key the redaction depends on resolving — a segment of a
+  redact path (the masking walk looks its segments up exactly) or one of the envelope's
+  protocol-reserved keys (`ApplyRedactObligs` dispatches on those exactly, so `Content`
+  alongside `content` would take the lenient generic walk instead of the content-array
+  pass and its fail-closed resource guard). Case variants of names the obligation does not
+  touch are ordinary data and are not refused; the fold is narrower here than on the
+  request and `*/list` paths because those decode into Go structs, where the decoder's own
+  case-insensitive field matching makes every case-variant sibling a divergence, while the
+  redaction walk decodes into a generic map.
 - **The audit HMAC key is opened under the symlink guard, and chmod'd through the
   handle.** The key is the one audit file whose redirection is unrecoverable — the log is
   HMAC-protected, but whoever chooses the key chooses what verifies — and it was the only

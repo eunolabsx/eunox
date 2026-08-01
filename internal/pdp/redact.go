@@ -35,8 +35,9 @@ import (
 // object key and passes through unchanged; redactFields redacts cleanly-parseable JSON
 // only and does NOT fail the response closed over string content it cannot parse. It
 // fails closed on a structural/resource guard: an unparseable (or trailing-data)
-// envelope, an envelope or unwrapped JSON leaf whose object keys duplicate or case-collide
-// (so its decode may differ from what a host renders; see redactionKeysAmbiguous), a
+// envelope, an envelope or unwrapped JSON leaf whose object keys duplicate — or case-collide
+// on a name this redaction resolves by matching — so that its decode may differ from what a
+// host renders (see redactionKeysAmbiguous and redactionFoldKeys), a
 // structurally unverifiable content array/item shape, the depth bound, or a
 // resource/resource_link content item (whose embedded text/blob body this redactor
 // cannot inspect) — the last so an upstream cannot evade a declared redactFields
@@ -484,8 +485,9 @@ const (
 	// itself decode to a container (or another string layer) and must be recursed into,
 	// not treated as terminal — the fix for the double-encoding fail-open.
 	leafKindString
-	// leafKindAmbiguous is a JSON container whose object keys duplicate or case-collide, so
-	// this redactor's decode of it may differ from what a host renders. It is NOT a
+	// leafKindAmbiguous is a JSON container whose object keys duplicate, or case-collide on
+	// a name this redaction resolves by matching (see redactionFoldKeys), so that this
+	// redactor's decode of it may differ from what a host renders. It is NOT a
 	// pass-through shape like leafKindOther: the caller fails the whole response closed,
 	// because a container the redactor cannot read the way the host will could be hiding
 	// the very field the obligation names.

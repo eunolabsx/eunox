@@ -203,6 +203,10 @@ type StdioProxy struct {
 	// honorAttribution admits the client-supplied attribution interface. Set from
 	// StdioProxyOptions.HonorAttribution at construction; see that field.
 	honorAttribution bool
+
+	// onReady is the post-startup hook, run once the session is live. Set from
+	// StdioProxyOptions.OnReady at construction; see that field.
+	onReady func()
 }
 
 // StdioProxyOptions configures a StdioProxy. The upstream is either a local
@@ -244,6 +248,23 @@ type StdioProxyOptions struct {
 
 	// DriftCheck is the injected drift hook; nil = no drift checking.
 	DriftCheck drift.CheckFunc
+
+	// OnReady, when non-nil, runs inside Start once the session is live — the upstream is
+	// connected, the initialize handshake has answered, and the drift check has passed —
+	// and before the host serve loop begins. It is the stdio analogue of
+	// HTTPGatewayOptions.AfterListen and exists for the same reason: startup effects that
+	// overwrite SHARED, last-writer-wins state other processes then trust (the
+	// session-kill TTL this proxy publishes for `eunox kill`) must not be performed by a
+	// process that never comes up. The stdio host has no bind step, so the fallible steps
+	// it must clear instead are its own — a missing upstream binary, an upstream that
+	// never answers initialize, a refused drift check — each of which returns straight out
+	// of Start. Running the hook before them let a doomed process clobber a RUNNING
+	// proxy's published state on its way to dying.
+	//
+	// Unlike AfterListen it returns no error: its callers are advisory (a failure warns and
+	// the proxy runs on), and there is no useful "abort startup" for an effect whose whole
+	// contract is best-effort. It is called exactly once, on the success path only.
+	OnReady func()
 }
 
 // NewStdioProxy creates a StdioProxy ready to call Start.
@@ -274,6 +295,7 @@ func NewStdioProxy(opts StdioProxyOptions) *StdioProxy {
 		requireAuditStrict:    opts.RequireAuditStrict,
 		driftCheck:            opts.DriftCheck,
 		honorAttribution:      opts.HonorAttribution,
+		onReady:               opts.OnReady,
 		byUpstreamID:          make(map[string]chan upstreamResult),
 		hostToUp:              make(map[string]*json.RawMessage),
 		hostReader:            mcp.NewMsgReader(os.Stdin),
@@ -430,6 +452,16 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 	}()
 
 	fmt.Fprintf(os.Stderr, "[eunox] Session %s initialized; proxying to %q.\n", p.sessionID, p.upstreamLabel())
+
+	// Post-startup effects (see StdioProxyOptions.OnReady). This is the stdio host's ready
+	// point — the analogue of the HTTP transport's post-bind hook — and it is placed HERE,
+	// after every fallible startup step, rather than before Start: connectUpstream, the
+	// initialize handshake, and the drift check each return straight out of Start, so a
+	// hook run ahead of them would let a proxy that never comes up overwrite shared state a
+	// running one owns. Nothing between this line and the serve loop can fail.
+	if p.onReady != nil {
+		p.onReady()
+	}
 
 	// ── 6. Serve host until stdin closes ───────────────────────────────────────
 	p.serveHost(ctx)
