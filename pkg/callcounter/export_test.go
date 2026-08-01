@@ -19,3 +19,11 @@ func WithRedisTimeFunc(fn func() time.Time) redisOption {
 func ParseIncrIfBelowReply(res interface{}) (count int64, admitted bool, retryAfter time.Duration, err error) {
 	return parseIncrIfBelowReply(res)
 }
+
+// ParseAddIfTotalBelowReply exposes the weighted reply decoder for the same reason
+// ParseIncrIfBelowReply is exposed: a wrong element type cannot be produced through the
+// real Lua script via miniredis, and the decoder's job is to fail closed on one rather than
+// default to a zero total that would read as an unspent budget.
+func ParseAddIfTotalBelowReply(res interface{}) (total float64, admitted bool, retryAfter time.Duration, err error) {
+	return parseAddIfTotalBelowReply(res)
+}

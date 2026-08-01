@@ -428,6 +428,169 @@ func parseIncrIfAllBelowReply(res interface{}) (admitted bool, deniedIndex int, 
 	return false, int(deniedRaw) - 1, cnt, time.Duration(retryMicros) * time.Microsecond, nil
 }
 
+// weightMemberSep separates a sorted-set member's uniqueness prefix from the WEIGHT it
+// carries. One key holds both the timestamp (the score) and the magnitude (the member
+// suffix), so a weighted counter needs no second key to stay consistent with its own
+// expiry — the weight ages out with the entry that carried it, atomically, because they
+// are the same element.
+//
+// The separator is a byte the uniqueness prefix cannot contain: newMember emits only hex,
+// digits, and '-'. A member WITHOUT it is a plain counted call and reads as weight 1,
+// which is what lets a key written by IncrementIfBelow be summed by AddIfTotalBelow
+// without a migration — the sense in which the weighted total generalizes the count.
+const weightMemberSep = "|"
+
+// newWeightedMember builds a sorted-set member carrying both the per-instance uniqueness
+// of newMember and this call's weight. 'g' with -1 precision emits the shortest form that
+// round-trips through Lua's tonumber (itself a float64 parse), so the weight summed by the
+// script is bit-identical to the one this process admitted.
+func (r *Redis) newWeightedMember(now time.Time, weight float64) string {
+	return r.newMember(now) + weightMemberSep + strconv.FormatFloat(weight, 'g', -1, 64)
+}
+
+// addIfTotalBelowScript atomically adds weight to a key's in-window WEIGHTED TOTAL only
+// when the resulting total would not exceed the limit. Running prune, sum, compare,
+// conditional add, and TTL as one script makes check-and-record atomic across replicas, so
+// a denied call adds no member and a burst of refusals cannot extend its own lockout.
+//
+//	KEYS[1] sorted-set key
+//	ARGV[1] cutoff (microseconds; members with score <= cutoff are expired)
+//	ARGV[2] now (microseconds; score for the new member)
+//	ARGV[3] member (uniqueness prefix, separator, weight)
+//	ARGV[4] weight
+//	ARGV[5] limit
+//	ARGV[6] TTL (seconds)
+//	ARGV[7] window (microseconds; for the retryAfter estimate)
+//
+// Reply: {admitted (1|0), total (string), retryAfterMicros}.
+//
+// The total is returned as a STRING, not a Redis integer: it is a magnitude, routinely
+// fractional (a currency amount), and Redis integer replies truncate. It is formatted with
+// %.17g rather than Lua's tostring, which uses %.14g and would silently round a total in
+// the upper range of what MaxWeightedTotal admits — turning an exact budget into an
+// approximate one at exactly the magnitudes where the bound matters most. The Go side
+// parses it back with the same float64 parse the script used, so the value the caller
+// compares is the value the script compared.
+//
+// The retryAfter estimate walks oldest-first accumulating the weight each expiry frees,
+// and reports when the entry that crosses the shortfall leaves the window — the weighted
+// analogue of incrIfBelowScript's rank-(count-limit) pivot. Timestamps are MICROSECONDS
+// for the same reason as there: Lua numbers are float64, exact only to 2^53.
+var addIfTotalBelowScript = redis.NewScript(`
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+local entries = redis.call('ZRANGE', KEYS[1], 0, -1, 'WITHSCORES')
+local weight = tonumber(ARGV[4])
+local limit = tonumber(ARGV[5])
+local total = 0
+local n = 0
+local w = {}
+local s = {}
+for i = 1, #entries, 2 do
+  local m = entries[i]
+  local sep = string.find(m, '|', 1, true)
+  local ew = 1
+  if sep then
+    ew = tonumber(string.sub(m, sep + 1)) or 1
+  end
+  n = n + 1
+  w[n] = ew
+  s[n] = tonumber(entries[i + 1])
+  total = total + ew
+end
+if total + weight > limit then
+  -- Refresh the TTL on the denied path too: a key held at its bound is never admitted, so
+  -- its TTL would count down from the last admit and the key could expire mid-window,
+  -- silently resetting the budget. Gate on EXISTS so the invariant is "refresh whenever
+  -- present, never re-create an absent key".
+  if redis.call('EXISTS', KEYS[1]) == 1 then
+    redis.call('EXPIRE', KEYS[1], ARGV[6])
+  end
+  local needed = (total + weight) - limit
+  local retry = 0
+  local freed = 0
+  for i = 1, n do
+    freed = freed + w[i]
+    if freed >= needed then
+      retry = (s[i] + tonumber(ARGV[7])) - tonumber(ARGV[2])
+      if retry < 0 then retry = 0 end
+      break
+    end
+  end
+  return {0, string.format('%.17g', total), retry}
+end
+redis.call('ZADD', KEYS[1], ARGV[2], ARGV[3])
+redis.call('EXPIRE', KEYS[1], ARGV[6])
+return {1, string.format('%.17g', total + weight), 0}
+`)
+
+// AddIfTotalBelow adds weight to the key's in-window weighted total only when the
+// resulting total would not exceed limit, evaluating check and record in one atomic Lua
+// script (see addIfTotalBelowScript). It is the weighted counterpart of IncrementIfBelow
+// that the cumulative blastRadius bound uses; an over-limit call adds no member.
+//
+// Cost note: unlike the counting paths, which answer with an O(1) ZCARD, this sums the
+// per-member weights and is therefore O(n) in the window's entry count. That asymmetry is
+// why maxCalls keeps its own primitive rather than riding this one.
+func (r *Redis) AddIfTotalBelow(ctx context.Context, key string, windowSec int, weight, limit float64) (total float64, admitted bool, retryAfter time.Duration, err error) {
+	if err := checkWindowSec(windowSec); err != nil {
+		return 0, false, 0, err
+	}
+	// Reject a malformed weight or bound before the round trip: the script's
+	// `total + weight > limit` branch would otherwise deny with a nil error, making a
+	// misconfiguration indistinguishable from an exhausted budget (and a NaN weight would
+	// make that comparison false forever — the fail-OPEN direction).
+	if err := checkWeight(weight); err != nil {
+		return 0, false, 0, err
+	}
+	if err := checkTotalLimit(limit); err != nil {
+		return 0, false, 0, err
+	}
+
+	now := r.now()
+	windowKey := redisWindowKey(key, windowSec)
+	nowMicros := now.UnixMicro()
+	cutoff := now.Add(-time.Duration(windowSec) * time.Second).UnixMicro()
+	windowMicros := int64(windowSec) * 1_000_000
+	ttlSec := int64(windowSec) * cleanupMarginFactor
+	member := r.newWeightedMember(now, weight)
+
+	res, runErr := addIfTotalBelowScript.Run(ctx, r.client, []string{windowKey},
+		cutoff, nowMicros, member, weight, limit, ttlSec, windowMicros).Result()
+	if runErr != nil {
+		return 0, false, 0, fmt.Errorf("redis eval: %w", runErr)
+	}
+	return parseAddIfTotalBelowReply(res)
+}
+
+// parseAddIfTotalBelowReply decodes the {admitted, total, retryAfterMicros} array
+// addIfTotalBelowScript returns. Each element is type-checked so a changed encoding (a
+// go-redis upgrade, a Valkey/KeyDB proxy, a test mock) fails closed with a structured
+// error rather than defaulting to a zero value, which would report an empty budget and
+// admit — mirroring parseIncrIfBelowReply.
+func parseAddIfTotalBelowReply(res interface{}) (total float64, admitted bool, retryAfter time.Duration, err error) {
+	arr, ok := res.([]interface{})
+	if !ok || len(arr) != 3 {
+		return 0, false, 0, fmt.Errorf("redis eval: unexpected reply %T", res)
+	}
+	admittedRaw, ok := arr[0].(int64)
+	if !ok {
+		return 0, false, 0, fmt.Errorf("redis eval: unexpected admitted type %T (value %v)", arr[0], arr[0])
+	}
+	totalRaw, ok := arr[1].(string)
+	if !ok {
+		return 0, false, 0, fmt.Errorf("redis eval: unexpected total type %T (value %v)", arr[1], arr[1])
+	}
+	total, parseErr := strconv.ParseFloat(totalRaw, 64)
+	if parseErr != nil {
+		return 0, false, 0, fmt.Errorf("redis eval: unparseable total %q: %w", totalRaw, parseErr)
+	}
+	retryMicros, ok := arr[2].(int64)
+	if !ok {
+		return 0, false, 0, fmt.Errorf("redis eval: unexpected retryMicros type %T (value %v)", arr[2], arr[2])
+	}
+	return total, admittedRaw == 1, time.Duration(retryMicros) * time.Microsecond, nil
+}
+
 // Peek returns the number of entries recorded for key within the window WITHOUT
 // adding one. It is the read-only counterpart of IncrementAndGet used by
 // sequenceBlock to test whether a tool has already run. windowSec must match the

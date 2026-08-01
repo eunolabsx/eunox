@@ -179,7 +179,56 @@ type CallCounter interface {
 	// each limit must be >= 1 and each windowSec in range, else it fails closed and
 	// records nothing. The single-bucket path stays on IncrementIfBelow.
 	IncrementIfAllBelow(ctx context.Context, keys []string, windowSecs []int, limits []int64) (admitted bool, deniedIndex int, count int64, retryAfter time.Duration, err error)
+
+	// AddIfTotalBelow is the WEIGHTED sibling of IncrementIfBelow: it atomically adds
+	// weight to a key's in-window total only when the resulting total would not exceed
+	// limit, so an over-limit call writes NOTHING. It backs the cumulative blastRadius
+	// bound — "no more than $2,000 of refunds an hour" — which per-call authorization
+	// structurally cannot see: four hundred individually-permitted $10 refunds are each
+	// legal and only the aggregate is catastrophic.
+	//
+	// It is a generalization of the counting methods above rather than a second
+	// accounting system: maxCalls is this with every weight equal to 1. It lives on this
+	// one contract for that reason, and is a MANDATORY method by the same convention the
+	// rest obey — a backend that omitted it would fail every velocity condition closed at
+	// runtime instead of failing to compile.
+	//
+	// The counting methods are nonetheless kept separate, deliberately: a count is O(1)
+	// in every backend (ZCARD, a slice length) while a weighted total is O(n) in the
+	// window (the per-entry weights have to be summed), so folding maxCalls onto this
+	// would make every rate-limit check pay a linear scan it does not need.
+	//
+	// total is the post-add total when admitted and the current total when denied.
+	// retryAfter estimates when enough weight ages out for THIS call's weight to fit.
+	// weight must be finite and non-negative; limit must be finite and in
+	// (0, MaxWeightedTotal] — the bound at which both backends still represent a total
+	// exactly. Out-of-range inputs fail closed with a structured error and write nothing,
+	// so a misconfigured bound stays distinguishable from an exhausted one.
+	//
+	// PRECISION. Both backends accumulate in IEEE-754 double precision, in timestamp
+	// order, deliberately: the Redis backend's Lua arithmetic is float64 and nothing
+	// else is available there, so making the in-memory backend exact would be the two
+	// backends disagreeing rather than one of them being right. Every total below
+	// MaxWeightedTotal composed of integral magnitudes is exact; a fractional magnitude
+	// (a currency amount) can differ from an exact decimal sum in the last bits, far
+	// below any bound an operator authors.
+	AddIfTotalBelow(ctx context.Context, key string, windowSec int, weight, limit float64) (total float64, admitted bool, retryAfter time.Duration, err error)
 }
+
+// MaxWeightedTotal is the largest weighted total a CallCounter backend represents exactly,
+// and therefore the largest limit — and largest single weight — AddIfTotalBelow accepts.
+//
+// It is 2^53 for the same reason the counting limit is: the Redis backend evaluates its
+// admission in Lua, whose numbers are IEEE-754 doubles, so a larger value would be
+// silently rounded to a threshold the operator never authored. No real cumulative bound
+// approaches it — a $2,000-per-hour refund ceiling is thirteen orders of magnitude below.
+//
+// It lives on the CONTRACT rather than in a backend package because three layers apply it
+// to the same input class: the manifest loader (rejecting an unrepresentable authored
+// bound), the engine (refusing to sum a magnitude it would have to round), and each
+// backend (its own fail-closed guard). A bound every layer "mirrors" is exactly the guard
+// that ends up missing from one of them.
+const MaxWeightedTotal float64 = 1 << 53
 
 // FlowLabelStore holds each session's accumulated information-flow-control label
 // set — the source->sink provenance state a labelOutput directive writes and a

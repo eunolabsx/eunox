@@ -8132,3 +8132,31 @@ func TestSequenceBlock_ReArmSurvivesRequestCancellation(t *testing.T) {
 	require.Equal(t, capability.DecisionDeny, resp.Decision,
 		"a client that disconnects on every probe must not be able to age the gate out")
 }
+
+// AddIfTotalBelow satisfies the weighted half of capability.CallCounter. This double
+// exercises the counting paths only, so a weighted add admits without recording: nothing
+// under test reads a weighted total from it.
+func (*spyLimiter) AddIfTotalBelow(_ context.Context, _ string, _ int, weight, _ float64) (float64, bool, time.Duration, error) {
+	return weight, true, 0, nil
+}
+
+// AddIfTotalBelow satisfies the weighted half of capability.CallCounter. This double
+// exercises the counting paths only, so a weighted add admits without recording: nothing
+// under test reads a weighted total from it.
+func (ctxHonoringCounter) AddIfTotalBelow(_ context.Context, _ string, _ int, weight, _ float64) (float64, bool, time.Duration, error) {
+	return weight, true, 0, nil
+}
+
+// AddIfTotalBelow satisfies the weighted half of capability.CallCounter. This double
+// exercises the counting paths only, so a weighted add admits without recording: nothing
+// under test reads a weighted total from it.
+func (errorCounter) AddIfTotalBelow(_ context.Context, _ string, _ int, weight, _ float64) (float64, bool, time.Duration, error) {
+	return weight, true, 0, nil
+}
+
+// AddIfTotalBelow satisfies the weighted half of capability.CallCounter. This double
+// exercises the counting paths only, so a weighted add admits without recording: nothing
+// under test reads a weighted total from it.
+func (recordingErrorCounter) AddIfTotalBelow(_ context.Context, _ string, _ int, weight, _ float64) (float64, bool, time.Duration, error) {
+	return weight, true, 0, nil
+}

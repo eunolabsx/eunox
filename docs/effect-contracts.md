@@ -157,11 +157,43 @@ Two behaviors worth knowing:
         allow: [reversible, compensable]   # this target may only ever do these
       - type: blastRadius
         max: 500                           # no single call over this magnitude
+        maxTotal: 2000                     # no more than this SUMMED...
+        windowSeconds: 3600                # ...within this sliding window
 ```
 
-A call whose blast radius **cannot be quantified** fails a `blastRadius` bound. An action
-whose size cannot be established must not be treated as small; treating unknown as zero is
-the fail-open the condition exists to prevent.
+A call whose blast radius **cannot be quantified** fails a `blastRadius` bound — either
+half of it. An action whose size cannot be established must not be treated as small, and it
+must not contribute 0 to a sum; treating unknown as zero is the fail-open the condition
+exists to prevent.
+
+### Cumulative velocity
+
+`max` bounds one call. `maxTotal` over `windowSeconds` bounds the **summed** magnitude of a
+session's calls to the target — the thing per-call authorization structurally cannot see.
+The per-call bound catches the $5,000 refund; it does not catch four hundred
+individually-permitted $10 refunds, which is the shape a compromised or prompt-injected
+agent actually produces, because every one of those calls is legal and only the aggregate
+is catastrophic.
+
+- The two cumulative keys are **set together or not at all**, and at least one of `max` or
+  `maxTotal` must be present. Half a pair silently disables the other half, and an authored
+  bound that bounded nothing is worse than its absence — the operator would believe a limit
+  was in force. Both shapes are load errors.
+- The budget is per **(session, target)**, like a `maxCalls` quota, and it is summed by
+  `CallCounter.AddIfTotalBelow` — the weighted generalization of the counting primitive
+  `maxCalls` uses, on the same seam rather than in a second accounting system.
+- An over-limit call **records nothing**. Charging a refused call's magnitude to the window
+  would let a burst of rejections extend its own lockout past the window that actually
+  spent the budget — the same rule an over-limit `maxCalls` follows.
+- The per-call bound is checked **first**, so a call refused for being too large on its own
+  never consumes cumulative budget that the permitted calls would then be denied.
+- `maxTotal` must be at most 2^53, the largest total both counter backends sum exactly. The
+  Redis backend evaluates its admission in Lua, whose numbers are IEEE-754 doubles; a larger
+  bound would be enforced as a threshold nobody authored, so it is refused at load. A
+  magnitude the double would have to round is likewise treated as unquantified rather than
+  summed approximately.
+- Under `--audit` the budget is **not** consumed, exactly as `maxCalls` quota is not:
+  observing it accurately would spend the thing observation exists to leave alone.
 
 ## The effect ceiling
 
@@ -275,11 +307,13 @@ consequential reading* (annotate the tool).
   a server attesting what it actually did, which eunox verifies for signature and
   consistency — is the effect-receipt surface, and it too verifies attestations rather
   than watching servers.
-- **No cumulative velocity yet.** "No more than $2,000 of refunds an hour" — the four
-  hundred individually-permitted $10 refunds — is **not expressible**. It needs a weighted
-  sliding-window sum the `CallCounter` contract does not provide, and the grammar
-  deliberately carries no half-working key for it: an authored `maxTotal` that silently
-  bounded nothing would be worse than its absence.
+- **One committing bound per capability.** A cumulative `blastRadius` bound cannot share a
+  capability with a `maxCalls` (or a second cumulative bound). A weighted budget and a call
+  count cannot be admitted in one atomic commit — a count is O(1) in every backend while a
+  weighted total is summed per entry — and committing them one after another would let a
+  call the second denies spend the first's budget. The combination is refused **at load**
+  rather than enforced with a weaker guarantee than the manifest appears to promise; declare
+  the two bounds on separate capabilities.
 - **Determinism.** Nothing on this path reads a payload, consults a model, or makes a
   network call. Effect is declared by policy and resolved from the call's own arguments.
 

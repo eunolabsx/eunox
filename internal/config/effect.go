@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/eunolabs/eunox/pkg/callcounter"
 	"github.com/eunolabs/eunox/pkg/capability"
 )
 
@@ -38,13 +39,69 @@ func validateEffectClass(i, j int, allow []string) error {
 	return nil
 }
 
-// validateBlastRadius checks a blastRadius condition: a present, well-formed,
-// non-negative per-call bound.
+// validateBlastRadius checks a blastRadius condition: well-formed, non-negative bounds,
+// at least one of them present, and a cumulative bound whose two halves are both set.
 func validateBlastRadius(i, j int, c *capability.BlastRadiusCondition) error {
-	if c.Max == nil {
-		return fmt.Errorf("capability at index %d, condition %d: blastRadius requires 'max', the largest magnitude one call may have; a condition with no bound bounds nothing", i, j)
+	// The pair rule, checked FIRST so a half-written velocity bound is reported as the
+	// pairing mistake it is rather than as a missing 'max'. Half the pair silently
+	// disables the other half — a `maxTotal` with no window has no window to sum over, and
+	// a `windowSeconds` with no total bounds nothing — and an authored bound that bounded
+	// nothing is worse than its absence, because the operator would believe a limit was in
+	// force.
+	switch {
+	case c.MaxTotal != nil && c.WindowSeconds == 0:
+		return fmt.Errorf("capability at index %d, condition %d: blastRadius 'maxTotal' requires 'windowSeconds', the sliding window it is summed over; a total with no window bounds nothing", i, j)
+	case c.MaxTotal == nil && c.WindowSeconds != 0:
+		return fmt.Errorf("capability at index %d, condition %d: blastRadius 'windowSeconds' requires 'maxTotal', the summed magnitude it bounds; a window with no total bounds nothing", i, j)
 	}
-	return validateBlastRadiusNumber(i, j, "max", c.Max)
+	if c.Max == nil && c.MaxTotal == nil {
+		return fmt.Errorf("capability at index %d, condition %d: blastRadius requires 'max' (the largest magnitude one call may have) or 'maxTotal' with 'windowSeconds' (the largest summed magnitude within a window), or both; a condition with no bound bounds nothing", i, j)
+	}
+	if err := validateBlastRadiusNumber(i, j, "max", c.Max); err != nil {
+		return err
+	}
+	if err := validateBlastRadiusNumber(i, j, "maxTotal", c.MaxTotal); err != nil {
+		return err
+	}
+	if c.MaxTotal != nil {
+		if err := validateBlastRadiusTotalRange(i, j, c.MaxTotal); err != nil {
+			return err
+		}
+		if c.WindowSeconds < 1 {
+			return fmt.Errorf("capability at index %d, condition %d: blastRadius 'windowSeconds' must be >= 1, got %d", i, j, c.WindowSeconds)
+		}
+		if int64(c.WindowSeconds) > callcounter.MaxWindowSeconds {
+			return fmt.Errorf("capability at index %d, condition %d: blastRadius 'windowSeconds' %d exceeds the maximum %d seconds", i, j, c.WindowSeconds, callcounter.MaxWindowSeconds)
+		}
+	}
+	return nil
+}
+
+// validateBlastRadiusTotalRange rejects a cumulative bound the counter backends cannot
+// represent exactly. Above MaxWeightedTotal the Redis backend's float64 arithmetic would
+// silently round the threshold to one the operator never authored — so the bound is
+// refused at load rather than enforced approximately at a magnitude where the rounding
+// alone could be thousands.
+//
+// It is separate from validateBlastRadiusNumber because the PER-CALL bound has no such
+// limit: it is compared exactly, in arbitrary precision, and never summed.
+func validateBlastRadiusTotalRange(i, j int, n *json.Number) error {
+	v, ok := capability.ParseBlastRadiusNumber(*n)
+	if !ok {
+		// Already reported by validateBlastRadiusNumber; nothing to add.
+		return nil
+	}
+	f, _ := v.Float64()
+	if f > callcounter.MaxWeightedTotal {
+		return fmt.Errorf("capability at index %d, condition %d: blastRadius 'maxTotal' must be <= %v (the largest total both counter backends sum exactly), got %q", i, j, callcounter.MaxWeightedTotal, n.String())
+	}
+	if f <= 0 {
+		// Zero admits nothing with a positive magnitude and would deny every quantified
+		// call in the window — a limit that looks generous and refuses everything, the same
+		// trap validateBlastRadiusNumber rejects a negative bound for.
+		return fmt.Errorf("capability at index %d, condition %d: blastRadius 'maxTotal' must be > 0, got %q; a zero total admits no quantified call at all", i, j, n.String())
+	}
+	return nil
 }
 
 // validateBlastRadiusNumber checks one bound: a parseable, non-negative number. A

@@ -45,7 +45,26 @@ type DeferredCommit struct {
 	WindowSecs int
 	Limit      int64
 	Deny       func(count int64, retryAfter time.Duration) *ConditionError
+	// Weighted marks a bucket admitted by SUMMING a per-call magnitude against a total
+	// (the cumulative blastRadius bound) rather than by counting calls against a limit.
+	// Such a bucket cannot join the count-based atomic commit — a weighted total is summed
+	// per entry while a count is O(1), so folding the two would make every rate-limit check
+	// pay a linear scan it does not need — and the manifest loader therefore refuses a
+	// constraint that carries one alongside any other quota-consuming condition. The engine
+	// fails closed if a programmatically built constraint produces that shape anyway; a
+	// weighted bucket that is the constraint's ONLY committing condition is admitted
+	// through its handler, which is already atomic on its own.
+	Weighted bool
 }
+
+// Commits reports whether this prepared commit names a bucket at all.
+//
+// A handler whose condition commits only in SOME configurations returns a zero
+// DeferredCommit for the non-committing case: blastRadius consumes a weighted budget only
+// when the condition declares a cumulative bound, but deferral is keyed by condition TYPE,
+// so the per-call-only shape reaches PrepareCommit too and has to be able to say "nothing
+// to commit". The engine then evaluates that condition as the pure predicate it is.
+func (d DeferredCommit) Commits() bool { return d.Key != "" }
 
 // CommittingConditionHandler is a ConditionHandler whose condition commits state
 // (consumes a quota slot) on admit, so it must run after all pure predicates and,
@@ -797,17 +816,26 @@ func isTypedNil(v interface{}) bool {
 // WithConditionHandler that commits state is honored here exactly as on the
 // single-condition path.
 func (e *Engine) commitDeferredAtomic(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, deferred []capability.Condition, requestID, now string) *capability.EnforceResponse {
-	keys := make([]string, len(deferred))
-	windowSecs := make([]int, len(deferred))
-	limits := make([]int64, len(deferred))
-	denies := make([]func(count int64, retryAfter time.Duration) *ConditionError, len(deferred))
+	var (
+		keys        []string
+		windowSecs  []int
+		limits      []int64
+		denies      []func(count int64, retryAfter time.Duration) *ConditionError
+		weighted    []capability.Condition
+		passthrough []capability.Condition
+		// committing counts the conditions that actually consume quota, which is NOT
+		// len(deferred): deferral is keyed by condition TYPE, so a condition whose type can
+		// commit but whose configuration does not (a per-call-only blastRadius) arrives here
+		// too and reports no bucket.
+		committing int
+	)
 	// Track buckets skipped under SkipQuota so a PARTIAL skip (some buckets skipped, some
 	// committing) can be caught after the loop. The loop evaluates EVERY bucket so a later
 	// bucket's validation condErr surfaces even when an earlier bucket skipped — returning
 	// on the first skip (the prior behavior) let an observe-mode call mask a later
 	// committing condition's error as an allow where enforce mode would deny.
 	skipped := 0
-	for i, cond := range deferred {
+	for _, cond := range deferred {
 		condType := cond.ConditionType()
 		ch, ok := e.committingHandler(condType)
 		if !ok {
@@ -855,6 +883,7 @@ func (e *Engine) commitDeferredAtomic(ctx context.Context, req *capability.Enfor
 			// call enforce mode would); the all-skip vs partial-skip decision is made after
 			// the loop.
 			skipped++
+			committing++
 			continue
 		}
 		// No second condErr check here: the one above the skip branch already returned for
@@ -862,12 +891,44 @@ func (e *Engine) commitDeferredAtomic(ctx context.Context, req *capability.Enfor
 		// twin of a load-bearing ordering rule is worse than none, because it makes the
 		// earlier check look redundant and invites a future "dedupe" that deletes the
 		// reachable one and silently restores the discarded-validation-error fail-open.
-		keys[i], windowSecs[i], limits[i], denies[i] = commit.Key, commit.WindowSecs, commit.Limit, commit.Deny
+		if !commit.Commits() {
+			// This particular condition consumes nothing, so it is a pure predicate wearing a
+			// committing type. Evaluate it below, before any budget is spent.
+			passthrough = append(passthrough, cond)
+			continue
+		}
+		committing++
+		if commit.Weighted {
+			// A weighted bucket cannot join the count-based atomic commit; see
+			// DeferredCommit.Weighted. Collected here so the incompatible combination is
+			// diagnosed once, after the whole set is known, rather than depending on which
+			// condition the author happened to write first.
+			weighted = append(weighted, cond)
+			continue
+		}
+		keys = append(keys, commit.Key)
+		windowSecs = append(windowSecs, commit.WindowSecs)
+		limits = append(limits, commit.Limit)
+		denies = append(denies, commit.Deny)
 	}
 
+	// Non-committing conditions run FIRST, before anything is charged to a budget: they are
+	// pure predicates, and the whole reason committing conditions are deferred is that a
+	// predicate which denies must be checked before a slot or a magnitude is spent.
+	for _, cond := range passthrough {
+		if deny := e.evalCondition(ctx, cond, req, matched, requestID, now); deny != nil {
+			return deny
+		}
+	}
+
+	// Nothing on this constraint actually consumes quota (every deferred condition was a
+	// pure predicate of a committing type), so there is no commit to make.
+	if committing == 0 {
+		return nil
+	}
 	// Every bucket skipped under SkipQuota (audit/observe): quota must not be consumed,
 	// so record nothing and allow — the ctx-driven skip held for all of them.
-	if skipped == len(deferred) {
+	if skipped == committing {
 		return nil
 	}
 	// A PARTIAL skip — some buckets skipped, others produced a commit — is a non-uniform
@@ -901,6 +962,30 @@ func (e *Engine) commitDeferredAtomic(ctx context.Context, req *capability.Enfor
 			Code:    capability.ErrCodeConditionFailed,
 			Message: "call counter not configured",
 		}, matched, requestID, now)
+	}
+
+	// A WEIGHTED bucket (a cumulative blastRadius bound) sums magnitudes rather than
+	// counting calls, so it cannot be admitted in the same atomic call as a counted one —
+	// see DeferredCommit.Weighted. Alone it needs no batching: its own handler admits it in
+	// one atomic backend call, and every other condition on the constraint has now been
+	// evaluated. Alongside anything else it is the shape the manifest loader refuses
+	// (validateOneCommittingCondition), so a programmatically built constraint reaching
+	// here fails closed rather than committing the two separately — which would let a call
+	// the second denies spend the first's budget.
+	if len(weighted) > 0 {
+		if len(keys) > 0 || len(weighted) > 1 {
+			resp := denyResponse(requestID, now, matched.IsAuditOnly(), nil, capability.DenialInfo{
+				Code:          capability.ErrCodeConditionFailed,
+				ConditionType: capability.ConditionTypeBlastRadius,
+				// HardDeny: an unenforceable combination is a construction fault, not a
+				// downgradable policy verdict, so it must block rather than be forwarded with
+				// neither budget checked.
+				HardDeny: true,
+				Message:  "this constraint carries a cumulative blastRadius bound alongside another quota-consuming condition; the two cannot be admitted in one atomic commit, so the combination is refused rather than enforced with a weaker guarantee",
+			})
+			return &resp
+		}
+		return e.evalCondition(ctx, weighted[0], req, matched, requestID, now)
 	}
 
 	admitted, deniedIndex, count, retryAfter, err := e.counter.IncrementIfAllBelow(ctx, keys, windowSecs, limits)

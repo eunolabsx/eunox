@@ -258,17 +258,45 @@ func (c EffectClassCondition) MarshalJSON() ([]byte, error) { return marshalCond
 // argument the call did not supply — FAILS the condition. An action whose size cannot be
 // established must not be treated as small.
 //
-// CUMULATIVE velocity ("no more than $2,000 of refunds an hour" — the four hundred
-// individually-permitted $10 refunds per-call authorization structurally cannot see) is
-// NOT expressible here yet. It needs a weighted sliding-window sum, which the CallCounter
-// contract (a count of timestamps) does not provide, and adding a second accounting
-// system rather than generalizing that one would be the wrong shape. The grammar
-// deliberately carries no half-working key for it: an authored `maxTotal` that silently
-// bounded nothing would be worse than its absence.
+// CUMULATIVE velocity is the second half: `maxTotal` over `windowSeconds` bounds the
+// SUMMED magnitude of a session's calls to this target — "no more than $2,000 of refunds
+// an hour". The per-call bound catches the $5,000 refund; it does not catch four hundred
+// individually-permitted $10 refunds, which is the shape a compromised or prompt-injected
+// agent actually produces. Every one of those calls is legal, and only the aggregate is
+// catastrophic, so the aggregate is precisely what per-call authorization structurally
+// cannot see.
+//
+// It is backed by CallCounter.AddIfTotalBelow — the weighted generalization of the
+// counting primitive maxCalls uses, on the same seam, not a second accounting system. An
+// over-limit call writes NOTHING, exactly as an over-limit maxCalls does: recording the
+// weight of a refused call would let a burst of rejections extend its own lockout past the
+// window that actually spent the budget.
+//
+// An UNQUANTIFIED call fails a cumulative bound for the same reason it fails the per-call
+// one: an action whose size cannot be established must not contribute 0 to a sum.
 type BlastRadiusCondition struct {
-	// Max bounds one call's magnitude. Required — a condition with no bound bounds
-	// nothing.
-	Max *json.Number `json:"max"`
+	// Max bounds one call's magnitude. Optional only in the sense that a condition
+	// declaring a cumulative bound instead still bounds something; a condition declaring
+	// NEITHER is rejected at load, since a bound-free condition bounds nothing.
+	Max *json.Number `json:"max,omitempty"`
+	// MaxTotal bounds the SUMMED magnitude of this session's calls to this target within
+	// WindowSeconds. Set together with WindowSeconds or not at all: half the pair silently
+	// disables the other half, which is the failure the loader rejects rather than accepts.
+	// An authored bound that bounded nothing would be worse than its absence, because the
+	// operator would believe a limit was in force.
+	MaxTotal *json.Number `json:"maxTotal,omitempty"`
+	// WindowSeconds is the sliding window MaxTotal is summed over. Set together with
+	// MaxTotal or not at all.
+	WindowSeconds int `json:"windowSeconds,omitempty"`
+}
+
+// HasVelocity reports whether this condition declares a cumulative bound — the property
+// that makes it commit state, and therefore the property the engine keys deferral and the
+// loader keys its one-committing-condition rule on. Both halves are required because
+// either alone bounds nothing; the loader rejects that shape, so a manifest-loaded
+// condition can never be half-set, but a programmatically built one can.
+func (c *BlastRadiusCondition) HasVelocity() bool {
+	return c != nil && c.MaxTotal != nil && c.WindowSeconds > 0
 }
 
 // ConditionType returns the blastRadius discriminator.

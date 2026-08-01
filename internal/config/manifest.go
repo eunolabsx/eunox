@@ -1096,6 +1096,12 @@ func validateLocalManifest(m *LocalManifest) error {
 		if err := validateMaxCallsWindowsDistinct(i, c.Conditions); err != nil {
 			return err
 		}
+		// A cumulative blastRadius bound consumes quota, so it obeys the same
+		// one-atomic-commit rule the maxCalls buckets do — see validateOneCommittingCondition
+		// for why a weighted budget cannot share that commit with a call count.
+		if err := validateOneCommittingCondition(i, c.Conditions); err != nil {
+			return err
+		}
 		// Validate conditions. Conditions needing an explicit argument name fail
 		// closed at runtime when it is empty; reject them here instead.
 		for j, cond := range c.Conditions {
@@ -1555,6 +1561,63 @@ func validateMaxCallsWindowsDistinct(i int, conditions []capability.Condition) e
 		seen[window] = j
 	}
 	return nil
+}
+
+// validateOneCommittingCondition rejects a capability carrying a CUMULATIVE blastRadius
+// bound alongside any other quota-consuming condition — a second cumulative bound, or any
+// maxCalls.
+//
+// The engine admits several quota-consuming conditions on one constraint in a single
+// atomic backend call, precisely so two concurrent same-session requests cannot both
+// observe headroom and both commit. That commit is count-based (IncrementIfAllBelow); a
+// weighted bucket cannot join it, because a weighted total is summed per entry while a
+// count is O(1), and folding the two would make every rate-limit check pay a linear scan
+// it does not need. Committing them one after another instead would leave exactly the
+// check->commit gap the atomic commit exists to close — and worse, whichever committed
+// first would have spent its budget on a call the second then denied, which is the
+// self-extending lockout an over-limit call must never cause.
+//
+// So the shape is refused at LOAD, where the operator sees it, rather than enforced with a
+// weaker guarantee than the manifest appears to promise. The faithful rewrite is to put the
+// two bounds on separate capabilities, or to express the rate limit as a cumulative bound
+// with weight-like magnitudes.
+func validateOneCommittingCondition(i int, conditions []capability.Condition) error {
+	velocity := -1
+	for j, cond := range conditions {
+		var isVelocity, isMaxCalls bool
+		switch v := cond.(type) {
+		case capability.BlastRadiusCondition:
+			isVelocity = v.HasVelocity()
+		case *capability.BlastRadiusCondition:
+			isVelocity = v.HasVelocity()
+		case capability.MaxCallsCondition, *capability.MaxCallsCondition:
+			isMaxCalls = true
+		}
+		if isMaxCalls && velocity >= 0 {
+			return committingConditionConflictErr(i, velocity, j)
+		}
+		if !isVelocity {
+			continue
+		}
+		if velocity >= 0 {
+			return committingConditionConflictErr(i, velocity, j)
+		}
+		velocity = j
+		// A maxCalls declared BEFORE the cumulative bound is caught by re-scanning rather
+		// than by remembering it: order must not decide whether the shape is legal.
+		for k, prior := range conditions[:j] {
+			switch prior.(type) {
+			case capability.MaxCallsCondition, *capability.MaxCallsCondition:
+				return committingConditionConflictErr(i, k, j)
+			}
+		}
+	}
+	return nil
+}
+
+// committingConditionConflictErr names the two conditions that cannot share a constraint.
+func committingConditionConflictErr(i, first, second int) error {
+	return fmt.Errorf("capability at index %d: conditions %d and %d both consume quota, and one of them is a cumulative blastRadius bound; a weighted budget and a call count cannot be admitted in one atomic commit, and committing them separately would let a call denied by the second spend the first's budget — declare them on separate capabilities", i, first, second)
 }
 
 // validateIPRange rejects an ipRange condition with an empty CIDR list (denies

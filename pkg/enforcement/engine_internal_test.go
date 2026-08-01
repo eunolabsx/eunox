@@ -1191,3 +1191,24 @@ func TestExactRat_BoundsTheParse(t *testing.T) {
 		})
 	}
 }
+
+// AddIfTotalBelow satisfies the weighted half of capability.CallCounter. This double
+// exercises the counting paths only, so a weighted add admits without recording: nothing
+// under test reads a weighted total from it.
+func (*keyCapturingCounter) AddIfTotalBelow(_ context.Context, _ string, _ int, weight, _ float64) (float64, bool, time.Duration, error) {
+	return weight, true, 0, nil
+}
+
+// AddIfTotalBelow satisfies the weighted half of capability.CallCounter. This double
+// exercises the counting paths only, so a weighted add admits without recording: nothing
+// under test reads a weighted total from it.
+func (*recordFaultCounter) AddIfTotalBelow(_ context.Context, _ string, _ int, weight, _ float64) (float64, bool, time.Duration, error) {
+	return weight, true, 0, nil
+}
+
+// AddIfTotalBelow satisfies the weighted half of capability.CallCounter. This double
+// exercises the counting paths only, so a weighted add admits without recording: nothing
+// under test reads a weighted total from it.
+func (forceDenyAtIndexZeroCounter) AddIfTotalBelow(_ context.Context, _ string, _ int, weight, _ float64) (float64, bool, time.Duration, error) {
+	return weight, true, 0, nil
+}

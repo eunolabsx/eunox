@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"math"
 	"time"
+
+	"github.com/eunolabs/eunox/pkg/capability"
 )
 
 // checkDistinctBuckets reports an error if any (key, windowSec) pair repeats in an
@@ -134,6 +136,54 @@ func checkMaxEntries(maxEntries int) error {
 	}
 	if maxEntries > MaxEntries {
 		return fmt.Errorf("callcounter: maxEntries must be <= %d, got %d", MaxEntries, maxEntries)
+	}
+	return nil
+}
+
+// MaxWeightedTotal re-exports the contract's bound so a backend guard reads it beside the
+// other backend limits. It lives in pkg/capability because the CallCounter contract that
+// documents it does, and because the ENGINE has to apply the same bound to a resolved
+// magnitude before handing it to a backend — and the engine must not import a backend
+// package to learn what its own contract promises.
+const MaxWeightedTotal = capability.MaxWeightedTotal
+
+// checkWeight guards one call's contribution to a weighted total. A NaN or infinite
+// weight is rejected rather than added: NaN poisons every later comparison into false
+// (which admits forever — the fail-OPEN direction), and an infinity saturates the total so
+// nothing is ever admitted again. A negative weight is rejected because a magnitude is
+// non-negative by construction and a negative one would let a caller REFUND its own
+// consumed quota, which is the bypass a cumulative bound exists to close. A weight above
+// MaxWeightedTotal cannot be summed exactly and is refused rather than rounded.
+//
+// Zero IS admitted: a genuinely zero-magnitude action consumes no budget, and the
+// alternative — refusing it — would deny a call the policy considers weightless.
+func checkWeight(weight float64) error {
+	if math.IsNaN(weight) || math.IsInf(weight, 0) {
+		return fmt.Errorf("callcounter: weight must be a finite number, got %v", weight)
+	}
+	if weight < 0 {
+		return fmt.Errorf("callcounter: weight must not be negative, got %v", weight)
+	}
+	if weight > MaxWeightedTotal {
+		return fmt.Errorf("callcounter: weight must be <= %v (the largest value both backends represent exactly), got %v", MaxWeightedTotal, weight)
+	}
+	return nil
+}
+
+// checkTotalLimit guards the AddIfTotalBelow admission threshold, mirroring checkLimit.
+// A non-positive limit can never admit anything with a positive weight, but that is a
+// misconfiguration rather than an exhausted budget and the two must stay distinguishable:
+// a structured error lets the caller surface and audit it instead of reading it as
+// "cumulative bound reached".
+func checkTotalLimit(limit float64) error {
+	if math.IsNaN(limit) || math.IsInf(limit, 0) {
+		return fmt.Errorf("callcounter: total limit must be a finite number, got %v", limit)
+	}
+	if limit <= 0 {
+		return fmt.Errorf("callcounter: total limit must be > 0, got %v", limit)
+	}
+	if limit > MaxWeightedTotal {
+		return fmt.Errorf("callcounter: total limit must be <= %v (the largest value both backends represent exactly), got %v", MaxWeightedTotal, limit)
 	}
 	return nil
 }
