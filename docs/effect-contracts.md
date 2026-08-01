@@ -303,10 +303,9 @@ consequential reading* (annotate the tool).
   contextually-poisoned and the cumulatively-catastrophic-but-individually-permitted
   cases, **over** a resource's own grants, never instead of them.
 - **Assertion, not verification.** A contract asserts what a tool does. Nothing here
-  observes whether a server behaves as its contract says. The runtime counterpart —
-  a server attesting what it actually did, which eunox verifies for signature and
-  consistency — is the effect-receipt surface, and it too verifies attestations rather
-  than watching servers.
+  observes whether a server behaves as its contract says. The runtime counterpart is the
+  effect-receipt surface below, and it too verifies attestations rather than watching
+  servers.
 - **One committing bound per capability.** A cumulative `blastRadius` bound cannot share a
   capability with a `maxCalls` (or a second cumulative bound). A weighted budget and a call
   count cannot be admitted in one atomic commit — a count is O(1) in every backend while a
@@ -316,6 +315,78 @@ consequential reading* (annotate the tool).
   the two bounds on separate capabilities.
 - **Determinism.** Nothing on this path reads a payload, consults a model, or makes a
   network call. Effect is declared by policy and resolved from the call's own arguments.
+
+## Effect receipts — what the server says it actually did
+
+A contract is an assertion. Nothing above checks whether a server behaves as its contract
+says, and the design deliberately refuses to find out by watching: eunox verifies
+attestations, it does not monitor servers, and no payload inference or egress observation is
+on the table.
+
+A **receipt** closes that loop honestly. A server MAY publish, in a tool *result's* `_meta`,
+a signed statement of what it actually did:
+
+```json
+{
+  "_meta": {
+    "io.eunolabs.effect-receipt": { "jws": "<compact JWS>" }
+  }
+}
+```
+
+whose signed payload carries the same vocabulary a contract does — `tool`, `class`,
+`blastRadius`, `unit`, `compensatingAction`, and an `iat`. eunox verifies the signature
+against the key domain configured for **that upstream**, checks the statement against the
+contract the pre-call decision resolved, and records the verdict.
+
+Configure it per upstream, with a **local** JWKS file:
+
+```yaml
+upstreams:
+  - name: payments
+    effectReceiptKeys: /etc/eunox/payments-receipt-jwks.json
+```
+
+The key domain is the **server's own**, deliberately not the JWKS that authenticates
+callers. A receipt is a statement by the upstream about its own behavior — closer to
+package signing than to an access token — so tying it to the caller's IdP would let any
+party who can mint a caller token also mint attestations about a server's behavior. The
+file is read once at startup and never fetched, for the same reason the registry is never
+fetched: the check's value is that it is local and unfalsifiable.
+
+Verdicts are a closed vocabulary, recorded under `details.effect_receipt`:
+
+| Verdict | Meaning |
+| --- | --- |
+| `verified` | Signature checked against this upstream's key domain, and consistent with the declaration. |
+| `inconsistent` | Signature checked; the server's own account contradicts the contract. Evidence, never a late denial. |
+| `unverified` | Unknown key, bad signature, stale or future-dated. Earns nothing. |
+| `malformed` | A block is present but is not a well-formed envelope. Earns nothing. |
+
+Four properties are load-bearing:
+
+- **Verification only, never monitoring.** The declared block is read and nothing else.
+- **Fail closed on trust.** An unsigned or unverifiable receipt earns nothing, and **none
+  of its claims reach the tape** — a forged "reversible, 1 row" recorded as fact would
+  invert the control it is meant to strengthen.
+- **Post-hoc, never retroactive.** The call already happened. An inconsistency is evidence
+  and an input to future friction, never a refusal taken after the side effect.
+- **Zero cost when unconfigured.** With no key domain the surface does nothing at all — no
+  parse, no record. A non-supporting server simply never sets the field, so value accrues
+  per server with no ecosystem coordination.
+
+Consistency is one-directional: a server reporting a **smaller or less consequential**
+action than declared is honoring the contract, since the declaration is the upper bound the
+decision was made against. Only exceeding it contradicts. A contract that could not be
+resolved before the call — genuinely runtime-dynamic effect — has no bound to exceed, and
+the receipt is then the only account of what happened, which is the case receipts uniquely
+serve.
+
+**Residual — replay.** `iat` plus a freshness window bounds how long a captured receipt can
+be re-presented; it does not eliminate replay, which would need a nonce eunox supplies on
+the request leg. That bound is adequate today because a receipt grants no friction reduction
+at all: it is recorded evidence, and nothing consumes it as an authorization input. Any
+future mechanism that lets a receipt lower a bar has to close this first.
 
 ## Worked example
 

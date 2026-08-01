@@ -1231,12 +1231,16 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 	}
 
 	return capability.EnforceResponse{
-		RequestID:     requestID,
-		Decision:      capability.DecisionAllow,
-		Obligations:   obligations,
-		DecidedAt:     now,
-		AuditOnly:     matched.IsAuditOnly(),
-		LabelsOut:     labelsOut,
+		RequestID:   requestID,
+		Decision:    capability.DecisionAllow,
+		Obligations: obligations,
+		DecidedAt:   now,
+		AuditOnly:   matched.IsAuditOnly(),
+		LabelsOut:   labelsOut,
+		// The SAME resolution the two effect conditions and the ceiling read, handed on to
+		// the post-hoc receipt check rather than re-resolved there — one resolution per
+		// call, so the decision and the check cannot disagree about what the effect was.
+		Effect:        effect,
 		CarriedLabels: carriedLabels,
 	}
 }

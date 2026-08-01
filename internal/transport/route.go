@@ -56,6 +56,13 @@ type UpstreamRoute struct {
 	// after BuildRoutes. See (*config.LocalManifest).HonorsAttributionInterface.
 	honorAttribution bool
 
+	// receipts verifies the signed effect receipts this upstream publishes in a tool
+	// result's `_meta`, against the key domain the operator configured for THIS upstream.
+	// nil (the default) means no key domain is configured, and Verify then returns nil
+	// without parsing anything — so a route that did not opt in pays nothing at all.
+	// Read-only after BuildRoutes.
+	receipts *capability.EffectReceiptVerifier
+
 	// serializeDecisions is set when the route's policy is flow- or sequenceBlock-relevant,
 	// so each of its sessions serializes its decision phase (the PDP decision + state
 	// write, NOT the upstream forward) to order a source's write before a later sink's
@@ -291,6 +298,19 @@ func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability
 			// change ever left it unreplaced).
 			pdp: pdp.DenyAllPDP{},
 		}
+
+		// The upstream's own receipt-signing key domain, loaded ONCE at startup from a
+		// local file — no fetch here or anywhere else. A configured-but-unreadable key set
+		// is fatal rather than a route that silently records every receipt as unverifiable:
+		// an operator who wired a key domain asked for the check, and a typo'd path that
+		// degraded to "no receipt ever verifies" is indistinguishable from a server that
+		// stopped signing. Absent (the default) leaves the verifier nil, and the whole
+		// surface costs nothing.
+		receipts, err := LoadEffectReceiptVerifier(u.EffectReceiptKeys)
+		if err != nil {
+			return nil, fmt.Errorf("upstream %q: %w", u.Name, err)
+		}
+		r.receipts = receipts
 
 		// Fail-closed per-upstream startup guards (config-declared strictDrift requires
 		// a policy; a policyless route must be in audit mode — otherwise it would
@@ -734,3 +754,54 @@ func AnyRouteHasFlowLabel(routes map[string]*UpstreamRoute) bool {
 	}
 	return false
 }
+
+// LoadEffectReceiptVerifier builds an upstream's effect-receipt verifier from a local JWKS
+// path, or returns nil for an empty path — the default, under which no receipt handling
+// happens at all.
+//
+// The path is LOCAL and read once at startup. eunox does not fetch receipt keys: they are
+// part of an upstream's configuration exactly as its command line is, and a network
+// dependency behind a check whose whole value is being local and unfalsifiable would trade
+// that value away. It is also a DISTINCT key domain from the caller-authenticating JWKS —
+// a receipt is a server's statement about its own behavior, and tying it to the token
+// issuer that authenticates callers would let any party who can mint a caller token also
+// mint attestations about a server.
+//
+// Exported so the CLI can build the same verifier for the single-upstream stdio host from
+// its own flag, rather than a second loader that could drift on what it accepts.
+func LoadEffectReceiptVerifier(path string) (*capability.EffectReceiptVerifier, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, nil
+	}
+	resolved, err := config.ExpandHome(path)
+	if err != nil {
+		return nil, fmt.Errorf("resolving effectReceiptKeys path: %w", err)
+	}
+	// Same symlink and regular-file discipline every other operator-supplied key path in
+	// the binary gets: a key set is a trust anchor, so following a symlink to one is how a
+	// local attacker substitutes it. RefuseNonRegularPath is the portable half (it also
+	// refuses directories, devices and FIFOs); config.OpenNoFollow closes the open race
+	// where the platform supports it.
+	if err := config.RefuseNonRegularPath(resolved, "effect-receipt key set"); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(resolved, os.O_RDONLY|config.OpenNoFollow, 0) //nolint:gosec // G304: operator-configured key-set path, guarded above
+	if err != nil {
+		return nil, fmt.Errorf("opening effectReceiptKeys %q: %w", resolved, err)
+	}
+	defer func() { _ = f.Close() }()
+	data, err := io.ReadAll(io.LimitReader(f, maxEffectReceiptJWKSBytes))
+	if err != nil {
+		return nil, fmt.Errorf("reading effectReceiptKeys %q: %w", resolved, err)
+	}
+	v, err := capability.NewEffectReceiptVerifier(data, capability.DefaultReceiptMaxAge, capability.DefaultReceiptLeeway)
+	if err != nil {
+		return nil, fmt.Errorf("effectReceiptKeys %q: %w", resolved, err)
+	}
+	return v, nil
+}
+
+// maxEffectReceiptJWKSBytes bounds the key document read. A JWKS holding even a few dozen
+// keys is a handful of kilobytes; the cap exists so a mistyped path pointing at something
+// enormous fails as a parse error rather than as a startup that reads a gigabyte first.
+const maxEffectReceiptJWKSBytes = 1 << 20

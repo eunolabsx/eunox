@@ -1874,6 +1874,16 @@ func serveStdioHost(ctx context.Context, cfg *config.GatewayConfig, sink *audit.
 
 	warnNoRedisSharedState(pf.redisConfigured, manifest.HasMaxCalls() || manifest.HasSequenceBlock() || manifest.HasFlowLabel())
 
+	// This upstream's own receipt-signing key domain, from the same local-file loader the
+	// gateway routes use. Absent (the default) leaves the verifier nil and the whole
+	// surface disabled; a configured-but-unreadable key set is fatal, since an operator
+	// who wired one asked for the check and a path typo that degraded to "no receipt ever
+	// verifies" is indistinguishable from a server that stopped signing.
+	receipts, err := transport.LoadEffectReceiptVerifier(u.EffectReceiptKeys)
+	if err != nil {
+		return fmt.Errorf("upstream %q: %w", u.Name, err)
+	}
+
 	proxy := transport.NewStdioProxy(transport.StdioProxyOptions{
 		Command:               u.Command,
 		Args:                  u.Args,
@@ -1897,7 +1907,10 @@ func serveStdioHost(ctx context.Context, cfg *config.GatewayConfig, sink *audit.
 		// Admit the client-supplied attribution interface only under the draft
 		// schemaVersion that contains it; a published-grammar policy ignores the block.
 		HonorAttribution: manifest.HonorsAttributionInterface(),
-		DriftCheck:       drift.MakeDriftCheck(manifest, strictDrift),
+		// The signed effect receipts this upstream publishes, verified against its own key
+		// domain — never the caller IdP's. nil when unconfigured, which disables the surface.
+		EffectReceipts: receipts,
+		DriftCheck:     drift.MakeDriftCheck(manifest, strictDrift),
 		// The stdio host has no bind step, so the transport fires the ready hook itself,
 		// from inside Start once the session is live. Calling it here instead would put it
 		// ahead of Start's own fallible steps — spawning the upstream, the initialize

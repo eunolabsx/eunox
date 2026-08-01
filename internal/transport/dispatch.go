@@ -13,6 +13,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/eunolabs/eunox/internal/audit"
 	"github.com/eunolabs/eunox/internal/mcp"
@@ -55,6 +56,11 @@ type dispatchParams struct {
 	// decision). nil for a non-serialized request (a non-flow/non-sequenceBlock policy, or
 	// a locally-answered method), where finishDecision is a no-op.
 	endDecision func()
+
+	// receipts verifies a tool result's signed effect receipt against this upstream's
+	// configured key domain. nil when the operator configured none, which is the default
+	// and skips the whole surface — no parse, no allocation, no recorded field.
+	receipts *capability.EffectReceiptVerifier
 
 	// honorAttribution admits the client-supplied attribution interface (the
 	// io.eunolabs.context-manifest block in a request's _meta). It is the runtime staging
@@ -453,7 +459,7 @@ func dispatchToolsCall(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mc
 	if (d.audit || dec.AuditOnly) && len(params.Arguments) > 0 {
 		toolDetails = params.Arguments
 	}
-	return enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodToolsCall, params.Name, params.Name, "tool", true,
+	out := enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodToolsCall, params.Name, params.Name, "tool", true,
 		func(upResp mcp.RPCMsg) map[string]interface{} {
 			// Record the forwarded upstream's error code, as every other enforced method
 			// does, so a tools/call the upstream rejected is not byte-for-byte identical
@@ -487,6 +493,64 @@ func dispatchToolsCall(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mc
 			}
 			return details
 		})
+	return d.withEffectReceipt(ctx, out, dec, params.Name)
+}
+
+// withEffectReceipt verifies the signed effect receipt an upstream published in the tool
+// result's `_meta`, and folds the verdict into the response the host receives — which it
+// never alters — by way of the record that was already written for this call.
+//
+// It is POST-HOC by construction and must stay so. The call has already been forwarded and
+// answered; a receipt cannot un-forward it, so an inconsistency is evidence on the tape and
+// an input to future friction, never a late denial. Making it one would be a decision taken
+// after the side effect, which is the one thing the enforcement point exists to precede.
+//
+// It is also VERIFICATION ONLY: the declared `_meta` block is read and nothing else. No
+// server-egress watching, no inference from the payload.
+//
+// Zero cost when unconfigured: with no key domain for this upstream (the default) the
+// verifier is nil and this returns immediately, before decoding a single byte of the result.
+func (d dispatchParams) withEffectReceipt(ctx context.Context, out mcp.RPCMsg, dec capability.EnforceResponse, tool string) mcp.RPCMsg {
+	if d.receipts == nil || out.Result == nil {
+		return out
+	}
+	// Only an ALLOW carries a resolved contract to check the attestation against, and only
+	// an allowed call reached the upstream in the first place. An observe-mode forward is
+	// deliberately included: the call ran, so the server's account of it is worth the same
+	// scrutiny — it just has no declaration to compare against, which Verify handles.
+	var meta struct {
+		Meta map[string]json.RawMessage `json:"_meta"`
+	}
+	if err := json.Unmarshal(out.Result, &meta); err != nil || len(meta.Meta) == 0 {
+		return out
+	}
+	raw, present := capability.ParseEffectReceipt(meta.Meta)
+	if !present {
+		return out
+	}
+	result := d.receipts.Verify(raw, tool, dec.Effect, time.Now())
+	if result == nil {
+		return out
+	}
+	// The verdict rides its own record rather than being merged into the allow record
+	// written moments ago: that record was enqueued before the upstream answered this
+	// question, and an append-only tape is never rewritten. A separate record keeps both
+	// facts — what was authorized, and what the server then said it did — each stamped at
+	// the moment it was known.
+	if d.rec != nil {
+		d.rec.RecordAllow(ctx, d.sessionID, tool, capability.MethodToolsCall,
+			result.AuditDetails(), nil, true, nil, nil)
+	}
+	if result.Verdict == capability.ReceiptInconsistent {
+		// The one verdict that is a finding rather than bookkeeping: a server whose own
+		// signed account contradicts the contract policy was written against. Surfaced on
+		// the operator's stderr channel beside the interface-drift findings, because a
+		// contract that no longer describes its tool is a policy defect a human must act on.
+		fmt.Fprintf(os.Stderr,
+			"[eunox] WARN effect-receipt tool=%q — the upstream's signed receipt contradicts the effect contract this policy declares (%s); the call already ran, so this is evidence, not a refusal\n",
+			audit.SanitizeAuditField(tool), strings.Join(result.Reasons, ", "))
+	}
+	return out
 }
 
 // dispatchResourcesRead applies the PDP to a resources/read request and either

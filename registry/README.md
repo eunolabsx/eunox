@@ -39,9 +39,14 @@ What the corpus gives you:
 
 What it does not give you: any claim that a server behaves as its contract says. A
 divergence between a contract and observed behavior is a **community-advisory signal**, not
-a detection result. The runtime counterpart to this — a server *attesting* what it actually
-did, which eunox verifies for signature and consistency — is the effect-receipt surface,
-and it too verifies attestations rather than watching servers.
+a detection result. The runtime counterpart to this is the **effect-receipt** surface — a
+server *attesting*, in a tool result's `_meta`, what it actually did, which eunox verifies
+for signature (against that upstream's own key domain, configured per upstream and never
+the caller's IdP) and for consistency with the contract the decision used. It too verifies
+attestations rather than watching servers, and an unverifiable receipt earns nothing. The
+two halves of the same trust story: reviewable, pinnable, attributable *declarations* here;
+what the server says it did at runtime there. See
+[`docs/effect-contracts.md`](../docs/effect-contracts.md).
 
 ## How it is used — authoring time, never the decision path
 

@@ -104,6 +104,18 @@ type EnforceResponse struct {
 	// in the fixed vocabulary order for a deterministic record; nil on a non-flow call.
 	LabelsOut     []string `json:"labelsOut,omitempty"`
 	CarriedLabels []string `json:"carriedLabels,omitempty"`
+	// Effect is the contract the decision resolved against this call's arguments, stamped
+	// on an ALLOW so a post-hoc check has the declaration in hand. Its one consumer is the
+	// effect-receipt verifier, which compares what a server ATTESTS it did against what
+	// policy DECLARED it would do; without the declaration threaded here, that comparison
+	// would have to re-resolve the contract from the matched constraint, and a second
+	// resolution is a place for the decision and the check to silently disagree about what
+	// the call's effect was.
+	//
+	// In-process only (json:"-"), like HardDeny: it is a decision artifact for the
+	// transport, not a wire field, and the audit record carries the effect's own rendered
+	// details rather than this struct.
+	Effect *ResolvedEffect `json:"-"`
 }
 
 // Decision identifies the enforcement outcome.

@@ -256,6 +256,10 @@
             "audit"
           ]
         },
+        "effectReceiptKeys": {
+          "type": "string",
+          "description": "Path to a local JWKS document holding THIS upstream's receipt-signing public keys, enabling verification of the signed effect receipts it publishes in a tool result's `_meta` (`io.eunolabs.effect-receipt`). A distinct key domain from the caller-authenticating JWKS on purpose: a receipt is a server's statement about its own behavior, so tying it to the token issuer that authenticates callers would let anyone who can mint a caller token also mint attestations about a server. Read once from disk at startup \u2014 never fetched \u2014 and omitting it disables receipt handling entirely for the route."
+        },
         "strictDrift": {
           "type": "boolean",
           "description": "Per-route override of defaults.strictDrift."

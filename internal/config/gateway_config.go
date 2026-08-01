@@ -328,6 +328,23 @@ type UpstreamConfig struct {
 	// `policy:` (it acknowledges the observe-only, allow-and-log stance).
 	Enforcement string `yaml:"enforcement"`
 
+	// EffectReceiptKeys is a path to a JWKS document holding THIS upstream's
+	// receipt-signing public keys — the key domain that lets a server attest what it
+	// actually did (`io.eunolabs.effect-receipt` in a tool result's `_meta`), which eunox
+	// verifies for signature and for consistency with the contract the decision used.
+	//
+	// Deliberately per-upstream and deliberately NOT the JWKS that authenticates callers:
+	// a receipt is a statement by the server about its own behavior, closer to package
+	// signing than to an access token, and wiring it to the caller's IdP would let any
+	// party that can mint a caller token also mint attestations about a server. It is also
+	// a local FILE, never a URL — the keys are part of an upstream's configuration exactly
+	// as its command line is, and fetching them would put a network dependency behind a
+	// check whose value is that it is local.
+	//
+	// Empty (the default) disables receipt handling entirely for the route: nothing is
+	// parsed, nothing is recorded, and a non-supporting server costs nothing.
+	EffectReceiptKeys string `yaml:"effectReceiptKeys"`
+
 	// Per-route override. Pointer ⟹ "unset, inherit from defaults".
 	StrictDrift *bool `yaml:"strictDrift"`
 }
