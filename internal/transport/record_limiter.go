@@ -63,11 +63,12 @@ import (
 // version gave every category the full pre-split rate, which raised the sustained
 // ceiling an unauthenticated caller could drive from 20/s to ~160/s (8 categories x
 // 20/s) with no measurement behind the new number — the same aggregate the bound
-// was introduced to hold, moved without re-checking it. Dividing preserves that
-// ceiling exactly (categories x (total/categories) == total) while KEEPING the
-// property the split exists for: no category can silence another, because each
-// still gets its own bucket and its own token supply, just a fair share of one
-// budget instead of a full budget each.
+// was introduced to hold, moved without re-checking it. Dividing keeps the reachable
+// aggregate AT OR UNDER that ceiling (integer division floors each share, so the sum
+// across categories can land under the total when it does not divide evenly — the
+// safe direction, never over) while KEEPING the property the split exists for: no
+// category can silence another, because each still gets its own bucket and its own
+// token supply, just a fair share of one budget instead of a full budget each.
 //
 // The tally still spans routes within a category, and a record reporting it may be
 // route-stamped (recordSessionCapDeny writes RESOURCE_EXHAUSTED through the route's sink) —
@@ -106,21 +107,45 @@ var refusalCategories = []refusalCategory{
 	catOrigin, catJWT, catAuth, catControl, catLoopback, catBody, catContentType, catSaturation,
 }
 
-// perCategoryDenyRate and perCategoryDenyBurst are each category's share of the
-// aggregate pre-session budget (preSessionDenyRatePerSec/preSessionDenyBurst),
-// divided evenly across every registered category so the SUM across all of them
-// is at or under the pre-split aggregate, regardless of how many categories exist.
-// See the const block above for why dividing (not replicating) is the fix.
-//
-// Integer division, not float: it keeps each category's share a WHOLE token count
-// (simpler to reason about and to test than a fractional bucket), at the cost of
-// the sum landing at or slightly UNDER the aggregate rather than exactly on it when
-// the category count does not divide evenly — the safe direction for an
-// availability bound, and 20/50 over 8 categories (the count today) divides with a
-// remainder either way.
+// perCategoryFloor is the minimum share perCategoryShare ever returns. Plain integer
+// division floors a share to 0 once the category count exceeds the total (e.g. past
+// 20 categories at today's preSessionDenyRatePerSec=20) — and a rate of 0 never
+// refills while a burst of 0 admits nothing, so every category's bucket would
+// silently and permanently suppress every refusal record for the rest of the
+// process's life the moment its initial (zero-sized) burst is "drained". The floor
+// keeps every category a genuine, if small, token bucket instead of a dead one; it
+// costs at most a few tokens of aggregate overshoot, never a total denial.
+const perCategoryFloor = 1
+
+// perCategoryShare divides total evenly across categories (see the const block
+// above for why dividing, not replicating, is the fix), flooring at
+// perCategoryFloor. Integer division, not float: it keeps each category's share a
+// WHOLE token count (simpler to reason about and to test than a fractional bucket),
+// at the cost of the sum landing at or slightly UNDER the aggregate rather than
+// exactly on it when the category count does not divide evenly — the safe
+// direction for an availability bound, and 20/50 over 8 categories (the count
+// today) divides with a remainder either way.
+func perCategoryShare(total, categories int) float64 {
+	share := total / categories
+	if share < perCategoryFloor {
+		share = perCategoryFloor
+	}
+	return float64(share)
+}
+
+// perCategoryDenyRate and perCategoryDenyBurst are each REGISTERED category's share
+// of the aggregate pre-session budget (preSessionDenyRatePerSec/preSessionDenyBurst;
+// see perCategoryShare). The unknown fallback bucket (newPreSessionDenyLimiter) is
+// deliberately NOT sized from these: it is unreachable in production (every call
+// site passes a registered constant, pinned by
+// TestRefusalCategories_AllHaveTheirOwnBucket), so treating it as a further category
+// sharing the same budget would both overstate what an attacker can actually drive
+// and understate each real category's share for no reason — it gets perCategoryFloor
+// instead, enough to keep it a usable bucket if it is ever reached without
+// participating in the division.
 var (
-	perCategoryDenyRate  = float64(preSessionDenyRatePerSec / len(refusalCategories))
-	perCategoryDenyBurst = float64(preSessionDenyBurst / len(refusalCategories))
+	perCategoryDenyRate  = perCategoryShare(preSessionDenyRatePerSec, len(refusalCategories))
+	perCategoryDenyBurst = perCategoryShare(preSessionDenyBurst, len(refusalCategories))
 )
 
 // newPreSessionDenyLimiter builds the per-category buckets over pre-session refusal
@@ -130,7 +155,7 @@ var (
 func newPreSessionDenyLimiter() *categoryRecordLimiter {
 	c := &categoryRecordLimiter{
 		buckets: make(map[refusalCategory]*recordRateLimiter, len(refusalCategories)),
-		unknown: newRecordRateLimiter(perCategoryDenyRate, perCategoryDenyBurst),
+		unknown: newRecordRateLimiter(perCategoryFloor, perCategoryFloor),
 	}
 	for _, cat := range refusalCategories {
 		c.buckets[cat] = newRecordRateLimiter(perCategoryDenyRate, perCategoryDenyBurst)

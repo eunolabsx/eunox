@@ -709,9 +709,11 @@ Section conventions:
   so the sustained ceiling an unauthenticated caller could drive rose from 20/s
   (burst 50) to as much as ~160/s (burst ~400) with no measurement behind the new
   number — the same aggregate the bound was introduced to hold. Categories now
-  divide one aggregate budget instead of each replicating it, restoring the original
-  ceiling while keeping the no-cross-category-suppression property the split exists
-  for. See `docs/threat-model-mcp.md` §3.7.
+  divide one aggregate budget instead of each replicating it (each share floored at
+  one token, so a future category count cannot divide a share down to zero and stop
+  refilling it), restoring the ceiling to at or under its original bound while
+  keeping the no-cross-category-suppression property the split exists for. See
+  `docs/threat-model-mcp.md` §3.7.
 - **An encoded NUL (`%00`) riding alongside some other malformed `%` escape in a
   path-confinement value produced one of two different denial messages depending on
   what else in the value failed to decode**, splitting one smuggling attempt's

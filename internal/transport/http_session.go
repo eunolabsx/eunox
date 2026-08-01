@@ -128,6 +128,17 @@ type httpSession struct {
 	// cancellation signal — that is sessCtx.
 	done chan struct{}
 
+	// handshakeStopped is closed once runInitHandshake's goroutine returns, whether or
+	// not initUpstream itself was still waiting for it. initUpstream's post-kill wait is
+	// BOUNDED (a descendant that escaped the process group can hold the stdout pipe open
+	// past that bound), but os/exec documents that calling cmd.Wait after a bounded give-up
+	// is not enough on its own: "it is incorrect to call Wait before all reads from the
+	// [StdoutPipe] have completed" — Wait closes that same pipe, racing the handshake
+	// goroutine's still-in-flight Read. newSession's failed-initialize reap therefore joins
+	// this (in a background goroutine, so it does not itself hang) before calling cmd.Wait,
+	// rather than assuming initUpstream's own join already happened.
+	handshakeStopped chan struct{}
+
 	// sessCtx is the session's single teardown-cancellation signal, canceled by close().
 	// Both transports derive their in-flight-call cancellation from it, so teardown flows
 	// through ONE primitive instead of two:
@@ -400,9 +411,20 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 
 	if err := sess.initUpstream(ctx); err != nil {
 		killUpstreamProcess(cmd.Process)
-		// Reap so a failed initialize leaves no zombie. initUpstream has joined its
-		// handshake goroutine, so all pipe reads are done and Wait is safe.
-		_ = cmd.Wait()
+		// Reap so a failed initialize leaves no zombie — but NOT synchronously: unlike
+		// the registerSession failure arm below (which is reached only after initUpstream
+		// has already returned nil, meaning runInitHandshake genuinely completed),
+		// initUpstream can return here having only bounded its wait for the handshake
+		// goroutine, not joined it — a descendant that escaped the process group can still
+		// be holding the stdout pipe open. Calling cmd.Wait while that goroutine's Read on
+		// the same pipe is still in flight is exactly what os/exec documents as incorrect
+		// (Wait closes the pipe out from under it). Join s.handshakeStopped first, in the
+		// background so a still-escaped descendant cannot hang newSession itself; the
+		// resulting zombie is reaped whenever that eventually resolves.
+		go func() {
+			<-sess.handshakeStopped
+			_ = cmd.Wait()
+		}()
 		return nil, fmt.Errorf("upstream initialize: %w", err)
 	}
 
@@ -974,8 +996,17 @@ func (p *HTTPProxy) evictAllSessionStreams() {
 // handshake runs in a goroutine; on ctx expiry the subprocess is killed, which
 // closes the pipe, unblocks the reader, and lets the goroutine exit.
 func (s *httpSession) initUpstream(ctx context.Context) error {
+	// handshakeStopped is closed by the goroutine below when runInitHandshake actually
+	// returns — unconditionally, regardless of which arm of the select below fires — so a
+	// caller that needs to know the pipe read has genuinely stopped (newSession's
+	// failed-initialize reap, which must not call cmd.Wait while it hasn't) can join it
+	// instead of assuming this function's own bounded wait covered that.
+	s.handshakeStopped = make(chan struct{})
 	done := make(chan error, 1)
-	go func() { done <- s.runInitHandshake() }()
+	go func() {
+		defer close(s.handshakeStopped)
+		done <- s.runInitHandshake()
+	}()
 	select {
 	case err := <-done:
 		return err
@@ -987,8 +1018,9 @@ func (s *httpSession) initUpstream(ctx context.Context) error {
 		// no process-group teardown at all) can still hold it open indefinitely, and an
 		// unbounded join here would hang session establishment forever instead of failing
 		// it — the grandchild-holds-the-pipe hang the other teardown paths in this package
-		// are bounded against. The handshake goroutine is left to drain and exit on its own
-		// if the pipe ever closes.
+		// are bounded against. THIS wait giving up does not mean the goroutine has stopped
+		// reading the pipe — s.handshakeStopped, not this return, is what callers must join
+		// before it is safe to reap the subprocess (see its doc).
 		waitBounded(done, s.shutdownBudget(), "upstream initialize output stream")
 		return fmt.Errorf("upstream did not complete initialize: %w", ctx.Err())
 	}
@@ -1112,7 +1144,10 @@ func (s *httpSession) withUpstreamTimeout(ctx context.Context) (context.Context,
 // stdio side. initUpstream's post-kill wait uses it since, unlike close(), it is
 // not handed shutdownMs by its caller.
 func (s *httpSession) shutdownBudget() time.Duration {
-	if s.proxy == nil {
+	// Mirrors killDelay's clamp (stdio.go): shutdownMs <= 0 means "use the default"
+	// (--shutdown-timeout=0 is documented as exactly that), not "wait zero time". A
+	// proxy-less test-assembled session (nil proxy) falls back the same way.
+	if s.proxy == nil || s.proxy.shutdownMs <= 0 {
 		return 5 * time.Second
 	}
 	return msToDuration(s.proxy.shutdownMs)
