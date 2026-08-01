@@ -1091,7 +1091,7 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 	// already allowed. It runs BEFORE the state commit below, for the same reason the
 	// obligation deny does: an over-ceiling call is not forwarded, so it must leave
 	// neither a phantom sequenceBlock antecedent nor a stranded flow label behind.
-	if ceilingDeny := e.checkEffectCeiling(effect, matched, requestID, now); ceilingDeny != nil {
+	if ceilingDeny := e.checkEffectCeiling(effect, matched, carriedLabels, requestID, now); ceilingDeny != nil {
 		return *ceilingDeny
 	}
 

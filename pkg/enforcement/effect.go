@@ -193,7 +193,7 @@ func effectDenial(condType, message string, details map[string]interface{}) *Con
 // forwarded". What it buys over a plain deny is the record — decision=escalate plus the
 // consequence inputs — so an auditor or a control plane can tell an action awaiting a
 // human from one policy forbids outright.
-func (e *Engine) checkEffectCeiling(eff capability.ResolvedEffect, matched *capability.Constraint, requestID, now string) *capability.EnforceResponse {
+func (e *Engine) checkEffectCeiling(eff capability.ResolvedEffect, matched *capability.Constraint, carriedLabels []string, requestID, now string) *capability.EnforceResponse {
 	exceeds, reasons := e.effectCeiling.Exceeds(eff)
 	if !exceeds {
 		return nil
@@ -201,6 +201,15 @@ func (e *Engine) checkEffectCeiling(eff capability.ResolvedEffect, matched *capa
 	details := eff.AuditDetails()
 	details["effect"] = true
 	details["ceiling_exceeded"] = reasons
+	// Stamp the session's accumulated flow labels INTO the escalation's structured
+	// details. The top-level carried_labels field is reserved for allow records (a deny
+	// carries none), but an escalation is the one refusal a human is expected to read and
+	// act on, and "which provenance produced this" is the first thing they need: it is
+	// what ties the who-may-know axis to the what-may-break one on a single record. Empty
+	// for a non-flow policy, where the key is simply absent.
+	if len(carriedLabels) > 0 {
+		details["carried_labels"] = carriedLabels
+	}
 	if e.effectCeiling.MaxEffectClass != "" {
 		details["ceiling_max_effect_class"] = e.effectCeiling.MaxEffectClass
 	}

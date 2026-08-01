@@ -30,6 +30,29 @@ Two Docker services. One manifest file. First enforced tool call in under 10 min
 > requires a shared Redis flow-label store (a startup NOTICE warns when one is
 > missing).
 
+> **Effect contracts (experimental).** `make -C demo effect-escalate` shows the other
+> axis: an agent reads an untrusted, customer-submitted ticket carrying a prompt
+> injection and then attempts `DROP TABLE customers`. The capability is **granted** —
+> `query_db` is in the allowlist and `DROP` is explicitly in its `allowedOperations` —
+> so per-call authorization has nothing left to say. The call is **escalated** because
+> of what it would *do*: the effect contract resolves `DROP` to `irreversible` with no
+> compensating action, which exceeds the policy's tool-agnostic `effectCeiling`. A
+> `SELECT` through the same tool in the same tainted session is **allowed**, so it is
+> the consequence — not the tool, the session, or the taint — that decided it. The
+> escalated record carries `carried_labels=untrusted`, tying the refusal to the
+> provenance that produced it: one tape, one enforcement point, both axes.
+> Deterministic and model-free; `make -C demo ci-test-effect` asserts 20 identical runs
+> with a verified tape. Uses the experimental flow+effect grammar (`effect`,
+> `effectCeiling`), staged behind `schemaVersion: "0.2-draft"` in
+> [`manifest-effect.yaml`](./manifest-effect.yaml) — not part of the published `0.1`
+> grammar. Go + python3, no Docker.
+>
+> Scope: escalate is a **refusal that says why**, not a pending state. The in-path proxy
+> holds no approval workflow (that is the control-plane surface), so with none wired an
+> escalation resolves fail-closed to "not forwarded", carrying the consequence inputs on
+> the tape as `decision=escalate` with `ceiling_exceeded`. It is a hard refusal: a route
+> running `--audit` cannot downgrade it to "performed anyway, logged".
+
 ## What this demo shows
 
 - `eunox` sitting between a client and an MCP server, enforcing a YAML policy

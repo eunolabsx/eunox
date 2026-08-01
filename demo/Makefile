@@ -11,6 +11,7 @@
 
 .PHONY: up up-jwt down allow deny deny-path deny-op audit jwt jwt-allow jwt-deny logs ci-test ci-test-jwt \
         stdio-allow stdio-deny stdio-deny-path stdio-deny-op ci-test-stdio flow-exfil ci-test-flow \
+        effect-escalate ci-test-effect \
         gateway-up gateway-down gw-files-allow gw-files-deny gw-db-allow gw-db-deny gw-cross-deny gw-404 \
         gateway-audit ci-test-gateway ci-test-e2e e2e trifecta trifecta-audit help
 
@@ -270,6 +271,14 @@ flow-exfil:
 ## ci-test-flow: Determinism gate for Demo (a) — 20 identical runs + verified tape (no Docker; go + python3).
 ci-test-flow:
 	@bash "$(DEMO_DIR)scripts/ci-test-flow.sh"
+
+## effect-escalate: Demo (b) — untrusted-influenced destructive action escalated by the effect ceiling (no Docker; go + python3).
+effect-escalate:
+	@bash "$(DEMO_DIR)scripts/effect-escalate.sh"
+
+## ci-test-effect: Determinism gate for Demo (b) — 20 identical runs + verified tape (no Docker; go + python3).
+ci-test-effect:
+	@bash "$(DEMO_DIR)scripts/ci-test-effect.sh"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Full end-to-end suite (demo/e2e) — mock host + mock server drive the REAL
