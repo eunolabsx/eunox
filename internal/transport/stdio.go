@@ -201,6 +201,10 @@ type StdioProxy struct {
 	// decideGate != nil. nil keeps full intra-session
 	// decision parallelism. Set from StdioProxyOptions.SerializeDecisions at construction.
 	decideGate *decisionSerializer
+
+	// honorAttribution admits the client-supplied attribution interface. Set from
+	// StdioProxyOptions.HonorAttribution at construction; see that field.
+	honorAttribution bool
 }
 
 // StdioProxyOptions configures a StdioProxy. The upstream is either a local
@@ -233,6 +237,13 @@ type StdioProxyOptions struct {
 	// manifest.HasFlowLabel() || manifest.HasSequenceBlock().
 	SerializeDecisions bool
 
+	// HonorAttribution admits the client-supplied attribution interface (the
+	// io.eunolabs.context-manifest block in a request's _meta). The binary sets it from
+	// manifest.HonorsAttributionInterface() — i.e. only under the flow+effect draft
+	// schemaVersion — so a policy running the published grammar ignores the block instead
+	// of acting on a token that grammar does not contain.
+	HonorAttribution bool
+
 	// DriftCheck is the injected drift hook; nil = no drift checking.
 	DriftCheck drift.CheckFunc
 }
@@ -264,6 +275,7 @@ func NewStdioProxy(opts StdioProxyOptions) *StdioProxy {
 		audit:                 opts.Audit,
 		requireAuditStrict:    opts.RequireAuditStrict,
 		driftCheck:            opts.DriftCheck,
+		honorAttribution:      opts.HonorAttribution,
 		pending:               make(map[string]struct{}),
 		byUpstreamID:          make(map[string]chan upstreamResult),
 		hostToUp:              make(map[string]*json.RawMessage),
@@ -1196,9 +1208,10 @@ func (p *StdioProxy) dispatchParams() dispatchParams {
 			callUpstream:     p.callUpstream,
 			strictAuditState: p.strictAudit(),
 		},
-		pdp:       p.pdp,
-		sourceIP:  "", // stdio has no per-request client address
-		buildInit: p.buildInitResponse,
+		pdp:              p.pdp,
+		sourceIP:         "", // stdio has no per-request client address
+		buildInit:        p.buildInitResponse,
+		honorAttribution: p.honorAttribution,
 	}
 }
 

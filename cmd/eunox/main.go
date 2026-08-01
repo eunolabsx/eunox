@@ -1826,7 +1826,10 @@ func serveStdioHost(ctx context.Context, cfg *config.GatewayConfig, sink *audit.
 		// pipelining host cannot race a sink ahead of its source. A non-flow/non-sequence
 		// policy keeps full parallelism.
 		SerializeDecisions: manifest != nil && (manifest.HasFlowLabel() || manifest.HasSequenceBlock()),
-		DriftCheck:         drift.MakeDriftCheck(manifest, strictDrift),
+		// Admit the client-supplied attribution interface only under the draft
+		// schemaVersion that contains it; a published-grammar policy ignores the block.
+		HonorAttribution: manifest.HonorsAttributionInterface(),
+		DriftCheck:       drift.MakeDriftCheck(manifest, strictDrift),
 	})
 	return proxy.Start(ctx)
 }

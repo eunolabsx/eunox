@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -746,22 +747,26 @@ func (p *ManifestPDP) engineClock() enforcement.Clock {
 	return p.engine.Clock()
 }
 
-// recordObservedToolHash stores the hash of a tool's live model-facing surface
-// (description + title + annotations + input/output parameter descriptions) seen in
-// a tools/list response, so
-// decideTarget can enforce a pinned descriptionHash on the call leg against the
-// same surface the host was shown. Callers must gate this on a pinned exact-tool
-// constraint match (see filterToolsListResult) and pass that constraint's pinned
-// hash as pin.
+// recordObservedHash stores the hash of a tool's live model-facing surface (description +
+// title + annotations + input/output parameter descriptions) seen in a tools/list
+// response, so decideTarget can enforce a pinned descriptionHash on the call leg against
+// the same surface the host was shown. Callers must gate this on a pinned exact-tool
+// constraint match (see filterToolsListResult) and pass that constraint's pinned hash as
+// pin.
 //
-// Recording the observed hash and marking a mismatch as poisoned happen under a
-// SINGLE lock, so the two updates are atomic: a concurrent call-leg reader
-// (pinViolated, also single-locked) can never observe the hash updated but the
-// poison mark not yet set, which would let an interleaving honest-session
-// overwrite re-open the pin. pin is the constraint's DescriptionHash ("" only for
-// a non-pinned caller, in which case no poison is possible).
-func (p *ManifestPDP) recordObservedToolHash(name, description, title string, annotations, inputSchema, outputSchema map[string]interface{}, pin string) {
-	h := capability.ComputeToolHash(description, capability.ToolHashParams(title, annotations, inputSchema, outputSchema))
+// It takes an already-computed hash rather than the entry's fields because the SAME hash
+// arms Tier-2's baseline in the same walk (armPinsFromToolsList), and computing it at both
+// places hashed every pinned tool's whole inputSchema twice per tools/list. Both pins
+// compare the same bytes by construction — SurfaceHash is the one spelling — so there was
+// never a reason for two computations, only a seam that made it easy.
+//
+// Recording the observed hash and marking a mismatch as poisoned happen under a SINGLE
+// lock, so the two updates are atomic: a concurrent call-leg reader (pinViolated, also
+// single-locked) can never observe the hash updated but the poison mark not yet set, which
+// would let an interleaving honest-session overwrite re-open the pin. pin is the
+// constraint's DescriptionHash ("" only for a non-pinned caller, in which case no poison
+// is possible).
+func (p *ManifestPDP) recordObservedHash(name, h, pin string) {
 	// Sticky poison mark: set when the live hash differs from the pin, never cleared by a
 	// later clean observation, so a concurrent honest session cannot re-open the call-leg pin
 	// for a session whose upstream instance is still poisoned. The `pin != ""` guard keeps a
@@ -1481,6 +1486,56 @@ func (p *ManifestPDP) withForwardObligations(ctx context.Context, r capability.E
 	}
 	r.Obligations = obs
 	return r
+}
+
+// hardenOnBrokenInterface re-stamps a refusal that some OTHER layer produced as a hard,
+// non-downgradable one when this PDP holds a broken interface pin for the target. broke
+// reports whether it fired, so the caller can stop treating the response as forwardable.
+//
+// It exists for the wrapper case. Both interface pins — the operator's FM-5
+// descriptionHash and the automatic Tier-2 surface baseline — are enforced inside
+// ManifestPDP.Decide, keyed off the tool NAME and placed before findConstraint precisely
+// so that no later, softer verdict can preempt them. A JWTPDP wrapping this PDP breaks
+// that placement from the outside: it short-circuits above the inner on its own denies
+// (a target absent from mcp.capabilities, a failing JWT condition), so Decide never runs
+// and the pin never fires. The composed refusal is then a SOFT deny — and a route running
+// --audit downgrades a soft deny to a forwarded call, sending the request to the very
+// upstream whose interface was rewritten. Turning the JWT on removed a guarantee, which
+// inverts the "JWT can only restrict, never expand" invariant.
+//
+// Both pin reads are pure lookups against state armed by an earlier tools/list, so this
+// commits nothing: it cannot leave a sequenceBlock antecedent, a flow label, or a consumed
+// maxCalls slot behind for a call that is never forwarded. That is what makes it safe to
+// run on a path the inner PDP deliberately never reached — and it is also the reason this
+// covers the pins and NOT the effect ceiling, whose evaluation requires running the
+// matched constraint's conditions, some of which do commit.
+//
+// Only tools/call carries an advertised surface to pin, matching the schema gate the two
+// blocks inside Decide use.
+func (p *ManifestPDP) hardenOnBrokenInterface(sessionID string, r capability.EnforceResponse, target EnforceTarget) (capability.EnforceResponse, bool) {
+	if r.Decision == capability.DecisionAllow || r.Denial == nil || r.Denial.HardDeny {
+		return r, false
+	}
+	if target.Type != capability.TargetTypeTool {
+		return r, false
+	}
+	pin, isPinned := p.pinnedTools[target.Name]
+	fm5Broken := isPinned && p.pinViolated(target.Name, pin)
+	if !fm5Broken && !p.surface.Broken(sessionID, target.Name) {
+		return r, false
+	}
+	// The other layer's code and message are preserved — its verdict is why the call was
+	// refused, and rewriting it would hide the authorization failure the caller must fix.
+	// Only the forwardability changes, which is the one property the pin governs.
+	denial := *r.Denial
+	denial.HardDeny = true
+	denial.Message = denial.Message + " (additionally: tool " + strconv.Quote(target.Name) +
+		" advertised a different interface surface than when this session started, so this call is refused" +
+		" outright and cannot be forwarded by an audit-mode route)"
+	r.Denial = &denial
+	// Obligations describe how to redact a FORWARDED response. This one is not forwarded.
+	r.Obligations = nil
+	return r, true
 }
 
 // directivesNamingTarget collects the directives of every capability whose target type +
@@ -2216,9 +2271,9 @@ func EntryKeysAmbiguous(raw json.RawMessage) bool {
 //
 // The caller MUST have cleared the entry through scanToolEntry first: this trusts
 // entry.Name, and a duplicated or case-variant name key makes that value untrustworthy.
-func (p *ManifestPDP) recordPinnedToolHash(entry toolListEntry) {
-	if pin, pinned := p.pinnedTools[entry.Name]; pinned {
-		p.recordObservedToolHash(entry.Name, entry.Description, entry.Title, entry.Annotations, entry.InputSchema, entry.OutputSchema, pin)
+func (p *ManifestPDP) recordPinnedToolHash(name, surface string) {
+	if pin, pinned := p.pinnedTools[name]; pinned {
+		p.recordObservedHash(name, surface, pin)
 	}
 }
 
@@ -2400,12 +2455,13 @@ func (p *ManifestPDP) armPinsFromToolsList(sessionID string, result json.RawMess
 			p.surface.MarkBroken(sessionID, scan.names...)
 			continue
 		}
-		p.recordPinnedToolHash(entry)
+		// One hash per entry, shared by both pins. FM-5 pins some tools and Tier-2 pins
+		// every one, over the SAME hash of the SAME bytes — so a pinned tool's whole
+		// inputSchema was being hashed twice per tools/list before this.
+		surface := SurfaceHash(entry.Description, entry.Title, entry.Annotations, entry.InputSchema, entry.OutputSchema)
+		p.recordPinnedToolHash(entry.Name, surface)
 		if tier2 {
-			surfaces = append(surfaces, ToolSurface{
-				Name: entry.Name,
-				Hash: SurfaceHash(entry.Description, entry.Title, entry.Annotations, entry.InputSchema, entry.OutputSchema),
-			})
+			surfaces = append(surfaces, ToolSurface{Name: entry.Name, Hash: surface})
 		}
 	}
 	// One Observe per response, after the whole walk: a break discovered at entry N must

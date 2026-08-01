@@ -47,6 +47,15 @@ type UpstreamRoute struct {
 	audit      bool                  // observe mode: evaluate and log, but forward instead of block
 	driftCheck drift.CheckFunc       // set inside BuildRoutes from its driftCheckFor hook; nil = no drift checking
 
+	// honorAttribution is set when the route's policy opts into the flow+effect draft
+	// grammar, which is what admits the client-supplied attribution interface (the
+	// io.eunolabs.context-manifest block in a request's _meta). It is the runtime half of
+	// the same staging discipline checkExperimentalTokenStaging applies at load: that gate
+	// cannot cover this token because the token never appears in a manifest, so a route
+	// running the published grammar must ignore the block rather than act on it. Read-only
+	// after BuildRoutes. See (*config.LocalManifest).HonorsAttributionInterface.
+	honorAttribution bool
+
 	// serializeDecisions is set when the route's policy is flow- or sequenceBlock-relevant,
 	// so each of its sessions serializes its decision phase (the PDP decision + state
 	// write, NOT the upstream forward) to order a source's write before a later sink's
@@ -292,6 +301,7 @@ func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability
 		// A non-flow/non-sequence route keeps full
 		// intra-session decision parallelism.
 		r.serializeDecisions = manifest != nil && (manifest.HasFlowLabel() || manifest.HasSequenceBlock())
+		r.honorAttribution = manifest.HonorsAttributionInterface()
 		// strictDrift is used only to build this route's drift hook (its one
 		// consumer), so it stays a local rather than write-only route state.
 		strictDrift := ResolveStrictDrift(configStrict, globalStrictDrift, manifest != nil)

@@ -48,6 +48,14 @@ Tier-2 closes the two gaps `descriptionHash` leaves:
   it) and **hidden from `tools/list`**, so the catalog a host is shown never advertises a
   tool its call leg will reject. The break is **sticky**: reverting the surface does not
   re-open the tool, because a host may still hold the rewritten copy.
+- **The break outranks a wrapping PDP's own refusal.** A JWT-backed route short-circuits
+  above the manifest PDP on its own denials, so the pin check inside it does not run for
+  such a call. Were the composed refusal left soft, an `--audit` route would downgrade it
+  to a forward and send the request to the rewritten upstream — so turning a JWT on would
+  have removed a guarantee, which inverts the rule that a JWT may only *restrict*. The
+  wrapper therefore re-stamps its refusal as hard when the pin is broken, keeping the
+  wrapping layer's own code and message (an operator fixing the token still needs to see
+  the authorization failure) and adding the pin break to it.
 - **Membership findings need a complete listing.** A single *page* of a paginated
   `tools/list` says nothing about which tools exist, so additions and removals are reported
   only for an observation that covers the whole advertised surface (the session-start probe,

@@ -53,6 +53,16 @@ type dispatchParams struct {
 	// decision). nil for a non-serialized request (a non-flow/non-sequenceBlock policy, or
 	// a locally-answered method), where finishDecision is a no-op.
 	endDecision func()
+
+	// honorAttribution admits the client-supplied attribution interface (the
+	// io.eunolabs.context-manifest block in a request's _meta). It is the runtime staging
+	// gate for a DRAFT wire token — set only when the route's policy declares the
+	// flow+effect draft schemaVersion — because the manifest-side gate
+	// (checkExperimentalTokenStaging) structurally cannot cover a token that arrives on a
+	// REQUEST rather than in the policy. False means the block is IGNORED, not rejected:
+	// the interface is union-only, so ignoring it falls back to the conservative session
+	// join, which is the stricter reading.
+	honorAttribution bool
 }
 
 // finishDecision closes the per-session decision critical section, if one is open (see
@@ -357,13 +367,21 @@ func dispatchToolsCall(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mc
 	// call's sink check. A malformed block is a malformed REQUEST, not a silently ignored
 	// hint — a client that tried to attribute a call and got the shape wrong must find
 	// out, rather than proceed believing a tightening is in force when it is not.
-	declared, metaErr := capability.ParseContextManifest(params.Meta)
-	if metaErr != nil {
-		return d.malformedDeny(ctx, msg, "tools/call: "+metaErr.Error())
-	}
+	//
+	// Gated on honorAttribution, which is the DRAFT staging discipline: under the
+	// published grammar the whole block — including that malformed-request rejection — is
+	// skipped, so a `0.1` operator sees no behavior change from a token their grammar does
+	// not contain. Ignoring rather than rejecting is the conservative direction here
+	// because the interface is union-only and can only ever tighten.
 	decideCtx := d.decideCtx(ctx)
-	if declared != nil {
-		decideCtx = pdp.WithDeclaredLabels(decideCtx, declared.Labels)
+	if d.honorAttribution {
+		declared, metaErr := capability.ParseContextManifest(params.Meta)
+		if metaErr != nil {
+			return d.malformedDeny(ctx, msg, "tools/call: "+metaErr.Error())
+		}
+		if declared != nil {
+			decideCtx = pdp.WithDeclaredLabels(decideCtx, declared.Labels)
+		}
 	}
 	dec := d.pdp.Decide(decideCtx, d.sessionID, pdp.EnforceTarget{Type: capability.TargetTypeTool, Name: params.Name}, params.Arguments, d.sourceIP)
 	// Close the per-session decision critical section here — the decision and its flow/
