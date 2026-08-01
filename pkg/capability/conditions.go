@@ -166,6 +166,18 @@ func marshalCondition(condition Condition) ([]byte, error) {
 			conditionEnvelope
 			*alias
 		}{conditionEnvelope{Type: typed.ConditionType()}, (*alias)(typed)})
+	case *EffectClassCondition:
+		type alias EffectClassCondition
+		return json.Marshal(struct {
+			conditionEnvelope
+			*alias
+		}{conditionEnvelope{Type: typed.ConditionType()}, (*alias)(typed)})
+	case *BlastRadiusCondition:
+		type alias BlastRadiusCondition
+		return json.Marshal(struct {
+			conditionEnvelope
+			*alias
+		}{conditionEnvelope{Type: typed.ConditionType()}, (*alias)(typed)})
 	default:
 		return nil, fmt.Errorf("unsupported condition payload: %T", condition)
 	}
@@ -324,6 +336,8 @@ var knownConditionTypes = []string{
 	ConditionTypeAllowedValues,
 	ConditionTypeSequenceBlock,
 	ConditionTypeFlowLabel,
+	ConditionTypeEffectClass,
+	ConditionTypeBlastRadius,
 	ConditionTypePolicy,
 	ConditionTypeCustom,
 }
@@ -361,6 +375,10 @@ func newCondition(conditionType string) Condition {
 		return &SequenceBlockCondition{}
 	case ConditionTypeFlowLabel:
 		return &FlowLabelCondition{}
+	case ConditionTypeEffectClass:
+		return &EffectClassCondition{}
+	case ConditionTypeBlastRadius:
+		return &BlastRadiusCondition{}
 	default:
 		return nil
 	}

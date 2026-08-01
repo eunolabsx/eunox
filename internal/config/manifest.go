@@ -56,6 +56,16 @@ type LocalManifest struct {
 	// with a conflict check (first non-empty wins; two disagreeing files are rejected),
 	// like serverVersion — never silently dropped. See docs/capability-manifest-guide.md.
 	Audience string `json:"audience,omitempty"`
+	// EffectCeiling is the tool-agnostic consequence bound EVERY allowed action is
+	// additionally checked against, keyed on the action's effect properties rather than
+	// on which tool it is (see capability.EffectCeiling). It can only ever narrow — it
+	// runs after a constraint has already allowed the call — so it never admits anything
+	// the allowlist denied. Absent means no consequence bound. Staged behind the
+	// flow+effect draft schemaVersion until the batched grammar bump. On a multi-file
+	// merge it is folded with a conflict check (first non-empty wins; two disagreeing
+	// files are rejected), like serverVersion and audience: silently dropping one file's
+	// ceiling would raise the bound for every capability the other file contributed.
+	EffectCeiling *capability.EffectCeiling `json:"effectCeiling,omitempty"`
 }
 
 // LoadManifest reads and validates a LocalManifest from a manifest file of any
@@ -566,6 +576,11 @@ func MergeManifests(ms []*LocalManifest) (*LocalManifest, error) {
 		if err := mergeSingleValueField(&merged.Audience, m.Audience, "audience"); err != nil {
 			return nil, err
 		}
+		ceiling, err := mergeEffectCeiling(merged.EffectCeiling, m.EffectCeiling, m.Name)
+		if err != nil {
+			return nil, err
+		}
+		merged.EffectCeiling = ceiling
 	}
 	// Re-validate the merged union. This is load-bearing, not merely defensive: two
 	// individually-valid files can each pin the SAME tool to a DIFFERENT descriptionHash,
@@ -828,6 +843,9 @@ func validateLocalManifest(m *LocalManifest) error {
 	if strings.TrimSpace(m.Name) == "" {
 		return fmt.Errorf("'name' must not be empty")
 	}
+	if err := validateEffectCeiling(m.EffectCeiling); err != nil {
+		return err
+	}
 	if m.Version == "" {
 		return fmt.Errorf("'version' must not be empty")
 	}
@@ -968,6 +986,13 @@ func validateLocalManifest(m *LocalManifest) error {
 		if err := validatePrincipal(c.Principal); err != nil {
 			return fmt.Errorf("capability at index %d: %w", i, err)
 		}
+		// Validate the effect contract. It is the single input every effect check reads
+		// (the effectClass condition, the blastRadius condition, and the ceiling), so a
+		// malformed one would make all three wrong at once — and wrong in the direction
+		// of looking declared while quantifying nothing.
+		if err := validateEffectContract(i, c.Effect); err != nil {
+			return err
+		}
 		// Validate directives. redactFields mutates the tools/call RESPONSE and so
 		// applies only to tool: targets (a directive that never applies is a fail-open
 		// leak plus a false "discharged" audit record). labelOutput is different: it is
@@ -1069,6 +1094,12 @@ func validateLocalManifest(m *LocalManifest) error {
 				err = validateTypedCondition(i, j, cond, func(i, j int, c *capability.FlowLabelCondition) error {
 					return validateFlowLabel(i, j, c.Allow)
 				})
+			case capability.EffectClassCondition, *capability.EffectClassCondition:
+				err = validateTypedCondition(i, j, cond, func(i, j int, c *capability.EffectClassCondition) error {
+					return validateEffectClass(i, j, c.Allow)
+				})
+			case capability.BlastRadiusCondition, *capability.BlastRadiusCondition:
+				err = validateTypedCondition(i, j, cond, validateBlastRadius)
 			}
 			if err != nil {
 				return err
@@ -1621,6 +1652,8 @@ func validateSequenceBlock(i, j int, v *capability.SequenceBlockCondition) error
 var experimentalTokenVersions = map[string]string{
 	capability.ConditionTypeFlowLabel:   ManifestSchemaVersionFlowEffectDraft,
 	capability.DirectiveTypeLabelOutput: ManifestSchemaVersionFlowEffectDraft,
+	capability.ConditionTypeEffectClass: ManifestSchemaVersionFlowEffectDraft,
+	capability.ConditionTypeBlastRadius: ManifestSchemaVersionFlowEffectDraft,
 }
 
 // checkExperimentalTokenStaging fails closed if any capability carries a DRAFT-staged token
@@ -1634,8 +1667,19 @@ var experimentalTokenVersions = map[string]string{
 // whitespace-padded scalar is judged on its real value.
 func checkExperimentalTokenStaging(m *LocalManifest) error {
 	declared := strings.TrimSpace(m.SchemaVersion)
+	// The effect layer's two non-condition tokens — the top-level effectCeiling and a
+	// constraint's effect contract — are staged by the same rule. They are not
+	// conditions or directives, so they cannot ride experimentalTokenVersions (which is
+	// keyed by discriminator); gating them here keeps ONE staging gate rather than a
+	// second one somewhere else that could be updated out of step.
+	if m.EffectCeiling != nil && declared != ManifestSchemaVersionFlowEffectDraft {
+		return fmt.Errorf("the top-level effectCeiling is experimental and requires schemaVersion %q (the flow+effect draft); this manifest declares schemaVersion %q, under which the key is not part of the grammar", ManifestSchemaVersionFlowEffectDraft, declared)
+	}
 	for i := range m.Capabilities {
 		c := &m.Capabilities[i]
+		if c.Effect != nil && declared != ManifestSchemaVersionFlowEffectDraft {
+			return experimentalTokenStagingErr(i, "the effect contract block", ManifestSchemaVersionFlowEffectDraft, declared)
+		}
 		for _, cond := range c.Conditions {
 			if req, staged := experimentalTokenVersions[cond.ConditionType()]; staged && declared != req {
 				return experimentalTokenStagingErr(i, "the "+cond.ConditionType()+" condition", req, declared)
@@ -1760,6 +1804,13 @@ func checkManifestKeys(data []byte) error {
 		return nil //nolint:nilerr // a non-object document has no key structure to validate
 	}
 	if err := checkObjectKeys("", root, jsonFieldKeys(reflect.TypeOf(LocalManifest{}))); err != nil {
+		return err
+	}
+	// The effect layer's nested objects (a constraint's effect block, the top-level
+	// effectCeiling) are walked by their own checker: checkObjectKeys above covers only
+	// the top-level key of each, and a typo INSIDE one decodes to nothing while looking
+	// like a declaration.
+	if err := checkEffectKeys(root); err != nil {
 		return err
 	}
 	caps, _ := root["capabilities"].([]interface{})
@@ -2119,6 +2170,10 @@ func conditionKeysFor(condType string) (map[string]bool, bool) {
 		t = reflect.TypeOf(capability.SequenceBlockCondition{})
 	case capability.ConditionTypeFlowLabel:
 		t = reflect.TypeOf(capability.FlowLabelCondition{})
+	case capability.ConditionTypeEffectClass:
+		t = reflect.TypeOf(capability.EffectClassCondition{})
+	case capability.ConditionTypeBlastRadius:
+		t = reflect.TypeOf(capability.BlastRadiusCondition{})
 	case capability.ConditionTypePolicy:
 		t = reflect.TypeOf(capability.PolicyCondition{})
 	case capability.ConditionTypeCustom:

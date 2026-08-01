@@ -203,6 +203,15 @@ type Engine struct {
 	// deny path for a source-only policy whose markers no sink reads.
 	skipFlow bool
 
+	// effectCeiling is the policy's tool-agnostic consequence bound, applied to EVERY
+	// action the conditions allowed (see checkEffectCeiling). It is engine-level rather
+	// than per-constraint on purpose: a per-target gate only guards the targets someone
+	// wrote one for, while the ceiling is what catches the target nobody thought about —
+	// including the unannotated one, which resolves to irreversible and so exceeds any
+	// ceiling. nil (the default) means the policy sets no consequence bound and the whole
+	// check is skipped.
+	effectCeiling *capability.EffectCeiling
+
 	// counterKeyNamespace is folded into every maxCalls/sequenceBlock counter key
 	// (compositeCounterKey's first component). The binary wires each route's name here
 	// so every route's engine addresses a disjoint counter namespace even when they
@@ -288,6 +297,17 @@ func WithoutFlowLabels() Option {
 func WithCounterKeyNamespace(ns string) Option {
 	return func(e *Engine) {
 		e.counterKeyNamespace = ns
+	}
+}
+
+// WithEffectCeiling sets the policy's tool-agnostic consequence bound, checked on every
+// allow after the matched constraint's conditions have passed. Leave it unset for a
+// policy that declares no ceiling (see config.LocalManifest.HasEffectCeiling): the
+// ceiling can only ever narrow, so an absent one changes nothing, and an unset one skips
+// the check entirely.
+func WithEffectCeiling(ceiling *capability.EffectCeiling) Option {
+	return func(e *Engine) {
+		e.effectCeiling = ceiling
 	}
 }
 
@@ -627,6 +647,31 @@ func denyResponse(requestID, now string, auditOnly bool, obligations []capabilit
 		Obligations: obligations,
 		DecidedAt:   now,
 		Denial:      &denial,
+	}
+}
+
+// escalateResponse builds an escalate EnforceResponse — the effect ceiling's
+// needs-human-approval outcome — from the same envelope denyResponse builds, including
+// the boundDenialDetails pass every refusal's details must go through before they reach
+// the signed tape. It exists so the escalate decision does not become the one refusal
+// shape assembled as a struct literal, silently exempt from a bound the other twenty-odd
+// sites inherit by construction.
+//
+// AuditOnly and Obligations are deliberately absent rather than parameters. An audit-mode
+// constraint downgrades a DENY to an observed forward, which is coherent for a policy
+// verdict being staged; an escalation is not a verdict being staged, it is "a human has
+// not approved this yet", and forwarding it because the target is in observe mode would
+// perform exactly the consequential action the ceiling flagged. The transport's
+// isObserveDeny consults AuditOnly, so leaving it unset is what keeps an escalation
+// unforwardable on an audit route — and an unforwardable refusal has no response to
+// redact, so obligations would have nothing to apply to.
+func escalateResponse(requestID, now string, denial capability.DenialInfo) capability.EnforceResponse {
+	denial.Details = boundDenialDetails(denial.Details)
+	return capability.EnforceResponse{
+		RequestID: requestID,
+		Decision:  capability.DecisionEscalate,
+		DecidedAt: now,
+		Denial:    &denial,
 	}
 }
 
@@ -973,6 +1018,15 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 	// that will apply on allow.
 	ctx = withDirectives(ctx, matched.Directives)
 
+	// Resolve the constraint's effect contract against THIS call's arguments once, and
+	// thread it: the effectClass condition, the blastRadius condition, and the ceiling
+	// below all read this one value, so they cannot disagree about what the call's effect
+	// was. A constraint with no contract resolves to the fail-closed default
+	// (irreversible, unquantified) — the flywheel that makes an unannotated target
+	// escalate under any ceiling.
+	effect := capability.ResolveEffect(matched.Effect, req.Arguments)
+	ctx = withResolvedEffect(ctx, effect)
+
 	// Collect the matched constraint's obligations UP FRONT and stamp them onto every
 	// deny this function returns that will be FORWARDED rather than blocked.
 	//
@@ -1035,7 +1089,10 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 		// defer's deny-only guard skips it.
 		ctx = withCarriedLabels(ctx, carriedLabels)
 		defer func() {
-			if resp.Decision == capability.DecisionDeny && resp.CarriedLabels == nil {
+			// `!= DecisionAllow`, not `== DecisionDeny`: an escalation is also a
+			// non-forwarded exit, and its record must carry the same accumulated-label
+			// snapshot every other non-allow exit carries.
+			if resp.Decision != capability.DecisionAllow && resp.CarriedLabels == nil {
 				resp.CarriedLabels = carriedLabels
 			}
 		}()
@@ -1053,6 +1110,14 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 	// sequenceBlock Peek would see as "run".
 	if obligDeny != nil {
 		return *obligDeny
+	}
+
+	// The tool-agnostic consequence bound, applied to an action the conditions have
+	// already allowed. It runs BEFORE the state commit below, for the same reason the
+	// obligation deny does: an over-ceiling call is not forwarded, so it must leave
+	// neither a phantom sequenceBlock antecedent nor a stranded flow label behind.
+	if ceilingDeny := e.checkEffectCeiling(effect, matched, carriedLabels, requestID, now); ceilingDeny != nil {
+		return *ceilingDeny
 	}
 
 	// Commit this call's sequenceBlock antecedent and flow labels as a single

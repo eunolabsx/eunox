@@ -1301,8 +1301,8 @@ func TestRenderSuggestedManifest_MaxValuesDefaultAndDenyOnlySort(t *testing.T) {
 		deny:    3,
 	}
 	out := renderSuggestedManifest(s, "draft", 0 /* maxValues<=0 → default */)
-	if !strings.Contains(out, "Seen only as denials") {
-		t.Errorf("expected the deny-only section:\n%s", out)
+	if !strings.Contains(out, "Seen only as refusals") {
+		t.Errorf("expected the refusal-only section:\n%s", out)
 	}
 	// Deny-only entries are sorted by name, so alpha precedes zeta.
 	ai := strings.Index(out, "tool:alpha")

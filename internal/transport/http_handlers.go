@@ -249,9 +249,10 @@ func (p *HTTPProxy) dispatchParams(sess *httpSession, sourceIP string) dispatchP
 			callUpstream:     sess.callUpstream,
 			strictAuditState: p.strictAudit(),
 		},
-		pdp:       rt.pdp,
-		sourceIP:  sourceIP,
-		buildInit: sess.buildInitResponse,
+		pdp:              rt.pdp,
+		sourceIP:         sourceIP,
+		buildInit:        sess.buildInitResponse,
+		honorAttribution: rt.honorAttribution,
 	}
 }
 

@@ -422,7 +422,15 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 		// background so a still-escaped descendant cannot hang newSession itself; the
 		// resulting zombie is reaped whenever that eventually resolves.
 		go func() {
-			<-sess.handshakeStopped
+			// Bounded, like every other wait on this channel: unbounded, this goroutine
+			// (and the zombie it exists to reap) outlives the process whenever a
+			// descendant that escaped the process group keeps the pipe open forever. It
+			// runs BEFORE registerSession, so --max-sessions does not bound how many can
+			// accumulate — a repeatedly-failing upstream would leak one per attempt.
+			// Abandoning the wait leaks the same zombie the unbounded version was trying
+			// to avoid, but it leaks exactly one goroutine's worth of nothing instead of
+			// one goroutine forever, and it says so on stderr.
+			waitBounded(sess.handshakeStopped, sess.shutdownBudget(), "upstream handshake reader")
 			_ = cmd.Wait()
 		}()
 		return nil, fmt.Errorf("upstream initialize: %w", err)
@@ -535,13 +543,19 @@ func (p *HTTPProxy) runDriftCheckOrTeardown(ctx context.Context, sess *httpSessi
 		return nil
 	}
 	raw, probeErr := sess.fetchUpstreamToolsRaw(ctx)
+	// Take this session's Tier-2 interface baseline from the same probe (see the stdio
+	// path for why the session-start view is the right one). Keyed by session id, so each
+	// HTTP session on this shared per-route PDP baselines its own upstream independently.
+	if probeErr == nil {
+		route.pdp.RecordObservedToolHashes(pdp.WithCompleteToolListing(pdp.WithSessionID(ctx, sess.id)), raw)
+	}
 	if err := route.driftCheck(raw, sess.upstreamServerVersion, probeErr); err != nil {
 		// Record the refusal before teardown: a startup drift failure is the FM-5
 		// tool-poisoning / rug-pull event this check exists to catch, so it must land on
 		// the tamper-evident tape (route-stamped), not only stderr and a generic 500. The
 		// raw drift reason (which names drifted tools) stays on stderr; the tape carries
 		// the stable DRIFT_REFUSED category.
-		recordDriftRefused(ctx, route.sink, sess.id)
+		recordDriftRefused(ctx, asRecorder(route.sink), sess.id)
 		sess.close(p.shutdownMs) //nolint:contextcheck // teardown path: the upstream session-termination DELETE intentionally uses a detached, bounded background context — close/reaper/signal/shutdown carry no request context.
 		p.mu.Lock()
 		delete(p.sessions, sess.id)

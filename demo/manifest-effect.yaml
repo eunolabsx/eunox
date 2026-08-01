@@ -1,0 +1,86 @@
+# demo/manifest-effect.yaml — effect-contract demo policy (Demo (b), the integrity dual).
+#
+# Opts into the experimental flow+effect draft grammar (schemaVersion 0.2-draft), so the
+# effect contract block, the top-level effectCeiling, and the flow tokens are available.
+# The published "0.1" grammar does NOT recognize them — they are staged behind
+# schema-version negotiation until a batched grammar bump.
+#
+# The scenario: an agent reads an untrusted, customer-submitted support ticket, which
+# carries a prompt injection telling it to drop a table. The agent HOLDS the capability:
+# query_db is in the allowlist, and DROP is explicitly in its allowedOperations. Per-call
+# authorization has nothing left to say — the call is permitted, by identity and by
+# argument.
+#
+# What stops it is the consequence. The effect contract makes query_db's effect a function
+# of the statement it is asked to run (a static decision table, not inference): SELECT is
+# reversible, DELETE is compensable via a declared restore, DROP is irreversible with
+# nothing to compensate with. The tool-agnostic effectCeiling then refuses to let ANY
+# action past `compensable`, or past a compensable one with no compensating action, without
+# human approval — keyed on the action's effect properties, never on which tool it is.
+#
+# The identical tool, in the identical session, with a SELECT is allowed. That contrast is
+# the point: the verdict is decided by what the action would DO, not by who asked.
+schemaVersion: "0.2-draft"
+name: demo-effect-policy
+version: "0.1.0"
+
+# The tool-agnostic consequence bound. Every allowed action is additionally checked
+# against it, so a target nobody wrote a per-target gate for — including one with no
+# effect contract at all — is still covered. onExceed: escalate routes an over-ceiling
+# action to human approval; with no approval integration wired in the in-path proxy that
+# resolves fail-closed to "not forwarded, and here is why".
+effectCeiling:
+  maxEffectClass: compensable
+  requireCompensation: true
+  onExceed: escalate
+
+capabilities:
+  # Source: the customer-submitted ticket is an untrusted input. Reading it is permitted,
+  # and its output carries the `untrusted` integrity label into the task — asserted by
+  # policy, never inferred from the content. The label rides the tape on every later
+  # decision in the session (carried_labels), so the escalation below is attributable to
+  # the untrusted provenance that produced it.
+  - target: tool:read_file
+    actions: [call]
+    effect:
+      class: reversible
+    directives:
+      - type: labelOutput
+        labels: [untrusted]
+
+  # The destructive target. The agent HOLDS this capability, and DROP is explicitly
+  # granted at the argument level — this demo is not about a missing permission.
+  #
+  # The effect contract keys on the statement: an argument-parameterized decision table,
+  # resolved from the call's own arguments on the decision path. No callout, no model.
+  - target: tool:query_db
+    actions: [call]
+    effect:
+      class: reversible
+      byArgument:
+        argument: query
+        cases:
+          SELECT:
+            class: reversible
+          DELETE:
+            class: compensable
+            compensatingAction: tool:restore_backup
+          DROP:
+            class: irreversible
+          # A statement the table does not cover has not been declared safe, so it
+          # resolves to the fail-closed default and escalates like an unannotated tool.
+        default:
+          class: irreversible
+    conditions:
+      - type: allowedOperations
+        argument: query
+        operations: [SELECT, DELETE, DROP]
+      # The flow rule for this target, stated explicitly so the tape shows it was
+      # consulted and PASSED. An untrusted-provenance task may query the database —
+      # reading a support ticket and then looking something up is ordinary work — while a
+      # confidential or PII flow may not reach it. Declaring it is what makes
+      # carried_labels appear on every decision here, so the escalation below is provably
+      # the consequence gate firing and not the flow control: same labels on the allowed
+      # SELECT and on the escalated DROP.
+      - type: flowLabel
+        allow: [public, internal, untrusted]

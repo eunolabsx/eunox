@@ -97,3 +97,63 @@ func ArgumentRootKey(ref string) string {
 	}
 	return ArgumentLiteralKey(ref)
 }
+
+// ResolveArgument returns the value a condition's or contract's `argument`
+// reference addresses, resolving the "$." nested-path syntax.
+//
+// "$." is a dotted path into nested object arguments: "$.a.b" reads
+// args["a"].(map)["b"]. A reference beginning with "$$." is the escaped literal form
+// of a top-level key that itself starts with "$.": "$$.x" reads the literal key
+// args["$.x"], not a traversal into args["x"].
+//
+// It lives HERE, in the package that already owns the path grammar, rather than in
+// pkg/enforcement, because both layers need it: the argument-matching conditions
+// (allowedValues, allowedOperations, allowedExtensions, allowedTables,
+// recipientDomain) resolve through enforcement.ResolveArgument, which delegates here,
+// and the effect layer's contract resolution (ResolveEffect) resolves through it
+// directly — pkg/capability cannot import pkg/enforcement, so a copy in each was the
+// alternative, and a copy is exactly how one layer silently stops honoring a syntax
+// the other documents.
+//
+// Fail closed: a malformed "$." path, a segment that lands on a non-object, or a
+// missing key all return (nil, false) — exactly the "argument missing" signal a
+// missing flat key produces, which every caller already denies on.
+func ResolveArgument(args map[string]interface{}, ref string) (interface{}, bool) {
+	if !IsArgumentPath(ref) {
+		v, ok := args[ArgumentLiteralKey(ref)]
+		return v, ok
+	}
+	segs := ArgumentPathSegments(ref)
+	if segs == nil {
+		return nil, false // malformed path: fail closed
+	}
+	var cur interface{} = args
+	for _, seg := range segs {
+		m, ok := cur.(map[string]interface{})
+		if !ok {
+			return nil, false
+		}
+		cur, ok = m[seg]
+		if !ok {
+			return nil, false
+		}
+	}
+	return cur, true
+}
+
+// OperationVerb returns the leading whitespace-delimited token of s, upper-cased —
+// the coarse first-verb rule allowedOperations applies to a SQL-ish argument.
+//
+// It splits on strings.Fields, so ANY whitespace separates (a newline- or
+// tab-formatted statement, which is the norm from a model, resolves the same verb as
+// a single-line one). It lives here for the same reason ResolveArgument does: the
+// effect layer's argument-parameterized contract falls back to this same rule, and a
+// second implementation is how "the same rule" quietly becomes two rules that
+// disagree on exactly the multi-line input a real agent sends.
+func OperationVerb(s string) string {
+	fields := strings.Fields(s)
+	if len(fields) == 0 {
+		return ""
+	}
+	return strings.ToUpper(fields[0])
+}

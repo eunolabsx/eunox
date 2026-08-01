@@ -151,3 +151,12 @@ func (*staticPDP) FilterResourcesList(_ context.Context, result json.RawMessage)
 func (*staticPDP) FilterPromptsList(_ context.Context, result json.RawMessage) ListFilterResult {
 	return ListFilterResult{Result: result}
 }
+
+// recordObservedToolHash records a tool's observed surface from its FIELDS rather than a
+// precomputed hash. Production computes the hash once per tools/list entry and shares it
+// between the FM-5 and Tier-2 pins (see recordObservedHash), so this spelling exists only
+// for tests, which are clearer stating the description they mean to pin than the digest of
+// it.
+func (p *ManifestPDP) recordObservedToolHash(name, description, title string, annotations, inputSchema, outputSchema map[string]interface{}, pin string) {
+	p.recordObservedHash(name, SurfaceHash(description, title, annotations, inputSchema, outputSchema), pin)
+}

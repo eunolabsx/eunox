@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/eunolabs/eunox/pkg/capability"
 	"github.com/eunolabs/eunox/pkg/enforcement"
@@ -87,6 +88,29 @@ func (m *LocalManifest) HasFlowLabel() bool {
 	// what counts as flow-relevant when the type set grows.
 	return m.anyCondition(capability.IsFlowLabelCondition) ||
 		m.anyDirective(capability.IsLabelOutputDirective)
+}
+
+// HonorsAttributionInterface reports whether this policy admits the client-supplied
+// attribution interface (the `io.eunolabs.context-manifest` block in a request's `_meta`).
+//
+// It is the staging gate for a wire-side draft token, and it exists for the same reason
+// checkExperimentalTokenStaging gates the manifest-side ones: a DRAFT feature must not
+// change behavior for an operator running the published grammar. This one cannot ride
+// checkExperimentalTokenStaging itself because the token never appears in the manifest —
+// it arrives on a REQUEST, so there is nothing to reject at load, and the gate has to be
+// a runtime predicate the transport consults.
+//
+// Under the published grammar the block is IGNORED rather than rejected, which is the
+// conservative direction: the interface is union-only (a declaration may only tighten a
+// call's labels, never widen them), so ignoring it falls back to the conservative session
+// join — the stricter reading. Rejecting instead would make a `0.1` operator's calls start
+// failing on a `_meta` key that is not part of their grammar, which is a behavior change
+// in the opposite, breaking direction.
+//
+// A nil manifest (a route with no policy) has no schema version and therefore no draft
+// opt-in, so it reports false.
+func (m *LocalManifest) HonorsAttributionInterface() bool {
+	return m != nil && strings.TrimSpace(m.SchemaVersion) == ManifestSchemaVersionFlowEffectDraft
 }
 
 // HasSamplingGrant reports whether the manifest grants server-initiated sampling:

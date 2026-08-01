@@ -53,6 +53,14 @@ type EnforceRequest struct {
 	// context instead, so it never mutates a shared caller request (a data race). A
 	// direct BuildRegoInput caller may set it to surface directives itself.
 	Directives []Directive `json:"directives,omitempty"`
+	// DeclaredLabels carries a cooperating client's per-call attribution (the
+	// `io.eunolabs.context-manifest` block in the request's `_meta`): native flow labels
+	// it asserts THIS call's inputs carry. They are UNIONED into the session's
+	// accumulated set for this call's sink check and are never written into session
+	// state. Union-only is the security property, not a simplification — see
+	// attribution.go. Empty for every non-cooperating client, which is the default and
+	// costs nothing.
+	DeclaredLabels []string `json:"declaredLabels,omitempty"`
 }
 
 // EnforceRequestContext carries request attributes used during enforcement.
@@ -105,6 +113,17 @@ type Decision string
 const (
 	DecisionAllow Decision = "allow"
 	DecisionDeny  Decision = "deny"
+	// DecisionEscalate marks an action the policy would permit but whose CONSEQUENCE
+	// exceeds the effectCeiling: it needs human approval, not a policy verdict.
+	//
+	// It is not a third forwarding state. Every forward gate in the proxy tests
+	// `!= DecisionAllow`, so an escalation is NOT forwarded — the fail-closed reading
+	// of "escalate" with no approval integration wired is "deny, and say why". What it
+	// changes is the RECORD and the reason: the tape carries decision=escalate and the
+	// consequence inputs (class, blast radius, compensating action), so an auditor —
+	// or a control plane driving an approval workflow — can tell an action awaiting a
+	// human from one policy forbids outright.
+	DecisionEscalate Decision = "escalate"
 )
 
 // DenialInfo describes why enforcement denied a request.

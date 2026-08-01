@@ -95,7 +95,7 @@ func BenchmarkListFilter(b *testing.B) {
 		b.ResetTimer()
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			_ = filterToolsListResult(raw, mpdp, nil)
+			_ = filterToolsListResult(raw, mpdp, nil, "", true)
 		}
 	})
 
@@ -108,7 +108,7 @@ func BenchmarkListFilter(b *testing.B) {
 		b.ResetTimer()
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			_ = filterToolsListResult(raw, mpdp, nil)
+			_ = filterToolsListResult(raw, mpdp, nil, "", true)
 		}
 	})
 }

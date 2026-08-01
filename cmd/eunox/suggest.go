@@ -78,6 +78,11 @@ type observedTarget struct {
 	name      string // bare name: tool name, resource URI, prompt name, or "sampling/createMessage"
 	allow     int
 	deny      int
+	// escalate counts calls the effect ceiling refused pending human approval. Tracked
+	// apart from deny because the remediation differs — an escalation is not a policy
+	// defect, it is an action whose CONSEQUENCE needs a human — but it is still a
+	// refusal, so it must never be silently allowlisted into the draft.
+	escalate int
 	// nonTruncatedAllow counts allowed calls whose detail map was NOT replaced
 	// wholesale by the audit truncation marker — i.e. the calls whose arguments
 	// could actually be mined. It is the correct denominator for the "argument is
@@ -102,6 +107,7 @@ type suggestionSet struct {
 	records  int
 	allow    int
 	deny     int
+	escalate int
 	sessions map[string]struct{}
 }
 
@@ -208,6 +214,14 @@ func computeSuggestions(r io.Reader, maxValues int) (suggestionSet, error) {
 		case "deny":
 			out.deny++
 			t.deny++
+		case audit.DecisionEscalate:
+			// An escalation is a refusal: the call was NOT forwarded. Counting it is what
+			// keeps an escalate-only target in the draft at all — with only allow and deny
+			// arms it matched neither list below and vanished, and a tape whose refusals
+			// were ALL escalations reported "no tool calls found", which is false and hides
+			// exactly the consequential actions an operator most needs to see.
+			out.escalate++
+			t.escalate++
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -389,9 +403,10 @@ func renderSuggestedManifest(s suggestionSet, manifestName string, maxValues int
 	// previously-blocked call is never silently allowlisted.
 	var allowed, denyOnly []*observedTarget
 	for _, t := range s.targets {
-		if t.allow > 0 {
+		switch {
+		case t.allow > 0:
 			allowed = append(allowed, t)
-		} else if t.deny > 0 {
+		case t.deny > 0 || t.escalate > 0:
 			denyOnly = append(denyOnly, t)
 		}
 	}
@@ -417,16 +432,34 @@ func renderSuggestedManifest(s suggestionSet, manifestName string, maxValues int
 
 	if len(denyOnly) > 0 {
 		sb.WriteString("  #\n")
-		sb.WriteString("  # ── Seen only as denials ──────────────────────────────────────────────\n")
-		sb.WriteString("  # The agent attempted these but a policy blocked them. Uncomment only the\n")
-		sb.WriteString("  # ones you deliberately intend to permit.\n")
+		sb.WriteString("  # ── Seen only as refusals ─────────────────────────────────────────────\n")
+		sb.WriteString("  # The agent attempted these but was refused. Uncomment only the ones you\n")
+		sb.WriteString("  # deliberately intend to permit. An ESCALATION is not a policy defect: the\n")
+		sb.WriteString("  # action was permitted but its consequence exceeded the effect ceiling and it\n")
+		sb.WriteString("  # was held for human approval — allowlisting the target does NOT change that.\n")
 		for _, t := range denyOnly {
 			fmt.Fprintf(&sb, "  # - target: %s\n", yamlScalar(t.namespace+":"+t.name))
-			fmt.Fprintf(&sb, "  #   actions: [%s]   # observed %d denial(s)\n", actionForNamespace(t.namespace), t.deny)
+			fmt.Fprintf(&sb, "  #   actions: [%s]   # observed %s\n", actionForNamespace(t.namespace), refusalTally(t))
 		}
 	}
 
 	return sb.String()
+}
+
+// refusalTally renders a target's refusal counts for the commented draft entry. Denials
+// and escalations are reported separately because the remediation differs: a denial says
+// policy forbade the call, an escalation says policy permitted it and its CONSEQUENCE
+// needs a human. Collapsing them into one "denial(s)" count would tell an operator to fix
+// a policy that is working as written.
+func refusalTally(t *observedTarget) string {
+	switch {
+	case t.deny > 0 && t.escalate > 0:
+		return fmt.Sprintf("%d denial(s), %d escalation(s)", t.deny, t.escalate)
+	case t.escalate > 0:
+		return fmt.Sprintf("%d escalation(s)", t.escalate)
+	default:
+		return fmt.Sprintf("%d denial(s)", t.deny)
+	}
 }
 
 // writeSuggestBanner emits the leading comment block: provenance (so the draft
@@ -438,8 +471,8 @@ func writeSuggestBanner(sb *strings.Builder, s suggestionSet) {
 	// target_type is unrecognized are excluded. Reporting it as the tape's record count
 	// overstated the evidence behind the draft -- an operator comparing it against
 	// `eunox stats` would see a smaller number here with no explanation.
-	fmt.Fprintf(sb, "# Source: %d mined audit record(s) — %d allow, %d deny — across %d session(s).\n",
-		s.records, s.allow, s.deny, len(s.sessions))
+	fmt.Fprintf(sb, "# Source: %d mined audit record(s) — %d allow, %d deny, %d escalate — across %d session(s).\n",
+		s.records, s.allow, s.deny, s.escalate, len(s.sessions))
 	sb.WriteString("# (Records that name no capability target — infrastructure denials, unmapped\n")
 	sb.WriteString("#  methods — are not mined and are not counted above.)\n")
 	sb.WriteString("#\n")

@@ -12,7 +12,6 @@ import (
 	"net"
 	"path"
 	"reflect"
-	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -34,26 +33,7 @@ import (
 // missing key all return (nil, false) — exactly the "argument missing" signal a
 // missing flat key produces, which the callers already deny on.
 func ResolveArgument(args map[string]interface{}, ref string) (interface{}, bool) {
-	if !capability.IsArgumentPath(ref) {
-		v, ok := args[capability.ArgumentLiteralKey(ref)]
-		return v, ok
-	}
-	segs := capability.ArgumentPathSegments(ref)
-	if segs == nil {
-		return nil, false // malformed path: fail closed
-	}
-	var cur interface{} = args
-	for _, seg := range segs {
-		m, ok := cur.(map[string]interface{})
-		if !ok {
-			return nil, false
-		}
-		cur, ok = m[seg]
-		if !ok {
-			return nil, false
-		}
-	}
-	return cur, true
+	return capability.ResolveArgument(args, ref)
 }
 
 // BuildRegoInput constructs the standard Rego input document from an
@@ -170,6 +150,8 @@ func (e *Engine) registerBuiltins() {
 	e.handlers[capability.ConditionTypeAllowedValues] = ConditionHandlerFunc(e.handleAllowedValues)
 	e.handlers[capability.ConditionTypeSequenceBlock] = ConditionHandlerFunc(e.handleSequenceBlock)
 	e.handlers[capability.ConditionTypeFlowLabel] = ConditionHandlerFunc(e.handleFlowLabel)
+	e.handlers[capability.ConditionTypeEffectClass] = ConditionHandlerFunc(e.handleEffectClass)
+	e.handlers[capability.ConditionTypeBlastRadius] = ConditionHandlerFunc(e.handleBlastRadius)
 	e.handlers[capability.ConditionTypePolicy] = ConditionHandlerFunc(e.handlePolicy)
 	e.handlers[capability.ConditionTypeCustom] = ConditionHandlerFunc(e.handleCustom)
 }
@@ -1024,11 +1006,7 @@ func MatchAllowedValue(argValue interface{}, allowed []interface{}) bool {
 // gate belongs in argumentSchema, an external PolicyEvaluator, or the database's own
 // grants; do not grow a SQL parser here.
 func OperationVerb(s string) string {
-	fields := strings.Fields(s)
-	if len(fields) == 0 {
-		return ""
-	}
-	return strings.ToUpper(fields[0])
+	return capability.OperationVerb(s)
 }
 
 // numericEqual reports whether a and b are both numeric and equal in value,
@@ -1108,10 +1086,10 @@ func exactIntegerRat(v any) (*big.Rat, bool) {
 // worst case sub-millisecond. A literal past either bound falls through to the
 // float64 comparison, which is what happened for every such value before the exact
 // arm existed — no new fail-open, just no exactness for a literal no policy writes.
-const (
-	maxExactNumericLen = 1024
-	maxExactNumericExp = 1024
-)
+// The literal bound lives in pkg/capability (NumericLiteralBounded): the JSON-RPC id
+// parse, this exact comparison, and the effect layer's blast-radius parse all need the
+// identical guard against the identical input class, and three hand-rolled copies is how
+// one of them ends up without it.
 
 // exactRat returns v's exact value as a *big.Rat, without the float64 round-trip
 // asInt64/toFloat64 take. Only the types that can carry a value outside int64 range
@@ -1123,7 +1101,7 @@ func exactRat(v any) (*big.Rat, bool) {
 		// coercion would round away. It also accepts exponent forms ("1e30"), which is
 		// what makes this the right parse for an argument decoded in UseNumber mode —
 		// and what makes the exponent bound necessary.
-		if len(n) > maxExactNumericLen || !exactNumericExponentBounded(string(n)) {
+		if !capability.NumericLiteralBounded(string(n)) {
 			return nil, false
 		}
 		return new(big.Rat).SetString(string(n))
@@ -1145,27 +1123,6 @@ func exactRat(v any) (*big.Rat, bool) {
 func ratFromFloat(f float64) (*big.Rat, bool) {
 	r := new(big.Rat).SetFloat64(f)
 	return r, r != nil
-}
-
-// exactNumericExponentBounded reports whether a decimal literal's exponent (if any) is
-// small enough that big.Rat.SetString will not materialize a huge 10^N value: the
-// length cap alone does not bound "1e1000000", nine bytes that expand to ~1 MiB. An
-// unparseable or over-bound exponent reports false, so the caller takes the float64
-// path. Mirrors internal/mcp's numericIDExponentBounded, which guards the same parse
-// against the same input class one layer up.
-func exactNumericExponentBounded(s string) bool {
-	i := strings.IndexAny(s, "eE")
-	if i < 0 {
-		return true // no exponent: only the length cap applies
-	}
-	v, err := strconv.Atoi(strings.TrimPrefix(s[i+1:], "+"))
-	if err != nil {
-		return false
-	}
-	if v < 0 {
-		v = -v
-	}
-	return v <= maxExactNumericExp
 }
 
 // maxInt64Uint is math.MaxInt64 as a uint64, for the unsigned arms of asInt64. The

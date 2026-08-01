@@ -1,0 +1,21 @@
+{
+  "schemaVersion": "0.1",
+  "id": "modelcontextprotocol/brave-search.brave_web_search",
+  "tool": "brave_web_search",
+  "server": {
+    "name": "@modelcontextprotocol/server-brave-search",
+    "homepage": "https://github.com/modelcontextprotocol/servers"
+  },
+  "summary": "Runs a web search. Read-only with respect to the caller's own systems.",
+  "notes": "Reversible on the effect axis, which says nothing about the FLOW axis: a search query leaves the trust domain, so this is a natural flowLabel sink as well as a low-effect action. The two axes are independent by design.",
+  "attestation": {
+    "author": "eunolabs",
+    "source": "authored",
+    "review": "pending"
+  },
+  "digest": "sha256:1c31c480454555ba060182c381540b3bd959c13e8febf7e3fdcee79e62ca50a5",
+  "effect": {
+    "class": "reversible",
+    "idempotent": true
+  }
+}

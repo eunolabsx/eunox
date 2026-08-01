@@ -115,6 +115,32 @@ jobs:
         # enforcement assertions and validates audit log HMAC signatures.
         # No Docker required.
 
+  # ── demo: flow + effect determinism gates ─────────────────────────────────
+  # The two headline demos' acceptance bar: each runs its scenario 20 times and
+  # requires a byte-identical normalized decision sequence and an HMAC-verified
+  # tape on every run. Determinism is the thesis — a flake here is a defect to
+  # diagnose, never a retry-until-green — so both gates run in CI rather than
+  # only by hand. No Docker; go + python3.
+  demo-flow-effect:
+    name: "demo / flow + effect determinism"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.5"
+          cache-dependency-path: go.sum
+
+      - name: Demo (a) — within-scope exfil blocked by source->sink flow policy (20 runs)
+        run: make -C demo ci-test-flow
+
+      - name: Demo (b) — untrusted-influenced destructive action escalated by the effect ceiling (20 runs)
+        run: make -C demo ci-test-effect
+
   # ── demo: lethal-trifecta hero demo ────────────────────────────────────────
   # Drives the real binary through the read->exfiltrate kill-chain (sequenceBlock
   # DENY), then the persistent-audit variant twice: the second run proves the

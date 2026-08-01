@@ -15,6 +15,8 @@
 // test-only message types.
 package mcp
 
+import "encoding/json"
+
 // InitResult is the result field of an `initialize` response.
 type InitResult struct {
 	ProtocolVersion string                 `json:"protocolVersion"`
@@ -27,6 +29,12 @@ type InitResult struct {
 type ToolCallParams struct {
 	Name      string                 `json:"name"`
 	Arguments map[string]interface{} `json:"arguments,omitempty"`
+	// Meta carries the request's `_meta` block, left as raw JSON per namespaced key so a
+	// key eunox does not model is neither decoded nor disturbed. Today the proxy reads
+	// exactly one key from it — the attribution interface's context manifest (see
+	// capability.MetaKeyContextManifest) — and the params are forwarded upstream
+	// VERBATIM regardless, so a key meant for the upstream still reaches it untouched.
+	Meta map[string]json.RawMessage `json:"_meta,omitempty"`
 }
 
 // ToolsListResult is the result field of a tools/list response.

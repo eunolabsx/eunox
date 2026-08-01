@@ -1348,3 +1348,61 @@ func TestRenderSuggestedManifest_EscapedArgumentLiteralNoted(t *testing.T) {
 	// of leaving it unconstrained instead of emitting a self-denying condition.
 	assertManifestAllows(t, out, "foo", map[string]any{"$$.x": "val"})
 }
+
+// TestSuggest_EscalateOnlyTargetsSurvive is the regression for a target that vanished
+// from the draft entirely.
+//
+// The miner's decision switch handled only "allow" and "deny", so an escalate record
+// incremented neither counter — and the renderer's split ("allow > 0" → active, else
+// "deny > 0" → commented) then matched neither list. An escalate-only target disappeared
+// silently, and a tape whose refusals were ALL escalations rendered
+// "capabilities: [] # no tool calls found", which is false. Escalations are the
+// consequential actions an operator most needs to see in a draft they are about to
+// enforce, so losing exactly those is the worst possible subset to lose.
+func TestSuggest_EscalateOnlyTargetsSurvive(t *testing.T) {
+	var tape strings.Builder
+	for _, rec := range []map[string]interface{}{
+		{"decision": "escalate", "target_type": "tool", "target": "wire_transfer", "session_id": "s1"},
+		{"decision": "escalate", "target_type": "tool", "target": "wire_transfer", "session_id": "s1"},
+		{"decision": "deny", "target_type": "tool", "target": "drop_table", "session_id": "s1"},
+		{"decision": "escalate", "target_type": "tool", "target": "drop_table", "session_id": "s1"},
+	} {
+		b, err := json.Marshal(rec)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		tape.WriteString(string(b) + "\n")
+	}
+
+	s, err := computeSuggestions(strings.NewReader(tape.String()), suggestMaxValuesDefault)
+	if err != nil {
+		t.Fatalf("computeSuggestions: %v", err)
+	}
+	if s.escalate != 3 {
+		t.Errorf("escalate = %d, want 3", s.escalate)
+	}
+	wt := s.targets["tool:wire_transfer"]
+	if wt == nil {
+		t.Fatal("an escalate-only target must be mined, not dropped")
+	}
+	if wt.escalate != 2 || wt.deny != 0 {
+		t.Errorf("wire_transfer: escalate=%d deny=%d, want 2/0", wt.escalate, wt.deny)
+	}
+
+	out := renderSuggestedManifest(s, "draft", suggestMaxValuesDefault)
+	if strings.Contains(out, "no tool calls found") {
+		t.Errorf("a tape carrying escalations must not render as empty:\n%s", out)
+	}
+	if !strings.Contains(out, "tool:wire_transfer") {
+		t.Errorf("the escalate-only target must appear in the draft:\n%s", out)
+	}
+	// The tally distinguishes the two: a denial says policy forbade the call, an
+	// escalation says policy permitted it and its consequence needs a human. Reporting
+	// escalations as "denial(s)" would tell an operator to fix a working policy.
+	if !strings.Contains(out, "2 escalation(s)") {
+		t.Errorf("escalations must be tallied as escalations:\n%s", out)
+	}
+	if !strings.Contains(out, "1 denial(s), 1 escalation(s)") {
+		t.Errorf("a target seen as both must report both counts:\n%s", out)
+	}
+}

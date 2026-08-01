@@ -1,0 +1,52 @@
+{
+  "schemaVersion": "0.1",
+  "id": "modelcontextprotocol/postgres.query",
+  "tool": "query",
+  "server": {
+    "name": "@modelcontextprotocol/server-postgres",
+    "homepage": "https://github.com/modelcontextprotocol/servers"
+  },
+  "summary": "Executes a SQL statement.",
+  "notes": "Argument-parameterized: the effect is a function of the statement's leading verb, matched as a static table. This is a coarse first-verb gate, not a SQL parser — the same documented limit allowedOperations carries — so pair it with a read-only role and multi-statement execution disabled at the driver rather than relying on it alone.",
+  "attestation": {
+    "author": "eunolabs",
+    "source": "authored",
+    "review": "pending"
+  },
+  "digest": "sha256:8f12c4151fd625714b36fdead67303b62a2556af54b21abc67902518ccffc680",
+  "effect": {
+    "class": "irreversible",
+    "byArgument": {
+      "argument": "sql",
+      "cases": {
+        "DELETE": {
+          "class": "irreversible"
+        },
+        "DROP": {
+          "class": "irreversible"
+        },
+        "EXPLAIN": {
+          "class": "reversible",
+          "idempotent": true
+        },
+        "INSERT": {
+          "class": "compensable",
+          "compensatingAction": "tool:query"
+        },
+        "SELECT": {
+          "class": "reversible",
+          "idempotent": true
+        },
+        "TRUNCATE": {
+          "class": "irreversible"
+        },
+        "UPDATE": {
+          "class": "irreversible"
+        }
+      },
+      "default": {
+        "class": "irreversible"
+      }
+    }
+  }
+}

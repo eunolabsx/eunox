@@ -137,6 +137,16 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 		present = peeked
 	}
 
+	// Union in a cooperating client's per-call attribution. The interface is one-
+	// directional by design: a client may declare labels the session join did not know
+	// about, never fewer. Union-only means an untrusted client's declaration can produce
+	// only MORE denials, which is what makes honoring it need no trust decision — an agent
+	// that could narrow its own taint would defeat information-flow control with one extra
+	// field, and it would be the first thing an injection reached for. The declared set is
+	// used for THIS check only and is never written into session state.
+	declared := capability.NormalizeDeclaredLabels(req.DeclaredLabels)
+	present = unionLabels(present, declared)
+
 	// blocked = present labels not permitted here. present is vocabulary-ordered (both
 	// the threaded snapshot and the fallback append in vocab order), so blocked is too.
 	var blocked []string
@@ -150,19 +160,51 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 			Code:          capability.ErrCodeConditionFailed,
 			ConditionType: capability.ConditionTypeFlowLabel,
 			Message:       fmt.Sprintf("flow label(s) %v present in this session but not permitted at this sink", blocked),
-			Details: map[string]interface{}{
-				// "flow": true distinguishes a source->sink flow denial from a plain
-				// capability/argument denial. blockedLabels lists every offending class;
-				// blockedLabel is the highest-vocabulary-order one (untrusted-preferring),
-				// so a single-value consumer keyed on the integrity signal still sees it.
-				"flow":          true,
-				"blockedLabel":  blocked[len(blocked)-1],
-				"blockedLabels": blocked,
-				"allowLabels":   fl.Allow,
-			},
+			Details: func() map[string]interface{} {
+				d := map[string]interface{}{
+					// "flow": true distinguishes a source->sink flow denial from a plain
+					// capability/argument denial. blockedLabels lists every offending class;
+					// blockedLabel is the highest-vocabulary-order one (untrusted-preferring),
+					// so a single-value consumer keyed on the integrity signal still sees it.
+					"flow":          true,
+					"blockedLabel":  blocked[len(blocked)-1],
+					"blockedLabels": blocked,
+					"allowLabels":   fl.Allow,
+				}
+				// Record the client's own attribution separately from the proxy's observed
+				// state, so an auditor can tell a denial the proxy derived from one the
+				// client asked for. Conflating them into carried_labels would make the
+				// tape unable to answer "did we see this, or were we told?".
+				if len(declared) > 0 {
+					d["declared_labels"] = declared
+				}
+				return d
+			}(),
 		}
 	}
 	return nil
+}
+
+// unionLabels merges declared into present, deduplicated and in the fixed vocabulary
+// order. Returns present unchanged when there is nothing to add, so the common
+// non-cooperating-client path allocates nothing.
+//
+// The merge itself is capability.NormalizeDeclaredLabels — the same routine that
+// normalizes a client's declaration at the wire boundary — rather than a second copy of
+// "dedupe, then emit in vocabulary order". Two copies of that would be two places to
+// update when the vocabulary grows, and they would disagree silently: the ordering here
+// is what both the enforced subset check and the audit record's label fields rely on, so
+// a divergence would not show up as an error, only as a differently-ordered label set on
+// the tape. Both slices are bounded by the closed vocabulary (at most five entries), so
+// the concat is trivially small.
+func unionLabels(present, declared []string) []string {
+	if len(declared) == 0 {
+		return present
+	}
+	all := make([]string, 0, len(present)+len(declared))
+	all = append(all, present...)
+	all = append(all, declared...)
+	return capability.NormalizeDeclaredLabels(all)
 }
 
 // peekSessionLabels reports the session's accumulated flow-label set (vocabulary order)

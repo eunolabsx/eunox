@@ -1,0 +1,24 @@
+{
+  "schemaVersion": "0.1",
+  "id": "modelcontextprotocol/memory.delete_entities",
+  "tool": "delete_entities",
+  "server": {
+    "name": "@modelcontextprotocol/server-memory",
+    "homepage": "https://github.com/modelcontextprotocol/servers"
+  },
+  "summary": "Deletes entities and their relations from the knowledge graph.",
+  "notes": "Blast radius is the LENGTH of the entityNames array — the quantity a per-call authorization decision cannot see, because one legal call may name one entity or ten thousand.",
+  "attestation": {
+    "author": "eunolabs",
+    "source": "authored",
+    "review": "pending"
+  },
+  "digest": "sha256:3722a7d51f956e37275c957bb15295491ccdbffe5897bebadc309028ad125b67",
+  "effect": {
+    "class": "irreversible",
+    "blastRadius": {
+      "argument": "entityNames",
+      "unit": "entities"
+    }
+  }
+}

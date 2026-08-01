@@ -1,0 +1,37 @@
+{
+  "schemaVersion": "0.1",
+  "id": "modelcontextprotocol/sqlite.write_query",
+  "tool": "write_query",
+  "server": {
+    "name": "@modelcontextprotocol/server-sqlite",
+    "homepage": "https://github.com/modelcontextprotocol/servers"
+  },
+  "summary": "Executes an INSERT, UPDATE, or DELETE statement.",
+  "attestation": {
+    "author": "eunolabs",
+    "source": "authored",
+    "review": "pending"
+  },
+  "digest": "sha256:8e15a179019f6ad8fa1f586cca5d10db4bcfaf74c5fe0509a3869d6e76b63673",
+  "effect": {
+    "class": "irreversible",
+    "byArgument": {
+      "argument": "query",
+      "cases": {
+        "DELETE": {
+          "class": "irreversible"
+        },
+        "INSERT": {
+          "class": "compensable",
+          "compensatingAction": "tool:write_query"
+        },
+        "UPDATE": {
+          "class": "irreversible"
+        }
+      },
+      "default": {
+        "class": "irreversible"
+      }
+    }
+  }
+}

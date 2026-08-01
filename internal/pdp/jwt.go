@@ -1021,7 +1021,11 @@ func (p *JWTPDP) audienceDeny(message string) capability.EnforceResponse {
 //
 // HardDeny responses are excluded: the transport never downgrades them, so there is no
 // forwarded response to redact.
-func (p *JWTPDP) withInnerForwardObligations(ctx context.Context, r capability.EnforceResponse, target EnforceTarget) capability.EnforceResponse {
+//
+// It ALSO carries the inner's interface-pin verdict, which is the other half of the same
+// fail-open — see hardenOnBrokenInterface. Both live here because this is the one function
+// every short-circuiting JWT deny already passes through on its way to being forwarded.
+func (p *JWTPDP) withInnerForwardObligations(ctx context.Context, sessionID string, r capability.EnforceResponse, target EnforceTarget) capability.EnforceResponse {
 	if r.Decision == capability.DecisionAllow || len(r.Obligations) > 0 {
 		return r
 	}
@@ -1031,6 +1035,12 @@ func (p *JWTPDP) withInnerForwardObligations(ctx context.Context, r capability.E
 	mdp, ok := p.inner.(*ManifestPDP)
 	if !ok {
 		return r
+	}
+	if hardened, broke := mdp.hardenOnBrokenInterface(sessionID, r, target); broke {
+		// A broken pin means "must not be forwarded", which outranks "may be forwarded with
+		// obligations" — so return before stamping them. A HardDeny is never downgraded, so
+		// it has no forwarded response to redact.
+		return hardened
 	}
 	return mdp.withForwardObligations(ctx, r, target)
 }
@@ -1086,7 +1096,7 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 		if p.innerEnforces() {
 			return p.decideInner(ctx, sessionID, target, args, sourceIP)
 		}
-		return p.withInnerForwardObligations(ctx, denyResponse(p.clock, capability.ErrCodeAuthorizationFailed, "jwtCapability",
+		return p.withInnerForwardObligations(ctx, sessionID, denyResponse(p.clock, capability.ErrCodeAuthorizationFailed, "jwtCapability",
 			"token carries no mcp.capabilities claim and the route has no manifest policy to fall back on; "+
 				"JWT mode denies by default — issue a token with capability claims or add a manifest policy to the route"), target)
 	}
@@ -1101,7 +1111,7 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 		constraints = buildConstraintsFromClaims(claims.Capabilities, target)
 	}
 	if len(constraints) == 0 {
-		return p.withInnerForwardObligations(ctx, denyResponse(p.clock, capability.ErrCodeAuthorizationFailed, "jwtCapability",
+		return p.withInnerForwardObligations(ctx, sessionID, denyResponse(p.clock, capability.ErrCodeAuthorizationFailed, "jwtCapability",
 			fmt.Sprintf("%s %q is not in the JWT capability claims", target.Type, target.Name)), target)
 	}
 
@@ -1129,7 +1139,7 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 		break
 	}
 	if lastDeny != nil {
-		return p.withInnerForwardObligations(ctx, *lastDeny, target)
+		return p.withInnerForwardObligations(ctx, sessionID, *lastDeny, target)
 	}
 
 	// JWT allows — intersect with the inner manifest PDP if configured (both sides

@@ -201,6 +201,10 @@ type StdioProxy struct {
 	// decideGate != nil. nil keeps full intra-session
 	// decision parallelism. Set from StdioProxyOptions.SerializeDecisions at construction.
 	decideGate *decisionSerializer
+
+	// honorAttribution admits the client-supplied attribution interface. Set from
+	// StdioProxyOptions.HonorAttribution at construction; see that field.
+	honorAttribution bool
 }
 
 // StdioProxyOptions configures a StdioProxy. The upstream is either a local
@@ -233,6 +237,13 @@ type StdioProxyOptions struct {
 	// manifest.HasFlowLabel() || manifest.HasSequenceBlock().
 	SerializeDecisions bool
 
+	// HonorAttribution admits the client-supplied attribution interface (the
+	// io.eunolabs.context-manifest block in a request's _meta). The binary sets it from
+	// manifest.HonorsAttributionInterface() — i.e. only under the flow+effect draft
+	// schemaVersion — so a policy running the published grammar ignores the block instead
+	// of acting on a token that grammar does not contain.
+	HonorAttribution bool
+
 	// DriftCheck is the injected drift hook; nil = no drift checking.
 	DriftCheck drift.CheckFunc
 }
@@ -264,6 +275,7 @@ func NewStdioProxy(opts StdioProxyOptions) *StdioProxy {
 		audit:                 opts.Audit,
 		requireAuditStrict:    opts.RequireAuditStrict,
 		driftCheck:            opts.DriftCheck,
+		honorAttribution:      opts.HonorAttribution,
 		pending:               make(map[string]struct{}),
 		byUpstreamID:          make(map[string]chan upstreamResult),
 		hostToUp:              make(map[string]*json.RawMessage),
@@ -347,6 +359,16 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 		}
 		if p.driftCheck != nil {
 			raw, probeErr := p.fetchUpstreamToolsRaw(ctx)
+			// Take the Tier-2 interface baseline from the session-start probe, the earliest
+			// view of the advertised surface this session has, so a rewrite between startup
+			// and the host's first tools/list already trips a pin break. It runs BEFORE the
+			// drift check so a session the check then refuses leaves no half-baselined
+			// state behind (ReleaseSession clears it on teardown either way). A probe
+			// failure records nothing — the PDP refuses to baseline an unreadable response
+			// — and the first host tools/list establishes the baseline instead.
+			if probeErr == nil {
+				p.pdp.RecordObservedToolHashes(pdp.WithCompleteToolListing(pdp.WithSessionID(ctx, p.sessionID)), raw)
+			}
 			if err := p.driftCheck(raw, p.upstreamServerVersion, probeErr); err != nil {
 				// Record the refusal before tearing down: a startup drift failure is the
 				// FM-5 tool-poisoning / rug-pull event this check exists to catch, so it
@@ -1186,9 +1208,10 @@ func (p *StdioProxy) dispatchParams() dispatchParams {
 			callUpstream:     p.callUpstream,
 			strictAuditState: p.strictAudit(),
 		},
-		pdp:       p.pdp,
-		sourceIP:  "", // stdio has no per-request client address
-		buildInit: p.buildInitResponse,
+		pdp:              p.pdp,
+		sourceIP:         "", // stdio has no per-request client address
+		buildInit:        p.buildInitResponse,
+		honorAttribution: p.honorAttribution,
 	}
 }
 

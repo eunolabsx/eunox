@@ -64,6 +64,20 @@ const (
 	// typo cannot diverge the wire/audit code, and denialToJSONRPCCode maps it
 	// explicitly to -32001 so the wire code, the mapping, and the docs stay in lockstep.
 	ErrCodeSamplingDenied = "SAMPLING_DENIED"
+	// ErrCodeEscalationRequired refuses an action that exceeds the policy's
+	// effectCeiling under onExceed: escalate — one whose consequence (irreversibility,
+	// blast radius, or the absence of a compensating action) requires human approval
+	// rather than a policy verdict alone.
+	//
+	// It is a REFUSAL, not a pending state. eunox has no approval integration in the
+	// in-path proxy — approval is the control-plane surface — so "escalate" resolves
+	// fail-closed to "not forwarded", carrying the reason so the operator (or a
+	// control plane) knows what to approve. A host receiving it must not retry
+	// blindly: the same call escalates again until the ceiling or the contract
+	// changes. On the wire it shares -32003 with the other condition-failure codes;
+	// the symbolic code and the audit record's decision=escalate are what distinguish
+	// "a human must decide" from "policy said no".
+	ErrCodeEscalationRequired = "ESCALATION_REQUIRED"
 )
 
 // Fixed JSON-RPC integer error codes for denial responses.
@@ -103,6 +117,7 @@ var AllDenialCodes = []string{
 	ErrCodeEnforcementError,
 	ErrCodeAuditUnavailable,
 	ErrCodeSamplingDenied,
+	ErrCodeEscalationRequired,
 }
 
 // DenialWireCode maps a symbolic denial code (ErrCode*) to the JSON-RPC integer
@@ -130,9 +145,14 @@ func DenialWireCode(code string) (wire int, ok bool) {
 	// Condition-failure codes share -32003: a failed maxCalls (RATE_LIMITED), a
 	// missing required argument (MISSING_CONTEXT), and the allowedOperations/
 	// allowedValues failures.
+	// ESCALATION_REQUIRED joins them: an over-ceiling action is a failed policy
+	// condition on the consequence axis, and the symbolic code (plus decision=escalate
+	// on the tape) is what tells a host "a human must approve this" rather than "this
+	// is forbidden".
 	case ErrCodeConditionFailed, ErrCodeRateLimited,
 		ErrCodeMissingContext,
-		ErrCodeOperationNotPermitted, ErrCodeValueNotPermitted:
+		ErrCodeOperationNotPermitted, ErrCodeValueNotPermitted,
+		ErrCodeEscalationRequired:
 		return JSONRPCCodeConditionFailed, true
 	// Server-side failures (an enforcement-engine error, or AUDIT_UNAVAILABLE from
 	// the --require-audit=strict gate) are not policy verdicts, so they use the

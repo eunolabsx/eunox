@@ -1,0 +1,24 @@
+{
+  "schemaVersion": "0.1",
+  "id": "modelcontextprotocol/filesystem.write_file",
+  "tool": "write_file",
+  "server": {
+    "name": "@modelcontextprotocol/server-filesystem",
+    "homepage": "https://github.com/modelcontextprotocol/servers"
+  },
+  "summary": "Overwrites a file at the given path. The previous contents are not recoverable through this server.",
+  "notes": "Irreversible rather than compensable: the server exposes no restore, so nothing declared here can reverse it. A deployment with filesystem snapshots may re-author this as compensable against its own restore tool — that is a property of the deployment, not of the tool.",
+  "attestation": {
+    "author": "eunolabs",
+    "source": "authored",
+    "review": "pending"
+  },
+  "digest": "sha256:de15c7abd1c4b580c3c7fd56365c0808cd184207cca9940cff2a0f97e778fbf3",
+  "effect": {
+    "class": "irreversible",
+    "blastRadius": {
+      "value": 1,
+      "unit": "files"
+    }
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "schemaVersion": "0.1",
+  "id": "modelcontextprotocol/github.create_issue",
+  "tool": "create_issue",
+  "server": {
+    "name": "@modelcontextprotocol/server-github",
+    "homepage": "https://github.com/modelcontextprotocol/servers"
+  },
+  "summary": "Opens an issue on a repository.",
+  "notes": "Irreversible: an issue can be closed but not unsent — subscribers are notified the moment it is created, and that notification is the effect that cannot be withdrawn.",
+  "attestation": {
+    "author": "eunolabs",
+    "source": "authored",
+    "review": "pending"
+  },
+  "digest": "sha256:086274ec883df4b075e49798e08e93663a29cda7a1b971a9b36eea450c20dd1c",
+  "effect": {
+    "class": "irreversible",
+    "blastRadius": {
+      "value": 1,
+      "unit": "issues"
+    }
+  }
+}

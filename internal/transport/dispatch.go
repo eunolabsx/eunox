@@ -53,6 +53,16 @@ type dispatchParams struct {
 	// decision). nil for a non-serialized request (a non-flow/non-sequenceBlock policy, or
 	// a locally-answered method), where finishDecision is a no-op.
 	endDecision func()
+
+	// honorAttribution admits the client-supplied attribution interface (the
+	// io.eunolabs.context-manifest block in a request's _meta). It is the runtime staging
+	// gate for a DRAFT wire token — set only when the route's policy declares the
+	// flow+effect draft schemaVersion — because the manifest-side gate
+	// (checkExperimentalTokenStaging) structurally cannot cover a token that arrives on a
+	// REQUEST rather than in the policy. False means the block is IGNORED, not rejected:
+	// the interface is union-only, so ignoring it falls back to the conservative session
+	// join, which is the stricter reading.
+	honorAttribution bool
 }
 
 // finishDecision closes the per-session decision critical section, if one is open (see
@@ -352,7 +362,28 @@ func dispatchToolsCall(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mc
 	if params.Arguments == nil {
 		params.Arguments = map[string]interface{}{}
 	}
-	dec := d.pdp.Decide(d.decideCtx(ctx), d.sessionID, pdp.EnforceTarget{Type: capability.TargetTypeTool, Name: params.Name}, params.Arguments, d.sourceIP)
+	// The attribution interface: a cooperating client may attribute this call's inputs in
+	// `_meta`, and those labels are unioned into the session's accumulated set for this
+	// call's sink check. A malformed block is a malformed REQUEST, not a silently ignored
+	// hint — a client that tried to attribute a call and got the shape wrong must find
+	// out, rather than proceed believing a tightening is in force when it is not.
+	//
+	// Gated on honorAttribution, which is the DRAFT staging discipline: under the
+	// published grammar the whole block — including that malformed-request rejection — is
+	// skipped, so a `0.1` operator sees no behavior change from a token their grammar does
+	// not contain. Ignoring rather than rejecting is the conservative direction here
+	// because the interface is union-only and can only ever tighten.
+	decideCtx := d.decideCtx(ctx)
+	if d.honorAttribution {
+		declared, metaErr := capability.ParseContextManifest(params.Meta)
+		if metaErr != nil {
+			return d.malformedDeny(ctx, msg, "tools/call: "+metaErr.Error())
+		}
+		if declared != nil {
+			decideCtx = pdp.WithDeclaredLabels(decideCtx, declared.Labels)
+		}
+	}
+	dec := d.pdp.Decide(decideCtx, d.sessionID, pdp.EnforceTarget{Type: capability.TargetTypeTool, Name: params.Name}, params.Arguments, d.sourceIP)
 	// Close the per-session decision critical section here — the decision and its flow/
 	// sequence state write are done — so the upstream forward below runs concurrently.
 	// Everything after this reads the settled dec.
@@ -479,6 +510,12 @@ func dispatchList(ctx context.Context, d dispatchParams, msg mcp.RPCMsg, filter 
 	if denied, blocked := d.strictAuditDenial(ctx, msg, msg.Method, msg.Method, msg.Method); blocked {
 		return denied
 	}
+
+	// The ListFilterer/RecordObservedToolHashes seams take (ctx, result) and no session —
+	// unlike the enforced Decide* paths, which receive it as a parameter — so the session
+	// id rides the context, as JWT claims already do. The Tier-2 interface baseline is
+	// per-session (see pdp.SurfaceBaseline), so both paths below need it.
+	ctx = pdp.WithSessionID(ctx, d.sessionID)
 
 	upResp, err := d.callUpstream(ctx, msg)
 	if err != nil {
