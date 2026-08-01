@@ -5,6 +5,7 @@ package capability
 
 import (
 	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 )
@@ -509,5 +510,189 @@ func TestResolvedEffectStringNamesTheUnquantifiedCase(t *testing.T) {
 	}
 	if strings.Contains(full, "unannotated") {
 		t.Fatalf("an annotated effect must not render as unannotated: %q", full)
+	}
+}
+
+// TestEffectArgumentReferencesHonorNestedPaths pins that the effect layer resolves an
+// `argument` reference through the SAME grammar every condition uses. A bare map index
+// made the documented "$." syntax resolve to ABSENT: the decision table never matched, a
+// permissive default applied to the exact call it was written to catch, and a blast radius
+// silently went unquantified — all while the manifest loaded clean.
+func TestEffectArgumentReferencesHonorNestedPaths(t *testing.T) {
+	table := &EffectContract{
+		Class: EffectReversible,
+		ByArgument: &EffectByArgument{
+			Argument: "$.filters.query",
+			Cases:    map[string]EffectCase{"DROP": {Class: EffectIrreversible}},
+			Default:  &EffectCase{Class: EffectReversible},
+		},
+	}
+	nested := map[string]interface{}{"filters": map[string]interface{}{"query": "DROP TABLE customers"}}
+	if got := ResolveEffect(table, nested).Class; got != EffectIrreversible {
+		t.Fatalf("a nested byArgument reference must resolve, got class %q", got)
+	}
+
+	radius := &EffectContract{Class: EffectIrreversible, BlastRadius: &BlastRadiusSpec{Argument: "$.body.amount"}}
+	got := ResolveEffect(radius, map[string]interface{}{"body": map[string]interface{}{"amount": json.Number("5000")}})
+	if !got.Quantified || got.BlastRadius.Text('f', -1) != "5000" {
+		t.Fatalf("a nested blastRadius reference must resolve, got %+v", got)
+	}
+
+	// The "$$." escape addresses a literal top-level key that itself starts with "$.".
+	escaped := &EffectContract{Class: EffectIrreversible, BlastRadius: &BlastRadiusSpec{Argument: "$$.amount"}}
+	if e := ResolveEffect(escaped, map[string]interface{}{"$.amount": json.Number("7")}); !e.Quantified {
+		t.Fatalf("the escaped literal form must resolve, got %+v", e)
+	}
+	// A malformed path fails closed rather than matching something unintended.
+	bad := &EffectContract{Class: EffectIrreversible, BlastRadius: &BlastRadiusSpec{Argument: "$.a..b"}}
+	if e := ResolveEffect(bad, map[string]interface{}{"a": map[string]interface{}{"b": json.Number("1")}}); e.Quantified {
+		t.Fatal("a malformed path must resolve unquantified, not match")
+	}
+}
+
+// TestBlastRadiusRejectsANegativeMagnitude pins the fail-closed treatment of a
+// caller-controlled magnitude. A magnitude is non-negative by construction — the loader
+// refuses a negative bound for exactly that reason — but the ARGUMENT value comes from the
+// request, and an unchecked negative compared below every bound and under every ceiling.
+func TestBlastRadiusRejectsANegativeMagnitude(t *testing.T) {
+	c := &EffectContract{Class: EffectCompensable, CompensatingAction: "tool:recharge",
+		BlastRadius: &BlastRadiusSpec{Argument: "amount", Unit: "usd"}}
+	got := ResolveEffect(c, map[string]interface{}{"amount": json.Number("-1000000")})
+	if got.Quantified {
+		t.Fatalf("a negative magnitude must resolve unquantified, got %s", got.BlastRadius.Text('f', -1))
+	}
+	// Unquantified exceeds any finite bound, so the call is refused rather than admitted.
+	if over, _ := (&EffectCeiling{MaxBlastRadius: num("500")}).Exceeds(got); !over {
+		t.Fatal("an unquantifiable magnitude must exceed a finite ceiling")
+	}
+	// Zero is a legitimate magnitude and must still quantify.
+	if z := ResolveEffect(c, map[string]interface{}{"amount": json.Number("0")}); !z.Quantified {
+		t.Fatal("zero is a magnitude and must quantify")
+	}
+}
+
+// TestBlastRadiusFailsClosedOnNaNAndInf pins that an unevaluable float argument denies
+// rather than panicking the enforcement goroutine. big.Float.SetFloat64 PANICS on NaN, and
+// this branch exists for a direct caller of the exported engine that decoded arguments
+// without UseNumber — i.e. one whose input the proxy never screened.
+func TestBlastRadiusFailsClosedOnNaNAndInf(t *testing.T) {
+	c := &EffectContract{Class: EffectIrreversible, BlastRadius: &BlastRadiusSpec{Argument: "amount"}}
+	for name, v := range map[string]float64{"NaN": math.NaN(), "+Inf": math.Inf(1), "-Inf": math.Inf(-1)} {
+		t.Run(name, func(t *testing.T) {
+			if got := ResolveEffect(c, map[string]interface{}{"amount": v}); got.Quantified {
+				t.Fatalf("%s must resolve unquantified", name)
+			}
+		})
+	}
+	if got := ResolveEffect(c, map[string]interface{}{"amount": 42.5}); !got.Quantified {
+		t.Fatal("an ordinary float64 argument must still quantify")
+	}
+}
+
+// TestEffectVerbMatchingHandlesAllWhitespace pins that the first-verb fallback uses the
+// shared OperationVerb rule. Splitting on a space alone made a newline- or tab-formatted
+// statement — the norm from a model — miss its case and fall to the table default, so an
+// ordinary multi-line SELECT escalated under any ceiling with no diagnosable cause.
+func TestEffectVerbMatchingHandlesAllWhitespace(t *testing.T) {
+	c := &EffectContract{
+		Class: EffectIrreversible,
+		ByArgument: &EffectByArgument{
+			Argument: "query",
+			Cases:    map[string]EffectCase{"SELECT": {Class: EffectReversible}},
+			Default:  &EffectCase{Class: EffectIrreversible},
+		},
+	}
+	for _, q := range []string{"SELECT id FROM t", "SELECT\n  id\nFROM t", "SELECT\tid FROM t", "  SELECT id  "} {
+		if got := ResolveEffect(c, map[string]interface{}{"query": q}).Class; got != EffectReversible {
+			t.Errorf("%q must resolve reversible, got %q", q, got)
+		}
+	}
+	if got := ResolveEffect(c, map[string]interface{}{"query": "DROP\nTABLE t"}).Class; got != EffectIrreversible {
+		t.Errorf("an uncovered verb must still fall to the default, got %q", got)
+	}
+}
+
+// TestByArgumentCaseLookupIsDeterministic pins that a programmatically-built table with
+// two keys that fold together resolves the same way every time. The loader rejects the
+// shape, but map-order iteration made the resolved effect class differ between two
+// identical calls — disqualifying for a layer whose whole claim is determinism.
+func TestByArgumentCaseLookupIsDeterministic(t *testing.T) {
+	c := &EffectContract{
+		Class: EffectReversible,
+		ByArgument: &EffectByArgument{
+			Argument: "q",
+			Cases: map[string]EffectCase{
+				"DROP": {Class: EffectIrreversible},
+				"drop": {Class: EffectReversible},
+			},
+		},
+	}
+	first := ResolveEffect(c, map[string]interface{}{"q": "DROP TABLE t"}).Class
+	for range 200 {
+		if got := ResolveEffect(c, map[string]interface{}{"q": "DROP TABLE t"}).Class; got != first {
+			t.Fatalf("a colliding table must resolve deterministically: got both %q and %q", first, got)
+		}
+	}
+}
+
+// TestResolvedClassNeverInheritsAnIncompatibleCompensation pins the compensable invariant
+// on the RESOLVED effect, not only on the authored one. A byArgument row that RAISES the
+// class inherited the base block's compensatingAction and produced exactly the pairing the
+// loader refuses — an irreversible action carrying something claiming to reverse it —
+// which suppressed the ceiling's no_compensating_action reason and put a false
+// compensating action on the escalation record a human is expected to act on.
+func TestResolvedClassNeverInheritsAnIncompatibleCompensation(t *testing.T) {
+	c := &EffectContract{
+		Class: EffectCompensable, CompensatingAction: "tool:restore_backup",
+		ByArgument: &EffectByArgument{
+			Argument: "query",
+			Cases: map[string]EffectCase{
+				"DROP": {Class: EffectIrreversible},
+				// A row that overlays nothing leaves the base contract intact — the
+				// contrast leg for the clearing rule below.
+				"UPDATE": {},
+			},
+		},
+	}
+	got := ResolveEffect(c, map[string]interface{}{"query": "DROP TABLE customers"})
+	if got.Class != EffectIrreversible {
+		t.Fatalf("class = %q, want irreversible", got.Class)
+	}
+	if got.CompensatingAction != "" {
+		t.Fatalf("an irreversible resolution must not carry a compensating action, got %q", got.CompensatingAction)
+	}
+	if _, ok := got.AuditDetails()["compensating_action"]; ok {
+		t.Fatal("the audit record must not claim a compensating action for an irreversible action")
+	}
+	ceiling := &EffectCeiling{MaxEffectClass: EffectCompensable, RequireCompensation: true}
+	_, reasons := ceiling.Exceeds(got)
+	var sawNoComp bool
+	for _, r := range reasons {
+		if r == "no_compensating_action" {
+			sawNoComp = true
+		}
+	}
+	if !sawNoComp {
+		t.Fatalf("the consequence gate must report the missing compensation, got %v", reasons)
+	}
+	// A row that stays compensable keeps the inherited action — the clearing rule applies
+	// to the RESOLVED class, so it must not strip a compensation that is still valid.
+	kept := ResolveEffect(c, map[string]interface{}{"query": "UPDATE t SET x = 1"})
+	if kept.Class != EffectCompensable || kept.CompensatingAction != "tool:restore_backup" {
+		t.Fatalf("a compensable resolution must keep its compensating action, got %+v", kept)
+	}
+}
+
+// TestCeilingWithOnlyRequireCompensationIsNotSet pins that a ceiling incapable of firing
+// does not report itself as active. Exceeds gates the compensation leg on being ABOVE the
+// class bound, so with no maxEffectClass it can never fire — and IsSet is what the wiring
+// gate (HasEffectCeiling) reads to decide whether a ceiling is in force at all.
+func TestCeilingWithOnlyRequireCompensationIsNotSet(t *testing.T) {
+	c := &EffectCeiling{RequireCompensation: true}
+	if c.IsSet() {
+		t.Fatal("a ceiling that can never fire must not report itself as set")
+	}
+	if over, reasons := c.Exceeds(ResolvedEffect{Class: EffectIrreversible, Annotated: true}); over {
+		t.Fatalf("and it must refuse nothing, got %v", reasons)
 	}
 }

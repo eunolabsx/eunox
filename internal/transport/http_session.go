@@ -539,7 +539,7 @@ func (p *HTTPProxy) runDriftCheckOrTeardown(ctx context.Context, sess *httpSessi
 	// path for why the session-start view is the right one). Keyed by session id, so each
 	// HTTP session on this shared per-route PDP baselines its own upstream independently.
 	if probeErr == nil {
-		route.pdp.RecordObservedToolHashes(pdp.WithSessionID(ctx, sess.id), raw)
+		route.pdp.RecordObservedToolHashes(pdp.WithCompleteToolListing(pdp.WithSessionID(ctx, sess.id)), raw)
 	}
 	if err := route.driftCheck(raw, sess.upstreamServerVersion, probeErr); err != nil {
 		// Record the refusal before teardown: a startup drift failure is the FM-5

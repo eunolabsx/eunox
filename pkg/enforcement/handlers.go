@@ -34,26 +34,7 @@ import (
 // missing key all return (nil, false) — exactly the "argument missing" signal a
 // missing flat key produces, which the callers already deny on.
 func ResolveArgument(args map[string]interface{}, ref string) (interface{}, bool) {
-	if !capability.IsArgumentPath(ref) {
-		v, ok := args[capability.ArgumentLiteralKey(ref)]
-		return v, ok
-	}
-	segs := capability.ArgumentPathSegments(ref)
-	if segs == nil {
-		return nil, false // malformed path: fail closed
-	}
-	var cur interface{} = args
-	for _, seg := range segs {
-		m, ok := cur.(map[string]interface{})
-		if !ok {
-			return nil, false
-		}
-		cur, ok = m[seg]
-		if !ok {
-			return nil, false
-		}
-	}
-	return cur, true
+	return capability.ResolveArgument(args, ref)
 }
 
 // BuildRegoInput constructs the standard Rego input document from an
@@ -1026,11 +1007,7 @@ func MatchAllowedValue(argValue interface{}, allowed []interface{}) bool {
 // gate belongs in argumentSchema, an external PolicyEvaluator, or the database's own
 // grants; do not grow a SQL parser here.
 func OperationVerb(s string) string {
-	fields := strings.Fields(s)
-	if len(fields) == 0 {
-		return ""
-	}
-	return strings.ToUpper(fields[0])
+	return capability.OperationVerb(s)
 }
 
 // numericEqual reports whether a and b are both numeric and equal in value,

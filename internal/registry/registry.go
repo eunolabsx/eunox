@@ -21,6 +21,7 @@
 package registry
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -184,7 +185,7 @@ func LoadCorpus(dir string) ([]Contract, error) {
 			return nil, fmt.Errorf("reading contract %q: %w", p, err)
 		}
 		var c Contract
-		dec := json.NewDecoder(strings.NewReader(string(data)))
+		dec := json.NewDecoder(bytes.NewReader(data))
 		dec.DisallowUnknownFields()
 		// UseNumber keeps a blast-radius literal exact: a magnitude above 2^53 widened to
 		// float64 would round, and the digest is computed over the decoded value, so the
@@ -192,6 +193,14 @@ func LoadCorpus(dir string) ([]Contract, error) {
 		dec.UseNumber()
 		if err := dec.Decode(&c); err != nil {
 			return nil, fmt.Errorf("parsing contract %q: %w", p, err)
+		}
+		// Decode reads only the FIRST JSON value, so a file holding two concatenated
+		// objects — a bad merge, an append where a rewrite was meant — would load the
+		// first and discard the second in silence. That is the shape this loader's
+		// fail-on-first-invalid rule exists to prevent: a contract that vanishes without
+		// an alarm is indistinguishable from one that was never there.
+		if dec.More() {
+			return nil, fmt.Errorf("parsing contract %q: trailing content after the first JSON object; one entry per file", p)
 		}
 		if err := c.Validate(); err != nil {
 			return nil, fmt.Errorf("%s: %w", filepath.Base(p), err)

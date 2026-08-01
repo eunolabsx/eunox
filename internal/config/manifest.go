@@ -1676,12 +1676,10 @@ func checkExperimentalTokenStaging(m *LocalManifest) error {
 		return fmt.Errorf("the top-level effectCeiling is experimental and requires schemaVersion %q (the flow+effect draft); this manifest declares schemaVersion %q, under which the key is not part of the grammar", ManifestSchemaVersionFlowEffectDraft, declared)
 	}
 	for i := range m.Capabilities {
-		if m.Capabilities[i].Effect != nil && declared != ManifestSchemaVersionFlowEffectDraft {
+		c := &m.Capabilities[i]
+		if c.Effect != nil && declared != ManifestSchemaVersionFlowEffectDraft {
 			return experimentalTokenStagingErr(i, "the effect contract block", ManifestSchemaVersionFlowEffectDraft, declared)
 		}
-	}
-	for i := range m.Capabilities {
-		c := &m.Capabilities[i]
 		for _, cond := range c.Conditions {
 			if req, staged := experimentalTokenVersions[cond.ConditionType()]; staged && declared != req {
 				return experimentalTokenStagingErr(i, "the "+cond.ConditionType()+" condition", req, declared)

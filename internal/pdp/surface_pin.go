@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"sync"
 
 	"github.com/eunolabs/eunox/pkg/capability"
@@ -130,7 +131,7 @@ func NewSurfaceBaseline() *SurfaceBaseline {
 // sessionID may be empty (a direct caller with no session): the empty string is its own
 // bucket rather than a skipped check, so an anonymous caller is still pinned. Sharing one
 // bucket can only over-block, never under-block.
-func (b *SurfaceBaseline) Observe(sessionID string, tools []ToolSurface) []SurfaceChange {
+func (b *SurfaceBaseline) Observe(sessionID string, tools []ToolSurface, complete bool) []SurfaceChange {
 	if b == nil {
 		return nil
 	}
@@ -138,8 +139,18 @@ func (b *SurfaceBaseline) Observe(sessionID string, tools []ToolSurface) []Surfa
 	defer b.mu.Unlock()
 	s := b.session(sessionID)
 
+	// A PARTIAL view (one page of a paginated tools/list) can baseline and re-diff each
+	// tool it contains — a surface change is per-tool and needs no knowledge of the rest —
+	// but it says nothing about which tools exist. Only a complete listing establishes the
+	// session's baseline for membership, and only a complete listing may report an
+	// addition or a removal; a page otherwise reported every tool on the OTHER pages as
+	// disappeared, on every pagination cycle, into the same stderr stream that carries
+	// genuine break findings.
 	first := !s.established
-	s.established = true
+	if complete {
+		s.established = true
+	}
+	reportMembership := complete && !first
 
 	var changes []SurfaceChange
 	seen := make(map[string]struct{}, len(tools))
@@ -149,7 +160,7 @@ func (b *SurfaceBaseline) Observe(sessionID string, tools []ToolSurface) []Surfa
 		switch {
 		case !known:
 			s.hashes[t.Name] = t.Hash
-			if !first {
+			if reportMembership {
 				changes = append(changes, SurfaceChange{Tool: t.Name, Kind: SurfaceAdded})
 			}
 		case baseline != t.Hash:
@@ -161,11 +172,18 @@ func (b *SurfaceBaseline) Observe(sessionID string, tools []ToolSurface) []Surfa
 			})
 		}
 	}
-	if !first {
+	if reportMembership {
+		// Sorted so a multi-tool removal reports in a stable order — the findings are read
+		// as a set, and map order would make two identical sessions log differently.
+		var gone []string
 		for name := range s.hashes {
 			if _, still := seen[name]; !still {
-				changes = append(changes, SurfaceChange{Tool: name, Kind: SurfaceRemoved})
+				gone = append(gone, name)
 			}
+		}
+		sort.Strings(gone)
+		for _, name := range gone {
+			changes = append(changes, SurfaceChange{Tool: name, Kind: SurfaceRemoved})
 		}
 	}
 	return changes
@@ -275,10 +293,13 @@ func (c SurfaceChange) LogLine() string {
 	}
 }
 
-// quote renders a tool name the way the drift LogLines do (%q), without pulling fmt in
-// for a single verb.
+// quote renders a tool name with %q — real escaping, the way internal/drift's LogLines
+// do. Concatenating bare quotes let an UPSTREAM-CONTROLLED tool name containing a quote
+// and a newline forge additional lines on the operator's stderr channel: a hostile server
+// could advertise a tool whose name closes the field and appends a benign-looking
+// `drift=tier2` line, masking a real break in the one stream an operator greps for them.
 func quote(s string) string {
-	return `"` + s + `"`
+	return fmt.Sprintf("%q", s)
 }
 
 // surfaceLog is where Tier-2 findings are written. It is a package variable solely so a
@@ -342,4 +363,28 @@ func WithDeclaredLabels(ctx context.Context, labels []string) context.Context {
 func declaredLabelsFromContext(ctx context.Context) []string {
 	labels, _ := ctx.Value(declaredLabelsKey{}).([]string)
 	return labels
+}
+
+// completeListingKey marks a tools/list observation as covering the WHOLE advertised
+// surface rather than one page of it.
+type completeListingKey struct{}
+
+// WithCompleteToolListing marks the tools/list result on this context as a complete
+// listing — every page fetched and concatenated, as the session-start drift probe does
+// (drift.FetchAllToolPages). Tier-2 reports tool additions and removals only for a
+// complete listing: a single page cannot distinguish "this tool is gone" from "this tool
+// is on another page", and reporting it anyway produced a false removal notice on every
+// pagination cycle. Surface CHANGES are per-tool and are detected either way.
+//
+// The default (unmarked) is the conservative one: a host's own tools/call-time listing is
+// treated as possibly partial, which suppresses membership findings but never a break.
+func WithCompleteToolListing(ctx context.Context) context.Context {
+	return context.WithValue(ctx, completeListingKey{}, true)
+}
+
+// completeToolListing reports whether this observation covers the whole advertised
+// surface. False unless a caller explicitly marked it.
+func completeToolListing(ctx context.Context) bool {
+	complete, _ := ctx.Value(completeListingKey{}).(bool)
+	return complete
 }

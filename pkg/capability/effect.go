@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"math/big"
 	"sort"
 	"strings"
@@ -308,11 +309,19 @@ func (c *EffectCeiling) Outcome() string {
 	return c.OnExceed
 }
 
-// IsSet reports whether the ceiling bounds anything. A ceiling that bounds nothing is
-// treated as absent rather than as a ceiling every action passes, so a half-written block
-// cannot read as "checked and fine".
+// IsSet reports whether the ceiling bounds anything it can actually evaluate. A ceiling
+// that bounds nothing is treated as absent rather than as a ceiling every action passes,
+// so a half-written block cannot read as "checked and fine".
+//
+// RequireCompensation deliberately does NOT count on its own: the compensation leg only
+// applies to an action ABOVE the class bound, so with no MaxEffectClass it can never fire.
+// Counting it would make IsSet — and the HasEffectCeiling wiring gate that reads it —
+// report an active ceiling that is structurally incapable of refusing anything, which is
+// precisely the state this predicate exists to deny. The manifest loader rejects that
+// shape too; this closes the same hole for the exported WithEffectCeiling seam, which
+// takes a ceiling directly and never passes through the loader.
 func (c *EffectCeiling) IsSet() bool {
-	return c != nil && (c.MaxEffectClass != "" || c.MaxBlastRadius != nil || c.RequireCompensation)
+	return c != nil && (c.MaxEffectClass != "" || c.MaxBlastRadius != nil)
 }
 
 // Exceeds reports whether a resolved effect is over the ceiling, and why. reasons are
@@ -452,6 +461,17 @@ func ResolveEffect(contract *EffectContract, args map[string]interface{}) Resolv
 		// is, which is a different remediation from "no contract at all".
 		eff.Class = EffectIrreversible
 	}
+	// Apply the compensable invariant to the RESOLVED effect, not only to the authored
+	// one. The loader enforces "a compensating action is what makes an action compensable"
+	// per declaration, but an argument-parameterized row that RAISES the class (a
+	// compensable base contract whose DROP case is irreversible) inherited the base
+	// block's compensatingAction and produced exactly the pairing the loader refuses — an
+	// irreversible action carrying something that claims to reverse it. That suppressed
+	// the ceiling's no_compensating_action reason and put a false compensating action on
+	// the escalation record a human is expected to act on.
+	if eff.Class != EffectCompensable {
+		eff.CompensatingAction = ""
+	}
 	if spec != nil {
 		eff.Unit = spec.Unit
 		if v, ok := spec.resolve(args); ok {
@@ -464,7 +484,12 @@ func ResolveEffect(contract *EffectContract, args map[string]interface{}) Resolv
 // match finds the case for the call's argument value. found is false when the argument is
 // absent or unusable and no default is declared.
 func (t *EffectByArgument) match(args map[string]interface{}) (EffectCase, bool) {
-	raw, ok := args[t.Argument]
+	// ResolveArgument, not a bare map index: the `argument` reference obeys the same
+	// "$." nested-path grammar every argument-matching condition obeys. A bare index
+	// made a documented reference like "$.filters.query" resolve to ABSENT, so the
+	// table never matched and a permissive default silently applied to the exact call
+	// the table was written to catch.
+	raw, ok := ResolveArgument(args, t.Argument)
 	if !ok {
 		if t.Default != nil {
 			return *t.Default, true
@@ -476,12 +501,13 @@ func (t *EffectByArgument) match(args map[string]interface{}) (EffectCase, bool)
 		return c, true
 	}
 	// Operation-style arguments carry the verb as the first token ("DROP TABLE users").
-	// Matching it is the same coarse first-verb rule allowedOperations applies, with the
-	// same documented limit: it is not a SQL parser, and a case never matches a verb
-	// buried after a leading CTE. The conservative direction is the safe one here — an
-	// unmatched value falls to Default, which is fail-closed when absent.
-	if first, _, cut := strings.Cut(key, " "); cut {
-		if c, hit := t.lookup(first); hit {
+	// Matching it goes through the SHARED OperationVerb, so it is literally the rule
+	// allowedOperations applies rather than a lookalike: splitting on a space alone made
+	// a newline- or tab-formatted statement — the norm from a model — miss its case and
+	// fall to the default. The documented limit is unchanged: it is not a SQL parser, and
+	// a case never matches a verb buried after a leading CTE.
+	if verb := OperationVerb(key); verb != "" && verb != key {
+		if c, hit := t.lookup(verb); hit {
 			return c, true
 		}
 	}
@@ -493,10 +519,22 @@ func (t *EffectByArgument) match(args map[string]interface{}) (EffectCase, bool)
 
 // lookup matches a case key case-insensitively, the way an operator writes SQL verbs and
 // enum-ish argument values.
+//
+// It scans in SORTED key order rather than Go's randomized map order. The loader rejects
+// two case- or whitespace-variant keys that fold together (validateEffectByArgument), so a
+// manifest can no longer produce a collision — but a programmatically built contract still
+// can, and under map-order iteration that made the resolved effect class differ between
+// two identical calls. A nondeterministic verdict is disqualifying for a layer whose whole
+// claim is determinism, so the tie is broken stably here as well as rejected at load.
 func (t *EffectByArgument) lookup(key string) (EffectCase, bool) {
-	for k, c := range t.Cases {
+	keys := make([]string, 0, len(t.Cases))
+	for k := range t.Cases {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
 		if strings.EqualFold(strings.TrimSpace(k), key) {
-			return c, true
+			return t.Cases[k], true
 		}
 	}
 	return EffectCase{}, false
@@ -524,14 +562,32 @@ func argumentMatchKey(raw interface{}) string {
 
 // resolve computes the call's blast-radius magnitude. ok is false when it cannot be
 // established, which every numeric bound treats as exceeded.
+//
+// A NEGATIVE result is rejected as unestablished rather than compared. A magnitude is
+// non-negative by construction — the loader refuses a negative bound and a negative fixed
+// value for exactly that reason — but the argument-supplied value is CALLER-controlled,
+// and an unchecked negative passed every bound: `amount: -1000000` compared below any max
+// and under any ceiling. Treating it as unquantified applies the same rule to the runtime
+// value that the loader applies to the authored one, and lands on the fail-closed side.
 func (s *BlastRadiusSpec) resolve(args map[string]interface{}) (*big.Float, bool) {
+	v, ok := s.resolveRaw(args)
+	if !ok || v == nil || v.Sign() < 0 || v.IsInf() {
+		return nil, false
+	}
+	return v, true
+}
+
+// resolveRaw reads the declared magnitude before the non-negativity check.
+func (s *BlastRadiusSpec) resolveRaw(args map[string]interface{}) (*big.Float, bool) {
 	if s.Value != nil {
 		return ParseBlastRadiusNumber(*s.Value)
 	}
 	if s.Argument == "" {
 		return nil, false
 	}
-	raw, ok := args[s.Argument]
+	// Same shared resolver the conditions use, so a "$." nested reference addresses the
+	// same value here as it does in an allowedValues on the same argument.
+	raw, ok := ResolveArgument(args, s.Argument)
 	if !ok {
 		return nil, false
 	}
@@ -541,7 +597,12 @@ func (s *BlastRadiusSpec) resolve(args map[string]interface{}) (*big.Float, bool
 	case float64:
 		// A caller that decoded arguments without UseNumber. Exactness is already lost
 		// upstream; carry the value through rather than reporting it unquantified, which
-		// would over-block every such caller.
+		// would over-block every such caller. NaN and Inf are screened FIRST:
+		// big.Float.SetFloat64 PANICS on NaN, and an unevaluable input must fail closed,
+		// never take down the enforcement goroutine.
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return nil, false
+		}
 		return new(big.Float).SetFloat64(v), true
 	case string:
 		// A numeric string ("250") is a magnitude; anything else is not. This does NOT

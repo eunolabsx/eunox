@@ -48,6 +48,12 @@ Tier-2 closes the two gaps `descriptionHash` leaves:
   it) and **hidden from `tools/list`**, so the catalog a host is shown never advertises a
   tool its call leg will reject. The break is **sticky**: reverting the surface does not
   re-open the tool, because a host may still hold the rewritten copy.
+- **Membership findings need a complete listing.** A single *page* of a paginated
+  `tools/list` says nothing about which tools exist, so additions and removals are reported
+  only for an observation that covers the whole advertised surface (the session-start probe,
+  which fetches every page). A partial page still baselines and re-diffs each tool it
+  carries — a surface change is per-tool — so a break is never suppressed by pagination;
+  only the membership notices are.
 - **Adds and removes are advisory.** MCP supports a changing tool list explicitly, and a
   new tool is still gated by the manifest allowlist, so an appearance or disappearance is
   logged, not denied. An added tool is baselined on sight, so a later change to *it* is a

@@ -1678,7 +1678,7 @@ func (p *ManifestPDP) DecidePromptGet(ctx context.Context, sessionID, promptName
 // read from ctx so a principal-scoped entry is hidden from an identity that does
 // not match it, keeping the visible list aligned with what the caller can invoke.
 func (p *ManifestPDP) FilterToolsList(ctx context.Context, result json.RawMessage) ListFilterResult {
-	return filterToolsListResult(result, p, jwtClaimsAsMap(ctx), sessionIDFromContext(ctx))
+	return filterToolsListResult(result, p, jwtClaimsAsMap(ctx), sessionIDFromContext(ctx), completeToolListing(ctx))
 }
 
 // FilterResourcesList implements ListFilterer for the manifest PDP.
@@ -2273,7 +2273,7 @@ func (p *ManifestPDP) poisonCandidates(names []string) {
 // enforce-mode filter call, for exactly which shapes fail closed and how widely. With NO
 // pinned tool there is nothing to protect, so the walk only counts entries.
 func (p *ManifestPDP) RecordObservedToolHashes(ctx context.Context, result json.RawMessage) int {
-	return p.armPinsFromToolsList(sessionIDFromContext(ctx), result)
+	return p.armPinsFromToolsList(sessionIDFromContext(ctx), result, completeToolListing(ctx))
 }
 
 // armPinsFromToolsList walks a tools/list result, records every pinned tool's live
@@ -2304,7 +2304,7 @@ func (p *ManifestPDP) RecordObservedToolHashes(ctx context.Context, result json.
 //     case-variant "tools" key (Go keeps one array while a host may render the other) —
 //     poisons every pin, because no entry in it can be believed. A plainly absent tools
 //     key is not ambiguous: a host renders no tools from it, so nothing is poisoned.
-func (p *ManifestPDP) armPinsFromToolsList(sessionID string, result json.RawMessage) (entryCount int) {
+func (p *ManifestPDP) armPinsFromToolsList(sessionID string, result json.RawMessage, completeListing bool) (entryCount int) {
 	pinned := p.hasPinnedTools()
 	// Tier-2 arms off the same pass, so the two pins read one decode of one response and
 	// cannot disagree about what the upstream advertised. It applies to EVERY tool, so
@@ -2412,7 +2412,7 @@ func (p *ManifestPDP) armPinsFromToolsList(sessionID string, result json.RawMess
 	// be visible to the keep decision for entry 1 (the caller filters only once this
 	// returns), exactly as the FM-5 poisoning is.
 	if tier2 {
-		emitSurfaceChanges(p.surface.Observe(sessionID, surfaces))
+		emitSurfaceChanges(p.surface.Observe(sessionID, surfaces, completeListing))
 	}
 	return len(entries)
 }
@@ -2486,7 +2486,7 @@ func ToolsKeyAmbiguous(raw json.RawMessage) bool {
 	return toolsKeyAmbiguous(raw)
 }
 
-func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims map[string]interface{}, sessionID string) ListFilterResult {
+func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims map[string]interface{}, sessionID string, completeListing bool) ListFilterResult {
 	// Arm the pins over the WHOLE catalog first, then filter. Recording and poisoning
 	// happen here — in the one pass the observe route shares (armPinsFromToolsList) — so
 	// the two routes cannot drift, and so every poison discovered anywhere in the array is
@@ -2514,7 +2514,7 @@ func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims
 	// to arm and the skip applies only to a PDP with neither pin active (a directly
 	// constructed one, where surface is nil).
 	if mdp.hasPinnedTools() || mdp.surface != nil {
-		mdp.armPinsFromToolsList(sessionID, resultBytes)
+		mdp.armPinsFromToolsList(sessionID, resultBytes, completeListing)
 	}
 
 	return filterListResult(resultBytes, listKeyTools, func(raw json.RawMessage) (bool, string) {

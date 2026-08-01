@@ -355,7 +355,7 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 			// failure records nothing — the PDP refuses to baseline an unreadable response
 			// — and the first host tools/list establishes the baseline instead.
 			if probeErr == nil {
-				p.pdp.RecordObservedToolHashes(pdp.WithSessionID(ctx, p.sessionID), raw)
+				p.pdp.RecordObservedToolHashes(pdp.WithCompleteToolListing(pdp.WithSessionID(ctx, p.sessionID)), raw)
 			}
 			if err := p.driftCheck(raw, p.upstreamServerVersion, probeErr); err != nil {
 				// Record the refusal before tearing down: a startup drift failure is the

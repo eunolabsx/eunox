@@ -151,6 +151,20 @@ func validateEffectByArgument(i int, t *capability.EffectByArgument) error {
 	if len(t.Cases) == 0 && t.Default == nil {
 		return fmt.Errorf("capability at index %d: effect.byArgument declares neither 'cases' nor 'default', so it decides nothing", i)
 	}
+	// Two keys that match the SAME argument value are an ambiguous table. Matching is
+	// case-insensitive after trimming (an operator writes "DROP" or "drop"), so
+	// {"DROP": irreversible, "drop": reversible} would leave which row wins to map
+	// iteration order — a nondeterministic effect class, which is disqualifying for a
+	// layer whose whole claim is determinism. Reject it here, the way every other
+	// case-variant ambiguity in this codebase is rejected rather than resolved.
+	folded := make(map[string]string, len(t.Cases))
+	for value := range t.Cases {
+		key := strings.ToLower(strings.TrimSpace(value))
+		if prev, dup := folded[key]; dup {
+			return fmt.Errorf("capability at index %d: effect.byArgument declares cases %q and %q, which match the same argument value (matching is case-insensitive after trimming); a single value cannot resolve to two effects, so remove or reconcile one", i, prev, value)
+		}
+		folded[key] = value
+	}
 	for value, c := range t.Cases {
 		if err := validateEffectCase(i, fmt.Sprintf("effect.byArgument.cases[%q]", value), c); err != nil {
 			return err
@@ -235,14 +249,17 @@ func validateEffectCeiling(c *capability.EffectCeiling) error {
 	default:
 		return fmt.Errorf("effectCeiling 'onExceed' is %q — valid outcomes are %s (the default) and %s", c.OnExceed, capability.OnExceedEscalate, capability.OnExceedDeny)
 	}
-	if !c.IsSet() {
-		return fmt.Errorf("effectCeiling bounds nothing: set 'maxEffectClass', 'maxBlastRadius', or 'requireCompensation' (a ceiling with only 'onExceed' never fires, which reads as \"checked and fine\")")
-	}
 	// RequireCompensation only ever applies to an action already over the class bound
 	// (see EffectCeiling.Exceeds), so on its own it is inert — and inert-but-present is
-	// exactly the shape that reads as a control when it is not.
+	// exactly the shape that reads as a control when it is not. Checked BEFORE the
+	// bounds-nothing test below so the author gets the specific diagnosis ("this key needs
+	// that one") rather than the generic one, which would send them to add a key they
+	// already wrote.
 	if c.RequireCompensation && c.MaxEffectClass == "" {
 		return fmt.Errorf("effectCeiling 'requireCompensation' needs 'maxEffectClass': it demands a compensating action only for an action ABOVE the class bound, so without one it never fires")
+	}
+	if !c.IsSet() {
+		return fmt.Errorf("effectCeiling bounds nothing: set 'maxEffectClass' or 'maxBlastRadius' (a ceiling with only 'onExceed' never fires, which reads as \"checked and fine\")")
 	}
 	return nil
 }

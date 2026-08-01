@@ -70,7 +70,13 @@ capabilities:
   one, never both. A **list** argument contributes its **length** ("how many things does
   this touch"). A non-numeric string has no magnitude and resolves to *unquantified*; it is
   not counted by characters, because inventing a magnitude is the inference this layer
-  refuses to do.
+  refuses to do. A **negative** argument value also resolves to unquantified: a magnitude
+  is non-negative by construction, so a negative one is caller-supplied nonsense, and
+  treating it as a very small number would pass every bound.
+- Every `argument` reference — here and in `byArgument` — obeys the **same `$.` nested-path
+  grammar** the conditions use: `$.filters.query` traverses into a nested object, and
+  `$$.x` addresses a literal top-level key named `$.x`. A malformed path resolves to
+  absent, fail closed.
 - **`ref`** pins the registry entry the block was authored from. eunox never fetches it —
   the decision path takes no network I/O — but the pin is **verified locally at load** by
   recomputing the digest of the inline block. Editing a pinned contract therefore fails
@@ -100,9 +106,19 @@ expression must be executed to be understood — the property the registry depen
 Two behaviors worth knowing:
 
 - The first whitespace-delimited token is matched too, so `DROP` matches
-  `DROP TABLE users`. This is the same coarse first-verb rule `allowedOperations` uses,
-  with the same documented limit: **it is not a SQL parser**. Pair it with a read-only role
-  and multi-statement execution disabled at the driver; never make it the sole control.
+  `DROP TABLE users` — and, because it splits on *any* whitespace, a multi-line or
+  tab-formatted statement resolves the same verb. This is literally the rule
+  `allowedOperations` uses (one shared implementation), with the same documented limit:
+  **it is not a SQL parser**. Pair it with a read-only role and multi-statement execution
+  disabled at the driver; never make it the sole control.
+- Two case keys that fold together (`DROP` and `drop`) are **rejected at load**: one value
+  cannot resolve to two effects, and leaving the tie to map order would make the verdict
+  nondeterministic.
+- A row that **raises** the class does not inherit the base contract's
+  `compensatingAction`. Compensable is the only class that may carry one, and that
+  invariant holds on the *resolved* effect, not just the authored one — otherwise an
+  irreversible row would carry something claiming to reverse it, and the ceiling's
+  `no_compensating_action` reason would never fire.
 - An **uncovered** value falls to `default`, and an **absent** `default` means the
   fail-closed reading (irreversible, unquantified) — *not* the base contract. A table that
   does not mention a value has not said the value is safe.
@@ -148,8 +164,10 @@ antecedent nor a stranded flow label — it was never forwarded.
 
 `requireCompensation` applies only to an action already **above** `maxEffectClass`;
 demanding a compensating action for a reversible read would be noise. It therefore requires
-`maxEffectClass` to be set, and the loader rejects it alone rather than letting an inert
-key read as a control.
+`maxEffectClass` to be set — the loader rejects it alone, and a ceiling carrying only
+`requireCompensation` does not count as set at all, so the library seam that takes a
+ceiling directly cannot end up with one that reports itself active while being
+structurally incapable of refusing anything.
 
 ## `escalate` is a refusal, not a pending state
 
