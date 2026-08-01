@@ -352,7 +352,20 @@ func dispatchToolsCall(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mc
 	if params.Arguments == nil {
 		params.Arguments = map[string]interface{}{}
 	}
-	dec := d.pdp.Decide(d.decideCtx(ctx), d.sessionID, pdp.EnforceTarget{Type: capability.TargetTypeTool, Name: params.Name}, params.Arguments, d.sourceIP)
+	// The attribution interface: a cooperating client may attribute this call's inputs in
+	// `_meta`, and those labels are unioned into the session's accumulated set for this
+	// call's sink check. A malformed block is a malformed REQUEST, not a silently ignored
+	// hint — a client that tried to attribute a call and got the shape wrong must find
+	// out, rather than proceed believing a tightening is in force when it is not.
+	declared, metaErr := capability.ParseContextManifest(params.Meta)
+	if metaErr != nil {
+		return d.malformedDeny(ctx, msg, "tools/call: "+metaErr.Error())
+	}
+	decideCtx := d.decideCtx(ctx)
+	if declared != nil {
+		decideCtx = pdp.WithDeclaredLabels(decideCtx, declared.Labels)
+	}
+	dec := d.pdp.Decide(decideCtx, d.sessionID, pdp.EnforceTarget{Type: capability.TargetTypeTool, Name: params.Name}, params.Arguments, d.sourceIP)
 	// Close the per-session decision critical section here — the decision and its flow/
 	// sequence state write are done — so the upstream forward below runs concurrently.
 	// Everything after this reads the settled dec.

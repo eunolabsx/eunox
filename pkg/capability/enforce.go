@@ -53,6 +53,14 @@ type EnforceRequest struct {
 	// context instead, so it never mutates a shared caller request (a data race). A
 	// direct BuildRegoInput caller may set it to surface directives itself.
 	Directives []Directive `json:"directives,omitempty"`
+	// DeclaredLabels carries a cooperating client's per-call attribution (the
+	// `io.eunolabs.context-manifest` block in the request's `_meta`): native flow labels
+	// it asserts THIS call's inputs carry. They are UNIONED into the session's
+	// accumulated set for this call's sink check and are never written into session
+	// state. Union-only is the security property, not a simplification — see
+	// attribution.go. Empty for every non-cooperating client, which is the default and
+	// costs nothing.
+	DeclaredLabels []string `json:"declaredLabels,omitempty"`
 }
 
 // EnforceRequestContext carries request attributes used during enforcement.

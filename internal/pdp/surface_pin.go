@@ -317,3 +317,29 @@ func sessionIDFromContext(ctx context.Context) string {
 	id, _ := ctx.Value(sessionIDKey{}).(string)
 	return id
 }
+
+// declaredLabelsKey types the context value carrying a cooperating client's per-call flow
+// attribution (the `io.eunolabs.context-manifest` block in the request's `_meta`) from the
+// transport into the PDP. It rides the context for the same reason the session id does:
+// the Decide* signatures take the target and its arguments, not the request envelope, and
+// widening them for an optional, additive hint would push it onto every PDP
+// implementation and test double.
+type declaredLabelsKey struct{}
+
+// WithDeclaredLabels returns a child context carrying a client's per-call flow
+// attribution. The labels are UNIONED into the session's accumulated set for that call's
+// sink check — never subtracted, and never written into session state. See
+// capability/attribution.go for why the interface is one-directional.
+func WithDeclaredLabels(ctx context.Context, labels []string) context.Context {
+	if len(labels) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, declaredLabelsKey{}, capability.NormalizeDeclaredLabels(labels))
+}
+
+// declaredLabelsFromContext returns the client-attributed labels, or nil when the client
+// attributed nothing — the default for every non-cooperating client.
+func declaredLabelsFromContext(ctx context.Context) []string {
+	labels, _ := ctx.Value(declaredLabelsKey{}).([]string)
+	return labels
+}

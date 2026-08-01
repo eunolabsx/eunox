@@ -21,6 +21,7 @@ Design and operational documentation for `eunox`.
 | [adr/](./adr/) | Architecture Decision Records — why specific load-bearing decisions were made, one short file per decision. |
 | [capability-manifest-guide.md](./capability-manifest-guide.md) | Manifest authoring: structure, conditions, anti-patterns. |
 | [effect-contracts.md](./effect-contracts.md) | The effect layer (experimental, `0.2-draft`): effect contracts, the `effectClass`/`blastRadius` conditions, the tool-agnostic `effectCeiling`, and the `escalate` outcome. Deliberately outside the manifest guide until the tokens are published. |
+| [attribution-interface.md](./attribution-interface.md) | The attribution interface (experimental): how a cooperating client attributes a call's inputs in `_meta`, and why the interface only ever adds labels. |
 | [interface-pinning-tier2.md](./interface-pinning-tier2.md) | Tier-2 interface pinning: auto-baselining every advertised tool surface per session and denying mid-session drift, plus the honest limit on what metadata comparison cannot catch. |
 | [../registry/README.md](../registry/README.md) | The effect-contract registry: corpus format, trust model (package signing, not behavioral verification), and how a manifest pins an entry. |
 | [threat-model-mcp.md](./threat-model-mcp.md) | Security threat model for the `eunox` proxy. |

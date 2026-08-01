@@ -1004,6 +1004,11 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 			Name: target.Name,
 		},
 		Claims: claims,
+		// A cooperating client's per-call flow attribution, if it sent one. Union-only at
+		// the sink (see capability/attribution.go), so an untrusted client's declaration
+		// can only produce more denials — which is what makes honoring it need no trust
+		// decision.
+		DeclaredLabels: declaredLabelsFromContext(ctx),
 	}
 
 	matched := p.findConstraint(target, claims)
