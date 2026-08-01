@@ -1090,10 +1090,13 @@ func (p *JWTPDP) audienceDeny(message string) capability.EnforceResponse {
 // HardDeny responses are excluded: the transport never downgrades them, so there is no
 // forwarded response to redact.
 //
-// It ALSO carries the inner's interface-pin verdict, which is the other half of the same
-// fail-open — see hardenOnBrokenInterface. Both live here because this is the one function
-// every short-circuiting JWT deny already passes through on its way to being forwarded.
-func (p *JWTPDP) withInnerForwardObligations(ctx context.Context, sessionID string, r capability.EnforceResponse, target EnforceTarget) capability.EnforceResponse {
+// It ALSO carries the two inner verdicts a short-circuit would otherwise lose, which are
+// the other halves of the same fail-open: the interface-pin break (hardenOnBrokenInterface)
+// and the effect ceiling (hardenOnEffectCeiling). All three live here because this is the
+// one function every short-circuiting JWT deny already passes through on its way to being
+// forwarded — and args is threaded in for the ceiling, whose verdict depends on the call's
+// arguments (a blast radius is routinely an argument's value).
+func (p *JWTPDP) withInnerForwardObligations(ctx context.Context, sessionID string, r capability.EnforceResponse, target EnforceTarget, args map[string]interface{}) capability.EnforceResponse {
 	if r.Decision == capability.DecisionAllow || len(r.Obligations) > 0 {
 		return r
 	}
@@ -1108,6 +1111,14 @@ func (p *JWTPDP) withInnerForwardObligations(ctx context.Context, sessionID stri
 		// A broken pin means "must not be forwarded", which outranks "may be forwarded with
 		// obligations" — so return before stamping them. A HardDeny is never downgraded, so
 		// it has no forwarded response to redact.
+		return hardened
+	}
+	// The ceiling runs only if the pin did not fire, mirroring decideTarget's own ordering:
+	// there the pin checks sit above findConstraint precisely so no later verdict can
+	// preempt them, and the ceiling is the LAST thing evaluateMatched reaches. A tool whose
+	// interface was rewritten mid-session is refused for that reason, not re-labelled as an
+	// approval request.
+	if hardened, over := mdp.hardenOnEffectCeiling(ctx, sessionID, r, target, args); over {
 		return hardened
 	}
 	return mdp.withForwardObligations(ctx, r, target)
@@ -1166,7 +1177,7 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 		}
 		return p.withInnerForwardObligations(ctx, sessionID, denyResponse(p.clock, capability.ErrCodeAuthorizationFailed, "jwtCapability",
 			"token carries no mcp.capabilities claim and the route has no manifest policy to fall back on; "+
-				"JWT mode denies by default — issue a token with capability claims or add a manifest policy to the route"), target)
+				"JWT mode denies by default — issue a token with capability claims or add a manifest policy to the route"), target, args)
 	}
 
 	// mcp.capabilities present → exhaustive allowlist; an unlisted target is denied
@@ -1188,7 +1199,7 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 		if claimNamesTargetButFailedToParse(claims, target) {
 			msg = fmt.Sprintf("a JWT capability claim names %s %q, but its condition suffix could not be parsed, so it grants nothing (see the eunox log for the parse error)", target.Type, target.Name)
 		}
-		return p.withInnerForwardObligations(ctx, sessionID, denyResponse(p.clock, capability.ErrCodeAuthorizationFailed, "jwtCapability", msg), target)
+		return p.withInnerForwardObligations(ctx, sessionID, denyResponse(p.clock, capability.ErrCodeAuthorizationFailed, "jwtCapability", msg), target, args)
 	}
 
 	// mcp.capabilities is an OR-list: the call is permitted if ANY matching entry's
@@ -1215,7 +1226,7 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 		break
 	}
 	if lastDeny != nil {
-		return p.withInnerForwardObligations(ctx, sessionID, *lastDeny, target)
+		return p.withInnerForwardObligations(ctx, sessionID, *lastDeny, target, args)
 	}
 
 	// JWT allows — intersect with the inner manifest PDP if configured (both sides

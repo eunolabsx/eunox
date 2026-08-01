@@ -99,6 +99,8 @@ func run(args []string) int {
 		return cmdAuditVerify(subArgs)
 	case "stats":
 		return cmdStats(subArgs)
+	case "contracts":
+		return cmdContracts(subArgs)
 	case "doctor":
 		return cmdDoctor(subArgs)
 	case "version", "--version", "-version":
@@ -134,6 +136,7 @@ Usage:
   eunox kill         [--port N | --redis-addr H:P] <session-id|all>
   eunox audit-verify [flags]
   eunox stats        [flags]
+  eunox contracts    [--dir <corpus-dir>] [--ref <contract-id>]
   eunox doctor       [flags]
   eunox version
 
@@ -150,6 +153,9 @@ Subcommands:
                   kill switch (the only channel for a stdio proxy).
   audit-verify    Verify HMAC signatures in the local audit log.
   stats           Print a denial count histogram from the audit log.
+  contracts       Verify a local effect-contract corpus (every declared digest recomputed
+                  from its content) and print the effect.ref pin an author copies into a
+                  manifest. Local only — the registry is never fetched.
   doctor          Print a user-initiated support bundle (redacted) for bug reports.
                   Nothing is uploaded — paste the output into your report manually.
   version         Print the binary version and exit.
@@ -2078,6 +2084,12 @@ Flags:
 		return 2
 	}
 
+	// Effect-contract coverage of the MERGED policy, which is what actually decides:
+	// annotating is what buys a capability out of maximum friction, so the ratio (and the
+	// names) is the operator's progress meter. Advisory — it never affects the exit code,
+	// since an unannotated capability is a conservative default, not a defect.
+	writeEffectCoverage(os.Stdout, "", merged)
+
 	if !*live {
 		return 0
 	}
@@ -2164,7 +2176,24 @@ func reportRouteOutcome(wf func(string, ...interface{}), wln func(...interface{}
 		wf("  FAIL  %v\n", outcome.StartupErr)
 		return 2, true
 	}
+	// Advisory, and never part of the exit code: an unannotated capability is the
+	// fail-closed default working as intended, not a config defect. Per route, because
+	// the ceiling and the capabilities it governs are both per route.
+	writeEffectCoverage(routeCoverageWriter{wf}, "  ", outcome.Merged)
 	return 0, false
+}
+
+// routeCoverageWriter adapts the (wf, wln) pair reportRouteOutcome is handed to the
+// io.Writer writeEffectCoverage takes, so the per-route and whole-manifest reports are
+// produced by ONE function rather than two that drift. reportRouteOutcome receives write
+// closures rather than the writer itself, which is why the adapter is needed at all.
+type routeCoverageWriter struct {
+	wf func(string, ...interface{})
+}
+
+func (w routeCoverageWriter) Write(p []byte) (int, error) {
+	w.wf("%s", p)
+	return len(p), nil
 }
 
 // validateConfigRoutes walks every upstream in cfg, validating each route's

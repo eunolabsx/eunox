@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/eunolabs/eunox/pkg/capability"
 )
@@ -247,6 +248,80 @@ func (e *Engine) checkEffectCeiling(eff *capability.ResolvedEffect, matched *cap
 		HardDeny: true,
 	})
 	return &resp
+}
+
+// CeilingVerdictFor answers ONE question — "does this action exceed the policy's effect
+// ceiling?" — for a constraint that has already been selected, WITHOUT evaluating a single
+// condition and WITHOUT committing any state. It returns the refusal the ceiling would
+// produce (an ESCALATION_REQUIRED escalate, or a plain deny per onExceed), or nil when the
+// policy sets no ceiling, no constraint was selected, or the action is within it.
+//
+// It exists for the COMPOSED case. A PDP wrapping this engine's PDP — the JWT layer — can
+// refuse a call on its own terms and short-circuit above the inner PDP, so evaluateMatched
+// never runs and the ceiling never evaluates. The call is still refused, but the KIND of
+// refusal is wrong in two ways that matter: the escalation never happens, so an action
+// that should have entered the approval queue silently does not and the escalation counts
+// under-report; and the composed refusal is a soft deny, which a route running --audit
+// downgrades to a FORWARD — so adding a JWT would forward a call the same manifest refuses
+// outright, inverting the rule that a token may only ever restrict.
+//
+// Non-committing is the whole design constraint, and it is why this answers the ceiling
+// question ALONE rather than replaying the full decision. Reaching the ceiling the normal
+// way means running the matched constraint's conditions, and some of those COMMIT: maxCalls
+// consumes a window slot, labelOutput writes a flow label, sequenceBlock writes an
+// antecedent. Running them for a call that is already refused and will never be forwarded
+// would leave exactly the phantom state evaluateMatched's ordering exists to prevent — the
+// reason checkEffectCeiling runs before the state commit in the first place. Trading a
+// wrong denial code for corrupted session state is not a fix. The ceiling's inputs are the
+// resolved effect of the matched constraint's contract and nothing else, so this cannot
+// disagree with the full path about whether the action is over the ceiling.
+//
+// What it deliberately does NOT reproduce: when a condition would have denied FIRST, the
+// full path returns that condition's verdict and never reaches the ceiling, while this
+// reports the ceiling. The caller composes a refusal for a call that is being refused
+// either way, so the difference is a harder refusal rather than a wrong one — and the
+// ceiling statement it carries is true regardless of which check the full path would have
+// stopped at. The caller must therefore only ever use this to HARDEN a refusal, never to
+// produce an allow, and never on a path that would otherwise forward.
+//
+// The flow-label peek is the one backend read here, and it is a pure Get, taken only for a
+// flow-relevant constraint. Its failure is swallowed rather than converted into a deny:
+// this is asked about a call that is ALREADY refused, so a label-store fault must not be
+// able to weaken (or replace) the refusal being hardened.
+func (e *Engine) CeilingVerdictFor(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint) *capability.EnforceResponse {
+	if req == nil || matched == nil || !e.effectCeiling.IsSet() {
+		return nil
+	}
+	requestID := NewRequestID()
+	now := e.clock.Now().UTC().Format(time.RFC3339Nano)
+
+	// One ResolveEffect of the matched constraint's contract against this call's
+	// arguments — the same single resolution evaluateMatched threads to the two effect
+	// conditions and the ceiling, so the composed verdict and a full-path verdict cannot
+	// disagree about what the call's effect was.
+	effect := capability.ResolveEffect(matched.Effect, req.Arguments)
+
+	var carriedLabels []string
+	if !e.skipFlow && constraintHasFlow(matched) {
+		// A pure read. "Which provenance produced this" is the first thing a human in the
+		// approval queue needs, and it is one of the consequence inputs the short-circuit
+		// was dropping, so it is worth the round trip on a constraint that has flow at all.
+		if labels, err := e.peekSessionLabels(ctx, req); err == nil {
+			carriedLabels = labels
+		}
+	}
+
+	resp := e.checkEffectCeiling(effect, matched, carriedLabels, requestID, now)
+	if resp == nil {
+		return nil
+	}
+	// Stamp the snapshot onto the response as evaluateMatched's defer does for every
+	// non-allow exit, so a composed escalation carries the same top-level field a
+	// full-path one does.
+	if resp.CarriedLabels == nil {
+		resp.CarriedLabels = carriedLabels
+	}
+	return resp
 }
 
 // ceilingConditionType is the conditionType stamped on a ceiling verdict. The ceiling is

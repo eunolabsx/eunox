@@ -1542,9 +1542,10 @@ func (p *ManifestPDP) withForwardObligations(ctx context.Context, r capability.E
 // Both pin reads are pure lookups against state armed by an earlier tools/list, so this
 // commits nothing: it cannot leave a sequenceBlock antecedent, a flow label, or a consumed
 // maxCalls slot behind for a call that is never forwarded. That is what makes it safe to
-// run on a path the inner PDP deliberately never reached — and it is also the reason this
-// covers the pins and NOT the effect ceiling, whose evaluation requires running the
-// matched constraint's conditions, some of which do commit.
+// run on a path the inner PDP deliberately never reached. The effect ceiling has the same
+// problem and needed a narrower answer, since reaching it normally means running conditions
+// that DO commit; hardenOnEffectCeiling covers it through the engine's non-committing
+// CeilingVerdictFor, and runs only when this one did not fire.
 //
 // Only tools/call carries an advertised surface to pin, matching the schema gate the two
 // blocks inside Decide use.
@@ -1581,6 +1582,86 @@ func (p *ManifestPDP) hardenOnBrokenInterface(sessionID string, r capability.Enf
 	// Obligations describe how to redact a FORWARDED response. This one is not forwarded.
 	r.Obligations = nil
 	return r, true
+}
+
+// hardenOnEffectCeiling re-stamps a refusal that some OTHER layer produced as the effect
+// ceiling's own refusal when the manifest's ceiling would have refused this action too.
+// over reports whether it fired.
+//
+// It is the ceiling's half of the wrapper problem hardenOnBrokenInterface solves for the
+// interface pins. A JWTPDP wrapping this PDP short-circuits above it on its own denials —
+// a target absent from mcp.capabilities, a failing JWT condition — so evaluateMatched
+// never runs and the ceiling never evaluates. The call is still refused, so this is not a
+// fail-open in the usual sense; what is lost is the KIND of refusal:
+//
+//   - The ESCALATION never happens. The ceiling's ESCALATION_REQUIRED is a hard,
+//     non-downgradable refusal carrying the consequence inputs a human acts on
+//     (ceiling_exceeded, effect_class, carried_labels). A plain AUTHORIZATION_FAILED
+//     carries none of them, so an action that should have entered the approval queue
+//     silently does not and `eunox stats` under-counts escalations.
+//   - The refusal is DOWNGRADABLE. A route running --audit forwards a soft deny, so a
+//     JWT-wrapped route forwards a call the same manifest without the JWT refuses
+//     outright. Adding a JWT weakened enforcement, which inverts "a JWT may only restrict".
+//
+// Unlike the pin reads — pure lookups against state an earlier tools/list armed — the
+// ceiling sits behind the matched constraint's conditions, and some of those COMMIT
+// (maxCalls consumes a window slot, labelOutput writes a flow label, sequenceBlock writes
+// an antecedent). Running them for a call that is already refused and will never be
+// forwarded would leave exactly the phantom state the engine's ordering exists to prevent.
+// So this goes through the engine's narrow, non-committing CeilingVerdictFor, which
+// evaluates the ceiling and NOTHING else; see that method for what the narrowing does and
+// does not reproduce.
+//
+// The gates below are the STRUCTURAL ones the real path applies before a ceiling could
+// ever be reached — no ceiling configured, no constraint selected for this caller, or a
+// constraint that does not permit this action — each of which means the manifest refuses
+// on its own terms and the ceiling never runs. They are all pure predicates, so applying
+// them here costs nothing and keeps the composed verdict faithful where it can be cheaply.
+//
+// The ceiling verdict becomes the PRIMARY response: its code and structured details are
+// the whole point (an AUTHORIZATION_FAILED with the pin's message appended would leave
+// stats under-counting escalations exactly as before). The wrapping layer's own reason is
+// appended to the message so an operator fixing the token still sees why authorization
+// failed.
+func (p *ManifestPDP) hardenOnEffectCeiling(ctx context.Context, sessionID string, r capability.EnforceResponse, target EnforceTarget, args map[string]interface{}) (capability.EnforceResponse, bool) {
+	if r.Decision == capability.DecisionAllow || r.Denial == nil || r.Denial.HardDeny {
+		return r, false
+	}
+	claims := jwtClaimsAsMap(ctx)
+	matched := p.findConstraint(target, claims)
+	if matched == nil || !containsAction(matched.Actions, requiredActionFor(target.Type)) {
+		return r, false
+	}
+	// jwtConditionArgs synthesizes the {"uri"}/{"name"} map DecideResourceRead and
+	// DecidePromptGet build, so a contract naming one of those resolves to the same value
+	// here that the full path would have resolved.
+	req := &capability.EnforceRequest{
+		SessionID:  sessionID,
+		TargetName: target.Name,
+		Arguments:  jwtConditionArgs(target, args),
+		Target: &capability.EnforceRequestTarget{
+			Type: string(target.Type),
+			Name: target.Name,
+		},
+		Claims:         claims,
+		DeclaredLabels: declaredLabelsFromContext(ctx),
+	}
+	verdict := p.engine.CeilingVerdictFor(ctx, req, matched)
+	if verdict == nil {
+		return r, false
+	}
+	out := *verdict
+	if out.Denial != nil && r.Denial.Message != "" {
+		denial := *out.Denial
+		denial.Message = denial.Message +
+			" (this call was also refused by the wrapping authorization layer: " + r.Denial.Message + ")"
+		out.Denial = &denial
+	}
+	// Obligations describe how to redact a FORWARDED response. Neither ceiling outcome is
+	// forwarded on this path — the escalate arm sets HardDeny, and the deny arm replaces a
+	// refusal that was already not going to be an allow.
+	out.Obligations = nil
+	return out, true
 }
 
 // directivesNamingTarget collects the directives of every capability whose target type +
@@ -1824,7 +1905,7 @@ func (p *ManifestPDP) DecidePromptGet(ctx context.Context, sessionID, promptName
 // read from ctx so a principal-scoped entry is hidden from an identity that does
 // not match it, keeping the visible list aligned with what the caller can invoke.
 func (p *ManifestPDP) FilterToolsList(ctx context.Context, result json.RawMessage) ListFilterResult {
-	return filterToolsListResult(result, p, jwtClaimsAsMap(ctx), sessionIDFromContext(ctx), completeToolListing(ctx))
+	return filterToolsListResult(result, p, jwtClaimsAsMap(ctx), sessionIDFromContext(ctx), CompleteToolListingFromContext(ctx))
 }
 
 // FilterResourcesList implements ListFilterer for the manifest PDP.
@@ -2491,7 +2572,7 @@ func (p *ManifestPDP) poisonCandidates(names []string) {
 func (p *ManifestPDP) RecordObservedToolHashes(ctx context.Context, result json.RawMessage) int {
 	// The per-entry verdicts are for a caller that goes on to FILTER the same bytes; this
 	// route forwards the catalog verbatim, so there is nothing to hand them to.
-	count, _ := p.armPinsFromToolsList(sessionIDFromContext(ctx), result, completeToolListing(ctx))
+	count, _ := p.armPinsFromToolsList(sessionIDFromContext(ctx), result, CompleteToolListingFromContext(ctx))
 	return count
 }
 

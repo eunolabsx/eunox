@@ -83,7 +83,30 @@ capabilities:
 - **`ref`** pins the registry entry the block was authored from. eunox never fetches it —
   the decision path takes no network I/O — but the pin is **verified locally at load** by
   recomputing the digest of the inline block. Editing a pinned contract therefore fails
-  until the author re-pins. See [`registry/README.md`](../registry/README.md).
+  until the author re-pins. `eunox contracts --ref <id>` prints the exact string to paste,
+  so the digest is never hand-computed. See [`registry/README.md`](../registry/README.md).
+
+## Operator surface
+
+Three things about the effect layer are visible from the CLI rather than only by reading
+YAML:
+
+| Question | Command |
+| --- | --- |
+| How much of my policy is annotated, and what is not? | `eunox validate <manifest…>` (also in `eunox doctor`) |
+| Is this contract corpus intact? | `eunox contracts --dir <path>` |
+| What do I paste into `effect.ref` for this entry? | `eunox contracts --dir <path> --ref <id>` |
+
+The coverage line is the progress meter on the flywheel below: under an `effectCeiling`
+every unannotated capability escalates, so the named worklist is what turns "everything is
+hitting the approval queue" into a list of files to edit. It is advisory and never changes
+`validate`'s exit code — an unannotated capability is the fail-closed default working as
+intended, not a defect.
+
+`eunox contracts` loads every entry, recomputes each declared digest against its own
+content, and rejects a duplicate id — the same checks the corpus test runs, reachable
+without writing Go. All of it is **local**: nothing is fetched, here or on the decision
+path.
 
 ### Argument-parameterized contracts
 
@@ -164,6 +187,26 @@ The ceiling can only ever **narrow**: it runs after a constraint has already all
 call, so it never admits anything the allowlist or the conditions denied. It runs **before**
 the session-state commit, so an over-ceiling call leaves neither a phantom `sequenceBlock`
 antecedent nor a stranded flow label — it was never forwarded.
+
+### Under a JWT-wrapped route
+
+A JWT layer refuses some calls on its own terms and short-circuits above the manifest PDP,
+so the ceiling would never evaluate for them. The call is still refused, but the *kind* of
+refusal matters: a plain `AUTHORIZATION_FAILED` carries none of the consequence inputs a
+human acts on, so the action never enters the approval queue and `eunox stats` under-counts
+escalations — and, being a soft deny, an `--audit` route **forwards** it, meaning adding a
+JWT would perform the very action the ceiling flagged. The wrapper therefore consults the
+ceiling itself and returns its verdict, appending the token's own refusal reason to the
+message so an operator fixing the token still sees it.
+
+That consultation is **non-committing** by construction: it evaluates the ceiling alone,
+never the matched constraint's conditions, because some of those commit (`maxCalls`,
+`labelOutput`, `sequenceBlock`) and replaying them for a call that will never be forwarded
+would leave exactly the phantom state the ordering above prevents. The ceiling's inputs are
+the resolved effect and nothing else, so the composed verdict cannot disagree with a
+full-path one about whether the action is over the bound. Where a *condition* would have
+denied first, the composed refusal is the ceiling's rather than that condition's — harder
+than the manifest's, which is the safe direction for a call that is refused either way.
 
 `requireCompensation` applies only to an action already **above** `maxEffectClass`;
 demanding a compensating action for a reversible read would be noise. It therefore requires

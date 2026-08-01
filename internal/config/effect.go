@@ -208,7 +208,7 @@ func (m *LocalManifest) HasEffectCeiling() bool {
 }
 
 // EffectAnnotatedCount reports how many capabilities carry an effect contract, for the
-// `stats`/`doctor` operator reports: under a ceiling, an unannotated capability is one
+// `validate`/`doctor` operator reports: under a ceiling, an unannotated capability is one
 // that will escalate, so the ratio is the operator's progress meter on the registry
 // flywheel.
 func (m *LocalManifest) EffectAnnotatedCount() int {
@@ -222,4 +222,33 @@ func (m *LocalManifest) EffectAnnotatedCount() int {
 		}
 	}
 	return n
+}
+
+// EffectUnannotatedTargets names the capabilities carrying NO effect contract, in
+// manifest order, deduplicated.
+//
+// The count alone is a progress meter; this is the worklist. Under an effectCeiling each
+// of these resolves to the fail-closed default (irreversible, unquantified) and therefore
+// escalates, so an operator asking "why is everything hitting the approval queue" needs the
+// names, not a ratio. Order is the manifest's own so the list reads against the file the
+// operator is about to edit; duplicates are dropped because two entries for one target
+// (different principals, different conditions) are one annotation job.
+func (m *LocalManifest) EffectUnannotatedTargets() []string {
+	if m == nil {
+		return nil
+	}
+	var out []string
+	seen := make(map[string]struct{}, len(m.Capabilities))
+	for i := range m.Capabilities {
+		if m.Capabilities[i].Effect != nil {
+			continue
+		}
+		t := m.Capabilities[i].Target
+		if _, dup := seen[t]; dup {
+			continue
+		}
+		seen[t] = struct{}{}
+		out = append(out, t)
+	}
+	return out
 }

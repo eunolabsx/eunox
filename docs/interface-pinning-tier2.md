@@ -56,12 +56,17 @@ Tier-2 closes the two gaps `descriptionHash` leaves:
   wrapper therefore re-stamps its refusal as hard when the pin is broken, keeping the
   wrapping layer's own code and message (an operator fixing the token still needs to see
   the authorization failure) and adding the pin break to it.
-- **Membership findings need a complete listing.** A single *page* of a paginated
+- **Membership findings need two complete listings.** A single *page* of a paginated
   `tools/list` says nothing about which tools exist, so additions and removals are reported
-  only for an observation that covers the whole advertised surface (the session-start probe,
-  which fetches every page). A partial page still baselines and re-diffs each tool it
-  carries — a surface change is per-tool — so a break is never suppressed by pagination;
-  only the membership notices are.
+  only for an observation that covers the whole advertised surface. Two kinds qualify: the
+  session-start probe, which fetches every page and **establishes** membership, and any
+  later host `tools/list` whose request carried no `cursor` and whose response carried no
+  `nextCursor` — the ordinary unpaginated shape — which is **compared** against it. A
+  finding needs both halves: a complete listing that is a session's first has nothing to be
+  a change from. A partial page still baselines and re-diffs each tool it carries — a
+  surface change is per-tool — so a break is never suppressed by pagination; only the
+  membership notices are. Against a *paginated* upstream the notices stay suppressed for
+  the life of the session, since no host listing is ever complete.
 - **Adds and removes are advisory.** MCP supports a changing tool list explicitly, and a
   new tool is still gated by the manifest allowlist, so an appearance or disappearance is
   logged, not denied. An added tool is baselined on sight, so a later change to *it* is a

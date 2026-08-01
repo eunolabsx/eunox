@@ -50,11 +50,27 @@ so a registry outage cannot change a verdict.
 
 The flow is:
 
-1. Find the entry for a tool you are writing policy for.
+1. Find the entry for a tool you are writing policy for — `eunox contracts` lists the
+   corpus, verifying every entry's digest against its own content as it goes.
 2. Copy its `effect` block into the capability, and set `effect.ref` to the entry's
-   `"<id>@<digest>"`.
+   `"<id>@<digest>"`. `eunox contracts --ref <id>` prints exactly that string, so the pin
+   is copied rather than hand-computed.
 3. eunox verifies the pin **locally at manifest load** by recomputing the digest of the
    inline block. A mismatch is a load error.
+
+```console
+$ eunox contracts --ref modelcontextprotocol/memory.delete_entities
+modelcontextprotocol/memory.delete_entities@sha256:3722a7d51f956e37275c957bb15295491ccdbffe5897bebadc309028ad125b67
+```
+
+Both are **local**: the digest is over the contract's own content, so verifying a corpus
+someone handed you and pinning an entry from it both work offline. `--dir` points at any
+corpus directory; nothing searches, and a path that does not exist is an error rather than
+a clean bill of health for an empty result.
+
+To see how much of a policy is annotated, `eunox validate` (and `eunox doctor`) report the
+ratio and name what is missing — under an `effectCeiling` those are exactly the capabilities
+that will escalate.
 
 ```yaml
 capabilities:

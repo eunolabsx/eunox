@@ -146,6 +146,12 @@ func (b *SurfaceBaseline) Observe(sessionID string, tools []ToolSurface, complet
 	// addition or a removal; a page otherwise reported every tool on the OTHER pages as
 	// disappeared, on every pagination cycle, into the same stderr stream that carries
 	// genuine break findings.
+	//
+	// The membership gate therefore needs a complete listing that is NOT the session's
+	// first, which means more than one caller has to be able to supply one. Both do: the
+	// session-start probe (which merges every page) establishes it, and any later host
+	// tools/list the transport judges unpaginated is comparable against it. See
+	// WithCompleteToolListing.
 	first := !s.established
 	if complete {
 		s.established = true
@@ -376,21 +382,38 @@ func declaredLabelsFromContext(ctx context.Context) []string {
 type completeListingKey struct{}
 
 // WithCompleteToolListing marks the tools/list result on this context as a complete
-// listing — every page fetched and concatenated, as the session-start drift probe does
-// (drift.FetchAllToolPages). Tier-2 reports tool additions and removals only for a
-// complete listing: a single page cannot distinguish "this tool is gone" from "this tool
-// is on another page", and reporting it anyway produced a false removal notice on every
-// pagination cycle. Surface CHANGES are per-tool and are detected either way.
+// listing. Tier-2 reports tool additions and removals only for a complete listing: a
+// single page cannot distinguish "this tool is gone" from "this tool is on another page",
+// and reporting it anyway produced a false removal notice on every pagination cycle.
+// Surface CHANGES are per-tool and are detected either way.
 //
-// The default (unmarked) is the conservative one: a host's own tools/call-time listing is
-// treated as possibly partial, which suppresses membership findings but never a break.
+// Two callers mark it, and BOTH are needed for the membership findings to exist at all.
+// The session-start drift probe fetches every page and concatenates them
+// (drift.FetchAllToolPages), which establishes the baseline; the transport marks a HOST
+// tools/list whose request carried no cursor and whose response carried no nextCursor
+// (transport.completeToolsListing), which is what a later complete listing can be compared
+// AGAINST. With only the probe marking, every complete observation was that session's
+// first, so an addition or a removal had nothing to be a change from — and a route with no
+// drift check configured (the probe is gated on one) never took a complete observation at
+// all.
+//
+// The default (unmarked) is the conservative one: a paginated listing is treated as
+// partial, which suppresses membership findings but never a break.
 func WithCompleteToolListing(ctx context.Context) context.Context {
 	return context.WithValue(ctx, completeListingKey{}, true)
 }
 
-// completeToolListing reports whether this observation covers the whole advertised
-// surface. False unless a caller explicitly marked it.
-func completeToolListing(ctx context.Context) bool {
+// CompleteToolListingFromContext reports whether this observation covers the whole
+// advertised surface. False unless a caller explicitly marked it with
+// WithCompleteToolListing.
+//
+// Exported as the reader half of that setter so the layer that decides completeness —
+// the transport, which is the only thing that can see a request's cursor and a response's
+// nextCursor together — can assert what it marked. The membership findings this gates are
+// advisory and logged, with no decision to observe, so without a reader the transport's
+// half of the contract would be untestable at the boundary that implements it. That is
+// precisely how it came to be wired such that the gate could never open.
+func CompleteToolListingFromContext(ctx context.Context) bool {
 	complete, _ := ctx.Value(completeListingKey{}).(bool)
 	return complete
 }

@@ -632,6 +632,18 @@ func dispatchList(ctx context.Context, d dispatchParams, msg mcp.RPCMsg, filter 
 		return mcp.ErrorResponse(msg.ID, jsonRPCCodeInternalError, "upstream returned a malformed list response (no result and no error)")
 	}
 
+	// Mark a tools/list observation that covers the WHOLE advertised surface, so the
+	// Tier-2 baseline can report a tool APPEARING or DISAPPEARING mid-session and not only
+	// a surface rewrite. Without this the only complete observation a session ever took was
+	// the session-start drift probe — always that session's FIRST, and therefore never
+	// comparable against an earlier one — so those two findings could not fire at all, and
+	// a session on a route with no drift check took no complete observation whatsoever. See
+	// completeToolsListing for what makes a listing complete; an incomplete one still
+	// baselines and re-diffs each tool it carries, which is where the pin BREAK comes from.
+	if msg.Method == capability.MethodToolsList && upResp.Result != nil && completeToolsListing(msg.Params, upResp.Result) {
+		ctx = pdp.WithCompleteToolListing(ctx)
+	}
+
 	// In audit (observe/wiretap) mode the enumeration must return the full upstream
 	// catalog: filtering here would hide tools the host can still CALL (deny
 	// downgraded to observe), contradicting "observe everything, block nothing".
@@ -712,6 +724,44 @@ func listAllowDetails(upResp mcp.RPCMsg, upstreamCount, filteredCount int, obser
 		details[audit.UpstreamErrorCodeKey] = upResp.Error.Code
 	}
 	return details
+}
+
+// completeToolsListing reports whether a tools/list request and the upstream response to
+// it, together, cover the WHOLE advertised tool set — the precondition Tier-2 requires
+// before it may conclude that a tool is missing rather than merely on another page.
+//
+// Both halves are load-bearing. A request carrying a `cursor` asked for ONE page by
+// definition, so its response says nothing about the rest. A response carrying a
+// `nextCursor` has more pages behind it. Only a cursor-less request answered with a
+// cursor-less response is the entire surface, and that is the ordinary shape: pagination
+// is optional in MCP and most servers return every tool in one reply.
+//
+// Every ambiguous input reports false — unparseable params, a non-object result, bytes
+// that do not decode. False is the conservative direction: it suppresses the advisory
+// added/removed findings and never suppresses a surface-change break, which is per-tool
+// and needs no membership knowledge.
+func completeToolsListing(params, result json.RawMessage) bool {
+	if len(params) > 0 {
+		// Cursor as a *string, not a string: a request that sends `"cursor": null` (a
+		// client filling an optional field) is asking for the first page, exactly as an
+		// absent key does, and must not be read as a paginated fetch.
+		var req struct {
+			Cursor *string `json:"cursor"`
+		}
+		if err := json.Unmarshal(params, &req); err != nil {
+			return false
+		}
+		if req.Cursor != nil && *req.Cursor != "" {
+			return false
+		}
+	}
+	var res struct {
+		NextCursor string `json:"nextCursor"`
+	}
+	if err := json.Unmarshal(result, &res); err != nil {
+		return false
+	}
+	return res.NextCursor == ""
 }
 
 // dispatchUnmapped is the fail-closed default: an unmapped MCP method is denied
