@@ -1,0 +1,20 @@
+{
+  "schemaVersion": "0.1",
+  "id": "modelcontextprotocol/filesystem.read_file",
+  "tool": "read_file",
+  "server": {
+    "name": "@modelcontextprotocol/server-filesystem",
+    "homepage": "https://github.com/modelcontextprotocol/servers"
+  },
+  "summary": "Reads a file's contents. No state changes.",
+  "attestation": {
+    "author": "eunolabs",
+    "source": "authored",
+    "review": "pending"
+  },
+  "digest": "sha256:1c31c480454555ba060182c381540b3bd959c13e8febf7e3fdcee79e62ca50a5",
+  "effect": {
+    "class": "reversible",
+    "idempotent": true
+  }
+}

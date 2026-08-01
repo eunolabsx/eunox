@@ -1,0 +1,23 @@
+{
+  "schemaVersion": "0.1",
+  "id": "modelcontextprotocol/filesystem.edit_file",
+  "tool": "edit_file",
+  "server": {
+    "name": "@modelcontextprotocol/server-filesystem",
+    "homepage": "https://github.com/modelcontextprotocol/servers"
+  },
+  "summary": "Applies line-based edits to a file in place.",
+  "attestation": {
+    "author": "eunolabs",
+    "source": "authored",
+    "review": "pending"
+  },
+  "digest": "sha256:de15c7abd1c4b580c3c7fd56365c0808cd184207cca9940cff2a0f97e778fbf3",
+  "effect": {
+    "class": "irreversible",
+    "blastRadius": {
+      "value": 1,
+      "unit": "files"
+    }
+  }
+}

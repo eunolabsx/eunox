@@ -1,0 +1,24 @@
+{
+  "schemaVersion": "0.1",
+  "id": "modelcontextprotocol/github.merge_pull_request",
+  "tool": "merge_pull_request",
+  "server": {
+    "name": "@modelcontextprotocol/server-github",
+    "homepage": "https://github.com/modelcontextprotocol/servers"
+  },
+  "summary": "Merges a pull request into its base branch.",
+  "notes": "Irreversible: a revert is a new commit, not an undo — the merge remains in history and anything triggered by it (CI, deploys, releases) has already run.",
+  "attestation": {
+    "author": "eunolabs",
+    "source": "authored",
+    "review": "pending"
+  },
+  "digest": "sha256:b041ed0f11b5135fd28c6de4d4a031cd52c35d5cc14bcd02b1e8d0fce6406eb4",
+  "effect": {
+    "class": "irreversible",
+    "blastRadius": {
+      "value": 1,
+      "unit": "merges"
+    }
+  }
+}

@@ -4,6 +4,8 @@
 package capability
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math/big"
@@ -131,11 +133,14 @@ type EffectContract struct {
 	// amount). It is resolved from the call's own arguments on the decision path — no
 	// callout, no inference — and its matched case overlays the fields above.
 	ByArgument *EffectByArgument `json:"byArgument,omitempty"`
-	// Ref optionally records the registry contract this block was authored from, as
-	// "<contract-id>@sha256:<hex>". eunox does not fetch it: the pin is provenance for a
-	// human reviewing the manifest and for the audit record, so the decision path stays
-	// local (no network on the decision path) and a registry outage cannot change a
-	// verdict.
+	// Ref optionally pins the registry contract this block was authored from, as
+	// "<contract-id>@sha256:<hex>", where the digest is EffectContractDigest of this very
+	// block. eunox never fetches it — the decision path stays local, so a registry outage
+	// cannot change a verdict — but the pin is still verifiable: the loader recomputes the
+	// digest of the inline block and refuses a mismatch. That is what makes it an
+	// integrity pin rather than a comment. Editing a contract after pinning it therefore
+	// fails at load until the author re-pins, which is the review step the registry exists
+	// to create.
 	Ref string `json:"ref,omitempty"`
 }
 
@@ -351,6 +356,39 @@ func exceedsNumber(value *big.Float, limit json.Number) bool {
 		return true
 	}
 	return value != nil && value.Cmp(lim) > 0
+}
+
+// EffectContractDigest returns the "sha256:<lowercase-hex>" digest of a contract's
+// CONTENT — every field except Ref, which cannot be inside its own digest.
+//
+// It is what makes a registry contract hash-pinnable, and it is why the effect vocabulary
+// had to stay a closed typed schema: you can pin a declaration and check it locally, but
+// pinning a policy program tells a reviewer nothing without executing it. The encoding is
+// encoding/json over the typed struct — field order is the struct's, and map keys (the
+// argument-parameterized cases) are sorted by encoding/json — so the same contract always
+// produces the same digest regardless of how the source document was written or ordered.
+func EffectContractDigest(c *EffectContract) (string, error) {
+	if c == nil {
+		return "", fmt.Errorf("cannot digest a nil effect contract")
+	}
+	content := *c
+	content.Ref = ""
+	b, err := json.Marshal(content)
+	if err != nil {
+		return "", fmt.Errorf("serializing effect contract for digest: %w", err)
+	}
+	sum := sha256.Sum256(b)
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
+}
+
+// SplitEffectRef splits a contract ref into its id and digest halves. ok is false for a
+// ref that is not "<contract-id>@sha256:<hex>" shaped.
+func SplitEffectRef(ref string) (id, digest string, ok bool) {
+	id, digest, ok = strings.Cut(ref, "@")
+	if !ok || strings.TrimSpace(id) == "" || digest == "" {
+		return "", "", false
+	}
+	return id, digest, true
 }
 
 // ParseBlastRadiusNumber converts a manifest numeric literal to an exact big.Float, so a

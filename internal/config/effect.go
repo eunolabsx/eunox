@@ -80,7 +80,7 @@ func validateEffectContract(i int, e *capability.EffectContract) error {
 	if err := validateBlastRadiusSpec(i, "effect.blastRadius", e.BlastRadius); err != nil {
 		return err
 	}
-	if err := validateEffectRef(i, e.Ref); err != nil {
+	if err := validateEffectRef(i, e); err != nil {
 		return err
 	}
 	return validateEffectByArgument(i, e.ByArgument)
@@ -179,20 +179,34 @@ func validateEffectCase(i int, where string, c capability.EffectCase) error {
 	return validateBlastRadiusSpec(i, where+".blastRadius", c.BlastRadius)
 }
 
-// validateEffectRef checks the registry provenance pin's shape:
-// "<contract-id>@sha256:<64 lowercase hex>". eunox never fetches it — the decision path
-// stays local — so this is the only check it gets, and a malformed pin must fail at load
-// rather than sit in a manifest looking like provenance it is not.
-func validateEffectRef(i int, ref string) error {
-	if ref == "" {
+// validateEffectRef verifies the registry pin: its shape
+// ("<contract-id>@sha256:<64 lowercase hex>") AND that the digest matches the inline
+// contract it is attached to.
+//
+// eunox never fetches the registry — the decision path stays local, so a registry outage
+// cannot change a verdict — but the pin is still fully checkable here, because the digest
+// is over the contract's own content. Verifying it is what makes `ref` an integrity pin
+// rather than a comment: without the check, a manifest could carry the reviewed
+// contract's id while enforcing something else entirely, which is the one thing a
+// hash-pinned registry exists to prevent. Editing a pinned contract therefore fails at
+// load until the author re-pins — the review step, enforced rather than requested.
+func validateEffectRef(i int, e *capability.EffectContract) error {
+	if e.Ref == "" {
 		return nil
 	}
-	id, digest, ok := strings.Cut(ref, "@")
-	if !ok || strings.TrimSpace(id) == "" {
-		return fmt.Errorf("capability at index %d: effect 'ref' %q must be \"<contract-id>@sha256:<hex>\" — the registry contract this block was authored from", i, ref)
+	_, digest, ok := capability.SplitEffectRef(e.Ref)
+	if !ok {
+		return fmt.Errorf("capability at index %d: effect 'ref' %q must be \"<contract-id>@sha256:<hex>\" — the registry contract this block was authored from", i, e.Ref)
 	}
 	if err := validateDescriptionHashFormat(digest); err != nil {
-		return fmt.Errorf("capability at index %d: effect 'ref' %q: %w", i, ref, err)
+		return fmt.Errorf("capability at index %d: effect 'ref' %q: %w", i, e.Ref, err)
+	}
+	actual, err := capability.EffectContractDigest(e)
+	if err != nil {
+		return fmt.Errorf("capability at index %d: effect 'ref' %q: %w", i, e.Ref, err)
+	}
+	if actual != digest {
+		return fmt.Errorf("capability at index %d: effect 'ref' %q pins digest %s but this contract's content digests to %s — the block was edited after it was pinned; re-review it and update the pin (eunox never fetches the registry, so the pin is only worth anything if it matches what is enforced)", i, e.Ref, digest, actual)
 	}
 	return nil
 }

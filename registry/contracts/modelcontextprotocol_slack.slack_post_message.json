@@ -1,0 +1,24 @@
+{
+  "schemaVersion": "0.1",
+  "id": "modelcontextprotocol/slack.slack_post_message",
+  "tool": "slack_post_message",
+  "server": {
+    "name": "@modelcontextprotocol/server-slack",
+    "homepage": "https://github.com/modelcontextprotocol/servers"
+  },
+  "summary": "Posts a message to a channel.",
+  "notes": "Irreversible and the archetypal external-message sink: deletion does not unsend, and the blast radius is the audience, not the call count.",
+  "attestation": {
+    "author": "eunolabs",
+    "source": "authored",
+    "review": "pending"
+  },
+  "digest": "sha256:acd1695cb562978eb2f58aa763638e938cf7defda3a297c6bb5cfc71c4727337",
+  "effect": {
+    "class": "irreversible",
+    "blastRadius": {
+      "value": 1,
+      "unit": "messages"
+    }
+  }
+}

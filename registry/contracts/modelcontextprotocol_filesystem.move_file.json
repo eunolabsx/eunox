@@ -1,0 +1,25 @@
+{
+  "schemaVersion": "0.1",
+  "id": "modelcontextprotocol/filesystem.move_file",
+  "tool": "move_file",
+  "server": {
+    "name": "@modelcontextprotocol/server-filesystem",
+    "homepage": "https://github.com/modelcontextprotocol/servers"
+  },
+  "summary": "Moves or renames a file.",
+  "notes": "Compensable: moving it back restores the prior state exactly, and the compensating action is the same tool with the arguments swapped.",
+  "attestation": {
+    "author": "eunolabs",
+    "source": "authored",
+    "review": "pending"
+  },
+  "digest": "sha256:6334bf5dcfcfbdcfc31e87f1516af1b28b572ce22245a918a85d9905ce60d997",
+  "effect": {
+    "class": "compensable",
+    "compensatingAction": "tool:move_file",
+    "blastRadius": {
+      "value": 1,
+      "unit": "files"
+    }
+  }
+}

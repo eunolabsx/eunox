@@ -39,7 +39,7 @@ func TestEffectGrammarAcceptsAWellFormedPolicy(t *testing.T) {
       blastRadius:
         argument: amount
         unit: usd
-      ref: eunox/payments.refund@sha256:0000000000000000000000000000000000000000000000000000000000000000
+      ref: eunox/payments.refund@sha256:69c29150ddda6ddcbb538bc20314a55c83445b8e58d6c50fa189342976e65cdb
     conditions:
       - type: effectClass
         allow: [reversible, compensable]
@@ -127,6 +127,15 @@ func TestEffectGrammarRejections(t *testing.T) {
 			name:    "a malformed contract ref",
 			caps:    "  - target: tool:t\n    actions: [call]\n    effect:\n      class: reversible\n      ref: not-a-ref\n",
 			wantErr: "contract-id",
+		},
+		{
+			// The pin is only worth anything if it matches what is enforced: a manifest
+			// carrying a reviewed contract's id alongside a different contract is exactly
+			// the substitution a hash-pinned registry exists to prevent, and eunox can
+			// catch it locally because the digest is over the contract's own content.
+			name:    "a contract edited after it was pinned",
+			caps:    "  - target: tool:t\n    actions: [call]\n    effect:\n      class: irreversible\n      ref: eunox/payments.refund@sha256:69c29150ddda6ddcbb538bc20314a55c83445b8e58d6c50fa189342976e65cdb\n",
+			wantErr: "was edited after it was pinned",
 		},
 		{
 			name:    "an effectClass condition with an empty allow set",

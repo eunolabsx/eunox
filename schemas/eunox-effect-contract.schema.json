@@ -1,0 +1,166 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://eunolabs.com/schemas/eunox-effect-contract.schema.json",
+  "title": "eunox effect contract (registry corpus entry)",
+  "description": "One entry in the eunox effect-contract registry: an effect contract plus the identity, provenance, and content digest a shared corpus needs. The registry is authoring-time input, never a runtime dependency — eunox does not fetch a contract while deciding. A manifest carries the contract inline and optionally pins the entry it was authored from via `effect.ref` (\"<id>@<digest>\"), which the manifest loader verifies locally by recomputing the digest. Trust model is package signing, not behavioral verification: a contract asserts what a tool does, and nothing here observes whether that is true.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "id", "tool", "server", "attestation", "digest", "effect"],
+  "properties": {
+    "schemaVersion": {
+      "description": "Corpus entry grammar version. Independent of the manifest schemaVersion: an entry is a distributed artifact with its own compatibility story.",
+      "const": "0.1"
+    },
+    "id": {
+      "description": "Corpus-unique contract identifier, \"<publisher>/<server>.<tool>\". It is the half of a manifest `effect.ref` before the '@'.",
+      "type": "string",
+      "minLength": 1
+    },
+    "tool": {
+      "description": "The advertised MCP tool name this contract describes.",
+      "type": "string",
+      "minLength": 1
+    },
+    "server": {
+      "description": "The MCP server that advertises the tool.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": {
+          "description": "Package or service identifier as its publisher spells it.",
+          "type": "string",
+          "minLength": 1
+        },
+        "homepage": {
+          "description": "Where a reviewer goes to check the claim.",
+          "type": "string"
+        },
+        "versionRange": {
+          "description": "Server versions whose advertised surface matches what was reviewed. Absent means the contract is believed stable across versions — which is itself a claim, so record it deliberately.",
+          "type": "string"
+        }
+      }
+    },
+    "summary": {
+      "description": "One-line description of what the tool does. Prose for a human reviewer; never parsed, never an input to a decision.",
+      "type": "string"
+    },
+    "notes": {
+      "description": "The reasoning behind the class, especially where the obvious reading is wrong (why an apparently undoable action is irreversible; why a compensable one is not therefore safe). This is the part a reviewer reviews.",
+      "type": "string"
+    },
+    "attestation": {
+      "description": "Provenance and review state — the trust surface, deliberately modest: authorship and review, not a verification claim.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["author", "source", "review"],
+      "properties": {
+        "author": { "type": "string", "minLength": 1 },
+        "source": {
+          "description": "authored = written by hand from the tool's documented behavior; vendor = contributed by the server's publisher; imported = derived from an orchestrator's existing compensation definitions (has-compensation implies compensable, neither-compensated-nor-idempotent implies irreversible).",
+          "enum": ["authored", "vendor", "imported"]
+        },
+        "review": {
+          "description": "Review state. NOT a correctness guarantee.",
+          "enum": ["pending", "community", "vendor"]
+        }
+      }
+    },
+    "digest": {
+      "description": "sha256 of the `effect` block's canonical JSON encoding — the value a manifest pins after the '@'. Two entries with identical contract content share a digest; identity lives in `id`, integrity in `digest`.",
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "effect": {
+      "$ref": "#/$defs/effectContract"
+    }
+  },
+  "$defs": {
+    "effectClass": {
+      "description": "The closed reversibility vocabulary, ordered least to most consequential. Flat and totally ordered on purpose: no lattice until a partner forces a partial order.",
+      "enum": ["reversible", "compensable", "irreversible"]
+    },
+    "blastRadius": {
+      "description": "How much one call affects. Exactly one of `value` or `argument`. Absent entirely means unquantified, which exceeds any finite bound — an action whose size cannot be established must not be treated as small.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "value": {
+          "description": "A fixed magnitude for every call to this target.",
+          "type": "number",
+          "minimum": 0
+        },
+        "argument": {
+          "description": "The call argument carrying the magnitude. A list argument contributes its LENGTH; a non-numeric string has no magnitude and resolves to unquantified rather than being counted by characters.",
+          "type": "string",
+          "minLength": 1
+        },
+        "unit": {
+          "description": "Free-form label for reports and audit records (\"usd\", \"rows\", \"recipients\"). Never compared — eunox models no unit algebra — so two contracts on one target must agree by convention, not by check.",
+          "type": "string"
+        }
+      },
+      "oneOf": [{ "required": ["value"] }, { "required": ["argument"] }]
+    },
+    "effectCase": {
+      "description": "One row of an argument-parameterized contract. A row is a contract, and obeys the same rules.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "class": { "$ref": "#/$defs/effectClass" },
+        "idempotent": { "type": "boolean" },
+        "compensatingAction": { "type": "string" },
+        "blastRadius": { "$ref": "#/$defs/blastRadius" }
+      }
+    },
+    "effectContract": {
+      "description": "What a call DOES, as PDP-addressable policy input — replacing a server's self-declared, unauthenticated hints. Note the absence of a `ref` here: a corpus entry IS the thing a ref points at, and a self-reference is excluded from the digest.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "class": { "$ref": "#/$defs/effectClass" },
+        "idempotent": {
+          "description": "The call can be safely repeated with no additional effect. It does not by itself make an action reversible — a repeatable outbound email is still irreversible — but it is what lets a retry count as one action.",
+          "type": "boolean"
+        },
+        "compensatingAction": {
+          "description": "The target that reverses this one. Required for class `compensable` and rejected on any other: \"compensable with nothing to compensate with\" is irreversible wearing a softer label, and the consequence gate must not accept that mislabel.",
+          "type": "string"
+        },
+        "blastRadius": { "$ref": "#/$defs/blastRadius" },
+        "byArgument": {
+          "description": "The argument-parameterized form: effect as a function of one argument, expressed as a STATIC decision table (db.query reversible for SELECT, irreversible for DROP). Resolved from the call's own arguments on the decision path — no callout, no inference. A table, not an expression, because a table is reviewable and pinnable and an expression must be executed to be understood.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["argument"],
+          "properties": {
+            "argument": { "type": "string", "minLength": 1 },
+            "cases": {
+              "description": "Argument value to contract overlay. For an operation-style argument the first whitespace-delimited token is matched too, so \"DROP\" matches \"DROP TABLE users\" — the same coarse first-verb rule allowedOperations uses, with the same limit that it is not a SQL parser.",
+              "type": "object",
+              "additionalProperties": { "$ref": "#/$defs/effectCase" }
+            },
+            "default": {
+              "description": "Applies when no case matches. ABSENT means the fail-closed default (irreversible, unquantified), not the base contract: a table that does not cover a value has not said the value is safe.",
+              "$ref": "#/$defs/effectCase"
+            }
+          },
+          "anyOf": [{ "required": ["cases"] }, { "required": ["default"] }]
+        }
+      },
+      "allOf": [
+        {
+          "description": "compensable requires a compensating action.",
+          "if": { "properties": { "class": { "const": "compensable" } }, "required": ["class"] },
+          "then": { "required": ["compensatingAction"] }
+        },
+        {
+          "description": "A compensating action is what makes an action compensable, so it may not appear with any other class.",
+          "if": { "required": ["compensatingAction"] },
+          "then": { "properties": { "class": { "const": "compensable" } }, "required": ["class"] }
+        }
+      ]
+    }
+  }
+}

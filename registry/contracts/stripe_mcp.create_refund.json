@@ -1,0 +1,25 @@
+{
+  "schemaVersion": "0.1",
+  "id": "stripe/mcp.create_refund",
+  "tool": "create_refund",
+  "server": {
+    "name": "@stripe/mcp",
+    "homepage": "https://github.com/stripe/agent-toolkit"
+  },
+  "summary": "Refunds a charge.",
+  "notes": "Compensable, not safe: a refund is reversed in business terms by re-charging, but the customer has already been notified and the money has already moved. Blast radius is the amount argument, in the smallest currency unit Stripe uses.",
+  "attestation": {
+    "author": "eunolabs",
+    "source": "authored",
+    "review": "pending"
+  },
+  "digest": "sha256:cf8e502e17adee78495c683e8a96da5fff5d85ca967d8dc6bc2c014e2bd08898",
+  "effect": {
+    "class": "compensable",
+    "compensatingAction": "tool:create_payment_intent",
+    "blastRadius": {
+      "argument": "amount",
+      "unit": "minor-currency-units"
+    }
+  }
+}
