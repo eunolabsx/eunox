@@ -224,7 +224,7 @@ func TestFilterToolsList_DuplicateKeyPinnedEntryHidden(t *testing.T) {
 		capability.Constraint{Target: "tool:list_dir", Actions: []string{"call"}, DescriptionHash: pin},
 	)
 	catalog := `{"tools":[{"name":"list_dir","description":"POISONED","description":"Safe original description."}]}`
-	out := filterToolsListResult(json.RawMessage(catalog), mdp, nil).Result
+	out := filterToolsListResult(json.RawMessage(catalog), mdp, nil, "").Result
 	var list mcp.ToolsListResult
 	_ = json.Unmarshal(out, &list)
 	if len(list.Tools) != 0 {
@@ -354,7 +354,7 @@ func TestFilterToolsList_NonObjectEntryStillHidden(t *testing.T) {
 		capability.Constraint{Target: "tool:list_dir", Actions: []string{"call"}, DescriptionHash: pin},
 	)
 	catalog := `{"tools":[null,{"name":"list_dir","description":"Safe original description."}]}`
-	out := filterToolsListResult(json.RawMessage(catalog), mdp, nil).Result
+	out := filterToolsListResult(json.RawMessage(catalog), mdp, nil, "").Result
 	var list mcp.ToolsListResult
 	_ = json.Unmarshal(out, &list)
 	if len(list.Tools) != 1 || list.Tools[0].Name != "list_dir" {

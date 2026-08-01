@@ -480,6 +480,12 @@ func dispatchList(ctx context.Context, d dispatchParams, msg mcp.RPCMsg, filter 
 		return denied
 	}
 
+	// The ListFilterer/RecordObservedToolHashes seams take (ctx, result) and no session —
+	// unlike the enforced Decide* paths, which receive it as a parameter — so the session
+	// id rides the context, as JWT claims already do. The Tier-2 interface baseline is
+	// per-session (see pdp.SurfaceBaseline), so both paths below need it.
+	ctx = pdp.WithSessionID(ctx, d.sessionID)
+
 	upResp, err := d.callUpstream(ctx, msg)
 	if err != nil {
 		return d.recordUpstreamFailure(ctx, msg, err, msg.Method, msg.Method)

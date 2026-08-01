@@ -347,6 +347,16 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 		}
 		if p.driftCheck != nil {
 			raw, probeErr := p.fetchUpstreamToolsRaw(ctx)
+			// Take the Tier-2 interface baseline from the session-start probe, the earliest
+			// view of the advertised surface this session has, so a rewrite between startup
+			// and the host's first tools/list already trips a pin break. It runs BEFORE the
+			// drift check so a session the check then refuses leaves no half-baselined
+			// state behind (ReleaseSession clears it on teardown either way). A probe
+			// failure records nothing — the PDP refuses to baseline an unreadable response
+			// — and the first host tools/list establishes the baseline instead.
+			if probeErr == nil {
+				p.pdp.RecordObservedToolHashes(pdp.WithSessionID(ctx, p.sessionID), raw)
+			}
 			if err := p.driftCheck(raw, p.upstreamServerVersion, probeErr); err != nil {
 				// Record the refusal before tearing down: a startup drift failure is the
 				// FM-5 tool-poisoning / rug-pull event this check exists to catch, so it

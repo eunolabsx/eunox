@@ -637,6 +637,16 @@ type ManifestPDP struct {
 	// only a name a later sequenceBlock can actually query needs history. See
 	// decideTarget's no-match branch.
 	sequenceAntecedents map[string]struct{}
+	// surface holds the Tier-2 interface pin: the advertised-surface hash every session
+	// first saw for each tool, and the sticky set of tools whose surface later changed
+	// (see surface_pin.go). Unlike pinnedTools it is not derived from the manifest — it
+	// pins what the UPSTREAM advertises, so it covers tools no operator pinned — and
+	// unlike observedToolHash/poisonedTools it is keyed per session, so a legitimate
+	// upstream upgrade re-baselines on the next session instead of denying for the life
+	// of the process. Always non-nil for a PDP built by NewManifestPDP; a nil value is a
+	// working "pinning off" state for a directly-constructed one.
+	surface *SurfaceBaseline
+
 	// anyLabelOutput is true when at least one capability carries a labelOutput directive.
 	// It gates the union scan (constraintWithUnionLabelOutput): a source read's taint is
 	// the union of labelOutput across ALL entries matching the request, not only the one
@@ -693,7 +703,7 @@ func NewManifestPDP(caps []capability.Constraint, engine *enforcement.Engine, ks
 			break
 		}
 	}
-	return &ManifestPDP{caps: caps, parsedTargets: parsed, engine: engine, ks: ks, observedToolHash: make(map[string]string), pinnedTools: pinned, sequenceAntecedents: collectSequenceAntecedents(caps), anyLabelOutput: anyLabelOutput}
+	return &ManifestPDP{caps: caps, parsedTargets: parsed, engine: engine, ks: ks, observedToolHash: make(map[string]string), pinnedTools: pinned, surface: NewSurfaceBaseline(), sequenceAntecedents: collectSequenceAntecedents(caps), anyLabelOutput: anyLabelOutput}
 }
 
 // collectSequenceAntecedents gathers every bare tool name any sequenceBlock condition
@@ -881,6 +891,11 @@ func (*ManifestPDP) CheckAudience(_ context.Context) *capability.EnforceResponse
 // store fault on teardown is swallowed rather than surfaced — the session is already
 // gone, and a Redis-backed store reclaims an orphaned key by idle TTL regardless.
 func (p *ManifestPDP) ReleaseSession(ctx context.Context, sessionID string) {
+	// Drop the Tier-2 interface baseline first, and unconditionally: it is local state
+	// that must be reclaimed even for a PDP built without an engine, and leaving it
+	// behind would both leak memory on a long-lived gateway and carry a broken pin into a
+	// reused session id.
+	p.surface.Release(sessionID)
 	if p.engine == nil {
 		return
 	}
@@ -956,6 +971,19 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 			return hardDenyResponse(p.engineClock(), capability.ErrCodeAuthorizationFailed,
 				fmt.Sprintf("tool %q description no longer matches the pinned descriptionHash (the upstream description changed after the session started); refusing to forward (fail closed)", target.Name))
 		}
+	}
+
+	// Tier-2 interface pin (tools/call leg). The FM-5 block above covers tools an
+	// operator pinned to a specific hash; this covers EVERY tool, against the surface the
+	// session first saw. It runs in the same position and for the same reason: keyed off
+	// the tool NAME rather than a selected constraint, before findConstraint, so a
+	// mid-session surface rewrite is a hard AUTHORIZATION_FAILED that an audit route
+	// cannot downgrade and forward to the rewritten upstream. Only tools/call carries an
+	// advertised surface to pin, so the schema==validateSchema gate scopes it exactly as
+	// the FM-5 block is scoped.
+	if schema == validateSchema && p.surface.Broken(sessionID, target.Name) {
+		return hardDenyResponse(p.engineClock(), capability.ErrCodeAuthorizationFailed,
+			fmt.Sprintf("tool %q advertised a different interface surface than when this session started (description, title, annotations, or a parameter description changed); refusing to forward (fail closed) — start a new session to re-baseline after a deliberate upstream change", target.Name))
 	}
 
 	// Find the most specific matching constraint, scoped to the target type and the
@@ -1645,7 +1673,7 @@ func (p *ManifestPDP) DecidePromptGet(ctx context.Context, sessionID, promptName
 // read from ctx so a principal-scoped entry is hidden from an identity that does
 // not match it, keeping the visible list aligned with what the caller can invoke.
 func (p *ManifestPDP) FilterToolsList(ctx context.Context, result json.RawMessage) ListFilterResult {
-	return filterToolsListResult(result, p, jwtClaimsAsMap(ctx))
+	return filterToolsListResult(result, p, jwtClaimsAsMap(ctx), sessionIDFromContext(ctx))
 }
 
 // FilterResourcesList implements ListFilterer for the manifest PDP.
@@ -2239,8 +2267,8 @@ func (p *ManifestPDP) poisonCandidates(names []string) {
 // mid-session poisoning pin unarmed. See armPinsFromToolsList, which both this and the
 // enforce-mode filter call, for exactly which shapes fail closed and how widely. With NO
 // pinned tool there is nothing to protect, so the walk only counts entries.
-func (p *ManifestPDP) RecordObservedToolHashes(_ context.Context, result json.RawMessage) int {
-	return p.armPinsFromToolsList(result)
+func (p *ManifestPDP) RecordObservedToolHashes(ctx context.Context, result json.RawMessage) int {
+	return p.armPinsFromToolsList(sessionIDFromContext(ctx), result)
 }
 
 // armPinsFromToolsList walks a tools/list result, records every pinned tool's live
@@ -2271,31 +2299,41 @@ func (p *ManifestPDP) RecordObservedToolHashes(_ context.Context, result json.Ra
 //     case-variant "tools" key (Go keeps one array while a host may render the other) —
 //     poisons every pin, because no entry in it can be believed. A plainly absent tools
 //     key is not ambiguous: a host renders no tools from it, so nothing is poisoned.
-func (p *ManifestPDP) armPinsFromToolsList(result json.RawMessage) (entryCount int) {
+func (p *ManifestPDP) armPinsFromToolsList(sessionID string, result json.RawMessage) (entryCount int) {
 	pinned := p.hasPinnedTools()
+	// Tier-2 arms off the same pass, so the two pins read one decode of one response and
+	// cannot disagree about what the upstream advertised. It applies to EVERY tool, so
+	// unlike the FM-5 gates below it is never skipped for want of a manifest pin.
+	tier2 := p.surface != nil
 	entries, outcome := decodeListEntries(result, listKeyTools)
 	switch outcome {
 	case listDecodeEmptyResult:
-		// No bytes at all: nothing was rendered to a host, so nothing is ambiguous.
+		// No bytes at all: nothing was rendered to a host, so nothing is ambiguous. No
+		// Tier-2 baseline is taken either — an absent response must not become the
+		// session's idea of the advertised surface.
 		return 0
 	case listDecodeBadEnvelope, listDecodeBadArray:
 		// The envelope or its array is unreadable, so no entry in it can be believed.
 		if pinned {
 			p.poisonAllPinned()
 		}
+		p.surface.BreakAll(sessionID)
 		return 0
 	case listDecodeKeyAbsent:
 		// No exact "tools" key. toolsKeyAmbiguous also catches a case-variant sibling
 		// ("Tools") that still decodes for a host whose reader binds it
 		// case-insensitively, and the proxy cannot tell what that host sees, so treat it
 		// as ambiguous; a plainly absent key is not.
-		if pinned && toolsKeyAmbiguous(result) {
-			p.poisonAllPinned()
+		if toolsKeyAmbiguous(result) {
+			if pinned {
+				p.poisonAllPinned()
+			}
+			p.surface.BreakAll(sessionID)
 		}
 		return 0
 	case listDecodeOK:
 	}
-	if !pinned {
+	if !pinned && !tier2 {
 		// Nothing to record or protect: skip the per-entry scan and decode entirely rather
 		// than walking every entry only to find none pinned.
 		return len(entries)
@@ -2303,8 +2341,15 @@ func (p *ManifestPDP) armPinsFromToolsList(result json.RawMessage) (entryCount i
 	// A duplicate or case-variant "tools" key leaves Go and the host reading different
 	// arrays, so no entry below can be believed.
 	if toolsKeyAmbiguous(result) {
-		p.poisonAllPinned()
+		if pinned {
+			p.poisonAllPinned()
+		}
+		p.surface.BreakAll(sessionID)
 		return len(entries)
+	}
+	var surfaces []ToolSurface
+	if tier2 {
+		surfaces = make([]ToolSurface, 0, len(entries))
 	}
 	for _, raw := range entries {
 		scan := scanToolEntry(raw)
@@ -2317,19 +2362,28 @@ func (p *ManifestPDP) armPinsFromToolsList(result json.RawMessage) (entryCount i
 				// an audit route where this pass is the only thing arming it. The pins an
 				// unreadable entry could be impersonating are unknown, not none.
 				p.poisonAllPinned()
+				p.surface.BreakAll(sessionID)
 				continue
 			}
 			p.poisonCandidates(scan.names)
+			// Same narrowing for Tier-2: deny only the names this entry could present. An
+			// entry whose bytes are ambiguous cannot be baselined at all (the proxy does
+			// not know which surface the host reads), so breaking is the only fail-closed
+			// option -- skipping would leave the tool unpinned for the session.
+			p.surface.MarkBroken(sessionID, scan.names...)
 			continue
 		}
 		// Decide on the NAME before paying for the decode. The unmarshal below pulls in
 		// the entry's whole inputSchema -- by far the largest thing on this path -- and
-		// everything it feeds is gated on the name being pinned: recordPinnedToolHash
-		// looks the name up in pinnedTools, and the decode-failure branch poisons
-		// candidates that poisonCandidates would filter to the same empty set. The scan
-		// above already produced the name set, so an unpinned entry (the common case on
-		// any manifest that pins one tool out of fifty) can be skipped outright.
-		if !p.anyNamePinned(scan.names) {
+		// everything the FM-5 half feeds is gated on the name being pinned:
+		// recordPinnedToolHash looks the name up in pinnedTools, and the decode-failure
+		// branch poisons candidates that poisonCandidates would filter to the same empty
+		// set. The scan above already produced the name set, so with Tier-2 off an
+		// unpinned entry (the common case on any manifest that pins one tool out of fifty)
+		// can be skipped outright. Tier-2 pins EVERY advertised tool, so when it is on the
+		// decode is unavoidable -- that is the cost of covering tools nobody pinned, and it
+		// is paid on */list, not on the call leg.
+		if !tier2 && !p.anyNamePinned(scan.names) {
 			continue
 		}
 		var entry toolListEntry
@@ -2338,9 +2392,22 @@ func (p *ManifestPDP) armPinsFromToolsList(result json.RawMessage) (entryCount i
 			// into the hashed surface: poison just this pin rather than skip, which would
 			// leave it unarmed on a poisoned entry a lenient host still renders.
 			p.poisonCandidates(scan.names)
+			p.surface.MarkBroken(sessionID, scan.names...)
 			continue
 		}
 		p.recordPinnedToolHash(entry)
+		if tier2 {
+			surfaces = append(surfaces, ToolSurface{
+				Name: entry.Name,
+				Hash: SurfaceHash(entry.Description, entry.Title, entry.Annotations, entry.InputSchema, entry.OutputSchema),
+			})
+		}
+	}
+	// One Observe per response, after the whole walk: a break discovered at entry N must
+	// be visible to the keep decision for entry 1 (the caller filters only once this
+	// returns), exactly as the FM-5 poisoning is.
+	if tier2 {
+		emitSurfaceChanges(p.surface.Observe(sessionID, surfaces))
 	}
 	return len(entries)
 }
@@ -2414,7 +2481,7 @@ func ToolsKeyAmbiguous(raw json.RawMessage) bool {
 	return toolsKeyAmbiguous(raw)
 }
 
-func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims map[string]interface{}) ListFilterResult {
+func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims map[string]interface{}, sessionID string) ListFilterResult {
 	// Arm the pins over the WHOLE catalog first, then filter. Recording and poisoning
 	// happen here — in the one pass the observe route shares (armPinsFromToolsList) — so
 	// the two routes cannot drift, and so every poison discovered anywhere in the array is
@@ -2437,8 +2504,12 @@ func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims
 	// skips it on the enforce route while the observe route still runs it, so this gate
 	// must be removed in the same change. Both sides read one predicate so the pairing is
 	// at least visible.
-	if mdp.hasPinnedTools() {
-		mdp.armPinsFromToolsList(resultBytes)
+	//
+	// Tier-2 widens the gate: it pins every advertised tool, so there is always something
+	// to arm and the skip applies only to a PDP with neither pin active (a directly
+	// constructed one, where surface is nil).
+	if mdp.hasPinnedTools() || mdp.surface != nil {
+		mdp.armPinsFromToolsList(sessionID, resultBytes)
 	}
 
 	return filterListResult(resultBytes, listKeyTools, func(raw json.RawMessage) (bool, string) {
@@ -2468,6 +2539,13 @@ func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims
 		// mirroring the call-leg deny so the list a host is shown never contains a tool
 		// its call leg will reject.
 		if _, pinned := mdp.pinnedTools[entry.Name]; pinned && mdp.isToolPoisoned(entry.Name) {
+			return false, ""
+		}
+		// Same rule for the Tier-2 pin, which needs no manifest entry: a tool whose
+		// advertised surface changed mid-session is hidden here as well as denied on the
+		// call leg, so the catalog a host is shown never advertises a tool the call leg
+		// will reject.
+		if mdp.surface.Broken(sessionID, entry.Name) {
 			return false, ""
 		}
 		return true, entry.Name

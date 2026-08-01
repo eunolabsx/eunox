@@ -1,13 +1,13 @@
-# Interface pinning — Tier-2 design
+# Interface pinning — Tier-2
 
-**Status:** design; not yet implemented. The behavior below is specified here and
-pinned by a committed, skipped test (`internal/drift/tier2_pinning_test.go`) that is
-red when unskipped. Removing that skip and making it pass is the entry point for the
-implementation.
+**Status:** implemented and on by default. No manifest key, no flag: every session
+auto-baselines the advertised surface of every tool the upstream reports and denies a
+tool whose surface later changes. The acceptance suite is
+`internal/pdp/surface_pin_test.go`.
 
 ## What ships today
 
-Interface conformance has two shipped pieces:
+Interface conformance has three pieces:
 
 - **Tier-1 (request side).** Argument validation, method mapping, and fail-closed
   handling of unmapped methods — a request that does not conform to the manifest is
@@ -18,47 +18,72 @@ Interface conformance has two shipped pieces:
   session init** (and in `validate --live`). The hash is computed by
   `capability.ComputeToolHash` over the tool's description plus its title, annotations,
   input schema, and output schema (`capability.ToolHashParams`). A mismatch is fatal.
+- **Tier-2 (this document).** The same hash, applied **automatically to every advertised
+  tool** and **re-diffed on every `tools/list`**, pinned to what the tool first advertised
+  in this session rather than to a hash an operator wrote.
 
-Two gaps remain, and Tier-2 closes them:
+Tier-2 closes the two gaps `descriptionHash` leaves:
 
-1. FM-5 only covers tools an operator **manually pinned**. An unpinned tool's
-   advertised surface can change with no finding.
-2. FM-5 only runs **at session init**. MCP lets a server change its tool list
-   mid-session (`notifications/tools/list_changed`, after which the client re-lists);
-   a surface that changes *after* init is not re-checked.
+1. FM-5 only covers tools an operator **manually pinned**. An unpinned tool's advertised
+   surface could change with no finding.
+2. FM-5 only ran **at session init**. MCP lets a server change its tool list mid-session
+   (`notifications/tools/list_changed`, after which the client re-lists); a surface that
+   changed *after* init was not re-checked.
 
-## What Tier-2 adds
+## Behavior
 
-**Automatically baseline the full advertised surface of every advertised tool at
-session init, and re-diff on any subsequent `tools/list`.**
+- **Baseline.** The first `tools/list` a session sees establishes the baseline: a
+  `toolName -> surfaceHash` map, where the hash is `capability.ComputeToolHash` over
+  exactly the bytes FM-5 pins (description + every parameter description at any depth +
+  title + annotations + `outputSchema` descriptions). When the manifest configures a
+  startup drift check, the session-start probe is that first list, so the baseline is
+  taken before the host has listed anything; otherwise the host's first `tools/list`
+  takes it.
+- **Re-diff on change.** Every later `tools/list` result in the session is re-hashed and
+  compared. This covers both the enforce-mode filter and the audit-mode (observe) path,
+  where the catalog is forwarded verbatim and `RecordObservedToolHashes` is the only pass
+  that can arm the pin.
+- **A changed surface is a pin break.** The tool is **denied on the `tools/call` leg**
+  with a hard `AUTHORIZATION_FAILED` (not downgradable — an `--audit` route cannot forward
+  it) and **hidden from `tools/list`**, so the catalog a host is shown never advertises a
+  tool its call leg will reject. The break is **sticky**: reverting the surface does not
+  re-open the tool, because a host may still hold the rewritten copy.
+- **Adds and removes are advisory.** MCP supports a changing tool list explicitly, and a
+  new tool is still gated by the manifest allowlist, so an appearance or disappearance is
+  logged, not denied. An added tool is baselined on sight, so a later change to *it* is a
+  break like any other; a removed tool's baseline is **retained**, so a tool that
+  disappears and returns with a rewritten surface still breaks.
+- **Untrustworthy bytes fail closed.** A `tools/list` entry the proxy cannot trust to
+  decode to what a host renders (a duplicate or case-variant key) cannot be baselined, so
+  every name it could be presenting is broken. An entry whose bytes aborted the trust scan
+  — leaving the names it could impersonate unknown rather than none — and an unreadable
+  envelope or `tools` array break every tool the session had baselined.
+- **Findings are logged.** Each finding emits one structured stderr line
+  (`[eunox] ERROR drift=tier2 tool="..." — ...`), matching the shape `internal/drift`
+  emits for FM-1..FM-6 so an operator greps interface findings uniformly.
 
-- **Baseline.** At session init, for every tool the upstream advertises, compute its
-  surface hash with the *same* primitive FM-5 uses (`capability.ComputeToolHash` over
-  name + description + input schema + title/annotations/output schema) and record a
-  `map[toolName]surfaceHash` baseline for the session. No manual pin required — every
-  advertised tool is pinned to what it first advertised.
-- **Re-diff on change.** On any later `tools/list` result in the same session
-  (including the re-list prompted by a `tools/list_changed` notification), recompute
-  each tool's surface hash and compare to the baseline. A changed hash, an added tool,
-  or a removed tool is a **pin break**.
-- **Fail closed on a break.** A tool whose surface no longer matches its baseline is
-  denied until re-review (the operator restarts or re-baselines deliberately), the same
-  posture FM-5 takes on a mismatch. Adds/removes are surfaced as findings.
-- **New audit record type.** A pin break emits a dedicated drift finding
-  (a new `drift.Kind`, e.g. a surface-pin break) and a distinct audit record, so a
-  SIEM rule can alert on interface drift specifically. It also feeds the registry: a
-  drift-vs-registry mismatch is a **community-advisory signal, not a scanner verdict**.
+## Scope: per session, not per process
 
-Tier-2 is a strict superset of the FM-5 machinery: same hash, applied to every tool
-automatically and re-checked on change, rather than to a hand-pinned subset at init
-only. It reuses `capability.ComputeToolHash` / `ToolHashParams` and the existing
-`internal/drift` comparison seam; it is **metadata comparison, not a new subsystem**.
+The baseline is keyed by **session**, and released on session teardown alongside the
+flow-label state. Two reasons:
+
+- A tool's advertised surface changing *within* a session is anomalous — servers evolve
+  across restarts, not mid-conversation — so a session-scoped pin has a low false-positive
+  rate while still catching the mid-session rewrite that is the poisoning carrier.
+- In HTTP/gateway mode one per-route PDP serves N sessions, each with its own upstream
+  process. A per-process baseline would let a session talking to an upgraded server poison
+  every other session on the route until the proxy restarted.
+
+**Recovery from a false positive is therefore a new session, not a proxy restart.** That
+is why Tier-2 ships without an off switch: the blast radius of a wrong verdict is one
+session, and an off switch is a fail-open an operator would reach for exactly once.
 
 ## Honest limit (do not overstate)
 
 Tier-2 is **pure metadata comparison**. It catches:
 
-- tool-description poisoning (a description rewritten to inject instructions), and
+- tool-description poisoning (a description, title, annotation, or parameter description
+  rewritten to inject instructions), and
 - silent interface drift (schemas or names changing under a session).
 
 It does **not** catch a rug pull where the **advertised interface is unchanged** but
@@ -66,27 +91,27 @@ the upstream's *behavior* changes — a server that returns the same tool metada
 doing something different on the wire. That is behavioral, not metadata, and Tier-2
 makes no claim to detect it. Detecting it would require watching server behavior, which
 is out of scope by design (eunox verifies attestations; it does not monitor servers).
-The documentation and any operator-facing copy must state this non-coverage explicitly
-rather than imply Tier-2 is a general anti-tamper guarantee.
+The break log line states this non-coverage inline, and operator-facing copy must do the
+same rather than imply Tier-2 is a general anti-tamper guarantee.
 
-## Wiring sketch
+## Where it lives
 
-- `internal/drift` gains a baseline type and a re-diff entrypoint (baseline built from
-  the first `tools/list`, compared against each later one), alongside the existing
-  `CheckManifestDrift`. The transport already probes `tools/list` at session start for
-  FM-5; Tier-2 records the baseline there and re-runs the diff whenever a `tools/list`
-  result passes through.
-- A new `drift.Kind` for a surface-pin break, threaded through `Warning` and the audit
-  record shape (a new record type, per the audit discipline: additive field/kind, a
-  sign-and-verify round-trip test, and a threat-model update).
-- No change to the manifest grammar: Tier-2 needs no new manifest keys — it pins what
-  the upstream advertises, not what the operator writes. (`descriptionHash` stays as the
-  explicit, stricter opt-in for a tool an operator wants pinned to a *specific* hash.)
+`internal/pdp/surface_pin.go` holds the baseline (`SurfaceBaseline`), the diff, and the
+sticky break set; `internal/pdp/pdp.go` arms it from the one `tools/list` pass that also
+arms the FM-5 pin, and consults it on the call leg and in the list filter.
 
-## The staged test
+**Deviation from the original design sketch, recorded:** that sketch put the baseline in
+`internal/drift` alongside the FM-1..FM-6 comparison. It is in `internal/pdp` instead,
+because Tier-2 must *deny* — and the call-leg decision and the list filter both live in
+the PDP, which sits **below** `internal/drift` in the layering (`internal/drift` imports
+`internal/pdp`, so the reverse is a cycle). Putting the state in `drift` would have meant
+either a second copy of the break set in the PDP or a new transport-mediated hook to push
+verdicts down a layer. The comparison itself is one line — hash equality against the same
+`capability.ComputeToolHash` primitive FM-5 uses — so nothing about the drift *policy* is
+duplicated by the move. The session-scoping decision above is the second deviation: the
+sketch said "for the session" and this implements exactly that, which the per-route PDP
+made a real design constraint rather than a wording detail.
 
-`internal/drift/tier2_pinning_test.go` encodes the acceptance criterion and is committed
-**skipped**, demonstrably **red when unskipped**: it asserts that a description change on
-an *unpinned* tool trips a pin break, which today it does not (only the opt-in FM-5 pin
-fires, and only at init). Removing the `t.Skip` and making the assertion pass is the
-first implementation step.
+No manifest grammar change: Tier-2 pins what the upstream advertises, not what the
+operator writes. `descriptionHash` stays as the explicit, stricter opt-in for a tool an
+operator wants pinned to a *specific* hash, verified at startup and fatal on mismatch.
