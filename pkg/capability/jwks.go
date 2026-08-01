@@ -177,7 +177,11 @@ func VerifyWithKeyRotation[T any](
 	kid string,
 	verify func(key *jose.JSONWebKey, freshKeySet bool) (result *T, err error),
 ) (*T, error) {
-	keys, err := cache.GetKeys(ctx)
+	// getKeysLive, not GetKeys: this call immediately narrows the result through
+	// FindKeys below, which always allocates its own fresh, cache-independent slice —
+	// so GetKeys' own copyKeySet copy would be transient garbage paid on every
+	// verification. See getKeysLive's doc.
+	keys, err := cache.getKeysLive(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("fetch JWKS: %w", err)
 	}
@@ -192,7 +196,7 @@ func VerifyWithKeyRotation[T any](
 		// TTL-respecting refresh would return the stale cached set). ForceRefreshForKID
 		// also rate-limits this so a flood of distinct unknown-kid tokens cannot
 		// amplify into one upstream fetch each.
-		keys, err = cache.ForceRefreshForKID(ctx, kid)
+		keys, err = cache.forceRefreshForKIDLive(ctx, kid)
 		if err != nil {
 			return nil, fmt.Errorf("refresh JWKS: %w", err)
 		}
@@ -262,7 +266,7 @@ func VerifyWithKeyRotation[T any](
 	// picked up immediately. A kid-bearing token that already refreshed above is NOT
 	// retried — the just-fetched set is current, so its failure is terminal.
 	if kid == "" || !refreshedForKid {
-		refreshed, ferr := cache.ForceRefreshForVerify(ctx)
+		refreshed, ferr := cache.forceRefreshForVerifyLive(ctx)
 		if ferr != nil {
 			// The token has already been checked against a key we DID hold (the cached
 			// set) and failed that signature check, so this is a signature failure, not a

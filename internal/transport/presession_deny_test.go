@@ -26,13 +26,14 @@ func TestPreSessionDenyLimiter_BoundsBurstAndCountsSuppressed(t *testing.T) {
 
 	admitted := 0
 	const attempts = 5000
+	catBurst := int(perCategoryDenyBurst)
 	for i := 0; i < attempts; i++ {
 		if ok, _ := l.admit(catAuth); ok {
 			admitted++
 		}
 	}
-	if admitted != preSessionDenyBurst {
-		t.Fatalf("a burst with no clock movement must admit exactly the burst size; admitted %d, want %d", admitted, preSessionDenyBurst)
+	if admitted != catBurst {
+		t.Fatalf("a burst with no clock movement must admit exactly the burst size; admitted %d, want %d", admitted, catBurst)
 	}
 
 	// The suppressed refusals are not lost: the next admitted record carries the count, so
@@ -42,7 +43,7 @@ func TestPreSessionDenyLimiter_BoundsBurstAndCountsSuppressed(t *testing.T) {
 	if !ok {
 		t.Fatal("a refill second must admit again")
 	}
-	if want := uint64(attempts - preSessionDenyBurst); suppressed != want {
+	if want := uint64(attempts - catBurst); suppressed != want {
 		t.Fatalf("suppressed = %d, want %d — every suppressed refusal must be folded into the next admitted record", suppressed, want)
 	}
 
@@ -101,7 +102,7 @@ func TestRefusalRollup_NamesItsScopeOnARouteStampedRecord(t *testing.T) {
 		t.Fatal("expected an admitted record carrying the rollup")
 	}
 	details, _ := rec["details"].(map[string]interface{})
-	want := float64(attempts - preSessionDenyBurst)
+	want := float64(attempts - int(perCategoryDenyBurst))
 	if got := details[detailSuppressedRefusalCount]; got != want {
 		t.Fatalf("%s = %v, want %v — the suppressed refusals must be folded into the next admitted record", detailSuppressedRefusalCount, got, want)
 	}
@@ -159,8 +160,10 @@ func TestRefusalLimiter_OneCategoryFloodDoesNotEraseAnother(t *testing.T) {
 	for i := 0; i < 5000; i++ {
 		proxy.recordPreSessionDeny(req, "ORIGIN_REJECTED", catOrigin, nil)
 	}
-	// The control-token attempts that follow must still be recorded in full.
-	const controlAttempts = 10
+	// The control-token attempts that follow must still be recorded in full — kept
+	// comfortably under catControl's own per-category burst so this stays a test of
+	// cross-category fairness, not a second bound-exhaustion test.
+	controlAttempts := int(perCategoryDenyBurst) - 1
 	for i := 0; i < controlAttempts; i++ {
 		proxy.recordPreSessionDeny(req, codeControlAuthFailed, catControl, nil)
 	}
@@ -183,8 +186,8 @@ func TestRefusalLimiter_OneCategoryFloodDoesNotEraseAnother(t *testing.T) {
 			origin++
 		}
 	}
-	if origin != preSessionDenyBurst {
-		t.Errorf("wrote %d origin refusal records, want the burst size %d — the flood must still be bounded", origin, preSessionDenyBurst)
+	if want := int(perCategoryDenyBurst); origin != want {
+		t.Errorf("wrote %d origin refusal records, want the burst size %d — the flood must still be bounded", origin, want)
 	}
 }
 
@@ -225,8 +228,11 @@ func TestPreSessionDenyLimiter_RefillIsRateBounded(t *testing.T) {
 	l := newPreSessionDenyLimiter()
 	l.setNow(func() time.Time { return now })
 
+	catBurst := int(perCategoryDenyBurst)
+	catRate := int(perCategoryDenyRate)
+
 	// Drain the burst.
-	for i := 0; i < preSessionDenyBurst; i++ {
+	for i := 0; i < catBurst; i++ {
 		if ok, _ := l.admit(catAuth); !ok {
 			t.Fatalf("burst token %d should have been admitted", i)
 		}
@@ -238,13 +244,13 @@ func TestPreSessionDenyLimiter_RefillIsRateBounded(t *testing.T) {
 	// One second of refill yields exactly the per-second rate, not more.
 	now = base.Add(time.Second)
 	admitted := 0
-	for i := 0; i < preSessionDenyRatePerSec*10; i++ {
+	for i := 0; i < catRate*10; i++ {
 		if ok, _ := l.admit(catAuth); ok {
 			admitted++
 		}
 	}
-	if admitted != preSessionDenyRatePerSec {
-		t.Fatalf("one second of refill admitted %d, want %d", admitted, preSessionDenyRatePerSec)
+	if admitted != catRate {
+		t.Fatalf("one second of refill admitted %d, want %d", admitted, catRate)
 	}
 }
 
@@ -256,7 +262,7 @@ func TestPreSessionDenyLimiter_BackwardsClockDoesNotGrantTokens(t *testing.T) {
 	now := base
 	l := newPreSessionDenyLimiter()
 	l.setNow(func() time.Time { return now })
-	for i := 0; i < preSessionDenyBurst; i++ {
+	for i := 0; i < int(perCategoryDenyBurst); i++ {
 		l.admit(catAuth)
 	}
 	now = base.Add(-time.Hour)

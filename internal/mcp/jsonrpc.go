@@ -661,46 +661,42 @@ func (mw *MsgWriter) Write(msg RPCMsg) error {
 	// reporting one. n == len(data) with a non-nil error (which io.Writer permits) is NOT
 	// poison: the whole frame landed.
 	switch {
+	case n < len(data) && mw.deadliner != nil && errors.Is(err, os.ErrDeadlineExceeded):
+		// A short write attributable to the deadline, whether it flushed nothing (n == 0,
+		// the pipe was already wedged) or a partial frame (n > 0, a frame larger than the
+		// free buffer against an upstream that stopped draining stdin): the same physical
+		// failure either way, differing only in how much happened to fit in the kernel
+		// buffer before the deadline fired. n < len(data) subsumes n == 0 because every
+		// frame this writer emits ends in '\n' (appended above), so a complete write is
+		// always n == len(data) and there is no third byte-count case to keep separate.
+		// This used to be two arms — split on the byte count first, deadline-checked only
+		// inside the partial-write one — which is exactly how the classification drifted:
+		// the partial-write message formatted "%d of %d bytes" and the zero-write one did
+		// not, so the same wedged pipe read two different ways on the tape depending on
+		// frame size. %w on the cause: %v would drop os.ErrDeadlineExceeded (and the
+		// net.Error the poller returns) out of the chain, so errors.Is/As for a deadline
+		// would go false on this value — and it is latched as poisonErr and returned
+		// verbatim from every later Write. upstreamErrInfo matches the sentinel first
+		// today, but its default arm has a net.Error timeout fallback this error must stay
+		// able to satisfy. A deadline error accompanying a COMPLETE write (n == len(data),
+		// which io.Writer permits) does not match this case at all: the frame landed, so
+		// poisoning the writer would tear down a healthy stream and put a fabricated
+		// UPSTREAM_TIMEOUT on the tape for a call that was delivered.
+		err = fmt.Errorf("%w: %d of %d bytes: %w", ErrUpstreamWriteTimeout, n, len(data), err)
+		mw.poisonErr = err
+		justPoisoned = true
 	case n > 0 && n < len(data):
-		// A distinct sentinel from the deadline case: the framing outcome is the same, the
-		// cause is not, and the audit tape must not record a crashed upstream as a timeout.
-		//
-		// Except when the cause IS the deadline. On a pollable pipe, a frame larger than
-		// the free buffer against an upstream that stopped draining stdin returns
-		// (n > 0, os.ErrDeadlineExceeded): the same physical failure as the n == 0 arm
-		// below, differing only in whether the frame happened to fit. Keying the sentinel
-		// purely on byte count recorded that one failure as UPSTREAM_TIMEOUT for a small
-		// frame and UPSTREAM_ERROR for a large one — precisely the split classification
-		// these two sentinels exist to prevent. The framing is desynced either way (the
-		// poison below is unconditional); only the recorded CAUSE differs, and the cause
-		// here is the deadline.
+		// A distinct sentinel from the deadline case above: the framing outcome is the
+		// same, the cause is not, and the audit tape must not record a crashed upstream as
+		// a timeout. A >PIPE_BUF write interrupted by EPIPE, ENOSPC, or a signal leaves
+		// n < len(data) just the same as a deadline would (already ruled out by the case
+		// above), and the framing is equally desynced; keyed on the byte count rather than
+		// on err, because a short write is a desync whether or not the writer honored
+		// io.Writer's contract of reporting one.
 		if err == nil {
 			err = io.ErrShortWrite
 		}
-		if mw.deadliner != nil && errors.Is(err, os.ErrDeadlineExceeded) {
-			// %w on the cause too, matching the desync arm below: %v would drop
-			// os.ErrDeadlineExceeded (and the net.Error the poller returns) out of the
-			// chain, so errors.Is/As for a deadline would go false on this value — and it
-			// is latched as poisonErr and returned verbatim from every later Write.
-			// upstreamErrInfo matches the sentinel first today, but its default arm has a
-			// net.Error timeout fallback this error must stay able to satisfy.
-			err = fmt.Errorf("%w: %d of %d bytes: %w", ErrUpstreamWriteTimeout, n, len(data), err)
-		} else {
-			err = fmt.Errorf("%w: %d of %d bytes: %w", ErrFrameDesync, n, len(data), err)
-		}
-		mw.poisonErr = err
-		justPoisoned = true
-	case n == 0 && mw.deadliner != nil && errors.Is(err, os.ErrDeadlineExceeded):
-		// A deadline expiry that wrote nothing left the framing intact, but the pipe is
-		// wedged and the session is torn down either way; keep the established behavior.
-		//
-		// Gated on n == 0 for the same reason the partial-write arm is keyed on the byte
-		// count: a deadline error accompanying a COMPLETE write (n == len(data), which
-		// io.Writer permits) means the frame landed, so poisoning the writer would tear
-		// down a healthy stream and put a fabricated UPSTREAM_TIMEOUT on the tape for a
-		// call that was delivered — the misclassification the ErrFrameDesync /
-		// ErrUpstreamWriteTimeout split exists to prevent, in the other direction.
-		err = fmt.Errorf("%w: %v", ErrUpstreamWriteTimeout, err)
+		err = fmt.Errorf("%w: %d of %d bytes: %w", ErrFrameDesync, n, len(data), err)
 		mw.poisonErr = err
 		justPoisoned = true
 	}

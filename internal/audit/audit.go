@@ -30,7 +30,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode/utf8"
 
 	"github.com/eunolabs/eunox/internal/config"
 	"github.com/eunolabs/eunox/pkg/capability"
@@ -1349,16 +1348,20 @@ func (s *Sink) Record(ctx context.Context, p RecordParams) {
 		AgentID:     agentID,
 		TaskID:      taskID,
 		UserID:      userID,
-		// Route provenance is operator-supplied (config route name, manifest version,
-		// computed digest) rather than attacker-supplied, so these are bounds of last
-		// resort — but writeRecord's "already bounded at Record() time" invariant covers
-		// the whole envelope, not the attacker-influenced subset, and boundFieldTo is
-		// also where invalid UTF-8 is normalized to U+FFFD. Skipping it here left three
-		// fields whose bytes could round-trip differently through the HMAC than they
-		// arrived. Bound them like the rest so the invariant holds by construction.
-		Upstream:      boundFieldTo(p.Upstream, auditEnvelopeFieldCap),
-		PolicyVersion: boundFieldTo(p.PolicyVersion, auditEnvelopeFieldCap),
-		PolicySHA256:  boundFieldTo(p.PolicySHA256, auditEnvelopeFieldCap),
+		// Route provenance (config route name, manifest version, computed digest) is
+		// operator-supplied and fixed for the lifetime of the route, unlike every other
+		// field here — so, unlike them, it is bounded ONCE by the caller (via
+		// BoundEnvelopeField, at routeSink construction: BuildRoutes for the gateway,
+		// the stdio proxy's equivalent for the single-upstream path) rather than
+		// re-derived on every allow/deny. unlike them: re-bounding a value that cannot
+		// change between calls was measured as ~100-150 ns of pure waste per enforced
+		// request, on fields the round-trip-idempotency argument below does not need
+		// re-verified per call, only once. Sink.RecordAllow/RecordDeny (the
+		// single-upstream path with no route) leave all three "", which is already
+		// within any cap, so the invariant holds there for free.
+		Upstream:      p.Upstream,
+		PolicyVersion: p.PolicyVersion,
+		PolicySHA256:  p.PolicySHA256,
 		TargetType:    targetType,
 		Target:        target,
 		Method:        mcpMethod,
@@ -1846,9 +1849,9 @@ func deriveTargetFields(method, identifier string) (mcpMethod, targetType, targe
 		// Post-dispatch: an unrecognized method string. Preserve it (bounded, since
 		// it is attacker-controlled) so SIEM and suggest can distinguish these from
 		// pre-dispatch denials.
-		return boundEnvelopeField(method), "", ""
+		return BoundEnvelopeField(method), "", ""
 	}
-	return method, string(tt), boundEnvelopeField(bareTargetName(tt, identifier))
+	return method, string(tt), BoundEnvelopeField(bareTargetName(tt, identifier))
 }
 
 // auditEnvelopeFieldCap bounds attacker-controlled envelope string fields (Target
@@ -1865,8 +1868,17 @@ const auditEnvelopeFieldCap = 8 << 10 // 8 KiB
 // Server session IDs are UUIDv4 (36 bytes), so 256 is generous headroom.
 const auditSessionIDCap = 256
 
-// boundEnvelopeField truncates an over-cap envelope string with a visible marker.
-func boundEnvelopeField(s string) string {
+// BoundEnvelopeField truncates an over-cap envelope string with a visible marker, at
+// auditEnvelopeFieldCap.
+//
+// Exported so a caller outside this package can pre-bound a value ONCE rather than
+// pay Record's per-record bound for a field that never changes: internal/transport's
+// routeSink construction (BuildRoutes, and the stdio proxy's single-route equivalent)
+// uses it to bound Upstream/PolicyVersion/PolicySHA256 once at startup, since those
+// three are operator-supplied (a config route name, a manifest version, a computed
+// digest) and immutable for the life of the route — see Record's doc for why it no
+// longer re-bounds them itself.
+func BoundEnvelopeField(s string) string {
 	return boundFieldTo(s, auditEnvelopeFieldCap)
 }
 
@@ -1875,48 +1887,28 @@ func boundEnvelopeField(s string) string {
 // shortens to make room), so the result is always <= limit bytes — the invariant
 // the 4 MiB scanner buffer relies on.
 //
-// s is first normalized to valid UTF-8 (strings.ToValidUTF8, replacing any invalid
-// byte sequence with U+FFFD). Every caller of this function passes a field that can
-// hold raw attacker/IdP-supplied bytes not yet validated as UTF-8 — SessionID from
-// the client-controlled Mcp-Session-Id HTTP header, Target/Method from request
-// envelope fields, AgentID/TaskID/UserID from JWT claims — and encoding/json's
-// Marshal is NOT idempotent across a decode-then-re-encode round trip when a string
-// holds invalid UTF-8: it writes a lone invalid byte as the literal 6-byte escape
-// text `�`, but decoding that text and re-marshaling the resulting (valid)
-// U+FFFD rune instead emits its raw 3-byte UTF-8 encoding. Two different on-disk
-// byte sequences for what is nominally "the same" value break the assumption behind
-// both the HMAC recompute (decode → clear _hmac → re-marshal → re-sign) and
-// VerifyRecord's canonical-bytes check, which is not a hypothetical: a session ID
-// containing one stray invalid byte forwarded from an untrusted header round-trips
-// to different bytes than it was signed with, so a genuine, never-tampered record
-// fails verification and (via resumeChainFromTail, which runs this same check on
-// every restart) can make the live proxy restart its own chain from genesis. Normalizing
-// here, before the field is ever marshaled the first time, makes the stored value
-// already-valid UTF-8 from the start, so every later marshal of it is byte-identical —
-// restoring the round-trip idempotency both mechanisms depend on.
+// Delegates to capability.BoundString, the shared normalize-then-rune-safe-cut
+// primitive: s is first normalized to valid UTF-8, for a reason worth restating here
+// since every caller of this function passes a field that can hold raw attacker/IdP-
+// supplied bytes not yet validated as UTF-8 — SessionID from the client-controlled
+// Mcp-Session-Id HTTP header, Target/Method from request envelope fields,
+// AgentID/TaskID/UserID from JWT claims — and encoding/json's Marshal is NOT
+// idempotent across a decode-then-re-encode round trip when a string holds invalid
+// UTF-8: it writes a lone invalid byte as the literal 6-byte escape text `�`, but
+// decoding that text and re-marshaling the resulting (valid) U+FFFD rune instead
+// emits its raw 3-byte UTF-8 encoding. Two different on-disk byte sequences for what
+// is nominally "the same" value break the assumption behind both the HMAC recompute
+// (decode → clear _hmac → re-marshal → re-sign) and VerifyRecord's canonical-bytes
+// check, which is not a hypothetical: a session ID containing one stray invalid byte
+// forwarded from an untrusted header round-trips to different bytes than it was
+// signed with, so a genuine, never-tampered record fails verification and (via
+// resumeChainFromTail, which runs this same check on every restart) can make the
+// live proxy restart its own chain from genesis. Normalizing here, before the field
+// is ever marshaled the first time, makes the stored value already-valid UTF-8 from
+// the start, so every later marshal of it is byte-identical — restoring the
+// round-trip idempotency both mechanisms depend on.
 func boundFieldTo(s string, limit int) string {
-	s = strings.ToValidUTF8(s, "�")
-	if len(s) <= limit {
-		return s
-	}
-	marker := fmt.Sprintf("...[eunox: truncated, %d bytes]", len(s))
-	keep := limit - len(marker)
-	if keep < 0 {
-		// The full marker does not fit (a limit smaller than the marker). The result
-		// must stay non-empty so it is not mistaken for a genuinely empty field, but
-		// must not exceed limit, so emit the shortest recognizable "..." marker. Only
-		// a non-positive limit yields "", which is a caller bug (every real cap is far
-		// larger than this marker).
-		const shortMarker = "..."
-		if limit <= 0 {
-			return ""
-		}
-		if limit < len(shortMarker) {
-			return shortMarker[:limit]
-		}
-		return shortMarker
-	}
-	return s[:runeBoundaryCut(s, keep)] + marker
+	return capability.BoundString(s, limit)
 }
 
 // TruncateUTF8 normalizes s to valid UTF-8 (replacing any invalid byte sequence with
@@ -1926,34 +1918,14 @@ func boundFieldTo(s string, limit int) string {
 //
 // Exported so a caller outside this package (internal/transport's sanitizeClaimedID,
 // which makes an attacker-controlled HTTP header safe for a signed refusal-record
-// field) shares this exact normalize-then-rune-safe-cut logic rather than
-// re-deriving it: both calls exist to make an attacker string safe to log, and letting
-// them drift apart on the boundary-walk or normalization details would be a
-// maintenance trap neither copy's own tests would catch.
+// field) shares this exact logic rather than re-deriving it: both calls exist to make
+// an attacker string safe to log, and letting them drift apart on the boundary-walk
+// or normalization details would be a maintenance trap neither copy's own tests would
+// catch. Thin wrapper over capability.TruncateUTF8, the shared home for this
+// primitive (also used by pkg/enforcement's denial-details bound, which cannot import
+// this package), kept here so existing callers of audit.TruncateUTF8 need no change.
 func TruncateUTF8(s string, limit int) string {
-	s = strings.ToValidUTF8(s, "�")
-	if limit <= 0 {
-		return ""
-	}
-	if len(s) <= limit {
-		return s
-	}
-	return s[:runeBoundaryCut(s, limit)]
-}
-
-// runeBoundaryCut returns the largest n <= limit such that s[:n] does not split a
-// UTF-8 rune, so a byte-length truncation never leaves an orphaned continuation byte
-// that json.Marshal would silently rewrite to the replacement character. Walks back
-// from limit to the nearest rune start (drops at most 3 bytes). Callers must have
-// already normalized s to valid UTF-8 and must pass limit < len(s) (both current
-// callers only reach this after their own len(s) <= limit early return); it indexes
-// s[limit] directly and panics on an out-of-range limit.
-func runeBoundaryCut(s string, limit int) int {
-	keep := limit
-	for keep > 0 && !utf8.RuneStart(s[keep]) {
-		keep--
-	}
-	return keep
+	return capability.TruncateUTF8(s, limit)
 }
 
 // bareTargetName returns the canonical bare target value. Every method except

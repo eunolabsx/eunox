@@ -342,11 +342,16 @@ func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability
 		// own methods no-op on a nil inner sink, so a caller that ignores the nil
 		// and records anyway stays safe either way.
 		if sink != nil {
+			// Bound the three provenance fields ONCE here rather than on every audit
+			// record: they are fixed for the route's lifetime, so re-deriving their
+			// UTF-8 validity and length bound per enforced call (as Sink.Record used to)
+			// was pure per-request waste on values that cannot change between calls.
+			// See audit.BoundEnvelopeField's doc.
 			r.sink = &routeSink{
 				sink:          sink,
-				upstream:      r.name,
-				policyVersion: policyVersion,
-				policySHA256:  policySHA256,
+				upstream:      audit.BoundEnvelopeField(r.name),
+				policyVersion: audit.BoundEnvelopeField(policyVersion),
+				policySHA256:  audit.BoundEnvelopeField(policySHA256),
 			}
 		}
 		routes[u.Name] = r

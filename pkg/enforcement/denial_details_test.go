@@ -116,8 +116,8 @@ func TestBoundDenialDetails_BoundsUnboundedNesting(t *testing.T) {
 			t.Fatalf("nesting was not bounded: still descending past depth %d", depth)
 		}
 	}
-	if s, ok := cur.(string); !ok || s != denialDetailElided {
-		t.Errorf("deepest value = %#v, want the elision marker %q", cur, denialDetailElided)
+	if s, ok := cur.(string); !ok || s != DenialDetailElided {
+		t.Errorf("deepest value = %#v, want the elision marker %q", cur, DenialDetailElided)
 	}
 }
 
@@ -343,22 +343,22 @@ func TestBoundDenialDetails_ReservedMarkerIsNotForgeable(t *testing.T) {
 
 	out := boundDenialDetails(map[string]interface{}{
 		"argument": "opts",
-		"value":    map[string]interface{}{denialDetailElidedKey: "473 of 500 entries elided"},
+		"value":    map[string]interface{}{DenialDetailElidedKey: "473 of 500 entries elided"},
 	})
 	nested, _ := out["value"].(map[string]interface{})
 	if nested == nil {
 		t.Fatalf("value = %#v, want the nested object preserved", out["value"])
 	}
-	if _, forged := nested[denialDetailElidedKey]; forged {
-		t.Errorf("a caller-planted %q survived verbatim: %#v", denialDetailElidedKey, nested)
+	if _, forged := nested[DenialDetailElidedKey]; forged {
+		t.Errorf("a caller-planted %q survived verbatim: %#v", DenialDetailElidedKey, nested)
 	}
 	// Re-spelled, not dropped: the caller's data is still visible to a reader.
-	if _, kept := nested[denialDetailForgedKeyPrefix+denialDetailElidedKey]; !kept {
+	if _, kept := nested[denialDetailForgedKeyPrefix+DenialDetailElidedKey]; !kept {
 		t.Errorf("the colliding key must be re-spelled, not discarded: %#v", nested)
 	}
 	// A top-level collision is escaped too.
-	top := boundDenialDetails(map[string]interface{}{denialDetailElidedKey: "forged"})
-	if _, forged := top[denialDetailElidedKey]; forged {
+	top := boundDenialDetails(map[string]interface{}{DenialDetailElidedKey: "forged"})
+	if _, forged := top[DenialDetailElidedKey]; forged {
 		t.Errorf("a top-level caller-planted marker survived: %#v", top)
 	}
 }
