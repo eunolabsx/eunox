@@ -189,7 +189,7 @@ type httpSession struct {
 	// reqSem bounds concurrent in-flight enforced-request handlers on this session,
 	// the HTTP analogue of the stdio transport's hostSem. Without it a pipelining
 	// host — or a silent upstream under --upstream-timeout=0, where handlers never
-	// return — grows goroutines and the pending / byUpstreamID maps without bound on
+	// return — grows goroutines and the byUpstreamID / hostToUp maps without bound on
 	// the network-exposed transport. Lazily created (reqSemOnce) so directly
 	// constructed sessions (tests) get a real cap on first use; acquired non-blocking
 	// in handleSessionPost, rejected with a retryable busy error on saturation.

@@ -391,12 +391,10 @@ func suggestConditionType(unknown string) string {
 }
 
 // newCondition returns a zero value of the condition type named by conditionType, or nil
-// for a discriminator this build does not model. It is a lookup in conditionPrototypes —
-// the one registry — rather than a switch that has to be kept in step with it.
+// for a discriminator this build does not model. It is the in-package spelling of
+// NewConditionPrototype — same registry, nil rather than a second (Condition, bool) return,
+// because the decoder's next step is a type switch that handles nil anyway.
 func newCondition(conditionType string) Condition {
-	proto, ok := conditionPrototypes[conditionType]
-	if !ok {
-		return nil
-	}
-	return proto()
+	proto, _ := NewConditionPrototype(conditionType)
+	return proto
 }

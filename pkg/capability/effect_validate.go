@@ -39,7 +39,7 @@ func ValidateEffectContract(e *EffectContract) error {
 	if err := validateCompensationPairing("effect", e.Class, e.CompensatingAction); err != nil {
 		return err
 	}
-	if err := ValidateBlastRadiusSpec("effect.blastRadius", e.BlastRadius); err != nil {
+	if err := validateBlastRadiusSpec("effect.blastRadius", e.BlastRadius); err != nil {
 		return err
 	}
 	if err := validateEffectRefPin(e); err != nil {
@@ -113,11 +113,11 @@ func classOrUnset(class string) string {
 	return class
 }
 
-// ValidateBlastRadiusSpec checks a blast-radius declaration: exactly one of a fixed value
+// validateBlastRadiusSpec checks a blast-radius declaration: exactly one of a fixed value
 // or an argument reference. Both is ambiguous (which wins?) and neither declares nothing
 // while looking like a declaration — the shape most likely to leave an operator believing
 // an action is quantified when it is not. where names the block for the error.
-func ValidateBlastRadiusSpec(where string, s *BlastRadiusSpec) error {
+func validateBlastRadiusSpec(where string, s *BlastRadiusSpec) error {
 	if s == nil {
 		return nil
 	}
@@ -170,12 +170,12 @@ func validateEffectByArgument(e *EffectContract) error {
 		folded[key] = value
 	}
 	for value, c := range t.Cases {
-		if err := validateEffectCase(fmt.Sprintf("effect.byArgument.cases[%q]", value), c, e.Class); err != nil {
+		if err := validateEffectCase(fmt.Sprintf("effect.byArgument.cases[%q]", value), c, e.Class, e.CompensatingAction); err != nil {
 			return err
 		}
 	}
 	if t.Default != nil {
-		return validateEffectCase("effect.byArgument.default", *t.Default, e.Class)
+		return validateEffectCase("effect.byArgument.default", *t.Default, e.Class, e.CompensatingAction)
 	}
 	return nil
 }
@@ -183,13 +183,16 @@ func validateEffectByArgument(e *EffectContract) error {
 // validateEffectCase checks one row of an argument-parameterized contract, applying the
 // same class and compensation rules the base contract obeys — a row is a contract.
 //
-// baseClass is the contract's own class, which a row that states none INHERITS. The
-// pairing is checked against that effective class rather than skipped when the row is
-// silent: a row declaring `compensatingAction` under an inherited class of, say,
-// irreversible used to load clean and then have the field scrubbed at resolution, so the
-// author's declared reversal silently did not exist. Validating the effective class turns
-// that into the load-time error every other compensable mismatch already gets.
-func validateEffectCase(where string, c EffectCase, baseClass string) error {
+// baseClass and baseAction are the contract's own class and compensating action, either of
+// which a row that states none INHERITS (exactly as ResolveEffect overlays them: a row's
+// field wins only when non-empty). Validating the row against the EFFECTIVE pair rather
+// than its own declarations alone is what makes the check agree with what gets enforced —
+// in both directions. A row declaring `compensatingAction` under an inherited class of,
+// say, irreversible used to load clean and then have the field scrubbed at resolution, so
+// the author's declared reversal silently did not exist; and a row RESTATING the
+// compensable class it already inherits was rejected for naming no action, though it
+// inherits the base's and resolves identically to the silent spelling that loads fine.
+func validateEffectCase(where string, c EffectCase, baseClass, baseAction string) error {
 	if c.Class != "" && !IsEffectClass(c.Class) {
 		return fmt.Errorf("%s 'class' is %q — valid effect classes are %s", where, c.Class, strings.Join(EffectClassVocabulary(), ", "))
 	}
@@ -197,28 +200,35 @@ func validateEffectCase(where string, c EffectCase, baseClass string) error {
 	if effectiveClass == "" {
 		effectiveClass = baseClass
 	}
+	effectiveAction := c.CompensatingAction
+	if effectiveAction == "" {
+		effectiveAction = baseAction
+	}
 	// A row that states NEITHER a class nor a compensating action overlays nothing on
 	// those axes, so there is no pairing to check (and an inherited compensable base
 	// already had its own action validated).
 	if effectiveClass != "" || c.CompensatingAction != "" {
-		if err := validateCaseCompensation(where, c, effectiveClass); err != nil {
+		if err := validateCaseCompensation(where, c, effectiveClass, effectiveAction); err != nil {
 			return err
 		}
 	}
-	return ValidateBlastRadiusSpec(where+".blastRadius", c.BlastRadius)
+	return validateBlastRadiusSpec(where+".blastRadius", c.BlastRadius)
 }
 
-// validateCaseCompensation applies the compensable pairing to one row, with the one
-// asymmetry a row has against a whole contract: a row that inherits a compensable class
-// and states no action of its own inherits the base contract's action too, so it is NOT
-// missing one. Only the row's own declarations can be wrong.
-func validateCaseCompensation(where string, c EffectCase, effectiveClass string) error {
+// validateCaseCompensation applies the compensable pairing to one row, against the
+// EFFECTIVE class and action — what ResolveEffect will actually produce for it — rather
+// than the row's own fields. That is the one asymmetry a row has against a whole contract:
+// a row inherits both halves of the pairing independently, so it can be complete without
+// stating either.
+func validateCaseCompensation(where string, c EffectCase, effectiveClass, effectiveAction string) error {
 	if c.Class == "" && c.CompensatingAction == "" {
 		return nil // pure inheritance: the base contract's own validation covers it
 	}
-	if effectiveClass == EffectCompensable && c.Class != "" && c.CompensatingAction == "" {
-		// The row RAISES itself to compensable without naming the action that reverses it.
-		return fmt.Errorf("%s declares class %q but no 'compensatingAction'; compensable means a declared action reverses this one, so without it the class is irreversible wearing a softer label", where, EffectCompensable)
+	if effectiveClass == EffectCompensable && effectiveAction == "" {
+		// Nothing supplies the reversal: the row raised itself to compensable and neither
+		// it nor the base names an action. (A row that merely RESTATES a compensable base's
+		// class inherits that base's action and is complete, so it does not land here.)
+		return fmt.Errorf("%s declares class %q but no 'compensatingAction', and the contract it overlays names none to inherit; compensable means a declared action reverses this one, so without it the class is irreversible wearing a softer label", where, EffectCompensable)
 	}
 	if effectiveClass != EffectCompensable && c.CompensatingAction != "" {
 		return fmt.Errorf("%s declares 'compensatingAction' with class %q; a compensating action is what makes an action %q, so declare that class on the case or drop the field", where, classOrUnset(effectiveClass), EffectCompensable)

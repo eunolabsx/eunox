@@ -177,6 +177,18 @@ type Sink struct {
 	// fake clock.
 	now func() time.Time
 
+	// syncDirOverride, when set, replaces syncDir on this Sink's rotation path. An fsync
+	// has no effect a test can otherwise assert on, and rotation's whole point is a crash
+	// window no unit test can produce, so the observation has to come from a seam.
+	//
+	// It lives on the Sink rather than in a package var deliberately. Rotation runs on the
+	// drainer goroutine, and this package's tests run in parallel, so a swappable global
+	// would be written by one test's goroutine while another test's live drainer read and
+	// called it — a data race in the seam itself, on the one path whose reason for existing
+	// is durability. Per-Sink, a test observes only the Sink it built. nil (every
+	// production Sink, and every test that does not ask) uses syncDir; see syncLogDir.
+	syncDirOverride func(dir, subject string)
+
 	// identity, when set, extracts the agent/task/user identity to stamp on each
 	// record from the request context. Injected via WithIdentity so the audit
 	// subsystem need not depend on the JWT/PDP layer; nil leaves

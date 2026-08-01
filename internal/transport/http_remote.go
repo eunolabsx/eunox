@@ -222,8 +222,9 @@ func (p *HTTPProxy) newRemoteSession(ctx context.Context, route *UpstreamRoute, 
 		id:    uuid.New().String(),
 		proxy: p,
 		route: route,
-		// pending is left nil: it correlates subprocess-upstream responses and is
-		// never touched on the remote-HTTP path (doRemoteHTTP is request/response).
+		// byUpstreamID and hostToUp are left nil: they correlate and nonce-rewrite
+		// subprocess-upstream traffic and are never touched on the remote-HTTP path,
+		// which is plain request/response through doRemoteHTTP.
 		done:         make(chan struct{}),
 		evicted:      make(chan struct{}),
 		sessCtx:      sessCtx,

@@ -1199,6 +1199,13 @@ denied fail-closed in the stock binary), and the `custom` escape hatch
 `WithConditionHandler(capability.ConditionTypeCustom, …)` that dispatches on the
 condition's `name`; denied fail-closed in the stock binary).
 
+Both library-only hooks require the field that names what they dispatch to —
+`backend` for `policy`, `name` for `custom` — and a missing, empty, or
+whitespace-only value is **rejected at load**. Neither could dispatch anywhere,
+so it would deny every matching call at request time with nothing pointing at the
+manifest; naming an evaluator or handler that is not (yet) registered is a
+different case and still loads, denying fail-closed at request time.
+
 > **`redactFields` is a directive, not a condition.** It mutates the
 > response rather than allowing or denying, so it lives under `directives`
 > (§ 5a), and `conditions` is strictly boolean predicates.
@@ -1858,6 +1865,17 @@ let a policy that inspects `input.directives` decide on incomplete information.
 When no evaluator is wired — the default, and the only state the prebuilt
 binary can be in — any `policy` condition is denied fail-closed. Use this for
 logic that cannot be expressed with the other typed conditions.
+
+> **`backend` is required and must be non-blank.** A `policy` condition with no
+> `backend` (or one that is empty or whitespace) names no evaluator, so it could
+> only ever deny every matching call at request time — a deny-all with no
+> diagnostic pointing at the manifest. It is **rejected at load** instead, like
+> every other condition whose misconfiguration would deny at runtime. The check
+> is for a *name*, not for registration: an evaluator is registered by the
+> embedding program, possibly after the manifest loads, so naming one that is not
+> (yet) wired still loads and denies fail-closed at request time as documented
+> above. `config` and `input` stay optional and opaque — they are author-defined
+> payloads handed verbatim to your evaluator, and eunox does not interpret them.
 
 > If a condition type you need does not exist, **add a new typed shape
 > to `pkg/capability/condition.go` first**, register its handler in

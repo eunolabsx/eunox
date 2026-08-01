@@ -13,17 +13,17 @@ import (
 	"time"
 )
 
-// recordSyncDirs swaps in a counting stand-in for the syncDir seam and returns a
-// func yielding the (dir, subject) pairs it saw. Restores the real one at test end.
-func recordSyncDirs(t *testing.T) func() [][2]string {
-	t.Helper()
+// recordSyncDirs installs a counting stand-in for s's directory-fsync seam and returns a
+// func yielding the (dir, subject) pairs it saw. Scoped to the one Sink: the seam is a
+// Sink field precisely so this observation cannot race another test's drainer goroutine
+// (rotation runs on the drainer, and this package's tests run in parallel), which a
+// swappable package var could not avoid.
+func recordSyncDirs(s *Sink) func() [][2]string {
 	var calls [][2]string
-	prev := syncDirFn
-	syncDirFn = func(dir, subject string) {
+	s.syncDirOverride = func(dir, subject string) {
 		calls = append(calls, [2]string{dir, subject})
-		prev(dir, subject)
+		syncDir(dir, subject)
 	}
-	t.Cleanup(func() { syncDirFn = prev })
 	return func() [][2]string { return calls }
 }
 
@@ -48,7 +48,6 @@ func TestRotate_FsyncsLogDirectoryOnRenameAndFreshBase(t *testing.T) {
 		t.Fatalf("seed log: %v", err)
 	}
 
-	seen := recordSyncDirs(t)
 	s := &Sink{
 		logPath:    logPath,
 		activePath: logPath,
@@ -58,6 +57,7 @@ func TestRotate_FsyncsLogDirectoryOnRenameAndFreshBase(t *testing.T) {
 		written:    64, // over maxBytes: the next rotate() rotates for real
 		now:        func() time.Time { return time.Date(2026, 6, 22, 12, 0, 0, 0, time.UTC) },
 	}
+	seen := recordSyncDirs(s)
 
 	s.rotate()
 
@@ -89,7 +89,6 @@ func TestRotate_EmptyBaseDoesNotFsyncDirectory(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = f.Close() })
 
-	seen := recordSyncDirs(t)
 	s := &Sink{
 		logPath:    logPath,
 		activePath: logPath,
@@ -99,6 +98,7 @@ func TestRotate_EmptyBaseDoesNotFsyncDirectory(t *testing.T) {
 		written:    0, // fresh base: rotate() is a no-op
 		now:        func() time.Time { return time.Date(2026, 6, 22, 12, 0, 0, 0, time.UTC) },
 	}
+	seen := recordSyncDirs(s)
 
 	s.rotate()
 

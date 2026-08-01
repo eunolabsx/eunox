@@ -212,7 +212,7 @@ func generateAndPersistAuditKey(keyPath string) ([][]byte, error) {
 			if renameErr := os.Rename(tmpName, keyPath); renameErr != nil { //nolint:gosec // G304: keyPath is user-configured via --audit-key-path; taint is intentional
 				return nil, fmt.Errorf("publishing audit key file %q: %w", keyPath, renameErr)
 			}
-			syncDirFn(dir, "audit key")
+			syncDir(dir, "audit key")
 			return readPublishedAuditKeys(keyPath, "after rename publish")
 		}
 		return nil, fmt.Errorf("publishing audit key file %q: %w", keyPath, err)
@@ -221,15 +221,9 @@ func generateAndPersistAuditKey(keyPath string) ([][]byte, error) {
 	// rename(2) only updates the directory inode in cache, so a power loss before the
 	// next flush can leave the key absent on restart, rendering every prior record
 	// unverifiable.
-	syncDirFn(dir, "audit key")
+	syncDir(dir, "audit key")
 	return [][]byte{key}, nil
 }
-
-// syncDirFn is a seam over syncDir so a test can observe that a path makes its directory
-// entries durable — an fsync has no effect a test can otherwise assert on, and the
-// rotation sites' whole point is a crash window no unit test can produce. Production
-// always uses syncDir. (Same seam pattern as osLink below.)
-var syncDirFn = syncDir
 
 // syncDir fsyncs a directory so a just-published directory entry (from link, rename, or
 // create) survives a crash. subject names what the directory holds, for the warning

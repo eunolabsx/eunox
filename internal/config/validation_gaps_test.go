@@ -221,6 +221,51 @@ func TestLoadManifest_AcceptsCaseCompensationSpellings(t *testing.T) {
 			t.Fatalf("a case inheriting a compensable base (which already named its action) must load: %v", err)
 		}
 	})
+
+	// A row may RESTATE the class it already inherits. It names no action of its own, but
+	// ResolveEffect overlays a row's fields only when non-empty, so it inherits the base's
+	// and resolves identically to the silent spelling above. Rejecting it for "declaring a
+	// class with no compensatingAction" judged the row's own fields instead of the pair
+	// that gets enforced, and refused an honest manifest whose only sin was being explicit.
+	t.Run("case restates the compensable class it inherits", func(t *testing.T) {
+		if _, err := writeEffectManifest(t, effectManifest("", `  - target: tool:refund
+    actions: [call]
+    effect:
+      class: compensable
+      compensatingAction: tool:reverse_refund
+      byArgument:
+        argument: mode
+        cases:
+          partial:
+            class: compensable
+            blastRadius:
+              value: 100
+`)); err != nil {
+			t.Fatalf("a case restating its inherited compensable class inherits the base's action too: %v", err)
+		}
+	})
+
+	// The guard still fires when NOTHING supplies the reversal: the row raises itself to
+	// compensable over a base that names no action, so the resolved effect would be a
+	// compensable with nothing to compensate it.
+	t.Run("case raises itself over a base with no action", func(t *testing.T) {
+		_, err := writeEffectManifest(t, effectManifest("", `  - target: tool:db_query
+    actions: [call]
+    effect:
+      class: irreversible
+      byArgument:
+        argument: sql
+        cases:
+          DELETE:
+            class: compensable
+`))
+		if err == nil {
+			t.Fatal("a case raising itself to compensable with no action to inherit must be rejected at load")
+		}
+		if !strings.Contains(err.Error(), "compensatingAction") {
+			t.Errorf("error should name the missing field, got: %v", err)
+		}
+	})
 }
 
 // The effect layer's numeric bounds have GENERIC spellings (`max`, `value`), and the

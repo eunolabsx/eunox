@@ -302,6 +302,19 @@ func LogChainFiles(logPath string) ([]string, error) {
 // keeps AuditDegraded() accurate, matching Close's treatment of the same operation.
 // closeErrContext labels that stderr line so each caller keeps its own provenance
 // ("rotated fd" vs "fallback fd").
+// syncLogDir fsyncs the log's parent directory so a rotation's just-published directory
+// entry survives a crash (see the call sites for what each one makes durable). It routes
+// through the Sink's own seam (syncDirOverride) rather than a package-level function
+// variable, so a test observing these fsyncs cannot race the drainer goroutine of another
+// test's Sink; production leaves the override nil and gets syncDir.
+func (s *Sink) syncLogDir() {
+	fn := s.syncDirOverride
+	if fn == nil {
+		fn = syncDir
+	}
+	fn(filepath.Dir(s.logPath), "audit log")
+}
+
 func (s *Sink) swapToFreshBase(f *os.File, closeErrContext string) {
 	tightenLogMode(f, s.logPath)
 	// Make the fresh base's DIRECTORY ENTRY durable, not just its (empty) data. Creating
@@ -313,7 +326,7 @@ func (s *Sink) swapToFreshBase(f *os.File, closeErrContext string) {
 	// rotation path was simply the one place that fsynced data without ever fsyncing the
 	// directory. Best-effort with a warning: a filesystem that refuses directory fsync
 	// must not wedge rotation.
-	syncDirFn(filepath.Dir(s.logPath), "audit log")
+	s.syncLogDir()
 	if cerr := s.f.Close(); cerr != nil {
 		s.writeFailures.Add(1)
 		fmt.Fprintf(os.Stderr, "[eunox] audit rotate error (close of %s): %v\n", closeErrContext, cerr)
@@ -427,7 +440,7 @@ func (s *Sink) rotateAttempt() string {
 	// disk under blocks the reverted directory no longer references. Ordered BEFORE the
 	// data sync below for the same reason that sync precedes the reopen: each step must be
 	// durable before the next one can depend on it.
-	syncDirFn(filepath.Dir(s.logPath), "audit log")
+	s.syncLogDir()
 	// Sync the rotated file BEFORE opening the new one. Close does not fsync on
 	// Linux, so a crash could otherwise leave the rotated file missing its tail — an
 	// undetectable chain gap, since the HMAC-linked successor lives in the new file.
