@@ -185,29 +185,26 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 	return nil
 }
 
-// unionLabels merges declared into present, preserving the fixed vocabulary order both
-// sides already carry. Both slices are bounded by the closed vocabulary (at most five
-// entries), so a linear merge is cheaper than a map and keeps the result ordered without
-// a sort. Returns present unchanged when there is nothing to add, so the common
+// unionLabels merges declared into present, deduplicated and in the fixed vocabulary
+// order. Returns present unchanged when there is nothing to add, so the common
 // non-cooperating-client path allocates nothing.
+//
+// The merge itself is capability.NormalizeDeclaredLabels — the same routine that
+// normalizes a client's declaration at the wire boundary — rather than a second copy of
+// "dedupe, then emit in vocabulary order". Two copies of that would be two places to
+// update when the vocabulary grows, and they would disagree silently: the ordering here
+// is what both the enforced subset check and the audit record's label fields rely on, so
+// a divergence would not show up as an error, only as a differently-ordered label set on
+// the tape. Both slices are bounded by the closed vocabulary (at most five entries), so
+// the concat is trivially small.
 func unionLabels(present, declared []string) []string {
 	if len(declared) == 0 {
 		return present
 	}
-	in := make(map[string]bool, len(present)+len(declared))
-	for _, l := range present {
-		in[l] = true
-	}
-	for _, l := range declared {
-		in[l] = true
-	}
-	out := make([]string, 0, len(in))
-	for _, l := range flowLabelVocab {
-		if in[l] {
-			out = append(out, l)
-		}
-	}
-	return out
+	all := make([]string, 0, len(present)+len(declared))
+	all = append(all, present...)
+	all = append(all, declared...)
+	return capability.NormalizeDeclaredLabels(all)
 }
 
 // peekSessionLabels reports the session's accumulated flow-label set (vocabulary order)

@@ -2374,9 +2374,7 @@ func (p *ManifestPDP) armPinsFromToolsList(sessionID string, result json.RawMess
 		return 0
 	case listDecodeBadEnvelope, listDecodeBadArray:
 		// The envelope or its array is unreadable, so no entry in it can be believed.
-		if pinned {
-			p.poisonAllPinned()
-		}
+		p.poisonAllPinned()
 		p.surface.BreakAll(sessionID)
 		return 0
 	case listDecodeKeyAbsent:
@@ -2385,9 +2383,7 @@ func (p *ManifestPDP) armPinsFromToolsList(sessionID string, result json.RawMess
 		// case-insensitively, and the proxy cannot tell what that host sees, so treat it
 		// as ambiguous; a plainly absent key is not.
 		if toolsKeyAmbiguous(result) {
-			if pinned {
-				p.poisonAllPinned()
-			}
+			p.poisonAllPinned()
 			p.surface.BreakAll(sessionID)
 		}
 		return 0
@@ -2401,9 +2397,7 @@ func (p *ManifestPDP) armPinsFromToolsList(sessionID string, result json.RawMess
 	// A duplicate or case-variant "tools" key leaves Go and the host reading different
 	// arrays, so no entry below can be believed.
 	if toolsKeyAmbiguous(result) {
-		if pinned {
-			p.poisonAllPinned()
-		}
+		p.poisonAllPinned()
 		p.surface.BreakAll(sessionID)
 		return len(entries)
 	}
