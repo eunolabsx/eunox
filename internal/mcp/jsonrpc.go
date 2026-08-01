@@ -247,26 +247,14 @@ func stringIDIsWellFormed(raw []byte) bool {
 	return true
 }
 
-// numericIDExponentBounded reports whether a numeric id's exponent (if any) is
-// small enough that big.Rat.SetString will not materialize a huge 10^N value (a
-// short literal like "1e1000000" would otherwise expand to a ~1 MB integer). An
-// unparseable or over-bound exponent reports false so the caller uses the
-// raw-bytes fallback.
+// numericIDExponentBounded reports whether a numeric id's exponent (if any) is small
+// enough that big.Rat.SetString will not materialize a huge 10^N value (a short literal
+// like "1e1000000" would otherwise expand to a ~1 MB integer). It delegates to
+// pkg/capability's shared bound rather than keeping a second copy: the same guard, for
+// the same input class, is needed by the exact numeric comparison in pkg/enforcement and
+// the effect layer's blast-radius parse, and independent copies drift.
 func numericIDExponentBounded(raw []byte) bool {
-	const maxNumericIDExp = 1024
-	i := bytes.IndexAny(raw, "eE")
-	if i < 0 {
-		return true // no exponent: only the length cap applies
-	}
-	exp := bytes.TrimPrefix(raw[i+1:], []byte("+"))
-	v, err := strconv.Atoi(string(exp))
-	if err != nil {
-		return false
-	}
-	if v < 0 {
-		v = -v
-	}
-	return v <= maxNumericIDExp
+	return capability.NumericLiteralBounded(string(raw))
 }
 
 // parseCanonicalJSONInt parses raw as a CANONICAL JSON integer — an optional leading

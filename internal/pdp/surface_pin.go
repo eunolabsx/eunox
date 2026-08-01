@@ -312,7 +312,13 @@ var surfaceLog io.Writer = os.Stderr
 // notice of an enforcement action, not the enforcement itself.
 func emitSurfaceChanges(changes []SurfaceChange) {
 	for _, c := range changes {
-		fmt.Fprintln(surfaceLog, c.LogLine())
+		// Discarded explicitly. A failed write to the finding sink is not actionable from
+		// the decision path — the enforcement it announces has already happened, and the
+		// only alternative to dropping the notice would be failing the call over an
+		// unwritable stderr. (internal/drift's equivalent writes to os.Stderr by name,
+		// which errcheck exempts by default; this one goes through a variable so a test
+		// can capture it, so the discard is written out.)
+		_, _ = fmt.Fprintln(surfaceLog, c.LogLine())
 	}
 }
 

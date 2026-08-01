@@ -220,9 +220,9 @@ func TestEffectCeiling_OnExceedDeny(t *testing.T) {
 	assert.Equal(t, capability.ErrCodeConditionFailed, resp.Denial.Code)
 }
 
-// TestEffectCeiling_RequiresCompensationIsTheThirdGateInput pins FR-3.3's shape: the
-// same irreversible action escalates without a compensating action and passes with one,
-// when the ceiling admits its class.
+// TestEffectCeiling_RequiresCompensationIsTheThirdGateInput pins the third input of the
+// consequence gate: the same irreversible action escalates without a compensating action
+// and passes with one, when the ceiling admits its class.
 func TestEffectCeiling_RequiresCompensationIsTheThirdGateInput(t *testing.T) {
 	eng := effectEngine(&capability.EffectCeiling{MaxEffectClass: capability.EffectIrreversible, RequireCompensation: true})
 

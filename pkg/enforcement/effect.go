@@ -35,7 +35,11 @@ import (
 type resolvedEffectKey struct{}
 
 // withResolvedEffect returns a child context carrying the call's resolved effect.
-func withResolvedEffect(ctx context.Context, eff capability.ResolvedEffect) context.Context {
+//
+// By pointer, not by value: one resolution is threaded to three readers (the two
+// conditions and the ceiling), and a resolved effect is read-only once produced, so
+// copying it per reader buys nothing and costs a multi-word copy on the hot path.
+func withResolvedEffect(ctx context.Context, eff *capability.ResolvedEffect) context.Context {
 	return context.WithValue(ctx, resolvedEffectKey{}, eff)
 }
 
@@ -43,10 +47,11 @@ func withResolvedEffect(ctx context.Context, eff capability.ResolvedEffect) cont
 // ok is false for a direct caller of an exported entrypoint that did not thread one; the
 // handlers then fail closed rather than guess, because the alternative — resolving an
 // UNANNOTATED default here — would silently judge every direct caller's call as
-// irreversible without telling them why.
-func resolvedEffectFromContext(ctx context.Context) (capability.ResolvedEffect, bool) {
-	eff, ok := ctx.Value(resolvedEffectKey{}).(capability.ResolvedEffect)
-	return eff, ok
+// irreversible without telling them why. A threaded-but-nil pointer reports false for the
+// same reason: unevaluable must fail closed, never dereference nil.
+func resolvedEffectFromContext(ctx context.Context) (*capability.ResolvedEffect, bool) {
+	eff, ok := ctx.Value(resolvedEffectKey{}).(*capability.ResolvedEffect)
+	return eff, ok && eff != nil
 }
 
 // handleEffectClass denies a call whose resolved effect class is not in the condition's
@@ -97,7 +102,6 @@ func (e *Engine) handleEffectClass(ctx context.Context, cond capability.Conditio
 	}
 	details := eff.AuditDetails()
 	details["allow_effect_classes"] = capability.SortedEffectClasses(ec.Allow)
-	details["effect"] = true
 	return effectDenial(capability.ConditionTypeEffectClass, fmt.Sprintf(
 		"this call's effect class %q is not permitted at this target (permitted: %s)%s",
 		eff.Class, strings.Join(capability.SortedEffectClasses(ec.Allow), ", "), unannotatedHint(eff)), details)
@@ -136,9 +140,8 @@ func (e *Engine) handleBlastRadius(ctx context.Context, cond capability.Conditio
 		return effectDenial(capability.ConditionTypeBlastRadius,
 			"effect contract was not resolved for this call; blast radius is unavailable", nil)
 	}
-	if !eff.Quantified {
+	if !eff.Quantified() {
 		details := eff.AuditDetails()
-		details["effect"] = true
 		details["blast_radius_max"] = br.Max.String()
 		return effectDenial(capability.ConditionTypeBlastRadius, fmt.Sprintf(
 			"this call's blast radius could not be quantified, so it cannot be shown to be within the bound of %s%s",
@@ -148,7 +151,6 @@ func (e *Engine) handleBlastRadius(ctx context.Context, cond capability.Conditio
 		return nil
 	}
 	details := eff.AuditDetails()
-	details["effect"] = true
 	details["blast_radius_max"] = br.Max.String()
 	return effectDenial(capability.ConditionTypeBlastRadius, fmt.Sprintf(
 		"this call's blast radius %s exceeds the permitted maximum %s",
@@ -158,7 +160,7 @@ func (e *Engine) handleBlastRadius(ctx context.Context, cond capability.Conditio
 // unannotatedHint appends the remediation that differs between "declared, and it does not
 // pass" and "never declared, so it defaulted to the most consequential reading". Both
 // deny; only the fix differs, and an operator reading a denial needs to know which.
-func unannotatedHint(eff capability.ResolvedEffect) string {
+func unannotatedHint(eff *capability.ResolvedEffect) string {
 	if eff.Annotated {
 		return ""
 	}
@@ -193,13 +195,12 @@ func effectDenial(condType, message string, details map[string]interface{}) *Con
 // forwarded". What it buys over a plain deny is the record — decision=escalate plus the
 // consequence inputs — so an auditor or a control plane can tell an action awaiting a
 // human from one policy forbids outright.
-func (e *Engine) checkEffectCeiling(eff capability.ResolvedEffect, matched *capability.Constraint, carriedLabels []string, requestID, now string) *capability.EnforceResponse {
+func (e *Engine) checkEffectCeiling(eff *capability.ResolvedEffect, matched *capability.Constraint, carriedLabels []string, requestID, now string) *capability.EnforceResponse {
 	exceeds, reasons := e.effectCeiling.Exceeds(eff)
 	if !exceeds {
 		return nil
 	}
 	details := eff.AuditDetails()
-	details["effect"] = true
 	details["ceiling_exceeded"] = reasons
 	// Stamp the session's accumulated flow labels INTO the escalation's structured
 	// details. The top-level carried_labels field is reserved for allow records (a deny
@@ -220,41 +221,32 @@ func (e *Engine) checkEffectCeiling(eff capability.ResolvedEffect, matched *capa
 	message := fmt.Sprintf("this action exceeds the policy's effect ceiling (%s): %s%s",
 		strings.Join(reasons, ", "), eff.String(), unannotatedHint(eff))
 
+	// Both arms go through the shared constructors rather than building an
+	// EnforceResponse literal. Those constructors are where boundDenialDetails runs, and
+	// details here carries caller-controlled bytes: blast_radius is rendered from a tool
+	// ARGUMENT, and compensating_action / effect_contract come from the manifest. A
+	// hand-built literal skipped the bound entirely, so the one refusal shape a human is
+	// expected to read was also the one that could carry an unbounded value onto the
+	// signed tape.
 	if e.effectCeiling.Outcome() == capability.OnExceedDeny {
-		return &capability.EnforceResponse{
-			RequestID: requestID,
-			Decision:  capability.DecisionDeny,
-			DecidedAt: now,
-			AuditOnly: matched.IsAuditOnly(),
-			Denial: &capability.DenialInfo{
-				Code:          capability.ErrCodeConditionFailed,
-				ConditionType: ceilingConditionType,
-				Message:       message,
-				Details:       details,
-			},
-		}
-	}
-	return &capability.EnforceResponse{
-		RequestID: requestID,
-		Decision:  capability.DecisionEscalate,
-		DecidedAt: now,
-		// AuditOnly is deliberately NOT taken from the constraint. An audit-mode
-		// constraint downgrades a DENY to an observed forward, which is coherent for a
-		// policy verdict being staged; an escalation is not a verdict being staged, it is
-		// "a human has not approved this yet", and forwarding it because the target is in
-		// observe mode would perform exactly the consequential action the ceiling flagged.
-		// The transport's isObserveDeny consults AuditOnly, so leaving it false is what
-		// keeps an escalation unforwardable on an audit route.
-		Denial: &capability.DenialInfo{
-			Code:          capability.ErrCodeEscalationRequired,
+		resp := denyResponse(requestID, now, matched.IsAuditOnly(), nil, capability.DenialInfo{
+			Code:          capability.ErrCodeConditionFailed,
 			ConditionType: ceilingConditionType,
 			Message:       message,
 			Details:       details,
-			// Hard: same reason AuditOnly stays false — a route-wide --audit must not turn
-			// "needs human approval" into "performed anyway, logged".
-			HardDeny: true,
-		},
+		})
+		return &resp
 	}
+	resp := escalateResponse(requestID, now, capability.DenialInfo{
+		Code:          capability.ErrCodeEscalationRequired,
+		ConditionType: ceilingConditionType,
+		Message:       message,
+		Details:       details,
+		// Hard: same reason AuditOnly stays false (see escalateResponse) — a route-wide
+		// --audit must not turn "needs human approval" into "performed anyway, logged".
+		HardDeny: true,
+	})
+	return &resp
 }
 
 // ceilingConditionType is the conditionType stamped on a ceiling verdict. The ceiling is

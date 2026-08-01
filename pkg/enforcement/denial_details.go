@@ -326,9 +326,23 @@ func in2any(v []interface{}) []interface{} { return v }
 // arm can charge and then forget to check — the []string arm previously checked only at
 // the top of its loop, writing the element that crossed the budget in full and never
 // checking the last element at all, while the []interface{} arm elided it.
+//
+// The charge is FLOORED at denialDetailScalarCost rather than being the string's own
+// length, because a short string is not free to carry: it still marshals with its quotes
+// and its separator, and unlike a map key it has no uniqueness constraint bounding how
+// many of it a caller can send. Charging len() alone made the EMPTY string cost zero, so
+// an argument that decoded to an array of them was admitted in full — half a million
+// elements marshaled to ~1.5 MB against an 8 KiB budget, the same unbounded-breadth hole
+// denialDetailContainerCost closed for empty maps and arrays, one shape further down.
+// Every non-string scalar already charges this floor; a string is charged no less than a
+// bool for occupying a slot.
 func chargeBoundedString(s string, budget *int) (string, bool) {
 	b := boundDetailString(s)
-	*budget -= len(b)
+	cost := len(b)
+	if cost < denialDetailScalarCost {
+		cost = denialDetailScalarCost
+	}
+	*budget -= cost
 	if *budget < 0 {
 		return "", false
 	}

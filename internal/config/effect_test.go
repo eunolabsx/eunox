@@ -105,7 +105,7 @@ func TestEffectGrammarRejections(t *testing.T) {
 		},
 		{
 			name:    "a misspelled key inside the effect block",
-			caps:    "  - target: tool:t\n    actions: [call]\n    effect:\n      clas: reversible\n",
+			caps:    "  - target: tool:t\n    actions: [call]\n    effect:\n      clazz: reversible\n",
 			wantErr: "unknown field",
 		},
 		{

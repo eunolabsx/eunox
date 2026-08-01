@@ -650,6 +650,31 @@ func denyResponse(requestID, now string, auditOnly bool, obligations []capabilit
 	}
 }
 
+// escalateResponse builds an escalate EnforceResponse — the effect ceiling's
+// needs-human-approval outcome — from the same envelope denyResponse builds, including
+// the boundDenialDetails pass every refusal's details must go through before they reach
+// the signed tape. It exists so the escalate decision does not become the one refusal
+// shape assembled as a struct literal, silently exempt from a bound the other twenty-odd
+// sites inherit by construction.
+//
+// AuditOnly and Obligations are deliberately absent rather than parameters. An audit-mode
+// constraint downgrades a DENY to an observed forward, which is coherent for a policy
+// verdict being staged; an escalation is not a verdict being staged, it is "a human has
+// not approved this yet", and forwarding it because the target is in observe mode would
+// perform exactly the consequential action the ceiling flagged. The transport's
+// isObserveDeny consults AuditOnly, so leaving it unset is what keeps an escalation
+// unforwardable on an audit route — and an unforwardable refusal has no response to
+// redact, so obligations would have nothing to apply to.
+func escalateResponse(requestID, now string, denial capability.DenialInfo) capability.EnforceResponse {
+	denial.Details = boundDenialDetails(denial.Details)
+	return capability.EnforceResponse{
+		RequestID: requestID,
+		Decision:  capability.DecisionEscalate,
+		DecidedAt: now,
+		Denial:    &denial,
+	}
+}
+
 // WithConditionHandler registers a custom condition handler under name. Applied
 // after the built-ins (see New), it overwrites one of the same type. The map is
 // frozen by the time New returns, so the engine reads it lock-free on the hot path.

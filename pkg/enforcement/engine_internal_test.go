@@ -1160,8 +1160,8 @@ func TestExactRat_BoundsTheParse(t *testing.T) {
 		name string
 		lit  string
 	}{
-		{"over-long fractional", "0." + strings.Repeat("7", maxExactNumericLen*4)},
-		{"over-long integer", strings.Repeat("9", maxExactNumericLen+1)},
+		{"over-long fractional", "0." + strings.Repeat("7", capability.MaxNumericLiteralLen*4)},
+		{"over-long integer", strings.Repeat("9", capability.MaxNumericLiteralLen+1)},
 		{"huge positive exponent", "1e1000000"},
 		{"huge negative exponent", "1e-1000000"},
 		{"unparseable exponent", "1e" + strings.Repeat("9", 40)},

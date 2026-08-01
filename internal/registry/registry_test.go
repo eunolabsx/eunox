@@ -25,7 +25,7 @@ func TestShippedCorpusLoadsAndVerifies(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the shipped corpus must load and verify: %v", err)
 	}
-	// The Phase-B deliverable is ten real public-server contracts; the gate is a floor,
+	// The shipped corpus targets ten real public-server contracts; the gate is a floor,
 	// not an exact count, so adding one does not fail the build.
 	if len(contracts) < 10 {
 		t.Fatalf("the corpus must carry at least 10 contracts, got %d", len(contracts))

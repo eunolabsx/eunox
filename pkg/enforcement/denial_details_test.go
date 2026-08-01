@@ -5,6 +5,7 @@ package enforcement
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -275,12 +276,30 @@ func TestDenyResponse_BoundsDetails(t *testing.T) {
 // against an 8 KiB budget, which then tripped the audit sink's coarse 1 MiB cap and
 // replaced the WHOLE details map with a marker, destroying the diagnostic content this
 // walk exists to preserve.
+// namedDetailString is a named scalar type: it reaches boundDetailValue's default arm
+// through reflection rather than the string arm, so it must be charged there too.
+type namedDetailString string
+
 func TestBoundDenialDetails_EmptyContainersAreCharged(t *testing.T) {
 	t.Parallel()
 
 	for name, elem := range map[string]func() interface{}{
 		"empty objects": func() interface{} { return map[string]interface{}{} },
 		"empty arrays":  func() interface{} { return []interface{}{} },
+		// The same hole one shape further down: a container charges
+		// denialDetailContainerCost, but an empty STRING charged len()==0, so an array of
+		// them was admitted whole. Both concrete slice arms are covered — []interface{}
+		// routes through boundDetailValue and []string through its own bound closure, and
+		// the two have drifted apart before.
+		"empty strings":       func() interface{} { return "" },
+		"empty json.Numbers":  func() interface{} { return json.Number("") },
+		"one-byte strings":    func() interface{} { return "x" },
+		"empty []byte":        func() interface{} { return []byte{} },
+		"empty typed strings": func() interface{} { return namedDetailString("") },
+		"empty strings in []string": func() interface{} {
+			s := make([]string, 200)
+			return s
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -360,5 +379,62 @@ func TestBoundDenialDetails_ReservedMarkerIsNotForgeable(t *testing.T) {
 	top := boundDenialDetails(map[string]interface{}{DenialDetailElidedKey: "forged"})
 	if _, forged := top[DenialDetailElidedKey]; forged {
 		t.Errorf("a top-level caller-planted marker survived: %#v", top)
+	}
+}
+
+// TestCeilingRefusalDetailsAreBounded pins that BOTH effect-ceiling outcomes go through
+// the shared response constructors, which is where boundDenialDetails runs.
+//
+// The details a ceiling stamps carry caller-controlled bytes — blast_radius is rendered
+// from a tool ARGUMENT — and the two arms were assembled as EnforceResponse literals, so
+// they were the only refusals in the engine exempt from the bound every other deny site
+// inherits by construction. An escalation is also the one refusal shape a human is
+// expected to read back off the signed tape, which is exactly the record that must not be
+// a megabyte of caller-chosen digits.
+//
+// It lives in the internal test package rather than beside the other ceiling tests so it
+// can assert against the real budget constants instead of hardcoded copies of them.
+func TestCeilingRefusalDetailsAreBounded(t *testing.T) {
+	t.Parallel()
+
+	caps := []capability.Constraint{{
+		Target:  "tool:refund",
+		Actions: []string{"call"},
+		Effect: &capability.EffectContract{
+			Class:              capability.EffectCompensable,
+			CompensatingAction: "tool:" + strings.Repeat("z", 4096),
+			BlastRadius:        &capability.BlastRadiusSpec{Argument: "amount", Unit: strings.Repeat("u", 4096)},
+		},
+	}}
+	req := &capability.EnforceRequest{
+		SessionID:  "sess",
+		TargetName: "refund",
+		Target:     &capability.EnforceRequestTarget{Type: "tool", Name: "refund"},
+		// ~1500 digits: over the ceiling, and rendered into the details in full by
+		// big.Float.Text('f', -1).
+		Arguments: map[string]interface{}{"amount": json.Number(strings.Repeat("9", 1500))},
+	}
+	bound := json.Number("1000")
+
+	for name, ceiling := range map[string]*capability.EffectCeiling{
+		"escalate": {MaxBlastRadius: &bound},
+		"deny":     {MaxBlastRadius: &bound, OnExceed: capability.OnExceedDeny},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			eng := New(WithEffectCeiling(ceiling))
+			resp := eng.ValidateAction(context.Background(), req, caps)
+			if resp.Decision == capability.DecisionAllow || resp.Denial == nil {
+				t.Fatalf("decision = %v, want a ceiling refusal", resp.Decision)
+			}
+			for k, v := range resp.Denial.Details {
+				if s, ok := v.(string); ok && len(s) > maxDenialDetailStringLen {
+					t.Errorf("details[%q] reached the tape unbounded at %d bytes", k, len(s))
+				}
+			}
+			if n := marshaledLen(t, resp.Denial.Details); n > 4*maxDenialDetailsBytes {
+				t.Errorf("marshaled details = %d bytes, want bounded near the %d-byte budget", n, maxDenialDetailsBytes)
+			}
+		})
 	}
 }

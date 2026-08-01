@@ -113,8 +113,8 @@ func TestResolveEffect(t *testing.T) {
 			if got.Class != c.wantClass {
 				t.Errorf("class = %q, want %q", got.Class, c.wantClass)
 			}
-			if got.Quantified != c.wantQuant {
-				t.Errorf("quantified = %v, want %v", got.Quantified, c.wantQuant)
+			if got.Quantified() != c.wantQuant {
+				t.Errorf("quantified = %v, want %v", got.Quantified(), c.wantQuant)
 			}
 			if c.wantQuant && got.BlastRadius.Text('f', -1) != c.wantRadius {
 				t.Errorf("blastRadius = %s, want %s", got.BlastRadius.Text('f', -1), c.wantRadius)
@@ -191,22 +191,22 @@ func TestResolveEffect_ByArgument(t *testing.T) {
 			},
 		}
 		got := ResolveEffect(byArg, map[string]interface{}{"op": "transfer", "amount": json.Number("250")})
-		if !got.Quantified || got.BlastRadius.Text('f', -1) != "250" || got.Unit != "usd" {
+		if !got.Quantified() || got.BlastRadius.Text('f', -1) != "250" || got.Unit != "usd" {
 			t.Fatalf("want a 250 usd blast radius, got %+v", got)
 		}
 	})
 }
 
 func TestEffectCeiling_Exceeds(t *testing.T) {
-	quantified := func(n string) ResolvedEffect {
+	quantified := func(n string) *ResolvedEffect {
 		v, _ := ParseBlastRadiusNumber(json.Number(n))
-		return ResolvedEffect{Class: EffectReversible, BlastRadius: v, Quantified: true, Annotated: true}
+		return &ResolvedEffect{Class: EffectReversible, BlastRadius: v, Annotated: true}
 	}
 
 	cases := []struct {
 		name        string
 		ceiling     *EffectCeiling
-		effect      ResolvedEffect
+		effect      *ResolvedEffect
 		wantExceeds bool
 		wantReason  string
 	}{
@@ -232,13 +232,13 @@ func TestEffectCeiling_Exceeds(t *testing.T) {
 		{
 			name:        "a class under the bound passes",
 			ceiling:     &EffectCeiling{MaxEffectClass: EffectCompensable},
-			effect:      ResolvedEffect{Class: EffectCompensable, Annotated: true},
+			effect:      &ResolvedEffect{Class: EffectCompensable, Annotated: true},
 			wantExceeds: false,
 		},
 		{
 			name:        "an unquantified action exceeds ANY finite magnitude bound",
 			ceiling:     &EffectCeiling{MaxBlastRadius: num("100")},
-			effect:      ResolvedEffect{Class: EffectReversible, Annotated: true},
+			effect:      &ResolvedEffect{Class: EffectReversible, Annotated: true},
 			wantExceeds: true,
 			wantReason:  "blast_radius_unknown",
 		},
@@ -258,21 +258,21 @@ func TestEffectCeiling_Exceeds(t *testing.T) {
 		{
 			name:        "requireCompensation fires only above the class bound",
 			ceiling:     &EffectCeiling{MaxEffectClass: EffectCompensable, RequireCompensation: true},
-			effect:      ResolvedEffect{Class: EffectIrreversible, Annotated: true},
+			effect:      &ResolvedEffect{Class: EffectIrreversible, Annotated: true},
 			wantExceeds: true,
 			wantReason:  "no_compensating_action",
 		},
 		{
 			name:        "a declared compensating action does not clear the class bound by itself",
 			ceiling:     &EffectCeiling{MaxEffectClass: EffectCompensable, RequireCompensation: true},
-			effect:      ResolvedEffect{Class: EffectIrreversible, CompensatingAction: "tool:reverse", Annotated: true},
+			effect:      &ResolvedEffect{Class: EffectIrreversible, CompensatingAction: "tool:reverse", Annotated: true},
 			wantExceeds: true,
 			wantReason:  "effect_class",
 		},
 		{
 			name:        "requireCompensation does not fire for an action under the class bound",
 			ceiling:     &EffectCeiling{MaxEffectClass: EffectIrreversible, RequireCompensation: true},
-			effect:      ResolvedEffect{Class: EffectReversible, Annotated: true},
+			effect:      &ResolvedEffect{Class: EffectReversible, Annotated: true},
 			wantExceeds: false,
 		},
 	}
@@ -304,7 +304,7 @@ func TestEffectCeiling_Exceeds(t *testing.T) {
 // would silently disable the check it was written to impose.
 func TestEffectCeiling_ExceedsIsFailClosedOnAnUnreadableBound(t *testing.T) {
 	v, _ := ParseBlastRadiusNumber(json.Number("1"))
-	eff := ResolvedEffect{Class: EffectReversible, BlastRadius: v, Quantified: true, Annotated: true}
+	eff := &ResolvedEffect{Class: EffectReversible, BlastRadius: v, Annotated: true}
 	ceiling := &EffectCeiling{MaxBlastRadius: num("not-a-number")}
 	if exceeds, _ := ceiling.Exceeds(eff); !exceeds {
 		t.Fatal("an unreadable maxBlastRadius must fail closed")
@@ -343,8 +343,8 @@ func TestEffectConditionsRoundtripThroughTheWrapper(t *testing.T) {
 		if err := json.Unmarshal(b, &back); err != nil {
 			t.Fatalf("unmarshal %s: %v", b, err)
 		}
-		if back.Condition.ConditionType() != cond.ConditionType() {
-			t.Fatalf("roundtrip type = %q, want %q", back.Condition.ConditionType(), cond.ConditionType())
+		if back.ConditionType() != cond.ConditionType() {
+			t.Fatalf("roundtrip type = %q, want %q", back.ConditionType(), cond.ConditionType())
 		}
 	}
 
@@ -364,7 +364,7 @@ func TestEffectConditionsRoundtripThroughTheWrapper(t *testing.T) {
 func TestResolvedEffectAuditDetailsAreStructured(t *testing.T) {
 	v, _ := ParseBlastRadiusNumber(json.Number("42"))
 	eff := ResolvedEffect{
-		Class: EffectCompensable, BlastRadius: v, Quantified: true, Unit: "rows",
+		Class: EffectCompensable, BlastRadius: v, Unit: "rows",
 		CompensatingAction: "tool:restore", Ref: "eunox/postgres.delete@sha256:" + zeroHex(), Annotated: true,
 	}
 	d := eff.AuditDetails()
@@ -501,8 +501,8 @@ func TestResolvedEffectStringNamesTheUnquantifiedCase(t *testing.T) {
 		t.Fatalf("unannotated rendering must name both facts, got %q", bare)
 	}
 	v, _ := ParseBlastRadiusNumber(json.Number("7"))
-	full := ResolvedEffect{Class: EffectCompensable, BlastRadius: v, Quantified: true, Unit: "rows",
-		CompensatingAction: "tool:restore", Annotated: true}.String()
+	full := (&ResolvedEffect{Class: EffectCompensable, BlastRadius: v, Unit: "rows",
+		CompensatingAction: "tool:restore", Annotated: true}).String()
 	for _, want := range []string{"class=compensable", "blastRadius=7 rows", "compensatingAction=tool:restore"} {
 		if !strings.Contains(full, want) {
 			t.Fatalf("rendering must contain %q, got %q", want, full)
@@ -534,18 +534,18 @@ func TestEffectArgumentReferencesHonorNestedPaths(t *testing.T) {
 
 	radius := &EffectContract{Class: EffectIrreversible, BlastRadius: &BlastRadiusSpec{Argument: "$.body.amount"}}
 	got := ResolveEffect(radius, map[string]interface{}{"body": map[string]interface{}{"amount": json.Number("5000")}})
-	if !got.Quantified || got.BlastRadius.Text('f', -1) != "5000" {
+	if !got.Quantified() || got.BlastRadius.Text('f', -1) != "5000" {
 		t.Fatalf("a nested blastRadius reference must resolve, got %+v", got)
 	}
 
 	// The "$$." escape addresses a literal top-level key that itself starts with "$.".
 	escaped := &EffectContract{Class: EffectIrreversible, BlastRadius: &BlastRadiusSpec{Argument: "$$.amount"}}
-	if e := ResolveEffect(escaped, map[string]interface{}{"$.amount": json.Number("7")}); !e.Quantified {
+	if e := ResolveEffect(escaped, map[string]interface{}{"$.amount": json.Number("7")}); !e.Quantified() {
 		t.Fatalf("the escaped literal form must resolve, got %+v", e)
 	}
 	// A malformed path fails closed rather than matching something unintended.
 	bad := &EffectContract{Class: EffectIrreversible, BlastRadius: &BlastRadiusSpec{Argument: "$.a..b"}}
-	if e := ResolveEffect(bad, map[string]interface{}{"a": map[string]interface{}{"b": json.Number("1")}}); e.Quantified {
+	if e := ResolveEffect(bad, map[string]interface{}{"a": map[string]interface{}{"b": json.Number("1")}}); e.Quantified() {
 		t.Fatal("a malformed path must resolve unquantified, not match")
 	}
 }
@@ -558,7 +558,7 @@ func TestBlastRadiusRejectsANegativeMagnitude(t *testing.T) {
 	c := &EffectContract{Class: EffectCompensable, CompensatingAction: "tool:recharge",
 		BlastRadius: &BlastRadiusSpec{Argument: "amount", Unit: "usd"}}
 	got := ResolveEffect(c, map[string]interface{}{"amount": json.Number("-1000000")})
-	if got.Quantified {
+	if got.Quantified() {
 		t.Fatalf("a negative magnitude must resolve unquantified, got %s", got.BlastRadius.Text('f', -1))
 	}
 	// Unquantified exceeds any finite bound, so the call is refused rather than admitted.
@@ -566,7 +566,7 @@ func TestBlastRadiusRejectsANegativeMagnitude(t *testing.T) {
 		t.Fatal("an unquantifiable magnitude must exceed a finite ceiling")
 	}
 	// Zero is a legitimate magnitude and must still quantify.
-	if z := ResolveEffect(c, map[string]interface{}{"amount": json.Number("0")}); !z.Quantified {
+	if z := ResolveEffect(c, map[string]interface{}{"amount": json.Number("0")}); !z.Quantified() {
 		t.Fatal("zero is a magnitude and must quantify")
 	}
 }
@@ -579,12 +579,12 @@ func TestBlastRadiusFailsClosedOnNaNAndInf(t *testing.T) {
 	c := &EffectContract{Class: EffectIrreversible, BlastRadius: &BlastRadiusSpec{Argument: "amount"}}
 	for name, v := range map[string]float64{"NaN": math.NaN(), "+Inf": math.Inf(1), "-Inf": math.Inf(-1)} {
 		t.Run(name, func(t *testing.T) {
-			if got := ResolveEffect(c, map[string]interface{}{"amount": v}); got.Quantified {
+			if got := ResolveEffect(c, map[string]interface{}{"amount": v}); got.Quantified() {
 				t.Fatalf("%s must resolve unquantified", name)
 			}
 		})
 	}
-	if got := ResolveEffect(c, map[string]interface{}{"amount": 42.5}); !got.Quantified {
+	if got := ResolveEffect(c, map[string]interface{}{"amount": 42.5}); !got.Quantified() {
 		t.Fatal("an ordinary float64 argument must still quantify")
 	}
 }
@@ -692,7 +692,59 @@ func TestCeilingWithOnlyRequireCompensationIsNotSet(t *testing.T) {
 	if c.IsSet() {
 		t.Fatal("a ceiling that can never fire must not report itself as set")
 	}
-	if over, reasons := c.Exceeds(ResolvedEffect{Class: EffectIrreversible, Annotated: true}); over {
+	if over, reasons := c.Exceeds(&ResolvedEffect{Class: EffectIrreversible, Annotated: true}); over {
 		t.Fatalf("and it must refuse nothing, got %v", reasons)
+	}
+}
+
+// TestCeilingRequireCompensationWithoutAClassBoundIsRefused covers the shape the test
+// above does NOT: requireCompensation alongside maxBlastRadius but with no maxEffectClass.
+// IsSet reports true there (the magnitude bound is real), so the ceiling IS in force —
+// while the compensation leg, gated on being above the class bound, could never fire. An
+// operator who wrote it got a requirement that silently bounded nothing.
+//
+// The manifest loader rejects the shape, so this is unreachable from a manifest; the
+// exported WithEffectCeiling seam takes a ceiling directly and never passes through the
+// loader, which is the caller this closes it for. An unevaluable ceiling leg must fail
+// closed, and it names the misconfiguration rather than reporting a consequence that was
+// never assessed.
+func TestCeilingRequireCompensationWithoutAClassBoundIsRefused(t *testing.T) {
+	c := &EffectCeiling{MaxBlastRadius: num("1000"), RequireCompensation: true}
+	if !c.IsSet() {
+		t.Fatal("a ceiling with a real magnitude bound is in force")
+	}
+	// Well under every bound the ceiling states, and compensable besides: the only reason
+	// to refuse it is that the ceiling itself cannot be evaluated as written.
+	v, _ := ParseBlastRadiusNumber(json.Number("1"))
+	over, reasons := c.Exceeds(&ResolvedEffect{
+		Class: EffectCompensable, BlastRadius: v,
+		CompensatingAction: "tool:undo", Annotated: true,
+	})
+	if !over {
+		t.Fatal("a ceiling whose compensation leg can never fire must not admit silently")
+	}
+	if len(reasons) != 1 || reasons[0] != "ceiling_misconfigured" {
+		t.Fatalf("reasons = %v, want exactly [ceiling_misconfigured] — the token must name the\n"+
+			"misconfiguration, not a consequence the ceiling never actually assessed", reasons)
+	}
+}
+
+// TestResolvedEffectQuantifiedTracksTheBlastRadius pins that the two cannot disagree.
+// Quantified was a stored bool set alongside BlastRadius, so a directly-constructed
+// ResolvedEffect could carry Quantified: true with a nil pointer — and the very next thing
+// every reader does with a quantified effect is dereference it to compare or render it.
+func TestResolvedEffectQuantifiedTracksTheBlastRadius(t *testing.T) {
+	if (&ResolvedEffect{Class: EffectReversible}).Quantified() {
+		t.Error("an effect with no blast radius must not report itself quantified")
+	}
+	v, _ := ParseBlastRadiusNumber(json.Number("3"))
+	if !(&ResolvedEffect{Class: EffectReversible, BlastRadius: v}).Quantified() {
+		t.Error("an effect carrying a blast radius must report itself quantified")
+	}
+	// A nil receiver reaches this through a caller that did not check ok on the context
+	// lookup. Unquantified is the fail-closed answer; a panic is not an answer at all.
+	var nilEff *ResolvedEffect
+	if nilEff.Quantified() {
+		t.Error("a nil effect must read as unquantified, not quantified")
 	}
 }

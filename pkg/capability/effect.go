@@ -11,6 +11,7 @@ import (
 	"math"
 	"math/big"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -193,14 +194,17 @@ type EffectCase struct {
 }
 
 // ResolvedEffect is a contract reduced against one call's arguments: the values the
-// conditions and the ceiling actually compare. Quantified is false when no blast radius
-// could be established, which every numeric bound treats as exceeded.
+// conditions and the ceiling actually compare.
+//
+// A resolved effect is READ-ONLY once returned. ResolveEffect produces a fresh value per
+// call and the engine threads it by pointer through the decision context, so the
+// condition handlers, the ceiling, and the audit record all read one snapshot; mutating
+// it would change what a later reader in the same decision judges.
 type ResolvedEffect struct {
 	Class              string
 	Idempotent         bool
 	CompensatingAction string
 	BlastRadius        *big.Float
-	Quantified         bool
 	Unit               string
 	Ref                string
 	// Annotated is false when the constraint carried no contract at all, so a caller can
@@ -210,12 +214,24 @@ type ResolvedEffect struct {
 	Annotated bool
 }
 
+// Quantified reports whether a blast radius could be established for this call. False —
+// no contract, a contract naming an argument the call did not supply, or an argument with
+// no magnitude — is treated as EXCEEDING every numeric bound: an action whose size cannot
+// be established must not be treated as small.
+//
+// Derived rather than stored. It was a bool field set alongside BlastRadius, which made
+// one fact two sources of truth: a directly-constructed ResolvedEffect could carry
+// Quantified: true with a nil BlastRadius, and the very next thing every reader does with
+// a quantified effect is dereference that pointer to compare or render it. Deriving it
+// makes the pair unable to disagree.
+func (e *ResolvedEffect) Quantified() bool { return e != nil && e.BlastRadius != nil }
+
 // UnannotatedEffect is the fail-closed resolution for a target with no contract:
 // irreversible, unquantified, nothing to compensate with. It is what makes the registry
 // a flywheel rather than a nice-to-have — an unannotated tool exceeds any ceiling and so
 // escalates, and the way out is to annotate it.
-func UnannotatedEffect() ResolvedEffect {
-	return ResolvedEffect{Class: EffectIrreversible}
+func UnannotatedEffect() *ResolvedEffect {
+	return &ResolvedEffect{Class: EffectIrreversible}
 }
 
 // EffectClassCondition denies a call whose resolved effect class is not in Allow. It is
@@ -327,18 +343,26 @@ func (c *EffectCeiling) IsSet() bool {
 // Exceeds reports whether a resolved effect is over the ceiling, and why. reasons are
 // stable, machine-readable tokens for the audit record; the human message is built by the
 // caller. A nil or unset ceiling never exceeds.
-func (c *EffectCeiling) Exceeds(eff ResolvedEffect) (bool, []string) {
+func (c *EffectCeiling) Exceeds(eff *ResolvedEffect) (exceeds bool, reasons []string) {
 	if !c.IsSet() {
 		return false, nil
 	}
-	var reasons []string
+	// requireCompensation with no class bound to hang it on. The manifest loader rejects
+	// this shape outright; the exported WithEffectCeiling seam takes a ceiling directly
+	// and never passes through it, and there the leg below could never fire — an operator
+	// would have authored a compensation requirement that silently bounded nothing. An
+	// unevaluable ceiling leg must not read as "checked and fine", so it exceeds, loudly,
+	// with a token that names the misconfiguration rather than a consequence.
+	if c.RequireCompensation && c.MaxEffectClass == "" {
+		return true, []string{"ceiling_misconfigured"}
+	}
 	overClass := c.MaxEffectClass != "" && !EffectClassAtMost(eff.Class, c.MaxEffectClass)
 	if overClass {
 		reasons = append(reasons, "effect_class")
 	}
 	if c.MaxBlastRadius != nil {
 		switch {
-		case !eff.Quantified:
+		case !eff.Quantified():
 			// Unquantified is over ANY finite bound: an action whose size cannot be
 			// established must not be treated as small.
 			reasons = append(reasons, "blast_radius_unknown")
@@ -400,11 +424,65 @@ func SplitEffectRef(ref string) (id, digest string, ok bool) {
 	return id, digest, true
 }
 
-// ParseBlastRadiusNumber converts a manifest numeric literal to an exact big.Float, so a
-// bound above 2^53 is compared exactly rather than through a lossy float64 widening (the
-// same reason condition literals are decoded with UseNumber). ok is false for a literal
-// that is not a number.
+// Bounds on a decimal literal this package will parse into an arbitrary-precision value.
+//
+// Length alone does not bound the work: "1e1000000" is nine bytes and expands to a
+// ~1 MiB integer, and rendering it back with big.Float.Text('f', -1) costs a full second
+// and a megabyte of string. Both bounds are therefore needed, and both are far above any
+// literal a real policy or a real tool argument carries — the exact arm exists to compare
+// integers around and above 2^63, which needs tens of digits.
+const (
+	MaxNumericLiteralLen = 1024
+	MaxNumericLiteralExp = 1024
+)
+
+// NumericLiteralBounded reports whether a decimal literal is small enough to parse into
+// an arbitrary-precision value without materializing a huge 10^N intermediate.
+//
+// It lives here, in the package that owns the shared literal grammar, because THREE
+// layers need the identical bound against the identical input class: the JSON-RPC id
+// parse (internal/mcp), the exact numeric comparison behind allowedValues
+// (pkg/enforcement), and the blast-radius parse below. Two of those had hand-rolled
+// copies and the third had none — which is exactly how a guard that everyone "mirrors"
+// ends up missing from the one place a caller can actually reach.
+//
+// An unparseable or over-bound exponent reports false, so every caller falls back to its
+// own documented not-exact path (a float64 comparison, a raw-bytes id, an unquantified
+// blast radius). Each of those is the conservative direction for that caller.
+func NumericLiteralBounded(s string) bool {
+	if len(s) > MaxNumericLiteralLen {
+		return false
+	}
+	i := strings.IndexAny(s, "eE")
+	if i < 0 {
+		return true // no exponent: only the length cap applies
+	}
+	v, err := strconv.Atoi(strings.TrimPrefix(s[i+1:], "+"))
+	if err != nil {
+		return false
+	}
+	if v < 0 {
+		v = -v
+	}
+	return v <= MaxNumericLiteralExp
+}
+
+// ParseBlastRadiusNumber converts a numeric literal to an exact big.Float, so a bound
+// above 2^53 is compared exactly rather than through a lossy float64 widening (the same
+// reason condition literals are decoded with UseNumber). ok is false for a literal that
+// is not a number, or one outside NumericLiteralBounded.
+//
+// The bound is load-bearing on BOTH sides. On the manifest side it turns an absurd
+// authored bound into a load error. On the REQUEST side it is a DoS guard: the literal is
+// a caller-supplied tool argument, and without the bound "1e100000000" — twelve bytes —
+// parses cheaply and then costs seconds of CPU and gigabytes of string when the denial
+// path renders it with Text('f', -1), synchronously, inside the per-session decision.
+// Rejecting it here resolves the call unquantified, which exceeds every bound and so
+// fails closed.
 func ParseBlastRadiusNumber(n json.Number) (*big.Float, bool) {
+	if !NumericLiteralBounded(n.String()) {
+		return nil, false
+	}
 	f, ok := new(big.Float).SetString(n.String())
 	return f, ok
 }
@@ -416,11 +494,11 @@ func ParseBlastRadiusNumber(n json.Number) (*big.Float, bool) {
 //
 // A nil contract resolves to UnannotatedEffect (irreversible, unquantified): the
 // fail-closed default that makes an unannotated tool escalate under any ceiling.
-func ResolveEffect(contract *EffectContract, args map[string]interface{}) ResolvedEffect {
+func ResolveEffect(contract *EffectContract, args map[string]interface{}) *ResolvedEffect {
 	if contract == nil {
 		return UnannotatedEffect()
 	}
-	eff := ResolvedEffect{
+	eff := &ResolvedEffect{
 		Class:              contract.Class,
 		Idempotent:         contract.Idempotent,
 		CompensatingAction: contract.CompensatingAction,
@@ -475,7 +553,7 @@ func ResolveEffect(contract *EffectContract, args map[string]interface{}) Resolv
 	if spec != nil {
 		eff.Unit = spec.Unit
 		if v, ok := spec.resolve(args); ok {
-			eff.BlastRadius, eff.Quantified = v, true
+			eff.BlastRadius = v
 		}
 	}
 	return eff
@@ -520,24 +598,35 @@ func (t *EffectByArgument) match(args map[string]interface{}) (EffectCase, bool)
 // lookup matches a case key case-insensitively, the way an operator writes SQL verbs and
 // enum-ish argument values.
 //
-// It scans in SORTED key order rather than Go's randomized map order. The loader rejects
+// On a fold collision it resolves to the lexicographically SMALLEST matching key rather
+// than to whichever one Go's randomized map iteration reached first. The loader rejects
 // two case- or whitespace-variant keys that fold together (validateEffectByArgument), so a
 // manifest can no longer produce a collision — but a programmatically built contract still
 // can, and under map-order iteration that made the resolved effect class differ between
 // two identical calls. A nondeterministic verdict is disqualifying for a layer whose whole
 // claim is determinism, so the tie is broken stably here as well as rejected at load.
+//
+// Tracking the smallest match in one pass, rather than materializing and sorting the key
+// set, keeps that determinism allocation-free: this runs up to twice per enforced call
+// (the raw key, then the first verb) on the decision path, and the sort was O(n log n)
+// work plus a fresh slice to answer what is almost always a single-candidate question.
 func (t *EffectByArgument) lookup(key string) (EffectCase, bool) {
-	keys := make([]string, 0, len(t.Cases))
+	var (
+		best  string
+		found bool
+	)
 	for k := range t.Cases {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		if strings.EqualFold(strings.TrimSpace(k), key) {
-			return t.Cases[k], true
+		if !strings.EqualFold(strings.TrimSpace(k), key) {
+			continue
+		}
+		if !found || k < best {
+			best, found = k, true
 		}
 	}
-	return EffectCase{}, false
+	if !found {
+		return EffectCase{}, false
+	}
+	return t.Cases[best], true
 }
 
 // argumentMatchKey renders an argument value as the string the decision table matches on.
@@ -607,8 +696,14 @@ func (s *BlastRadiusSpec) resolveRaw(args map[string]interface{}) (*big.Float, b
 	case string:
 		// A numeric string ("250") is a magnitude; anything else is not. This does NOT
 		// fall through to counting characters — a free-form string has no magnitude, and
-		// inventing one would be exactly the inference this layer refuses to do.
-		return new(big.Float).SetString(strings.TrimSpace(v))
+		// inventing one would be exactly the inference this layer refuses to do. The same
+		// literal bound applies: a string argument is caller-supplied too, and a
+		// multi-million-digit one costs the same superlinear parse as the numeric form.
+		t := strings.TrimSpace(v)
+		if !NumericLiteralBounded(t) {
+			return nil, false
+		}
+		return new(big.Float).SetString(t)
 	case []interface{}:
 		// A list argument (recipients, row ids) contributes its LENGTH: "how many things
 		// does this touch" is the quantity a recipient-count or row-count bound means.
@@ -619,9 +714,9 @@ func (s *BlastRadiusSpec) resolveRaw(args map[string]interface{}) (*big.Float, b
 }
 
 // String renders a resolved effect for an operator-facing message.
-func (e ResolvedEffect) String() string {
+func (e *ResolvedEffect) String() string {
 	parts := []string{"class=" + e.Class}
-	if e.Quantified {
+	if e.Quantified() {
 		br := "blastRadius=" + e.BlastRadius.Text('f', -1)
 		if e.Unit != "" {
 			br += " " + e.Unit
@@ -642,12 +737,18 @@ func (e ResolvedEffect) String() string {
 // AuditDetails renders a resolved effect as the structured fields an audit record and a
 // denial detail carry. Sorted, scalar values only — never free-form prose in a structured
 // field.
-func (e ResolvedEffect) AuditDetails() map[string]interface{} {
+func (e *ResolvedEffect) AuditDetails() map[string]interface{} {
 	d := map[string]interface{}{
+		// A stable discriminator saying THIS refusal came from the effect layer, so an
+		// operator (or a SIEM rule) can select every effect-layer record on one key
+		// instead of enumerating the layer's other details. Set here, once, rather than at
+		// each denial site: it was stamped by hand at four of them, which is a marker one
+		// new site forgets and a reader then reads as "not an effect refusal".
+		"effect":       true,
 		"effect_class": e.Class,
 		"annotated":    e.Annotated,
 	}
-	if e.Quantified {
+	if e.Quantified() {
 		d["blast_radius"] = e.BlastRadius.Text('f', -1)
 		if e.Unit != "" {
 			d["blast_radius_unit"] = e.Unit

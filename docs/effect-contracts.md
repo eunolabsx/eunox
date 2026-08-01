@@ -72,7 +72,10 @@ capabilities:
   not counted by characters, because inventing a magnitude is the inference this layer
   refuses to do. A **negative** argument value also resolves to unquantified: a magnitude
   is non-negative by construction, so a negative one is caller-supplied nonsense, and
-  treating it as a very small number would pass every bound.
+  treating it as a very small number would pass every bound. A magnitude outside the
+  shared numeric-literal bound (1024 characters, exponent within +/-1024) likewise resolves
+  to unquantified rather than being parsed: `1e100000000` is twelve caller-supplied bytes
+  that expand to gigabytes when a denial renders them, and an argument is caller-supplied.
 - Every `argument` reference — here and in `byArgument` — obeys the **same `$.` nested-path
   grammar** the conditions use: `$.filters.query` traverses into a nested object, and
   `$$.x` addresses a literal top-level key named `$.x`. A malformed path resolves to
@@ -164,10 +167,15 @@ antecedent nor a stranded flow label — it was never forwarded.
 
 `requireCompensation` applies only to an action already **above** `maxEffectClass`;
 demanding a compensating action for a reversible read would be noise. It therefore requires
-`maxEffectClass` to be set — the loader rejects it alone, and a ceiling carrying only
-`requireCompensation` does not count as set at all, so the library seam that takes a
-ceiling directly cannot end up with one that reports itself active while being
-structurally incapable of refusing anything.
+`maxEffectClass` to be set, and the loader rejects every shape where it is not. Two
+different things enforce that for the library seam that takes a ceiling directly, since
+that seam never passes through the loader: a ceiling carrying **only**
+`requireCompensation` does not count as set at all, so it cannot report itself active while
+being structurally incapable of refusing anything; and a ceiling carrying
+`requireCompensation` **alongside `maxBlastRadius` but no `maxEffectClass`** — which *is*
+set, and whose compensation leg still could never fire — exceeds outright, with the reason
+`ceiling_misconfigured`. A ceiling leg that cannot be evaluated must not read as "checked
+and fine".
 
 ## `escalate` is a refusal, not a pending state
 
