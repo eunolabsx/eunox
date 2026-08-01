@@ -46,17 +46,23 @@ eunox/
 │   ├── drift/              # Startup manifest-drift comparison policy
 │   ├── mcp/                # MCP message types + JSON-RPC envelope/framing layer
 │   ├── pdp/                # Policy decision points (ManifestPDP, JWTPDP, ...)
+│   ├── registry/           # Effect-contract corpus format + loader/verifier
 │   └── transport/          # stdio + HTTP/gateway transport runtime
 ├── pkg/                    # Importable packages
-│   ├── capability/         # Constraint types, conditions, JWKS verification
+│   ├── capability/         # Constraint types, conditions, effect contracts, JWKS verification
 │   ├── callcounter/        # Rate-limit call counting (in-memory and Redis)
 │   ├── circuitbreaker/     # Circuit-breaker (guards JWKS endpoint fetches)
+│   ├── durationsentinel/   # Distinguishes an unset duration from an explicit zero
 │   ├── enforcement/        # PDP enforcement engine
+│   ├── flowlabelstore/     # Session-scoped information-flow label state (in-memory and Redis)
 │   └── killswitch/         # Emergency kill switch (in-memory and Redis)
-├── schemas/                # JSON Schemas for the gateway config / manifest
+├── schemas/                # JSON Schemas for the gateway config and the effect-contract corpus
+├── registry/               # Effect-contract corpus (data + its own README)
+├── examples/               # Example config, policies, and the attribution client stub
 ├── demo/                   # Runnable demo stack (Docker Compose + scripts)
 ├── deploy/docker/          # Dockerfiles for eunox
 ├── docs/                   # Documentation
+├── site/                   # Project website sources
 └── scripts/                # Development scripts (benchmarks, etc.)
 ```
 

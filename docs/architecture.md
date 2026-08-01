@@ -83,7 +83,7 @@ Three layers, one module:
 | Layer | Role |
 | ----- | ---- |
 | `cmd/eunox/` | The binary: CLI subcommands, transport wiring, and PDP wiring. |
-| `internal/` | Subsystems factored out of the binary behind narrow seams, importable only within this module: `internal/audit` (the tamper-evident audit log, consumed through the exported `audit.Sink`), `internal/mcp` (the MCP protocol message types plus the JSON-RPC envelope/newline-framing/classification layer — `RPCMsg`, `MsgReader`/`MsgWriter`, `MsgKey`, the response builders — shared by the transports, PDPs, and the CLI's live-upstream probe), `internal/pdp` (the policy decision points — the `PolicyDecisionPoint` contract and its `ManifestPDP`/`JWTPDP`/`AlwaysAllowPDP` implementations), `internal/config` (the config + manifest loading layer — `GatewayConfig` parsing, `LocalManifest` load/validate/merge, schema-version negotiation), `internal/drift` (the startup manifest-drift-comparison policy — `CheckManifestDrift`/`MakeDriftCheck`/`UpstreamTool`/`Warning`/`ParseToolsListResult`, and the `CheckFunc` hook type; shared by the binary's `validate --live` and the transport runtime), and `internal/transport` (the stdio + HTTP/gateway transport runtime — the proxies, the shared dispatch/forward/enforcement core, the remote-upstream bridge, the route wiring, and the control-token/OAuth-metadata/health endpoints; the binary constructs the proxies and calls `Start`/`Serve`). `internal/mcp` is the layering foundation for `internal/pdp` and `internal/transport`; `internal/config` and `internal/drift` are sibling lower layers (`internal/drift` builds on `internal/{config,mcp,pdp}` + `pkg/*`) that both the CLI and the transport layer import. |
+| `internal/` | Subsystems factored out of the binary behind narrow seams, importable only within this module: `internal/audit` (the tamper-evident audit log, consumed through the exported `audit.Sink`), `internal/mcp` (the MCP protocol message types plus the JSON-RPC envelope/newline-framing/classification layer — `RPCMsg`, `MsgReader`/`MsgWriter`, `MsgKey`, the response builders — shared by the transports, PDPs, and the CLI's live-upstream probe), `internal/pdp` (the policy decision points — the `PolicyDecisionPoint` contract and its `ManifestPDP`/`JWTPDP`/`AlwaysAllowPDP` implementations), `internal/config` (the config + manifest loading layer — `GatewayConfig` parsing, `LocalManifest` load/validate/merge, schema-version negotiation), `internal/drift` (the startup manifest-drift-comparison policy — `CheckManifestDrift`/`MakeDriftCheck`/`UpstreamTool`/`Warning`/`ParseToolsListResult`, and the `CheckFunc` hook type; shared by the binary's `validate --live` and the transport runtime), `internal/registry` (the effect-contract corpus format and its loader/verifier — authoring-time input only, never consulted on the decision path), and `internal/transport` (the stdio + HTTP/gateway transport runtime — the proxies, the shared dispatch/forward/enforcement core, the remote-upstream bridge, the route wiring, and the control-token/OAuth-metadata/health endpoints; the binary constructs the proxies and calls `Start`/`Serve`). `internal/mcp` is the layering foundation for `internal/pdp` and `internal/transport`; `internal/config` and `internal/drift` are sibling lower layers (`internal/drift` builds on `internal/{config,mcp,pdp}` + `pkg/*`) that both the CLI and the transport layer import. |
 | `pkg/` | Importable libraries: the enforcement engine, manifest/condition types, and the operational backends. Apache-2.0, reusable outside the proxy. |
 
 Within `pkg/`:
@@ -268,6 +268,15 @@ Conditions are string-discriminated types (authoritative list in
 `recipientDomain`, `sequenceBlock`, `policy`, `custom`.
 Conditions match a specific argument name and never silently match
 alternatives; an unset argument fails the condition (fail closed).
+
+Four further discriminators — `flowLabel` and the `labelOutput` directive
+(information flow), `effectClass` and `blastRadius` (effect) — plus a
+constraint's `effect` contract and the top-level `effectCeiling` are
+**experimental** and staged behind `schemaVersion: "0.2-draft"`. They are not
+part of the published `0.1` grammar: a `0.1` manifest that uses one is refused at
+load, fail closed. They are deliberately absent from the manifest guide and from
+`schemas/` until a batched grammar bump publishes them. See
+[effect-contracts.md](./effect-contracts.md) for the effect layer.
 
 The `Engine` evaluates conditions through a `ConditionHandler` registry —
 built-ins are registered at construction, and embedders can register their
