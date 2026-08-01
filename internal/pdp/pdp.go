@@ -1692,6 +1692,16 @@ func (p *ManifestPDP) DecideResourceRead(ctx context.Context, sessionID, uri, so
 // applies, so what a session may cancel is exactly what it may see listed. A poisoned or
 // otherwise unreadable entry is not a consideration here: a cancel names a URI, not a
 // catalog entry, and carries no description a host renders.
+//
+// The matched entry's per-constraint observe posture (enforcement: audit) IS carried onto
+// the response, exactly as decideTarget's stamp does for a read. Building the response
+// directly here skips that stamp, and dropping it broke the method in both directions on
+// an observe entry: the read deny was downgraded and FORWARDED (the subscription really
+// opened) while the cancel deny stayed hard, restoring the very dead end this entry point
+// removes — and on the allowing spelling the tape recorded audit_only=true for the read and
+// audit_only=false for the unsubscribe, claiming an observe-only entry enforced the cancel.
+// A no-match deny carries no entry and so no posture, which is right: there is nothing
+// declaring observe mode for a URI the manifest never names.
 func (p *ManifestPDP) DecideResourceCancel(ctx context.Context, sessionID, uri, _ string) capability.EnforceResponse {
 	if deny := p.CheckKill(ctx, sessionID); deny != nil {
 		return *deny
@@ -1703,10 +1713,21 @@ func (p *ManifestPDP) DecideResourceCancel(ctx context.Context, sessionID, uri, 
 			fmt.Sprintf("resource %q is not permitted by the capability manifest, so there is no subscription to it to cancel", uri))
 	}
 	if !containsAction(c.Actions, requiredActionFor(capability.TargetTypeResource)) {
-		return denyResponse(p.engineClock(), capability.ErrCodeCapabilityDenied, "",
-			fmt.Sprintf("resource %q is present in the manifest but not with the %q action, so there is no subscription to it to cancel", uri, requiredActionFor(capability.TargetTypeResource)))
+		return withCancelAuditPosture(denyResponse(p.engineClock(), capability.ErrCodeCapabilityDenied, "",
+			fmt.Sprintf("resource %q is present in the manifest but not with the %q action, so there is no subscription to it to cancel", uri, requiredActionFor(capability.TargetTypeResource))), c)
 	}
-	return newAllowResponse(p.engineClock())
+	return withCancelAuditPosture(newAllowResponse(p.engineClock()), c)
+}
+
+// withCancelAuditPosture stamps the matched constraint's enforcement: audit posture onto a
+// cancel response, the one field decideTarget's stamp contributes that a match-only
+// decision still needs. Everything else stamp does (obligations, flow labels, condition
+// details) describes work a cancel deliberately does not perform.
+func withCancelAuditPosture(r capability.EnforceResponse, matched *capability.Constraint) capability.EnforceResponse {
+	if matched.IsAuditOnly() {
+		r.AuditOnly = true
+	}
+	return r
 }
 
 // DecideSampling implements SamplingAuthorizer. The kill switch is checked first

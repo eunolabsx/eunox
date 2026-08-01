@@ -939,7 +939,20 @@ func (p *JWTPDP) DecideResourceCancel(ctx context.Context, sessionID, uri, sourc
 			return denyResponse(p.clock, capability.ErrCodeAuthorizationFailed, "jwtCapability",
 				fmt.Sprintf("resource %q is not in the JWT capability claims, so this token holds no subscription to it to cancel", uri))
 		}
+		// The plain nil check, matching the same branch in Decide and for the same reason:
+		// the token has ALREADY authorized this URI against its exhaustive allowlist, so
+		// delegating to a permissive inner can only re-affirm — a weaker gate cannot fail
+		// open here. Using innerEnforces() instead made the two legs of one subscription
+		// disagree on a wiretap route: the same token was allowed the subscribe (Decide's
+		// nil check reaches AlwaysAllowPDP) and denied the unsubscribe.
+		if p.inner != nil {
+			return p.inner.DecideResourceCancel(ctx, sessionID, uri, sourceIP)
+		}
+		return newAllowResponse(p.clock)
 	}
+	// No mcp.capabilities claim: the JWT ABSTAINS, so a permissive inner would fail open
+	// and only a real policy can authorize. That is the stricter innerEnforces() gate, the
+	// same asymmetry Decide documents.
 	if p.innerEnforces() {
 		return p.inner.DecideResourceCancel(ctx, sessionID, uri, sourceIP)
 	}
@@ -1698,16 +1711,11 @@ func buildConstraintsFromParsed(heads []capHead, target EnforceTarget) []capabil
 	return out
 }
 
-// anyCapCovers reports whether any pre-parsed claim head covers target. Conditions
-// are not consulted — a list response carries no arguments — so a target is retained
-// whenever a claim matches its namespace and bare name. It takes the same []capHead
-// the Decide path caches (JWTClaims.parsedCaps) so list filtering and Decide share
-// one claim parser instead of maintaining a second name-only variant.
 // parsedCapHeads returns the claim heads parsed once at token validation, falling back to
 // parsing them here for a JWTClaims built directly (tests, and any caller that set
-// Capabilities without going through ValidateToken). Three paths need the same fallback —
-// the capability decision, the list filter, and the malformed-claim diagnosis — so it is
-// written once rather than re-spelled at each.
+// Capabilities without going through ValidateToken). Four paths need the same fallback —
+// the capability decision, the list filter, the malformed-claim diagnosis, and the
+// resources/unsubscribe cancel check — so it is written once rather than re-spelled at each.
 func parsedCapHeads(claims *JWTClaims) []capHead {
 	if claims.parsedCaps != nil {
 		return claims.parsedCaps
@@ -1715,6 +1723,13 @@ func parsedCapHeads(claims *JWTClaims) []capHead {
 	return parseCapHeads(claims.Capabilities)
 }
 
+// anyCapCovers reports whether any pre-parsed claim head covers target. Conditions
+// are not consulted — a list response carries no arguments, and a cancel names only a URI —
+// so a target is retained whenever a claim matches its namespace and bare name. That
+// condition-blindness is exactly what makes it the right predicate for DecideResourceCancel,
+// which is a match-only decision by design. It takes the same []capHead the Decide path
+// caches (JWTClaims.parsedCaps) so list filtering, cancellation, and Decide share one claim
+// parser instead of maintaining a second name-only variant.
 func anyCapCovers(parsed []capHead, target EnforceTarget) bool {
 	for _, c := range parsed {
 		if c.prefix == target.Type && matchClaimBare(c.prefix, c.bareName, target.Name) {

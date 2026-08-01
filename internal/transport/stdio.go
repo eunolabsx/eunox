@@ -206,7 +206,7 @@ type StdioProxy struct {
 
 	// onReady is the post-startup hook, run once the session is live. Set from
 	// StdioProxyOptions.OnReady at construction; see that field.
-	onReady func()
+	onReady func(ctx context.Context)
 }
 
 // StdioProxyOptions configures a StdioProxy. The upstream is either a local
@@ -261,10 +261,14 @@ type StdioProxyOptions struct {
 	// of Start. Running the hook before them let a doomed process clobber a RUNNING
 	// proxy's published state on its way to dying.
 	//
+	// It receives Start's context so an effect that talks to a network service bounds its
+	// round-trip by the proxy's own lifetime rather than running detached — the gateway
+	// hook's contract too, and what keeps a cancelled startup from landing a write.
+	//
 	// Unlike AfterListen it returns no error: its callers are advisory (a failure warns and
 	// the proxy runs on), and there is no useful "abort startup" for an effect whose whole
 	// contract is best-effort. It is called exactly once, on the success path only.
-	OnReady func()
+	OnReady func(ctx context.Context)
 }
 
 // NewStdioProxy creates a StdioProxy ready to call Start.
@@ -460,7 +464,7 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 	// hook run ahead of them would let a proxy that never comes up overwrite shared state a
 	// running one owns. Nothing between this line and the serve loop can fail.
 	if p.onReady != nil {
-		p.onReady()
+		p.onReady(ctx)
 	}
 
 	// ── 6. Serve host until stdin closes ───────────────────────────────────────

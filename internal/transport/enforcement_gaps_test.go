@@ -1498,28 +1498,40 @@ func TestGap3_ResourcesUnsubscribe_IsEnforcedMethod(t *testing.T) {
 	}
 }
 
-// The audit-mode banner must not promise to forward more than the dispatcher handles: its
-// method list is derived from the two routing tables, so a method added to either shows up
-// in the banner automatically, and one that is NOT dispatched is never advertised.
-func TestDispatchedMethodSummary_DerivedFromRoutingTables(t *testing.T) {
+// The audit-mode banner must name exactly the ENFORCED set — the methods that reach the
+// upstream AND leave a decision record — and its list is derived from decideMethodHandlers,
+// so a newly enforced method shows up automatically. The locally-answered half must NOT be
+// advertised as "forwarded and logged": initialize and ping never touch the upstream and
+// write no record, and the …/list flavors are recorded as enumeration events, not decisions.
+func TestEnforcedMethodSummary_DerivedFromTheDecideTable(t *testing.T) {
 	for _, m := range []string{
 		capability.MethodToolsCall,
 		capability.MethodResourcesRead,
 		capability.MethodResourcesSubscribe,
 		capability.MethodResourcesUnsubscribe,
 		capability.MethodPromptsGet,
+	} {
+		if !strings.Contains(enforcedMethodSummary, m) {
+			t.Errorf("enforced method %q missing from the audit-mode banner summary %q", m, enforcedMethodSummary)
+		}
+	}
+	for _, m := range []string{
 		capability.MethodToolsList,
 		capability.MethodResourcesList,
 		capability.MethodPromptsList,
 		mcp.MethodInitialize,
 		methodPing,
 	} {
-		if !strings.Contains(dispatchedMethodSummary, m) {
-			t.Errorf("dispatched method %q missing from the audit-mode banner summary %q", m, dispatchedMethodSummary)
+		if strings.Contains(enforcedMethodSummary, m) {
+			t.Errorf("locally-answered method %q must not be advertised as forwarded and logged: %q", m, enforcedMethodSummary)
+		}
+		if _, ok := locallyAnsweredHandlers[m]; !ok {
+			t.Errorf("%q is expected to be locally answered, but is not in the table", m)
 		}
 	}
+	// The banner's caveat names these as NOT dispatched, so neither table may claim them.
 	for _, m := range []string{"completion/complete", "logging/setLevel", "resources/templates/list"} {
-		if strings.Contains(dispatchedMethodSummary, m) {
+		if strings.Contains(enforcedMethodSummary, m) {
 			t.Errorf("method %q is NOT dispatched (it hits the fail-closed default) but the banner advertises it", m)
 		}
 		if _, ok := decideMethodHandlers[m]; ok {

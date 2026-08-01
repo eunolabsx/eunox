@@ -287,6 +287,19 @@ func LogChainFiles(logPath string) ([]string, error) {
 	return files, nil
 }
 
+// syncLogDir fsyncs the log's parent directory so a rotation's just-published directory
+// entry survives a crash (see the call sites for what each one makes durable). It routes
+// through the Sink's own seam (syncDirOverride) rather than a package-level function
+// variable, so a test observing these fsyncs cannot race the drainer goroutine of another
+// test's Sink; production leaves the override nil and gets syncDir.
+func (s *Sink) syncLogDir() {
+	fn := s.syncDirOverride
+	if fn == nil {
+		fn = syncDir
+	}
+	fn(filepath.Dir(s.logPath), "audit log")
+}
+
 // swapToFreshBase completes a rotation once a fresh base log f has been opened,
 // running the tail that rotate() (clean rotation) and retryRotateReopen() (fallback
 // recovery) share so it cannot drift between them: it tightens the new file's mode,
@@ -302,19 +315,6 @@ func LogChainFiles(logPath string) ([]string, error) {
 // keeps AuditDegraded() accurate, matching Close's treatment of the same operation.
 // closeErrContext labels that stderr line so each caller keeps its own provenance
 // ("rotated fd" vs "fallback fd").
-// syncLogDir fsyncs the log's parent directory so a rotation's just-published directory
-// entry survives a crash (see the call sites for what each one makes durable). It routes
-// through the Sink's own seam (syncDirOverride) rather than a package-level function
-// variable, so a test observing these fsyncs cannot race the drainer goroutine of another
-// test's Sink; production leaves the override nil and gets syncDir.
-func (s *Sink) syncLogDir() {
-	fn := s.syncDirOverride
-	if fn == nil {
-		fn = syncDir
-	}
-	fn(filepath.Dir(s.logPath), "audit log")
-}
-
 func (s *Sink) swapToFreshBase(f *os.File, closeErrContext string) {
 	tightenLogMode(f, s.logPath)
 	// Make the fresh base's DIRECTORY ENTRY durable, not just its (empty) data. Creating

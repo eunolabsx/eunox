@@ -323,3 +323,88 @@ func TestJWTPDP_DecideResourceCancel_IdentityOnlyTokenUnpolicedRouteDenied(t *te
 	require.NotNil(t, resp.Denial)
 	assert.Equal(t, capability.ErrCodeAuthorizationFailed, resp.Denial.Code)
 }
+
+// -----------------------------------------------------------------
+// The per-entry observe posture, and the JWT inner gate
+// -----------------------------------------------------------------
+
+// An entry marked `enforcement: audit` declares observe mode for the whole entry. The read
+// decision carries that posture onto its response (AuditOnly), which the transport's
+// observe gate reads to downgrade a deny into a logged forward. The cancel decision must
+// carry it too — dropping it broke the method in BOTH directions.
+func TestDecideResourceCancel_CarriesTheEntryObservePosture(t *testing.T) {
+	t.Parallel()
+
+	t.Run("deny keeps the posture, so the cancel is downgradable like the read", func(t *testing.T) {
+		// actions:[write] means neither the read nor the cancel matches the required
+		// action, so both DENY. Under enforcement: audit the read's deny is downgraded and
+		// the subscription really opens; a cancel deny that lost the posture would be hard,
+		// leaving the host with a stream it cannot close.
+		p := newCancelPDP(capability.Constraint{
+			Target:      "resource:file:///data/live/*",
+			Actions:     []string{"write"},
+			Enforcement: capability.EnforcementAudit,
+		})
+		ctx := context.Background()
+
+		read := p.DecideResourceRead(ctx, cancelSess, cancelURI, "")
+		require.Equal(t, capability.DecisionDeny, read.Decision)
+		require.True(t, read.AuditOnly, "the read deny must be downgradable (test premise)")
+
+		cancel := p.DecideResourceCancel(ctx, cancelSess, cancelURI, "")
+		require.Equal(t, capability.DecisionDeny, cancel.Decision)
+		assert.True(t, cancel.AuditOnly,
+			"an observe-mode entry must leave the cancel deny downgradable too, or the subscribe opens a stream the unsubscribe cannot close")
+	})
+
+	t.Run("allow keeps the posture, so the tape does not misreport the entry", func(t *testing.T) {
+		p := newCancelPDP(capability.Constraint{
+			Target:      "resource:file:///data/live/*",
+			Actions:     []string{"read"},
+			Enforcement: capability.EnforcementAudit,
+		})
+		ctx := context.Background()
+
+		read := p.DecideResourceRead(ctx, cancelSess, cancelURI, "")
+		require.Equal(t, capability.DecisionAllow, read.Decision)
+		require.True(t, read.AuditOnly, "the read allow is stamped observe (test premise)")
+
+		cancel := p.DecideResourceCancel(ctx, cancelSess, cancelURI, "")
+		require.Equal(t, capability.DecisionAllow, cancel.Decision)
+		assert.True(t, cancel.AuditOnly,
+			"audit_only must match the read's, or the record claims an observe-only entry enforced the cancel")
+	})
+
+	t.Run("a no-match deny carries no posture", func(t *testing.T) {
+		p := newCancelPDP(capability.Constraint{
+			Target:      "resource:file:///other/*",
+			Actions:     []string{"read"},
+			Enforcement: capability.EnforcementAudit,
+		})
+		resp := p.DecideResourceCancel(context.Background(), cancelSess, cancelURI, "")
+		require.Equal(t, capability.DecisionDeny, resp.Decision)
+		assert.False(t, resp.AuditOnly,
+			"no entry names this URI, so nothing declares observe mode for it")
+	})
+}
+
+// The JWT cancel must use the SAME inner gate Decide uses once the token's exhaustive
+// allowlist has already authorized the target — the plain nil check, not innerEnforces().
+// With the stricter gate the two legs of one subscription disagreed on a wiretap route: the
+// same token was allowed the subscribe and denied the unsubscribe.
+func TestJWTPDP_DecideResourceCancel_WiretapInnerMatchesSubscribeLeg(t *testing.T) {
+	t.Parallel()
+	key := newTestKey(t, "cancel-wiretap")
+	p, cleanup := makeJWTPDPWithInner(t, key, AlwaysAllowPDP{})
+	defer cleanup()
+
+	ctx, err := p.ValidateToken(context.Background(), "Bearer "+makeJWTToken(t, key, []string{"resource:file:///data/live/*"}))
+	require.NoError(t, err)
+
+	// The subscribe leg goes through Decide, whose HasCapabilities branch uses `inner != nil`.
+	sub := p.DecideResourceRead(ctx, cancelSess, cancelURI, "")
+	require.Equal(t, capability.DecisionAllow, sub.Decision, "the subscribe leg allows (test premise)")
+
+	assert.Equal(t, capability.DecisionAllow, p.DecideResourceCancel(ctx, cancelSess, cancelURI, "").Decision,
+		"the cancel must not be denied where the subscribe was allowed: one token, one URI, one route")
+}

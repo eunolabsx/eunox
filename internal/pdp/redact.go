@@ -276,20 +276,28 @@ type redactSpec struct {
 //     "ssn" and "SSN" has two candidate fields where the obligation named one. A host that
 //     binds the result into a struct resolves that pair case-insensitively and may render
 //     the sibling this walk did not mask, so the bytes cannot verify the obligation.
-//   - The protocol-reserved envelope keys (mcpReservedRootKeys). ApplyRedactObligs
-//     dispatches on them EXACTLY — result["content"] gets the content-array treatment, with
-//     its fail-closed guards on resource items and anomalous shapes, while anything else
-//     falls to the weaker generic sibling walk. So {"content":[],"Content":[{"type":
-//     "resource",…}]} passes the strict pass over an empty array and the lenient one over
-//     the payload, while a case-insensitive host binds the payload as its content. The
-//     variant spelling has to be refused, not silently downgraded to the generic walk.
+//   - Every key ApplyRedactObligs itself DISPATCHES on exactly — the protocol-reserved
+//     envelope keys (mcpReservedRootKeys) and the content-item keys (mcpContentItemKeys).
+//     An exact-match dispatch is a resolution: result["content"] gets the content-array
+//     treatment, with its fail-closed guards on resource items and anomalous shapes, while
+//     anything else falls to the weaker generic sibling walk. So {"content":[],"Content":
+//     [{"type":"resource",…}]} passes the strict pass over an empty array and the lenient
+//     one over the payload, while a case-insensitive host binds the payload as its content.
+//     One level down, obj["text"] is the same story: {"type":"text","text":"benign",
+//     "Text":"<secret>"} leaves the redactor inspecting the benign body while such a host
+//     renders the sibling, and since nothing matched, the ORIGINAL bytes are forwarded with
+//     the record reporting the obligation applied. Both variant spellings have to be
+//     refused, not silently routed to a weaker pass.
 //
 // Segments are collected from the whole path (not just its head) because a leaf scan sees
 // the blob's own root, where "data.ssn" is looked up as "ssn". Folding at every depth costs
 // only over-refusal on a nested case-variant pair, which is a denial, never a bypass.
 func redactionFoldKeys(paths []string) map[string]struct{} {
-	fold := make(map[string]struct{}, len(paths)+len(mcpReservedRootKeys))
+	fold := make(map[string]struct{}, len(paths)+len(mcpReservedRootKeys)+len(mcpContentItemKeys))
 	for k := range mcpReservedRootKeys {
+		fold[capability.FoldJSONKey(k)] = struct{}{}
+	}
+	for k := range mcpContentItemKeys {
 		fold[capability.FoldJSONKey(k)] = struct{}{}
 	}
 	for _, p := range paths {
@@ -614,6 +622,21 @@ func redactJSONValue(val interface{}, paths []string) bool {
 // result a spec-conformant host cannot decode at all — a hard protocol failure in place of
 // the field-level masking the operator asked for. content/structuredContent additionally
 // have their own shape-specific passes, which redact WITHIN them.
+// mcpContentItemKeys are the keys ApplyRedactObligs reads EXACTLY off a `content` item:
+// obj["type"] selects the per-type treatment (text redacted, image/audio passed through,
+// resource/resource_link failed closed), and obj["text"] is the body it then walks.
+//
+// They are in the case-variant fold scope for the same reason the reserved ROOT keys are:
+// an exact-match dispatch is a resolution, so a case variant routes the redactor to one
+// value while a case-insensitive consumer binds the other. Unlike the root keys they are
+// NOT exempted from path matching (envelopeRootExempt) — a redact path may legitimately
+// name a field called "text" nested in some payload, and masking it is what the operator
+// asked for.
+var mcpContentItemKeys = map[string]struct{}{
+	"type": {},
+	"text": {},
+}
+
 var mcpReservedRootKeys = map[string]struct{}{
 	"content":           {},
 	"structuredContent": {},

@@ -45,7 +45,7 @@ func TestProxyPublishesSessionKillTTL_ForTheKillCLI(t *testing.T) {
 		require.NoError(t, err)
 		ksRedis := backends.ksRedis
 		require.NotNil(t, ksRedis)
-		publishSessionKillTTL(ksRedis)
+		publishSessionKillTTL(context.Background(), ksRedis)
 	})
 
 	got, err := mr.Get(publishedTTLKey)
@@ -58,7 +58,7 @@ func TestProxyPublishesSessionKillTTL_ForTheKillCLI(t *testing.T) {
 		backends, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, false, 0, -1, 0)
 		require.NoError(t, err)
 		ksRedis := backends.ksRedis
-		publishSessionKillTTL(ksRedis)
+		publishSessionKillTTL(context.Background(), ksRedis)
 	})
 	got, err = mr.Get(publishedTTLKey)
 	require.NoError(t, err)
@@ -76,7 +76,7 @@ func TestProxyPublishSessionKillTTL_WarnsOnADifferingPriorValue(t *testing.T) {
 		backends, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, false, 0, 90*time.Minute, 0)
 		require.NoError(t, err)
 		ksRedis := backends.ksRedis
-		publishSessionKillTTL(ksRedis)
+		publishSessionKillTTL(context.Background(), ksRedis)
 	})
 	require.Contains(t, stderr, "24h0m0s", "the warning must name the value being replaced")
 	require.Contains(t, stderr, "1h30m0s", "and the value replacing it")
@@ -86,7 +86,7 @@ func TestProxyPublishSessionKillTTL_WarnsOnADifferingPriorValue(t *testing.T) {
 		backends, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, false, 0, 90*time.Minute, 0)
 		require.NoError(t, err)
 		ksRedis := backends.ksRedis
-		publishSessionKillTTL(ksRedis)
+		publishSessionKillTTL(context.Background(), ksRedis)
 	})
 	require.NotContains(t, stderr, "already advertised")
 }
@@ -293,7 +293,7 @@ func TestCmdKill_ExpiredPublishedTTL_FallsBackAndSaysSo(t *testing.T) {
 		require.NoError(t, err)
 		ksRedis := backends.ksRedis
 		require.NotNil(t, ksRedis)
-		publishSessionKillTTL(ksRedis)
+		publishSessionKillTTL(context.Background(), ksRedis)
 	})
 	require.NotZero(t, mr.TTL(publishedTTLKey), "precondition: the published key must carry an expiry")
 
@@ -490,7 +490,7 @@ func TestPublishSessionKillTTL_WarnsButDoesNotAbortStartup(t *testing.T) {
 	ksRedis := killswitch.NewRedis(client, killswitch.WithSessionKillTTL(0))
 	mr.Close()
 
-	stderr := captureStderr(t, func() { publishSessionKillTTL(ksRedis) })
+	stderr := captureStderr(t, func() { publishSessionKillTTL(context.Background(), ksRedis) })
 	require.Contains(t, stderr, "WARNING")
 	require.Contains(t, stderr, "--killswitch-session-ttl", "the warning must say what the CLI falls back to")
 }

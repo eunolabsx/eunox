@@ -1932,10 +1932,13 @@ metadata (`_meta`, content annotations) are preserved unchanged.
 >   redact nothing and be forwarded byte-for-byte while the host renders the ssn.
 > - A **case-variant collision** on a key this redaction depends on resolving — a segment
 >   of one of your redact paths (`data` alongside `Data` under `redactFields:
->   ["data.ssn"]`), or one of the result envelope's protocol keys (`content` alongside
->   `Content`), which the proxy matches exactly when deciding which pass to apply. A
->   consumer that binds keys case-insensitively folds such a pair to one field where the
->   proxy saw two.
+>   ["data.ssn"]`), or one of the keys the proxy matches exactly when deciding which pass to
+>   apply: the result envelope's protocol keys (`content` alongside `Content`) and a content
+>   item's own `type` / `text`. A consumer that binds keys case-insensitively folds such a
+>   pair to one field where the proxy saw two, so `{"type":"text","text":"benign","Text":
+>   "<secret>"}` would leave the proxy inspecting the benign body while the host renders the
+>   sibling. Naming `text` in a redact path is unaffected — it still masks a field called
+>   `text` wherever one appears.
 >
 > Case variants of names your obligation does not touch are ordinary data and are **not**
 > refused: a payload carrying both `Report` and `report` under `redactFields: ["data.ssn"]`

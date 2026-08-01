@@ -110,7 +110,7 @@ upstreams:
 	ctx, cancel := context.WithCancel(context.Background())
 	serveErr := make(chan error, 1)
 	go func() {
-		serveErr <- serveHTTPGateway(ctx, cfg, sink, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), pf, func() {})
+		serveErr <- serveHTTPGateway(ctx, cfg, sink, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), pf, func(context.Context) {})
 	}()
 	// Tear the gateway down even if an assertion below fails early, and confirm a
 	// graceful return (Serve returns nil once its context is cancelled).

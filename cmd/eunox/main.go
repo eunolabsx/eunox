@@ -639,9 +639,9 @@ func cmdProxy(args []string) (exitCode int) {
 	// is the same clobber-then-die bug already fixed once for the control-token file, and it
 	// is why the hook is threaded all the way into the transports rather than called after
 	// the fallible startup steps that happen to precede this line.
-	onServeReady := func() {}
+	onServeReady := func(context.Context) {}
 	if ksRedis != nil {
-		onServeReady = func() { publishSessionKillTTL(ksRedis) }
+		onServeReady = func(ctx context.Context) { publishSessionKillTTL(ctx, ksRedis) }
 		ksRedis.Start(ctx)
 		// Join the Redis kill-switch's pub/sub listener and reconcile loop on
 		// shutdown; otherwise they outlive cmdProxy and may touch the shared Redis
@@ -802,11 +802,17 @@ func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, ki
 // before the key existed. A prior value that differs is reported too — the key is
 // last-writer-wins, so two differently configured proxies on one Redis leave `eunox
 // kill` adopting whichever started last.
-func publishSessionKillTTL(ksRedis *killswitch.Redis) {
-	// Bounded and detached: this runs during startup wiring, before the proxy's own
-	// run context exists, and must not hang the boot on a Redis that answered PING and
-	// then stalled.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+//
+// parent is the ready hook's context, and the write is bounded BY it rather than detached
+// from it. That is what makes the abandonment case safe: the gateway's post-bind hook runs
+// on its own goroutine and is abandoned at hookCtx expiry, so a caller that merely CHECKED
+// ctx.Err() before calling would still let a doomed proxy's SET land — replacing a running
+// proxy's advertised TTL with one nothing enforces, exactly the clobber this hook's
+// placement exists to prevent. Deriving from parent cancels the round-trip instead. The 5s
+// cap still applies on top, so a Redis that answered PING and then stalled cannot hang the
+// boot even when parent has no deadline.
+func publishSessionKillTTL(parent context.Context, ksRedis *killswitch.Redis) {
+	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
 	prior, differs, err := ksRedis.PublishSessionKillTTL(ctx)
 	if err != nil {
@@ -1589,7 +1595,7 @@ func resolveOAuthMetadata(cfg *config.GatewayConfig, pf proxyFlags) (*transport.
 
 // serveHTTPGateway serves cfg's upstreams over an HTTP listener, one /mcp/<name>
 // route each (the gateway shape).
-func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audit.Sink, counter capability.CallCounter, flowStore capability.FlowLabelStore, ks killswitch.Manager, pf proxyFlags, onServeReady func()) error { //nolint:gocritic // hugeParam: pf is a small flag bundle
+func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audit.Sink, counter capability.CallCounter, flowStore capability.FlowLabelStore, ks killswitch.Manager, pf proxyFlags, onServeReady func(context.Context)) error { //nolint:gocritic // hugeParam: pf is a small flag bundle
 	// drift.MakeDriftCheck is passed as the per-route hook factory; BuildRoutes
 	// wires it inside, so this layer never reaches into route internals.
 	routes, err := transport.BuildRoutes(cfg, sink, counter, flowStore, ks, pf.strictDrift, drift.MakeDriftCheck)
@@ -1782,15 +1788,17 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 		// failure moving these effects behind the bind was meant to end. Nothing needs to
 		// run after the publish, so ordering it second costs nothing.
 		//
-		// The ctx re-check covers the other way this hook reaches its end without the proxy
-		// coming up: it runs under a bounded post-bind context that a shutdown landing in
-		// that window cancels. Aborting there returns nil rather than an error — a
-		// cancelled startup is not a token-write failure, and Serve treats the shutdown
-		// itself as the outcome.
+		// The hook runs under a bounded post-bind context that a shutdown landing in that
+		// window cancels, and that runAfterListen ABANDONS at expiry. Passing ctx through is
+		// what makes the abandonment safe — publishSessionKillTTL bounds its Redis round-trip
+		// by it, so a hook the server has already given up on cannot land a write. The early
+		// return below is only a fast path (skip a round-trip that would fail anyway);
+		// returning nil rather than an error is deliberate, since a cancelled startup is not
+		// a token-write failure and Serve treats the shutdown itself as the outcome.
 		if ctx.Err() != nil {
 			return nil
 		}
-		onServeReady()
+		onServeReady(ctx)
 		return nil
 	}
 
@@ -1823,7 +1831,7 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 // serveStdioHost serves cfg's single upstream over stdin/stdout (the stdio host
 // shape). The upstream is a subprocess (transport: stdio) or a remote HTTP server
 // (transport: http).
-func serveStdioHost(ctx context.Context, cfg *config.GatewayConfig, sink *audit.Sink, counter capability.CallCounter, flowStore capability.FlowLabelStore, ks killswitch.Manager, pf proxyFlags, onServeReady func()) error { //nolint:gocritic // hugeParam: pf is a small flag bundle
+func serveStdioHost(ctx context.Context, cfg *config.GatewayConfig, sink *audit.Sink, counter capability.CallCounter, flowStore capability.FlowLabelStore, ks killswitch.Manager, pf proxyFlags, onServeReady func(context.Context)) error { //nolint:gocritic // hugeParam: pf is a small flag bundle
 	u := &cfg.Upstreams[0] // validate() guarantees exactly one upstream for transport: stdio
 	auditMode := cfg.AuditModeFor(u)
 

@@ -478,9 +478,12 @@ Section conventions:
   `maxCalls: {count: 1}` the subscribe spends the slot and the unsubscribe is then denied
   `RATE_LIMITED`, so the stream can be opened but never closed — besides recording a
   `sequenceBlock` antecedent and applying `labelOutput` taint for a request that transfers
-  no data. Kill switch, principal scoping, per-route JWT audience, and a token's
-  `mcp.capabilities` allowlist all still apply. **Third-party `PolicyDecisionPoint`
-  implementations must add `DecideResourceCancel`.**
+  no data. Kill switch, principal scoping, per-route JWT audience, a token's
+  `mcp.capabilities` allowlist, and the matched entry's own `enforcement: audit` posture all
+  still apply — the last so an observe-mode entry downgrades the cancel exactly as it
+  downgrades the read, rather than hard-blocking the one leg that closes the stream the
+  other leg opened. **Third-party `PolicyDecisionPoint` implementations must add
+  `DecideResourceCancel`.**
 - **The audit-mode banners no longer promise more than the dispatcher delivers.** They
   claimed "ALL calls are forwarded and logged but NOT blocked", while MCP methods outside
   the mapped set (`completion/complete`, `logging/setLevel`,
@@ -836,7 +839,11 @@ Section conventions:
   touch are ordinary data and are not refused; the fold is narrower here than on the
   request and `*/list` paths because those decode into Go structs, where the decoder's own
   case-insensitive field matching makes every case-variant sibling a divergence, while the
-  redaction walk decodes into a generic map.
+  redaction walk decodes into a generic map. The exactly-dispatched set includes a content
+  ITEM's `type` and `text`, not only the envelope keys: `{"type":"text","text":"benign",
+  "Text":"<secret>"}` otherwise left the redactor inspecting the benign body while a
+  case-insensitive consumer rendered the sibling, with nothing matched and the original
+  bytes forwarded.
 - **The audit HMAC key is opened under the symlink guard, and chmod'd through the
   handle.** The key is the one audit file whose redirection is unrecoverable — the log is
   HMAC-protected, but whoever chooses the key chooses what verifies — and it was the only

@@ -1912,7 +1912,7 @@ func TestServeHTTPGateway_BuildRoutesError(t *testing.T) {
 			// no Policy and enforcement is not audit -> BuildRoutes fails fail-closed.
 		}},
 	}
-	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, proxyFlags{}, func() {})
+	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, proxyFlags{}, func(context.Context) {})
 	if err == nil {
 		t.Fatal("expected a BuildRoutes error for a policyless enforce-mode route")
 	}
@@ -1926,7 +1926,7 @@ func TestServeHTTPGateway_BindAllRejected(t *testing.T) {
 	cfg := auditUpstreamHTTPConfig(t, srv.URL)
 	cfg.Listen.Bind = "0.0.0.0"
 
-	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, proxyFlags{}, func() {})
+	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, proxyFlags{}, func(context.Context) {})
 	if err == nil || !strings.Contains(err.Error(), "--unsafe-bind-all") {
 		t.Fatalf("want a bind-all-rejected error, got %v", err)
 	}
@@ -1940,7 +1940,7 @@ func TestServeHTTPGateway_JWTAudienceError(t *testing.T) {
 	cfg := auditUpstreamHTTPConfig(t, srv.URL)
 	pf := proxyFlags{jwksURI: "https://idp.example.com/jwks.json"}
 
-	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf, func() {})
+	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf, func(context.Context) {})
 	if err == nil || !strings.Contains(err.Error(), "--jwt-audience") {
 		t.Fatalf("want a jwt-audience error, got %v", err)
 	}
@@ -1957,7 +1957,7 @@ func TestServeHTTPGateway_JWTIssuerError(t *testing.T) {
 		jwtAudience: "eunox",
 	}
 
-	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf, func() {})
+	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf, func(context.Context) {})
 	if err == nil || !strings.Contains(err.Error(), "--jwt-issuer") {
 		t.Fatalf("want a jwt-issuer error, got %v", err)
 	}
@@ -1975,7 +1975,7 @@ func TestServeHTTPGateway_JWKSSchemeError(t *testing.T) {
 		jwtIssuer:   "https://idp.example.com",
 	}
 
-	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf, func() {})
+	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf, func(context.Context) {})
 	if err == nil || !strings.Contains(err.Error(), "http or https") {
 		t.Fatalf("want a JWKS scheme error, got %v", err)
 	}
@@ -1996,7 +1996,7 @@ func TestServeHTTPGateway_AuthTokenJWTConflict(t *testing.T) {
 		jwtExperimentalCaps: true,
 	}
 
-	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf, func() {})
+	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf, func(context.Context) {})
 	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
 		t.Fatalf("want an authToken/jwks-uri conflict error, got %v", err)
 	}
@@ -2010,7 +2010,7 @@ func TestServeHTTPGateway_OAuthResourceError(t *testing.T) {
 	cfg := auditUpstreamHTTPConfig(t, srv.URL)
 	pf := proxyFlags{oauthResource: "not-a-url"}
 
-	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf, func() {})
+	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf, func(context.Context) {})
 	if err == nil || !strings.Contains(err.Error(), "--oauth-resource") {
 		t.Fatalf("want an oauth-resource error, got %v", err)
 	}
@@ -2028,7 +2028,7 @@ func TestServeHTTPGateway_OAuthResourceError_ConfigSourced(t *testing.T) {
 	cfg.Listen.OAuthResource = "not-a-url"
 	pf := proxyFlags{}
 
-	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf, func() {})
+	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf, func(context.Context) {})
 	if err == nil || !strings.Contains(err.Error(), "listen.oauthResource") {
 		t.Fatalf("want an error labeled listen.oauthResource, got %v", err)
 	}
@@ -2046,7 +2046,7 @@ func TestServeHTTPGateway_OAuthAuthzServerError(t *testing.T) {
 	cfg.Listen.OAuthAuthorizationServers = []string{"${ISSUER}"}
 	pf := proxyFlags{}
 
-	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf, func() {})
+	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf, func(context.Context) {})
 	if err == nil || !strings.Contains(err.Error(), "unexpanded") {
 		t.Fatalf("want an unexpanded-env-ref authz-server error, got %v", err)
 	}
@@ -2067,7 +2067,7 @@ func TestServeHTTPGateway_ControlTokenWriteError(t *testing.T) {
 	cfg := auditUpstreamHTTPConfig(t, srv.URL)
 	pf := proxyFlags{controlTokenPath: filepath.Join(blocker, "subdir", "token")}
 
-	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf, func() {})
+	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf, func(context.Context) {})
 	if err == nil || !strings.Contains(err.Error(), "kill control endpoint") {
 		t.Fatalf("want a control-token write error, got %v", err)
 	}
@@ -2101,7 +2101,7 @@ func TestServeHTTPGateway_FullSuccess(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
-	go func() { errCh <- serveHTTPGateway(ctx, cfg, nil, nil, nil, nil, pf, func() {}) }()
+	go func() { errCh <- serveHTTPGateway(ctx, cfg, nil, nil, nil, nil, pf, func(context.Context) {}) }()
 
 	// Poll for the listener instead of a fixed sleep, so this doesn't flake
 	// under a loaded CI runner: cancel() must not fire until Serve has bound,
@@ -2261,7 +2261,7 @@ func TestValidateTransportConditionalFlags_SessionIDRejectedOnGateway(t *testing
 func TestServeStdioHost_StrictDriftRequiresPolicy(t *testing.T) {
 	strict := true
 	cfg := stdioHostConfig(config.UpstreamConfig{Name: "u1", StrictDrift: &strict})
-	err := serveStdioHost(context.Background(), cfg, nil, nil, nil, nil, proxyFlags{}, func() {})
+	err := serveStdioHost(context.Background(), cfg, nil, nil, nil, nil, proxyFlags{}, func(context.Context) {})
 	if err == nil || !strings.Contains(err.Error(), "strictDrift requires a policy") {
 		t.Fatalf("want a strictDrift-requires-policy error, got %v", err)
 	}
@@ -2272,7 +2272,7 @@ func TestServeStdioHost_NoPolicyNotAuditRejected(t *testing.T) {
 		Transport: config.HostTransportStdio,
 		Upstreams: []config.UpstreamConfig{{Name: "u1"}},
 	}
-	err := serveStdioHost(context.Background(), cfg, nil, nil, nil, nil, proxyFlags{}, func() {})
+	err := serveStdioHost(context.Background(), cfg, nil, nil, nil, nil, proxyFlags{}, func(context.Context) {})
 	if err == nil || !strings.Contains(err.Error(), "no policy configured") {
 		t.Fatalf("want a no-policy-configured error, got %v", err)
 	}
@@ -2298,7 +2298,7 @@ func TestServeStdioHost_AuditModeStartsAndFailsFast(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	serveErr := serveStdioHost(ctx, cfg, sink, nil, nil, nil, proxyFlags{}, func() {})
+	serveErr := serveStdioHost(ctx, cfg, sink, nil, nil, nil, proxyFlags{}, func(context.Context) {})
 	if serveErr == nil {
 		t.Fatal("expected a spawn error for a non-existent upstream command")
 	}

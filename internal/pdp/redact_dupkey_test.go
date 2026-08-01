@@ -236,6 +236,39 @@ func TestApplyRedactObligs_CaseVariantOfReservedEnvelopeKeyFailsClosed(t *testin
 	assertRedactionFailsClosed(t, body, redactDataSSN, "123-45-6789")
 }
 
+// One level below the envelope, ApplyRedactObligs reads a content ITEM's keys exactly too:
+// obj["type"] picks the per-type treatment and obj["text"] is the body it walks. A case
+// variant therefore routes the redactor to one value while a case-insensitive consumer binds
+// the other — and because nothing matched, the ORIGINAL bytes are forwarded with the record
+// reporting the obligation applied.
+func TestApplyRedactObligs_CaseVariantOfContentItemKeyFailsClosed(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"text body variant", `{"content":[{"type":"text","text":"benign","Text":"123-45-6789"}]}`},
+		{"type selector variant", `{"content":[{"type":"image","Type":"text","text":"123-45-6789"}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assertRedactionFailsClosed(t, []byte(tc.body),
+				[]capability.Obligation{{Type: capability.DirectiveTypeRedactFields, Paths: []string{"ssn"}}},
+				"123-45-6789")
+		})
+	}
+}
+
+// The item keys are in the fold SCOPE, not exempt from path matching: an obligation that
+// names "text" must still mask a field called text, the way it would any other name.
+func TestApplyRedactObligs_ContentItemKeyIsStillRedactableByName(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{"structuredContent":{"payload":{"text":"123-45-6789"}}}`)
+	out, err := ApplyRedactObligs(body,
+		[]capability.Obligation{{Type: capability.DirectiveTypeRedactFields, Paths: []string{"payload.text"}}})
+	require.NoError(t, err, "naming an item key as a redact path is legitimate")
+	assert.NotContains(t, string(out), "123-45-6789")
+}
+
 // The companion honest case: an unmodelled sibling key whose case variant the obligation
 // never names must keep redacting rather than fail the whole response closed.
 func TestApplyRedactObligs_UnnamedCaseVariantSiblingsStillRedact(t *testing.T) {

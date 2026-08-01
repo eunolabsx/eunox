@@ -715,11 +715,15 @@ func TestStdioProxy_OnReadyNotRunWhenStartupFails(t *testing.T) {
 				SessionID:  "integ-onready-fail",
 				ShutdownMs: 2000,
 				DriftCheck: tc.drift,
-				OnReady:    func() { ready.Store(true) },
+				OnReady:    func(context.Context) { ready.Store(true) },
 			})
-			// Closed stdin so Start cannot block in serveHost if startup unexpectedly
-			// succeeds; the host side is never exercised.
-			inR, _ := io.Pipe()
+			// Genuinely CLOSED stdin, so Start cannot block in serveHost if startup
+			// unexpectedly succeeds. Discarding the write end instead leaves the read end
+			// blocking forever (a GC'd *io.PipeWriter closes nothing), which would turn a
+			// regression in the ordering this test pins into a package-wide timeout rather
+			// than a failed assertion.
+			inR, inW := io.Pipe()
+			_ = inW.Close()
 			p.hostReader = mcp.NewMsgReader(inR)
 			outR, outW := io.Pipe()
 			go func() { _, _ = io.Copy(io.Discard, outR) }()
@@ -747,7 +751,7 @@ func TestStdioProxy_OnReadyRunsOnceSessionIsLive(t *testing.T) {
 		PDP:        pdp.AlwaysAllowPDP{},
 		SessionID:  "integ-onready-ok",
 		ShutdownMs: 2000,
-		OnReady:    func() { ready.Store(true) },
+		OnReady:    func(context.Context) { ready.Store(true) },
 	})
 	// Drive one request through so the serve loop has demonstrably started, which places
 	// the hook strictly before it rather than merely somewhere inside Start.

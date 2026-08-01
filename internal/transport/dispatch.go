@@ -277,10 +277,11 @@ const methodPing = "ping"
 
 // locallyAnsweredHandlers maps each method dispatchRequest answers WITHOUT a PDP Decide*
 // call — the handshake, the liveness probe, and the three */list flavors — to its handler.
-// It is a table rather than a switch for the same reason decideMethodHandlers is: the set
-// is consulted twice, once to route and once to describe itself in the audit-mode banner
-// (dispatchedMethodSummary), and a hand-written second copy of it in banner prose is
-// exactly how a startup message comes to promise more than the dispatcher delivers.
+// It is a table rather than a switch for the same reason decideMethodHandlers is: routing
+// and "is this method dispatched at all" are then one fact rather than two hand-maintained
+// lists that can disagree. The audit-mode banner asks the SECOND question — it names the
+// enforced set (enforcedMethodSummary) and says an undispatched method is still denied — and
+// this table is what makes that claim checkable instead of prose.
 //
 // Everything NOT in this table or in decideMethodHandlers falls to dispatchUnmapped's
 // fail-closed deny, in every mode.
@@ -300,13 +301,6 @@ var locallyAnsweredHandlers = map[string]func(context.Context, dispatchParams, m
 	},
 }
 
-// dispatchedMethodSummary is the comma-separated, sorted set of host request methods this
-// build dispatches, derived from the two routing tables themselves. Observe mode
-// downgrades a POLICY denial to a logged forward, but it cannot downgrade the fail-closed
-// default for a method that reaches no policy at all — so a caller describing the posture
-// names the set it actually covers instead of promising "ALL calls".
-var dispatchedMethodSummary = sortedMethods(decideMethodHandlers, locallyAnsweredHandlers)
-
 // enforcedMethodSummary is the subset the audit-mode banner's "forwarded and logged"
 // sentence may name: only the Decide* methods actually reach the upstream AND leave a
 // decision record. The locally-answered half of the dispatch table does not — initialize
@@ -323,7 +317,9 @@ const unmappedMethodExamples = "e.g. completion/complete, logging/setLevel, reso
 
 // sortedMethods joins the given routing tables' keys in sorted order, so a banner derived
 // from a table cannot drift from what the dispatcher does (and a map's iteration order
-// cannot make the text unstable).
+// cannot make the text unstable). Variadic because it once joined both tables for a
+// whole-dispatch-table summary; the banner now names only the enforced half, and the tests
+// still exercise the multi-table form.
 func sortedMethods(tables ...map[string]func(context.Context, dispatchParams, mcp.RPCMsg) mcp.RPCMsg) string {
 	var methods []string
 	for _, t := range tables {

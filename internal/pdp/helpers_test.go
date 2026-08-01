@@ -46,10 +46,14 @@ func ctxWithAgent(agentID string) context.Context {
 // white-box test can call an inner redaction function the way ApplyRedactObligs does
 // (paths root-normalized once, fold scope derived from them once).
 func specFor(paths ...string) redactSpec {
-	for i := range paths {
-		paths[i] = normalizeDotPathRoot(paths[i])
+	// Copy first: a variadic call written as specFor(paths...) passes the CALLER's backing
+	// array, so normalizing in place would rewrite the test's own slice (invisible today
+	// only because normalizeDotPathRoot is the identity on an unprefixed path).
+	out := append([]string(nil), paths...)
+	for i := range out {
+		out[i] = normalizeDotPathRoot(out[i])
 	}
-	return redactSpec{paths: paths, fold: redactionFoldKeys(paths)}
+	return redactSpec{paths: out, fold: redactionFoldKeys(out)}
 }
 
 // callTool runs a tools/call decision through the ManifestPDP.
