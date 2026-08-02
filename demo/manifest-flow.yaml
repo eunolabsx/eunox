@@ -1,6 +1,6 @@
 # demo/manifest-flow.yaml — information-flow-control demo policy (Demo (a)).
 #
-# Opts into the experimental flow+effect draft grammar (schemaVersion 0.2-draft), so
+# Opts into the experimental flow+effect draft grammar (schemaVersion 0.2), so
 # the flowLabel condition and labelOutput directive are available. The published "0.1"
 # grammar does NOT recognize these tokens — they are staged behind schema-version
 # negotiation until a batched grammar bump.
@@ -10,7 +10,7 @@
 # only public/internal-labeled flows, so once the confidential label is present the
 # egress is denied by source->sink flow policy — deterministically, no model involved.
 # In a clean session (no sensitive read) the identical egress write is allowed.
-schemaVersion: "0.2-draft"
+schemaVersion: "0.2"
 name: demo-flow-policy
 version: "0.1.0"
 

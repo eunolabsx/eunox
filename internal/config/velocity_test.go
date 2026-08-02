@@ -178,7 +178,7 @@ func TestVelocityIsStagedBehindTheDraftVersion(t *testing.T) {
 	if err == nil {
 		t.Fatal("a cumulative blastRadius bound must be refused under the published 0.1 grammar")
 	}
-	if !strings.Contains(err.Error(), "0.2-draft") {
+	if !strings.Contains(err.Error(), "0.2") {
 		t.Fatalf("the refusal must name the draft version that admits it, got: %v", err)
 	}
 }

@@ -347,14 +347,22 @@ func (e *Engine) RecordLabels(ctx context.Context, req *capability.EnforceReques
 	return e.recordLabels(ctx, req, matched)
 }
 
-// SourceCommitError classifies which half of the atomic source-call commit
+// SourceCommitError classifies which leg of the atomic source-call commit
 // (recordSourceCall) faulted, so the caller builds the matching fail-closed deny: a
 // flow-label write fault (Flow=true) is a HARD deny (labelRecordFailureDenial /
-// hardDenyResponse — an unlabeled forward would fail a later sink open), a sequenceBlock
-// antecedent write fault (Flow=false) denies via recordFailureDenial.
+// hardDenyResponse — an unlabeled forward would fail a later sink open), a declassify
+// clear fault (Declassify=true, which also sets Flow) is a HARD deny via
+// declassifyRecordFailureDenial, and a sequenceBlock antecedent write fault (both false)
+// denies via recordFailureDenial.
+//
+// Declassify is a separate flag rather than a third value of one enum because both
+// label-write legs are flow faults and both must hard-deny; only the message differs. A
+// caller that checks Flow alone (the audit-mode antecedent path, which never declassifies)
+// therefore stays correct without knowing about the third leg.
 type SourceCommitError struct {
-	Err  error
-	Flow bool
+	Err        error
+	Flow       bool
+	Declassify bool
 }
 
 // Error implements error.
@@ -374,31 +382,54 @@ func (e *SourceCommitError) Error() string { return e.Err.Error() }
 // all. The per-session decision lock serializes this critical section, so the
 // rollback removes exactly this call's additions with no concurrent writer to race.
 //
-// Both writes still fail closed on their own fault (returned as a SourceCommitError the
+// An APPROVED declassification (decl, resolved by checkDeclassify before anything was
+// committed) is the third leg and runs between the two: labels are added, then cleared,
+// then the antecedent is written. A seq fault rolls BOTH label writes back — re-adding
+// what was cleared and removing what was added — so the never-forwarded call leaves the
+// session's label set exactly as it found it. The two label legs are mutually exclusive on
+// a loaded manifest (validateDeclassifyCoherence rejects a constraint carrying both
+// labelOutput and declassify), so the add-then-clear order only ever matters for a
+// programmatically built constraint; it is fixed here rather than left to directive order
+// so that case is deterministic too.
+//
+// Every write still fails closed on its own fault (returned as a SourceCommitError the
 // caller maps to the right deny). recordLabels is skipped when the constraint is not
 // flow-relevant; RecordSessionCall self-guards when the policy has no sequenceBlock
 // (skipAntecedentRecording) — so a flow-only or seq-only policy does exactly one write
 // and needs no rollback. carriedLabels is the pre-call accumulated set (peeked by the
-// caller before this commit), used to compute the rollback delta.
-func (e *Engine) recordSourceCall(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, flowRelevant bool, carriedLabels []string) ([]string, *SourceCommitError) {
-	var labelsOut, added []string
+// caller before this commit), used to compute the rollback delta and, for the clear, to
+// report which labels actually changed.
+func (e *Engine) recordSourceCall(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, flowRelevant bool, carriedLabels []string, decl declassifyOutcome) (labelsOut, labelsCleared []string, cerr *SourceCommitError) {
+	var added []string
 	if flowRelevant {
 		var err error
 		labelsOut, err = e.recordLabels(ctx, req, matched)
 		if err != nil {
-			return nil, &SourceCommitError{Err: err, Flow: true}
+			return nil, nil, &SourceCommitError{Err: err, Flow: true}
 		}
 		added = labelsAdded(labelsOut, carriedLabels)
 	}
-	if err := e.RecordSessionCall(ctx, req); err != nil {
-		// The seq write faulted after the flow write committed: roll the flow labels this
-		// call added back out so the hard-denied call taints nothing. Best-effort — a
-		// rollback fault leaves a stranded label (fail-closed: over-blocks a later sink,
-		// never a leak), the narrow accepted residual.
-		e.rollbackLabels(ctx, req, added)
-		return nil, &SourceCommitError{Err: err, Flow: false}
+	if len(decl.Labels) > 0 {
+		var err error
+		labelsCleared, err = e.clearLabels(ctx, req, decl, carriedLabels)
+		if err != nil {
+			// The clear faulted after the add committed: undo the add so the refused call
+			// leaves nothing behind, exactly as the seq-fault arm below does.
+			e.rollbackLabels(ctx, req, added)
+			return nil, nil, &SourceCommitError{Err: err, Flow: true, Declassify: true}
+		}
 	}
-	return labelsOut, nil
+	if err := e.RecordSessionCall(ctx, req); err != nil {
+		// The seq write faulted after the label writes committed: put the label set back as
+		// it was so the hard-denied call neither taints nor untaints. Best-effort — a
+		// rollback fault leaves a stranded label (fail-closed: over-blocks a later sink,
+		// never a leak), the narrow accepted residual. The re-add runs FIRST so a partial
+		// rollback errs toward more taint, not less.
+		e.restoreLabels(ctx, req, labelsCleared)
+		e.rollbackLabels(ctx, req, added)
+		return nil, nil, &SourceCommitError{Err: err, Flow: false}
+	}
+	return labelsOut, labelsCleared, nil
 }
 
 // RecordSourceCall is the exported form of recordSourceCall for the audit-mode
@@ -407,8 +438,14 @@ func (e *Engine) recordSourceCall(ctx context.Context, req *capability.EnforceRe
 // still be recorded — atomically, so a fault leaves neither stranded — and the labels
 // surfaced on the forwarded call's record. It returns labelsOut for that back-fill and a
 // SourceCommitError the caller maps to a hard deny.
+//
+// It deliberately commits NO declassification. That path forwards a call whose verdict was
+// a DENY, and the approval check that authorizes a clear runs only on the allow tail — so
+// clearing here would drop a label for a call policy refused, on the strength of an
+// approval nothing verified. A downgraded observe deny never untaints a session.
 func (e *Engine) RecordSourceCall(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, flowRelevant bool, carriedLabels []string) ([]string, *SourceCommitError) {
-	return e.recordSourceCall(ctx, req, matched, flowRelevant, carriedLabels)
+	labelsOut, _, cerr := e.recordSourceCall(ctx, req, matched, flowRelevant, carriedLabels, declassifyOutcome{})
+	return labelsOut, cerr
 }
 
 // labelsAdded returns the labels in out that were NOT already in the pre-call carried
@@ -444,6 +481,20 @@ func (e *Engine) rollbackLabels(ctx context.Context, req *capability.EnforceRequ
 		return
 	}
 	_ = e.flowStore.Remove(ctx, e.flowSessionKey(req.SessionID), added...)
+}
+
+// restoreLabels is rollbackLabels' mirror for the declassify leg: it best-effort re-adds
+// the labels an approved clear removed, so a call that faulted afterwards and is never
+// forwarded leaves the session as tainted as it found it. A nil store, empty session, or
+// empty set is a no-op; an Add fault is swallowed, and unlike the rollback's residual this
+// one is the fail-OPEN direction (a label stays cleared for a call that did not run), which
+// is why it runs before rollbackLabels rather than after — a partial rollback then leaves
+// more taint, not less.
+func (e *Engine) restoreLabels(ctx context.Context, req *capability.EnforceRequest, cleared []string) {
+	if e.flowStore == nil || req.SessionID == "" || len(cleared) == 0 {
+		return
+	}
+	_ = e.flowStore.Add(ctx, e.flowSessionKey(req.SessionID), cleared...)
 }
 
 // ClearSessionLabels releases a session's accumulated flow-label set, called from the

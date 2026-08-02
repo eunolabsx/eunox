@@ -1092,6 +1092,10 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 		// can only produce more denials — which is what makes honoring it need no trust
 		// decision.
 		DeclaredLabels: declaredLabelsFromContext(ctx),
+		// The human approvals the verified token granted. Nil for every request that is
+		// not a declassification, which is nearly all of them; without one, a declassify
+		// directive escalates rather than clearing a label.
+		DeclassifyApprovals: declassifyApprovalsFromContext(ctx),
 	}
 
 	matched := p.findConstraint(target, claims)

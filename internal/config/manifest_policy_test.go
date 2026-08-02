@@ -108,8 +108,8 @@ func TestHonorsAttributionInterface_IsStagedBehindTheDraftGrammar(t *testing.T) 
 		{"the published grammar does not contain the token", "0.1", false},
 		{"a bare version string is likewise published-grammar", "0.1.0", false},
 		{"an unset version cannot be an opt-in", "", false},
-		{"the flow+effect draft admits it", ManifestSchemaVersionFlowEffectDraft, true},
-		{"surrounding whitespace does not defeat the gate", "  " + ManifestSchemaVersionFlowEffectDraft + "  ", true},
+		{"the flow+effect grammar admits it", ManifestSchemaVersion02, true},
+		{"surrounding whitespace does not defeat the gate", "  " + ManifestSchemaVersion02 + "  ", true},
 		{"a future draft is not this draft", "0.3-draft", false},
 	}
 	for _, c := range cases {

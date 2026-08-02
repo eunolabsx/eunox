@@ -98,11 +98,17 @@ func IsLabelOutputDirective(d Directive) bool {
 }
 
 // ConstraintHasFlow reports whether c participates in information-flow control — it
-// carries a flowLabel condition (sink) or a labelOutput directive (source). It is the
-// single constraint-level flow-relevance predicate, built from the nil-safe
-// IsFlowLabelCondition/IsLabelOutputDirective helpers, so the engine's per-call allow-path
-// gate and the PDP's audit-mode antecedent gate consult one definition and cannot drift on
-// what counts as flow. Nil-safe.
+// carries a flowLabel condition (sink), a labelOutput directive (source), or a declassify
+// directive (the approval-gated clear). It is the single constraint-level flow-relevance
+// predicate, built from the nil-safe IsFlowLabelCondition/IsLabelOutputDirective/
+// IsDeclassifyDirective helpers, so the engine's per-call allow-path gate and the PDP's
+// audit-mode antecedent gate consult one definition and cannot drift on what counts as
+// flow. Nil-safe.
+//
+// declassify belongs here for the same reason the other two do: it makes the call's
+// verdict depend on session label state, so the engine must peek the accumulated set
+// (which is what the pre-call snapshot the clear is computed against, and what the audit
+// record's carried_labels reports, both come from).
 func ConstraintHasFlow(c *Constraint) bool {
 	if c == nil {
 		return false
@@ -113,7 +119,7 @@ func ConstraintHasFlow(c *Constraint) bool {
 		}
 	}
 	for _, dir := range c.Directives {
-		if IsLabelOutputDirective(dir) {
+		if IsLabelOutputDirective(dir) || IsDeclassifyDirective(dir) {
 			return true
 		}
 	}

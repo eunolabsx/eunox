@@ -190,10 +190,30 @@ the loader), the request is denied with `ENFORCEMENT_ERROR` rather than forwarde
 with the schema silently skipped — the tool-only guarantee does not rest on
 load-time validation alone.
 
-`schemaVersion` is the manifest **grammar** version (currently `"0.1"`) — the
-dialect of fields the document is written in, distinct from the policy-content
-`version`. A manifest with an absent or unsupported `schemaVersion` is refused at
-load (fail-closed) rather than parsed under a grammar the proxy may not model.
+`schemaVersion` is the manifest **grammar** version — the dialect of fields the
+document is written in, distinct from the policy-content `version`. A manifest
+with an absent or unsupported `schemaVersion` is refused at load (fail-closed)
+rather than parsed under a grammar the proxy may not model.
+
+Two revisions are published, and a build parses both:
+
+| `schemaVersion` | What it adds |
+|---|---|
+| `"0.1"` | The base authorization vocabulary: targets, actions, `argumentSchema`, `principal`, the conditions in § 5, and the `redactFields` directive. |
+| `"0.2"` | Everything in `0.1`, plus the **flow + effect layer**: the [`flowLabel`](#flowlabel--the-information-flow-sink) condition, the [`labelOutput`](#labeloutput--the-information-flow-source) and [`declassify`](#declassify--clearing-a-label-under-human-approval) directives, the [`effectClass` / `blastRadius`](./effect-contracts.md) conditions, a constraint's [`effect`](./effect-contracts.md) contract, the top-level [`effectCeiling`](./effect-contracts.md), and the [`${task.*}`](#task-context-variables) variables. |
+
+The revisions are **closed against each other in one direction only**: a `0.2`
+manifest may use every `0.1` token, and a `0.1` manifest that uses a `0.2` token
+is **refused at load** naming the version that introduced it. That is the same
+rule as a misspelled key — the grammar stays falsifiable — and it is what lets a
+fleet run both revisions without a `0.1` route silently acquiring a predicate its
+authors never reviewed.
+
+> **Migrating from `"0.2-draft"`.** Earlier builds staged the flow+effect tokens
+> behind a `"0.2-draft"` schemaVersion while the batch was assembled. That draft
+> is **removed, not aliased**: a manifest still declaring it is refused, with the
+> supported list naming `0.2`. Change the string to `"0.2"` — no token was
+> renamed, and nothing else in the document moves.
 
 > **Version axes are independent.** Three versions appear in these docs and they
 > do not move together: the **manifest grammar** version (`schemaVersion`, e.g.
@@ -1019,6 +1039,12 @@ Rules:
 `conditions` is an array of typed shapes from
 `pkg/capability/condition.go`. Every entry has a `type` discriminator.
 Unknown types are denied at the proxy, so spelling matters.
+
+The conditions in this section are part of every grammar revision. Three more
+arrive with `schemaVersion: "0.2"` and live in their own sections because their
+semantics are cross-request rather than per-call: [`flowLabel`](#5b-information-flow--flowlabel-labeloutput-declassify)
+(§ 5b), and [`effectClass` / `blastRadius`](./effect-contracts.md) (the effect
+layer, documented separately).
 
 ### Nested arguments — the `$.` path selector
 
@@ -2094,6 +2120,263 @@ A `redactFields` object found inside `conditions` is rejected at load —
 `conditions`. An unknown directive `type` is likewise rejected at load
 (fail-closed) rather than silently dropped.
 
+## 5b. Information flow — `flowLabel`, `labelOutput`, `declassify`
+
+> **`schemaVersion: "0.2"`.** All three tokens are refused under `0.1`.
+
+Every condition above decides whether **this call** is permitted. None of them can
+express *"the data this call would send came from somewhere it may not go."* That
+is a property of the **flow** across a task, not of any one request — and it is
+the shape a prompt-injected agent exploits, because each individual call is
+inside its granted capabilities.
+
+Information-flow control is two halves plus an escape hatch:
+
+- **`labelOutput`** (directive, the **source**): *"the output of this call carries
+  these labels."*
+- **`flowLabel`** (condition, the **sink**): *"only these classes may reach here."*
+- **`declassify`** (directive, the **approved clear**): *"a human agreed this
+  action removes these labels."*
+
+Labels are a **closed, flat** vocabulary of five native provenance/integrity
+classes — no lattice, no partial order:
+
+| Label | Meaning |
+|---|---|
+| `public` | Openly shareable. |
+| `internal` | Internal-only provenance. |
+| `confidential` | Confidential business data. |
+| `pii` | Carries personal information. |
+| `untrusted` | Attacker-influenceable input — the integrity class. An action whose control path carries it is blocked regardless of held permission. |
+
+A label is **asserted by policy, never inferred from content**. eunox reads no
+payload to decide one, so there is no classifier and no model anywhere on this
+path. A misspelled label is a load error.
+
+### `labelOutput` — the information-flow source
+
+```yaml
+- target: tool:read_customer_record
+  actions: [call]
+  directives:
+    - type: labelOutput
+      labels: [pii, confidential]
+```
+
+On an **allowed** call, the labels are unioned into the session's accumulated
+set. It is a state write, not a response mutation: the response is untouched.
+Valid on `tool:` and `resource:` targets — an egress is not a source.
+
+### `flowLabel` — the information-flow sink
+
+```yaml
+- target: tool:send_email
+  actions: [call]
+  conditions:
+    - type: flowLabel
+      allow: [public, internal]
+```
+
+The call is denied when the session's accumulated set is **not a subset** of
+`allow` — i.e. when any class that flowed into this session is not permitted
+here. The denial names the offending labels and is distinguishable from a
+capability denial (a `flow: true` detail plus `blockedLabels`), so an operator
+can tell "this tool is not granted" from "this data may not go there".
+
+An **empty** `allow` is valid and is the strictest sink: it admits only an
+unlabeled, clean-context flow.
+
+Propagation is a conservative **session-level set-union join**: eunox cannot see
+how a host assembled its context, so it assumes everything read in a session
+could reach everything written in it. A cooperating client may *sharpen* that
+per call — never widen it — via the
+[attribution interface](./attribution-interface.md).
+
+Accumulated labels live for the **session's lifetime** and are released when the
+session ends. There is deliberately no decay window: a taint that aged out
+mid-session would be a fail-open the "for all flows" guarantee cannot tolerate.
+
+> **Multi-instance deployments need a shared flow store.** Like `maxCalls` and
+> `sequenceBlock`, flow state is cross-request. Without a shared backend, a
+> source read on one replica and a sink on another do not see the same taint —
+> and the failure direction is *open*. `eunox validate` warns when a policy uses
+> flow tokens.
+
+### `declassify` — clearing a label under human approval
+
+`declassify` is the only token in the grammar that **removes** a flow label, and
+it is the only direction in the flow layer that can fail open. Adding taint can
+only ever produce more denials; clearing it can only ever produce more allows.
+Everything about how it behaves follows from that asymmetry.
+
+```yaml
+- target: tool:publish_sanitized_report
+  actions: [call]
+  directives:
+    - type: declassify
+      labels: [pii]
+```
+
+On an **approved** call, the named labels are removed from the session's
+accumulated set, so a later sink that would have denied now allows.
+
+**Without an approval covering every named label at this exact target, the call
+does not run.** It is refused with `ESCALATION_REQUIRED` — `decision: escalate`
+on the tape — not allowed-without-clearing. Forwarding it while quietly leaving
+the labels in place would let an author write a declassification the proxy never
+performs, and the next sink would deny for a reason the policy says should not
+apply: a policy that reads as broken rather than as enforced.
+
+The refusal is **hard**: a route running `--audit` cannot downgrade it to a
+forward. An audit-mode downgrade is coherent for a policy *verdict* being staged;
+"no human has approved dropping this label" is not a verdict being staged. This
+is the same non-negotiable that keeps an over-ceiling action from being
+performed-anyway-and-logged.
+
+Two shapes are refused at load, because in both the written intent and the
+enforced behavior would differ:
+
+- `declassify` **and** `labelOutput` on one constraint — they write the same
+  state in opposite directions on the same call, so evaluation order rather than
+  policy would decide the outcome. Split them into two capabilities.
+- **Two** `declassify` directives on one constraint — that reads as "either
+  approval suffices" and enforces as "one approval must cover the union". One
+  directive listing every label says the same thing unambiguously.
+
+Like `labelOutput`, it is valid on `tool:` and `resource:` targets only:
+clearing a label at an egress launders it at exactly the point the flow layer
+exists to gate.
+
+#### Where an approval comes from
+
+The proxy holds **no approval workflow** — that is the control-plane surface. It
+*verifies* approvals; a human (or the system acting for one) grants them. An
+approval rides the `mcp.declassify` claim of a token eunox has already verified
+for signature, issuer, audience, and expiry:
+
+```jsonc
+"mcp": {
+  "v": "0.2",
+  "declassify": [
+    {
+      "labels": ["pii"],                    // native labels this approval may drop
+      "target": "tool:publish_sanitized_report",  // the ONE action it covers
+      "approver": "alice@example.com",      // the accountable human — mandatory
+      "id": "apr-2026-08-01-014"            // optional control-plane record id
+    }
+  ]
+}
+```
+
+The claim is the carrier because it is the only approval channel already
+operator-controlled end to end: eunox consumes IdP tokens and never mints them,
+and the JWKS it validates against is the operator's — so an approval on a
+verified token needs no new key domain, no new trust root, and no fetch on the
+decision path.
+
+The rules the proxy enforces, each fail-closed:
+
+- **`target` is matched literally.** A glob in an approval target is refused: a
+  pattern would widen one human approval across every matching action, which is
+  the opposite of how a glob fails in a policy allowlist.
+- **`labels` must cover every label the directive clears.** A partial grant
+  escalates rather than clearing the covered subset — half-clearing leaves the
+  operator believing a label is gone while a later sink still sees it.
+- **`approver` is mandatory and non-empty.** An approval with no accountable
+  human is not human approval, and it is the value stamped on the tape.
+- **A malformed grant rejects the whole token**, rather than evaluating to a
+  grant that covers nothing — which would turn an IdP template mistake into a
+  permanent, invisible escalation loop with no error to grep for.
+- **No token means no approval**, so a deployment with no approval integration
+  escalates every declassification. That is the intended fail-closed default,
+  not a gap.
+
+The approval's lifetime is the **token's** lifetime — there is no separate expiry
+field, because a verified token already has one.
+
+> **The honest limit.** The token is held by the agent, so an approval minted into
+> it can be replayed for as long as that token lives, at any action the grant's
+> `target` names. Scope and expiry bound the damage; they do not eliminate it.
+> Mint a short-lived token per approval rather than a standing grant. The proxy
+> enforces the scope and records the approver; it cannot make a long-lived grant
+> safe.
+
+#### What lands on the tape
+
+An approved declassification is an **allow** record carrying two additive fields
+no other record shape has:
+
+```jsonc
+{
+  "decision": "allow",
+  "target": "publish_sanitized_report",
+  "carried_labels": ["internal", "pii"],   // what the session held going in
+  "labels_cleared": ["pii"],               // what this call actually removed
+  "approver": "alice@example.com",         // who authorized it
+  "details": { "_eunox_declassify_approval_id": "apr-2026-08-01-014" }
+}
+```
+
+`labels_cleared` reports what **changed**, not what was authorized: an approval to
+clear `pii` on a session that never carried it is a permitted no-op that records
+no `labels_cleared` and no `approver`. The tape must not claim a declassification
+that did not happen.
+
+A refused one is a `decision: escalate` record with `condition_type: declassify`,
+carrying the session's `carried_labels` and a `reason` — which is what an operator
+reads to decide whether the declassification should be approved at all.
+
+`eunox stats` counts both: escalations as the approval queue, declassifications
+as the number of times a human agreed to drop taint. A declassification count
+that has quietly become routine is the signal that a sanitizing step is being
+rubber-stamped.
+
+## 5c. Task-context variables
+
+> **`schemaVersion: "0.2"`.** Refused under `0.1`.
+
+A `${task.*}` reference binds an argument to the **caller's own verified
+identity** instead of to a literal — *"the task this argument names must be the
+task in the token"* — written once for every task rather than once per task.
+
+```yaml
+- target: tool:fetch_workspace
+  actions: [call]
+  conditions:
+    - type: allowedValues
+      argument: workspace_id
+      values: ["${task.id}"]      # must equal the token's mcp.task_id
+```
+
+The closed set is three properties of the validated JWT:
+
+| Reference | Resolves to |
+|---|---|
+| `${task.id}` | the `mcp.task_id` claim |
+| `${task.agent}` | the `mcp.agent_id` claim |
+| `${task.principal}` | the token subject (`sub`) |
+
+Three rules, each enforced rather than left to convention:
+
+1. **A reference is the whole value.** `"${task.id}"` is a reference;
+   `"job-${task.id}"` is a **load error**. An interpolated value would be
+   glob-matched text built partly from an IdP claim — a pattern the author did
+   not write.
+2. **A resolved value is compared by exact equality**, never as a glob — unlike
+   every other `allowedValues` string entry. A claim value of `*` would otherwise
+   be an allow-anything wildcard the token holder chose for themselves.
+3. **An unresolvable reference denies.** No token, or the claim absent or empty,
+   and the entry matches nothing. It never falls back to the literal placeholder
+   text and never matches an empty argument: the condition exists to bind a value
+   to an identity, and "there is no identity" is not a match.
+
+A misspelled variable (`${task.identifier}`) is a **load error**, like every other
+token in this grammar — not an inert literal that silently denies every call.
+
+References are resolved in `allowedValues` **only**. A `${...}` elsewhere in the
+manifest is an ordinary literal string, which for a security rule means it matches
+nothing — the fail-closed direction, but not what the author intended.
+
 ## 6. TTL guidance
 
 In JWT mode, token lifetime is controlled by the `exp` claim your IdP
@@ -2360,3 +2643,13 @@ the ✓ COVERED list means "covered with no outstanding issues".
 
 - **Security properties and threat model**: [`threat-model-mcp.md`](./threat-model-mcp.md)
 - **Performance baseline**: [`benchmarks.md`](./benchmarks.md)
+- **The effect layer** (`effect` contracts, `effectClass`/`blastRadius`, the
+  `effectCeiling`, the `escalate` outcome): [`effect-contracts.md`](./effect-contracts.md)
+- **The attribution interface** (a cooperating client sharpening the flow join):
+  [`attribution-interface.md`](./attribution-interface.md)
+- **Machine-readable grammar**: [`schemas/eunox-capability-manifest.schema.json`](../schemas/eunox-capability-manifest.schema.json).
+  It is an authoring aid — point an editor at it for completion and structural
+  checking. The **loader is authoritative**, and enforces rules JSON Schema cannot
+  express: glob well-formedness, effect-contract digest pins, the
+  `compensable`/`compensatingAction` pairing on the *resolved* effect, and
+  cross-condition quota-bucket collisions.

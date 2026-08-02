@@ -1,0 +1,447 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://eunolabs.com/schemas/eunox-capability-manifest.schema.json",
+  "title": "eunox capability manifest (schemaVersion 0.2)",
+  "description": "The typed, closed-vocabulary policy document eunox enforces. It is an ALLOWLIST: a request matching no capability is denied, so every grant is explicit and a misspelled key is a load error rather than a silently inert rule. This schema covers the published \"0.2\" grammar — the base authorization vocabulary plus the flow+effect layer (the flowLabel condition, the labelOutput and declassify directives, the effectClass and blastRadius conditions, a constraint's effect contract, the top-level effectCeiling, and ${task.*} variables). A \"0.1\" manifest is a strict subset: none of the flow+effect tokens is part of that revision, and the loader refuses one that uses them. This schema is an authoring aid; the loader is authoritative and enforces rules JSON Schema cannot express (glob well-formedness, effect-contract digest pins, the compensable/compensatingAction pairing, cross-condition quota-bucket collisions).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "name", "version", "capabilities"],
+  "properties": {
+    "schemaVersion": {
+      "description": "Manifest GRAMMAR version — the dialect of fields this document is written in. Distinct from `version` (the policy content's semver) and from the eunox release version. An absent or unrecognized value is refused at load, fail-closed: a grammar the proxy may not model must never be parsed with unmodeled fields silently dropped.",
+      "enum": ["0.1", "0.2"]
+    },
+    "name": {
+      "description": "Human-readable policy name, unique per logical agent. Recorded in audit records.",
+      "type": "string",
+      "minLength": 1
+    },
+    "version": {
+      "description": "Policy-content version, strict three-part semver with no pre-release or build suffix. Recorded in every audit record and pinnable from a gateway config via `expectVersion`.",
+      "type": "string",
+      "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)$"
+    },
+    "description": {
+      "description": "Optional free-text description of what this policy governs.",
+      "type": "string"
+    },
+    "serverVersion": {
+      "description": "Optional upstream MCP server version this policy was authored against. Compared with the live server at startup by the drift check.",
+      "type": "string"
+    },
+    "audience": {
+      "description": "Gateway mode: the JWT `aud` claim required on this route. Overrides the global --jwt-audience for the route, which remains the fallback for routes declaring none.",
+      "type": "string",
+      "minLength": 1
+    },
+    "capabilities": {
+      "description": "The allowlist. Each entry grants a set of actions on a target, optionally narrowed by conditions and annotated with directives and an effect contract. An empty list denies everything.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/capability" }
+    },
+    "effectCeiling": {
+      "$ref": "#/$defs/effectCeiling",
+      "description": "schemaVersion 0.2. The tool-agnostic consequence bound EVERY allowed action is additionally checked against, keyed on the action's effect properties rather than on which tool it is. It can only narrow — it runs after a constraint has already allowed the call."
+    }
+  },
+  "$defs": {
+    "capability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target", "actions"],
+      "properties": {
+        "target": {
+          "description": "Namespaced target: \"tool:<name>\", \"resource:<uri>\", \"prompt:<name>\", or \"system:sampling/createMessage\". Tool and resource targets may use path.Match globs; '*' does not cross '/'.",
+          "type": "string",
+          "pattern": "^(tool|resource|prompt|system):.+"
+        },
+        "actions": {
+          "description": "Actions granted on the target. Valid values depend on the namespace: tool -> call; resource -> read, subscribe, unsubscribe; prompt -> get; system -> allow. \"*\" grants every action valid for the namespace.",
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "enforcement": {
+          "description": "How a denial from THIS constraint is handled. \"enforce\" (the default) denies; \"audit\" downgrades the denial to an observed, forwarded call for staged rollout. It never opens the allowlist, and never downgrades a kill-switch, JWT-intersection, or hard denial.",
+          "enum": ["enforce", "audit"]
+        },
+        "descriptionHash": {
+          "description": "Optional \"sha256:<64 lowercase hex>\" pin of the tool description the upstream advertises. Supported only on exact-name tool: targets. A mismatch aborts startup unconditionally.",
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "principal": {
+          "description": "Scopes this constraint to requests whose validated JWT identity matches. Every listed claim must be present and match one of its patterns (AND across claims, OR within a claim). Requires JWT mode.",
+          "type": "object",
+          "additionalProperties": false,
+          "minProperties": 1,
+          "properties": {
+            "agent_id": { "$ref": "#/$defs/principalPatterns" },
+            "task_id": { "$ref": "#/$defs/principalPatterns" },
+            "sub": { "$ref": "#/$defs/principalPatterns" },
+            "iss": { "$ref": "#/$defs/principalPatterns" }
+          }
+        },
+        "argumentSchema": {
+          "$ref": "#/$defs/argumentSchema",
+          "description": "Structural validation of a tool call's argument map. Valid on tool: targets only — the other namespaces carry no argument map, so one elsewhere is refused at load rather than accepted and never enforced."
+        },
+        "effect": {
+          "$ref": "#/$defs/effectContract",
+          "description": "schemaVersion 0.2. What a call to this target DOES, as a declaration — never an inference from the payload. A constraint with no effect block resolves to the fail-closed default (irreversible, unquantified), which is what makes an unannotated target escalate under a ceiling."
+        },
+        "conditions": {
+          "description": "Boolean predicates that must ALL hold for the call to be allowed. Evaluated at the same interception point as the allowlist match; a condition that cannot be evaluated denies.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/condition" }
+        },
+        "directives": {
+          "description": "Post-allow obligations. redactFields mutates the response; labelOutput and declassify write per-session information-flow state. A directive never affects the allow/deny decision — except declassify, whose approval requirement is checked before the call is allowed to proceed.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/directive" }
+        }
+      }
+    },
+
+    "principalPatterns": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
+
+    "flowLabel": {
+      "description": "A native flow label: the closed, flat provenance/integrity vocabulary. No lattice, no partial order — a label is a tag policy asserts, never a value inferred from content.",
+      "enum": ["public", "internal", "confidential", "pii", "untrusted"]
+    },
+
+    "condition": {
+      "description": "One condition, discriminated by `type`. The vocabulary is CLOSED: an unrecognized type is a load error.",
+      "type": "object",
+      "required": ["type"],
+      "oneOf": [
+        {
+          "title": "timeWindow",
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "timeWindow" },
+            "notBefore": { "type": "string", "description": "RFC3339 instant before which the call is denied." },
+            "notAfter": { "type": "string", "description": "RFC3339 instant after which the call is denied." }
+          },
+          "anyOf": [{ "required": ["notBefore"] }, { "required": ["notAfter"] }]
+        },
+        {
+          "title": "ipRange",
+          "additionalProperties": false,
+          "required": ["cidrs"],
+          "properties": {
+            "type": { "const": "ipRange" },
+            "cidrs": { "type": "array", "minItems": 1, "items": { "type": "string" } }
+          }
+        },
+        {
+          "title": "allowedOperations",
+          "additionalProperties": false,
+          "required": ["argument", "operations"],
+          "properties": {
+            "type": { "const": "allowedOperations" },
+            "argument": { "type": "string", "minLength": 1 },
+            "operations": { "type": "array", "minItems": 1, "items": { "type": "string" } }
+          }
+        },
+        {
+          "title": "allowedExtensions",
+          "additionalProperties": false,
+          "required": ["argument", "extensions"],
+          "properties": {
+            "type": { "const": "allowedExtensions" },
+            "argument": { "type": "string", "minLength": 1 },
+            "extensions": { "type": "array", "minItems": 1, "items": { "type": "string" } }
+          }
+        },
+        {
+          "title": "allowedTables",
+          "additionalProperties": false,
+          "required": ["argument", "tables"],
+          "properties": {
+            "type": { "const": "allowedTables" },
+            "argument": { "type": "string", "minLength": 1 },
+            "tables": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+            "columns": {
+              "type": "object",
+              "additionalProperties": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        },
+        {
+          "title": "maxCalls",
+          "additionalProperties": false,
+          "required": ["count", "windowSeconds"],
+          "properties": {
+            "type": { "const": "maxCalls" },
+            "count": { "type": "integer", "minimum": 1 },
+            "windowSeconds": { "type": "integer", "minimum": 1 }
+          }
+        },
+        {
+          "title": "recipientDomain",
+          "additionalProperties": false,
+          "required": ["argument", "domains"],
+          "properties": {
+            "type": { "const": "recipientDomain" },
+            "argument": { "type": "string", "minLength": 1 },
+            "domains": { "type": "array", "minItems": 1, "items": { "type": "string" } }
+          }
+        },
+        {
+          "title": "allowedValues",
+          "additionalProperties": false,
+          "required": ["argument", "values"],
+          "properties": {
+            "type": { "const": "allowedValues" },
+            "argument": { "type": "string", "minLength": 1 },
+            "values": {
+              "description": "Scalar values. A STRING entry is matched as a glob, never by exact equality first. A \"${task.*}\" entry (schemaVersion 0.2) is a task-context variable instead: it resolves from the validated token and is compared by EXACT equality, and it must be the entire value.",
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": ["string", "number", "boolean", "null"] }
+            }
+          }
+        },
+        {
+          "title": "sequenceBlock",
+          "additionalProperties": false,
+          "required": ["afterTools"],
+          "properties": {
+            "type": { "const": "sequenceBlock" },
+            "afterTools": {
+              "description": "Tool names whose prior invocation in this session denies the call. Matched LITERALLY — a glob here never fires and would fail open, so it is refused at load.",
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        {
+          "title": "flowLabel",
+          "description": "schemaVersion 0.2. The SINK half of information-flow control: denies when the session's accumulated flow labels are not a subset of `allow`.",
+          "additionalProperties": false,
+          "required": ["allow"],
+          "properties": {
+            "type": { "const": "flowLabel" },
+            "allow": {
+              "description": "The source classes this sink tolerates. An EMPTY list is valid and is the strictest sink: it admits only an unlabeled, clean-context flow.",
+              "type": "array",
+              "items": { "$ref": "#/$defs/flowLabel" }
+            }
+          }
+        },
+        {
+          "title": "effectClass",
+          "description": "schemaVersion 0.2. Bounds the reversibility class of the call's resolved effect contract.",
+          "additionalProperties": false,
+          "required": ["allow"],
+          "properties": {
+            "type": { "const": "effectClass" },
+            "allow": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/effectClass" }
+            }
+          }
+        },
+        {
+          "title": "blastRadius",
+          "description": "schemaVersion 0.2. Bounds the quantitative size of the call's effect: `max` per call, and/or a cumulative `maxTotal` summed over `windowSeconds`. A condition declaring neither bound is refused at load, and maxTotal/windowSeconds must be set together — half the pair silently disables the other half.",
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "blastRadius" },
+            "max": { "type": "number" },
+            "maxTotal": { "type": "number" },
+            "windowSeconds": { "type": "integer", "minimum": 1 }
+          },
+          "anyOf": [
+            { "required": ["max"] },
+            { "required": ["maxTotal", "windowSeconds"] }
+          ]
+        },
+        {
+          "title": "policy",
+          "description": "Delegates a leaf predicate to an external PDP (OPA/Cedar) under the fail-closed ceiling. The engine supplies the input; an unreachable or erroring backend denies.",
+          "additionalProperties": false,
+          "required": ["backend"],
+          "properties": {
+            "type": { "const": "policy" },
+            "backend": { "type": "string", "minLength": 1 },
+            "config": {},
+            "input": {}
+          }
+        },
+        {
+          "title": "custom",
+          "description": "A condition handled by a handler registered on the engine. Unregistered at runtime means DENY, never skip.",
+          "additionalProperties": false,
+          "required": ["name"],
+          "properties": {
+            "type": { "const": "custom" },
+            "name": { "type": "string", "minLength": 1 },
+            "config": {}
+          }
+        }
+      ]
+    },
+
+    "directive": {
+      "description": "One directive, discriminated by `type`. The vocabulary is CLOSED: an unrecognized type is a load error.",
+      "type": "object",
+      "required": ["type"],
+      "oneOf": [
+        {
+          "title": "redactFields",
+          "description": "Masks the listed dot-path fields in a tools/call result. Valid on tool: targets only. Array-index notation is refused at load: each segment is a literal object key, so an indexed segment would silently match nothing.",
+          "additionalProperties": false,
+          "required": ["fields"],
+          "properties": {
+            "type": { "const": "redactFields" },
+            "fields": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } }
+          }
+        },
+        {
+          "title": "labelOutput",
+          "description": "schemaVersion 0.2. The SOURCE half of information-flow control: asserts that this call's output carries the named native labels into the session. Valid on tool: and resource: targets — an egress is not a source.",
+          "additionalProperties": false,
+          "required": ["labels"],
+          "properties": {
+            "type": { "const": "labelOutput" },
+            "labels": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/flowLabel" } }
+          }
+        },
+        {
+          "title": "declassify",
+          "description": "schemaVersion 0.2. Clears the named labels from the session — the only token that REMOVES flow state, and the only directive whose absence of an approval changes the decision. Without a human approval covering every label at this exact target, the call ESCALATES (ESCALATION_REQUIRED) rather than running unclassified. Valid on tool: and resource: targets, and never on the same constraint as labelOutput.",
+          "additionalProperties": false,
+          "required": ["labels"],
+          "properties": {
+            "type": { "const": "declassify" },
+            "labels": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/flowLabel" } }
+          }
+        }
+      ]
+    },
+
+    "effectClass": {
+      "description": "The closed reversibility vocabulary. Unannotated resolves to irreversible — the fail-closed flywheel that makes annotating a tool the thing that buys it out of maximum friction.",
+      "enum": ["reversible", "compensable", "irreversible"]
+    },
+
+    "blastRadiusSpec": {
+      "description": "Quantifies a call's magnitude. Exactly one of `value` or `argument` is set; the loader rejects both and neither. A missing or unusable argument resolves to UNQUANTIFIED, which exceeds any finite bound — an action whose size cannot be established must not be treated as small.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "value": { "type": "number", "description": "A fixed magnitude for every call to this target." },
+        "argument": { "type": "string", "minLength": 1, "description": "The call argument carrying the magnitude; a list contributes its LENGTH." },
+        "unit": { "type": "string", "description": "Free-form label for reports and audit records (\"usd\", \"rows\"). Never compared — eunox models no unit algebra." }
+      },
+      "oneOf": [{ "required": ["value"] }, { "required": ["argument"] }]
+    },
+
+    "effectCase": {
+      "description": "One row of an argument-parameterized contract; its fields overlay the base contract when the case matches.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "class": { "$ref": "#/$defs/effectClass" },
+        "idempotent": { "type": "boolean" },
+        "compensatingAction": { "type": "string", "minLength": 1 },
+        "blastRadius": { "$ref": "#/$defs/blastRadiusSpec" }
+      }
+    },
+
+    "effectContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "class": { "$ref": "#/$defs/effectClass" },
+        "idempotent": {
+          "description": "The call can be repeated with no additional effect. It does NOT by itself make an action reversible — a repeatable outbound email is still irreversible.",
+          "type": "boolean"
+        },
+        "compensatingAction": {
+          "description": "The target that reverses this one. REQUIRED for class \"compensable\" and refused on any other, applied to the RESOLVED effect: \"compensable with nothing to compensate with\" is irreversible wearing a softer label, which is exactly how an irreversible action gets waved through a consequence gate.",
+          "type": "string",
+          "minLength": 1
+        },
+        "blastRadius": { "$ref": "#/$defs/blastRadiusSpec" },
+        "byArgument": {
+          "description": "The argument-parameterized form: effect as a STATIC decision table keyed on one argument (db.query is reversible for SELECT, irreversible for DROP). Resolved from the call's own arguments — no callout, no inference.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["argument", "cases"],
+          "properties": {
+            "argument": { "type": "string", "minLength": 1 },
+            "cases": {
+              "type": "object",
+              "minProperties": 1,
+              "additionalProperties": { "$ref": "#/$defs/effectCase" }
+            },
+            "default": {
+              "$ref": "#/$defs/effectCase",
+              "description": "Applies when no case matches. ABSENT means the fail-closed default (irreversible, unquantified), not the base contract: a table that does not cover a value has not said the value is safe."
+            }
+          }
+        },
+        "ref": {
+          "description": "Pins the registry contract this block was authored from, as \"<contract-id>@sha256:<hex>\". eunox NEVER fetches it — the decision path stays local, so a registry outage cannot change a verdict — but the loader recomputes the inline block's digest and refuses a mismatch, which is what makes it an integrity pin rather than a comment.",
+          "type": "string",
+          "pattern": "^.+@sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+
+    "effectCeiling": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "maxEffectClass": {
+          "$ref": "#/$defs/effectClass",
+          "description": "The most consequential class that passes without escalation. Absent leaves the class dimension unbounded."
+        },
+        "maxBlastRadius": {
+          "description": "The largest magnitude that passes. An UNQUANTIFIED action exceeds any set bound. Absent leaves the magnitude dimension unbounded.",
+          "type": "number"
+        },
+        "requireCompensation": {
+          "description": "Additionally demand a compensating action for any action above maxEffectClass — the third input of the consequence gate.",
+          "type": "boolean"
+        },
+        "onExceed": {
+          "description": "The outcome for an over-ceiling action. \"escalate\" (the default) marks it as needing human approval; with no approval integration wired that resolves fail-closed to NOT FORWARDED. \"deny\" refuses outright with no approval path.",
+          "enum": ["escalate", "deny"]
+        }
+      }
+    },
+
+    "argumentSchema": {
+      "description": "A deliberately small JSON-Schema-like subset. `pattern` compiles with Go RE2 (no lookaround or backreferences) and matches UNANCHORED, as in JSON Schema — anchor with ^...$ for a security rule.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "enum": ["object", "array", "string", "number", "integer", "boolean", "null"] },
+        "properties": { "type": "object", "additionalProperties": { "$ref": "#/$defs/argumentSchema" } },
+        "required": { "type": "array", "items": { "type": "string" } },
+        "additionalProperties": { "type": "boolean" },
+        "enum": { "type": "array" },
+        "pattern": { "type": "string" },
+        "minLength": { "type": "integer", "minimum": 0 },
+        "maxLength": { "type": "integer", "minimum": 0 },
+        "minimum": { "type": "number" },
+        "maximum": { "type": "number" },
+        "items": { "$ref": "#/$defs/argumentSchema" },
+        "minItems": { "type": "integer", "minimum": 0 },
+        "maxItems": { "type": "integer", "minimum": 0 },
+        "description": { "type": "string" }
+      }
+    }
+  }
+}

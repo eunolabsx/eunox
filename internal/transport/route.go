@@ -155,6 +155,31 @@ func (r *routeSink) RecordAllow(ctx context.Context, sessionID, identifier, meth
 	})
 }
 
+// RecordDeclassifiedAllow stamps route identity onto the allow record for a call that
+// also performed an approved declassification (see *audit.Sink's method of the same name
+// for why the cleared labels and the approver travel together).
+func (r *routeSink) RecordDeclassifiedAllow(ctx context.Context, sessionID, identifier, method string, details map[string]interface{}, obligs []string, auditOnly bool, labelsOut, carriedLabels, labelsCleared []string, approver string) {
+	if r == nil || r.sink == nil {
+		return
+	}
+	r.sink.Record(ctx, audit.RecordParams{
+		Upstream:      r.upstream,
+		PolicyVersion: r.policyVersion,
+		PolicySHA256:  r.policySHA256,
+		SessionID:     sessionID,
+		Identifier:    identifier,
+		Method:        method,
+		Decision:      "allow",
+		Details:       details,
+		Obligations:   obligs,
+		AuditOnly:     auditOnly,
+		LabelsOut:     labelsOut,
+		CarriedLabels: carriedLabels,
+		LabelsCleared: labelsCleared,
+		Approver:      approver,
+	})
+}
+
 // RecordDeny stamps route identity onto a deny record (see RecordAllow).
 func (r *routeSink) RecordDeny(ctx context.Context, sessionID, identifier, method, denialCode, condType string, details map[string]interface{}, observe bool) {
 	if r == nil || r.sink == nil {

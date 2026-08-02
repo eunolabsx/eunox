@@ -21,22 +21,34 @@ import (
 	"strings"
 )
 
-// ManifestSchemaVersionFlowEffectDraft is the DRAFT grammar revision that opts a
-// manifest into the experimental flow+effect tokens (the flowLabel condition and the
-// labelOutput directive). Those tokens are staged behind schema-version negotiation:
-// a published "0.1" manifest that uses one is refused (the closed grammar stays
-// closed), and only a manifest declaring this draft version enables them. The draft
-// is deliberately NOT mirrored into schemas/ or the capability-manifest guide — it is
-// a staging vehicle until the tokens land in a batched grammar bump.
-const ManifestSchemaVersionFlowEffectDraft = "0.2-draft"
+// ManifestSchemaVersion01 is the base published grammar: deny-by-default capability
+// authorization over the original closed condition/directive vocabulary. It remains
+// supported and remains CLOSED — none of the flow+effect tokens introduced by "0.2"
+// is part of it, and a "0.1" manifest that uses one is refused at load.
+const ManifestSchemaVersion01 = "0.1"
+
+// ManifestSchemaVersion02 is the published flow+effect grammar revision. It adds the
+// information-flow tokens (the flowLabel condition, the labelOutput and declassify
+// directives), the effect layer (the effectClass and blastRadius conditions, a
+// constraint's effect contract, the top-level effectCeiling), and the claim-populated
+// ${task.*} variables — landed as ONE batched bump rather than one token at a time, so
+// the grammar has exactly two published revisions rather than a version per predicate.
+//
+// It replaces the draft staging vehicle those tokens shipped behind while the batch was
+// being assembled. There is no compatibility alias: pre-1.0, a draft is a staging vehicle
+// that is REMOVED once it folds into a published revision, so a manifest still declaring
+// the old draft string is refused, with the supported list naming this version. Leaving
+// the draft accepted as a synonym would leave two spellings of one grammar in the wild
+// and a second version string every future gate has to remember.
+const ManifestSchemaVersion02 = "0.2"
 
 var (
 	// supportedManifestSchemaVersions enumerates the manifest grammar versions
-	// this build can parse. Keep in sync with the spec's published
-	// schemas/<version>/ directories. The "0.2-draft" entry is the experimental
-	// flow+effect staging revision (ManifestSchemaVersionFlowEffectDraft), gated so
-	// its tokens are inert under the published "0.1" grammar.
-	supportedManifestSchemaVersions = map[string]bool{"0.1": true, ManifestSchemaVersionFlowEffectDraft: true}
+	// this build can parse. Keep in sync with the published
+	// schemas/eunox-capability-manifest.schema.json. A build understands both
+	// revisions at once; which tokens a document may use is decided per revision by
+	// tokenGrammarVersions, not by this set.
+	supportedManifestSchemaVersions = map[string]bool{ManifestSchemaVersion01: true, ManifestSchemaVersion02: true}
 
 	// supportedGatewaySchemaVersions enumerates the gateway-config grammar
 	// versions this build can parse. Keep in sync with

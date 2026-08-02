@@ -1213,6 +1213,18 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 		return *ceilingDeny
 	}
 
+	// The approval gate for the one directive that REMOVES a flow label. It sits with the
+	// ceiling on the pre-commit side of the line for the same reason: an unapproved
+	// declassification is refused and never forwarded, so it must not spend a quota slot,
+	// write an antecedent, or touch the session's label set. It runs AFTER the ceiling so a
+	// call that is over the consequence bound reports that — the bound is the more
+	// fundamental refusal, and an operator who fixes the approval first would otherwise
+	// discover the ceiling second.
+	decl, declDeny := e.checkDeclassify(req, matched, carriedLabels, requestID, now)
+	if declDeny != nil {
+		return *declDeny
+	}
+
 	// PASS TWO: commit the deferred conditions, now that nothing left can refuse the call
 	// without state. This ordering is load-bearing and was wrong: with the commit inside
 	// the first pass, an over-ceiling call spent its cumulative blastRadius budget before
@@ -1234,8 +1246,11 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 	// seq-write fault denies via recordFailureDenial. The per-session decision lock
 	// serializes this critical section, so the
 	// rollback removes exactly this call's additions with no concurrent writer.
-	labelsOut, cerr := e.recordSourceCall(ctx, req, matched, flowRelevant, carriedLabels)
+	labelsOut, labelsCleared, cerr := e.recordSourceCall(ctx, req, matched, flowRelevant, carriedLabels, decl)
 	if cerr != nil {
+		if cerr.Declassify {
+			return declassifyRecordFailureDenial(requestID, now, matched.IsAuditOnly())
+		}
 		if cerr.Flow {
 			// No obligations: this one sets HardDeny, so it is never downgraded to a
 			// forward and has no response to redact. Passing them would break the invariant
@@ -1247,6 +1262,15 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 		return recordFailureDenial(requestID, now, matched.IsAuditOnly(), obligations)
 	}
 
+	// The approver rides ONLY on a clear that actually changed the session's labels
+	// (clearLabels returns the intersection with what was carried). An approved directive
+	// whose labels the session never held is a permitted no-op, and stamping an approver
+	// on it would put a declassification that did not happen on the tape.
+	var approver, approvalID string
+	if len(labelsCleared) > 0 {
+		approver, approvalID = decl.Approver, decl.ApprovalID
+	}
+
 	return capability.EnforceResponse{
 		RequestID:   requestID,
 		Decision:    capability.DecisionAllow,
@@ -1254,6 +1278,10 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 		DecidedAt:   now,
 		AuditOnly:   matched.IsAuditOnly(),
 		LabelsOut:   labelsOut,
+
+		LabelsCleared: labelsCleared,
+		Approver:      approver,
+		ApprovalID:    approvalID,
 		// The SAME resolution the two effect conditions and the ceiling read, handed on to
 		// the post-hoc receipt check rather than re-resolved there — one resolution per
 		// call, so the decision and the check cannot disagree about what the effect was.
@@ -1571,11 +1599,13 @@ func (e *Engine) CollectObligations(matched *capability.Constraint, requestID, n
 		if isTypedNil(dir) {
 			continue
 		}
-		// labelOutput is an enforce-time state directive, not a response obligation:
-		// its effect is the session-label write recordLabels performs on allow, so it
-		// produces no post-allow response action. Skip it before ToObligation so it is
-		// neither applied to the response nor tripped by the unknown-obligation guard.
-		if dir.DirectiveType() == capability.DirectiveTypeLabelOutput {
+		// labelOutput and declassify are enforce-time state directives, not response
+		// obligations: their effect is the session-label write (recordLabels' Add and
+		// clearLabels' Remove) the engine performs on allow, so they produce no post-allow
+		// response action. Skip them before ToObligation so they are neither applied to the
+		// response nor tripped by the unknown-obligation guard.
+		switch dir.DirectiveType() {
+		case capability.DirectiveTypeLabelOutput, capability.DirectiveTypeDeclassify:
 			continue
 		}
 		ob := dir.ToObligation()

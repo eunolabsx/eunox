@@ -262,7 +262,7 @@ scaffolds both files from a live server.
 The manifest is a YAML file that declares exactly what the agent may call, read, subscribe to, and retrieve — and under what conditions. Absent entries are denied by default for every enforced MCP method.
 
 ```yaml
-schemaVersion: "0.1"                # manifest grammar version (required)
+schemaVersion: "0.1"                # manifest grammar version (required; "0.2" adds flow + effect)
 name: my-agent
 version: "0.1.0"
 

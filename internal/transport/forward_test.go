@@ -40,6 +40,8 @@ type fwdCapturedRecord struct {
 	auditOnly     bool
 	labelsOut     []string
 	carriedLabels []string
+	labelsCleared []string
+	approver      string
 	identifier    string
 	sessionID     string
 }
@@ -63,6 +65,16 @@ type fwdRecorder struct {
 func (f *fwdRecorder) RecordAllow(_ context.Context, sessionID, identifier, _ string, details map[string]interface{}, obligs []string, auditOnly bool, labelsOut, carriedLabels []string) {
 	f.records = append(f.records, fwdCapturedRecord{
 		decision: "allow", details: details, obligs: obligs, auditOnly: auditOnly, identifier: identifier, labelsOut: labelsOut, carriedLabels: carriedLabels, sessionID: sessionID,
+	})
+	if f.degradeOnRecord {
+		f.degraded = true
+		f.reason = "audit trail degraded: 1 record(s) dropped under back-pressure"
+	}
+}
+
+func (f *fwdRecorder) RecordDeclassifiedAllow(_ context.Context, sessionID, identifier, _ string, details map[string]interface{}, obligs []string, auditOnly bool, labelsOut, carriedLabels, labelsCleared []string, approver string) {
+	f.records = append(f.records, fwdCapturedRecord{
+		decision: "allow", details: details, obligs: obligs, auditOnly: auditOnly, identifier: identifier, labelsOut: labelsOut, carriedLabels: carriedLabels, labelsCleared: labelsCleared, approver: approver, sessionID: sessionID,
 	})
 	if f.degradeOnRecord {
 		f.degraded = true
@@ -756,6 +768,9 @@ func TestForwardServerRequest_ObserveLeg_RecordsDenyBeforeForward(t *testing.T) 
 type forwardOrderRecorder struct{}
 
 func (forwardOrderRecorder) RecordAllow(context.Context, string, string, string, map[string]interface{}, []string, bool, []string, []string) {
+}
+
+func (forwardOrderRecorder) RecordDeclassifiedAllow(context.Context, string, string, string, map[string]interface{}, []string, bool, []string, []string, []string, string) {
 }
 
 func (forwardOrderRecorder) RecordDeny(context.Context, string, string, string, string, string, map[string]interface{}, bool) {

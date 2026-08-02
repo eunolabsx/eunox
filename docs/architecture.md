@@ -281,14 +281,14 @@ Conditions are string-discriminated types (authoritative list in
 Conditions match a specific argument name and never silently match
 alternatives; an unset argument fails the condition (fail closed).
 
-Four further discriminators — `flowLabel` and the `labelOutput` directive
-(information flow), `effectClass` and `blastRadius` (effect) — plus a
-constraint's `effect` contract and the top-level `effectCeiling` are
-**experimental** and staged behind `schemaVersion: "0.2-draft"`. They are not
-part of the published `0.1` grammar: a `0.1` manifest that uses one is refused at
-load, fail closed. They are deliberately absent from the manifest guide and from
-`schemas/` until a batched grammar bump publishes them. See
-[effect-contracts.md](./effect-contracts.md) for the effect layer.
+Five further discriminators — `flowLabel` and the `labelOutput` and
+`declassify` directives (information flow), `effectClass` and `blastRadius`
+(effect) — plus a constraint's `effect` contract, the top-level `effectCeiling`,
+and the claim-populated `${task.*}` variables landed as one batched bump and are
+published in `schemaVersion: "0.2"`. They are not part of `"0.1"`: a `0.1`
+manifest that uses one is refused at load, fail closed. See
+[effect-contracts.md](./effect-contracts.md) for the effect layer and the
+manifest guide for the grammar.
 
 The `Engine` evaluates conditions through a `ConditionHandler` registry —
 built-ins are registered at construction, and embedders can register their

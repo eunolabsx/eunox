@@ -8,12 +8,12 @@ import (
 	"testing"
 )
 
-// TestFlowEffect_StagedBehindDraftSchemaVersion is the staging assertion: the
-// flowLabel condition and labelOutput directive are NOT part of the published "0.1"
-// grammar. A manifest declaring 0.1 that uses one is rejected; the same manifest under
-// the flow+effect draft schemaVersion loads. This keeps the closed 0.1 grammar closed
-// until the tokens land in a batched grammar bump.
-func TestFlowEffect_StagedBehindDraftSchemaVersion(t *testing.T) {
+// TestFlowEffect_RequireTheFlowEffectGrammar is the closed-grammar assertion across
+// revisions: the flowLabel condition and labelOutput directive are NOT part of "0.1".
+// A manifest declaring 0.1 that uses one is rejected; the same manifest under the
+// flow+effect grammar ("0.2") loads. A published revision does not retroactively widen
+// the one before it.
+func TestFlowEffect_RequireTheFlowEffectGrammar(t *testing.T) {
 	flowLabelBody := `name: p
 version: "0.1.0"
 capabilities:
@@ -39,10 +39,10 @@ capabilities:
 		body    string
 		wantErr string // "" means it must load
 	}{
-		{"flowLabel rejected under 0.1", "0.1", flowLabelBody, "requires schemaVersion \"0.2-draft\""},
-		{"labelOutput rejected under 0.1", "0.1", labelOutputBody, "requires schemaVersion \"0.2-draft\""},
-		{"flowLabel accepted under draft", ManifestSchemaVersionFlowEffectDraft, flowLabelBody, ""},
-		{"labelOutput accepted under draft", ManifestSchemaVersionFlowEffectDraft, labelOutputBody, ""},
+		{"flowLabel rejected under 0.1", "0.1", flowLabelBody, "was introduced in schemaVersion \"0.2\""},
+		{"labelOutput rejected under 0.1", "0.1", labelOutputBody, "was introduced in schemaVersion \"0.2\""},
+		{"flowLabel accepted under the flow+effect grammar", ManifestSchemaVersion02, flowLabelBody, ""},
+		{"labelOutput accepted under the flow+effect grammar", ManifestSchemaVersion02, labelOutputBody, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -51,7 +51,7 @@ capabilities:
 			_, err := LoadManifest(path)
 			if tc.wantErr == "" {
 				if err != nil {
-					t.Fatalf("LoadManifest rejected a draft manifest: %v", err)
+					t.Fatalf("LoadManifest rejected a 0.2 manifest: %v", err)
 				}
 				return
 			}
@@ -70,7 +70,7 @@ capabilities:
 // labelOutput requires a non-empty labels list. All under the draft schemaVersion so
 // the staging gate is already satisfied and only the vocabulary check is exercised.
 func TestFlowEffect_LabelVocabularyValidation(t *testing.T) {
-	draft := "schemaVersion: \"" + ManifestSchemaVersionFlowEffectDraft + "\"\n"
+	draft := "schemaVersion: \"" + ManifestSchemaVersion02 + "\"\n"
 	cases := []struct {
 		name    string
 		body    string
@@ -135,7 +135,7 @@ capabilities:
 // redactFields — a response mutation — remains tool-only. An empty allow flowLabel is
 // also accepted (the strictest sink), proving empty is a valid rule, not a malformed one.
 func TestLabelOutput_AllowedOnResourceTarget(t *testing.T) {
-	draft := "schemaVersion: \"" + ManifestSchemaVersionFlowEffectDraft + "\"\n"
+	draft := "schemaVersion: \"" + ManifestSchemaVersion02 + "\"\n"
 
 	ok := draft + `name: p
 version: "0.1.0"
@@ -176,7 +176,7 @@ capabilities:
 // a load error (conditionKeysFor/directiveKeysFor now cover them), not silently dropped
 // — so a typo like `allowed:` for `allow:` cannot silently turn a sink into deny-all.
 func TestFlowEffect_UnknownKeyRejected(t *testing.T) {
-	draft := "schemaVersion: \"" + ManifestSchemaVersionFlowEffectDraft + "\"\n"
+	draft := "schemaVersion: \"" + ManifestSchemaVersion02 + "\"\n"
 	cases := []struct{ name, body, wantErr string }{
 		{
 			"typo'd flowLabel key",
@@ -220,7 +220,7 @@ capabilities:
 // valid only on tool:/resource: targets; a system: target is rejected at load, so a
 // sampling-leg state/tape mismatch cannot be authored.
 func TestLabelOutput_RejectedOnSystemTarget(t *testing.T) {
-	draft := "schemaVersion: \"" + ManifestSchemaVersionFlowEffectDraft + "\"\n"
+	draft := "schemaVersion: \"" + ManifestSchemaVersion02 + "\"\n"
 	body := draft + `name: p
 version: "0.1.0"
 capabilities:

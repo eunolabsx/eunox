@@ -383,6 +383,18 @@ func NewConditionPrototype(condType string) (Condition, bool) {
 	return proto(), true
 }
 
+// KnownConditionTypes returns a fresh copy of the registry's discriminators in lexical
+// order — the closed condition vocabulary, read from the ONE registry rather than a
+// mirrored list. It exists so a consumer that must stay in step with the grammar (the
+// published JSON Schema's drift guard) derives its expectation from the registry itself:
+// a hand-written mirror is a second table to update per new condition type, and one that
+// fails silently — a type missing from it is simply not checked.
+//
+// A fresh slice each call, so a caller cannot mutate the package's accepted set.
+func KnownConditionTypes() []string {
+	return append([]string(nil), knownConditionTypes...)
+}
+
 // suggestConditionType returns the known condition type nearest to unknown, or
 // "" when nothing is close enough. Ties resolve to knownConditionTypes order
 // for deterministic messages.

@@ -75,6 +75,21 @@ func marshalDirective(directive Directive) ([]byte, error) {
 			directiveEnvelope
 			*alias
 		}{directiveEnvelope{Type: typed.DirectiveType()}, (*alias)(typed)})
+	case DeclassifyDirective:
+		type alias DeclassifyDirective
+		return json.Marshal(struct {
+			directiveEnvelope
+			alias
+		}{directiveEnvelope{Type: typed.DirectiveType()}, alias(typed)})
+	case *DeclassifyDirective:
+		if typed == nil {
+			return []byte("null"), nil
+		}
+		type alias DeclassifyDirective
+		return json.Marshal(struct {
+			directiveEnvelope
+			*alias
+		}{directiveEnvelope{Type: typed.DirectiveType()}, (*alias)(typed)})
 	default:
 		return nil, fmt.Errorf("unsupported directive payload: %T", directive)
 	}
@@ -90,7 +105,7 @@ func unmarshalDirective(data []byte) (Directive, error) {
 	}
 	target := newDirective(envelope.Type)
 	if target == nil {
-		return nil, fmt.Errorf("unknown directive type %q — valid types are: redactFields, labelOutput", envelope.Type)
+		return nil, fmt.Errorf("unknown directive type %q — valid types are: redactFields, labelOutput, declassify", envelope.Type)
 	}
 	// Reject unknown fields, by the same rule and for the same reason as
 	// unmarshalCondition (see jsonFieldNames): a lenient decode silently drops a
@@ -114,6 +129,8 @@ func newDirective(directiveType string) Directive {
 		return &RedactFieldsDirective{}
 	case DirectiveTypeLabelOutput:
 		return &LabelOutputDirective{}
+	case DirectiveTypeDeclassify:
+		return &DeclassifyDirective{}
 	default:
 		return nil
 	}

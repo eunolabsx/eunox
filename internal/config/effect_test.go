@@ -23,7 +23,7 @@ func writeEffectManifest(t *testing.T, body string) (*LocalManifest, error) {
 // effectManifest wraps capability/ceiling YAML in the draft-version envelope the effect
 // tokens are staged behind.
 func effectManifest(ceiling, caps string) string {
-	return "schemaVersion: \"0.2-draft\"\nname: t\nversion: 1.0.0\n" + ceiling + "capabilities:\n" + caps
+	return "schemaVersion: \"0.2\"\nname: t\nversion: 1.0.0\n" + ceiling + "capabilities:\n" + caps
 }
 
 // TestEffectGrammarAcceptsAWellFormedPolicy is the allow case: the whole effect grammar
@@ -209,10 +209,11 @@ func TestEffectGrammarRejections(t *testing.T) {
 	}
 }
 
-// TestEffectTokensAreStagedBehindTheDraftVersion pins the staging invariant: under the
-// PUBLISHED grammar the effect tokens are not part of the language and a manifest using
-// one is refused, rather than silently enabling an experimental predicate.
-func TestEffectTokensAreStagedBehindTheDraftVersion(t *testing.T) {
+// TestEffectTokensRequireTheFlowEffectGrammar pins the closed-grammar invariant across
+// revisions: under "0.1" the effect tokens are not part of the language and a manifest
+// using one is refused, rather than silently enabling a predicate that revision does not
+// define.
+func TestEffectTokensRequireTheFlowEffectGrammar(t *testing.T) {
 	published := func(ceiling, caps string) string {
 		return "schemaVersion: \"0.1\"\nname: t\nversion: 1.0.0\n" + ceiling + "capabilities:\n" + caps
 	}
@@ -220,29 +221,29 @@ func TestEffectTokensAreStagedBehindTheDraftVersion(t *testing.T) {
 		{
 			name:    "effectCeiling",
 			body:    published("effectCeiling:\n  maxEffectClass: reversible\n", "  - target: tool:t\n    actions: [call]\n"),
-			wantErr: "top-level effectCeiling is experimental",
+			wantErr: "top-level effectCeiling was introduced in schemaVersion \"0.2\"",
 		},
 		{
 			name:    "effect contract",
 			body:    published("", "  - target: tool:t\n    actions: [call]\n    effect:\n      class: reversible\n"),
-			wantErr: "effect contract block is experimental",
+			wantErr: "effect contract block was introduced in schemaVersion \"0.2\"",
 		},
 		{
 			name:    "effectClass condition",
 			body:    published("", "  - target: tool:t\n    actions: [call]\n    conditions:\n      - type: effectClass\n        allow: [reversible]\n"),
-			wantErr: "effectClass condition is experimental",
+			wantErr: "effectClass condition was introduced in schemaVersion \"0.2\"",
 		},
 		{
 			name:    "blastRadius condition",
 			body:    published("", "  - target: tool:t\n    actions: [call]\n    conditions:\n      - type: blastRadius\n        max: 5\n"),
-			wantErr: "blastRadius condition is experimental",
+			wantErr: "blastRadius condition was introduced in schemaVersion \"0.2\"",
 		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			_, err := writeEffectManifest(t, c.body)
 			if err == nil {
-				t.Fatal("a staged token must be refused under the published grammar")
+				t.Fatal("a 0.2 token must be refused under the 0.1 grammar")
 			}
 			if !strings.Contains(err.Error(), c.wantErr) {
 				t.Fatalf("error %q must mention %q", err, c.wantErr)

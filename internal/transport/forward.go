@@ -32,6 +32,12 @@ import (
 // to this interface at a call site.
 type auditRecorder interface {
 	RecordAllow(ctx context.Context, sessionID, identifier, method string, details map[string]interface{}, obligs []string, auditOnly bool, labelsOut, carriedLabels []string)
+	// RecordDeclassifiedAllow is the allow recorder for a call that ALSO cleared flow
+	// labels under a human approval. It is separate from RecordAllow so the cleared
+	// labels and the approving human can only be stamped together — a declassification
+	// with no named approver is not one the proxy performs, and a widened RecordAllow
+	// would let any of its call sites pass one without the other.
+	RecordDeclassifiedAllow(ctx context.Context, sessionID, identifier, method string, details map[string]interface{}, obligs []string, auditOnly bool, labelsOut, carriedLabels, labelsCleared []string, approver string)
 	RecordDeny(ctx context.Context, sessionID, identifier, method, denialCode, condType string, details map[string]interface{}, observe bool)
 	// AuditDegraded reports whether the audit trail has lost coverage (a dropped or
 	// failed-to-write record). reason is a short prose note for the host-facing
@@ -593,9 +599,32 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 	// Carry dec.AuditOnly so a per-entry audit-mode forward is not logged as a
 	// genuine allow. allowDetails supplies the structured details.
 	warnIfStrictAuditJustDegraded(fp.requireAuditStrict, fp.rec, kind, denialTarget, func() {
-		if fp.rec != nil {
-			fp.rec.RecordAllow(ctx, fp.sessionID, auditID, method, allowDetails(upResp), oblNames, fp.audit || dec.AuditOnly, dec.LabelsOut, dec.CarriedLabels)
+		if fp.rec == nil {
+			return
 		}
+		// A call that cleared flow labels under a human approval takes the recorder that
+		// carries the approval; every other call takes the plain one. The branch is on
+		// LabelsCleared rather than Approver because the engine populates both together
+		// and only when the clear actually changed the session's labels — an approved
+		// directive whose labels the session never held is a no-op, and recording an
+		// approver for it would put a declassification that did not happen on the tape.
+		if len(dec.LabelsCleared) > 0 {
+			details := allowDetails(upResp)
+			if dec.ApprovalID != "" {
+				// The control plane's own identifier for the approval, so a tape entry
+				// joins back to the workflow that produced it. It rides in details rather
+				// than as a top-level field because it is an opaque external reference —
+				// nothing in the proxy interprets it — where approver and labels_cleared
+				// are the facts the record asserts.
+				if details == nil {
+					details = map[string]interface{}{}
+				}
+				details[audit.DeclassifyApprovalIDKey] = dec.ApprovalID
+			}
+			fp.rec.RecordDeclassifiedAllow(ctx, fp.sessionID, auditID, method, details, oblNames, fp.audit || dec.AuditOnly, dec.LabelsOut, dec.CarriedLabels, dec.LabelsCleared, dec.Approver)
+			return
+		}
+		fp.rec.RecordAllow(ctx, fp.sessionID, auditID, method, allowDetails(upResp), oblNames, fp.audit || dec.AuditOnly, dec.LabelsOut, dec.CarriedLabels)
 	})
 	upResp.ID = msg.ID
 	return upResp

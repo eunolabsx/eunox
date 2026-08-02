@@ -15,10 +15,9 @@ Two Docker services. One manifest file. First enforced tool call in under 10 min
 > clean session is allowed to make is **denied** once that label is present —
 > the agent is inside its granted capabilities, but the flow is not permitted.
 > Deterministic and model-free; `make -C demo ci-test-flow` asserts 20 identical
-> runs with a verified tape. Uses the experimental flow+effect grammar
-> (`flowLabel` / `labelOutput`), staged behind `schemaVersion: "0.2-draft"` in
-> [`manifest-flow.yaml`](./manifest-flow.yaml) — not part of the published `0.1`
-> grammar. Go + python3, no Docker.
+> runs with a verified tape. Uses the flow+effect grammar
+> (`flowLabel` / `labelOutput`), published in `schemaVersion: "0.2"` in
+> [`manifest-flow.yaml`](./manifest-flow.yaml) — not part of `0.1`. Go + python3, no Docker.
 >
 > Scope: the source→sink guarantee holds even against a client that fires the
 > source read and the egress write concurrently on one session — the proxy
@@ -42,10 +41,9 @@ Two Docker services. One manifest file. First enforced tool call in under 10 min
 > escalated record carries `carried_labels=untrusted`, tying the refusal to the
 > provenance that produced it: one tape, one enforcement point, both axes.
 > Deterministic and model-free; `make -C demo ci-test-effect` asserts 20 identical runs
-> with a verified tape. Uses the experimental flow+effect grammar (`effect`,
-> `effectCeiling`), staged behind `schemaVersion: "0.2-draft"` in
-> [`manifest-effect.yaml`](./manifest-effect.yaml) — not part of the published `0.1`
-> grammar. Go + python3, no Docker.
+> with a verified tape. Uses the flow+effect grammar (`effect`,
+> `effectCeiling`), published in `schemaVersion: "0.2"` in
+> [`manifest-effect.yaml`](./manifest-effect.yaml) — not part of `0.1`. Go + python3, no Docker.
 >
 > Scope: escalate is a **refusal that says why**, not a pending state. The in-path proxy
 > holds no approval workflow (that is the control-plane surface), so with none wired an
