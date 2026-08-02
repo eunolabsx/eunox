@@ -29,8 +29,8 @@ func TestRecordDeclassifiedAllow_SignAndVerify(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	sink.RecordDeclassifiedAllow(context.Background(), "sess-1", "sanitize_report", "tools/call",
-		map[string]interface{}{DeclassifyApprovalIDKey: "apr-9"}, nil, false,
-		nil, []string{"internal", "pii"}, []string{"pii"}, "alice@example.com")
+		nil, nil, false,
+		nil, []string{"internal", "pii"}, []string{"pii"}, "alice@example.com", "apr-9")
 	// An ordinary allow must carry neither field.
 	sink.RecordAllow(context.Background(), "sess-1", "read_file", "tools/call", nil, nil, false, nil, nil)
 	if err := sink.Close(); err != nil {
@@ -49,14 +49,14 @@ func TestRecordDeclassifiedAllow_SignAndVerify(t *testing.T) {
 	if !bytes.Contains(declassified, []byte(`"approver":"alice@example.com"`)) {
 		t.Fatalf("approver missing/wrong: %s", declassified)
 	}
-	if !bytes.Contains(declassified, []byte(DeclassifyApprovalIDKey)) {
-		t.Fatalf("the approval id must reach details so a record joins back to the workflow: %s", declassified)
+	if !bytes.Contains(declassified, []byte(`"approval_id":"apr-9"`)) {
+		t.Fatalf("the approval id must be a signed field so a record joins back to the workflow: %s", declassified)
 	}
 	// The record is still an ALLOW: the call ran. labels_cleared is what distinguishes it.
 	if !bytes.Contains(declassified, []byte(`"decision":"allow"`)) {
 		t.Fatalf("a declassification is an allow, not a separate decision: %s", declassified)
 	}
-	if bytes.Contains(plain, []byte("labels_cleared")) || bytes.Contains(plain, []byte("approver")) {
+	if bytes.Contains(plain, []byte("labels_cleared")) || bytes.Contains(plain, []byte("approver")) || bytes.Contains(plain, []byte("approval_id")) {
 		t.Fatalf("an ordinary allow must omit both declassification fields: %s", plain)
 	}
 

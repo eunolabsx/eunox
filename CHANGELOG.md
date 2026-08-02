@@ -58,10 +58,14 @@ Section conventions:
     **superset** of what the directive clears (a partial grant escalates rather than
     half-clearing), `approver` is mandatory, and a malformed grant rejects the **token**
     rather than evaluating to a grant that covers nothing.
-  - **Two new audit fields**, `labels_cleared` and `approver`, appear together or not at
-    all and are covered by the record HMAC. `labels_cleared` reports what actually
-    *changed*, so an approved clear of a label the session never held records neither.
-    `eunox stats` counts declassifications separately.
+  - **Three new audit fields**, `labels_cleared`, `approver` and `approval_id`, appear
+    together or not at all and are covered by the record HMAC. `labels_cleared` reports
+    what actually *changed*, so an approved clear of a label the session never held
+    records neither. `eunox stats` counts declassifications separately.
+  - **Requires an HTTP host.** Approvals ride a validated JWT and JWT validation needs an
+    HTTP listener, so a `declassify` directive on a **stdio host** could only ever
+    escalate — it is refused at startup rather than failing on every call. A stdio
+    *upstream* behind an HTTP gateway is unaffected.
   - **Honest limit, stated rather than mitigated:** the token is held by the agent, so an
     approval minted into it is replayable for that token's lifetime at any action the
     grant names. Mint a short-lived token per approval rather than a standing grant.
@@ -71,7 +75,9 @@ Section conventions:
   instead of to a literal. A resolved value is compared by **exact equality**, never as a
   glob (a claim of `*` must not become a wildcard the token holder chose for themselves),
   a reference must be the **entire** value, and an unresolvable one **denies** rather than
-  falling back to the placeholder text. A misspelled variable is a load error.
+  falling back to the placeholder text. A misspelled variable is a load error **under
+  `"0.2"`**; under `"0.1"` a `${` remains an ordinary character in a literal value, so an
+  existing manifest whose allowlist holds template-shaped text keeps loading unchanged.
 
 - **Interface pinning Tier-2** — every session now auto-baselines the advertised surface
   of **every** tool the upstream reports and re-diffs it on **every** `tools/list`. A tool

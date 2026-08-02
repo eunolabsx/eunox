@@ -110,6 +110,15 @@ func (m *LocalManifest) HasFlowLabel() bool {
 		m.anyDirective(capability.IsDeclassifyDirective)
 }
 
+// HasDeclassify reports whether this policy carries a declassify directive — the one
+// token whose satisfaction depends on a channel (a validated JWT) that not every host
+// transport has. The startup check consults it to refuse a manifest whose declassification
+// could never be approved; it is single-sourced here beside the other policy predicates so
+// that check and the engine's own gate cannot drift on what counts as declassifying.
+func (m *LocalManifest) HasDeclassify() bool {
+	return m != nil && m.anyDirective(capability.IsDeclassifyDirective)
+}
+
 // HonorsAttributionInterface reports whether this policy admits the client-supplied
 // attribution interface (the `io.eunolabs.context-manifest` block in a request's `_meta`).
 //

@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"regexp"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/eunolabs/eunox/internal/config"
@@ -121,19 +122,21 @@ func TestManifestSchema_CoversEveryConditionType(t *testing.T) {
 	}
 }
 
-// TestManifestSchema_CoversEveryDirectiveType mirrors the condition walk for directives.
-// The directive set has no prototype registry, so the expectation is spelled out — and
-// that is exactly why the count assertion below matters: it is what fails when a fourth
-// directive lands and this list is not updated.
+// TestManifestSchema_CoversEveryDirectiveType mirrors the condition walk for directives,
+// deriving its expectation from the directive registry for the same reason: a hand-written
+// mirror is a second table to update per new directive, and one that fails silently.
 func TestManifestSchema_CoversEveryDirectiveType(t *testing.T) {
 	t.Parallel()
 	doc := loadManifestSchema(t)
 	branches := schemaOneOfByConst(t, schemaObjectAt(t, doc, "$defs", "directive"))
 
-	want := map[string]any{
-		capability.DirectiveTypeRedactFields: capability.RedactFieldsDirective{},
-		capability.DirectiveTypeLabelOutput:  capability.LabelOutputDirective{},
-		capability.DirectiveTypeDeclassify:   capability.DeclassifyDirective{},
+	want := map[string]any{}
+	for _, dirType := range capability.KnownDirectiveTypes() {
+		proto, ok := capability.NewDirectivePrototype(dirType)
+		if !ok {
+			t.Fatalf("directive type %q is advertised but has no prototype", dirType)
+		}
+		want[dirType] = proto
 	}
 	for dirType, proto := range want {
 		branch, declared := branches[dirType]
@@ -351,4 +354,130 @@ func sameStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TestManifestSchema_GatesTheFlowEffectTokensByRevision is the correspondence test between
+// the published schema and the loader on the one rule an author is most likely to trip:
+// that "0.1" is a strict subset. It walks the same token list against BOTH — the schema
+// must name each in its 0.1 exclusion, and the loader must refuse each under 0.1 — so the
+// two cannot silently disagree about which revision admits a token.
+//
+// Without it, the schema's flat schemaVersion enum certified as valid exactly the manifest
+// the proxy then refused to boot on: an authoring aid that green-lights the error it exists
+// to catch is worse than none.
+func TestManifestSchema_GatesTheFlowEffectTokensByRevision(t *testing.T) {
+	t.Parallel()
+	doc := loadManifestSchema(t)
+	all, ok := doc["allOf"].([]any)
+	if !ok || len(all) != 1 {
+		t.Fatal("schema has no single-entry allOf carrying the 0.1 subset rule")
+	}
+	gate, ok := all[0].(map[string]any)
+	if !ok {
+		t.Fatal("allOf[0] is not an object")
+	}
+	then, ok := gate["then"].(map[string]any)
+	if !ok {
+		t.Fatal("the 0.1 subset rule has no \"then\"")
+	}
+	item := schemaObjectAt(t, then, "properties", "capabilities", "items")
+
+	// The root-level and per-capability structural exclusions.
+	if req, _ := schemaObjectAt(t, then, "not")["required"].([]any); len(req) != 1 || req[0] != "effectCeiling" {
+		t.Errorf("the 0.1 arm must exclude the top-level effectCeiling, got %v", req)
+	}
+	if req, _ := schemaObjectAt(t, item, "not")["required"].([]any); len(req) != 1 || req[0] != "effect" {
+		t.Errorf("the 0.1 arm must exclude a capability's effect contract, got %v", req)
+	}
+
+	condExcluded := schemaNotEnum(t, schemaObjectAt(t, item, "properties", "conditions", "items", "properties", "type"))
+	dirExcluded := schemaNotEnum(t, schemaObjectAt(t, item, "properties", "directives", "items", "properties", "type"))
+	varExcluded := schemaNotEnum(t, schemaObjectAt(t, item, "properties", "conditions", "items", "properties", "values", "items"))
+
+	wantCond := []string{capability.ConditionTypeFlowLabel, capability.ConditionTypeEffectClass, capability.ConditionTypeBlastRadius}
+	wantDir := []string{capability.DirectiveTypeLabelOutput, capability.DirectiveTypeDeclassify}
+	var wantVar []string
+	for _, n := range capability.TaskVarNames() {
+		wantVar = append(wantVar, "${"+n+"}")
+	}
+	if !sameStrings(condExcluded, wantCond) {
+		t.Errorf("0.1 condition exclusion = %v, want %v", condExcluded, wantCond)
+	}
+	if !sameStrings(dirExcluded, wantDir) {
+		t.Errorf("0.1 directive exclusion = %v, want %v", dirExcluded, wantDir)
+	}
+	if !sameStrings(varExcluded, wantVar) {
+		t.Errorf("0.1 task-variable exclusion = %v, want %v", varExcluded, wantVar)
+	}
+
+	// The other half of the correspondence: the LOADER refuses every one of them under
+	// 0.1. A schema exclusion the loader does not enforce (or vice versa) is the drift
+	// this test exists to catch.
+	bodies := map[string]string{
+		"effectCeiling":     "effectCeiling:\n  maxEffectClass: reversible\ncapabilities:\n  - target: tool:t\n    actions: [call]\n",
+		"effect contract":   "capabilities:\n  - target: tool:t\n    actions: [call]\n    effect:\n      class: reversible\n",
+		"flowLabel":         "capabilities:\n  - target: tool:t\n    actions: [call]\n    conditions:\n      - type: flowLabel\n        allow: [public]\n",
+		"effectClass":       "capabilities:\n  - target: tool:t\n    actions: [call]\n    conditions:\n      - type: effectClass\n        allow: [reversible]\n",
+		"blastRadius":       "capabilities:\n  - target: tool:t\n    actions: [call]\n    conditions:\n      - type: blastRadius\n        max: 5\n",
+		"labelOutput":       "capabilities:\n  - target: tool:t\n    actions: [call]\n    directives:\n      - type: labelOutput\n        labels: [pii]\n",
+		"declassify":        "capabilities:\n  - target: tool:t\n    actions: [call]\n    directives:\n      - type: declassify\n        labels: [pii]\n",
+		"${task.id}":        "capabilities:\n  - target: tool:t\n    actions: [call]\n    conditions:\n      - type: allowedValues\n        argument: a\n        values: [\"${task.id}\"]\n",
+		"${task.agent}":     "capabilities:\n  - target: tool:t\n    actions: [call]\n    conditions:\n      - type: allowedValues\n        argument: a\n        values: [\"${task.agent}\"]\n",
+		"${task.principal}": "capabilities:\n  - target: tool:t\n    actions: [call]\n    conditions:\n      - type: allowedValues\n        argument: a\n        values: [\"${task.principal}\"]\n",
+	}
+	for name, body := range bodies {
+		t.Run("loader refuses "+name+" under 0.1", func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "m.yaml")
+			if err := os.WriteFile(path, []byte("schemaVersion: \"0.1\"\nname: m\nversion: \"1.0.0\"\n"+body), 0o600); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			_, err := config.LoadManifest(path)
+			if err == nil {
+				t.Fatalf("%s must be refused under the 0.1 grammar", name)
+			}
+			if !strings.Contains(err.Error(), "schemaVersion \"0.2\"") {
+				t.Fatalf("%s: err = %v, want it to name the introducing revision", name, err)
+			}
+		})
+	}
+}
+
+// schemaNotEnum returns the enum a node excludes via {"not": {"enum": [...]}}.
+func schemaNotEnum(t *testing.T, node map[string]any) []string {
+	t.Helper()
+	return schemaEnum(t, schemaObjectAt(t, node, "not"))
+}
+
+// TestComputeAuditStats_CountsDeclassifications pins the operator-facing half of the
+// declassification path: `eunox stats` counts an approved clear separately, as the other
+// side of the approval queue the escalate count reports.
+//
+// The count is what an operator watches for a sanitizing step that has quietly become
+// routine, so it must key on labels_cleared (the fact the record asserts) and must not
+// bucket a declassification away from the allows it belongs with — the call ran.
+func TestComputeAuditStats_CountsDeclassifications(t *testing.T) {
+	t.Parallel()
+	tape := strings.Join([]string{
+		`{"decision":"allow","target":"read_file","method":"tools/call"}`,
+		`{"decision":"allow","target":"sanitize","method":"tools/call","labels_cleared":["pii"],"approver":"alice"}`,
+		`{"decision":"allow","target":"sanitize","method":"tools/call","labels_cleared":["confidential"],"approver":"bob"}`,
+		`{"decision":"escalate","target":"drop_table","method":"tools/call","denial_code":"ESCALATION_REQUIRED"}`,
+	}, "\n")
+
+	got, err := computeAuditStats(strings.NewReader(tape))
+	if err != nil {
+		t.Fatalf("computeAuditStats: %v", err)
+	}
+	if got.allowed != 3 {
+		t.Errorf("allowed = %d, want 3 — a declassification is an allow, not a separate bucket", got.allowed)
+	}
+	if got.declassified != 2 {
+		t.Errorf("declassified = %d, want 2", got.declassified)
+	}
+	if got.escalated != 1 {
+		t.Errorf("escalated = %d, want 1", got.escalated)
+	}
+	if got.allowed+got.blocked+got.observed+got.other != got.total {
+		t.Errorf("buckets do not reconcile with total %d", got.total)
+	}
 }

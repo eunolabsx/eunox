@@ -123,6 +123,25 @@ func unmarshalDirective(data []byte) (Directive, error) {
 	return target, nil
 }
 
+// NewDirectivePrototype returns a fresh zero-valued directive of the given type, or
+// (nil, false) for a type this build does not model. It is the directive analogue of
+// NewConditionPrototype, exported for the same reason: the manifest loader's
+// permitted-key check and the published schema's drift guard must both read the ONE
+// registry rather than mirroring it. A hand-written mirror there fails OPEN — an
+// unlisted type makes the caller skip the unknown-key check entirely, so a misspelled
+// field loads as an empty value instead of erroring.
+func NewDirectivePrototype(directiveType string) (Directive, bool) {
+	d := newDirective(directiveType)
+	return d, d != nil
+}
+
+// KnownDirectiveTypes returns the registry's directive discriminators in lexical order —
+// the closed directive vocabulary, read from the registry rather than a mirrored list.
+// A fresh slice each call.
+func KnownDirectiveTypes() []string {
+	return []string{DirectiveTypeDeclassify, DirectiveTypeLabelOutput, DirectiveTypeRedactFields}
+}
+
 func newDirective(directiveType string) Directive {
 	switch directiveType {
 	case DirectiveTypeRedactFields:

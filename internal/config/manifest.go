@@ -894,6 +894,11 @@ func validateLocalManifest(m *LocalManifest) error {
 	if strings.TrimSpace(m.Name) == "" {
 		return fmt.Errorf("'name' must not be empty")
 	}
+	// The declared grammar revision, trimmed once. Only validateAllowedValues consults it
+	// (the ${task.*} surface is defined by "0.2" and absent from "0.1"); every other
+	// per-type validator is revision-independent, and the authoritative version gate for
+	// discriminator tokens stays checkTokenGrammarVersion below.
+	declaredSchemaVersion := strings.TrimSpace(m.SchemaVersion)
 	if err := validateEffectCeiling(m.EffectCeiling); err != nil {
 		return err
 	}
@@ -1151,7 +1156,12 @@ func validateLocalManifest(m *LocalManifest) error {
 			case capability.RecipientDomainCondition, *capability.RecipientDomainCondition:
 				err = validateTypedCondition(i, j, cond, validateRecipientDomain)
 			case capability.AllowedValuesCondition, *capability.AllowedValuesCondition:
-				err = validateTypedCondition(i, j, cond, validateAllowedValues)
+				// The only per-type validator that needs the declared grammar revision:
+				// the ${task.*} surface exists in "0.2" and not in "0.1", so what counts
+				// as a malformed reference versus an ordinary literal differs between them.
+				err = validateTypedCondition(i, j, cond, func(i, j int, v *capability.AllowedValuesCondition) error {
+					return validateAllowedValues(i, j, v, declaredSchemaVersion)
+				})
 			case capability.MaxCallsCondition, *capability.MaxCallsCondition:
 				err = validateTypedCondition(i, j, cond, validateMaxCalls)
 			case capability.IPRangeCondition, *capability.IPRangeCondition:
@@ -1428,7 +1438,7 @@ func validateAllowedExtensions(i, j int, v *capability.AllowedExtensionsConditio
 // validateAllowedValues rejects an allowedValues condition that fails closed: a
 // missing 'argument' or an empty 'values' list (both deny every call, typically
 // from an `arguments:`/`value:` typo), or a value that is a malformed glob.
-func validateAllowedValues(i, j int, v *capability.AllowedValuesCondition) error {
+func validateAllowedValues(i, j int, v *capability.AllowedValuesCondition, declared string) error {
 	if err := validateArgumentRef(i, j, v.Argument, "allowedValues requires an 'argument' field naming the tool parameter to check (e.g. argument: path)"); err != nil {
 		return err
 	}
@@ -1451,7 +1461,15 @@ func validateAllowedValues(i, j int, v *capability.AllowedValuesCondition) error
 		// carrying a "${" that is not a well-formed, recognized reference is a load error
 		// — the closed grammar's rule, applied to the variable surface: a misspelled
 		// ${task.identifier} must not load as an inert literal that denies every call.
-		if capability.ContainsVariableRef(s) {
+		//
+		// Gated on the revision that DEFINES the surface. Under "0.1" a "${" is an
+		// ordinary character in a literal value (it is not a glob metacharacter), so a
+		// document that was valid before the variable surface existed keeps loading;
+		// applying the rule there would turn an existing manifest into a startup failure
+		// over a token its grammar does not contain. A recognized reference under "0.1" is
+		// still refused — by checkTaskVarGrammarVersion, which names the revision that
+		// introduced it, exactly as every other 0.2 token is refused.
+		if declared == ManifestSchemaVersion02 && capability.ContainsVariableRef(s) {
 			if err := capability.ValidateVariableRef(s); err != nil {
 				return fmt.Errorf("capability at index %d, condition %d, value %d: %w", i, j, k, err)
 			}
@@ -1862,7 +1880,10 @@ func checkTaskVarGrammarVersion(i int, c *capability.Constraint, declared string
 		}
 		for _, val := range av.Values {
 			s, isString := val.(string)
-			if !isString || !capability.ContainsVariableRef(s) {
+			if !isString || !capability.IsTaskVarRef(s) {
+				// Only a RECOGNIZED reference is a "0.2" token. An unrecognized "${...}"
+				// under "0.1" is a literal that revision has always accepted, so refusing
+				// it here would be a breaking change dressed as a grammar gate.
 				continue
 			}
 			return tokenGrammarVersionErr(i, "the task-context variable "+s, ManifestSchemaVersion02, declared)
@@ -2392,23 +2413,21 @@ func conditionKeysFor(condType string) (map[string]bool, bool) {
 	return keys, true
 }
 
-// directiveKeysFor mirrors conditionKeysFor for response directives.
+// directiveKeysFor mirrors conditionKeysFor for directives — and, like it, reads the ONE
+// registry rather than a hand-written type switch.
+//
+// The switch it replaced was a fail-open: the caller skips the unknown-key check for a
+// type this returns "not known" for, so a directive whose arm someone forgot to add would
+// silently accept a misspelled field and load it as an empty value — exactly the shape the
+// unknown-key check exists to reject.
 func directiveKeysFor(dirType string) (map[string]bool, bool) {
-	switch dirType {
-	case capability.DirectiveTypeRedactFields:
-		keys := jsonFieldKeys(reflect.TypeOf(capability.RedactFieldsDirective{}))
-		keys["type"] = true
-		return keys, true
-	case capability.DirectiveTypeLabelOutput:
-		keys := jsonFieldKeys(reflect.TypeOf(capability.LabelOutputDirective{}))
-		keys["type"] = true
-		return keys, true
-	case capability.DirectiveTypeDeclassify:
-		keys := jsonFieldKeys(reflect.TypeOf(capability.DeclassifyDirective{}))
-		keys["type"] = true
-		return keys, true
+	proto, known := capability.NewDirectivePrototype(dirType)
+	if !known {
+		return nil, false
 	}
-	return nil, false
+	keys := jsonFieldKeys(reflect.TypeOf(proto))
+	keys["type"] = true
+	return keys, true
 }
 
 // validateDescriptionHashFormat reports an error if s is not a valid

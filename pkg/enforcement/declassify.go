@@ -6,7 +6,6 @@ package enforcement
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/eunolabs/eunox/pkg/capability"
 )
@@ -50,6 +49,14 @@ type declassifyOutcome struct {
 // forward would not merely perform the action, it would perform it while ALSO clearing the
 // taint that would have stopped the next one.
 func (e *Engine) checkDeclassify(req *capability.EnforceRequest, matched *capability.Constraint, carriedLabels []string, requestID, now string) (declassifyOutcome, *capability.EnforceResponse) {
+	if e.skipFlow {
+		// An engine built WithoutFlowLabels holds no flow state, so it can neither read
+		// what a session carries nor clear it. Returning the zero outcome means such a
+		// constraint neither escalates nor pretends to declassify; the config layer keeps
+		// this unreachable in-tree by counting declassify as flow-relevant, and this is
+		// the same defense in depth its two siblings carry.
+		return declassifyOutcome{}, nil
+	}
 	want := capability.DeclassifyLabelsOf(matched)
 	if len(want) == 0 {
 		return declassifyOutcome{}, nil
@@ -137,9 +144,7 @@ func (e *Engine) declassifyRefusal(requestID, now string, carriedLabels, want []
 		// policy verdict being staged, and this is not one.
 		HardDeny: true,
 	})
-	if resp.CarriedLabels == nil {
-		resp.CarriedLabels = carriedLabels
-	}
+	resp.CarriedLabels = carriedLabels
 	return &resp
 }
 
@@ -156,28 +161,24 @@ func approvalCountDetail(req *capability.EnforceRequest) map[string]interface{} 
 }
 
 // canonicalApprovalTarget renders the request's target in the "<type>:<bare>" spelling an
-// approval names. It prefers the split Target the PDP populates and falls back to parsing
-// the caller-supplied TargetName, so a direct engine caller that set only the latter is
-// still scoped rather than silently unscoped. An unparseable target yields "", which
-// checkDeclassify turns into a refusal — never into an approval that matches everything.
+// approval names. It delegates to resolveRequestTarget — the ONE resolver
+// FindMatchingCapability uses to select the constraint in the first place — so the target
+// an approval is scoped against is by construction the target that selected the entry.
+//
+// A second, hand-rolled resolver here diverged from it in three ways that each made a
+// correctly-written approval unsatisfiable: it preferred req.Target wholesale rather than
+// per-field, it did not trim a padded name, and it rejected an unrecognized prefix where
+// splitEnginePrefix defaults one to the tool namespace. Every one of those produced a
+// permanent escalation on a grant the operator had scoped correctly.
+//
+// An empty bare name yields "", which checkDeclassify turns into a refusal — never into an
+// approval that matches everything.
 func canonicalApprovalTarget(req *capability.EnforceRequest) string {
-	if req.Target != nil && req.Target.Type != "" && req.Target.Name != "" {
-		return req.Target.Type + ":" + req.Target.Name
-	}
-	name := strings.TrimSpace(req.TargetName)
-	if name == "" {
+	reqType, bare := resolveRequestTarget(req)
+	if bare == "" || reqType == "" {
 		return ""
 	}
-	tt, bare, err := capability.ParseTarget(name)
-	if err != nil {
-		// A bare name defaults to the tool namespace, matching EnforceRequest.TargetName's
-		// documented spelling rule. Anything else (an unknown prefix) stays unresolvable.
-		if strings.Contains(name, ":") {
-			return ""
-		}
-		return string(capability.TargetTypeTool) + ":" + name
-	}
-	return string(tt) + ":" + bare
+	return reqType + ":" + bare
 }
 
 // clearLabels applies an approved declassification: it removes the granted labels from
@@ -190,8 +191,21 @@ func canonicalApprovalTarget(req *capability.EnforceRequest) string {
 // the policy asked for), but recording labels_cleared: ["pii"] would put a declassification
 // that did not happen on the tape, and the tape is the artifact an auditor reconstructs the
 // flow from. A no-op clear records no labels_cleared and no approver.
-func (e *Engine) clearLabels(ctx context.Context, req *capability.EnforceRequest, out declassifyOutcome, carriedLabels []string) ([]string, error) {
-	if len(out.Labels) == 0 {
+//
+// present is the set as it stands AFTER this call's own labelOutput write, not the pre-call
+// snapshot. The distinction only bites for a constraint carrying both directives — which
+// the loader refuses and the PDP no longer synthesizes, but which an embedder of this
+// package can still build — and getting it wrong there meant the clear could not remove a
+// label the same call had just asserted, i.e. assert silently won over clear. Ordering the
+// commit add-then-clear and reading the post-add state is what makes "clear wins"
+// deterministic rather than a claim the code did not honor.
+func (e *Engine) clearLabels(ctx context.Context, req *capability.EnforceRequest, out declassifyOutcome, present []string) ([]string, error) {
+	if len(out.Labels) == 0 || e.skipFlow {
+		// skipFlow means the engine holds no flow state at all, so there is nothing to
+		// clear. It short-circuits here for the same defense-in-depth reason recordLabels
+		// and peekSessionLabels do: the caller derives flow-relevance separately, and a
+		// clear that silently removed nothing would leave the operator believing a label
+		// was dropped.
 		return nil, nil
 	}
 	if e.flowStore == nil {
@@ -200,13 +214,13 @@ func (e *Engine) clearLabels(ctx context.Context, req *capability.EnforceRequest
 	if req.SessionID == "" {
 		return nil, fmt.Errorf("sessionId is required to clear flow labels")
 	}
-	present := make(map[string]bool, len(carriedLabels))
-	for _, l := range carriedLabels {
-		present[l] = true
+	held := make(map[string]bool, len(present))
+	for _, l := range present {
+		held[l] = true
 	}
 	var removed []string
 	for _, l := range out.Labels {
-		if present[l] {
+		if held[l] {
 			removed = append(removed, l)
 		}
 	}

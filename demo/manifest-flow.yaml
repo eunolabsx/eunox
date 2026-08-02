@@ -1,9 +1,9 @@
 # demo/manifest-flow.yaml — information-flow-control demo policy (Demo (a)).
 #
-# Opts into the experimental flow+effect draft grammar (schemaVersion 0.2), so
+# Opts into the published flow+effect grammar (schemaVersion 0.2), so
 # the flowLabel condition and labelOutput directive are available. The published "0.1"
-# grammar does NOT recognize these tokens — they are staged behind schema-version
-# negotiation until a batched grammar bump.
+# these tokens: they were introduced by "0.2" and a "0.1" manifest using one is
+# refused at load.
 #
 # The scenario: an agent holds granted capabilities for BOTH a sensitive read and an
 # egress write. Reading the sensitive source labels the task; the egress sink permits

@@ -174,3 +174,36 @@ func TestTaskVarNames_MatchTheLoaderVocabulary(t *testing.T) {
 		}
 	}
 }
+
+// TestTaskVar_LiteralBracesStillLoadUnder01 is the compatibility guard for the revision the
+// variable surface does NOT exist in.
+//
+// The reference check first shipped ungated, which turned any pre-existing "0.1" manifest
+// whose allowlist held template-shaped text ("${HOME}/reports", "greeting-${name}") into a
+// hard load failure — and a manifest that fails to load is a proxy that refuses to start.
+// Under "0.1" a "${" is an ordinary character in a literal value (it is not a glob
+// metacharacter), so those documents must keep loading exactly as they did.
+func TestTaskVar_LiteralBracesStillLoadUnder01(t *testing.T) {
+	body := func(value string) string {
+		return "  - target: \"tool:fetch\"\n    actions: [call]\n    conditions:\n      - type: allowedValues\n        argument: a\n        values: [\"" + value + "\"]\n"
+	}
+	for _, value := range []string{"${HOME}/reports", "greeting-${name}", "${BUILD_ID}", "${env.HOME}"} {
+		t.Run(value, func(t *testing.T) {
+			if _, err := LoadManifest(writeManifestFile(t, declassifyManifest("0.1", body(value)))); err != nil {
+				t.Fatalf("a literal %q was valid under 0.1 before the variable surface existed and must stay valid: %v", value, err)
+			}
+		})
+	}
+	// A RECOGNIZED reference is the one shape 0.1 must still refuse — it is a 0.2 token,
+	// and the refusal names the revision that introduced it.
+	_, err := LoadManifest(writeManifestFile(t, declassifyManifest("0.1", body("${task.id}"))))
+	if err == nil || !strings.Contains(err.Error(), "was introduced in schemaVersion \"0.2\"") {
+		t.Fatalf("a recognized task variable must still be refused under 0.1, got %v", err)
+	}
+	// Under 0.2 the closed-grammar rule applies in full: an unrecognized ${...} is a load
+	// error rather than an inert literal.
+	_, err = LoadManifest(writeManifestFile(t, declassifyManifest(ManifestSchemaVersion02, body("${env.HOME}"))))
+	if err == nil || !strings.Contains(err.Error(), "unknown task-context variable") {
+		t.Fatalf("under 0.2 an unrecognized reference must be a load error, got %v", err)
+	}
+}

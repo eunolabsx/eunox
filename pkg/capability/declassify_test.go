@@ -126,11 +126,7 @@ func TestParseDeclassifyApprovals(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			var raw interface{}
-			if err := json.Unmarshal([]byte(tc.raw), &raw); err != nil {
-				t.Fatalf("fixture is not JSON: %v", err)
-			}
-			got, err := capability.ParseDeclassifyApprovals(raw)
+			got, err := capability.ParseDeclassifyApprovals(json.RawMessage(tc.raw))
 			if tc.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 					t.Fatalf("err = %v, want it to contain %q", err, tc.wantErr)
@@ -149,8 +145,13 @@ func TestParseDeclassifyApprovals(t *testing.T) {
 		})
 	}
 
-	if got, err := capability.ParseDeclassifyApprovals(nil); got != nil || err != nil {
-		t.Fatalf("an absent claim is not an error: got %v, %v", got, err)
+	// The absent-claim fast path, in both spellings an IdP produces. A nil json.RawMessage
+	// is what an omitted claim decodes to; an explicit JSON null is what a template that
+	// always emits the key produces. Neither is an error and neither grants anything.
+	for _, absent := range []json.RawMessage{nil, json.RawMessage("null")} {
+		if got, err := capability.ParseDeclassifyApprovals(absent); got != nil || err != nil {
+			t.Fatalf("an absent claim is not an error: got %v, %v", got, err)
+		}
 	}
 }
 

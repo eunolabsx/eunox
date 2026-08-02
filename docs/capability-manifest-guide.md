@@ -532,7 +532,7 @@ capability claim.
 | Verified by | the IdP's JWKS (`--jwks-uri`) |
 | `capabilities` shape | array of **shorthand strings** (`tool:read_file?path=/reports/*`) |
 | How conditions appear | encoded in the `?key=value` suffix grammar (§ 5.2, Pattern D) |
-| Extra machinery | `task_id`, `agent_id` |
+| Extra machinery | `task_id`, `agent_id`, `declassify` ([§ 5b](#declassify--clearing-a-label-under-human-approval); `schemaVersion 0.2`) |
 | Role | per-invocation narrowing in intersection mode |
 
 **Why conditions aren't enumerated in the published JWT schema.** In the IdP
@@ -2294,6 +2294,13 @@ The rules the proxy enforces, each fail-closed:
 The approval's lifetime is the **token's** lifetime — there is no separate expiry
 field, because a verified token already has one.
 
+> **`declassify` requires an HTTP host.** Approvals ride a validated JWT, and JWT
+> validation needs an HTTP listener (`--jwks-uri` requires `transport: http`), so a
+> **stdio host** can never present one. A `declassify` directive there could only
+> ever escalate, so it is **refused at startup** rather than left to fail on every
+> call. A stdio *upstream* behind an HTTP gateway is fine — the token arrives on the
+> host leg.
+
 > **The honest limit.** The token is held by the agent, so an approval minted into
 > it can be replayed for as long as that token lives, at any action the grant's
 > `target` names. Scope and expiry bound the damage; they do not eliminate it.
@@ -2313,9 +2320,12 @@ no other record shape has:
   "carried_labels": ["internal", "pii"],   // what the session held going in
   "labels_cleared": ["pii"],               // what this call actually removed
   "approver": "alice@example.com",         // who authorized it
-  "details": { "_eunox_declassify_approval_id": "apr-2026-08-01-014" }
+  "approval_id": "apr-2026-08-01-014"      // the control plane's own record id
 }
 ```
+
+All three are **signed fields**, covered by the record HMAC — so neither the cleared
+set nor the approving human can be rewritten after the fact.
 
 `labels_cleared` reports what **changed**, not what was authorized: an approval to
 clear `pii` on a session that never carried it is a permitted no-op that records
@@ -2372,6 +2382,13 @@ Three rules, each enforced rather than left to convention:
 
 A misspelled variable (`${task.identifier}`) is a **load error**, like every other
 token in this grammar — not an inert literal that silently denies every call.
+
+That rule applies **under `"0.2"` only**, because that is the revision the variable
+surface belongs to. Under `"0.1"` a `${` is an ordinary character in a literal value
+(it is not a glob metacharacter), so a `0.1` manifest whose allowlist holds
+template-shaped text — `"${HOME}/reports"`, `"${BUILD_ID}"` — keeps loading exactly
+as it always did. A *recognized* reference is still refused under `0.1`, naming the
+revision that introduced it, like every other `0.2` token.
 
 References are resolved in `allowedValues` **only**. A `${...}` elsewhere in the
 manifest is an ordinary literal string, which for a security rule means it matches

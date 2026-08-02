@@ -71,8 +71,33 @@ func TaskVarNames() []string {
 // wants to be a variable, so a misspelled or embedded one is a load error instead of a
 // literal string that silently never matches. A value with no "${" at all is an ordinary
 // literal and never reaches the variable machinery.
+//
+// It is applied ONLY under the grammar revision that defines the variable surface. Under
+// "0.1" a "${" is what it has always been — an ordinary character in a literal value, with
+// no glob meaning — so a manifest whose allowlist carries template-shaped text keeps
+// loading. Applying this check to "0.1" turned an existing, valid document into a startup
+// failure over a surface that revision does not have.
 func ContainsVariableRef(s string) bool {
 	return strings.Contains(s, "${")
+}
+
+// IsTaskVarRef reports whether s is EXACTLY one recognized task-context variable. It is
+// the narrow test the RUNTIME matchers use, where ContainsVariableRef is the wide test the
+// loader uses.
+//
+// The distinction is load-bearing in two directions. A manifest value must not be a
+// half-formed reference (the loader's job, and a load error). But a value that merely looks
+// reference-ish and names nothing in the closed set — "${STAGE}" in a caller's JWT
+// capability claim, say — is a LITERAL that must keep matching itself: those values never
+// pass through the manifest loader, so treating them as references would void a grant with
+// no error anywhere to grep for.
+func IsTaskVarRef(s string) bool {
+	name, ok := ParseVariableRef(s)
+	if !ok {
+		return false
+	}
+	_, known := taskVarClaims[name]
+	return known
 }
 
 // ParseVariableRef returns the variable name when s is EXACTLY one reference

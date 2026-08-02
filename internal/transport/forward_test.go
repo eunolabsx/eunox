@@ -42,6 +42,7 @@ type fwdCapturedRecord struct {
 	carriedLabels []string
 	labelsCleared []string
 	approver      string
+	approvalID    string
 	identifier    string
 	sessionID     string
 }
@@ -72,9 +73,9 @@ func (f *fwdRecorder) RecordAllow(_ context.Context, sessionID, identifier, _ st
 	}
 }
 
-func (f *fwdRecorder) RecordDeclassifiedAllow(_ context.Context, sessionID, identifier, _ string, details map[string]interface{}, obligs []string, auditOnly bool, labelsOut, carriedLabels, labelsCleared []string, approver string) {
+func (f *fwdRecorder) RecordDeclassifiedAllow(_ context.Context, sessionID, identifier, _ string, details map[string]interface{}, obligs []string, auditOnly bool, labelsOut, carriedLabels, labelsCleared []string, approver, approvalID string) {
 	f.records = append(f.records, fwdCapturedRecord{
-		decision: "allow", details: details, obligs: obligs, auditOnly: auditOnly, identifier: identifier, labelsOut: labelsOut, carriedLabels: carriedLabels, labelsCleared: labelsCleared, approver: approver, sessionID: sessionID,
+		decision: "allow", details: details, obligs: obligs, auditOnly: auditOnly, identifier: identifier, labelsOut: labelsOut, carriedLabels: carriedLabels, labelsCleared: labelsCleared, approver: approver, approvalID: approvalID, sessionID: sessionID,
 	})
 	if f.degradeOnRecord {
 		f.degraded = true
@@ -770,7 +771,7 @@ type forwardOrderRecorder struct{}
 func (forwardOrderRecorder) RecordAllow(context.Context, string, string, string, map[string]interface{}, []string, bool, []string, []string) {
 }
 
-func (forwardOrderRecorder) RecordDeclassifiedAllow(context.Context, string, string, string, map[string]interface{}, []string, bool, []string, []string, []string, string) {
+func (forwardOrderRecorder) RecordDeclassifiedAllow(context.Context, string, string, string, map[string]interface{}, []string, bool, []string, []string, []string, string, string) {
 }
 
 func (forwardOrderRecorder) RecordDeny(context.Context, string, string, string, string, string, map[string]interface{}, bool) {

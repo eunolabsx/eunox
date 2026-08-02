@@ -165,7 +165,11 @@ type DeclassifyApproval struct {
 // approval never covers anything — Validate rejects those at the token boundary, and this
 // stays independently fail-closed for a programmatically built approval.
 func (a *DeclassifyApproval) Covers(target string, want []string) bool {
-	if a == nil || a.Approver == "" || a.Target == "" || len(a.Labels) == 0 || len(want) == 0 {
+	// Approver is checked TRIMMED, matching Validate: a whitespace-only approver is not a
+	// named human, and Covers is the check that actually decides whether a label is
+	// cleared. A programmatically built approval never passes through Validate, so the two
+	// must agree on what "named" means or the authorization test is the looser of the pair.
+	if a == nil || strings.TrimSpace(a.Approver) == "" || a.Target == "" || len(a.Labels) == 0 || len(want) == 0 {
 		return false
 	}
 	if a.Target != target {
@@ -216,10 +220,9 @@ func (a *DeclassifyApproval) Validate() error {
 	return nil
 }
 
-// ParseDeclassifyApprovals decodes the `mcp.declassify` claim value into validated
-// approvals. raw is the value as it came off a verified token (a []interface{} of
-// objects); nil or absent yields (nil, nil), which is the overwhelmingly common case and
-// costs nothing.
+// ParseDeclassifyApprovals decodes the `mcp.declassify` claim into validated approvals.
+// raw is the claim's bytes as they came off a verified token; absent or JSON null yields
+// (nil, nil), which is the overwhelmingly common case and costs nothing.
 //
 // Every failure is an ERROR, never a silently-dropped grant: an unparseable or invalid
 // approval means the token says something about declassification this build cannot
@@ -227,20 +230,16 @@ func (a *DeclassifyApproval) Validate() error {
 // the same reason the manifest decoders are — a misspelled "lables" would decode to an
 // EMPTY label set, i.e. a grant that covers nothing while looking like it covers
 // something.
-func ParseDeclassifyApprovals(raw interface{}) ([]DeclassifyApproval, error) {
-	if raw == nil {
+func ParseDeclassifyApprovals(raw json.RawMessage) ([]DeclassifyApproval, error) {
+	// The parameter is json.RawMessage, not interface{}, so this guard actually fires. A
+	// nil slice boxed in an interface{} is a NON-nil interface, so the earlier `raw == nil`
+	// spelling was dead for the overwhelmingly common absent-claim case and every token
+	// validation paid a marshal + unmarshal to discover it had nothing to do.
+	if len(raw) == 0 || string(raw) == "null" {
 		return nil, nil
 	}
-	// Round-trip through JSON rather than type-asserting the generic map: the claim
-	// arrives as whatever encoding/json produced for an `any`, and re-marshaling is the
-	// one decode path that gets field binding, type checking, and unknown-field rejection
-	// from the same rules every other wire type in this package uses.
-	b, err := json.Marshal(raw)
-	if err != nil {
-		return nil, fmt.Errorf("mcp.%s claim cannot be re-encoded: %w", ClaimDeclassify, err)
-	}
 	var msgs []json.RawMessage
-	if err := json.Unmarshal(b, &msgs); err != nil {
+	if err := json.Unmarshal(raw, &msgs); err != nil {
 		return nil, fmt.Errorf("mcp.%s claim must be an array of approval objects: %w", ClaimDeclassify, err)
 	}
 	if len(msgs) == 0 {

@@ -79,8 +79,14 @@ type auditRecord struct {
 	// shape carries labels_cleared. LabelsCleared is drawn from the closed native
 	// vocabulary and needs no length bound; Approver is IdP-supplied free text and is
 	// bounded like the other envelope strings.
+	// ApprovalID is the control plane's own identifier for the approval, echoed so a
+	// tape entry joins back to the workflow that produced it. It travels with the other
+	// two rather than in Details because a declassification's evidence must be one
+	// record shape, not a top-level pair plus a magic details key the transport
+	// hand-merges into a map it does not own.
 	LabelsCleared []string `json:"labels_cleared,omitempty"`
 	Approver      string   `json:"approver,omitempty"`
+	ApprovalID    string   `json:"approval_id,omitempty"`
 	KeyID         string   `json:"key_id,omitempty"` // id of the HMAC key that signed this record; lets audit-verify select the right key after rotation (§ 3.4)
 	PrevHMAC      string   `json:"prev_hmac"`        // _hmac of the preceding record (genesis sentinel for the first); chains records together
 	HMAC          string   `json:"_hmac,omitempty"`
@@ -1292,7 +1298,7 @@ func (s *Sink) RecordAllow(ctx context.Context, sessionID, identifier, method st
 // proxy performs — and a widened RecordAllow would let a call site pass one without the
 // other at every one of its call sites. Here the pairing is structural: the only way to
 // stamp labels_cleared is to name an approver in the same call.
-func (s *Sink) RecordDeclassifiedAllow(ctx context.Context, sessionID, identifier, method string, details map[string]interface{}, obligs []string, auditOnly bool, labelsOut, carriedLabels, labelsCleared []string, approver string) {
+func (s *Sink) RecordDeclassifiedAllow(ctx context.Context, sessionID, identifier, method string, details map[string]interface{}, obligs []string, auditOnly bool, labelsOut, carriedLabels, labelsCleared []string, approver, approvalID string) {
 	s.Record(ctx, RecordParams{
 		SessionID:     sessionID,
 		Identifier:    identifier,
@@ -1305,6 +1311,7 @@ func (s *Sink) RecordDeclassifiedAllow(ctx context.Context, sessionID, identifie
 		CarriedLabels: carriedLabels,
 		LabelsCleared: labelsCleared,
 		Approver:      approver,
+		ApprovalID:    approvalID,
 	})
 }
 
@@ -1375,6 +1382,7 @@ type RecordParams struct {
 	CarriedLabels []string
 	LabelsCleared []string
 	Approver      string
+	ApprovalID    string
 }
 
 // Record is the gateway-aware variant: p.Upstream, p.PolicyVersion, and
@@ -1481,7 +1489,10 @@ func (s *Sink) Record(ctx context.Context, p RecordParams) {
 		// length-bounded, so an unbounded one could push a record past the 4 MiB scanner
 		// buffer.
 		Approver: boundFieldTo(p.Approver, auditEnvelopeFieldCap),
-		KeyID:    s.keyID,
+		// Bounded for the same reason as Approver: it is an opaque identifier minted by
+		// the operator's control plane and echoed verbatim.
+		ApprovalID: boundFieldTo(p.ApprovalID, auditEnvelopeFieldCap),
+		KeyID:      s.keyID,
 	}
 
 	// The drop warnings are emitted OUTSIDE the lock. stderr can block indefinitely — a
@@ -1723,7 +1734,7 @@ func (rec *auditRecord) queueSize() int64 {
 	for _, l := range rec.LabelsCleared {
 		n += int64(len(l))
 	}
-	n += int64(len(rec.Approver))
+	n += int64(len(rec.Approver) + len(rec.ApprovalID))
 	return n
 }
 
@@ -1748,14 +1759,6 @@ const TruncatedKey = "_eunox_truncated"
 // producer (internal/transport) and the miner (cmd/eunox/suggest) share one spelling
 // and cannot drift.
 const UpstreamErrorCodeKey = "_eunox_upstream_error_code"
-
-// DeclassifyApprovalIDKey is the reserved detail key carrying the control plane's own
-// identifier for the approval that authorized a declassification (the `id` of the
-// `mcp.declassify` grant). It sits in Details rather than in a top-level field because it
-// is an opaque external reference nothing in the proxy interprets, where labels_cleared
-// and approver are facts the record itself asserts. The underscore prefix keeps it in the
-// same reserved namespace as UpstreamErrorCodeKey, clear of real tool-argument names.
-const DeclassifyApprovalIDKey = "_eunox_declassify_approval_id"
 
 // EffectReceiptKey is the reserved detail key the transport merges into an ALLOW record's
 // Details carrying the verdict for a signed effect receipt the upstream published in the

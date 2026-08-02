@@ -2166,7 +2166,7 @@ type killCheckRecorder struct {
 	allows int
 }
 
-func (r *killCheckRecorder) RecordDeclassifiedAllow(context.Context, string, string, string, map[string]interface{}, []string, bool, []string, []string, []string, string) {
+func (r *killCheckRecorder) RecordDeclassifiedAllow(context.Context, string, string, string, map[string]interface{}, []string, bool, []string, []string, []string, string, string) {
 }
 
 func (r *killCheckRecorder) RecordAllow(_ context.Context, _, _, _ string, _ map[string]interface{}, _ []string, _ bool, _, _ []string) {
@@ -2265,7 +2265,7 @@ type degradedDeny struct {
 	details map[string]interface{}
 }
 
-func (r *degradedRecorder) RecordDeclassifiedAllow(context.Context, string, string, string, map[string]interface{}, []string, bool, []string, []string, []string, string) {
+func (r *degradedRecorder) RecordDeclassifiedAllow(context.Context, string, string, string, map[string]interface{}, []string, bool, []string, []string, []string, string, string) {
 }
 
 func (r *degradedRecorder) RecordAllow(_ context.Context, _, _, _ string, _ map[string]interface{}, _ []string, _ bool, _, _ []string) {

@@ -974,6 +974,12 @@ func (e *Engine) handleAllowedValues(_ context.Context, cond capability.Conditio
 //
 // A non-string argument never matches: every variable resolves to a claim string.
 func matchTaskVars(argValue interface{}, allowed []interface{}, claims map[string]interface{}) bool {
+	// No claims means no token, so nothing can resolve and the whole scan is dead. This is
+	// the default for every deployment without JWT wiring, and this function runs on every
+	// allowedValues deny — the path already doing the most work.
+	if len(claims) == 0 {
+		return false
+	}
 	s, isString := argValue.(string)
 	if !isString {
 		return false
@@ -987,6 +993,9 @@ func matchTaskVars(argValue interface{}, allowed []interface{}, claims map[strin
 		if !isRef {
 			continue
 		}
+		// Skipped by MatchAllowedValue only when recognized, so an unrecognized reference
+		// reaches neither matcher as a variable — it stays a literal there and resolves to
+		// nothing here.
 		resolved, ok := capability.ResolveTaskVar(name, claims)
 		if !ok {
 			// Unresolvable: no token, or the claim is absent/empty. Skip rather than
@@ -1023,13 +1032,19 @@ func matchTaskVars(argValue interface{}, allowed []interface{}, claims map[strin
 func MatchAllowedValue(argValue interface{}, allowed []interface{}) bool {
 	for _, a := range allowed {
 		if pattern, ok := a.(string); ok {
-			// A "${task.*}" entry is a REFERENCE, never a pattern, and is skipped here
-			// entirely. It carries no glob metacharacter, so MatchValueGlob would treat it
-			// as a literal — and an argument whose value happened to be the placeholder
-			// TEXT ("${task.id}") would satisfy an identity binding by spelling it out.
-			// Skipping makes the reference matchable only by matchTaskVars, i.e. only
-			// against the claim it resolves to.
-			if _, isRef := capability.ParseVariableRef(pattern); isRef {
+			// A RECOGNIZED "${task.*}" entry is a reference, never a pattern, and is
+			// skipped here entirely. It carries no glob metacharacter, so MatchValueGlob
+			// would treat it as a literal — and an argument whose value happened to be the
+			// placeholder TEXT ("${task.id}") would satisfy an identity binding by spelling
+			// it out. Skipping makes the reference matchable only by matchTaskVars, i.e.
+			// only against the claim it resolves to.
+			//
+			// The test is IsTaskVarRef, not "looks like ${...}". This matcher is shared
+			// with the JWT shorthand path, whose values come from a TOKEN's capability
+			// claim rather than a manifest — so an unrecognized "${STAGE}" there has never
+			// passed through the loader, and skipping it would silently void the grant with
+			// no diagnostic. It stays a literal and keeps matching itself.
+			if capability.IsTaskVarRef(pattern) {
 				continue
 			}
 			if s, ok := argValue.(string); ok && MatchValueGlob(pattern, s) {

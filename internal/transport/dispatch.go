@@ -65,9 +65,9 @@ type dispatchParams struct {
 
 	// honorAttribution admits the client-supplied attribution interface (the
 	// io.eunolabs.context-manifest block in a request's _meta). It is the runtime staging
-	// gate for a DRAFT wire token — set only when the route's policy declares the
+	// gate for a wire token a later grammar revision introduced — set only when the route's policy declares the
 	// flow+effect draft schemaVersion — because the manifest-side gate
-	// (checkExperimentalTokenStaging) structurally cannot cover a token that arrives on a
+	// (checkTokenGrammarVersion) structurally cannot cover a token that arrives on a
 	// REQUEST rather than in the policy. False means the block is IGNORED, not rejected:
 	// the interface is union-only, so ignoring it falls back to the conservative session
 	// join, which is the stricter reading.

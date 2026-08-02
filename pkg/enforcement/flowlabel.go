@@ -411,7 +411,11 @@ func (e *Engine) recordSourceCall(ctx context.Context, req *capability.EnforceRe
 	}
 	if len(decl.Labels) > 0 {
 		var err error
-		labelsCleared, err = e.clearLabels(ctx, req, decl, carriedLabels)
+		// The post-add set: what the session holds now that this call's own labelOutput
+		// (if any) has committed. Handing the PRE-call snapshot instead meant a clear could
+		// not remove a label the same call had just asserted, so "assert-then-clear leaves
+		// nothing" was documented and not delivered.
+		labelsCleared, err = e.clearLabels(ctx, req, decl, unionLabels(carriedLabels, labelsOut))
 		if err != nil {
 			// The clear faulted after the add committed: undo the add so the refused call
 			// leaves nothing behind, exactly as the seq-fault arm below does.
@@ -420,6 +424,17 @@ func (e *Engine) recordSourceCall(ctx context.Context, req *capability.EnforceRe
 		}
 	}
 	if err := e.RecordSessionCall(ctx, req); err != nil {
+		// A call whose approved clear was just undone must not be forwarded. The plain
+		// antecedent-fault deny is SOFT (an audit route downgrades it), which before the
+		// declassify leg existed meant only "the sequence history is unreliable" — now it
+		// would mean "the action ran and the taint the policy declared cleared is back",
+		// the outcome declassifyRecordFailureDenial exists to prevent. Reported as the
+		// declassify leg so the deny it maps to is the hard one.
+		if len(labelsCleared) > 0 {
+			e.restoreLabels(ctx, req, labelsCleared)
+			e.rollbackLabels(ctx, req, added)
+			return nil, nil, &SourceCommitError{Err: err, Flow: true, Declassify: true}
+		}
 		// The seq write faulted after the label writes committed: put the label set back as
 		// it was so the hard-denied call neither taints nor untaints. Best-effort — a
 		// rollback fault leaves a stranded label (fail-closed: over-blocks a later sink,
@@ -533,6 +548,11 @@ func labelRecordFailureDenial(requestID, now string, auditOnly bool, obligations
 		ConditionType: capability.ConditionTypeFlowLabel,
 		Message:       "flow-label recording failed; source->sink flow state is unreliable",
 		HardDeny:      true,
-		Details:       map[string]interface{}{"phase": "record"},
+		// "flow": true is the discriminator every information-flow event on the tape
+		// carries (the flowLabel sink denial, the declassify refusal and its record
+		// fault). Without it here, a filter keyed on that field missed the one flow event
+		// an operator most needs to see: the hard deny raised when a source's label write
+		// faulted.
+		Details: map[string]interface{}{"flow": true, "phase": "record"},
 	})
 }

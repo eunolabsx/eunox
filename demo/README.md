@@ -9,7 +9,7 @@ Two Docker services. One manifest file. First enforced tool call in under 10 min
 > `make -C demo trifecta-audit`, keeps the signed tape across runs and shows
 > tampering with it — a rewritten verdict, a forged record — being caught live.
 
-> **Information-flow control (experimental).** `make -C demo flow-exfil` shows
+> **Information-flow control.** `make -C demo flow-exfil` shows
 > within-scope exfil blocked by *source→sink flow policy*: reading a sensitive
 > source labels the task `confidential`, so the identical egress write that a
 > clean session is allowed to make is **denied** once that label is present —
@@ -29,7 +29,7 @@ Two Docker services. One manifest file. First enforced tool call in under 10 min
 > requires a shared Redis flow-label store (a startup NOTICE warns when one is
 > missing).
 
-> **Effect contracts (experimental).** `make -C demo effect-escalate` shows the other
+> **Effect contracts.** `make -C demo effect-escalate` shows the other
 > axis: an agent reads an untrusted, customer-submitted ticket carrying a prompt
 > injection and then attempts `DROP TABLE customers`. The capability is **granted** —
 > `query_db` is in the allowlist and `DROP` is explicitly in its `allowedOperations` —
