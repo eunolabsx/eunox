@@ -437,97 +437,64 @@ func (e *SourceCommitError) Error() string { return e.Err.Error() }
 // rollback removes exactly this call's additions with no concurrent writer to race.
 //
 // An APPROVED declassification (decl, resolved by checkDeclassify before anything was
-// committed) is the third leg and runs between the two: labels are added, then cleared,
-// then the antecedent is written. A seq fault rolls BOTH label writes back — re-adding
-// what was cleared and removing what was added — so the never-forwarded call leaves the
-// session's label set exactly as it found it. The two label legs are mutually exclusive on
-// a loaded manifest (validateDeclassifyCoherence rejects a constraint carrying both
-// labelOutput and declassify), so the add-then-clear order only ever matters for a
-// programmatically built constraint; it is fixed here rather than left to directive order
-// so that case is deterministic too.
+// committed) contributes exactly ONE thing here: the BURN of a single-use grant. Its label
+// clear does NOT happen here — it is deferred to CommitDeclassification, which the caller
+// runs after the call has actually completed. See LabelsPendingClear for why: a clear
+// applied at this point is invisible to every concurrent decision for the whole upstream
+// round trip, and a sink that the taint existed to stop can be allowed and forwarded while
+// the sanitizing call is still in flight. labelOutput's add stays here and is safe there
+// for the mirror reason — a call that taints and then fails leaves EXTRA taint, which
+// over-blocks.
+//
+// The burn stays for the reason it exists: it is the atomic test that makes "once" mean
+// once under concurrency, so it belongs with the decision that accepted the grant, not with
+// a later commit two callers could both reach. A burn that is never followed by a clear
+// over-refuses (the operator mints another approval), which is the safe direction —
+// burnApproval documents the same trade for the un-burn it deliberately does not offer.
 //
 // Every write still fails closed on its own fault (returned as a SourceCommitError the
 // caller maps to the right deny). recordLabels is skipped when the constraint is not
 // flow-relevant; RecordSessionCall self-guards when the policy has no sequenceBlock
 // (skipAntecedentRecording) — so a flow-only or seq-only policy does exactly one write
 // and needs no rollback. carriedLabels is the pre-call accumulated set (peeked by the
-// caller before this commit), used to compute the rollback delta and, for the clear, to
-// report which labels actually changed.
-func (e *Engine) recordSourceCall(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, flowRelevant bool, carriedLabels []string, decl declassifyOutcome) (labelsOut, labelsCleared []string, cerr *SourceCommitError) {
+// caller before this commit), used to compute the rollback delta.
+func (e *Engine) recordSourceCall(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, flowRelevant bool, carriedLabels []string, decl declassifyOutcome) (labelsOut []string, cerr *SourceCommitError) {
 	var added []string
 	if flowRelevant {
 		var err error
 		labelsOut, err = e.recordLabels(ctx, req, matched)
 		if err != nil {
-			return nil, nil, &SourceCommitError{Err: err, Flow: true}
+			return nil, &SourceCommitError{Err: err, Flow: true}
 		}
 		added = labelsAdded(labelsOut, carriedLabels)
 	}
 	if len(decl.Labels) > 0 {
-		// Burn a single-use grant BEFORE clearing with it, so the two possible faults land on
-		// the safe side of the one that matters. Burn-then-clear can leave a grant spent for
-		// a clear that did not happen (over-refusal: the operator mints another approval).
-		// Clear-then-burn would leave a label dropped by a grant still marked live — the
-		// replay this ledger exists to close, reachable by faulting the store at the right
-		// moment. A standing grant burns nothing and this costs it no round-trip.
+		// A standing grant burns nothing and costs no round-trip; a single-use one is spent
+		// here, atomically, and the loser of a concurrent race hard-denies.
 		if err := e.burnApproval(ctx, decl.LedgerID); err != nil {
 			e.rollbackLabels(ctx, req, added)
-			return nil, nil, &SourceCommitError{Err: err, Flow: true, Declassify: true}
-		}
-		var err error
-		// The post-add set: what the session holds now that this call's own labelOutput
-		// (if any) has committed. Handing the PRE-call snapshot instead meant a clear could
-		// not remove a label the same call had just asserted, so "assert-then-clear leaves
-		// nothing" was documented and not delivered.
-		labelsCleared, err = e.clearLabels(ctx, req, decl, unionLabels(carriedLabels, labelsOut))
-		if err != nil {
-			// The clear faulted: put back whatever it may have removed BEFORE undoing the
-			// add, the same order the seq-fault arm below uses and for the same reason —
-			// this direction is the fail-OPEN one, so a partial rollback must err toward
-			// more taint. A faulted Remove is not a Remove that changed nothing (it can
-			// delete and then lose its reply, or remove part of a set and error), and the
-			// call is hard-denied and never forwarded, so a label left cleared here would
-			// untaint the session for an action that did not happen. clearLabels returns
-			// what it may have removed alongside the error precisely so this can run.
-			e.restoreLabels(ctx, req, labelsCleared)
-			// Undo the add so the refused call leaves nothing behind, exactly as the
-			// seq-fault arm below does. The burn is NOT undone — the counter has no delete,
-			// and leaving the grant spent for a call that did not run over-refuses, which is
-			// the safe direction (see burnApproval).
-			e.rollbackLabels(ctx, req, added)
-			return nil, nil, &SourceCommitError{Err: err, Flow: true, Declassify: true}
+			return nil, &SourceCommitError{Err: err, Flow: true, Declassify: true}
 		}
 	}
 	if err := e.RecordSessionCall(ctx, req); err != nil {
-		// A call whose approved clear was just undone must not be forwarded. The plain
-		// antecedent-fault deny is SOFT (an audit route downgrades it), which before the
-		// declassify leg existed meant only "the sequence history is unreliable" — now it
-		// would mean "the action ran and the taint the policy declared cleared is back",
-		// the outcome declassifyRecordFailureDenial exists to prevent. Reported as the
-		// declassify leg so the deny it maps to is the hard one.
-		//
-		// A call that BURNED a single-use grant takes the declassify arm whether or not the
-		// clear moved a label, so the deny it maps to is the HARD one. The soft
-		// antecedent-fault deny is downgraded and FORWARDED by an --audit route, and
-		// forwarding a call whose one-shot approval was just spent is the worst of both: the
-		// action runs, and the operator's single approval is gone with no clear to show for
-		// it. Keyed on LedgerID rather than on labelsCleared because the burn happens on a
-		// no-op clear too.
-		if len(labelsCleared) > 0 || decl.LedgerID != "" {
-			e.restoreLabels(ctx, req, labelsCleared)
+		// A call that BURNED a single-use grant takes the declassify arm, so the deny it maps
+		// to is the HARD one. The plain antecedent-fault deny is SOFT — downgraded and
+		// FORWARDED by an --audit route — and forwarding a call whose one-shot approval was
+		// just spent is the worst of both: the action runs, and the operator's single approval
+		// is gone with nothing to show for it. Keyed on LedgerID because the burn is the only
+		// declassify state this commit writes; the clear has not run and needs no undo.
+		if decl.LedgerID != "" {
 			e.rollbackLabels(ctx, req, added)
-			return nil, nil, &SourceCommitError{Err: err, Flow: true, Declassify: true}
+			return nil, &SourceCommitError{Err: err, Flow: true, Declassify: true}
 		}
-		// The seq write faulted after the label writes committed: put the label set back as
-		// it was so the hard-denied call neither taints nor untaints. Best-effort — a
-		// rollback fault leaves a stranded label (fail-closed: over-blocks a later sink,
-		// never a leak), the narrow accepted residual. The re-add runs FIRST so a partial
-		// rollback errs toward more taint, not less.
-		e.restoreLabels(ctx, req, labelsCleared)
+		// The seq write faulted after the label add committed: take it back out so the
+		// hard-denied call leaves no taint. Best-effort — a rollback fault leaves a stranded
+		// label (fail-closed: over-blocks a later sink, never a leak), the narrow accepted
+		// residual.
 		e.rollbackLabels(ctx, req, added)
-		return nil, nil, &SourceCommitError{Err: err, Flow: false}
+		return nil, &SourceCommitError{Err: err, Flow: false}
 	}
-	return labelsOut, labelsCleared, nil
+	return labelsOut, nil
 }
 
 // RecordSourceCall is the exported form of recordSourceCall for the audit-mode
@@ -542,8 +509,7 @@ func (e *Engine) recordSourceCall(ctx context.Context, req *capability.EnforceRe
 // clearing here would drop a label for a call policy refused, on the strength of an
 // approval nothing verified. A downgraded observe deny never untaints a session.
 func (e *Engine) RecordSourceCall(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, flowRelevant bool, carriedLabels []string) ([]string, *SourceCommitError) {
-	labelsOut, _, cerr := e.recordSourceCall(ctx, req, matched, flowRelevant, carriedLabels, declassifyOutcome{})
-	return labelsOut, cerr
+	return e.recordSourceCall(ctx, req, matched, flowRelevant, carriedLabels, declassifyOutcome{})
 }
 
 // labelsAdded returns the labels in out that were NOT already in the pre-call carried
@@ -597,80 +563,67 @@ func (e *Engine) rollbackLabels(ctx context.Context, req *capability.EnforceRequ
 	_ = e.flowStore.Remove(ctx, e.flowKey(req), added...)
 }
 
-// restoreLabels is rollbackLabels' mirror for the declassify leg: it best-effort re-adds
-// the labels an approved clear removed, so a call that faulted afterwards and is never
-// forwarded leaves the session as tainted as it found it. A nil store, empty session, or
-// empty set is a no-op; an Add fault is swallowed, and unlike the rollback's residual this
-// one is the fail-OPEN direction (a label stays cleared for a call that did not run), which
-// is why it runs before rollbackLabels rather than after — a partial rollback then leaves
-// more taint, not less.
-func (e *Engine) restoreLabels(ctx context.Context, req *capability.EnforceRequest, cleared []string) {
-	// One implementation, not two: these are the two arms of the SAME fail-open (a cleared
-	// label surviving a call that never ran), one inside the decision and one above it, and
-	// they had already drifted on which guards they applied. A divergence there leaves one
-	// arm restoring and the other not, and both call sites look identical from the outside.
-	// The in-decision arm swallows the fault — it is best-effort by contract, with a
-	// stranded label as its accepted residual — while the exported arm reports it, because
-	// its caller writes that outcome onto the tape.
-	_, _ = e.RestoreDeclassifiedLabels(ctx, req, cleared)
-}
-
-// RestoreDeclassifiedLabels re-adds the labels an approved declassification cleared, for a
-// call the decision COMMITTED and a layer ABOVE the engine then refused. It is
-// restoreLabels' exported form, and it exists because the clear and the refusal can sit on
-// opposite sides of the engine boundary.
+// CommitDeclassification applies an approved declassification's label clear, for a call
+// the decision AUTHORIZED and the caller has now actually performed. It is the second half
+// of the two-phase clear: the decision resolves and authorizes (LabelsPendingClear, plus
+// the burn of a single-use grant), and this removes the labels once the action it sanitizes
+// has run.
 //
-// A declassification commits inside Decide, before the transport has run its own gates.
-// Three of those gates then refuse the call without ever contacting the upstream — the
-// --require-audit=strict gate, an upstream transport failure, and a redaction failure — so
-// the sanitizing action did not happen while the taint it was authorized to clear is gone.
-// The next egress that flowLabel would have blocked now passes: a call that never ran has
-// untainted the session.
+// The split is what makes the clear safe under concurrency. Applied inside the decision, the
+// removal outlived the per-session decision lock the transport releases before the upstream
+// forward — so for the whole round trip (bounded only by --upstream-timeout, and by nothing
+// at all when it is 0) every concurrent decision on the anchor read an already-clean label
+// set, and a sink the taint existed to stop could be allowed and forwarded before the
+// sanitizing call had even returned. Under task-anchored state it was wider still: the lock
+// is per-session and does not span a task key two sessions share, so the concurrent reader
+// need not have been on the same session at all. Deferring the removal to here removes the
+// window rather than narrowing it, and does so without depending on any lock: the labels are
+// never absent until the call that clears them has completed.
 //
-// labelOutput's identical ordering is safe and this one is not, which is why only this
-// direction needs an exported undo: a call that TAINTS and then fails leaves extra taint,
-// which over-blocks. A clear that survives its own refusal fails open.
+// It is also why nothing above the engine needs an UNDO any more. Every refusal below the
+// decision — the --require-audit=strict gate, an upstream transport failure, a redaction
+// failure — now simply never calls this, so the labels were never gone and there is nothing
+// to put back. The compensating restore that used to run there could only narrow the window,
+// never close it, and its own failure arm was the residual fail-open an operator was told to
+// alert on.
 //
-// Unlike restoreLabels this RETURNS the fault instead of swallowing it, and it reports
-// whether it actually wrote. The caller is building the refusal's audit record at that
-// moment, and it stamps a SIGNED assertion about the session's state — so "the labels are
-// back" and "I did nothing" must not look alike. Returning only an error made every
-// declined arm below indistinguishable from a completed restore, which would have put
-// `declassify_reverted` on the tape for a session whose taint was in fact still gone: a
-// false negative on the one residual an operator is told to alert on.
+// A caller that never commits (a crash, a store fault here, an embedder that forgets)
+// leaves the session as tainted as it found it. That over-blocks a later sink, which the
+// operator resolves with another approval — the fail-closed direction, and the mirror of
+// the burn's own accepted over-refusal.
 //
-// restored is therefore true only when the store accepted the write. Every arm that
-// declines returns (false, nil) — no fault to report, but no restore either — EXCEPT the
-// empty label set, which is the one case where "nothing to restore" and "restored" are
-// genuinely the same state; the caller never reaches here with one.
+// It returns what actually CHANGED — the intersection of the authorized labels with what the
+// anchor is carrying — because that is what the tape must report: an approval to clear a
+// label the session never held is a permitted no-op, and recording labels_cleared for it
+// would put a declassification that did not happen on the signed record. The set is read
+// HERE rather than at decision time so the report describes the anchor as it stands when the
+// clear lands, not as it stood a round trip earlier.
 //
-// Anchoring follows the request, exactly as the clear did (flowKey), so a task-anchored
-// call restores under the same key it cleared. The caller MUST therefore hand a context
-// that still carries the request's validated claims: the anchor resolves from
-// Claims["task_id"], so a context detached with context.Background() would restore under
-// the SESSION key a task-anchored clear never touched — leaving the task untainted, a
-// duplicate stranded on the session key, and this function reporting success. Detach
-// cancellation only (context.WithoutCancel), never the values.
-//
-// It does NOT stand down for a task-anchored request the way rollbackLabels does: that
-// stand-down avoids deleting a concurrent session's legitimate label, and this only ADDS —
-// the fail-closed direction, where the worst case is a stranded label that over-blocks.
-func (e *Engine) RestoreDeclassifiedLabels(ctx context.Context, req *capability.EnforceRequest, cleared []string) (restored bool, err error) {
-	if len(cleared) == 0 {
-		// Nothing was cleared, so the session already is as it should be. This is the one
-		// decline that is honestly reportable as "restored".
-		return true, nil
+// Anchoring follows the request (flowKey), so a task-anchored call clears the key its
+// decision was accounted against. The caller MUST therefore hand a context that still
+// carries the request's validated claims: the anchor resolves from Claims["task_id"], so a
+// context detached with context.Background() would clear the SESSION key instead — leaving
+// the task tainted, deleting a label the session never asked to drop, and reporting success.
+// Detach cancellation only (context.WithoutCancel), never the values.
+func (e *Engine) CommitDeclassification(ctx context.Context, req *capability.EnforceRequest, labels []string) (cleared []string, err error) {
+	if len(labels) == 0 {
+		return nil, nil
 	}
 	// Exported, so it is reachable on an engine that holds no flow state at all — and on a
-	// PDP whose restore chain terminates in a no-op. Each of these means the labels stay
-	// cleared, so none of them may report success.
+	// PDP whose commit chain terminates in a no-op. Each of those means the labels stay
+	// exactly where they are, which is the safe state; report it as "cleared nothing" rather
+	// than as a fault, since there was never a store to clear them from.
 	if e == nil || e.skipFlow || e.flowStore == nil || req == nil || req.SessionID == "" {
-		return false, nil
+		return nil, nil
 	}
-	if err := e.flowStore.Add(ctx, e.flowKey(req), cleared...); err != nil {
-		return false, err
+	// The set as it stands NOW, so the intersection reported below is the truth at commit
+	// time. A read fault fails the commit rather than clearing blind: removing labels the
+	// proxy could not first observe would report a declassification it cannot substantiate.
+	present, err := e.peekSessionLabels(ctx, req)
+	if err != nil {
+		return nil, err
 	}
-	return true, nil
+	return e.clearLabels(ctx, req, declassifyOutcome{Labels: labels}, present)
 }
 
 // ClearSessionLabels releases a session's accumulated flow-label set, called from the

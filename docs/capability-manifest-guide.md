@@ -2400,39 +2400,57 @@ reads to decide whether the declassification should be approved at all. It carri
 own refusal is re-stamped as this same escalation, through the same builder, so
 one logical refusal has one record shape.
 
-A declassification can also be committed and then **refused by the proxy itself**,
-which is a third shape. The clear commits inside the decision, and three gates after
-it can still refuse without reaching the upstream — `--require-audit=strict`, an
-upstream transport failure, and a redaction failure. Each undoes the clear before
-recording, and the deny record says so:
+#### When the clear is applied
+
+The decision **authorizes** the clear; it does not remove the label. The removal
+happens once the call has actually run and its response is deliverable.
+
+That ordering is what makes the clear safe under concurrency. The proxy releases
+its per-session decision lock right after the decision, so the slow upstream call
+is not held under it — which means a clear applied inside the decision would be
+visible to every concurrent decision for the *whole* round trip. An egress decided
+in that window would read a clean label set and be forwarded while the sanitizing
+call was still in flight. Deferring the removal closes that: the labels stay until
+the action that clears them has completed.
+
+The practical consequence for a policy author is small but worth knowing: a call
+issued **concurrently** with a declassifying call still sees the old taint. A call
+issued after its response is back sees the cleared set, as it always did.
+
+#### Records for a clear that did not take effect
+
+Three gates below the decision can still refuse a call — `--require-audit=strict`,
+an upstream transport failure, and a redaction failure. None of them commits the
+clear, so nothing needs undoing and nothing is under-tainted. The deny record says
+what happened; so does an allow whose commit faulted:
 
 | detail key | meaning |
 | --- | --- |
-| `declassify_reverted` | the labels were put back; the session is as it was |
-| `declassify_orphaned` | they could **not** be put back — the labels are gone for a call that never ran, and a later sink will now pass |
-| `declassify_approval_id` | the grant, which stays **burned** either way — a `once` approval spent on a call that did not run needs replacing |
+| `_eunox_declassify_spent_approval_id` | a **single-use** grant this call burned. Stamped on the allow and on any refusal, and whether or not a label moved — the grant is spent in every one of those cases |
+| `_eunox_declassify_not_applied` | the call was refused below the decision, so the approved clear was never made. Benign: the labels were never removed |
+| `_eunox_declassify_commit_failed` | the call **ran** and the clear could not be applied. The session keeps taint the policy says the action dropped, so later sinks over-block until you retry under a new approval |
 
-`declassify_orphaned` is the one to alert on. It is spelled
-`declassify_approval_id` rather than `approval_id` so the top-level signed field
-keeps meaning "a declassification that actually took effect".
+`_eunox_declassify_commit_failed` is the one to alert on. None of the three reuses
+`approval_id`, the top-level signed field, which keeps meaning "a declassification
+that actually took effect".
 
-Two limits worth knowing:
+The `_eunox_` prefix marks a key eunox injects rather than one a caller sent: two
+of these ride an **allow** record, whose `details` is the caller's own argument map
+under `--audit`, and `eunox suggest` mines that map as argument names.
 
-- These keys appear only when the clear **changed** something. A `once` grant
-  presented on a session that was not carrying the label is still burned (see
-  above), but nothing was cleared, so a refusal after it records no
-  `declassify_approval_id` — same rule as the allow, which stamps no `approver`
-  for a no-op clear. Reconcile a spent grant against the allow record, not the
-  refusal.
-- The undo runs *after* the upstream round trip, while the clear committed
-  *inside* the decision. A concurrent request decided in between sees the cleared
-  set, so a sink that would have blocked can be allowed during that window
-  (bounded by `--upstream-timeout`). See the threat model's §3.13 residual.
+`_eunox_declassify_spent_approval_id` is what makes a `once` grant reconcilable.
+The grant is burned by the decision that accepted it — including on a clear that
+turns out to change nothing, since burning only on a clear that moved a label would
+make the grant replayable by ordering — while `labels_cleared`/`approver`/
+`approval_id` ride only on a clear that *did* change something. Without a separate
+key, a real approval could be spent with nothing on the tape naming it, and
+"which of my outstanding one-shot approvals are still live?" would be unanswerable.
 
-`eunox stats` counts both: escalations as the approval queue, declassifications
-as the number of times a human agreed to drop taint. A declassification count
-that has quietly become routine is the signal that a sanitizing step is being
-rubber-stamped.
+`eunox stats` counts all of it: escalations as the approval queue, declassifications
+as the number of times a human agreed to drop taint, single-use approvals spent as
+the reconciliation list, and failed commits called out on their own. A
+declassification count that has quietly become routine is the signal that a
+sanitizing step is being rubber-stamped.
 
 ## 5c. Task-context variables
 

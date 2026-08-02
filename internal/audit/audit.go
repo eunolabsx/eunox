@@ -1774,12 +1774,60 @@ const UpstreamErrorCodeKey = "_eunox_upstream_error_code"
 // (internal/transport) and the miner (cmd/eunox/suggest) share one spelling.
 const EffectReceiptKey = "_eunox_effect_receipt"
 
+// The three declassification detail keys. They report the facts a declassification's
+// top-level signed fields (labels_cleared / approver / approval_id) deliberately cannot:
+// those three appear together and ONLY when a clear actually changed the session's labels,
+// so on their own they leave a real approval spendable with nothing on the tape naming it,
+// and an authorized clear that never landed indistinguishable from a call that never asked
+// for one.
+//
+// Each has exactly ONE provenance, which is why there are three rather than one flag with a
+// mode. A consumer keyed on any of them knows what happened without also having to read the
+// record's decision:
+//
+//   - DeclassifySpentApprovalKey: this call BURNED a single-use grant. It is stamped
+//     whether or not the clear moved a label and whether or not the call went on to be
+//     refused, because the grant is spent in all three cases — that is the property `once`
+//     advertises. It is the key that answers "which of my outstanding single-use approvals
+//     are still live?", which neither approval_id (present only on a clear that changed
+//     something) nor a refusal-only key could.
+//   - DeclassifyNotAppliedKey: an approved clear did NOT run because the call was refused
+//     below the decision (the --require-audit=strict gate, an upstream transport failure, a
+//     redaction failure). Benign by construction — the labels were never removed, so the
+//     session is exactly as tainted as the calls it actually made — and recorded so a spent
+//     grant beside it is explicable.
+//   - DeclassifyCommitFailedKey: the call RAN and the clear the policy authorized could not
+//     be applied. The session keeps taint it should have dropped, so a later sink
+//     over-blocks until the operator retries with a new approval. This is the direction the
+//     residual now fails in; it is not a fail-open, and it is counted by `eunox stats`.
+//
+// All three carry the reserved underscore prefix for EffectReceiptKey's reason, which binds
+// harder here: two of them ride an ALLOW record, and a tools/call allow's Details IS the
+// caller's argument map in audit mode, which `eunox suggest` mines as argument names. A bare
+// key would be drafted into an allowedValues condition on an argument no call carries.
+const (
+	DeclassifySpentApprovalKey = DeclassifyDetailPrefix + "spent_approval_id"
+	DeclassifyNotAppliedKey    = DeclassifyDetailPrefix + "not_applied"
+	DeclassifyCommitFailedKey  = DeclassifyDetailPrefix + "commit_failed"
+)
+
+// DeclassifyDetailPrefix is the common prefix of the three keys above, and the three are
+// BUILT from it rather than spelled out beside it. A consumer that has to scan for them —
+// `eunox stats` probes a record's raw details bytes for this substring before paying for a
+// decode, the same pre-filter the effect-receipt path uses — then cannot fall out of step
+// with the producer by one edited literal. Nothing else in the details namespace may start
+// with it.
+const DeclassifyDetailPrefix = "_eunox_declassify_"
+
 // reservedDetailKeys is the set of Details keys eunox itself injects into an allow record.
 // None is ever a caller-supplied tool argument.
 var reservedDetailKeys = map[string]bool{
-	TruncatedKey:         true,
-	UpstreamErrorCodeKey: true,
-	EffectReceiptKey:     true,
+	TruncatedKey:               true,
+	UpstreamErrorCodeKey:       true,
+	EffectReceiptKey:           true,
+	DeclassifySpentApprovalKey: true,
+	DeclassifyNotAppliedKey:    true,
+	DeclassifyCommitFailedKey:  true,
 }
 
 // IsReservedDetailKey reports whether a Details key is one eunox injects rather than one a

@@ -306,38 +306,39 @@ type forwardParams struct {
 	sessionID      string
 	upstreamTimeMs int
 	callUpstream   func(context.Context, mcp.RPCMsg) (mcp.RPCMsg, error)
-	// restorer undoes an approved declassification's label clear when this transport
-	// refuses the call AFTER the decision committed it. nil in a params built with no PDP
-	// (the session-creating initialize gate, tests), where no decision is in hand and so
-	// none can carry LabelsCleared. See declassifyRestorer.
+	// committer applies an approved declassification's label clear once this transport has
+	// actually performed the call. nil in a params built with no PDP (the session-creating
+	// initialize gate, tests), where no decision is in hand and so none can carry
+	// LabelsPendingClear. See declassifyCommitter.
 	//
 	// It is populated by dispatchParams' own constructor from the SAME field the dispatcher
-	// decides with (see newDispatchParams), not assigned independently at each site: two
-	// fields holding one PDP is a drift surface where the next construction site sets `pdp`
-	// and forgets this one, and the failure that produces is silent — every post-decision
-	// refusal on that path reports declassify_orphaned while the labels really are gone.
-	restorer declassifyRestorer
+	// decides with (see withPDP), not assigned independently at each site: two fields holding
+	// one PDP is a drift surface where the next construction site sets `pdp` and forgets this
+	// one, and the failure that produces is silent in the direction of a policy whose
+	// sanitizing step never takes effect.
+	committer declassifyCommitter
 	strictAuditState
 }
 
-// declassifyRestorer is the one method the forward core needs from the PDP: put back the
-// flow labels an approved declassification cleared, for a call that was decided and then
-// refused here. *pdp.JWTPDP, *pdp.ManifestPDP and every other PolicyDecisionPoint satisfy
-// it, so the core stays ignorant of which one it holds.
+// declassifyCommitter is the one method the forward core needs from the PDP: apply the flow
+// label clear an approved declassification authorized, for a call that was decided here and
+// has now actually run. *pdp.JWTPDP, *pdp.ManifestPDP and every other PolicyDecisionPoint
+// satisfy it, so the core stays ignorant of which one it holds.
 //
 // It is a narrow interface rather than a pdp.PolicyDecisionPoint field because that is all
 // this path may do: the decision has already been made, and nothing below it is allowed to
 // re-decide.
-type declassifyRestorer interface {
-	RestoreDeclassified(ctx context.Context, sessionID string, labels []string) (bool, error)
+type declassifyCommitter interface {
+	CommitDeclassified(ctx context.Context, sessionID string, labels []string) ([]string, error)
 }
 
-// declassifyRestoreTimeout bounds the compensating flow-store write undoDeclassify makes
-// after the request's own context is no longer usable. It is a single store round-trip on a
-// path that is already returning a refusal, so it wants a bound short enough not to hold the
-// response and long enough to survive an ordinary backend hiccup — the alternative to
-// completing it is a permanently untainted session.
-const declassifyRestoreTimeout = 5 * time.Second
+// declassifyCommitTimeout bounds the flow-store write commitDeclassify makes after the
+// upstream call has returned, when the request's own context may no longer be usable. It is
+// a single store round-trip on a path that is already holding a response for the host, so it
+// wants a bound short enough not to stall that response and long enough to survive an
+// ordinary backend hiccup — the alternative to completing it is a session that stays tainted
+// after the action that was authorized to sanitize it.
+const declassifyCommitTimeout = 5 * time.Second
 
 // strictAuditState is the --require-audit=strict configuration shared by the
 // host-facing forward path (forwardParams) and the server-initiated sampling path
@@ -444,104 +445,135 @@ func (fp forwardParams) recordUpstreamFailure(ctx context.Context, msg mcp.RPCMs
 	return mcp.ErrorResponse(msg.ID, rpcCode, reason)
 }
 
-// undoDeclassify puts back the flow labels an approved declassification cleared, for a call
-// this transport is refusing AFTER the decision committed the clear, and returns the audit
-// fields that refusal's record must carry. It returns nil — and touches nothing — for a
-// decision that cleared no label, which is every call in a deployment with no declassify
-// directive.
+// declassifyRefusalDetail reports, for a call this transport is refusing BELOW the
+// decision, that an approved declassification did not take effect — and names the
+// single-use grant the decision spent to authorize it. It returns nil, and touches nothing,
+// for a decision that authorized no clear, which is every call in a deployment with no
+// declassify directive.
 //
-// The commit is inside Decide, so by the time any of the three post-decision refusals runs
-// (the --require-audit=strict gate, an upstream transport failure, a redaction failure) the
-// labels are already gone while the action itself never happened. Left alone that is a
-// fail-open the engine's own rollback arms cannot reach: they undo faults INSIDE the
-// decision, and this is a clean clear followed by a refusal one layer out.
+// There is nothing to UNDO here, and that is the point of the two-phase clear. The clear is
+// applied by commitDeclassify on the success path only, so by the time any of the three
+// refusals below the decision runs (the --require-audit=strict gate, an upstream transport
+// failure, a redaction failure) the labels were never removed and the session is exactly as
+// tainted as the calls it actually made. The compensating restore this replaced ran AFTER
+// the upstream round trip, so it could only ever narrow the window in which a concurrent
+// decision saw the cleared set — never close it — and its own failure arm was the residual
+// fail-open an operator was told to alert on.
 //
-// The single-use grant that authorized the clear stays BURNED — the counter has no delete,
-// and handing a use back for a call that may or may not have run is the direction
-// burnApproval documents as unsafe. So the record names it: the operator mints a new
-// approval, and the tape says why. That is also what keeps this honest as evidence — a
-// declassification that was authorized and then undone is a different event from one that
-// never happened, and the approval id is what joins either to the approval workflow.
-func (fp forwardParams) undoDeclassify(ctx context.Context, dec capability.EnforceResponse, kind, denialTarget string) map[string]interface{} {
-	if len(dec.LabelsCleared) == 0 {
+// The single-use grant is still BURNED, because the burn is the atomic test that makes
+// "once" mean once and so belongs with the decision that accepted it (see burnApproval).
+// That is over-refusal — the operator mints another approval — and it is the fact the record
+// has to carry, since nothing else on the tape would name a grant spent by a call that did
+// not run.
+func (fp forwardParams) declassifyRefusalDetail(dec capability.EnforceResponse) map[string]interface{} {
+	if len(dec.LabelsPendingClear) == 0 {
 		return nil
 	}
 	detail := map[string]interface{}{
 		// The discriminator every information-flow event on the tape carries, so one
 		// filter finds this beside the sink denials and the declassify escalations.
-		"flow": true,
+		"flow":                        true,
+		audit.DeclassifyNotAppliedKey: dec.LabelsPendingClear,
 	}
-	restored, err := fp.restoreCleared(ctx, dec.LabelsCleared)
-	switch {
-	case err != nil || !restored:
-		// The fail-open residual, and the reason this returns fields at all: the labels are
-		// gone for a call that never ran, so a later sink the operator believes is guarded
-		// will pass. Spelled as its own key rather than a flag on the revert, so an alert
-		// matches this and not the benign case.
-		//
-		// !restored is folded in beside the error deliberately. A restorer that DECLINES —
-		// no engine, no flow store, a wrapper whose inner is gone — leaves the labels
-		// exactly as un-restored as a failed write does, and reporting that as a revert
-		// would put a signed claim about the session's state on the tape with nothing
-		// behind it. Only an implementation that actually wrote may reach the other arm.
-		detail["declassify_orphaned"] = dec.LabelsCleared
-		reason := "the policy decision point declined to restore them"
-		if err != nil {
-			reason = err.Error()
-		}
-		fmt.Fprintf(os.Stderr,
-			"[eunox] SECURITY: %s %q was refused after an approved declassification, and the cleared flow label(s) %v could not be restored: %s — the session is now less tainted than the calls it actually made\n",
-			kind, denialTarget, dec.LabelsCleared, reason)
-	default:
-		detail["declassify_reverted"] = dec.LabelsCleared
-	}
-	// Spelled declassify_approval_id rather than approval_id: the latter is a top-level
-	// SIGNED field on the allow that PERFORMED a declassification, and reusing the name
-	// inside a refusal's details would put one key in two places with two provenances on
-	// one tape — the same rule consumed_approval_id follows in the engine.
-	//
-	// Bounded before it lands, through the SAME cap the top-level approval_id gets. The id
-	// is an IdP-supplied string Validate() places no length limit on, and unlike the
-	// engine's own refusal details — which pass through boundDenialDetails — a value
-	// written straight into a transport-built details map reaches the tape under only the
-	// 1 MiB whole-map cap. Left unbounded, one 500 KB approval id would write 128x the
-	// envelope cap per refused declassification into the tape and the audit queue's byte
-	// budget, on exactly the value declassifyRefusal's own doc calls out as one that must
-	// not carry an unbounded value onto the signed tape.
-	if dec.ApprovalID != "" {
-		detail["declassify_approval_id"] = audit.BoundEnvelopeField(dec.ApprovalID)
-	}
+	addSpentApproval(detail, dec)
 	return detail
 }
 
-// restoreCleared runs the compensating write on a context that outlives the request.
+// addSpentApproval stamps the single-use declassify grant this call burned, if it burned
+// one. Shared by the allow and refusal paths because the fact is the same on both: a `once`
+// approval is spent by the decision that accepted it, whether the call went on to succeed,
+// to be refused, or to clear nothing at all. One key, one provenance — see
+// audit.DeclassifySpentApprovalKey, and the consumed_approval_id rule it follows.
 //
-// The request's own context is the wrong one, and on one of the three exits it is
-// systematically wrong: an upstream transport failure is frequently CAUSED by that context
-// being canceled (a client disconnect surfaces as REQUEST_CANCELED), and a
-// context-honouring FlowLabelStore — the Redis backend passes ctx into every pipelined
-// command — then fails the restore immediately. The restore would be guaranteed to fail in
-// exactly the case it exists for, and would be recorded as declassify_orphaned while
-// blaming a store that was healthy. Every other post-request state operation in this
-// package already detaches for this reason; see the ReleaseSession contract.
-//
-// context.WithoutCancel, NOT context.Background: the anchor the labels are restored under
-// resolves from the request's validated claims, so a fully detached context would restore a
-// task-anchored clear under the session key — leaving the task untainted, stranding a
-// duplicate, and reporting success. WithoutCancel keeps the values and drops only the
-// cancellation. See PolicyDecisionPoint.RestoreDeclassified's context contract.
-func (fp forwardParams) restoreCleared(ctx context.Context, cleared []string) (bool, error) {
-	if fp.restorer == nil {
-		// Unreachable through dispatchParams, whose constructor sets this from the same PDP
-		// it decides with — but this is the fail-open path, so it reports rather than
-		// assumes. Distinguished from a store fault in the message: the remedies are a code
-		// fix and a backend fix respectively, and an operator paged on declassify_orphaned
-		// must not be sent to look at a healthy store.
-		return false, fmt.Errorf("no policy decision point is wired into this transport path (wiring fault, not a flow-store failure)")
+// Bounded before it lands, through the SAME cap the top-level approval_id gets. The id is an
+// IdP-supplied string Validate() places no length limit on, and unlike the engine's own
+// refusal details — which pass through boundDenialDetails — a value written straight into a
+// transport-built details map reaches the tape under only the 1 MiB whole-map cap. Left
+// unbounded, one 500 KB approval id would write 128x the envelope cap per declassification
+// into the tape and the audit queue's byte budget, on exactly the value declassifyRefusal's
+// own doc calls out as one that must not carry an unbounded value onto the signed tape.
+func addSpentApproval(detail map[string]interface{}, dec capability.EnforceResponse) {
+	if dec.SpentApprovalID == "" {
+		return
 	}
-	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), declassifyRestoreTimeout)
+	detail[audit.DeclassifySpentApprovalKey] = audit.BoundEnvelopeField(dec.SpentApprovalID)
+}
+
+// commitDeclassify applies the label clear an approved declassification authorized, for a
+// call that has now RUN and whose response is about to reach the host. It returns what the
+// clear actually changed — for the allow record's top-level labels_cleared/approver/
+// approval_id triple — and the extra details that record must carry.
+//
+// It is the second phase of the clear, and its position is the whole fix: the labels stay
+// visible to every concurrent decision until the sanitizing call has completed, so a sink
+// that the taint exists to stop cannot be allowed while that call is still in flight. That
+// holds without leaning on the per-session decision lock, which the transport deliberately
+// releases before the forward and which does not span a task key two sessions share.
+//
+// A commit FAULT is not a refusal. The upstream has already executed the action and its
+// (redacted) response is in hand, so there is nothing left to withhold; the honest outcome
+// is to deliver it and record that the clear did not land. The session then keeps taint it
+// should have dropped, which over-blocks a later sink until the operator retries under a new
+// approval — the fail-closed direction, and the mirror of the burn's own accepted
+// over-refusal.
+func (fp forwardParams) commitDeclassify(ctx context.Context, dec capability.EnforceResponse, kind, target string) (cleared []string, detail map[string]interface{}) {
+	if len(dec.LabelsPendingClear) == 0 {
+		return nil, nil
+	}
+	detail = map[string]interface{}{}
+	addSpentApproval(detail, dec)
+	cleared, err := fp.commitCleared(ctx, dec.LabelsPendingClear)
+	if err != nil {
+		// The call ran and the clear did not, so the tape says so. Spelled as its own key
+		// rather than a flag beside the refusal's, because the operator action differs: this
+		// one means the flow store faulted on a call that really happened, and the approval
+		// has to be reissued for the session to reach the state the policy describes.
+		detail[audit.DeclassifyCommitFailedKey] = dec.LabelsPendingClear
+		fmt.Fprintf(os.Stderr,
+			"[eunox] WARN declassify %s %q ran under an approved declassification, but the flow label(s) %v could not be cleared: %v — the session stays tainted, so a later sink will over-block until the action is retried under a new approval\n",
+			kind, target, dec.LabelsPendingClear, err)
+		// cleared may still be non-empty beside the error (a Remove can delete and then lose
+		// its reply), and it is DISCARDED here rather than reported: labels_cleared is a
+		// signed claim that these labels are gone, and a set that may or may not have landed
+		// cannot back it. The key above carries the whole authorized set instead, which is
+		// the superset an operator has to reconcile either way.
+		return nil, detail
+	}
+	if len(detail) == 0 {
+		// A standing grant on a no-op clear contributes nothing at all; return nil so the
+		// common path allocates no details map for the record.
+		return cleared, nil
+	}
+	return cleared, detail
+}
+
+// commitCleared runs the clear on a context that outlives the request.
+//
+// The request's own context is the wrong one, and systematically so on the path that
+// matters: the forward has just returned, and a client that disconnects while its response
+// is being assembled cancels that context — after which a context-honouring FlowLabelStore
+// (the Redis backend passes ctx into every pipelined command) fails the commit immediately.
+// The clear would be lost precisely when the call it sanitizes DID run. Every other
+// post-request state operation in this package already detaches for this reason; see the
+// ReleaseSession contract.
+//
+// context.WithoutCancel, NOT context.Background: the anchor the labels are cleared under
+// resolves from the request's validated claims, so a fully detached context would clear the
+// SESSION key for a task-anchored call — leaving the task tainted while deleting a label the
+// session never asked to drop, and reporting success. WithoutCancel keeps the values and
+// drops only the cancellation. See PolicyDecisionPoint.CommitDeclassified's context contract.
+func (fp forwardParams) commitCleared(ctx context.Context, labels []string) ([]string, error) {
+	if fp.committer == nil {
+		// Unreachable through dispatchParams, whose constructor sets this from the same PDP
+		// it decides with — but a clear that silently never happens is exactly the failure
+		// that constructor exists to prevent, so it reports rather than assumes.
+		// Distinguished from a store fault in the message: the remedies are a code fix and a
+		// backend fix respectively.
+		return nil, fmt.Errorf("no policy decision point is wired into this transport path (wiring fault, not a flow-store failure)")
+	}
+	commitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), declassifyCommitTimeout)
 	defer cancel()
-	return fp.restorer.RestoreDeclassified(restoreCtx, fp.sessionID, cleared)
+	return fp.committer.CommitDeclassified(commitCtx, fp.sessionID, labels)
 }
 
 // mergeAuditDetails folds extra into base without mutating either — base may be the
@@ -649,8 +681,20 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 		observe = isObserveDeny(denial, fp.audit, dec.AuditOnly)
 		if !observe {
 			// A genuine hard deny: record it (upstream never called) and return.
+			//
+			// The declassify fields ride along, through mergeAuditDetails so the engine's own
+			// details map is never written into. In-tree this is always a no-op — a refusal
+			// carries no LabelsPendingClear, because the approval check turns an unapproved
+			// declassification into an escalation BEFORE anything is committed, and the
+			// wrapping JWT layer's own denials all short-circuit above the inner decision
+			// that would burn a grant. It is here so the invariant is structural rather than
+			// a property of who currently sets what: a spent single-use grant that reached a
+			// refusal exit with nothing on the tape naming it is exactly the reconciliation
+			// gap this key exists to close, and an exit that silently could not report one
+			// would reopen it.
 			if fp.rec != nil {
-				fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, denial.Code, denial.ConditionType, denial.Details, false)
+				fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, denial.Code, denial.ConditionType,
+					mergeAuditDetails(denial.Details, fp.declassifyRefusalDetail(dec)), false)
 			}
 			return denialResult(msg.ID, denial.Code, denial.ConditionType, denialTarget, denialArgument(denial))
 		}
@@ -666,11 +710,12 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 	// contradicting the AUDIT_UNAVAILABLE hard-block.
 	//
 	// This is the FIRST of three exits below the decision, and the decision may have
-	// already cleared flow labels under a human approval. Blocking here means the
-	// sanitizing action never runs while its taint is gone, so the undo runs on the
-	// blocking path and its outcome lands on the same record (see undoDeclassify).
+	// authorized a flow-label clear under a human approval. Blocking here means the
+	// sanitizing action never runs — so the clear is simply never committed, and the record
+	// says that an approved declassification did not take effect and names the single-use
+	// grant it spent (see declassifyRefusalDetail).
 	if denied, blocked := fp.strictAuditDenial(ctx, msg, auditID, method, denialTarget, func() map[string]interface{} {
-		return fp.undoDeclassify(ctx, dec, kind, denialTarget)
+		return fp.declassifyRefusalDetail(dec)
 	}); blocked {
 		return denied
 	}
@@ -715,14 +760,14 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 		// direction hands back quota for a call that DID execute. An over-count on a host
 		// that reuses an in-flight JSON-RPC id is the safe side of that trade.
 		//
-		// The declassification is undone here even though the upstream MAY have executed
-		// the call (a write timeout means the bytes were already handed over). The two
-		// possible errors are not symmetric: restoring a label for a call that did run
-		// over-blocks a later sink, which the operator resolves with another approval,
-		// while leaving it cleared for a call that did NOT run silently admits the next
-		// egress the label exists to stop. The quota slot above is NOT refunded for the
-		// mirror-image reason — there the fail-closed direction is to keep it spent.
-		return fp.recordUpstreamFailure(ctx, msg, fwdErr, auditID, method, fp.undoDeclassify(ctx, dec, kind, denialTarget))
+		// The declassification is NOT committed here, even though the upstream MAY have
+		// executed the call (a write timeout means the bytes were already handed over). The
+		// two possible errors are not symmetric: keeping a label for a call that did run
+		// over-blocks a later sink, which the operator resolves with another approval, while
+		// clearing it for a call that did NOT run silently admits the next egress the label
+		// exists to stop. The quota slot above is NOT refunded for the mirror-image reason —
+		// there the fail-closed direction is to keep it spent.
+		return fp.recordUpstreamFailure(ctx, msg, fwdErr, auditID, method, fp.declassifyRefusalDetail(dec))
 	}
 
 	// Apply post-allow obligations (redactFields) before the response reaches the
@@ -737,10 +782,10 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 			// every redactFields-guarded call vanish from the audit trail. Also a
 			// forwarded-then-recorded boundary call, so it gets the same diagnostic.
 			//
-			// The third post-decision exit, and the same undo: the response never reaches
-			// the host, so the declassifying call did not deliver its result while its
-			// taint is already cleared.
-			redactDetail := fp.undoDeclassify(ctx, dec, kind, denialTarget)
+			// The third exit below the decision, and the clear is withheld for the same
+			// reason: the response never reaches the host, so the declassifying call did
+			// not deliver its result, and the taint it was authorized to drop stays.
+			redactDetail := fp.declassifyRefusalDetail(dec)
 			warnIfStrictAuditJustDegraded(fp.requireAuditStrict, fp.rec, kind, denialTarget, func() {
 				if fp.rec != nil {
 					fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, capability.ErrCodeEnforcementError, "", redactDetail, false)
@@ -774,28 +819,37 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 	if recordObligations && upResp.Result != nil {
 		oblNames = auditObligationNames(dec.Obligations)
 	}
+	// The call has run and its (redacted) response is deliverable, which is exactly the
+	// condition an approved declassification's clear was waiting on. Commit it HERE — after
+	// the last exit that could still refuse, before the record that reports it — so no
+	// refusal can leave a label cleared, and no record can claim a clear that has not landed.
+	// A no-op for every call in a deployment with no declassify directive.
+	labelsCleared, declDetail := fp.commitDeclassify(ctx, dec, kind, denialTarget)
+
 	// Carry dec.AuditOnly so a per-entry audit-mode forward is not logged as a
 	// genuine allow. allowDetails supplies the structured details.
 	warnIfStrictAuditJustDegraded(fp.requireAuditStrict, fp.rec, kind, denialTarget, func() {
 		if fp.rec == nil {
 			return
 		}
-		// A call that cleared flow labels under a human approval takes the recorder that
-		// carries the approval; every other call takes the plain one. The branch is on
-		// LabelsCleared rather than Approver because the engine populates both together
-		// and only when the clear actually changed the session's labels — an approved
-		// directive whose labels the session never held is a no-op, and recording an
-		// approver for it would put a declassification that did not happen on the tape.
-		if len(dec.LabelsCleared) > 0 {
-			// The declassification's three facts are passed as fields, never merged into
-			// the details map: allowDetails returns the caller's LIVE argument map on the
-			// audit-mode tools/call path, so writing into it would mutate the request the
-			// record is supposed to describe and would silently shadow a caller argument
-			// of the same name.
-			fp.rec.RecordDeclassifiedAllow(ctx, fp.sessionID, auditID, method, allowDetails(upResp), oblNames, fp.audit || dec.AuditOnly, dec.LabelsOut, dec.CarriedLabels, dec.LabelsCleared, dec.Approver, dec.ApprovalID)
+		// mergeAuditDetails, never a write into allowDetails' return: on the audit-mode
+		// tools/call path that IS the caller's live argument map, so writing into it would
+		// mutate the request the record is supposed to describe. It returns the base
+		// untouched when there is nothing to add, so the common path allocates nothing.
+		details := mergeAuditDetails(allowDetails(upResp), declDetail)
+		// A call that CLEARED flow labels under a human approval takes the recorder that
+		// carries the approval; every other call takes the plain one. The branch is on what
+		// the commit actually changed, not on what was authorized — an approved directive
+		// whose labels the anchor never held is a permitted no-op, and recording an approver
+		// for it would put a declassification that did not happen on the tape. A no-op clear
+		// under a single-use grant is still visible: declDetail names the spent approval.
+		if len(labelsCleared) > 0 {
+			// The declassification's three facts are passed as FIELDS — they are top-level,
+			// signed, and appear together or not at all — never merged into the details map.
+			fp.rec.RecordDeclassifiedAllow(ctx, fp.sessionID, auditID, method, details, oblNames, fp.audit || dec.AuditOnly, dec.LabelsOut, dec.CarriedLabels, labelsCleared, dec.Approver, dec.ApprovalID)
 			return
 		}
-		fp.rec.RecordAllow(ctx, fp.sessionID, auditID, method, allowDetails(upResp), oblNames, fp.audit || dec.AuditOnly, dec.LabelsOut, dec.CarriedLabels)
+		fp.rec.RecordAllow(ctx, fp.sessionID, auditID, method, details, oblNames, fp.audit || dec.AuditOnly, dec.LabelsOut, dec.CarriedLabels)
 	})
 	upResp.ID = msg.ID
 	return upResp
@@ -1034,14 +1088,15 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 		// system:sampling opt-in, rejected at startup for HTTP upstreams, so this only
 		// bites stdio subprocess upstreams.
 		//
-		// There is deliberately no declassify undo on this gate, unlike its counterpart in
-		// enforcedForwardCore. A declassify directive is refused at LOAD on a system:
+		// There is deliberately no declassify handling on this leg, unlike its counterpart
+		// in enforcedForwardCore. A declassify directive is refused at LOAD on a system:
 		// target (requireSourceDirectiveTarget: an egress is a place for a flow sink, not
 		// for clearing a label — clearing at an egress launders it at exactly the point the
-		// flow layer exists to gate), so a sampling decision cannot carry LabelsCleared and
-		// there is nothing here for a strict-audit block to have left cleared. Should that
-		// restriction ever be relaxed, this gate needs undoDeclassify exactly as the
-		// host-path gates do.
+		// flow layer exists to gate), so a sampling decision cannot carry
+		// LabelsPendingClear: there is nothing here to commit, and nothing a gate could
+		// leave unapplied. Should that restriction ever be relaxed, this leg needs
+		// commitDeclassify on its forward and declassifyRefusalDetail on its gates, exactly
+		// as the host path does.
 		if fp.strictServerRequestAuditDenial(ctx, msg, samplingMethod) {
 			return
 		}

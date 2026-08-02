@@ -83,12 +83,31 @@ func statsTarget(targetType, target, method string) string {
 // by audit_only so an operator running in audit mode (forwarded, would-be
 // denials) cannot misread observations as enforced blocks.
 type auditStatsSummary struct {
-	total           int
-	allowed         int
-	blocked         int // denials with audit_only=false (call was rejected)
-	observed        int // denials with audit_only=true  (call was forwarded)
-	escalated       int // decision=escalate: refused pending human approval (never forwarded)
-	declassified    int // allows that cleared a flow label under a human approval (labels_cleared present)
+	total        int
+	allowed      int
+	blocked      int // denials with audit_only=false (call was rejected)
+	observed     int // denials with audit_only=true  (call was forwarded)
+	escalated    int // decision=escalate: refused pending human approval (never forwarded)
+	declassified int // allows that cleared a flow label under a human approval (labels_cleared present)
+	// The three declassification facts that live in `details` rather than in a top-level
+	// field, because none of them is a declassification that HAPPENED — which is all the
+	// signed labels_cleared/approver/approval_id triple may describe. Without a count here
+	// each was byte-indistinguishable from an ordinary allow or an ordinary UPSTREAM_ERROR
+	// deny in everything this tool reported, so a policy whose sanitizing step had stopped
+	// working, or an approval queue quietly draining, looked exactly like a healthy run.
+	//
+	// declassifyCommitFailed is the one to alert on: the call RAN and the clear did not
+	// land, so the session keeps taint it should have dropped and every later sink
+	// over-blocks until a new approval is issued.
+	declassifyCommitFailed int
+	// declassifyNotApplied is benign — the call was refused below the decision, so the
+	// labels were never removed — but it is what explains a spent grant beside it.
+	declassifyNotApplied int
+	// spentApprovals counts single-use grants this log shows being burned, which is the
+	// reconciliation signal: an operator asking "which of my outstanding one-shot approvals
+	// are still live?" cannot answer it from approval_id, which appears only when the clear
+	// changed something.
+	spentApprovals  int
 	other           int // records with a decision outside "allow" | "deny" | "escalate"
 	blockedDenials  map[denialKey]int
 	observedDenials map[denialKey]int
@@ -117,6 +136,11 @@ func computeAuditStats(r io.Reader) (auditStatsSummary, error) {
 			DenialCode    string   `json:"denial_code"`
 			AuditOnly     bool     `json:"audit_only"`
 			LabelsCleared []string `json:"labels_cleared"`
+			// Captured as raw bytes, not decoded: `details` on a tools/call allow is the
+			// caller's whole argument map, and parsing every one of those to look for three
+			// rare keys would make this scan pay for the largest field in the record on
+			// every line. json.RawMessage costs a slice of the input and no parse.
+			Details json.RawMessage `json:"details"`
 		}
 		if err := json.Unmarshal(line, &rec); err != nil {
 			// Undecodable line: count in "other" so the total still reconciles
@@ -124,6 +148,7 @@ func computeAuditStats(r io.Reader) (auditStatsSummary, error) {
 			out.other++
 			continue
 		}
+		out.addDeclassifyDetails(rec.Details)
 		switch rec.Decision {
 		case "allow":
 			out.allowed++
@@ -164,6 +189,37 @@ func computeAuditStats(r io.Reader) (auditStatsSummary, error) {
 	return out, nil
 }
 
+// addDeclassifyDetails tallies the declassification facts that ride in a record's `details`
+// map. It is the only place this tool reads details at all, and it reads exactly three keys.
+//
+// The substring probe before the decode is the same pre-filter the effect-receipt path uses,
+// and for the same reason: almost no record carries one of these keys, and `details` is the
+// biggest field on the line (a tools/call allow's details IS the caller's argument map), so
+// paying a JSON scan per record to discover their absence is the cost this avoids. A miss is
+// safe in the only direction that matters — an unrecognizable payload reads as "no
+// declassification facts", which is what the tool reported before it read details at all.
+//
+// The keys come from internal/audit rather than being spelled here, so the producer and this
+// consumer cannot drift; audit.DeclassifyDetailPrefix is likewise derived from them.
+func (s *auditStatsSummary) addDeclassifyDetails(raw json.RawMessage) {
+	if len(raw) == 0 || !bytes.Contains(raw, []byte(audit.DeclassifyDetailPrefix)) {
+		return
+	}
+	var details map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &details); err != nil {
+		return
+	}
+	if _, ok := details[audit.DeclassifySpentApprovalKey]; ok {
+		s.spentApprovals++
+	}
+	if _, ok := details[audit.DeclassifyNotAppliedKey]; ok {
+		s.declassifyNotApplied++
+	}
+	if _, ok := details[audit.DeclassifyCommitFailedKey]; ok {
+		s.declassifyCommitFailed++
+	}
+}
+
 // printAuditStats renders the bucketed summary in two tables — BLOCKED (enforced)
 // and OBSERVED (audit-mode, call forwarded) — so an audit-mode denial is never
 // mistaken for a block.
@@ -185,6 +241,23 @@ func printAuditStats(w io.Writer, s auditStatsSummary) {
 	}
 	if s.declassified > 0 {
 		wf("  (declassified = %d allow(s) cleared a flow label under a human approval; every one names its approver in the record.)\n", s.declassified)
+	}
+	// Called out rather than listed, and FIRST among the declassification notes: this is the
+	// one that means a session is not in the state the policy describes. The call ran, its
+	// approved clear did not land, so the taint is still there and every later sink governed
+	// by it over-blocks until a fresh approval is issued.
+	if s.declassifyCommitFailed > 0 {
+		wf("\n  ATTENTION: %d approved declassification(s) could not be applied after the call had already run\n", s.declassifyCommitFailed)
+		wln("  (the flow store faulted at the commit; those sessions keep taint the policy says the action cleared,")
+		wln("   so later sinks over-block until the action is retried under a new approval. Check the flow-store backend.)")
+	}
+	if s.declassifyNotApplied > 0 {
+		wf("  (declassify-not-applied = %d refused call(s) whose approved clear was therefore never made; the labels were never removed, so nothing is under-tainted.)\n",
+			s.declassifyNotApplied)
+	}
+	if s.spentApprovals > 0 {
+		wf("  (single-use approvals spent = %d; each is burned for good, including on a clear that changed nothing or a call that was then refused. Reconcile these against your outstanding one-shot approvals — details.%s names each.)\n",
+			s.spentApprovals, audit.DeclassifySpentApprovalKey)
 	}
 	if s.observed > 0 {
 		wln("  (observed = audit-mode denials: the call was forwarded; the verdict is recorded but was not enforced.)")

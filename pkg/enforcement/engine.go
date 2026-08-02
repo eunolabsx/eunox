@@ -1312,7 +1312,7 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 	// seq-write fault denies via recordFailureDenial. The per-session decision lock
 	// serializes this critical section, so the
 	// rollback removes exactly this call's additions with no concurrent writer.
-	labelsOut, labelsCleared, cerr := e.recordSourceCall(ctx, req, matched, flowRelevant, carriedLabels, decl)
+	labelsOut, cerr := e.recordSourceCall(ctx, req, matched, flowRelevant, carriedLabels, decl)
 	if cerr != nil {
 		if cerr.Declassify {
 			return declassifyRecordFailureDenial(requestID, now, matched.IsAuditOnly())
@@ -1328,13 +1328,19 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 		return recordFailureDenial(requestID, now, matched.IsAuditOnly(), obligations)
 	}
 
-	// The approver rides ONLY on a clear that actually changed the session's labels
-	// (clearLabels returns the intersection with what was carried). An approved directive
-	// whose labels the session never held is a permitted no-op, and stamping an approver
-	// on it would put a declassification that did not happen on the tape.
-	var approver, approvalID string
-	if len(labelsCleared) > 0 {
-		approver, approvalID = decl.Approver, decl.ApprovalID
+	// The clear itself is NOT applied here; it is handed to the caller to commit once the
+	// call has actually run (see LabelsPendingClear and CommitDeclassification). The approver
+	// travels with it because the pair describes the AUTHORIZATION — which is settled — while
+	// the audit record's approver still rides only on a clear that CHANGED something, so the
+	// tape keeps its rule that a declassification which did not happen is never recorded.
+	//
+	// SpentApprovalID is populated only for a single-use grant, and only here — past the burn,
+	// so it names a grant this call really did spend. It is a distinct fact from ApprovalID:
+	// the grant is spent whether or not the clear that follows moves a label, or happens at
+	// all.
+	var spentApprovalID string
+	if decl.LedgerID != "" {
+		spentApprovalID = decl.ApprovalID
 	}
 
 	return capability.EnforceResponse{
@@ -1345,9 +1351,10 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 		AuditOnly:   matched.IsAuditOnly(),
 		LabelsOut:   labelsOut,
 
-		LabelsCleared: labelsCleared,
-		Approver:      approver,
-		ApprovalID:    approvalID,
+		LabelsPendingClear: decl.Labels,
+		Approver:           decl.Approver,
+		ApprovalID:         decl.ApprovalID,
+		SpentApprovalID:    spentApprovalID,
 		// The SAME resolution the two effect conditions and the ceiling read, handed on to
 		// the post-hoc receipt check rather than re-resolved there — one resolution per
 		// call, so the decision and the check cannot disagree about what the effect was.

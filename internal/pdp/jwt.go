@@ -2151,20 +2151,20 @@ func (p *JWTPDP) ReleaseSession(ctx context.Context, sessionID string) {
 	}
 }
 
-// RestoreDeclassified delegates to the inner PDP, which owns the flow store the clear was
-// committed against. The JWT layer clears no label of its own — a token can only restrict —
-// so a nil inner has nothing to undo. p == nil guards the typed-nil case for the same reason
-// ManifestPDP's does: this is reached through the transport's restorer interface on a
-// refusal path, where a panic is a fail-open-via-crash.
+// CommitDeclassified delegates to the inner PDP, which owns the flow store the clear
+// applies to. The JWT layer clears no label of its own — a token can only restrict — so a
+// nil inner has nothing to commit. p == nil guards the typed-nil case for the same reason
+// ManifestPDP's does: this is reached through the transport's committer interface after the
+// upstream call has already run, where a panic is a crash with the response in hand.
 //
-// A nil inner reports restored only for the empty set. Reaching here with labels in hand
-// means the clear was committed by a layer this wrapper cannot see, so claiming the revert
+// A nil inner clears nothing and reports an empty set. Reaching here with labels in hand
+// means the authorization came from a layer this wrapper cannot see, so claiming a clear
 // happened would put that claim on the signed tape unbacked.
-func (p *JWTPDP) RestoreDeclassified(ctx context.Context, sessionID string, labels []string) (bool, error) {
+func (p *JWTPDP) CommitDeclassified(ctx context.Context, sessionID string, labels []string) ([]string, error) {
 	if p == nil || p.inner == nil {
-		return len(labels) == 0, nil
+		return nil, nil
 	}
-	return p.inner.RestoreDeclassified(ctx, sessionID, labels)
+	return p.inner.CommitDeclassified(ctx, sessionID, labels)
 }
 
 // innerFilter applies the inner PDP's list filter (selected by sel) to intersect

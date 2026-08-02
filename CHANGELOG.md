@@ -235,6 +235,15 @@ Section conventions:
 
 ### Changed
 
+- **`eunox stats` reports the declassification faults it previously could not see.** It
+  decoded six top-level fields and never read `details` at all, so an approved clear that
+  failed to apply was byte-indistinguishable from an ordinary allow, and a refused
+  declassification from an ordinary `UPSTREAM_ERROR` deny — the benign case had a first-class
+  count and the fault cases had none. It now reads exactly three reserved detail keys (behind
+  a substring pre-filter, so a tools/call allow's argument map is not parsed per record) and
+  reports: failed commits as a called-out `ATTENTION` line, clears that were never applied
+  because the call was refused, and single-use approvals spent.
+
 - **BREAKING (pre-1.0): `schemaVersion: "0.2-draft"` is removed, not aliased.** A manifest
   still declaring the draft string is refused at load, with the supported list naming
   `0.2`. **Migration: change the string to `"0.2"`.** No token was renamed and nothing else
@@ -958,6 +967,48 @@ Section conventions:
   session establishment forever. All four now share one helper.
 
 ### Security
+
+- **A declassification's label clear is now two-phase, and the second phase runs after the
+  call.** The clear used to commit *inside* the decision, while the transport releases its
+  per-session decision lock immediately afterwards so the slow upstream forward is not held
+  under it. For the whole round trip — bounded only by `--upstream-timeout`, and by nothing
+  at all when that is `0` — every concurrent decision on the session therefore read an
+  already-clean label set, so a sink the taint existed to stop could be **allowed and
+  forwarded while the sanitizing call was still in flight**. The compensating undo that
+  shipped alongside it ran *after* the round trip, i.e. after the window it was meant to
+  cover, so it narrowed the fail-open and could not close it; under `taskAnchoredState` the
+  window was wider still, since the decision lock is per-session and does not span a task key
+  two sessions share. The decision now only **authorizes** the clear and the removal happens
+  once the call has actually run and its redacted response is deliverable, so the labels are
+  never absent until the action that clears them has completed — and that holds without
+  depending on any lock. `labelOutput` and the `sequenceBlock` antecedent still commit inside
+  the decision (extra taint over-blocks), and so does the **burn** of a single-use grant,
+  which is the atomic test that makes `once` mean once.
+
+  The residual now fails in the safe direction: a commit fault leaves the label in place, so
+  a later sink over-blocks until the operator retries under a new approval. A session is
+  deliberately **not** marked sticky-untrusted for it — there is no longer any state in which
+  the proxy knows a session's taint is missing.
+
+- **A spent single-use approval is now named on the tape.** A `once` grant is burned by the
+  decision that accepts it — including on a clear that turns out to change nothing, since
+  burning only on a clear that moved a label would make the grant replayable by ordering —
+  while `labels_cleared`/`approver`/`approval_id` appear only when the clear *did* change
+  something. A real approval could therefore be spent with nothing anywhere on the signed
+  tape naming it, so an operator could not answer "which of my outstanding one-shot approvals
+  are still live?" — silent in the direction of believing you still hold an approval you do
+  not. Every call that burns one now stamps `details._eunox_declassify_spent_approval_id`, on
+  the allow and on any refusal below the decision alike, kept distinct from `approval_id` so
+  one key never carries two provenances.
+
+- **`internal/config`'s grammar gate no longer fails open on an unclassified token.**
+  `tokenGrammarVersions` — the guard whose whole job is stopping a later revision's predicate
+  from silently widening an earlier one — was consulted with a comma-ok, so a condition or
+  directive missing from it was **admitted under `schemaVersion "0.1"`**, and no test walked
+  `pkg/capability`'s prototype registries against it. It is now paired with an explicit
+  `baseGrammarTokens` table, the two are total over the vocabulary, a token in neither is
+  refused under every revision, and tests walk `KnownConditionTypes()`/`KnownDirectiveTypes()`
+  against both (plus assert every later-revision token is refused under `0.1`).
 
 - **`redactFields` fails closed on a result whose object keys are ambiguous.** The
   redaction path was the one JSON surface in the codebase without a duplicate-key gate:

@@ -75,19 +75,19 @@ type dispatchParams struct {
 }
 
 // withPDP records the policy decision point and derives every field that must be the SAME
-// PDP from it — today the embedded forwardParams.restorer, which undoes a declassification
-// this transport refuses after the decision committed it.
+// PDP from it — today the embedded forwardParams.committer, which applies the label clear an
+// approved declassification authorized once this transport has performed the call.
 //
 // It exists so those two cannot be set independently. They were, at both construction
 // sites, two lines apart; nothing tied them together, and the failure a divergence produces
-// is silent in the worst direction: a site that sets pdp and forgets restorer compiles,
-// passes every test that does not exercise a declassify refusal, and then reports
-// declassify_orphaned — the key operators are told to page on — for every post-decision
-// refusal, while the labels really are gone. Deriving it here means a new dispatchParams
-// site inherits the undo by construction.
+// is silent: a site that sets pdp and forgets committer compiles, passes every test that
+// does not exercise a declassification, and then never clears a label — every sanitizing
+// step in the policy silently failing to take effect, with the session over-blocking from
+// then on. Deriving it here means a new dispatchParams site inherits the commit by
+// construction.
 func (d dispatchParams) withPDP(p pdp.PolicyDecisionPoint) dispatchParams {
 	d.pdp = p
-	d.restorer = p
+	d.committer = p
 	return d
 }
 
