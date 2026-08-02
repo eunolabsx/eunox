@@ -683,7 +683,9 @@ func dispatchList(ctx context.Context, d dispatchParams, msg mcp.RPCMsg, filter 
 	// denial target) all collapse to the method name here: a */list request
 	// addresses no sub-target, so the method IS the target. The repetition is
 	// intentional.
-	if denied, blocked := d.strictAuditDenial(ctx, msg, msg.Method, msg.Method, msg.Method); blocked {
+	// nil onBlocked: a */list is never an enforced decision, so it can carry no
+	// declassification for a gate block to undo.
+	if denied, blocked := d.strictAuditDenial(ctx, msg, msg.Method, msg.Method, msg.Method, nil); blocked {
 		return denied
 	}
 
@@ -695,7 +697,7 @@ func dispatchList(ctx context.Context, d dispatchParams, msg mcp.RPCMsg, filter 
 
 	upResp, err := d.callUpstream(ctx, msg)
 	if err != nil {
-		return d.recordUpstreamFailure(ctx, msg, err, msg.Method, msg.Method)
+		return d.recordUpstreamFailure(ctx, msg, err, msg.Method, msg.Method, nil)
 	}
 
 	// Defense-in-depth: a non-error response carrying no result is malformed, and

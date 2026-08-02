@@ -725,6 +725,7 @@ func (*staticPDP) CheckAudience(_ context.Context) *capability.EnforceResponse {
 
 func (*staticPDP) RecordObservedToolHashes(_ context.Context, _ json.RawMessage) int { return 0 }
 func (*staticPDP) ReleaseSession(_ context.Context, _ string)                        {}
+func (*staticPDP) RestoreDeclassified(_ context.Context, _ string, _ []string) error { return nil }
 
 func (*staticPDP) FilterToolsList(_ context.Context, result json.RawMessage) pdp.ListFilterResult {
 	return pdp.ListFilterResult{Result: result}

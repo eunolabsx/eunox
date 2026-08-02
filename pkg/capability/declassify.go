@@ -161,9 +161,11 @@ type DeclassifyApproval struct {
 	// accountable human is not human approval, and it is the value stamped on the tape
 	// (the `approver` audit field) that makes the record answerable later.
 	Approver string `json:"approver"`
-	// ID optionally carries the control plane's own record identifier for this approval,
-	// echoed into the audit record's details so a tape entry joins back to the approval
-	// workflow that produced it. Absent is fine; empty and absent are the same — EXCEPT
+	// ID optionally carries the control plane's own record identifier for this approval.
+	// It is stamped onto the audit record as the TOP-LEVEL, HMAC-signed `approval_id`
+	// field — beside labels_cleared and approver, never inside details — so a tape entry
+	// joins back to the approval workflow that produced it under the same integrity
+	// protection as the other two. Absent is fine; empty and absent are the same — EXCEPT
 	// under Once, where it is the ledger's key and therefore mandatory.
 	ID string `json:"id,omitempty"`
 	// Once marks the grant SINGLE-USE: the proxy burns it in the anchored declassify

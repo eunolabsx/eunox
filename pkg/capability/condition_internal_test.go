@@ -196,11 +196,12 @@ var goConditionTypes = []string{
 	ConditionTypeCustom,
 }
 
-// goDirectiveTypes lists every directive type discriminator registered in Go.
-// This must be kept in sync with directive.go.
-var goDirectiveTypes = []string{
-	DirectiveTypeRedactFields,
-}
+// goDirectiveTypes is every directive type discriminator registered in Go, read from
+// the registry rather than restated. It was a hand-written list, and it rotted exactly
+// as such a list does: it still named only redactFields after labelOutput and
+// declassify shipped, so the round-trip assertions below covered one third of the
+// vocabulary while reading as if they covered all of it.
+var goDirectiveTypes = knownDirectiveTypes
 
 // TestConditionTypeConstantsValid verifies that each Go condition type constant
 // is a non-empty camelCase string and matches the JSON round-trip discriminator.

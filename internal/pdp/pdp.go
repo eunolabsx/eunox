@@ -118,6 +118,26 @@ type PolicyDecisionPoint interface {
 	// call it with a detached, bounded context.
 	ReleaseSession(ctx context.Context, sessionID string)
 
+	// RestoreDeclassified puts back the flow labels an approved declassification cleared,
+	// for a call the TRANSPORT then refused and never forwarded. labels is the decision's
+	// LabelsCleared — what actually changed, not what was authorized.
+	//
+	// It is on this interface because the clear and the refusal sit on opposite sides of it.
+	// The clear commits inside Decide; the transport's own gates run afterwards, and three
+	// of them refuse without ever contacting the upstream (--require-audit=strict, an
+	// upstream transport failure, a redaction failure). Each leaves the sanitizing action
+	// unperformed while the taint it was authorized to clear is gone, so the next egress
+	// flowLabel would have blocked passes — a call that never ran has untainted the session.
+	//
+	// labelOutput commits before the forward too, and safely: extra taint over-blocks. This
+	// is the opposite direction, which is why it alone needs an undo reachable from here.
+	//
+	// It returns the fault rather than swallowing it: the caller is writing the refusal's
+	// audit record at that moment, and a label that could NOT be put back is a real
+	// fail-open residual the tape has to carry. A no-op for a PDP that never clears a label
+	// (AlwaysAllowPDP, DenyAllPDP) and for an empty label set.
+	RestoreDeclassified(ctx context.Context, sessionID string, labels []string) error
+
 	// HardenRefusal re-stamps a refusal that some OTHER layer produced with the verdicts
 	// THIS PDP would have contributed had it been consulted, and returns the composed
 	// refusal.
@@ -528,6 +548,12 @@ func (AlwaysAllowPDP) RecordObservedToolHashes(_ context.Context, result json.Ra
 // flow state to release.
 func (AlwaysAllowPDP) ReleaseSession(_ context.Context, _ string) {}
 
+// RestoreDeclassified is a no-op: a wiretap PDP never clears a flow label, so no decision
+// it returns can carry a LabelsCleared for the transport to undo.
+func (AlwaysAllowPDP) RestoreDeclassified(_ context.Context, _ string, _ []string) error {
+	return nil
+}
+
 // HardenRefusal returns the refusal unchanged: a wiretap PDP declares no pin, no ceiling
 // and no redaction, so it has nothing to compose onto another layer's verdict.
 func (AlwaysAllowPDP) HardenRefusal(_ context.Context, _ string, r capability.EnforceResponse, _ EnforceTarget, _ map[string]interface{}) capability.EnforceResponse {
@@ -628,6 +654,10 @@ func (DenyAllPDP) RecordObservedToolHashes(_ context.Context, result json.RawMes
 
 // ReleaseSession is a no-op: the fail-closed default holds no per-session flow state.
 func (DenyAllPDP) ReleaseSession(_ context.Context, _ string) {}
+
+// RestoreDeclassified is a no-op: the fail-closed default allows nothing, so no decision it
+// returns can have cleared a flow label.
+func (DenyAllPDP) RestoreDeclassified(_ context.Context, _ string, _ []string) error { return nil }
 
 // HardenRefusal returns the refusal unchanged: the "no policy" default declares no pin, no
 // ceiling and no redaction, so it has nothing to compose onto another layer's verdict.
@@ -995,6 +1025,26 @@ func (p *ManifestPDP) ReleaseSession(ctx context.Context, sessionID string) {
 		return
 	}
 	_ = p.engine.ClearSessionLabels(ctx, sessionID)
+}
+
+// RestoreDeclassified puts back the labels an approved declassification cleared, for a call
+// the transport refused after the decision committed the clear. See the interface for why
+// the undo has to be reachable from there at all.
+//
+// The claims come from the context so the request resolves to the SAME anchor the clear
+// used: under task anchoring the labels were removed from the task's key, and restoring
+// them under the session's would both leave the task untainted and strand a duplicate.
+// Every other field of the request is irrelevant here — RestoreDeclassifiedLabels is a
+// keyed Add and evaluates no policy — so this deliberately does not rebuild the decision's
+// target or arguments.
+func (p *ManifestPDP) RestoreDeclassified(ctx context.Context, sessionID string, labels []string) error {
+	if p.engine == nil || len(labels) == 0 {
+		return nil
+	}
+	return p.engine.RestoreDeclassifiedLabels(ctx, &capability.EnforceRequest{
+		SessionID: sessionID,
+		Claims:    jwtClaimsAsMap(ctx),
+	}, labels)
 }
 
 // Decide evaluates a tools/call against the manifest: it selects the
@@ -1790,7 +1840,7 @@ func (p *ManifestPDP) HardenRefusal(ctx context.Context, sessionID string, r cap
 	if hardened, over := p.hardenOnEffectCeiling(ctx, sessionID, r, target, args); over {
 		return hardened
 	}
-	if hardened, unapproved := p.hardenOnUnapprovedDeclassify(ctx, r, target); unapproved {
+	if hardened, unapproved := p.hardenOnUnapprovedDeclassify(ctx, sessionID, r, target, args); unapproved {
 		return hardened
 	}
 	return p.withForwardObligations(ctx, r, target)
@@ -1811,12 +1861,23 @@ func (p *ManifestPDP) HardenRefusal(ctx context.Context, sessionID string, r cap
 //
 // Like the ceiling's, it COMMITS nothing — but unlike the ceiling's it is not a pure
 // comparison either: answering "would this have been authorized" requires knowing whether a
-// single-use grant is still live, which is a ledger read (UsableDeclassifyApproval). The read
-// records nothing, so a call refused here still leaves no spent approval behind; what it costs
-// is one Peek per covering grant on a path that only runs for an already-refused call.
+// single-use grant is still live, which is a ledger read. The read records nothing, so a
+// call refused here still leaves no spent approval behind; what it costs is one Peek per
+// covering grant on a path that only runs for an already-refused call.
 // It runs AFTER the ceiling so a call that is over the consequence bound reports that, the
 // same precedence the full path applies.
-func (p *ManifestPDP) hardenOnUnapprovedDeclassify(ctx context.Context, r capability.EnforceResponse, target EnforceTarget) (capability.EnforceResponse, bool) {
+//
+// It answers the question through the engine's non-committing DeclassifyVerdictFor rather
+// than deriving one here, exactly as the ceiling's sibling delegates to CeilingVerdictFor,
+// and the reason is that a hand-rolled answer HAD diverged twice. It resolved the approval
+// target itself (`string(target.Type) + ":" + target.Name`), which does not trim a padded
+// name — one of the three divergences canonicalApprovalTarget's doc records as already
+// paid for, each of which turned a correctly-scoped grant into a permanent, unsatisfiable
+// escalation. And it built its own DenialInfo without CarriedLabels, so the same logical
+// refusal had two record shapes depending on whether a JWT layer wrapped the call, with the
+// JWT-wrapped one missing the field an approver needs first ("what is this session already
+// carrying"). One resolver, one refusal builder, one record shape.
+func (p *ManifestPDP) hardenOnUnapprovedDeclassify(ctx context.Context, sessionID string, r capability.EnforceResponse, target EnforceTarget, args map[string]interface{}) (capability.EnforceResponse, bool) {
 	if r.Decision == capability.DecisionAllow || r.Denial == nil || r.Denial.HardDeny {
 		return r, false
 	}
@@ -1825,57 +1886,52 @@ func (p *ManifestPDP) hardenOnUnapprovedDeclassify(ctx context.Context, r capabi
 	if p.engine == nil {
 		return r, false
 	}
-	matched := p.findConstraint(target, jwtClaimsAsMap(ctx))
+	claims := jwtClaimsAsMap(ctx)
+	matched := p.findConstraint(target, claims)
 	if matched == nil || !containsAction(matched.Actions, requiredActionFor(target.Type)) {
 		return r, false
 	}
-	want := capability.DeclassifyLabelsOf(matched)
-	if len(want) == 0 {
+	// The same request shape hardenOnEffectCeiling builds, plus the approvals — the verdict
+	// turns on them, and the engine reads them off the request rather than the context.
+	// Target is populated per-field so the ONE resolver behind canonicalApprovalTarget sees
+	// exactly what FindMatchingCapability would have.
+	req := &capability.EnforceRequest{
+		SessionID:  sessionID,
+		TargetName: target.Name,
+		Arguments:  jwtConditionArgs(target, args),
+		Target: &capability.EnforceRequestTarget{
+			Type: string(target.Type),
+			Name: target.Name,
+		},
+		Claims:              claims,
+		DeclassifyApprovals: declassifyApprovalsFromContext(ctx),
+		DeclaredLabels:      declaredLabelsFromContext(ctx),
+	}
+	// nil means the declassification would have been authorized — a live covering approval,
+	// or nothing to clear at all — so the outer layer's verdict stands as it was. Every
+	// refusal arm is the engine's own, including the hard `ledger_unavailable` one: a fault
+	// that left a downgradable verdict in place made an unreachable ledger the way to run,
+	// on an --audit route, a declassification the same manifest blocks without a token.
+	verdict := p.engine.DeclassifyVerdictFor(ctx, req, matched)
+	if verdict == nil {
 		return r, false
 	}
-	canonical := string(target.Type) + ":" + target.Name
-	// USABLE, not merely covering. The scope-only test would treat a single-use grant this
-	// anchor has already burned as authorization, leaving the wrapping layer's SOFT deny
-	// intact — which an --audit route then downgrades and forwards. Without the JWT the same
-	// call meets checkDeclassify's hard, non-downgradable `approval_consumed` escalation, so
-	// the scope-only test here would mean adding a token makes the proxy allow more, which is
-	// precisely the inversion this function exists to close.
-	usable, err := p.engine.UsableDeclassifyApproval(ctx, declassifyApprovalsFromContext(ctx), canonical, want)
-	if usable && err == nil {
-		// A live covering approval: the declassification would have been authorized, so the
-		// outer layer's verdict stands as it was.
-		return r, false
+	out := *verdict
+	if out.Denial != nil && r.Denial.Message != "" {
+		denial := *out.Denial
+		denial.Message = denial.Message +
+			" (this call was also refused by the wrapping authorization layer: " + r.Denial.Message + ")"
+		out.Denial = &denial
 	}
-	// A ledger fault takes the SAME hard escalation an absent approval does, matching what
-	// checkDeclassify does with the identical fault on the unwrapped path (its
-	// `ledger_unavailable` arm). Letting the fault leave a downgradable verdict in place was
-	// the inversion this function exists to close, arrived at from the other direction: on an
-	// --audit route the wrapping layer's refusal is FORWARDED, so an unreachable ledger became
-	// the way to run a declassification the same manifest blocks without a token. "A backend
-	// hiccup should not turn an observe route into a blocking one" is a real cost, but it is
-	// the cost the engine already pays here, and the two paths must not answer one fault two
-	// ways.
-	reason, message := "no_approval", fmt.Sprintf(
-		"clearing flow label(s) %v at %s requires a human approval covering all of them; the request carries none (this call was also refused by the wrapping authorization layer: %s)",
-		want, canonical, r.Denial.Message)
-	if err != nil {
-		reason, message = "ledger_unavailable", fmt.Sprintf(
-			"single-use declassify approval state could not be read: %v (this call was also refused by the wrapping authorization layer: %s)",
-			err, r.Denial.Message)
-	}
-	denial := capability.DenialInfo{
-		Code:          capability.ErrCodeEscalationRequired,
-		ConditionType: capability.DirectiveTypeDeclassify,
-		Message:       message,
-		HardDeny:      true,
-		Details:       map[string]interface{}{"flow": true, "declassify_labels": want, "reason": reason},
-	}
-	return capability.EnforceResponse{
-		RequestID: r.RequestID,
-		Decision:  capability.DecisionEscalate,
-		DecidedAt: r.DecidedAt,
-		Denial:    &denial,
-	}, true
+	// The composed refusal must never be SOFTER than the one it replaces. Every declassify
+	// refusal is built hard (escalateResponse leaves AuditOnly false for the same reason the
+	// ceiling's escalation does), so this AND is a backstop rather than a live correction —
+	// kept because the cost of it being wrong is a forwarded, executed declassification.
+	out.AuditOnly = out.AuditOnly && r.AuditOnly
+	// Never forwarded, so there is no response to redact and obligations would be a claim
+	// that a redaction ran.
+	out.Obligations = nil
+	return out, true
 }
 
 // directivesNamingTarget collects the directives of every capability whose target type +
@@ -3609,9 +3665,22 @@ func jwtClaimsAsMap(ctx context.Context) map[string]interface{} {
 	if !ok {
 		return nil
 	}
+	return c.flatMap()
+}
+
+// flatMap is jwtClaimsAsMap for a caller that already holds the *JWTClaims — the JWT
+// PDP's own decision path, which reads the claims off its validated token rather than
+// back out of the context. Same memoized map, same read-only contract; nil-safe so a
+// caller need not branch.
+func (c *JWTClaims) flatMap() map[string]interface{} {
+	if c == nil {
+		return nil
+	}
 	if c.flatClaims != nil {
 		return c.flatClaims
 	}
+	// A JWTClaims built without ValidateToken (e.g. tests) has no memoized map. Never
+	// stored — the *JWTClaims may be shared across a session's requests.
 	return buildFlatClaims(c)
 }
 

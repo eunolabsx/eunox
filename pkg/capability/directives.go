@@ -6,6 +6,8 @@ package capability
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strings"
 )
 
 type directiveEnvelope struct {
@@ -105,7 +107,10 @@ func unmarshalDirective(data []byte) (Directive, error) {
 	}
 	target := newDirective(envelope.Type)
 	if target == nil {
-		return nil, fmt.Errorf("unknown directive type %q — valid types are: redactFields, labelOutput, declassify", envelope.Type)
+		// The valid set is enumerated FROM the registry, not spelled out here: a literal
+		// list is a third mirror to keep in step, and one whose drift is invisible (an
+		// author reading a stale "valid types are" line has no way to tell it is stale).
+		return nil, fmt.Errorf("unknown directive type %q — valid types are: %s", envelope.Type, strings.Join(knownDirectiveTypes, ", "))
 	}
 	// Reject unknown fields, by the same rule and for the same reason as
 	// unmarshalCondition (see jsonFieldNames): a lenient decode silently drops a
@@ -123,6 +128,40 @@ func unmarshalDirective(data []byte) (Directive, error) {
 	return target, nil
 }
 
+// directivePrototypes is THE registry of directive discriminators this build models,
+// the directive twin of conditionPrototypes: the decoder instantiates from it
+// (newDirective), the closed vocabulary is derived from it (knownDirectiveTypes), and
+// the manifest loader's per-type permitted-key sets are reflected off its prototypes
+// (NewDirectivePrototype) — so adding a directive type means adding it HERE, not in
+// three hand-maintained tables that drift one entry at a time.
+//
+// It replaces a switch plus two literals that had already drifted apart. The one that
+// mattered is KnownDirectiveTypes: the published schema's drift guard derives its
+// expectation from it and compares only COUNTS, so a fourth directive added to the
+// switch and forgotten in the literal left `want` and `branches` both at three and
+// shipped a token with no schema branch — the exact outcome the guard exists to
+// prevent.
+var directivePrototypes = map[string]func() Directive{
+	DirectiveTypeRedactFields: func() Directive { return &RedactFieldsDirective{} },
+	DirectiveTypeLabelOutput:  func() Directive { return &LabelOutputDirective{} },
+	DirectiveTypeDeclassify:   func() Directive { return &DeclassifyDirective{} },
+}
+
+// knownDirectiveTypes is every discriminator in the registry, sorted so the
+// unknown-type error enumerates them deterministically (a map's iteration order would
+// not).
+var knownDirectiveTypes = sortedDirectiveTypes()
+
+// sortedDirectiveTypes returns the registry's discriminators in lexical order.
+func sortedDirectiveTypes() []string {
+	out := make([]string, 0, len(directivePrototypes))
+	for t := range directivePrototypes {
+		out = append(out, t)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // NewDirectivePrototype returns a fresh zero-valued directive of the given type, or
 // (nil, false) for a type this build does not model. It is the directive analogue of
 // NewConditionPrototype, exported for the same reason: the manifest loader's
@@ -130,27 +169,30 @@ func unmarshalDirective(data []byte) (Directive, error) {
 // registry rather than mirroring it. A hand-written mirror there fails OPEN — an
 // unlisted type makes the caller skip the unknown-key check entirely, so a misspelled
 // field loads as an empty value instead of erroring.
+//
+// The prototype is freshly constructed per call, so a caller cannot mutate the
+// registry's idea of a type.
 func NewDirectivePrototype(directiveType string) (Directive, bool) {
-	d := newDirective(directiveType)
-	return d, d != nil
-}
-
-// KnownDirectiveTypes returns the registry's directive discriminators in lexical order —
-// the closed directive vocabulary, read from the registry rather than a mirrored list.
-// A fresh slice each call.
-func KnownDirectiveTypes() []string {
-	return []string{DirectiveTypeDeclassify, DirectiveTypeLabelOutput, DirectiveTypeRedactFields}
-}
-
-func newDirective(directiveType string) Directive {
-	switch directiveType {
-	case DirectiveTypeRedactFields:
-		return &RedactFieldsDirective{}
-	case DirectiveTypeLabelOutput:
-		return &LabelOutputDirective{}
-	case DirectiveTypeDeclassify:
-		return &DeclassifyDirective{}
-	default:
-		return nil
+	proto, ok := directivePrototypes[directiveType]
+	if !ok {
+		return nil, false
 	}
+	return proto(), true
+}
+
+// KnownDirectiveTypes returns a fresh copy of the registry's directive discriminators in
+// lexical order — the closed directive vocabulary, read from the ONE registry rather
+// than a mirrored list. A fresh slice each call, so a caller cannot mutate the package's
+// accepted set.
+func KnownDirectiveTypes() []string {
+	return append([]string(nil), knownDirectiveTypes...)
+}
+
+// newDirective returns a zero value of the directive type named by directiveType, or nil
+// for a discriminator this build does not model. It is the in-package spelling of
+// NewDirectivePrototype — same registry, nil rather than a second (Directive, bool)
+// return, because the decoder's next step handles nil anyway.
+func newDirective(directiveType string) Directive {
+	proto, _ := NewDirectivePrototype(directiveType)
+	return proto
 }

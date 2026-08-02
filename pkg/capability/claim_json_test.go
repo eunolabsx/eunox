@@ -83,6 +83,28 @@ func TestClaimDecode_RefusesDuplicateKeys(t *testing.T) {
 			`[{"labels":["pii"],"target":"tool:publish","approver":"ops@example.com","once":true,"id":"a1","Once":false}]`,
 			func(r json.RawMessage) error { _, err := capability.ParseDeclassifyApprovals(r); return err },
 		},
+		// The three members that decide WHAT a human approved. A repeated "target" is the
+		// sharpest: both decodes see only known keys, Go keeps the last, and every
+		// first-wins reader of the same signed bytes — the control-plane record a human
+		// reviewed, a SIEM, jq — reads the other one. That is a confused deputy on the one
+		// claim that removes a flow label, with `approver` stamped on the signed tape
+		// against the action they did not approve.
+		"declassify duplicate target": {
+			`[{"labels":["pii"],"target":"tool:read_note","target":"tool:wire_transfer","approver":"alice"}]`,
+			func(r json.RawMessage) error { _, err := capability.ParseDeclassifyApprovals(r); return err },
+		},
+		"declassify duplicate labels": {
+			`[{"labels":["pii"],"labels":["pii","secret"],"target":"tool:publish","approver":"alice"}]`,
+			func(r json.RawMessage) error { _, err := capability.ParseDeclassifyApprovals(r); return err },
+		},
+		"declassify duplicate approver": {
+			`[{"labels":["pii"],"target":"tool:publish","approver":"alice","approver":"bob"}]`,
+			func(r json.RawMessage) error { _, err := capability.ParseDeclassifyApprovals(r); return err },
+		},
+		"declassify id case variant": {
+			`[{"labels":["pii"],"target":"tool:publish","approver":"alice","once":true,"id":"apr-1","ID":"apr-2"}]`,
+			func(r json.RawMessage) error { _, err := capability.ParseDeclassifyApprovals(r); return err },
+		},
 		"actor case variant": {
 			`{"sub":"inner","Sub":"outer"}`,
 			func(r json.RawMessage) error { _, err := capability.ParseActorChain(r); return err },

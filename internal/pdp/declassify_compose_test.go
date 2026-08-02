@@ -173,3 +173,93 @@ func TestDeclassify_ComposedRefusalHardensOnAnUnreadableLedger(t *testing.T) {
 		t.Fatalf("reason = %v, want ledger_unavailable so the tape names the fault rather than a missing approval", got)
 	}
 }
+
+// TestDeclassify_ComposedRefusalUsesTheCanonicalTarget is the padded-name divergence. The
+// composed path derived the approval target itself as `type + ":" + name`, which does not
+// trim — while the engine resolves it through resolveRequestTarget, which does. A request
+// whose target name carried surrounding whitespace therefore resolved to "tool:sanitize "
+// here and "tool:sanitize" there, and an approval (already trimmed at the token boundary)
+// could never match it: a permanent ESCALATION_REQUIRED on a grant the operator scoped
+// correctly, with nothing they could change to satisfy it.
+//
+// It fails closed, which is why it is a usability defect rather than a widening — but an
+// unsatisfiable escalation is exactly the failure the centralized resolver exists to prevent.
+//
+// The constraint is a WILDCARD on purpose: an exactly-named entry does not match a padded
+// name in findConstraint at all, so the request never reaches the approval check and the
+// divergence is unobservable. A "tool:*" entry does match, which is how a padded name a host
+// sends in tools/call params reaches the target resolver in the first place.
+func TestDeclassify_ComposedRefusalUsesTheCanonicalTarget(t *testing.T) {
+	p := declassifyPDP(t, []capability.Constraint{{
+		Target:     "tool:*",
+		Actions:    []string{"call"},
+		Directives: []capability.Directive{capability.DeclassifyDirective{Labels: []string{capability.FlowLabelPII}}},
+	}})
+	ctx := WithJWTClaims(context.Background(), &JWTClaims{
+		Subject: "svc",
+		Declassify: []capability.DeclassifyApproval{{
+			Labels: []string{capability.FlowLabelPII}, Target: "tool:sanitize", Approver: "alice",
+		}},
+	})
+	soft := capability.EnforceResponse{
+		Decision: capability.DecisionDeny,
+		Denial: &capability.DenialInfo{
+			Code:    capability.ErrCodeAuthorizationFailed,
+			Message: "tool \"sanitize\" is not in the JWT capability claims",
+		},
+	}
+
+	hardened := p.HardenRefusal(ctx, "s", soft,
+		EnforceTarget{Type: capability.TargetTypeTool, Name: "  sanitize  "}, map[string]interface{}{})
+	if hardened.Decision == capability.DecisionEscalate {
+		t.Fatalf("a padded target name must resolve to the canonical target the approval names, "+
+			"not to an escalation no approval can satisfy: %+v", hardened.Denial)
+	}
+}
+
+// TestDeclassify_ComposedRefusalCarriesTheSessionsLabels pins the record shape. The engine's
+// own refusal sets both details.carried_labels and the top-level CarriedLabels, because "what
+// is this session already carrying" is the first thing an approver needs in order to decide
+// whether the declassification should be approved at all. The composed refusal built its own
+// DenialInfo and set neither, so the same logical refusal landed on the tape two different
+// ways depending on whether a JWT layer wrapped the call — and the wrapped one dropped the
+// field the approver acts on.
+func TestDeclassify_ComposedRefusalCarriesTheSessionsLabels(t *testing.T) {
+	p := declassifyPDP(t, []capability.Constraint{
+		{
+			Target:     "tool:read_customer",
+			Actions:    []string{"call"},
+			Directives: []capability.Directive{capability.LabelOutputDirective{Labels: []string{capability.FlowLabelPII}}},
+		},
+		{
+			Target:     "tool:sanitize",
+			Actions:    []string{"call"},
+			Directives: []capability.Directive{capability.DeclassifyDirective{Labels: []string{capability.FlowLabelPII}}},
+		},
+	})
+	ctx := context.Background()
+	if got := p.Decide(ctx, "s", EnforceTarget{Type: capability.TargetTypeTool, Name: "read_customer"},
+		map[string]interface{}{}, ""); got.Decision != capability.DecisionAllow {
+		t.Fatalf("source read = %v, want allow", got.Decision)
+	}
+
+	soft := capability.EnforceResponse{
+		Decision: capability.DecisionDeny,
+		Denial: &capability.DenialInfo{
+			Code:    capability.ErrCodeAuthorizationFailed,
+			Message: "tool \"sanitize\" is not in the JWT capability claims",
+		},
+	}
+	hardened := p.HardenRefusal(ctx, "s", soft,
+		EnforceTarget{Type: capability.TargetTypeTool, Name: "sanitize"}, map[string]interface{}{})
+	if hardened.Decision != capability.DecisionEscalate || hardened.Denial == nil {
+		t.Fatalf("decision = %v, want escalate (%+v)", hardened.Decision, hardened.Denial)
+	}
+	if len(hardened.CarriedLabels) != 1 || hardened.CarriedLabels[0] != capability.FlowLabelPII {
+		t.Fatalf("carried_labels = %v, want [pii] — the approver reads this to decide", hardened.CarriedLabels)
+	}
+	got, ok := hardened.Denial.Details["carried_labels"].([]string)
+	if !ok || len(got) != 1 || got[0] != capability.FlowLabelPII {
+		t.Fatalf("details.carried_labels = %v, want [pii]; the composed record must match the documented shape", hardened.Denial.Details["carried_labels"])
+	}
+}

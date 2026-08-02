@@ -214,6 +214,64 @@ func (s *removeFailingStore) Remove(ctx context.Context, key string, labels ...s
 	return s.FlowLabelStore.Remove(ctx, key, labels...)
 }
 
+// TestDeclassify_ClearFaultRestoresTheTaint is the fail-OPEN half of the clear-fault
+// path, which the hard-deny above does not cover on its own. "Remove errored" is not
+// "Remove changed nothing": a store can delete and then lose its reply (a timeout, a
+// reset), or remove part of a multi-label set before erroring. The call is hard-denied
+// and never forwarded, so a label left cleared here has untainted the session for an
+// action that did not happen — and the next egress flowLabel would have blocked passes.
+//
+// This is the one direction the flow layer calls out as able to fail open, which is why
+// the restore runs at all and why it runs BEFORE the add rollback.
+func TestDeclassify_ClearFaultRestoresTheTaint(t *testing.T) {
+	store := &deleteThenFailStore{FlowLabelStore: flowlabelstore.NewInMemory()}
+	eng := enforcement.New(
+		enforcement.WithCallCounter(callcounter.NewInMemory()),
+		enforcement.WithFlowLabelStore(store),
+	)
+	ctx := context.Background()
+
+	require.Equal(t, capability.DecisionAllow,
+		eng.ValidateAction(ctx, req("s", "read"), sourceCaps("read", capability.FlowLabelPII)).Decision)
+	require.Equal(t, capability.DecisionDeny,
+		eng.ValidateAction(ctx, req("s", "publish"), sinkCaps("publish", capability.FlowLabelPublic)).Decision,
+		"precondition: the sink denies while the session carries pii")
+
+	store.fail = true
+	resp := eng.ValidateAction(ctx,
+		approvedReq("s", "sanitize", "a@b", capability.FlowLabelPII),
+		declassifyCaps("sanitize", capability.FlowLabelPII))
+	require.Equal(t, capability.DecisionDeny, resp.Decision)
+	require.NotNil(t, resp.Denial)
+	require.True(t, resp.Denial.HardDeny, "the sanitizing call never ran")
+	assert.Empty(t, resp.LabelsCleared, "a faulted clear reports nothing cleared")
+
+	// The whole point: sanitize did not run, so the taint it would have cleared must
+	// still be there. Before the restore, this call was allowed.
+	after := eng.ValidateAction(ctx, req("s", "publish"), sinkCaps("publish", capability.FlowLabelPublic))
+	assert.Equal(t, capability.DecisionDeny, after.Decision,
+		"a call that never ran must not have permanently untainted the session")
+}
+
+// deleteThenFailStore performs the Remove and THEN reports an error, which is what a lost
+// reply looks like to the caller (and what a partial multi-label removal looks like at
+// its own layer). A store double that errors WITHOUT deleting cannot exercise the
+// fail-open direction at all, which is how the missing restore went unnoticed.
+type deleteThenFailStore struct {
+	capability.FlowLabelStore
+	fail bool
+}
+
+func (s *deleteThenFailStore) Remove(ctx context.Context, key string, labels ...string) error {
+	if err := s.FlowLabelStore.Remove(ctx, key, labels...); err != nil {
+		return err
+	}
+	if s.fail {
+		return errors.New("backend reply lost after the delete committed")
+	}
+	return nil
+}
+
 // TestDeclassify_CarriesNoResponseObligation pins that declassify, like labelOutput, is an
 // enforce-time state directive: it emits no post-allow obligation, so nothing tries to
 // apply it to the response and the unknown-obligation guard never fires.

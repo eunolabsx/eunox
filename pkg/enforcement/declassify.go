@@ -6,6 +6,7 @@ package enforcement
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/eunolabs/eunox/pkg/capability"
 )
@@ -105,29 +106,19 @@ func (e *Engine) approvalSpent(ctx context.Context, ledgerID string) (bool, erro
 	return n > 0, nil
 }
 
-// UsableDeclassifyApproval reports whether any of the presented approvals both COVERS
-// (labels + target) and is still LIVE (not a burned single-use grant) — the same two-part
-// test checkDeclassify applies when it selects one.
+// There is deliberately no exported "is there a usable approval for this?" predicate.
 //
-// It is exported for the wrapping-PDP hardening path, which has to answer "would the
-// declassification have been authorized?" without running a decision. That path used the
-// scope-only test, so a burned grant read as authorization and left a wrapping layer's SOFT
-// refusal intact for an --audit route to downgrade and forward — while the same call without
-// the wrapper met the hard `approval_consumed` escalation. Adding a token must never make the
-// proxy allow more, so the two paths ask the same question here.
-func (e *Engine) UsableDeclassifyApproval(ctx context.Context, approvals []capability.DeclassifyApproval, target string, want []string) (bool, error) {
-	// Exported, so a caller can reach it with no engine configured. Report the fault rather
-	// than dereferencing: every caller treats an error as "cannot tell live from spent" and
-	// fails closed, which is the right reading of "there is no ledger here".
-	if e == nil {
-		return false, fmt.Errorf("no enforcement engine configured, so a single-use declassify approval cannot be checked")
-	}
-	sel, err := e.selectLiveApproval(ctx, approvals, target, want)
-	if err != nil {
-		return false, err
-	}
-	return sel.approval != nil, nil
-}
+// One existed (UsableDeclassifyApproval), for the wrapping-PDP hardening path, and answering
+// only THAT question is what left the rest of the answer to be hand-rolled at the call site —
+// which is where the caller re-derived the canonical approval target without trimming a padded
+// name, and built its own refusal without CarriedLabels. Scoping a seam to the boolean and
+// leaving the target resolution and the record shape to the caller reproduces, one layer up,
+// exactly the divergence canonicalApprovalTarget was centralized to prevent.
+//
+// DeclassifyVerdictFor is the seam instead: it answers the whole question — resolve the target,
+// select a live grant, and build the refusal — through the same checkDeclassify the decision
+// path runs, so the composed verdict cannot be looser than, or shaped differently from, the
+// unwrapped one. A caller that needs only the boolean can test its result for nil.
 
 // approvalSelection is what one walk of the covering grants found: the first still-live grant
 // (nil when every covering grant is spent, or none covers), its ledger member, and how many
@@ -141,12 +132,12 @@ type approvalSelection struct {
 	consumed int
 }
 
-// selectLiveApproval is the ONE walk over the covering grants, shared by the decision path
-// (checkDeclassify, which needs the selected grant to stamp and burn) and by the wrapping-PDP
-// hardening path (UsableDeclassifyApproval, which needs only whether one exists). The two must
-// agree — a hardening check looser than the decision means adding a token makes the proxy allow
-// more — and a second copy of "walk, peek, take the first live one" is exactly where that
-// divergence had already happened once.
+// selectLiveApproval is the ONE walk over the covering grants. checkDeclassify is its only
+// caller now, and so — through checkDeclassify — is the wrapping-PDP hardening path, which
+// reaches it via DeclassifyVerdictFor rather than through a predicate of its own. A hardening
+// check looser than the decision means adding a token makes the proxy allow more, and a second
+// copy of "walk, peek, take the first live one" is exactly where that divergence had already
+// happened once.
 //
 // It walks rather than taking the first covering grant, because scope is not the whole test: a
 // single-use grant already burned covers the call on paper and must be passed over in favour of
@@ -231,9 +222,9 @@ func (e *Engine) checkDeclassify(ctx context.Context, req *capability.EnforceReq
 			"the request carries no resolvable target, so no approval can be scoped to it", "no_target")
 	}
 
-	// The first still-live grant among those whose scope covers this call, through the walk
-	// UsableDeclassifyApproval shares — so the hardening path cannot answer this question more
-	// loosely than the decision does.
+	// The first still-live grant among those whose scope covers this call. The wrapping-PDP
+	// hardening path reaches this same walk through DeclassifyVerdictFor, so it cannot answer
+	// the question more loosely than the decision does.
 	sel, err := e.selectLiveApproval(ctx, req.DeclassifyApprovals, target, want)
 	if err != nil {
 		// The ledger is unreadable, so "already used" cannot be distinguished from "never
@@ -278,6 +269,68 @@ func (e *Engine) checkDeclassify(ctx context.Context, req *capability.EnforceReq
 		ApprovalID: approval.ID,
 		LedgerID:   ledgerID,
 	}, nil
+}
+
+// DeclassifyVerdictFor answers ONE question — "would this constraint's declassification
+// have been authorized?" — for a constraint that has already been selected, WITHOUT
+// evaluating a single condition and WITHOUT committing any state. It returns the refusal
+// checkDeclassify would produce (an ESCALATION_REQUIRED escalate), or nil when the
+// constraint clears nothing, the engine holds no flow state, or the request carries a live
+// covering approval.
+//
+// It is the declassify twin of CeilingVerdictFor and exists for the same COMPOSED case: a
+// PDP wrapping this engine's PDP — the JWT layer — can refuse a call on its own terms and
+// short-circuit above the inner PDP, so evaluateMatched never runs and checkDeclassify
+// never fires. The call is still refused, but that refusal is a SOFT deny an --audit route
+// downgrades to a FORWARD, which would perform the action AND leave the taint the policy
+// says the action clears. Adding a token must never make the proxy allow more.
+//
+// What makes this a SEAM rather than a convenience is that the wrapping path used to
+// answer the question itself, and a hand-rolled answer diverges. It resolved the approval
+// target as `string(target.Type) + ":" + target.Name` — reintroducing one of the three
+// divergences canonicalApprovalTarget's doc records as already paid for, so a request
+// whose target name carried surrounding whitespace resolved to a target no
+// already-trimmed grant could ever match, and a correctly-scoped approval became a
+// permanent, unsatisfiable escalation. It also built its own DenialInfo and omitted
+// CarriedLabels, so the same logical refusal had two record shapes depending on whether a
+// JWT layer wrapped the call — and the JWT-wrapped one dropped the field an approver acts
+// on first. Routing through checkDeclassify gives one canonical-target resolver, one
+// refusal builder, and one record shape, and means a future change to checkDeclassify
+// needs no hand-mirroring.
+//
+// Non-committing is a property of checkDeclassify itself, not something reproduced here:
+// it runs before any commit precisely so an unapproved declassification spends no quota
+// slot, writes no antecedent, and changes no label. Its only backend touch is the ledger
+// PEEK behind selectLiveApproval, which records nothing.
+//
+// Like CeilingVerdictFor, the caller may use this ONLY to HARDEN a refusal — never to
+// produce an allow, and never on a path that would otherwise forward. When a condition
+// would have denied first, the full path reports that condition and never reaches the
+// declassify check, while this reports the declassification; the call is refused either
+// way, so the difference is a harder refusal rather than a wrong one.
+//
+// The flow-label peek is a pure Get and its failure is swallowed, matching
+// CeilingVerdictFor: this is asked about a call that is ALREADY refused, so a label-store
+// fault must not weaken (or replace) the refusal being hardened. The peeked set is only
+// evidence on the record; the authorization test itself does not read it.
+func (e *Engine) DeclassifyVerdictFor(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint) *capability.EnforceResponse {
+	if req == nil || matched == nil || e.skipFlow {
+		return nil
+	}
+	if len(capability.DeclassifyLabelsOf(matched)) == 0 {
+		return nil
+	}
+	requestID := NewRequestID()
+	now := e.clock.Now().UTC().Format(time.RFC3339Nano)
+
+	var carriedLabels []string
+	if labels, err := e.peekSessionLabels(ctx, req); err == nil {
+		carriedLabels = labels
+	}
+	// The outcome is discarded on purpose: it describes what a COMMIT would apply, and
+	// this path commits nothing. Only the refusal is the answer.
+	_, refusal := e.checkDeclassify(ctx, req, matched, carriedLabels, requestID, now)
+	return refusal
 }
 
 // declassifyRefusal builds the ESCALATION_REQUIRED refusal that replaces the allow for an
@@ -356,6 +409,18 @@ func canonicalApprovalTarget(req *capability.EnforceRequest) string {
 // with what the session was carrying — so the audit record reports what CHANGED rather
 // than what was authorized.
 //
+// On a store FAULT it returns that same set ALONGSIDE the error, and that pairing is
+// load-bearing rather than tidy. A Remove can reach the store, delete, and then lose its
+// reply (a timeout, a reset), or a store implementation can remove part of a multi-label
+// set before erroring — so "errored" does not mean "changed nothing". Discarding the set
+// here left the caller's clear-fault arm with nothing to hand restoreLabels, on the one
+// directive the flow layer describes as the only one that can fail OPEN: the call
+// hard-denies and is never forwarded, while the labels it would have cleared stay gone,
+// and the next egress flowLabel would have blocked now passes. The caller treats a
+// non-empty set beside an error as "these MAY have been removed" and re-adds them
+// best-effort; a re-add that itself fails strands a label, which over-blocks and is the
+// safe residual.
+//
 // Reporting the intersection is deliberate. An approval to clear `pii` on a session that
 // never carried it is not an error (the action is permitted and the end state is the one
 // the policy asked for), but recording labels_cleared: ["pii"] would put a declassification
@@ -398,7 +463,9 @@ func (e *Engine) clearLabels(ctx context.Context, req *capability.EnforceRequest
 		return nil, nil
 	}
 	if err := e.flowStore.Remove(ctx, e.flowKey(req), removed...); err != nil {
-		return nil, err
+		// removed, not nil: the Remove may well have taken effect before the error
+		// surfaced, and the caller cannot restore a set it was never told about.
+		return removed, err
 	}
 	return removed, nil
 }

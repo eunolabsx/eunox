@@ -305,7 +305,24 @@ type forwardParams struct {
 	sessionID      string
 	upstreamTimeMs int
 	callUpstream   func(context.Context, mcp.RPCMsg) (mcp.RPCMsg, error)
+	// restorer undoes an approved declassification's label clear when this transport
+	// refuses the call AFTER the decision committed it. nil in a params built with no PDP
+	// (the session-creating initialize gate, tests), where no decision is in hand and so
+	// none can carry LabelsCleared. See declassifyRestorer.
+	restorer declassifyRestorer
 	strictAuditState
+}
+
+// declassifyRestorer is the one method the forward core needs from the PDP: put back the
+// flow labels an approved declassification cleared, for a call that was decided and then
+// refused here. *pdp.JWTPDP, *pdp.ManifestPDP and every other PolicyDecisionPoint satisfy
+// it, so a dispatchParams assigns its own pdp and the core stays ignorant of which one.
+//
+// It is a narrow interface rather than a pdp.PolicyDecisionPoint field because that is all
+// this path may do: the decision has already been made, and nothing below it is allowed to
+// re-decide.
+type declassifyRestorer interface {
+	RestoreDeclassified(ctx context.Context, sessionID string, labels []string) error
 }
 
 // strictAuditState is the --require-audit=strict configuration shared by the
@@ -400,17 +417,94 @@ func warnIfStrictAuditJustDegraded(strict bool, rec auditRecorder, kind, target 
 // and silently drift the other. dispatchList passes the method as both auditID and
 // method (a */list request has no sub-target); the forward core passes the per-target
 // audit id.
-func (fp forwardParams) recordUpstreamFailure(ctx context.Context, msg mcp.RPCMsg, err error, auditID, method string) mcp.RPCMsg {
+func (fp forwardParams) recordUpstreamFailure(ctx context.Context, msg mcp.RPCMsg, err error, auditID, method string, detail map[string]interface{}) mcp.RPCMsg {
 	code, reason, rpcCode := upstreamErrInfo(err, fp.upstreamTimeMs)
 	// This deny records a call already forwarded to (and answered, however badly, by)
 	// the upstream — the same boundary-call shape warnIfStrictAuditJustDegraded exists
 	// for, so it gets the same immediate diagnostic under strict mode.
 	warnIfStrictAuditJustDegraded(fp.requireAuditStrict, fp.rec, method, auditID, func() {
 		if fp.rec != nil {
-			fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, code, "", nil, false)
+			fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, code, "", detail, false)
 		}
 	})
 	return mcp.ErrorResponse(msg.ID, rpcCode, reason)
+}
+
+// undoDeclassify puts back the flow labels an approved declassification cleared, for a call
+// this transport is refusing AFTER the decision committed the clear, and returns the audit
+// fields that refusal's record must carry. It returns nil — and touches nothing — for a
+// decision that cleared no label, which is every call in a deployment with no declassify
+// directive.
+//
+// The commit is inside Decide, so by the time any of the three post-decision refusals runs
+// (the --require-audit=strict gate, an upstream transport failure, a redaction failure) the
+// labels are already gone while the action itself never happened. Left alone that is a
+// fail-open the engine's own rollback arms cannot reach: they undo faults INSIDE the
+// decision, and this is a clean clear followed by a refusal one layer out.
+//
+// The single-use grant that authorized the clear stays BURNED — the counter has no delete,
+// and handing a use back for a call that may or may not have run is the direction
+// burnApproval documents as unsafe. So the record names it: the operator mints a new
+// approval, and the tape says why. That is also what keeps this honest as evidence — a
+// declassification that was authorized and then undone is a different event from one that
+// never happened, and the approval id is what joins either to the approval workflow.
+func (fp forwardParams) undoDeclassify(ctx context.Context, dec capability.EnforceResponse, kind, denialTarget string) map[string]interface{} {
+	if len(dec.LabelsCleared) == 0 {
+		return nil
+	}
+	detail := map[string]interface{}{
+		// The discriminator every information-flow event on the tape carries, so one
+		// filter finds this beside the sink denials and the declassify escalations.
+		"flow": true,
+	}
+	// A nil restorer means no PDP was wired into these params, which cannot coexist with a
+	// decision carrying LabelsCleared on any in-tree path. Report it rather than silently
+	// recording a revert that did not happen.
+	var err error
+	if fp.restorer == nil {
+		err = fmt.Errorf("no policy decision point is wired into this transport path")
+	} else {
+		err = fp.restorer.RestoreDeclassified(ctx, fp.sessionID, dec.LabelsCleared)
+	}
+	if err != nil {
+		// The fail-open residual, and the reason this returns fields at all: the labels are
+		// gone for a call that never ran, so a later sink the operator believes is guarded
+		// will pass. Spelled as its own key rather than a flag on the revert, so an alert
+		// matches this and not the benign case.
+		detail["declassify_orphaned"] = dec.LabelsCleared
+		fmt.Fprintf(os.Stderr,
+			"[eunox] SECURITY: %s %q was refused after an approved declassification, and the cleared flow label(s) %v could not be restored: %v — the session is now less tainted than the calls it actually made\n",
+			kind, denialTarget, dec.LabelsCleared, err)
+	} else {
+		detail["declassify_reverted"] = dec.LabelsCleared
+	}
+	// Spelled declassify_approval_id rather than approval_id: the latter is a top-level
+	// SIGNED field on the allow that PERFORMED a declassification, and reusing the name
+	// inside a refusal's details would put one key in two places with two provenances on
+	// one tape — the same rule consumed_approval_id follows in the engine.
+	if dec.ApprovalID != "" {
+		detail["declassify_approval_id"] = dec.ApprovalID
+	}
+	return detail
+}
+
+// mergeAuditDetails folds extra into base without mutating either — base may be the
+// caller's own live map (the audit-mode tools/call path passes the request's argument map
+// straight through), so writing into it would rewrite the request the record describes.
+// Returns base when extra is empty, so the overwhelmingly common no-declassification path
+// allocates nothing.
+func mergeAuditDetails(base, extra map[string]interface{}) map[string]interface{} {
+	if len(extra) == 0 {
+		return base
+	}
+	out := make(map[string]interface{}, len(base)+len(extra))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range extra {
+		out[k] = v
+	}
+	return out
 }
 
 // strictAuditDenial implements the --require-audit=strict gate for the
@@ -420,10 +514,18 @@ func (fp forwardParams) recordUpstreamFailure(ctx context.Context, msg mcp.RPCMs
 // itself be dropped, which is fine — the call is denied either way, so no
 // unaudited privileged call reaches the upstream. Only the forward path needs
 // gating; a hard deny already returns without contacting the upstream.
-func (fp forwardParams) strictAuditDenial(ctx context.Context, msg mcp.RPCMsg, auditID, method, denialTarget string) (mcp.RPCMsg, bool) {
+//
+// onBlocked, when non-nil, runs ONLY on the blocking path and contributes extra fields to
+// the deny record. It is a closure rather than a plain map because its caller's version has
+// a side effect — undoing a declassification the decision already committed — that must not
+// happen on the far more common path where the gate does not trip.
+func (fp forwardParams) strictAuditDenial(ctx context.Context, msg mcp.RPCMsg, auditID, method, denialTarget string, onBlocked func() map[string]interface{}) (mcp.RPCMsg, bool) {
 	tripped, reason, detail := auditGateTripped(fp.rec, fp.requireAuditStrict)
 	if !tripped {
 		return mcp.RPCMsg{}, false
+	}
+	if onBlocked != nil {
+		detail = mergeAuditDetails(detail, onBlocked())
 	}
 	// detail carries discrete counts (dropped_count/write_failure_count); the prose
 	// reason is for the host-facing error and the stderr warning only, never the
@@ -506,7 +608,14 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 	// coverage gates the upstream side effect. Runs BEFORE the observe deny is
 	// recorded so a gate block does not leave an audit_only=true record
 	// contradicting the AUDIT_UNAVAILABLE hard-block.
-	if denied, blocked := fp.strictAuditDenial(ctx, msg, auditID, method, denialTarget); blocked {
+	//
+	// This is the FIRST of three exits below the decision, and the decision may have
+	// already cleared flow labels under a human approval. Blocking here means the
+	// sanitizing action never runs while its taint is gone, so the undo runs on the
+	// blocking path and its outcome lands on the same record (see undoDeclassify).
+	if denied, blocked := fp.strictAuditDenial(ctx, msg, auditID, method, denialTarget, func() map[string]interface{} {
+		return fp.undoDeclassify(ctx, dec, kind, denialTarget)
+	}); blocked {
 		return denied
 	}
 
@@ -549,7 +658,15 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 		// property only this one error has today — and getting that wrong in the other
 		// direction hands back quota for a call that DID execute. An over-count on a host
 		// that reuses an in-flight JSON-RPC id is the safe side of that trade.
-		return fp.recordUpstreamFailure(ctx, msg, fwdErr, auditID, method)
+		//
+		// The declassification is undone here even though the upstream MAY have executed
+		// the call (a write timeout means the bytes were already handed over). The two
+		// possible errors are not symmetric: restoring a label for a call that did run
+		// over-blocks a later sink, which the operator resolves with another approval,
+		// while leaving it cleared for a call that did NOT run silently admits the next
+		// egress the label exists to stop. The quota slot above is NOT refunded for the
+		// mirror-image reason — there the fail-closed direction is to keep it spent.
+		return fp.recordUpstreamFailure(ctx, msg, fwdErr, auditID, method, fp.undoDeclassify(ctx, dec, kind, denialTarget))
 	}
 
 	// Apply post-allow obligations (redactFields) before the response reaches the
@@ -563,9 +680,14 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 			// adversarial upstream could return a redaction-failing response to make
 			// every redactFields-guarded call vanish from the audit trail. Also a
 			// forwarded-then-recorded boundary call, so it gets the same diagnostic.
+			//
+			// The third post-decision exit, and the same undo: the response never reaches
+			// the host, so the declassifying call did not deliver its result while its
+			// taint is already cleared.
+			redactDetail := fp.undoDeclassify(ctx, dec, kind, denialTarget)
 			warnIfStrictAuditJustDegraded(fp.requireAuditStrict, fp.rec, kind, denialTarget, func() {
 				if fp.rec != nil {
-					fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, capability.ErrCodeEnforcementError, "", nil, false)
+					fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, capability.ErrCodeEnforcementError, "", redactDetail, false)
 				}
 			})
 			return mcp.ErrorResponse(msg.ID, jsonRPCCodeInternalError, "internal error: response redaction failed")
@@ -855,6 +977,15 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 		// initiator) rather than forwarding it unaudited. Scope: sampling needs the
 		// system:sampling opt-in, rejected at startup for HTTP upstreams, so this only
 		// bites stdio subprocess upstreams.
+		//
+		// There is deliberately no declassify undo on this gate, unlike its counterpart in
+		// enforcedForwardCore. A declassify directive is refused at LOAD on a system:
+		// target (requireSourceDirectiveTarget: an egress is a place for a flow sink, not
+		// for clearing a label — clearing at an egress launders it at exactly the point the
+		// flow layer exists to gate), so a sampling decision cannot carry LabelsCleared and
+		// there is nothing here for a strict-audit block to have left cleared. Should that
+		// restriction ever be relaxed, this gate needs undoDeclassify exactly as the
+		// host-path gates do.
 		if fp.strictServerRequestAuditDenial(ctx, msg, samplingMethod) {
 			return
 		}

@@ -11,14 +11,16 @@ import (
 )
 
 // TestRecordDeclassifiedAllow_SignAndVerify is the required sign-and-verify round-trip
-// for the two declassification audit fields (labels_cleared, approver): a record carrying
-// them serializes with both, verifies under the HMAC chain, and — the tamper half — fails
-// closed when either is altered on disk without re-signing.
+// for the three declassification audit fields (labels_cleared, approver, approval_id): a
+// record carrying them serializes with all three, verifies under the HMAC chain, and — the
+// tamper half — fails closed when any is altered on disk without re-signing.
 //
-// The tamper half is the point of the test, not a formality. These two fields are the
-// evidence that a human authorized dropping a flow label; a tape on which the approver
-// could be rewritten after the fact would record the declassification without recording
-// who is answerable for it.
+// The tamper half is the point of the test, not a formality. These fields are the evidence
+// that a human authorized dropping a flow label; a tape on which the approver could be
+// rewritten after the fact would record the declassification without recording who is
+// answerable for it. approval_id is signed alongside them rather than riding details for
+// the same reason: it is what joins the record back to the approval workflow, and a
+// declassification's evidence must be one record shape.
 func TestRecordDeclassifiedAllow_SignAndVerify(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "audit.jsonl")

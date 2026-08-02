@@ -1275,6 +1275,7 @@ func (p *StdioProxy) dispatchParams() dispatchParams {
 			sessionID:        p.sessionID,
 			upstreamTimeMs:   p.upstreamTimeMs,
 			callUpstream:     p.callUpstream,
+			restorer:         p.pdp,
 			strictAuditState: p.strictAudit(),
 		},
 		pdp:              p.pdp,

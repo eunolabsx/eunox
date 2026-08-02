@@ -701,26 +701,51 @@ func parseDelegationChain(payload idpJWTPayload) (*capability.DelegationChain, e
 	return chain, nil
 }
 
-// rejectAmbiguousTopLevelClaims confirms the token's payload names each of `mcp` and `act`
-// at most once, and the `mcp` block itself names each of its own members at most once,
-// before ANYTHING decoded from either is trusted.
+// stdClaimNames are the RFC 7519 registered claims this build reads off the token: the
+// identity `sub`/`iss`/`jti`, the audience pin `aud`, and the temporal bounds
+// `exp`/`nbf`/`iat`. Every one of them is decoded by go-jose's plain
+// encoding/json.Unmarshal into jwt.Claims — a struct with no custom UnmarshalJSON — so an
+// ambiguous pair among them resolves by member ORDER exactly as `mcp`/`act` do, and is
+// watched here for exactly the same reason.
 //
-// The struct unmarshal that already ran (UnsafeClaimsWithoutVerification) resolved any
-// collision silently — encoding/json folds field names case-insensitively and keeps the
-// last one, so a payload carrying both "act" and "Act", or an mcp block carrying both
-// "delegation" and "Delegation", bound whichever spelling the author wrote LAST with no
-// signal a narrower or differently-scoped sibling ever existed. A JWT is signed by its
-// issuer, so this is not an externally forgeable ambiguity — but it is the same "an IdP
-// template mistake becomes a rejected token, not a silently-resolved one" failure the
-// per-grant decoders (decodeClaimObject) already refuse one layer in; a minting pipeline
-// that merges claim sources, or a migration that renamed a claim and left both spellings
-// live, can produce it exactly as easily one layer out. See capability.ClaimMembers.
+// They are listed rather than reflected off jwt.Claims because the list must name what
+// eunox TRUSTS, not what a dependency happens to model: a go-jose release that adds a
+// field would silently widen a security check, and one that renames a tag would silently
+// narrow it. Both directions are worse than an explicit list beside the check.
+var stdClaimNames = []string{"sub", "iss", "aud", "exp", "nbf", "iat", "jti"}
+
+// rejectAmbiguousTopLevelClaims confirms the token's payload names each of `mcp`, `act`
+// and the RFC 7519 standard claims at most once, and that the `mcp` block itself names
+// each of its own members at most once, before ANYTHING decoded from any of them is
+// trusted.
+//
+// The struct unmarshals that already ran (tok.Claims into jwt.Claims,
+// UnsafeClaimsWithoutVerification into idpJWTPayload) resolved any collision silently —
+// encoding/json folds field names case-insensitively and keeps the last one, so a payload
+// carrying both "act" and "Act", or an mcp block carrying both "delegation" and
+// "Delegation", bound whichever spelling the author wrote LAST with no signal a narrower
+// or differently-scoped sibling ever existed. A JWT is signed by its issuer, so this is
+// not an externally forgeable ambiguity — but it is the same "an IdP template mistake
+// becomes a rejected token, not a silently-resolved one" failure the per-grant decoders
+// (decodeClaimObject) already refuse one layer in; a minting pipeline that merges claim
+// sources, or a migration that renamed a claim and left both spellings live, can produce
+// it exactly as easily one layer out. See capability.ClaimMembers.
+//
+// The standard claims are watched alongside them because they decide MORE than the custom
+// ones do. `sub` is what a manifest's `principal:` scoping reads, so a payload carrying
+// both "sub" and "Sub" is enforced under whichever identity sorts last in the payload
+// bytes — a value neither side of the token exchange controls or can verify, and one that
+// can resolve a narrowly-scoped agent's token to a broader identity's constraints.
+// `exp`/`nbf` decide whether the token is live at all, and `aud`/`iss` decide whether it
+// was minted for this proxy. Refusing the token is the only reading of "on any ambiguity,
+// deny" that holds here: there is no safe way to pick between two spellings of the
+// caller's own name.
 func rejectAmbiguousTopLevelClaims(tokenStr string) error {
 	payloadBytes, err := jwtPayloadSegment(tokenStr)
 	if err != nil {
 		return capability.Terminal(jwtErr(jwtErrMalformedToken, err))
 	}
-	top, err := capability.ClaimMembers(payloadBytes, "jwt payload", "mcp", "act")
+	top, err := capability.ClaimMembers(payloadBytes, "jwt payload", append([]string{"mcp", "act"}, stdClaimNames...)...)
 	if err != nil {
 		return capability.Terminal(jwtErr(jwtErrAmbiguousClaims, err))
 	}
@@ -1390,7 +1415,7 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 			lastDeny = nil
 			break
 		}
-		if resp := evaluateJWTConditions(p.clock, matched.Conditions, target.Name, condArgs); resp != nil {
+		if resp := evaluateJWTConditions(p.clock, matched.Conditions, target.Name, condArgs, claims.flatMap()); resp != nil {
 			lastDeny = resp
 			continue
 		}
@@ -2094,6 +2119,16 @@ func (p *JWTPDP) ReleaseSession(ctx context.Context, sessionID string) {
 	}
 }
 
+// RestoreDeclassified delegates to the inner PDP, which owns the flow store the clear was
+// committed against. The JWT layer clears no label of its own — a token can only restrict —
+// so a nil inner has nothing to undo.
+func (p *JWTPDP) RestoreDeclassified(ctx context.Context, sessionID string, labels []string) error {
+	if p.inner == nil {
+		return nil
+	}
+	return p.inner.RestoreDeclassified(ctx, sessionID, labels)
+}
+
 // innerFilter applies the inner PDP's list filter (selected by sel) to intersect
 // with the JWT claim filter. A nil inner passes the result through (counting its
 // entries via fieldName so the composed counts stay accurate), so the JWT claim
@@ -2292,7 +2327,14 @@ func collectArgStringsDepth(v interface{}, out *[]string, depth int) bool {
 
 // evaluateJWTConditions checks JWT-derived conditions against the call arguments.
 // Returns a non-nil denial response if any condition fails.
-func evaluateJWTConditions(clock enforcement.Clock, conditions []capability.Condition, name string, args map[string]interface{}) *capability.EnforceResponse {
+//
+// claims is the caller's flat input.claims map — the same one the manifest path threads
+// into the engine — so a `${task.*}` reference an issuer wrote into a capability claim
+// resolves here exactly as it does there. It is a parameter rather than something read
+// back off a context because this function is the JWT path's whole condition evaluator:
+// handing it the arguments but not the identity is what let a grant carrying a recognized
+// reference match nothing and deny every call under it.
+func evaluateJWTConditions(clock enforcement.Clock, conditions []capability.Condition, name string, args, claims map[string]interface{}) *capability.EnforceResponse {
 	for _, cond := range conditions {
 		switch c := cond.(type) {
 		case capability.AllowedOperationsCondition:
@@ -2385,7 +2427,7 @@ func evaluateJWTConditions(clock enforcement.Clock, conditions []capability.Cond
 			// string and non-string cases differ only in how the DENIAL reads — a string
 			// value is quoted into the message, a non-string one is not (its Go rendering
 			// would be neither the wire form nor useful).
-			if !enforcement.MatchAllowedValue(rawVal, c.Values) {
+			if !enforcement.MatchAllowedValue(rawVal, c.Values, claims) {
 				detail := fmt.Sprintf("%q: argument %q value is not in the permitted set", name, c.Argument)
 				if val, isStr := rawVal.(string); isStr {
 					detail = fmt.Sprintf("%q: argument %q value %q is not permitted", name, c.Argument, val)

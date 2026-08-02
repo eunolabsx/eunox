@@ -247,6 +247,7 @@ func (p *HTTPProxy) dispatchParams(sess *httpSession, sourceIP string) dispatchP
 			sessionID:        sess.id,
 			upstreamTimeMs:   p.upstreamTimeMs,
 			callUpstream:     sess.callUpstream,
+			restorer:         rt.pdp,
 			strictAuditState: p.strictAudit(),
 		},
 		pdp:              rt.pdp,
@@ -273,7 +274,9 @@ func (p *HTTPProxy) initStrictAuditDenial(ctx context.Context, route *UpstreamRo
 	}
 	// initialize addresses no sub-target, so the audit id, method, and denial
 	// target all collapse to "initialize" (see dispatchList for the same pattern).
-	return fp.strictAuditDenial(ctx, msg, mcp.MethodInitialize, mcp.MethodInitialize, mcp.MethodInitialize)
+	// nil onBlocked: no session and no decision exist yet on a session-creating
+	// initialize, so nothing can have cleared a flow label.
+	return fp.strictAuditDenial(ctx, msg, mcp.MethodInitialize, mcp.MethodInitialize, mcp.MethodInitialize, nil)
 }
 
 // initAudienceDenial applies the per-route JWT audience pin to the session-creating

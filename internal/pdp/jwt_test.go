@@ -2524,7 +2524,7 @@ func TestJWTPDP_OpCondition_NamedArgumentFailsClosed(t *testing.T) {
 	// Even the operation that would be permitted must deny — the named-argument form
 	// is not supported from a claim.
 	resp := evaluateJWTConditions(nil, []capability.Condition{cond}, "storage_access",
-		map[string]interface{}{"cmd": "read /bucket/key"})
+		map[string]interface{}{"cmd": "read /bucket/key"}, nil)
 	if resp == nil {
 		t.Fatal("a named-argument allowedOperations condition must fail closed, got allow")
 	}
@@ -2541,7 +2541,7 @@ func TestJWTPDP_UnknownConditionType_FailsClosed(t *testing.T) {
 
 	resp := evaluateJWTConditions(nil,
 		[]capability.Condition{capability.TimeWindowCondition{NotAfter: "2099-01-01T00:00:00Z"}},
-		"storage_access", map[string]interface{}{})
+		"storage_access", map[string]interface{}{}, nil)
 	if resp == nil {
 		t.Fatal("an unevaluable JWT condition type must deny (fail closed), not pass silently")
 	}
@@ -3067,6 +3067,7 @@ func (condPDP) CheckAudience(_ context.Context) *capability.EnforceResponse {
 }
 func (condPDP) RecordObservedToolHashes(_ context.Context, _ json.RawMessage) int { return 0 }
 func (condPDP) ReleaseSession(_ context.Context, _ string)                        {}
+func (condPDP) RestoreDeclassified(_ context.Context, _ string, _ []string) error { return nil }
 func (condPDP) FilterToolsList(_ context.Context, result json.RawMessage) ListFilterResult {
 	return ListFilterResult{Result: result}
 }
@@ -4683,7 +4684,7 @@ func TestEvaluateJWTConditionsNonStringAllowedValues(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			resp := evaluateJWTConditions(nil, tc.conds, "tool:x", tc.args)
+			resp := evaluateJWTConditions(nil, tc.conds, "tool:x", tc.args, nil)
 			if tc.wantDeny {
 				if resp == nil {
 					t.Fatalf("expected deny, got allow")
@@ -4776,7 +4777,7 @@ func TestJWTShorthandValuesMatchTypedArgs(t *testing.T) {
 			if len(constraints) != 1 {
 				t.Fatalf("expected 1 constraint from claim %q, got %d", tc.claim, len(constraints))
 			}
-			resp := evaluateJWTConditions(nil, constraints[0].Conditions, constraints[0].Target, tc.args)
+			resp := evaluateJWTConditions(nil, constraints[0].Conditions, constraints[0].Target, tc.args, nil)
 			if tc.wantDeny {
 				if resp == nil {
 					t.Fatalf("expected deny for args %+v, got allow", tc.args)
@@ -4867,7 +4868,7 @@ func TestEvaluateJWTConditionsAllowedOperations(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			resp := evaluateJWTConditions(nil, tc.conds, "tool:x", tc.args)
+			resp := evaluateJWTConditions(nil, tc.conds, "tool:x", tc.args, nil)
 			if tc.wantDeny {
 				if resp == nil {
 					t.Fatalf("expected deny, got allow")

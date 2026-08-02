@@ -2368,8 +2368,8 @@ by other means and should not be made to keep a ledger for nothing.
 
 #### What lands on the tape
 
-An approved declassification is an **allow** record carrying two additive fields
-no other record shape has:
+An approved declassification is an **allow** record carrying three additive
+top-level fields no other record shape has:
 
 ```jsonc
 {
@@ -2382,8 +2382,11 @@ no other record shape has:
 }
 ```
 
-All three are **signed fields**, covered by the record HMAC — so neither the cleared
-set nor the approving human can be rewritten after the fact.
+All three are **top-level signed fields**, covered by the record HMAC — so neither
+the cleared set, nor the approving human, nor the approval identifier can be
+rewritten after the fact. In particular `approval_id` is a field of its own and
+**not** a `details` key: it is what joins a tape entry back to the approval workflow,
+so a SIEM rule reading `details.approval_id` would always find nothing.
 
 `labels_cleared` reports what **changed**, not what was authorized: an approval to
 clear `pii` on a session that never carried it is a permitted no-op that records
@@ -2392,7 +2395,26 @@ that did not happen.
 
 A refused one is a `decision: escalate` record with `condition_type: declassify`,
 carrying the session's `carried_labels` and a `reason` — which is what an operator
-reads to decide whether the declassification should be approved at all.
+reads to decide whether the declassification should be approved at all. It carries
+`carried_labels` whether or not a JWT layer wrapped the call: a wrapping layer's
+own refusal is re-stamped as this same escalation, through the same builder, so
+one logical refusal has one record shape.
+
+A declassification can also be committed and then **refused by the proxy itself**,
+which is a third shape. The clear commits inside the decision, and three gates after
+it can still refuse without reaching the upstream — `--require-audit=strict`, an
+upstream transport failure, and a redaction failure. Each undoes the clear before
+recording, and the deny record says so:
+
+| detail key | meaning |
+| --- | --- |
+| `declassify_reverted` | the labels were put back; the session is as it was |
+| `declassify_orphaned` | they could **not** be put back (the flow store was unreachable) — the labels are gone for a call that never ran, and a later sink will now pass |
+| `declassify_approval_id` | the grant, which stays **burned** either way — a `once` approval spent on a call that did not run needs replacing |
+
+`declassify_orphaned` is the one to alert on. It is spelled
+`declassify_approval_id` rather than `approval_id` so the top-level signed field
+keeps meaning "a declassification that actually took effect".
 
 `eunox stats` counts both: escalations as the approval queue, declassifications
 as the number of times a human agreed to drop taint. A declassification count
@@ -2451,6 +2473,21 @@ revision that introduced it, like every other `0.2` token.
 References are resolved in `allowedValues` **only**. A `${...}` elsewhere in the
 manifest is an ordinary literal string, which for a security rule means it matches
 nothing — the fail-closed direction, but not what the author intended.
+
+They also resolve in a **JWT capability claim's** shorthand, which uses the same
+`allowedValues` matcher, so an issuer can mint one grant for every task instead of
+one per task:
+
+```json
+"capabilities": ["tool:fetch_workspace?workspace_id=${task.id}"]
+```
+
+The three rules above apply there unchanged — in particular rule 2, which matters
+more here: the token holder supplies the claim, so a `task_id` of `*` compared as a
+glob would be a wildcard they granted themselves. One difference: a claim value is
+never seen by the manifest loader, so an **unrecognized** reference such as
+`${STAGE}` cannot be reported as a bad reference. It stays an ordinary literal and
+matches itself, rather than voiding the grant with no error anywhere to look for.
 
 ## 5d. Delegation attenuation — narrowing authority across a hop
 
