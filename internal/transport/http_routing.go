@@ -230,12 +230,13 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 	// already executed upstream. With the budget disabled the upstream may take
 	// arbitrarily long, so the entry deadline stays at the fixed backstop and the
 	// pre-encode re-arm is what bounds the client-facing write.
-	rc := http.NewResponseController(w)
-	if p.upstreamTimeMs > 0 {
-		_ = rc.SetWriteDeadline(time.Now().Add(addSlack(msToDuration(p.upstreamTimeMs))))
-	} else {
-		_ = rc.SetWriteDeadline(time.Now().Add(httpWriteTimeout))
-	}
+	//
+	// Through the shared helper, so this site cannot drift from the response-write one: it
+	// also FLOORS the window at httpWriteTimeout, which the hand-written arm here did not.
+	// An --upstream-timeout below httpWriteTimeout used to arm a window SHORTER than the
+	// one every other leg gets, even though how long the client may take to read a response
+	// has nothing to do with how long the upstream was given.
+	rearmWriteDeadline(w, p.upstreamTimeMs)
 
 	sessionID := r.Header.Get(SessionHeader)
 
@@ -320,7 +321,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 		if b := msToDuration(p.upstreamTimeMs); p.upstreamTimeMs > 0 && b > startBudget {
 			startBudget = b
 		}
-		_ = rc.SetWriteDeadline(time.Now().Add(addSlack(startBudget)))
+		rearmWriteDeadlineFor(w, startBudget)
 		initCtx, initCancel := context.WithTimeout(r.Context(), sessionStartTimeout)
 		defer initCancel()
 
@@ -681,8 +682,9 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 	// bounds only the client-facing write — so a client that stops reading (TCP zero
 	// window) still cannot block json.Encode, and thus the deferred inFlight/reqSem
 	// release, indefinitely — while decoupling that write from however long pre-forward
-	// work and the upstream took.
-	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(httpWriteTimeout))
+	// work and the upstream took. Budget 0: this leg's window is the fixed floor, which is
+	// exactly what the helper arms with no budget.
+	rearmWriteDeadline(w, 0)
 	writeJSONMsg(w, resp)
 }
 
