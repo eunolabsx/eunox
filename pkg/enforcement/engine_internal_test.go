@@ -1033,7 +1033,7 @@ func TestCollectObligationsValueDirective(t *testing.T) {
 				Actions:    []string{"call"},
 				Directives: []capability.Directive{dir},
 			}
-			obs, deny := e.CollectObligations(c, "req-1", "2026-06-14T00:00:00Z")
+			obs, deny := e.CollectObligations(nil, c, "req-1", "2026-06-14T00:00:00Z")
 			if deny != nil {
 				t.Fatalf("CollectObligations denied a valid redactFields directive: %+v", deny.Denial)
 			}

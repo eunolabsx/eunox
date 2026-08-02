@@ -115,6 +115,12 @@ type JWTClaims struct {
 	// it is parsed and validated at the token boundary (ValidateToken) rather than read
 	// out of Extra on the decision path.
 	Declassify []capability.DeclassifyApproval
+	// Delegation holds the token's validated delegation chain: its RFC 8693 `act` actors
+	// and its `mcp.delegation` per-hop grants, already asserted to narrow at every hop.
+	// Nil for the overwhelming majority of tokens. Like Declassify it is decoded and
+	// checked at the token boundary (ValidateToken) rather than read out of Extra on the
+	// decision path — a widening chain is a rejected token, not a decision-time surprise.
+	Delegation *capability.DelegationChain
 	// ExpiresAt is the verified token's `exp` as a wall-clock time. ValidateToken
 	// rejects a token with no exp, so this is always set on a validated JWTClaims; it is
 	// the zero Time for a JWTClaims built without ValidateToken (e.g. tests). A long-lived
@@ -171,6 +177,19 @@ func declassifyApprovalsFromContext(ctx context.Context) []capability.Declassify
 	return nil
 }
 
+// delegationFromContext returns the validated delegation chain the request's token declared,
+// or nil when there is no token or it declared none — the default, and what makes a
+// deployment with no delegation integration behave exactly as it does today.
+//
+// It reads the typed, already-validated JWTClaims rather than the flat input.claims map, for
+// the reason declassifyApprovalsFromContext does: every axis this carries bounds a decision.
+func delegationFromContext(ctx context.Context) *capability.DelegationChain {
+	if c, ok := jwtClaimsFromContext(ctx); ok {
+		return c.Delegation
+	}
+	return nil
+}
+
 // jwtClaimsFromContext retrieves JWT claims from the context.
 func jwtClaimsFromContext(ctx context.Context) (*JWTClaims, bool) {
 	c, ok := ctx.Value(jwtClaimsKey{}).(*JWTClaims)
@@ -211,6 +230,12 @@ type mcpClaimSet struct {
 	// being re-modeled here. Absent on every token that is not carrying an approval,
 	// which is nearly all of them.
 	Declassify json.RawMessage `json:"declassify,omitempty"`
+	// Delegation carries the per-hop attenuation grants of a delegation chain
+	// (capability.DelegationGrant), held raw and decoded through
+	// capability.ParseDelegationGrants for the same reason Declassify is: the grammar,
+	// its validation, and its unknown-field rejection live in the package that owns
+	// them. Absent on every token that is not a delegated one.
+	Delegation json.RawMessage `json:"delegation,omitempty"`
 }
 
 // idpJWTPayload is the subset of IdP JWT claims relevant to MCP enforcement.
@@ -218,6 +243,10 @@ type mcpClaimSet struct {
 // jwt.Claims; this struct handles only the MCP-specific custom claims.
 type idpJWTPayload struct {
 	MCP mcpClaimSet `json:"mcp"`
+	// Act is the RFC 8693 §4.1 actor chain, a top-level claim rather than an mcp one
+	// because it is a standard OAuth token-exchange claim an IdP emits on its own terms.
+	// Held raw and walked by capability.ParseActorChain.
+	Act json.RawMessage `json:"act,omitempty"`
 }
 
 // JWTPDP validates IdP-issued JWTs and enforces capability claims.
@@ -550,6 +579,7 @@ const (
 	jwtErrCapabilitiesDisabled = "capabilities_disabled"
 	jwtErrInvalidCapabilities  = "invalid_capabilities"
 	jwtErrInvalidDeclassify    = "invalid_declassify"
+	jwtErrInvalidDelegation    = "invalid_delegation"
 	jwtErrSenderConstrained    = "sender_constrained"
 	// jwtErrJWKSUnavailable marks a validation that failed because the key set could
 	// not be fetched (network error, non-200, empty/oversized set, open breaker), not
@@ -621,16 +651,49 @@ func ClassifyJWTError(err error) string {
 	}
 }
 
+// parseDelegationChain decodes and asserts a token's delegation state: the RFC 8693 `act`
+// actor chain and the mcp.delegation per-hop grants. It runs at the TOKEN boundary, for the
+// same reason the declassify approvals are parsed there: a chain this build cannot read, or
+// one whose hops WIDEN rather than narrow, is a token making a delegation claim the proxy
+// cannot honor — and the operator's whole reason for minting the chain is that "the delegate
+// is no broader than its delegator" is checkable. Rejecting the token is what makes it
+// checkable; clamping a widening hop would leave the token working while quietly meaning
+// something other than what it says.
+//
+// Like the approvals and unlike mcp.capabilities, this is not behind the experimental gate:
+// every axis a grant carries NARROWS, so a build that honors it can only deny more than one
+// that ignores it. There is no fail-open direction to gate against.
+//
+// Returns (nil, nil) for the overwhelming majority of tokens, which declare neither claim.
+// Every error is already Terminal-wrapped for the caller (verified-but-invalid, not a
+// retryable transport fault).
+func parseDelegationChain(payload idpJWTPayload) (*capability.DelegationChain, error) {
+	actors, err := capability.ParseActorChain(payload.Act)
+	if err != nil {
+		return nil, capability.Terminal(jwtErr(jwtErrInvalidDelegation, err))
+	}
+	grants, err := capability.ParseDelegationGrants(payload.MCP.Delegation)
+	if err != nil {
+		return nil, capability.Terminal(jwtErr(jwtErrInvalidDelegation, err))
+	}
+	chain, err := capability.ValidateDelegationChain(actors, grants)
+	if err != nil {
+		return nil, capability.Terminal(jwtErr(jwtErrInvalidDelegation, err))
+	}
+	return chain, nil
+}
+
 // newValidatedClaims assembles the *JWTClaims a successful ValidateToken returns,
 // memoizing at validation the two derived views later per-request decisions reuse:
 // the parsed capability heads (parsedCaps) and the flattened input.claims map
 // (flatClaims). Both are computed once here so decide/list-filter/sampling calls hand
 // out precomputed values instead of re-parsing/re-building per request.
-func newValidatedClaims(capsList []string, capsPresent bool, declassify []capability.DeclassifyApproval, payload idpJWTPayload, std jwt.Claims, rawClaims map[string]interface{}) *JWTClaims {
+func newValidatedClaims(capsList []string, capsPresent bool, declassify []capability.DeclassifyApproval, delegation *capability.DelegationChain, payload idpJWTPayload, std jwt.Claims, rawClaims map[string]interface{}) *JWTClaims {
 	claims := &JWTClaims{
 		Capabilities:    capsList,
 		HasCapabilities: capsPresent,
 		Declassify:      declassify,
+		Delegation:      delegation,
 		TaskID:          payload.MCP.TaskID,
 		AgentID:         payload.MCP.AgentID,
 		Subject:         std.Subject,
@@ -882,6 +945,12 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 			return nil, capability.Terminal(jwtErr(jwtErrInvalidDeclassify, declErr))
 		}
 
+		// Delegation attenuation, decoded and asserted at this same boundary.
+		delegation, delegErr := parseDelegationChain(payload)
+		if delegErr != nil {
+			return nil, delegErr
+		}
+
 		// Sub is the primary identity anchor; without it a token cannot be attributed
 		// in audit records or matched against principal-scoped constraints. Reject
 		// (fail closed).
@@ -906,7 +975,7 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 			return nil, capability.Terminal(jwtErr(jwtErrSenderConstrained, fmt.Errorf("sender-constrained token (cnf) requires proof-of-possession, which the proxy does not verify; refusing to accept it as a plain bearer token (fail closed)")))
 		}
 
-		return newValidatedClaims(capsList, capabilitiesPresent, declassify, payload, stdClaims, rawClaims), nil
+		return newValidatedClaims(capsList, capabilitiesPresent, declassify, delegation, payload, stdClaims, rawClaims), nil
 	})
 	if err != nil {
 		return ctx, err
@@ -979,6 +1048,12 @@ func (p *JWTPDP) DecideResourceCancel(ctx context.Context, sessionID, uri, sourc
 		return p.audienceDeny(fmt.Sprintf("token audience %v does not satisfy the route's required audience %q", claims.Audiences, p.routeAudience))
 	}
 	target := EnforceTarget{Type: capability.TargetTypeResource, Name: uri}
+	// The delegation target gate, for the same reason Decide runs one: this method can
+	// resolve entirely inside the wrapper (an exhaustive claim plus a nil or wiretap inner),
+	// so the chain would otherwise bound the subscribe and not the cancel.
+	if deny := delegationTargetDenial(ctx, p.clock, target, false); deny != nil {
+		return *deny
+	}
 	if claims.HasCapabilities {
 		// The claim is an exhaustive allowlist, so a resource it does not name is not
 		// cancellable through this token either. Matching (not condition evaluation) is
@@ -1186,6 +1261,26 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 	// routeAudience) or --jwt-allow-any-audience.
 	if !p.routeAudienceSatisfied(claims) {
 		return p.audienceDeny(fmt.Sprintf("token audience %v does not satisfy the route's required audience %q", claims.Audiences, p.routeAudience))
+	}
+
+	// The delegation target gate, applied HERE rather than left to the inner PDP. Every
+	// other axis of the chain composes inside the enforcement engine, but this wrapper has
+	// decision paths that never reach one: a JWT-only route has no manifest engine, and a
+	// policyless route's inner is the wiretap AlwaysAllowPDP. On those routes the chain was
+	// validated at the token boundary — a widening hop rejected the token — and then applied
+	// to nothing, so a delegate whose grant reaches no target was still allowed. Running it
+	// before the capability logic also means a delegated call is refused for the reason that
+	// actually bounds it rather than for whichever check happened to fire first.
+	//
+	// Composed through withInnerVerdicts for the reason every other short-circuit above the
+	// inner PDP is: the refusal is downgradable by design (see delegationDenial), so on an
+	// --audit route it becomes a FORWARD — and a forward assembled here carries none of the
+	// three things the inner PDP would have contributed had it run. Without this, adding a
+	// delegation chain to a token made the same request forward UNREDACTED, past a broken
+	// interface pin, and past the effect ceiling. That is the exact inversion the seam exists
+	// to prevent, arrived at through the one axis that only ever narrows.
+	if deny := delegationTargetDenial(ctx, p.clock, target, false); deny != nil {
+		return p.withInnerVerdicts(ctx, sessionID, *deny, target, args)
 	}
 
 	// No mcp.capabilities field: the JWT provides identity only and the decision
@@ -1840,16 +1935,34 @@ func (p *JWTPDP) filterList(ctx context.Context, result json.RawMessage, desc li
 	// parsing here for a test-built JWTClaims that set Capabilities directly. Mirrors
 	// Decide's use of parsedCaps so list filtering never re-parses on the hot path.
 	parsed := parsedCapHeads(claims)
+	// The delegation chain narrows the catalog here as well as the call leg, mirroring the
+	// ManifestPDP filters. On a JWT-only or wiretap route the inner filter is a passthrough,
+	// so without this the chain bounded what a delegate could CALL while the listing still
+	// advertised everything its capability claim named — and the two catalogs a host is shown
+	// would disagree depending on which PDP happened to filter.
+	chain := claims.Delegation
 	kept := make([]json.RawMessage, 0, len(innerRes.Entries))
 	for i, raw := range innerRes.Entries {
 		var covered bool
+		var id string
 		if i < len(innerRes.entryIDs) && innerRes.entryIDs[i] != "" {
 			// ID already decoded by inner PDP's keep func — skip re-unmarshal. An empty
 			// ID means the inner decoded none (e.g. the byClaims path), so fall back to
 			// decoding the entry rather than treating "" as the identifier.
-			covered = anyCapCoversName(innerRes.entryIDs[i], desc.targetType, parsed)
+			id = innerRes.entryIDs[i]
+			covered = anyCapCoversName(id, desc.targetType, parsed)
 		} else {
-			covered = entryCoveredByClaims(raw, parsed, desc.idField, desc.targetType)
+			id, covered = entryCoveredByClaims(raw, parsed, desc.idField, desc.targetType)
+		}
+		if covered && !chain.IsEmpty() {
+			// An entry whose id could not be decoded cannot be scoped against the chain, so
+			// it is dropped rather than admitted — the same fail-closed reading the call leg
+			// applies to an unresolvable target.
+			if id == "" {
+				covered = false
+			} else if permitted, _ := chain.PermitsTarget(string(desc.targetType) + ":" + id); !permitted {
+				covered = false
+			}
 		}
 		if covered {
 			kept = append(kept, raw)
@@ -1984,8 +2097,8 @@ func emptyListing(resultBytes json.RawMessage, listKey string) ListFilterResult 
 	})
 }
 
-// entryCoveredByClaims reports whether a single list entry's identifier — the JSON
-// field idField, "name" for tools/prompts or "uri" for resources — is covered by a
+// entryCoveredByClaims reports a single list entry's identifier — the JSON field idField,
+// "name" for tools/prompts or "uri" for resources — and whether it is covered by a
 // capability claim of targetType. Conditions are not evaluated (list methods carry
 // no arguments) and it fails closed (false) on a decode error. Both id fields are
 // decoded and the requested one selected, so an entry missing idField yields the
@@ -1998,22 +2111,30 @@ func emptyListing(resultBytes json.RawMessage, listKey string) ListFilterResult 
 // render a different name/uri to a case-sensitive host, and this path (reached whenever
 // the inner PDP is nil or AlwaysAllowPDP, i.e. its result comes from an unfiltered
 // passThroughList) is the one list-filter path that had no per-entry gate at all.
-func entryCoveredByClaims(raw json.RawMessage, parsed []capHead, idField string, targetType capability.TargetType) bool {
+// It returns the identifier alongside the verdict because the caller needs both — the verdict
+// to keep the entry, the id to scope it against a delegation chain — and asking two functions
+// meant two duplicate-key scans and two unmarshals of the same bytes, per entry, on every
+// list. A 200-entry catalog paid that twice over for nothing; the id falls out of the decode
+// the coverage test already performs.
+//
+// An ambiguous or undecodable entry yields ("", false): no identifier to scope and nothing to
+// keep, which is the same fail-closed answer both halves gave separately.
+func entryCoveredByClaims(raw json.RawMessage, parsed []capHead, idField string, targetType capability.TargetType) (id string, covered bool) {
 	if entryKeysAmbiguous(raw) {
-		return false
+		return "", false
 	}
 	var entry struct {
 		Name string `json:"name"`
 		URI  string `json:"uri"`
 	}
 	if err := json.Unmarshal(raw, &entry); err != nil {
-		return false
+		return "", false
 	}
-	name := entry.Name
+	id = entry.Name
 	if idField == "uri" {
-		name = entry.URI
+		id = entry.URI
 	}
-	return anyCapCovers(parsed, EnforceTarget{Type: targetType, Name: name})
+	return id, anyCapCovers(parsed, EnforceTarget{Type: targetType, Name: id})
 }
 
 // sqlVerbs is the set of SQL statement verbs the op= scan-all-args evaluator

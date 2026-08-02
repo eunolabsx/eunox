@@ -23,11 +23,26 @@ func TestClaimDecode_RefusesNullMembers(t *testing.T) {
 		raw   string
 		parse func(json.RawMessage) error
 	}{
+		// nil Targets means "this hop places no target restriction" — the widest value the
+		// field has, reached by a member the author explicitly wrote.
+		"delegation targets": {
+			`[{"subject":"a","targets":null}]`,
+			func(r json.RawMessage) error { _, err := capability.ParseDelegationGrants(r); return err },
+		},
+		// nil AllowLabels means the manifest's own sink allow-set stands unmodified.
+		"delegation allowLabels": {
+			`[{"subject":"a","allowLabels":null}]`,
+			func(r json.RawMessage) error { _, err := capability.ParseDelegationGrants(r); return err },
+		},
 		// false Once is a STANDING approval, replayable for the token's whole life — exactly
 		// the window the flag exists to close.
 		"declassify once": {
 			`[{"labels":["pii"],"target":"tool:publish","approver":"ops@example.com","once":null}]`,
 			func(r json.RawMessage) error { _, err := capability.ParseDeclassifyApprovals(r); return err },
+		},
+		"actor sub": {
+			`{"sub":null}`,
+			func(r json.RawMessage) error { _, err := capability.ParseActorChain(r); return err },
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -50,15 +65,27 @@ func TestClaimDecode_RefusesDuplicateKeys(t *testing.T) {
 		raw   string
 		parse func(json.RawMessage) error
 	}{
+		"delegation exact duplicate": {
+			`[{"subject":"a","targets":["tool:read"],"targets":[]}]`,
+			func(r json.RawMessage) error { _, err := capability.ParseDelegationGrants(r); return err },
+		},
+		"delegation case variant": {
+			`[{"subject":"a","targets":["tool:read"],"Targets":["tool:read","tool:wipe_db"]}]`,
+			func(r json.RawMessage) error { _, err := capability.ParseDelegationGrants(r); return err },
+		},
 		// U+017F folds to 's' for encoding/json's matcher but not for strings.ToLower, which is
 		// why the scan folds rather than lower-cases.
-		"declassify non-ascii fold": {
-			"[{\"labels\":[\"pii\"],\"target\":\"tool:publish\",\"approver\":\"ops@example.com\",\"targeT\":\"x\"}]",
-			func(r json.RawMessage) error { _, err := capability.ParseDeclassifyApprovals(r); return err },
+		"delegation non-ascii fold": {
+			"[{\"subject\":\"a\",\"targets\":[\"tool:read\"],\"targetſ\":[\"tool:wipe_db\"]}]",
+			func(r json.RawMessage) error { _, err := capability.ParseDelegationGrants(r); return err },
 		},
 		"declassify case variant": {
 			`[{"labels":["pii"],"target":"tool:publish","approver":"ops@example.com","once":true,"id":"a1","Once":false}]`,
 			func(r json.RawMessage) error { _, err := capability.ParseDeclassifyApprovals(r); return err },
+		},
+		"actor case variant": {
+			`{"sub":"inner","Sub":"outer"}`,
+			func(r json.RawMessage) error { _, err := capability.ParseActorChain(r); return err },
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -70,22 +97,43 @@ func TestClaimDecode_RefusesDuplicateKeys(t *testing.T) {
 	}
 }
 
-// TestClaimDecode_BoundsListLength pins the cap on a list-valued member: a claim is
-// attacker-influenced input the decision path reads, and an unbounded list in it is an
-// unbounded allocation per token.
+// TestParseActorChain_AdmitsIdentityMembers is the outage case: RFC 8693 §4.1 defines an actor
+// object as a set of claims identifying the actor, and a token-exchange IdP routinely writes
+// the actor's issuer beside its subject. Refusing that denied EVERY request the caller made.
+func TestParseActorChain_AdmitsIdentityMembers(t *testing.T) {
+	t.Parallel()
+	actors, err := capability.ParseActorChain(json.RawMessage(
+		`{"sub":"agent-b","iss":"https://idp.example.com","client_id":"cli-1","act":{"sub":"agent-a","iss":"https://idp.example.com"}}`))
+	require.NoError(t, err)
+	assert.Equal(t, []string{"agent-a", "agent-b"}, actors)
+
+	// A member this build does not recognize stays refused: it may be the one carrying the
+	// attenuation, and ignoring it would apply less narrowing than the token declares.
+	_, err = capability.ParseActorChain(json.RawMessage(`{"sub":"agent-b","scope":"admin"}`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown field")
+
+	// The misspelled-"act" truncation the strict decode exists to catch is still caught.
+	_, err = capability.ParseActorChain(json.RawMessage(`{"sub":"agent-b","acts":{"sub":"agent-a"}}`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown field")
+}
+
+// TestClaimDecode_BoundsListLength pins the cap on a list-valued member. The chain is validated
+// once but WALKED on every enforced call, and the target index is a map built per hop.
 func TestClaimDecode_BoundsListLength(t *testing.T) {
 	t.Parallel()
-	labels := make([]string, capability.MaxClaimListEntries+1)
-	for i := range labels {
-		labels[i] = `"pii"`
+	targets := make([]string, capability.MaxClaimListEntries+1)
+	for i := range targets {
+		targets[i] = fmt.Sprintf("%q", fmt.Sprintf("tool:t%d", i))
 	}
-	raw := fmt.Sprintf(`[{"labels":[%s],"target":"tool:publish","approver":"ops@example.com"}]`, strings.Join(labels, ","))
-	_, err := capability.ParseDeclassifyApprovals(json.RawMessage(raw))
+	raw := fmt.Sprintf(`[{"subject":"a","targets":[%s]}]`, strings.Join(targets, ","))
+	_, err := capability.ParseDelegationGrants(json.RawMessage(raw))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "more than the maximum")
 
 	// One under the cap is fine, so the bound is a bound and not an off-by-one refusal.
-	raw = fmt.Sprintf(`[{"labels":[%s],"target":"tool:publish","approver":"ops@example.com"}]`, strings.Join(labels[:capability.MaxClaimListEntries], ","))
-	_, err = capability.ParseDeclassifyApprovals(json.RawMessage(raw))
+	raw = fmt.Sprintf(`[{"subject":"a","targets":[%s]}]`, strings.Join(targets[:capability.MaxClaimListEntries], ","))
+	_, err = capability.ParseDelegationGrants(json.RawMessage(raw))
 	require.NoError(t, err)
 }

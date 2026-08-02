@@ -1160,7 +1160,7 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 	// denied-and-forwarded would instead be BLOCKED, because isObserveDeny refuses to
 	// downgrade a HardDeny. A wiretap route documented never to block must not start
 	// blocking over an engine bug in a directive it was going to apply post-allow.
-	obligations, obligDeny := e.CollectObligations(matched, requestID, now)
+	obligations, obligDeny := e.CollectObligations(req.Delegation, matched, requestID, now)
 	if WillForwardDeny(ctx, matched) {
 		defer func() {
 			// The test is `!= DecisionAllow`, not `== DecisionDeny`, matching the transport's
@@ -1210,13 +1210,20 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 		}()
 	}
 
-	// An authenticated caller this engine cannot anchor as configured. It sits here — after
-	// the obligation and carried-label defers are installed, so a downgraded (observe-mode)
-	// refusal still carries the redactions and the label snapshot every other non-allow exit
-	// carries, and before the conditions, because it is a property of the request rather than
-	// of the conditions: a call that cannot be accounted must not reach the state commits
-	// below. Falling back to session keying here would let one caller split its own taint,
-	// budgets and antecedents across two buckets by alternating tokens — see anchorUnresolved.
+	// The delegation authority gate. It sits here — after the obligation and carried-label
+	// defers are installed, so a downgraded (observe-mode) refusal still carries the
+	// redactions and the label snapshot every other non-allow exit carries, and before the
+	// conditions, because it does not depend on them: the manifest may permit this target and
+	// every condition may pass, and the call is still one this delegate was never handed.
+	if delegDeny := e.checkDelegationTarget(req, matched.IsAuditOnly(), requestID, now); delegDeny != nil {
+		return *delegDeny
+	}
+
+	// An authenticated caller this engine cannot anchor as configured. It sits beside the
+	// delegation gate for the same reason: it is a property of the request rather than of the
+	// conditions, and a call that cannot be accounted must not reach the state commits below.
+	// Falling back to session keying here would let one caller split its own taint, budgets
+	// and antecedents across two buckets by alternating tokens — see anchorUnresolved.
 	if e.anchorUnresolved(req) {
 		return denyResponse(requestID, now, matched.IsAuditOnly(), nil, capability.DenialInfo{
 			Code:          capability.ErrCodeMissingContext,
@@ -1261,6 +1268,15 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 	// neither a phantom sequenceBlock antecedent nor a stranded flow label behind.
 	if ceilingDeny := e.checkEffectCeiling(effect, matched, carriedLabels, requestID, now); ceilingDeny != nil {
 		return *ceilingDeny
+	}
+
+	// The delegated consequence bound, on the same pre-commit side of the line and reading
+	// the SAME resolved effect. It runs after the policy's own ceiling so an action over both
+	// reports the ceiling: the ceiling is the operator's bound on what may happen at all,
+	// while this one is about who was allowed to ask for it, and fixing the second while the
+	// first still refuses would be wasted work.
+	if delegDeny := e.checkDelegationEffectClass(req, effect, matched.IsAuditOnly(), requestID, now); delegDeny != nil {
+		return *delegDeny
 	}
 
 	// The approval gate for the one directive that REMOVES a flow label. It sits with the
@@ -1367,7 +1383,7 @@ func (e *Engine) ValidateAction(ctx context.Context, req *capability.EnforceRequ
 		// forwarded. On an enforce route this is skipped and the deny blocks with nothing.
 		var obligations []capability.Obligation
 		if WillForwardDeny(ctx, nil) {
-			obs, obligDeny := e.CollectObligations(namingTargetConstraint(req, capabilities), requestID, now)
+			obs, obligDeny := e.CollectObligations(req.Delegation, namingTargetConstraint(req, capabilities), requestID, now)
 			if obligDeny != nil {
 				return *obligDeny
 			}
@@ -1393,7 +1409,7 @@ func (e *Engine) ValidateAction(ctx context.Context, req *capability.EnforceRequ
 			// bug, so its hard deny wins rather than forwarding unredacted.
 			var obligations []capability.Obligation
 			if WillForwardDeny(ctx, matched) {
-				obs, obligDeny := e.CollectObligations(matched, requestID, now)
+				obs, obligDeny := e.CollectObligations(req.Delegation, matched, requestID, now)
 				if obligDeny != nil {
 					return *obligDeny
 				}
@@ -1634,8 +1650,18 @@ var knownObligationTypes = map[string]bool{
 // unwired directive type — so they cannot drift on which directives translate to which
 // obligations. requestID and now stamp the fail-closed response the unwired-directive
 // guard returns, so it matches the surrounding decision.
-func (e *Engine) CollectObligations(matched *capability.Constraint, requestID, now string) ([]capability.Obligation, *capability.EnforceResponse) {
+func (e *Engine) CollectObligations(chain *capability.DelegationChain, matched *capability.Constraint, requestID, now string) ([]capability.Obligation, *capability.EnforceResponse) {
 	var obligations []capability.Obligation
+	// The delegation chain's composed redactFields, first so it applies even to a constraint
+	// carrying no directives at all. It is a parameter rather than something the caller
+	// unions on afterwards because there are five call sites — the allow path, two no-match/
+	// schema deny paths, and the PDP's two audit-downgrade paths — and the ones that matter
+	// most for a leak are the downgrades, which are exactly the ones easiest to forget. A
+	// signature that cannot be called without deciding what the chain contributes makes
+	// forgetting impossible.
+	if ob := delegatedRedaction(chain); ob != nil {
+		obligations = append(obligations, *ob)
+	}
 	for _, dir := range matched.Directives {
 		if dir == nil {
 			continue
