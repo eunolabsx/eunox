@@ -4,12 +4,11 @@
 package registry
 
 import (
-	"bytes"
 	"crypto/ed25519"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 
@@ -190,15 +189,7 @@ type TrustedKey struct {
 
 // permits reports whether this key may assert the given role.
 func (k *TrustedKey) permits(role string) bool {
-	if len(k.Roles) == 0 {
-		return true
-	}
-	for _, r := range k.Roles {
-		if r == role {
-			return true
-		}
-	}
-	return false
+	return len(k.Roles) == 0 || slices.Contains(k.Roles, role)
 }
 
 // TrustStore is the operator's set of trusted attestation keys, loaded from a local file.
@@ -235,13 +226,8 @@ func LoadTrustStore(path string) (*TrustStore, error) {
 	var doc struct {
 		Keys []TrustedKey `json:"keys"`
 	}
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&doc); err != nil {
-		return nil, fmt.Errorf("parsing attestation trust store %q: %w", resolved, err)
-	}
-	if dec.More() {
-		return nil, fmt.Errorf("parsing attestation trust store %q: trailing content after the first JSON object", resolved)
+	if err := strictDecodeJSON(data, &doc, fmt.Sprintf("attestation trust store %q", resolved), false); err != nil {
+		return nil, err
 	}
 	store := &TrustStore{keys: make(map[string]*TrustedKey, len(doc.Keys))}
 	for i := range doc.Keys {
@@ -297,21 +283,31 @@ func (s AttestationStatus) Signed() bool { return len(s.Attested)+len(s.Disputed
 
 // Summary renders the status as one short operator-facing token for a report column.
 func (s AttestationStatus) Summary() string {
+	var head string
 	switch {
 	case len(s.Disputed) > 0:
 		// A dispute leads, always, even alongside attestations. The whole reason to record
 		// one is that a reader must not skim past it, and a row that led with "vendor" while
 		// someone who looked disagreed would bury the signal under the endorsement.
-		return fmt.Sprintf("DISPUTED(%d)", len(s.Disputed))
+		head = fmt.Sprintf("DISPUTED(%d)", len(s.Disputed))
 	case s.VendorAttested:
-		return "vendor"
+		head = "vendor"
 	case len(s.Attested) > 0:
-		return fmt.Sprintf("reviewed(%d)", len(s.Attested))
+		head = fmt.Sprintf("reviewed(%d)", len(s.Attested))
 	case s.Unverified > 0:
 		return fmt.Sprintf("unverified(%d)", s.Unverified)
 	default:
 		return "-"
 	}
+	// The unverified count rides ALONGSIDE whatever verified, never gets replaced by it. The
+	// Unverified field exists precisely because "signed by strangers" and "not signed" are
+	// different states; reporting only the head hid the same distinction one level up, so an
+	// entry with one trusted reviewer and nine signatures from unknown keys rendered as a bare
+	// "reviewed(1)" and the operator had no indication the nine existed.
+	if s.Unverified > 0 {
+		return fmt.Sprintf("%s +unverified(%d)", head, s.Unverified)
+	}
+	return head
 }
 
 // VerifyAttestations checks every signature on c against the trust store and reports what
@@ -337,7 +333,8 @@ func (c *Contract) VerifyAttestations(store *TrustStore) (AttestationStatus, err
 	for i := range c.Signatures {
 		sig := &c.Signatures[i]
 		key := store.lookup(sig.KeyID)
-		if key == nil || !key.permits(sig.Role) {
+		if key == nil {
+			// A key the operator does not hold. Inert, never an error — see property 4.
 			status.Unverified++
 			continue
 		}
@@ -348,20 +345,42 @@ func (c *Contract) VerifyAttestations(store *TrustStore) (AttestationStatus, err
 			// stranger case.
 			return AttestationStatus{}, fmt.Errorf("contract %q: signature %q is not valid base64: %w", c.ID, sig.KeyID, decErr)
 		}
+		// VERIFY FIRST, then decide whether the verified statement counts. Testing the role
+		// restriction before the signature collapsed two different failures into one: a key
+		// the operator trusts only as a reviewer, whose vendor-role signature no longer
+		// matches the content, was reported as a stranger's signature rather than as the
+		// tampering it is — and tampering is the substitution this whole mechanism exists to
+		// catch, in an entry the operator explicitly configured a key for.
 		if !ed25519.Verify(key.pub, AttestationPayload(c.ID, digest, sig.Role, sig.Statement), raw) {
 			return AttestationStatus{}, fmt.Errorf("contract %q: signature by trusted key %q (%s) does not verify against this entry's content; the entry was edited after it was signed, or the signature was copied from another entry", c.ID, sig.KeyID, key.Owner)
+		}
+		if !key.permits(sig.Role) {
+			// A genuine signature, in a role this operator does not accept from this key.
+			// Trusting a key is not one decision, so this counts for nothing rather than
+			// erroring.
+			status.Unverified++
+			continue
 		}
 		owner := key.Owner
 		if owner == "" {
 			owner = key.KeyID
 		}
-		if sig.Statement == AttestStatementDisputes {
+		// An explicit switch with a fail-closed default. Signature.Validate closes the
+		// statement vocabulary, but it runs only on the LoadCorpus path, and this method is
+		// exported on an exported struct — a caller-built or externally-decoded Contract
+		// reaches here with an unchecked Statement. Falling through to "attested" would let a
+		// statement this build does not understand ("revoked", or a capitalized "Disputes")
+		// earn the strongest badge the report emits.
+		switch sig.Statement {
+		case AttestStatementDisputes:
 			disputed[owner] = true
-			continue
-		}
-		attested[owner] = true
-		if sig.Role == AttestRoleVendor {
-			status.VendorAttested = true
+		case AttestStatementAttests:
+			attested[owner] = true
+			if sig.Role == AttestRoleVendor {
+				status.VendorAttested = true
+			}
+		default:
+			status.Unverified++
 		}
 	}
 	status.Attested = sortedSet(attested)
@@ -377,7 +396,9 @@ func (t *TrustStore) lookup(keyID string) *TrustedKey {
 	return t.keys[keyID]
 }
 
-// sortedSet renders a set as a sorted slice, for deterministic reports.
+// sortedSet renders a set as a sorted slice, for deterministic reports. sortedKeys (the
+// error-message renderer in registry.go) is this plus a join, so the two share one collect-and-
+// sort rather than being near-identical bodies with near-identical names.
 func sortedSet(m map[string]bool) []string {
 	if len(m) == 0 {
 		return nil

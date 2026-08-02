@@ -6,6 +6,8 @@ package enforcement_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -41,7 +43,7 @@ func taintAndClear(t *testing.T, eng *enforcement.Engine, source, declassifying 
 	return eng.ValidateAction(ctx, declassifying, declassifyCaps(declassifying.TargetName, capability.FlowLabelPII))
 }
 
-// TestDeclassifyOnce_SecondPresentationEscalates is the replay window the issue names, closed:
+// TestDeclassifyOnce_SecondPresentationEscalates closes the replay window a scope-only grant leaves open:
 // the first call clears the label with the grant, and the SAME grant on the SAME token
 // escalates the second time rather than clearing again.
 func TestDeclassifyOnce_SecondPresentationEscalates(t *testing.T) {
@@ -137,12 +139,14 @@ func TestDeclassifyOnce_ASecondLiveGrantIsSelected(t *testing.T) {
 	assert.Equal(t, "apr-2", resp.ApprovalID)
 }
 
-// TestDeclassifyOnce_LedgerFaultEscalates is the fail-closed posture the issue requires: a
-// store fault while checking or burning a use-count must escalate, never silently allow.
+// TestDeclassifyOnce_LedgerFaultEscalates is the fail-closed posture a use-count demands:
+// a ledger fault while checking or burning a use-count must refuse, never silently allow.
 func TestDeclassifyOnce_LedgerFaultEscalates(t *testing.T) {
-	t.Run("read fault", func(t *testing.T) {
-		store := &faultyFlowStore{inner: flowlabelstore.NewInMemory(), failGetOn: "declassify"}
-		eng := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()), enforcement.WithFlowLabelStore(store))
+	t.Run("peek fault escalates", func(t *testing.T) {
+		eng := enforcement.New(
+			enforcement.WithCallCounter(&faultyCounter{inner: callcounter.NewInMemory(), failPeek: true}),
+			enforcement.WithFlowLabelStore(flowlabelstore.NewInMemory()),
+		)
 		resp := eng.ValidateAction(context.Background(),
 			onceApprovedReq("s", "publish", "ada@example.com", "apr-1", capability.FlowLabelPII),
 			declassifyCaps("publish", capability.FlowLabelPII))
@@ -152,9 +156,11 @@ func TestDeclassifyOnce_LedgerFaultEscalates(t *testing.T) {
 			"an unreadable ledger must not become the way to replay every one-shot grant in a token")
 	})
 
-	t.Run("burn fault", func(t *testing.T) {
-		store := &faultyFlowStore{inner: flowlabelstore.NewInMemory(), failAddOn: "declassify"}
-		eng := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()), enforcement.WithFlowLabelStore(store))
+	t.Run("burn fault hard-denies", func(t *testing.T) {
+		eng := enforcement.New(
+			enforcement.WithCallCounter(&faultyCounter{inner: callcounter.NewInMemory(), failAdmit: true}),
+			enforcement.WithFlowLabelStore(flowlabelstore.NewInMemory()),
+		)
 		resp := eng.ValidateAction(context.Background(),
 			onceApprovedReq("s", "publish", "ada@example.com", "apr-1", capability.FlowLabelPII),
 			declassifyCaps("publish", capability.FlowLabelPII))
@@ -164,29 +170,69 @@ func TestDeclassifyOnce_LedgerFaultEscalates(t *testing.T) {
 	})
 }
 
-// TestDeclassifyOnce_ClearedByTeardown pins that a session's spent grants are released with
-// the rest of its state, so a reused session id does not inherit another session's ledger.
-func TestDeclassifyOnce_ClearedByTeardown(t *testing.T) {
+// TestDeclassifyOnce_ConcurrentBurnAdmitsExactlyOne is why the ledger sits on the counter's
+// atomic admission rather than on a check-then-act against the flow store: two callers that
+// both observe the grant as live must not both spend it. The loser is refused, which is the
+// only outcome that keeps "once" meaning once.
+func TestDeclassifyOnce_ConcurrentBurnAdmitsExactlyOne(t *testing.T) {
+	counter, store := callcounter.NewInMemory(), flowlabelstore.NewInMemory()
+	caps := declassifyCaps("publish", capability.FlowLabelPII)
+	ctx := context.Background()
+
+	const racers = 8
+	var wg sync.WaitGroup
+	results := make([]capability.Decision, racers)
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			// Distinct sessions on one shared backend: the per-session decision lock the
+			// transport holds does not serialize these, which is exactly the shape that
+			// double-spent the grant when the burn was a Get-then-Add.
+			eng := enforcement.New(enforcement.WithCallCounter(counter), enforcement.WithFlowLabelStore(store))
+			results[i] = eng.ValidateAction(ctx,
+				onceApprovedReq(fmt.Sprintf("s%d", i), "publish", "ada@example.com", "apr-1", capability.FlowLabelPII),
+				caps).Decision
+		}(i)
+	}
+	wg.Wait()
+
+	allowed := 0
+	for _, d := range results {
+		if d == capability.DecisionAllow {
+			allowed++
+		}
+	}
+	assert.Equal(t, 1, allowed, "exactly one racer may spend a single-use approval, got %d of %d", allowed, racers)
+}
+
+// TestDeclassifyOnce_SurvivesSessionTeardown is the property the ledger's whole shape exists
+// for: a burn a session teardown could reclaim would make "approve this once" mean "once per
+// connection", and session lifetime is entirely under the caller's control.
+func TestDeclassifyOnce_SurvivesSessionTeardown(t *testing.T) {
 	eng := declassifyEngine()
 	ctx := context.Background()
 
 	require.Equal(t, capability.DecisionAllow, eng.ValidateAction(ctx,
-		onceApprovedReq("s", "publish", "ada@example.com", "apr-1", capability.FlowLabelPII),
+		onceApprovedReq("s1", "publish", "ada@example.com", "apr-1", capability.FlowLabelPII),
 		declassifyCaps("publish", capability.FlowLabelPII)).Decision)
 
-	require.NoError(t, eng.ClearSessionApprovals(ctx, "s"))
+	// Everything a session teardown reclaims.
+	require.NoError(t, eng.ClearSessionLabels(ctx, "s1"))
 
+	// A fresh session, same token, same grant.
 	after := eng.ValidateAction(ctx,
-		onceApprovedReq("s", "publish", "ada@example.com", "apr-1", capability.FlowLabelPII),
+		onceApprovedReq("s2", "publish", "ada@example.com", "apr-1", capability.FlowLabelPII),
 		declassifyCaps("publish", capability.FlowLabelPII))
-	assert.Equal(t, capability.DecisionAllow, after.Decision)
+	assert.Equal(t, capability.DecisionEscalate, after.Decision,
+		"reconnecting must not restore a spent single-use approval")
+	assert.Equal(t, "approval_consumed", after.Denial.Details["reason"])
 }
 
-// TestDeclassifyOnce_BurnFollowsTheTaskAnchor is the composition with task anchoring: a
-// one-shot approval spent on one enforcement point stays spent on the next, so re-entering
-// through a fresh session does not restore it. That is the replay a session-keyed ledger
-// would leave open in exactly the multi-PEP topology a one-shot approval is minted for.
-func TestDeclassifyOnce_BurnFollowsTheTaskAnchor(t *testing.T) {
+// TestDeclassifyOnce_BurnIsAnchorIndependent pins that the burn is not scoped to a session or
+// a task. "Approve clearing this once" means once; scoping the ledger to an anchor made it
+// once-per-anchor, which is a different and much weaker promise than the grant advertises.
+func TestDeclassifyOnce_BurnIsAnchorIndependent(t *testing.T) {
 	counter, store := callcounter.NewInMemory(), flowlabelstore.NewInMemory()
 	pepA := anchoredEngine(counter, store, true)
 	pepB := anchoredEngine(counter, store, true)
@@ -196,91 +242,112 @@ func TestDeclassifyOnce_BurnFollowsTheTaskAnchor(t *testing.T) {
 	spend.Claims = map[string]interface{}{"task_id": "t1"}
 	require.Equal(t, capability.DecisionAllow, pepA.ValidateAction(ctx, spend, declassifyCaps("publish", capability.FlowLabelPII)).Decision)
 
+	// A different session, a different enforcement point, and a DIFFERENT task: the grant is
+	// still spent, because the human approved it once and not once per task.
 	replay := onceApprovedReq("s2", "publish", "ada@example.com", "apr-1", capability.FlowLabelPII)
-	replay.Claims = map[string]interface{}{"task_id": "t1"}
+	replay.Claims = map[string]interface{}{"task_id": "t2"}
 	resp := pepB.ValidateAction(ctx, replay, declassifyCaps("publish", capability.FlowLabelPII))
 	assert.Equal(t, capability.DecisionEscalate, resp.Decision)
 	assert.Equal(t, "approval_consumed", resp.Denial.Details["reason"])
 }
 
-// faultyFlowStore fails Get or Add for keys carrying a marker substring, so a test can fault
-// exactly one of the two logical stores (labels or the declassify ledger) sharing the backend.
-type faultyFlowStore struct {
-	inner     capability.FlowLabelStore
-	failGetOn string
-	failAddOn string
-}
-
-func (f *faultyFlowStore) Add(ctx context.Context, key string, labels ...string) error {
-	if f.failAddOn != "" && hasPrefixToken(key, f.failAddOn) {
-		return errors.New("synthetic add fault")
-	}
-	return f.inner.Add(ctx, key, labels...)
-}
-
-func (f *faultyFlowStore) Get(ctx context.Context, key string) ([]string, error) {
-	if f.failGetOn != "" && hasPrefixToken(key, f.failGetOn) {
-		return nil, errors.New("synthetic get fault")
-	}
-	return f.inner.Get(ctx, key)
-}
-
-func (f *faultyFlowStore) Remove(ctx context.Context, key string, labels ...string) error {
-	return f.inner.Remove(ctx, key, labels...)
-}
-
-func (f *faultyFlowStore) Clear(ctx context.Context, key string) error {
-	return f.inner.Clear(ctx, key)
-}
-
-// hasPrefixToken reports whether key begins with the given verbatim prefix token. Counter and
-// store keys lead with their prefix ("flow:", "declassify:"), which is what lets a test aim a
-// fault at one of them.
-func hasPrefixToken(key, token string) bool {
-	return len(key) > len(token) && key[:len(token)] == token && key[len(token)] == ':'
-}
-
-// TestDeclassifyOnce_UnburnedWhenTheCallIsRefusedAfterTheBurn covers the rollback leg: the
-// burn commits, the sequenceBlock antecedent write then faults, and the call is hard-denied
-// and never forwarded — so the use has to be handed back. Otherwise a backend hiccup would
-// silently consume an approval for an action that did not happen.
-func TestDeclassifyOnce_UnburnedWhenTheCallIsRefusedAfterTheBurn(t *testing.T) {
-	store := flowlabelstore.NewInMemory()
+// TestDeclassifyOnce_ScopedByTargetNotJustID pins that one control-plane record minted per
+// approved action burns per action rather than collapsing to one use across all of them.
+func TestDeclassifyOnce_ScopedByTargetNotJustID(t *testing.T) {
+	eng := declassifyEngine()
 	ctx := context.Background()
 
-	// An engine whose antecedent write always faults, sharing the store with a healthy one.
-	broken := enforcement.New(
-		enforcement.WithCallCounter(&faultyCounter{inner: callcounter.NewInMemory()}),
-		enforcement.WithFlowLabelStore(store),
-	)
-	refused := broken.ValidateAction(ctx,
+	require.Equal(t, capability.DecisionAllow, eng.ValidateAction(ctx,
 		onceApprovedReq("s", "publish", "ada@example.com", "apr-1", capability.FlowLabelPII),
-		declassifyCaps("publish", capability.FlowLabelPII))
-	require.NotEqual(t, capability.DecisionAllow, refused.Decision, "the antecedent fault must refuse the call")
+		declassifyCaps("publish", capability.FlowLabelPII)).Decision)
 
-	healthy := enforcement.New(
-		enforcement.WithCallCounter(callcounter.NewInMemory()),
-		enforcement.WithFlowLabelStore(store),
-	)
-	retry := healthy.ValidateAction(ctx,
-		onceApprovedReq("s", "publish", "ada@example.com", "apr-1", capability.FlowLabelPII),
-		declassifyCaps("publish", capability.FlowLabelPII))
-	assert.Equal(t, capability.DecisionAllow, retry.Decision,
-		"a grant burned for a call that was then refused must be handed back")
+	// Same approval id, different target: a separate use.
+	assert.Equal(t, capability.DecisionAllow, eng.ValidateAction(ctx,
+		onceApprovedReq("s", "export", "ada@example.com", "apr-1", capability.FlowLabelPII),
+		declassifyCaps("export", capability.FlowLabelPII)).Decision)
 }
 
-// faultyCounter fails every recorded call, which is what the sequenceBlock antecedent write
-// uses, while leaving the read paths intact.
-type faultyCounter struct{ inner capability.CallCounter }
+// faultyCounter selectively faults one of the three CallCounter operations, so a test can aim
+// a fault at the antecedent write (IncrementAndGet), the ledger peek, or the ledger burn.
+type faultyCounter struct {
+	inner         capability.CallCounter
+	failIncrement bool
+	failPeek      bool
+	failAdmit     bool
+}
 
-func (f *faultyCounter) IncrementAndGet(context.Context, string, int, int) (int64, error) {
-	return 0, errors.New("synthetic counter fault")
+func (f *faultyCounter) IncrementAndGet(ctx context.Context, key string, windowSec, maxEntries int) (int64, error) {
+	if f.failIncrement {
+		return 0, errors.New("synthetic counter fault")
+	}
+	return f.inner.IncrementAndGet(ctx, key, windowSec, maxEntries)
 }
 
 func (f *faultyCounter) Peek(ctx context.Context, key string, windowSec int) (int64, error) {
+	if f.failPeek {
+		return 0, errors.New("synthetic peek fault")
+	}
 	return f.inner.Peek(ctx, key, windowSec)
 }
 
 func (f *faultyCounter) AdmitAll(ctx context.Context, buckets []capability.QuotaBucket) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error) {
+	if f.failAdmit {
+		return false, 0, 0, 0, errors.New("synthetic admit fault")
+	}
 	return f.inner.AdmitAll(ctx, buckets)
+}
+
+// TestUsableDeclassifyApproval_TracksConsumption is the predicate the wrapping-PDP hardening
+// path asks. It has to answer the same question checkDeclassify answers — is there a covering
+// approval that is still LIVE — because the scope-only test let a burned grant suppress the
+// hardening, leaving a wrapping layer's soft refusal for an --audit route to forward while the
+// same call without the wrapper met a hard escalation.
+func TestUsableDeclassifyApproval_TracksConsumption(t *testing.T) {
+	eng := declassifyEngine()
+	ctx := context.Background()
+	approvals := []capability.DeclassifyApproval{
+		{Labels: []string{capability.FlowLabelPII}, Target: "tool:publish", Approver: "ada", ID: "apr-1", Once: true},
+	}
+	want := []string{capability.FlowLabelPII}
+
+	usable, err := eng.UsableDeclassifyApproval(ctx, approvals, "tool:publish", want)
+	require.NoError(t, err)
+	assert.True(t, usable, "a fresh covering grant is usable")
+
+	// A grant covering a DIFFERENT action is not usable here.
+	usable, err = eng.UsableDeclassifyApproval(ctx, approvals, "tool:other", want)
+	require.NoError(t, err)
+	assert.False(t, usable)
+
+	// Spend it through the decision path, then ask again.
+	require.Equal(t, capability.DecisionAllow, eng.ValidateAction(ctx,
+		onceApprovedReq("s", "publish", "ada", "apr-1", capability.FlowLabelPII),
+		declassifyCaps("publish", capability.FlowLabelPII)).Decision)
+
+	usable, err = eng.UsableDeclassifyApproval(ctx, approvals, "tool:publish", want)
+	require.NoError(t, err)
+	assert.False(t, usable, "a burned grant must not read as authorization to a layer above the engine")
+
+	// A standing grant is always usable — it is never burned.
+	standing := []capability.DeclassifyApproval{
+		{Labels: []string{capability.FlowLabelPII}, Target: "tool:publish", Approver: "ada", ID: "apr-2"},
+	}
+	usable, err = eng.UsableDeclassifyApproval(ctx, standing, "tool:publish", want)
+	require.NoError(t, err)
+	assert.True(t, usable)
+}
+
+// TestUsableDeclassifyApproval_LedgerFaultSurfaces keeps the caller able to distinguish "no
+// usable approval" from "could not tell": the hardening path leaves a verdict downgradable on
+// a fault rather than hardening on an unreadable ledger, and it can only do that if the error
+// reaches it.
+func TestUsableDeclassifyApproval_LedgerFaultSurfaces(t *testing.T) {
+	eng := enforcement.New(
+		enforcement.WithCallCounter(&faultyCounter{inner: callcounter.NewInMemory(), failPeek: true}),
+		enforcement.WithFlowLabelStore(flowlabelstore.NewInMemory()),
+	)
+	_, err := eng.UsableDeclassifyApproval(context.Background(),
+		[]capability.DeclassifyApproval{{Labels: []string{capability.FlowLabelPII}, Target: "tool:publish", Approver: "ada", ID: "apr-1", Once: true}},
+		"tool:publish", []string{capability.FlowLabelPII})
+	assert.Error(t, err)
 }

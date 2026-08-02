@@ -38,22 +38,37 @@ const delegationConditionType = "delegation"
 // actionable: with a three-hop chain, "not permitted" says nothing about which delegator's
 // grant to widen. The target itself is already on the record.
 func (e *Engine) checkDelegationTarget(req *capability.EnforceRequest, auditOnly bool, requestID, now string) *capability.EnforceResponse {
-	if req == nil || req.Delegation.IsEmpty() {
+	if req == nil {
 		return nil
 	}
-	target := canonicalApprovalTarget(req)
+	return DelegationTargetDenial(req.Delegation, canonicalApprovalTarget(req), auditOnly, requestID, now)
+}
+
+// DelegationTargetDenial is the ONE construction of the target-axis refusal, exported
+// because the gate has to run on decision paths that never reach the engine: the PDP's
+// match-only `resources/unsubscribe`, and a JWT-only or wiretap route where there is no
+// manifest engine at all. Those paths built their own denies before this existed, which is
+// how three of the six enforced methods ended up unbound by the chain — a refusal every
+// caller has to remember to construct is a refusal someone forgets.
+//
+// target is the request's canonical "<type>:<bare>" spelling. An EMPTY target on a delegated
+// request is itself a refusal: a request whose target cannot be resolved cannot be scoped
+// against the chain either, and admitting it would make an unresolvable target the way past
+// every hop's grant. Returns nil when there is no chain (the overwhelming majority of
+// requests) or the chain admits the target.
+func DelegationTargetDenial(chain *capability.DelegationChain, target string, auditOnly bool, requestID, now string) *capability.EnforceResponse {
+	if chain.IsEmpty() {
+		return nil
+	}
 	if target == "" {
-		// A delegated request whose target cannot be resolved cannot be scoped against the
-		// chain either. Refusing is the only fail-closed answer: admitting it would let an
-		// unresolvable target be the way past every hop's grant.
-		return e.delegationDenial(auditOnly, requestID, now, "unresolvable_target", "",
+		return delegationDenial(auditOnly, requestID, now, "unresolvable_target", "",
 			"the request carries no resolvable target, so it cannot be scoped against the delegation chain it presents", nil)
 	}
-	ok, blockedBy := req.Delegation.PermitsTarget(target)
+	ok, blockedBy := chain.PermitsTarget(target)
 	if ok {
 		return nil
 	}
-	return e.delegationDenial(auditOnly, requestID, now, "target_not_delegated", blockedBy,
+	return delegationDenial(auditOnly, requestID, now, "target_not_delegated", blockedBy,
 		fmt.Sprintf("%s is not among the actions delegated to %q; a delegate cannot reach past the authority its delegator handed it", target, blockedBy),
 		map[string]interface{}{"target": target})
 }
@@ -72,7 +87,7 @@ func (e *Engine) checkDelegationEffectClass(req *capability.EnforceRequest, eff 
 	if !capped || capability.EffectClassAtMost(eff.Class, cap0) {
 		return nil
 	}
-	return e.delegationDenial(auditOnly, requestID, now, "effect_class", subject,
+	return delegationDenial(auditOnly, requestID, now, "effect_class", subject,
 		fmt.Sprintf("this action's effect class %q exceeds the %q cap delegated to %q", eff.Class, cap0, subject),
 		map[string]interface{}{"effect_class": eff.Class, "delegated_max_effect_class": cap0})
 }
@@ -88,7 +103,7 @@ func (e *Engine) checkDelegationEffectClass(req *capability.EnforceRequest, eff 
 // destroying the evidence or the invariant (an unapproved declassification, an over-ceiling
 // effect, a failed state write); a delegate reaching past its grant on an observe route is a
 // prediction being logged, which is what observe mode is.
-func (e *Engine) delegationDenial(auditOnly bool, requestID, now, reason, hop, message string, extra map[string]interface{}) *capability.EnforceResponse {
+func delegationDenial(auditOnly bool, requestID, now, reason, hop, message string, extra map[string]interface{}) *capability.EnforceResponse {
 	details := map[string]interface{}{
 		// "delegation": true is the discriminator every refusal on this axis carries, so one
 		// filter finds every attenuation event on the tape — the same role "flow": true plays

@@ -1048,6 +1048,12 @@ func (p *JWTPDP) DecideResourceCancel(ctx context.Context, sessionID, uri, sourc
 		return p.audienceDeny(fmt.Sprintf("token audience %v does not satisfy the route's required audience %q", claims.Audiences, p.routeAudience))
 	}
 	target := EnforceTarget{Type: capability.TargetTypeResource, Name: uri}
+	// The delegation target gate, for the same reason Decide runs one: this method can
+	// resolve entirely inside the wrapper (an exhaustive claim plus a nil or wiretap inner),
+	// so the chain would otherwise bound the subscribe and not the cancel.
+	if deny := delegationTargetDenial(ctx, p.clock, target, false); deny != nil {
+		return *deny
+	}
 	if claims.HasCapabilities {
 		// The claim is an exhaustive allowlist, so a resource it does not name is not
 		// cancellable through this token either. Matching (not condition evaluation) is
@@ -1255,6 +1261,18 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 	// routeAudience) or --jwt-allow-any-audience.
 	if !p.routeAudienceSatisfied(claims) {
 		return p.audienceDeny(fmt.Sprintf("token audience %v does not satisfy the route's required audience %q", claims.Audiences, p.routeAudience))
+	}
+
+	// The delegation target gate, applied HERE rather than left to the inner PDP. Every
+	// other axis of the chain composes inside the enforcement engine, but this wrapper has
+	// decision paths that never reach one: a JWT-only route has no manifest engine, and a
+	// policyless route's inner is the wiretap AlwaysAllowPDP. On those routes the chain was
+	// validated at the token boundary — a widening hop rejected the token — and then applied
+	// to nothing, so a delegate whose grant reaches no target was still allowed. Running it
+	// before the capability logic also means a delegated call is refused for the reason that
+	// actually bounds it rather than for whichever check happened to fire first.
+	if deny := delegationTargetDenial(ctx, p.clock, target, false); deny != nil {
+		return *deny
 	}
 
 	// No mcp.capabilities field: the JWT provides identity only and the decision

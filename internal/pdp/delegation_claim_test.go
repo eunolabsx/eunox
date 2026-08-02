@@ -106,9 +106,14 @@ func TestValidateToken_DelegationChain(t *testing.T) {
 			wantErr: "chain names",
 		},
 		{
-			name:    "a glob in a delegated target rejects the token",
+			name:    "a star in a delegated target rejects the token",
 			grants:  `[{"subject":"agent-a","targets":["tool:read_*"]}]`,
-			wantErr: "glob metacharacter",
+			wantErr: "contains '*'",
+		},
+		{
+			name:    "a misspelled act nesting rejects the token",
+			act:     `{"sub":"agent-b","acts":{"sub":"agent-a"}}`,
+			wantErr: "unknown",
 		},
 		{
 			name:    "an actor with no sub rejects the token",

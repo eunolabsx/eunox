@@ -6,6 +6,7 @@ package capability
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -129,6 +130,58 @@ type DelegationChain struct {
 	// Grants are the per-hop grants, delegator-first. Empty when the token carries no
 	// mcp.delegation claim.
 	Grants []DelegationGrant
+
+	// The four derived views the decision path reads, computed ONCE by
+	// ValidateDelegationChain and never written again. A chain is built at token validation
+	// and is immutable and shared read-only across every request on that token, so rebuilding
+	// these per call was pure repeated work — and not trivial work: each allocated a map and a
+	// sorted slice, and handleFlowLabel reads two of them once per flowLabel condition, so an
+	// eight-hop chain paid dozens of identical map builds on every decision.
+	//
+	// This is the same memoize-at-validation pattern JWTClaims already uses for its parsed
+	// capability heads and its flattened claims map, and it is safe for the same reason: the
+	// value is finished before any request can observe it, so no reader ever races a write.
+	// A chain built by a struct literal (in tests) has none of them; every accessor falls back
+	// to computing on the fly and never stores, so a literal-built chain behaves identically.
+	memo *delegationMemo
+	// targetIndex is the per-hop target sets PermitsTarget tests against, so a catalog filter
+	// is O(1) per entry per hop instead of a linear scan of every hop's list. nil for a
+	// literal-built chain, where PermitsTarget falls back to scanning.
+	targetIndex []map[string]struct{}
+}
+
+// delegationMemo holds the precomputed views. A pointer so the zero DelegationChain (and any
+// struct-literal one) is plainly "not memoized" rather than "memoized to empty".
+type delegationMemo struct {
+	forcedLabels   []string
+	allowLabels    []string
+	allowCapped    bool
+	redactFields   []string
+	effectClass    string
+	effectSubject  string
+	effectClassSet bool
+}
+
+// memoize computes the derived views once. Called only from ValidateDelegationChain, before
+// the chain is published to any reader.
+func (c *DelegationChain) memoize() {
+	c.targetIndex = make([]map[string]struct{}, len(c.Grants))
+	for i := range c.Grants {
+		if c.Grants[i].Targets == nil {
+			continue
+		}
+		set := make(map[string]struct{}, len(*c.Grants[i].Targets))
+		for _, t := range *c.Grants[i].Targets {
+			set[t] = struct{}{}
+		}
+		c.targetIndex[i] = set
+	}
+	m := &delegationMemo{}
+	m.forcedLabels = c.computeForcedLabels()
+	m.allowLabels, m.allowCapped = c.computeAllowedLabelCap()
+	m.redactFields = c.computeRedactFields()
+	m.effectClass, m.effectSubject, m.effectClassSet = c.computeEffectClassCap()
+	c.memo = m
 }
 
 // IsEmpty reports whether the token carried no delegation state at all — the overwhelmingly
@@ -137,9 +190,17 @@ func (c *DelegationChain) IsEmpty() bool {
 	return c == nil || (len(c.Actors) == 0 && len(c.Grants) == 0)
 }
 
-// Delegate returns the identity the token is currently held by: the last actor in the chain,
-// or "" when the token carries no actor chain. It is stamped on the audit record so a
-// delegated call is attributable to the hop that made it, not only to the original subject.
+// Delegate returns the identity the token is currently held by: the last actor in the chain
+// (delegator-first order, so the most recent actor is last), or "" when the token carries no
+// actor chain.
+//
+// It is the RFC 8693 reading of the chain in one place — "the outermost `act` is who holds
+// this now" — for a caller that needs to attribute or log a delegated call. eunox does not
+// currently stamp it on the audit record: a delegated ALLOW is recorded under the token's
+// `sub` like any other, and only a delegation REFUSAL names a hop (the one that blocked it, in
+// the denial's details). Adding it to the tape means a new top-level signed field and the
+// threat-model entry that goes with it, which is a deliberate change rather than a side
+// effect of this accessor existing.
 func (c *DelegationChain) Delegate() string {
 	if c == nil || len(c.Actors) == 0 {
 		return ""
@@ -163,7 +224,18 @@ func (c *DelegationChain) PermitsTarget(target string) (ok bool, blockedBy strin
 		if g.Targets == nil {
 			continue
 		}
-		if !containsExact(*g.Targets, target) {
+		// The precomputed set when the chain came through validation (every production
+		// chain), a linear scan for a struct-literal one. The index matters because this runs
+		// per CATALOG ENTRY in the list filters: a 200-entry catalog behind an eight-hop chain
+		// was up to 200x8x|targets| string comparisons on every tools/list, three times over
+		// for the three list flavors.
+		if i < len(c.targetIndex) && c.targetIndex[i] != nil {
+			if _, ok := c.targetIndex[i][target]; !ok {
+				return false, g.Subject
+			}
+			continue
+		}
+		if !slices.Contains(*g.Targets, target) {
 			return false, g.Subject
 		}
 	}
@@ -172,7 +244,7 @@ func (c *DelegationChain) PermitsTarget(target string) (ok bool, blockedBy strin
 
 // ForcedLabels returns the union of every hop's Labels, in canonical vocabulary order. These
 // are unioned into a call's flow check — never into the anchor's stored set.
-func (c *DelegationChain) ForcedLabels() []string {
+func (c *DelegationChain) computeForcedLabels() []string {
 	if c == nil {
 		return nil
 	}
@@ -190,7 +262,7 @@ func (c *DelegationChain) ForcedLabels() []string {
 // declared one. A nil-with-true result is the full quarantine (no labeled flow reaches any
 // sink); false means no hop capped the sink allow-set and the manifest's own Allow stands
 // unmodified.
-func (c *DelegationChain) AllowedLabelCap() (allowed []string, capped bool) {
+func (c *DelegationChain) computeAllowedLabelCap() (allowed []string, capped bool) {
 	if c == nil {
 		return nil, false
 	}
@@ -217,19 +289,22 @@ func (c *DelegationChain) AllowedLabelCap() (allowed []string, capped bool) {
 	if !capped || len(acc) == 0 {
 		return nil, capped
 	}
-	out := make([]string, 0, len(acc))
-	for _, l := range FlowLabelVocabulary() {
-		if acc[l] {
-			out = append(out, l)
-		}
+	keys := make([]string, 0, len(acc))
+	for l := range acc {
+		keys = append(keys, l)
 	}
-	return out, true
+	// NormalizeDeclaredLabels is the ONE renderer of a label set in canonical vocabulary
+	// order, shared with the attribution path and ForcedLabels above. A third hand-rolled copy
+	// of that loop would be a third place to update when the vocabulary grows, and this one
+	// decides which labels a delegated call may carry into a sink — a divergence there is a
+	// silent change in what is permitted, not a compile error.
+	return NormalizeDeclaredLabels(keys), true
 }
 
 // RedactFields returns the union of every hop's RedactFields, sorted for a deterministic
 // obligation. Composing rather than replacing is the narrowing direction: a delegate sees at
 // least as much masked as its delegator did.
-func (c *DelegationChain) RedactFields() []string {
+func (c *DelegationChain) computeRedactFields() []string {
 	if c == nil {
 		return nil
 	}
@@ -252,7 +327,7 @@ func (c *DelegationChain) RedactFields() []string {
 
 // EffectClassCap returns the most restrictive MaxEffectClass any hop declared, and the hop
 // that declared it. ok is false when no hop capped the class.
-func (c *DelegationChain) EffectClassCap() (class, subject string, ok bool) {
+func (c *DelegationChain) computeEffectClassCap() (class, subject string, ok bool) {
 	if c == nil {
 		return "", "", false
 	}
@@ -266,6 +341,57 @@ func (c *DelegationChain) EffectClassCap() (class, subject string, ok bool) {
 		}
 	}
 	return class, subject, ok
+}
+
+// ForcedLabels returns the union of every hop's Labels, in canonical vocabulary order. These
+// are unioned into a call's flow check — never into the anchor's stored set.
+func (c *DelegationChain) ForcedLabels() []string {
+	if c == nil {
+		return nil
+	}
+	if c.memo != nil {
+		return c.memo.forcedLabels
+	}
+	return c.computeForcedLabels()
+}
+
+// AllowedLabelCap returns the intersection of every hop's AllowLabels, and whether any hop
+// declared one. A nil-with-true result is the full quarantine (no labeled flow reaches any
+// sink); false means no hop capped the sink allow-set and the manifest's own Allow stands
+// unmodified.
+func (c *DelegationChain) AllowedLabelCap() (allowed []string, capped bool) {
+	if c == nil {
+		return nil, false
+	}
+	if c.memo != nil {
+		return c.memo.allowLabels, c.memo.allowCapped
+	}
+	return c.computeAllowedLabelCap()
+}
+
+// RedactFields returns the union of every hop's RedactFields, sorted for a deterministic
+// obligation. Composing rather than replacing is the narrowing direction: a delegate sees at
+// least as much masked as its delegator did.
+func (c *DelegationChain) RedactFields() []string {
+	if c == nil {
+		return nil
+	}
+	if c.memo != nil {
+		return c.memo.redactFields
+	}
+	return c.computeRedactFields()
+}
+
+// EffectClassCap returns the most restrictive MaxEffectClass any hop declared, and the hop
+// that declared it. ok is false when no hop capped the class.
+func (c *DelegationChain) EffectClassCap() (class, subject string, ok bool) {
+	if c == nil {
+		return "", "", false
+	}
+	if c.memo != nil {
+		return c.memo.effectClass, c.memo.effectSubject, c.memo.effectClassSet
+	}
+	return c.computeEffectClassCap()
 }
 
 // Validate checks one grant in isolation: the fields it declares must be ones this build can
@@ -286,8 +412,15 @@ func (g *DelegationGrant) Validate() error {
 			if t == "" {
 				return fmt.Errorf("delegation grant for %q has an empty entry in 'targets'", g.Subject)
 			}
-			if ContainsGlobMeta(t) {
-				return fmt.Errorf("delegation grant for %q: target %q contains a glob metacharacter (%s); a delegated target is matched literally, so a pattern would widen one hop's grant across every matching action", g.Subject, t, GlobMetaChars)
+			// Only '*' is refused, and only because it is the character an author writes
+			// when they MEAN a pattern. Delegated targets are matched literally, so no
+			// metacharacter can widen anything — which is exactly why refusing the full
+			// GlobMetaChars set was wrong: it made a resource URI carrying a query string
+			// ("resource:https://api.example.com/search?q=x") or a Windows path unexpressible,
+			// and because a malformed grant rejects the TOKEN, one such target refused every
+			// request the caller made rather than the one resource it named.
+			if strings.Contains(t, "*") {
+				return fmt.Errorf("delegation grant for %q: target %q contains '*'; a delegated target is matched literally, so a pattern would silently grant nothing rather than the set of actions it appears to name — list the actions explicitly", g.Subject, t)
 			}
 			if _, _, err := ParseTarget(t); err != nil {
 				return fmt.Errorf("delegation grant for %q: %w", g.Subject, err)
@@ -328,6 +461,13 @@ func (g *DelegationGrant) Validate() error {
 // unset likewise removes nothing: the delegator's grant is applied at decision time in its own
 // right, so an omitted field cannot escape it.
 func (g *DelegationGrant) NarrowsFrom(prior *DelegationGrant) error {
+	if g == nil {
+		// Every other method in this package guards its receiver; this one is reached with a
+		// slice element in-tree, so the guard is defense in depth rather than a live path —
+		// but an API whose neighbours are all nil-safe must not have the one member that
+		// panics.
+		return fmt.Errorf("delegation grant is null")
+	}
 	if prior == nil {
 		return nil
 	}
@@ -377,6 +517,47 @@ func (g *DelegationGrant) NarrowsFrom(prior *DelegationGrant) error {
 	return nil
 }
 
+// tightenedBy folds one hop into the running floor the next hop is compared against: the
+// narrowest value seen so far on each axis, in that axis's own direction. It is the
+// accumulator ValidateDelegationChain walks the chain with, so a hop that omits an axis
+// carries the previous constraint forward rather than erasing it.
+//
+// It is deliberately NOT the effective grant the decision path applies — that stays "every hop
+// applies", so the enforcement does not depend on this fold being right. This only decides
+// what a later hop is measured against.
+func (g *DelegationGrant) tightenedBy(next *DelegationGrant) *DelegationGrant {
+	out := *g
+	out.Subject = next.Subject
+	if next.Targets != nil {
+		out.Targets = next.Targets
+	}
+	if len(next.Labels) > 0 {
+		out.Labels = NormalizeDeclaredLabels(append(append([]string{}, g.Labels...), next.Labels...))
+	}
+	if next.AllowLabels != nil {
+		out.AllowLabels = next.AllowLabels
+	}
+	if len(next.RedactFields) > 0 {
+		set := map[string]bool{}
+		for _, f := range g.RedactFields {
+			set[f] = true
+		}
+		for _, f := range next.RedactFields {
+			set[f] = true
+		}
+		merged := make([]string, 0, len(set))
+		for f := range set {
+			merged = append(merged, f)
+		}
+		sort.Strings(merged)
+		out.RedactFields = merged
+	}
+	if next.MaxEffectClass != "" && (out.MaxEffectClass == "" || EffectClassAtMost(next.MaxEffectClass, out.MaxEffectClass)) {
+		out.MaxEffectClass = next.MaxEffectClass
+	}
+	return &out
+}
+
 // ParseActorChain decodes the RFC 8693 `act` claim into subjects ordered DELEGATOR-FIRST.
 // raw is the claim as it came off a verified token; absent or JSON null yields (nil, nil).
 //
@@ -402,6 +583,13 @@ func ParseActorChain(raw json.RawMessage) ([]string, error) {
 			return nil, fmt.Errorf("%s claim nests more than %d actors; refusing to walk an unbounded delegation chain", ClaimActor, MaxDelegationDepth)
 		}
 		var node actNode
+		// Strict, exactly as the grant decoder is: an IdP template that misspells "act" as
+		// "acts" would otherwise TRUNCATE the chain silently, and with an act-only token
+		// nothing downstream detects it — the hop-for-hop agreement check is skipped when
+		// there are no grants, and Delegate() then names the wrong actor.
+		if err := rejectUnknownJSONFields(cur, &node, fmt.Sprintf("%s claim at depth %d", ClaimActor, depth)); err != nil {
+			return nil, err
+		}
 		if err := json.Unmarshal(cur, &node); err != nil {
 			return nil, fmt.Errorf("%s claim at depth %d must be an object with a 'sub' member: %w", ClaimActor, depth, err)
 		}
@@ -487,31 +675,37 @@ func ValidateDelegationChain(actors []string, grants []DelegationGrant) (*Delega
 			}
 		}
 	}
+	// Each hop is compared against the ACCUMULATED narrowest of everything before it, not
+	// merely against its immediate predecessor. Pairwise comparison is vacuous the moment an
+	// intervening hop omits an axis: with grants [{targets:[x]}, {}, {targets:[x, wipe_db]}]
+	// both adjacent checks skip the targets axis (one side is absent each time) and the chain
+	// is accepted, though hop 3 declares authority hop 1 never held. The decision path applies
+	// every hop, so that chain is still refused at wipe_db — but the boundary check exists
+	// precisely to make a mis-minted chain LOUD, and a check that stays silent on the shape it
+	// was written for is not one.
+	// len(grants) may be 0 — an `act`-only token expresses the chain's identities and no
+	// narrowing at all, which is well-formed. Indexing grants[0] unconditionally panicked on
+	// exactly that shape.
+	var floor DelegationGrant
 	for i := 1; i < len(grants); i++ {
-		if err := grants[i].NarrowsFrom(&grants[i-1]); err != nil {
+		if i == 1 {
+			floor = grants[0]
+		}
+		if err := grants[i].NarrowsFrom(&floor); err != nil {
 			return nil, fmt.Errorf("delegation chain widens at hop %d: %w", i, err)
 		}
+		floor = *floor.tightenedBy(&grants[i])
 	}
-	return &DelegationChain{Actors: actors, Grants: grants}, nil
+	chain := &DelegationChain{Actors: actors, Grants: grants}
+	chain.memoize()
+	return chain, nil
 }
 
-// containsExact reports whether list holds s verbatim. Delegated targets are literal, so this
-// is the whole matching rule — deliberately not a glob match (see DelegationGrant.Targets).
-func containsExact(list []string, s string) bool {
-	for _, v := range list {
-		if v == s {
-			return true
-		}
-	}
-	return false
-}
-
-// trimmedList returns a copy of list with each entry space-trimmed, or nil for an empty
-// input, so a padded claim value compares equal to the manifest spelling it names.
-func trimmedList(list []string) []string {
-	if len(list) == 0 {
-		return nil
-	}
+// trimEach returns a copy of list with each entry space-trimmed, so a padded claim value
+// compares equal to the manifest spelling it names. Always non-nil, so each caller applies its
+// OWN empty-list policy — which is the one thing that differs between the two below, and the
+// one thing that must not be shared.
+func trimEach(list []string) []string {
 	out := make([]string, len(list))
 	for i, v := range list {
 		out[i] = strings.TrimSpace(v)
@@ -519,16 +713,22 @@ func trimmedList(list []string) []string {
 	return out
 }
 
-// trimmedListPtr is trimmedList for the pointer-valued fields, preserving the
-// absent(nil)/present-empty distinction those fields depend on: a present-empty list must stay
-// present-empty (it is the deny-all grant), never collapse to nil (which means unrestricted).
+// trimmedList collapses an empty input to nil: for the slice-valued fields, empty and absent
+// mean the same thing.
+func trimmedList(list []string) []string {
+	if len(list) == 0 {
+		return nil
+	}
+	return trimEach(list)
+}
+
+// trimmedListPtr preserves the absent(nil)/present-empty distinction the pointer-valued fields
+// depend on: a present-empty list must stay present-empty (it is the deny-all grant), never
+// collapse to nil (which means unrestricted).
 func trimmedListPtr(list *[]string) *[]string {
 	if list == nil {
 		return nil
 	}
-	out := make([]string, len(*list))
-	for i, v := range *list {
-		out[i] = strings.TrimSpace(v)
-	}
+	out := trimEach(*list)
 	return &out
 }

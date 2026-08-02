@@ -2337,11 +2337,20 @@ than clearing again:
   written, the call hard-denies rather than clearing anyway.
 - **A token may carry several grants.** The proxy uses the first *live* one, so a
   spent grant beside a fresh one is passed over rather than refused on.
-- **The ledger follows the anchor.** Under session anchoring (the default) a burn
-  is released with the session; under `taskAnchoredState` it follows the **task**,
-  so re-entering through a fresh session does not restore a spent approval — which
-  is the replay a per-session ledger would leave open in exactly the multi-PEP
-  topology a one-shot approval is minted for.
+- **The burn is not scoped to anything.** Not the session, not the task. "Approve
+  clearing this once" means once: reconnecting does not restore it, a second session
+  does not get its own copy, and a different task does not either. The one bound is
+  **retention** — a burn is remembered for seven days, after which the grant is live
+  again. That is a real limit on the guarantee, stated rather than wished away, and
+  the answer to it is the one the docs already give: mint a short-lived token per
+  approval.
+- **Concurrency is closed at the burn, not at the check.** Two calls presenting the
+  same live grant at the same moment can both *see* it as live; exactly one is
+  admitted, and the other is refused. Over-refusing one of two racing calls is the
+  only outcome that keeps "once" meaning once.
+- **A call refused after its burn does not get the use back.** The grant is spent.
+  That over-refuses (mint another approval) rather than handing a use back to a
+  caller whose action may still have been forwarded by an `--audit` route.
 
 A standing grant (`once` unset) still behaves exactly as before, because an operator
 whose control plane already mints a short-lived token per approval has the property
@@ -2513,10 +2522,11 @@ delegator's whole surface: the manifest still bounds it.
 
 ### Other rules
 
-- **Delegated targets are literal.** A glob in a grant is refused, exactly as it is in
-  a declassify approval: a pattern widens one scoped grant across every matching
-  action, and set containment between literal sets is a subset test an operator can
-  verify by reading.
+- **Delegated targets are literal.** `*` in a grant is refused: it is the character an
+  author writes when they *mean* a pattern, and a pattern here would silently grant
+  nothing rather than the set of actions it appears to name. Every other character is
+  ordinary — a resource URI carrying `?`, `[` or `\` is a perfectly good delegated
+  target, and refusing those made an entire class of resource unexpressible.
 - **`act` and `mcp.delegation` must agree hop for hop** when both are present. A
   mismatch means the token's two halves describe different delegations, and picking
   either would be guessing. Grants without an `act` chain are accepted (an IdP that
@@ -2585,10 +2595,17 @@ conventional:
    `input.claims` keys filled authoritatively from the verified token, which a
    same-named custom claim cannot shadow. An agent cannot pick which task's budget it
    spends.
-3. **It falls back to the session, never to a shared bucket.** A request with no token,
-   or a token carrying no `task_id`, is anchored exactly as it is today. Turning this
-   on can never make two unauthenticated callers share state — and it does nothing at
-   all without a JWT integration that mints `mcp.task_id`.
+3. **It falls back to the session for an unauthenticated caller, and refuses an
+   authenticated one it cannot anchor.** A request with **no token** is anchored on its
+   session exactly as it is today, so turning this on can never make two unauthenticated
+   callers share state. A request that **did** present a token but carries no `task_id` is
+   **denied** (`MISSING_CONTEXT`): on an HTTP host each request carries its own
+   `Authorization` header, so falling back there would let one caller split its own taint,
+   budgets and antecedents across two buckets by alternating tokens — and every direction
+   of that split is a fail-open. An operator who enables this has an IdP minting the claim;
+   a token without it on such a route is a misconfiguration the proxy cannot account for
+   safely. eunox prints a startup notice if the option is on with no JWT validation
+   configured at all, since it would then do nothing.
 
 A task-anchored key carries the anchor kind as its own component, so a task named `x`
 and a session named `x` address different buckets, and a session-anchored key is
@@ -2596,9 +2613,18 @@ byte-for-byte what it was before this option existed.
 
 > **Task state outlives the session that wrote it.** That is the whole point, so session
 > teardown does not reclaim it — clearing it on disconnect would let an agent launder a
-> task's taint, or recover a spent one-shot approval, by reconnecting. Pair this with the
-> **Redis** backends, whose idle TTL reclaims an abandoned task, or bound the in-memory
-> flow store with `flowlabelstore.WithMaxKeys`.
+> task's taint by reconnecting. **Use the Redis backends for this mode**: their idle TTL is
+> what reclaims an abandoned task. The in-memory flow store has no eviction at all, only the
+> fail-closed `WithMaxKeys` admission ceiling, so a long-lived process accumulating distinct
+> task ids will eventually refuse new ones — over-blocking, but a restart to recover.
+
+> **Label rollback stands down under task anchoring.** When a source call's flow write
+> commits and a later write in the same commit faults, the engine normally removes the labels
+> that call added. It does not do so on a task key: the delta is computed from a snapshot
+> taken under one session's decision lock, and that lock does not span a key two sessions
+> share, so the removal could delete taint a *concurrent* session legitimately deposited. The
+> label is stranded instead, which over-blocks a later sink — the direction the rollback path
+> already accepts as its residual.
 
 ## 6. TTL guidance
 

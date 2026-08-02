@@ -990,7 +990,6 @@ func (p *ManifestPDP) ReleaseSession(ctx context.Context, sessionID string) {
 		return
 	}
 	_ = p.engine.ClearSessionLabels(ctx, sessionID)
-	_ = p.engine.ClearSessionApprovals(ctx, sessionID)
 }
 
 // Decide evaluates a tools/call against the manifest: it selects the
@@ -1583,16 +1582,17 @@ func (p *ManifestPDP) withForwardObligations(ctx context.Context, r capability.E
 	}
 	dirs := p.directivesNamingTarget(target)
 	chain := delegationFromContext(ctx)
-	// The early return has to account for the chain too: a delegated caller whose hops
-	// compose a redactFields list must have it applied even when no manifest entry names this
-	// target, and returning on `len(dirs) == 0` alone would forward the response unmasked on
-	// exactly the no-match-under-audit path this function exists to cover.
-	if len(dirs) == 0 && len(chain.RedactFields()) == 0 {
-		return r
-	}
+	// No early return on `len(dirs) == 0`: a delegated caller whose hops compose a
+	// redactFields list must have it applied even when no manifest entry names this target,
+	// and CollectObligations already answers "is there anything to apply" — restating that
+	// question here meant asking the chain twice and gave a second place for the two to
+	// disagree about when the response is forwarded unmasked.
 	obs, deny := p.engine.CollectObligations(chain, &capability.Constraint{Target: string(target.Type) + ":" + target.Name, Directives: dirs}, r.RequestID, r.DecidedAt)
 	if deny != nil {
 		return *deny
+	}
+	if len(obs) == 0 {
+		return r
 	}
 	r.Obligations = obs
 	return r
@@ -1719,6 +1719,12 @@ func (p *ManifestPDP) hardenOnEffectCeiling(ctx context.Context, sessionID strin
 		},
 		Claims:         claims,
 		DeclaredLabels: declaredLabelsFromContext(ctx),
+		// The chain, so the composed verdict bounds the same consequence axis the full
+		// path does. Without it a wrapping layer's soft refusal could be downgraded and
+		// FORWARDED for a call whose delegated maxEffectClass the same manifest refuses
+		// outright without the JWT — the "adding a token weakened enforcement" inversion
+		// this whole function exists to close.
+		Delegation: delegationFromContext(ctx),
 	}
 	verdict := p.engine.CeilingVerdictFor(ctx, req, matched)
 	if verdict == nil {
@@ -1816,9 +1822,17 @@ func (p *ManifestPDP) hardenOnUnapprovedDeclassify(ctx context.Context, r capabi
 		return r, false
 	}
 	canonical := string(target.Type) + ":" + target.Name
-	if capability.FindDeclassifyApproval(declassifyApprovalsFromContext(ctx), canonical, want) != nil {
-		// A covering approval exists, so the declassification is not what makes this call
-		// refusable — the outer layer's own verdict stands, downgradable as it was.
+	// USABLE, not merely covering. The scope-only test would treat a single-use grant this
+	// anchor has already burned as authorization, leaving the wrapping layer's SOFT deny
+	// intact — which an --audit route then downgrades and forwards. Without the JWT the same
+	// call meets checkDeclassify's hard, non-downgradable `approval_consumed` escalation, so
+	// the scope-only test here would mean adding a token makes the proxy allow more, which is
+	// precisely the inversion this function exists to close.
+	if usable, err := p.engine.UsableDeclassifyApproval(ctx, declassifyApprovalsFromContext(ctx), canonical, want); err != nil || usable {
+		// A store fault reads as "a covering approval may exist": the outer layer's verdict
+		// stands and stays downgradable, which is where it already was. Hardening on an
+		// unreadable ledger would let a backend hiccup turn an observe route into a blocking
+		// one, and the engine's own path fails closed on the same fault when it runs.
 		return r, false
 	}
 	denial := capability.DenialInfo{
@@ -1970,6 +1984,16 @@ func (p *ManifestPDP) DecideResourceCancel(ctx context.Context, sessionID, uri, 
 		return withCancelAuditPosture(denyResponse(p.engineClock(), capability.ErrCodeCapabilityDenied, "",
 			fmt.Sprintf("resource %q is present in the manifest but not with the %q action, so there is no subscription to it to cancel", uri, requiredActionFor(capability.TargetTypeResource))), c)
 	}
+	// The delegation target gate. A cancel is authorized by MATCH ALONE — no conditions, no
+	// quota, no session-state commit — and this belongs on the match side of that line
+	// rather than the metering side: it is authority, not accounting, so it commits nothing
+	// and cannot deny an unsubscribe by spending a budget. Without it this method's own
+	// documented invariant ("what a session may cancel is exactly what it may see listed")
+	// became false the moment the list filter learned about chains.
+	if deny := delegationTargetDenial(ctx, p.engineClock(),
+		EnforceTarget{Type: capability.TargetTypeResource, Name: uri}, c.IsAuditOnly()); deny != nil {
+		return *deny
+	}
 	return withCancelAuditPosture(newAllowResponse(p.engineClock()), c)
 }
 
@@ -2059,6 +2083,17 @@ func (p *ManifestPDP) DecideSampling(ctx context.Context, sessionID, sourceIP st
 			Name: capability.MethodSamplingCreateMessage,
 		},
 		Claims: claims,
+		// Sampling is the one enforced method that drives the HOST's model, so it is the
+		// one a quarantined delegate most wants and the one whose omission is least
+		// visible: with this field unset every delegation gate short-circuits on
+		// IsEmpty() and a chain granting one read tool still reaches inference. The JWT
+		// layer already learned this exact lesson for mcp.capabilities ("sampling was the
+		// one enforced method that ignored it"); this is the same seam, so it carries the
+		// same field every other decision path carries.
+		Delegation: delegationFromContext(ctx),
+		// Approvals for the same reason: a declassify directive on the sampling opt-in
+		// must be satisfiable by the same grant that satisfies it anywhere else.
+		DeclassifyApprovals: declassifyApprovalsFromContext(ctx),
 	}
 
 	return p.evaluateAndRecord(ctx, req, matched)

@@ -7,6 +7,7 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -297,4 +298,73 @@ func TestNewSignaturePayload_ValidatesAndBindsContent(t *testing.T) {
 	assert.Error(t, err)
 	_, err = registry.NewSignaturePayload(&c, registry.AttestRoleVendor, "maybe")
 	assert.Error(t, err)
+}
+
+// TestVerifyAttestations_RoleRestrictedKeyStillSurfacesTampering is the ordering the file's
+// own stated property depends on: verify FIRST, then decide whether the verified statement
+// counts. Testing the role restriction first collapsed "a key I do not hold" with "a key I
+// hold, but not for this role", so tampering in an entry the operator had explicitly
+// configured a key for was reported as a stranger's signature.
+func TestVerifyAttestations_RoleRestrictedKeyStillSurfacesTampering(t *testing.T) {
+	c, pub, priv := signedEntry(t)
+	sign(t, &c, "researcher-1", registry.AttestRoleVendor, registry.AttestStatementAttests, priv)
+
+	// Edit the entry after signing, and re-digest so only the signature betrays it.
+	c.Effect = &capability.EffectContract{Class: capability.EffectReversible}
+	digest, err := capability.EffectContractDigest(c.Effect)
+	require.NoError(t, err)
+	c.Digest = digest
+
+	// The operator trusts this key ONLY as a reviewer; the signature claims the vendor role.
+	store, err := registry.LoadTrustStore(writeTrustStore(t, trusted("researcher-1", "A Researcher", pub, registry.AttestRoleReviewer)))
+	require.NoError(t, err)
+
+	_, err = c.VerifyAttestations(store)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "edited after it was signed")
+}
+
+// TestVerifyAttestations_UnknownStatementCountsForNothing is the fail-closed default. Statement
+// validation runs only on the LoadCorpus path, and this method is exported on an exported
+// struct — so a caller-built Contract reaches it with an unchecked statement, and falling
+// through to "attested" would let one this build does not understand earn the strongest badge
+// the report emits.
+func TestVerifyAttestations_UnknownStatementCountsForNothing(t *testing.T) {
+	c, pub, priv := signedEntry(t)
+	sign(t, &c, "acme-2026", registry.AttestRoleVendor, registry.AttestStatementAttests, priv)
+	// A genuine signature whose statement this build does not model. Signed over the same
+	// payload so it verifies; only the vocabulary is unknown.
+	c.Signatures[0].Statement = "revoked"
+	payload := registry.AttestationPayload(c.ID, c.Digest, registry.AttestRoleVendor, "revoked")
+	c.Signatures[0].Value = base64.StdEncoding.EncodeToString(ed25519.Sign(priv, payload))
+
+	store, err := registry.LoadTrustStore(writeTrustStore(t, trusted("acme-2026", "Acme Inc", pub)))
+	require.NoError(t, err)
+	status, err := c.VerifyAttestations(store)
+	require.NoError(t, err)
+	assert.False(t, status.VendorAttested, "a statement this build cannot interpret must not earn the vendor badge")
+	assert.Empty(t, status.Attested)
+	assert.Equal(t, 1, status.Unverified)
+}
+
+// TestAttestationStatus_SummaryKeepsTheUnverifiedCount pins that "signed by strangers" is
+// reported alongside whatever verified rather than being replaced by it — the same distinction
+// the Unverified field exists to preserve one level down.
+func TestAttestationStatus_SummaryKeepsTheUnverifiedCount(t *testing.T) {
+	c, pub, priv := signedEntry(t)
+	sign(t, &c, "acme-2026", registry.AttestRoleVendor, registry.AttestStatementAttests, priv)
+
+	// Nine more signatures from keys the operator has never seen.
+	for i := 0; i < 9; i++ {
+		_, strangerPriv, err := ed25519.GenerateKey(nil)
+		require.NoError(t, err)
+		sign(t, &c, fmt.Sprintf("stranger-%d", i), registry.AttestRoleReviewer, registry.AttestStatementAttests, strangerPriv)
+	}
+
+	store, err := registry.LoadTrustStore(writeTrustStore(t, trusted("acme-2026", "Acme Inc", pub)))
+	require.NoError(t, err)
+	status, err := c.VerifyAttestations(store)
+	require.NoError(t, err)
+	assert.Equal(t, 9, status.Unverified)
+	assert.Equal(t, "vendor +unverified(9)", status.Summary())
 }

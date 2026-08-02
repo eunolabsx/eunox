@@ -36,36 +36,92 @@ type declassifyOutcome struct {
 	LedgerID string
 }
 
-// declassifyLedgerKey is the store key holding the single-use declassify grants already
-// spent under this request's anchor. It lives in the FlowLabelStore — the same
-// session-lifetime, monotonic backend holding the labels these grants clear — for the reason
-// the issue that motivated it names: a spent approval is provenance, not a rate, and a
-// windowed counter would age a burn out and hand the grant back. Its own "declassify" prefix
-// keeps it disjoint from the label set, which matters because peekSessionLabels fails closed
-// on any member of the label key outside the flow vocabulary.
+// declassifyLedgerWindowSec bounds how long a burned single-use approval is remembered. It
+// is a REAL bound on the guarantee, not a storage detail, and it is stated in the same terms
+// sequenceHistoryWindowSec states its own: after this long with no further presentation of
+// that grant, the burn is gone and the grant is live again.
 //
-// It follows the same anchor as the labels, so a task-anchored deployment burns the grant for
-// the TASK: re-entering through a fresh session does not restore a spent approval, which is
-// the replay a per-session ledger would leave open in exactly the multi-PEP topology a
-// one-shot approval is for.
-func (e *Engine) declassifyLedgerKey(req *capability.EnforceRequest) string {
-	return e.anchoredKey("declassify", req)
+// Seven days is chosen against what the burn has to outlive — the TOKEN carrying the grant.
+// A control plane minting a short-lived token per approval (the practice the docs recommend
+// regardless) is orders of magnitude inside it; a deployment issuing week-long tokens with
+// standing single-use grants embedded is at the edge of what any local ledger can promise,
+// and shortening the token is the fix, not lengthening this.
+const declassifyLedgerWindowSec = 7 * 86400
+
+// declassifyLedgerKey addresses ONE single-use grant's burn. The key is the route namespace
+// plus the grant's ledger id, and deliberately carries no session and no task:
+//
+//   - "Approve clearing this once" means once. Anchoring the ledger made it once-per-session
+//     by default — session teardown reclaimed it and two concurrent sessions held two
+//     independent ledgers — so the property the grant advertises held in no default
+//     deployment. Anchoring it to the task merely moved the boundary.
+//   - A per-grant key rather than one set per anchor also bounds the state: each burn is
+//     reclaimed on its own window instead of accumulating in a set that is never pruned.
+//
+// It lives in the CallCounter rather than the FlowLabelStore, which reverses the original
+// choice, and the reason is atomicity. The flow store offers no test-and-set: a Get-then-Add
+// burn is a check-then-act that two concurrent callers both win, which double-spends exactly
+// the approval this mechanism exists to make single-use. The counter's AdmitAll is the
+// codebase's ONE atomic admission primitive, and a counted bucket with a limit of 1 is
+// precisely "admit once, ever". The cost is that the counter is windowed — see
+// declassifyLedgerWindowSec, where that bound is stated rather than wished away.
+func (e *Engine) declassifyLedgerKey(ledgerID string) string {
+	return compositeCounterKey("declassify", e.counterKeyNamespace, ledgerID)
 }
 
-// approvalSpent reports whether a single-use grant has already been burned under this
-// request's anchor. The error is NOT swallowed: a store fault while checking means the proxy
-// cannot tell a fresh approval from a spent one, and treating that as fresh would make an
-// unreachable backend the way to replay every one-shot grant in a token. The caller escalates.
-func (e *Engine) approvalSpent(ctx context.Context, req *capability.EnforceRequest, ledgerID string) (bool, error) {
+// declassifyLedgerBucket is the one-slot quota a single-use grant draws on. Counted with a
+// limit of 1: the first AdmitAll records the entry and admits, every later one is refused
+// having recorded nothing.
+func (e *Engine) declassifyLedgerBucket(ledgerID string) capability.QuotaBucket {
+	return capability.QuotaBucket{
+		Key:       e.declassifyLedgerKey(ledgerID),
+		WindowSec: declassifyLedgerWindowSec,
+		Counted:   true,
+		Limit:     1,
+	}
+}
+
+// approvalSpent reports whether a single-use grant looks already burned. It is a PEEK — it
+// records nothing — because it runs during selection, before the ceiling and the quota
+// commits have had their chance to refuse the call, and a check that spent the grant would
+// consume a human approval for a call that never ran.
+//
+// It is therefore advisory: two concurrent callers can both peek clean. That race is closed at
+// the commit, where burnApproval's atomic admission lets exactly one through and the loser
+// hard-denies. The error is NOT swallowed — a fault means the proxy cannot tell a fresh
+// approval from a spent one, and treating that as fresh would make an unreachable backend the
+// way to replay every one-shot grant in a token.
+func (e *Engine) approvalSpent(ctx context.Context, ledgerID string) (bool, error) {
 	if ledgerID == "" {
 		return false, nil
 	}
-	spent, err := e.flowStore.Get(ctx, e.declassifyLedgerKey(req))
+	if e.counter == nil {
+		return false, fmt.Errorf("call counter not configured, so a single-use declassify approval cannot be checked")
+	}
+	n, err := e.counter.Peek(ctx, e.declassifyLedgerKey(ledgerID), declassifyLedgerWindowSec)
 	if err != nil {
 		return false, err
 	}
-	for _, s := range spent {
-		if s == ledgerID {
+	return n > 0, nil
+}
+
+// UsableDeclassifyApproval reports whether any of the presented approvals both COVERS
+// (labels + target) and is still LIVE (not a burned single-use grant) — the same two-part
+// test checkDeclassify applies when it selects one.
+//
+// It is exported for the wrapping-PDP hardening path, which has to answer "would the
+// declassification have been authorized?" without running a decision. That path used the
+// scope-only test, so a burned grant read as authorization and left a wrapping layer's SOFT
+// refusal intact for an --audit route to downgrade and forward — while the same call without
+// the wrapper met the hard `approval_consumed` escalation. Adding a token must never make the
+// proxy allow more, so the two paths ask the same question here.
+func (e *Engine) UsableDeclassifyApproval(ctx context.Context, approvals []capability.DeclassifyApproval, target string, want []string) (bool, error) {
+	for _, cand := range capability.CoveringDeclassifyApprovals(approvals, target, want) {
+		spent, err := e.approvalSpent(ctx, cand.LedgerID())
+		if err != nil {
+			return false, err
+		}
+		if !spent {
 			return true, nil
 		}
 	}
@@ -146,7 +202,7 @@ func (e *Engine) checkDeclassify(ctx context.Context, req *capability.EnforceReq
 	)
 	for _, cand := range covering {
 		id := cand.LedgerID()
-		spent, err := e.approvalSpent(ctx, req, id)
+		spent, err := e.approvalSpent(ctx, id)
 		if err != nil {
 			// The ledger is unreadable, so "already used" cannot be distinguished from
 			// "never used". Escalating is the only answer that does not make an unreachable
@@ -178,7 +234,7 @@ func (e *Engine) checkDeclassify(ctx context.Context, req *capability.EnforceReq
 			// places with two provenances on one tape.
 			return declassifyOutcome{}, e.declassifyRefusal(requestID, now, carriedLabels, want,
 				map[string]interface{}{"approvals_consumed": consumed, "consumed_approval_id": covering[0].ID},
-				fmt.Sprintf("the human approval covering flow label(s) %v at %s is single-use and has already been consumed for this %s; a new approval is required", want, target, e.anchorKindOf(req)),
+				fmt.Sprintf("the human approval covering flow label(s) %v at %s is single-use and has already been consumed; a new approval is required", want, target),
 				"approval_consumed")
 		}
 		// One message for "no grant at all" and "a grant that does not cover this",
@@ -196,15 +252,6 @@ func (e *Engine) checkDeclassify(ctx context.Context, req *capability.EnforceReq
 		ApprovalID: approval.ID,
 		LedgerID:   ledgerID,
 	}, nil
-}
-
-// anchorKindOf names the scope a burn applies to ("session" or "task"), for the one message
-// an operator reads when a one-shot approval is refused as spent. Which scope it was is the
-// difference between "reconnecting will let me retry" and "it will not", so the refusal says
-// which rather than leaving the operator to infer it from the deployment's config.
-func (e *Engine) anchorKindOf(req *capability.EnforceRequest) string {
-	_, kind := e.stateAnchor(req)
-	return kind
 }
 
 // declassifyRefusal builds the ESCALATION_REQUIRED refusal that replaces the allow for an
@@ -330,9 +377,12 @@ func (e *Engine) clearLabels(ctx context.Context, req *capability.EnforceRequest
 	return removed, nil
 }
 
-// burnApproval spends a single-use grant: it writes the grant's ledger member under this
-// request's anchor, so every later presentation of the same grant escalates as consumed. A
-// standing grant (empty ledgerID) burns nothing.
+// burnApproval spends a single-use grant: one atomic admission against the grant's one-slot
+// bucket. It is the ONLY authoritative test — approvalSpent's peek is advisory, so two
+// concurrent callers can both reach here believing the grant is live, and exactly one of them
+// is admitted. The loser gets admitted=false and an error, which the caller turns into a hard
+// deny: over-refusing one of two racing calls is the only outcome that keeps "once" meaning
+// once. A standing grant (empty ledgerID) burns nothing and costs no round trip.
 //
 // It runs on EVERY commit of an approved single-use declassification, including one whose
 // clear turns out to be a no-op because the anchor was not carrying the labels. That is the
@@ -341,40 +391,26 @@ func (e *Engine) clearLabels(ctx context.Context, req *capability.EnforceRequest
 // would make the grant trivially replayable by ordering — present it once while clean (no
 // burn), acquire the taint, present it again to the clear that matters.
 //
-// A write fault is returned, never swallowed: the caller undoes the call and hard-denies, so
-// the grant is not spent by a call that did not happen.
-func (e *Engine) burnApproval(ctx context.Context, req *capability.EnforceRequest, ledgerID string) error {
+// There is deliberately no un-burn. The counter has no delete, and that is the right shape
+// here: a call refused AFTER its burn leaves the grant spent, which over-refuses (the operator
+// mints another approval) rather than handing a use back. The un-burn this replaced was a
+// fail-OPEN on one path — a soft antecedent-fault deny is downgraded and FORWARDED by an
+// --audit route, so the action ran while the grant was handed back.
+func (e *Engine) burnApproval(ctx context.Context, ledgerID string) error {
 	if ledgerID == "" {
 		return nil
 	}
-	if e.flowStore == nil {
-		return fmt.Errorf("flow label store not configured; a single-use declassify approval cannot be burned")
+	if e.counter == nil {
+		return fmt.Errorf("call counter not configured; a single-use declassify approval cannot be burned")
 	}
-	return e.flowStore.Add(ctx, e.declassifyLedgerKey(req), ledgerID)
-}
-
-// unburnApproval best-effort returns a single-use grant to the ledger when the call that
-// spent it is refused after the burn and never forwarded. It is the mirror of restoreLabels
-// and carries the mirror residual: a failed un-burn leaves the grant spent for a call that
-// did not run, which over-refuses (the operator mints another approval) rather than handing
-// back a use. That is the direction to fail in, so the fault is swallowed here exactly as
-// rollbackLabels swallows its own.
-func (e *Engine) unburnApproval(ctx context.Context, req *capability.EnforceRequest, ledgerID string) {
-	if ledgerID == "" || e.flowStore == nil {
-		return
+	admitted, _, _, _, err := e.counter.AdmitAll(ctx, []capability.QuotaBucket{e.declassifyLedgerBucket(ledgerID)})
+	if err != nil {
+		return err
 	}
-	_ = e.flowStore.Remove(ctx, e.declassifyLedgerKey(req), ledgerID)
-}
-
-// ClearSessionApprovals releases the session-anchored single-use declassify ledger, called
-// from the transport's teardown alongside ClearSessionLabels so an ended session leaves no
-// state behind. Like its sibling it clears the SESSION key only — a task-anchored burn must
-// outlive the session, or disconnecting would hand a spent approval back.
-func (e *Engine) ClearSessionApprovals(ctx context.Context, sessionID string) error {
-	if e.flowStore == nil || e.skipFlow || sessionID == "" {
-		return nil
+	if !admitted {
+		return fmt.Errorf("single-use declassify approval was consumed concurrently by another call")
 	}
-	return e.flowStore.Clear(ctx, compositeCounterKey("declassify", e.counterKeyNamespace, sessionID))
+	return nil
 }
 
 // declassifyRecordFailureDenial is the fail-closed response when an approved

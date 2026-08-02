@@ -42,7 +42,7 @@ func anchoredEngine(counter capability.CallCounter, store capability.FlowLabelSt
 // TestTaskAnchor_TaintCrossesAPEPHop is the whole point of the feature: a source read on one
 // enforcement point taints the TASK, and a sink on a second enforcement point — a different
 // engine, a different session id, the same task — sees the taint and denies. Under session
-// anchoring the same sequence allows, which is the gap the issue describes.
+// anchoring the same sequence allows, which is the gap task anchoring closes.
 func TestTaskAnchor_TaintCrossesAPEPHop(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -131,7 +131,7 @@ func TestTaskAnchor_QuotaFollowsTheTask(t *testing.T) {
 	assert.Equal(t, capability.DecisionAllow, plain.ValidateAction(ctx, taskReq("s2", "t1", "refund"), caps).Decision)
 }
 
-// TestTaskAnchor_SequenceAntecedentFollowsTheTask covers the third axis the issue names: a
+// TestTaskAnchor_SequenceAntecedentFollowsTheTask covers the antecedent axis: a
 // sequenceBlock antecedent recorded on one hop is visible to the gate on the next.
 func TestTaskAnchor_SequenceAntecedentFollowsTheTask(t *testing.T) {
 	counter, store := callcounter.NewInMemory(), flowlabelstore.NewInMemory()
@@ -170,9 +170,58 @@ func TestTaskAnchor_TeardownDoesNotReclaimTaskState(t *testing.T) {
 	assert.Equal(t, capability.DecisionDeny, sink.Decision, "a task's taint must survive the teardown of the session that created it")
 }
 
-// TestTaskAnchor_Reported exposes the posture so the transport can decide what teardown may
-// reclaim without re-deriving the config.
-func TestTaskAnchor_Reported(t *testing.T) {
-	assert.True(t, anchoredEngine(callcounter.NewInMemory(), flowlabelstore.NewInMemory(), true).TaskAnchored())
-	assert.False(t, anchoredEngine(callcounter.NewInMemory(), flowlabelstore.NewInMemory(), false).TaskAnchored())
+// TestTaskAnchor_RefusesAnAuthenticatedCallerWithNoTaskID is the fail-closed half of the
+// fallback. Falling back to session keying is safe for a caller with NO token — it shares
+// state with nobody. An authenticated caller whose token omits the claim is a different case:
+// on an HTTP host each request carries its own Authorization header, so alternating tokens
+// would split one caller's taint, budgets and antecedents across two buckets, and every
+// direction of that split is a fail-open.
+func TestTaskAnchor_RefusesAnAuthenticatedCallerWithNoTaskID(t *testing.T) {
+	eng := anchoredEngine(callcounter.NewInMemory(), flowlabelstore.NewInMemory(), true)
+	ctx := context.Background()
+	caps := []capability.Constraint{{Target: "tool:read_customer", Actions: []string{"call"}}}
+
+	// A token that authenticated but carries no task_id.
+	authed := req("s", "read_customer")
+	authed.Claims = map[string]interface{}{"sub": "svc@example.com"}
+	resp := eng.ValidateAction(ctx, authed, caps)
+	require.Equal(t, capability.DecisionDeny, resp.Decision)
+	require.NotNil(t, resp.Denial)
+	assert.Equal(t, capability.ErrCodeMissingContext, resp.Denial.Code)
+	assert.Equal(t, "no_task_id", resp.Denial.Details["reason"])
+
+	// A caller with NO token still falls back to its session, unchanged.
+	assert.Equal(t, capability.DecisionAllow, eng.ValidateAction(ctx, req("s", "read_customer"), caps).Decision)
+
+	// And a token carrying the claim is anchored on the task.
+	assert.Equal(t, capability.DecisionAllow, eng.ValidateAction(ctx, taskReq("s", "t1", "read_customer"), caps).Decision)
+}
+
+// TestTaskAnchor_NoRollbackAcrossASharedTaskKey pins why the label rollback stands down under
+// task anchoring: the snapshot it computes its delta from is taken under ONE session's decision
+// lock, and that lock does not span a task key two sessions share. Removing a label a
+// concurrent session legitimately added would leave the task untainted for a source read that
+// really happened.
+func TestTaskAnchor_NoRollbackAcrossASharedTaskKey(t *testing.T) {
+	counter, store := callcounter.NewInMemory(), flowlabelstore.NewInMemory()
+	ctx := context.Background()
+
+	// Session A taints the task legitimately.
+	healthy := anchoredEngine(counter, store, true)
+	require.Equal(t, capability.DecisionAllow,
+		healthy.ValidateAction(ctx, taskReq("sA", "t1", "read_customer"), sourceCaps("read_customer", capability.FlowLabelPII)).Decision)
+
+	// Session B's source faults after its own label write. Its rollback must not reach for a
+	// key it does not exclusively own.
+	broken := enforcement.New(
+		enforcement.WithCallCounter(&faultyCounter{inner: counter, failIncrement: true}),
+		enforcement.WithFlowLabelStore(store),
+		enforcement.WithTaskAnchoredState(),
+	)
+	require.NotEqual(t, capability.DecisionAllow,
+		broken.ValidateAction(ctx, taskReq("sB", "t1", "read_customer"), sourceCaps("read_customer", capability.FlowLabelPII)).Decision)
+
+	sink := healthy.ValidateAction(ctx, taskReq("sA", "t1", "publish"), sinkCaps("publish", capability.FlowLabelPublic))
+	assert.Equal(t, capability.DecisionDeny, sink.Decision,
+		"a faulted call in one session must not launder the taint another session deposited on the task")
 }

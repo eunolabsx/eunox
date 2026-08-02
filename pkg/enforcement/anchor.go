@@ -46,33 +46,52 @@ import "github.com/eunolabs/eunox/pkg/capability"
 const anchorKindTask = "task"
 
 // stateAnchor returns the key components identifying the subject this request's accumulated
-// state accrues to, and the kind for the audit record. The result is a fresh slice the caller
-// may append to.
+// state accrues to. The result is a fresh slice the caller may append to.
 //
 // A nil request or an empty session id yields a session anchor of "" — never a shared one.
 // Every caller already fails closed on an empty session id before it builds a key (an empty
 // anchor would merge anonymous callers into one bucket), so this returns the degenerate value
 // rather than second-guessing those guards; it must not silently substitute some other
 // identity for a session the caller is about to refuse.
-func (e *Engine) stateAnchor(req *capability.EnforceRequest) (parts []string, kind string) {
+func (e *Engine) stateAnchor(req *capability.EnforceRequest) []string {
 	if e.taskAnchored && req != nil {
 		// ResolveTaskVar is the same resolver a ${task.id} allowedValues entry uses, so the
 		// anchor and the manifest's own task binding cannot disagree about what the task id
 		// is — or about when there isn't one. It reports absent for a missing claim, a
-		// non-string claim, and a whitespace-only claim alike, each of which must fall back
-		// rather than anchor on "".
+		// non-string claim, and a whitespace-only claim alike.
 		if id, ok := capability.ResolveTaskVar(capability.TaskVarID, req.Claims); ok {
-			return []string{anchorKindTask, id}, anchorKindTask
+			return []string{anchorKindTask, id}
 		}
 	}
 	if req == nil {
-		return []string{""}, anchorKindSession
+		return []string{""}
 	}
-	return []string{req.SessionID}, anchorKindSession
+	return []string{req.SessionID}
 }
 
-// anchorKindSession names the default anchor in audit details and error messages.
-const anchorKindSession = "session"
+// anchorUnresolved reports a request this engine cannot anchor as the operator configured it:
+// task anchoring is on and the caller PRESENTED A TOKEN, but that token carries no usable
+// mcp.task_id.
+//
+// Such a request would fall back to session keying, and the fallback is only safe for the case
+// it was written for — a caller with no token at all, which shares state with nobody. An
+// AUTHENTICATED caller mixing the two shapes on one session splits its own state across two
+// buckets, and the split is a fail-open in every direction that matters: a labelOutput written
+// under the task key is invisible to a sink read under the session key, a spent maxCalls
+// budget is refilled, and a sequenceBlock antecedent is hidden. On an HTTP host each request
+// carries its own Authorization header, so a caller can produce the mix at will.
+//
+// The caller turns this into a deny. That is deliberately strict — an operator who enables
+// task anchoring has an IdP minting the claim, and a token without it on such a route is a
+// misconfiguration the proxy cannot account for safely — and it is the fail-closed reading of
+// "on any ambiguity, deny".
+func (e *Engine) anchorUnresolved(req *capability.EnforceRequest) bool {
+	if !e.taskAnchored || req == nil || len(req.Claims) == 0 {
+		return false
+	}
+	_, ok := capability.ResolveTaskVar(capability.TaskVarID, req.Claims)
+	return !ok
+}
 
 // anchoredKey builds a counter/store key for this request's anchor: the engine's route
 // namespace, then the anchor, then whatever addresses the specific bucket (a target type and
@@ -80,20 +99,13 @@ const anchorKindSession = "session"
 // accumulated state cannot be added under session keying by accident while every existing one
 // follows the task.
 func (e *Engine) anchoredKey(prefix string, req *capability.EnforceRequest, tail ...string) string {
-	anchor, _ := e.stateAnchor(req)
+	anchor := e.stateAnchor(req)
 	parts := make([]string, 0, 1+len(anchor)+len(tail))
 	parts = append(parts, e.counterKeyNamespace)
 	parts = append(parts, anchor...)
 	parts = append(parts, tail...)
 	return compositeCounterKey(prefix, parts...)
 }
-
-// TaskAnchored reports whether this engine keys accumulated state on the validated task id
-// when a request carries one. Exported for the transport's session teardown, which must not
-// Clear task-anchored state: the whole point of the anchor is that it outlives the session
-// that created it, so tearing it down on disconnect would restore exactly the boundary it
-// exists to cross.
-func (e *Engine) TaskAnchored() bool { return e.taskAnchored }
 
 // sequenceHistoryKey builds the per-anchor, per-target key under which an
 // allowed call is recorded for sequenceBlock lookups. namespace (the engine's

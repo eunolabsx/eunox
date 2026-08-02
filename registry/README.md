@@ -226,9 +226,17 @@ without this the two would be the same grant.
 4. **An untrusted signature is inert; a trusted one that fails is an error.** A corpus may
    carry signatures from keys you have never heard of, and refusing to load it over one
    would make every entry's usability depend on collecting every publisher's key — those are
-   reported as `unverified(n)`, which is a materially different state from unsigned. But a
+   reported as `unverified(n)`, which is a materially different state from unsigned, and
+   which is reported *alongside* whatever did verify rather than being replaced by it. But a
    signature by a key you *did* configure that does not verify means the entry was **edited
-   after it was signed**, and that stops the command.
+   after it was signed**, and that stops the command. The signature is checked **before** the
+   `roles` restriction is applied, so a key you trust only as a reviewer still surfaces
+   tampering on a vendor-role signature rather than being written off as a stranger's mark.
+
+`--trust-keys` composes with `--ref` and `--attest-payload`: verification runs first, so
+copying a pin or producing a signing payload cannot succeed against an entry a trusted key
+signed and someone then edited, and `--ref` warns on stderr when the entry it is pinning is
+disputed.
 
 ### Producing a signature
 

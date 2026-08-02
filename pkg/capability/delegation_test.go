@@ -64,11 +64,16 @@ func TestParseDelegationGrants_RejectsUnknownFieldAndBadValues(t *testing.T) {
 	for name, tc := range map[string]struct{ raw, want string }{
 		"misspelled field": {`[{"subject":"a","targts":["tool:x"]}]`, "unknown"},
 		"no subject":       {`[{"targets":["tool:x"]}]`, "subject"},
-		"glob target":      {`[{"subject":"a","targets":["tool:read_*"]}]`, "glob metacharacter"},
+		"star target":      {`[{"subject":"a","targets":["tool:read_*"]}]`, "contains '*'"},
 		"unknown label":    {`[{"subject":"a","labels":["secret-ish"]}]`, "unknown flow label"},
 		"unknown allow":    {`[{"subject":"a","allowLabels":["nope"]}]`, "unknown flow label"},
 		"bad class":        {`[{"subject":"a","maxEffectClass":"safe"}]`, "maxEffectClass"},
 		"empty redact":     {`[{"subject":"a","redactFields":["  "]}]`, "redactFields"},
+		// '?' and '[' are ordinary characters in a resource URI, and delegated targets are
+		// matched literally, so refusing them made an entire class of target unexpressible —
+		// and because a malformed grant rejects the TOKEN, one such entry refused every
+		// request the caller made.
+		"unknown act field": {`[{"subject":"a","bogus":1}]`, "unknown"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := capability.ParseDelegationGrants(json.RawMessage(tc.raw))
@@ -76,6 +81,49 @@ func TestParseDelegationGrants_RejectsUnknownFieldAndBadValues(t *testing.T) {
 			assert.Contains(t, err.Error(), tc.want)
 		})
 	}
+}
+
+// TestParseDelegationGrants_AcceptsLiteralURIMetacharacters pins that only '*' is refused.
+// Delegated targets are matched literally, so nothing else can widen a grant — and refusing
+// the whole glob-metacharacter set made a resource URI with a query string unexpressible,
+// which (since a malformed grant rejects the token) refused every request the caller made.
+func TestParseDelegationGrants_AcceptsLiteralURIMetacharacters(t *testing.T) {
+	grants, err := capability.ParseDelegationGrants(json.RawMessage(
+		`[{"subject":"a","targets":["resource:https://api.example.com/search?q=x","resource:file:///c[1]/x"]}]`))
+	require.NoError(t, err)
+	require.Len(t, grants, 1)
+	require.NotNil(t, grants[0].Targets)
+	assert.Len(t, *grants[0].Targets, 2)
+}
+
+// TestParseActorChain_RejectsUnknownField keeps a misspelled "acts" from silently truncating
+// the chain: with an act-only token nothing downstream would detect it, because the hop-for-hop
+// agreement check is skipped when there are no grants.
+func TestParseActorChain_RejectsUnknownField(t *testing.T) {
+	_, err := capability.ParseActorChain(json.RawMessage(`{"sub":"b","acts":{"sub":"a"}}`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown")
+}
+
+// TestValidateDelegationChain_AccumulatesTheFloor is the assertion an adjacent-pairs comparison
+// could not make: an intervening hop that omits an axis must not erase the constraint an
+// earlier hop placed on it.
+func TestValidateDelegationChain_AccumulatesTheFloor(t *testing.T) {
+	_, err := capability.ValidateDelegationChain(nil, []capability.DelegationGrant{
+		{Subject: "a", Targets: list("tool:x")},
+		{Subject: "b"},
+		{Subject: "c", Targets: list("tool:x", "tool:wipe_db")},
+	})
+	require.Error(t, err, "hop c declares authority hop a never held; the omitted middle hop must not launder it")
+	assert.Contains(t, err.Error(), "does not hold")
+
+	// The same shape that genuinely narrows still passes.
+	_, err = capability.ValidateDelegationChain(nil, []capability.DelegationGrant{
+		{Subject: "a", Targets: list("tool:x", "tool:y")},
+		{Subject: "b"},
+		{Subject: "c", Targets: list("tool:x")},
+	})
+	assert.NoError(t, err)
 }
 
 // TestParseDelegationGrants_PreservesPresentEmpty is the load-bearing decode property: a

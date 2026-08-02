@@ -470,7 +470,7 @@ func (e *Engine) recordSourceCall(ctx context.Context, req *capability.EnforceRe
 		// Clear-then-burn would leave a label dropped by a grant still marked live — the
 		// replay this ledger exists to close, reachable by faulting the store at the right
 		// moment. A standing grant burns nothing and this costs it no round-trip.
-		if err := e.burnApproval(ctx, req, decl.LedgerID); err != nil {
+		if err := e.burnApproval(ctx, decl.LedgerID); err != nil {
 			e.rollbackLabels(ctx, req, added)
 			return nil, nil, &SourceCommitError{Err: err, Flow: true, Declassify: true}
 		}
@@ -482,8 +482,9 @@ func (e *Engine) recordSourceCall(ctx context.Context, req *capability.EnforceRe
 		labelsCleared, err = e.clearLabels(ctx, req, decl, unionLabels(carriedLabels, labelsOut))
 		if err != nil {
 			// The clear faulted after the add committed: undo the add so the refused call
-			// leaves nothing behind, exactly as the seq-fault arm below does.
-			e.unburnApproval(ctx, req, decl.LedgerID)
+			// leaves nothing behind, exactly as the seq-fault arm below does. The burn is
+			// NOT undone — the counter has no delete, and leaving the grant spent for a call
+			// that did not run over-refuses, which is the safe direction (see burnApproval).
 			e.rollbackLabels(ctx, req, added)
 			return nil, nil, &SourceCommitError{Err: err, Flow: true, Declassify: true}
 		}
@@ -495,16 +496,19 @@ func (e *Engine) recordSourceCall(ctx context.Context, req *capability.EnforceRe
 		// would mean "the action ran and the taint the policy declared cleared is back",
 		// the outcome declassifyRecordFailureDenial exists to prevent. Reported as the
 		// declassify leg so the deny it maps to is the hard one.
-		if len(labelsCleared) > 0 {
+		//
+		// A call that BURNED a single-use grant takes the declassify arm whether or not the
+		// clear moved a label, so the deny it maps to is the HARD one. The soft
+		// antecedent-fault deny is downgraded and FORWARDED by an --audit route, and
+		// forwarding a call whose one-shot approval was just spent is the worst of both: the
+		// action runs, and the operator's single approval is gone with no clear to show for
+		// it. Keyed on LedgerID rather than on labelsCleared because the burn happens on a
+		// no-op clear too.
+		if len(labelsCleared) > 0 || decl.LedgerID != "" {
 			e.restoreLabels(ctx, req, labelsCleared)
-			e.unburnApproval(ctx, req, decl.LedgerID)
 			e.rollbackLabels(ctx, req, added)
 			return nil, nil, &SourceCommitError{Err: err, Flow: true, Declassify: true}
 		}
-		// A single-use grant whose clear was a permitted no-op is still spent (see
-		// burnApproval), so the seq fault has to hand it back here too — this arm is reached
-		// for exactly that shape, where labelsCleared is empty but the burn committed.
-		e.unburnApproval(ctx, req, decl.LedgerID)
 		// The seq write faulted after the label writes committed: put the label set back as
 		// it was so the hard-denied call neither taints nor untaints. Best-effort — a
 		// rollback fault leaves a stranded label (fail-closed: over-blocks a later sink,
@@ -563,6 +567,17 @@ func labelsAdded(out, carried []string) []string {
 // residual — a stranded label over-blocks, never leaks).
 func (e *Engine) rollbackLabels(ctx context.Context, req *capability.EnforceRequest, added []string) {
 	if e.flowStore == nil || req.SessionID == "" || len(added) == 0 {
+		return
+	}
+	// Not under task anchoring. The rollback removes exactly the labels THIS call added,
+	// computed from a snapshot peeked under this session's decision lock — and that lock does
+	// not span a task key two sessions share. A concurrent session that legitimately added the
+	// same label between the snapshot and here would have it deleted, leaving the task
+	// UNTAINTED for a source read that really happened: a fail-open on precisely the "for all
+	// flows" claim the anchor exists to extend. Declining to roll back strands this call's
+	// label instead, which over-blocks a later sink — the direction the whole rollback path
+	// already accepts as its residual when a Remove faults.
+	if e.taskAnchored {
 		return
 	}
 	_ = e.flowStore.Remove(ctx, e.flowKey(req), added...)

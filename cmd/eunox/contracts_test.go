@@ -458,3 +458,67 @@ func TestContractsAttestPayloadRejectsBadInput(t *testing.T) {
 		})
 	}
 }
+
+// TestContractsRefVerifiesAttestationsToo pins that --trust-keys is not silently ignored by
+// the query modes. Copying a pin is the moment an author commits to an entry, so a tampered
+// signature has to stop the command there rather than only in the listing nobody was running.
+func TestContractsRefVerifiesAttestationsToo(t *testing.T) {
+	dir := t.TempDir()
+	entry := validCorpusEntry("acme/mcp.send", "send")
+	digest, err := capability.EffectContractDigest(entry.Effect)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	entry.Digest = digest
+	sig, pub := signCorpusEntry(t, &entry, "acme-2026", registry.AttestRoleVendor, registry.AttestStatementAttests)
+
+	// Rewrite after signing, and re-digest so the entry is self-consistent.
+	entry.Effect = &capability.EffectContract{Class: capability.EffectIrreversible}
+	entry.Digest = ""
+	entry.Signatures = []registry.Signature{sig}
+	writeCorpusEntry(t, dir, "acme.json", entry)
+	keys := writeCLITrustStore(t, dir, registry.TrustedKey{
+		KeyID:     "acme-2026",
+		Algorithm: registry.AttestAlgorithmEd25519,
+		PublicKey: base64.StdEncoding.EncodeToString(pub),
+		Owner:     "Acme Inc",
+	})
+
+	if code := cmdContracts([]string{"--dir", dir, "--trust-keys", keys, "--ref", "acme/mcp.send"}); code != 2 {
+		t.Fatalf("--ref exit = %d, want 2 — a pin must not be printed for an entry a trusted key signed and someone then edited", code)
+	}
+	if code := cmdContracts([]string{"--dir", dir, "--trust-keys", keys, "--attest-payload", "acme/mcp.send"}); code != 2 {
+		t.Fatalf("--attest-payload exit = %d, want 2", code)
+	}
+}
+
+// TestContractsRefWarnsOnADisputedEntry: a dispute does not block the pin (it is a
+// community-advisory signal, not a verdict eunox issues), but the one moment an author is
+// about to commit to an entry is the moment they need to know someone who read it disagreed.
+func TestContractsRefWarnsOnADisputedEntry(t *testing.T) {
+	dir := t.TempDir()
+	entry := validCorpusEntry("acme/mcp.send", "send")
+	digest, err := capability.EffectContractDigest(entry.Effect)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	entry.Digest = digest
+	sig, pub := signCorpusEntry(t, &entry, "reviewer-1", registry.AttestRoleReviewer, registry.AttestStatementDisputes)
+	entry.Signatures = []registry.Signature{sig}
+	writeCorpusEntry(t, dir, "acme.json", entry)
+	keys := writeCLITrustStore(t, dir, registry.TrustedKey{
+		KeyID:     "reviewer-1",
+		Algorithm: registry.AttestAlgorithmEd25519,
+		PublicKey: base64.StdEncoding.EncodeToString(pub),
+		Owner:     "A Reviewer",
+	})
+
+	var code int
+	out := captureStdout(t, func() { code = cmdContracts([]string{"--dir", dir, "--trust-keys", keys, "--ref", "acme/mcp.send"}) })
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 — a dispute must not block a pin", code)
+	}
+	if !strings.Contains(out, "acme/mcp.send@") {
+		t.Errorf("the pin should still be printed:\n%s", out)
+	}
+}

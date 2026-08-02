@@ -209,6 +209,33 @@ func (c *Contract) Validate() error {
 	return nil
 }
 
+// strictDecodeJSON is the one JSON reader this package uses for a document on disk: unknown
+// fields refused, and trailing content after the first value refused.
+//
+// Both halves are load-bearing and both were previously written out twice, once per loader.
+// Unknown-field rejection turns a misspelling into an error rather than a silently-absent
+// value. The trailing-content check catches a file holding two concatenated objects — a bad
+// merge, an append where a rewrite was meant — where Decode would read the first and discard
+// the second in silence; a contract or a trusted key that vanishes without an alarm is
+// indistinguishable from one that was never there.
+//
+// useNumber preserves integer literals beyond float64's exact range, which matters for a
+// contract's blast radius and not for a key file.
+func strictDecodeJSON(data []byte, target any, what string, useNumber bool) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if useNumber {
+		dec.UseNumber()
+	}
+	if err := dec.Decode(target); err != nil {
+		return fmt.Errorf("parsing %s: %w", what, err)
+	}
+	if dec.More() {
+		return fmt.Errorf("parsing %s: trailing content after the first JSON object", what)
+	}
+	return nil
+}
+
 // LoadCorpus reads every *.json entry in dir, validates each, and returns them sorted by
 // id. It fails on the FIRST invalid entry rather than skipping it: a corpus that silently
 // drops an unreadable contract would let a tampered file disappear instead of raising an
@@ -239,22 +266,11 @@ func LoadCorpus(dir string) ([]Contract, error) {
 			return nil, fmt.Errorf("reading contract %q: %w", p, err)
 		}
 		var c Contract
-		dec := json.NewDecoder(bytes.NewReader(data))
-		dec.DisallowUnknownFields()
 		// UseNumber keeps a blast-radius literal exact: a magnitude above 2^53 widened to
 		// float64 would round, and the digest is computed over the decoded value, so the
 		// entry would fail its own digest check for a reason that looks like tampering.
-		dec.UseNumber()
-		if err := dec.Decode(&c); err != nil {
-			return nil, fmt.Errorf("parsing contract %q: %w", p, err)
-		}
-		// Decode reads only the FIRST JSON value, so a file holding two concatenated
-		// objects — a bad merge, an append where a rewrite was meant — would load the
-		// first and discard the second in silence. That is the shape this loader's
-		// fail-on-first-invalid rule exists to prevent: a contract that vanishes without
-		// an alarm is indistinguishable from one that was never there.
-		if dec.More() {
-			return nil, fmt.Errorf("parsing contract %q: trailing content after the first JSON object; one entry per file", p)
+		if err := strictDecodeJSON(data, &c, fmt.Sprintf("contract %q", p), true); err != nil {
+			return nil, err
 		}
 		if err := c.Validate(); err != nil {
 			return nil, fmt.Errorf("%s: %w", filepath.Base(p), err)
@@ -269,12 +285,9 @@ func LoadCorpus(dir string) ([]Contract, error) {
 	return out, nil
 }
 
-// sortedKeys renders a validation set for a deterministic error message.
+// sortedKeys renders a validation set for a deterministic error message. The collect-and-sort
+// is sortedSet's (attest.go); this is that plus the join, so one function orders a set in this
+// package rather than two with near-identical bodies.
 func sortedKeys(m map[string]bool) string {
-	ks := make([]string, 0, len(m))
-	for k := range m {
-		ks = append(ks, k)
-	}
-	sort.Strings(ks)
-	return strings.Join(ks, ", ")
+	return strings.Join(sortedSet(m), ", ")
 }

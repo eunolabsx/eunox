@@ -27,6 +27,43 @@ Section conventions:
 
 ### Added
 
+- **Single-use declassify approvals (`once`).** A `mcp.declassify` grant marked
+  `"once": true` is **burned on first use**, so a replay is refused
+  `approval_consumed` instead of clearing a flow label again. The burn is keyed by the
+  grant's `id` (which `once` therefore makes mandatory), commits atomically through the
+  call counter's one admission primitive so two concurrent callers cannot both spend it,
+  and is **not** reclaimed by session teardown — a burn a reconnect could undo would make
+  "approve this once" mean "once per connection". A grant without `once` still behaves
+  exactly as before. See
+  [`docs/capability-manifest-guide.md`](./docs/capability-manifest-guide.md).
+
+- **Cross-PEP task anchoring (`taskAnchoredState`).** A new gateway-config key (per-route,
+  with a `defaults` fallback) that keys accumulated enforcement state — flow-label taint,
+  `sequenceBlock` antecedents, `maxCalls` and cumulative `blastRadius` budgets — on the
+  caller's **validated `mcp.task_id` claim** rather than on its session, so state survives
+  a hop between enforcement points instead of restarting clean on the far side. Off by
+  default: it changes what every budget in a policy *means*. A request with **no token**
+  is anchored on its session exactly as before; an **authenticated** request whose token
+  omits the claim is refused rather than accounted against a second bucket.
+
+- **Delegation attenuation (RFC 8693 `act` + `mcp.delegation`).** A verified token may
+  carry an actor chain and a per-hop grant list that narrow authority across a delegation
+  hop on five axes — `targets`, `labels`, `allowLabels`, `redactFields`, `maxEffectClass`.
+  A hop that widens any axis **rejects the token**; the decision path independently applies
+  every hop, so neither check depends on the other. `allowLabels: []` is the quarantine: a
+  delegate sharing a tainted task reaches no labeled sink at all. List results are filtered
+  by the chain, so a delegate never sees a tool its call leg will refuse.
+
+- **Signed registry attestations (`eunox contracts --trust-keys`, `--attest-payload`).**
+  Effect-contract corpus entries may carry Ed25519 `signatures` over their content digest,
+  verified **locally** against a trusted-key file the operator supplies — never fetched,
+  and never on the decision path. Role and statement are inside the signed payload, so a
+  reviewer's signature cannot be re-presented as a vendor's and a **dispute** cannot be
+  edited into an endorsement. A signature from an unknown key is inert; one from a trusted
+  key that fails to verify is an error. `--attest-payload` prints the exact bytes a
+  publisher signs — eunox verifies attestations and never mints them. See
+  [`registry/README.md`](./registry/README.md#vendor-attestation-and-community-review).
+
 - **`schemaVersion "0.2"` — the flow + effect grammar is published.** The tokens that
   shipped behind the `"0.2-draft"` staging string land as **one** batched revision:
   `flowLabel`, `labelOutput`, `declassify`, `effectClass`, `blastRadius`, a constraint's

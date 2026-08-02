@@ -348,7 +348,7 @@ func registerProxyFlags(fs *flag.FlagSet) *proxyCLIFlags {
 		killswitchFailOpen:   fs.Bool("killswitch-fail-open", false, "Redis kill-switch behaviour during a Redis outage. By default the kill switch\nfails CLOSED: while Redis is unreachable the proxy denies every request\n(KILL_SWITCH_ERROR) because a kill issued during the outage cannot be confirmed.\nSet this flag to fail OPEN instead -- serve the last-known kill state and allow\ntraffic not already known to be killed -- trading guaranteed revocation for\ndata-plane availability. Only affects --redis-addr deployments. See ADR-0003."),
 		killswitchReconcile:  fs.Duration("killswitch-reconcile-interval", 0, "How often the Redis kill switch reconciles its local cache against Redis\n(default 30s). Lower values shorten the kill-propagation window and, in the\ndefault fail-closed mode, the data-plane denial window that persists after a\ntransient Redis blip recovers -- recovery is bounded by this interval, not Redis.\nVery low values increase Redis load. 0 uses the default. Only affects --redis-addr."),
 		killswitchSessionTTL: fs.Duration("killswitch-session-ttl", 0, "How long a SESSION kill tombstone lives in Redis before it is garbage\ncollected (default 720h / 30 days). This is a memory bound, not a policy\nexpiry: when the tombstone expires the kill is LIFTED, so a value shorter\nthan the longest session your deployment holds open re-admits a revoked\nsession. Relevant when a stdio agent pins and reuses one --session-id for\nmonths. Negative disables expiry entirely; 0 uses the default. Agent kills\nare never expired. Only affects --redis-addr."),
-		maxCallCounterKeys:   fs.Int("max-call-counter-keys", defaultMaxCallCounterKeys, "Maximum distinct keys the in-memory maxCalls/sequenceBlock counter holds at once.\nEach live (session, tool) pair is one key, reclaimed only on the periodic cleanup;\nthis ceiling bounds the heap a flood of unique session IDs can pin between cleanups\n(a call under a new key past the limit fails closed). The same bound also caps the\nin-memory flow-label store's distinct SESSIONS (one key per session, so its ceiling\nis looser and never trips first). 0 disables the bound. Ignored when --redis-addr is\nset (Redis keeps this state off the Go heap, with TTLs)."),
+		maxCallCounterKeys:   fs.Int("max-call-counter-keys", defaultMaxCallCounterKeys, "Maximum distinct keys the in-memory maxCalls/sequenceBlock counter holds at once.\nEach live (session, tool) pair is one key, reclaimed only on the periodic cleanup;\nthis ceiling bounds the heap a flood of unique session IDs can pin between cleanups\n(a call under a new key past the limit fails closed). The same bound also caps the\nin-memory flow-label store's distinct SESSIONS (one key per session, so its ceiling\nis looser and never trips first) — under taskAnchoredState that becomes one key per\nTASK, which OUTLIVES the session that created it and is reclaimed only by the Redis\nbackend's idle TTL, so prefer --redis-addr for that mode. 0 disables the bound. Ignored when --redis-addr is\nset (Redis keeps this state off the Go heap, with TTLs)."),
 
 		// Compliance flags.
 		strictDrift: fs.Bool("strict-drift", false, "Promote startup drift warnings to fatal errors that abort session startup: a new\nupstream tool matched by a manifest glob, a manifest entry that matches no live\ntool, or an upstream version that does not satisfy the manifest's serverVersion\npin. (A condition argument absent from the live schema and the uncovered-tool\nINFO stay advisory, never fatal.) A launch-time global override: applies to every\npoliced route, regardless of a per-route 'strictDrift' in the config. Routes with\nno policy are unaffected; the proxy warns if the flag matched no policed route\n(e.g. with --audit)."),
@@ -1516,6 +1516,34 @@ func warnNoRedisSharedState(redisConfigured, policyUsesSharedState bool) {
 	fmt.Fprintf(os.Stderr, "[eunox] NOTICE: a policy uses maxCalls or sequenceBlock but no --redis-addr is set — call-counter, call-ordering history, and kill-switch state are per-process. Running multiple instances will not share quotas, sequence history, or revocations; configure --redis-addr for multi-instance deployments.\n")
 }
 
+// anyRouteTaskAnchored reports whether any upstream resolves to task-anchored state, so the
+// advisory fires once per process rather than once per route.
+func anyRouteTaskAnchored(cfg *config.GatewayConfig) bool {
+	for i := range cfg.Upstreams {
+		if cfg.ResolvedTaskAnchoredState(&cfg.Upstreams[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+// warnTaskAnchoringWithoutJWT prints the advisory for a route that opts into task-anchored
+// state on a proxy that never validates a token. The anchor is derived from the VALIDATED
+// mcp.task_id claim and falls back to session keying when there is none, so without a JWT
+// integration every request takes the fallback and the option does exactly nothing — a clean
+// startup and a silently unchanged deployment, which is the shape the --strict-drift notice
+// beside it exists to prevent for its own flag.
+//
+// It is a notice rather than a startup refusal because the combination is legitimate mid-
+// rollout: an operator may enable the config key before the IdP starts minting the claim, and
+// the fallback keeps that state safe rather than merely quiet.
+func warnTaskAnchoringWithoutJWT(jwtConfigured, anyRouteTaskAnchored bool) {
+	if jwtConfigured || !anyRouteTaskAnchored {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[eunox] NOTICE: taskAnchoredState is enabled but no JWT validation is configured (--jwks-uri) — the anchor comes from the VALIDATED mcp.task_id claim, so every request falls back to session keying and the option has no effect.\n")
+}
+
 // resolveOAuthMetadata builds the RFC 9728 protected-resource metadata document
 // (and its URL) for the gateway, or returns (nil, "", nil) when no resource URI is
 // configured — in which case the metadata endpoint is simply not published. It fails
@@ -1689,6 +1717,7 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 	}
 
 	warnNoRedisSharedState(pf.redisConfigured, transport.AnyRouteHasMaxCalls(routes) || transport.AnyRouteHasBlastRadiusVelocity(routes) || transport.AnyRouteHasSequenceBlock(routes) || transport.AnyRouteHasFlowLabel(routes))
+	warnTaskAnchoringWithoutJWT(pf.jwksURI != "", anyRouteTaskAnchored(cfg))
 
 	bind := cfg.Listen.Bind
 	if bind == "" {
@@ -1891,6 +1920,7 @@ func serveStdioHost(ctx context.Context, cfg *config.GatewayConfig, sink *audit.
 	upstreamTimeMs := transport.ResolveUpstreamTimeout(pf.upstreamTimeoutMs, cfg.Defaults.UpstreamTimeoutMs)
 
 	warnNoRedisSharedState(pf.redisConfigured, manifest.HasMaxCalls() || manifest.HasBlastRadiusVelocity() || manifest.HasSequenceBlock() || manifest.HasFlowLabel())
+	warnTaskAnchoringWithoutJWT(pf.jwksURI != "", anyRouteTaskAnchored(cfg))
 
 	// This upstream's own receipt-signing key domain, from the same local-file loader the
 	// gateway routes use. Absent (the default) leaves the verifier nil and the whole

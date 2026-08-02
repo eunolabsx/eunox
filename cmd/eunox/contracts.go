@@ -126,18 +126,17 @@ Flags:
 		return 2
 	}
 
-	if *ref != "" {
-		return writeContractRef(os.Stdout, contracts, *ref)
-	}
-	if *attestPayload != "" {
-		return writeAttestPayload(os.Stdout, contracts, *attestPayload, *role, *statement)
-	}
-
 	// Signature verification is opt-in, because it needs a key file only the operator can
 	// supply — there is no default trust store and nothing is fetched to build one. Without
 	// --trust-keys the corpus verifies exactly as it did before (digest integrity), and the
 	// listing simply omits the column rather than printing an unverified one that reads like
 	// a verdict.
+	//
+	// It runs BEFORE the --ref and --attest-payload branches, not after. Those two are the
+	// moments a decision is made — an author copies a pin, a publisher signs — so they are
+	// exactly where a tampered entry or a trusted reviewer's DISPUTE has to stop the command.
+	// Returning early made `--ref` with `--trust-keys` exit 0 having verified nothing, which
+	// is the false assurance the listing's own column rule exists to avoid.
 	var statuses map[string]registry.AttestationStatus
 	if *trustKeys != "" {
 		store, storeErr := registry.LoadTrustStore(*trustKeys)
@@ -157,7 +156,16 @@ Flags:
 			}
 			statuses[contracts[i].ID] = st
 		}
-		wf(os.Stdout, "OK    %s  (%d trusted attestation key(s))\n", *trustKeys, store.Len())
+		if *ref == "" && *attestPayload == "" {
+			wf(os.Stdout, "OK    %s  (%d trusted attestation key(s))\n", *trustKeys, store.Len())
+		}
+	}
+
+	if *ref != "" {
+		return writeContractRef(os.Stdout, contracts, *ref, statuses)
+	}
+	if *attestPayload != "" {
+		return writeAttestPayload(os.Stdout, contracts, *attestPayload, *role, *statement)
 	}
 	writeContractCorpus(os.Stdout, resolved, contracts, statuses)
 	return 0
@@ -193,12 +201,22 @@ func writeAttestPayload(out io.Writer, contracts []registry.Contract, id, role, 
 
 // writeContractRef prints the pin for one contract id. An unknown id is an error, not an
 // empty line: a pin an author pastes has to come from an entry that exists.
-func writeContractRef(out io.Writer, contracts []registry.Contract, id string) int {
+//
+// When attestations were verified (--trust-keys), a DISPUTE on the entry being pinned is
+// reported on stderr rather than swallowed. Printing the pin anyway is deliberate — a dispute
+// is a community-advisory signal and not a verdict eunox is in a position to issue — but the
+// one moment an author is about to commit to an entry is the moment they need to know someone
+// who read it disagreed.
+func writeContractRef(out io.Writer, contracts []registry.Contract, id string, statuses map[string]registry.AttestationStatus) int {
 	for i := range contracts {
-		if contracts[i].ID == id {
-			wf(out, "%s\n", contracts[i].Ref())
-			return 0
+		if contracts[i].ID != id {
+			continue
 		}
+		if st, ok := statuses[id]; ok && len(st.Disputed) > 0 {
+			fmt.Fprintf(os.Stderr, "eunox contracts: WARNING %q is DISPUTED by %v (a trusted key you configured); read their reasoning before pinning it\n", id, st.Disputed)
+		}
+		wf(out, "%s\n", contracts[i].Ref())
+		return 0
 	}
 	fmt.Fprintf(os.Stderr, "eunox contracts: no contract with id %q in the corpus (run without --ref to list the ids it holds)\n", id)
 	return 2

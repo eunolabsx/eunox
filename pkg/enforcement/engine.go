@@ -1216,6 +1216,20 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 		return *delegDeny
 	}
 
+	// An authenticated caller this engine cannot anchor as configured. It sits beside the
+	// delegation gate for the same reason: it is a property of the request rather than of the
+	// conditions, and a call that cannot be accounted must not reach the state commits below.
+	// Falling back to session keying here would let one caller split its own taint, budgets
+	// and antecedents across two buckets by alternating tokens — see anchorUnresolved.
+	if e.anchorUnresolved(req) {
+		return denyResponse(requestID, now, matched.IsAuditOnly(), nil, capability.DenialInfo{
+			Code:          capability.ErrCodeMissingContext,
+			ConditionType: anchorKindTask,
+			Message:       "this route anchors enforcement state on the task, but the presented token carries no mcp.task_id; refusing rather than accounting this call against a second, session-keyed bucket (fail closed)",
+			Details:       map[string]interface{}{"anchor": anchorKindTask, "reason": "no_task_id"},
+		})
+	}
+
 	// PASS ONE: the pure predicates. The deferred (quota-consuming) conditions are
 	// collected but NOT committed here — the ceiling below has to be able to refuse the
 	// call before anything is charged to it.
