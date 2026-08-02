@@ -1,19 +1,19 @@
 # The attribution interface
 
-**Status:** experimental, and **staged behind `schemaVersion: "0.2-draft"`** like every
-other draft token. The wire surface is the `_meta` key `io.eunolabs.context-manifest` on a
+**Status:** published, and **gated on `schemaVersion: "0.2"`** like the rest of the
+flow+effect layer. The wire surface is the `_meta` key `io.eunolabs.context-manifest` on a
 `tools/call` request; a client either sends it or does not.
 
 It needs no manifest grammar change — the key never appears in a policy — but that is
-exactly why the staging gate has to be a **runtime** one: the load-time check that refuses
-a draft token under the published `0.1` grammar has nothing to inspect for a token that
-arrives on a request. A route whose policy declares `0.1` (or declares no policy at all)
-therefore **ignores** the block entirely, including the malformed-request rejection below.
+exactly why the grammar gate has to be a **runtime** one: the load-time check that refuses
+a `0.2` token under `0.1` has nothing to inspect for a token that arrives on a request. A
+route whose policy declares `0.1` (or declares no policy at all) therefore **ignores** the
+block entirely, including the malformed-request rejection below.
 
 Ignoring rather than rejecting is deliberate, and it is the conservative direction: the
 interface is [union-only](#the-one-directional-rule), so a declaration can only ever
 *tighten* a call. Ignoring it falls back to the conservative session join — the stricter
-reading — while rejecting would make a published-grammar operator's calls start failing
+reading — while rejecting would make a `0.1` operator's calls start failing
 over a key their grammar does not contain.
 
 ## Why it exists
@@ -95,7 +95,7 @@ question.
 
 ## Failure behavior
 
-Under `schemaVersion: "0.2-draft"`, a **malformed** block is a malformed **request**
+Under `schemaVersion: "0.2"`, a **malformed** block is a malformed **request**
 (`INVALID_PARAMS`), not a silently ignored hint. Rejected shapes:
 
 - an unknown label (the flow vocabulary is closed — a typo'd label that silently vanished

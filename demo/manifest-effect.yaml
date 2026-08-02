@@ -1,9 +1,9 @@
 # demo/manifest-effect.yaml — effect-contract demo policy (Demo (b), the integrity dual).
 #
-# Opts into the experimental flow+effect draft grammar (schemaVersion 0.2-draft), so the
+# Opts into the published flow+effect grammar (schemaVersion 0.2), so the
 # effect contract block, the top-level effectCeiling, and the flow tokens are available.
-# The published "0.1" grammar does NOT recognize them — they are staged behind
-# schema-version negotiation until a batched grammar bump.
+# The "0.1" grammar does NOT define these tokens; a "0.1" manifest using one is
+# refused at load, naming the revision that introduced it.
 #
 # The scenario: an agent reads an untrusted, customer-submitted support ticket, which
 # carries a prompt injection telling it to drop a table. The agent HOLDS the capability:
@@ -20,7 +20,7 @@
 #
 # The identical tool, in the identical session, with a SELECT is allowed. That contrast is
 # the point: the verdict is decided by what the action would DO, not by who asked.
-schemaVersion: "0.2-draft"
+schemaVersion: "0.2"
 name: demo-effect-policy
 version: "0.1.0"
 

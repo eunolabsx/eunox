@@ -50,7 +50,7 @@ type UpstreamRoute struct {
 	// honorAttribution is set when the route's policy opts into the flow+effect draft
 	// grammar, which is what admits the client-supplied attribution interface (the
 	// io.eunolabs.context-manifest block in a request's _meta). It is the runtime half of
-	// the same staging discipline checkExperimentalTokenStaging applies at load: that gate
+	// the same grammar-version discipline checkTokenGrammarVersion applies at load: that gate
 	// cannot cover this token because the token never appears in a manifest, so a route
 	// running the published grammar must ignore the block rather than act on it. Read-only
 	// after BuildRoutes. See (*config.LocalManifest).HonorsAttributionInterface.
@@ -152,6 +152,32 @@ func (r *routeSink) RecordAllow(ctx context.Context, sessionID, identifier, meth
 		AuditOnly:     auditOnly,
 		LabelsOut:     labelsOut,
 		CarriedLabels: carriedLabels,
+	})
+}
+
+// RecordDeclassifiedAllow stamps route identity onto the allow record for a call that
+// also performed an approved declassification (see *audit.Sink's method of the same name
+// for why the cleared labels and the approver travel together).
+func (r *routeSink) RecordDeclassifiedAllow(ctx context.Context, sessionID, identifier, method string, details map[string]interface{}, obligs []string, auditOnly bool, labelsOut, carriedLabels, labelsCleared []string, approver, approvalID string) {
+	if r == nil || r.sink == nil {
+		return
+	}
+	r.sink.Record(ctx, audit.RecordParams{
+		Upstream:      r.upstream,
+		PolicyVersion: r.policyVersion,
+		PolicySHA256:  r.policySHA256,
+		SessionID:     sessionID,
+		Identifier:    identifier,
+		Method:        method,
+		Decision:      "allow",
+		Details:       details,
+		Obligations:   obligs,
+		AuditOnly:     auditOnly,
+		LabelsOut:     labelsOut,
+		CarriedLabels: carriedLabels,
+		LabelsCleared: labelsCleared,
+		Approver:      approver,
+		ApprovalID:    approvalID,
 	})
 }
 
@@ -452,6 +478,20 @@ func startupFatalManifestCheck(u *config.UpstreamConfig, hostTransport string, m
 	// audience-gated when it is not.
 	if hostTransport == config.HostTransportStdio && merged.Audience != "" {
 		return fmt.Errorf("upstream %q declares an audience pin in its policy manifest, but audience pins are a JWT concept enforced only in gateway (transport: http) mode with --jwks-uri; a stdio host cannot enforce it. Remove the manifest 'audience' field or run this upstream as an http gateway route", u.Name)
+	}
+	// A declassify directive is satisfiable only by a human approval, and an approval
+	// arrives only on a validated JWT — which a stdio HOST can never present, since
+	// --jwks-uri is categorically rejected there and no stdio path populates claims. Every
+	// call to such a capability would escalate ESCALATION_REQUIRED/no_approval forever with
+	// no way to supply the approval and no startup error, which is the same
+	// "the capability could never be satisfied" outcome validateDeclassify refuses an empty
+	// label list to avoid. Decidable from the config alone, so refuse it here for the same
+	// reason the audience pin above is refused.
+	//
+	// The axis is the HOST transport, not the upstream's: a stdio UPSTREAM behind an http
+	// gateway is fine, because the token arrives on the host leg.
+	if hostTransport == config.HostTransportStdio && merged.HasDeclassify() {
+		return fmt.Errorf("upstream %q declares a declassify directive in its policy manifest, but a declassification requires a human approval carried on a validated JWT, and a stdio host has no HTTP listener to present one to (--jwks-uri requires transport: http); every call to that capability would escalate forever with no way to approve it. Remove the directive or run this upstream as an http gateway route", u.Name)
 	}
 	return nil
 }

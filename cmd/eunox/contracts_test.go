@@ -223,7 +223,7 @@ func TestEffectCoverageSilentOnAnEmptyManifest(t *testing.T) {
 func TestValidateReportsEffectCoverage(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "policy.yaml")
-	manifest := `schemaVersion: "0.2-draft"
+	manifest := `schemaVersion: "0.2"
 name: coverage-policy
 version: 0.1.0
 capabilities:

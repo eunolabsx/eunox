@@ -1092,6 +1092,10 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 		// can only produce more denials — which is what makes honoring it need no trust
 		// decision.
 		DeclaredLabels: declaredLabelsFromContext(ctx),
+		// The human approvals the verified token granted. Nil for every request that is
+		// not a declassification, which is nearly all of them; without one, a declassify
+		// directive escalates rather than clearing a label.
+		DeclassifyApprovals: declassifyApprovalsFromContext(ctx),
 	}
 
 	matched := p.findConstraint(target, claims)
@@ -1498,6 +1502,17 @@ func (p *ManifestPDP) constraintWithUnionLabelOutput(matched *capability.Constra
 	if !p.anyLabelOutput {
 		return matched
 	}
+	// A DECLASSIFYING constraint is never augmented. validateDeclassifyCoherence refuses
+	// labelOutput and declassify on one constraint at load precisely because the two write
+	// the same session state in opposite directions on one call; synthesizing a labelOutput
+	// here would rebuild that shape at runtime out of two individually-coherent entries —
+	// a `tool:*` source and a specific sanitizer — and the outcome would then be decided by
+	// session history rather than by policy. The union exists so a sibling cannot SHADOW a
+	// source's taint; a declassify entry is not a source that forgot its label, it is the
+	// one action whose whole purpose is to remove one.
+	if len(capability.DeclassifyLabelsOf(matched)) > 0 {
+		return matched
+	}
 	union := p.matchingLabelOutputUnion(target, claims)
 	if len(union) == 0 || labelSetContainsAll(labelOutputLabels(matched), union) {
 		return matched
@@ -1748,7 +1763,61 @@ func (p *ManifestPDP) HardenRefusal(ctx context.Context, sessionID string, r cap
 	if hardened, over := p.hardenOnEffectCeiling(ctx, sessionID, r, target, args); over {
 		return hardened
 	}
+	if hardened, unapproved := p.hardenOnUnapprovedDeclassify(ctx, r, target); unapproved {
+		return hardened
+	}
 	return p.withForwardObligations(ctx, r, target)
+}
+
+// hardenOnUnapprovedDeclassify replaces an outer layer's downgradable refusal with the
+// declassify escalation when the matched constraint clears a flow label and the request
+// carries no approval covering it.
+//
+// It exists for the same COMPOSED case hardenOnEffectCeiling does, and the failure it
+// closes is sharper. A wrapping PDP (the JWT layer) can refuse a call on its own terms and
+// short-circuit above the inner PDP, so evaluateMatched never runs and checkDeclassify
+// never fires. That refusal is a SOFT deny, which a route running --audit downgrades to a
+// forward — so adding a JWT would forward a declassification the same manifest hard-refuses
+// without one, inverting the rule that a token may only ever restrict. The forward is the
+// worst of the two outcomes here: it performs the action AND leaves the taint the policy
+// said the action clears.
+//
+// Like the ceiling's, it commits nothing: the approval test is a pure comparison of the
+// request's grants against the directive's labels, with no store read and no state write.
+// It runs AFTER the ceiling so a call that is over the consequence bound reports that, the
+// same precedence the full path applies.
+func (p *ManifestPDP) hardenOnUnapprovedDeclassify(ctx context.Context, r capability.EnforceResponse, target EnforceTarget) (capability.EnforceResponse, bool) {
+	if r.Decision == capability.DecisionAllow || r.Denial == nil || r.Denial.HardDeny {
+		return r, false
+	}
+	matched := p.findConstraint(target, jwtClaimsAsMap(ctx))
+	if matched == nil || !containsAction(matched.Actions, requiredActionFor(target.Type)) {
+		return r, false
+	}
+	want := capability.DeclassifyLabelsOf(matched)
+	if len(want) == 0 {
+		return r, false
+	}
+	canonical := string(target.Type) + ":" + target.Name
+	if capability.FindDeclassifyApproval(declassifyApprovalsFromContext(ctx), canonical, want) != nil {
+		// A covering approval exists, so the declassification is not what makes this call
+		// refusable — the outer layer's own verdict stands, downgradable as it was.
+		return r, false
+	}
+	denial := capability.DenialInfo{
+		Code:          capability.ErrCodeEscalationRequired,
+		ConditionType: capability.DirectiveTypeDeclassify,
+		Message: fmt.Sprintf("clearing flow label(s) %v at %s requires a human approval covering all of them; the request carries none (this call was also refused by the wrapping authorization layer: %s)",
+			want, canonical, r.Denial.Message),
+		HardDeny: true,
+		Details:  map[string]interface{}{"flow": true, "declassify_labels": want, "reason": "no_approval"},
+	}
+	return capability.EnforceResponse{
+		RequestID: r.RequestID,
+		Decision:  capability.DecisionEscalate,
+		DecidedAt: r.DecidedAt,
+		Denial:    &denial,
+	}, true
 }
 
 // directivesNamingTarget collects the directives of every capability whose target type +

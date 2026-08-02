@@ -61,6 +61,18 @@ type EnforceRequest struct {
 	// attribution.go. Empty for every non-cooperating client, which is the default and
 	// costs nothing.
 	DeclaredLabels []string `json:"declaredLabels,omitempty"`
+	// DeclassifyApprovals carries the human approvals the request's VERIFIED token
+	// granted (the `mcp.declassify` claim), already parsed and validated. They are the
+	// only thing that lets a declassify directive clear a flow label instead of
+	// escalating. Empty on every request that is not a declassification — including every
+	// request with no token at all, which is why a deployment with no approval integration
+	// escalates rather than silently declassifying.
+	//
+	// It is a typed field rather than a lookup into Claims for the same reason
+	// DeclaredLabels is: the engine must not re-derive a security-critical input from an
+	// untyped claim map on the hot path, where a decode slip reads as "no approval"
+	// (harmless) or "some approval" (not).
+	DeclassifyApprovals []DeclassifyApproval `json:"declassifyApprovals,omitempty"`
 }
 
 // EnforceRequestContext carries request attributes used during enforcement.
@@ -104,6 +116,18 @@ type EnforceResponse struct {
 	// in the fixed vocabulary order for a deterministic record; nil on a non-flow call.
 	LabelsOut     []string `json:"labelsOut,omitempty"`
 	CarriedLabels []string `json:"carriedLabels,omitempty"`
+	// LabelsCleared is the set of native flow labels an APPROVED declassify directive
+	// removed from the session on this call, and Approver / ApprovalID identify the human
+	// approval that authorized it. All three are populated together or not at all: a
+	// declassification with no named approver is not one this proxy performs.
+	//
+	// They are stamped onto the audit record (labels_cleared / approver, and approval_id
+	// in details), which is what makes an approved declassification a distinguishable
+	// event on the tape rather than an ordinary allow that quietly dropped a label.
+	// Vocabulary-ordered for a deterministic record; nil on every other call.
+	LabelsCleared []string `json:"labelsCleared,omitempty"`
+	Approver      string   `json:"approver,omitempty"`
+	ApprovalID    string   `json:"approvalId,omitempty"`
 	// Effect is the contract the decision resolved against this call's arguments, stamped
 	// on an ALLOW so a post-hoc check has the declaration in hand. Its one consumer is the
 	// effect-receipt verifier, which compares what a server ATTESTS it did against what

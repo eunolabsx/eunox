@@ -1,10 +1,14 @@
 # Effect contracts and the effect ceiling
 
-**Status:** experimental, staged behind `schemaVersion: "0.2-draft"`. The tokens below are
-**not part of the published `0.1` grammar** — a `0.1` manifest that uses one is refused at
-load, fail closed. They are deliberately absent from
-[capability-manifest-guide.md](./capability-manifest-guide.md) and from `schemas/` until
-they land in a batched grammar bump. This document is where they live until then.
+**Status:** published in `schemaVersion "0.2"`. The tokens below are **not part of
+`"0.1"`** — a `0.1` manifest that uses one is refused at load, fail closed — so a policy
+adopting them declares `schemaVersion: "0.2"`. They are in `schemas/` and summarized in
+[capability-manifest-guide.md](./capability-manifest-guide.md); this document is the
+reference for the layer's semantics and design rationale.
+
+*(Earlier builds staged these tokens behind a `"0.2-draft"` schemaVersion. That draft is
+**removed, not aliased**: a manifest still declaring it is refused, so there is exactly one
+spelling of the grammar in the wild. Change the string to `"0.2"`; nothing else moved.)*
 
 *(The registry corpus format is a separate artifact with its own published schema — see
 [`registry/README.md`](../registry/README.md) — because a distributed corpus has its own
@@ -51,7 +55,7 @@ waved through a consequence gate.
 ## Declaring a contract
 
 ```yaml
-schemaVersion: "0.2-draft"
+schemaVersion: "0.2"
 
 capabilities:
   - target: tool:refund

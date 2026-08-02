@@ -166,11 +166,11 @@ func TestVelocityAllowsAPerCallBoundBesideMaxCalls(t *testing.T) {
 	}
 }
 
-// TestVelocityIsStagedBehindTheDraftVersion pins the staging invariant: the cumulative
+// TestVelocityRequiresTheFlowEffectGrammar pins the closed-grammar invariant: the cumulative
 // keys ride the blastRadius condition, which is already DRAFT-staged, so a published "0.1"
 // manifest using them is refused rather than silently enabling an experimental predicate.
 // The gate is what keeps a staged token from becoming part of the language by accident.
-func TestVelocityIsStagedBehindTheDraftVersion(t *testing.T) {
+func TestVelocityRequiresTheFlowEffectGrammar(t *testing.T) {
 	body := "schemaVersion: \"0.1\"\nname: t\nversion: 1.0.0\ncapabilities:\n" +
 		"  - target: tool:refund\n    actions: [call]\n    conditions:\n" +
 		"      - type: blastRadius\n        maxTotal: 2000\n        windowSeconds: 3600\n"
@@ -178,7 +178,7 @@ func TestVelocityIsStagedBehindTheDraftVersion(t *testing.T) {
 	if err == nil {
 		t.Fatal("a cumulative blastRadius bound must be refused under the published 0.1 grammar")
 	}
-	if !strings.Contains(err.Error(), "0.2-draft") {
+	if !strings.Contains(err.Error(), "0.2") {
 		t.Fatalf("the refusal must name the draft version that admits it, got: %v", err)
 	}
 }

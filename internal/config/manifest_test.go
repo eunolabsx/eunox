@@ -429,9 +429,14 @@ func TestLoadManifest_SchemaVersion(t *testing.T) {
 		name, prefix, wantErr string
 	}{
 		{"valid 0.1", "schemaVersion: \"0.1\"\n", ""},
+		{"valid 0.2", "schemaVersion: \"0.2\"\n", ""},
 		{"absent", "", "'schemaVersion' is required"},
 		{"empty", "schemaVersion: \"\"\n", "'schemaVersion' is required"},
-		{"unsupported", "schemaVersion: \"0.2\"\n", "unsupported manifest schemaVersion"},
+		{"unsupported", "schemaVersion: \"0.3\"\n", "unsupported manifest schemaVersion"},
+		// The draft string the flow+effect tokens staged behind before they were
+		// published. It is REMOVED, not aliased: a manifest still declaring it is
+		// refused so there is exactly one spelling of the grammar in the wild.
+		{"retired draft", "schemaVersion: \"0.2-draft\"\n", "unsupported manifest schemaVersion"},
 		// A quoted scalar's surrounding whitespace survives the load path; the empty
 		// check and the membership lookup now both run on the trimmed value, so a
 		// padded-but-valid version is accepted instead of failing with a misleading

@@ -938,6 +938,15 @@ func (e *Engine) handleAllowedValues(_ context.Context, cond capability.Conditio
 		return nil
 	}
 
+	// Task-context variables are matched separately, and by EXACT equality rather than
+	// through MatchAllowedValue's glob. A resolved value is IdP-supplied text: run through
+	// the glob matcher, a claim of "*" would become an allow-anything wildcard the token
+	// holder chose for themselves. An unresolvable reference falls through to the denial
+	// below rather than matching, so a missing token or empty claim never widens the set.
+	if matchTaskVars(argValue, av.Values, req.Claims) {
+		return nil
+	}
+
 	return &ConditionError{
 		// VALUE_NOT_PERMITTED matches the denial_code the JWT PDP emits for the same
 		// failure, keeping audit records and SIEM rules consistent across the manifest
@@ -953,8 +962,64 @@ func (e *Engine) handleAllowedValues(_ context.Context, cond capability.Conditio
 	}
 }
 
+// matchTaskVars reports whether argValue equals what any task-context variable in allowed
+// resolves to for this request's validated claims. It is separate from MatchAllowedValue
+// on purpose — see the call site: a resolved claim is compared by exact equality, never as
+// a glob.
+//
+// It is also deliberately NOT part of the JWT shorthand PDP's matcher. That path
+// authorizes against capability CLAIMS rather than a manifest, so there is no manifest
+// value to carry a reference; keeping the variable surface in the manifest matcher alone
+// means there is one place a claim can be turned into a comparison.
+//
+// A non-string argument never matches: every variable resolves to a claim string.
+func matchTaskVars(argValue interface{}, allowed []interface{}, claims map[string]interface{}) bool {
+	// No claims means no token, so nothing can resolve and the whole scan is dead. This is
+	// the default for every deployment without JWT wiring, and this function runs on every
+	// allowedValues deny — the path already doing the most work.
+	if len(claims) == 0 {
+		return false
+	}
+	s, isString := argValue.(string)
+	if !isString {
+		return false
+	}
+	for _, a := range allowed {
+		pattern, ok := a.(string)
+		if !ok {
+			continue
+		}
+		name, isRef := capability.ParseVariableRef(pattern)
+		if !isRef {
+			continue
+		}
+		// Skipped by MatchAllowedValue only when recognized, so an unrecognized reference
+		// reaches neither matcher as a variable — it stays a literal there and resolves to
+		// nothing here.
+		resolved, ok := capability.ResolveTaskVar(name, claims)
+		if !ok {
+			// Unresolvable: no token, or the claim is absent/empty. Skip rather than
+			// match — falling back to the literal "${task.id}" text would compare an
+			// argument against a manifest placeholder, and matching an empty claim
+			// against an empty argument would let an unauthenticated caller satisfy an
+			// identity binding by sending "".
+			continue
+		}
+		if resolved == s {
+			return true
+		}
+	}
+	return false
+}
+
 // MatchAllowedValue reports whether argValue satisfies an allowedValues set. It is
 // the single matcher shared by handleAllowedValues and the JWT shorthand PDP.
+//
+// It does NOT resolve task-context variables — it SKIPS them, so a reference matches
+// nothing here, not even its own placeholder text. handleAllowedValues runs matchTaskVars
+// alongside this for the manifest path (exact equality against the resolved claim); the
+// JWT shorthand path carries no manifest values and therefore no references, so skipping
+// is the whole of its handling.
 //
 // A string allowed entry is matched ONLY as a glob via MatchValueGlob, never by
 // exact equality: MatchValueGlob treats a metacharacter-free pattern as a literal,
@@ -967,6 +1032,21 @@ func (e *Engine) handleAllowedValues(_ context.Context, cond capability.Conditio
 func MatchAllowedValue(argValue interface{}, allowed []interface{}) bool {
 	for _, a := range allowed {
 		if pattern, ok := a.(string); ok {
+			// A RECOGNIZED "${task.*}" entry is a reference, never a pattern, and is
+			// skipped here entirely. It carries no glob metacharacter, so MatchValueGlob
+			// would treat it as a literal — and an argument whose value happened to be the
+			// placeholder TEXT ("${task.id}") would satisfy an identity binding by spelling
+			// it out. Skipping makes the reference matchable only by matchTaskVars, i.e.
+			// only against the claim it resolves to.
+			//
+			// The test is IsTaskVarRef, not "looks like ${...}". This matcher is shared
+			// with the JWT shorthand path, whose values come from a TOKEN's capability
+			// claim rather than a manifest — so an unrecognized "${STAGE}" there has never
+			// passed through the loader, and skipping it would silently void the grant with
+			// no diagnostic. It stays a literal and keeps matching itself.
+			if capability.IsTaskVarRef(pattern) {
+				continue
+			}
 			if s, ok := argValue.(string); ok && MatchValueGlob(pattern, s) {
 				return true
 			}

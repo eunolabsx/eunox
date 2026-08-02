@@ -27,6 +27,58 @@ Section conventions:
 
 ### Added
 
+- **`schemaVersion "0.2"` — the flow + effect grammar is published.** The tokens that
+  shipped behind the `"0.2-draft"` staging string land as **one** batched revision:
+  `flowLabel`, `labelOutput`, `declassify`, `effectClass`, `blastRadius`, a constraint's
+  `effect` contract, the top-level `effectCeiling`, and the `${task.*}` variables. They
+  are documented in [`docs/capability-manifest-guide.md`](./docs/capability-manifest-guide.md)
+  and [`docs/effect-contracts.md`](./docs/effect-contracts.md), and published as a machine
+  -readable grammar at
+  [`schemas/eunox-capability-manifest.schema.json`](./schemas/eunox-capability-manifest.schema.json).
+  - `"0.1"` stays **closed** against every one of them: a `0.1` manifest that uses a `0.2`
+    token is refused at load, naming the revision that introduced it. That is the same
+    rule a misspelled key obeys, and it is what lets a fleet run both revisions without a
+    `0.1` route silently acquiring a predicate its authors never reviewed.
+  - The published schema is guarded against drift from the Go types by tests that derive
+    their expectation from the **condition prototype registry** rather than a mirrored
+    list, so a future condition type cannot land without a schema branch.
+
+- **`declassify` — the declassification path.** A directive naming the flow labels an
+  action clears, so a policy can express the review/redaction step that legitimately drops
+  taint. It is the only token in the grammar that **removes** flow state, and everything
+  about it follows from that:
+  - The clear happens **only** under a human approval covering every named label at that
+    exact target. Approvals ride the `mcp.declassify` claim of a token eunox has already
+    verified — the operator's own identity plane, so no new trust root and no fetch on the
+    decision path. With no covering approval the call is refused `ESCALATION_REQUIRED`
+    rather than forwarded-without-clearing, and the refusal is **hard**: a route running
+    `--audit` cannot turn "no human has approved this" into "performed anyway, logged".
+  - Scope rules all fail closed: the grant's `target` is matched **literally** (a glob
+    would widen one approval across every matching action), its `labels` must be a
+    **superset** of what the directive clears (a partial grant escalates rather than
+    half-clearing), `approver` is mandatory, and a malformed grant rejects the **token**
+    rather than evaluating to a grant that covers nothing.
+  - **Three new audit fields**, `labels_cleared`, `approver` and `approval_id`, appear
+    together or not at all and are covered by the record HMAC. `labels_cleared` reports
+    what actually *changed*, so an approved clear of a label the session never held
+    records neither. `eunox stats` counts declassifications separately.
+  - **Requires an HTTP host.** Approvals ride a validated JWT and JWT validation needs an
+    HTTP listener, so a `declassify` directive on a **stdio host** could only ever
+    escalate — it is refused at startup rather than failing on every call. A stdio
+    *upstream* behind an HTTP gateway is unaffected.
+  - **Honest limit, stated rather than mitigated:** the token is held by the agent, so an
+    approval minted into it is replayable for that token's lifetime at any action the
+    grant names. Mint a short-lived token per approval rather than a standing grant.
+
+- **`${task.*}` task-context variables** — `${task.id}`, `${task.agent}`,
+  `${task.principal}` bind an `allowedValues` entry to the caller's own verified identity
+  instead of to a literal. A resolved value is compared by **exact equality**, never as a
+  glob (a claim of `*` must not become a wildcard the token holder chose for themselves),
+  a reference must be the **entire** value, and an unresolvable one **denies** rather than
+  falling back to the placeholder text. A misspelled variable is a load error **under
+  `"0.2"`**; under `"0.1"` a `${` remains an ordinary character in a literal value, so an
+  existing manifest whose allowlist holds template-shaped text keeps loading unchanged.
+
 - **Interface pinning Tier-2** — every session now auto-baselines the advertised surface
   of **every** tool the upstream reports and re-diffs it on **every** `tools/list`. A tool
   whose surface changes mid-session is denied on the `tools/call` leg and hidden from
@@ -135,6 +187,13 @@ Section conventions:
   `mcp.MethodNotificationsInitialized`, the other half of the same handshake.
 
 ### Changed
+
+- **BREAKING (pre-1.0): `schemaVersion: "0.2-draft"` is removed, not aliased.** A manifest
+  still declaring the draft string is refused at load, with the supported list naming
+  `0.2`. **Migration: change the string to `"0.2"`.** No token was renamed and nothing else
+  in the document moves. Keeping the draft accepted as a synonym would leave two spellings
+  of one grammar in the wild and a second version string every future gate has to remember
+  — the shim this project does not carry before 1.0.
 
 - **Every HTTP response-write deadline is armed by one helper, floored at
   `httpWriteTimeout` (30s).** Three legs still computed their own window: the handler

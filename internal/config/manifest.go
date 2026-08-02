@@ -894,6 +894,11 @@ func validateLocalManifest(m *LocalManifest) error {
 	if strings.TrimSpace(m.Name) == "" {
 		return fmt.Errorf("'name' must not be empty")
 	}
+	// The declared grammar revision, trimmed once. Only validateAllowedValues consults it
+	// (the ${task.*} surface is defined by "0.2" and absent from "0.1"); every other
+	// per-type validator is revision-independent, and the authoritative version gate for
+	// discriminator tokens stays checkTokenGrammarVersion below.
+	declaredSchemaVersion := strings.TrimSpace(m.SchemaVersion)
 	if err := validateEffectCeiling(m.EffectCeiling); err != nil {
 		return err
 	}
@@ -1080,15 +1085,34 @@ func validateLocalManifest(m *LocalManifest) error {
 				}
 			case capability.LabelOutputDirective, *capability.LabelOutputDirective:
 				d, _ := capability.AsValueOrPointer[capability.LabelOutputDirective](dir)
-				if err := requireSourceDirectiveTarget(i, c.Target, targetType); err != nil {
+				if err := requireSourceDirectiveTarget(i, c.Target, targetType, capability.DirectiveTypeLabelOutput); err != nil {
 					return err
 				}
 				if err := validateLabelOutput(i, j, d.Labels); err != nil {
 					return err
 				}
+			case capability.DeclassifyDirective, *capability.DeclassifyDirective:
+				d, _ := capability.AsValueOrPointer[capability.DeclassifyDirective](dir)
+				// Same target restriction as labelOutput, for the mirror reason: a
+				// declassification is a TRANSFORM — the sanitize/redact/review step whose
+				// completion a human approved — so it sits where data is produced or read.
+				// A prompt: fetch or the sampling opt-in is an egress the agent drives, and
+				// clearing a label at an egress launders it at exactly the point the flow
+				// layer exists to gate.
+				if err := requireSourceDirectiveTarget(i, c.Target, targetType, capability.DirectiveTypeDeclassify); err != nil {
+					return err
+				}
+				if err := validateDeclassify(i, j, d.Labels); err != nil {
+					return err
+				}
 			default:
-				return fmt.Errorf("capability at index %d, directive %d: unrecognized directive type %q; the only supported directives are redactFields and labelOutput", i, j, dir.DirectiveType())
+				return fmt.Errorf("capability at index %d, directive %d: unrecognized directive type %q; the only supported directives are redactFields, labelOutput and declassify", i, j, dir.DirectiveType())
 			}
+		}
+		// Cross-directive coherence for the flow pair, checked once per constraint rather
+		// than inside the per-directive loop (which sees one entry at a time).
+		if err := validateDeclassifyCoherence(i, c); err != nil {
+			return err
 		}
 		// Reject two quota-consuming conditions that would address the same counter
 		// bucket, before the per-condition pass, so the cross-condition collision is
@@ -1132,7 +1156,12 @@ func validateLocalManifest(m *LocalManifest) error {
 			case capability.RecipientDomainCondition, *capability.RecipientDomainCondition:
 				err = validateTypedCondition(i, j, cond, validateRecipientDomain)
 			case capability.AllowedValuesCondition, *capability.AllowedValuesCondition:
-				err = validateTypedCondition(i, j, cond, validateAllowedValues)
+				// The only per-type validator that needs the declared grammar revision:
+				// the ${task.*} surface exists in "0.2" and not in "0.1", so what counts
+				// as a malformed reference versus an ordinary literal differs between them.
+				err = validateTypedCondition(i, j, cond, func(i, j int, v *capability.AllowedValuesCondition) error {
+					return validateAllowedValues(i, j, v, declaredSchemaVersion)
+				})
 			case capability.MaxCallsCondition, *capability.MaxCallsCondition:
 				err = validateTypedCondition(i, j, cond, validateMaxCalls)
 			case capability.IPRangeCondition, *capability.IPRangeCondition:
@@ -1161,12 +1190,12 @@ func validateLocalManifest(m *LocalManifest) error {
 			}
 		}
 	}
-	// Single authoritative staging gate: reject any DRAFT-staged token the declared
-	// schemaVersion does not admit. Runs after the per-capability loop (so every
+	// Single authoritative grammar-version gate: reject any token the declared
+	// schemaVersion does not define. Runs after the per-capability loop (so every
 	// condition/directive is non-nil and well-typed) rather than at each token's
-	// validation case, so a future staged token cannot slip under the published grammar
-	// by omitting a per-case gate.
-	if err := checkExperimentalTokenStaging(m); err != nil {
+	// validation case, so a future token cannot slip under an older revision by omitting
+	// a per-case gate.
+	if err := checkTokenGrammarVersion(m); err != nil {
 		return err
 	}
 	return nil
@@ -1409,7 +1438,7 @@ func validateAllowedExtensions(i, j int, v *capability.AllowedExtensionsConditio
 // validateAllowedValues rejects an allowedValues condition that fails closed: a
 // missing 'argument' or an empty 'values' list (both deny every call, typically
 // from an `arguments:`/`value:` typo), or a value that is a malformed glob.
-func validateAllowedValues(i, j int, v *capability.AllowedValuesCondition) error {
+func validateAllowedValues(i, j int, v *capability.AllowedValuesCondition, declared string) error {
 	if err := validateArgumentRef(i, j, v.Argument, "allowedValues requires an 'argument' field naming the tool parameter to check (e.g. argument: path)"); err != nil {
 		return err
 	}
@@ -1424,6 +1453,26 @@ func validateAllowedValues(i, j int, v *capability.AllowedValuesCondition) error
 	for k, val := range v.Values {
 		s, ok := val.(string)
 		if !ok {
+			continue
+		}
+		// A task-context variable is a REFERENCE, not a pattern: it is resolved from the
+		// validated token and compared by exact equality (see enforcement.matchTaskVars),
+		// so it is validated as a reference and skips the glob check entirely. Anything
+		// carrying a "${" that is not a well-formed, recognized reference is a load error
+		// — the closed grammar's rule, applied to the variable surface: a misspelled
+		// ${task.identifier} must not load as an inert literal that denies every call.
+		//
+		// Gated on the revision that DEFINES the surface. Under "0.1" a "${" is an
+		// ordinary character in a literal value (it is not a glob metacharacter), so a
+		// document that was valid before the variable surface existed keeps loading;
+		// applying the rule there would turn an existing manifest into a startup failure
+		// over a token its grammar does not contain. A recognized reference under "0.1" is
+		// still refused — by checkTaskVarGrammarVersion, which names the revision that
+		// introduced it, exactly as every other 0.2 token is refused.
+		if declared == ManifestSchemaVersion02 && capability.ContainsVariableRef(s) {
+			if err := capability.ValidateVariableRef(s); err != nil {
+				return fmt.Errorf("capability at index %d, condition %d, value %d: %w", i, j, k, err)
+			}
 			continue
 		}
 		if err := enforcement.ValidateValueGlob(s); err != nil {
@@ -1749,64 +1798,104 @@ func validateSequenceBlock(i, j int, v *capability.SequenceBlockCondition) error
 	return nil
 }
 
-// experimentalTokenVersions maps a DRAFT-staged condition/directive discriminator to the
-// manifest schemaVersion that admits it. A token absent from this map is part of the base
-// published grammar and needs no gate. It is the single source of the staging invariant:
-// a staged token is inert unless the manifest declares its introducing draft version, so
-// adding a future staged token is one map entry — not a gate call threaded through each
-// per-type validation case, which a contributor could forget, silently admitting the token
-// under the published grammar (the fail-open this gate exists to prevent). A draft token
-// requires its EXACT introducing version: a draft is a staging vehicle removed once it
-// folds into a batched grammar bump, so no later version inherits it through this map.
-var experimentalTokenVersions = map[string]string{
-	capability.ConditionTypeFlowLabel:   ManifestSchemaVersionFlowEffectDraft,
-	capability.DirectiveTypeLabelOutput: ManifestSchemaVersionFlowEffectDraft,
-	capability.ConditionTypeEffectClass: ManifestSchemaVersionFlowEffectDraft,
-	capability.ConditionTypeBlastRadius: ManifestSchemaVersionFlowEffectDraft,
+// tokenGrammarVersions maps a condition/directive discriminator to the manifest
+// schemaVersion that INTRODUCED it. A token absent from this map is part of the base
+// published grammar ("0.1") and needs no gate. It is the single source of the
+// closed-grammar invariant across revisions: a token is inert unless the manifest
+// declares the revision that introduced it, so adding a future token is one map entry —
+// not a gate call threaded through each per-type validation case, which a contributor
+// could forget, silently admitting the token under an older revision (the fail-open this
+// gate exists to prevent).
+//
+// A token requires its EXACT introducing version. That is deliberately not "this version
+// or later": there are two published revisions, so "later" has no members yet, and
+// spelling the rule as an ordering would invite a >= comparison over version strings that
+// is wrong the first time a revision is not orderable by string compare. When a third
+// revision lands, this map is what decides inheritance explicitly.
+var tokenGrammarVersions = map[string]string{
+	capability.ConditionTypeFlowLabel:   ManifestSchemaVersion02,
+	capability.DirectiveTypeLabelOutput: ManifestSchemaVersion02,
+	capability.DirectiveTypeDeclassify:  ManifestSchemaVersion02,
+	capability.ConditionTypeEffectClass: ManifestSchemaVersion02,
+	capability.ConditionTypeBlastRadius: ManifestSchemaVersion02,
 }
 
-// checkExperimentalTokenStaging fails closed if any capability carries a DRAFT-staged token
-// (per experimentalTokenVersions) the declared schemaVersion does not admit — so a published
-// "0.1" manifest that uses one is rejected (the closed grammar stays closed) rather than
-// silently enabling an experimental predicate. It is the one authoritative staging gate: the
-// per-type validation cases carry no version check, so a new staged token cannot bypass the
-// gate by omitting one. It runs after the per-capability structural validation, so every
-// condition/directive is non-nil and well-typed and ConditionType()/DirectiveType() cannot
-// panic on a null or typed-nil entry. SchemaVersion is compared trimmed so a quoted,
-// whitespace-padded scalar is judged on its real value.
-func checkExperimentalTokenStaging(m *LocalManifest) error {
+// checkTokenGrammarVersion fails closed if any capability carries a token (per
+// tokenGrammarVersions) the declared schemaVersion does not admit — so a "0.1" manifest
+// that uses a flow+effect token is rejected (the closed grammar stays closed) rather than
+// silently enabling a predicate that revision does not define. It is the one authoritative
+// grammar-version gate: the per-type validation cases carry no version check, so a new
+// token cannot bypass the gate by omitting one. It runs after the per-capability
+// structural validation, so every condition/directive is non-nil and well-typed and
+// ConditionType()/DirectiveType() cannot panic on a null or typed-nil entry. SchemaVersion
+// is compared trimmed so a quoted, whitespace-padded scalar is judged on its real value.
+func checkTokenGrammarVersion(m *LocalManifest) error {
 	declared := strings.TrimSpace(m.SchemaVersion)
 	// The effect layer's two non-condition tokens — the top-level effectCeiling and a
-	// constraint's effect contract — are staged by the same rule. They are not
-	// conditions or directives, so they cannot ride experimentalTokenVersions (which is
-	// keyed by discriminator); gating them here keeps ONE staging gate rather than a
+	// constraint's effect contract — are gated by the same rule. They are not
+	// conditions or directives, so they cannot ride tokenGrammarVersions (which is
+	// keyed by discriminator); gating them here keeps ONE grammar gate rather than a
 	// second one somewhere else that could be updated out of step.
-	if m.EffectCeiling != nil && declared != ManifestSchemaVersionFlowEffectDraft {
-		return fmt.Errorf("the top-level effectCeiling is experimental and requires schemaVersion %q (the flow+effect draft); this manifest declares schemaVersion %q, under which the key is not part of the grammar", ManifestSchemaVersionFlowEffectDraft, declared)
+	if m.EffectCeiling != nil && declared != ManifestSchemaVersion02 {
+		return fmt.Errorf("the top-level effectCeiling was introduced in schemaVersion %q (the flow+effect grammar); this manifest declares schemaVersion %q, under which the key is not part of the grammar", ManifestSchemaVersion02, declared)
 	}
 	for i := range m.Capabilities {
 		c := &m.Capabilities[i]
-		if c.Effect != nil && declared != ManifestSchemaVersionFlowEffectDraft {
-			return experimentalTokenStagingErr(i, "the effect contract block", ManifestSchemaVersionFlowEffectDraft, declared)
+		if c.Effect != nil && declared != ManifestSchemaVersion02 {
+			return tokenGrammarVersionErr(i, "the effect contract block", ManifestSchemaVersion02, declared)
 		}
 		for _, cond := range c.Conditions {
-			if req, staged := experimentalTokenVersions[cond.ConditionType()]; staged && declared != req {
-				return experimentalTokenStagingErr(i, "the "+cond.ConditionType()+" condition", req, declared)
+			if req, gated := tokenGrammarVersions[cond.ConditionType()]; gated && declared != req {
+				return tokenGrammarVersionErr(i, "the "+cond.ConditionType()+" condition", req, declared)
 			}
 		}
 		for _, dir := range c.Directives {
-			if req, staged := experimentalTokenVersions[dir.DirectiveType()]; staged && declared != req {
-				return experimentalTokenStagingErr(i, "the "+dir.DirectiveType()+" directive", req, declared)
+			if req, gated := tokenGrammarVersions[dir.DirectiveType()]; gated && declared != req {
+				return tokenGrammarVersionErr(i, "the "+dir.DirectiveType()+" directive", req, declared)
 			}
+		}
+		// Task-context variables are the batch's third non-discriminator token: they are
+		// VALUES inside a condition that exists in both revisions, so they cannot ride
+		// tokenGrammarVersions either. Gated here, beside the other two, so the whole
+		// grammar-version rule is readable in one function.
+		if err := checkTaskVarGrammarVersion(i, c, declared); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-// experimentalTokenStagingErr builds the fail-closed rejection for a staged token used
-// under a schemaVersion that does not admit it.
-func experimentalTokenStagingErr(i int, feature, required, declared string) error {
-	return fmt.Errorf("capability at index %d: %s is experimental and requires schemaVersion %q (the flow+effect draft); this manifest declares schemaVersion %q, under which the token is not part of the grammar", i, feature, required, declared)
+// checkTaskVarGrammarVersion rejects a ${task.*} reference under a revision that does not
+// define it. Validation has already run, so every reference present here is well-formed
+// and recognized; this decides only whether the declared revision admits the surface at
+// all.
+func checkTaskVarGrammarVersion(i int, c *capability.Constraint, declared string) error {
+	if declared == ManifestSchemaVersion02 {
+		return nil
+	}
+	for _, cond := range c.Conditions {
+		av, ok := capability.AsValueOrPointer[capability.AllowedValuesCondition](cond)
+		if !ok || av == nil {
+			continue
+		}
+		for _, val := range av.Values {
+			s, isString := val.(string)
+			if !isString || !capability.IsTaskVarRef(s) {
+				// Only a RECOGNIZED reference is a "0.2" token. An unrecognized "${...}"
+				// under "0.1" is a literal that revision has always accepted, so refusing
+				// it here would be a breaking change dressed as a grammar gate.
+				continue
+			}
+			return tokenGrammarVersionErr(i, "the task-context variable "+s, ManifestSchemaVersion02, declared)
+		}
+	}
+	return nil
+}
+
+// tokenGrammarVersionErr builds the fail-closed rejection for a token used under a
+// schemaVersion that does not define it.
+func tokenGrammarVersionErr(i int, feature, required, declared string) error {
+	return fmt.Errorf("capability at index %d: %s was introduced in schemaVersion %q (the flow+effect grammar); this manifest declares schemaVersion %q, under which the token is not part of the grammar", i, feature, required, declared)
 }
 
 // requireResponseDirectiveTarget rejects a response-mutating directive (redactFields)
@@ -1821,16 +1910,18 @@ func requireResponseDirectiveTarget(i int, target string, targetType capability.
 	return nil
 }
 
-// requireSourceDirectiveTarget restricts labelOutput to tool: and resource: source
-// targets — the boundaries a sensitive read sits at. A prompt: or system: target is not a
-// flow SOURCE: a sampling/createMessage request is an egress the agent drives, a place a
-// flowLabel SINK belongs, not a source that asserts new taint. (This restriction is why
-// sampling can only ever be a flow sink, never a concurrent flow writer — see the
-// per-session serialization in internal/transport.) Reject at load rather than admit a
-// labelOutput on a non-source target.
-func requireSourceDirectiveTarget(i int, target string, targetType capability.TargetType) error {
+// requireSourceDirectiveTarget restricts the two flow-state directives — labelOutput and
+// declassify — to tool: and resource: source targets, the boundaries a sensitive read or
+// a sanitizing transform sits at. A prompt: or system: target is not a flow SOURCE: a
+// sampling/createMessage request is an egress the agent drives, a place a flowLabel SINK
+// belongs, not a source that asserts new taint (nor one that may clear it — clearing at
+// an egress launders a label at exactly the point the flow layer exists to gate). This
+// restriction is why sampling can only ever be a flow sink, never a concurrent flow
+// writer — see the per-session serialization in internal/transport. Reject at load rather
+// than admit the directive on a non-source target.
+func requireSourceDirectiveTarget(i int, target string, targetType capability.TargetType, directive string) error {
 	if targetType != capability.TargetTypeTool && targetType != capability.TargetTypeResource {
-		return fmt.Errorf("capability at index %d: constraint %q carries a labelOutput directive, which is valid only on tool: or resource: source targets (a %s target is not a flow source)", i, target, targetType)
+		return fmt.Errorf("capability at index %d: constraint %q carries a %s directive, which is valid only on tool: or resource: source targets (a %s target is not a flow source)", i, target, directive, targetType)
 	}
 	return nil
 }
@@ -1858,6 +1949,57 @@ func validateLabelOutput(i, j int, labels []string) error {
 	for _, l := range labels {
 		if !capability.IsFlowLabel(l) {
 			return fmt.Errorf("capability at index %d, directive %d: labelOutput 'labels' contains unknown label %q — valid native flow labels are %s", i, j, l, strings.Join(capability.FlowLabelVocabulary(), ", "))
+		}
+	}
+	return nil
+}
+
+// validateDeclassify checks a declassify directive's label list against the closed native
+// vocabulary, mirroring validateLabelOutput. An empty list is rejected for a sharper
+// reason than labelOutput's: a declassify directive that clears nothing still ESCALATES
+// every call it sits on (the approval check runs on the directive's presence), so the
+// author would get a permanently-refused capability with no way to satisfy it.
+func validateDeclassify(i, j int, labels []string) error {
+	if len(labels) == 0 {
+		return fmt.Errorf("capability at index %d, directive %d: declassify requires a non-empty 'labels' list naming the native flow labels this action clears; an empty list clears nothing while still requiring an approval, so the capability could never be satisfied", i, j)
+	}
+	for _, l := range labels {
+		if !capability.IsFlowLabel(l) {
+			return fmt.Errorf("capability at index %d, directive %d: declassify 'labels' contains unknown label %q — valid native flow labels are %s", i, j, l, strings.Join(capability.FlowLabelVocabulary(), ", "))
+		}
+	}
+	return nil
+}
+
+// validateDeclassifyCoherence rejects the two constraint shapes a declassify directive
+// cannot mean anything sensible in. Both are load errors rather than runtime surprises,
+// because both would produce a policy whose written intent and enforced behavior differ.
+//
+//  1. declassify together with labelOutput on ONE constraint. The two write the same
+//     session state in opposite directions on the same call, and the order in which they
+//     resolve would silently decide the outcome (assert-then-clear leaves nothing;
+//     clear-then-assert leaves everything). An author who wants a source read that carries
+//     a different label than it clears writes two constraints.
+//  2. more than one declassify directive on one constraint. Two grants' worth of labels
+//     on one action reads as "either approval suffices" but enforces as "one approval must
+//     cover the union" — the stricter reading, arrived at by accident. One directive
+//     listing every label says the same thing unambiguously.
+func validateDeclassifyCoherence(i int, c *capability.Constraint) error {
+	count := 0
+	for _, dir := range c.Directives {
+		if capability.IsDeclassifyDirective(dir) {
+			count++
+		}
+	}
+	if count == 0 {
+		return nil
+	}
+	if count > 1 {
+		return fmt.Errorf("capability at index %d: %d declassify directives on one constraint; list every label in a single declassify directive instead — one approval has to cover all of them, and two entries read as if either would do", i, count)
+	}
+	for _, dir := range c.Directives {
+		if capability.IsLabelOutputDirective(dir) {
+			return fmt.Errorf("capability at index %d: a constraint carries both labelOutput and declassify; they write the same session flow state in opposite directions on one call, so which one wins would be decided by evaluation order rather than by policy — split them into two capabilities", i)
 		}
 	}
 	return nil
@@ -2271,19 +2413,21 @@ func conditionKeysFor(condType string) (map[string]bool, bool) {
 	return keys, true
 }
 
-// directiveKeysFor mirrors conditionKeysFor for response directives.
+// directiveKeysFor mirrors conditionKeysFor for directives — and, like it, reads the ONE
+// registry rather than a hand-written type switch.
+//
+// The switch it replaced was a fail-open: the caller skips the unknown-key check for a
+// type this returns "not known" for, so a directive whose arm someone forgot to add would
+// silently accept a misspelled field and load it as an empty value — exactly the shape the
+// unknown-key check exists to reject.
 func directiveKeysFor(dirType string) (map[string]bool, bool) {
-	switch dirType {
-	case capability.DirectiveTypeRedactFields:
-		keys := jsonFieldKeys(reflect.TypeOf(capability.RedactFieldsDirective{}))
-		keys["type"] = true
-		return keys, true
-	case capability.DirectiveTypeLabelOutput:
-		keys := jsonFieldKeys(reflect.TypeOf(capability.LabelOutputDirective{}))
-		keys["type"] = true
-		return keys, true
+	proto, known := capability.NewDirectivePrototype(dirType)
+	if !known {
+		return nil, false
 	}
-	return nil, false
+	keys := jsonFieldKeys(reflect.TypeOf(proto))
+	keys["type"] = true
+	return keys, true
 }
 
 // validateDescriptionHashFormat reports an error if s is not a valid

@@ -68,6 +68,25 @@ type auditRecord struct {
 	// Present only on flow-relevant decisions; omitted otherwise.
 	LabelsOut     []string `json:"labels_out,omitempty"`
 	CarriedLabels []string `json:"carried_labels,omitempty"`
+	// LabelsCleared and Approver are the declassification fields: the native flow labels
+	// an APPROVED declassify directive removed from the session on this call, and the
+	// human who approved it. They appear together or not at all — the proxy performs no
+	// declassification without a named approver — and only on an allow, since an
+	// unapproved one escalates and clears nothing.
+	//
+	// Their presence is what makes a declassification a distinguishable event on the
+	// tape rather than an ordinary allow that quietly dropped a label: no other record
+	// shape carries labels_cleared. LabelsCleared is drawn from the closed native
+	// vocabulary and needs no length bound; Approver is IdP-supplied free text and is
+	// bounded like the other envelope strings.
+	// ApprovalID is the control plane's own identifier for the approval, echoed so a
+	// tape entry joins back to the workflow that produced it. It travels with the other
+	// two rather than in Details because a declassification's evidence must be one
+	// record shape, not a top-level pair plus a magic details key the transport
+	// hand-merges into a map it does not own.
+	LabelsCleared []string `json:"labels_cleared,omitempty"`
+	Approver      string   `json:"approver,omitempty"`
+	ApprovalID    string   `json:"approval_id,omitempty"`
 	KeyID         string   `json:"key_id,omitempty"` // id of the HMAC key that signed this record; lets audit-verify select the right key after rotation (§ 3.4)
 	PrevHMAC      string   `json:"prev_hmac"`        // _hmac of the preceding record (genesis sentinel for the first); chains records together
 	HMAC          string   `json:"_hmac,omitempty"`
@@ -1270,6 +1289,32 @@ func (s *Sink) RecordAllow(ctx context.Context, sessionID, identifier, method st
 	})
 }
 
+// RecordDeclassifiedAllow enqueues the allow record for a call that ALSO performed an
+// approved declassification: labelsCleared are the labels actually removed from the
+// session and approver is the human the approval named.
+//
+// It is a distinct entrypoint rather than two more parameters on RecordAllow because the
+// two fields are meaningless apart — a declassification with no approver is not one this
+// proxy performs — and a widened RecordAllow would let a call site pass one without the
+// other at every one of its call sites. Here the pairing is structural: the only way to
+// stamp labels_cleared is to name an approver in the same call.
+func (s *Sink) RecordDeclassifiedAllow(ctx context.Context, sessionID, identifier, method string, details map[string]interface{}, obligs []string, auditOnly bool, labelsOut, carriedLabels, labelsCleared []string, approver, approvalID string) {
+	s.Record(ctx, RecordParams{
+		SessionID:     sessionID,
+		Identifier:    identifier,
+		Method:        method,
+		Decision:      "allow",
+		Details:       details,
+		Obligations:   obligs,
+		AuditOnly:     auditOnly,
+		LabelsOut:     labelsOut,
+		CarriedLabels: carriedLabels,
+		LabelsCleared: labelsCleared,
+		Approver:      approver,
+		ApprovalID:    approvalID,
+	})
+}
+
 // RecordDeny enqueues a deny audit record (see RecordAllow for the shared
 // semantics). denialCode and condType carry the structured denial taxonomy;
 // observe is the audit-mode flag — an observed deny is logged and forwarded rather
@@ -1335,6 +1380,9 @@ type RecordParams struct {
 	AuditOnly     bool
 	LabelsOut     []string
 	CarriedLabels []string
+	LabelsCleared []string
+	Approver      string
+	ApprovalID    string
 }
 
 // Record is the gateway-aware variant: p.Upstream, p.PolicyVersion, and
@@ -1435,7 +1483,16 @@ func (s *Sink) Record(ctx context.Context, p RecordParams) {
 		// decision keeps both fields omitted.
 		LabelsOut:     slices.Clone(p.LabelsOut),
 		CarriedLabels: slices.Clone(p.CarriedLabels),
-		KeyID:         s.keyID,
+		LabelsCleared: slices.Clone(p.LabelsCleared),
+		// Bounded like the identity claims above and for the same reason: the approver
+		// comes from an IdP-minted claim, structure-validated (non-empty) but not
+		// length-bounded, so an unbounded one could push a record past the 4 MiB scanner
+		// buffer.
+		Approver: boundFieldTo(p.Approver, auditEnvelopeFieldCap),
+		// Bounded for the same reason as Approver: it is an opaque identifier minted by
+		// the operator's control plane and echoed verbatim.
+		ApprovalID: boundFieldTo(p.ApprovalID, auditEnvelopeFieldCap),
+		KeyID:      s.keyID,
 	}
 
 	// The drop warnings are emitted OUTSIDE the lock. stderr can block indefinitely — a
@@ -1674,6 +1731,10 @@ func (rec *auditRecord) queueSize() int64 {
 	for _, l := range rec.CarriedLabels {
 		n += int64(len(l))
 	}
+	for _, l := range rec.LabelsCleared {
+		n += int64(len(l))
+	}
+	n += int64(len(rec.Approver) + len(rec.ApprovalID))
 	return n
 }
 

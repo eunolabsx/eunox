@@ -88,6 +88,7 @@ type auditStatsSummary struct {
 	blocked         int // denials with audit_only=false (call was rejected)
 	observed        int // denials with audit_only=true  (call was forwarded)
 	escalated       int // decision=escalate: refused pending human approval (never forwarded)
+	declassified    int // allows that cleared a flow label under a human approval (labels_cleared present)
 	other           int // records with a decision outside "allow" | "deny" | "escalate"
 	blockedDenials  map[denialKey]int
 	observedDenials map[denialKey]int
@@ -109,12 +110,13 @@ func computeAuditStats(r io.Reader) (auditStatsSummary, error) {
 		}
 		out.total++
 		var rec struct {
-			Decision   string `json:"decision"`
-			TargetType string `json:"target_type"`
-			Target     string `json:"target"`
-			Method     string `json:"method"`
-			DenialCode string `json:"denial_code"`
-			AuditOnly  bool   `json:"audit_only"`
+			Decision      string   `json:"decision"`
+			TargetType    string   `json:"target_type"`
+			Target        string   `json:"target"`
+			Method        string   `json:"method"`
+			DenialCode    string   `json:"denial_code"`
+			AuditOnly     bool     `json:"audit_only"`
+			LabelsCleared []string `json:"labels_cleared"`
 		}
 		if err := json.Unmarshal(line, &rec); err != nil {
 			// Undecodable line: count in "other" so the total still reconciles
@@ -125,6 +127,15 @@ func computeAuditStats(r io.Reader) (auditStatsSummary, error) {
 		switch rec.Decision {
 		case "allow":
 			out.allowed++
+			// A declassification is an allow that ALSO dropped a flow label under a
+			// human approval. It is counted separately, not bucketed apart: the record
+			// is a genuine allow, and the count answers "how often did a human agree to
+			// drop taint" — the other half of the approval queue the escalate count
+			// reports, and the number an operator watches for a policy whose sanitizing
+			// step has quietly become routine.
+			if len(rec.LabelsCleared) > 0 {
+				out.declassified++
+			}
 		case "deny":
 			k := denialKey{tool: statsTarget(rec.TargetType, rec.Target, rec.Method), code: rec.DenialCode}
 			if rec.AuditOnly {
@@ -170,7 +181,10 @@ func printAuditStats(w io.Writer, s auditStatsSummary) {
 	}
 	wln(")")
 	if s.escalated > 0 {
-		wln("  (escalated = refused because the action's consequence exceeds the effect ceiling: the call was NOT forwarded and needs human approval, not a policy fix.)")
+		wln("  (escalated = refused pending human approval — an action over the effect ceiling, or a declassification no approval covered: the call was NOT forwarded, and it needs a human, not a policy fix.)")
+	}
+	if s.declassified > 0 {
+		wf("  (declassified = %d allow(s) cleared a flow label under a human approval; every one names its approver in the record.)\n", s.declassified)
 	}
 	if s.observed > 0 {
 		wln("  (observed = audit-mode denials: the call was forwarded; the verdict is recorded but was not enforced.)")

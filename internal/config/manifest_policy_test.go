@@ -89,17 +89,17 @@ capabilities:
 	}
 }
 
-// TestHonorsAttributionInterface_IsStagedBehindTheDraftGrammar pins the runtime staging
+// TestHonorsAttributionInterface_RequiresTheFlowEffectGrammar pins the runtime staging
 // gate for the attribution interface.
 //
 // The repo's staging discipline is that a DRAFT grammar token must be refused under the
-// published grammar, and checkExperimentalTokenStaging enforces that at load for every
+// published grammar, and checkTokenGrammarVersion enforces that at load for every
 // token that appears IN a manifest. The attribution interface cannot ride that gate: its
 // token (`io.eunolabs.context-manifest`) arrives in a REQUEST's `_meta`, so there is
 // nothing to reject at load and the gate has to be a runtime predicate the transport
 // consults per call. Without this, a `0.1` operator got a draft feature — including its
 // malformed-request rejection — that is not in the grammar they declared.
-func TestHonorsAttributionInterface_IsStagedBehindTheDraftGrammar(t *testing.T) {
+func TestHonorsAttributionInterface_RequiresTheFlowEffectGrammar(t *testing.T) {
 	cases := []struct {
 		name    string
 		version string
@@ -108,8 +108,8 @@ func TestHonorsAttributionInterface_IsStagedBehindTheDraftGrammar(t *testing.T) 
 		{"the published grammar does not contain the token", "0.1", false},
 		{"a bare version string is likewise published-grammar", "0.1.0", false},
 		{"an unset version cannot be an opt-in", "", false},
-		{"the flow+effect draft admits it", ManifestSchemaVersionFlowEffectDraft, true},
-		{"surrounding whitespace does not defeat the gate", "  " + ManifestSchemaVersionFlowEffectDraft + "  ", true},
+		{"the flow+effect grammar admits it", ManifestSchemaVersion02, true},
+		{"surrounding whitespace does not defeat the gate", "  " + ManifestSchemaVersion02 + "  ", true},
 		{"a future draft is not this draft", "0.3-draft", false},
 	}
 	for _, c := range cases {

@@ -109,6 +109,12 @@ type JWTClaims struct {
 	// its own audience after the shared validator has accepted the token — see
 	// JWTPDP.routeAudience and WrapRoutesWithJWT. Empty when the token carried no aud.
 	Audiences []string
+	// Declassify holds the validated human approvals the token's `mcp.declassify` claim
+	// granted. Nil for the overwhelming majority of tokens. It is the ONLY thing that
+	// lets a declassify directive clear a flow label instead of escalating, which is why
+	// it is parsed and validated at the token boundary (ValidateToken) rather than read
+	// out of Extra on the decision path.
+	Declassify []capability.DeclassifyApproval
 	// ExpiresAt is the verified token's `exp` as a wall-clock time. ValidateToken
 	// rejects a token with no exp, so this is always set on a validated JWTClaims; it is
 	// the zero Time for a JWTClaims built without ValidateToken (e.g. tests). A long-lived
@@ -149,6 +155,22 @@ func WithJWTClaims(ctx context.Context, claims *JWTClaims) context.Context {
 	return context.WithValue(ctx, jwtClaimsKey{}, claims)
 }
 
+// declassifyApprovalsFromContext returns the human declassification approvals the
+// request's VERIFIED token granted, or nil when there is no token or it carried none —
+// which is the default, and is exactly what makes a deployment with no approval
+// integration escalate a declassify directive rather than silently performing it.
+//
+// It reads the validated JWTClaims rather than the flat input.claims map on purpose: the
+// map is a convenience surface for third-party policy evaluators and holds raw,
+// re-decoded claim values, while this input decides whether a flow label may be removed.
+// A security-critical input takes the typed, already-validated path.
+func declassifyApprovalsFromContext(ctx context.Context) []capability.DeclassifyApproval {
+	if c, ok := jwtClaimsFromContext(ctx); ok {
+		return c.Declassify
+	}
+	return nil
+}
+
 // jwtClaimsFromContext retrieves JWT claims from the context.
 func jwtClaimsFromContext(ctx context.Context) (*JWTClaims, bool) {
 	c, ok := ctx.Value(jwtClaimsKey{}).(*JWTClaims)
@@ -182,6 +204,13 @@ type mcpClaimSet struct {
 	Capabilities *[]string `json:"capabilities,omitempty"` // nil ⟹ field absent
 	TaskID       string    `json:"task_id"`
 	AgentID      string    `json:"agent_id"`
+	// Declassify carries the human approvals to drop flow labels
+	// (capability.DeclassifyApproval). It is held raw and decoded through
+	// capability.ParseDeclassifyApprovals so the wire type, its validation, and its
+	// unknown-field rejection live in the package that owns the grammar rather than
+	// being re-modeled here. Absent on every token that is not carrying an approval,
+	// which is nearly all of them.
+	Declassify json.RawMessage `json:"declassify,omitempty"`
 }
 
 // idpJWTPayload is the subset of IdP JWT claims relevant to MCP enforcement.
@@ -520,6 +549,7 @@ const (
 	jwtErrUnsupportedVersion   = "unsupported_version"
 	jwtErrCapabilitiesDisabled = "capabilities_disabled"
 	jwtErrInvalidCapabilities  = "invalid_capabilities"
+	jwtErrInvalidDeclassify    = "invalid_declassify"
 	jwtErrSenderConstrained    = "sender_constrained"
 	// jwtErrJWKSUnavailable marks a validation that failed because the key set could
 	// not be fetched (network error, non-200, empty/oversized set, open breaker), not
@@ -596,10 +626,11 @@ func ClassifyJWTError(err error) string {
 // the parsed capability heads (parsedCaps) and the flattened input.claims map
 // (flatClaims). Both are computed once here so decide/list-filter/sampling calls hand
 // out precomputed values instead of re-parsing/re-building per request.
-func newValidatedClaims(capsList []string, capsPresent bool, payload idpJWTPayload, std jwt.Claims, rawClaims map[string]interface{}) *JWTClaims {
+func newValidatedClaims(capsList []string, capsPresent bool, declassify []capability.DeclassifyApproval, payload idpJWTPayload, std jwt.Claims, rawClaims map[string]interface{}) *JWTClaims {
 	claims := &JWTClaims{
 		Capabilities:    capsList,
 		HasCapabilities: capsPresent,
+		Declassify:      declassify,
 		TaskID:          payload.MCP.TaskID,
 		AgentID:         payload.MCP.AgentID,
 		Subject:         std.Subject,
@@ -833,6 +864,24 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 			}
 		}
 
+		// Declassification approvals. Parsed HERE, at the token boundary, so a grant this
+		// build cannot enforce rejects the TOKEN rather than evaluating later to "covers
+		// nothing" — which would turn an IdP template mistake into a permanent, invisible
+		// escalation loop an operator has no error to grep for.
+		//
+		// Unlike mcp.capabilities this is NOT behind the experimental gate, and the reason
+		// is that it cannot widen anything on its own. A capability claim REPLACES the
+		// authorization surface, so admitting it under a build that ignores its restriction
+		// fails open. An approval is inert unless the manifest carries a declassify
+		// directive — a schemaVersion 0.2 token the operator wrote — so the manifest is
+		// already the opt-in, and a second gate would only add a way to configure the
+		// approval path off while leaving the directive on, i.e. a policy that can never be
+		// satisfied.
+		declassify, declErr := capability.ParseDeclassifyApprovals(payload.MCP.Declassify)
+		if declErr != nil {
+			return nil, capability.Terminal(jwtErr(jwtErrInvalidDeclassify, declErr))
+		}
+
 		// Sub is the primary identity anchor; without it a token cannot be attributed
 		// in audit records or matched against principal-scoped constraints. Reject
 		// (fail closed).
@@ -857,7 +906,7 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 			return nil, capability.Terminal(jwtErr(jwtErrSenderConstrained, fmt.Errorf("sender-constrained token (cnf) requires proof-of-possession, which the proxy does not verify; refusing to accept it as a plain bearer token (fail closed)")))
 		}
 
-		return newValidatedClaims(capsList, capabilitiesPresent, payload, stdClaims, rawClaims), nil
+		return newValidatedClaims(capsList, capabilitiesPresent, declassify, payload, stdClaims, rawClaims), nil
 	})
 	if err != nil {
 		return ctx, err

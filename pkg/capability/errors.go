@@ -64,19 +64,30 @@ const (
 	// typo cannot diverge the wire/audit code, and denialToJSONRPCCode maps it
 	// explicitly to -32001 so the wire code, the mapping, and the docs stay in lockstep.
 	ErrCodeSamplingDenied = "SAMPLING_DENIED"
-	// ErrCodeEscalationRequired refuses an action that exceeds the policy's
-	// effectCeiling under onExceed: escalate — one whose consequence (irreversibility,
-	// blast radius, or the absence of a compensating action) requires human approval
-	// rather than a policy verdict alone.
+	// ErrCodeEscalationRequired refuses an action that requires human approval rather
+	// than a policy verdict alone. Two things produce it:
 	//
-	// It is a REFUSAL, not a pending state. eunox has no approval integration in the
-	// in-path proxy — approval is the control-plane surface — so "escalate" resolves
-	// fail-closed to "not forwarded", carrying the reason so the operator (or a
-	// control plane) knows what to approve. A host receiving it must not retry
-	// blindly: the same call escalates again until the ceiling or the contract
-	// changes. On the wire it shares -32003 with the other condition-failure codes;
-	// the symbolic code and the audit record's decision=escalate are what distinguish
-	// "a human must decide" from "policy said no".
+	//   - the effectCeiling under onExceed: escalate, for an action whose CONSEQUENCE
+	//     (irreversibility, blast radius, or the absence of a compensating action)
+	//     exceeds the bound; and
+	//   - a declassify directive with no approval covering the labels it clears —
+	//     "no human has agreed to drop this flow label here".
+	//
+	// It is a REFUSAL, not a pending state: it resolves fail-closed to "not forwarded",
+	// carrying the reason so the operator (or a control plane) knows what to approve.
+	//
+	// What a host may do about it differs by producer, and the audit record's
+	// condition_type distinguishes them. A CEILING escalation is not satisfiable by
+	// retrying: the same call escalates again until the ceiling or the contract
+	// changes. A DECLASSIFY escalation IS satisfiable without any policy change — a
+	// token carrying an approval that covers the labels at that exact target clears it —
+	// so a control plane driving an approval workflow retries after the human acts. The
+	// proxy still holds no approval workflow itself; it verifies the evidence a human
+	// decision produced.
+	//
+	// On the wire it shares -32003 with the other condition-failure codes; the symbolic
+	// code and the audit record's decision=escalate are what distinguish "a human must
+	// decide" from "policy said no".
 	ErrCodeEscalationRequired = "ESCALATION_REQUIRED"
 )
 
