@@ -19,6 +19,15 @@ const DirectiveTypeDeclassify = "declassify"
 // `mcp` object. Its value is the array a DeclassifyApproval decodes from.
 const ClaimDeclassify = "declassify"
 
+// MaxDeclassifyApprovals bounds how many approvals one token may carry. Like the delegation
+// chain's depth cap this is a bound on attacker-influenced input the decision path walks, not
+// hygiene: the engine tests each COVERING grant against the ledger to find a live one, so a
+// token stuffed with spent single-use grants for one action turns every later call at that
+// action into that many ledger reads, inside the per-session decision lock, forever. Thirty-two
+// is far above any real approval workflow (a human approves one action at a time) and far
+// below anything measurable.
+const MaxDeclassifyApprovals = 32
+
 // DeclassifyDirective clears the named native flow Labels from the session's accumulated
 // set on an ALLOWED call — but only when the request carries a human approval covering
 // them. It is the declassification path: policy states WHERE a label may be dropped,
@@ -285,6 +294,9 @@ func ParseDeclassifyApprovals(raw json.RawMessage) ([]DeclassifyApproval, error)
 	if err := json.Unmarshal(raw, &msgs); err != nil {
 		return nil, fmt.Errorf("mcp.%s claim must be an array of approval objects: %w", ClaimDeclassify, err)
 	}
+	if len(msgs) > MaxDeclassifyApprovals {
+		return nil, fmt.Errorf("mcp.%s declares %d approvals, more than the maximum of %d", ClaimDeclassify, len(msgs), MaxDeclassifyApprovals)
+	}
 	if len(msgs) == 0 {
 		// An explicitly empty array is a token that grants no declassification. That is
 		// well-formed, not an error: it is exactly what a control plane emits when it
@@ -336,9 +348,12 @@ func CoveringDeclassifyApprovals(approvals []DeclassifyApproval, target string, 
 // most likely to be holding. Returning the grant itself (rather than a bool) is what lets
 // the caller stamp the approver and id onto the audit record.
 //
-// It ignores single-use consumption, which only the engine can see (the ledger is anchored
-// state), so the decision path uses CoveringDeclassifyApprovals instead. This stays as the
-// scope-only test for callers that have no store — the CLI and validation paths.
+// It answers SCOPE only. Whether a single-use grant is still live is a question only the
+// engine can answer (the ledger is engine state), so every decision path — including the
+// wrapping-PDP hardening check, which used this and was wrong to — goes through
+// Engine.UsableDeclassifyApproval instead. What remains here is the scope predicate itself,
+// used by CoveringDeclassifyApprovals and available to a caller reasoning about a grant with
+// no engine in hand.
 func FindDeclassifyApproval(approvals []DeclassifyApproval, target string, want []string) *DeclassifyApproval {
 	if covering := CoveringDeclassifyApprovals(approvals, target, want); len(covering) > 0 {
 		return covering[0]

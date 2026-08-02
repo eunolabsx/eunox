@@ -1719,12 +1719,11 @@ func (p *ManifestPDP) hardenOnEffectCeiling(ctx context.Context, sessionID strin
 		},
 		Claims:         claims,
 		DeclaredLabels: declaredLabelsFromContext(ctx),
-		// The chain, so the composed verdict bounds the same consequence axis the full
-		// path does. Without it a wrapping layer's soft refusal could be downgraded and
-		// FORWARDED for a call whose delegated maxEffectClass the same manifest refuses
-		// outright without the JWT — the "adding a token weakened enforcement" inversion
-		// this whole function exists to close.
-		Delegation: delegationFromContext(ctx),
+		// No Delegation, deliberately. CeilingVerdictFor may only HARDEN a refusal, and a
+		// delegation refusal is downgradable by design — the full path forwards it under
+		// --audit too, so there is no inversion here for a composed delegation verdict to
+		// close, and producing a soft verdict through a harden-only seam would break that
+		// seam's contract to fix nothing. See CeilingVerdictFor.
 	}
 	verdict := p.engine.CeilingVerdictFor(ctx, req, matched)
 	if verdict == nil {

@@ -278,9 +278,6 @@ type AttestationStatus struct {
 	Unverified int
 }
 
-// Signed reports whether the entry carries any verified signature at all.
-func (s AttestationStatus) Signed() bool { return len(s.Attested)+len(s.Disputed) > 0 }
-
 // Summary renders the status as one short operator-facing token for a report column.
 func (s AttestationStatus) Summary() string {
 	var head string

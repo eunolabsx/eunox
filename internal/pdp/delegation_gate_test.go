@@ -5,6 +5,8 @@ package pdp
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/eunolabs/eunox/pkg/callcounter"
@@ -101,5 +103,74 @@ func TestDelegationGate_UnresolvableTargetRefuses(t *testing.T) {
 	// No chain: nothing to scope against, so nothing to refuse.
 	if got := enforcement.DelegationTargetDenial(nil, "", false, "req-1", "now"); got != nil {
 		t.Fatalf("an undelegated request must not be refused, got %+v", got)
+	}
+}
+
+// TestDelegationGate_JWTListFilter covers the catalog leg on a route where the JWT layer is
+// the one doing the filtering — a JWT-only or wiretap route, where the inner filter is a
+// passthrough. Without the gate the chain bounded what a delegate could CALL while the listing
+// still advertised everything its capability claim named.
+func TestDelegationGate_JWTListFilter(t *testing.T) {
+	key := newTestKey(t, "k1")
+	srv := makeJWKSServer(t, key)
+	defer srv.Close()
+	p := makeJWTPDP(t, srv, "", "", nil)
+
+	catalog := json.RawMessage(`{"tools":[{"name":"search"},{"name":"wipe_db"}]}`)
+	claims := &JWTClaims{
+		Subject:         "user@example.com",
+		Capabilities:    []string{"tool:search", "tool:wipe_db"},
+		HasCapabilities: true,
+		Delegation: &capability.DelegationChain{
+			Actors: []string{"worker"},
+			Grants: []capability.DelegationGrant{{Subject: "worker", Targets: &[]string{"tool:search"}}},
+		},
+	}
+	out := p.FilterToolsList(WithJWTClaims(context.Background(), claims), catalog).Result
+	if strings.Contains(string(out), "wipe_db") {
+		t.Errorf("the catalog advertised a tool the delegate's call leg refuses:\n%s", out)
+	}
+	if !strings.Contains(string(out), "search") {
+		t.Errorf("the delegated tool was dropped:\n%s", out)
+	}
+}
+
+// TestDelegationGate_ComposedVerdictIsNotHardened records a deliberate NON-fix, because it
+// looks like a gap and is not one.
+//
+// A review flagged that hardenOnEffectCeiling's composed verdict does not include the
+// delegated maxEffectClass, reasoning that an --audit route would therefore forward a call
+// "the same manifest refuses outright without the JWT". It would not: a delegation refusal is
+// an authorization verdict and is downgradable BY DESIGN, so the full path forwards it under
+// --audit too. There is no inversion to close, only a less specific denial reason — and
+// CeilingVerdictFor's contract is that a caller may use it ONLY to harden, never to produce a
+// refusal that was already downgradable. Composing a soft verdict through it would have broken
+// that contract to fix nothing.
+//
+// The ceiling is different, and that difference is the whole reason it composes: its own
+// refusal is HARD, so a JWT short-circuit really would downgrade something the manifest will
+// not.
+func TestDelegationGate_ComposedVerdictIsNotHardened(t *testing.T) {
+	eng := gatedEngine() // no policy effectCeiling
+	caps := []capability.Constraint{{
+		Target:  "tool:wipe_db",
+		Actions: []string{"call"},
+		Effect:  &capability.EffectContract{Class: capability.EffectIrreversible},
+	}}
+	p := NewManifestPDP(caps, eng, nil)
+	chain := &capability.DelegationChain{
+		Actors: []string{"worker"},
+		Grants: []capability.DelegationGrant{{Subject: "worker", MaxEffectClass: capability.EffectReversible}},
+	}
+	ctx := WithJWTClaims(context.Background(), &JWTClaims{Subject: "u", Delegation: chain})
+
+	// The FULL path's own delegation refusal is downgradable, which is what makes composing
+	// it onto a wrapping layer's refusal unnecessary.
+	full := p.Decide(ctx, "s", EnforceTarget{Type: capability.TargetTypeTool, Name: "wipe_db"}, nil, "")
+	if full.Decision == capability.DecisionAllow {
+		t.Fatal("the delegated class cap must refuse this call on the full path")
+	}
+	if full.Denial == nil || full.Denial.HardDeny {
+		t.Fatalf("a delegation refusal is downgradable by design; got HardDeny=%v", full.Denial)
 	}
 }

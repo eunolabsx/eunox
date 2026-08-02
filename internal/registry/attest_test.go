@@ -127,7 +127,8 @@ func TestVerifyAttestations_UntrustedKeyIsInertNotAnError(t *testing.T) {
 	status, err := c.VerifyAttestations(store)
 	require.NoError(t, err)
 	assert.Equal(t, 1, status.Unverified)
-	assert.False(t, status.Signed())
+	assert.Empty(t, status.Attested)
+	assert.Empty(t, status.Disputed)
 	assert.Equal(t, "unverified(1)", status.Summary(),
 		"'signed by strangers' and 'not signed' are different states and must not collapse")
 }
@@ -266,7 +267,7 @@ func TestVerifyAttestations_NilStoreTrustsNothing(t *testing.T) {
 	status, err := c.VerifyAttestations(nil)
 	require.NoError(t, err)
 	assert.Equal(t, 1, status.Unverified)
-	assert.False(t, status.Signed())
+	assert.Empty(t, status.Attested)
 }
 
 // TestVerifyAttestations_UnsignedEntryIsBlank keeps an unsigned corpus (which is every entry
