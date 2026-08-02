@@ -2455,8 +2455,15 @@ func keepByManifestEntry(
 		// refuse it, and a catalog advertising an action the caller cannot take is a catalog
 		// the model will spend turns trying to use. Delegation narrows only, so this can
 		// only ever remove entries a wider caller would still see.
-		if permitted, _ := chain.PermitsTarget(string(targetType) + ":" + id); !permitted {
-			return false, ""
+		// Guarded on IsEmpty() rather than left to PermitsTarget's own nil fast path: the
+		// fast path skips the SCAN, but the string concat naming the target is built by the
+		// caller before the call happens, on every entry, on the overwhelming majority of
+		// requests that carry no chain at all — exactly the per-entry allocation the
+		// targetIndex map exists to keep off this path for a delegated caller.
+		if !chain.IsEmpty() {
+			if permitted, _ := chain.PermitsTarget(string(targetType) + ":" + id); !permitted {
+				return false, ""
+			}
 		}
 		c := mdp.findConstraint(EnforceTarget{Type: targetType, Name: id}, claims)
 		if c != nil && containsAction(c.Actions, requiredAction) {
@@ -3492,8 +3499,13 @@ func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims
 		// leg's own delegation gate so the catalog never advertises a tool this delegate
 		// will be refused. Placed before the constraint lookup because it does not need
 		// one: the chain bounds the caller regardless of what the manifest says.
-		if permitted, _ := chain.PermitsTarget("tool:" + v.name); !permitted {
-			return false, ""
+		// Guarded on IsEmpty() for the same reason keepByManifestEntry is: the string concat
+		// naming the target would otherwise be built on every entry, on every request, even
+		// for the overwhelming majority that carry no delegation chain at all.
+		if !chain.IsEmpty() {
+			if permitted, _ := chain.PermitsTarget("tool:" + v.name); !permitted {
+				return false, ""
+			}
 		}
 		c := mdp.findConstraint(EnforceTarget{Type: capability.TargetTypeTool, Name: v.name}, claims)
 
