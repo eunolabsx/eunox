@@ -201,17 +201,76 @@ func TestDeclassify_ClearFaultHardDenies(t *testing.T) {
 	assert.Equal(t, "record", resp.Denial.Details["phase"])
 }
 
-// removeFailingStore fails Remove on demand so the clear-fault path is reachable.
+// removeFailingStore fails Remove on demand so the clear-fault path is reachable, in either
+// of the two shapes that matter.
+//
+// deleteFirst is what separates them, and it is a flag rather than a second double because
+// picking wrong is invisible at the construction site. With it unset the Remove errors
+// having changed NOTHING, which exercises only the hard-deny posture; with it set the Remove
+// COMMITS and then reports failure, which is what a lost reply (a timeout, a reset) or a
+// partial multi-label removal looks like to the caller — and it is the only shape that
+// reaches the fail-OPEN direction at all. A test that reached for the wrong one of two
+// similarly-named doubles would pass while asserting nothing about the residual, which is
+// how the missing restore went unnoticed in the first place.
 type removeFailingStore struct {
 	capability.FlowLabelStore
-	fail bool
+	fail        bool
+	deleteFirst bool
 }
 
 func (s *removeFailingStore) Remove(ctx context.Context, key string, labels ...string) error {
+	if s.deleteFirst {
+		if err := s.FlowLabelStore.Remove(ctx, key, labels...); err != nil {
+			return err
+		}
+		if s.fail {
+			return errors.New("backend reply lost after the delete committed")
+		}
+		return nil
+	}
 	if s.fail {
 		return errors.New("backend unavailable")
 	}
 	return s.FlowLabelStore.Remove(ctx, key, labels...)
+}
+
+// TestDeclassify_ClearFaultRestoresTheTaint is the fail-OPEN half of the clear-fault
+// path, which the hard-deny above does not cover on its own. "Remove errored" is not
+// "Remove changed nothing": a store can delete and then lose its reply (a timeout, a
+// reset), or remove part of a multi-label set before erroring. The call is hard-denied
+// and never forwarded, so a label left cleared here has untainted the session for an
+// action that did not happen — and the next egress flowLabel would have blocked passes.
+//
+// This is the one direction the flow layer calls out as able to fail open, which is why
+// the restore runs at all and why it runs BEFORE the add rollback.
+func TestDeclassify_ClearFaultRestoresTheTaint(t *testing.T) {
+	store := &removeFailingStore{FlowLabelStore: flowlabelstore.NewInMemory(), deleteFirst: true}
+	eng := enforcement.New(
+		enforcement.WithCallCounter(callcounter.NewInMemory()),
+		enforcement.WithFlowLabelStore(store),
+	)
+	ctx := context.Background()
+
+	require.Equal(t, capability.DecisionAllow,
+		eng.ValidateAction(ctx, req("s", "read"), sourceCaps("read", capability.FlowLabelPII)).Decision)
+	require.Equal(t, capability.DecisionDeny,
+		eng.ValidateAction(ctx, req("s", "publish"), sinkCaps("publish", capability.FlowLabelPublic)).Decision,
+		"precondition: the sink denies while the session carries pii")
+
+	store.fail = true
+	resp := eng.ValidateAction(ctx,
+		approvedReq("s", "sanitize", "a@b", capability.FlowLabelPII),
+		declassifyCaps("sanitize", capability.FlowLabelPII))
+	require.Equal(t, capability.DecisionDeny, resp.Decision)
+	require.NotNil(t, resp.Denial)
+	require.True(t, resp.Denial.HardDeny, "the sanitizing call never ran")
+	assert.Empty(t, resp.LabelsCleared, "a faulted clear reports nothing cleared")
+
+	// The whole point: sanitize did not run, so the taint it would have cleared must
+	// still be there. Before the restore, this call was allowed.
+	after := eng.ValidateAction(ctx, req("s", "publish"), sinkCaps("publish", capability.FlowLabelPublic))
+	assert.Equal(t, capability.DecisionDeny, after.Decision,
+		"a call that never ran must not have permanently untainted the session")
 }
 
 // TestDeclassify_CarriesNoResponseObligation pins that declassify, like labelOutput, is an

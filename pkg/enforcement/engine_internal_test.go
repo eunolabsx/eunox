@@ -978,10 +978,10 @@ func TestMatchAllowedValue_LargeIntegerExactMatch(t *testing.T) {
 	authored := json.Number("9007199254740993") // request carrying the authorized value
 	adjacent := json.Number("9007199254740992") // the float64-rounded neighbour
 
-	if !MatchAllowedValue(authored, allowed) {
+	if !MatchAllowedValue(authored, allowed, nil) {
 		t.Errorf("the authored value %s must be allowed", authored)
 	}
-	if MatchAllowedValue(adjacent, allowed) {
+	if MatchAllowedValue(adjacent, allowed, nil) {
 		t.Errorf("the adjacent value %s must NOT be allowed (would authorize the wrong value)", adjacent)
 	}
 }
@@ -1005,10 +1005,10 @@ func TestNumericEqual_MaxInt64BoundaryNotConflated(t *testing.T) {
 	}
 
 	allowed := []interface{}{maxInt64}
-	if MatchAllowedValue(maxInt64, allowed) != true {
+	if MatchAllowedValue(maxInt64, allowed, nil) != true {
 		t.Errorf("the authorized MaxInt64 must be allowed")
 	}
-	if MatchAllowedValue(overInt64, allowed) {
+	if MatchAllowedValue(overInt64, allowed, nil) {
 		t.Errorf("MaxInt64+1 must NOT be allowed by an allowlist of only MaxInt64")
 	}
 }

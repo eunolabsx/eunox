@@ -297,63 +297,92 @@ func (f *faultyCounter) AdmitAll(ctx context.Context, buckets []capability.Quota
 	return f.inner.AdmitAll(ctx, buckets)
 }
 
-// TestUsableDeclassifyApproval_TracksConsumption is the predicate the wrapping-PDP hardening
-// path asks. It has to answer the same question checkDeclassify answers — is there a covering
-// approval that is still LIVE — because the scope-only test let a burned grant suppress the
+// TestDeclassifyVerdictFor_TracksConsumption is the question the wrapping-PDP hardening path
+// asks. It has to answer the same question checkDeclassify answers — is there a covering
+// approval that is still LIVE — because a scope-only test lets a burned grant suppress the
 // hardening, leaving a wrapping layer's soft refusal for an --audit route to forward while the
 // same call without the wrapper met a hard escalation.
-func TestUsableDeclassifyApproval_TracksConsumption(t *testing.T) {
+func TestDeclassifyVerdictFor_TracksConsumption(t *testing.T) {
 	eng := declassifyEngine()
 	ctx := context.Background()
-	approvals := []capability.DeclassifyApproval{
-		{Labels: []string{capability.FlowLabelPII}, Target: "tool:publish", Approver: "ada", ID: "apr-1", Once: true},
-	}
-	want := []string{capability.FlowLabelPII}
+	caps := declassifyCaps("publish", capability.FlowLabelPII)
+	live := onceApprovedReq("s", "publish", "ada", "apr-1", capability.FlowLabelPII)
 
-	usable, err := eng.UsableDeclassifyApproval(ctx, approvals, "tool:publish", want)
-	require.NoError(t, err)
-	assert.True(t, usable, "a fresh covering grant is usable")
+	assert.Nil(t, eng.DeclassifyVerdictFor(ctx, live, &caps[0]),
+		"a fresh covering grant would have been authorized, so there is nothing to harden")
 
-	// A grant covering a DIFFERENT action is not usable here.
-	usable, err = eng.UsableDeclassifyApproval(ctx, approvals, "tool:other", want)
-	require.NoError(t, err)
-	assert.False(t, usable)
+	// A grant covering a DIFFERENT action does not authorize this one.
+	elsewhere := onceApprovedReq("s", "publish", "ada", "apr-1", capability.FlowLabelPII)
+	elsewhere.DeclassifyApprovals[0].Target = "tool:other"
+	verdict := eng.DeclassifyVerdictFor(ctx, elsewhere, &caps[0])
+	require.NotNil(t, verdict)
+	assert.Equal(t, "no_approval", verdict.Denial.Details["reason"])
 
 	// Spend it through the decision path, then ask again.
-	require.Equal(t, capability.DecisionAllow, eng.ValidateAction(ctx,
-		onceApprovedReq("s", "publish", "ada", "apr-1", capability.FlowLabelPII),
-		declassifyCaps("publish", capability.FlowLabelPII)).Decision)
+	require.Equal(t, capability.DecisionAllow, eng.ValidateAction(ctx, live, caps).Decision)
 
-	usable, err = eng.UsableDeclassifyApproval(ctx, approvals, "tool:publish", want)
-	require.NoError(t, err)
-	assert.False(t, usable, "a burned grant must not read as authorization to a layer above the engine")
+	verdict = eng.DeclassifyVerdictFor(ctx, onceApprovedReq("s", "publish", "ada", "apr-1", capability.FlowLabelPII), &caps[0])
+	require.NotNil(t, verdict, "a burned grant must not read as authorization to a layer above the engine")
+	assert.Equal(t, "approval_consumed", verdict.Denial.Details["reason"])
+	assert.True(t, verdict.Denial.HardDeny, "the composed refusal must not be downgradable")
 
 	// A standing grant is always usable — it is never burned.
-	standing := []capability.DeclassifyApproval{
-		{Labels: []string{capability.FlowLabelPII}, Target: "tool:publish", Approver: "ada", ID: "apr-2"},
-	}
-	usable, err = eng.UsableDeclassifyApproval(ctx, standing, "tool:publish", want)
-	require.NoError(t, err)
-	assert.True(t, usable)
+	standing := approvedReq("s", "publish", "ada", capability.FlowLabelPII)
+	assert.Nil(t, eng.DeclassifyVerdictFor(ctx, standing, &caps[0]))
+
+	// A constraint that clears nothing has no verdict to compose at all.
+	plain := capability.Constraint{Target: "tool:publish", Actions: []string{"call"}}
+	assert.Nil(t, eng.DeclassifyVerdictFor(ctx, live, &plain))
 }
 
-// TestUsableDeclassifyApproval_LedgerFaultSurfaces keeps the caller able to distinguish "no
-// usable approval" from "could not tell". The hardening path turns the fault into the same hard
-// escalation checkDeclassify raises on it, and it can only do that if the error reaches it —
-// swallowing it would make an unreachable ledger the way past the control on a wrapped route.
-func TestUsableDeclassifyApproval_LedgerFaultSurfaces(t *testing.T) {
+// TestDeclassifyVerdictFor_LedgerFaultHardens keeps "could not tell" distinct from "no
+// approval" without letting either forward. The fault must produce the same hard escalation
+// checkDeclassify raises on it — swallowing it would make an unreachable ledger the way past
+// the control on a wrapped route.
+func TestDeclassifyVerdictFor_LedgerFaultHardens(t *testing.T) {
 	eng := enforcement.New(
 		enforcement.WithCallCounter(&faultyCounter{inner: callcounter.NewInMemory(), failPeek: true}),
 		enforcement.WithFlowLabelStore(flowlabelstore.NewInMemory()),
 	)
-	_, err := eng.UsableDeclassifyApproval(context.Background(),
-		[]capability.DeclassifyApproval{{Labels: []string{capability.FlowLabelPII}, Target: "tool:publish", Approver: "ada", ID: "apr-1", Once: true}},
-		"tool:publish", []string{capability.FlowLabelPII})
-	assert.Error(t, err)
+	caps := declassifyCaps("publish", capability.FlowLabelPII)
+	verdict := eng.DeclassifyVerdictFor(context.Background(),
+		onceApprovedReq("s", "publish", "ada", "apr-1", capability.FlowLabelPII), &caps[0])
+	require.NotNil(t, verdict)
+	assert.Equal(t, "ledger_unavailable", verdict.Denial.Details["reason"])
+	assert.True(t, verdict.Denial.HardDeny)
+}
 
-	// Exported, so it is reachable with no engine at all. That must report the fault rather
-	// than panic, and the fault reads as "cannot tell live from spent" like any other.
-	var none *enforcement.Engine
-	_, err = none.UsableDeclassifyApproval(context.Background(), nil, "tool:publish", []string{capability.FlowLabelPII})
-	assert.Error(t, err)
+// TestDeclassifyVerdictFor_TrimsThePaddedTarget is the divergence the seam exists to remove.
+// The composed path used to derive the approval target itself, without the trim
+// resolveRequestTarget applies — so a request whose target name carried surrounding
+// whitespace resolved to "tool:publish " here and "tool:publish" in the engine, and a
+// correctly-scoped approval (already trimmed at the token boundary) could never match it. The
+// result was a permanent ESCALATION_REQUIRED with nothing the operator could do to satisfy it.
+func TestDeclassifyVerdictFor_TrimsThePaddedTarget(t *testing.T) {
+	eng := declassifyEngine()
+	caps := declassifyCaps("publish", capability.FlowLabelPII)
+
+	padded := approvedReq("s", "publish", "ada", capability.FlowLabelPII)
+	padded.Target.Name = "  publish  "
+	assert.Nil(t, eng.DeclassifyVerdictFor(context.Background(), padded, &caps[0]),
+		"a padded target name must resolve to the same canonical target the approval names")
+}
+
+// TestDeclassifyVerdictFor_CarriesTheSessionsLabels pins the record shape. The composed refusal
+// built its own DenialInfo and set no CarriedLabels, so the same logical refusal landed on the
+// tape two different ways depending on whether a JWT layer wrapped the call — and the wrapped
+// one dropped the field an approver needs first: what the session is already carrying, which is
+// what they read to decide whether the declassification should be approved at all.
+func TestDeclassifyVerdictFor_CarriesTheSessionsLabels(t *testing.T) {
+	eng := declassifyEngine()
+	ctx := context.Background()
+	require.Equal(t, capability.DecisionAllow,
+		eng.ValidateAction(ctx, req("s", "read"), sourceCaps("read", capability.FlowLabelPII)).Decision)
+
+	caps := declassifyCaps("publish", capability.FlowLabelPII)
+	verdict := eng.DeclassifyVerdictFor(ctx, req("s", "publish"), &caps[0]) // no approvals at all
+	require.NotNil(t, verdict)
+	assert.Equal(t, []string{capability.FlowLabelPII}, verdict.CarriedLabels)
+	assert.Equal(t, []string{capability.FlowLabelPII}, verdict.Denial.Details["carried_labels"])
+	assert.Equal(t, true, verdict.Denial.Details["flow"])
 }

@@ -481,10 +481,19 @@ func (e *Engine) recordSourceCall(ctx context.Context, req *capability.EnforceRe
 		// nothing" was documented and not delivered.
 		labelsCleared, err = e.clearLabels(ctx, req, decl, unionLabels(carriedLabels, labelsOut))
 		if err != nil {
-			// The clear faulted after the add committed: undo the add so the refused call
-			// leaves nothing behind, exactly as the seq-fault arm below does. The burn is
-			// NOT undone — the counter has no delete, and leaving the grant spent for a call
-			// that did not run over-refuses, which is the safe direction (see burnApproval).
+			// The clear faulted: put back whatever it may have removed BEFORE undoing the
+			// add, the same order the seq-fault arm below uses and for the same reason —
+			// this direction is the fail-OPEN one, so a partial rollback must err toward
+			// more taint. A faulted Remove is not a Remove that changed nothing (it can
+			// delete and then lose its reply, or remove part of a set and error), and the
+			// call is hard-denied and never forwarded, so a label left cleared here would
+			// untaint the session for an action that did not happen. clearLabels returns
+			// what it may have removed alongside the error precisely so this can run.
+			e.restoreLabels(ctx, req, labelsCleared)
+			// Undo the add so the refused call leaves nothing behind, exactly as the
+			// seq-fault arm below does. The burn is NOT undone — the counter has no delete,
+			// and leaving the grant spent for a call that did not run over-refuses, which is
+			// the safe direction (see burnApproval).
 			e.rollbackLabels(ctx, req, added)
 			return nil, nil, &SourceCommitError{Err: err, Flow: true, Declassify: true}
 		}
@@ -596,10 +605,72 @@ func (e *Engine) rollbackLabels(ctx context.Context, req *capability.EnforceRequ
 // is why it runs before rollbackLabels rather than after — a partial rollback then leaves
 // more taint, not less.
 func (e *Engine) restoreLabels(ctx context.Context, req *capability.EnforceRequest, cleared []string) {
-	if e.flowStore == nil || req.SessionID == "" || len(cleared) == 0 {
-		return
+	// One implementation, not two: these are the two arms of the SAME fail-open (a cleared
+	// label surviving a call that never ran), one inside the decision and one above it, and
+	// they had already drifted on which guards they applied. A divergence there leaves one
+	// arm restoring and the other not, and both call sites look identical from the outside.
+	// The in-decision arm swallows the fault — it is best-effort by contract, with a
+	// stranded label as its accepted residual — while the exported arm reports it, because
+	// its caller writes that outcome onto the tape.
+	_, _ = e.RestoreDeclassifiedLabels(ctx, req, cleared)
+}
+
+// RestoreDeclassifiedLabels re-adds the labels an approved declassification cleared, for a
+// call the decision COMMITTED and a layer ABOVE the engine then refused. It is
+// restoreLabels' exported form, and it exists because the clear and the refusal can sit on
+// opposite sides of the engine boundary.
+//
+// A declassification commits inside Decide, before the transport has run its own gates.
+// Three of those gates then refuse the call without ever contacting the upstream — the
+// --require-audit=strict gate, an upstream transport failure, and a redaction failure — so
+// the sanitizing action did not happen while the taint it was authorized to clear is gone.
+// The next egress that flowLabel would have blocked now passes: a call that never ran has
+// untainted the session.
+//
+// labelOutput's identical ordering is safe and this one is not, which is why only this
+// direction needs an exported undo: a call that TAINTS and then fails leaves extra taint,
+// which over-blocks. A clear that survives its own refusal fails open.
+//
+// Unlike restoreLabels this RETURNS the fault instead of swallowing it, and it reports
+// whether it actually wrote. The caller is building the refusal's audit record at that
+// moment, and it stamps a SIGNED assertion about the session's state — so "the labels are
+// back" and "I did nothing" must not look alike. Returning only an error made every
+// declined arm below indistinguishable from a completed restore, which would have put
+// `declassify_reverted` on the tape for a session whose taint was in fact still gone: a
+// false negative on the one residual an operator is told to alert on.
+//
+// restored is therefore true only when the store accepted the write. Every arm that
+// declines returns (false, nil) — no fault to report, but no restore either — EXCEPT the
+// empty label set, which is the one case where "nothing to restore" and "restored" are
+// genuinely the same state; the caller never reaches here with one.
+//
+// Anchoring follows the request, exactly as the clear did (flowKey), so a task-anchored
+// call restores under the same key it cleared. The caller MUST therefore hand a context
+// that still carries the request's validated claims: the anchor resolves from
+// Claims["task_id"], so a context detached with context.Background() would restore under
+// the SESSION key a task-anchored clear never touched — leaving the task untainted, a
+// duplicate stranded on the session key, and this function reporting success. Detach
+// cancellation only (context.WithoutCancel), never the values.
+//
+// It does NOT stand down for a task-anchored request the way rollbackLabels does: that
+// stand-down avoids deleting a concurrent session's legitimate label, and this only ADDS —
+// the fail-closed direction, where the worst case is a stranded label that over-blocks.
+func (e *Engine) RestoreDeclassifiedLabels(ctx context.Context, req *capability.EnforceRequest, cleared []string) (restored bool, err error) {
+	if len(cleared) == 0 {
+		// Nothing was cleared, so the session already is as it should be. This is the one
+		// decline that is honestly reportable as "restored".
+		return true, nil
 	}
-	_ = e.flowStore.Add(ctx, e.flowKey(req), cleared...)
+	// Exported, so it is reachable on an engine that holds no flow state at all — and on a
+	// PDP whose restore chain terminates in a no-op. Each of these means the labels stay
+	// cleared, so none of them may report success.
+	if e == nil || e.skipFlow || e.flowStore == nil || req == nil || req.SessionID == "" {
+		return false, nil
+	}
+	if err := e.flowStore.Add(ctx, e.flowKey(req), cleared...); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // ClearSessionLabels releases a session's accumulated flow-label set, called from the

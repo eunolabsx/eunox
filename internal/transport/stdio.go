@@ -1277,12 +1277,11 @@ func (p *StdioProxy) dispatchParams() dispatchParams {
 			callUpstream:     p.callUpstream,
 			strictAuditState: p.strictAudit(),
 		},
-		pdp:              p.pdp,
 		sourceIP:         "", // stdio has no per-request client address
 		buildInit:        p.buildInitResponse,
 		receipts:         p.receipts,
 		honorAttribution: p.honorAttribution,
-	}
+	}.withPDP(p.pdp)
 }
 
 // buildInitResponse builds the host-facing initialize response from the upstream

@@ -161,9 +161,11 @@ type DeclassifyApproval struct {
 	// accountable human is not human approval, and it is the value stamped on the tape
 	// (the `approver` audit field) that makes the record answerable later.
 	Approver string `json:"approver"`
-	// ID optionally carries the control plane's own record identifier for this approval,
-	// echoed into the audit record's details so a tape entry joins back to the approval
-	// workflow that produced it. Absent is fine; empty and absent are the same — EXCEPT
+	// ID optionally carries the control plane's own record identifier for this approval.
+	// It is stamped onto the audit record as the TOP-LEVEL, HMAC-signed `approval_id`
+	// field — beside labels_cleared and approver, never inside details — so a tape entry
+	// joins back to the approval workflow that produced it under the same integrity
+	// protection as the other two. Absent is fine; empty and absent are the same — EXCEPT
 	// under Once, where it is the ledger's key and therefore mandatory.
 	ID string `json:"id,omitempty"`
 	// Once marks the grant SINGLE-USE: the proxy burns it in the anchored declassify
@@ -352,5 +354,9 @@ func CoveringDeclassifyApprovals(approvals []DeclassifyApproval, target string, 
 // read as authorization and left a downgradable refusal in place where the engine hard-escalates.
 // Whether a grant is still LIVE is a question only the engine can answer (the ledger is engine
 // state), so the two callable shapes are the full list — for a caller that will test liveness
-// itself — and Engine.UsableDeclassifyApproval. Re-adding the looser one puts the same footgun
-// back within reach of exactly the code that already picked it up.
+// itself — and enforcement.Engine.DeclassifyVerdictFor, which answers the WHOLE question
+// (resolve the target, select a live grant, build the refusal) rather than handing back a
+// boolean the caller then has to dress. A narrower liveness predicate existed and was removed:
+// answering only the boolean is what left the target resolution and the refusal shape to the
+// call site, which is where they diverged. Re-adding it puts the same footgun back within
+// reach of exactly the code that already picked it up.

@@ -131,10 +131,13 @@ type EnforceResponse struct {
 	// approval that authorized it. All three are populated together or not at all: a
 	// declassification with no named approver is not one this proxy performs.
 	//
-	// They are stamped onto the audit record (labels_cleared / approver, and approval_id
-	// in details), which is what makes an approved declassification a distinguishable
-	// event on the tape rather than an ordinary allow that quietly dropped a label.
-	// Vocabulary-ordered for a deterministic record; nil on every other call.
+	// All three are stamped onto the audit record as TOP-LEVEL, HMAC-signed fields
+	// (labels_cleared / approver / approval_id) — none of them rides details — which is
+	// what makes an approved declassification a distinguishable event on the tape rather
+	// than an ordinary allow that quietly dropped a label, and what keeps a
+	// declassification's evidence one record shape instead of a top-level pair plus a
+	// magic details key. Vocabulary-ordered for a deterministic record; nil on every
+	// other call.
 	LabelsCleared []string `json:"labelsCleared,omitempty"`
 	Approver      string   `json:"approver,omitempty"`
 	ApprovalID    string   `json:"approvalId,omitempty"`
