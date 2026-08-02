@@ -252,6 +252,7 @@ func (p *HTTPProxy) dispatchParams(sess *httpSession, sourceIP string) dispatchP
 		pdp:              rt.pdp,
 		sourceIP:         sourceIP,
 		buildInit:        sess.buildInitResponse,
+		receipts:         rt.receipts,
 		honorAttribution: rt.honorAttribution,
 	}
 }

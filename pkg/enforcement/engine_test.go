@@ -2901,7 +2901,7 @@ func (errorCounter) Peek(_ context.Context, _ string, _ int) (int64, error) {
 	return 0, nil
 }
 
-func (errorCounter) IncrementIfAllBelow(_ context.Context, _ []string, _ []int, _ []int64) (admitted bool, deniedIndex int, count int64, retryAfter time.Duration, err error) {
+func (errorCounter) AdmitAll(_ context.Context, _ []capability.QuotaBucket) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error) {
 	return false, 0, 0, 0, errors.New("counter error")
 }
 
@@ -5614,21 +5614,21 @@ func (s *spyLimiter) IncrementIfBelow(ctx context.Context, key string, windowSec
 	return count, admitted, retryAfter, err
 }
 
-// IncrementIfAllBelow mirrors IncrementIfBelow's accounting for the atomic
+// AdmitAll mirrors IncrementIfBelow's accounting for the atomic
 // multi-bucket path the engine takes when a constraint carries more than one
-// maxCalls: it delegates to the embedded counter and, only on an all-or-nothing
-// admit, records one admitted slot per window. A denied batch records nothing, so
-// the spy still proves a denied call burned no sibling window's quota.
-func (s *spyLimiter) IncrementIfAllBelow(ctx context.Context, keys []string, windowSecs []int, limits []int64) (admitted bool, deniedIndex int, count int64, retryAfter time.Duration, err error) {
-	admitted, deniedIndex, count, retryAfter, err = s.InMemory.IncrementIfAllBelow(ctx, keys, windowSecs, limits)
+// quota-consuming condition: it delegates to the embedded counter and, only on an
+// all-or-nothing admit, records one admitted slot per window. A denied batch records
+// nothing, so the spy still proves a denied call burned no sibling window's quota.
+func (s *spyLimiter) AdmitAll(ctx context.Context, buckets []capability.QuotaBucket) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error) {
+	admitted, deniedIndex, total, retryAfter, err = s.InMemory.AdmitAll(ctx, buckets)
 	if admitted {
 		s.mu.Lock()
-		for _, w := range windowSecs {
-			s.admittedByWindo[w]++
+		for _, b := range buckets {
+			s.admittedByWindo[b.WindowSec]++
 		}
 		s.mu.Unlock()
 	}
-	return admitted, deniedIndex, count, retryAfter, err
+	return admitted, deniedIndex, total, retryAfter, err
 }
 
 func (s *spyLimiter) admitted(windowSec int) int {
@@ -7066,7 +7066,7 @@ func (s *spyDirectiveEvaluator) Evaluate(
 
 // TestMaxCalls_ResourceTarget_NoToolName is the regression: a maxCalls
 // condition on a non-tool capability (resources/read, prompts/get, …) carries the
-// identifier in req.Target.Name, not req.TargetName. Before the fix handleMaxCalls
+// identifier in req.Target.Name, not req.TargetName. Before the fix the maxCalls bucket derivation
 // denied every such call with a misleading "tool name is required" MISSING_CONTEXT
 // before any count check, and never keyed the counter. It must now fall back to
 // req.Target.Name and enforce the limit.
@@ -7692,7 +7692,7 @@ func (recordingErrorCounter) IncrementIfBelow(_ context.Context, _ string, _ int
 	return 0, true, 0, nil
 }
 
-func (recordingErrorCounter) IncrementIfAllBelow(_ context.Context, _ []string, _ []int, _ []int64) (admitted bool, deniedIndex int, count int64, retryAfter time.Duration, err error) {
+func (recordingErrorCounter) AdmitAll(_ context.Context, _ []capability.QuotaBucket) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error) {
 	return true, 0, 0, 0, nil
 }
 
@@ -8081,11 +8081,11 @@ func (c ctxHonoringCounter) IncrementIfBelow(ctx context.Context, key string, wi
 	return c.inner.IncrementIfBelow(ctx, key, windowSec, limit)
 }
 
-func (c ctxHonoringCounter) IncrementIfAllBelow(ctx context.Context, keys []string, windowSecs []int, limits []int64) (admitted bool, deniedIndex int, count int64, retryAfter time.Duration, err error) {
+func (c ctxHonoringCounter) AdmitAll(ctx context.Context, buckets []capability.QuotaBucket) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error) {
 	if err := ctx.Err(); err != nil {
 		return false, 0, 0, 0, err
 	}
-	return c.inner.IncrementIfAllBelow(ctx, keys, windowSecs, limits)
+	return c.inner.AdmitAll(ctx, buckets)
 }
 
 // TestSequenceBlock_ReArmSurvivesRequestCancellation closes the bypass in the re-arm
@@ -8131,4 +8131,32 @@ func TestSequenceBlock_ReArmSurvivesRequestCancellation(t *testing.T) {
 		&capability.EnforceRequest{SessionID: "sess-1", TargetName: "write_external"}, caps)
 	require.Equal(t, capability.DecisionDeny, resp.Decision,
 		"a client that disconnects on every probe must not be able to age the gate out")
+}
+
+// AddIfTotalBelow satisfies the weighted half of capability.CallCounter. This double
+// exercises the counting paths only, so a weighted add admits without recording: nothing
+// under test reads a weighted total from it.
+func (*spyLimiter) AddIfTotalBelow(_ context.Context, _ string, _ int, weight, _ float64) (total float64, admitted bool, retryAfter time.Duration, err error) {
+	return weight, true, 0, nil
+}
+
+// AddIfTotalBelow satisfies the weighted half of capability.CallCounter. This double
+// exercises the counting paths only, so a weighted add admits without recording: nothing
+// under test reads a weighted total from it.
+func (ctxHonoringCounter) AddIfTotalBelow(_ context.Context, _ string, _ int, weight, _ float64) (total float64, admitted bool, retryAfter time.Duration, err error) {
+	return weight, true, 0, nil
+}
+
+// AddIfTotalBelow satisfies the weighted half of capability.CallCounter. This double
+// exercises the counting paths only, so a weighted add admits without recording: nothing
+// under test reads a weighted total from it.
+func (errorCounter) AddIfTotalBelow(_ context.Context, _ string, _ int, weight, _ float64) (total float64, admitted bool, retryAfter time.Duration, err error) {
+	return weight, true, 0, nil
+}
+
+// AddIfTotalBelow satisfies the weighted half of capability.CallCounter. This double
+// exercises the counting paths only, so a weighted add admits without recording: nothing
+// under test reads a weighted total from it.
+func (recordingErrorCounter) AddIfTotalBelow(_ context.Context, _ string, _ int, weight, _ float64) (total float64, admitted bool, retryAfter time.Duration, err error) {
+	return weight, true, 0, nil
 }

@@ -542,6 +542,13 @@ func writeDoctorManifests(w io.Writer, cfg *config.GatewayConfig, cfgErr error) 
 		if n := merged.AuditOnlyCount(); n > 0 {
 			wf(w, "    audit-only capabilities: %d (observed but not enforced)\n", n)
 		}
+		// Effect-contract coverage. In a bug report "everything escalates" and "half the
+		// policy is unannotated under a ceiling" are the same fact, and the second one is
+		// the one that explains it — so the bundle carries the ratio and the worklist
+		// rather than leaving a reader to infer it from the manifest they cannot see.
+		// Counts only: this bundle is pasted into public bug reports, and a capability
+		// target is a resource URI or a tool name.
+		writeEffectCoverage(w, "    ", merged, false)
 		if outcome.StartupErr != nil {
 			wf(w, "    WOULD FAIL CLOSED at startup: %v\n", outcome.StartupErr)
 		}

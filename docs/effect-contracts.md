@@ -83,7 +83,30 @@ capabilities:
 - **`ref`** pins the registry entry the block was authored from. eunox never fetches it —
   the decision path takes no network I/O — but the pin is **verified locally at load** by
   recomputing the digest of the inline block. Editing a pinned contract therefore fails
-  until the author re-pins. See [`registry/README.md`](../registry/README.md).
+  until the author re-pins. `eunox contracts --ref <id>` prints the exact string to paste,
+  so the digest is never hand-computed. See [`registry/README.md`](../registry/README.md).
+
+## Operator surface
+
+Three things about the effect layer are visible from the CLI rather than only by reading
+YAML:
+
+| Question | Command |
+| --- | --- |
+| How much of my policy is annotated, and what is not? | `eunox validate <manifest…>` (also in `eunox doctor`) |
+| Is this contract corpus intact? | `eunox contracts --dir <path>` |
+| What do I paste into `effect.ref` for this entry? | `eunox contracts --dir <path> --ref <id>` |
+
+The coverage line is the progress meter on the flywheel below: under an `effectCeiling`
+every unannotated capability escalates, so the named worklist is what turns "everything is
+hitting the approval queue" into a list of files to edit. It is advisory and never changes
+`validate`'s exit code — an unannotated capability is the fail-closed default working as
+intended, not a defect.
+
+`eunox contracts` loads every entry, recomputes each declared digest against its own
+content, and rejects a duplicate id — the same checks the corpus test runs, reachable
+without writing Go. All of it is **local**: nothing is fetched, here or on the decision
+path.
 
 ### Argument-parameterized contracts
 
@@ -134,11 +157,49 @@ Two behaviors worth knowing:
         allow: [reversible, compensable]   # this target may only ever do these
       - type: blastRadius
         max: 500                           # no single call over this magnitude
+        maxTotal: 2000                     # no more than this SUMMED...
+        windowSeconds: 3600                # ...within this sliding window
 ```
 
-A call whose blast radius **cannot be quantified** fails a `blastRadius` bound. An action
-whose size cannot be established must not be treated as small; treating unknown as zero is
-the fail-open the condition exists to prevent.
+A call whose blast radius **cannot be quantified** fails a `blastRadius` bound — either
+half of it. An action whose size cannot be established must not be treated as small, and it
+must not contribute 0 to a sum; treating unknown as zero is the fail-open the condition
+exists to prevent.
+
+### Cumulative velocity
+
+`max` bounds one call. `maxTotal` over `windowSeconds` bounds the **summed** magnitude of a
+session's calls to the target — the thing per-call authorization structurally cannot see.
+The per-call bound catches the $5,000 refund; it does not catch four hundred
+individually-permitted $10 refunds, which is the shape a compromised or prompt-injected
+agent actually produces, because every one of those calls is legal and only the aggregate
+is catastrophic.
+
+- The two cumulative keys are **set together or not at all**, and at least one of `max` or
+  `maxTotal` must be present. Half a pair silently disables the other half, and an authored
+  bound that bounded nothing is worse than its absence — the operator would believe a limit
+  was in force. Both shapes are load errors.
+- The budget is per **(session, target)**, like a `maxCalls` quota, and it is summed by
+  `CallCounter.AdmitAll` over a **weight-summing** bucket — the same admission `maxCalls`
+  goes through with an **entry-counting** one, on the same seam rather than in a second
+  accounting system.
+- An over-limit call **records nothing**. Charging a refused call's magnitude to the window
+  would let a burst of rejections extend its own lockout past the window that actually
+  spent the budget — the same rule an over-limit `maxCalls` follows.
+- The per-call bound is checked **first**, so a call refused for being too large on its own
+  never consumes cumulative budget that the permitted calls would then be denied.
+- `maxTotal` must be at most 2^53, the largest total both counter backends sum exactly. The
+  Redis backend evaluates its admission in Lua, whose numbers are IEEE-754 doubles; a larger
+  bound would be enforced as a threshold nobody authored, so it is refused at load — compared
+  in arbitrary precision, so a bound one unit above the maximum cannot round its way in. A
+  **fractional** magnitude is summable and expected: currency is the motivating case, and
+  both backends accumulate in double precision by contract, so `$19.99` differs from an exact
+  decimal sum only in the last bits, far below any bound an operator authors.
+- A call whose weight cannot move the running total — zero, or anything too small to register
+  in double precision — is admitted **without being recorded**. It can never affect a future
+  decision, and recording it was the one case with no bound on how much a key could grow.
+- Under `--audit` the budget is **not** consumed, exactly as `maxCalls` quota is not:
+  observing it accurately would spend the thing observation exists to leave alone.
 
 ## The effect ceiling
 
@@ -164,6 +225,26 @@ The ceiling can only ever **narrow**: it runs after a constraint has already all
 call, so it never admits anything the allowlist or the conditions denied. It runs **before**
 the session-state commit, so an over-ceiling call leaves neither a phantom `sequenceBlock`
 antecedent nor a stranded flow label — it was never forwarded.
+
+### Under a JWT-wrapped route
+
+A JWT layer refuses some calls on its own terms and short-circuits above the manifest PDP,
+so the ceiling would never evaluate for them. The call is still refused, but the *kind* of
+refusal matters: a plain `AUTHORIZATION_FAILED` carries none of the consequence inputs a
+human acts on, so the action never enters the approval queue and `eunox stats` under-counts
+escalations — and, being a soft deny, an `--audit` route **forwards** it, meaning adding a
+JWT would perform the very action the ceiling flagged. The wrapper therefore consults the
+ceiling itself and returns its verdict, appending the token's own refusal reason to the
+message so an operator fixing the token still sees it.
+
+That consultation is **non-committing** by construction: it evaluates the ceiling alone,
+never the matched constraint's conditions, because some of those commit (`maxCalls`,
+`labelOutput`, `sequenceBlock`) and replaying them for a call that will never be forwarded
+would leave exactly the phantom state the ordering above prevents. The ceiling's inputs are
+the resolved effect and nothing else, so the composed verdict cannot disagree with a
+full-path one about whether the action is over the bound. Where a *condition* would have
+denied first, the composed refusal is the ceiling's rather than that condition's — harder
+than the manifest's, which is the safe direction for a call that is refused either way.
 
 `requireCompensation` applies only to an action already **above** `maxEffectClass`;
 demanding a compensating action for a reversible read would be noise. It therefore requires
@@ -228,17 +309,98 @@ consequential reading* (annotate the tool).
   contextually-poisoned and the cumulatively-catastrophic-but-individually-permitted
   cases, **over** a resource's own grants, never instead of them.
 - **Assertion, not verification.** A contract asserts what a tool does. Nothing here
-  observes whether a server behaves as its contract says. The runtime counterpart —
-  a server attesting what it actually did, which eunox verifies for signature and
-  consistency — is the effect-receipt surface, and it too verifies attestations rather
-  than watching servers.
-- **No cumulative velocity yet.** "No more than $2,000 of refunds an hour" — the four
-  hundred individually-permitted $10 refunds — is **not expressible**. It needs a weighted
-  sliding-window sum the `CallCounter` contract does not provide, and the grammar
-  deliberately carries no half-working key for it: an authored `maxTotal` that silently
-  bounded nothing would be worse than its absence.
+  observes whether a server behaves as its contract says. The runtime counterpart is the
+  effect-receipt surface below, and it too verifies attestations rather than watching
+  servers.
+- **Ordering.** The cumulative bound COMMITS, so it is evaluated after every pure predicate
+  *and* after the effect ceiling: a call the ceiling escalates is never forwarded, so it must
+  not have spent budget the calls that follow then lack. That is the same rule the
+  `sequenceBlock` antecedent and the flow label already obeyed, in a third currency.
+- **A count and a budget compose.** A cumulative `blastRadius` bound and a `maxCalls` are
+  different questions about the same call — "how many" and "how much" — and a capability may
+  carry both: *no more than 20 refunds an hour AND no more than $2,000 an hour*. They draw
+  on separately-namespaced counter keys and are admitted in ONE atomic backend call, so
+  neither can spend the other's budget on a call the other denies. What IS refused at load
+  is two bounds of the same kind on the same `windowSeconds`: they address one physical
+  bucket, so every call would be charged to it twice and the effective limit halved — a
+  limit the manifest never states. Write the lower of the two instead.
 - **Determinism.** Nothing on this path reads a payload, consults a model, or makes a
   network call. Effect is declared by policy and resolved from the call's own arguments.
+
+## Effect receipts — what the server says it actually did
+
+A contract is an assertion. Nothing above checks whether a server behaves as its contract
+says, and the design deliberately refuses to find out by watching: eunox verifies
+attestations, it does not monitor servers, and no payload inference or egress observation is
+on the table.
+
+A **receipt** closes that loop honestly. A server MAY publish, in a tool *result's* `_meta`,
+a signed statement of what it actually did:
+
+```json
+{
+  "_meta": {
+    "io.eunolabs.effect-receipt": { "jws": "<compact JWS>" }
+  }
+}
+```
+
+whose signed payload carries the same vocabulary a contract does — `tool`, `class`,
+`blastRadius`, `unit`, `compensatingAction`, and an `iat`. eunox verifies the signature
+against the key domain configured for **that upstream**, checks the statement against the
+contract the pre-call decision resolved, and records the verdict.
+
+Configure it per upstream, with a **local** JWKS file:
+
+```yaml
+upstreams:
+  - name: payments
+    effectReceiptKeys: /etc/eunox/payments-receipt-jwks.json
+```
+
+The key domain is the **server's own**, deliberately not the JWKS that authenticates
+callers. A receipt is a statement by the upstream about its own behavior — closer to
+package signing than to an access token — so tying it to the caller's IdP would let any
+party who can mint a caller token also mint attestations about a server's behavior. The
+file is read once at startup and never fetched, for the same reason the registry is never
+fetched: the check's value is that it is local and unfalsifiable.
+
+Verdicts are a closed vocabulary, recorded under `details.effect_receipt`:
+
+| Verdict | Meaning |
+| --- | --- |
+| `verified` | Signature checked against this upstream's key domain, and consistent with the declaration. |
+| `inconsistent` | Signature checked; the server's own account contradicts the contract. Evidence, never a late denial. |
+| `unverified` | Unknown key, bad signature, stale or future-dated. Earns nothing. |
+| `malformed` | A block is present but is not a well-formed envelope. Earns nothing. |
+
+Four properties are load-bearing:
+
+- **Verification only, never monitoring.** The declared block is read and nothing else.
+- **Fail closed on trust.** An unsigned or unverifiable receipt earns nothing, and **none
+  of its claims reach the tape** — a forged "reversible, 1 row" recorded as fact would
+  invert the control it is meant to strengthen.
+- **Post-hoc, never retroactive.** The call already happened. An inconsistency is evidence
+  and an input to future friction, never a refusal taken after the side effect.
+- **Zero cost when unconfigured.** With no key domain the surface does nothing at all — no
+  parse, no record. A non-supporting server simply never sets the field, so value accrues
+  per server with no ecosystem coordination.
+
+Consistency is one-directional: a server reporting a **smaller or less consequential**
+action than declared is honoring the contract, since the declaration is the upper bound the
+decision was made against. Only exceeding it contradicts. Silence, though, is not agreement:
+a receipt that omits a dimension the contract **quantified** records as `inconsistent`
+(`blast_radius_unstated`), because an attestation that never covered the bounded dimension
+must not earn `verified` — the strongest signal this surface emits. A contract that could not be
+resolved before the call — genuinely runtime-dynamic effect — has no bound to exceed, and
+the receipt is then the only account of what happened, which is the case receipts uniquely
+serve.
+
+**Residual — replay.** `iat` plus a freshness window bounds how long a captured receipt can
+be re-presented; it does not eliminate replay, which would need a nonce eunox supplies on
+the request leg. That bound is adequate today because a receipt grants no friction reduction
+at all: it is recorded evidence, and nothing consumes it as an authorization input. Any
+future mechanism that lets a receipt lower a bar has to close this first.
 
 ## Worked example
 

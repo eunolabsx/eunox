@@ -151,7 +151,7 @@ func (e *Engine) registerBuiltins() {
 	e.handlers[capability.ConditionTypeSequenceBlock] = ConditionHandlerFunc(e.handleSequenceBlock)
 	e.handlers[capability.ConditionTypeFlowLabel] = ConditionHandlerFunc(e.handleFlowLabel)
 	e.handlers[capability.ConditionTypeEffectClass] = ConditionHandlerFunc(e.handleEffectClass)
-	e.handlers[capability.ConditionTypeBlastRadius] = ConditionHandlerFunc(e.handleBlastRadius)
+	e.handlers[capability.ConditionTypeBlastRadius] = blastRadiusHandler{e: e}
 	e.handlers[capability.ConditionTypePolicy] = ConditionHandlerFunc(e.handlePolicy)
 	e.handlers[capability.ConditionTypeCustom] = ConditionHandlerFunc(e.handleCustom)
 }
@@ -295,9 +295,9 @@ func (e *Engine) handleIPRange(_ context.Context, cond capability.Condition, req
 
 // maxCallsBucket derives the counter bucket for a maxCalls condition: it casts the
 // condition, applies the skip-quota bypass, and validates the counter, session, and
-// target. The single-condition handler (handleMaxCalls) and the atomic
-// multi-condition commit (commitDeferredAtomic, engine.go) both go through it so
-// they build the SAME key under the SAME fail-closed guards. skip is true when quota
+// target. Both the direct condition-handler path (maxCallsHandler.Handle) and the engine's
+// atomic multi-condition commit (commitDeferredConditions, engine.go) reach it through
+// PrepareCommit, so they build the SAME key under the SAME fail-closed guards. skip is true when quota
 // must not be consumed (--audit observe mode via WithSkipQuota — treat the condition
 // as satisfied); condErr is non-nil on any deny; otherwise the condition and its
 // bucket key are returned.
@@ -338,7 +338,7 @@ func (e *Engine) maxCallsBucket(ctx context.Context, cond capability.Condition, 
 	// windowSeconds is deliberately NOT part of this logical key: per-window
 	// isolation is supplied by each backend appending windowSec to the physical key.
 	// Two conditions sharing one window are rejected at load
-	// (validateMaxCallsWindowsDistinct). Route scoping is unneeded — session IDs are
+	// (validateQuotaBucketsDistinct). Route scoping is unneeded — session IDs are
 	// per-connection UUIDs and the transport rejects cross-route sessions — and
 	// compositeCounterKey length-prefixes every component against collision.
 	targetType, toolName := sessionTargetKey(req)
@@ -361,7 +361,7 @@ func (e *Engine) maxCallsBucket(ctx context.Context, cond capability.Condition, 
 	// misconfigurations that deny in enforce mode no matter what the quota is. Skipping
 	// first hid exactly those from the audit log — the run an operator makes precisely to
 	// find them — and reported ALLOW where enforce mode would have written
-	// MISSING_CONTEXT/CONDITION_FAILED. Same rationale as commitDeferredAtomic's
+	// MISSING_CONTEXT/CONDITION_FAILED. Same rationale as commitDeferredConditions'
 	// validate-then-skip ordering (engine.go), which this now matches.
 	if SkipQuota(ctx) {
 		return nil, "", true, nil
@@ -378,64 +378,42 @@ func (e *Engine) maxCallsBucket(ctx context.Context, cond capability.Condition, 
 // the SAME fail-closed guards.
 type maxCallsHandler struct{ e *Engine }
 
-// Handle implements ConditionHandler for the single-condition path.
+// Handle implements ConditionHandler by routing through PrepareCommit and admitting the
+// single bucket, so the pure checks and the bucket derivation have ONE implementation. The
+// engine's deferred path calls PrepareCommit directly; this exists for a direct caller of
+// the exported condition-handler seam.
 func (h maxCallsHandler) Handle(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) *ConditionError {
-	return h.e.handleMaxCalls(ctx, cond, req)
+	return h.e.prepareAndAdmit(ctx, h, cond, req)
 }
 
-// PrepareCommit implements CommittingConditionHandler: it derives the counter
-// bucket WITHOUT consuming a slot, so commitDeferredAtomic can admit several
-// deferred conditions in one atomic IncrementIfAllBelow.
+// PrepareCommit implements CommittingConditionHandler: it derives the counter bucket
+// WITHOUT consuming a slot, so the engine can admit several deferred conditions in one
+// atomic AdmitAll. maxCalls carries no pure checks of its own beyond the structural guards
+// maxCallsBucket applies.
 func (h maxCallsHandler) PrepareCommit(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (DeferredCommit, bool, *ConditionError) {
 	mc, key, skip, condErr := h.e.maxCallsBucket(ctx, cond, req)
-	if skip {
-		return DeferredCommit{}, true, nil
-	}
 	if condErr != nil {
 		return DeferredCommit{}, false, condErr
 	}
+	if skip {
+		return DeferredCommit{}, true, nil
+	}
 	return DeferredCommit{
-		Key:        key,
-		WindowSecs: mc.WindowSeconds,
-		Limit:      int64(mc.Count),
-		Deny: func(count int64, retryAfter time.Duration) *ConditionError {
+		Bucket: capability.QuotaBucket{
+			Key:       key,
+			WindowSec: mc.WindowSeconds,
+			// Counted: a maxCalls bucket bounds the NUMBER of calls, which every backend
+			// answers in O(1). It is the weight-1 case of the weighted accounting, kept
+			// distinct only so a large quota does not pay a linear scan per check.
+			Counted: true,
+			Limit:   float64(mc.Count),
+		},
+		Deny: func(total float64, retryAfter time.Duration) *ConditionError {
 			// Surface a Retry-After hint so a caller can back off; fall back to the full
 			// window when the backend has no estimate.
-			return maxCallsRateLimited(mc, count, retryAfterSeconds(retryAfter, mc.WindowSeconds))
+			return maxCallsRateLimited(mc, int64(total), retryAfterSeconds(retryAfter, mc.WindowSeconds))
 		},
 	}, false, nil
-}
-
-// handleMaxCalls evaluates a single maxCalls condition, committing a sliding-window
-// slot via the backend's atomic IncrementIfBelow so a denied (over-limit) call
-// never writes a new timestamp. A constraint carrying more than one maxCalls is
-// committed atomically across all of them by commitDeferredAtomic (engine.go), so
-// this single-condition path needs no separate non-committing pre-check.
-func (e *Engine) handleMaxCalls(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) *ConditionError {
-	mc, key, skip, condErr := e.maxCallsBucket(ctx, cond, req)
-	if skip {
-		return nil
-	}
-	if condErr != nil {
-		return condErr
-	}
-
-	count, admitted, retryAfter, err := e.counter.IncrementIfBelow(ctx, key, mc.WindowSeconds, int64(mc.Count))
-	if err != nil {
-		return &ConditionError{
-			Code:          capability.ErrCodeConditionFailed,
-			ConditionType: capability.ConditionTypeMaxCalls,
-			Message:       fmt.Sprintf("call counter error: %v", err),
-		}
-	}
-
-	if !admitted {
-		// Surface a Retry-After hint so a caller can back off instead of holding the
-		// window full; fall back to the full window if the backend has no estimate.
-		return maxCallsRateLimited(mc, count, retryAfterSeconds(retryAfter, mc.WindowSeconds))
-	}
-
-	return nil
 }
 
 // retryAfterSeconds converts a backend retry-after estimate to whole seconds

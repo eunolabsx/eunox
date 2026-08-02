@@ -185,9 +185,21 @@ func (c *Contract) Validate() error {
 // drops an unreadable contract would let a tampered file disappear instead of raising an
 // alarm.
 func LoadCorpus(dir string) ([]Contract, error) {
-	paths, err := filepath.Glob(filepath.Join(dir, "*.json"))
+	// os.ReadDir, not filepath.Glob: Glob re-interprets the caller's DIRECTORY as a
+	// pattern, so a real directory whose name contains a metacharacter
+	// ("/opt/corpora/mcp[v2]/contracts") matched nothing and returned an empty corpus with
+	// no error — a clean bill of health for files that were never read, which is exactly
+	// what this loader's fail-on-first-invalid rule exists to prevent one level down.
+	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("scanning contract corpus %q: %w", dir, err)
+	}
+	var paths []string
+	for _, e := range ents {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		paths = append(paths, filepath.Join(dir, e.Name()))
 	}
 	sort.Strings(paths)
 	out := make([]Contract, 0, len(paths))

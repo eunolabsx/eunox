@@ -200,6 +200,10 @@ type StdioProxy struct {
 	// decision parallelism. Set from StdioProxyOptions.SerializeDecisions at construction.
 	decideGate *decisionSerializer
 
+	// receipts verifies signed effect receipts published by this proxy's single upstream,
+	// against the key domain the operator configured for it. nil disables the surface.
+	receipts *capability.EffectReceiptVerifier
+
 	// honorAttribution admits the client-supplied attribution interface. Set from
 	// StdioProxyOptions.HonorAttribution at construction; see that field.
 	honorAttribution bool
@@ -245,6 +249,12 @@ type StdioProxyOptions struct {
 	// schemaVersion — so a policy running the published grammar ignores the block instead
 	// of acting on a token that grammar does not contain.
 	HonorAttribution bool
+
+	// EffectReceipts verifies signed effect receipts this upstream publishes in a tool
+	// result's `_meta`. nil (the default) disables the surface entirely: nothing is
+	// parsed and nothing is recorded, so an operator who configured no key domain for
+	// this upstream pays nothing.
+	EffectReceipts *capability.EffectReceiptVerifier
 
 	// DriftCheck is the injected drift hook; nil = no drift checking.
 	DriftCheck drift.CheckFunc
@@ -299,6 +309,7 @@ func NewStdioProxy(opts StdioProxyOptions) *StdioProxy {
 		requireAuditStrict:    opts.RequireAuditStrict,
 		driftCheck:            opts.DriftCheck,
 		honorAttribution:      opts.HonorAttribution,
+		receipts:              opts.EffectReceipts,
 		onReady:               opts.OnReady,
 		byUpstreamID:          make(map[string]chan upstreamResult),
 		hostToUp:              make(map[string]*json.RawMessage),
@@ -1269,6 +1280,7 @@ func (p *StdioProxy) dispatchParams() dispatchParams {
 		pdp:              p.pdp,
 		sourceIP:         "", // stdio has no per-request client address
 		buildInit:        p.buildInitResponse,
+		receipts:         p.receipts,
 		honorAttribution: p.honorAttribution,
 	}
 }

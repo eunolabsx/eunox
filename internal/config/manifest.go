@@ -1090,10 +1090,10 @@ func validateLocalManifest(m *LocalManifest) error {
 				return fmt.Errorf("capability at index %d, directive %d: unrecognized directive type %q; the only supported directives are redactFields and labelOutput", i, j, dir.DirectiveType())
 			}
 		}
-		// Reject two maxCalls sharing a windowSeconds before the per-condition pass,
-		// so the cross-condition collision is reported clearly. See
-		// validateMaxCallsWindowsDistinct.
-		if err := validateMaxCallsWindowsDistinct(i, c.Conditions); err != nil {
+		// Reject two quota-consuming conditions that would address the same counter
+		// bucket, before the per-condition pass, so the cross-condition collision is
+		// reported clearly. See validateQuotaBucketsDistinct.
+		if err := validateQuotaBucketsDistinct(i, c.Conditions); err != nil {
 			return err
 		}
 		// Validate conditions. Conditions needing an explicit argument name fail
@@ -1523,36 +1523,63 @@ func validateMaxCalls(i, j int, v *capability.MaxCallsCondition) error {
 	return nil
 }
 
-// validateMaxCallsWindowsDistinct rejects a capability with two or more maxCalls
-// conditions sharing a windowSeconds. The call counter keys each bucket by
-// (session, targetType, name, windowSeconds), so they share one bucket: every call
-// is counted once per condition, halving the effective limit. The combination adds
-// no expressiveness (`count: min(a, b)` on one condition is the faithful rewrite),
-// so reject it at load. Distinct windows are independent rate limits and left
-// alone.
+// validateQuotaBucketsDistinct rejects a capability whose quota-consuming conditions would
+// address the SAME counter bucket: two maxCalls sharing a windowSeconds, or two cumulative
+// blastRadius bounds sharing one. The counter keys each bucket by (session, targetType,
+// name, windowSeconds) within its own namespace, so two such conditions share one physical
+// bucket: every call is counted (or summed) once per condition, halving the effective
+// limit. The combination adds no expressiveness — one condition with the lower bound is the
+// faithful rewrite — so reject it at load. Distinct windows are independent limits and are
+// left alone.
 //
-// A non-positive window is skipped and left to validateMaxCalls's sharper
-// "windowSeconds >= 1" message, rather than reported here as a duplicate-window
-// conflict that would misdirect the author.
-func validateMaxCallsWindowsDistinct(i int, conditions []capability.Condition) error {
-	seen := make(map[int]int) // windowSeconds -> index of the first maxCalls with it
+// Mixing the two TYPES is explicitly fine and is an ordinary policy ("no more than 20
+// refunds an hour AND no more than $2,000 an hour"): they draw on separately-namespaced
+// keys, and the engine admits a counted bucket and a weighted one together in ONE atomic
+// backend call, so neither can spend the other's budget on a call the other denies.
+//
+// The type switch is complete for its INPUT DOMAIN and only for that: a manifest carries
+// only the closed set of grammar conditions, so a registry-supplied custom committing
+// handler cannot appear here. The backstop for that case is the counter's own
+// checkDistinctBuckets, which fails the admission closed at request time.
+//
+// A non-positive window is skipped and left to each condition's own sharper "windowSeconds
+// >= 1" message, rather than reported here as a duplicate-window conflict that would
+// misdirect the author.
+func validateQuotaBucketsDistinct(i int, conditions []capability.Condition) error {
+	// Keyed by (namespace, window): only a collision WITHIN one namespace is a shared
+	// bucket, because that is exactly how the counter keys them.
+	type bucket struct {
+		namespace string
+		window    int
+	}
+	seen := make(map[bucket]int)
 	for j, cond := range conditions {
-		var window int
+		var b bucket
 		switch v := cond.(type) {
 		case capability.MaxCallsCondition:
-			window = v.WindowSeconds
+			b = bucket{"maxCalls", v.WindowSeconds}
 		case *capability.MaxCallsCondition:
-			window = v.WindowSeconds
+			b = bucket{"maxCalls", v.WindowSeconds}
+		case capability.BlastRadiusCondition:
+			if !v.HasVelocity() {
+				continue
+			}
+			b = bucket{"blastRadius", v.WindowSeconds}
+		case *capability.BlastRadiusCondition:
+			if !v.HasVelocity() {
+				continue
+			}
+			b = bucket{"blastRadius", v.WindowSeconds}
 		default:
 			continue
 		}
-		if window < 1 {
+		if b.window < 1 {
 			continue
 		}
-		if first, dup := seen[window]; dup {
-			return fmt.Errorf("capability at index %d: conditions %d and %d are both maxCalls with the same windowSeconds (%d); two equal windows share one counter bucket and would halve the effective limit — combine them into a single maxCalls with the lower 'count'", i, first, j, window)
+		if first, dup := seen[b]; dup {
+			return fmt.Errorf("capability at index %d: conditions %d and %d are both %s with the same windowSeconds (%d); two equal windows share one counter bucket and would halve the effective limit — combine them into a single condition with the lower bound", i, first, j, b.namespace, b.window)
 		}
-		seen[window] = j
+		seen[b] = j
 	}
 	return nil
 }

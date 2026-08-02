@@ -309,7 +309,7 @@ func (c *recordingCounter) Peek(context.Context, string, int) (int64, error) { r
 func (c *recordingCounter) IncrementIfBelow(context.Context, string, int, int64) (count int64, admitted bool, retryAfter time.Duration, err error) {
 	return 0, true, 0, nil
 }
-func (c *recordingCounter) IncrementIfAllBelow(context.Context, []string, []int, []int64) (admitted bool, deniedIndex int, count int64, retryAfter time.Duration, err error) {
+func (c *recordingCounter) AdmitAll(context.Context, []capability.QuotaBucket) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error) {
 	return true, 0, 0, 0, nil
 }
 
@@ -1622,4 +1622,11 @@ func TestApplyRedactObligs_ReservedRootKeyNotMaskedWholesale(t *testing.T) {
 		assert.Contains(t, string(out), tc.keep,
 			"a single-segment path naming the protocol-reserved key %q must not mask the whole component", tc.path)
 	}
+}
+
+// AddIfTotalBelow satisfies the weighted half of capability.CallCounter. This double
+// exercises the counting paths only, so a weighted add admits without recording: nothing
+// under test reads a weighted total from it.
+func (*recordingCounter) AddIfTotalBelow(_ context.Context, _ string, _ int, weight, _ float64) (total float64, admitted bool, retryAfter time.Duration, err error) {
+	return weight, true, 0, nil
 }

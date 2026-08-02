@@ -34,34 +34,57 @@ func (f ConditionHandlerFunc) Handle(ctx context.Context, condition capability.C
 	return f(ctx, condition, req)
 }
 
-// DeferredCommit describes one deferred (quota-consuming) condition's counter
-// bucket, derived WITHOUT yet consuming the slot, so the engine can admit several
-// deferred conditions across a constraint in a single atomic backend call
-// (IncrementIfAllBelow). Deny builds the denial for this bucket when it is the one
-// that lacked headroom, given the observed count and the backend's retry-after
-// hint.
+// DeferredCommit is one deferred (quota-consuming) condition's admission plan, derived
+// WITHOUT yet consuming anything, so the engine can admit every such condition on a
+// constraint in ONE atomic backend call.
+//
+// It carries the bucket rather than a flag the engine interprets: a handler states which
+// accounting its bucket uses (QuotaBucket.Counted), what this call contributes, and what
+// bound applies, and the backend admits the whole mixed set. Nothing here requires the
+// engine to know which CONDITION TYPE produced a bucket — an earlier shape did, and the
+// branch it needed stamped one built-in's discriminator onto a refusal that a third-party
+// handler could equally have produced, which is exactly the free-form-text-in-a-structured-
+// field mistake the audit taxonomy forbids.
+//
+// Deny builds the denial for this bucket when it is the one that lacked headroom, given the
+// observed total and the backend's retry-after hint.
 type DeferredCommit struct {
-	Key        string
-	WindowSecs int
-	Limit      int64
-	Deny       func(count int64, retryAfter time.Duration) *ConditionError
+	Bucket capability.QuotaBucket
+	Deny   func(total float64, retryAfter time.Duration) *ConditionError
 }
 
+// Commits reports whether this prepared commit names a bucket at all.
+//
+// A handler whose condition commits only in SOME configurations returns a zero
+// DeferredCommit for the non-committing case: blastRadius consumes a weighted budget only
+// when the condition declares a cumulative bound, but deferral is keyed by condition TYPE,
+// so the per-call-only shape reaches PrepareCommit too and has to be able to say "nothing
+// to commit". Its PURE checks have already run by then — PrepareCommit performs them — so
+// the engine simply has no bucket to admit for it.
+func (d DeferredCommit) Commits() bool { return d.Bucket.Key != "" }
+
 // CommittingConditionHandler is a ConditionHandler whose condition commits state
-// (consumes a quota slot) on admit, so it must run after all pure predicates and,
-// when a constraint carries more than one such condition, participate in the
-// engine's atomic multi-condition commit instead of committing per-bucket (which
-// would leave a check->commit TOCTOU across the buckets). PrepareCommit derives the
-// bucket without consuming it; the engine then commits every prepared bucket in one
-// atomic call. skip is true when quota must not be consumed (observe mode), in
-// which case the condition is treated as satisfied and no bucket is committed.
+// (consumes a quota slot) on admit, so it must run after all pure predicates and
+// participate in the engine's atomic multi-condition commit instead of committing
+// per-bucket (which would leave a check->commit TOCTOU across the buckets).
+//
+// PrepareCommit is the condition's WHOLE evaluation minus the commit: it performs every
+// pure check the condition makes and derives the bucket without consuming it, and the
+// engine then admits every prepared bucket in one atomic call. Putting the pure checks here
+// rather than in Handle is load-bearing — under observe mode the commit is skipped, and a
+// handler that carried its pure checks only in Handle had them silently skipped too, so a
+// per-call bound went unevaluated on exactly the run an operator makes to predict
+// enforcement.
+//
+// skip is true when quota must not be consumed (observe mode), in which case no bucket is
+// committed — but the pure checks have still run and may still have returned condErr.
 //
 // skip MUST be uniform across the whole constraint: it must be derived solely from
 // the request context (as the built-in maxCalls does via SkipQuota(ctx)), never from
 // this condition's own configuration or arguments. The atomic multi-condition commit
 // treats one bucket's skip as skipping the entire deferred set — admitting the call
 // without limit-checking the remaining committing conditions — so a per-condition skip
-// would be a fail-open for the buckets it never checked. commitDeferredAtomic asserts
+// would be a fail-open for the buckets it never checked. commitDeferredConditions asserts
 // skip == SkipQuota(ctx) and fails closed on a violation, but a conforming handler must
 // keep skip context-derived so the whole set skips or none does.
 //
@@ -695,13 +718,14 @@ func WithConditionHandler(name string, handler ConditionHandler) Option {
 	}
 }
 
-// runConditions evaluates every condition on matched in order. It returns a
-// non-nil deny response on the first condition with an unknown type or a Handle
-// failure (fail closed), and nil when all conditions pass. requestID and now
+// runPureConditions evaluates every PURE (non-committing) condition on matched in order
+// and returns the deferred (quota-consuming) ones for the caller to commit later. It
+// returns a non-nil deny response on the first condition with an unknown type or a Handle
+// failure (fail closed). requestID and now
 // stamp the returned response so it matches the surrounding decision; AuditOnly
 // mirrors the matched constraint. Extracted so ValidateAction and
 // EvaluateConditions share one dispatch path and cannot diverge.
-func (e *Engine) runConditions(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, requestID, now string) *capability.EnforceResponse {
+func (e *Engine) runPureConditions(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, requestID, now string) ([]capability.Condition, *capability.EnforceResponse) {
 	// Two passes over matched.Conditions so a consuming condition never burns its
 	// quota for a call a later condition denies. The loop just below is the first
 	// pass: it walks matched.Conditions once, evaluating every pure-predicate
@@ -711,7 +735,7 @@ func (e *Engine) runConditions(ctx context.Context, req *capability.EnforceReque
 	// does both the classifying and the evaluating, so there is no second loop that
 	// could re-derive the classification differently. The code after the loop is the
 	// second pass: it evaluates the collected deferred conditions and commits them.
-	// handleMaxCalls commits a sliding-window slot the instant it admits, and that
+	// The maxCalls handler commits a sliding-window slot the instant it admits, and that
 	// commit is not rolled back on a later failure, so keeping commit in the second
 	// pass means a pure predicate that denies is always checked first.
 	//
@@ -747,67 +771,114 @@ func (e *Engine) runConditions(ctx context.Context, req *capability.EnforceReque
 				HardDeny: true,
 				Message:  "constraint carries a null condition that cannot be evaluated",
 			})
-			return &resp
+			return nil, &resp
 		}
 		if e.isDeferredCondition(cond.ConditionType()) {
 			deferred = append(deferred, cond)
 			continue
 		}
 		if deny := e.evalCondition(ctx, cond, req, matched, requestID, now); deny != nil {
-			return deny
+			return nil, deny
 		}
 	}
 
-	// More than one consuming condition: commit atomically across all buckets so
-	// two concurrent same-session requests cannot both observe headroom and both
-	// commit (a per-bucket commit leaves a check→commit TOCTOU). A single deferred
-	// condition has no cross-bucket race — its IncrementIfBelow is already atomic.
-	if len(deferred) > 1 {
-		return e.commitDeferredAtomic(ctx, req, matched, deferred, requestID, now)
-	}
-
-	// Commit pass for the single (or zero) deferred condition.
-	for _, cond := range deferred {
-		if deny := e.evalCondition(ctx, cond, req, matched, requestID, now); deny != nil {
-			return deny
-		}
-	}
-	return nil
+	return deferred, nil
 }
 
-// isTypedNil reports whether v is a non-nil interface value wrapping a nil
-// pointer — e.g. a (*MaxCallsCondition)(nil) boxed into a capability.Condition,
-// or a (*RedactFieldsDirective)(nil) boxed into a capability.Directive. Such a
-// value survives a plain `v == nil` check (the interface itself is non-nil) but
-// would panic a value/pointer-receiver method that dereferences it (e.g.
-// ConditionType(), ToObligation()). Delegates to capability.IsTypedNil, the single
-// source of truth for this guard, shared by runConditions' condition check,
-// CollectObligations' directive check, and the config-loader validation guards, so
-// the copies cannot drift.
+// prepareAndAdmit evaluates ONE committing condition end to end: its pure checks and bucket
+// derivation (PrepareCommit), then the admission of that single bucket. It is the
+// ConditionHandler path every committing handler's Handle delegates to, so a handler has one
+// implementation of its own semantics rather than two that can drift — which they had, with
+// observe mode skipping a pure check on one path and evaluating it on the other.
+//
+// The engine's own deferred pass does NOT come through here: it prepares every condition and
+// admits the whole set atomically, which is the only way a multi-condition constraint gets a
+// TOCTOU-free commit.
+func (e *Engine) prepareAndAdmit(ctx context.Context, h CommittingConditionHandler, cond capability.Condition, req *capability.EnforceRequest) *ConditionError {
+	commit, skip, condErr := h.PrepareCommit(ctx, cond, req)
+	if condErr != nil {
+		return condErr
+	}
+	if skip || !commit.Commits() {
+		return nil
+	}
+	if e.counter == nil {
+		return &ConditionError{
+			Code:          capability.ErrCodeConditionFailed,
+			ConditionType: cond.ConditionType(),
+			Message:       "call counter not configured",
+		}
+	}
+	admitted, _, total, retryAfter, err := e.counter.AdmitAll(ctx, []capability.QuotaBucket{commit.Bucket})
+	if err != nil {
+		return &ConditionError{
+			Code:          capability.ErrCodeConditionFailed,
+			ConditionType: cond.ConditionType(),
+			Message:       fmt.Sprintf("call counter error: %v", err),
+		}
+	}
+	if admitted {
+		return nil
+	}
+	if commit.Deny == nil {
+		return &ConditionError{
+			Code:          capability.ErrCodeConditionFailed,
+			ConditionType: cond.ConditionType(),
+			Message:       "committing condition handler supplied a nil Deny callback",
+		}
+	}
+	return commit.Deny(total, retryAfter)
+}
+
+// isTypedNil reports whether v is a non-nil interface value wrapping a nil pointer — e.g. a
+// (*MaxCallsCondition)(nil) boxed into a capability.Condition, or a
+// (*RedactFieldsDirective)(nil) boxed into a capability.Directive. Such a value survives a
+// plain `v == nil` check (the interface itself is non-nil) but would panic a
+// value/pointer-receiver method that dereferences it (e.g. ConditionType(), ToObligation()).
+// Delegates to capability.IsTypedNil, the single source of truth for this guard, shared by
+// runPureConditions' condition check, CollectObligations' directive check, and the
+// config-loader validation guards, so the copies cannot drift.
 func isTypedNil(v interface{}) bool {
 	return capability.IsTypedNil(v)
 }
 
-// commitDeferredAtomic admits a constraint's deferred (quota-consuming) conditions
-// in one atomic backend call (IncrementIfAllBelow): the call is recorded in every
-// bucket only if every bucket has headroom, closing the per-bucket check→commit
-// TOCTOU. Used only when a constraint carries more than one deferred condition. It
-// derives each bucket through the registered CommittingConditionHandler
-// (PrepareCommit) rather than a hardcoded maxCalls type switch, so a custom
-// WithConditionHandler that commits state is honored here exactly as on the
-// single-condition path.
-func (e *Engine) commitDeferredAtomic(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, deferred []capability.Condition, requestID, now string) *capability.EnforceResponse {
-	keys := make([]string, len(deferred))
-	windowSecs := make([]int, len(deferred))
-	limits := make([]int64, len(deferred))
-	denies := make([]func(count int64, retryAfter time.Duration) *ConditionError, len(deferred))
-	// Track buckets skipped under SkipQuota so a PARTIAL skip (some buckets skipped, some
-	// committing) can be caught after the loop. The loop evaluates EVERY bucket so a later
-	// bucket's validation condErr surfaces even when an earlier bucket skipped — returning
-	// on the first skip (the prior behavior) let an observe-mode call mask a later
-	// committing condition's error as an allow where enforce mode would deny.
+// commitDeferredConditions runs the SECOND pass: it prepares every deferred condition —
+// which runs that condition's pure checks — and admits the resulting buckets in ONE atomic
+// backend call. It is reached only after every check that can refuse the call without state
+// has passed (the pure predicates, the obligation collection, and the EFFECT CEILING), so
+// nothing here is charged to a call that is then refused.
+//
+// One path for one and for many. The single-deferred case used to bypass this and commit
+// through the handler's own Handle, and the two paths had already diverged: under observe
+// mode this one skipped a condition ENTIRELY, including the pure per-call bound Handle
+// still evaluated, so the same policy was enforced differently depending on how many
+// deferred conditions a constraint happened to carry.
+//
+// The buckets may MIX accountings — a maxCalls count beside a cumulative blastRadius
+// magnitude — because the backend admits them together (capability.CallCounter.AdmitAll).
+// The engine therefore has no compatibility table to maintain and no combination to refuse:
+// "can these be admitted together" is answered once, by the layer that does the admitting.
+func (e *Engine) commitDeferredConditions(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, deferred []capability.Condition, requestID, now string) *capability.EnforceResponse {
+	var (
+		buckets []capability.QuotaBucket
+		denies  []func(total float64, retryAfter time.Duration) *ConditionError
+		// bucketTypes[i] is the condition type that produced buckets[i], kept so a fault
+		// spanning the WHOLE commit can still be attributed when every bucket came from one
+		// condition type (see attributableType).
+		bucketTypes []string
+		// committing counts the conditions that actually consume quota, which is NOT
+		// len(deferred): deferral is keyed by condition TYPE, so a condition whose type can
+		// commit but whose configuration does not (a per-call-only blastRadius) arrives here
+		// too and reports no bucket.
+		committing int
+	)
+	// Track buckets skipped under SkipQuota so a PARTIAL skip (some skipped, some
+	// committing) can be caught after the loop. The loop prepares EVERY condition so a later
+	// one's validation condErr surfaces even when an earlier one skipped — returning on the
+	// first skip let an observe-mode call mask a later committing condition's error as an
+	// allow where enforce mode would deny.
 	skipped := 0
-	for i, cond := range deferred {
+	for _, cond := range deferred {
 		condType := cond.ConditionType()
 		ch, ok := e.committingHandler(condType)
 		if !ok {
@@ -823,21 +894,20 @@ func (e *Engine) commitDeferredAtomic(ctx context.Context, req *capability.Enfor
 		}
 		commit, skip, condErr := ch.PrepareCommit(ctx, cond, req)
 		// A condErr is checked BEFORE skip is honored. PrepareCommit's contract puts no
-		// exclusion between the two, so a handler may legitimately report both — e.g. a
-		// malformed-condition validation error discovered on a bucket that also skips under
-		// SkipQuota. Honoring skip first would discard that error, and if every bucket
-		// skipped the call would then be ALLOWED under observe while enforce denies it:
-		// precisely the observe/enforce divergence this function exists to prevent.
+		// exclusion between the two, so a handler may legitimately report both — a pure
+		// check that failed on a condition that also skips its commit under SkipQuota.
+		// Honoring skip first would discard that verdict, and if every condition skipped the
+		// call would then be ALLOWED under observe while enforce denies it: precisely the
+		// observe/enforce divergence this function exists to prevent.
 		if condErr != nil {
 			return denyFromConditionError(condErr, matched, requestID, now)
 		}
 		if skip {
 			// skip must be uniform across the constraint — the contract requires it to be
-			// derived solely from ctx (SkipQuota). A handler that reports skip for some
-			// other reason (its own config/arguments) would leave the remaining committing
+			// derived solely from ctx (SkipQuota). A handler that reports skip for some other
+			// reason (its own config/arguments) would leave the remaining committing
 			// conditions unchecked: a fail-open. Assert the contract and fail closed on a
-			// per-bucket violation. The built-in maxCalls always derives skip from
-			// SkipQuota(ctx), so this never trips for it.
+			// per-bucket violation.
 			if !SkipQuota(ctx) {
 				resp := denyResponse(requestID, now, matched.IsAuditOnly(), nil, capability.DenialInfo{
 					Code:          capability.ErrCodeConditionFailed,
@@ -850,52 +920,53 @@ func (e *Engine) commitDeferredAtomic(ctx context.Context, req *capability.Enfor
 				})
 				return &resp
 			}
-			// Quota must not be consumed for this bucket. Keep evaluating the rest so a
-			// later bucket's PrepareCommit condErr still surfaces (observe mode must deny a
-			// call enforce mode would); the all-skip vs partial-skip decision is made after
-			// the loop.
 			skipped++
+			committing++
 			continue
 		}
-		// No second condErr check here: the one above the skip branch already returned for
-		// every non-nil condErr, so a duplicate would be unreachable — and an unreachable
-		// twin of a load-bearing ordering rule is worse than none, because it makes the
-		// earlier check look redundant and invites a future "dedupe" that deletes the
-		// reachable one and silently restores the discarded-validation-error fail-open.
-		keys[i], windowSecs[i], limits[i], denies[i] = commit.Key, commit.WindowSecs, commit.Limit, commit.Deny
+		if !commit.Commits() {
+			// This particular condition consumes nothing. Its pure checks ran inside
+			// PrepareCommit and passed, so there is simply no bucket to admit.
+			continue
+		}
+		committing++
+		buckets = append(buckets, commit.Bucket)
+		denies = append(denies, commit.Deny)
+		bucketTypes = append(bucketTypes, condType)
 	}
 
-	// Every bucket skipped under SkipQuota (audit/observe): quota must not be consumed,
-	// so record nothing and allow — the ctx-driven skip held for all of them.
-	if skipped == len(deferred) {
+	// Nothing on this constraint actually consumes quota (every deferred condition was a
+	// pure predicate of a committing type), so there is no commit to make.
+	if committing == 0 {
 		return nil
 	}
-	// A PARTIAL skip — some buckets skipped, others produced a commit — is a non-uniform
-	// skip the per-bucket assertion above cannot catch (each skipping bucket individually
-	// satisfied SkipQuota). Admitting the committing buckets while silently dropping the
-	// skipped ones is a fail-open, so fail closed.
+	// Every bucket skipped under SkipQuota (audit/observe): quota must not be consumed, so
+	// record nothing and allow — the ctx-driven skip held for all of them.
+	if skipped == committing {
+		return nil
+	}
+	// A PARTIAL skip — some skipped, others produced a bucket — is a non-uniform skip the
+	// per-condition assertion above cannot catch (each skipping one individually satisfied
+	// SkipQuota). Admitting the committing buckets while silently dropping the skipped ones
+	// is a fail-open, so fail closed.
 	if skipped > 0 {
 		resp := denyResponse(requestID, now, matched.IsAuditOnly(), nil, capability.DenialInfo{
 			Code: capability.ErrCodeConditionFailed,
 			// HardDeny, or this guard can never actually block: a partial skip is reachable
 			// only when SkipQuota(ctx) is set, which the binary sets only on a route running
 			// --audit — and on that route the transport downgrades and FORWARDS any
-			// non-HardDeny verdict. Without this the call proceeds with zero quota consumed
-			// on any bucket, which is the fail-open the guard was written to prevent.
+			// non-HardDeny verdict.
 			HardDeny: true,
 			Message:  "deferred commit received a non-uniform skip across buckets; skip must hold for every committing condition or none",
 		})
 		return &resp
 	}
 
-	// A committing condition needs the call-counter backend. The built-in maxCalls
-	// funnels through maxCallsBucket, whose nil-counter guard already surfaced as a
-	// PrepareCommit condErr above, but a custom CommittingConditionHandler need not,
-	// so guard here before the backend call rather than dereferencing a nil counter
-	// and panicking the enforcement goroutine. Reached only by a library consumer
-	// that registered a committing handler without WithCallCounter (the binary always
-	// wires one); the skip-quota path already returned above, so a nil counter here is
-	// a genuine misconfiguration that must fail closed. Mirrors handlers.go's guard.
+	// A committing condition needs the call-counter backend. Every in-tree handler funnels
+	// through a bucket derivation whose nil-counter guard already surfaced as a
+	// PrepareCommit condErr above, but a custom CommittingConditionHandler need not, so
+	// guard here rather than dereferencing a nil counter and panicking the enforcement
+	// goroutine.
 	if e.counter == nil {
 		return denyFromConditionError(&ConditionError{
 			Code:    capability.ErrCodeConditionFailed,
@@ -903,51 +974,65 @@ func (e *Engine) commitDeferredAtomic(ctx context.Context, req *capability.Enfor
 		}, matched, requestID, now)
 	}
 
-	admitted, deniedIndex, count, retryAfter, err := e.counter.IncrementIfAllBelow(ctx, keys, windowSecs, limits)
+	admitted, deniedIndex, total, retryAfter, err := e.counter.AdmitAll(ctx, buckets)
 	if err != nil {
-		// Infrastructure fault across the whole atomic commit, not any single
-		// condition's verdict — this function dispatches through the registry and may
-		// mix condition types, so do not misattribute it to maxCalls. Leave
-		// ConditionType empty and let Code+Message carry the fault.
+		// Infrastructure fault across the WHOLE atomic commit, so it belongs to no single
+		// condition's verdict. It is still attributable when every bucket came from one
+		// condition type, which is the ordinary case; a genuinely mixed batch leaves the
+		// field empty rather than naming an arbitrary one of the two, and Code+Message carry
+		// the fault either way.
 		return denyFromConditionError(&ConditionError{
-			Code:    capability.ErrCodeConditionFailed,
-			Message: fmt.Sprintf("call counter error: %v", err),
+			Code:          capability.ErrCodeConditionFailed,
+			ConditionType: attributableType(bucketTypes),
+			Message:       fmt.Sprintf("call counter error: %v", err),
 		}, matched, requestID, now)
 	}
 	if !admitted {
-		// deniedIndex comes from the CallCounter backend; validate it before using it
-		// as a slice index. A non-conforming backend (or Redis-compatible server whose
-		// reply deviates from the script contract) could return an out-of-range value,
-		// which would panic the enforcement goroutine instead of failing closed. Fail
-		// closed with a structured deny, consistent with the parse layer's intent.
+		// deniedIndex comes from the CallCounter backend; validate it before using it as a
+		// slice index. A non-conforming backend could return an out-of-range value, which
+		// would panic the enforcement goroutine instead of failing closed.
 		if deniedIndex < 0 || deniedIndex >= len(denies) {
-			// A bad-index fault is not any single condition's verdict; leave
-			// ConditionType empty (see the backend-error deny above).
 			return denyFromConditionError(&ConditionError{
-				Code:    capability.ErrCodeConditionFailed,
-				Message: fmt.Sprintf("call counter returned out-of-range denied bucket index %d (have %d buckets)", deniedIndex, len(denies)),
+				Code:          capability.ErrCodeConditionFailed,
+				ConditionType: attributableType(bucketTypes),
+				Message:       fmt.Sprintf("call counter returned out-of-range denied bucket index %d (have %d buckets)", deniedIndex, len(denies)),
 			}, matched, requestID, now)
 		}
 		if denies[deniedIndex] == nil {
-			// A committing handler's PrepareCommit populated commit.Key/WindowSecs/Limit
-			// but left Deny nil — a handler bug, not any single condition's verdict (the
-			// registry may mix condition types here, as commitDeferredAtomic's doc
-			// explains). Fail closed with a structured error instead of panicking the
-			// enforcement goroutine on a nil-func call.
+			// A committing handler's PrepareCommit populated a bucket but left Deny nil — a
+			// handler bug. The bucket IS attributable here, unlike the batch-wide fault above.
 			return denyFromConditionError(&ConditionError{
-				Code:    capability.ErrCodeConditionFailed,
-				Message: fmt.Sprintf("committing condition handler for bucket index %d supplied a nil Deny callback", deniedIndex),
+				Code:          capability.ErrCodeConditionFailed,
+				ConditionType: bucketTypes[deniedIndex],
+				Message:       fmt.Sprintf("committing condition handler for bucket index %d supplied a nil Deny callback", deniedIndex),
 			}, matched, requestID, now)
 		}
-		return denyFromConditionError(denies[deniedIndex](count, retryAfter), matched, requestID, now)
+		return denyFromConditionError(denies[deniedIndex](total, retryAfter), matched, requestID, now)
 	}
 	return nil
+}
+
+// attributableType reports the one condition type every bucket in a commit came from, or
+// "" when the batch mixes types. It exists for the failures that belong to the COMMIT
+// rather than to a bucket — a backend fault, a malformed reply — which still deserve a
+// structured condition type whenever there is an unambiguous one to give. Naming a type on
+// a mixed batch would be a guess, and a structured audit field must never carry a guess.
+func attributableType(types []string) string {
+	if len(types) == 0 {
+		return ""
+	}
+	for _, t := range types[1:] {
+		if t != types[0] {
+			return ""
+		}
+	}
+	return types[0]
 }
 
 // denyFromConditionError wraps a handler's *ConditionError into a deny
 // EnforceResponse, stamping the surrounding decision's requestID/now and the
 // matched constraint's audit-only flag. Shared by evalCondition and
-// commitDeferredAtomic so a condition denial has one canonical response shape.
+// commitDeferredConditions so a condition denial has one canonical response shape.
 func denyFromConditionError(condErr *ConditionError, matched *capability.Constraint, requestID, now string) *capability.EnforceResponse {
 	resp := denyResponse(requestID, now, matched.IsAuditOnly(), nil, capability.DenialInfo{
 		Code:          condErr.Code,
@@ -1010,8 +1095,11 @@ func (e *Engine) evalCondition(ctx context.Context, cond capability.Condition, r
 // evaluates every condition and — on allow — collects obligations BEFORE recording the
 // call in session history. That ordering is load-bearing: recording first would let a
 // later sequenceBlock Peek treat a hard-denied (never-forwarded) call as "run".
-// runConditions, CollectObligations, and RecordSessionCall each short-circuit to their
-// own deny (a failing condition, an unhandled directive, or a history-write fault).
+// The condition evaluation is TWO passes with the ceiling between them: every pure
+// predicate runs first, then the ceiling, then the quota-consuming commits — so no budget,
+// slot or label is charged to a call that a later check still refuses. runPureConditions,
+// CollectObligations, checkEffectCeiling, commitDeferredConditions and RecordSessionCall
+// each short-circuit to their own deny.
 // Shared by ValidateAction and EvaluateConditions so the two cannot diverge on this
 // security-critical ordering.
 func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, requestID, now string) (resp capability.EnforceResponse) {
@@ -1099,7 +1187,11 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 		}()
 	}
 
-	if deny := e.runConditions(ctx, req, matched, requestID, now); deny != nil {
+	// PASS ONE: the pure predicates. The deferred (quota-consuming) conditions are
+	// collected but NOT committed here — the ceiling below has to be able to refuse the
+	// call before anything is charged to it.
+	deferred, deny := e.runPureConditions(ctx, req, matched, requestID, now)
+	if deny != nil {
 		return *deny
 	}
 
@@ -1119,6 +1211,16 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 	// neither a phantom sequenceBlock antecedent nor a stranded flow label behind.
 	if ceilingDeny := e.checkEffectCeiling(effect, matched, carriedLabels, requestID, now); ceilingDeny != nil {
 		return *ceilingDeny
+	}
+
+	// PASS TWO: commit the deferred conditions, now that nothing left can refuse the call
+	// without state. This ordering is load-bearing and was wrong: with the commit inside
+	// the first pass, an over-ceiling call spent its cumulative blastRadius budget before
+	// the ceiling ever ran, so four never-forwarded escalations could exhaust a session's
+	// whole hourly budget and deny the legal calls that followed — the same phantom state
+	// the antecedent and flow-label ordering below exists to prevent, in a third currency.
+	if deny := e.commitDeferredConditions(ctx, req, matched, deferred, requestID, now); deny != nil {
+		return *deny
 	}
 
 	// Commit this call's sequenceBlock antecedent and flow labels as a single
@@ -1146,12 +1248,16 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 	}
 
 	return capability.EnforceResponse{
-		RequestID:     requestID,
-		Decision:      capability.DecisionAllow,
-		Obligations:   obligations,
-		DecidedAt:     now,
-		AuditOnly:     matched.IsAuditOnly(),
-		LabelsOut:     labelsOut,
+		RequestID:   requestID,
+		Decision:    capability.DecisionAllow,
+		Obligations: obligations,
+		DecidedAt:   now,
+		AuditOnly:   matched.IsAuditOnly(),
+		LabelsOut:   labelsOut,
+		// The SAME resolution the two effect conditions and the ceiling read, handed on to
+		// the post-hoc receipt check rather than re-resolved there — one resolution per
+		// call, so the decision and the check cannot disagree about what the effect was.
+		Effect:        effect,
 		CarriedLabels: carriedLabels,
 	}
 }

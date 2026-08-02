@@ -339,6 +339,40 @@ func TestTier2_ObserveReportsEveryChangeKind(t *testing.T) {
 	}
 }
 
+// TestTier2_MembershipFindingsReachTheOperatorLog pins the two ADVISORY findings end to
+// end through the real PDP path, not only at the SurfaceBaseline. They are gated on a
+// complete listing that is not the session's first, and for a long time nothing in
+// production could produce one — the session-start probe is always a session's first
+// observation, and no other caller marked completeness at all, so both kinds were dead.
+// The docs state an appearance or disappearance is logged; this is what makes that true.
+func TestTier2_MembershipFindingsReachTheOperatorLog(t *testing.T) {
+	var buf bytes.Buffer
+	prev := surfaceLog
+	surfaceLog = &buf
+	t.Cleanup(func() { surfaceLog = prev })
+
+	p := newTestManifestPDP(
+		capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}},
+		capability.Constraint{Target: "tool:write_file", Actions: []string{"call"}},
+	)
+	ctx := WithCompleteToolListing(WithSessionID(context.Background(), "s"))
+
+	// First complete listing: establishes membership, reports nothing.
+	p.FilterToolsList(ctx, tier2Catalog(t, tier2Tool("read_file", "Reads a file.")))
+	if buf.Len() != 0 {
+		t.Fatalf("the first complete listing establishes the baseline and must report nothing, got %q", buf.String())
+	}
+
+	// Second complete listing: write_file appeared, read_file disappeared.
+	p.FilterToolsList(ctx, tier2Catalog(t, tier2Tool("write_file", "Writes a file.")))
+	out := buf.String()
+	for _, want := range []string{`tool="write_file"`, "appeared after", `tool="read_file"`, "disappeared after"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("membership findings must be logged; missing %q in %q", want, out)
+		}
+	}
+}
+
 // TestTier2_LogLineNamesTheHonestLimit pins that the operator-facing break line states
 // the non-coverage rather than implying Tier-2 is a general anti-tamper guarantee. The
 // documentation carries the same caveat; the log line is where an operator actually reads

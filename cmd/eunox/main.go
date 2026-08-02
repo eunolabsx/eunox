@@ -99,6 +99,8 @@ func run(args []string) int {
 		return cmdAuditVerify(subArgs)
 	case "stats":
 		return cmdStats(subArgs)
+	case "contracts":
+		return cmdContracts(subArgs)
 	case "doctor":
 		return cmdDoctor(subArgs)
 	case "version", "--version", "-version":
@@ -134,6 +136,7 @@ Usage:
   eunox kill         [--port N | --redis-addr H:P] <session-id|all>
   eunox audit-verify [flags]
   eunox stats        [flags]
+  eunox contracts    [--dir <corpus-dir>] [--ref <contract-id>]
   eunox doctor       [flags]
   eunox version
 
@@ -150,6 +153,9 @@ Subcommands:
                   kill switch (the only channel for a stdio proxy).
   audit-verify    Verify HMAC signatures in the local audit log.
   stats           Print a denial count histogram from the audit log.
+  contracts       Verify a local effect-contract corpus (every declared digest recomputed
+                  from its content) and print the effect.ref pin an author copies into a
+                  manifest. Local only — the registry is never fetched.
   doctor          Print a user-initiated support bundle (redacted) for bug reports.
                   Nothing is uploaded — paste the output into your report manually.
   version         Print the binary version and exit.
@@ -1593,6 +1599,85 @@ func resolveOAuthMetadata(cfg *config.GatewayConfig, pf proxyFlags) (*transport.
 	}, transport.BuildOAuthMetadataURL(oauthResource), nil
 }
 
+// gatewayJWTLayer stands up the gateway's JWT layer from the flags: it validates the
+// JWT-adjacent flag combinations, emits the bypass warnings, and wraps every route's
+// manifest PDP in a pdp.JWTPDP sharing one JWKS validator (the per-route
+// JWT-intersect-manifest composition). It returns a nil PDP when --jwks-uri is unset,
+// which is the "no JWT mode" case the caller's later checks key on.
+//
+// It is a function rather than an inline block because the validation and warning arms
+// dominate serveHTTPGateway's branch count on their own, and every one of them answers the
+// same question: is this a JWT deployment, and is it configured safely. routes is mutated
+// in place by WrapRoutesWithJWT.
+func gatewayJWTLayer(routes map[string]*transport.UpstreamRoute, ks killswitch.Manager, pf proxyFlags) (*pdp.JWTPDP, error) { //nolint:gocritic // hugeParam: pf is a small flag bundle
+	if pf.jwksURI == "" {
+		return nil, nil
+	}
+	// Fail closed on audience pinning and on a plaintext JWKS endpoint before
+	// standing up the JWT PDP.
+	if err := validateJWTAudienceConfig(pf.jwksURI, pf.jwtAudience, pf.jwtAllowAnyAudience); err != nil {
+		return nil, err
+	}
+	if err := validateJWTIssuerConfig(pf.jwksURI, pf.jwtIssuer, pf.jwtAllowAnyIssuer); err != nil {
+		return nil, err
+	}
+	if err := validateJWKSURIScheme(pf.jwksURI, pf.jwksAllowInsecure); err != nil {
+		return nil, err
+	}
+	if w := jwtAudienceBypassWarning(pf.jwtAllowAnyAudience, pf.jwtAudience); w != "" {
+		fmt.Fprintf(os.Stderr, "[eunox] WARNING: %s\n", w)
+	}
+	// --jwt-allow-any-audience also voids per-route manifest 'audience' pins (the
+	// wrapper skips per-route narrowing when AllowAnyAudience is set). The generic
+	// bypass warning above names only the --jwt-audience flag, so call out the dead
+	// manifest pin explicitly — otherwise an operator who pinned a route's audience
+	// in its policy manifest has no signal that the pin no longer enforces.
+	if pf.jwtAllowAnyAudience {
+		if name, pinned := transport.FirstRouteAudiencePin(routes); pinned {
+			fmt.Fprintf(os.Stderr, "[eunox] WARNING: --jwt-allow-any-audience voids the manifest 'audience' pin on route %q; that route now accepts tokens for any audience. Remove --jwt-allow-any-audience to enforce the pin.\n", name)
+		}
+	}
+	if w := jwtIssuerBypassWarning(pf.jwtAllowAnyIssuer, pf.jwtIssuer); w != "" {
+		fmt.Fprintf(os.Stderr, "[eunox] WARNING: %s\n", w)
+	}
+	if w := jwtExperimentalCapsWarning(pf.jwtExperimentalCaps); w != "" {
+		fmt.Fprintf(os.Stderr, "[eunox] WARNING: %s\n", w)
+	}
+	// Describe what is actually enforced: the manifest intersection with
+	// mcp.capabilities runs only when the experimental flag is on. With it off,
+	// identity-only tokens are validated and a token carrying mcp.capabilities is
+	// rejected, so claiming "intersecting" unconditionally would mislead operators.
+	// Redact before printing: some IdPs gate the JWKS endpoint behind a query key or
+	// basic-auth userinfo, and this banner goes to the same stderr the systemd journal,
+	// container logs, and the doctor bundle collect. That is a log surface, so it takes
+	// the strict log-facing redactor (scheme://host only) the other banner and
+	// validation-error sites use; the JWKS URI — the root of trust for token
+	// verification — must not be the exception.
+	safeJWKS := capability.RedactURLForLog(pf.jwksURI)
+	if pf.jwtExperimentalCaps {
+		fmt.Fprintf(os.Stderr, "[eunox] JWT PDP enabled (JWKS URI: %s); intersecting per-route manifests with experimental mcp.capabilities claims\n", safeJWKS)
+	} else {
+		fmt.Fprintf(os.Stderr, "[eunox] JWT PDP enabled (JWKS URI: %s); enforcing per-route manifests (experimental mcp.capabilities intersection disabled; pass --jwt-experimental-capabilities to enable)\n", safeJWKS)
+	}
+	gwJWTPDP, err := transport.WrapRoutesWithJWT(routes, pdp.JWTPDPOptions{
+		JWKSURI:                  pf.jwksURI,
+		Issuer:                   pf.jwtIssuer,
+		Audience:                 pf.jwtAudience,
+		AllowAnyAudience:         pf.jwtAllowAnyAudience,
+		AllowAnyIssuer:           pf.jwtAllowAnyIssuer,
+		Leeway:                   jwtLeewayOption(pf.jwtLeeway),
+		KillSwitch:               ks,
+		ExperimentalCapabilities: pf.jwtExperimentalCaps,
+		// Client enforces the scheme policy on redirects too, so an https
+		// JWKS endpoint cannot 302 the key fetch onto plaintext remote http.
+		Client: newJWKSHTTPClient(pf.jwksAllowInsecure),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return gwJWTPDP, nil
+}
+
 // serveHTTPGateway serves cfg's upstreams over an HTTP listener, one /mcp/<name>
 // route each (the gateway shape).
 func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audit.Sink, counter capability.CallCounter, flowStore capability.FlowLabelStore, ks killswitch.Manager, pf proxyFlags, onServeReady func(context.Context)) error { //nolint:gocritic // hugeParam: pf is a small flag bundle
@@ -1603,7 +1688,7 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 		return err
 	}
 
-	warnNoRedisSharedState(pf.redisConfigured, transport.AnyRouteHasMaxCalls(routes) || transport.AnyRouteHasSequenceBlock(routes) || transport.AnyRouteHasFlowLabel(routes))
+	warnNoRedisSharedState(pf.redisConfigured, transport.AnyRouteHasMaxCalls(routes) || transport.AnyRouteHasBlastRadiusVelocity(routes) || transport.AnyRouteHasSequenceBlock(routes) || transport.AnyRouteHasFlowLabel(routes))
 
 	bind := cfg.Listen.Bind
 	if bind == "" {
@@ -1653,70 +1738,9 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 
 	// Per-route JWT∩manifest intersection: wrap each route's PDP in a pdp.JWTPDP
 	// whose Inner is that route's manifest PDP, sharing one JWKS validator.
-	var gwJWTPDP *pdp.JWTPDP
-	if pf.jwksURI != "" {
-		// Fail closed on audience pinning and on a plaintext JWKS endpoint before
-		// standing up the JWT PDP.
-		if err := validateJWTAudienceConfig(pf.jwksURI, pf.jwtAudience, pf.jwtAllowAnyAudience); err != nil {
-			return err
-		}
-		if err := validateJWTIssuerConfig(pf.jwksURI, pf.jwtIssuer, pf.jwtAllowAnyIssuer); err != nil {
-			return err
-		}
-		if err := validateJWKSURIScheme(pf.jwksURI, pf.jwksAllowInsecure); err != nil {
-			return err
-		}
-		if w := jwtAudienceBypassWarning(pf.jwtAllowAnyAudience, pf.jwtAudience); w != "" {
-			fmt.Fprintf(os.Stderr, "[eunox] WARNING: %s\n", w)
-		}
-		// --jwt-allow-any-audience also voids per-route manifest 'audience' pins (the
-		// wrapper skips per-route narrowing when AllowAnyAudience is set). The generic
-		// bypass warning above names only the --jwt-audience flag, so call out the dead
-		// manifest pin explicitly — otherwise an operator who pinned a route's audience
-		// in its policy manifest has no signal that the pin no longer enforces.
-		if pf.jwtAllowAnyAudience {
-			if name, pinned := transport.FirstRouteAudiencePin(routes); pinned {
-				fmt.Fprintf(os.Stderr, "[eunox] WARNING: --jwt-allow-any-audience voids the manifest 'audience' pin on route %q; that route now accepts tokens for any audience. Remove --jwt-allow-any-audience to enforce the pin.\n", name)
-			}
-		}
-		if w := jwtIssuerBypassWarning(pf.jwtAllowAnyIssuer, pf.jwtIssuer); w != "" {
-			fmt.Fprintf(os.Stderr, "[eunox] WARNING: %s\n", w)
-		}
-		if w := jwtExperimentalCapsWarning(pf.jwtExperimentalCaps); w != "" {
-			fmt.Fprintf(os.Stderr, "[eunox] WARNING: %s\n", w)
-		}
-		// Describe what is actually enforced: the manifest intersection with
-		// mcp.capabilities runs only when the experimental flag is on. With it off,
-		// identity-only tokens are validated and a token carrying mcp.capabilities is
-		// rejected, so claiming "intersecting" unconditionally would mislead operators.
-		// Redact before printing: some IdPs gate the JWKS endpoint behind a query key or
-		// basic-auth userinfo, and this banner goes to the same stderr the systemd journal,
-		// container logs, and the doctor bundle collect. That is a log surface, so it takes
-		// the strict log-facing redactor (scheme://host only) the other banner and
-		// validation-error sites use; the JWKS URI — the root of trust for token
-		// verification — must not be the exception.
-		safeJWKS := capability.RedactURLForLog(pf.jwksURI)
-		if pf.jwtExperimentalCaps {
-			fmt.Fprintf(os.Stderr, "[eunox] JWT PDP enabled (JWKS URI: %s); intersecting per-route manifests with experimental mcp.capabilities claims\n", safeJWKS)
-		} else {
-			fmt.Fprintf(os.Stderr, "[eunox] JWT PDP enabled (JWKS URI: %s); enforcing per-route manifests (experimental mcp.capabilities intersection disabled; pass --jwt-experimental-capabilities to enable)\n", safeJWKS)
-		}
-		gwJWTPDP, err = transport.WrapRoutesWithJWT(routes, pdp.JWTPDPOptions{
-			JWKSURI:                  pf.jwksURI,
-			Issuer:                   pf.jwtIssuer,
-			Audience:                 pf.jwtAudience,
-			AllowAnyAudience:         pf.jwtAllowAnyAudience,
-			AllowAnyIssuer:           pf.jwtAllowAnyIssuer,
-			Leeway:                   jwtLeewayOption(pf.jwtLeeway),
-			KillSwitch:               ks,
-			ExperimentalCapabilities: pf.jwtExperimentalCaps,
-			// Client enforces the scheme policy on redirects too, so an https
-			// JWKS endpoint cannot 302 the key fetch onto plaintext remote http.
-			Client: newJWKSHTTPClient(pf.jwksAllowInsecure),
-		})
-		if err != nil {
-			return err
-		}
+	gwJWTPDP, err := gatewayJWTLayer(routes, ks, pf)
+	if err != nil {
+		return err
 	}
 
 	// listen.authToken and --jwks-uri are mutually exclusive: the static token
@@ -1866,7 +1890,17 @@ func serveStdioHost(ctx context.Context, cfg *config.GatewayConfig, sink *audit.
 
 	upstreamTimeMs := transport.ResolveUpstreamTimeout(pf.upstreamTimeoutMs, cfg.Defaults.UpstreamTimeoutMs)
 
-	warnNoRedisSharedState(pf.redisConfigured, manifest.HasMaxCalls() || manifest.HasSequenceBlock() || manifest.HasFlowLabel())
+	warnNoRedisSharedState(pf.redisConfigured, manifest.HasMaxCalls() || manifest.HasBlastRadiusVelocity() || manifest.HasSequenceBlock() || manifest.HasFlowLabel())
+
+	// This upstream's own receipt-signing key domain, from the same local-file loader the
+	// gateway routes use. Absent (the default) leaves the verifier nil and the whole
+	// surface disabled; a configured-but-unreadable key set is fatal, since an operator
+	// who wired one asked for the check and a path typo that degraded to "no receipt ever
+	// verifies" is indistinguishable from a server that stopped signing.
+	receipts, err := transport.LoadEffectReceiptVerifier(cfg.BaseDir, u.EffectReceiptKeys)
+	if err != nil {
+		return fmt.Errorf("upstream %q: %w", u.Name, err)
+	}
 
 	proxy := transport.NewStdioProxy(transport.StdioProxyOptions{
 		Command:               u.Command,
@@ -1891,7 +1925,10 @@ func serveStdioHost(ctx context.Context, cfg *config.GatewayConfig, sink *audit.
 		// Admit the client-supplied attribution interface only under the draft
 		// schemaVersion that contains it; a published-grammar policy ignores the block.
 		HonorAttribution: manifest.HonorsAttributionInterface(),
-		DriftCheck:       drift.MakeDriftCheck(manifest, strictDrift),
+		// The signed effect receipts this upstream publishes, verified against its own key
+		// domain — never the caller IdP's. nil when unconfigured, which disables the surface.
+		EffectReceipts: receipts,
+		DriftCheck:     drift.MakeDriftCheck(manifest, strictDrift),
 		// The stdio host has no bind step, so the transport fires the ready hook itself,
 		// from inside Start once the session is live. Calling it here instead would put it
 		// ahead of Start's own fallible steps — spawning the upstream, the initialize
@@ -2078,6 +2115,12 @@ Flags:
 		return 2
 	}
 
+	// Effect-contract coverage of the MERGED policy, which is what actually decides:
+	// annotating is what buys a capability out of maximum friction, so the ratio (and the
+	// names) is the operator's progress meter. Advisory — it never affects the exit code,
+	// since an unannotated capability is a conservative default, not a defect.
+	writeEffectCoverage(os.Stdout, "", merged, true)
+
 	if !*live {
 		return 0
 	}
@@ -2164,7 +2207,24 @@ func reportRouteOutcome(wf func(string, ...interface{}), wln func(...interface{}
 		wf("  FAIL  %v\n", outcome.StartupErr)
 		return 2, true
 	}
+	// Advisory, and never part of the exit code: an unannotated capability is the
+	// fail-closed default working as intended, not a config defect. Per route, because
+	// the ceiling and the capabilities it governs are both per route.
+	writeEffectCoverage(routeCoverageWriter{wf}, "  ", outcome.Merged, true)
 	return 0, false
+}
+
+// routeCoverageWriter adapts the (wf, wln) pair reportRouteOutcome is handed to the
+// io.Writer writeEffectCoverage takes, so the per-route and whole-manifest reports are
+// produced by ONE function rather than two that drift. reportRouteOutcome receives write
+// closures rather than the writer itself, which is why the adapter is needed at all.
+type routeCoverageWriter struct {
+	wf func(string, ...interface{})
+}
+
+func (w routeCoverageWriter) Write(p []byte) (int, error) {
+	w.wf("%s", p)
+	return len(p), nil
 }
 
 // validateConfigRoutes walks every upstream in cfg, validating each route's

@@ -318,8 +318,13 @@ func mineArgs(t *observedTarget, details map[string]interface{}, auditOnly bool,
 	}
 	realArgCount := len(args)
 	if skipReserved {
-		if _, hasReserved := args[audit.UpstreamErrorCodeKey]; hasReserved {
-			realArgCount--
+		// Every key eunox injects, not just the upstream-error code: the effect-receipt
+		// verdict rides here too, and a miner keyed on one literal would draft an
+		// allowedValues condition on a phantom argument that denies every real call.
+		for name := range args {
+			if audit.IsReservedDetailKey(name) {
+				realArgCount--
+			}
 		}
 	}
 	if realArgCount == 0 {
@@ -338,7 +343,7 @@ func mineArgs(t *observedTarget, details map[string]interface{}, auditOnly bool,
 	// optional-argument check.
 	t.nonTruncatedAllow++
 	for name, raw := range args {
-		if skipReserved && name == audit.UpstreamErrorCodeKey {
+		if skipReserved && audit.IsReservedDetailKey(name) {
 			continue
 		}
 		a := t.args[name]

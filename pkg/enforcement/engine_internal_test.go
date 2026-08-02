@@ -114,9 +114,9 @@ func TestCompositeCounterKey_PrefixPreserved(t *testing.T) {
 	}
 }
 
-// keyCapturingCounter records the key and window handleMaxCalls passes to the
-// rate limiter. Peek/PeekRetryAfter are stubs: handleMaxCalls' commit path uses
-// only IncrementIfBelow, which is what this test inspects.
+// keyCapturingCounter records the bucket the maxCalls handler hands the rate limiter.
+// Peek/IncrementIfBelow are stubs: the commit path is AdmitAll, which is what this
+// test inspects.
 type keyCapturingCounter struct {
 	gotKey       string
 	gotWindowSec int
@@ -126,9 +126,7 @@ func (c *keyCapturingCounter) IncrementAndGet(_ context.Context, _ string, _, _ 
 	return 1, nil
 }
 
-func (c *keyCapturingCounter) IncrementIfBelow(_ context.Context, key string, windowSec int, _ int64) (count int64, admitted bool, retryAfter time.Duration, err error) {
-	c.gotKey = key
-	c.gotWindowSec = windowSec
+func (c *keyCapturingCounter) IncrementIfBelow(_ context.Context, _ string, _ int, _ int64) (count int64, admitted bool, retryAfter time.Duration, err error) {
 	return 1, true, 0, nil
 }
 
@@ -136,7 +134,11 @@ func (c *keyCapturingCounter) Peek(_ context.Context, _ string, _ int) (int64, e
 	return 0, nil
 }
 
-func (c *keyCapturingCounter) IncrementIfAllBelow(_ context.Context, _ []string, _ []int, _ []int64) (admitted bool, deniedIndex int, count int64, retryAfter time.Duration, err error) {
+func (c *keyCapturingCounter) AdmitAll(_ context.Context, buckets []capability.QuotaBucket) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error) {
+	if len(buckets) > 0 {
+		c.gotKey = buckets[0].Key
+		c.gotWindowSec = buckets[0].WindowSec
+	}
 	return true, 0, 0, 0, nil
 }
 
@@ -173,7 +175,7 @@ type recordingCommittingHandler struct {
 }
 
 func (h *recordingCommittingHandler) Handle(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) *ConditionError {
-	return h.e.handleMaxCalls(ctx, cond, req)
+	return h.e.prepareAndAdmit(ctx, h, cond, req)
 }
 
 func (h *recordingCommittingHandler) PrepareCommit(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (DeferredCommit, bool, *ConditionError) {
@@ -186,11 +188,14 @@ func (h *recordingCommittingHandler) PrepareCommit(ctx context.Context, cond cap
 		return DeferredCommit{}, false, condErr
 	}
 	return DeferredCommit{
-		Key:        key,
-		WindowSecs: mc.WindowSeconds,
-		Limit:      int64(mc.Count),
-		Deny: func(count int64, retryAfter time.Duration) *ConditionError {
-			return maxCallsRateLimited(mc, count, retryAfterSeconds(retryAfter, mc.WindowSeconds))
+		Bucket: capability.QuotaBucket{
+			Key:       key,
+			WindowSec: mc.WindowSeconds,
+			Counted:   true,
+			Limit:     float64(mc.Count),
+		},
+		Deny: func(total float64, retryAfter time.Duration) *ConditionError {
+			return maxCallsRateLimited(mc, int64(total), retryAfterSeconds(retryAfter, mc.WindowSeconds))
 		},
 	}, false, nil
 }
@@ -199,7 +204,7 @@ func (h *recordingCommittingHandler) PrepareCommit(ctx context.Context, cond cap
 // carrying more than one deferred condition commits through the registered
 // CommittingConditionHandler, so a custom WithConditionHandler for maxCalls is honored
 // on the multi-deferred path exactly as on the single-condition path — not bypassed by
-// a hardcoded maxCalls type switch. Before the fix commitDeferredAtomic called the
+// a hardcoded maxCalls type switch. Before the fix the atomic commit called the
 // built-in maxCallsBucket directly and this custom handler's PrepareCommit was never
 // invoked.
 func TestCommitDeferredAtomic_DispatchesThroughRegistry(t *testing.T) {
@@ -216,7 +221,7 @@ func TestCommitDeferredAtomic_DispatchesThroughRegistry(t *testing.T) {
 		Target:  "tool",
 		Actions: []string{"*"},
 		// Two maxCalls with DISTINCT windows: forces the multi-deferred atomic-commit path
-		// (validateMaxCallsWindowsDistinct requires the windows differ).
+		// (validateQuotaBucketsDistinct requires the windows differ).
 		Conditions: []capability.Condition{
 			&capability.MaxCallsCondition{Count: 5, WindowSeconds: 60},
 			&capability.MaxCallsCondition{Count: 3, WindowSeconds: 3600},
@@ -236,11 +241,11 @@ func TestCommitDeferredAtomic_DispatchesThroughRegistry(t *testing.T) {
 // for its OWN reason (never from ctx/SkipQuota), violating the contract that skip must
 // be uniform across the constraint. On the multi-deferred path this would fail OPEN —
 // one bucket's skip shortcuts the whole set to allow without limit-checking the rest —
-// so commitDeferredAtomic must instead fail closed.
+// so the atomic commit must instead fail closed.
 type nonUniformSkipHandler struct{ e *Engine }
 
 func (h nonUniformSkipHandler) Handle(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) *ConditionError {
-	return h.e.handleMaxCalls(ctx, cond, req)
+	return h.e.prepareAndAdmit(ctx, h, cond, req)
 }
 
 func (h nonUniformSkipHandler) PrepareCommit(_ context.Context, _ capability.Condition, _ *capability.EnforceRequest) (DeferredCommit, bool, *ConditionError) {
@@ -282,7 +287,7 @@ func TestCommitDeferredAtomic_NonUniformSkipFailsClosed(t *testing.T) {
 
 // nilDenyHandler is a custom CommittingConditionHandler whose PrepareCommit
 // derives a real bucket (Key/WindowSecs/Limit) via the built-in maxCallsBucket
-// but deliberately leaves Deny nil — a handler bug commitDeferredAtomic must not
+// but deliberately leaves Deny nil — a handler bug the atomic commit must not
 // let panic the enforcement goroutine when that bucket is the one the call
 // counter denies. Pointer receiver so the copy held in the registry and the
 // test's reference share the same engine pointer (mirrors
@@ -290,7 +295,7 @@ func TestCommitDeferredAtomic_NonUniformSkipFailsClosed(t *testing.T) {
 type nilDenyHandler struct{ e *Engine }
 
 func (h *nilDenyHandler) Handle(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) *ConditionError {
-	return h.e.handleMaxCalls(ctx, cond, req)
+	return h.e.prepareAndAdmit(ctx, h, cond, req)
 }
 
 func (h *nilDenyHandler) PrepareCommit(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (DeferredCommit, bool, *ConditionError) {
@@ -302,16 +307,19 @@ func (h *nilDenyHandler) PrepareCommit(ctx context.Context, cond capability.Cond
 		return DeferredCommit{}, false, condErr
 	}
 	return DeferredCommit{
-		Key:        key,
-		WindowSecs: mc.WindowSeconds,
-		Limit:      int64(mc.Count),
+		Bucket: capability.QuotaBucket{
+			Key:       key,
+			WindowSec: mc.WindowSeconds,
+			Counted:   true,
+			Limit:     float64(mc.Count),
+		},
 		// Deny deliberately left nil: the handler bug under test.
 	}, false, nil
 }
 
 // forceDenyAtIndexZeroCounter is a minimal CallCounter fake whose
-// IncrementIfAllBelow always denies bucket 0, deterministically driving
-// commitDeferredAtomic to invoke denies[0] regardless of the built-in InMemory
+// AdmitAll always denies bucket 0, deterministically driving
+// commitDeferredConditions to invoke denies[0] regardless of the built-in InMemory
 // counter's real quota semantics.
 type forceDenyAtIndexZeroCounter struct{}
 
@@ -324,7 +332,7 @@ func (forceDenyAtIndexZeroCounter) Peek(_ context.Context, _ string, _ int) (int
 func (forceDenyAtIndexZeroCounter) IncrementIfBelow(_ context.Context, _ string, _ int, _ int64) (count int64, admitted bool, retryAfter time.Duration, err error) {
 	return 0, true, 0, nil
 }
-func (forceDenyAtIndexZeroCounter) IncrementIfAllBelow(_ context.Context, _ []string, _ []int, _ []int64) (admitted bool, deniedIndex int, count int64, retryAfter time.Duration, err error) {
+func (forceDenyAtIndexZeroCounter) AdmitAll(_ context.Context, _ []capability.QuotaBucket) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error) {
 	return false, 0, 5, 0, nil
 }
 
@@ -360,14 +368,14 @@ func TestCommitDeferredAtomic_NilDenyCallbackFailsClosed(t *testing.T) {
 // nilCounterCommitHandler is a custom CommittingConditionHandler whose
 // PrepareCommit returns a complete DeferredCommit WITHOUT consulting the engine's
 // call counter — unlike the built-in maxCallsBucket, which fails closed on a nil
-// counter before commitDeferredAtomic ever reaches the backend. It models a library
+// counter before the atomic commit ever reaches the backend. It models a library
 // consumer that registers a committing handler on an engine built without
 // WithCallCounter, so the atomic multi-deferred commit path reaches its backend call
 // with e.counter still nil.
 type nilCounterCommitHandler struct{ e *Engine }
 
 func (h *nilCounterCommitHandler) Handle(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) *ConditionError {
-	return h.e.handleMaxCalls(ctx, cond, req)
+	return h.e.prepareAndAdmit(ctx, h, cond, req)
 }
 
 func (h *nilCounterCommitHandler) PrepareCommit(_ context.Context, cond capability.Condition, _ *capability.EnforceRequest) (DeferredCommit, bool, *ConditionError) {
@@ -376,10 +384,13 @@ func (h *nilCounterCommitHandler) PrepareCommit(_ context.Context, cond capabili
 		return DeferredCommit{}, false, condErr
 	}
 	return DeferredCommit{
-		Key:        "nil-counter-bucket",
-		WindowSecs: mc.WindowSeconds,
-		Limit:      int64(mc.Count),
-		Deny: func(int64, time.Duration) *ConditionError {
+		Bucket: capability.QuotaBucket{
+			Key:       "nil-counter-bucket",
+			WindowSec: mc.WindowSeconds,
+			Counted:   true,
+			Limit:     float64(mc.Count),
+		},
+		Deny: func(float64, time.Duration) *ConditionError {
 			return &ConditionError{Code: capability.ErrCodeConditionFailed, ConditionType: capability.ConditionTypeMaxCalls, Message: "over limit"}
 		},
 	}, false, nil
@@ -403,7 +414,7 @@ func TestCommitDeferredAtomic_NilCounterFailsClosed(t *testing.T) {
 		Target:  "tool",
 		Actions: []string{"*"},
 		// Two committing conditions with DISTINCT windows force the multi-deferred
-		// atomic-commit path (commitDeferredAtomic) rather than the single-condition leg.
+		// atomic-commit path (commitDeferredConditions) rather than the direct handler leg.
 		Conditions: []capability.Condition{
 			&capability.MaxCallsCondition{Count: 5, WindowSeconds: 60},
 			&capability.MaxCallsCondition{Count: 3, WindowSeconds: 3600},
@@ -442,10 +453,13 @@ func (sentinelCommitHandler) PrepareCommit(ctx context.Context, cond capability.
 		return DeferredCommit{}, false, condErr
 	}
 	commit := DeferredCommit{
-		Key:        "sentinel-bucket",
-		WindowSecs: mc.WindowSeconds,
-		Limit:      int64(mc.Count),
-		Deny: func(int64, time.Duration) *ConditionError {
+		Bucket: capability.QuotaBucket{
+			Key:       "sentinel-bucket",
+			WindowSec: mc.WindowSeconds,
+			Counted:   true,
+			Limit:     float64(mc.Count),
+		},
+		Deny: func(float64, time.Duration) *ConditionError {
 			return &ConditionError{Code: capability.ErrCodeConditionFailed, ConditionType: capability.ConditionTypeMaxCalls, Message: "over limit"}
 		},
 	}
@@ -686,7 +700,7 @@ func (c *recordFaultCounter) IncrementIfBelow(_ context.Context, _ string, _ int
 	return 1, true, 0, nil // admit: maxCalls passes and commits a slot
 }
 func (c *recordFaultCounter) Peek(_ context.Context, _ string, _ int) (int64, error) { return 0, nil }
-func (c *recordFaultCounter) IncrementIfAllBelow(_ context.Context, _ []string, _ []int, _ []int64) (admitted bool, deniedIndex int, count int64, retryAfter time.Duration, err error) {
+func (c *recordFaultCounter) AdmitAll(_ context.Context, _ []capability.QuotaBucket) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error) {
 	return true, 0, 0, 0, nil
 }
 
@@ -731,7 +745,7 @@ func TestRecordSessionCall_NoSequenceBlock_NoQuotaBurnOnRecordFault(t *testing.T
 	}
 }
 
-func TestHandleMaxCalls_LogicalKeyExcludesWindow(t *testing.T) {
+func TestMaxCalls_LogicalKeyExcludesWindow(t *testing.T) {
 	counter := &keyCapturingCounter{}
 	e := New(WithCallCounter(counter))
 
@@ -1190,4 +1204,25 @@ func TestExactRat_BoundsTheParse(t *testing.T) {
 			}
 		})
 	}
+}
+
+// AddIfTotalBelow satisfies the weighted half of capability.CallCounter. This double
+// exercises the counting paths only, so a weighted add admits without recording: nothing
+// under test reads a weighted total from it.
+func (*keyCapturingCounter) AddIfTotalBelow(_ context.Context, _ string, _ int, weight, _ float64) (total float64, admitted bool, retryAfter time.Duration, err error) {
+	return weight, true, 0, nil
+}
+
+// AddIfTotalBelow satisfies the weighted half of capability.CallCounter. This double
+// exercises the counting paths only, so a weighted add admits without recording: nothing
+// under test reads a weighted total from it.
+func (*recordFaultCounter) AddIfTotalBelow(_ context.Context, _ string, _ int, weight, _ float64) (total float64, admitted bool, retryAfter time.Duration, err error) {
+	return weight, true, 0, nil
+}
+
+// AddIfTotalBelow satisfies the weighted half of capability.CallCounter. This double
+// exercises the counting paths only, so a weighted add admits without recording: nothing
+// under test reads a weighted total from it.
+func (forceDenyAtIndexZeroCounter) AddIfTotalBelow(_ context.Context, _ string, _ int, weight, _ float64) (total float64, admitted bool, retryAfter time.Duration, err error) {
+	return weight, true, 0, nil
 }

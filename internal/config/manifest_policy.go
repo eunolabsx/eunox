@@ -61,6 +61,25 @@ func (m *LocalManifest) HasMaxCalls() bool {
 	})
 }
 
+// HasBlastRadiusVelocity reports whether any capability entry carries a CUMULATIVE
+// blastRadius bound. Such a bound consumes a sliding-window budget exactly as maxCalls
+// consumes a slot, so it is per-process state under the in-memory counter — and the
+// operator advisory about running several replicas without a shared Redis has to know
+// about it, or a $2,000-an-hour ceiling is silently enforced as $6,000 across three
+// replicas with no notice printed. The per-call `max` bound consumes nothing and does not
+// count.
+func (m *LocalManifest) HasBlastRadiusVelocity() bool {
+	return m.anyCondition(func(cond capability.Condition) bool {
+		switch v := cond.(type) {
+		case capability.BlastRadiusCondition:
+			return v.HasVelocity()
+		case *capability.BlastRadiusCondition:
+			return v.HasVelocity()
+		}
+		return false
+	})
+}
+
 // HasSequenceBlock reports whether any capability entry carries a sequenceBlock
 // condition. The engine records a per-call antecedent marker only so a later
 // sequenceBlock can read it; when no entry uses sequenceBlock the marker is never

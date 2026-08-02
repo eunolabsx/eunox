@@ -6,9 +6,11 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"reflect"
 	"strings"
 
+	"github.com/eunolabs/eunox/pkg/callcounter"
 	"github.com/eunolabs/eunox/pkg/capability"
 )
 
@@ -38,13 +40,72 @@ func validateEffectClass(i, j int, allow []string) error {
 	return nil
 }
 
-// validateBlastRadius checks a blastRadius condition: a present, well-formed,
-// non-negative per-call bound.
+// validateBlastRadius checks a blastRadius condition: well-formed, non-negative bounds,
+// at least one of them present, and a cumulative bound whose two halves are both set.
 func validateBlastRadius(i, j int, c *capability.BlastRadiusCondition) error {
-	if c.Max == nil {
-		return fmt.Errorf("capability at index %d, condition %d: blastRadius requires 'max', the largest magnitude one call may have; a condition with no bound bounds nothing", i, j)
+	// The pair rule, checked FIRST so a half-written velocity bound is reported as the
+	// pairing mistake it is rather than as a missing 'max'. Half the pair silently
+	// disables the other half — a `maxTotal` with no window has no window to sum over, and
+	// a `windowSeconds` with no total bounds nothing — and an authored bound that bounded
+	// nothing is worse than its absence, because the operator would believe a limit was in
+	// force.
+	switch {
+	case c.MaxTotal != nil && c.WindowSeconds == 0:
+		return fmt.Errorf("capability at index %d, condition %d: blastRadius 'maxTotal' requires 'windowSeconds', the sliding window it is summed over; a total with no window bounds nothing", i, j)
+	case c.MaxTotal == nil && c.WindowSeconds != 0:
+		return fmt.Errorf("capability at index %d, condition %d: blastRadius 'windowSeconds' requires 'maxTotal', the summed magnitude it bounds; a window with no total bounds nothing", i, j)
 	}
-	return validateBlastRadiusNumber(i, j, "max", c.Max)
+	if c.Max == nil && c.MaxTotal == nil {
+		return fmt.Errorf("capability at index %d, condition %d: blastRadius requires 'max' (the largest magnitude one call may have) or 'maxTotal' with 'windowSeconds' (the largest summed magnitude within a window), or both; a condition with no bound bounds nothing", i, j)
+	}
+	if err := validateBlastRadiusNumber(i, j, "max", c.Max); err != nil {
+		return err
+	}
+	if err := validateBlastRadiusNumber(i, j, "maxTotal", c.MaxTotal); err != nil {
+		return err
+	}
+	if c.MaxTotal != nil {
+		if err := validateBlastRadiusTotalRange(i, j, c.MaxTotal); err != nil {
+			return err
+		}
+		if c.WindowSeconds < 1 {
+			return fmt.Errorf("capability at index %d, condition %d: blastRadius 'windowSeconds' must be >= 1, got %d", i, j, c.WindowSeconds)
+		}
+		if int64(c.WindowSeconds) > callcounter.MaxWindowSeconds {
+			return fmt.Errorf("capability at index %d, condition %d: blastRadius 'windowSeconds' %d exceeds the maximum %d seconds", i, j, c.WindowSeconds, callcounter.MaxWindowSeconds)
+		}
+	}
+	return nil
+}
+
+// validateBlastRadiusTotalRange rejects a cumulative bound the counter backends cannot
+// represent exactly. Above MaxWeightedTotal the Redis backend's float64 arithmetic would
+// silently round the threshold to one the operator never authored — so the bound is
+// refused at load rather than enforced approximately at a magnitude where the rounding
+// alone could be thousands.
+//
+// It is separate from validateBlastRadiusNumber because the PER-CALL bound has no such
+// limit: it is compared exactly, in arbitrary precision, and never summed.
+func validateBlastRadiusTotalRange(i, j int, n *json.Number) error {
+	v, ok := capability.ParseBlastRadiusNumber(*n)
+	if !ok {
+		// Already reported by validateBlastRadiusNumber; nothing to add.
+		return nil
+	}
+	// Compare the arbitrary-precision value, NOT its float64 narrowing. Rounding first let
+	// 2^53+1 pass — it narrows to exactly 2^53 — so a bound one unit above the
+	// representable maximum loaded clean and was then enforced as a threshold the operator
+	// never authored, which is the failure this check exists to prevent.
+	if v.Cmp(new(big.Float).SetFloat64(callcounter.MaxWeightedTotal)) > 0 {
+		return fmt.Errorf("capability at index %d, condition %d: blastRadius 'maxTotal' must be <= %v (the largest total both counter backends sum exactly), got %q", i, j, callcounter.MaxWeightedTotal, n.String())
+	}
+	if v.Sign() <= 0 {
+		// Zero admits nothing with a positive magnitude and would deny every quantified
+		// call in the window — a limit that looks generous and refuses everything, the same
+		// trap validateBlastRadiusNumber rejects a negative bound for.
+		return fmt.Errorf("capability at index %d, condition %d: blastRadius 'maxTotal' must be > 0, got %q; a zero total admits no quantified call at all", i, j, n.String())
+	}
+	return nil
 }
 
 // validateBlastRadiusNumber checks one bound: a parseable, non-negative number. A
@@ -208,7 +269,7 @@ func (m *LocalManifest) HasEffectCeiling() bool {
 }
 
 // EffectAnnotatedCount reports how many capabilities carry an effect contract, for the
-// `stats`/`doctor` operator reports: under a ceiling, an unannotated capability is one
+// `validate`/`doctor` operator reports: under a ceiling, an unannotated capability is one
 // that will escalate, so the ratio is the operator's progress meter on the registry
 // flywheel.
 func (m *LocalManifest) EffectAnnotatedCount() int {
@@ -222,4 +283,33 @@ func (m *LocalManifest) EffectAnnotatedCount() int {
 		}
 	}
 	return n
+}
+
+// EffectUnannotatedTargets names the capabilities carrying NO effect contract, in
+// manifest order, deduplicated.
+//
+// The count alone is a progress meter; this is the worklist. Under an effectCeiling each
+// of these resolves to the fail-closed default (irreversible, unquantified) and therefore
+// escalates, so an operator asking "why is everything hitting the approval queue" needs the
+// names, not a ratio. Order is the manifest's own so the list reads against the file the
+// operator is about to edit; duplicates are dropped because two entries for one target
+// (different principals, different conditions) are one annotation job.
+func (m *LocalManifest) EffectUnannotatedTargets() []string {
+	if m == nil {
+		return nil
+	}
+	var out []string
+	seen := make(map[string]struct{}, len(m.Capabilities))
+	for i := range m.Capabilities {
+		if m.Capabilities[i].Effect != nil {
+			continue
+		}
+		t := m.Capabilities[i].Target
+		if _, dup := seen[t]; dup {
+			continue
+		}
+		seen[t] = struct{}{}
+		out = append(out, t)
+	}
+	return out
 }

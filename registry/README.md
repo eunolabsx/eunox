@@ -39,9 +39,14 @@ What the corpus gives you:
 
 What it does not give you: any claim that a server behaves as its contract says. A
 divergence between a contract and observed behavior is a **community-advisory signal**, not
-a detection result. The runtime counterpart to this — a server *attesting* what it actually
-did, which eunox verifies for signature and consistency — is the effect-receipt surface,
-and it too verifies attestations rather than watching servers.
+a detection result. The runtime counterpart to this is the **effect-receipt** surface — a
+server *attesting*, in a tool result's `_meta`, what it actually did, which eunox verifies
+for signature (against that upstream's own key domain, configured per upstream and never
+the caller's IdP) and for consistency with the contract the decision used. It too verifies
+attestations rather than watching servers, and an unverifiable receipt earns nothing. The
+two halves of the same trust story: reviewable, pinnable, attributable *declarations* here;
+what the server says it did at runtime there. See
+[`docs/effect-contracts.md`](../docs/effect-contracts.md).
 
 ## How it is used — authoring time, never the decision path
 
@@ -50,11 +55,27 @@ so a registry outage cannot change a verdict.
 
 The flow is:
 
-1. Find the entry for a tool you are writing policy for.
+1. Find the entry for a tool you are writing policy for — `eunox contracts` lists the
+   corpus, verifying every entry's digest against its own content as it goes.
 2. Copy its `effect` block into the capability, and set `effect.ref` to the entry's
-   `"<id>@<digest>"`.
+   `"<id>@<digest>"`. `eunox contracts --ref <id>` prints exactly that string, so the pin
+   is copied rather than hand-computed.
 3. eunox verifies the pin **locally at manifest load** by recomputing the digest of the
    inline block. A mismatch is a load error.
+
+```console
+$ eunox contracts --ref modelcontextprotocol/memory.delete_entities
+modelcontextprotocol/memory.delete_entities@sha256:3722a7d51f956e37275c957bb15295491ccdbffe5897bebadc309028ad125b67
+```
+
+Both are **local**: the digest is over the contract's own content, so verifying a corpus
+someone handed you and pinning an entry from it both work offline. `--dir` points at any
+corpus directory; nothing searches, and a path that does not exist is an error rather than
+a clean bill of health for an empty result.
+
+To see how much of a policy is annotated, `eunox validate` (and `eunox doctor`) report the
+ratio and name what is missing — under an `effectCeiling` those are exactly the capabilities
+that will escalate.
 
 ```yaml
 capabilities:

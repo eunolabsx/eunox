@@ -334,6 +334,8 @@ func TestEffectConditionsRoundtripThroughTheWrapper(t *testing.T) {
 	for _, cond := range []Condition{
 		EffectClassCondition{Allow: []string{EffectReversible, EffectCompensable}},
 		BlastRadiusCondition{Max: num("500")},
+		BlastRadiusCondition{MaxTotal: num("2000"), WindowSeconds: 3600},
+		BlastRadiusCondition{Max: num("500"), MaxTotal: num("2000"), WindowSeconds: 3600},
 	} {
 		b, err := json.Marshal(ConditionWrapper{Condition: cond})
 		if err != nil {
@@ -746,5 +748,33 @@ func TestResolvedEffectQuantifiedTracksTheBlastRadius(t *testing.T) {
 	var nilEff *ResolvedEffect
 	if nilEff.Quantified() {
 		t.Error("a nil effect must read as unquantified, not quantified")
+	}
+}
+
+// TestBlastRadiusHasVelocity pins the predicate the engine keys DEFERRAL on and the loader
+// keys its one-committing-condition rule on. Both halves are required because either alone
+// bounds nothing: a total with no window has no window to sum over, and a window with no
+// total bounds nothing. A half-set condition must therefore report NO velocity, so the
+// engine treats it as the boundless condition it is and fails it closed, rather than
+// deferring and committing against a bound that does not exist.
+func TestBlastRadiusHasVelocity(t *testing.T) {
+	cases := []struct {
+		name string
+		cond *BlastRadiusCondition
+		want bool
+	}{
+		{"both halves", &BlastRadiusCondition{MaxTotal: num("2000"), WindowSeconds: 3600}, true},
+		{"per-call only", &BlastRadiusCondition{Max: num("500")}, false},
+		{"total with no window", &BlastRadiusCondition{MaxTotal: num("2000")}, false},
+		{"window with no total", &BlastRadiusCondition{WindowSeconds: 3600}, false},
+		{"non-positive window", &BlastRadiusCondition{MaxTotal: num("2000"), WindowSeconds: 0}, false},
+		{"nil condition", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.cond.HasVelocity(); got != tc.want {
+				t.Fatalf("HasVelocity() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
