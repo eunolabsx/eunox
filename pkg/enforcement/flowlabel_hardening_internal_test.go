@@ -29,9 +29,6 @@ func (faultOnIncrementCounter) IncrementAndGet(context.Context, string, int, int
 	return 0, errors.New("injected seq-write fault")
 }
 func (faultOnIncrementCounter) Peek(context.Context, string, int) (int64, error) { return 0, nil }
-func (faultOnIncrementCounter) IncrementIfBelow(context.Context, string, int, int64) (count int64, admitted bool, retryAfter time.Duration, err error) {
-	return 0, false, 0, nil
-}
 func (faultOnIncrementCounter) AdmitAll(context.Context, []capability.QuotaBucket) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error) {
 	return false, 0, 0, 0, nil
 }
@@ -105,11 +102,4 @@ func TestFlowHardening_AtomicCommitRollsBackOnSeqFault(t *testing.T) {
 			assert.Equal(t, capability.DecisionAllow, sink.Decision, "a later sink must see clean state after the rolled-back commit")
 		})
 	}
-}
-
-// AddIfTotalBelow satisfies the weighted half of capability.CallCounter. This double
-// exercises the counting paths only, so a weighted add admits without recording: nothing
-// under test reads a weighted total from it.
-func (faultOnIncrementCounter) AddIfTotalBelow(_ context.Context, _ string, _ int, weight, _ float64) (total float64, admitted bool, retryAfter time.Duration, err error) {
-	return weight, true, 0, nil
 }

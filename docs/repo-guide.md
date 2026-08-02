@@ -12,8 +12,14 @@ built on the [Model Context Protocol](https://spec.modelcontextprotocol.io/).
 ## Prerequisites
 
 - Go 1.26.5+
-- golangci-lint v2.12+
 - Docker (for integration tests and local deployment)
+
+golangci-lint is not a prerequisite: `make lint` resolves the exact version CI runs
+(`GOLANGCI_LINT_VERSION` in the Makefile, which the workflow reads via
+`make print-lint-version`) and installs it if no binary on `PATH` matches. A different
+version already installed is ignored rather than used — one built with an older Go
+toolchain than `go.mod` targets refuses to lint at all, which looks like "the linter is
+unavailable here" while CI fails on findings no local run could surface.
 
 ## Build & Test
 

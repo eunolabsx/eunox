@@ -53,9 +53,12 @@ func checkBuckets(buckets []capability.QuotaBucket) error {
 			return e
 		}
 		if buckets[i].Counted {
-			// A counted bucket contributes exactly one entry, so its weight is not read;
-			// its LIMIT must still be a whole number of calls the backends can compare
-			// exactly, which checkTotalLimit's range already guarantees.
+			// A counted bucket contributes exactly one entry, so its weight is not read —
+			// but its LIMIT is a number of CALLS, which checkTotalLimit alone does not
+			// establish: that check bounds the range (0, MaxWeightedTotal], nothing more.
+			if e := checkCountedLimit(buckets[i].Limit); e != nil {
+				return e
+			}
 			continue
 		}
 		if e := checkWeight(buckets[i].Weight); e != nil {
@@ -97,19 +100,6 @@ const MaxWindowSeconds = min(
 // maxCalls the quota).
 const MaxEntries = math.MaxInt32
 
-// MaxLimit is the largest admission threshold IncrementIfBelow accepts. The Redis
-// Lua backend reads the limit via tonumber(), an IEEE-754 float64 exact only up to
-// 2^53; a larger limit would be silently rounded to a threshold the caller never
-// set. Capping at 2^53 keeps both backends' enforced threshold identical to the
-// request and rejects out-of-range limits up front. No real quota approaches 2^53.
-//
-// Typed int64 (not an untyped constant): the limit > MaxLimit comparison takes
-// int64 either way, but as a bare fmt.Errorf variadic argument an untyped 1<<53
-// would default to int and fail to compile on 32-bit targets (GOARCH=386, arm,
-// mips), where int is 32 bits. retryAfterFromPivot in memory.go already notes
-// MaxLimit exceeds 32-bit int range; typing it here keeps every use site 32-bit-safe.
-const MaxLimit int64 = 1 << 53
-
 // checkWindowSec is the single guardrail both call-counter backends call before any
 // duration arithmetic. It rejects a non-positive window (no meaningful span) and
 // one above MaxWindowSeconds (which overflows time.Duration), so an out-of-range
@@ -128,8 +118,9 @@ func checkWindowSec(windowSec int) error {
 // checkMaxEntries guards the IncrementAndGet retention cap. A non-positive cap is
 // rejected (fail closed) rather than treated as "unbounded" — an unbounded
 // in-window slice is the heap-growth sink, and no real caller needs one
-// (sequenceBlock needs maxEntries=1, maxCalls uses IncrementIfBelow). A
-// 0-means-unlimited escape hatch could silently re-open that sink.
+// (sequenceBlock needs maxEntries=1; maxCalls goes through AdmitAll, whose retention
+// is bounded by the quota itself). A 0-means-unlimited escape hatch could silently
+// re-open that sink.
 func checkMaxEntries(maxEntries int) error {
 	if maxEntries < 1 {
 		return fmt.Errorf("callcounter: maxEntries must be >= 1, got %d", maxEntries)
@@ -170,7 +161,36 @@ func checkWeight(weight float64) error {
 	return nil
 }
 
-// checkTotalLimit guards the AddIfTotalBelow admission threshold, mirroring checkLimit.
+// checkCountedLimit guards a COUNTED bucket's threshold, on top of checkTotalLimit's range
+// bound. A counted bucket's limit is a number of calls, so it must be a whole number and at
+// least 1, and neither follows from being a positive float64.
+//
+// Both halves are load-bearing, and neither is theoretical:
+//
+//   - A limit below 1 can never admit, but that denial is a MISCONFIGURATION rather than an
+//     exhausted quota and the two must stay distinguishable. Without this, a bound of 0.5
+//     denies every call forever with a nil error, which a caller reads (and audits) as
+//     "rate limit exceeded" — the silent-deny-all this package refuses everywhere else.
+//   - A FRACTIONAL limit additionally makes the two backends disagree, which is the one
+//     thing checkBuckets exists to prevent: the in-memory backend compares against it
+//     directly and returns an ordinary denial, while the Redis script derives its
+//     retry-after pivot as `total - limit` and hands that fractional index to ZRANGE, which
+//     errors the whole admission. Same input, one backend denying and the other faulting.
+//
+// The manifest loader already rejects maxCalls.count < 1 and carries it as an int, so this
+// guards direct library use and custom backends — the same reach the retired single-bucket
+// admission's own limit guard had.
+func checkCountedLimit(limit float64) error {
+	if limit < 1 {
+		return fmt.Errorf("callcounter: counted bucket limit must be >= 1, got %v", limit)
+	}
+	if limit != math.Trunc(limit) {
+		return fmt.Errorf("callcounter: counted bucket limit must be a whole number of calls, got %v", limit)
+	}
+	return nil
+}
+
+// checkTotalLimit guards a QuotaBucket's admission threshold, counted and weighted alike.
 // A non-positive limit can never admit anything with a positive weight, but that is a
 // misconfiguration rather than an exhausted budget and the two must stay distinguishable:
 // a structured error lets the caller surface and audit it instead of reading it as
@@ -184,22 +204,6 @@ func checkTotalLimit(limit float64) error {
 	}
 	if limit > MaxWeightedTotal {
 		return fmt.Errorf("callcounter: total limit must be <= %v (the largest value both backends represent exactly), got %v", MaxWeightedTotal, limit)
-	}
-	return nil
-}
-
-// checkLimit guards the IncrementIfBelow admission threshold. A limit<1 can never
-// admit, but that denial is a misconfiguration, not an exhausted quota, and the
-// two must be distinguishable: returning a structured error (rather than a silent
-// nil denial reading as "rate limit exceeded") lets the caller surface and audit
-// it. The manifest loader already rejects maxCalls.count<1; this guards direct
-// library use that bypasses it.
-func checkLimit(limit int64) error {
-	if limit < 1 {
-		return fmt.Errorf("callcounter: limit must be >= 1, got %d", limit)
-	}
-	if limit > MaxLimit {
-		return fmt.Errorf("callcounter: limit must be <= %d (the largest integer the Redis Lua backend represents exactly as a float64), got %d", MaxLimit, limit)
 	}
 	return nil
 }

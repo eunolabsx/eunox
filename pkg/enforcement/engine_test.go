@@ -45,7 +45,7 @@ import (
 )
 
 // Both built-in counter backends must satisfy the full capability.CallCounter
-// contract — IncrementAndGet plus the folded-in Peek, IncrementIfBelow, and
+// contract — IncrementAndGet plus the folded-in Peek and
 // PeekRetryAfter. The maxCalls and sequenceBlock handlers call those
 // directly and fail closed only when no counter is configured, so a backend that
 // dropped one of the folded methods stops compiling here instead of failing at
@@ -2884,17 +2884,13 @@ func TestEngine_AllowedValues_LiteralPatternStringDenied(t *testing.T) {
 		"a single digit must satisfy the [0-9] glob")
 }
 
-// errorCounter is a capability.CallCounter whose IncrementIfBelow always returns
+// errorCounter is a capability.CallCounter whose AdmitAll always returns
 // an error, so maxCalls exercises counter-error handling rather than the
 // fail-closed "no counter configured" branch.
 type errorCounter struct{}
 
 func (errorCounter) IncrementAndGet(_ context.Context, _ string, _, _ int) (int64, error) {
 	return 0, errors.New("counter error")
-}
-
-func (errorCounter) IncrementIfBelow(_ context.Context, _ string, _ int, _ int64) (count int64, admitted bool, retryAfter time.Duration, err error) {
-	return 0, false, 0, errors.New("counter error")
 }
 
 func (errorCounter) Peek(_ context.Context, _ string, _ int) (int64, error) {
@@ -3376,7 +3372,7 @@ func TestEngine_MaxCalls_DeniedCallsDoNotExtendLockout(t *testing.T) {
 // TestEngine_MaxCalls_NoCounterFailsClosed verifies that with no call counter
 // configured, the atomic check-and-record maxCalls requires cannot run and the
 // condition denies fail-closed rather than silently allowing the call. Before
-// IncrementIfBelow was folded into capability.CallCounter this was tested with a
+// the quota admission was folded into capability.CallCounter this was tested with a
 // counter that lacked the atomic check; that gap is now a compile error, so a nil
 // counter is the only remaining trigger.
 func TestEngine_MaxCalls_NoCounterFailsClosed(t *testing.T) {
@@ -5590,10 +5586,10 @@ func TestObligationDeny_DoesNotPoisonSessionHistory(t *testing.T) {
 	})
 }
 
-// spyLimiter wraps an InMemory counter and records how many IncrementIfBelow
+// spyLimiter wraps an InMemory counter and records how many AdmitAll
 // calls were ADMITTED per window, so a test can prove a denied call did not burn
 // a sibling window's quota. It embeds *callcounter.InMemory so it still
-// satisfies both RateLimiter (IncrementIfBelow) and CallHistory (Peek).
+// satisfies the whole capability.CallCounter contract, Peek included.
 type spyLimiter struct {
 	*callcounter.InMemory
 	mu              sync.Mutex
@@ -5604,19 +5600,8 @@ func newSpyLimiter() *spyLimiter {
 	return &spyLimiter{InMemory: callcounter.NewInMemory(), admittedByWindo: map[int]int{}}
 }
 
-func (s *spyLimiter) IncrementIfBelow(ctx context.Context, key string, windowSec int, limit int64) (count int64, admitted bool, retryAfter time.Duration, err error) {
-	count, admitted, retryAfter, err = s.InMemory.IncrementIfBelow(ctx, key, windowSec, limit)
-	if admitted {
-		s.mu.Lock()
-		s.admittedByWindo[windowSec]++
-		s.mu.Unlock()
-	}
-	return count, admitted, retryAfter, err
-}
-
-// AdmitAll mirrors IncrementIfBelow's accounting for the atomic
-// multi-bucket path the engine takes when a constraint carries more than one
-// quota-consuming condition: it delegates to the embedded counter and, only on an
+// AdmitAll is the one commit path the engine takes, single-bucket or multi-bucket
+// alike: it delegates to the embedded counter and, only on an
 // all-or-nothing admit, records one admitted slot per window. A denied batch records
 // nothing, so the spy still proves a denied call burned no sibling window's quota.
 func (s *spyLimiter) AdmitAll(ctx context.Context, buckets []capability.QuotaBucket) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error) {
@@ -5640,7 +5625,7 @@ func (s *spyLimiter) admitted(windowSec int) int {
 // TestMaxCalls_MultiWindow_DenialDoesNotBurnSiblingQuota pins: when a
 // constraint carries two maxCalls conditions on different windows, a call denied
 // by the longer window must NOT consume a slot in the shorter window. Before the
-// fix the shorter (declared-first) window committed its slot via IncrementIfBelow
+// fix the shorter (declared-first) window committed its slot in its own admission
 // before the longer window denied, permanently displacing a legitimate call.
 func TestMaxCalls_MultiWindow_DenialDoesNotBurnSiblingQuota(t *testing.T) {
 	spy := newSpyLimiter()
@@ -7688,10 +7673,6 @@ func (recordingErrorCounter) Peek(_ context.Context, _ string, _ int) (int64, er
 	return 0, nil
 }
 
-func (recordingErrorCounter) IncrementIfBelow(_ context.Context, _ string, _ int, _ int64) (count int64, admitted bool, retryAfter time.Duration, err error) {
-	return 0, true, 0, nil
-}
-
 func (recordingErrorCounter) AdmitAll(_ context.Context, _ []capability.QuotaBucket) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error) {
 	return true, 0, 0, 0, nil
 }
@@ -8074,13 +8055,6 @@ func (c ctxHonoringCounter) Peek(ctx context.Context, key string, windowSec int)
 	return c.inner.Peek(ctx, key, windowSec)
 }
 
-func (c ctxHonoringCounter) IncrementIfBelow(ctx context.Context, key string, windowSec int, limit int64) (count int64, admitted bool, retryAfter time.Duration, err error) {
-	if err := ctx.Err(); err != nil {
-		return 0, false, 0, err
-	}
-	return c.inner.IncrementIfBelow(ctx, key, windowSec, limit)
-}
-
 func (c ctxHonoringCounter) AdmitAll(ctx context.Context, buckets []capability.QuotaBucket) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error) {
 	if err := ctx.Err(); err != nil {
 		return false, 0, 0, 0, err
@@ -8131,32 +8105,4 @@ func TestSequenceBlock_ReArmSurvivesRequestCancellation(t *testing.T) {
 		&capability.EnforceRequest{SessionID: "sess-1", TargetName: "write_external"}, caps)
 	require.Equal(t, capability.DecisionDeny, resp.Decision,
 		"a client that disconnects on every probe must not be able to age the gate out")
-}
-
-// AddIfTotalBelow satisfies the weighted half of capability.CallCounter. This double
-// exercises the counting paths only, so a weighted add admits without recording: nothing
-// under test reads a weighted total from it.
-func (*spyLimiter) AddIfTotalBelow(_ context.Context, _ string, _ int, weight, _ float64) (total float64, admitted bool, retryAfter time.Duration, err error) {
-	return weight, true, 0, nil
-}
-
-// AddIfTotalBelow satisfies the weighted half of capability.CallCounter. This double
-// exercises the counting paths only, so a weighted add admits without recording: nothing
-// under test reads a weighted total from it.
-func (ctxHonoringCounter) AddIfTotalBelow(_ context.Context, _ string, _ int, weight, _ float64) (total float64, admitted bool, retryAfter time.Duration, err error) {
-	return weight, true, 0, nil
-}
-
-// AddIfTotalBelow satisfies the weighted half of capability.CallCounter. This double
-// exercises the counting paths only, so a weighted add admits without recording: nothing
-// under test reads a weighted total from it.
-func (errorCounter) AddIfTotalBelow(_ context.Context, _ string, _ int, weight, _ float64) (total float64, admitted bool, retryAfter time.Duration, err error) {
-	return weight, true, 0, nil
-}
-
-// AddIfTotalBelow satisfies the weighted half of capability.CallCounter. This double
-// exercises the counting paths only, so a weighted add admits without recording: nothing
-// under test reads a weighted total from it.
-func (recordingErrorCounter) AddIfTotalBelow(_ context.Context, _ string, _ int, weight, _ float64) (total float64, admitted bool, retryAfter time.Duration, err error) {
-	return weight, true, 0, nil
 }

@@ -912,10 +912,10 @@ func TestInMemory_WithMaxKeys_IncrementAndGet(t *testing.T) {
 	}
 }
 
-// TestInMemory_WithMaxKeys_IncrementIfBelow verifies the key bound on the
-// maxCalls rate-limit path (IncrementIfBelow): a new key past the bound fails
+// TestInMemory_WithMaxKeys_AdmitCounted verifies the key bound on the
+// maxCalls rate-limit path: a new key past the bound fails
 // closed (error, not admitted) so the maxCalls handler denies the call.
-func TestInMemory_WithMaxKeys_IncrementIfBelow(t *testing.T) {
+func TestInMemory_WithMaxKeys_AdmitCounted(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	const (
@@ -924,13 +924,13 @@ func TestInMemory_WithMaxKeys_IncrementIfBelow(t *testing.T) {
 	)
 	m := NewInMemory(WithMaxKeys(1))
 
-	if _, admitted, _, err := m.IncrementIfBelow(ctx, "maxcalls:a:tool", window, limit); err != nil || !admitted {
+	if _, admitted, _, err := AdmitCounted(ctx, m, "maxcalls:a:tool", window, limit); err != nil || !admitted {
 		t.Fatalf("first key: admitted=%v err=%v, want admitted=true err=nil", admitted, err)
 	}
 
-	count, admitted, retryAfter, err := m.IncrementIfBelow(ctx, "maxcalls:b:tool", window, limit)
+	count, admitted, retryAfter, err := AdmitCounted(ctx, m, "maxcalls:b:tool", window, limit)
 	if err == nil {
-		t.Fatal("IncrementIfBelow on a new key past maxKeys: want error, got nil")
+		t.Fatal("a counted admission on a new key past maxKeys: want error, got nil")
 	}
 	if admitted {
 		t.Error("refused call: admitted = true, want false (must fail closed)")
@@ -943,32 +943,32 @@ func TestInMemory_WithMaxKeys_IncrementIfBelow(t *testing.T) {
 	}
 
 	// The already-admitted key keeps counting up to its own limit.
-	if _, admitted, _, err := m.IncrementIfBelow(ctx, "maxcalls:a:tool", window, limit); err != nil || !admitted {
+	if _, admitted, _, err := AdmitCounted(ctx, m, "maxcalls:a:tool", window, limit); err != nil || !admitted {
 		t.Fatalf("existing key recount: admitted=%v err=%v, want admitted=true err=nil", admitted, err)
 	}
 }
 
-// TestInMemory_IncrementIfBelow_LimitBelowOneWritesNoState is a regression test:
+// TestInMemory_AdmitCounted_LimitBelowOneWritesNoState is a regression test:
 // a limit<1 call can never admit, so it must not insert a phantom entry.
 // Previously the entry was created (and counted against maxKeys) before the
 // limit<1 check, so a limit<1 call on a new key burned the sole slot and then
 // permanently denied a legitimate new key until Cleanup ran.
 //
-// A limit<1 is now reported as a structured error (not a silent nil denial) so
+// A limit below one is reported as a structured error (not a silent nil denial) so
 // a misconfigured limit is distinguishable from an exhausted quota; the
 // no-phantom-entry guarantee is unchanged and still asserted here.
-func TestInMemory_IncrementIfBelow_LimitBelowOneWritesNoState(t *testing.T) {
+func TestInMemory_AdmitCounted_LimitBelowOneWritesNoState(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	const window = 60
 	m := NewInMemory(WithMaxKeys(1))
 
 	// A limit<1 call on a new key fails closed with an error and writes no state.
-	count, admitted, retryAfter, err := m.IncrementIfBelow(ctx, "key-A", window, 0)
+	count, admitted, retryAfter, err := AdmitCounted(ctx, m, "key-A", window, 0)
 	if err == nil {
 		t.Fatal("limit<1 on a new key: want error, got nil")
 	}
-	if want := "limit must be >= 1"; !strings.Contains(err.Error(), want) {
+	if want := "limit must be > 0"; !strings.Contains(err.Error(), want) {
 		t.Errorf("error = %q, want it to contain %q", err.Error(), want)
 	}
 	if admitted {
@@ -982,42 +982,45 @@ func TestInMemory_IncrementIfBelow_LimitBelowOneWritesNoState(t *testing.T) {
 	}
 
 	// The sole maxKeys slot is still free: a legitimate new key is admitted.
-	if _, admitted, _, err := m.IncrementIfBelow(ctx, "key-B", window, 5); err != nil || !admitted {
+	if _, admitted, _, err := AdmitCounted(ctx, m, "key-B", window, 5); err != nil || !admitted {
 		t.Fatalf("legitimate new key after a limit<1 denial: admitted=%v err=%v, want admitted=true err=nil", admitted, err)
 	}
 }
 
-// TestInMemory_IncrementIfBelow_LimitAboveMaxFailsClosed is a regression test:
-// a limit above MaxLimit (2^53) would be silently rounded to a different
-// threshold in the Redis Lua float64 arithmetic, so checkLimit rejects it up
+// TestInMemory_AdmitCounted_LimitAboveMaxFailsClosed is a regression test:
+// a limit above MaxWeightedTotal (2^53) would be silently rounded to a different
+// threshold in the Redis Lua float64 arithmetic, so the bucket check rejects it up
 // front with a structured error and writes no state, exactly like limit<1.
-// The boundary value MaxLimit itself is still accepted.
-func TestInMemory_IncrementIfBelow_LimitAboveMaxFailsClosed(t *testing.T) {
+// The boundary value MaxWeightedTotal itself is still accepted.
+func TestInMemory_AdmitCounted_LimitAboveMaxFailsClosed(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	const window = 60
 	m := NewInMemory(WithMaxKeys(1))
 
-	count, admitted, retryAfter, err := m.IncrementIfBelow(ctx, "key-A", window, MaxLimit+1)
+	// 2^53+1 is not representable as a float64 (it rounds back to 2^53, which is IN
+	// range), so the over-bound case has to be the next representable value up.
+	const overBound = int64(MaxWeightedTotal) + 2
+	count, admitted, retryAfter, err := AdmitCounted(ctx, m, "key-A", window, overBound)
 	if err == nil {
-		t.Fatal("limit>MaxLimit on a new key: want error, got nil")
+		t.Fatal("limit>MaxWeightedTotal on a new key: want error, got nil")
 	}
 	if want := "limit must be <="; !strings.Contains(err.Error(), want) {
 		t.Errorf("error = %q, want it to contain %q", err.Error(), want)
 	}
 	if admitted {
-		t.Error("limit>MaxLimit: admitted = true, want false")
+		t.Error("limit>MaxWeightedTotal: admitted = true, want false")
 	}
 	if count != 0 || retryAfter != 0 {
-		t.Errorf("limit>MaxLimit: count=%d retryAfter=%v, want 0/0", count, retryAfter)
+		t.Errorf("limit>MaxWeightedTotal: count=%d retryAfter=%v, want 0/0", count, retryAfter)
 	}
 	if got := numEntries(m); got != 0 {
-		t.Fatalf("limit>MaxLimit must not create an entry: entries = %d, want 0", got)
+		t.Fatalf("limit>MaxWeightedTotal must not create an entry: entries = %d, want 0", got)
 	}
 
-	// The boundary value MaxLimit is in range and admits.
-	if _, admitted, _, err := m.IncrementIfBelow(ctx, "key-B", window, MaxLimit); err != nil || !admitted {
-		t.Fatalf("limit==MaxLimit: admitted=%v err=%v, want admitted=true err=nil", admitted, err)
+	// The boundary value MaxWeightedTotal is in range and admits.
+	if _, admitted, _, err := AdmitCounted(ctx, m, "key-B", window, int64(MaxWeightedTotal)); err != nil || !admitted {
+		t.Fatalf("limit==MaxWeightedTotal: admitted=%v err=%v, want admitted=true err=nil", admitted, err)
 	}
 }
 
@@ -1118,11 +1121,11 @@ func TestStorageKey_NamespacesByWindow(t *testing.T) {
 	ctx := context.Background()
 
 	// One logical key, two windows: each call must create its own entry.
-	if _, _, _, err := m.IncrementIfBelow(ctx, key, 60, 5); err != nil {
-		t.Fatalf("IncrementIfBelow(60): %v", err)
+	if _, _, _, err := AdmitCounted(ctx, m, key, 60, 5); err != nil {
+		t.Fatalf("AdmitCounted(60): %v", err)
 	}
-	if _, _, _, err := m.IncrementIfBelow(ctx, key, 3600, 10); err != nil {
-		t.Fatalf("IncrementIfBelow(3600): %v", err)
+	if _, _, _, err := AdmitCounted(ctx, m, key, 3600, 10); err != nil {
+		t.Fatalf("AdmitCounted(3600): %v", err)
 	}
 
 	m.mu.Lock()

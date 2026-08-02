@@ -25,7 +25,8 @@ type entry struct {
 	timestamps []time.Time
 	windowSec  int
 	// weights carries one magnitude per timestamp for a key that has ever taken a
-	// WEIGHTED add (AddIfTotalBelow). It is nil for a pure counting key, which is every
+	// WEIGHTED admission (an AdmitAll bucket with Counted unset). It is nil for a pure
+	// counting key, which is every
 	// maxCalls and sequenceBlock key: a count needs no per-entry magnitude, and carrying
 	// a parallel float64 slice for them would grow the in-memory footprint the threat
 	// model bounds by a third for nothing.
@@ -41,9 +42,9 @@ type entry struct {
 // score-ordered scan, so the two backends accumulate the same IEEE-754 double from the same
 // sequence. An empty set totals zero.
 //
-// It takes only the weights: AddIfTotalBelow materializes an implicit 1 per counted call
-// before calling this, so the "no weights means every entry weighs one" fallback could
-// never be reached and advertised a contract no caller exercised.
+// It takes only the weights: the commit materializes an implicit 1 per counted call before
+// calling this, so the "no weights means every entry weighs one" fallback could never be
+// reached and advertised a contract no caller exercised.
 func weightedTotal(liveWeights []float64) float64 {
 	total := 0.0
 	for _, w := range liveWeights {
@@ -133,9 +134,9 @@ func WithMaxKeys(n int) InMemoryOption {
 // such deployments prefer the Redis backend (per-key TTL, off-heap) or pass
 // WithMaxKeys to bound the count.
 //
-// Quota size is a second, orthogonal heap concern: IncrementIfBelow retains up to
-// limit timestamps per (key, window), so a large maxCalls.count also favours
-// Redis (see IncrementIfBelow).
+// Quota size is a second, orthogonal heap concern: a counted bucket retains up to its
+// limit in timestamps per (key, window) — the admission has no separate retention cap, the
+// bound IS the quota — so a large maxCalls.count also favours Redis.
 func NewInMemory(opts ...InMemoryOption) *InMemory {
 	m := &InMemory{
 		entries: make(map[string]*entry),
@@ -351,154 +352,6 @@ func floorToMicro(t time.Time) time.Time {
 	return t.Add(-time.Duration(t.Nanosecond() % 1000))
 }
 
-// IncrementIfBelow records a call for key only when the in-window count is
-// strictly below limit, doing the prune, count, and record under a single lock so
-// the check and record are atomic. It is the rate-limiting counterpart of
-// IncrementAndGet that maxCalls uses: a denied call appends no timestamp, which
-// previously grew the slice unbounded and kept the lockout from clearing under
-// retries.
-//
-// It returns the resulting in-window count (post-record when admitted, current
-// otherwise), whether admitted, and — when rejected — how long until a slot frees.
-// Expired timestamps are pruned on every call, including denials.
-//
-// There is no maxEntries cap (unlike IncrementAndGet): the slice is bounded by
-// limit, which scales with the quota, so a maxCalls limit in the millions retains
-// a correspondingly large per-key slice on the heap. Prefer the Redis backend for
-// large quotas.
-func (m *InMemory) IncrementIfBelow(_ context.Context, key string, windowSec int, limit int64) (count int64, admitted bool, retryAfter time.Duration, err error) {
-	if err := checkWindowSec(windowSec); err != nil {
-		return 0, false, 0, err
-	}
-	// Fail closed before touching map state: a limit<1 can never admit, so no entry
-	// should be created or counted against maxKeys (matching the Redis backend,
-	// which writes nothing on a denied call). A structured error keeps a
-	// misconfigured limit distinguishable from an exhausted quota.
-	if err := checkLimit(limit); err != nil {
-		return 0, false, 0, err
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	now := floorToMicro(m.now())
-	window := time.Duration(windowSec) * time.Second
-	cutoff := now.Add(-window)
-
-	// Namespace the entry by window (storageKey) so two windows on the same key
-	// never share one slice.
-	sk := storageKey(key, windowSec)
-	e, ok := m.entries[sk]
-	if !ok {
-		if err := m.admitNewKey(); err != nil {
-			return 0, false, 0, err
-		}
-		// Record the window so Cleanup can scale its staleness threshold (set once;
-		// never changes).
-		e = &entry{windowSec: windowSec}
-		m.entries[sk] = e
-	}
-
-	// Drop expired timestamps. Writing the pruned slice back on every call (admitted
-	// or denied) is what bounds a rate-limited key's storage.
-	valid, validWeights, weighted := pruneInWindow(e, cutoff)
-
-	cur := int64(len(valid))
-	if cur >= limit {
-		// Reclaim the backing array if a past burst left it mostly empty, matching
-		// IncrementAndGet so a denied-but-drained key does not pin its peak array.
-		storeEntry(e, valid, validWeights, weighted)
-		// Advisory retry-after estimate; details in retryAfterFromPivot.
-		return cur, false, retryAfterFromPivot(valid, cur, limit, window, now), nil
-	}
-
-	// Below the limit: record the call.
-	valid, validWeights = appendCall(valid, validWeights, now, 1, weighted)
-	storeEntry(e, valid, validWeights, weighted)
-	return int64(len(valid)), true, 0, nil
-}
-
-// AddIfTotalBelow adds weight to the key's in-window WEIGHTED TOTAL only when the
-// resulting total would not exceed limit, doing the prune, sum, compare, and record under
-// a single lock so the check and the record are atomic. It backs the cumulative
-// blastRadius bound; see the capability.CallCounter contract for the semantics and the
-// precision note.
-//
-// An over-limit call adds NOTHING — the same rule IncrementIfBelow follows, and for the
-// same reason: writing the weight of a refused call would let a denied caller extend its
-// own lockout, so a burst of rejected $5,000 refunds would keep the budget exhausted long
-// after the window that actually spent it.
-//
-// It returns the resulting in-window total (post-add when admitted, current otherwise),
-// whether admitted, and — when rejected — how long until enough weight ages out for THIS
-// call's weight to fit.
-func (m *InMemory) AddIfTotalBelow(_ context.Context, key string, windowSec int, weight, limit float64) (total float64, admitted bool, retryAfter time.Duration, err error) {
-	if err := checkWindowSec(windowSec); err != nil {
-		return 0, false, 0, err
-	}
-	// Fail closed before touching map state, mirroring IncrementIfBelow: a malformed
-	// weight or bound is a misconfiguration, not an exhausted budget, and must not create
-	// an entry or count against maxKeys.
-	if err := checkWeight(weight); err != nil {
-		return 0, false, 0, err
-	}
-	if err := checkTotalLimit(limit); err != nil {
-		return 0, false, 0, err
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	now := floorToMicro(m.now())
-	window := time.Duration(windowSec) * time.Second
-	cutoff := now.Add(-window)
-
-	sk := storageKey(key, windowSec)
-	e, ok := m.entries[sk]
-	if !ok {
-		if err := m.admitNewKey(); err != nil {
-			return 0, false, 0, err
-		}
-		e = &entry{windowSec: windowSec}
-		m.entries[sk] = e
-	}
-
-	valid, validWeights, _ := pruneInWindow(e, cutoff)
-	// This key is weighted from here on, whether or not it was before: a key that had
-	// only counted calls has an implicit weight of 1 for each, which materializing now
-	// makes explicit so later prunes and sums stay exact.
-	if len(validWeights) == 0 && len(valid) > 0 {
-		validWeights = make([]float64, len(valid))
-		for i := range validWeights {
-			validWeights[i] = 1
-		}
-	}
-
-	cur := weightedTotal(validWeights)
-	// A weight that cannot move the total is admitted WITHOUT being recorded. Zero is the
-	// motivating case and it is unbounded: `cur + 0 > limit` is never true, so a
-	// zero-magnitude call was admitted and appended forever, growing one key without limit
-	// and making every later call re-sum the whole window under the counter's lock (and,
-	// on Redis, re-scan the whole sorted set). Every non-zero weight is self-bounding at
-	// limit/weight entries, exactly as a maxCalls key is bounded by its limit; zero — and
-	// any weight so small that adding it is a no-op in double precision — was the one case
-	// with no bound. Recording it buys nothing either: it can never affect a future total.
-	if cur+weight == cur {
-		storeEntry(e, valid, validWeights, true)
-		return cur, true, 0, nil
-	}
-	if cur+weight > limit {
-		// Write the pruned state back on the denied path too (bounding storage exactly as
-		// IncrementIfBelow does), but record NOTHING of this call.
-		storeEntry(e, valid, validWeights, true)
-		return cur, false, retryAfterForWeight(valid, validWeights, cur+weight-limit, window, now), nil
-	}
-
-	valid, validWeights = appendCall(valid, validWeights, now, weight, true)
-	storeEntry(e, valid, validWeights, true)
-	return cur + weight, true, 0, nil
-}
-
 // retryAfterForWeight estimates how long until `needed` units of weight age out, so a
 // refused call of a given magnitude would fit. It walks oldest-first, accumulating the
 // weight each expiry would free, and returns when the entry that crosses `needed` leaves
@@ -617,7 +470,7 @@ func (m *InMemory) AdmitAll(_ context.Context, buckets []capability.QuotaBucket)
 		post := states[i].cur + bucketWeight(b)
 		// A weight that cannot move the total is admitted WITHOUT being recorded: it can
 		// never affect a future decision, and recording it is the one case that would grow a
-		// key without bound (see AddIfTotalBelow).
+		// key without bound.
 		if post != states[i].cur {
 			weighted := states[i].weighted || !b.Counted
 			ts, weights := e.timestamps, e.weights
@@ -725,9 +578,8 @@ func (m *InMemory) Peek(_ context.Context, key string, windowSec int) (int64, er
 // retryAfterFromPivot estimates how long until the in-window count next drops below
 // limit: the last call that must age out is valid[cur-limit] in oldest-first order,
 // and a slot frees one window after it was recorded. Returns 0 when the pivot index
-// is out of range or the estimate is non-positive. Shared by IncrementIfBelow and
-// IncrementIfAllBelow (both deny paths) so the two cannot drift. The index is kept in
-// int64 since int(cur-limit) truncates on 32-bit (MaxLimit is 1<<53).
+// is out of range or the estimate is non-positive. The index is kept in int64 since
+// int(cur-limit) truncates on 32-bit (a limit may reach MaxWeightedTotal, 1<<53).
 //
 // "Oldest-first" holds only under a monotonically non-decreasing clock (production
 // time.Now()); a backward-jumping test clock (WithTimeFunc) can leave valid unsorted

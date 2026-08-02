@@ -72,14 +72,18 @@ cd eunox
 
 make build           # → bin/eunox
 make test            # go test -race ./...
-make lint            # go vet + golangci-lint
+make lint            # go vet + golangci-lint (pinned to CI's version)
 make check-license   # Apache-2.0 header on every .go file
 make check-notice    # NOTICE matches the binary's third-party modules
 make coverage        # write coverage.out
 ```
 
-Full prerequisites (Go 1.26.5+, golangci-lint v2.12+, Docker) and the
-repository layout are in [`docs/repo-guide.md`](./docs/repo-guide.md).
+`make lint` runs the exact golangci-lint version CI does, installing it when no
+matching binary is on `PATH` — a different version already installed is ignored, not
+used, so a local run and a CI run cannot disagree.
+
+Full prerequisites (Go 1.26.5+, Docker) and the repository layout are in
+[`docs/repo-guide.md`](./docs/repo-guide.md).
 
 The end-to-end demo lives under [`demo/`](./demo/) — `make -C demo up` is the
 fastest way to exercise a real proxy with a mock upstream and verify a
@@ -217,6 +221,14 @@ rules:
 - For new MCP method coverage, add an enforcement-gap-style test in
   `internal/transport/enforcement_gaps_test.go`.
 - For new audit-record fields, add a sign-and-verify round-trip test.
+- The duplicate-key scan (`internal/pdp`, the fail-closed gate behind the
+  `*/list` entry filter and the `redactFields` response path) is checked against
+  a tokenizer-derived oracle kept beside it in `scan_oracle_test.go`. Changing
+  the scan means keeping the two in agreement on all three outputs — the
+  untrustworthy verdict, the candidate-name set, and whether that set is
+  complete — through the equivalence table and the fuzz targets, and running a
+  fuzz campaign (`go test -run XXX -fuzz '^FuzzScanJSONKeys$' ./internal/pdp/`)
+  rather than relying on the seed corpus alone.
 
 ### Documentation
 

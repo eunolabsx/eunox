@@ -157,11 +157,22 @@ type DenialInfo struct {
 //
 // Every method is mandatory — the full contract WithCallCounter accepts, not a
 // core with optional type-asserted extensions: IncrementAndGet backs the counting
-// conditions, Peek backs sequenceBlock, IncrementIfBelow / AdmitAll back
-// maxCalls. Folding them into one contract means a backend that omits any fails to
-// satisfy CallCounter at compile time, rather than wiring up cleanly and then
-// failing every maxCalls/sequenceBlock condition closed at runtime. A custom
-// backend pins conformance with `var _ capability.CallCounter = (*MyCounter)(nil)`.
+// conditions, Peek backs sequenceBlock, and AdmitAll backs every quota bound
+// (maxCalls and the cumulative blastRadius alike). Folding them into one contract
+// means a backend that omits any fails to satisfy CallCounter at compile time,
+// rather than wiring up cleanly and then failing every maxCalls/sequenceBlock
+// condition closed at runtime. A custom backend pins conformance with
+// `var _ capability.CallCounter = (*MyCounter)(nil)`.
+//
+// There is exactly ONE admission primitive on purpose. AdmitAll subsumed two
+// single-bucket forms (IncrementIfBelow, AddIfTotalBelow) that the decision path
+// stopped calling once every handler routed its commit through it, and leaving them
+// on the contract would have been the same "two implementations of one semantics
+// that can drift" hazard their merger removed one layer up: a backend could get the
+// retired pair exactly right — they were independently testable, so they would look
+// solid — while getting AdmitAll subtly wrong, and nothing on the decision path
+// would exercise the difference. A backend author writes one admission and every
+// quota bound rides it.
 type CallCounter interface {
 	// IncrementAndGet records a call and returns the in-window count, retaining at
 	// most maxEntries most-recent in-window timestamps so storage stays bounded
@@ -173,20 +184,17 @@ type CallCounter interface {
 	// lookup itself counting.
 	Peek(ctx context.Context, key string, windowSec int) (int64, error)
 
-	// IncrementIfBelow atomically records a call only when fewer than limit calls
-	// are already in the window, so an over-limit (denied) call never writes a new
-	// entry — maxCalls requires this to avoid the unbounded growth and self-
-	// extending lockout a plain increment-then-compare caused. admitted reports
-	// whether the call was recorded; count is the in-window total; retryAfter
-	// estimates the time until a slot frees on a denial. limit must be >= 1.
-	IncrementIfBelow(ctx context.Context, key string, windowSec int, limit int64) (count int64, admitted bool, retryAfter time.Duration, err error)
-
-	// AdmitAll is the multi-bucket analogue of the two single-bucket admissions above: it
-	// records all of SEVERAL quota buckets only when every one has headroom
-	// (admitted=true), otherwise records NOTHING (admitted=false) with deniedIndex naming a
-	// blocking bucket, total its resulting total, and retryAfter its estimate. It exists so
-	// a constraint carrying more than one quota-consuming condition cannot over-admit by
+	// AdmitAll is the ONE quota admission: it records all of the given buckets only when
+	// every one has headroom (admitted=true), otherwise records NOTHING (admitted=false)
+	// with deniedIndex naming a blocking bucket, total its resulting total, and retryAfter
+	// its estimate. A single-bucket batch is an ordinary call — that is how a lone maxCalls
+	// or a lone cumulative blastRadius commits — and a multi-bucket batch is what keeps a
+	// constraint carrying more than one quota-consuming condition from over-admitting by
 	// racing the check->commit gap a per-bucket commit would leave.
+	//
+	// An over-limit call records NOTHING, which maxCalls requires: writing the denied call
+	// would let a client extend its own lockout by retrying, and would grow the backing
+	// store on exactly the path that must not grow it.
 	//
 	// The buckets may MIX accountings. A QuotaBucket either counts entries (maxCalls) or
 	// sums magnitudes (a cumulative blastRadius bound), and one call to this method admits
@@ -197,45 +205,25 @@ type CallCounter interface {
 	// buckets must be non-empty, each bucket valid (see QuotaBucket), and no two may address
 	// the same (Key, WindowSec) — two buckets sharing one physical key cannot be committed
 	// consistently. A malformed batch fails closed and records nothing.
+	//
+	// total is the LARGEST post-admission total across the batch when admitted (an absolute
+	// magnitude, not a fraction of any bucket's limit — with limits of differing scale it
+	// need not be the bucket closest to its own bound), and the blocking bucket's current
+	// total when denied. retryAfter estimates when the blocking bucket frees enough room for
+	// THIS call.
+	//
+	// PRECISION. A weighted total accumulates in IEEE-754 double precision, in timestamp
+	// order, deliberately: the Redis backend's Lua arithmetic is float64 and nothing else
+	// is available there, so making an in-process backend exact would be the two backends
+	// disagreeing rather than one of them being right. Every total below MaxWeightedTotal
+	// composed of integral magnitudes is exact; a fractional magnitude (a currency amount)
+	// can differ from an exact decimal sum in the last bits, far below any bound an
+	// operator authors.
 	AdmitAll(ctx context.Context, buckets []QuotaBucket) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error)
-
-	// AddIfTotalBelow is the WEIGHTED sibling of IncrementIfBelow: it atomically adds
-	// weight to a key's in-window total only when the resulting total would not exceed
-	// limit, so an over-limit call writes NOTHING. It backs the cumulative blastRadius
-	// bound — "no more than $2,000 of refunds an hour" — which per-call authorization
-	// structurally cannot see: four hundred individually-permitted $10 refunds are each
-	// legal and only the aggregate is catastrophic.
-	//
-	// It is a generalization of the counting methods above rather than a second
-	// accounting system: maxCalls is this with every weight equal to 1. It lives on this
-	// one contract for that reason, and is a MANDATORY method by the same convention the
-	// rest obey — a backend that omitted it would fail every velocity condition closed at
-	// runtime instead of failing to compile.
-	//
-	// The counting methods are nonetheless kept separate, deliberately: a count is O(1)
-	// in every backend (ZCARD, a slice length) while a weighted total is O(n) in the
-	// window (the per-entry weights have to be summed), so folding maxCalls onto this
-	// would make every rate-limit check pay a linear scan it does not need.
-	//
-	// total is the post-add total when admitted and the current total when denied.
-	// retryAfter estimates when enough weight ages out for THIS call's weight to fit.
-	// weight must be finite and non-negative; limit must be finite and in
-	// (0, MaxWeightedTotal] — the bound at which both backends still represent a total
-	// exactly. Out-of-range inputs fail closed with a structured error and write nothing,
-	// so a misconfigured bound stays distinguishable from an exhausted one.
-	//
-	// PRECISION. Both backends accumulate in IEEE-754 double precision, in timestamp
-	// order, deliberately: the Redis backend's Lua arithmetic is float64 and nothing
-	// else is available there, so making the in-memory backend exact would be the two
-	// backends disagreeing rather than one of them being right. Every total below
-	// MaxWeightedTotal composed of integral magnitudes is exact; a fractional magnitude
-	// (a currency amount) can differ from an exact decimal sum in the last bits, far
-	// below any bound an operator authors.
-	AddIfTotalBelow(ctx context.Context, key string, windowSec int, weight, limit float64) (total float64, admitted bool, retryAfter time.Duration, err error)
 }
 
 // MaxWeightedTotal is the largest weighted total a CallCounter backend represents exactly,
-// and therefore the largest limit — and largest single weight — AddIfTotalBelow accepts.
+// and therefore the largest limit — and largest single weight — a QuotaBucket accepts.
 //
 // It is 2^53 for the same reason the counting limit is: the Redis backend evaluates its
 // admission in Lua, whose numbers are IEEE-754 doubles, so a larger value would be
@@ -275,6 +263,13 @@ type QuotaBucket struct {
 	Weight float64
 	// Limit is the largest total the bucket may hold after this call. Must be positive and
 	// at most MaxWeightedTotal.
+	//
+	// A COUNTED bucket's limit is additionally a number of calls: it must be a whole number
+	// and at least 1. Both halves are enforced, and neither follows from being a positive
+	// float64 — a bound below 1 can never admit, which is a misconfiguration a backend must
+	// report as one rather than as an exhausted quota, and a fractional bound makes a
+	// backend deriving its retry pivot arithmetically (Redis does) fault where an in-process
+	// one merely denies.
 	Limit float64
 }
 

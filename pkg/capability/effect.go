@@ -266,8 +266,9 @@ func (c EffectClassCondition) MarshalJSON() ([]byte, error) { return marshalCond
 // catastrophic, so the aggregate is precisely what per-call authorization structurally
 // cannot see.
 //
-// It is backed by CallCounter.AddIfTotalBelow — the weighted generalization of the
-// counting primitive maxCalls uses, on the same seam, not a second accounting system. An
+// It is backed by a WEIGHTED CallCounter.AdmitAll bucket — the same admission maxCalls
+// commits through, summing magnitudes instead of counting entries, not a second accounting
+// system (which is why the two compose atomically on one capability). An
 // over-limit call writes NOTHING, exactly as an over-limit maxCalls does: recording the
 // weight of a refused call would let a burst of rejections extend its own lockout past the
 // window that actually spent the budget.

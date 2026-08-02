@@ -794,7 +794,7 @@ For integration examples with Auth0, Okta, WorkOS, and Cloudflare Access, see
 PR workflow, commit conventions, DCO sign-off, and house style are in
 [`CONTRIBUTING.md`](./CONTRIBUTING.md). Build, test, and lint with `make build` /
 `make test` / `make lint`; `make check-license` verifies the Apache-2.0 headers.
-Prerequisites (Go 1.26.5+, golangci-lint), repository layout, and the CI matrix
+Prerequisites (Go 1.26.5+), repository layout, and the CI matrix
 are in [`docs/repo-guide.md`](./docs/repo-guide.md). Vulnerability reports go
 through [`SECURITY.md`](./SECURITY.md), not the public issue tracker.
 

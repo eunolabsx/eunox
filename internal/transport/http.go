@@ -148,10 +148,34 @@ func addSlack(d time.Duration) time.Duration {
 // window is that budget plus writeSlack, floored at httpWriteTimeout so a small or absent
 // budget still leaves a usable window for the write itself. Best-effort, matching every
 // other SetWriteDeadline site: a ResponseWriter that does not support it changes nothing.
+//
+// Every response-write deadline in this package goes through this helper (or its Duration
+// and teardown spellings). Four hand-written expressions of "how long may this write take"
+// is how the entry-deadline bug arose in the first place — each site computed its own
+// window and one of them was wrong for its leg. One helper with one floor rule is what
+// keeps that class of bug from recurring. The SSE delivery loop is the deliberate
+// exception: it arms a per-chunk FORWARD-PROGRESS deadline, a different policy on purpose
+// (see the SSE write-deadline entry in docs/threat-model-mcp.md), and must not be folded in.
 func rearmWriteDeadline(w http.ResponseWriter, budgetMs int) {
-	window := httpWriteTimeout
+	var budget time.Duration
 	if budgetMs > 0 {
-		if b := addSlack(msToDuration(budgetMs)); b > window {
+		budget = msToDuration(budgetMs)
+	}
+	rearmWriteDeadlineFor(w, budget)
+}
+
+// rearmWriteDeadlineFor is rearmWriteDeadline's core, taking the leg's budget as a Duration
+// for the one caller that computes one directly (session establishment, whose budget is the
+// larger of sessionStartTimeout and --upstream-timeout). Routing that caller through the
+// millisecond spelling would mean converting a Duration to int milliseconds only to convert
+// it back, which truncates and can overflow int on a 32-bit build at the saturated budget
+// msToDuration deliberately produces.
+//
+// budget <= 0 means "no configured budget"; see rearmWriteDeadline for the floor rule.
+func rearmWriteDeadlineFor(w http.ResponseWriter, budget time.Duration) {
+	window := httpWriteTimeout
+	if budget > 0 {
+		if b := addSlack(budget); b > window {
 			window = b
 		}
 	}

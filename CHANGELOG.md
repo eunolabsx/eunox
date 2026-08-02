@@ -136,6 +136,24 @@ Section conventions:
 
 ### Changed
 
+- **Every HTTP response-write deadline is armed by one helper, floored at
+  `httpWriteTimeout` (30s).** Three legs still computed their own window: the handler
+  entry arm, the session-creating `initialize` arm, and the response encode. The first two
+  scaled their window with `--upstream-timeout`, which is unrelated to how long the
+  *client* may take to read a response — so a deployment running a 50 ms upstream budget
+  armed just over five seconds for any response written before the pre-encode re-arm,
+  including the early 4xx/404 legs that return without one, and the `initialize` arm armed
+  25s against the 30s floor every other leg gets. Both now get the floor. The SSE delivery
+  loop's per-chunk arm is deliberately **not** folded in: it is a forward-progress deadline
+  re-armed per write, and pooling it with the response rule would kill a slow-but-
+  progressing reader mid-frame.
+- **`make lint` runs the golangci-lint version CI pins, whatever is on `PATH`,** and
+  `.golangci.yml` no longer caps findings (`max-same-issues`/`max-issues-per-linter` are
+  0). Installing "only if missing" left any already-installed version in charge, and one
+  built with an older Go toolchain than `go.mod` targets refuses to lint at all — which
+  reads as "the linter is unavailable here" while CI fails on findings no local run could
+  surface. The pin lives once, in the Makefile; CI's Lint job reads it via
+  `make print-lint-version`.
 - **The session-kill TTL the proxy publishes to Redis now expires, and is refreshed
   while the proxy runs.** The key (`killswitch:config:session-kill-ttl`) carried no
   expiry, timestamp, or writer identity, so nothing distinguished a value a running
@@ -462,6 +480,21 @@ Section conventions:
   form should check their own fields.
 - `drift.ToolsListCursorParams` is unexported; `drift.ToolsListRequest` is the seam
   probes use and builds the whole request.
+- **`capability.CallCounter.IncrementIfBelow` and `.AddIfTotalBelow`.** Once every quota
+  handler committed through `AdmitAll`, nothing on the decision path called either
+  single-bucket method again — `maxCalls` and the cumulative `blastRadius` both admit
+  through `AdmitAll` with a one-element batch — yet both stayed **mandatory** on the
+  contract. That is the same "two implementations of one semantics that can drift" hazard
+  their merger removed one layer up, with a worse failure mode: a custom backend could get
+  the retired pair exactly right (they were independently tested, so they would look
+  solid) while getting `AdmitAll` subtly wrong, and nothing on the decision path would
+  exercise the difference. **Migration:** a custom `CallCounter` implements
+  `IncrementAndGet`, `Peek`, and `AdmitAll`; delete the other two. `callcounter.MaxLimit`
+  goes with them — a counted bucket's bound is now validated by the shared batch check,
+  against the same `MaxWeightedTotal` (2^53) representability limit **plus** the
+  whole-number-of-calls rule the retired method's `int64` limit carried in its type (a
+  fractional counted bound would otherwise deny silently in memory and fault the Redis
+  script's retry pivot — the backend divergence that check exists to prevent).
 
 ### Fixed
 
