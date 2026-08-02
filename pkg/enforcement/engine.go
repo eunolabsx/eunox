@@ -240,8 +240,9 @@ type Engine struct {
 	// maxCalls and cumulative blastRadius budgets, the single-use declassify ledger) on
 	// the request's VALIDATED mcp.task_id claim rather than on its session, so the state
 	// survives a hop across enforcement points. Opt-in (WithTaskAnchoredState) and
-	// fail-safe: a request with no task claim falls back to session keying rather than to
-	// a shared bucket. See anchor.go for why each of those three properties is required.
+	// fail-safe: a request with NO TOKEN falls back to session keying rather than to a
+	// shared bucket, and an authenticated one whose token carries no task_id is refused
+	// rather than split across both. See anchor.go for why each property is required.
 	taskAnchored bool
 }
 
@@ -328,15 +329,17 @@ func WithCounterKeyNamespace(ns string) Option {
 // clean.
 //
 // It changes what every budget in the policy MEANS (a maxCalls of 20 becomes 20 per task,
-// not 20 per connection), which is why it is opt-in rather than derived. A request whose
-// token carries no task_id — including every unauthenticated one — is anchored on its
-// session exactly as it is without this option, so enabling it can never make two callers
-// share state on the strength of something neither of them proved.
+// not 20 per connection), which is why it is opt-in rather than derived. An UNAUTHENTICATED
+// request is anchored on its session exactly as it is without this option, so enabling it can
+// never make two callers share state on the strength of something neither of them proved; an
+// authenticated request whose token carries no task_id is REFUSED rather than session-keyed
+// (anchorUnresolved), because one caller alternating token shapes would otherwise split its
+// own taint, budgets and antecedents across two buckets.
 //
 // Task-anchored state deliberately OUTLIVES the session that wrote it, so the transport's
-// teardown does not reclaim it (see Engine.TaskAnchored and ClearSessionLabels). Pair this
-// with the Redis backends, whose idle TTL reclaims an abandoned task, or bound the in-memory
-// store with flowlabelstore.WithMaxKeys.
+// teardown does not reclaim it (see ClearSessionLabels). Pair this with the Redis backends,
+// whose idle TTL reclaims an abandoned task, or bound the in-memory store with
+// flowlabelstore.WithMaxKeys.
 func WithTaskAnchoredState() Option {
 	return func(e *Engine) {
 		e.taskAnchored = true
@@ -1225,8 +1228,19 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 		return denyResponse(requestID, now, matched.IsAuditOnly(), nil, capability.DenialInfo{
 			Code:          capability.ErrCodeMissingContext,
 			ConditionType: anchorKindTask,
-			Message:       "this route anchors enforcement state on the task, but the presented token carries no mcp.task_id; refusing rather than accounting this call against a second, session-keyed bucket (fail closed)",
-			Details:       map[string]interface{}{"anchor": anchorKindTask, "reason": "no_task_id"},
+			// HardDeny, which puts this beside the unapproved declassification and the
+			// over-ceiling effect rather than beside an ordinary authorization verdict. A
+			// downgradable refusal is FORWARDED on an audit-only constraint, and the observe
+			// path's own antecedent recorder then writes this call's labels and sequence marker
+			// through stateAnchor — which, with no task id to resolve, keys them on the SESSION.
+			// So the very state split this check exists to refuse is what the downgrade
+			// performs, on a route whose other constraints are reading the task-keyed bucket.
+			// It is a failed state write, not a verdict being staged, and an operator staging
+			// task anchoring still gets the diagnostic: the refusal is on the tape either way,
+			// carrying the reason.
+			HardDeny: true,
+			Message:  "this route anchors enforcement state on the task, but the presented token carries no mcp.task_id; refusing rather than accounting this call against a second, session-keyed bucket (fail closed)",
+			Details:  map[string]interface{}{"anchor": anchorKindTask, "reason": "no_task_id"},
 		})
 	}
 

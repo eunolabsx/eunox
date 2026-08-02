@@ -514,11 +514,34 @@ func TestContractsRefWarnsOnADisputedEntry(t *testing.T) {
 	})
 
 	var code int
-	out := captureStdout(t, func() { code = cmdContracts([]string{"--dir", dir, "--trust-keys", keys, "--ref", "acme/mcp.send"}) })
+	var out string
+	warning := captureStderr(t, func() {
+		out = captureStdout(t, func() { code = cmdContracts([]string{"--dir", dir, "--trust-keys", keys, "--ref", "acme/mcp.send"}) })
+	})
 	if code != 0 {
 		t.Fatalf("exit = %d, want 0 — a dispute must not block a pin", code)
 	}
 	if !strings.Contains(out, "acme/mcp.send@") {
 		t.Errorf("the pin should still be printed:\n%s", out)
+	}
+	if !strings.Contains(warning, "DISPUTED") {
+		t.Errorf("the dispute must reach the operator on stderr:\n%s", warning)
+	}
+
+	// The same warning on --attest-payload: signing an entry is a MORE durable commitment
+	// than pasting a pin, so a publisher about to make one needs the dispute at least as much.
+	warning = captureStderr(t, func() {
+		out = captureStdout(t, func() {
+			code = cmdContracts([]string{"--dir", dir, "--trust-keys", keys, "--attest-payload", "acme/mcp.send"})
+		})
+	})
+	if code != 0 {
+		t.Fatalf("--attest-payload exit = %d, want 0 — a dispute must not block signing either", code)
+	}
+	if out == "" {
+		t.Error("the payload should still be printed")
+	}
+	if !strings.Contains(warning, "DISPUTED") {
+		t.Errorf("--attest-payload must warn on a disputed entry too:\n%s", warning)
 	}
 }

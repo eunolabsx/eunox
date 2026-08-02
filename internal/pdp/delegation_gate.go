@@ -5,6 +5,7 @@ package pdp
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/eunolabs/eunox/pkg/capability"
@@ -37,7 +38,23 @@ func delegationTargetDenial(ctx context.Context, clock enforcement.Clock, target
 	// The canonical "<type>:<bare>" spelling a grant names. It is built from the resolved
 	// EnforceTarget rather than from a raw request field, so it matches what the engine's own
 	// canonicalApprovalTarget produces for the same call and what the list filters test.
-	canonical := string(target.Type) + ":" + target.Name
+	//
+	// An unresolved target is passed through as the EMPTY string rather than as "tool:", so
+	// DelegationTargetDenial's unresolvable-target arm is the one that answers it. Concatenating
+	// unconditionally made that arm unreachable from here — every canonical form carried at
+	// least the type and a colon — and the call was then measured against the chain as if
+	// "tool:" were an action, which no grant names, so it refused with the wrong reason.
+	//
+	// TrimSpace decides ONLY whether the target resolved to anything; the value compared
+	// against the chain is the untrimmed one. A grant's entries are trimmed at the token
+	// boundary, which tolerates padding in the CLAIM — it does not make " search " and "search"
+	// the same action, and trimming the REQUEST here would have let a delegate reach a grant by
+	// naming an action the grant does not name. Both arms of that are wrong, and this one is
+	// wrong in the fail-open direction.
+	canonical := ""
+	if strings.TrimSpace(target.Name) != "" {
+		canonical = string(target.Type) + ":" + target.Name
+	}
 	return enforcement.DelegationTargetDenial(chain, canonical, auditOnly,
 		enforcement.NewRequestID(), clockNow(clock).UTC().Format(time.RFC3339Nano))
 }

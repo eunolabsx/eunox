@@ -134,9 +134,11 @@ Flags:
 	//
 	// It runs BEFORE the --ref and --attest-payload branches, not after. Those two are the
 	// moments a decision is made — an author copies a pin, a publisher signs — so they are
-	// exactly where a tampered entry or a trusted reviewer's DISPUTE has to stop the command.
-	// Returning early made `--ref` with `--trust-keys` exit 0 having verified nothing, which
-	// is the false assurance the listing's own column rule exists to avoid.
+	// exactly where a tampered entry has to STOP the command (exit 2) and a trusted reviewer's
+	// DISPUTE has to reach the operator (a stderr warning; a dispute is advisory and does not
+	// change the exit code). Returning early made `--ref` with `--trust-keys` exit 0 having
+	// verified nothing, which is the false assurance the listing's own column rule exists to
+	// avoid.
 	var statuses map[string]registry.AttestationStatus
 	if *trustKeys != "" {
 		store, storeErr := registry.LoadTrustStore(*trustKeys)
@@ -165,7 +167,7 @@ Flags:
 		return writeContractRef(os.Stdout, contracts, *ref, statuses)
 	}
 	if *attestPayload != "" {
-		return writeAttestPayload(os.Stdout, contracts, *attestPayload, *role, *statement)
+		return writeAttestPayload(os.Stdout, contracts, *attestPayload, *role, *statement, statuses)
 	}
 	writeContractCorpus(os.Stdout, resolved, contracts, statuses)
 	return 0
@@ -179,12 +181,18 @@ Flags:
 // The digest that goes into the payload is the one LoadCorpus already recomputed from the
 // entry's content, so a signature made from this output is bound to the content in the file
 // rather than to whatever the file happened to declare.
-func writeAttestPayload(out io.Writer, contracts []registry.Contract, id, role, statement string) int {
+//
+// It warns on a DISPUTE for the same reason --ref does, and the case is if anything stronger:
+// putting a signature on an entry is a more durable commitment than pasting a pin, and a
+// publisher who is about to make one is exactly who needs to know that a reviewer they trust
+// read the entry and disagreed.
+func writeAttestPayload(out io.Writer, contracts []registry.Contract, id, role, statement string, statuses map[string]registry.AttestationStatus) int {
 	for i := range contracts {
 		c := &contracts[i]
 		if c.ID != id {
 			continue
 		}
+		warnIfDisputed(id, statuses)
 		payload, err := registry.NewSignaturePayload(c, role, statement)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "eunox contracts: %v\n", err)
@@ -197,6 +205,23 @@ func writeAttestPayload(out io.Writer, contracts []registry.Contract, id, role, 
 	}
 	fmt.Fprintf(os.Stderr, "eunox contracts: no contract with id %q in the corpus (run without --attest-payload to list the ids it holds)\n", id)
 	return 2
+}
+
+// warnIfDisputed reports a trusted key's DISPUTE of the entry a single-entry command is about
+// to hand over, on stderr so the value on stdout stays pipeable. Nothing when the caller passed
+// no --trust-keys (statuses is nil) or nobody disputed.
+//
+// It is one function rather than a line in each caller because the two callers are the two
+// moments an author commits to an entry — pasting a pin, signing an attestation — and a warning
+// that fires at one and not the other is the shape that silently regresses. It deliberately
+// does not change the exit code: a dispute is a community-advisory signal, not a verdict eunox
+// is in a position to issue.
+func warnIfDisputed(id string, statuses map[string]registry.AttestationStatus) {
+	st, ok := statuses[id]
+	if !ok || len(st.Disputed) == 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "eunox contracts: WARNING %q is DISPUTED by %v (a trusted key you configured); read their reasoning before relying on it\n", id, st.Disputed)
 }
 
 // writeContractRef prints the pin for one contract id. An unknown id is an error, not an
@@ -212,9 +237,7 @@ func writeContractRef(out io.Writer, contracts []registry.Contract, id string, s
 		if contracts[i].ID != id {
 			continue
 		}
-		if st, ok := statuses[id]; ok && len(st.Disputed) > 0 {
-			fmt.Fprintf(os.Stderr, "eunox contracts: WARNING %q is DISPUTED by %v (a trusted key you configured); read their reasoning before pinning it\n", id, st.Disputed)
-		}
+		warnIfDisputed(id, statuses)
 		wf(out, "%s\n", contracts[i].Ref())
 		return 0
 	}

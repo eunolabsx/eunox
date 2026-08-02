@@ -1529,16 +1529,16 @@ func anyRouteTaskAnchored(cfg *config.GatewayConfig) bool {
 
 // warnTaskAnchoringWithoutJWT prints the advisory for a route that opts into task-anchored
 // state on a proxy that never validates a token. The anchor is derived from the VALIDATED
-// mcp.task_id claim and falls back to session keying when there is none, so without a JWT
-// integration every request takes the fallback and the option does exactly nothing — a clean
+// mcp.task_id claim; with no JWT integration no request carries claims at all, so every one of
+// them takes the token-less session fallback and the option does exactly nothing — a clean
 // startup and a silently unchanged deployment, which is the shape the --strict-drift notice
 // beside it exists to prevent for its own flag.
 //
 // It is a notice rather than a startup refusal because the combination is legitimate mid-
 // rollout: an operator may enable the config key before the IdP starts minting the claim, and
 // the fallback keeps that state safe rather than merely quiet.
-func warnTaskAnchoringWithoutJWT(jwtConfigured, anyRouteTaskAnchored bool) {
-	if jwtConfigured || !anyRouteTaskAnchored {
+func warnTaskAnchoringWithoutJWT(jwtConfigured, taskAnchored bool) {
+	if jwtConfigured || !taskAnchored {
 		return
 	}
 	fmt.Fprintf(os.Stderr, "[eunox] NOTICE: taskAnchoredState is enabled but no JWT validation is configured (--jwks-uri) — the anchor comes from the VALIDATED mcp.task_id claim, so every request falls back to session keying and the option has no effect.\n")
@@ -1920,7 +1920,11 @@ func serveStdioHost(ctx context.Context, cfg *config.GatewayConfig, sink *audit.
 	upstreamTimeMs := transport.ResolveUpstreamTimeout(pf.upstreamTimeoutMs, cfg.Defaults.UpstreamTimeoutMs)
 
 	warnNoRedisSharedState(pf.redisConfigured, manifest.HasMaxCalls() || manifest.HasBlastRadiusVelocity() || manifest.HasSequenceBlock() || manifest.HasFlowLabel())
-	warnTaskAnchoringWithoutJWT(pf.jwksURI != "", anyRouteTaskAnchored(cfg))
+	// THIS upstream's resolved posture, not the config's. A stdio host runs exactly one
+	// upstream, so scanning every upstream in the file made it advise about a route this
+	// process is not serving — and stay silent when the one it IS serving turned the option
+	// off per-route while a sibling left it on.
+	warnTaskAnchoringWithoutJWT(pf.jwksURI != "", cfg.ResolvedTaskAnchoredState(u))
 
 	// This upstream's own receipt-signing key domain, from the same local-file loader the
 	// gateway routes use. Absent (the default) leaves the verifier nil and the whole

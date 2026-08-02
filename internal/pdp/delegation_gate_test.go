@@ -104,6 +104,32 @@ func TestDelegationGate_UnresolvableTargetRefuses(t *testing.T) {
 	if got := enforcement.DelegationTargetDenial(nil, "", false, "req-1", "now"); got != nil {
 		t.Fatalf("an undelegated request must not be refused, got %+v", got)
 	}
+
+	// The arm has to be REACHABLE from the PDP gate, not merely present in the engine. Passing
+	// a target with no name through as "tool:" measured it against the chain as if that were an
+	// action, so an unresolved target was refused with "not among the actions delegated" and the
+	// arm written for it never ran.
+	resp := delegationTargetDenial(quarantinedCtx("tool:search"), nil,
+		EnforceTarget{Type: capability.TargetTypeTool, Name: "  "}, false)
+	if resp == nil || resp.Denial == nil {
+		t.Fatal("a delegated request with no resolvable target must be refused")
+	}
+	if got := resp.Denial.Details["reason"]; got != "unresolvable_target" {
+		t.Fatalf("reason = %v, want unresolvable_target", got)
+	}
+
+	// The trim decides only whether the target resolved to ANYTHING. A padded name is still a
+	// different action from the unpadded one, so it is compared untrimmed and refused —
+	// trimming the request would let a delegate reach a grant by naming an action it does not
+	// name, which is the fail-open direction.
+	padded := delegationTargetDenial(quarantinedCtx("tool:search"), nil,
+		EnforceTarget{Type: capability.TargetTypeTool, Name: " search "}, false)
+	if padded == nil {
+		t.Fatal("a padded target names a different action than the grant does and must be refused")
+	}
+	if got := padded.Denial.Details["reason"]; got != "target_not_delegated" {
+		t.Fatalf("reason = %v, want target_not_delegated", got)
+	}
 }
 
 // TestDelegationGate_JWTListFilter covers the catalog leg on a route where the JWT layer is
@@ -132,6 +158,51 @@ func TestDelegationGate_JWTListFilter(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "search") {
 		t.Errorf("the delegated tool was dropped:\n%s", out)
+	}
+}
+
+// TestDelegationGate_JWTDenyCarriesInnerVerdicts is the other side of the coin from the
+// non-fix below. The delegation refusal is downgradable by design, so on an --audit route it
+// becomes a FORWARD — and a refusal the JWT wrapper assembles by short-circuiting above the
+// inner PDP carries none of what the inner PDP would have contributed to that forward. Here
+// the manifest declares a redactFields obligation; without the composition the delegated call
+// forwards the upstream's response UNREDACTED, so adding a chain that only narrows made the
+// proxy leak a field it masks without one.
+func TestDelegationGate_JWTDenyCarriesInnerVerdicts(t *testing.T) {
+	key := newTestKey(t, "k1")
+	srv := makeJWKSServer(t, key)
+	defer srv.Close()
+
+	inner := NewManifestPDP([]capability.Constraint{{
+		Target:     "tool:search",
+		Actions:    []string{"call"},
+		Directives: []capability.Directive{capability.RedactFieldsDirective{Fields: []string{"ssn"}}},
+	}}, gatedEngine(), nil)
+	p := makeJWTPDP(t, srv, "", "", inner)
+
+	claims := &JWTClaims{
+		Subject:         "user@example.com",
+		Capabilities:    []string{"tool:search"},
+		HasCapabilities: true,
+		Delegation: &capability.DelegationChain{
+			Actors: []string{"worker"},
+			Grants: []capability.DelegationGrant{{Subject: "worker", Targets: &[]string{"tool:other"}}},
+		},
+	}
+	// The route-level observe posture, which is what turns this refusal into a forward and so
+	// is the only context where the composed obligation has anything to do.
+	ctx := enforcement.WithSkipQuota(WithJWTClaims(context.Background(), claims))
+	resp := p.Decide(ctx, "s", EnforceTarget{Type: capability.TargetTypeTool, Name: "search"}, nil, "")
+
+	if resp.Decision == capability.DecisionAllow {
+		t.Fatal("a delegate whose chain does not name this tool was allowed")
+	}
+	if resp.Denial == nil || resp.Denial.ConditionType != "delegation" {
+		t.Fatalf("want a delegation refusal, got %+v", resp.Denial)
+	}
+	// The obligation is what an --audit downgrade applies to the forwarded response.
+	if len(resp.Obligations) == 0 {
+		t.Fatal("the composed refusal carries no inner obligation, so an --audit route would forward unredacted")
 	}
 }
 

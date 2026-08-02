@@ -7,6 +7,7 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"os"
 	"slices"
 	"sort"
@@ -114,6 +115,16 @@ type Signature struct {
 // deriving them from a prose description of the format is how two implementations end up
 // disagreeing about a trailing newline. `eunox contracts --attest-payload` prints exactly
 // this.
+//
+// The separator is a newline rather than the length prefix this codebase uses for counter keys,
+// and that is sound HERE for a reason worth stating, since the usual answer is the opposite.
+// Field confusion needs two distinct field tuples to render the same bytes. Reading this
+// payload from the END is unambiguous: statement and role come from closed vocabularies and
+// digest is 64 hex characters, so none of the three can contain a newline and each is
+// determined by counting back from the tail. Everything between the fixed prefix and those
+// three is the id, whatever it contains. There is no shift to find. The one field that COULD
+// carry a newline is the id, and Contract.Validate refuses one outright rather than leaving
+// this argument as the only thing standing between a corpus and a re-presented signature.
 func AttestationPayload(id, digest, role, statement string) []byte {
 	return []byte(strings.Join([]string{attestPayloadPrefix, id, digest, role, statement}, "\n"))
 }
@@ -206,6 +217,38 @@ func (t *TrustStore) Len() int {
 	return len(t.keys)
 }
 
+// maxTrustStoreBytes bounds a trust-store file. It is a bound on how much a MISDIRECTED path
+// can make this read, not on how many keys an operator may configure: RefuseNonRegularPath
+// rejects the device and FIFO cases up front, but a plain regular file of the wrong kind
+// (a log, a core dump, a pointed-at disk image) is exactly what a fat-fingered --trust-keys
+// produces, and reading it whole before discovering it is not JSON is the difference between an
+// error message and an OOM. Four mebibytes is roughly ten thousand Ed25519 keys with their
+// metadata — far past any real store — and it errors rather than truncating, because a
+// truncated store would silently stop trusting the keys past the cut.
+const maxTrustStoreBytes = 4 << 20
+
+// readTrustStoreFile opens the store with the same symlink guard the audit key file uses and
+// reads it under the size bound. O_NOFOLLOW closes the Lstat->open window RefuseNonRegularPath
+// cannot: the trust store names the keys whose attestations are believed, so swapping it for a
+// symlink between the check and the read substitutes the operator's whole trust root.
+func readTrustStoreFile(path string) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|config.OpenNoFollow, 0) //nolint:gosec // G304: operator-supplied trust-store path
+	if err != nil {
+		return nil, fmt.Errorf("reading attestation trust store %q: %w", path, err)
+	}
+	defer func() { _ = f.Close() }()
+	// Read one byte past the bound so a file exactly at the limit still loads and anything
+	// larger is detectable without reading it all.
+	data, err := io.ReadAll(io.LimitReader(f, maxTrustStoreBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("reading attestation trust store %q: %w", path, err)
+	}
+	if len(data) > maxTrustStoreBytes {
+		return nil, fmt.Errorf("attestation trust store %q is larger than %d bytes; refusing to load it rather than trusting a truncated key set", path, maxTrustStoreBytes)
+	}
+	return data, nil
+}
+
 // LoadTrustStore reads a trusted-key file. The format is a JSON object with a "keys" array of
 // TrustedKey. Unknown fields are rejected, and every failure is an error rather than a skipped
 // key: a trust store that silently dropped a malformed entry would report an entry as
@@ -219,9 +262,9 @@ func LoadTrustStore(path string) (*TrustStore, error) {
 	if err := config.RefuseNonRegularPath(resolved, "attestation trust store"); err != nil {
 		return nil, err
 	}
-	data, err := os.ReadFile(resolved) //nolint:gosec // G304: operator-supplied trust-store path
+	data, err := readTrustStoreFile(resolved)
 	if err != nil {
-		return nil, fmt.Errorf("reading attestation trust store %q: %w", resolved, err)
+		return nil, err
 	}
 	var doc struct {
 		Keys []TrustedKey `json:"keys"`

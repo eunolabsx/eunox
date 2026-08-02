@@ -302,10 +302,11 @@ type RouteDefaults struct {
 	//
 	// It is off by default because it changes what every budget in a policy MEANS: a
 	// maxCalls of 20 becomes 20 per task rather than 20 per connection, and two sessions
-	// carrying one task id share one flow-label set. A request with no task claim is
-	// anchored on its session exactly as it is today, so turning this on cannot make two
-	// unauthenticated callers share anything — but it also does nothing at all without a
-	// JWT integration that mints mcp.task_id. See enforcement.WithTaskAnchoredState.
+	// carrying one task id share one flow-label set. A request with NO TOKEN is anchored on
+	// its session exactly as it is today, so turning this on cannot make two unauthenticated
+	// callers share anything; a request that presented a token carrying no task_id is DENIED
+	// (MISSING_CONTEXT) rather than split across both buckets. It does nothing at all without
+	// a JWT integration that mints mcp.task_id. See enforcement.WithTaskAnchoredState.
 	TaskAnchoredState bool `yaml:"taskAnchoredState"`
 }
 

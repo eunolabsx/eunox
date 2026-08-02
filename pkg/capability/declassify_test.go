@@ -295,7 +295,7 @@ func TestCoveringDeclassifyApprovals_ReturnsEveryMatchInTokenOrder(t *testing.T)
 	assert.Equal(t, "apr-1", covering[0].ID)
 	assert.Equal(t, "apr-3", covering[1].ID)
 
-	// FindDeclassifyApproval stays the scope-only test for callers with no store.
-	assert.Equal(t, "apr-1", capability.FindDeclassifyApproval(approvals, "tool:publish", []string{capability.FlowLabelPII}).ID)
-	assert.Nil(t, capability.FindDeclassifyApproval(approvals, "tool:other", []string{capability.FlowLabelPII}))
+	// A target no grant names covers nothing — an empty list rather than a nil-dereferencing
+	// "first match".
+	assert.Empty(t, capability.CoveringDeclassifyApprovals(approvals, "tool:other", []string{capability.FlowLabelPII}))
 }

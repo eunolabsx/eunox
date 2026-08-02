@@ -338,9 +338,9 @@ func TestUsableDeclassifyApproval_TracksConsumption(t *testing.T) {
 }
 
 // TestUsableDeclassifyApproval_LedgerFaultSurfaces keeps the caller able to distinguish "no
-// usable approval" from "could not tell": the hardening path leaves a verdict downgradable on
-// a fault rather than hardening on an unreadable ledger, and it can only do that if the error
-// reaches it.
+// usable approval" from "could not tell". The hardening path turns the fault into the same hard
+// escalation checkDeclassify raises on it, and it can only do that if the error reaches it —
+// swallowing it would make an unreachable ledger the way past the control on a wrapped route.
 func TestUsableDeclassifyApproval_LedgerFaultSurfaces(t *testing.T) {
 	eng := enforcement.New(
 		enforcement.WithCallCounter(&faultyCounter{inner: callcounter.NewInMemory(), failPeek: true}),
@@ -349,5 +349,11 @@ func TestUsableDeclassifyApproval_LedgerFaultSurfaces(t *testing.T) {
 	_, err := eng.UsableDeclassifyApproval(context.Background(),
 		[]capability.DeclassifyApproval{{Labels: []string{capability.FlowLabelPII}, Target: "tool:publish", Approver: "ada", ID: "apr-1", Once: true}},
 		"tool:publish", []string{capability.FlowLabelPII})
+	assert.Error(t, err)
+
+	// Exported, so it is reachable with no engine at all. That must report the fault rather
+	// than panic, and the fault reads as "cannot tell live from spent" like any other.
+	var none *enforcement.Engine
+	_, err = none.UsableDeclassifyApproval(context.Background(), nil, "tool:publish", []string{capability.FlowLabelPII})
 	assert.Error(t, err)
 }

@@ -147,6 +147,13 @@ func (c *Contract) Validate() error {
 	if strings.TrimSpace(c.ID) == "" {
 		return fmt.Errorf("contract entry is missing 'id'")
 	}
+	// The id is the only free-form field inside the signed attestation payload, whose fields
+	// are newline-separated. Refusing a newline keeps that payload's field boundaries a
+	// property of the format rather than of an argument about which fields happen to be
+	// newline-free — and an id is a "vendor/tool" slug, so nothing legitimate is lost.
+	if strings.ContainsAny(c.ID, "\r\n") {
+		return fmt.Errorf("contract %q: 'id' contains a line break; an id is a vendor/tool slug and is embedded verbatim in the signed attestation payload", c.ID)
+	}
 	if strings.TrimSpace(c.Tool) == "" {
 		return fmt.Errorf("contract %q is missing 'tool'", c.ID)
 	}

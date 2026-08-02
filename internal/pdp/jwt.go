@@ -1271,8 +1271,16 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 	// to nothing, so a delegate whose grant reaches no target was still allowed. Running it
 	// before the capability logic also means a delegated call is refused for the reason that
 	// actually bounds it rather than for whichever check happened to fire first.
+	//
+	// Composed through withInnerVerdicts for the reason every other short-circuit above the
+	// inner PDP is: the refusal is downgradable by design (see delegationDenial), so on an
+	// --audit route it becomes a FORWARD — and a forward assembled here carries none of the
+	// three things the inner PDP would have contributed had it run. Without this, adding a
+	// delegation chain to a token made the same request forward UNREDACTED, past a broken
+	// interface pin, and past the effect ceiling. That is the exact inversion the seam exists
+	// to prevent, arrived at through the one axis that only ever narrows.
 	if deny := delegationTargetDenial(ctx, p.clock, target, false); deny != nil {
-		return *deny
+		return p.withInnerVerdicts(ctx, sessionID, *deny, target, args)
 	}
 
 	// No mcp.capabilities field: the JWT provides identity only and the decision
@@ -1944,8 +1952,7 @@ func (p *JWTPDP) filterList(ctx context.Context, result json.RawMessage, desc li
 			id = innerRes.entryIDs[i]
 			covered = anyCapCoversName(id, desc.targetType, parsed)
 		} else {
-			id = entryIDOf(raw, desc.idField)
-			covered = entryCoveredByClaims(raw, parsed, desc.idField, desc.targetType)
+			id, covered = entryCoveredByClaims(raw, parsed, desc.idField, desc.targetType)
 		}
 		if covered && !chain.IsEmpty() {
 			// An entry whose id could not be decoded cannot be scoped against the chain, so
@@ -2090,8 +2097,8 @@ func emptyListing(resultBytes json.RawMessage, listKey string) ListFilterResult 
 	})
 }
 
-// entryCoveredByClaims reports whether a single list entry's identifier — the JSON
-// field idField, "name" for tools/prompts or "uri" for resources — is covered by a
+// entryCoveredByClaims reports a single list entry's identifier — the JSON field idField,
+// "name" for tools/prompts or "uri" for resources — and whether it is covered by a
 // capability claim of targetType. Conditions are not evaluated (list methods carry
 // no arguments) and it fails closed (false) on a decode error. Both id fields are
 // decoded and the requested one selected, so an entry missing idField yields the
@@ -2104,44 +2111,30 @@ func emptyListing(resultBytes json.RawMessage, listKey string) ListFilterResult 
 // render a different name/uri to a case-sensitive host, and this path (reached whenever
 // the inner PDP is nil or AlwaysAllowPDP, i.e. its result comes from an unfiltered
 // passThroughList) is the one list-filter path that had no per-entry gate at all.
-func entryCoveredByClaims(raw json.RawMessage, parsed []capHead, idField string, targetType capability.TargetType) bool {
+// It returns the identifier alongside the verdict because the caller needs both — the verdict
+// to keep the entry, the id to scope it against a delegation chain — and asking two functions
+// meant two duplicate-key scans and two unmarshals of the same bytes, per entry, on every
+// list. A 200-entry catalog paid that twice over for nothing; the id falls out of the decode
+// the coverage test already performs.
+//
+// An ambiguous or undecodable entry yields ("", false): no identifier to scope and nothing to
+// keep, which is the same fail-closed answer both halves gave separately.
+func entryCoveredByClaims(raw json.RawMessage, parsed []capHead, idField string, targetType capability.TargetType) (id string, covered bool) {
 	if entryKeysAmbiguous(raw) {
-		return false
+		return "", false
 	}
 	var entry struct {
 		Name string `json:"name"`
 		URI  string `json:"uri"`
 	}
 	if err := json.Unmarshal(raw, &entry); err != nil {
-		return false
+		return "", false
 	}
-	name := entry.Name
+	id = entry.Name
 	if idField == "uri" {
-		name = entry.URI
+		id = entry.URI
 	}
-	return anyCapCovers(parsed, EnforceTarget{Type: targetType, Name: name})
-}
-
-// entryIDOf decodes a list entry's identifier — its "name", or its "uri" for a resource — for
-// a caller that needs the id itself rather than a coverage verdict. It shares
-// entryCoveredByClaims' ambiguity gate: an entry carrying both "name" and "Name" has no
-// single identifier, so it yields "" and the caller drops it rather than scoping the wrong
-// string.
-func entryIDOf(raw json.RawMessage, idField string) string {
-	if entryKeysAmbiguous(raw) {
-		return ""
-	}
-	var entry struct {
-		Name string `json:"name"`
-		URI  string `json:"uri"`
-	}
-	if err := json.Unmarshal(raw, &entry); err != nil {
-		return ""
-	}
-	if idField == "uri" {
-		return entry.URI
-	}
-	return entry.Name
+	return id, anyCapCovers(parsed, EnforceTarget{Type: targetType, Name: id})
 }
 
 // sqlVerbs is the set of SQL statement verbs the op= scan-all-args evaluator

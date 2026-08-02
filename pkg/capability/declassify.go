@@ -178,11 +178,18 @@ type DeclassifyApproval struct {
 	// here — a single-use grant with nothing to burn is not enforceable as written, so it is
 	// refused at the token boundary rather than silently degrading to a standing one.
 	//
-	// The ledger lives in the FlowLabelStore (the same session-lifetime backend already
-	// holding the labels this grant clears) under the same anchor, so a task-anchored
-	// deployment burns the approval for the TASK: an agent cannot spend a one-shot approval
-	// again by re-entering through a fresh session, which is exactly the replay a
-	// per-session ledger would leave open.
+	// The ledger lives in the CallCounter, and it is deliberately NOT anchored: the burn is a
+	// property of the approval itself, not of the session or task that spent it. Anchoring it
+	// would leave the replay the flag exists to close — re-entering through a fresh session (or
+	// a fresh task_id, which the caller supplies) gives a fresh ledger and the grant is live
+	// again. It is also written through the counter's atomic admission rather than a
+	// read-then-write on the label store, so two concurrent calls cannot both observe the grant
+	// unspent and both clear.
+	//
+	// The entry is retained for a bounded window (declassifyLedgerWindowSec) rather than
+	// forever, because a counter backend has no unbounded key space to spend. That window is far
+	// longer than any token this claim can ride: an approval whose token outlives it is a token
+	// lifetime problem, and the engine's doc says so at the constant.
 	Once bool `json:"once,omitempty"`
 }
 
@@ -306,11 +313,8 @@ func ParseDeclassifyApprovals(raw json.RawMessage) ([]DeclassifyApproval, error)
 	out := make([]DeclassifyApproval, 0, len(msgs))
 	for i, m := range msgs {
 		var a DeclassifyApproval
-		if err := rejectUnknownJSONFields(m, &a, fmt.Sprintf("mcp.%s approval %d", ClaimDeclassify, i)); err != nil {
+		if err := decodeClaimObject(m, &a, fmt.Sprintf("mcp.%s approval %d", ClaimDeclassify, i)); err != nil {
 			return nil, err
-		}
-		if err := json.Unmarshal(m, &a); err != nil {
-			return nil, fmt.Errorf("mcp.%s approval %d: %w", ClaimDeclassify, i, err)
 		}
 		a.Target = strings.TrimSpace(a.Target)
 		a.Approver = strings.TrimSpace(a.Approver)
@@ -342,21 +346,11 @@ func CoveringDeclassifyApprovals(approvals []DeclassifyApproval, target string, 
 	return out
 }
 
-// FindDeclassifyApproval returns the first approval covering every label in want at
-// target, or nil when none does. Order is the token's, so a control plane that appends
-// approvals gets the oldest covering grant — which is the one whose id an operator is
-// most likely to be holding. Returning the grant itself (rather than a bool) is what lets
-// the caller stamp the approver and id onto the audit record.
-//
-// It answers SCOPE only. Whether a single-use grant is still live is a question only the
-// engine can answer (the ledger is engine state), so every decision path — including the
-// wrapping-PDP hardening check, which used this and was wrong to — goes through
-// Engine.UsableDeclassifyApproval instead. What remains here is the scope predicate itself,
-// used by CoveringDeclassifyApprovals and available to a caller reasoning about a grant with
-// no engine in hand.
-func FindDeclassifyApproval(approvals []DeclassifyApproval, target string, want []string) *DeclassifyApproval {
-	if covering := CoveringDeclassifyApprovals(approvals, target, want); len(covering) > 0 {
-		return covering[0]
-	}
-	return nil
-}
+// There is deliberately no first-covering-grant accessor beside CoveringDeclassifyApprovals.
+// One existed, answering SCOPE alone, and the wrapping-PDP hardening path called it and was
+// wrong to: a single-use grant already burned covers a call on paper, so the scope-only answer
+// read as authorization and left a downgradable refusal in place where the engine hard-escalates.
+// Whether a grant is still LIVE is a question only the engine can answer (the ledger is engine
+// state), so the two callable shapes are the full list — for a caller that will test liveness
+// itself — and Engine.UsableDeclassifyApproval. Re-adding the looser one puts the same footgun
+// back within reach of exactly the code that already picked it up.

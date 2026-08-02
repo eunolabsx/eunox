@@ -103,10 +103,9 @@ func TestDelegation_ForcedLabelsTaintTheDelegatesCalls(t *testing.T) {
 		"the tape must distinguish taint the chain imposed from taint the proxy observed")
 }
 
-// TestDelegation_AllowLabelCapQuarantinesEveryLabeledSink is the acceptance shape the issue
-// states: a sub-agent sharing a tainted task reaches NO sink, however it is injected — because
-// its hop capped the sink allow-set to empty, and the intersection of anything with empty is
-// empty.
+// TestDelegation_AllowLabelCapQuarantinesEveryLabeledSink is the full quarantine: a sub-agent
+// sharing a tainted task reaches NO sink, however it is injected — because its hop capped the
+// sink allow-set to empty, and the intersection of anything with empty is empty.
 func TestDelegation_AllowLabelCapQuarantinesEveryLabeledSink(t *testing.T) {
 	eng := declassifyEngine()
 	ctx := context.Background()

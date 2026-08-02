@@ -5,13 +5,32 @@ package pdp
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/eunolabs/eunox/pkg/callcounter"
 	"github.com/eunolabs/eunox/pkg/capability"
 	"github.com/eunolabs/eunox/pkg/enforcement"
 	"github.com/eunolabs/eunox/pkg/flowlabelstore"
 )
+
+// faultyPeekCounter is a call counter whose ledger read always faults, so a test can put the
+// declassify ledger in the one state the hardening path has to answer for: "cannot tell a live
+// single-use grant from a spent one".
+type faultyPeekCounter struct{}
+
+func (faultyPeekCounter) IncrementAndGet(_ context.Context, _ string, _, _ int) (int64, error) {
+	return 0, nil
+}
+
+func (faultyPeekCounter) Peek(_ context.Context, _ string, _ int) (int64, error) {
+	return 0, errors.New("ledger backend unreachable")
+}
+
+func (faultyPeekCounter) AdmitAll(_ context.Context, _ []capability.QuotaBucket) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error) {
+	return true, -1, 0, 0, nil
+}
 
 // declassifyPDP builds a ManifestPDP over caps with a real flow store.
 func declassifyPDP(t *testing.T, caps []capability.Constraint) *ManifestPDP {
@@ -112,5 +131,45 @@ func TestDeclassify_ComposedRefusalStaysHard(t *testing.T) {
 	unchanged := p.HardenRefusal(approved, "s", soft, target, map[string]interface{}{})
 	if unchanged.Decision == capability.DecisionEscalate {
 		t.Fatal("an approved declassification must not harden the wrapping layer's verdict into an escalation")
+	}
+}
+
+// TestDeclassify_ComposedRefusalHardensOnAnUnreadableLedger closes the same inversion from the
+// other direction. checkDeclassify raises a HARD `ledger_unavailable` escalation when it cannot
+// tell a live single-use grant from a spent one; leaving the wrapping layer's SOFT refusal in
+// place on the identical fault meant an --audit route FORWARDED the call, so an unreachable
+// ledger became the way to run a declassification the same manifest blocks without a token.
+func TestDeclassify_ComposedRefusalHardensOnAnUnreadableLedger(t *testing.T) {
+	eng := enforcement.New(
+		enforcement.WithCallCounter(faultyPeekCounter{}),
+		enforcement.WithFlowLabelStore(flowlabelstore.NewInMemory()),
+	)
+	p := NewManifestPDP([]capability.Constraint{{
+		Target:     "tool:sanitize",
+		Actions:    []string{"call"},
+		Directives: []capability.Directive{capability.DeclassifyDirective{Labels: []string{capability.FlowLabelPII}}},
+	}}, eng, nil)
+
+	// A covering, single-use grant — so the answer turns entirely on the ledger read.
+	ctx := WithJWTClaims(context.Background(), &JWTClaims{
+		Subject: "svc",
+		Declassify: []capability.DeclassifyApproval{{
+			Labels: []string{capability.FlowLabelPII}, Target: "tool:sanitize",
+			Approver: "alice", ID: "apr-1", Once: true,
+		}},
+	})
+	soft := capability.EnforceResponse{
+		Decision: capability.DecisionDeny,
+		Denial: &capability.DenialInfo{
+			Code:    capability.ErrCodeAuthorizationFailed,
+			Message: "tool \"sanitize\" is not in the JWT capability claims",
+		},
+	}
+	hardened := p.HardenRefusal(ctx, "s", soft, EnforceTarget{Type: capability.TargetTypeTool, Name: "sanitize"}, map[string]interface{}{})
+	if hardened.Denial == nil || !hardened.Denial.HardDeny {
+		t.Fatalf("an unreadable ledger must leave a non-downgradable refusal: %+v", hardened.Denial)
+	}
+	if got := hardened.Denial.Details["reason"]; got != "ledger_unavailable" {
+		t.Fatalf("reason = %v, want ledger_unavailable so the tape names the fault rather than a missing approval", got)
 	}
 }

@@ -303,9 +303,10 @@ own. Three seams are pluggable via functional options:
   antecedents, `maxCalls` and cumulative `blastRadius` budgets, spent single-use
   declassify grants) on the caller's validated `mcp.task_id` claim instead of on
   its session, so it survives a hop to a second enforcement point. Opt-in, and it
-  falls back to session keying for a request carrying no task claim — so it can
-  never make two unauthenticated callers share state. `anchor.go` owns the choice,
-  and every key builder routes through it.
+  falls back to session keying for a request carrying **no token** — so it can
+  never make two unauthenticated callers share state — while an authenticated
+  request whose token carries no task id is denied rather than accounted against a
+  second bucket. `anchor.go` owns the choice, and every key builder routes through it.
 
 Two narrowing surfaces ride an already-verified token rather than the manifest,
 because they are properties of the CALLER rather than of the policy: the

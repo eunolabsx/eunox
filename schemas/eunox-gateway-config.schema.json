@@ -182,7 +182,7 @@
         },
         "taskAnchoredState": {
           "type": "boolean",
-          "description": "Key accumulated enforcement state \u2014 flow-label taint, sequenceBlock antecedents, maxCalls and cumulative blastRadius budgets, spent single-use declassify grants \u2014 on the caller's VALIDATED mcp.task_id claim rather than on its session, so the state survives a hop between enforcement points instead of restarting clean on the far side. Off by default because it changes what every budget in a policy MEANS: a maxCalls of 20 becomes 20 per task rather than 20 per connection. A request whose token carries no task_id is anchored on its session exactly as it is today, so this can never make two unauthenticated callers share state \u2014 and it does nothing without a JWT integration that mints mcp.task_id.",
+          "description": "Key accumulated enforcement state \u2014 flow-label taint, sequenceBlock antecedents, maxCalls and cumulative blastRadius budgets, spent single-use declassify grants \u2014 on the caller's VALIDATED mcp.task_id claim rather than on its session, so the state survives a hop between enforcement points instead of restarting clean on the far side. Off by default because it changes what every budget in a policy MEANS: a maxCalls of 20 becomes 20 per task rather than 20 per connection. A request with no token at all is anchored on its session exactly as it is today, so this can never make two unauthenticated callers share state; a request that presented a token carrying no task_id is DENIED (MISSING_CONTEXT) rather than accounted against a second, session-keyed bucket. It does nothing without a JWT integration that mints mcp.task_id.",
           "default": false
         },
         "upstreamTimeoutMs": {

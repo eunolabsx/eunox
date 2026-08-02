@@ -569,15 +569,20 @@ func (e *Engine) rollbackLabels(ctx context.Context, req *capability.EnforceRequ
 	if e.flowStore == nil || req.SessionID == "" || len(added) == 0 {
 		return
 	}
-	// Not under task anchoring. The rollback removes exactly the labels THIS call added,
-	// computed from a snapshot peeked under this session's decision lock — and that lock does
-	// not span a task key two sessions share. A concurrent session that legitimately added the
-	// same label between the snapshot and here would have it deleted, leaving the task
+	// Not when THIS request is task-keyed. The rollback removes exactly the labels this call
+	// added, computed from a snapshot peeked under this session's decision lock — and that lock
+	// does not span a task key two sessions share. A concurrent session that legitimately added
+	// the same label between the snapshot and here would have it deleted, leaving the task
 	// UNTAINTED for a source read that really happened: a fail-open on precisely the "for all
 	// flows" claim the anchor exists to extend. Declining to roll back strands this call's
 	// label instead, which over-blocks a later sink — the direction the whole rollback path
 	// already accepts as its residual when a Remove faults.
-	if e.taskAnchored {
+	//
+	// The question is about the REQUEST, not the engine's mode. A task-anchored engine still
+	// keys a token-less caller on its session, where the decision lock does span the key and
+	// no concurrent writer exists — standing down there strands a label for a hazard that
+	// cannot occur, on every unauthenticated caller the route serves.
+	if e.anchoredOnTask(req) {
 		return
 	}
 	_ = e.flowStore.Remove(ctx, e.flowKey(req), added...)

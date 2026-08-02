@@ -257,6 +257,31 @@ func TestLoadTrustStore_RejectsMalformed(t *testing.T) {
 		_, loadErr := registry.LoadTrustStore(path)
 		assert.Error(t, loadErr)
 	})
+
+	// A mistyped --trust-keys lands on some other regular file, and reading it whole before
+	// discovering it is not JSON is the difference between an error and an OOM.
+	t.Run("oversized file", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "huge.json")
+		require.NoError(t, os.WriteFile(path, make([]byte, (4<<20)+1), 0o600))
+		_, loadErr := registry.LoadTrustStore(path)
+		require.Error(t, loadErr)
+		assert.Contains(t, loadErr.Error(), "larger than")
+	})
+
+	// The store names the keys whose attestations are believed, so a symlink swapped in
+	// between the regularity check and the read would substitute the whole trust root. The
+	// open carries O_NOFOLLOW, which closes that window on platforms that have it.
+	t.Run("symlink", func(t *testing.T) {
+		dir := t.TempDir()
+		target := filepath.Join(dir, "keys.json")
+		require.NoError(t, os.WriteFile(target, []byte(`{"keys":[]}`), 0o600))
+		link := filepath.Join(dir, "link.json")
+		if err := os.Symlink(target, link); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+		_, loadErr := registry.LoadTrustStore(link)
+		assert.Error(t, loadErr)
+	})
 }
 
 // TestVerifyAttestations_NilStoreTrustsNothing is the default posture: without --trust-keys

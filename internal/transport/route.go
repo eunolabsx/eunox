@@ -655,8 +655,8 @@ func LoadUpstreamPDP(u *config.UpstreamConfig, hostTransport, baseDir string, co
 		// Key this route's accumulated state on the caller's validated mcp.task_id claim
 		// instead of on its session, so taint, antecedents, budgets, and spent one-shot
 		// approvals survive a hop to another enforcement point. Wired only when the route
-		// asks for it: it changes what every budget in the policy means, and a request with
-		// no task claim falls back to session keying either way.
+		// asks for it: it changes what every budget in the policy means, and a token that
+		// authenticated without carrying a task id is refused rather than accounted twice.
 		engineOpts = append(engineOpts, enforcement.WithTaskAnchoredState())
 	}
 	if !merged.HasFlowLabel() {

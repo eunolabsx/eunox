@@ -140,8 +140,8 @@ func TestParseDelegationGrants_PreservesPresentEmpty(t *testing.T) {
 }
 
 // TestValidateDelegationChain_RefusesEveryWideningDirection is the monotonicity assertion,
-// one case per axis. Each axis narrows in its OWN direction, so a single "is a subset" test
-// would be wrong for three of the five.
+// one case per ASSERTED axis. Each narrows in its OWN direction, so a single "is a subset" test
+// would be wrong for one of the three.
 func TestValidateDelegationChain_RefusesEveryWideningDirection(t *testing.T) {
 	for name, tc := range map[string]struct {
 		prior, next capability.DelegationGrant
@@ -152,20 +152,10 @@ func TestValidateDelegationChain_RefusesEveryWideningDirection(t *testing.T) {
 			capability.DelegationGrant{Subject: "b", Targets: list("tool:read", "tool:write")},
 			"does not hold",
 		},
-		"drops taint its delegator carries": {
-			capability.DelegationGrant{Subject: "a", Labels: []string{capability.FlowLabelUntrusted}},
-			capability.DelegationGrant{Subject: "b"},
-			"drops flow label",
-		},
 		"admits taint at a sink its delegator cannot": {
 			capability.DelegationGrant{Subject: "a", AllowLabels: list(capability.FlowLabelPublic)},
 			capability.DelegationGrant{Subject: "b", AllowLabels: list(capability.FlowLabelPublic, capability.FlowLabelPII)},
 			"admits flow label",
-		},
-		"unmasks a field its delegator redacts": {
-			capability.DelegationGrant{Subject: "a", RedactFields: []string{"ssn"}},
-			capability.DelegationGrant{Subject: "b"},
-			"unmasks field",
 		},
 		"caps effect class above its delegator": {
 			capability.DelegationGrant{Subject: "a", MaxEffectClass: capability.EffectReversible},
@@ -179,6 +169,24 @@ func TestValidateDelegationChain_RefusesEveryWideningDirection(t *testing.T) {
 			assert.Contains(t, err.Error(), tc.want)
 		})
 	}
+}
+
+// TestValidateDelegationChain_UnionAxesAreNotAsserted pins the other half of the split: a hop
+// that names none of its delegator's labels or redactions is ACCEPTED, because the decision path
+// unions both across every hop and so the delegate carries them anyway. Rejecting the shape
+// demanded that every hop restate every ancestor's values, and the whole TOKEN was denied when
+// one did not — a monotonicity check denying a monotone chain.
+func TestValidateDelegationChain_UnionAxesAreNotAsserted(t *testing.T) {
+	chain, err := capability.ValidateDelegationChain(nil, []capability.DelegationGrant{
+		{Subject: "a", Labels: []string{capability.FlowLabelUntrusted}, RedactFields: []string{"ssn"}},
+		{Subject: "b", Labels: []string{capability.FlowLabelPII}, RedactFields: []string{"dob"}},
+		{Subject: "c"},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, chain)
+	// Both hops' declarations survive to the decision path, so nothing hop c omitted was lost.
+	assert.ElementsMatch(t, []string{capability.FlowLabelUntrusted, capability.FlowLabelPII}, chain.ForcedLabels())
+	assert.Equal(t, []string{"dob", "ssn"}, chain.RedactFields())
 }
 
 // TestValidateDelegationChain_AcceptsNarrowing is the positive case for every axis at once.
@@ -220,6 +228,31 @@ func TestValidateDelegationChain_ActorsAndGrantsMustAgree(t *testing.T) {
 	_, err = capability.ValidateDelegationChain([]string{"a", "b"}, []capability.DelegationGrant{{Subject: "a"}, {Subject: "z"}})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "chain names")
+}
+
+// TestValidateDelegationChain_PresentEmptyGrantsDisagreeWithActors is the mis-mint most likely
+// to come out of an IdP template: the act chain is right and the grant array came out empty.
+// Zero hops beside two actors is a disagreement like any other, and collapsing present-empty
+// into absent made it the one that passed silently — leaving the operator believing an
+// attenuation is in force that the token does not carry.
+func TestValidateDelegationChain_PresentEmptyGrantsDisagreeWithActors(t *testing.T) {
+	grants, err := capability.ParseDelegationGrants(json.RawMessage(`[]`))
+	require.NoError(t, err)
+	require.NotNil(t, grants, "a present-empty claim must stay distinguishable from an absent one")
+
+	_, err = capability.ValidateDelegationChain([]string{"a", "b"}, grants)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "hop for hop")
+
+	// The genuinely act-only token — no delegation claim at all — is still well-formed: it
+	// carries the chain's identities and states no narrowing.
+	absent, err := capability.ParseDelegationGrants(nil)
+	require.NoError(t, err)
+	require.Nil(t, absent)
+	chain, err := capability.ValidateDelegationChain([]string{"a", "b"}, absent)
+	require.NoError(t, err)
+	require.NotNil(t, chain)
+	assert.Equal(t, "b", chain.Delegate())
 }
 
 // TestValidateDelegationChain_EmptyIsNoChain keeps the common path free: no act, no grants, no

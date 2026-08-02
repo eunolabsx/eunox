@@ -2351,6 +2351,11 @@ than clearing again:
 - **A call refused after its burn does not get the use back.** The grant is spent.
   That over-refuses (mint another approval) rather than handing a use back to a
   caller whose action may still have been forwarded by an `--audit` route.
+- **A token carries at most 32 approvals**, and each approval is decoded with the same
+  three strict rules a delegation grant is: an unknown member, an explicit `null`, or a
+  duplicate key rejects the token. `"once": null` is the one that matters most — it
+  decodes to `false`, which is a *standing* grant, i.e. exactly the replay window `once`
+  exists to close. Omit the member instead of writing `null`.
 
 A standing grant (`once` unset) still behaves exactly as before, because an operator
 whose control plane already mints a short-lived token per approval has the property
@@ -2494,11 +2499,22 @@ attenuation is a property of the caller, not of the policy.
 | `redactFields` | **growing** | unioned with the constraint's own redaction |
 | `maxEffectClass` | **no higher** | the resolved effect class must be at or below it |
 
-A hop that moves any field the other way is a **widening**, and a widening token is
-**rejected outright** rather than clamped. Clamping would leave a mis-minted token
-working while quietly meaning something other than what it says, and the whole value
-of the chain is that "the delegate is no broader than its delegator" is a property
-someone can check rather than a convention someone follows.
+Three of the five — `targets`, `allowLabels`, `maxEffectClass` — are also **asserted at
+the token boundary**, and a hop that moves one of those the other way is a **widening**
+whose token is **rejected outright** rather than clamped. Clamping would leave a
+mis-minted token working while quietly meaning something other than what it says, and the
+whole value of the chain is that "the delegate is no broader than its delegator" is a
+property someone can check rather than a convention someone follows.
+
+`labels` and `redactFields` are not asserted, and the difference is worth understanding
+before you write a chain. The asserted three are the axes whose value reads as a **claim
+of authority** — "I may reach these", "I may carry taint into these sinks", "I may cause
+up to this" — where declaring more than your delegator held is visible nonsense. The
+other two impose something on the hop **itself**, and the decision path **unions** them
+across every hop: a hop that names a different taint than its delegator adds to it, and a
+hop that names none inherits its delegator's untouched. Neither can widen by construction,
+so **you do not restate your ancestors' `labels` and `redactFields`** — a hop that omits
+them loses nothing.
 
 That assertion is not what the enforcement rests on, though. The decision path applies
 **every** hop's grant, not just the last one — so even a chain whose monotonicity check
@@ -2532,8 +2548,21 @@ delegator's whole surface: the manifest still bounds it.
   either would be guessing. Grants without an `act` chain are accepted (an IdP that
   does not implement RFC 8693 can still express attenuation, and a grant can only
   narrow).
-- **Depth is capped at 8.** The chain is attacker-influenced input the decision path
-  walks once per enforced call.
+- **Depth is capped at 8, and each list-valued member at 256 entries.** The chain is
+  attacker-influenced input the decision path walks once per enforced call, and each hop's
+  `targets` become a lookup index built per token.
+- **A grant is decoded strictly, and three shapes reject the token.** An unknown member
+  (`targts` would decode to *no* target restriction), an explicit `null` (`"targets": null`
+  is a nil pointer, which this grammar reads as unrestricted), and a duplicate key
+  (`targets` beside `Targets` is one field to a JSON decoder and the last one wins, so
+  which takes effect depends on member order). All three would produce a grant that reads
+  as a narrowing and is not one, so they fail loudly: the caller cannot authenticate,
+  rather than losing a control silently. Omit a member you do not want to set — do not
+  write `null`.
+- **`act` may carry the actor's `iss` and `client_id`** beside its `sub`. RFC 8693 defines
+  an actor object as a set of claims identifying the actor, and a token-exchange IdP
+  routinely writes its issuer there. Any other member is refused, so a misspelled `act`
+  (which would silently truncate the chain) is still caught.
 - **No experimental gate.** Every axis narrows, so a build that honors these claims can
   only deny more than one that ignores them — there is no fail-open direction to gate
   against. That is why this differs from `mcp.capabilities`, which *replaces* the

@@ -25,8 +25,7 @@ import (
 //   - `mcp.delegation`, an array of grants ordered delegator-first (agent-a, then agent-b),
 //     one per hop. It carries WHAT each hop kept.
 //
-// Every grant NARROWS along a fixed direction per field, and each direction is asserted at
-// the token boundary (ValidateDelegationChain) rather than left to the minting side's care:
+// Every grant NARROWS along a fixed direction per field:
 //
 //	targets       subset      — a delegate may reach fewer actions, never more
 //	labels        superset    — a delegate's calls carry at least as much taint
@@ -34,11 +33,14 @@ import (
 //	redactFields  superset    — a delegate sees at least as much redacted
 //	maxEffectClass  no higher — a delegate may cause no more consequential an effect
 //
-// A hop that moves any field the other way is a WIDENING, and a widening token is rejected
-// outright rather than clamped. Clamping would let a mis-minted (or forged-upstream) token
-// keep working while quietly meaning something other than what it says, and the whole value
-// of the chain is that "the delegate is no broader than its delegator" is a property someone
-// can check rather than a convention someone follows.
+// Three of the five are also ASSERTED at the token boundary (ValidateDelegationChain) rather
+// than left to the minting side's care. A hop that moves one of those the other way is a
+// WIDENING, and a widening token is rejected outright rather than clamped. Clamping would let a
+// mis-minted (or forged-upstream) token keep working while quietly meaning something other than
+// what it says, and the whole value of the chain is that "the delegate is no broader than its
+// delegator" is a property someone can check rather than a convention someone follows. The
+// other two — labels and redactFields — are unioned across hops by the decision path and so
+// cannot widen at all; NarrowsFrom says why asserting them anyway was harmful.
 //
 // The assertion is not what the enforcement rests on, though — the decision path applies
 // EVERY hop's grant, not just the last one. So even a chain whose monotonicity check was
@@ -63,6 +65,13 @@ const (
 // it. Eight is far above any real delegation topology (a planner handing to a researcher
 // handing to a tool-runner is three) and far below anything that costs measurable time.
 const MaxDelegationDepth = 8
+
+// actorIdentityMembers are the `act` members this build admits without decoding: the ones an
+// RFC 8693 IdP writes to say WHICH namespace the actor's `sub` belongs to. They are
+// identity-descriptive and scope nothing, so ignoring them loses no narrowing — which is the
+// bar for admitting a member at all. Anything else stays refused, because a member this build
+// does not recognize may well be the one carrying the attenuation.
+var actorIdentityMembers = []string{"iss", "client_id"}
 
 // DelegationGrant is ONE hop's remaining authority: what the delegate at this depth kept of
 // what its delegator held. Every field is optional except Subject, and an omitted field means
@@ -460,6 +469,21 @@ func (g *DelegationGrant) Validate() error {
 // (there is nothing to compare against and nothing was widened). A field the delegate leaves
 // unset likewise removes nothing: the delegator's grant is applied at decision time in its own
 // right, so an omitted field cannot escape it.
+//
+// Only THREE of the five axes are asserted here, and the split is not an oversight. An axis is
+// checkable at the boundary when a hop's value reads as a CLAIM OF AUTHORITY — targets ("I may
+// reach these"), allowLabels ("I may carry taint into these sinks"), maxEffectClass ("I may
+// cause up to this") — where declaring more than the delegator held is visible nonsense worth
+// being loud about even though the decision path refuses it anyway.
+//
+// labels and redactFields are the other kind: a hop declaring them imposes something on ITSELF,
+// and the decision path UNIONS them across every hop. A hop that names a different taint than
+// its delegator adds to it; a hop that names none inherits its delegator's untouched. Neither
+// can widen, by construction — so there is nothing at the boundary to assert, and asserting it
+// anyway did real damage: it demanded every hop restate every ancestor's labels and redactions,
+// and a chain that did not (which is the ordinary way these are minted, since the union makes
+// restating pointless) was reported as a widening and REJECTED THE TOKEN. A monotonicity check
+// that denies a monotone chain is worse than no check on that axis.
 func (g *DelegationGrant) NarrowsFrom(prior *DelegationGrant) error {
 	if g == nil {
 		// Every other method in this package guards its receiver; this one is reached with a
@@ -482,15 +506,6 @@ func (g *DelegationGrant) NarrowsFrom(prior *DelegationGrant) error {
 			}
 		}
 	}
-	held := make(map[string]bool, len(g.Labels))
-	for _, l := range g.Labels {
-		held[l] = true
-	}
-	for _, l := range prior.Labels {
-		if !held[l] {
-			return fmt.Errorf("hop %q drops flow label %q that its delegator %q carries; a delegate's calls must carry at least its delegator's taint", g.Subject, l, prior.Subject)
-		}
-	}
 	if prior.AllowLabels != nil && g.AllowLabels != nil {
 		allowed := make(map[string]bool, len(*prior.AllowLabels))
 		for _, l := range *prior.AllowLabels {
@@ -500,15 +515,6 @@ func (g *DelegationGrant) NarrowsFrom(prior *DelegationGrant) error {
 			if !allowed[l] {
 				return fmt.Errorf("hop %q admits flow label %q at a sink, which its delegator %q does not; a delegate cannot carry taint anywhere its delegator cannot", g.Subject, l, prior.Subject)
 			}
-		}
-	}
-	masked := make(map[string]bool, len(g.RedactFields))
-	for _, f := range g.RedactFields {
-		masked[f] = true
-	}
-	for _, f := range prior.RedactFields {
-		if !masked[f] {
-			return fmt.Errorf("hop %q unmasks field %q that its delegator %q redacts; a delegate must see at least as much redacted", g.Subject, f, prior.Subject)
 		}
 	}
 	if prior.MaxEffectClass != "" && g.MaxEffectClass != "" && !EffectClassAtMost(g.MaxEffectClass, prior.MaxEffectClass) {
@@ -525,32 +531,17 @@ func (g *DelegationGrant) NarrowsFrom(prior *DelegationGrant) error {
 // It is deliberately NOT the effective grant the decision path applies — that stays "every hop
 // applies", so the enforcement does not depend on this fold being right. This only decides
 // what a later hop is measured against.
+// It folds only the three axes NarrowsFrom asserts. labels and redactFields are unioned by the
+// decision path across every hop and cannot widen (see NarrowsFrom), so accumulating them into
+// a floor nobody compares against was work with no reader.
 func (g *DelegationGrant) tightenedBy(next *DelegationGrant) *DelegationGrant {
 	out := *g
 	out.Subject = next.Subject
 	if next.Targets != nil {
 		out.Targets = next.Targets
 	}
-	if len(next.Labels) > 0 {
-		out.Labels = NormalizeDeclaredLabels(append(append([]string{}, g.Labels...), next.Labels...))
-	}
 	if next.AllowLabels != nil {
 		out.AllowLabels = next.AllowLabels
-	}
-	if len(next.RedactFields) > 0 {
-		set := map[string]bool{}
-		for _, f := range g.RedactFields {
-			set[f] = true
-		}
-		for _, f := range next.RedactFields {
-			set[f] = true
-		}
-		merged := make([]string, 0, len(set))
-		for f := range set {
-			merged = append(merged, f)
-		}
-		sort.Strings(merged)
-		out.RedactFields = merged
 	}
 	if next.MaxEffectClass != "" && (out.MaxEffectClass == "" || EffectClassAtMost(next.MaxEffectClass, out.MaxEffectClass)) {
 		out.MaxEffectClass = next.MaxEffectClass
@@ -587,11 +578,15 @@ func ParseActorChain(raw json.RawMessage) ([]string, error) {
 		// "acts" would otherwise TRUNCATE the chain silently, and with an act-only token
 		// nothing downstream detects it — the hop-for-hop agreement check is skipped when
 		// there are no grants, and Delegate() then names the wrong actor.
-		if err := rejectUnknownJSONFields(cur, &node, fmt.Sprintf("%s claim at depth %d", ClaimActor, depth)); err != nil {
+		//
+		// Strict does NOT mean sub-and-act-only. RFC 8693 §4.1 defines an `act` value as a set
+		// of claims identifying the actor, and a token-exchange IdP routinely writes the actor's
+		// issuer beside its subject to say WHICH namespace that subject belongs to. Refusing
+		// those made every request on such a token deny — an outage produced by a member that
+		// scopes nothing this build applies. They are admitted by name rather than by admitting
+		// unknown members generally, so a misspelling is still refused.
+		if err := decodeClaimObject(cur, &node, fmt.Sprintf("%s claim at depth %d", ClaimActor, depth), actorIdentityMembers...); err != nil {
 			return nil, err
-		}
-		if err := json.Unmarshal(cur, &node); err != nil {
-			return nil, fmt.Errorf("%s claim at depth %d must be an object with a 'sub' member: %w", ClaimActor, depth, err)
 		}
 		sub := strings.TrimSpace(node.Sub)
 		if sub == "" {
@@ -623,9 +618,13 @@ func ParseDelegationGrants(raw json.RawMessage) ([]DelegationGrant, error) {
 		return nil, fmt.Errorf("mcp.%s claim must be an array of delegation grants: %w", ClaimDelegation, err)
 	}
 	if len(msgs) == 0 {
-		// An explicitly empty array declares a chain with no narrowing at any hop. That is
-		// well-formed and means exactly what it says.
-		return nil, nil
+		// A present-empty array is NOT the same as an absent claim, and the two must not
+		// collapse — the same absent/present-empty rule Targets and AllowLabels draw, for the
+		// same reason. Absent means "this token makes no delegation-grant statement", which is
+		// the supported act-only shape; present-empty means "zero hops", which DISAGREES with
+		// an act chain that names any. Returning a non-nil zero-length slice is what lets
+		// ValidateDelegationChain tell them apart and refuse the second.
+		return []DelegationGrant{}, nil
 	}
 	if len(msgs) > MaxDelegationDepth {
 		return nil, fmt.Errorf("mcp.%s declares %d hops, more than the maximum of %d", ClaimDelegation, len(msgs), MaxDelegationDepth)
@@ -633,11 +632,8 @@ func ParseDelegationGrants(raw json.RawMessage) ([]DelegationGrant, error) {
 	out := make([]DelegationGrant, 0, len(msgs))
 	for i, m := range msgs {
 		var g DelegationGrant
-		if err := rejectUnknownJSONFields(m, &g, fmt.Sprintf("mcp.%s grant %d", ClaimDelegation, i)); err != nil {
+		if err := decodeClaimObject(m, &g, fmt.Sprintf("mcp.%s grant %d", ClaimDelegation, i)); err != nil {
 			return nil, err
-		}
-		if err := json.Unmarshal(m, &g); err != nil {
-			return nil, fmt.Errorf("mcp.%s grant %d: %w", ClaimDelegation, i, err)
 		}
 		g.Subject = strings.TrimSpace(g.Subject)
 		g.Targets = trimmedListPtr(g.Targets)
@@ -658,6 +654,12 @@ func ParseDelegationGrants(raw json.RawMessage) ([]DelegationGrant, error) {
 // still express attenuation, and a grant can only narrow), but an actor chain and a grant
 // list that DISAGREE are refused. A mismatch means the token's two halves describe different
 // delegations, and picking either one would be guessing which of them the control plane meant.
+//
+// grants distinguishes NIL (the claim was absent — the act-only shape, where the chain carries
+// identities and states no narrowing) from PRESENT-EMPTY (the claim declared zero hops, which
+// disagrees with an act chain naming any). Collapsing the two made `"delegation": []` beside a
+// correct act chain the one mis-mint that passed silently, and it is the likeliest one an IdP
+// template produces.
 func ValidateDelegationChain(actors []string, grants []DelegationGrant) (*DelegationChain, error) {
 	if len(actors) == 0 && len(grants) == 0 {
 		return nil, nil
@@ -665,7 +667,7 @@ func ValidateDelegationChain(actors []string, grants []DelegationGrant) (*Delega
 	if len(actors) > MaxDelegationDepth {
 		return nil, fmt.Errorf("%s claim declares %d actors, more than the maximum of %d", ClaimActor, len(actors), MaxDelegationDepth)
 	}
-	if len(actors) > 0 && len(grants) > 0 {
+	if len(actors) > 0 && grants != nil {
 		if len(actors) != len(grants) {
 			return nil, fmt.Errorf("token declares %d actor(s) in %s but %d delegation grant(s) in mcp.%s; the two describe the same chain and must agree hop for hop", len(actors), ClaimActor, len(grants), ClaimDelegation)
 		}

@@ -116,16 +116,58 @@ func (e *Engine) approvalSpent(ctx context.Context, ledgerID string) (bool, erro
 // the wrapper met the hard `approval_consumed` escalation. Adding a token must never make the
 // proxy allow more, so the two paths ask the same question here.
 func (e *Engine) UsableDeclassifyApproval(ctx context.Context, approvals []capability.DeclassifyApproval, target string, want []string) (bool, error) {
-	for _, cand := range capability.CoveringDeclassifyApprovals(approvals, target, want) {
-		spent, err := e.approvalSpent(ctx, cand.LedgerID())
-		if err != nil {
-			return false, err
-		}
-		if !spent {
-			return true, nil
-		}
+	// Exported, so a caller can reach it with no engine configured. Report the fault rather
+	// than dereferencing: every caller treats an error as "cannot tell live from spent" and
+	// fails closed, which is the right reading of "there is no ledger here".
+	if e == nil {
+		return false, fmt.Errorf("no enforcement engine configured, so a single-use declassify approval cannot be checked")
 	}
-	return false, nil
+	sel, err := e.selectLiveApproval(ctx, approvals, target, want)
+	if err != nil {
+		return false, err
+	}
+	return sel.approval != nil, nil
+}
+
+// approvalSelection is what one walk of the covering grants found: the first still-live grant
+// (nil when every covering grant is spent, or none covers), its ledger member, and how many
+// covering grants were passed over as already burned — the count that separates "no approval
+// covers this" from "the approval was real and has been spent", which are different operator
+// actions.
+type approvalSelection struct {
+	approval *capability.DeclassifyApproval
+	ledgerID string
+	covering []*capability.DeclassifyApproval
+	consumed int
+}
+
+// selectLiveApproval is the ONE walk over the covering grants, shared by the decision path
+// (checkDeclassify, which needs the selected grant to stamp and burn) and by the wrapping-PDP
+// hardening path (UsableDeclassifyApproval, which needs only whether one exists). The two must
+// agree — a hardening check looser than the decision means adding a token makes the proxy allow
+// more — and a second copy of "walk, peek, take the first live one" is exactly where that
+// divergence had already happened once.
+//
+// It walks rather than taking the first covering grant, because scope is not the whole test: a
+// single-use grant already burned covers the call on paper and must be passed over in favour of
+// a later grant that is still live. One Peek per covering grant, bounded by
+// MaxDeclassifyApprovals.
+func (e *Engine) selectLiveApproval(ctx context.Context, approvals []capability.DeclassifyApproval, target string, want []string) (approvalSelection, error) {
+	sel := approvalSelection{covering: capability.CoveringDeclassifyApprovals(approvals, target, want)}
+	for _, cand := range sel.covering {
+		id := cand.LedgerID()
+		spent, err := e.approvalSpent(ctx, id)
+		if err != nil {
+			return approvalSelection{}, err
+		}
+		if spent {
+			sel.consumed++
+			continue
+		}
+		sel.approval, sel.ledgerID = cand, id
+		break
+	}
+	return sel, nil
 }
 
 // checkDeclassify resolves the constraint's declassify directive against the request's
@@ -189,36 +231,20 @@ func (e *Engine) checkDeclassify(ctx context.Context, req *capability.EnforceReq
 			"the request carries no resolvable target, so no approval can be scoped to it", "no_target")
 	}
 
-	// Every grant whose scope covers this call, in the token's order. Scope is not the whole
-	// test: a single-use grant already burned under this anchor covers the call on paper and
-	// must be passed over, so the selection walks the list and takes the first LIVE one.
-	// Taking the first covering grant and only then testing consumption would refuse a
-	// request whose token carried a perfectly good second approval.
-	covering := capability.CoveringDeclassifyApprovals(req.DeclassifyApprovals, target, want)
-	var (
-		approval *capability.DeclassifyApproval
-		ledgerID string
-		consumed int
-	)
-	for _, cand := range covering {
-		id := cand.LedgerID()
-		spent, err := e.approvalSpent(ctx, id)
-		if err != nil {
-			// The ledger is unreadable, so "already used" cannot be distinguished from
-			// "never used". Escalating is the only answer that does not make an unreachable
-			// backend the way to replay every one-shot grant in a token — the same
-			// fail-closed posture every other flow-state read fault takes.
-			return declassifyOutcome{}, e.declassifyRefusal(requestID, now, carriedLabels, want, nil,
-				fmt.Sprintf("single-use declassify approval state could not be read: %v", err),
-				"ledger_unavailable")
-		}
-		if spent {
-			consumed++
-			continue
-		}
-		approval, ledgerID = cand, id
-		break
+	// The first still-live grant among those whose scope covers this call, through the walk
+	// UsableDeclassifyApproval shares — so the hardening path cannot answer this question more
+	// loosely than the decision does.
+	sel, err := e.selectLiveApproval(ctx, req.DeclassifyApprovals, target, want)
+	if err != nil {
+		// The ledger is unreadable, so "already used" cannot be distinguished from "never
+		// used". Escalating is the only answer that does not make an unreachable backend the
+		// way to replay every one-shot grant in a token — the same fail-closed posture every
+		// other flow-state read fault takes.
+		return declassifyOutcome{}, e.declassifyRefusal(requestID, now, carriedLabels, want, nil,
+			fmt.Sprintf("single-use declassify approval state could not be read: %v", err),
+			"ledger_unavailable")
 	}
+	approval, ledgerID, covering, consumed := sel.approval, sel.ledgerID, sel.covering, sel.consumed
 	if approval == nil {
 		if consumed > 0 {
 			// A distinct reason from "no approval", because it is a distinct operator
@@ -396,6 +422,15 @@ func (e *Engine) clearLabels(ctx context.Context, req *capability.EnforceRequest
 // mints another approval) rather than handing a use back. The un-burn this replaced was a
 // fail-OPEN on one path — a soft antecedent-fault deny is downgraded and FORWARDED by an
 // --audit route, so the action ran while the grant was handed back.
+//
+// It is also NOT skipped under SkipQuota, which makes it the one thing on the commit path that
+// an --audit route still spends. That asymmetry is deliberate and follows from what observe
+// mode actually does: a maxCalls bucket is skipped because observe consumes no BUDGET, but the
+// label clear this grant authorizes is performed for real on an observe route (flow state has
+// to stay accurate or the predictions are worthless). Skipping only the burn would leave a real
+// clear behind a grant still marked live — the replay this ledger exists to close, reachable by
+// putting the route in observe mode. The burn and the clear are one transaction; observe either
+// does both or neither, and it does both.
 func (e *Engine) burnApproval(ctx context.Context, ledgerID string) error {
 	if ledgerID == "" {
 		return nil

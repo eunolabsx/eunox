@@ -189,6 +189,11 @@ func TestTaskAnchor_RefusesAnAuthenticatedCallerWithNoTaskID(t *testing.T) {
 	require.NotNil(t, resp.Denial)
 	assert.Equal(t, capability.ErrCodeMissingContext, resp.Denial.Code)
 	assert.Equal(t, "no_task_id", resp.Denial.Details["reason"])
+	// Non-downgradable. A forwarded refusal here is not a verdict being staged: the observe
+	// path's own antecedent recorder would then write this call's labels and sequence marker
+	// through the session key, performing the very state split the check refuses — on a route
+	// whose other constraints read the task-keyed bucket.
+	assert.True(t, resp.Denial.HardDeny, "an unaccountable call must not be downgraded and forwarded")
 
 	// A caller with NO token still falls back to its session, unchanged.
 	assert.Equal(t, capability.DecisionAllow, eng.ValidateAction(ctx, req("s", "read_customer"), caps).Decision)
@@ -224,4 +229,32 @@ func TestTaskAnchor_NoRollbackAcrossASharedTaskKey(t *testing.T) {
 	sink := healthy.ValidateAction(ctx, taskReq("sA", "t1", "publish"), sinkCaps("publish", capability.FlowLabelPublic))
 	assert.Equal(t, capability.DecisionDeny, sink.Decision,
 		"a faulted call in one session must not launder the taint another session deposited on the task")
+}
+
+// TestTaskAnchor_RollbackStillRunsForASessionKeyedRequest is the other half of the stand-down
+// above: it is a property of the REQUEST's key, not of the engine's mode. A task-anchored engine
+// still keys a token-less caller on its session, where the decision lock does span the key and
+// no concurrent writer exists — so declining to roll back there stranded a label for a hazard
+// that cannot occur, over-blocking every unauthenticated caller the route serves for the rest of
+// the session.
+func TestTaskAnchor_RollbackStillRunsForASessionKeyedRequest(t *testing.T) {
+	counter, store := callcounter.NewInMemory(), flowlabelstore.NewInMemory()
+	ctx := context.Background()
+
+	// A token-less caller (session-keyed even on a task-anchored engine) whose source faults
+	// after its own label write.
+	broken := enforcement.New(
+		enforcement.WithCallCounter(&faultyCounter{inner: counter, failIncrement: true}),
+		enforcement.WithFlowLabelStore(store),
+		enforcement.WithTaskAnchoredState(),
+	)
+	require.NotEqual(t, capability.DecisionAllow,
+		broken.ValidateAction(ctx, req("sA", "read_customer"), sourceCaps("read_customer", capability.FlowLabelPII)).Decision)
+
+	// The refused call left nothing behind, so the session's next sink is not blocked by taint
+	// from a read that never happened.
+	healthy := anchoredEngine(counter, store, true)
+	sink := healthy.ValidateAction(ctx, req("sA", "publish"), sinkCaps("publish", capability.FlowLabelPublic))
+	assert.Equal(t, capability.DecisionAllow, sink.Decision,
+		"a faulted source on a session-keyed request must roll its own label back")
 }

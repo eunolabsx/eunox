@@ -49,10 +49,17 @@ Section conventions:
 - **Delegation attenuation (RFC 8693 `act` + `mcp.delegation`).** A verified token may
   carry an actor chain and a per-hop grant list that narrow authority across a delegation
   hop on five axes — `targets`, `labels`, `allowLabels`, `redactFields`, `maxEffectClass`.
-  A hop that widens any axis **rejects the token**; the decision path independently applies
-  every hop, so neither check depends on the other. `allowLabels: []` is the quarantine: a
-  delegate sharing a tainted task reaches no labeled sink at all. List results are filtered
-  by the chain, so a delegate never sees a tool its call leg will refuse.
+  A hop that widens one of the three axes asserted at the token boundary (`targets`,
+  `allowLabels`, `maxEffectClass`) **rejects the token**; `labels` and `redactFields` are
+  unioned across hops and cannot widen, so a hop need not restate its ancestors' values.
+  The decision path independently applies every hop, so neither check depends on the other.
+  `allowLabels: []` is the quarantine: a delegate sharing a tainted task reaches no labeled
+  sink at all. List results are filtered by the chain, so a delegate never sees a tool its
+  call leg will refuse. Claim-borne grants are decoded strictly: an unknown member, an
+  explicit `null` (which would decode to the field's widest value), or a duplicate key
+  rejects the token rather than silently losing the narrowing it declares. An `act` object
+  may carry the actor's `iss` and `client_id` beside its `sub`, as a token-exchange IdP
+  emits.
 
 - **Signed registry attestations (`eunox contracts --trust-keys`, `--attest-payload`).**
   Effect-contract corpus entries may carry Ed25519 `signatures` over their content digest,
