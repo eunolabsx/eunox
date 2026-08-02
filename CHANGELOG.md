@@ -57,9 +57,12 @@ Section conventions:
   sink at all. List results are filtered by the chain, so a delegate never sees a tool its
   call leg will refuse. Claim-borne grants are decoded strictly: an unknown member, an
   explicit `null` (which would decode to the field's widest value), or a duplicate key
-  rejects the token rather than silently losing the narrowing it declares. An `act` object
-  may carry the actor's `iss` and `client_id` beside its `sub`, as a token-exchange IdP
-  emits.
+  rejects the token rather than silently losing the narrowing it declares — checked both
+  in a grant's own fields and, separately, in the token's top-level `act`/`mcp` claims and
+  the `mcp` block's own members, so an ambiguity in WHICH claim object is selected cannot
+  hide from a per-grant decoder that only ever sees the one JSON decoding already picked.
+  An `act` object may carry the actor's `iss` and `client_id` beside its `sub`, as a
+  token-exchange IdP emits.
 
 - **Signed registry attestations (`eunox contracts --trust-keys`, `--attest-payload`).**
   Effect-contract corpus entries may carry Ed25519 `signatures` over their content digest,

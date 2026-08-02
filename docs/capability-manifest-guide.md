@@ -2559,6 +2559,15 @@ delegator's whole surface: the manifest still bounds it.
   as a narrowing and is not one, so they fail loudly: the caller cannot authenticate,
   rather than losing a control silently. Omit a member you do not want to set — do not
   write `null`.
+- **The SAME ambiguity is checked one layer out, too.** The token's top-level `act`/`mcp`
+  claims, and the `mcp` block's own `capabilities`/`declassify`/`delegation`/`task_id`/
+  `agent_id`/`v` members, are also rejected if named more than one way — `{"mcp":
+  {"delegation":[...narrow],"Delegation":[...wide]}}` would otherwise hand the per-grant
+  decoder only the wide array, with nothing left to show a narrower candidate ever
+  existed. Unlike a grant's own strict decode this does not reject an unrecognized
+  claim — a token legitimately carries claims for other audiences (`roles`, `email`, …)
+  this build never reads, and an ambiguity there is not this build's business to refuse
+  a token over.
 - **`act` may carry the actor's `iss` and `client_id`** beside its `sub`. RFC 8693 defines
   an actor object as a set of claims identifying the actor, and a token-exchange IdP
   routinely writes its issuer there. Any other member is refused, so a misspelled `act`

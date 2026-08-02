@@ -124,6 +124,57 @@ func decodeClaimObject(data []byte, target any, context string, allowExtra ...st
 	return nil
 }
 
+// ClaimMembers validates that none of watch is spelled more than one way among data's
+// top-level JSON members, and returns each watched name's value keyed by FoldJSONKey(name)
+// — a name absent under every spelling is simply missing from the map.
+//
+// It is decodeClaimObject's duplicate-key check, applied one layer OUT rather than one layer
+// IN: decodeClaimObject asks "does this already-selected claim object's OWN fields agree with
+// what it says", this asks "is there only one candidate for a claim object at all". A JWT
+// payload's `mcp`/`act` claims and the `mcp` block's own `capabilities`/`declassify`/
+// `delegation` members are decoded by go-jose's/encoding/json's plain struct unmarshal — the
+// same case-insensitive-fold-and-keep-the-last-one rule decodeClaimObject exists to refuse —
+// but that struct decode happens BEFORE any per-grant decoder ever runs, so a grant's own
+// strict decoding cannot see an ambiguity that was already silently resolved one level up:
+// `{"mcp":{"delegation":[{narrow}],"Delegation":[{wide}]}}` hands ParseDelegationGrants only
+// the WIDE array, with nothing left to indicate a narrower candidate ever existed. A JWT is
+// signed by its issuer, so this is not an externally forgeable ambiguity — but it is the same
+// "an IdP template mistake becomes a rejected token, not a silently-resolved one" failure
+// decodeClaimObject documents, and a minting pipeline that merges claim sources (or a
+// migration that renamed a claim and left both spellings live) can produce it exactly as
+// easily one level up as one level in.
+//
+// Unlike decodeClaimObject this does NOT reject an unrecognized member: data may be a claim
+// object other parties legitimately extend — a JWT's whole payload carries claims for
+// audiences besides this proxy, and even the proxy-owned `mcp` block is versioned
+// (`schemaVersion`-style) and may grow fields a running build predates. Only the small set of
+// names in watch is checked; everything else is ignored, ambiguous or not — an ambiguity in a
+// claim this build never reads is not this build's business to refuse a token over.
+func ClaimMembers(data []byte, context string, watch ...string) (map[string]json.RawMessage, error) {
+	members, err := claimObjectMembers(data, context)
+	if err != nil {
+		return nil, err
+	}
+	want := make(map[string]bool, len(watch))
+	for _, w := range watch {
+		want[FoldJSONKey(w)] = true
+	}
+	out := make(map[string]json.RawMessage, len(want))
+	seen := make(map[string]string, len(want))
+	for _, m := range members {
+		folded := FoldJSONKey(m.key)
+		if !want[folded] {
+			continue
+		}
+		if prior, dup := seen[folded]; dup {
+			return nil, fmt.Errorf("%s: members %q and %q are the same claim to a JSON decoder, so which one is enforced depends on their order; declare it once", context, prior, m.key)
+		}
+		seen[folded] = m.key
+		out[folded] = m.value
+	}
+	return out, nil
+}
+
 // checkClaimListLength bounds a list-valued member. Non-array members are left alone; the
 // element values themselves are the decoder's business.
 func checkClaimListLength(value json.RawMessage, key, context string) error {

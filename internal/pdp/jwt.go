@@ -529,13 +529,11 @@ func (p *JWTPDP) innerEnforces() bool {
 	}
 }
 
-// decodeJWTClaimsPreservingNumbers decodes the top-level claim map from a compact
-// JWS (header.payload.signature) using json.Number, so integer claims above 2^53
-// are preserved exactly instead of rounded through float64 (which go-jose's
-// UnsafeClaimsWithoutVerification does). The caller verifies the signature first,
-// so the payload is authentic; this re-decodes those bytes only to keep numeric
-// precision for input.claims.
-func decodeJWTClaimsPreservingNumbers(tokenStr string) (map[string]interface{}, error) {
+// jwtPayloadSegment base64url-decodes a compact JWS's (header.payload.signature) middle
+// segment, so a caller needing the raw payload bytes — rather than a value decoded from
+// them — does not restate the split-and-decode every claims-preserving-numbers decode
+// already performs.
+func jwtPayloadSegment(tokenStr string) ([]byte, error) {
 	parts := strings.Split(tokenStr, ".")
 	// A JWS compact serialization has exactly three segments. Reject anything else
 	// (fail closed) in case a future caller invokes this before verification.
@@ -545,6 +543,20 @@ func decodeJWTClaimsPreservingNumbers(tokenStr string) (map[string]interface{}, 
 	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
 		return nil, fmt.Errorf("decoding JWT payload segment: %w", err)
+	}
+	return payloadBytes, nil
+}
+
+// decodeJWTClaimsPreservingNumbers decodes the top-level claim map from a compact
+// JWS (header.payload.signature) using json.Number, so integer claims above 2^53
+// are preserved exactly instead of rounded through float64 (which go-jose's
+// UnsafeClaimsWithoutVerification does). The caller verifies the signature first,
+// so the payload is authentic; this re-decodes those bytes only to keep numeric
+// precision for input.claims.
+func decodeJWTClaimsPreservingNumbers(tokenStr string) (map[string]interface{}, error) {
+	payloadBytes, err := jwtPayloadSegment(tokenStr)
+	if err != nil {
+		return nil, err
 	}
 	dec := json.NewDecoder(bytes.NewReader(payloadBytes))
 	dec.UseNumber()
@@ -580,7 +592,13 @@ const (
 	jwtErrInvalidCapabilities  = "invalid_capabilities"
 	jwtErrInvalidDeclassify    = "invalid_declassify"
 	jwtErrInvalidDelegation    = "invalid_delegation"
-	jwtErrSenderConstrained    = "sender_constrained"
+	// jwtErrAmbiguousClaims marks a top-level `mcp`/`act` claim, or a member of the `mcp`
+	// block itself, spelled more than one way — see capability.ClaimMembers. Distinct from
+	// jwtErrMalformedToken because the payload IS valid JSON; what is wrong is that two
+	// members bind to the one value encoding/json reads, and which one wins is invisible to
+	// the token's own author.
+	jwtErrAmbiguousClaims   = "ambiguous_claims"
+	jwtErrSenderConstrained = "sender_constrained"
 	// jwtErrJWKSUnavailable marks a validation that failed because the key set could
 	// not be fetched (network error, non-200, empty/oversized set, open breaker), not
 	// because the token was bad — the token was never checked against a key. Keeping it
@@ -681,6 +699,40 @@ func parseDelegationChain(payload idpJWTPayload) (*capability.DelegationChain, e
 		return nil, capability.Terminal(jwtErr(jwtErrInvalidDelegation, err))
 	}
 	return chain, nil
+}
+
+// rejectAmbiguousTopLevelClaims confirms the token's payload names each of `mcp` and `act`
+// at most once, and the `mcp` block itself names each of its own members at most once,
+// before ANYTHING decoded from either is trusted.
+//
+// The struct unmarshal that already ran (UnsafeClaimsWithoutVerification) resolved any
+// collision silently — encoding/json folds field names case-insensitively and keeps the
+// last one, so a payload carrying both "act" and "Act", or an mcp block carrying both
+// "delegation" and "Delegation", bound whichever spelling the author wrote LAST with no
+// signal a narrower or differently-scoped sibling ever existed. A JWT is signed by its
+// issuer, so this is not an externally forgeable ambiguity — but it is the same "an IdP
+// template mistake becomes a rejected token, not a silently-resolved one" failure the
+// per-grant decoders (decodeClaimObject) already refuse one layer in; a minting pipeline
+// that merges claim sources, or a migration that renamed a claim and left both spellings
+// live, can produce it exactly as easily one layer out. See capability.ClaimMembers.
+func rejectAmbiguousTopLevelClaims(tokenStr string) error {
+	payloadBytes, err := jwtPayloadSegment(tokenStr)
+	if err != nil {
+		return capability.Terminal(jwtErr(jwtErrMalformedToken, err))
+	}
+	top, err := capability.ClaimMembers(payloadBytes, "jwt payload", "mcp", "act")
+	if err != nil {
+		return capability.Terminal(jwtErr(jwtErrAmbiguousClaims, err))
+	}
+	mcpBytes, ok := top[capability.FoldJSONKey("mcp")]
+	if !ok {
+		return nil
+	}
+	if _, err := capability.ClaimMembers(mcpBytes, "jwt mcp claim",
+		"v", "capabilities", "task_id", "agent_id", "declassify", "delegation"); err != nil {
+		return capability.Terminal(jwtErr(jwtErrAmbiguousClaims, err))
+	}
+	return nil
 }
 
 // newValidatedClaims assembles the *JWTClaims a successful ValidateToken returns,
@@ -868,7 +920,11 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 		if rawErr != nil {
 			return nil, capability.Terminal(jwtErr(jwtErrMalformedToken, fmt.Errorf("jwt raw claims decode: %w", rawErr)))
 		}
-
+		// The struct unmarshal above resolves an "act"/"Act" (or mcp-block) collision
+		// silently; confirm there was only one candidate before trusting either.
+		if err := rejectAmbiguousTopLevelClaims(tokenStr); err != nil {
+			return nil, err
+		}
 		// Standard claims (iat/exp/audience/issuer). Returns the token's exp so the
 		// verified-token cache TTL can be capped at it; now is the single lazy sample.
 		exp, stdErr := p.validateStandardClaims(stdClaims, now)

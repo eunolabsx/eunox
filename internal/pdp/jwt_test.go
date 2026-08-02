@@ -5289,6 +5289,119 @@ func TestJWT_NullCapabilitiesRejected(t *testing.T) {
 	}
 }
 
+// signRawClaimsToken signs stdClaims plus every top-level entry of raw, exactly as
+// makeIDPTokenNullCapabilities does. Unlike a typed Go struct (which cannot have two
+// fields with the same JSON name) a map[string]interface{} passed directly to
+// jwt.Signed(...).Claims(...) is merged key-for-key with NO struct-normalize round
+// trip, so two DIFFERENT Go strings that fold to the same field ("act" and "Act") both
+// survive into the signed payload bytes as two distinct JSON members — which is exactly
+// the shape a real IdP's minting pipeline could produce (a claims-merging bug, a
+// migration that renamed a claim and left both spellings live) and the one a struct-only
+// test builder cannot construct at all.
+func signRawClaimsToken(t *testing.T, key testKey, sub string, exp time.Time, raw map[string]interface{}) string {
+	t.Helper()
+	sig, err := jose.NewSigner(
+		jose.SigningKey{Algorithm: jose.ES256, Key: key.priv},
+		(&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", key.kid),
+	)
+	if err != nil {
+		t.Fatalf("new signer: %v", err)
+	}
+	stdClaims := jwt.Claims{
+		Subject:  sub,
+		IssuedAt: jwt.NewNumericDate(time.Now()),
+		Expiry:   jwt.NewNumericDate(exp),
+	}
+	token, err := jwt.Signed(sig).Claims(stdClaims).Claims(raw).Serialize()
+	if err != nil {
+		t.Fatalf("sign token: %v", err)
+	}
+	return token
+}
+
+// TestJWT_AmbiguousTopLevelClaimRejected is a regression for the ambiguity a struct
+// decode resolves silently: encoding/json binds "act" and "Act" to the SAME field and
+// keeps whichever appears last in the payload bytes, with nothing downstream able to
+// tell a second candidate ever existed. Before this test's fix, a payload carrying
+// {"act":{"sub":"narrow"},"Act":{"sub":"wide"}} decoded to whichever of the two
+// happened to sort last — silently, and a JWT is signed by the issuer, so this is the
+// issuer's own minting-pipeline mistake to make, not a third party's forgery.
+func TestJWT_AmbiguousTopLevelClaimRejected(t *testing.T) {
+	key := newTestKey(t, "k1")
+	srv := makeJWKSServer(t, key)
+	defer srv.Close()
+	pdp := makeJWTPDP(t, srv, "", "", nil)
+	exp := time.Now().Add(time.Hour)
+
+	token := signRawClaimsToken(t, key, "agent-1", exp, map[string]interface{}{
+		"mcp": map[string]interface{}{"v": mcpClaimVersion},
+		"act": map[string]interface{}{"sub": "narrow-actor"},
+		"Act": map[string]interface{}{"sub": "wide-actor"},
+	})
+	_, err := pdp.ValidateToken(context.Background(), "Bearer "+token)
+	if err == nil {
+		t.Fatal("ValidateToken accepted a token with both act and Act claims; want a terminal rejection")
+	}
+	if got := ClassifyJWTError(err); got != "ambiguous_claims" {
+		t.Fatalf("error category = %q, want ambiguous_claims", got)
+	}
+
+	// A token with unrelated top-level claims the proxy does not read — the ordinary
+	// case for a JWT that also carries claims for other audiences — must still validate.
+	clean := signRawClaimsToken(t, key, "agent-1", exp, map[string]interface{}{
+		"mcp":    map[string]interface{}{"v": mcpClaimVersion},
+		"act":    map[string]interface{}{"sub": "agent-1"},
+		"roles":  []string{"a"},
+		"Roles":  []string{"b"}, // ambiguous, but not a claim this build reads
+		"groups": []string{"x"},
+	})
+	if _, err := pdp.ValidateToken(context.Background(), "Bearer "+clean); err != nil {
+		t.Fatalf("a claim this build does not read must not be scrutinized for ambiguity: %v", err)
+	}
+}
+
+// TestJWT_AmbiguousMcpMemberRejected covers the SAME ambiguity one layer further in:
+// duplicate/case-variant keys inside the mcp claim block itself. This is the shape that
+// would otherwise reach a per-grant decoder (ParseDelegationGrants,
+// ParseDeclassifyApprovals) with only ONE already-selected candidate and no sign a
+// second one existed — silently widening whichever of two grants happened to sort last.
+func TestJWT_AmbiguousMcpMemberRejected(t *testing.T) {
+	key := newTestKey(t, "k1")
+	srv := makeJWKSServer(t, key)
+	defer srv.Close()
+	pdp := makeJWTPDP(t, srv, "", "", nil)
+	exp := time.Now().Add(time.Hour)
+
+	for name, mcp := range map[string]map[string]interface{}{
+		"delegation/Delegation": {
+			"v":          mcpClaimVersion,
+			"delegation": []interface{}{map[string]interface{}{"subject": "worker", "targets": []string{"tool:read_file"}}},
+			"Delegation": []interface{}{map[string]interface{}{"subject": "worker"}},
+		},
+		"declassify/Declassify": {
+			"v":          mcpClaimVersion,
+			"declassify": []interface{}{},
+			"Declassify": []interface{}{map[string]interface{}{"labels": []string{"pii"}, "target": "tool:publish", "approver": "ops"}},
+		},
+		"capabilities/Capabilities": {
+			"v":            mcpClaimVersion,
+			"capabilities": []string{"tool:read"},
+			"Capabilities": []string{"tool:read", "tool:wipe_db"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			token := signRawClaimsToken(t, key, "agent-1", exp, map[string]interface{}{"mcp": mcp})
+			_, err := pdp.ValidateToken(context.Background(), "Bearer "+token)
+			if err == nil {
+				t.Fatalf("ValidateToken accepted an mcp claim with %s; want a terminal rejection", name)
+			}
+			if got := ClassifyJWTError(err); got != "ambiguous_claims" {
+				t.Fatalf("error category = %q, want ambiguous_claims", got)
+			}
+		})
+	}
+}
+
 // TestJWT_HTTPResourceQueryNotWildcard is a regression: the literal '?' query
 // delimiter in an http(s) resource claim must NOT act as a single-char glob. An
 // exact claim for one URL must authorize only that URL (query matched literally),
