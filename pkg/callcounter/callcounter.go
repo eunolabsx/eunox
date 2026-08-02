@@ -53,9 +53,12 @@ func checkBuckets(buckets []capability.QuotaBucket) error {
 			return e
 		}
 		if buckets[i].Counted {
-			// A counted bucket contributes exactly one entry, so its weight is not read;
-			// its LIMIT must still be a whole number of calls the backends can compare
-			// exactly, which checkTotalLimit's range already guarantees.
+			// A counted bucket contributes exactly one entry, so its weight is not read —
+			// but its LIMIT is a number of CALLS, which checkTotalLimit alone does not
+			// establish: that check bounds the range (0, MaxWeightedTotal], nothing more.
+			if e := checkCountedLimit(buckets[i].Limit); e != nil {
+				return e
+			}
 			continue
 		}
 		if e := checkWeight(buckets[i].Weight); e != nil {
@@ -154,6 +157,35 @@ func checkWeight(weight float64) error {
 	}
 	if weight > MaxWeightedTotal {
 		return fmt.Errorf("callcounter: weight must be <= %v (the largest value both backends represent exactly), got %v", MaxWeightedTotal, weight)
+	}
+	return nil
+}
+
+// checkCountedLimit guards a COUNTED bucket's threshold, on top of checkTotalLimit's range
+// bound. A counted bucket's limit is a number of calls, so it must be a whole number and at
+// least 1, and neither follows from being a positive float64.
+//
+// Both halves are load-bearing, and neither is theoretical:
+//
+//   - A limit below 1 can never admit, but that denial is a MISCONFIGURATION rather than an
+//     exhausted quota and the two must stay distinguishable. Without this, a bound of 0.5
+//     denies every call forever with a nil error, which a caller reads (and audits) as
+//     "rate limit exceeded" — the silent-deny-all this package refuses everywhere else.
+//   - A FRACTIONAL limit additionally makes the two backends disagree, which is the one
+//     thing checkBuckets exists to prevent: the in-memory backend compares against it
+//     directly and returns an ordinary denial, while the Redis script derives its
+//     retry-after pivot as `total - limit` and hands that fractional index to ZRANGE, which
+//     errors the whole admission. Same input, one backend denying and the other faulting.
+//
+// The manifest loader already rejects maxCalls.count < 1 and carries it as an int, so this
+// guards direct library use and custom backends — the same reach the retired single-bucket
+// admission's own limit guard had.
+func checkCountedLimit(limit float64) error {
+	if limit < 1 {
+		return fmt.Errorf("callcounter: counted bucket limit must be >= 1, got %v", limit)
+	}
+	if limit != math.Trunc(limit) {
+		return fmt.Errorf("callcounter: counted bucket limit must be a whole number of calls, got %v", limit)
 	}
 	return nil
 }

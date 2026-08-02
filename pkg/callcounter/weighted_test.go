@@ -5,6 +5,7 @@ package callcounter_test
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -305,6 +306,55 @@ func TestAdmitWeighted_WeightlessCallsAreNotRecorded(t *testing.T) {
 			require.NoError(t, err)
 			assert.True(t, admitted)
 			assert.InDelta(t, 100.0, total, 1e-9)
+		})
+	}
+}
+
+// TestAdmitCounted_SubOneAndFractionalLimitsFailClosed pins the guard a counted bucket
+// needs beyond the shared range check, on BOTH backends.
+//
+// A counted bucket's limit is a number of calls. checkTotalLimit only bounds it to
+// (0, MaxWeightedTotal], which leaves two shapes that must not reach a backend:
+//
+//   - Below 1. It can never admit, but that is a MISCONFIGURATION, not an exhausted
+//     quota, and a silent nil denial is indistinguishable from "rate limit exceeded" to
+//     every caller and every audit record.
+//   - Fractional. It additionally makes the two backends DISAGREE — the one thing the
+//     shared batch validation exists to prevent: in memory it compares directly and
+//     denies, while the Redis script derives its retry pivot as `total - limit` and hands
+//     that fractional index to ZRANGE, which errors the whole admission.
+//
+// Written against AdmitAll directly rather than through the AdmitCounted helper, whose
+// int64 limit cannot express either shape.
+func TestAdmitCounted_SubOneAndFractionalLimitsFailClosed(t *testing.T) {
+	fixed := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	for name, c := range weightedBackends(t, func() time.Time { return fixed }) {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			for _, tc := range []struct {
+				limit float64
+				want  string
+			}{
+				{0.5, "limit must be >= 1"},
+				{0.999, "limit must be >= 1"},
+				{2.5, "whole number of calls"},
+				{1e6 + 0.5, "whole number of calls"},
+			} {
+				admitted, _, _, _, err := c.AdmitAll(ctx, []capability.QuotaBucket{
+					{Key: "counted", WindowSec: 60, Counted: true, Limit: tc.limit},
+				})
+				require.Error(t, err, "counted limit %v must fail closed with a structured error, not a silent denial", tc.limit)
+				assert.Contains(t, err.Error(), tc.want)
+				assert.False(t, admitted, "nothing is admitted on the error path")
+			}
+			// The whole numbers on either side of the rejected band still admit.
+			for _, limit := range []float64{1, 2, 1000} {
+				admitted, _, _, _, err := c.AdmitAll(ctx, []capability.QuotaBucket{
+					{Key: fmt.Sprintf("ok-%v", limit), WindowSec: 60, Counted: true, Limit: limit},
+				})
+				require.NoError(t, err, "a whole-number counted limit must be accepted")
+				assert.True(t, admitted)
+			}
 		})
 	}
 }

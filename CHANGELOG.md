@@ -490,8 +490,11 @@ Section conventions:
   solid) while getting `AdmitAll` subtly wrong, and nothing on the decision path would
   exercise the difference. **Migration:** a custom `CallCounter` implements
   `IncrementAndGet`, `Peek`, and `AdmitAll`; delete the other two. `callcounter.MaxLimit`
-  goes with them — a counted bucket's bound is validated by the same check a weighted one
-  gets, against the same `MaxWeightedTotal` (2^53) representability limit.
+  goes with them — a counted bucket's bound is now validated by the shared batch check,
+  against the same `MaxWeightedTotal` (2^53) representability limit **plus** the
+  whole-number-of-calls rule the retired method's `int64` limit carried in its type (a
+  fractional counted bound would otherwise deny silently in memory and fault the Redis
+  script's retry pivot — the backend divergence that check exists to prevent).
 
 ### Fixed
 

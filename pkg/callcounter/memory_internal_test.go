@@ -954,7 +954,7 @@ func TestInMemory_WithMaxKeys_AdmitCounted(t *testing.T) {
 // limit<1 check, so a limit<1 call on a new key burned the sole slot and then
 // permanently denied a legitimate new key until Cleanup ran.
 //
-// A non-positive limit is reported as a structured error (not a silent nil denial) so
+// A limit below one is reported as a structured error (not a silent nil denial) so
 // a misconfigured limit is distinguishable from an exhausted quota; the
 // no-phantom-entry guarantee is unchanged and still asserted here.
 func TestInMemory_AdmitCounted_LimitBelowOneWritesNoState(t *testing.T) {

@@ -6,6 +6,7 @@ package pdp
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -36,24 +37,12 @@ func assertScanAgrees(t *testing.T, raw []byte, optsName string, opts jsonKeySca
 	got := scanJSONKeys(raw, opts)
 	want := scanJSONKeysTokenizer(raw, opts)
 	if got.untrustworthy != want.untrustworthy || got.namesComplete != want.namesComplete ||
-		!equalStrings(got.names, want.names) {
+		!slices.Equal(got.names, want.names) {
 		t.Errorf("scan disagreement (%s) on %q:\n  byte walk: untrustworthy=%v namesComplete=%v names=%q\n  tokenizer: untrustworthy=%v namesComplete=%v names=%q",
 			optsName, truncateForLog(raw),
 			got.untrustworthy, got.namesComplete, got.names,
 			want.untrustworthy, want.namesComplete, want.names)
 	}
-}
-
-func equalStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 func truncateForLog(raw []byte) string {
@@ -207,7 +196,7 @@ func FuzzScanJSONKeys(f *testing.F) {
 			got := scanJSONKeys(raw, opts)
 			want := scanJSONKeysTokenizer(raw, opts)
 			if got.untrustworthy != want.untrustworthy || got.namesComplete != want.namesComplete ||
-				!equalStrings(got.names, want.names) {
+				!slices.Equal(got.names, want.names) {
 				t.Fatalf("scan disagreement (%s) on %q:\n  byte walk: untrustworthy=%v namesComplete=%v names=%q\n  tokenizer: untrustworthy=%v namesComplete=%v names=%q",
 					optsName, truncateForLog(raw),
 					got.untrustworthy, got.namesComplete, got.names,
@@ -241,7 +230,7 @@ func FuzzScanJSONKeysWellFormed(f *testing.F) {
 			got := scanJSONKeys(raw, opts)
 			want := scanJSONKeysTokenizer(raw, opts)
 			if got.untrustworthy != want.untrustworthy || got.namesComplete != want.namesComplete ||
-				!equalStrings(got.names, want.names) {
+				!slices.Equal(got.names, want.names) {
 				t.Fatalf("scan disagreement on well-formed JSON (%s) %q:\n  byte walk: %+v\n  tokenizer: %+v",
 					optsName, truncateForLog(raw), got, want)
 			}

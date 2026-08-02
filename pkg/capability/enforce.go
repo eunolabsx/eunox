@@ -206,9 +206,11 @@ type CallCounter interface {
 	// the same (Key, WindowSec) — two buckets sharing one physical key cannot be committed
 	// consistently. A malformed batch fails closed and records nothing.
 	//
-	// total is the post-admission total of the bucket closest to its limit when admitted,
-	// and the blocking bucket's current total when denied. retryAfter estimates when the
-	// blocking bucket frees enough room for THIS call.
+	// total is the LARGEST post-admission total across the batch when admitted (an absolute
+	// magnitude, not a fraction of any bucket's limit — with limits of differing scale it
+	// need not be the bucket closest to its own bound), and the blocking bucket's current
+	// total when denied. retryAfter estimates when the blocking bucket frees enough room for
+	// THIS call.
 	//
 	// PRECISION. A weighted total accumulates in IEEE-754 double precision, in timestamp
 	// order, deliberately: the Redis backend's Lua arithmetic is float64 and nothing else
@@ -261,6 +263,13 @@ type QuotaBucket struct {
 	Weight float64
 	// Limit is the largest total the bucket may hold after this call. Must be positive and
 	// at most MaxWeightedTotal.
+	//
+	// A COUNTED bucket's limit is additionally a number of calls: it must be a whole number
+	// and at least 1. Both halves are enforced, and neither follows from being a positive
+	// float64 — a bound below 1 can never admit, which is a misconfiguration a backend must
+	// report as one rather than as an exhausted quota, and a fractional bound makes a
+	// backend deriving its retry pivot arithmetically (Redis does) fault where an in-process
+	// one merely denies.
 	Limit float64
 }
 

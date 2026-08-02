@@ -2377,17 +2377,10 @@ type toolEntryScan struct {
 //     Nested duplicates still matter because the hash covers parameter descriptions at
 //     any depth, so a duplicate one level down is an injection surface.
 //
-// Values are consumed with Decode into a json.RawMessage rather than token-by-token: that
-// captures a value's bytes through the scanner without converting them, so a
-// float64-overflowing number (1e999) cannot error the walk and shield a later duplicate —
-// and it needs no UseNumber. Any malformed or over-deep input reports untrustworthy.
-// The walk is a SINGLE streaming pass with an explicit frame stack, not a recursion that
-// re-decodes each sub-value: decoding every value into a json.RawMessage and recursing on
-// those same bytes copies them once per level of nesting, making the scan O(bytes x depth)
-// on a path that runs for every entry of every tools/list. With maxDuplicateKeyScanDepth
-// at 512 that let one hostile entry cost hundreds of megabytes of transient garbage. The
-// stack form is O(bytes), and it mirrors mcp.rejectDuplicateJSONKeys, which walks request
-// params the same way.
+// Any malformed or over-deep input reports untrustworthy. How the walk itself works — a
+// single byte-level streaming pass, why values are never converted, and why a
+// float64-overflowing literal must not error it — is documented once on keyScanner, which
+// performs it.
 func scanToolEntry(raw json.RawMessage) toolEntryScan {
 	return scanJSONKeys(raw, jsonKeyScanOpts{})
 }
@@ -2504,8 +2497,15 @@ type keyScanFrame struct {
 // sub-values: decoding each value into a json.RawMessage and recursing on those same bytes
 // copies them once per level of nesting, making the scan O(bytes x depth) — at
 // maxDuplicateKeyScanDepth 512 that let one hostile entry cost hundreds of megabytes of
-// transient garbage. This form is O(bytes), and it mirrors mcp.rejectDuplicateJSONKeys,
-// which walks request params the same way.
+// transient garbage. This form is O(bytes).
+//
+// The REQUEST-side gate, mcp.rejectDuplicateJSONKeys, asks the same security question of
+// request params and shares the iterative-frame-stack shape, but it still drives
+// encoding/json's tokenizer — only this one walks bytes. They are two implementations of
+// one rule, which is a real cost: a grammar fix here is not a fix there. Consolidating them
+// means a scanner in pkg/ (the only layer both packages reach) and an oracle for the
+// request path too, which is its own change; until then, do not read the shared shape as a
+// shared implementation.
 //
 // Malformed bytes anywhere report untrustworthy: this is a strict JSON walk, not a lenient
 // one. It never has to be the authority on well-formedness in production — both callers have
@@ -2684,7 +2684,19 @@ func (s *keyScanner) stepValue(c byte) bool {
 		if s.pendingName {
 			// Decode only the value the caller will attribute a pin to; every other string
 			// in the payload is walked past without becoming a Go string.
-			if name, dok := decodeJSONStringSpan(s.raw[s.p:end], simple); dok && name != "" {
+			//
+			// A decode failure ABORTS the walk rather than skipping the name, matching the
+			// key path. Continuing would finish with namesComplete set and this entry's name
+			// missing from the list, so an entry the scan could not fully read would poison
+			// the EMPTY set of pins instead of every pin — the widening an unreadable entry
+			// is supposed to trigger. No input reaches this today (a span this scanner
+			// accepts is one encoding/json decodes), which is exactly why the branch has to
+			// state the fail-closed direction rather than rely on being unreachable.
+			name, dok := decodeJSONStringSpan(s.raw[s.p:end], simple)
+			if !dok {
+				return false
+			}
+			if name != "" {
 				s.out.names = append(s.out.names, name)
 			}
 			s.pendingName = false
@@ -2748,13 +2760,19 @@ func skipJSONSpace(raw []byte, p int) int {
 // scanJSONStringSpan walks the JSON string beginning at raw[p] (which must be '"') and
 // returns the index just past its closing quote.
 //
-// simple reports that the span's contents are plain ASCII text — every byte in 0x20..0x7E,
+// simple reports that the span's contents are plain ASCII text — every byte in 0x20..0x7F,
 // no backslash — so the string's value is the span between the quotes with no decoding.
-// That mirrors encoding/json's own fast path exactly: it too falls back to a copying decode
-// for an escape, a control byte, or a non-ASCII byte, and its slow path rewrites invalid
-// UTF-8 to U+FFFD. Treating a non-ASCII key as simple would therefore leave two keys that
-// differ only in invalid bytes distinct here while the decoder folds them together — the
-// fail-open direction, so the flag is conservative by construction.
+// (0x7F, DEL, is included deliberately: encoding/json's own fast path admits it, since that
+// path's guard is `c < utf8.RuneSelf`, not printability.)
+//
+// The flag is a CONSERVATIVE approximation of encoding/json's fast path, not an exact
+// mirror: the decoder also returns valid multi-byte UTF-8 uncopied, while this marks every
+// byte >= 0x80 non-simple and routes it through json.Unmarshal. Erring that way is the
+// point — the decoder's copying path rewrites INVALID UTF-8 to U+FFFD, so two keys that
+// differ only in invalid bytes fold together there; treating a non-ASCII span as simple
+// would leave them distinct here and miss a collision the decoder makes. Widening this to
+// "no escape and valid UTF-8" would match the decoder byte for byte and is the correct way
+// to make non-ASCII keys cheap, but it must be derived from unquoteBytes, not assumed.
 func scanJSONStringSpan(raw []byte, p int) (end int, simple, ok bool) {
 	simple = true
 	for i := p + 1; i < len(raw); i++ {
