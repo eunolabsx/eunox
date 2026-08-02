@@ -88,4 +88,18 @@ func TestRecordDeclassifiedAllow_SignAndVerify(t *testing.T) {
 	if ok, _ := verifier.VerifyRecord(tampered); ok {
 		t.Fatal("a tampered labels_cleared must fail verification")
 	}
+
+	// Tamper: repoint the approval id without re-signing -> must fail closed. This arm is
+	// the reason the field is top-level and signed rather than a details key: it is what
+	// joins the record back to the approval workflow, so a tape on which it could be
+	// rewritten would let a declassification be reconciled against someone else's approval.
+	tampered = bytes.Replace(declassified,
+		[]byte(`"approval_id":"apr-9"`),
+		[]byte(`"approval_id":"apr-other"`), 1)
+	if bytes.Equal(tampered, declassified) {
+		t.Fatal("test setup failed to alter approval_id")
+	}
+	if ok, _ := verifier.VerifyRecord(tampered); ok {
+		t.Fatal("a tampered approval_id must fail verification")
+	}
 }
