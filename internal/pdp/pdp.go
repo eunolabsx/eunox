@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/eunolabs/eunox/pkg/capability"
 	"github.com/eunolabs/eunox/pkg/enforcement"
@@ -2431,136 +2432,460 @@ type jsonKeyScanOpts struct {
 // What the callers do NOT share is which keys are additionally folded; that is
 // opts.foldKeys, documented on jsonKeyScanOpts.
 func scanJSONKeys(raw json.RawMessage, opts jsonKeyScanOpts) toolEntryScan {
-	// frame tracks one open composite. seen is allocated lazily: most nested objects in a
-	// tool schema are small, and an empty-object-heavy payload should not cost a map
-	// header per object.
-	type frame struct {
-		object    bool
-		seen      map[string]struct{}
-		expectKey bool
+	// Classify the root from its first significant byte. A container root — the only shape
+	// with keys to scan, and the only one either caller passes in production — goes to the
+	// byte walk below. Everything else is handed to encoding/json, which is what decides
+	// "valid scalar" from "malformed" here, so that classification stays byte-identical to
+	// the decoder's without this scanner having to re-derive JSON's literal grammar for a
+	// case it never sees in production.
+	i := skipJSONSpace(raw, 0)
+	if i < len(raw) && (raw[i] == '{' || (opts.allowArrayRoot && raw[i] == '[')) {
+		return scanContainerKeys(raw, i, opts)
 	}
+	return classifyNonContainerRoot(raw)
+}
+
+// classifyNonContainerRoot handles a root scanJSONKeys will not walk: a scalar, a
+// (non-admitted) array, or bytes that are not JSON at all.
+//
+// Either way the value is untrustworthy — it cannot decode into the hashed tool surface, so
+// the filter must drop it — but the two differ in what they say about the entry's candidate
+// NAMES. A well-formed non-object carries no top-level "name", so a host renders no tool
+// name from it and its candidate set is knowably EMPTY: namesComplete is set and the caller
+// poisons nothing, rather than escalating one null entry to a route-wide, sticky poison of
+// every pinned tool. Bytes that do not parse at all say nothing about what they could be
+// presenting, so the set stays unknown (namesComplete false) and the caller widens.
+//
+// The entries arrive as json.RawMessage elements of an already-unmarshaled array, so each is
+// exactly one complete, well-formed JSON value: reading its first token is enough to
+// classify it, with no trailing bytes left to hide anything.
+func classifyNonContainerRoot(raw json.RawMessage) toolEntryScan {
 	dec := json.NewDecoder(bytes.NewReader(raw))
-	// UseNumber so a float64-overflowing literal (1e999) inside a schema yields a
-	// json.Number instead of erroring the walk, which would otherwise report a valid
-	// entry untrustworthy (and, worse, shield a later duplicate behind that error).
+	// UseNumber so a float64-overflowing literal (1e999) yields a json.Number instead of
+	// erroring, which would otherwise report a well-formed scalar as unparseable.
 	dec.UseNumber()
-	tok, err := dec.Token()
-	if err != nil {
+	if _, err := dec.Token(); err != nil {
 		return toolEntryScan{untrustworthy: true}
 	}
-	rootDelim, rootIsDelim := tok.(json.Delim)
-	rootObject := rootIsDelim && rootDelim == '{'
-	rootAdmittedArray := opts.allowArrayRoot && rootIsDelim && rootDelim == '['
-	if !rootObject && !rootAdmittedArray {
-		// Not a JSON object: null, a number, a string, a bool, or (unless the caller admits
-		// one) an array. The entry is
-		// still untrustworthy — it cannot decode into the hashed tool surface, so the
-		// filter must drop it — but unlike an entry whose bytes ABORTED the scan, its
-		// candidate-name set is knowably EMPTY, not unknown: none of these shapes carries
-		// a top-level "name", so a host renders no tool name from it and it cannot
-		// impersonate any pin. Mark the (empty) name set complete so the caller poisons
-		// nothing, rather than escalating a single null entry to a route-wide,
-		// sticky-to-process-exit poison of every pinned tool.
-		//
-		// The entries arrive as json.RawMessage elements of an already-unmarshaled array,
-		// so each is exactly one complete, well-formed JSON value: reading its first token
-		// is enough to classify it, with no trailing bytes left to hide anything.
-		return toolEntryScan{untrustworthy: true, namesComplete: true}
-	}
-	var out toolEntryScan
-	stack := []frame{{object: rootObject, expectKey: rootObject}}
+	return toolEntryScan{untrustworthy: true, namesComplete: true}
+}
+
+// The three positions the walk can be in inside a container.
+const (
+	scanStateValue = iota // raw[p] begins a value, or closes an empty array
+	scanStateKey          // raw[p] begins a key, or closes an empty object
+	scanStateNext         // raw[p] is ',' or this container's closer
+)
+
+// keyScanFrame tracks one open composite. seen is allocated lazily: most nested objects in a
+// tool schema are small, and an empty-object-heavy payload should not cost a map header per
+// object. empty distinguishes a closer that ends an EMPTY container from one that follows a
+// comma (a trailing comma, which JSON forbids).
+type keyScanFrame struct {
+	object bool
+	seen   map[string]struct{}
+	empty  bool
+}
+
+// keyScanner is the byte-level duplicate-key walk: one streaming pass over raw, collecting
+// each object's keys under the caller's fold policy and reporting a collision, plus (for the
+// struct-binding caller) every top-level name value.
+//
+// It reads the BYTES rather than driving encoding/json's tokenizer, and the difference is
+// the reason it exists: the tokenizer materializes every value it walks — a Go string per
+// string, a json.Number per number, an interface box per delimiter — while this scan needs
+// none of them. Only object KEYS become strings here (a scan that compares keys has to), and
+// values are traversed by advancing past them. The gate runs twice over every allowed
+// tools/call carrying a redactFields obligation (once over the envelope, once over every
+// JSON leaf) and once per entry of every */list, so the values it does not need were the
+// bulk of what it paid for.
+//
+// The walk is iterative with an explicit frame stack, not recursion over re-decoded
+// sub-values: decoding each value into a json.RawMessage and recursing on those same bytes
+// copies them once per level of nesting, making the scan O(bytes x depth) — at
+// maxDuplicateKeyScanDepth 512 that let one hostile entry cost hundreds of megabytes of
+// transient garbage. This form is O(bytes), and it mirrors mcp.rejectDuplicateJSONKeys,
+// which walks request params the same way.
+//
+// Malformed bytes anywhere report untrustworthy: this is a strict JSON walk, not a lenient
+// one. It never has to be the authority on well-formedness in production — both callers have
+// already decoded these exact bytes with encoding/json before asking — so refusing something
+// the decoder would have accepted denies rather than admits.
+type keyScanner struct {
+	raw   []byte
+	opts  jsonKeyScanOpts
+	stack []keyScanFrame
+	p     int
+	st    int
 	// pendingName is set when the value about to be read is the ENTRY's top-level name
-	// value, so the names it could present to a host can be collected in the same pass.
-	// Only the struct-binding caller (opts.foldKeys == nil, i.e. the tools/list entry gate)
-	// reads out.names; the redaction gate consults untrustworthy alone, so it never arms
-	// this and never pays for the name collection.
-	pendingName := false
-	markValueDone := func() {
-		if n := len(stack); n > 0 && stack[n-1].object {
-			stack[n-1].expectKey = true
+	// value, so the names it could present to a host are collected in the same pass. Only
+	// the struct-binding caller (opts.foldKeys == nil, i.e. the tools/list entry gate) reads
+	// out.names; the redaction gate consults untrustworthy alone, so it never arms this and
+	// never pays for the name collection.
+	pendingName bool
+	done        bool
+	out         toolEntryScan
+}
+
+// scanContainerKeys walks the container beginning at raw[start] and returns its verdict.
+func scanContainerKeys(raw json.RawMessage, start int, opts jsonKeyScanOpts) toolEntryScan {
+	s := keyScanner{raw: raw, opts: opts, stack: make([]keyScanFrame, 0, 8), p: start + 1}
+	s.stack = append(s.stack, keyScanFrame{object: raw[start] == '{', empty: true})
+	s.st = scanStateValue
+	if s.stack[0].object {
+		s.st = scanStateKey
+	}
+	return s.run()
+}
+
+// run drives the walk to the root container's closer or to the first malformed byte.
+//
+// Every abort returns the verdict accumulated SO FAR rather than a fresh zero value, so
+// names already collected survive -- and leaves namesComplete false, so the caller knows the
+// list is truncated and widens the poison accordingly.
+func (s *keyScanner) run() toolEntryScan {
+	for !s.done {
+		s.p = skipJSONSpace(s.raw, s.p)
+		if s.p >= len(s.raw) {
+			s.out.untrustworthy = true
+			return s.out
+		}
+		var ok bool
+		switch c := s.raw[s.p]; s.st {
+		case scanStateKey:
+			ok = s.stepKey(c)
+		case scanStateValue:
+			ok = s.stepValue(c)
+		default:
+			ok = s.stepNext(c)
+		}
+		if !ok {
+			s.out.untrustworthy = true
+			return s.out
 		}
 	}
-	// Every abort below returns `out` rather than a fresh zero value, so names already
-	// collected survive -- and leaves namesComplete false, so the caller knows the list is
-	// truncated and widens the poison accordingly.
-	for len(stack) > 0 {
-		tok, err := dec.Token()
-		if err != nil {
-			out.untrustworthy = true
-			return out
+	// The stack unwound to empty: the whole value was walked, so names is authoritative.
+	s.out.namesComplete = true
+	return s.out
+}
+
+// top is the innermost open container. It is only ever read between pushes: push invalidates
+// the pointer (append may move the backing array), which is why callers re-take it.
+func (s *keyScanner) top() *keyScanFrame { return &s.stack[len(s.stack)-1] }
+
+// push opens a nested container, refusing one nested past the depth bound.
+func (s *keyScanner) push(object bool) bool {
+	if len(s.stack) >= maxDuplicateKeyScanDepth {
+		return false // pathologically deep
+	}
+	s.top().empty = false
+	s.stack = append(s.stack, keyScanFrame{object: object, empty: true})
+	s.st = scanStateValue
+	if object {
+		s.st = scanStateKey
+	}
+	s.p++
+	s.pendingName = false
+	return true
+}
+
+// pop closes the innermost container, ending the walk when it was the root.
+func (s *keyScanner) pop() {
+	s.p++
+	s.stack = s.stack[:len(s.stack)-1]
+	if len(s.stack) == 0 {
+		s.done = true
+		return
+	}
+	s.st = scanStateNext
+}
+
+// stepKey reads one object key (or closes an empty object): the collision check itself.
+func (s *keyScanner) stepKey(c byte) bool {
+	if c == '}' && s.top().empty {
+		s.pop()
+		return true
+	}
+	if c != '"' {
+		return false
+	}
+	end, simple, ok := scanJSONStringSpan(s.raw, s.p)
+	if !ok {
+		return false
+	}
+	key, ok := decodeJSONStringSpan(s.raw[s.p:end], simple)
+	if !ok {
+		return false
+	}
+	s.p = skipJSONSpace(s.raw, end)
+	if s.p >= len(s.raw) || s.raw[s.p] != ':' {
+		return false
+	}
+	s.p++
+	depth := len(s.stack)
+	canon := s.canonicalize(key, depth)
+	top := s.top()
+	if top.seen == nil {
+		top.seen = make(map[string]struct{})
+	}
+	if _, dup := top.seen[canon]; dup {
+		s.out.untrustworthy = true
+	}
+	top.seen[canon] = struct{}{}
+	top.empty = false
+	s.pendingName = s.opts.foldKeys == nil && depth == 1 && canon == jsonKeyNameFolded
+	s.st = scanStateValue
+	return true
+}
+
+// canonicalize applies the caller's fold policy to one key (see jsonKeyScanOpts). Everything
+// not folded is compared byte-exactly, which is what catches the caller-independent exact
+// duplicate. capability.FoldJSONKey, not strings.ToLower: ToLower leaves an already-lower-case
+// case variant such as U+017F ("deſcription") distinct from "description", so the collision
+// the decoder makes would go unseen and the bytes would clear the scan.
+func (s *keyScanner) canonicalize(key string, depth int) string {
+	switch {
+	case s.opts.foldKeys != nil:
+		// Scoped fold, at every depth: only a name whose case variant could change what a
+		// consumer resolves. Depth-uniform on purpose -- an unscoped rule keyed to depth made
+		// the verdict depend on whether the value happened to be wrapped in an array, since
+		// the bracket occupies a level of its own.
+		//
+		// A key already equal to its folded form needs no rewrite (canon is that form), so
+		// only the variant spelling is redirected onto it -- which is what makes the two
+		// collide in `seen`.
+		if folded := capability.FoldJSONKey(key); folded != key {
+			if _, scoped := s.opts.foldKeys[folded]; scoped {
+				return folded
+			}
 		}
-		if d, ok := tok.(json.Delim); ok {
-			switch d {
-			case '{', '[':
-				if len(stack) >= maxDuplicateKeyScanDepth {
-					out.untrustworthy = true // pathologically deep
-					return out
+	case depth == 1:
+		// Struct-binding fold, root object only. depth == 1 IS the root object here: this arm
+		// is reached only when opts.foldKeys is nil, and that caller does not admit an array
+		// root, so the root frame is always the object.
+		return capability.FoldJSONKey(key)
+	}
+	return key
+}
+
+// stepValue reads one value (or closes an empty array).
+func (s *keyScanner) stepValue(c byte) bool {
+	switch {
+	case c == ']' && !s.top().object && s.top().empty:
+		s.pop()
+		return true
+	case c == '{' || c == '[':
+		return s.push(c == '{')
+	case c == '"':
+		end, simple, ok := scanJSONStringSpan(s.raw, s.p)
+		if !ok {
+			return false
+		}
+		if s.pendingName {
+			// Decode only the value the caller will attribute a pin to; every other string
+			// in the payload is walked past without becoming a Go string.
+			if name, dok := decodeJSONStringSpan(s.raw[s.p:end], simple); dok && name != "" {
+				s.out.names = append(s.out.names, name)
+			}
+			s.pendingName = false
+		}
+		s.p = end
+	default:
+		end, ok := scanJSONScalarSpan(s.raw, s.p)
+		if !ok {
+			return false
+		}
+		s.p = end
+		s.pendingName = false
+	}
+	s.top().empty = false
+	s.st = scanStateNext
+	return true
+}
+
+// stepNext reads the separator or closer that must follow a completed member.
+func (s *keyScanner) stepNext(c byte) bool {
+	switch c {
+	case ',':
+		s.p++
+		s.st = scanStateValue
+		if s.top().object {
+			s.st = scanStateKey
+		}
+		return true
+	case '}':
+		if !s.top().object {
+			return false
+		}
+		s.pop()
+		return true
+	case ']':
+		if s.top().object {
+			return false
+		}
+		s.pop()
+		return true
+	}
+	return false
+}
+
+// skipJSONSpace returns the index of the first byte at or after p that is not JSON
+// whitespace. The four bytes are exactly what encoding/json skips; a UTF-8 BOM is
+// deliberately NOT among them, so a BOM-prefixed root falls to classifyNonContainerRoot and
+// is refused there, as the decoder refuses it.
+func skipJSONSpace(raw []byte, p int) int {
+	for p < len(raw) {
+		switch raw[p] {
+		case ' ', '\t', '\r', '\n':
+			p++
+		default:
+			return p
+		}
+	}
+	return p
+}
+
+// scanJSONStringSpan walks the JSON string beginning at raw[p] (which must be '"') and
+// returns the index just past its closing quote.
+//
+// simple reports that the span's contents are plain ASCII text — every byte in 0x20..0x7E,
+// no backslash — so the string's value is the span between the quotes with no decoding.
+// That mirrors encoding/json's own fast path exactly: it too falls back to a copying decode
+// for an escape, a control byte, or a non-ASCII byte, and its slow path rewrites invalid
+// UTF-8 to U+FFFD. Treating a non-ASCII key as simple would therefore leave two keys that
+// differ only in invalid bytes distinct here while the decoder folds them together — the
+// fail-open direction, so the flag is conservative by construction.
+func scanJSONStringSpan(raw []byte, p int) (end int, simple, ok bool) {
+	simple = true
+	for i := p + 1; i < len(raw); i++ {
+		switch c := raw[i]; {
+		case c == '"':
+			return i + 1, simple, true
+		case c == '\\':
+			simple = false
+			// Validate the escape here rather than leaving it to the decode below: the
+			// decode runs only for a KEY (and for the one name value the tools/list caller
+			// attributes), so an invalid escape inside any other string would otherwise be
+			// walked past as if the bytes were fine — reporting trustworthy where the
+			// decoder these bytes are checked against refuses them outright. Wrong
+			// direction on a fail-closed gate.
+			i++
+			if i >= len(raw) {
+				return 0, false, false
+			}
+			switch raw[i] {
+			case '"', '\\', '/', 'b', 'f', 'n', 'r', 't':
+			case 'u':
+				// Four hex digits. A lone surrogate is NOT rejected — the decoder
+				// substitutes U+FFFD for one rather than erroring — so only the digits
+				// are checked.
+				if i+4 >= len(raw) {
+					return 0, false, false
 				}
-				stack = append(stack, frame{object: d == '{', expectKey: d == '{'})
-				pendingName = false
-			default: // '}' or ']'
-				stack = stack[:len(stack)-1]
-				markValueDone()
-			}
-			continue
-		}
-		n := len(stack)
-		if stack[n-1].object && stack[n-1].expectKey {
-			key, ok := tok.(string)
-			if !ok {
-				out.untrustworthy = true
-				return out
-			}
-			// Canonicalize per the caller's fold policy (see jsonKeyScanOpts). Everything
-			// not folded is compared byte-exactly, which is what catches the
-			// caller-independent exact duplicate. capability.FoldJSONKey, not
-			// strings.ToLower: ToLower leaves an already-lower-case case variant such as
-			// U+017F ("deſcription") distinct from "description", so the collision the
-			// decoder makes would go unseen and the bytes would clear the scan.
-			canon := key
-			switch {
-			case opts.foldKeys != nil:
-				// Scoped fold, at every depth: only a name whose case variant could change
-				// what a consumer resolves. Depth-uniform on purpose -- an unscoped rule
-				// keyed to depth made the verdict depend on whether the value happened to
-				// be wrapped in an array, since the bracket occupies a level of its own.
-				//
-				// A key already equal to its folded form needs no rewrite (canon is that
-				// form), so only the variant spelling is redirected onto it -- which is what
-				// makes the two collide in `seen`.
-				if folded := capability.FoldJSONKey(key); folded != key {
-					if _, scoped := opts.foldKeys[folded]; scoped {
-						canon = folded
+				for j := i + 1; j <= i+4; j++ {
+					if !isHexDigit(raw[j]) {
+						return 0, false, false
 					}
 				}
-			case n == 1:
-				// Struct-binding fold, root object only. n == 1 IS the root object here:
-				// this arm is reached only when opts.foldKeys is nil, and that caller does
-				// not admit an array root, so the root frame is always the object.
-				canon = capability.FoldJSONKey(key)
+				i += 4
+			default:
+				return 0, false, false
 			}
-			if stack[n-1].seen == nil {
-				stack[n-1].seen = make(map[string]struct{})
+		case c < 0x20 || c >= utf8.RuneSelf:
+			// A raw control byte is invalid JSON; a non-ASCII byte is valid but takes the
+			// decoder's copying path, so it is not simple.
+			if c < 0x20 {
+				return 0, false, false
 			}
-			if _, dup := stack[n-1].seen[canon]; dup {
-				out.untrustworthy = true
-			}
-			stack[n-1].seen[canon] = struct{}{}
-			stack[n-1].expectKey = false
-			pendingName = opts.foldKeys == nil && n == 1 && canon == jsonKeyNameFolded
-			continue
+			simple = false
 		}
-		if pendingName {
-			if s, ok := tok.(string); ok && s != "" {
-				out.names = append(out.names, s)
-			}
-			pendingName = false
-		}
-		markValueDone()
 	}
-	// The stack unwound to empty: the whole entry was walked, so names is authoritative.
-	out.namesComplete = true
-	return out
+	return 0, false, false // unterminated
+}
+
+// isHexDigit reports whether b is one of the sixteen hex digits a \u escape admits.
+func isHexDigit(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
+}
+
+// decodeJSONStringSpan returns the Go string a JSON string span decodes to. The simple span
+// (see scanJSONStringSpan) is its own contents; anything else goes through encoding/json, so
+// escapes, surrogate pairs, and invalid UTF-8 resolve exactly as the decoder resolves them
+// rather than by a second implementation of the same rules.
+func decodeJSONStringSpan(span []byte, simple bool) (string, bool) {
+	if simple {
+		return string(span[1 : len(span)-1]), true
+	}
+	var s string
+	if err := json.Unmarshal(span, &s); err != nil {
+		return "", false
+	}
+	return s, true
+}
+
+// scanJSONScalarSpan walks the non-string scalar beginning at raw[p] — a number, true,
+// false, or null — and returns the index just past it. A number is validated against JSON's
+// grammar but never converted: an out-of-range literal (1e999) must not error the walk, or
+// it would report a valid entry untrustworthy and, worse, shield a later duplicate behind
+// that error. This is the byte-level equivalent of the decoder's UseNumber mode.
+func scanJSONScalarSpan(raw []byte, p int) (end int, ok bool) {
+	switch raw[p] {
+	case 't':
+		return matchJSONLiteral(raw, p, "true")
+	case 'f':
+		return matchJSONLiteral(raw, p, "false")
+	case 'n':
+		return matchJSONLiteral(raw, p, "null")
+	}
+	i := p
+	if i < len(raw) && raw[i] == '-' {
+		i++
+	}
+	// int: a single 0, or a nonzero digit followed by digits.
+	switch {
+	case i < len(raw) && raw[i] == '0':
+		i++
+	case i < len(raw) && raw[i] >= '1' && raw[i] <= '9':
+		for i < len(raw) && raw[i] >= '0' && raw[i] <= '9' {
+			i++
+		}
+	default:
+		return 0, false
+	}
+	// frac
+	if i < len(raw) && raw[i] == '.' {
+		i++
+		start := i
+		for i < len(raw) && raw[i] >= '0' && raw[i] <= '9' {
+			i++
+		}
+		if i == start {
+			return 0, false
+		}
+	}
+	// exp
+	if i < len(raw) && (raw[i] == 'e' || raw[i] == 'E') {
+		i++
+		if i < len(raw) && (raw[i] == '+' || raw[i] == '-') {
+			i++
+		}
+		start := i
+		for i < len(raw) && raw[i] >= '0' && raw[i] <= '9' {
+			i++
+		}
+		if i == start {
+			return 0, false
+		}
+	}
+	return i, true
+}
+
+// matchJSONLiteral returns the index just past lit when raw[p:] begins with it.
+func matchJSONLiteral(raw []byte, p int, lit string) (end int, ok bool) {
+	if p+len(lit) <= len(raw) && string(raw[p:p+len(lit)]) == lit {
+		return p + len(lit), true
+	}
+	return 0, false
 }
 
 // entryKeysAmbiguous reports whether a */list entry's own bytes could decode to a

@@ -221,6 +221,14 @@ rules:
 - For new MCP method coverage, add an enforcement-gap-style test in
   `internal/transport/enforcement_gaps_test.go`.
 - For new audit-record fields, add a sign-and-verify round-trip test.
+- The duplicate-key scan (`internal/pdp`, the fail-closed gate behind the
+  `*/list` entry filter and the `redactFields` response path) is checked against
+  a tokenizer-derived oracle kept beside it in `scan_oracle_test.go`. Changing
+  the scan means keeping the two in agreement on all three outputs — the
+  untrustworthy verdict, the candidate-name set, and whether that set is
+  complete — through the equivalence table and the fuzz targets, and running a
+  fuzz campaign (`go test -run XXX -fuzz '^FuzzScanJSONKeys$' ./internal/pdp/`)
+  rather than relying on the seed corpus alone.
 
 ### Documentation
 
