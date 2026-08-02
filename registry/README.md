@@ -37,6 +37,12 @@ What the corpus gives you:
 - **Attributable** — an attestation naming who authored the entry and what review it has
   had (`pending`, `community`, `vendor`).
 
+- **Signed** — an optional `signatures` array carrying a vendor's or a reviewer's Ed25519
+  statement over the entry's content digest, verified locally against a trusted-key file
+  you supply. That is what turns the attestation block above from an unverifiable label
+  into something a second party asserted with a key. See
+  [Vendor attestation and community review](#vendor-attestation-and-community-review).
+
 What it does not give you: any claim that a server behaves as its contract says. A
 divergence between a contract and observed behavior is a **community-advisory signal**, not
 a detection result. The runtime counterpart to this is the **effect-receipt** surface — a
@@ -151,9 +157,118 @@ excluded (a contract cannot contain its own digest). Two entries whose contracts
   costly, or delayed, and the action still happened. The shipped entries record that
   reasoning in `notes`; a compensable entry without notes fails the corpus test.
 
+## Vendor attestation and community review
+
+A content digest establishes that an entry **is what it says it is**. It says nothing about
+*who* is saying it, and nothing about whether anyone else has looked. Those are the two
+things that turn a corpus of files into a corpus with a trust model.
+
+An entry may carry a `signatures` array: Ed25519 statements over the entry's content digest,
+each naming the key that made it, the **role** its signer claims, and **what** they claim.
+
+```jsonc
+"signatures": [
+  {
+    "keyId": "stripe-2026",
+    "algorithm": "ed25519",
+    "role": "vendor",        // "vendor" = publishes the server; "reviewer" = a third party
+    "statement": "attests",  // "attests" = the contract is correct; "disputes" = it is not
+    "signature": "<base64>"
+  }
+]
+```
+
+Verify a corpus against keys **you** have chosen to trust:
+
+```console
+$ eunox contracts --trust-keys ./trusted-keys.json
+OK    ./trusted-keys.json  (2 trusted attestation key(s))
+OK    registry/contracts  (12 contract(s), every declared digest matches its content)
+
+ID                        TOOL           CLASS        REVIEW   ATTESTATION  REF
+stripe/mcp.create_refund  create_refund  compensable  vendor   vendor       stripe/mcp.create_refund@sha256:cf8e…
+```
+
+The trust store is a local JSON file — there is no key discovery, no fetch, and no
+well-known URL:
+
+```jsonc
+{
+  "keys": [
+    {
+      "keyId": "stripe-2026",
+      "algorithm": "ed25519",
+      "publicKey": "<base64 raw 32-byte Ed25519 public key>",
+      "owner": "Stripe",
+      "roles": ["vendor"]     // optional: what this key may assert. Empty means any.
+    }
+  ]
+}
+```
+
+`roles` exists because trusting a key is not one decision. You may well trust a security
+researcher's key as a **reviewer** while not accepting it as the vendor of anything, and
+without this the two would be the same grant.
+
+### Four properties, each a deliberate limit
+
+1. **Local, always.** Verification takes the trust store you point at and nothing else, so
+   checking a corpus someone handed you works offline.
+2. **Never on the decision path.** Attestations are authoring-time input. A manifest still
+   pins an entry by content digest, and that pin is still what the manifest loader verifies.
+   An unattested contract enforces exactly as it did before — attestation changes what a
+   human knows when choosing to pin it, not what the proxy does with it.
+3. **A claim of authorship, not of truth.** A vendor signature says the vendor asserts this
+   is what their tool does. Nothing here observes the tool. A **dispute** is likewise a
+   community-advisory signal, not a detection result — the same posture the drift layer
+   takes about a manifest/upstream mismatch. A disputed entry is surfaced prominently and is
+   **not** an error exit: someone who looked disagreeing is a signal to weigh.
+4. **An untrusted signature is inert; a trusted one that fails is an error.** A corpus may
+   carry signatures from keys you have never heard of, and refusing to load it over one
+   would make every entry's usability depend on collecting every publisher's key — those are
+   reported as `unverified(n)`, which is a materially different state from unsigned, and
+   which is reported *alongside* whatever did verify rather than being replaced by it. But a
+   signature by a key you *did* configure that does not verify means the entry was **edited
+   after it was signed**, and that stops the command. The signature is checked **before** the
+   `roles` restriction is applied, so a key you trust only as a reviewer still surfaces
+   tampering on a vendor-role signature rather than being written off as a stranger's mark.
+
+`--trust-keys` composes with `--ref` and `--attest-payload`: verification runs first, so
+copying a pin or producing a signing payload cannot succeed against an entry a trusted key
+signed and someone then edited, and `--ref` warns on stderr when the entry it is pinning is
+disputed.
+
+### Producing a signature
+
+eunox **verifies** attestations and never mints them — it holds no signing key, for the same
+reason it consumes IdP tokens and never issues them. What it gives a publisher is the exact
+byte string to sign:
+
+```console
+$ eunox contracts --attest-payload stripe/mcp.create_refund --role vendor --statement attests
+eunox-effect-contract-attestation/v1
+stripe/mcp.create_refund
+sha256:cf8e502e17adee78495c683e8a96da5fff5d85ca967d8dc6bc2c014e2bd08898
+vendor
+attests
+```
+
+Sign those bytes with your Ed25519 key, base64 the 64-byte signature, and add the entry to
+`signatures`. Note what is inside the payload: the **digest**, so re-signing is required
+after any edit to the `effect` block; and the **role and statement**, so a reviewer's
+signature cannot be re-presented as a vendor's and a dispute cannot be edited into an
+endorsement. There is deliberately no timestamp — a value beside a signature that the
+signature does not cover is exactly the mistake this format should not permit, and a
+timestamp inside it would promise a freshness story an offline trust store cannot deliver.
+
+Signatures sit **outside** the digest. Each one is over the digest, so including them would
+be circular — and every added countersignature would invalidate every manifest pin to the
+entry.
+
 ## Status
 
 The shipped entries are **eunolabs-authored and review-pending**: written from public
 documentation of widely-used MCP servers, not contributed or confirmed by their publishers.
-They are a starting corpus and a worked demonstration of the format, not an authority.
-Vendor attestation and community review are what turn them into one.
+They are a starting corpus and a worked demonstration of the format, not an authority. None
+of them is signed yet — the format and the verifier are in place, and the signatures are the
+part only their publishers and reviewers can supply.

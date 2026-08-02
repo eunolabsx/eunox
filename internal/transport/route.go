@@ -347,7 +347,7 @@ func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability
 		}
 		configStrict := cfg.ResolvedStrictDrift(u)
 
-		dp, manifest, policyVersion, policySHA256, err := LoadUpstreamPDP(u, cfg.HostTransport(), cfg.BaseDir, counter, flowStore, ks)
+		dp, manifest, policyVersion, policySHA256, err := LoadUpstreamPDP(u, cfg.HostTransport(), cfg.BaseDir, counter, flowStore, ks, cfg.ResolvedTaskAnchoredState(u))
 		if err != nil {
 			return nil, err
 		}
@@ -578,7 +578,7 @@ func WalkRouteManifests(cfg *config.GatewayConfig, u *config.UpstreamConfig) Rou
 // against it, not the process working directory, so a config launched from any cwd
 // finds its manifests. An empty baseDir (e.g. a programmatically built config) keeps
 // the prior cwd-relative behavior. Absolute policy paths are used verbatim.
-func LoadUpstreamPDP(u *config.UpstreamConfig, hostTransport, baseDir string, counter capability.CallCounter, flowStore capability.FlowLabelStore, ks killswitch.Manager) (policy pdp.PolicyDecisionPoint, manifest *config.LocalManifest, policyVersion, policySHA256 string, err error) {
+func LoadUpstreamPDP(u *config.UpstreamConfig, hostTransport, baseDir string, counter capability.CallCounter, flowStore capability.FlowLabelStore, ks killswitch.Manager, taskAnchored bool) (policy pdp.PolicyDecisionPoint, manifest *config.LocalManifest, policyVersion, policySHA256 string, err error) {
 	if len(u.Policy) == 0 {
 		if u.ExpectVersion != "" {
 			return nil, nil, "", "", fmt.Errorf("upstream %q: expectVersion %q set but no policy is configured", u.Name, u.ExpectVersion)
@@ -650,6 +650,14 @@ func LoadUpstreamPDP(u *config.UpstreamConfig, hostTransport, baseDir string, co
 		// policy declares one: the ceiling can only narrow, so an absent one changes
 		// nothing, and leaving it unset skips the per-allow check entirely.
 		engineOpts = append(engineOpts, enforcement.WithEffectCeiling(merged.EffectCeiling))
+	}
+	if taskAnchored {
+		// Key this route's accumulated state on the caller's validated mcp.task_id claim
+		// instead of on its session, so taint, antecedents, budgets, and spent one-shot
+		// approvals survive a hop to another enforcement point. Wired only when the route
+		// asks for it: it changes what every budget in the policy means, and a token that
+		// authenticated without carrying a task id is refused rather than accounted twice.
+		engineOpts = append(engineOpts, enforcement.WithTaskAnchoredState())
 	}
 	if !merged.HasFlowLabel() {
 		// No flowLabel condition or labelOutput directive anywhere in the policy: the

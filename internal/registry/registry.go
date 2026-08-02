@@ -63,6 +63,17 @@ type Contract struct {
 	// trust surface, and it is deliberately modest: authorship and review state, not a
 	// verification claim.
 	Attestation Attestation `json:"attestation"`
+	// Signatures carries signed statements about this entry — a vendor attesting that the
+	// contract describes their tool, a reviewer who read it, or either DISPUTING it. They
+	// are what turns the Attestation block above from an unverifiable label into something
+	// a second party asserted with a key.
+	//
+	// They are verified LOCALLY against a trust store the operator points at, at
+	// `eunox contracts` time and never on the decision path (see attest.go). They are also
+	// deliberately OUTSIDE the digest: the digest is over the effect contract's own content,
+	// and each signature is over that digest, so including them would be circular and would
+	// mean every new countersignature invalidated every manifest pin to the entry.
+	Signatures []Signature `json:"signatures,omitempty"`
 	// Digest is EffectContractDigest of Effect — the value a manifest pins after the '@'
 	// in `effect.ref`. Stored rather than only computed so a corpus consumer can detect a
 	// tampered entry without re-deriving the encoding, and so the file is self-describing.
@@ -136,6 +147,13 @@ func (c *Contract) Validate() error {
 	if strings.TrimSpace(c.ID) == "" {
 		return fmt.Errorf("contract entry is missing 'id'")
 	}
+	// The id is the only free-form field inside the signed attestation payload, whose fields
+	// are newline-separated. Refusing a newline keeps that payload's field boundaries a
+	// property of the format rather than of an argument about which fields happen to be
+	// newline-free — and an id is a "vendor/tool" slug, so nothing legitimate is lost.
+	if strings.ContainsAny(c.ID, "\r\n") {
+		return fmt.Errorf("contract %q: 'id' contains a line break; an id is a vendor/tool slug and is embedded verbatim in the signed attestation payload", c.ID)
+	}
 	if strings.TrimSpace(c.Tool) == "" {
 		return fmt.Errorf("contract %q is missing 'tool'", c.ID)
 	}
@@ -177,6 +195,51 @@ func (c *Contract) Validate() error {
 	if actual != c.Digest {
 		return fmt.Errorf("contract %q: declared digest %s does not match its content digest %s — the entry was edited without re-digesting", c.ID, c.Digest, actual)
 	}
+	// Structural validation only — everything checkable without a key. Signature
+	// VERIFICATION needs the operator's trust store and happens in VerifyAttestations; a
+	// malformed signature is refused here rather than there so a corpus cannot carry one
+	// that looks like assurance in a listing and turns out to be unevaluable.
+	seenSig := make(map[string]bool, len(c.Signatures))
+	for i := range c.Signatures {
+		if err := c.Signatures[i].Validate(c.ID); err != nil {
+			return err
+		}
+		// One statement per key per entry. Two signatures from one key are either a
+		// duplicate or a key that both attests and disputes, and neither is something a
+		// report can render honestly.
+		k := c.Signatures[i].KeyID
+		if seenSig[k] {
+			return fmt.Errorf("contract %q: key %q signs this entry more than once; one statement per key", c.ID, k)
+		}
+		seenSig[k] = true
+	}
+	return nil
+}
+
+// strictDecodeJSON is the one JSON reader this package uses for a document on disk: unknown
+// fields refused, and trailing content after the first value refused.
+//
+// Both halves are load-bearing and both were previously written out twice, once per loader.
+// Unknown-field rejection turns a misspelling into an error rather than a silently-absent
+// value. The trailing-content check catches a file holding two concatenated objects — a bad
+// merge, an append where a rewrite was meant — where Decode would read the first and discard
+// the second in silence; a contract or a trusted key that vanishes without an alarm is
+// indistinguishable from one that was never there.
+//
+// useNumber preserves integer literals beyond float64's exact range, which matters for a
+// contract's blast radius and not for a key file.
+func strictDecodeJSON(data []byte, target any, what string, useNumber bool) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if useNumber {
+		dec.UseNumber()
+	}
+	if err := dec.Decode(target); err != nil {
+		return fmt.Errorf("parsing %s: %w", what, err)
+	}
+	if dec.More() {
+		return fmt.Errorf("parsing %s: trailing content after the first JSON object", what)
+	}
 	return nil
 }
 
@@ -210,22 +273,11 @@ func LoadCorpus(dir string) ([]Contract, error) {
 			return nil, fmt.Errorf("reading contract %q: %w", p, err)
 		}
 		var c Contract
-		dec := json.NewDecoder(bytes.NewReader(data))
-		dec.DisallowUnknownFields()
 		// UseNumber keeps a blast-radius literal exact: a magnitude above 2^53 widened to
 		// float64 would round, and the digest is computed over the decoded value, so the
 		// entry would fail its own digest check for a reason that looks like tampering.
-		dec.UseNumber()
-		if err := dec.Decode(&c); err != nil {
-			return nil, fmt.Errorf("parsing contract %q: %w", p, err)
-		}
-		// Decode reads only the FIRST JSON value, so a file holding two concatenated
-		// objects — a bad merge, an append where a rewrite was meant — would load the
-		// first and discard the second in silence. That is the shape this loader's
-		// fail-on-first-invalid rule exists to prevent: a contract that vanishes without
-		// an alarm is indistinguishable from one that was never there.
-		if dec.More() {
-			return nil, fmt.Errorf("parsing contract %q: trailing content after the first JSON object; one entry per file", p)
+		if err := strictDecodeJSON(data, &c, fmt.Sprintf("contract %q", p), true); err != nil {
+			return nil, err
 		}
 		if err := c.Validate(); err != nil {
 			return nil, fmt.Errorf("%s: %w", filepath.Base(p), err)
@@ -240,12 +292,9 @@ func LoadCorpus(dir string) ([]Contract, error) {
 	return out, nil
 }
 
-// sortedKeys renders a validation set for a deterministic error message.
+// sortedKeys renders a validation set for a deterministic error message. The collect-and-sort
+// is sortedSet's (attest.go); this is that plus the join, so one function orders a set in this
+// package rather than two with near-identical bodies.
 func sortedKeys(m map[string]bool) string {
-	ks := make([]string, 0, len(m))
-	for k := range m {
-		ks = append(ks, k)
-	}
-	sort.Strings(ks)
-	return strings.Join(ks, ", ")
+	return strings.Join(sortedSet(m), ", ")
 }

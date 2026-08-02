@@ -23,17 +23,31 @@ import (
 // reclaimed by the transport's Clear on session end (a windowed marker aged a taint out
 // mid-session, a fail-open the "for all flows" claim cannot tolerate). See
 // pkg/flowlabelstore.
+//
+// Under WithTaskAnchoredState the same set is keyed on the validated task instead, so taint
+// crosses a hop between enforcement points rather than restarting clean on the far side.
+// See anchor.go.
 
 // flowLabelVocab is the native flow-label vocabulary, cached once from
 // capability.FlowLabelVocabulary so the subset check and the accumulated-set peek do
 // not re-allocate it per request. Read-only.
 var flowLabelVocab = capability.FlowLabelVocabulary()
 
-// flowSessionKey builds the per-session flow-label store key. namespace (the engine's
-// counterKeyNamespace) leads so routes sharing one FlowLabelStore address disjoint
-// label state, mirroring sequenceHistoryKey. There is no per-label component: the store
-// holds the whole accumulated SET under this one key (Add unions, Get returns the set),
-// where the old windowed counter needed one marker key per label.
+// flowKey builds the flow-label store key for a request's anchor — the session, or the
+// validated task under WithTaskAnchoredState. namespace (the engine's counterKeyNamespace)
+// leads so routes sharing one FlowLabelStore address disjoint label state, mirroring
+// sequenceHistoryKey. There is no per-label component: the store holds the whole accumulated
+// SET under this one key (Add unions, Get returns the set), where the old windowed counter
+// needed one marker key per label.
+func (e *Engine) flowKey(req *capability.EnforceRequest) string {
+	return e.anchoredKey("flow", req)
+}
+
+// flowSessionKey is the SESSION-anchored flow key, for the one caller that has a session id
+// and nothing else: the transport's teardown Clear. It equals flowKey for every request
+// without task anchoring, and under task anchoring it addresses the key a task-less request
+// on that session would have written — which is precisely what teardown should reclaim and
+// all it should reclaim.
 func (e *Engine) flowSessionKey(sessionID string) string {
 	return compositeCounterKey("flow", e.counterKeyNamespace, sessionID)
 }
@@ -237,7 +251,7 @@ func (e *Engine) peekSessionLabels(ctx context.Context, req *capability.EnforceR
 	if e.skipFlow || e.flowStore == nil || req.SessionID == "" {
 		return nil, nil
 	}
-	present, err := e.flowStore.Get(ctx, e.flowSessionKey(req.SessionID))
+	present, err := e.flowStore.Get(ctx, e.flowKey(req))
 	if err != nil {
 		return nil, err
 	}
@@ -331,7 +345,7 @@ func (e *Engine) recordLabels(ctx context.Context, req *capability.EnforceReques
 			out = append(out, label)
 		}
 	}
-	if err := e.flowStore.Add(ctx, e.flowSessionKey(req.SessionID), out...); err != nil {
+	if err := e.flowStore.Add(ctx, e.flowKey(req), out...); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -410,6 +424,16 @@ func (e *Engine) recordSourceCall(ctx context.Context, req *capability.EnforceRe
 		added = labelsAdded(labelsOut, carriedLabels)
 	}
 	if len(decl.Labels) > 0 {
+		// Burn a single-use grant BEFORE clearing with it, so the two possible faults land on
+		// the safe side of the one that matters. Burn-then-clear can leave a grant spent for
+		// a clear that did not happen (over-refusal: the operator mints another approval).
+		// Clear-then-burn would leave a label dropped by a grant still marked live — the
+		// replay this ledger exists to close, reachable by faulting the store at the right
+		// moment. A standing grant burns nothing and this costs it no round-trip.
+		if err := e.burnApproval(ctx, decl.LedgerID); err != nil {
+			e.rollbackLabels(ctx, req, added)
+			return nil, nil, &SourceCommitError{Err: err, Flow: true, Declassify: true}
+		}
 		var err error
 		// The post-add set: what the session holds now that this call's own labelOutput
 		// (if any) has committed. Handing the PRE-call snapshot instead meant a clear could
@@ -418,7 +442,9 @@ func (e *Engine) recordSourceCall(ctx context.Context, req *capability.EnforceRe
 		labelsCleared, err = e.clearLabels(ctx, req, decl, unionLabels(carriedLabels, labelsOut))
 		if err != nil {
 			// The clear faulted after the add committed: undo the add so the refused call
-			// leaves nothing behind, exactly as the seq-fault arm below does.
+			// leaves nothing behind, exactly as the seq-fault arm below does. The burn is
+			// NOT undone — the counter has no delete, and leaving the grant spent for a call
+			// that did not run over-refuses, which is the safe direction (see burnApproval).
 			e.rollbackLabels(ctx, req, added)
 			return nil, nil, &SourceCommitError{Err: err, Flow: true, Declassify: true}
 		}
@@ -430,7 +456,15 @@ func (e *Engine) recordSourceCall(ctx context.Context, req *capability.EnforceRe
 		// would mean "the action ran and the taint the policy declared cleared is back",
 		// the outcome declassifyRecordFailureDenial exists to prevent. Reported as the
 		// declassify leg so the deny it maps to is the hard one.
-		if len(labelsCleared) > 0 {
+		//
+		// A call that BURNED a single-use grant takes the declassify arm whether or not the
+		// clear moved a label, so the deny it maps to is the HARD one. The soft
+		// antecedent-fault deny is downgraded and FORWARDED by an --audit route, and
+		// forwarding a call whose one-shot approval was just spent is the worst of both: the
+		// action runs, and the operator's single approval is gone with no clear to show for
+		// it. Keyed on LedgerID rather than on labelsCleared because the burn happens on a
+		// no-op clear too.
+		if len(labelsCleared) > 0 || decl.LedgerID != "" {
 			e.restoreLabels(ctx, req, labelsCleared)
 			e.rollbackLabels(ctx, req, added)
 			return nil, nil, &SourceCommitError{Err: err, Flow: true, Declassify: true}
@@ -495,7 +529,23 @@ func (e *Engine) rollbackLabels(ctx context.Context, req *capability.EnforceRequ
 	if e.flowStore == nil || req.SessionID == "" || len(added) == 0 {
 		return
 	}
-	_ = e.flowStore.Remove(ctx, e.flowSessionKey(req.SessionID), added...)
+	// Not when THIS request is task-keyed. The rollback removes exactly the labels this call
+	// added, computed from a snapshot peeked under this session's decision lock — and that lock
+	// does not span a task key two sessions share. A concurrent session that legitimately added
+	// the same label between the snapshot and here would have it deleted, leaving the task
+	// UNTAINTED for a source read that really happened: a fail-open on precisely the "for all
+	// flows" claim the anchor exists to extend. Declining to roll back strands this call's
+	// label instead, which over-blocks a later sink — the direction the whole rollback path
+	// already accepts as its residual when a Remove faults.
+	//
+	// The question is about the REQUEST, not the engine's mode. A task-anchored engine still
+	// keys a token-less caller on its session, where the decision lock does span the key and
+	// no concurrent writer exists — standing down there strands a label for a hazard that
+	// cannot occur, on every unauthenticated caller the route serves.
+	if e.anchoredOnTask(req) {
+		return
+	}
+	_ = e.flowStore.Remove(ctx, e.flowKey(req), added...)
 }
 
 // restoreLabels is rollbackLabels' mirror for the declassify leg: it best-effort re-adds
@@ -509,7 +559,7 @@ func (e *Engine) restoreLabels(ctx context.Context, req *capability.EnforceReque
 	if e.flowStore == nil || req.SessionID == "" || len(cleared) == 0 {
 		return
 	}
-	_ = e.flowStore.Add(ctx, e.flowSessionKey(req.SessionID), cleared...)
+	_ = e.flowStore.Add(ctx, e.flowKey(req), cleared...)
 }
 
 // ClearSessionLabels releases a session's accumulated flow-label set, called from the
@@ -518,6 +568,13 @@ func (e *Engine) restoreLabels(ctx context.Context, req *capability.EnforceReque
 // wired, the policy uses no flow control (skipFlow), or the session id is empty — the
 // same guards recordLabels/peekSessionLabels apply, so a non-flow deployment pays
 // nothing on teardown.
+//
+// It clears the SESSION-anchored key only, which is the whole of what a session owns. Under
+// WithTaskAnchoredState a request carrying a task id wrote its labels under the TASK's key,
+// and that state is meant to outlive this session — clearing it here would restore exactly
+// the per-PEP boundary the anchor exists to cross, and would let an agent launder a task's
+// taint by disconnecting. Abandoned task state is reclaimed by the store's own idle TTL
+// (Redis) or bounded by flowlabelstore.WithMaxKeys (in-memory); see WithTaskAnchoredState.
 func (e *Engine) ClearSessionLabels(ctx context.Context, sessionID string) error {
 	if e.flowStore == nil || e.skipFlow || sessionID == "" {
 		return nil

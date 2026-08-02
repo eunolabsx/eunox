@@ -366,7 +366,7 @@ func (e *Engine) maxCallsBucket(ctx context.Context, cond capability.Condition, 
 	if SkipQuota(ctx) {
 		return nil, "", true, nil
 	}
-	return mc, compositeCounterKey("maxcalls", e.counterKeyNamespace, req.SessionID, targetType, toolName), false, nil
+	return mc, e.anchoredKey("maxcalls", req, targetType, toolName), false, nil
 }
 
 // maxCallsHandler is the built-in maxCalls condition handler. maxCalls commits a
@@ -1410,7 +1410,7 @@ func (e *Engine) handleSequenceBlock(ctx context.Context, cond capability.Condit
 		priorType, priorTool := splitEnginePrefix(prior)
 		priorTool = strings.TrimSpace(priorTool)
 		priorTarget := priorType + ":" + priorTool
-		key := sequenceHistoryKey(e.counterKeyNamespace, req.SessionID, priorType, priorTool)
+		key := e.sequenceHistoryKey(req, priorType, priorTool)
 
 		count, err := e.counter.Peek(histCtx, key, sequenceHistoryWindowSec)
 		if err != nil {

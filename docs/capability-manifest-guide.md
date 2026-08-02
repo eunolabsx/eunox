@@ -2301,12 +2301,70 @@ field, because a verified token already has one.
 > call. A stdio *upstream* behind an HTTP gateway is fine — the token arrives on the
 > host leg.
 
-> **The honest limit.** The token is held by the agent, so an approval minted into
-> it can be replayed for as long as that token lives, at any action the grant's
-> `target` names. Scope and expiry bound the damage; they do not eliminate it.
-> Mint a short-lived token per approval rather than a standing grant. The proxy
-> enforces the scope and records the approver; it cannot make a long-lived grant
-> safe.
+#### `once` — a single-use approval
+
+A grant is **replayable by default**: the token is held by the agent, so an approval
+minted into it can be presented for as long as that token lives, at any action the
+grant's `target` names. Scope bounds that; scope is not lifetime.
+
+`once: true` closes it. The grant is **burned** on the first call that clears with
+it, and every later presentation is refused with `reason: approval_consumed` rather
+than clearing again:
+
+```jsonc
+{
+  "labels": ["pii"],
+  "target": "tool:publish_sanitized_report",
+  "approver": "alice@example.com",
+  "id": "apr-2026-08-01-014",   // REQUIRED under once — the ledger burns by id
+  "once": true
+}
+```
+
+- **`id` is mandatory** under `once`. The burn is keyed by id, not by the grant's
+  content: two approvals naming the same labels, target, and approver are two
+  separate human decisions, and a content key would let the first spend the second.
+  A `once` grant with no `id` **rejects the token** rather than silently degrading
+  to a standing approval.
+- **The grant is spent even when the clear is a no-op.** Presenting it on a session
+  that is not carrying the label still burns it. That is the property, not an
+  oversight: burning only on a clear that changed something would make the grant
+  replayable by ordering — present it once while clean, acquire the taint, present
+  it again to the clear that matters.
+- **A store fault escalates.** If the ledger cannot be read, "already used" cannot
+  be told from "never used", and treating that as fresh would make an unreachable
+  backend the way to replay every one-shot grant in a token. If the burn cannot be
+  written, the call hard-denies rather than clearing anyway.
+- **A token may carry several grants.** The proxy uses the first *live* one, so a
+  spent grant beside a fresh one is passed over rather than refused on.
+- **The burn is not scoped to anything.** Not the session, not the task. "Approve
+  clearing this once" means once: reconnecting does not restore it, a second session
+  does not get its own copy, and a different task does not either. The one bound is
+  **retention** — a burn is remembered for seven days, after which the grant is live
+  again. That is a real limit on the guarantee, stated rather than wished away, and
+  the answer to it is the one the docs already give: mint a short-lived token per
+  approval.
+- **Concurrency is closed at the burn, not at the check.** Two calls presenting the
+  same live grant at the same moment can both *see* it as live; exactly one is
+  admitted, and the other is refused. Over-refusing one of two racing calls is the
+  only outcome that keeps "once" meaning once.
+- **A call refused after its burn does not get the use back.** The grant is spent.
+  That over-refuses (mint another approval) rather than handing a use back to a
+  caller whose action may still have been forwarded by an `--audit` route.
+- **A token carries at most 32 approvals**, each with at most 256 labels, and each is
+  decoded strictly: an unknown member (`lables` would decode to an empty label set), an
+  explicit `null`, or a duplicate key rejects the token. `"once": null` is the one that
+  matters most — it decodes to `false`, which is a *standing* grant, i.e. exactly the
+  replay window `once` exists to close. Omit a member instead of writing `null`.
+
+A standing grant (`once` unset) still behaves exactly as before, because an operator
+whose control plane already mints a short-lived token per approval has the property
+by other means and should not be made to keep a ledger for nothing.
+
+> **What is still not solved.** `once` bounds how many times an approval is
+> *usable*; it does not bound who holds the token. A token stolen before its grant
+> is spent still spends it. Short-lived tokens remain the right practice; this makes
+> a long-lived one bounded rather than standing.
 
 #### What lands on the tape
 
@@ -2393,6 +2451,70 @@ revision that introduced it, like every other `0.2` token.
 References are resolved in `allowedValues` **only**. A `${...}` elsewhere in the
 manifest is an ordinary literal string, which for a security rule means it matches
 nothing — the fail-closed direction, but not what the author intended.
+
+## 5d. Cross-PEP state — `taskAnchoredState`
+
+Everything eunox accumulates — flow-label taint, `sequenceBlock` antecedents,
+`maxCalls` and cumulative `blastRadius` budgets, spent one-shot declassify grants — is
+keyed on an **anchor**: the identity the state accrues to. By default that is the
+**session**, which is exactly right for one proxy in front of one host↔upstream pair.
+
+It is also the boundary that state cannot cross. A sub-agent delegated to a second
+enforcement point, or the same task re-entering through a fresh session, starts with a
+clean label set, an empty antecedent history, and a full budget. Information-flow
+control's "for all flows" claim spans one enforcement point, and no more.
+
+`taskAnchoredState` keys the same state on the validated `mcp.task_id` claim instead:
+
+```yaml
+defaults:
+  taskAnchoredState: true      # every route
+upstreams:
+  - name: reporting
+    taskAnchoredState: false   # ...except this one
+```
+
+Three properties make it safe to turn on, and each is structural rather than
+conventional:
+
+1. **Opt-in.** It changes what every budget in the policy *means* — a `maxCalls` of 20
+   becomes 20 per task rather than 20 per connection, and two sessions carrying one
+   task id share one label set. That is the point, and it is not a change to make on an
+   operator's behalf.
+2. **The anchor is a validated claim.** `task_id` is one of the reserved
+   `input.claims` keys filled authoritatively from the verified token, which a
+   same-named custom claim cannot shadow. An agent cannot pick which task's budget it
+   spends.
+3. **It falls back to the session for an unauthenticated caller, and refuses an
+   authenticated one it cannot anchor.** A request with **no token** is anchored on its
+   session exactly as it is today, so turning this on can never make two unauthenticated
+   callers share state. A request that **did** present a token but carries no `task_id` is
+   **denied** (`MISSING_CONTEXT`): on an HTTP host each request carries its own
+   `Authorization` header, so falling back there would let one caller split its own taint,
+   budgets and antecedents across two buckets by alternating tokens — and every direction
+   of that split is a fail-open. An operator who enables this has an IdP minting the claim;
+   a token without it on such a route is a misconfiguration the proxy cannot account for
+   safely. eunox prints a startup notice if the option is on with no JWT validation
+   configured at all, since it would then do nothing.
+
+A task-anchored key carries the anchor kind as its own component, so a task named `x`
+and a session named `x` address different buckets, and a session-anchored key is
+byte-for-byte what it was before this option existed.
+
+> **Task state outlives the session that wrote it.** That is the whole point, so session
+> teardown does not reclaim it — clearing it on disconnect would let an agent launder a
+> task's taint by reconnecting. **Use the Redis backends for this mode**: their idle TTL is
+> what reclaims an abandoned task. The in-memory flow store has no eviction at all, only the
+> fail-closed `WithMaxKeys` admission ceiling, so a long-lived process accumulating distinct
+> task ids will eventually refuse new ones — over-blocking, but a restart to recover.
+
+> **Label rollback stands down under task anchoring.** When a source call's flow write
+> commits and a later write in the same commit faults, the engine normally removes the labels
+> that call added. It does not do so on a task key: the delta is computed from a snapshot
+> taken under one session's decision lock, and that lock does not span a key two sessions
+> share, so the removal could delete taint a *concurrent* session legitimately deposited. The
+> label is stranded instead, which over-blocks a later sink — the direction the rollback path
+> already accepts as its residual.
 
 ## 6. TTL guidance
 

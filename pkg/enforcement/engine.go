@@ -166,17 +166,6 @@ func compositeCounterKey(prefix string, parts ...string) string {
 // per call across the 24h window — an unbounded heap sink for a one-bit question.
 const sequenceHistoryMaxEntries = 1
 
-// sequenceHistoryKey builds the per-session, per-target key under which an
-// allowed call is recorded for sequenceBlock lookups. namespace (the engine's
-// counterKeyNamespace) is the leading component so routes sharing one CallCounter
-// address disjoint history. The target type is part of the key because the bare name
-// alone is ambiguous — a tool "export" and a prompt "export" would otherwise collide
-// on one bucket and cross-trip each other's sequenceBlocks. Recording and Peek must
-// pass the same namespace and type (see RecordSessionCall and handleSequenceBlock).
-func sequenceHistoryKey(namespace, sessionID, targetType, target string) string {
-	return compositeCounterKey("seq", namespace, sessionID, targetType, target)
-}
-
 // PolicyEvaluator evaluates a policy condition against an enforce request by
 // calling an external policy decision point (e.g. OPA, Cedar). Implementations
 // must return nil to allow or a non-nil [*ConditionError] to deny.
@@ -246,6 +235,15 @@ type Engine struct {
 	// empty (a directly-constructed Engine) the leading component is still emitted (a
 	// length-prefixed empty part), so the key differs from a pre-namespace key either way.
 	counterKeyNamespace string
+
+	// taskAnchored keys accumulated state (flow labels, sequenceBlock antecedents,
+	// maxCalls and cumulative blastRadius budgets, the single-use declassify ledger) on
+	// the request's VALIDATED mcp.task_id claim rather than on its session, so the state
+	// survives a hop across enforcement points. Opt-in (WithTaskAnchoredState) and
+	// fail-safe: a request with NO TOKEN falls back to session keying rather than to a
+	// shared bucket, and an authenticated one whose token carries no task_id is refused
+	// rather than split across both. See anchor.go for why each property is required.
+	taskAnchored bool
 }
 
 // Option configures the Engine.
@@ -320,6 +318,31 @@ func WithoutFlowLabels() Option {
 func WithCounterKeyNamespace(ns string) Option {
 	return func(e *Engine) {
 		e.counterKeyNamespace = ns
+	}
+}
+
+// WithTaskAnchoredState keys accumulated enforcement state on the request's VALIDATED
+// mcp.task_id claim instead of on its session, so information-flow taint, sequenceBlock
+// antecedents, quota and blast-radius budgets, and single-use declassify grants survive a
+// hop across enforcement points — a sub-agent delegated to a second PEP, or the same task
+// re-entering through a fresh session, continues the task's state rather than starting
+// clean.
+//
+// It changes what every budget in the policy MEANS (a maxCalls of 20 becomes 20 per task,
+// not 20 per connection), which is why it is opt-in rather than derived. An UNAUTHENTICATED
+// request is anchored on its session exactly as it is without this option, so enabling it can
+// never make two callers share state on the strength of something neither of them proved; an
+// authenticated request whose token carries no task_id is REFUSED rather than session-keyed
+// (anchorUnresolved), because one caller alternating token shapes would otherwise split its
+// own taint, budgets and antecedents across two buckets.
+//
+// Task-anchored state deliberately OUTLIVES the session that wrote it, so the transport's
+// teardown does not reclaim it (see ClearSessionLabels). Pair this with the Redis backends,
+// whose idle TTL reclaims an abandoned task, or bound the in-memory store with
+// flowlabelstore.WithMaxKeys.
+func WithTaskAnchoredState() Option {
+	return func(e *Engine) {
+		e.taskAnchored = true
 	}
 }
 
@@ -566,11 +589,11 @@ func (e *Engine) RecordSessionCall(ctx context.Context, req *capability.EnforceR
 	// fully-qualified spelling ("resource:tool:reboot" vs "tool:reboot"), which resolves
 	// to the primary verbatim marker and never touches this alias key.
 	if altType, altName := splitEnginePrefix(tool); altName != tool {
-		if _, err := e.counter.IncrementAndGet(ctx, sequenceHistoryKey(e.counterKeyNamespace, req.SessionID, altType, altName), sequenceHistoryWindowSec, sequenceHistoryMaxEntries); err != nil {
+		if _, err := e.counter.IncrementAndGet(ctx, e.sequenceHistoryKey(req, altType, altName), sequenceHistoryWindowSec, sequenceHistoryMaxEntries); err != nil {
 			return err
 		}
 	}
-	if _, err := e.counter.IncrementAndGet(ctx, sequenceHistoryKey(e.counterKeyNamespace, req.SessionID, targetType, tool), sequenceHistoryWindowSec, sequenceHistoryMaxEntries); err != nil {
+	if _, err := e.counter.IncrementAndGet(ctx, e.sequenceHistoryKey(req, targetType, tool), sequenceHistoryWindowSec, sequenceHistoryMaxEntries); err != nil {
 		return err
 	}
 	return nil
@@ -1187,6 +1210,33 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 		}()
 	}
 
+	// An authenticated caller this engine cannot anchor as configured. It sits here — after
+	// the obligation and carried-label defers are installed, so a downgraded (observe-mode)
+	// refusal still carries the redactions and the label snapshot every other non-allow exit
+	// carries, and before the conditions, because it is a property of the request rather than
+	// of the conditions: a call that cannot be accounted must not reach the state commits
+	// below. Falling back to session keying here would let one caller split its own taint,
+	// budgets and antecedents across two buckets by alternating tokens — see anchorUnresolved.
+	if e.anchorUnresolved(req) {
+		return denyResponse(requestID, now, matched.IsAuditOnly(), nil, capability.DenialInfo{
+			Code:          capability.ErrCodeMissingContext,
+			ConditionType: anchorKindTask,
+			// HardDeny, which puts this beside the unapproved declassification and the
+			// over-ceiling effect rather than beside an ordinary authorization verdict. A
+			// downgradable refusal is FORWARDED on an audit-only constraint, and the observe
+			// path's own antecedent recorder then writes this call's labels and sequence marker
+			// through stateAnchor — which, with no task id to resolve, keys them on the SESSION.
+			// So the very state split this check exists to refuse is what the downgrade
+			// performs, on a route whose other constraints are reading the task-keyed bucket.
+			// It is a failed state write, not a verdict being staged, and an operator staging
+			// task anchoring still gets the diagnostic: the refusal is on the tape either way,
+			// carrying the reason.
+			HardDeny: true,
+			Message:  "this route anchors enforcement state on the task, but the presented token carries no mcp.task_id; refusing rather than accounting this call against a second, session-keyed bucket (fail closed)",
+			Details:  map[string]interface{}{"anchor": anchorKindTask, "reason": "no_task_id"},
+		})
+	}
+
 	// PASS ONE: the pure predicates. The deferred (quota-consuming) conditions are
 	// collected but NOT committed here — the ceiling below has to be able to refuse the
 	// call before anything is charged to it.
@@ -1220,7 +1270,7 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 	// call that is over the consequence bound reports that — the bound is the more
 	// fundamental refusal, and an operator who fixes the approval first would otherwise
 	// discover the ceiling second.
-	decl, declDeny := e.checkDeclassify(req, matched, carriedLabels, requestID, now)
+	decl, declDeny := e.checkDeclassify(ctx, req, matched, carriedLabels, requestID, now)
 	if declDeny != nil {
 		return *declDeny
 	}

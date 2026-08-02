@@ -100,6 +100,8 @@ YAML:
 | How much of my policy is annotated, and what is not? | `eunox validate <manifest…>` (also in `eunox doctor`) |
 | Is this contract corpus intact? | `eunox contracts --dir <path>` |
 | What do I paste into `effect.ref` for this entry? | `eunox contracts --dir <path> --ref <id>` |
+| Who attests to these entries, and who disputes them? | `eunox contracts --dir <path> --trust-keys <file>` |
+| What bytes do I sign to attest to an entry? | `eunox contracts --dir <path> --attest-payload <id>` |
 
 The coverage line is the progress meter on the flywheel below: under an `effectCeiling`
 every unannotated capability escalates, so the named worklist is what turns "everything is
@@ -111,6 +113,17 @@ intended, not a defect.
 content, and rejects a duplicate id — the same checks the corpus test runs, reachable
 without writing Go. All of it is **local**: nothing is fetched, here or on the decision
 path.
+
+With `--trust-keys` it additionally verifies each entry's signed attestations against a
+local trusted-key file and adds an `ATTESTATION` column: who **attests** to the entry, and
+who **disputes** it. A digest establishes that an entry is what it says it is; a signature
+establishes *who is saying it*, which is the half a hash cannot supply. A signature by a key
+the file does not hold is reported as unverified rather than erroring — a corpus may be
+signed by parties you have not chosen to trust — while a signature by a key it **does** hold
+that fails to verify stops the command, because the only way to produce one is to edit an
+entry after it was signed. eunox verifies attestations and never mints them; `--attest-payload`
+prints the exact bytes a publisher signs with their own key. Format and worked examples:
+[`registry/README.md`](../registry/README.md#vendor-attestation-and-community-review).
 
 ### Argument-parameterized contracts
 

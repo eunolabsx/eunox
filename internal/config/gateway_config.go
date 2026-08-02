@@ -293,6 +293,21 @@ type RouteDefaults struct {
 
 	StrictDrift       bool `yaml:"strictDrift"`
 	UpstreamTimeoutMs int  `yaml:"upstreamTimeoutMs"`
+
+	// TaskAnchoredState keys every route's accumulated enforcement state — flow-label
+	// taint, sequenceBlock antecedents, maxCalls and cumulative blastRadius budgets, spent
+	// single-use declassify grants — on the caller's VALIDATED mcp.task_id claim rather
+	// than on its session, so the state survives a hop between enforcement points instead
+	// of restarting clean on the far side.
+	//
+	// It is off by default because it changes what every budget in a policy MEANS: a
+	// maxCalls of 20 becomes 20 per task rather than 20 per connection, and two sessions
+	// carrying one task id share one flow-label set. A request with NO TOKEN is anchored on
+	// its session exactly as it is today, so turning this on cannot make two unauthenticated
+	// callers share anything; a request that presented a token carrying no task_id is DENIED
+	// (MISSING_CONTEXT) rather than split across both buckets. It does nothing at all without
+	// a JWT integration that mints mcp.task_id. See enforcement.WithTaskAnchoredState.
+	TaskAnchoredState bool `yaml:"taskAnchoredState"`
 }
 
 // UpstreamConfig declares one upstream route.
@@ -345,8 +360,14 @@ type UpstreamConfig struct {
 	// parsed, nothing is recorded, and a non-supporting server costs nothing.
 	EffectReceiptKeys string `yaml:"effectReceiptKeys"`
 
-	// Per-route override. Pointer ⟹ "unset, inherit from defaults".
+	// Per-route overrides. Pointer ⟹ "unset, inherit from defaults".
 	StrictDrift *bool `yaml:"strictDrift"`
+	// TaskAnchoredState overrides RouteDefaults.TaskAnchoredState for this route. Per-route
+	// because the anchor is a property of the topology a route sits in: one upstream may be
+	// reached by delegated sub-agents sharing a task while another serves a single host
+	// session, and forcing one anchor on both would either strand the first route's taint
+	// at the hop or silently pool the second route's budgets.
+	TaskAnchoredState *bool `yaml:"taskAnchoredState"`
 }
 
 // mcpbBundleMagic is the local-file-header signature that begins every ZIP
@@ -1138,6 +1159,13 @@ func (cfg *GatewayConfig) AuditModeFor(u *UpstreamConfig) bool {
 // (transport.ResolveStrictDrift) and never promotes a policyless route.
 func (cfg *GatewayConfig) ResolvedStrictDrift(u *UpstreamConfig) bool {
 	return ResolveBool(u.StrictDrift, cfg.Defaults.StrictDrift)
+}
+
+// ResolvedTaskAnchoredState resolves the effective task-anchoring posture for u (the
+// per-route value overriding the default), single-sourced so both serve paths wire the
+// engine identically. See RouteDefaults.TaskAnchoredState for what it changes.
+func (cfg *GatewayConfig) ResolvedTaskAnchoredState(u *UpstreamConfig) bool {
+	return ResolveBool(u.TaskAnchoredState, cfg.Defaults.TaskAnchoredState)
 }
 
 // startupRefusal classifies whether a policyless upstream is refused at startup and

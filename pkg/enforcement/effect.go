@@ -276,7 +276,7 @@ func (e *Engine) blastRadiusBucket(ctx context.Context, req *capability.EnforceR
 	if SkipQuota(ctx) {
 		return "", true, nil
 	}
-	return compositeCounterKey("blastradius", e.counterKeyNamespace, req.SessionID, targetType, toolName), false, nil
+	return e.anchoredKey("blastradius", req, targetType, toolName), false, nil
 }
 
 // blastRadiusHandler is the built-in blastRadius condition handler. A condition declaring a

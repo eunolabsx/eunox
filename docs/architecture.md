@@ -299,6 +299,21 @@ own. Three seams are pluggable via functional options:
 - `WithPolicyEvaluator` — delegates `policy` conditions to an external PDP
   (e.g. OPA/Rego or Cedar). `BuildRegoInput` exposes the request — including
   `input.target.*` and JWT claims as `input.claims.*` — as evaluator input.
+- `WithTaskAnchoredState` — keys accumulated state (flow taint, `sequenceBlock`
+  antecedents, `maxCalls` and cumulative `blastRadius` budgets, spent single-use
+  declassify grants) on the caller's validated `mcp.task_id` claim instead of on
+  its session, so it survives a hop to a second enforcement point. Opt-in, and it
+  falls back to session keying for a request carrying **no token** — so it can
+  never make two unauthenticated callers share state — while an authenticated
+  request whose token carries no task id is denied rather than accounted against a
+  second bucket. `anchor.go` owns the choice, and every key builder routes through it.
+
+One narrowing surface rides an already-verified token rather than the manifest,
+because it is a property of the CALLER rather than of the policy: the
+`mcp.declassify` approvals, which alone let a `declassify` directive clear a
+label, single-use when marked `once`. The decision
+path additionally applies every hop, so the assertion and the enforcement are
+independent. Neither surface needs an experimental gate: both can only subtract.
 
 Directives attached to an allow decision come back as **obligations** the
 proxy must discharge before returning the result. `redactFields` masks

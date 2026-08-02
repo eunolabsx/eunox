@@ -38,24 +38,37 @@ func cmdContracts(args []string) int {
 	fs := flag.NewFlagSet("contracts", flag.ContinueOnError)
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `Usage:
-  eunox contracts [--dir <corpus-dir>]
+  eunox contracts [--dir <corpus-dir>] [--trust-keys <file>]
   eunox contracts [--dir <corpus-dir>] --ref <contract-id>
+  eunox contracts [--dir <corpus-dir>] --attest-payload <contract-id> [--role <role>] [--statement <statement>]
 
 Verify a local effect-contract corpus: every *.json entry is loaded and validated,
 each entry's declared digest is recomputed from its own content, and duplicate ids
 are reported. Without --ref, the verified corpus is listed with the pin for each
 entry.
 
+With --trust-keys, each entry's signed attestations are additionally verified
+against a local trusted-key file, and the listing gains an ATTESTATION column: who
+attests to the entry, and who DISPUTES it. A signature by a key the file does not
+hold is reported as unverified, never as an error — a corpus may be signed by
+parties you have not chosen to trust. A signature by a key it DOES hold that fails
+to verify is an error: the entry was edited after it was signed.
+
 With --ref, print just the "effect.ref" value for one contract id — the
 "<id>@sha256:<hex>" string a manifest capability pins — so an author copies a pin
 rather than hand-computing a digest.
 
-Everything is local: eunox never fetches the registry, and the digest is over the
-contract's own content, so this works offline.
+With --attest-payload, print the exact bytes a signer covers when attesting to an
+entry, so a publisher signs them with their own tooling and key. eunox verifies
+attestations; it never mints them, and it holds no signing key.
+
+Everything is local: eunox never fetches the registry or any key, and the digest is
+over the contract's own content, so this works offline.
 
 Exit codes:
-  0  Corpus valid (and, with --ref, the pin printed).
-  2  Usage error, an unreadable corpus, an invalid entry, or an unknown --ref id.
+  0  Corpus valid (and, with --ref/--attest-payload, the requested value printed).
+  2  Usage error, an unreadable corpus or trust store, an invalid entry, a trusted
+     signature that does not verify, or an unknown contract id.
 
 Flags:
 `)
@@ -64,6 +77,10 @@ Flags:
 
 	dir := fs.String("dir", defaultContractsDir, "Directory holding the corpus entries (*.json).")
 	ref := fs.String("ref", "", "Print the effect.ref pin for this contract id and exit.")
+	trustKeys := fs.String("trust-keys", "", "Local JSON file of trusted attestation public keys; verifies each entry's signatures and adds an ATTESTATION column.")
+	attestPayload := fs.String("attest-payload", "", "Print the bytes a signer covers for this contract id and exit (see --role/--statement).")
+	role := fs.String("role", registry.AttestRoleVendor, "Signer role for --attest-payload: \"vendor\" or \"reviewer\".")
+	statement := fs.String("statement", registry.AttestStatementAttests, "Statement for --attest-payload: \"attests\" or \"disputes\".")
 
 	if err := fs.Parse(args); err != nil {
 		// flag.ErrHelp is a successful query (fs.Usage already printed), not a usage error.
@@ -74,6 +91,12 @@ Flags:
 	}
 	if rest := fs.Args(); len(rest) > 0 {
 		fmt.Fprintf(os.Stderr, "eunox contracts: unexpected argument %q; the corpus directory is given with --dir\n", rest[0])
+		return 2
+	}
+	// Two query modes that each print one value and exit. Combining them would have to pick
+	// one silently, so it is a usage error instead.
+	if *ref != "" && *attestPayload != "" {
+		fmt.Fprintln(os.Stderr, "eunox contracts: --ref and --attest-payload each print one value; pass only one")
 		return 2
 	}
 
@@ -103,21 +126,120 @@ Flags:
 		return 2
 	}
 
-	if *ref != "" {
-		return writeContractRef(os.Stdout, contracts, *ref)
+	// Signature verification is opt-in, because it needs a key file only the operator can
+	// supply — there is no default trust store and nothing is fetched to build one. Without
+	// --trust-keys the corpus verifies exactly as it did before (digest integrity), and the
+	// listing simply omits the column rather than printing an unverified one that reads like
+	// a verdict.
+	//
+	// It runs BEFORE the --ref and --attest-payload branches, not after. Those two are the
+	// moments a decision is made — an author copies a pin, a publisher signs — so they are
+	// exactly where a tampered entry has to STOP the command (exit 2) and a trusted reviewer's
+	// DISPUTE has to reach the operator (a stderr warning; a dispute is advisory and does not
+	// change the exit code). Returning early made `--ref` with `--trust-keys` exit 0 having
+	// verified nothing, which is the false assurance the listing's own column rule exists to
+	// avoid.
+	var statuses map[string]registry.AttestationStatus
+	if *trustKeys != "" {
+		store, storeErr := registry.LoadTrustStore(*trustKeys)
+		if storeErr != nil {
+			fmt.Fprintf(os.Stderr, "eunox contracts: %v\n", storeErr)
+			return 2
+		}
+		statuses = make(map[string]registry.AttestationStatus, len(contracts))
+		for i := range contracts {
+			st, verifyErr := contracts[i].VerifyAttestations(store)
+			if verifyErr != nil {
+				// A trusted key whose signature does not verify is tampering, not a
+				// reporting nuance: stop rather than print a corpus listing with one row
+				// quietly saying "-".
+				fmt.Fprintf(os.Stderr, "eunox contracts: %v\n", verifyErr)
+				return 2
+			}
+			statuses[contracts[i].ID] = st
+		}
+		if *ref == "" && *attestPayload == "" {
+			wf(os.Stdout, "OK    %s  (%d trusted attestation key(s))\n", *trustKeys, store.Len())
+		}
 	}
-	writeContractCorpus(os.Stdout, resolved, contracts)
+
+	if *ref != "" {
+		return writeContractRef(os.Stdout, contracts, *ref, statuses)
+	}
+	if *attestPayload != "" {
+		return writeAttestPayload(os.Stdout, contracts, *attestPayload, *role, *statement, statuses)
+	}
+	writeContractCorpus(os.Stdout, resolved, contracts, statuses)
 	return 0
+}
+
+// writeAttestPayload prints the exact bytes a signer covers for one entry, so a publisher can
+// sign them with their own tooling. eunox verifies attestations and never mints them — it
+// holds no signing key and has no subcommand that would want one — so the deliverable here is
+// the payload, not a signature.
+//
+// The digest that goes into the payload is the one LoadCorpus already recomputed from the
+// entry's content, so a signature made from this output is bound to the content in the file
+// rather than to whatever the file happened to declare.
+//
+// It warns on a DISPUTE for the same reason --ref does, and the case is if anything stronger:
+// putting a signature on an entry is a more durable commitment than pasting a pin, and a
+// publisher who is about to make one is exactly who needs to know that a reviewer they trust
+// read the entry and disagreed.
+func writeAttestPayload(out io.Writer, contracts []registry.Contract, id, role, statement string, statuses map[string]registry.AttestationStatus) int {
+	for i := range contracts {
+		c := &contracts[i]
+		if c.ID != id {
+			continue
+		}
+		warnIfDisputed(id, statuses)
+		payload, err := registry.NewSignaturePayload(c, role, statement)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "eunox contracts: %v\n", err)
+			return 2
+		}
+		// No trailing newline: the payload is the signed byte string, and a shell
+		// redirection of this output has to be the bytes and nothing else.
+		wf(out, "%s", payload)
+		return 0
+	}
+	fmt.Fprintf(os.Stderr, "eunox contracts: no contract with id %q in the corpus (run without --attest-payload to list the ids it holds)\n", id)
+	return 2
+}
+
+// warnIfDisputed reports a trusted key's DISPUTE of the entry a single-entry command is about
+// to hand over, on stderr so the value on stdout stays pipeable. Nothing when the caller passed
+// no --trust-keys (statuses is nil) or nobody disputed.
+//
+// It is one function rather than a line in each caller because the two callers are the two
+// moments an author commits to an entry — pasting a pin, signing an attestation — and a warning
+// that fires at one and not the other is the shape that silently regresses. It deliberately
+// does not change the exit code: a dispute is a community-advisory signal, not a verdict eunox
+// is in a position to issue.
+func warnIfDisputed(id string, statuses map[string]registry.AttestationStatus) {
+	st, ok := statuses[id]
+	if !ok || len(st.Disputed) == 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "eunox contracts: WARNING %q is DISPUTED by %v (a trusted key you configured); read their reasoning before relying on it\n", id, st.Disputed)
 }
 
 // writeContractRef prints the pin for one contract id. An unknown id is an error, not an
 // empty line: a pin an author pastes has to come from an entry that exists.
-func writeContractRef(out io.Writer, contracts []registry.Contract, id string) int {
+//
+// When attestations were verified (--trust-keys), a DISPUTE on the entry being pinned is
+// reported on stderr rather than swallowed. Printing the pin anyway is deliberate — a dispute
+// is a community-advisory signal and not a verdict eunox is in a position to issue — but the
+// one moment an author is about to commit to an entry is the moment they need to know someone
+// who read it disagreed.
+func writeContractRef(out io.Writer, contracts []registry.Contract, id string, statuses map[string]registry.AttestationStatus) int {
 	for i := range contracts {
-		if contracts[i].ID == id {
-			wf(out, "%s\n", contracts[i].Ref())
-			return 0
+		if contracts[i].ID != id {
+			continue
 		}
+		warnIfDisputed(id, statuses)
+		wf(out, "%s\n", contracts[i].Ref())
+		return 0
 	}
 	fmt.Fprintf(os.Stderr, "eunox contracts: no contract with id %q in the corpus (run without --ref to list the ids it holds)\n", id)
 	return 2
@@ -126,7 +248,12 @@ func writeContractRef(out io.Writer, contracts []registry.Contract, id string) i
 // writeContractCorpus lists a verified corpus: one row per entry with the fields a
 // reviewer selects on, plus the pin. The digest each row carries has already been
 // recomputed from the entry's content by LoadCorpus, so a listed row is a verified one.
-func writeContractCorpus(out io.Writer, dir string, contracts []registry.Contract) {
+//
+// statuses is nil unless the caller passed --trust-keys, in which case each row gains an
+// ATTESTATION column reporting what verified. The column is omitted entirely rather than
+// filled with a placeholder when no trust store was given: a column of "-" beside every entry
+// reads as "nobody signed these", when the truth is "nothing was checked".
+func writeContractCorpus(out io.Writer, dir string, contracts []registry.Contract, statuses map[string]registry.AttestationStatus) {
 	wf(out, "OK    %s  (%d contract(s), every declared digest matches its content)\n", dir, len(contracts))
 	if len(contracts) == 0 {
 		wln(out, "\n(no *.json entries)")
@@ -134,7 +261,12 @@ func writeContractCorpus(out io.Writer, dir string, contracts []registry.Contrac
 	}
 	wln(out)
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	wf(tw, "ID\tTOOL\tCLASS\tREVIEW\tREF\n")
+	if statuses != nil {
+		wf(tw, "ID\tTOOL\tCLASS\tREVIEW\tATTESTATION\tREF\n")
+	} else {
+		wf(tw, "ID\tTOOL\tCLASS\tREVIEW\tREF\n")
+	}
+	var disputed int
 	for i := range contracts {
 		c := &contracts[i]
 		class := c.Effect.Class
@@ -144,14 +276,32 @@ func writeContractCorpus(out io.Writer, dir string, contracts []registry.Contrac
 			// the answer for every call.
 			class = "by " + c.Effect.ByArgument.Argument
 		}
-		wf(tw, "%s\t%s\t%s\t%s\t%s\n", c.ID, c.Tool, class, c.Attestation.Review, c.Ref())
+		if statuses == nil {
+			wf(tw, "%s\t%s\t%s\t%s\t%s\n", c.ID, c.Tool, class, c.Attestation.Review, c.Ref())
+			continue
+		}
+		st := statuses[c.ID]
+		if len(st.Disputed) > 0 {
+			disputed++
+		}
+		wf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", c.ID, c.Tool, class, c.Attestation.Review, st.Summary(), c.Ref())
 	}
 	// The write errors tabwriter can report are the same non-actionable stdout failures wf
 	// discards; the report is already emitted by the time this returns.
 	_ = tw.Flush()
 	wln(out)
+	if disputed > 0 {
+		// Repeated below the table because the table is what gets scrolled past. A dispute
+		// is the one row state that should change what an operator does next, and it is
+		// deliberately not an error exit: someone who looked disagreeing is a signal to weigh,
+		// not a verdict eunox is in a position to issue.
+		wf(out, "%d entr(y/ies) carry a DISPUTE from a key you trust. A dispute is a community-advisory\n", disputed)
+		wln(out, "signal, not a scanner verdict: read the disputing party's reasoning before pinning.")
+		wln(out)
+	}
 	wln(out, "A review state is provenance, not a correctness guarantee: a contract asserts what a")
-	wln(out, "tool does, and nothing here observes whether it is telling the truth.")
+	wln(out, "tool does, and nothing here observes whether it is telling the truth. A verified")
+	wln(out, "attestation says WHO is making the claim, never that the claim is true.")
 }
 
 // writeEffectCoverage reports how much of a manifest carries an effect contract, and names

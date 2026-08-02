@@ -968,11 +968,23 @@ func (*ManifestPDP) CheckAudience(_ context.Context) *capability.EnforceResponse
 	return nil
 }
 
-// ReleaseSession releases the session's accumulated flow-label state on teardown, via
-// the engine (which namespaces the store key by route). A no-op when the policy uses no
-// flow control or no store is wired (see Engine.ClearSessionLabels). Best-effort: a
-// store fault on teardown is swallowed rather than surfaced — the session is already
-// gone, and a Redis-backed store reclaims an orphaned key by idle TTL regardless.
+// ReleaseSession releases the session's Tier-2 interface baseline and its accumulated
+// flow-label state on teardown, via the engine (which namespaces the store keys by route). A
+// no-op when the policy uses no flow control or no store is wired (see
+// Engine.ClearSessionLabels). Best-effort: a store fault on teardown is swallowed rather
+// than surfaced — the session is already gone, and a Redis-backed store reclaims an orphaned
+// key by idle TTL regardless.
+//
+// The label release is SESSION-anchored. Under task anchoring the same taint may have been
+// written under the task's key instead, and that is deliberately not reclaimed here: it is
+// the state whose whole purpose is to outlive this session, and clearing it on disconnect
+// would let an agent launder a task's taint by reconnecting.
+//
+// A spent single-use declassify grant is NOT released here, and not because of the anchor: the
+// ledger is unanchored by construction (it lives in the call counter under the grant's own id),
+// so a burn belongs to the APPROVAL rather than to any session or task. Releasing it on
+// teardown would have made "once" mean once per connection, which is the property the ledger
+// was moved out of the label store to stop meaning.
 func (p *ManifestPDP) ReleaseSession(ctx context.Context, sessionID string) {
 	// Drop the Tier-2 interface baseline first, and unconditionally: it is local state
 	// that must be reclaimed even for a PDP built without an engine, and leaving it
@@ -1577,6 +1589,9 @@ func (p *ManifestPDP) withForwardObligations(ctx context.Context, r capability.E
 	if deny != nil {
 		return *deny
 	}
+	if len(obs) == 0 {
+		return r
+	}
 	r.Obligations = obs
 	return r
 }
@@ -1782,12 +1797,20 @@ func (p *ManifestPDP) HardenRefusal(ctx context.Context, sessionID string, r cap
 // worst of the two outcomes here: it performs the action AND leaves the taint the policy
 // said the action clears.
 //
-// Like the ceiling's, it commits nothing: the approval test is a pure comparison of the
-// request's grants against the directive's labels, with no store read and no state write.
+// Like the ceiling's, it COMMITS nothing — but unlike the ceiling's it is not a pure
+// comparison either: answering "would this have been authorized" requires knowing whether a
+// single-use grant is still live, which is a ledger read (UsableDeclassifyApproval). The read
+// records nothing, so a call refused here still leaves no spent approval behind; what it costs
+// is one Peek per covering grant on a path that only runs for an already-refused call.
 // It runs AFTER the ceiling so a call that is over the consequence bound reports that, the
 // same precedence the full path applies.
 func (p *ManifestPDP) hardenOnUnapprovedDeclassify(ctx context.Context, r capability.EnforceResponse, target EnforceTarget) (capability.EnforceResponse, bool) {
 	if r.Decision == capability.DecisionAllow || r.Denial == nil || r.Denial.HardDeny {
+		return r, false
+	}
+	// No engine means no checkDeclassify on the unwrapped path either, so there is no verdict
+	// this could be weaker than — and nothing to read the ledger with.
+	if p.engine == nil {
 		return r, false
 	}
 	matched := p.findConstraint(target, jwtClaimsAsMap(ctx))
@@ -1799,18 +1822,41 @@ func (p *ManifestPDP) hardenOnUnapprovedDeclassify(ctx context.Context, r capabi
 		return r, false
 	}
 	canonical := string(target.Type) + ":" + target.Name
-	if capability.FindDeclassifyApproval(declassifyApprovalsFromContext(ctx), canonical, want) != nil {
-		// A covering approval exists, so the declassification is not what makes this call
-		// refusable — the outer layer's own verdict stands, downgradable as it was.
+	// USABLE, not merely covering. The scope-only test would treat a single-use grant this
+	// anchor has already burned as authorization, leaving the wrapping layer's SOFT deny
+	// intact — which an --audit route then downgrades and forwards. Without the JWT the same
+	// call meets checkDeclassify's hard, non-downgradable `approval_consumed` escalation, so
+	// the scope-only test here would mean adding a token makes the proxy allow more, which is
+	// precisely the inversion this function exists to close.
+	usable, err := p.engine.UsableDeclassifyApproval(ctx, declassifyApprovalsFromContext(ctx), canonical, want)
+	if usable && err == nil {
+		// A live covering approval: the declassification would have been authorized, so the
+		// outer layer's verdict stands as it was.
 		return r, false
+	}
+	// A ledger fault takes the SAME hard escalation an absent approval does, matching what
+	// checkDeclassify does with the identical fault on the unwrapped path (its
+	// `ledger_unavailable` arm). Letting the fault leave a downgradable verdict in place was
+	// the inversion this function exists to close, arrived at from the other direction: on an
+	// --audit route the wrapping layer's refusal is FORWARDED, so an unreachable ledger became
+	// the way to run a declassification the same manifest blocks without a token. "A backend
+	// hiccup should not turn an observe route into a blocking one" is a real cost, but it is
+	// the cost the engine already pays here, and the two paths must not answer one fault two
+	// ways.
+	reason, message := "no_approval", fmt.Sprintf(
+		"clearing flow label(s) %v at %s requires a human approval covering all of them; the request carries none (this call was also refused by the wrapping authorization layer: %s)",
+		want, canonical, r.Denial.Message)
+	if err != nil {
+		reason, message = "ledger_unavailable", fmt.Sprintf(
+			"single-use declassify approval state could not be read: %v (this call was also refused by the wrapping authorization layer: %s)",
+			err, r.Denial.Message)
 	}
 	denial := capability.DenialInfo{
 		Code:          capability.ErrCodeEscalationRequired,
 		ConditionType: capability.DirectiveTypeDeclassify,
-		Message: fmt.Sprintf("clearing flow label(s) %v at %s requires a human approval covering all of them; the request carries none (this call was also refused by the wrapping authorization layer: %s)",
-			want, canonical, r.Denial.Message),
-		HardDeny: true,
-		Details:  map[string]interface{}{"flow": true, "declassify_labels": want, "reason": "no_approval"},
+		Message:       message,
+		HardDeny:      true,
+		Details:       map[string]interface{}{"flow": true, "declassify_labels": want, "reason": reason},
 	}
 	return capability.EnforceResponse{
 		RequestID: r.RequestID,
@@ -2042,6 +2088,9 @@ func (p *ManifestPDP) DecideSampling(ctx context.Context, sessionID, sourceIP st
 			Name: capability.MethodSamplingCreateMessage,
 		},
 		Claims: claims,
+		// Approvals so a declassify directive on the sampling opt-in is satisfiable by the
+		// same grant that satisfies it anywhere else.
+		DeclassifyApprovals: declassifyApprovalsFromContext(ctx),
 	}
 
 	return p.evaluateAndRecord(ctx, req, matched)

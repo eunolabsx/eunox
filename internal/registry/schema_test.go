@@ -164,6 +164,13 @@ func TestEffectContractSchema_MatchesStructs(t *testing.T) {
 			schemaNodeAt(t, doc, "$defs", "effectContract", "properties", "byArgument")},
 		{"effectCase", jsonTagSet(reflect.TypeOf(capability.EffectCase{})),
 			schemaNodeAt(t, doc, "$defs", "effectCase")},
+		// The signature object lives under an ARRAY, so it is reached through "items"
+		// rather than through a "properties" child. Without a case here a renamed or added
+		// Signature field would ship undetected — which is exactly the drift the rest of
+		// this table exists to catch, and the walk below cannot see it either (see the
+		// items recursion added there).
+		{"signatures[*]", jsonTagSet(reflect.TypeOf(Signature{})),
+			schemaNodeAt(t, doc, "properties", "signatures", "items")},
 	}
 
 	for _, c := range cases {
@@ -200,6 +207,13 @@ func TestEffectContractSchema_EveryObjectForbidsAdditionalProperties(t *testing.
 		// is walked through additionalProperties rather than being required to close.
 		if child, ok := node["additionalProperties"].(map[string]any); ok {
 			walk(path+"[*]", child)
+		}
+		// An ARRAY node constrains its element schema through "items". Without this the
+		// walk never descended into one, so an object nested under an array — the
+		// signatures entry — was exempt from the closed-schema invariant every other object
+		// in the document is held to.
+		if child, ok := node["items"].(map[string]any); ok {
+			walk(path+"[]", child)
 		}
 	}
 	walk("root", doc)
