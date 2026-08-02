@@ -1627,6 +1627,6 @@ func TestApplyRedactObligs_ReservedRootKeyNotMaskedWholesale(t *testing.T) {
 // AddIfTotalBelow satisfies the weighted half of capability.CallCounter. This double
 // exercises the counting paths only, so a weighted add admits without recording: nothing
 // under test reads a weighted total from it.
-func (*recordingCounter) AddIfTotalBelow(_ context.Context, _ string, _ int, weight, _ float64) (float64, bool, time.Duration, error) {
+func (*recordingCounter) AddIfTotalBelow(_ context.Context, _ string, _ int, weight, _ float64) (total float64, admitted bool, retryAfter time.Duration, err error) {
 	return weight, true, 0, nil
 }

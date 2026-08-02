@@ -110,6 +110,6 @@ func TestFlowHardening_AtomicCommitRollsBackOnSeqFault(t *testing.T) {
 // AddIfTotalBelow satisfies the weighted half of capability.CallCounter. This double
 // exercises the counting paths only, so a weighted add admits without recording: nothing
 // under test reads a weighted total from it.
-func (faultOnIncrementCounter) AddIfTotalBelow(_ context.Context, _ string, _ int, weight, _ float64) (float64, bool, time.Duration, error) {
+func (faultOnIncrementCounter) AddIfTotalBelow(_ context.Context, _ string, _ int, weight, _ float64) (total float64, admitted bool, retryAfter time.Duration, err error) {
 	return weight, true, 0, nil
 }

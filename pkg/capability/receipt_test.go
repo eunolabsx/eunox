@@ -47,7 +47,7 @@ func newReceiptSigner(t *testing.T, kid string) *receiptSigner {
 }
 
 // sign renders claims as a signed `_meta` receipt block.
-func (s *receiptSigner) sign(t *testing.T, claims capability.EffectReceiptClaims) json.RawMessage {
+func (s *receiptSigner) sign(t *testing.T, claims *capability.EffectReceiptClaims) json.RawMessage {
 	t.Helper()
 	payload, err := json.Marshal(claims)
 	require.NoError(t, err)
@@ -93,7 +93,7 @@ func TestEffectReceiptSignAndVerifyRoundTrip(t *testing.T) {
 	v := newVerifier(t, s)
 	now := time.Now()
 
-	block := s.sign(t, capability.EffectReceiptClaims{
+	block := s.sign(t, &capability.EffectReceiptClaims{
 		Tool:               "refund",
 		Class:              capability.EffectCompensable,
 		BlastRadius:        rnum("100"),
@@ -127,7 +127,7 @@ func TestEffectReceiptForgedByAnotherKeyEarnsNothing(t *testing.T) {
 	v := newVerifier(t, server)
 	now := time.Now()
 
-	block := attacker.sign(t, capability.EffectReceiptClaims{
+	block := attacker.sign(t, &capability.EffectReceiptClaims{
 		Tool:        "refund",
 		Class:       capability.EffectReversible,
 		BlastRadius: rnum("1"),
@@ -151,7 +151,7 @@ func TestEffectReceiptUnknownKidEarnsNothing(t *testing.T) {
 	v := newVerifier(t, server)
 	now := time.Now()
 
-	block := other.sign(t, capability.EffectReceiptClaims{Tool: "refund", IssuedAt: now.Unix()})
+	block := other.sign(t, &capability.EffectReceiptClaims{Tool: "refund", IssuedAt: now.Unix()})
 	got := v.Verify(block, "refund", nil, now)
 	require.NotNil(t, got)
 	assert.Equal(t, capability.ReceiptUnverified, got.Verdict)
@@ -204,7 +204,7 @@ func TestEffectReceiptInconsistencies(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := v.Verify(s.sign(t, tc.claims), tc.tool, declaredRefund(), now)
+			got := v.Verify(s.sign(t, &tc.claims), tc.tool, declaredRefund(), now)
 			require.NotNil(t, got)
 			assert.Equal(t, capability.ReceiptInconsistent, got.Verdict)
 			assert.Contains(t, got.Reasons, tc.want)
@@ -222,7 +222,7 @@ func TestEffectReceiptSmallerThanDeclaredIsConsistent(t *testing.T) {
 	v := newVerifier(t, s)
 	now := time.Now()
 
-	block := s.sign(t, capability.EffectReceiptClaims{
+	block := s.sign(t, &capability.EffectReceiptClaims{
 		Tool: "refund", Class: capability.EffectReversible, BlastRadius: rnum("5"), IssuedAt: now.Unix(),
 	})
 	got := v.Verify(block, "refund", declaredRefund(), now)
@@ -241,7 +241,7 @@ func TestEffectReceiptCarriesRuntimeDynamicEffect(t *testing.T) {
 
 	// Declared unquantified: the manifest could not say how much this call would touch.
 	unquantified := &capability.ResolvedEffect{Class: capability.EffectIrreversible, Annotated: true}
-	block := s.sign(t, capability.EffectReceiptClaims{
+	block := s.sign(t, &capability.EffectReceiptClaims{
 		Tool: "purge", Class: capability.EffectIrreversible, BlastRadius: rnum("3"), Unit: "rows", IssuedAt: now.Unix(),
 	})
 
@@ -269,7 +269,7 @@ func TestEffectReceiptFreshness(t *testing.T) {
 		{"dated beyond the skew allowance", now.Add(10 * time.Minute).Unix()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			block := s.sign(t, capability.EffectReceiptClaims{Tool: "refund", IssuedAt: tc.iat})
+			block := s.sign(t, &capability.EffectReceiptClaims{Tool: "refund", IssuedAt: tc.iat})
 			got := v.Verify(block, "refund", nil, now)
 			require.NotNil(t, got)
 			assert.Equal(t, capability.ReceiptUnverified, got.Verdict)
@@ -277,7 +277,7 @@ func TestEffectReceiptFreshness(t *testing.T) {
 	}
 
 	// Small skew inside the allowance is skew, not forgery.
-	block := s.sign(t, capability.EffectReceiptClaims{Tool: "refund", IssuedAt: now.Add(5 * time.Second).Unix()})
+	block := s.sign(t, &capability.EffectReceiptClaims{Tool: "refund", IssuedAt: now.Add(5 * time.Second).Unix()})
 	got := v.Verify(block, "refund", nil, now)
 	require.NotNil(t, got)
 	assert.Equal(t, capability.ReceiptVerified, got.Verdict)
@@ -348,7 +348,7 @@ func TestEffectReceiptSilentAboutAQuantifiedDimension(t *testing.T) {
 	v := newVerifier(t, s)
 	now := time.Now()
 
-	block := s.sign(t, capability.EffectReceiptClaims{
+	block := s.sign(t, &capability.EffectReceiptClaims{
 		Tool: "refund", Class: capability.EffectCompensable,
 		CompensatingAction: "tool:reverse_refund", IssuedAt: now.Unix(),
 	})
@@ -387,6 +387,6 @@ func TestEffectReceiptKeySetIsBounded(t *testing.T) {
 // output.
 func TestEffectReceiptZeroValueVerifierFailsClosed(t *testing.T) {
 	s := newReceiptSigner(t, "k")
-	block := s.sign(t, capability.EffectReceiptClaims{Tool: "refund", IssuedAt: time.Now().Unix()})
+	block := s.sign(t, &capability.EffectReceiptClaims{Tool: "refund", IssuedAt: time.Now().Unix()})
 	assert.Nil(t, (&capability.EffectReceiptVerifier{}).Verify(block, "refund", nil, time.Now()))
 }

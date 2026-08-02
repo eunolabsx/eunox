@@ -480,6 +480,6 @@ func TestBlastRadiusVelocity_BackendFaultDenies(t *testing.T) {
 // backend-fault branch from a misconfiguration.
 type faultingWeightedCounter struct{ *callcounter.InMemory }
 
-func (faultingWeightedCounter) AdmitAll(_ context.Context, _ []capability.QuotaBucket) (bool, int, float64, time.Duration, error) {
+func (faultingWeightedCounter) AdmitAll(_ context.Context, _ []capability.QuotaBucket) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error) {
 	return false, 0, 0, 0, assert.AnError
 }

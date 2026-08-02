@@ -279,12 +279,12 @@ func (c *countingCallCounter) IncrementAndGet(ctx context.Context, key string, w
 	return c.InMemory.IncrementAndGet(ctx, key, windowSec, maxEntries)
 }
 
-func (c *countingCallCounter) IncrementIfBelow(ctx context.Context, key string, windowSec int, limit int64) (int64, bool, time.Duration, error) {
+func (c *countingCallCounter) IncrementIfBelow(ctx context.Context, key string, windowSec int, limit int64) (count int64, admitted bool, retryAfter time.Duration, err error) {
 	c.n++
 	return c.InMemory.IncrementIfBelow(ctx, key, windowSec, limit)
 }
 
-func (c *countingCallCounter) AdmitAll(ctx context.Context, buckets []capability.QuotaBucket) (bool, int, float64, time.Duration, error) {
+func (c *countingCallCounter) AdmitAll(ctx context.Context, buckets []capability.QuotaBucket) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error) {
 	c.n += len(buckets)
 	return c.InMemory.AdmitAll(ctx, buckets)
 }

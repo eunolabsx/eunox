@@ -236,7 +236,7 @@ func isWeighted(e *entry) bool { return e.weights != nil && len(e.weights) == le
 // arriving through one of the counting methods is 1, the weight that makes a total equal a
 // count. Callers pass weighted so a mid-life transition to weighted is decided once, above,
 // rather than re-derived from the possibly-emptied slices here.
-func appendCall(ts []time.Time, weights []float64, now time.Time, weight float64, weighted bool) ([]time.Time, []float64) {
+func appendCall(ts []time.Time, weights []float64, now time.Time, weight float64, weighted bool) (outTS []time.Time, outWeights []float64) {
 	ts = append(ts, now)
 	if weighted {
 		weights = append(weights, weight)
@@ -247,7 +247,7 @@ func appendCall(ts []time.Time, weights []float64, now time.Time, weight float64
 // trimOldest keeps the newest n entries of the pair, dropping the surplus from the front.
 // copy is a forward shift over each backing array (dst index < src index), so it is safe
 // despite the overlap.
-func trimOldest(ts []time.Time, weights []float64, n int) ([]time.Time, []float64) {
+func trimOldest(ts []time.Time, weights []float64, n int) (outTS []time.Time, outWeights []float64) {
 	if len(ts) <= n {
 		return ts, weights
 	}

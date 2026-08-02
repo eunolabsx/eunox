@@ -1599,6 +1599,85 @@ func resolveOAuthMetadata(cfg *config.GatewayConfig, pf proxyFlags) (*transport.
 	}, transport.BuildOAuthMetadataURL(oauthResource), nil
 }
 
+// gatewayJWTLayer stands up the gateway's JWT layer from the flags: it validates the
+// JWT-adjacent flag combinations, emits the bypass warnings, and wraps every route's
+// manifest PDP in a pdp.JWTPDP sharing one JWKS validator (the per-route
+// JWT-intersect-manifest composition). It returns a nil PDP when --jwks-uri is unset,
+// which is the "no JWT mode" case the caller's later checks key on.
+//
+// It is a function rather than an inline block because the validation and warning arms
+// dominate serveHTTPGateway's branch count on their own, and every one of them answers the
+// same question: is this a JWT deployment, and is it configured safely. routes is mutated
+// in place by WrapRoutesWithJWT.
+func gatewayJWTLayer(routes map[string]*transport.UpstreamRoute, ks killswitch.Manager, pf proxyFlags) (*pdp.JWTPDP, error) { //nolint:gocritic // hugeParam: pf is a small flag bundle
+	if pf.jwksURI == "" {
+		return nil, nil
+	}
+	// Fail closed on audience pinning and on a plaintext JWKS endpoint before
+	// standing up the JWT PDP.
+	if err := validateJWTAudienceConfig(pf.jwksURI, pf.jwtAudience, pf.jwtAllowAnyAudience); err != nil {
+		return nil, err
+	}
+	if err := validateJWTIssuerConfig(pf.jwksURI, pf.jwtIssuer, pf.jwtAllowAnyIssuer); err != nil {
+		return nil, err
+	}
+	if err := validateJWKSURIScheme(pf.jwksURI, pf.jwksAllowInsecure); err != nil {
+		return nil, err
+	}
+	if w := jwtAudienceBypassWarning(pf.jwtAllowAnyAudience, pf.jwtAudience); w != "" {
+		fmt.Fprintf(os.Stderr, "[eunox] WARNING: %s\n", w)
+	}
+	// --jwt-allow-any-audience also voids per-route manifest 'audience' pins (the
+	// wrapper skips per-route narrowing when AllowAnyAudience is set). The generic
+	// bypass warning above names only the --jwt-audience flag, so call out the dead
+	// manifest pin explicitly — otherwise an operator who pinned a route's audience
+	// in its policy manifest has no signal that the pin no longer enforces.
+	if pf.jwtAllowAnyAudience {
+		if name, pinned := transport.FirstRouteAudiencePin(routes); pinned {
+			fmt.Fprintf(os.Stderr, "[eunox] WARNING: --jwt-allow-any-audience voids the manifest 'audience' pin on route %q; that route now accepts tokens for any audience. Remove --jwt-allow-any-audience to enforce the pin.\n", name)
+		}
+	}
+	if w := jwtIssuerBypassWarning(pf.jwtAllowAnyIssuer, pf.jwtIssuer); w != "" {
+		fmt.Fprintf(os.Stderr, "[eunox] WARNING: %s\n", w)
+	}
+	if w := jwtExperimentalCapsWarning(pf.jwtExperimentalCaps); w != "" {
+		fmt.Fprintf(os.Stderr, "[eunox] WARNING: %s\n", w)
+	}
+	// Describe what is actually enforced: the manifest intersection with
+	// mcp.capabilities runs only when the experimental flag is on. With it off,
+	// identity-only tokens are validated and a token carrying mcp.capabilities is
+	// rejected, so claiming "intersecting" unconditionally would mislead operators.
+	// Redact before printing: some IdPs gate the JWKS endpoint behind a query key or
+	// basic-auth userinfo, and this banner goes to the same stderr the systemd journal,
+	// container logs, and the doctor bundle collect. That is a log surface, so it takes
+	// the strict log-facing redactor (scheme://host only) the other banner and
+	// validation-error sites use; the JWKS URI — the root of trust for token
+	// verification — must not be the exception.
+	safeJWKS := capability.RedactURLForLog(pf.jwksURI)
+	if pf.jwtExperimentalCaps {
+		fmt.Fprintf(os.Stderr, "[eunox] JWT PDP enabled (JWKS URI: %s); intersecting per-route manifests with experimental mcp.capabilities claims\n", safeJWKS)
+	} else {
+		fmt.Fprintf(os.Stderr, "[eunox] JWT PDP enabled (JWKS URI: %s); enforcing per-route manifests (experimental mcp.capabilities intersection disabled; pass --jwt-experimental-capabilities to enable)\n", safeJWKS)
+	}
+	gwJWTPDP, err := transport.WrapRoutesWithJWT(routes, pdp.JWTPDPOptions{
+		JWKSURI:                  pf.jwksURI,
+		Issuer:                   pf.jwtIssuer,
+		Audience:                 pf.jwtAudience,
+		AllowAnyAudience:         pf.jwtAllowAnyAudience,
+		AllowAnyIssuer:           pf.jwtAllowAnyIssuer,
+		Leeway:                   jwtLeewayOption(pf.jwtLeeway),
+		KillSwitch:               ks,
+		ExperimentalCapabilities: pf.jwtExperimentalCaps,
+		// Client enforces the scheme policy on redirects too, so an https
+		// JWKS endpoint cannot 302 the key fetch onto plaintext remote http.
+		Client: newJWKSHTTPClient(pf.jwksAllowInsecure),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return gwJWTPDP, nil
+}
+
 // serveHTTPGateway serves cfg's upstreams over an HTTP listener, one /mcp/<name>
 // route each (the gateway shape).
 func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audit.Sink, counter capability.CallCounter, flowStore capability.FlowLabelStore, ks killswitch.Manager, pf proxyFlags, onServeReady func(context.Context)) error { //nolint:gocritic // hugeParam: pf is a small flag bundle
@@ -1659,70 +1738,9 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 
 	// Per-route JWT∩manifest intersection: wrap each route's PDP in a pdp.JWTPDP
 	// whose Inner is that route's manifest PDP, sharing one JWKS validator.
-	var gwJWTPDP *pdp.JWTPDP
-	if pf.jwksURI != "" {
-		// Fail closed on audience pinning and on a plaintext JWKS endpoint before
-		// standing up the JWT PDP.
-		if err := validateJWTAudienceConfig(pf.jwksURI, pf.jwtAudience, pf.jwtAllowAnyAudience); err != nil {
-			return err
-		}
-		if err := validateJWTIssuerConfig(pf.jwksURI, pf.jwtIssuer, pf.jwtAllowAnyIssuer); err != nil {
-			return err
-		}
-		if err := validateJWKSURIScheme(pf.jwksURI, pf.jwksAllowInsecure); err != nil {
-			return err
-		}
-		if w := jwtAudienceBypassWarning(pf.jwtAllowAnyAudience, pf.jwtAudience); w != "" {
-			fmt.Fprintf(os.Stderr, "[eunox] WARNING: %s\n", w)
-		}
-		// --jwt-allow-any-audience also voids per-route manifest 'audience' pins (the
-		// wrapper skips per-route narrowing when AllowAnyAudience is set). The generic
-		// bypass warning above names only the --jwt-audience flag, so call out the dead
-		// manifest pin explicitly — otherwise an operator who pinned a route's audience
-		// in its policy manifest has no signal that the pin no longer enforces.
-		if pf.jwtAllowAnyAudience {
-			if name, pinned := transport.FirstRouteAudiencePin(routes); pinned {
-				fmt.Fprintf(os.Stderr, "[eunox] WARNING: --jwt-allow-any-audience voids the manifest 'audience' pin on route %q; that route now accepts tokens for any audience. Remove --jwt-allow-any-audience to enforce the pin.\n", name)
-			}
-		}
-		if w := jwtIssuerBypassWarning(pf.jwtAllowAnyIssuer, pf.jwtIssuer); w != "" {
-			fmt.Fprintf(os.Stderr, "[eunox] WARNING: %s\n", w)
-		}
-		if w := jwtExperimentalCapsWarning(pf.jwtExperimentalCaps); w != "" {
-			fmt.Fprintf(os.Stderr, "[eunox] WARNING: %s\n", w)
-		}
-		// Describe what is actually enforced: the manifest intersection with
-		// mcp.capabilities runs only when the experimental flag is on. With it off,
-		// identity-only tokens are validated and a token carrying mcp.capabilities is
-		// rejected, so claiming "intersecting" unconditionally would mislead operators.
-		// Redact before printing: some IdPs gate the JWKS endpoint behind a query key or
-		// basic-auth userinfo, and this banner goes to the same stderr the systemd journal,
-		// container logs, and the doctor bundle collect. That is a log surface, so it takes
-		// the strict log-facing redactor (scheme://host only) the other banner and
-		// validation-error sites use; the JWKS URI — the root of trust for token
-		// verification — must not be the exception.
-		safeJWKS := capability.RedactURLForLog(pf.jwksURI)
-		if pf.jwtExperimentalCaps {
-			fmt.Fprintf(os.Stderr, "[eunox] JWT PDP enabled (JWKS URI: %s); intersecting per-route manifests with experimental mcp.capabilities claims\n", safeJWKS)
-		} else {
-			fmt.Fprintf(os.Stderr, "[eunox] JWT PDP enabled (JWKS URI: %s); enforcing per-route manifests (experimental mcp.capabilities intersection disabled; pass --jwt-experimental-capabilities to enable)\n", safeJWKS)
-		}
-		gwJWTPDP, err = transport.WrapRoutesWithJWT(routes, pdp.JWTPDPOptions{
-			JWKSURI:                  pf.jwksURI,
-			Issuer:                   pf.jwtIssuer,
-			Audience:                 pf.jwtAudience,
-			AllowAnyAudience:         pf.jwtAllowAnyAudience,
-			AllowAnyIssuer:           pf.jwtAllowAnyIssuer,
-			Leeway:                   jwtLeewayOption(pf.jwtLeeway),
-			KillSwitch:               ks,
-			ExperimentalCapabilities: pf.jwtExperimentalCaps,
-			// Client enforces the scheme policy on redirects too, so an https
-			// JWKS endpoint cannot 302 the key fetch onto plaintext remote http.
-			Client: newJWKSHTTPClient(pf.jwksAllowInsecure),
-		})
-		if err != nil {
-			return err
-		}
+	gwJWTPDP, err := gatewayJWTLayer(routes, ks, pf)
+	if err != nil {
+		return err
 	}
 
 	// listen.authToken and --jwks-uri are mutually exclusive: the static token

@@ -162,7 +162,7 @@ func TestEffectReceiptIsPostHocNeverRetroactive(t *testing.T) {
 // transport boundary: an unverifiable receipt records as unverified and puts NONE of its
 // claims on the signed tape, where a later reader could mistake them for checked facts.
 func TestEffectReceiptForgedEarnsNothingOnTheTape(t *testing.T) {
-	real := newReceiptFixture(t)
+	genuine := newReceiptFixture(t)
 	forger := newReceiptFixture(t)
 	rec := &fwdRecorder{}
 
@@ -170,7 +170,7 @@ func TestEffectReceiptForgedEarnsNothingOnTheTape(t *testing.T) {
 	result := forger.toolResult(t, capability.EffectReceiptClaims{
 		Tool: "refund", Class: capability.EffectReversible, IssuedAt: time.Now().Unix(),
 	})
-	runToolCall(t, rec, real.verifier, result)
+	runToolCall(t, rec, genuine.verifier, result)
 
 	details := receiptRecord(t, rec)
 	require.NotNil(t, details)
