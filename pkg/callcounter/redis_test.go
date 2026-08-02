@@ -5,6 +5,7 @@ package callcounter_test
 
 import (
 	"context"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -622,7 +623,7 @@ func TestRedis_ScoreEncoding_ConsistentAcrossMethods(t *testing.T) {
 // TestRedis_IncrementAndGet_ConnectionLoss_ReturnsError verifies that when the
 // Redis backend becomes unreachable, IncrementAndGet surfaces the error rather
 // than silently reporting a zero/low count. The enforcement engine relies on
-// this: handleMaxCalls treats a counter error as a CONDITION_FAILED denial
+// this: the maxCalls handler treats a counter error as a CONDITION_FAILED denial
 // (fail-closed), so a swallowed error here would silently disable rate limits.
 func TestRedis_IncrementAndGet_ConnectionLoss_ReturnsError(t *testing.T) {
 	mr := miniredis.NewMiniRedis()
@@ -774,7 +775,7 @@ func TestRedis_MultiInstance_SameTick_NoCollision(t *testing.T) {
 // TestParseIncrIfBelowReply is a regression test: the IncrementIfBelow reply
 // decoder must fail closed with a structured error on any element whose type is
 // not the int64 the Lua script promises, rather than silently defaulting to the
-// zero value. A zero retryMicros would otherwise be masked by the handleMaxCalls
+// zero value. A zero retryMicros would otherwise be masked by the maxCalls handler's
 // full-window fallback, leaving the type mismatch undetected.
 func TestParseIncrIfBelowReply(t *testing.T) {
 	tests := []struct {
@@ -931,30 +932,31 @@ func TestRedis_IncrementAndGet_CapKeepsNewestAcrossDigitBoundary(t *testing.T) {
 	assert.Equal(t, 10, seq, "the newest member (seq 10) must be retained, not seq 9")
 }
 
-// TestRedis_IncrementIfAllBelow_AllOrNothing is the Redis half of the atomic
+// TestRedis_AdmitAll_AllOrNothing is the Redis half of the atomic
 // multi-bucket admission check: every bucket records only when all have headroom,
 // and a full bucket blocks the batch and records nothing (the script runs the
 // check and the all-or-nothing commit in one atomic EVAL).
-func TestRedis_IncrementIfAllBelow_AllOrNothing(t *testing.T) {
+func TestRedis_AdmitAll_AllOrNothing(t *testing.T) {
 	mr := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	defer func() { _ = client.Close() }()
 	counter := callcounter.NewRedis(client)
 	ctx := context.Background()
 
-	keys := []string{"ka", "kb"}
-	windows := []int{3600, 86400}
-	limits := []int64{10, 1}
+	buckets := []capability.QuotaBucket{
+		countedBucket("ka", 3600, 10),
+		countedBucket("kb", 86400, 1),
+	}
 
-	admitted, _, _, _, err := counter.IncrementIfAllBelow(ctx, keys, windows, limits)
+	admitted, _, _, _, err := counter.AdmitAll(ctx, buckets)
 	require.NoError(t, err)
 	require.True(t, admitted, "first call has headroom in every bucket")
 
-	admitted, deniedIndex, count, retry, err := counter.IncrementIfAllBelow(ctx, keys, windows, limits)
+	admitted, deniedIndex, total, retry, err := counter.AdmitAll(ctx, buckets)
 	require.NoError(t, err)
 	assert.False(t, admitted, "a full bucket must block the whole batch")
 	assert.Equal(t, 1, deniedIndex, "the daily bucket (index 1) is the blocker")
-	assert.Equal(t, int64(1), count)
+	assert.Equal(t, float64(1), total)
 	assert.Greater(t, retry, time.Duration(0))
 
 	// The sibling (hourly) bucket must not have been charged for the denied batch.
@@ -964,17 +966,73 @@ func TestRedis_IncrementIfAllBelow_AllOrNothing(t *testing.T) {
 	assert.Equal(t, int64(2), probe, "the denied batch must not have charged the sibling bucket")
 }
 
-// TestIncrementIfAllBelow_DuplicateBucketsFailClosed_BothBackends is the cross-backend
+// TestRedis_AdmitAll_MixedAccounting is the Redis half of the mixed-accounting batch:
+// one EVAL must apply entry-counting to the counted buckets and weight-summing to the
+// weighted ones, commit both or neither, and report the blocking bucket's own total in
+// its own accounting. This is the shape a capability carrying maxCalls AND a cumulative
+// blastRadius produces, so the two backends have to agree on it exactly.
+func TestRedis_AdmitAll_MixedAccounting(t *testing.T) {
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer func() { _ = client.Close() }()
+	counter := callcounter.NewRedis(client)
+	ctx := context.Background()
+
+	mixed := func(weight float64) []capability.QuotaBucket {
+		return []capability.QuotaBucket{
+			countedBucket("calls", 3600, 5),
+			weightedBucket("spend", 3600, weight, 100),
+		}
+	}
+
+	for i := 0; i < 2; i++ {
+		admitted, _, _, _, err := counter.AdmitAll(ctx, mixed(40))
+		require.NoError(t, err)
+		require.True(t, admitted, "call %d is inside both bounds", i)
+	}
+
+	admitted, deniedIndex, total, _, err := counter.AdmitAll(ctx, mixed(40))
+	require.NoError(t, err)
+	assert.False(t, admitted, "the weighted bound must block while the counted one still has headroom")
+	assert.Equal(t, 1, deniedIndex, "the weighted bucket (index 1) is the blocker")
+	assert.Equal(t, float64(80), total, "the reported total is the weighted bucket's in-window sum")
+
+	probe, ok, _, err := counter.IncrementIfBelow(ctx, "calls", 3600, 100)
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, int64(3), probe, "a weighted denial must not charge the counted sibling")
+
+	// And the mirror: when the counted bound is the blocker, the weighted sibling is
+	// left alone. "calls" now holds 3 of a fresh limit of 3.
+	admitted, deniedIndex, total, _, err = counter.AdmitAll(ctx, []capability.QuotaBucket{
+		countedBucket("calls", 3600, 3),
+		weightedBucket("spend", 3600, 1, 1000),
+	})
+	require.NoError(t, err)
+	assert.False(t, admitted, "the spent call budget blocks the batch")
+	assert.Equal(t, 0, deniedIndex, "the counted bucket (index 0) is the blocker")
+	assert.Equal(t, float64(3), total, "the reported total is the counted bucket's entry count")
+
+	_, _, spend, _, err := counter.AdmitAll(ctx, []capability.QuotaBucket{weightedBucket("spend", 3600, 1, 1000)})
+	require.NoError(t, err)
+	assert.Equal(t, float64(81), spend, "a counted denial must not charge the weighted sibling")
+}
+
+// TestAdmitAll_DuplicateBucketsFailClosed_BothBackends is the cross-backend
 // regression for the duplicate-(key, windowSec) fail-open: a batch with two buckets
 // resolving to one storage key must return a structured error and record NOTHING on
 // BOTH backends, so InMemory cannot silently under-count where Redis would
 // double-count. The engine never produces such a batch; this guards a direct consumer
 // against the unsupported input and keeps the two backends equivalent.
-func TestIncrementIfAllBelow_DuplicateBucketsFailClosed_BothBackends(t *testing.T) {
+func TestAdmitAll_DuplicateBucketsFailClosed_BothBackends(t *testing.T) {
 	ctx := context.Background()
-	dupKeys := []string{"k", "k"}
-	dupWindows := []int{60, 60}
-	dupLimits := []int64{5, 5}
+	// A counted and a weighted bucket on ONE storage key is the dangerous shape: the two
+	// accountings disagree about what the key holds, so it must be refused rather than
+	// resolved to whichever the backend happens to apply.
+	dup := []capability.QuotaBucket{
+		countedBucket("k", 60, 5),
+		weightedBucket("k", 60, 1, 5),
+	}
 
 	mr := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
@@ -988,7 +1046,7 @@ func TestIncrementIfAllBelow_DuplicateBucketsFailClosed_BothBackends(t *testing.
 		{"redis", callcounter.NewRedis(client)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			admitted, _, _, _, err := tc.counter.IncrementIfAllBelow(ctx, dupKeys, dupWindows, dupLimits)
+			admitted, _, _, _, err := tc.counter.AdmitAll(ctx, dup)
 			require.Error(t, err, "duplicate (key, windowSec) buckets must fail closed")
 			assert.False(t, admitted, "nothing is admitted on the error path")
 			assert.Contains(t, err.Error(), "duplicate")
@@ -1001,46 +1059,47 @@ func TestIncrementIfAllBelow_DuplicateBucketsFailClosed_BothBackends(t *testing.
 	}
 }
 
-// TestRedis_IncrementIfAllBelow_AdmittedReturnsCount pins the capability.CallCounter
+// TestRedis_AdmitAll_AdmittedReturnsTotal pins the capability.CallCounter
 // contract that the admitted path reports the post-admission in-window total (the
 // maximum across buckets), not a hardcoded 0.
-func TestRedis_IncrementIfAllBelow_AdmittedReturnsCount(t *testing.T) {
+func TestRedis_AdmitAll_AdmittedReturnsTotal(t *testing.T) {
 	mr := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	defer func() { _ = client.Close() }()
 	counter := callcounter.NewRedis(client)
 	ctx := context.Background()
 
-	keys := []string{"ka", "kb"}
-	windows := []int{3600, 86400}
-	limits := []int64{10, 10}
+	buckets := []capability.QuotaBucket{
+		countedBucket("ka", 3600, 10),
+		countedBucket("kb", 86400, 10),
+	}
 
-	admitted, _, count, _, err := counter.IncrementIfAllBelow(ctx, keys, windows, limits)
+	admitted, _, total, _, err := counter.AdmitAll(ctx, buckets)
 	require.NoError(t, err)
 	require.True(t, admitted)
-	assert.Equal(t, int64(1), count, "first admit: every bucket holds exactly one call")
+	assert.Equal(t, float64(1), total, "first admit: every bucket holds exactly one call")
 
-	admitted, _, count, _, err = counter.IncrementIfAllBelow(ctx, keys, windows, limits)
+	admitted, _, total, _, err = counter.AdmitAll(ctx, buckets)
 	require.NoError(t, err)
 	require.True(t, admitted)
-	assert.Equal(t, int64(2), count, "second admit: post-admission total is 2, not 0")
+	assert.Equal(t, float64(2), total, "second admit: post-admission total is 2, not 0")
 }
 
-// TestRedis_IncrementIfAllBelow_ValidatesInputs pins the fail-closed argument
+// TestRedis_AdmitAll_ValidatesInputs pins the fail-closed argument
 // checks before the Redis call.
-func TestRedis_IncrementIfAllBelow_ValidatesInputs(t *testing.T) {
+func TestRedis_AdmitAll_ValidatesInputs(t *testing.T) {
 	mr := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	defer func() { _ = client.Close() }()
 	counter := callcounter.NewRedis(client)
 	ctx := context.Background()
 
-	_, _, _, _, err := counter.IncrementIfAllBelow(ctx, []string{"a", "b"}, []int{60}, []int64{1, 1})
-	assert.Error(t, err, "mismatched slice lengths must error")
-	_, _, _, _, err = counter.IncrementIfAllBelow(ctx, nil, nil, nil)
+	_, _, _, _, err := counter.AdmitAll(ctx, nil)
 	assert.Error(t, err, "an empty batch must error")
-	_, _, _, _, err = counter.IncrementIfAllBelow(ctx, []string{"a"}, []int{0}, []int64{1})
+	_, _, _, _, err = counter.AdmitAll(ctx, []capability.QuotaBucket{countedBucket("a", 0, 1)})
 	assert.Error(t, err, "an out-of-range window must error")
-	_, _, _, _, err = counter.IncrementIfAllBelow(ctx, []string{"a"}, []int{60}, []int64{0})
+	_, _, _, _, err = counter.AdmitAll(ctx, []capability.QuotaBucket{countedBucket("a", 60, 0)})
 	assert.Error(t, err, "a non-positive limit must error")
+	_, _, _, _, err = counter.AdmitAll(ctx, []capability.QuotaBucket{weightedBucket("a", 60, math.Inf(1), 10)})
+	assert.Error(t, err, "a non-finite weight must error")
 }

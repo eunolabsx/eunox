@@ -912,7 +912,7 @@ func (p *JWTPDP) DecideResourceRead(ctx context.Context, sessionID, uri, sourceI
 // requirement that some claim cover this resource, all apply before the inner PDP's own
 // match-only decision.
 //
-// Unlike Decide, the denials here are not routed through withInnerForwardObligations.
+// Unlike Decide, the denials here are not routed through withInnerVerdicts.
 // Neither half of that helper applies to a cancel: the interface-pin hardening it carries
 // is tool-only (hardenOnBrokenInterface returns unchanged for a resource target), and
 // obligations describe how to redact a FORWARDED response — an unsubscribe result carries
@@ -1067,61 +1067,34 @@ func (p *JWTPDP) audienceDeny(message string) capability.EnforceResponse {
 	return resp
 }
 
-// withInnerForwardObligations fills r with the inner manifest's redaction obligations when
-// r is one of JWTPDP's OWN denies and a route-level --audit will forward it anyway.
+// withInnerVerdicts composes the inner PDP's own verdicts onto one of JWTPDP's OWN denies,
+// which the wrapper produced by short-circuiting above the inner PDP.
 //
-// This is the wrapper-shaped half of the observe-mode fail-open the ManifestPDP path closes
-// with withForwardObligations. JWTPDP short-circuits above the inner PDP on three
-// non-HardDeny paths — target absent from mcp.capabilities, a JWT condition failure, and
-// no-capabilities-with-no-backstop — so the inner PDP never runs, never collects
-// obligations, and the response reaches the transport with Obligations empty. On a route
-// running --audit the transport downgrades that deny to a forwarded call and gates
-// redaction on len(Obligations) > 0, so a manifest declaring redactFields on the target was
-// silently skipped: the identical request WITHOUT the JWT wrapper redacted, and turning JWT
-// on removed the guarantee.
+// JWTPDP short-circuits on three non-HardDeny paths — target absent from mcp.capabilities,
+// a JWT condition failure, and no-capabilities-with-no-backstop — so the inner PDP never
+// runs and never contributes the three things it would have: the redaction obligations a
+// route running --audit needs when it downgrades the deny to a forward, the interface-pin
+// break, and the effect ceiling. Each omission made the composed refusal WEAKER than the
+// same request without the JWT, inverting "a JWT may only restrict".
 //
-// The inner is consulted through a *ManifestPDP assertion because obligation collection
-// needs the engine and the capability list, neither of which is on the PolicyDecisionPoint
-// contract. A non-manifest inner (AlwaysAllowPDP, nil, or a third-party implementation)
-// declares no directives, so there is nothing to stamp and r is returned unchanged.
-// withForwardObligations itself no-ops unless the route is running --audit, so an enforce
-// route pays a nil check.
+// It goes through the PolicyDecisionPoint contract (HardenRefusal), not a type assertion to
+// *ManifestPDP. The assertion silently did nothing for any other implementation, so a
+// third-party inner PDP holding a pin or a ceiling composed as if it held neither — and the
+// ORDER of the three checks had to be restated here, away from the decideTarget ordering it
+// mirrors. Both now live with the implementation that owns them.
 //
-// HardDeny responses are excluded: the transport never downgrades them, so there is no
-// forwarded response to redact.
-//
-// It ALSO carries the two inner verdicts a short-circuit would otherwise lose, which are
-// the other halves of the same fail-open: the interface-pin break (hardenOnBrokenInterface)
-// and the effect ceiling (hardenOnEffectCeiling). All three live here because this is the
-// one function every short-circuiting JWT deny already passes through on its way to being
-// forwarded — and args is threaded in for the ceiling, whose verdict depends on the call's
-// arguments (a blast radius is routinely an argument's value).
-func (p *JWTPDP) withInnerForwardObligations(ctx context.Context, sessionID string, r capability.EnforceResponse, target EnforceTarget, args map[string]interface{}) capability.EnforceResponse {
-	if r.Decision == capability.DecisionAllow || len(r.Obligations) > 0 {
+// args is threaded through because the ceiling's verdict depends on the call's arguments (a
+// blast radius is routinely an argument's value).
+func (p *JWTPDP) withInnerVerdicts(ctx context.Context, sessionID string, r capability.EnforceResponse, target EnforceTarget, args map[string]interface{}) capability.EnforceResponse {
+	if p.inner == nil || r.Decision == capability.DecisionAllow || len(r.Obligations) > 0 {
 		return r
 	}
 	if r.Denial != nil && r.Denial.HardDeny {
+		// Never downgraded to a forward, so there is no response to redact and no softer
+		// verdict to harden.
 		return r
 	}
-	mdp, ok := p.inner.(*ManifestPDP)
-	if !ok {
-		return r
-	}
-	if hardened, broke := mdp.hardenOnBrokenInterface(sessionID, r, target); broke {
-		// A broken pin means "must not be forwarded", which outranks "may be forwarded with
-		// obligations" — so return before stamping them. A HardDeny is never downgraded, so
-		// it has no forwarded response to redact.
-		return hardened
-	}
-	// The ceiling runs only if the pin did not fire, mirroring decideTarget's own ordering:
-	// there the pin checks sit above findConstraint precisely so no later verdict can
-	// preempt them, and the ceiling is the LAST thing evaluateMatched reaches. A tool whose
-	// interface was rewritten mid-session is refused for that reason, not re-labelled as an
-	// approval request.
-	if hardened, over := mdp.hardenOnEffectCeiling(ctx, sessionID, r, target, args); over {
-		return hardened
-	}
-	return mdp.withForwardObligations(ctx, r, target)
+	return p.inner.HardenRefusal(ctx, sessionID, r, target, args)
 }
 
 // Decide reads JWT claims from the context (populated by ValidateToken), builds
@@ -1175,7 +1148,7 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 		if p.innerEnforces() {
 			return p.decideInner(ctx, sessionID, target, args, sourceIP)
 		}
-		return p.withInnerForwardObligations(ctx, sessionID, denyResponse(p.clock, capability.ErrCodeAuthorizationFailed, "jwtCapability",
+		return p.withInnerVerdicts(ctx, sessionID, denyResponse(p.clock, capability.ErrCodeAuthorizationFailed, "jwtCapability",
 			"token carries no mcp.capabilities claim and the route has no manifest policy to fall back on; "+
 				"JWT mode denies by default — issue a token with capability claims or add a manifest policy to the route"), target, args)
 	}
@@ -1199,7 +1172,7 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 		if claimNamesTargetButFailedToParse(claims, target) {
 			msg = fmt.Sprintf("a JWT capability claim names %s %q, but its condition suffix could not be parsed, so it grants nothing (see the eunox log for the parse error)", target.Type, target.Name)
 		}
-		return p.withInnerForwardObligations(ctx, sessionID, denyResponse(p.clock, capability.ErrCodeAuthorizationFailed, "jwtCapability", msg), target, args)
+		return p.withInnerVerdicts(ctx, sessionID, denyResponse(p.clock, capability.ErrCodeAuthorizationFailed, "jwtCapability", msg), target, args)
 	}
 
 	// mcp.capabilities is an OR-list: the call is permitted if ANY matching entry's
@@ -1226,7 +1199,7 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 		break
 	}
 	if lastDeny != nil {
-		return p.withInnerForwardObligations(ctx, sessionID, *lastDeny, target, args)
+		return p.withInnerVerdicts(ctx, sessionID, *lastDeny, target, args)
 	}
 
 	// JWT allows — intersect with the inner manifest PDP if configured (both sides
@@ -1866,6 +1839,16 @@ func (p *JWTPDP) FilterResourcesList(ctx context.Context, result json.RawMessage
 // FilterPromptsList implements ListFilterer for the JWT PDP.
 func (p *JWTPDP) FilterPromptsList(ctx context.Context, result json.RawMessage) ListFilterResult {
 	return p.filterList(ctx, result, promptsDesc)
+}
+
+// HardenRefusal delegates to the inner PDP: JWTPDP holds no pin, no ceiling and no
+// directives of its own, so everything it could compose onto another layer's refusal comes
+// from what it wraps. A JWT-only route (no inner) returns the refusal unchanged.
+func (p *JWTPDP) HardenRefusal(ctx context.Context, sessionID string, r capability.EnforceResponse, target EnforceTarget, args map[string]interface{}) capability.EnforceResponse {
+	if p.inner == nil {
+		return r
+	}
+	return p.inner.HardenRefusal(ctx, sessionID, r, target, args)
 }
 
 // RecordObservedToolHashes delegates to the inner PDP, which holds any description-hash

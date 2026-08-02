@@ -17,8 +17,8 @@ import (
 )
 
 // Both built-in backends must satisfy the single mandatory call-counter contract,
-// capability.CallCounter (IncrementAndGet/Peek/IncrementIfBelow/IncrementIfAllBelow):
-// Peek backs sequenceBlock and IncrementIfBelow/IncrementIfAllBelow back maxCalls.
+// capability.CallCounter (IncrementAndGet/Peek/IncrementIfBelow/AdmitAll):
+// Peek backs sequenceBlock and IncrementIfBelow/AdmitAll back maxCalls.
 // Pinning it proves in a single assertion that each backend carries every method
 // any built-in condition can require — a built-in backend that dropped one becomes
 // a build failure here instead of an opaque runtime deny, and each line documents
@@ -700,27 +700,39 @@ func TestStartCleanup_RecoversAfterContextCancel(t *testing.T) {
 		"a second live StartCleanup is the idempotent no-op")
 }
 
-// TestInMemory_IncrementIfAllBelow_AllOrNothing pins the atomic multi-bucket
+// countedBucket is the entry-counting bucket a maxCalls condition prepares.
+func countedBucket(key string, windowSec int, limit float64) capability.QuotaBucket {
+	return capability.QuotaBucket{Key: key, WindowSec: windowSec, Counted: true, Limit: limit}
+}
+
+// weightedBucket is the weight-summing bucket a cumulative blastRadius prepares.
+func weightedBucket(key string, windowSec int, weight, limit float64) capability.QuotaBucket {
+	return capability.QuotaBucket{Key: key, WindowSec: windowSec, Weight: weight, Limit: limit}
+}
+
+// TestInMemory_AdmitAll_AllOrNothing pins the atomic multi-bucket
 // admission: when every bucket has headroom all are recorded, and when any bucket
 // is full nothing is recorded and the blocking bucket is reported.
-func TestInMemory_IncrementIfAllBelow_AllOrNothing(t *testing.T) {
+func TestInMemory_AdmitAll_AllOrNothing(t *testing.T) {
 	counter := callcounter.NewInMemory()
 	ctx := context.Background()
-	keys := []string{"ka", "kb"}
-	windows := []int{3600, 86400}
-	limits := []int64{10, 1} // hourly 10, daily 1; the daily bucket binds first.
+	// Hourly 10, daily 1; the daily bucket binds first.
+	buckets := []capability.QuotaBucket{
+		countedBucket("ka", 3600, 10),
+		countedBucket("kb", 86400, 1),
+	}
 
 	// First call: both buckets below limit → admitted, one slot recorded in each.
-	admitted, _, _, _, err := counter.IncrementIfAllBelow(ctx, keys, windows, limits)
+	admitted, _, _, _, err := counter.AdmitAll(ctx, buckets)
 	require.NoError(t, err)
 	require.True(t, admitted, "first call has headroom in every bucket")
 
 	// Second call: the daily bucket (index 1) is now full → deny, record nothing.
-	admitted, deniedIndex, count, retry, err := counter.IncrementIfAllBelow(ctx, keys, windows, limits)
+	admitted, deniedIndex, total, retry, err := counter.AdmitAll(ctx, buckets)
 	require.NoError(t, err)
 	assert.False(t, admitted, "a full bucket must block the whole batch")
 	assert.Equal(t, 1, deniedIndex, "the daily bucket (index 1) is the blocker")
-	assert.Equal(t, int64(1), count, "reported count is the blocking bucket's in-window total")
+	assert.Equal(t, float64(1), total, "reported total is the blocking bucket's in-window total")
 	assert.Greater(t, retry, time.Duration(0), "a blocked batch reports a retry-after hint")
 
 	// The hourly bucket (index 0) must NOT have been charged for the denied batch:
@@ -732,45 +744,122 @@ func TestInMemory_IncrementIfAllBelow_AllOrNothing(t *testing.T) {
 	assert.Equal(t, int64(2), probe, "the denied batch must not have charged the sibling (hourly) bucket")
 }
 
-// TestInMemory_IncrementIfAllBelow_AdmittedReturnsCount pins the capability.CallCounter
-// contract that the admitted path reports the post-admission in-window total (the
-// maximum across buckets), not a hardcoded 0.
-func TestInMemory_IncrementIfAllBelow_AdmittedReturnsCount(t *testing.T) {
+// TestInMemory_AdmitAll_MixedAccounting is the reason AdmitAll takes buckets rather
+// than parallel limit slices: one capability may carry a maxCalls (entry-counting) bound
+// and a cumulative blastRadius (weight-summing) bound at once, and the two must commit in
+// the same atomic admission. A weighted bucket that blocks must leave the counted sibling
+// uncharged, and vice versa.
+func TestInMemory_AdmitAll_MixedAccounting(t *testing.T) {
 	counter := callcounter.NewInMemory()
 	ctx := context.Background()
-	keys := []string{"ka", "kb"}
-	windows := []int{3600, 86400}
-	limits := []int64{10, 10}
+	// 5 calls/hour AND 100 units/hour, on the same capability.
+	mixed := func(weight float64) []capability.QuotaBucket {
+		return []capability.QuotaBucket{
+			countedBucket("calls", 3600, 5),
+			weightedBucket("spend", 3600, weight, 100),
+		}
+	}
 
-	admitted, _, count, _, err := counter.IncrementIfAllBelow(ctx, keys, windows, limits)
-	require.NoError(t, err)
-	require.True(t, admitted)
-	assert.Equal(t, int64(1), count, "first admit: every bucket holds exactly one call")
+	// Two calls of 40 units each: both bounds have headroom.
+	for i := 0; i < 2; i++ {
+		admitted, _, _, _, err := counter.AdmitAll(ctx, mixed(40))
+		require.NoError(t, err)
+		require.True(t, admitted, "call %d is inside both bounds", i)
+	}
 
-	admitted, _, count, _, err = counter.IncrementIfAllBelow(ctx, keys, windows, limits)
+	// A third 40-unit call would put the weighted bucket at 120 > 100, even though the
+	// counted bucket is only at 2 of 5. The weighted bucket blocks the batch.
+	admitted, deniedIndex, total, _, err := counter.AdmitAll(ctx, mixed(40))
 	require.NoError(t, err)
-	require.True(t, admitted)
-	assert.Equal(t, int64(2), count, "second admit: post-admission total is 2, not 0")
+	assert.False(t, admitted, "the weighted bound must block while the counted one still has headroom")
+	assert.Equal(t, 1, deniedIndex, "the weighted bucket (index 1) is the blocker")
+	assert.Equal(t, float64(80), total, "the reported total is the weighted bucket's in-window sum")
+
+	// The counted bucket must be untouched by the denied batch: it holds 2, so a probe
+	// recording one more sees 3.
+	probe, ok, _, err := counter.IncrementIfBelow(ctx, "calls", 3600, 100)
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, int64(3), probe, "a weighted denial must not charge the counted sibling")
+
+	// A smaller call still fits under the weighted bound and is admitted.
+	admitted, _, _, _, err = counter.AdmitAll(ctx, mixed(20))
+	require.NoError(t, err)
+	assert.True(t, admitted, "a call that fits under both bounds is admitted")
 }
 
-// TestInMemory_IncrementIfAllBelow_ValidatesInputs pins the fail-closed argument
-// checks: mismatched slice lengths, an empty batch, and an out-of-range window or
-// non-positive limit all error and record nothing.
-func TestInMemory_IncrementIfAllBelow_ValidatesInputs(t *testing.T) {
+// TestInMemory_AdmitAll_CountedBlocksWeightedSibling is the mirror of the mixed test
+// above: when the entry-counting bound is the one that binds, the weight-summing sibling
+// must be left uncharged, so a spent call budget cannot silently consume the magnitude
+// budget too.
+func TestInMemory_AdmitAll_CountedBlocksWeightedSibling(t *testing.T) {
+	counter := callcounter.NewInMemory()
+	ctx := context.Background()
+	mixed := []capability.QuotaBucket{
+		countedBucket("calls", 3600, 1),
+		weightedBucket("spend", 3600, 10, 1000),
+	}
+
+	admitted, _, _, _, err := counter.AdmitAll(ctx, mixed)
+	require.NoError(t, err)
+	require.True(t, admitted)
+
+	admitted, deniedIndex, total, _, err := counter.AdmitAll(ctx, mixed)
+	require.NoError(t, err)
+	assert.False(t, admitted, "the spent call budget blocks the batch")
+	assert.Equal(t, 0, deniedIndex, "the counted bucket (index 0) is the blocker")
+	assert.Equal(t, float64(1), total, "the reported total is the counted bucket's entry count")
+
+	// The weighted sibling still holds only the one admitted call's 10 units: a probe
+	// weight of 1 must see a post-admission total of 11, not 21.
+	_, _, probeTotal, _, err := counter.AdmitAll(ctx, []capability.QuotaBucket{weightedBucket("spend", 3600, 1, 1000)})
+	require.NoError(t, err)
+	assert.Equal(t, float64(11), probeTotal, "a counted denial must not charge the weighted sibling")
+}
+
+// TestInMemory_AdmitAll_AdmittedReturnsTotal pins the capability.CallCounter
+// contract that the admitted path reports the post-admission in-window total (the
+// maximum across buckets), not a hardcoded 0.
+func TestInMemory_AdmitAll_AdmittedReturnsTotal(t *testing.T) {
+	counter := callcounter.NewInMemory()
+	ctx := context.Background()
+	buckets := []capability.QuotaBucket{
+		countedBucket("ka", 3600, 10),
+		countedBucket("kb", 86400, 10),
+	}
+
+	admitted, _, total, _, err := counter.AdmitAll(ctx, buckets)
+	require.NoError(t, err)
+	require.True(t, admitted)
+	assert.Equal(t, float64(1), total, "first admit: every bucket holds exactly one call")
+
+	admitted, _, total, _, err = counter.AdmitAll(ctx, buckets)
+	require.NoError(t, err)
+	require.True(t, admitted)
+	assert.Equal(t, float64(2), total, "second admit: post-admission total is 2, not 0")
+}
+
+// TestInMemory_AdmitAll_ValidatesInputs pins the fail-closed argument
+// checks: an empty batch, an out-of-range window, a non-positive limit and an
+// unusable weight all error and record nothing.
+func TestInMemory_AdmitAll_ValidatesInputs(t *testing.T) {
 	counter := callcounter.NewInMemory()
 	ctx := context.Background()
 
-	_, _, _, _, err := counter.IncrementIfAllBelow(ctx, []string{"a", "b"}, []int{60}, []int64{1, 1})
-	assert.Error(t, err, "mismatched slice lengths must error")
-
-	_, _, _, _, err = counter.IncrementIfAllBelow(ctx, nil, nil, nil)
+	_, _, _, _, err := counter.AdmitAll(ctx, nil)
 	assert.Error(t, err, "an empty batch must error")
 
-	_, _, _, _, err = counter.IncrementIfAllBelow(ctx, []string{"a"}, []int{0}, []int64{1})
+	_, _, _, _, err = counter.AdmitAll(ctx, []capability.QuotaBucket{countedBucket("a", 0, 1)})
 	assert.Error(t, err, "an out-of-range window must error")
 
-	_, _, _, _, err = counter.IncrementIfAllBelow(ctx, []string{"a"}, []int{60}, []int64{0})
+	_, _, _, _, err = counter.AdmitAll(ctx, []capability.QuotaBucket{countedBucket("a", 60, 0)})
 	assert.Error(t, err, "a non-positive limit must error")
+
+	_, _, _, _, err = counter.AdmitAll(ctx, []capability.QuotaBucket{weightedBucket("a", 60, math.NaN(), 10)})
+	assert.Error(t, err, "a non-finite weight must error")
+
+	_, _, _, _, err = counter.AdmitAll(ctx, []capability.QuotaBucket{weightedBucket("a", 60, -1, 10)})
+	assert.Error(t, err, "a negative weight must error")
 
 	// None of the rejected calls created a bucket: a fresh admit must report count 1.
 	count, ok, _, err := counter.IncrementIfBelow(ctx, "a", 60, 5)
@@ -779,16 +868,19 @@ func TestInMemory_IncrementIfAllBelow_ValidatesInputs(t *testing.T) {
 	assert.Equal(t, int64(1), count, "a rejected validation must not create a phantom entry")
 }
 
-// TestInMemory_IncrementIfAllBelow_AtomicUnderConcurrency proves the multi-bucket
+// TestInMemory_AdmitAll_AtomicUnderConcurrency proves the multi-bucket
 // admission is atomic: with two buckets of limit 1, exactly one of many concurrent
 // callers is admitted — the over-admission the per-bucket check->commit path
 // allowed cannot happen. Run with -race.
-func TestInMemory_IncrementIfAllBelow_AtomicUnderConcurrency(t *testing.T) {
+func TestInMemory_AdmitAll_AtomicUnderConcurrency(t *testing.T) {
 	counter := callcounter.NewInMemory()
 	ctx := context.Background()
-	keys := []string{"ka", "kb"}
-	windows := []int{60, 3600}
-	limits := []int64{1, 1}
+	// One counted and one weighted bucket, so the atomicity claim covers the mixed
+	// batch and not just the uniform one.
+	buckets := []capability.QuotaBucket{
+		countedBucket("ka", 60, 1),
+		weightedBucket("kb", 3600, 1, 1),
+	}
 
 	const goroutines = 64
 	var (
@@ -802,7 +894,7 @@ func TestInMemory_IncrementIfAllBelow_AtomicUnderConcurrency(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			admitted, _, _, _, err := counter.IncrementIfAllBelow(ctx, keys, windows, limits)
+			admitted, _, _, _, err := counter.AdmitAll(ctx, buckets)
 			if err == nil && admitted {
 				mu.Lock()
 				admittedCnt++
@@ -819,7 +911,7 @@ func TestInMemory_IncrementIfAllBelow_AtomicUnderConcurrency(t *testing.T) {
 // TestInMemory_IncrementIfBelow_AtomicUnderConcurrency pins the single-bucket maxCalls
 // admission bound under concurrency: N racing callers against a limit of L admit exactly
 // L, never more — over-admission would be a maxCalls bypass. The sibling above covers the
-// multi-bucket IncrementIfAllBelow; this covers the primary single-key maxCalls path. Run
+// multi-bucket AdmitAll; this covers the primary single-key maxCalls path. Run
 // under -race to catch a torn read/write of the bucket counter.
 func TestInMemory_IncrementIfBelow_AtomicUnderConcurrency(t *testing.T) {
 	cases := []struct {

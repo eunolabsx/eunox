@@ -172,6 +172,55 @@ func TestBlastRadiusVelocity_NotConsumedUnderObserveMode(t *testing.T) {
 	assert.Equal(t, capability.DecisionAllow, refund(t, e, caps, "100").Decision)
 }
 
+// TestBlastRadiusVelocity_ObserveStillEvaluatesThePerCallBound pins the half of a
+// condition observe mode must NOT skip. Only the cumulative bound consumes quota; the
+// per-call bound is a pure predicate that costs nothing to evaluate, so an --audit route
+// must still report the deny it would have produced — that is the entire point of running
+// one before enforcing.
+//
+// This is where the two evaluation paths had diverged. The per-call check lived on the
+// commit side of the deferral, so a constraint routed through the deferred pass skipped it
+// wholesale under observe while the same condition evaluated it when it reached the handler
+// directly: the same policy predicting two different verdicts depending on how many
+// deferred conditions the constraint happened to carry.
+func TestBlastRadiusVelocity_ObserveStillEvaluatesThePerCallBound(t *testing.T) {
+	e := effectEngine(nil)
+	// One condition carrying BOTH bounds: the per-call bound must be reported, the
+	// cumulative one must not be charged.
+	caps := []capability.Constraint{refundConstraint("500", "100000", 3600)}
+	ctx := enforcement.WithSkipQuota(context.Background())
+
+	over := e.ValidateAction(ctx, effectReq("refund", map[string]interface{}{"amount": jsonNumber("5000")}), caps)
+	require.Equal(t, capability.DecisionDeny, over.Decision,
+		"observe mode must still predict the per-call deny; it consumes no quota to check")
+	require.NotNil(t, over.Denial)
+	assert.Equal(t, capability.ConditionTypeBlastRadius, over.Denial.ConditionType)
+
+	// A call inside the per-call bound is allowed and spends nothing, so enforce mode still
+	// sees the whole budget.
+	under := e.ValidateAction(ctx, effectReq("refund", map[string]interface{}{"amount": jsonNumber("100")}), caps)
+	assert.Equal(t, capability.DecisionAllow, under.Decision)
+
+	// The same verdict must hold when the constraint carries a SECOND deferred condition,
+	// which is what routes it through the multi-bucket commit rather than the single one.
+	both := []capability.Constraint{{
+		Target:  "tool:refund",
+		Actions: []string{"call"},
+		Effect: &capability.EffectContract{
+			Class:       capability.EffectCompensable,
+			BlastRadius: &capability.BlastRadiusSpec{Argument: "amount", Unit: "usd"},
+		},
+		Conditions: []capability.Condition{
+			&capability.BlastRadiusCondition{Max: effNum("500"), MaxTotal: effNum("100000"), WindowSeconds: 3600},
+			&capability.MaxCallsCondition{Count: 100, WindowSeconds: 3600},
+		},
+	}}
+	multi := e.ValidateAction(ctx, effectReq("refund", map[string]interface{}{"amount": jsonNumber("5000")}), both)
+	require.Equal(t, capability.DecisionDeny, multi.Decision,
+		"the per-call bound must be reported identically on the multi-bucket path")
+	assert.Equal(t, capability.ConditionTypeBlastRadius, multi.Denial.ConditionType)
+}
+
 // TestBlastRadiusVelocity_RunsAfterPurePredicates pins that the cumulative bound is a
 // DEFERRED condition: a magnitude must never be charged to the window for a call some other
 // predicate on the same constraint then denies.
@@ -235,12 +284,13 @@ func TestBlastRadiusVelocity_PerCallOnlyCommitsNothing(t *testing.T) {
 	assert.Equal(t, capability.ConditionTypeBlastRadius, over.Denial.ConditionType)
 }
 
-// TestBlastRadiusVelocity_RefusesAnUnenforceableCombination pins the engine's fail-closed
-// backstop for the shape the manifest loader rejects. A weighted budget and a call count
-// cannot be admitted in one atomic commit, so a programmatically built constraint carrying
-// both must be REFUSED rather than committed separately — which would let a call the second
-// bound denies spend the first's budget.
-func TestBlastRadiusVelocity_RefusesAnUnenforceableCombination(t *testing.T) {
+// TestBlastRadiusVelocity_CumulativeAndMaxCallsCommitTogether pins the combination the
+// two accountings exist to support: "at most 10 refunds AND at most 2000 units per hour",
+// on ONE capability. The call count and the weighted budget are different questions about
+// the same call, and a policy author needs both — so they are prepared together and
+// admitted in ONE atomic commit, each bound binding on its own terms and neither spending
+// the other's budget when it denies.
+func TestBlastRadiusVelocity_CumulativeAndMaxCallsCommitTogether(t *testing.T) {
 	e := effectEngine(nil)
 	caps := []capability.Constraint{{
 		Target:  "tool:refund",
@@ -251,15 +301,45 @@ func TestBlastRadiusVelocity_RefusesAnUnenforceableCombination(t *testing.T) {
 		},
 		Conditions: []capability.Condition{
 			&capability.BlastRadiusCondition{MaxTotal: effNum("2000"), WindowSeconds: 3600},
-			&capability.MaxCallsCondition{Count: 10, WindowSeconds: 3600},
+			&capability.MaxCallsCondition{Count: 3, WindowSeconds: 3600},
 		},
 	}}
 
-	resp := refund(t, e, caps, "10")
-	require.Equal(t, capability.DecisionDeny, resp.Decision)
-	require.NotNil(t, resp.Denial)
-	assert.True(t, resp.Denial.HardDeny, "an unenforceable combination is a construction fault, not a downgradable verdict")
-	assert.Contains(t, resp.Denial.Message, "cannot be admitted in one atomic commit")
+	// Two small refunds sit inside both bounds.
+	require.Equal(t, capability.DecisionAllow, refund(t, e, caps, "10").Decision)
+	require.Equal(t, capability.DecisionAllow, refund(t, e, caps, "10").Decision)
+
+	// A large one exceeds the weighted budget while the call count still has headroom:
+	// the WEIGHTED bound is the one that denies.
+	big := refund(t, e, caps, "5000")
+	require.Equal(t, capability.DecisionDeny, big.Decision)
+	assert.Equal(t, capability.ConditionTypeBlastRadius, big.Denial.ConditionType,
+		"the weighted budget must be the reported blocker")
+
+	// That denial spent no call slot: the third small refund is admitted, and only the
+	// FOURTH trips the count.
+	require.Equal(t, capability.DecisionAllow, refund(t, e, caps, "10").Decision,
+		"a weighted denial must not have burned a call slot")
+	fourth := refund(t, e, caps, "10")
+	require.Equal(t, capability.DecisionDeny, fourth.Decision)
+	assert.Equal(t, capability.ConditionTypeMaxCalls, fourth.Denial.ConditionType,
+		"the call count must be the reported blocker once it binds")
+
+	// And the count's denial spent no magnitude budget either: 30 units are recorded, so
+	// a fresh capability with a 40-unit budget on the same session still admits 10 more.
+	loose := []capability.Constraint{{
+		Target:  "tool:refund",
+		Actions: []string{"call"},
+		Effect: &capability.EffectContract{
+			Class:       capability.EffectIrreversible,
+			BlastRadius: &capability.BlastRadiusSpec{Argument: "amount"},
+		},
+		Conditions: []capability.Condition{
+			&capability.BlastRadiusCondition{MaxTotal: effNum("40"), WindowSeconds: 3600},
+		},
+	}}
+	assert.Equal(t, capability.DecisionAllow, refund(t, e, loose, "10").Decision,
+		"a count denial must not have charged the weighted sibling")
 }
 
 // TestBlastRadiusVelocity_FailsClosedWithoutACounter pins that a policy declaring a
@@ -381,19 +461,25 @@ func TestBlastRadiusVelocity_RetryHintIsUsable(t *testing.T) {
 
 // TestBlastRadiusVelocity_BackendFaultDenies pins the fail-closed posture on an
 // infrastructure fault: an unreadable budget must never be mistaken for an unspent one.
+// Which bound faulted is reported STRUCTURALLY (the denial's ConditionType), not in the
+// message — the message names the counter fault and nothing else, so an operator selects
+// on the field rather than parsing prose.
 func TestBlastRadiusVelocity_BackendFaultDenies(t *testing.T) {
 	e := enforcement.New(enforcement.WithCallCounter(faultingWeightedCounter{}))
 	caps := []capability.Constraint{refundConstraint("", "2000", 3600)}
 
 	resp := refund(t, e, caps, "10")
 	require.Equal(t, capability.DecisionDeny, resp.Decision)
-	assert.Contains(t, resp.Denial.Message, "could not be read")
+	require.NotNil(t, resp.Denial)
+	assert.Equal(t, capability.ConditionTypeBlastRadius, resp.Denial.ConditionType,
+		"the faulting bound must be identified structurally")
+	assert.Contains(t, resp.Denial.Message, "call counter error")
 }
 
-// faultingWeightedCounter fails only the weighted path, so a test can isolate the
+// faultingWeightedCounter fails the admission path, so a test can isolate the
 // backend-fault branch from a misconfiguration.
 type faultingWeightedCounter struct{ *callcounter.InMemory }
 
-func (faultingWeightedCounter) AddIfTotalBelow(_ context.Context, _ string, _ int, _, _ float64) (float64, bool, time.Duration, error) {
-	return 0, false, 0, assert.AnError
+func (faultingWeightedCounter) AdmitAll(_ context.Context, _ []capability.QuotaBucket) (bool, int, float64, time.Duration, error) {
+	return false, 0, 0, 0, assert.AnError
 }

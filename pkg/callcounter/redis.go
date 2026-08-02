@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/eunolabs/eunox/pkg/capability"
+
 	"github.com/redis/go-redis/v9"
 )
 
@@ -287,119 +289,174 @@ func parseIncrIfBelowReply(res interface{}) (count int64, admitted bool, retryAf
 	return cnt, admittedRaw == 1, time.Duration(retryMicros) * time.Microsecond, nil
 }
 
-// incrIfAllBelowScript is the multi-bucket analogue of incrIfBelowScript: it prunes
-// and counts every bucket, and ZADDs a member into all of them only if EVERY bucket
-// is strictly below its limit — otherwise records nothing and reports the first
-// blocking bucket. Evaluating check and all-or-nothing commit in one script makes a
-// multi-maxCalls admission atomic.
+// admitAllScript is the multi-bucket admission: it prunes and totals every bucket under
+// that bucket's OWN accounting, and ZADDs a member into all of them only if EVERY bucket
+// has headroom — otherwise records nothing and reports the first blocking bucket.
+// Evaluating check and all-or-nothing commit in one script makes a multi-condition
+// admission atomic.
+//
+// A counted bucket totals with ZCARD (O(1)); a weighted one sums the per-member weights.
+// Mixing the two in one script is what lets "no more than 20 refunds an hour AND no more
+// than $2,000 an hour" be one atomic decision instead of two that can disagree.
 //
 //	KEYS[i]               sorted-set key for bucket i (1..#KEYS)
 //	ARGV[1]               now (microseconds; score for new members)
-//	ARGV[2+(i-1)*5 .. +5] per-bucket: cutoff, member, limit, ttlSec, windowMicros
+//	ARGV[2+(i-1)*7 .. +7] per-bucket: cutoff, member, limit, ttlSec, windowMicros, counted, weight
 //
-// Reply: {admitted (1|0), deniedIndex (1-based; 0 when admitted), count, retryAfterMicros}.
+// Reply: {admitted (1|0), deniedIndex (1-based; 0 when admitted), total (string), retryAfterMicros}.
 //
-// Retry-after, TTL refresh, and the microsecond requirement are as in
-// incrIfBelowScript. The bucket keys must share a Redis slot for a multi-key EVAL;
-// the binary wires a single-node client, where slots do not apply.
-var incrIfAllBelowScript = redis.NewScript(`
+// The total is a STRING for the same reason AddIfTotalBelow's is: it is a magnitude,
+// routinely fractional, and %.17g round-trips a float64 exactly where Redis integer replies
+// and Lua's own tostring would not. Timestamps are MICROSECONDS throughout: Lua numbers are
+// float64, exact only to 2^53.
+var admitAllScript = redis.NewScript(`
 local now = tonumber(ARGV[1])
 local n = #KEYS
-local counts = {}
+local totals = {}
 local denied = 0
+
+local function entry_weight(m)
+  local sep = string.find(m, '|', 1, true)
+  if sep then return tonumber(string.sub(m, sep + 1)) or 1 end
+  return 1
+end
+
 for i = 1, n do
-  local base = 1 + (i-1)*5
+  local base = 1 + (i-1)*7
   redis.call('ZREMRANGEBYSCORE', KEYS[i], '-inf', ARGV[base+1])
-  local count = redis.call('ZCARD', KEYS[i])
-  counts[i] = count
-  local limit = tonumber(ARGV[base+3])
-  if denied == 0 and (limit < 1 or count >= limit) then
+  local counted = tonumber(ARGV[base+6])
+  local total = 0
+  if counted == 1 then
+    total = redis.call('ZCARD', KEYS[i])
+  else
+    local entries = redis.call('ZRANGE', KEYS[i], 0, -1)
+    for j = 1, #entries do
+      total = total + entry_weight(entries[j])
+    end
+  end
+  totals[i] = total
+  local weight = tonumber(ARGV[base+7])
+  if counted == 1 then weight = 1 end
+  if denied == 0 and (total + weight) > tonumber(ARGV[base+3]) then
     denied = i
   end
 end
+
 if denied > 0 then
+  -- Refresh the TTL on the denied path too: a bucket held at its bound is never admitted,
+  -- so its TTL would count down from the last admit and could expire mid-window, silently
+  -- resetting the quota. Gate on EXISTS so the invariant is "refresh whenever present,
+  -- never re-create an absent key".
   for i = 1, n do
-    local base = 1 + (i-1)*5
+    local base = 1 + (i-1)*7
     if redis.call('EXISTS', KEYS[i]) == 1 then
       redis.call('EXPIRE', KEYS[i], ARGV[base+4])
     end
   end
-  local base = 1 + (denied-1)*5
+  local base = 1 + (denied-1)*7
+  local counted = tonumber(ARGV[base+6])
   local limit = tonumber(ARGV[base+3])
-  local count = counts[denied]
+  local weight = tonumber(ARGV[base+7])
+  if counted == 1 then weight = 1 end
+  local total = totals[denied]
   local retry = 0
-  if limit >= 1 then
-    local idx = count - limit
+  if counted == 1 then
+    -- The last entry that must age out is the (total-limit)-th oldest; read it directly
+    -- rather than walking, so a large quota does not pay a linear scan on the deny path.
+    local idx = total - limit
     local pivot = redis.call('ZRANGE', KEYS[denied], idx, idx, 'WITHSCORES')
     if pivot[2] then
       retry = (tonumber(pivot[2]) + tonumber(ARGV[base+5])) - now
-      if retry < 0 then retry = 0 end
+    end
+  else
+    local needed = (total + weight) - limit
+    local freed = 0
+    local entries = redis.call('ZRANGE', KEYS[denied], 0, -1, 'WITHSCORES')
+    for j = 1, #entries, 2 do
+      freed = freed + entry_weight(entries[j])
+      if freed >= needed then
+        retry = (tonumber(entries[j+1]) + tonumber(ARGV[base+5])) - now
+        break
+      end
     end
   end
-  return {0, denied, count, retry}
+  if retry < 0 then retry = 0 end
+  return {0, denied, string.format('%.17g', total), retry}
 end
-local maxCount = 0
+
+local maxTotal = 0
 for i = 1, n do
-  local base = 1 + (i-1)*5
-  redis.call('ZADD', KEYS[i], now, ARGV[base+2])
+  local base = 1 + (i-1)*7
+  local counted = tonumber(ARGV[base+6])
+  local weight = tonumber(ARGV[base+7])
+  if counted == 1 then weight = 1 end
+  local post = totals[i] + weight
+  -- A weight that cannot move the total is admitted WITHOUT being recorded: it can never
+  -- affect a future decision, and recording it is the one case that would grow a key
+  -- without bound.
+  if post ~= totals[i] then
+    redis.call('ZADD', KEYS[i], now, ARGV[base+2])
+  end
   redis.call('EXPIRE', KEYS[i], ARGV[base+4])
-  -- Post-admission total: pruned pre-count plus the member just added. counts[i]+1
-  -- is exact because the script runs atomically (no concurrent ZADD between the ZCARD
-  -- and this ZADD) and the unique member always inserts (never a no-op overwrite).
-  local c = counts[i] + 1
-  if c > maxCount then maxCount = c end
+  if post > maxTotal then maxTotal = post end
 end
 -- Report the maximum post-admission total across buckets per the capability.CallCounter
 -- contract, mirroring the in-memory backend (no single binding bucket on admit).
-return {1, 0, maxCount, 0}
+return {1, 0, string.format('%.17g', maxTotal), 0}
 `)
 
-// IncrementIfAllBelow admits a call against several maxCalls buckets atomically
-// (see the capability.CallCounter contract and incrIfAllBelowScript). The keys,
-// windowSecs, and limits slices are parallel and must share one non-zero length.
+// AdmitAll admits a call against several quota buckets atomically, mixing counted and
+// weighted accountings in one script (see admitAllScript and the capability.CallCounter
+// contract).
 //
-// This is a multi-key EVAL: the buckets carry distinct windowSec suffixes, so on a
-// Redis Cluster they hash to different slots and the script returns CROSSSLOT. The
-// binary wires a single-node client, where slots do not apply; if a cluster client
-// is ever wired, that error surfaces here and the engine maps it to a deny, so the
-// constraint fails CLOSED rather than silently over-admitting.
-func (r *Redis) IncrementIfAllBelow(ctx context.Context, keys []string, windowSecs []int, limits []int64) (admitted bool, deniedIndex int, count int64, retryAfter time.Duration, err error) {
-	// Validate the batch (slice lengths, non-empty, per-bucket window/limit, distinct
-	// (key, windowSec) buckets) before the Redis call, failing closed as
-	// IncrementIfBelow does: two buckets sharing a Redis window key would ZADD two
-	// members into one sorted set (double-count), diverging from the fail-closed
-	// InMemory backend. checkBatch is shared with InMemory so both reject the same
-	// inputs identically.
-	if e := checkBatch(keys, windowSecs, limits); e != nil {
+// This is a multi-key EVAL: the buckets carry distinct windowSec suffixes, so on a Redis
+// Cluster they hash to different slots and the script returns CROSSSLOT. The binary wires a
+// single-node client, where slots do not apply; if a cluster client is ever wired, that
+// error surfaces here and the engine maps it to a deny, so the constraint fails CLOSED
+// rather than silently over-admitting.
+func (r *Redis) AdmitAll(ctx context.Context, buckets []capability.QuotaBucket) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error) {
+	// Validate the batch before the Redis call, failing closed as the single-bucket paths
+	// do: two buckets sharing a Redis window key would ZADD two members into one sorted set
+	// (double-count), diverging from the fail-closed InMemory backend. checkBuckets is
+	// shared with InMemory so both reject the same inputs identically.
+	if e := checkBuckets(buckets); e != nil {
 		return false, 0, 0, 0, e
 	}
 
 	now := r.now()
-	redisKeys := make([]string, len(keys))
-	argv := make([]interface{}, 0, 1+5*len(keys))
+	redisKeys := make([]string, len(buckets))
+	argv := make([]interface{}, 0, 1+7*len(buckets))
 	argv = append(argv, now.UnixMicro())
-	for i := range keys {
-		redisKeys[i] = redisWindowKey(keys[i], windowSecs[i])
-		cutoff := now.Add(-time.Duration(windowSecs[i]) * time.Second).UnixMicro()
-		windowMicros := int64(windowSecs[i]) * 1_000_000
-		ttlSec := int64(windowSecs[i]) * cleanupMarginFactor
+	for i := range buckets {
+		b := &buckets[i]
+		redisKeys[i] = redisWindowKey(b.Key, b.WindowSec)
+		cutoff := now.Add(-time.Duration(b.WindowSec) * time.Second).UnixMicro()
+		windowMicros := int64(b.WindowSec) * 1_000_000
+		ttlSec := int64(b.WindowSec) * cleanupMarginFactor
+		counted := 0
+		// A counted bucket's member carries NO weight suffix, so a later weighted read of
+		// the same key reads it as 1 — the sense in which maxCalls is this with weight 1.
 		member := r.newMember(now)
-		argv = append(argv, cutoff, member, limits[i], ttlSec, windowMicros)
+		if b.Counted {
+			counted = 1
+		} else {
+			member = r.newWeightedMember(now, b.Weight)
+		}
+		argv = append(argv, cutoff, member, b.Limit, ttlSec, windowMicros, counted, b.Weight)
 	}
 
-	res, runErr := incrIfAllBelowScript.Run(ctx, r.client, redisKeys, argv...).Result()
+	res, runErr := admitAllScript.Run(ctx, r.client, redisKeys, argv...).Result()
 	if runErr != nil {
 		return false, 0, 0, 0, fmt.Errorf("redis eval: %w", runErr)
 	}
-	return parseIncrIfAllBelowReply(res)
+	return parseAdmitAllReply(res)
 }
 
-// parseIncrIfAllBelowReply decodes the {admitted, deniedIndex, count,
-// retryAfterMicros} array incrIfAllBelowScript returns, converting the script's
-// 1-based deniedIndex to a 0-based slice index. Each element is checked so a
-// changed encoding fails closed with a structured error rather than defaulting to
-// a zero value (mirroring parseIncrIfBelowReply).
-func parseIncrIfAllBelowReply(res interface{}) (admitted bool, deniedIndex int, count int64, retryAfter time.Duration, err error) {
+// parseAdmitAllReply decodes the {admitted, deniedIndex, total, retryAfterMicros} array
+// admitAllScript returns, converting the script's 1-based deniedIndex to a 0-based slice
+// index. Each element is type-checked so a changed encoding fails closed with a structured
+// error rather than defaulting to a zero value (mirroring parseIncrIfBelowReply).
+func parseAdmitAllReply(res interface{}) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error) {
 	arr, ok := res.([]interface{})
 	if !ok || len(arr) != 4 {
 		return false, 0, 0, 0, fmt.Errorf("redis eval: unexpected reply %T", res)
@@ -412,20 +469,22 @@ func parseIncrIfAllBelowReply(res interface{}) (admitted bool, deniedIndex int, 
 	if !ok {
 		return false, 0, 0, 0, fmt.Errorf("redis eval: unexpected deniedIndex type %T (value %v)", arr[1], arr[1])
 	}
-	cnt, ok := arr[2].(int64)
+	totalRaw, ok := arr[2].(string)
 	if !ok {
-		return false, 0, 0, 0, fmt.Errorf("redis eval: unexpected count type %T (value %v)", arr[2], arr[2])
+		return false, 0, 0, 0, fmt.Errorf("redis eval: unexpected total type %T (value %v)", arr[2], arr[2])
+	}
+	total, parseErr := strconv.ParseFloat(totalRaw, 64)
+	if parseErr != nil {
+		return false, 0, 0, 0, fmt.Errorf("redis eval: unparseable total %q: %w", totalRaw, parseErr)
 	}
 	retryMicros, ok := arr[3].(int64)
 	if !ok {
 		return false, 0, 0, 0, fmt.Errorf("redis eval: unexpected retryMicros type %T (value %v)", arr[3], arr[3])
 	}
 	if admittedRaw == 1 {
-		// Propagate the script's post-admission count; deniedIndex/retryAfter are
-		// meaningless on the admit path.
-		return true, 0, cnt, 0, nil
+		return true, 0, total, 0, nil
 	}
-	return false, int(deniedRaw) - 1, cnt, time.Duration(retryMicros) * time.Microsecond, nil
+	return false, int(deniedRaw) - 1, total, time.Duration(retryMicros) * time.Microsecond, nil
 }
 
 // weightMemberSep separates a sorted-set member's uniqueness prefix from the WEIGHT it

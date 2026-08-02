@@ -832,6 +832,13 @@ func (denyAllPDP) DecideSampling(_ context.Context, _, _ string) capability.Enfo
 		},
 	}
 }
+
+// HardenRefusal is the identity: a deny-all test PDP holds no pin, no ceiling and no
+// obligations, so it has nothing to contribute to another layer's refusal.
+func (denyAllPDP) HardenRefusal(_ context.Context, _ string, r capability.EnforceResponse, _ pdp.EnforceTarget, _ map[string]interface{}) capability.EnforceResponse {
+	return r
+}
+
 func (denyAllPDP) CheckKill(_ context.Context, _ string) *capability.EnforceResponse {
 	return nil
 }

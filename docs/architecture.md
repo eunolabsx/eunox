@@ -394,7 +394,7 @@ opaque resource URI or an oddly-named tool maps to the right namespace — and
   tombstone lifetime the proxy publishes at startup so the CLI stamps the
   same expiry the proxy would; the loopback endpoint is kill-only.
 - **Call counter** (`pkg/callcounter`) — backs `maxCalls` rate conditions
-  (`IncrementIfBelow`/`IncrementIfAllBelow`) and `sequenceBlock` session-history
+  (`AdmitAll`) and `sequenceBlock` session-history
   lookups (`Peek`).
 - Both ship an in-memory backend (single instance) and a Redis backend
   (`redis.go`), so multiple proxy instances can share kill-switch state and
@@ -431,7 +431,7 @@ lifecycle:
 | New condition type | Add the type to `pkg/capability/condition.go`, register a handler on the engine, table-driven tests under `pkg/capability/` (allow, deny, malformed input). |
 | External policy engine | Implement `enforcement.PolicyEvaluator`; wire with `WithPolicyEvaluator`. |
 | Alternative PDP | Implement the full `PolicyDecisionPoint` contract — including the embedded `ListFilterer` and `SamplingAuthorizer` facets. Every method must be decided explicitly; there is no optional list-filtering interface to skip. |
-| Distributed state | Implement the `callcounter` / `killswitch` store interfaces (Redis backends are the reference). For `callcounter`, implement the single mandatory `capability.CallCounter` contract — `Peek` backs `sequenceBlock`, `IncrementIfBelow`/`IncrementIfAllBelow` back `maxCalls` — and pin conformance with one `var _ capability.CallCounter = (*MyStore)(nil)` assertion so an omitted method is a build error rather than an opaque runtime deny. |
+| Distributed state | Implement the `callcounter` / `killswitch` store interfaces (Redis backends are the reference). For `callcounter`, implement the single mandatory `capability.CallCounter` contract — `Peek` backs `sequenceBlock`, `AdmitAll` backs every quota bound (`maxCalls` and the cumulative `blastRadius`, over entry-counting and weight-summing buckets respectively) — and pin conformance with one `var _ capability.CallCounter = (*MyStore)(nil)` assertion so an omitted method is a build error rather than an opaque runtime deny. |
 | New MCP method coverage | Transport handler + PDP decision path + a test in `internal/transport/enforcement_gaps_test.go`. |
 
 ## Related documents

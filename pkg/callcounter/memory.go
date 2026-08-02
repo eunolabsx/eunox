@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/eunolabs/eunox/pkg/capability"
 )
 
 // DefaultCleanupInterval is the period at which StartCleanup fires.
@@ -523,20 +525,22 @@ func retryAfterForWeight(valid []time.Time, weights []float64, needed float64, w
 	return 0
 }
 
-// IncrementIfAllBelow admits a call against several maxCalls buckets atomically
-// under a single lock: all buckets are recorded only when every (key, windowSec,
-// limit) is strictly below its limit; otherwise nothing is recorded and the
-// blocking bucket is reported. Holding m.mu across the whole check-and-commit
-// closes the multi-maxCalls TOCTOU a per-bucket IncrementIfBelow would leave. See
-// the capability.CallCounter contract.
-func (m *InMemory) IncrementIfAllBelow(_ context.Context, keys []string, windowSecs []int, limits []int64) (admitted bool, deniedIndex int, count int64, retryAfter time.Duration, err error) {
-	// Validate the batch (slice lengths, non-empty, per-bucket window/limit, distinct
-	// (key, windowSec) buckets) and fail closed before touching map state: a
-	// misconfigured window/limit must not create a phantom entry or admit a partial
-	// set, and a duplicate (key, windowSec) bucket would let the commit loop below
-	// silently overwrite one entry (a fail-open under-count that diverges from Redis).
-	// checkBatch is shared with the Redis backend so both reject the same inputs.
-	if e := checkBatch(keys, windowSecs, limits); e != nil {
+// AdmitAll admits a call against several quota buckets atomically under a single lock: all
+// buckets are recorded only when every one has headroom; otherwise nothing is recorded and
+// the blocking bucket is reported. Holding m.mu across the whole check-and-commit closes
+// the multi-bucket TOCTOU a per-bucket admission would leave.
+//
+// The batch may MIX accountings — a counted bucket (maxCalls) beside a weighted one (a
+// cumulative blastRadius bound) — and that is the point: committing the two separately
+// would let a call the second denies spend the first's budget. See the
+// capability.CallCounter contract.
+func (m *InMemory) AdmitAll(_ context.Context, buckets []capability.QuotaBucket) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error) {
+	// Validate the batch and fail closed before touching map state: a misconfigured
+	// window/weight/limit must not create a phantom entry or admit a partial set, and a
+	// duplicate bucket would let the commit loop below silently overwrite one entry (a
+	// fail-open under-count that diverges from Redis). checkBuckets is shared with the
+	// Redis backend so both reject the same inputs.
+	if e := checkBuckets(buckets); e != nil {
 		return false, 0, 0, 0, e
 	}
 
@@ -545,59 +549,53 @@ func (m *InMemory) IncrementIfAllBelow(_ context.Context, keys []string, windowS
 
 	now := floorToMicro(m.now())
 
-	// Each bucket keys a distinct window-namespaced entry (storageKey), and two
-	// maxCalls on one constraint must declare distinct windows (rejected at manifest
-	// load); checkDistinctBuckets above also fails the call closed if a direct consumer
-	// passes colliding (key, windowSec) buckets, so the storage keys within a committed
-	// batch never collide.
+	// Each bucket keys a distinct window-namespaced entry (storageKey); checkDistinctBuckets
+	// above fails the call closed if a caller passes colliding buckets, so the storage keys
+	// within a committed batch never collide.
 	type bucketState struct {
 		sk       string
 		e        *entry // nil until the bucket's first admitted call
 		valid    []time.Time
+		weights  []float64
 		weighted bool
 		window   time.Duration
-		cur      int64
+		cur      float64
 	}
-	states := make([]bucketState, len(keys))
+	states := make([]bucketState, len(buckets))
 	blocked := -1
-	for i := range keys {
-		window := time.Duration(windowSecs[i]) * time.Second
+	for i := range buckets {
+		b := &buckets[i]
+		window := time.Duration(b.WindowSec) * time.Second
 		cutoff := now.Add(-window)
-		sk := storageKey(keys[i], windowSecs[i])
-		st := bucketState{sk: sk, window: window}
-		if e, ok := m.entries[sk]; ok {
-			// Prune expired timestamps and write back now: idempotent maintenance the
-			// single-key path also does on every call, so doing it before the admit
-			// decision (and on the deny path) is safe and bounds storage.
+		st := bucketState{sk: storageKey(b.Key, b.WindowSec), window: window}
+		if e, ok := m.entries[st.sk]; ok {
+			// Prune expired entries and write back now: idempotent maintenance the
+			// single-key paths also do on every call, so doing it before the admit decision
+			// (and on the deny path) is safe and bounds storage.
 			valid, validWeights, weighted := pruneInWindow(e, cutoff)
-			st.weighted = weighted
 			storeEntry(e, valid, validWeights, weighted)
-			st.e = e
-			st.valid = e.timestamps
-			st.cur = int64(len(e.timestamps))
+			st.e, st.valid, st.weights, st.weighted = e, e.timestamps, e.weights, weighted
+			st.cur = bucketTotal(b.Counted, e.timestamps, e.weights)
 		}
 		states[i] = st
-		// Report the FIRST full bucket (by slice order), not the one with the longest
-		// retry-after: the caller retries when this one frees and, if a tighter
-		// sibling still blocks, is denied again with that sibling's hint. Admission is
-		// unchanged either way; only the first hint differs.
-		if blocked < 0 && st.cur >= limits[i] {
+		// Report the FIRST bucket without headroom (by slice order), not the one with the
+		// longest retry-after: the caller retries when this one frees and, if a tighter
+		// sibling still blocks, is denied again with that sibling's hint.
+		if blocked < 0 && st.cur+bucketWeight(b) > b.Limit {
 			blocked = i
 		}
 	}
 
 	if blocked >= 0 {
-		// At least one bucket is full: record nothing new (each existing entry was
-		// already pruned above) and report the blocking bucket with the same
-		// retry-after estimate IncrementIfBelow gives.
-		b := states[blocked]
-		return false, blocked, b.cur, retryAfterFromPivot(b.valid, b.cur, limits[blocked], b.window, now), nil
+		// At least one bucket is full: record nothing new (each existing entry was already
+		// pruned above) and report the blocking bucket with the same retry-after estimate
+		// its single-bucket sibling gives.
+		b, st := &buckets[blocked], states[blocked]
+		return false, blocked, st.cur, bucketRetryAfter(b, st.valid, st.weights, st.cur, st.window, now), nil
 	}
 
-	// All buckets have headroom → commit every one. Pre-check the entry cap against
-	// the number of absent buckets so the batch is all-or-nothing against maxKeys too.
-	// Each bucket is its own (key, window) storage entry, so a multi-window increment
-	// consumes several of the maxKeys slots at once.
+	// Every bucket has headroom → commit all of them. Pre-check the entry cap against the
+	// number of absent buckets so the batch is all-or-nothing against maxKeys too.
 	newKeys := 0
 	for i := range states {
 		if states[i].e == nil {
@@ -607,25 +605,87 @@ func (m *InMemory) IncrementIfAllBelow(_ context.Context, keys []string, windowS
 	if m.maxKeys > 0 && len(m.entries)+newKeys > m.maxKeys {
 		return false, 0, 0, 0, m.errEntryLimit()
 	}
-	var maxCount int64
+	var maxTotal float64
 	for i := range states {
+		b := &buckets[i]
 		e := states[i].e
 		if e == nil {
-			e = &entry{windowSec: windowSecs[i]}
+			e = &entry{windowSec: b.WindowSec}
 			m.entries[states[i].sk] = e
+			states[i].e = e
 		}
-		// A counted call contributes weight 1 to a bucket that also tracks magnitudes, so
-		// the pair stays parallel; a pure counting bucket appends only the timestamp.
-		ts, weights := appendCall(e.timestamps, e.weights, now, 1, states[i].weighted)
-		storeEntry(e, ts, weights, states[i].weighted)
-		// Report the max post-admission total across buckets (no single binding bucket
-		// on the admit path) per the capability.CallCounter contract — the bucket closest
-		// to its limit, the most useful figure for the caller.
-		if c := int64(len(e.timestamps)); c > maxCount {
-			maxCount = c
+		post := states[i].cur + bucketWeight(b)
+		// A weight that cannot move the total is admitted WITHOUT being recorded: it can
+		// never affect a future decision, and recording it is the one case that would grow a
+		// key without bound (see AddIfTotalBelow).
+		if post != states[i].cur {
+			weighted := states[i].weighted || !b.Counted
+			ts, weights := e.timestamps, e.weights
+			if weighted && len(weights) != len(ts) {
+				// This key is weighted from here on, whether or not it was before: a key
+				// that had only counted calls has an implicit weight of 1 for each, which
+				// materializing now makes explicit so later prunes and sums stay exact.
+				weights = make([]float64, len(ts))
+				for j := range weights {
+					weights[j] = 1
+				}
+			}
+			ts, weights = appendCall(ts, weights, now, bucketWeight(b), weighted)
+			storeEntry(e, ts, weights, weighted)
+		}
+		// Report the max post-admission total across buckets (no single binding bucket on
+		// the admit path) per the capability.CallCounter contract — the bucket closest to
+		// its limit, the most useful figure for the caller.
+		if post > maxTotal {
+			maxTotal = post
 		}
 	}
-	return true, 0, maxCount, 0, nil
+	return true, 0, maxTotal, 0, nil
+}
+
+// bucketWeight is what one call contributes to a bucket: exactly one entry for a counted
+// bucket, its declared magnitude for a weighted one. It is the single spelling of "maxCalls
+// is this with every weight equal to 1", so the admit test, the commit and the retry
+// estimate cannot disagree about it.
+func bucketWeight(b *capability.QuotaBucket) float64 {
+	if b.Counted {
+		return 1
+	}
+	return b.Weight
+}
+
+// bucketTotal reads a bucket's current in-window total under its own accounting: the entry
+// count (O(1)) for a counted bucket, the weight sum (O(n)) for a weighted one.
+func bucketTotal(counted bool, ts []time.Time, weights []float64) float64 {
+	if counted {
+		return float64(len(ts))
+	}
+	if len(weights) != len(ts) {
+		// A key that has only ever taken counted calls carries no per-entry weights; each
+		// of those calls weighed exactly 1, so its total is its count.
+		return float64(len(ts))
+	}
+	return weightedTotal(weights)
+}
+
+// bucketRetryAfter estimates when a blocked bucket frees enough for THIS call, under the
+// bucket's own accounting. Advisory in both cases; the caller clamps and falls back to the
+// full window.
+func bucketRetryAfter(b *capability.QuotaBucket, valid []time.Time, weights []float64, cur float64, window time.Duration, now time.Time) time.Duration {
+	needed := cur + bucketWeight(b) - b.Limit
+	if b.Counted && len(weights) != len(valid) {
+		// Pure counting: the last entry that must age out is at index cur-limit in
+		// oldest-first order, which retryAfterFromPivot reads directly rather than walking.
+		return retryAfterFromPivot(valid, int64(cur), int64(b.Limit), window, now)
+	}
+	if len(weights) != len(valid) {
+		// Weighted bucket over a key that holds only counted entries: each weighs 1.
+		weights = make([]float64, len(valid))
+		for i := range weights {
+			weights[i] = 1
+		}
+	}
+	return retryAfterForWeight(valid, weights, needed, window, now)
 }
 
 // Peek returns the number of calls recorded for key within the window WITHOUT

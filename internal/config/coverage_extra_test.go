@@ -1303,7 +1303,7 @@ func TestValidateLocalManifest_EmptyTargetAndActions(t *testing.T) {
 }
 
 // A maxCalls condition whose window is non-positive is skipped by
-// validateMaxCallsWindowsDistinct (left to the per-condition validateMaxCalls),
+// validateQuotaBucketsDistinct (left to the per-condition validateMaxCalls),
 // and a non-maxCalls condition alongside it drives the default/skip arm of the
 // distinct-windows scan. The per-condition validator then reports the missing
 // window.

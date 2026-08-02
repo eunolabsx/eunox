@@ -110,6 +110,12 @@ func (denyAllPDP) DecideSampling(_ context.Context, _, _ string) capability.Enfo
 		},
 	}
 }
+
+// HardenRefusal is the identity: a deny-all test PDP holds no pin, no ceiling and no
+// obligations, so it has nothing to contribute to another layer's refusal.
+func (denyAllPDP) HardenRefusal(_ context.Context, _ string, r capability.EnforceResponse, _ EnforceTarget, _ map[string]interface{}) capability.EnforceResponse {
+	return r
+}
 func (denyAllPDP) CheckKill(_ context.Context, _ string) *capability.EnforceResponse {
 	return nil
 }
@@ -129,9 +135,14 @@ func (denyAllPDP) FilterPromptsList(_ context.Context, result json.RawMessage) L
 }
 
 // staticPDP returns a fixed decision for every enforced method and passes list
-// results through.
+// results through. harden, when set, is what its HardenRefusal contributes — the seam
+// that lets a test compose the JWT wrapper over an inner PDP that is NOT a *ManifestPDP
+// and still observe the inner's verdicts reaching the composed refusal. It receives the
+// full call identity because that is exactly what a real inner needs: a pin is keyed by
+// session, and a ceiling verdict reads the arguments.
 type staticPDP struct {
 	decision capability.EnforceResponse
+	harden   func(sessionID string, r capability.EnforceResponse, target EnforceTarget, args map[string]interface{}) capability.EnforceResponse
 }
 
 func (s *staticPDP) Decide(_ context.Context, _ string, _ EnforceTarget, _ map[string]interface{}, _ string) capability.EnforceResponse {
@@ -158,6 +169,12 @@ func (*staticPDP) DecideSampling(_ context.Context, _, _ string) capability.Enfo
 			Message: "staticPDP: sampling deny-by-default",
 		},
 	}
+}
+func (s *staticPDP) HardenRefusal(_ context.Context, sessionID string, r capability.EnforceResponse, target EnforceTarget, args map[string]interface{}) capability.EnforceResponse {
+	if s.harden == nil {
+		return r
+	}
+	return s.harden(sessionID, r, target, args)
 }
 func (*staticPDP) CheckKill(_ context.Context, _ string) *capability.EnforceResponse {
 	return nil

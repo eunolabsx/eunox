@@ -309,7 +309,7 @@ func (c *recordingCounter) Peek(context.Context, string, int) (int64, error) { r
 func (c *recordingCounter) IncrementIfBelow(context.Context, string, int, int64) (count int64, admitted bool, retryAfter time.Duration, err error) {
 	return 0, true, 0, nil
 }
-func (c *recordingCounter) IncrementIfAllBelow(context.Context, []string, []int, []int64) (admitted bool, deniedIndex int, count int64, retryAfter time.Duration, err error) {
+func (c *recordingCounter) AdmitAll(context.Context, []capability.QuotaBucket) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error) {
 	return true, 0, 0, 0, nil
 }
 

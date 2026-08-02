@@ -157,7 +157,7 @@ type DenialInfo struct {
 //
 // Every method is mandatory — the full contract WithCallCounter accepts, not a
 // core with optional type-asserted extensions: IncrementAndGet backs the counting
-// conditions, Peek backs sequenceBlock, IncrementIfBelow / IncrementIfAllBelow back
+// conditions, Peek backs sequenceBlock, IncrementIfBelow / AdmitAll back
 // maxCalls. Folding them into one contract means a backend that omits any fails to
 // satisfy CallCounter at compile time, rather than wiring up cleanly and then
 // failing every maxCalls/sequenceBlock condition closed at runtime. A custom
@@ -181,16 +181,23 @@ type CallCounter interface {
 	// estimates the time until a slot frees on a denial. limit must be >= 1.
 	IncrementIfBelow(ctx context.Context, key string, windowSec int, limit int64) (count int64, admitted bool, retryAfter time.Duration, err error)
 
-	// IncrementIfAllBelow is the multi-bucket analogue of IncrementIfBelow: it
-	// records all of SEVERAL maxCalls buckets only when every one is strictly below
-	// its limit (admitted=true), otherwise records NOTHING (admitted=false) with
-	// deniedIndex naming a blocking bucket, count its total, and retryAfter its
-	// estimate. It exists so a constraint with more than one maxCalls cannot
-	// over-admit by racing the check->commit gap a per-bucket commit would leave.
-	// keys, windowSecs, and limits are parallel and must share one non-zero length;
-	// each limit must be >= 1 and each windowSec in range, else it fails closed and
-	// records nothing. The single-bucket path stays on IncrementIfBelow.
-	IncrementIfAllBelow(ctx context.Context, keys []string, windowSecs []int, limits []int64) (admitted bool, deniedIndex int, count int64, retryAfter time.Duration, err error)
+	// AdmitAll is the multi-bucket analogue of the two single-bucket admissions above: it
+	// records all of SEVERAL quota buckets only when every one has headroom
+	// (admitted=true), otherwise records NOTHING (admitted=false) with deniedIndex naming a
+	// blocking bucket, total its resulting total, and retryAfter its estimate. It exists so
+	// a constraint carrying more than one quota-consuming condition cannot over-admit by
+	// racing the check->commit gap a per-bucket commit would leave.
+	//
+	// The buckets may MIX accountings. A QuotaBucket either counts entries (maxCalls) or
+	// sums magnitudes (a cumulative blastRadius bound), and one call to this method admits
+	// both kinds together atomically. That is the whole point: "no more than 20 refunds an
+	// hour AND no more than $2,000 an hour" is one natural policy, and committing the two
+	// separately would let a call the second denies spend the first's budget.
+	//
+	// buckets must be non-empty, each bucket valid (see QuotaBucket), and no two may address
+	// the same (Key, WindowSec) — two buckets sharing one physical key cannot be committed
+	// consistently. A malformed batch fails closed and records nothing.
+	AdmitAll(ctx context.Context, buckets []QuotaBucket) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error)
 
 	// AddIfTotalBelow is the WEIGHTED sibling of IncrementIfBelow: it atomically adds
 	// weight to a key's in-window total only when the resulting total would not exceed
@@ -241,6 +248,35 @@ type CallCounter interface {
 // backend (its own fail-closed guard). A bound every layer "mirrors" is exactly the guard
 // that ends up missing from one of them.
 const MaxWeightedTotal float64 = 1 << 53
+
+// QuotaBucket is one quota-consuming admission in a multi-condition commit: the sliding
+// window it draws on, what this call contributes, and the bound the resulting total must
+// not exceed.
+//
+// Counted is the one field that changes the ACCOUNTING, and it exists for cost rather than
+// expressiveness. A counted bucket's total is the number of entries in the window, which
+// every backend answers in O(1) (a ZCARD, a slice length); a weighted bucket's total is the
+// sum of the per-entry magnitudes, which is O(n). maxCalls is a weighted bucket with every
+// weight equal to 1, so the two could be one — but folding them would make every rate-limit
+// check pay a linear scan it does not need, and a maxCalls quota is documented to reach the
+// millions. Declaring the accounting per bucket keeps one commit path without that cost.
+type QuotaBucket struct {
+	// Key is the caller-namespaced counter key; WindowSec the sliding window it is
+	// counted over. Together they address one physical bucket.
+	Key       string
+	WindowSec int
+	// Counted selects entry-counting over weight-summing. Weight is ignored when set: a
+	// counted call contributes exactly one entry.
+	Counted bool
+	// Weight is this call's contribution to a weighted total. Must be finite,
+	// non-negative, and at most MaxWeightedTotal. A weight that cannot move the total is
+	// admitted but not recorded — it can never affect a future decision, and recording it
+	// is the one case that would grow a key without bound.
+	Weight float64
+	// Limit is the largest total the bucket may hold after this call. Must be positive and
+	// at most MaxWeightedTotal.
+	Limit float64
+}
 
 // FlowLabelStore holds each session's accumulated information-flow-control label
 // set — the source->sink provenance state a labelOutput directive writes and a

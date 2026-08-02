@@ -1090,16 +1090,10 @@ func validateLocalManifest(m *LocalManifest) error {
 				return fmt.Errorf("capability at index %d, directive %d: unrecognized directive type %q; the only supported directives are redactFields and labelOutput", i, j, dir.DirectiveType())
 			}
 		}
-		// Reject two maxCalls sharing a windowSeconds before the per-condition pass,
-		// so the cross-condition collision is reported clearly. See
-		// validateMaxCallsWindowsDistinct.
-		if err := validateMaxCallsWindowsDistinct(i, c.Conditions); err != nil {
-			return err
-		}
-		// A cumulative blastRadius bound consumes quota, so it obeys the same
-		// one-atomic-commit rule the maxCalls buckets do — see validateOneCommittingCondition
-		// for why a weighted budget cannot share that commit with a call count.
-		if err := validateOneCommittingCondition(i, c.Conditions); err != nil {
+		// Reject two quota-consuming conditions that would address the same counter
+		// bucket, before the per-condition pass, so the cross-condition collision is
+		// reported clearly. See validateQuotaBucketsDistinct.
+		if err := validateQuotaBucketsDistinct(i, c.Conditions); err != nil {
 			return err
 		}
 		// Validate conditions. Conditions needing an explicit argument name fail
@@ -1529,102 +1523,65 @@ func validateMaxCalls(i, j int, v *capability.MaxCallsCondition) error {
 	return nil
 }
 
-// validateMaxCallsWindowsDistinct rejects a capability with two or more maxCalls
-// conditions sharing a windowSeconds. The call counter keys each bucket by
-// (session, targetType, name, windowSeconds), so they share one bucket: every call
-// is counted once per condition, halving the effective limit. The combination adds
-// no expressiveness (`count: min(a, b)` on one condition is the faithful rewrite),
-// so reject it at load. Distinct windows are independent rate limits and left
-// alone.
+// validateQuotaBucketsDistinct rejects a capability whose quota-consuming conditions would
+// address the SAME counter bucket: two maxCalls sharing a windowSeconds, or two cumulative
+// blastRadius bounds sharing one. The counter keys each bucket by (session, targetType,
+// name, windowSeconds) within its own namespace, so two such conditions share one physical
+// bucket: every call is counted (or summed) once per condition, halving the effective
+// limit. The combination adds no expressiveness — one condition with the lower bound is the
+// faithful rewrite — so reject it at load. Distinct windows are independent limits and are
+// left alone.
 //
-// A non-positive window is skipped and left to validateMaxCalls's sharper
-// "windowSeconds >= 1" message, rather than reported here as a duplicate-window
-// conflict that would misdirect the author.
-func validateMaxCallsWindowsDistinct(i int, conditions []capability.Condition) error {
-	seen := make(map[int]int) // windowSeconds -> index of the first maxCalls with it
+// Mixing the two TYPES is explicitly fine and is an ordinary policy ("no more than 20
+// refunds an hour AND no more than $2,000 an hour"): they draw on separately-namespaced
+// keys, and the engine admits a counted bucket and a weighted one together in ONE atomic
+// backend call, so neither can spend the other's budget on a call the other denies.
+//
+// The type switch is complete for its INPUT DOMAIN and only for that: a manifest carries
+// only the closed set of grammar conditions, so a registry-supplied custom committing
+// handler cannot appear here. The backstop for that case is the counter's own
+// checkDistinctBuckets, which fails the admission closed at request time.
+//
+// A non-positive window is skipped and left to each condition's own sharper "windowSeconds
+// >= 1" message, rather than reported here as a duplicate-window conflict that would
+// misdirect the author.
+func validateQuotaBucketsDistinct(i int, conditions []capability.Condition) error {
+	// Keyed by (namespace, window): only a collision WITHIN one namespace is a shared
+	// bucket, because that is exactly how the counter keys them.
+	type bucket struct {
+		namespace string
+		window    int
+	}
+	seen := make(map[bucket]int)
 	for j, cond := range conditions {
-		var window int
+		var b bucket
 		switch v := cond.(type) {
 		case capability.MaxCallsCondition:
-			window = v.WindowSeconds
+			b = bucket{"maxCalls", v.WindowSeconds}
 		case *capability.MaxCallsCondition:
-			window = v.WindowSeconds
-		default:
-			continue
-		}
-		if window < 1 {
-			continue
-		}
-		if first, dup := seen[window]; dup {
-			return fmt.Errorf("capability at index %d: conditions %d and %d are both maxCalls with the same windowSeconds (%d); two equal windows share one counter bucket and would halve the effective limit — combine them into a single maxCalls with the lower 'count'", i, first, j, window)
-		}
-		seen[window] = j
-	}
-	return nil
-}
-
-// validateOneCommittingCondition rejects a capability carrying a CUMULATIVE blastRadius
-// bound alongside any other quota-consuming condition — a second cumulative bound, or any
-// maxCalls.
-//
-// The engine admits several quota-consuming conditions on one constraint in a single
-// atomic backend call, precisely so two concurrent same-session requests cannot both
-// observe headroom and both commit. That commit is count-based (IncrementIfAllBelow); a
-// weighted bucket cannot join it, because a weighted total is summed per entry while a
-// count is O(1), and folding the two would make every rate-limit check pay a linear scan
-// it does not need. Committing them one after another instead would leave exactly the
-// check->commit gap the atomic commit exists to close — and worse, whichever committed
-// first would have spent its budget on a call the second then denied, which is the
-// self-extending lockout an over-limit call must never cause.
-//
-// So the shape is refused at LOAD, where the operator sees it, rather than enforced with a
-// weaker guarantee than the manifest appears to promise. The faithful rewrite is to put the
-// two bounds on separate capabilities, or to express the rate limit as a cumulative bound
-// with weight-like magnitudes.
-func validateOneCommittingCondition(i int, conditions []capability.Condition) error {
-	// Index of the first cumulative bound and of the first maxCalls, remembered as the one
-	// pass goes. Remembering is exactly as order-independent as re-scanning backwards was,
-	// and it keeps the maxCalls arm of the type switch in ONE place — a third committing
-	// condition type would otherwise have to be added twice, and forgetting the second copy
-	// silently re-admits the shape this function exists to refuse.
-	velocity, maxCalls := -1, -1
-	for j, cond := range conditions {
-		switch v := cond.(type) {
+			b = bucket{"maxCalls", v.WindowSeconds}
 		case capability.BlastRadiusCondition:
 			if !v.HasVelocity() {
 				continue
 			}
+			b = bucket{"blastRadius", v.WindowSeconds}
 		case *capability.BlastRadiusCondition:
 			if !v.HasVelocity() {
 				continue
 			}
-		case capability.MaxCallsCondition, *capability.MaxCallsCondition:
-			if velocity >= 0 {
-				return committingConditionConflictErr(i, velocity, j)
-			}
-			if maxCalls < 0 {
-				maxCalls = j
-			}
-			continue
+			b = bucket{"blastRadius", v.WindowSeconds}
 		default:
 			continue
 		}
-		// A cumulative blastRadius bound: it may not join another quota-consuming
-		// condition, whichever was declared first.
-		if velocity >= 0 {
-			return committingConditionConflictErr(i, velocity, j)
+		if b.window < 1 {
+			continue
 		}
-		if maxCalls >= 0 {
-			return committingConditionConflictErr(i, maxCalls, j)
+		if first, dup := seen[b]; dup {
+			return fmt.Errorf("capability at index %d: conditions %d and %d are both %s with the same windowSeconds (%d); two equal windows share one counter bucket and would halve the effective limit — combine them into a single condition with the lower bound", i, first, j, b.namespace, b.window)
 		}
-		velocity = j
+		seen[b] = j
 	}
 	return nil
-}
-
-// committingConditionConflictErr names the two conditions that cannot share a constraint.
-func committingConditionConflictErr(i, first, second int) error {
-	return fmt.Errorf("capability at index %d: conditions %d and %d both consume quota, and one of them is a cumulative blastRadius bound; a weighted budget and a call count cannot be admitted in one atomic commit, and committing them separately would let a call denied by the second spend the first's budget — declare them on separate capabilities", i, first, second)
 }
 
 // validateIPRange rejects an ipRange condition with an empty CIDR list (denies

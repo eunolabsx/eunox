@@ -180,8 +180,9 @@ is catastrophic.
   bound that bounded nothing is worse than its absence — the operator would believe a limit
   was in force. Both shapes are load errors.
 - The budget is per **(session, target)**, like a `maxCalls` quota, and it is summed by
-  `CallCounter.AddIfTotalBelow` — the weighted generalization of the counting primitive
-  `maxCalls` uses, on the same seam rather than in a second accounting system.
+  `CallCounter.AdmitAll` over a **weight-summing** bucket — the same admission `maxCalls`
+  goes through with an **entry-counting** one, on the same seam rather than in a second
+  accounting system.
 - An over-limit call **records nothing**. Charging a refused call's magnitude to the window
   would let a burst of rejections extend its own lockout past the window that actually
   spent the budget — the same rule an over-limit `maxCalls` follows.
@@ -315,13 +316,14 @@ consequential reading* (annotate the tool).
   *and* after the effect ceiling: a call the ceiling escalates is never forwarded, so it must
   not have spent budget the calls that follow then lack. That is the same rule the
   `sequenceBlock` antecedent and the flow label already obeyed, in a third currency.
-- **One committing bound per capability.** A cumulative `blastRadius` bound cannot share a
-  capability with a `maxCalls` (or a second cumulative bound). A weighted budget and a call
-  count cannot be admitted in one atomic commit — a count is O(1) in every backend while a
-  weighted total is summed per entry — and committing them one after another would let a
-  call the second denies spend the first's budget. The combination is refused **at load**
-  rather than enforced with a weaker guarantee than the manifest appears to promise; declare
-  the two bounds on separate capabilities.
+- **A count and a budget compose.** A cumulative `blastRadius` bound and a `maxCalls` are
+  different questions about the same call — "how many" and "how much" — and a capability may
+  carry both: *no more than 20 refunds an hour AND no more than $2,000 an hour*. They draw
+  on separately-namespaced counter keys and are admitted in ONE atomic backend call, so
+  neither can spend the other's budget on a call the other denies. What IS refused at load
+  is two bounds of the same kind on the same `windowSeconds`: they address one physical
+  bucket, so every call would be charged to it twice and the effective limit halved — a
+  limit the manifest never states. Write the lower of the two instead.
 - **Determinism.** Nothing on this path reads a payload, consults a model, or makes a
   network call. Effect is declared by policy and resolved from the call's own arguments.
 

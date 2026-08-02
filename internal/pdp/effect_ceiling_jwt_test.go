@@ -284,9 +284,9 @@ func (c *countingCallCounter) IncrementIfBelow(ctx context.Context, key string, 
 	return c.InMemory.IncrementIfBelow(ctx, key, windowSec, limit)
 }
 
-func (c *countingCallCounter) IncrementIfAllBelow(ctx context.Context, keys []string, windowSecs []int, limits []int64) (bool, int, int64, time.Duration, error) {
-	c.n += len(keys)
-	return c.InMemory.IncrementIfAllBelow(ctx, keys, windowSecs, limits)
+func (c *countingCallCounter) AdmitAll(ctx context.Context, buckets []capability.QuotaBucket) (bool, int, float64, time.Duration, error) {
+	c.n += len(buckets)
+	return c.InMemory.AdmitAll(ctx, buckets)
 }
 
 // TestCeilingHardeningNeverSoftensTheRefusal pins the two ways the composed verdict could
@@ -323,4 +323,55 @@ func TestCeilingHardeningNeverSoftensTheRefusal(t *testing.T) {
 	// must carry the manifest's redaction or the response reaches the host unmasked.
 	assert.NotEmpty(t, got.Obligations,
 		"a forwardable refusal must keep the redactFields obligations the same call gets without a ceiling")
+}
+
+// TestHardeningReachesANonManifestInner is the regression for the composition seam itself.
+// The wrapper used to reach its inner PDP through a type assertion to the concrete
+// *ManifestPDP, so a deployment whose inner was ANY other implementation — an external
+// policy engine, a decorator, a test double — composed as though the inner held no pin, no
+// ceiling and no obligations. That failure is silent: the refusal still refuses, so nothing
+// breaks loudly; it just refuses more WEAKLY than the same policy without the JWT, which is
+// the exact inversion of "a token may only ever restrict".
+//
+// The double here is deliberately not a *ManifestPDP and not a wrapper around one. It
+// contributes both halves of what an inner owes a refusal — hardening it against downgrade,
+// and attaching the obligations a downgraded forward would need — so the test fails if
+// either is dropped in transit, and it records the call identity it was handed so a
+// hardening run against the wrong session or a stripped argument map cannot pass either.
+func TestHardeningReachesANonManifestInner(t *testing.T) {
+	key := newTestKey(t, "k1")
+	var (
+		calls        int
+		gotSessionID string
+		gotTarget    string
+		gotArgs      map[string]interface{}
+	)
+	inner := &staticPDP{
+		decision: capability.EnforceResponse{Decision: capability.DecisionAllow},
+		harden: func(sessionID string, r capability.EnforceResponse, target EnforceTarget, args map[string]interface{}) capability.EnforceResponse {
+			calls++
+			gotSessionID, gotTarget, gotArgs = sessionID, target.Name, args
+			r.Denial.HardDeny = true
+			r.Obligations = []capability.Obligation{{Type: capability.DirectiveTypeRedactFields, Paths: []string{"account"}}}
+			return r
+		},
+	}
+
+	jp, cleanup := makeJWTPDPWithInner(t, key, inner)
+	defer cleanup()
+
+	ctx := makeJWTCtx(t, jp, makeJWTToken(t, key, []string{"tool:other_tool"}))
+	args := map[string]interface{}{"amount": "5000"}
+	got := jp.Decide(ctx, "sess-nonmanifest", EnforceTarget{Type: capability.TargetTypeTool, Name: "wire_transfer"}, args, "")
+
+	require.NotNil(t, got.Denial)
+	require.Equal(t, 1, calls, "the wrapper must reach its inner through the contract, whatever the inner's concrete type")
+	assert.True(t, got.Denial.HardDeny,
+		"the inner's hardening must survive composition; the type assertion to *ManifestPDP dropped it")
+	assert.NotEmpty(t, got.Obligations,
+		"the inner's obligations must survive composition, or a downgraded forward reaches the host unmasked")
+
+	assert.Equal(t, "sess-nonmanifest", gotSessionID)
+	assert.Equal(t, "wire_transfer", gotTarget)
+	assert.Equal(t, args, gotArgs)
 }

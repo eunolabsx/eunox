@@ -110,51 +110,6 @@ func (e *Engine) handleEffectClass(ctx context.Context, cond capability.Conditio
 		eff.Class, strings.Join(capability.SortedEffectClasses(ec.Allow), ", "), unannotatedHint(eff)), details)
 }
 
-// handleBlastRadius denies a call whose magnitude exceeds the condition's per-call bound.
-// It is the quantitative gate an argument allowlist cannot express: the argument is legal
-// at every value, and only its SIZE is the problem.
-//
-// An UNQUANTIFIED call — no contract, or a contract naming an argument this call did not
-// supply — is denied, not admitted. An action whose size cannot be established must not
-// be treated as small; treating unknown as zero is the fail-open this condition exists to
-// prevent.
-func (e *Engine) handleBlastRadius(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) *ConditionError {
-	br, condErr := castCondition[capability.BlastRadiusCondition](cond)
-	if condErr != nil {
-		return condErr
-	}
-	if br == nil {
-		return effectDenial(capability.ConditionTypeBlastRadius, "blastRadius condition is nil and cannot be evaluated", nil)
-	}
-	if br.Max == nil && !br.HasVelocity() {
-		// The loader requires at least one bound, and rejects a half-written cumulative
-		// pair; a programmatically built condition may carry neither, or half of one. A
-		// condition that bounds nothing must not read as "checked and fine".
-		return effectDenial(capability.ConditionTypeBlastRadius,
-			"blastRadius declares neither 'max' nor a complete 'maxTotal'/'windowSeconds' pair, so it bounds nothing", nil)
-	}
-
-	eff, resolved := resolvedEffectFromContext(ctx)
-	if !resolved {
-		return effectDenial(capability.ConditionTypeBlastRadius,
-			"effect contract was not resolved for this call; blast radius is unavailable", nil)
-	}
-
-	// The per-call bound first, and only then the cumulative one. A call over the per-call
-	// bound must be refused WITHOUT consuming any of the cumulative budget: charging a
-	// refused call's magnitude to the window would let a burst of oversized attempts
-	// exhaust the budget of the calls that were actually permitted.
-	if br.Max != nil {
-		if condErr := checkPerCallBlastRadius(br, eff); condErr != nil {
-			return condErr
-		}
-	}
-	if !br.HasVelocity() {
-		return nil
-	}
-	return e.commitBlastRadiusVelocity(ctx, br, eff, req)
-}
-
 // checkPerCallBlastRadius applies the per-call `max` bound. It commits nothing.
 func checkPerCallBlastRadius(br *capability.BlastRadiusCondition, eff *capability.ResolvedEffect) *ConditionError {
 	limit, ok := capability.ParseBlastRadiusNumber(*br.Max)
@@ -179,75 +134,66 @@ func checkPerCallBlastRadius(br *capability.BlastRadiusCondition, eff *capabilit
 		eff.BlastRadius.Text('f', -1), br.Max.String()), details)
 }
 
-// commitBlastRadiusVelocity applies the CUMULATIVE bound: it adds this call's magnitude to
-// the session's in-window total for this target, admitting only when the resulting total
-// stays within `maxTotal`. This is the bound per-call authorization structurally cannot
-// express — four hundred individually-permitted $10 refunds are each legal and only the
-// aggregate is catastrophic.
+// velocityBucket derives the weighted bucket a cumulative bound draws on, after the checks
+// that must fail closed before any budget is considered: an unquantified magnitude, one the
+// accumulator cannot represent, and the structural session/target guards.
 //
-// It COMMITS on admit, which is why blastRadius is a deferred condition (see
-// blastRadiusHandler): every pure predicate on the constraint has already passed by the
-// time this runs, so a magnitude is never charged to the window for a call some later
-// predicate then denies. An over-limit call adds nothing, so a burst of refusals cannot
-// extend its own lockout.
-func (e *Engine) commitBlastRadiusVelocity(ctx context.Context, br *capability.BlastRadiusCondition, eff *capability.ResolvedEffect, req *capability.EnforceRequest) *ConditionError {
+// It COMMITS nothing — the engine admits the returned bucket alongside every other
+// quota-consuming condition on the constraint, in one atomic call, after the effect ceiling
+// has had its chance to refuse.
+func (e *Engine) velocityBucket(ctx context.Context, br *capability.BlastRadiusCondition, eff *capability.ResolvedEffect, req *capability.EnforceRequest) (DeferredCommit, bool, *ConditionError) {
 	limit, ok := capability.ParseBlastRadiusNumber(*br.MaxTotal)
 	if !ok {
-		return effectDenial(capability.ConditionTypeBlastRadius, fmt.Sprintf(
+		return DeferredCommit{}, false, effectDenial(capability.ConditionTypeBlastRadius, fmt.Sprintf(
 			"blastRadius 'maxTotal' is not a number (%q)", br.MaxTotal.String()), nil)
 	}
 	if !eff.Quantified() {
 		// The same rule the per-call bound applies, for the same reason: an action whose
 		// size cannot be established must not contribute 0 to a sum. Treating it as
 		// weightless would make the unannotated call the one way to spend nothing.
-		return effectDenial(capability.ConditionTypeBlastRadius, fmt.Sprintf(
+		return DeferredCommit{}, false, effectDenial(capability.ConditionTypeBlastRadius, fmt.Sprintf(
 			"this call's blast radius could not be quantified, so it cannot be summed against the cumulative bound of %s per %ds%s",
 			br.MaxTotal.String(), br.WindowSeconds, unannotatedHint(eff)), velocityDetails(eff, br))
 	}
-
-	key, skip, condErr := e.blastRadiusBucket(ctx, req)
-	if condErr != nil {
-		return condErr
-	}
-	if skip {
-		// Observe mode (--audit): the budget must not be consumed, so the condition is
-		// treated as satisfied. Same inexactness maxCalls accepts there, and for the same
-		// reason — observing it accurately would spend the budget it exists to leave alone.
-		return nil
-	}
-
-	// float64 on both sides, matching the counter contract's accumulator. A magnitude the
-	// double cannot represent (above 2^53, or non-finite) resolves as UNQUANTIFIED rather
-	// than being rounded into the sum: a budget spent in approximated units is not the
-	// budget the operator authored.
+	// float64 on both sides, matching the counter contract's accumulator.
 	weight, _ := eff.BlastRadius.Float64()
 	limitF, _ := limit.Float64()
 	if !weightSummable(weight) {
-		return effectDenial(capability.ConditionTypeBlastRadius, fmt.Sprintf(
+		return DeferredCommit{}, false, effectDenial(capability.ConditionTypeBlastRadius, fmt.Sprintf(
 			"this call's blast radius %s is outside the range a cumulative bound can sum, so it cannot be shown to be within %s",
 			eff.BlastRadius.Text('f', -1), br.MaxTotal.String()), velocityDetails(eff, br))
 	}
 
-	total, admitted, retryAfter, err := e.counter.AddIfTotalBelow(ctx, key, br.WindowSeconds, weight, limitF)
-	if err != nil {
-		// Fail closed on a backend fault, exactly as maxCalls does: an unreadable budget
-		// must never be mistaken for an unspent one.
-		return effectDenial(capability.ConditionTypeBlastRadius, fmt.Sprintf(
-			"cumulative blast-radius budget could not be read: %v", err), nil)
+	key, skip, condErr := e.blastRadiusBucket(ctx, req)
+	if condErr != nil {
+		return DeferredCommit{}, false, condErr
 	}
-	if admitted {
-		return nil
+	if skip {
+		// Observe mode (--audit): the budget must not be consumed. The per-call bound has
+		// already been evaluated above, which is the half observe mode must still report —
+		// leaving it on the commit side is what let it go unchecked on this exact run.
+		return DeferredCommit{}, true, nil
 	}
-	details := velocityDetails(eff, br)
-	details["blast_radius_total"] = total
-	// The SHARED helper every other quota condition uses: it rounds a fractional estimate
-	// UP (a truncating int64 conversion reported a 900ms wait as 0, telling the caller to
-	// retry immediately into a guaranteed denial) and falls back to the full window when no
-	// estimate could be made, rather than omitting the hint entirely.
-	details["retry_after_seconds"] = retryAfterSeconds(retryAfter, br.WindowSeconds)
-	return effectDenial(capability.ConditionTypeBlastRadius, fmt.Sprintf(
-		"this call's blast radius %s would take this session's cumulative total for the target past the permitted %s per %ds (already %s within the window)",
-		eff.BlastRadius.Text('f', -1), br.MaxTotal.String(), br.WindowSeconds, formatTotal(total)), details)
+	return DeferredCommit{
+		Bucket: capability.QuotaBucket{
+			Key:       key,
+			WindowSec: br.WindowSeconds,
+			Weight:    weight,
+			Limit:     limitF,
+		},
+		Deny: func(total float64, retryAfter time.Duration) *ConditionError {
+			details := velocityDetails(eff, br)
+			details["blast_radius_total"] = total
+			// The SHARED helper every other quota condition uses: it rounds a fractional
+			// estimate UP (a truncating conversion reported a 900ms wait as 0, telling the
+			// caller to retry immediately into a guaranteed denial) and falls back to the
+			// full window when no estimate could be made.
+			details["retry_after_seconds"] = retryAfterSeconds(retryAfter, br.WindowSeconds)
+			return effectDenial(capability.ConditionTypeBlastRadius, fmt.Sprintf(
+				"this call's blast radius %s would take this session's cumulative total for the target past the permitted %s per %ds (already %s within the window)",
+				eff.BlastRadius.Text('f', -1), br.MaxTotal.String(), br.WindowSeconds, formatTotal(total)), details)
+		},
+	}, false, nil
 }
 
 // weightSummable reports whether a resolved magnitude can join a weighted total at all.
@@ -333,51 +279,69 @@ func (e *Engine) blastRadiusBucket(ctx context.Context, req *capability.EnforceR
 	return compositeCounterKey("blastradius", e.counterKeyNamespace, req.SessionID, targetType, toolName), false, nil
 }
 
-// blastRadiusHandler is the built-in blastRadius condition handler. A condition declaring
-// a CUMULATIVE bound commits a weighted slice of a sliding-window budget on admit, so
-// beyond the plain Handle path it implements CommittingConditionHandler: the engine runs
-// it after every pure predicate, so a magnitude is never charged to the window for a call
-// a later predicate then denies.
+// blastRadiusHandler is the built-in blastRadius condition handler. A condition declaring a
+// CUMULATIVE bound commits a weighted slice of a sliding-window budget on admit, so beyond
+// the plain Handle path it implements CommittingConditionHandler: the engine runs it after
+// every pure predicate and after the effect ceiling, so a magnitude is never charged to a
+// call a later check then refuses.
 //
-// A per-call-only condition commits nothing, and reports that by preparing a commit with
-// no bucket (DeferredCommit.Commits() == false) — the engine then evaluates it as the pure
-// predicate it is. Deferral is keyed by condition TYPE, so both shapes arrive here and the
-// distinction has to be per-condition rather than per-type.
+// PrepareCommit carries the PER-CALL bound as well as the bucket. That is not tidiness: the
+// per-call `max` is a pure check, and leaving it in Handle alone meant observe mode — which
+// skips the commit — skipped the bound too, so a constraint carrying `max` and `maxTotal`
+// together had its per-call bound evaluated or not depending on how many deferred conditions
+// happened to sit beside it.
+//
+// A per-call-only condition commits nothing and reports that by preparing a commit with no
+// bucket (DeferredCommit.Commits() == false); its bound has still been checked. Deferral is
+// keyed by condition TYPE, so both shapes arrive here and the distinction has to be
+// per-condition rather than per-type.
 type blastRadiusHandler struct{ e *Engine }
 
-// Handle implements ConditionHandler for the single-condition path.
+// Handle implements ConditionHandler by routing through PrepareCommit and admitting the
+// single bucket, so the condition has ONE implementation of its own semantics.
 func (h blastRadiusHandler) Handle(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) *ConditionError {
-	return h.e.handleBlastRadius(ctx, cond, req)
+	return h.e.prepareAndAdmit(ctx, h, cond, req)
 }
 
-// PrepareCommit implements CommittingConditionHandler. A cumulative bound reports a
-// WEIGHTED bucket, which the engine's atomic multi-bucket commit cannot admit alongside a
-// counted one (see DeferredCommit.Weighted) — the manifest loader rejects that shape, and
-// the engine fails closed if a programmatically built constraint produces it. A per-call
-// bound reports no bucket at all.
+// PrepareCommit runs the condition's pure checks (the bounds' well-formedness and the
+// per-call `max`) and derives the weighted bucket for a cumulative bound.
 func (h blastRadiusHandler) PrepareCommit(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (DeferredCommit, bool, *ConditionError) {
 	br, condErr := castCondition[capability.BlastRadiusCondition](cond)
 	if condErr != nil {
 		return DeferredCommit{}, false, condErr
 	}
-	if br == nil || !br.HasVelocity() {
-		// Nothing is committed for this condition; the engine evaluates it through Handle
-		// as an ordinary predicate. A nil condition lands here too and is denied there,
-		// rather than being reported as a bucket that cannot be built.
+	if br == nil {
+		return DeferredCommit{}, false, effectDenial(capability.ConditionTypeBlastRadius,
+			"blastRadius condition is nil and cannot be evaluated", nil)
+	}
+	if br.Max == nil && !br.HasVelocity() {
+		// The loader requires at least one bound, and rejects a half-written cumulative
+		// pair; a programmatically built condition may carry neither, or half of one. A
+		// condition that bounds nothing must not read as "checked and fine".
+		return DeferredCommit{}, false, effectDenial(capability.ConditionTypeBlastRadius,
+			"blastRadius declares neither 'max' nor a complete 'maxTotal'/'windowSeconds' pair, so it bounds nothing", nil)
+	}
+
+	eff, resolved := resolvedEffectFromContext(ctx)
+	if !resolved {
+		return DeferredCommit{}, false, effectDenial(capability.ConditionTypeBlastRadius,
+			"effect contract was not resolved for this call; blast radius is unavailable", nil)
+	}
+
+	// The per-call bound first, and only then the cumulative one. A call over the per-call
+	// bound must be refused WITHOUT consuming any of the cumulative budget: charging a
+	// refused call's magnitude to the window would let a burst of oversized attempts exhaust
+	// the budget of the calls that were actually permitted.
+	if br.Max != nil {
+		if condErr := checkPerCallBlastRadius(br, eff); condErr != nil {
+			return DeferredCommit{}, false, condErr
+		}
+	}
+	if !br.HasVelocity() {
+		// Bound checked, nothing to commit.
 		return DeferredCommit{}, false, nil
 	}
-	key, skip, condErr := h.e.blastRadiusBucket(ctx, req)
-	if skip {
-		return DeferredCommit{}, true, nil
-	}
-	if condErr != nil {
-		return DeferredCommit{}, false, condErr
-	}
-	return DeferredCommit{
-		Key:        key,
-		WindowSecs: br.WindowSeconds,
-		Weighted:   true,
-	}, false, nil
+	return h.e.velocityBucket(ctx, br, eff, req)
 }
 
 // unannotatedHint appends the remediation that differs between "declared, and it does not
