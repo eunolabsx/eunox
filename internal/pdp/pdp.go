@@ -1108,10 +1108,6 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 		// not a declassification, which is nearly all of them; without one, a declassify
 		// directive escalates rather than clearing a label.
 		DeclassifyApprovals: declassifyApprovalsFromContext(ctx),
-		// The attenuation the token's delegation chain declared, already asserted to narrow
-		// at every hop. Nil for every non-delegated request; when present it can only ever
-		// subtract from what the manifest already allowed.
-		Delegation: delegationFromContext(ctx),
 	}
 
 	matched := p.findConstraint(target, claims)
@@ -1567,7 +1563,7 @@ func (p *ManifestPDP) withForwardObligationsFor(ctx context.Context, r capabilit
 	if !willForwardDeny(ctx, matched) || matched == nil {
 		return r
 	}
-	obs, deny := p.engine.CollectObligations(delegationFromContext(ctx), matched, r.RequestID, r.DecidedAt)
+	obs, deny := p.engine.CollectObligations(matched, r.RequestID, r.DecidedAt)
 	if deny != nil {
 		return *deny
 	}
@@ -1586,13 +1582,10 @@ func (p *ManifestPDP) withForwardObligations(ctx context.Context, r capability.E
 		return r
 	}
 	dirs := p.directivesNamingTarget(target)
-	chain := delegationFromContext(ctx)
-	// No early return on `len(dirs) == 0`: a delegated caller whose hops compose a
-	// redactFields list must have it applied even when no manifest entry names this target,
-	// and CollectObligations already answers "is there anything to apply" — restating that
-	// question here meant asking the chain twice and gave a second place for the two to
-	// disagree about when the response is forwarded unmasked.
-	obs, deny := p.engine.CollectObligations(chain, &capability.Constraint{Target: string(target.Type) + ":" + target.Name, Directives: dirs}, r.RequestID, r.DecidedAt)
+	if len(dirs) == 0 {
+		return r
+	}
+	obs, deny := p.engine.CollectObligations(&capability.Constraint{Target: string(target.Type) + ":" + target.Name, Directives: dirs}, r.RequestID, r.DecidedAt)
 	if deny != nil {
 		return *deny
 	}
@@ -1724,11 +1717,6 @@ func (p *ManifestPDP) hardenOnEffectCeiling(ctx context.Context, sessionID strin
 		},
 		Claims:         claims,
 		DeclaredLabels: declaredLabelsFromContext(ctx),
-		// No Delegation, deliberately. CeilingVerdictFor may only HARDEN a refusal, and a
-		// delegation refusal is downgradable by design — the full path forwards it under
-		// --audit too, so there is no inversion here for a composed delegation verdict to
-		// close, and producing a soft verdict through a harden-only seam would break that
-		// seam's contract to fix nothing. See CeilingVerdictFor.
 	}
 	verdict := p.engine.CeilingVerdictFor(ctx, req, matched)
 	if verdict == nil {
@@ -2011,16 +1999,6 @@ func (p *ManifestPDP) DecideResourceCancel(ctx context.Context, sessionID, uri, 
 		return withCancelAuditPosture(denyResponse(p.engineClock(), capability.ErrCodeCapabilityDenied, "",
 			fmt.Sprintf("resource %q is present in the manifest but not with the %q action, so there is no subscription to it to cancel", uri, requiredActionFor(capability.TargetTypeResource))), c)
 	}
-	// The delegation target gate. A cancel is authorized by MATCH ALONE — no conditions, no
-	// quota, no session-state commit — and this belongs on the match side of that line
-	// rather than the metering side: it is authority, not accounting, so it commits nothing
-	// and cannot deny an unsubscribe by spending a budget. Without it this method's own
-	// documented invariant ("what a session may cancel is exactly what it may see listed")
-	// became false the moment the list filter learned about chains.
-	if deny := delegationTargetDenial(ctx, p.engineClock(),
-		EnforceTarget{Type: capability.TargetTypeResource, Name: uri}, c.IsAuditOnly()); deny != nil {
-		return *deny
-	}
 	return withCancelAuditPosture(newAllowResponse(p.engineClock()), c)
 }
 
@@ -2110,16 +2088,8 @@ func (p *ManifestPDP) DecideSampling(ctx context.Context, sessionID, sourceIP st
 			Name: capability.MethodSamplingCreateMessage,
 		},
 		Claims: claims,
-		// Sampling is the one enforced method that drives the HOST's model, so it is the
-		// one a quarantined delegate most wants and the one whose omission is least
-		// visible: with this field unset every delegation gate short-circuits on
-		// IsEmpty() and a chain granting one read tool still reaches inference. The JWT
-		// layer already learned this exact lesson for mcp.capabilities ("sampling was the
-		// one enforced method that ignored it"); this is the same seam, so it carries the
-		// same field every other decision path carries.
-		Delegation: delegationFromContext(ctx),
-		// Approvals for the same reason: a declassify directive on the sampling opt-in
-		// must be satisfiable by the same grant that satisfies it anywhere else.
+		// Approvals so a declassify directive on the sampling opt-in is satisfiable by the
+		// same grant that satisfies it anywhere else.
 		DeclassifyApprovals: declassifyApprovalsFromContext(ctx),
 	}
 
@@ -2140,17 +2110,17 @@ func (p *ManifestPDP) DecidePromptGet(ctx context.Context, sessionID, promptName
 // read from ctx so a principal-scoped entry is hidden from an identity that does
 // not match it, keeping the visible list aligned with what the caller can invoke.
 func (p *ManifestPDP) FilterToolsList(ctx context.Context, result json.RawMessage) ListFilterResult {
-	return filterToolsListResult(result, p, jwtClaimsAsMap(ctx), delegationFromContext(ctx), sessionIDFromContext(ctx), CompleteToolListingFromContext(ctx))
+	return filterToolsListResult(result, p, jwtClaimsAsMap(ctx), sessionIDFromContext(ctx), CompleteToolListingFromContext(ctx))
 }
 
 // FilterResourcesList implements ListFilterer for the manifest PDP.
 func (p *ManifestPDP) FilterResourcesList(ctx context.Context, result json.RawMessage) ListFilterResult {
-	return filterResourcesListResult(result, p, jwtClaimsAsMap(ctx), delegationFromContext(ctx))
+	return filterResourcesListResult(result, p, jwtClaimsAsMap(ctx))
 }
 
 // FilterPromptsList implements ListFilterer for the manifest PDP.
 func (p *ManifestPDP) FilterPromptsList(ctx context.Context, result json.RawMessage) ListFilterResult {
-	return filterPromptsListResult(result, p, jwtClaimsAsMap(ctx), delegationFromContext(ctx))
+	return filterPromptsListResult(result, p, jwtClaimsAsMap(ctx))
 }
 
 // emptyListEnvelope holds precomputed fail-closed envelopes keyed by list field
@@ -2404,13 +2374,13 @@ func replaceOrderedListField(envelope json.RawMessage, fieldName string, entries
 // list filter (anyCapCovers), which likewise defer conditions to the call leg; the
 // trade-off is that a resource whose read always denies on a uri allowedValues can
 // still be advertised. Fails closed to an empty list on error.
-func filterResourcesListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims map[string]interface{}, chain *capability.DelegationChain) ListFilterResult {
+func filterResourcesListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims map[string]interface{}) ListFilterResult {
 	// The entry-ambiguity gate, the constraint lookup and the action check live in
 	// keepByManifestEntry, shared with prompts/list; only the id field differs. Here the
 	// smuggled key would be "uri" vs "URI", which decides which resource the host
 	// believes it is reading.
 	return filterListResult(resultBytes, listKeyResources,
-		keepByManifestEntry(mdp, claims, chain, capability.TargetTypeResource, "read", func(raw json.RawMessage) (string, bool) {
+		keepByManifestEntry(mdp, claims, capability.TargetTypeResource, "read", func(raw json.RawMessage) (string, bool) {
 			var entry struct {
 				URI string `json:"uri"`
 			}
@@ -2437,7 +2407,6 @@ func filterResourcesListResult(resultBytes json.RawMessage, mdp *ManifestPDP, cl
 func keepByManifestEntry(
 	mdp *ManifestPDP,
 	claims map[string]interface{},
-	chain *capability.DelegationChain,
 	targetType capability.TargetType,
 	requiredAction string,
 	entryID func(json.RawMessage) (string, bool),
@@ -2448,14 +2417,6 @@ func keepByManifestEntry(
 		}
 		id, ok := entryID(raw)
 		if !ok {
-			return false, ""
-		}
-		// An entry no hop of the caller's delegation chain admits is hidden, for the reason
-		// every other hide-here-and-deny-there rule in this file exists: the call leg will
-		// refuse it, and a catalog advertising an action the caller cannot take is a catalog
-		// the model will spend turns trying to use. Delegation narrows only, so this can
-		// only ever remove entries a wider caller would still see.
-		if permitted, _ := chain.PermitsTarget(string(targetType) + ":" + id); !permitted {
 			return false, ""
 		}
 		c := mdp.findConstraint(EnforceTarget{Type: targetType, Name: id}, claims)
@@ -3429,7 +3390,7 @@ func ToolsKeyAmbiguous(raw json.RawMessage) bool {
 	return toolsKeyAmbiguous(raw)
 }
 
-func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims map[string]interface{}, chain *capability.DelegationChain, sessionID string, completeListing bool) ListFilterResult {
+func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims map[string]interface{}, sessionID string, completeListing bool) ListFilterResult {
 	// Arm the pins over the WHOLE catalog first, then filter. Recording and poisoning
 	// happen here — in the one pass the observe route shares (armPinsFromToolsList) — so
 	// the two routes cannot drift, and so every poison discovered anywhere in the array is
@@ -3488,13 +3449,6 @@ func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims
 		if v.drop {
 			return false, ""
 		}
-		// Hidden when the caller's delegation chain does not reach it, mirroring the call
-		// leg's own delegation gate so the catalog never advertises a tool this delegate
-		// will be refused. Placed before the constraint lookup because it does not need
-		// one: the chain bounds the caller regardless of what the manifest says.
-		if permitted, _ := chain.PermitsTarget("tool:" + v.name); !permitted {
-			return false, ""
-		}
 		c := mdp.findConstraint(EnforceTarget{Type: capability.TargetTypeTool, Name: v.name}, claims)
 
 		// c is nil when the tool is absent from the manifest; guard every dereference
@@ -3535,14 +3489,14 @@ func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims
 // and the JWT list filter (anyCapCovers), which likewise defer conditions to the
 // call leg; the trade-off is that a prompt whose get always denies on a name
 // allowedValues can still be advertised. Fails closed to an empty list on error.
-func filterPromptsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims map[string]interface{}, chain *capability.DelegationChain) ListFilterResult {
+func filterPromptsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims map[string]interface{}) ListFilterResult {
 	// Shares keepByManifestEntry with resources/list, so the entry-ambiguity gate cannot
 	// be present on one flavor and missing on the other: a prompt entry carrying both
 	// "name" and "Name" would otherwise be kept under Go's decoded name while a host
 	// renders the other, and a prompt description reaches the model exactly as a tool
 	// description does. All three list flavors share the FM-5 surface.
 	return filterListResult(resultBytes, listKeyPrompts,
-		keepByManifestEntry(mdp, claims, chain, capability.TargetTypePrompt, "get", func(raw json.RawMessage) (string, bool) {
+		keepByManifestEntry(mdp, claims, capability.TargetTypePrompt, "get", func(raw json.RawMessage) (string, bool) {
 			var entry struct {
 				Name string `json:"name"`
 			}

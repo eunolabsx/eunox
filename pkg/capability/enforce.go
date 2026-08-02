@@ -73,16 +73,6 @@ type EnforceRequest struct {
 	// untyped claim map on the hot path, where a decode slip reads as "no approval"
 	// (harmless) or "some approval" (not).
 	DeclassifyApprovals []DeclassifyApproval `json:"declassifyApprovals,omitempty"`
-	// Delegation carries the attenuation the request's VERIFIED token declared across a
-	// delegation chain (its RFC 8693 `act` actors and its `mcp.delegation` grants), already
-	// decoded, validated, and asserted to narrow at every hop. Nil for every non-delegated
-	// request, which is nearly all of them.
-	//
-	// Like DeclassifyApprovals it is a typed field rather than a lookup into Claims, and for
-	// the same reason: every axis it carries bounds the decision, so re-deriving it from an
-	// untyped claim map on the hot path would put a decode slip between the operator's
-	// narrowing and its enforcement. See delegation.go.
-	Delegation *DelegationChain `json:"delegation,omitempty"`
 }
 
 // EnforceRequestContext carries request attributes used during enforcement.

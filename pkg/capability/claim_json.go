@@ -9,21 +9,20 @@ import (
 	"fmt"
 )
 
-// The claim-borne grants in this package (delegation grants, declassify approvals, actor-chain
-// nodes) are decoded from a token an IdP minted, and every one of them NARROWS something. That
+// The claim-borne grants in this package (declassify approvals today; any later claim that
+// scopes a decision) are decoded from a token an IdP minted, and each NARROWS something. That
 // makes their decoding asymmetric with the manifest's: a manifest that fails to parse is an
 // operator's file and an operator's error, while a grant that parses to something WEAKER than
 // it reads is an invisible loss of a control someone believes is in force.
 //
 // Three JSON shapes produce exactly that, and none of them is caught by decoding into a struct:
 //
-//   - An unknown member. `{"targts":["tool:read"]}` decodes to a grant with NO target
-//     restriction — the widest value the field has.
-//   - An explicit null. `{"targets":null}` decodes to a nil pointer, which this package reads as
-//     "this hop places no target restriction". `{"once":null}` decodes to false, turning a
-//     single-use approval into a standing one. In both cases the author WROTE the key, so
-//     "absent means unrestricted" is not the reading they intended.
-//   - A duplicate key. `{"targets":["tool:read"],"Targets":[]}` is two members; encoding/json
+//   - An unknown member. `{"lables":["pii"]}` decodes to a grant with an EMPTY label set — a
+//     grant that covers nothing while looking like it covers something.
+//   - An explicit null. `{"once":null}` decodes to false, turning a single-use approval into a
+//     standing one — exactly the replay window the flag exists to close. The author WROTE the
+//     key, so "absent means the default" is not the reading they intended.
+//   - A duplicate key. `{"target":"tool:a","Target":"tool:b"}` is two members; encoding/json
 //     matches field names case-insensitively and keeps the LAST, so which of the two takes
 //     effect depends on member order rather than on anything the author can see. That is the
 //     same ambiguity the JSON-RPC envelope and tools/list scans already refuse, for the same
@@ -35,11 +34,10 @@ import (
 // evaporated.
 
 // MaxClaimListEntries bounds how many entries one grant's list-valued member may carry. Like
-// MaxDelegationDepth this is a bound on attacker-influenced input, not hygiene: a chain is
-// validated once but WALKED on every enforced call, and the target index is a map built per hop
-// per token. Two hundred fifty-six is far above any real grant (a delegated sub-agent scoped to
-// more tools than a whole manifest declares is not a narrowing) and far below anything that
-// costs measurable memory.
+// MaxDeclassifyApprovals this is a bound on attacker-influenced input, not hygiene: a claim is
+// decoded once per token but its contents are read on the decision path, and an unbounded list
+// is an unbounded allocation a caller chooses. Two hundred fifty-six is far above any real
+// grant and far below anything that costs measurable memory.
 const MaxClaimListEntries = 256
 
 // claimMember is one key/value pair of a claim object, in source order and WITHOUT the
@@ -85,7 +83,7 @@ func claimObjectMembers(data []byte, context string) ([]claimMember, error) {
 
 // decodeClaimObject decodes one claim-borne grant object into target, refusing the three shapes
 // documented above before the struct decode runs. allowExtra names members that are permitted
-// but not decoded — used only for the actor chain's identity-descriptive members.
+// but not decoded, for a claim shape whose spec allows members this build does not model.
 func decodeClaimObject(data []byte, target any, context string, allowExtra ...string) error {
 	members, err := claimObjectMembers(data, context)
 	if err != nil {
