@@ -17,8 +17,8 @@ import (
 )
 
 // Both built-in backends must satisfy the single mandatory call-counter contract,
-// capability.CallCounter (IncrementAndGet/Peek/IncrementIfBelow/AdmitAll):
-// Peek backs sequenceBlock and IncrementIfBelow/AdmitAll back maxCalls.
+// capability.CallCounter (IncrementAndGet/Peek/AdmitAll): Peek backs sequenceBlock
+// and AdmitAll backs every quota bound, maxCalls included.
 // Pinning it proves in a single assertion that each backend carries every method
 // any built-in condition can require — a built-in backend that dropped one becomes
 // a build failure here instead of an opaque runtime deny, and each line documents
@@ -456,12 +456,12 @@ func TestInMemory_StartCleanup_Idempotent(t *testing.T) {
 // so a post-prune count reads 1 whether or not Cleanup evicted the entry — only
 // the entry's presence in the map distinguishes the fast from the slow interval.)
 
-func TestInMemory_IncrementIfBelow_AdmitsUpToLimit(t *testing.T) {
+func TestInMemory_AdmitCounted_AdmitsUpToLimit(t *testing.T) {
 	counter := callcounter.NewInMemory()
 	ctx := context.Background()
 
 	for i := 1; i <= 3; i++ {
-		count, admitted, retry, err := counter.IncrementIfBelow(ctx, "k", 60, 3)
+		count, admitted, retry, err := admitCounted(ctx, counter, "k", 60, 3)
 		require.NoError(t, err)
 		assert.True(t, admitted, "call %d within the limit must be admitted", i)
 		assert.Equal(t, int64(i), count)
@@ -470,53 +470,53 @@ func TestInMemory_IncrementIfBelow_AdmitsUpToLimit(t *testing.T) {
 
 	// The 4th call is over the limit: denied, the count stays at the limit (no
 	// growth from the denied call), and a positive retryAfter is reported.
-	count, admitted, retry, err := counter.IncrementIfBelow(ctx, "k", 60, 3)
+	count, admitted, retry, err := admitCounted(ctx, counter, "k", 60, 3)
 	require.NoError(t, err)
 	assert.False(t, admitted)
 	assert.Equal(t, int64(3), count, "a denied call must not increment the counter")
 	assert.Greater(t, retry, time.Duration(0), "a denied call should report a retryAfter hint")
 }
 
-func TestInMemory_IncrementIfBelow_RejectsOutOfRangeWindow(t *testing.T) {
+func TestInMemory_AdmitCounted_RejectsOutOfRangeWindow(t *testing.T) {
 	counter := callcounter.NewInMemory()
 	ctx := context.Background()
 
-	_, _, _, err := counter.IncrementIfBelow(ctx, "k", 0, 1)
+	_, _, _, err := admitCounted(ctx, counter, "k", 0, 1)
 	require.Error(t, err, "non-positive window must fail closed")
 
-	_, _, _, err = counter.IncrementIfBelow(ctx, "k", int(callcounter.MaxWindowSeconds)+1, 1)
+	_, _, _, err = admitCounted(ctx, counter, "k", int(callcounter.MaxWindowSeconds)+1, 1)
 	require.Error(t, err, "overflowing window must fail closed")
 }
 
-// TestInMemory_IncrementIfBelow_RejectsNonPositiveLimit verifies that a limit<1
+// TestInMemory_AdmitCounted_RejectsNonPositiveLimit verifies that a limit<1
 // is an unambiguously invalid argument (the "fewer than limit calls" contract is
 // undefined for it), so it must fail closed with an explicit error instead of a
 // silent admitted=false, err=nil denial that reads as an exhausted quota.
-func TestInMemory_IncrementIfBelow_RejectsNonPositiveLimit(t *testing.T) {
+func TestInMemory_AdmitCounted_RejectsNonPositiveLimit(t *testing.T) {
 	counter := callcounter.NewInMemory()
 	ctx := context.Background()
 
 	for _, limit := range []int64{0, -1} {
-		_, admitted, _, err := counter.IncrementIfBelow(ctx, "k", 60, limit)
+		_, admitted, _, err := admitCounted(ctx, counter, "k", 60, limit)
 		require.Errorf(t, err, "limit=%d must fail closed with an error", limit)
 		require.Falsef(t, admitted, "limit=%d must not admit", limit)
 	}
 }
 
-// TestInMemory_IncrementIfBelow_DeniedCallsDoNotExtendLockout is a regression
+// TestInMemory_AdmitCounted_DeniedCallsDoNotExtendLockout is a regression
 // test: a client that keeps retrying after being rate-limited must not push its
 // own recovery further out. Because denied calls add no timestamp, once the
 // original in-window calls age out the limit clears even though the client never
 // stopped retrying. With the pre-fix increment-on-deny, the denied retries would
 // refill the window and the lockout would never lift.
-func TestInMemory_IncrementIfBelow_DeniedCallsDoNotExtendLockout(t *testing.T) {
+func TestInMemory_AdmitCounted_DeniedCallsDoNotExtendLockout(t *testing.T) {
 	clk := &fakeNow{t: time.Unix(1_000_000, 0)}
 	counter := callcounter.NewInMemory(callcounter.WithTimeFunc(clk.now))
 	ctx := context.Background()
 
 	// Fill the window: 2 calls at T=0 with a limit of 2.
 	for i := 0; i < 2; i++ {
-		_, admitted, _, err := counter.IncrementIfBelow(ctx, "k", 60, 2)
+		_, admitted, _, err := admitCounted(ctx, counter, "k", 60, 2)
 		require.NoError(t, err)
 		require.True(t, admitted)
 	}
@@ -526,7 +526,7 @@ func TestInMemory_IncrementIfBelow_DeniedCallsDoNotExtendLockout(t *testing.T) {
 	// limit and the retryAfter hint counts down toward the original calls' expiry.
 	for sec := 1; sec <= 59; sec++ {
 		clk.t = clk.t.Add(time.Second)
-		count, admitted, retry, err := counter.IncrementIfBelow(ctx, "k", 60, 2)
+		count, admitted, retry, err := admitCounted(ctx, counter, "k", 60, 2)
 		require.NoError(t, err)
 		assert.False(t, admitted, "second %d: over-limit call must be denied", sec)
 		assert.Equal(t, int64(2), count, "second %d: denied retries must not grow the counter", sec)
@@ -536,20 +536,20 @@ func TestInMemory_IncrementIfBelow_DeniedCallsDoNotExtendLockout(t *testing.T) {
 	// One tick past the original window: the two T=0 calls have aged out, so a
 	// retry is admitted even though the client never paused.
 	clk.t = clk.t.Add(2 * time.Second) // now T=61
-	count, admitted, _, err := counter.IncrementIfBelow(ctx, "k", 60, 2)
+	count, admitted, _, err := admitCounted(ctx, counter, "k", 60, 2)
 	require.NoError(t, err)
 	assert.True(t, admitted, "after the original window clears, a retry must be admitted")
 	assert.Equal(t, int64(1), count)
 }
 
-// TestInMemory_IncrementIfBelow_RetryAfterWhenCountExceedsLimit is the InMemory
+// TestInMemory_AdmitCounted_RetryAfterWhenCountExceedsLimit is the InMemory
 // half of the cross-backend agreement check: when the in-window count exceeds
 // the limit (as it does after a manifest reload lowers maxCalls.count while
 // earlier, more permissive calls are still in the window), the retryAfter hint
 // must track the entry at rank count-limit, not the oldest. InMemory already
 // does this (valid[cur-limit]); the Redis script is fixed to match. Both
 // backends, given the identical scenario, must report the same 35s.
-func TestInMemory_IncrementIfBelow_RetryAfterWhenCountExceedsLimit(t *testing.T) {
+func TestInMemory_AdmitCounted_RetryAfterWhenCountExceedsLimit(t *testing.T) {
 	base := time.Unix(1_700_000_000, 0)
 	clk := &fakeNow{t: base}
 	counter := callcounter.NewInMemory(callcounter.WithTimeFunc(clk.now))
@@ -564,7 +564,7 @@ func TestInMemory_IncrementIfBelow_RetryAfterWhenCountExceedsLimit(t *testing.T)
 	// then holds timestamps at T=0,10,20,30,40,50, all inside the 60s window.
 	for i := 0; i < 6; i++ {
 		clk.t = base.Add(time.Duration(i*10) * time.Second)
-		_, admitted, _, err := counter.IncrementIfBelow(ctx, key, windowSec, 10)
+		_, admitted, _, err := admitCounted(ctx, counter, key, windowSec, 10)
 		require.NoError(t, err)
 		require.True(t, admitted, "call %d under the permissive limit must be admitted", i)
 	}
@@ -574,7 +574,7 @@ func TestInMemory_IncrementIfBelow_RetryAfterWhenCountExceedsLimit(t *testing.T)
 	// valid[3] (the T=30 entry), which frees a slot one window later at T=90 —
 	// 35s from the T=55 evaluation — not the oldest T=0 entry (which would give 5s).
 	clk.t = base.Add(55 * time.Second)
-	count, admitted, retry, err := counter.IncrementIfBelow(ctx, key, windowSec, 3)
+	count, admitted, retry, err := admitCounted(ctx, counter, key, windowSec, 3)
 	require.NoError(t, err)
 	assert.False(t, admitted, "count 6 over limit 3 must be denied")
 	assert.Equal(t, int64(6), count, "a denied call must not grow the counter")
@@ -582,7 +582,7 @@ func TestInMemory_IncrementIfBelow_RetryAfterWhenCountExceedsLimit(t *testing.T)
 		"retryAfter must track the rank count-limit entry (T=30), not the oldest (T=0)")
 }
 
-// TestInMemory_IncrementIfBelow_CrossWindowPruneIsolated is a regression test:
+// TestInMemory_AdmitCounted_CrossWindowPruneIsolated is a regression test:
 // two maxCalls windows that share one logical key must not share one timestamp
 // slice. The shorter window's prune (which fires the moment its window elapses)
 // previously destroyed timestamps the longer window still counted, undercounting
@@ -592,7 +592,7 @@ func TestInMemory_IncrementIfBelow_RetryAfterWhenCountExceedsLimit(t *testing.T)
 //
 // Mirrors the scenario: a 5/min burst limit and a 10/hour sustained limit on the
 // same key.
-func TestInMemory_IncrementIfBelow_CrossWindowPruneIsolated(t *testing.T) {
+func TestInMemory_AdmitCounted_CrossWindowPruneIsolated(t *testing.T) {
 	t.Parallel()
 
 	base := time.Date(2026, 6, 14, 0, 0, 0, 0, time.UTC)
@@ -611,11 +611,11 @@ func TestInMemory_IncrementIfBelow_CrossWindowPruneIsolated(t *testing.T) {
 	// Minute 1 (T=0): five calls, each checked against BOTH windows — as two
 	// maxCalls conditions on one capability would be. All are admitted.
 	for i := 0; i < 5; i++ {
-		_, admitted, _, err := counter.IncrementIfBelow(ctx, key, shortWin, shortLim)
+		_, admitted, _, err := admitCounted(ctx, counter, key, shortWin, shortLim)
 		require.NoError(t, err)
 		require.True(t, admitted, "minute 1 call %d: short window must admit (under 5)", i)
 
-		_, admitted, _, err = counter.IncrementIfBelow(ctx, key, longWin, longLim)
+		_, admitted, _, err = admitCounted(ctx, counter, key, longWin, longLim)
 		require.NoError(t, err)
 		require.True(t, admitted, "minute 1 call %d: long window must admit (under 10)", i)
 	}
@@ -626,11 +626,11 @@ func TestInMemory_IncrementIfBelow_CrossWindowPruneIsolated(t *testing.T) {
 	// one — count 6, NOT the 1 the shared-slice bug reported after the short
 	// window's prune wiped the history.
 	now = base.Add(61 * time.Second)
-	_, admitted, _, err := counter.IncrementIfBelow(ctx, key, shortWin, shortLim)
+	_, admitted, _, err := admitCounted(ctx, counter, key, shortWin, shortLim)
 	require.NoError(t, err)
 	require.True(t, admitted, "minute 2: short window must re-admit after its window cleared")
 
-	count, admitted, _, err := counter.IncrementIfBelow(ctx, key, longWin, longLim)
+	count, admitted, _, err := admitCounted(ctx, counter, key, longWin, longLim)
 	require.NoError(t, err)
 	require.True(t, admitted, "minute 2: 6th call is still under the hourly limit of 10")
 	assert.Equal(t, int64(6), count,
@@ -639,12 +639,12 @@ func TestInMemory_IncrementIfBelow_CrossWindowPruneIsolated(t *testing.T) {
 	// Drive the hourly window to its limit to confirm the quota is enforced and
 	// was not silently reset: calls 7..10 admit, the 11th is denied.
 	for want := int64(7); want <= 10; want++ {
-		count, admitted, _, err := counter.IncrementIfBelow(ctx, key, longWin, longLim)
+		count, admitted, _, err := admitCounted(ctx, counter, key, longWin, longLim)
 		require.NoError(t, err)
 		require.True(t, admitted, "hourly call to %d must admit", want)
 		assert.Equal(t, want, count, "hourly count must climb monotonically")
 	}
-	_, admitted, _, err = counter.IncrementIfBelow(ctx, key, longWin, longLim)
+	_, admitted, _, err = admitCounted(ctx, counter, key, longWin, longLim)
 	require.NoError(t, err)
 	assert.False(t, admitted, "the 11th hourly call must be denied: the 10/hour quota must hold, not reset")
 }
@@ -738,7 +738,7 @@ func TestInMemory_AdmitAll_AllOrNothing(t *testing.T) {
 	// The hourly bucket (index 0) must NOT have been charged for the denied batch:
 	// a probe that records one call must see count 2 (the one admitted call + this
 	// probe), proving the denied batch left it at 1.
-	probe, ok, _, err := counter.IncrementIfBelow(ctx, "ka", 3600, 100)
+	probe, ok, _, err := admitCounted(ctx, counter, "ka", 3600, 100)
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, int64(2), probe, "the denied batch must not have charged the sibling (hourly) bucket")
@@ -777,7 +777,7 @@ func TestInMemory_AdmitAll_MixedAccounting(t *testing.T) {
 
 	// The counted bucket must be untouched by the denied batch: it holds 2, so a probe
 	// recording one more sees 3.
-	probe, ok, _, err := counter.IncrementIfBelow(ctx, "calls", 3600, 100)
+	probe, ok, _, err := admitCounted(ctx, counter, "calls", 3600, 100)
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, int64(3), probe, "a weighted denial must not charge the counted sibling")
@@ -862,7 +862,7 @@ func TestInMemory_AdmitAll_ValidatesInputs(t *testing.T) {
 	assert.Error(t, err, "a negative weight must error")
 
 	// None of the rejected calls created a bucket: a fresh admit must report count 1.
-	count, ok, _, err := counter.IncrementIfBelow(ctx, "a", 60, 5)
+	count, ok, _, err := admitCounted(ctx, counter, "a", 60, 5)
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, int64(1), count, "a rejected validation must not create a phantom entry")
@@ -908,12 +908,12 @@ func TestInMemory_AdmitAll_AtomicUnderConcurrency(t *testing.T) {
 	assert.Equal(t, 1, admittedCnt, "exactly one concurrent caller may be admitted against a limit of 1")
 }
 
-// TestInMemory_IncrementIfBelow_AtomicUnderConcurrency pins the single-bucket maxCalls
+// TestInMemory_AdmitCounted_AtomicUnderConcurrency pins the single-bucket maxCalls
 // admission bound under concurrency: N racing callers against a limit of L admit exactly
 // L, never more — over-admission would be a maxCalls bypass. The sibling above covers the
 // multi-bucket AdmitAll; this covers the primary single-key maxCalls path. Run
 // under -race to catch a torn read/write of the bucket counter.
-func TestInMemory_IncrementIfBelow_AtomicUnderConcurrency(t *testing.T) {
+func TestInMemory_AdmitCounted_AtomicUnderConcurrency(t *testing.T) {
 	cases := []struct {
 		name  string
 		limit int64
@@ -939,7 +939,7 @@ func TestInMemory_IncrementIfBelow_AtomicUnderConcurrency(t *testing.T) {
 				go func() {
 					defer wg.Done()
 					<-start
-					_, admitted, _, err := counter.IncrementIfBelow(ctx, "k", 60, tc.limit)
+					_, admitted, _, err := admitCounted(ctx, counter, "k", 60, tc.limit)
 					if err == nil && admitted {
 						mu.Lock()
 						admittedCnt++

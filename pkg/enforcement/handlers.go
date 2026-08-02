@@ -1216,8 +1216,8 @@ func toFloat64(v any) (float64, bool) {
 // through. This is intrinsic to two independent requests racing; only per-session
 // serialization could close it, which the engine deliberately does not impose.
 // MCP's per-session request model is serial, so a compliant client never triggers
-// it. Note this is NOT a Redis-atomicity gap that an IncrementIfBelow-style check-
-// and-set could close: the check and the antecedent's recording happen in different
+// it. Note this is NOT a Redis-atomicity gap that a check-and-set admission (the shape
+// AdmitAll uses) could close: the check and the antecedent's recording happen in different
 // requests on different keys, so there is no single key/op to make atomic, and the
 // race is identical under the in-memory and Redis backends. See
 // docs/capability-manifest-guide.md (sequenceBlock).

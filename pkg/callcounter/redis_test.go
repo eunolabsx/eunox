@@ -335,7 +335,7 @@ func TestRedis_IncrementAndGet_ConcurrentCallsNoDuplicate(t *testing.T) {
 		"all concurrent calls must be counted as distinct entries (no nanosecond collision)")
 }
 
-func TestRedis_IncrementIfBelow_AdmitsUpToLimit(t *testing.T) {
+func TestRedis_AdmitCounted_AdmitsUpToLimit(t *testing.T) {
 	mr := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
@@ -344,28 +344,28 @@ func TestRedis_IncrementIfBelow_AdmitsUpToLimit(t *testing.T) {
 	ctx := context.Background()
 
 	for i := 1; i <= 3; i++ {
-		count, admitted, retry, err := counter.IncrementIfBelow(ctx, "k", 60, 3)
+		count, admitted, retry, err := admitCounted(ctx, counter, "k", 60, 3)
 		require.NoError(t, err)
 		assert.True(t, admitted, "call %d within the limit must be admitted", i)
 		assert.Equal(t, int64(i), count)
 		assert.Equal(t, time.Duration(0), retry)
 	}
 
-	count, admitted, retry, err := counter.IncrementIfBelow(ctx, "k", 60, 3)
+	count, admitted, retry, err := admitCounted(ctx, counter, "k", 60, 3)
 	require.NoError(t, err)
 	assert.False(t, admitted)
 	assert.Equal(t, int64(3), count, "a denied call must not add a member")
 	assert.Greater(t, retry, time.Duration(0), "a denied call should report a retryAfter hint")
 }
 
-// TestRedis_IncrementIfBelow_AtomicUnderConcurrency pins the single-bucket maxCalls
+// TestRedis_AdmitCounted_AtomicUnderConcurrency pins the single-bucket maxCalls
 // admission bound on the Redis backend, mirroring the in-memory sibling: N racing
 // callers against a limit of L admit exactly L, never more. This is the PRIMARY maxCalls
 // path, and Redis is the backend where over-admission is most plausible — the
 // check-and-increment spans a network round trip, so it is atomic only because it runs
 // as one server-side script. A regression that split the check from the increment would
 // admit more than L here while every sequential test still passed.
-func TestRedis_IncrementIfBelow_AtomicUnderConcurrency(t *testing.T) {
+func TestRedis_AdmitCounted_AtomicUnderConcurrency(t *testing.T) {
 	cases := []struct {
 		name  string
 		limit int64
@@ -395,7 +395,7 @@ func TestRedis_IncrementIfBelow_AtomicUnderConcurrency(t *testing.T) {
 				go func() {
 					defer wg.Done()
 					<-start
-					_, admitted, _, err := counter.IncrementIfBelow(ctx, "k", 60, tc.limit)
+					_, admitted, _, err := admitCounted(ctx, counter, "k", 60, tc.limit)
 					if err == nil && admitted {
 						mu.Lock()
 						admittedCnt++
@@ -412,7 +412,7 @@ func TestRedis_IncrementIfBelow_AtomicUnderConcurrency(t *testing.T) {
 	}
 }
 
-func TestRedis_IncrementIfBelow_RejectsOutOfRangeWindow(t *testing.T) {
+func TestRedis_AdmitCounted_RejectsOutOfRangeWindow(t *testing.T) {
 	mr := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
@@ -420,18 +420,18 @@ func TestRedis_IncrementIfBelow_RejectsOutOfRangeWindow(t *testing.T) {
 	counter := callcounter.NewRedis(client)
 	ctx := context.Background()
 
-	_, _, _, err := counter.IncrementIfBelow(ctx, "k", 0, 1)
+	_, _, _, err := admitCounted(ctx, counter, "k", 0, 1)
 	require.Error(t, err, "non-positive window must fail closed")
 
-	_, _, _, err = counter.IncrementIfBelow(ctx, "k", int(callcounter.MaxWindowSeconds)+1, 1)
+	_, _, _, err = admitCounted(ctx, counter, "k", int(callcounter.MaxWindowSeconds)+1, 1)
 	require.Error(t, err, "overflowing window must fail closed")
 }
 
-// TestRedis_IncrementIfBelow_RejectsNonPositiveLimit is a Redis-backed regression
+// TestRedis_AdmitCounted_RejectsNonPositiveLimit is a Redis-backed regression
 // test: a limit<1 fails closed with an explicit error before the Lua script runs,
 // rather than letting the script's `if limit < 1` branch return a denial with a
 // nil error. It also writes no member, matching the window guard.
-func TestRedis_IncrementIfBelow_RejectsNonPositiveLimit(t *testing.T) {
+func TestRedis_AdmitCounted_RejectsNonPositiveLimit(t *testing.T) {
 	mr := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
@@ -440,24 +440,24 @@ func TestRedis_IncrementIfBelow_RejectsNonPositiveLimit(t *testing.T) {
 	ctx := context.Background()
 
 	for _, limit := range []int64{0, -1} {
-		_, admitted, _, err := counter.IncrementIfBelow(ctx, "k", 60, limit)
+		_, admitted, _, err := admitCounted(ctx, counter, "k", 60, limit)
 		require.Errorf(t, err, "limit=%d must fail closed with an error", limit)
 		require.Falsef(t, admitted, "limit=%d must not admit", limit)
 	}
 
 	// The rejected calls wrote no state: a subsequent valid call is the first in
 	// its window.
-	count, admitted, _, err := counter.IncrementIfBelow(ctx, "k", 60, 5)
+	count, admitted, _, err := admitCounted(ctx, counter, "k", 60, 5)
 	require.NoError(t, err)
 	require.True(t, admitted, "a valid call after rejected limit<1 calls must be admitted")
 	require.Equal(t, int64(1), count, "rejected limit<1 calls must not have written a member")
 }
 
-// TestRedis_IncrementIfBelow_DeniedCallsDoNotExtendLockout is a Redis-backed
+// TestRedis_AdmitCounted_DeniedCallsDoNotExtendLockout is a Redis-backed
 // regression test: denied retries add no member to the sorted set, so the set
 // does not grow under a retry flood and the window clears on time once the
 // original calls age out (controlled here via the injected clock).
-func TestRedis_IncrementIfBelow_DeniedCallsDoNotExtendLockout(t *testing.T) {
+func TestRedis_AdmitCounted_DeniedCallsDoNotExtendLockout(t *testing.T) {
 	mr := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
@@ -468,7 +468,7 @@ func TestRedis_IncrementIfBelow_DeniedCallsDoNotExtendLockout(t *testing.T) {
 
 	// Fill the window: 2 calls at T=0 with a limit of 2.
 	for i := 0; i < 2; i++ {
-		_, admitted, _, err := counter.IncrementIfBelow(ctx, "k", 60, 2)
+		_, admitted, _, err := admitCounted(ctx, counter, "k", 60, 2)
 		require.NoError(t, err)
 		require.True(t, admitted)
 	}
@@ -478,7 +478,7 @@ func TestRedis_IncrementIfBelow_DeniedCallsDoNotExtendLockout(t *testing.T) {
 	// not grow with the denied retries.
 	for sec := 1; sec <= 59; sec++ {
 		now = now.Add(time.Second)
-		count, admitted, retry, err := counter.IncrementIfBelow(ctx, "k", 60, 2)
+		count, admitted, retry, err := admitCounted(ctx, counter, "k", 60, 2)
 		require.NoError(t, err)
 		assert.False(t, admitted, "second %d: over-limit call must be denied", sec)
 		assert.Equal(t, int64(2), count, "second %d: denied retries must not grow the sorted set", sec)
@@ -488,13 +488,13 @@ func TestRedis_IncrementIfBelow_DeniedCallsDoNotExtendLockout(t *testing.T) {
 	// One tick past the original window: the two T=0 calls fall outside the
 	// score window and are pruned, so a retry is admitted.
 	now = now.Add(2 * time.Second) // T=61
-	count, admitted, _, err := counter.IncrementIfBelow(ctx, "k", 60, 2)
+	count, admitted, _, err := admitCounted(ctx, counter, "k", 60, 2)
 	require.NoError(t, err)
 	assert.True(t, admitted, "after the original window clears, a retry must be admitted")
 	assert.Equal(t, int64(1), count)
 }
 
-// TestRedis_IncrementIfBelow_DeniedCallRefreshesTTL is a regression test: the
+// TestRedis_AdmitCounted_DeniedCallRefreshesTTL is a regression test: the
 // Lua script must refresh the key TTL on the denied path too, not only on
 // admission. Otherwise a key that is continuously at or above limit (never
 // admitted) lets its TTL count down from the last admitted call and can expire
@@ -502,7 +502,7 @@ func TestRedis_IncrementIfBelow_DeniedCallsDoNotExtendLockout(t *testing.T) {
 // We advance Redis's internal TTL clock (FastForward) without advancing the
 // counter's sliding-window clock, so the admitted entry is still logically in the
 // window when the denied call arrives; the denied call must restore the full TTL.
-func TestRedis_IncrementIfBelow_DeniedCallRefreshesTTL(t *testing.T) {
+func TestRedis_AdmitCounted_DeniedCallRefreshesTTL(t *testing.T) {
 	mr := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
@@ -515,7 +515,7 @@ func TestRedis_IncrementIfBelow_DeniedCallRefreshesTTL(t *testing.T) {
 	key := "callcounter:k:60"
 
 	// Admit the single allowed call; this sets the key TTL to 120s.
-	_, admitted, _, err := counter.IncrementIfBelow(ctx, "k", windowSec, 1)
+	_, admitted, _, err := admitCounted(ctx, counter, "k", windowSec, 1)
 	require.NoError(t, err)
 	require.True(t, admitted)
 	require.InDelta(t, (120 * time.Second).Seconds(), mr.TTL(key).Seconds(), 2,
@@ -529,14 +529,14 @@ func TestRedis_IncrementIfBelow_DeniedCallRefreshesTTL(t *testing.T) {
 
 	// A denied call (still at limit, entry still in window) must refresh the TTL
 	// back to the full window so the key does not expire and reset the quota.
-	_, admitted, _, err = counter.IncrementIfBelow(ctx, "k", windowSec, 1)
+	_, admitted, _, err = admitCounted(ctx, counter, "k", windowSec, 1)
 	require.NoError(t, err)
 	require.False(t, admitted, "call at limit must be denied")
 	require.InDelta(t, (120 * time.Second).Seconds(), mr.TTL(key).Seconds(), 2,
 		"denied call must refresh the key TTL to windowSec*2")
 }
 
-// TestRedis_IncrementIfBelow_RetryAfterWhenCountExceedsLimit is a regression
+// TestRedis_AdmitCounted_RetryAfterWhenCountExceedsLimit is a regression
 // test: when the in-window count exceeds the limit (the situation a manifest
 // reload that lowers maxCalls.count creates while earlier, more permissive calls
 // are still in the window), the retryAfter hint must point at the entry whose
@@ -544,7 +544,7 @@ func TestRedis_IncrementIfBelow_DeniedCallRefreshesTTL(t *testing.T) {
 // — not the very oldest entry at rank 0. Rank 0 expires sooner, so the old
 // script underestimated the wait and a well-behaved client would retry early only
 // to be denied again.
-func TestRedis_IncrementIfBelow_RetryAfterWhenCountExceedsLimit(t *testing.T) {
+func TestRedis_AdmitCounted_RetryAfterWhenCountExceedsLimit(t *testing.T) {
 	mr := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
@@ -564,7 +564,7 @@ func TestRedis_IncrementIfBelow_RetryAfterWhenCountExceedsLimit(t *testing.T) {
 	// then holds entries at T=0,10,20,30,40,50 — all inside the 60s window.
 	for i := 0; i < 6; i++ {
 		now = base.Add(time.Duration(i*10) * time.Second)
-		_, admitted, _, err := counter.IncrementIfBelow(ctx, key, windowSec, highLimit)
+		_, admitted, _, err := admitCounted(ctx, counter, key, windowSec, highLimit)
 		require.NoError(t, err)
 		require.True(t, admitted, "call %d under the permissive limit must be admitted", i)
 	}
@@ -576,7 +576,7 @@ func TestRedis_IncrementIfBelow_RetryAfterWhenCountExceedsLimit(t *testing.T) {
 	// below 3 — 35s from the T=55 evaluation. The rank-0 bug would have reported
 	// the T=0 entry's expiry at T=60, i.e. only 5s: far too soon.
 	now = base.Add(55 * time.Second)
-	count, admitted, retry, err := counter.IncrementIfBelow(ctx, key, windowSec, 3)
+	count, admitted, retry, err := admitCounted(ctx, counter, key, windowSec, 3)
 	require.NoError(t, err)
 	assert.False(t, admitted, "count 6 over limit 3 must be denied")
 	assert.Equal(t, int64(6), count, "a denied call must not add a member")
@@ -585,10 +585,10 @@ func TestRedis_IncrementIfBelow_RetryAfterWhenCountExceedsLimit(t *testing.T) {
 }
 
 // TestRedis_ScoreEncoding_ConsistentAcrossMethods pins the score-encoding
-// invariant: IncrementAndGet, IncrementIfBelow, and Peek all encode sorted-set
+// invariant: IncrementAndGet, AdmitAll, and Peek all encode sorted-set
 // scores as integer microseconds, so entries written via one method are seen by
 // the others on the same key and window. Composing IncrementAndGet (which once
-// used float-formatted scores) with IncrementIfBelow (integer scores) on one key
+// used float-formatted scores) with the quota admission (integer scores) on one key
 // must count both entries, and a read-only Peek must agree with both. This guards
 // against a future precision divergence reintroducing the asymmetry.
 func TestRedis_ScoreEncoding_ConsistentAcrossMethods(t *testing.T) {
@@ -609,11 +609,11 @@ func TestRedis_ScoreEncoding_ConsistentAcrossMethods(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(1), n)
 
-	count, admitted, _, err := counter.IncrementIfBelow(ctx, key, windowSec, 5)
+	count, admitted, _, err := admitCounted(ctx, counter, key, windowSec, 5)
 	require.NoError(t, err)
 	require.True(t, admitted)
 	assert.Equal(t, int64(2), count,
-		"IncrementIfBelow must see the IncrementAndGet entry under a uniform score encoding")
+		"the quota admission must see the IncrementAndGet entry under a uniform score encoding")
 
 	got, err := counter.Peek(ctx, key, windowSec)
 	require.NoError(t, err)
@@ -772,33 +772,37 @@ func TestRedis_MultiInstance_SameTick_NoCollision(t *testing.T) {
 		"every increment across instances must be counted; cross-replica members must be unique even at the same UnixNano tick")
 }
 
-// TestParseIncrIfBelowReply is a regression test: the IncrementIfBelow reply
-// decoder must fail closed with a structured error on any element whose type is
-// not the int64 the Lua script promises, rather than silently defaulting to the
-// zero value. A zero retryMicros would otherwise be masked by the maxCalls handler's
+// TestParseAdmitAllReply is a regression test: the AdmitAll reply decoder must fail closed
+// with a structured error on any element whose type is not what the Lua script promises,
+// rather than silently defaulting to the zero value. A zero total would read as an unspent
+// budget and admit; a zero retryMicros would be masked by the maxCalls handler's
 // full-window fallback, leaving the type mismatch undetected.
-func TestParseIncrIfBelowReply(t *testing.T) {
+//
+// The total is a STRING on this reply (a magnitude, routinely fractional, formatted %.17g),
+// so "an integer where a string belongs" is a real shape a Redis-compatible proxy could
+// produce and must be refused rather than read as zero.
+func TestParseAdmitAllReply(t *testing.T) {
 	tests := []struct {
 		name         string
 		res          interface{}
 		wantErr      bool
-		wantCount    int64
 		wantAdmitted bool
+		wantDenied   int
+		wantTotal    float64
 		wantRetry    time.Duration
 	}{
 		{
 			name:         "admitted",
-			res:          []interface{}{int64(1), int64(5), int64(0)},
-			wantCount:    5,
+			res:          []interface{}{int64(1), int64(0), "5", int64(0)},
 			wantAdmitted: true,
-			wantRetry:    0,
+			wantTotal:    5,
 		},
 		{
-			name:         "denied with retry",
-			res:          []interface{}{int64(0), int64(10), int64(2_000_000)},
-			wantCount:    10,
-			wantAdmitted: false,
-			wantRetry:    2 * time.Second,
+			name:       "denied with retry, 1-based index converted",
+			res:        []interface{}{int64(0), int64(2), "1250.5", int64(2_000_000)},
+			wantDenied: 1,
+			wantTotal:  1250.5,
+			wantRetry:  2 * time.Second,
 		},
 		{
 			name:    "not an array",
@@ -807,33 +811,43 @@ func TestParseIncrIfBelowReply(t *testing.T) {
 		},
 		{
 			name:    "wrong length",
-			res:     []interface{}{int64(1), int64(5)},
+			res:     []interface{}{int64(1), int64(0), "5"},
 			wantErr: true,
 		},
 		{
 			name:    "admitted wrong type",
-			res:     []interface{}{"1", int64(5), int64(0)},
+			res:     []interface{}{"1", int64(0), "5", int64(0)},
 			wantErr: true,
 		},
 		{
-			name:    "count wrong type",
-			res:     []interface{}{int64(1), "5", int64(0)},
+			name:    "deniedIndex wrong type",
+			res:     []interface{}{int64(0), "2", "5", int64(0)},
+			wantErr: true,
+		},
+		{
+			name:    "total wrong type (integer, not the %.17g string)",
+			res:     []interface{}{int64(1), int64(0), int64(5), int64(0)},
+			wantErr: true,
+		},
+		{
+			name:    "total unparseable",
+			res:     []interface{}{int64(1), int64(0), "not a number", int64(0)},
 			wantErr: true,
 		},
 		{
 			name:    "retryMicros wrong type (bulk string)",
-			res:     []interface{}{int64(0), int64(10), "2000000"},
+			res:     []interface{}{int64(0), int64(1), "10", "2000000"},
 			wantErr: true,
 		},
 		{
 			name:    "retryMicros wrong type (float)",
-			res:     []interface{}{int64(0), int64(10), float64(2_000_000)},
+			res:     []interface{}{int64(0), int64(1), "10", float64(2_000_000)},
 			wantErr: true,
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			count, admitted, retry, err := callcounter.ParseIncrIfBelowReply(tc.res)
+			admitted, denied, total, retry, err := callcounter.ParseAdmitAllReply(tc.res)
 			if tc.wantErr {
 				require.Error(t, err)
 				// Fail closed: a decode error must not report an admission.
@@ -841,8 +855,9 @@ func TestParseIncrIfBelowReply(t *testing.T) {
 				return
 			}
 			require.NoError(t, err)
-			assert.Equal(t, tc.wantCount, count)
 			assert.Equal(t, tc.wantAdmitted, admitted)
+			assert.Equal(t, tc.wantDenied, denied)
+			assert.InDelta(t, tc.wantTotal, total, 1e-9)
 			assert.Equal(t, tc.wantRetry, retry)
 		})
 	}
@@ -960,7 +975,7 @@ func TestRedis_AdmitAll_AllOrNothing(t *testing.T) {
 	assert.Greater(t, retry, time.Duration(0))
 
 	// The sibling (hourly) bucket must not have been charged for the denied batch.
-	probe, ok, _, err := counter.IncrementIfBelow(ctx, "ka", 3600, 100)
+	probe, ok, _, err := admitCounted(ctx, counter, "ka", 3600, 100)
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, int64(2), probe, "the denied batch must not have charged the sibling bucket")
@@ -997,7 +1012,7 @@ func TestRedis_AdmitAll_MixedAccounting(t *testing.T) {
 	assert.Equal(t, 1, deniedIndex, "the weighted bucket (index 1) is the blocker")
 	assert.Equal(t, float64(80), total, "the reported total is the weighted bucket's in-window sum")
 
-	probe, ok, _, err := counter.IncrementIfBelow(ctx, "calls", 3600, 100)
+	probe, ok, _, err := admitCounted(ctx, counter, "calls", 3600, 100)
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, int64(3), probe, "a weighted denial must not charge the counted sibling")
@@ -1051,7 +1066,7 @@ func TestAdmitAll_DuplicateBucketsFailClosed_BothBackends(t *testing.T) {
 			assert.False(t, admitted, "nothing is admitted on the error path")
 			assert.Contains(t, err.Error(), "duplicate")
 			// Nothing was recorded: a fresh single-bucket probe of the same key sees count 1.
-			count, ok, _, perr := tc.counter.IncrementIfBelow(ctx, "k", 60, 100)
+			count, ok, _, perr := admitCounted(ctx, tc.counter, "k", 60, 100)
 			require.NoError(t, perr)
 			require.True(t, ok)
 			assert.Equal(t, int64(1), count, "the rejected batch must not have recorded any call")

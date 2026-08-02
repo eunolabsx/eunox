@@ -18,9 +18,9 @@ import (
 )
 
 // Redis is a Redis-backed call counter. Unconditional increments (IncrementAndGet)
-// run as an atomic MULTI/EXEC transaction; the check-and-record limiter paths
-// (IncrementIfBelow, IncrementIfAllBelow) run as atomic Lua scripts so the count and
-// conditional add cannot race. Every path stamps a per-key TTL (windowSec *
+// run as an atomic MULTI/EXEC transaction; the check-and-record quota admission
+// (AdmitAll) runs as an atomic Lua script so the totals and the conditional adds cannot
+// race — across every bucket of a batch, not just within one. Every path stamps a per-key TTL (windowSec *
 // cleanupMarginFactor) so idle counters are reclaimed without a separate sweep.
 type Redis struct {
 	client redis.Cmdable
@@ -166,129 +166,6 @@ func (r *Redis) IncrementAndGet(ctx context.Context, key string, windowSec, maxE
 	return countCmd.Val(), nil
 }
 
-// incrIfBelowScript atomically records a call only when the in-window count is
-// below limit. Running prune, count, conditional add, and TTL as one Lua script
-// makes check-and-record atomic across replicas, so a denied call adds no member
-// and the set never grows from retries (a separate ZCOUNT-then-ZADD would leave a
-// TOCTOU gap).
-//
-//	KEYS[1] sorted-set key
-//	ARGV[1] cutoff (microseconds; members with score <= cutoff are expired)
-//	ARGV[2] now (microseconds; score for the new member)
-//	ARGV[3] member
-//	ARGV[4] limit
-//	ARGV[5] TTL (seconds)
-//	ARGV[6] window (microseconds; for the retryAfter estimate)
-//
-// Reply: {admitted (1|0), count, retryAfterMicros}.
-//
-// The retryAfter estimate uses the entry at rank (count - limit), not rank 0: a
-// slot frees only once enough of the oldest entries expire to drop below limit, and
-// the last of those is the (count-limit)-th oldest. Rank 0 is correct only when
-// count == limit; when a manifest reload lowered the limit, count > limit and rank 0
-// underestimates. Matches InMemory's valid[cur-limit].
-//
-// Timestamps MUST be MICROSECONDS, never nanoseconds: Lua numbers are float64, exact
-// only to 2^53. UnixMicro (~1.75e15) and the retry-math sum stay inside that range; a
-// UnixNano value (~1.75e18) would lose precision and yield a wrong retryAfter.
-var incrIfBelowScript = redis.NewScript(`
-redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
-local count = redis.call('ZCARD', KEYS[1])
-local limit = tonumber(ARGV[4])
-if limit < 1 or count >= limit then
-  -- Refresh the TTL on the denied path too: a key constantly at/above limit is
-  -- never admitted, so its TTL would count down from the last admit and the key
-  -- could expire mid-window, silently resetting the quota. Gate on EXISTS (not
-  -- count>0) so the invariant is "refresh whenever present, never re-create an
-  -- absent key", correct for the limit<1 branch without relying on zset auto-delete.
-  if redis.call('EXISTS', KEYS[1]) == 1 then
-    redis.call('EXPIRE', KEYS[1], ARGV[5])
-  end
-  local retry = 0
-  if limit >= 1 then
-    local idx = count - limit
-    local pivot = redis.call('ZRANGE', KEYS[1], idx, idx, 'WITHSCORES')
-    if pivot[2] then
-      retry = (tonumber(pivot[2]) + tonumber(ARGV[6])) - tonumber(ARGV[2])
-      if retry < 0 then retry = 0 end
-    end
-  end
-  return {0, count, retry}
-end
-redis.call('ZADD', KEYS[1], ARGV[2], ARGV[3])
-redis.call('EXPIRE', KEYS[1], ARGV[5])
-return {1, count + 1, 0}
-`)
-
-// IncrementIfBelow records a call for key only when the in-window count is
-// strictly below limit, evaluating check and record in one atomic Lua script (see
-// incrIfBelowScript). It is the rate-limiting counterpart of IncrementAndGet that
-// maxCalls uses; an over-limit call adds no member.
-//
-// It returns the resulting in-window count (post-record when admitted, current
-// otherwise), whether admitted, and — when rejected — how long until a slot frees
-// (the entry at rank count-limit, see incrIfBelowScript).
-func (r *Redis) IncrementIfBelow(ctx context.Context, key string, windowSec int, limit int64) (count int64, admitted bool, retryAfter time.Duration, err error) {
-	// Reject an out-of-range window before computing the TTL: an overflowing window
-	// wraps the TTL non-positive, expiring the key immediately and resetting the
-	// quota (as in IncrementAndGet).
-	if err := checkWindowSec(windowSec); err != nil {
-		return 0, false, 0, err
-	}
-	// Reject a non-positive limit: the script's `if limit < 1` branch would deny with
-	// a nil error, making a misconfigured limit indistinguishable from an exhausted
-	// quota.
-	if err := checkLimit(limit); err != nil {
-		return 0, false, 0, err
-	}
-
-	now := r.now()
-	windowKey := redisWindowKey(key, windowSec)
-	// Integer microseconds for score and cutoff, matching IncrementAndGet and Peek so
-	// the encoding is uniform across all three methods (exact within float64's 2^53
-	// range).
-	nowMicros := now.UnixMicro()
-	cutoff := now.Add(-time.Duration(windowSec) * time.Second).UnixMicro()
-	windowMicros := int64(windowSec) * 1_000_000
-	ttlSec := int64(windowSec) * cleanupMarginFactor
-	member := r.newMember(now)
-
-	res, runErr := incrIfBelowScript.Run(ctx, r.client, []string{windowKey},
-		cutoff, nowMicros, member, limit, ttlSec, windowMicros).Result()
-	if runErr != nil {
-		return 0, false, 0, fmt.Errorf("redis eval: %w", runErr)
-	}
-
-	return parseIncrIfBelowReply(res)
-}
-
-// parseIncrIfBelowReply decodes the {admitted, count, retryAfterMicros} array the
-// incrIfBelowScript returns (three Redis integers → int64). Each element is checked
-// so a changed encoding (go-redis upgrade, a Valkey/KeyDB proxy, a test mock
-// returning a string/float) fails closed with a structured error rather than
-// defaulting to the int64 zero value, which would silently report no in-window
-// calls and a bogus retryAfter the full-window fallback masks.
-func parseIncrIfBelowReply(res interface{}) (count int64, admitted bool, retryAfter time.Duration, err error) {
-	arr, ok := res.([]interface{})
-	if !ok || len(arr) != 3 {
-		return 0, false, 0, fmt.Errorf("redis eval: unexpected reply %T", res)
-	}
-	admittedRaw, ok := arr[0].(int64)
-	if !ok {
-		return 0, false, 0, fmt.Errorf("redis eval: unexpected admitted type %T (value %v)", arr[0], arr[0])
-	}
-	cnt, ok := arr[1].(int64)
-	if !ok {
-		return 0, false, 0, fmt.Errorf("redis eval: unexpected count type %T (value %v)", arr[1], arr[1])
-	}
-	retryMicros, ok := arr[2].(int64)
-	if !ok {
-		return 0, false, 0, fmt.Errorf("redis eval: unexpected retryMicros type %T (value %v)", arr[2], arr[2])
-	}
-
-	return cnt, admittedRaw == 1, time.Duration(retryMicros) * time.Microsecond, nil
-}
-
 // admitAllScript is the multi-bucket admission: it prunes and totals every bucket under
 // that bucket's OWN accounting, and ZADDs a member into all of them only if EVERY bucket
 // has headroom — otherwise records nothing and reports the first blocking bucket.
@@ -305,9 +182,11 @@ func parseIncrIfBelowReply(res interface{}) (count int64, admitted bool, retryAf
 //
 // Reply: {admitted (1|0), deniedIndex (1-based; 0 when admitted), total (string), retryAfterMicros}.
 //
-// The total is a STRING for the same reason AddIfTotalBelow's is: it is a magnitude,
-// routinely fractional, and %.17g round-trips a float64 exactly where Redis integer replies
-// and Lua's own tostring would not. Timestamps are MICROSECONDS throughout: Lua numbers are
+// The total is a STRING, not a Redis integer: it is a magnitude, routinely fractional (a
+// currency amount), and %.17g round-trips a float64 exactly where Redis integer replies
+// truncate and Lua's own tostring (%.14g) would silently round a total in the upper range
+// of what MaxWeightedTotal admits — turning an exact budget into an approximate one at
+// exactly the magnitudes where the bound matters most. Timestamps are MICROSECONDS throughout: Lua numbers are
 // float64, exact only to 2^53.
 var admitAllScript = redis.NewScript(`
 local now = tonumber(ARGV[1])
@@ -454,8 +333,9 @@ func (r *Redis) AdmitAll(ctx context.Context, buckets []capability.QuotaBucket) 
 
 // parseAdmitAllReply decodes the {admitted, deniedIndex, total, retryAfterMicros} array
 // admitAllScript returns, converting the script's 1-based deniedIndex to a 0-based slice
-// index. Each element is type-checked so a changed encoding fails closed with a structured
-// error rather than defaulting to a zero value (mirroring parseIncrIfBelowReply).
+// index. Each element is type-checked so a changed encoding (a go-redis upgrade, a
+// Redis-compatible proxy, a mock) fails closed with a structured error rather than
+// defaulting to a zero value — a zero total would read as an unspent budget and admit.
 func parseAdmitAllReply(res interface{}) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error) {
 	arr, ok := res.([]interface{})
 	if !ok || len(arr) != 4 {
@@ -494,9 +374,9 @@ func parseAdmitAllReply(res interface{}) (admitted bool, deniedIndex int, total 
 // are the same element.
 //
 // The separator is a byte the uniqueness prefix cannot contain: newMember emits only hex,
-// digits, and '-'. A member WITHOUT it is a plain counted call and reads as weight 1,
-// which is what lets a key written by IncrementIfBelow be summed by AddIfTotalBelow
-// without a migration — the sense in which the weighted total generalizes the count.
+// digits, and '-'. A member WITHOUT it is a plain counted call and reads as weight 1, which
+// is what lets a key a counted bucket wrote be summed by a weighted one without a
+// migration — the sense in which the weighted total generalizes the count.
 const weightMemberSep = "|"
 
 // newWeightedMember builds a sorted-set member carrying both the per-instance uniqueness
@@ -505,164 +385,6 @@ const weightMemberSep = "|"
 // script is bit-identical to the one this process admitted.
 func (r *Redis) newWeightedMember(now time.Time, weight float64) string {
 	return r.newMember(now) + weightMemberSep + strconv.FormatFloat(weight, 'g', -1, 64)
-}
-
-// addIfTotalBelowScript atomically adds weight to a key's in-window WEIGHTED TOTAL only
-// when the resulting total would not exceed the limit. Running prune, sum, compare,
-// conditional add, and TTL as one script makes check-and-record atomic across replicas, so
-// a denied call adds no member and a burst of refusals cannot extend its own lockout.
-//
-//	KEYS[1] sorted-set key
-//	ARGV[1] cutoff (microseconds; members with score <= cutoff are expired)
-//	ARGV[2] now (microseconds; score for the new member)
-//	ARGV[3] member (uniqueness prefix, separator, weight)
-//	ARGV[4] weight
-//	ARGV[5] limit
-//	ARGV[6] TTL (seconds)
-//	ARGV[7] window (microseconds; for the retryAfter estimate)
-//
-// Reply: {admitted (1|0), total (string), retryAfterMicros}.
-//
-// The total is returned as a STRING, not a Redis integer: it is a magnitude, routinely
-// fractional (a currency amount), and Redis integer replies truncate. It is formatted with
-// %.17g rather than Lua's tostring, which uses %.14g and would silently round a total in
-// the upper range of what MaxWeightedTotal admits — turning an exact budget into an
-// approximate one at exactly the magnitudes where the bound matters most. The Go side
-// parses it back with the same float64 parse the script used, so the value the caller
-// compares is the value the script compared.
-//
-// The retryAfter estimate walks oldest-first accumulating the weight each expiry frees,
-// and reports when the entry that crosses the shortfall leaves the window — the weighted
-// analogue of incrIfBelowScript's rank-(count-limit) pivot. Timestamps are MICROSECONDS
-// for the same reason as there: Lua numbers are float64, exact only to 2^53.
-var addIfTotalBelowScript = redis.NewScript(`
-redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
-local entries = redis.call('ZRANGE', KEYS[1], 0, -1, 'WITHSCORES')
-local weight = tonumber(ARGV[4])
-local limit = tonumber(ARGV[5])
-local total = 0
-for i = 1, #entries, 2 do
-  local m = entries[i]
-  local sep = string.find(m, '|', 1, true)
-  local ew = 1
-  if sep then
-    ew = tonumber(string.sub(m, sep + 1)) or 1
-  end
-  total = total + ew
-end
-if total + weight == total then
-  -- A weight that cannot move the total is admitted but NOT recorded, matching the
-  -- in-memory backend: zero (and any weight too small to register in double precision) is
-  -- otherwise admitted forever and grows the sorted set without bound, making every later
-  -- call re-scan it. It can never affect a future total, so there is nothing to record.
-  if redis.call('EXISTS', KEYS[1]) == 1 then
-    redis.call('EXPIRE', KEYS[1], ARGV[6])
-  end
-  return {1, string.format('%.17g', total), 0}
-end
-if total + weight > limit then
-  -- Refresh the TTL on the denied path too: a key held at its bound is never admitted, so
-  -- its TTL would count down from the last admit and the key could expire mid-window,
-  -- silently resetting the budget. Gate on EXISTS so the invariant is "refresh whenever
-  -- present, never re-create an absent key".
-  if redis.call('EXISTS', KEYS[1]) == 1 then
-    redis.call('EXPIRE', KEYS[1], ARGV[6])
-  end
-  -- The retry estimate re-walks the entries array (already in memory, member and score
-  -- interleaved) rather than the script building two parallel tables of size n on EVERY
-  -- call to serve a branch only the deny path reaches. On the admit path — the common one
-  -- — that was 2n wasted table stores per call inside Redis's single-threaded execution,
-  -- growing with the window.
-  local needed = (total + weight) - limit
-  local retry = 0
-  local freed = 0
-  for i = 1, #entries, 2 do
-    local m = entries[i]
-    local sep = string.find(m, '|', 1, true)
-    local ew = 1
-    if sep then
-      ew = tonumber(string.sub(m, sep + 1)) or 1
-    end
-    freed = freed + ew
-    if freed >= needed then
-      retry = (tonumber(entries[i + 1]) + tonumber(ARGV[7])) - tonumber(ARGV[2])
-      if retry < 0 then retry = 0 end
-      break
-    end
-  end
-  return {0, string.format('%.17g', total), retry}
-end
-redis.call('ZADD', KEYS[1], ARGV[2], ARGV[3])
-redis.call('EXPIRE', KEYS[1], ARGV[6])
-return {1, string.format('%.17g', total + weight), 0}
-`)
-
-// AddIfTotalBelow adds weight to the key's in-window weighted total only when the
-// resulting total would not exceed limit, evaluating check and record in one atomic Lua
-// script (see addIfTotalBelowScript). It is the weighted counterpart of IncrementIfBelow
-// that the cumulative blastRadius bound uses; an over-limit call adds no member.
-//
-// Cost note: unlike the counting paths, which answer with an O(1) ZCARD, this sums the
-// per-member weights and is therefore O(n) in the window's entry count. That asymmetry is
-// why maxCalls keeps its own primitive rather than riding this one.
-func (r *Redis) AddIfTotalBelow(ctx context.Context, key string, windowSec int, weight, limit float64) (total float64, admitted bool, retryAfter time.Duration, err error) {
-	if err := checkWindowSec(windowSec); err != nil {
-		return 0, false, 0, err
-	}
-	// Reject a malformed weight or bound before the round trip: the script's
-	// `total + weight > limit` branch would otherwise deny with a nil error, making a
-	// misconfiguration indistinguishable from an exhausted budget (and a NaN weight would
-	// make that comparison false forever — the fail-OPEN direction).
-	if err := checkWeight(weight); err != nil {
-		return 0, false, 0, err
-	}
-	if err := checkTotalLimit(limit); err != nil {
-		return 0, false, 0, err
-	}
-
-	now := r.now()
-	windowKey := redisWindowKey(key, windowSec)
-	nowMicros := now.UnixMicro()
-	cutoff := now.Add(-time.Duration(windowSec) * time.Second).UnixMicro()
-	windowMicros := int64(windowSec) * 1_000_000
-	ttlSec := int64(windowSec) * cleanupMarginFactor
-	member := r.newWeightedMember(now, weight)
-
-	res, runErr := addIfTotalBelowScript.Run(ctx, r.client, []string{windowKey},
-		cutoff, nowMicros, member, weight, limit, ttlSec, windowMicros).Result()
-	if runErr != nil {
-		return 0, false, 0, fmt.Errorf("redis eval: %w", runErr)
-	}
-	return parseAddIfTotalBelowReply(res)
-}
-
-// parseAddIfTotalBelowReply decodes the {admitted, total, retryAfterMicros} array
-// addIfTotalBelowScript returns. Each element is type-checked so a changed encoding (a
-// go-redis upgrade, a Valkey/KeyDB proxy, a test mock) fails closed with a structured
-// error rather than defaulting to a zero value, which would report an empty budget and
-// admit — mirroring parseIncrIfBelowReply.
-func parseAddIfTotalBelowReply(res interface{}) (total float64, admitted bool, retryAfter time.Duration, err error) {
-	arr, ok := res.([]interface{})
-	if !ok || len(arr) != 3 {
-		return 0, false, 0, fmt.Errorf("redis eval: unexpected reply %T", res)
-	}
-	admittedRaw, ok := arr[0].(int64)
-	if !ok {
-		return 0, false, 0, fmt.Errorf("redis eval: unexpected admitted type %T (value %v)", arr[0], arr[0])
-	}
-	totalRaw, ok := arr[1].(string)
-	if !ok {
-		return 0, false, 0, fmt.Errorf("redis eval: unexpected total type %T (value %v)", arr[1], arr[1])
-	}
-	total, parseErr := strconv.ParseFloat(totalRaw, 64)
-	if parseErr != nil {
-		return 0, false, 0, fmt.Errorf("redis eval: unparseable total %q: %w", totalRaw, parseErr)
-	}
-	retryMicros, ok := arr[2].(int64)
-	if !ok {
-		return 0, false, 0, fmt.Errorf("redis eval: unexpected retryMicros type %T (value %v)", arr[2], arr[2])
-	}
-	return total, admittedRaw == 1, time.Duration(retryMicros) * time.Microsecond, nil
 }
 
 // Peek returns the number of entries recorded for key within the window WITHOUT

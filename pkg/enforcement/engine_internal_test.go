@@ -115,7 +115,7 @@ func TestCompositeCounterKey_PrefixPreserved(t *testing.T) {
 }
 
 // keyCapturingCounter records the bucket the maxCalls handler hands the rate limiter.
-// Peek/IncrementIfBelow are stubs: the commit path is AdmitAll, which is what this
+// Peek is a stub: the commit path is AdmitAll, which is what this
 // test inspects.
 type keyCapturingCounter struct {
 	gotKey       string
@@ -124,10 +124,6 @@ type keyCapturingCounter struct {
 
 func (c *keyCapturingCounter) IncrementAndGet(_ context.Context, _ string, _, _ int) (int64, error) {
 	return 1, nil
-}
-
-func (c *keyCapturingCounter) IncrementIfBelow(_ context.Context, _ string, _ int, _ int64) (count int64, admitted bool, retryAfter time.Duration, err error) {
-	return 1, true, 0, nil
 }
 
 func (c *keyCapturingCounter) Peek(_ context.Context, _ string, _ int) (int64, error) {
@@ -329,9 +325,6 @@ func (forceDenyAtIndexZeroCounter) IncrementAndGet(_ context.Context, _ string, 
 func (forceDenyAtIndexZeroCounter) Peek(_ context.Context, _ string, _ int) (int64, error) {
 	return 0, nil
 }
-func (forceDenyAtIndexZeroCounter) IncrementIfBelow(_ context.Context, _ string, _ int, _ int64) (count int64, admitted bool, retryAfter time.Duration, err error) {
-	return 0, true, 0, nil
-}
 func (forceDenyAtIndexZeroCounter) AdmitAll(_ context.Context, _ []capability.QuotaBucket) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error) {
 	return false, 0, 5, 0, nil
 }
@@ -398,7 +391,7 @@ func (h *nilCounterCommitHandler) PrepareCommit(_ context.Context, cond capabili
 
 // TestCommitDeferredAtomic_NilCounterFailsClosed pins that the atomic
 // multi-deferred commit path fails closed with a structured CONDITION_FAILED deny —
-// not a nil-pointer panic on e.counter.IncrementIfAllBelow — when a custom
+// not a nil-pointer panic on e.counter.AdmitAll — when a custom
 // committing handler is registered on an engine built without WithCallCounter. The
 // built-in maxCalls funnels through maxCallsBucket (whose nil guard surfaces earlier
 // as a PrepareCommit condErr), so a custom handler that skips that guard is the only
@@ -685,7 +678,7 @@ func TestRecordSessionCall_TargetNameKeyedVerbatim(t *testing.T) {
 	}
 }
 
-// recordFaultCounter admits maxCalls (IncrementIfBelow) but fails the
+// recordFaultCounter admits maxCalls (AdmitAll) but fails the
 // sequenceBlock-antecedent write (IncrementAndGet), reproducing the counter-fault
 // the RecordSessionCall deny path is reachable through.
 type recordFaultCounter struct {
@@ -695,9 +688,6 @@ type recordFaultCounter struct {
 func (c *recordFaultCounter) IncrementAndGet(_ context.Context, _ string, _, _ int) (int64, error) {
 	c.incrementAndGetCalls++
 	return 0, errors.New("counter backend fault")
-}
-func (c *recordFaultCounter) IncrementIfBelow(_ context.Context, _ string, _ int, _ int64) (count int64, admitted bool, retryAfter time.Duration, err error) {
-	return 1, true, 0, nil // admit: maxCalls passes and commits a slot
 }
 func (c *recordFaultCounter) Peek(_ context.Context, _ string, _ int) (int64, error) { return 0, nil }
 func (c *recordFaultCounter) AdmitAll(_ context.Context, _ []capability.QuotaBucket) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error) {
@@ -1204,25 +1194,4 @@ func TestExactRat_BoundsTheParse(t *testing.T) {
 			}
 		})
 	}
-}
-
-// AddIfTotalBelow satisfies the weighted half of capability.CallCounter. This double
-// exercises the counting paths only, so a weighted add admits without recording: nothing
-// under test reads a weighted total from it.
-func (*keyCapturingCounter) AddIfTotalBelow(_ context.Context, _ string, _ int, weight, _ float64) (total float64, admitted bool, retryAfter time.Duration, err error) {
-	return weight, true, 0, nil
-}
-
-// AddIfTotalBelow satisfies the weighted half of capability.CallCounter. This double
-// exercises the counting paths only, so a weighted add admits without recording: nothing
-// under test reads a weighted total from it.
-func (*recordFaultCounter) AddIfTotalBelow(_ context.Context, _ string, _ int, weight, _ float64) (total float64, admitted bool, retryAfter time.Duration, err error) {
-	return weight, true, 0, nil
-}
-
-// AddIfTotalBelow satisfies the weighted half of capability.CallCounter. This double
-// exercises the counting paths only, so a weighted add admits without recording: nothing
-// under test reads a weighted total from it.
-func (forceDenyAtIndexZeroCounter) AddIfTotalBelow(_ context.Context, _ string, _ int, weight, _ float64) (total float64, admitted bool, retryAfter time.Duration, err error) {
-	return weight, true, 0, nil
 }
