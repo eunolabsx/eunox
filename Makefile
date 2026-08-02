@@ -17,7 +17,7 @@ IMAGE_REPO    ?= ghcr.io/eunolabs/eunox
 DOCKERFILE_MCP     := deploy/docker/Dockerfile.mcp
 DOCKERFILE_MCP_WIN := deploy/docker/Dockerfile.mcp.windows
 
-.PHONY: all build test lint clean coverage check-license check-notice check-fmt fmt vet \
+.PHONY: all build test lint print-lint-version clean coverage check-license check-notice check-fmt fmt vet \
         check-go-version check-cross-compile mcpb \
         docker-build-mcp docker-build-mcp-multi docker-push-mcp
 
@@ -47,15 +47,21 @@ coverage:
 	@echo "---"
 	@echo "Coverage report: coverage.out"
 
-## Run linter
+## Run linter — the version CI pins, whatever is on PATH.
+##
+## Delegates to scripts/golangci-lint.sh, which accepts a candidate binary only when it is
+## EXACTLY $(GOLANGCI_LINT_VERSION) and was built with a Go at least as new as go.mod
+## targets, and installs that version itself otherwise. Installing only "if missing" left
+## whatever was on PATH in charge: a golangci-lint built with an older toolchain refuses to
+## lint at all, which reads as "unavailable here" while CI fails on findings no local run
+## could surface. See the script header.
 lint: vet
-	@GOLANGCI_LINT=$$(command -v golangci-lint 2>/dev/null || true); \
-	if [ -z "$$GOLANGCI_LINT" ]; then \
-		echo "Installing golangci-lint..."; \
-		$(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION); \
-		GOLANGCI_LINT="$$($(GO) env GOPATH)/bin/golangci-lint"; \
-	fi; \
-	"$$GOLANGCI_LINT" run ./...
+	@GOLANGCI_LINT_VERSION=$(GOLANGCI_LINT_VERSION) GO=$(GO) ./scripts/golangci-lint.sh ./...
+
+## Print the pinned golangci-lint version. This is the single source of the pin: CI's Lint
+## job reads it from here rather than restating it, so the local and CI linters cannot drift.
+print-lint-version:
+	@echo $(GOLANGCI_LINT_VERSION)
 
 ## Run go vet
 vet:

@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 make build           # → bin/eunox
 make test            # go test -race -count=1 ./...
-make lint            # go vet + golangci-lint (installs golangci-lint if missing)
+make lint            # go vet + golangci-lint at CI's pinned version (installs it when PATH has another)
 make fmt             # gofmt -w every .go file
 make check-fmt       # gofmt-clean check on every .go file (CI-enforced); fix with `make fmt`
 make check-license   # Apache-2.0 SPDX header on every .go file (CI-enforced)

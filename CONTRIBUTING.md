@@ -72,14 +72,18 @@ cd eunox
 
 make build           # → bin/eunox
 make test            # go test -race ./...
-make lint            # go vet + golangci-lint
+make lint            # go vet + golangci-lint (pinned to CI's version)
 make check-license   # Apache-2.0 header on every .go file
 make check-notice    # NOTICE matches the binary's third-party modules
 make coverage        # write coverage.out
 ```
 
-Full prerequisites (Go 1.26.5+, golangci-lint v2.12+, Docker) and the
-repository layout are in [`docs/repo-guide.md`](./docs/repo-guide.md).
+`make lint` runs the exact golangci-lint version CI does, installing it when no
+matching binary is on `PATH` — a different version already installed is ignored, not
+used, so a local run and a CI run cannot disagree.
+
+Full prerequisites (Go 1.26.5+, Docker) and the repository layout are in
+[`docs/repo-guide.md`](./docs/repo-guide.md).
 
 The end-to-end demo lives under [`demo/`](./demo/) — `make -C demo up` is the
 fastest way to exercise a real proxy with a mock upstream and verify a

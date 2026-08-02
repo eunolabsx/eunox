@@ -6,6 +6,19 @@ version: "2"
 run:
   timeout: 5m
 
+# Report every finding. golangci-lint defaults to max-same-issues: 3 and
+# max-issues-per-linter: 50, which TRUNCATES output rather than summarizing it: a run
+# reporting three hits of one linter can be hiding a fourth, so a green run after fixing
+# those three still leaves the same defect elsewhere in the tree -- and the fix/push/fail
+# loop repeats once per hidden batch. (Observed: four rounds of fix-and-rerun to reach zero
+# on one branch, each round revealing findings that were present the whole time.) The caps
+# exist to keep output readable during a first adoption sweep; this repo lints clean, so
+# there is nothing to keep readable and the completeness is what matters -- CI's gate is
+# "lint must pass", which is only meaningful if a pass means no findings at all.
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
 linters:
   default: standard
   enable:
