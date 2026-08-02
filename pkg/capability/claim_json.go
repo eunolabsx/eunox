@@ -9,20 +9,21 @@ import (
 	"fmt"
 )
 
-// The claim-borne grants in this package (declassify approvals today; any later claim that
-// scopes a decision) are decoded from a token an IdP minted, and each NARROWS something. That
+// The claim-borne grants in this package (delegation grants, declassify approvals, actor-chain
+// nodes) are decoded from a token an IdP minted, and every one of them NARROWS something. That
 // makes their decoding asymmetric with the manifest's: a manifest that fails to parse is an
 // operator's file and an operator's error, while a grant that parses to something WEAKER than
 // it reads is an invisible loss of a control someone believes is in force.
 //
 // Three JSON shapes produce exactly that, and none of them is caught by decoding into a struct:
 //
-//   - An unknown member. `{"lables":["pii"]}` decodes to a grant with an EMPTY label set — a
-//     grant that covers nothing while looking like it covers something.
-//   - An explicit null. `{"once":null}` decodes to false, turning a single-use approval into a
-//     standing one — exactly the replay window the flag exists to close. The author WROTE the
-//     key, so "absent means the default" is not the reading they intended.
-//   - A duplicate key. `{"target":"tool:a","Target":"tool:b"}` is two members; encoding/json
+//   - An unknown member. `{"targts":["tool:read"]}` decodes to a grant with NO target
+//     restriction — the widest value the field has.
+//   - An explicit null. `{"targets":null}` decodes to a nil pointer, which this package reads as
+//     "this hop places no target restriction". `{"once":null}` decodes to false, turning a
+//     single-use approval into a standing one. In both cases the author WROTE the key, so
+//     "absent means unrestricted" is not the reading they intended.
+//   - A duplicate key. `{"targets":["tool:read"],"Targets":[]}` is two members; encoding/json
 //     matches field names case-insensitively and keeps the LAST, so which of the two takes
 //     effect depends on member order rather than on anything the author can see. That is the
 //     same ambiguity the JSON-RPC envelope and tools/list scans already refuse, for the same
@@ -34,10 +35,11 @@ import (
 // evaporated.
 
 // MaxClaimListEntries bounds how many entries one grant's list-valued member may carry. Like
-// MaxDeclassifyApprovals this is a bound on attacker-influenced input, not hygiene: a claim is
-// decoded once per token but its contents are read on the decision path, and an unbounded list
-// is an unbounded allocation a caller chooses. Two hundred fifty-six is far above any real
-// grant and far below anything that costs measurable memory.
+// MaxDelegationDepth this is a bound on attacker-influenced input, not hygiene: a chain is
+// validated once but WALKED on every enforced call, and the target index is a map built per hop
+// per token. Two hundred fifty-six is far above any real grant (a delegated sub-agent scoped to
+// more tools than a whole manifest declares is not a narrowing) and far below anything that
+// costs measurable memory.
 const MaxClaimListEntries = 256
 
 // claimMember is one key/value pair of a claim object, in source order and WITHOUT the
@@ -83,7 +85,7 @@ func claimObjectMembers(data []byte, context string) ([]claimMember, error) {
 
 // decodeClaimObject decodes one claim-borne grant object into target, refusing the three shapes
 // documented above before the struct decode runs. allowExtra names members that are permitted
-// but not decoded, for a claim shape whose spec allows members this build does not model.
+// but not decoded — used only for the actor chain's identity-descriptive members.
 func decodeClaimObject(data []byte, target any, context string, allowExtra ...string) error {
 	members, err := claimObjectMembers(data, context)
 	if err != nil {
@@ -120,6 +122,57 @@ func decodeClaimObject(data []byte, target any, context string, allowExtra ...st
 		return fmt.Errorf("%s: %w", context, err)
 	}
 	return nil
+}
+
+// ClaimMembers validates that none of watch is spelled more than one way among data's
+// top-level JSON members, and returns each watched name's value keyed by FoldJSONKey(name)
+// — a name absent under every spelling is simply missing from the map.
+//
+// It is decodeClaimObject's duplicate-key check, applied one layer OUT rather than one layer
+// IN: decodeClaimObject asks "does this already-selected claim object's OWN fields agree with
+// what it says", this asks "is there only one candidate for a claim object at all". A JWT
+// payload's `mcp`/`act` claims and the `mcp` block's own `capabilities`/`declassify`/
+// `delegation` members are decoded by go-jose's/encoding/json's plain struct unmarshal — the
+// same case-insensitive-fold-and-keep-the-last-one rule decodeClaimObject exists to refuse —
+// but that struct decode happens BEFORE any per-grant decoder ever runs, so a grant's own
+// strict decoding cannot see an ambiguity that was already silently resolved one level up:
+// `{"mcp":{"delegation":[{narrow}],"Delegation":[{wide}]}}` hands ParseDelegationGrants only
+// the WIDE array, with nothing left to indicate a narrower candidate ever existed. A JWT is
+// signed by its issuer, so this is not an externally forgeable ambiguity — but it is the same
+// "an IdP template mistake becomes a rejected token, not a silently-resolved one" failure
+// decodeClaimObject documents, and a minting pipeline that merges claim sources (or a
+// migration that renamed a claim and left both spellings live) can produce it exactly as
+// easily one level up as one level in.
+//
+// Unlike decodeClaimObject this does NOT reject an unrecognized member: data may be a claim
+// object other parties legitimately extend — a JWT's whole payload carries claims for
+// audiences besides this proxy, and even the proxy-owned `mcp` block is versioned
+// (`schemaVersion`-style) and may grow fields a running build predates. Only the small set of
+// names in watch is checked; everything else is ignored, ambiguous or not — an ambiguity in a
+// claim this build never reads is not this build's business to refuse a token over.
+func ClaimMembers(data []byte, context string, watch ...string) (map[string]json.RawMessage, error) {
+	members, err := claimObjectMembers(data, context)
+	if err != nil {
+		return nil, err
+	}
+	want := make(map[string]bool, len(watch))
+	for _, w := range watch {
+		want[FoldJSONKey(w)] = true
+	}
+	out := make(map[string]json.RawMessage, len(want))
+	seen := make(map[string]string, len(want))
+	for _, m := range members {
+		folded := FoldJSONKey(m.key)
+		if !want[folded] {
+			continue
+		}
+		if prior, dup := seen[folded]; dup {
+			return nil, fmt.Errorf("%s: members %q and %q are the same claim to a JSON decoder, so which one is enforced depends on their order; declare it once", context, prior, m.key)
+		}
+		seen[folded] = m.key
+		out[folded] = m.value
+	}
+	return out, nil
 }
 
 // checkClaimListLength bounds a list-valued member. Non-array members are left alone; the

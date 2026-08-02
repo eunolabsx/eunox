@@ -308,10 +308,12 @@ own. Three seams are pluggable via functional options:
   request whose token carries no task id is denied rather than accounted against a
   second bucket. `anchor.go` owns the choice, and every key builder routes through it.
 
-One narrowing surface rides an already-verified token rather than the manifest,
-because it is a property of the CALLER rather than of the policy: the
-`mcp.declassify` approvals, which alone let a `declassify` directive clear a
-label, single-use when marked `once`. The decision
+Two narrowing surfaces ride an already-verified token rather than the manifest,
+because they are properties of the CALLER rather than of the policy: the
+`mcp.declassify` approvals (which alone let a `declassify` directive clear a
+label, single-use when marked `once`), and delegation attenuation — the RFC 8693
+`act` actor chain plus per-hop `mcp.delegation` grants, whose every axis narrows
+in a fixed direction. A chain whose hops widen rejects the token; the decision
 path additionally applies every hop, so the assertion and the enforcement are
 independent. Neither surface needs an experimental gate: both can only subtract.
 

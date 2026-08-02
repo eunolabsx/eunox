@@ -470,6 +470,13 @@ func (e *Engine) checkEffectCeiling(eff *capability.ResolvedEffect, matched *cap
 // stopped at. The caller must therefore only ever use this to HARDEN a refusal, never to
 // produce an allow, and never on a path that would otherwise forward.
 //
+// The DELEGATED maxEffectClass deliberately does not compose here, though it bounds the same
+// axis. This function may only ever HARDEN a refusal, and a delegation refusal is an
+// authorization verdict that is downgradable by design — so the full path forwards it under
+// --audit too, and there is no inversion for the composed path to close. The ceiling composes
+// because its own refusal is HARD, which is exactly the property a JWT short-circuit would
+// otherwise erase.
+//
 // The flow-label peek is the one backend read here, and it is a pure Get, taken only for a
 // flow-relevant constraint. Its failure is swallowed rather than converted into a deny:
 // this is asked about a call that is ALREADY refused, so a label-store fault must not be

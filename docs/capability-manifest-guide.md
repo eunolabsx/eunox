@@ -2351,11 +2351,11 @@ than clearing again:
 - **A call refused after its burn does not get the use back.** The grant is spent.
   That over-refuses (mint another approval) rather than handing a use back to a
   caller whose action may still have been forwarded by an `--audit` route.
-- **A token carries at most 32 approvals**, each with at most 256 labels, and each is
-  decoded strictly: an unknown member (`lables` would decode to an empty label set), an
-  explicit `null`, or a duplicate key rejects the token. `"once": null` is the one that
-  matters most — it decodes to `false`, which is a *standing* grant, i.e. exactly the
-  replay window `once` exists to close. Omit a member instead of writing `null`.
+- **A token carries at most 32 approvals**, and each approval is decoded with the same
+  three strict rules a delegation grant is: an unknown member, an explicit `null`, or a
+  duplicate key rejects the token. `"once": null` is the one that matters most — it
+  decodes to `false`, which is a *standing* grant, i.e. exactly the replay window `once`
+  exists to close. Omit the member instead of writing `null`.
 
 A standing grant (`once` unset) still behaves exactly as before, because an operator
 whose control plane already mints a short-lived token per approval has the property
@@ -2452,7 +2452,155 @@ References are resolved in `allowedValues` **only**. A `${...}` elsewhere in the
 manifest is an ordinary literal string, which for a security rule means it matches
 nothing — the fail-closed direction, but not what the author intended.
 
-## 5d. Cross-PEP state — `taskAnchoredState`
+## 5d. Delegation attenuation — narrowing authority across a hop
+
+`principal` scoping answers *which caller does this capability apply to*. Delegation
+answers the other half: **what is left of that caller's authority after it hands work
+to a sub-agent**. A delegate is not a second principal with its own grants — it is its
+delegator's authority minus something, and the minus is what has to be checkable.
+
+Two claims on an already-verified token carry it, and neither has a manifest token:
+attenuation is a property of the caller, not of the policy.
+
+```jsonc
+{
+  "sub": "user@example.com",
+  // RFC 8693 §4.1 actor chain — WHO. Nested most-recent-actor-OUTERMOST.
+  "act": { "sub": "agent-b", "act": { "sub": "agent-a" } },
+  "mcp": {
+    "v": "0.2",
+    // WHAT each hop kept, ordered DELEGATOR-FIRST (agent-a, then agent-b).
+    "delegation": [
+      {
+        "subject": "agent-a",
+        "targets": ["tool:read_file", "tool:write_file"],
+        "redactFields": ["ssn"]
+      },
+      {
+        "subject": "agent-b",
+        "targets": ["tool:read_file"],       // narrower: write_file is gone
+        "labels": ["untrusted"],             // its calls carry this taint
+        "allowLabels": [],                   // and reach no labeled sink at all
+        "redactFields": ["ssn", "email"],    // sees at least as much masked
+        "maxEffectClass": "reversible"
+      }
+    ]
+  }
+}
+```
+
+### The five axes, and the direction each narrows
+
+| Field | Narrows by | Effect on a call |
+|---|---|---|
+| `targets` | **shrinking** | the target must be in every hop's list |
+| `labels` | **growing** | unioned into the call's flow check as forced taint |
+| `allowLabels` | **shrinking** | intersected with the sink's `flowLabel.allow` |
+| `redactFields` | **growing** | unioned with the constraint's own redaction |
+| `maxEffectClass` | **no higher** | the resolved effect class must be at or below it |
+
+Three of the five — `targets`, `allowLabels`, `maxEffectClass` — are also **asserted at
+the token boundary**, and a hop that moves one of those the other way is a **widening**
+whose token is **rejected outright** rather than clamped. Clamping would leave a
+mis-minted token working while quietly meaning something other than what it says, and the
+whole value of the chain is that "the delegate is no broader than its delegator" is a
+property someone can check rather than a convention someone follows.
+
+`labels` and `redactFields` are not asserted, and the difference is worth understanding
+before you write a chain. The asserted three are the axes whose value reads as a **claim
+of authority** — "I may reach these", "I may carry taint into these sinks", "I may cause
+up to this" — where declaring more than your delegator held is visible nonsense. The
+other two impose something on the hop **itself**, and the decision path **unions** them
+across every hop: a hop that names a different taint than its delegator adds to it, and a
+hop that names none inherits its delegator's untouched. Neither can widen by construction,
+so **you do not restate your ancestors' `labels` and `redactFields`** — a hop that omits
+them loses nothing.
+
+That assertion is not what the enforcement rests on, though. The decision path applies
+**every** hop's grant, not just the last one — so even a chain whose monotonicity check
+was somehow skipped cannot let hop 3 reach what hop 1 forbade. The assertion makes a
+broken chain loud at the boundary; the per-hop application makes it harmless regardless.
+
+### Absent versus present-empty
+
+`targets` and `allowLabels` distinguish **absent** (the key is omitted — this hop
+narrows nothing on that axis) from **present-empty** (`[]` — this hop grants nothing
+on that axis). They must not collapse, because present-empty is the strictest value
+expressible:
+
+- `"targets": []` — the delegate reaches **no action at all**.
+- `"allowLabels": []` — **no labeled flow reaches any sink**. This is the quarantine:
+  a sub-agent sharing a tainted task reaches nothing however it is injected, because
+  the intersection of any allow-set with the empty set is empty.
+
+An omitted key is the common case for a root hop that does not want to enumerate the
+delegator's whole surface: the manifest still bounds it.
+
+### Other rules
+
+- **Delegated targets are literal.** `*` in a grant is refused: it is the character an
+  author writes when they *mean* a pattern, and a pattern here would silently grant
+  nothing rather than the set of actions it appears to name. Every other character is
+  ordinary — a resource URI carrying `?`, `[` or `\` is a perfectly good delegated
+  target, and refusing those made an entire class of resource unexpressible.
+- **`act` and `mcp.delegation` must agree hop for hop** when both are present. A
+  mismatch means the token's two halves describe different delegations, and picking
+  either would be guessing. Grants without an `act` chain are accepted (an IdP that
+  does not implement RFC 8693 can still express attenuation, and a grant can only
+  narrow).
+- **Depth is capped at 8, and each list-valued member at 256 entries.** The chain is
+  attacker-influenced input the decision path walks once per enforced call, and each hop's
+  `targets` become a lookup index built per token.
+- **A grant is decoded strictly, and three shapes reject the token.** An unknown member
+  (`targts` would decode to *no* target restriction), an explicit `null` (`"targets": null`
+  is a nil pointer, which this grammar reads as unrestricted), and a duplicate key
+  (`targets` beside `Targets` is one field to a JSON decoder and the last one wins, so
+  which takes effect depends on member order). All three would produce a grant that reads
+  as a narrowing and is not one, so they fail loudly: the caller cannot authenticate,
+  rather than losing a control silently. Omit a member you do not want to set — do not
+  write `null`.
+- **The SAME ambiguity is checked one layer out, too.** The token's top-level `act`/`mcp`
+  claims, and the `mcp` block's own `capabilities`/`declassify`/`delegation`/`task_id`/
+  `agent_id`/`v` members, are also rejected if named more than one way — `{"mcp":
+  {"delegation":[...narrow],"Delegation":[...wide]}}` would otherwise hand the per-grant
+  decoder only the wide array, with nothing left to show a narrower candidate ever
+  existed. Unlike a grant's own strict decode this does not reject an unrecognized
+  claim — a token legitimately carries claims for other audiences (`roles`, `email`, …)
+  this build never reads, and an ambiguity there is not this build's business to refuse
+  a token over.
+- **`act` may carry the actor's `iss` and `client_id`** beside its `sub`. RFC 8693 defines
+  an actor object as a set of claims identifying the actor, and a token-exchange IdP
+  routinely writes its issuer there. Any other member is refused, so a misspelled `act`
+  (which would silently truncate the chain) is still caught.
+- **No experimental gate.** Every axis narrows, so a build that honors these claims can
+  only deny more than one that ignores them — there is no fail-open direction to gate
+  against. That is why this differs from `mcp.capabilities`, which *replaces* the
+  authorization surface and therefore fails open if ignored.
+
+### What lands on the tape, and in the listing
+
+A delegation refusal is a `decision: deny` with `code: AUTHORIZATION_FAILED` and
+`condition_type: delegation`, carrying `delegation: true`, a `reason`
+(`target_not_delegated` / `effect_class` / `unresolvable_target`), and the `delegate`
+that blocked it — with a chain several hops deep, "not permitted" says nothing about
+which delegator's grant to widen.
+
+A flow denial caused by forced taint records `delegated_labels` **separately** from
+`carried_labels` (what the proxy observed) and `declared_labels` (what the client
+asserted), so an auditor can tell why a call was tainted. `allowLabels` on such a
+record is the **effective** set the check ran against, not the manifest's — under a cap
+the two differ, and recording the manifest's would send an operator to widen a sink
+rule that was never what refused the call.
+
+`tools/list`, `resources/list`, and `prompts/list` are filtered by the chain too, so
+the catalog a delegate is shown never advertises an action its call leg will refuse.
+
+A delegation refusal **is** downgradable by `enforcement: audit` — it is an
+authorization verdict like the manifest's own no-match deny, and an observe route
+exists to show what enforcement would do before it does it, including on a delegation
+chain being rolled out.
+
+## 5e. Cross-PEP state — `taskAnchoredState`
 
 Everything eunox accumulates — flow-label taint, `sequenceBlock` antecedents,
 `maxCalls` and cumulative `blastRadius` budgets, spent one-shot declassify grants — is

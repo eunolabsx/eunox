@@ -98,10 +98,20 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 		}
 	}
 
+	// Compose the delegation chain's allow-set cap into the condition's own: the effective
+	// allow-set is the manifest's Allow INTERSECTED with what every hop kept. Intersection is
+	// the only safe composition, because the sink rule is "present and not allowed => deny" —
+	// so a hop's cap can only ever remove entries, never add one. A hop with a present-empty
+	// allowLabels reduces this to the empty set, which is the full quarantine: a delegate
+	// sharing a tainted task then reaches no labeled sink at all, whatever it is injected to
+	// call.
+	effectiveAllow := delegatedAllowLabels(fl.Allow, req.Delegation)
+
 	// Defense in depth: the loader rejects an unknown label in Allow, but a
 	// programmatically built condition can carry one. Surface it rather than silently
-	// ignore (matching recordLabels, which also errors on an unknown label).
-	allow := make(map[string]bool, len(fl.Allow))
+	// ignore (matching recordLabels, which also errors on an unknown label). The unknown-label
+	// scan runs over the AUTHORED set, not the intersected one, so a typo in the manifest is
+	// still reported when a delegation cap happens to have removed the entry.
 	for _, l := range fl.Allow {
 		if !capability.IsFlowLabel(l) {
 			return &ConditionError{
@@ -110,6 +120,9 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 				Message:       fmt.Sprintf("flowLabel 'allow' contains unknown label %q; valid native labels are %v", l, flowLabelVocab),
 			}
 		}
+	}
+	allow := make(map[string]bool, len(effectiveAllow))
+	for _, l := range effectiveAllow {
 		allow[l] = true
 	}
 
@@ -162,6 +175,21 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 	declared := capability.NormalizeDeclaredLabels(req.DeclaredLabels)
 	present = unionLabels(present, declared)
 
+	// Union in the taint every hop of the delegation chain forces onto this delegate's calls.
+	// It is the same one-directional rule the client attribution above follows and safe for
+	// the same reason — more taint produces only more denials — but it is not the same input:
+	// the client's declaration is a cooperating agent describing its own inputs, while this is
+	// what the delegators DECIDED this delegate is, carried on a verified token the delegate
+	// cannot edit. A sub-agent reading arbitrary web content is `untrusted` whether or not it
+	// cares to say so, which is precisely what makes the quarantine hold against an agent that
+	// has been fully injected.
+	//
+	// Like the declaration, it is used for THIS check only and never written into the anchor's
+	// stored set: it is the delegate's own constitution, not something it deposits on the task
+	// for every hop that follows.
+	forced := req.Delegation.ForcedLabels()
+	present = unionLabels(present, forced)
+
 	// blocked = present labels not permitted here. present is vocabulary-ordered (both
 	// the threaded snapshot and the fallback append in vocab order), so blocked is too.
 	var blocked []string
@@ -184,7 +212,11 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 					"flow":          true,
 					"blockedLabel":  blocked[len(blocked)-1],
 					"blockedLabels": blocked,
-					"allowLabels":   fl.Allow,
+					// The EFFECTIVE allow-set the check ran against, not the authored one:
+					// under a delegation cap the two differ, and recording the manifest's
+					// list would put a set on the tape that no decision used — sending an
+					// operator to widen a sink rule that was never what refused the call.
+					"allowLabels": effectiveAllow,
 				}
 				// Record the client's own attribution separately from the proxy's observed
 				// state, so an auditor can tell a denial the proxy derived from one the
@@ -192,6 +224,14 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 				// tape unable to answer "did we see this, or were we told?".
 				if len(declared) > 0 {
 					d["declared_labels"] = declared
+				}
+				// Recorded separately from both of the above for the same reason they are
+				// separate from each other: an auditor has to be able to tell a denial the
+				// proxy OBSERVED from one the client asked for from one the delegation chain
+				// imposed. Conflating them leaves the tape unable to answer "why was this
+				// call tainted".
+				if len(forced) > 0 {
+					d["delegated_labels"] = forced
 				}
 				return d
 			}(),

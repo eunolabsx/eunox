@@ -131,7 +131,7 @@ unable to answer "did we see this, or were we told?" — which is the first ques
 client-supplied input.
 
 A third source can add taint the same union-only way, and is recorded separately for the same
-reason: a claim-borne label set
+reason: a delegation chain's `labels` (see the manifest guide's *Delegation attenuation*)
 appear as `delegated_labels`. The distinction between the three is the whole point — the
 client *asserted* it, the proxy *observed* it, or a delegator *imposed* it — and only the
 last is something the caller cannot choose to omit.
