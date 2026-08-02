@@ -6,7 +6,6 @@ package capability
 import (
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strings"
 )
 
@@ -150,17 +149,7 @@ var directivePrototypes = map[string]func() Directive{
 // knownDirectiveTypes is every discriminator in the registry, sorted so the
 // unknown-type error enumerates them deterministically (a map's iteration order would
 // not).
-var knownDirectiveTypes = sortedDirectiveTypes()
-
-// sortedDirectiveTypes returns the registry's discriminators in lexical order.
-func sortedDirectiveTypes() []string {
-	out := make([]string, 0, len(directivePrototypes))
-	for t := range directivePrototypes {
-		out = append(out, t)
-	}
-	sort.Strings(out)
-	return out
-}
+var knownDirectiveTypes = sortedRegistryKeys(directivePrototypes)
 
 // NewDirectivePrototype returns a fresh zero-valued directive of the given type, or
 // (nil, false) for a type this build does not model. It is the directive analogue of

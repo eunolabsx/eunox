@@ -847,7 +847,9 @@ func (denyAllPDP) CheckAudience(_ context.Context) *capability.EnforceResponse {
 }
 func (denyAllPDP) RecordObservedToolHashes(_ context.Context, _ json.RawMessage) int { return 0 }
 func (denyAllPDP) ReleaseSession(_ context.Context, _ string)                        {}
-func (denyAllPDP) RestoreDeclassified(_ context.Context, _ string, _ []string) error { return nil }
+func (denyAllPDP) RestoreDeclassified(_ context.Context, _ string, l []string) (bool, error) {
+	return len(l) == 0, nil
+}
 func (denyAllPDP) FilterToolsList(_ context.Context, result json.RawMessage) pdp.ListFilterResult {
 	return pdp.ListFilterResult{Result: result}
 }

@@ -954,62 +954,6 @@ func (e *Engine) handleAllowedValues(_ context.Context, cond capability.Conditio
 	}
 }
 
-// matchTaskVars reports whether argValue equals what any task-context variable in allowed
-// resolves to for the caller's validated claims. It is a separate PASS from the glob pass,
-// not a separate CALLER: a resolved claim is compared by exact equality, never as a glob,
-// so the two cannot share one loop — but both run inside MatchAllowedValue, which is what
-// makes the skip and the resolution inseparable.
-//
-// They were separate callers, and the split did exactly what splitting a matcher does. The
-// glob pass SKIPS a recognized reference (it must — see MatchAllowedValue), so resolution
-// was the only thing that could match one; a caller that ran the glob pass alone therefore
-// silently voided every grant carrying a reference, denying every call under it with
-// VALUE_NOT_PERMITTED and no diagnostic naming the cause. The JWT shorthand path was such
-// a caller, on the reasoning that a token's capability claim "carries no manifest values
-// and therefore no references" — which is true of where the values come FROM and false of
-// what an issuer can write INTO them. Folding resolution into the matcher means a third
-// caller inherits the whole semantics rather than half of them.
-//
-// A non-string argument never matches: every variable resolves to a claim string.
-func matchTaskVars(argValue interface{}, allowed []interface{}, claims map[string]interface{}) bool {
-	// No claims means no token, so nothing can resolve and the whole scan is dead. This is
-	// the default for every deployment without JWT wiring, and this function runs on every
-	// allowedValues deny — the path already doing the most work.
-	if len(claims) == 0 {
-		return false
-	}
-	s, isString := argValue.(string)
-	if !isString {
-		return false
-	}
-	for _, a := range allowed {
-		pattern, ok := a.(string)
-		if !ok {
-			continue
-		}
-		name, isRef := capability.ParseVariableRef(pattern)
-		if !isRef {
-			continue
-		}
-		// Skipped by MatchAllowedValue only when recognized, so an unrecognized reference
-		// reaches neither matcher as a variable — it stays a literal there and resolves to
-		// nothing here.
-		resolved, ok := capability.ResolveTaskVar(name, claims)
-		if !ok {
-			// Unresolvable: no token, or the claim is absent/empty. Skip rather than
-			// match — falling back to the literal "${task.id}" text would compare an
-			// argument against a manifest placeholder, and matching an empty claim
-			// against an empty argument would let an unauthenticated caller satisfy an
-			// identity binding by sending "".
-			continue
-		}
-		if resolved == s {
-			return true
-		}
-	}
-	return false
-}
-
 // MatchAllowedValue reports whether argValue satisfies an allowedValues set. It is
 // the single matcher shared by handleAllowedValues and the JWT shorthand PDP, and it
 // answers the WHOLE question — glob matching and task-context variable resolution
@@ -1017,15 +961,21 @@ func matchTaskVars(argValue interface{}, allowed []interface{}, claims map[strin
 //
 // claims is what makes that possible, and it is a parameter rather than a second call
 // a caller must remember. Resolution used to live outside this function, and the
-// consequence was structural: the glob pass SKIPS a recognized "${task.*}" entry, so a
-// caller that ran only this matcher voided every grant carrying one. That is what the
-// JWT shorthand path did — a token whose capability claim read
+// consequence was structural: the matcher SKIPS a recognized "${task.*}" entry, so a
+// caller that ran only this voided every grant carrying one. That is what the JWT
+// shorthand path did — a token whose capability claim read
 // `tool:fetch_workspace?workspace_id=${task.id}` skipped its only allowed-value entry,
 // matched nothing, and denied every call under the grant with VALUE_NOT_PERMITTED and no
 // diagnostic naming the cause. It fails closed, so it was a silent usability defect rather
 // than a widening — and the fix is to make the two inseparable, so a future caller
 // inherits "task vars resolve" by construction instead of "task vars never match" by
 // default. nil claims (no token) simply resolve nothing.
+//
+// One loop, one classification per entry: the skip rule and the resolve rule are the two
+// halves of the same decision about one allowed-value, so evaluating them in separate
+// passes both re-parsed every entry and left the two able to disagree about what counts as
+// a recognized reference — a disagreement that voids the grant silently, which is the very
+// defect above.
 //
 // A string allowed entry is matched ONLY as a glob via MatchValueGlob, never by
 // exact equality: MatchValueGlob treats a metacharacter-free pattern as a literal,
@@ -1036,38 +986,51 @@ func matchTaskVars(argValue interface{}, allowed []interface{}, claims map[strin
 // A non-string entry (bool, number, nil) is matched by exact value, with
 // numericEqual bridging the YAML-int vs JSON-float64 type gap.
 func MatchAllowedValue(argValue interface{}, allowed []interface{}, claims map[string]interface{}) bool {
+	argStr, argIsString := argValue.(string)
 	for _, a := range allowed {
-		if pattern, ok := a.(string); ok {
-			// A RECOGNIZED "${task.*}" entry is a reference, never a pattern, and is
-			// skipped by THIS pass entirely. It carries no glob metacharacter, so
-			// MatchValueGlob would treat it as a literal — and an argument whose value
-			// happened to be the placeholder TEXT ("${task.id}") would satisfy an identity
-			// binding by spelling it out. Skipping makes the reference matchable only by
-			// the resolution pass below, i.e. only against the claim it resolves to.
-			//
-			// The test is IsTaskVarRef, not "looks like ${...}". This matcher is shared
-			// with the JWT shorthand path, whose values come from a TOKEN's capability
-			// claim rather than a manifest — so an unrecognized "${STAGE}" there has never
-			// passed through the loader, and skipping it would silently void the grant with
-			// no diagnostic. It stays a literal and keeps matching itself.
-			if capability.IsTaskVarRef(pattern) {
-				continue
-			}
-			if s, ok := argValue.(string); ok && MatchValueGlob(pattern, s) {
+		pattern, ok := a.(string)
+		if !ok {
+			if reflect.DeepEqual(a, argValue) || numericEqual(a, argValue) {
 				return true
 			}
 			continue
 		}
-		if reflect.DeepEqual(a, argValue) || numericEqual(a, argValue) {
+		// ONE classification per entry, deciding both branches. A recognized "${task.*}"
+		// entry is a reference, never a pattern: it carries no glob metacharacter, so
+		// MatchValueGlob would treat it as a literal — and an argument whose value happened
+		// to be the placeholder TEXT ("${task.id}") would satisfy an identity binding by
+		// spelling it out. So the two rules are mutually exclusive per entry, which is
+		// exactly why they belong in one loop. Two passes with two different predicates
+		// (IsTaskVarRef to skip, ParseVariableRef to resolve) could disagree if the closed
+		// set ever moved, and an entry skipped by the first that the second declined to
+		// resolve would match NOTHING — silently voiding the grant, which is the defect this
+		// function was rewritten to fix.
+		name, isRef := capability.ParseVariableRef(pattern)
+		if _, known := capability.TaskVarClaimKey(name); isRef && known {
+			// A resolved value is IdP-supplied text compared by EXACT equality, never
+			// through the glob below: run through MatchValueGlob, a claim of "*" would
+			// become an allow-anything wildcard the token holder chose for themselves. An
+			// unresolvable reference (no token, or the claim absent or empty) matches
+			// nothing rather than falling back to the placeholder text, so a missing
+			// identity never widens the set.
+			if !argIsString || len(claims) == 0 {
+				continue
+			}
+			if resolved, ok := capability.ResolveTaskVar(name, claims); ok && resolved == argStr {
+				return true
+			}
+			continue
+		}
+		// Not a recognized reference. That includes an UNRECOGNIZED "${STAGE}", which this
+		// matcher must keep treating as a literal: it is shared with the JWT shorthand path,
+		// whose values come from a TOKEN's capability claim rather than a manifest, so such
+		// a value has never passed through the loader and voiding it would kill the grant
+		// with no diagnostic anywhere to grep for. It stays a literal and matches itself.
+		if argIsString && MatchValueGlob(pattern, argStr) {
 			return true
 		}
 	}
-	// The resolution pass, second and separate: a resolved value is IdP-supplied text
-	// compared by EXACT equality, never through the glob above. Run through MatchValueGlob,
-	// a claim of "*" would become an allow-anything wildcard the token holder chose for
-	// themselves. An unresolvable reference matches nothing, so a missing token or an empty
-	// claim never widens the set.
-	return matchTaskVars(argValue, allowed, claims)
+	return false
 }
 
 // OperationVerb extracts the operation token from an argument value: the uppercased

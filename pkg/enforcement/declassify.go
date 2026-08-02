@@ -314,7 +314,16 @@ func (e *Engine) checkDeclassify(ctx context.Context, req *capability.EnforceReq
 // fault must not weaken (or replace) the refusal being hardened. The peeked set is only
 // evidence on the record; the authorization test itself does not read it.
 func (e *Engine) DeclassifyVerdictFor(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint) *capability.EnforceResponse {
-	if req == nil || matched == nil || e.skipFlow {
+	// e == nil first, and it is not defensive noise. This is an exported method on an
+	// exported type whose fields are unexported, so an embedder legitimately holds an
+	// unwired *Engine — and the predicate this replaced (UsableDeclassifyApproval) guarded
+	// exactly that, with a test pinning it. Dereferencing instead would panic a request
+	// goroutine on a refusal path, which is fail-open-via-crash: the connection drops with
+	// no denial and no audit record for the refusal being hardened. The sibling
+	// RestoreDeclassifiedLabels guards the same way for the same reason. nil means "no
+	// engine, so no checkDeclassify on the unwrapped path either" — there is no verdict
+	// this could be weaker than.
+	if e == nil || req == nil || matched == nil || e.skipFlow {
 		return nil
 	}
 	if len(capability.DeclassifyLabelsOf(matched)) == 0 {

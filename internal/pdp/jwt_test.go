@@ -3067,7 +3067,9 @@ func (condPDP) CheckAudience(_ context.Context) *capability.EnforceResponse {
 }
 func (condPDP) RecordObservedToolHashes(_ context.Context, _ json.RawMessage) int { return 0 }
 func (condPDP) ReleaseSession(_ context.Context, _ string)                        {}
-func (condPDP) RestoreDeclassified(_ context.Context, _ string, _ []string) error { return nil }
+func (condPDP) RestoreDeclassified(_ context.Context, _ string, l []string) (bool, error) {
+	return len(l) == 0, nil
+}
 func (condPDP) FilterToolsList(_ context.Context, result json.RawMessage) ListFilterResult {
 	return ListFilterResult{Result: result}
 }

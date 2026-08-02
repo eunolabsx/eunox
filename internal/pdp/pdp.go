@@ -132,11 +132,20 @@ type PolicyDecisionPoint interface {
 	// labelOutput commits before the forward too, and safely: extra taint over-blocks. This
 	// is the opposite direction, which is why it alone needs an undo reachable from here.
 	//
-	// It returns the fault rather than swallowing it: the caller is writing the refusal's
-	// audit record at that moment, and a label that could NOT be put back is a real
-	// fail-open residual the tape has to carry. A no-op for a PDP that never clears a label
-	// (AlwaysAllowPDP, DenyAllPDP) and for an empty label set.
-	RestoreDeclassified(ctx context.Context, sessionID string, labels []string) error
+	// Two return values, and the bool is the load-bearing one. The caller stamps a SIGNED
+	// audit assertion about the session's state, so an implementation that DECLINES must not
+	// be mistaken for one that restored: report restored=false with a nil error rather than
+	// a bare nil, or the tape claims a revert that never happened. Only an implementation
+	// that actually wrote (or that had nothing to write, len(labels) == 0) may report true.
+	// An error is the fail-open residual the record has to carry.
+	//
+	// CONTEXT CONTRACT: the caller must preserve the request's validated claims. An
+	// implementation resolves the state anchor from them (a task-anchored clear removed the
+	// labels under the TASK key), so a context detached with context.Background() restores
+	// under the wrong key — leaving the task untainted while reporting success. Detach
+	// cancellation only (context.WithoutCancel), never the values. This differs from
+	// ReleaseSession above, which owns only session-anchored state and may be fully detached.
+	RestoreDeclassified(ctx context.Context, sessionID string, labels []string) (restored bool, err error)
 
 	// HardenRefusal re-stamps a refusal that some OTHER layer produced with the verdicts
 	// THIS PDP would have contributed had it been consulted, and returns the composed
@@ -549,9 +558,11 @@ func (AlwaysAllowPDP) RecordObservedToolHashes(_ context.Context, result json.Ra
 func (AlwaysAllowPDP) ReleaseSession(_ context.Context, _ string) {}
 
 // RestoreDeclassified is a no-op: a wiretap PDP never clears a flow label, so no decision
-// it returns can carry a LabelsCleared for the transport to undo.
-func (AlwaysAllowPDP) RestoreDeclassified(_ context.Context, _ string, _ []string) error {
-	return nil
+// it returns can carry a LabelsCleared for the transport to undo. It reports restored only
+// for the empty set — reaching it with labels in hand means some other layer cleared them,
+// and this PDP has no store to put them back into.
+func (AlwaysAllowPDP) RestoreDeclassified(_ context.Context, _ string, labels []string) (bool, error) {
+	return len(labels) == 0, nil
 }
 
 // HardenRefusal returns the refusal unchanged: a wiretap PDP declares no pin, no ceiling
@@ -656,8 +667,10 @@ func (DenyAllPDP) RecordObservedToolHashes(_ context.Context, result json.RawMes
 func (DenyAllPDP) ReleaseSession(_ context.Context, _ string) {}
 
 // RestoreDeclassified is a no-op: the fail-closed default allows nothing, so no decision it
-// returns can have cleared a flow label.
-func (DenyAllPDP) RestoreDeclassified(_ context.Context, _ string, _ []string) error { return nil }
+// returns can have cleared a flow label. Same reporting rule as AlwaysAllowPDP's.
+func (DenyAllPDP) RestoreDeclassified(_ context.Context, _ string, labels []string) (bool, error) {
+	return len(labels) == 0, nil
+}
 
 // HardenRefusal returns the refusal unchanged: the "no policy" default declares no pin, no
 // ceiling and no redaction, so it has nothing to compose onto another layer's verdict.
@@ -1037,10 +1050,18 @@ func (p *ManifestPDP) ReleaseSession(ctx context.Context, sessionID string) {
 // Every other field of the request is irrelevant here — RestoreDeclassifiedLabels is a
 // keyed Add and evaluates no policy — so this deliberately does not rebuild the decision's
 // target or arguments.
-func (p *ManifestPDP) RestoreDeclassified(ctx context.Context, sessionID string, labels []string) error {
-	if p.engine == nil || len(labels) == 0 {
-		return nil
+func (p *ManifestPDP) RestoreDeclassified(ctx context.Context, sessionID string, labels []string) (bool, error) {
+	// p == nil covers a typed-nil (*ManifestPDP)(nil) reaching the transport's restorer
+	// interface, where the caller's `!= nil` check passes and the dereference below would
+	// panic a request goroutine on the refusal path. The engine's own guard is one frame
+	// further in and cannot help until this receiver is read.
+	if p == nil || p.engine == nil {
+		// Declined, not restored: a PDP with no engine holds no flow store, so the labels
+		// are still cleared and the record must not claim otherwise.
+		return len(labels) == 0, nil
 	}
+	// The claims come from the context so the request resolves to the SAME anchor the clear
+	// used; see the interface's context contract.
 	return p.engine.RestoreDeclassifiedLabels(ctx, &capability.EnforceRequest{
 		SessionID: sessionID,
 		Claims:    jwtClaimsAsMap(ctx),
@@ -1713,6 +1734,63 @@ func (p *ManifestPDP) hardenOnBrokenInterface(sessionID string, r capability.Enf
 	return r, true
 }
 
+// hardenRequest builds the EnforceRequest a *VerdictFor seam is asked about. Both hardening
+// paths need the identical shape, and they had two copies of it — ten lines each, differing
+// only in one field — which is the same duplication the seams themselves exist to remove,
+// one level up. canonicalApprovalTarget resolves off req.Target per FIELD, so the literal is
+// load-bearing: a divergence here reproduces exactly the padded-target bug the centralized
+// resolver was introduced to prevent.
+//
+// jwtConditionArgs synthesizes the {"uri"}/{"name"} map DecideResourceRead and DecidePromptGet
+// build, so a contract naming one of those resolves to the same value here that the full path
+// would have resolved.
+//
+// Delegation is deliberately absent, for both callers. A *VerdictFor seam may only HARDEN a
+// refusal, and a delegation refusal is downgradable by design — the full path forwards it
+// under --audit too, so there is no inversion here for a composed delegation verdict to
+// close, and producing a soft verdict through a harden-only seam would break that seam's
+// contract to fix nothing.
+func hardenRequest(ctx context.Context, sessionID string, target EnforceTarget, args, claims map[string]interface{}) *capability.EnforceRequest {
+	return &capability.EnforceRequest{
+		SessionID:  sessionID,
+		TargetName: target.Name,
+		Arguments:  jwtConditionArgs(target, args),
+		Target: &capability.EnforceRequestTarget{
+			Type: string(target.Type),
+			Name: target.Name,
+		},
+		Claims:         claims,
+		DeclaredLabels: declaredLabelsFromContext(ctx),
+	}
+}
+
+// composeHardened folds a *VerdictFor seam's verdict onto the refusal it is hardening: the
+// verdict becomes the PRIMARY response (its code and structured details are the whole point),
+// with the wrapping layer's own reason appended so an operator fixing the token still sees why
+// authorization failed.
+//
+// The AuditOnly AND is the load-bearing part and belongs here rather than at each caller: the
+// composed refusal must never be SOFTER than the one it replaces. The ceiling's onExceed:deny
+// arm is built with the matched constraint's own audit posture, so a constraint marked
+// `enforcement: audit` hands back AuditOnly=true — which the transport's isObserveDeny reads as
+// "downgrade and forward". Inheriting it turned a JWT refusal that BLOCKED on an enforce route
+// into a forwarded, executed call. Taking the AND keeps the composed posture at least as hard
+// as both inputs, for every seam that routes through here.
+//
+// The Denial is copied before its Message is rewritten, so the caller never mutates a value the
+// engine still owns.
+func composeHardened(r, verdict capability.EnforceResponse) capability.EnforceResponse {
+	out := verdict
+	if out.Denial != nil && r.Denial != nil && r.Denial.Message != "" {
+		denial := *out.Denial
+		denial.Message = denial.Message +
+			" (this call was also refused by the wrapping authorization layer: " + r.Denial.Message + ")"
+		out.Denial = &denial
+	}
+	out.AuditOnly = out.AuditOnly && r.AuditOnly
+	return out
+}
+
 // hardenOnEffectCeiling re-stamps a refusal that some OTHER layer produced as the effect
 // ceiling's own refusal when the manifest's ceiling would have refused this action too.
 // over reports whether it fired.
@@ -1761,44 +1839,11 @@ func (p *ManifestPDP) hardenOnEffectCeiling(ctx context.Context, sessionID strin
 	if matched == nil || !containsAction(matched.Actions, requiredActionFor(target.Type)) {
 		return r, false
 	}
-	// jwtConditionArgs synthesizes the {"uri"}/{"name"} map DecideResourceRead and
-	// DecidePromptGet build, so a contract naming one of those resolves to the same value
-	// here that the full path would have resolved.
-	req := &capability.EnforceRequest{
-		SessionID:  sessionID,
-		TargetName: target.Name,
-		Arguments:  jwtConditionArgs(target, args),
-		Target: &capability.EnforceRequestTarget{
-			Type: string(target.Type),
-			Name: target.Name,
-		},
-		Claims:         claims,
-		DeclaredLabels: declaredLabelsFromContext(ctx),
-		// No Delegation, deliberately. CeilingVerdictFor may only HARDEN a refusal, and a
-		// delegation refusal is downgradable by design — the full path forwards it under
-		// --audit too, so there is no inversion here for a composed delegation verdict to
-		// close, and producing a soft verdict through a harden-only seam would break that
-		// seam's contract to fix nothing. See CeilingVerdictFor.
-	}
-	verdict := p.engine.CeilingVerdictFor(ctx, req, matched)
+	verdict := p.engine.CeilingVerdictFor(ctx, hardenRequest(ctx, sessionID, target, args, claims), matched)
 	if verdict == nil {
 		return r, false
 	}
-	out := *verdict
-	if out.Denial != nil && r.Denial.Message != "" {
-		denial := *out.Denial
-		denial.Message = denial.Message +
-			" (this call was also refused by the wrapping authorization layer: " + r.Denial.Message + ")"
-		out.Denial = &denial
-	}
-	// The composed refusal must never be SOFTER than the one it replaces. The ceiling's
-	// onExceed:deny arm is built with the matched constraint's own audit posture, so a
-	// constraint marked `enforcement: audit` handed back AuditOnly=true — which the
-	// transport's isObserveDeny reads as "downgrade and forward". Inheriting it turned a
-	// JWT refusal that BLOCKED on an enforce route into a forwarded, executed call: a
-	// hardening path making an over-ceiling, token-refused action run. Taking the AND
-	// keeps the composed posture at least as hard as both inputs.
-	out.AuditOnly = out.AuditOnly && r.AuditOnly
+	out := composeHardened(r, *verdict)
 	if out.Denial != nil && out.Denial.HardDeny {
 		// Never forwarded (the escalate arm), so there is no response to redact and
 		// obligations would be a claim that a redaction ran.
@@ -1891,22 +1936,18 @@ func (p *ManifestPDP) hardenOnUnapprovedDeclassify(ctx context.Context, sessionI
 	if matched == nil || !containsAction(matched.Actions, requiredActionFor(target.Type)) {
 		return r, false
 	}
-	// The same request shape hardenOnEffectCeiling builds, plus the approvals — the verdict
-	// turns on them, and the engine reads them off the request rather than the context.
-	// Target is populated per-field so the ONE resolver behind canonicalApprovalTarget sees
-	// exactly what FindMatchingCapability would have.
-	req := &capability.EnforceRequest{
-		SessionID:  sessionID,
-		TargetName: target.Name,
-		Arguments:  jwtConditionArgs(target, args),
-		Target: &capability.EnforceRequestTarget{
-			Type: string(target.Type),
-			Name: target.Name,
-		},
-		Claims:              claims,
-		DeclassifyApprovals: declassifyApprovalsFromContext(ctx),
-		DeclaredLabels:      declaredLabelsFromContext(ctx),
+	// The cheap structural test BEFORE the request is built. DeclassifyVerdictFor's first
+	// real gate is this same question, and it is false for every deployment that declares no
+	// declassify directive — i.e. essentially all of them — so asking it here keeps the
+	// throwaway argument map and two context walks off the denial path of every route that
+	// has nothing to declassify.
+	if len(capability.DeclassifyLabelsOf(matched)) == 0 {
+		return r, false
 	}
+	// The shared request shape, plus the approvals — the verdict turns on them, and the
+	// engine reads them off the request rather than the context.
+	req := hardenRequest(ctx, sessionID, target, args, claims)
+	req.DeclassifyApprovals = declassifyApprovalsFromContext(ctx)
 	// nil means the declassification would have been authorized — a live covering approval,
 	// or nothing to clear at all — so the outer layer's verdict stands as it was. Every
 	// refusal arm is the engine's own, including the hard `ledger_unavailable` one: a fault
@@ -1916,22 +1957,22 @@ func (p *ManifestPDP) hardenOnUnapprovedDeclassify(ctx context.Context, sessionI
 	if verdict == nil {
 		return r, false
 	}
-	out := *verdict
-	if out.Denial != nil && r.Denial.Message != "" {
-		denial := *out.Denial
-		denial.Message = denial.Message +
-			" (this call was also refused by the wrapping authorization layer: " + r.Denial.Message + ")"
-		out.Denial = &denial
+	// composeHardened carries the AuditOnly AND. Every declassify refusal is built hard
+	// (escalateResponse leaves AuditOnly false for the same reason the ceiling's escalation
+	// does), so for this caller it is a backstop rather than a live correction — which is an
+	// argument for sharing the composition, not for hand-writing a weaker one here.
+	out := composeHardened(r, *verdict)
+	// Obligations are stripped only for a refusal that is never forwarded, and re-filled
+	// otherwise — the same rule the ceiling's sibling applies, rather than an unconditional
+	// strip resting on "every declassify refusal is hard". Stripping unconditionally is the
+	// shape that re-opened a fail-open there: a downgradable refusal reaching the host on an
+	// --audit route with the manifest's redactFields already discarded, so the response
+	// arrives unmasked.
+	if out.Denial != nil && out.Denial.HardDeny {
+		out.Obligations = nil
+		return out, true
 	}
-	// The composed refusal must never be SOFTER than the one it replaces. Every declassify
-	// refusal is built hard (escalateResponse leaves AuditOnly false for the same reason the
-	// ceiling's escalation does), so this AND is a backstop rather than a live correction —
-	// kept because the cost of it being wrong is a forwarded, executed declassification.
-	out.AuditOnly = out.AuditOnly && r.AuditOnly
-	// Never forwarded, so there is no response to redact and obligations would be a claim
-	// that a redaction ran.
-	out.Obligations = nil
-	return out, true
+	return p.withForwardObligationsFor(ctx, out, matched), true
 }
 
 // directivesNamingTarget collects the directives of every capability whose target type +

@@ -41,7 +41,11 @@ func TestJWT_AmbiguousStandardClaimRejected(t *testing.T) {
 		"nbf pair":         {"nbf": time.Now().Add(-time.Hour).Unix(), "NBF": time.Now().Add(time.Hour).Unix()},
 		"iss pair":         {"iss": "https://idp.example.com", "Iss": "https://evil.example.com"},
 		"aud pair":         {"aud": "eunox", "Aud": "other"},
-		"jti pair":         {"jti": "a", "JTI": "b"},
+		// cnf is not one of go-jose's std claims — eunox reads it out of the raw claim map
+		// for the RFC 7800 sender-constrained check — and it is the one watched claim whose
+		// ambiguity fails OPEN rather than merely picking wrong. See the cnf-specific test
+		// below for why that makes it the sharpest entry in the list.
+		"cnf pair": {"cnf": map[string]interface{}{"jkt": "abc"}, "Cnf": map[string]interface{}{"jkt": "def"}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			claims := map[string]interface{}{"mcp": map[string]interface{}{"v": mcpClaimVersion}}
@@ -71,12 +75,18 @@ func TestJWT_UnambiguousStandardClaimsAccepted(t *testing.T) {
 
 	token := signRawClaimsToken(t, key, "agent-1", time.Now().Add(time.Hour), map[string]interface{}{
 		"mcp": map[string]interface{}{"v": mcpClaimVersion},
-		"jti": "token-1",
 		"nbf": time.Now().Add(-time.Minute).Unix(),
 		// An ambiguity among claims this build never reads stays none of its business,
 		// exactly as for the mcp/act gate.
 		"email": "a@example.com",
 		"Email": "b@example.com",
+		// jti is the same case, and it is a REGISTERED claim — which is the point. The
+		// watch list is scoped to what eunox reads, not to what RFC 7519 defines: nothing
+		// in this binary decodes jti (newValidatedClaims copies sub/iss/aud/exp and never
+		// jwt.Claims.ID), so refusing a token over two spellings of it would deny every
+		// request from an IdP whose template emits both, buying no security at all.
+		"jti": "token-1",
+		"JTI": "token-2",
 	})
 	ctx, err := pdp.ValidateToken(context.Background(), "Bearer "+token)
 	if err != nil {
@@ -84,5 +94,47 @@ func TestJWT_UnambiguousStandardClaimsAccepted(t *testing.T) {
 	}
 	if got := JWTClaimsPtr(ctx); got == nil || got.Subject != "agent-1" {
 		t.Fatalf("subject = %v, want agent-1", got)
+	}
+}
+
+// TestJWT_AmbiguousCnfRejected is the one entry in the watch list whose ambiguity fails
+// OPEN, which is why it is watched even though it is not a claim go-jose decodes.
+//
+// eunox reads `cnf` from the RAW claim map (a plain map decode — last member wins) to
+// detect an RFC 7800 sender-constrained token, which it must refuse because it verifies no
+// proof of possession. `CnfIsSenderConstrained(nil)` reads an explicit null as ABSENT, not
+// malformed — so `{"cnf":{"jkt":…},"cnf":null}` resolves to null, the constraint
+// evaporates, and a PoP-bound token is accepted as a plain bearer token. Anyone who
+// captures it can then replay it: the exact downgrade the rejection exists to prevent,
+// reached through the ambiguity class the rest of this gate closes.
+func TestJWT_AmbiguousCnfRejected(t *testing.T) {
+	key := newTestKey(t, "k1")
+	srv := makeJWKSServer(t, key)
+	defer srv.Close()
+	p := makeJWTPDP(t, srv, "", "", nil)
+
+	// A single, unambiguous cnf is still refused on its own terms (sender-constrained),
+	// which is the behavior this test must not be confused with.
+	constrained := signRawClaimsToken(t, key, "agent-1", time.Now().Add(time.Hour), map[string]interface{}{
+		"mcp": map[string]interface{}{"v": mcpClaimVersion},
+		"cnf": map[string]interface{}{"jkt": "abc"},
+	})
+	if _, err := p.ValidateToken(context.Background(), "Bearer "+constrained); err == nil {
+		t.Fatal("a sender-constrained token must be refused")
+	} else if got := ClassifyJWTError(err); got != "sender_constrained" {
+		t.Fatalf("error category = %q, want sender_constrained", got)
+	}
+
+	// The fail-open shape: a real cnf plus a null one. Before the gate watched cnf this
+	// validated cleanly and downgraded to a bearer token.
+	ambiguous := signRawClaimsToken(t, key, "agent-1", time.Now().Add(time.Hour), map[string]interface{}{
+		"mcp": map[string]interface{}{"v": mcpClaimVersion},
+		"cnf": map[string]interface{}{"jkt": "abc"},
+		"Cnf": nil,
+	})
+	if _, err := p.ValidateToken(context.Background(), "Bearer "+ambiguous); err == nil {
+		t.Fatal("an ambiguous cnf must reject the token, not resolve to whichever member sorts last")
+	} else if got := ClassifyJWTError(err); got != "ambiguous_claims" && got != "sender_constrained" {
+		t.Fatalf("error category = %q, want the token refused (ambiguous_claims or sender_constrained)", got)
 	}
 }

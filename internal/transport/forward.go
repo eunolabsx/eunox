@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"sync/atomic"
+	"time"
 
 	"github.com/eunolabs/eunox/internal/audit"
 	"github.com/eunolabs/eunox/internal/mcp"
@@ -309,6 +310,12 @@ type forwardParams struct {
 	// refuses the call AFTER the decision committed it. nil in a params built with no PDP
 	// (the session-creating initialize gate, tests), where no decision is in hand and so
 	// none can carry LabelsCleared. See declassifyRestorer.
+	//
+	// It is populated by dispatchParams' own constructor from the SAME field the dispatcher
+	// decides with (see newDispatchParams), not assigned independently at each site: two
+	// fields holding one PDP is a drift surface where the next construction site sets `pdp`
+	// and forgets this one, and the failure that produces is silent — every post-decision
+	// refusal on that path reports declassify_orphaned while the labels really are gone.
 	restorer declassifyRestorer
 	strictAuditState
 }
@@ -316,14 +323,21 @@ type forwardParams struct {
 // declassifyRestorer is the one method the forward core needs from the PDP: put back the
 // flow labels an approved declassification cleared, for a call that was decided and then
 // refused here. *pdp.JWTPDP, *pdp.ManifestPDP and every other PolicyDecisionPoint satisfy
-// it, so a dispatchParams assigns its own pdp and the core stays ignorant of which one.
+// it, so the core stays ignorant of which one it holds.
 //
 // It is a narrow interface rather than a pdp.PolicyDecisionPoint field because that is all
 // this path may do: the decision has already been made, and nothing below it is allowed to
 // re-decide.
 type declassifyRestorer interface {
-	RestoreDeclassified(ctx context.Context, sessionID string, labels []string) error
+	RestoreDeclassified(ctx context.Context, sessionID string, labels []string) (bool, error)
 }
+
+// declassifyRestoreTimeout bounds the compensating flow-store write undoDeclassify makes
+// after the request's own context is no longer usable. It is a single store round-trip on a
+// path that is already returning a refusal, so it wants a bound short enough not to hold the
+// response and long enough to survive an ordinary backend hiccup — the alternative to
+// completing it is a permanently untainted session.
+const declassifyRestoreTimeout = 5 * time.Second
 
 // strictAuditState is the --require-audit=strict configuration shared by the
 // host-facing forward path (forwardParams) and the server-initiated sampling path
@@ -457,35 +471,77 @@ func (fp forwardParams) undoDeclassify(ctx context.Context, dec capability.Enfor
 		// filter finds this beside the sink denials and the declassify escalations.
 		"flow": true,
 	}
-	// A nil restorer means no PDP was wired into these params, which cannot coexist with a
-	// decision carrying LabelsCleared on any in-tree path. Report it rather than silently
-	// recording a revert that did not happen.
-	var err error
-	if fp.restorer == nil {
-		err = fmt.Errorf("no policy decision point is wired into this transport path")
-	} else {
-		err = fp.restorer.RestoreDeclassified(ctx, fp.sessionID, dec.LabelsCleared)
-	}
-	if err != nil {
+	restored, err := fp.restoreCleared(ctx, dec.LabelsCleared)
+	switch {
+	case err != nil || !restored:
 		// The fail-open residual, and the reason this returns fields at all: the labels are
 		// gone for a call that never ran, so a later sink the operator believes is guarded
 		// will pass. Spelled as its own key rather than a flag on the revert, so an alert
 		// matches this and not the benign case.
+		//
+		// !restored is folded in beside the error deliberately. A restorer that DECLINES —
+		// no engine, no flow store, a wrapper whose inner is gone — leaves the labels
+		// exactly as un-restored as a failed write does, and reporting that as a revert
+		// would put a signed claim about the session's state on the tape with nothing
+		// behind it. Only an implementation that actually wrote may reach the other arm.
 		detail["declassify_orphaned"] = dec.LabelsCleared
+		reason := "the policy decision point declined to restore them"
+		if err != nil {
+			reason = err.Error()
+		}
 		fmt.Fprintf(os.Stderr,
-			"[eunox] SECURITY: %s %q was refused after an approved declassification, and the cleared flow label(s) %v could not be restored: %v — the session is now less tainted than the calls it actually made\n",
-			kind, denialTarget, dec.LabelsCleared, err)
-	} else {
+			"[eunox] SECURITY: %s %q was refused after an approved declassification, and the cleared flow label(s) %v could not be restored: %s — the session is now less tainted than the calls it actually made\n",
+			kind, denialTarget, dec.LabelsCleared, reason)
+	default:
 		detail["declassify_reverted"] = dec.LabelsCleared
 	}
 	// Spelled declassify_approval_id rather than approval_id: the latter is a top-level
 	// SIGNED field on the allow that PERFORMED a declassification, and reusing the name
 	// inside a refusal's details would put one key in two places with two provenances on
 	// one tape — the same rule consumed_approval_id follows in the engine.
+	//
+	// Bounded before it lands, through the SAME cap the top-level approval_id gets. The id
+	// is an IdP-supplied string Validate() places no length limit on, and unlike the
+	// engine's own refusal details — which pass through boundDenialDetails — a value
+	// written straight into a transport-built details map reaches the tape under only the
+	// 1 MiB whole-map cap. Left unbounded, one 500 KB approval id would write 128x the
+	// envelope cap per refused declassification into the tape and the audit queue's byte
+	// budget, on exactly the value declassifyRefusal's own doc calls out as one that must
+	// not carry an unbounded value onto the signed tape.
 	if dec.ApprovalID != "" {
-		detail["declassify_approval_id"] = dec.ApprovalID
+		detail["declassify_approval_id"] = audit.BoundEnvelopeField(dec.ApprovalID)
 	}
 	return detail
+}
+
+// restoreCleared runs the compensating write on a context that outlives the request.
+//
+// The request's own context is the wrong one, and on one of the three exits it is
+// systematically wrong: an upstream transport failure is frequently CAUSED by that context
+// being canceled (a client disconnect surfaces as REQUEST_CANCELED), and a
+// context-honouring FlowLabelStore — the Redis backend passes ctx into every pipelined
+// command — then fails the restore immediately. The restore would be guaranteed to fail in
+// exactly the case it exists for, and would be recorded as declassify_orphaned while
+// blaming a store that was healthy. Every other post-request state operation in this
+// package already detaches for this reason; see the ReleaseSession contract.
+//
+// context.WithoutCancel, NOT context.Background: the anchor the labels are restored under
+// resolves from the request's validated claims, so a fully detached context would restore a
+// task-anchored clear under the session key — leaving the task untainted, stranding a
+// duplicate, and reporting success. WithoutCancel keeps the values and drops only the
+// cancellation. See PolicyDecisionPoint.RestoreDeclassified's context contract.
+func (fp forwardParams) restoreCleared(ctx context.Context, cleared []string) (bool, error) {
+	if fp.restorer == nil {
+		// Unreachable through dispatchParams, whose constructor sets this from the same PDP
+		// it decides with — but this is the fail-open path, so it reports rather than
+		// assumes. Distinguished from a store fault in the message: the remedies are a code
+		// fix and a backend fix respectively, and an operator paged on declassify_orphaned
+		// must not be sent to look at a healthy store.
+		return false, fmt.Errorf("no policy decision point is wired into this transport path (wiring fault, not a flow-store failure)")
+	}
+	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), declassifyRestoreTimeout)
+	defer cancel()
+	return fp.restorer.RestoreDeclassified(restoreCtx, fp.sessionID, cleared)
 }
 
 // mergeAuditDetails folds extra into base without mutating either — base may be the

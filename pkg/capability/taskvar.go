@@ -100,6 +100,17 @@ func IsTaskVarRef(s string) bool {
 	return known
 }
 
+// TaskVarClaimKey returns the flat input.claims key a variable reads, and whether the name
+// is in the closed set at all. It is IsTaskVarRef's second half, exposed so a caller that
+// has ALREADY parsed the reference can finish the classification without re-parsing —
+// enforcement's allowedValues matcher decides "skip as a reference" and "resolve against
+// the claim" from one classification, and re-deriving the second from a different predicate
+// is how the two came to disagree about what a recognized reference is.
+func TaskVarClaimKey(name string) (string, bool) {
+	key, known := taskVarClaims[name]
+	return key, known
+}
+
 // ParseVariableRef returns the variable name when s is EXACTLY one reference
 // ("${task.id}" -> "task.id", true). Anything else — an embedded reference, an unclosed
 // brace, plain text — returns ("", false).

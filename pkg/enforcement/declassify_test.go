@@ -201,13 +201,33 @@ func TestDeclassify_ClearFaultHardDenies(t *testing.T) {
 	assert.Equal(t, "record", resp.Denial.Details["phase"])
 }
 
-// removeFailingStore fails Remove on demand so the clear-fault path is reachable.
+// removeFailingStore fails Remove on demand so the clear-fault path is reachable, in either
+// of the two shapes that matter.
+//
+// deleteFirst is what separates them, and it is a flag rather than a second double because
+// picking wrong is invisible at the construction site. With it unset the Remove errors
+// having changed NOTHING, which exercises only the hard-deny posture; with it set the Remove
+// COMMITS and then reports failure, which is what a lost reply (a timeout, a reset) or a
+// partial multi-label removal looks like to the caller — and it is the only shape that
+// reaches the fail-OPEN direction at all. A test that reached for the wrong one of two
+// similarly-named doubles would pass while asserting nothing about the residual, which is
+// how the missing restore went unnoticed in the first place.
 type removeFailingStore struct {
 	capability.FlowLabelStore
-	fail bool
+	fail        bool
+	deleteFirst bool
 }
 
 func (s *removeFailingStore) Remove(ctx context.Context, key string, labels ...string) error {
+	if s.deleteFirst {
+		if err := s.FlowLabelStore.Remove(ctx, key, labels...); err != nil {
+			return err
+		}
+		if s.fail {
+			return errors.New("backend reply lost after the delete committed")
+		}
+		return nil
+	}
 	if s.fail {
 		return errors.New("backend unavailable")
 	}
@@ -224,7 +244,7 @@ func (s *removeFailingStore) Remove(ctx context.Context, key string, labels ...s
 // This is the one direction the flow layer calls out as able to fail open, which is why
 // the restore runs at all and why it runs BEFORE the add rollback.
 func TestDeclassify_ClearFaultRestoresTheTaint(t *testing.T) {
-	store := &deleteThenFailStore{FlowLabelStore: flowlabelstore.NewInMemory()}
+	store := &removeFailingStore{FlowLabelStore: flowlabelstore.NewInMemory(), deleteFirst: true}
 	eng := enforcement.New(
 		enforcement.WithCallCounter(callcounter.NewInMemory()),
 		enforcement.WithFlowLabelStore(store),
@@ -251,25 +271,6 @@ func TestDeclassify_ClearFaultRestoresTheTaint(t *testing.T) {
 	after := eng.ValidateAction(ctx, req("s", "publish"), sinkCaps("publish", capability.FlowLabelPublic))
 	assert.Equal(t, capability.DecisionDeny, after.Decision,
 		"a call that never ran must not have permanently untainted the session")
-}
-
-// deleteThenFailStore performs the Remove and THEN reports an error, which is what a lost
-// reply looks like to the caller (and what a partial multi-label removal looks like at
-// its own layer). A store double that errors WITHOUT deleting cannot exercise the
-// fail-open direction at all, which is how the missing restore went unnoticed.
-type deleteThenFailStore struct {
-	capability.FlowLabelStore
-	fail bool
-}
-
-func (s *deleteThenFailStore) Remove(ctx context.Context, key string, labels ...string) error {
-	if err := s.FlowLabelStore.Remove(ctx, key, labels...); err != nil {
-		return err
-	}
-	if s.fail {
-		return errors.New("backend reply lost after the delete committed")
-	}
-	return nil
 }
 
 // TestDeclassify_CarriesNoResponseObligation pins that declassify, like labelOutput, is an

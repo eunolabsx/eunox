@@ -701,23 +701,50 @@ func parseDelegationChain(payload idpJWTPayload) (*capability.DelegationChain, e
 	return chain, nil
 }
 
-// stdClaimNames are the RFC 7519 registered claims this build reads off the token: the
-// identity `sub`/`iss`/`jti`, the audience pin `aud`, and the temporal bounds
-// `exp`/`nbf`/`iat`. Every one of them is decoded by go-jose's plain
-// encoding/json.Unmarshal into jwt.Claims — a struct with no custom UnmarshalJSON — so an
-// ambiguous pair among them resolves by member ORDER exactly as `mcp`/`act` do, and is
-// watched here for exactly the same reason.
+// watchedTopLevelClaims is every top-level claim THIS BUILD READS, and therefore every one
+// whose ambiguity it must refuse rather than resolve by member order. It is one list, built
+// once, because it is the answer to a single question — "what does eunox trust from this
+// payload?" — and splitting it across a var and a spliced literal at the call site is how a
+// claim gets added to one and missed in the other.
 //
-// They are listed rather than reflected off jwt.Claims because the list must name what
-// eunox TRUSTS, not what a dependency happens to model: a go-jose release that adds a
+// Membership is decided by "does this build read it", not by "is it a registered claim".
+// That criterion is ClaimMembers' own (an ambiguity in a claim carried for another audience
+// is not this build's business to refuse a token over), and it cuts both ways:
+//
+//   - `jti` is deliberately ABSENT. Nothing in this binary reads it — newValidatedClaims
+//     copies sub/iss/aud/exp and never jwt.Claims.ID — so watching it would reject every
+//     token from an IdP whose template happens to emit two spellings of a claim eunox never
+//     decodes: an availability regression bought for no security.
+//   - `cnf` is deliberately PRESENT even though it is not one of go-jose's std claims. It
+//     is read from the raw claim map (RFC 7800 sender-constrained detection), and that map
+//     is a plain map decode — last member wins. An ambiguous `cnf` is the one entry here
+//     that fails OPEN rather than merely picking wrong: `{"cnf":{"jkt":…},"cnf":null}`
+//     resolves to null, CnfIsSenderConstrained reads null as ABSENT, and a
+//     proof-of-possession token is accepted as a plain bearer token by a proxy that
+//     verifies no PoP — the exact downgrade that rejection exists to prevent.
+//
+// The std claims are listed rather than reflected off jwt.Claims because the list must name
+// what eunox TRUSTS, not what a dependency happens to model: a go-jose release that adds a
 // field would silently widen a security check, and one that renames a tag would silently
 // narrow it. Both directions are worse than an explicit list beside the check.
-var stdClaimNames = []string{"sub", "iss", "aud", "exp", "nbf", "iat", "jti"}
+//
+// go-jose decodes sub/iss/aud/exp/nbf/iat through a plain encoding/json.Unmarshal into
+// jwt.Claims — a struct with no custom UnmarshalJSON — so an ambiguous pair among them
+// resolves by member ORDER exactly as `mcp`/`act` do.
+var watchedTopLevelClaims = []string{
+	// The proxy's own claim blocks.
+	"mcp", "act",
+	// Identity and audience: `sub` is what a manifest's principal: scoping reads.
+	"sub", "iss", "aud",
+	// Temporal bounds: whether the token is live at all.
+	"exp", "nbf", "iat",
+	// Proof-of-possession: read from the raw claim map, and the one that fails open.
+	"cnf",
+}
 
-// rejectAmbiguousTopLevelClaims confirms the token's payload names each of `mcp`, `act`
-// and the RFC 7519 standard claims at most once, and that the `mcp` block itself names
-// each of its own members at most once, before ANYTHING decoded from any of them is
-// trusted.
+// rejectAmbiguousTopLevelClaims confirms the token's payload names each claim this build
+// reads (watchedTopLevelClaims) at most once, and that the `mcp` block itself names each of
+// its own members at most once, before ANYTHING decoded from any of them is trusted.
 //
 // The struct unmarshals that already ran (tok.Claims into jwt.Claims,
 // UnsafeClaimsWithoutVerification into idpJWTPayload) resolved any collision silently —
@@ -745,7 +772,7 @@ func rejectAmbiguousTopLevelClaims(tokenStr string) error {
 	if err != nil {
 		return capability.Terminal(jwtErr(jwtErrMalformedToken, err))
 	}
-	top, err := capability.ClaimMembers(payloadBytes, "jwt payload", append([]string{"mcp", "act"}, stdClaimNames...)...)
+	top, err := capability.ClaimMembers(payloadBytes, "jwt payload", watchedTopLevelClaims...)
 	if err != nil {
 		return capability.Terminal(jwtErr(jwtErrAmbiguousClaims, err))
 	}
@@ -1408,6 +1435,11 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 	// resources/read and prompts/get synthesize the name under "uri"/"name" — so a
 	// resource:/prompt: allowedValues claim does not always deny with MISSING_CONTEXT.
 	condArgs := jwtConditionArgs(target, args)
+	// Hoisted beside condArgs: both are loop-invariant, and flatMap falls back to REBUILDING
+	// the flat claim map for a *JWTClaims that never went through ValidateToken (the
+	// documented test/embedder case), which inside the loop would be one map allocation per
+	// candidate grant.
+	flatClaims := claims.flatMap()
 	var lastDeny *capability.EnforceResponse
 	for i := range constraints {
 		matched := constraints[i]
@@ -1415,7 +1447,7 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 			lastDeny = nil
 			break
 		}
-		if resp := evaluateJWTConditions(p.clock, matched.Conditions, target.Name, condArgs, claims.flatMap()); resp != nil {
+		if resp := evaluateJWTConditions(p.clock, matched.Conditions, target.Name, condArgs, flatClaims); resp != nil {
 			lastDeny = resp
 			continue
 		}
@@ -2121,10 +2153,16 @@ func (p *JWTPDP) ReleaseSession(ctx context.Context, sessionID string) {
 
 // RestoreDeclassified delegates to the inner PDP, which owns the flow store the clear was
 // committed against. The JWT layer clears no label of its own — a token can only restrict —
-// so a nil inner has nothing to undo.
-func (p *JWTPDP) RestoreDeclassified(ctx context.Context, sessionID string, labels []string) error {
-	if p.inner == nil {
-		return nil
+// so a nil inner has nothing to undo. p == nil guards the typed-nil case for the same reason
+// ManifestPDP's does: this is reached through the transport's restorer interface on a
+// refusal path, where a panic is a fail-open-via-crash.
+//
+// A nil inner reports restored only for the empty set. Reaching here with labels in hand
+// means the clear was committed by a layer this wrapper cannot see, so claiming the revert
+// happened would put that claim on the signed tape unbacked.
+func (p *JWTPDP) RestoreDeclassified(ctx context.Context, sessionID string, labels []string) (bool, error) {
+	if p == nil || p.inner == nil {
+		return len(labels) == 0, nil
 	}
 	return p.inner.RestoreDeclassified(ctx, sessionID, labels)
 }

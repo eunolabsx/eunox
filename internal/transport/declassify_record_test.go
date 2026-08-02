@@ -14,6 +14,7 @@ import (
 	"github.com/eunolabs/eunox/internal/audit"
 	"github.com/eunolabs/eunox/internal/config"
 	"github.com/eunolabs/eunox/internal/mcp"
+	"github.com/eunolabs/eunox/internal/pdp"
 	"github.com/eunolabs/eunox/pkg/capability"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -125,17 +126,38 @@ func TestRouteSink_DeclassifiedAllowStampsRouteIdentity(t *testing.T) {
 }
 
 // restoreSpy is the transport's view of the PDP for the undo path: it records what it was
-// asked to put back, and can fault on demand so the fail-open residual is reachable.
+// asked to put back and the context it was handed, and can fault or DECLINE on demand so
+// both shapes of the fail-open residual are reachable.
 type restoreSpy struct {
 	labels  []string
 	calls   int
 	failErr error
+	decline bool // report restored=false with no error, as a PDP with no store does
+	// What the restore context looked like: whether it was already done, whether it stayed
+	// bounded, and whether the request's values (which the state anchor resolves from)
+	// survived the detach.
+	sawErr    error
+	sawBound  bool
+	sawValue  interface{}
+	sawCalled bool
 }
 
-func (r *restoreSpy) RestoreDeclassified(_ context.Context, _ string, labels []string) error {
+// restoreCtxProbe keys a value planted on the request context, so a test can assert the
+// restore context still carries it — WithoutCancel preserves values, context.Background()
+// would not.
+type restoreCtxProbe struct{}
+
+func (r *restoreSpy) RestoreDeclassified(ctx context.Context, _ string, labels []string) (bool, error) {
 	r.calls++
+	r.sawCalled = true
 	r.labels = append([]string(nil), labels...)
-	return r.failErr
+	r.sawErr = ctx.Err()
+	_, r.sawBound = ctx.Deadline()
+	r.sawValue = ctx.Value(restoreCtxProbe{})
+	if r.failErr != nil {
+		return false, r.failErr
+	}
+	return !r.decline, nil
 }
 
 // TestEnforcedForwardCore_RefusalAfterDeclassifyRestoresTheLabels is the fail-open the
@@ -247,6 +269,111 @@ func TestEnforcedForwardCore_UnrestorableDeclassifyIsRecorded(t *testing.T) {
 	// The strict gate's own counts survive the merge — the undo adds fields, never replaces
 	// the record the refusal is actually about.
 	assert.Equal(t, capability.ErrCodeAuditUnavailable, got.code)
+}
+
+// TestEnforcedForwardCore_RestoreOutlivesTheRequestContext is the case that made the undo
+// a no-op in exactly the deployment it was written for. The restore ran on the REQUEST's
+// context — and on the upstream-failure exit that context is frequently the very thing that
+// failed the call (a client disconnect surfaces as REQUEST_CANCELED). A context-honouring
+// FlowLabelStore (the Redis backend passes ctx into every pipelined command) then refused
+// the write immediately, so the labels stayed cleared and the record blamed a store that
+// was healthy. The in-memory store ignores ctx, which is why every earlier test passed.
+//
+// It must be detached from CANCELLATION but not from VALUES: the anchor the labels are
+// restored under resolves from the request's validated claims, so context.Background()
+// would restore a task-anchored clear under the session key — untainting the task while
+// reporting success. WithoutCancel plus a bound is the shape.
+func TestEnforcedForwardCore_RestoreOutlivesTheRequestContext(t *testing.T) {
+	rec, spy := &fwdRecorder{}, &restoreSpy{}
+	// A value stands in for the validated JWT claims the real request context carries and
+	// the state anchor resolves from.
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), restoreCtxProbe{}, "claims"))
+	defer cancel()
+	fp := forwardParams{rec: rec, sessionID: "s", restorer: spy,
+		callUpstream: func(context.Context, mcp.RPCMsg) (mcp.RPCMsg, error) {
+			// What a client disconnect looks like from here: the call fails BECAUSE the
+			// request context is done.
+			cancel()
+			return mcp.RPCMsg{}, context.Canceled
+		}}
+
+	enforcedForwardCore(ctx, fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
+		declassifiedAllow(), "tools/call", "sanitize", "sanitize", "tool", false, upstreamErrorDetail)
+
+	require.True(t, spy.sawCalled)
+	assert.NoError(t, spy.sawErr,
+		"the restore must not run on an already-canceled context — against a ctx-honouring store it would fail every time, in exactly the case it exists for")
+	assert.True(t, spy.sawBound, "and it must stay bounded rather than run unbounded after the request")
+	assert.Equal(t, "claims", spy.sawValue,
+		"cancellation is detached, VALUES are not: the state anchor resolves from the request's claims, so context.Background() would restore under the wrong key")
+	require.Len(t, rec.records, 1)
+	assert.Equal(t, []string{capability.FlowLabelPII}, rec.records[0].details["declassify_reverted"])
+}
+
+// TestEnforcedForwardCore_DeclinedRestoreIsNotRecordedAsReverted is the audit-integrity
+// half. A restorer that DECLINES — a PDP with no engine, a wrapper whose inner is gone, an
+// engine with no flow store — leaves the labels exactly as un-restored as a failed write
+// does. Reporting only an error made the two indistinguishable, so the transport stamped
+// declassify_reverted: a signed claim that the session was put back as it was, with nothing
+// behind it, suppressing the one key operators are told to alert on.
+func TestEnforcedForwardCore_DeclinedRestoreIsNotRecordedAsReverted(t *testing.T) {
+	rec := &fwdRecorder{}
+	spy := &restoreSpy{decline: true} // no error, but nothing written either
+	fp := forwardParams{rec: rec, sessionID: "s", restorer: spy,
+		callUpstream: func(context.Context, mcp.RPCMsg) (mcp.RPCMsg, error) {
+			return mcp.RPCMsg{}, errors.New("upstream gone")
+		}}
+
+	enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
+		declassifiedAllow(), "tools/call", "sanitize", "sanitize", "tool", false, upstreamErrorDetail)
+
+	require.Len(t, rec.records, 1)
+	got := rec.records[0]
+	assert.Equal(t, []string{capability.FlowLabelPII}, got.details["declassify_orphaned"],
+		"a declined restore is as un-restored as a failed one and must alert the same way")
+	assert.Nil(t, got.details["declassify_reverted"],
+		"the tape must never assert a revert the PDP did not perform")
+}
+
+// TestEnforcedForwardCore_BoundsTheApprovalID keeps an IdP-supplied string off the tape
+// unbounded. DeclassifyApproval.Validate places no length limit on the id, and a value
+// written straight into a transport-built details map reaches the sink under only the 1 MiB
+// whole-map cap — where the same value on the allow record is cut at the 8 KiB envelope cap.
+func TestEnforcedForwardCore_BoundsTheApprovalID(t *testing.T) {
+	rec, spy := &fwdRecorder{}, &restoreSpy{}
+	dec := declassifiedAllow()
+	dec.ApprovalID = strings.Repeat("a", 64*1024)
+	fp := forwardParams{rec: rec, sessionID: "s", restorer: spy,
+		callUpstream: func(context.Context, mcp.RPCMsg) (mcp.RPCMsg, error) {
+			return mcp.RPCMsg{}, errors.New("upstream gone")
+		}}
+
+	enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
+		dec, "tools/call", "sanitize", "sanitize", "tool", false, upstreamErrorDetail)
+
+	require.Len(t, rec.records, 1)
+	got, ok := rec.records[0].details["declassify_approval_id"].(string)
+	require.True(t, ok)
+	assert.Less(t, len(got), len(dec.ApprovalID), "an unbounded IdP string must not reach the tape verbatim")
+	assert.Contains(t, got, "eunox: truncated", "and the cut must be visible")
+}
+
+// TestDispatchParams_WireTheRestorerFromTheDecidingPDP closes the gap that let the whole
+// undo be deleted with green tests: every other test builds a forwardParams literal by
+// hand, so nothing exercised the PRODUCTION wiring. Both transports must derive the
+// restorer from the same PDP they decide with — two independently-assigned fields is a
+// drift surface whose failure mode is silent (declassify_orphaned on every refusal while
+// the labels really are gone).
+func TestDispatchParams_WireTheRestorerFromTheDecidingPDP(t *testing.T) {
+	sp := &StdioProxy{pdp: pdp.DenyAllPDP{}}
+	d := sp.dispatchParams()
+	require.NotNil(t, d.restorer, "stdio must wire the undo")
+	assert.Equal(t, d.pdp, d.restorer, "and it must be the PDP that decided")
+
+	hp := &HTTPProxy{}
+	hd := hp.dispatchParams(&httpSession{id: "s", route: &UpstreamRoute{pdp: pdp.DenyAllPDP{}}}, "")
+	require.NotNil(t, hd.restorer, "http must wire the undo")
+	assert.Equal(t, hd.pdp, hd.restorer, "and it must be the PDP that decided")
 }
 
 // TestEnforcedForwardCore_OrdinaryRefusalTouchesNoRestorer is the negative half: a call

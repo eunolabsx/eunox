@@ -351,12 +351,17 @@ var conditionPrototypes = map[string]func() Condition{
 
 // knownConditionTypes is every discriminator in the registry, sorted so the "did you mean"
 // hint resolves ties deterministically (a map's iteration order would not).
-var knownConditionTypes = sortedConditionTypes()
+var knownConditionTypes = sortedRegistryKeys(conditionPrototypes)
 
-// sortedConditionTypes returns the registry's discriminators in lexical order.
-func sortedConditionTypes() []string {
-	out := make([]string, 0, len(conditionPrototypes))
-	for t := range conditionPrototypes {
+// sortedRegistryKeys returns a prototype registry's discriminators in lexical order. It is
+// generic over the prototype constructor so the condition and directive registries share one
+// derivation: two copies of "collect the map keys and sort them" is the same mirrored-table
+// shape the registries themselves exist to remove, and a later refinement of how a
+// vocabulary is derived (an alias table, a non-lexical tie-break) must not land on one of
+// them only.
+func sortedRegistryKeys[V any](prototypes map[string]V) []string {
+	out := make([]string, 0, len(prototypes))
+	for t := range prototypes {
 		out = append(out, t)
 	}
 	sort.Strings(out)

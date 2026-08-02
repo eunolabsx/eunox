@@ -247,15 +247,13 @@ func (p *HTTPProxy) dispatchParams(sess *httpSession, sourceIP string) dispatchP
 			sessionID:        sess.id,
 			upstreamTimeMs:   p.upstreamTimeMs,
 			callUpstream:     sess.callUpstream,
-			restorer:         rt.pdp,
 			strictAuditState: p.strictAudit(),
 		},
-		pdp:              rt.pdp,
 		sourceIP:         sourceIP,
 		buildInit:        sess.buildInitResponse,
 		receipts:         rt.receipts,
 		honorAttribution: rt.honorAttribution,
-	}
+	}.withPDP(rt.pdp)
 }
 
 // initStrictAuditDenial applies the --require-audit=strict gate to the

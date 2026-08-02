@@ -201,7 +201,12 @@ var goConditionTypes = []string{
 // as such a list does: it still named only redactFields after labelOutput and
 // declassify shipped, so the round-trip assertions below covered one third of the
 // vocabulary while reading as if they covered all of it.
-var goDirectiveTypes = knownDirectiveTypes
+//
+// Through the accessor, not by aliasing knownDirectiveTypes: that variable is read on a
+// PRODUCTION path (unmarshalDirective enumerates it in the unknown-type error), so a test
+// that sorted or wrote an element of a shared backing array would corrupt the vocabulary
+// the decoder reports — and race against the parallel registry tests reading it.
+var goDirectiveTypes = KnownDirectiveTypes()
 
 // TestConditionTypeConstantsValid verifies that each Go condition type constant
 // is a non-empty camelCase string and matches the JSON round-trip discriminator.

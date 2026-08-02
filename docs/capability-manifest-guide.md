@@ -2409,12 +2409,25 @@ recording, and the deny record says so:
 | detail key | meaning |
 | --- | --- |
 | `declassify_reverted` | the labels were put back; the session is as it was |
-| `declassify_orphaned` | they could **not** be put back (the flow store was unreachable) — the labels are gone for a call that never ran, and a later sink will now pass |
+| `declassify_orphaned` | they could **not** be put back — the labels are gone for a call that never ran, and a later sink will now pass |
 | `declassify_approval_id` | the grant, which stays **burned** either way — a `once` approval spent on a call that did not run needs replacing |
 
 `declassify_orphaned` is the one to alert on. It is spelled
 `declassify_approval_id` rather than `approval_id` so the top-level signed field
 keeps meaning "a declassification that actually took effect".
+
+Two limits worth knowing:
+
+- These keys appear only when the clear **changed** something. A `once` grant
+  presented on a session that was not carrying the label is still burned (see
+  above), but nothing was cleared, so a refusal after it records no
+  `declassify_approval_id` — same rule as the allow, which stamps no `approver`
+  for a no-op clear. Reconcile a spent grant against the allow record, not the
+  refusal.
+- The undo runs *after* the upstream round trip, while the clear committed
+  *inside* the decision. A concurrent request decided in between sees the cleared
+  set, so a sink that would have blocked can be allowed during that window
+  (bounded by `--upstream-timeout`). See the threat model's §3.13 residual.
 
 `eunox stats` counts both: escalations as the approval queue, declassifications
 as the number of times a human agreed to drop taint. A declassification count
