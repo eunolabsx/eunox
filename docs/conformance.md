@@ -149,6 +149,16 @@ verified: a malformed pattern (e.g. an unclosed character class) rejects the tok
 up front rather than silently matching nothing and denying every affected call
 with a misleading `VALUE_NOT_PERMITTED` — mirroring the manifest load-time check.
 
+The one exception, and it is the same exception the manifest path makes: a
+**recognized `${task.*}` reference** (`?workspace_id=${task.id}`) is not a glob.
+It is compared by exact equality against the value the token's own claim resolves
+to, never glob-matched — a `task_id` of `*` must not become a wildcard the token
+holder granted themselves — and it never matches its own placeholder text. An
+*unrecognized* reference (`${STAGE}`) stays an ordinary literal and matches itself:
+a claim value has not passed through the manifest loader, so there is no
+load-time error to report, and treating it as a reference would void the grant
+with nothing to grep for. See the capability manifest guide, §5.4.
+
 Every enforcing route in JWT mode has a manifest. JWT mode requires the HTTP
 transport, where — since SEC-05 (see the
 [fail-closed invariant](#fail-closed-invariant-enforce-mode) above) — a route
