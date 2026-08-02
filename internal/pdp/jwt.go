@@ -115,6 +115,12 @@ type JWTClaims struct {
 	// it is parsed and validated at the token boundary (ValidateToken) rather than read
 	// out of Extra on the decision path.
 	Declassify []capability.DeclassifyApproval
+	// Delegation holds the token's validated delegation chain: its RFC 8693 `act` actors
+	// and its `mcp.delegation` per-hop grants, already asserted to narrow at every hop.
+	// Nil for the overwhelming majority of tokens. Like Declassify it is decoded and
+	// checked at the token boundary (ValidateToken) rather than read out of Extra on the
+	// decision path — a widening chain is a rejected token, not a decision-time surprise.
+	Delegation *capability.DelegationChain
 	// ExpiresAt is the verified token's `exp` as a wall-clock time. ValidateToken
 	// rejects a token with no exp, so this is always set on a validated JWTClaims; it is
 	// the zero Time for a JWTClaims built without ValidateToken (e.g. tests). A long-lived
@@ -171,6 +177,19 @@ func declassifyApprovalsFromContext(ctx context.Context) []capability.Declassify
 	return nil
 }
 
+// delegationFromContext returns the validated delegation chain the request's token declared,
+// or nil when there is no token or it declared none — the default, and what makes a
+// deployment with no delegation integration behave exactly as it does today.
+//
+// It reads the typed, already-validated JWTClaims rather than the flat input.claims map, for
+// the reason declassifyApprovalsFromContext does: every axis this carries bounds a decision.
+func delegationFromContext(ctx context.Context) *capability.DelegationChain {
+	if c, ok := jwtClaimsFromContext(ctx); ok {
+		return c.Delegation
+	}
+	return nil
+}
+
 // jwtClaimsFromContext retrieves JWT claims from the context.
 func jwtClaimsFromContext(ctx context.Context) (*JWTClaims, bool) {
 	c, ok := ctx.Value(jwtClaimsKey{}).(*JWTClaims)
@@ -211,6 +230,12 @@ type mcpClaimSet struct {
 	// being re-modeled here. Absent on every token that is not carrying an approval,
 	// which is nearly all of them.
 	Declassify json.RawMessage `json:"declassify,omitempty"`
+	// Delegation carries the per-hop attenuation grants of a delegation chain
+	// (capability.DelegationGrant), held raw and decoded through
+	// capability.ParseDelegationGrants for the same reason Declassify is: the grammar,
+	// its validation, and its unknown-field rejection live in the package that owns
+	// them. Absent on every token that is not a delegated one.
+	Delegation json.RawMessage `json:"delegation,omitempty"`
 }
 
 // idpJWTPayload is the subset of IdP JWT claims relevant to MCP enforcement.
@@ -218,6 +243,10 @@ type mcpClaimSet struct {
 // jwt.Claims; this struct handles only the MCP-specific custom claims.
 type idpJWTPayload struct {
 	MCP mcpClaimSet `json:"mcp"`
+	// Act is the RFC 8693 §4.1 actor chain, a top-level claim rather than an mcp one
+	// because it is a standard OAuth token-exchange claim an IdP emits on its own terms.
+	// Held raw and walked by capability.ParseActorChain.
+	Act json.RawMessage `json:"act,omitempty"`
 }
 
 // JWTPDP validates IdP-issued JWTs and enforces capability claims.
@@ -550,6 +579,7 @@ const (
 	jwtErrCapabilitiesDisabled = "capabilities_disabled"
 	jwtErrInvalidCapabilities  = "invalid_capabilities"
 	jwtErrInvalidDeclassify    = "invalid_declassify"
+	jwtErrInvalidDelegation    = "invalid_delegation"
 	jwtErrSenderConstrained    = "sender_constrained"
 	// jwtErrJWKSUnavailable marks a validation that failed because the key set could
 	// not be fetched (network error, non-200, empty/oversized set, open breaker), not
@@ -621,16 +651,49 @@ func ClassifyJWTError(err error) string {
 	}
 }
 
+// parseDelegationChain decodes and asserts a token's delegation state: the RFC 8693 `act`
+// actor chain and the mcp.delegation per-hop grants. It runs at the TOKEN boundary, for the
+// same reason the declassify approvals are parsed there: a chain this build cannot read, or
+// one whose hops WIDEN rather than narrow, is a token making a delegation claim the proxy
+// cannot honor — and the operator's whole reason for minting the chain is that "the delegate
+// is no broader than its delegator" is checkable. Rejecting the token is what makes it
+// checkable; clamping a widening hop would leave the token working while quietly meaning
+// something other than what it says.
+//
+// Like the approvals and unlike mcp.capabilities, this is not behind the experimental gate:
+// every axis a grant carries NARROWS, so a build that honors it can only deny more than one
+// that ignores it. There is no fail-open direction to gate against.
+//
+// Returns (nil, nil) for the overwhelming majority of tokens, which declare neither claim.
+// Every error is already Terminal-wrapped for the caller (verified-but-invalid, not a
+// retryable transport fault).
+func parseDelegationChain(payload idpJWTPayload) (*capability.DelegationChain, error) {
+	actors, err := capability.ParseActorChain(payload.Act)
+	if err != nil {
+		return nil, capability.Terminal(jwtErr(jwtErrInvalidDelegation, err))
+	}
+	grants, err := capability.ParseDelegationGrants(payload.MCP.Delegation)
+	if err != nil {
+		return nil, capability.Terminal(jwtErr(jwtErrInvalidDelegation, err))
+	}
+	chain, err := capability.ValidateDelegationChain(actors, grants)
+	if err != nil {
+		return nil, capability.Terminal(jwtErr(jwtErrInvalidDelegation, err))
+	}
+	return chain, nil
+}
+
 // newValidatedClaims assembles the *JWTClaims a successful ValidateToken returns,
 // memoizing at validation the two derived views later per-request decisions reuse:
 // the parsed capability heads (parsedCaps) and the flattened input.claims map
 // (flatClaims). Both are computed once here so decide/list-filter/sampling calls hand
 // out precomputed values instead of re-parsing/re-building per request.
-func newValidatedClaims(capsList []string, capsPresent bool, declassify []capability.DeclassifyApproval, payload idpJWTPayload, std jwt.Claims, rawClaims map[string]interface{}) *JWTClaims {
+func newValidatedClaims(capsList []string, capsPresent bool, declassify []capability.DeclassifyApproval, delegation *capability.DelegationChain, payload idpJWTPayload, std jwt.Claims, rawClaims map[string]interface{}) *JWTClaims {
 	claims := &JWTClaims{
 		Capabilities:    capsList,
 		HasCapabilities: capsPresent,
 		Declassify:      declassify,
+		Delegation:      delegation,
 		TaskID:          payload.MCP.TaskID,
 		AgentID:         payload.MCP.AgentID,
 		Subject:         std.Subject,
@@ -882,6 +945,12 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 			return nil, capability.Terminal(jwtErr(jwtErrInvalidDeclassify, declErr))
 		}
 
+		// Delegation attenuation, decoded and asserted at this same boundary.
+		delegation, delegErr := parseDelegationChain(payload)
+		if delegErr != nil {
+			return nil, delegErr
+		}
+
 		// Sub is the primary identity anchor; without it a token cannot be attributed
 		// in audit records or matched against principal-scoped constraints. Reject
 		// (fail closed).
@@ -906,7 +975,7 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 			return nil, capability.Terminal(jwtErr(jwtErrSenderConstrained, fmt.Errorf("sender-constrained token (cnf) requires proof-of-possession, which the proxy does not verify; refusing to accept it as a plain bearer token (fail closed)")))
 		}
 
-		return newValidatedClaims(capsList, capabilitiesPresent, declassify, payload, stdClaims, rawClaims), nil
+		return newValidatedClaims(capsList, capabilitiesPresent, declassify, delegation, payload, stdClaims, rawClaims), nil
 	})
 	if err != nil {
 		return ctx, err

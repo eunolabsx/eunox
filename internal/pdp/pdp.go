@@ -968,11 +968,18 @@ func (*ManifestPDP) CheckAudience(_ context.Context) *capability.EnforceResponse
 	return nil
 }
 
-// ReleaseSession releases the session's accumulated flow-label state on teardown, via
-// the engine (which namespaces the store key by route). A no-op when the policy uses no
-// flow control or no store is wired (see Engine.ClearSessionLabels). Best-effort: a
-// store fault on teardown is swallowed rather than surfaced — the session is already
-// gone, and a Redis-backed store reclaims an orphaned key by idle TTL regardless.
+// ReleaseSession releases the session's accumulated flow-label state and its spent
+// single-use declassify grants on teardown, via the engine (which namespaces the store keys
+// by route). A no-op when the policy uses no flow control or no store is wired (see
+// Engine.ClearSessionLabels). Best-effort: a store fault on teardown is swallowed rather
+// than surfaced — the session is already gone, and a Redis-backed store reclaims an orphaned
+// key by idle TTL regardless.
+//
+// Both releases are SESSION-anchored. Under task anchoring the same state may have been
+// written under the task's key instead, and that is deliberately not reclaimed here: it is
+// the state whose whole purpose is to outlive this session, and clearing it on disconnect
+// would let an agent launder a task's taint — or recover a spent one-shot approval — by
+// reconnecting.
 func (p *ManifestPDP) ReleaseSession(ctx context.Context, sessionID string) {
 	// Drop the Tier-2 interface baseline first, and unconditionally: it is local state
 	// that must be reclaimed even for a PDP built without an engine, and leaving it
@@ -983,6 +990,7 @@ func (p *ManifestPDP) ReleaseSession(ctx context.Context, sessionID string) {
 		return
 	}
 	_ = p.engine.ClearSessionLabels(ctx, sessionID)
+	_ = p.engine.ClearSessionApprovals(ctx, sessionID)
 }
 
 // Decide evaluates a tools/call against the manifest: it selects the
@@ -1096,6 +1104,10 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 		// not a declassification, which is nearly all of them; without one, a declassify
 		// directive escalates rather than clearing a label.
 		DeclassifyApprovals: declassifyApprovalsFromContext(ctx),
+		// The attenuation the token's delegation chain declared, already asserted to narrow
+		// at every hop. Nil for every non-delegated request; when present it can only ever
+		// subtract from what the manifest already allowed.
+		Delegation: delegationFromContext(ctx),
 	}
 
 	matched := p.findConstraint(target, claims)
@@ -1551,7 +1563,7 @@ func (p *ManifestPDP) withForwardObligationsFor(ctx context.Context, r capabilit
 	if !willForwardDeny(ctx, matched) || matched == nil {
 		return r
 	}
-	obs, deny := p.engine.CollectObligations(matched, r.RequestID, r.DecidedAt)
+	obs, deny := p.engine.CollectObligations(delegationFromContext(ctx), matched, r.RequestID, r.DecidedAt)
 	if deny != nil {
 		return *deny
 	}
@@ -1570,10 +1582,15 @@ func (p *ManifestPDP) withForwardObligations(ctx context.Context, r capability.E
 		return r
 	}
 	dirs := p.directivesNamingTarget(target)
-	if len(dirs) == 0 {
+	chain := delegationFromContext(ctx)
+	// The early return has to account for the chain too: a delegated caller whose hops
+	// compose a redactFields list must have it applied even when no manifest entry names this
+	// target, and returning on `len(dirs) == 0` alone would forward the response unmasked on
+	// exactly the no-match-under-audit path this function exists to cover.
+	if len(dirs) == 0 && len(chain.RedactFields()) == 0 {
 		return r
 	}
-	obs, deny := p.engine.CollectObligations(&capability.Constraint{Target: string(target.Type) + ":" + target.Name, Directives: dirs}, r.RequestID, r.DecidedAt)
+	obs, deny := p.engine.CollectObligations(chain, &capability.Constraint{Target: string(target.Type) + ":" + target.Name, Directives: dirs}, r.RequestID, r.DecidedAt)
 	if deny != nil {
 		return *deny
 	}
@@ -2061,17 +2078,17 @@ func (p *ManifestPDP) DecidePromptGet(ctx context.Context, sessionID, promptName
 // read from ctx so a principal-scoped entry is hidden from an identity that does
 // not match it, keeping the visible list aligned with what the caller can invoke.
 func (p *ManifestPDP) FilterToolsList(ctx context.Context, result json.RawMessage) ListFilterResult {
-	return filterToolsListResult(result, p, jwtClaimsAsMap(ctx), sessionIDFromContext(ctx), CompleteToolListingFromContext(ctx))
+	return filterToolsListResult(result, p, jwtClaimsAsMap(ctx), delegationFromContext(ctx), sessionIDFromContext(ctx), CompleteToolListingFromContext(ctx))
 }
 
 // FilterResourcesList implements ListFilterer for the manifest PDP.
 func (p *ManifestPDP) FilterResourcesList(ctx context.Context, result json.RawMessage) ListFilterResult {
-	return filterResourcesListResult(result, p, jwtClaimsAsMap(ctx))
+	return filterResourcesListResult(result, p, jwtClaimsAsMap(ctx), delegationFromContext(ctx))
 }
 
 // FilterPromptsList implements ListFilterer for the manifest PDP.
 func (p *ManifestPDP) FilterPromptsList(ctx context.Context, result json.RawMessage) ListFilterResult {
-	return filterPromptsListResult(result, p, jwtClaimsAsMap(ctx))
+	return filterPromptsListResult(result, p, jwtClaimsAsMap(ctx), delegationFromContext(ctx))
 }
 
 // emptyListEnvelope holds precomputed fail-closed envelopes keyed by list field
@@ -2325,13 +2342,13 @@ func replaceOrderedListField(envelope json.RawMessage, fieldName string, entries
 // list filter (anyCapCovers), which likewise defer conditions to the call leg; the
 // trade-off is that a resource whose read always denies on a uri allowedValues can
 // still be advertised. Fails closed to an empty list on error.
-func filterResourcesListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims map[string]interface{}) ListFilterResult {
+func filterResourcesListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims map[string]interface{}, chain *capability.DelegationChain) ListFilterResult {
 	// The entry-ambiguity gate, the constraint lookup and the action check live in
 	// keepByManifestEntry, shared with prompts/list; only the id field differs. Here the
 	// smuggled key would be "uri" vs "URI", which decides which resource the host
 	// believes it is reading.
 	return filterListResult(resultBytes, listKeyResources,
-		keepByManifestEntry(mdp, claims, capability.TargetTypeResource, "read", func(raw json.RawMessage) (string, bool) {
+		keepByManifestEntry(mdp, claims, chain, capability.TargetTypeResource, "read", func(raw json.RawMessage) (string, bool) {
 			var entry struct {
 				URI string `json:"uri"`
 			}
@@ -2358,6 +2375,7 @@ func filterResourcesListResult(resultBytes json.RawMessage, mdp *ManifestPDP, cl
 func keepByManifestEntry(
 	mdp *ManifestPDP,
 	claims map[string]interface{},
+	chain *capability.DelegationChain,
 	targetType capability.TargetType,
 	requiredAction string,
 	entryID func(json.RawMessage) (string, bool),
@@ -2368,6 +2386,14 @@ func keepByManifestEntry(
 		}
 		id, ok := entryID(raw)
 		if !ok {
+			return false, ""
+		}
+		// An entry no hop of the caller's delegation chain admits is hidden, for the reason
+		// every other hide-here-and-deny-there rule in this file exists: the call leg will
+		// refuse it, and a catalog advertising an action the caller cannot take is a catalog
+		// the model will spend turns trying to use. Delegation narrows only, so this can
+		// only ever remove entries a wider caller would still see.
+		if permitted, _ := chain.PermitsTarget(string(targetType) + ":" + id); !permitted {
 			return false, ""
 		}
 		c := mdp.findConstraint(EnforceTarget{Type: targetType, Name: id}, claims)
@@ -3341,7 +3367,7 @@ func ToolsKeyAmbiguous(raw json.RawMessage) bool {
 	return toolsKeyAmbiguous(raw)
 }
 
-func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims map[string]interface{}, sessionID string, completeListing bool) ListFilterResult {
+func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims map[string]interface{}, chain *capability.DelegationChain, sessionID string, completeListing bool) ListFilterResult {
 	// Arm the pins over the WHOLE catalog first, then filter. Recording and poisoning
 	// happen here — in the one pass the observe route shares (armPinsFromToolsList) — so
 	// the two routes cannot drift, and so every poison discovered anywhere in the array is
@@ -3400,6 +3426,13 @@ func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims
 		if v.drop {
 			return false, ""
 		}
+		// Hidden when the caller's delegation chain does not reach it, mirroring the call
+		// leg's own delegation gate so the catalog never advertises a tool this delegate
+		// will be refused. Placed before the constraint lookup because it does not need
+		// one: the chain bounds the caller regardless of what the manifest says.
+		if permitted, _ := chain.PermitsTarget("tool:" + v.name); !permitted {
+			return false, ""
+		}
 		c := mdp.findConstraint(EnforceTarget{Type: capability.TargetTypeTool, Name: v.name}, claims)
 
 		// c is nil when the tool is absent from the manifest; guard every dereference
@@ -3440,14 +3473,14 @@ func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims
 // and the JWT list filter (anyCapCovers), which likewise defer conditions to the
 // call leg; the trade-off is that a prompt whose get always denies on a name
 // allowedValues can still be advertised. Fails closed to an empty list on error.
-func filterPromptsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims map[string]interface{}) ListFilterResult {
+func filterPromptsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims map[string]interface{}, chain *capability.DelegationChain) ListFilterResult {
 	// Shares keepByManifestEntry with resources/list, so the entry-ambiguity gate cannot
 	// be present on one flavor and missing on the other: a prompt entry carrying both
 	// "name" and "Name" would otherwise be kept under Go's decoded name while a host
 	// renders the other, and a prompt description reaches the model exactly as a tool
 	// description does. All three list flavors share the FM-5 surface.
 	return filterListResult(resultBytes, listKeyPrompts,
-		keepByManifestEntry(mdp, claims, capability.TargetTypePrompt, "get", func(raw json.RawMessage) (string, bool) {
+		keepByManifestEntry(mdp, claims, chain, capability.TargetTypePrompt, "get", func(raw json.RawMessage) (string, bool) {
 			var entry struct {
 				Name string `json:"name"`
 			}

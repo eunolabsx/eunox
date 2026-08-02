@@ -23,17 +23,31 @@ import (
 // reclaimed by the transport's Clear on session end (a windowed marker aged a taint out
 // mid-session, a fail-open the "for all flows" claim cannot tolerate). See
 // pkg/flowlabelstore.
+//
+// Under WithTaskAnchoredState the same set is keyed on the validated task instead, so taint
+// crosses a hop between enforcement points rather than restarting clean on the far side.
+// See anchor.go.
 
 // flowLabelVocab is the native flow-label vocabulary, cached once from
 // capability.FlowLabelVocabulary so the subset check and the accumulated-set peek do
 // not re-allocate it per request. Read-only.
 var flowLabelVocab = capability.FlowLabelVocabulary()
 
-// flowSessionKey builds the per-session flow-label store key. namespace (the engine's
-// counterKeyNamespace) leads so routes sharing one FlowLabelStore address disjoint
-// label state, mirroring sequenceHistoryKey. There is no per-label component: the store
-// holds the whole accumulated SET under this one key (Add unions, Get returns the set),
-// where the old windowed counter needed one marker key per label.
+// flowKey builds the flow-label store key for a request's anchor — the session, or the
+// validated task under WithTaskAnchoredState. namespace (the engine's counterKeyNamespace)
+// leads so routes sharing one FlowLabelStore address disjoint label state, mirroring
+// sequenceHistoryKey. There is no per-label component: the store holds the whole accumulated
+// SET under this one key (Add unions, Get returns the set), where the old windowed counter
+// needed one marker key per label.
+func (e *Engine) flowKey(req *capability.EnforceRequest) string {
+	return e.anchoredKey("flow", req)
+}
+
+// flowSessionKey is the SESSION-anchored flow key, for the one caller that has a session id
+// and nothing else: the transport's teardown Clear. It equals flowKey for every request
+// without task anchoring, and under task anchoring it addresses the key a task-less request
+// on that session would have written — which is precisely what teardown should reclaim and
+// all it should reclaim.
 func (e *Engine) flowSessionKey(sessionID string) string {
 	return compositeCounterKey("flow", e.counterKeyNamespace, sessionID)
 }
@@ -84,10 +98,20 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 		}
 	}
 
+	// Compose the delegation chain's allow-set cap into the condition's own: the effective
+	// allow-set is the manifest's Allow INTERSECTED with what every hop kept. Intersection is
+	// the only safe composition, because the sink rule is "present and not allowed => deny" —
+	// so a hop's cap can only ever remove entries, never add one. A hop with a present-empty
+	// allowLabels reduces this to the empty set, which is the full quarantine: a delegate
+	// sharing a tainted task then reaches no labeled sink at all, whatever it is injected to
+	// call.
+	effectiveAllow := delegatedAllowLabels(fl.Allow, req.Delegation)
+
 	// Defense in depth: the loader rejects an unknown label in Allow, but a
 	// programmatically built condition can carry one. Surface it rather than silently
-	// ignore (matching recordLabels, which also errors on an unknown label).
-	allow := make(map[string]bool, len(fl.Allow))
+	// ignore (matching recordLabels, which also errors on an unknown label). The unknown-label
+	// scan runs over the AUTHORED set, not the intersected one, so a typo in the manifest is
+	// still reported when a delegation cap happens to have removed the entry.
 	for _, l := range fl.Allow {
 		if !capability.IsFlowLabel(l) {
 			return &ConditionError{
@@ -96,6 +120,9 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 				Message:       fmt.Sprintf("flowLabel 'allow' contains unknown label %q; valid native labels are %v", l, flowLabelVocab),
 			}
 		}
+	}
+	allow := make(map[string]bool, len(effectiveAllow))
+	for _, l := range effectiveAllow {
 		allow[l] = true
 	}
 
@@ -148,6 +175,21 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 	declared := capability.NormalizeDeclaredLabels(req.DeclaredLabels)
 	present = unionLabels(present, declared)
 
+	// Union in the taint every hop of the delegation chain forces onto this delegate's calls.
+	// It is the same one-directional rule the client attribution above follows and safe for
+	// the same reason — more taint produces only more denials — but it is not the same input:
+	// the client's declaration is a cooperating agent describing its own inputs, while this is
+	// what the delegators DECIDED this delegate is, carried on a verified token the delegate
+	// cannot edit. A sub-agent reading arbitrary web content is `untrusted` whether or not it
+	// cares to say so, which is precisely what makes the quarantine hold against an agent that
+	// has been fully injected.
+	//
+	// Like the declaration, it is used for THIS check only and never written into the anchor's
+	// stored set: it is the delegate's own constitution, not something it deposits on the task
+	// for every hop that follows.
+	forced := req.Delegation.ForcedLabels()
+	present = unionLabels(present, forced)
+
 	// blocked = present labels not permitted here. present is vocabulary-ordered (both
 	// the threaded snapshot and the fallback append in vocab order), so blocked is too.
 	var blocked []string
@@ -170,7 +212,11 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 					"flow":          true,
 					"blockedLabel":  blocked[len(blocked)-1],
 					"blockedLabels": blocked,
-					"allowLabels":   fl.Allow,
+					// The EFFECTIVE allow-set the check ran against, not the authored one:
+					// under a delegation cap the two differ, and recording the manifest's
+					// list would put a set on the tape that no decision used — sending an
+					// operator to widen a sink rule that was never what refused the call.
+					"allowLabels": effectiveAllow,
 				}
 				// Record the client's own attribution separately from the proxy's observed
 				// state, so an auditor can tell a denial the proxy derived from one the
@@ -178,6 +224,14 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 				// tape unable to answer "did we see this, or were we told?".
 				if len(declared) > 0 {
 					d["declared_labels"] = declared
+				}
+				// Recorded separately from both of the above for the same reason they are
+				// separate from each other: an auditor has to be able to tell a denial the
+				// proxy OBSERVED from one the client asked for from one the delegation chain
+				// imposed. Conflating them leaves the tape unable to answer "why was this
+				// call tainted".
+				if len(forced) > 0 {
+					d["delegated_labels"] = forced
 				}
 				return d
 			}(),
@@ -237,7 +291,7 @@ func (e *Engine) peekSessionLabels(ctx context.Context, req *capability.EnforceR
 	if e.skipFlow || e.flowStore == nil || req.SessionID == "" {
 		return nil, nil
 	}
-	present, err := e.flowStore.Get(ctx, e.flowSessionKey(req.SessionID))
+	present, err := e.flowStore.Get(ctx, e.flowKey(req))
 	if err != nil {
 		return nil, err
 	}
@@ -331,7 +385,7 @@ func (e *Engine) recordLabels(ctx context.Context, req *capability.EnforceReques
 			out = append(out, label)
 		}
 	}
-	if err := e.flowStore.Add(ctx, e.flowSessionKey(req.SessionID), out...); err != nil {
+	if err := e.flowStore.Add(ctx, e.flowKey(req), out...); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -410,6 +464,16 @@ func (e *Engine) recordSourceCall(ctx context.Context, req *capability.EnforceRe
 		added = labelsAdded(labelsOut, carriedLabels)
 	}
 	if len(decl.Labels) > 0 {
+		// Burn a single-use grant BEFORE clearing with it, so the two possible faults land on
+		// the safe side of the one that matters. Burn-then-clear can leave a grant spent for
+		// a clear that did not happen (over-refusal: the operator mints another approval).
+		// Clear-then-burn would leave a label dropped by a grant still marked live — the
+		// replay this ledger exists to close, reachable by faulting the store at the right
+		// moment. A standing grant burns nothing and this costs it no round-trip.
+		if err := e.burnApproval(ctx, req, decl.LedgerID); err != nil {
+			e.rollbackLabels(ctx, req, added)
+			return nil, nil, &SourceCommitError{Err: err, Flow: true, Declassify: true}
+		}
 		var err error
 		// The post-add set: what the session holds now that this call's own labelOutput
 		// (if any) has committed. Handing the PRE-call snapshot instead meant a clear could
@@ -419,6 +483,7 @@ func (e *Engine) recordSourceCall(ctx context.Context, req *capability.EnforceRe
 		if err != nil {
 			// The clear faulted after the add committed: undo the add so the refused call
 			// leaves nothing behind, exactly as the seq-fault arm below does.
+			e.unburnApproval(ctx, req, decl.LedgerID)
 			e.rollbackLabels(ctx, req, added)
 			return nil, nil, &SourceCommitError{Err: err, Flow: true, Declassify: true}
 		}
@@ -432,9 +497,14 @@ func (e *Engine) recordSourceCall(ctx context.Context, req *capability.EnforceRe
 		// declassify leg so the deny it maps to is the hard one.
 		if len(labelsCleared) > 0 {
 			e.restoreLabels(ctx, req, labelsCleared)
+			e.unburnApproval(ctx, req, decl.LedgerID)
 			e.rollbackLabels(ctx, req, added)
 			return nil, nil, &SourceCommitError{Err: err, Flow: true, Declassify: true}
 		}
+		// A single-use grant whose clear was a permitted no-op is still spent (see
+		// burnApproval), so the seq fault has to hand it back here too — this arm is reached
+		// for exactly that shape, where labelsCleared is empty but the burn committed.
+		e.unburnApproval(ctx, req, decl.LedgerID)
 		// The seq write faulted after the label writes committed: put the label set back as
 		// it was so the hard-denied call neither taints nor untaints. Best-effort — a
 		// rollback fault leaves a stranded label (fail-closed: over-blocks a later sink,
@@ -495,7 +565,7 @@ func (e *Engine) rollbackLabels(ctx context.Context, req *capability.EnforceRequ
 	if e.flowStore == nil || req.SessionID == "" || len(added) == 0 {
 		return
 	}
-	_ = e.flowStore.Remove(ctx, e.flowSessionKey(req.SessionID), added...)
+	_ = e.flowStore.Remove(ctx, e.flowKey(req), added...)
 }
 
 // restoreLabels is rollbackLabels' mirror for the declassify leg: it best-effort re-adds
@@ -509,7 +579,7 @@ func (e *Engine) restoreLabels(ctx context.Context, req *capability.EnforceReque
 	if e.flowStore == nil || req.SessionID == "" || len(cleared) == 0 {
 		return
 	}
-	_ = e.flowStore.Add(ctx, e.flowSessionKey(req.SessionID), cleared...)
+	_ = e.flowStore.Add(ctx, e.flowKey(req), cleared...)
 }
 
 // ClearSessionLabels releases a session's accumulated flow-label set, called from the
@@ -518,6 +588,13 @@ func (e *Engine) restoreLabels(ctx context.Context, req *capability.EnforceReque
 // wired, the policy uses no flow control (skipFlow), or the session id is empty — the
 // same guards recordLabels/peekSessionLabels apply, so a non-flow deployment pays
 // nothing on teardown.
+//
+// It clears the SESSION-anchored key only, which is the whole of what a session owns. Under
+// WithTaskAnchoredState a request carrying a task id wrote its labels under the TASK's key,
+// and that state is meant to outlive this session — clearing it here would restore exactly
+// the per-PEP boundary the anchor exists to cross, and would let an agent launder a task's
+// taint by disconnecting. Abandoned task state is reclaimed by the store's own idle TTL
+// (Redis) or bounded by flowlabelstore.WithMaxKeys (in-memory); see WithTaskAnchoredState.
 func (e *Engine) ClearSessionLabels(ctx context.Context, sessionID string) error {
 	if e.flowStore == nil || e.skipFlow || sessionID == "" {
 		return nil

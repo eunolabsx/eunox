@@ -736,7 +736,7 @@ func TestBuildRoutes_WiretapPDPWiredToKillSwitch(t *testing.T) {
 	ks := killswitch.NewInMemory()
 	rt := &UpstreamRoute{name: "wt"}
 	// A policyless upstream (no policy, no expectVersion) yields the wiretap PDP.
-	dp, _, _, _, err := LoadUpstreamPDP(&config.UpstreamConfig{Name: "wt"}, config.HostTransportStdio, "", nil, nil, ks)
+	dp, _, _, _, err := LoadUpstreamPDP(&config.UpstreamConfig{Name: "wt"}, config.HostTransportStdio, "", nil, nil, ks, false)
 	if err != nil {
 		t.Fatalf("LoadUpstreamPDP: %v", err)
 	}

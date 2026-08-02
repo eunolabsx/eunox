@@ -2301,12 +2301,56 @@ field, because a verified token already has one.
 > call. A stdio *upstream* behind an HTTP gateway is fine — the token arrives on the
 > host leg.
 
-> **The honest limit.** The token is held by the agent, so an approval minted into
-> it can be replayed for as long as that token lives, at any action the grant's
-> `target` names. Scope and expiry bound the damage; they do not eliminate it.
-> Mint a short-lived token per approval rather than a standing grant. The proxy
-> enforces the scope and records the approver; it cannot make a long-lived grant
-> safe.
+#### `once` — a single-use approval
+
+A grant is **replayable by default**: the token is held by the agent, so an approval
+minted into it can be presented for as long as that token lives, at any action the
+grant's `target` names. Scope bounds that; scope is not lifetime.
+
+`once: true` closes it. The grant is **burned** on the first call that clears with
+it, and every later presentation is refused with `reason: approval_consumed` rather
+than clearing again:
+
+```jsonc
+{
+  "labels": ["pii"],
+  "target": "tool:publish_sanitized_report",
+  "approver": "alice@example.com",
+  "id": "apr-2026-08-01-014",   // REQUIRED under once — the ledger burns by id
+  "once": true
+}
+```
+
+- **`id` is mandatory** under `once`. The burn is keyed by id, not by the grant's
+  content: two approvals naming the same labels, target, and approver are two
+  separate human decisions, and a content key would let the first spend the second.
+  A `once` grant with no `id` **rejects the token** rather than silently degrading
+  to a standing approval.
+- **The grant is spent even when the clear is a no-op.** Presenting it on a session
+  that is not carrying the label still burns it. That is the property, not an
+  oversight: burning only on a clear that changed something would make the grant
+  replayable by ordering — present it once while clean, acquire the taint, present
+  it again to the clear that matters.
+- **A store fault escalates.** If the ledger cannot be read, "already used" cannot
+  be told from "never used", and treating that as fresh would make an unreachable
+  backend the way to replay every one-shot grant in a token. If the burn cannot be
+  written, the call hard-denies rather than clearing anyway.
+- **A token may carry several grants.** The proxy uses the first *live* one, so a
+  spent grant beside a fresh one is passed over rather than refused on.
+- **The ledger follows the anchor.** Under session anchoring (the default) a burn
+  is released with the session; under `taskAnchoredState` it follows the **task**,
+  so re-entering through a fresh session does not restore a spent approval — which
+  is the replay a per-session ledger would leave open in exactly the multi-PEP
+  topology a one-shot approval is minted for.
+
+A standing grant (`once` unset) still behaves exactly as before, because an operator
+whose control plane already mints a short-lived token per approval has the property
+by other means and should not be made to keep a ledger for nothing.
+
+> **What is still not solved.** `once` bounds how many times an approval is
+> *usable*; it does not bound who holds the token. A token stolen before its grant
+> is spent still spends it. Short-lived tokens remain the right practice; this makes
+> a long-lived one bounded rather than standing.
 
 #### What lands on the tape
 
@@ -2393,6 +2437,168 @@ revision that introduced it, like every other `0.2` token.
 References are resolved in `allowedValues` **only**. A `${...}` elsewhere in the
 manifest is an ordinary literal string, which for a security rule means it matches
 nothing — the fail-closed direction, but not what the author intended.
+
+## 5d. Delegation attenuation — narrowing authority across a hop
+
+`principal` scoping answers *which caller does this capability apply to*. Delegation
+answers the other half: **what is left of that caller's authority after it hands work
+to a sub-agent**. A delegate is not a second principal with its own grants — it is its
+delegator's authority minus something, and the minus is what has to be checkable.
+
+Two claims on an already-verified token carry it, and neither has a manifest token:
+attenuation is a property of the caller, not of the policy.
+
+```jsonc
+{
+  "sub": "user@example.com",
+  // RFC 8693 §4.1 actor chain — WHO. Nested most-recent-actor-OUTERMOST.
+  "act": { "sub": "agent-b", "act": { "sub": "agent-a" } },
+  "mcp": {
+    "v": "0.2",
+    // WHAT each hop kept, ordered DELEGATOR-FIRST (agent-a, then agent-b).
+    "delegation": [
+      {
+        "subject": "agent-a",
+        "targets": ["tool:read_file", "tool:write_file"],
+        "redactFields": ["ssn"]
+      },
+      {
+        "subject": "agent-b",
+        "targets": ["tool:read_file"],       // narrower: write_file is gone
+        "labels": ["untrusted"],             // its calls carry this taint
+        "allowLabels": [],                   // and reach no labeled sink at all
+        "redactFields": ["ssn", "email"],    // sees at least as much masked
+        "maxEffectClass": "reversible"
+      }
+    ]
+  }
+}
+```
+
+### The five axes, and the direction each narrows
+
+| Field | Narrows by | Effect on a call |
+|---|---|---|
+| `targets` | **shrinking** | the target must be in every hop's list |
+| `labels` | **growing** | unioned into the call's flow check as forced taint |
+| `allowLabels` | **shrinking** | intersected with the sink's `flowLabel.allow` |
+| `redactFields` | **growing** | unioned with the constraint's own redaction |
+| `maxEffectClass` | **no higher** | the resolved effect class must be at or below it |
+
+A hop that moves any field the other way is a **widening**, and a widening token is
+**rejected outright** rather than clamped. Clamping would leave a mis-minted token
+working while quietly meaning something other than what it says, and the whole value
+of the chain is that "the delegate is no broader than its delegator" is a property
+someone can check rather than a convention someone follows.
+
+That assertion is not what the enforcement rests on, though. The decision path applies
+**every** hop's grant, not just the last one — so even a chain whose monotonicity check
+was somehow skipped cannot let hop 3 reach what hop 1 forbade. The assertion makes a
+broken chain loud at the boundary; the per-hop application makes it harmless regardless.
+
+### Absent versus present-empty
+
+`targets` and `allowLabels` distinguish **absent** (the key is omitted — this hop
+narrows nothing on that axis) from **present-empty** (`[]` — this hop grants nothing
+on that axis). They must not collapse, because present-empty is the strictest value
+expressible:
+
+- `"targets": []` — the delegate reaches **no action at all**.
+- `"allowLabels": []` — **no labeled flow reaches any sink**. This is the quarantine:
+  a sub-agent sharing a tainted task reaches nothing however it is injected, because
+  the intersection of any allow-set with the empty set is empty.
+
+An omitted key is the common case for a root hop that does not want to enumerate the
+delegator's whole surface: the manifest still bounds it.
+
+### Other rules
+
+- **Delegated targets are literal.** A glob in a grant is refused, exactly as it is in
+  a declassify approval: a pattern widens one scoped grant across every matching
+  action, and set containment between literal sets is a subset test an operator can
+  verify by reading.
+- **`act` and `mcp.delegation` must agree hop for hop** when both are present. A
+  mismatch means the token's two halves describe different delegations, and picking
+  either would be guessing. Grants without an `act` chain are accepted (an IdP that
+  does not implement RFC 8693 can still express attenuation, and a grant can only
+  narrow).
+- **Depth is capped at 8.** The chain is attacker-influenced input the decision path
+  walks once per enforced call.
+- **No experimental gate.** Every axis narrows, so a build that honors these claims can
+  only deny more than one that ignores them — there is no fail-open direction to gate
+  against. That is why this differs from `mcp.capabilities`, which *replaces* the
+  authorization surface and therefore fails open if ignored.
+
+### What lands on the tape, and in the listing
+
+A delegation refusal is a `decision: deny` with `code: AUTHORIZATION_FAILED` and
+`condition_type: delegation`, carrying `delegation: true`, a `reason`
+(`target_not_delegated` / `effect_class` / `unresolvable_target`), and the `delegate`
+that blocked it — with a chain several hops deep, "not permitted" says nothing about
+which delegator's grant to widen.
+
+A flow denial caused by forced taint records `delegated_labels` **separately** from
+`carried_labels` (what the proxy observed) and `declared_labels` (what the client
+asserted), so an auditor can tell why a call was tainted. `allowLabels` on such a
+record is the **effective** set the check ran against, not the manifest's — under a cap
+the two differ, and recording the manifest's would send an operator to widen a sink
+rule that was never what refused the call.
+
+`tools/list`, `resources/list`, and `prompts/list` are filtered by the chain too, so
+the catalog a delegate is shown never advertises an action its call leg will refuse.
+
+A delegation refusal **is** downgradable by `enforcement: audit` — it is an
+authorization verdict like the manifest's own no-match deny, and an observe route
+exists to show what enforcement would do before it does it, including on a delegation
+chain being rolled out.
+
+## 5e. Cross-PEP state — `taskAnchoredState`
+
+Everything eunox accumulates — flow-label taint, `sequenceBlock` antecedents,
+`maxCalls` and cumulative `blastRadius` budgets, spent one-shot declassify grants — is
+keyed on an **anchor**: the identity the state accrues to. By default that is the
+**session**, which is exactly right for one proxy in front of one host↔upstream pair.
+
+It is also the boundary that state cannot cross. A sub-agent delegated to a second
+enforcement point, or the same task re-entering through a fresh session, starts with a
+clean label set, an empty antecedent history, and a full budget. Information-flow
+control's "for all flows" claim spans one enforcement point, and no more.
+
+`taskAnchoredState` keys the same state on the validated `mcp.task_id` claim instead:
+
+```yaml
+defaults:
+  taskAnchoredState: true      # every route
+upstreams:
+  - name: reporting
+    taskAnchoredState: false   # ...except this one
+```
+
+Three properties make it safe to turn on, and each is structural rather than
+conventional:
+
+1. **Opt-in.** It changes what every budget in the policy *means* — a `maxCalls` of 20
+   becomes 20 per task rather than 20 per connection, and two sessions carrying one
+   task id share one label set. That is the point, and it is not a change to make on an
+   operator's behalf.
+2. **The anchor is a validated claim.** `task_id` is one of the reserved
+   `input.claims` keys filled authoritatively from the verified token, which a
+   same-named custom claim cannot shadow. An agent cannot pick which task's budget it
+   spends.
+3. **It falls back to the session, never to a shared bucket.** A request with no token,
+   or a token carrying no `task_id`, is anchored exactly as it is today. Turning this
+   on can never make two unauthenticated callers share state — and it does nothing at
+   all without a JWT integration that mints `mcp.task_id`.
+
+A task-anchored key carries the anchor kind as its own component, so a task named `x`
+and a session named `x` address different buckets, and a session-anchored key is
+byte-for-byte what it was before this option existed.
+
+> **Task state outlives the session that wrote it.** That is the whole point, so session
+> teardown does not reclaim it — clearing it on disconnect would let an agent launder a
+> task's taint, or recover a spent one-shot approval, by reconnecting. Pair this with the
+> **Redis** backends, whose idle TTL reclaims an abandoned task, or bound the in-memory
+> flow store with `flowlabelstore.WithMaxKeys`.
 
 ## 6. TTL guidance
 

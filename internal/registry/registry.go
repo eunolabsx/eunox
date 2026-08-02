@@ -63,6 +63,17 @@ type Contract struct {
 	// trust surface, and it is deliberately modest: authorship and review state, not a
 	// verification claim.
 	Attestation Attestation `json:"attestation"`
+	// Signatures carries signed statements about this entry — a vendor attesting that the
+	// contract describes their tool, a reviewer who read it, or either DISPUTING it. They
+	// are what turns the Attestation block above from an unverifiable label into something
+	// a second party asserted with a key.
+	//
+	// They are verified LOCALLY against a trust store the operator points at, at
+	// `eunox contracts` time and never on the decision path (see attest.go). They are also
+	// deliberately OUTSIDE the digest: the digest is over the effect contract's own content,
+	// and each signature is over that digest, so including them would be circular and would
+	// mean every new countersignature invalidated every manifest pin to the entry.
+	Signatures []Signature `json:"signatures,omitempty"`
 	// Digest is EffectContractDigest of Effect — the value a manifest pins after the '@'
 	// in `effect.ref`. Stored rather than only computed so a corpus consumer can detect a
 	// tampered entry without re-deriving the encoding, and so the file is self-describing.
@@ -176,6 +187,24 @@ func (c *Contract) Validate() error {
 	}
 	if actual != c.Digest {
 		return fmt.Errorf("contract %q: declared digest %s does not match its content digest %s — the entry was edited without re-digesting", c.ID, c.Digest, actual)
+	}
+	// Structural validation only — everything checkable without a key. Signature
+	// VERIFICATION needs the operator's trust store and happens in VerifyAttestations; a
+	// malformed signature is refused here rather than there so a corpus cannot carry one
+	// that looks like assurance in a listing and turns out to be unevaluable.
+	seenSig := make(map[string]bool, len(c.Signatures))
+	for i := range c.Signatures {
+		if err := c.Signatures[i].Validate(c.ID); err != nil {
+			return err
+		}
+		// One statement per key per entry. Two signatures from one key are either a
+		// duplicate or a key that both attests and disputes, and neither is something a
+		// report can render honestly.
+		k := c.Signatures[i].KeyID
+		if seenSig[k] {
+			return fmt.Errorf("contract %q: key %q signs this entry more than once; one statement per key", c.ID, k)
+		}
+		seenSig[k] = true
 	}
 	return nil
 }

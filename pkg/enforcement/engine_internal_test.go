@@ -32,20 +32,29 @@ import (
 	"github.com/eunolabs/eunox/pkg/capability"
 )
 
+// seqKeyForTest builds a sequenceBlock-history key the way the engine does, for the tests
+// that assert on the key ENCODING rather than on a decision. The engine method takes the
+// request (the anchor is derived from it — see anchor.go), so this adapts the (namespace,
+// session, type, target) tuple those tests are written in terms of.
+func seqKeyForTest(namespace, sessionID, targetType, target string) string {
+	e := &Engine{counterKeyNamespace: namespace}
+	return e.sequenceHistoryKey(&capability.EnforceRequest{SessionID: sessionID}, targetType, target)
+}
+
 // TestSequenceHistoryKey_ColonCollisionResistant pins the ambiguity from
 // the three-component history key: joined with a bare ":" delimiter,
 // (session "a:b", type "c", target "d") and (session "a", type "b", target "c:d")
 // both render "seq:a:b:c:d" and so address one bucket. The length-prefixed
 // encoding must keep them distinct.
 func TestSequenceHistoryKey_ColonCollisionResistant(t *testing.T) {
-	a := sequenceHistoryKey("", "a:b", "c", "d")
-	b := sequenceHistoryKey("", "a", "b", "c:d")
+	a := seqKeyForTest("", "a:b", "c", "d")
+	b := seqKeyForTest("", "a", "b", "c:d")
 	if a == b {
 		t.Fatalf("sequenceHistoryKey collides for ('a:b','c','d') and ('a','b','c:d'): both = %q", a)
 	}
 	// A distinct namespace (gateway route) must also disjoin two otherwise-identical
 	// (session, type, target) tuples, so routes sharing one CallCounter cannot collide.
-	if sequenceHistoryKey("routeA", "s", "tool", "x") == sequenceHistoryKey("routeB", "s", "tool", "x") {
+	if seqKeyForTest("routeA", "s", "tool", "x") == seqKeyForTest("routeB", "s", "tool", "x") {
 		t.Fatal("sequenceHistoryKey must disjoin distinct namespaces for the same tuple")
 	}
 }
@@ -106,7 +115,7 @@ func TestCompositeCounterKey_NulSeparatorWouldNotSuffice(t *testing.T) {
 // "maxcalls:" namespaces the callcounter backends rely on (redis.go) survive the
 // length-prefixed encoding: each key still leads with its verbatim prefix token.
 func TestCompositeCounterKey_PrefixPreserved(t *testing.T) {
-	if got := sequenceHistoryKey("", "s", "tool", "t"); !strings.HasPrefix(got, "seq:") {
+	if got := seqKeyForTest("", "s", "tool", "t"); !strings.HasPrefix(got, "seq:") {
 		t.Errorf("sequenceHistoryKey = %q, want \"seq:\" prefix", got)
 	}
 	if got := compositeCounterKey("maxcalls", "s", "tool", "t"); !strings.HasPrefix(got, "maxcalls:") {
@@ -665,14 +674,14 @@ func TestRecordSessionCall_TargetNameKeyedVerbatim(t *testing.T) {
 	// Primary: the explicit afterTools entry "resource:system:foo" strips one
 	// "resource:" token via splitEnginePrefix, leaving the name "system:foo" verbatim.
 	_, priorName := splitEnginePrefix("resource:system:foo")
-	primaryKey := sequenceHistoryKey("", "s1", "resource", priorName)
+	primaryKey := seqKeyForTest("", "s1", "resource", priorName)
 	if !counter.hasKey(primaryKey) {
 		t.Errorf("verbatim primary key %q not recorded; keys=%v", primaryKey, counter.incrKeys)
 	}
 
 	// Secondary: the bare afterTools entry "system:foo" splits to (system, foo).
 	secType, secName := splitEnginePrefix("system:foo")
-	secondaryKey := sequenceHistoryKey("", "s1", secType, secName)
+	secondaryKey := seqKeyForTest("", "s1", secType, secName)
 	if !counter.hasKey(secondaryKey) {
 		t.Errorf("bare-spelling secondary key %q not recorded; keys=%v", secondaryKey, counter.incrKeys)
 	}
@@ -1024,7 +1033,7 @@ func TestCollectObligationsValueDirective(t *testing.T) {
 				Actions:    []string{"call"},
 				Directives: []capability.Directive{dir},
 			}
-			obs, deny := e.CollectObligations(c, "req-1", "2026-06-14T00:00:00Z")
+			obs, deny := e.CollectObligations(nil, c, "req-1", "2026-06-14T00:00:00Z")
 			if deny != nil {
 				t.Fatalf("CollectObligations denied a valid redactFields directive: %+v", deny.Denial)
 			}

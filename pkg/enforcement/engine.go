@@ -166,17 +166,6 @@ func compositeCounterKey(prefix string, parts ...string) string {
 // per call across the 24h window — an unbounded heap sink for a one-bit question.
 const sequenceHistoryMaxEntries = 1
 
-// sequenceHistoryKey builds the per-session, per-target key under which an
-// allowed call is recorded for sequenceBlock lookups. namespace (the engine's
-// counterKeyNamespace) is the leading component so routes sharing one CallCounter
-// address disjoint history. The target type is part of the key because the bare name
-// alone is ambiguous — a tool "export" and a prompt "export" would otherwise collide
-// on one bucket and cross-trip each other's sequenceBlocks. Recording and Peek must
-// pass the same namespace and type (see RecordSessionCall and handleSequenceBlock).
-func sequenceHistoryKey(namespace, sessionID, targetType, target string) string {
-	return compositeCounterKey("seq", namespace, sessionID, targetType, target)
-}
-
 // PolicyEvaluator evaluates a policy condition against an enforce request by
 // calling an external policy decision point (e.g. OPA, Cedar). Implementations
 // must return nil to allow or a non-nil [*ConditionError] to deny.
@@ -246,6 +235,14 @@ type Engine struct {
 	// empty (a directly-constructed Engine) the leading component is still emitted (a
 	// length-prefixed empty part), so the key differs from a pre-namespace key either way.
 	counterKeyNamespace string
+
+	// taskAnchored keys accumulated state (flow labels, sequenceBlock antecedents,
+	// maxCalls and cumulative blastRadius budgets, the single-use declassify ledger) on
+	// the request's VALIDATED mcp.task_id claim rather than on its session, so the state
+	// survives a hop across enforcement points. Opt-in (WithTaskAnchoredState) and
+	// fail-safe: a request with no task claim falls back to session keying rather than to
+	// a shared bucket. See anchor.go for why each of those three properties is required.
+	taskAnchored bool
 }
 
 // Option configures the Engine.
@@ -320,6 +317,29 @@ func WithoutFlowLabels() Option {
 func WithCounterKeyNamespace(ns string) Option {
 	return func(e *Engine) {
 		e.counterKeyNamespace = ns
+	}
+}
+
+// WithTaskAnchoredState keys accumulated enforcement state on the request's VALIDATED
+// mcp.task_id claim instead of on its session, so information-flow taint, sequenceBlock
+// antecedents, quota and blast-radius budgets, and single-use declassify grants survive a
+// hop across enforcement points — a sub-agent delegated to a second PEP, or the same task
+// re-entering through a fresh session, continues the task's state rather than starting
+// clean.
+//
+// It changes what every budget in the policy MEANS (a maxCalls of 20 becomes 20 per task,
+// not 20 per connection), which is why it is opt-in rather than derived. A request whose
+// token carries no task_id — including every unauthenticated one — is anchored on its
+// session exactly as it is without this option, so enabling it can never make two callers
+// share state on the strength of something neither of them proved.
+//
+// Task-anchored state deliberately OUTLIVES the session that wrote it, so the transport's
+// teardown does not reclaim it (see Engine.TaskAnchored and ClearSessionLabels). Pair this
+// with the Redis backends, whose idle TTL reclaims an abandoned task, or bound the in-memory
+// store with flowlabelstore.WithMaxKeys.
+func WithTaskAnchoredState() Option {
+	return func(e *Engine) {
+		e.taskAnchored = true
 	}
 }
 
@@ -566,11 +586,11 @@ func (e *Engine) RecordSessionCall(ctx context.Context, req *capability.EnforceR
 	// fully-qualified spelling ("resource:tool:reboot" vs "tool:reboot"), which resolves
 	// to the primary verbatim marker and never touches this alias key.
 	if altType, altName := splitEnginePrefix(tool); altName != tool {
-		if _, err := e.counter.IncrementAndGet(ctx, sequenceHistoryKey(e.counterKeyNamespace, req.SessionID, altType, altName), sequenceHistoryWindowSec, sequenceHistoryMaxEntries); err != nil {
+		if _, err := e.counter.IncrementAndGet(ctx, e.sequenceHistoryKey(req, altType, altName), sequenceHistoryWindowSec, sequenceHistoryMaxEntries); err != nil {
 			return err
 		}
 	}
-	if _, err := e.counter.IncrementAndGet(ctx, sequenceHistoryKey(e.counterKeyNamespace, req.SessionID, targetType, tool), sequenceHistoryWindowSec, sequenceHistoryMaxEntries); err != nil {
+	if _, err := e.counter.IncrementAndGet(ctx, e.sequenceHistoryKey(req, targetType, tool), sequenceHistoryWindowSec, sequenceHistoryMaxEntries); err != nil {
 		return err
 	}
 	return nil
@@ -1137,7 +1157,7 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 	// denied-and-forwarded would instead be BLOCKED, because isObserveDeny refuses to
 	// downgrade a HardDeny. A wiretap route documented never to block must not start
 	// blocking over an engine bug in a directive it was going to apply post-allow.
-	obligations, obligDeny := e.CollectObligations(matched, requestID, now)
+	obligations, obligDeny := e.CollectObligations(req.Delegation, matched, requestID, now)
 	if WillForwardDeny(ctx, matched) {
 		defer func() {
 			// The test is `!= DecisionAllow`, not `== DecisionDeny`, matching the transport's
@@ -1187,6 +1207,15 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 		}()
 	}
 
+	// The delegation authority gate. It sits here — after the obligation and carried-label
+	// defers are installed, so a downgraded (observe-mode) refusal still carries the
+	// redactions and the label snapshot every other non-allow exit carries, and before the
+	// conditions, because it does not depend on them: the manifest may permit this target and
+	// every condition may pass, and the call is still one this delegate was never handed.
+	if delegDeny := e.checkDelegationTarget(req, matched.IsAuditOnly(), requestID, now); delegDeny != nil {
+		return *delegDeny
+	}
+
 	// PASS ONE: the pure predicates. The deferred (quota-consuming) conditions are
 	// collected but NOT committed here — the ceiling below has to be able to refuse the
 	// call before anything is charged to it.
@@ -1213,6 +1242,15 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 		return *ceilingDeny
 	}
 
+	// The delegated consequence bound, on the same pre-commit side of the line and reading
+	// the SAME resolved effect. It runs after the policy's own ceiling so an action over both
+	// reports the ceiling: the ceiling is the operator's bound on what may happen at all,
+	// while this one is about who was allowed to ask for it, and fixing the second while the
+	// first still refuses would be wasted work.
+	if delegDeny := e.checkDelegationEffectClass(req, effect, matched.IsAuditOnly(), requestID, now); delegDeny != nil {
+		return *delegDeny
+	}
+
 	// The approval gate for the one directive that REMOVES a flow label. It sits with the
 	// ceiling on the pre-commit side of the line for the same reason: an unapproved
 	// declassification is refused and never forwarded, so it must not spend a quota slot,
@@ -1220,7 +1258,7 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 	// call that is over the consequence bound reports that — the bound is the more
 	// fundamental refusal, and an operator who fixes the approval first would otherwise
 	// discover the ceiling second.
-	decl, declDeny := e.checkDeclassify(req, matched, carriedLabels, requestID, now)
+	decl, declDeny := e.checkDeclassify(ctx, req, matched, carriedLabels, requestID, now)
 	if declDeny != nil {
 		return *declDeny
 	}
@@ -1317,7 +1355,7 @@ func (e *Engine) ValidateAction(ctx context.Context, req *capability.EnforceRequ
 		// forwarded. On an enforce route this is skipped and the deny blocks with nothing.
 		var obligations []capability.Obligation
 		if WillForwardDeny(ctx, nil) {
-			obs, obligDeny := e.CollectObligations(namingTargetConstraint(req, capabilities), requestID, now)
+			obs, obligDeny := e.CollectObligations(req.Delegation, namingTargetConstraint(req, capabilities), requestID, now)
 			if obligDeny != nil {
 				return *obligDeny
 			}
@@ -1343,7 +1381,7 @@ func (e *Engine) ValidateAction(ctx context.Context, req *capability.EnforceRequ
 			// bug, so its hard deny wins rather than forwarding unredacted.
 			var obligations []capability.Obligation
 			if WillForwardDeny(ctx, matched) {
-				obs, obligDeny := e.CollectObligations(matched, requestID, now)
+				obs, obligDeny := e.CollectObligations(req.Delegation, matched, requestID, now)
 				if obligDeny != nil {
 					return *obligDeny
 				}
@@ -1584,8 +1622,18 @@ var knownObligationTypes = map[string]bool{
 // unwired directive type — so they cannot drift on which directives translate to which
 // obligations. requestID and now stamp the fail-closed response the unwired-directive
 // guard returns, so it matches the surrounding decision.
-func (e *Engine) CollectObligations(matched *capability.Constraint, requestID, now string) ([]capability.Obligation, *capability.EnforceResponse) {
+func (e *Engine) CollectObligations(chain *capability.DelegationChain, matched *capability.Constraint, requestID, now string) ([]capability.Obligation, *capability.EnforceResponse) {
 	var obligations []capability.Obligation
+	// The delegation chain's composed redactFields, first so it applies even to a constraint
+	// carrying no directives at all. It is a parameter rather than something the caller
+	// unions on afterwards because there are five call sites — the allow path, two no-match/
+	// schema deny paths, and the PDP's two audit-downgrade paths — and the ones that matter
+	// most for a leak are the downgrades, which are exactly the ones easiest to forget. A
+	// signature that cannot be called without deciding what the chain contributes makes
+	// forgetting impossible.
+	if ob := delegatedRedaction(chain); ob != nil {
+		obligations = append(obligations, *ob)
+	}
 	for _, dir := range matched.Directives {
 		if dir == nil {
 			continue

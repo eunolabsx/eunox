@@ -1867,7 +1867,7 @@ func serveStdioHost(ctx context.Context, cfg *config.GatewayConfig, sink *audit.
 	}
 	configStrict := cfg.ResolvedStrictDrift(u)
 
-	dp, manifest, policyVersion, policySHA256, err := transport.LoadUpstreamPDP(u, cfg.HostTransport(), cfg.BaseDir, counter, flowStore, ks)
+	dp, manifest, policyVersion, policySHA256, err := transport.LoadUpstreamPDP(u, cfg.HostTransport(), cfg.BaseDir, counter, flowStore, ks, cfg.ResolvedTaskAnchoredState(u))
 	if err != nil {
 		return err
 	}

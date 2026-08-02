@@ -5,6 +5,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -275,5 +277,184 @@ func TestEffectCoverageWithheldTargetsForTheBundle(t *testing.T) {
 		if strings.Contains(got, secret) {
 			t.Errorf("the redacted bundle must not name capability targets; found %q in:\n%s", secret, got)
 		}
+	}
+}
+
+// signCorpusEntry signs c for the given role/statement and returns the signature plus the
+// public key, so a test can build a corpus whose entries carry real signatures.
+func signCorpusEntry(t *testing.T, c *registry.Contract, keyID, role, statement string) (registry.Signature, ed25519.PublicKey) {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	payload, err := registry.NewSignaturePayload(c, role, statement)
+	if err != nil {
+		t.Fatalf("payload: %v", err)
+	}
+	return registry.Signature{
+		KeyID:     keyID,
+		Algorithm: registry.AttestAlgorithmEd25519,
+		Role:      role,
+		Statement: statement,
+		Value:     base64.StdEncoding.EncodeToString(ed25519.Sign(priv, payload)),
+	}, pub
+}
+
+// writeCLITrustStore writes a trusted-key file and returns its path. It deliberately writes
+// OUTSIDE the corpus directory: every *.json in that directory is a corpus entry, so a keys
+// file parked there would be loaded as a (malformed) contract.
+func writeCLITrustStore(t *testing.T, _ string, keys ...registry.TrustedKey) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "trusted-keys.json")
+	b, err := json.Marshal(map[string]interface{}{"keys": keys})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	return path
+}
+
+// TestContractsTrustKeysSurfacesAttestationState is the operator-facing half of the registry
+// trust model: with a trust store, the listing says who attests to each entry and who
+// disputes it — the two things a content digest alone cannot express.
+func TestContractsTrustKeysSurfacesAttestationState(t *testing.T) {
+	dir := t.TempDir()
+	entry := validCorpusEntry("acme/mcp.send", "send")
+	digest, err := capability.EffectContractDigest(entry.Effect)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	entry.Digest = digest
+	sig, pub := signCorpusEntry(t, &entry, "acme-2026", registry.AttestRoleVendor, registry.AttestStatementAttests)
+	entry.Signatures = []registry.Signature{sig}
+	writeCorpusEntry(t, dir, "acme.json", entry)
+	keys := writeCLITrustStore(t, dir, registry.TrustedKey{
+		KeyID:     "acme-2026",
+		Algorithm: registry.AttestAlgorithmEd25519,
+		PublicKey: base64.StdEncoding.EncodeToString(pub),
+		Owner:     "Acme Inc",
+	})
+
+	var code int
+	out := captureStdout(t, func() { code = cmdContracts([]string{"--dir", dir, "--trust-keys", keys}) })
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0\n%s", code, out)
+	}
+	for _, want := range []string{"ATTESTATION", "vendor", "1 trusted attestation key(s)"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestContractsTrustKeysReportsADispute pins that a dispute from a trusted key is surfaced
+// prominently and is NOT an error exit: someone who looked disagreeing is a signal to weigh,
+// not a verdict eunox is in a position to issue.
+func TestContractsTrustKeysReportsADispute(t *testing.T) {
+	dir := t.TempDir()
+	entry := validCorpusEntry("acme/mcp.send", "send")
+	digest, err := capability.EffectContractDigest(entry.Effect)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	entry.Digest = digest
+	sig, pub := signCorpusEntry(t, &entry, "reviewer-1", registry.AttestRoleReviewer, registry.AttestStatementDisputes)
+	entry.Signatures = []registry.Signature{sig}
+	writeCorpusEntry(t, dir, "acme.json", entry)
+	keys := writeCLITrustStore(t, dir, registry.TrustedKey{
+		KeyID:     "reviewer-1",
+		Algorithm: registry.AttestAlgorithmEd25519,
+		PublicKey: base64.StdEncoding.EncodeToString(pub),
+		Owner:     "A Reviewer",
+	})
+
+	var code int
+	out := captureStdout(t, func() { code = cmdContracts([]string{"--dir", dir, "--trust-keys", keys}) })
+	if code != 0 {
+		t.Fatalf("a dispute must not be an error exit; exit = %d\n%s", code, out)
+	}
+	for _, want := range []string{"DISPUTED(1)", "community-advisory"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestContractsTrustKeysFailsOnATamperedEntry is the one attestation outcome that must stop
+// the command: a signature by a key the operator DID configure that no longer verifies means
+// the entry was edited after it was signed.
+func TestContractsTrustKeysFailsOnATamperedEntry(t *testing.T) {
+	dir := t.TempDir()
+	entry := validCorpusEntry("acme/mcp.send", "send")
+	digest, err := capability.EffectContractDigest(entry.Effect)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	entry.Digest = digest
+	sig, pub := signCorpusEntry(t, &entry, "acme-2026", registry.AttestRoleVendor, registry.AttestStatementAttests)
+
+	// Rewrite the contract and re-digest, so the ENTRY is self-consistent and only the
+	// signature betrays the edit.
+	entry.Effect = &capability.EffectContract{Class: capability.EffectIrreversible}
+	entry.Digest = ""
+	entry.Signatures = []registry.Signature{sig}
+	writeCorpusEntry(t, dir, "acme.json", entry)
+	keys := writeCLITrustStore(t, dir, registry.TrustedKey{
+		KeyID:     "acme-2026",
+		Algorithm: registry.AttestAlgorithmEd25519,
+		PublicKey: base64.StdEncoding.EncodeToString(pub),
+		Owner:     "Acme Inc",
+	})
+
+	if code := cmdContracts([]string{"--dir", dir, "--trust-keys", keys}); code != 2 {
+		t.Fatalf("exit = %d, want 2 for a trusted signature that does not verify", code)
+	}
+}
+
+// TestContractsAttestPayloadPrintsSignableBytes covers the produce side: eunox never mints a
+// signature, so the deliverable is the exact payload a publisher signs with their own key.
+func TestContractsAttestPayloadPrintsSignableBytes(t *testing.T) {
+	dir := t.TempDir()
+	entry := validCorpusEntry("acme/mcp.send", "send")
+	writeCorpusEntry(t, dir, "acme.json", entry)
+	digest, err := capability.EffectContractDigest(entry.Effect)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+
+	var code int
+	out := captureStdout(t, func() {
+		code = cmdContracts([]string{"--dir", dir, "--attest-payload", "acme/mcp.send", "--role", "reviewer", "--statement", "disputes"})
+	})
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0\n%s", code, out)
+	}
+	want := "eunox-effect-contract-attestation/v1\nacme/mcp.send\n" + digest + "\nreviewer\ndisputes"
+	if out != want {
+		t.Errorf("payload = %q, want %q (a shell redirection of this output must be the signed bytes and nothing else)", out, want)
+	}
+}
+
+// TestContractsAttestPayloadRejectsBadInput keeps a typo from producing a payload nobody will
+// ever be able to verify against, and keeps the two query modes from silently picking one.
+func TestContractsAttestPayloadRejectsBadInput(t *testing.T) {
+	dir := t.TempDir()
+	writeCorpusEntry(t, dir, "acme.json", validCorpusEntry("acme/mcp.send", "send"))
+
+	for name, args := range map[string][]string{
+		"unknown id":        {"--dir", dir, "--attest-payload", "nope/absent.tool"},
+		"bad role":          {"--dir", dir, "--attest-payload", "acme/mcp.send", "--role", "owner"},
+		"bad statement":     {"--dir", dir, "--attest-payload", "acme/mcp.send", "--statement", "maybe"},
+		"two query modes":   {"--dir", dir, "--attest-payload", "acme/mcp.send", "--ref", "acme/mcp.send"},
+		"missing key store": {"--dir", dir, "--trust-keys", filepath.Join(dir, "absent.json")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if code := cmdContracts(args); code != 2 {
+				t.Errorf("exit = %d, want 2", code)
+			}
+		})
 	}
 }

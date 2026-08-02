@@ -130,12 +130,14 @@ func DeclassifyLabelsOf(c *Constraint) []string {
 // path. (This is the same reasoning that blocked effect receipts until an operator-owned
 // key domain existed: a signature is only worth what the key domain behind it is.)
 //
-// The honest limit, which the docs state rather than hide: the token is held by the agent,
-// so an approval minted into it can be replayed for as long as that token lives, at any
-// action the grant's Target names. That is why Target is matched LITERALLY and Approver is
-// mandatory, and why the operator's control plane should mint a short-lived token per
-// approval rather than a standing grant. The proxy enforces scope and records the
-// approver; it cannot make a long-lived grant safe.
+// A grant is REPLAYABLE by default: the token is held by the agent, so an approval minted
+// into it can be presented for as long as that token lives, at any action the grant's Target
+// names. Target is matched LITERALLY and Approver is mandatory to bound that, but scope is
+// not lifetime. Once closes it — a grant marked single-use is BURNED on the first call that
+// clears a label with it, so the second presentation escalates as "already consumed" rather
+// than declassifying again. A standing grant remains expressible (Once unset) because an
+// operator whose control plane mints a short-lived token per approval already has the
+// property by other means, and forcing the ledger on them would be state kept for nothing.
 type DeclassifyApproval struct {
 	// Labels are the native flow labels this approval permits dropping. Non-empty; every
 	// entry must be in the closed vocabulary.
@@ -152,8 +154,27 @@ type DeclassifyApproval struct {
 	Approver string `json:"approver"`
 	// ID optionally carries the control plane's own record identifier for this approval,
 	// echoed into the audit record's details so a tape entry joins back to the approval
-	// workflow that produced it. Absent is fine; empty and absent are the same.
+	// workflow that produced it. Absent is fine; empty and absent are the same — EXCEPT
+	// under Once, where it is the ledger's key and therefore mandatory.
 	ID string `json:"id,omitempty"`
+	// Once marks the grant SINGLE-USE: the proxy burns it in the anchored declassify
+	// ledger on the first call that clears a label with it, and every later presentation
+	// escalates ("approval_consumed") instead of clearing again. It is the mechanism behind
+	// "approve clearing this once", which is what an approval workflow almost always means
+	// and what a scope-only grant cannot express.
+	//
+	// The burn is keyed by ID, not by the grant's content: two approvals that happen to name
+	// the same labels, target, and approver are two separate human decisions, and a content
+	// key would let the first one spend the second. That is why Validate makes ID mandatory
+	// here — a single-use grant with nothing to burn is not enforceable as written, so it is
+	// refused at the token boundary rather than silently degrading to a standing one.
+	//
+	// The ledger lives in the FlowLabelStore (the same session-lifetime backend already
+	// holding the labels this grant clears) under the same anchor, so a task-anchored
+	// deployment burns the approval for the TASK: an agent cannot spend a one-shot approval
+	// again by re-entering through a fresh session, which is exactly the replay a
+	// per-session ledger would leave open.
+	Once bool `json:"once,omitempty"`
 }
 
 // Covers reports whether this approval authorizes clearing every label in want at target.
@@ -217,7 +238,29 @@ func (a *DeclassifyApproval) Validate() error {
 	if strings.TrimSpace(a.Approver) == "" {
 		return fmt.Errorf("declassify approval must name the human who approved it in 'approver'")
 	}
+	// A single-use grant is burned by ID (see the Once field). Without one there is nothing
+	// to burn, and the alternatives are both wrong: silently treating it as standing gives
+	// the operator the replay window they marked the grant to close, and burning by content
+	// makes two genuinely distinct approvals collide. Refuse the token instead.
+	if a.Once && strings.TrimSpace(a.ID) == "" {
+		return fmt.Errorf("declassify approval sets 'once' but carries no 'id'; a single-use grant is burned by its id, so an id is required (without one the grant would silently behave as a standing approval)")
+	}
 	return nil
+}
+
+// LedgerID is the member a single-use grant occupies in the anchored declassify ledger.
+// Empty for a standing grant, which is never burned and never looked up.
+//
+// The Target is folded in beside the ID so one control-plane record covering several actions
+// (the same id minted per approved action) burns per action rather than collapsing to one
+// use across all of them. Both halves are length-prefixed for the same reason every counter
+// key is: an id and a target are external strings with no enforced format, so a plain
+// delimiter join would let one forge another pair's member.
+func (a *DeclassifyApproval) LedgerID() string {
+	if a == nil || !a.Once || a.ID == "" {
+		return ""
+	}
+	return fmt.Sprintf("once:%d:%s:%d:%s", len(a.ID), a.ID, len(a.Target), a.Target)
 }
 
 // ParseDeclassifyApprovals decodes the `mcp.declassify` claim into validated approvals.
@@ -268,16 +311,37 @@ func ParseDeclassifyApprovals(raw json.RawMessage) ([]DeclassifyApproval, error)
 	return out, nil
 }
 
+// CoveringDeclassifyApprovals returns every approval covering all of want at target, in the
+// token's own order. The engine walks the whole list rather than taking the first match
+// because a covering grant is not necessarily a USABLE one: a single-use grant already burned
+// in this anchor's ledger covers the call on paper and must be passed over in favour of a
+// later grant that is still live. Selecting first-covering and only then testing consumption
+// would refuse a request the token was carrying a valid second approval for.
+//
+// Pointers into approvals, so the caller stamps the selected grant's approver and id onto the
+// audit record without a copy.
+func CoveringDeclassifyApprovals(approvals []DeclassifyApproval, target string, want []string) []*DeclassifyApproval {
+	var out []*DeclassifyApproval
+	for i := range approvals {
+		if approvals[i].Covers(target, want) {
+			out = append(out, &approvals[i])
+		}
+	}
+	return out
+}
+
 // FindDeclassifyApproval returns the first approval covering every label in want at
 // target, or nil when none does. Order is the token's, so a control plane that appends
 // approvals gets the oldest covering grant — which is the one whose id an operator is
 // most likely to be holding. Returning the grant itself (rather than a bool) is what lets
 // the caller stamp the approver and id onto the audit record.
+//
+// It ignores single-use consumption, which only the engine can see (the ledger is anchored
+// state), so the decision path uses CoveringDeclassifyApprovals instead. This stays as the
+// scope-only test for callers that have no store — the CLI and validation paths.
 func FindDeclassifyApproval(approvals []DeclassifyApproval, target string, want []string) *DeclassifyApproval {
-	for i := range approvals {
-		if approvals[i].Covers(target, want) {
-			return &approvals[i]
-		}
+	if covering := CoveringDeclassifyApprovals(approvals, target, want); len(covering) > 0 {
+		return covering[0]
 	}
 	return nil
 }

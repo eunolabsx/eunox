@@ -67,6 +67,39 @@
         }
       }
     },
+    "signatures": {
+      "description": "Signed statements about this entry: a vendor attesting that the contract describes their tool, a reviewer who read it, or either DISPUTING it. Verified LOCALLY against a trusted-key file the operator supplies (`eunox contracts --trust-keys`) — never fetched, and never on the decision path. Deliberately OUTSIDE the digest: each signature is over the digest, so including them would be circular and every added countersignature would invalidate every manifest pin to the entry.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["keyId", "algorithm", "role", "statement", "signature"],
+        "properties": {
+          "keyId": {
+            "description": "Names the key that produced the signature, matched against the operator's trusted-key file. A signature whose key is absent from that file is reported as unverified, never as an error — a corpus may be signed by parties you have not chosen to trust.",
+            "type": "string",
+            "minLength": 1
+          },
+          "algorithm": {
+            "description": "Signature algorithm. One value, chosen rather than negotiated: an algorithm field a verifier honors is an algorithm an attacker selects.",
+            "enum": ["ed25519"]
+          },
+          "role": {
+            "description": "Standing the signer claims: vendor = the party publishing the MCP server; reviewer = a third party who read the entry. Part of the SIGNED payload, so a reviewer's signature cannot be re-presented as a vendor's.",
+            "enum": ["vendor", "reviewer"]
+          },
+          "statement": {
+            "description": "attests = the contract correctly describes the tool; disputes = it does not. Part of the SIGNED payload, so a dispute cannot be edited into an endorsement. A dispute is a community-advisory signal, never a scanner verdict.",
+            "enum": ["attests", "disputes"]
+          },
+          "signature": {
+            "description": "Base64 (standard encoding) Ed25519 signature over the newline-joined payload \"eunox-effect-contract-attestation/v1\\n<id>\\n<digest>\\n<role>\\n<statement>\". `eunox contracts --attest-payload <id>` prints those exact bytes.",
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
     "digest": {
       "description": "sha256 of the `effect` block's canonical JSON encoding — the value a manifest pins after the '@'. Two entries with identical contract content share a digest; identity lives in `id`, integrity in `digest`.",
       "type": "string",

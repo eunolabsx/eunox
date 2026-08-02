@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/eunolabs/eunox/pkg/capability"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestDeclassifyDirective_RoundTrip pins that the directive marshals with its
@@ -225,4 +227,75 @@ func TestConstraintHasFlow_IncludesDeclassify(t *testing.T) {
 	if !capability.ConstraintHasFlow(c) {
 		t.Fatal("a declassify constraint participates in information-flow control")
 	}
+}
+
+// TestDeclassifyApproval_OnceRequiresAnID pins the one structural rule single-use adds. A
+// single-use grant is burned by its id; with none there is nothing to burn, and both
+// alternatives are wrong — treating it as standing gives the operator back the replay window
+// they marked the grant to close, and burning by content makes two genuinely distinct
+// approvals collide. So the token is refused.
+func TestDeclassifyApproval_OnceRequiresAnID(t *testing.T) {
+	a := capability.DeclassifyApproval{
+		Labels:   []string{capability.FlowLabelPII},
+		Target:   "tool:publish",
+		Approver: "ada@example.com",
+		Once:     true,
+	}
+	err := a.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "'id'")
+
+	a.ID = "apr-1"
+	assert.NoError(t, a.Validate())
+}
+
+// TestParseDeclassifyApprovals_Once decodes the flag off a token exactly as an IdP emits it,
+// and pins that a once-grant with no id rejects the TOKEN rather than degrading silently.
+func TestParseDeclassifyApprovals_Once(t *testing.T) {
+	got, err := capability.ParseDeclassifyApprovals(json.RawMessage(
+		`[{"labels":["pii"],"target":"tool:publish","approver":"ada","id":"apr-1","once":true}]`))
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.True(t, got[0].Once)
+	assert.NotEmpty(t, got[0].LedgerID())
+
+	_, err = capability.ParseDeclassifyApprovals(json.RawMessage(
+		`[{"labels":["pii"],"target":"tool:publish","approver":"ada","once":true}]`))
+	assert.Error(t, err)
+}
+
+// TestDeclassifyApproval_LedgerIDScopesByTarget pins that one control-plane record minted per
+// approved action burns per action: two grants sharing an id but naming different targets are
+// two uses, not one.
+func TestDeclassifyApproval_LedgerIDScopesByTarget(t *testing.T) {
+	base := capability.DeclassifyApproval{
+		Labels: []string{capability.FlowLabelPII}, Approver: "ada", ID: "apr-1", Once: true,
+	}
+	a, b := base, base
+	a.Target, b.Target = "tool:publish", "tool:export"
+	assert.NotEqual(t, a.LedgerID(), b.LedgerID())
+
+	// A standing grant occupies no ledger slot at all.
+	standing := a
+	standing.Once = false
+	assert.Empty(t, standing.LedgerID())
+}
+
+// TestCoveringDeclassifyApprovals_ReturnsEveryMatchInTokenOrder is what lets the engine pass
+// over a spent grant for a live one: selecting first-covering and only then testing
+// consumption would refuse a request the token was carrying a valid second approval for.
+func TestCoveringDeclassifyApprovals_ReturnsEveryMatchInTokenOrder(t *testing.T) {
+	approvals := []capability.DeclassifyApproval{
+		{Labels: []string{capability.FlowLabelPII}, Target: "tool:publish", Approver: "ada", ID: "apr-1"},
+		{Labels: []string{capability.FlowLabelPublic}, Target: "tool:publish", Approver: "bob", ID: "apr-2"},
+		{Labels: []string{capability.FlowLabelPII}, Target: "tool:publish", Approver: "cy", ID: "apr-3"},
+	}
+	covering := capability.CoveringDeclassifyApprovals(approvals, "tool:publish", []string{capability.FlowLabelPII})
+	require.Len(t, covering, 2)
+	assert.Equal(t, "apr-1", covering[0].ID)
+	assert.Equal(t, "apr-3", covering[1].ID)
+
+	// FindDeclassifyApproval stays the scope-only test for callers with no store.
+	assert.Equal(t, "apr-1", capability.FindDeclassifyApproval(approvals, "tool:publish", []string{capability.FlowLabelPII}).ID)
+	assert.Nil(t, capability.FindDeclassifyApproval(approvals, "tool:other", []string{capability.FlowLabelPII}))
 }
