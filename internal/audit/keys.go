@@ -13,8 +13,10 @@ package audit
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -109,7 +111,13 @@ func LoadOrCreateKeys(keyPath string) ([][]byte, error) {
 		}
 		return keys, nil
 	}
-	if !os.IsNotExist(err) {
+	// errors.Is, not os.IsNotExist: os.IsNotExist does NOT unwrap, so this arm is correct
+	// only while readAuditKeyFile returns the raw ENOENT — a contract held by a comment
+	// while every other error on that path is %w-wrapped. audit.go documents the same trap
+	// for the same shape and uses errors.Is. If a future edit wraps the ENOENT (the natural
+	// move), the non-unwrapping test stops matching and every fresh install refuses to
+	// start instead of minting a key.
+	if !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
 
@@ -133,7 +141,9 @@ func LoadOrCreateKeys(keyPath string) ([][]byte, error) {
 func LoadKeys(keyPath string) ([][]byte, error) {
 	data, err := readAuditKeyFile(keyPath, false)
 	if err != nil {
-		if os.IsNotExist(err) {
+		// errors.Is for the same reason LoadOrCreateKeys uses it: the absence test must not
+		// depend on readAuditKeyFile leaving its ENOENT unwrapped.
+		if errors.Is(err, fs.ErrNotExist) {
 			return nil, fmt.Errorf("audit key file %q not found — pass --audit-key-path pointing at the key that signed this log", keyPath)
 		}
 		return nil, err

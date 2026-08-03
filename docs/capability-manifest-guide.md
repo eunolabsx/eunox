@@ -1974,6 +1974,15 @@ metadata (`_meta`, content annotations) are preserved unchanged.
 >   sibling. Naming `text` in a redact path is unaffected — it still masks a field called
 >   `text` wherever one appears.
 >
+> - A **lone case variant of a result-envelope key**, with no canonical sibling to collide
+>   with: `{"Content":[…]}` or `{"StructuredContent":{…}}`. There is no divergence between
+>   two keys here, but there is one between the proxy and the host — the proxy matches
+>   `content` exactly and would route the variant to its weaker generic pass, while a
+>   case-insensitive consumer binds the variant as the real content. Only the six
+>   protocol-reserved envelope keys are covered (`content`, `structuredContent`, `isError`,
+>   `contents`, `messages`, `_meta`); a spec-conformant server never spells them any other
+>   way.
+>
 > Case variants of names your obligation does not touch are ordinary data and are **not**
 > refused: a payload carrying both `Report` and `report` under `redactFields: ["data.ssn"]`
 > redacts normally. The same check applies to a JSON blob unwrapped from a text item or a

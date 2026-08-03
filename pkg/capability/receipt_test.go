@@ -364,6 +364,44 @@ func TestEffectReceiptSilentAboutAQuantifiedDimension(t *testing.T) {
 	assert.Equal(t, capability.ReceiptVerified, got.Verdict)
 }
 
+// TestEffectReceiptSilentAboutTheDeclaredClass is the class twin of the magnitude case
+// above, and it closes the asymmetry between them. Class is omitempty and every comparison
+// in receiptInconsistencies was gated on the field being PRESENT, so a receipt carrying only
+// tool + iat tripped nothing and recorded `verified` — for an attestation that never covered
+// the dimension the contract bounded.
+func TestEffectReceiptSilentAboutTheDeclaredClass(t *testing.T) {
+	s := newReceiptSigner(t, "k")
+	v := newVerifier(t, s)
+	now := time.Now()
+
+	// The concrete failure: the contract says compensable, the server omits `class`, and the
+	// receipt says nothing about whether the action it performed was undoable at all.
+	silent := s.sign(t, &capability.EffectReceiptClaims{Tool: "refund", IssuedAt: now.Unix()})
+	got := v.Verify(silent, "refund", declaredRefund(), now)
+	require.NotNil(t, got)
+	assert.Equal(t, capability.ReceiptInconsistent, got.Verdict)
+	assert.Contains(t, got.Reasons, capability.ReceiptReasonClassUnstated)
+
+	// At the top of the vocabulary there is nothing silence could hide: an unstated class
+	// cannot exceed `irreversible`, so flagging it would report an inconsistency against a
+	// declaration no receipt could contradict.
+	topDeclared := &capability.ResolvedEffect{Class: capability.EffectIrreversible, Annotated: true}
+	got = v.Verify(silent, "refund", topDeclared, now)
+	require.NotNil(t, got)
+	assert.Equal(t, capability.ReceiptVerified, got.Verdict)
+	assert.NotContains(t, got.Reasons, capability.ReceiptReasonClassUnstated)
+
+	// And an honest receipt that STATES a class within the declaration keeps verifying.
+	stated := s.sign(t, &capability.EffectReceiptClaims{
+		Tool: "refund", Class: capability.EffectCompensable,
+		CompensatingAction: "tool:reverse_refund", IssuedAt: now.Unix(),
+	})
+	unquantified := &capability.ResolvedEffect{Class: capability.EffectCompensable, CompensatingAction: "tool:reverse_refund", Annotated: true}
+	got = v.Verify(stated, "refund", unquantified, now)
+	require.NotNil(t, got)
+	assert.Equal(t, capability.ReceiptVerified, got.Verdict)
+}
+
 // TestEffectReceiptKeySetIsBounded pins the kid-less fan-out bound. A receipt carrying no
 // kid is trialled against every configured key, so an unbounded key set is an unbounded
 // amount of signature verification a hostile upstream can force on the response path of

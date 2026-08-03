@@ -153,6 +153,14 @@ func (r *Redis) SessionKillTTL() time.Duration {
 // uses this instance's own configured value either way -- so a caller should warn on an
 // error rather than refuse to start.
 func (r *Redis) PublishSessionKillTTL(ctx context.Context) (prior time.Duration, differs bool, err error) {
+	// Arm the reconcile loop's republish HERE, before the round trip and regardless of how it
+	// goes. What the loop must not do is publish before the caller's ready hook has run at
+	// all; once it has, a FAILED publish is exactly the case the loop should retry — that is
+	// the self-healing an unconditional tick used to provide for a proxy that came up while
+	// Redis was briefly unreachable, and latching on success alone would have silently
+	// disabled the republish (and its own edge-triggered warning) for the life of the
+	// process. See sessionTTLPublished.
+	r.sessionTTLPublished.Store(true)
 	mine := r.SessionKillTTL()
 	// Read before writing so the caller can report a disagreement. A GET error (or an
 	// absent/garbage value) simply yields no diagnostic; it must not stop the publish.
@@ -191,6 +199,14 @@ func (r *Redis) PublishSessionKillTTL(ctx context.Context) (prior time.Duration,
 // so a persistent condition does not reprint every interval and train operators to ignore
 // the line; a CHANGED prior value warns again.
 func (r *Redis) refreshPublishedSessionKillTTL(ctx context.Context) {
+	// REFRESH means refresh: this keeps alive a value an explicit startup publish has already
+	// attempted, and publishes nothing on its own. Start runs before the transport is
+	// serving, so an unconditional SET here made the loop the first writer for any startup
+	// that failed after one tick — clobbering a running proxy's published lifetime with a
+	// value nothing would ever enforce. See sessionTTLPublished.
+	if !r.sessionTTLPublished.Load() {
+		return
+	}
 	// Carve a short budget out of the loop's deadline-free context. This runs on the
 	// reconcile goroutine, immediately after the cache refresh that BOUNDS kill
 	// propagation -- so a slow-but-not-down Redis that let this advisory write consume

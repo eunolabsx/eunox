@@ -24,6 +24,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -287,9 +288,14 @@ func LoadCorpus(dir string) ([]Contract, error) {
 	out := make([]Contract, 0, len(paths))
 	seen := make(map[string]string, len(paths))
 	for _, p := range paths {
-		data, err := os.ReadFile(p) //nolint:gosec // G304: corpus path derived from the caller-supplied directory
+		data, err := readBoundedFile(boundedRead{
+			path:      p,
+			what:      "contract",
+			max:       maxContractFileBytes,
+			overLimit: "refusing to buffer it rather than decoding a corpus entry that cannot be one",
+		})
 		if err != nil {
-			return nil, fmt.Errorf("reading contract %q: %w", p, err)
+			return nil, err
 		}
 		var c Contract
 		// UseNumber keeps a blast-radius literal exact: a magnitude above 2^53 widened to
@@ -309,6 +315,55 @@ func LoadCorpus(dir string) ([]Contract, error) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil
+}
+
+// maxContractFileBytes bounds ONE corpus entry's read. Like maxTrustStoreBytes it bounds what
+// a MISDIRECTED path can make this loader allocate, not how much an author may write: a real
+// entry is a few kilobytes, and a mebibyte is orders of magnitude past the largest plausible
+// one. The directory is operator-supplied (`--dir`), so a corpus path fat-fingered at a data
+// directory holding a multi-gigabyte .json was buffered whole before strictDecodeJSON could
+// reject it — an OOM where an error belongs.
+const maxContractFileBytes = 1 << 20
+
+// boundedRead is one bounded whole-file read's parameters. A struct rather than four
+// positional arguments because two of them are strings that read identically at a call site
+// and swapping them would garble every error message this produces.
+type boundedRead struct {
+	// path is the file to read; what names its kind for the error messages ("contract").
+	path, what string
+	// max is the inclusive byte bound: a file exactly this size still loads.
+	max int64
+	// flags are any extra open flags the caller's own threat model needs, beyond O_RDONLY
+	// (the trust store's O_NOFOLLOW). Zero for a caller that needs none.
+	flags int
+	// overLimit completes the over-size error: "<what> %q is larger than N bytes; <overLimit>".
+	// Each caller states what refusing buys IT, since a truncated read means something
+	// different for a key set than for a single entry.
+	overLimit string
+}
+
+// readBoundedFile reads a file whole under a size bound, erroring rather than truncating when
+// it is exceeded.
+//
+// Shared by the two operator-supplied paths this package reads — the attestation trust store
+// and each corpus entry — because the rationale is identical and only one of them had it: a
+// path fat-fingered at a log, a core dump, or a disk image must produce an error, not an OOM.
+func readBoundedFile(rd boundedRead) ([]byte, error) {
+	f, err := os.OpenFile(rd.path, os.O_RDONLY|rd.flags, 0) //nolint:gosec // G304: operator-supplied path (trust store, or a corpus entry under the caller's --dir)
+	if err != nil {
+		return nil, fmt.Errorf("reading %s %q: %w", rd.what, rd.path, err)
+	}
+	defer func() { _ = f.Close() }()
+	// Read one byte past the bound so a file exactly at the limit still loads and anything
+	// larger is detectable without reading it all.
+	data, err := io.ReadAll(io.LimitReader(f, rd.max+1))
+	if err != nil {
+		return nil, fmt.Errorf("reading %s %q: %w", rd.what, rd.path, err)
+	}
+	if int64(len(data)) > rd.max {
+		return nil, fmt.Errorf("%s %q is larger than %d bytes; %s", rd.what, rd.path, rd.max, rd.overLimit)
+	}
+	return data, nil
 }
 
 // sortedKeys renders a validation set for a deterministic error message. The collect-and-sort

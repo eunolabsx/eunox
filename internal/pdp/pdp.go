@@ -506,6 +506,21 @@ func (p AlwaysAllowPDP) wiretapAllow() capability.EnforceResponse {
 	return newAllowResponse(p.clock)
 }
 
+// allowUnlessKilled is every Decide* method's whole body: audit/wiretap mode applies no
+// policy and forwards after logging, unless the kill switch is active — which hard-blocks
+// even a wiretap route.
+//
+// The five methods exist because the PolicyDecisionPoint contract names five decisions with
+// five signatures, not because they decide differently; written out, they were five
+// byte-identical bodies whose only distinguishing content was the doc comment above each.
+// Sharing the body means an operator's /control/kill cannot come to cover four of them.
+func (p AlwaysAllowPDP) allowUnlessKilled(ctx context.Context, sessionID string) capability.EnforceResponse {
+	if deny := p.CheckKill(ctx, sessionID); deny != nil {
+		return *deny
+	}
+	return p.wiretapAllow()
+}
+
 // clockNow returns the current instant from c when non-nil, falling back to the
 // real wall clock. Centralizing the nil-check keeps the injected-clock fallback
 // identical across every PDP allow path.
@@ -533,37 +548,25 @@ func newAllowResponse(clock enforcement.Clock) capability.EnforceResponse {
 // no policy and forwards the call after logging it — unless the kill switch is
 // active, which hard-blocks even a wiretap route.
 func (p AlwaysAllowPDP) Decide(ctx context.Context, sessionID string, _ EnforceTarget, _ map[string]interface{}, _ string) capability.EnforceResponse {
-	if deny := p.CheckKill(ctx, sessionID); deny != nil {
-		return *deny
-	}
-	return p.wiretapAllow()
+	return p.allowUnlessKilled(ctx, sessionID)
 }
 
 // DecideResourceRead returns a wiretap allow for every resources/read, unless a
 // kill is active.
 func (p AlwaysAllowPDP) DecideResourceRead(ctx context.Context, sessionID, _, _ string) capability.EnforceResponse {
-	if deny := p.CheckKill(ctx, sessionID); deny != nil {
-		return *deny
-	}
-	return p.wiretapAllow()
+	return p.allowUnlessKilled(ctx, sessionID)
 }
 
 // DecideResourceCancel returns a wiretap allow for every resources/unsubscribe, unless a
 // kill is active.
 func (p AlwaysAllowPDP) DecideResourceCancel(ctx context.Context, sessionID, _, _ string) capability.EnforceResponse {
-	if deny := p.CheckKill(ctx, sessionID); deny != nil {
-		return *deny
-	}
-	return p.wiretapAllow()
+	return p.allowUnlessKilled(ctx, sessionID)
 }
 
 // DecidePromptGet returns a wiretap allow for every prompts/get, unless a kill is
 // active.
 func (p AlwaysAllowPDP) DecidePromptGet(ctx context.Context, sessionID, _, _ string) capability.EnforceResponse {
-	if deny := p.CheckKill(ctx, sessionID); deny != nil {
-		return *deny
-	}
-	return p.wiretapAllow()
+	return p.allowUnlessKilled(ctx, sessionID)
 }
 
 // DecideSampling lets audit/wiretap mode observe server-initiated sampling
@@ -572,10 +575,7 @@ func (p AlwaysAllowPDP) DecidePromptGet(ctx context.Context, sessionID, _, _ str
 // consults the kill switch when one is wired (NewAlwaysAllowPDP); a bare
 // AlwaysAllowPDP{} keeps observing.
 func (p AlwaysAllowPDP) DecideSampling(ctx context.Context, sessionID, _ string) capability.EnforceResponse {
-	if deny := p.CheckKill(ctx, sessionID); deny != nil {
-		return *deny
-	}
-	return p.wiretapAllow()
+	return p.allowUnlessKilled(ctx, sessionID)
 }
 
 // CheckKill consults the kill switch when one is wired (NewAlwaysAllowPDP), so an
@@ -1925,7 +1925,32 @@ func (p *ManifestPDP) hardenOnEffectCeiling(ctx context.Context, sessionID strin
 	if matched == nil {
 		return r, false
 	}
-	verdict := p.engine.CeilingVerdictFor(ctx, hardenRequest(ctx, sessionID, target, args, sel.claims), matched)
+	return p.hardenViaVerdict(ctx, r, matched, hardenRequest(ctx, sessionID, target, args, sel.claims), p.engine.CeilingVerdictFor)
+}
+
+// hardenViaVerdict is the tail both harden legs share: ask a non-committing *VerdictFor seam,
+// compose its verdict onto the outer refusal, and decide what happens to the obligations.
+//
+// It is one function rather than two copies because the obligation rule is the part that
+// matters and it was written out twice. Obligations are stripped only for a refusal that is
+// never FORWARDED, and re-filled otherwise — an unconditional strip, resting on "every refusal
+// on this arm is hard", is the shape that re-opened a fail-open once already: a downgradable
+// refusal reaching the host on an --audit route with the manifest's redactFields already
+// discarded, so the response arrives unmasked. Each leg's own pre-gates stay at the leg; what
+// they share is this.
+//
+// verdictFor is the engine seam, passed as a value rather than named by a discriminator so the
+// caller's choice of seam is the whole difference between the two legs.
+func (p *ManifestPDP) hardenViaVerdict(
+	ctx context.Context,
+	r capability.EnforceResponse,
+	matched *capability.Constraint,
+	req *capability.EnforceRequest,
+	verdictFor func(context.Context, *capability.EnforceRequest, *capability.Constraint) *capability.EnforceResponse,
+) (capability.EnforceResponse, bool) {
+	// nil means the call would have been authorized on this axis, so the outer layer's verdict
+	// stands as it was.
+	verdict := verdictFor(ctx, req, matched)
 	if verdict == nil {
 		return r, false
 	}
@@ -1936,11 +1961,9 @@ func (p *ManifestPDP) hardenOnEffectCeiling(ctx context.Context, sessionID strin
 		out.Obligations = nil
 		return out, true
 	}
-	// Still downgradable (onExceed: deny), so a route running --audit WILL forward it — and
-	// a forwarded response must carry the manifest's redactFields obligations or it reaches
-	// the host unmasked. Stripping them here re-opened the exact fail-open this whole seam
-	// exists to close: adding an effect ceiling silently removed redaction that the same
-	// request got without one.
+	// Still downgradable (the ceiling's onExceed: deny), so a route running --audit WILL
+	// forward it — and a forwarded response must carry the manifest's redactFields obligations
+	// or it reaches the host unmasked.
 	return p.withForwardObligationsFor(ctx, out, matched), true
 }
 
@@ -2095,31 +2118,16 @@ func (p *ManifestPDP) hardenOnUnapprovedDeclassify(ctx context.Context, sessionI
 	// engine reads them off the request rather than the context.
 	req := hardenRequest(ctx, sessionID, target, args, sel.claims)
 	req.DeclassifyApprovals = declassifyApprovalsFromContext(ctx)
-	// nil means the declassification would have been authorized — a live covering approval,
-	// or nothing to clear at all — so the outer layer's verdict stands as it was. Every
-	// refusal arm is the engine's own, including the hard `ledger_unavailable` one: a fault
-	// that left a downgradable verdict in place made an unreachable ledger the way to run,
-	// on an --audit route, a declassification the same manifest blocks without a token.
-	verdict := p.engine.DeclassifyVerdictFor(ctx, req, matched)
-	if verdict == nil {
-		return r, false
-	}
-	// composeHardened carries the AuditOnly AND. Every declassify refusal is built hard
-	// (escalateResponse leaves AuditOnly false for the same reason the ceiling's escalation
-	// does), so for this caller it is a backstop rather than a live correction — which is an
-	// argument for sharing the composition, not for hand-writing a weaker one here.
-	out := composeHardened(r, *verdict)
-	// Obligations are stripped only for a refusal that is never forwarded, and re-filled
-	// otherwise — the same rule the ceiling's sibling applies, rather than an unconditional
-	// strip resting on "every declassify refusal is hard". Stripping unconditionally is the
-	// shape that re-opened a fail-open there: a downgradable refusal reaching the host on an
-	// --audit route with the manifest's redactFields already discarded, so the response
-	// arrives unmasked.
-	if out.Denial != nil && out.Denial.HardDeny {
-		out.Obligations = nil
-		return out, true
-	}
-	return p.withForwardObligationsFor(ctx, out, matched), true
+	// Every refusal arm the seam returns is the engine's own, including the hard
+	// `ledger_unavailable` one: a fault that left a downgradable verdict in place made an
+	// unreachable ledger the way to run, on an --audit route, a declassification the same
+	// manifest blocks without a token.
+	//
+	// The shared tail carries composeHardened's AuditOnly AND. Every declassify refusal is
+	// built hard (escalateResponse leaves AuditOnly false for the same reason the ceiling's
+	// escalation does), so for this caller it is a backstop rather than a live correction —
+	// which is an argument for sharing the composition, not for hand-writing a weaker one.
+	return p.hardenViaVerdict(ctx, r, matched, req, p.engine.DeclassifyVerdictFor)
 }
 
 // directivesNamingTarget collects the directives of every capability whose target type +
@@ -2560,14 +2568,21 @@ func isSafeJSONKey(s string) bool {
 // encodeOrderedObjectWithList re-emits a JSON object in keys order, substituting
 // the marshaled entries array for the value of fieldName while every other field
 // keeps its original bytes verbatim. For a conformant (unique-key) object the only
-// change versus the upstream is the pruned list — field order and sibling fields
-// are byte-faithful. It never SEES a duplicate-key object: its sole producer,
-// decodeOrderedObject, rejects an envelope carrying duplicate or fold-colliding keys
-// outright, because the proxy cannot know which of the two values a host binds. (This
-// once described collapsing them last-wins, matching encoding/json — a description that
-// now contradicts the gate above it, in the file where duplicate-key handling IS the
-// security-critical behavior.) A
-// nil/empty entries slice is emitted as [] (never null) so the list field stays an array.
+// change versus the upstream is the pruned list — field order and SIBLING fields are
+// byte-faithful.
+//
+// The entries themselves are not: they are re-marshaled with json.Marshal, which
+// HTML-escapes <, > and & inside the entry bytes. Semantically identical, and the list
+// filter is the one place on this path that does not promise otherwise (the redaction
+// engine, which does, marshals through marshalNoHTMLEscape).
+//
+// It never SEES a duplicate-key object: its sole producer, decodeOrderedObject, rejects an
+// envelope carrying duplicate or fold-colliding keys outright, because the proxy cannot know
+// which of the two values a host binds. (This once described collapsing them last-wins,
+// matching encoding/json — a description that now contradicts the gate above it, in the file
+// where duplicate-key handling IS the security-critical behavior.)
+//
+// A nil/empty entries slice is emitted as [] (never null) so the list field stays an array.
 // If fieldName is not among keys it is appended, so the encoded object always carries
 // the list field (an envelope is never returned with the list silently dropped).
 func encodeOrderedObjectWithList(keys []string, values map[string]json.RawMessage, fieldName string, entries []json.RawMessage) ([]byte, error) {

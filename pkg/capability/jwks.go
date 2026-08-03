@@ -284,11 +284,12 @@ func VerifyWithKeyRotation[T any](
 		// already tried: re-verifying the same keys against the same token can never
 		// succeed, so a flood of forged kid-less tokens would otherwise pay ~2x the
 		// per-key signature-verification cost during the rate-limit suppression window
-		// (the window the sentinel exists to protect). sameMatchingKeys compares against
-		// the keys THIS caller tried, so a set a CONCURRENT goroutine just rotated in
-		// (different from ours) is still retried and a real rotation is never missed.
+		// (the window the sentinel exists to protect). The comparison is against the keys
+		// THIS caller actually tried rather than a bare "did our own fetch change the cache"
+		// flag, so a set a CONCURRENT goroutine just rotated in (different from ours) still
+		// differs here and is retried — a real rotation is never skipped.
 		retryKeys := FindKeys(refreshed, kid)
-		if !sameMatchingKeys(matchingKeys, retryKeys) {
+		if !sameKeyMultiset(matchingKeys, retryKeys) {
 			// The forced refresh returned a DIFFERENT (rotated) set, so signal the verifier
 			// to re-sample its validation clock: reusing a clock sampled before this
 			// (possibly slow) refresh would let a token that expired DURING the refresh pass

@@ -419,9 +419,13 @@ Four properties are load-bearing:
 Consistency is one-directional: a server reporting a **smaller or less consequential**
 action than declared is honoring the contract, since the declaration is the upper bound the
 decision was made against. Only exceeding it contradicts. Silence, though, is not agreement:
-a receipt that omits a dimension the contract **quantified** records as `inconsistent`
-(`blast_radius_unstated`), because an attestation that never covered the bounded dimension
-must not earn `verified` — the strongest signal this surface emits. A contract that could not be
+a receipt that omits a dimension the contract **bounded** records as `inconsistent` —
+`blast_radius_unstated` for an omitted magnitude against a quantified contract,
+`effect_class_unstated` for an omitted `class` against a contract declaring anything below
+`irreversible` — because an attestation that never covered the bounded dimension
+must not earn `verified`, the strongest signal this surface emits. (An omitted class against
+an `irreversible` declaration is not flagged: silence cannot exceed the top of the
+vocabulary.) A contract that could not be
 resolved before the call — genuinely runtime-dynamic effect — has no bound to exceed, and
 the receipt is then the only account of what happened, which is the case receipts uniquely
 serve.

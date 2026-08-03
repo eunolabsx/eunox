@@ -168,7 +168,7 @@ type DeclassifyApproval struct {
 	// protection as the other two. Absent is fine; empty and absent are the same — EXCEPT
 	// under Once, where it is the ledger's key and therefore mandatory.
 	ID string `json:"id,omitempty"`
-	// Once marks the grant SINGLE-USE: the proxy burns it in the anchored declassify
+	// Once marks the grant SINGLE-USE: the proxy burns it in the declassify
 	// ledger on the first call that clears a label with it, and every later presentation
 	// escalates ("approval_consumed") instead of clearing again. It is the mechanism behind
 	// "approve clearing this once", which is what an approval workflow almost always means
@@ -266,7 +266,7 @@ func (a *DeclassifyApproval) Validate() error {
 	return nil
 }
 
-// LedgerID is the member a single-use grant occupies in the anchored declassify ledger.
+// LedgerID is the member a single-use grant occupies in the declassify ledger.
 // Empty for a standing grant, which is never burned and never looked up.
 //
 // The Target is folded in beside the ID so one control-plane record covering several actions
@@ -332,7 +332,7 @@ func ParseDeclassifyApprovals(raw json.RawMessage) ([]DeclassifyApproval, error)
 // CoveringDeclassifyApprovals returns every approval covering all of want at target, in the
 // token's own order. The engine walks the whole list rather than taking the first match
 // because a covering grant is not necessarily a USABLE one: a single-use grant already burned
-// in this anchor's ledger covers the call on paper and must be passed over in favour of a
+// in the ledger covers the call on paper and must be passed over in favour of a
 // later grant that is still live. Selecting first-covering and only then testing consumption
 // would refuse a request the token was carrying a valid second approval for.
 //

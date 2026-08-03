@@ -251,8 +251,9 @@ func (c *DelegationChain) PermitsTarget(target string) (ok bool, blockedBy strin
 	return true, ""
 }
 
-// ForcedLabels returns the union of every hop's Labels, in canonical vocabulary order. These
-// are unioned into a call's flow check — never into the anchor's stored set.
+// computeForcedLabels does the work ForcedLabels memoizes. The CONTRACT is stated on the
+// exported accessor; copying it here named the wrong function and left two statements of one
+// rule to drift apart.
 func (c *DelegationChain) computeForcedLabels() []string {
 	if c == nil {
 		return nil
@@ -267,10 +268,8 @@ func (c *DelegationChain) computeForcedLabels() []string {
 	return NormalizeDeclaredLabels(all)
 }
 
-// AllowedLabelCap returns the intersection of every hop's AllowLabels, and whether any hop
-// declared one. A nil-with-true result is the full quarantine (no labeled flow reaches any
-// sink); false means no hop capped the sink allow-set and the manifest's own Allow stands
-// unmodified.
+// computeAllowedLabelCap does the work AllowedLabelCap memoizes; the contract is on the
+// exported accessor.
 func (c *DelegationChain) computeAllowedLabelCap() (allowed []string, capped bool) {
 	if c == nil {
 		return nil, false
@@ -310,9 +309,8 @@ func (c *DelegationChain) computeAllowedLabelCap() (allowed []string, capped boo
 	return NormalizeDeclaredLabels(keys), true
 }
 
-// RedactFields returns the union of every hop's RedactFields, sorted for a deterministic
-// obligation. Composing rather than replacing is the narrowing direction: a delegate sees at
-// least as much masked as its delegator did.
+// computeRedactFields does the work RedactFields memoizes; the contract is on the exported
+// accessor.
 func (c *DelegationChain) computeRedactFields() []string {
 	if c == nil {
 		return nil
@@ -334,8 +332,8 @@ func (c *DelegationChain) computeRedactFields() []string {
 	return out
 }
 
-// EffectClassCap returns the most restrictive MaxEffectClass any hop declared, and the hop
-// that declared it. ok is false when no hop capped the class.
+// computeEffectClassCap does the work EffectClassCap memoizes; the contract is on the
+// exported accessor.
 func (c *DelegationChain) computeEffectClassCap() (class, subject string, ok bool) {
 	if c == nil {
 		return "", "", false

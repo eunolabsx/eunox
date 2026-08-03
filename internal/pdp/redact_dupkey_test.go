@@ -295,3 +295,91 @@ func TestApplyRedactObligs_ArrayLeafCaseVariantFailsClosed(t *testing.T) {
 		t.Errorf("the obligated field must not be forwarded; got %s", out)
 	}
 }
+
+// The case-variant gate above fires on a COLLISION. A LONE variant collides with nothing,
+// so it slipped every check: it missed ApplyRedactObligs' exact-match dispatch
+// (result["content"] is not result["Content"]) and fell to the generic sibling walk, which
+// is strictly weaker — no resource-body guard, no content-item shape checks, and dotted
+// paths dropped under the walk's own prefixes. Nothing matched, so `changed` stayed false
+// and the ORIGINAL bytes reached a case-insensitive host (Go MCP SDK struct binding, .NET
+// PropertyNameCaseInsensitive) that binds the variant as the real content — while the tape
+// reported the obligation applied.
+//
+// Each shape below is paired with its canonical spelling, which already behaves correctly,
+// so the test pins the ASYMMETRY rather than just the new error.
+func TestApplyRedactObligs_LoneReservedRootKeyVariantFailsClosed(t *testing.T) {
+	t.Parallel()
+	const ssn = "123-45-6789"
+	for _, tc := range []struct {
+		name         string
+		variant      string
+		canonical    string
+		paths        []string
+		canonRefuses bool
+	}{
+		{
+			name:         "Content carrying an uninspectable resource body",
+			variant:      `{"Content":[{"type":"resource","resource":{"text":"ssn=` + ssn + `"}}]}`,
+			canonical:    `{"content":[{"type":"resource","resource":{"text":"ssn=` + ssn + `"}}]}`,
+			paths:        []string{"ssn"},
+			canonRefuses: true,
+		},
+		{
+			name:      "Content carrying a doubly-encoded text body",
+			variant:   `{"Content":[{"type":"text","text":"{\"data\":{\"ssn\":\"` + ssn + `\"}}"}]}`,
+			canonical: `{"content":[{"type":"text","text":"{\"data\":{\"ssn\":\"` + ssn + `\"}}"}]}`,
+			paths:     []string{"data.ssn"},
+		},
+		{
+			name:      "StructuredContent under the guide-recommended dotted path",
+			variant:   `{"StructuredContent":{"ssn":"` + ssn + `"}}`,
+			canonical: `{"structuredContent":{"ssn":"` + ssn + `"}}`,
+			paths:     []string{"structuredContent.ssn"},
+		},
+		{
+			name:      "the metadata sidecar",
+			variant:   `{"_Meta":{"data":{"ssn":"` + ssn + `"}}}`,
+			canonical: `{"_meta":{"data":{"ssn":"` + ssn + `"}}}`,
+			paths:     []string{"data.ssn"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			obl := []capability.Obligation{{Type: capability.DirectiveTypeRedactFields, Paths: tc.paths}}
+			assertRedactionFailsClosed(t, []byte(tc.variant), obl, ssn)
+
+			out, err := ApplyRedactObligs([]byte(tc.canonical), obl)
+			if tc.canonRefuses {
+				require.Error(t, err, "the canonical spelling of this shape already fails closed")
+				return
+			}
+			require.NoError(t, err, "the canonical spelling must keep redacting")
+			assert.NotContains(t, string(out), ssn, "the canonical spelling masks the field")
+		})
+	}
+}
+
+// The refusal names ONE offender deterministically. Map iteration order would otherwise make
+// two identical responses fail with two different messages, which is the sort of thing that
+// turns a fail-closed diagnostic into a flaky one.
+func TestRefuseReservedRootKeyVariants_DeterministicAndScoped(t *testing.T) {
+	t.Parallel()
+	err := refuseReservedRootKeyVariants(map[string]interface{}{
+		"StructuredContent": map[string]interface{}{},
+		"Content":           []interface{}{},
+		"IsError":           true,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `"Content"`, "the sorted-first offender is named")
+	assert.Contains(t, err.Error(), `"content"`, "and the canonical key it folds to")
+
+	require.NoError(t, refuseReservedRootKeyVariants(map[string]interface{}{
+		"content":           []interface{}{},
+		"structuredContent": map[string]interface{}{},
+		"isError":           false,
+		"contents":          []interface{}{},
+		"messages":          []interface{}{},
+		"_meta":             map[string]interface{}{},
+		"Report":            "an unmodelled sibling folding to no reserved key",
+	}), "canonical spellings and unrelated keys are honest data")
+}

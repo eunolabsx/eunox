@@ -1,8 +1,10 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// Per-method MCP enforcement handlers (tools/call, resources/*, prompts/*,
-// and server-initiated requests) with their upstream-timeout and denial helpers.
+// The upstream-timeout and denial helpers shared by the enforcement path, plus the
+// server-initiated request leg. The per-method handlers themselves (tools/call,
+// resources/*, prompts/*) live in dispatch.go, with the method->handler mapping both
+// transports share.
 
 package transport
 

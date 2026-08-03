@@ -65,17 +65,25 @@ import (
 // enforces it.
 func (p *HTTPProxy) requireJSONContentType(w http.ResponseWriter, r *http.Request, route *UpstreamRoute) bool {
 	vals := r.Header.Values("Content-Type")
-	switch {
-	case len(vals) > 1:
-		fmt.Fprintf(os.Stderr,
-			"[eunox] SECURITY: rejected request carrying %d Content-Type headers (%q); exactly one is required (a reverse proxy that re-adds the header will trip this)\n",
-			len(vals), strings.Join(vals, ", "))
-	case len(vals) == 1 && isJSONMediaType(vals[0]):
+	if len(vals) == 1 && isJSONMediaType(vals[0]) {
 		return true
 	}
-	p.recordRefusal(r, route, codeUnsupportedMediaType, catContentType, map[string]interface{}{
+	admitted := p.recordRefusal(r, route, codeUnsupportedMediaType, catContentType, map[string]interface{}{
 		"header_count": len(vals),
 	})
+	// Bounded AND gated on the same admission verdict as the record, mirroring checkOrigin.
+	// The line printed strings.Join(vals, ", ") unconditionally, ahead of and independent of
+	// the limiter: attacker-controlled header values, up to ~1 MiB under Go's default
+	// MaxHeaderBytes, at one line per request with no credential required on the default
+	// loopback deployment. That is the cheapest half of the flooding primitive checkOrigin
+	// already closed for its twin, while the record beside it was carefully bounded to a
+	// count. A suppressed burst is still visible, as the rollup count on the next admitted
+	// record.
+	if admitted && len(vals) > 1 {
+		fmt.Fprintf(os.Stderr,
+			"[eunox] SECURITY: rejected request carrying %d Content-Type headers (%q); exactly one is required (a reverse proxy that re-adds the header will trip this)\n",
+			len(vals), boundedRefusalDetail(strings.Join(vals, ", ")))
+	}
 	http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
 	return false
 }
