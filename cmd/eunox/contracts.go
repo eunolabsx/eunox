@@ -229,12 +229,12 @@ func findContract(contracts []registry.Contract, id string) *registry.Contract {
 	return nil
 }
 
-// reportUnknownContractID is the shared not-found path, parameterized by the flag that
-// asked. An unknown id is an error rather than empty output for both callers: a pin an
-// author pastes, and a payload a publisher signs, both have to come from an entry that
-// exists.
-func reportUnknownContractID(id, flag string) int {
-	fmt.Fprintf(os.Stderr, "eunox contracts: no contract with id %q in the corpus (run without %s to list the ids it holds)\n", id, flag)
+// reportUnknownContractID is the shared not-found path; askedBy names the flag that asked,
+// so the message points at the one the operator actually typed. An unknown id is an error
+// rather than empty output for both callers: a pin an author pastes, and a payload a
+// publisher signs, both have to come from an entry that exists.
+func reportUnknownContractID(id, askedBy string) int {
+	fmt.Fprintf(os.Stderr, "eunox contracts: no contract with id %q in the corpus (run without %s to list the ids it holds)\n", id, askedBy)
 	return 2
 }
 

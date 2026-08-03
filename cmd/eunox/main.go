@@ -654,19 +654,7 @@ func cmdProxy(args []string) (exitCode int) {
 		// so (LIFO) it runs before earlier defers, while sink.Close stays last.
 		defer ksRedis.Stop()
 	}
-	if mem, ok := counter.(*callcounter.InMemory); ok {
-		mem.StartCleanup(ctx, callcounter.DefaultCleanupInterval)
-	}
-	// The flow store's own sweep, which the store itself declines when it expires nothing
-	// (the default). Where it IS armed — task anchoring — the lazy expiry on the access
-	// paths never runs for an anchor nothing accesses again, which is precisely what an
-	// abandoned task is: no teardown owns it, and its agent has simply stopped using the
-	// task. Without the sweep the map holds every task the process has ever seen until it
-	// hits the admission ceiling, after which every flow-relevant source call fails closed
-	// for the life of the process.
-	if mem, ok := flowStore.(*flowlabelstore.InMemory); ok {
-		mem.StartCleanup(ctx, flowlabelstore.DefaultCleanupInterval)
-	}
+	startInMemorySweeps(ctx, counter, flowStore)
 
 	var serveErr error
 	switch cfg.HostTransport() {
@@ -830,6 +818,24 @@ func flowStoreOptions(taskAnchored bool) []flowlabelstore.InMemoryOption {
 		return nil
 	}
 	return []flowlabelstore.InMemoryOption{flowlabelstore.WithMemoryIdleTTL(flowlabelstore.DefaultIdleTTL)}
+}
+
+// startInMemorySweeps arms the background reclamation for whichever in-process backends are
+// in use, and is a no-op for the Redis ones (which reclaim by TTL server-side).
+//
+// The flow store's sweep is the one that is easy to miss the point of: the lazy expiry on
+// its access paths never runs for an anchor nothing accesses AGAIN, which is precisely what
+// an abandoned one is — a task whose agent has stopped using it, with no teardown that owns
+// it. Without the sweep the map holds every such task until it hits the admission ceiling,
+// after which every flow-relevant source call fails closed for the life of the process. The
+// store declines to start one when it expires nothing at all, which is the default.
+func startInMemorySweeps(ctx context.Context, counter capability.CallCounter, flowStore capability.FlowLabelStore) {
+	if mem, ok := counter.(*callcounter.InMemory); ok {
+		mem.StartCleanup(ctx, callcounter.DefaultCleanupInterval)
+	}
+	if mem, ok := flowStore.(*flowlabelstore.InMemory); ok {
+		mem.StartCleanup(ctx, flowlabelstore.DefaultCleanupInterval)
+	}
 }
 
 // publishSessionKillTTL advertises the effective session-tombstone lifetime on the

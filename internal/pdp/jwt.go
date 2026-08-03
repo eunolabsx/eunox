@@ -876,6 +876,47 @@ func (p *JWTPDP) validateStandardClaims(stdClaims jwt.Claims, now time.Time) (in
 	return stdClaims.Expiry.Time().Unix(), nil
 }
 
+// parseDeclassifyApprovals decodes the mcp.declassify claim and refuses a token whose
+// single-use grants would outlive the ledger's memory of their own burn. The two are one
+// function because they are one question — "can this build enforce the approvals this token
+// declares, as written?" — and both answers are a rejected TOKEN.
+//
+// The burn lives in a WINDOWED ledger, so a token that outlives the window would present
+// the same grant again after the burn aged out and clear a second time — one human
+// approval, two declassifications, and nothing on the tape saying so. Refusing here bounds
+// the token's remaining lifetime against the same exp and the same leeway
+// validateStandardClaims just accepted it under, so the burn a later call writes always
+// outlives the token that could replay it. A standing grant is unaffected.
+//
+// It runs at the token boundary rather than on the decision path for the reason every other
+// claim-borne narrowing does: a grant this build cannot enforce as written is a rejected
+// token, not a decision-time surprise the operator has no error to grep for.
+//
+// expUnix is the value validateStandardClaims returned after accepting exp, rather than a
+// second dereference of stdClaims.Expiry: that pointer is non-nil only because the check
+// above ran first, and a reordering would turn a second read into a nil dereference on a
+// request goroutine.
+//
+// A non-positive expUnix stays the ZERO time rather than becoming time.Unix(0, 0). The two
+// look interchangeable and are not: 1970-01-01 is a real instant, so it is not IsZero, and
+// it would sail through the window check as a lifetime tens of years in the past —
+// admitting a `once` grant on a token whose expiry this build never established. The unset
+// case has to reach the guard that refuses it, so it is encoded as unset.
+func (p *JWTPDP) parseDeclassifyApprovals(raw json.RawMessage, expUnix int64, now time.Time) ([]capability.DeclassifyApproval, error) {
+	approvals, err := capability.ParseDeclassifyApprovals(raw)
+	if err != nil {
+		return nil, capability.Terminal(jwtErr(jwtErrInvalidDeclassify, err))
+	}
+	var exp time.Time
+	if expUnix > 0 {
+		exp = time.Unix(expUnix, 0)
+	}
+	if err := capability.CheckDeclassifyApprovalLifetime(approvals, exp, now, p.leeway); err != nil {
+		return nil, capability.Terminal(jwtErr(jwtErrInvalidDeclassify, err))
+	}
+	return approvals, nil
+}
+
 // ValidateToken validates the Authorization: Bearer token in the request,
 // extracts eunox claims, and returns a new context carrying the claims.
 // On failure it returns an error whose message is safe to surface as HTTP 401.
@@ -1048,39 +1089,9 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 		// already the opt-in, and a second gate would only add a way to configure the
 		// approval path off while leaving the directive on, i.e. a policy that can never be
 		// satisfied.
-		declassify, declErr := capability.ParseDeclassifyApprovals(payload.MCP.Declassify)
+		declassify, declErr := p.parseDeclassifyApprovals(payload.MCP.Declassify, tokenExpUnix, now)
 		if declErr != nil {
-			return nil, capability.Terminal(jwtErr(jwtErrInvalidDeclassify, declErr))
-		}
-		// A single-use grant is burned in a WINDOWED ledger, so a token that outlives that
-		// window would present the same grant again after the burn aged out and clear a
-		// second time — one human approval, two declassifications, and nothing on the tape
-		// saying so. Refuse the token here instead: the bound is on the token's remaining
-		// lifetime, checked against the same exp and the same leeway validateStandardClaims
-		// just accepted it under, so the burn a later call writes always outlives the token
-		// that could replay it. A standing grant is unaffected.
-		//
-		// It runs at the boundary rather than on the decision path for the reason every other
-		// claim-borne narrowing does: a grant this build cannot enforce as written is a
-		// rejected token, not a decision-time surprise the operator has no error to grep for.
-		//
-		// The exp read here is tokenExpUnix — the value validateStandardClaims returned
-		// after accepting it — rather than a second dereference of stdClaims.Expiry: that
-		// pointer is non-nil only because the check above ran first, and a reordering would
-		// turn a second read into a nil dereference on a request goroutine.
-		//
-		// A non-positive tokenExpUnix stays the ZERO time rather than becoming
-		// time.Unix(0, 0). The two look interchangeable and are not: 1970-01-01 is a real
-		// instant, so it is not IsZero, and it would sail through the window check as a
-		// lifetime tens of years in the past — admitting a `once` grant on a token whose
-		// expiry this build never established. The unset case has to reach the guard that
-		// refuses it, so it is encoded as unset.
-		var tokenExp time.Time
-		if tokenExpUnix > 0 {
-			tokenExp = time.Unix(tokenExpUnix, 0)
-		}
-		if lifeErr := capability.CheckDeclassifyApprovalLifetime(declassify, tokenExp, now, p.leeway); lifeErr != nil {
-			return nil, capability.Terminal(jwtErr(jwtErrInvalidDeclassify, lifeErr))
+			return nil, declErr
 		}
 
 		// Delegation attenuation, decoded and asserted at this same boundary.
