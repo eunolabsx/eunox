@@ -1602,6 +1602,11 @@ func (r recordingDecisionPoint) HardenRefusal(ctx context.Context, sessionID str
 func (r recordingDecisionPoint) EvaluateClaimCondition(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (*enforcement.ConditionError, bool) {
 	return enforcement.NonCommittingConditionVerdict(ctx, cond, req)
 }
+
+// ConditionHandlerOverridden: this fake holds no condition engine, so nothing in it
+// can have been overridden.
+func (recordingDecisionPoint) ConditionHandlerOverridden(_ string) bool { return false }
+
 func (r recordingDecisionPoint) CheckKill(ctx context.Context, sessionID string) *capability.EnforceResponse {
 	return r.inner.CheckKill(ctx, sessionID)
 }

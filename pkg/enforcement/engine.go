@@ -71,6 +71,12 @@ type registeredHandler struct {
 	// everything). A handler implementing SubsystemDependent answers for itself and this is
 	// not consulted.
 	uses []capability.EngineSubsystem
+	// builtin records that this entry came from this build's own registry rather than from
+	// [WithConditionHandler]. It is recorded at registration rather than inferred later,
+	// because "is this the shipped handler" stops being answerable once the entry is in the
+	// map: a ConditionHandlerFunc is not comparable, so nothing downstream can tell one from a
+	// replacement. See ConditionHandlerOverridden for the one question it answers.
+	builtin bool
 }
 
 // dependsOn reports whether this entry's handler depends on subsystem s.
@@ -850,7 +856,7 @@ func escalateResponse(requestID, now string, denial capability.DenialInfo) capab
 // interface is only needed to declare less.
 func WithConditionHandler(name string, handler ConditionHandler) Option {
 	return func(e *Engine) {
-		e.register(name, handler, nil)
+		e.register(name, handler, nil, false)
 	}
 }
 
@@ -858,8 +864,36 @@ func WithConditionHandler(name string, handler ConditionHandler) Option {
 // enforcement depends on. It is the ONLY write to the registry — built-ins and overrides both
 // go through it — so a registration cannot install a handler while leaving the previous
 // handler's subsystem declaration in place.
-func (e *Engine) register(name string, handler ConditionHandler, uses []capability.EngineSubsystem) {
-	e.handlers[name] = registeredHandler{ConditionHandler: handler, uses: uses}
+func (e *Engine) register(name string, handler ConditionHandler, uses []capability.EngineSubsystem, builtin bool) {
+	e.handlers[name] = registeredHandler{ConditionHandler: handler, uses: uses, builtin: builtin}
+}
+
+// ConditionHandlerOverridden reports whether the handler this engine dispatches for condType
+// came from [WithConditionHandler] rather than from this build's own registry.
+//
+// It exists for a composing layer that CANNOT route through the override and must therefore
+// refuse rather than diverge. Most such layers do route through it — the JWT capability-claim
+// path asks the deciding PDP (EvaluateClaimCondition) so an embedder's allowedValues means the
+// same thing on both sides of a JWT/manifest intersection. One arm cannot: the claim grammar's
+// `op=` shorthand has no way to NAME the operation argument, so its semantics are
+// scan-every-argument while the engine's handler hard-denies exactly that empty argument
+// ("conditions match a specific argument name; never silently match alternatives"). Dispatching
+// that arm through the registry would not enforce an override; it would deny every `op=` grant
+// in existence.
+//
+// So the divergence is answered by this fact instead: a layer that cannot honor an override for
+// a type asks whether one exists, and fails closed if it does — loudly, at startup where the
+// wiring is visible, and again at the request that would otherwise have been judged by the
+// shipped predicate while the manifest path was judged by the replacement.
+//
+// A nil engine has overridden nothing (an embedder legitimately holds an unwired *Engine; see
+// NonCommittingConditionVerdict), and neither has a type nothing registered.
+func (e *Engine) ConditionHandlerOverridden(condType string) bool {
+	if e == nil {
+		return false
+	}
+	h, ok := e.handlers[condType]
+	return ok && !h.builtin
 }
 
 // registerBuiltin installs one of this build's own handlers, taking its subsystem declaration
@@ -873,7 +907,7 @@ func (e *Engine) registerBuiltin(name string, handler ConditionHandler) {
 		// dependsOn, which resolves it to "depends on everything".
 		uses = nil
 	}
-	e.register(name, handler, uses)
+	e.register(name, handler, uses, true)
 }
 
 // runPureConditions evaluates every PURE (non-committing) condition on matched in order

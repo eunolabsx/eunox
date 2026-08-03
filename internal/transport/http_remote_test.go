@@ -844,6 +844,10 @@ func (denyAllPDP) EvaluateClaimCondition(ctx context.Context, cond capability.Co
 	return enforcement.NonCommittingConditionVerdict(ctx, cond, req)
 }
 
+// ConditionHandlerOverridden: this fake holds no condition engine, so nothing in it
+// can have been overridden.
+func (denyAllPDP) ConditionHandlerOverridden(_ string) bool { return false }
+
 func (denyAllPDP) CheckKill(_ context.Context, _ string) *capability.EnforceResponse {
 	return nil
 }

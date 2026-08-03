@@ -482,7 +482,10 @@ func (e *Engine) checkEffectCeiling(eff *capability.ResolvedEffect, matched *cap
 // this is asked about a call that is ALREADY refused, so a label-store fault must not be
 // able to weaken (or replace) the refusal being hardened.
 func (e *Engine) CeilingVerdictFor(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint) *capability.EnforceResponse {
-	if req == nil || matched == nil || !e.effectCeiling.IsSet() {
+	// A nil engine sets no ceiling, so there is nothing to compose — and this runs on a
+	// refusal path, where a panic would replace an answered denial with a dropped connection.
+	// A ManifestPDP may legitimately hold none (see engineClock).
+	if e == nil || req == nil || matched == nil || !e.effectCeiling.IsSet() {
 		return nil
 	}
 	requestID := NewRequestID()

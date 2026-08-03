@@ -227,60 +227,104 @@ func (g *decisionSerializer) begin(t decisionTicket) (end func()) {
 	// With no bound there is no give-up path — the wait loop can only exit on the turn — so ok
 	// is invariably true and the end func is never nil. A future second reason to give up would
 	// have to make this branch, rather than silently returning a nil release to a deferred call.
-	end, _ = g.beginWithin(t, 0)
+	end, _ = g.beginWithin(t, turnWait{})
 	return end
 }
 
-// beginWithin is begin bounded by d: it reports ok=false when the ticket's turn has not come
-// up within d, having ABANDONED the ticket so no later one queues behind it. d <= 0 waits
-// forever (what begin does).
+// turnWait is a bounded waiter's give-up rule, in TWO parts. It is a type rather than one
+// duration because the two answer different questions, and collapsing them is what made the
+// single duration answer neither well once server-initiated requests stopped serializing.
 //
-// The bound exists for one caller — the server-initiated (sampling) leg — and for one hazard,
-// which on this transport is a CYCLE rather than a slow turn:
+// perHolder bounds ONE turn HOLDER: a waiter gives up when the request currently holding the
+// turn has held it for that long without handing off. It does NOT bound the waiter's own
+// elapsed wait, and that is the point — a waiter parked behind a queue that is moving is
+// waiting on real work, exactly like the unbounded host path, while a waiter parked behind a
+// holder that is stuck is waiting on the hazard the bound exists for. (Before this, the window
+// started at ARRIVAL: when handlers ran inline each got a fresh window for free because the
+// next was not read off the pipe until the previous finished, and once they ran concurrently N
+// waiters started one window together and all expired at the same instant, refusing N requests
+// for one slow holder.)
 //
-//   - handleUpstreamRequest runs INLINE on the upstream reader goroutine, and that goroutine is
-//     also the only one that delivers upstream responses to waiting host handlers;
-//   - a declassifying host call deliberately holds its turn across the whole upstream round
-//     trip (finishDecision does not release it while a clear is pending), because the two
-//     phases of the clear are one critical section;
-//   - so a sampling request arriving mid-clear parks the reader on a turn that is waiting for
-//     a response only that reader can deliver.
+// total is the absolute ceiling, and it is what keeps "the queue is moving" from meaning
+// "forever": a waiter holds one of the server-request pool's slots, so an anchor with a steady
+// stream of sub-perHolder holders would otherwise park a slot indefinitely and convert into the
+// pool's own saturation refusals for later requests.
 //
-// That deadlocks until --upstream-timeout fires, and forever when it is 0. The wait is bounded
-// here and the caller fails the sampling request CLOSED (samplingTurnDenial), which is exactly
-// what the HTTP leg already does with the identical hazard — the two legs now answer "what
-// happens when the turn is held by a declassifying call" the same way.
+// A zero perHolder is the unbounded wait (what begin does); total is read only when perHolder
+// is set.
+type turnWait struct {
+	perHolder time.Duration
+	total     time.Duration
+}
+
+// bounded reports whether this waiter gives up at all.
+func (w turnWait) bounded() bool { return w.perHolder > 0 }
+
+// beginWithin is begin bounded by w: it reports ok=false when the ticket's turn has not come up
+// under w's rule, having ABANDONED the ticket so no later one queues behind it. An unbounded w
+// waits forever (what begin does).
+//
+// The bound exists for one caller — the server-initiated (sampling) leg — and it began as a
+// bound on a WEDGE: that leg ran inline on the upstream reader, the only goroutine that
+// delivers upstream responses, while a declassifying host call holds its turn across the whole
+// upstream round trip (finishDecision does not release it while a clear is pending, because the
+// two phases of the clear are one critical section) — so a sampling request arriving mid-clear
+// parked the reader on a turn whose holder was waiting for a response only that reader could
+// deliver. That wedge is gone: the leg runs on its own goroutine (serverRequestPool).
+//
+// What is left is an UNBOUNDED WAIT, which is a different thing and is why the rule is
+// per-holder rather than per-arrival: without a bound the wait is limited only by
+// --upstream-timeout, which may be 0 (never), and the waiter holds a pool slot the whole time.
+// See turnWait.
 //
 // Abandoning is what makes bounding safe. The queue's invariant is handed/serving, so a ticket
 // nobody will ever begin is a hole every later ticket waits behind; recording it in abandoned
 // lets the turn skip it when serving arrives, which is the difference between a bounded stall
 // and an unbounded one.
-func (g *decisionSerializer) beginWithin(t decisionTicket, d time.Duration) (end func(), ok bool) {
+func (g *decisionSerializer) beginWithin(t decisionTicket, w turnWait) (end func(), ok bool) {
 	q := t.queue
 	if q == nil {
 		return func() {}, true
 	}
-	// sync.Cond has no bounded Wait, so the bound is a timer that broadcasts. gaveUp is this
+	// sync.Cond has no bounded Wait, so the bound is a timer that broadcasts. expired is this
 	// call's own variable, written and read under g.mu; a broadcast wakes every waiter on the
-	// anchor and each re-checks its own two conditions, which is the ordinary spurious-wakeup
+	// anchor and each re-checks its own conditions, which is the ordinary spurious-wakeup
 	// discipline the loop already had.
-	gaveUp := false
-	if d > 0 {
-		timer := time.AfterFunc(d, func() {
+	expired := false
+	var timer *time.Timer
+	var deadline time.Time
+	if w.bounded() {
+		timer = time.AfterFunc(w.perHolder, func() {
 			g.queues.lock()
 			defer g.queues.unlock()
-			gaveUp = true
+			expired = true
 			q.cond.Broadcast()
 		})
 		defer timer.Stop()
+		deadline = time.Now().Add(w.total)
 	}
 	g.queues.lock()
-	for q.serving != t.n && !gaveUp {
+	// The ticket holding the turn when this window opened. A change means the queue handed off
+	// while we waited, which is progress rather than the stall the bound is for.
+	holder := q.serving
+	for q.serving != t.n {
+		if expired {
+			if q.serving == holder || !time.Now().Before(deadline) {
+				break
+			}
+			// A fresh window for the new holder: this waiter has not been stalled by anyone,
+			// it is queued behind work that is completing.
+			holder = q.serving
+			expired = false
+			timer.Reset(w.perHolder)
+			continue
+		}
 		q.cond.Wait()
 	}
 	if q.serving != t.n {
-		// The turn is checked FIRST on the way out: a timer that fires in the same instant the
-		// turn comes up loses, so a caller is never refused a turn it could have had.
+		// The turn is checked FIRST on the way out (it is the loop condition): a timer that
+		// fires in the same instant the turn comes up loses, so a caller is never refused a turn
+		// it could have had.
 		q.abandonLocked(t.n)
 		g.queues.unlock()
 		return nil, false

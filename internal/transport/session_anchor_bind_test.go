@@ -23,14 +23,15 @@ import (
 // are two different state anchors for one session as soon as a caller sends a second token that
 // differs only in mcp.task_id — which sub/iss alone accepted.
 //
-// These pin the fix: a session on a task-anchored route is bound to its ANCHOR, so the two legs
-// cannot be reading different buckets, and the taint a host source records is the taint the
-// sampling sink peeks.
+// These pin where the refusal lands: on the SINK, not on the request. Each host request is
+// decided, keyed and serialized on its own anchor, which is correct however many the session
+// spans; the leg that cannot be decided that way is refused for the session's life.
 
-// TestOwnerMismatch_TaskAnchoredSessionIsBoundToItsAnchor is the gate. The principal pin
-// (iss+sub) accepts two tokens that differ only in task_id, which is exactly the pair that
-// splits the two legs' state.
-func TestOwnerMismatch_TaskAnchoredSessionIsBoundToItsAnchor(t *testing.T) {
+// TestOwnerMismatch_PinsThePrincipalNotTheAnchor: the session gate is about IDENTITY. A second
+// task on the same principal is admitted — spanning tasks over one long-lived connection is a
+// normal shape for an agent runtime, and the reason task anchoring exists is that a task
+// outlives a connection.
+func TestOwnerMismatch_PinsThePrincipalNotTheAnchor(t *testing.T) {
 	t.Parallel()
 	anchored := &UpstreamRoute{taskAnchored: true}
 	sessionOnly := &UpstreamRoute{}
@@ -43,14 +44,12 @@ func TestOwnerMismatch_TaskAnchoredSessionIsBoundToItsAnchor(t *testing.T) {
 		wantReason string
 	}{
 		"same principal, same task": {anchored, t1, t1, ""},
-		"same principal, DIFFERENT task is refused": {
-			anchored, t1, t2, "session_anchor_mismatch"},
+		"same principal, DIFFERENT task is admitted (the sink pays, not the request)": {
+			anchored, t1, t2, ""},
 		"another token for the same task still matches": {
 			anchored, t1, &pdp.JWTClaims{Issuer: "iss-a", Subject: "sub-a", TaskID: "task-1", AgentID: "agent-9"}, ""},
-		"a token carrying no task at all is refused": {
-			anchored, t1, &pdp.JWTClaims{Issuer: "iss-a", Subject: "sub-a"}, "session_anchor_mismatch"},
-		"an UNBOUND session cannot be joined by a tokened request either": {
-			anchored, nil, t1, "session_anchor_mismatch"},
+		"a token carrying no task at all is admitted here (the engine refuses it on its own grounds)": {
+			anchored, t1, &pdp.JWTClaims{Issuer: "iss-a", Subject: "sub-a"}, ""},
 		"an unbound session with untokened requests is unaffected": {
 			anchored, nil, nil, ""},
 		"a different principal is still an owner mismatch": {
@@ -67,10 +66,32 @@ func TestOwnerMismatch_TaskAnchoredSessionIsBoundToItsAnchor(t *testing.T) {
 			reason, mismatch := sess.ownerMismatch(tc.cur)
 			assert.Equal(t, tc.wantReason != "", mismatch)
 			assert.Equal(t, tc.wantReason, reason,
-				"the deny record must name WHICH pin failed: an anchor refusal reported as an owner "+
-					"mismatch sends an operator looking for a second client that does not exist")
+				"the deny record must name WHICH pin failed, so an operator is not sent looking for a second client that does not exist")
 		})
 	}
+}
+
+// TestNoteRequestAnchor_SpanIsStickyAndScoped: the span is recorded per request, is one-way,
+// and cannot arise at all on a route that does not anchor state on the task.
+func TestNoteRequestAnchor_SpanIsStickyAndScoped(t *testing.T) {
+	t.Parallel()
+	t1 := &pdp.JWTClaims{Issuer: "iss-a", Subject: "sub-a", TaskID: "task-1"}
+	t2 := &pdp.JWTClaims{Issuer: "iss-a", Subject: "sub-a", TaskID: "task-2"}
+
+	sess := newTestSession(&httpSession{id: "sess-a", route: &UpstreamRoute{taskAnchored: true}, claims: t1})
+	sess.noteRequestAnchor(t1)
+	assert.False(t, sess.spansAnchors(), "the session's own anchor is not a span")
+	sess.noteRequestAnchor(t2)
+	assert.True(t, sess.spansAnchors(), "a second anchor is a span")
+	sess.noteRequestAnchor(t1)
+	assert.True(t, sess.spansAnchors(),
+		"and it is STICKY: the taint written under the other anchor outlives the request that wrote it, "+
+			"so returning to the original task does not make this leg decidable again")
+
+	// On a session-anchored route every request resolves the session, so the question is vacuous.
+	plain := newTestSession(&httpSession{id: "sess-b", route: &UpstreamRoute{}, claims: t1})
+	plain.noteRequestAnchor(t2)
+	assert.False(t, plain.spansAnchors())
 }
 
 // TestTaskAnchoredSession_SourceTaintIsVisibleToTheSamplingSink is the acceptance test for the
@@ -79,9 +100,9 @@ func TestOwnerMismatch_TaskAnchoredSessionIsBoundToItsAnchor(t *testing.T) {
 //
 // The host leg records it under the REQUEST's task and the sampling leg peeks under the
 // SESSION's, so the two legs must be reading one anchor for the sink to see anything at all.
-// The session gate is what guarantees that, and the two halves are asserted together here: with
-// the tokens the gate admits, the sink denies; the token that would have split the buckets is
-// refused before it can taint one of them.
+// Both halves are asserted together: while the session stays on one anchor the sink sees the
+// taint, and the moment it spans, the sink is refused outright rather than peeking a bucket
+// nothing is tainting.
 func TestTaskAnchoredSession_SourceTaintIsVisibleToTheSamplingSink(t *testing.T) {
 	t.Parallel()
 	engine := enforcement.New(
@@ -103,12 +124,6 @@ func TestTaskAnchoredSession_SourceTaintIsVisibleToTheSamplingSink(t *testing.T)
 	sess.holdDecisionGate()
 	t.Cleanup(sess.dropDecideGate)
 
-	// The token that would have split the two legs is refused before it can taint anything.
-	splitting := &pdp.JWTClaims{Issuer: "iss-a", Subject: "sub-a", TaskID: "task-2"}
-	reason, mismatch := sess.ownerMismatch(splitting)
-	require.True(t, mismatch, "a second task on this session must not be admitted")
-	require.Equal(t, "session_anchor_mismatch", reason)
-
 	// A sampling request BEFORE any source runs is clean, so the deny below is the taint and
 	// not a deny-by-default.
 	samplingLeg := func() capability.EnforceResponse {
@@ -118,7 +133,8 @@ func TestTaskAnchoredSession_SourceTaintIsVisibleToTheSamplingSink(t *testing.T)
 			decideLock: func() (func(), bool) {
 				return sess.beginDecisionTurnWithin(samplingTurnWait)
 			},
-			pdp: rt.pdp,
+			anchorSplit: sess.spansAnchors,
+			pdp:         rt.pdp,
 		}
 		// forwardServerRequest attaches fp.claims to the decision context; this drives the
 		// decision half directly, so it does the same.
@@ -128,10 +144,11 @@ func TestTaskAnchoredSession_SourceTaintIsVisibleToTheSamplingSink(t *testing.T)
 		"an untainted session must be allowed, or the assertion below proves nothing")
 
 	// The host leg taints, reading the REQUEST's claims — a DISTINCT token for the same task,
-	// which is what the gate admits and what a long-lived session actually carries.
-	hostCtx := pdp.WithJWTClaims(context.Background(),
-		&pdp.JWTClaims{Issuer: "iss-a", Subject: "sub-a", TaskID: "task-1", AgentID: "agent-9"})
-	src := dp.Decide(hostCtx, sess.id,
+	// which is what a long-lived session actually carries.
+	hostClaims := &pdp.JWTClaims{Issuer: "iss-a", Subject: "sub-a", TaskID: "task-1", AgentID: "agent-9"}
+	sess.noteRequestAnchor(hostClaims)
+	require.False(t, sess.spansAnchors(), "the same task is not a span")
+	src := dp.Decide(pdp.WithJWTClaims(context.Background(), hostClaims), sess.id,
 		pdp.EnforceTarget{Type: capability.TargetTypeTool, Name: "read_secret"}, map[string]interface{}{}, "")
 	require.Equal(t, capability.DecisionAllow, src.Decision, "the source read must be allowed: %+v", src.Denial)
 
@@ -141,21 +158,67 @@ func TestTaskAnchoredSession_SourceTaintIsVisibleToTheSamplingSink(t *testing.T)
 		"the sampling sink peeked a different anchor than the source tainted — the egress the label exists to stop was forwarded")
 	require.NotNil(t, dec.Denial)
 	assert.Equal(t, capability.ConditionTypeFlowLabel, dec.Denial.ConditionType)
+}
 
-	// The negative control, and the reason the gate is a security fix rather than tidiness: the
-	// SAME source tainting under a second task leaves the session's anchor clean, so the sink
-	// allows. Driven against the PDP directly, below the gate — which is the only thing standing
-	// between a caller holding two tokens and this outcome.
-	splitCtx := pdp.WithJWTClaims(context.Background(), splitting)
-	other := dp.Decide(splitCtx, sess.id,
-		pdp.EnforceTarget{Type: capability.TargetTypeTool, Name: "read_secret"}, map[string]interface{}{}, "")
-	require.Equal(t, capability.DecisionAllow, other.Decision)
-	clean := serverRequestParams{
-		sessionID: "sess-b",
-		claims:    &pdp.JWTClaims{Issuer: "iss-a", Subject: "sub-a", TaskID: "task-3"},
-		pdp:       rt.pdp,
+// TestTaskAnchoredSession_SpanningRefusesTheSinkNotTheRequest is the other horn, and the
+// security-relevant one. A source tainting under a SECOND task leaves the session's own anchor
+// clean, so a sink that went on deciding against the captured claims would allow the very
+// egress the label exists to stop. The host request is admitted (its own bucket is tainted
+// correctly); the sink is refused for the rest of the session's life.
+func TestTaskAnchoredSession_SpanningRefusesTheSinkNotTheRequest(t *testing.T) {
+	t.Parallel()
+	engine := enforcement.New(
+		enforcement.WithCallCounter(callcounter.NewInMemory()),
+		enforcement.WithFlowLabelStore(flowlabelstore.NewInMemory()),
+		enforcement.WithTaskAnchoredState(),
+	)
+	caps := []capability.Constraint{
+		{Target: "tool:read_secret", Actions: []string{"call"},
+			Directives: []capability.Directive{capability.LabelOutputDirective{Labels: []string{capability.FlowLabelConfidential}}}},
+		{Target: "system:sampling/createMessage", Actions: []string{"allow"},
+			Conditions: []capability.Condition{capability.FlowLabelCondition{Allow: []string{capability.FlowLabelPublic}}}},
 	}
-	assert.Equal(t, capability.DecisionAllow,
-		clean.decideSampling(pdp.WithJWTClaims(context.Background(), clean.claims)).Decision,
-		"a taint recorded under another task is invisible here — which is exactly what the session's anchor pin refuses to let happen")
+	dp := pdp.NewManifestPDP(caps, engine, killswitch.NewInMemory())
+	rt := &UpstreamRoute{name: "up1", pdp: dp, taskAnchored: true, decideGates: newAnchorGates()}
+
+	sess := newTestSession(&httpSession{id: "sess-a", route: rt,
+		claims: &pdp.JWTClaims{Issuer: "iss-a", Subject: "sub-a", TaskID: "task-1"}})
+	sess.holdDecisionGate()
+	t.Cleanup(sess.dropDecideGate)
+
+	samplingLeg := func() capability.EnforceResponse {
+		fp := serverRequestParams{
+			sessionID:   sess.id,
+			claims:      sess.claims,
+			anchorSplit: sess.spansAnchors,
+			pdp:         rt.pdp,
+		}
+		return fp.decideSampling(pdp.WithJWTClaims(context.Background(), fp.claims))
+	}
+	require.Equal(t, capability.DecisionAllow, samplingLeg().Decision, "clean session, clean sink")
+
+	// The second task's request is ADMITTED and taints its own bucket.
+	second := &pdp.JWTClaims{Issuer: "iss-a", Subject: "sub-a", TaskID: "task-2"}
+	sess.noteRequestAnchor(second)
+	require.True(t, sess.spansAnchors(), "a second anchor on one session is a span")
+	src := dp.Decide(pdp.WithJWTClaims(context.Background(), second), sess.id,
+		pdp.EnforceTarget{Type: capability.TargetTypeTool, Name: "read_secret"}, map[string]interface{}{}, "")
+	require.Equal(t, capability.DecisionAllow, src.Decision,
+		"a request for a second task is decided on its OWN anchor and must not be refused: %+v", src.Denial)
+
+	// The sink cannot be decided at all now: the session's own anchor is clean, and allowing on
+	// that basis is the fail-open this refusal exists to prevent.
+	dec := samplingLeg()
+	require.Equal(t, capability.DecisionDeny, dec.Decision,
+		"the sink peeked the session's clean anchor while another task carried the taint")
+	require.NotNil(t, dec.Denial)
+	assert.True(t, dec.Denial.HardDeny, "an --audit route must not downgrade this into the forward it prevents")
+	assert.Equal(t, capability.ConditionTypeFlowLabel, dec.Denial.ConditionType)
+	assert.Equal(t, "session_spans_anchors", dec.Denial.Details["reason"])
+
+	// Sticky: even a sampling request while the session is back on its original task stays
+	// refused, because the other task's taint outlives the request that wrote it.
+	sess.noteRequestAnchor(sess.claims)
+	require.True(t, sess.spansAnchors(), "the span does not clear")
+	assert.Equal(t, capability.DecisionDeny, samplingLeg().Decision)
 }

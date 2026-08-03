@@ -204,17 +204,31 @@ func (c *DelegationChain) IsEmpty() bool {
 // actor chain.
 //
 // It is the RFC 8693 reading of the chain in one place — "the outermost `act` is who holds
-// this now" — for a caller that needs to attribute or log a delegated call. eunox does not
-// currently stamp it on the audit record: a delegated ALLOW is recorded under the token's
-// `sub` like any other, and only a delegation REFUSAL names a hop (the one that blocked it, in
-// the denial's details). Adding it to the tape means a new top-level signed field and the
-// threat-model entry that goes with it, which is a deliberate change rather than a side
-// effect of this accessor existing.
+// this now" — for a caller that needs to attribute or log a delegated call. eunox stamps it on
+// every audit record for a delegated call, as the top-level `delegate` field beside
+// `agent_id`/`task_id`/`user_id` (which name the human the token is FOR, not the sub-agent that
+// used it), together with ActorDepth as `delegation_depth`.
 func (c *DelegationChain) Delegate() string {
 	if c == nil || len(c.Actors) == 0 {
 		return ""
 	}
 	return c.Actors[len(c.Actors)-1]
+}
+
+// ActorDepth returns how many actors the chain declares — 0 for no chain, 1 for a single
+// delegate, N for user -> hop1 -> … -> hopN.
+//
+// It is the companion to Delegate for a reader that gets the terminal actor and needs to know
+// whether it was reached through intermediaries. Recording the depth rather than the whole
+// actor list is the deliberate compromise the audit record makes: every top-level field on the
+// signed tape is a size commitment, the list is unbounded up to MaxDelegationDepth, and "who
+// acted, and how far from the human" answers the attribution question a record is read for.
+// The full chain is in the token, which is where a reconstruction that needs each hop goes.
+func (c *DelegationChain) ActorDepth() int {
+	if c == nil {
+		return 0
+	}
+	return len(c.Actors)
 }
 
 // PermitsTarget reports whether every hop's grant admits target (canonical "<type>:<bare>"

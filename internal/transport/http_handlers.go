@@ -339,14 +339,19 @@ func (p *HTTPProxy) handleHTTPUpstreamRequest(ctx context.Context, sess *httpSes
 	// request; sess.claims (captured at initialize) is attached for the sampling
 	// decision so per-agent kills are honored and the record carries agent_id/task_id.
 	forwardServerRequest(ctx, msg, serverRequestParams{
-		rec:              asRecorder(rt.sink),
-		audit:            rt.audit,
-		sessionID:        sess.id,
-		sourceIP:         sess.clientIP,
-		claims:           sess.claims,
-		forward:          sess.broadcastServerRequest,
-		writeUpstream:    func(m mcp.RPCMsg) { _ = sess.upWriter.Write(m) },
-		decideLock:       decideLock,
+		rec:           asRecorder(rt.sink),
+		audit:         rt.audit,
+		sessionID:     sess.id,
+		sourceIP:      sess.clientIP,
+		claims:        sess.claims,
+		forward:       sess.broadcastServerRequest,
+		writeUpstream: func(m mcp.RPCMsg) { _ = sess.upWriter.Write(m) },
+		decideLock:    decideLock,
+		// A session that has spanned two state anchors cannot decide on this leg at all; see
+		// samplingAnchorSplitDenial. Always wired (not only for a task-anchored route): the
+		// session answers false unless it actually spanned, so the question is asked in one
+		// place rather than re-derived from the route's mode here.
+		anchorSplit:      sess.spansAnchors,
 		strictAuditState: p.strictAudit(),
 		pdp:              rt.pdp,
 	})

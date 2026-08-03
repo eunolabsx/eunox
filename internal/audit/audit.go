@@ -37,28 +37,46 @@ import (
 
 // auditRecord is an OCSF-inspired audit record written to the local audit log.
 type auditRecord struct {
-	ClassUID      int             `json:"class_uid"`    // 6003 = API Activity
-	CategoryUID   int             `json:"category_uid"` // 6 = Application Activity
-	ActivityID    int             `json:"activity_id"`  // 1 = Allow, 2 = Deny
-	Time          string          `json:"time"`
-	Seq           uint64          `json:"seq"` // monotonic per-log sequence number; links the tamper-evident chain
-	RequestID     string          `json:"request_id"`
-	SessionID     string          `json:"session_id,omitempty"`     // omitted when empty, matching AgentID/TaskID/UserID: synthetic integrity/drop markers carry no session, so they no longer emit "session_id":""
-	AgentID       string          `json:"agent_id,omitempty"`       // JWT mcp.agent_id, stamped when a validated token is present (§ 2.1)
-	TaskID        string          `json:"task_id,omitempty"`        // JWT mcp.task_id, stamped when a validated token is present (§ 2.1)
-	UserID        string          `json:"user_id,omitempty"`        // JWT subject (sub): the human/principal identity, stamped when a validated token is present (§ 2.1)
-	Upstream      string          `json:"upstream,omitempty"`       // gateway route name (empty in single-upstream mode)
-	PolicyVersion string          `json:"policy_version,omitempty"` // manifest.Version in force for this decision
-	PolicySHA256  string          `json:"policy_sha256,omitempty"`  // digest of the canonical policy document
-	TargetType    string          `json:"target_type,omitempty"`    // "tool" | "resource" | "prompt" | "system"; namespace taken from the MCP method, not the raw identifier
-	Target        string          `json:"target,omitempty"`         // canonical bare target: tool name, resource URI, prompt name, or "sampling/createMessage"
-	Method        string          `json:"method,omitempty"`         // MCP method that produced the decision, e.g. "tools/call"
-	Decision      string          `json:"decision"`                 // "allow" | "deny" | "escalate"
-	AuditOnly     bool            `json:"audit_only,omitempty"`     // true when the decision was observed, not enforced (audit mode)
-	DenialCode    string          `json:"denial_code,omitempty"`
-	ConditionType string          `json:"condition_type,omitempty"`
-	Details       json.RawMessage `json:"details,omitempty"` // marshaled once at record time (marshalAndBoundDetails); writeRecord embeds it verbatim rather than re-marshaling the map
-	Obligations   []string        `json:"obligations,omitempty"`
+	ClassUID    int    `json:"class_uid"`    // 6003 = API Activity
+	CategoryUID int    `json:"category_uid"` // 6 = Application Activity
+	ActivityID  int    `json:"activity_id"`  // 1 = Allow, 2 = Deny
+	Time        string `json:"time"`
+	Seq         uint64 `json:"seq"` // monotonic per-log sequence number; links the tamper-evident chain
+	RequestID   string `json:"request_id"`
+	SessionID   string `json:"session_id,omitempty"` // omitted when empty, matching AgentID/TaskID/UserID: synthetic integrity/drop markers carry no session, so they no longer emit "session_id":""
+	AgentID     string `json:"agent_id,omitempty"`   // JWT mcp.agent_id, stamped when a validated token is present (§ 2.1)
+	TaskID      string `json:"task_id,omitempty"`    // JWT mcp.task_id, stamped when a validated token is present (§ 2.1)
+	UserID      string `json:"user_id,omitempty"`    // JWT subject (sub): the human/principal identity, stamped when a validated token is present (§ 2.1)
+	// Delegate and DelegationDepth attribute a DELEGATED call to the sub-agent that actually
+	// made it. UserID names the human the token is for; on a chain user -> agent-a -> agent-b
+	// that human made none of these calls directly, and without these two the record is
+	// indistinguishable from one they did. Delegate is the CURRENT holder (the outermost
+	// RFC 8693 `act` actor) and DelegationDepth is how many hops the chain declares, so an
+	// auditor reconstructing "who invoked tool:wire_transfer" gets the acting identity plus
+	// whether it was reached through intermediaries.
+	//
+	// The terminal actor plus a depth, rather than the whole actor list: every top-level field
+	// on the tape is a size commitment, and the list is unbounded up to MaxDelegationDepth
+	// while these two are one bounded string and one small int. The full chain, when it is
+	// needed, is in the token the refusal path already names hops from.
+	//
+	// Delegate is IdP-supplied (structure-validated, not length-bounded at the source) and is
+	// bounded exactly like AgentID/TaskID/UserID. Both are omitted for the overwhelming
+	// majority of records, which carry no delegation at all.
+	Delegate        string          `json:"delegate,omitempty"`
+	DelegationDepth int             `json:"delegation_depth,omitempty"`
+	Upstream        string          `json:"upstream,omitempty"`       // gateway route name (empty in single-upstream mode)
+	PolicyVersion   string          `json:"policy_version,omitempty"` // manifest.Version in force for this decision
+	PolicySHA256    string          `json:"policy_sha256,omitempty"`  // digest of the canonical policy document
+	TargetType      string          `json:"target_type,omitempty"`    // "tool" | "resource" | "prompt" | "system"; namespace taken from the MCP method, not the raw identifier
+	Target          string          `json:"target,omitempty"`         // canonical bare target: tool name, resource URI, prompt name, or "sampling/createMessage"
+	Method          string          `json:"method,omitempty"`         // MCP method that produced the decision, e.g. "tools/call"
+	Decision        string          `json:"decision"`                 // "allow" | "deny" | "escalate"
+	AuditOnly       bool            `json:"audit_only,omitempty"`     // true when the decision was observed, not enforced (audit mode)
+	DenialCode      string          `json:"denial_code,omitempty"`
+	ConditionType   string          `json:"condition_type,omitempty"`
+	Details         json.RawMessage `json:"details,omitempty"` // marshaled once at record time (marshalAndBoundDetails); writeRecord embeds it verbatim rather than re-marshaling the map
+	Obligations     []string        `json:"obligations,omitempty"`
 	// LabelsOut and CarriedLabels are the information-flow-control fields: the native
 	// flow labels this call's output asserted into the session (labelsOut, from its
 	// labelOutput directives) and the session's accumulated label set observed at
@@ -208,11 +226,10 @@ type Sink struct {
 	// production Sink, and every test that does not ask) uses syncDir; see syncLogDir.
 	syncDirOverride func(dir, subject string)
 
-	// identity, when set, extracts the agent/task/user identity to stamp on each
-	// record from the request context. Injected via WithIdentity so the audit
-	// subsystem need not depend on the JWT/PDP layer; nil leaves
-	// AgentID/TaskID/UserID empty.
-	identity func(ctx context.Context) (agentID, taskID, userID string)
+	// identity, when set, extracts the caller identity to stamp on each record from the
+	// request context. Injected via WithIdentity so the audit subsystem need not depend on
+	// the JWT/PDP layer; nil leaves every identity field empty.
+	identity func(ctx context.Context) Identity
 
 	// activePath is the file the current fd (s.f) writes to. It equals logPath
 	// normally, but a rotation whose reopen of logPath fails keeps writing to the
@@ -434,9 +451,32 @@ const (
 // synchronization.
 type Option func(*Sink)
 
-// WithIdentity injects the agent/task/user identity extractor read by Record.
-// Supplied by the caller so the audit subsystem need not import the JWT/PDP layer.
-func WithIdentity(fn func(ctx context.Context) (agentID, taskID, userID string)) Option {
+// Identity is the caller identity a Record stamps, extracted from the request context by the
+// injected WithIdentity func.
+//
+// It is a struct rather than a positional tuple because it grew: three same-typed strings in a
+// row is a transposition waiting to happen, and adding the delegation attribution made it five
+// values of which two are new. Named fields also mean a future identity axis is a field, not a
+// fourth string every implementation and call site has to get in the right order.
+type Identity struct {
+	// AgentID and TaskID are the mcp.agent_id / mcp.task_id claims of a validated token.
+	AgentID string
+	TaskID  string
+	// UserID is the token SUBJECT (sub): the human or principal the agent acts for. On a
+	// delegated call it is still the human — which is precisely why Delegate exists.
+	UserID string
+	// Delegate is the identity currently HOLDING the token: the outermost RFC 8693 `act`
+	// actor. Empty for a token carrying no actor chain, which is nearly all of them.
+	Delegate string
+	// DelegationDepth is how many actors the chain declares (0 when there is none), so a
+	// record naming only the terminal delegate still says whether it was reached through
+	// intermediaries.
+	DelegationDepth int
+}
+
+// WithIdentity injects the caller-identity extractor read by Record. Supplied by the caller so
+// the audit subsystem need not import the JWT/PDP layer.
+func WithIdentity(fn func(ctx context.Context) Identity) Option {
 	return func(s *Sink) { s.identity = fn }
 }
 
@@ -1428,12 +1468,16 @@ func (s *Sink) Record(ctx context.Context, p RecordParams) {
 	// to auditEnvelopeFieldCap: these IdP-supplied claims are structure-validated but
 	// not length-bounded, so a misconfigured or compromised IdP could otherwise push
 	// a record past the 4 MiB scanner buffer. Mirrors SessionID/Target/Method.
-	var agentID, taskID, userID string
+	var id Identity
 	if s.identity != nil {
-		agentID, taskID, userID = s.identity(ctx)
-		agentID = boundFieldTo(agentID, auditEnvelopeFieldCap)
-		taskID = boundFieldTo(taskID, auditEnvelopeFieldCap)
-		userID = boundFieldTo(userID, auditEnvelopeFieldCap)
+		id = s.identity(ctx)
+		id.AgentID = boundFieldTo(id.AgentID, auditEnvelopeFieldCap)
+		id.TaskID = boundFieldTo(id.TaskID, auditEnvelopeFieldCap)
+		id.UserID = boundFieldTo(id.UserID, auditEnvelopeFieldCap)
+		// Bounded with the other three: act.sub is IdP-supplied and structure-validated but
+		// not length-bounded at the source, so it is the same exposure they are. The depth is
+		// an int the chain validator already caps at MaxDelegationDepth.
+		id.Delegate = boundFieldTo(id.Delegate, auditEnvelopeFieldCap)
 	}
 
 	rec := auditRecord{
@@ -1443,9 +1487,13 @@ func (s *Sink) Record(ctx context.Context, p RecordParams) {
 		Time:        s.clock().UTC().Format(time.RFC3339Nano),
 		RequestID:   nextRequestID(),
 		SessionID:   boundFieldTo(p.SessionID, auditSessionIDCap),
-		AgentID:     agentID,
-		TaskID:      taskID,
-		UserID:      userID,
+		AgentID:     id.AgentID,
+		TaskID:      id.TaskID,
+		UserID:      id.UserID,
+		// The acting delegate, for a call a sub-agent made on the human's behalf. Both are
+		// zero for every non-delegated request and omitempty keeps them off those records.
+		Delegate:        id.Delegate,
+		DelegationDepth: id.DelegationDepth,
 		// Route provenance (config route name, manifest version, computed digest) is
 		// operator-supplied and fixed for the lifetime of the route, unlike every other
 		// field here — so, unlike them, it is bounded ONCE by the caller (via
@@ -1733,7 +1781,7 @@ func (rec *auditRecord) queueSize() int64 {
 	for _, o := range rec.Obligations {
 		n += int64(len(o))
 	}
-	n += int64(len(rec.SessionID) + len(rec.AgentID) + len(rec.TaskID) + len(rec.UserID))
+	n += int64(len(rec.SessionID) + len(rec.AgentID) + len(rec.TaskID) + len(rec.UserID) + len(rec.Delegate))
 	n += int64(len(rec.Target) + len(rec.Method) + len(rec.TargetType))
 	n += int64(len(rec.Upstream) + len(rec.PolicyVersion) + len(rec.PolicySHA256))
 	n += int64(len(rec.DenialCode) + len(rec.ConditionType))
