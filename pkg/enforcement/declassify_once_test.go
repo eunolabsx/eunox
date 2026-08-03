@@ -409,3 +409,34 @@ func TestDeclassifyVerdictFor_CarriesTheSessionsLabels(t *testing.T) {
 	assert.Equal(t, []string{capability.FlowLabelPII}, verdict.Denial.Details["carried_labels"])
 	assert.Equal(t, true, verdict.Denial.Details["flow"])
 }
+
+// TestDeclassifyOnce_BurnedGrantIsNamedWhenTheCommitFaults closes the one path on which a
+// single-use grant was spent and nothing anywhere named it.
+//
+// burnApproval runs inside the decision's commit — deliberately, because it is the atomic
+// test that makes "once" mean once and two callers must not both reach it. The antecedent
+// write that follows can then fault, which hard-denies: the call never runs, the clear is
+// never resolved (so the refusal carries no LabelsPendingClear), and the grant is spent for
+// good, since there is no un-burn. Without the id on that refusal an operator reconciling
+// one-shot approvals would believe this one was still live, and every later presentation
+// would escalate with nothing on the tape explaining why.
+func TestDeclassifyOnce_BurnedGrantIsNamedWhenTheCommitFaults(t *testing.T) {
+	eng := enforcement.New(
+		// AdmitAll succeeds (the burn lands) and the antecedent write then faults.
+		enforcement.WithCallCounter(&faultyCounter{inner: callcounter.NewInMemory(), failIncrement: true}),
+		enforcement.WithFlowLabelStore(flowlabelstore.NewInMemory()),
+	)
+	caps := declassifyCaps("publish", capability.FlowLabelPII)
+	caps[0].Conditions = []capability.Condition{capability.SequenceBlockCondition{AfterTools: []string{"tool:read_customer"}}}
+
+	resp := eng.ValidateAction(context.Background(),
+		onceApprovedReq("s", "publish", "ada@example.com", "apr-1", capability.FlowLabelPII), caps)
+
+	require.Equal(t, capability.DecisionDeny, resp.Decision)
+	require.NotNil(t, resp.Denial)
+	assert.True(t, resp.Denial.HardDeny,
+		"a call whose one-shot approval was just spent must not be downgraded and forwarded by an --audit route")
+	assert.Equal(t, "apr-1", resp.SpentApprovalID,
+		"the grant is burned and the call never ran, so this refusal is the only record that can name it")
+	assert.Empty(t, resp.LabelsPendingClear, "the clear was never resolved, so nothing is pending")
+}

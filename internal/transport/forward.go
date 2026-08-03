@@ -4,6 +4,7 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -466,17 +467,33 @@ func (fp forwardParams) recordUpstreamFailure(ctx context.Context, msg mcp.RPCMs
 // has to carry, since nothing else on the tape would name a grant spent by a call that did
 // not run.
 func (fp forwardParams) declassifyRefusalDetail(dec capability.EnforceResponse) map[string]interface{} {
-	if len(dec.LabelsPendingClear) == 0 {
+	// Either fact on its own is worth a record, and neither implies the other. A refusal
+	// below the decision carries the labels but no spent id when the grant was standing; the
+	// engine's own declassify-leg commit fault carries a spent id but no labels, because the
+	// clear never got as far as being resolved. Keying on the labels alone dropped the id on
+	// exactly that path, which is the reconciliation gap this key exists to close.
+	if len(dec.LabelsPendingClear) == 0 && dec.SpentApprovalID == "" {
 		return nil
 	}
-	detail := map[string]interface{}{
-		// The discriminator every information-flow event on the tape carries, so one
-		// filter finds this beside the sink denials and the declassify escalations.
-		"flow":                        true,
-		audit.DeclassifyNotAppliedKey: dec.LabelsPendingClear,
+	detail := declassifyDetail()
+	if len(dec.LabelsPendingClear) > 0 {
+		detail[audit.DeclassifyNotAppliedKey] = dec.LabelsPendingClear
 	}
 	addSpentApproval(detail, dec)
 	return detail
+}
+
+// declassifyDetail starts a declassification detail map with the discriminator every
+// information-flow event on the tape carries, so one filter finds these beside the sink
+// denials and the declassify escalations. Shared by the refusal and commit paths because
+// they had already diverged on it once: the commit-failure record — the one operators are
+// told to alert on — was the only declassification event without it.
+//
+// The reserved `_eunox_declassify_*` keys, not this, are what a rule should MATCH on: two of
+// them ride an allow record whose details is the caller's argument map under --audit, and a
+// bare key there is caller-writable. This is a filter aid, not evidence.
+func declassifyDetail() map[string]interface{} {
+	return map[string]interface{}{"flow": true}
 }
 
 // addSpentApproval stamps the single-use declassify grant this call burned, if it burned
@@ -518,9 +535,13 @@ func addSpentApproval(detail map[string]interface{}, dec capability.EnforceRespo
 // over-refusal.
 func (fp forwardParams) commitDeclassify(ctx context.Context, dec capability.EnforceResponse, kind, target string) (cleared []string, detail map[string]interface{}) {
 	if len(dec.LabelsPendingClear) == 0 {
+		// Either no declassify directive at all, or an approved one whose labels the anchor
+		// was not carrying — the decision resolved that intersection, so a no-op clear needs
+		// no store round trip and records no declassification. The grant it spent is still
+		// named, on the allow, by the caller's own spent-approval stamp.
 		return nil, nil
 	}
-	detail = map[string]interface{}{}
+	detail = declassifyDetail()
 	addSpentApproval(detail, dec)
 	cleared, err := fp.commitCleared(ctx, dec.LabelsPendingClear)
 	if err != nil {
@@ -539,12 +560,45 @@ func (fp forwardParams) commitDeclassify(ctx context.Context, dec capability.Enf
 		// the superset an operator has to reconcile either way.
 		return nil, detail
 	}
-	if len(detail) == 0 {
-		// A standing grant on a no-op clear contributes nothing at all; return nil so the
-		// common path allocates no details map for the record.
-		return cleared, nil
-	}
 	return cleared, detail
+}
+
+// declassifyCommitted reports whether the upstream's reply is one an approved
+// declassification may be committed against — i.e. whether the sanitizing action actually
+// SUCCEEDED, not merely whether a message came back.
+//
+// "The call ran" is not the same as "the call did what the approval was granted for". A
+// declassification's whole premise is that some transform completed, so a sanitize that
+// answers with a JSON-RPC error, or an MCP tool result flagged `isError`, must not drop the
+// taint: the data was never sanitized and the next egress would be forwarded on the strength
+// of a step that failed. Both shapes are checked because MCP conveys tool-level failure in
+// the RESULT (`isError: true`) while protocol-level failure uses the error member, and only
+// the second is visible to the transport-failure branch above.
+//
+// Ambiguity reads as failure. Bytes that do not decode, or a non-object result, return false
+// and leave the taint in place — over-blocking, which the operator resolves with another
+// approval, rather than clearing on a reply this build could not interpret.
+func declassifyCommitted(upResp mcp.RPCMsg) bool {
+	if upResp.Error != nil {
+		return false
+	}
+	if upResp.Result == nil {
+		return false
+	}
+	// A substring probe before the decode: `isError` is absent from the overwhelming
+	// majority of tool results, and a tool result is the largest body on the wire. A miss is
+	// safe in the only direction that matters — it reads as "no failure flag", which is what
+	// an absent key means.
+	if !bytes.Contains(upResp.Result, []byte(`"isError"`)) {
+		return true
+	}
+	var res struct {
+		IsError *bool `json:"isError"`
+	}
+	if err := json.Unmarshal(upResp.Result, &res); err != nil {
+		return false
+	}
+	return res.IsError == nil || !*res.IsError
 }
 
 // commitCleared runs the clear on a context that outlives the request.
@@ -819,12 +873,27 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 	if recordObligations && upResp.Result != nil {
 		oblNames = auditObligationNames(dec.Obligations)
 	}
-	// The call has run and its (redacted) response is deliverable, which is exactly the
-	// condition an approved declassification's clear was waiting on. Commit it HERE — after
-	// the last exit that could still refuse, before the record that reports it — so no
-	// refusal can leave a label cleared, and no record can claim a clear that has not landed.
+	// The call has run, SUCCEEDED, and its redacted response is deliverable — which together
+	// are the condition an approved declassification's clear was waiting on. Commit it HERE:
+	// after the last exit that could still refuse, so no refusal can leave a label cleared;
+	// before the record that reports it, so no record can claim a clear that has not landed.
+	//
+	// declassifyCommitted is the SUCCESS half, and it is not redundant with the exits above.
+	// A sanitize whose upstream answers with a JSON-RPC error, or with a tool result flagged
+	// isError, is delivered to the host and is not a transport failure — so it reaches here
+	// with the transform never performed. Dropping the taint on it would forward the next
+	// egress on the strength of a step that failed. An unsuccessful call is treated exactly
+	// as a refused one: nothing is cleared, and the record says the approved clear did not
+	// take effect.
+	//
 	// A no-op for every call in a deployment with no declassify directive.
-	labelsCleared, declDetail := fp.commitDeclassify(ctx, dec, kind, denialTarget)
+	var labelsCleared []string
+	var declDetail map[string]interface{}
+	if declassifyCommitted(upResp) {
+		labelsCleared, declDetail = fp.commitDeclassify(ctx, dec, kind, denialTarget)
+	} else {
+		declDetail = fp.declassifyRefusalDetail(dec)
+	}
 
 	// Carry dec.AuditOnly so a per-entry audit-mode forward is not logged as a
 	// genuine allow. allowDetails supplies the structured details.

@@ -217,3 +217,38 @@ func TestGrammarTables_NoStrayPrefixes(t *testing.T) {
 		"the refusal must name the token it refused")
 	assert.NoError(t, checkTokenRevision(0, capability.DirectiveTypeDeclassify, "directive", ManifestSchemaVersion02))
 }
+
+// TestDirectiveValidator_TypeMismatchIsRefusedNotPanicked covers the failure mode that
+// appeared the moment dispatch moved off the concrete Go type. directiveValidators is keyed
+// by dir.DirectiveType() — a string the directive REPORTS — so a value whose report
+// disagrees with its type selects an entry whose assertion then fails. The type switch this
+// replaced could not reach that state; a discarded ok here would dereference nil and panic
+// the loader, turning a fail-closed load error into a crash on the path the fail-closed arm
+// exists for (a programmatically built manifest, reachable through MergeManifests).
+func TestDirectiveValidator_TypeMismatchIsRefusedNotPanicked(t *testing.T) {
+	m := &LocalManifest{
+		SchemaVersion: ManifestSchemaVersion01,
+		Name:          "p",
+		Version:       "1.0.0",
+		Capabilities: []capability.Constraint{{
+			Target:     "tool:x",
+			Actions:    []string{"call"},
+			Directives: []capability.Directive{impostorDirective{}},
+		}},
+	}
+	require.NotPanics(t, func() {
+		err := validateLocalManifest(m)
+		require.Error(t, err, "a directive that is not the type it claims must be refused")
+		assert.Contains(t, err.Error(), "reports type")
+		assert.Contains(t, err.Error(), capability.DirectiveTypeRedactFields)
+	})
+}
+
+// impostorDirective reports a discriminator the registry models while being an entirely
+// different Go type — the shape a keyed dispatch cannot rule out and a type switch could.
+type impostorDirective struct{}
+
+func (impostorDirective) DirectiveType() string { return capability.DirectiveTypeRedactFields }
+func (impostorDirective) ToObligation() capability.Obligation {
+	return capability.Obligation{Type: capability.DirectiveTypeRedactFields}
+}

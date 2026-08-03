@@ -136,11 +136,6 @@ func computeAuditStats(r io.Reader) (auditStatsSummary, error) {
 			DenialCode    string   `json:"denial_code"`
 			AuditOnly     bool     `json:"audit_only"`
 			LabelsCleared []string `json:"labels_cleared"`
-			// Captured as raw bytes, not decoded: `details` on a tools/call allow is the
-			// caller's whole argument map, and parsing every one of those to look for three
-			// rare keys would make this scan pay for the largest field in the record on
-			// every line. json.RawMessage costs a slice of the input and no parse.
-			Details json.RawMessage `json:"details"`
 		}
 		if err := json.Unmarshal(line, &rec); err != nil {
 			// Undecodable line: count in "other" so the total still reconciles
@@ -148,7 +143,7 @@ func computeAuditStats(r io.Reader) (auditStatsSummary, error) {
 			out.other++
 			continue
 		}
-		out.addDeclassifyDetails(rec.Details)
+		out.addDeclassifyDetails(line)
 		switch rec.Decision {
 		case "allow":
 			out.allowed++
@@ -189,26 +184,37 @@ func computeAuditStats(r io.Reader) (auditStatsSummary, error) {
 	return out, nil
 }
 
+// declassifyProbe is the byte pattern addDeclassifyDetails scans a raw record for before
+// paying for a second decode. Hoisted so the conversion is not redone per record, and
+// derived from the producer's own key prefix so the two cannot drift.
+var declassifyProbe = []byte(audit.DeclassifyDetailPrefix)
+
 // addDeclassifyDetails tallies the declassification facts that ride in a record's `details`
 // map. It is the only place this tool reads details at all, and it reads exactly three keys.
 //
-// The substring probe before the decode is the same pre-filter the effect-receipt path uses,
-// and for the same reason: almost no record carries one of these keys, and `details` is the
-// biggest field on the line (a tools/call allow's details IS the caller's argument map), so
-// paying a JSON scan per record to discover their absence is the cost this avoids. A miss is
-// safe in the only direction that matters — an unrecognizable payload reads as "no
-// declassification facts", which is what the tool reported before it read details at all.
+// It probes the WHOLE record line rather than a captured `details` field, and decodes only
+// on a hit. Capturing details on the outer struct — even as a json.RawMessage — is not free:
+// RawMessage.UnmarshalJSON copies the bytes, and on a tools/call allow under --audit those
+// bytes are the caller's entire argument map, the largest field on the line. Probing the
+// line the scanner already holds costs one substring scan and no allocation, on records that
+// essentially never carry these keys.
 //
-// The keys come from internal/audit rather than being spelled here, so the producer and this
-// consumer cannot drift; audit.DeclassifyDetailPrefix is likewise derived from them.
-func (s *auditStatsSummary) addDeclassifyDetails(raw json.RawMessage) {
-	if len(raw) == 0 || !bytes.Contains(raw, []byte(audit.DeclassifyDetailPrefix)) {
+// A miss is safe in the only direction that matters: an unrecognizable payload reads as "no
+// declassification facts", which is what the tool reported before it read details at all.
+// Scanning the whole line can only produce a false POSITIVE (the prefix appearing outside
+// details), which costs one wasted decode and no miscount — the decode below looks the keys
+// up inside `details` specifically.
+func (s *auditStatsSummary) addDeclassifyDetails(line []byte) {
+	if !bytes.Contains(line, declassifyProbe) {
 		return
 	}
-	var details map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &details); err != nil {
+	var rec struct {
+		Details map[string]json.RawMessage `json:"details"`
+	}
+	if err := json.Unmarshal(line, &rec); err != nil {
 		return
 	}
+	details := rec.Details
 	if _, ok := details[audit.DeclassifySpentApprovalKey]; ok {
 		s.spentApprovals++
 	}

@@ -95,10 +95,29 @@ func (d dispatchParams) withPDP(p pdp.PolicyDecisionPoint) dispatchParams {
 // dispatchParams.endDecision). The Decide* handlers call it right after the PDP decision
 // and before enforcedForwardCore, so the upstream forward is never held under the
 // per-session lock. A no-op when the request is not serialized.
-func (d dispatchParams) finishDecision() {
-	if d.endDecision != nil {
-		d.endDecision()
+//
+// It makes ONE exception, and it is the reason this takes the decision rather than no
+// arguments: a call that authorized a declassification keeps the turn until the handler
+// returns. Such a call splits its flow-state write across the decision (which resolves what
+// to clear) and the commit after the forward (which removes it), and those two must not have
+// another decision interleaved between them. With the turn released early, a source read
+// decided during the forward committed a FRESH taint that the commit then removed — the
+// approval was granted before that read existed, and a set store cannot tell the new
+// occurrence of the label from the old one, so nothing downstream could catch it. Holding
+// the turn is what makes the two phases one critical section.
+//
+// The cost is head-of-line blocking on that session for the length of one declassifying
+// call, bounded by --upstream-timeout (and unbounded when that is 0, which is the one
+// setting a deployment using declassify should not choose). It is paid only by sessions that
+// actually declassify: every other call still releases before the forward and keeps the full
+// concurrency the split exists for. The turn is not leaked — both transports ALSO defer this
+// same idempotent release in the handler goroutine, so it advances when the handler returns
+// whatever path it takes.
+func (d dispatchParams) finishDecision(dec capability.EnforceResponse) {
+	if d.endDecision == nil || len(dec.LabelsPendingClear) > 0 {
+		return
 	}
+	d.endDecision()
 }
 
 // killDenied runs the session kill-switch check for a locally-answered method that
@@ -463,8 +482,9 @@ func dispatchToolsCall(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mc
 	dec := d.pdp.Decide(decideCtx, d.sessionID, pdp.EnforceTarget{Type: capability.TargetTypeTool, Name: params.Name}, params.Arguments, d.sourceIP)
 	// Close the per-session decision critical section here — the decision and its flow/
 	// sequence state write are done — so the upstream forward below runs concurrently.
-	// Everything after this reads the settled dec.
-	d.finishDecision()
+	// Everything after this reads the settled dec. A decision that authorized a
+	// declassification keeps the turn instead; see finishDecision.
+	d.finishDecision(dec)
 
 	// In audit mode the allow record logs the full tool arguments; otherwise none.
 	// Unlike resources/prompts, tools/call's details slot holds that argument map
@@ -475,7 +495,7 @@ func dispatchToolsCall(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mc
 	// an observe-mode constraint, leaving its allow records without the very detail
 	// the operator attached audit mode to capture.
 	if (d.audit || dec.AuditOnly) && len(params.Arguments) > 0 {
-		toolDetails = params.Arguments
+		toolDetails = quarantineReservedArgs(params.Arguments)
 	}
 	out := enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodToolsCall, params.Name, params.Name, "tool", true,
 		func(upResp mcp.RPCMsg) map[string]interface{} {
@@ -484,14 +504,15 @@ func dispatchToolsCall(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mc
 			// to a clean success on the tamper-evident tape. Reuse upstreamErrorDetail
 			// (the shared source of the field name and the never-record-the-message rule)
 			// and merge it into a COPY of toolDetails so the caller's live
-			// params.Arguments map is never mutated. audit.UpstreamErrorCodeKey is
-			// underscore-prefixed and reserved, so a host argument literally named
-			// "upstream_error_code" (bare, no prefix) cannot collide with it in practice —
-			// but the underscore-prefixed name itself is still just a caller-supplied
-			// string, not something pkg/capability rejects as a tool argument name, so
-			// keep the same collision guard the bare key used to need, just re-keyed onto
-			// the new reserved name: on the vanishingly rare call whose real argument is
-			// literally named "_eunox_upstream_error_code", nest instead of overwriting it.
+			// params.Arguments map is never mutated.
+			//
+			// No per-key collision branch here: quarantineReservedArgs has already moved
+			// every reserved name out of the caller's map before it became toolDetails, so
+			// nothing eunox writes below can shadow a real argument, and nothing a caller
+			// sent can be mistaken for something eunox wrote. That replaces a guard which
+			// covered only this one key and produced a shape (`{"arguments": {…}, …}`) that
+			// a miner could not tell apart from a tool genuinely called with an argument
+			// named "arguments" — see the disambiguation eunox suggest used to need.
 			extra := upstreamErrorDetail(upResp)
 			// The signed effect receipt, verified here so its verdict rides the SAME allow
 			// record as the call it describes rather than a second one. A separate record
@@ -503,16 +524,6 @@ func dispatchToolsCall(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mc
 			receipt := d.effectReceiptDetail(upResp, dec, params.Name)
 			if extra == nil && receipt == nil {
 				return toolDetails
-			}
-			if _, collide := toolDetails[audit.UpstreamErrorCodeKey]; collide {
-				nested := map[string]interface{}{"arguments": toolDetails}
-				if extra != nil {
-					nested[audit.UpstreamErrorCodeKey] = extra[audit.UpstreamErrorCodeKey]
-				}
-				if receipt != nil {
-					nested[audit.EffectReceiptKey] = receipt
-				}
-				return nested
 			}
 			details := make(map[string]interface{}, len(toolDetails)+len(extra)+1)
 			for k, v := range toolDetails {
@@ -529,6 +540,50 @@ func dispatchToolsCall(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mc
 			}
 			return details
 		})
+	return out
+}
+
+// quarantineReservedArgs returns args with any key in eunox's own reserved details namespace
+// moved under a nested holder, so a caller-supplied tool argument can never land on the tape
+// spelled as a fact the proxy asserts. args is not mutated: on the overwhelmingly common
+// path (no reserved key) it is returned unchanged and nothing is allocated.
+//
+// A tools/call allow's details IS the caller's argument map under --audit, and eunox merges
+// its own annotations into that same map. Those annotations are read as proxy statements:
+// `eunox stats` counts details._eunox_declassify_commit_failed and prints an ATTENTION line
+// telling the operator their flow store faulted, and `eunox suggest` skips reserved keys
+// when mining arguments. Left alone, any client could put those keys in its arguments and
+// forge the alert — or, by repetition, bury a real one — on a proxy where no declassification
+// ever ran. The signed top-level fields (labels_cleared, approver, approval_id) are
+// structurally immune because they are not in this namespace; these keys are not, so the
+// namespace has to be defended at the point the caller's map enters it.
+//
+// Quarantining rather than dropping keeps the record faithful to the request: the argument
+// really was sent, and an auditor reconstructing the call should see it — just not in a
+// position where it reads as eunox's own annotation. This generalizes the single-key nested
+// fallback the upstream-error-code merge already performs, to every current and future
+// reserved key.
+func quarantineReservedArgs(args map[string]interface{}) map[string]interface{} {
+	reserved := false
+	for k := range args {
+		if audit.IsReservedDetailKey(k) {
+			reserved = true
+			break
+		}
+	}
+	if !reserved {
+		return args
+	}
+	out := make(map[string]interface{}, len(args))
+	quarantined := make(map[string]interface{})
+	for k, v := range args {
+		if audit.IsReservedDetailKey(k) {
+			quarantined[k] = v
+			continue
+		}
+		out[k] = v
+	}
+	out[audit.ReservedArgumentsKey] = quarantined
 	return out
 }
 
@@ -602,7 +657,7 @@ func dispatchResourcesRead(ctx context.Context, d dispatchParams, msg mcp.RPCMsg
 	// Interface method (not a type-assert to *pdp.ManifestPDP) so JWT-only PDPs
 	// also enforce resource reads.
 	dec := d.pdp.DecideResourceRead(d.decideCtx(ctx), d.sessionID, params.URI, d.sourceIP)
-	d.finishDecision() // release the per-session decision lock before the forward
+	d.finishDecision(dec) // release the per-session decision lock before the forward
 	return enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodResourcesRead, params.URI, params.URI, "resource", true, upstreamErrorDetail)
 }
 
@@ -618,7 +673,7 @@ func dispatchResourcesSubscribe(ctx context.Context, d dispatchParams, msg mcp.R
 		return d.malformedDeny(ctx, msg, "resources/subscribe: uri must not be empty")
 	}
 	dec := d.pdp.DecideResourceRead(d.decideCtx(ctx), d.sessionID, params.URI, d.sourceIP)
-	d.finishDecision() // release the per-session decision lock before the forward
+	d.finishDecision(dec) // release the per-session decision lock before the forward
 	// recordObligations is false: a subscription does not log obligation names.
 	return enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodResourcesSubscribe, params.URI, params.URI, "resource subscription", false, upstreamErrorDetail)
 }
@@ -658,7 +713,7 @@ func dispatchResourcesUnsubscribe(ctx context.Context, d dispatchParams, msg mcp
 		return d.malformedDeny(ctx, msg, "resources/unsubscribe: uri must not be empty")
 	}
 	dec := d.pdp.DecideResourceCancel(ctx, d.sessionID, params.URI, d.sourceIP)
-	d.finishDecision() // release the per-session decision lock before the forward
+	d.finishDecision(dec) // release the per-session decision lock before the forward
 	// recordObligations is false: cancelling a subscription does not log obligation names.
 	return enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodResourcesUnsubscribe, params.URI, params.URI, "resource subscription", false, upstreamErrorDetail)
 }
@@ -676,7 +731,7 @@ func dispatchPromptsGet(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) m
 	}
 	// Interface method (not a type-assert to *pdp.ManifestPDP).
 	dec := d.pdp.DecidePromptGet(d.decideCtx(ctx), d.sessionID, params.Name, d.sourceIP)
-	d.finishDecision() // release the per-session decision lock before the forward
+	d.finishDecision(dec) // release the per-session decision lock before the forward
 	// auditID carries the "prompts/" display prefix; denialTarget is the bare name.
 	return enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodPromptsGet, "prompts/"+params.Name, params.Name, "prompt", true, upstreamErrorDetail)
 }

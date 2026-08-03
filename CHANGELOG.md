@@ -985,10 +985,35 @@ Section conventions:
   the decision (extra taint over-blocks), and so does the **burn** of a single-use grant,
   which is the atomic test that makes `once` mean once.
 
-  The residual now fails in the safe direction: a commit fault leaves the label in place, so
-  a later sink over-blocks until the operator retries under a new approval. A session is
+  Deferring alone would open the mirror race, so two things bound it. **What** to clear is
+  fixed at decision time (the approved labels intersected against what the anchor is carrying,
+  inside the decision's critical section), so a taint a concurrent source read asserts during
+  the round trip is not in the set and cannot be laundered by it. And a declassifying call
+  **keeps the per-session decision turn** until its commit lands, so nothing interleaves
+  between the two phases; every other call still releases before the forward. The cost is
+  head-of-line blocking on that one session for the length of one declassifying call, bounded
+  by `--upstream-timeout` — which a route using `declassify` should therefore not set to `0`.
+
+  The clear now also requires the call to have **succeeded**. A sanitize whose upstream
+  answers with a JSON-RPC error, or with a tool result flagged `isError`, is delivered to the
+  host and is not a transport failure, so it previously reached the commit with nothing
+  sanitized and dropped the taint anyway. It is now recorded exactly as a refused call.
+
+  The residual fails in the safe direction: a commit fault leaves the label in place, so a
+  later sink over-blocks until the operator retries under a new approval. A session is
   deliberately **not** marked sticky-untrusted for it — there is no longer any state in which
   the proxy knows a session's taint is missing.
+
+- **A caller's tool argument can no longer forge an operator alert.** eunox's reserved
+  `_eunox_*` detail keys ride an **allow** record whose `details` IS the caller's argument map
+  under `--audit`, and `eunox stats` raises an `ATTENTION` line off one of them. A client
+  sending an argument with that name landed it on the signed tape spelled as a proxy
+  statement. Reserved-namespace arguments are now quarantined under
+  `_eunox_reserved_arguments` before the record is built — preserved for the auditor, never in
+  a position where they read as something eunox asserted. This replaces a single-key nested
+  fallback that covered only the upstream-error code and produced a `{"arguments": {…}}` shape
+  a miner could not distinguish from a tool genuinely called with an argument named
+  `arguments`.
 
 - **A spent single-use approval is now named on the tape.** A `once` grant is burned by the
   decision that accepts it — including on a clear that turns out to change nothing, since
@@ -1009,6 +1034,12 @@ Section conventions:
   `baseGrammarTokens` table, the two are total over the vocabulary, a token in neither is
   refused under every revision, and tests walk `KnownConditionTypes()`/`KnownDirectiveTypes()`
   against both (plus assert every later-revision token is refused under `0.1`).
+
+  The loader's per-directive validation moved to a table keyed by the same registry. Because
+  that dispatches on the discriminator a directive *reports* rather than on its Go type, each
+  entry honours its type assertion instead of discarding it: a value whose report disagrees
+  with its type is refused with a diagnostic, where a discarded `ok` would have dereferenced
+  nil and turned a fail-closed load error into a crash.
 
 - **`redactFields` fails closed on a result whose object keys are ambiguous.** The
   redaction path was the one JSON surface in the codebase without a duplicate-key gate:

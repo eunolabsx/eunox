@@ -401,6 +401,31 @@ func (e *Engine) RecordLabels(ctx context.Context, req *capability.EnforceReques
 	return e.recordLabels(ctx, req, matched)
 }
 
+// intersectLabels returns the members of want that are present in held, in want's order.
+// Both slices are bounded by the closed vocabulary (at most five entries), so a linear scan
+// beats a map.
+//
+// It is what bounds an approved declassification's clear to the taint the decision actually
+// OBSERVED. The alternative — intersecting at commit time, against whatever the anchor holds
+// a round trip later — silently widens the clear to cover a label a concurrent source added
+// in between, which a set store cannot distinguish from the one the approval was granted
+// against. See LabelsPendingClear.
+func intersectLabels(want, held []string) []string {
+	if len(want) == 0 || len(held) == 0 {
+		return nil
+	}
+	var out []string
+	for _, w := range want {
+		for _, h := range held {
+			if w == h {
+				out = append(out, w)
+				break
+			}
+		}
+	}
+	return out
+}
+
 // SourceCommitError classifies which leg of the atomic source-call commit
 // (recordSourceCall) faulted, so the caller builds the matching fail-closed deny: a
 // flow-label write fault (Flow=true) is a HARD deny (labelRecordFailureDenial /
@@ -417,6 +442,15 @@ type SourceCommitError struct {
 	Err        error
 	Flow       bool
 	Declassify bool
+	// SpentApprovalID names a single-use grant this commit BURNED before faulting, empty
+	// when nothing was spent. It exists because the burn is the one piece of declassify
+	// state the decision writes, and a fault after it produces a refusal that carries no
+	// LabelsPendingClear — so without carrying the id here, a grant spent by a call that
+	// never ran would reach the tape named by nothing at all, which is the reconciliation
+	// gap the whole spent-approval key exists to close. The burn's OWN fault arm leaves it
+	// empty: the loser of a concurrent admission records nothing, so there is nothing spent
+	// to report.
+	SpentApprovalID string
 }
 
 // Error implements error.
@@ -477,21 +511,22 @@ func (e *Engine) recordSourceCall(ctx context.Context, req *capability.EnforceRe
 		}
 	}
 	if err := e.RecordSessionCall(ctx, req); err != nil {
+		// The seq write faulted after the label add committed: take it back out so the
+		// hard-denied call leaves no taint. Best-effort — a rollback fault leaves a stranded
+		// label (fail-closed: over-blocks a later sink, never a leak), the narrow accepted
+		// residual. It runs before the branch because BOTH arms need it; only the error's
+		// shape differs below.
+		e.rollbackLabels(ctx, req, added)
 		// A call that BURNED a single-use grant takes the declassify arm, so the deny it maps
 		// to is the HARD one. The plain antecedent-fault deny is SOFT — downgraded and
 		// FORWARDED by an --audit route — and forwarding a call whose one-shot approval was
 		// just spent is the worst of both: the action runs, and the operator's single approval
 		// is gone with nothing to show for it. Keyed on LedgerID because the burn is the only
-		// declassify state this commit writes; the clear has not run and needs no undo.
+		// declassify state this commit writes; the clear has not run and needs no undo. The id
+		// travels with the error so the refusal can name the grant it spent.
 		if decl.LedgerID != "" {
-			e.rollbackLabels(ctx, req, added)
-			return nil, &SourceCommitError{Err: err, Flow: true, Declassify: true}
+			return nil, &SourceCommitError{Err: err, Flow: true, Declassify: true, SpentApprovalID: decl.ApprovalID}
 		}
-		// The seq write faulted after the label add committed: take it back out so the
-		// hard-denied call leaves no taint. Best-effort — a rollback fault leaves a stranded
-		// label (fail-closed: over-blocks a later sink, never a leak), the narrow accepted
-		// residual.
-		e.rollbackLabels(ctx, req, added)
 		return nil, &SourceCommitError{Err: err, Flow: false}
 	}
 	return labelsOut, nil
@@ -592,12 +627,24 @@ func (e *Engine) rollbackLabels(ctx context.Context, req *capability.EnforceRequ
 // operator resolves with another approval — the fail-closed direction, and the mirror of
 // the burn's own accepted over-refusal.
 //
-// It returns what actually CHANGED — the intersection of the authorized labels with what the
-// anchor is carrying — because that is what the tape must report: an approval to clear a
-// label the session never held is a permitted no-op, and recording labels_cleared for it
-// would put a declassification that did not happen on the signed record. The set is read
-// HERE rather than at decision time so the report describes the anchor as it stands when the
-// clear lands, not as it stood a round trip earlier.
+// labels MUST be the decision's LabelsPendingClear and nothing else. That set was already
+// intersected against what the anchor was carrying, INSIDE the decision's critical section,
+// and this removes exactly it — it does NOT re-read the anchor. Both halves of that matter:
+//
+//   - Re-reading here would widen the clear to whatever the anchor holds a round trip later,
+//     so a source read decided while the sanitizing call was in flight would have its
+//     brand-new taint laundered by an approval granted before that read existed. A set store
+//     cannot tell one occurrence of a label from another, so nothing downstream could catch
+//     it. That is the mirror of the fail-open the deferral closes, and it is why the
+//     intersection is a decision-time fact rather than a commit-time one.
+//   - Removing exactly the pre-intersected set also makes what the tape reports and what the
+//     store did the same thing by construction: labels_cleared can no longer disagree with
+//     the carried_labels stamped on the same record, and the commit costs one round trip
+//     rather than two on the host's response path.
+//
+// A caller passing a wider set than the decision authorized would clear more than the
+// approval covered; the transport passes dec.LabelsPendingClear verbatim, and the parameter
+// exists rather than being re-derived here because only the caller knows the call ran.
 //
 // Anchoring follows the request (flowKey), so a task-anchored call clears the key its
 // decision was accounted against. The caller MUST therefore hand a context that still
@@ -611,20 +658,26 @@ func (e *Engine) CommitDeclassification(ctx context.Context, req *capability.Enf
 	}
 	// Exported, so it is reachable on an engine that holds no flow state at all — and on a
 	// PDP whose commit chain terminates in a no-op. Each of those means the labels stay
-	// exactly where they are, which is the safe state; report it as "cleared nothing" rather
-	// than as a fault, since there was never a store to clear them from.
+	// exactly where they are, so none of them may report a clear.
 	if e == nil || e.skipFlow || e.flowStore == nil || req == nil || req.SessionID == "" {
-		return nil, nil
+		return nil, errNoFlowStateToClear
 	}
-	// The set as it stands NOW, so the intersection reported below is the truth at commit
-	// time. A read fault fails the commit rather than clearing blind: removing labels the
-	// proxy could not first observe would report a declassification it cannot substantiate.
-	present, err := e.peekSessionLabels(ctx, req)
-	if err != nil {
-		return nil, err
+	if err := e.flowStore.Remove(ctx, e.flowKey(req), labels...); err != nil {
+		// labels, not nil: the Remove may well have taken effect before the error surfaced,
+		// and the caller reports which labels MAY have gone rather than claiming they did.
+		return labels, err
 	}
-	return e.clearLabels(ctx, req, declassifyOutcome{Labels: labels}, present)
+	return labels, nil
 }
+
+// errNoFlowStateToClear is what an engine holding no flow state returns from a commit it was
+// asked to perform. It is an ERROR rather than a silent empty result because the two are not
+// the same fact: a no-op clear is decided at decision time (LabelsPendingClear comes back
+// empty and the caller never commits at all), so reaching the commit with labels in hand and
+// no store is a wiring fault — the policy's sanitizing step will never take effect, and the
+// old contract's `restored bool` existed precisely so that could not be mistaken for success.
+// The caller records it as a failed commit, which is the loud, fail-closed direction.
+var errNoFlowStateToClear = fmt.Errorf("this decision point holds no flow-label state, so an approved declassification cannot be applied (wiring fault, not a store failure)")
 
 // ClearSessionLabels releases a session's accumulated flow-label set, called from the
 // transport's session teardown so an ended session retains no state and a reused session

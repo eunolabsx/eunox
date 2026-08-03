@@ -280,51 +280,25 @@ func mineArgs(t *observedTarget, details map[string]interface{}, auditOnly bool,
 		t.wholeTruncated = true
 		return
 	}
-	// The transport merges the reserved audit-only key audit.UpstreamErrorCodeKey
-	// (underscore-prefixed, so it can't collide with any ORDINARY caller-supplied tool
-	// argument name) into a tools/call allow record's details when the upstream call
-	// itself errored. It is a flat merge in the common case. On the vanishingly rare
-	// call whose real argument is literally named the reserved key's own string, the
-	// transport nests the caller's args under "arguments" instead of overwriting them
-	// (see dispatch.go's dispatchToolsCall) — resolve that shape here too, exactly as
-	// the pre-rename code did, just keyed on the new reserved name.
+	// eunox injects its own reserved, underscore-prefixed keys into a tools/call allow
+	// record's details (the upstream error code, the effect-receipt verdict, the
+	// declassification facts), and under --audit that details map IS the caller's argument
+	// map. Mining a reserved key as an argument name would draft an allowedValues condition
+	// on an argument no call carries, which denies every real call to the tool — so they are
+	// skipped, as a SET rather than one literal, so a newly added key is excluded by
+	// construction.
+	//
+	// A caller argument that happens to be spelled like one of those keys is not a problem
+	// here either: the transport quarantines it under audit.ReservedArgumentsKey before the
+	// record is built, so the reserved namespace at the top of details is eunox's alone. That
+	// replaced a nested `{"arguments": {…}}` wrapper this function used to have to
+	// disambiguate by shape — a shape a tool genuinely called with an argument named
+	// "arguments" produced identically.
 	args := details
-	skipReserved := true
-	if inner, ok := details["arguments"].(map[string]interface{}); ok {
-		if _, hasCode := details[audit.UpstreamErrorCodeKey]; hasCode && len(details) == 2 {
-			// Shape alone is not sufficient to conclude this is the nested-collision
-			// wrapper: a call that never errored upstream produces details == the
-			// caller's real top-level arguments verbatim, so a tool genuinely called
-			// with two real top-level arguments named "arguments" and the reserved
-			// key's string produces this exact same shape. Disambiguate using the one
-			// fact that distinguishes them: the transport's collide branch fires
-			// exactly when the caller's real arguments already contained the reserved
-			// key — so in the true nested shape, the inner map necessarily carries its
-			// own copy of it.
-			//
-			// When the inner map does NOT carry it, this is not the nested wrapper. The
-			// far likelier producer of that shape is the ORDINARY flat merge on a call
-			// whose one real argument is a map named "arguments" (a plausible argument
-			// name) that then errored upstream; the alternative needs a caller argument
-			// literally named the reserved key, the case this comment calls vanishingly
-			// rare. So keep the flat reading: mine details as-is with the reserved key
-			// still skipped, rather than fabricating a phantom argument for it and
-			// skewing the presence accounting of the real "arguments" argument.
-			if _, innerHasCode := inner[audit.UpstreamErrorCodeKey]; innerHasCode {
-				args = inner
-				skipReserved = false
-			}
-		}
-	}
 	realArgCount := len(args)
-	if skipReserved {
-		// Every key eunox injects, not just the upstream-error code: the effect-receipt
-		// verdict rides here too, and a miner keyed on one literal would draft an
-		// allowedValues condition on a phantom argument that denies every real call.
-		for name := range args {
-			if audit.IsReservedDetailKey(name) {
-				realArgCount--
-			}
+	for name := range args {
+		if audit.IsReservedDetailKey(name) {
+			realArgCount--
 		}
 	}
 	if realArgCount == 0 {
@@ -343,7 +317,7 @@ func mineArgs(t *observedTarget, details map[string]interface{}, auditOnly bool,
 	// optional-argument check.
 	t.nonTruncatedAllow++
 	for name, raw := range args {
-		if skipReserved && audit.IsReservedDetailKey(name) {
+		if audit.IsReservedDetailKey(name) {
 			continue
 		}
 		a := t.args[name]

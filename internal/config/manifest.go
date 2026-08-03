@@ -1794,12 +1794,14 @@ type directiveValidator func(i, j int, target string, targetType capability.Targ
 // (see the directive-coverage test), and makes the unknown-type message derive from
 // KnownDirectiveTypes rather than restate it.
 //
-// Each entry re-normalizes to a pointer via AsValueOrPointer, which handles the value and
-// pointer decode forms in one arm — the assertion is infallible here (the key already
-// selected the type) and the caller's typed-nil guard makes the deref safe.
+// Each entry goes through typedDirective, which honours AsValueOrPointer's ok. Dispatch is
+// on the discriminator the directive REPORTS, not on its Go type, so a value whose
+// DirectiveType() disagrees with its concrete type selects an entry the assertion then
+// fails — and a discarded ok there is a nil dereference, i.e. a fail-closed load error
+// turned into a crash. The type switch this replaced could not reach that state; the
+// adapter is what restores the property.
 var directiveValidators = map[string]directiveValidator{
-	capability.DirectiveTypeRedactFields: func(i, j int, target string, targetType capability.TargetType, dir capability.Directive) error {
-		d, _ := capability.AsValueOrPointer[capability.RedactFieldsDirective](dir)
+	capability.DirectiveTypeRedactFields: typedDirective(func(i, j int, target string, targetType capability.TargetType, d *capability.RedactFieldsDirective) error {
 		// redactFields mutates the tools/call RESPONSE, so it applies only to tool: targets:
 		// a directive that never applies is a fail-open leak plus a false "discharged" audit
 		// record.
@@ -1807,18 +1809,16 @@ var directiveValidators = map[string]directiveValidator{
 			return err
 		}
 		return validateRedactFields(i, j, d.Fields)
-	},
-	capability.DirectiveTypeLabelOutput: func(i, j int, target string, targetType capability.TargetType, dir capability.Directive) error {
-		d, _ := capability.AsValueOrPointer[capability.LabelOutputDirective](dir)
+	}),
+	capability.DirectiveTypeLabelOutput: typedDirective(func(i, j int, target string, targetType capability.TargetType, d *capability.LabelOutputDirective) error {
 		// An enforce-time STATE directive rather than a response mutation, so it is valid on
 		// any flow SOURCE target.
 		if err := requireSourceDirectiveTarget(i, target, targetType, capability.DirectiveTypeLabelOutput); err != nil {
 			return err
 		}
 		return validateLabelOutput(i, j, d.Labels)
-	},
-	capability.DirectiveTypeDeclassify: func(i, j int, target string, targetType capability.TargetType, dir capability.Directive) error {
-		d, _ := capability.AsValueOrPointer[capability.DeclassifyDirective](dir)
+	}),
+	capability.DirectiveTypeDeclassify: typedDirective(func(i, j int, target string, targetType capability.TargetType, d *capability.DeclassifyDirective) error {
 		// Same target restriction as labelOutput, for the mirror reason: a declassification
 		// is a TRANSFORM — the sanitize/redact/review step whose completion a human approved
 		// — so it sits where data is produced or read. A prompt: fetch or the sampling opt-in
@@ -1828,7 +1828,29 @@ var directiveValidators = map[string]directiveValidator{
 			return err
 		}
 		return validateDeclassify(i, j, d.Labels)
-	},
+	}),
+}
+
+// typedDirective adapts a per-type validator to the discriminator-keyed table, normalizing
+// the value and pointer decode forms to *T and REPORTING a type that does not match the
+// discriminator it was filed under rather than dereferencing nil.
+//
+// It is the directive twin of validateTypedCondition, and it exists for a reason that only
+// appeared when dispatch moved off the Go type: capability.Directive is an exported
+// interface whose DirectiveType() is self-reported, so a programmatically built manifest —
+// exactly the input the fail-closed arm below exists for, reachable through the exported
+// MergeManifests — can present a directive claiming "redactFields" that is not one. Under
+// the old type switch that landed in the default arm and returned an error; keyed dispatch
+// sends it here, and a discarded ok would panic the loader instead.
+func typedDirective[T any](check func(i, j int, target string, targetType capability.TargetType, d *T) error) directiveValidator {
+	return func(i, j int, target string, targetType capability.TargetType, dir capability.Directive) error {
+		d, ok := capability.AsValueOrPointer[T](dir)
+		if !ok || d == nil {
+			return fmt.Errorf("capability at index %d, directive %d: directive reports type %q but is not one; refusing rather than validating it as a type it is not",
+				i, j, dir.DirectiveType())
+		}
+		return check(i, j, target, targetType, d)
+	}
 }
 
 // baseGrammarTokens names every condition and directive discriminator that is part of the

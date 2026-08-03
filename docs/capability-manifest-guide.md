@@ -2413,9 +2413,25 @@ in that window would read a clean label set and be forwarded while the sanitizin
 call was still in flight. Deferring the removal closes that: the labels stay until
 the action that clears them has completed.
 
-The practical consequence for a policy author is small but worth knowing: a call
-issued **concurrently** with a declassifying call still sees the old taint. A call
-issued after its response is back sees the cleared set, as it always did.
+Two details keep the deferral from opening the opposite hole. **What** to clear is
+decided up front — the approved labels are intersected against what the session is
+carrying at decision time, so a taint asserted by some *other* call while the
+sanitizing one is in flight is not in the set and cannot be removed by it. And a
+declassifying call **keeps the per-session decision turn** until its clear lands,
+so nothing interleaves between the two halves. Everything else still releases
+before the forward.
+
+Two practical consequences for a policy author:
+
+- A call issued **concurrently** with a declassifying call still sees the old
+  taint; one issued after its response is back sees the cleared set, as always.
+- A declassifying call briefly serializes its own session, bounded by
+  `--upstream-timeout`. Do not set that to `0` on a route that uses `declassify`.
+
+The clear also requires the call to have **succeeded**. A sanitize whose upstream
+returns an error — a JSON-RPC error, or a tool result with `isError: true` — is
+recorded exactly like a refused one: nothing is cleared, because nothing was
+sanitized.
 
 #### Records for a clear that did not take effect
 
@@ -2436,7 +2452,10 @@ that actually took effect".
 
 The `_eunox_` prefix marks a key eunox injects rather than one a caller sent: two
 of these ride an **allow** record, whose `details` is the caller's own argument map
-under `--audit`, and `eunox suggest` mines that map as argument names.
+under `--audit`, and `eunox suggest` mines that map as argument names. A caller
+*can* send an argument with one of those names, so eunox moves any such argument
+under `_eunox_reserved_arguments` before writing the record — it is preserved, but
+it cannot land where it would read as something the proxy asserted.
 
 `_eunox_declassify_spent_approval_id` is what makes a `once` grant reconcilable.
 The grant is burned by the decision that accepted it — including on a clear that

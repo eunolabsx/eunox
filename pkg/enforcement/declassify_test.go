@@ -119,6 +119,67 @@ func TestDeclassify_PendingClearIsInvisibleUntilCommitted(t *testing.T) {
 		eng.ValidateAction(ctx, req("s", "publish"), sinkCaps("publish", capability.FlowLabelPublic)).Decision)
 }
 
+// TestDeclassify_CommitCannotClearTaintAcquiredAfterTheDecision is the other half of the
+// ordering, and the one a deferred clear gets wrong if it re-reads the anchor.
+//
+// Deferring the removal fixes the sink race (a concurrent egress must not see a clean set
+// while the sanitizing call is still in flight). Done naively — by intersecting the
+// authorized labels against whatever the anchor holds AT COMMIT TIME — it opens the mirror
+// race in the source direction: a read decided during that same window commits a FRESH
+// taint, and the commit then removes it. The approval was granted before that read existed,
+// and a set store cannot tell the new occurrence of `pii` from the old one, so no later
+// check can catch it. The result is a brand-new tainted read laundered by a call that never
+// observed it.
+//
+// The fix is that the intersection is a DECISION-time fact: LabelsPendingClear is resolved
+// inside the decision's critical section, and the commit removes exactly that set.
+func TestDeclassify_CommitCannotClearTaintAcquiredAfterTheDecision(t *testing.T) {
+	eng := declassifyEngine()
+	ctx := context.Background()
+
+	// The sanitizing call is decided against a CLEAN session: there is nothing to clear.
+	sanitizeReq := approvedReq("s", "sanitize", "alice@example.com", capability.FlowLabelPII)
+	decided := eng.ValidateAction(ctx, sanitizeReq, declassifyCaps("sanitize", capability.FlowLabelPII))
+	require.Equal(t, capability.DecisionAllow, decided.Decision)
+	require.Empty(t, decided.LabelsPendingClear, "the anchor was clean, so the approved clear has nothing to remove")
+
+	// While it is in flight, a source read taints the session for real.
+	require.Equal(t, capability.DecisionAllow,
+		eng.ValidateAction(ctx, req("s", "read_customer"), sourceCaps("read_customer", capability.FlowLabelPII)).Decision)
+
+	// The sanitizing call now completes and commits. It must NOT touch the label the read
+	// just asserted — that data was never sanitized.
+	cleared, err := eng.CommitDeclassification(ctx, sanitizeReq, decided.LabelsPendingClear)
+	require.NoError(t, err)
+	assert.Empty(t, cleared)
+
+	assert.Equal(t, capability.DecisionDeny,
+		eng.ValidateAction(ctx, req("s", "publish"), sinkCaps("publish", capability.FlowLabelPublic)).Decision,
+		"a call decided before the tainting read must not be able to clear that read's taint")
+}
+
+// TestDeclassify_CommitRemovesOnlyTheDecisionsSet is the same rule stated against the API
+// rather than a scenario: the commit removes what it is handed, and what it is handed is the
+// decision's intersection. A caller cannot widen it by handing over a set the decision did
+// not authorize, and the engine does not re-derive one.
+func TestDeclassify_CommitRemovesOnlyTheDecisionsSet(t *testing.T) {
+	eng := declassifyEngine()
+	ctx := context.Background()
+
+	require.Equal(t, capability.DecisionAllow,
+		eng.ValidateAction(ctx, req("s", "read_customer"), sourceCaps("read_customer", capability.FlowLabelPII)).Decision)
+
+	r := approvedReq("s", "sanitize", "alice@example.com", capability.FlowLabelPII)
+	decided := eng.ValidateAction(ctx, r, declassifyCaps("sanitize", capability.FlowLabelPII))
+	require.Equal(t, []string{capability.FlowLabelPII}, decided.LabelsPendingClear,
+		"the anchor carried pii at decision time, so that is what is pending")
+
+	cleared, err := eng.CommitDeclassification(ctx, r, decided.LabelsPendingClear)
+	require.NoError(t, err)
+	assert.Equal(t, []string{capability.FlowLabelPII}, cleared,
+		"what the commit reports is what it removed, which is what the decision resolved")
+}
+
 // TestDeclassify_UncommittedClearLeavesTheTaint pins the fail-CLOSED direction of the
 // deferred clear: a caller that never commits (a refusal below the decision, a crash, an
 // embedder that forgets) leaves the session exactly as tainted as it found it. The old
@@ -220,15 +281,16 @@ func TestDeclassify_NoOpClearRecordsNothing(t *testing.T) {
 	resp := eng.ValidateAction(ctx, r, declassifyCaps("sanitize", capability.FlowLabelPII))
 
 	require.Equal(t, capability.DecisionAllow, resp.Decision)
-	// The decision reports the AUTHORIZATION — settled, and the same whether or not a label
-	// turns out to move — while the commit reports the CHANGE, which is what the record's
-	// labels_cleared/approver/approval_id triple rides on.
-	assert.Equal(t, []string{capability.FlowLabelPII}, resp.LabelsPendingClear)
-	assert.Equal(t, "alice@example.com", resp.Approver)
-
-	cleared, err := eng.CommitDeclassification(ctx, r, resp.LabelsPendingClear)
-	require.NoError(t, err)
-	assert.Empty(t, cleared, "nothing was carried, so nothing changed")
+	// The no-op is resolved by the DECISION, not by the commit: LabelsPendingClear is the
+	// intersection with what the anchor was carrying, so an approval to clear a label the
+	// session never held leaves nothing pending, the caller skips the commit entirely, and
+	// no declassification reaches the tape.
+	//
+	// Intersecting here rather than at commit time is what bounds the clear to the taint the
+	// sanitizing call actually observed — see
+	// TestDeclassify_CommitCannotClearTaintAcquiredAfterTheDecision.
+	assert.Empty(t, resp.LabelsPendingClear, "nothing was carried, so nothing is pending")
+	assert.Equal(t, "alice@example.com", resp.Approver, "the authorization still happened and still names its human")
 }
 
 // TestDeclassify_FailsClosedWithoutSessionOrStore covers the two states in which the

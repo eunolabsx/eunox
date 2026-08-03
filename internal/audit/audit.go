@@ -1811,6 +1811,17 @@ const (
 	DeclassifyCommitFailedKey  = DeclassifyDetailPrefix + "commit_failed"
 )
 
+// ReservedArgumentsKey holds the caller-supplied tool arguments whose names collided with
+// eunox's own reserved details namespace. The transport moves them here rather than letting
+// them land at the top of an allow record's details, where they would be indistinguishable
+// from the annotations the proxy writes — and where a client could forge the operator alert
+// `eunox stats` raises off DeclassifyCommitFailedKey.
+//
+// They are quarantined rather than dropped: the argument really was sent, and an auditor
+// reconstructing the call should still see it. Reserved itself, so a miner skips the holder
+// too rather than drafting "_eunox_reserved_arguments" as a tool argument name.
+const ReservedArgumentsKey = "_eunox_reserved_arguments"
+
 // DeclassifyDetailPrefix is the common prefix of the three keys above, and the three are
 // BUILT from it rather than spelled out beside it. A consumer that has to scan for them —
 // `eunox stats` probes a record's raw details bytes for this substring before paying for a
@@ -1828,6 +1839,7 @@ var reservedDetailKeys = map[string]bool{
 	DeclassifySpentApprovalKey: true,
 	DeclassifyNotAppliedKey:    true,
 	DeclassifyCommitFailedKey:  true,
+	ReservedArgumentsKey:       true,
 }
 
 // IsReservedDetailKey reports whether a Details key is one eunox injects rather than one a

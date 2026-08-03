@@ -379,3 +379,38 @@ func TestAwaitHostDecisionsDrained_NoopWhenNoDecideGate(t *testing.T) {
 		t.Fatal("drain must be a no-op for a non-flow session (decideGate nil)")
 	}
 }
+
+// TestFinishDecision_HoldsTheTurnForADeclassifyingCall pins the one exception to releasing
+// the per-session decision turn before the forward.
+//
+// A declassifying call splits its flow-state write in two — the decision resolves what to
+// clear, the commit after the forward removes it — and another decision must not interleave
+// between them. Everything else releases immediately, which is what keeps the slow upstream
+// round trip off the lock.
+func TestFinishDecision_HoldsTheTurnForADeclassifyingCall(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		dec      capability.EnforceResponse
+		released bool
+	}{
+		"ordinary allow releases": {capability.EnforceResponse{Decision: capability.DecisionAllow}, true},
+		"deny releases":           {capability.EnforceResponse{Decision: capability.DecisionDeny}, true},
+		"declassifying allow holds": {capability.EnforceResponse{
+			Decision:           capability.DecisionAllow,
+			LabelsPendingClear: []string{capability.FlowLabelPII},
+		}, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			released := false
+			d := dispatchParams{endDecision: func() { released = true }}
+			d.finishDecision(tc.dec)
+			if released != tc.released {
+				t.Fatalf("turn released = %v, want %v", released, tc.released)
+			}
+		})
+	}
+
+	// And a non-serialized request is a no-op either way rather than a nil call.
+	var d dispatchParams
+	d.finishDecision(capability.EnforceResponse{LabelsPendingClear: []string{capability.FlowLabelPII}})
+}
