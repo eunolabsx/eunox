@@ -244,7 +244,11 @@ Section conventions:
   sessions sharing a task have to reach the same gate. The `--require-audit=strict` gate on the
   host leg likewise stopped building its declassification detail map at the call site, for a
   gate that returns without reading it whenever the audit trail is healthy — the shape its
-  server-initiated twin already had. No behavior change on any path.
+  server-initiated twin already had. On the stdio host the turn's anchor is resolved once from
+  the identity its single host connection carries and the ticket queue is pinned for the
+  proxy's life, so the read loop — which is also the only goroutine routing host replies back
+  to the upstream — renders no key and enters no registry per request. No behavior change on
+  any path.
 
 - **BREAKING (pre-1.0): the declassification's four response fields are one commit handle,
   and the commit takes nothing else.** `EnforceResponse.LabelsPendingClear`, `Approver`,

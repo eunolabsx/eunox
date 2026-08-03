@@ -33,7 +33,6 @@ import (
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/pdp"
 	"github.com/eunolabs/eunox/pkg/capability"
-	"github.com/eunolabs/eunox/pkg/enforcement"
 )
 
 const (
@@ -207,6 +206,27 @@ type StdioProxy struct {
 	// keyed on, through the same resolver the engine's own key builder uses, so the turn
 	// spans the key the state lives on. See decisionAnchor.
 	taskAnchored bool
+
+	// claims are the validated JWT claims this host connection carries, captured ONCE from
+	// the context handed to Start. A stdio host has one connection and no per-request token
+	// channel, so a connection-level identity is the only identity there is — which is the
+	// same thing httpSession.claims is for an HTTP session, captured at initialize. Both the
+	// host leg and the server-initiated leg resolve their anchor from this ONE field rather
+	// than each reaching for a context of its own: the two legs must land on the same turn,
+	// and two sources for one identity is exactly how they would stop.
+	//
+	// nil in every shipped configuration (--jwks-uri is refused on a stdio host, and nothing
+	// on this path attaches claims), which resolves every request to the session anchor.
+	claims *pdp.JWTClaims
+
+	// decideQueue is this proxy's pinned ticket queue and dropDecideQueue releases it. The
+	// anchor is a per-proxy CONSTANT (see claims), so the queue is resolved once instead of
+	// re-rendering the key and re-entering the registry on every enforced request — the
+	// registry reclaims a queue the moment its last ticket is served, so per-request
+	// resolution meant creating and destroying the same queue per call on the read loop,
+	// which is also the only goroutine that routes host replies back to the upstream.
+	decideQueue     *ticketQueue
+	dropDecideQueue func()
 
 	// receipts verifies signed effect receipts published by this proxy's single upstream,
 	// against the key domain the operator configured for it. nil disables the surface.
@@ -398,6 +418,18 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 		fmt.Fprintf(os.Stderr, "[eunox] FATAL: host stdout framing desynced (partial write); tearing down the upstream — no further responses can be delivered.\n")
 		p.killUpstream()
 	})
+	// This connection's identity, captured once: a stdio host has one host connection, so
+	// the claims on the context it is served under are the claims every request on it
+	// carries. Both legs' decision turns and the engine's own state key resolve from this,
+	// so they cannot disagree about which subject this proxy's state accrues to.
+	p.claims = pdp.JWTClaimsPtr(ctx)
+	// The anchor follows from that identity and is therefore a constant, so the ticket queue
+	// is resolved now rather than on every enforced request. Released in Start's teardown.
+	p.pinDecisionQueue()
+	if p.dropDecideQueue != nil {
+		defer p.dropDecideQueue()
+	}
+
 	// ── 1. Connect to upstream (subprocess or remote HTTP) ─────────────────────
 	if err := p.connectUpstream(ctx); err != nil {
 		return err
@@ -1119,11 +1151,8 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 			serialized := p.decideGate != nil && isEnforcedMethod(msg.Method)
 			var ticket decisionTicket
 			if serialized {
-				// Keyed on the state ANCHOR, resolved here — in the reader, where the
-				// receipt order is — through the same resolver the engine's key builder
-				// uses. Today that is invariantly this proxy's single session; see
-				// decisionAnchor.
-				ticket = p.decideGate.take(p.decisionAnchor(ctx))
+				// Reserved HERE, in the reader, because that is where the receipt order is.
+				ticket = p.takeDecisionTicket()
 			}
 			// One goroutine per request. The read loop must NOT block on a request: it
 			// is also the only path that routes the host's replies to server-initiated
@@ -1389,33 +1418,59 @@ func (p *StdioProxy) samplingDecideLock() func() (end func(), ok bool) {
 		return nil
 	}
 	return func() (func(), bool) {
-		// A server-initiated request has no host request in scope, so its anchor comes from
-		// the proxy's own identity — which is what every host request on this transport
-		// resolves to as well (see decisionAnchor), so the two legs share one queue.
-		anchor := p.decisionAnchor(context.Background())
-		return p.decideGate.begin(p.decideGate.take(anchor)), true
+		// The SAME queue the host leg takes its tickets from, through the same helper — not a
+		// second anchor resolution. A server-initiated request has no host request in scope,
+		// so a leg that resolved its own anchor would have to reach for some other source of
+		// claims, and the two legs landing on different queues is precisely the fail-open this
+		// lock exists to close: a sampling flowLabel sink would no longer be serialized
+		// against a host source's label write.
+		return p.decideGate.begin(p.takeDecisionTicket()), true
 	}
 }
 
-// decisionAnchor is the key this proxy serializes a request's decision on: the validated task
-// when the operator anchors state on the task and the caller presented one, the session
+// takeDecisionTicket reserves this proxy's next decision ticket in receipt order, preferring
+// the queue pinned at startup and falling back to resolving the anchor through the registry.
+//
+// The fallback is the ALWAYS-CORRECT path and the pin is the optimization — the same shape the
+// HTTP session's cached gate has. It is not a formality: a caller that drives serveHost
+// directly without going through Start holds no pin, and a nil pin that quietly produced the
+// zero ticket would run every decision on that proxy unserialized while every test still
+// passed. Resolving here costs one key render, which is what the pin exists to avoid on the
+// read loop, and is paid only where there is no pin.
+func (p *StdioProxy) takeDecisionTicket() decisionTicket {
+	if p.decideQueue != nil {
+		return p.decideGate.takeOn(p.decideQueue)
+	}
+	return p.decideGate.take(p.decisionAnchor())
+}
+
+// pinDecisionQueue resolves this connection's anchor once and pins its ticket queue for the
+// proxy's life. Called from Start, after the serve context (and so any claims an embedder
+// attached to it) is in hand.
+//
+// The anchor is a per-proxy constant because the identity it resolves from is: one host
+// connection, one claims set. That is what makes pinning correct, and it is the same
+// reasoning that lets an HTTP session hold one gate on a route which does not anchor on the
+// task. Giving this transport per-REQUEST tokens would break the premise — and this function
+// is where it would break, rather than somewhere the anchor is silently no longer consulted.
+func (p *StdioProxy) pinDecisionQueue() {
+	if p.decideGate == nil {
+		return
+	}
+	p.decideQueue, p.dropDecideQueue = p.decideGate.hold(p.decisionAnchor())
+}
+
+// decisionAnchor is the key this proxy serializes its decisions on: the validated task when
+// the operator anchors state on the task and this connection presented one, the session
 // otherwise.
 //
-// It resolves through enforcement.ResolveStateAnchor — the SAME function the engine's own key
-// builder resolves through — so the turn and the state key cannot come to different answers
-// about one request. That matters here even though the answer is currently fixed: a stdio host
-// has one connection and no path on it attaches validated claims, so pdp.TaskAnchor reports
-// none and every request anchors on p.sessionID. What this removes is the assumption. The
-// premise was held up by a --jwks-uri check in another package while StdioProxyOptions.PDP is
-// an exported seam, so the first per-request token channel on this transport would have left a
-// single FIFO queue silently mis-serializing; resolved this way, such a channel gets the right
-// key by construction.
-func (p *StdioProxy) decisionAnchor(ctx context.Context) string {
-	id, hasTask := "", false
-	if p.taskAnchored {
-		id, hasTask = pdp.TaskAnchor(pdp.JWTClaimsPtr(ctx))
-	}
-	return enforcement.ResolveStateAnchor(p.taskAnchored, hasTask, id, p.sessionID).Key()
+// It goes through decisionAnchorKey — the same builder the gateway route uses, over the same
+// enforcement.ResolveStateAnchor the engine's own key builder resolves through — so the turn
+// and the state key cannot come to different answers, and neither transport re-derives the
+// fallback. The claims are the proxy's captured connection identity, which is the one source
+// both of this transport's legs read (see StdioProxy.claims).
+func (p *StdioProxy) decisionAnchor() string {
+	return decisionAnchorKey(p.taskAnchored, p.claims, p.sessionID)
 }
 
 // withUpstreamTimeout bounds a StdioProxy upstream round-trip (see boundUpstreamCall).

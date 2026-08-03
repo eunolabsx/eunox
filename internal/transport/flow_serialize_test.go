@@ -476,22 +476,100 @@ func TestDecisionSerializer_ZeroTicketIsANoOp(t *testing.T) {
 }
 
 // TestStdioDecisionAnchor_ResolvesThroughTheSharedResolver pins that the stdio proxy asks the
-// same question the engine's key builder asks. Today the answer is always the session — the
-// transport attaches no validated claims — and that is exactly the premise that was previously
-// held up by a CLI flag check in another package rather than by anything on this path.
+// same question the engine's key builder asks, from the connection identity it captured — the
+// one source both of this transport's legs read, so the host leg and the server-initiated leg
+// cannot land on different turns.
 func TestStdioDecisionAnchor_ResolvesThroughTheSharedResolver(t *testing.T) {
 	t.Parallel()
 	claims := &pdp.JWTClaims{TaskID: "task-42"}
-	withClaims := pdp.WithJWTClaims(context.Background(), claims)
 
 	plain := &StdioProxy{sessionID: "sess-a"}
-	assert.Equal(t, sessionAnchorKey("sess-a"), plain.decisionAnchor(context.Background()))
-	assert.Equal(t, sessionAnchorKey("sess-a"), plain.decisionAnchor(withClaims),
+	assert.Equal(t, sessionAnchorKey("sess-a"), plain.decisionAnchor())
+	plain.claims = claims
+	assert.Equal(t, sessionAnchorKey("sess-a"), plain.decisionAnchor(),
 		"an operator who did not enable task anchoring sees the session turn, claims or no claims")
 
 	anchored := &StdioProxy{sessionID: "sess-a", taskAnchored: true}
-	assert.Equal(t, sessionAnchorKey("sess-a"), anchored.decisionAnchor(context.Background()),
-		"a request with no token anchors on the session, exactly as the engine keys it")
-	assert.Equal(t, taskAnchorKey("task-42"), anchored.decisionAnchor(withClaims),
+	assert.Equal(t, sessionAnchorKey("sess-a"), anchored.decisionAnchor(),
+		"a connection with no token anchors on the session, exactly as the engine keys it")
+	anchored.claims = claims
+	assert.Equal(t, taskAnchorKey("task-42"), anchored.decisionAnchor(),
 		"and a validated task claim keys the turn where the state lives")
+}
+
+// TestStdioPinnedQueue_IsSharedByBothLegsAndReclaimed covers what the pin buys and what it
+// must not cost. Both legs take their tickets from the ONE queue the proxy pinned — a
+// sampling sink that queued somewhere else would not be serialized against a host source's
+// label write, which is the whole reason the server-initiated leg takes a turn at all — and
+// the pin is released at teardown so a queue is not retained past the proxy that held it.
+func TestStdioPinnedQueue_IsSharedByBothLegsAndReclaimed(t *testing.T) {
+	t.Parallel()
+	p := &StdioProxy{sessionID: "sess-a", decideGate: newDecisionSerializer()}
+	p.pinDecisionQueue()
+	require.NotNil(t, p.decideQueue)
+	require.Equal(t, 1, p.decideGate.size())
+
+	// The host leg holds its turn; the sampling leg must wait for it rather than run beside it.
+	host := p.decideGate.begin(p.decideGate.takeOn(p.decideQueue))
+	sampling := p.samplingDecideLock()
+	require.NotNil(t, sampling)
+	entered := make(chan struct{})
+	go func() {
+		end, ok := sampling()
+		if ok {
+			end()
+		}
+		close(entered)
+	}()
+	select {
+	case <-entered:
+		t.Fatal("the server-initiated leg must queue behind the host leg's turn: they share one anchor")
+	case <-time.After(20 * time.Millisecond):
+	}
+	host()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("the sampling leg must run once the host turn is released")
+	}
+
+	// Still exactly one queue after all that traffic: the pin is what keeps the read loop off
+	// the registry, and it is released when the proxy is done with it.
+	assert.Equal(t, 1, p.decideGate.size())
+	p.dropDecideQueue()
+	assert.Zero(t, p.decideGate.size(), "a pinned queue must not outlive the proxy that pinned it")
+}
+
+// TestStdioDecisionTicket_UnpinnedProxyStillSerializes is the fail-open guard on the pin. The
+// pinned queue is an optimization resolved in Start; a proxy driven without it (a direct
+// serveHost caller, which is how much of this package's own coverage runs) must still take a
+// real turn. A nil pin that quietly produced the zero ticket would leave every decision on
+// such a proxy unserialized while every test kept passing — the source->sink race reopened by
+// the very change that was meant to make the keying structural.
+func TestStdioDecisionTicket_UnpinnedProxyStillSerializes(t *testing.T) {
+	t.Parallel()
+	p := &StdioProxy{sessionID: "sess-a", decideGate: newDecisionSerializer()}
+	require.Nil(t, p.decideQueue, "this proxy never ran Start, so it holds no pin")
+
+	first := p.decideGate.begin(p.takeDecisionTicket())
+	second := p.takeDecisionTicket()
+	entered := make(chan struct{})
+	go func() { defer close(entered); p.decideGate.begin(second)() }()
+	select {
+	case <-entered:
+		t.Fatal("an unpinned proxy must still serialize its decisions, not run them concurrently")
+	case <-time.After(20 * time.Millisecond):
+	}
+	first()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("the turn must advance once released")
+	}
+
+	// And the fallback resolves the same anchor the pin would have, so a proxy that pins
+	// later does not move to a different queue.
+	p.pinDecisionQueue()
+	assert.Equal(t, 1, p.decideGate.size(), "the fallback and the pin address one queue, not two")
+	p.dropDecideQueue()
 }

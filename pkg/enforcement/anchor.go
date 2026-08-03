@@ -162,9 +162,12 @@ func (e *Engine) resolveAnchor(req *capability.EnforceRequest) StateAnchor {
 // rollbackLabels, where it stranded a flow label for every unauthenticated caller on the route.
 //
 // It resolves through the same resolveAnchor the key builder uses rather than repeating the
-// claim lookup, so it cannot disagree with the key that was actually built.
+// claim lookup, so it cannot disagree with the key that was actually built — and it asks only
+// about the resolved KIND. Re-testing e.taskAnchored beside that would be a second guard on a
+// condition the resolver has already applied (it cannot return a task anchor with anchoring
+// off), which is the shape this file exists to remove rather than add.
 func (e *Engine) anchoredOnTask(req *capability.EnforceRequest) bool {
-	return e.taskAnchored && e.resolveAnchor(req).Kind == AnchorKindTask
+	return e.resolveAnchor(req).Kind == AnchorKindTask
 }
 
 // anchorUnresolved reports a request this engine cannot anchor as the operator configured it:

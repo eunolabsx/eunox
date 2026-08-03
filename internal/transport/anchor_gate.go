@@ -61,7 +61,15 @@ func (r *UpstreamRoute) serializes() bool { return r != nil && r.decideGates != 
 // under task anchoring — a turn on the session is the right one for a call that is about to
 // be denied).
 func (r *UpstreamRoute) decisionAnchor(sessionID string, claims *pdp.JWTClaims) string {
-	taskAnchored := r != nil && r.taskAnchored
+	return decisionAnchorKey(r != nil && r.taskAnchored, claims, sessionID)
+}
+
+// decisionAnchorKey is the one place a transport turns (its anchoring setting, a request's
+// validated claims, a session id) into the turn key. Both transports call it — a second
+// hand-rolled copy of the fallback branching is the shape this whole seam exists to remove,
+// and the engine's key builder resolving through enforcement.ResolveStateAnchor while a
+// transport re-derived it is precisely how the turn and the key would come to disagree.
+func decisionAnchorKey(taskAnchored bool, claims *pdp.JWTClaims, sessionID string) string {
 	id, hasTask := "", false
 	if taskAnchored {
 		id, hasTask = pdp.TaskAnchor(claims)
@@ -154,30 +162,6 @@ func (a *anchorGate) drop() {
 	g.mu.Unlock()
 }
 
-// begin blocks until this anchor's turn is free and returns the idempotent release func. It
-// is the host path's entry: that path holds the turn on its own request goroutine, so waiting
-// costs only the waiting request. A nil registry is a no-op returning a no-op release, so a
-// non-serialized route needs no branch at the call site.
-func (g *anchorGates) begin(key string) (end func()) {
-	end, _ = g.acquire(key, nil)
-	return end
-}
-
-// beginWithin is begin with a bound: it reports ok=false, having taken no turn, when the
-// anchor is still busy after d. The caller must then refuse the request rather than proceed —
-// an unserialized decision is the fail-open the turn exists to close.
-//
-// It exists for the server-initiated leg, which waits on the session's single upstream-reader
-// goroutine. That goroutine also delivers every upstream response, so blocking it for the
-// length of another call's turn — held across a whole upstream round trip by a declassifying
-// host call, and under task anchoring possibly by a call on a DIFFERENT session — stalls every
-// in-flight request on the session. See samplingTurnWait.
-func (g *anchorGates) beginWithin(key string, d time.Duration) (end func(), ok bool) {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	return g.acquire(key, timer.C)
-}
-
 // acquire takes the turn for key, giving up if giveUp fires first (nil waits forever). It is
 // the per-request path: it holds a reference only for the length of the turn, which is what
 // keeps a route's gate map from growing one entry per anchor it has ever served.
@@ -186,6 +170,9 @@ func (g *anchorGates) beginWithin(key string, d time.Duration) (end func(), ok b
 // otherwise one session's decision would block every other anchor's lookup. The gate is
 // leaf-level: nothing else is locked under it, so it cannot participate in a cycle, and a
 // request only ever holds one.
+//
+// A nil registry is a no-op returning a no-op release, so a non-serialized route needs no
+// branch at the call site.
 func (g *anchorGates) acquire(key string, giveUp <-chan time.Time) (end func(), ok bool) {
 	if g == nil {
 		return func() {}, true
@@ -200,10 +187,10 @@ func (g *anchorGates) acquire(key string, giveUp <-chan time.Time) (end func(), 
 		drop()
 		return nil, false
 	}
-	return sync.OnceFunc(func() {
-		release()
-		drop()
-	}), true
+	// Composed rather than wrapped in a third sync.OnceFunc: both halves are already
+	// idempotent, so a guard over them would only allocate a second Once for a property they
+	// each carry — on the path this file calls the microsecond decision path.
+	return func() { release(); drop() }, true
 }
 
 // take waits for this gate's turn and returns the idempotent release, or ok=false when giveUp

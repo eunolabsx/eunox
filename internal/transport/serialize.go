@@ -24,17 +24,23 @@
 // reader, it hands out a ticket per enforced request AS IT ARRIVES and each handler waits its
 // ticket, so the order is proxy-RECEIPT order rather than scheduler order.
 //
-// Today a stdio host resolves one anchor and one only: it has a single host connection, and
-// no path on it attaches a validated token, so every request falls back to the session (task
-// anchoring anchors a caller with no token on its session). The keying is therefore not
-// carrying weight yet — and that is precisely why it is here rather than assumed. The
-// premise "stdio has one session and no per-request token" was enforced by a CLI flag check
-// in another package (--jwks-uri is refused on a stdio host) while StdioProxyOptions.PDP is
-// an exported seam any embedder can hand a JWTPDP; the first per-request token channel on
-// this transport would have made a single FIFO queue silently stop being "the anchor", with
-// no seam to reach for and no test that would fail. Resolving the anchor through the same
-// enforcement.ResolveStateAnchor the engine's key builder uses means such a channel gets
-// correct keying by construction instead.
+// A stdio host resolves ONE anchor, and the reason is structural rather than incidental: it
+// has a single host connection, so whatever identity that connection carries is the identity
+// every request on it carries. StdioProxy therefore resolves its anchor once and pins that
+// anchor's queue for the proxy's life — the registry is not on its per-request path at all,
+// the same conclusion the HTTP side reaches for a session-anchored route.
+//
+// The keying is still here, rather than a bare pair of counters, for two reasons. It is what
+// makes the primitive correct for a caller that resolves more than one anchor, which is what
+// the HTTP transport is. And it puts the premise in ONE place: previously "stdio has one
+// session and no per-request token" was held up by a CLI flag check in another package
+// (--jwks-uri is refused on a stdio host) while StdioProxyOptions.PDP is an exported seam any
+// embedder can hand a JWTPDP. Now the proxy resolves its anchor through the same
+// enforcement.ResolveStateAnchor the engine's key builder uses, from the same claims its
+// engine decides with — so an embedder that attaches connection-level claims gets a turn on
+// the key its state actually lives on. Giving stdio PER-REQUEST tokens would make the pin
+// wrong, and the pin is where that change has to be made; it is a seam rather than an
+// assumption spread across two packages.
 
 package transport
 
@@ -90,8 +96,9 @@ func decisionEndFromContext(ctx context.Context) func() {
 type decisionSerializer struct {
 	mu sync.Mutex
 	// queues holds one FIFO per LIVE anchor. An entry is dropped once every ticket it handed
-	// out has been served, so a proxy that ever serves many anchors does not accumulate one
-	// counter pair per anchor it has seen — the same reason the HTTP gate registry refcounts.
+	// out has been served and no holder is pinning it, so a proxy that ever serves many
+	// anchors does not accumulate one counter pair per anchor it has seen — the same reason
+	// the HTTP gate registry refcounts.
 	queues map[string]*ticketQueue
 }
 
@@ -101,7 +108,11 @@ type ticketQueue struct {
 	cond    *sync.Cond // over the serializer's mu; broadcasts wake only this anchor's waiters
 	handed  uint64     // next ticket to hand out
 	serving uint64     // ticket currently allowed to run its decision
-	live    int        // tickets handed out whose turn has not yet been advanced
+	// pins counts long-lived holders (see hold). Tickets in flight are NOT counted here:
+	// handed != serving already says a ticket is outstanding, and a second counter restating
+	// that is one more thing to keep in agreement — one that, left above zero by a future
+	// path, would silently pin the queue forever.
+	pins int
 }
 
 // decisionTicket is a reserved place in one anchor's queue. Its zero value is the
@@ -128,14 +139,73 @@ func newDecisionSerializer() *decisionSerializer {
 func (g *decisionSerializer) take(anchor string) decisionTicket {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	return g.queueLocked(anchor).ticket()
+}
+
+// takeOn reserves the next ticket on a queue the caller already holds pinned, skipping the
+// registry entirely. Same receipt-order contract as take.
+//
+// q must be non-nil. A nil-tolerant version would return the zero ticket, which begin treats
+// as "this request is not serialized" — so a caller that had not pinned a queue would run its
+// decisions unserialized, silently, which is the fail-open the turn exists to close. Callers
+// that may hold no pin resolve through take instead; see StdioProxy.takeDecisionTicket.
+func (g *decisionSerializer) takeOn(q *ticketQueue) decisionTicket {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return q.ticket()
+}
+
+// hold returns this anchor's queue pinned, plus the func that unpins it. A caller that keeps
+// one across many requests takes tickets straight off the queue (queue.ticket) and never
+// touches the registry again.
+//
+// It is what keeps the map off the per-request path where the anchor cannot vary. A stdio
+// host has one connection and no per-request token channel, so every request on it resolves
+// the same anchor — and re-resolving it per request meant rendering the key, taking the
+// registry mutex, and creating and destroying the same queue on every enforced call, since
+// the queue is reclaimed the moment its last ticket is served. That is the cost the HTTP
+// side of this seam pays once per session; there is no reason for the transport with a
+// SINGLE anchor to pay it per request. The keying stays because it is what makes the
+// primitive right for a caller that ever resolves more than one.
+func (g *decisionSerializer) hold(anchor string) (*ticketQueue, func()) {
+	if g == nil {
+		return nil, func() {}
+	}
+	g.mu.Lock()
+	q := g.queueLocked(anchor)
+	q.pins++
+	g.mu.Unlock()
+	return q, sync.OnceFunc(func() {
+		g.mu.Lock()
+		q.pins--
+		g.reclaimLocked(q)
+		g.mu.Unlock()
+	})
+}
+
+// queueLocked returns this anchor's queue, creating it if needed. Caller holds g.mu.
+func (g *decisionSerializer) queueLocked(anchor string) *ticketQueue {
 	q := g.queues[anchor]
 	if q == nil {
 		q = &ticketQueue{anchor: anchor, cond: sync.NewCond(&g.mu)}
 		g.queues[anchor] = q
 	}
+	return q
+}
+
+// reclaimLocked drops a queue with no pin and no outstanding ticket. Caller holds g.mu.
+// Reclaimed only when both are true, so a waiter — which by definition holds a ticket the
+// serving counter has not reached — always keeps the queue it is parked on.
+func (g *decisionSerializer) reclaimLocked(q *ticketQueue) {
+	if q.pins == 0 && q.handed == q.serving {
+		delete(g.queues, q.anchor)
+	}
+}
+
+// ticket reserves the next place in this queue's FIFO. Caller holds the serializer's mu.
+func (q *ticketQueue) ticket() decisionTicket {
 	t := decisionTicket{queue: q, n: q.handed}
 	q.handed++
-	q.live++
 	return t
 }
 
@@ -164,13 +234,10 @@ func (g *decisionSerializer) begin(t decisionTicket) (end func()) {
 	return sync.OnceFunc(func() {
 		g.mu.Lock()
 		q.serving++
-		q.live--
-		if q.live == 0 {
-			// Every ticket this queue handed out has been served, so nothing is queued on it
-			// and nothing can be: a later take under the same anchor builds a fresh queue,
-			// which is correct precisely because no waiter holds the old one.
-			delete(g.queues, q.anchor)
-		}
+		// Every ticket this queue handed out has now been served (and nobody has pinned it),
+		// so nothing is queued on it and nothing can be: a later take under the same anchor
+		// builds a fresh queue, which is correct precisely because no waiter holds the old one.
+		g.reclaimLocked(q)
 		q.cond.Broadcast()
 		g.mu.Unlock()
 	})

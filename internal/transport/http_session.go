@@ -102,6 +102,14 @@ type httpSession struct {
 	// span it. Under the default session anchoring the route's gate for this session's key
 	// IS a per-session mutex, so nothing changed for that deployment. See anchor_gate.go.
 	//
+	// Both entries above branch on decideGate rather than routing through one helper: the
+	// cached path must render no anchor key, and threading the key past that branch as a
+	// closure only moves the allocation it saves into a closure the branch then never calls.
+	// The registry arm is the ALWAYS-CORRECT path and the cache is the special case — a
+	// session-anchored route's anchor cannot change between requests, so one gate serves the
+	// session, and anything else (a task-anchored route, a session a test assembled without
+	// registering) resolves per request.
+	//
 	// decideGate is that gate, resolved ONCE at registration and held for the session's
 	// life, for the case where it is a per-session constant: a route that does not anchor
 	// state on the task. There the anchor is invariantly this session's id, so going back
@@ -114,8 +122,9 @@ type httpSession struct {
 	// never registered, which falls back to the always-correct registry path).
 	decideGate *anchorGate
 	// dropDecideGate releases the reference above at teardown, so a long-lived gateway does
-	// not accumulate one gate per session it has ever served. nil when none is held;
-	// idempotent, and called from close(), which runs exactly once.
+	// not accumulate one gate per session it has ever served. nil when none is held, and
+	// idempotent. Called from releaseSessionState — the funnel that runs on EVERY teardown,
+	// including the natural upstream exit that close() deliberately does not cover.
 	dropDecideGate func()
 
 	notifMu   sync.Mutex
@@ -683,7 +692,11 @@ func (s *httpSession) holdDecisionGate() {
 // route. A session-anchored route takes its turn on the gate held for the session's life and
 // touches the registry not at all.
 func (s *httpSession) beginDecisionTurn(ctx context.Context) func() {
-	end, _ := s.acquireDecisionTurn(func() string { return s.route.decisionAnchorFromContext(ctx, s.id) }, nil)
+	if s.decideGate != nil {
+		end, _ := s.decideGate.take(nil)
+		return end
+	}
+	end, _ := s.route.decideGates.acquire(s.route.decisionAnchorFromContext(ctx, s.id), nil)
 	return end
 }
 
@@ -694,25 +707,10 @@ func (s *httpSession) beginDecisionTurn(ctx context.Context) func() {
 func (s *httpSession) beginDecisionTurnWithin(d time.Duration) (func(), bool) {
 	timer := time.NewTimer(d)
 	defer timer.Stop()
-	return s.acquireDecisionTurn(func() string { return s.route.decisionAnchor(s.id, s.claims) }, timer.C)
-}
-
-// acquireDecisionTurn takes this request's turn, preferring the gate cached for the session's
-// life and falling back to the route's registry when there is none.
-//
-// The fallback is not a slow path to be avoided — it is the ALWAYS-CORRECT one, and the cache
-// is the special case: a session-anchored route's anchor cannot change between requests, so
-// one gate serves the session. Anything else (a task-anchored route, a session assembled by a
-// test that never registered) resolves per request.
-//
-// anchor is a func rather than a string because the cached path must not build one: rendering
-// the key is a per-request allocation, and skipping the registry only to allocate its key
-// anyway would give back part of what the cache is for.
-func (s *httpSession) acquireDecisionTurn(anchor func() string, giveUp <-chan time.Time) (func(), bool) {
 	if s.decideGate != nil {
-		return s.decideGate.take(giveUp)
+		return s.decideGate.take(timer.C)
 	}
-	return s.route.decideGates.acquire(anchor(), giveUp)
+	return s.route.decideGates.acquire(s.route.decisionAnchor(s.id, s.claims), timer.C)
 }
 
 // getSession returns the session for id, or nil.
@@ -1374,6 +1372,17 @@ func releaseSessionState(sess *httpSession) {
 	// entirely, which is the fail-open the drain exists to close.
 	budget := sess.shutdownBudget()
 	sess.awaitInFlightDrained(budget)
+	// The decision gate held for this session's life goes back here, beside the flow-state
+	// release and AFTER the in-flight drain, for both of this function's reasons. It has to
+	// be on the funnel that covers every teardown — a session whose upstream exits on its own
+	// never reaches close(), so releasing there retained one gate per such session for the
+	// proxy's life, which is exactly the accumulation the registry's refcounting exists to
+	// prevent. And it has to be after the drain: dropping the last reference deletes the gate
+	// from the registry, so a request still taking turns on it would be holding a gate a later
+	// caller under the same key could no longer reach.
+	if sess.dropDecideGate != nil {
+		sess.dropDecideGate()
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 	sess.route.pdp.ReleaseSession(ctx, sess.id)
@@ -1420,13 +1429,6 @@ func (s *httpSession) close(shutdownMs int) {
 		// primitive. The done-channel handling below is now purely lifecycle: reap the
 		// subprocess (local) or release the connection pool (remote).
 		s.sessCancel()
-		// Release the decision gate held for this session's life, so the route's registry
-		// holds one entry per LIVE session rather than one per session it has ever served.
-		// Here rather than in a reaper arm because close() is the single teardown funnel
-		// both modes and every teardown reason pass through, and it runs exactly once.
-		if s.dropDecideGate != nil {
-			s.dropDecideGate()
-		}
 		if s.upHTTPClient != nil {
 			// Remote mode: no subprocess. Terminate the upstream MCP session with a bounded
 			// DELETE so the remote frees its session state rather than leaking it, only when

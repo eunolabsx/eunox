@@ -110,3 +110,27 @@ func validateSchemaVersion(kind, v string, supported []string) error {
 func supportedVersionList(supported []string) string {
 	return strings.Join(supported, ", ")
 }
+
+// revisionAdmits reports whether a manifest declaring revision `declared` may carry a token
+// introduced by revision `since`: it may when `declared` is `since` or any revision published
+// after it. A revision therefore inherits every earlier revision's vocabulary and stays CLOSED
+// against every later one's, which is the gate's whole job.
+//
+// It indexes the published SEQUENCE (supportedManifestSchemaVersions, derived from
+// pkg/capability's list) rather than comparing the version strings, and rather than spelling
+// the two-revision case as a boolean. Both alternatives break silently on the third revision:
+// a string compare inverts the first time a revision is not orderable lexically ("0.10" sorts
+// before "0.2"), and "the base grammar plus an exact match" refused every `0.2` token under a
+// semantics-only `0.3` that introduced none. Publishing a revision is an append to one
+// ordered list; nothing here is re-derived for it.
+//
+// An unrecognized revision on either side admits nothing — the fail-closed direction, and the
+// same one checkTokenRevision takes for a token this build cannot classify at all.
+func revisionAdmits(declared, since string) bool {
+	di := slices.Index(supportedManifestSchemaVersions, declared)
+	si := slices.Index(supportedManifestSchemaVersions, since)
+	if di < 0 || si < 0 {
+		return false
+	}
+	return di >= si
+}

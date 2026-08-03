@@ -582,16 +582,22 @@ func TestParamsLiterals_DoNotAssignThePDPFields(t *testing.T) {
 		"forwardParams":       true,
 		"decidingPDP":         true,
 	}
-	// Fields that must only ever be set by withPDP: the decision point itself and everything
-	// derived from it.
-	derived := map[string]bool{"pdp": true, "committer": true}
-	// Files allowed to ASSIGN one of those fields through a selector. withPDP's own two bodies
-	// are recognized by their enclosing function name (below); this allowlist covers the one
-	// remaining site, where the field belongs to a DIFFERENT type that happens to share the
-	// name — UpstreamRoute.pdp, which BuildRoutes fills in and which has no derived twin. An
-	// AST walk has no type information, so the exemption is by file and is deliberately a
-	// review signal: adding one means editing this guard.
-	assignAllowed := map[string]bool{"route.go": true}
+	// Fields that must only ever be set by withPDP: the decision point itself, everything
+	// derived from it, and the wrapper that holds it (assigning the whole embedded struct
+	// installs a decision point just as effectively as naming its field).
+	derived := map[string]bool{"pdp": true, "committer": true, "decidingPDP": true}
+	// The FUNCTIONS allowed to assign one of those names through a selector. withPDP's own
+	// two bodies are the point of the invariant; the other two are where UpstreamRoute.pdp —
+	// a different type that happens to share the field name, with no derived twin — is filled
+	// in. An AST walk carries no type information, so the exemption cannot be by type; it is
+	// by function rather than by file because a whole-file pass would leave every future
+	// function in route.go (which is where per-route wiring is assembled) silently outside a
+	// guard whose entire job is to notice new wiring. Adding an entry is the review signal.
+	assignAllowed := map[string]bool{
+		"withPDP":           true,
+		"BuildRoutes":       true,
+		"WrapRoutesWithJWT": true,
+	}
 
 	entries, err := os.ReadDir(".")
 	require.NoError(t, err)
@@ -627,32 +633,31 @@ func TestParamsLiterals_DoNotAssignThePDPFields(t *testing.T) {
 			}
 		})
 
-		// The assignment half. Skip withPDP's own body, which is where these fields are
-		// SUPPOSED to be written, and skip the allowlisted files.
-		for _, decl := range file.Decls {
-			fn, isFn := decl.(*ast.FuncDecl)
-			if !isFn || fn.Body == nil || fn.Name.Name == "withPDP" || assignAllowed[name] {
-				continue
-			}
-			ast.Inspect(fn.Body, func(n ast.Node) bool {
-				assign, isAssign := n.(*ast.AssignStmt)
-				if !isAssign {
-					return true
-				}
-				for _, lhs := range assign.Lhs {
-					sel, isSel := lhs.(*ast.SelectorExpr)
-					if !isSel {
-						continue
-					}
-					assignsChecked++
-					if derived[sel.Sel.Name] {
-						t.Errorf("%s assigns .%s in %s; the decision point and every field derived from it must be set together by .withPDP(p), never one at a time",
-							fn.Name.Name, sel.Sel.Name, name)
-					}
-				}
+		// The assignment half. It walks the WHOLE file rather than descending only into
+		// FuncDecl bodies, because an assignment inside a package-level `var f = func() {...}`
+		// is a GenDecl and would otherwise never be visited. The enclosing function is tracked
+		// so the allowlist can be per-function; an assignment outside any function body has no
+		// enclosing name and is never exempt.
+		enclosing := enclosingFuncs(file)
+		ast.Inspect(file, func(n ast.Node) bool {
+			assign, isAssign := n.(*ast.AssignStmt)
+			if !isAssign {
 				return true
-			})
-		}
+			}
+			for _, lhs := range assign.Lhs {
+				sel, isSel := lhs.(*ast.SelectorExpr)
+				if !isSel {
+					continue
+				}
+				assignsChecked++
+				if !derived[sel.Sel.Name] || assignAllowed[enclosing.at(assign.Pos())] {
+					continue
+				}
+				t.Errorf("%s assigns .%s in %s; the decision point and every field derived from it must be set together by .withPDP(p), never one at a time",
+					enclosing.describe(assign.Pos()), sel.Sel.Name, name)
+			}
+			return true
+		})
 	}
 	require.Positive(t, litsChecked, "no params literal found in any non-test file; the literal half of this guard would pass vacuously")
 	require.Positive(t, assignsChecked, "no field assignment found in any non-test file; the assignment half of this guard would pass vacuously")
@@ -1237,6 +1242,22 @@ func TestEnforcedForwardCore_DoubleCommitIsNotReportedAsAFailedClear(t *testing.
 		"and this call changed nothing, so it must not re-claim the labels the first commit removed")
 	assert.Equal(t, "apr-9", got.details[audit.DeclassifySpentApprovalKey],
 		"the spent grant is still named, exactly as a no-op clear names it")
+
+	// And under a STANDING grant there is no spent id, so there is no declassification
+	// evidence at all — the record must carry nothing rather than a bare flow discriminator,
+	// which is what the shared producer guarantees and a hand-built detail map did not.
+	standing := declassifiedAllow()
+	standing.Declassification = capability.NewDeclassification(
+		[]string{capability.FlowLabelPII}, "alice@example.com", "apr-9", false)
+	rec2 := &fwdRecorder{}
+	enforcedForwardCore(context.Background(),
+		forwardParams{rec: rec2, sessionID: "s", callUpstream: cleanUpstream(), committer: spy},
+		mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, standing, "tools/call", "sanitize", "sanitize", "tool", false, upstreamErrorDetail)
+	require.Len(t, rec2.records, 1)
+	for key, v := range rec2.records[0].details {
+		assert.NotEqual(t, capability.FlowAuditDetailKey, key,
+			"a call with no declassification evidence must not be marked as an information-flow event (got %v)", v)
+	}
 }
 
 // TestStrictAuditDenial_BuildsTheDeclassifyDetailOnlyWhenItTrips is the eager-evaluation guard.
@@ -1270,4 +1291,51 @@ func TestStrictAuditDenial_BuildsTheDeclassifyDetailOnlyWhenItTrips(t *testing.T
 	require.Len(t, rec.records, 1)
 	assert.Equal(t, []string{capability.FlowLabelPII}, rec.records[0].details[audit.DeclassifyNotAppliedKey])
 	assert.Equal(t, "apr-9", rec.records[0].details[audit.DeclassifySpentApprovalKey])
+}
+
+// funcSpans maps source positions back to the function that encloses them, so a source guard
+// can exempt a FUNCTION rather than a whole file. ast.Inspect carries no parent link, so the
+// spans are collected up front from the file's declarations — including function literals
+// bound to package-level vars, which are not FuncDecls and which a body-only walk misses.
+type funcSpans []funcSpan
+
+type funcSpan struct {
+	name       string
+	start, end token.Pos
+}
+
+func enclosingFuncs(file *ast.File) funcSpans {
+	var spans funcSpans
+	ast.Inspect(file, func(n ast.Node) bool {
+		if fn, ok := n.(*ast.FuncDecl); ok && fn.Body != nil {
+			spans = append(spans, funcSpan{name: fn.Name.Name, start: fn.Body.Pos(), end: fn.Body.End()})
+		}
+		return true
+	})
+	return spans
+}
+
+// at returns the name of the innermost declared function containing pos, or "" when pos is
+// outside every function body (a package-level closure, say) — which no allowlist entry
+// matches, so such an assignment is always flagged.
+func (s funcSpans) at(pos token.Pos) string {
+	name, width := "", token.Pos(-1)
+	for _, span := range s {
+		if pos < span.start || pos >= span.end {
+			continue
+		}
+		if w := span.end - span.start; width < 0 || w < width {
+			name, width = span.name, w
+		}
+	}
+	return name
+}
+
+// describe names the enclosing function for an error message, falling back to a phrase for an
+// assignment that sits outside any function body.
+func (s funcSpans) describe(pos token.Pos) string {
+	if name := s.at(pos); name != "" {
+		return name
+	}
+	return "a package-level initializer"
 }

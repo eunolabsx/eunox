@@ -22,7 +22,6 @@ import (
 	stdpath "path"
 	"reflect"
 	"regexp"
-	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -1960,34 +1959,17 @@ func checkTokenRevision(i int, token, kind, declared string) error {
 	return nil
 }
 
-// revisionAdmits reports whether a manifest declaring revision `declared` may carry a token
-// introduced by revision `since`: it may when `declared` is `since` or any revision published
-// after it. A revision therefore inherits every earlier revision's vocabulary and stays CLOSED
-// against every later one's, which is the gate's whole job.
-//
-// It indexes the published SEQUENCE (supportedManifestSchemaVersions, derived from
-// pkg/capability's list) rather than comparing the version strings, and rather than spelling
-// the two-revision case as a boolean. Both alternatives break silently on the third revision:
-// a string compare inverts the first time a revision is not orderable lexically ("0.10" sorts
-// before "0.2"), and "the base grammar plus an exact match" refused every `0.2` token under a
-// semantics-only `0.3` that introduced none. Publishing a revision is an append to one
-// ordered list; nothing here is re-derived for it.
-//
-// An unrecognized revision on either side admits nothing — the fail-closed direction, and the
-// same one checkTokenRevision takes for a token this build cannot classify at all.
-func revisionAdmits(declared, since string) bool {
-	di := slices.Index(supportedManifestSchemaVersions, declared)
-	si := slices.Index(supportedManifestSchemaVersions, since)
-	if di < 0 || si < 0 {
-		return false
-	}
-	return di >= si
-}
-
 // tokenGrammarVersionErr builds the fail-closed rejection for a token used under a
 // schemaVersion that does not define it.
+//
+// It names the introducing revision and nothing else. It used to call that revision "the
+// flow+effect grammar", which was accurate only while "0.2" was the sole revision that could
+// reach this argument: with inheritance running forward along the published sequence, a token
+// introduced by any later revision reaches it too, and so does a base-grammar token under an
+// unrecognized declared version — both of which the parenthetical would have mislabeled to an
+// operator debugging a refused load.
 func tokenGrammarVersionErr(i int, feature, required, declared string) error {
-	return fmt.Errorf("capability at index %d: %s was introduced in schemaVersion %q (the flow+effect grammar); this manifest declares schemaVersion %q, under which the token is not part of the grammar", i, feature, required, declared)
+	return fmt.Errorf("capability at index %d: %s was introduced in schemaVersion %q; this manifest declares schemaVersion %q, under which the token is not part of the grammar", i, feature, required, declared)
 }
 
 // requireResponseDirectiveTarget rejects a response-mutating directive (redactFields)

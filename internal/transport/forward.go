@@ -681,11 +681,16 @@ func commitDeclassify(ctx context.Context, committer declassifyCommitter, sessio
 		// which is the unsafe direction for an alert to be wrong in.
 		//
 		// Nothing is cleared HERE (this call removed nothing), so the record carries only the
-		// spent grant, exactly as the no-op-clear path does.
+		// spent grant — through spentGrantDetail, the same producer the no-op-clear path uses,
+		// rather than the map built above. That map is declassifyDetail() plus a spent id that
+		// a STANDING grant does not have, so returning it would put a bare flow discriminator
+		// on the tape for a call with no declassification evidence at all — the shape
+		// declassifyRefusalDetail's own doc identifies as the defect that made it test both
+		// facts rather than the handle's nil.
 		fmt.Fprintf(os.Stderr,
 			"[eunox] WARN declassify %s %q: the authorized clear was committed twice; the first commit applied it and this one changed nothing (proxy wiring fault, not a flow-store failure — the session is NOT over-tainted)\n",
 			kind, target)
-		return nil, detail
+		return nil, spentGrantDetail(dec)
 	}
 	if err != nil {
 		authorized := decl.Labels()

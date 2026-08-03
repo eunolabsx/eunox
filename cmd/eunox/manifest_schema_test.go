@@ -202,7 +202,12 @@ func TestManifestSchema_SchemaVersionEnum(t *testing.T) {
 	t.Parallel()
 	doc := loadManifestSchema(t)
 	got := schemaEnum(t, schemaObjectAt(t, doc, "properties", "schemaVersion"))
-	want := []string{config.ManifestSchemaVersion01, config.ManifestSchemaVersion02}
+	// Derived, not restated: publishing a revision is an append to capability's ordered
+	// sequence, which the loader's parse set is derived from — so a literal here would let
+	// the loader accept a manifest the published schema's enum still rejects, with both
+	// sides of this assertion frozen and the test green. Same reason the token expectations
+	// below derive from the prototype registry.
+	want := capability.PublishedSchemaVersions()
 	if !sameStrings(got, want) {
 		t.Fatalf("schemaVersion enum = %v, want %v", got, want)
 	}

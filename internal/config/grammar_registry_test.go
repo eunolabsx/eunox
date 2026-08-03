@@ -203,7 +203,10 @@ func TestBaseGrammarTokensLoadUnderBothRevisions(t *testing.T) {
 		}
 		t.Run(token, func(t *testing.T) {
 			c := constraintCarrying(t, token)
-			for _, v := range []string{ManifestSchemaVersion01, ManifestSchemaVersion02} {
+			// The published sequence, not a restated pair: a base-grammar token must load
+			// under EVERY published revision, which is what the name says and what a
+			// two-element literal stops asserting the moment a third is published.
+			for _, v := range supportedManifestSchemaVersions {
 				m := &LocalManifest{SchemaVersion: v, Capabilities: []capability.Constraint{c}}
 				assert.NoError(t, checkTokenGrammarVersion(m),
 					"%q is a base-grammar token and must load under schemaVersion %q", token, v)

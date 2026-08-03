@@ -29,6 +29,23 @@ func taskAnchorKey(taskID string) string {
 	return enforcement.ResolveStateAnchor(true, true, taskID, "some-session").Key()
 }
 
+// beginTurn and beginTurnWithin drive the registry's one entry point, anchorGates.acquire,
+// which is what httpSession.acquireDecisionTurn calls for a task-anchored route and for any
+// session holding no cached gate. They are two lines in the test rather than two methods on
+// the registry because that is all they were: a pair of production entry points that the
+// session-held gate left with no production callers would have gone on being the code these
+// tests pin while the code that runs is somewhere else.
+func beginTurn(g *anchorGates, key string) func() {
+	end, _ := g.acquire(key, nil)
+	return end
+}
+
+func beginTurnWithin(g *anchorGates, key string, d time.Duration) (func(), bool) {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	return g.acquire(key, timer.C)
+}
+
 // TestAnchorGates_ExcludeWithinAKeyAndNotAcross is the primitive's contract: one turn per
 // key, and keys are independent. The second half matters as much as the first — a registry
 // that serialized everything would turn a gateway's whole traffic into one queue.
@@ -36,11 +53,11 @@ func TestAnchorGates_ExcludeWithinAKeyAndNotAcross(t *testing.T) {
 	t.Parallel()
 	g := newAnchorGates()
 
-	end := g.begin("a")
+	end := beginTurn(g, "a")
 	held := make(chan struct{})
 	go func() {
 		defer close(held)
-		g.begin("a")() // blocks until the turn above is released, then releases its own
+		beginTurn(g, "a")() // blocks until the turn above is released, then releases its own
 	}()
 	select {
 	case <-held:
@@ -52,7 +69,7 @@ func TestAnchorGates_ExcludeWithinAKeyAndNotAcross(t *testing.T) {
 	other := make(chan struct{})
 	go func() {
 		defer close(other)
-		g.begin("b")()
+		beginTurn(g, "b")()
 	}()
 	select {
 	case <-other:
@@ -74,13 +91,13 @@ func TestAnchorGates_ExcludeWithinAKeyAndNotAcross(t *testing.T) {
 func TestAnchorGates_ReleaseIsIdempotent(t *testing.T) {
 	t.Parallel()
 	g := newAnchorGates()
-	end := g.begin("a")
+	end := beginTurn(g, "a")
 	end()
 	require.NotPanics(t, end, "the second release must be a no-op, not an unlock of an unlocked mutex")
 
 	// And the turn really is free afterwards.
 	done := make(chan struct{})
-	go func() { defer close(done); g.begin("a")() }()
+	go func() { defer close(done); beginTurn(g, "a")() }()
 	select {
 	case <-done:
 	case <-time.After(time.Second):
@@ -96,14 +113,14 @@ func TestAnchorGates_ReclaimsIdleAnchors(t *testing.T) {
 	g := newAnchorGates()
 	for i := range 100 {
 		key := sessionAnchorKey(string(rune('a'+i%26)) + string(rune('0'+i/26)))
-		g.begin(key)()
+		beginTurn(g, key)()
 	}
 	assert.Zero(t, g.size(), "a released anchor must not be retained")
 
 	// A gate with a waiter is retained until BOTH are done.
-	end := g.begin("held")
+	end := beginTurn(g, "held")
 	waiting := make(chan func(), 1)
-	go func() { waiting <- g.begin("held") }()
+	go func() { waiting <- beginTurn(g, "held") }()
 	time.Sleep(20 * time.Millisecond)
 	assert.Equal(t, 1, g.size(), "one gate serves both the holder and its waiter")
 	end()
@@ -116,7 +133,7 @@ func TestAnchorGates_ReclaimsIdleAnchors(t *testing.T) {
 func TestAnchorGates_NilRegistryIsANoOp(t *testing.T) {
 	t.Parallel()
 	var g *anchorGates
-	require.NotPanics(t, func() { g.begin("a")() })
+	require.NotPanics(t, func() { beginTurn(g, "a")() })
 }
 
 // TestDecisionAnchor_FollowsTheStateAnchor pins the property the anchor keying exists for: the
@@ -189,7 +206,7 @@ func TestDecisionTurn_SpansTwoSessionsSharingATask(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			// Session A takes its turn and holds it, as a declassifying call does across its
 			// forward.
-			endA := tc.route.decideGates.begin(tc.route.decisionAnchor("sess-a", claims))
+			endA := beginTurn(tc.route.decideGates, tc.route.decisionAnchor("sess-a", claims))
 
 			var started atomic.Bool
 			ready := make(chan struct{})
@@ -198,7 +215,7 @@ func TestDecisionTurn_SpansTwoSessionsSharingATask(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				close(ready)
-				end := tc.route.decideGates.begin(tc.route.decisionAnchor("sess-b", claims))
+				end := beginTurn(tc.route.decideGates, tc.route.decisionAnchor("sess-b", claims))
 				started.Store(true)
 				end()
 			}()
@@ -227,9 +244,9 @@ func TestDecisionTurn_SpansTwoSessionsSharingATask(t *testing.T) {
 func TestAnchorGates_BeginWithinGivesUp(t *testing.T) {
 	t.Parallel()
 	g := newAnchorGates()
-	held := g.begin("a")
+	held := beginTurn(g, "a")
 
-	end, ok := g.beginWithin("a", 20*time.Millisecond)
+	end, ok := beginTurnWithin(g, "a", 20*time.Millisecond)
 	assert.False(t, ok, "a busy anchor must be reported rather than waited for")
 	assert.Nil(t, end, "and no turn was taken, so there is nothing to release")
 
@@ -239,7 +256,7 @@ func TestAnchorGates_BeginWithinGivesUp(t *testing.T) {
 	assert.Zero(t, g.size(), "an abandoned wait must drop its reference")
 
 	// A free anchor is entered immediately.
-	end, ok = g.beginWithin("a", time.Second)
+	end, ok = beginTurnWithin(g, "a", time.Second)
 	require.True(t, ok)
 	require.NotNil(t, end)
 	end()
@@ -259,8 +276,8 @@ func TestAnchorGates_BeginWithinGivesUp(t *testing.T) {
 // completing.
 func TestSessionGate_HeldOnceForTheSessionsLife(t *testing.T) {
 	t.Parallel()
-	rt := &UpstreamRoute{decideGates: newAnchorGates()}
-	sess := &httpSession{id: "sess-a", route: rt}
+	rt := &UpstreamRoute{decideGates: newAnchorGates(), pdp: pdp.DenyAllPDP{}}
+	sess := newTestSession(&httpSession{id: "sess-a", route: rt})
 	sess.holdDecisionGate()
 	require.NotNil(t, sess.decideGate, "a session-anchored route caches its gate")
 	require.Equal(t, 1, rt.decideGates.size())
@@ -279,10 +296,44 @@ func TestSessionGate_HeldOnceForTheSessionsLife(t *testing.T) {
 	assert.Same(t, held, viaRegistry)
 	drop()
 
-	// And it is released at teardown, so a long-lived route holds one gate per LIVE session
-	// rather than one per session it has ever served.
-	sess.dropDecideGate()
+	// And it is released by the TEARDOWN FUNNEL, not by a hand call: releaseSessionState is
+	// the one path that runs on every teardown reason, and driving it is what makes this
+	// assertion about the release production performs. See
+	// TestSessionGate_ReleasedOnEveryTeardownPath.
+	releaseSessionState(sess)
 	assert.Zero(t, rt.decideGates.size())
+}
+
+// TestSessionGate_ReleasedOnEveryTeardownPath is the leak guard, and it drives the funnel
+// rather than the drop.
+//
+// A session-lifetime hold is only bounded if something always releases it, and close() is NOT
+// that something: a local upstream that exits on its own (crash, clean exit, an unreadable
+// frame) has its session reaped by the cleanup goroutine, which deletes the registry entry and
+// calls releaseSessionState WITHOUT ever calling close() — the path releaseSessionState's own
+// doc exists to cover. Releasing the gate anywhere else retained one per such session for the
+// proxy's life, which is exactly the accumulation the registry refcounts to prevent, and a
+// test that called dropDecideGate directly could not see it.
+func TestSessionGate_ReleasedOnEveryTeardownPath(t *testing.T) {
+	t.Parallel()
+	for name, teardown := range map[string]func(*httpSession){
+		// The natural-upstream-exit path: what the cleanup goroutine runs after <-sess.done,
+		// with no close() anywhere in it.
+		"upstream exited on its own": func(s *httpSession) { releaseSessionState(s) },
+		// An explicit teardown (idle reap, DELETE, kill, shutdown) closes first and is reaped
+		// by the same goroutine afterwards.
+		"explicit close then reap": func(s *httpSession) { s.close(0); releaseSessionState(s) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			rt := &UpstreamRoute{decideGates: newAnchorGates(), pdp: pdp.DenyAllPDP{}}
+			sess := newTestSession(&httpSession{id: "sess-x", route: rt})
+			sess.holdDecisionGate()
+			require.Equal(t, 1, rt.decideGates.size())
+			teardown(sess)
+			assert.Zero(t, rt.decideGates.size(),
+				"a gate held for a session's life must be released on every teardown path, not just close()")
+		})
+	}
 }
 
 // TestSessionGate_TaskAnchoredRouteResolvesPerRequest is the negative half: caching is only
@@ -292,8 +343,8 @@ func TestSessionGate_HeldOnceForTheSessionsLife(t *testing.T) {
 func TestSessionGate_TaskAnchoredRouteResolvesPerRequest(t *testing.T) {
 	t.Parallel()
 	rt := &UpstreamRoute{decideGates: newAnchorGates(), taskAnchored: true}
-	a := &httpSession{id: "sess-a", route: rt}
-	b := &httpSession{id: "sess-b", route: rt}
+	a := newTestSession(&httpSession{id: "sess-a", route: rt})
+	b := newTestSession(&httpSession{id: "sess-b", route: rt})
 	a.holdDecisionGate()
 	b.holdDecisionGate()
 	assert.Nil(t, a.decideGate, "a task-anchored route must not pin a per-session gate")
@@ -322,7 +373,7 @@ func TestSessionGate_TaskAnchoredRouteResolvesPerRequest(t *testing.T) {
 func TestSessionGate_UnregisteredSessionStillSerializes(t *testing.T) {
 	t.Parallel()
 	rt := &UpstreamRoute{decideGates: newAnchorGates()}
-	sess := &httpSession{id: "sess-a", route: rt}
+	sess := newTestSession(&httpSession{id: "sess-a", route: rt})
 	require.Nil(t, sess.decideGate)
 
 	end := sess.beginDecisionTurn(context.Background())
