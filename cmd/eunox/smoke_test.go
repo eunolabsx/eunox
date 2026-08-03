@@ -34,7 +34,6 @@ import (
 	"github.com/eunolabs/eunox/internal/audit"
 	"github.com/eunolabs/eunox/internal/config"
 	"github.com/eunolabs/eunox/internal/mcp"
-	"github.com/eunolabs/eunox/internal/pdp"
 	"github.com/eunolabs/eunox/internal/transport"
 	"github.com/eunolabs/eunox/pkg/callcounter"
 	"github.com/eunolabs/eunox/pkg/killswitch"
@@ -92,7 +91,7 @@ upstreams:
 		filepath.Join(dir, "audit.jsonl"),
 		filepath.Join(dir, "audit.key"),
 		0, 0,
-		audit.WithIdentity(pdp.AuditIdentityFromContext),
+		audit.WithIdentity(auditIdentity),
 	)
 	if err != nil {
 		t.Fatalf("audit.Open: %v", err)

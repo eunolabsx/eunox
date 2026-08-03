@@ -397,8 +397,9 @@ func TestSessionGate_TaskAnchoredRouteResolvesPerRequest(t *testing.T) {
 	}
 	end()
 	(<-waiting)()
-	assert.Equal(t, 2, rt.decideGates.size(),
-		"the shared task gate is reclaimed once both are done; the two session gates are held for the sessions' lives")
+	assert.Equal(t, 3, rt.decideGates.size(),
+		"three live gates: each session's own, plus the ONE both sessions resolved for task-42 — "+
+			"which each now holds through its span cache rather than re-minting per call")
 	releaseSessionState(a)
 	releaseSessionState(b)
 	assert.Zero(t, rt.decideGates.size())
@@ -467,7 +468,9 @@ func TestSessionGate_CacheFollowsTheResolvedAnchor(t *testing.T) {
 		t.Fatal("the turn must advance once released")
 	}
 	releaseSessionState(sess)
-	assert.Zero(t, rt.decideGates.size())
+	releaseSessionState(sibling)
+	assert.Zero(t, rt.decideGates.size(),
+		"both sessions spanned onto task-99 and each cached its gate, so both teardowns are what empties the registry")
 }
 
 // TestSessionGate_UnregisteredSessionStillSerializes covers the fallback. The cache is set at

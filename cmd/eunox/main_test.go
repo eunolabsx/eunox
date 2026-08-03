@@ -1347,7 +1347,7 @@ func TestRecordOversizedAgentTaskIDBounded(t *testing.T) {
 	logPath := filepath.Join(dir, "audit.jsonl")
 	keyPath := filepath.Join(dir, "audit.key")
 
-	sink, err := audit.Open(logPath, keyPath, 0, 0, audit.WithIdentity(pdp.AuditIdentityFromContext))
+	sink, err := audit.Open(logPath, keyPath, 0, 0, audit.WithIdentity(auditIdentity))
 	if err != nil {
 		t.Fatalf("audit.Open: %v", err)
 	}

@@ -1124,11 +1124,32 @@ func TestAuditSink_Close_Idempotent(t *testing.T) {
 	}
 }
 
+// testAuditIdentity is this package's stand-in for the caller-identity extractor the BINARY
+// wires into the sink (cmd/eunox/audit_identity.go). It is deliberately a local double rather
+// than a shared helper: the production adapter is the one place that joins internal/pdp to
+// internal/audit, and importing it here would be the transport layer reaching back into the
+// binary. What these tests assert is that the transport threads a request's validated claims
+// into the context the sink reads — not which claim the binary maps onto which field, which
+// cmd/eunox tests directly.
+func testAuditIdentity(ctx context.Context) audit.Identity {
+	c := pdp.JWTClaimsPtr(ctx)
+	if c == nil {
+		return audit.Identity{}
+	}
+	return audit.Identity{
+		AgentID:         c.AgentID,
+		TaskID:          c.TaskID,
+		UserID:          c.Subject,
+		Delegate:        c.Delegation.Delegate(),
+		DelegationDepth: c.Delegation.ActorDepth(),
+	}
+}
+
 func newTempAuditSink(t *testing.T) (sink *audit.Sink, logPath string) {
 	t.Helper()
 	dir := t.TempDir()
 	var err error
-	sink, err = audit.Open(dir+"/audit.jsonl", dir+"/audit.key", 0, 0, audit.WithIdentity(pdp.AuditIdentityFromContext))
+	sink, err = audit.Open(dir+"/audit.jsonl", dir+"/audit.key", 0, 0, audit.WithIdentity(testAuditIdentity))
 	if err != nil {
 		t.Fatalf("openAuditSink: %v", err)
 	}

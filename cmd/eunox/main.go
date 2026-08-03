@@ -954,7 +954,7 @@ func openConfiguredAuditSink(auditLog, auditKeyPath string, auditRotateSize int6
 		warnAuditFlagOverridden("--audit-retain", fmt.Sprintf("%d", auditRetain), "audit.retainRotated", fmt.Sprintf("%d", *cfg.Audit.RetainRotated))
 	}
 	auditRetain = config.ResolveInt(cfg.Audit.RetainRotated, auditRetain)
-	sink, err := audit.Open(auditLogPath, auditKey, auditRotate, auditRetain, audit.WithIdentity(pdp.AuditIdentityFromContext))
+	sink, err := audit.Open(auditLogPath, auditKey, auditRotate, auditRetain, audit.WithIdentity(auditIdentity))
 	if err != nil {
 		if requireAudit {
 			return nil, fmt.Errorf("audit sink could not be opened and --require-audit is not 'off' (it defaults to 'strict'); set a writable audit path or pass --require-audit=off to run unaudited: %w", err)

@@ -84,7 +84,6 @@ import (
 	jose "github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
 
-	"github.com/eunolabs/eunox/internal/audit"
 	"github.com/eunolabs/eunox/pkg/capability"
 	"github.com/eunolabs/eunox/pkg/circuitbreaker"
 	"github.com/eunolabs/eunox/pkg/enforcement"
@@ -197,33 +196,12 @@ func jwtClaimsFromContext(ctx context.Context) (*JWTClaims, bool) {
 	return c, ok && c != nil
 }
 
-// AuditIdentityFromContext returns the caller identity from any validated JWT claims in ctx
-// (the zero Identity when there are none). The user identity is the token subject (sub), the
-// human/principal the agent acts for. Wired into the audit sink via audit.WithIdentity so it
-// stamps IdP identity without importing the JWT layer.
-//
-// The delegation half is what makes a DELEGATED allow attributable. A refusal on that axis
-// already names the hop that blocked it, in the denial's details; an allow carried nothing at
-// all, so a call made by agent-b, delegated from agent-a, acting for a human, produced a record
-// whose only identity was that human's — indistinguishable from one they made directly, which
-// is backwards for the record an investigator most needs to attribute.
-func AuditIdentityFromContext(ctx context.Context) audit.Identity {
-	c, ok := jwtClaimsFromContext(ctx)
-	if !ok {
-		return audit.Identity{}
-	}
-	return audit.Identity{
-		AgentID:  c.AgentID,
-		TaskID:   c.TaskID,
-		UserID:   c.Subject,
-		Delegate: c.Delegation.Delegate(),
-		// len(Actors), not len(Grants): the actors are the identities the token passed
-		// through, which is what a depth means to a reader reconstructing user -> a -> b. A
-		// chain may carry per-hop grants without an act claim, and Delegate() is empty there
-		// too — the two fields agree about what they describe.
-		DelegationDepth: c.Delegation.ActorDepth(),
-	}
-}
+// The caller identity a record is stamped with is deliberately NOT built here, even though
+// this package owns the claims it comes from. audit.WithIdentity exists so the audit writer
+// need not import the JWT/PDP layer, and returning the writer's own struct from here satisfied
+// that by inverting the arrow rather than removing it — every consumer of this package then
+// linked the audit writer, internal/drift included. The adapter lives at the one place that
+// imports both, cmd/eunox/audit_identity.go, over the exported JWTClaimsPtr.
 
 // mcpClaimVersion is the only accepted value for the mcp claim set's "v" field.
 // Other versions (including the legacy "0.1") are rejected so a schema change is

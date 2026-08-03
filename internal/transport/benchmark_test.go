@@ -931,41 +931,66 @@ func BenchmarkAuditRecord(b *testing.B) {
 	})
 }
 
-// BenchmarkDecisionTurn_SessionAnchored measures what a serialized route pays per enforced
-// request when the turn is UNCONTENDED — distinct sessions, so no two goroutines want the same
-// anchor. That is the shape ordinary traffic has, and it is the shape the anchor-keyed registry
-// made expensive: the refcount falls to zero the instant a non-overlapping request finishes, so
-// the steady state was create-insert-lookup-delete on a route-wide mutex per call, with
-// contention scaling against the route's whole request rate rather than against contending
-// anchors.
+// BenchmarkDecisionTurn_Pinned measures what a serialized route pays per enforced request when
+// the turn is UNCONTENDED — distinct sessions, so no two goroutines want the same anchor — and
+// the request resolves the anchor its session pinned at registration. That covers every request
+// on a session-anchored route and every request of a task-anchored session that stays on one
+// task, and it touches no map and no shared lock at all.
 //
-// A session-anchored route's anchor cannot change between its requests, so the session holds one
-// gate for its life and this path touches no map and no route-wide lock. Run both to see the
-// difference the cache makes:
+// Run the three together to see what each tier costs:
 //
 //	go test -run XXX -bench 'BenchmarkDecisionTurn' -cpu=8 ./internal/transport/
-func BenchmarkDecisionTurn_SessionAnchored(b *testing.B) {
-	benchmarkDecisionTurn(b, true)
+func BenchmarkDecisionTurn_Pinned(b *testing.B) {
+	benchmarkDecisionTurn(b, turnPinned)
 }
 
-// BenchmarkDecisionTurn_ResolvedPerRequest is the same measurement without the cache — the path
-// a task-anchored route necessarily takes, since there the anchor comes from each request's own
-// claims and two sessions sharing a task must reach one gate.
-func BenchmarkDecisionTurn_ResolvedPerRequest(b *testing.B) {
-	benchmarkDecisionTurn(b, false)
+// BenchmarkDecisionTurn_SpanCached is the same measurement for a session that has MOVED off the
+// anchor it pinned — an agent runtime multiplexing task-2 … task-n over one long-lived
+// connection, which is the shape task anchoring exists for. It is served from the session's own
+// gate cache: one uncontended session-local mutex, no route-wide lock and no map churn.
+func BenchmarkDecisionTurn_SpanCached(b *testing.B) {
+	benchmarkDecisionTurn(b, turnSpanCached)
 }
 
-func benchmarkDecisionTurn(b *testing.B, cached bool) {
+// BenchmarkDecisionTurn_Registry is the always-correct path both caches sit in front of, and
+// what a spanning session paid on EVERY call before the cache existed: a route-wide mutex, a map
+// insert and a map delete per request, since the refcount falls to zero the instant a
+// non-overlapping request finishes. It is still what a session past its cache's cap takes, so
+// the number is a live cost rather than a historical one.
+func BenchmarkDecisionTurn_Registry(b *testing.B) {
+	benchmarkDecisionTurn(b, turnRegistry)
+}
+
+// Which tier of httpSession.beginTurn the benchmark below exercises.
+type turnTier int
+
+const (
+	turnPinned turnTier = iota
+	turnSpanCached
+	turnRegistry
+)
+
+func benchmarkDecisionTurn(b *testing.B, tier turnTier) {
 	b.Helper()
-	rt := &UpstreamRoute{decideGates: newAnchorGates()}
-	ctx := context.Background()
+	rt := &UpstreamRoute{decideGates: newAnchorGates(), taskAnchored: tier == turnSpanCached}
 	var seq atomic.Uint64
 	b.ReportAllocs()
 	b.RunParallel(func(pb *testing.PB) {
-		sess := &httpSession{id: fmt.Sprintf("sess-%d", seq.Add(1)), route: rt}
-		if cached {
+		n := seq.Add(1)
+		sess := &httpSession{id: fmt.Sprintf("sess-%d", n), route: rt}
+		ctx := context.Background()
+		if tier != turnRegistry {
+			// The pin every registered session takes. On the spanning tier the requests below
+			// resolve a task the pin does not name, so they fall through to the cache.
 			sess.holdDecisionGate()
 			defer sess.dropDecideGate()
+		}
+		if tier == turnSpanCached {
+			ctx = taskCtx(fmt.Sprintf("task-%d", n))
+			defer sess.decideCache.close()
+		} else {
+			// No pin and no cache: every request resolves through the route registry.
+			sess.decideCache.close()
 		}
 		for pb.Next() {
 			sess.beginDecisionTurn(ctx)()

@@ -99,7 +99,11 @@ Within `pkg/`:
 The dependency direction is strictly inward — `cmd` → `internal/` → `pkg/` —
 and never back: nothing in `internal/` or `pkg/` imports the binary. Within the
 `internal/` layer, `internal/mcp` depends only on the stdlib, `internal/audit`
-only on `pkg/capability`, `internal/config` only on `pkg/*` and `gopkg.in/yaml.v3`,
+only on `internal/config` and `pkg/capability`, `internal/pdp` only on
+`pkg/*` (notably *not* on `internal/audit`: the adapter turning a
+request's validated claims into the `audit.Identity` a record stamps is wired by the
+binary, `cmd/eunox/audit_identity.go`, so the `WithIdentity` seam keeps the audit
+writer off the PDP layer without inverting the dependency), `internal/config` only on `pkg/*` and `gopkg.in/yaml.v3`,
 `internal/drift` only on `internal/{config,mcp,pdp}` + `pkg/{capability,enforcement}`
 (it sits above config/mcp/pdp and below transport), and `internal/transport` only
 on `internal/{audit,config,drift,mcp,pdp}` + `pkg/*`. `internal/transport` imports
