@@ -235,6 +235,15 @@ Section conventions:
 
 ### Changed
 
+- **`eunox stats` reports the declassification faults it previously could not see.** It
+  decoded six top-level fields and never read `details` at all, so an approved clear that
+  failed to apply was byte-indistinguishable from an ordinary allow, and a refused
+  declassification from an ordinary `UPSTREAM_ERROR` deny — the benign case had a first-class
+  count and the fault cases had none. It now reads exactly three reserved detail keys (behind
+  a substring pre-filter, so a tools/call allow's argument map is not parsed per record) and
+  reports: failed commits as a called-out `ATTENTION` line, clears that were never applied
+  because the call was refused, and single-use approvals spent.
+
 - **BREAKING (pre-1.0): `schemaVersion: "0.2-draft"` is removed, not aliased.** A manifest
   still declaring the draft string is refused at load, with the supported list naming
   `0.2`. **Migration: change the string to `"0.2"`.** No token was renamed and nothing else
@@ -563,6 +572,38 @@ Section conventions:
   realistic depth-3 manifest, but ~89ms -> ~41ms on a synthetic depth-400/16.8KB one.
 
 ### Removed
+
+- **The declassification undo, and the three `details` keys it wrote.**
+  `PolicyDecisionPoint.RestoreDeclassified`, `Engine.RestoreDeclassifiedLabels` and the
+  transport's compensating restore are deleted: with the clear deferred until after the call
+  succeeds, a refusal below the decision never removed a label, so there is nothing to put
+  back. `details.declassify_reverted`, `details.declassify_orphaned` and
+  `details.declassify_approval_id` are gone with them.
+  **Migration:** SIEM rules and dashboards keyed on those three keys move to
+  `_eunox_declassify_not_applied` (an approved clear that never ran — benign),
+  `_eunox_declassify_commit_failed` (the call succeeded and the clear did not — **this is the
+  alert**, replacing `declassify_orphaned`), and `_eunox_declassify_spent_approval_id` (a
+  single-use grant this call burned, replacing `declassify_approval_id` and now stamped on
+  the allow as well). `eunox stats` counts all three.
+
+- **`EnforceResponse.LabelsCleared`, replaced by `LabelsPendingClear`.** The decision no
+  longer reports what it cleared, because it no longer clears: it reports what the caller is
+  authorized to clear, already intersected against what the anchor was carrying.
+  **Migration:** embedders of `pkg/enforcement` read `LabelsPendingClear` and call
+  `Engine.CommitDeclassification` with that set verbatim once the action has SUCCEEDED; what
+  it returns is what the audit record's `labels_cleared` should carry. A caller that skips
+  the commit never clears a label — fail-closed, and visible as a session that keeps
+  over-blocking. Implementers of `pdp.PolicyDecisionPoint` rename `RestoreDeclassified` to
+  `CommitDeclassified` (`(cleared []string, err error)`); an implementation that holds no
+  flow state must return an ERROR rather than an empty set, so a broken chain is not mistaken
+  for a clear that legitimately moved nothing.
+
+- **The single-key nested-collision wrapper for reserved detail keys.** A caller argument
+  named `_eunox_upstream_error_code` used to produce `{"arguments": {…}, "_eunox_…": …}` — a
+  shape indistinguishable from a tool genuinely called with an argument named `arguments`,
+  which `eunox suggest` had to disambiguate heuristically. Every reserved-namespace argument
+  is now quarantined under `_eunox_reserved_arguments` instead.
+  **Migration:** consumers resolving the old nested shape read the new holder key.
 
 - **The pre-HMAC ("legacy tail") audit compatibility path is gone.** An unsigned
   record is never resumed onto and never exempted from verification: the writer
@@ -958,6 +999,79 @@ Section conventions:
   session establishment forever. All four now share one helper.
 
 ### Security
+
+- **A declassification's label clear is now two-phase, and the second phase runs after the
+  call.** The clear used to commit *inside* the decision, while the transport releases its
+  per-session decision lock immediately afterwards so the slow upstream forward is not held
+  under it. For the whole round trip — bounded only by `--upstream-timeout`, and by nothing
+  at all when that is `0` — every concurrent decision on the session therefore read an
+  already-clean label set, so a sink the taint existed to stop could be **allowed and
+  forwarded while the sanitizing call was still in flight**. The compensating undo that
+  shipped alongside it ran *after* the round trip, i.e. after the window it was meant to
+  cover, so it narrowed the fail-open and could not close it; under `taskAnchoredState` the
+  window was wider still, since the decision lock is per-session and does not span a task key
+  two sessions share. The decision now only **authorizes** the clear and the removal happens
+  once the call has actually run and its redacted response is deliverable, so the labels are
+  never absent until the action that clears them has completed — and that holds without
+  depending on any lock. `labelOutput` and the `sequenceBlock` antecedent still commit inside
+  the decision (extra taint over-blocks), and so does the **burn** of a single-use grant,
+  which is the atomic test that makes `once` mean once.
+
+  Deferring alone would open the mirror race, so two things bound it. **What** to clear is
+  fixed at decision time (the approved labels intersected against what the anchor is carrying,
+  inside the decision's critical section), so a taint a concurrent source read asserts during
+  the round trip is not in the set and cannot be laundered by it. And a declassifying call
+  **keeps the per-session decision turn** until its commit lands, so nothing interleaves
+  between the two phases; every other call still releases before the forward. The cost is
+  head-of-line blocking on that one session for the length of one declassifying call, bounded
+  by `--upstream-timeout` — which a route using `declassify` should therefore not set to `0`.
+
+  The clear now also requires the call to have **succeeded**. A sanitize whose upstream
+  answers with a JSON-RPC error, or with a tool result flagged `isError`, is delivered to the
+  host and is not a transport failure, so it previously reached the commit with nothing
+  sanitized and dropped the taint anyway. It is now recorded exactly as a refused call.
+
+  The residual fails in the safe direction: a commit fault leaves the label in place, so a
+  later sink over-blocks until the operator retries under a new approval. A session is
+  deliberately **not** marked sticky-untrusted for it — there is no longer any state in which
+  the proxy knows a session's taint is missing.
+
+- **A caller's tool argument can no longer forge an operator alert.** eunox's reserved
+  `_eunox_*` detail keys ride an **allow** record whose `details` IS the caller's argument map
+  under `--audit`, and `eunox stats` raises an `ATTENTION` line off one of them. A client
+  sending an argument with that name landed it on the signed tape spelled as a proxy
+  statement. Reserved-namespace arguments are now quarantined under
+  `_eunox_reserved_arguments` before the record is built — preserved for the auditor, never in
+  a position where they read as something eunox asserted. This replaces a single-key nested
+  fallback that covered only the upstream-error code and produced a `{"arguments": {…}}` shape
+  a miner could not distinguish from a tool genuinely called with an argument named
+  `arguments`.
+
+- **A spent single-use approval is now named on the tape.** A `once` grant is burned by the
+  decision that accepts it — including on a clear that turns out to change nothing, since
+  burning only on a clear that moved a label would make the grant replayable by ordering —
+  while `labels_cleared`/`approver`/`approval_id` appear only when the clear *did* change
+  something. A real approval could therefore be spent with nothing anywhere on the signed
+  tape naming it, so an operator could not answer "which of my outstanding one-shot approvals
+  are still live?" — silent in the direction of believing you still hold an approval you do
+  not. Every call that burns one now stamps `details._eunox_declassify_spent_approval_id`, on
+  the allow and on any refusal below the decision alike, kept distinct from `approval_id` so
+  one key never carries two provenances.
+
+- **`internal/config`'s grammar gate no longer fails open on an unclassified token.**
+  `tokenGrammarVersions` — the guard whose whole job is stopping a later revision's predicate
+  from silently widening an earlier one — was consulted with a comma-ok, so a condition or
+  directive missing from it was **admitted under `schemaVersion "0.1"`**, and no test walked
+  `pkg/capability`'s prototype registries against it. It is now paired with an explicit
+  `baseGrammarTokens` table, the two are total over the vocabulary, a token in neither is
+  refused under every revision, and tests walk `KnownConditionTypes()`/`KnownDirectiveTypes()`
+  against both (plus assert every later-revision token is refused under `0.1`).
+
+  The loader's per-directive validation moved to a table keyed by the same registry. Because
+  that dispatches on the discriminator a directive *reports* rather than on its Go type, each
+  entry honours its type assertion instead of discarding it: a value whose report disagrees
+  with its type is refused with a diagnostic, where a discarded `ok` would have dereferenced
+  nil and turned a fail-closed load error into a crash.
 
 - **`redactFields` fails closed on a result whose object keys are ambiguous.** The
   redaction path was the one JSON surface in the codebase without a duplicate-key gate:

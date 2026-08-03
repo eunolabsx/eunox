@@ -320,7 +320,7 @@ func (e *Engine) DeclassifyVerdictFor(ctx context.Context, req *capability.Enfor
 	// exactly that, with a test pinning it. Dereferencing instead would panic a request
 	// goroutine on a refusal path, which is fail-open-via-crash: the connection drops with
 	// no denial and no audit record for the refusal being hardened. The sibling
-	// RestoreDeclassifiedLabels guards the same way for the same reason. nil means "no
+	// CommitDeclassification guards the same way for the same reason. nil means "no
 	// engine, so no checkDeclassify on the unwrapped path either" — there is no verdict
 	// this could be weaker than.
 	if e == nil || req == nil || matched == nil || e.skipFlow {
@@ -413,78 +413,18 @@ func canonicalApprovalTarget(req *capability.EnforceRequest) string {
 	return reqType + ":" + bare
 }
 
-// clearLabels applies an approved declassification: it removes the granted labels from
-// the session's accumulated set. It returns the labels actually removed — the intersection
-// with what the session was carrying — so the audit record reports what CHANGED rather
-// than what was authorized.
-//
-// On a store FAULT it returns that same set ALONGSIDE the error, and that pairing is
-// load-bearing rather than tidy. A Remove can reach the store, delete, and then lose its
-// reply (a timeout, a reset), or a store implementation can remove part of a multi-label
-// set before erroring — so "errored" does not mean "changed nothing". Discarding the set
-// here left the caller's clear-fault arm with nothing to hand restoreLabels, on the one
-// directive the flow layer describes as the only one that can fail OPEN: the call
-// hard-denies and is never forwarded, while the labels it would have cleared stay gone,
-// and the next egress flowLabel would have blocked now passes. The caller treats a
-// non-empty set beside an error as "these MAY have been removed" and re-adds them
-// best-effort; a re-add that itself fails strands a label, which over-blocks and is the
-// safe residual.
-//
-// Reporting the intersection is deliberate. An approval to clear `pii` on a session that
-// never carried it is not an error (the action is permitted and the end state is the one
-// the policy asked for), but recording labels_cleared: ["pii"] would put a declassification
-// that did not happen on the tape, and the tape is the artifact an auditor reconstructs the
-// flow from. A no-op clear records no labels_cleared and no approver.
-//
-// present is the set as it stands AFTER this call's own labelOutput write, not the pre-call
-// snapshot. The distinction only bites for a constraint carrying both directives — which
-// the loader refuses and the PDP no longer synthesizes, but which an embedder of this
-// package can still build — and getting it wrong there meant the clear could not remove a
-// label the same call had just asserted, i.e. assert silently won over clear. Ordering the
-// commit add-then-clear and reading the post-add state is what makes "clear wins"
-// deterministic rather than a claim the code did not honor.
-func (e *Engine) clearLabels(ctx context.Context, req *capability.EnforceRequest, out declassifyOutcome, present []string) ([]string, error) {
-	if len(out.Labels) == 0 || e.skipFlow {
-		// skipFlow means the engine holds no flow state at all, so there is nothing to
-		// clear. It short-circuits here for the same defense-in-depth reason recordLabels
-		// and peekSessionLabels do: the caller derives flow-relevance separately, and a
-		// clear that silently removed nothing would leave the operator believing a label
-		// was dropped.
-		return nil, nil
-	}
-	if e.flowStore == nil {
-		return nil, fmt.Errorf("flow label store not configured; flow labels cannot be cleared")
-	}
-	if req.SessionID == "" {
-		return nil, fmt.Errorf("sessionId is required to clear flow labels")
-	}
-	held := make(map[string]bool, len(present))
-	for _, l := range present {
-		held[l] = true
-	}
-	var removed []string
-	for _, l := range out.Labels {
-		if held[l] {
-			removed = append(removed, l)
-		}
-	}
-	if len(removed) == 0 {
-		return nil, nil
-	}
-	if err := e.flowStore.Remove(ctx, e.flowKey(req), removed...); err != nil {
-		// removed, not nil: the Remove may well have taken effect before the error
-		// surfaced, and the caller cannot restore a set it was never told about.
-		return removed, err
-	}
-	return removed, nil
-}
-
 // burnApproval spends a single-use grant: one atomic admission against the grant's one-slot
 // bucket. It is the ONLY authoritative test — approvalSpent's peek is advisory, so two
 // concurrent callers can both reach here believing the grant is live, and exactly one of them
 // is admitted. The loser gets admitted=false and an error, which the caller turns into a hard
 // deny: over-refusing one of two racing calls is the only outcome that keeps "once" meaning
 // once. A standing grant (empty ledgerID) burns nothing and costs no round trip.
+//
+// It runs inside the DECISION's commit — not with the deferred clear it authorizes — because
+// it is the atomic test that makes "once" mean once, and two callers must not both be able to
+// reach it. That leaves it possible for a grant to be spent by a call whose clear is never
+// committed (a refusal below the decision, a fault at the commit); the response carries a
+// SpentApprovalID for exactly that case, so the tape names the grant an operator must replace.
 //
 // It runs on EVERY commit of an approved single-use declassification, including one whose
 // clear turns out to be a no-op because the anchor was not carrying the labels. That is the
@@ -524,18 +464,30 @@ func (e *Engine) burnApproval(ctx context.Context, ledgerID string) error {
 	return nil
 }
 
-// declassifyRecordFailureDenial is the fail-closed response when an approved
-// declassification cannot be applied. It is a HARD deny for the mirror of
-// labelRecordFailureDenial's reason: forwarding the call while the Remove failed would
-// perform the action AND leave the taint the policy said this action clears, so the next
-// call in the session hits a sink rule the operator believes no longer applies. Over-
-// blocking is the safe direction; the operator retries once the store is reachable.
-func declassifyRecordFailureDenial(requestID, now string, auditOnly bool) capability.EnforceResponse {
-	return denyResponse(requestID, now, auditOnly, nil, capability.DenialInfo{
+// declassifyRecordFailureDenial is the fail-closed response when the declassify leg of the
+// source commit faulted. It is a HARD deny: the soft antecedent-fault deny beside it is
+// downgraded and FORWARDED by an --audit route, and forwarding a call whose one-shot
+// approval was just spent runs the action while the operator's single approval is gone with
+// nothing to show for it.
+//
+// Nothing was cleared on this path — the clear is the caller's second phase and never ran —
+// so the session's flow state is exactly as accurate as before the call. What may have
+// changed is the LEDGER: spentApprovalID names a single-use grant this commit burned before
+// faulting, empty when nothing was spent. It rides the refusal because this is the only
+// record the grant will ever appear on, and an operator reconciling one-shot approvals would
+// otherwise believe it was still live.
+// The id rides the RESPONSE field rather than being stamped into details here: the detail
+// key belongs to the audit layer, and one producer of it — the transport, which stamps it
+// identically on the allow and on every refusal — is what keeps a single spelling and a
+// single provenance on the tape.
+func declassifyRecordFailureDenial(requestID, now string, auditOnly bool, spentApprovalID string) capability.EnforceResponse {
+	resp := denyResponse(requestID, now, auditOnly, nil, capability.DenialInfo{
 		Code:          capability.ErrCodeConditionFailed,
 		ConditionType: declassifyConditionType,
-		Message:       "declassification could not be applied; session flow state is unreliable",
+		Message:       "the declassification leg of this call's state commit failed; the approved clear was not applied and the call is refused",
 		HardDeny:      true,
 		Details:       map[string]interface{}{"flow": true, "phase": "record"},
 	})
+	resp.SpentApprovalID = spentApprovalID
+	return resp
 }

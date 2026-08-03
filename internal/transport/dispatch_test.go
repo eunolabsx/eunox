@@ -1532,7 +1532,7 @@ func TestDispatchToolsCall_CollisionShape_SignsAndVerifies(t *testing.T) {
 // with the injected code unless the transport still guards this exact collision by
 // nesting the caller's arguments under "arguments" — mirroring what the bare
 // "upstream_error_code" name needed before the rename.
-func TestDispatchToolsCall_ArgNamedReservedKeyItself_NestsInsteadOfOverwriting(t *testing.T) {
+func TestDispatchToolsCall_ArgNamedReservedKeyIsQuarantined(t *testing.T) {
 	rec := &fwdRecorder{}
 	dp := newTestManifestPDP(capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}})
 	d := dispatchParams{
@@ -1557,8 +1557,9 @@ func TestDispatchToolsCall_ArgNamedReservedKeyItself_NestsInsteadOfOverwriting(t
 	require.Len(t, rec.records, 1)
 	details := rec.records[0].details
 	require.NotNil(t, details)
-	args, ok := details["arguments"].(map[string]interface{})
-	require.True(t, ok, "a real argument literally named the reserved key must be nested under \"arguments\", got: %#v", details)
-	assert.Equal(t, "my-real-value", args[audit.UpstreamErrorCodeKey], "the host-sent argument value must survive")
-	assert.Equal(t, -32000, details[audit.UpstreamErrorCodeKey], "the upstream's forwarded error code must also be recorded")
+	held, ok := details[audit.ReservedArgumentsKey].(map[string]interface{})
+	require.True(t, ok, "a real argument literally named a reserved key must be quarantined, got: %#v", details)
+	assert.Equal(t, "my-real-value", held[audit.UpstreamErrorCodeKey], "the host-sent argument value must survive")
+	assert.Equal(t, -32000, details[audit.UpstreamErrorCodeKey],
+		"and the top-level reserved namespace carries the proxy's own value, never the caller's")
 }

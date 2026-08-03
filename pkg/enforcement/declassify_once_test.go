@@ -34,13 +34,25 @@ func onceApprovedReq(session, name, approver, id string, labels ...string) *capa
 }
 
 // taintAndClear runs the standard shape: taint the anchor via a labeled source, then present
-// the request at a constraint that declassifies. Returns the declassifying call's response.
-func taintAndClear(t *testing.T, eng *enforcement.Engine, source, declassifying *capability.EnforceRequest) capability.EnforceResponse {
+// the request at a constraint that declassifies, and — on an allow — COMMIT the pending
+// clear, exactly as the transport does once the call has run. Returns the declassifying
+// call's response and what the commit actually cleared.
+//
+// The commit is part of the helper because the decision alone no longer moves a label; a
+// test that skipped it would be asserting against a session the clear never reached. See
+// TestDeclassify_PendingClearIsInvisibleUntilCommitted for why the two phases are separate.
+func taintAndClear(t *testing.T, eng *enforcement.Engine, source, declassifying *capability.EnforceRequest) (decision capability.EnforceResponse, cleared []string) {
 	t.Helper()
 	ctx := context.Background()
 	src := eng.ValidateAction(ctx, source, sourceCaps(source.TargetName, capability.FlowLabelPII))
 	require.Equal(t, capability.DecisionAllow, src.Decision)
-	return eng.ValidateAction(ctx, declassifying, declassifyCaps(declassifying.TargetName, capability.FlowLabelPII))
+	resp := eng.ValidateAction(ctx, declassifying, declassifyCaps(declassifying.TargetName, capability.FlowLabelPII))
+	if resp.Decision != capability.DecisionAllow {
+		return resp, nil
+	}
+	cleared, err := eng.CommitDeclassification(ctx, declassifying, resp.LabelsPendingClear)
+	require.NoError(t, err)
+	return resp, cleared
 }
 
 // TestDeclassifyOnce_SecondPresentationEscalates closes the replay window a scope-only grant leaves open:
@@ -50,12 +62,14 @@ func TestDeclassifyOnce_SecondPresentationEscalates(t *testing.T) {
 	eng := declassifyEngine()
 	ctx := context.Background()
 
-	first := taintAndClear(t, eng,
+	first, cleared := taintAndClear(t, eng,
 		req("s", "read_customer"),
 		onceApprovedReq("s", "publish", "ada@example.com", "apr-1", capability.FlowLabelPII))
 	require.Equal(t, capability.DecisionAllow, first.Decision)
-	require.Equal(t, []string{capability.FlowLabelPII}, first.LabelsCleared)
+	require.Equal(t, []string{capability.FlowLabelPII}, cleared)
 	require.Equal(t, "ada@example.com", first.Approver)
+	require.Equal(t, "apr-1", first.SpentApprovalID,
+		"the burned grant is named on the decision so the tape can carry it")
 
 	// Re-taint, then present the identical grant again.
 	src := eng.ValidateAction(ctx, req("s", "read_customer"), sourceCaps("read_customer", capability.FlowLabelPII))
@@ -80,15 +94,19 @@ func TestDeclassifyOnce_StandingGrantStillReplays(t *testing.T) {
 	eng := declassifyEngine()
 	ctx := context.Background()
 
-	first := taintAndClear(t, eng, req("s", "read_customer"), approvedReq("s", "publish", "ada@example.com", capability.FlowLabelPII))
+	first, _ := taintAndClear(t, eng, req("s", "read_customer"), approvedReq("s", "publish", "ada@example.com", capability.FlowLabelPII))
 	require.Equal(t, capability.DecisionAllow, first.Decision)
+	require.Empty(t, first.SpentApprovalID, "a standing grant spends nothing, so there is nothing to reconcile")
 
 	require.Equal(t, capability.DecisionAllow,
 		eng.ValidateAction(ctx, req("s", "read_customer"), sourceCaps("read_customer", capability.FlowLabelPII)).Decision)
-	again := eng.ValidateAction(ctx, approvedReq("s", "publish", "ada@example.com", capability.FlowLabelPII),
-		declassifyCaps("publish", capability.FlowLabelPII))
+	replayReq := approvedReq("s", "publish", "ada@example.com", capability.FlowLabelPII)
+	again := eng.ValidateAction(ctx, replayReq, declassifyCaps("publish", capability.FlowLabelPII))
 	assert.Equal(t, capability.DecisionAllow, again.Decision)
-	assert.Equal(t, []string{capability.FlowLabelPII}, again.LabelsCleared)
+	assert.Equal(t, []string{capability.FlowLabelPII}, again.LabelsPendingClear)
+	cleared, err := eng.CommitDeclassification(ctx, replayReq, again.LabelsPendingClear)
+	require.NoError(t, err)
+	assert.Equal(t, []string{capability.FlowLabelPII}, cleared)
 }
 
 // TestDeclassifyOnce_BurnsEvenWhenTheClearIsANoOp is the ordering property that makes the
@@ -98,13 +116,18 @@ func TestDeclassifyOnce_BurnsEvenWhenTheClearIsANoOp(t *testing.T) {
 	eng := declassifyEngine()
 	ctx := context.Background()
 
-	// Clean anchor: allowed, clears nothing, records no approver — and still spends the grant.
-	noop := eng.ValidateAction(ctx,
-		onceApprovedReq("s", "publish", "ada@example.com", "apr-1", capability.FlowLabelPII),
-		declassifyCaps("publish", capability.FlowLabelPII))
+	// Clean anchor: allowed, clears nothing — and still spends the grant.
+	noopReq := onceApprovedReq("s", "publish", "ada@example.com", "apr-1", capability.FlowLabelPII)
+	noop := eng.ValidateAction(ctx, noopReq, declassifyCaps("publish", capability.FlowLabelPII))
 	require.Equal(t, capability.DecisionAllow, noop.Decision)
-	require.Empty(t, noop.LabelsCleared, "nothing was carried, so nothing was cleared")
-	require.Empty(t, noop.Approver, "a no-op clear must not put a declassification that did not happen on the tape")
+	noopCleared, err := eng.CommitDeclassification(ctx, noopReq, noop.LabelsPendingClear)
+	require.NoError(t, err)
+	require.Empty(t, noopCleared, "nothing was carried, so nothing was cleared")
+	// The grant is spent all the same, and the decision says so — which is the ONLY thing on
+	// the tape naming it, since the labels_cleared/approver/approval_id triple rides on a
+	// clear that changed something and this one did not.
+	require.Equal(t, "apr-1", noop.SpentApprovalID,
+		"a single-use grant spent on a no-op clear must still be reconcilable from the tape")
 
 	require.Equal(t, capability.DecisionAllow,
 		eng.ValidateAction(ctx, req("s", "read_customer"), sourceCaps("read_customer", capability.FlowLabelPII)).Decision)
@@ -385,4 +408,35 @@ func TestDeclassifyVerdictFor_CarriesTheSessionsLabels(t *testing.T) {
 	assert.Equal(t, []string{capability.FlowLabelPII}, verdict.CarriedLabels)
 	assert.Equal(t, []string{capability.FlowLabelPII}, verdict.Denial.Details["carried_labels"])
 	assert.Equal(t, true, verdict.Denial.Details["flow"])
+}
+
+// TestDeclassifyOnce_BurnedGrantIsNamedWhenTheCommitFaults closes the one path on which a
+// single-use grant was spent and nothing anywhere named it.
+//
+// burnApproval runs inside the decision's commit — deliberately, because it is the atomic
+// test that makes "once" mean once and two callers must not both reach it. The antecedent
+// write that follows can then fault, which hard-denies: the call never runs, the clear is
+// never resolved (so the refusal carries no LabelsPendingClear), and the grant is spent for
+// good, since there is no un-burn. Without the id on that refusal an operator reconciling
+// one-shot approvals would believe this one was still live, and every later presentation
+// would escalate with nothing on the tape explaining why.
+func TestDeclassifyOnce_BurnedGrantIsNamedWhenTheCommitFaults(t *testing.T) {
+	eng := enforcement.New(
+		// AdmitAll succeeds (the burn lands) and the antecedent write then faults.
+		enforcement.WithCallCounter(&faultyCounter{inner: callcounter.NewInMemory(), failIncrement: true}),
+		enforcement.WithFlowLabelStore(flowlabelstore.NewInMemory()),
+	)
+	caps := declassifyCaps("publish", capability.FlowLabelPII)
+	caps[0].Conditions = []capability.Condition{capability.SequenceBlockCondition{AfterTools: []string{"tool:read_customer"}}}
+
+	resp := eng.ValidateAction(context.Background(),
+		onceApprovedReq("s", "publish", "ada@example.com", "apr-1", capability.FlowLabelPII), caps)
+
+	require.Equal(t, capability.DecisionDeny, resp.Decision)
+	require.NotNil(t, resp.Denial)
+	assert.True(t, resp.Denial.HardDeny,
+		"a call whose one-shot approval was just spent must not be downgraded and forwarded by an --audit route")
+	assert.Equal(t, "apr-1", resp.SpentApprovalID,
+		"the grant is burned and the call never ran, so this refusal is the only record that can name it")
+	assert.Empty(t, resp.LabelsPendingClear, "the clear was never resolved, so nothing is pending")
 }

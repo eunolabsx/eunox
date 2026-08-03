@@ -1049,13 +1049,11 @@ func validateLocalManifest(m *LocalManifest) error {
 		if err := validateEffectContract(i, c.Effect); err != nil {
 			return err
 		}
-		// Validate directives. redactFields mutates the tools/call RESPONSE and so
-		// applies only to tool: targets (a directive that never applies is a fail-open
-		// leak plus a false "discharged" audit record). labelOutput is different: it is
-		// an enforce-time state directive that records flow labels on allow, not a
-		// response mutation, so it is valid on any source target and is staged behind the
-		// flow+effect draft schemaVersion. A null directive is rejected fail-closed like
-		// a null condition.
+		// Validate directives. Each type's own rules live in directiveValidators, keyed by
+		// the same discriminator pkg/capability's registry uses; the grammar-revision gate
+		// is separate (checkTokenGrammarVersion), so a per-type validator carries no
+		// version check and cannot bypass one by omitting it. A null directive is rejected
+		// fail-closed like a null condition.
 		for j, dir := range c.Directives {
 			if dir == nil {
 				return fmt.Errorf("capability at index %d, directive %d: a null directive is not permitted; every directives entry must be a typed directive object", i, j)
@@ -1067,46 +1065,26 @@ func validateLocalManifest(m *LocalManifest) error {
 			if capability.IsTypedNil(dir) {
 				return fmt.Errorf("capability at index %d, directive %d: a typed-nil directive is not permitted; every directives entry must be a typed directive object", i, j)
 			}
-			// Each case pairs a directive's value and pointer decode forms and
-			// re-normalizes to a pointer via AsValueOrPointer: the case types make that
-			// assertion infallible and the typed-nil guard above makes the deref safe, so
-			// the two logical directives need two arms, not four. An unrecognized directive
-			// type hits the fail-closed default — the YAML/JSON loader only produces the two
-			// known types (and rejects unknowns at decode), so this is defense in depth
-			// against a programmatically built manifest, not a manifest-author hole.
-			switch dir.(type) {
-			case capability.RedactFieldsDirective, *capability.RedactFieldsDirective:
-				d, _ := capability.AsValueOrPointer[capability.RedactFieldsDirective](dir)
-				if err := requireResponseDirectiveTarget(i, c.Target, targetType); err != nil {
-					return err
-				}
-				if err := validateRedactFields(i, j, d.Fields); err != nil {
-					return err
-				}
-			case capability.LabelOutputDirective, *capability.LabelOutputDirective:
-				d, _ := capability.AsValueOrPointer[capability.LabelOutputDirective](dir)
-				if err := requireSourceDirectiveTarget(i, c.Target, targetType, capability.DirectiveTypeLabelOutput); err != nil {
-					return err
-				}
-				if err := validateLabelOutput(i, j, d.Labels); err != nil {
-					return err
-				}
-			case capability.DeclassifyDirective, *capability.DeclassifyDirective:
-				d, _ := capability.AsValueOrPointer[capability.DeclassifyDirective](dir)
-				// Same target restriction as labelOutput, for the mirror reason: a
-				// declassification is a TRANSFORM — the sanitize/redact/review step whose
-				// completion a human approved — so it sits where data is produced or read.
-				// A prompt: fetch or the sampling opt-in is an egress the agent drives, and
-				// clearing a label at an egress launders it at exactly the point the flow
-				// layer exists to gate.
-				if err := requireSourceDirectiveTarget(i, c.Target, targetType, capability.DirectiveTypeDeclassify); err != nil {
-					return err
-				}
-				if err := validateDeclassify(i, j, d.Labels); err != nil {
-					return err
-				}
-			default:
-				return fmt.Errorf("capability at index %d, directive %d: unrecognized directive type %q; the only supported directives are redactFields, labelOutput and declassify", i, j, dir.DirectiveType())
+			// Dispatched off the directive's own DISCRIMINATOR through directiveValidators,
+			// which is keyed by the same strings capability's directivePrototypes registry
+			// holds — not off a type switch whose arms and whose "the only supported
+			// directives are…" default message were two more hand-maintained mirrors of that
+			// registry. A directive type present in the registry and missing here is caught
+			// by the completeness test rather than shipping a token every manifest carrying
+			// it is refused for, with a message naming three directives that are not the
+			// problem.
+			validate, known := directiveValidators[dir.DirectiveType()]
+			if !known {
+				// Fail closed, and enumerate FROM the registry: a literal list here is a
+				// third mirror, and one whose staleness an author reading the message has no
+				// way to detect. Reachable only for a programmatically built manifest — the
+				// YAML/JSON loader instantiates from the registry and rejects an unknown type
+				// at decode — so this is defense in depth, not a manifest-author hole.
+				return fmt.Errorf("capability at index %d, directive %d: unrecognized directive type %q; the supported directives are %s",
+					i, j, dir.DirectiveType(), strings.Join(capability.KnownDirectiveTypes(), ", "))
+			}
+			if err := validate(i, j, c.Target, targetType, dir); err != nil {
+				return err
 			}
 		}
 		// Cross-directive coherence for the flow pair, checked once per constraint rather
@@ -1798,14 +1776,123 @@ func validateSequenceBlock(i, j int, v *capability.SequenceBlockCondition) error
 	return nil
 }
 
+// directiveValidator is the per-type validation one directive needs: its target
+// restriction and its own field checks. i/j are the capability and directive indices for the
+// error message, target/targetType the constraint's target, and dir the (non-nil,
+// non-typed-nil — validateLocalManifest guarantees both before dispatch) directive itself.
+type directiveValidator func(i, j int, target string, targetType capability.TargetType, dir capability.Directive) error
+
+// directiveValidators is the manifest loader's per-directive validation, keyed by the SAME
+// discriminator strings pkg/capability's directivePrototypes registry holds.
+//
+// It replaces a type switch whose arms — and whose default-arm message, which spelled out
+// "redactFields, labelOutput and declassify" — were two more hand-maintained mirrors of that
+// registry, one package over from the ones the registry already absorbed. A fourth directive
+// added to the registry and forgotten here was refused at load with a message listing three
+// directives that were not the problem: fail-closed, but a diagnostic pointing away from the
+// fault. A map keyed by discriminator makes that a missing key the completeness test names
+// (see the directive-coverage test), and makes the unknown-type message derive from
+// KnownDirectiveTypes rather than restate it.
+//
+// Each entry goes through typedDirective, which honours AsValueOrPointer's ok. Dispatch is
+// on the discriminator the directive REPORTS, not on its Go type, so a value whose
+// DirectiveType() disagrees with its concrete type selects an entry the assertion then
+// fails — and a discarded ok there is a nil dereference, i.e. a fail-closed load error
+// turned into a crash. The type switch this replaced could not reach that state; the
+// adapter is what restores the property.
+var directiveValidators = map[string]directiveValidator{
+	capability.DirectiveTypeRedactFields: typedDirective(func(i, j int, target string, targetType capability.TargetType, d *capability.RedactFieldsDirective) error {
+		// redactFields mutates the tools/call RESPONSE, so it applies only to tool: targets:
+		// a directive that never applies is a fail-open leak plus a false "discharged" audit
+		// record.
+		if err := requireResponseDirectiveTarget(i, target, targetType); err != nil {
+			return err
+		}
+		return validateRedactFields(i, j, d.Fields)
+	}),
+	capability.DirectiveTypeLabelOutput: typedDirective(func(i, j int, target string, targetType capability.TargetType, d *capability.LabelOutputDirective) error {
+		// An enforce-time STATE directive rather than a response mutation, so it is valid on
+		// any flow SOURCE target.
+		if err := requireSourceDirectiveTarget(i, target, targetType, capability.DirectiveTypeLabelOutput); err != nil {
+			return err
+		}
+		return validateLabelOutput(i, j, d.Labels)
+	}),
+	capability.DirectiveTypeDeclassify: typedDirective(func(i, j int, target string, targetType capability.TargetType, d *capability.DeclassifyDirective) error {
+		// Same target restriction as labelOutput, for the mirror reason: a declassification
+		// is a TRANSFORM — the sanitize/redact/review step whose completion a human approved
+		// — so it sits where data is produced or read. A prompt: fetch or the sampling opt-in
+		// is an egress the agent drives, and clearing a label at an egress launders it at
+		// exactly the point the flow layer exists to gate.
+		if err := requireSourceDirectiveTarget(i, target, targetType, capability.DirectiveTypeDeclassify); err != nil {
+			return err
+		}
+		return validateDeclassify(i, j, d.Labels)
+	}),
+}
+
+// typedDirective adapts a per-type validator to the discriminator-keyed table, normalizing
+// the value and pointer decode forms to *T and REPORTING a type that does not match the
+// discriminator it was filed under rather than dereferencing nil.
+//
+// It is the directive twin of validateTypedCondition, and it exists for a reason that only
+// appeared when dispatch moved off the Go type: capability.Directive is an exported
+// interface whose DirectiveType() is self-reported, so a programmatically built manifest —
+// exactly the input the fail-closed arm below exists for, reachable through the exported
+// MergeManifests — can present a directive claiming "redactFields" that is not one. Under
+// the old type switch that landed in the default arm and returned an error; keyed dispatch
+// sends it here, and a discarded ok would panic the loader instead.
+func typedDirective[T any](check func(i, j int, target string, targetType capability.TargetType, d *T) error) directiveValidator {
+	return func(i, j int, target string, targetType capability.TargetType, dir capability.Directive) error {
+		d, ok := capability.AsValueOrPointer[T](dir)
+		if !ok || d == nil {
+			return fmt.Errorf("capability at index %d, directive %d: directive reports type %q but is not one; refusing rather than validating it as a type it is not",
+				i, j, dir.DirectiveType())
+		}
+		return check(i, j, target, targetType, d)
+	}
+}
+
+// baseGrammarTokens names every condition and directive discriminator that is part of the
+// BASE published grammar ("0.1") and therefore needs no tokenGrammarVersions entry.
+//
+// It exists so the two tables are TOTAL over the vocabulary rather than one table plus an
+// implicit default. tokenGrammarVersions on its own is consulted with a comma-ok: a token
+// absent from it was silently admitted under every revision, which is the fail-OPEN
+// direction on the one gate whose entire job is stopping a later revision's predicate from
+// widening an earlier one. A new token now has to be classified into one of these two maps
+// to load at all, and the completeness test names it if it is in neither.
+//
+// Entries here are a statement about the PUBLISHED grammar, not a convenience: adding a
+// newly-introduced token to this map instead of to tokenGrammarVersions is precisely the
+// widening the gate prevents, so it takes a deliberate edit that reads as what it is.
+var baseGrammarTokens = map[string]bool{
+	capability.ConditionTypeTimeWindow:        true,
+	capability.ConditionTypeIPRange:           true,
+	capability.ConditionTypeAllowedOperations: true,
+	capability.ConditionTypeAllowedExtensions: true,
+	capability.ConditionTypeAllowedTables:     true,
+	capability.ConditionTypeMaxCalls:          true,
+	capability.ConditionTypeRecipientDomain:   true,
+	capability.ConditionTypeAllowedValues:     true,
+	capability.ConditionTypeSequenceBlock:     true,
+	capability.ConditionTypePolicy:            true,
+	capability.ConditionTypeCustom:            true,
+	capability.DirectiveTypeRedactFields:      true,
+}
+
 // tokenGrammarVersions maps a condition/directive discriminator to the manifest
-// schemaVersion that INTRODUCED it. A token absent from this map is part of the base
-// published grammar ("0.1") and needs no gate. It is the single source of the
-// closed-grammar invariant across revisions: a token is inert unless the manifest
-// declares the revision that introduced it, so adding a future token is one map entry —
-// not a gate call threaded through each per-type validation case, which a contributor
-// could forget, silently admitting the token under an older revision (the fail-open this
-// gate exists to prevent).
+// schemaVersion that INTRODUCED it. It is one half of a TOTAL classification: a token
+// belongs here or in baseGrammarTokens, and one in neither is refused under every revision
+// (see checkTokenRevision). Absence used to mean "part of the base grammar", which is the
+// fail-OPEN reading — a token a contributor forgot to classify was silently admitted under
+// "0.1", on the one gate whose whole job is stopping a later revision's predicate from
+// widening an earlier one.
+//
+// It is the single source of the closed-grammar invariant across revisions: a token is
+// inert unless the manifest declares the revision that introduced it, so adding a future
+// token is one map entry — not a gate call threaded through each per-type validation case,
+// which a contributor could forget.
 //
 // A token requires its EXACT introducing version. That is deliberately not "this version
 // or later": there are two published revisions, so "later" has no members yet, and
@@ -1845,13 +1932,13 @@ func checkTokenGrammarVersion(m *LocalManifest) error {
 			return tokenGrammarVersionErr(i, "the effect contract block", ManifestSchemaVersion02, declared)
 		}
 		for _, cond := range c.Conditions {
-			if req, gated := tokenGrammarVersions[cond.ConditionType()]; gated && declared != req {
-				return tokenGrammarVersionErr(i, "the "+cond.ConditionType()+" condition", req, declared)
+			if err := checkTokenRevision(i, cond.ConditionType(), "condition", declared); err != nil {
+				return err
 			}
 		}
 		for _, dir := range c.Directives {
-			if req, gated := tokenGrammarVersions[dir.DirectiveType()]; gated && declared != req {
-				return tokenGrammarVersionErr(i, "the "+dir.DirectiveType()+" directive", req, declared)
+			if err := checkTokenRevision(i, dir.DirectiveType(), "directive", declared); err != nil {
+				return err
 			}
 		}
 		// Task-context variables are the batch's third non-discriminator token: they are
@@ -1890,6 +1977,34 @@ func checkTaskVarGrammarVersion(i int, c *capability.Constraint, declared string
 		}
 	}
 	return nil
+}
+
+// checkTokenRevision decides whether the declared revision admits one token, given the two
+// tables that between them classify the whole vocabulary: tokenGrammarVersions (introduced
+// by a later revision, admitted only under that revision) and baseGrammarTokens (part of the
+// base "0.1" grammar, admitted under every revision).
+//
+// A token in NEITHER is refused, under every revision. That is the fail-closed reading of a
+// gate this build cannot classify, and it reverses the direction the comma-ok lookup used to
+// fail in: a token missing from tokenGrammarVersions was silently admitted under "0.1", so
+// the one guard whose job is stopping a later revision's predicate from widening an earlier
+// one could be defeated by forgetting a map entry — with nothing anywhere reporting it. The
+// message says what to do, because the only way to reach it is a contributor adding a
+// discriminator to pkg/capability's registry without classifying it here.
+//
+// kind is "condition" or "directive", for the message only.
+func checkTokenRevision(i int, token, kind, declared string) error {
+	if req, gated := tokenGrammarVersions[token]; gated {
+		if declared != req {
+			return tokenGrammarVersionErr(i, "the "+token+" "+kind, req, declared)
+		}
+		return nil
+	}
+	if baseGrammarTokens[token] {
+		return nil
+	}
+	return fmt.Errorf("capability at index %d: the %s %s is not classified into any published schemaVersion, so this build cannot decide whether schemaVersion %q admits it; refusing rather than guessing (a new token needs an entry in internal/config's tokenGrammarVersions, or in baseGrammarTokens if it is part of the base grammar)",
+		i, token, kind, declared)
 }
 
 // tokenGrammarVersionErr builds the fail-closed rejection for a token used under a

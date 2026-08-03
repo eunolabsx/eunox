@@ -1204,34 +1204,34 @@ func TestMineArgs_ReservedUpstreamErrorCodeKey(t *testing.T) {
 		}
 	})
 
-	t.Run("nested collision shape mines the real inner arguments", func(t *testing.T) {
-		// The residual rare collision: a real tool argument is literally named the
-		// reserved key's own string, so the transport nests the caller's args under
-		// "arguments" (dispatch.go's dispatchToolsCall collide branch).
+	t.Run("a quarantined reserved argument is neither mined nor misread", func(t *testing.T) {
+		// The collision the transport now resolves at the source: a real tool argument
+		// literally named the reserved key's own string is moved under
+		// audit.ReservedArgumentsKey before the record is built, so the top-level reserved
+		// namespace belongs to eunox alone. The holder is itself reserved, so mining skips
+		// it rather than drafting "_eunox_reserved_arguments" as a tool argument.
 		tgt := &observedTarget{namespace: "tool", name: "fetch", args: map[string]*observedArg{}}
 		mineArgs(tgt, map[string]interface{}{
-			"arguments": map[string]interface{}{reserved: "user-value"},
-			reserved:    500,
+			"url":                      "https://x",
+			audit.ReservedArgumentsKey: map[string]interface{}{reserved: "user-value"},
+			reserved:                   500,
 		}, true, suggestMaxValuesDefault)
-		if _, ok := tgt.args["arguments"]; ok {
-			t.Errorf("the nested wrapper key \"arguments\" must not be mined as an argument")
+		if _, ok := tgt.args[audit.ReservedArgumentsKey]; ok {
+			t.Errorf("the quarantine holder must not be mined as an argument")
 		}
-		if a := tgt.args[reserved]; a == nil || a.calls != 1 {
-			t.Errorf("the genuine inner argument %q must be mined; got %+v", reserved, a)
+		if _, ok := tgt.args[reserved]; ok {
+			t.Errorf("the reserved key %q must not be mined as an argument", reserved)
+		}
+		if a := tgt.args["url"]; a == nil || a.calls != 1 {
+			t.Errorf("the real argument must still be mined; got %+v", a)
 		}
 	})
 
-	t.Run("flat merge over an object-valued argument named arguments is not misread as the nested wrapper", func(t *testing.T) {
-		// NOT the nested-collision shape: the ORDINARY flat merge for a call whose one
-		// real argument is a map named "arguments" and whose upstream then errored.
-		// Structurally identical to the true nested wrapper EXCEPT the inner map does
-		// not itself carry the reserved key — the fact that disambiguates the two.
-		//
-		// Mining must read it flat: "arguments" is the one real argument and the
-		// reserved key is still the transport's injected code, not caller data. The
-		// accepted cost of preferring this (far likelier) reading is that a call
-		// genuinely carrying a top-level argument literally named the reserved key's
-		// string drops that one argument — the vanishingly rare case.
+	t.Run("an object-valued argument named arguments is mined flat", func(t *testing.T) {
+		// This shape used to be ambiguous: the transport's old single-key collision guard
+		// produced {"arguments": {…}, reserved: …} too, so mining had to disambiguate by
+		// inspecting the inner map. With the quarantine there is one reading — "arguments"
+		// is an ordinary argument that happens to hold an object — and no heuristic.
 		tgt := &observedTarget{namespace: "tool", name: "fetch", args: map[string]*observedArg{}}
 		mineArgs(tgt, map[string]interface{}{
 			"arguments": map[string]interface{}{"depth": float64(3)},

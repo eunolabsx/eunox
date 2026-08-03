@@ -118,34 +118,40 @@ type PolicyDecisionPoint interface {
 	// call it with a detached, bounded context.
 	ReleaseSession(ctx context.Context, sessionID string)
 
-	// RestoreDeclassified puts back the flow labels an approved declassification cleared,
-	// for a call the TRANSPORT then refused and never forwarded. labels is the decision's
-	// LabelsCleared — what actually changed, not what was authorized.
+	// CommitDeclassified applies an approved declassification's label clear, for a call the
+	// decision AUTHORIZED and the transport has now actually performed. labels is the
+	// decision's LabelsPendingClear — what the approval authorized, not what will
+	// necessarily change.
 	//
-	// It is on this interface because the clear and the refusal sit on opposite sides of it.
-	// The clear commits inside Decide; the transport's own gates run afterwards, and three
-	// of them refuse without ever contacting the upstream (--require-audit=strict, an
-	// upstream transport failure, a redaction failure). Each leaves the sanitizing action
-	// unperformed while the taint it was authorized to clear is gone, so the next egress
-	// flowLabel would have blocked passes — a call that never ran has untainted the session.
+	// It is on this interface because the two halves sit on opposite sides of it. Decide
+	// resolves the approval, burns a single-use grant, and hands back the labels to clear;
+	// only the transport knows whether the call went on to reach the upstream and return a
+	// deliverable response. Applying the clear inside Decide instead made the labels
+	// invisible to every concurrent decision for the whole upstream round trip — a sink the
+	// taint existed to stop could be allowed and forwarded while the sanitizing call was
+	// still in flight — and no compensating undo could close that, because the window opened
+	// before the undo could possibly run.
 	//
-	// labelOutput commits before the forward too, and safely: extra taint over-blocks. This
-	// is the opposite direction, which is why it alone needs an undo reachable from here.
+	// It follows that the transport must call this ONLY on the success path. Every refusal
+	// below the decision (--require-audit=strict, an upstream transport failure, a redaction
+	// failure) simply does not call it, and the labels were never gone.
 	//
-	// Two return values, and the bool is the load-bearing one. The caller stamps a SIGNED
-	// audit assertion about the session's state, so an implementation that DECLINES must not
-	// be mistaken for one that restored: report restored=false with a nil error rather than
-	// a bare nil, or the tape claims a revert that never happened. Only an implementation
-	// that actually wrote (or that had nothing to write, len(labels) == 0) may report true.
-	// An error is the fail-open residual the record has to carry.
+	// It returns what actually CHANGED — the intersection with what the anchor is carrying at
+	// commit time — because the caller stamps that onto the tape as a SIGNED assertion, and
+	// an approval to clear a label the session never held is a permitted no-op that must
+	// record no labels_cleared and no approver. An implementation that holds no flow state
+	// reports (nil, nil): it cleared nothing, which is the truth and is the safe state.
+	// An error means the clear may have partly landed; the labels that stay over-block a
+	// later sink, which is the fail-closed residual.
 	//
 	// CONTEXT CONTRACT: the caller must preserve the request's validated claims. An
-	// implementation resolves the state anchor from them (a task-anchored clear removed the
-	// labels under the TASK key), so a context detached with context.Background() restores
-	// under the wrong key — leaving the task untainted while reporting success. Detach
-	// cancellation only (context.WithoutCancel), never the values. This differs from
-	// ReleaseSession above, which owns only session-anchored state and may be fully detached.
-	RestoreDeclassified(ctx context.Context, sessionID string, labels []string) (restored bool, err error)
+	// implementation resolves the state anchor from them (a task-anchored call is accounted
+	// against the TASK key), so a context detached with context.Background() would clear the
+	// wrong key — leaving the task tainted, dropping a label the session never asked to drop,
+	// and reporting success. Detach cancellation only (context.WithoutCancel), never the
+	// values. This differs from ReleaseSession above, which owns only session-anchored state
+	// and may be fully detached.
+	CommitDeclassified(ctx context.Context, sessionID string, labels []string) (cleared []string, err error)
 
 	// HardenRefusal re-stamps a refusal that some OTHER layer produced with the verdicts
 	// THIS PDP would have contributed had it been consulted, and returns the composed
@@ -557,12 +563,17 @@ func (AlwaysAllowPDP) RecordObservedToolHashes(_ context.Context, result json.Ra
 // flow state to release.
 func (AlwaysAllowPDP) ReleaseSession(_ context.Context, _ string) {}
 
-// RestoreDeclassified is a no-op: a wiretap PDP never clears a flow label, so no decision
-// it returns can carry a LabelsCleared for the transport to undo. It reports restored only
-// for the empty set — reaching it with labels in hand means some other layer cleared them,
-// and this PDP has no store to put them back into.
-func (AlwaysAllowPDP) RestoreDeclassified(_ context.Context, _ string, labels []string) (bool, error) {
-	return len(labels) == 0, nil
+// CommitDeclassified never clears anything: a wiretap PDP holds no flow store and
+// authorizes no declassification, so no decision it returns can carry a LabelsPendingClear.
+//
+// Reaching it WITH labels therefore means some other layer authorized a clear this one
+// cannot perform, and that is reported as an error rather than as a silent empty result.
+// The two are different facts, and the caller writes a signed record from the difference: an
+// empty result means "the clear ran and moved nothing", which for a wiring fault would put
+// an ordinary allow on the tape for a policy whose sanitizing step never takes effect. The
+// old contract carried a `restored bool` for exactly this distinction.
+func (AlwaysAllowPDP) CommitDeclassified(_ context.Context, _ string, labels []string) ([]string, error) {
+	return nil, noFlowStateErr(labels, "audit-mode (wiretap) decision point")
 }
 
 // HardenRefusal returns the refusal unchanged: a wiretap PDP declares no pin, no ceiling
@@ -666,10 +677,25 @@ func (DenyAllPDP) RecordObservedToolHashes(_ context.Context, result json.RawMes
 // ReleaseSession is a no-op: the fail-closed default holds no per-session flow state.
 func (DenyAllPDP) ReleaseSession(_ context.Context, _ string) {}
 
-// RestoreDeclassified is a no-op: the fail-closed default allows nothing, so no decision it
-// returns can have cleared a flow label. Same reporting rule as AlwaysAllowPDP's.
-func (DenyAllPDP) RestoreDeclassified(_ context.Context, _ string, labels []string) (bool, error) {
-	return len(labels) == 0, nil
+// CommitDeclassified never clears anything: the fail-closed default allows nothing, so no
+// decision it returns can authorize a clear. Same reporting rule as AlwaysAllowPDP's.
+func (DenyAllPDP) CommitDeclassified(_ context.Context, _ string, labels []string) ([]string, error) {
+	return nil, noFlowStateErr(labels, "deny-all (no policy) decision point")
+}
+
+// noFlowStateErr builds the fault a decision point returns when it is handed labels to clear
+// and holds no flow state to clear them from, or nil for the empty set (where "cleared
+// nothing" and "nothing to clear" are genuinely the same state).
+//
+// It exists so the several no-op implementations report identically. Each of them means the
+// same thing — the policy's sanitizing step will not take effect on this path — and a silent
+// empty result would make that indistinguishable from an approved clear whose labels the
+// anchor was not carrying, which is a routine, healthy outcome.
+func noFlowStateErr(labels []string, who string) error {
+	if len(labels) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s holds no flow-label state, so the approved declassification of %v cannot be applied (wiring fault, not a store failure)", who, labels)
 }
 
 // HardenRefusal returns the refusal unchanged: the "no policy" default declares no pin, no
@@ -1040,29 +1066,28 @@ func (p *ManifestPDP) ReleaseSession(ctx context.Context, sessionID string) {
 	_ = p.engine.ClearSessionLabels(ctx, sessionID)
 }
 
-// RestoreDeclassified puts back the labels an approved declassification cleared, for a call
-// the transport refused after the decision committed the clear. See the interface for why
-// the undo has to be reachable from there at all.
+// CommitDeclassified applies the clear an approved declassification authorized, for a call
+// the transport has now performed. See the interface for why the commit has to be reachable
+// from there at all.
 //
-// The claims come from the context so the request resolves to the SAME anchor the clear
-// used: under task anchoring the labels were removed from the task's key, and restoring
-// them under the session's would both leave the task untainted and strand a duplicate.
-// Every other field of the request is irrelevant here — RestoreDeclassifiedLabels is a
-// keyed Add and evaluates no policy — so this deliberately does not rebuild the decision's
-// target or arguments.
-func (p *ManifestPDP) RestoreDeclassified(ctx context.Context, sessionID string, labels []string) (bool, error) {
-	// p == nil covers a typed-nil (*ManifestPDP)(nil) reaching the transport's restorer
+// The claims come from the context so the request resolves to the SAME anchor the decision
+// was accounted against: under task anchoring the call's state lives on the task's key, and
+// clearing the session's would leave the task tainted while dropping a label the session
+// never asked to drop. Every other field of the request is irrelevant here —
+// CommitDeclassification is a keyed read-then-Remove and evaluates no policy — so this
+// deliberately does not rebuild the decision's target or arguments.
+func (p *ManifestPDP) CommitDeclassified(ctx context.Context, sessionID string, labels []string) ([]string, error) {
+	// p == nil covers a typed-nil (*ManifestPDP)(nil) reaching the transport's committer
 	// interface, where the caller's `!= nil` check passes and the dereference below would
-	// panic a request goroutine on the refusal path. The engine's own guard is one frame
-	// further in and cannot help until this receiver is read.
+	// panic a request goroutine after the upstream call has already run.
 	if p == nil || p.engine == nil {
-		// Declined, not restored: a PDP with no engine holds no flow store, so the labels
-		// are still cleared and the record must not claim otherwise.
-		return len(labels) == 0, nil
+		// A PDP with no engine holds no flow store, so the clear cannot happen. Reported as a
+		// fault, not as an empty result: see noFlowStateErr.
+		return nil, noFlowStateErr(labels, "manifest decision point with no engine")
 	}
-	// The claims come from the context so the request resolves to the SAME anchor the clear
-	// used; see the interface's context contract.
-	return p.engine.RestoreDeclassifiedLabels(ctx, &capability.EnforceRequest{
+	// The claims come from the context so the request resolves to the SAME anchor the
+	// decision used; see the interface's context contract.
+	return p.engine.CommitDeclassification(ctx, &capability.EnforceRequest{
 		SessionID: sessionID,
 		Claims:    jwtClaimsAsMap(ctx),
 	}, labels)

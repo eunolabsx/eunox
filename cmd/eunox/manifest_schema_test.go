@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/eunolabs/eunox/internal/audit"
 	"github.com/eunolabs/eunox/internal/config"
 	"github.com/eunolabs/eunox/pkg/capability"
 )
@@ -479,5 +480,86 @@ func TestComputeAuditStats_CountsDeclassifications(t *testing.T) {
 	}
 	if got.allowed+got.blocked+got.observed+got.other != got.total {
 		t.Errorf("buckets do not reconcile with total %d", got.total)
+	}
+}
+
+// TestComputeAuditStats_CountsDeclassifyFaults covers the three declassification facts that
+// live in `details` rather than in a signed top-level field, none of which this tool could
+// see at all before — it decoded six fields and never touched details, so an approved clear
+// that failed to apply was byte-indistinguishable from an ordinary allow, and a refused
+// declassification from an ordinary UPSTREAM_ERROR deny.
+//
+// Each is counted separately because each sends an operator somewhere different: a failed
+// commit means the flow store faulted on a call that really ran (the session is now
+// over-tainted and later sinks over-block); a not-applied clear means the call was refused
+// and nothing moved; a spent grant means a one-shot approval is gone and has to be reissued.
+func TestComputeAuditStats_CountsDeclassifyFaults(t *testing.T) {
+	t.Parallel()
+	tape := strings.Join([]string{
+		// A clean declassification: cleared, and the single-use grant it spent is named.
+		`{"decision":"allow","target":"sanitize","method":"tools/call","labels_cleared":["pii"],"approver":"alice",` +
+			`"details":{"` + audit.DeclassifySpentApprovalKey + `":"apr-1"}}`,
+		// The call ran; the clear did not land.
+		`{"decision":"allow","target":"sanitize","method":"tools/call",` +
+			`"details":{"` + audit.DeclassifyCommitFailedKey + `":["pii"],"` + audit.DeclassifySpentApprovalKey + `":"apr-2"}}`,
+		// The call was refused below the decision, so the clear was never made.
+		`{"decision":"deny","target":"sanitize","method":"tools/call","denial_code":"UPSTREAM_ERROR",` +
+			`"details":{"flow":true,"` + audit.DeclassifyNotAppliedKey + `":["pii"],"` + audit.DeclassifySpentApprovalKey + `":"apr-3"}}`,
+		// An ordinary allow whose details are the caller's arguments: no declassify facts,
+		// and nothing here may be mistaken for one.
+		`{"decision":"allow","target":"read_file","method":"tools/call","details":{"path":"/tmp/x"}}`,
+	}, "\n")
+
+	got, err := computeAuditStats(strings.NewReader(tape))
+	if err != nil {
+		t.Fatalf("computeAuditStats: %v", err)
+	}
+	if got.declassifyCommitFailed != 1 {
+		t.Errorf("declassifyCommitFailed = %d, want 1 — the one an operator must act on", got.declassifyCommitFailed)
+	}
+	if got.declassifyNotApplied != 1 {
+		t.Errorf("declassifyNotApplied = %d, want 1", got.declassifyNotApplied)
+	}
+	if got.spentApprovals != 3 {
+		t.Errorf("spentApprovals = %d, want 3 — a grant is spent on a clean clear, a failed commit and a refusal alike", got.spentApprovals)
+	}
+	if got.declassified != 1 {
+		t.Errorf("declassified = %d, want 1 — only the clear that actually changed something", got.declassified)
+	}
+	if got.allowed+got.blocked+got.observed+got.other != got.total {
+		t.Errorf("buckets do not reconcile with total %d", got.total)
+	}
+
+	// The commit failure is CALLED OUT, not merely tallied: it is the only one of the three
+	// that means a session is not in the state the policy describes.
+	var out strings.Builder
+	printAuditStats(&out, got)
+	if !strings.Contains(out.String(), "ATTENTION") {
+		t.Errorf("printAuditStats did not call out the failed commit:\n%s", out.String())
+	}
+	for _, want := range []string{"single-use approvals spent = 3", "declassify-not-applied = 1"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("printAuditStats is missing %q:\n%s", want, out.String())
+		}
+	}
+}
+
+// TestComputeAuditStats_DeclassifyProbeMatchesTheProducer pins the substring pre-filter the
+// details scan uses. It is an optimization with a security-adjacent failure mode: a prefix
+// that no longer matches the producer's keys makes every declassification fault silently
+// invisible again, which is exactly the state this counting was added to fix.
+func TestComputeAuditStats_DeclassifyProbeMatchesTheProducer(t *testing.T) {
+	t.Parallel()
+	for _, key := range []string{
+		audit.DeclassifySpentApprovalKey,
+		audit.DeclassifyNotAppliedKey,
+		audit.DeclassifyCommitFailedKey,
+	} {
+		if !strings.HasPrefix(key, audit.DeclassifyDetailPrefix) {
+			t.Errorf("key %q does not carry the prefix %q the stats probe filters on", key, audit.DeclassifyDetailPrefix)
+		}
+		if !audit.IsReservedDetailKey(key) {
+			t.Errorf("key %q is not reserved, so `eunox suggest` would mine it as a tool argument", key)
+		}
 	}
 }
