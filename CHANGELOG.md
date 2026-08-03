@@ -235,6 +235,49 @@ Section conventions:
 
 ### Changed
 
+- **BREAKING (pre-1.0): a `once` declassify grant may not ride a token that outlives the
+  ledger.** A burn is remembered for seven days, so a longer-lived token could present the
+  same grant again after the burn aged out and clear a flow label a second time — one human
+  approval, two declassifications. A token carrying such a grant is now **rejected at
+  validation** (HTTP 401, `invalid_declassify`), naming the grant. The guarantee is
+  unconditional for every token the proxy accepts: the burn is written no earlier than the
+  moment the token is presented, so it always outlives the token that could replay it.
+  Standing grants (`once` unset) are unaffected — they are replayable for the token's
+  lifetime by design. Remedy for a long-lived-token deployment: mint a short-lived token
+  per approval (already the recommended practice), or drop `once`.
+
+- **BREAKING (pre-1.0): under `taskAnchoredState` the in-memory flow-label store reclaims
+  abandoned anchors on an idle bound, and `flowlabelstore.WithIdleTTL` is now
+  `WithRedisIdleTTL` / `WithMemoryIdleTTL`.** In that mode both backends release an
+  anchor's label set after 24 hours with nothing touching it, and the bound is refreshed by
+  every `Add` **and** every `Get` — so it measures the anchor's INACTIVITY, not the age of
+  its taint, and a live anchor never loses provenance however long it runs. This is what a
+  **task-anchored** key needed: it deliberately outlives its session (teardown reclaiming it
+  would let an agent launder a task's taint by reconnecting), so it previously had no
+  reclamation at all and a long-running proxy accrued one key per distinct `task_id` until
+  the `--max-call-counter-keys` ceiling, after which every flow-relevant source call failed
+  closed for the life of the process. The bound is scoped to that mode and **off by
+  default**: a session-anchored key already has a reclamation path in the transport's
+  teardown, and expiring it would age a taint out from under a session that is merely
+  quiet. The ceiling remains an ADMISSION bound, never a reaper; the store now logs a
+  warning as the live count approaches it and one line per refusal episode at it, and its
+  at-ceiling sweep is rate-limited so a store sitting at the bound refuses cheaply instead
+  of re-scanning per call. `eunox proxy` also prints a startup notice when
+  `taskAnchoredState` is enabled with no `--redis-addr`, since per-process stores cannot
+  share a task's state across instances. The option rename is because both backends take
+  the setting now, and their constructors take different option types — one name would have
+  to be the one that silently does not apply to the store you passed it to.
+
+- **BREAKING (pre-1.0): `pdp.PolicyDecisionPoint` gains `EvaluateClaimCondition`.** The JWT
+  capability-claim path now asks the DECIDING PDP to evaluate a claim-derived condition
+  instead of calling the package-level predicate, so an embedder's
+  `enforcement.WithConditionHandler` override reaches both sides of a JWT/manifest
+  intersection. `pkg/enforcement` gains the seam behind it:
+  `(*Engine).NonCommittingConditionVerdict` and the engine-free
+  `enforcement.NonCommittingConditionVerdict`. A third-party `PolicyDecisionPoint`
+  implementation must add the method; delegating to
+  `enforcement.NonCommittingConditionVerdict` reproduces the previous behavior exactly.
+
 - **BREAKING (pre-1.0): the engine decides which optional subsystems to wire, from its own
   handler registry; the two options a caller used to state the conclusion with are gone.**
   `enforcement.WithoutAntecedentRecording()` and `enforcement.WithoutFlowLabels()` are removed,
@@ -741,6 +784,18 @@ Section conventions:
   manifest-load cost (internal/config imposes no depth or size cap): unmeasurable at a
   realistic depth-3 manifest, but ~89ms -> ~41ms on a synthetic depth-400/16.8KB one.
 
+- **Internal cleanup with no observable behavior change.** The repo's one length-prefixed
+  anti-forgery key encoding is now `capability.CompositeKey`, called by both the engine's
+  counter keys and `DeclassifyApproval.LedgerID` (which had reproduced its output with a
+  `Sprintf` it could not reach); `eunox contracts` shares one `findContract` lookup and
+  builds its table from one row shape instead of two near-identical literals; and the two
+  operator-configured public-key file formats (the attestation trust store and the
+  per-upstream receipt JWKS) now document why they take opposite positions on
+  unknown-key-versus-bad-signature. The corpus signature and content-digest recomputations
+  the issue also flagged are deliberately LEFT in place, with the reason recorded at each:
+  caching either makes an integrity result correct only for an entry nobody mutated since
+  load, and the saving is one hash and one base64 decode on an authoring-time CLI path.
+
 ### Removed
 
 - **The declassification undo, and the three `details` keys it wrote.**
@@ -814,6 +869,26 @@ Section conventions:
   script's retry pivot — the backend divergence that check exists to prevent).
 
 ### Fixed
+
+- **An embedder's `allowedValues` override no longer applies to only half of a JWT/manifest
+  intersection.** `WithConditionHandler` is the documented seam for redefining a built-in
+  condition type, and the manifest path dispatched through the engine's registry while the
+  JWT capability-claim path called the shipped predicate directly — so one `Engine` wired
+  into both a `ManifestPDP` and the `JWTPDP` intersecting against it enforced two different
+  rules for the same condition on the same call, with nothing failing and nothing logging.
+  The claim path now reaches the deciding PDP's own semantics. The one narrowing: a
+  replacement that COMMITS state on admit cannot be evaluated ahead of the decision (it
+  would charge the call's quota twice), so a claim carrying that condition type is refused,
+  naming the type, rather than silently falling back to the built-in.
+
+- **The JWT capability-claim path builds a complete `EnforceRequest`.** It passed a
+  two-field literal (`Arguments`, `Claims`) to a predicate shared with the manifest path —
+  correct for what that predicate reads today, and silently wrong the moment a semantic
+  added there read any other field, since it would see the zero value on one path and the
+  real value on the other with no compile error and no test failure. `SessionID`,
+  `TargetName` and `Target` are now populated, the fields deliberately left zero are
+  documented per field, and a test fails when a field is added to
+  `capability.EnforceRequest` so the next one is a decision rather than an omission.
 
 - **An HTTP upstream can no longer stall its session's response delivery by emitting
   `sampling/createMessage` repeatedly.** The stdio half of this was fixed previously and scoped

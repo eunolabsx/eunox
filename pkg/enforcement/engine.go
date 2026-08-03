@@ -9,7 +9,6 @@ import (
 	"context"
 	"fmt"
 	"path"
-	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -184,32 +183,18 @@ type Clock interface {
 // trades a longer guarantee against retaining abandoned-session state for as long.
 const sequenceHistoryWindowSec = 86400 // 24h
 
-// compositeCounterKey joins prefix and the variadic parts into one counter key.
-// Each part is emitted length-prefixed (":" + decimal byte length + ":" + raw
-// bytes), so the key is injective for arbitrary byte content — no ":" or NUL a
-// part contains can forge a different tuple's key, which a plain delimiter join
-// ("seq:"+sessionID+":"+tool) cannot guarantee since SessionID and tool names are
-// caller/host-supplied with no enforced format. The prefix is emitted verbatim
-// (no length tag), preserving the disjoint "seq:" / "maxcalls:" namespaces the
-// callcounter backends rely on; both call sites pass distinct colon-free literals
-// at a fixed arity.
+// compositeCounterKey joins prefix and the variadic parts into one counter key,
+// length-prefixing each part so the key is injective for arbitrary byte content — no
+// ":" or NUL a part contains can forge a different tuple's key, which a plain delimiter
+// join ("seq:"+sessionID+":"+tool) cannot guarantee since SessionID and tool names are
+// caller/host-supplied with no enforced format.
+//
+// The encoding itself lives in capability.CompositeKey, not here, because it is the
+// repo's ONE anti-forgery key encoding and a second copy of it had already appeared one
+// package over (DeclassifyApproval.LedgerID, which could not reach this unexported
+// helper). This stays as the counter-side name so the call sites read in their own terms.
 func compositeCounterKey(prefix string, parts ...string) string {
-	// Pre-size the buffer (this runs on every recorded call and maxCalls check).
-	// Over-estimating only sizes the backing array slightly large.
-	size := len(prefix)
-	for _, p := range parts {
-		size += len(p) + 8
-	}
-	var b strings.Builder
-	b.Grow(size)
-	b.WriteString(prefix)
-	for _, p := range parts {
-		b.WriteByte(':')
-		b.WriteString(strconv.Itoa(len(p)))
-		b.WriteByte(':')
-		b.WriteString(p)
-	}
-	return b.String()
+	return capability.CompositeKey(prefix, parts...)
 }
 
 // sequenceHistoryMaxEntries caps how many per-(session, tool) call markers the
@@ -1846,6 +1831,17 @@ func (e *Engine) CollectObligations(chain *capability.DelegationChain, matched *
 	// most for a leak are the downgrades, which are exactly the ones easiest to forget. A
 	// signature that cannot be called without deciding what the chain contributes makes
 	// forgetting impossible.
+	//
+	// It is also a parameter rather than a read of req.Delegation, and that was reconsidered
+	// rather than inherited. Reading it inside would remove the appearance of two sources
+	// (three call sites pass req.Delegation, two pass delegationFromContext), but the two are
+	// the same context-derived value and the shape only holds where a REQUEST exists: the
+	// no-match site synthesizes a constraint with no request behind it, and the PDP's harden
+	// sites build one DELIBERATELY WITHOUT the chain (hardenRequest's doc says why — a
+	// harden-only seam may not produce the downgradable verdict a delegation refusal is). An
+	// inside read would therefore silently drop the chain's redaction on exactly the
+	// forwarded-refusal path this fill exists for. The parameter is what keeps "which chain
+	// applies here" a decision each call site makes in the open.
 	if ob := delegatedRedaction(chain); ob != nil {
 		obligations = append(obligations, *ob)
 	}

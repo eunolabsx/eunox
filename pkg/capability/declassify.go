@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 )
 
 // DirectiveTypeDeclassify is the discriminator for declassify directives — the
@@ -188,10 +189,11 @@ type DeclassifyApproval struct {
 	// read-then-write on the label store, so two concurrent calls cannot both observe the grant
 	// unspent and both clear.
 	//
-	// The entry is retained for a bounded window (declassifyLedgerWindowSec) rather than
-	// forever, because a counter backend has no unbounded key space to spend. That window is far
-	// longer than any token this claim can ride: an approval whose token outlives it is a token
-	// lifetime problem, and the engine's doc says so at the constant.
+	// The entry is retained for a bounded window (DeclassifyLedgerWindowSec) rather than
+	// forever, because a counter backend has no unbounded key space to spend. The window is
+	// not left as a residual on the guarantee: a token whose remaining lifetime exceeds it is
+	// REFUSED at the boundary (CheckDeclassifyApprovalLifetime), so a grant this proxy admits
+	// can never outlive the memory of its own burn.
 	Once bool `json:"once,omitempty"`
 }
 
@@ -271,14 +273,82 @@ func (a *DeclassifyApproval) Validate() error {
 //
 // The Target is folded in beside the ID so one control-plane record covering several actions
 // (the same id minted per approved action) burns per action rather than collapsing to one
-// use across all of them. Both halves are length-prefixed for the same reason every counter
-// key is: an id and a target are external strings with no enforced format, so a plain
-// delimiter join would let one forge another pair's member.
+// use across all of them. Both halves go through CompositeKey — the repo's ONE
+// length-prefixed, anti-forgery key encoding — rather than a Sprintf that reproduced its
+// output byte for byte: an id and a target are external strings with no enforced format, so
+// a plain delimiter join would let one forge another pair's member, and a hardening change
+// to that encoding has to reach this member too or the two address different buckets.
 func (a *DeclassifyApproval) LedgerID() string {
 	if a == nil || !a.Once || a.ID == "" {
 		return ""
 	}
-	return fmt.Sprintf("once:%d:%s:%d:%s", len(a.ID), a.ID, len(a.Target), a.Target)
+	return CompositeKey("once", a.ID, a.Target)
+}
+
+// DeclassifyLedgerWindowSec is how long a burned single-use approval is remembered.
+//
+// It is a property of the GRANT, not of the counter that stores the burn, which is why it
+// lives here beside the claim rather than in the engine that writes it. Two layers read it
+// and they must not disagree: the engine sizes the ledger bucket's window with it, and the
+// token boundary refuses a `once` grant whose token would outlive it (see
+// CheckDeclassifyApprovalLifetime). That pairing is what makes "once" unconditional — the
+// burn is written no earlier than the moment the token is presented, so a window this long
+// always outlives a token admitted under the bound.
+//
+// Seven days is chosen against what the burn has to outlive: the TOKEN carrying the grant.
+// Longer is not simply better — the retention is also what bounds the ledger's storage in a
+// backend an operator shares across instances — so the answer is to hold tokens inside the
+// window rather than to keep burns for ever.
+const DeclassifyLedgerWindowSec = 7 * 86400
+
+// CheckDeclassifyApprovalLifetime refuses a single-use grant riding a token that would
+// outlive the ledger's memory of the burn.
+//
+// The ledger is a sliding window (DeclassifyLedgerWindowSec), so a burn is forgotten
+// eventually. Without this bound that made `once` a promise with an expiry date attached: a
+// control plane mints a 30-day token carrying `{"once": true}`, the agent spends the grant
+// on day 1, and on day 9 the ledger read comes back empty and the same grant clears a label
+// a second time. The operator believes one human approved one declassification; two
+// happened.
+//
+// Refusing the TOKEN is the fail-closed reading, and it is the one that keeps the guarantee
+// unconditional rather than merely wide. The alternatives were worse in both directions:
+// lengthening the window trades a narrower replay for unbounded growth in a shared backend,
+// and silently offering a weaker guarantee than the field advertises leaves the operator
+// with no way to discover it. This converts a silent residual into a startup-visible one —
+// the IdP is told, in the token's own terms, to shorten the token or drop `once`.
+//
+// The check is deliberately about REMAINING lifetime rather than total: what has to be
+// outlived is the interval from the moment of the burn (no earlier than now, since the token
+// is being presented) to exp. leeway is the clock-skew grace the same validation applied to
+// exp, added to the remaining lifetime so a token accepted at the edge of that grace is
+// still inside the window.
+//
+// An UNSET exp — the zero Time — is refused for the same reason a token with no exp is: an
+// unbounded lifetime cannot be inside any window. Callers must encode "not established" as
+// the zero Time and not as an epoch instant: time.Unix(0, 0) is a real 1970 timestamp, so
+// it is not IsZero and would read here as a lifetime decades in the past, i.e. comfortably
+// inside the window. That is the fail-OPEN direction on the one property this function
+// exists to guarantee.
+//
+// Standing grants (Once unset) are unaffected — they are replayable for the token's lifetime
+// by design, which is the property the field's own doc states.
+func CheckDeclassifyApprovalLifetime(approvals []DeclassifyApproval, exp, now time.Time, leeway time.Duration) error {
+	window := time.Duration(DeclassifyLedgerWindowSec) * time.Second
+	for i := range approvals {
+		if !approvals[i].Once {
+			continue
+		}
+		if exp.IsZero() {
+			return fmt.Errorf("mcp.%s approval %q sets 'once' but the token carries no verified expiry; a single-use burn is remembered for %s, so a grant on a token with no bounded lifetime cannot be enforced as written",
+				ClaimDeclassify, approvals[i].ID, window)
+		}
+		if remaining := exp.Sub(now) + leeway; remaining > window {
+			return fmt.Errorf("mcp.%s approval %q sets 'once' but the token remains valid for %s, longer than the %s a single-use burn is remembered for; the grant would go live again while the token is still usable — mint a shorter-lived token for the approval, or drop 'once' and accept a standing grant",
+				ClaimDeclassify, approvals[i].ID, remaining.Round(time.Second), window)
+		}
+	}
+	return nil
 }
 
 // ParseDeclassifyApprovals decodes the `mcp.declassify` claim into validated approvals.

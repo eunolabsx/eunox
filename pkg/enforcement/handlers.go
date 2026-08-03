@@ -977,9 +977,26 @@ func (e *Engine) handleAllowedValues(_ context.Context, cond capability.Conditio
 // here — a coercion rule, a reference kind, a bounded-details rule — reaches both paths by
 // construction rather than by whoever edits it remembering there are two.
 //
+// The "both paths" that claim is about is the CODE, and it holds for a semantic added to
+// this function. It does NOT extend to the one axis a shared function cannot cover:
+// WithConditionHandler replaces the handler an *Engine dispatches for this type, and a
+// caller reaching this package-level predicate directly runs the built-in regardless of
+// what any engine's registry holds. A composing layer must therefore ask the DECIDING
+// engine — (*Engine).NonCommittingConditionVerdict — which dispatches through that registry
+// and fails closed when it cannot answer without committing. This function stays exported
+// as the implementation of the built-in and as the answer for a caller that genuinely has
+// no engine (a JWT-only or wiretap route); it is not the way to evaluate a condition on
+// behalf of an engine that exists.
+//
 // A caller outside the engine must pass the returned Details through BoundDenialDetails
 // before they reach an audit record; on the engine's own path denyResponse does that for
 // every deny it builds.
+//
+// It reads exactly two fields of req — Arguments and Claims — and nothing else. That is a
+// statement about TODAY, not a permanent contract: a caller building a partial request is
+// relying on it, so internal/pdp pins the set with a test that fails when a field is added
+// to capability.EnforceRequest, forcing whoever adds one to decide whether the claim-side
+// request must carry it.
 func EvaluateAllowedValues(cond capability.Condition, req *capability.EnforceRequest) *ConditionError {
 	av, condErr := castCondition[capability.AllowedValuesCondition](cond)
 	if condErr != nil {

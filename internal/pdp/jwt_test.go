@@ -24,6 +24,7 @@ import (
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/mcp/mcptest"
 	"github.com/eunolabs/eunox/pkg/capability"
+	"github.com/eunolabs/eunox/pkg/enforcement"
 	"github.com/eunolabs/eunox/pkg/killswitch"
 )
 
@@ -2523,8 +2524,7 @@ func TestJWTPDP_OpCondition_NamedArgumentFailsClosed(t *testing.T) {
 	}
 	// Even the operation that would be permitted must deny — the named-argument form
 	// is not supported from a claim.
-	resp := evaluateJWTConditions(nil, []capability.Condition{cond}, "storage_access",
-		map[string]interface{}{"cmd": "read /bucket/key"}, nil)
+	resp := evaluateJWTConditions(context.Background(), nil, nil, []capability.Condition{cond}, jwtCondReq("storage_access", map[string]interface{}{"cmd": "read /bucket/key"}, nil))
 	if resp == nil {
 		t.Fatal("a named-argument allowedOperations condition must fail closed, got allow")
 	}
@@ -2539,9 +2539,7 @@ func TestJWTPDP_OpCondition_NamedArgumentFailsClosed(t *testing.T) {
 func TestJWTPDP_UnknownConditionType_FailsClosed(t *testing.T) {
 	t.Parallel()
 
-	resp := evaluateJWTConditions(nil,
-		[]capability.Condition{capability.TimeWindowCondition{NotAfter: "2099-01-01T00:00:00Z"}},
-		"storage_access", map[string]interface{}{}, nil)
+	resp := evaluateJWTConditions(context.Background(), nil, nil, []capability.Condition{capability.TimeWindowCondition{NotAfter: "2099-01-01T00:00:00Z"}}, jwtCondReq("storage_access", map[string]interface{}{}, nil))
 	if resp == nil {
 		t.Fatal("an unevaluable JWT condition type must deny (fail closed), not pass silently")
 	}
@@ -3058,6 +3056,10 @@ func (condPDP) DecideSampling(_ context.Context, _, _ string) capability.Enforce
 }
 func (condPDP) HardenRefusal(_ context.Context, _ string, r capability.EnforceResponse, _ EnforceTarget, _ map[string]interface{}) capability.EnforceResponse {
 	return r
+}
+
+func (condPDP) EvaluateClaimCondition(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (*enforcement.ConditionError, bool) {
+	return enforcement.NonCommittingConditionVerdict(ctx, cond, req)
 }
 func (condPDP) CheckKill(_ context.Context, _ string) *capability.EnforceResponse {
 	return nil
@@ -4686,7 +4688,7 @@ func TestEvaluateJWTConditionsNonStringAllowedValues(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			resp := evaluateJWTConditions(nil, tc.conds, "tool:x", tc.args, nil)
+			resp := evaluateJWTConditions(context.Background(), nil, nil, tc.conds, jwtCondReq("tool:x", tc.args, nil))
 			if tc.wantDeny {
 				if resp == nil {
 					t.Fatalf("expected deny, got allow")
@@ -4779,7 +4781,7 @@ func TestJWTShorthandValuesMatchTypedArgs(t *testing.T) {
 			if len(constraints) != 1 {
 				t.Fatalf("expected 1 constraint from claim %q, got %d", tc.claim, len(constraints))
 			}
-			resp := evaluateJWTConditions(nil, constraints[0].Conditions, constraints[0].Target, tc.args, nil)
+			resp := evaluateJWTConditions(context.Background(), nil, nil, constraints[0].Conditions, jwtCondReq(constraints[0].Target, tc.args, nil))
 			if tc.wantDeny {
 				if resp == nil {
 					t.Fatalf("expected deny for args %+v, got allow", tc.args)
@@ -4870,7 +4872,7 @@ func TestEvaluateJWTConditionsAllowedOperations(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			resp := evaluateJWTConditions(nil, tc.conds, "tool:x", tc.args, nil)
+			resp := evaluateJWTConditions(context.Background(), nil, nil, tc.conds, jwtCondReq("tool:x", tc.args, nil))
 			if tc.wantDeny {
 				if resp == nil {
 					t.Fatalf("expected deny, got allow")
@@ -6071,5 +6073,62 @@ func TestJWTPDP_FilterList_NonEnforcingInnerSkipsSideEffectPass(t *testing.T) {
 	}
 	if res.Upstream != 1 {
 		t.Errorf("Upstream = %d, want the true pre-filter count 1", res.Upstream)
+	}
+}
+
+// TestJWT_OnceGrantRefusedWhenTokenOutlivesLedger is the token-boundary half of the `once`
+// guarantee. The burn lives in a WINDOWED ledger, so a grant riding a token that outlives
+// the window would be presented again once the burn aged out and clear a second time — one
+// human approval, two declassifications. The token is refused instead, with a message an
+// operator can act on, rather than admitted under a weaker promise than the field makes.
+func TestJWT_OnceGrantRefusedWhenTokenOutlivesLedger(t *testing.T) {
+	key := newTestKey(t, "k1")
+	srv := makeJWKSServer(t, key)
+	defer srv.Close()
+	p := makeJWTPDP(t, srv, "", "", nil)
+	window := time.Duration(capability.DeclassifyLedgerWindowSec) * time.Second
+
+	grant := func(once bool) []interface{} {
+		g := map[string]interface{}{
+			"labels": []string{"pii"}, "target": "tool:publish", "approver": "ops", "id": "apr-1",
+		}
+		if once {
+			g["once"] = true
+		}
+		return []interface{}{g}
+	}
+
+	// A long-lived token carrying a single-use grant: refused, classified as an invalid
+	// declassify claim rather than collapsed into a generic "invalid".
+	long := signRawClaimsToken(t, key, "agent-1", time.Now().Add(window+24*time.Hour),
+		map[string]interface{}{"mcp": map[string]interface{}{"v": mcpClaimVersion, "declassify": grant(true)}})
+	_, err := p.ValidateToken(context.Background(), "Bearer "+long)
+	if err == nil {
+		t.Fatal("ValidateToken accepted a once grant on a token that outlives the ledger window")
+	}
+	if got := ClassifyJWTError(err); got != jwtErrInvalidDeclassify {
+		t.Fatalf("error category = %q, want %q", got, jwtErrInvalidDeclassify)
+	}
+	if !strings.Contains(err.Error(), "apr-1") {
+		t.Fatalf("refusal must name the offending grant: %v", err)
+	}
+
+	// The same grant on a short-lived token — the practice the docs recommend — is admitted.
+	short := signRawClaimsToken(t, key, "agent-1", time.Now().Add(15*time.Minute),
+		map[string]interface{}{"mcp": map[string]interface{}{"v": mcpClaimVersion, "declassify": grant(true)}})
+	ctx, err := p.ValidateToken(context.Background(), "Bearer "+short)
+	if err != nil {
+		t.Fatalf("a once grant inside the ledger window must be admitted: %v", err)
+	}
+	if claims, ok := jwtClaimsFromContext(ctx); !ok || len(claims.Declassify) != 1 || !claims.Declassify[0].Once {
+		t.Fatalf("the admitted token must still carry its single-use grant, got %+v", claims)
+	}
+
+	// A STANDING grant is replayable for the token's lifetime by design, so the bound does
+	// not apply to it: the long-lived token above is accepted once `once` is dropped.
+	standing := signRawClaimsToken(t, key, "agent-1", time.Now().Add(window+24*time.Hour),
+		map[string]interface{}{"mcp": map[string]interface{}{"v": mcpClaimVersion, "declassify": grant(false)}})
+	if _, err := p.ValidateToken(context.Background(), "Bearer "+standing); err != nil {
+		t.Fatalf("a standing grant on a long-lived token must still validate: %v", err)
 	}
 }

@@ -131,7 +131,31 @@ var validReviews = map[string]bool{ReviewPending: true, ReviewCommunity: true, R
 
 // Ref returns the manifest pin for this entry: "<id>@<digest>", the value an author
 // copies into a capability's `effect.ref`.
+//
+// It reads the DECLARED digest deliberately, unlike contentDigest: a pin is what the file
+// says it is, and Validate has already refused any entry where the two differ — so on a
+// loaded corpus they are the same string, and on a hand-built Contract this reports what
+// the caller declared rather than silently correcting it.
 func (c *Contract) Ref() string { return c.ID + "@" + c.Digest }
+
+// contentDigest is the digest of the entry's own CONTENT, recomputed on every call.
+//
+// Every consumer that binds a signature to an entry must use this rather than c.Digest:
+// signing or verifying against a self-declared digest authenticates the declaration
+// instead of the content, which is exactly the substitution a content digest exists to
+// prevent.
+//
+// It is deliberately NOT cached at load, and the redundancy with Validate's own
+// computation is the price of an unconditional guarantee. A cache would be correct only
+// for a Contract nobody has touched since Validate ran — Effect is a pointer, so an
+// in-process caller can rewrite the block a signature covers and leave the cached digest
+// naming the old content, and VerifyAttestations would then report a tampered entry as
+// verified. That is precisely the substitution this whole layer exists to catch, so it
+// must not depend on caller discipline. The cost is one SHA-256 over a small JSON block,
+// on an authoring-time CLI path that never touches the decision path.
+func (c *Contract) contentDigest() (string, error) {
+	return capability.EffectContractDigest(c.Effect)
+}
 
 // Validate checks one entry: a known grammar version, the required identity fields, a
 // recognized attestation, and — the load-bearing one — a digest that matches the

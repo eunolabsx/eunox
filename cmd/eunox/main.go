@@ -347,7 +347,7 @@ func registerProxyFlags(fs *flag.FlagSet) *proxyCLIFlags {
 		killswitchFailOpen:   fs.Bool("killswitch-fail-open", false, "Redis kill-switch behaviour during a Redis outage. By default the kill switch\nfails CLOSED: while Redis is unreachable the proxy denies every request\n(KILL_SWITCH_ERROR) because a kill issued during the outage cannot be confirmed.\nSet this flag to fail OPEN instead -- serve the last-known kill state and allow\ntraffic not already known to be killed -- trading guaranteed revocation for\ndata-plane availability. Only affects --redis-addr deployments. See ADR-0003."),
 		killswitchReconcile:  fs.Duration("killswitch-reconcile-interval", 0, "How often the Redis kill switch reconciles its local cache against Redis\n(default 30s). Lower values shorten the kill-propagation window and, in the\ndefault fail-closed mode, the data-plane denial window that persists after a\ntransient Redis blip recovers -- recovery is bounded by this interval, not Redis.\nVery low values increase Redis load. 0 uses the default. Only affects --redis-addr."),
 		killswitchSessionTTL: fs.Duration("killswitch-session-ttl", 0, "How long a SESSION kill tombstone lives in Redis before it is garbage\ncollected (default 720h / 30 days). This is a memory bound, not a policy\nexpiry: when the tombstone expires the kill is LIFTED, so a value shorter\nthan the longest session your deployment holds open re-admits a revoked\nsession. Relevant when a stdio agent pins and reuses one --session-id for\nmonths. Negative disables expiry entirely; 0 uses the default. Agent kills\nare never expired. Only affects --redis-addr."),
-		maxCallCounterKeys:   fs.Int("max-call-counter-keys", defaultMaxCallCounterKeys, "Maximum distinct keys the in-memory maxCalls/sequenceBlock counter holds at once.\nEach live (session, tool) pair is one key, reclaimed only on the periodic cleanup;\nthis ceiling bounds the heap a flood of unique session IDs can pin between cleanups\n(a call under a new key past the limit fails closed). The same bound also caps the\nin-memory flow-label store's distinct SESSIONS (one key per session, so its ceiling\nis looser and never trips first) — under taskAnchoredState that becomes one key per\nTASK, which OUTLIVES the session that created it and is reclaimed only by the Redis\nbackend's idle TTL, so prefer --redis-addr for that mode. 0 disables the bound. Ignored when --redis-addr is\nset (Redis keeps this state off the Go heap, with TTLs)."),
+		maxCallCounterKeys:   fs.Int("max-call-counter-keys", defaultMaxCallCounterKeys, "Maximum distinct keys the in-memory maxCalls/sequenceBlock counter holds at once.\nEach live (session, tool) pair is one key, reclaimed only on the periodic cleanup;\nthis ceiling bounds the heap a flood of unique session IDs can pin between cleanups\n(a call under a new key past the limit fails closed). The same bound also caps the\nin-memory flow-label store's distinct ANCHORS — one key per session, or under\ntaskAnchoredState one per TASK, which OUTLIVES the session that created it. Both\nstores reclaim an idle anchor on a periodic sweep, so the ceiling bounds LIVE\nanchors; a warning is logged as it is approached. 0 disables the bound. Ignored when --redis-addr is\nset (Redis keeps this state off the Go heap, with TTLs)."),
 
 		// Compliance flags.
 		strictDrift: fs.Bool("strict-drift", false, "Promote startup drift warnings to fatal errors that abort session startup: a new\nupstream tool matched by a manifest glob, a manifest entry that matches no live\ntool, or an upstream version that does not satisfy the manifest's serverVersion\npin. (A condition argument absent from the live schema and the uncovered-tool\nINFO stay advisory, never fatal.) A launch-time global override: applies to every\npoliced route, regardless of a per-route 'strictDrift' in the config. Routes with\nno policy are unaffected; the proxy warns if the flag matched no policed route\n(e.g. with --audit)."),
@@ -553,7 +553,7 @@ func cmdProxy(args []string) (exitCode int) {
 
 	// Build call counter and kill-switch manager, shared across routes and the
 	// kill-switch endpoint. Backed by Redis when --redis-addr is set.
-	backends, err := buildCallCounterAndKillSwitch(*f.redisAddr, resolveRedisPassword(*f.redisPassword), *f.redisTLS, *f.killswitchFailOpen, *f.killswitchReconcile, *f.killswitchSessionTTL, *f.maxCallCounterKeys)
+	backends, err := buildCallCounterAndKillSwitch(*f.redisAddr, resolveRedisPassword(*f.redisPassword), *f.redisTLS, *f.killswitchFailOpen, *f.killswitchReconcile, *f.killswitchSessionTTL, *f.maxCallCounterKeys, anyRouteTaskAnchored(cfg))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "eunox proxy: %v\n", err)
 		return 1
@@ -654,9 +654,7 @@ func cmdProxy(args []string) (exitCode int) {
 		// so (LIFO) it runs before earlier defers, while sink.Close stays last.
 		defer ksRedis.Stop()
 	}
-	if mem, ok := counter.(*callcounter.InMemory); ok {
-		mem.StartCleanup(ctx, callcounter.DefaultCleanupInterval)
-	}
+	startInMemorySweeps(ctx, counter, flowStore)
 
 	var serveErr error
 	switch cfg.HostTransport() {
@@ -722,16 +720,32 @@ type upstreamBackends struct {
 	redis *goredis.Client
 }
 
-func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, killswitchFailOpen bool, killswitchReconcile, killswitchSessionTTL time.Duration, maxCallCounterKeys int) (upstreamBackends, error) {
+func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, killswitchFailOpen bool, killswitchReconcile, killswitchSessionTTL time.Duration, maxCallCounterKeys int, taskAnchored bool) (upstreamBackends, error) {
+	// One stderr logger for every backend that takes one, rather than the same expression
+	// written out per call site: where these lines go (level, format, destination) is one
+	// operator-facing decision.
+	stderrLog := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	var (
 		counter capability.CallCounter = callcounter.NewInMemory(callcounter.WithMaxKeys(maxCallCounterKeys))
-		// The in-memory flow store has no time window (a taint lives until the session's
-		// Clear on teardown), so it needs no cleanup goroutine; WithMaxKeys is its
-		// fail-closed growth backstop for a session whose Clear never arrives, sized to
-		// the same bound as the counter.
-		flowStore capability.FlowLabelStore = flowlabelstore.NewInMemory(flowlabelstore.WithMaxKeys(maxCallCounterKeys))
-		ks        killswitch.Manager        = killswitch.NewInMemory()
-		ksRedis   *killswitch.Redis         // non-nil when --redis-addr is set
+		// WithMaxKeys is the flow store's fail-closed admission ceiling, sized to the same
+		// bound as the counter, and the logger is what makes the approach to it visible: at
+		// the ceiling every new anchor's first labelled call fails closed, and an operator
+		// who learns that from a denied call has already hit the cliff.
+		//
+		// The idle bound is enabled ONLY under task anchoring, and that scoping is the
+		// point rather than caution. A session-anchored key already has a reclamation path
+		// — the transport's teardown — so expiring it would age a taint out from under a
+		// session that is merely quiet, which is the fail-open this store exists to
+		// prevent. A TASK-anchored key has no teardown owner at all (reclaiming it on
+		// disconnect would let an agent launder a task's taint by reconnecting), so an
+		// idle bound is the only reclamation it can safely have, and without one the
+		// ceiling above is an availability cliff a long-lived proxy walks into.
+		flowStore capability.FlowLabelStore = flowlabelstore.NewInMemory(
+			append(flowStoreOptions(taskAnchored),
+				flowlabelstore.WithMaxKeys(maxCallCounterKeys),
+				flowlabelstore.WithLogger(stderrLog))...)
+		ks      killswitch.Manager = killswitch.NewInMemory()
+		ksRedis *killswitch.Redis  // non-nil when --redis-addr is set
 	)
 	var rdb *goredis.Client
 	if redisAddr != "" {
@@ -774,7 +788,7 @@ func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, ki
 			// operator action. Both directions need to be reachable -- raise it past the
 			// longest session, or make it permanent -- so it cannot be a constant.
 			killswitch.WithSessionKillTTL(killswitchSessionTTL),
-			killswitch.WithLogger(slog.New(slog.NewTextHandler(os.Stderr, nil))))
+			killswitch.WithLogger(stderrLog))
 		ks = ksRedis
 		if killswitchFailOpen {
 			fmt.Fprintf(os.Stderr, "[eunox] Kill switch: fail-OPEN during a Redis outage (--killswitch-fail-open). Kills issued while Redis is unreachable may be delayed until it recovers; the data plane stays available.\n")
@@ -793,6 +807,35 @@ func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, ki
 		// that can still fail and exit the process — see that call site.
 	}
 	return upstreamBackends{counter: counter, flowStore: flowStore, killSwitch: ks, ksRedis: ksRedis, redis: rdb}, nil
+}
+
+// flowStoreOptions returns the anchor-lifetime options for the in-memory flow store: an
+// idle bound under task anchoring, and none otherwise. It is a function rather than an
+// inline conditional so the reason lives in one place — see the call site, and
+// flowlabelstore.WithMemoryIdleTTL for why the default is off.
+func flowStoreOptions(taskAnchored bool) []flowlabelstore.InMemoryOption {
+	if !taskAnchored {
+		return nil
+	}
+	return []flowlabelstore.InMemoryOption{flowlabelstore.WithMemoryIdleTTL(flowlabelstore.DefaultIdleTTL)}
+}
+
+// startInMemorySweeps arms the background reclamation for whichever in-process backends are
+// in use, and is a no-op for the Redis ones (which reclaim by TTL server-side).
+//
+// The flow store's sweep is the one that is easy to miss the point of: the lazy expiry on
+// its access paths never runs for an anchor nothing accesses AGAIN, which is precisely what
+// an abandoned one is — a task whose agent has stopped using it, with no teardown that owns
+// it. Without the sweep the map holds every such task until it hits the admission ceiling,
+// after which every flow-relevant source call fails closed for the life of the process. The
+// store declines to start one when it expires nothing at all, which is the default.
+func startInMemorySweeps(ctx context.Context, counter capability.CallCounter, flowStore capability.FlowLabelStore) {
+	if mem, ok := counter.(*callcounter.InMemory); ok {
+		mem.StartCleanup(ctx, callcounter.DefaultCleanupInterval)
+	}
+	if mem, ok := flowStore.(*flowlabelstore.InMemory); ok {
+		mem.StartCleanup(ctx, flowlabelstore.DefaultCleanupInterval)
+	}
 }
 
 // publishSessionKillTTL advertises the effective session-tombstone lifetime on the
@@ -1555,6 +1598,27 @@ func warnTaskAnchoringWithoutJWT(jwtConfigured, taskAnchored bool) {
 	fmt.Fprintf(os.Stderr, "[eunox] NOTICE: taskAnchoredState is enabled but no JWT validation is configured (--jwks-uri) — the anchor comes from the VALIDATED mcp.task_id claim, so every request falls back to session keying and the option has no effect.\n")
 }
 
+// warnTaskAnchoringWithoutRedis prints the advisory for task-anchored state on the
+// in-memory backends. A task-anchored key deliberately OUTLIVES its session — teardown
+// does not reclaim it, or an agent could launder a task's taint by reconnecting — so the
+// per-process stores accrue one key per distinct task id, reclaimed only by their idle
+// TTL. That is enough to keep a single instance bounded, which is why this is a notice and
+// not a refusal; what it is not enough for is a deployment running more than one instance,
+// where two PEPs each hold half the task's state and the cross-PEP property the option
+// exists to provide silently does not hold.
+//
+// It is a notice rather than a startup refusal for the reason the JWT one beside it is:
+// making a correctness knob depend on a deployment-topology knob would refuse a
+// single-instance configuration that is perfectly sound, and a mid-rollout operator
+// enabling the key before wiring Redis gets a working proxy plus a line telling them what
+// is missing.
+func warnTaskAnchoringWithoutRedis(redisConfigured, taskAnchored bool) {
+	if redisConfigured || !taskAnchored {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[eunox] NOTICE: taskAnchoredState is enabled but no --redis-addr is set — task-anchored flow labels, budgets and antecedents live in this process only, and a task key outlives the session that created it (nothing tears it down; in this mode the in-memory stores reclaim one idle for %s). A single instance is bounded; more than one will not share a task's state. Configure --redis-addr for multi-instance deployments.\n", flowlabelstore.DefaultIdleTTL)
+}
+
 // resolveOAuthMetadata builds the RFC 9728 protected-resource metadata document
 // (and its URL) for the gateway, or returns (nil, "", nil) when no resource URI is
 // configured — in which case the metadata endpoint is simply not published. It fails
@@ -1729,6 +1793,7 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 
 	warnNoRedisSharedState(pf.redisConfigured, transport.AnyRouteAccumulatesSharedState(routes))
 	warnTaskAnchoringWithoutJWT(pf.jwksURI != "", anyRouteTaskAnchored(cfg))
+	warnTaskAnchoringWithoutRedis(pf.redisConfigured, anyRouteTaskAnchored(cfg))
 
 	bind := cfg.Listen.Bind
 	if bind == "" {
@@ -1936,6 +2001,7 @@ func serveStdioHost(ctx context.Context, cfg *config.GatewayConfig, sink *audit.
 	// process is not serving — and stay silent when the one it IS serving turned the option
 	// off per-route while a sibling left it on.
 	warnTaskAnchoringWithoutJWT(pf.jwksURI != "", cfg.ResolvedTaskAnchoredState(u))
+	warnTaskAnchoringWithoutRedis(pf.redisConfigured, cfg.ResolvedTaskAnchoredState(u))
 
 	// This upstream's own receipt-signing key domain, from the same local-file loader the
 	// gateway routes use. Absent (the default) leaves the verifier nil and the whole

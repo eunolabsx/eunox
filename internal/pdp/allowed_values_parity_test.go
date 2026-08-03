@@ -76,7 +76,7 @@ func TestAllowedValues_ManifestAndJWTPathsAgree(t *testing.T) {
 				})
 
 			// The JWT capability-claim path.
-			jwt := evaluateJWTConditions(nil, []capability.Condition{cond}, "read_file", tc.args, nil)
+			jwt := evaluateJWTConditions(context.Background(), nil, nil, []capability.Condition{cond}, jwtCondReq("read_file", tc.args, nil))
 
 			require.Equal(t, capability.DecisionDeny, manifest.Decision, "the manifest path must refuse")
 			require.NotNil(t, jwt, "the JWT path must refuse the same input")
@@ -101,8 +101,7 @@ func TestAllowedValues_ManifestAndJWTPathsAgree(t *testing.T) {
 // asserts the guard is reachable from THIS path rather than re-asserting the engine's own.
 func TestAllowedValues_JWTPathHasTheEmptyArgumentGuard(t *testing.T) {
 	cond := capability.AllowedValuesCondition{Argument: "", Values: []interface{}{"*"}}
-	resp := evaluateJWTConditions(nil, []capability.Condition{cond}, "read_file",
-		map[string]interface{}{"path": "/tmp/x"}, nil)
+	resp := evaluateJWTConditions(context.Background(), nil, nil, []capability.Condition{cond}, jwtCondReq("read_file", map[string]interface{}{"path": "/tmp/x"}, nil))
 
 	require.NotNil(t, resp, "an allowedValues condition that names no argument restricts nothing; fail closed")
 	require.NotNil(t, resp.Denial)
@@ -120,8 +119,7 @@ func TestAllowedValues_JWTPathHasTheEmptyArgumentGuard(t *testing.T) {
 // exactly what this path could not populate before.
 func TestAllowedValues_JWTDenialNamesTheGrantAndTheArgument(t *testing.T) {
 	cond := capability.AllowedValuesCondition{Argument: "path", Values: []interface{}{"/tmp/*"}}
-	resp := evaluateJWTConditions(nil, []capability.Condition{cond}, "read_file",
-		map[string]interface{}{"path": "/etc/shadow"}, nil)
+	resp := evaluateJWTConditions(context.Background(), nil, nil, []capability.Condition{cond}, jwtCondReq("read_file", map[string]interface{}{"path": "/etc/shadow"}, nil))
 
 	require.NotNil(t, resp)
 	require.NotNil(t, resp.Denial)
@@ -140,8 +138,7 @@ func TestAllowedValues_JWTDenialNamesTheGrantAndTheArgument(t *testing.T) {
 func TestAllowedValues_JWTDenialDetailsAreBounded(t *testing.T) {
 	huge := strings.Repeat("A", 64<<10)
 	cond := capability.AllowedValuesCondition{Argument: "path", Values: []interface{}{"/tmp/*"}}
-	resp := evaluateJWTConditions(nil, []capability.Condition{cond}, "read_file",
-		map[string]interface{}{"path": huge}, nil)
+	resp := evaluateJWTConditions(context.Background(), nil, nil, []capability.Condition{cond}, jwtCondReq("read_file", map[string]interface{}{"path": huge}, nil))
 
 	require.NotNil(t, resp)
 	require.NotNil(t, resp.Denial)
@@ -160,7 +157,7 @@ func TestAllowedValues_TaskVariableResolvesOnBothPaths(t *testing.T) {
 	cond := capability.AllowedValuesCondition{Argument: "workspace_id", Values: []interface{}{"${task.id}"}}
 	args := map[string]interface{}{"workspace_id": "t-42"}
 
-	assert.Nil(t, evaluateJWTConditions(nil, []capability.Condition{cond}, "fetch_workspace", args, claims),
+	assert.Nil(t, evaluateJWTConditions(context.Background(), nil, nil, []capability.Condition{cond}, jwtCondReq("fetch_workspace", args, claims)),
 		"a grant carrying a recognized task reference must match the call it describes")
 
 	manifest := enforcement.New().EvaluateConditions(context.Background(),
@@ -218,8 +215,7 @@ func TestAllowedOperations_JWTDenialsCarryTheEnginesDetails(t *testing.T) {
 	require.NotNil(t, manifest.Denial)
 	require.Equal(t, capability.ErrCodeOperationNotPermitted, manifest.Denial.Code)
 
-	jwt := evaluateJWTConditions(nil, []capability.Condition{cond}, "query_db",
-		map[string]interface{}{"sql": "DROP TABLE users"}, nil)
+	jwt := evaluateJWTConditions(context.Background(), nil, nil, []capability.Condition{cond}, jwtCondReq("query_db", map[string]interface{}{"sql": "DROP TABLE users"}, nil))
 	require.NotNil(t, jwt)
 	require.NotNil(t, jwt.Denial)
 
@@ -258,7 +254,7 @@ func TestAllowedOperations_EveryJWTRefusalCarriesDetails(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			resp := evaluateJWTConditions(nil, []capability.Condition{tc.cond}, "query_db", tc.args, nil)
+			resp := evaluateJWTConditions(context.Background(), nil, nil, []capability.Condition{tc.cond}, jwtCondReq("query_db", tc.args, nil))
 			require.NotNil(t, resp, "these arms all refuse; that is deliberate and unchanged")
 			require.NotNil(t, resp.Denial)
 			assert.Equal(t, tc.wantCode, resp.Denial.Code)
@@ -272,9 +268,7 @@ func TestAllowedOperations_EveryJWTRefusalCarriesDetails(t *testing.T) {
 	// The MISSING_CONTEXT arm deliberately does NOT name an argument, unlike the engine's:
 	// the claim grammar cannot express one, so the scan covers every argument, and a phantom
 	// name would send an operator looking for a manifest field that does not exist.
-	resp := evaluateJWTConditions(nil,
-		[]capability.Condition{capability.AllowedOperationsCondition{Operations: []string{"SELECT"}}},
-		"query_db", map[string]interface{}{"note": "nothing here"}, nil)
+	resp := evaluateJWTConditions(context.Background(), nil, nil, []capability.Condition{capability.AllowedOperationsCondition{Operations: []string{"SELECT"}}}, jwtCondReq("query_db", map[string]interface{}{"note": "nothing here"}, nil))
 	require.NotNil(t, resp)
 	assert.NotContains(t, resp.Denial.Details, "argument")
 }
@@ -286,9 +280,7 @@ func TestAllowedOperations_EveryJWTRefusalCarriesDetails(t *testing.T) {
 // chain-verifiable, just unbounded.
 func TestJWTConditionDenials_DetailsAreBounded(t *testing.T) {
 	huge := strings.Repeat("A", 64<<10)
-	resp := evaluateJWTConditions(nil,
-		[]capability.Condition{capability.AllowedOperationsCondition{Operations: []string{"SELECT"}}},
-		"query_db", map[string]interface{}{"sql": "DROP " + huge}, nil)
+	resp := evaluateJWTConditions(context.Background(), nil, nil, []capability.Condition{capability.AllowedOperationsCondition{Operations: []string{"SELECT"}}}, jwtCondReq("query_db", map[string]interface{}{"sql": "DROP " + huge}, nil))
 	require.NotNil(t, resp)
 	require.NotNil(t, resp.Denial)
 	op, ok := resp.Denial.Details["operation"].(string)

@@ -184,6 +184,35 @@ type PolicyDecisionPoint interface {
 	//   - MUST be a safe identity for a PDP with nothing to contribute (AlwaysAllowPDP,
 	//     DenyAllPDP), and for an allow.
 	HardenRefusal(ctx context.Context, sessionID string, r capability.EnforceResponse, target EnforceTarget, args map[string]interface{}) capability.EnforceResponse
+
+	// EvaluateClaimCondition evaluates ONE condition that a COMPOSING layer derived from a
+	// token claim, under THIS PDP's own condition semantics, committing nothing. It returns
+	// the refusal that condition produces (nil when it passes) and whether this PDP could
+	// answer at all.
+	//
+	// It is on the contract for the reason HardenRefusal is: the composing layer is the JWT
+	// PDP, which evaluates a capability claim's conditions BEFORE delegating to the PDP it
+	// wraps, and "what does allowedValues mean here" is a question only the wrapped PDP can
+	// answer. enforcement.WithConditionHandler is the documented seam for an embedder to
+	// redefine a built-in condition type, and it reaches an *Engine's dispatch table — which
+	// the manifest path goes through and a package-level predicate call does not. Without
+	// this seam, an embedder wiring one Engine into both a ManifestPDP and a JWTPDP got two
+	// PDPs in one intersection disagreeing about the same condition type on the same call:
+	// a token-scoped caller denied by a rule the override does not enforce, or allowed past
+	// one the override was written to close. Nothing fails and nothing logs; the two
+	// verdicts are each internally consistent and only wrong together.
+	//
+	// Contract for implementers:
+	//   - MUST NOT commit state. It runs ahead of this PDP's own decision, so a committing
+	//     evaluation would consume a quota slot (or write a label, or record an antecedent)
+	//     for a call this PDP has not decided, and then charge it again when it does.
+	//   - MUST report ok=false rather than guess when it cannot answer without committing,
+	//     or has no semantics for the type. The caller fails closed on false; returning a
+	//     nil refusal instead would read as "the condition passed".
+	//   - A PDP holding no condition engine of its own (AlwaysAllowPDP, DenyAllPDP, a
+	//     JWT-only route) answers from the built-ins, which are that deployment's semantics
+	//     precisely because there is no engine to have overridden them.
+	EvaluateClaimCondition(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (*enforcement.ConditionError, bool)
 }
 
 // ListFilterer filters tools/resources/prompts list results down to the entries
@@ -625,6 +654,15 @@ func (AlwaysAllowPDP) HardenRefusal(_ context.Context, _ string, r capability.En
 	return r
 }
 
+// EvaluateClaimCondition answers from the built-in condition semantics. A wiretap route
+// holds no enforcement engine, so there is no handler registry an embedder could have
+// overridden and the built-in IS this route's meaning of the condition type — unlike a
+// ManifestPDP, where answering from the built-in would ignore an override the operator
+// wired.
+func (AlwaysAllowPDP) EvaluateClaimCondition(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (*enforcement.ConditionError, bool) {
+	return enforcement.NonCommittingConditionVerdict(ctx, cond, req)
+}
+
 // FilterToolsList passes the tools/list result through unchanged: wiretap/audit
 // mode applies no policy. It still reports an accurate entry count (Upstream ==
 // Kept) so a JWT route layered over a wiretap inner audits the right numbers.
@@ -748,6 +786,13 @@ func noFlowStateErr(decl *capability.Declassification, who string) error {
 // ceiling and no redaction, so it has nothing to compose onto another layer's verdict.
 func (DenyAllPDP) HardenRefusal(_ context.Context, _ string, r capability.EnforceResponse, _ EnforceTarget, _ map[string]interface{}) capability.EnforceResponse {
 	return r
+}
+
+// EvaluateClaimCondition answers from the built-in condition semantics, for the reason the
+// wiretap PDP does: the "no policy" default holds no engine, so there is no override to
+// consult. Its own decisions deny regardless, so this can only ever refuse a call earlier.
+func (DenyAllPDP) EvaluateClaimCondition(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (*enforcement.ConditionError, bool) {
+	return enforcement.NonCommittingConditionVerdict(ctx, cond, req)
 }
 
 // FilterToolsList filters the tools/list result down to nothing (keep == false
@@ -2060,6 +2105,16 @@ func (p *ManifestPDP) HardenRefusal(ctx context.Context, sessionID string, r cap
 		return hardened
 	}
 	return p.withForwardObligations(ctx, r, target, sel.naming)
+}
+
+// EvaluateClaimCondition dispatches through THIS PDP's engine, so an embedder's
+// WithConditionHandler override is what a claim-derived condition is judged by — the same
+// handler the manifest path runs for the same type on the same call. The engine refuses
+// (ok=false) a type it has no handler for, and one whose handler COMMITS state on admit,
+// since this runs before the decision and a committing evaluation would charge the call
+// twice. A nil engine falls back to the built-ins inside the engine method.
+func (p *ManifestPDP) EvaluateClaimCondition(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (*enforcement.ConditionError, bool) {
+	return p.engine.NonCommittingConditionVerdict(ctx, cond, req)
 }
 
 // hardenOnUnapprovedDeclassify replaces an outer layer's downgradable refusal with the

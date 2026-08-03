@@ -25,7 +25,7 @@ const DefaultIdleTTL = 24 * time.Hour
 // see the same taint. Safe for concurrent use.
 type Redis struct {
 	client redis.Cmdable
-	// ttl is the configured idle TTL as passed to WithIdleTTL (DefaultIdleTTL when
+	// ttl is the configured idle TTL as passed to WithRedisIdleTTL (DefaultIdleTTL when
 	// unset). It is stored verbatim; effectiveTTL applies the non-positive guard at
 	// the point of use.
 	ttl time.Duration
@@ -34,14 +34,18 @@ type Redis struct {
 // RedisOption configures the Redis store.
 type RedisOption func(*Redis)
 
-// WithIdleTTL overrides the idle TTL stamped (and refreshed) on each session's label
-// set. The TTL is a safety-reclamation bound for an orphaned session whose Clear never
-// arrives (e.g. a crashed instance), NOT a security-relevant lifetime: it is refreshed
-// on every Add and Get, so a live/active session never loses its taint. Size it
-// to the deployment's session idle timeout. A non-positive d is ignored in favor of
-// DefaultIdleTTL (see effectiveTTL), since a zero/negative EXPIRE would drop a live
-// session's taint immediately — fail safe, not open.
-func WithIdleTTL(d time.Duration) RedisOption {
+// WithRedisIdleTTL overrides the idle TTL stamped (and refreshed) on each anchor's label
+// set. The TTL is a safety-reclamation bound for an orphaned anchor whose Clear never
+// arrives (e.g. a crashed instance, or a task-anchored key no teardown owns), NOT a
+// security-relevant lifetime: it is refreshed on every Add and Get, so a live/active
+// anchor never loses its taint. Size it to the deployment's session idle timeout. A
+// non-positive d is ignored in favor of DefaultIdleTTL (see effectiveTTL), since a
+// zero/negative EXPIRE would drop a live anchor's taint immediately — fail safe, not open.
+//
+// It is spelled per-backend, beside WithMemoryIdleTTL, because the setting is now common
+// to both and the two constructors take different option types: one name would have to be
+// the one that silently does not apply to the store you passed it to.
+func WithRedisIdleTTL(d time.Duration) RedisOption {
 	return func(r *Redis) {
 		r.ttl = d
 	}

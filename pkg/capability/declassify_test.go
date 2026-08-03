@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/eunolabs/eunox/pkg/capability"
 	"github.com/stretchr/testify/assert"
@@ -298,4 +299,129 @@ func TestCoveringDeclassifyApprovals_ReturnsEveryMatchInTokenOrder(t *testing.T)
 	// A target no grant names covers nothing — an empty list rather than a nil-dereferencing
 	// "first match".
 	assert.Empty(t, capability.CoveringDeclassifyApprovals(approvals, "tool:other", []string{capability.FlowLabelPII}))
+}
+
+// TestCheckDeclassifyApprovalLifetime is the bound that makes `once` unconditional rather
+// than "once per ledger window": a burn is remembered for DeclassifyLedgerWindowSec, so a
+// token that outlives the window would present the same grant after the burn aged out and
+// clear a second time. The token is refused instead.
+func TestCheckDeclassifyApprovalLifetime(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	window := time.Duration(capability.DeclassifyLedgerWindowSec) * time.Second
+	once := capability.DeclassifyApproval{
+		Labels: []string{capability.FlowLabelPII}, Target: "tool:publish",
+		Approver: "ada", ID: "apr-1", Once: true,
+	}
+	standing := once
+	standing.Once = false
+
+	cases := []struct {
+		name      string
+		approvals []capability.DeclassifyApproval
+		exp       time.Time
+		leeway    time.Duration
+		wantErr   string
+	}{
+		{
+			name:      "short-lived token carrying a once grant is admitted",
+			approvals: []capability.DeclassifyApproval{once},
+			exp:       now.Add(15 * time.Minute),
+		},
+		{
+			name:      "a token exactly at the window is admitted",
+			approvals: []capability.DeclassifyApproval{once},
+			exp:       now.Add(window),
+		},
+		{
+			name:      "a token past the window is refused",
+			approvals: []capability.DeclassifyApproval{once},
+			exp:       now.Add(window + time.Second),
+			wantErr:   "longer than the",
+		},
+		{
+			// The leeway the same validation accepted exp under counts against the window:
+			// a token admitted at the edge of that grace must still be inside it.
+			name:      "leeway counts against the window",
+			approvals: []capability.DeclassifyApproval{once},
+			exp:       now.Add(window),
+			leeway:    time.Second,
+			wantErr:   "longer than the",
+		},
+		{
+			// A standing grant is replayable for the token's lifetime by design, so no
+			// ledger memory has to outlive anything.
+			name:      "a standing grant on a long-lived token is untouched",
+			approvals: []capability.DeclassifyApproval{standing},
+			exp:       now.Add(365 * 24 * time.Hour),
+		},
+		{
+			name:      "no verified expiry cannot be inside any window",
+			approvals: []capability.DeclassifyApproval{once},
+			wantErr:   "no verified expiry",
+		},
+		{
+			name: "no approvals at all is the overwhelmingly common case",
+			exp:  now.Add(365 * 24 * time.Hour),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := capability.CheckDeclassifyApprovalLifetime(tc.approvals, tc.exp, now, tc.leeway)
+			if tc.wantErr == "" {
+				assert.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+			// The offending grant is named, so an operator fixes the approval rather than
+			// hunting the whole claim.
+			assert.Contains(t, err.Error(), "apr-1")
+		})
+	}
+}
+
+// TestDeclassifyLedgerWindow_OutlivesEveryAdmittedToken states the composition the two halves
+// make, which neither states alone: the burn is written no earlier than the moment the token
+// is presented, and the boundary admits no token whose remaining life exceeds the window, so
+// the burn always outlives the token that could replay it.
+func TestDeclassifyLedgerWindow_OutlivesEveryAdmittedToken(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	window := time.Duration(capability.DeclassifyLedgerWindowSec) * time.Second
+	once := capability.DeclassifyApproval{
+		Labels: []string{capability.FlowLabelPII}, Target: "tool:publish",
+		Approver: "ada", ID: "apr-1", Once: true,
+	}
+	admitted := []time.Time{now.Add(time.Minute), now.Add(window / 2), now.Add(window)}
+	for _, exp := range admitted {
+		require.NoError(t, capability.CheckDeclassifyApprovalLifetime(
+			[]capability.DeclassifyApproval{once}, exp, now, 0))
+		// The burn happens no earlier than now (the token is being presented), so it is
+		// remembered until at least now+window — never before exp.
+		assert.False(t, now.Add(window).Before(exp),
+			"an admitted token outlives the ledger memory of its own burn")
+	}
+}
+
+// TestCheckDeclassifyApprovalLifetime_EpochIsNotUnset is the encoding trap the guard has to
+// survive. time.Unix(0, 0) is a real 1970 instant, so it is NOT IsZero — and its remaining
+// lifetime is decades in the past, comfortably "inside" the window. A caller that encoded
+// "no expiry established" that way would have a `once` grant admitted on a token whose
+// lifetime this build never bounded, which is the fail-open direction on the one property
+// this function guarantees. The unset case must be the zero Time, and this pins that the
+// two are treated differently.
+func TestCheckDeclassifyApprovalLifetime_EpochIsNotUnset(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	once := []capability.DeclassifyApproval{{
+		Labels: []string{capability.FlowLabelPII}, Target: "tool:publish",
+		Approver: "ada", ID: "apr-1", Once: true,
+	}}
+
+	require.Error(t, capability.CheckDeclassifyApprovalLifetime(once, time.Time{}, now, 0),
+		"the zero Time is 'no verified expiry' and must be refused")
+
+	// Documenting the trap rather than blessing it: an epoch instant is a real (long
+	// expired) timestamp, so it does NOT take the unset arm. A caller must not use it as a
+	// sentinel — see the function's own doc, and the JWT call site that guards for it.
+	assert.False(t, time.Unix(0, 0).IsZero(),
+		"time.Unix(0,0) is not the zero Time; a caller must not use it to mean 'unset'")
 }

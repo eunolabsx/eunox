@@ -104,6 +104,16 @@ const (
 	// signature, a stale or future-dated receipt. It earns nothing. This is the fail-closed
 	// case, and it must stay distinct from "no receipt at all": a server that USED to
 	// attest and now cannot is a different event from one that never did.
+	//
+	// It deliberately COLLAPSES what internal/registry's attestation verifier deliberately
+	// SPLITS: there, a key the operator does not hold is inert while a key they do hold
+	// whose signature fails is a hard error. Both choices are right in context, and the
+	// difference is worth naming because an operator reasoning from one about the other
+	// gets it backwards. Here every unverified receipt earns exactly nothing, so grading
+	// them would only invite a consumer to treat some as softer; there, the two are the
+	// difference between "signed by a stranger" and "edited after it was signed", which are
+	// different actions for the human reading the report. See docs/effect-contracts.md,
+	// "Why there are two operator-configured key files".
 	ReceiptUnverified ReceiptVerdict = "unverified"
 	// ReceiptInconsistent — the signature verified, and the server's own account of what
 	// it did contradicts the contract the decision was made against. The strongest signal
