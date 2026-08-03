@@ -98,40 +98,32 @@ func (m *LocalManifest) AccumulatesSharedState() bool {
 	return m.anyTokenState(capability.StateAccumulation.AccumulatesSharedState)
 }
 
-// HasSequenceBlock reports whether any capability entry carries a sequenceBlock
-// condition. The engine records a per-call antecedent marker only so a later
-// sequenceBlock can read it; when no entry uses sequenceBlock the marker is never
-// read, so recording (and its fail-closed deny on a counter-write fault) can be
-// skipped entirely. Like HasFlowLabel it is a SUBSYSTEM question — the
-// WithoutAntecedentRecording gate — and not the state-accumulation one.
-func (m *LocalManifest) HasSequenceBlock() bool {
-	return m.anyCondition(func(cond capability.Condition) bool {
-		switch cond.(type) {
-		case capability.SequenceBlockCondition, *capability.SequenceBlockCondition:
-			return true
-		}
-		return false
-	})
-}
-
-// HasFlowLabel reports whether any capability entry uses information-flow control — a
-// flowLabel condition (sink; reads per-anchor label state), a labelOutput directive (source;
-// writes it), or a declassify directive (the approval-gated clear).
+// UsesEngineSubsystem reports whether any of this policy's tokens depends on the named
+// OPTIONAL engine subsystem — the antecedent history a sequenceBlock reads, or the flow-label
+// set a sink peeks and a source writes. The route builder asks it once per subsystem and skips
+// the ones no token needs (WithoutAntecedentRecording, WithoutFlowLabels).
 //
-// It is a SUBSYSTEM question, not the state-accumulation one: its consumer is the engine's
-// WithoutFlowLabels gate, which skips the flow peek/record path entirely for a policy that has
-// no flow token. That is deliberately narrower than "does this policy accumulate state" — a
-// sequenceBlock-only policy accumulates plenty and still wants the flow path skipped — so it
-// stays a per-token predicate while the decision turn and the shared-state advisory derive
-// from the tokens' declared classes. The failure direction differs too: a subsystem gate left
-// un-skipped costs a per-call scan, where a missed turn reopens a race.
-func (m *LocalManifest) HasFlowLabel() bool {
-	// Single-sourced through the capability predicates (value/pointer-safe) so this
-	// config-level advisory and the engine's constraintHasFlow gate cannot drift on
-	// what counts as flow-relevant when the type set grows.
-	return m.anyCondition(capability.IsFlowLabelCondition) ||
-		m.anyDirective(capability.IsLabelOutputDirective) ||
-		m.anyDirective(capability.IsDeclassifyDirective)
+// It is a narrower question than "does this policy accumulate state", and deliberately so: a
+// sequenceBlock-only policy accumulates plenty and still wants the flow path skipped. The two
+// were previously separate hand-written predicates — one naming sequenceBlock, one naming the
+// three flow token types — and the flow one failed in the direction that matters. Add a
+// condition that READS the flow-label set and a policy carrying only it reports "no flow
+// token": the engine is built WithoutFlowLabels and the new handler runs against an engine
+// holding no flow state, most plausibly reading an empty set and allowing what the labels
+// existed to block. Both gates now derive from the subsystem each token DECLARES on its
+// pkg/capability prototype-registry entry, so a token added there is covered by construction.
+//
+// An UNCLASSIFIED token (one declaring no subsystem, or naming one this build does not model)
+// depends on all of them, so it disables both skips. That is the cheap direction — the skips
+// are optimizations, and the build-time completeness test is what stops such a token shipping.
+//
+// A nil manifest (a route with no policy) carries no token and needs no subsystem.
+func (m *LocalManifest) UsesEngineSubsystem(s capability.EngineSubsystem) bool {
+	return m.anyCondition(func(cond capability.Condition) bool {
+		return capability.ConditionUsesEngineSubsystem(cond, s)
+	}) || m.anyDirective(func(dir capability.Directive) bool {
+		return capability.DirectiveUsesEngineSubsystem(dir, s)
+	})
 }
 
 // NeedsDecisionTurn reports whether this policy's decisions must be SERIALIZED on the state

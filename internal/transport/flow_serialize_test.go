@@ -263,7 +263,8 @@ func TestFlowSerialize_SamplingSinkSerializedAgainstSource(t *testing.T) {
 			// The sampling decision reserves its own (later) ticket and blocks until its turn —
 			// the exact wiring stdio's samplingDecideLock installs.
 			decideLock: func() (func(), bool) { return gate.begin(gate.take(sessionAnchorKey(sessionID))), true },
-		}.withPDP(dp)
+			pdp:        dp,
+		}
 
 		var wg sync.WaitGroup
 		wg.Add(1)
@@ -667,7 +668,8 @@ func TestDecideSampling_RefusedTurnIsAHardDeny(t *testing.T) {
 	fp := serverRequestParams{
 		sessionID:  "sess-a",
 		decideLock: func() (func(), bool) { return nil, false },
-	}.withPDP(pdp.AlwaysAllowPDP{})
+		pdp:        pdp.AlwaysAllowPDP{},
+	}
 
 	dec := fp.decideSampling(context.Background())
 	require.Equal(t, capability.DecisionDeny, dec.Decision, "an unenterable turn must not be decided unserialized")
@@ -774,4 +776,115 @@ func TestStdioDecisionTicket_UnpinnedProxyStillSerializes(t *testing.T) {
 	p.pinDecisionQueue()
 	assert.Equal(t, 1, p.decideGate.size(), "the fallback and the pin address one queue, not two")
 	p.dropDecideQueue()
+}
+
+// TestStdioUpstreamRequest_DoesNotStallResponseDelivery is the acceptance test for moving the
+// server-initiated leg off the read loop, and it drives the whole reader rather than the lock.
+//
+// Bounding the sampling leg's wait turned a deadlock into a stall, and nothing bounded how
+// OFTEN that stall could be provoked: the reader is the only goroutine that delivers upstream
+// responses to waiting host handlers, so an upstream emitting one sampling/createMessage per
+// in-flight declassifying call cost the whole session its response delivery for the length of
+// the bound, every time. The handler runs on its own goroutine now, so a blocked one blocks
+// only itself.
+//
+// The property is timed rather than merely reached: with the handler inline, the response
+// below is not even READ off the pipe until the sampling wait expires, so the assertion is
+// that delivery happens in a fraction of that bound.
+func TestStdioUpstreamRequest_DoesNotStallResponseDelivery(t *testing.T) {
+	t.Parallel()
+	pr, pw := io.Pipe()
+	p := &StdioProxy{
+		// The policy grants no sampling: the turn is taken BEFORE the decision that would
+		// refuse it, so an upstream policy denies sampling to can stall the reader just as
+		// well as one it permits.
+		pdp:          newTestManifestPDP(capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
+		sessionID:    "sess-a",
+		decideGate:   newDecisionSerializer(),
+		upReader:     mcp.NewMsgReader(pr),
+		upWriter:     mcp.NewMsgWriter(io.Discard),
+		hostWriter:   mcp.NewMsgWriter(io.Discard),
+		byUpstreamID: map[string]chan upstreamResult{},
+	}
+	p.pinDecisionQueue()
+	t.Cleanup(p.dropDecideQueue)
+
+	// A declassifying host call holds the turn across its upstream round trip, waiting for the
+	// very response this reader has to deliver.
+	held := p.decideGate.begin(p.decideGate.takeOn(p.decideQueue))
+
+	// That call's in-flight registration, exactly as callUpstream makes it.
+	nonce := mcp.RawJSON(`"eunox-up-1"`)
+	reply := make(chan upstreamResult, 1)
+	p.byUpstreamID[mcp.MsgKey(nonce)] = reply
+
+	readerDone := make(chan struct{})
+	go func() { defer close(readerDone); p.readUpstream(context.Background()) }()
+
+	start := time.Now()
+	w := mcp.NewMsgWriter(pw)
+	require.NoError(t, w.Write(mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: capability.MethodSamplingCreateMessage}))
+	require.NoError(t, w.Write(mcp.RPCMsg{JSONRPC: "2.0", ID: nonce, Result: json.RawMessage(`{"ok":true}`)}))
+
+	select {
+	case <-reply:
+	case <-time.After(4 * samplingTurnWait):
+		t.Fatal("the response never arrived: the reader is wedged behind the sampling handler")
+	}
+	assert.Less(t, time.Since(start), samplingTurnWait/2,
+		"the reader must keep delivering responses while a sampling handler waits for the turn, "+
+			"not stall for the length of that wait")
+
+	// Release the turn so the parked handler completes promptly, then tear down and drain it —
+	// the reader exiting does not imply its handlers have.
+	held()
+	require.NoError(t, pw.Close())
+	<-readerDone
+	p.awaitServerRequestsDrained(4 * samplingTurnWait)
+	assert.Zero(t, p.serverReqInFlight.Load(), "every dispatched handler must be accounted for at teardown")
+}
+
+// TestStdioUpstreamRequest_SaturationIsRefusedAndRecorded covers the bound that had to come
+// with the goroutine. An upstream emitting server-initiated requests faster than the host
+// answers them would otherwise grow goroutines without limit — the hazard hostSem exists for
+// on the other side, arriving from the upstream instead.
+//
+// Both halves matter: the upstream is ANSWERED (a request it never gets a reply to leaves it
+// waiting forever) and the refusal is RECORDED, so a flood leaves a trace on the tamper-evident
+// tape rather than only a stream of error replies.
+func TestStdioUpstreamRequest_SaturationIsRefusedAndRecorded(t *testing.T) {
+	t.Parallel()
+	uw := &mockUpstreamWriter{}
+	rec := &fwdRecorder{}
+	p := &StdioProxy{
+		pdp:        pdp.AlwaysAllowPDP{},
+		sessionID:  "sess-a",
+		upWriter:   mcp.NewMsgWriter(&writerAdapter{uw}),
+		hostWriter: mcp.NewMsgWriter(io.Discard),
+		recCached:  rec,
+		serverSem:  make(chan struct{}, maxConcurrentServerRequests),
+	}
+	p.recOnce.Do(func() {}) // the recorder is injected; keep rec() from rebuilding it
+
+	for range maxConcurrentServerRequests {
+		p.serverSem <- struct{}{}
+	}
+	p.dispatchUpstreamRequest(context.Background(), mcp.RPCMsg{
+		JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: capability.MethodSamplingCreateMessage,
+	})
+
+	assert.Zero(t, p.serverReqInFlight.Load(), "a refused request must not have been dispatched")
+	require.Len(t, uw.messages, 1, "the refused request must be answered, not left hanging")
+	require.NotNil(t, uw.messages[0].Error)
+	assert.Equal(t, jsonRPCCodeServerBusy, uw.messages[0].Error.Code, "and refused as retryable overload, not as a policy denial")
+	require.Len(t, rec.records, 1, "a saturating upstream must leave a trace on the tape")
+	assert.Equal(t, codeResourceExhausted, rec.records[0].code)
+
+	// A freed slot ends the episode: the next request is dispatched normally.
+	<-p.serverSem
+	p.dispatchUpstreamRequest(context.Background(), mcp.RPCMsg{
+		JSONRPC: "2.0", ID: mcp.RawJSON(`8`), Method: capability.MethodSamplingCreateMessage,
+	})
+	p.awaitServerRequestsDrained(4 * samplingTurnWait)
+	assert.Zero(t, p.serverReqInFlight.Load())
 }

@@ -88,7 +88,7 @@ func dispatchToolsList(t *testing.T, o *listingObserver, audit bool, params, res
 				return mcp.RPCMsg{JSONRPC: "2.0", ID: msg.ID, Result: json.RawMessage(result)}, nil
 			},
 		},
-		decidingPDP: decidingPDP{pdp: o},
+		pdp: o,
 	}
 	msg := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsList}
 	if params != "" {
@@ -148,7 +148,7 @@ func TestDispatchList_MarksOnlyToolsList(t *testing.T) {
 				return mcp.RPCMsg{JSONRPC: "2.0", ID: msg.ID, Result: json.RawMessage(`{"resources":[]}`)}, nil
 			},
 		},
-		decidingPDP: decidingPDP{pdp: filterProbePDP{onFilter: func(ctx context.Context) { seen = pdp.CompleteToolListingFromContext(ctx) }}},
+		pdp: filterProbePDP{onFilter: func(ctx context.Context) { seen = pdp.CompleteToolListingFromContext(ctx) }},
 	}
 	out := dispatchRequest(context.Background(), d, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodResourcesList})
 	if out.Error != nil {

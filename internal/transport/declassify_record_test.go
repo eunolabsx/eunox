@@ -10,9 +10,9 @@ import (
 	"errors"
 	"go/ast"
 	"go/parser"
+	"go/printer"
 	"go/token"
 	"os"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -97,9 +97,9 @@ func (c *commitSpy) CommitDeclassified(ctx context.Context, _ string, decl *capa
 // tape — and the ones an auditor most needs complete — unguarded.
 func TestEnforcedForwardCore_DeclassifiedAllowRecordsTheApproval(t *testing.T) {
 	rec, spy := &fwdRecorder{}, &commitSpy{}
-	fp := forwardParams{rec: rec, sessionID: "s", callUpstream: cleanUpstream(), committer: spy}
+	fp := forwardParams{rec: rec, sessionID: "s", callUpstream: cleanUpstream()}
 
-	resp := enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
+	resp := enforcedForwardCore(context.Background(), fp, spy, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
 		declassifiedAllow(), "tools/call", "sanitize", "sanitize", "tool", false, upstreamErrorDetail)
 
 	require.Nil(t, resp.Error)
@@ -126,7 +126,7 @@ func TestEnforcedForwardCore_OrdinaryAllowCarriesNoApproval(t *testing.T) {
 	rec := &fwdRecorder{}
 	fp := forwardParams{rec: rec, sessionID: "s", callUpstream: cleanUpstream()}
 
-	enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
+	enforcedForwardCore(context.Background(), fp, &commitSpy{}, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
 		allowDecision(), "tools/call", "read_file", "read_file", "tool", false, upstreamErrorDetail)
 
 	require.Len(t, rec.records, 1)
@@ -142,11 +142,11 @@ func TestEnforcedForwardCore_OrdinaryAllowCarriesNoApproval(t *testing.T) {
 // silently overwrote a real argument of the same name.
 func TestEnforcedForwardCore_DeclassifyDoesNotMutateCallerDetails(t *testing.T) {
 	rec, spy := &fwdRecorder{}, &commitSpy{}
-	fp := forwardParams{rec: rec, sessionID: "s", callUpstream: cleanUpstream(), committer: spy}
+	fp := forwardParams{rec: rec, sessionID: "s", callUpstream: cleanUpstream()}
 
 	// A closure returning the caller's own map by reference, as the tools/call one does.
 	live := map[string]interface{}{"path": "/tmp/x"}
-	enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
+	enforcedForwardCore(context.Background(), fp, spy, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
 		declassifiedAllow(), "tools/call", "sanitize", "sanitize", "tool", false,
 		func(mcp.RPCMsg) map[string]interface{} { return live })
 
@@ -216,7 +216,7 @@ func TestEnforcedForwardCore_RefusalBelowTheDecisionNeverCommits(t *testing.T) {
 			fp: func(rec *fwdRecorder, spy *commitSpy) forwardParams {
 				rec.degraded, rec.reason = true, "audit trail degraded"
 				return forwardParams{
-					rec: rec, sessionID: "s", callUpstream: cleanUpstream(), committer: spy,
+					rec: rec, sessionID: "s", callUpstream: cleanUpstream(),
 					strictAuditState: strictAuditState{requireAuditStrict: true},
 				}
 			},
@@ -226,7 +226,7 @@ func TestEnforcedForwardCore_RefusalBelowTheDecisionNeverCommits(t *testing.T) {
 		"upstream failure": {
 			fp: func(rec *fwdRecorder, spy *commitSpy) forwardParams {
 				return forwardParams{
-					rec: rec, sessionID: "s", committer: spy,
+					rec: rec, sessionID: "s",
 					callUpstream: func(context.Context, mcp.RPCMsg) (mcp.RPCMsg, error) {
 						return mcp.RPCMsg{}, errors.New("upstream gone")
 					},
@@ -239,7 +239,7 @@ func TestEnforcedForwardCore_RefusalBelowTheDecisionNeverCommits(t *testing.T) {
 		// answer, but the response is withheld, so the clear must not have landed either.
 		"redaction failure": {
 			fp: func(rec *fwdRecorder, spy *commitSpy) forwardParams {
-				return forwardParams{rec: rec, sessionID: "s", committer: spy,
+				return forwardParams{rec: rec, sessionID: "s",
 					callUpstream: func(_ context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, error) {
 						// A result the redact path cannot walk, so ApplyRedactObligs fails.
 						return mcp.RPCMsg{ID: msg.ID, Result: json.RawMessage(`"not-an-object"`)}, nil
@@ -252,7 +252,7 @@ func TestEnforcedForwardCore_RefusalBelowTheDecisionNeverCommits(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			rec, spy := &fwdRecorder{}, &commitSpy{}
-			resp := enforcedForwardCore(context.Background(), tc.fp(rec, spy), mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
+			resp := enforcedForwardCore(context.Background(), tc.fp(rec, spy), spy, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
 				tc.dec(), "tools/call", "sanitize", "sanitize", "tool", false, upstreamErrorDetail)
 
 			require.NotNil(t, resp.Error, "the call is refused")
@@ -395,9 +395,9 @@ func TestDeclassifyRedactionDetail_RidesAloneOnANoOpClear(t *testing.T) {
 func TestEnforcedForwardCore_CommitFaultIsRecordedOnTheAllow(t *testing.T) {
 	rec := &fwdRecorder{}
 	spy := &commitSpy{failErr: errors.New("flow store unreachable")}
-	fp := forwardParams{rec: rec, sessionID: "s", callUpstream: cleanUpstream(), committer: spy}
+	fp := forwardParams{rec: rec, sessionID: "s", callUpstream: cleanUpstream()}
 
-	resp := enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
+	resp := enforcedForwardCore(context.Background(), fp, spy, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
 		declassifiedAllow(), "tools/call", "sanitize", "sanitize", "tool", false, upstreamErrorDetail)
 
 	require.Nil(t, resp.Error, "the call ran; its response is not withheld because bookkeeping failed")
@@ -423,9 +423,9 @@ func TestEnforcedForwardCore_CommitFaultIsRecordedOnTheAllow(t *testing.T) {
 // operator could not tell which of their outstanding one-shot approvals were still live.
 func TestEnforcedForwardCore_NoOpCommitStillNamesTheSpentGrant(t *testing.T) {
 	rec, spy := &fwdRecorder{}, &commitSpy{noop: true}
-	fp := forwardParams{rec: rec, sessionID: "s", callUpstream: cleanUpstream(), committer: spy}
+	fp := forwardParams{rec: rec, sessionID: "s", callUpstream: cleanUpstream()}
 
-	enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
+	enforcedForwardCore(context.Background(), fp, spy, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
 		declassifiedAllow(), "tools/call", "sanitize", "sanitize", "tool", false, upstreamErrorDetail)
 
 	require.Equal(t, 1, spy.calls)
@@ -445,9 +445,9 @@ func TestEnforcedForwardCore_StandingGrantStampsNoSpentID(t *testing.T) {
 	// Standing grant: authorized, but nothing burned.
 	dec.Declassification = capability.NewDeclassification(
 		[]string{capability.FlowLabelPII}, "alice@example.com", "apr-9", false)
-	fp := forwardParams{rec: rec, sessionID: "s", callUpstream: cleanUpstream(), committer: spy}
+	fp := forwardParams{rec: rec, sessionID: "s", callUpstream: cleanUpstream()}
 
-	enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
+	enforcedForwardCore(context.Background(), fp, spy, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
 		dec, "tools/call", "sanitize", "sanitize", "tool", false, upstreamErrorDetail)
 
 	require.Len(t, rec.records, 1)
@@ -475,7 +475,7 @@ func TestEnforcedForwardCore_CommitOutlivesTheRequestContext(t *testing.T) {
 	// the state anchor resolves from.
 	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), commitCtxProbe{}, "claims"))
 	defer cancel()
-	fp := forwardParams{rec: rec, sessionID: "s", committer: spy,
+	fp := forwardParams{rec: rec, sessionID: "s",
 		callUpstream: func(_ context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, error) {
 			// What a client disconnect looks like from here: the upstream answered, and the
 			// request context is done by the time the response is assembled.
@@ -483,7 +483,7 @@ func TestEnforcedForwardCore_CommitOutlivesTheRequestContext(t *testing.T) {
 			return mcp.RPCMsg{ID: msg.ID, Result: json.RawMessage(`{"ok":true}`)}, nil
 		}}
 
-	enforcedForwardCore(ctx, fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
+	enforcedForwardCore(ctx, fp, spy, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
 		declassifiedAllow(), "tools/call", "sanitize", "sanitize", "tool", false, upstreamErrorDetail)
 
 	require.True(t, spy.sawCalled)
@@ -505,12 +505,12 @@ func TestEnforcedForwardCore_BoundsTheSpentApprovalID(t *testing.T) {
 	dec := declassifiedAllow()
 	longID := strings.Repeat("a", 64*1024)
 	dec.Declassification = capability.NewDeclassification([]string{capability.FlowLabelPII}, "alice@example.com", longID, true)
-	fp := forwardParams{rec: rec, sessionID: "s", committer: spy,
+	fp := forwardParams{rec: rec, sessionID: "s",
 		callUpstream: func(context.Context, mcp.RPCMsg) (mcp.RPCMsg, error) {
 			return mcp.RPCMsg{}, errors.New("upstream gone")
 		}}
 
-	enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
+	enforcedForwardCore(context.Background(), fp, spy, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
 		dec, "tools/call", "sanitize", "sanitize", "tool", false, upstreamErrorDetail)
 
 	require.Len(t, rec.records, 1)
@@ -520,89 +520,27 @@ func TestEnforcedForwardCore_BoundsTheSpentApprovalID(t *testing.T) {
 	assert.Contains(t, got, "eunox: truncated", "and the cut must be visible")
 }
 
-// TestDispatchParams_WireTheCommitterFromTheDecidingPDP closes the gap that let the whole
-// commit be deleted with green tests: every other test builds a forwardParams literal by
-// hand, so nothing exercised the PRODUCTION wiring. Both transports must derive the
-// committer from the same PDP they decide with — two independently-assigned fields is a
-// drift surface whose failure mode is silent (every declassification in the policy quietly
-// failing to take effect).
-func TestDispatchParams_WireTheCommitterFromTheDecidingPDP(t *testing.T) {
-	// Distinguishable POINTERS, not two zero-size DenyAllPDP{} values. Every DenyAllPDP is
-	// deeply equal to every other, so an assertion over those passes for a withPDP that
-	// wired committer to some OTHER instance of the same type — which is exactly the drift
-	// this test exists to catch. Identity has to be asserted on something that has an
-	// identity.
-	sp := &StdioProxy{pdp: &pdp.JWTPDP{}}
-	d := sp.dispatchParams()
-	require.NotNil(t, d.committer, "stdio must wire the commit")
-	assert.Same(t, d.pdp, d.committer, "and it must be the PDP that decided, not merely one of the same type")
-
-	hp := &HTTPProxy{}
-	hd := hp.dispatchParams(&httpSession{id: "s", route: &UpstreamRoute{pdp: &pdp.JWTPDP{}}}, "")
-	require.NotNil(t, hd.committer, "http must wire the commit")
-	assert.Same(t, hd.pdp, hd.committer, "and it must be the PDP that decided, not merely one of the same type")
-
-	// The server-initiated leg goes through the same constructor. It was the one construction
-	// path the invariant did not cover: both of its sites assigned pdp directly, so neither the
-	// compiler nor a test could see a field derived from it being forgotten. It carries no
-	// committer — that leg refuses a declassification rather than committing one — so what the
-	// source guard below enforces is that nothing sets pdp outside this constructor.
-	decider := &pdp.JWTPDP{}
-	sr := serverRequestParams{sessionID: "s"}.withPDP(decider)
-	assert.Same(t, decider, sr.pdp, "the leg must decide with the PDP it was handed")
-}
-
-// TestParamsLiterals_DoNotAssignThePDPFields is what makes withPDP an invariant rather than a
-// convention. The compiler already refuses `dispatchParams{pdp: p}` — pdp lives on the
-// embedded decidingPDP, and Go rejects a promoted field in a composite literal — so what is
-// left to guard is the spellings the language still allows: a literal of decidingPDP itself, a
-// literal naming a field DERIVED from the decision point (committer), and a plain assignment
-// to either through the promotion.
+// TestEnforcedForwardCore_CommitsWithTheDecidingPDP is what is left to guard once the
+// committer stopped being a FIELD. It used to be forwardParams.committer, a second copy of
+// the decision point the dispatcher decides with, kept in agreement by a constructor step
+// (withPDP), an embedded wrapper that made the field unspellable, and an AST walk over every
+// literal and assignment in the package. The core takes it as a parameter now — the shape
+// commitDeclassify one layer down always had — so there is no pair to keep in agreement and
+// none of that machinery has anything left to protect.
 //
-// The last one is not hypothetical shape in this package: `d.endDecision = end` is the
-// established way to finish a dispatchParams after construction, and a contributor following
-// that precedent for pdp or committer would produce exactly the silent divergence withPDP
-// exists to make impossible — a site that sets one and forgets the other compiles, passes
-// every test that does not exercise a declassification, and then never clears a label.
-//
-// It is an AST walk for the reason the composite-literal guard it shares a walker with is: the
-// rule is about literals and assignments, which no linter in .golangci.yml can express. It
-// reuses that walker rather than repeating one, because the walker is what threads the
-// enclosing element type through an ELIDED literal — `[]dispatchParams{{...}}` or
-// `map[string]serverRequestParams{"k": {...}}` name no type of their own, and a guard that
-// matches only `T{...}` passes while the thing it guards is bypassed.
-func TestParamsLiterals_DoNotAssignThePDPFields(t *testing.T) {
+// One invariant does survive the deletion: the committer a call site passes must be the PDP
+// that MADE the decision it is committing, not merely some decision point in scope. That is a
+// property of five call expressions, and this asserts it directly on them: each passes
+// X.forwardParams and X.pdp for the same X. A site that decided with d.pdp and committed with
+// something else would compile and would silently apply a clear the decision never authorized
+// — the same class of failure the old guard existed for, now expressible as one property of
+// the call rather than as a rule about who may write a field.
+func TestEnforcedForwardCore_CommitsWithTheDecidingPDP(t *testing.T) {
 	t.Parallel()
-	// The params types, plus the wrapper the decision point now lives on: a literal of
-	// decidingPDP is the one spelling that can still put a PDP into a params struct without
-	// going through withPDP.
-	guarded := map[string]bool{
-		"serverRequestParams": true,
-		"dispatchParams":      true,
-		"forwardParams":       true,
-		"decidingPDP":         true,
-	}
-	// Fields that must only ever be set by withPDP: the decision point itself, everything
-	// derived from it, and the wrapper that holds it (assigning the whole embedded struct
-	// installs a decision point just as effectively as naming its field).
-	derived := map[string]bool{"pdp": true, "committer": true, "decidingPDP": true}
-	// The FUNCTIONS allowed to assign one of those names through a selector. withPDP's own
-	// two bodies are the point of the invariant; the other two are where UpstreamRoute.pdp —
-	// a different type that happens to share the field name, with no derived twin — is filled
-	// in. An AST walk carries no type information, so the exemption cannot be by type; it is
-	// by function rather than by file because a whole-file pass would leave every future
-	// function in route.go (which is where per-route wiring is assembled) silently outside a
-	// guard whose entire job is to notice new wiring. Adding an entry is the review signal.
-	assignAllowed := map[string]bool{
-		"withPDP":           true,
-		"BuildRoutes":       true,
-		"WrapRoutesWithJWT": true,
-	}
-
 	entries, err := os.ReadDir(".")
 	require.NoError(t, err)
 	fset := token.NewFileSet()
-	litsChecked, assignsChecked := 0, 0
+	checked := 0
 	for _, e := range entries {
 		name := e.Name()
 		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
@@ -610,83 +548,51 @@ func TestParamsLiterals_DoNotAssignThePDPFields(t *testing.T) {
 		}
 		file, perr := parser.ParseFile(fset, name, nil, 0)
 		require.NoError(t, perr)
-
-		walkLiterals(file, "", func(typeName string, lit *ast.CompositeLit) {
-			if !guarded[typeName] {
-				return
-			}
-			litsChecked++
-			if typeName == "decidingPDP" {
-				t.Errorf("decidingPDP literal in %s: it exists so the decision point can only be set by .withPDP(p); building one directly reopens the divergence between it and every field derived from it", name)
-				return
-			}
-			for _, el := range lit.Elts {
-				kv, isKV := el.(*ast.KeyValueExpr)
-				if !isKV {
-					continue
-				}
-				key, isKey := kv.Key.(*ast.Ident)
-				if isKey && derived[key.Name] {
-					t.Errorf("%s literal in %s assigns %s directly; use .withPDP(p) so the decision point and every field derived from it cannot diverge",
-						typeName, name, key.Name)
-				}
-			}
-		})
-
-		// The assignment half. It walks the WHOLE file rather than descending only into
-		// FuncDecl bodies, because an assignment inside a package-level `var f = func() {...}`
-		// is a GenDecl and would otherwise never be visited. The enclosing function is tracked
-		// so the allowlist can be per-function; an assignment outside any function body has no
-		// enclosing name and is never exempt.
-		enclosing := enclosingFuncs(file)
 		ast.Inspect(file, func(n ast.Node) bool {
-			assign, isAssign := n.(*ast.AssignStmt)
-			if !isAssign {
+			call, isCall := n.(*ast.CallExpr)
+			if !isCall {
 				return true
 			}
-			for _, lhs := range assign.Lhs {
-				sel, isSel := lhs.(*ast.SelectorExpr)
-				if !isSel {
-					continue
-				}
-				assignsChecked++
-				if !derived[sel.Sel.Name] || assignAllowed[enclosing.at(assign.Pos())] {
-					continue
-				}
-				t.Errorf("%s assigns .%s in %s; the decision point and every field derived from it must be set together by .withPDP(p), never one at a time",
-					enclosing.describe(assign.Pos()), sel.Sel.Name, name)
+			fn, isIdent := call.Fun.(*ast.Ident)
+			if !isIdent || fn.Name != "enforcedForwardCore" || len(call.Args) < 3 {
+				return true
+			}
+			checked++
+			params, committer := receiverOf(call.Args[1], "forwardParams"), receiverOf(call.Args[2], "pdp")
+			if params == "" || committer == "" || params != committer {
+				t.Errorf("%s: enforcedForwardCore must be handed the decision point that MADE the decision "+
+					"(pass d.forwardParams and d.pdp for the same d); got %s and %s",
+					name, exprText(fset, call.Args[1]), exprText(fset, call.Args[2]))
 			}
 			return true
 		})
 	}
-	require.Positive(t, litsChecked, "no params literal found in any non-test file; the literal half of this guard would pass vacuously")
-	require.Positive(t, assignsChecked, "no field assignment found in any non-test file; the assignment half of this guard would pass vacuously")
+	require.Positive(t, checked, "no enforcedForwardCore call found in any non-test file; this guard would pass vacuously")
 }
 
-// TestDispatchParamsLiteral_CannotNameThePDPField is the compile-time half of the invariant,
-// asserted here because a compile error cannot be written as a test.
-//
-// dispatchParams and serverRequestParams embed decidingPDP, and Go forbids setting a PROMOTED
-// field in a composite literal — so `dispatchParams{pdp: p}` does not build, in any spelling,
-// including the elided ones a source guard is most likely to miss. This test pins the property
-// the embedding provides (the field is reachable for READS through the promotion, so every
-// call site still says d.pdp) so that flattening the struct back out, which would silently
-// restore the spellable field, fails something.
-func TestDispatchParamsLiteral_CannotNameThePDPField(t *testing.T) {
-	t.Parallel()
-	decider := &pdp.JWTPDP{}
-	d := dispatchParams{}.withPDP(decider)
-	assert.Same(t, decider, d.pdp, "the promoted field is readable as if it were declared inline")
+// receiverOf returns the receiver identifier of `x.field` when field matches, or "" for any
+// other expression shape — which the caller treats as a failure, so an unrecognized spelling
+// is reported rather than skipped.
+func receiverOf(e ast.Expr, field string) string {
+	sel, ok := e.(*ast.SelectorExpr)
+	if !ok || sel.Sel.Name != field {
+		return ""
+	}
+	ident, ok := sel.X.(*ast.Ident)
+	if !ok {
+		return ""
+	}
+	return ident.Name
+}
 
-	typ := reflect.TypeOf(dispatchParams{})
-	field, ok := typ.FieldByName("decidingPDP")
-	require.True(t, ok, "dispatchParams must hold its decision point in the embedded wrapper, not as a directly-spellable field")
-	assert.True(t, field.Anonymous, "decidingPDP must stay EMBEDDED: a named field is spellable in a literal again")
-
-	srType := reflect.TypeOf(serverRequestParams{})
-	srField, ok := srType.FieldByName("decidingPDP")
-	require.True(t, ok, "serverRequestParams must hold its decision point in the embedded wrapper too")
-	assert.True(t, srField.Anonymous)
+// exprText renders an expression for a failure message, through the fileset it was parsed
+// with so positions resolve.
+func exprText(fset *token.FileSet, e ast.Expr) string {
+	var b strings.Builder
+	if err := printer.Fprint(&b, fset, e); err != nil {
+		return "<unprintable>"
+	}
+	return b.String()
 }
 
 // TestEnforcedForwardCore_OrdinaryCallTouchesNoCommitter is the negative half: a call that
@@ -702,9 +608,9 @@ func TestEnforcedForwardCore_OrdinaryCallTouchesNoCommitter(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			rec, spy := &fwdRecorder{}, &commitSpy{}
-			fp := forwardParams{rec: rec, sessionID: "s", committer: spy, callUpstream: upstream}
+			fp := forwardParams{rec: rec, sessionID: "s", callUpstream: upstream}
 
-			enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
+			enforcedForwardCore(context.Background(), fp, spy, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
 				allowDecision(), "tools/call", "read_file", "read_file", "tool", false, upstreamErrorDetail)
 
 			assert.Zero(t, spy.calls, "a decision that authorized no clear has nothing to commit")
@@ -723,7 +629,7 @@ func TestEnforcedForwardCore_MissingCommitterIsRecordedNotSilent(t *testing.T) {
 	rec := &fwdRecorder{}
 	fp := forwardParams{rec: rec, sessionID: "s", callUpstream: cleanUpstream()} // no committer
 
-	enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
+	enforcedForwardCore(context.Background(), fp, nil, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
 		declassifiedAllow(), "tools/call", "sanitize", "sanitize", "tool", false, upstreamErrorDetail)
 
 	require.Len(t, rec.records, 1)
@@ -825,7 +731,7 @@ func TestEnforcedForwardCore_ConcurrentSinkStaysBlockedDuringTheForward(t *testi
 
 	// The sanitizing call: decided (its clear authorized), then blocked in the upstream.
 	inFlight, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
-	fp := forwardParams{rec: &fwdRecorder{}, sessionID: "s", committer: dp,
+	fp := forwardParams{rec: &fwdRecorder{}, sessionID: "s",
 		callUpstream: func(_ context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, error) {
 			close(inFlight)
 			<-release
@@ -833,7 +739,7 @@ func TestEnforcedForwardCore_ConcurrentSinkStaysBlockedDuringTheForward(t *testi
 		}}
 	go func() {
 		defer close(done)
-		enforcedForwardCore(ctx, fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
+		enforcedForwardCore(ctx, fp, dp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
 			declassifiedAllow(), "tools/call", "sanitize", "sanitize", "tool", false, upstreamErrorDetail)
 	}()
 
@@ -895,7 +801,7 @@ func TestEnforcedForwardCore_ConcurrentSourceKeepsItsTaintAcrossTheCommit(t *tes
 	require.False(t, decided.Declassification.PendingClear(), "the anchor was clean, so the approved clear has nothing pending")
 
 	inFlight, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
-	fp := forwardParams{rec: &fwdRecorder{}, sessionID: "s", committer: dp,
+	fp := forwardParams{rec: &fwdRecorder{}, sessionID: "s",
 		callUpstream: func(_ context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, error) {
 			close(inFlight)
 			<-release
@@ -903,7 +809,7 @@ func TestEnforcedForwardCore_ConcurrentSourceKeepsItsTaintAcrossTheCommit(t *tes
 		}}
 	go func() {
 		defer close(done)
-		enforcedForwardCore(ctx, fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
+		enforcedForwardCore(ctx, fp, dp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
 			decided, "tools/call", "sanitize", "sanitize", "tool", false, upstreamErrorDetail)
 	}()
 
@@ -938,14 +844,14 @@ func TestEnforcedForwardCore_UnsuccessfulCallDoesNotCommit(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			rec, spy := &fwdRecorder{}, &commitSpy{}
-			fp := forwardParams{rec: rec, sessionID: "s", committer: spy,
+			fp := forwardParams{rec: rec, sessionID: "s",
 				callUpstream: func(_ context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, error) {
 					out := reply
 					out.ID = msg.ID
 					return out, nil
 				}}
 
-			enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
+			enforcedForwardCore(context.Background(), fp, spy, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
 				declassifiedAllow(), "tools/call", "sanitize", "sanitize", "tool", false, upstreamErrorDetail)
 
 			assert.Zero(t, spy.calls, "a sanitizing call that FAILED must not drop the taint")
@@ -972,12 +878,12 @@ func TestEnforcedForwardCore_SuccessfulResultCommits(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			rec, spy := &fwdRecorder{}, &commitSpy{}
-			fp := forwardParams{rec: rec, sessionID: "s", committer: spy,
+			fp := forwardParams{rec: rec, sessionID: "s",
 				callUpstream: func(_ context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, error) {
 					return mcp.RPCMsg{ID: msg.ID, Result: json.RawMessage(body)}, nil
 				}}
 
-			enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
+			enforcedForwardCore(context.Background(), fp, spy, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
 				declassifiedAllow(), "tools/call", "sanitize", "sanitize", "tool", false, upstreamErrorDetail)
 
 			require.Equal(t, 1, spy.calls)
@@ -1004,9 +910,9 @@ func TestEnforcedForwardCore_SpentGrantIsNamedWithoutPendingLabels(t *testing.T)
 			HardDeny: true, Details: map[string]interface{}{capability.FlowAuditDetailKey: true, "phase": "record"},
 		},
 	}
-	fp := forwardParams{rec: rec, sessionID: "s", committer: spy, callUpstream: cleanUpstream()}
+	fp := forwardParams{rec: rec, sessionID: "s", callUpstream: cleanUpstream()}
 
-	enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
+	enforcedForwardCore(context.Background(), fp, spy, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
 		dec, "tools/call", "sanitize", "sanitize", "tool", false, upstreamErrorDetail)
 
 	assert.Zero(t, spy.calls, "a refused call clears nothing")
@@ -1102,9 +1008,9 @@ func TestEnforcedForwardCore_NoOpClearOnASuccessfulCallNamesTheSpentGrant(t *tes
 		// clear — but it burned the grant to get here.
 		Declassification: capability.NewDeclassification(nil, "alice@example.com", "apr-9", true),
 	}
-	fp := forwardParams{rec: rec, sessionID: "s", callUpstream: cleanUpstream(), committer: spy}
+	fp := forwardParams{rec: rec, sessionID: "s", callUpstream: cleanUpstream()}
 
-	enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
+	enforcedForwardCore(context.Background(), fp, spy, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
 		dec, "tools/call", "sanitize", "sanitize", "tool", false, upstreamErrorDetail)
 
 	assert.Zero(t, spy.calls, "nothing was pending, so no store round trip")
@@ -1173,7 +1079,8 @@ func TestForwardServerRequest_RefusesADeclassifyingSamplingDecision(t *testing.T
 		sessionID:     "s",
 		forward:       func(mcp.RPCMsg) bool { forwarded = true; return true },
 		writeUpstream: func(m mcp.RPCMsg) { toUpstream = append(toUpstream, m) },
-	}.withPDP(samplingPDP{dec: dec})
+		pdp:           samplingPDP{dec: dec},
+	}
 
 	forwardServerRequest(context.Background(), mcp.RPCMsg{ID: mcp.RawJSON(`1`), Method: capability.MethodSamplingCreateMessage}, fp)
 
@@ -1201,7 +1108,8 @@ func TestForwardServerRequest_RefusesWhenTheTurnIsUnavailable(t *testing.T) {
 		forward:       func(mcp.RPCMsg) bool { forwarded = true; return true },
 		writeUpstream: func(m mcp.RPCMsg) { toUpstream = append(toUpstream, m) },
 		decideLock:    func() (func(), bool) { return nil, false },
-	}.withPDP(samplingPDP{dec: capability.EnforceResponse{Decision: capability.DecisionAllow}})
+		pdp:           samplingPDP{dec: capability.EnforceResponse{Decision: capability.DecisionAllow}},
+	}
 
 	forwardServerRequest(context.Background(), mcp.RPCMsg{ID: mcp.RawJSON(`1`), Method: capability.MethodSamplingCreateMessage}, fp)
 
@@ -1227,9 +1135,9 @@ func TestForwardServerRequest_RefusesWhenTheTurnIsUnavailable(t *testing.T) {
 func TestEnforcedForwardCore_DoubleCommitIsNotReportedAsAFailedClear(t *testing.T) {
 	rec := &fwdRecorder{}
 	spy := &commitSpy{failErr: capability.ErrDeclassificationCommitted}
-	fp := forwardParams{rec: rec, sessionID: "s", callUpstream: cleanUpstream(), committer: spy}
+	fp := forwardParams{rec: rec, sessionID: "s", callUpstream: cleanUpstream()}
 
-	resp := enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
+	resp := enforcedForwardCore(context.Background(), fp, spy, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
 		declassifiedAllow(), "tools/call", "sanitize", "sanitize", "tool", false, upstreamErrorDetail)
 
 	require.Nil(t, resp.Error, "a wiring fault after the call ran does not withhold its response")
@@ -1251,7 +1159,7 @@ func TestEnforcedForwardCore_DoubleCommitIsNotReportedAsAFailedClear(t *testing.
 		[]string{capability.FlowLabelPII}, "alice@example.com", "apr-9", false)
 	rec2 := &fwdRecorder{}
 	enforcedForwardCore(context.Background(),
-		forwardParams{rec: rec2, sessionID: "s", callUpstream: cleanUpstream(), committer: spy},
+		forwardParams{rec: rec2, sessionID: "s", callUpstream: cleanUpstream()}, spy,
 		mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, standing, "tools/call", "sanitize", "sanitize", "tool", false, upstreamErrorDetail)
 	require.Len(t, rec2.records, 1)
 	for key, v := range rec2.records[0].details {
@@ -1291,51 +1199,4 @@ func TestStrictAuditDenial_BuildsTheDeclassifyDetailOnlyWhenItTrips(t *testing.T
 	require.Len(t, rec.records, 1)
 	assert.Equal(t, []string{capability.FlowLabelPII}, rec.records[0].details[audit.DeclassifyNotAppliedKey])
 	assert.Equal(t, "apr-9", rec.records[0].details[audit.DeclassifySpentApprovalKey])
-}
-
-// funcSpans maps source positions back to the function that encloses them, so a source guard
-// can exempt a FUNCTION rather than a whole file. ast.Inspect carries no parent link, so the
-// spans are collected up front from the file's declarations — including function literals
-// bound to package-level vars, which are not FuncDecls and which a body-only walk misses.
-type funcSpans []funcSpan
-
-type funcSpan struct {
-	name       string
-	start, end token.Pos
-}
-
-func enclosingFuncs(file *ast.File) funcSpans {
-	var spans funcSpans
-	ast.Inspect(file, func(n ast.Node) bool {
-		if fn, ok := n.(*ast.FuncDecl); ok && fn.Body != nil {
-			spans = append(spans, funcSpan{name: fn.Name.Name, start: fn.Body.Pos(), end: fn.Body.End()})
-		}
-		return true
-	})
-	return spans
-}
-
-// at returns the name of the innermost declared function containing pos, or "" when pos is
-// outside every function body (a package-level closure, say) — which no allowlist entry
-// matches, so such an assignment is always flagged.
-func (s funcSpans) at(pos token.Pos) string {
-	name, width := "", token.Pos(-1)
-	for _, span := range s {
-		if pos < span.start || pos >= span.end {
-			continue
-		}
-		if w := span.end - span.start; width < 0 || w < width {
-			name, width = span.name, w
-		}
-	}
-	return name
-}
-
-// describe names the enclosing function for an error message, falling back to a phrase for an
-// assignment that sits outside any function body.
-func (s funcSpans) describe(pos token.Pos) string {
-	if name := s.at(pos); name != "" {
-		return name
-	}
-	return "a package-level initializer"
 }

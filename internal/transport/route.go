@@ -663,11 +663,12 @@ func LoadUpstreamPDP(u *config.UpstreamConfig, hostTransport, baseDir string, co
 		enforcement.WithFlowLabelStore(flowStore),
 		enforcement.WithCounterKeyNamespace(u.Name),
 	}
-	if !merged.HasSequenceBlock() {
-		// No sequenceBlock in the policy: the per-call antecedent marker is never
+	if !merged.UsesEngineSubsystem(capability.SubsystemAntecedentHistory) {
+		// Nothing in the policy reads the antecedent history: the per-call marker is never
 		// read, so skip recording it (avoids a counter round-trip per call and the
 		// fail-closed deny path that could burn a committed maxCalls slot on a write
-		// fault).
+		// fault). Derived from what each token DECLARES it depends on, not from a
+		// hand-written list of token types — see LocalManifest.UsesEngineSubsystem.
 		engineOpts = append(engineOpts, enforcement.WithoutAntecedentRecording())
 	}
 	if merged.HasEffectCeiling() {
@@ -684,11 +685,13 @@ func LoadUpstreamPDP(u *config.UpstreamConfig, hostTransport, baseDir string, co
 		// authenticated without carrying a task id is refused rather than accounted twice.
 		engineOpts = append(engineOpts, enforcement.WithTaskAnchoredState())
 	}
-	if !merged.HasFlowLabel() {
-		// No flowLabel condition or labelOutput directive anywhere in the policy: the
-		// per-call flow-relevance scan and the peek/record path are pure overhead, and
-		// skipping them also drops the recordLabels fail-closed deny path a source-only
-		// policy would otherwise carry. Mirrors the WithoutAntecedentRecording gate above.
+	if !merged.UsesEngineSubsystem(capability.SubsystemFlowLabels) {
+		// Nothing in the policy reads or writes the flow-label set: the per-call
+		// flow-relevance scan and the peek/record path are pure overhead, and skipping them
+		// also drops the recordLabels fail-closed deny path a source-only policy would
+		// otherwise carry. Same derivation as the WithoutAntecedentRecording gate above,
+		// which is what keeps a future flow-store-reading condition from having this path
+		// skipped out from under it.
 		engineOpts = append(engineOpts, enforcement.WithoutFlowLabels())
 	}
 	engine := enforcement.New(engineOpts...)

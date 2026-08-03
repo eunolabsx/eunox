@@ -218,10 +218,11 @@ rules:
 - For new condition types, add table-driven tests under
   `pkg/capability/`. Include at least one allow case, one deny case, and one
   malformed-input case.
-- A new condition or directive declares two things on its `pkg/capability`
+- A new condition or directive declares three things on its `pkg/capability`
   prototype-registry entry, beside its constructor, and the build fails without
-  either: `Since`, the published `schemaVersion` that introduced its
-  discriminator, and `State`, the cross-call state its enforcement touches.
+  any of them: `Since`, the published `schemaVersion` that introduced its
+  discriminator; `State`, the cross-call state its enforcement touches; and
+  `Uses`, the optional engine subsystems that enforcement depends on.
   `State` is `StateNone` when the token decides from the request alone;
   `StateAtomic` when it consumes a budget through one atomic `AdmitAll`
   admission per call (which is accumulated state the multi-instance advisory
@@ -230,6 +231,19 @@ rules:
   flow-label set, an antecedent marker — which is what the transports' decision
   turn exists to order. Both transports derive whether to serialize from it, so
   a token that declares nothing is treated as `StateNonAtomic` until it does.
+  `Uses` is `SubsystemNone` when the handler reads no engine facility beyond
+  the request, the clock, the call counter and its own configuration;
+  `SubsystemAntecedentHistory` when it reads the marker an earlier call
+  recorded; `SubsystemFlowLabels` when it reads or writes the flow-label set.
+  The route builder skips a facility no token needs
+  (`WithoutAntecedentRecording`, `WithoutFlowLabels`), so a token that declares
+  nothing is treated as depending on all of them. Over-declaring costs work per
+  call — a relevance scan for the flow gate, a counter round-trip and its
+  fail-closed deny path for the antecedent one — and never authority; only
+  under-declaring can leave a handler reading a facility nothing wired. Declare
+  every subsystem for a token whose enforcement is supplied from outside this
+  build (`policy`, `custom`): what an embedder's evaluator reads is not
+  knowable here.
 - For new MCP method coverage, add an enforcement-gap-style test in
   `internal/transport/enforcement_gaps_test.go`.
 - For new audit-record fields, add a sign-and-verify round-trip test.

@@ -275,7 +275,7 @@ func WithCallCounter(counter capability.CallCounter) Option {
 // the CallCounter: flow-label provenance is a monotonic per-session set with a
 // session-scoped lifetime, so it must not live in the sliding-window counter that
 // backs maxCalls/sequenceBlock. Leave it unset only for a policy known to use no flow
-// control (see config.LocalManifest.HasFlowLabel); a flow constraint with no store
+// control (see config.LocalManifest.UsesEngineSubsystem); a flow constraint with no store
 // wired fails closed. See pkg/flowlabelstore.
 func WithFlowLabelStore(store capability.FlowLabelStore) Option {
 	return func(e *Engine) {
@@ -289,7 +289,8 @@ func WithFlowLabelStore(store capability.FlowLabelStore) Option {
 // the write is pure overhead, and skipping it also removes the RecordSessionCall
 // fail-closed deny path that could burn a just-committed maxCalls slot on a
 // counter-write fault. Only set this when the policy is known to use no
-// sequenceBlock (see config.LocalManifest.HasSequenceBlock); leaving it unset
+// sequenceBlock — derived from what each token declares it uses, see
+// config.LocalManifest.UsesEngineSubsystem; leaving it unset
 // preserves the always-record fail-closed behavior.
 func WithoutAntecedentRecording() Option {
 	return func(e *Engine) {
@@ -300,7 +301,7 @@ func WithoutAntecedentRecording() Option {
 // WithoutFlowLabels tells the engine the policy contains no flowLabel condition and no
 // labelOutput directive, so it skips the per-call flow-relevance scan and the flow
 // peek/record path. Only set this when the policy is known to use neither (see
-// config.LocalManifest.HasFlowLabel); leaving it unset preserves the always-check
+// config.LocalManifest.UsesEngineSubsystem); leaving it unset preserves the always-check
 // behavior. Mirrors WithoutAntecedentRecording.
 func WithoutFlowLabels() Option {
 	return func(e *Engine) {

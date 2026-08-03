@@ -91,49 +91,49 @@ func (r *UpstreamRoute) decisionAnchorFromContext(ctx context.Context, sessionID
 // anchorGates hands out one decision gate per anchor key, refcounted so an idle anchor holds
 // no memory. A gateway route serves an unbounded number of sessions over its lifetime, and a
 // map that only ever grew would be a slow leak keyed by session id.
+//
+// The map, the key, the refcount and the delete-at-zero are the shared keyedRegistry
+// (keyed_registry.go); this type is the TURN — a one-slot channel per anchor — and nothing
+// else. Its reclaim trigger is the plain one (no holders left), so it supplies no idle
+// predicate; stdio's FIFO, which must also outlive the tickets it handed out, supplies one.
 type anchorGates struct {
-	mu    sync.Mutex
-	gates map[string]*anchorGate
+	reg keyedRegistry[*anchorGate]
 }
 
-// anchorGate is one anchor's turn, plus the count of holders keeping it in the registry.
+// anchorGate is one anchor's turn.
 //
 // The turn is a one-slot channel rather than a sync.Mutex because one caller has to be able to
 // GIVE UP: the server-initiated leg waits for it on the session's single upstream-reader
 // goroutine, and a mutex offers no bounded acquire. A token in the channel means the turn is
 // held; taking the turn is a send, releasing it a receive.
+//
+// The embedded keyedEntry is the registry's bookkeeping (this gate's key and refcount), which
+// a holder can keep for a whole session and take turns on without going back through the map —
+// the registry round trip is what the per-request path pays, and a session-anchored route has
+// nothing to look up. The turn channel itself is guarded by nothing: a send/receive IS the
+// synchronization.
 type anchorGate struct {
+	keyedEntry
 	turn chan struct{}
-	refs int
-	// registry and key are what a release needs to drop this gate's reference. They are on the
-	// gate so a holder can keep the gate itself for a whole session (see hold) and take turns
-	// on it without going back through the map — the registry round trip is what the
-	// per-request path pays, and a session-anchored route has nothing to look up.
-	registry *anchorGates
-	key      string
 }
+
+// entry exposes this gate's registry bookkeeping (keyedRegistryValue).
+func (a *anchorGate) entry() *keyedEntry { return &a.keyedEntry }
 
 // newAnchorGates builds an empty registry. One per route: routes carry independent policies
 // and their own key namespace, so a task id shared by two routes addresses two different sets
 // of state and must not share a turn.
 func newAnchorGates() *anchorGates {
-	return &anchorGates{gates: map[string]*anchorGate{}}
+	g := &anchorGates{}
+	g.reg.init(func() *anchorGate { return &anchorGate{turn: make(chan struct{}, 1)} }, nil)
+	return g
 }
 
 // hold returns this anchor's gate with a reference taken, plus the func that drops it. The
 // gate stays in the registry until every holder has dropped, so a caller may keep one across
-// many turns.
-//
-// It is the seam that keeps the registry off the per-request path for a route that does not
-// anchor on the task. There, a session's anchor is a CONSTANT — the session id — so resolving
-// it per request meant a registry mutex, a map lookup, an insert and a delete on every single
-// enforced call, plus the garbage each produced: the refcount fell to zero the instant a
-// non-overlapping request finished, so the steady state for ordinary sequential traffic was
-// create-insert-lookup-delete per call on the path this file's own comment calls the
-// microsecond decision path. Worse, that mutex is route-wide, so its contention scaled with
-// the route's whole request rate rather than with contending anchors. A session that holds
-// its one gate for its lifetime pays all of that once. Task-anchored routes still resolve per
-// request, because there the anchor genuinely varies per call and cross-session sharing is
+// many turns. See keyedRegistry.hold for why holding one matters on the per-request path — a
+// session-anchored route resolves a CONSTANT anchor, while task-anchored routes still resolve
+// per request, because there the anchor genuinely varies per call and cross-session sharing is
 // the entire point.
 //
 // A nil registry yields a nil gate and a no-op drop, so a non-serialized route needs no branch
@@ -142,29 +142,7 @@ func (g *anchorGates) hold(key string) (gate *anchorGate, drop func()) {
 	if g == nil {
 		return nil, func() {}
 	}
-	g.mu.Lock()
-	gate = g.gates[key]
-	if gate == nil {
-		gate = &anchorGate{turn: make(chan struct{}, 1), registry: g, key: key}
-		g.gates[key] = gate
-	}
-	gate.refs++
-	g.mu.Unlock()
-	return gate, sync.OnceFunc(gate.drop)
-}
-
-// drop releases one reference to this gate, deleting it from the registry at zero.
-func (a *anchorGate) drop() {
-	g := a.registry
-	g.mu.Lock()
-	a.refs--
-	if a.refs == 0 {
-		// Deleted only at zero, and only while holding the registry lock, so a waiter that
-		// already took a reference keeps the gate it is queued on. A later hold under the same
-		// key creates a fresh gate, which is correct precisely because nobody holds the old one.
-		delete(g.gates, a.key)
-	}
-	g.mu.Unlock()
+	return g.reg.hold(key)
 }
 
 // acquire takes the turn for key, giving up if giveUp fires first (nil waits forever). It is
@@ -219,8 +197,4 @@ func (a *anchorGate) take(giveUp <-chan time.Time) (end func(), ok bool) {
 // size reports how many gates are live. Test-only: the refcounting is what keeps a long-lived
 // gateway from accumulating one entry per session it has ever served, and that is invisible
 // from the outside otherwise.
-func (g *anchorGates) size() int {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return len(g.gates)
-}
+func (g *anchorGates) size() int { return g.reg.size() }

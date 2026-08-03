@@ -781,7 +781,7 @@ func TestDispatchUnmapped_RecordsBeforeLogging(t *testing.T) {
 
 	d := dispatchParams{
 		forwardParams: forwardParams{rec: orderTrackingRecorder{}},
-		decidingPDP:   decidingPDP{pdp: pdp.AlwaysAllowPDP{}},
+		pdp:           pdp.AlwaysAllowPDP{},
 	}
 	msg := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "agents/delegate"}
 	dispatchUnmapped(context.Background(), d, msg)
@@ -1029,7 +1029,7 @@ func TestDispatchList_NoPolicyUsesDenyAll(t *testing.T) {
 			},
 		},
 		// The "no policy" default the constructors substitute.
-		decidingPDP: decidingPDP{pdp: pdp.DenyAllPDP{}},
+		pdp: pdp.DenyAllPDP{},
 	}
 	msg := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "tools/list"}
 
@@ -1079,7 +1079,7 @@ func TestDispatchList_RecordsFilterCounts(t *testing.T) {
 				return mcp.RPCMsg{JSONRPC: "2.0", ID: msg.ID, Result: json.RawMessage(`{"tools":[{"name":"read_file"},{"name":"write_file"}]}`)}, nil
 			},
 		},
-		decidingPDP: decidingPDP{pdp: dp},
+		pdp: dp,
 	}
 
 	out := dispatchRequest(context.Background(), d, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "tools/list"})
@@ -1113,7 +1113,7 @@ func TestDispatchList_AuditMode_CountsFullCatalog(t *testing.T) {
 				return mcp.RPCMsg{JSONRPC: "2.0", ID: msg.ID, Result: json.RawMessage(`{"tools":[{"name":"read_file"},{"name":"write_file"}]}`)}, nil
 			},
 		},
-		decidingPDP: decidingPDP{pdp: dp},
+		pdp: dp,
 	}
 
 	out := dispatchRequest(context.Background(), d, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "tools/list"})
@@ -1157,7 +1157,7 @@ func TestDispatchList_NilResultRefused(t *testing.T) {
 				return mcp.RPCMsg{JSONRPC: "2.0", ID: msg.ID}, nil
 			},
 		},
-		decidingPDP: decidingPDP{pdp: dp},
+		pdp: dp,
 	}
 
 	out := dispatchRequest(context.Background(), d, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "tools/list"})
@@ -1184,7 +1184,7 @@ func TestDispatchList_FilterCountsSignVerifyRoundTrip(t *testing.T) {
 				return mcp.RPCMsg{JSONRPC: "2.0", ID: msg.ID, Result: json.RawMessage(`{"tools":[{"name":"read_file"},{"name":"write_file"}]}`)}, nil
 			},
 		},
-		decidingPDP: decidingPDP{pdp: dp},
+		pdp: dp,
 	}
 	_ = dispatchRequest(context.Background(), d, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "tools/list"})
 	if err := sink.Close(); err != nil {
@@ -1424,7 +1424,7 @@ func TestDispatchToolsCall_ArgNamedUpstreamErrorCode_SurvivesUpstreamError(t *te
 				return mcp.RPCMsg{JSONRPC: "2.0", ID: msg.ID, Error: &mcp.RPCError{Code: -32000, Message: "boom"}}, nil
 			},
 		},
-		decidingPDP: decidingPDP{pdp: dp},
+		pdp: dp,
 	}
 	msg := mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "tools/call",
@@ -1457,7 +1457,7 @@ func TestDispatchToolsCall_AuditArguments_FlatMergeWhenNoCollision(t *testing.T)
 				return mcp.RPCMsg{JSONRPC: "2.0", ID: msg.ID, Error: &mcp.RPCError{Code: -32000, Message: "boom"}}, nil
 			},
 		},
-		decidingPDP: decidingPDP{pdp: dp},
+		pdp: dp,
 	}
 	msg := mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "tools/call",
@@ -1492,7 +1492,7 @@ func TestDispatchToolsCall_CollisionShape_SignsAndVerifies(t *testing.T) {
 				return mcp.RPCMsg{JSONRPC: "2.0", ID: msg.ID, Error: &mcp.RPCError{Code: -32000, Message: "boom"}}, nil
 			},
 		},
-		decidingPDP: decidingPDP{pdp: dp},
+		pdp: dp,
 	}
 	msg := mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "tools/call",
@@ -1545,7 +1545,7 @@ func TestDispatchToolsCall_ArgNamedReservedKeyIsQuarantined(t *testing.T) {
 				return mcp.RPCMsg{JSONRPC: "2.0", ID: msg.ID, Error: &mcp.RPCError{Code: -32000, Message: "boom"}}, nil
 			},
 		},
-		decidingPDP: decidingPDP{pdp: dp},
+		pdp: dp,
 	}
 	msg := mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "tools/call",

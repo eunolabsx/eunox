@@ -344,27 +344,50 @@ func jsonFieldNames(v any) map[string]bool {
 // state-accumulating condition missing from the one that gates the decision turn runs its
 // decisions unserialized — the source->sink race, reopened silently, with every completeness
 // test still green. See tokenstate.go for the rule that sets it.
+//
+// Uses is the third declaration and closes the same gap one layer over, on the engine's two
+// skip gates: a condition that reads the flow-label set but is absent from a hand-written
+// "does this policy use flow control" predicate has that path skipped out from under it. See
+// subsystem.go.
 var conditionPrototypes = map[string]tokenSpec[Condition]{
-	ConditionTypeTimeWindow:        {New: func() Condition { return &TimeWindowCondition{} }, Since: SchemaVersion01, State: StateNone},
-	ConditionTypeIPRange:           {New: func() Condition { return &IPRangeCondition{} }, Since: SchemaVersion01, State: StateNone},
-	ConditionTypeAllowedOperations: {New: func() Condition { return &AllowedOperationsCondition{} }, Since: SchemaVersion01, State: StateNone},
-	ConditionTypeAllowedExtensions: {New: func() Condition { return &AllowedExtensionsCondition{} }, Since: SchemaVersion01, State: StateNone},
-	ConditionTypeAllowedTables:     {New: func() Condition { return &AllowedTablesCondition{} }, Since: SchemaVersion01, State: StateNone},
-	ConditionTypeMaxCalls:          {New: func() Condition { return &MaxCallsCondition{} }, Since: SchemaVersion01, State: StateAtomic},
-	ConditionTypeRecipientDomain:   {New: func() Condition { return &RecipientDomainCondition{} }, Since: SchemaVersion01, State: StateNone},
-	ConditionTypeAllowedValues:     {New: func() Condition { return &AllowedValuesCondition{} }, Since: SchemaVersion01, State: StateNone},
-	ConditionTypeSequenceBlock:     {New: func() Condition { return &SequenceBlockCondition{} }, Since: SchemaVersion01, State: StateNonAtomic},
-	ConditionTypeFlowLabel:         {New: func() Condition { return &FlowLabelCondition{} }, Since: SchemaVersion02, State: StateNonAtomic},
-	ConditionTypeEffectClass:       {New: func() Condition { return &EffectClassCondition{} }, Since: SchemaVersion02, State: StateNone},
+	ConditionTypeTimeWindow:        {New: func() Condition { return &TimeWindowCondition{} }, Since: SchemaVersion01, State: StateNone, Uses: usesNothing},
+	ConditionTypeIPRange:           {New: func() Condition { return &IPRangeCondition{} }, Since: SchemaVersion01, State: StateNone, Uses: usesNothing},
+	ConditionTypeAllowedOperations: {New: func() Condition { return &AllowedOperationsCondition{} }, Since: SchemaVersion01, State: StateNone, Uses: usesNothing},
+	ConditionTypeAllowedExtensions: {New: func() Condition { return &AllowedExtensionsCondition{} }, Since: SchemaVersion01, State: StateNone, Uses: usesNothing},
+	ConditionTypeAllowedTables:     {New: func() Condition { return &AllowedTablesCondition{} }, Since: SchemaVersion01, State: StateNone, Uses: usesNothing},
+	// The quota lives in the call counter, which is wired unconditionally — it is not one of
+	// the optional subsystems either gate can skip.
+	ConditionTypeMaxCalls:        {New: func() Condition { return &MaxCallsCondition{} }, Since: SchemaVersion01, State: StateAtomic, Uses: usesNothing},
+	ConditionTypeRecipientDomain: {New: func() Condition { return &RecipientDomainCondition{} }, Since: SchemaVersion01, State: StateNone, Uses: usesNothing},
+	ConditionTypeAllowedValues:   {New: func() Condition { return &AllowedValuesCondition{} }, Since: SchemaVersion01, State: StateNone, Uses: usesNothing},
+	// The one reader of the antecedent marker: recording it exists solely so this can ask what
+	// preceded the call.
+	ConditionTypeSequenceBlock: {New: func() Condition { return &SequenceBlockCondition{} }, Since: SchemaVersion01, State: StateNonAtomic, Uses: []EngineSubsystem{SubsystemAntecedentHistory}},
+	// The flow sink: it peeks the label set a labelOutput source writes.
+	ConditionTypeFlowLabel:   {New: func() Condition { return &FlowLabelCondition{} }, Since: SchemaVersion02, State: StateNonAtomic, Uses: []EngineSubsystem{SubsystemFlowLabels}},
+	ConditionTypeEffectClass: {New: func() Condition { return &EffectClassCondition{} }, Since: SchemaVersion02, State: StateNone, Uses: usesNothing},
 	// The strongest class a blastRadius bound can reach; an instance carrying only the
-	// per-call `max` narrows itself to StateNone (RefineStateAccumulation).
-	ConditionTypeBlastRadius: {New: func() Condition { return &BlastRadiusCondition{} }, Since: SchemaVersion02, State: StateAtomic},
+	// per-call `max` narrows itself to StateNone (RefineStateAccumulation). Its cumulative
+	// bound is a call-counter budget, not one of the optional subsystems.
+	ConditionTypeBlastRadius: {New: func() Condition { return &BlastRadiusCondition{} }, Since: SchemaVersion02, State: StateAtomic, Uses: usesNothing},
 	// An external evaluator (OPA, Cedar) may keep state of its own, but none of it is state
 	// THIS engine accumulates, orders, or shares between replicas — which is the only thing
 	// the two derived predicates can speak for.
-	ConditionTypePolicy: {New: func() Condition { return &PolicyCondition{} }, Since: SchemaVersion01, State: StateNone},
-	ConditionTypeCustom: {New: func() Condition { return &CustomCondition{} }, Since: SchemaVersion01, State: StateNone},
+	//
+	// Uses is the opposite call, and deliberately so: these two are the extension points, so
+	// what their enforcement reads is supplied from OUTSIDE this build and cannot be known
+	// here. An embedder's handler can close over the very FlowLabelStore the engine was given,
+	// and skipping the flow path for a policy whose only token is one of these would leave it
+	// reading a set nothing populates. Declaring everything costs a per-call scan; the other
+	// direction is the silent one.
+	ConditionTypePolicy: {New: func() Condition { return &PolicyCondition{} }, Since: SchemaVersion01, State: StateNone, Uses: engineSubsystems},
+	ConditionTypeCustom: {New: func() Condition { return &CustomCondition{} }, Since: SchemaVersion01, State: StateNone, Uses: engineSubsystems},
 }
+
+// usesNothing is the shared declaration for a token whose enforcement reads no optional engine
+// subsystem. It is a named value rather than a repeated literal so the registry lines stay
+// readable, and it is never mutated (TokenEngineSubsystems clones before returning).
+var usesNothing = []EngineSubsystem{SubsystemNone}
 
 // knownConditionTypes is every discriminator in the registry, sorted so the "did you mean"
 // hint resolves ties deterministically (a map's iteration order would not).

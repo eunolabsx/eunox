@@ -248,11 +248,12 @@ func (p *HTTPProxy) dispatchParams(sess *httpSession, sourceIP string) dispatchP
 			callUpstream:     sess.callUpstream,
 			strictAuditState: p.strictAudit(),
 		},
+		pdp:              rt.pdp,
 		sourceIP:         sourceIP,
 		buildInit:        sess.buildInitResponse,
 		receipts:         rt.receipts,
 		honorAttribution: rt.honorAttribution,
-	}.withPDP(rt.pdp)
+	}
 }
 
 // initStrictAuditDenial applies the --require-audit=strict gate to the
@@ -343,5 +344,6 @@ func (p *HTTPProxy) handleHTTPUpstreamRequest(ctx context.Context, sess *httpSes
 		writeUpstream:    func(m mcp.RPCMsg) { _ = sess.upWriter.Write(m) },
 		decideLock:       decideLock,
 		strictAuditState: p.strictAudit(),
-	}.withPDP(rt.pdp))
+		pdp:              rt.pdp,
+	})
 }
