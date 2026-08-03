@@ -1318,7 +1318,7 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 			// decl.LedgerID, not the outcome: this arm is reached AFTER the burn on the
 			// antecedent-fault path, so the grant may already be spent for a call that is
 			// about to hard-deny and never run. Naming it here is the only way that fact
-			// reaches the tape — the refusal carries no LabelsPendingClear, so nothing
+			// reaches the tape — the refusal authorizes no clear, so nothing
 			// downstream could infer it, and an operator reconciling one-shot approvals
 			// would believe this one was still live. The burn arm itself reaches here too,
 			// where the grant was NOT spent (the losing side of a race records nothing), so
@@ -1337,7 +1337,8 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 	}
 
 	// The clear itself is NOT applied here; it is handed to the caller to commit once the
-	// call has actually run (see LabelsPendingClear and CommitDeclassification).
+	// call has actually run (see EnforceResponse.Declassification and
+	// CommitDeclassification).
 	//
 	// What is handed over is the INTERSECTION with what the anchor is carrying as of this
 	// decision — resolved here, inside the decision's critical section, never re-derived at
@@ -1348,18 +1349,17 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 	// mirror of the fail-open the deferral exists to close, and a set store cannot tell the
 	// two occurrences of a label apart afterwards.
 	//
-	// It is also why the set is empty for a no-op clear: nothing to remove, so the commit is
-	// skipped entirely and the tape records no declassification. The grant is spent all the
-	// same, which is what SpentApprovalID is for — populated only for a single-use grant, and
-	// only here, past the burn, so it names a grant this call really did spend. That is a
-	// distinct fact from ApprovalID: the grant is spent whether or not a label moves, and
-	// whether or not the clear happens at all.
-	pendingClear := intersectLabels(decl.Labels, unionLabels(carriedLabels, labelsOut))
-	var spentApprovalID string
-	if decl.LedgerID != "" {
-		spentApprovalID = decl.ApprovalID
-	}
-
+	// It is also why the handle's set is empty for a no-op clear: nothing to remove, so the
+	// commit is skipped entirely and the tape records no declassification. The grant is spent
+	// all the same, which is what the handle's SpentApprovalID reports — non-empty only for a
+	// single-use grant, and minted only here, past the burn, so it names a grant this call
+	// really did spend. That is a distinct fact from the approval id: the grant is spent
+	// whether or not a label moves, and whether or not the clear happens at all.
+	//
+	// The handle is nil when the constraint carries no declassify directive (decl is the zero
+	// outcome), which is every call in a deployment that does not declassify — the caller's
+	// presence test is that nil, and nothing downstream has to reason about four fields being
+	// populated together.
 	return capability.EnforceResponse{
 		RequestID:   requestID,
 		Decision:    capability.DecisionAllow,
@@ -1368,10 +1368,7 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 		AuditOnly:   matched.IsAuditOnly(),
 		LabelsOut:   labelsOut,
 
-		LabelsPendingClear: pendingClear,
-		Approver:           decl.Approver,
-		ApprovalID:         decl.ApprovalID,
-		SpentApprovalID:    spentApprovalID,
+		Declassification: decl.handle(intersectLabels(decl.Labels, unionLabels(carriedLabels, labelsOut))),
 		// The SAME resolution the two effect conditions and the ceiling read, handed on to
 		// the post-hoc receipt check rather than re-resolved there — one resolution per
 		// call, so the decision and the check cannot disagree about what the effect was.

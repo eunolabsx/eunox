@@ -64,12 +64,12 @@ func TestDeclassify_ApprovedClearsTheLabel(t *testing.T) {
 	sanitizeReq := approvedReq("s", "sanitize", "alice@example.com", capability.FlowLabelPII)
 	cleared := eng.ValidateAction(ctx, sanitizeReq, declassifyCaps("sanitize", capability.FlowLabelPII))
 	require.Equal(t, capability.DecisionAllow, cleared.Decision)
-	assert.Equal(t, []string{capability.FlowLabelPII}, cleared.LabelsPendingClear)
-	assert.Equal(t, "alice@example.com", cleared.Approver, "the approving human is on the decision")
-	assert.Equal(t, "apr-1", cleared.ApprovalID)
+	assert.Equal(t, []string{capability.FlowLabelPII}, cleared.Declassification.Labels())
+	assert.Equal(t, "alice@example.com", cleared.Declassification.Approver(), "the approving human is on the decision")
+	assert.Equal(t, "apr-1", cleared.Declassification.ApprovalID())
 	assert.Equal(t, []string{capability.FlowLabelPII}, cleared.CarriedLabels, "carried_labels reports the pre-call set")
 
-	committed, err := eng.CommitDeclassification(ctx, sanitizeReq, cleared.LabelsPendingClear)
+	committed, err := eng.CommitDeclassification(ctx, sanitizeReq, cleared.Declassification)
 	require.NoError(t, err)
 	assert.Equal(t, []string{capability.FlowLabelPII}, committed, "the commit reports what it changed")
 
@@ -102,7 +102,7 @@ func TestDeclassify_PendingClearIsInvisibleUntilCommitted(t *testing.T) {
 	sanitizeReq := approvedReq("s", "sanitize", "alice@example.com", capability.FlowLabelPII)
 	decided := eng.ValidateAction(ctx, sanitizeReq, declassifyCaps("sanitize", capability.FlowLabelPII))
 	require.Equal(t, capability.DecisionAllow, decided.Decision)
-	require.Equal(t, []string{capability.FlowLabelPII}, decided.LabelsPendingClear)
+	require.Equal(t, []string{capability.FlowLabelPII}, decided.Declassification.Labels())
 
 	// The sanitizing call is decided but has NOT run. A concurrent egress decided in this
 	// window must still see the taint.
@@ -113,7 +113,7 @@ func TestDeclassify_PendingClearIsInvisibleUntilCommitted(t *testing.T) {
 		"and the taint is still on the tape for it")
 
 	// Only once the sanitizing call has actually run does the label go.
-	_, err := eng.CommitDeclassification(ctx, sanitizeReq, decided.LabelsPendingClear)
+	_, err := eng.CommitDeclassification(ctx, sanitizeReq, decided.Declassification)
 	require.NoError(t, err)
 	assert.Equal(t, capability.DecisionAllow,
 		eng.ValidateAction(ctx, req("s", "publish"), sinkCaps("publish", capability.FlowLabelPublic)).Decision)
@@ -141,7 +141,7 @@ func TestDeclassify_CommitCannotClearTaintAcquiredAfterTheDecision(t *testing.T)
 	sanitizeReq := approvedReq("s", "sanitize", "alice@example.com", capability.FlowLabelPII)
 	decided := eng.ValidateAction(ctx, sanitizeReq, declassifyCaps("sanitize", capability.FlowLabelPII))
 	require.Equal(t, capability.DecisionAllow, decided.Decision)
-	require.Empty(t, decided.LabelsPendingClear, "the anchor was clean, so the approved clear has nothing to remove")
+	require.Empty(t, decided.Declassification.Labels(), "the anchor was clean, so the approved clear has nothing to remove")
 
 	// While it is in flight, a source read taints the session for real.
 	require.Equal(t, capability.DecisionAllow,
@@ -149,7 +149,7 @@ func TestDeclassify_CommitCannotClearTaintAcquiredAfterTheDecision(t *testing.T)
 
 	// The sanitizing call now completes and commits. It must NOT touch the label the read
 	// just asserted — that data was never sanitized.
-	cleared, err := eng.CommitDeclassification(ctx, sanitizeReq, decided.LabelsPendingClear)
+	cleared, err := eng.CommitDeclassification(ctx, sanitizeReq, decided.Declassification)
 	require.NoError(t, err)
 	assert.Empty(t, cleared)
 
@@ -171,13 +171,50 @@ func TestDeclassify_CommitRemovesOnlyTheDecisionsSet(t *testing.T) {
 
 	r := approvedReq("s", "sanitize", "alice@example.com", capability.FlowLabelPII)
 	decided := eng.ValidateAction(ctx, r, declassifyCaps("sanitize", capability.FlowLabelPII))
-	require.Equal(t, []string{capability.FlowLabelPII}, decided.LabelsPendingClear,
+	require.Equal(t, []string{capability.FlowLabelPII}, decided.Declassification.Labels(),
 		"the anchor carried pii at decision time, so that is what is pending")
 
-	cleared, err := eng.CommitDeclassification(ctx, r, decided.LabelsPendingClear)
+	cleared, err := eng.CommitDeclassification(ctx, r, decided.Declassification)
 	require.NoError(t, err)
 	assert.Equal(t, []string{capability.FlowLabelPII}, cleared,
 		"what the commit reports is what it removed, which is what the decision resolved")
+}
+
+// TestDeclassify_CommitTakesOnlyTheDecisionsHandle is the API half of the same rule, and the
+// half that used to be unenforceable. The commit's parameter was a []string, so an embedder
+// holding an *Engine could remove any label it named with no approval presented, no grant
+// burned and nothing on the tape — every gate the declassify surface installs sits on the
+// decision. The handle is minted only by a decision that authorized something, and there is
+// no way to spell "clear these other labels" through it.
+func TestDeclassify_CommitTakesOnlyTheDecisionsHandle(t *testing.T) {
+	eng := declassifyEngine()
+	ctx := context.Background()
+
+	// A session carrying two labels, and a decision authorizing exactly one of them.
+	require.Equal(t, capability.DecisionAllow,
+		eng.ValidateAction(ctx, req("s", "read_customer"), sourceCaps("read_customer", capability.FlowLabelPII)).Decision)
+	require.Equal(t, capability.DecisionAllow,
+		eng.ValidateAction(ctx, req("s", "read_internal"), sourceCaps("read_internal", capability.FlowLabelInternal)).Decision)
+
+	r := approvedReq("s", "sanitize", "alice@example.com", capability.FlowLabelPII)
+	decided := eng.ValidateAction(ctx, r, declassifyCaps("sanitize", capability.FlowLabelPII))
+	require.Equal(t, capability.DecisionAllow, decided.Decision)
+	require.Equal(t, []string{capability.FlowLabelPII}, decided.Declassification.Labels())
+
+	cleared, err := eng.CommitDeclassification(ctx, r, decided.Declassification)
+	require.NoError(t, err)
+	assert.Equal(t, []string{capability.FlowLabelPII}, cleared)
+
+	// The label the approval never covered is still on the anchor.
+	assert.Equal(t, capability.DecisionDeny,
+		eng.ValidateAction(ctx, req("s", "publish"), sinkCaps("publish", capability.FlowLabelPublic)).Decision,
+		"the unapproved label must survive a clear scoped to another one")
+
+	// And the authorization is spent: a second commit of the same decision is refused rather
+	// than replayed into a second clear.
+	again, err := eng.CommitDeclassification(ctx, r, decided.Declassification)
+	require.ErrorIs(t, err, capability.ErrDeclassificationCommitted)
+	assert.Empty(t, again)
 }
 
 // TestDeclassify_UncommittedClearLeavesTheTaint pins the fail-CLOSED direction of the
@@ -289,8 +326,8 @@ func TestDeclassify_NoOpClearRecordsNothing(t *testing.T) {
 	// Intersecting here rather than at commit time is what bounds the clear to the taint the
 	// sanitizing call actually observed — see
 	// TestDeclassify_CommitCannotClearTaintAcquiredAfterTheDecision.
-	assert.Empty(t, resp.LabelsPendingClear, "nothing was carried, so nothing is pending")
-	assert.Equal(t, "alice@example.com", resp.Approver, "the authorization still happened and still names its human")
+	assert.Empty(t, resp.Declassification.Labels(), "nothing was carried, so nothing is pending")
+	assert.Equal(t, "alice@example.com", resp.Declassification.Approver(), "the authorization still happened and still names its human")
 }
 
 // TestDeclassify_FailsClosedWithoutSessionOrStore covers the two states in which the
@@ -335,7 +372,7 @@ func TestDeclassify_CommitFaultKeepsTheTaint(t *testing.T) {
 	require.Equal(t, capability.DecisionAllow, resp.Decision, "the decision authorizes; it does not write")
 
 	store.fail = true
-	cleared, err := eng.CommitDeclassification(ctx, r, resp.LabelsPendingClear)
+	cleared, err := eng.CommitDeclassification(ctx, r, resp.Declassification)
 	require.Error(t, err, "the commit reports the fault rather than swallowing it")
 	assert.Equal(t, []string{capability.FlowLabelPII}, cleared,
 		"the set travels with the error so the caller can report which labels MAY have gone")
@@ -405,7 +442,7 @@ func TestDeclassify_CommitFaultAfterDeleteReportsTheSet(t *testing.T) {
 	require.Equal(t, capability.DecisionAllow, resp.Decision)
 
 	store.fail = true
-	cleared, err := eng.CommitDeclassification(ctx, r, resp.LabelsPendingClear)
+	cleared, err := eng.CommitDeclassification(ctx, r, resp.Declassification)
 	require.Error(t, err)
 	assert.Equal(t, []string{capability.FlowLabelPII}, cleared,
 		"the caller cannot report what it was never told about")

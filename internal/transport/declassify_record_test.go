@@ -8,6 +8,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"strings"
 	"testing"
@@ -27,16 +30,14 @@ import (
 )
 
 // declassifiedAllow is the decision an approved single-use declassification produces: the
-// clear is AUTHORIZED (LabelsPendingClear) and the grant is already spent, but no label has
-// moved — that happens at the commit, once the call has run.
+// clear is AUTHORIZED (the handle carries it) and the grant is already spent, but no label
+// has moved — that happens at the commit, once the call has run.
 func declassifiedAllow() capability.EnforceResponse {
 	return capability.EnforceResponse{
-		Decision:           capability.DecisionAllow,
-		CarriedLabels:      []string{capability.FlowLabelInternal, capability.FlowLabelPII},
-		LabelsPendingClear: []string{capability.FlowLabelPII},
-		Approver:           "alice@example.com",
-		ApprovalID:         "apr-9",
-		SpentApprovalID:    "apr-9",
+		Decision:      capability.DecisionAllow,
+		CarriedLabels: []string{capability.FlowLabelInternal, capability.FlowLabelPII},
+		Declassification: capability.NewDeclassification(
+			[]string{capability.FlowLabelPII}, "alice@example.com", "apr-9", true),
 	}
 }
 
@@ -68,9 +69,10 @@ type commitSpy struct {
 // would not.
 type commitCtxProbe struct{}
 
-func (c *commitSpy) CommitDeclassified(ctx context.Context, _ string, labels []string) ([]string, error) {
+func (c *commitSpy) CommitDeclassified(ctx context.Context, _ string, decl *capability.Declassification) ([]string, error) {
 	c.calls++
 	c.sawCalled = true
+	labels := decl.Labels()
 	c.labels = append([]string(nil), labels...)
 	c.sawErr = ctx.Err()
 	_, c.sawBound = ctx.Deadline()
@@ -289,7 +291,6 @@ func TestEnforcedForwardCore_RefusalBelowTheDecisionNeverCommits(t *testing.T) {
 // The gate is declassifyCommitted, the SAME predicate the success path uses, so the two cannot
 // disagree about what counts as the action having happened.
 func TestDeclassifyRedactionDetail_ClaimsExecutionOnlyForASuccessfulReply(t *testing.T) {
-	fp := forwardParams{sessionID: "s"}
 	for name, tc := range map[string]struct {
 		upResp      mcp.RPCMsg
 		dec         func() capability.EnforceResponse
@@ -323,7 +324,7 @@ func TestDeclassifyRedactionDetail_ClaimsExecutionOnlyForASuccessfulReply(t *tes
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			got := fp.declassifyRedactionDetail(tc.dec(), tc.upResp)
+			got := declassifyRedactionDetail(tc.dec(), tc.upResp)
 			require.NotNil(t, got, "an authorized clear that did not take effect is always reported")
 			assert.Equal(t, []string{capability.FlowLabelPII}, got[audit.DeclassifyNotAppliedKey])
 			assert.Equal(t, true, got[capability.FlowAuditDetailKey])
@@ -345,15 +346,15 @@ func TestDeclassifyRedactionDetail_ClaimsExecutionOnlyForASuccessfulReply(t *tes
 // has nothing to do with one, inflating exactly the filter the discriminator exists to keep
 // meaningful.
 func TestDeclassifyRedactionDetail_SilentOnANonDeclassifyingCall(t *testing.T) {
-	fp := forwardParams{sessionID: "s"}
-	assert.Nil(t, fp.declassifyRedactionDetail(allowDecision(), successfulReply()),
+	assert.Nil(t, declassifyRedactionDetail(allowDecision(), successfulReply()),
 		"a decision that authorized no clear and spent no grant is not a declassification event")
 
 	// A standing grant with no `once` id still authorizes a clear, so the withheld fact is
 	// reportable and rides beside the benign not-applied key rather than replacing it.
 	dec := declassifiedAllow()
-	dec.SpentApprovalID = ""
-	got := fp.declassifyRedactionDetail(dec, successfulReply())
+	dec.Declassification = capability.NewDeclassification(
+		[]string{capability.FlowLabelPII}, "alice@example.com", "apr-9", false) // standing grant
+	got := declassifyRedactionDetail(dec, successfulReply())
 	require.NotNil(t, got)
 	assert.Equal(t, true, got[audit.DeclassifyResultWithheldKey])
 	assert.Equal(t, []string{capability.FlowLabelPII}, got[audit.DeclassifyNotAppliedKey],
@@ -366,14 +367,16 @@ func TestDeclassifyRedactionDetail_SilentOnANonDeclassifyingCall(t *testing.T) {
 // a containment that does not hold.
 //
 // A single-use grant is burned by the decision that accepts it even when the clear turns out
-// to be a no-op — the anchor was not carrying the approved labels — so LabelsPendingClear is
-// empty while SpentApprovalID is set. If that call then fails redaction, the withheld fact is
+// to be a no-op — the anchor was not carrying the approved labels — so the handle authorizes
+// no clear while still naming a spent grant. If that call then fails redaction, the withheld fact is
 // still worth recording (it is what says the spent grant bought work that actually happened),
 // and it is the only declassify key on the record.
 func TestDeclassifyRedactionDetail_RidesAloneOnANoOpClear(t *testing.T) {
 	dec := declassifiedAllow()
-	dec.LabelsPendingClear = nil // the anchor held none of the approved labels
-	got := forwardParams{sessionID: "s"}.declassifyRedactionDetail(dec, successfulReply())
+	// The anchor held none of the approved labels, so the handle authorizes no clear while
+	// still naming the grant the decision burned.
+	dec.Declassification = capability.NewDeclassification(nil, "alice@example.com", "apr-9", true)
+	got := declassifyRedactionDetail(dec, successfulReply())
 
 	require.NotNil(t, got, "the spent grant alone is worth a record")
 	assert.Equal(t, true, got[audit.DeclassifyResultWithheldKey])
@@ -438,7 +441,9 @@ func TestEnforcedForwardCore_NoOpCommitStillNamesTheSpentGrant(t *testing.T) {
 func TestEnforcedForwardCore_StandingGrantStampsNoSpentID(t *testing.T) {
 	rec, spy := &fwdRecorder{}, &commitSpy{}
 	dec := declassifiedAllow()
-	dec.SpentApprovalID = "" // standing grant: authorized, but nothing burned
+	// Standing grant: authorized, but nothing burned.
+	dec.Declassification = capability.NewDeclassification(
+		[]string{capability.FlowLabelPII}, "alice@example.com", "apr-9", false)
 	fp := forwardParams{rec: rec, sessionID: "s", callUpstream: cleanUpstream(), committer: spy}
 
 	enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
@@ -497,7 +502,8 @@ func TestEnforcedForwardCore_CommitOutlivesTheRequestContext(t *testing.T) {
 func TestEnforcedForwardCore_BoundsTheSpentApprovalID(t *testing.T) {
 	rec, spy := &fwdRecorder{}, &commitSpy{}
 	dec := declassifiedAllow()
-	dec.SpentApprovalID = strings.Repeat("a", 64*1024)
+	longID := strings.Repeat("a", 64*1024)
+	dec.Declassification = capability.NewDeclassification([]string{capability.FlowLabelPII}, "alice@example.com", longID, true)
 	fp := forwardParams{rec: rec, sessionID: "s", committer: spy,
 		callUpstream: func(context.Context, mcp.RPCMsg) (mcp.RPCMsg, error) {
 			return mcp.RPCMsg{}, errors.New("upstream gone")
@@ -509,7 +515,7 @@ func TestEnforcedForwardCore_BoundsTheSpentApprovalID(t *testing.T) {
 	require.Len(t, rec.records, 1)
 	got, ok := rec.records[0].details[audit.DeclassifySpentApprovalKey].(string)
 	require.True(t, ok)
-	assert.Less(t, len(got), len(dec.SpentApprovalID), "an unbounded IdP string must not reach the tape verbatim")
+	assert.Less(t, len(got), len(longID), "an unbounded IdP string must not reach the tape verbatim")
 	assert.Contains(t, got, "eunox: truncated", "and the cut must be visible")
 }
 
@@ -534,6 +540,64 @@ func TestDispatchParams_WireTheCommitterFromTheDecidingPDP(t *testing.T) {
 	hd := hp.dispatchParams(&httpSession{id: "s", route: &UpstreamRoute{pdp: &pdp.JWTPDP{}}}, "")
 	require.NotNil(t, hd.committer, "http must wire the commit")
 	assert.Same(t, hd.pdp, hd.committer, "and it must be the PDP that decided, not merely one of the same type")
+
+	// The server-initiated leg carries the same pair and so needs the same derivation. It was
+	// the one construction path the invariant did not cover: both of its sites assigned pdp
+	// directly and the struct had no committer at all, so neither the compiler nor a test
+	// could see the omission.
+	sr := serverRequestParams{sessionID: "s"}.withPDP(&pdp.JWTPDP{})
+	require.NotNil(t, sr.committer, "the server-initiated leg must wire the commit")
+	assert.Same(t, sr.pdp, sr.committer, "and it must be the PDP that decided, not merely one of the same type")
+}
+
+// TestParamsLiterals_DoNotAssignThePDPFields is what makes withPDP an invariant rather than a
+// convention. Go has no way to require a constructor, so the guard is over the SOURCE: no
+// literal of either params type may name pdp or committer, because a site that names one and
+// forgets the other compiles, passes every test that does not exercise a declassification,
+// and then never clears a label.
+//
+// It is an AST walk for the reason the composite-literal guard beside it is: the rule is
+// about composite literals, which no linter in .golangci.yml can express.
+func TestParamsLiterals_DoNotAssignThePDPFields(t *testing.T) {
+	t.Parallel()
+	derived := map[string]bool{"pdp": true, "committer": true}
+
+	entries, err := os.ReadDir(".")
+	require.NoError(t, err)
+	fset := token.NewFileSet()
+	checked := 0
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, perr := parser.ParseFile(fset, name, nil, 0)
+		require.NoError(t, perr)
+		ast.Inspect(file, func(n ast.Node) bool {
+			lit, ok := n.(*ast.CompositeLit)
+			if !ok {
+				return true
+			}
+			ident, isIdent := lit.Type.(*ast.Ident)
+			if !isIdent || (ident.Name != "serverRequestParams" && ident.Name != "dispatchParams" && ident.Name != "forwardParams") {
+				return true
+			}
+			checked++
+			for _, el := range lit.Elts {
+				kv, isKV := el.(*ast.KeyValueExpr)
+				if !isKV {
+					continue
+				}
+				key, isKey := kv.Key.(*ast.Ident)
+				if isKey && derived[key.Name] {
+					t.Errorf("%s literal in %s assigns %s directly; use .withPDP(p) so the decision point and every field derived from it cannot diverge",
+						ident.Name, name, key.Name)
+				}
+			}
+			return true
+		})
+	}
+	require.Positive(t, checked, "no params literal found in any non-test file; this guard would pass vacuously")
 }
 
 // TestEnforcedForwardCore_OrdinaryCallTouchesNoCommitter is the negative half: a call that
@@ -739,7 +803,7 @@ func TestEnforcedForwardCore_ConcurrentSourceKeepsItsTaintAcrossTheCommit(t *tes
 	}}})
 	decided := dp.Decide(approved, "s", pdp.EnforceTarget{Type: capability.TargetTypeTool, Name: "sanitize"}, nil, "")
 	require.Equal(t, capability.DecisionAllow, decided.Decision)
-	require.Empty(t, decided.LabelsPendingClear, "the anchor was clean, so the approved clear has nothing pending")
+	require.False(t, decided.Declassification.PendingClear(), "the anchor was clean, so the approved clear has nothing pending")
 
 	inFlight, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	fp := forwardParams{rec: &fwdRecorder{}, sessionID: "s", committer: dp,
@@ -836,14 +900,16 @@ func TestEnforcedForwardCore_SuccessfulResultCommits(t *testing.T) {
 
 // TestEnforcedForwardCore_SpentGrantIsNamedWithoutPendingLabels covers the refusal shape the
 // engine produces when its own declassify-leg commit faults AFTER burning a single-use grant:
-// the clear was never resolved, so the decision carries no LabelsPendingClear, but the grant
+// the clear was never resolved, so the decision's handle authorizes nothing, but the grant
 // is spent for good. Keying the refusal detail on the labels alone dropped the id on exactly
 // that path — the one record it would ever have appeared on.
 func TestEnforcedForwardCore_SpentGrantIsNamedWithoutPendingLabels(t *testing.T) {
 	rec, spy := &fwdRecorder{}, &commitSpy{}
 	dec := capability.EnforceResponse{
-		Decision:        capability.DecisionDeny,
-		SpentApprovalID: "apr-9",
+		Decision: capability.DecisionDeny,
+		// The engine's own declassify-leg commit fault: no clear was resolved, so the handle
+		// carries no labels and exists only to name the grant that was burned.
+		Declassification: capability.NewDeclassification(nil, "", "apr-9", true),
 		Denial: &capability.DenialInfo{
 			Code: capability.ErrCodeConditionFailed, ConditionType: capability.DirectiveTypeDeclassify,
 			HardDeny: true, Details: map[string]interface{}{capability.FlowAuditDetailKey: true, "phase": "record"},

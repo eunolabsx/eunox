@@ -1336,12 +1336,11 @@ func (p *StdioProxy) handleUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) 
 		rec:              p.rec(),
 		audit:            p.audit,
 		sessionID:        p.sessionID,
-		pdp:              p.pdp,
 		forward:          func(m mcp.RPCMsg) bool { p.forwardServerRequestToHost(m); return true },
 		writeUpstream:    func(m mcp.RPCMsg) { _ = p.upWriter.Write(m) },
 		decideLock:       p.samplingDecideLock(),
 		strictAuditState: p.strictAudit(),
-	})
+	}.withPDP(p.pdp))
 }
 
 // samplingDecideLock returns the entry into this session's decision serializer for a

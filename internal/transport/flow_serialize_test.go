@@ -257,11 +257,10 @@ func TestFlowSerialize_SamplingSinkSerializedAgainstSource(t *testing.T) {
 
 		fp := serverRequestParams{
 			sessionID: sessionID,
-			pdp:       dp,
 			// The sampling decision reserves its own (later) ticket and blocks until its turn —
 			// the exact wiring stdio's samplingDecideLock installs.
 			decideLock: func() func() { return gate.begin(gate.take()) },
-		}
+		}.withPDP(dp)
 
 		var wg sync.WaitGroup
 		wg.Add(1)
@@ -396,9 +395,15 @@ func TestFinishDecision_HoldsTheTurnForADeclassifyingCall(t *testing.T) {
 		"ordinary allow releases": {capability.EnforceResponse{Decision: capability.DecisionAllow}, true},
 		"deny releases":           {capability.EnforceResponse{Decision: capability.DecisionDeny}, true},
 		"declassifying allow holds": {capability.EnforceResponse{
-			Decision:           capability.DecisionAllow,
-			LabelsPendingClear: []string{capability.FlowLabelPII},
+			Decision:         capability.DecisionAllow,
+			Declassification: capability.NewDeclassification([]string{capability.FlowLabelPII}, "ada@example.com", "apr-1", false),
 		}, false},
+		// A handle that authorizes NO clear (a burned grant on a no-op) has no second phase to
+		// keep the turn for, so it releases like any other call.
+		"spent grant with nothing pending releases": {capability.EnforceResponse{
+			Decision:         capability.DecisionAllow,
+			Declassification: capability.NewDeclassification(nil, "ada@example.com", "apr-1", true),
+		}, true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			released := false
@@ -412,5 +417,6 @@ func TestFinishDecision_HoldsTheTurnForADeclassifyingCall(t *testing.T) {
 
 	// And a non-serialized request is a no-op either way rather than a nil call.
 	var d dispatchParams
-	d.finishDecision(capability.EnforceResponse{LabelsPendingClear: []string{capability.FlowLabelPII}})
+	d.finishDecision(capability.EnforceResponse{
+		Declassification: capability.NewDeclassification([]string{capability.FlowLabelPII}, "ada@example.com", "apr-1", false)})
 }

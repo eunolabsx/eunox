@@ -91,10 +91,10 @@ func (d dispatchParams) withPDP(p pdp.PolicyDecisionPoint) dispatchParams {
 	return d
 }
 
-// finishDecision closes the per-session decision critical section, if one is open (see
+// finishDecision closes the decision critical section, if one is open (see
 // dispatchParams.endDecision). The Decide* handlers call it right after the PDP decision
 // and before enforcedForwardCore, so the upstream forward is never held under the
-// per-session lock. A no-op when the request is not serialized.
+// turn. A no-op when the request is not serialized.
 //
 // It makes ONE exception, and it is the reason this takes the decision rather than no
 // arguments: a call that authorized a declassification keeps the turn until the handler
@@ -106,15 +106,23 @@ func (d dispatchParams) withPDP(p pdp.PolicyDecisionPoint) dispatchParams {
 // occurrence of the label from the old one, so nothing downstream could catch it. Holding
 // the turn is what makes the two phases one critical section.
 //
-// The cost is head-of-line blocking on that session for the length of one declassifying
+// The turn spans the state ANCHOR (see anchor_gate.go), which is what makes that hold mean
+// something under task-anchored state: two sessions sharing a task share the turn, so a
+// concurrent source on the OTHER session cannot land between a declassifying call's two
+// phases either. It is still an in-process gate — two eunox instances on one Redis backend
+// hold independent turns — and what bounds the damage there is the decision-time
+// intersection, which is a property of the decision rather than of any lock: a label not
+// carried at decision time is not in the authorized set, so no commit can remove it.
+//
+// The cost is head-of-line blocking on that anchor for the length of one declassifying
 // call, bounded by --upstream-timeout (and unbounded when that is 0, which is the one
-// setting a deployment using declassify should not choose). It is paid only by sessions that
+// setting a deployment using declassify should not choose). It is paid only by callers that
 // actually declassify: every other call still releases before the forward and keeps the full
 // concurrency the split exists for. The turn is not leaked — both transports ALSO defer this
 // same idempotent release in the handler goroutine, so it advances when the handler returns
 // whatever path it takes.
 func (d dispatchParams) finishDecision(dec capability.EnforceResponse) {
-	if d.endDecision == nil || len(dec.LabelsPendingClear) > 0 {
+	if d.endDecision == nil || dec.Declassification.PendingClear() {
 		return
 	}
 	d.endDecision()

@@ -124,7 +124,7 @@ func (denyAllPDP) CheckAudience(_ context.Context) *capability.EnforceResponse {
 }
 func (denyAllPDP) RecordObservedToolHashes(_ context.Context, _ json.RawMessage) int { return 0 }
 func (denyAllPDP) ReleaseSession(_ context.Context, _ string)                        {}
-func (denyAllPDP) CommitDeclassified(_ context.Context, _ string, _ []string) ([]string, error) {
+func (denyAllPDP) CommitDeclassified(_ context.Context, _ string, _ *capability.Declassification) ([]string, error) {
 	return nil, nil
 }
 func (denyAllPDP) FilterToolsList(_ context.Context, result json.RawMessage) ListFilterResult {
@@ -187,7 +187,7 @@ func (*staticPDP) CheckAudience(_ context.Context) *capability.EnforceResponse {
 }
 func (*staticPDP) RecordObservedToolHashes(_ context.Context, _ json.RawMessage) int { return 0 }
 func (*staticPDP) ReleaseSession(_ context.Context, _ string)                        {}
-func (*staticPDP) CommitDeclassified(_ context.Context, _ string, _ []string) ([]string, error) {
+func (*staticPDP) CommitDeclassified(_ context.Context, _ string, _ *capability.Declassification) ([]string, error) {
 	return nil, nil
 }
 func (*staticPDP) FilterToolsList(_ context.Context, result json.RawMessage) ListFilterResult {

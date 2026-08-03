@@ -14,7 +14,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/eunolabs/eunox/internal/mcp"
@@ -650,21 +649,28 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 			sess.releaseRequestSlot()
 		}()
 		d := p.dispatchParams(sess, p.sourceIP(r))
-		// Serialize the per-session decision phase for a flow-/sequenceBlock-relevant
+		// Serialize the decision phase for a flow-/sequenceBlock-relevant
 		// route, so a source's state write is not
-		// raced ahead of by a later sink's read on the same session. Only enforced methods
-		// take the lock (only they run a PDP decision + state write); the Decide* handler
+		// raced ahead of by a later sink's read on the same ANCHOR. Only enforced methods
+		// take the turn (only they run a PDP decision + state write); the Decide* handler
 		// releases it via finishDecision right after the decision, so the upstream forward
 		// runs outside it, and this defer is the idempotent backstop for the
 		// malformed-params path (which returns before the decision).
+		//
+		// The turn is keyed on the anchor rather than on the session: under task-anchored
+		// state two sessions share one key, and a per-session lock would leave their
+		// decisions unserialized against state they share. Under the default session
+		// anchoring the key IS this session, so this is the same mutual exclusion a
+		// per-session mutex gave.
+		//
 		// sess.route is dereferenced unconditionally by dispatchParams eight lines above,
 		// so a nil-route session cannot reach here — a nil check would only mislead a
 		// reader into believing one can.
-		if sess.route.serializeDecisions && isEnforcedMethod(msg.Method) {
-			sess.decideMu.Lock()
-			// sync.OnceFunc so the handler's release-after-decision (finishDecision) and this
-			// deferred backstop unlock exactly once between them.
-			end := sync.OnceFunc(sess.decideMu.Unlock)
+		if sess.route.serializes() && isEnforcedMethod(msg.Method) {
+			// begin's release is already idempotent, so the handler's
+			// release-after-decision (finishDecision) and this deferred backstop advance
+			// the turn exactly once between them.
+			end := sess.route.decideGates.begin(sess.route.decisionAnchorFromContext(ctx, sess.id))
 			d.endDecision = end
 			defer end()
 		}

@@ -273,7 +273,6 @@ func TestDeclassify_ComposedRefusalCarriesTheSessionsLabels(t *testing.T) {
 // The caller writes a SIGNED record from the difference, so the two must not return the same
 // value: reported as an empty result, a broken chain looks exactly like an ordinary allow.
 func TestCommitDeclassified_NoFlowStateIsAFaultNotSilence(t *testing.T) {
-	labels := []string{capability.FlowLabelPII}
 	for name, p := range map[string]PolicyDecisionPoint{
 		"wiretap":               AlwaysAllowPDP{},
 		"deny-all":              DenyAllPDP{},
@@ -281,20 +280,26 @@ func TestCommitDeclassified_NoFlowStateIsAFaultNotSilence(t *testing.T) {
 		"jwt wrapper, no inner": &JWTPDP{},
 	} {
 		t.Run(name, func(t *testing.T) {
-			cleared, err := p.CommitDeclassified(context.Background(), "s", labels)
+			decl := capability.NewDeclassification([]string{capability.FlowLabelPII}, "ada@example.com", "apr-1", false)
+			cleared, err := p.CommitDeclassified(context.Background(), "s", decl)
 			if err == nil {
 				t.Fatal("a decision point that cannot clear must say so, not report an empty result")
 			}
 			if len(cleared) != 0 {
 				t.Fatalf("must never claim a clear it did not perform; got %v", cleared)
 			}
+			// And the authorization must survive the fault: a path that cleared nothing must
+			// not consume the handle, or a correctly-wired retry would find it spent.
+			if decl.Committed() {
+				t.Fatal("a decision point that cleared nothing must not consume the authorization")
+			}
 
-			// The empty set is the one case where "nothing to clear" and "cleared nothing"
-			// are the same state, so it is not a fault — otherwise every ordinary call in a
-			// deployment with no declassify directive would report one.
+			// A handle authorizing nothing is the one case where "nothing to clear" and
+			// "cleared nothing" are the same state, so it is not a fault — otherwise every
+			// ordinary call in a deployment with no declassify directive would report one.
 			cleared, err = p.CommitDeclassified(context.Background(), "s", nil)
 			if err != nil {
-				t.Fatalf("an empty set is not a fault; got %v", err)
+				t.Fatalf("a nil handle is not a fault; got %v", err)
 			}
 			if len(cleared) != 0 {
 				t.Fatalf("cleared = %v, want empty", cleared)

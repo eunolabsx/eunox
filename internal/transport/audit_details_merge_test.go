@@ -250,10 +250,9 @@ func TestFlowDiscriminator_IsOneSharedConstant(t *testing.T) {
 	// Every producer, reached through its own path, agrees on the key.
 	assert.Equal(t, map[string]interface{}{capability.FlowAuditDetailKey: true}, declassifyDetail())
 
-	fp := forwardParams{sessionID: "s"}
 	for name, got := range map[string]map[string]interface{}{
-		"refusal below the decision": fp.declassifyRefusalDetail(declassifiedAllow()),
-		"result withheld":            fp.declassifyRedactionDetail(declassifiedAllow(), successfulReply()),
+		"refusal below the decision": declassifyRefusalDetail(declassifiedAllow()),
+		"result withheld":            declassifyRedactionDetail(declassifiedAllow(), successfulReply()),
 	} {
 		assert.Equal(t, true, got[capability.FlowAuditDetailKey], "%s must carry the discriminator", name)
 	}

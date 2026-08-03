@@ -2157,15 +2157,15 @@ func (p *JWTPDP) ReleaseSession(ctx context.Context, sessionID string) {
 // ManifestPDP's does: this is reached through the transport's committer interface after the
 // upstream call has already run, where a panic is a crash with the response in hand.
 //
-// A nil inner clears nothing and says so. Reaching here with labels in hand means the
+// A nil inner clears nothing and says so. Reaching here with an authorizing handle means the
 // authorization came from a layer this wrapper cannot see, so reporting an empty set would
 // be indistinguishable from a clear that legitimately moved nothing — and would put an
 // ordinary allow on the tape for a declassification that will never take effect.
-func (p *JWTPDP) CommitDeclassified(ctx context.Context, sessionID string, labels []string) ([]string, error) {
+func (p *JWTPDP) CommitDeclassified(ctx context.Context, sessionID string, decl *capability.Declassification) ([]string, error) {
 	if p == nil || p.inner == nil {
-		return nil, noFlowStateErr(labels, "JWT decision point with no inner policy")
+		return nil, noFlowStateErr(decl, "JWT decision point with no inner policy")
 	}
-	return p.inner.CommitDeclassified(ctx, sessionID, labels)
+	return p.inner.CommitDeclassified(ctx, sessionID, decl)
 }
 
 // innerFilter applies the inner PDP's list filter (selected by sel) to intersect

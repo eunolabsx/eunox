@@ -96,14 +96,11 @@ type httpSession struct {
 	// evaluates against, since server-initiated sampling has no host request in scope.
 	clientIP string
 
-	// decideMu serializes this session's enforced-request decision phase when the route
-	// is flow- or sequenceBlock-relevant (route.serializeDecisions), so a source's
-	// per-session state write is not raced ahead of by a later sink's read on the same
-	// session. HTTP has no serial reader, so it is
-	// held in arrival-at-the-lock order and released right after the decision (via the
-	// dispatch handler's finishDecision) so the upstream forward stays concurrent. Unused
-	// on a non-serialized route.
-	decideMu sync.Mutex
+	// There is deliberately no per-session decision mutex here. The decision turn is keyed
+	// on the state ANCHOR and handed out by the route (UpstreamRoute.decideGates), because
+	// under task-anchored state two sessions share one key and a per-session lock would not
+	// span it. Under the default session anchoring the route's gate for this session's key
+	// IS a per-session mutex, so nothing changed for that deployment. See anchor_gate.go.
 
 	notifMu   sync.Mutex
 	notifSubs []chan mcp.RPCMsg

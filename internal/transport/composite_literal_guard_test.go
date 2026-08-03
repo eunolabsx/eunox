@@ -47,10 +47,11 @@ var guardedStructs = map[string]struct {
 	},
 	"serverRequestParams": {
 		files:       []string{"stdio.go", "http_handlers.go"},
-		constructor: "(*HTTPProxy).dispatchParams or (*StdioProxy).dispatchParams",
+		constructor: "a literal at one of the allowlisted sites, completed with .withPDP(pdp)",
 		why: "serverRequestParams.sessionID is recorded as the session a server-initiated " +
 			"sampling/roots/elicitation request was answered for, with the same provenance " +
-			"requirement as forwardParams",
+			"requirement as forwardParams; its pdp and committer must also come from ONE " +
+			"decision point, which is what withPDP derives",
 	},
 }
 

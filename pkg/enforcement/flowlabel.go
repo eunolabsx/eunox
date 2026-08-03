@@ -410,7 +410,7 @@ func (e *Engine) RecordLabels(ctx context.Context, req *capability.EnforceReques
 // OBSERVED. The alternative — intersecting at commit time, against whatever the anchor holds
 // a round trip later — silently widens the clear to cover a label a concurrent source added
 // in between, which a set store cannot distinguish from the one the approval was granted
-// against. See LabelsPendingClear.
+// against. See EnforceResponse.Declassification.
 func intersectLabels(want, held []string) []string {
 	if len(want) == 0 || len(held) == 0 {
 		return nil
@@ -449,7 +449,7 @@ type SourceCommitError struct {
 	// SpentApprovalID names a single-use grant this commit BURNED before faulting, empty
 	// when nothing was spent. It exists because the burn is the one piece of declassify
 	// state the decision writes, and a fault after it produces a refusal that carries no
-	// LabelsPendingClear — so without carrying the id here, a grant spent by a call that
+	// authorizing handle — so without carrying the id here, a grant spent by a call that
 	// never ran would reach the tape named by nothing at all, which is the reconciliation
 	// gap the whole spent-approval key exists to close. The burn's OWN fault arm leaves it
 	// empty: the loser of a concurrent admission records nothing, so there is nothing spent
@@ -477,7 +477,7 @@ func (e *SourceCommitError) Error() string { return e.Err.Error() }
 // An APPROVED declassification (decl, resolved by checkDeclassify before anything was
 // committed) contributes exactly ONE thing here: the BURN of a single-use grant. Its label
 // clear does NOT happen here — it is deferred to CommitDeclassification, which the caller
-// runs after the call has actually completed. See LabelsPendingClear for why: a clear
+// runs after the call has actually completed. See EnforceResponse.Declassification for why: a clear
 // applied at this point is invisible to every concurrent decision for the whole upstream
 // round trip, and a sink that the taint existed to stop can be allowed and forwarded while
 // the sanitizing call is still in flight. labelOutput's add stays here and is safe there
@@ -604,7 +604,8 @@ func (e *Engine) rollbackLabels(ctx context.Context, req *capability.EnforceRequ
 
 // CommitDeclassification applies an approved declassification's label clear, for a call
 // the decision AUTHORIZED and the caller has now actually performed. It is the second half
-// of the two-phase clear: the decision resolves and authorizes (LabelsPendingClear, plus
+// of the two-phase clear: the decision resolves and authorizes (the handle on
+// EnforceResponse.Declassification, plus
 // the burn of a single-use grant), and this removes the labels once the action it sanitizes
 // has run.
 //
@@ -631,9 +632,9 @@ func (e *Engine) rollbackLabels(ctx context.Context, req *capability.EnforceRequ
 // operator resolves with another approval — the fail-closed direction, and the mirror of
 // the burn's own accepted over-refusal.
 //
-// labels MUST be the decision's LabelsPendingClear and nothing else. That set was already
-// intersected against what the anchor was carrying, INSIDE the decision's critical section,
-// and this removes exactly it — it does NOT re-read the anchor. Both halves of that matter:
+// What it clears is decl's authorized set and NOTHING else. That set was already intersected
+// against what the anchor was carrying, INSIDE the decision's critical section, and this
+// removes exactly it — it does NOT re-read the anchor. Both halves of that matter:
 //
 //   - Re-reading here would widen the clear to whatever the anchor holds a round trip later,
 //     so a source read decided while the sanitizing call was in flight would have its
@@ -646,9 +647,19 @@ func (e *Engine) rollbackLabels(ctx context.Context, req *capability.EnforceRequ
 //     the carried_labels stamped on the same record, and the commit costs one round trip
 //     rather than two on the host's response path.
 //
-// A caller passing a wider set than the decision authorized would clear more than the
-// approval covered; the transport passes dec.LabelsPendingClear verbatim, and the parameter
-// exists rather than being re-derived here because only the caller knows the call ran.
+// The parameter is the decision's HANDLE rather than a label slice, which is what makes the
+// bound above structural instead of documented. This used to take []string, so an embedder
+// holding an *Engine could clear any label it named with no approval presented, no grant
+// burned, no escalation raised, and nothing on the tape — every gate the declassify surface
+// installs sits on the first phase, and the second phase accepted anything. A handle is minted
+// only by a decision that authorized something, carries its set unexported, and claims
+// single-use, so a wider clear cannot be expressed and an authorization cannot be replayed.
+// The parameter exists rather than being re-derived here because only the caller knows the
+// call ran.
+//
+// A nil handle is the no-declassification case and clears nothing, without error: every call
+// in a deployment with no declassify directive lands there, and so does a handle whose
+// intersection was empty (see NewDeclassification).
 //
 // Anchoring follows the request (flowKey), so a task-anchored call clears the key its
 // decision was accounted against. The caller MUST therefore hand a context that still
@@ -656,15 +667,25 @@ func (e *Engine) rollbackLabels(ctx context.Context, req *capability.EnforceRequ
 // context detached with context.Background() would clear the SESSION key instead — leaving
 // the task tainted, deleting a label the session never asked to drop, and reporting success.
 // Detach cancellation only (context.WithoutCancel), never the values.
-func (e *Engine) CommitDeclassification(ctx context.Context, req *capability.EnforceRequest, labels []string) (cleared []string, err error) {
-	if len(labels) == 0 {
+func (e *Engine) CommitDeclassification(ctx context.Context, req *capability.EnforceRequest, decl *capability.Declassification) (cleared []string, err error) {
+	if !decl.PendingClear() {
 		return nil, nil
 	}
 	// Exported, so it is reachable on an engine that holds no flow state at all — and on a
 	// PDP whose commit chain terminates in a no-op. Each of those means the labels stay
 	// exactly where they are, so none of them may report a clear.
+	//
+	// Checked BEFORE the claim: an engine that cannot clear must not consume the handle, or a
+	// correctly-wired retry would find the authorization already spent.
 	if e == nil || e.skipFlow || e.flowStore == nil || req == nil || req.SessionID == "" {
 		return nil, errNoFlowStateToClear
+	}
+	// One authorization, one clear. A second commit of the same decision is a caller fault,
+	// and reporting it is what keeps a double-commit from looking like a healthy one — the
+	// grant behind it was burned exactly once.
+	labels, err := decl.Claim()
+	if err != nil {
+		return nil, err
 	}
 	if err := e.flowStore.Remove(ctx, e.flowKey(req), labels...); err != nil {
 		// labels, not nil: the Remove may well have taken effect before the error surfaced,
@@ -676,7 +697,7 @@ func (e *Engine) CommitDeclassification(ctx context.Context, req *capability.Enf
 
 // errNoFlowStateToClear is what an engine holding no flow state returns from a commit it was
 // asked to perform. It is an ERROR rather than a silent empty result because the two are not
-// the same fact: a no-op clear is decided at decision time (LabelsPendingClear comes back
+// the same fact: a no-op clear is decided at decision time (the handle's set comes back
 // empty and the caller never commits at all), so reaching the commit with labels in hand and
 // no store is a wiring fault — the policy's sanitizing step will never take effect, and the
 // old contract's `restored bool` existed precisely so that could not be mistaken for success.

@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/eunolabs/eunox/internal/mcp"
@@ -308,17 +307,19 @@ func (p *HTTPProxy) handleHTTPUpstreamRequest(ctx context.Context, sess *httpSes
 	// dereferenced rt three lines later anyway, so it bought nothing except the impression
 	// that a nil route is survivable here.
 	rt := sess.route
-	// Serialize the sampling decision against this session's host-path decisions for a
-	// flow-/sequenceBlock-relevant route, so a flowLabel sink on system:sampling cannot
-	// peek the flow set concurrently with a host source's label write. Same per-session
-	// decideMu the host path uses; released before
+	// Serialize the sampling decision against the host-path decisions on the same anchor for
+	// a flow-/sequenceBlock-relevant route, so a flowLabel sink on system:sampling cannot
+	// peek the flow set concurrently with a host source's label write. Same anchor-keyed gate
+	// the host path uses; released before
 	// the forward. nil (no serialization) for a non-flow route.
+	//
+	// The anchor comes from the SESSION's claims, captured at initialize: a server-initiated
+	// request has no host request in scope, and those are the same claims its decision is
+	// taken with (see serverRequestParams.claims), so the turn and the state key agree.
 	var decideLock func() (end func())
-	if rt.serializeDecisions {
-		decideLock = func() func() {
-			sess.decideMu.Lock()
-			return sync.OnceFunc(sess.decideMu.Unlock)
-		}
+	if rt.serializes() {
+		anchor := rt.decisionAnchor(sess.id, sess.claims)
+		decideLock = func() func() { return rt.decideGates.begin(anchor) }
 	}
 	// sess.broadcastServerRequest reports whether an SSE subscriber received the
 	// request; sess.claims (captured at initialize) is attached for the sampling
@@ -329,10 +330,9 @@ func (p *HTTPProxy) handleHTTPUpstreamRequest(ctx context.Context, sess *httpSes
 		sessionID:        sess.id,
 		sourceIP:         sess.clientIP,
 		claims:           sess.claims,
-		pdp:              rt.pdp,
 		forward:          sess.broadcastServerRequest,
 		writeUpstream:    func(m mcp.RPCMsg) { _ = sess.upWriter.Write(m) },
 		decideLock:       decideLock,
 		strictAuditState: p.strictAudit(),
-	})
+	}.withPDP(rt.pdp))
 }
