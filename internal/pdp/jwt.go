@@ -2387,83 +2387,85 @@ func evaluateJWTConditions(clock enforcement.Clock, conditions []capability.Cond
 				// named argument means "match THIS argument", and scanning all args instead
 				// would silently match an alternative — the "never silently match alternatives"
 				// invariant. Fail closed rather than re-implement the engine's per-argument
-				// taxonomy for this claim-unreachable form.
+				// taxonomy for this claim-unreachable form. It RETURNS, so the scan-all-args
+				// body below follows at this level rather than sitting in an else — one
+				// gratuitous nesting level off the longest, most security-sensitive stretch
+				// in this function.
 				resp := denyResponseWithDetails(clock, capability.ErrCodeConditionFailed, capability.ConditionTypeAllowedOperations,
 					fmt.Sprintf("%q: allowedOperations with a named argument is not supported from a capability claim", name),
 					map[string]interface{}{"argument": c.Argument, "allowedOperations": c.Operations})
 				return &resp
-			} else {
-				// Scan-all-args mode: the first word of each string argument is checked
-				// against the permitted set. This is sound only for SQL ops, where the
-				// isSQLVerb hard-deny below catches a disallowed statement smuggled into
-				// any argument. For a non-SQL op there is no "disallowed verbs" set, so
-				// fail closed and require the manifest form (Pattern C) that names the
-				// operation argument.
-				for _, op := range c.Operations {
-					if !isSQLVerb(op) {
-						resp := denyResponseWithDetails(clock, capability.ErrCodeConditionFailed, capability.ConditionTypeAllowedOperations,
-							fmt.Sprintf("%q: non-SQL operation %q cannot be safely enforced without an explicit argument naming the operation parameter; use the manifest form that names the argument", name, op),
-							map[string]interface{}{"operation": op, "allowedOperations": c.Operations})
-						return &resp
-					}
-				}
-				// All granted ops are SQL verbs: scan ALL arguments (do not break on the
-				// first match) and deny if any argument's first word is a SQL verb
-				// outside the allowed set. This closes the multi-argument bypass (e.g.
-				// op=SELECT granted, but {"sql":"DROP TABLE x","note":"SELECT 1"}).
-				var matchedOp string
-				// Scan every string scalar reachable from the arguments, including those
-				// nested inside objects and arrays: a SQL verb smuggled into a nested
-				// value (e.g. {"query":{"sql":"DROP TABLE x"}}) would otherwise be skipped,
-				// letting a disallowed statement through while a benign sibling string
-				// matched a permitted op. collectArgStrings walks maps in sorted-key order
-				// and slices in index order, so matchedOp and any denial message stay
-				// deterministic (independent of Go's randomized map iteration).
-				var argStrings []string
-				if !collectArgStrings(args, &argStrings) {
-					// Argument nesting exceeded the depth bound; fail closed rather
-					// than risk stack exhaustion or an incomplete (and therefore
-					// unsound) scan.
+			}
+			// Scan-all-args mode: the first word of each string argument is checked
+			// against the permitted set. This is sound only for SQL ops, where the
+			// isSQLVerb hard-deny below catches a disallowed statement smuggled into
+			// any argument. For a non-SQL op there is no "disallowed verbs" set, so
+			// fail closed and require the manifest form (Pattern C) that names the
+			// operation argument.
+			for _, op := range c.Operations {
+				if !isSQLVerb(op) {
 					resp := denyResponseWithDetails(clock, capability.ErrCodeConditionFailed, capability.ConditionTypeAllowedOperations,
-						fmt.Sprintf("%q: arguments nested too deeply to scan for operations", name),
-						map[string]interface{}{"maxDepth": maxArgStringDepth, "allowedOperations": c.Operations})
+						fmt.Sprintf("%q: non-SQL operation %q cannot be safely enforced without an explicit argument naming the operation parameter; use the manifest form that names the argument", name, op),
+						map[string]interface{}{"operation": op, "allowedOperations": c.Operations})
 					return &resp
 				}
-				for _, s := range argStrings {
-					word := enforcement.OperationVerb(s)
-					if word == "" {
-						continue
-					}
-					if capability.MatchOperation(c.Operations, word) {
-						matchedOp = word
-						continue
-					}
-					// A disallowed SQL statement in any argument is a hard denial.
-					if isSQLVerb(word) {
-						// The SAME details the engine's handleAllowedOperations records for this exact
-						// code, so a SIEM rule keyed on the manifest path's denial finds a token-scoped
-						// caller too — the parity allowedValues just got, on the other arm of the same
-						// function. This path cannot share the engine's HANDLER (its scan-all-arguments
-						// semantics are deliberately different, and the engine hard-denies the empty
-						// argument this claim grammar always emits), but it can share the record shape.
-						resp := denyResponseWithDetails(clock, capability.ErrCodeOperationNotPermitted, capability.ConditionTypeAllowedOperations,
-							fmt.Sprintf("%q: operation %q is not in the permitted set %v", name, word, c.Operations),
-							map[string]interface{}{"operation": word, "allowedOperations": c.Operations})
-						return &resp
-					}
+			}
+			// All granted ops are SQL verbs: scan ALL arguments (do not break on the
+			// first match) and deny if any argument's first word is a SQL verb
+			// outside the allowed set. This closes the multi-argument bypass (e.g.
+			// op=SELECT granted, but {"sql":"DROP TABLE x","note":"SELECT 1"}).
+			var matchedOp string
+			// Scan every string scalar reachable from the arguments, including those
+			// nested inside objects and arrays: a SQL verb smuggled into a nested
+			// value (e.g. {"query":{"sql":"DROP TABLE x"}}) would otherwise be skipped,
+			// letting a disallowed statement through while a benign sibling string
+			// matched a permitted op. collectArgStrings walks maps in sorted-key order
+			// and slices in index order, so matchedOp and any denial message stay
+			// deterministic (independent of Go's randomized map iteration).
+			var argStrings []string
+			if !collectArgStrings(args, &argStrings) {
+				// Argument nesting exceeded the depth bound; fail closed rather
+				// than risk stack exhaustion or an incomplete (and therefore
+				// unsound) scan.
+				resp := denyResponseWithDetails(clock, capability.ErrCodeConditionFailed, capability.ConditionTypeAllowedOperations,
+					fmt.Sprintf("%q: arguments nested too deeply to scan for operations", name),
+					map[string]interface{}{"maxDepth": maxArgStringDepth, "allowedOperations": c.Operations})
+				return &resp
+			}
+			for _, s := range argStrings {
+				word := enforcement.OperationVerb(s)
+				if word == "" {
+					continue
 				}
-				// matchedOp is non-empty only if some argument matched a permitted
-				// operation, so the only failure left is "no argument matched any".
-				if matchedOp == "" {
-					// No "argument" key here, unlike the engine's MISSING_CONTEXT for this condition:
-					// that one names the argument the manifest declared, and this path has none — the
-					// claim grammar cannot express one, which is why it scans every argument. Naming a
-					// phantom argument would send an operator looking for a field that does not exist.
-					resp := denyResponseWithDetails(clock, capability.ErrCodeMissingContext, capability.ConditionTypeAllowedOperations,
-						fmt.Sprintf("%q: no matching operation found in arguments", name),
-						map[string]interface{}{"allowedOperations": c.Operations})
+				if capability.MatchOperation(c.Operations, word) {
+					matchedOp = word
+					continue
+				}
+				// A disallowed SQL statement in any argument is a hard denial.
+				if isSQLVerb(word) {
+					// The SAME details the engine's handleAllowedOperations records for this exact
+					// code, so a SIEM rule keyed on the manifest path's denial finds a token-scoped
+					// caller too — the parity allowedValues just got, on the other arm of the same
+					// function. This path cannot share the engine's HANDLER (its scan-all-arguments
+					// semantics are deliberately different, and the engine hard-denies the empty
+					// argument this claim grammar always emits), but it can share the record shape.
+					resp := denyResponseWithDetails(clock, capability.ErrCodeOperationNotPermitted, capability.ConditionTypeAllowedOperations,
+						fmt.Sprintf("%q: operation %q is not in the permitted set %v", name, word, c.Operations),
+						map[string]interface{}{"operation": word, "allowedOperations": c.Operations})
 					return &resp
 				}
+			}
+			// matchedOp is non-empty only if some argument matched a permitted
+			// operation, so the only failure left is "no argument matched any".
+			if matchedOp == "" {
+				// No "argument" key here, unlike the engine's MISSING_CONTEXT for this condition:
+				// that one names the argument the manifest declared, and this path has none — the
+				// claim grammar cannot express one, which is why it scans every argument. Naming a
+				// phantom argument would send an operator looking for a field that does not exist.
+				resp := denyResponseWithDetails(clock, capability.ErrCodeMissingContext, capability.ConditionTypeAllowedOperations,
+					fmt.Sprintf("%q: no matching operation found in arguments", name),
+					map[string]interface{}{"allowedOperations": c.Operations})
+				return &resp
 			}
 		case capability.AllowedValuesCondition:
 			// The engine's own predicate, NOT a copy of it. This arm used to re-implement

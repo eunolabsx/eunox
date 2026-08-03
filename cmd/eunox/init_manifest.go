@@ -1,7 +1,8 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// Starter manifest generator for the init subcommand.
+// The `init` subcommand (cmdInit and its upstream-spec parsing) and the starter manifest
+// generator behind it.
 //
 // generateInitManifestYAML produces a YAML manifest with every tool commented
 // out; operators uncomment and add conditions only for tools the agent needs.
@@ -10,8 +11,13 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
+	"errors"
+	"flag"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -397,3 +403,181 @@ func sortedKeys[V any](m map[string]V) []string {
 	sort.Strings(keys)
 	return keys
 }
+
+// initUsageExit is init's exit code for a usage error. It is 2, matching validate — the
+// sibling it shares live-introspection flags with — and contracts, rather than the 1 it
+// used: init reports no findings, so it has nothing 1 could mean, and an operator (or a
+// scaffolding script) reading a 1 from one command and a 2 from the other for the same
+// class of mistake has to learn each command's private convention.
+const initUsageExit = 2
+
+// cmdInit runs the `init` subcommand and returns the process exit code (rather
+// than calling os.Exit itself), so tests can drive every branch — including the
+// fail-closed error paths — without terminating the test binary. args carries
+// the subcommand's own arguments (os.Args[2:] in a real invocation), threaded
+// from run.
+
+// cmdInit runs the `init` subcommand and returns the process exit code (rather
+// than calling os.Exit itself), so tests can drive every branch — including the
+// fail-closed error paths — without terminating the test binary. args carries
+// the subcommand's own arguments (os.Args[2:] in a real invocation), threaded
+// from run.
+func cmdInit(args []string) int {
+	fs := flag.NewFlagSet("init", flag.ContinueOnError)
+	fs.Usage = func() {
+		fmt.Fprint(os.Stderr, `Usage:
+  eunox init [--transport http] --upstream-url <url> [flags]
+  eunox init   --transport stdio [flags] -- <command> [args...]
+
+Connect to a live MCP server (HTTP or stdio subprocess) and generate a deny-all
+starter manifest. Every tool is commented out — uncomment and add conditions
+only for tools the agent genuinely needs. Re-running init after a server update
+and diffing against the current manifest surfaces additions and removals.
+
+With --config-output, also scaffold a runnable eunox config matching the
+introspected transport, so the quickstart is two commands:
+  eunox init  --upstream-url <url> --output manifest.yaml --config-output eunox.yaml
+  eunox proxy --config eunox.yaml
+
+Exit codes:
+  0  Manifest generated (to stdout, or to --output).
+  2  Usage error, or a failure reaching the upstream or writing a file.
+
+Flags:
+`)
+		fs.PrintDefaults()
+	}
+
+	transportFlag := fs.String("transport", config.HostTransportHTTP, `Upstream transport to introspect: "http" or "stdio".`)
+	upstreamURL := fs.String("upstream-url", "", "Base URL of the MCP HTTP server (required with --transport http).")
+	output := fs.String("output", "", "Path to write the generated manifest YAML (default: stdout).")
+	configOutput := fs.String("config-output", "", "Also write a runnable eunox config to this path that fronts the introspected\nupstream and enforces the generated manifest. Requires --output (the config references it).")
+	force := fs.Bool("force", false, "Overwrite --output / --config-output if they already exist (default: refuse to\nclobber). An overwrite also re-tightens the file mode to 0600.")
+	name := fs.String("name", "generated-manifest", "Value for the manifest name field.")
+	authHeader := fs.String("upstream-auth-header", "", `Header forwarded to the HTTP upstream in "Name: Value" format.`)
+	tlsSkipVerify := fs.Bool("upstream-tls-skip-verify", false, "Skip TLS certificate verification for the HTTP upstream (development only).")
+	pinDescriptions := fs.Bool("pin-descriptions", false, "Include a descriptionHash field for each tool, computed from its current live\ndescription. When set in the manifest, the proxy verifies the hash at startup\nand aborts if the description has changed — detecting upstream tool poisoning.")
+
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return initUsageExit
+	}
+
+	// Reject the incoherent --config-output-without--output combination up front, before
+	// the live upstream fetch — otherwise the operator waits out the whole introspection
+	// (up to liveUpstreamTimeout) only to be told their flags were incoherent (matches
+	// buildInitUpstreamSpec's reject-flag-mixes-before-the-first-network-call posture).
+	if *configOutput != "" && *output == "" {
+		fmt.Fprintf(os.Stderr, "eunox init: --config-output requires --output (the config references the manifest file)\n")
+		return initUsageExit
+	}
+
+	positional := fs.Args()
+	spec, err := buildInitUpstreamSpec(*transportFlag, *upstreamURL, *authHeader, *tlsSkipVerify, positional)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "eunox init: %v\n", err)
+		return initUsageExit
+	}
+
+	fmt.Fprintf(os.Stderr, "Fetching tool list from upstream...")
+	ctx, cancel := context.WithTimeout(context.Background(), liveUpstreamTimeout)
+	defer cancel()
+	info, err := fetchSpecLive(ctx, spec)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  FAILED\n")
+		fmt.Fprintf(os.Stderr, "eunox init: %v\n", err)
+		return 2
+	}
+	fmt.Fprintf(os.Stderr, "  %d tool(s)\n\n", len(info.Tools))
+
+	manifest := generateInitManifestYAML(info.Tools, *name, info.ServerVersion, *pinDescriptions)
+
+	if *output == "" {
+		// --config-output-without--output was already rejected up front.
+		fmt.Print(manifest)
+		return 0
+	}
+
+	if err := writeGeneratedFile(*output, manifest, *force); err != nil {
+		fmt.Fprintf(os.Stderr, "eunox init: %v\n", err)
+		return 2
+	}
+	fmt.Fprintf(os.Stderr, "Generated manifest %s — review and uncomment the capabilities you want to permit.\n", *output)
+
+	if *configOutput != "" {
+		// Resolve the manifest path to absolute so the config works regardless of
+		// the CWD when `proxy --config` is invoked.
+		absManifest, err := filepath.Abs(*output)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "eunox init: resolving manifest path: %v\n", err)
+			return 2
+		}
+		cfg := generateInitConfigYAML(spec, absManifest)
+		if err := writeGeneratedFile(*configOutput, cfg, *force); err != nil {
+			fmt.Fprintf(os.Stderr, "eunox init: %v\n", err)
+			return 2
+		}
+		fmt.Fprintf(os.Stderr, "Generated config %s — run: eunox proxy --config %s\n", *configOutput, *configOutput)
+		if spec.AuthHeader != "" {
+			fmt.Fprintf(os.Stderr, "[eunox] SECURITY: %s embeds the --upstream-auth-header value as a cleartext credential; keep it out of version control, or replace it with an env-ref (e.g. \"Authorization: Bearer ${UPSTREAM_TOKEN}\").\n", *configOutput)
+		}
+	}
+	return 0
+}
+
+// buildInitUpstreamSpec validates and returns the live-introspection target,
+// rejecting cross-axis flag mixes (http vs stdio) up front rather than at the
+// first network call. Shared by `init` and `validate --live`; error messages are
+// subcommand-agnostic.
+
+// buildInitUpstreamSpec validates and returns the live-introspection target,
+// rejecting cross-axis flag mixes (http vs stdio) up front rather than at the
+// first network call. Shared by `init` and `validate --live`; error messages are
+// subcommand-agnostic.
+func buildInitUpstreamSpec(transportMode, upstreamURL, authHeader string, tlsSkipVerify bool, positional []string) (initUpstreamSpec, error) {
+	switch transportMode {
+	case config.HostTransportHTTP:
+		if upstreamURL == "" {
+			return initUpstreamSpec{}, fmt.Errorf("--upstream-url is required with --transport http")
+		}
+		if len(positional) > 0 {
+			return initUpstreamSpec{}, fmt.Errorf("positional args are not allowed with --transport http (got %q); they are the stdio subprocess command", positional)
+		}
+		return initUpstreamSpec{
+			Transport:     config.HostTransportHTTP,
+			URL:           upstreamURL,
+			AuthHeader:    authHeader,
+			TLSSkipVerify: tlsSkipVerify,
+		}, nil
+	case config.HostTransportStdio:
+		if upstreamURL != "" {
+			return initUpstreamSpec{}, fmt.Errorf("--upstream-url is not allowed with --transport stdio")
+		}
+		if authHeader != "" {
+			return initUpstreamSpec{}, fmt.Errorf("--upstream-auth-header is not allowed with --transport stdio")
+		}
+		if tlsSkipVerify {
+			return initUpstreamSpec{}, fmt.Errorf("--upstream-tls-skip-verify is not allowed with --transport stdio")
+		}
+		if len(positional) == 0 {
+			return initUpstreamSpec{}, fmt.Errorf(`--transport stdio requires a subprocess command after "--", e.g.: --transport stdio -- npx -y @modelcontextprotocol/server-filesystem /data`)
+		}
+		return initUpstreamSpec{
+			Transport: config.HostTransportStdio,
+			Command:   positional[0],
+			Args:      positional[1:],
+		}, nil
+	default:
+		return initUpstreamSpec{}, fmt.Errorf("--transport must be %q or %q (got %q)", config.HostTransportHTTP, config.HostTransportStdio, transportMode)
+	}
+}
+
+// -----------------------------------------------------------------
+// audit-log readers (suggest / stats / audit-verify)
+// -----------------------------------------------------------------
+
+// auditLogMissingHint returns a first-run-friendly message for when the audit log
+// does not exist yet — what the log is and how to produce one, instead of a raw
+// OS error. cmdName is the subcommand, used in the message and re-run command.

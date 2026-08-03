@@ -448,26 +448,12 @@ func jwksKeysUnchanged(before, after *jose.JSONWebKeySet) bool {
 	return sameKeyMultiset(before.Keys, after.Keys)
 }
 
-// sameMatchingKeys reports whether two candidate-key slices hold the same keys by
-// RFC 7638 thumbprint, independent of order. It backs the post-signature-failure
-// retry skip in VerifyWithKeyRotation: when a forced refresh returns the identical
-// keys the caller already tried, re-verifying them against the same token can never
-// succeed, so the retry (a full per-key signature pass) is pointless CPU. The
-// comparison is against the keys the caller ACTUALLY tried rather than a bare "did
-// our own fetch change the cache" flag, so a set a concurrent goroutine rotated in
-// (different from ours) still differs here and is retried — a real rotation is never
-// skipped. On any thumbprint error it returns false (treat as different), so the
-// only failure cost is one extra retry, never a wrongly skipped one.
-func sameMatchingKeys(before, after []jose.JSONWebKey) bool {
-	return sameKeyMultiset(before, after)
-}
-
 // sameKeyMultiset reports whether two key slices hold the same keys by RFC 7638
 // thumbprint, order-independent (a multiset compare). Shared by jwksKeysUnchanged
-// (rotation-detection guard) and sameMatchingKeys (retry-skip guard) so the security-
-// relevant thumbprint comparison lives once. On any thumbprint error it returns false
-// (treat as different) — the fail-safe direction for both callers: the only cost is an
-// extra forced refresh or an extra retry, never a wrongly suppressed one.
+// (rotation-detection guard) and VerifyWithKeyRotation's retry-skip guard so the
+// security-relevant thumbprint comparison lives once. On any thumbprint error it returns
+// false (treat as different) — the fail-safe direction for both callers: the only cost is
+// an extra forced refresh or an extra retry, never a wrongly suppressed one.
 func sameKeyMultiset(before, after []jose.JSONWebKey) bool {
 	if len(before) != len(after) {
 		return false

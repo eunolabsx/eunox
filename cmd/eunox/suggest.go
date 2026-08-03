@@ -1,7 +1,7 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// Draft-manifest generator for the `suggest` subcommand.
+// The `suggest` subcommand (cmdSuggest) and the draft-manifest generator behind it.
 //
 // Where `init` reads a live upstream's tool list and emits a deny-all starter,
 // `suggest` reads the local audit tape — what the agent actually did — and emits
@@ -19,8 +19,10 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"strings"
 
@@ -763,4 +765,79 @@ func targetLess(a, b *observedTarget) bool {
 		return a.namespace < b.namespace
 	}
 	return a.name < b.name
+}
+
+// cmdSuggest runs the `suggest` subcommand and returns the process exit code
+// (rather than calling os.Exit itself), so tests can drive every branch. args
+// carries the subcommand's own arguments (os.Args[2:] in a real invocation),
+// threaded from run.
+func cmdSuggest(args []string) int {
+	fs := flag.NewFlagSet("suggest", flag.ContinueOnError)
+	fs.Usage = func() {
+		fmt.Fprint(os.Stderr, `Usage: eunox suggest [flags]
+
+Generate a draft capability manifest from the local audit log. Unlike 'init'
+(which scaffolds a deny-all from a live tool list), 'suggest' reads what the
+agent actually did: it emits one entry per observed target and, for tool
+arguments seen with a bounded set of string values, an allowedValues condition
+grounded in those values.
+
+Capture a tape first with a wiretap, then suggest:
+  eunox proxy --audit -- <the command that launches your MCP server>
+  # …use the agent for real work, then:
+  eunox suggest --output manifest.yaml
+
+The output is a DRAFT describing observed usage, not vetted policy. Review and
+tighten every entry, then 'eunox validate' it before enforcing.
+
+Exit codes:
+  0  Draft manifest generated (to stdout or --output).
+  1  Usage, config, or audit-log-read error.
+  2  --output was set but writing the file failed.
+
+Flags:
+`)
+		fs.PrintDefaults()
+	}
+	auditLogPath := fs.String("audit-log", "", "Path to the audit JSONL log (default: ~/.eunox/audit.jsonl).")
+	configPath := fs.String("config", "", "Path to the eunox config (YAML). When set, the configured audit.log is\nused as the default for --audit-log.")
+	name := fs.String("name", "suggested-manifest", "Value for the manifest name field.")
+	output := fs.String("output", "", "Path to write the draft manifest (default: stdout).")
+	force := fs.Bool("force", false, "Overwrite --output if it already exists (default: refuse to clobber). An\noverwrite also re-tightens the file mode to 0600.")
+	maxValues := fs.Int("max-values", suggestMaxValuesDefault, "Max distinct values an argument may have before allowedValues is downgraded to a review comment.\n0 or negative falls back to the default (20).")
+
+	if code, done := parseAuditReaderFlags("suggest", fs, args, configPath, auditLogPath, nil); done {
+		return code
+	}
+	logPath, ok := resolveAuditReaderLogPath("suggest", *auditLogPath)
+	if !ok {
+		return 1
+	}
+
+	r, closeChain, err := openAuditChain("suggest", logPath)
+	if err != nil {
+		fmt.Fprint(os.Stderr, err.Error())
+		return 1
+	}
+	defer closeChain()
+
+	resolvedMaxValues := resolveMaxValues(*maxValues)
+	suggestions, err := computeSuggestions(r, resolvedMaxValues)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "eunox suggest: reading log: %v\n", err)
+		return 1
+	}
+	manifest := renderSuggestedManifest(suggestions, *name, resolvedMaxValues)
+
+	if *output == "" {
+		fmt.Print(manifest)
+		return 0
+	}
+	if err := writeGeneratedFile(*output, manifest, *force); err != nil {
+		fmt.Fprintf(os.Stderr, "eunox suggest: %v\n", err)
+		return 2
+	}
+	fmt.Fprintf(os.Stderr, "Generated draft manifest %s from %d audit record(s) — review and tighten each entry, then run: eunox validate %s\n",
+		*output, suggestions.records, *output)
+	return 0
 }

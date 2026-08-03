@@ -382,8 +382,10 @@ func (e *Engine) maxCallsBucket(ctx context.Context, cond capability.Condition, 
 	// windowSeconds is deliberately NOT part of this logical key: per-window
 	// isolation is supplied by each backend appending windowSec to the physical key.
 	// Two conditions sharing one window are rejected at load
-	// (validateQuotaBucketsDistinct). Route scoping is unneeded — session IDs are
-	// per-connection UUIDs and the transport rejects cross-route sessions — and
+	// (validateQuotaBucketsDistinct). Route scoping is not spelled out HERE because
+	// anchoredKey already supplies it — the engine's counterKeyNamespace leads every key
+	// it builds, as the cross-route fail-closed backstop that field documents, rather than
+	// resting on session IDs being per-connection UUIDs the transport keeps to one route.
 	// compositeCounterKey length-prefixes every component against collision.
 	targetType, toolName := sessionTargetKey(req)
 	// An empty bare name would key every such call into one bucket. Deny rather

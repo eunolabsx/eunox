@@ -300,7 +300,8 @@ type Engine struct {
 	counterKeyNamespace string
 
 	// taskAnchored keys accumulated state (flow labels, sequenceBlock antecedents,
-	// maxCalls and cumulative blastRadius budgets, the single-use declassify ledger) on
+	// maxCalls and cumulative blastRadius budgets — NOT the single-use declassify ledger,
+	// which is deliberately un-anchored; see declassifyLedgerKey) on
 	// the request's VALIDATED mcp.task_id claim rather than on its session, so the state
 	// survives a hop across enforcement points. Opt-in (WithTaskAnchoredState) and
 	// fail-safe: a request with NO TOKEN falls back to session keying rather than to a
@@ -393,10 +394,14 @@ func WithCounterKeyNamespace(ns string) Option {
 
 // WithTaskAnchoredState keys accumulated enforcement state on the request's VALIDATED
 // mcp.task_id claim instead of on its session, so information-flow taint, sequenceBlock
-// antecedents, quota and blast-radius budgets, and single-use declassify grants survive a
+// antecedents, and quota and blast-radius budgets survive a
 // hop across enforcement points — a sub-agent delegated to a second PEP, or the same task
 // re-entering through a fresh session, continues the task's state rather than starting
 // clean.
+//
+// The single-use declassify ledger is NOT among them and does not change under this option:
+// it is keyed on the grant alone, because a per-anchor ledger would make "approve clearing
+// this once" mean once per task. See declassifyLedgerKey.
 //
 // It changes what every budget in the policy MEANS (a maxCalls of 20 becomes 20 per task,
 // not 20 per connection), which is why it is opt-in rather than derived. An UNAUTHENTICATED

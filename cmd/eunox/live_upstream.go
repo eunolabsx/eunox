@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/eunolabs/eunox/internal/config"
 	"github.com/eunolabs/eunox/internal/drift"
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/transport"
@@ -307,3 +308,47 @@ func readResponseWithID(ctx context.Context, w *mcp.MsgWriter, r *mcp.MsgReader,
 		transport.RejectPreInitServerRequest(w, msg)
 	}
 }
+
+// fetchSpecLive introspects the upstream an initUpstreamSpec points at, dispatching
+// on its transport. Shared by `validate --live` and `init`, which both build a spec
+// from the same CLI flags (via buildInitUpstreamSpec) and then probe it identically;
+// fetchRouteLive is the gateway-config sibling for a *config.UpstreamConfig.
+func fetchSpecLive(ctx context.Context, spec initUpstreamSpec) (LiveUpstreamInfo, error) {
+	switch spec.Transport {
+	case config.HostTransportStdio:
+		return fetchLiveToolsStdio(ctx, spec.Command, spec.Args)
+	case config.HostTransportHTTP:
+		return fetchLiveTools(ctx, spec.URL, spec.AuthHeader, spec.TLSSkipVerify)
+	default:
+		// Fail closed on an unrecognized transport rather than probing it as HTTP,
+		// matching fetchRouteLive and this package's every-switch-names-its-cases
+		// convention. buildInitUpstreamSpec already rejects anything else, so this
+		// is the structural guard that keeps a future third transport from silently
+		// inheriting the HTTP probe.
+		return LiveUpstreamInfo{}, fmt.Errorf("unknown upstream transport %q", spec.Transport)
+	}
+}
+
+// fetchRouteLive introspects one route's declared upstream, dispatching on its
+// transport. A fresh liveUpstreamTimeout is applied PER route so a slow early
+// route cannot exhaust a shared budget and fail every later route.
+
+// fetchRouteLive introspects one route's declared upstream, dispatching on its
+// transport. A fresh liveUpstreamTimeout is applied PER route so a slow early
+// route cannot exhaust a shared budget and fail every later route.
+func fetchRouteLive(ctx context.Context, u *config.UpstreamConfig) (LiveUpstreamInfo, error) {
+	ctx, cancel := context.WithTimeout(ctx, liveUpstreamTimeout)
+	defer cancel()
+	switch u.Transport {
+	case config.HostTransportStdio:
+		return fetchLiveToolsStdio(ctx, u.Command, u.Args)
+	case config.HostTransportHTTP:
+		return fetchLiveTools(ctx, u.UpstreamURL, u.UpstreamAuthHeader, u.UpstreamTLSSkipVerify)
+	default:
+		return LiveUpstreamInfo{}, fmt.Errorf("upstream %q: unknown transport %q", u.Name, u.Transport)
+	}
+}
+
+// -----------------------------------------------------------------
+// init subcommand
+// -----------------------------------------------------------------

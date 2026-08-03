@@ -1451,10 +1451,10 @@ func (s *Sink) Record(ctx context.Context, p RecordParams) {
 		// field here — so, unlike them, it is bounded ONCE by the caller (via
 		// BoundEnvelopeField, at routeSink construction: BuildRoutes for the gateway,
 		// the stdio proxy's equivalent for the single-upstream path) rather than
-		// re-derived on every allow/deny. unlike them: re-bounding a value that cannot
+		// re-derived on every allow/deny: re-bounding a value that cannot
 		// change between calls was measured as ~100-150 ns of pure waste per enforced
-		// request, on fields the round-trip-idempotency argument below does not need
-		// re-verified per call, only once. Sink.RecordAllow/RecordDeny (the
+		// request, on fields the round-trip-idempotency argument below needs verified
+		// once rather than per call. Sink.RecordAllow/RecordDeny (the
 		// single-upstream path with no route) leave all three "", which is already
 		// within any cap, so the invariant holds there for free.
 		Upstream:      p.Upstream,

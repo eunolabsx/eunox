@@ -522,7 +522,7 @@ func writeDoctorManifests(w io.Writer, cfg *config.GatewayConfig, cfgErr error) 
 			}
 			continue
 		}
-		writePolicyLoadResults(func(format string, args ...interface{}) { wf(w, format, args...) }, "    ", outcome.LoadResults)
+		writePolicyLoadResults(w, "    ", outcome.LoadResults)
 		if outcome.LoadFailed {
 			continue
 		}

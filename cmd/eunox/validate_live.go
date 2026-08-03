@@ -1,7 +1,9 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// Live drift report formatter for the validate --live subcommand.
+// The `validate` subcommand: its flag parsing and route walk (cmdValidate,
+// validateConfigRoutes, reportRouteOutcome, writePolicyLoadResults), plus the live drift
+// report formatter --live renders.
 //
 // runValidateLive classifies every live tool against the manifest and renders
 // four sections:
@@ -17,13 +19,18 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"flag"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"strings"
 
 	"github.com/eunolabs/eunox/internal/config"
 	"github.com/eunolabs/eunox/internal/drift"
+	"github.com/eunolabs/eunox/internal/transport"
 )
 
 // coveredEntry records a live tool that is covered by an exact manifest entry.
@@ -398,3 +405,376 @@ func renderLiveReport(rep liveReport, out io.Writer) int {
 	}
 	return 1
 }
+
+// cmdValidate runs the `validate` subcommand and returns the process exit code
+// (rather than calling os.Exit itself), so tests can drive every branch —
+// including the fail-closed error paths — without terminating the test binary.
+// args carries the subcommand's own arguments (os.Args[2:] in a real
+// invocation), threaded from run.
+func cmdValidate(args []string) int {
+	fs := flag.NewFlagSet("validate", flag.ContinueOnError)
+	fs.Usage = func() {
+		fmt.Fprint(os.Stderr, `Usage:
+  eunox validate <manifest.yaml> [...] --live --upstream-url <url>
+  eunox validate <manifest.yaml> [...] --live --transport stdio -- <cmd> [args...]
+  eunox validate --config <eunox.yaml> [--live]
+
+Validate manifest file(s). Without --live, checks file syntax and exits.
+With --live, also connects to a running upstream MCP server and reports
+contract drift between the manifest and the live tool set. The upstream is
+reached over HTTP (--transport http --upstream-url, the default) or as a
+subprocess (--transport stdio -- <command>).
+
+With --config, every route in the config is walked: each route's manifest(s)
+are merged and validated, and with --live each route's declared upstream
+(http or stdio subprocess) is introspected — no need to re-specify the
+upstream wiring. The config is the source of truth.
+
+Exit codes:
+  0  Manifests valid; with --live, all entries match live tools and no
+     glob-matched tools were detected.
+  1  Drift warnings or stale entries present (operator review required).
+     Reserved for findings, so CI can gate on it; never used for usage errors.
+  2  Usage error, or a manifest/config parse or upstream-connection failure.
+
+With --config the exit code is the maximum across all routes.
+
+Flags:
+`)
+		fs.PrintDefaults()
+	}
+
+	live := fs.Bool("live", false, "Connect to a running upstream and report drift against the live tool set.")
+	configPath := fs.String("config", "", "Path to an eunox config (YAML). Walks every route, validating each route's\nmanifest(s); with --live, each route's declared upstream is introspected.\nMutually exclusive with positional manifest files and --upstream-url.")
+	transportFlag := fs.String("transport", config.HostTransportHTTP, "Upstream transport for --live: \"http\" (default, with --upstream-url) or \"stdio\"\n(subprocess command after \"--\").")
+	upstreamURL := fs.String("upstream-url", "", "Base URL of the MCP HTTP server (required with --live --transport http, unless --config is set).")
+	authHeader := fs.String("upstream-auth-header", "", `Header forwarded to the upstream in "Name: Value" format.`)
+	tlsSkipVerify := fs.Bool("upstream-tls-skip-verify", false, "Skip TLS certificate verification for the upstream (development only).")
+
+	// Split off a stdio subprocess command after the first standalone "--".
+	// Manifest files are positional too, so "--" is the only unambiguous boundary;
+	// Go's flag package consumes "--", so we split before parsing.
+	rawArgs := args
+	var stdioCmd []string
+	for i, a := range rawArgs {
+		if a == "--" {
+			stdioCmd = rawArgs[i+1:]
+			rawArgs = rawArgs[:i]
+			break
+		}
+	}
+
+	// Allow flags and positional manifest files to be interspersed (see
+	// parseFlagsAndPositionals); a single fs.Parse would treat --live in
+	// "validate manifest.yaml --live" as a filename.
+	files, err := parseFlagsAndPositionals(fs, rawArgs)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		// 2, not 1: exit 1 is reserved for "drift warnings present, operator review
+		// required", which a CI pipeline is expected to gate on. A usage error
+		// exiting 1 is indistinguishable from a clean run that found drift, so a
+		// misspelled flag reads as a policy finding. Every usage rejection below
+		// exits 2 for the same reason.
+		return 2
+	}
+
+	// Track whether --transport was set explicitly so we can reject it in modes
+	// where it has no effect rather than ignoring it.
+	transportSet := flagWasSet(fs, "transport")
+	// Whether any live-upstream flag was supplied at all — computed once and
+	// referenced at both guard sites below (the --config mutual-exclusion check and
+	// the non---live rejection) so the two hand-maintained copies of this 5-term
+	// predicate cannot drift out of lockstep with each other.
+	upstreamFlagsGiven := *upstreamURL != "" || *authHeader != "" || *tlsSkipVerify || transportSet || len(stdioCmd) > 0
+
+	// Mode selection: --config is mutually exclusive with positional manifests
+	// and per-upstream flags — the config carries that wiring.
+	if *configPath != "" {
+		if len(files) > 0 {
+			fmt.Fprintf(os.Stderr, "eunox validate: --config cannot be combined with positional manifest files (got %d); manifests are declared per-route in the config\n", len(files))
+			return 2
+		}
+		if upstreamFlagsGiven {
+			fmt.Fprintf(os.Stderr, "eunox validate: --config cannot be combined with --transport / --upstream-url / --upstream-auth-header / --upstream-tls-skip-verify / a stdio command; each route's transport and upstream wiring is declared in the config\n")
+			return 2
+		}
+		cfg, err := config.LoadGatewayConfig(*configPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "eunox validate: %v\n", err)
+			return 2
+		}
+		// Base context; fetchRouteLive applies its own per-route timeout, so a slow
+		// early route cannot exhaust a shared budget and fail the rest.
+		return validateConfigRoutes(context.Background(), cfg, *live, os.Stdout)
+	}
+
+	if len(files) == 0 {
+		fmt.Fprintf(os.Stderr, "eunox validate: at least one manifest file is required (or use --config <eunox.yaml>)\n")
+		return 2
+	}
+
+	// --transport, the upstream-* flags, and a stdio command only select how to
+	// reach a live upstream, so they are meaningless without --live. Reject up
+	// front rather than silently dropping them in a syntax-only check.
+	if !*live && upstreamFlagsGiven {
+		fmt.Fprintf(os.Stderr, "eunox validate: --transport / --upstream-url / --upstream-auth-header / --upstream-tls-skip-verify and a stdio command ('-- <cmd>') only apply with --live; add --live to drift-check against the upstream\n")
+		return 2
+	}
+
+	// Syntax check (always runs).
+	ok := true
+	var manifests []*config.LocalManifest
+	for _, f := range files {
+		m, err := config.LoadManifest(f)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "FAIL  %s: %v\n", f, err)
+			ok = false
+		} else {
+			fmt.Printf("OK    %s  (name=%q version=%q capabilities=%d)\n", f, m.Name, m.Version, len(m.Capabilities))
+			manifests = append(manifests, m)
+		}
+	}
+	if !ok {
+		// A parse/validate failure is exit code 2 ("connection or parse error"), not 1
+		// ("drift warnings present"), matching the documented codes and the --config
+		// path (LoadGatewayConfig returns 2) so a CI script keyed on the codes does not
+		// mislabel a corrupt manifest as drift.
+		return 2
+	}
+
+	// Cross-file merge-conflict detection (config.MergeManifests) must run even in
+	// the syntax-only (non-live) path: `validate a.yaml b.yaml` (no --config, no
+	// --live) previously returned 0 right after the per-file syntax check above,
+	// so two positional manifests with a genuine merge conflict passed while the
+	// equivalent --config route (validateConfigRoutes, which always merges) would
+	// have failed, and `proxy` itself refuses to boot on the same conflict.
+	merged, err := config.MergeManifests(manifests)
+	if err != nil {
+		// A merge conflict is a parse-class error (exit 2), not drift.
+		fmt.Fprintf(os.Stderr, "eunox validate: %v\n", err)
+		return 2
+	}
+
+	// Effect-contract coverage of the MERGED policy, which is what actually decides:
+	// annotating is what buys a capability out of maximum friction, so the ratio (and the
+	// names) is the operator's progress meter. Advisory — it never affects the exit code,
+	// since an unannotated capability is a conservative default, not a defect.
+	writeEffectCoverage(os.Stdout, "", merged, true)
+
+	if !*live {
+		return 0
+	}
+
+	// Live drift check. buildInitUpstreamSpec (shared with `init`) validates the
+	// http/stdio flag combination, then we introspect the upstream as `init` does.
+	spec, err := buildInitUpstreamSpec(*transportFlag, *upstreamURL, *authHeader, *tlsSkipVerify, stdioCmd)
+	if err != nil {
+		// A missing/incoherent upstream wiring is a connection error (exit 2), not drift.
+		fmt.Fprintf(os.Stderr, "eunox validate: %v (or use --config <eunox.yaml>)\n", err)
+		return 2
+	}
+
+	fmt.Printf("\nConnecting to upstream...")
+	ctx, cancel := context.WithTimeout(context.Background(), liveUpstreamTimeout)
+	defer cancel()
+	info, err := fetchSpecLive(ctx, spec)
+	if err != nil {
+		fmt.Printf("  FAILED\n")
+		fmt.Fprintf(os.Stderr, "eunox validate: %v\n", err)
+		return 2
+	}
+	versionLabel := info.ServerVersion
+	if versionLabel == "" {
+		versionLabel = "unknown"
+	}
+	fmt.Printf("  ok (%d tool(s), server version: %s)\n\n", len(info.Tools), versionLabel)
+
+	return runValidateLive(merged, info.Tools, info.ServerVersion, os.Stdout)
+}
+
+// writePolicyLoadResults prints one FAIL/OK line per outcome.LoadResults entry via
+// wf, each indented by prefix, so validate and doctor cannot diverge on how a
+// route's per-file manifest load result is reported — both format the exact same
+// transport.PolicyLoadResult slice through this one function instead of
+// hand-mirroring the loop.
+
+// writePolicyLoadResults prints one FAIL/OK line per outcome.LoadResults entry to out,
+// each indented by prefix, so validate and doctor cannot diverge on how a
+// route's per-file manifest load result is reported — both format the exact same
+// transport.PolicyLoadResult slice through this one function instead of
+// hand-mirroring the loop.
+//
+// It takes the WRITER, like reportRouteOutcome and every other report writer here. Taking
+// the wf closure instead meant each caller converted its writer into one — and doctor,
+// which holds only a writer, spelled that conversion out inline at the call site.
+func writePolicyLoadResults(out io.Writer, prefix string, results []transport.PolicyLoadResult) {
+	wf, _ := writers(out)
+	for _, lr := range results {
+		if lr.Err != nil {
+			wf("%sFAIL  %s: %v\n", prefix, lr.Path, lr.Err)
+			continue
+		}
+		wf("%sOK    %s  (name=%q version=%q capabilities=%d)\n", prefix, lr.Path, lr.Manifest.Name, lr.Manifest.Version, len(lr.Manifest.Capabilities))
+	}
+}
+
+// reportRouteOutcome prints outcome's FAIL/OK/policy-config report for one route
+// and reports whether its startup-fatal checks were satisfied. skip is true when
+// the route's live-drift introspection (or, without --live, the route entirely)
+// must not proceed: a no-policy route that fails closed at startup, a non-live
+// no-policy route, or any policy'd-route load/merge/startup-check failure. code is
+// the route's exit-code contribution (0 clean, 2 a startup-fatal failure) —
+// factored out of validateConfigRoutes's loop body to keep its nesting flat.
+//
+// It takes the WRITER, not the (wf, wln) closure pair, because the coverage report it
+// ends with takes one: handing this function closures meant rebuilding an io.Writer from
+// them through a dedicated adapter, purely to undo the conversion its own caller had just
+// done.
+
+// reportRouteOutcome prints outcome's FAIL/OK/policy-config report for one route
+// and reports whether its startup-fatal checks were satisfied. skip is true when
+// the route's live-drift introspection (or, without --live, the route entirely)
+// must not proceed: a no-policy route that fails closed at startup, a non-live
+// no-policy route, or any policy'd-route load/merge/startup-check failure. code is
+// the route's exit-code contribution (0 clean, 2 a startup-fatal failure) —
+// factored out of validateConfigRoutes's loop body to keep its nesting flat.
+//
+// It takes the WRITER, not the (wf, wln) closure pair, because the coverage report it
+// ends with takes one: handing this function closures meant rebuilding an io.Writer from
+// them through a dedicated adapter, purely to undo the conversion its own caller had just
+// done. Same reason writePolicyLoadResults takes one.
+func reportRouteOutcome(out io.Writer, outcome transport.RouteManifestOutcome, live bool) (code int, skip bool) {
+	wf, wln := writers(out)
+	if outcome.NoPolicy {
+		// A policyless route is only legal when it will actually boot. Flag a
+		// config the proxy would refuse to start as FAIL rather than green-lighting
+		// it or (under --live) connecting to an upstream that would never serve
+		// traffic.
+		if outcome.NoPolicyReason != "" {
+			wf("  FAIL  this route fails closed at startup: %s.\n", outcome.NoPolicyReason)
+			return 2, true
+		}
+		if outcome.AuditMode {
+			wln("  (no policy configured — observe-only/wiretap route)")
+		} else {
+			wln("  (no policy configured — route is allow-all)")
+		}
+		// Without --live there is nothing further to report; with --live, the
+		// caller falls through to introspection for visibility (no manifest to
+		// drift-check, but the upstream connection is still worth showing).
+		return 0, !live
+	}
+
+	writePolicyLoadResults(out, "  ", outcome.LoadResults)
+	if outcome.LoadFailed {
+		return 2, true
+	}
+	if outcome.MergeErr != nil {
+		wf("  FAIL  %v\n", outcome.MergeErr)
+		return 2, true
+	}
+	if outcome.StartupErr != nil {
+		wf("  FAIL  %v\n", outcome.StartupErr)
+		return 2, true
+	}
+	// Advisory, and never part of the exit code: an unannotated capability is the
+	// fail-closed default working as intended, not a config defect. Per route, because
+	// the ceiling and the capabilities it governs are both per route.
+	writeEffectCoverage(out, "  ", outcome.Merged, true)
+	return 0, false
+}
+
+// validateConfigRoutes walks every upstream in cfg, validating each route's
+// manifest(s) and — when live is set — introspecting the declared upstream and
+// reporting drift. A no-policy route the proxy would refuse to start is reported
+// FAIL and skipped (never introspected, since the upstream would never serve); a
+// valid no-policy route -- which on a gateway means audit/wiretap mode ONLY, since a
+// policyless enforce route is refused at startup -- is introspected under --live for
+// visibility but contributes no drift findings.
+//
+// Exit code is the maximum across routes: 0 clean, 1 drift, 2 parse/connection
+// failure.
+
+// validateConfigRoutes walks every upstream in cfg, validating each route's
+// manifest(s) and — when live is set — introspecting the declared upstream and
+// reporting drift. A no-policy route the proxy would refuse to start is reported
+// FAIL and skipped (never introspected, since the upstream would never serve); a
+// valid no-policy route -- which on a gateway means audit/wiretap mode ONLY, since a
+// policyless enforce route is refused at startup -- is introspected under --live for
+// visibility but contributes no drift findings.
+//
+// Exit code is the maximum across routes: 0 clean, 1 drift, 2 parse/connection
+// failure.
+func validateConfigRoutes(ctx context.Context, cfg *config.GatewayConfig, live bool, out io.Writer) int {
+	wf, wln := writers(out)
+
+	worst := 0
+	for i := range cfg.Upstreams {
+		u := &cfg.Upstreams[i]
+		if i > 0 {
+			wln()
+		}
+		wf("── route %q (transport: %s) ──\n", u.Name, u.Transport)
+
+		// Reproduce the proxy's actual startup policy-load decision so validate cannot
+		// green-light a config `proxy` would refuse to boot: load and merge this
+		// route's manifests (the cross-file merge-conflict detection lives in
+		// MergeManifests itself), then run the same startup-fatal check LoadUpstreamPDP
+		// folds in — the expectVersion pin, the sampling/createMessage-on-http guard,
+		// and the stdio-host audience-pin guard — directly against the merged result,
+		// via the shared walk both validate and doctor use.
+		outcome := transport.WalkRouteManifests(cfg, u)
+
+		exitCode, skip := reportRouteOutcome(out, outcome, live)
+		if exitCode > worst {
+			worst = exitCode
+		}
+		if skip {
+			continue
+		}
+
+		if !live {
+			continue
+		}
+
+		// Live drift check for this route.
+		info, err := fetchRouteLive(ctx, u)
+		if err != nil {
+			wf("  Connecting to upstream...  FAILED\n  %v\n", err)
+			if worst < 2 {
+				worst = 2
+			}
+			continue
+		}
+		versionLabel := info.ServerVersion
+		if versionLabel == "" {
+			versionLabel = "unknown"
+		}
+		wf("  Connecting to upstream...  ok (%d tool(s), server version: %s)\n\n", len(info.Tools), versionLabel)
+
+		// outcome.NoPolicy is the allow-all/no-policy route: every policy file loaded
+		// cleanly to reach here (outcome.LoadFailed would have continued above), so
+		// outcome.Merged covers a policy'd route and there is nothing to drift-check
+		// for a policyless one.
+		if outcome.NoPolicy {
+			// Allow-all route with --live: nothing to drift-check against.
+			wln("  (no manifest to compare against)")
+			continue
+		}
+		// outcome.Merged was produced by WalkRouteManifests above (a merge failure
+		// already FAILed the route), so the live drift check reuses it rather than
+		// re-merging.
+		code := runValidateLive(outcome.Merged, info.Tools, info.ServerVersion, out)
+		if code > worst {
+			worst = code
+		}
+	}
+	return worst
+}
+
+// fetchSpecLive introspects the upstream an initUpstreamSpec points at, dispatching
+// on its transport. Shared by `validate --live` and `init`, which both build a spec
+// from the same CLI flags (via buildInitUpstreamSpec) and then probe it identically;
+// fetchRouteLive is the gateway-config sibling for a *config.UpstreamConfig.

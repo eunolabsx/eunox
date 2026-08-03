@@ -6,9 +6,13 @@ package enforcement
 import "github.com/eunolabs/eunox/pkg/capability"
 
 // Every piece of accumulated enforcement state — the flow-label set a labelOutput writes,
-// the sequenceBlock antecedent history, the maxCalls and cumulative blastRadius budgets, the
-// single-use declassify ledger — is addressed under an ANCHOR: the identity the state
-// accrues to. This file owns that choice, in one place, because the whole guarantee of each
+// the sequenceBlock antecedent history, the maxCalls and cumulative blastRadius budgets — is
+// addressed under an ANCHOR: the identity the state accrues to.
+//
+// With ONE deliberate exception, stated here so it is not read as an oversight and "fixed"
+// back into the hole it closes: the single-use declassify ledger carries no session and no
+// task. Anchoring it made "approve clearing this once" mean once per session (or per task),
+// which is a replay of the approval rather than a scope for it. See declassifyLedgerKey. This file owns that choice, in one place, because the whole guarantee of each
 // of those features is "the same subject cannot get more than this", and the anchor is what
 // "the same subject" means.
 //
