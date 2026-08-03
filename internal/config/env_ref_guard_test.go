@@ -144,3 +144,73 @@ func TestFailOnUnsetBracedEnvRef_SkipsEscapes(t *testing.T) {
 		t.Errorf("escaped $$ treated as a reference: %v", err)
 	}
 }
+
+// TestLoadGatewayConfig_BareDollarInUpstreamURLQueryIsLiteral pins the split in the
+// upstreamUrl rule. A URL's query legitimately carries a bare "$" — OData's "?$filter=",
+// "?$select=", a JSONPath expression — and the broad bare-$ rule refused to start such a
+// config, naming an environment variable ("filter") the operator never wrote. The braced
+// form still carries unambiguous intent to substitute, so it is still guarded there.
+func TestLoadGatewayConfig_BareDollarInUpstreamURLQueryIsLiteral(t *testing.T) {
+	cfg, err := LoadGatewayConfig(writeConfig(t, `
+schemaVersion: "0.1"
+transport: http
+listen:
+  bind: "127.0.0.1:9000"
+upstreams:
+  - name: odata
+    transport: http
+    upstreamUrl: "https://api.example.com/odata?$filter=name eq 'x'&$select=id"
+    policy: ["odata.yaml"]
+`))
+	if err != nil {
+		t.Fatalf("a bare $ in an upstreamUrl query was rejected: %v", err)
+	}
+	if got := cfg.Upstreams[0].UpstreamURL; got != "https://api.example.com/odata?$filter=name eq 'x'&$select=id" {
+		t.Errorf("upstreamUrl = %q, want the OData query preserved verbatim", got)
+	}
+}
+
+// The authority half keeps the broad rule: a bare "$HOST" there is a reference by any
+// reading, and letting it boot points the route at a literal "$HOST".
+func TestLoadGatewayConfig_RejectsUnsetBareEnvRefInUpstreamURLHost(t *testing.T) {
+	_, err := LoadGatewayConfig(writeConfig(t, `
+schemaVersion: "0.1"
+transport: http
+listen:
+  bind: "127.0.0.1:9000"
+upstreams:
+  - name: api
+    transport: http
+    upstreamUrl: "https://$EUNOX_TEST_NO_SUCH_HOST/mcp"
+    policy: ["api.yaml"]
+`))
+	if err == nil {
+		t.Fatal("expected a load error for an unset bare $VAR in an upstreamUrl host")
+	}
+	for _, want := range []string{`upstream "api" upstreamUrl`, "EUNOX_TEST_NO_SUCH_HOST", "unset"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to mention %q", err, want)
+		}
+	}
+}
+
+// And the braced form is still guarded inside the query, where intent is unambiguous.
+func TestLoadGatewayConfig_RejectsUnsetBracedEnvRefInUpstreamURLQuery(t *testing.T) {
+	_, err := LoadGatewayConfig(writeConfig(t, `
+schemaVersion: "0.1"
+transport: http
+listen:
+  bind: "127.0.0.1:9000"
+upstreams:
+  - name: api
+    transport: http
+    upstreamUrl: "https://api.example.com/mcp?tenant=${EUNOX_TEST_NO_SUCH_TENANT}"
+    policy: ["api.yaml"]
+`))
+	if err == nil {
+		t.Fatal("expected a load error for an unset ${VAR} in an upstreamUrl query")
+	}
+	if !strings.Contains(err.Error(), "EUNOX_TEST_NO_SUCH_TENANT") {
+		t.Errorf("error = %q, want it to name the unset variable", err)
+	}
+}

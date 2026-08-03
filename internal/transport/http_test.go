@@ -29,6 +29,7 @@ import (
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/pdp"
 	"github.com/eunolabs/eunox/pkg/capability"
+	"github.com/eunolabs/eunox/pkg/enforcement"
 	"github.com/eunolabs/eunox/pkg/killswitch"
 )
 
@@ -807,7 +808,7 @@ func TestHTTPHandlePromptsGet_InvalidParams(t *testing.T) {
 
 func TestHTTPHandleKill_NonLoopback(t *testing.T) {
 	t.Parallel()
-	proxy := &HTTPProxy{sessions: make(map[string]*httpSession)}
+	proxy := newTestHTTPProxy()
 	body := `{"all":true}`
 	req := httptest.NewRequest(http.MethodPost, "/control/kill", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", CTJSON)
@@ -2430,7 +2431,7 @@ func TestHTTPSamplingRoundTrip_HostResponseRoutedToUpstream(t *testing.T) {
 	t.Parallel()
 	var up bytes.Buffer
 	rt := &UpstreamRoute{pdp: pdp.AlwaysAllowPDP{}}
-	proxy := &HTTPProxy{sessions: make(map[string]*httpSession)}
+	proxy := newTestHTTPProxy()
 	sess := newTestSession(&httpSession{
 		id:       "rt-sess",
 		route:    rt,
@@ -2563,7 +2564,7 @@ func TestHTTPHandleMCPPost_UntrackedResponseIgnored(t *testing.T) {
 	t.Parallel()
 	var up bytes.Buffer
 	rt := &UpstreamRoute{pdp: pdp.AlwaysAllowPDP{}}
-	proxy := &HTTPProxy{sessions: make(map[string]*httpSession)}
+	proxy := newTestHTTPProxy()
 	sess := newTestSession(&httpSession{
 		id:       "rt-sess2",
 		route:    rt,
@@ -2607,7 +2608,7 @@ func TestHTTPHandleSessionPost_KilledServerResponseRecordsDeny(t *testing.T) {
 
 	var up bytes.Buffer
 	rt := &UpstreamRoute{pdp: policy, sink: &routeSink{sink: sink, upstream: "up1"}}
-	proxy := &HTTPProxy{sessions: make(map[string]*httpSession)}
+	proxy := newTestHTTPProxy()
 	sess := newTestSession(&httpSession{
 		id:       "kill-sess",
 		route:    rt,
@@ -2667,7 +2668,7 @@ func TestHTTPHandleSessionPost_ReapedKilledServerResponseTagsServerResponseLeg(t
 
 	rt := &UpstreamRoute{pdp: policy, sink: &routeSink{sink: sink, upstream: "up1"}}
 	// Empty registry: the killed session has already been reaped.
-	proxy := &HTTPProxy{sessions: make(map[string]*httpSession)}
+	proxy := newTestHTTPProxy()
 
 	body := `{"jsonrpc":"2.0","id":5,"result":{}}`
 	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
@@ -2708,7 +2709,7 @@ func TestHTTPHandleSessionPost_ReapedKilledNotificationTagsNotificationLeg(t *te
 	policy := newTestManifestPDPWithKS(ks, capability.Constraint{Target: "tool:*", Actions: []string{"call"}})
 
 	rt := &UpstreamRoute{pdp: policy, sink: &routeSink{sink: sink, upstream: "up1"}}
-	proxy := &HTTPProxy{sessions: make(map[string]*httpSession)}
+	proxy := newTestHTTPProxy()
 
 	body := `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{}}`
 	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
@@ -2872,7 +2873,7 @@ func TestHTTPFailServerRequestDelivery_WritesCorrectionRecord(t *testing.T) {
 func TestHTTPHandleMCPPost_RemoteModeServerResponseWarnsAndUntracks(t *testing.T) {
 	// Mutates os.Stderr; must not run in parallel with other stderr-capturing tests.
 	rt := &UpstreamRoute{pdp: pdp.AlwaysAllowPDP{}}
-	proxy := &HTTPProxy{sessions: make(map[string]*httpSession)}
+	proxy := newTestHTTPProxy()
 	sess := newTestSession(&httpSession{
 		id:    "remote-sess",
 		route: rt,
@@ -3427,7 +3428,7 @@ func TestHTTPInitialize_GlobalKill_RefusesSessionCreation(t *testing.T) {
 		pdp:       newTestManifestPDPWithKS(ks, capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
 		sink:      &routeSink{},
 	}
-	proxy := &HTTPProxy{sessions: make(map[string]*httpSession)}
+	proxy := newTestHTTPProxy()
 
 	body := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`
 	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
@@ -3469,7 +3470,7 @@ func TestHTTPHandleGet_KilledSession_RefusesStream(t *testing.T) {
 		pdp:  newTestManifestPDPWithKS(ks, capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
 		sink: &routeSink{},
 	}
-	proxy := &HTTPProxy{sessions: make(map[string]*httpSession)}
+	proxy := newTestHTTPProxy()
 	proxy.sessions["sess-killed"] = newTestSession(&httpSession{id: "sess-killed", route: route, done: make(chan struct{})})
 
 	req := httptest.NewRequest(http.MethodGet, "/mcp", http.NoBody)
@@ -3500,7 +3501,7 @@ func TestHTTPHandleGet_GlobalKill_RefusesStream(t *testing.T) {
 		pdp:  newTestManifestPDPWithKS(ks, capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
 		sink: &routeSink{},
 	}
-	proxy := &HTTPProxy{sessions: make(map[string]*httpSession)}
+	proxy := newTestHTTPProxy()
 	proxy.sessions["sess-any"] = newTestSession(&httpSession{id: "sess-any", route: route, done: make(chan struct{})})
 
 	req := httptest.NewRequest(http.MethodGet, "/mcp", http.NoBody)
@@ -3528,7 +3529,7 @@ func TestHTTPHandleGet_LiveSession_OpensStream(t *testing.T) {
 		pdp:  newTestManifestPDPWithKS(ks, capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
 		sink: &routeSink{},
 	}
-	proxy := &HTTPProxy{sessions: make(map[string]*httpSession)}
+	proxy := newTestHTTPProxy()
 	proxy.sessions["sess-live"] = newTestSession(&httpSession{id: "sess-live", route: route, done: make(chan struct{})})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -3559,7 +3560,7 @@ func TestHTTPHandleGet_EvictedSession_ClosesOpenStream(t *testing.T) {
 		pdp:  newTestManifestPDPWithKS(ks, capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
 		sink: &routeSink{},
 	}
-	proxy := &HTTPProxy{sessions: make(map[string]*httpSession)}
+	proxy := newTestHTTPProxy()
 	sess := newTestSession(&httpSession{id: "sess-evict", route: route, done: make(chan struct{}), evicted: make(chan struct{})})
 	proxy.sessions["sess-evict"] = sess
 
@@ -3622,7 +3623,7 @@ func TestHandleSessionPost_OwnerMismatchNotification_Acks202(t *testing.T) {
 		pdp:  newTestManifestPDPWithKS(ks, capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
 		sink: &routeSink{},
 	}
-	proxy := &HTTPProxy{sessions: make(map[string]*httpSession)}
+	proxy := newTestHTTPProxy()
 	// A session BOUND to a creating identity, so a request from a different (here: no)
 	// identity is an owner mismatch.
 	sess := newTestSession(&httpSession{
@@ -3667,7 +3668,7 @@ func TestHandleSessionPost_KilledReapedSession_DeniesWithKillSwitch(t *testing.T
 		pdp:  newTestManifestPDPWithKS(ks, capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
 		sink: &routeSink{},
 	}
-	proxy := &HTTPProxy{sessions: make(map[string]*httpSession)}
+	proxy := newTestHTTPProxy()
 	// The session has been killed AND reaped out of the registry (its subprocess/slot
 	// reclaimed) — exactly the post-kill state reapKilledSession leaves behind — but the
 	// kill store still records the id.
@@ -3737,7 +3738,7 @@ func TestHandleSessionPost_UnresolvedSessionKillDeny_DoesNotForgeSessionID(t *te
 		pdp:  newTestManifestPDPWithKS(ks, capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
 		sink: &routeSink{sink: sink},
 	}
-	proxy := &HTTPProxy{sessions: make(map[string]*httpSession)}
+	proxy := newTestHTTPProxy()
 
 	const forged = "victim-real-session-id"
 	msg := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`9`), Method: "tools/call"}
@@ -3797,7 +3798,7 @@ func TestHandleSessionPost_UnresolvedSessionKillDrop_DoesNotForgeSessionID(t *te
 		pdp:  newTestManifestPDPWithKS(ks, capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
 		sink: &routeSink{sink: sink},
 	}
-	proxy := &HTTPProxy{sessions: make(map[string]*httpSession)}
+	proxy := newTestHTTPProxy()
 
 	const forged = "victim-real-session-id"
 	// notifications/cancelled: a real notification method (no id), reaching the same
@@ -3914,7 +3915,7 @@ func TestEvictAllSessionStreams_ClosesOpenStream(t *testing.T) {
 		pdp:  newTestManifestPDPWithKS(ks, capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
 		sink: &routeSink{},
 	}
-	proxy := &HTTPProxy{sessions: make(map[string]*httpSession)}
+	proxy := newTestHTTPProxy()
 	sess := newTestSession(&httpSession{id: "sess-a", route: route, done: make(chan struct{}), evicted: make(chan struct{})})
 	proxy.sessions["sess-a"] = sess
 
@@ -3990,7 +3991,7 @@ func TestHTTPHandleGet_WriteErrorUnblocksInflightServerRequest(t *testing.T) {
 		sink: &routeSink{},
 	}
 	var up bytes.Buffer
-	proxy := &HTTPProxy{sessions: make(map[string]*httpSession)}
+	proxy := newTestHTTPProxy()
 	sess := newTestSession(&httpSession{
 		id:       "sess-werr",
 		route:    route,
@@ -4276,7 +4277,7 @@ func TestHTTPHandleUpstreamRequest_NonSampling_WritesAuditRecord(t *testing.T) {
 		t.Fatalf("openAuditSink: %v", err)
 	}
 	route := &UpstreamRoute{name: "up1", pdp: pdp.AlwaysAllowPDP{}, sink: &routeSink{sink: sink, upstream: "up1"}}
-	proxy := &HTTPProxy{sessions: make(map[string]*httpSession)}
+	proxy := newTestHTTPProxy()
 	sess := newTestSession(&httpSession{id: "sess-roots", route: route, done: make(chan struct{}), upWriter: mcp.NewMsgWriter(io.Discard)})
 	ch := make(chan mcp.RPCMsg, 1)
 	sess.addSub(ch)
@@ -4323,7 +4324,7 @@ func TestHTTPHandleUpstreamRequest_SamplingAuditMode_RecordsDenyThenAllow(t *tes
 		audit: true,
 		sink:  &routeSink{sink: sink, upstream: "up1"},
 	}
-	proxy := &HTTPProxy{sessions: make(map[string]*httpSession)}
+	proxy := newTestHTTPProxy()
 	sess := newTestSession(&httpSession{id: "sess-audit2", route: route, done: make(chan struct{}), upWriter: mcp.NewMsgWriter(io.Discard)})
 	ch := make(chan mcp.RPCMsg, 1)
 	sess.addSub(ch)
@@ -4455,7 +4456,7 @@ func TestHTTPHandleSessionPost_EnforcedMethodNotificationDenied(t *testing.T) {
 
 			var up bytes.Buffer
 			rt := &UpstreamRoute{pdp: policy, sink: &routeSink{sink: sink, upstream: "up1"}}
-			proxy := &HTTPProxy{sessions: make(map[string]*httpSession)}
+			proxy := newTestHTTPProxy()
 			sess := newTestSession(&httpSession{
 				id:       "notif-bypass-sess",
 				route:    rt,
@@ -4506,7 +4507,7 @@ func TestHTTPHandleSessionPost_UnmappedNotificationDeniedAndRecorded(t *testing.
 
 	var up bytes.Buffer
 	rt := &UpstreamRoute{pdp: policy, sink: &routeSink{sink: sink, upstream: "up1"}}
-	proxy := &HTTPProxy{sessions: make(map[string]*httpSession)}
+	proxy := newTestHTTPProxy()
 	sess := newTestSession(&httpSession{
 		id:       "unmapped-notif-sess",
 		route:    rt,
@@ -4559,7 +4560,7 @@ func TestHTTPHandleSessionPost_MidSessionInitializeSwallowed(t *testing.T) {
 	policy := newTestManifestPDP(capability.Constraint{Target: "tool:*", Actions: []string{"call"}})
 	var up bytes.Buffer
 	rt := &UpstreamRoute{pdp: policy, sink: &routeSink{sink: sink}}
-	proxy := &HTTPProxy{sessions: make(map[string]*httpSession)}
+	proxy := newTestHTTPProxy()
 	sess := newTestSession(&httpSession{
 		id:       "mid-session-init-sess",
 		route:    rt,
@@ -5812,6 +5813,51 @@ func TestIdleReaper_ClosesIdleSession(t *testing.T) {
 	waitForSessions(t, proxy, 0)
 }
 
+// TestIdleReaper_ReclaimsASessionKilledElsewhere pins the reaper's kill sweep.
+//
+// A kill delivered through Redis — `eunox kill --redis-addr`, or a sibling instance's
+// /control/kill, which is the whole point of the Redis backend — reaches this proxy only
+// through CheckKill. Nothing wires it to the inline teardown the LOCAL /control/kill path
+// performs, so the killed session's upstream and its maxSessions slot stayed pinned here
+// while its traffic was (correctly) denied: accumulated killed-but-undead sessions
+// eventually 503 every new initialize, a session-exhaustion DoS the kill switch triggers
+// on itself. The session below is fresh and active, so no idle arm would touch it.
+func TestIdleReaper_ReclaimsASessionKilledElsewhere(t *testing.T) {
+	fake := newFakeUpstream()
+	upSrv := httptest.NewServer(http.StripPrefix("/mcp", fake))
+	t.Cleanup(upSrv.Close)
+	sink, _ := newTempAuditSink(t)
+	ks := killswitch.NewInMemory()
+	proxy := newHTTPProxy(httpProxyOptions{
+		UpstreamURL:   upSrv.URL,
+		PDP:           pdp.NewManifestPDP([]capability.Constraint{{Target: "tool:*", Actions: []string{"call"}}}, enforcement.New(), ks),
+		SessionIdleMs: 60000,
+		Sink:          sink,
+	})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/mcp", proxy.handleMCP)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	sid := initSession(t, srv)
+	if proxy.sessionCount() != 1 {
+		t.Fatalf("expected 1 session after init, got %d", proxy.sessionCount())
+	}
+	// Not idle by any measure: a sweep now must spare it.
+	proxy.reapOnce(time.Minute)
+	if proxy.sessionCount() != 1 {
+		t.Fatalf("an active session must not be reaped, count=%d", proxy.sessionCount())
+	}
+
+	// The kill arrives through the store alone — exactly what a Redis-delivered kill (or
+	// a sibling instance's) looks like to this process. No handler here observed it.
+	if err := ks.KillSession(context.Background(), sid); err != nil {
+		t.Fatalf("KillSession: %v", err)
+	}
+	proxy.reapOnce(time.Minute)
+	waitForSessions(t, proxy, 0)
+}
+
 // TestIdleReaper_SparesInitInProgressSession covers a session still
 // initializing — registered, no subscribers, stale lastActive while the startup
 // drift check blocks — must not be reaped. reapOnce skips it while initInProgress
@@ -6256,4 +6302,18 @@ func killStatusForTest(t *testing.T, p *HTTPProxy) *killswitch.Status {
 		t.Fatalf("Status: %v", err)
 	}
 	return st
+}
+
+// newTestHTTPProxy builds the bare in-package proxy these tests drive handlers on
+// directly, WITH the pre-session record limiter NewHTTPProxyGateway always constructs. A
+// literal missing it is not merely incomplete: every refusal path that charges a bucket
+// treats a nil limiter beside a live sink as the construction bug it is and panics, which
+// is the discipline that keeps an unbounded refusal record from being written by accident.
+// Building it here means a test reaching a rate-limited refusal exercises the production
+// bound rather than either extreme.
+func newTestHTTPProxy() *HTTPProxy {
+	return &HTTPProxy{
+		sessions:         make(map[string]*httpSession),
+		preSessionDenies: newPreSessionDenyLimiter(),
+	}
 }

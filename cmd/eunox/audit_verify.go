@@ -127,6 +127,18 @@ func resolveAuditReaderLogPath(name, configured string) (string, bool) {
 // constant so the site-drift test can assert the published landing-page demo still
 // quotes tallies this command actually emits: the previous copy drifted silently when a
 // tally was removed, because nothing tied the two together.
+// auditVerifyUsageExit is audit-verify's exit code for a usage, config, key-resolution,
+// or log-read failure. Exit 1 is RESERVED for a log that fails verification, exactly as
+// validate reserves it for findings: the whole point of the tamper-evidence tool is that
+// a cron or CI job can gate on its exit code, and it has to be able to tell "this log
+// fails verification" (page someone) from "the key path was wrong on this host" (fix the
+// job). One code for both makes a mistyped flag indistinguishable from tampering.
+//
+// The shared reader preamble (parseAuditReaderFlags) reports its usage errors as 1, which
+// is what its other callers — suggest, stats, doctor — document for themselves, so this
+// command translates at that call rather than changing theirs.
+const auditVerifyUsageExit = 2
+
 const auditVerifySummaryFormat = "Checked %d record(s): %d valid, %d invalid, %d skipped, %d unknown-key, %d unverifiable; %d chain break(s).\n"
 
 // cmdAuditVerify runs the `audit-verify` subcommand and returns the process
@@ -140,6 +152,13 @@ func cmdAuditVerify(args []string) int {
 
 Verify HMAC-SHA256 signatures in the local audit log.
 
+Exit codes:
+  0  Every record verified and the tamper-evident chain is intact.
+  1  The log failed verification (an invalid record, a chain break, an
+     unverifiable or unknown-key record). Reserved for findings, so a cron or
+     CI job can gate on it; never used for usage errors.
+  2  Usage error, or a config, key-resolution, or log-read failure.
+
 Flags:
 `)
 		fs.PrintDefaults()
@@ -151,18 +170,24 @@ Flags:
 	since := fs.String("since", "", "Report (count and print) only records after this RFC3339 timestamp. Every\nrecord is still HMAC-verified and the tamper-evident chain is always checked;\nthis filter narrows the report, not the verification.")
 
 	if code, done := parseAuditReaderFlags("audit-verify", fs, args, configPath, auditLogPath, auditKeyPath); done {
+		if code != 0 {
+			// The shared preamble reports a usage or config error as 1 — the convention
+			// its other callers document. Translate at that boundary; see
+			// auditVerifyUsageExit for why this command cannot share it.
+			return auditVerifyUsageExit
+		}
 		return code
 	}
 	logPath, ok := resolveAuditReaderLogPath("audit-verify", *auditLogPath)
 	if !ok {
-		return 1
+		return auditVerifyUsageExit
 	}
 
 	// Key path resolves: flag (already merged with config) > env var > default.
 	expandedKeyPath, err := audit.ResolveKeyPath(*auditKeyPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "eunox audit-verify: %v\n", err)
-		return 1
+		return auditVerifyUsageExit
 	}
 	// Load-only: audit-verify must never mint a key as a side effect. A missing key
 	// file is an operator error (mistyped --audit-key-path, wrong machine) — creating a
@@ -171,7 +196,7 @@ Flags:
 	keys, err := audit.LoadKeys(expandedKeyPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "eunox audit-verify: loading audit key: %v\n", err)
-		return 1
+		return auditVerifyUsageExit
 	}
 
 	// Verifier keyring holds every key indexed by key id, so records straddling a
@@ -186,12 +211,12 @@ Flags:
 	chainFiles, err := audit.LogChainFiles(logPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "eunox audit-verify: discovering rotated audit logs: %v\n", err)
-		return 1
+		return auditVerifyUsageExit
 	}
 	if len(chainFiles) == 0 {
 		// No base log and no rotated siblings: same first-run hint as the readers.
 		fmt.Fprint(os.Stderr, auditLogMissingHint("audit-verify", logPath))
-		return 1
+		return auditVerifyUsageExit
 	}
 
 	var sinceTime time.Time
@@ -199,7 +224,7 @@ Flags:
 		sinceTime, err = time.Parse(time.RFC3339, *since)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "eunox audit-verify: invalid --since value %q: %v\n", *since, err)
-			return 1
+			return auditVerifyUsageExit
 		}
 	}
 
@@ -209,7 +234,7 @@ Flags:
 	res, err := audit.VerifyLogFiles(chainFiles, verifier, *requestID, sinceTime, os.Stdout)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "eunox audit-verify: reading log: %v\n", err)
-		return 1
+		return auditVerifyUsageExit
 	}
 
 	if res.Total == 0 {
@@ -231,12 +256,13 @@ Flags:
 			"expected after a key rotation that retired the signing key. Add the retired key(s) to the ring "+
 			"(--audit-key-path / the configured keyPath) to verify them; they are NOT counted as tampered.\n", res.UnknownKey)
 	}
-	// UNVERIFIABLE is a record that names NO key_id which no held key matched: the
-	// signing key cannot be identified, so it cannot be proven tampered the way a
-	// named-but-missing key_id can. Surfaced distinctly from INVALID, but the verdict
-	// still fails (OK() counts it) — fail-closed, since the cause may be tampering.
+	// UNVERIFIABLE is a record NO key was available to check: an empty verification ring,
+	// or a record naming no key_id that no held key matched. Nothing was checked, so it
+	// cannot be proven tampered the way a named-but-missing key_id can. Surfaced
+	// distinctly from INVALID, but the verdict still fails (OK() counts it) — fail-closed,
+	// since the cause may be tampering.
 	if res.Unverifiable > 0 {
-		fmt.Printf("Note: %d record(s) name no key_id and no key in the ring matched them (UNVERIFIABLE) — "+
+		fmt.Printf("Note: %d record(s) could not be checked against any key (UNVERIFIABLE) — "+
 			"typically a pre-key_id-era record whose signing key was retired. Add the original key(s) to the ring "+
 			"to verify them; until then they cannot be distinguished from tampering and the verdict fails.\n", res.Unverifiable)
 	}

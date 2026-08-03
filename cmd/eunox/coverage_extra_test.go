@@ -2514,11 +2514,16 @@ func TestCmdKill_ProxyReturnsError(t *testing.T) {
 
 // ───────────────────────── cmdAuditVerify error branches ────────────────────
 
+// Every branch below is an OPERATIONAL failure — a missing log, an unparseable
+// flag, an unreadable key — and must exit auditVerifyUsageExit (2). Exit 1 is
+// reserved for a log that fails verification, so a cron or CI job gating on this
+// command can tell "the tape is bad" from "this host is misconfigured".
+
 func TestCmdAuditVerify_NoAuditLog(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "audit.jsonl")
 	code := cmdAuditVerify([]string{"--audit-log", logPath})
-	if code != 1 {
-		t.Errorf("expected exit code 1 (no audit log), got %d", code)
+	if code != auditVerifyUsageExit {
+		t.Errorf("expected exit code %d (no audit log), got %d", auditVerifyUsageExit, code)
 	}
 }
 
@@ -2536,15 +2541,15 @@ func TestCmdAuditVerify_InvalidSince(t *testing.T) {
 	}
 
 	code := cmdAuditVerify([]string{"--audit-log", logPath, "--audit-key-path", keyPath, "--since", "not-a-timestamp"})
-	if code != 1 {
-		t.Errorf("expected exit code 1 (invalid --since), got %d", code)
+	if code != auditVerifyUsageExit {
+		t.Errorf("expected exit code %d (invalid --since), got %d", auditVerifyUsageExit, code)
 	}
 }
 
 func TestCmdAuditVerify_ConfigLoadError(t *testing.T) {
 	code := cmdAuditVerify([]string{"--config", "/no/such/config.yaml"})
-	if code != 1 {
-		t.Errorf("expected exit code 1 (config load error), got %d", code)
+	if code != auditVerifyUsageExit {
+		t.Errorf("expected exit code %d (config load error), got %d", auditVerifyUsageExit, code)
 	}
 }
 
@@ -2774,8 +2779,8 @@ func TestCmdAuditVerify_LoadOrCreateKeysError(t *testing.T) {
 	badKeyPath := filepath.Join(blocker, "subdir", "audit.key")
 
 	code := cmdAuditVerify([]string{"--audit-log", logPath, "--audit-key-path", badKeyPath})
-	if code != 1 {
-		t.Errorf("expected exit code 1 (LoadOrCreateKeys failed), got %d", code)
+	if code != auditVerifyUsageExit {
+		t.Errorf("expected exit code %d (LoadOrCreateKeys failed), got %d", auditVerifyUsageExit, code)
 	}
 }
 
@@ -2792,15 +2797,20 @@ func TestCmdAuditVerify_LogChainFilesError(t *testing.T) {
 	keyPath := filepath.Join(dir, "audit.key")
 
 	code := cmdAuditVerify([]string{"--audit-log", logPath, "--audit-key-path", keyPath})
-	if code != 1 {
-		t.Errorf("expected exit code 1 (LogChainFiles failed), got %d", code)
+	if code != auditVerifyUsageExit {
+		t.Errorf("expected exit code %d (LogChainFiles failed), got %d", auditVerifyUsageExit, code)
 	}
 }
 
-// TestCmdAuditVerify_UnknownKeyID covers the res.UnknownKey > 0 notice and
-// the !res.OK() return: records are signed with key A but verification uses key
-// B (a freshly generated key at a different path), so every record's key_id is
-// absent from the ring and the verdict fails with UNKNOWN_KEY_ID.
+// TestCmdAuditVerify_UnknownKeyID covers the res.UnknownKey > 0 notice and the
+// !res.OK() return: records are signed with key A but verification uses key B, so
+// every record's key_id is absent from the ring and the verdict fails with
+// UNKNOWN_KEY_ID. That is a FINDING about the tape, so it exits 1 — the code a
+// gating job pages on — unlike the operational failures above.
+//
+// Key B has to EXIST for that to be what is under test: audit-verify never mints a
+// key, so naming a path with no key file is an operational failure (exit 2), which
+// is a different branch entirely.
 func TestCmdAuditVerify_UnknownKeyID(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "audit.jsonl")
@@ -2816,10 +2826,19 @@ func TestCmdAuditVerify_UnknownKeyID(t *testing.T) {
 		t.Fatalf("sink.Close: %v", err)
 	}
 
-	// Verify with a completely different key (keyB is freshly generated).
+	// Mint key B by opening a throwaway sink at its path, so the ring loads and holds
+	// a real key that simply did not sign these records.
+	otherSink, err := audit.Open(filepath.Join(dir, "other.jsonl"), keyPathB, 0, 0, audit.WithIdentity(pdp.AuditIdentityFromContext))
+	if err != nil {
+		t.Fatalf("audit.Open (key B): %v", err)
+	}
+	if err := otherSink.Close(); err != nil {
+		t.Fatalf("otherSink.Close: %v", err)
+	}
+
 	code := cmdAuditVerify([]string{"--audit-log", logPath, "--audit-key-path", keyPathB})
 	if code != 1 {
-		t.Errorf("expected exit code 1 (UNKNOWN_KEY_ID), got %d", code)
+		t.Errorf("expected exit code 1 (UNKNOWN_KEY_ID is a finding about the tape), got %d", code)
 	}
 }
 

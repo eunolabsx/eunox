@@ -7,6 +7,7 @@
 package transport
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -490,6 +491,64 @@ func addClaimedSessionIDValue(details map[string]interface{}, claimed string) ma
 // stderr diagnostic with so both halves of a refusal are bounded by one decision.
 func (p *HTTPProxy) recordPreSessionDeny(r *http.Request, code string, category refusalCategory, extra map[string]interface{}) bool {
 	return p.recordRefusal(r, nil, code, category, extra)
+}
+
+// preSessionKillRecorder returns the recorder a PRE-SESSION kill-switch site must write
+// its record through, or nil when the bucket suppressed this one (in which case the site
+// still denies the request — only the RECORD is elided, never the enforcement).
+//
+// Those sites — the session-creating initialize, the sessionless initialize notification,
+// and a POST naming an unknown or killed session — fire for raw, unauthenticated requests.
+// Left unbounded they are an audit-queue flooding primitive exactly like the transport
+// refusals beside them: one signed record per sprayed request while a global kill is
+// active, and one dropped record latches AuditDegraded() for the process lifetime, which
+// under the default --require-audit=strict strict-denies every route until restart. So an
+// attacker could turn an emergency stop into a permanent outage that outlives it.
+//
+// It does NOT bound kill records for an established session (see catKill): those describe
+// a caller the proxy already admitted, and are what an operator reads during a stop.
+func (p *HTTPProxy) preSessionKillRecorder(route *UpstreamRoute) auditRecorder {
+	rec := asRecorder(route.sink)
+	if rec == nil {
+		// Nothing to write, so nothing to bound: leave the bucket's tokens for a site
+		// that has a tape. (Unlike recordRefusal, no stderr line rides on this verdict.)
+		return nil
+	}
+	// A nil limiter beside a live sink is a construction bug and panics like one, exactly
+	// as in recordRefusal: a "defensive" fallback here would write kill records with no
+	// bound at all, which is the fail-open this function exists to close.
+	admitted, suppressed := p.preSessionDenies.admit(catKill)
+	if !admitted {
+		return nil
+	}
+	if suppressed == 0 {
+		return rec
+	}
+	return rolledUpRecorder{auditRecorder: rec, suppressed: suppressed}
+}
+
+// rolledUpRecorder folds a suppressed-refusal rollup into the details of the one record
+// it passes through, so a bounded record still reports how much was elided — the property
+// that makes the bound evidence-preserving rather than evidence-destroying.
+//
+// It wraps rather than widening recordKillDenial/recordKillDrop with a details parameter:
+// those two are the single source of the kill record's SHAPE, shared with the
+// verified-session sites that take no rollup, and threading an always-nil argument through
+// every one of them to serve three is how a shape grows a hole.
+type rolledUpRecorder struct {
+	auditRecorder
+	suppressed uint64
+}
+
+func (r rolledUpRecorder) RecordDeny(ctx context.Context, sessionID, identifier, method, denialCode, condType string, details map[string]interface{}, observe bool) {
+	if details == nil {
+		details = make(map[string]interface{}, 2)
+	}
+	// Always paired, for the reason the keys' own doc gives: a count whose scope a reader
+	// has to infer from the stamp beside it is a count that gets misread.
+	details[detailSuppressedRefusalCount] = r.suppressed
+	details[detailSuppressedRefusalScope] = suppressedScopeProxyCategory
+	r.auditRecorder.RecordDeny(ctx, sessionID, identifier, method, denialCode, condType, details, observe)
 }
 
 // recordSessionCapDeny records a session-cap refusal — the pre-spawn slot reservation and

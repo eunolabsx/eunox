@@ -134,6 +134,16 @@ func TestValidateRejectsATamperedEntry(t *testing.T) {
 		{"missing effect", func(c *Contract) { c.Effect = nil }, "missing 'effect'"},
 		{"self-referential ref", func(c *Contract) { c.Effect.Ref = "x@sha256:0" }, "must not carry its own 'ref'"},
 		{"digest does not match content", func(c *Contract) { c.Effect.Class = capability.EffectIrreversible }, "does not match its content digest"},
+		// The id is the half of Ref() before the "@", and SplitEffectRef cuts at the
+		// first one — so an id carrying an "@" digests cleanly here and yields a ref
+		// that can never resolve, surfacing much later as a mismatch at manifest load.
+		{"id contains @", func(c *Contract) { c.ID = "acme/server@v2.tool" }, "'@'"},
+		{"id has leading whitespace", func(c *Contract) { c.ID = " acme/server.tool" }, "whitespace"},
+		{"id has trailing whitespace", func(c *Contract) { c.ID = "acme/server.tool " }, "whitespace"},
+		{"id has an interior space", func(c *Contract) { c.ID = "acme/my server.tool" }, "whitespace"},
+		// Nothing else catches an entry attesting one tool under another's name: every
+		// later layer treats the id as the entry's identity.
+		{"id does not name its tool", func(c *Contract) { c.Tool = "other_tool" }, `must end in ".other_tool"`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -147,6 +157,31 @@ func TestValidateRejectsATamperedEntry(t *testing.T) {
 				t.Fatalf("error %q must mention %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// TestCorpusRefRoundTripsThroughSplitEffectRef pins Validate's id rules against the
+// consumer that makes them matter: every valid entry's Ref() must split back into exactly
+// the id and digest it was built from. That is the property an id containing "@" (or
+// stray whitespace) silently broke — the entry validated, and only a manifest pinning it
+// ever found out.
+func TestCorpusRefRoundTripsThroughSplitEffectRef(t *testing.T) {
+	corpus, err := LoadCorpus("../../registry/contracts")
+	if err != nil {
+		t.Fatalf("LoadCorpus: %v", err)
+	}
+	if len(corpus) == 0 {
+		t.Fatal("the shipped corpus must not be empty")
+	}
+	for _, c := range corpus {
+		id, digest, ok := capability.SplitEffectRef(c.Ref())
+		if !ok {
+			t.Errorf("contract %q: Ref() %q does not split", c.ID, c.Ref())
+			continue
+		}
+		if id != c.ID || digest != c.Digest {
+			t.Errorf("contract %q: Ref() split to (%q, %q), want (%q, %q)", c.ID, id, digest, c.ID, c.Digest)
+		}
 	}
 }
 

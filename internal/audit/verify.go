@@ -24,13 +24,14 @@ import (
 // Signalling it distinctly lets VerifyLog report UNKNOWN_KEY_ID rather than INVALID.
 var errKeyIDNotInRing = errors.New("audit record key_id is not in the verification ring")
 
-// errUnidentifiedNoMatch is returned by the signature check when a record names NO key_id
-// (a pre-key_id-era signed record) and no key in the ring matched its HMAC. Unlike
-// a named-key-in-ring mismatch (genuine tampering → INVALID), an unidentified
-// record offers no way to tell a retired/absent signing key from tampering, so the
-// caller reports UNVERIFIABLE rather than asserting tampering — still failing the
-// verdict (fail-closed), distinct from both INVALID and UNKNOWN_KEY_ID.
-var errUnidentifiedNoMatch = errors.New("audit record names no key_id and no ring key matched its HMAC")
+// errNoKeyTried is returned by the signature check when NO key was available to check a
+// record against: a pre-key_id-era record against an empty ring, or any record against a
+// keyless verifier (the nil/zero receiver VerifyLog documents as the structure-only mode).
+// Unlike a mismatch under a key that WAS tried (genuine tampering → INVALID), a record
+// nothing was checked against offers no way to tell a retired/absent signing key from
+// tampering, so the caller reports UNVERIFIABLE rather than asserting tampering — still
+// failing the verdict (fail-closed), distinct from both INVALID and UNKNOWN_KEY_ID.
+var errNoKeyTried = errors.New("no verification key was available to check this audit record's HMAC")
 
 // errNonCanonicalRecord is returned by the canonical-on-disk-form check; see that
 // check's comment in verifyDecodedRecord for what it catches and why.
@@ -146,20 +147,28 @@ func (s *Sink) verifyDecodedRecord(line []byte, rec auditRecord) (bool, error) {
 			return true, nil
 		}
 	}
-	// No key matched. Distinguish "could not verify" from "tampered":
-	//   - A record naming a key_id present in the ring, or one naming none while the
-	//     ring DID hold keys to try, was checked against a real key and failed →
-	//     (false, nil) → INVALID. When keys were tried, a mismatch is tampering (or an
-	//     indistinguishable retired-key case, which we accept reporting as a defensible
-	//     INVALID), and the tamper-detection guarantee depends on it.
-	//   - A record that names NO key_id verified against NO keys at all (empty ring /
-	//     no configured key) could not be checked: the signing key is unidentifiable
-	//     AND absent, so calling it tampering is unjustified. Signal that distinctly
-	//     (still fail-closed) so the caller reports UNVERIFIABLE. An HMAC-less record
-	//     cannot reach here: it is refused above with a plain error, deliberately NOT a
-	//     sentinel (nothing branches on the reason).
-	if rec.KeyID == "" && len(keys) == 0 {
-		return false, errUnidentifiedNoMatch
+	// No key matched. Distinguish "could not verify" from "tampered" on the only fact
+	// that separates them — whether a key was actually TRIED:
+	//   - At least one key was tried and none matched → (false, nil) → INVALID. That is
+	//     tampering (or an indistinguishable retired-key case, which we accept reporting
+	//     as a defensible INVALID), and the tamper-detection guarantee depends on it.
+	//   - NO key was tried, because the verifier holds none (an empty ring, no configured
+	//     key, or the nil/zero verifier VerifyLog documents as the structure-only mode).
+	//     Nothing was checked, so calling the record tampered is unjustified. Signal that
+	//     distinctly (still fail-closed) so the caller reports UNVERIFIABLE.
+	//
+	// The predicate deliberately does NOT also require an empty key_id. A record naming a
+	// key_id reaches here only from a keyless verifier — with a real ring, keysToTry
+	// returns that id's key or errKeyIDNotInRing, both handled above — and every record
+	// the current writer produces stamps one. Requiring the empty id therefore reported
+	// EVERY modern record as tampered under the structure-only mode, each one also
+	// latching a spurious CHAIN BREAK on its successor: a whole untampered log read as
+	// wholly tampered, which is the opposite of what that mode promises.
+	//
+	// An HMAC-less record cannot reach here: it is refused above with a plain error,
+	// deliberately NOT a sentinel (nothing branches on the reason).
+	if len(keys) == 0 {
+		return false, errNoKeyTried
 	}
 	return false, nil
 }
@@ -174,8 +183,10 @@ func (s *Sink) keysToTry(keyID string) ([][]byte, error) {
 	// load-bearing, not defensive: VerifyLog/VerifyLogFiles document a nil verifier as
 	// the structure-only mode (verify shape and chain, no signature check), and classify
 	// reaches it through verifyDecodedRecord on every signed record, so deleting this
-	// branch turns that pass into a nil dereference. Returning no keys routes the
-	// record through the "could not verify" branch, never the "tampered" one.
+	// branch turns that pass into a nil dereference. Returning no keys routes the record
+	// through the "could not verify" branch, never the "tampered" one — which is true of
+	// a record carrying a key_id too, since the caller keys that branch on "no key was
+	// tried" rather than on the record naming none.
 	if s == nil {
 		return nil, nil
 	}
@@ -836,13 +847,13 @@ func (v *auditChainVerifier) classify(line []byte, rec auditRecord, dec recordDe
 		// rotation as tampering. Only a provable HMAC mismatch under a held key (the !ok /
 		// err cases below) invalidates the anchor.
 		v.reportMalformedTime(rec, malformedTime)
-	case errors.Is(err, errUnidentifiedNoMatch):
-		// The record names no key_id and no ring key matched it: the signing key is
-		// unidentifiable, so this cannot be proven to be tampering rather than a
+	case errors.Is(err, errNoKeyTried):
+		// Nothing was checked: no key was available to try. The signing key is
+		// unidentifiable or absent, so this cannot be proven to be tampering rather than a
 		// retired/absent key (as a named-but-missing key_id can). Report distinctly and
 		// count it in its own bucket so the INVALID tally stays a true tamper count; the
 		// verdict still fails (OK() treats Unverifiable as unverified).
-		_, _ = fmt.Fprintf(v.out, "UNVERIFIABLE  seq=%d — record names no key_id and no key in the verification ring matched it; cannot identify the signing key to verify it (add the original key, or this may be tampering)\n",
+		_, _ = fmt.Fprintf(v.out, "UNVERIFIABLE  seq=%d — no key was available to check this record's HMAC (an empty verification ring, or a keyless verifier); cannot verify it (supply the signing key, or this may be tampering)\n",
 			rec.Seq)
 		v.res.Unverifiable++
 		// Not provably tampering (see the message): this is indistinguishable from a

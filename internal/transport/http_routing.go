@@ -267,7 +267,10 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 			// the honest subject. The header is empty on this branch (its absence is what
 			// routed the request here), so it contributes no detail today — but should the
 			// branch ever admit one, it lands as an unverified claim rather than as fact.
-			resp := recordKillDenial(r.Context(), asRecorder(route.sink), deny, msg.ID, claimedSession(r), mcp.MethodInitialize)
+			// Rate-limited: an unauthenticated caller reaches this record, so an unbounded
+			// write here is an audit-queue flooding primitive (preSessionKillRecorder). A
+			// suppressed record elides only the RECORD; the request is denied either way.
+			resp := recordKillDenial(r.Context(), p.preSessionKillRecorder(route), deny, msg.ID, claimedSession(r), mcp.MethodInitialize)
 			writeJSONMsg(w, resp)
 			return
 		}
@@ -371,7 +374,9 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 				// notification kill path below, and ack the drop with a bodyless 202.
 				// claimedSession for the same reason as the session-creating branch above:
 				// no session was established, so nothing here is verified.
-				recordKillDrop(r.Context(), asRecorder(route.sink), deny, claimedSession(r), msg.Method, msg.Method, legHTTPNotification)
+				// Rate-limited for the same reason as the session-creating branch above: no
+				// session was established, so an unauthenticated caller reaches this record.
+				recordKillDrop(r.Context(), p.preSessionKillRecorder(route), deny, claimedSession(r), msg.Method, msg.Method, legHTTPNotification)
 				w.WriteHeader(http.StatusAccepted)
 				return
 			}
@@ -415,7 +420,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 		// even looked up.
 		if deny := route.pdp.CheckKill(r.Context(), sessionID); deny != nil {
 			if msg.IsRequest() {
-				writeJSONMsg(w, recordKillDenial(r.Context(), asRecorder(route.sink), deny, msg.ID, claimedSession(r), msg.Method))
+				writeJSONMsg(w, recordKillDenial(r.Context(), p.preSessionKillRecorder(route), deny, msg.ID, claimedSession(r), msg.Method))
 			} else {
 				// Fire-and-forget (notification / response): record the drop and ack with a
 				// bodyless 202, matching the existing-session notification kill path below.
@@ -431,7 +436,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 				if msg.IsResponse() {
 					label, leg = "server-response", legHTTPServerResponse
 				}
-				recordKillDrop(r.Context(), asRecorder(route.sink), deny, claimedSession(r), label, label, leg)
+				recordKillDrop(r.Context(), p.preSessionKillRecorder(route), deny, claimedSession(r), label, label, leg)
 				w.WriteHeader(http.StatusAccepted)
 			}
 			return

@@ -253,6 +253,13 @@ type GatewayConfig struct {
 		// SessionIdleTimeoutMs reaps a session whose host has sent no request for
 		// this many milliseconds, closing its upstream so idle sessions cannot pin
 		// resources indefinitely. 0 ⟹ no idle reaping. Only valid for transport: http.
+		//
+		// The same sweep also reclaims KILLED sessions, which matters to a deployment
+		// taking kills through Redis: a kill this instance did not serve locally reaches
+		// it only through the kill store, so with no sweep running its subprocess and
+		// session slot stay pinned until the process exits (its traffic is denied
+		// throughout — this is resource reclaim, not enforcement). Set a non-zero value
+		// when kills arrive from another instance.
 		// Pointer so an explicit value (including 0) is distinguishable from "unset"
 		// (where the --session-idle-timeout flag applies); a bare int would conflate an
 		// omitted key with a deliberate 0, making "0 = no idle reaping" inexpressible
@@ -581,12 +588,15 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	// whose VALUE itself contains "${...}"/"$..." text (e.g. an OData query string
 	// forwarded through an env var) would make the expanded URL still match
 	// ContainsEnvRef even though the reference resolved correctly, misdiagnosing a
-	// healthy config as unset. Walking the raw text's references and checking each
-	// named variable's presence (matching validateCredentialEnvRefs's rule) avoids
-	// that false positive and also lets a literal "$" with no matching env var name
-	// (e.g. "?$filter=") pass through untouched.
+	// healthy config as unset.
+	//
+	// The QUERY and FRAGMENT take the braced-only rule (failOnUnsetURLEnvRef), for the
+	// same reason argv does: a bare "$word" is ordinary content there. "?$filter=" is a
+	// perfectly good OData URL, and the bare-$ rule refused to start that config while
+	// naming an environment variable "filter" the operator never wrote — a refusal the
+	// argv rule already documents "?$filter=" as the reason for avoiding.
 	for i := range cfg.Upstreams {
-		if err := failOnUnsetEnvRef(path, fmt.Sprintf("upstream %q upstreamUrl", cfg.Upstreams[i].Name), rawUpstreamURL[i]); err != nil {
+		if err := failOnUnsetURLEnvRef(path, fmt.Sprintf("upstream %q upstreamUrl", cfg.Upstreams[i].Name), rawUpstreamURL[i]); err != nil {
 			return nil, err
 		}
 	}
@@ -767,10 +777,37 @@ func failOnUnsetBracedEnvRef(path, label, raw string) error {
 	return nil
 }
 
+// failOnUnsetURLEnvRef is the upstreamUrl leg of the rule: the bare-$ form counts as a
+// reference in the scheme/host/path, and only the braced "${VAR}" form counts in the
+// QUERY or FRAGMENT.
+//
+// The split is the point. A URL's authority has no legitimate bare "$", so the broad rule
+// belongs there; a query does — "?$filter=eq(...)" (OData), "?$select=", a JSONPath "$."
+// — and applying the broad rule to it refused an otherwise-working config, blaming an
+// environment variable named "filter" the operator never wrote.
+//
+// An env reference cannot straddle the split: the reference grammar admits only
+// identifier characters, so neither "?" nor "#" can appear inside one.
+//
+// Note this governs the GUARD, not the expansion: a bare "$filter" in a query whose
+// variable IS set is still substituted by the tree-wide expansion, which "$$" escapes.
+// The guard's job is to refuse a reference that silently survives as literal text, and
+// after this split that is exactly what it refuses.
+func failOnUnsetURLEnvRef(path, label, raw string) error {
+	head, tail := raw, ""
+	if i := strings.IndexAny(raw, "?#"); i >= 0 {
+		head, tail = raw[:i], raw[i:]
+	}
+	if err := failOnUnsetEnvRef(path, label, head); err != nil {
+		return err
+	}
+	return failOnUnsetBracedEnvRef(path, label, tail)
+}
+
 // unsetEnvRefError is the single operator-facing message for an unset reference, shared
 // by the full and braced-only guards so the two cannot drift on wording.
 func unsetEnvRefError(path, label, name string) error {
-	return fmt.Errorf("invalid gateway config %q: %s references environment variable %q, which is unset, so it is left as literal text — set the variable or remove the reference", path, label, name)
+	return fmt.Errorf("invalid gateway config %q: %s references environment variable %q, which is unset, so it is left as literal text — set the variable, remove the reference, or write \"$$\" for a literal dollar sign", path, label, name)
 }
 
 // validateCredentialEnvRefs fails closed when a credential field whose value is built

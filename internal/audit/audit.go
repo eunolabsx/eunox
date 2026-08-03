@@ -1752,9 +1752,10 @@ const TruncatedKey = "_eunox_truncated"
 // "upstream_error_code" (bare, no prefix) no longer collides with the injected code in
 // the ordinary case. A tool argument literally matching THIS exact reserved string
 // remains possible in principle — nothing outside this codebase's own convention stops
-// it — so dispatch.go's flat merge still falls back to its nested-wrapper shape on that
-// rare collision, exactly as it did for the old bare name; only the name that can no
-// longer be silently shadowed by ordinary usage changed. Consumers mining Details for
+// it — and dispatch.go handles that at the point the caller's map ENTERS the namespace:
+// quarantineReservedArgs moves every reserved name under ReservedArgumentsKey before the
+// arguments become an allow record's Details, for this key and every other one in
+// reservedDetailKeys. Consumers mining Details for
 // real arguments (the suggest subcommand) must still exclude it. Kept here so the
 // producer (internal/transport) and the miner (cmd/eunox/suggest) share one spelling
 // and cannot drift.
