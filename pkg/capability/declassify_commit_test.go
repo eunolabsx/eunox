@@ -117,3 +117,37 @@ func TestDeclassification_NilIsSafeToAsk(t *testing.T) {
 	assert.NoError(t, err, "a nil handle authorizes nothing, which is not a fault")
 	assert.Empty(t, labels)
 }
+
+// TestNewSpentGrantOnly_NamesTheBurnWithoutClaimingAnAuthorization is the record-shape
+// invariant the two accessors carry between them. A decision whose own commit faulted after
+// burning a single-use grant authorized NOTHING — the clear was never resolved — and its
+// handle exists solely so the spent grant reaches the tape.
+//
+// ApprovalID feeds the top-level, HMAC-signed approval_id field, which is reserved for a
+// declassification that actually TOOK EFFECT; SpentApprovalID feeds a details key with the
+// opposite meaning. A handle built as a single-use grant with no labels used to return the
+// same string from both, putting one id on the tape through two fields with two documented
+// provenances — the collision the separate detail key exists to prevent.
+func TestNewSpentGrantOnly_NamesTheBurnWithoutClaimingAnAuthorization(t *testing.T) {
+	d := capability.NewSpentGrantOnly("apr-9")
+	assert.Equal(t, "apr-9", d.SpentApprovalID(), "the burned grant is the one fact this handle carries")
+	assert.Empty(t, d.ApprovalID(),
+		"nothing was authorized, so the field reserved for a clear that took effect must stay empty")
+	assert.Empty(t, d.Approver())
+	assert.Empty(t, d.Labels())
+	assert.False(t, d.PendingClear(), "the commit must skip it: this cannot become a clear on a refused call")
+}
+
+// TestNewDeclassification_SpentIDTracksTheBurnFlag is the positive half. On a handle that DID
+// authorize a clear, the authorizing approval and the burned grant are genuinely the same
+// approval, so both accessors name it — and a standing grant burns nothing, so only the
+// authorizing one is populated.
+func TestNewDeclassification_SpentIDTracksTheBurnFlag(t *testing.T) {
+	once := capability.NewDeclassification([]string{capability.FlowLabelPII}, "alice@example.com", "apr-9", true)
+	assert.Equal(t, "apr-9", once.ApprovalID())
+	assert.Equal(t, "apr-9", once.SpentApprovalID())
+
+	standing := capability.NewDeclassification([]string{capability.FlowLabelPII}, "alice@example.com", "apr-9", false)
+	assert.Equal(t, "apr-9", standing.ApprovalID())
+	assert.Empty(t, standing.SpentApprovalID(), "a standing grant spends nothing and needs no reconciliation")
+}

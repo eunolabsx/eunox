@@ -258,3 +258,81 @@ func TestTaskAnchor_RollbackStillRunsForASessionKeyedRequest(t *testing.T) {
 	assert.Equal(t, capability.DecisionAllow, sink.Decision,
 		"a faulted source on a session-keyed request must roll its own label back")
 }
+
+// TestResolveStateAnchor_IsTheOneAnchorDecision pins the resolver both the engine's key
+// builder and a transport's decision turn go through. Two independent readings of "is this
+// request task-anchored, and under which id" is where a turn keyed on one thing and state
+// stored under another come to disagree — silently, since nothing in the process ever compares
+// the two keys.
+func TestResolveStateAnchor_IsTheOneAnchorDecision(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		taskAnchored, hasTask bool
+		taskID, sessionID     string
+		wantKind              enforcement.AnchorKind
+		wantID                string
+	}{
+		"task anchoring on, task presented": {true, true, "task-42", "sess-a", enforcement.AnchorKindTask, "task-42"},
+		// The one safe fallback: a caller with no usable task claim keys on its own session,
+		// never on a shared bucket.
+		"task anchoring on, no task claim": {true, false, "", "sess-a", enforcement.AnchorKindSession, "sess-a"},
+		// An operator who did not enable anchoring is unaffected by it, claim or no claim.
+		"task anchoring off": {false, true, "task-42", "sess-a", enforcement.AnchorKindSession, "sess-a"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := enforcement.ResolveStateAnchor(tc.taskAnchored, tc.hasTask, tc.taskID, tc.sessionID)
+			assert.Equal(t, tc.wantKind, got.Kind)
+			assert.Equal(t, tc.wantID, got.ID)
+		})
+	}
+}
+
+// TestStateAnchorKey_KeepsTheKindsDisjoint is the property the turn registry depends on: a
+// session named X and a task named X are different subjects and must not share a gate.
+func TestStateAnchorKey_KeepsTheKindsDisjoint(t *testing.T) {
+	t.Parallel()
+	task := enforcement.ResolveStateAnchor(true, true, "x", "ignored").Key()
+	session := enforcement.ResolveStateAnchor(false, false, "", "x").Key()
+	assert.NotEqual(t, task, session, "one identity string under two kinds must address two turns")
+
+	// Two sessions on one task reach the same key; that is the whole point of the anchor.
+	assert.Equal(t, task, enforcement.ResolveStateAnchor(true, true, "x", "another-session").Key())
+	// And the separator is not something an id can contain, so no pair of ids can collide by
+	// concatenation.
+	assert.NotEqual(t,
+		enforcement.ResolveStateAnchor(false, false, "", "a\x00b").Key(),
+		enforcement.ResolveStateAnchor(false, false, "", "a").Key()+"b")
+}
+
+// TestStateAnchor_AgreesWithTheEngineKey is the correspondence that matters: the exported
+// resolver and the engine's own accounting must classify a request the same way. Here that is
+// asserted through observable behavior — two sessions sharing a task share a maxCalls budget
+// exactly when the resolver says they share an anchor.
+func TestStateAnchor_AgreesWithTheEngineKey(t *testing.T) {
+	t.Parallel()
+	caps := []capability.Constraint{{
+		Target: "tool:x", Actions: []string{"call"},
+		Conditions: []capability.Condition{capability.MaxCallsCondition{Count: 1, WindowSeconds: 3600}},
+	}}
+	e := anchoredEngine(callcounter.NewInMemory(), flowlabelstore.NewInMemory(), true)
+	ctx := context.Background()
+
+	first := e.ValidateAction(ctx, taskReq("session-a", "task-1", "x"), caps)
+	require.Equal(t, capability.DecisionAllow, first.Decision)
+
+	// The resolver says these two requests share an anchor...
+	assert.Equal(t,
+		enforcement.ResolveStateAnchor(true, true, "task-1", "session-a").Key(),
+		enforcement.ResolveStateAnchor(true, true, "task-1", "session-b").Key())
+	// ...and the engine spends one budget across both, which is what sharing an anchor means.
+	assert.Equal(t, capability.DecisionDeny,
+		e.ValidateAction(ctx, taskReq("session-b", "task-1", "x"), caps).Decision,
+		"the second session spends the same task's budget, so the resolver and the key builder agree")
+
+	// A session-anchored request on the same engine (no task claim) keeps its own budget,
+	// which is the fallback the resolver reports for it.
+	assert.Equal(t, enforcement.AnchorKindSession,
+		enforcement.ResolveStateAnchor(true, false, "", "session-c").Kind)
+	assert.Equal(t, capability.DecisionAllow,
+		e.ValidateAction(ctx, req("session-c", "x"), caps).Decision)
+}

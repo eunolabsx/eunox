@@ -570,7 +570,8 @@ func TestDispatchList_StrictAudit_DegradedDeniesAndSkipsUpstream(t *testing.T) {
 				return mcp.RPCMsg{Result: json.RawMessage(`{"tools":[]}`)}, nil
 			},
 		},
-		pdp: pdp.AlwaysAllowPDP{}, // CheckKill returns nil; the strict gate is what fires
+		// CheckKill returns nil; the strict gate is what fires
+		decidingPDP: decidingPDP{pdp: pdp.AlwaysAllowPDP{}},
 	}
 	resp := dispatchList(context.Background(), d, mcp.RPCMsg{ID: mcp.RawJSON(`1`), Method: "tools/list"}, pdp.ListFilterer.FilterToolsList)
 
@@ -593,7 +594,7 @@ func TestForwardServerRequest_StrictAudit_DegradedDeniesSampling(t *testing.T) {
 	fp := serverRequestParams{
 		rec:              rec,
 		sessionID:        "s",
-		pdp:              newTestManifestPDP(capability.Constraint{Target: "system:sampling/createMessage", Actions: []string{"allow"}}),
+		decidingPDP:      decidingPDP{pdp: newTestManifestPDP(capability.Constraint{Target: "system:sampling/createMessage", Actions: []string{"allow"}})},
 		forward:          func(mcp.RPCMsg) bool { forwarded = true; return true },
 		writeUpstream:    func(m mcp.RPCMsg) { upstreamReply = m },
 		strictAuditState: strictAuditState{requireAuditStrict: true},
@@ -616,7 +617,7 @@ func TestForwardServerRequest_StrictAudit_HealthyForwardsSampling(t *testing.T) 
 	fp := serverRequestParams{
 		rec:              rec,
 		sessionID:        "s",
-		pdp:              newTestManifestPDP(capability.Constraint{Target: "system:sampling/createMessage", Actions: []string{"allow"}}),
+		decidingPDP:      decidingPDP{pdp: newTestManifestPDP(capability.Constraint{Target: "system:sampling/createMessage", Actions: []string{"allow"}})},
 		forward:          func(mcp.RPCMsg) bool { forwarded = true; return true },
 		writeUpstream:    func(mcp.RPCMsg) { t.Error("a healthy gate must not write an error to the upstream") },
 		strictAuditState: strictAuditState{requireAuditStrict: true},
@@ -659,9 +660,9 @@ func TestForwardServerRequest_SamplingFlowLabelDenyRecordsDetails(t *testing.T) 
 	rec := &fwdRecorder{}
 	var upstreamReply mcp.RPCMsg
 	fp := serverRequestParams{
-		rec:       rec,
-		sessionID: "s",
-		pdp:       dp,
+		rec:         rec,
+		sessionID:   "s",
+		decidingPDP: decidingPDP{pdp: dp},
 		forward: func(mcp.RPCMsg) bool {
 			t.Error("an enforced flowLabel deny must not forward to the host")
 			return false
@@ -692,9 +693,10 @@ func TestForwardServerRequest_StrictAudit_DegradedDeniesNonSampling(t *testing.T
 	forwarded := false
 	var upstreamReply mcp.RPCMsg
 	fp := serverRequestParams{
-		rec:              rec,
-		sessionID:        "s",
-		pdp:              pdp.AlwaysAllowPDP{}, // CheckKill returns nil; the strict gate is what fires
+		rec:       rec,
+		sessionID: "s",
+		// CheckKill returns nil; the strict gate is what fires
+		decidingPDP:      decidingPDP{pdp: pdp.AlwaysAllowPDP{}},
 		forward:          func(mcp.RPCMsg) bool { forwarded = true; return true },
 		writeUpstream:    func(m mcp.RPCMsg) { upstreamReply = m },
 		strictAuditState: strictAuditState{requireAuditStrict: true},
@@ -718,7 +720,7 @@ func TestForwardServerRequest_StrictAudit_HealthyForwardsNonSampling(t *testing.
 	fp := serverRequestParams{
 		rec:              rec,
 		sessionID:        "s",
-		pdp:              pdp.AlwaysAllowPDP{},
+		decidingPDP:      decidingPDP{pdp: pdp.AlwaysAllowPDP{}},
 		forward:          func(mcp.RPCMsg) bool { forwarded = true; return true },
 		writeUpstream:    func(mcp.RPCMsg) { t.Error("a healthy gate must not write an error to the upstream") },
 		strictAuditState: strictAuditState{requireAuditStrict: true},
@@ -744,7 +746,7 @@ func TestForwardServerRequest_ObserveLeg_RecordsDenyBeforeForward(t *testing.T) 
 		sessionID: "s",
 		// An empty manifest denies sampling/createMessage; audit mode downgrades the
 		// hard deny to an observe.
-		pdp: newTestManifestPDP(capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}}),
+		decidingPDP: decidingPDP{pdp: newTestManifestPDP(capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}})},
 		forward: func(mcp.RPCMsg) bool {
 			// Capture how many records existed at the moment of forwarding: the deny
 			// observation must already be among them.
@@ -800,7 +802,7 @@ func TestForwardServerRequest_ObserveLeg_RecordsBeforeLogging(t *testing.T) {
 		sessionID: "s",
 		// An empty manifest denies sampling/createMessage; audit mode downgrades the
 		// hard deny to an observe.
-		pdp:           newTestManifestPDP(capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}}),
+		decidingPDP:   decidingPDP{pdp: newTestManifestPDP(capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}})},
 		forward:       func(mcp.RPCMsg) bool { return true },
 		writeUpstream: func(mcp.RPCMsg) { t.Error("observe leg must not write an error to the upstream") },
 	}
@@ -836,7 +838,7 @@ func TestForwardServerRequest_StrictAudit_DegradedDeniesSamplingObserveLeg(t *te
 		audit:     true, // route audit mode → a would-be-deny is observed-and-forwarded
 		// No system:sampling opt-in → DecideSampling denies (a capability deny, not a
 		// kill-switch deny), so the request reaches the audit-mode observe leg.
-		pdp:              newTestManifestPDP(capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}}),
+		decidingPDP:      decidingPDP{pdp: newTestManifestPDP(capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}})},
 		forward:          func(mcp.RPCMsg) bool { forwarded = true; return true },
 		writeUpstream:    func(m mcp.RPCMsg) { upstreamReply = m },
 		strictAuditState: strictAuditState{requireAuditStrict: true},

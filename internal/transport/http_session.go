@@ -101,6 +101,31 @@ type httpSession struct {
 	// under task-anchored state two sessions share one key and a per-session lock would not
 	// span it. Under the default session anchoring the route's gate for this session's key
 	// IS a per-session mutex, so nothing changed for that deployment. See anchor_gate.go.
+	//
+	// Both entries above branch on decideGate rather than routing through one helper: the
+	// cached path must render no anchor key, and threading the key past that branch as a
+	// closure only moves the allocation it saves into a closure the branch then never calls.
+	// The registry arm is the ALWAYS-CORRECT path and the cache is the special case — a
+	// session-anchored route's anchor cannot change between requests, so one gate serves the
+	// session, and anything else (a task-anchored route, a session a test assembled without
+	// registering) resolves per request.
+	//
+	// decideGate is that gate, resolved ONCE at registration and held for the session's
+	// life, for the case where it is a per-session constant: a route that does not anchor
+	// state on the task. There the anchor is invariantly this session's id, so going back
+	// through the route's registry per request bought nothing and cost a route-wide mutex,
+	// a map insert and a map delete on every enforced call — the refcount fell to zero the
+	// moment a non-overlapping request finished, so ordinary sequential traffic re-created
+	// the same entry per call on the microsecond decision path. nil on a task-anchored
+	// route, where the anchor genuinely varies per request and the registry round trip is
+	// the point, and nil on a non-serialized route (and on a test-assembled session that
+	// never registered, which falls back to the always-correct registry path).
+	decideGate *anchorGate
+	// dropDecideGate releases the reference above at teardown, so a long-lived gateway does
+	// not accumulate one gate per session it has ever served. nil when none is held, and
+	// idempotent. Called from releaseSessionState — the funnel that runs on EVERY teardown,
+	// including the natural upstream exit that close() deliberately does not cover.
+	dropDecideGate func()
 
 	notifMu   sync.Mutex
 	notifSubs []chan mcp.RPCMsg
@@ -630,8 +655,62 @@ func (p *HTTPProxy) registerSession(sess *httpSession, startGen uint64) error {
 	// Seed lastRequest so the hard idle ceiling is measured from creation: the
 	// initialize POST counts as the first host request.
 	sess.lastRequest.Store(now)
+	// Resolve the session's decision gate here, on the one path every session that will
+	// ever serve a request passes through, and only after the checks above — a session
+	// this call refuses is never registered and must not leave a reference behind. The
+	// gate registry is leaf-level (it locks nothing under its own mutex), so entering it
+	// under p.mu introduces no ordering hazard.
+	sess.holdDecisionGate()
 	p.sessions[sess.id] = sess
 	return nil
+}
+
+// holdDecisionGate takes and keeps this session's decision-turn gate for the cases where the
+// turn's anchor is a per-session CONSTANT — a serialized route that does not anchor state on
+// the task. The reference is released by close().
+//
+// A task-anchored route holds nothing: its anchor is resolved per request from that request's
+// validated claims, and two sessions sharing a task must reach the same gate, which is exactly
+// what the registry is for. A non-serialized route has no registry at all.
+func (s *httpSession) holdDecisionGate() {
+	rt := s.route
+	if !rt.serializes() || rt.taskAnchored {
+		return
+	}
+	// Resolved through the route's own anchor resolver with no claims, which is what a
+	// non-task-anchored route resolves for every request on this session anyway — so the
+	// cached gate is the same gate the per-request path would have found, not a second
+	// keying scheme.
+	s.decideGate, s.dropDecideGate = rt.decideGates.hold(rt.decisionAnchor(s.id, nil))
+}
+
+// beginDecisionTurn enters this request's decision turn and returns the idempotent release,
+// or nil when the route is not serialized. The host path holds the turn on its own request
+// goroutine, so it waits without a bound.
+//
+// ctx supplies the request's VALIDATED claims, which decide the anchor on a task-anchored
+// route. A session-anchored route takes its turn on the gate held for the session's life and
+// touches the registry not at all.
+func (s *httpSession) beginDecisionTurn(ctx context.Context) func() {
+	if s.decideGate != nil {
+		end, _ := s.decideGate.take(nil)
+		return end
+	}
+	end, _ := s.route.decideGates.acquire(s.route.decisionAnchorFromContext(ctx, s.id), nil)
+	return end
+}
+
+// beginDecisionTurnWithin is beginDecisionTurn for the server-initiated leg, bounded by d and
+// anchored on the SESSION's claims (captured at initialize) because that leg has no host
+// request in scope. ok is false when the turn could not be entered in time, which the caller
+// must turn into a refusal — see samplingTurnWait.
+func (s *httpSession) beginDecisionTurnWithin(d time.Duration) (func(), bool) {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	if s.decideGate != nil {
+		return s.decideGate.take(timer.C)
+	}
+	return s.route.decideGates.acquire(s.route.decisionAnchor(s.id, s.claims), timer.C)
 }
 
 // getSession returns the session for id, or nil.
@@ -1293,6 +1372,17 @@ func releaseSessionState(sess *httpSession) {
 	// entirely, which is the fail-open the drain exists to close.
 	budget := sess.shutdownBudget()
 	sess.awaitInFlightDrained(budget)
+	// The decision gate held for this session's life goes back here, beside the flow-state
+	// release and AFTER the in-flight drain, for both of this function's reasons. It has to
+	// be on the funnel that covers every teardown — a session whose upstream exits on its own
+	// never reaches close(), so releasing there retained one gate per such session for the
+	// proxy's life, which is exactly the accumulation the registry's refcounting exists to
+	// prevent. And it has to be after the drain: dropping the last reference deletes the gate
+	// from the registry, so a request still taking turns on it would be holding a gate a later
+	// caller under the same key could no longer reach.
+	if sess.dropDecideGate != nil {
+		sess.dropDecideGate()
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 	sess.route.pdp.ReleaseSession(ctx, sess.id)

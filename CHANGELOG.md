@@ -235,6 +235,21 @@ Section conventions:
 
 ### Changed
 
+- **The decision turn no longer round-trips a route-wide registry on every enforced request.**
+  On a route that anchors accumulated state on the session, the turn's anchor is a per-session
+  constant, so resolving it per request took a route-wide mutex, minted a gate entry and deleted
+  it again on every call — with contention scaling against the route's whole request rate rather
+  than against contending anchors. A session now holds one gate for its lifetime and releases it
+  at teardown. Routes running `taskAnchoredState` still resolve per request, which is where two
+  sessions sharing a task have to reach the same gate. The `--require-audit=strict` gate on the
+  host leg likewise stopped building its declassification detail map at the call site, for a
+  gate that returns without reading it whenever the audit trail is healthy — the shape its
+  server-initiated twin already had. On the stdio host the turn's anchor is resolved once from
+  the identity its single host connection carries and the ticket queue is pinned for the
+  proxy's life, so the read loop — which is also the only goroutine routing host replies back
+  to the upstream — renders no key and enters no registry per request. No behavior change on
+  any path.
+
 - **BREAKING (pre-1.0): the declassification's four response fields are one commit handle,
   and the commit takes nothing else.** `EnforceResponse.LabelsPendingClear`, `Approver`,
   `ApprovalID` and `SpentApprovalID` are replaced by a single
@@ -690,6 +705,35 @@ Section conventions:
   script's retry pivot — the backend divergence that check exists to prevent).
 
 ### Fixed
+
+- **A future `schemaVersion` no longer refuses the tokens its predecessor published.** The
+  manifest loader's grammar gate admitted a token when the base grammar introduced it or when
+  the declared revision matched it exactly — correct for exactly two published revisions. A
+  third would have refused every `0.2` token under it, *including* a revision published only to
+  change semantics that introduces no token of its own, telling operators their `flowLabel`
+  condition "requires schemaVersion 0.2" on a manifest declaring `0.3`. The four tokens gated by
+  hand rather than by the prototype registry (the top-level `effectCeiling`, a capability's
+  `effect` contract, the `${task.*}` variables, and the `_meta` attribution interface) each
+  carried the same equality and would have inverted independently — the last of them silently,
+  since "off" there means a client's declaration is ignored rather than rejected. Inheritance
+  now runs forward along one ordered list of published revisions, which the set of parseable
+  versions is derived from as well, so publishing a revision is a data append. No behavior
+  changes for `0.1` or `0.2`.
+
+- **A declassification refused by a fault inside the decision no longer puts one approval id on
+  the tape under two meanings.** When the decision's own state commit faulted after burning a
+  single-use grant, the response handle reported that grant from both the "which approval
+  authorized this clear" accessor and the "which grant did this call burn" accessor — and the
+  first feeds the top-level signed `approval_id`, reserved for a declassification that actually
+  took effect. Such a decision now mints a handle that can only name the burn. Latent: no
+  in-tree consumer read the field on a refusal.
+
+- **A declassification committed twice is reported as the wiring fault it is.** A second commit
+  of one decision was folded into the flow-store-fault arm, which stamps
+  `_eunox_declassify_commit_failed` (the key `eunox stats` raises an `ATTENTION` line on) and
+  prints that the session stays tainted — the opposite of what happened, since the first commit
+  applied the clear, and an instruction to re-approve work that already landed. Latent: the call
+  graph commits at most once per decision.
 
 - **A single-use declassify grant spent on a no-op clear now reaches the tape on the success
   path too.** A `once` approval is burned by the decision that accepts it even when the clear

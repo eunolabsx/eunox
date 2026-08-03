@@ -202,7 +202,12 @@ func TestManifestSchema_SchemaVersionEnum(t *testing.T) {
 	t.Parallel()
 	doc := loadManifestSchema(t)
 	got := schemaEnum(t, schemaObjectAt(t, doc, "properties", "schemaVersion"))
-	want := []string{config.ManifestSchemaVersion01, config.ManifestSchemaVersion02}
+	// Derived, not restated: publishing a revision is an append to capability's ordered
+	// sequence, which the loader's parse set is derived from — so a literal here would let
+	// the loader accept a manifest the published schema's enum still rejects, with both
+	// sides of this assertion frozen and the test green. Same reason the token expectations
+	// below derive from the prototype registry.
+	want := capability.PublishedSchemaVersions()
 	if !sameStrings(got, want) {
 		t.Fatalf("schemaVersion enum = %v, want %v", got, want)
 	}
@@ -395,8 +400,15 @@ func TestManifestSchema_GatesTheFlowEffectTokensByRevision(t *testing.T) {
 	dirExcluded := schemaNotEnum(t, schemaObjectAt(t, item, "properties", "directives", "items", "properties", "type"))
 	varExcluded := schemaNotEnum(t, schemaObjectAt(t, item, "properties", "conditions", "items", "properties", "values", "items"))
 
-	wantCond := []string{capability.ConditionTypeFlowLabel, capability.ConditionTypeEffectClass, capability.ConditionTypeBlastRadius}
-	wantDir := []string{capability.DirectiveTypeLabelOutput, capability.DirectiveTypeDeclassify}
+	// DERIVED from the prototype registry, not restated: every condition and directive the
+	// registry classifies as introduced by the flow+effect revision must appear in the
+	// schema's 0.1 exclusion. Written as literals, a fourth such token could be added to the
+	// registry (which the loader then correctly refuses under 0.1) while the schema's
+	// exclusion arm and this expectation were both left behind — and the test would pass
+	// while the published authoring aid green-lit a manifest the proxy refuses to boot on.
+	// The task-variable check below already derives its expectation the same way.
+	wantCond := tokensIntroducedIn(capability.SchemaVersion02, capability.KnownConditionTypes())
+	wantDir := tokensIntroducedIn(capability.SchemaVersion02, capability.KnownDirectiveTypes())
 	var wantVar []string
 	for _, n := range capability.TaskVarNames() {
 		wantVar = append(wantVar, "${"+n+"}")
@@ -613,4 +625,21 @@ func TestComputeAuditStats_DeclassifyProbeMatchesTheProducer(t *testing.T) {
 			t.Errorf("key %q is not reserved, so `eunox suggest` would mine it as a tool argument", key)
 		}
 	}
+}
+
+// tokensIntroducedIn filters a prototype registry's discriminators down to those the registry
+// says a given grammar revision introduced, through the one classification lookup
+// (capability.TokenSince). It is what lets the schema-drift checks derive their expectations
+// from the registry rather than from a literal list beside it.
+func tokensIntroducedIn(revision string, tokens []string) []string {
+	var out []string
+	for _, tok := range tokens {
+		// An unclassified token is deliberately not folded into any revision here: the loader
+		// refuses it outright, and TestManifestSchema_CoversEveryConditionType is what fails
+		// when a token is missing a Since.
+		if since, ok := capability.TokenSince(tok); ok && since == revision {
+			out = append(out, tok)
+		}
+	}
+	return out
 }

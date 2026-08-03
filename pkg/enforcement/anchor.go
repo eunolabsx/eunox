@@ -44,7 +44,71 @@ import "github.com/eunolabs/eunox/pkg/capability"
 // different buckets, and a session-anchored key is byte-for-byte what it was before this
 // existed (an operator who does not enable anchoring cannot be affected by it, including
 // mid-rollout against a shared Redis backend).
-const anchorKindTask = "task"
+
+// AnchorKind names which identity a request's state accrues to. The two constants are the
+// closed set: there is no third kind, and no "unanchored".
+type AnchorKind string
+
+const (
+	// AnchorKindSession keys the state on the host<->upstream connection.
+	AnchorKindSession AnchorKind = "session"
+	// AnchorKindTask keys it on the validated mcp.task_id claim, which two sessions can share.
+	// It is also the component spliced into a task-anchored counter/store key, and the
+	// condition type the anchor-unresolved refusal reports.
+	AnchorKindTask AnchorKind = "task"
+)
+
+// StateAnchor is the resolved identity a request's accumulated state accrues to — the answer
+// to "the same subject" for this one request.
+//
+// It is exported because the engine is not the only thing that has to know: a transport
+// serializing the decision phase must take its turn on the key the state actually LIVES on
+// (see the decision turn in internal/transport), and a turn keyed on anything else is not
+// serialization at all. Two independent readings of "is this request task-anchored, and under
+// which id" is exactly where the gate and the key come to disagree — silently, since nothing
+// compares them — so both sides resolve through ResolveStateAnchor and neither re-derives the
+// fallback.
+//
+// The ENCODING is deliberately not shared, and that is a property of the two consumers rather
+// than an oversight: the engine splices the anchor into a length-prefixed counter/store key
+// whose session form must stay byte-for-byte what it was before task anchoring existed (an
+// operator who never enabled it must not have their Redis budgets re-keyed by a release),
+// while an in-process turn registry needs one opaque, unambiguous map key and has no stored
+// history to preserve. Key() below is that second form, and it is the only other encoding in
+// the tree.
+type StateAnchor struct {
+	// Kind is which identity this request resolved to.
+	Kind AnchorKind
+	// ID is the identity within that kind: the validated task id, or the session id.
+	ID string
+}
+
+// ResolveStateAnchor picks the anchor for one request. taskAnchored is the operator's
+// WithTaskAnchoredState setting for this engine or route; hasTask/taskID are the result of
+// resolving the validated mcp.task_id claim (capability.ResolveTaskVar for the engine,
+// pdp.TaskAnchor for the transport — the same resolver either way, so "there isn't one"
+// means the same thing on both sides).
+//
+// The session fallback fires when task anchoring is off and when the caller presented no
+// usable task claim. It is never a shared bucket: the failure direction is "no sharing", and
+// an AUTHENTICATED caller whose token carries no task id is refused outright rather than
+// session-keyed (see anchorUnresolved) — a decision that belongs to the engine, not here,
+// because this must still report the turn such a request takes while it is being denied.
+func ResolveStateAnchor(taskAnchored, hasTask bool, taskID, sessionID string) StateAnchor {
+	if taskAnchored && hasTask {
+		return StateAnchor{Kind: AnchorKindTask, ID: taskID}
+	}
+	return StateAnchor{Kind: AnchorKindSession, ID: sessionID}
+}
+
+// Key renders the anchor as one opaque string for an in-process registry keyed on it — the
+// decision turn's gate map. The separator is a NUL, which neither a session id nor a task
+// claim can contain, so a session named X and a task named X never share an entry.
+//
+// It is NOT the engine's counter/store key and must never be used as one: those are built by
+// anchoredKey, which keeps the session form byte-compatible with pre-task-anchoring
+// deployments. Two encodings, one resolution — see StateAnchor.
+func (a StateAnchor) Key() string { return string(a.Kind) + "\x00" + a.ID }
 
 // appendStateAnchor appends the key components identifying the subject this request's
 // accumulated state accrues to. It APPENDS rather than returning a fresh slice so the only two
@@ -57,19 +121,37 @@ const anchorKindTask = "task"
 // rather than second-guessing those guards; it must not silently substitute some other
 // identity for a session the caller is about to refuse.
 func (e *Engine) appendStateAnchor(dst []string, req *capability.EnforceRequest) []string {
-	if e.taskAnchored && req != nil {
-		// ResolveTaskVar is the same resolver a ${task.id} allowedValues entry uses, so the
-		// anchor and the manifest's own task binding cannot disagree about what the task id
-		// is — or about when there isn't one. It reports absent for a missing claim, a
-		// non-string claim, and a whitespace-only claim alike.
-		if id, ok := capability.ResolveTaskVar(capability.TaskVarID, req.Claims); ok {
-			return append(dst, anchorKindTask, id)
-		}
+	anchor := e.resolveAnchor(req)
+	if anchor.Kind == AnchorKindTask {
+		return append(dst, string(anchor.Kind), anchor.ID)
 	}
+	// The session form carries no kind component, so it is byte-for-byte the key this engine
+	// built before task anchoring existed. See the encoding note on StateAnchor.
+	return append(dst, anchor.ID)
+}
+
+// resolveAnchor answers which subject this request's state accrues to, through the one
+// exported resolver a transport also uses (ResolveStateAnchor), so the engine's key and a
+// caller's decision turn cannot come to different answers about the same request.
+//
+// The claim lookup is capability.ResolveTaskVar — the same resolver a ${task.id}
+// allowedValues entry uses — so the anchor and the manifest's own task binding cannot
+// disagree about what the task id is, or about when there isn't one. It reports absent for a
+// missing claim, a non-string claim, and a whitespace-only claim alike.
+//
+// A nil request yields a session anchor of "" — never a shared one. Every caller already
+// fails closed on an empty session id before it builds a key, so this returns the degenerate
+// value rather than substituting some other identity for a session the caller is about to
+// refuse.
+func (e *Engine) resolveAnchor(req *capability.EnforceRequest) StateAnchor {
 	if req == nil {
-		return append(dst, "")
+		return ResolveStateAnchor(false, false, "", "")
 	}
-	return append(dst, req.SessionID)
+	id, hasTask := "", false
+	if e.taskAnchored {
+		id, hasTask = capability.ResolveTaskVar(capability.TaskVarID, req.Claims)
+	}
+	return ResolveStateAnchor(e.taskAnchored, hasTask, id, req.SessionID)
 }
 
 // anchoredOnTask reports whether THIS request's state is keyed on a task rather than on its
@@ -79,16 +161,13 @@ func (e *Engine) appendStateAnchor(dst []string, req *capability.EnforceRequest)
 // instead applied a task-shaped restriction to a plainly session-keyed request — see
 // rollbackLabels, where it stranded a flow label for every unauthenticated caller on the route.
 //
-// It resolves through the same appendStateAnchor the key builder uses rather than repeating the
-// claim lookup, so it cannot disagree with the key that was actually built. The two-element
-// backing array is the widest anchor there is, so the resolve costs no allocation.
+// It resolves through the same resolveAnchor the key builder uses rather than repeating the
+// claim lookup, so it cannot disagree with the key that was actually built — and it asks only
+// about the resolved KIND. Re-testing e.taskAnchored beside that would be a second guard on a
+// condition the resolver has already applied (it cannot return a task anchor with anchoring
+// off), which is the shape this file exists to remove rather than add.
 func (e *Engine) anchoredOnTask(req *capability.EnforceRequest) bool {
-	if !e.taskAnchored {
-		return false
-	}
-	var buf [2]string
-	anchor := e.appendStateAnchor(buf[:0], req)
-	return len(anchor) > 0 && anchor[0] == anchorKindTask
+	return e.resolveAnchor(req).Kind == AnchorKindTask
 }
 
 // anchorUnresolved reports a request this engine cannot anchor as the operator configured it:

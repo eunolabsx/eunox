@@ -271,9 +271,9 @@ func (p *HTTPProxy) initStrictAuditDenial(ctx context.Context, route *UpstreamRo
 	}
 	// initialize addresses no sub-target, so the audit id, method, and denial
 	// target all collapse to "initialize" (see dispatchList for the same pattern).
-	// nil extra: no session and no decision exist yet on a session-creating
+	// A zero decision: no session and no decision exist yet on a session-creating
 	// initialize, so nothing can have cleared a flow label.
-	return fp.strictAuditDenial(ctx, msg, mcp.MethodInitialize, mcp.MethodInitialize, mcp.MethodInitialize, nil)
+	return fp.strictAuditDenial(ctx, msg, mcp.MethodInitialize, mcp.MethodInitialize, mcp.MethodInitialize, capability.EnforceResponse{})
 }
 
 // initAudienceDenial applies the per-route JWT audience pin to the session-creating
@@ -321,8 +321,7 @@ func (p *HTTPProxy) handleHTTPUpstreamRequest(ctx context.Context, sess *httpSes
 	// samplingTurnWait, and decideSampling for what a refused turn produces.
 	var decideLock func() (end func(), ok bool)
 	if rt.serializes() {
-		anchor := rt.decisionAnchor(sess.id, sess.claims)
-		decideLock = func() (func(), bool) { return rt.decideGates.beginWithin(anchor, samplingTurnWait) }
+		decideLock = func() (func(), bool) { return sess.beginDecisionTurnWithin(samplingTurnWait) }
 	}
 	// sess.broadcastServerRequest reports whether an SSE subscriber received the
 	// request; sess.claims (captured at initialize) is attached for the sampling

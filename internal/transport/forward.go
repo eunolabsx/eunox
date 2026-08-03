@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -352,7 +353,7 @@ type declassifyCommitter interface {
 // declassifyCommitTimeout bounds the single flow-store write commitDeclassify makes after
 // the upstream call has returned.
 //
-// It sits on the host's response path AND under the per-session decision turn, which a
+// It sits on the host's response path AND under the anchor-keyed decision turn, which a
 // declassifying call holds until its commit lands — so an exhausted bound stalls that
 // response and every other decision on the session for its full length. That is why it is
 // shorter than a bound chosen for a background write would be: long enough to ride out an
@@ -633,8 +634,9 @@ func addSpentApproval(detail map[string]interface{}, dec capability.EnforceRespo
 // It is the second phase of the clear, and its position is the whole fix: the labels stay
 // visible to every concurrent decision until the sanitizing call has completed, so a sink
 // that the taint exists to stop cannot be allowed while that call is still in flight. That
-// holds without leaning on the per-session decision lock, which the transport deliberately
-// releases before the forward and which does not span a task key two sessions share.
+// holds without leaning on the decision turn at all, which the transport deliberately
+// releases before the forward, and which is in-process only — two eunox instances against one
+// backend hold independent turns for the same anchor.
 //
 // A commit FAULT is not a refusal. The upstream has already executed the action and its
 // (redacted) response is in hand, so there is nothing left to withhold; the honest outcome
@@ -664,6 +666,32 @@ func commitDeclassify(ctx context.Context, committer declassifyCommitter, sessio
 	detail = declassifyDetail()
 	addSpentApproval(detail, dec)
 	cleared, err := commitCleared(ctx, committer, sessionID, decl)
+	if errors.Is(err, capability.ErrDeclassificationCommitted) {
+		// A SECOND commit of one decision, which is a wiring fault rather than a store fault
+		// and must be reported as one. It is unreachable through this transport's call graph
+		// (a decision reaches the commit at most once), and the branch exists because the
+		// handle's single-use claim answers "what if it is called twice" — so this has to
+		// answer it correctly rather than plausibly.
+		//
+		// The facts are the opposite of a commit fault's: the first commit APPLIED the clear,
+		// so the labels are gone, the session is not over-blocking, and there is nothing for
+		// an operator to re-approve. Folding it into the arm below stamped the alert key that
+		// says the clear could not be applied and printed the instruction to retry under a new
+		// approval — telling an operator to reissue an approval for work that already landed,
+		// which is the unsafe direction for an alert to be wrong in.
+		//
+		// Nothing is cleared HERE (this call removed nothing), so the record carries only the
+		// spent grant — through spentGrantDetail, the same producer the no-op-clear path uses,
+		// rather than the map built above. That map is declassifyDetail() plus a spent id that
+		// a STANDING grant does not have, so returning it would put a bare flow discriminator
+		// on the tape for a call with no declassification evidence at all — the shape
+		// declassifyRefusalDetail's own doc identifies as the defect that made it test both
+		// facts rather than the handle's nil.
+		fmt.Fprintf(os.Stderr,
+			"[eunox] WARN declassify %s %q: the authorized clear was committed twice; the first commit applied it and this one changed nothing (proxy wiring fault, not a flow-store failure — the session is NOT over-tainted)\n",
+			kind, target)
+		return nil, spentGrantDetail(dec)
+	}
 	if err != nil {
 		authorized := decl.Labels()
 		// The call ran and the clear did not, so the tape says so. Spelled as its own key
@@ -799,18 +827,30 @@ func mergeAuditDetails(base, extra map[string]interface{}) map[string]interface{
 // unaudited privileged call reaches the upstream. Only the forward path needs
 // gating; a hard deny already returns without contacting the upstream.
 //
-// extra contributes additional fields to the deny record this gate writes, and is merged
-// only when the gate actually trips. It is a plain map rather than a callback: the caller's
+// dec is the decision this gate is refusing below, zero for the paths that run no decision at
+// all (a */list dispatch, a session-creating initialize). Its declassification facts ride the
+// deny record: blocking here means the sanitizing action never runs, so an approved clear did
+// not take effect and a single-use grant the decision burned is named nowhere else.
+//
+// The decision is passed rather than a pre-built details map, and that is the whole reason the
+// parameter has this type: the gate returns without reading it at all whenever the audit trail
+// is healthy, which is every call in every healthy deployment. Building the map at the call
+// site allocated it — plus a full copy of the handle's label slice — and handed both straight
+// to the GC on the overwhelming common path, for a value nothing read. Deriving it inside the
+// tripped branch is what the server-initiated twin (strictServerRequestAuditDenial) already
+// does, and there is no reason for the two legs to differ.
+//
+// It is a value rather than a callback for the reason the callback was removed: the caller's
 // version used to have a SIDE EFFECT — undoing a declassification the decision had already
-// committed — which had to be withheld from the far more common non-blocking path, and the
-// closure existed for that. Nothing below the decision mutates state any more, so the
-// indirection would now only suggest to the next reader that this gate writes flow state.
-func (fp forwardParams) strictAuditDenial(ctx context.Context, msg mcp.RPCMsg, auditID, method, denialTarget string, extra map[string]interface{}) (mcp.RPCMsg, bool) {
+// committed — which had to be withheld from the non-blocking path, and the closure existed for
+// that. Nothing below the decision mutates state any more, so a closure would now only suggest
+// to the next reader that this gate writes flow state.
+func (fp forwardParams) strictAuditDenial(ctx context.Context, msg mcp.RPCMsg, auditID, method, denialTarget string, dec capability.EnforceResponse) (mcp.RPCMsg, bool) {
 	tripped, reason, detail := auditGateTripped(fp.rec, fp.requireAuditStrict)
 	if !tripped {
 		return mcp.RPCMsg{}, false
 	}
-	detail = mergeAuditDetails(detail, extra)
+	detail = mergeAuditDetails(detail, declassifyRefusalDetail(dec))
 	// detail carries discrete counts (dropped_count/write_failure_count); the prose
 	// reason is for the host-facing error and the stderr warning only, never the
 	// structured audit field.
@@ -910,7 +950,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 	// sanitizing action never runs — so the clear is simply never committed, and the record
 	// says that an approved declassification did not take effect and names the single-use
 	// grant it spent (see declassifyRefusalDetail).
-	if denied, blocked := fp.strictAuditDenial(ctx, msg, auditID, method, denialTarget, declassifyRefusalDetail(dec)); blocked {
+	if denied, blocked := fp.strictAuditDenial(ctx, msg, auditID, method, denialTarget, dec); blocked {
 		return denied
 	}
 
@@ -1169,10 +1209,11 @@ type serverRequestParams struct {
 	sessionID string
 	sourceIP  string
 	claims    *pdp.JWTClaims
-	// pdp is the decision point this leg decides with. Set it through withPDP, never in a
-	// literal: it is the one field a future PDP-shaped field must be derived FROM, and a
-	// source guard fails the build on a literal that assigns it.
-	pdp           pdp.PolicyDecisionPoint
+	// decidingPDP (embedded) carries the decision point this leg decides with. It is
+	// EMBEDDED so `pdp:` cannot be named in a literal of this type at all — Go rejects a
+	// promoted field in a composite literal — leaving withPDP as the only way to set it and
+	// so the only place a future field derived from it can be forgotten. See decidingPDP.
+	decidingPDP
 	forward       func(mcp.RPCMsg) bool
 	writeUpstream func(mcp.RPCMsg)
 	// decideLock serializes the sampling decision against the host-path

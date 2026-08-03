@@ -1447,7 +1447,7 @@ func validateAllowedValues(i, j int, v *capability.AllowedValuesCondition, decla
 		// over a token its grammar does not contain. A recognized reference under "0.1" is
 		// still refused — by checkTaskVarGrammarVersion, which names the revision that
 		// introduced it, exactly as every other 0.2 token is refused.
-		if declared == ManifestSchemaVersion02 && capability.ContainsVariableRef(s) {
+		if revisionAdmits(declared, ManifestSchemaVersion02) && capability.ContainsVariableRef(s) {
 			if err := capability.ValidateVariableRef(s); err != nil {
 				return fmt.Errorf("capability at index %d, condition %d, value %d: %w", i, j, k, err)
 			}
@@ -1869,12 +1869,17 @@ func checkTokenGrammarVersion(m *LocalManifest) error {
 	// conditions or directives, so they have no prototype registry entry to carry a Since;
 	// gating them here keeps ONE grammar gate rather than a second one somewhere else that
 	// could be updated out of step.
-	if m.EffectCeiling != nil && declared != ManifestSchemaVersion02 {
+	//
+	// Through revisionAdmits, not an equality: a token is admitted by the revision that
+	// introduced it and by every revision published after it, and an equality check refuses
+	// its own token the moment a third revision exists — including a semantics-only one that
+	// introduces nothing. Every gate in this file reads the same rule for that reason.
+	if m.EffectCeiling != nil && !revisionAdmits(declared, ManifestSchemaVersion02) {
 		return fmt.Errorf("the top-level effectCeiling was introduced in schemaVersion %q (the flow+effect grammar); this manifest declares schemaVersion %q, under which the key is not part of the grammar", ManifestSchemaVersion02, declared)
 	}
 	for i := range m.Capabilities {
 		c := &m.Capabilities[i]
-		if c.Effect != nil && declared != ManifestSchemaVersion02 {
+		if c.Effect != nil && !revisionAdmits(declared, ManifestSchemaVersion02) {
 			return tokenGrammarVersionErr(i, "the effect contract block", ManifestSchemaVersion02, declared)
 		}
 		for _, cond := range c.Conditions {
@@ -1903,7 +1908,7 @@ func checkTokenGrammarVersion(m *LocalManifest) error {
 // and recognized; this decides only whether the declared revision admits the surface at
 // all.
 func checkTaskVarGrammarVersion(i int, c *capability.Constraint, declared string) error {
-	if declared == ManifestSchemaVersion02 {
+	if revisionAdmits(declared, ManifestSchemaVersion02) {
 		return nil
 	}
 	for _, cond := range c.Conditions {
@@ -1937,12 +1942,9 @@ func checkTaskVarGrammarVersion(i int, c *capability.Constraint, declared string
 // anywhere reporting it. The message says what to do, because the only way to reach it is a
 // contributor adding a discriminator to that registry without declaring its Since.
 //
-// The admission rule itself is deliberately not an ORDERING over version strings. A base-
-// grammar token is inherited by every later revision; a token a later revision introduced
-// requires EXACTLY that revision. There are two published revisions, so "or later" has no
-// members yet, and spelling the rule as >= over version strings is wrong the first time a
-// revision is not orderable by string compare. When a third revision lands, revisionAdmits
-// is the one place that decides inheritance, explicitly.
+// The admission rule itself is an ordering over the PUBLISHED SEQUENCE, never over the
+// version strings: a token is admitted by the revision that introduced it and by every
+// revision published after it. See revisionAdmits.
 //
 // kind is "condition" or "directive", for the message only.
 func checkTokenRevision(i int, token, kind, declared string) error {
@@ -1957,18 +1959,17 @@ func checkTokenRevision(i int, token, kind, declared string) error {
 	return nil
 }
 
-// revisionAdmits reports whether a manifest declaring revision `declared` may carry a token
-// introduced by revision `since`. The base grammar is inherited (its tokens load under every
-// published revision); anything introduced later needs its exact revision declared. See
-// checkTokenRevision for why this is not a version comparison.
-func revisionAdmits(declared, since string) bool {
-	return since == ManifestSchemaVersion01 || declared == since
-}
-
 // tokenGrammarVersionErr builds the fail-closed rejection for a token used under a
 // schemaVersion that does not define it.
+//
+// It names the introducing revision and nothing else. It used to call that revision "the
+// flow+effect grammar", which was accurate only while "0.2" was the sole revision that could
+// reach this argument: with inheritance running forward along the published sequence, a token
+// introduced by any later revision reaches it too, and so does a base-grammar token under an
+// unrecognized declared version — both of which the parenthetical would have mislabeled to an
+// operator debugging a refused load.
 func tokenGrammarVersionErr(i int, feature, required, declared string) error {
-	return fmt.Errorf("capability at index %d: %s was introduced in schemaVersion %q (the flow+effect grammar); this manifest declares schemaVersion %q, under which the token is not part of the grammar", i, feature, required, declared)
+	return fmt.Errorf("capability at index %d: %s was introduced in schemaVersion %q; this manifest declares schemaVersion %q, under which the token is not part of the grammar", i, feature, required, declared)
 }
 
 // requireResponseDirectiveTarget rejects a response-mutating directive (redactFields)

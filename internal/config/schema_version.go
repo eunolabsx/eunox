@@ -17,7 +17,7 @@ package config
 
 import (
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/eunolabs/eunox/pkg/capability"
@@ -52,17 +52,24 @@ const ManifestSchemaVersion01 = capability.SchemaVersion01
 const ManifestSchemaVersion02 = capability.SchemaVersion02
 
 var (
-	// supportedManifestSchemaVersions enumerates the manifest grammar versions
-	// this build can parse. Keep in sync with the published
-	// schemas/eunox-capability-manifest.schema.json. A build understands both
-	// revisions at once; which tokens a document may use is decided per revision by each
-	// token's own capability.TokenSince, not by this set.
-	supportedManifestSchemaVersions = map[string]bool{ManifestSchemaVersion01: true, ManifestSchemaVersion02: true}
+	// supportedManifestSchemaVersions enumerates the manifest grammar versions this build
+	// can parse, in publication order. Keep in sync with the published
+	// schemas/eunox-capability-manifest.schema.json. A build understands every published
+	// revision at once; which tokens a document may use is decided per revision by each
+	// token's own capability.TokenSince against this order, not by membership alone.
+	//
+	// DERIVED from pkg/capability's published sequence rather than restated, so "which
+	// revisions parse" and "which revision inherits which token" cannot disagree — the second
+	// is an index into this same slice (see revisionAdmits). It is a package var rather than
+	// a call per use so a test can publish a synthetic revision and drive the whole loader
+	// under it, which is the only way to cover a third revision before there is one.
+	supportedManifestSchemaVersions = capability.PublishedSchemaVersions()
 
 	// supportedGatewaySchemaVersions enumerates the gateway-config grammar
 	// versions this build can parse. Keep in sync with
-	// schemas/eunox-gateway-config.schema.json.
-	supportedGatewaySchemaVersions = map[string]bool{"0.1": true}
+	// schemas/eunox-gateway-config.schema.json. The gateway config has no token grammar,
+	// so it needs no ordering — only membership.
+	supportedGatewaySchemaVersions = []string{"0.1"}
 )
 
 // validateManifestSchemaVersion fails closed unless v is a manifest grammar
@@ -77,7 +84,7 @@ func validateGatewaySchemaVersion(v string) error {
 	return validateSchemaVersion("gateway config", v, supportedGatewaySchemaVersions)
 }
 
-func validateSchemaVersion(kind, v string, supported map[string]bool) error {
+func validateSchemaVersion(kind, v string, supported []string) error {
 	// Trim once and use the trimmed value for BOTH the empty check and the membership
 	// lookup. Keying the empty check off the trimmed value but membership off the raw
 	// value diverged on a padded scalar: a quoted " 0.1" passed the empty check then
@@ -90,17 +97,40 @@ func validateSchemaVersion(kind, v string, supported map[string]bool) error {
 	switch {
 	case v == "":
 		return fmt.Errorf("%s 'schemaVersion' is required and must be one of [%s]", kind, supportedVersionList(supported))
-	case !supported[v]:
+	case !slices.Contains(supported, v):
 		return fmt.Errorf("unsupported %s schemaVersion %q (this build understands [%s])", kind, v, supportedVersionList(supported))
 	}
 	return nil
 }
 
-func supportedVersionList(supported map[string]bool) string {
-	vs := make([]string, 0, len(supported))
-	for v := range supported {
-		vs = append(vs, v)
+// supportedVersionList renders the supported set for an error message. The versions are
+// listed in PUBLICATION order rather than sorted: the sequence is what a reader needs (it is
+// what decides which tokens each revision admits), and sorting version strings is the same
+// wrong ordering the gate itself deliberately avoids.
+func supportedVersionList(supported []string) string {
+	return strings.Join(supported, ", ")
+}
+
+// revisionAdmits reports whether a manifest declaring revision `declared` may carry a token
+// introduced by revision `since`: it may when `declared` is `since` or any revision published
+// after it. A revision therefore inherits every earlier revision's vocabulary and stays CLOSED
+// against every later one's, which is the gate's whole job.
+//
+// It indexes the published SEQUENCE (supportedManifestSchemaVersions, derived from
+// pkg/capability's list) rather than comparing the version strings, and rather than spelling
+// the two-revision case as a boolean. Both alternatives break silently on the third revision:
+// a string compare inverts the first time a revision is not orderable lexically ("0.10" sorts
+// before "0.2"), and "the base grammar plus an exact match" refused every `0.2` token under a
+// semantics-only `0.3` that introduced none. Publishing a revision is an append to one
+// ordered list; nothing here is re-derived for it.
+//
+// An unrecognized revision on either side admits nothing — the fail-closed direction, and the
+// same one checkTokenRevision takes for a token this build cannot classify at all.
+func revisionAdmits(declared, since string) bool {
+	di := slices.Index(supportedManifestSchemaVersions, declared)
+	si := slices.Index(supportedManifestSchemaVersions, since)
+	if di < 0 || si < 0 {
+		return false
 	}
-	sort.Strings(vs)
-	return strings.Join(vs, ", ")
+	return di >= si
 }

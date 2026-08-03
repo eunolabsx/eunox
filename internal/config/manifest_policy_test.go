@@ -129,3 +129,43 @@ func TestHonorsAttributionInterface_RequiresTheFlowEffectGrammar(t *testing.T) {
 		t.Error("a nil manifest must not opt into a draft token")
 	}
 }
+
+// TestNeedsDecisionTurn is the predicate both transports gate their decision turn on. It was
+// spelled out at each of them, and a mirrored condition's failure mode is silent: a third
+// state-accumulating token added to one copy leaves one transport serializing and the other
+// racing the source->sink ordering the turn exists to guarantee.
+func TestNeedsDecisionTurn(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		m    *LocalManifest
+		want bool
+	}{
+		"nil manifest accumulates nothing": {nil, false},
+		"no state-accumulating token": {&LocalManifest{Capabilities: []capability.Constraint{{
+			Target: "tool:x", Actions: []string{"call"},
+			Conditions: []capability.Condition{capability.MaxCallsCondition{Count: 1, WindowSeconds: 60}},
+		}}}, false},
+		"a flowLabel sink reads what a source wrote": {&LocalManifest{Capabilities: []capability.Constraint{{
+			Target: "tool:x", Actions: []string{"call"},
+			Conditions: []capability.Condition{capability.FlowLabelCondition{Allow: []string{capability.FlowLabelPublic}}},
+		}}}, true},
+		"a labelOutput source writes what a sink reads": {&LocalManifest{Capabilities: []capability.Constraint{{
+			Target: "tool:x", Actions: []string{"call"},
+			Directives: []capability.Directive{capability.LabelOutputDirective{Labels: []string{capability.FlowLabelPII}}},
+		}}}, true},
+		"a declassify directive splits its write across two phases": {&LocalManifest{Capabilities: []capability.Constraint{{
+			Target: "tool:x", Actions: []string{"call"},
+			Directives: []capability.Directive{capability.DeclassifyDirective{Labels: []string{capability.FlowLabelPII}}},
+		}}}, true},
+		"a sequenceBlock antecedent has the same shape": {&LocalManifest{Capabilities: []capability.Constraint{{
+			Target: "tool:x", Actions: []string{"call"},
+			Conditions: []capability.Condition{capability.SequenceBlockCondition{AfterTools: []string{"tool:y"}}},
+		}}}, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := tc.m.NeedsDecisionTurn(); got != tc.want {
+				t.Errorf("NeedsDecisionTurn() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

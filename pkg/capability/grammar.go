@@ -17,6 +17,8 @@
 
 package capability
 
+import "slices"
+
 // SchemaVersion01 is the base published grammar: deny-by-default capability authorization
 // over the original closed condition/directive vocabulary. It remains supported and remains
 // CLOSED — none of the flow+effect tokens introduced by SchemaVersion02 is part of it, and a
@@ -30,6 +32,26 @@ const SchemaVersion01 = "0.1"
 // rather than one token at a time, so the grammar has exactly two published revisions rather
 // than a version per predicate.
 const SchemaVersion02 = "0.2"
+
+// publishedSchemaVersions lists every published grammar revision in PUBLICATION ORDER. It is
+// the one place the sequence of revisions is written down: which revisions a build parses, and
+// which of them admit a given token, are both read off this order, so publishing a revision is
+// an append here rather than an edit to a rule stated somewhere else.
+//
+// The ordering is DATA rather than a comparison over the version strings. "0.10" sorts before
+// "0.2" and a grammar gate that silently inverts on the tenth revision is the kind of defect
+// that ships. The index in this slice is the only ordering there is, and a version absent from
+// it has no rank at all — every consumer of the order fails closed on one.
+var publishedSchemaVersions = []string{SchemaVersion01, SchemaVersion02}
+
+// PublishedSchemaVersions returns the published grammar revisions in publication order, as a
+// fresh copy so a caller cannot reorder the sequence the loader's gates read.
+//
+// The manifest loader derives BOTH of its version questions from this one sequence — the set
+// of revisions it will parse at all, and (by index) which revision inherits which token — so
+// the two cannot disagree about a revision that exists. Restating the list anywhere would be
+// one more place for them to.
+func PublishedSchemaVersions() []string { return slices.Clone(publishedSchemaVersions) }
 
 // tokenSpec is one entry of a prototype registry: how to instantiate the token's zero value,
 // and the published grammar revision that introduced its discriminator.

@@ -4,6 +4,7 @@
 package capability
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -16,12 +17,16 @@ import (
 
 func TestTokenSince_EveryRegisteredTokenDeclaresAPublishedRevision(t *testing.T) {
 	t.Parallel()
-	published := map[string]bool{SchemaVersion01: true, SchemaVersion02: true}
+	// The published sequence itself, not a restatement of it: this file declares that
+	// sequence to be the one place the revisions are written down, and a literal here would
+	// be the second — failing on correct code the first time a token is filed under a newly
+	// published revision, with the reflex fix being to edit the copy.
 	for _, token := range append(KnownConditionTypes(), KnownDirectiveTypes()...) {
 		t.Run(token, func(t *testing.T) {
 			since, ok := TokenSince(token)
 			require.True(t, ok, "%q declares no Since, so the manifest loader must refuse every manifest carrying it", token)
-			assert.True(t, published[since], "%q declares Since %q, which is not a published grammar revision", token, since)
+			assert.True(t, slices.Contains(publishedSchemaVersions, since),
+				"%q declares Since %q, which is not a published grammar revision", token, since)
 		})
 	}
 }

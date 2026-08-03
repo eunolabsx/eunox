@@ -110,7 +110,7 @@ func TestDispatchToolsCall_AnnotationsNeverLandInTheCallersArguments(t *testing.
 					Error: &mcp.RPCError{Code: -32000, Message: "upstream said no"}}, nil
 			},
 		},
-		pdp: dp,
+		decidingPDP: decidingPDP{pdp: dp},
 	}
 	// The exact bytes the host sent, kept so the parsed map can be compared against them.
 	const rawArgs = `{"path":"/tmp/x"}`

@@ -23,6 +23,8 @@ import (
 	"github.com/eunolabs/eunox/pkg/enforcement"
 	"github.com/eunolabs/eunox/pkg/flowlabelstore"
 	"github.com/eunolabs/eunox/pkg/killswitch"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestDecisionSerializer_FIFOOrderUnderConcurrency proves the serialization primitive
@@ -33,10 +35,11 @@ func TestDecisionSerializer_FIFOOrderUnderConcurrency(t *testing.T) {
 	t.Parallel()
 	const n = 200
 	g := newDecisionSerializer()
-	// Reserve every ticket up front, in order, as the single-threaded reader would.
-	tickets := make([]uint64, n)
+	// Reserve every ticket up front, in order, as the single-threaded reader would. One
+	// anchor, which is what a stdio host resolves for every request on it.
+	tickets := make([]decisionTicket, n)
 	for i := range tickets {
-		tickets[i] = g.take()
+		tickets[i] = g.take(sessionAnchorKey("sess"))
 	}
 
 	var mu sync.Mutex
@@ -253,13 +256,13 @@ func TestFlowSerialize_SamplingSinkSerializedAgainstSource(t *testing.T) {
 		gate := newDecisionSerializer()
 		// The host reader reserves the source's decision ticket FIRST (receipt order), before
 		// the sampling decision is dispatched to the upstream-reader goroutine.
-		srcTicket := gate.take()
+		srcTicket := gate.take(sessionAnchorKey(sessionID))
 
 		fp := serverRequestParams{
 			sessionID: sessionID,
 			// The sampling decision reserves its own (later) ticket and blocks until its turn —
 			// the exact wiring stdio's samplingDecideLock installs.
-			decideLock: func() (func(), bool) { return gate.begin(gate.take()), true },
+			decideLock: func() (func(), bool) { return gate.begin(gate.take(sessionAnchorKey(sessionID))), true },
 		}.withPDP(dp)
 
 		var wg sync.WaitGroup
@@ -419,4 +422,154 @@ func TestFinishDecision_HoldsTheTurnForADeclassifyingCall(t *testing.T) {
 	var d dispatchParams
 	d.finishDecision(capability.EnforceResponse{
 		Declassification: capability.NewDeclassification([]string{capability.FlowLabelPII}, "ada@example.com", "apr-1", false)})
+}
+
+// TestDecisionSerializer_KeysOnTheAnchor is the stdio half of the property the HTTP gate
+// registry provides: the FIFO turn is per ANCHOR, not per proxy. Two anchors accumulate no
+// shared state, so their decisions must not queue behind each other; two requests on one
+// anchor must.
+//
+// It is currently exercised only by this test, because nothing on the stdio path attaches
+// validated claims and every request there resolves to the proxy's single session. That is why
+// the keying is here rather than assumed: StdioProxyOptions.PDP is an exported seam, and the
+// first per-request token channel on this transport would otherwise have left one FIFO queue
+// silently serving two anchors' worth of state.
+func TestDecisionSerializer_KeysOnTheAnchor(t *testing.T) {
+	t.Parallel()
+	g := newDecisionSerializer()
+	a, b := sessionAnchorKey("sess-a"), taskAnchorKey("task-42")
+
+	held := g.begin(g.take(a))
+	// A ticket on a DIFFERENT anchor runs immediately.
+	other := make(chan struct{})
+	go func() { defer close(other); g.begin(g.take(b))() }()
+	select {
+	case <-other:
+	case <-time.After(time.Second):
+		t.Fatal("a different anchor must not queue behind this one")
+	}
+
+	// A second ticket on the SAME anchor waits.
+	queued := make(chan struct{})
+	ticket := g.take(a)
+	go func() { defer close(queued); g.begin(ticket)() }()
+	select {
+	case <-queued:
+		t.Fatal("a second request on one anchor must wait its turn")
+	case <-time.After(20 * time.Millisecond):
+	}
+	held()
+	select {
+	case <-queued:
+	case <-time.After(time.Second):
+		t.Fatal("the turn must advance once released")
+	}
+	assert.Zero(t, g.size(), "a queue whose tickets have all been served must not be retained")
+}
+
+// TestDecisionSerializer_ZeroTicketIsANoOp: a request that was never serialized carries the
+// zero ticket, and the call site must not have to branch on it.
+func TestDecisionSerializer_ZeroTicketIsANoOp(t *testing.T) {
+	t.Parallel()
+	g := newDecisionSerializer()
+	require.NotPanics(t, func() { g.begin(decisionTicket{})() })
+}
+
+// TestStdioDecisionAnchor_ResolvesThroughTheSharedResolver pins that the stdio proxy asks the
+// same question the engine's key builder asks, from the connection identity it captured — the
+// one source both of this transport's legs read, so the host leg and the server-initiated leg
+// cannot land on different turns.
+func TestStdioDecisionAnchor_ResolvesThroughTheSharedResolver(t *testing.T) {
+	t.Parallel()
+	claims := &pdp.JWTClaims{TaskID: "task-42"}
+
+	plain := &StdioProxy{sessionID: "sess-a"}
+	assert.Equal(t, sessionAnchorKey("sess-a"), plain.decisionAnchor())
+	plain.claims = claims
+	assert.Equal(t, sessionAnchorKey("sess-a"), plain.decisionAnchor(),
+		"an operator who did not enable task anchoring sees the session turn, claims or no claims")
+
+	anchored := &StdioProxy{sessionID: "sess-a", taskAnchored: true}
+	assert.Equal(t, sessionAnchorKey("sess-a"), anchored.decisionAnchor(),
+		"a connection with no token anchors on the session, exactly as the engine keys it")
+	anchored.claims = claims
+	assert.Equal(t, taskAnchorKey("task-42"), anchored.decisionAnchor(),
+		"and a validated task claim keys the turn where the state lives")
+}
+
+// TestStdioPinnedQueue_IsSharedByBothLegsAndReclaimed covers what the pin buys and what it
+// must not cost. Both legs take their tickets from the ONE queue the proxy pinned — a
+// sampling sink that queued somewhere else would not be serialized against a host source's
+// label write, which is the whole reason the server-initiated leg takes a turn at all — and
+// the pin is released at teardown so a queue is not retained past the proxy that held it.
+func TestStdioPinnedQueue_IsSharedByBothLegsAndReclaimed(t *testing.T) {
+	t.Parallel()
+	p := &StdioProxy{sessionID: "sess-a", decideGate: newDecisionSerializer()}
+	p.pinDecisionQueue()
+	require.NotNil(t, p.decideQueue)
+	require.Equal(t, 1, p.decideGate.size())
+
+	// The host leg holds its turn; the sampling leg must wait for it rather than run beside it.
+	host := p.decideGate.begin(p.decideGate.takeOn(p.decideQueue))
+	sampling := p.samplingDecideLock()
+	require.NotNil(t, sampling)
+	entered := make(chan struct{})
+	go func() {
+		end, ok := sampling()
+		if ok {
+			end()
+		}
+		close(entered)
+	}()
+	select {
+	case <-entered:
+		t.Fatal("the server-initiated leg must queue behind the host leg's turn: they share one anchor")
+	case <-time.After(20 * time.Millisecond):
+	}
+	host()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("the sampling leg must run once the host turn is released")
+	}
+
+	// Still exactly one queue after all that traffic: the pin is what keeps the read loop off
+	// the registry, and it is released when the proxy is done with it.
+	assert.Equal(t, 1, p.decideGate.size())
+	p.dropDecideQueue()
+	assert.Zero(t, p.decideGate.size(), "a pinned queue must not outlive the proxy that pinned it")
+}
+
+// TestStdioDecisionTicket_UnpinnedProxyStillSerializes is the fail-open guard on the pin. The
+// pinned queue is an optimization resolved in Start; a proxy driven without it (a direct
+// serveHost caller, which is how much of this package's own coverage runs) must still take a
+// real turn. A nil pin that quietly produced the zero ticket would leave every decision on
+// such a proxy unserialized while every test kept passing — the source->sink race reopened by
+// the very change that was meant to make the keying structural.
+func TestStdioDecisionTicket_UnpinnedProxyStillSerializes(t *testing.T) {
+	t.Parallel()
+	p := &StdioProxy{sessionID: "sess-a", decideGate: newDecisionSerializer()}
+	require.Nil(t, p.decideQueue, "this proxy never ran Start, so it holds no pin")
+
+	first := p.decideGate.begin(p.takeDecisionTicket())
+	second := p.takeDecisionTicket()
+	entered := make(chan struct{})
+	go func() { defer close(entered); p.decideGate.begin(second)() }()
+	select {
+	case <-entered:
+		t.Fatal("an unpinned proxy must still serialize its decisions, not run them concurrently")
+	case <-time.After(20 * time.Millisecond):
+	}
+	first()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("the turn must advance once released")
+	}
+
+	// And the fallback resolves the same anchor the pin would have, so a proxy that pins
+	// later does not move to a different queue.
+	p.pinDecisionQueue()
+	assert.Equal(t, 1, p.decideGate.size(), "the fallback and the pin address one queue, not two")
+	p.dropDecideQueue()
 }

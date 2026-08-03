@@ -110,6 +110,28 @@ func (m *LocalManifest) HasFlowLabel() bool {
 		m.anyDirective(capability.IsDeclassifyDirective)
 }
 
+// NeedsDecisionTurn reports whether this policy's decisions must be SERIALIZED on the state
+// anchor: whether it reads or writes accumulated state that one call commits and a later one
+// reads back. Both transports gate their decision turn on it.
+//
+// The two conditions are the two ways such a dependency exists today. A flow-relevant policy
+// has a source that writes labels and a sink that reads them; a sequenceBlock has an
+// antecedent marker with the same shape. Without an ordered decision phase a host that
+// pipelines the source and the sink lets the sink's read run before the source's write
+// commits, which is the fail-open the turn exists to close. Everything else keeps full
+// decision parallelism.
+//
+// It lives here, beside HasFlowLabel/HasSequenceBlock/HasMaxCalls, because it was previously
+// spelled out twice — once in the stdio host's wiring, once in the gateway's route builder —
+// and a mirrored predicate is a second place to update whose failure is silent: a third
+// state-accumulating condition added to one copy and not the other leaves one transport
+// serializing and the other racing, with nothing failing to say so.
+//
+// A nil manifest (a route with no policy) accumulates nothing and needs no turn.
+func (m *LocalManifest) NeedsDecisionTurn() bool {
+	return m != nil && (m.HasFlowLabel() || m.HasSequenceBlock())
+}
+
 // HasDeclassify reports whether this policy carries a declassify directive — the one
 // token whose satisfaction depends on a channel (a validated JWT) that not every host
 // transport has. The startup check consults it to refuse a manifest whose declassification
@@ -138,8 +160,14 @@ func (m *LocalManifest) HasDeclassify() bool {
 //
 // A nil manifest (a route with no policy) has no schema version and therefore no opt-in,
 // so it reports false.
+//
+// It asks revisionAdmits rather than comparing to the introducing revision, which is the same
+// rule the manifest-side gates apply: a revision published after the one that introduced the
+// interface still contains it. An equality check would silently turn the interface OFF for a
+// policy on a later revision — and "off" here means the client's declaration is ignored, which
+// is quiet rather than loud.
 func (m *LocalManifest) HonorsAttributionInterface() bool {
-	return m != nil && strings.TrimSpace(m.SchemaVersion) == ManifestSchemaVersion02
+	return m != nil && revisionAdmits(strings.TrimSpace(m.SchemaVersion), ManifestSchemaVersion02)
 }
 
 // HasSamplingGrant reports whether the manifest grants server-initiated sampling:
