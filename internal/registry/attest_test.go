@@ -394,3 +394,43 @@ func TestAttestationStatus_SummaryKeepsTheUnverifiedCount(t *testing.T) {
 	assert.Equal(t, 9, status.Unverified)
 	assert.Equal(t, "vendor +unverified(9)", status.Summary())
 }
+
+// TestVerifyAttestations_WorksOnAnUnvalidatedEntry pins the fallback both load-time caches
+// need. Validate stashes the decoded signature and the recomputed content digest, and this
+// method is exported on an exported struct — so a Contract a caller built directly reaches
+// it with neither cached, and must derive both rather than verifying against nothing.
+func TestVerifyAttestations_WorksOnAnUnvalidatedEntry(t *testing.T) {
+	c, pub, priv := signedEntry(t)
+	sign(t, &c, "acme-2026", registry.AttestRoleVendor, registry.AttestStatementAttests, priv)
+	// Deliberately NOT calling Validate: this is the caller-built path.
+
+	store, err := registry.LoadTrustStore(writeTrustStore(t, trusted("acme-2026", "Acme Inc", pub)))
+	require.NoError(t, err)
+	status, err := c.VerifyAttestations(store)
+	require.NoError(t, err)
+	assert.True(t, status.VendorAttested)
+
+	// And the tampering case still fails on that same uncached path: a caller-built entry
+	// whose content no longer matches its signature is the substitution this catches,
+	// whether or not a loader ever saw it.
+	c.Effect = &capability.EffectContract{Class: capability.EffectReversible}
+	_, err = c.VerifyAttestations(store)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "edited after it was signed")
+}
+
+// TestVerifyAttestations_MalformedSignatureOnAnUnvalidatedEntry covers the decode fallback's
+// error arm. Structural checking happens at load, so this shape only exists for a
+// caller-built entry — and an unparseable signature by a TRUSTED key is the tampering case,
+// not the stranger case, so it must be an error rather than an unverified count.
+func TestVerifyAttestations_MalformedSignatureOnAnUnvalidatedEntry(t *testing.T) {
+	c, pub, priv := signedEntry(t)
+	sign(t, &c, "acme-2026", registry.AttestRoleVendor, registry.AttestStatementAttests, priv)
+	c.Signatures[0].Value = "not-base64!!"
+
+	store, err := registry.LoadTrustStore(writeTrustStore(t, trusted("acme-2026", "Acme Inc", pub)))
+	require.NoError(t, err)
+	_, err = c.VerifyAttestations(store)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not valid base64")
+}

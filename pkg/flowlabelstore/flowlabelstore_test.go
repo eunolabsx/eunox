@@ -254,7 +254,7 @@ func TestRedis_IdleTTL_RefreshedOnAddAndGet(t *testing.T) {
 	t.Cleanup(func() { _ = client.Close() })
 
 	const ttl = 100 * time.Second
-	store := flowlabelstore.NewRedis(client, flowlabelstore.WithIdleTTL(ttl))
+	store := flowlabelstore.NewRedis(client, flowlabelstore.WithRedisIdleTTL(ttl))
 	ctx := context.Background()
 	const key = "flowlabels:s1"
 
@@ -307,7 +307,7 @@ func TestRedis_WithIdleTTL_BelowOneSecondFallsBackToDefault(t *testing.T) {
 	ctx := context.Background()
 
 	for _, ttl := range []time.Duration{0, -time.Second, 500 * time.Millisecond, time.Second - time.Nanosecond} {
-		store := flowlabelstore.NewRedis(client, flowlabelstore.WithIdleTTL(ttl))
+		store := flowlabelstore.NewRedis(client, flowlabelstore.WithRedisIdleTTL(ttl))
 		require.NoError(t, store.Add(ctx, "s", "pii"))
 		assert.InDelta(t, flowlabelstore.DefaultIdleTTL.Seconds(), mr.TTL("flowlabels:s").Seconds(), 5,
 			"an idle TTL below one second must fall back to DefaultIdleTTL")

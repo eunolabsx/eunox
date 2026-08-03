@@ -22,6 +22,7 @@ import (
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/pdp"
 	"github.com/eunolabs/eunox/pkg/capability"
+	"github.com/eunolabs/eunox/pkg/enforcement"
 )
 
 // ---------------------------------------------------------------------------
@@ -711,6 +712,10 @@ func (*staticPDP) DecideSampling(_ context.Context, _, _ string) capability.Enfo
 
 // HardenRefusal is the identity: a fixed-decision test PDP holds no pin, no ceiling and
 // no obligations, so it has nothing to contribute to another layer's refusal.
+func (*staticPDP) EvaluateClaimCondition(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (*enforcement.ConditionError, bool) {
+	return enforcement.NonCommittingConditionVerdict(ctx, cond, req)
+}
+
 func (*staticPDP) HardenRefusal(_ context.Context, _ string, r capability.EnforceResponse, _ pdp.EnforceTarget, _ map[string]interface{}) capability.EnforceResponse {
 	return r
 }

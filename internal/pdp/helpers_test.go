@@ -113,6 +113,10 @@ func (denyAllPDP) DecideSampling(_ context.Context, _, _ string) capability.Enfo
 
 // HardenRefusal is the identity: a deny-all test PDP holds no pin, no ceiling and no
 // obligations, so it has nothing to contribute to another layer's refusal.
+func (denyAllPDP) EvaluateClaimCondition(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (*enforcement.ConditionError, bool) {
+	return enforcement.NonCommittingConditionVerdict(ctx, cond, req)
+}
+
 func (denyAllPDP) HardenRefusal(_ context.Context, _ string, r capability.EnforceResponse, _ EnforceTarget, _ map[string]interface{}) capability.EnforceResponse {
 	return r
 }
@@ -173,6 +177,10 @@ func (*staticPDP) DecideSampling(_ context.Context, _, _ string) capability.Enfo
 		},
 	}
 }
+func (s *staticPDP) EvaluateClaimCondition(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (*enforcement.ConditionError, bool) {
+	return enforcement.NonCommittingConditionVerdict(ctx, cond, req)
+}
+
 func (s *staticPDP) HardenRefusal(_ context.Context, sessionID string, r capability.EnforceResponse, target EnforceTarget, args map[string]interface{}) capability.EnforceResponse {
 	if s.harden == nil {
 		return r
@@ -207,4 +215,17 @@ func (*staticPDP) FilterPromptsList(_ context.Context, result json.RawMessage) L
 // it.
 func (p *ManifestPDP) recordObservedToolHash(name, description, title string, annotations, inputSchema, outputSchema map[string]interface{}, pin string) {
 	p.recordObservedHash(name, SurfaceHash(description, title, annotations, inputSchema, outputSchema), pin)
+}
+
+// jwtCondReq builds the request evaluateJWTConditions is fed, from the (name, args, claims)
+// triple these tests are written in terms of.
+//
+// It goes through jwtClaimEnforceRequest — the same builder the decision path uses — rather
+// than a struct literal of its own, so a test can never assert against a request shape the
+// real call site does not produce. That matters here more than usual: the whole point of
+// the builder is which fields it populates, and a test literal would be a second answer to
+// exactly that question.
+func jwtCondReq(name string, args, claims map[string]interface{}) *capability.EnforceRequest {
+	return jwtClaimEnforceRequest("s-test",
+		EnforceTarget{Type: capability.TargetTypeTool, Name: name}, args, claims)
 }

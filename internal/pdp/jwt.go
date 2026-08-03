@@ -1052,6 +1052,25 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 		if declErr != nil {
 			return nil, capability.Terminal(jwtErr(jwtErrInvalidDeclassify, declErr))
 		}
+		// A single-use grant is burned in a WINDOWED ledger, so a token that outlives that
+		// window would present the same grant again after the burn aged out and clear a
+		// second time — one human approval, two declassifications, and nothing on the tape
+		// saying so. Refuse the token here instead: the bound is on the token's remaining
+		// lifetime, checked against the same exp and the same leeway validateStandardClaims
+		// just accepted it under, so the burn a later call writes always outlives the token
+		// that could replay it. A standing grant is unaffected.
+		//
+		// It runs at the boundary rather than on the decision path for the reason every other
+		// claim-borne narrowing does: a grant this build cannot enforce as written is a
+		// rejected token, not a decision-time surprise the operator has no error to grep for.
+		//
+		// The exp read here is tokenExpUnix — the value validateStandardClaims returned
+		// after accepting it — rather than a second dereference of stdClaims.Expiry: that
+		// pointer is non-nil only because the check above ran first, and a reordering would
+		// turn a second read into a nil dereference on a request goroutine.
+		if lifeErr := capability.CheckDeclassifyApprovalLifetime(declassify, time.Unix(tokenExpUnix, 0), now, p.leeway); lifeErr != nil {
+			return nil, capability.Terminal(jwtErr(jwtErrInvalidDeclassify, lifeErr))
+		}
 
 		// Delegation attenuation, decoded and asserted at this same boundary.
 		delegation, delegErr := parseDelegationChain(payload)
@@ -1439,8 +1458,9 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 	// Hoisted beside condArgs: both are loop-invariant, and flatMap falls back to REBUILDING
 	// the flat claim map for a *JWTClaims that never went through ValidateToken (the
 	// documented test/embedder case), which inside the loop would be one map allocation per
-	// candidate grant.
-	flatClaims := claims.flatMap()
+	// candidate grant. The request is built once for the same reason — every candidate grant
+	// is judged against the identical call.
+	condReq := jwtClaimEnforceRequest(sessionID, target, condArgs, claims.flatMap())
 	var lastDeny *capability.EnforceResponse
 	for i := range constraints {
 		matched := constraints[i]
@@ -1448,7 +1468,7 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 			lastDeny = nil
 			break
 		}
-		if resp := evaluateJWTConditions(p.clock, matched.Conditions, target.Name, condArgs, flatClaims); resp != nil {
+		if resp := evaluateJWTConditions(ctx, p.clock, p.inner, matched.Conditions, condReq); resp != nil {
 			lastDeny = resp
 			continue
 		}
@@ -1511,6 +1531,78 @@ func (p *JWTPDP) decideInner(ctx context.Context, sessionID string, target Enfor
 		// system lands here on purpose (see the tool case).
 		return hardDenyResponse(p.clock, capability.ErrCodeEnforcementError,
 			fmt.Sprintf("decideInner: unhandled target type %q — update decideInner", target.Type))
+	}
+}
+
+// claimConditionEvaluator is the narrow view evaluateJWTConditions needs of the PDP whose
+// condition semantics this deployment enforces. It is the one method of
+// PolicyDecisionPoint that matters here, named separately so the evaluator can be nil
+// (a JWT-only route, which has no wrapped PDP) without the caller having to hold a full
+// contract implementation to say so.
+type claimConditionEvaluator interface {
+	EvaluateClaimCondition(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (*enforcement.ConditionError, bool)
+}
+
+// claimConditionVerdict asks the deciding PDP, or the built-ins when there is none.
+//
+// The nil case is a route with no wrapped PDP at all: no engine exists, so no
+// WithConditionHandler override can exist either, and the shipped predicate is by
+// construction this route's semantics. That is the ONLY reading of nil — it must never
+// become the fallback for "the PDP is there but did not answer", which is what ok=false
+// reports and the caller fails closed on.
+func claimConditionVerdict(eval claimConditionEvaluator, ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (*enforcement.ConditionError, bool) {
+	if eval == nil {
+		return enforcement.NonCommittingConditionVerdict(ctx, cond, req)
+	}
+	return eval.EvaluateClaimCondition(ctx, cond, req)
+}
+
+// EvaluateClaimCondition delegates to the PDP this one wraps, so a stack of wrappers
+// resolves to the semantics of whatever is actually deciding. With no inner PDP there is
+// no engine either, so the built-ins are the route's semantics — see claimConditionVerdict.
+func (p *JWTPDP) EvaluateClaimCondition(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (*enforcement.ConditionError, bool) {
+	return claimConditionVerdict(p.inner, ctx, cond, req)
+}
+
+// jwtClaimEnforceRequest builds the EnforceRequest a capability claim's conditions are
+// evaluated against.
+//
+// It exists because the shared predicate's guarantee is only as good as what it is FED.
+// enforcement.EvaluateAllowedValues reads Arguments and Claims today, and the call site
+// used to pass a two-field literal — correct, and silently wrong the moment a semantic
+// added there reads any other field: it would see the real value on the manifest path and
+// the zero value here, with no compile error and no test failure, because there is no
+// longer a second hand-written implementation whose incompleteness a reviewer would notice
+// by diffing it against the first. So the identity of the call is populated as fully as
+// this layer knows it, and what is left zero is left zero deliberately:
+//
+//   - SessionID, TargetName, Target — populated. All three are the identity of the call
+//     being authorized, all three are already in scope at the call site, and they are what
+//     a target-scoped or session-keyed rule added later would read.
+//   - Context (source IP, timestamp) — zero. Threading it would mean a claim-scoped
+//     condition could turn on the network position of the caller, which is the manifest's
+//     job: the intersection runs the manifest path immediately after, with the real value.
+//   - Directives — zero. Directives come from the MATCHED MANIFEST constraint, and no
+//     constraint has been selected at this point. A claim grant carries none.
+//   - DeclaredLabels, DeclassifyApprovals, Delegation — zero. Each is enforced on its own
+//     path (the flow layer, the declassify seam, the delegation gate, all of which run
+//     over the full request), and populating them here would let a claim-scoped condition
+//     evaluate a second, partial view of state whose authoritative evaluation is one frame
+//     away.
+//
+// internal/pdp pins this decision with a test that fails when a field is added to
+// capability.EnforceRequest, so the next field is a deliberate choice rather than an
+// omission nobody notices.
+func jwtClaimEnforceRequest(sessionID string, target EnforceTarget, args, claims map[string]interface{}) *capability.EnforceRequest {
+	return &capability.EnforceRequest{
+		SessionID:  sessionID,
+		TargetName: target.Name,
+		Arguments:  args,
+		Target: &capability.EnforceRequestTarget{
+			Type: string(target.Type),
+			Name: target.Name,
+		},
+		Claims: claims,
 	}
 }
 
@@ -2365,16 +2457,34 @@ func collectArgStringsDepth(v interface{}, out *[]string, depth int) bool {
 	return true
 }
 
-// evaluateJWTConditions checks JWT-derived conditions against the call arguments.
-// Returns a non-nil denial response if any condition fails.
+// evaluateJWTConditions checks JWT-derived conditions against the call the request
+// describes. Returns a non-nil denial response if any condition fails.
 //
-// claims is the caller's flat input.claims map — the same one the manifest path threads
-// into the engine — so a `${task.*}` reference an issuer wrote into a capability claim
-// resolves here exactly as it does there. It is a parameter rather than something read
-// back off a context because this function is the JWT path's whole condition evaluator:
-// handing it the arguments but not the identity is what let a grant carrying a recognized
-// reference match nothing and deny every call under it.
-func evaluateJWTConditions(clock enforcement.Clock, conditions []capability.Condition, name string, args, claims map[string]interface{}) *capability.EnforceResponse {
+// req is the whole call, not a pair of maps: its Claims carry the caller's flat
+// input.claims — the same map the manifest path threads into the engine, so a `${task.*}`
+// reference an issuer wrote into a capability claim resolves here exactly as it does there
+// — and its Arguments the values the conditions match against. Handing this the arguments
+// but not the identity is what once let a grant carrying a recognized reference match
+// nothing and deny every call under it. See jwtClaimEnforceRequest for which of the
+// remaining fields are populated and which are deliberately zero.
+//
+// eval is the PDP whose condition semantics this deployment enforces — the inner PDP when
+// one is wired. It is a parameter, and reached rather than assumed, because
+// enforcement.WithConditionHandler can replace what a condition TYPE means for an
+// embedder's engine: calling the package-level built-in here would enforce the override on
+// the manifest path and the shipped predicate on this one, for the same condition on the
+// same call. nil means there is no wrapped PDP at all (a JWT-only route), where the
+// built-ins are the semantics because there is no engine to have overridden them.
+func evaluateJWTConditions(ctx context.Context, clock enforcement.Clock, eval claimConditionEvaluator, conditions []capability.Condition, req *capability.EnforceRequest) *capability.EnforceResponse {
+	if req == nil {
+		// Unreachable from Decide, which always builds one — but this is the JWT path's
+		// whole condition evaluator, and a nil request must DENY rather than read as a
+		// grant whose conditions all passed.
+		resp := denyResponse(clock, capability.ErrCodeConditionFailed, "",
+			"JWT capability-claim conditions were evaluated with no request to check against; deny (fail closed)")
+		return &resp
+	}
+	name, args := req.TargetName, req.Arguments
 	for _, cond := range conditions {
 		switch c := cond.(type) {
 		case capability.AllowedOperationsCondition:
@@ -2480,7 +2590,21 @@ func evaluateJWTConditions(clock enforcement.Clock, conditions []capability.Cond
 			// It commits nothing, which is what makes it usable here: this runs BEFORE the
 			// inner PDP's own decision, so an evaluator that consumed a window slot or wrote a
 			// flow label would double-count against the manifest path that follows.
-			if cerr := enforcement.EvaluateAllowedValues(c, &capability.EnforceRequest{Arguments: args, Claims: claims}); cerr != nil {
+			//
+			// It is reached through the DECIDING PDP rather than called directly, because a
+			// shared function closes copy-drift and not handler overriding: an embedder who
+			// redefined allowedValues via WithConditionHandler had it enforced on the
+			// manifest path and silently not on this one. The seam refuses (ok=false) a type
+			// it cannot evaluate without committing, which is the one case where running the
+			// override here would be worse than not having it.
+			cerr, ok := claimConditionVerdict(eval, ctx, c, req)
+			if !ok {
+				resp := denyResponseWithDetails(clock, capability.ErrCodeConditionFailed, c.ConditionType(),
+					fmt.Sprintf("%q: the deciding policy's %s handler cannot be evaluated ahead of its own decision (it commits state, or is not registered); deny (fail closed)", name, c.ConditionType()),
+					map[string]interface{}{"conditionType": c.ConditionType()})
+				return &resp
+			}
+			if cerr != nil {
 				resp := denyFromCondition(clock, name, cerr)
 				return &resp
 			}

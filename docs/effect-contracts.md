@@ -436,6 +436,30 @@ the request leg. That bound is adequate today because a receipt grants no fricti
 at all: it is recorded evidence, and nothing consumes it as an authorization input. Any
 future mechanism that lets a receipt lower a bar has to close this first.
 
+### Why there are two operator-configured key files
+
+Receipts take a **JWKS** (`effectReceiptKeys`); corpus attestations take a bespoke
+`{"keys": [...]}` **trust store** (`--trust-keys`). Both are local files of public keys an
+operator chose, both pin one algorithm, both are read rather than fetched — and they are
+deliberately separate, because they answer different questions and, more importantly, take
+**opposite** positions on the same one.
+
+- A receipt is a **JWS with claims**, made by an upstream about a call that already
+  happened, verified on the request path. Its verdicts collapse "unknown key" and "bad
+  signature" into one `unverified`: splitting them would invite a consumer to treat some
+  unverified receipts as softer than others, and every one of them earns nothing anyway.
+- An attestation is a **detached signature over content**, made by a publisher or reviewer
+  about a corpus entry, verified at authoring time by a human running `eunox contracts`.
+  It splits the same two: a signature by a key you do not hold is **inert** (a corpus may
+  be signed by strangers, and refusing to load it would make every entry's usability
+  depend on collecting every publisher's key), while a signature by a key you **do** hold
+  that fails to verify is a hard **error** — that is the entry-edited-after-signing case
+  the whole mechanism exists to catch.
+
+Neither posture is right for the other surface, which is why one shared format would have
+to pick a wrong answer for one of them. What they do share is the rule that matters: no key
+is ever fetched, and nothing here is on the decision path.
+
 ## Worked example
 
 The full scenario, running against the real binary: `make -C demo effect-escalate`

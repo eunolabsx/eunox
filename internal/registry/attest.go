@@ -12,7 +12,6 @@ import (
 	"strings"
 
 	"github.com/eunolabs/eunox/internal/config"
-	"github.com/eunolabs/eunox/pkg/capability"
 )
 
 // A content digest establishes that an entry is what it says it is. It says nothing about
@@ -43,6 +42,18 @@ import (
 //     signature by a key the operator DID configure, which does not verify against the
 //     content in front of it, means the entry was edited after it was signed — which is the
 //     substitution the whole mechanism exists to catch.
+//
+// This is the SECOND operator-configured public-key file in the codebase, beside the
+// per-upstream JWKS in pkg/capability/receipt.go, and the divergence is deliberate rather
+// than an oversight. Property 4 above splits "unknown key" from "trusted key, bad
+// signature"; the receipt verifier deliberately COLLAPSES the same two into one
+// ReceiptUnverified verdict, because splitting them there would invite a consumer to treat
+// some unverified receipts as softer than others when all of them earn nothing. The two
+// surfaces are genuinely different objects — a detached signature over content, read by a
+// human at authoring time, versus a JWS with claims verified on the request path — so one
+// shared format would have to pick a posture that is wrong for one of them. An operator
+// reasoning from one file about the other gets it backwards, which is why
+// docs/effect-contracts.md states the difference where both are documented.
 const (
 	// AttestRoleVendor marks a signature by the party that publishes the MCP server the
 	// contract describes: the strongest claim available here, because the signer is the one
@@ -99,6 +110,26 @@ type Signature struct {
 	Statement string `json:"statement"`
 	// Value is the base64 (standard encoding) Ed25519 signature over AttestationPayload.
 	Value string `json:"signature"`
+
+	// raw is Value decoded, cached by Validate at corpus load. It follows the pattern
+	// TrustedKey.pub already establishes one struct down: the decode is length-checked at
+	// load and the bytes were then thrown away, so verification decoded the same string a
+	// second time and re-derived a near-identical error message for a failure the loader had
+	// already ruled out. nil for a Contract built by a caller that never went through
+	// Validate, which decoded() handles.
+	raw []byte
+}
+
+// decoded returns the signature bytes: the ones Validate already decoded when this entry
+// came from a corpus, or a fresh decode for a Contract a caller built directly. The second
+// path is not dead — VerifyAttestations is exported on an exported struct — and an
+// unparseable signature by a TRUSTED key is the tampering case, so it stays an error rather
+// than being treated as a stranger's mark.
+func (s *Signature) decoded() ([]byte, error) {
+	if len(s.raw) > 0 {
+		return s.raw, nil
+	}
+	return base64.StdEncoding.DecodeString(s.Value)
 }
 
 // AttestationPayload returns the exact bytes a signature covers: the domain separator, the
@@ -139,7 +170,7 @@ func NewSignaturePayload(c *Contract, role, statement string) ([]byte, error) {
 	if !validAttestStatements[statement] {
 		return nil, fmt.Errorf("attestation statement %q is not one of %s", statement, sortedKeys(validAttestStatements))
 	}
-	digest, err := capability.EffectContractDigest(c.Effect)
+	digest, err := c.contentDigest()
 	if err != nil {
 		return nil, fmt.Errorf("contract %q: %w", c.ID, err)
 	}
@@ -173,6 +204,10 @@ func (s *Signature) Validate(contractID string) error {
 	if len(raw) != ed25519.SignatureSize {
 		return fmt.Errorf("contract %q: signature %q is %d bytes, not the %d an Ed25519 signature is", contractID, s.KeyID, len(raw), ed25519.SignatureSize)
 	}
+	// Keep the bytes rather than discarding them: verification needs exactly these, and
+	// decoding the same string twice is a second place for the two to disagree about what
+	// this signature is.
+	s.raw = raw
 	return nil
 }
 
@@ -349,12 +384,10 @@ func (c *Contract) VerifyAttestations(store *TrustStore) (AttestationStatus, err
 	if len(c.Signatures) == 0 {
 		return status, nil
 	}
-	// Re-derive the digest from the entry's own content rather than trusting the declared
-	// one. Validate already refuses a mismatch, but this function is exported and a caller
-	// may hold a Contract built any way at all — and a signature verified against a
-	// SELF-DECLARED digest would authenticate the declaration instead of the content, which
-	// is precisely the substitution the digest exists to prevent.
-	digest, err := capability.EffectContractDigest(c.Effect)
+	// The digest derived from the entry's own CONTENT, never the declared one: a signature
+	// verified against a self-declared digest would authenticate the declaration instead of
+	// the content, which is precisely the substitution the digest exists to prevent.
+	digest, err := c.contentDigest()
 	if err != nil {
 		return status, fmt.Errorf("contract %q: %w", c.ID, err)
 	}
@@ -368,7 +401,7 @@ func (c *Contract) VerifyAttestations(store *TrustStore) (AttestationStatus, err
 			status.Unverified++
 			continue
 		}
-		raw, decErr := base64.StdEncoding.DecodeString(sig.Value)
+		raw, decErr := sig.decoded()
 		if decErr != nil {
 			// Structurally checked at load; a caller-built Contract can still carry one, and
 			// an unparseable signature by a TRUSTED key is the tampering case, not the

@@ -83,6 +83,12 @@ type Contract struct {
 	// One type, so an author copies the block across with no translation step where the
 	// two could drift.
 	Effect *capability.EffectContract `json:"effect"`
+
+	// contentDigestCache is the digest recomputed from Effect at load, kept so the
+	// attestation payload and every signature verification read the value already in hand
+	// instead of re-hashing the same block per signed entry. Unexported, and never
+	// populated from the declared Digest — see contentDigest.
+	contentDigestCache string
 }
 
 // ServerRef identifies the MCP server a contract's tool belongs to.
@@ -131,7 +137,33 @@ var validReviews = map[string]bool{ReviewPending: true, ReviewCommunity: true, R
 
 // Ref returns the manifest pin for this entry: "<id>@<digest>", the value an author
 // copies into a capability's `effect.ref`.
+//
+// It reads the DECLARED digest deliberately, unlike contentDigest: a pin is what the file
+// says it is, and Validate has already refused any entry where the two differ — so on a
+// loaded corpus they are the same string, and on a hand-built Contract this reports what
+// the caller declared rather than silently correcting it.
 func (c *Contract) Ref() string { return c.ID + "@" + c.Digest }
+
+// contentDigest is the digest of the entry's own CONTENT, cached by Validate at load.
+//
+// Every consumer that binds a signature to an entry must use this rather than c.Digest:
+// signing or verifying against a self-declared digest authenticates the declaration
+// instead of the content, which is exactly the substitution a content digest exists to
+// prevent. A Contract that never went through Validate has no cache and computes it here,
+// so an exported entry point cannot be made to skip the derivation.
+//
+// INVARIANT: the cache belongs to the Effect that Validate saw. A caller that mutates
+// Effect in place afterwards must re-run Validate, exactly as it must for the decoded key
+// on TrustedKey.pub and the decoded signature on Signature.raw. This is not the tampering
+// case the digest defends against — that one edits the FILE, and every load recomputes
+// from the bytes on disk (and refuses a declared digest that no longer matches) — it is
+// the ordinary Go rule that a derived field is derived from the value it was derived from.
+func (c *Contract) contentDigest() (string, error) {
+	if c.contentDigestCache != "" {
+		return c.contentDigestCache, nil
+	}
+	return capability.EffectContractDigest(c.Effect)
+}
 
 // Validate checks one entry: a known grammar version, the required identity fields, a
 // recognized attestation, and — the load-bearing one — a digest that matches the
@@ -212,6 +244,11 @@ func (c *Contract) Validate() error {
 	if err != nil {
 		return fmt.Errorf("contract %q: %w", c.ID, err)
 	}
+	// Keep the recomputed value: it is the one every later consumer needs (the attestation
+	// payload, verification) and recomputing it per signed entry re-hashes the same block
+	// for an answer already in hand. It caches the CONTENT digest, never the declared one —
+	// the two are only equal because the check below passes.
+	c.contentDigestCache = actual
 	if actual != c.Digest {
 		return fmt.Errorf("contract %q: declared digest %s does not match its content digest %s — the entry was edited without re-digesting", c.ID, c.Digest, actual)
 	}

@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/eunolabs/eunox/internal/config"
@@ -199,23 +200,41 @@ Flags:
 // publisher who is about to make one is exactly who needs to know that a reviewer they trust
 // read the entry and disagreed.
 func writeAttestPayload(out io.Writer, contracts []registry.Contract, id, role, statement string, statuses map[string]registry.AttestationStatus) int {
-	for i := range contracts {
-		c := &contracts[i]
-		if c.ID != id {
-			continue
-		}
-		warnIfDisputed(id, statuses)
-		payload, err := registry.NewSignaturePayload(c, role, statement)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "eunox contracts: %v\n", err)
-			return 2
-		}
-		// No trailing newline: the payload is the signed byte string, and a shell
-		// redirection of this output has to be the bytes and nothing else.
-		wf(out, "%s", payload)
-		return 0
+	c := findContract(contracts, id)
+	if c == nil {
+		return reportUnknownContractID(id, "--attest-payload")
 	}
-	fmt.Fprintf(os.Stderr, "eunox contracts: no contract with id %q in the corpus (run without --attest-payload to list the ids it holds)\n", id)
+	warnIfDisputed(id, statuses)
+	payload, err := registry.NewSignaturePayload(c, role, statement)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "eunox contracts: %v\n", err)
+		return 2
+	}
+	// No trailing newline: the payload is the signed byte string, and a shell
+	// redirection of this output has to be the bytes and nothing else.
+	wf(out, "%s", payload)
+	return 0
+}
+
+// findContract returns the entry with this id, or nil. It is one linear walk shared by the
+// two single-entry commands rather than a copy in each: they had the same scan and the same
+// not-found message differing only in the flag name, which is two places to edit for one
+// lookup and two places for the message to drift.
+func findContract(contracts []registry.Contract, id string) *registry.Contract {
+	for i := range contracts {
+		if contracts[i].ID == id {
+			return &contracts[i]
+		}
+	}
+	return nil
+}
+
+// reportUnknownContractID is the shared not-found path, parameterized by the flag that
+// asked. An unknown id is an error rather than empty output for both callers: a pin an
+// author pastes, and a payload a publisher signs, both have to come from an entry that
+// exists.
+func reportUnknownContractID(id, flag string) int {
+	fmt.Fprintf(os.Stderr, "eunox contracts: no contract with id %q in the corpus (run without %s to list the ids it holds)\n", id, flag)
 	return 2
 }
 
@@ -245,16 +264,13 @@ func warnIfDisputed(id string, statuses map[string]registry.AttestationStatus) {
 // one moment an author is about to commit to an entry is the moment they need to know someone
 // who read it disagreed.
 func writeContractRef(out io.Writer, contracts []registry.Contract, id string, statuses map[string]registry.AttestationStatus) int {
-	for i := range contracts {
-		if contracts[i].ID != id {
-			continue
-		}
-		warnIfDisputed(id, statuses)
-		wf(out, "%s\n", contracts[i].Ref())
-		return 0
+	c := findContract(contracts, id)
+	if c == nil {
+		return reportUnknownContractID(id, "--ref")
 	}
-	fmt.Fprintf(os.Stderr, "eunox contracts: no contract with id %q in the corpus (run without --ref to list the ids it holds)\n", id)
-	return 2
+	warnIfDisputed(id, statuses)
+	wf(out, "%s\n", c.Ref())
+	return 0
 }
 
 // writeContractCorpus lists a verified corpus: one row per entry with the fields a
@@ -273,11 +289,17 @@ func writeContractCorpus(out io.Writer, dir string, contracts []registry.Contrac
 	}
 	wln(out)
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	// One row shape, assembled as cells and joined once, rather than a header literal and a
+	// row call per column set. The two-copy form was four places to edit for a new column,
+	// and the copies could drift so that the header and the rows disagreed on column count —
+	// which tabwriter renders as a silently misaligned table, not an error.
+	writeRow := func(cells []string) { wf(tw, "%s\n", strings.Join(cells, "\t")) }
+	header := []string{"ID", "TOOL", "CLASS", "REVIEW"}
 	if statuses != nil {
-		wf(tw, "ID\tTOOL\tCLASS\tREVIEW\tATTESTATION\tREF\n")
-	} else {
-		wf(tw, "ID\tTOOL\tCLASS\tREVIEW\tREF\n")
+		header = append(header, "ATTESTATION")
 	}
+	writeRow(append(header, "REF"))
+
 	var disputed int
 	for i := range contracts {
 		c := &contracts[i]
@@ -288,15 +310,15 @@ func writeContractCorpus(out io.Writer, dir string, contracts []registry.Contrac
 			// the answer for every call.
 			class = "by " + c.Effect.ByArgument.Argument
 		}
-		if statuses == nil {
-			wf(tw, "%s\t%s\t%s\t%s\t%s\n", c.ID, c.Tool, class, c.Attestation.Review, c.Ref())
-			continue
+		cells := []string{c.ID, c.Tool, class, c.Attestation.Review}
+		if statuses != nil {
+			st := statuses[c.ID]
+			if len(st.Disputed) > 0 {
+				disputed++
+			}
+			cells = append(cells, st.Summary())
 		}
-		st := statuses[c.ID]
-		if len(st.Disputed) > 0 {
-			disputed++
-		}
-		wf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", c.ID, c.Tool, class, c.Attestation.Review, st.Summary(), c.Ref())
+		writeRow(append(cells, c.Ref()))
 	}
 	// The write errors tabwriter can report are the same non-actionable stdout failures wf
 	// discards; the report is already emitted by the time this returns.

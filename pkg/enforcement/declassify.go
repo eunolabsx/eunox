@@ -56,17 +56,17 @@ func (d declassifyOutcome) handle(carriedLabels, labelsOut []string) *capability
 	return capability.NewDeclassification(pendingClear, d.Approver, d.ApprovalID, d.LedgerID != "")
 }
 
-// declassifyLedgerWindowSec bounds how long a burned single-use approval is remembered. It
-// is a REAL bound on the guarantee, not a storage detail, and it is stated in the same terms
-// sequenceHistoryWindowSec states its own: after this long with no further presentation of
-// that grant, the burn is gone and the grant is live again.
+// declassifyLedgerWindowSec bounds how long a burned single-use approval is remembered.
 //
-// Seven days is chosen against what the burn has to outlive — the TOKEN carrying the grant.
-// A control plane minting a short-lived token per approval (the practice the docs recommend
-// regardless) is orders of magnitude inside it; a deployment issuing week-long tokens with
-// standing single-use grants embedded is at the edge of what any local ledger can promise,
-// and shortening the token is the fix, not lengthening this.
-const declassifyLedgerWindowSec = 7 * 86400
+// It is capability.DeclassifyLedgerWindowSec rather than a number of its own, because the
+// window is only half of the guarantee and the other half is enforced at the TOKEN
+// boundary: a token whose remaining lifetime exceeds this window is refused outright
+// (capability.CheckDeclassifyApprovalLifetime). The burn is written no earlier than the
+// moment the token is presented, so a window this long always outlives a token admitted
+// under that bound — which is what makes "once" mean once unconditionally rather than
+// "once per seven days". Two numbers here would be a way for the boundary to admit a token
+// the ledger cannot remember.
+const declassifyLedgerWindowSec = capability.DeclassifyLedgerWindowSec
 
 // declassifyLedgerKey addresses ONE single-use grant's burn. The key is the route namespace
 // plus the grant's ledger id, and deliberately carries no session and no task:
@@ -84,7 +84,8 @@ const declassifyLedgerWindowSec = 7 * 86400
 // the approval this mechanism exists to make single-use. The counter's AdmitAll is the
 // codebase's ONE atomic admission primitive, and a counted bucket with a limit of 1 is
 // precisely "admit once, ever". The cost is that the counter is windowed — see
-// declassifyLedgerWindowSec, where that bound is stated rather than wished away.
+// declassifyLedgerWindowSec, and the token-boundary bound that keeps a grant from outliving
+// it.
 func (e *Engine) declassifyLedgerKey(ledgerID string) string {
 	return compositeCounterKey("declassify", e.counterKeyNamespace, ledgerID)
 }
