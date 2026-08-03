@@ -209,7 +209,14 @@ local now = tonumber(ARGV[1])
 local n = #KEYS
 local totals = {}
 local counts = {}
-local maxWeightedEntries = tonumber(ARGV[#ARGV])
+-- Positional, not ARGV[#ARGV]: with the trailing argument omitted, #ARGV lands on the
+-- last bucket's WEIGHT and would be read as a ceiling (a weight of 5 silently refusing
+-- every key holding 5 entries). Indexing past the per-bucket block yields nil instead, so
+-- a caller invoking this script directly without it fails closed and diagnosably.
+local maxWeightedEntries = tonumber(ARGV[2 + n*7])
+if maxWeightedEntries == nil then
+  return redis.error_reply('callcounter: admitAll requires the trailing weighted-entry ceiling argument')
+end
 local denied = 0
 
 local function entry_weight(m)

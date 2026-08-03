@@ -242,9 +242,6 @@ func (b *SurfaceBaseline) Observe(sessionID string, tools []ToolSurface, complet
 		}
 		sort.Strings(gone)
 		for _, name := range gone {
-			if s.reportedGone == nil {
-				s.reportedGone = make(map[string]struct{})
-			}
 			s.reportedGone[name] = struct{}{}
 			changes = append(changes, SurfaceChange{Tool: name, Kind: SurfaceRemoved})
 		}

@@ -5858,6 +5858,64 @@ func TestIdleReaper_ReclaimsASessionKilledElsewhere(t *testing.T) {
 	waitForSessions(t, proxy, 0)
 }
 
+// TestIdleReaper_SparesSessionsWhenTheKillStoreIsUnreachable is the counterpart to the
+// kill sweep above, and the reason it tests the DENIAL CODE rather than "CheckKill said
+// no". CheckKill fails closed on a kill-store fault too — KILL_SWITCH_ERROR, the right
+// answer for a request, which is denied now and served again when the store recovers
+// seconds later. Reaping on it would turn a transient Redis blip into every live session
+// on the instance losing its upstream and its stream, which no recovery undoes.
+func TestIdleReaper_SparesSessionsWhenTheKillStoreIsUnreachable(t *testing.T) {
+	fake := newFakeUpstream()
+	upSrv := httptest.NewServer(http.StripPrefix("/mcp", fake))
+	t.Cleanup(upSrv.Close)
+	sink, _ := newTempAuditSink(t)
+	ks := &unreachableKillSwitch{}
+	proxy := newHTTPProxy(httpProxyOptions{
+		UpstreamURL: upSrv.URL,
+		PDP: pdp.NewManifestPDP([]capability.Constraint{{Target: "tool:*", Actions: []string{"call"}}},
+			enforcement.New(), ks),
+		SessionIdleMs: 60000,
+		Sink:          sink,
+	})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/mcp", proxy.handleMCP)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	sid := initSession(t, srv)
+	if proxy.sessionCount() != 1 {
+		t.Fatalf("expected 1 session after init, got %d", proxy.sessionCount())
+	}
+	// The store goes down AFTER the session is established.
+	ks.down.Store(true)
+	// Precondition: the store really is faulting, so the check under test is reached.
+	if deny := proxy.getSession(sid).route.pdp.CheckKill(context.Background(), sid); deny == nil ||
+		deny.Denial == nil || deny.Denial.Code != capability.ErrCodeKillSwitchError {
+		t.Fatalf("precondition: want a KILL_SWITCH_ERROR denial, got %+v", deny)
+	}
+
+	proxy.reapOnce(time.Minute)
+	if proxy.sessionCount() != 1 {
+		t.Fatal("a kill-store fault must not reap live sessions; only an actual kill does")
+	}
+}
+
+// unreachableKillSwitch reports healthy until it is broken, then faults every read — the
+// shape a Redis outage takes mid-session. It has to be switchable because a faulting store
+// also (correctly) fails the session-creating initialize closed, so a session cannot be
+// established while it is down.
+type unreachableKillSwitch struct {
+	failingKillSwitch
+	down atomic.Bool
+}
+
+func (k *unreachableKillSwitch) ShouldBlock(context.Context, string, string) (bool, error) {
+	if k.down.Load() {
+		return false, errors.New("kill store unreachable")
+	}
+	return false, nil
+}
+
 // TestIdleReaper_SparesInitInProgressSession covers a session still
 // initializing — registered, no subscribers, stale lastActive while the startup
 // drift check blocks — must not be reaped. reapOnce skips it while initInProgress

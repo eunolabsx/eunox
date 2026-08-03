@@ -929,6 +929,15 @@ func (p *HTTPProxy) reapOnce(idle time.Duration) {
 	p.mu.RUnlock()
 	var stale []staleSession
 	for _, s := range snapshot {
+		// A session still initializing (handshake + synchronous drift check) is not
+		// eligible for reaping on ANY arm: it is registered but has no subscribers and a
+		// stale lastActive while the drift check blocks, which would otherwise read as
+		// idle — and tearing one down would race the establishment path's own teardown,
+		// which no reap arm does today. A session killed while it establishes is denied
+		// throughout and reclaimed by the next sweep.
+		if s.initInProgress.Load() {
+			continue
+		}
 		// A KILLED session is reaped whatever its idle state, because a kill this
 		// instance did not itself serve has nothing else that reclaims it. The local
 		// /control/kill path calls reapKilledSession inline, but a kill delivered through
@@ -949,12 +958,6 @@ func (p *HTTPProxy) reapOnce(idle time.Duration) {
 		// non-zero idle timeout — see the field's documentation.
 		if p.sessionKilled(s) {
 			stale = append(stale, staleSession{s: s, killed: true})
-			continue
-		}
-		// A session still initializing (handshake + synchronous drift check) is not
-		// eligible for IDLE reaping: it is registered but has no subscribers and a stale
-		// lastActive while the drift check blocks, which would otherwise read as idle.
-		if s.initInProgress.Load() {
 			continue
 		}
 		switch {
@@ -1033,11 +1036,23 @@ func (p *HTTPProxy) reapOnce(idle time.Duration) {
 	wg.Wait()
 }
 
-// sessionKilled reports whether the kill switch currently blocks this session — either
-// its own id or a global emergency stop. It is the reaper's read of the same authority
-// the request path consults, so a session the data plane is already denying is one the
-// reaper reclaims, however the kill arrived (locally through /control/kill, or through
-// Redis from another instance).
+// sessionKilled reports whether the kill switch currently names this session — its own
+// id, its agent, or a global emergency stop. It is the reaper's read of the same
+// authority the request path consults, so a session the data plane is already denying is
+// one the reaper reclaims, however the kill arrived (locally through /control/kill, or
+// through Redis from another instance).
+//
+// It answers ONLY on an actual kill. CheckKill also denies on a kill-store ERROR
+// (KILL_SWITCH_ERROR — the fail-closed answer to, say, a Redis blip under the default
+// posture), and that is the right answer for a REQUEST: deny now, serve again when the
+// store recovers, seconds later. It is the wrong answer HERE, because this sweep's
+// response is not a denial but a teardown — every live session on the instance would
+// lose its upstream and its stream over a store that was briefly unreachable, and no
+// recovery undoes that. A store fault is not evidence that anyone was killed.
+//
+// The session's own claims ride the check, so an AGENT-scoped kill reclaims its sessions
+// too: the store matches on (agent, session), and a background sweep has no request
+// context to take an agent id from. Same source the upstream-notification gate uses.
 //
 // A session assembled without a route or PDP (an in-package test literal) is never
 // killed: there is no authority to ask. That is not a security-gate fail-open — the
@@ -1047,7 +1062,12 @@ func (p *HTTPProxy) sessionKilled(s *httpSession) bool {
 	if s.route == nil || s.route.pdp == nil {
 		return false
 	}
-	return s.route.pdp.CheckKill(context.Background(), s.id) != nil
+	ctx := context.Background()
+	if s.claims != nil {
+		ctx = pdp.WithJWTClaims(ctx, s.claims)
+	}
+	deny := s.route.pdp.CheckKill(ctx, s.id)
+	return deny != nil && deny.Denial != nil && deny.Denial.Code == capability.ErrCodeKillSwitch
 }
 
 // hardReapEligible reports whether a session past the hard idle ceiling may be torn
