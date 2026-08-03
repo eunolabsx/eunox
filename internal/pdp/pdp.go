@@ -563,11 +563,17 @@ func (AlwaysAllowPDP) RecordObservedToolHashes(_ context.Context, result json.Ra
 // flow state to release.
 func (AlwaysAllowPDP) ReleaseSession(_ context.Context, _ string) {}
 
-// CommitDeclassified is a no-op: a wiretap PDP never authorizes a declassification, so no
-// decision it returns can carry a LabelsPendingClear for the transport to commit. It holds
-// no flow store either, so it clears nothing and says so.
-func (AlwaysAllowPDP) CommitDeclassified(_ context.Context, _ string, _ []string) ([]string, error) {
-	return nil, nil
+// CommitDeclassified never clears anything: a wiretap PDP holds no flow store and
+// authorizes no declassification, so no decision it returns can carry a LabelsPendingClear.
+//
+// Reaching it WITH labels therefore means some other layer authorized a clear this one
+// cannot perform, and that is reported as an error rather than as a silent empty result.
+// The two are different facts, and the caller writes a signed record from the difference: an
+// empty result means "the clear ran and moved nothing", which for a wiring fault would put
+// an ordinary allow on the tape for a policy whose sanitizing step never takes effect. The
+// old contract carried a `restored bool` for exactly this distinction.
+func (AlwaysAllowPDP) CommitDeclassified(_ context.Context, _ string, labels []string) ([]string, error) {
+	return nil, noFlowStateErr(labels, "audit-mode (wiretap) decision point")
 }
 
 // HardenRefusal returns the refusal unchanged: a wiretap PDP declares no pin, no ceiling
@@ -671,10 +677,25 @@ func (DenyAllPDP) RecordObservedToolHashes(_ context.Context, result json.RawMes
 // ReleaseSession is a no-op: the fail-closed default holds no per-session flow state.
 func (DenyAllPDP) ReleaseSession(_ context.Context, _ string) {}
 
-// CommitDeclassified is a no-op: the fail-closed default allows nothing, so no decision it
-// returns can authorize a clear. Same reporting rule as AlwaysAllowPDP's.
-func (DenyAllPDP) CommitDeclassified(_ context.Context, _ string, _ []string) ([]string, error) {
-	return nil, nil
+// CommitDeclassified never clears anything: the fail-closed default allows nothing, so no
+// decision it returns can authorize a clear. Same reporting rule as AlwaysAllowPDP's.
+func (DenyAllPDP) CommitDeclassified(_ context.Context, _ string, labels []string) ([]string, error) {
+	return nil, noFlowStateErr(labels, "deny-all (no policy) decision point")
+}
+
+// noFlowStateErr builds the fault a decision point returns when it is handed labels to clear
+// and holds no flow state to clear them from, or nil for the empty set (where "cleared
+// nothing" and "nothing to clear" are genuinely the same state).
+//
+// It exists so the several no-op implementations report identically. Each of them means the
+// same thing — the policy's sanitizing step will not take effect on this path — and a silent
+// empty result would make that indistinguishable from an approved clear whose labels the
+// anchor was not carrying, which is a routine, healthy outcome.
+func noFlowStateErr(labels []string, who string) error {
+	if len(labels) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s holds no flow-label state, so the approved declassification of %v cannot be applied (wiring fault, not a store failure)", who, labels)
 }
 
 // HardenRefusal returns the refusal unchanged: the "no policy" default declares no pin, no
@@ -1060,10 +1081,9 @@ func (p *ManifestPDP) CommitDeclassified(ctx context.Context, sessionID string, 
 	// interface, where the caller's `!= nil` check passes and the dereference below would
 	// panic a request goroutine after the upstream call has already run.
 	if p == nil || p.engine == nil {
-		// A PDP with no engine holds no flow store, so there was nothing to clear and
-		// nothing was cleared. Reporting an empty set is the truth, not a decline to paper
-		// over: the session is in the state the tape will describe.
-		return nil, nil
+		// A PDP with no engine holds no flow store, so the clear cannot happen. Reported as a
+		// fault, not as an empty result: see noFlowStateErr.
+		return nil, noFlowStateErr(labels, "manifest decision point with no engine")
 	}
 	// The claims come from the context so the request resolves to the SAME anchor the
 	// decision used; see the interface's context contract.

@@ -1779,7 +1779,7 @@ func validateSequenceBlock(i, j int, v *capability.SequenceBlockCondition) error
 // directiveValidator is the per-type validation one directive needs: its target
 // restriction and its own field checks. i/j are the capability and directive indices for the
 // error message, target/targetType the constraint's target, and dir the (non-nil,
-// non-typed-nil — validateCapabilities guarantees both before dispatch) directive itself.
+// non-typed-nil — validateLocalManifest guarantees both before dispatch) directive itself.
 type directiveValidator func(i, j int, target string, targetType capability.TargetType, dir capability.Directive) error
 
 // directiveValidators is the manifest loader's per-directive validation, keyed by the SAME
@@ -1882,13 +1882,17 @@ var baseGrammarTokens = map[string]bool{
 }
 
 // tokenGrammarVersions maps a condition/directive discriminator to the manifest
-// schemaVersion that INTRODUCED it. A token absent from this map is part of the base
-// published grammar ("0.1") and needs no gate. It is the single source of the
-// closed-grammar invariant across revisions: a token is inert unless the manifest
-// declares the revision that introduced it, so adding a future token is one map entry —
-// not a gate call threaded through each per-type validation case, which a contributor
-// could forget, silently admitting the token under an older revision (the fail-open this
-// gate exists to prevent).
+// schemaVersion that INTRODUCED it. It is one half of a TOTAL classification: a token
+// belongs here or in baseGrammarTokens, and one in neither is refused under every revision
+// (see checkTokenRevision). Absence used to mean "part of the base grammar", which is the
+// fail-OPEN reading — a token a contributor forgot to classify was silently admitted under
+// "0.1", on the one gate whose whole job is stopping a later revision's predicate from
+// widening an earlier one.
+//
+// It is the single source of the closed-grammar invariant across revisions: a token is
+// inert unless the manifest declares the revision that introduced it, so adding a future
+// token is one map entry — not a gate call threaded through each per-type validation case,
+// which a contributor could forget.
 //
 // A token requires its EXACT introducing version. That is deliberately not "this version
 // or later": there are two published revisions, so "later" has no members yet, and

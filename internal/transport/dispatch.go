@@ -755,8 +755,8 @@ func dispatchList(ctx context.Context, d dispatchParams, msg mcp.RPCMsg, filter 
 	// denial target) all collapse to the method name here: a */list request
 	// addresses no sub-target, so the method IS the target. The repetition is
 	// intentional.
-	// nil onBlocked: a */list is never an enforced decision, so it can carry no
-	// declassification for a gate block to undo.
+	// nil extra: a */list is never an enforced decision, so it can carry no
+	// declassification for a gate block to report.
 	if denied, blocked := d.strictAuditDenial(ctx, msg, msg.Method, msg.Method, msg.Method, nil); blocked {
 		return denied
 	}

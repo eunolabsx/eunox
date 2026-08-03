@@ -272,7 +272,7 @@ func (p *HTTPProxy) initStrictAuditDenial(ctx context.Context, route *UpstreamRo
 	}
 	// initialize addresses no sub-target, so the audit id, method, and denial
 	// target all collapse to "initialize" (see dispatchList for the same pattern).
-	// nil onBlocked: no session and no decision exist yet on a session-creating
+	// nil extra: no session and no decision exist yet on a session-creating
 	// initialize, so nothing can have cleared a flow label.
 	return fp.strictAuditDenial(ctx, msg, mcp.MethodInitialize, mcp.MethodInitialize, mcp.MethodInitialize, nil)
 }

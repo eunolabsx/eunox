@@ -429,15 +429,18 @@ func intersectLabels(want, held []string) []string {
 // SourceCommitError classifies which leg of the atomic source-call commit
 // (recordSourceCall) faulted, so the caller builds the matching fail-closed deny: a
 // flow-label write fault (Flow=true) is a HARD deny (labelRecordFailureDenial /
-// hardDenyResponse — an unlabeled forward would fail a later sink open), a declassify
-// clear fault (Declassify=true, which also sets Flow) is a HARD deny via
-// declassifyRecordFailureDenial, and a sequenceBlock antecedent write fault (both false)
-// denies via recordFailureDenial.
+// hardDenyResponse — an unlabeled forward would fail a later sink open), a declassify leg
+// fault (Declassify=true) is a HARD deny via declassifyRecordFailureDenial, and a
+// sequenceBlock antecedent write fault (both false) denies via recordFailureDenial.
 //
-// Declassify is a separate flag rather than a third value of one enum because both
-// label-write legs are flow faults and both must hard-deny; only the message differs. A
-// caller that checks Flow alone (the audit-mode antecedent path, which never declassifies)
-// therefore stays correct without knowing about the third leg.
+// The declassify leg's fault is a BURN fault, not a clear fault: the clear is the caller's
+// second phase and does not run inside this commit at all, so what can fail here is the
+// ledger admission that spends a single-use grant — a CallCounter write, not a
+// FlowLabelStore one. It sets Flow too, so a caller that checks Flow alone (the audit-mode
+// antecedent path, which never declassifies) still routes it to a hard deny without knowing
+// about the third leg; Declassify is checked first, so the two never disagree about which
+// denial to build. An operator reading Flow off this should look at the flow store only when
+// Declassify is unset.
 type SourceCommitError struct {
 	Err        error
 	Flow       bool

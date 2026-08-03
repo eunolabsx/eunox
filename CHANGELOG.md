@@ -573,6 +573,38 @@ Section conventions:
 
 ### Removed
 
+- **The declassification undo, and the three `details` keys it wrote.**
+  `PolicyDecisionPoint.RestoreDeclassified`, `Engine.RestoreDeclassifiedLabels` and the
+  transport's compensating restore are deleted: with the clear deferred until after the call
+  succeeds, a refusal below the decision never removed a label, so there is nothing to put
+  back. `details.declassify_reverted`, `details.declassify_orphaned` and
+  `details.declassify_approval_id` are gone with them.
+  **Migration:** SIEM rules and dashboards keyed on those three keys move to
+  `_eunox_declassify_not_applied` (an approved clear that never ran — benign),
+  `_eunox_declassify_commit_failed` (the call succeeded and the clear did not — **this is the
+  alert**, replacing `declassify_orphaned`), and `_eunox_declassify_spent_approval_id` (a
+  single-use grant this call burned, replacing `declassify_approval_id` and now stamped on
+  the allow as well). `eunox stats` counts all three.
+
+- **`EnforceResponse.LabelsCleared`, replaced by `LabelsPendingClear`.** The decision no
+  longer reports what it cleared, because it no longer clears: it reports what the caller is
+  authorized to clear, already intersected against what the anchor was carrying.
+  **Migration:** embedders of `pkg/enforcement` read `LabelsPendingClear` and call
+  `Engine.CommitDeclassification` with that set verbatim once the action has SUCCEEDED; what
+  it returns is what the audit record's `labels_cleared` should carry. A caller that skips
+  the commit never clears a label — fail-closed, and visible as a session that keeps
+  over-blocking. Implementers of `pdp.PolicyDecisionPoint` rename `RestoreDeclassified` to
+  `CommitDeclassified` (`(cleared []string, err error)`); an implementation that holds no
+  flow state must return an ERROR rather than an empty set, so a broken chain is not mistaken
+  for a clear that legitimately moved nothing.
+
+- **The single-key nested-collision wrapper for reserved detail keys.** A caller argument
+  named `_eunox_upstream_error_code` used to produce `{"arguments": {…}, "_eunox_…": …}` — a
+  shape indistinguishable from a tool genuinely called with an argument named `arguments`,
+  which `eunox suggest` had to disambiguate heuristically. Every reserved-namespace argument
+  is now quarantined under `_eunox_reserved_arguments` instead.
+  **Migration:** consumers resolving the old nested shape read the new holder key.
+
 - **The pre-HMAC ("legacy tail") audit compatibility path is gone.** An unsigned
   record is never resumed onto and never exempted from verification: the writer
   treats an unsigned tail exactly like an unparseable one (restart the chain from

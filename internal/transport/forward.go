@@ -333,13 +333,17 @@ type declassifyCommitter interface {
 	CommitDeclassified(ctx context.Context, sessionID string, labels []string) ([]string, error)
 }
 
-// declassifyCommitTimeout bounds the flow-store write commitDeclassify makes after the
-// upstream call has returned, when the request's own context may no longer be usable. It is
-// a single store round-trip on a path that is already holding a response for the host, so it
-// wants a bound short enough not to stall that response and long enough to survive an
-// ordinary backend hiccup — the alternative to completing it is a session that stays tainted
-// after the action that was authorized to sanitize it.
-const declassifyCommitTimeout = 5 * time.Second
+// declassifyCommitTimeout bounds the single flow-store write commitDeclassify makes after
+// the upstream call has returned.
+//
+// It sits on the host's response path AND under the per-session decision turn, which a
+// declassifying call holds until its commit lands — so an exhausted bound stalls that
+// response and every other decision on the session for its full length. That is why it is
+// shorter than a bound chosen for a background write would be: long enough to ride out an
+// ordinary backend hiccup, short enough that a wedged flow store degrades a session's
+// latency rather than its availability. Failing it is not a refusal — the label simply stays
+// and a later sink over-blocks — so waiting longer buys little and costs the whole session.
+const declassifyCommitTimeout = 2 * time.Second
 
 // strictAuditState is the --require-audit=strict configuration shared by the
 // host-facing forward path (forwardParams) and the server-initiated sampling path
@@ -657,18 +661,18 @@ func mergeAuditDetails(base, extra map[string]interface{}) map[string]interface{
 // unaudited privileged call reaches the upstream. Only the forward path needs
 // gating; a hard deny already returns without contacting the upstream.
 //
-// onBlocked, when non-nil, runs ONLY on the blocking path and contributes extra fields to
-// the deny record. It is a closure rather than a plain map because its caller's version has
-// a side effect — undoing a declassification the decision already committed — that must not
-// happen on the far more common path where the gate does not trip.
-func (fp forwardParams) strictAuditDenial(ctx context.Context, msg mcp.RPCMsg, auditID, method, denialTarget string, onBlocked func() map[string]interface{}) (mcp.RPCMsg, bool) {
+// extra contributes additional fields to the deny record this gate writes, and is merged
+// only when the gate actually trips. It is a plain map rather than a callback: the caller's
+// version used to have a SIDE EFFECT — undoing a declassification the decision had already
+// committed — which had to be withheld from the far more common non-blocking path, and the
+// closure existed for that. Nothing below the decision mutates state any more, so the
+// indirection would now only suggest to the next reader that this gate writes flow state.
+func (fp forwardParams) strictAuditDenial(ctx context.Context, msg mcp.RPCMsg, auditID, method, denialTarget string, extra map[string]interface{}) (mcp.RPCMsg, bool) {
 	tripped, reason, detail := auditGateTripped(fp.rec, fp.requireAuditStrict)
 	if !tripped {
 		return mcp.RPCMsg{}, false
 	}
-	if onBlocked != nil {
-		detail = mergeAuditDetails(detail, onBlocked())
-	}
+	detail = mergeAuditDetails(detail, extra)
 	// detail carries discrete counts (dropped_count/write_failure_count); the prose
 	// reason is for the host-facing error and the stderr warning only, never the
 	// structured audit field.
@@ -768,18 +772,20 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 	// sanitizing action never runs — so the clear is simply never committed, and the record
 	// says that an approved declassification did not take effect and names the single-use
 	// grant it spent (see declassifyRefusalDetail).
-	if denied, blocked := fp.strictAuditDenial(ctx, msg, auditID, method, denialTarget, func() map[string]interface{} {
-		return fp.declassifyRefusalDetail(dec)
-	}); blocked {
+	if denied, blocked := fp.strictAuditDenial(ctx, msg, auditID, method, denialTarget, fp.declassifyRefusalDetail(dec)); blocked {
 		return denied
 	}
 
 	// Gate passed: record the observed (audit_only=true) deny and log the downgrade.
 	// denial was set on the deny path above (observe is only true there), so non-nil.
 	if observe {
+		// The same declassify merge the hard-deny arm makes, for the same structural reason:
+		// this was the one exit below the decision that could not report a spent grant, and
+		// "no exit is silent" is only an invariant if it holds at every one of them.
+		observeDetail := mergeAuditDetails(denial.Details, fp.declassifyRefusalDetail(dec))
 		warnIfStrictAuditJustDegraded(fp.requireAuditStrict, fp.rec, kind, denialTarget, func() {
 			if fp.rec != nil {
-				fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, denial.Code, denial.ConditionType, denial.Details, true)
+				fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, denial.Code, denial.ConditionType, observeDetail, true)
 			}
 		})
 		fmt.Fprintf(os.Stderr,
@@ -889,7 +895,12 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 	// A no-op for every call in a deployment with no declassify directive.
 	var labelsCleared []string
 	var declDetail map[string]interface{}
-	if declassifyCommitted(upResp) {
+	// dec.Decision, not just the pending set: the observe path forwards a call whose verdict
+	// was a DENY, and a downgraded deny must never untaint a session — the same rule
+	// RecordSourceCall states for the audit-mode antecedent write. In-tree a deny carries no
+	// LabelsPendingClear, so this is defense in depth against a PDP that stamps one; the cost
+	// is a field comparison on the one path that already resolved the decision.
+	if dec.Decision == capability.DecisionAllow && declassifyCommitted(upResp) {
 		labelsCleared, declDetail = fp.commitDeclassify(ctx, dec, kind, denialTarget)
 	} else {
 		declDetail = fp.declassifyRefusalDetail(dec)
