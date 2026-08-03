@@ -21,9 +21,17 @@
 //
 // Declaring the dependency on the registry entry removes that. The registry is the one place a
 // token can be added at all, an entry declaring nothing is UNCLASSIFIED, and every consumer
-// treats unclassified as "depends on every subsystem" — the skip is an optimization, so failing
-// closed costs a per-call scan and nothing else. The completeness test in grammar_test.go fails
-// the build when an entry declares none.
+// treats unclassified as "depends on every subsystem". The completeness test in
+// subsystem_test.go fails the build when an entry declares none.
+//
+// Over-declaring is not free, and the cost differs by subsystem — stated here rather than
+// waved at as "just an optimization". Keeping the flow path wired costs a per-call relevance
+// scan that short-circuits on a constraint carrying no flow token. Keeping antecedent
+// recording wired costs a counter round-trip per call AND re-arms its fail-closed deny path,
+// so a policy that would otherwise have skipped it can now be denied by a counter-write fault.
+// Both of those are availability and latency, never authority: neither direction can widen
+// what a manifest permits. Under-declaring can, which is why the unclassified default is to
+// declare everything.
 //
 // The rule for setting it, stated once: ask which engine facility the token's HANDLER reads or
 // writes. Nothing beyond the request, the clock, the call counter and its own configuration is
@@ -99,23 +107,32 @@ func validSubsystemDeclaration(uses []EngineSubsystem) bool {
 // as "depends on every subsystem" — see TokenUsesEngineSubsystem, which applies that rule so
 // each consumer does not have to.
 func TokenEngineSubsystems(token string) ([]EngineSubsystem, bool) {
+	uses, ok := tokenSubsystems(token)
+	return slices.Clone(uses), ok
+}
+
+// tokenSubsystems is TokenEngineSubsystems without the defensive copy, for the in-package
+// predicate below. The exported form clones because its caller receives the registry's own
+// backing array (several entries share one), and a caller that reordered it would reorder what
+// the gates read.
+func tokenSubsystems(token string) ([]EngineSubsystem, bool) {
 	if spec, ok := conditionPrototypes[token]; ok {
-		return slices.Clone(spec.Uses), validSubsystemDeclaration(spec.Uses)
+		return spec.Uses, validSubsystemDeclaration(spec.Uses)
 	}
 	if spec, ok := directivePrototypes[token]; ok {
-		return slices.Clone(spec.Uses), validSubsystemDeclaration(spec.Uses)
+		return spec.Uses, validSubsystemDeclaration(spec.Uses)
 	}
 	return nil, false
 }
 
 // TokenUsesEngineSubsystem reports whether the named token's enforcement depends on s.
 //
-// An UNCLASSIFIED token reports true for every subsystem. That is the fail-closed direction
-// and it is cheap: the two gates it feeds are optimizations, so over-reporting builds an
-// engine that does slightly more work per call, while under-reporting runs a handler against a
-// facility that was never wired.
+// An UNCLASSIFIED token reports true for every subsystem — the fail-closed direction: an
+// over-reported subsystem stays wired and costs work per call, while an under-reported one
+// runs a handler against a facility that was never wired. See the file comment for what each
+// direction actually costs.
 func TokenUsesEngineSubsystem(token string, s EngineSubsystem) bool {
-	uses, ok := TokenEngineSubsystems(token)
+	uses, ok := tokenSubsystems(token)
 	if !ok {
 		return true
 	}

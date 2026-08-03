@@ -237,8 +237,10 @@ rules:
   recorded; `SubsystemFlowLabels` when it reads or writes the flow-label set.
   The route builder skips a facility no token needs
   (`WithoutAntecedentRecording`, `WithoutFlowLabels`), so a token that declares
-  nothing is treated as depending on all of them — the skip is an optimization,
-  and failing closed there costs a per-call scan and nothing else. Declare
+  nothing is treated as depending on all of them. Over-declaring costs work per
+  call — a relevance scan for the flow gate, a counter round-trip and its
+  fail-closed deny path for the antecedent one — and never authority; only
+  under-declaring can leave a handler reading a facility nothing wired. Declare
   every subsystem for a token whose enforcement is supplied from outside this
   build (`policy`, `custom`): what an embedder's evaluator reads is not
   knowable here.

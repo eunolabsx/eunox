@@ -562,7 +562,7 @@ func TestEnforcedForwardCore_CommitsWithTheDecidingPDP(t *testing.T) {
 			if params == "" || committer == "" || params != committer {
 				t.Errorf("%s: enforcedForwardCore must be handed the decision point that MADE the decision "+
 					"(pass d.forwardParams and d.pdp for the same d); got %s and %s",
-					name, exprText(call.Args[1]), exprText(call.Args[2]))
+					name, exprText(fset, call.Args[1]), exprText(fset, call.Args[2]))
 			}
 			return true
 		})
@@ -585,10 +585,11 @@ func receiverOf(e ast.Expr, field string) string {
 	return ident.Name
 }
 
-// exprText renders an expression for a failure message.
-func exprText(e ast.Expr) string {
+// exprText renders an expression for a failure message, through the fileset it was parsed
+// with so positions resolve.
+func exprText(fset *token.FileSet, e ast.Expr) string {
 	var b strings.Builder
-	if err := printer.Fprint(&b, token.NewFileSet(), e); err != nil {
+	if err := printer.Fprint(&b, fset, e); err != nil {
 		return "<unprintable>"
 	}
 	return b.String()

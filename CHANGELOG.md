@@ -247,8 +247,10 @@ Section conventions:
   added later that READ the flow-label set would report "no flow token", have the flow path
   skipped out from under it, and most plausibly read an empty set: a fail-open arriving
   through the gate rather than through the decision turn. A token that declares nothing is
-  treated as depending on every subsystem, which costs a per-call scan and nothing else, and
-  the build fails until it declares one. No manifest, schema or audit shape changed, and no
+  treated as depending on every subsystem: over-declaring costs work per call — a relevance
+  scan for the flow gate, a counter round-trip and its fail-closed deny path for the antecedent
+  one — and never authority, while only under-declaring can leave a handler reading a facility
+  nothing wired. The build fails until a token declares one. No manifest, schema or audit shape changed, and no
   policy's allow/deny outcome changes.
 
 - **BREAKING (pre-1.0): `enforcedForwardCore` takes the declassification committer as a
