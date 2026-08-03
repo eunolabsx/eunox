@@ -77,6 +77,11 @@ type InMemory struct {
 	// -- not logical keys; 0 (the default) leaves it unbounded. See WithMaxKeys and
 	// admitNewKey.
 	maxKeys int
+	// maxWeightedEntries bounds the live entries ONE storage entry may hold under
+	// weighted accounting. Defaults to MaxWeightedEntriesPerKey; the option that
+	// lowers it is test-only, because this is a package invariant both backends
+	// enforce identically rather than an operator knob.
+	maxWeightedEntries int
 
 	// cleanupMu guards the cleanup-goroutine lifecycle state below. It replaces a
 	// plain atomic flag released on goroutine exit, under which "flag set" meant both
@@ -124,6 +129,17 @@ func WithMaxKeys(n int) InMemoryOption {
 	}
 }
 
+// withMaxWeightedEntries lowers the per-key weighted retention ceiling from
+// MaxWeightedEntriesPerKey. Unexported on purpose: the ceiling is a package invariant
+// both backends enforce identically, not an operator knob, and an operator who could
+// raise it would re-open the growth it exists to bound. Tests use it to reach the
+// ceiling without writing 100k entries.
+func withMaxWeightedEntries(n int) InMemoryOption {
+	return func(m *InMemory) {
+		m.maxWeightedEntries = n
+	}
+}
+
 // NewInMemory creates an in-memory sliding-window call counter.
 //
 // The entry set is unbounded by default: every distinct (session, tool, window)
@@ -134,13 +150,18 @@ func WithMaxKeys(n int) InMemoryOption {
 // such deployments prefer the Redis backend (per-key TTL, off-heap) or pass
 // WithMaxKeys to bound the count.
 //
-// Quota size is a second, orthogonal heap concern: a counted bucket retains up to its
-// limit in timestamps per (key, window) — the admission has no separate retention cap, the
-// bound IS the quota — so a large maxCalls.count also favours Redis.
+// Quota size is a second, orthogonal heap concern, and the two accountings differ. A
+// COUNTED bucket retains up to its limit in timestamps per (key, window) — no separate
+// retention cap, the bound IS the quota — so a large maxCalls.count favours Redis. A
+// WEIGHTED bucket has no such implicit bound: its total is the sum of caller-supplied
+// magnitudes, so arbitrarily many sub-threshold entries fit under one limit. That set
+// is bounded by MaxWeightedEntriesPerKey instead, which refuses the commit rather than
+// growing the key (and the per-admission re-sum) without limit.
 func NewInMemory(opts ...InMemoryOption) *InMemory {
 	m := &InMemory{
-		entries: make(map[string]*entry),
-		now:     time.Now,
+		entries:            make(map[string]*entry),
+		now:                time.Now,
+		maxWeightedEntries: MaxWeightedEntriesPerKey,
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -166,6 +187,14 @@ func (m *InMemory) admitNewKey() error {
 // the same refusal for a caller to have to match on.
 func (m *InMemory) errEntryLimit() error {
 	return fmt.Errorf("callcounter: entry limit reached (%d)", m.maxKeys)
+}
+
+// errWeightedEntryLimit is the per-key counterpart of errEntryLimit: the map has room,
+// but ONE weighted (key, window) is holding as many live entries as it may. It names
+// neither the key nor the session — an error reaches an operator through a denial
+// message, and the key embeds identifiers the audit record carries in structured fields.
+func (m *InMemory) errWeightedEntryLimit() error {
+	return fmt.Errorf("callcounter: weighted entry limit reached (%d entries in one window)", m.maxWeightedEntries)
 }
 
 // IncrementAndGet records a call and returns the number of calls within the
@@ -406,13 +435,21 @@ func (m *InMemory) AdmitAll(_ context.Context, buckets []capability.QuotaBucket)
 	// above fails the call closed if a caller passes colliding buckets, so the storage keys
 	// within a committed batch never collide.
 	type bucketState struct {
+		// b is the bucket this state belongs to. Held here rather than re-indexed as
+		// buckets[i] at each later loop: states is built one-per-bucket, so carrying the
+		// pointer keeps the two from being re-associated by index three more times.
+		b        *capability.QuotaBucket
 		sk       string
 		e        *entry // nil until the bucket's first admitted call
 		valid    []time.Time
 		weights  []float64
-		weighted bool
+		weighted bool // this key already carries per-entry weights
 		window   time.Duration
 		cur      float64
+		// Filled in by the commit pre-pass, once every bucket is known to have headroom.
+		post          float64
+		record        bool // this bucket's call moves the total, so it is written
+		writeWeighted bool // the write carries weights (this key, or this bucket, is weighted)
 	}
 	states := make([]bucketState, len(buckets))
 	blocked := -1
@@ -420,7 +457,7 @@ func (m *InMemory) AdmitAll(_ context.Context, buckets []capability.QuotaBucket)
 		b := &buckets[i]
 		window := time.Duration(b.WindowSec) * time.Second
 		cutoff := now.Add(-window)
-		st := bucketState{sk: storageKey(b.Key, b.WindowSec), window: window}
+		st := bucketState{b: b, sk: storageKey(b.Key, b.WindowSec), window: window}
 		if e, ok := m.entries[st.sk]; ok {
 			// Prune expired entries and write back now: idempotent maintenance the
 			// single-key paths also do on every call, so doing it before the admit decision
@@ -443,55 +480,76 @@ func (m *InMemory) AdmitAll(_ context.Context, buckets []capability.QuotaBucket)
 		// At least one bucket is full: record nothing new (each existing entry was already
 		// pruned above) and report the blocking bucket with the same retry-after estimate
 		// its single-bucket sibling gives.
-		b, st := &buckets[blocked], states[blocked]
-		return false, blocked, st.cur, bucketRetryAfter(b, st.valid, st.weights, st.cur, st.window, now), nil
+		st := states[blocked]
+		return false, blocked, st.cur, bucketRetryAfter(st.b, st.valid, st.weights, st.cur, st.window, now), nil
 	}
 
-	// Every bucket has headroom → commit all of them. Pre-check the entry cap against the
-	// number of absent buckets so the batch is all-or-nothing against maxKeys too.
+	// Every bucket has headroom → commit all of them. Resolve ONCE what each bucket would
+	// do — its post-admission total, whether that total moves at all, and whether the
+	// write is weighted — so the two entry ceilings below and the commit loop after them
+	// cannot disagree about which buckets write.
+	var maxTotal float64
 	newKeys := 0
 	for i := range states {
-		if states[i].e == nil {
-			newKeys++
-		}
-	}
-	if m.maxKeys > 0 && len(m.entries)+newKeys > m.maxKeys {
-		return false, 0, 0, 0, m.errEntryLimit()
-	}
-	var maxTotal float64
-	for i := range states {
-		b := &buckets[i]
-		e := states[i].e
-		if e == nil {
-			e = &entry{windowSec: b.WindowSec}
-			m.entries[states[i].sk] = e
-			states[i].e = e
-		}
-		post := states[i].cur + bucketWeight(b)
+		st := &states[i]
+		st.post = st.cur + bucketWeight(st.b)
 		// A weight that cannot move the total is admitted WITHOUT being recorded: it can
-		// never affect a future decision, and recording it is the one case that would grow a
-		// key without bound.
-		if post != states[i].cur {
-			weighted := states[i].weighted || !b.Counted
-			ts, weights := e.timestamps, e.weights
-			if weighted && len(weights) != len(ts) {
-				// This key is weighted from here on, whether or not it was before: a key
-				// that had only counted calls has an implicit weight of 1 for each, which
-				// materializing now makes explicit so later prunes and sums stay exact.
-				weights = make([]float64, len(ts))
-				for j := range weights {
-					weights[j] = 1
-				}
-			}
-			ts, weights = appendCall(ts, weights, now, bucketWeight(b), weighted)
-			storeEntry(e, ts, weights, weighted)
+		// never affect a future decision, and recording it is the one case that would grow
+		// a key without bound.
+		st.record = st.post != st.cur
+		// This key is weighted from here on if it was before OR this bucket is weighted.
+		st.writeWeighted = st.weighted || !st.b.Counted
+		if st.record && st.e == nil {
+			// Counted only for a bucket that will actually WRITE. A zero-weight call on an
+			// unseen key records nothing, so charging it against maxKeys (and denying on a
+			// full map) would create a phantom the Redis backend never creates.
+			newKeys++
 		}
 		// Report the max post-admission total across buckets (no single binding bucket on
 		// the admit path) per the capability.CallCounter contract — the bucket closest to
 		// its limit, the most useful figure for the caller.
-		if post > maxTotal {
-			maxTotal = post
+		if st.post > maxTotal {
+			maxTotal = st.post
 		}
+	}
+
+	// Both entry ceilings are checked against the WHOLE batch before any bucket is
+	// written, so the commit stays all-or-nothing against them the way it is against the
+	// quota itself. maxKeys bounds the map; maxWeightedEntries bounds one weighted key,
+	// whose entry count its own limit does not bound (see MaxWeightedEntriesPerKey).
+	if m.maxKeys > 0 && len(m.entries)+newKeys > m.maxKeys {
+		return false, 0, 0, 0, m.errEntryLimit()
+	}
+	for i := range states {
+		st := &states[i]
+		if st.record && st.writeWeighted && m.maxWeightedEntries > 0 &&
+			len(st.valid) >= m.maxWeightedEntries {
+			return false, 0, 0, 0, m.errWeightedEntryLimit()
+		}
+	}
+
+	for i := range states {
+		st := &states[i]
+		if !st.record {
+			continue
+		}
+		e := st.e
+		if e == nil {
+			e = &entry{windowSec: st.b.WindowSec}
+			m.entries[st.sk] = e
+			st.e = e
+		}
+		ts, weights := e.timestamps, e.weights
+		if st.writeWeighted && len(weights) != len(ts) {
+			// A key that had only counted calls has an implicit weight of 1 for each,
+			// which materializing now makes explicit so later prunes and sums stay exact.
+			weights = make([]float64, len(ts))
+			for j := range weights {
+				weights[j] = 1
+			}
+		}
+		ts, weights = appendCall(ts, weights, now, bucketWeight(st.b), st.writeWeighted)
+		storeEntry(e, ts, weights, st.writeWeighted)
 	}
 	return true, 0, maxTotal, 0, nil
 }
@@ -526,9 +584,13 @@ func bucketTotal(counted bool, ts []time.Time, weights []float64) float64 {
 // full window.
 func bucketRetryAfter(b *capability.QuotaBucket, valid []time.Time, weights []float64, cur float64, window time.Duration, now time.Time) time.Duration {
 	needed := cur + bucketWeight(b) - b.Limit
-	if b.Counted && len(weights) != len(valid) {
-		// Pure counting: the last entry that must age out is at index cur-limit in
-		// oldest-first order, which retryAfterFromPivot reads directly rather than walking.
+	if b.Counted {
+		// Counting: the last entry that must age out is at index cur-limit in oldest-first
+		// order, which retryAfterFromPivot reads directly rather than walking. This does
+		// NOT depend on whether the key also carries weights — cur is a COUNT for a
+		// counted bucket, so measuring `needed` in calls and `freed` in weight would give
+		// a hint in mismatched units on exactly the mixed key where the two differ. Redis
+		// always takes the rank pivot for a counted bucket; this is that same rule.
 		return retryAfterFromPivot(valid, int64(cur), int64(b.Limit), window, now)
 	}
 	if len(weights) != len(valid) {

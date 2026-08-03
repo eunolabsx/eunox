@@ -71,12 +71,22 @@ Tier-2 closes the two gaps `descriptionHash` leaves:
   new tool is still gated by the manifest allowlist, so an appearance or disappearance is
   logged, not denied. An added tool is baselined on sight, so a later change to *it* is a
   break like any other; a removed tool's baseline is **retained**, so a tool that
-  disappears and returns with a rewritten surface still breaks.
+  disappears and returns with a rewritten surface still breaks. A removal is reported once
+  per disappearance, on the transition — not on every later listing that keeps omitting it.
 - **Untrustworthy bytes fail closed.** A `tools/list` entry the proxy cannot trust to
   decode to what a host renders (a duplicate or case-variant key) cannot be baselined, so
   every name it could be presenting is broken. An entry whose bytes aborted the trust scan
   — leaving the names it could impersonate unknown rather than none — and an unreadable
-  envelope or `tools` array break every tool the session had baselined.
+  envelope or `tools` array break the **whole session**: every tool, baselined or not, now
+  or later. Not merely those already baselined, which on a session's *first* listing is
+  none of them — that reading broke nothing at all and left the same response's remaining
+  entries callable.
+- **The baseline is bounded.** A session pins at most 100,000 distinct tool names. Tier-2
+  pins every advertised tool and keeps a removed one's baseline, so the set is
+  upstream-driven; past the bound the session is broken **whole**, with one `ERROR
+  drift=tier2` line. Dropping entries instead would silently *un-pin* tools, and evicting
+  the oldest would let an upstream choose which pin to evict. No real catalog approaches
+  it: an upstream rotating 100k names within one session is itself the anomaly.
 - **Findings are logged.** Each finding emits one structured stderr line
   (`[eunox] ERROR drift=tier2 tool="..." — ...`), matching the shape `internal/drift`
   emits for FM-1..FM-6 so an operator greps interface findings uniformly.

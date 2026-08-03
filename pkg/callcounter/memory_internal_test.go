@@ -11,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/eunolabs/eunox/pkg/capability"
 )
 
 // TestMaxWindowSeconds_BoundaryDoesNotOverflow pins the security bound to the
@@ -1193,5 +1195,120 @@ func waitForEntryCount(m *InMemory, want int) int {
 			return n
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// weightedCeilingBucket is the shape the ceiling exists for: a magnitude far too small to
+// move a large total, which admits every time and is recorded every time.
+func weightedCeilingBucket() capability.QuotaBucket {
+	return capability.QuotaBucket{Key: "sess|tool:charge", WindowSec: 60, Weight: 1e-9, Limit: 1000}
+}
+
+// TestAdmitAll_WeightedEntryCeilingRefusesRatherThanGrowing pins MaxWeightedEntriesPerKey.
+// A counted bucket's limit bounds its entry count; a weighted one's does not, so a caller
+// driving a tiny caller-controlled magnitude stays admitted while the entry slice grows
+// without bound — and every later admission re-sums it under this backend's global lock.
+// The ceiling must REFUSE the commit (a structured error the engine denies on), never
+// silently skip recording: N unrecorded near-threshold magnitudes are unmetered spend.
+func TestAdmitAll_WeightedEntryCeilingRefusesRatherThanGrowing(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(1_700_000_000, 0)
+	m := NewInMemory(WithTimeFunc(func() time.Time { return now }), withMaxWeightedEntries(3))
+	b := weightedCeilingBucket()
+
+	for i := 1; i <= 3; i++ {
+		admitted, _, _, _, err := m.AdmitAll(ctx, []capability.QuotaBucket{b})
+		if err != nil || !admitted {
+			t.Fatalf("call %d under the ceiling: admitted=%v err=%v, want true/nil", i, admitted, err)
+		}
+	}
+
+	admitted, _, _, _, err := m.AdmitAll(ctx, []capability.QuotaBucket{b})
+	if err == nil {
+		t.Fatal("the call past the ceiling must fail closed with an error, got nil")
+	}
+	if !strings.Contains(err.Error(), "weighted entry limit") {
+		t.Errorf("error = %q, want it to name the weighted entry limit", err)
+	}
+	if admitted {
+		t.Error("admitted = true past the ceiling, want false")
+	}
+	// The refused commit wrote nothing: the ceiling is all-or-nothing like every other
+	// refusal on this path.
+	if got := len(m.entries[storageKey(b.Key, b.WindowSec)].timestamps); got != 3 {
+		t.Errorf("entries after the refusal = %d, want 3", got)
+	}
+
+	// Availability, not a permanent wedge: the entries age out of the window on their own.
+	now = now.Add(time.Duration(b.WindowSec+1) * time.Second)
+	if admitted, _, _, _, err := m.AdmitAll(ctx, []capability.QuotaBucket{b}); err != nil || !admitted {
+		t.Fatalf("after the window aged out: admitted=%v err=%v, want true/nil", admitted, err)
+	}
+}
+
+// TestAdmitAll_WeightedCeilingDoesNotBindACountedBucket pins the ceiling's scope. A
+// counted bucket retains at most `limit` entries — its limit IS its retention — so
+// applying the weighted ceiling to it would cap maxCalls at a bound no operator wrote.
+func TestAdmitAll_WeightedCeilingDoesNotBindACountedBucket(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(1_700_000_000, 0)
+	m := NewInMemory(WithTimeFunc(func() time.Time { return now }), withMaxWeightedEntries(2))
+	b := capability.QuotaBucket{Key: "sess|tool:read", WindowSec: 60, Counted: true, Limit: 5}
+	for i := 1; i <= 5; i++ {
+		admitted, _, _, _, err := m.AdmitAll(ctx, []capability.QuotaBucket{b})
+		if err != nil || !admitted {
+			t.Fatalf("counted call %d: admitted=%v err=%v, want true/nil", i, admitted, err)
+		}
+	}
+	// The sixth is refused by the QUOTA, not by an error.
+	admitted, _, _, _, err := m.AdmitAll(ctx, []capability.QuotaBucket{b})
+	if err != nil || admitted {
+		t.Fatalf("counted call past the limit: admitted=%v err=%v, want false/nil", admitted, err)
+	}
+}
+
+// TestAdmitAll_ZeroWeightCreatesNoEntry pins the two backends together on a call that
+// records nothing. A zero-weight call on an unseen key must not materialize a map entry:
+// in-memory that entry is charged against maxKeys (and can deny a later call with the
+// entry-limit error) where Redis touches no key at all — a divergence in what the two
+// backends hold after the identical call.
+func TestAdmitAll_ZeroWeightCreatesNoEntry(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(1_700_000_000, 0)
+	m := NewInMemory(WithTimeFunc(func() time.Time { return now }), WithMaxKeys(1))
+	zero := capability.QuotaBucket{Key: "sess|tool:noop", WindowSec: 60, Weight: 0, Limit: 1000}
+	if admitted, _, _, _, err := m.AdmitAll(ctx, []capability.QuotaBucket{zero}); err != nil || !admitted {
+		t.Fatalf("zero-weight call: admitted=%v err=%v, want true/nil", admitted, err)
+	}
+	if got := len(m.entries); got != 0 {
+		t.Fatalf("entries after a zero-weight call = %d, want 0 (it records nothing)", got)
+	}
+	// The single maxKeys slot is therefore still free for a call that does record.
+	recording := capability.QuotaBucket{Key: "sess|tool:charge", WindowSec: 60, Weight: 5, Limit: 1000}
+	if admitted, _, _, _, err := m.AdmitAll(ctx, []capability.QuotaBucket{recording}); err != nil || !admitted {
+		t.Fatalf("recording call after a zero-weight one: admitted=%v err=%v, want true/nil", admitted, err)
+	}
+}
+
+// TestBucketRetryAfter_CountedBucketAlwaysPivotsOnRank pins the counted hint to the
+// bucket's own accounting on a key that ALSO carries weights. `cur` is a call count for a
+// counted bucket, so measuring `needed` in calls and `freed` in weight mixes units and
+// returns a hint for the wrong entry. Redis always takes the rank pivot here; this is the
+// in-memory backend agreeing with it.
+func TestBucketRetryAfter_CountedBucketAlwaysPivotsOnRank(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	window := time.Minute
+	// Three in-window calls, oldest first, each carrying a large weight.
+	valid := []time.Time{now.Add(-50 * time.Second), now.Add(-30 * time.Second), now.Add(-10 * time.Second)}
+	weights := []float64{100, 100, 100}
+	b := &capability.QuotaBucket{Key: "k", WindowSec: 60, Counted: true, Limit: 3}
+
+	got := bucketRetryAfter(b, valid, weights, 3, window, now)
+	// The 4th call needs one entry to age out: the oldest, at now-50s, leaves the window
+	// 10s from now. A weight walk would have stopped at the first entry whose weight
+	// covered `needed` = 1 and answered for the same instant only by coincidence of this
+	// data; the assertion is that the hint tracks the RANK pivot.
+	if want := 10 * time.Second; got != want {
+		t.Errorf("retryAfter = %v, want %v (the rank pivot for a counted bucket)", got, want)
 	}
 }

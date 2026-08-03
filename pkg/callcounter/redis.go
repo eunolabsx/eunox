@@ -36,6 +36,9 @@ type Redis struct {
 	// nanosecond within one process produce distinct members. Cross-process
 	// uniqueness comes from instanceID.
 	seq atomic.Int64
+	// maxWeightedEntries bounds the live entries one weighted (key, window) may hold,
+	// mirroring InMemory. Defaults to MaxWeightedEntriesPerKey; lowered only by tests.
+	maxWeightedEntries int
 }
 
 // redisOption configures the Redis counter. It is unexported because the only
@@ -48,6 +51,15 @@ type redisOption func(*Redis)
 func withTimeFunc(fn func() time.Time) redisOption {
 	return func(r *Redis) {
 		r.now = fn
+	}
+}
+
+// withRedisMaxWeightedEntries lowers the per-key weighted retention ceiling, so a test
+// can reach it without writing MaxWeightedEntriesPerKey entries. Unexported for the same
+// reason as its in-memory twin: the ceiling is a package invariant, not an operator knob.
+func withRedisMaxWeightedEntries(n int) redisOption {
+	return func(r *Redis) {
+		r.maxWeightedEntries = n
 	}
 }
 
@@ -90,9 +102,10 @@ func NewRedis(client redis.Cmdable, opts ...redisOption) *Redis {
 		panic(fmt.Errorf("callcounter: crypto/rand unavailable: %w", err))
 	}
 	r := &Redis{
-		client:     client,
-		now:        time.Now,
-		instanceID: hex.EncodeToString(b[:]),
+		client:             client,
+		now:                time.Now,
+		instanceID:         hex.EncodeToString(b[:]),
+		maxWeightedEntries: MaxWeightedEntriesPerKey,
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -179,8 +192,11 @@ func (r *Redis) IncrementAndGet(ctx context.Context, key string, windowSec, maxE
 //	KEYS[i]               sorted-set key for bucket i (1..#KEYS)
 //	ARGV[1]               now (microseconds; score for new members)
 //	ARGV[2+(i-1)*7 .. +7] per-bucket: cutoff, member, limit, ttlSec, windowMicros, counted, weight
+//	ARGV[#ARGV]           maxWeightedEntries (per-key weighted retention ceiling; 0 = unbounded)
 //
-// Reply: {admitted (1|0), deniedIndex (1-based; 0 when admitted), total (string), retryAfterMicros}.
+// Reply: {admitted (1|0), deniedIndex (1-based; 0 when admitted), total (string), retryAfterMicros},
+// or an ERROR reply when a weighted bucket is at the retention ceiling — which the caller
+// surfaces as an infrastructure fault and the engine denies on (see MaxWeightedEntriesPerKey).
 //
 // The total is a STRING, not a Redis integer: it is a magnitude, routinely fractional (a
 // currency amount), and %.17g round-trips a float64 exactly where Redis integer replies
@@ -192,12 +208,34 @@ var admitAllScript = redis.NewScript(`
 local now = tonumber(ARGV[1])
 local n = #KEYS
 local totals = {}
+local counts = {}
+-- Positional, not ARGV[#ARGV]: with the trailing argument omitted, #ARGV lands on the
+-- last bucket's WEIGHT and would be read as a ceiling (a weight of 5 silently refusing
+-- every key holding 5 entries). Indexing past the per-bucket block yields nil instead, so
+-- a caller invoking this script directly without it fails closed and diagnosably.
+local maxWeightedEntries = tonumber(ARGV[2 + n*7])
+if maxWeightedEntries == nil then
+  return redis.error_reply('callcounter: admitAll requires the trailing weighted-entry ceiling argument')
+end
 local denied = 0
 
 local function entry_weight(m)
   local sep = string.find(m, '|', 1, true)
   if sep then return tonumber(string.sub(m, sep + 1)) or 1 end
   return 1
+end
+
+local function refresh_ttls()
+  -- Refresh the TTL on every non-admitting path: a bucket that is never admitted would
+  -- otherwise count its TTL down from the last admit and could expire mid-window,
+  -- silently resetting the quota. Gate on EXISTS so the invariant is "refresh whenever
+  -- present, never re-create an absent key".
+  for i = 1, n do
+    local base = 1 + (i-1)*7
+    if redis.call('EXISTS', KEYS[i]) == 1 then
+      redis.call('EXPIRE', KEYS[i], ARGV[base+4])
+    end
+  end
 end
 
 for i = 1, n do
@@ -207,8 +245,10 @@ for i = 1, n do
   local total = 0
   if counted == 1 then
     total = redis.call('ZCARD', KEYS[i])
+    counts[i] = total
   else
     local entries = redis.call('ZRANGE', KEYS[i], 0, -1)
+    counts[i] = #entries
     for j = 1, #entries do
       total = total + entry_weight(entries[j])
     end
@@ -222,16 +262,7 @@ for i = 1, n do
 end
 
 if denied > 0 then
-  -- Refresh the TTL on the denied path too: a bucket held at its bound is never admitted,
-  -- so its TTL would count down from the last admit and could expire mid-window, silently
-  -- resetting the quota. Gate on EXISTS so the invariant is "refresh whenever present,
-  -- never re-create an absent key".
-  for i = 1, n do
-    local base = 1 + (i-1)*7
-    if redis.call('EXISTS', KEYS[i]) == 1 then
-      redis.call('EXPIRE', KEYS[i], ARGV[base+4])
-    end
-  end
+  refresh_ttls()
   local base = 1 + (denied-1)*7
   local counted = tonumber(ARGV[base+6])
   local limit = tonumber(ARGV[base+3])
@@ -261,6 +292,24 @@ if denied > 0 then
   end
   if retry < 0 then retry = 0 end
   return {0, denied, string.format('%.17g', total), retry}
+end
+
+-- Every bucket has headroom. Before writing ANY of them, check the weighted retention
+-- ceiling across the whole batch, so the commit stays all-or-nothing against it the way
+-- it is against the quota. A weighted bucket's entry count is not bounded by its own
+-- limit -- arbitrarily many sub-threshold magnitudes fit under one total -- and each
+-- later admission re-sums the set inside this blocking script. An error reply is the
+-- fail-closed refusal; nothing has been written yet, so no partial commit escapes.
+if maxWeightedEntries > 0 then
+  for i = 1, n do
+    local base = 1 + (i-1)*7
+    local counted = tonumber(ARGV[base+6])
+    local weight = tonumber(ARGV[base+7])
+    if counted ~= 1 and (totals[i] + weight) ~= totals[i] and (counts[i] + 1) > maxWeightedEntries then
+      refresh_ttls()
+      return redis.error_reply('callcounter: weighted entry limit reached (' .. maxWeightedEntries .. ' entries in one window)')
+    end
+  end
 end
 
 local maxTotal = 0
@@ -304,7 +353,7 @@ func (r *Redis) AdmitAll(ctx context.Context, buckets []capability.QuotaBucket) 
 
 	now := r.now()
 	redisKeys := make([]string, len(buckets))
-	argv := make([]interface{}, 0, 1+7*len(buckets))
+	argv := make([]interface{}, 0, 2+7*len(buckets))
 	argv = append(argv, now.UnixMicro())
 	for i := range buckets {
 		b := &buckets[i]
@@ -323,6 +372,10 @@ func (r *Redis) AdmitAll(ctx context.Context, buckets []capability.QuotaBucket) 
 		}
 		argv = append(argv, cutoff, member, b.Limit, ttlSec, windowMicros, counted, b.Weight)
 	}
+	// Trailing, batch-wide: the script reads it as ARGV[#ARGV] rather than as an eighth
+	// per-bucket field, since the ceiling is one package invariant and not a per-bucket
+	// property.
+	argv = append(argv, r.maxWeightedEntries)
 
 	res, runErr := admitAllScript.Run(ctx, r.client, redisKeys, argv...).Result()
 	if runErr != nil {

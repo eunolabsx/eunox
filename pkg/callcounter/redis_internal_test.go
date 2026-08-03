@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/eunolabs/eunox/pkg/capability"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 )
@@ -33,11 +34,13 @@ func TestAdmitAllScript_DenyPathRefreshesTTLWhenKeyExists(t *testing.T) {
 	key := "callcounter:itest:60"
 
 	// One counted bucket, the shape a lone maxCalls commits: per-bucket ARGV is
-	// cutoff, member, limit, ttlSec, windowMicros, counted, weight.
+	// cutoff, member, limit, ttlSec, windowMicros, counted, weight — then the
+	// batch-wide weighted-entry ceiling as the trailing ARGV.
 	run := func(limit int64, member string) {
 		cutoff := now.Add(-time.Duration(windowSec) * time.Second).UnixMicro()
 		_, err := admitAllScript.Run(ctx, client, []string{key},
-			now.UnixMicro(), cutoff, member, limit, ttlSec, windowMicros, 1, 0).Result()
+			now.UnixMicro(), cutoff, member, limit, ttlSec, windowMicros, 1, 0,
+			MaxWeightedEntriesPerKey).Result()
 		require.NoError(t, err)
 	}
 
@@ -71,4 +74,77 @@ func TestAdmitAllScript_DenyPathRefreshesTTLWhenKeyExists(t *testing.T) {
 	card, err := client.ZCard(ctx, key).Result()
 	require.NoError(t, err)
 	require.Equal(t, int64(1), card, "the in-window entry must remain (deny adds none)")
+}
+
+// TestRedisAdmitAll_WeightedEntryCeilingRefusesRatherThanGrowing is the Redis half of
+// MaxWeightedEntriesPerKey. It matters more here than in-memory: the per-admission re-sum
+// is a ZRANGE 0 -1 walk INSIDE the blocking Lua script, so an unbounded weighted key
+// slows every replica pointed at that Redis, not just this process. The refusal must be
+// an error reply (which the engine denies on) and must write nothing.
+func TestRedisAdmitAll_WeightedEntryCeilingRefusesRatherThanGrowing(t *testing.T) {
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	ctx := context.Background()
+
+	now := time.Unix(1_700_000_000, 0)
+	r := NewRedis(client, withTimeFunc(func() time.Time { return now }), withRedisMaxWeightedEntries(3))
+	b := capability.QuotaBucket{Key: "sess|tool:charge", WindowSec: 60, Weight: 1e-9, Limit: 1000}
+	redisKey := redisWindowKey(b.Key, b.WindowSec)
+
+	for i := 1; i <= 3; i++ {
+		admitted, _, _, _, err := r.AdmitAll(ctx, []capability.QuotaBucket{b})
+		require.NoError(t, err, "call %d under the ceiling", i)
+		require.True(t, admitted, "call %d under the ceiling", i)
+	}
+
+	admitted, _, _, _, err := r.AdmitAll(ctx, []capability.QuotaBucket{b})
+	require.Error(t, err, "the call past the ceiling must fail closed")
+	require.Contains(t, err.Error(), "weighted entry limit")
+	require.False(t, admitted)
+
+	card, cardErr := client.ZCard(ctx, redisKey).Result()
+	require.NoError(t, cardErr)
+	require.Equal(t, int64(3), card, "the refused commit must write nothing")
+	// The refusal still refreshes the TTL, so a key held at the ceiling cannot expire
+	// mid-window and silently reset the budget it is holding.
+	require.InDelta(t, float64(b.WindowSec*cleanupMarginFactor), mr.TTL(redisKey).Seconds(), 2)
+
+	// A COUNTED bucket on its own key is unaffected: its limit is its retention.
+	counted := capability.QuotaBucket{Key: "sess|tool:read", WindowSec: 60, Counted: true, Limit: 5}
+	for i := 1; i <= 5; i++ {
+		admitted, _, _, _, err := r.AdmitAll(ctx, []capability.QuotaBucket{counted})
+		require.NoError(t, err, "counted call %d", i)
+		require.True(t, admitted, "counted call %d", i)
+	}
+}
+
+// TestRedisAdmitAll_WeightedCeilingIsAllOrNothingAcrossTheBatch pins that one bucket at
+// the ceiling refuses the WHOLE batch before anything is written. A partial commit would
+// let the sibling bucket's budget be spent by a call the batch did not admit — the same
+// atomicity AdmitAll gives every other refusal on this path.
+func TestRedisAdmitAll_WeightedCeilingIsAllOrNothingAcrossTheBatch(t *testing.T) {
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	ctx := context.Background()
+
+	now := time.Unix(1_700_000_000, 0)
+	r := NewRedis(client, withTimeFunc(func() time.Time { return now }), withRedisMaxWeightedEntries(2))
+	full := capability.QuotaBucket{Key: "sess|tool:charge", WindowSec: 60, Weight: 1e-9, Limit: 1000}
+	sibling := capability.QuotaBucket{Key: "sess|tool:charge", WindowSec: 3600, Counted: true, Limit: 100}
+
+	for i := 1; i <= 2; i++ {
+		_, _, _, _, err := r.AdmitAll(ctx, []capability.QuotaBucket{full})
+		require.NoError(t, err)
+	}
+
+	// The sibling is FIRST in the batch, so a ceiling checked inline in the commit loop
+	// would already have written it by the time the second bucket refused.
+	_, _, _, _, err := r.AdmitAll(ctx, []capability.QuotaBucket{sibling, full})
+	require.Error(t, err, "a batch containing a bucket at the ceiling must fail closed")
+
+	card, err := client.ZCard(ctx, redisWindowKey(sibling.Key, sibling.WindowSec)).Result()
+	require.NoError(t, err)
+	require.Equal(t, int64(0), card, "the sibling bucket must not have been charged")
 }

@@ -15,9 +15,12 @@ import (
 	"time"
 )
 
-// Pre-session denial records are the only audit writes an UNAUTHENTICATED caller can
-// trigger, so they are the only ones whose rate an attacker sets at zero cost. They are
-// bounded by a token bucket rather than written one-per-refusal.
+// Pre-session denial records are the audit writes an UNAUTHENTICATED caller can trigger,
+// so they are the ones whose rate an attacker sets at zero cost. They are bounded by a
+// token bucket rather than written one-per-refusal. Two kinds reach that description: the
+// transport-level refusals (rejected Origin/JWT/bearer/control token, a bad body or
+// content type, a full session table) and the kill-switch records the pre-session legs
+// write while a kill is active (catKill). Both are charged here; nothing else is.
 //
 // Without a bound the refusal record is a lever on the proxy's own availability: the audit
 // queue is finite and its drop counter is monotonic, so one drop latches AuditDegraded()
@@ -98,13 +101,26 @@ const (
 	catBody        refusalCategory = "body"
 	catContentType refusalCategory = "content_type"
 	catSaturation  refusalCategory = "saturation"
+	// catKill bounds the kill-switch records the PRE-SESSION legs write — the
+	// session-creating initialize under an active global kill, the sessionless
+	// initialize notification, and any POST naming an unknown or killed session. Those
+	// three fire for raw, unauthenticated requests, so on an open-posture deployment
+	// (no authToken, no JWT) a caller spraying initialize POSTs while a kill is active
+	// drove one signed record per request: the same audit-queue flood this file bounds
+	// everywhere else, and the one the invariant above claimed was already covered.
+	//
+	// It bounds ONLY those legs. A kill record for a session this proxy established is
+	// written unlimited — that caller held a session, the record is bounded by traffic
+	// the proxy already admitted, and it is the record an operator most needs during an
+	// emergency stop.
+	catKill refusalCategory = "kill"
 )
 
 // refusalCategories is the authoritative list the bucket table is built from. A constant
 // added above but omitted here would fall to the shared unknown bucket rather than
 // getting its own; TestRefusalCategories_AllHaveTheirOwnBucket pins that they match.
 var refusalCategories = []refusalCategory{
-	catOrigin, catJWT, catAuth, catControl, catLoopback, catBody, catContentType, catSaturation,
+	catOrigin, catJWT, catAuth, catControl, catLoopback, catBody, catContentType, catSaturation, catKill,
 }
 
 // perCategoryFloor is the minimum share perCategoryShare ever returns. Plain integer

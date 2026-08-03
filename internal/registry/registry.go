@@ -154,8 +154,27 @@ func (c *Contract) Validate() error {
 	if strings.ContainsAny(c.ID, "\r\n") {
 		return fmt.Errorf("contract %q: 'id' contains a line break; an id is a vendor/tool slug and is embedded verbatim in the signed attestation payload", c.ID)
 	}
+	// The id is also the half of Ref() BEFORE the "@", and SplitEffectRef cuts a ref at
+	// its FIRST "@" — so an id containing one validates and digests cleanly here while
+	// producing a ref that can never resolve: the id half is truncated and the digest half
+	// is whatever followed. The author's mistake then surfaces as a baffling
+	// digest-mismatch at manifest load, far from the entry that caused it. Whitespace is
+	// refused for the neighbouring reason: a ref is copied into a manifest as one token,
+	// and a leading or trailing space is invisible in the place it breaks.
+	if strings.ContainsRune(c.ID, '@') {
+		return fmt.Errorf("contract %q: 'id' contains '@', which separates the id from the digest in the 'effect.ref' pin this entry serves — its ref could never resolve", c.ID)
+	}
+	if strings.ContainsAny(c.ID, " \t") || c.ID != strings.TrimSpace(c.ID) {
+		return fmt.Errorf("contract %q: 'id' contains whitespace; an id is a vendor/tool slug copied verbatim into an 'effect.ref' pin", c.ID)
+	}
 	if strings.TrimSpace(c.Tool) == "" {
 		return fmt.Errorf("contract %q is missing 'tool'", c.ID)
+	}
+	// The id ends in "." + the tool it describes ("<publisher>/<server>.<tool>"), so an
+	// entry cannot attest one tool under another's name — a mislabelling nothing else
+	// catches, since every later layer trusts the id as the entry's identity.
+	if suffix := "." + c.Tool; !strings.HasSuffix(c.ID, suffix) {
+		return fmt.Errorf("contract %q: 'id' must end in %q to match its 'tool' (an id is \"<publisher>/<server>.<tool>\")", c.ID, suffix)
 	}
 	if strings.TrimSpace(c.Server.Name) == "" {
 		return fmt.Errorf("contract %q is missing 'server.name'", c.ID)

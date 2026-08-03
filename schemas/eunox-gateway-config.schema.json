@@ -88,7 +88,7 @@
         },
         "sessionIdleTimeoutMs": {
           "type": "integer",
-          "description": "Reap a session whose host has sent no request for this many milliseconds, closing its upstream so idle sessions cannot pin resources. 0 (default) disables idle reaping. Only valid for transport: http.",
+          "description": "Reap a session whose host has sent no request for this many milliseconds, closing its upstream so idle sessions cannot pin resources. 0 (default) disables idle reaping. Only valid for transport: http. The same sweep reclaims killed sessions, so a deployment taking kill-switch activations from another instance through Redis wants a non-zero value: without a sweep, a session killed elsewhere keeps its upstream and session slot until the process exits (its traffic is denied throughout).",
           "minimum": 0,
           "maximum": 9223372036854,
           "default": 0

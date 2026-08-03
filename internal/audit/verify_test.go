@@ -2360,3 +2360,69 @@ func TestVerifyLog_UnsignedDiagnosticsUncappedBelowLimit(t *testing.T) {
 		t.Errorf("nothing was suppressed, so no summary line should appear:\n%s", out.String())
 	}
 }
+
+// TestVerifyAuditLog_KeylessVerifierReportsUnverifiableNotTampered pins the degraded mode
+// VerifyLog documents. A nil (or zero) verifier holds no keys — "verify shape and chain,
+// no signature check" — but the unverifiable branch also required the record to name NO
+// key_id, and every record the current writer produces stamps one. So under that mode
+// every modern record was reported INVALID, the tamper verdict, and each one latched a
+// spurious CHAIN BREAK on its successor: an untampered log read as wholly tampered.
+func TestVerifyAuditLog_KeylessVerifierReportsUnverifiableNotTampered(t *testing.T) {
+	t.Parallel()
+	key := nonZeroTestKey()
+	keyID := hmacKeyID(key)
+
+	var log bytes.Buffer
+	prev := auditGenesisPrev
+	for seq := 1; seq <= 3; seq++ {
+		rec := auditRecord{
+			ClassUID: 6003, CategoryUID: 6, ActivityID: 1,
+			Time: "2026-06-15T10:00:00Z", Seq: uint64(seq), RequestID: "r",
+			Decision: "allow", PrevHMAC: prev, KeyID: keyID,
+		}
+		line := signTestRecord(t, key, rec)
+		log.Write(line)
+		log.WriteByte('\n')
+		var written auditRecord
+		if err := json.Unmarshal(bytes.TrimSpace(line), &written); err != nil {
+			t.Fatalf("decode written record: %v", err)
+		}
+		prev = written.HMAC
+	}
+
+	for name, verifier := range map[string]*Sink{"nil": nil, "zero": {}} {
+		t.Run(name, func(t *testing.T) {
+			var out strings.Builder
+			res, err := VerifyLog(bytes.NewReader(log.Bytes()), verifier, "", time.Time{}, &out)
+			if err != nil {
+				t.Fatalf("VerifyLog: %v", err)
+			}
+			if res.Invalid != 0 {
+				t.Errorf("a verifier holding no keys checked nothing, so nothing is tampered: Invalid=%d", res.Invalid)
+			}
+			if res.ChainBreaks != 0 {
+				t.Errorf("an intact chain must not report breaks under the structure-only mode: ChainBreaks=%d", res.ChainBreaks)
+			}
+			if res.Unverifiable != 3 {
+				t.Errorf("want all 3 records unverifiable, got %+v", res)
+			}
+			// Still fail-closed: unverified is not verified.
+			if res.OK() {
+				t.Error("the structure-only mode must not report a PASS verdict")
+			}
+			if !strings.Contains(out.String(), "UNVERIFIABLE") {
+				t.Errorf("expected UNVERIFIABLE diagnostics, got %q", out.String())
+			}
+		})
+	}
+
+	// The control: with the real key in the ring, the same log verifies clean — so the
+	// assertions above are about the missing key, not about a malformed fixture.
+	res, err := VerifyLog(bytes.NewReader(log.Bytes()), &Sink{verifyKeys: map[string][]byte{keyID: key}}, "", time.Time{}, &strings.Builder{})
+	if err != nil {
+		t.Fatalf("VerifyLog (matching key): %v", err)
+	}
+	if !res.OK() || res.Valid != 3 {
+		t.Fatalf("matching key: got %+v, want OK with Valid=3", res)
+	}
+}

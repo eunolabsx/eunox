@@ -77,9 +77,14 @@ capabilities:
   refuses to do. A **negative** argument value also resolves to unquantified: a magnitude
   is non-negative by construction, so a negative one is caller-supplied nonsense, and
   treating it as a very small number would pass every bound. A magnitude outside the
-  shared numeric-literal bound (1024 characters, exponent within +/-1024) likewise resolves
-  to unquantified rather than being parsed: `1e100000000` is twelve caller-supplied bytes
-  that expand to gigabytes when a denial renders them, and an argument is caller-supplied.
+  shared numeric-literal bound likewise resolves to unquantified rather than being parsed:
+  `1e100000000` is twelve caller-supplied bytes that expand to gigabytes when a denial
+  renders them, and an argument is caller-supplied. That bound is a **decimal-only**
+  grammar — an optional sign, digits with an optional fraction, an optional `e`/`E`
+  exponent — within 1024 characters and an exponent within +/-1024. A non-decimal literal
+  is refused outright rather than sized, because no digit budget bounds it: `1p100000000`
+  and `0x1p1000000` scale by a power of *two*, and Go's parser also reads `0x1p4` as 16 and
+  `1_000` as 1000 — so accepting them would meter a value the caller never wrote.
 - Every `argument` reference — here and in `byArgument` — obeys the **same `$.` nested-path
   grammar** the conditions use: `$.filters.query` traverses into a nested object, and
   `$$.x` addresses a literal top-level key named `$.x`. A malformed path resolves to
@@ -215,6 +220,14 @@ is catastrophic.
 - A call whose weight cannot move the running total — zero, or anything too small to register
   in double precision — is admitted **without being recorded**. It can never affect a future
   decision, and recording it was the one case with no bound on how much a key could grow.
+- A weighted window retains at most **100,000 entries** per (session, target). Unlike a
+  counted quota, whose limit *is* its retention, a weighted one admits arbitrarily many
+  sub-threshold magnitudes under a single bound — and every later admission re-sums the
+  whole set, under the in-memory backend's lock or inside the Redis backend's script. At
+  the ceiling the call is **refused** with `CONDITION_FAILED` (the whole batch, never a
+  partial commit) rather than admitted-but-unrecorded, which would be unmetered spend;
+  entries age out of the window on their own, so the refusal lasts as long as the burst
+  that caused it. Reaching it takes 100k calls to one target inside one window.
 - Under `--audit` the budget is **not** consumed, exactly as `maxCalls` quota is not:
   observing it accurately would spend the thing observation exists to leave alone.
 

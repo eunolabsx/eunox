@@ -31,6 +31,18 @@ import (
 // is not there is an error rather than a silent empty result.
 const defaultContractsDir = "registry/contracts"
 
+// reportUnreadableCorpusDir explains a corpus directory that could not be read, adding
+// where the path came from when the operator did not choose it. The default is
+// CWD-relative, so a bare `eunox contracts` from an installed binary dead-ends on a path
+// nothing in the output identifies as a default — the first-run experience for anyone not
+// standing in a checkout.
+func reportUnreadableCorpusDir(resolved, requested string, statErr error) {
+	fmt.Fprintf(os.Stderr, "eunox contracts: cannot read corpus directory %q: %v\n", resolved, statErr)
+	if requested == defaultContractsDir {
+		fmt.Fprintf(os.Stderr, "  (%q is the default, resolved against the current directory — pass --dir to name a corpus, e.g. --dir ./registry/contracts from a checkout)\n", defaultContractsDir)
+	}
+}
+
 // cmdContracts runs the `contracts` subcommand and returns the process exit code (rather
 // than calling os.Exit itself), so tests can drive every branch — including the failure
 // paths — without terminating the test binary.
@@ -111,7 +123,7 @@ Flags:
 	// clean bill of health for something never read — the exact shape the loader's own
 	// fail-on-first-invalid rule exists to prevent one level down.
 	if info, statErr := os.Stat(resolved); statErr != nil {
-		fmt.Fprintf(os.Stderr, "eunox contracts: cannot read corpus directory %q: %v\n", resolved, statErr)
+		reportUnreadableCorpusDir(resolved, *dir, statErr)
 		return 2
 	} else if !info.IsDir() {
 		fmt.Fprintf(os.Stderr, "eunox contracts: %q is not a directory\n", resolved)

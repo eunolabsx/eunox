@@ -344,17 +344,16 @@ var enforcedMethodSummary = sortedMethods(decideMethodHandlers)
 // anything outside the two routing tables is denied the same way.
 const unmappedMethodExamples = "e.g. completion/complete, logging/setLevel, resources/templates/list"
 
-// sortedMethods joins the given routing tables' keys in sorted order, so a banner derived
-// from a table cannot drift from what the dispatcher does (and a map's iteration order
-// cannot make the text unstable). Variadic because it once joined both tables for a
-// whole-dispatch-table summary; the banner now names only the enforced half, and the tests
-// still exercise the multi-table form.
-func sortedMethods(tables ...map[string]func(context.Context, dispatchParams, mcp.RPCMsg) mcp.RPCMsg) string {
-	var methods []string
-	for _, t := range tables {
-		for m := range t {
-			methods = append(methods, m)
-		}
+// sortedMethods joins a routing table's keys in sorted order, so a banner derived from a
+// table cannot drift from what the dispatcher does (and a map's iteration order cannot
+// make the text unstable). It took a variadic list of tables when the banner summarized
+// the whole dispatch table; the banner now names only the enforced half, so the extra
+// shape survived on the strength of a test that exercised it — which is the tail wagging
+// the dog. One table, one caller.
+func sortedMethods(table map[string]func(context.Context, dispatchParams, mcp.RPCMsg) mcp.RPCMsg) string {
+	methods := make([]string, 0, len(table))
+	for m := range table {
+		methods = append(methods, m)
 	}
 	sort.Strings(methods)
 	return strings.Join(methods, ", ")

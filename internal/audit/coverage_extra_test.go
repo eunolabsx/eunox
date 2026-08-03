@@ -1265,3 +1265,68 @@ func TestCloneAndBound_JSONNumber(t *testing.T) {
 		t.Errorf("cloneAndBound(json.Number(%q)) = %v, want the same value", n, got)
 	}
 }
+
+// TestOpen_EnforcesRetentionAtStartup pins that the retention bound is enforced when the
+// sink OPENS, not only after the active log next crosses rotateSizeBytes. An operator who
+// lowers retainRotated (or whose siblings accumulated while retention was failing) would
+// otherwise keep the excess until the next size-triggered rotation — days or weeks on a
+// quiet proxy at the 100 MiB default — with the configured disk bound silently unenforced.
+func TestOpen_EnforcesRetentionAtStartup(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+	keyPath := filepath.Join(dir, "audit.key")
+
+	stamps := []string{
+		".20260101T000000.000000000Z",
+		".20260102T000000.000000000Z",
+		".20260103T000000.000000000Z",
+		".20260104T000000.000000000Z",
+	}
+	for _, st := range stamps {
+		if err := os.WriteFile(logPath+st, []byte("{}\n"), 0o600); err != nil {
+			t.Fatalf("write rotated sibling: %v", err)
+		}
+	}
+
+	// A large rotate size, so nothing here is a size-triggered rotation: the prune under
+	// test is the one Open performs.
+	sink, err := Open(logPath, keyPath, 100<<20, 2)
+	if err != nil {
+		t.Fatalf("audit.Open: %v", err)
+	}
+	defer func() { _ = sink.Close() }()
+
+	for i, st := range stamps {
+		_, err := os.Stat(logPath + st)
+		if i < 2 {
+			if !os.IsNotExist(err) {
+				t.Errorf("startup must prune the oldest siblings past the bound; %q survived (stat err = %v)", logPath+st, err)
+			}
+		} else if err != nil {
+			t.Errorf("startup must keep the newest %d siblings; %q was pruned (stat err = %v)", 2, logPath+st, err)
+		}
+	}
+}
+
+// The counterpart: retention disabled (retain 0 = keep all) must prune nothing at startup.
+func TestOpen_RetentionDisabledKeepsEverySibling(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+	keyPath := filepath.Join(dir, "audit.key")
+	sibling := logPath + ".20260101T000000.000000000Z"
+	if err := os.WriteFile(sibling, []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("write rotated sibling: %v", err)
+	}
+
+	sink, err := Open(logPath, keyPath, 100<<20, 0)
+	if err != nil {
+		t.Fatalf("audit.Open: %v", err)
+	}
+	defer func() { _ = sink.Close() }()
+
+	if _, err := os.Stat(sibling); err != nil {
+		t.Errorf("retain 0 keeps every rotated file; %q was pruned (stat err = %v)", sibling, err)
+	}
+}

@@ -253,6 +253,13 @@ type GatewayConfig struct {
 		// SessionIdleTimeoutMs reaps a session whose host has sent no request for
 		// this many milliseconds, closing its upstream so idle sessions cannot pin
 		// resources indefinitely. 0 ⟹ no idle reaping. Only valid for transport: http.
+		//
+		// The same sweep also reclaims KILLED sessions, which matters to a deployment
+		// taking kills through Redis: a kill this instance did not serve locally reaches
+		// it only through the kill store, so with no sweep running its subprocess and
+		// session slot stay pinned until the process exits (its traffic is denied
+		// throughout — this is resource reclaim, not enforcement). Set a non-zero value
+		// when kills arrive from another instance.
 		// Pointer so an explicit value (including 0) is distinguishable from "unset"
 		// (where the --session-idle-timeout flag applies); a bare int would conflate an
 		// omitted key with a deliberate 0, making "0 = no idle reaping" inexpressible
@@ -396,23 +403,17 @@ func errIfBinaryConfig(kind, path string, data []byte) error {
 	return nil
 }
 
-// gatewaySchemaVersionFromRaw reads the top-level schemaVersion scalar's VERBATIM text
-// from raw, plus whether it was written as a bare number (an unquoted 0.1, which YAML
-// auto-types !!float). Verbatim matters: "0.10" must stay "0.10" and not renormalize to
-// "0.1", which is a different grammar version. Returns "" when the document does not parse
-// as YAML at all or carries no schemaVersion — the caller's strict decode then reports the
-// syntax error with its own path-qualified message, and an absent version is handled by
-// the version validator.
-func gatewaySchemaVersionFromRaw(raw []byte) (version string, numeric, parsed bool) {
-	var node yaml.Node
-	if err := yaml.Unmarshal(raw, &node); err != nil {
-		return "", false, false
-	}
-	val := topLevelValueNode(&node, "schemaVersion")
+// gatewaySchemaVersionFromNode reads the top-level schemaVersion scalar's VERBATIM text
+// off the already-parsed document, plus whether it was written as a bare number (an
+// unquoted 0.1, which YAML auto-types !!float). Verbatim matters: "0.10" must stay "0.10"
+// and not renormalize to "0.1", which is a different grammar version. Returns "" when the
+// document carries no schemaVersion, which the version validator handles.
+func gatewaySchemaVersionFromNode(root *yaml.Node) (version string, numeric bool) {
+	val := topLevelValueNode(root, "schemaVersion")
 	if val == nil || val.Kind != yaml.ScalarNode {
-		return "", false, true
+		return "", false
 	}
-	return val.Value, val.Tag == "!!int" || val.Tag == "!!float", true
+	return val.Value, val.Tag == "!!int" || val.Tag == "!!float"
 }
 
 // LoadGatewayConfig reads, parses, env-expands, and validates a gateway config.
@@ -446,8 +447,19 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	// version gate entirely and leaving the strict decode below to report the whole
 	// document with an opaque "cannot unmarshal !!float into string". The node carries the
 	// scalar's verbatim text regardless of tag, so the gate runs either way.
-	version, numericVersion, parsed := gatewaySchemaVersionFromRaw(raw)
+	// ONE parse into a node, shared by every check that must see the document as
+	// WRITTEN rather than as decoded: this version pre-read, the numeric-coercion guard,
+	// and the per-upstream key-presence map below. Each used to re-parse the same bytes.
+	// A document that does not parse as YAML at all falls through with parsed=false to
+	// the strict decode, which reports the syntax error with its own path-qualified
+	// message — so every node-derived check below is gated on the SAME flag rather than
+	// each swallowing its own parse error.
+	var root yaml.Node
+	parsed := yaml.Unmarshal(raw, &root) == nil
+	var version string
+	var numericVersion bool
 	if parsed {
+		version, numericVersion = gatewaySchemaVersionFromNode(&root)
 		if err := validateGatewaySchemaVersion(version); err != nil {
 			return nil, fmt.Errorf("invalid gateway config %q: %w", path, err)
 		}
@@ -491,9 +503,8 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	// every 64 bytes). The strict struct decode above accepts the coerced integer with no
 	// signal, so re-walk the raw node and fail closed, reusing the manifest loader's
 	// coercion machinery so the two operator-authored config surfaces agree on this.
-	var rawNode yaml.Node
-	if err := yaml.Unmarshal(raw, &rawNode); err == nil {
-		if err := rejectCoercedGatewayNumerics(&rawNode, path); err != nil {
+	if parsed {
+		if err := rejectCoercedGatewayNumerics(&root, path); err != nil {
 			return nil, err
 		}
 	}
@@ -581,12 +592,15 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	// whose VALUE itself contains "${...}"/"$..." text (e.g. an OData query string
 	// forwarded through an env var) would make the expanded URL still match
 	// ContainsEnvRef even though the reference resolved correctly, misdiagnosing a
-	// healthy config as unset. Walking the raw text's references and checking each
-	// named variable's presence (matching validateCredentialEnvRefs's rule) avoids
-	// that false positive and also lets a literal "$" with no matching env var name
-	// (e.g. "?$filter=") pass through untouched.
+	// healthy config as unset.
+	//
+	// The QUERY and FRAGMENT take the braced-only rule (failOnUnsetURLEnvRef), for the
+	// same reason argv does: a bare "$word" is ordinary content there. "?$filter=" is a
+	// perfectly good OData URL, and the bare-$ rule refused to start that config while
+	// naming an environment variable "filter" the operator never wrote — a refusal the
+	// argv rule already documents "?$filter=" as the reason for avoiding.
 	for i := range cfg.Upstreams {
-		if err := failOnUnsetEnvRef(path, fmt.Sprintf("upstream %q upstreamUrl", cfg.Upstreams[i].Name), rawUpstreamURL[i]); err != nil {
+		if err := failOnUnsetURLEnvRef(path, fmt.Sprintf("upstream %q upstreamUrl", cfg.Upstreams[i].Name), rawUpstreamURL[i]); err != nil {
 			return nil, err
 		}
 	}
@@ -615,14 +629,15 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	// absent key. Re-read which keys each upstream actually wrote so validate() can
 	// reject forbidden transport fields on key *presence*, as the JSON Schema does.
 	// Read from the unexpanded raw: expansion changes values, never keys.
-	present, err := upstreamKeyPresence(raw)
+	present, err := upstreamKeyPresence(&root)
 	if err != nil {
 		return nil, fmt.Errorf("parsing gateway config %q: %w", path, err)
 	}
-	// present is indexed parallel to cfg.Upstreams. Assert the lengths match rather
-	// than assume it: a future YAML feature the two decoders treat differently
-	// could desync them, silently checking one upstream's forbidden fields against
-	// another's key set. Fail closed.
+	// present is indexed parallel to cfg.Upstreams. Assert the lengths match rather than
+	// assume it: this list is derived from the NODE while cfg.Upstreams comes from the
+	// strict Decoder (which is what KnownFields requires), so the two readings can still
+	// disagree on a future YAML feature and silently check one upstream's forbidden
+	// fields against another's key set. Fail closed.
 	if len(present) != len(cfg.Upstreams) {
 		return nil, fmt.Errorf("parsing gateway config %q: internal upstream-count mismatch (%d typed vs %d presence entries)", path, len(cfg.Upstreams), len(present))
 	}
@@ -767,10 +782,37 @@ func failOnUnsetBracedEnvRef(path, label, raw string) error {
 	return nil
 }
 
+// failOnUnsetURLEnvRef is the upstreamUrl leg of the rule: the bare-$ form counts as a
+// reference in the scheme/host/path, and only the braced "${VAR}" form counts in the
+// QUERY or FRAGMENT.
+//
+// The split is the point. A URL's authority has no legitimate bare "$", so the broad rule
+// belongs there; a query does — "?$filter=eq(...)" (OData), "?$select=", a JSONPath "$."
+// — and applying the broad rule to it refused an otherwise-working config, blaming an
+// environment variable named "filter" the operator never wrote.
+//
+// An env reference cannot straddle the split: the reference grammar admits only
+// identifier characters, so neither "?" nor "#" can appear inside one.
+//
+// Note this governs the GUARD, not the expansion: a bare "$filter" in a query whose
+// variable IS set is still substituted by the tree-wide expansion, which "$$" escapes.
+// The guard's job is to refuse a reference that silently survives as literal text, and
+// after this split that is exactly what it refuses.
+func failOnUnsetURLEnvRef(path, label, raw string) error {
+	head, tail := raw, ""
+	if i := strings.IndexAny(raw, "?#"); i >= 0 {
+		head, tail = raw[:i], raw[i:]
+	}
+	if err := failOnUnsetEnvRef(path, label, head); err != nil {
+		return err
+	}
+	return failOnUnsetBracedEnvRef(path, label, tail)
+}
+
 // unsetEnvRefError is the single operator-facing message for an unset reference, shared
 // by the full and braced-only guards so the two cannot drift on wording.
 func unsetEnvRefError(path, label, name string) error {
-	return fmt.Errorf("invalid gateway config %q: %s references environment variable %q, which is unset, so it is left as literal text — set the variable or remove the reference", path, label, name)
+	return fmt.Errorf("invalid gateway config %q: %s references environment variable %q, which is unset, so it is left as literal text — set the variable, remove the reference, or write \"$$\" for a literal dollar sign", path, label, name)
 }
 
 // validateCredentialEnvRefs fails closed when a credential field whose value is built
@@ -856,11 +898,11 @@ func rejectExtraYAMLDocuments(dec *yaml.Decoder, path, what string) error {
 // an explicit zero from an absent key; recording presence lets validate() reject
 // the same set the JSON Schema's "<field>": false does, keeping the two in
 // lockstep.
-func upstreamKeyPresence(raw []byte) ([]map[string]bool, error) {
+func upstreamKeyPresence(root *yaml.Node) ([]map[string]bool, error) {
 	var doc struct {
 		Upstreams []map[string]any `yaml:"upstreams"`
 	}
-	if err := yaml.Unmarshal(raw, &doc); err != nil {
+	if err := root.Decode(&doc); err != nil {
 		return nil, err
 	}
 	present := make([]map[string]bool, 0, len(doc.Upstreams))

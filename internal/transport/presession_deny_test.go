@@ -5,11 +5,18 @@ package transport
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"testing"
 	"time"
+
+	"github.com/eunolabs/eunox/internal/audit"
+	"github.com/eunolabs/eunox/internal/mcp"
+	"github.com/eunolabs/eunox/pkg/capability"
+	"github.com/eunolabs/eunox/pkg/killswitch"
 )
 
 // TestPreSessionDenyLimiter_BoundsBurstAndCountsSuppressed pins the property that closes
@@ -389,5 +396,98 @@ func TestBuildLoopbackPinHosts_DoesNotWidenTheOriginGate(t *testing.T) {
 	}
 	if p.originAllowed("https://eunox.internal:9999") {
 		t.Fatal("a different scheme/port on an allowlisted host must NOT be accepted on /mcp; the pin host set must not leak into the Origin gate")
+	}
+}
+
+// TestPreSessionKillRecords_AreRateLimited is the regression for the one audit write an
+// unauthenticated caller could still drive at an arbitrary rate.
+//
+// Three kill-switch legs fire before any session exists — a session-creating initialize
+// under an active global kill, the sessionless initialize notification, and a POST naming
+// an unknown or killed session. Each wrote one signed record per request. On an
+// open-posture deployment a caller spraying initializes WHILE A KILL IS ACTIVE therefore
+// overflowed the audit queue, whose monotonic drop counter latches AuditDegraded() for the
+// process lifetime — leaving the default --require-audit=strict denying every route long
+// after the kill was revived. Enforcement is never elided: every request below is denied
+// whether or not its record was written.
+func TestPreSessionKillRecords_AreRateLimited(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	sink, err := audit.Open(dir+"/audit.jsonl", dir+"/audit.key", 0, 0)
+	if err != nil {
+		t.Fatalf("audit.Open: %v", err)
+	}
+
+	ks := killswitch.NewInMemory()
+	if err := ks.ActivateGlobal(context.Background()); err != nil {
+		t.Fatalf("ActivateGlobal: %v", err)
+	}
+	route := &UpstreamRoute{
+		name: "up1",
+		pdp:  newTestManifestPDPWithKS(ks, capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
+		sink: &routeSink{sink: sink},
+	}
+	proxy := newTestHTTPProxy()
+	// Drive the buckets from an injected clock: the burst is then the whole budget under
+	// test, rather than a number that depends on how long the loop took to run.
+	base := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	now := base
+	proxy.preSessionDenies.setNow(func() time.Time { return now })
+
+	post := func(i int) {
+		msg := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`9`), Method: "tools/call"}
+		req := httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody)
+		req.Header.Set(SessionHeader, "no-such-session")
+		w := httptest.NewRecorder()
+		proxy.handleSessionPost(w, req, route, "no-such-session", msg)
+
+		// Every one is DENIED — the bound elides records, never enforcement.
+		var resp mcp.RPCMsg
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("response %d is not JSON-RPC: %v (body=%s)", i, err, w.Body.String())
+		}
+		if resp.Error == nil {
+			t.Fatalf("request %d must be denied while a global kill is active, got %s", i, w.Body.String())
+		}
+	}
+
+	const attempts = 200
+	for i := 0; i < attempts-1; i++ {
+		post(i)
+	}
+	// One more after a refill second, so a record IS admitted to carry the rollup the
+	// suppressed ones folded into.
+	now = base.Add(time.Second)
+	post(attempts - 1)
+
+	if err := sink.Close(); err != nil {
+		t.Fatalf("audit.Close: %v", err)
+	}
+	records := readAuditRecords(t, dir+"/audit.jsonl")
+	denies := 0
+	rollup := uint64(0)
+	for _, rec := range records {
+		if d, _ := rec["decision"].(string); d != "deny" {
+			continue
+		}
+		denies++
+		if details, _ := rec["details"].(map[string]interface{}); details != nil {
+			if n, ok := details[detailSuppressedRefusalCount].(float64); ok {
+				rollup += uint64(n)
+				if scope, _ := details[detailSuppressedRefusalScope].(string); scope != suppressedScopeProxyCategory {
+					t.Errorf("rollup scope = %q, want %q", scope, suppressedScopeProxyCategory)
+				}
+			}
+		}
+	}
+	if denies == 0 {
+		t.Fatal("the first refusals in a burst must be recorded in full — the bound caps the rate, it does not silence the evidence")
+	}
+	if denies >= attempts {
+		t.Fatalf("%d of %d pre-session kill records were written; an unauthenticated caller must not set the audit write rate", denies, attempts)
+	}
+	// Nothing vanishes: every suppressed record is folded into a later one's rollup.
+	if got := uint64(denies) + rollup; got != attempts {
+		t.Errorf("recorded %d + suppressed %d = %d, want %d — a suppressed refusal must be counted, not lost", denies, rollup, got, attempts)
 	}
 }

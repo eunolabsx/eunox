@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 // writeConfig writes cfg to a temp file and returns its path.
@@ -704,7 +706,11 @@ upstreams:
     upstreamUrl: https://example.com/mcp
     upstreamTlsSkipVerify: false
 `)
-	present, err := upstreamKeyPresence(raw)
+	var root yaml.Node
+	if err := yaml.Unmarshal(raw, &root); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	present, err := upstreamKeyPresence(&root)
 	if err != nil {
 		t.Fatalf("upstreamKeyPresence: %v", err)
 	}

@@ -555,6 +555,17 @@ func writeDoctorManifests(w io.Writer, cfg *config.GatewayConfig, cfgErr error) 
 	}
 }
 
+// doctorLoadAuditKeys reads the audit key file for the bundle's loadability line. It is a
+// function rather than an inline call so the switch above can report the resolve failure
+// and the load failure as the distinct diagnoses they are: a path that never resolved was
+// never read, so reporting it as unloadable would name the wrong problem.
+func doctorLoadAuditKeys(resolvedKey string, resolveErr error) ([][]byte, error) {
+	if resolveErr != nil {
+		return nil, nil
+	}
+	return audit.LoadKeys(resolvedKey)
+}
+
 // writeDoctorAudit prints aggregated counts from the audit log, then the last
 // `tail` records with `details` values scrubbed and the (noisy) HMAC stripped —
 // the operator can re-verify with `eunox audit-verify` after sharing.
@@ -567,12 +578,19 @@ func writeDoctorAudit(w io.Writer, logPath, keyPath string, tail int) {
 	}
 
 	resolvedKey, keyErr := audit.ResolveKeyPath(keyPath)
-	if keyErr != nil {
+	switch keys, loadErr := doctorLoadAuditKeys(resolvedKey, keyErr); {
+	case keyErr != nil:
 		wf(w, "  key path:  (cannot resolve: %v)\n", keyErr)
-	} else if _, err := os.Stat(resolvedKey); err == nil { //nolint:gosec // G304: resolvedKey is operator-supplied key path; Stat only checks existence
-		wf(w, "  key path:  %s (present)\n", resolvedKey)
-	} else {
-		wf(w, "  key path:  %s (%v)\n", resolvedKey, err)
+	case loadErr != nil:
+		// LOADABILITY, not mere existence. A key file that exists but is unreadable,
+		// truncated, or not hex reported "(present)" — in exactly the deployment chasing
+		// UNKNOWN_KEY_ID, where the whole question is whether this host can verify its own
+		// tape. LoadKeys never mints a key and (since it is the read-only counterpart) never
+		// changes the file's mode, so this stays a read-only probe. No key material is
+		// printed: the count is what an operator needs to see a rotation's keys are present.
+		wf(w, "  key path:  %s (NOT loadable: %v)\n", resolvedKey, loadErr)
+	default:
+		wf(w, "  key path:  %s (present, %d key(s) loadable)\n", resolvedKey, len(keys))
 	}
 
 	// Skip the log-file stat when the path could not be resolved: resolvedLog is ""

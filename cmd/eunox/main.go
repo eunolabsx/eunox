@@ -1204,6 +1204,13 @@ func validateProxyNumericFlags(f *proxyCLIFlags) error {
 		return errors.New("--audit-rotate-size must be >= 0 (0 = use the default size)")
 	case *f.auditRetainRotated < 0:
 		return errors.New("--audit-retain must be >= 0 (0 = keep all rotated files)")
+	// A DURATION flag, guarded here for the same reason as the ints beside it: the Redis
+	// kill switch clamps a non-positive reconcile interval to the 30s default, so a sign
+	// typo meant to SHORTEN the kill-propagation (and fail-closed recovery) window
+	// silently produced the default instead, with no diagnostic, on a revocation-latency
+	// knob.
+	case *f.killswitchReconcile < 0:
+		return errors.New("--killswitch-reconcile-interval must be >= 0 (0 = use the 30s default)")
 	}
 	return nil
 }
@@ -2219,7 +2226,13 @@ func writePolicyLoadResults(wf func(format string, args ...interface{}), prefix 
 // no-policy route, or any policy'd-route load/merge/startup-check failure. code is
 // the route's exit-code contribution (0 clean, 2 a startup-fatal failure) —
 // factored out of validateConfigRoutes's loop body to keep its nesting flat.
-func reportRouteOutcome(wf func(string, ...interface{}), wln func(...interface{}), outcome transport.RouteManifestOutcome, live bool) (code int, skip bool) {
+//
+// It takes the WRITER, not the (wf, wln) closure pair, because the coverage report it
+// ends with takes one: handing this function closures meant rebuilding an io.Writer from
+// them through a dedicated adapter, purely to undo the conversion its own caller had just
+// done.
+func reportRouteOutcome(out io.Writer, outcome transport.RouteManifestOutcome, live bool) (code int, skip bool) {
+	wf, wln := writers(out)
 	if outcome.NoPolicy {
 		// A policyless route is only legal when it will actually boot. Flag a
 		// config the proxy would refuse to start as FAIL rather than green-lighting
@@ -2255,21 +2268,8 @@ func reportRouteOutcome(wf func(string, ...interface{}), wln func(...interface{}
 	// Advisory, and never part of the exit code: an unannotated capability is the
 	// fail-closed default working as intended, not a config defect. Per route, because
 	// the ceiling and the capabilities it governs are both per route.
-	writeEffectCoverage(routeCoverageWriter{wf}, "  ", outcome.Merged, true)
+	writeEffectCoverage(out, "  ", outcome.Merged, true)
 	return 0, false
-}
-
-// routeCoverageWriter adapts the (wf, wln) pair reportRouteOutcome is handed to the
-// io.Writer writeEffectCoverage takes, so the per-route and whole-manifest reports are
-// produced by ONE function rather than two that drift. reportRouteOutcome receives write
-// closures rather than the writer itself, which is why the adapter is needed at all.
-type routeCoverageWriter struct {
-	wf func(string, ...interface{})
-}
-
-func (w routeCoverageWriter) Write(p []byte) (int, error) {
-	w.wf("%s", p)
-	return len(p), nil
 }
 
 // validateConfigRoutes walks every upstream in cfg, validating each route's
@@ -2302,7 +2302,7 @@ func validateConfigRoutes(ctx context.Context, cfg *config.GatewayConfig, live b
 		// via the shared walk both validate and doctor use.
 		outcome := transport.WalkRouteManifests(cfg, u)
 
-		exitCode, skip := reportRouteOutcome(wf, wln, outcome, live)
+		exitCode, skip := reportRouteOutcome(out, outcome, live)
 		if exitCode > worst {
 			worst = exitCode
 		}
@@ -2485,6 +2485,13 @@ func writeGeneratedFile(path, content string, force bool) (err error) {
 	return nil
 }
 
+// initUsageExit is init's exit code for a usage error. It is 2, matching validate — the
+// sibling it shares live-introspection flags with — and contracts, rather than the 1 it
+// used: init reports no findings, so it has nothing 1 could mean, and an operator (or a
+// scaffolding script) reading a 1 from one command and a 2 from the other for the same
+// class of mistake has to learn each command's private convention.
+const initUsageExit = 2
+
 // cmdInit runs the `init` subcommand and returns the process exit code (rather
 // than calling os.Exit itself), so tests can drive every branch — including the
 // fail-closed error paths — without terminating the test binary. args carries
@@ -2507,6 +2514,10 @@ introspected transport, so the quickstart is two commands:
   eunox init  --upstream-url <url> --output manifest.yaml --config-output eunox.yaml
   eunox proxy --config eunox.yaml
 
+Exit codes:
+  0  Manifest generated (to stdout, or to --output).
+  2  Usage error, or a failure reaching the upstream or writing a file.
+
 Flags:
 `)
 		fs.PrintDefaults()
@@ -2526,7 +2537,7 @@ Flags:
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
-		return 1
+		return initUsageExit
 	}
 
 	// Reject the incoherent --config-output-without--output combination up front, before
@@ -2535,14 +2546,14 @@ Flags:
 	// buildInitUpstreamSpec's reject-flag-mixes-before-the-first-network-call posture).
 	if *configOutput != "" && *output == "" {
 		fmt.Fprintf(os.Stderr, "eunox init: --config-output requires --output (the config references the manifest file)\n")
-		return 1
+		return initUsageExit
 	}
 
 	positional := fs.Args()
 	spec, err := buildInitUpstreamSpec(*transportFlag, *upstreamURL, *authHeader, *tlsSkipVerify, positional)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "eunox init: %v\n", err)
-		return 1
+		return initUsageExit
 	}
 
 	fmt.Fprintf(os.Stderr, "Fetching tool list from upstream...")

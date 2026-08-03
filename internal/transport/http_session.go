@@ -906,11 +906,12 @@ func (p *HTTPProxy) reapOnce(idle time.Duration) {
 		hard *= hardIdleMultiplier
 	}
 	hardCutoff := now.Add(-hard).UnixNano()
-	// staleSession pairs a reaped session with whether it tripped the hard ceiling,
-	// so the log line can name the reason; both share the close path.
+	// staleSession pairs a reaped session with WHY it is being reaped, so the log line
+	// can name the reason; all three arms share the close path.
 	type staleSession struct {
-		s    *httpSession
-		hard bool
+		s      *httpSession
+		hard   bool
+		killed bool
 	}
 	// Snapshot under p.mu, then release it BEFORE the idle/subscriber checks:
 	// hasSubscribers takes s.notifMu, so checking under p.mu would establish the lock
@@ -929,9 +930,34 @@ func (p *HTTPProxy) reapOnce(idle time.Duration) {
 	var stale []staleSession
 	for _, s := range snapshot {
 		// A session still initializing (handshake + synchronous drift check) is not
-		// eligible for reaping: it is registered but has no subscribers and a stale
-		// lastActive while the drift check blocks, which would otherwise read as idle.
+		// eligible for reaping on ANY arm: it is registered but has no subscribers and a
+		// stale lastActive while the drift check blocks, which would otherwise read as
+		// idle — and tearing one down would race the establishment path's own teardown,
+		// which no reap arm does today. A session killed while it establishes is denied
+		// throughout and reclaimed by the next sweep.
 		if s.initInProgress.Load() {
+			continue
+		}
+		// A KILLED session is reaped whatever its idle state, because a kill this
+		// instance did not itself serve has nothing else that reclaims it. The local
+		// /control/kill path calls reapKilledSession inline, but a kill delivered through
+		// Redis — `eunox kill --redis-addr`, or a sibling instance's /control/kill, the
+		// multi-instance deployments the Redis backend exists for — reaches this proxy
+		// only through CheckKill. Its traffic is denied either way (fail-closed holds),
+		// but without this sweep its subprocess and its maxSessions slot stay pinned and
+		// its SSE stream is never evicted: accumulated killed-but-undead sessions
+		// eventually 503 every new initialize, the session-exhaustion DoS the kill switch
+		// would then be triggering itself.
+		//
+		// The read is a local cache lookup, not a kill-store round trip (the Redis backend
+		// serves ShouldBlock from the cache its pub/sub and reconcile loops refresh), so
+		// this costs one map read per session per sweep.
+		//
+		// NOTE: this sweep is the idle reaper's, so it does not run at all under
+		// sessionIdleTimeoutMs: 0. A deployment taking kills through Redis wants a
+		// non-zero idle timeout — see the field's documentation.
+		if p.sessionKilled(s) {
+			stale = append(stale, staleSession{s: s, killed: true})
 			continue
 		}
 		switch {
@@ -963,6 +989,7 @@ func (p *HTTPProxy) reapOnce(idle time.Duration) {
 	for _, ss := range stale {
 		s := ss.s
 		hardReap := ss.hard
+		killed := ss.killed
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -973,6 +1000,21 @@ func (p *HTTPProxy) reapOnce(idle time.Duration) {
 			// log line is emitted only AFTER the re-check passes and inside this
 			// goroutine — printing it before (for every stale-snapshot entry) produced
 			// false "reaped" messages for sessions the re-check then spared.
+			if killed {
+				// Re-checked for the same reason the idle arms are: an operator who
+				// revived the kill between the snapshot and now should not lose the
+				// session to this sweep.
+				if !p.sessionKilled(s) {
+					return
+				}
+				fmt.Fprintf(os.Stderr, "[eunox] HTTP session %s reaped (kill switch active for this session).\n", s.id)
+				// Evict the SSE stream explicitly: the GET keepalive arm is not
+				// kill-gated, so a killed session's open stream would otherwise survive
+				// its own teardown. The local kill path evicts through the same call.
+				s.evictStreams()
+				s.close(p.shutdownMs)
+				return
+			}
 			if hardReap {
 				if s.lastRequest.Load() >= hardCutoff || !p.hardReapEligible(s) {
 					return
@@ -992,6 +1034,40 @@ func (p *HTTPProxy) reapOnce(idle time.Duration) {
 		}()
 	}
 	wg.Wait()
+}
+
+// sessionKilled reports whether the kill switch currently names this session — its own
+// id, its agent, or a global emergency stop. It is the reaper's read of the same
+// authority the request path consults, so a session the data plane is already denying is
+// one the reaper reclaims, however the kill arrived (locally through /control/kill, or
+// through Redis from another instance).
+//
+// It answers ONLY on an actual kill. CheckKill also denies on a kill-store ERROR
+// (KILL_SWITCH_ERROR — the fail-closed answer to, say, a Redis blip under the default
+// posture), and that is the right answer for a REQUEST: deny now, serve again when the
+// store recovers, seconds later. It is the wrong answer HERE, because this sweep's
+// response is not a denial but a teardown — every live session on the instance would
+// lose its upstream and its stream over a store that was briefly unreachable, and no
+// recovery undoes that. A store fault is not evidence that anyone was killed.
+//
+// The session's own claims ride the check, so an AGENT-scoped kill reclaims its sessions
+// too: the store matches on (agent, session), and a background sweep has no request
+// context to take an agent id from. Same source the upstream-notification gate uses.
+//
+// A session assembled without a route or PDP (an in-package test literal) is never
+// killed: there is no authority to ask. That is not a security-gate fail-open — the
+// gates that DENY traffic are elsewhere and unconditional — only a reclaim this sweep
+// cannot perform.
+func (p *HTTPProxy) sessionKilled(s *httpSession) bool {
+	if s.route == nil || s.route.pdp == nil {
+		return false
+	}
+	ctx := context.Background()
+	if s.claims != nil {
+		ctx = pdp.WithJWTClaims(ctx, s.claims)
+	}
+	deny := s.route.pdp.CheckKill(ctx, s.id)
+	return deny != nil && deny.Denial != nil && deny.Denial.Code == capability.ErrCodeKillSwitch
 }
 
 // hardReapEligible reports whether a session past the hard idle ceiling may be torn
@@ -1231,16 +1307,20 @@ func (s *httpSession) readUpstream(ctx context.Context) {
 			// of the kill only through CheckKill/pubsub — so gate the broadcast here too,
 			// mirroring the stdio transport. CheckKill reads the local cache (cheap) and
 			// denies on a store error (fail closed); the drop is recorded for auditability.
-			// s.route is non-nil in production; the guard covers a test-assembled session.
-			if s.route != nil && s.route.pdp != nil {
-				killCtx := ctx
-				if s.claims != nil {
-					killCtx = pdp.WithJWTClaims(killCtx, s.claims)
-				}
-				if deny := s.route.pdp.CheckKill(killCtx, s.id); deny != nil {
-					recordKillDrop(killCtx, asRecorder(s.route.sink), deny, verifiedSession(s.id), msg.Method, msg.Method, legHTTPUpstreamNotification)
-					continue
-				}
+			//
+			// Dereferenced unconditionally, with no `s.route != nil` guard. handleMCPGet
+			// rejects exactly that pattern in gate code for the reason it applies here:
+			// production never builds a route-less session, so the branch can only ever be
+			// taken by a test — and what it does when taken is SKIP a kill check and
+			// broadcast, i.e. fail open in the one place this block exists to close. A
+			// route-less session reaching here should panic like the construction bug it is.
+			killCtx := ctx
+			if s.claims != nil {
+				killCtx = pdp.WithJWTClaims(killCtx, s.claims)
+			}
+			if deny := s.route.pdp.CheckKill(killCtx, s.id); deny != nil {
+				recordKillDrop(killCtx, asRecorder(s.route.sink), deny, verifiedSession(s.id), msg.Method, msg.Method, legHTTPUpstreamNotification)
+				continue
 			}
 			s.broadcast(msg)
 			continue
