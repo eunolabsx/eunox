@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -926,6 +927,48 @@ func BenchmarkAuditRecord(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			sink.RecordAllow(context.Background(), "sess-bench", "read_file", "tools/call", details, []string{"redactFields"}, false, nil, nil)
+		}
+	})
+}
+
+// BenchmarkDecisionTurn_SessionAnchored measures what a serialized route pays per enforced
+// request when the turn is UNCONTENDED — distinct sessions, so no two goroutines want the same
+// anchor. That is the shape ordinary traffic has, and it is the shape the anchor-keyed registry
+// made expensive: the refcount falls to zero the instant a non-overlapping request finishes, so
+// the steady state was create-insert-lookup-delete on a route-wide mutex per call, with
+// contention scaling against the route's whole request rate rather than against contending
+// anchors.
+//
+// A session-anchored route's anchor cannot change between its requests, so the session holds one
+// gate for its life and this path touches no map and no route-wide lock. Run both to see the
+// difference the cache makes:
+//
+//	go test -run XXX -bench 'BenchmarkDecisionTurn' -cpu=8 ./internal/transport/
+func BenchmarkDecisionTurn_SessionAnchored(b *testing.B) {
+	benchmarkDecisionTurn(b, true)
+}
+
+// BenchmarkDecisionTurn_ResolvedPerRequest is the same measurement without the cache — the path
+// a task-anchored route necessarily takes, since there the anchor comes from each request's own
+// claims and two sessions sharing a task must reach one gate.
+func BenchmarkDecisionTurn_ResolvedPerRequest(b *testing.B) {
+	benchmarkDecisionTurn(b, false)
+}
+
+func benchmarkDecisionTurn(b *testing.B, cached bool) {
+	b.Helper()
+	rt := &UpstreamRoute{decideGates: newAnchorGates()}
+	ctx := context.Background()
+	var seq atomic.Uint64
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		sess := &httpSession{id: fmt.Sprintf("sess-%d", seq.Add(1)), route: rt}
+		if cached {
+			sess.holdDecisionGate()
+			defer sess.dropDecideGate()
+		}
+		for pb.Next() {
+			sess.beginDecisionTurn(ctx)()
 		}
 	})
 }

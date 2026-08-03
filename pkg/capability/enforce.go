@@ -360,10 +360,12 @@ type FlowLabelStore interface {
 
 	// Remove deletes the named labels from the session's set (idempotent — removing
 	// an absent label is a no-op). It backs the fail-closed rollback of a source
-	// call's flow write when the paired sequenceBlock antecedent write then faults:
-	// the per-session decision lock makes this rollback race-free, so it removes
-	// exactly the labels the faulted call added and never a concurrent source's. An
-	// empty labels list is a no-op.
+	// call's flow write when the paired sequenceBlock antecedent write then faults.
+	// That rollback is a compensating delete against SHARED state, so the engine
+	// performs it only where no other caller can be writing the same key — see
+	// Engine.rollbackLabels, which declines it for a task-anchored request rather
+	// than relying on an ordering guarantee it cannot see. An empty labels list is a
+	// no-op.
 	Remove(ctx context.Context, sessionKey string, labels ...string) error
 
 	// Clear releases the session's entire set, called from the transport's session

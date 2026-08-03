@@ -23,6 +23,8 @@ import (
 	"github.com/eunolabs/eunox/pkg/enforcement"
 	"github.com/eunolabs/eunox/pkg/flowlabelstore"
 	"github.com/eunolabs/eunox/pkg/killswitch"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestDecisionSerializer_FIFOOrderUnderConcurrency proves the serialization primitive
@@ -33,10 +35,11 @@ func TestDecisionSerializer_FIFOOrderUnderConcurrency(t *testing.T) {
 	t.Parallel()
 	const n = 200
 	g := newDecisionSerializer()
-	// Reserve every ticket up front, in order, as the single-threaded reader would.
-	tickets := make([]uint64, n)
+	// Reserve every ticket up front, in order, as the single-threaded reader would. One
+	// anchor, which is what a stdio host resolves for every request on it.
+	tickets := make([]decisionTicket, n)
 	for i := range tickets {
-		tickets[i] = g.take()
+		tickets[i] = g.take(sessionAnchorKey("sess"))
 	}
 
 	var mu sync.Mutex
@@ -253,13 +256,13 @@ func TestFlowSerialize_SamplingSinkSerializedAgainstSource(t *testing.T) {
 		gate := newDecisionSerializer()
 		// The host reader reserves the source's decision ticket FIRST (receipt order), before
 		// the sampling decision is dispatched to the upstream-reader goroutine.
-		srcTicket := gate.take()
+		srcTicket := gate.take(sessionAnchorKey(sessionID))
 
 		fp := serverRequestParams{
 			sessionID: sessionID,
 			// The sampling decision reserves its own (later) ticket and blocks until its turn —
 			// the exact wiring stdio's samplingDecideLock installs.
-			decideLock: func() (func(), bool) { return gate.begin(gate.take()), true },
+			decideLock: func() (func(), bool) { return gate.begin(gate.take(sessionAnchorKey(sessionID))), true },
 		}.withPDP(dp)
 
 		var wg sync.WaitGroup
@@ -419,4 +422,76 @@ func TestFinishDecision_HoldsTheTurnForADeclassifyingCall(t *testing.T) {
 	var d dispatchParams
 	d.finishDecision(capability.EnforceResponse{
 		Declassification: capability.NewDeclassification([]string{capability.FlowLabelPII}, "ada@example.com", "apr-1", false)})
+}
+
+// TestDecisionSerializer_KeysOnTheAnchor is the stdio half of the property the HTTP gate
+// registry provides: the FIFO turn is per ANCHOR, not per proxy. Two anchors accumulate no
+// shared state, so their decisions must not queue behind each other; two requests on one
+// anchor must.
+//
+// It is currently exercised only by this test, because nothing on the stdio path attaches
+// validated claims and every request there resolves to the proxy's single session. That is why
+// the keying is here rather than assumed: StdioProxyOptions.PDP is an exported seam, and the
+// first per-request token channel on this transport would otherwise have left one FIFO queue
+// silently serving two anchors' worth of state.
+func TestDecisionSerializer_KeysOnTheAnchor(t *testing.T) {
+	t.Parallel()
+	g := newDecisionSerializer()
+	a, b := sessionAnchorKey("sess-a"), taskAnchorKey("task-42")
+
+	held := g.begin(g.take(a))
+	// A ticket on a DIFFERENT anchor runs immediately.
+	other := make(chan struct{})
+	go func() { defer close(other); g.begin(g.take(b))() }()
+	select {
+	case <-other:
+	case <-time.After(time.Second):
+		t.Fatal("a different anchor must not queue behind this one")
+	}
+
+	// A second ticket on the SAME anchor waits.
+	queued := make(chan struct{})
+	ticket := g.take(a)
+	go func() { defer close(queued); g.begin(ticket)() }()
+	select {
+	case <-queued:
+		t.Fatal("a second request on one anchor must wait its turn")
+	case <-time.After(20 * time.Millisecond):
+	}
+	held()
+	select {
+	case <-queued:
+	case <-time.After(time.Second):
+		t.Fatal("the turn must advance once released")
+	}
+	assert.Zero(t, g.size(), "a queue whose tickets have all been served must not be retained")
+}
+
+// TestDecisionSerializer_ZeroTicketIsANoOp: a request that was never serialized carries the
+// zero ticket, and the call site must not have to branch on it.
+func TestDecisionSerializer_ZeroTicketIsANoOp(t *testing.T) {
+	t.Parallel()
+	g := newDecisionSerializer()
+	require.NotPanics(t, func() { g.begin(decisionTicket{})() })
+}
+
+// TestStdioDecisionAnchor_ResolvesThroughTheSharedResolver pins that the stdio proxy asks the
+// same question the engine's key builder asks. Today the answer is always the session — the
+// transport attaches no validated claims — and that is exactly the premise that was previously
+// held up by a CLI flag check in another package rather than by anything on this path.
+func TestStdioDecisionAnchor_ResolvesThroughTheSharedResolver(t *testing.T) {
+	t.Parallel()
+	claims := &pdp.JWTClaims{TaskID: "task-42"}
+	withClaims := pdp.WithJWTClaims(context.Background(), claims)
+
+	plain := &StdioProxy{sessionID: "sess-a"}
+	assert.Equal(t, sessionAnchorKey("sess-a"), plain.decisionAnchor(context.Background()))
+	assert.Equal(t, sessionAnchorKey("sess-a"), plain.decisionAnchor(withClaims),
+		"an operator who did not enable task anchoring sees the session turn, claims or no claims")
+
+	anchored := &StdioProxy{sessionID: "sess-a", taskAnchored: true}
+	assert.Equal(t, sessionAnchorKey("sess-a"), anchored.decisionAnchor(context.Background()),
+		"a request with no token anchors on the session, exactly as the engine keys it")
+	assert.Equal(t, taskAnchorKey("task-42"), anchored.decisionAnchor(withClaims),
+		"and a validated task claim keys the turn where the state lives")
 }

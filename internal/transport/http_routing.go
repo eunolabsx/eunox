@@ -667,10 +667,11 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 		// so a nil-route session cannot reach here — a nil check would only mislead a
 		// reader into believing one can.
 		if sess.route.serializes() && isEnforcedMethod(msg.Method) {
-			// begin's release is already idempotent, so the handler's
+			// The release is already idempotent, so the handler's
 			// release-after-decision (finishDecision) and this deferred backstop advance
-			// the turn exactly once between them.
-			end := sess.route.decideGates.begin(sess.route.decisionAnchorFromContext(ctx, sess.id))
+			// the turn exactly once between them. A session-anchored route takes it on the
+			// gate held for the session's life; a task-anchored one resolves per request.
+			end := sess.beginDecisionTurn(ctx)
 			d.endDecision = end
 			defer end()
 		}

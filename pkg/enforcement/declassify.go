@@ -509,12 +509,13 @@ func declassifyRecordFailureDenial(requestID, now string, auditOnly bool, spentA
 		Details:       map[string]interface{}{capability.FlowAuditDetailKey: true, "phase": "record"},
 	})
 	if spentApprovalID != "" {
-		// A handle carrying NO labels: nothing here authorizes a clear (the resolution never
-		// got that far), and its whole job is to name the burned grant. The commit skips a
-		// handle with an empty set, so this cannot become a clear on a refused call — see
-		// NewDeclassification for why the empty-set handle is a legitimate shape rather than
-		// a nil.
-		resp.Declassification = capability.NewDeclassification(nil, "", spentApprovalID, true)
+		// A handle carrying NO labels and no authorizing approval: nothing here authorized a
+		// clear (the resolution never got that far), and its whole job is to name the burned
+		// grant. The dedicated constructor is what keeps the id off ApprovalID(), which feeds
+		// the top-level signed approval_id — reserved for a declassification that actually
+		// took effect, so a refusal must not populate it. The commit skips a handle with an
+		// empty set, so this cannot become a clear on a refused call either.
+		resp.Declassification = capability.NewSpentGrantOnly(spentApprovalID)
 	}
 	return resp
 }

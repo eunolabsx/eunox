@@ -84,8 +84,8 @@ func runToolCall(t *testing.T, rec *fwdRecorder, verifier *capability.EffectRece
 				return mcp.RPCMsg{JSONRPC: "2.0", ID: msg.ID, Result: result}, nil
 			},
 		},
-		pdp:      dp,
-		receipts: verifier,
+		decidingPDP: decidingPDP{pdp: dp},
+		receipts:    verifier,
 	}
 	msg := mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsCall,

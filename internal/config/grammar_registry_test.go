@@ -4,6 +4,9 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -253,4 +256,120 @@ type impostorDirective struct{}
 func (impostorDirective) DirectiveType() string { return capability.DirectiveTypeRedactFields }
 func (impostorDirective) ToObligation() capability.Obligation {
 	return capability.Obligation{Type: capability.DirectiveTypeRedactFields}
+}
+
+// withPublishedRevision appends a synthetic grammar revision to the published sequence for
+// the duration of one test, and returns it.
+//
+// A third revision cannot otherwise be covered before it exists, and "before it exists" is
+// exactly when the forward-compatibility of the gate has to be right: the failure it guards
+// against is a semantics-only revision that introduces NO token and, under a rule spelled as
+// an equality, refuses every token its predecessor defined — with the operator told their
+// flowLabel condition "requires schemaVersion 0.2" on a manifest that declares 0.3.
+//
+// It mutates a package var, so its tests do not run in parallel.
+func withPublishedRevision(t *testing.T) string {
+	t.Helper()
+	const synthetic = "0.3-synthetic"
+	orig := supportedManifestSchemaVersions
+	supportedManifestSchemaVersions = append(slices.Clone(orig), synthetic)
+	t.Cleanup(func() { supportedManifestSchemaVersions = orig })
+	return synthetic
+}
+
+// TestThirdRevisionInheritsEveryPublishedToken is the forward-compatibility guard on the
+// grammar gate. Every token any published revision introduced must still load under a revision
+// published AFTER it — including the whole flow+effect batch, which a rule written for exactly
+// two revisions refused the moment a third appeared.
+func TestThirdRevisionInheritsEveryPublishedToken(t *testing.T) {
+	next := withPublishedRevision(t)
+	for _, token := range allKnownTokens() {
+		if _, classified := capability.TokenSince(token); !classified {
+			continue
+		}
+		t.Run(token, func(t *testing.T) {
+			m := &LocalManifest{
+				SchemaVersion: next,
+				Capabilities:  []capability.Constraint{constraintCarrying(t, token)},
+			}
+			assert.NoError(t, checkTokenGrammarVersion(m),
+				"%q was published before %q and must still be part of its grammar", token, next)
+		})
+	}
+}
+
+// TestThirdRevisionInheritsTheNonDiscriminatorTokens covers the same rule for the four tokens
+// that carry no prototype-registry entry and are therefore gated by hand — the top-level
+// effectCeiling, a constraint's effect contract, the ${task.*} variables, and the wire-side
+// attribution interface. Each was its own equality against the introducing revision, so each
+// would have inverted independently.
+func TestThirdRevisionInheritsTheNonDiscriminatorTokens(t *testing.T) {
+	next := withPublishedRevision(t)
+
+	ceiling := &LocalManifest{
+		SchemaVersion: next,
+		EffectCeiling: &capability.EffectCeiling{MaxEffectClass: capability.EffectReversible},
+		Capabilities:  []capability.Constraint{{Target: "tool:x", Actions: []string{"call"}}},
+	}
+	assert.NoError(t, checkTokenGrammarVersion(ceiling), "the top-level effectCeiling must survive a later revision")
+
+	contract := &LocalManifest{
+		SchemaVersion: next,
+		Capabilities: []capability.Constraint{{
+			Target: "tool:x", Actions: []string{"call"},
+			Effect: &capability.EffectContract{Class: capability.EffectReversible},
+		}},
+	}
+	assert.NoError(t, checkTokenGrammarVersion(contract), "a capability's effect contract must survive a later revision")
+
+	taskVar := &LocalManifest{
+		SchemaVersion: next,
+		Capabilities: []capability.Constraint{{
+			Target: "tool:x", Actions: []string{"call"},
+			Conditions: []capability.Condition{capability.AllowedValuesCondition{
+				Argument: "a", Values: []interface{}{"${" + capability.TaskVarID + "}"},
+			}},
+		}},
+	}
+	assert.NoError(t, checkTokenGrammarVersion(taskVar), "a ${task.*} reference must survive a later revision")
+
+	assert.True(t, (&LocalManifest{SchemaVersion: next}).HonorsAttributionInterface(),
+		"the attribution interface must stay admitted under a revision published after the one that introduced it")
+}
+
+// TestEarlierRevisionStaysClosedAgainstALaterToken is the half that must NOT change:
+// inheritance runs forward only. A token a later revision introduces is still refused under
+// every revision published before it, which is the gate's entire job.
+func TestEarlierRevisionStaysClosedAgainstALaterToken(t *testing.T) {
+	next := withPublishedRevision(t)
+	assert.False(t, revisionAdmits(ManifestSchemaVersion01, next),
+		"the base grammar must not admit a token introduced by a later revision")
+	assert.False(t, revisionAdmits(ManifestSchemaVersion02, next))
+	assert.True(t, revisionAdmits(next, ManifestSchemaVersion01))
+	assert.True(t, revisionAdmits(next, ManifestSchemaVersion02))
+	assert.True(t, revisionAdmits(next, next))
+
+	// And an unknown revision on either side admits nothing: this build cannot place it in
+	// the sequence, so it must refuse rather than guess.
+	assert.False(t, revisionAdmits("0.9-unpublished", ManifestSchemaVersion01))
+	assert.False(t, revisionAdmits(ManifestSchemaVersion02, "0.9-unpublished"))
+}
+
+// TestThirdRevisionLoadsAFlowManifestEndToEnd drives the whole loader rather than the gate
+// alone: a manifest file declaring the synthetic revision and carrying a flow+effect token
+// must load. The two halves are separate reads of the published sequence — one decides which
+// versions parse, the other which tokens each admits — and this is what pins that they agree.
+func TestThirdRevisionLoadsAFlowManifestEndToEnd(t *testing.T) {
+	next := withPublishedRevision(t)
+	path := filepath.Join(t.TempDir(), "m.yaml")
+	body := "schemaVersion: \"" + next + "\"\nname: m\nversion: \"1.0.0\"\n" +
+		"capabilities:\n  - target: tool:t\n    actions: [call]\n" +
+		"    conditions:\n      - type: flowLabel\n        allow: [public]\n" +
+		"    directives:\n      - type: labelOutput\n        labels: [pii]\n"
+	require.NoError(t, os.WriteFile(path, []byte(body), 0o600))
+
+	m, err := LoadManifest(path)
+	require.NoError(t, err, "a revision published after 0.2 still contains 0.2's grammar")
+	require.Len(t, m.Capabilities, 1)
+	assert.True(t, m.HasFlowLabel())
 }

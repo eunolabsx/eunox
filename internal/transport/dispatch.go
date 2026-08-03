@@ -38,7 +38,7 @@ import (
 // fail-closed "no policy" default.
 type dispatchParams struct {
 	forwardParams
-	pdp      pdp.PolicyDecisionPoint
+	decidingPDP
 	sourceIP string
 	// buildInit answers a host `initialize` locally from the upstream capabilities
 	// captured at session start (HTTP: the session's; stdio: the proxy's). It is
@@ -62,6 +62,28 @@ type dispatchParams struct {
 	// the interface is union-only, so ignoring it falls back to the conservative session
 	// join, which is the stricter reading.
 	honorAttribution bool
+}
+
+// decidingPDP holds the policy decision point a params struct decides with. It exists to make
+// the field UNSPELLABLE in a composite literal: Go forbids setting a promoted field in a
+// literal, so `dispatchParams{pdp: p}` and `serverRequestParams{pdp: p}` no longer compile in
+// any spelling — including the two an AST guard is most likely to miss, an element of a
+// slice/map literal that ELIDES its type and a literal built somewhere the guard does not walk.
+//
+// That matters because every field derived FROM the decision point (today the committer) must
+// be set by the same step that sets it; a site that assigns pdp and forgets the derived field
+// compiles, passes every test that does not exercise a declassification, and then silently
+// never clears a label. withPDP is the one step, and this type is what forces callers through
+// it rather than merely asking them to.
+//
+// SCOPE, stated rather than implied: Go's encapsulation is package-scoped, so a literal of
+// THIS type (`decidingPDP{pdp: p}`) and an assignment to the promoted field (`d.pdp = p`) are
+// both still writable from anywhere in internal/transport. Those two spellings are what the
+// source guard beside the type covers (see TestParamsLiterals_DoNotAssignThePDPFields); this
+// closes the accidental version, the guard closes the deliberate one, and neither pretends the
+// wrong value is unassignable.
+type decidingPDP struct {
+	pdp pdp.PolicyDecisionPoint
 }
 
 // withPDP records the policy decision point and derives every field that must be the SAME
@@ -754,7 +776,7 @@ func dispatchList(ctx context.Context, d dispatchParams, msg mcp.RPCMsg, filter 
 	// intentional.
 	// nil extra: a */list is never an enforced decision, so it can carry no
 	// declassification for a gate block to report.
-	if denied, blocked := d.strictAuditDenial(ctx, msg, msg.Method, msg.Method, msg.Method, nil); blocked {
+	if denied, blocked := d.strictAuditDenial(ctx, msg, msg.Method, msg.Method, msg.Method, capability.EnforceResponse{}); blocked {
 		return denied
 	}
 

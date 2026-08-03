@@ -23,7 +23,7 @@ const ClaimDeclassify = "declassify"
 // chain's depth cap this is a bound on attacker-influenced input the decision path walks, not
 // hygiene: the engine tests each COVERING grant against the ledger to find a live one, so a
 // token stuffed with spent single-use grants for one action turns every later call at that
-// action into that many ledger reads, inside the per-session decision lock, forever. Thirty-two
+// action into that many ledger reads, inside the anchor-keyed decision turn, forever. Thirty-two
 // is far above any real approval workflow (a human approves one action at a time) and far
 // below anything measurable.
 const MaxDeclassifyApprovals = 32

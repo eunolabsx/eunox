@@ -1951,11 +1951,17 @@ func serveStdioHost(ctx context.Context, cfg *config.GatewayConfig, sink *audit.
 		UpstreamTimeMs:        upstreamTimeMs,
 		Audit:                 auditMode,
 		RequireAuditStrict:    pf.requireAuditStrict,
-		// Serialize the decision phase when the policy reads/writes per-session state a
+		// Serialize the decision phase when the policy reads/writes accumulated state a
 		// source commits and a later call reads (flow labels or sequenceBlock), so a
-		// pipelining host cannot race a sink ahead of its source. A non-flow/non-sequence
-		// policy keeps full parallelism.
-		SerializeDecisions: manifest != nil && (manifest.HasFlowLabel() || manifest.HasSequenceBlock()),
+		// pipelining host cannot race a sink ahead of its source. A policy that accumulates
+		// nothing keeps full parallelism. The predicate is single-sourced in config so this
+		// host and the gateway's route builder cannot drift on which policies need a turn.
+		SerializeDecisions: manifest.NeedsDecisionTurn(),
+		// The operator's task-anchoring setting for THIS upstream — the same value handed to
+		// LoadUpstreamPDP above, so the engine's state key and the proxy's decision turn are
+		// built from one bit rather than two. Inert on stdio as shipped (nothing attaches
+		// validated claims here); see the option's own doc for why it is wired regardless.
+		TaskAnchoredState: cfg.ResolvedTaskAnchoredState(u),
 		// Admit the client-supplied attribution interface only under the draft
 		// schemaVersion that contains it; a published-grammar policy ignores the block.
 		HonorAttribution: manifest.HonorsAttributionInterface(),

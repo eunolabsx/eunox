@@ -367,18 +367,22 @@ func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability
 		r.pdp = dp
 		r.manifest = manifest
 		r.taskAnchored = taskAnchored
-		// Serialize this route's decision phase when its policy is
-		// flow- or sequenceBlock-relevant (both read accumulated state a source writes
-		// and a later call reads), so a source's write is ordered before a later sink's
-		// read on the same anchor under concurrent in-flight requests.
-		// A non-flow/non-sequence route keeps full
-		// decision parallelism (no registry, and serializes() reports false).
+		// Serialize this route's decision phase when its policy accumulates state one call
+		// writes and a later one reads, so a source's write is ordered before a later sink's
+		// read on the same anchor under concurrent in-flight requests. A policy that
+		// accumulates nothing keeps full decision parallelism (no registry, and serializes()
+		// reports false).
+		//
+		// The predicate is config's NeedsDecisionTurn, the same one the stdio host consults.
+		// Spelled out at both sites it was a mirrored condition whose failure is silent: a
+		// third state-accumulating token added to one copy leaves one transport serializing
+		// and the other racing, with nothing failing to say so.
 		//
 		// The registry is per ROUTE, not per session: the turn has to span the anchor the
 		// state accrues to, and under task anchoring two sessions can share one. Per route
 		// rather than per proxy because routes namespace their own state, so identical task
 		// ids on two routes address different buckets and must not queue behind each other.
-		if manifest != nil && (manifest.HasFlowLabel() || manifest.HasSequenceBlock()) {
+		if manifest.NeedsDecisionTurn() {
 			r.decideGates = newAnchorGates()
 		}
 		r.honorAttribution = manifest.HonorsAttributionInterface()

@@ -101,6 +101,22 @@ type httpSession struct {
 	// under task-anchored state two sessions share one key and a per-session lock would not
 	// span it. Under the default session anchoring the route's gate for this session's key
 	// IS a per-session mutex, so nothing changed for that deployment. See anchor_gate.go.
+	//
+	// decideGate is that gate, resolved ONCE at registration and held for the session's
+	// life, for the case where it is a per-session constant: a route that does not anchor
+	// state on the task. There the anchor is invariantly this session's id, so going back
+	// through the route's registry per request bought nothing and cost a route-wide mutex,
+	// a map insert and a map delete on every enforced call — the refcount fell to zero the
+	// moment a non-overlapping request finished, so ordinary sequential traffic re-created
+	// the same entry per call on the microsecond decision path. nil on a task-anchored
+	// route, where the anchor genuinely varies per request and the registry round trip is
+	// the point, and nil on a non-serialized route (and on a test-assembled session that
+	// never registered, which falls back to the always-correct registry path).
+	decideGate *anchorGate
+	// dropDecideGate releases the reference above at teardown, so a long-lived gateway does
+	// not accumulate one gate per session it has ever served. nil when none is held;
+	// idempotent, and called from close(), which runs exactly once.
+	dropDecideGate func()
 
 	notifMu   sync.Mutex
 	notifSubs []chan mcp.RPCMsg
@@ -630,8 +646,73 @@ func (p *HTTPProxy) registerSession(sess *httpSession, startGen uint64) error {
 	// Seed lastRequest so the hard idle ceiling is measured from creation: the
 	// initialize POST counts as the first host request.
 	sess.lastRequest.Store(now)
+	// Resolve the session's decision gate here, on the one path every session that will
+	// ever serve a request passes through, and only after the checks above — a session
+	// this call refuses is never registered and must not leave a reference behind. The
+	// gate registry is leaf-level (it locks nothing under its own mutex), so entering it
+	// under p.mu introduces no ordering hazard.
+	sess.holdDecisionGate()
 	p.sessions[sess.id] = sess
 	return nil
+}
+
+// holdDecisionGate takes and keeps this session's decision-turn gate for the cases where the
+// turn's anchor is a per-session CONSTANT — a serialized route that does not anchor state on
+// the task. The reference is released by close().
+//
+// A task-anchored route holds nothing: its anchor is resolved per request from that request's
+// validated claims, and two sessions sharing a task must reach the same gate, which is exactly
+// what the registry is for. A non-serialized route has no registry at all.
+func (s *httpSession) holdDecisionGate() {
+	rt := s.route
+	if !rt.serializes() || rt.taskAnchored {
+		return
+	}
+	// Resolved through the route's own anchor resolver with no claims, which is what a
+	// non-task-anchored route resolves for every request on this session anyway — so the
+	// cached gate is the same gate the per-request path would have found, not a second
+	// keying scheme.
+	s.decideGate, s.dropDecideGate = rt.decideGates.hold(rt.decisionAnchor(s.id, nil))
+}
+
+// beginDecisionTurn enters this request's decision turn and returns the idempotent release,
+// or nil when the route is not serialized. The host path holds the turn on its own request
+// goroutine, so it waits without a bound.
+//
+// ctx supplies the request's VALIDATED claims, which decide the anchor on a task-anchored
+// route. A session-anchored route takes its turn on the gate held for the session's life and
+// touches the registry not at all.
+func (s *httpSession) beginDecisionTurn(ctx context.Context) func() {
+	end, _ := s.acquireDecisionTurn(func() string { return s.route.decisionAnchorFromContext(ctx, s.id) }, nil)
+	return end
+}
+
+// beginDecisionTurnWithin is beginDecisionTurn for the server-initiated leg, bounded by d and
+// anchored on the SESSION's claims (captured at initialize) because that leg has no host
+// request in scope. ok is false when the turn could not be entered in time, which the caller
+// must turn into a refusal — see samplingTurnWait.
+func (s *httpSession) beginDecisionTurnWithin(d time.Duration) (func(), bool) {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	return s.acquireDecisionTurn(func() string { return s.route.decisionAnchor(s.id, s.claims) }, timer.C)
+}
+
+// acquireDecisionTurn takes this request's turn, preferring the gate cached for the session's
+// life and falling back to the route's registry when there is none.
+//
+// The fallback is not a slow path to be avoided — it is the ALWAYS-CORRECT one, and the cache
+// is the special case: a session-anchored route's anchor cannot change between requests, so
+// one gate serves the session. Anything else (a task-anchored route, a session assembled by a
+// test that never registered) resolves per request.
+//
+// anchor is a func rather than a string because the cached path must not build one: rendering
+// the key is a per-request allocation, and skipping the registry only to allocate its key
+// anyway would give back part of what the cache is for.
+func (s *httpSession) acquireDecisionTurn(anchor func() string, giveUp <-chan time.Time) (func(), bool) {
+	if s.decideGate != nil {
+		return s.decideGate.take(giveUp)
+	}
+	return s.route.decideGates.acquire(anchor(), giveUp)
 }
 
 // getSession returns the session for id, or nil.
@@ -1339,6 +1420,13 @@ func (s *httpSession) close(shutdownMs int) {
 		// primitive. The done-channel handling below is now purely lifecycle: reap the
 		// subprocess (local) or release the connection pool (remote).
 		s.sessCancel()
+		// Release the decision gate held for this session's life, so the route's registry
+		// holds one entry per LIVE session rather than one per session it has ever served.
+		// Here rather than in a reaper arm because close() is the single teardown funnel
+		// both modes and every teardown reason pass through, and it runs exactly once.
+		if s.dropDecideGate != nil {
+			s.dropDecideGate()
+		}
 		if s.upHTTPClient != nil {
 			// Remote mode: no subprocess. Terminate the upstream MCP session with a bounded
 			// DELETE so the remote frees its session state rather than leaking it, only when

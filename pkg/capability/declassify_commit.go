@@ -63,15 +63,23 @@ type Declassification struct {
 	// decision's critical section with what the anchor was carrying. Unexported so the
 	// commit phase cannot widen it, and copied on the way out so a caller cannot either.
 	labels []string
-	// approver and approvalID identify the human approval that authorized the clear. They
+	// approver and approvalID identify the human approval that AUTHORIZED the clear. They
 	// reach the audit record's top-level, signed triple beside the labels the commit
-	// actually changed.
+	// actually changed, so they are populated only on a handle that authorizes something.
 	approver   string
 	approvalID string
-	// singleUse marks an approval the decision BURNED in the ledger. It replaces a second
-	// approval-id string that was never anything but approvalID plus this bit, and that two
-	// sites had to keep in agreement.
-	singleUse bool
+	// spentApprovalID names an approval the decision BURNED in the ledger, and is empty for
+	// a standing grant (which spends nothing).
+	//
+	// It is a second string rather than a bit over approvalID because the two are not the
+	// same fact, and one handle shape proves it: a decision whose own commit faulted after
+	// burning a grant authorizes NOTHING and still has a spent id to report (see
+	// NewSpentGrantOnly). Derived from approvalID, that handle reported the same string from
+	// ApprovalID() — the top-level signed field reserved for a declassification that actually
+	// took effect — putting one id on the tape with two provenances, which is exactly what
+	// the separate detail key exists to prevent. The two fields are written in ONE place each
+	// (the two constructors below), so there is no pair for a caller to keep in agreement.
+	spentApprovalID string
 	// committed makes the handle single-use. atomic because a decision's response can be
 	// read by more than one goroutine on the transport's response path.
 	committed atomic.Bool
@@ -91,12 +99,41 @@ type Declassification struct {
 // out empty (the anchor was not carrying the approved labels), and the spent grant still has
 // to reach the tape. The commit skips a handle with nothing to clear.
 func NewDeclassification(labels []string, approver, approvalID string, singleUse bool) *Declassification {
-	return &Declassification{
+	d := &Declassification{
 		labels:     slices.Clone(labels),
 		approver:   approver,
 		approvalID: approvalID,
-		singleUse:  singleUse,
 	}
+	if singleUse {
+		// The approval that authorized this clear is also the one that was burned. That
+		// coincidence is real HERE — the clear was authorized, so both facts name the same
+		// grant — and it is precisely what must NOT be assumed on a handle that authorizes
+		// nothing; see NewSpentGrantOnly.
+		d.spentApprovalID = approvalID
+	}
+	return d
+}
+
+// NewSpentGrantOnly mints a handle that authorizes NO clear and exists solely to name a
+// single-use grant a decision already burned.
+//
+// It is the shape a fault inside the decision produces: the ledger burn is atomic with the
+// decision and has no un-burn, so a commit that faults after burning has spent the operator's
+// one-shot approval on a call that is about to be refused. That grant appears on no other
+// record, and an operator reconciling outstanding approvals would otherwise believe it live.
+//
+// The distinction from NewDeclassification(nil, "", id, true) is the whole point of a separate
+// constructor: that call produces a handle whose ApprovalID() and SpentApprovalID() are the
+// same string, and ApprovalID feeds the top-level, HMAC-signed approval_id field, which is
+// reserved for a declassification that actually TOOK EFFECT. One id reaching the tape through
+// two fields with two documented meanings is the collision the separate detail key exists to
+// avoid; a handle that authorizes nothing must not be able to populate the authorizing field
+// at all.
+//
+// It carries no labels, so PendingClear is false and the commit skips it — this cannot become
+// a clear on a refused call.
+func NewSpentGrantOnly(spentApprovalID string) *Declassification {
+	return &Declassification{spentApprovalID: spentApprovalID}
 }
 
 // Labels reports the authorized set — what the approval covered, as resolved at decision
@@ -126,8 +163,13 @@ func (d *Declassification) Approver() string {
 	return d.approver
 }
 
-// ApprovalID identifies the approval that authorized the clear — the control plane's own
+// ApprovalID identifies the approval that AUTHORIZED the clear — the control plane's own
 // record identifier, stamped on the allow that performed it.
+//
+// Empty on a handle that authorizes nothing, which is what keeps it from aliasing
+// SpentApprovalID: the field it feeds is the top-level signed approval_id, reserved for a
+// declassification that took effect, and a burned grant reaching the tape through it would put
+// one id in two places with two provenances. See NewSpentGrantOnly.
 func (d *Declassification) ApprovalID() string {
 	if d == nil {
 		return ""
@@ -138,20 +180,16 @@ func (d *Declassification) ApprovalID() string {
 // SpentApprovalID names a SINGLE-USE approval this call burned in the ledger, and is empty
 // for a standing grant (which spends nothing and needs no reconciliation).
 //
-// It is derived rather than stored because it never was an independent fact: a grant is spent
-// by the decision that accepted it, so "which approval did this call burn?" is the approval id
-// plus one bit. As two parallel fields it was two things to keep in agreement; here the bit is
-// the only input.
-//
 // It is populated whether or not the clear it authorized went on to change anything, and
 // whether or not the commit ever runs — the burn is what makes "once" mean once, so it happens
 // in the decision, and an operator reconciling outstanding one-shot approvals needs this on the
-// tape either way.
+// tape either way. It is therefore also the ONLY fact a handle minted after an in-decision
+// fault carries.
 func (d *Declassification) SpentApprovalID() string {
-	if d == nil || !d.singleUse {
+	if d == nil {
 		return ""
 	}
-	return d.approvalID
+	return d.spentApprovalID
 }
 
 // Claim consumes the handle and returns the labels the caller may now clear. The second call

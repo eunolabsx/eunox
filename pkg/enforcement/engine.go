@@ -1227,7 +1227,7 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 	if e.anchorUnresolved(req) {
 		return denyResponse(requestID, now, matched.IsAuditOnly(), nil, capability.DenialInfo{
 			Code:          capability.ErrCodeMissingContext,
-			ConditionType: anchorKindTask,
+			ConditionType: string(AnchorKindTask),
 			// HardDeny, which puts this beside the unapproved declassification and the
 			// over-ceiling effect rather than beside an ordinary authorization verdict. A
 			// downgradable refusal is FORWARDED on an audit-only constraint, and the observe
@@ -1240,7 +1240,7 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 			// carrying the reason.
 			HardDeny: true,
 			Message:  "this route anchors enforcement state on the task, but the presented token carries no mcp.task_id; refusing rather than accounting this call against a second, session-keyed bucket (fail closed)",
-			Details:  map[string]interface{}{"anchor": anchorKindTask, "reason": "no_task_id"},
+			Details:  map[string]interface{}{"anchor": string(AnchorKindTask), "reason": "no_task_id"},
 		})
 	}
 
@@ -1309,9 +1309,10 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 	// Each half still fails closed on its
 	// own fault: a flow-write fault is a HARD deny (labelRecordFailureDenial, so an
 	// audit-mode source whose label did not persist is not forwarded unlabeled); a
-	// seq-write fault denies via recordFailureDenial. The per-session decision lock
-	// serializes this critical section, so the
-	// rollback removes exactly this call's additions with no concurrent writer.
+	// seq-write fault denies via recordFailureDenial. A transport that serializes its
+	// decision phase orders this critical section against the other decisions on the same
+	// anchor, so the rollback removes exactly this call's additions with no concurrent
+	// writer — see rollbackLabels for the case where no such ordering can be assumed.
 	labelsOut, cerr := e.recordSourceCall(ctx, req, matched, flowRelevant, carriedLabels, decl)
 	if cerr != nil {
 		if cerr.Declassify {

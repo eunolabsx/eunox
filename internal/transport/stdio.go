@@ -33,6 +33,7 @@ import (
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/pdp"
 	"github.com/eunolabs/eunox/pkg/capability"
+	"github.com/eunolabs/eunox/pkg/enforcement"
 )
 
 const (
@@ -194,11 +195,18 @@ type StdioProxy struct {
 	// fwdHostWrites.Add, decremented in the same OnceFunc release as fwdHostWrites.Done.
 	fwdHostInFlight atomic.Int64
 
-	// decideGate serializes this session's enforced-request decisions in proxy-receipt
-	// order when the policy is flow- or sequenceBlock-relevant; the serve loop gates on
-	// decideGate != nil. nil keeps full intra-session
+	// decideGate serializes this proxy's enforced-request decisions in proxy-receipt
+	// order, per state ANCHOR, when the policy accumulates state one call writes and a later
+	// one reads; the serve loop gates on decideGate != nil. nil keeps full intra-session
 	// decision parallelism. Set from StdioProxyOptions.SerializeDecisions at construction.
 	decideGate *decisionSerializer
+
+	// taskAnchored is the operator's WithTaskAnchoredState setting for this upstream, the
+	// same bit the PDP's engine was built with (StdioProxyOptions.TaskAnchoredState). The
+	// proxy carries it for one purpose: resolving the anchor a request's decision turn is
+	// keyed on, through the same resolver the engine's own key builder uses, so the turn
+	// spans the key the state lives on. See decisionAnchor.
+	taskAnchored bool
 
 	// receipts verifies signed effect receipts published by this proxy's single upstream,
 	// against the key domain the operator configured for it. nil disables the surface.
@@ -236,12 +244,26 @@ type StdioProxyOptions struct {
 	Audit              bool // observe mode: evaluate and log, but forward instead of block
 	RequireAuditStrict bool // --require-audit=strict: deny forwards once the audit trail degrades
 
-	// SerializeDecisions serializes this session's enforced-request decisions in
-	// proxy-receipt order when the policy is flow- or sequenceBlock-relevant, so a
-	// source's flow-label write is ordered before a later sink's read even under a
-	// pipelining client. The binary sets it from
-	// manifest.HasFlowLabel() || manifest.HasSequenceBlock().
+	// SerializeDecisions serializes this proxy's enforced-request decisions in
+	// proxy-receipt order, per state anchor, when the policy accumulates state one call
+	// writes and a later one reads, so a source's flow-label write is ordered before a
+	// later sink's read even under a pipelining client. The binary sets it from
+	// config.LocalManifest.NeedsDecisionTurn — the same predicate the gateway's route
+	// builder uses, so the two transports cannot disagree about which policies need a turn.
 	SerializeDecisions bool
+
+	// TaskAnchoredState reports that this upstream's engine keys accumulated state on the
+	// validated mcp.task_id claim rather than on the session (config's
+	// ResolvedTaskAnchoredState, the same value passed to LoadUpstreamPDP). The proxy uses
+	// it to key each request's decision turn on the anchor the state actually lives on.
+	//
+	// It is inert on a stdio host as shipped — nothing on this path attaches validated
+	// claims, so every request anchors on the session — and it is wired anyway because the
+	// alternative is a load-bearing assumption held up by a flag check in another package
+	// (see serialize.go). An embedder handing this proxy a token-aware PDP through the PDP
+	// seam gets anchor-keyed serialization by construction rather than a single FIFO that
+	// silently stopped being the anchor.
+	TaskAnchoredState bool
 
 	// HonorAttribution admits the client-supplied attribution interface (the
 	// io.eunolabs.context-manifest block in a request's _meta). The binary sets it from
@@ -307,6 +329,7 @@ func NewStdioProxy(opts StdioProxyOptions) *StdioProxy {
 		upstreamTimeMs:        opts.UpstreamTimeMs,
 		audit:                 opts.Audit,
 		requireAuditStrict:    opts.RequireAuditStrict,
+		taskAnchored:          opts.TaskAnchoredState,
 		driftCheck:            opts.DriftCheck,
 		honorAttribution:      opts.HonorAttribution,
 		receipts:              opts.EffectReceipts,
@@ -1094,9 +1117,13 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 			// rejection never strands an un-begun ticket that would stall every later one.
 			// A non-serialized session (non-flow/non-sequenceBlock policy) reserves none.
 			serialized := p.decideGate != nil && isEnforcedMethod(msg.Method)
-			var ticket uint64
+			var ticket decisionTicket
 			if serialized {
-				ticket = p.decideGate.take()
+				// Keyed on the state ANCHOR, resolved here — in the reader, where the
+				// receipt order is — through the same resolver the engine's key builder
+				// uses. Today that is invariantly this proxy's single session; see
+				// decisionAnchor.
+				ticket = p.decideGate.take(p.decisionAnchor(ctx))
 			}
 			// One goroutine per request. The read loop must NOT block on a request: it
 			// is also the only path that routes the host's replies to server-initiated
@@ -1113,7 +1140,7 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 				p.fwdHostWrites.Done()
 			})
 			wg.Add(1)
-			go func(m mcp.RPCMsg, serialized bool, ticket uint64) {
+			go func(m mcp.RPCMsg, serialized bool, ticket decisionTicket) {
 				defer wg.Done()
 				defer func() { <-p.hostSem }()
 				defer release()
@@ -1361,7 +1388,34 @@ func (p *StdioProxy) samplingDecideLock() func() (end func(), ok bool) {
 	if p.decideGate == nil {
 		return nil
 	}
-	return func() (func(), bool) { return p.decideGate.begin(p.decideGate.take()), true }
+	return func() (func(), bool) {
+		// A server-initiated request has no host request in scope, so its anchor comes from
+		// the proxy's own identity — which is what every host request on this transport
+		// resolves to as well (see decisionAnchor), so the two legs share one queue.
+		anchor := p.decisionAnchor(context.Background())
+		return p.decideGate.begin(p.decideGate.take(anchor)), true
+	}
+}
+
+// decisionAnchor is the key this proxy serializes a request's decision on: the validated task
+// when the operator anchors state on the task and the caller presented one, the session
+// otherwise.
+//
+// It resolves through enforcement.ResolveStateAnchor — the SAME function the engine's own key
+// builder resolves through — so the turn and the state key cannot come to different answers
+// about one request. That matters here even though the answer is currently fixed: a stdio host
+// has one connection and no path on it attaches validated claims, so pdp.TaskAnchor reports
+// none and every request anchors on p.sessionID. What this removes is the assumption. The
+// premise was held up by a --jwks-uri check in another package while StdioProxyOptions.PDP is
+// an exported seam, so the first per-request token channel on this transport would have left a
+// single FIFO queue silently mis-serializing; resolved this way, such a channel gets the right
+// key by construction.
+func (p *StdioProxy) decisionAnchor(ctx context.Context) string {
+	id, hasTask := "", false
+	if p.taskAnchored {
+		id, hasTask = pdp.TaskAnchor(pdp.JWTClaimsPtr(ctx))
+	}
+	return enforcement.ResolveStateAnchor(p.taskAnchored, hasTask, id, p.sessionID).Key()
 }
 
 // withUpstreamTimeout bounds a StdioProxy upstream round-trip (see boundUpstreamCall).

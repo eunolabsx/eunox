@@ -471,8 +471,11 @@ func (e *SourceCommitError) Error() string { return e.Err.Error() }
 // antecedent; if the seq write faults, it rolls back the flow labels THIS call added
 // (out minus the pre-call carried set) so the hard-denied call leaves NEITHER committed.
 // This reverses the old seq-first order, which could not clean up a stranded write at
-// all. The per-session decision lock serializes this critical section, so the
-// rollback removes exactly this call's additions with no concurrent writer to race.
+// all. A transport that serializes its decision phase orders this critical section against
+// the other decisions on the same anchor, so the rollback removes exactly this call's
+// additions with no concurrent writer to race — but the engine is an exported seam and takes
+// no such guarantee for granted; see rollbackLabels for what it does when it cannot rely on
+// one.
 //
 // An APPROVED declassification (decl, resolved by checkDeclassify before anything was
 // committed) contributes exactly ONE thing here: the BURN of a single-use grant. Its label
@@ -584,18 +587,28 @@ func (e *Engine) rollbackLabels(ctx context.Context, req *capability.EnforceRequ
 		return
 	}
 	// Not when THIS request is task-keyed. The rollback removes exactly the labels this call
-	// added, computed from a snapshot peeked under this session's decision lock — and that lock
-	// does not span a task key two sessions share. A concurrent session that legitimately added
-	// the same label between the snapshot and here would have it deleted, leaving the task
-	// UNTAINTED for a source read that really happened: a fail-open on precisely the "for all
-	// flows" claim the anchor exists to extend. Declining to roll back strands this call's
-	// label instead, which over-blocks a later sink — the direction the whole rollback path
-	// already accepts as its residual when a Remove faults.
+	// added, computed from a snapshot peeked earlier in this decision — and nothing the ENGINE
+	// can see guarantees that no other writer touched the task's set in between. A concurrent
+	// writer that legitimately added the same label between the snapshot and here would have it
+	// deleted, leaving the task UNTAINTED for a source read that really happened: a fail-open
+	// on precisely the "for all flows" claim the anchor exists to extend. Declining to roll
+	// back strands this call's label instead, which over-blocks a later sink — the direction
+	// the whole rollback path already accepts as its residual when a Remove faults.
+	//
+	// The in-tree transports DO serialize a task's decisions in-process (the decision turn is
+	// keyed on this same anchor, so two sessions sharing a task share a turn), which closes the
+	// window for one proxy. It is deliberately not what this stands on. The turn is in-process:
+	// two eunox instances against one Redis backend hold independent turns for the same task,
+	// so the concurrent writer is a real deployment rather than a hypothetical — and this
+	// engine is an exported package an embedder can drive with no serialization at all. A
+	// rollback is a compensating DELETE against shared state; it is safe only where the caller
+	// can prove exclusivity, and the engine cannot. Making it conditional on a guarantee held
+	// somewhere above it would be the same shape as the premise this comment used to assert.
 	//
 	// The question is about the REQUEST, not the engine's mode. A task-anchored engine still
-	// keys a token-less caller on its session, where the decision lock does span the key and
-	// no concurrent writer exists — standing down there strands a label for a hazard that
-	// cannot occur, on every unauthenticated caller the route serves.
+	// keys a token-less caller on its session, which no other caller can write to at all —
+	// standing down there strands a label for a hazard that cannot occur, on every
+	// unauthenticated caller the route serves.
 	if e.anchoredOnTask(req) {
 		return
 	}
@@ -610,15 +623,15 @@ func (e *Engine) rollbackLabels(ctx context.Context, req *capability.EnforceRequ
 // has run.
 //
 // The split is what makes the clear safe under concurrency. Applied inside the decision, the
-// removal outlived the per-session decision lock the transport releases before the upstream
-// forward — so for the whole round trip (bounded only by --upstream-timeout, and by nothing
-// at all when it is 0) every concurrent decision on the anchor read an already-clean label
-// set, and a sink the taint existed to stop could be allowed and forwarded before the
-// sanitizing call had even returned. Under task-anchored state it was wider still: the lock
-// is per-session and does not span a task key two sessions share, so the concurrent reader
-// need not have been on the same session at all. Deferring the removal to here removes the
-// window rather than narrowing it, and does so without depending on any lock: the labels are
-// never absent until the call that clears them has completed.
+// removal outlived the decision turn the transport releases before the upstream forward — so
+// for the whole round trip (bounded only by --upstream-timeout, and by nothing at all when it
+// is 0) every concurrent decision on the anchor read an already-clean label set, and a sink
+// the taint existed to stop could be allowed and forwarded before the sanitizing call had even
+// returned. Deferring the removal to here removes the window rather than narrowing it, and
+// does so without depending on any turn at all: the labels are never absent until the call
+// that clears them has completed. That independence is what makes it hold for a deployment
+// the turn cannot cover — a second eunox instance on the same Redis backend, or an embedder
+// driving this engine with no serialization of its own.
 //
 // It is also why nothing above the engine needs an UNDO any more. Every refusal below the
 // decision — the --require-audit=strict gate, an upstream transport failure, a redaction

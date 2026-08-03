@@ -209,6 +209,14 @@ rule as a misspelled key — the grammar stays falsifiable — and it is what le
 fleet run both revisions without a `0.1` route silently acquiring a predicate its
 authors never reviewed.
 
+Inheritance runs **forward along the published sequence**, not between these two
+revisions specifically: a token belongs to the revision that introduced it and to
+every revision published after it. So a future revision contains the whole
+flow+effect vocabulary without re-declaring it, including a revision published
+only to change semantics that introduces no token of its own — and each revision
+stays closed against every token published later than it, which is the part the
+gate exists for.
+
 > **Migrating from `"0.2-draft"`.** Earlier builds staged the flow+effect tokens
 > behind a `"0.2-draft"` schemaVersion while the batch was assembled. That draft
 > is **removed, not aliased**: a manifest still declaring it is refused, with the
@@ -2458,7 +2466,7 @@ what happened; so does an allow whose commit faulted:
 | `_eunox_declassify_spent_approval_id` | a **single-use** grant this call burned. Stamped on the allow and on any refusal, and whether or not a label moved — the grant is spent in every one of those cases |
 | `_eunox_declassify_not_applied` | the call was refused below the decision, so the approved clear was never made. Benign: the labels were never removed |
 | `_eunox_declassify_result_withheld` | the action **executed** and eunox dropped its result. Stamped only at the **redaction-failure** gate, and only when that gate's reply passes the same success test the commit path uses — so the sanitizing work is done and only the delivery failed. Usually rides beside the key above; stands alone on a no-op clear under a `once` grant |
-| `_eunox_declassify_commit_failed` | the call **ran** and the clear could not be applied. The session keeps taint the policy says the action dropped, so later sinks over-block until you retry under a new approval |
+| `_eunox_declassify_commit_failed` | the call **ran** and the clear could not be applied. The session keeps taint the policy says the action dropped, so later sinks over-block until you retry under a new approval. It means a flow-store fault and nothing else — a clear the proxy somehow committed twice already landed, so it is logged as the proxy bug it is rather than stamped here |
 
 `_eunox_declassify_commit_failed` is the one to alert on. None of the four reuses
 `approval_id`, the top-level signed field, which keeps meaning "a declassification

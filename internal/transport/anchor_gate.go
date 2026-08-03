@@ -31,14 +31,7 @@ import (
 	"time"
 
 	"github.com/eunolabs/eunox/internal/pdp"
-)
-
-// anchorKindSession and anchorKindTask keep the two kinds of key disjoint, so a session named
-// X and a task named X never share a turn. The separator is a NUL, which neither a session id
-// nor a task claim can contain.
-const (
-	anchorKindSession = "session\x00"
-	anchorKindTask    = "task\x00"
+	"github.com/eunolabs/eunox/pkg/enforcement"
 )
 
 // serializes reports whether this route runs its decisions under a turn — i.e. whether its
@@ -48,9 +41,15 @@ func (r *UpstreamRoute) serializes() bool { return r != nil && r.decideGates != 
 
 // decisionAnchor is the key this route serializes a request's decision on: the validated task
 // when the route anchors state on the task and the caller presented one, the session
-// otherwise. It mirrors the engine's own anchor resolution (see pdp.TaskAnchor, which reads
-// the same claim through the same resolver the key builder uses), because a turn taken on a
-// key the state does not live on is not serialization at all.
+// otherwise.
+//
+// It resolves through enforcement.ResolveStateAnchor — the SAME function the engine's own key
+// builder resolves through — rather than re-deriving the fallback here. A turn taken on a key
+// the state does not live on is not serialization at all, and two independent readings of
+// "which anchor is this" is exactly where the gate and the key come to disagree, silently,
+// since nothing in the process ever compares them. The claim lookup likewise goes through
+// pdp.TaskAnchor, which reads the same claim through the same resolver the key builder uses,
+// so the two agree even about the cases that are NOT a task (a padded claim, a numeric one).
 //
 // claims must be the VALIDATED claims — the transport's HTTP entry point verifies the bearer
 // token before dispatch and attaches them to the request context. Resolving this from an
@@ -62,12 +61,12 @@ func (r *UpstreamRoute) serializes() bool { return r != nil && r.decideGates != 
 // under task anchoring — a turn on the session is the right one for a call that is about to
 // be denied).
 func (r *UpstreamRoute) decisionAnchor(sessionID string, claims *pdp.JWTClaims) string {
-	if r != nil && r.taskAnchored {
-		if id, ok := pdp.TaskAnchor(claims); ok {
-			return anchorKindTask + id
-		}
+	taskAnchored := r != nil && r.taskAnchored
+	id, hasTask := "", false
+	if taskAnchored {
+		id, hasTask = pdp.TaskAnchor(claims)
 	}
-	return anchorKindSession + sessionID
+	return enforcement.ResolveStateAnchor(taskAnchored, hasTask, id, sessionID).Key()
 }
 
 // decisionAnchorFromContext is decisionAnchor for the host request path, whose validated
@@ -93,6 +92,12 @@ type anchorGates struct {
 type anchorGate struct {
 	turn chan struct{}
 	refs int
+	// registry and key are what a release needs to drop this gate's reference. They are on the
+	// gate so a holder can keep the gate itself for a whole session (see hold) and take turns
+	// on it without going back through the map — the registry round trip is what the
+	// per-request path pays, and a session-anchored route has nothing to look up.
+	registry *anchorGates
+	key      string
 }
 
 // newAnchorGates builds an empty registry. One per route: routes carry independent policies
@@ -100,6 +105,53 @@ type anchorGate struct {
 // of state and must not share a turn.
 func newAnchorGates() *anchorGates {
 	return &anchorGates{gates: map[string]*anchorGate{}}
+}
+
+// hold returns this anchor's gate with a reference taken, plus the func that drops it. The
+// gate stays in the registry until every holder has dropped, so a caller may keep one across
+// many turns.
+//
+// It is the seam that keeps the registry off the per-request path for a route that does not
+// anchor on the task. There, a session's anchor is a CONSTANT — the session id — so resolving
+// it per request meant a registry mutex, a map lookup, an insert and a delete on every single
+// enforced call, plus the garbage each produced: the refcount fell to zero the instant a
+// non-overlapping request finished, so the steady state for ordinary sequential traffic was
+// create-insert-lookup-delete per call on the path this file's own comment calls the
+// microsecond decision path. Worse, that mutex is route-wide, so its contention scaled with
+// the route's whole request rate rather than with contending anchors. A session that holds
+// its one gate for its lifetime pays all of that once. Task-anchored routes still resolve per
+// request, because there the anchor genuinely varies per call and cross-session sharing is
+// the entire point.
+//
+// A nil registry yields a nil gate and a no-op drop, so a non-serialized route needs no branch
+// at the call site.
+func (g *anchorGates) hold(key string) (*anchorGate, func()) {
+	if g == nil {
+		return nil, func() {}
+	}
+	g.mu.Lock()
+	gate := g.gates[key]
+	if gate == nil {
+		gate = &anchorGate{turn: make(chan struct{}, 1), registry: g, key: key}
+		g.gates[key] = gate
+	}
+	gate.refs++
+	g.mu.Unlock()
+	return gate, sync.OnceFunc(gate.drop)
+}
+
+// drop releases one reference to this gate, deleting it from the registry at zero.
+func (a *anchorGate) drop() {
+	g := a.registry
+	g.mu.Lock()
+	a.refs--
+	if a.refs == 0 {
+		// Deleted only at zero, and only while holding the registry lock, so a waiter that
+		// already took a reference keeps the gate it is queued on. A later hold under the same
+		// key creates a fresh gate, which is correct precisely because nobody holds the old one.
+		delete(g.gates, a.key)
+	}
+	g.mu.Unlock()
 }
 
 // begin blocks until this anchor's turn is free and returns the idempotent release func. It
@@ -126,9 +178,9 @@ func (g *anchorGates) beginWithin(key string, d time.Duration) (end func(), ok b
 	return g.acquire(key, timer.C)
 }
 
-// acquire takes the turn for key, giving up if giveUp fires first (nil waits forever). The
-// returned release is idempotent (sync.OnceFunc), matching decisionSerializer.begin: a handler
-// releases right after its decision and defers the same func as a backstop.
+// acquire takes the turn for key, giving up if giveUp fires first (nil waits forever). It is
+// the per-request path: it holds a reference only for the length of the turn, which is what
+// keeps a route's gate map from growing one entry per anchor it has ever served.
 //
 // The registry lock is held only across the map operations, never across the turn itself —
 // otherwise one session's decision would block every other anchor's lookup. The gate is
@@ -138,40 +190,36 @@ func (g *anchorGates) acquire(key string, giveUp <-chan time.Time) (end func(), 
 	if g == nil {
 		return func() {}, true
 	}
-	g.mu.Lock()
-	gate := g.gates[key]
-	if gate == nil {
-		gate = &anchorGate{turn: make(chan struct{}, 1)}
-		g.gates[key] = gate
-	}
-	// Referenced BEFORE the (possibly blocking) acquire, so the gate this caller is queued on
+	// Referenced BEFORE the (possibly blocking) take, so the gate this caller is queued on
 	// cannot be reclaimed and replaced while it waits.
-	gate.refs++
-	g.mu.Unlock()
-
-	release := func() {
-		g.mu.Lock()
-		gate.refs--
-		if gate.refs == 0 {
-			// Deleted only at zero, and only while holding the registry lock, so a waiter
-			// that already took a reference keeps the gate it is queued on. A later acquire
-			// under the same key creates a fresh gate, which is correct precisely because
-			// nobody holds the old one.
-			delete(g.gates, key)
-		}
-		g.mu.Unlock()
+	gate, drop := g.hold(key)
+	release, ok := gate.take(giveUp)
+	if !ok {
+		// No turn was taken, so nothing is released — only this caller's reference is dropped,
+		// which is what keeps an abandoned wait from pinning the gate.
+		drop()
+		return nil, false
 	}
-
-	select {
-	case gate.turn <- struct{}{}:
-		return sync.OnceFunc(func() {
-			<-gate.turn
-			release()
-		}), true
-	case <-giveUp:
-		// No turn was taken, so nothing is released — only this caller's reference is
-		// dropped, which is what keeps an abandoned wait from pinning the gate.
+	return sync.OnceFunc(func() {
 		release()
+		drop()
+	}), true
+}
+
+// take waits for this gate's turn and returns the idempotent release, or ok=false when giveUp
+// fires first (nil waits forever). It touches no registry state: a caller holding the gate
+// across many turns (a session's cached gate) needs the turn and nothing else.
+//
+// The release is idempotent (sync.OnceFunc), matching decisionSerializer.begin: a handler
+// releases right after its decision and defers the same func as a backstop.
+func (a *anchorGate) take(giveUp <-chan time.Time) (end func(), ok bool) {
+	if a == nil {
+		return func() {}, true
+	}
+	select {
+	case a.turn <- struct{}{}:
+		return sync.OnceFunc(func() { <-a.turn }), true
+	case <-giveUp:
 		return nil, false
 	}
 }

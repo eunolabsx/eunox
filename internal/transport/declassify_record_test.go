@@ -12,6 +12,7 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -552,21 +553,50 @@ func TestDispatchParams_WireTheCommitterFromTheDecidingPDP(t *testing.T) {
 }
 
 // TestParamsLiterals_DoNotAssignThePDPFields is what makes withPDP an invariant rather than a
-// convention. Go has no way to require a constructor, so the guard is over the SOURCE: no
-// literal of either params type may name pdp or committer, because a site that names one and
-// forgets the other compiles, passes every test that does not exercise a declassification,
-// and then never clears a label.
+// convention. The compiler already refuses `dispatchParams{pdp: p}` — pdp lives on the
+// embedded decidingPDP, and Go rejects a promoted field in a composite literal — so what is
+// left to guard is the spellings the language still allows: a literal of decidingPDP itself, a
+// literal naming a field DERIVED from the decision point (committer), and a plain assignment
+// to either through the promotion.
 //
-// It is an AST walk for the reason the composite-literal guard beside it is: the rule is
-// about composite literals, which no linter in .golangci.yml can express.
+// The last one is not hypothetical shape in this package: `d.endDecision = end` is the
+// established way to finish a dispatchParams after construction, and a contributor following
+// that precedent for pdp or committer would produce exactly the silent divergence withPDP
+// exists to make impossible — a site that sets one and forgets the other compiles, passes
+// every test that does not exercise a declassification, and then never clears a label.
+//
+// It is an AST walk for the reason the composite-literal guard it shares a walker with is: the
+// rule is about literals and assignments, which no linter in .golangci.yml can express. It
+// reuses that walker rather than repeating one, because the walker is what threads the
+// enclosing element type through an ELIDED literal — `[]dispatchParams{{...}}` or
+// `map[string]serverRequestParams{"k": {...}}` name no type of their own, and a guard that
+// matches only `T{...}` passes while the thing it guards is bypassed.
 func TestParamsLiterals_DoNotAssignThePDPFields(t *testing.T) {
 	t.Parallel()
+	// The params types, plus the wrapper the decision point now lives on: a literal of
+	// decidingPDP is the one spelling that can still put a PDP into a params struct without
+	// going through withPDP.
+	guarded := map[string]bool{
+		"serverRequestParams": true,
+		"dispatchParams":      true,
+		"forwardParams":       true,
+		"decidingPDP":         true,
+	}
+	// Fields that must only ever be set by withPDP: the decision point itself and everything
+	// derived from it.
 	derived := map[string]bool{"pdp": true, "committer": true}
+	// Files allowed to ASSIGN one of those fields through a selector. withPDP's own two bodies
+	// are recognized by their enclosing function name (below); this allowlist covers the one
+	// remaining site, where the field belongs to a DIFFERENT type that happens to share the
+	// name — UpstreamRoute.pdp, which BuildRoutes fills in and which has no derived twin. An
+	// AST walk has no type information, so the exemption is by file and is deliberately a
+	// review signal: adding one means editing this guard.
+	assignAllowed := map[string]bool{"route.go": true}
 
 	entries, err := os.ReadDir(".")
 	require.NoError(t, err)
 	fset := token.NewFileSet()
-	checked := 0
+	litsChecked, assignsChecked := 0, 0
 	for _, e := range entries {
 		name := e.Name()
 		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
@@ -574,16 +604,16 @@ func TestParamsLiterals_DoNotAssignThePDPFields(t *testing.T) {
 		}
 		file, perr := parser.ParseFile(fset, name, nil, 0)
 		require.NoError(t, perr)
-		ast.Inspect(file, func(n ast.Node) bool {
-			lit, ok := n.(*ast.CompositeLit)
-			if !ok {
-				return true
+
+		walkLiterals(file, "", func(typeName string, lit *ast.CompositeLit) {
+			if !guarded[typeName] {
+				return
 			}
-			ident, isIdent := lit.Type.(*ast.Ident)
-			if !isIdent || (ident.Name != "serverRequestParams" && ident.Name != "dispatchParams" && ident.Name != "forwardParams") {
-				return true
+			litsChecked++
+			if typeName == "decidingPDP" {
+				t.Errorf("decidingPDP literal in %s: it exists so the decision point can only be set by .withPDP(p); building one directly reopens the divergence between it and every field derived from it", name)
+				return
 			}
-			checked++
 			for _, el := range lit.Elts {
 				kv, isKV := el.(*ast.KeyValueExpr)
 				if !isKV {
@@ -592,13 +622,66 @@ func TestParamsLiterals_DoNotAssignThePDPFields(t *testing.T) {
 				key, isKey := kv.Key.(*ast.Ident)
 				if isKey && derived[key.Name] {
 					t.Errorf("%s literal in %s assigns %s directly; use .withPDP(p) so the decision point and every field derived from it cannot diverge",
-						ident.Name, name, key.Name)
+						typeName, name, key.Name)
 				}
 			}
-			return true
 		})
+
+		// The assignment half. Skip withPDP's own body, which is where these fields are
+		// SUPPOSED to be written, and skip the allowlisted files.
+		for _, decl := range file.Decls {
+			fn, isFn := decl.(*ast.FuncDecl)
+			if !isFn || fn.Body == nil || fn.Name.Name == "withPDP" || assignAllowed[name] {
+				continue
+			}
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				assign, isAssign := n.(*ast.AssignStmt)
+				if !isAssign {
+					return true
+				}
+				for _, lhs := range assign.Lhs {
+					sel, isSel := lhs.(*ast.SelectorExpr)
+					if !isSel {
+						continue
+					}
+					assignsChecked++
+					if derived[sel.Sel.Name] {
+						t.Errorf("%s assigns .%s in %s; the decision point and every field derived from it must be set together by .withPDP(p), never one at a time",
+							fn.Name.Name, sel.Sel.Name, name)
+					}
+				}
+				return true
+			})
+		}
 	}
-	require.Positive(t, checked, "no params literal found in any non-test file; this guard would pass vacuously")
+	require.Positive(t, litsChecked, "no params literal found in any non-test file; the literal half of this guard would pass vacuously")
+	require.Positive(t, assignsChecked, "no field assignment found in any non-test file; the assignment half of this guard would pass vacuously")
+}
+
+// TestDispatchParamsLiteral_CannotNameThePDPField is the compile-time half of the invariant,
+// asserted here because a compile error cannot be written as a test.
+//
+// dispatchParams and serverRequestParams embed decidingPDP, and Go forbids setting a PROMOTED
+// field in a composite literal — so `dispatchParams{pdp: p}` does not build, in any spelling,
+// including the elided ones a source guard is most likely to miss. This test pins the property
+// the embedding provides (the field is reachable for READS through the promotion, so every
+// call site still says d.pdp) so that flattening the struct back out, which would silently
+// restore the spellable field, fails something.
+func TestDispatchParamsLiteral_CannotNameThePDPField(t *testing.T) {
+	t.Parallel()
+	decider := &pdp.JWTPDP{}
+	d := dispatchParams{}.withPDP(decider)
+	assert.Same(t, decider, d.pdp, "the promoted field is readable as if it were declared inline")
+
+	typ := reflect.TypeOf(dispatchParams{})
+	field, ok := typ.FieldByName("decidingPDP")
+	require.True(t, ok, "dispatchParams must hold its decision point in the embedded wrapper, not as a directly-spellable field")
+	assert.True(t, field.Anonymous, "decidingPDP must stay EMBEDDED: a named field is spellable in a literal again")
+
+	srType := reflect.TypeOf(serverRequestParams{})
+	srField, ok := srType.FieldByName("decidingPDP")
+	require.True(t, ok, "serverRequestParams must hold its decision point in the embedded wrapper too")
+	assert.True(t, srField.Anonymous)
 }
 
 // TestEnforcedForwardCore_OrdinaryCallTouchesNoCommitter is the negative half: a call that
@@ -1123,4 +1206,68 @@ func TestForwardServerRequest_RefusesWhenTheTurnIsUnavailable(t *testing.T) {
 	assert.Equal(t, "deny", rec.records[0].decision)
 	assert.Equal(t, capability.ErrCodeConditionFailed, rec.records[0].code)
 	assert.Equal(t, false, rec.records[0].auditOnly, "the refusal is hard: --audit must not downgrade it")
+}
+
+// TestEnforcedForwardCore_DoubleCommitIsNotReportedAsAFailedClear covers the one error the
+// commit path must not fold into its store-fault arm. A second commit of one decision returns
+// ErrDeclassificationCommitted — the handle authorizes exactly one clear — and the facts are
+// the OPPOSITE of a store fault's: the first commit applied the clear, so the labels are gone,
+// the session is not over-blocking, and there is nothing to re-approve.
+//
+// Reported as a commit failure it stamps the key `eunox stats` raises an ATTENTION line on and
+// tells an operator to reissue an approval for work that already landed — an alert that is
+// wrong in the unsafe direction, on a tamper-evident tape. It is unreachable through this
+// transport's call graph today; the branch exists to answer "what if it is called twice", so
+// it has to answer correctly rather than plausibly.
+func TestEnforcedForwardCore_DoubleCommitIsNotReportedAsAFailedClear(t *testing.T) {
+	rec := &fwdRecorder{}
+	spy := &commitSpy{failErr: capability.ErrDeclassificationCommitted}
+	fp := forwardParams{rec: rec, sessionID: "s", callUpstream: cleanUpstream(), committer: spy}
+
+	resp := enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
+		declassifiedAllow(), "tools/call", "sanitize", "sanitize", "tool", false, upstreamErrorDetail)
+
+	require.Nil(t, resp.Error, "a wiring fault after the call ran does not withhold its response")
+	require.Len(t, rec.records, 1)
+	got := rec.records[0]
+	assert.Equal(t, "allow", got.decision)
+	assert.Nil(t, got.details[audit.DeclassifyCommitFailedKey],
+		"the clear DID land on the first commit; claiming otherwise pages an operator to re-approve work already done")
+	assert.Empty(t, got.labelsCleared,
+		"and this call changed nothing, so it must not re-claim the labels the first commit removed")
+	assert.Equal(t, "apr-9", got.details[audit.DeclassifySpentApprovalKey],
+		"the spent grant is still named, exactly as a no-op clear names it")
+}
+
+// TestStrictAuditDenial_BuildsTheDeclassifyDetailOnlyWhenItTrips is the eager-evaluation guard.
+// The gate returns before reading the decision whenever the audit trail is healthy — every call
+// in every healthy deployment — so building the detail map at the CALL SITE allocated a map plus
+// a copy of the handle's label slice and handed both straight to the GC, unused, on every
+// declassifying call. The sampling leg was already taking the decision itself; this pins that
+// the host leg does too, and that the facts still land when the gate actually trips.
+func TestStrictAuditDenial_BuildsTheDeclassifyDetailOnlyWhenItTrips(t *testing.T) {
+	dec := declassifiedAllow()
+	msg := mcp.RPCMsg{ID: mcp.RawJSON(`1`)}
+
+	// Healthy trail: the gate does not fire, reads nothing off the decision, and allocates
+	// nothing for it.
+	healthy := forwardParams{rec: &fwdRecorder{}, sessionID: "s",
+		strictAuditState: strictAuditState{requireAuditStrict: true}}
+	_, blocked := healthy.strictAuditDenial(context.Background(), msg, "sanitize", "tools/call", "sanitize", dec)
+	require.False(t, blocked)
+	allocs := testing.AllocsPerRun(50, func() {
+		healthy.strictAuditDenial(context.Background(), msg, "sanitize", "tools/call", "sanitize", dec)
+	})
+	assert.Zero(t, allocs, "the common path must not build a details map for a gate that never reads it")
+
+	// Degraded trail: the gate fires and the declassification facts reach the record.
+	rec := &fwdRecorder{degraded: true, reason: "audit trail degraded"}
+	tripped := forwardParams{rec: rec, sessionID: "s",
+		strictAuditState: strictAuditState{requireAuditStrict: true}}
+	denied, blocked := tripped.strictAuditDenial(context.Background(), msg, "sanitize", "tools/call", "sanitize", dec)
+	require.True(t, blocked)
+	require.NotNil(t, denied.Error)
+	require.Len(t, rec.records, 1)
+	assert.Equal(t, []string{capability.FlowLabelPII}, rec.records[0].details[audit.DeclassifyNotAppliedKey])
+	assert.Equal(t, "apr-9", rec.records[0].details[audit.DeclassifySpentApprovalKey])
 }

@@ -2220,7 +2220,7 @@ func TestDispatchList_KillSwitch_DeniesAndSkipsUpstream(t *testing.T) {
 						return mcp.RPCMsg{Result: json.RawMessage(`{"tools":[]}`)}, nil
 					},
 				},
-				pdp: dpPolicy,
+				decidingPDP: decidingPDP{pdp: dpPolicy},
 			}
 
 			// Route through dispatchRequest, not dispatchList directly: the kill gate for
@@ -2394,7 +2394,7 @@ func TestDispatchUnmapped_KillSwitch_ReportsKillSwitch(t *testing.T) {
 				return mcp.RPCMsg{}, nil
 			},
 		},
-		pdp: dpPolicy,
+		decidingPDP: decidingPDP{pdp: dpPolicy},
 	}
 
 	msg := mcp.RPCMsg{ID: mcp.RawJSON(`1`), Method: "x-custom/extension"}
@@ -2437,7 +2437,7 @@ func TestMalformedDeny_KillSwitch_ReportsKillSwitch(t *testing.T) {
 				return mcp.RPCMsg{}, nil
 			},
 		},
-		pdp: dpPolicy,
+		decidingPDP: decidingPDP{pdp: dpPolicy},
 	}
 
 	// tools/call with non-object params fails to decode, taking the malformedDeny path
@@ -2476,7 +2476,7 @@ func TestDispatchList_AuditMode_DoesNotFilterCatalog(t *testing.T) {
 				return mcp.RPCMsg{Result: json.RawMessage(fullCatalog)}, nil
 			},
 		},
-		pdp: dpPolicy,
+		decidingPDP: decidingPDP{pdp: dpPolicy},
 	}
 
 	msg := mcp.RPCMsg{ID: mcp.RawJSON(`1`), Method: "tools/list"}
@@ -2507,7 +2507,7 @@ func TestDispatchList_EnforceMode_FiltersCatalog(t *testing.T) {
 				return mcp.RPCMsg{Result: json.RawMessage(fullCatalog)}, nil
 			},
 		},
-		pdp: dpPolicy,
+		decidingPDP: decidingPDP{pdp: dpPolicy},
 	}
 
 	msg := mcp.RPCMsg{ID: mcp.RawJSON(`1`), Method: "tools/list"}
@@ -2555,7 +2555,7 @@ func TestDispatchList_AuditMode_RecordsPinnedHashesSoPoisoningStillDenies(t *tes
 				return mcp.RPCMsg{Result: json.RawMessage(poisonedCatalog)}, nil
 			},
 		},
-		pdp: dpPolicy,
+		decidingPDP: decidingPDP{pdp: dpPolicy},
 	}
 	listResp := dispatchList(context.Background(), d, mcp.RPCMsg{ID: mcp.RawJSON(`1`), Method: "tools/list"}, pdp.ListFilterer.FilterToolsList)
 	if listResp.Result == nil || !strings.Contains(string(listResp.Result), "POISONED") {
@@ -2597,7 +2597,7 @@ func TestDispatchList_AuditMode_NoRecorder_StillRecordsPinnedHashes(t *testing.T
 				return mcp.RPCMsg{Result: json.RawMessage(poisonedCatalog)}, nil
 			},
 		},
-		pdp: dpPolicy,
+		decidingPDP: decidingPDP{pdp: dpPolicy},
 	}
 	listResp := dispatchList(context.Background(), d, mcp.RPCMsg{ID: mcp.RawJSON(`1`), Method: "tools/list"}, pdp.ListFilterer.FilterToolsList)
 	if listResp.Result == nil || !strings.Contains(string(listResp.Result), "POISONED") {
@@ -2630,7 +2630,7 @@ func TestDispatchToolsCall_EmptyName_InvalidParams(t *testing.T) {
 				return mcp.RPCMsg{}, nil
 			},
 		},
-		pdp: newTestManifestPDP(capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
+		decidingPDP: decidingPDP{pdp: newTestManifestPDP(capability.Constraint{Target: "tool:*", Actions: []string{"call"}})},
 	}
 
 	msg := mcp.RPCMsg{ID: mcp.RawJSON(`1`), Method: "tools/call", Params: json.RawMessage(`{"name":"","arguments":{}}`)}
@@ -2736,7 +2736,8 @@ func TestPing_AnsweredLocally_NotDeniedAsUnmapped(t *testing.T) {
 	rec := &fwdRecorder{}
 	d := dispatchParams{
 		forwardParams: forwardParams{rec: rec, sessionID: "sess"},
-		pdp:           newTestManifestPDP(), // empty manifest: nothing is authorized
+		// empty manifest: nothing is authorized
+		decidingPDP: decidingPDP{pdp: newTestManifestPDP()},
 	}
 
 	resp := dispatchRequest(context.Background(), d, mcp.RPCMsg{
@@ -2770,7 +2771,7 @@ func TestPing_NeverReachesUpstream(t *testing.T) {
 				return mcp.RPCMsg{JSONRPC: "2.0", ID: msg.ID, Result: json.RawMessage(`{}`)}, nil
 			},
 		},
-		pdp: pdp.AlwaysAllowPDP{},
+		decidingPDP: decidingPDP{pdp: pdp.AlwaysAllowPDP{}},
 	}
 
 	dispatchRequest(context.Background(), d, mcp.RPCMsg{
@@ -2796,7 +2797,7 @@ func TestPing_KilledSessionGetsKillSwitchNotPong(t *testing.T) {
 	rec := &fwdRecorder{}
 	d := dispatchParams{
 		forwardParams: forwardParams{rec: rec, sessionID: "sess-killed"},
-		pdp:           newTestManifestPDPWithKS(ks),
+		decidingPDP:   decidingPDP{pdp: newTestManifestPDPWithKS(ks)},
 	}
 
 	resp := dispatchRequest(context.Background(), d, mcp.RPCMsg{

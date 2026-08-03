@@ -110,7 +110,7 @@ func TestGuardedCompositeLiterals(t *testing.T) {
 		// `[]killSubject{{...}}` or `map[string]forwardParams{"k": {…}}` ELIDES it
 		// (lit.Type == nil) and inherits it from the enclosing literal's element type.
 		// ast.Inspect gives no parent link, so the walk threads that context itself.
-		walkLiterals(file, "", func(name string) {
+		walkLiterals(file, "", func(name string, _ *ast.CompositeLit) {
 			if _, guarded := guardedStructs[name]; guarded {
 				found[name] = append(found[name], base)
 			}
@@ -150,10 +150,16 @@ func TestGuardedCompositeLiterals(t *testing.T) {
 	}
 }
 
-// walkLiterals visits every composite literal under n, reporting the named type of each.
-// elem is the type name an ELIDED literal inherits from its enclosing slice/array/map
-// literal ("" when there is none), which is what makes `[]killSubject{{...}}` visible.
-func walkLiterals(n ast.Node, elem string, report func(name string)) {
+// walkLiterals visits every composite literal under n, reporting the named type of each and
+// the literal itself (so a caller can also inspect its elements). elem is the type name an
+// ELIDED literal inherits from its enclosing slice/array/map literal ("" when there is none),
+// which is what makes `[]killSubject{{...}}` visible.
+//
+// It is shared by every source guard in this package that reasons about composite literals.
+// A second walk written for one of them is how a guard passes while the thing it guards is
+// bypassed: the elided spelling is invisible to the obvious `lit.Type.(*ast.Ident)` match, and
+// nothing about a hand-rolled walk says so.
+func walkLiterals(n ast.Node, elem string, report func(name string, lit *ast.CompositeLit)) {
 	ast.Inspect(n, func(node ast.Node) bool {
 		lit, ok := node.(*ast.CompositeLit)
 		if !ok {
@@ -170,7 +176,7 @@ func walkLiterals(n ast.Node, elem string, report func(name string)) {
 			}
 		}
 		if name != "" {
-			report(name)
+			report(name, lit)
 		}
 		// Descend with THIS literal's element type in scope, so its elided children
 		// resolve. Recurse explicitly rather than returning true, because the child
