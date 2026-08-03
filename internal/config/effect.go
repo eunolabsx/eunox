@@ -263,7 +263,8 @@ func checkByArgumentKeys(path string, raw interface{}) error {
 
 // HasEffectCeiling reports whether the policy sets a consequence bound, so the wiring
 // layer can skip the per-allow ceiling check for a policy that has none. Mirrors
-// HasMaxCalls / HasFlowLabel.
+// HasFlowLabel / HasSequenceBlock: a subsystem question, not the state-accumulation one
+// (the ceiling reads no accumulated state at all).
 func (m *LocalManifest) HasEffectCeiling() bool {
 	return m != nil && m.EffectCeiling.IsSet()
 }

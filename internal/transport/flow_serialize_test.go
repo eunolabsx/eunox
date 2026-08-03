@@ -613,6 +613,51 @@ func TestStdioSamplingTurn_BoundedRatherThanWedgingTheReader(t *testing.T) {
 	}
 }
 
+// TestStdioUpstreamRequest_ReturnsWhileTheTurnIsHeld drives the REAL entry point the deadlock
+// went through — the one the upstream reader calls inline — rather than the lock in isolation.
+// That is the seam a refactor could drop the bound at while every primitive test still passed:
+// samplingDecideLock is installed here and nowhere else.
+//
+// The policy grants no sampling at all, which is the issue's point restated as a test: the turn
+// is taken BEFORE the sampling decision runs, so an upstream that policy denies sampling to
+// could wedge the reader just as well as one it permits.
+func TestStdioUpstreamRequest_ReturnsWhileTheTurnIsHeld(t *testing.T) {
+	t.Parallel()
+	uw := &mockUpstreamWriter{}
+	p := &StdioProxy{
+		pdp:        newTestManifestPDP(capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
+		sessionID:  "sess-a",
+		decideGate: newDecisionSerializer(),
+		upWriter:   mcp.NewMsgWriter(&writerAdapter{uw}),
+		hostWriter: mcp.NewMsgWriter(&writerAdapter{&mockHostWriter{}}),
+	}
+	p.pinDecisionQueue()
+	t.Cleanup(p.dropDecideQueue)
+
+	// A declassifying host call holds the turn across its upstream round trip — the response to
+	// which only the goroutine below can deliver.
+	held := p.decideGate.begin(p.decideGate.takeOn(p.decideQueue))
+	t.Cleanup(held)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p.handleUpstreamRequest(context.Background(), mcp.RPCMsg{
+			JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: capability.MethodSamplingCreateMessage,
+		})
+	}()
+	select {
+	case <-done:
+	case <-time.After(4 * samplingTurnWait):
+		t.Fatal("the upstream reader is wedged on a turn whose holder is waiting for a response only it can deliver")
+	}
+
+	// The upstream is ANSWERED rather than left hanging: a refusal it never receives leaves it
+	// waiting on a reply forever, which is the deadlock relocated rather than closed.
+	require.Len(t, uw.messages, 1, "the refused sampling request must be answered")
+	assert.NotNil(t, uw.messages[0].Error)
+}
+
 // TestDecideSampling_RefusedTurnIsAHardDeny pins what a refused turn produces. The refusal has
 // to be a DENY rather than an unserialized decision (the peek would be racing a host source's
 // label write, the exact fail-open the turn exists to close), and it has to be HARD so an

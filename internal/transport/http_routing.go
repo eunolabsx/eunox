@@ -742,8 +742,9 @@ type sessionGate struct {
 // sessionGateVerdict runs the two security checks every host-initiated action on an
 // EXISTING session must clear: the per-route audience pin (a token minted for a sibling
 // route's audience, accepted by the gateway's shared union validator, must not act on
-// this route's session) and the session-owner binding (only the JWT identity — issuer+sub
-// — that created the session may act on it; see httpSession.ownerMismatch). Both are
+// this route's session) and the session-owner binding (only the JWT identity — issuer+sub,
+// plus the state ANCHOR on a route that anchors state on the task — that created the
+// session may act on it; see httpSession.ownerMismatch). Both are
 // properties of the session, so applying them to EVERY host-initiated action is what stops
 // a second same-audience identity that learned a victim's Mcp-Session-Id from driving,
 // notifying, reading, or tearing down the victim's upstream session (the audience pin alone

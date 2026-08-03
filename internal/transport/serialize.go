@@ -234,6 +234,9 @@ func (q *ticketQueue) ticket() decisionTicket {
 // OWN handler goroutine, so a slow turn holder delays that request and nothing else. The
 // server-initiated leg does not have that property and uses beginWithin.
 func (g *decisionSerializer) begin(t decisionTicket) (end func()) {
+	// With no bound there is no give-up path — the wait loop can only exit on the turn — so ok
+	// is invariably true and the end func is never nil. A future second reason to give up would
+	// have to make this branch, rather than silently returning a nil release to a deferred call.
 	end, _ = g.beginWithin(t, 0)
 	return end
 }
