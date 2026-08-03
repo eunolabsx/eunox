@@ -33,20 +33,38 @@ import (
 // the signed record would misreport the request. Always allocating makes that unrepresentable
 // rather than a property of who currently writes what afterwards.
 func TestMergeAuditDetails_NeverHandsBackAnInput(t *testing.T) {
-	base := map[string]interface{}{"path": "/tmp/x"}
-	extra := map[string]interface{}{audit.UpstreamErrorCodeKey: -32000}
+	// Fixtures are built per subtest rather than shared: the assertions below WRITE into the
+	// merge result, so a regression that hands an input back would otherwise poison the
+	// fixture and fail sibling cases too — in an order Go randomizes, pointing a maintainer
+	// at three cases when one is at fault.
+	base := func() map[string]interface{} { return map[string]interface{}{"path": "/tmp/x"} }
+	extra := func() map[string]interface{} {
+		return map[string]interface{}{audit.UpstreamErrorCodeKey: -32000}
+	}
+	empty := func() map[string]interface{} { return map[string]interface{}{} }
 
 	for name, tc := range map[string]struct {
-		base, extra map[string]interface{}
+		base, extra func() map[string]interface{}
 		wantKeys    []string
 	}{
 		"both populated":  {base, extra, []string{"path", audit.UpstreamErrorCodeKey}},
 		"empty extra":     {base, nil, []string{"path"}},
 		"empty base":      {nil, extra, []string{audit.UpstreamErrorCodeKey}},
-		"empty extra map": {base, map[string]interface{}{}, []string{"path"}},
+		"empty extra map": {base, empty, []string{"path"}},
+		// The case that used to slip through: len() is 0 for an empty NON-NIL map too, so
+		// the both-empty shortcut handed the caller's own map straight back. "An empty map
+		// has nothing to corrupt" is a claim about reads; the write below is what breaks it.
+		"empty non-nil base": {empty, nil, nil},
 	} {
 		t.Run(name, func(t *testing.T) {
-			got := mergeAuditDetails(tc.base, tc.extra)
+			var inBase, inExtra map[string]interface{}
+			if tc.base != nil {
+				inBase = tc.base()
+			}
+			if tc.extra != nil {
+				inExtra = tc.extra()
+			}
+			got := mergeAuditDetails(inBase, inExtra)
 			require.NotNil(t, got)
 			for _, k := range tc.wantKeys {
 				assert.Contains(t, got, k)
@@ -54,41 +72,76 @@ func TestMergeAuditDetails_NeverHandsBackAnInput(t *testing.T) {
 			// The property the dispatch site depends on: writing into the result cannot
 			// reach either input.
 			got["_probe"] = true
-			assert.NotContains(t, tc.base, "_probe", "the result must not alias base")
-			assert.NotContains(t, tc.extra, "_probe", "nor extra")
+			assert.NotContains(t, inBase, "_probe", "the result must not alias base")
+			assert.NotContains(t, inExtra, "_probe", "nor extra")
 		})
 	}
 
-	// Both empty is the one case that allocates nothing, because there is nothing to own —
-	// and it must preserve nil-vs-empty: the sink omits a nil details map from the record
-	// entirely and marshals an empty one as {}. Returning {} here would put a details field
-	// on essentially every allow record that has none today.
+	// A nil base with nothing to add is the one case that allocates nothing, because there is
+	// nothing to own AND nothing to hand back. It must stay nil: the sink omits a nil details
+	// map from the record entirely and marshals an empty one as {}, so returning {} here would
+	// put a details field on essentially every allow record that has none today.
 	assert.Nil(t, mergeAuditDetails(nil, nil),
 		"nothing to merge must stay nil, not become an empty details object on the tape")
 }
 
-// TestDispatchToolsCall_ReceiptNeverLandsInTheCallersArguments is the failure the two merge
-// semantics could produce, exercised end to end rather than on the helper.
+// TestDispatchToolsCall_AnnotationsNeverLandInTheCallersArguments is the failure the two merge
+// semantics could produce, driven through the real dispatcher rather than re-stated on the
+// helper — a test that hand-copies the production merge and asserts on its own copy is a
+// fourth implementation of the thing this change exists to have one of, and would keep passing
+// after any regression in dispatch.go.
 //
 // Under --audit a tools/call allow record's details IS the caller's parsed argument map, and
-// the effect receipt is merged into it. If any step of that merge hands back the caller's map,
-// the reserved receipt key is written into the live request — so the record describes a
-// request carrying an argument nobody sent, on the signed tape.
-func TestDispatchToolsCall_ReceiptNeverLandsInTheCallersArguments(t *testing.T) {
-	live := map[string]interface{}{"path": "/tmp/x"}
-	toolDetails := live
+// eunox merges its own annotations into it. If any step of that merge hands the caller's map
+// back, the annotation is written into the live request — so the signed record describes a
+// request carrying something nobody sent.
+func TestDispatchToolsCall_AnnotationsNeverLandInTheCallersArguments(t *testing.T) {
+	rec := &fwdRecorder{}
+	dp := newTestManifestPDP(capability.Constraint{Target: "tool:refund", Actions: []string{"call"}})
+	d := dispatchParams{
+		forwardParams: forwardParams{
+			rec: rec, sessionID: "s",
+			// --audit, which is what makes the record's details the caller's own map.
+			audit: true,
+			callUpstream: func(_ context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, error) {
+				// An upstream ERROR, so the closure has an annotation to merge in
+				// (audit.UpstreamErrorCodeKey) on a path where extra would otherwise be nil.
+				return mcp.RPCMsg{JSONRPC: "2.0", ID: msg.ID,
+					Error: &mcp.RPCError{Code: -32000, Message: "upstream said no"}}, nil
+			},
+		},
+		pdp: dp,
+	}
+	// The exact bytes the host sent, kept so the parsed map can be compared against them.
+	const rawArgs = `{"path":"/tmp/x"}`
+	msg := mcp.RPCMsg{
+		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsCall,
+		Params: json.RawMessage(`{"name":"refund","arguments":` + rawArgs + `}`),
+	}
+	dispatchRequest(context.Background(), d, msg)
 
-	// The merge exactly as dispatchToolsCall performs it: annotations accumulate in a map
-	// this side owns, and the caller's map is only ever a merge INPUT.
-	extra := map[string]interface{}{audit.UpstreamErrorCodeKey: -32000}
-	extra[audit.EffectReceiptKey] = map[string]interface{}{"verdict": "verified"}
-	details := mergeAuditDetails(toolDetails, extra)
+	require.Len(t, rec.records, 1)
+	got := rec.records[0].details
+	assert.Equal(t, "/tmp/x", got["path"], "the caller's own arguments survive the merge")
+	assert.Equal(t, -32000, got[audit.UpstreamErrorCodeKey], "and eunox's annotation reaches the record")
 
-	assert.Equal(t, map[string]interface{}{"path": "/tmp/x"}, live,
-		"the caller's argument map is what the record describes; nothing eunox annotates may land in it")
-	assert.Equal(t, "/tmp/x", details["path"], "and the caller's own keys survive the merge")
-	assert.Contains(t, details, audit.EffectReceiptKey)
-	assert.Contains(t, details, audit.UpstreamErrorCodeKey)
+	// The point: the request's parsed argument map is still exactly what the host sent. Read
+	// back through the same decode the dispatcher used, so this compares the map eunox may
+	// have mutated rather than a copy the test made.
+	var params struct {
+		Arguments map[string]interface{} `json:"arguments"`
+	}
+	require.NoError(t, json.Unmarshal(msg.Params, &params))
+	assert.Equal(t, map[string]interface{}{"path": "/tmp/x"}, params.Arguments,
+		"the record's details are the caller's argument map; nothing eunox annotates may land in the request")
+	assert.NotContains(t, got, audit.EffectReceiptKey, "no receipts configured here")
+}
+
+// successfulReply is the upstream reply shape declassifyCommitted accepts: no error member,
+// a result object, no isError flag. The withheld-result fact is gated on it, so a test
+// asserting that fact has to present one.
+func successfulReply() mcp.RPCMsg {
+	return mcp.RPCMsg{ID: mcp.RawJSON(`1`), Result: json.RawMessage(`{"ok":true}`)}
 }
 
 // TestDispatchToolsCall_NoInlineDetailsMergeSurvives keeps the "one merge, one semantic"
@@ -108,14 +161,32 @@ func TestDispatchToolsCall_NoInlineDetailsMergeSurvives(t *testing.T) {
 	fn := findFuncDecl(file, "dispatchToolsCall")
 	require.NotNil(t, fn, "dispatchToolsCall must exist for this guard to mean anything")
 
-	merged := false
+	// Names bound to a mergeAuditDetails result. Derived rather than hardcoded: keying the
+	// guard on the identifier `details` made it vacuous the moment that local was renamed,
+	// and a reintroduced `d := mergeAuditDetails(...); d[k] = v` would have passed it.
+	merged := map[string]bool{}
 	ast.Inspect(fn, func(n ast.Node) bool {
-		if call, ok := n.(*ast.CallExpr); ok {
-			if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "mergeAuditDetails" {
-				merged = true
-			}
+		assign, ok := n.(*ast.AssignStmt)
+		if !ok {
 			return true
 		}
+		for i, rhs := range assign.Rhs {
+			call, ok := rhs.(*ast.CallExpr)
+			if !ok {
+				continue
+			}
+			if ident, ok := call.Fun.(*ast.Ident); !ok || ident.Name != "mergeAuditDetails" {
+				continue
+			}
+			if i < len(assign.Lhs) {
+				if ident, ok := assign.Lhs[i].(*ast.Ident); ok {
+					merged[ident.Name] = true
+				}
+			}
+		}
+		return true
+	})
+	ast.Inspect(fn, func(n ast.Node) bool {
 		assign, ok := n.(*ast.AssignStmt)
 		if !ok {
 			return true
@@ -126,16 +197,34 @@ func TestDispatchToolsCall_NoInlineDetailsMergeSurvives(t *testing.T) {
 				continue
 			}
 			ident, ok := idx.X.(*ast.Ident)
-			if !ok || ident.Name != "details" {
+			if !ok || !merged[ident.Name] {
 				continue
 			}
-			t.Errorf("dispatch.go:%d writes into a merged details map; pass the key through extra instead — "+
-				"the merge's result is the caller's to own, and its inputs include the live argument map",
-				fset.Position(assign.Pos()).Line)
+			t.Errorf("dispatch.go:%d writes into %q, which holds a mergeAuditDetails result; pass the key "+
+				"through extra instead — the merge's result is the caller's to own, and its inputs include "+
+				"the live argument map", fset.Position(assign.Pos()).Line, ident.Name)
 		}
 		return true
 	})
-	assert.True(t, merged,
+
+	// The merge must actually be reached, or the guard above proves nothing. Asserted on the
+	// RETURN so a stray call elsewhere in the function cannot satisfy it.
+	returnsMerge := false
+	ast.Inspect(fn, func(n ast.Node) bool {
+		ret, ok := n.(*ast.ReturnStmt)
+		if !ok {
+			return true
+		}
+		for _, res := range ret.Results {
+			if call, ok := res.(*ast.CallExpr); ok {
+				if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "mergeAuditDetails" {
+					returnsMerge = true
+				}
+			}
+		}
+		return true
+	})
+	assert.True(t, returnsMerge || len(merged) > 0,
 		"dispatchToolsCall must fold its annotations through the shared merge, not a private copy loop")
 }
 
@@ -164,7 +253,7 @@ func TestFlowDiscriminator_IsOneSharedConstant(t *testing.T) {
 	fp := forwardParams{sessionID: "s"}
 	for name, got := range map[string]map[string]interface{}{
 		"refusal below the decision": fp.declassifyRefusalDetail(declassifiedAllow()),
-		"result withheld":            fp.declassifyWithheldDetail(declassifiedAllow()),
+		"result withheld":            fp.declassifyRedactionDetail(declassifiedAllow(), successfulReply()),
 	} {
 		assert.Equal(t, true, got[capability.FlowAuditDetailKey], "%s must carry the discriminator", name)
 	}
@@ -175,7 +264,18 @@ func TestFlowDiscriminator_IsOneSharedConstant(t *testing.T) {
 	// Parsed per file rather than per package: build-tagged files (the O_NOFOLLOW pair and
 	// its siblings) belong to no single parse of a directory, and a producer hidden behind a
 	// build tag is exactly the one a reviewer would not notice either.
-	for _, dir := range []string{".", filepath.Join("..", "..", "pkg", "enforcement")} {
+	// Every package that builds a denial- or record-details map, not just today's two
+	// producers: a respelling added in internal/pdp (which gained a details-carrying deny
+	// funnel) or internal/audit would otherwise be invisible to the guard, and the whole
+	// point of the constant is that such a divergence fails nothing at runtime.
+	scanned := 0
+	for _, dir := range []string{
+		".",
+		filepath.Join("..", "..", "pkg", "enforcement"),
+		filepath.Join("..", "pdp"),
+		filepath.Join("..", "audit"),
+		filepath.Join("..", "..", "cmd", "eunox"),
+	} {
 		entries, err := os.ReadDir(dir)
 		require.NoError(t, err)
 		for _, e := range entries {
@@ -184,8 +284,9 @@ func TestFlowDiscriminator_IsOneSharedConstant(t *testing.T) {
 			}
 			path := filepath.Join(dir, e.Name())
 			fset := token.NewFileSet()
-			file, err := parser.ParseFile(fset, path, nil, 0)
+			file, err := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
 			require.NoError(t, err)
+			scanned++
 			ast.Inspect(file, func(n ast.Node) bool {
 				// Only where the literal is used as a details-map KEY — written into a map
 				// literal, or indexed into one. The same spelling as a plain call argument
@@ -210,6 +311,10 @@ func TestFlowDiscriminator_IsOneSharedConstant(t *testing.T) {
 			})
 		}
 	}
+	// Without this the guard degrades silently to covering nothing if a scanned package is
+	// renamed or moved — the same class of quiet, nothing-fails failure the constant exists
+	// to prevent.
+	require.Greater(t, scanned, 40, "the flow-discriminator scan covered too few files to be meaningful")
 }
 
 // TestEnforcedForwardCore_AllowDetailsAreNotTheCallersMap is the same aliasing guard one

@@ -471,10 +471,14 @@ func (fp forwardParams) recordUpstreamFailure(ctx context.Context, msg mcp.RPCMs
 // has to carry, since nothing else on the tape would name a grant spent by a call that did
 // not run.
 //
-// "Did not run" is true of the first two exits and NOT of the third, which is why the
-// redaction exit takes declassifyWithheldDetail instead of calling this directly: the labels
-// and the spent grant read the same on all three, but only there is it known that the action
-// executed.
+// Those three refusals are not its only callers, and the doc used to read as though they were.
+// Two more sites reach it: the redaction exit goes through declassifyRedactionDetail (which
+// adds the executed-and-withheld fact when the reply supports it, and falls back to this shape
+// when it does not), and the success path's else-branch calls this for a call that WAS
+// forwarded and delivered but whose reply showed the action failing — an isError result or a
+// JSON-RPC error. That last one rides an ALLOW record, so "not applied" here means the clear
+// did not take effect, never that the request was rejected; see audit.DeclassifyNotAppliedKey,
+// which states the same for the key.
 func (fp forwardParams) declassifyRefusalDetail(dec capability.EnforceResponse) map[string]interface{} {
 	// Either fact on its own is worth a record, and neither implies the other. A refusal
 	// below the decision carries the labels but no spent id when the grant was standing; the
@@ -492,32 +496,51 @@ func (fp forwardParams) declassifyRefusalDetail(dec capability.EnforceResponse) 
 	return detail
 }
 
-// declassifyWithheldDetail is declassifyRefusalDetail for the ONE refusal below the decision
-// where the upstream provably EXECUTED the declassifying action: redaction of its response
-// failed, so eunox dropped a well-formed, successful reply rather than forward it unredacted.
+// declassifyRedactionDetail is declassifyRefusalDetail for the redaction-failure exit — the
+// one refusal below the decision that the upstream may have ANSWERED before it was taken.
 //
 // It exists because the reasoning the other two exits share does not hold here. The strict
 // gate blocks before the forward and an upstream transport failure leaves it unknowable
 // whether a side effect landed, so for both of them "the approved clear did not take effect"
-// is the whole story. Here the sanitizing transform genuinely ran; only the delivery failed.
-// Sharing one detail shape across all three told an operator reconciling a burned `once`
-// grant that the call might never have happened, when on this exit it demonstrably did — the
-// difference between reissuing the approval to retry the work and reissuing it to re-deliver
-// work already done.
+// is the whole story. Reaching this exit means a reply came back and eunox dropped it rather
+// than forward it unredacted. Sharing one detail shape across all three told an operator
+// reconciling a burned `once` grant that the call might never have happened, when here it may
+// demonstrably have run — the difference between reissuing the approval to retry the work and
+// reissuing it to re-deliver work already done.
 //
-// The clear stays withheld, and that is decided here rather than inherited: the redacted
-// response never reached the host, so nothing sanitized entered the session and the taint
-// still describes it accurately. See audit.DeclassifyResultWithheldKey for the full reasoning
-// and the accepted cost. Returns nil for a decision that authorized no clear and spent no
-// grant, exactly as declassifyRefusalDetail does — a redaction failure on an ordinary call is
-// not a declassification event and gets no flow annotation.
-func (fp forwardParams) declassifyWithheldDetail(dec capability.EnforceResponse) map[string]interface{} {
+// "A reply came back" is NOT the claim, though, and the gate is what makes the difference. The
+// withheld-result key asserts the sanitizing action EXECUTED, and that is decided by the same
+// declassifyCommitted the success path uses — never by the mere presence of a result body.
+// A reply flagged isError, a reply carrying an error member beside a result (which JSON-RPC
+// forbids and a hostile upstream may still emit), or bytes this build cannot interpret all
+// mean the transform did not happen, and every one of them can reach this exit with a
+// non-nil Result that then fails redaction. Stamping "executed" on those would put a fact on
+// the signed tape that the proxy cannot back — and an upstream can produce them at will — so
+// an unsuccessful reply falls back to the plain refusal shape. dec.Decision is checked for the
+// reason the commit gate checks it: the observe path forwards a call whose verdict was a DENY,
+// and a downgraded deny must not be reported as an executed declassification.
+//
+// The clear stays withheld either way, and that is decided here rather than inherited: the
+// redacted response never reached the host, so nothing sanitized entered the session and the
+// taint still describes it accurately. See audit.DeclassifyResultWithheldKey for the full
+// reasoning and the accepted cost. Returns nil for a decision that authorized no clear and
+// spent no grant, exactly as declassifyRefusalDetail does — a redaction failure on an ordinary
+// call is not a declassification event and gets no flow annotation.
+func (fp forwardParams) declassifyRedactionDetail(dec capability.EnforceResponse, upResp mcp.RPCMsg) map[string]interface{} {
 	detail := fp.declassifyRefusalDetail(dec)
 	if detail == nil {
 		return nil
 	}
+	if dec.Decision != capability.DecisionAllow || !declassifyCommitted(upResp) {
+		// The reply did not show the action succeeding, so this exit says only what the
+		// other two say: the approved clear did not take effect.
+		return detail
+	}
 	// Beside the not-applied key rather than instead of it: both facts are true, and a
 	// consumer keyed on the benign "clear never ran" case must still find this refusal.
+	// The one shape where it rides ALONE is a no-op clear under a single-use grant — the
+	// decision authorized a clear the anchor was not carrying, so there is no not-applied
+	// label set, and the spent grant is what makes the withheld fact worth recording at all.
 	detail[audit.DeclassifyResultWithheldKey] = true
 	return detail
 }
@@ -548,7 +571,7 @@ func declassifyDetail() map[string]interface{} {
 //
 // Bounded before it lands, through the SAME cap the top-level approval_id gets. The id is an
 // IdP-supplied string Validate() places no length limit on, and unlike the engine's own
-// refusal details — which pass through boundDenialDetails — a value written straight into a
+// refusal details — which pass through enforcement.BoundDenialDetails — a value written straight into a
 // transport-built details map reaches the tape under only the 1 MiB whole-map cap. Left
 // unbounded, one 500 KB approval id would write 128x the envelope cap per declassification
 // into the tape and the audit queue's byte budget, on exactly the value declassifyRefusal's
@@ -694,14 +717,15 @@ func (fp forwardParams) commitCleared(ctx context.Context, labels []string) ([]s
 // afterwards. The saving it gives up is one shallow map copy on a path that is already
 // serializing, signing and writing an audit record.
 //
-// The one case that allocates nothing is the one where there is nothing to own: both inputs
-// empty returns base unchanged, preserving nil-vs-empty (the sink omits a nil details map
-// from the record entirely and marshals an empty one as {}), and an empty map has no entry
-// for a later write to corrupt. Callers that go on to write into the result must therefore
-// pass their key through extra rather than assigning into the return.
+// The one case that allocates nothing is the one where there is nothing to own AND nothing to
+// hand back: a nil base with no extra returns nil, preserving nil-vs-empty (the sink omits a
+// nil details map from the record entirely and marshals an empty one as {}). An EMPTY non-nil
+// base does not take that path — returning it would hand back an input, and "an empty map has
+// nothing to corrupt" is a claim about reads, not about the write that would put the first
+// entry in it. The invariant is total or it is a rule the next caller has to remember.
 func mergeAuditDetails(base, extra map[string]interface{}) map[string]interface{} {
-	if len(base) == 0 && len(extra) == 0 {
-		return base
+	if base == nil && len(extra) == 0 {
+		return nil
 	}
 	out := make(map[string]interface{}, len(base)+len(extra))
 	for k, v := range base {
@@ -902,16 +926,15 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 			// every redactFields-guarded call vanish from the audit trail. Also a
 			// forwarded-then-recorded boundary call, so it gets the same diagnostic.
 			//
-			// The third exit below the decision, and the only one where the upstream
-			// provably RAN the declassifying action — this is reached solely after a
-			// well-formed, successful reply, so the sanitizing transform happened and only
-			// the delivery failed. The clear is still withheld, but on this exit's own
-			// reasoning rather than the other two's: nothing sanitized reached the host, so
-			// nothing sanitized entered the session, which is what a flow label tracks. The
-			// record says so — declassifyWithheldDetail marks the action executed and the
-			// result withheld, so an operator reconciling the burned grant can tell "the work
-			// is done, only the delivery failed" from "it may never have run".
-			redactDetail := fp.declassifyWithheldDetail(dec)
+			// The third exit below the decision, and the only one the upstream may have
+			// ANSWERED before it was taken. The clear is still withheld, but on this exit's
+			// own reasoning rather than the other two's: nothing sanitized reached the host,
+			// so nothing sanitized entered the session, which is what a flow label tracks.
+			// declassifyRedactionDetail decides what the record may CLAIM about that reply —
+			// only a reply declassifyCommitted accepts is reported as an executed action,
+			// since this branch is reachable with an isError result or a hostile
+			// result-plus-error envelope that redaction then fails on.
+			redactDetail := fp.declassifyRedactionDetail(dec, upResp)
 			warnIfStrictAuditJustDegraded(fp.requireAuditStrict, fp.rec, kind, denialTarget, func() {
 				if fp.rec != nil {
 					fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, capability.ErrCodeEnforcementError, "", redactDetail, false)
@@ -978,10 +1001,11 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 		if fp.rec == nil {
 			return
 		}
-		// mergeAuditDetails, never a write into allowDetails' return: on the audit-mode
-		// tools/call path that IS the caller's live argument map, so writing into it would
-		// mutate the request the record is supposed to describe. It returns the base
-		// untouched when there is nothing to add, so the common path allocates nothing.
+		// Through mergeAuditDetails, never a write into allowDetails' return: the tools/call
+		// closure's own base under --audit is the caller's live parsed argument map, so an
+		// annotation written into whatever that chain hands back would rewrite the request the
+		// record is supposed to describe. The merge always returns a map this frame owns (see
+		// its doc); nothing here writes into it, and a future annotation must go through extra.
 		details := mergeAuditDetails(allowDetails(upResp), declDetail)
 		// A call that CLEARED flow labels under a human approval takes the recorder that
 		// carries the approval; every other call takes the plain one. The branch is on what

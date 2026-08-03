@@ -47,7 +47,7 @@ const (
 	maxDenialDetailStringLen = 512
 
 	// maxDenialDetailsBytes bounds the WHOLE map. A per-string cap alone bounds a
-	// handler that echoes one argument; it does not bound handleAllowedValues echoing
+	// handler that echoes one argument; it does not bound EvaluateAllowedValues echoing
 	// an argument that decoded to a large object or a 100k-element array, where each
 	// element is individually tiny — or, worse, an array of EMPTY containers, which
 	// carry no strings and no scalars at all. Every key, every scalar AND every
@@ -135,7 +135,7 @@ func IsDenialDetailSliceElided(s string) bool {
 	return denialDetailSliceElidedRe.MatchString(s)
 }
 
-// boundDenialDetails returns a bounded deep copy of a denial's details map, or nil
+// BoundDenialDetails returns a bounded deep copy of a denial's details map, or nil
 // when there is nothing to bound.
 //
 // Deep copy, not in-place: the maps and slices a handler puts in Details routinely
@@ -152,7 +152,19 @@ func IsDenialDetailSliceElided(s string) bool {
 // Details["argument"] to build the host-facing error message.) An equal share per key
 // cannot starve one key with another, needs no hand-maintained list of which keys are
 // "important", and stays deterministic.
-func boundDenialDetails(in map[string]interface{}) map[string]interface{} {
+// It is EXPORTED, with no unexported twin, for the reason capability.BoundString is: the
+// layer above evaluates a shared predicate (EvaluateAllowedValues) and assembles its own
+// EnforceResponse rather than going through denyResponse, so without a reachable bound it
+// would produce the one denial on the tape exempt from the cap the other twenty-odd inherit
+// by construction. Those are the engine's own denial details, just assembled one layer up.
+// Its one external caller routes every deny it builds through a single funnel, so the
+// "remember to call this" surface is one function rather than one call site per denial.
+//
+// NOT idempotent, and it must not be applied twice: boundDetailMap WRITES DenialDetailElidedKey
+// for an elided entry, and escapeReservedDetailKey re-spells that same key when it appears on
+// INPUT — so a second pass rewrites eunox's own elision marker into the caller-forgery spelling
+// and the tape reads as though a client planted it. Bound once, at the funnel.
+func BoundDenialDetails(in map[string]interface{}) map[string]interface{} {
 	if len(in) == 0 {
 		// Preserve nil-vs-empty: a nil details map is omitted from the audit record
 		// entirely, and an empty non-nil one marshals to {}. Handlers rely on the
@@ -170,19 +182,6 @@ func boundDenialDetails(in map[string]interface{}) map[string]interface{} {
 		out[bk] = boundDetailValue(v, &budget, 0)
 	}
 	return out
-}
-
-// BoundDenialDetails applies boundDenialDetails' bound for a caller OUTSIDE the engine — a
-// PDP that evaluates a shared predicate (EvaluateAllowedValues) and assembles its own
-// EnforceResponse instead of going through denyResponse.
-//
-// It is exported so such a caller cannot produce the one denial on the tape exempt from the
-// bound the other twenty-odd inherit by construction. The details a shared predicate returns
-// echo the caller's failed argument verbatim, so a path that skipped this would hand a
-// post-auth caller the same signed-log amplifier this file exists to close — these are the
-// engine's own denial details, just assembled one layer up.
-func BoundDenialDetails(in map[string]interface{}) map[string]interface{} {
-	return boundDenialDetails(in)
 }
 
 // escapeReservedDetailKey re-spells a caller key that collides with the reserved

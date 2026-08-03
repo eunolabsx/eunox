@@ -651,8 +651,11 @@ Section conventions:
   `--require-audit=strict` blocks before the forward and an upstream transport failure can
   follow a side effect that already happened, so for both it is genuinely unknown whether
   the upstream executed anything — while the **redaction-failure** gate is reached only
-  after a well-formed, successful reply, so there the sanitizing transform demonstrably ran
-  and only eunox's own delivery of the result failed. The clear is still withheld on that
+  after a reply came back — and "a reply came back" is not the same claim. A reply flagged
+  `isError`, a reply carrying an error member beside a result, or bytes eunox cannot interpret
+  can all reach that gate and fail redaction, and an upstream can produce any of them at will,
+  so the executed fact is stamped only for a reply that passes the same success test the clear
+  itself is gated on. The clear is still withheld on that
   exit (the sanitized result never reached the host, so nothing sanitized entered the
   session, which is what a flow label tracks), but the burned `once` grant is then spent for
   a proxy- or manifest-side defect. That refusal now stamps
@@ -662,21 +665,30 @@ Section conventions:
   carry. A non-zero count is also its own signal: a `redactFields` path and the real
   response shape disagree.
 
-- **`allowedValues` is one predicate instead of two.** The JWT capability-claim path
-  hand-copied the engine's `handleAllowedValues` — argument resolution, the
-  `MISSING_CONTEXT` arm, the match, the `VALUE_NOT_PERMITTED` arm — and the copy had drifted
-  on two axes: no empty-argument guard, and no structured `details`. One logical refusal
-  therefore reached the signed tape with **two shapes** depending only on whether a token
-  was involved, so a SIEM rule written against the manifest path's `allowedValues` denial
-  found nothing for a token-scoped caller, and the host-facing error could not name the
-  offending argument (the transport builds it from `details.argument`). The same mechanism
-  had already shipped a live defect once, when task-variable resolution was added on the
-  manifest side only and every grant carrying a `${task.*}` reference denied every call
-  under it. Both paths now call one exported, **non-committing** predicate
-  (`enforcement.EvaluateAllowedValues`), so a semantic added to it reaches both by
-  construction. The JWT-only fail-closed guards are untouched, and the JWT path's details go
-  through the same bound every engine-built deny inherits, so it does not become the one
-  denial able to carry a caller-sized value onto the tape.
+- **`allowedValues` is one predicate instead of two, and every JWT condition denial now
+  carries details.** The JWT capability-claim path hand-copied the engine's
+  `handleAllowedValues` — argument resolution, the `MISSING_CONTEXT` arm, the match, the
+  `VALUE_NOT_PERMITTED` arm — and the copy had drifted on two axes: no empty-argument guard,
+  and no structured `details`. One logical refusal therefore reached the signed tape with
+  **two shapes** depending only on whether a token was involved, so a SIEM rule written
+  against the manifest path's `allowedValues` denial found nothing for a token-scoped caller,
+  and the host-facing error could not name the offending argument (the transport builds it
+  from `details.argument`). The same mechanism had already shipped a live defect once, when
+  task-variable resolution was added on the manifest side only and every grant carrying a
+  `${task.*}` reference denied every call under it. Both paths now call one exported,
+  **non-committing** predicate (`enforcement.EvaluateAllowedValues`), so a semantic added to
+  it reaches both by construction.
+
+  The sibling `allowedOperations` arm had the same detail-less denials and keeps its own
+  deliberately different scan-all-arguments semantics, so it cannot share the handler — but it
+  now shares the record **shape**, emitting the same `details` keys the engine records for the
+  same denial code. Every deny this layer builds routes through one funnel that applies the
+  bound `pkg/enforcement` applies to its own, so a denial's echo of a caller-supplied value
+  cannot reach the tape at the caller's chosen length, and a future producer inherits the bound
+  instead of having to remember it. `enforcement.BoundDenialDetails` is the exported name for
+  that bound (it replaces the unexported spelling; it is deliberately not idempotent, so it
+  belongs at a funnel and nowhere else). A typed-nil condition handed to any handler now denies
+  rather than panicking the request goroutine.
 
 - **One audit-details merge, one aliasing semantic.** `internal/transport` had two
   implementations of "fold extra keys into a details map" roughly 200 lines apart, with

@@ -103,12 +103,14 @@ type auditStatsSummary struct {
 	// declassifyNotApplied is benign — the call was refused below the decision, so the
 	// labels were never removed — but it is what explains a spent grant beside it.
 	declassifyNotApplied int
-	// declassifyResultWithheld is the subset of the above where the action EXECUTED and
-	// eunox dropped its result (response redaction failed). Counted separately because it
-	// is the one the operator's remedy differs on: the sanitizing work is already done, so
-	// the re-minted approval re-delivers rather than re-runs. It is a proxy- or
-	// manifest-side defect rather than anything the caller or the upstream did, so a
-	// non-zero count means a redactFields directive and a real response shape disagree.
+	// declassifyResultWithheld counts the refusals where the action EXECUTED and eunox
+	// dropped its result (response redaction failed). It usually overlaps the count above but
+	// is NOT a strict subset — a no-op clear under a single-use grant carries no not-applied
+	// labels — so it is reported on its own line. Counted separately because the operator's
+	// remedy differs: the sanitizing work is already done, so the re-minted approval
+	// re-delivers rather than re-runs. It is a proxy- or manifest-side defect rather than
+	// anything the caller or the upstream did, so a non-zero count means a redactFields
+	// directive and a real response shape disagree.
 	declassifyResultWithheld int
 	// spentApprovals counts single-use grants this log shows being burned, which is the
 	// reconciliation signal: an operator asking "which of my outstanding one-shot approvals
@@ -271,14 +273,17 @@ func printAuditStats(w io.Writer, s auditStatsSummary) {
 		wf("  (declassify-not-applied = %d refused call(s) whose approved clear was therefore never made; the labels were never removed, so nothing is under-tainted.)\n",
 			s.declassifyNotApplied)
 	}
-	// A subset of the line above, called out because the remedy differs: on every other
-	// refusal below the decision it is unknown whether the upstream ran anything, so a
-	// re-minted approval retries the work. Here the work is already done and only its
-	// delivery failed, which is also a signal that a redactFields directive and the real
-	// response shape disagree — a policy or upstream-contract fix, not a retry.
+	// Its own line, not "of those": it usually accompanies the count above but can stand
+	// alone (a no-op clear under a single-use grant leaves no not-applied labels), so a
+	// subset phrasing would print under a heading that was never emitted. The remedy is what
+	// makes it worth separating — on every other refusal below the decision it is unknown
+	// whether the upstream ran anything, so a re-minted approval retries the work, while here
+	// the work is done and only its delivery failed. A non-zero count is also a signal in its
+	// own right: a redactFields directive and the real response shape disagree.
 	if s.declassifyResultWithheld > 0 {
-		wf("  (of those, %d had already EXECUTED upstream and had the result withheld because response redaction failed;\n", s.declassifyResultWithheld)
-		wln("   the sanitizing work is done, so a fresh approval re-delivers rather than re-runs it. Check the redactFields paths against the real response shape.)")
+		wf("  (declassify-result-withheld = %d refused call(s) whose action had already EXECUTED upstream, with the result dropped because response redaction failed;\n"+
+			"   the sanitizing work is done, so a fresh approval re-delivers rather than re-runs it. Check the redactFields paths against the real response shape.)\n",
+			s.declassifyResultWithheld)
 	}
 	if s.spentApprovals > 0 {
 		wf("  (single-use approvals spent = %d; each is burned for good, including on a clear that changed nothing or a call that was then refused. Reconcile these against your outstanding one-shot approvals — details.%s names each.)\n",

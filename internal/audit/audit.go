@@ -1791,15 +1791,21 @@ const EffectReceiptKey = "_eunox_effect_receipt"
 //     advertises. It is the key that answers "which of my outstanding single-use approvals
 //     are still live?", which neither approval_id (present only on a clear that changed
 //     something) nor a refusal-only key could.
-//   - DeclassifyNotAppliedKey: an approved clear did NOT run because the call was refused
-//     below the decision (the --require-audit=strict gate, an upstream transport failure, a
-//     redaction failure). Benign by construction — the labels were never removed, so the
-//     session is exactly as tainted as the calls it actually made — and recorded so a spent
-//     grant beside it is explicable.
-//   - DeclassifyResultWithheldKey: QUALIFIES the key above for the one refusal below the
-//     decision where the upstream provably RAN the action. It rides beside
-//     DeclassifyNotAppliedKey rather than replacing it, because both facts are true there
-//     and a consumer keyed on the benign case must still find it.
+//   - DeclassifyNotAppliedKey: an approved clear did NOT take effect. Usually because the
+//     call was refused below the decision (the --require-audit=strict gate, an upstream
+//     transport failure, a redaction failure); also on an ALLOW whose upstream reply showed
+//     the action failing (an isError result, or a JSON-RPC error), where the response IS
+//     delivered but the transform never happened. Benign by construction either way — the
+//     labels were never removed, so the session is exactly as tainted as the calls it
+//     actually made — and recorded so a spent grant beside it is explicable. It is "the
+//     clear did not land", never "the request was rejected"; read the record's decision for
+//     that.
+//   - DeclassifyResultWithheldKey: the action EXECUTED and eunox withheld its result. It
+//     normally QUALIFIES the key above — both facts are true on that exit, and a consumer
+//     keyed on the benign case must still find the refusal — but it can ride alone on a
+//     no-op clear under a single-use grant, where the decision authorized labels the anchor
+//     was not carrying and there is therefore no not-applied set. Treat it as its own fact
+//     about a spent grant, not as a strict subset of the key above.
 //   - DeclassifyCommitFailedKey: the call RAN and the clear the policy authorized could not
 //     be applied. The session keeps taint it should have dropped, so a later sink
 //     over-blocks until the operator retries with a new approval. This is the direction the
@@ -1821,13 +1827,22 @@ const (
 	// It exists because the three refusals below the decision are not one case. Two of them
 	// (the --require-audit=strict gate, an upstream transport failure) leave it genuinely
 	// unknown whether the upstream ran anything: strict blocks before the forward, and a
-	// transport failure can follow a side effect that already happened. The redaction exit is
-	// reached only after a well-formed, successful upstream reply, so the sanitizing transform
-	// really did happen and only the delivery failed. That distinction is what an operator
+	// transport failure can follow a side effect that already happened. Only the redaction
+	// exit is reached after a reply came back. That distinction is what an operator
 	// reconciling a burned `once` grant needs — it separates "retry it" from "the work is
 	// done, only the delivery failed" — and nothing else on the tape carries it: the refusal
 	// otherwise shares DeclassifyNotAppliedKey's shape with the two exits where the action may
 	// never have run.
+	//
+	// "A reply came back" is NOT this key's claim, and the producer gates the difference. A
+	// reply flagged isError, a reply carrying an error member beside a result (which JSON-RPC
+	// forbids and a hostile upstream may still emit), and bytes the proxy cannot interpret can
+	// all reach that exit and fail redaction — so an ungated stamp would let an upstream write
+	// "the work is done" onto the tamper-evident tape at will, and the operator would re-mint
+	// the approval to re-deliver work that never ran. It is therefore written only for a reply
+	// that passes the SAME success test the clear itself is gated on, and only for a decision
+	// that was an allow (a downgraded deny is forwarded under --audit and must never be
+	// reported as an executed declassification).
 	//
 	// The clear is still withheld on this exit, which is a decision rather than an inheritance
 	// from its two siblings. The sanitized result never reached the host, so nothing sanitized

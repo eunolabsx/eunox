@@ -2387,8 +2387,9 @@ func evaluateJWTConditions(clock enforcement.Clock, conditions []capability.Cond
 				// would silently match an alternative — the "never silently match alternatives"
 				// invariant. Fail closed rather than re-implement the engine's per-argument
 				// taxonomy for this claim-unreachable form.
-				resp := denyResponse(clock, capability.ErrCodeConditionFailed, capability.ConditionTypeAllowedOperations,
-					fmt.Sprintf("%q: allowedOperations with a named argument is not supported from a capability claim", name))
+				resp := denyResponseWithDetails(clock, capability.ErrCodeConditionFailed, capability.ConditionTypeAllowedOperations,
+					fmt.Sprintf("%q: allowedOperations with a named argument is not supported from a capability claim", name),
+					map[string]interface{}{"argument": c.Argument, "allowedOperations": c.Operations})
 				return &resp
 			} else {
 				// Scan-all-args mode: the first word of each string argument is checked
@@ -2399,8 +2400,9 @@ func evaluateJWTConditions(clock enforcement.Clock, conditions []capability.Cond
 				// operation argument.
 				for _, op := range c.Operations {
 					if !isSQLVerb(op) {
-						resp := denyResponse(clock, capability.ErrCodeConditionFailed, capability.ConditionTypeAllowedOperations,
-							fmt.Sprintf("%q: non-SQL operation %q cannot be safely enforced without an explicit argument naming the operation parameter; use the manifest form that names the argument", name, op))
+						resp := denyResponseWithDetails(clock, capability.ErrCodeConditionFailed, capability.ConditionTypeAllowedOperations,
+							fmt.Sprintf("%q: non-SQL operation %q cannot be safely enforced without an explicit argument naming the operation parameter; use the manifest form that names the argument", name, op),
+							map[string]interface{}{"operation": op, "allowedOperations": c.Operations})
 						return &resp
 					}
 				}
@@ -2421,8 +2423,9 @@ func evaluateJWTConditions(clock enforcement.Clock, conditions []capability.Cond
 					// Argument nesting exceeded the depth bound; fail closed rather
 					// than risk stack exhaustion or an incomplete (and therefore
 					// unsound) scan.
-					resp := denyResponse(clock, capability.ErrCodeConditionFailed, capability.ConditionTypeAllowedOperations,
-						fmt.Sprintf("%q: arguments nested too deeply to scan for operations", name))
+					resp := denyResponseWithDetails(clock, capability.ErrCodeConditionFailed, capability.ConditionTypeAllowedOperations,
+						fmt.Sprintf("%q: arguments nested too deeply to scan for operations", name),
+						map[string]interface{}{"maxDepth": maxArgStringDepth, "allowedOperations": c.Operations})
 					return &resp
 				}
 				for _, s := range argStrings {
@@ -2436,16 +2439,28 @@ func evaluateJWTConditions(clock enforcement.Clock, conditions []capability.Cond
 					}
 					// A disallowed SQL statement in any argument is a hard denial.
 					if isSQLVerb(word) {
-						resp := denyResponse(clock, capability.ErrCodeOperationNotPermitted, capability.ConditionTypeAllowedOperations,
-							fmt.Sprintf("%q: operation %q is not in the permitted set %v", name, word, c.Operations))
+						// The SAME details the engine's handleAllowedOperations records for this exact
+						// code, so a SIEM rule keyed on the manifest path's denial finds a token-scoped
+						// caller too — the parity allowedValues just got, on the other arm of the same
+						// function. This path cannot share the engine's HANDLER (its scan-all-arguments
+						// semantics are deliberately different, and the engine hard-denies the empty
+						// argument this claim grammar always emits), but it can share the record shape.
+						resp := denyResponseWithDetails(clock, capability.ErrCodeOperationNotPermitted, capability.ConditionTypeAllowedOperations,
+							fmt.Sprintf("%q: operation %q is not in the permitted set %v", name, word, c.Operations),
+							map[string]interface{}{"operation": word, "allowedOperations": c.Operations})
 						return &resp
 					}
 				}
 				// matchedOp is non-empty only if some argument matched a permitted
 				// operation, so the only failure left is "no argument matched any".
 				if matchedOp == "" {
-					resp := denyResponse(clock, capability.ErrCodeMissingContext, capability.ConditionTypeAllowedOperations,
-						fmt.Sprintf("%q: no matching operation found in arguments", name))
+					// No "argument" key here, unlike the engine's MISSING_CONTEXT for this condition:
+					// that one names the argument the manifest declared, and this path has none — the
+					// claim grammar cannot express one, which is why it scans every argument. Naming a
+					// phantom argument would send an operator looking for a field that does not exist.
+					resp := denyResponseWithDetails(clock, capability.ErrCodeMissingContext, capability.ConditionTypeAllowedOperations,
+						fmt.Sprintf("%q: no matching operation found in arguments", name),
+						map[string]interface{}{"allowedOperations": c.Operations})
 					return &resp
 				}
 			}
@@ -2470,8 +2485,9 @@ func evaluateJWTConditions(clock enforcement.Clock, conditions []capability.Cond
 			// Fail closed on any condition type without an evaluator. buildV2Constraint
 			// emits only AllowedOperations/AllowedValues today, so this is unreachable —
 			// but a new type added there without a case here must deny, not be skipped.
-			resp := denyResponse(clock, capability.ErrCodeConditionFailed, cond.ConditionType(),
-				fmt.Sprintf("%q: JWT condition type %q has no evaluator; deny (fail closed)", name, cond.ConditionType()))
+			resp := denyResponseWithDetails(clock, capability.ErrCodeConditionFailed, cond.ConditionType(),
+				fmt.Sprintf("%q: JWT condition type %q has no evaluator; deny (fail closed)", name, cond.ConditionType()),
+				map[string]interface{}{"conditionType": cond.ConditionType()})
 			return &resp
 		}
 	}

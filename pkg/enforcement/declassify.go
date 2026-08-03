@@ -344,7 +344,7 @@ func (e *Engine) DeclassifyVerdictFor(ctx context.Context, req *capability.Enfor
 
 // declassifyRefusal builds the ESCALATION_REQUIRED refusal that replaces the allow for an
 // unauthorized declassification. Every arm goes through it (rather than building an
-// EnforceResponse literal) so the boundDenialDetails pass and the details shape are
+// EnforceResponse literal) so the BoundDenialDetails pass and the details shape are
 // single-sourced — details here carries manifest-authored and request-derived values, and
 // the one refusal a human is expected to read is exactly the one that must not carry an
 // unbounded value onto the signed tape.

@@ -994,7 +994,8 @@ func EvaluateAllowedValues(cond capability.Condition, req *capability.EnforceReq
 }
 
 // MatchAllowedValue reports whether argValue satisfies an allowedValues set. It is
-// the single matcher shared by handleAllowedValues and the JWT shorthand PDP, and it
+// the single matcher shared by EvaluateAllowedValues and, through it, the JWT shorthand
+// PDP, and it
 // answers the WHOLE question — glob matching and task-context variable resolution
 // together — against the caller's validated claims.
 //
@@ -1648,9 +1649,17 @@ func asCondition[T any](cond capability.Condition) (*T, bool) {
 // castCondition[TimeWindowCondition](cond, ConditionTypeIPRange)) and compile
 // silently, corrupting the ConditionType field of a fail-closed deny on the
 // signed audit tape. Deriving it from T closes that class of mismatch entirely.
+//
+// A TYPED-NIL pointer — a (*AllowedValuesCondition)(nil) placed into a programmatically
+// built Constraint, or handed to an exported predicate — matches asCondition's `case *T`
+// arm and would come back as (nil, nil), after which every handler dereferences it and
+// panics the request goroutine: fail-open-via-crash, on the one path whose entire job is
+// to fail closed. It is refused here rather than at each of the thirteen handlers,
+// mirroring the typed-nil guard CollectObligations applies to directives for the same
+// reason. The manifest loader never produces one; an exported seam's caller can.
 func castCondition[T capability.Condition](cond capability.Condition) (*T, *ConditionError) {
 	t, ok := asCondition[T](cond)
-	if !ok {
+	if !ok || t == nil {
 		var zero T
 		condType := zero.ConditionType()
 		return nil, &ConditionError{

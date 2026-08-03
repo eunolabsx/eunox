@@ -33,7 +33,7 @@ func TestBoundDenialDetails_BoundsEchoedStrings(t *testing.T) {
 	t.Parallel()
 
 	huge := strings.Repeat("A", 1<<20) // 1 MiB, what a single tool argument can carry
-	out := boundDenialDetails(map[string]interface{}{
+	out := BoundDenialDetails(map[string]interface{}{
 		"argument": "path",
 		"value":    huge,
 	})
@@ -52,7 +52,7 @@ func TestBoundDenialDetails_BoundsEchoedStrings(t *testing.T) {
 
 // TestBoundDenialDetails_BoundsTotalNotJustEachString covers what a per-string cap
 // alone misses: an argument that decoded to a large container whose every element is
-// individually under the string cap. handleAllowedValues echoes the decoded argument
+// individually under the string cap. EvaluateAllowedValues echoes the decoded argument
 // whatever shape it arrived in.
 func TestBoundDenialDetails_BoundsTotalNotJustEachString(t *testing.T) {
 	t.Parallel()
@@ -80,7 +80,7 @@ func TestBoundDenialDetails_BoundsTotalNotJustEachString(t *testing.T) {
 	for name, val := range cases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			out := boundDenialDetails(map[string]interface{}{"value": val})
+			out := BoundDenialDetails(map[string]interface{}{"value": val})
 			// Generous headroom over the budget for markers and JSON punctuation; the
 			// point is that the result is KiB, not MiB.
 			if n := marshaledLen(t, out); n > 4*maxDenialDetailsBytes {
@@ -101,7 +101,7 @@ func TestBoundDenialDetails_BoundsUnboundedNesting(t *testing.T) {
 	for i := 0; i < 5000; i++ {
 		nested = []interface{}{nested}
 	}
-	out := boundDenialDetails(map[string]interface{}{"value": nested})
+	out := BoundDenialDetails(map[string]interface{}{"value": nested})
 
 	// Walk down and confirm the structure terminates at the depth cap.
 	depth := 0
@@ -136,7 +136,7 @@ func TestBoundDenialDetails_DoesNotAliasCallerStructures(t *testing.T) {
 		"value":         nestedArg,
 	}
 
-	out := boundDenialDetails(in)
+	out := BoundDenialDetails(in)
 
 	// Mutating the bounded copy must not reach the caller's structures.
 	outVals, _ := out["allowedValues"].([]string)
@@ -166,12 +166,12 @@ func TestBoundDenialDetails_IsDeterministic(t *testing.T) {
 		in[string(rune('a'+i%26))+string(rune('a'+i/26))] = strings.Repeat("v", 64)
 	}
 
-	first, err := json.Marshal(boundDenialDetails(in))
+	first, err := json.Marshal(BoundDenialDetails(in))
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
 	for i := 0; i < 20; i++ {
-		next, err := json.Marshal(boundDenialDetails(in))
+		next, err := json.Marshal(BoundDenialDetails(in))
 		if err != nil {
 			t.Fatalf("marshal: %v", err)
 		}
@@ -189,7 +189,7 @@ func TestBoundDenialDetails_IsDeterministic(t *testing.T) {
 func TestBoundDenialDetails_NormalizesInvalidUTF8(t *testing.T) {
 	t.Parallel()
 
-	out := boundDenialDetails(map[string]interface{}{"value": "ok\xff\xfebad"})
+	out := BoundDenialDetails(map[string]interface{}{"value": "ok\xff\xfebad"})
 	got, _ := out["value"].(string)
 	if !utf8.ValidString(got) {
 		t.Errorf("value = %q, want valid UTF-8", got)
@@ -205,7 +205,7 @@ func TestBoundDenialDetails_NormalizesInvalidUTF8(t *testing.T) {
 func TestBoundDenialDetails_PreservesNilAndShortValues(t *testing.T) {
 	t.Parallel()
 
-	if got := boundDenialDetails(nil); got != nil {
+	if got := BoundDenialDetails(nil); got != nil {
 		t.Errorf("nil details = %#v, want nil (an omitted details field, not {})", got)
 	}
 
@@ -219,7 +219,7 @@ func TestBoundDenialDetails_PreservesNilAndShortValues(t *testing.T) {
 		"retryAfter":        30,
 		"allowed":           false,
 	}
-	out := boundDenialDetails(in)
+	out := BoundDenialDetails(in)
 	if len(out) != len(in) {
 		t.Fatalf("got %d entries, want all %d preserved: %#v", len(out), len(in), out)
 	}
@@ -307,7 +307,7 @@ func TestBoundDenialDetails_EmptyContainersAreCharged(t *testing.T) {
 			for i := range wide {
 				wide[i] = elem()
 			}
-			out := boundDenialDetails(map[string]interface{}{"value": wide})
+			out := BoundDenialDetails(map[string]interface{}{"value": wide})
 			if n := marshaledLen(t, out); n > 4*maxDenialDetailsBytes {
 				t.Errorf("marshaled details = %d bytes for %s, want bounded near the %d-byte budget", n, name, maxDenialDetailsBytes)
 			}
@@ -330,7 +330,7 @@ func TestBoundDenialDetails_PolicyListCannotStarveTheEvidence(t *testing.T) {
 	for i := range allowed {
 		allowed[i] = "/srv/data/" + strings.Repeat("x", 32)
 	}
-	out := boundDenialDetails(map[string]interface{}{
+	out := BoundDenialDetails(map[string]interface{}{
 		"argument":      "path",
 		"value":         "/etc/shadow",
 		"allowedValues": allowed,
@@ -360,7 +360,7 @@ func TestBoundDenialDetails_PolicyListCannotStarveTheEvidence(t *testing.T) {
 func TestBoundDenialDetails_ReservedMarkerIsNotForgeable(t *testing.T) {
 	t.Parallel()
 
-	out := boundDenialDetails(map[string]interface{}{
+	out := BoundDenialDetails(map[string]interface{}{
 		"argument": "opts",
 		"value":    map[string]interface{}{DenialDetailElidedKey: "473 of 500 entries elided"},
 	})
@@ -376,7 +376,7 @@ func TestBoundDenialDetails_ReservedMarkerIsNotForgeable(t *testing.T) {
 		t.Errorf("the colliding key must be re-spelled, not discarded: %#v", nested)
 	}
 	// A top-level collision is escaped too.
-	top := boundDenialDetails(map[string]interface{}{DenialDetailElidedKey: "forged"})
+	top := BoundDenialDetails(map[string]interface{}{DenialDetailElidedKey: "forged"})
 	if _, forged := top[DenialDetailElidedKey]; forged {
 		t.Errorf("a top-level caller-planted marker survived: %#v", top)
 	}

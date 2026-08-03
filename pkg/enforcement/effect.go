@@ -409,7 +409,7 @@ func (e *Engine) checkEffectCeiling(eff *capability.ResolvedEffect, matched *cap
 		strings.Join(reasons, ", "), eff.String(), unannotatedHint(eff))
 
 	// Both arms go through the shared constructors rather than building an
-	// EnforceResponse literal. Those constructors are where boundDenialDetails runs, and
+	// EnforceResponse literal. Those constructors are where BoundDenialDetails runs, and
 	// details here carries caller-controlled bytes: blast_radius is rendered from a tool
 	// ARGUMENT, and compensating_action / effect_contract come from the manifest. A
 	// hand-built literal skipped the bound entirely, so the one refusal shape a human is

@@ -127,7 +127,7 @@ func schemaValidateValue(jsonPath string, val interface{}, schema *capability.Ar
 			// not satisfy). Unwrapping both compares by value, which is what an enum means.
 			allowed = unwrapNamedScalar(allowed)
 			// numericEqual bridges bare-int enum values and json.Number/float64
-			// request arguments, matching handleAllowedValues.
+			// request arguments, matching EvaluateAllowedValues.
 			if reflect.DeepEqual(allowed, val) || numericEqual(allowed, val) {
 				matched = true
 				break

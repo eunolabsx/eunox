@@ -506,12 +506,12 @@ func TestComputeAuditStats_CountsDeclassifyFaults(t *testing.T) {
 			`"details":{"` + audit.DeclassifyCommitFailedKey + `":["pii"],"` + audit.DeclassifySpentApprovalKey + `":"apr-2"}}`,
 		// The call was refused below the decision, so the clear was never made.
 		`{"decision":"deny","target":"sanitize","method":"tools/call","denial_code":"UPSTREAM_ERROR",` +
-			`"details":{"flow":true,"` + audit.DeclassifyNotAppliedKey + `":["pii"],"` + audit.DeclassifySpentApprovalKey + `":"apr-3"}}`,
+			`"details":{"` + capability.FlowAuditDetailKey + `":true,"` + audit.DeclassifyNotAppliedKey + `":["pii"],"` + audit.DeclassifySpentApprovalKey + `":"apr-3"}}`,
 		// Refused too, but the action had already EXECUTED and its result was withheld
 		// because response redaction failed. It counts as not-applied AND as withheld: the
 		// second qualifies the first rather than replacing it.
 		`{"decision":"deny","target":"sanitize","method":"tools/call","denial_code":"ENFORCEMENT_ERROR",` +
-			`"details":{"flow":true,"` + audit.DeclassifyNotAppliedKey + `":["pii"],"` +
+			`"details":{"` + capability.FlowAuditDetailKey + `":true,"` + audit.DeclassifyNotAppliedKey + `":["pii"],"` +
 			audit.DeclassifyResultWithheldKey + `":true,"` + audit.DeclassifySpentApprovalKey + `":"apr-4"}}`,
 		// An ordinary allow whose details are the caller's arguments: no declassify facts,
 		// and nothing here may be mistaken for one.
@@ -551,14 +551,46 @@ func TestComputeAuditStats_CountsDeclassifyFaults(t *testing.T) {
 	for _, want := range []string{
 		"single-use approvals spent = 4",
 		"declassify-not-applied = 2",
-		// The withheld-result subset must be legible on its own: it is the difference
-		// between reissuing an approval to retry the work and reissuing it to re-deliver
-		// work already done.
+		// The withheld-result count must be legible on its own line, not as "of those": it
+		// usually accompanies the count above but can stand alone (a no-op clear under a
+		// single-use grant leaves no not-applied labels), so a subset phrasing would print
+		// under a heading that was never emitted.
+		"declassify-result-withheld = 1",
 		"had already EXECUTED upstream",
 	} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("printAuditStats is missing %q:\n%s", want, out.String())
 		}
+	}
+}
+
+// TestPrintAuditStats_WithheldResultStandsAlone is the shape the "of those" phrasing could not
+// render: a no-op clear under a single-use grant carries no not-applied labels, so a refusal
+// whose action had already executed produces a withheld count with a zero not-applied count
+// beside it. The line must be self-contained rather than dangling under a heading that was
+// never printed.
+func TestPrintAuditStats_WithheldResultStandsAlone(t *testing.T) {
+	t.Parallel()
+	tape := `{"decision":"deny","target":"sanitize","method":"tools/call","denial_code":"ENFORCEMENT_ERROR",` +
+		`"details":{"` + capability.FlowAuditDetailKey + `":true,"` + audit.DeclassifyResultWithheldKey +
+		`":true,"` + audit.DeclassifySpentApprovalKey + `":"apr-9"}}`
+
+	got, err := computeAuditStats(strings.NewReader(tape))
+	if err != nil {
+		t.Fatalf("computeAuditStats: %v", err)
+	}
+	if got.declassifyResultWithheld != 1 || got.declassifyNotApplied != 0 {
+		t.Fatalf("withheld = %d, not-applied = %d; want 1 and 0 — the two counters are independent",
+			got.declassifyResultWithheld, got.declassifyNotApplied)
+	}
+
+	var out strings.Builder
+	printAuditStats(&out, got)
+	if !strings.Contains(out.String(), "declassify-result-withheld = 1") {
+		t.Errorf("the withheld line must render without a not-applied line above it:\n%s", out.String())
+	}
+	if strings.Contains(out.String(), "of those") {
+		t.Errorf("a subset phrasing has no antecedent here:\n%s", out.String())
 	}
 }
 

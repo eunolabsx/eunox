@@ -5,6 +5,7 @@ package pdp
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/eunolabs/eunox/pkg/capability"
@@ -137,13 +138,10 @@ func TestAllowedValues_JWTDenialNamesTheGrantAndTheArgument(t *testing.T) {
 // caller-sized value, turning each denied call into a lever on log growth at whatever rate the
 // caller can issue them.
 func TestAllowedValues_JWTDenialDetailsAreBounded(t *testing.T) {
-	huge := make([]byte, 64<<10)
-	for i := range huge {
-		huge[i] = 'A'
-	}
+	huge := strings.Repeat("A", 64<<10)
 	cond := capability.AllowedValuesCondition{Argument: "path", Values: []interface{}{"/tmp/*"}}
 	resp := evaluateJWTConditions(nil, []capability.Condition{cond}, "read_file",
-		map[string]interface{}{"path": string(huge)}, nil)
+		map[string]interface{}{"path": huge}, nil)
 
 	require.NotNil(t, resp)
 	require.NotNil(t, resp.Denial)
@@ -189,4 +187,112 @@ func TestEvaluateAllowedValues_NilRequestDenies(t *testing.T) {
 		capability.AllowedValuesCondition{Argument: "path", Values: []interface{}{"/tmp/*"}}, nil)
 	require.NotNil(t, cerr, "no request to check against is ambiguity; deny")
 	assert.Equal(t, capability.ErrCodeConditionFailed, cerr.Code)
+}
+
+// TestAllowedOperations_JWTDenialsCarryTheEnginesDetails is the other half of the same defect,
+// on the other arm of the same function.
+//
+// The allowedOperations arm cannot share the engine's HANDLER — its scan-all-arguments
+// semantics are deliberately different (the claim grammar cannot name the operation argument,
+// and the engine hard-denies the empty argument this path always emits) — but "one logical
+// refusal, two record shapes depending only on whether a token was involved" applies to it
+// exactly as it did to allowedValues. So it shares the record SHAPE: the same detail keys the
+// engine records for the same denial code, which is what a SIEM rule and the host-facing error
+// are keyed on.
+func TestAllowedOperations_JWTDenialsCarryTheEnginesDetails(t *testing.T) {
+	cond := capability.AllowedOperationsCondition{Operations: []string{"SELECT"}}
+
+	// The manifest path's shape for the same code, from the engine's own handler.
+	manifest := enforcement.New().EvaluateConditions(context.Background(),
+		&capability.EnforceRequest{
+			SessionID:  "s",
+			TargetName: "tool:query_db",
+			Arguments:  map[string]interface{}{"sql": "DROP TABLE users"},
+		},
+		&capability.Constraint{
+			Target:     "tool:query_db",
+			Actions:    []string{"invoke"},
+			Conditions: []capability.Condition{capability.AllowedOperationsCondition{Argument: "sql", Operations: []string{"SELECT"}}},
+		})
+	require.Equal(t, capability.DecisionDeny, manifest.Decision)
+	require.NotNil(t, manifest.Denial)
+	require.Equal(t, capability.ErrCodeOperationNotPermitted, manifest.Denial.Code)
+
+	jwt := evaluateJWTConditions(nil, []capability.Condition{cond}, "query_db",
+		map[string]interface{}{"sql": "DROP TABLE users"}, nil)
+	require.NotNil(t, jwt)
+	require.NotNil(t, jwt.Denial)
+
+	assert.Equal(t, manifest.Denial.Code, jwt.Denial.Code)
+	assert.Equal(t, manifest.Denial.ConditionType, jwt.Denial.ConditionType)
+	assert.Equal(t, manifest.Denial.Details, jwt.Denial.Details,
+		"the same denial code must reach the tape with the same details on both paths")
+}
+
+// TestAllowedOperations_EveryJWTRefusalCarriesDetails covers the arms with no manifest
+// counterpart — the two documented JWT-only fail-closed guards and the depth bound. They keep
+// their behavior (the point of those guards is that they refuse), but a refusal with an empty
+// details map is one an operator cannot act on and a rule cannot match, which is the whole
+// complaint against this function's denials.
+func TestAllowedOperations_EveryJWTRefusalCarriesDetails(t *testing.T) {
+	for name, tc := range map[string]struct {
+		cond     capability.Condition
+		args     map[string]interface{}
+		wantCode string
+		wantKeys []string
+	}{
+		"named argument is unenforceable from a claim": {
+			capability.AllowedOperationsCondition{Argument: "op", Operations: []string{"SELECT"}},
+			map[string]interface{}{"op": "SELECT"},
+			capability.ErrCodeConditionFailed, []string{"argument", "allowedOperations"},
+		},
+		"non-SQL op cannot be scanned for": {
+			capability.AllowedOperationsCondition{Operations: []string{"publish"}},
+			map[string]interface{}{"topic": "x"},
+			capability.ErrCodeConditionFailed, []string{"operation", "allowedOperations"},
+		},
+		"no argument matched any permitted operation": {
+			capability.AllowedOperationsCondition{Operations: []string{"SELECT"}},
+			map[string]interface{}{"note": "nothing here"},
+			capability.ErrCodeMissingContext, []string{"allowedOperations"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			resp := evaluateJWTConditions(nil, []capability.Condition{tc.cond}, "query_db", tc.args, nil)
+			require.NotNil(t, resp, "these arms all refuse; that is deliberate and unchanged")
+			require.NotNil(t, resp.Denial)
+			assert.Equal(t, tc.wantCode, resp.Denial.Code)
+			for _, k := range tc.wantKeys {
+				assert.Contains(t, resp.Denial.Details, k,
+					"a refusal an operator cannot act on is the defect this arm shares with allowedValues")
+			}
+		})
+	}
+
+	// The MISSING_CONTEXT arm deliberately does NOT name an argument, unlike the engine's:
+	// the claim grammar cannot express one, so the scan covers every argument, and a phantom
+	// name would send an operator looking for a manifest field that does not exist.
+	resp := evaluateJWTConditions(nil,
+		[]capability.Condition{capability.AllowedOperationsCondition{Operations: []string{"SELECT"}}},
+		"query_db", map[string]interface{}{"note": "nothing here"}, nil)
+	require.NotNil(t, resp)
+	assert.NotContains(t, resp.Denial.Details, "argument")
+}
+
+// TestJWTConditionDenials_DetailsAreBounded is the funnel's own guard. Every deny this package
+// builds now routes through denyResponse/denyResponseWithDetails, and the bound lives inside
+// that funnel rather than at each producer — a rule each site has to remember is one that gets
+// forgotten silently, since the resulting deny is still well-formed, signed and
+// chain-verifiable, just unbounded.
+func TestJWTConditionDenials_DetailsAreBounded(t *testing.T) {
+	huge := strings.Repeat("A", 64<<10)
+	resp := evaluateJWTConditions(nil,
+		[]capability.Condition{capability.AllowedOperationsCondition{Operations: []string{"SELECT"}}},
+		"query_db", map[string]interface{}{"sql": "DROP " + huge}, nil)
+	require.NotNil(t, resp)
+	require.NotNil(t, resp.Denial)
+	op, ok := resp.Denial.Details["operation"].(string)
+	require.True(t, ok)
+	assert.Less(t, len(op), len(huge),
+		"a caller-supplied value echoed into a denial must not reach the signed tape at its own length")
 }
