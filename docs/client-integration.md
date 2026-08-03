@@ -156,7 +156,15 @@ eunox proxy --config gateway.yaml
 
 > **Secrets and open routes.** `${VAR}` / `$VAR` references are expanded from the
 > environment into the parsed string values (tokens, auth headers), so secrets need
-> not be committed. The value is substituted as literal data — never re-interpreted
+> not be committed. Which spellings count is a property of the FIELD: `${VAR}` is a
+> reference everywhere, while the bare `$VAR` form is a reference everywhere *except*
+> a stdio upstream's `command` and `args` and the query/fragment of an `upstreamUrl`
+> — text that is passed verbatim to another program or to an API that gives a bare
+> `$` its own meaning (OData's `?$filter=`, a JSONPath `$.`, a regex `$anchor`). There
+> a bare `$word` is left exactly as written, so `command: "$SERVER_BIN"` runs a file
+> literally named `$SERVER_BIN`; write `${SERVER_BIN}` to substitute. The same
+> per-field rule decides what the startup guard treats as an unresolved reference, so
+> the two never disagree. The value is substituted as literal data — never re-interpreted
 > as YAML — so a secret containing a `#`, `:`, or other YAML metacharacter is used
 > verbatim instead of silently truncating or blanking the field. A reference to an
 > unset variable is left untouched — never blanked. A `$` followed by anything other

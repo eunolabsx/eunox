@@ -235,6 +235,71 @@ Section conventions:
 
 ### Changed
 
+- **BREAKING (pre-1.0): the engine decides which optional subsystems to wire, from its own
+  handler registry; the two options a caller used to state the conclusion with are gone.**
+  `enforcement.WithoutAntecedentRecording()` and `enforcement.WithoutFlowLabels()` are removed,
+  and `config.LocalManifest.UsesEngineSubsystem(subsystem)` is replaced by
+  `LocalManifest.PolicyTokens()`. The caller now states a FACT — which condition/directive
+  discriminators the policy carries — via `enforcement.WithPolicyTokens(tokens)`, and the
+  engine intersects it with the handlers actually registered.
+  **Why:** the previous derivation was a statement about token TYPES, while the thing that
+  reads a store is the HANDLER, and those are the same object only for the handlers this build
+  ships. `WithConditionHandler` overrides ANY registered type: an embedder registering a
+  handler for `allowedValues` — declared as depending on nothing, correctly, for the shipped
+  handler — that closes over the `FlowLabelStore` they also passed to `WithFlowLabelStore` got,
+  from a policy of nothing but `allowedValues`, an engine built never to populate the flow set.
+  The handler then read an empty set: the fail-open the flow layer exists to prevent, arriving
+  through the gate rather than through the turn. An override is now UNCLASSIFIED — every
+  facility stays wired — unless it declares via the new `enforcement.SubsystemDependent`
+  interface, so the conservative outcome is what an embedder gets by doing nothing.
+  Not calling `WithPolicyTokens` at all wires everything (the fail-closed default); calling it
+  with an empty set is the distinct statement that the policy carries no tokens.
+  **Migration:** `enforcement.New(..., WithoutFlowLabels(), WithoutAntecedentRecording())` ->
+  `enforcement.New(..., WithPolicyTokens(manifest.PolicyTokens()))`. A handler that reads an
+  optional facility implements `UsesEngineSubsystems() []capability.EngineSubsystem`.
+  `capability.ConditionUsesEngineSubsystem` / `DirectiveUsesEngineSubsystem` are removed
+  (the per-instance form has no consumer once the engine asks by discriminator);
+  `capability.TokenUsesEngineSubsystem` and the new `DeclarationUsesSubsystem` remain.
+
+- **The `policy` and `custom` extension points ask their evaluator instead of over-declaring.**
+  Their prototype-registry entries still declare every subsystem — a token type cannot know
+  what an out-of-tree evaluator reads — but the built-in handler now forwards the question to
+  the wired `PolicyEvaluator` when it implements `SubsystemDependent`. A manifest mixing
+  `policy` with a plain `maxCalls` therefore no longer keeps antecedent recording wired for the
+  whole engine, which cost every `maxCalls` call a counter round-trip and re-armed a
+  fail-closed deny path on a counter-write fault, for a sibling capability with nothing to do
+  with the extension point.
+
+- **BREAKING (pre-1.0): environment-reference expansion in the gateway config is per-FIELD.**
+  A bare `$word` is no longer substituted inside a URL's query or fragment (`upstreamUrl`) or
+  anywhere in a stdio upstream's `command`/`args`; only `${VAR}` is a reference there. The full
+  `$VAR`/`${VAR}` grammar still applies everywhere else, including a URL's authority and path
+  and `listen.allowedOrigins`.
+  **Why:** the unset-reference GUARD was already braced-only in those places, so a legitimate
+  `upstreamUrl: https://api.example.com/odata?$filter=...` no longer failed startup naming an
+  environment variable `filter` the operator never wrote — but expansion still rewrote the whole
+  config tree under the full grammar, so that same URL was silently substituted whenever a
+  variable of that name happened to be set, with no diagnostic, on the field that decides which
+  upstream the proxy talks to. `$$` escaped it, which is an escape an operator only learns about
+  after the URL breaks. The grammar is now declared once on the field and read by both the
+  expansion and the guard, so the two cannot disagree about what a `$` means in a given field.
+  `listen.allowedOrigins` deliberately keeps the full rule: an Origin is a scheme, host and
+  optional port, which admits no bare `$`, so a split would only drop a working spelling.
+  **Migration:** a config relying on bare-`$` substitution in a URL query or in argv must write
+  `${VAR}`. `$$` still collapses to a literal `$` under every grammar.
+
+- **BREAKING (pre-1.0): `killswitch.Manager` gained `ObserveRevocations`.** An implementation
+  outside this repo must add it;
+  `ObserveRevocations(func(killswitch.Revocation)) func() { return func() {} }` is a valid no-op
+  for a backend with no real-time delivery. It returns an idempotent unregister, because a kill
+  switch commonly outlives the consumer it was handed to (a proxy rebuilt after a listener
+  error, a config reload) and an append-only registration would keep the dead consumer — and
+  everything it captured — reachable and still called. See *Fixed* for what it closes.
+
+- **Server-initiated requests are no longer handled in receipt order on the HTTP transport
+  either**, matching the caveat already documented for stdio, and at most 32 may be in flight
+  per SESSION. See *Fixed*.
+
 - **BREAKING (pre-1.0): the engine's two skip gates derive from what each token declares, and
   the two per-token predicates behind them are gone.** `config.LocalManifest.HasSequenceBlock`
   and `HasFlowLabel` are replaced by `LocalManifest.UsesEngineSubsystem(subsystem)`. Each
@@ -749,6 +814,36 @@ Section conventions:
   script's retry pivot — the backend divergence that check exists to prevent).
 
 ### Fixed
+
+- **An HTTP upstream can no longer stall its session's response delivery by emitting
+  `sampling/createMessage` repeatedly.** The stdio half of this was fixed previously and scoped
+  itself there deliberately; this is the other half. `httpSession.readUpstream` is the only
+  goroutine that delivers upstream responses to that session's waiting host handlers and relays
+  notifications to its SSE subscribers, and it handled server-initiated requests INLINE — so a
+  request parked on the decision turn (bounded, but taken BEFORE the decision that would refuse
+  sampling) cost the session that bound every time, on calls that had nothing to do with
+  sampling. Under `taskAnchoredState` the turn holder can be a DIFFERENT session sharing the
+  anchor, so the stall was not even bounded by the stalled session's own traffic. Both
+  transports now dispatch through one shared pool: a handler per request, bounded at 32 in
+  flight (proxy-wide for stdio, per session for HTTP), with saturation refused to the upstream
+  as a retryable `-32000` and recorded `RESOURCE_EXHAUSTED`, and each transport's teardown
+  draining its handlers before session state is released.
+
+- **A kill delivered through Redis now reclaims its sessions even with idle reaping off.**
+  Reclaiming a killed session — its upstream subprocess, its `maxSessions` slot, its SSE
+  stream — ran on the IDLE reaper's sweep, which does not run at all under
+  `sessionIdleTimeoutMs: 0`, a documented and valid configuration. On such a deployment a kill
+  issued elsewhere (`eunox kill --redis-addr`, or a sibling instance's `/control/kill`) denied
+  every request for the session (fail-closed held) but reclaimed nothing until the process
+  exited. The kill switch now reports a revocation the moment its local view gains one — from
+  the Redis backend's pub/sub listener AND its reconcile commit, so a dropped publish still
+  reclaims — and the proxy responds by re-asking the kill switch about each session it holds.
+  That also removes the up-to-one-sweep (<=30s) reclaim latency the sweep carried when it WAS
+  running. The sweep stays as the backstop. An agent-scoped kill needs no agent->session map:
+  each session is re-checked with its own claims, through the same predicate the sweep uses.
+  A kill that lands while a session is still in its handshake is reclaimed too: every sweep
+  spares an establishing session (tearing one down would race its own establishment teardown),
+  so the check also runs on the one edge where that spare ends.
 
 - **A stdio upstream can no longer stall the proxy's response delivery by emitting
   `sampling/createMessage` repeatedly.** Bounding that leg's wait for the decision turn (below)

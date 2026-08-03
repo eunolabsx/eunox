@@ -114,6 +114,14 @@ type Redis struct {
 	client redis.Cmdable
 	logger *slog.Logger
 
+	// observers receive a Revocation the moment this instance's local view gains one. It is
+	// what makes a kill issued ELSEWHERE — `eunox kill --redis-addr`, or a sibling instance's
+	// /control/kill — reclaim anything here: this instance learns of it through pub/sub or
+	// the reconcile scan and has no request to hang a teardown off. Fired from BOTH paths, so
+	// a dropped publish still reclaims on the next reconcile rather than waiting for whatever
+	// sweep the consumer happens to run. See Manager.ObserveRevocations.
+	observers revocationObservers
+
 	// refreshMu serializes refreshState so two refreshes cannot overlap. Their
 	// snapshots are built lock-free (outside mu, so ShouldBlock is never stalled on
 	// Redis I/O), and the commit is guarded only by cacheGen against a racing cache
@@ -1044,8 +1052,9 @@ func (r *Redis) refreshState(ctx context.Context) error {
 		r.mu.Lock()
 		if r.cacheGen == startGen {
 			// No cache mutation raced the scan: the snapshot is consistent.
-			r.commitRefreshLocked(newGlobal, newAgents, newSessions)
+			gained := r.commitRefreshLocked(newGlobal, newAgents, newSessions)
 			r.mu.Unlock()
+			r.notifyRevocations(gained)
 			return nil
 		}
 		if attempt+1 < maxRefreshAttempts {
@@ -1064,9 +1073,20 @@ func (r *Redis) refreshState(ctx context.Context) error {
 		for s := range r.killedSessions {
 			newSessions[s] = true
 		}
-		r.commitRefreshLocked(newGlobal || r.globalActive, newAgents, newSessions)
+		gained := r.commitRefreshLocked(newGlobal || r.globalActive, newAgents, newSessions)
 		r.mu.Unlock()
+		r.notifyRevocations(gained)
 		return nil
+	}
+}
+
+// notifyRevocations calls the observers for every revocation a refresh added. Always OUTSIDE
+// r.mu — an observer's documented response is to re-ask ShouldBlock, which takes it — and on
+// the refreshing goroutine, so a slow observer delays the next reconcile rather than being
+// reordered against the cache state that justifies it.
+func (r *Redis) notifyRevocations(gained []Revocation) {
+	for _, ev := range gained {
+		r.observers.notify(ev)
 	}
 }
 
@@ -1083,12 +1103,35 @@ func (r *Redis) refreshState(ctx context.Context) error {
 // Clearing lastRefreshErr is correct on both: the Redis read succeeded, and refreshMu
 // serializes refreshes, so no concurrent refresh can have recorded a fresher error
 // between this scan's start and this commit.
-func (r *Redis) commitRefreshLocked(global bool, agents, sessions map[string]bool) {
+//
+// It returns the revocations the snapshot ADDS to the local view, for the caller to notify
+// after releasing r.mu. The reconcile loop fires observers as well as pub/sub does, because a
+// publish that never arrives (a subscription being retried, a message dropped during a
+// partition, a kill issued before this instance subscribed) would otherwise leave a consumer
+// with nothing to reclaim on until its own sweep — and the sessionIdleTimeoutMs: 0 case has no
+// sweep at all. Real-time delivery and the periodic scan are two paths to the same fact, so
+// both raise it.
+func (r *Redis) commitRefreshLocked(global bool, agents, sessions map[string]bool) []Revocation {
+	var gained []Revocation
+	if global && !r.globalActive {
+		gained = append(gained, Revocation{Global: true})
+	}
+	for id := range agents {
+		if !r.killedAgents[id] {
+			gained = append(gained, Revocation{AgentID: id})
+		}
+	}
+	for id := range sessions {
+		if !r.killedSessions[id] {
+			gained = append(gained, Revocation{SessionID: id})
+		}
+	}
 	r.globalActive = global
 	r.killedAgents = agents
 	r.killedSessions = sessions
 	r.lastRefreshErr = nil
 	r.lastRefreshOK = r.clock()
+	return gained
 }
 
 // scanner is the subset of a Redis node needed to enumerate keys by prefix. It is a
@@ -1312,9 +1355,18 @@ func (r *Redis) listenPubSub(ctx context.Context, pubsub *redis.PubSub) {
 func (r *Redis) handlePubSubMessage(payload string) {
 	r.mu.Lock()
 	shouldRefresh := false
+	// gained collects the revocations this event ADDS to the local view, notified after the
+	// lock is released (an observer's documented response re-enters this backend through
+	// ShouldBlock). Only real additions: re-announcing a kill this instance already holds
+	// reclaims nothing, and a duplicate publish is normal — every instance receives the
+	// message, and a reconcile can land the same kill first.
+	var gained []Revocation
 
 	switch payload {
 	case "global:activate":
+		if !r.globalActive {
+			gained = append(gained, Revocation{Global: true})
+		}
 		r.globalActive = true
 	case "global:deactivate":
 		r.globalActive = false
@@ -1331,10 +1383,16 @@ func (r *Redis) handlePubSubMessage(payload string) {
 		// Prefixed events carry a non-empty id; cutKillID returns "" for a non-match
 		// or a bare prefix, so an unrecognized message falls through to a full refresh.
 		if id := cutKillID(payload, "agent:kill:"); id != "" {
+			if !r.killedAgents[id] {
+				gained = append(gained, Revocation{AgentID: id})
+			}
 			r.killedAgents[id] = true
 		} else if id := cutKillID(payload, "agent:revive:"); id != "" {
 			delete(r.killedAgents, id)
 		} else if id := cutKillID(payload, "session:kill:"); id != "" {
+			if !r.killedSessions[id] {
+				gained = append(gained, Revocation{SessionID: id})
+			}
 			r.killedSessions[id] = true
 		} else if id := cutKillID(payload, "session:revive:"); id != "" {
 			delete(r.killedSessions, id)
@@ -1364,7 +1422,21 @@ func (r *Redis) handlePubSubMessage(payload string) {
 		default:
 		}
 	}
+	// This runs on the SINGLE real-time kill-event consumer goroutine, which is exactly why
+	// an observer must not block (Manager.ObserveRevocations says so): a slow one would stall
+	// the delivery of every later kill. Notifying here rather than from a goroutine per event
+	// is deliberate — a fan-out would reorder revocations against the cache updates that
+	// justify them, and an observer's whole job is to re-read that cache.
+	for _, ev := range gained {
+		r.observers.notify(ev)
+	}
 }
+
+// ObserveRevocations implements [Manager]. Observers are called from the pub/sub listener and
+// from the reconcile loop's commit, so a kill reaches one whether or not its publish was
+// delivered. See the interface doc for the contract, and note the must-not-block rule: both
+// callers are single goroutines whose progress every other instance-local kill depends on.
+func (r *Redis) ObserveRevocations(fn func(Revocation)) func() { return r.observers.observe(fn) }
 
 // cutKillID returns the id carried by a prefixed kill-switch pub/sub event (e.g.
 // "agent:kill:foo" with prefix "agent:kill:" yields "foo"), or "" when payload lacks

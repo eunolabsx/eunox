@@ -1247,15 +1247,28 @@ type serverRequestParams struct {
 // it waits on, so stdio and HTTP give the same answer to "what happens when the turn is held by
 // a declassifying call".
 //
-// It is a bound on a WEDGE, not on contention. This leg runs on the session's single
-// upstream-reader goroutine, which is also the only goroutine that delivers upstream responses
-// and relays notifications — so every microsecond spent blocked here is a microsecond in which
-// none of that session's in-flight calls can complete. The turn it waits for is held across
-// the whole upstream round trip by a declassifying host call (see finishDecision), and under
-// task anchoring by a call on a DIFFERENT session sharing the task, so the wait is bounded
-// only by --upstream-timeout — which may be 0, meaning unbounded. On stdio it is worse than a
-// stall: the host call holding the turn is itself waiting for a response only this blocked
-// reader can deliver, which is a deadlock rather than a wait.
+// It began as a bound on a WEDGE: this leg ran INLINE on the upstream reader, the only
+// goroutine that delivers upstream responses and relays notifications, so every microsecond
+// blocked here was a microsecond in which none of that connection's in-flight calls could
+// complete — and on stdio worse than a stall, since the host call holding the turn was itself
+// waiting for a response only the blocked reader could deliver. That wedge is gone on both
+// transports: each server-initiated request now runs on its own goroutine
+// (serverRequestPool), so a handler parked here blocks only itself.
+//
+// What remains is a bound on an UNBOUNDED WAIT. The turn is held across the whole upstream
+// round trip by a declassifying host call (see finishDecision), and under task anchoring by a
+// call on a DIFFERENT session sharing the task, so without a bound this leg's wait is limited
+// only by --upstream-timeout — which may be 0, meaning never. A parked handler also holds one
+// of the pool's slots, so an unbounded wait converts into the pool's own saturation refusal
+// for later requests.
+//
+// The change of reason has a consequence worth stating rather than leaving to be discovered:
+// handlers no longer serialize, so N of them parked on one held turn all start their bound at
+// once and all time out together, where the inline version gave each a fresh window because it
+// could not start the next until the previous finished. Refusing N at once on a genuinely
+// long-held turn is the fail-closed direction and each refusal is recorded, but it does mean
+// the constant is now calibrated against "how long may a server-initiated request wait" rather
+// than against "how long may this connection stop delivering responses".
 //
 // Two seconds is far above a healthy decision (microseconds on the in-memory backend, one
 // bounded round trip on Redis) and far below any upstream call worth waiting behind. Exceeding

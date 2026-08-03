@@ -15,6 +15,14 @@ type InMemory struct {
 	globalActive   bool
 	killedAgents   map[string]bool
 	killedSessions map[string]bool
+
+	// observers receive a Revocation the moment this backend gains one. Every kill here is
+	// issued in-process, so a consumer that reclaims at its own /control/kill handler is
+	// already covered — but a consumer calling Kill* on the Manager DIRECTLY is not, and it
+	// is the same reclaim either way. Implementing it on both backends keeps the consumer
+	// free of a "which backend is this" test, which is where a reclaim path that only ever
+	// runs under Redis comes from.
+	observers revocationObservers
 }
 
 // NewInMemory creates an in-memory kill-switch manager.
@@ -45,8 +53,14 @@ func (m *InMemory) ShouldBlock(_ context.Context, agentID, sessionID string) (bo
 // ActivateGlobal activates the global kill switch.
 func (m *InMemory) ActivateGlobal(_ context.Context) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	gained := !m.globalActive
 	m.globalActive = true
+	m.mu.Unlock()
+	// Notified outside the lock, and only on a state CHANGE: re-activating an already-active
+	// stop reclaims nothing new, and an observer's documented response re-enters this backend.
+	if gained {
+		m.observers.notify(Revocation{Global: true})
+	}
 	return nil
 }
 
@@ -66,8 +80,12 @@ func (m *InMemory) KillAgent(_ context.Context, agentID string) error {
 		return fmt.Errorf("killswitch: KillAgent: agentID must not be empty")
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	gained := !m.killedAgents[agentID]
 	m.killedAgents[agentID] = true
+	m.mu.Unlock()
+	if gained {
+		m.observers.notify(Revocation{AgentID: agentID})
+	}
 	return nil
 }
 
@@ -91,8 +109,12 @@ func (m *InMemory) KillSession(_ context.Context, sessionID string) error {
 		return fmt.Errorf("killswitch: KillSession: sessionID must not be empty")
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	gained := !m.killedSessions[sessionID]
 	m.killedSessions[sessionID] = true
+	m.mu.Unlock()
+	if gained {
+		m.observers.notify(Revocation{SessionID: sessionID})
+	}
 	return nil
 }
 
@@ -125,3 +147,9 @@ func (m *InMemory) Status(_ context.Context) (*Status, error) {
 	defer m.mu.RUnlock()
 	return buildStatus(m.globalActive, m.killedAgents, m.killedSessions), nil
 }
+
+// ObserveRevocations implements [Manager]. See its doc for the contract; here every
+// revocation is issued in-process, so an observer is called synchronously on the goroutine
+// that called Kill* — after the state is committed and outside the lock, so it may re-ask
+// ShouldBlock and see the kill it was told about.
+func (m *InMemory) ObserveRevocations(fn func(Revocation)) func() { return m.observers.observe(fn) }

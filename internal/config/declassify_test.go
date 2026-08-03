@@ -104,13 +104,19 @@ func TestDeclassify_RequiresTheFlowEffectGrammar(t *testing.T) {
 // trips the multi-instance shared-state advisory: the directive reads and writes the same
 // per-session label state labelOutput/flowLabel do, so a deployment running it without a
 // shared backend has the same silent split-brain.
+//
+// The engine learns of it through the token, so both halves are asserted: the manifest reports
+// the directive, and the directive declares the flow subsystem the engine will wire for it.
 func TestDeclassify_CountsAsFlowForTheSharedStateAdvisory(t *testing.T) {
 	caps := "  - target: \"tool:sanitize\"\n    actions: [call]\n    directives:\n      - type: declassify\n        labels: [pii]\n"
 	m, err := LoadManifest(writeManifestFile(t, declassifyManifest(ManifestSchemaVersion02, caps)))
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if !m.UsesEngineSubsystem(capability.SubsystemFlowLabels) {
+	if got := m.PolicyTokens(); len(got) != 1 || got[0] != capability.DirectiveTypeDeclassify {
+		t.Fatalf("PolicyTokens() = %v, want the declassify directive", got)
+	}
+	if !capability.TokenUsesEngineSubsystem(capability.DirectiveTypeDeclassify, capability.SubsystemFlowLabels) {
 		t.Fatal("a declassify policy is flow-relevant")
 	}
 }

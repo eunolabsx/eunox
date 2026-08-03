@@ -5,7 +5,7 @@
 // registry entry beside the grammar revision and the state class.
 //
 // The engine builds two of its facilities conditionally: the per-call antecedent marker
-// (WithoutAntecedentRecording) and the flow-label peek/record path (WithoutFlowLabels). Both
+// (skipAntecedentRecording) and the flow-label peek/record path (skipFlow). Both
 // skips are OPTIMIZATIONS — the marker exists only to be read by a later sequenceBlock, and
 // the flow path only to be read by a flow token — so a policy carrying neither pays for
 // neither.
@@ -14,7 +14,7 @@
 // another naming the three flow token types. That is the shape the state-accumulation axis
 // already retired for the decision turn, and it fails the same way here, in the direction that
 // matters: add a condition that READS the flow-label set, and a policy carrying only that
-// condition reports "no flow token" — so the engine is built WithoutFlowLabels and the new
+// condition reports "no flow token" — so the engine skips the flow path and the new
 // handler runs against an engine holding no flow state. Depending on how it reaches the store
 // that denies, allows, or (the plausible one) silently reads an empty set: a fail-open arriving
 // through the gate rather than through the turn.
@@ -23,6 +23,13 @@
 // token can be added at all, an entry declaring nothing is UNCLASSIFIED, and every consumer
 // treats unclassified as "depends on every subsystem". The completeness test in
 // subsystem_test.go fails the build when an entry declares none.
+//
+// What this declares is the handler THIS BUILD SHIPS for the token, which is why it is not the
+// last word: enforcement.WithConditionHandler can replace any token's handler, so the ENGINE
+// decides the two skips, from its own handler registry intersected with the tokens a policy
+// carries. A replacement handler is unclassified — every facility stays wired — unless it
+// declares for itself through enforcement.SubsystemDependent, which reads its declaration
+// through the same DeclarationUsesSubsystem rule below.
 //
 // Over-declaring is not free, and the cost differs by subsystem — stated here rather than
 // waved at as "just an optimization". Keeping the flow path wired costs a per-call relevance
@@ -39,7 +46,9 @@
 // SubsystemAntecedentHistory. Reading or writing the flow-label set is SubsystemFlowLabels. A
 // token whose enforcement is supplied from OUTSIDE this build (policy, custom) declares every
 // subsystem: what an embedder's evaluator reads is not knowable here, and the conservative
-// answer costs one per-call scan.
+// answer costs one per-call scan. (`policy`'s built-in handler asks the wired PolicyEvaluator
+// when it declares, so the conservative entry is the fallback rather than the ceiling; `custom`
+// deliberately does not, because its handler consults no evaluator at all.)
 
 package capability
 
@@ -55,10 +64,10 @@ const (
 	// reasoned about and fails closed, the second is a decision.
 	SubsystemNone EngineSubsystem = "none"
 	// SubsystemAntecedentHistory is the per-call marker the engine records so a later call's
-	// sequenceBlock can ask what preceded it. Gated by WithoutAntecedentRecording.
+	// sequenceBlock can ask what preceded it. Gated by the engine's skipAntecedentRecording.
 	SubsystemAntecedentHistory EngineSubsystem = "antecedentHistory"
 	// SubsystemFlowLabels is the session/task-scoped flow-label set: the labels a source
-	// writes, a sink peeks, and a declassification clears. Gated by WithoutFlowLabels.
+	// writes, a sink peeks, and a declassification clears. Gated by the engine's skipFlow.
 	SubsystemFlowLabels EngineSubsystem = "flowLabels"
 )
 
@@ -79,6 +88,23 @@ func EngineSubsystems() []EngineSubsystem { return slices.Clone(engineSubsystems
 
 // modelled reports whether s is a facility this build knows about.
 func (s EngineSubsystem) modelled() bool { return slices.Contains(engineSubsystems, s) }
+
+// DeclarationUsesSubsystem reports whether a declaration depends on s, applying the
+// unclassified rule: a MALFORMED declaration (empty, a mix of SubsystemNone with a real
+// facility, or a name this build does not model) depends on EVERY subsystem.
+//
+// It is the one place that rule lives. Two kinds of declaration reach it — the `Uses` a
+// prototype-registry entry states for a built-in token, and the one a registered condition
+// handler states for itself (enforcement.SubsystemDependent) — and they must be read
+// identically, because the second exists precisely to override the first for a handler an
+// embedder swapped in. A second copy of "empty means everything" is how one of the two
+// silently starts meaning "nothing".
+func DeclarationUsesSubsystem(uses []EngineSubsystem, s EngineSubsystem) bool {
+	if !validSubsystemDeclaration(uses) {
+		return true
+	}
+	return slices.Contains(uses, s)
+}
 
 // validSubsystemDeclaration reports whether uses is a well-formed declaration: either exactly
 // SubsystemNone, or a non-empty set of modelled subsystems. Anything else — empty, a mix of
@@ -136,24 +162,11 @@ func TokenUsesEngineSubsystem(token string, s EngineSubsystem) bool {
 	if !ok {
 		return true
 	}
-	return slices.Contains(uses, s)
+	return DeclarationUsesSubsystem(uses, s)
 }
 
-// ConditionUsesEngineSubsystem reports whether c's enforcement depends on s. A nil condition
-// carries no enforcement and depends on nothing. Both the pointer form the JSON loader builds
-// and the value form the JWT path builds are accepted, because the discriminator is read off
-// the interface rather than off a Go type switch.
-func ConditionUsesEngineSubsystem(c Condition, s EngineSubsystem) bool {
-	if isNilToken(c) {
-		return false
-	}
-	return TokenUsesEngineSubsystem(c.ConditionType(), s)
-}
-
-// DirectiveUsesEngineSubsystem is the directive-side twin of ConditionUsesEngineSubsystem.
-func DirectiveUsesEngineSubsystem(d Directive, s EngineSubsystem) bool {
-	if isNilToken(d) {
-		return false
-	}
-	return TokenUsesEngineSubsystem(d.DirectiveType(), s)
-}
+// There is deliberately no per-INSTANCE form of the lookup above (the state axis has
+// ConditionStateAccumulation/DirectiveStateAccumulation; this one does not). The consumer is
+// the engine, which asks about the tokens a policy carries and answers from its own handler
+// registry — a condition VALUE tells it nothing the discriminator does not, and a helper that
+// took one would invite the manifest layer to answer the engine's question again.

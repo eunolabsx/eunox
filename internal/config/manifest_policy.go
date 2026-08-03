@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/eunolabs/eunox/pkg/capability"
@@ -98,32 +99,50 @@ func (m *LocalManifest) AccumulatesSharedState() bool {
 	return m.anyTokenState(capability.StateAccumulation.AccumulatesSharedState)
 }
 
-// UsesEngineSubsystem reports whether any of this policy's tokens depends on the named
-// OPTIONAL engine subsystem — the antecedent history a sequenceBlock reads, or the flow-label
-// set a sink peeks and a source writes. The route builder asks it once per subsystem and skips
-// the ones no token needs (WithoutAntecedentRecording, WithoutFlowLabels).
+// PolicyTokens returns the set of condition and directive discriminators this policy carries,
+// sorted and deduplicated. The route builder hands it to enforcement.WithPolicyTokens, which is
+// what lets the engine decide which optional subsystems to wire.
 //
-// It is a narrower question than "does this policy accumulate state", and deliberately so: a
-// sequenceBlock-only policy accumulates plenty and still wants the flow path skipped. The two
-// were previously separate hand-written predicates — one naming sequenceBlock, one naming the
-// three flow token types — and the flow one failed in the direction that matters. Add a
-// condition that READS the flow-label set and a policy carrying only it reports "no flow
-// token": the engine is built WithoutFlowLabels and the new handler runs against an engine
-// holding no flow state, most plausibly reading an empty set and allowing what the labels
-// existed to block. Both gates now derive from the subsystem each token DECLARES on its
-// pkg/capability prototype-registry entry, so a token added there is covered by construction.
+// It is a FACT about the manifest, and that is the whole of its job. It used to be a
+// conclusion — UsesEngineSubsystem, which asked whether any token depended on a named engine
+// facility and was answered from the subsystem each token DECLARES on its pkg/capability
+// prototype-registry entry. That declaration describes the handler this build ships for the
+// token, and the thing that actually reads a store is the handler:
+// enforcement.WithConditionHandler can replace the handler for any type, including one whose
+// shipped handler touches nothing, so a policy of nothing but allowedValues could report "no
+// flow token" while its registered handler read the flow set through a store the engine was
+// then built never to populate. Naming the tokens and letting the engine intersect them with
+// its own registry removes that gap, and removes the possibility of the two disagreeing at all.
 //
-// An UNCLASSIFIED token (one declaring no subsystem, or naming one this build does not model)
-// depends on all of them, so it disables both skips. That is the cheap direction — the skips
-// are optimizations, and the build-time completeness test is what stops such a token shipping.
+// A token this build does not model still appears here verbatim; the engine treats an
+// unclassifiable one as depending on every subsystem, which is the cheap direction (the skips
+// are optimizations) and the same rule the declaration side applies.
 //
-// A nil manifest (a route with no policy) carries no token and needs no subsystem.
-func (m *LocalManifest) UsesEngineSubsystem(s capability.EngineSubsystem) bool {
-	return m.anyCondition(func(cond capability.Condition) bool {
-		return capability.ConditionUsesEngineSubsystem(cond, s)
-	}) || m.anyDirective(func(dir capability.Directive) bool {
-		return capability.DirectiveUsesEngineSubsystem(dir, s)
+// A nil manifest (a route with no policy) carries no token. That is DISTINCT from not calling
+// WithPolicyTokens at all — see its doc — which is why the empty result is still passed on.
+func (m *LocalManifest) PolicyTokens() []string {
+	seen := map[string]struct{}{}
+	// The discriminator methods have value receivers, so a typed-nil entry would panic on the
+	// call; MergeManifests takes programmatically built constraints, so a manifest is not the
+	// only source of these values. Same guard capability's own classification path applies.
+	m.anyCondition(func(cond capability.Condition) bool {
+		if cond != nil && !capability.IsTypedNil(cond) {
+			seen[cond.ConditionType()] = struct{}{}
+		}
+		return false // collect every entry, never short-circuit
 	})
+	m.anyDirective(func(dir capability.Directive) bool {
+		if dir != nil && !capability.IsTypedNil(dir) {
+			seen[dir.DirectiveType()] = struct{}{}
+		}
+		return false
+	})
+	tokens := make([]string, 0, len(seen))
+	for t := range seen {
+		tokens = append(tokens, t)
+	}
+	slices.Sort(tokens)
+	return tokens
 }
 
 // NeedsDecisionTurn reports whether this policy's decisions must be SERIALIZED on the state

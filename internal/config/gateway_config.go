@@ -96,13 +96,86 @@ func envRefName(match string) string {
 	return name
 }
 
+// envGrammar is which spellings count as an environment reference in ONE config field's text.
+//
+// It exists because the answer is not the same for every field, and for a while only the
+// GUARD knew that. The guard learned to apply a braced-only rule where a bare "$word" is
+// ordinary content — a stdio upstream's argv, a URL's query — so a legitimate
+// `upstreamUrl: https://api.example.com/odata?$filter=...` stopped failing startup while
+// naming an environment variable "filter" the operator never wrote. Expansion kept the full
+// grammar for every string in the tree, so that same URL was still silently REWRITTEN when a
+// variable of that name happened to be set: a valid OData/JMESPath/JSONPath URL turned into
+// something else, with no diagnostic, on the field that decides which upstream the proxy talks
+// to. "$$" escaped it, which is an escape an operator only learns about after the URL breaks.
+//
+// One grammar per field, read by BOTH passes, is the whole fix. A field is declared once (the
+// `env` struct tag) and the guard reads that same declaration, so the two cannot disagree about
+// what a "$" means in a given field again.
+type envGrammar int
+
+const (
+	// envGrammarFull recognizes "$VAR" and "${VAR}". The default, and right for the fields
+	// that hold a path, a URL authority, an Origin or a credential: none has a legitimate
+	// bare "$", and their guards refuse an unset reference outright, so a reference can
+	// neither survive as literal text nor be a false positive.
+	envGrammarFull envGrammar = iota
+	// envGrammarBraced recognizes only "${VAR}". For text passed verbatim to another
+	// program — a stdio upstream's command and args — where a bare "$word" is ordinary
+	// literal content (a regex "$anchor", a jq/JSONPath expression, anything the child
+	// interpolates itself) and "${VAR}" is unambiguous intent to substitute.
+	envGrammarBraced
+	// envGrammarURL is full in the authority and path, braced-only from the first "?" or "#"
+	// onward. A URL's authority has no legitimate bare "$"; its query does. An env reference
+	// cannot straddle the split, because the reference grammar admits only identifier
+	// characters and neither "?" nor "#" is one.
+	envGrammarURL
+)
+
+// envTagGrammars maps the `env` struct-tag value to its grammar. A field with no tag takes the
+// default (full), so declaring is only ever needed to narrow.
+var envTagGrammars = map[string]envGrammar{
+	"braced": envGrammarBraced,
+	"url":    envGrammarURL,
+}
+
+// splitURLEnvScope splits raw at the first "?" or "#" into the part that takes the full
+// grammar and the part that takes the braced-only one. Shared by the expansion and the guard so
+// the two cannot split a URL differently.
+func splitURLEnvScope(raw string) (head, tail string) {
+	if i := strings.IndexAny(raw, "?#"); i >= 0 {
+		return raw[:i], raw[i:]
+	}
+	return raw, ""
+}
+
 // expandEnvRefs replaces ${VAR} / $VAR with the environment value when VAR is
 // set, leaving the reference text intact when unset (unlike os.ExpandEnv, which
 // blanks it). See envRefRe for the matching rules.
-func expandEnvRefs(s string) string {
+func expandEnvRefs(s string) string { return expandEnvRefsUnder(s, envGrammarFull) }
+
+// expandEnvRefsUnder is expandEnvRefs under a field's declared grammar: a spelling the grammar
+// does not recognize is left exactly as written rather than substituted.
+//
+// The "$$" escape collapses to a literal "$" under EVERY grammar, deliberately. It is not part
+// of what the grammar narrows — it is how a literal "${" is written at all, which a braced-only
+// field needs as much as a full one — and making the escape itself field-dependent would put
+// back, one level down, exactly the per-field surprise this type removes.
+func expandEnvRefsUnder(s string, g envGrammar) string {
+	if g == envGrammarURL {
+		head, tail := splitURLEnvScope(s)
+		return expandRecognizedRefs(head, envGrammarFull) + expandRecognizedRefs(tail, envGrammarBraced)
+	}
+	return expandRecognizedRefs(s, g)
+}
+
+// expandRecognizedRefs is expandEnvRefsUnder for a grammar with no positional split.
+func expandRecognizedRefs(s string, g envGrammar) string {
 	return envRefRe.ReplaceAllStringFunc(s, func(match string) string {
 		if isEnvRefEscape(match) {
 			return "$" // "$$" collapses to a literal '$'
+		}
+		if !recognizedRef(match, g) {
+			return match // not a reference in this field: ordinary literal text
 		}
 		if val, ok := os.LookupEnv(envRefName(match)); ok {
 			return val
@@ -111,10 +184,21 @@ func expandEnvRefs(s string) string {
 	})
 }
 
+// recognizedRef reports whether an envRefRe match (already known not to be an escape) counts
+// as a reference under g. The one predicate both passes apply, so "which spellings count" is
+// answered identically by the expansion and the guard.
+func recognizedRef(match string, g envGrammar) bool {
+	return g != envGrammarBraced || strings.HasPrefix(match, "${")
+}
+
 // expandEnvInStrings walks v (which must be addressable) and rewrites every
-// string it reaches through expandEnvRefs. Running on the DECODED config rather
+// string it reaches through expandEnvRefsUnder, under the grammar its FIELD declares (the
+// `env` struct tag; see envGrammar). Running on the DECODED config rather
 // than the raw file text is what makes expansion safe: an env value is
 // substituted as opaque data and never re-parsed as YAML (see LoadGatewayConfig).
+//
+// The grammar is inherited by everything below the field that declared it, which is what makes
+// `args []string` work: the declaration is on the slice, and each element expands under it.
 //
 // Only struct/slice/string/pointer kinds are handled, which is all the
 // GatewayConfig tree contains. A map or interface field would be silently skipped
@@ -124,28 +208,107 @@ func expandEnvRefs(s string) string {
 // so `go test ./internal/config/` alone catches it — this package is designed to
 // build and test standalone, and a guard sitting in another package's tests would
 // pass a green run over exactly the field it is meant to catch.
-func expandEnvInStrings(v reflect.Value) {
+func expandEnvInStrings(v reflect.Value, g envGrammar) {
 	switch v.Kind() {
 	case reflect.String:
 		if v.CanSet() {
-			v.SetString(expandEnvRefs(v.String()))
+			v.SetString(expandEnvRefsUnder(v.String(), g))
 		}
 	case reflect.Pointer:
 		if !v.IsNil() {
-			expandEnvInStrings(v.Elem())
+			expandEnvInStrings(v.Elem(), g)
 		}
 	case reflect.Struct:
 		for i := 0; i < v.NumField(); i++ {
 			if f := v.Field(i); f.CanSet() { // CanSet skips unexported fields
-				expandEnvInStrings(f)
+				expandEnvInStrings(f, fieldEnvGrammar(v.Type().Field(i).Tag, g))
 			}
 		}
 	case reflect.Slice, reflect.Array:
 		for i := 0; i < v.Len(); i++ {
-			expandEnvInStrings(v.Index(i))
+			expandEnvInStrings(v.Index(i), g)
 		}
 	}
 }
+
+// fieldEnvGrammar returns the grammar declared on a struct field by its `env` tag, or
+// inherited when it declares none. An unrecognized tag value falls back to inherited rather
+// than being ignored silently at the type level: declaredEnvGrammar is what refuses one, and it
+// runs at package init over the fields the guards name.
+func fieldEnvGrammar(tag reflect.StructTag, inherited envGrammar) envGrammar {
+	if g, ok := envTagGrammars[tag.Get("env")]; ok {
+		return g
+	}
+	return inherited
+}
+
+// declaredEnvGrammarAt reads the `env` grammar declared on the GatewayConfig field at a dotted
+// yaml path ("listen.allowedOrigins", "upstreams.upstreamUrl"). Slice and pointer hops are
+// implicit — the grammar is a property of the field, and every element of a slice field shares
+// it, exactly as the expansion walk inherits it.
+//
+// It is what keeps the GUARD and the EXPANSION reading one declaration. The guards are a
+// hand-maintained per-field family (see failOnUnsetArgvAndOriginEnvRefs) while the expansion
+// walk is tag-driven, so without this the two would state the same rule twice — and the whole
+// point of the type is that a field's "$" means one thing. Every guarded field resolves its
+// grammar here, not just the ones that narrow it today: a guard passing envGrammarFull as a
+// literal is correct only until someone tags that field, and then it is the same silent
+// guard/expansion divergence on a field like audit.keyPath, where the expansion would leave
+// "$KEYDIR/audit.key" verbatim and the guard would see a resolved reference and pass it.
+//
+// It panics on a path or tag value it cannot resolve. That is a programming error in this file,
+// caught by package init on any test run, and the alternative (fall back to full) would
+// silently restore the mismatch this exists to prevent.
+func declaredEnvGrammarAt(path string) envGrammar {
+	t := reflect.TypeOf(GatewayConfig{})
+	g := envGrammarFull
+	for _, seg := range strings.Split(path, ".") {
+		for t.Kind() == reflect.Pointer || t.Kind() == reflect.Slice || t.Kind() == reflect.Array {
+			t = t.Elem()
+		}
+		if t.Kind() != reflect.Struct {
+			panic(fmt.Sprintf("config: env grammar path %q descends into non-struct %s", path, t.Kind()))
+		}
+		f, ok := fieldByYAMLName(t, seg)
+		if !ok {
+			panic(fmt.Sprintf("config: env grammar path %q has no field %q", path, seg))
+		}
+		if tag := f.Tag.Get("env"); tag != "" {
+			declared, known := envTagGrammars[tag]
+			if !known {
+				panic(fmt.Sprintf("config: field %q declares unknown env grammar %q", path, tag))
+			}
+			g = declared
+		}
+		t = f.Type
+	}
+	return g
+}
+
+// fieldByYAMLName finds t's field with the given yaml name.
+func fieldByYAMLName(t reflect.Type, yamlName string) (reflect.StructField, bool) {
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if strings.Split(f.Tag.Get("yaml"), ",")[0] == yamlName {
+			return f, true
+		}
+	}
+	return reflect.StructField{}, false
+}
+
+// The grammars the unset-reference guards apply, read from the same field declarations the
+// expansion walk reads. Package-level so a path or tag that stops resolving fails at init
+// rather than at the one startup that happens to reach the guard.
+var (
+	upstreamURLEnvGrammar        = declaredEnvGrammarAt("upstreams.upstreamUrl")
+	upstreamCommandEnvGrammar    = declaredEnvGrammarAt("upstreams.command")
+	upstreamArgsEnvGrammar       = declaredEnvGrammarAt("upstreams.args")
+	upstreamAuthHeaderEnvGrammar = declaredEnvGrammarAt("upstreams.upstreamAuthHeader")
+	allowedOriginsEnvGrammar     = declaredEnvGrammarAt("listen.allowedOrigins")
+	listenAuthTokenEnvGrammar    = declaredEnvGrammarAt("listen.authToken")
+	auditLogEnvGrammar           = declaredEnvGrammarAt("audit.log")
+	auditKeyPathEnvGrammar       = declaredEnvGrammarAt("audit.keyPath")
+)
 
 // gatewayNumericKeys are the gateway-config scalar fields holding a bare number that
 // yaml.v3 can auto-type away from the operator's written text — most dangerously a
@@ -323,12 +486,16 @@ type UpstreamConfig struct {
 
 	Transport string `yaml:"transport"` // "stdio" | "http"
 
-	// stdio transport
-	Command string   `yaml:"command"`
-	Args    []string `yaml:"args"`
+	// stdio transport. Both are passed verbatim to another program, so a bare "$word" is
+	// ordinary literal content there and only "${VAR}" is a reference — see envGrammar. The
+	// declaration is read by BOTH the expansion walk and the unset-reference guard.
+	Command string   `yaml:"command" env:"braced"`
+	Args    []string `yaml:"args" env:"braced"`
 
-	// http transport
-	UpstreamURL           string `yaml:"upstreamUrl"`
+	// http transport. The URL grammar: full in the authority and path, braced-only from the
+	// first "?" or "#", so `?$filter=` is neither refused at startup nor silently rewritten
+	// when a variable named "filter" happens to be set.
+	UpstreamURL           string `yaml:"upstreamUrl" env:"url"`
 	UpstreamAuthHeader    string `yaml:"upstreamAuthHeader"`
 	UpstreamTLSSkipVerify bool   `yaml:"upstreamTlsSkipVerify"`
 
@@ -545,7 +712,7 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	// the text before parsing let a YAML metacharacter in a secret alter the parse
 	// (e.g. "#secret" read as a comment, silently blanking listen.authToken).
 	// References resolve only in string-typed fields.
-	expandEnvInStrings(reflect.ValueOf(&cfg).Elem())
+	expandEnvInStrings(reflect.ValueOf(&cfg).Elem(), envGrammarFull)
 
 	// Fail closed if listen.authToken references a variable that leaves the credential
 	// blank — unset (left as literal "${VAR}" text), expanded to "", or every reference
@@ -556,7 +723,7 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	// the upstreamAuthHeader leg) for the exact rule and the "$identifier"-substring
 	// false-positive it avoids by detecting references on the RAW text.
 	if cfg.HostTransport() == HostTransportHTTP {
-		if err := validateCredentialEnvRefs(path, "listen.authToken", rawAuthToken); err != nil {
+		if err := validateCredentialEnvRefs(path, "listen.authToken", rawAuthToken, listenAuthTokenEnvGrammar); err != nil {
 			return nil, err
 		}
 	}
@@ -575,7 +742,7 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 			continue
 		}
 		label := fmt.Sprintf("upstream %q upstreamAuthHeader", cfg.Upstreams[i].Name)
-		if err := validateCredentialEnvRefs(path, label, raw); err != nil {
+		if err := validateCredentialEnvRefs(path, label, raw, upstreamAuthHeaderEnvGrammar); err != nil {
 			return nil, err
 		}
 	}
@@ -594,13 +761,14 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	// ContainsEnvRef even though the reference resolved correctly, misdiagnosing a
 	// healthy config as unset.
 	//
-	// The QUERY and FRAGMENT take the braced-only rule (failOnUnsetURLEnvRef), for the
-	// same reason argv does: a bare "$word" is ordinary content there. "?$filter=" is a
-	// perfectly good OData URL, and the bare-$ rule refused to start that config while
-	// naming an environment variable "filter" the operator never wrote — a refusal the
-	// argv rule already documents "?$filter=" as the reason for avoiding.
+	// The QUERY and FRAGMENT take the braced-only rule, for the same reason argv does: a bare
+	// "$word" is ordinary content there. "?$filter=" is a perfectly good OData URL, and the
+	// bare-$ rule refused to start that config while naming an environment variable "filter"
+	// the operator never wrote. The grammar comes from the FIELD's own declaration, the same
+	// one the expansion pass above read, so the guard cannot refuse a spelling the expansion
+	// left alone — or pass one it silently rewrote.
 	for i := range cfg.Upstreams {
-		if err := failOnUnsetURLEnvRef(path, fmt.Sprintf("upstream %q upstreamUrl", cfg.Upstreams[i].Name), rawUpstreamURL[i]); err != nil {
+		if err := failOnUnsetEnvRefUnder(path, fmt.Sprintf("upstream %q upstreamUrl", cfg.Upstreams[i].Name), rawUpstreamURL[i], upstreamURLEnvGrammar); err != nil {
 			return nil, err
 		}
 	}
@@ -616,11 +784,14 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	// path literally named "${VAR}", silently misdirecting the integrity artifact. Mirror
 	// the upstreamUrl leg, detecting on the RAW text so a set variable whose value itself
 	// contains "$" is not misdiagnosed as unset.
-	for _, f := range []struct{ label, raw string }{
-		{"audit.log", rawAuditLog},
-		{"audit.keyPath", rawAuditKeyPath},
+	for _, f := range []struct {
+		label, raw string
+		grammar    envGrammar
+	}{
+		{"audit.log", rawAuditLog, auditLogEnvGrammar},
+		{"audit.keyPath", rawAuditKeyPath, auditKeyPathEnvGrammar},
 	} {
-		if err := failOnUnsetEnvRef(path, f.label, f.raw); err != nil {
+		if err := failOnUnsetEnvRefUnder(path, f.label, f.raw, f.grammar); err != nil {
 			return nil, err
 		}
 	}
@@ -666,6 +837,25 @@ func ContainsEnvRef(s string) bool {
 // "$" -- which would make ContainsEnvRef report a residual reference for a value that
 // correctly expanded to a literal dollar sign, and make the unset-reference guard reject
 // a perfectly valid credential.
+// recognizedEnvRefs is realEnvRefs restricted to the spellings g recognizes — the same
+// predicate the expansion applies, so a field's guard and its expansion agree on what is a
+// reference at all. The URL grammar's positional split is applied here for the same reason
+// firstUnsetEnvRefUnder applies it: both callers must split a URL through splitURLEnvScope.
+func recognizedEnvRefs(s string, g envGrammar) []string {
+	if g == envGrammarURL {
+		head, tail := splitURLEnvScope(s)
+		return append(recognizedEnvRefs(head, envGrammarFull), recognizedEnvRefs(tail, envGrammarBraced)...)
+	}
+	refs := realEnvRefs(s)
+	out := refs[:0]
+	for _, ref := range refs {
+		if recognizedRef(ref, g) {
+			out = append(out, ref)
+		}
+	}
+	return out
+}
+
 func realEnvRefs(s string) []string {
 	matches := envRefRe.FindAllString(s, -1)
 	refs := matches[:0]
@@ -677,16 +867,30 @@ func realEnvRefs(s string) []string {
 	return refs
 }
 
-// firstUnsetEnvRef scans rawValue's raw (pre-expansion) text for $VAR/${VAR}
-// references and returns the name of the first one whose variable is unset — the
-// one expandEnvRefs would leave as literal "${VAR}" text in the expanded value.
-// ok is false when every reference (if any) resolved to a set variable. The
-// single walk-and-check-unset core shared by validateCredentialEnvRefs (the
-// listen.authToken / upstreamAuthHeader legs) and LoadGatewayConfig's upstreamUrl
-// residual-reference check, so the "what counts as unset" rule cannot drift
-// between them.
-func firstUnsetEnvRef(rawValue string) (name string, ok bool) {
-	for _, ref := range realEnvRefs(rawValue) {
+// firstUnsetEnvRefUnder scans rawValue's raw (pre-expansion) text for the references a field's
+// declared grammar RECOGNIZES and returns the name of the first one whose variable is unset —
+// the one expandEnvRefsUnder would leave as literal "${VAR}" text in the expanded value. ok is
+// false when every recognized reference (if any) resolved to a set variable.
+//
+// The single walk-and-check-unset core shared by validateCredentialEnvRefs (the
+// listen.authToken / upstreamAuthHeader legs) and every path-family guard, so the "what counts
+// as unset" rule cannot drift between them. The URL grammar's positional split is applied here
+// rather than by the caller, so the guard and the expansion split a URL through the one helper
+// (splitURLEnvScope). There is deliberately no full-grammar convenience wrapper: a caller that
+// did not name its field's grammar is the divergence this type exists to prevent.
+func firstUnsetEnvRefUnder(rawValue string, g envGrammar) (name string, ok bool) {
+	if g == envGrammarURL {
+		head, tail := splitURLEnvScope(rawValue)
+		if n, found := firstUnsetEnvRefUnder(head, envGrammarFull); found {
+			return n, true
+		}
+		return firstUnsetEnvRefUnder(tail, envGrammarBraced)
+	}
+	for _, ref := range recognizedEnvRefs(rawValue, g) {
+		// envRefRe guarantees at least one identifier character, so envRefName cannot
+		// return "" — and if it ever could, skipping would be the fail-OPEN direction (an
+		// unset reference left as literal text is exactly what this guard exists to
+		// refuse), so a "defensive" continue would defend the wrong way.
 		n := envRefName(ref)
 		if _, set := os.LookupEnv(n); !set {
 			return n, true
@@ -695,16 +899,20 @@ func firstUnsetEnvRef(rawValue string) (name string, ok bool) {
 	return "", false
 }
 
-// failOnUnsetEnvRef fails closed when raw carries a $VAR/${VAR} reference whose variable
-// is unset: expandEnvRefs leaves the literal "${VAR}" text in place, so the field would
-// resolve to a path/URL literally named "${VAR}". Single source of the operator-facing
-// message for the "path-family" fields (upstreamUrl, audit.log, audit.keyPath) so they
-// cannot drift; the credential fields use validateCredentialEnvRefs, whose message differs
-// (a literal token no client/upstream sends). Detection is on the RAW pre-expansion text
-// so a set variable whose value itself contains "$" is not misdiagnosed as unset. path
-// names the config file; label names the field.
-func failOnUnsetEnvRef(path, label, raw string) error {
-	if name, ok := firstUnsetEnvRef(raw); ok {
+// failOnUnsetEnvRefUnder fails closed when raw carries, under the field's declared grammar, a
+// reference whose variable is unset — so a path or URL never silently resolves to one literally
+// named "${VAR}". Single source of the operator-facing message for the path-family fields
+// (upstreamUrl, audit.log, audit.keyPath, listen.allowedOrigins, a stdio upstream's
+// command/args); the credential fields use validateCredentialEnvRefs, whose message differs (a
+// literal token no client/upstream sends). Detection is on the RAW pre-expansion text so a set
+// variable whose value itself contains "$" is not misdiagnosed as unset. path names the config
+// file; label names the field.
+//
+// Every caller passes the grammar read from the field's own declaration (see
+// declaredEnvGrammarAt), so the guard cannot refuse a spelling the expansion would have left
+// alone — or pass one it would have substituted.
+func failOnUnsetEnvRefUnder(path, label, raw string, g envGrammar) error {
+	if name, ok := firstUnsetEnvRefUnder(raw, g); ok {
 		return unsetEnvRefError(path, label, name)
 	}
 	return nil
@@ -717,20 +925,27 @@ func failOnUnsetEnvRef(path, label, raw string) error {
 //
 // command/args: an unset ${SERVER_BIN} survives as literal text and the route boots; the
 // failure lands at exec time on the FIRST SESSION instead of at startup, so the operator
-// learns of a plain config typo from a client's failed handshake. Restricted to the
-// BRACED form, because these two fields are arbitrary subprocess argv rather than a URL:
-// a bare "$word" is ordinary literal text there (an OData "?$filter=", a regex "$anchor",
-// a jq/JSONPath expression, or anything the child interpolates itself), so treating it as
-// a reference would refuse to START a config that works today, blaming a variable the
-// operator never wrote. "${VAR}" carries unambiguous intent to substitute. The
-// upstreamUrl guard keeps its broader bare-$ rule: it predates this, and a URL is a far
-// narrower surface than argv.
+// learns of a plain config typo from a client's failed handshake. Both fields DECLARE the
+// braced-only grammar (see envGrammar), because they are arbitrary subprocess argv rather
+// than a URL: a bare "$word" is ordinary literal text there (a regex "$anchor", a
+// jq/JSONPath expression, or anything the child interpolates itself), so treating it as a
+// reference would both refuse to START a config that works today and — the half that
+// outlived the guard fix — silently REWRITE the argv whenever a variable of that name
+// happened to be set. The grammar comes from the field, so the guard and the expansion
+// cannot disagree about which spellings are references.
 //
 // listen.allowedOrigins: an unset ${DASHBOARD_ORIGIN} survives, the proxy boots, and the
 // entry then matches no real Origin header — so a browser client gets a bare 403 with
 // nothing on stderr connecting it to the typo. Nothing else catches this one, which is
-// why it is guarded here; it takes the full bare-$ rule, matching the other URL-shaped
-// fields.
+// why it is guarded here.
+//
+// It keeps the FULL grammar, deliberately, and that is the whole of the answer to "should
+// allowedOrigins follow the URL split too". The split exists because a URL query and a
+// subprocess argv carry legitimate bare "$" content; an Origin is a scheme, host and
+// optional port and carries none — RFC 6454 admits no "$" in a host at all. So there is
+// nothing for a braced-only rule to protect here, and narrowing it would only drop a
+// working spelling. The rule that decides this is not "URL-shaped fields split", it is
+// "a field splits where its own syntax gives a bare $ a meaning of its own".
 //
 // Note the whole family is a hand-maintained per-field list while expandEnvInStrings
 // rewrites EVERY string in the tree, so "covered" is not the default — a field is covered
@@ -742,71 +957,21 @@ func failOnUnsetEnvRef(path, label, raw string) error {
 func failOnUnsetArgvAndOriginEnvRefs(path string, cfg *GatewayConfig, rawCommand []string, rawArgs [][]string, rawAllowedOrigins []string) error {
 	for i := range cfg.Upstreams {
 		name := cfg.Upstreams[i].Name
-		if err := failOnUnsetBracedEnvRef(path, fmt.Sprintf("upstream %q command", name), rawCommand[i]); err != nil {
+		if err := failOnUnsetEnvRefUnder(path, fmt.Sprintf("upstream %q command", name), rawCommand[i], upstreamCommandEnvGrammar); err != nil {
 			return err
 		}
 		for j, rawArg := range rawArgs[i] {
-			if err := failOnUnsetBracedEnvRef(path, fmt.Sprintf("upstream %q args[%d]", name, j), rawArg); err != nil {
+			if err := failOnUnsetEnvRefUnder(path, fmt.Sprintf("upstream %q args[%d]", name, j), rawArg, upstreamArgsEnvGrammar); err != nil {
 				return err
 			}
 		}
 	}
 	for i, rawOrigin := range rawAllowedOrigins {
-		if err := failOnUnsetEnvRef(path, fmt.Sprintf("listen.allowedOrigins[%d]", i), rawOrigin); err != nil {
+		if err := failOnUnsetEnvRefUnder(path, fmt.Sprintf("listen.allowedOrigins[%d]", i), rawOrigin, allowedOriginsEnvGrammar); err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-// failOnUnsetBracedEnvRef is failOnUnsetEnvRef restricted to the unambiguous "${VAR}"
-// spelling, for fields whose text is passed verbatim to another program (a stdio
-// upstream's command and args). A bare "$word" is ordinary literal content there, so
-// treating it as a reference would refuse to start an otherwise-working config; "${VAR}"
-// is unambiguous intent to substitute. Escapes ("$$") are skipped exactly as elsewhere,
-// and detection is on the RAW pre-expansion text for the same reason.
-func failOnUnsetBracedEnvRef(path, label, raw string) error {
-	for _, ref := range realEnvRefs(raw) {
-		if !strings.HasPrefix(ref, "${") {
-			continue
-		}
-		// envRefRe guarantees at least one identifier character, so envRefName cannot
-		// return "" — and if it ever could, skipping would be the fail-OPEN direction
-		// (an unset reference left as literal text is exactly what this guard exists to
-		// refuse), so a "defensive" continue defended the wrong way.
-		name := envRefName(ref)
-		if _, set := os.LookupEnv(name); !set {
-			return unsetEnvRefError(path, label, name)
-		}
-	}
-	return nil
-}
-
-// failOnUnsetURLEnvRef is the upstreamUrl leg of the rule: the bare-$ form counts as a
-// reference in the scheme/host/path, and only the braced "${VAR}" form counts in the
-// QUERY or FRAGMENT.
-//
-// The split is the point. A URL's authority has no legitimate bare "$", so the broad rule
-// belongs there; a query does — "?$filter=eq(...)" (OData), "?$select=", a JSONPath "$."
-// — and applying the broad rule to it refused an otherwise-working config, blaming an
-// environment variable named "filter" the operator never wrote.
-//
-// An env reference cannot straddle the split: the reference grammar admits only
-// identifier characters, so neither "?" nor "#" can appear inside one.
-//
-// Note this governs the GUARD, not the expansion: a bare "$filter" in a query whose
-// variable IS set is still substituted by the tree-wide expansion, which "$$" escapes.
-// The guard's job is to refuse a reference that silently survives as literal text, and
-// after this split that is exactly what it refuses.
-func failOnUnsetURLEnvRef(path, label, raw string) error {
-	head, tail := raw, ""
-	if i := strings.IndexAny(raw, "?#"); i >= 0 {
-		head, tail = raw[:i], raw[i:]
-	}
-	if err := failOnUnsetEnvRef(path, label, head); err != nil {
-		return err
-	}
-	return failOnUnsetBracedEnvRef(path, label, tail)
 }
 
 // unsetEnvRefError is the single operator-facing message for an unset reference, shared
@@ -838,13 +1003,15 @@ func unsetEnvRefError(path, label, name string) error {
 // case), since expandEnvRefs only ever replaces ref text with the referenced variable's
 // value and leaves every other character untouched — an expanded-field check can never
 // catch a case these two miss.
-func validateCredentialEnvRefs(path, label, rawValue string) error {
-	if name, ok := firstUnsetEnvRef(rawValue); ok {
+func validateCredentialEnvRefs(path, label, rawValue string, g envGrammar) error {
+	if name, ok := firstUnsetEnvRefUnder(rawValue, g); ok {
 		return fmt.Errorf("invalid gateway config %q: %s references environment variable %q, which is unset, so it is left as literal text — the field would require a literal token no client/upstream sends; set the variable, or remove the reference", path, label, name)
 	}
-	// Every reference (if any) is confirmed set by firstUnsetEnvRef above, so
-	// os.LookupEnv below always succeeds; this pass only tracks blankness.
-	refs := realEnvRefs(rawValue)
+	// Every reference (if any) is confirmed set by firstUnsetEnvRefUnder above, so
+	// os.LookupEnv below always succeeds; this pass only tracks blankness. Scoped to the
+	// spellings this FIELD's grammar recognizes, so a spelling the expansion leaves as
+	// literal text cannot be counted as the credential's secret content either.
+	refs := recognizedEnvRefs(rawValue, g)
 	sawNonEmptyRef := false
 	for _, ref := range refs {
 		val, _ := os.LookupEnv(envRefName(ref))

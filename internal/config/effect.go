@@ -263,7 +263,7 @@ func checkByArgumentKeys(path string, raw interface{}) error {
 
 // HasEffectCeiling reports whether the policy sets a consequence bound, so the wiring
 // layer can skip the per-allow ceiling check for a policy that has none. Mirrors
-// UsesEngineSubsystem: a wiring question, not the state-accumulation one (the ceiling reads
+// PolicyTokens and the engine gate it feeds: a wiring question, not the state-accumulation one (the ceiling reads
 // no accumulated state at all). It stays a direct field test rather than a token declaration
 // because the ceiling is a top-level manifest field, not a condition or directive, so there
 // is no prototype-registry entry to declare it on.

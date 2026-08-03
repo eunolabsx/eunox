@@ -705,10 +705,11 @@ func (c *recordFaultCounter) AdmitAll(_ context.Context, _ []capability.QuotaBuc
 
 // TestRecordSessionCall_NoSequenceBlock_NoQuotaBurnOnRecordFault is the regression
 // for the maxCalls slot being burned on a RecordSessionCall-fault deny. For a
-// maxCalls-only policy (no sequenceBlock), WithoutAntecedentRecording skips the
-// antecedent write entirely, so a counter fault on that write can no longer turn a
-// committed-maxCalls allow into a deny. The default engine (no option) still
-// records and so still denies on the fault, demonstrating the difference.
+// maxCalls-only policy (no sequenceBlock), the engine derives that nothing reads the
+// antecedent history and skips the write entirely, so a counter fault on that write can no
+// longer turn a committed-maxCalls allow into a deny. An engine told nothing about its policy
+// still records and so still denies on the fault, demonstrating both the difference and the
+// fail-closed default.
 func TestRecordSessionCall_NoSequenceBlock_NoQuotaBurnOnRecordFault(t *testing.T) {
 	maxCallsOnly := []capability.Constraint{{
 		Target:     "tool:t",
@@ -721,8 +722,8 @@ func TestRecordSessionCall_NoSequenceBlock_NoQuotaBurnOnRecordFault(t *testing.T
 		Target:     &capability.EnforceRequestTarget{Type: "tool", Name: "t"},
 	}
 
-	// Default engine: records the antecedent, so the IncrementAndGet fault denies the
-	// call (the residual burn the invariant doc now acknowledges).
+	// Engine told nothing about its policy: records the antecedent, so the IncrementAndGet
+	// fault denies the call (the residual burn the invariant doc now acknowledges).
 	cDefault := &recordFaultCounter{}
 	respDefault := New(WithCallCounter(cDefault)).ValidateAction(context.Background(), req, maxCallsOnly)
 	if respDefault.Decision != capability.DecisionDeny {
@@ -732,10 +733,11 @@ func TestRecordSessionCall_NoSequenceBlock_NoQuotaBurnOnRecordFault(t *testing.T
 		t.Error("default engine must attempt the antecedent write")
 	}
 
-	// With WithoutAntecedentRecording: the antecedent write is skipped, so the same
-	// fault cannot deny — the call is allowed and IncrementAndGet is never called.
+	// Told that the policy carries only maxCalls, the engine skips the antecedent write, so
+	// the same fault cannot deny — the call is allowed and IncrementAndGet is never called.
 	cSkip := &recordFaultCounter{}
-	respSkip := New(WithCallCounter(cSkip), WithoutAntecedentRecording()).ValidateAction(context.Background(), req, maxCallsOnly)
+	respSkip := New(WithCallCounter(cSkip), WithPolicyTokens([]string{capability.ConditionTypeMaxCalls})).
+		ValidateAction(context.Background(), req, maxCallsOnly)
 	if respSkip.Decision != capability.DecisionAllow {
 		t.Fatalf("skip-recording engine: a maxCalls-only call must be allowed despite a record-path fault, got %v (denial=%+v)", respSkip.Decision, respSkip.Denial)
 	}

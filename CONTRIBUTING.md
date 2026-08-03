@@ -235,15 +235,21 @@ rules:
   the request, the clock, the call counter and its own configuration;
   `SubsystemAntecedentHistory` when it reads the marker an earlier call
   recorded; `SubsystemFlowLabels` when it reads or writes the flow-label set.
-  The route builder skips a facility no token needs
-  (`WithoutAntecedentRecording`, `WithoutFlowLabels`), so a token that declares
-  nothing is treated as depending on all of them. Over-declaring costs work per
-  call — a relevance scan for the flow gate, a counter round-trip and its
-  fail-closed deny path for the antecedent one — and never authority; only
+  The declaration describes the handler **this build ships** for the token; the
+  ENGINE decides which facilities to wire, by intersecting the tokens a policy
+  carries (`config.LocalManifest.PolicyTokens` →
+  `enforcement.WithPolicyTokens`) with its own handler registry. A token that
+  declares nothing is treated as depending on all of them. Over-declaring costs
+  work per call — a relevance scan for the flow gate, a counter round-trip and
+  its fail-closed deny path for the antecedent one — and never authority; only
   under-declaring can leave a handler reading a facility nothing wired. Declare
   every subsystem for a token whose enforcement is supplied from outside this
   build (`policy`, `custom`): what an embedder's evaluator reads is not
-  knowable here.
+  knowable from the token type. Those two ask the wired `PolicyEvaluator`
+  instead when it implements `enforcement.SubsystemDependent`, which is also
+  how an embedder replacing a stock handler via `WithConditionHandler` declares
+  what the REPLACEMENT reads — an override is otherwise unclassified, and so
+  keeps every facility wired.
 - For new MCP method coverage, add an enforcement-gap-style test in
   `internal/transport/enforcement_gaps_test.go`.
 - For new audit-record fields, add a sign-and-verify round-trip test.
