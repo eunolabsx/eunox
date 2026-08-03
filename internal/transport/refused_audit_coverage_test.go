@@ -645,6 +645,22 @@ func TestUnsupportedMediaType_StderrLineIsBoundedAndGated(t *testing.T) {
 		_, _ = io.Copy(&buf, r)
 		drained <- buf.String()
 	}()
+	// Deferred, not just unwound at the bottom: a t.Fatalf inside the loop below runs
+	// runtime.Goexit, so an inline restore would leave os.Stderr pointing at a pipe nobody
+	// closes and the drain goroutine parked on it. Every later test in this package that
+	// writes a SECURITY line to stderr would then block once the 64 KiB pipe buffer filled,
+	// hanging the run instead of reporting the one real failure. Idempotent (sync.Once is
+	// unnecessary — the tail below no longer restores).
+	restored := false
+	restore := func() {
+		if restored {
+			return
+		}
+		restored = true
+		os.Stderr = old
+		_ = w.Close()
+	}
+	defer restore()
 
 	// Far more requests than the pre-session bucket admits, so the gate has to be doing the
 	// bounding rather than the loop count.
@@ -662,8 +678,7 @@ func TestUnsupportedMediaType_StderrLineIsBoundedAndGated(t *testing.T) {
 		}
 	}
 
-	_ = w.Close()
-	os.Stderr = old
+	restore()
 	logged := <-drained
 
 	if len(logged) >= requests*len(huge) {

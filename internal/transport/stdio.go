@@ -58,9 +58,11 @@ func SetProxyVersion(v string) { proxyVersion = v }
 
 // StdioProxy proxies MCP messages between the host (stdin/stdout) and an upstream MCP
 // server (a subprocess, or a remote HTTP upstream via the bridge), applying PDP
-// enforcement to every enforced method — the five Decide* surfaces (tools/call,
-// resources/read, resources/subscribe, resources/unsubscribe, prompts/get), the
-// server-initiated sampling/createMessage leg, and the */list response filters.
+// enforcement to every enforced method: tools/call, resources/read, resources/subscribe,
+// resources/unsubscribe and prompts/get on the host leg, sampling/createMessage on the
+// server-initiated leg, plus the */list response filters. Five wire methods over four
+// Decide* entry points — resources/subscribe is authorized through DecideResourceRead,
+// while resources/unsubscribe has its own (see the PolicyDecisionPoint contract).
 type StdioProxy struct {
 	// Upstream wiring. A non-empty command selects a local subprocess upstream
 	// (stdio); a non-empty upstreamURL selects a remote HTTP upstream. Exactly
@@ -1283,7 +1285,9 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 // notification to reach the upstream first, so on a SUBPROCESS upstream a
 // notifications/cancelled cannot be delivered ahead of the tools/call it cancels. On a
 // remote HTTP upstream it orders the proxy's dispatch only — each call is its own POST —
-// so cancellation there is best-effort, as it is on the gateway. It releases on the upstream WRITE,
+// so cancellation there is best-effort, as it is on the gateway.
+//
+// The barrier releases on the upstream WRITE,
 // not the response, so cancelling a slow in-flight call does not block it. On a
 // shutdown wake it returns stop=true rather than looping: a leaked waiter is still
 // registered on fwdHostWrites, so reading further requests (each fwdHostWrites.Add)

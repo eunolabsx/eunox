@@ -1338,7 +1338,14 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 	// produce at will by alternating token shapes.
 	//
 	// It reads only req and returns a HardDeny, so neither the obligations defer above nor
-	// the carried-labels defer below applies to it: no verdict changes, only the ordering.
+	// the carried-labels defer below applies to it. Moving it up does not turn any deny into
+	// an allow — it decides on the request alone, so a call it refuses was refused before —
+	// but for a request that ALSO trips the delegation gate or an unreadable label store it
+	// now wins the record: MISSING_CONTEXT/no_task_id where the tape previously carried the
+	// delegation or flowLabel verdict. That is the right precedence (a call that cannot be
+	// accounted has no bucket for the other two to speak about) and it is a reporting change,
+	// so a query keyed on those codes sees this request shape under this one instead.
+	//
 	// Falling back to session keying here would let one caller split its own taint, budgets
 	// and antecedents across two buckets by alternating tokens — see anchorUnresolved.
 	if e.anchorUnresolved(req) {

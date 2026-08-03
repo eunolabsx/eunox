@@ -33,10 +33,10 @@ func newTTLTestRedis(t *testing.T, opts ...RedisOption) (*Redis, *miniredis.Mini
 }
 
 // armSessionTTLPublished stands in for the startup publish the reconcile loop's republish is
-// gated on. refreshPublishedSessionKillTTL is a REFRESH: it keeps a value an explicit
-// PublishSessionKillTTL already wrote alive, and publishes nothing before one has succeeded
-// (see sessionTTLPublished). A test exercising the tick's own behaviour therefore has to
-// establish that precondition, and the flag is set directly rather than by a real publish
+// gated on. refreshPublishedSessionKillTTL is a REFRESH: it keeps alive a value an explicit
+// PublishSessionKillTTL has already attempted, and publishes nothing before one has been
+// called (see sessionTTLPublished). A test exercising the tick's own behaviour therefore has
+// to establish that precondition, and the flag is set directly rather than by a real publish
 // because two of the callers need the key in a state a publish would destroy — a WRONGTYPE
 // value, or a Redis that is already gone.
 func armSessionTTLPublished(t *testing.T, r *Redis) {
@@ -77,6 +77,41 @@ func TestRefreshPublishedSessionKillTTL_InertBeforeStartupPublish(t *testing.T) 
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.Equal(t, 24*time.Hour, got, "after the startup publish the tick republishes as before")
+}
+
+// TestRefreshPublishedSessionKillTTL_ArmedByAFailedStartupPublish is the other half of the
+// gate, and the reason it latches on the publish being CALLED rather than on it SUCCEEDING.
+//
+// The startup publish is best-effort by design: cmd/eunox warns and continues when it fails,
+// which is what a proxy booting during a brief Redis blip does. Latching on success would
+// have left that proxy with the republish dead for the life of the process — and, because
+// the gate returns before the error bookkeeping, with its periodic warning dead too, so the
+// operator would see one startup line and nothing after while `eunox kill` quietly fell back
+// to its own default. The unconditional tick this gate replaced self-healed; so does this.
+func TestRefreshPublishedSessionKillTTL_ArmedByAFailedStartupPublish(t *testing.T) {
+	t.Parallel()
+	h := &countingHandler{}
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{
+		Addr:         mr.Addr(),
+		DialTimeout:  50 * time.Millisecond,
+		ReadTimeout:  50 * time.Millisecond,
+		WriteTimeout: 50 * time.Millisecond,
+		MaxRetries:   -1,
+	})
+	t.Cleanup(func() { _ = client.Close() })
+	r := NewRedis(client, WithSessionKillTTL(time.Hour), WithReconcileInterval(30*time.Second), WithLogger(slog.New(h)))
+
+	mr.Close() // every command now fails, as it would for a proxy booting during an outage
+	_, _, err := r.PublishSessionKillTTL(context.Background())
+	require.Error(t, err, "precondition: the startup publish must fail")
+
+	// Armed anyway: the ordering this protects is "the ready hook has run", and it has.
+	require.True(t, r.sessionTTLPublished.Load(), "a failed startup publish must still arm the republish")
+
+	const failMsg = "could not refresh the session-kill TTL"
+	r.refreshPublishedSessionKillTTL(context.Background())
+	require.Equal(t, 1, h.countMatching(failMsg), "the tick must retry and report, not sit silent")
 }
 
 // TestNormalizeSessionKillTTL pins the flag-to-effective conversion both spellings

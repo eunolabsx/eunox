@@ -332,10 +332,6 @@ func fetchSpecLive(ctx context.Context, spec initUpstreamSpec) (LiveUpstreamInfo
 // fetchRouteLive introspects one route's declared upstream, dispatching on its
 // transport. A fresh liveUpstreamTimeout is applied PER route so a slow early
 // route cannot exhaust a shared budget and fail every later route.
-
-// fetchRouteLive introspects one route's declared upstream, dispatching on its
-// transport. A fresh liveUpstreamTimeout is applied PER route so a slow early
-// route cannot exhaust a shared budget and fail every later route.
 func fetchRouteLive(ctx context.Context, u *config.UpstreamConfig) (LiveUpstreamInfo, error) {
 	ctx, cancel := context.WithTimeout(ctx, liveUpstreamTimeout)
 	defer cancel()
@@ -348,7 +344,3 @@ func fetchRouteLive(ctx context.Context, u *config.UpstreamConfig) (LiveUpstream
 		return LiveUpstreamInfo{}, fmt.Errorf("upstream %q: unknown transport %q", u.Name, u.Transport)
 	}
 }
-
-// -----------------------------------------------------------------
-// init subcommand
-// -----------------------------------------------------------------

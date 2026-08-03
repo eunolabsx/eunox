@@ -2111,6 +2111,13 @@ func writeGeneratedFile(path, content string, force bool) (err error) {
 	return nil
 }
 
+// -----------------------------------------------------------------
+// audit-log readers (suggest / stats / audit-verify)
+// -----------------------------------------------------------------
+
+// auditLogMissingHint returns a first-run-friendly message for when the audit log
+// does not exist yet — what the log is and how to produce one, instead of a raw
+// OS error. cmdName is the subcommand, used in the message and re-run command.
 func auditLogMissingHint(cmdName, logPath string) string {
 	return fmt.Sprintf(
 		"eunox %s: no audit log yet at %s.\n\n"+

@@ -2574,13 +2574,15 @@ func isSafeJSONKey(s string) bool {
 // The entries themselves are not: they are re-marshaled with json.Marshal, which
 // HTML-escapes <, > and & inside the entry bytes. Semantically identical, and the list
 // filter is the one place on this path that does not promise otherwise (the redaction
-// engine, which does, marshals through marshalNoHTMLEscape). It never SEES a duplicate-key object: its sole producer,
-// decodeOrderedObject, rejects an envelope carrying duplicate or fold-colliding keys
-// outright, because the proxy cannot know which of the two values a host binds. (This
-// once described collapsing them last-wins, matching encoding/json — a description that
-// now contradicts the gate above it, in the file where duplicate-key handling IS the
-// security-critical behavior.) A
-// nil/empty entries slice is emitted as [] (never null) so the list field stays an array.
+// engine, which does, marshals through marshalNoHTMLEscape).
+//
+// It never SEES a duplicate-key object: its sole producer, decodeOrderedObject, rejects an
+// envelope carrying duplicate or fold-colliding keys outright, because the proxy cannot know
+// which of the two values a host binds. (This once described collapsing them last-wins,
+// matching encoding/json — a description that now contradicts the gate above it, in the file
+// where duplicate-key handling IS the security-critical behavior.)
+//
+// A nil/empty entries slice is emitted as [] (never null) so the list field stays an array.
 // If fieldName is not among keys it is appended, so the encoded object always carries
 // the list field (an envelope is never returned with the list silently dropped).
 func encodeOrderedObjectWithList(keys []string, values map[string]json.RawMessage, fieldName string, entries []json.RawMessage) ([]byte, error) {

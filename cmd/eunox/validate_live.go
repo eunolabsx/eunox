@@ -594,12 +594,6 @@ Flags:
 	return runValidateLive(merged, info.Tools, info.ServerVersion, os.Stdout)
 }
 
-// writePolicyLoadResults prints one FAIL/OK line per outcome.LoadResults entry via
-// wf, each indented by prefix, so validate and doctor cannot diverge on how a
-// route's per-file manifest load result is reported — both format the exact same
-// transport.PolicyLoadResult slice through this one function instead of
-// hand-mirroring the loop.
-
 // writePolicyLoadResults prints one FAIL/OK line per outcome.LoadResults entry to out,
 // each indented by prefix, so validate and doctor cannot diverge on how a
 // route's per-file manifest load result is reported — both format the exact same
@@ -619,19 +613,6 @@ func writePolicyLoadResults(out io.Writer, prefix string, results []transport.Po
 		wf("%sOK    %s  (name=%q version=%q capabilities=%d)\n", prefix, lr.Path, lr.Manifest.Name, lr.Manifest.Version, len(lr.Manifest.Capabilities))
 	}
 }
-
-// reportRouteOutcome prints outcome's FAIL/OK/policy-config report for one route
-// and reports whether its startup-fatal checks were satisfied. skip is true when
-// the route's live-drift introspection (or, without --live, the route entirely)
-// must not proceed: a no-policy route that fails closed at startup, a non-live
-// no-policy route, or any policy'd-route load/merge/startup-check failure. code is
-// the route's exit-code contribution (0 clean, 2 a startup-fatal failure) —
-// factored out of validateConfigRoutes's loop body to keep its nesting flat.
-//
-// It takes the WRITER, not the (wf, wln) closure pair, because the coverage report it
-// ends with takes one: handing this function closures meant rebuilding an io.Writer from
-// them through a dedicated adapter, purely to undo the conversion its own caller had just
-// done.
 
 // reportRouteOutcome prints outcome's FAIL/OK/policy-config report for one route
 // and reports whether its startup-fatal checks were satisfied. skip is true when
@@ -685,17 +666,6 @@ func reportRouteOutcome(out io.Writer, outcome transport.RouteManifestOutcome, l
 	writeEffectCoverage(out, "  ", outcome.Merged, true)
 	return 0, false
 }
-
-// validateConfigRoutes walks every upstream in cfg, validating each route's
-// manifest(s) and — when live is set — introspecting the declared upstream and
-// reporting drift. A no-policy route the proxy would refuse to start is reported
-// FAIL and skipped (never introspected, since the upstream would never serve); a
-// valid no-policy route -- which on a gateway means audit/wiretap mode ONLY, since a
-// policyless enforce route is refused at startup -- is introspected under --live for
-// visibility but contributes no drift findings.
-//
-// Exit code is the maximum across routes: 0 clean, 1 drift, 2 parse/connection
-// failure.
 
 // validateConfigRoutes walks every upstream in cfg, validating each route's
 // manifest(s) and — when live is set — introspecting the declared upstream and
@@ -773,8 +743,3 @@ func validateConfigRoutes(ctx context.Context, cfg *config.GatewayConfig, live b
 	}
 	return worst
 }
-
-// fetchSpecLive introspects the upstream an initUpstreamSpec points at, dispatching
-// on its transport. Shared by `validate --live` and `init`, which both build a spec
-// from the same CLI flags (via buildInitUpstreamSpec) and then probe it identically;
-// fetchRouteLive is the gateway-config sibling for a *config.UpstreamConfig.

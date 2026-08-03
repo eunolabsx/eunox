@@ -416,12 +416,6 @@ const initUsageExit = 2
 // fail-closed error paths — without terminating the test binary. args carries
 // the subcommand's own arguments (os.Args[2:] in a real invocation), threaded
 // from run.
-
-// cmdInit runs the `init` subcommand and returns the process exit code (rather
-// than calling os.Exit itself), so tests can drive every branch — including the
-// fail-closed error paths — without terminating the test binary. args carries
-// the subcommand's own arguments (os.Args[2:] in a real invocation), threaded
-// from run.
 func cmdInit(args []string) int {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	fs.Usage = func() {
@@ -531,11 +525,6 @@ Flags:
 // rejecting cross-axis flag mixes (http vs stdio) up front rather than at the
 // first network call. Shared by `init` and `validate --live`; error messages are
 // subcommand-agnostic.
-
-// buildInitUpstreamSpec validates and returns the live-introspection target,
-// rejecting cross-axis flag mixes (http vs stdio) up front rather than at the
-// first network call. Shared by `init` and `validate --live`; error messages are
-// subcommand-agnostic.
 func buildInitUpstreamSpec(transportMode, upstreamURL, authHeader string, tlsSkipVerify bool, positional []string) (initUpstreamSpec, error) {
 	switch transportMode {
 	case config.HostTransportHTTP:
@@ -573,11 +562,3 @@ func buildInitUpstreamSpec(transportMode, upstreamURL, authHeader string, tlsSki
 		return initUpstreamSpec{}, fmt.Errorf("--transport must be %q or %q (got %q)", config.HostTransportHTTP, config.HostTransportStdio, transportMode)
 	}
 }
-
-// -----------------------------------------------------------------
-// audit-log readers (suggest / stats / audit-verify)
-// -----------------------------------------------------------------
-
-// auditLogMissingHint returns a first-run-friendly message for when the audit log
-// does not exist yet — what the log is and how to produce one, instead of a raw
-// OS error. cmdName is the subcommand, used in the message and re-run command.
