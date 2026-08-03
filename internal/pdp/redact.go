@@ -108,22 +108,9 @@ func ApplyRedactObligs(resultBytes []byte, obligs []capability.Obligation) ([]by
 	if dec.More() {
 		return nil, fmt.Errorf("redactFields: trailing data after response envelope; cannot verify redaction (fail closed)")
 	}
-	// The decode above resolved every duplicate object key LAST-WINS, and a host is free
-	// to resolve it first-wins. That divergence is a redaction bypass on its own:
-	// {"content":[...],"data":{"ssn":"..."},"data":{}} decodes to an empty `data`, so no
-	// path matches, `changed` stays false, and the ORIGINAL bytes — carrying the ssn — are
-	// returned verbatim below while the audit record reports the obligation applied. The
-	// same rule the request path (mcp.rejectDuplicateJSONKeys) and the list filters
-	// (entryKeysAmbiguous) already apply closes it here: bytes whose decode cannot be
-	// trusted to match what a host renders cannot verify a redaction, so they fail closed.
-	if redactionKeysAmbiguous(resultBytes, spec.fold) {
-		return nil, fmt.Errorf("redactFields: response envelope carries a duplicate or case-variant object key, so its decode may differ from what a host renders; cannot verify redaction (fail closed)")
-	}
-	// The gate above fires on a COLLISION — two keys that fold together. A LONE variant
-	// spelling collides with nothing, so it reached the dispatch below, missed every
-	// exact-match arm, and fell to the weaker generic sibling walk. See
-	// refuseReservedRootKeyVariants for why that is a bypass rather than an over-refusal.
-	if err := refuseReservedRootKeyVariants(result); err != nil {
+	// Both key-trust gates, in one call: bytes whose decode cannot be trusted to match what
+	// a host renders cannot verify a redaction. See refuseUntrustworthyEnvelopeKeys.
+	if err := refuseUntrustworthyEnvelopeKeys(resultBytes, result, spec.fold); err != nil {
 		return nil, err
 	}
 
@@ -667,6 +654,27 @@ func foldedReservedRootKeys() map[string]string {
 		m[capability.FoldJSONKey(k)] = k
 	}
 	return m
+}
+
+// refuseUntrustworthyEnvelopeKeys runs both of the envelope's key-trust gates, which ask one
+// question in two ways: can this redactor's reading of these keys be trusted to match the
+// host's? They are one function because they are also one decision — every caller wants both,
+// and the second exists precisely to cover a shape the first structurally cannot.
+//
+//   - redactionKeysAmbiguous fires on a COLLISION. The decode above resolved every duplicate
+//     object key LAST-WINS, and a host is free to resolve it first-wins:
+//     {"content":[...],"data":{"ssn":"..."},"data":{}} decodes to an empty `data`, so no path
+//     matches, `changed` stays false, and the ORIGINAL bytes — carrying the ssn — are returned
+//     verbatim while the audit record reports the obligation applied. This is the same rule the
+//     request path (mcp.rejectDuplicateJSONKeys) and the list filters (entryKeysAmbiguous)
+//     already apply.
+//   - refuseReservedRootKeyVariants covers the LONE variant, which collides with nothing and so
+//     trips no collision rule at all.
+func refuseUntrustworthyEnvelopeKeys(raw []byte, result map[string]interface{}, fold map[string]struct{}) error {
+	if redactionKeysAmbiguous(raw, fold) {
+		return fmt.Errorf("redactFields: response envelope carries a duplicate or case-variant object key, so its decode may differ from what a host renders; cannot verify redaction (fail closed)")
+	}
+	return refuseReservedRootKeyVariants(result)
 }
 
 // refuseReservedRootKeyVariants fails the response closed when a top-level key folds to a
