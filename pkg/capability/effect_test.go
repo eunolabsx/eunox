@@ -6,6 +6,8 @@ package capability
 import (
 	"encoding/json"
 	"math"
+	"math/big"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -570,6 +572,80 @@ func TestBlastRadiusRejectsANegativeMagnitude(t *testing.T) {
 	// Zero is a legitimate magnitude and must still quantify.
 	if z := ResolveEffect(c, map[string]interface{}{"amount": json.Number("0")}); !z.Quantified() {
 		t.Fatal("zero is a magnitude and must quantify")
+	}
+}
+
+// TestNumericLiteralBoundedAcceptsDecimalOnly pins the shared literal grammar. Three
+// layers gate a caller-supplied literal on this one predicate, so a form it admits is a
+// form all three hand to an arbitrary-precision parser.
+func TestNumericLiteralBoundedAcceptsDecimalOnly(t *testing.T) {
+	accepted := []string{
+		"0", "5", "-5", "+5", "250", "0.5", ".5", "5.", "-0.125",
+		"1e10", "1E10", "1e+10", "1e-10", "1.5e3", "-1.5E-3", "0e0",
+		strings.Repeat("9", MaxNumericLiteralLen),
+		"1e" + strconv.Itoa(MaxNumericLiteralExp),
+		"1e-" + strconv.Itoa(MaxNumericLiteralExp),
+	}
+	for _, s := range accepted {
+		if !NumericLiteralBounded(s) {
+			t.Errorf("NumericLiteralBounded(%q) = false, want true", s)
+		}
+	}
+
+	rejected := []string{
+		// The vector: a binary exponent scales by a power of two that no decimal-digit
+		// budget bounds, and the pre-fix guard scanned only for 'e'/'E'.
+		"1p1000000", "1P64", "0x1p64", "0X1P1000000", "0x10",
+		// Go literal spellings whose value differs from the decimal a caller wrote.
+		"1_000", "1_0e1_0",
+		// Forms big.Rat/big.Float accept that are not magnitudes at all.
+		"1/3", "Inf", "+Inf", "-Inf", "inf", "NaN",
+		// Structurally malformed.
+		"", " ", "+", "-", ".", "e10", "1e", "1e+", "5abc", "1.2.3", "1 2", "٥",
+		// Over-bound length and exponent.
+		strings.Repeat("9", MaxNumericLiteralLen+1),
+		"1e" + strconv.Itoa(MaxNumericLiteralExp+1),
+		"1e-" + strconv.Itoa(MaxNumericLiteralExp+1),
+		"1e99999999999999999999", // an exponent too long for a machine int
+	}
+	for _, s := range rejected {
+		if NumericLiteralBounded(s) {
+			t.Errorf("NumericLiteralBounded(%q) = true, want false", s)
+		}
+	}
+}
+
+// TestBlastRadiusRejectsANonDecimalStringMagnitude pins the one arm where a caller
+// controls a literal that is NOT constrained by JSON's number grammar. A string tool
+// argument reaches big.Float.SetString directly, and SetString accepts binary exponents
+// and hex floats: "1p100000000" is eleven bytes that render, on the denial path, as
+// hundreds of megabytes of decimal digits — synchronously, inside the per-session
+// decision. It must resolve unquantified (which exceeds every bound) instead.
+func TestBlastRadiusRejectsANonDecimalStringMagnitude(t *testing.T) {
+	c := &EffectContract{Class: EffectIrreversible, BlastRadius: &BlastRadiusSpec{Argument: "amount"}}
+	// Every literal here is one big.Float.SetString accepts ("1/3" is big.Rat's alone,
+	// so it is pinned in the grammar table above rather than through this arm).
+	for _, arg := range []string{"1p100000000", "0x1p1000000", "0x1p64", "1_000", "Inf"} {
+		t.Run(arg, func(t *testing.T) {
+			// Establish that this literal really is one big.Float would have taken, so
+			// the test fails if the guard is the only thing standing between a caller
+			// and the parse.
+			if _, ok := new(big.Float).SetString(arg); !ok {
+				t.Fatalf("precondition: big.Float.SetString(%q) rejected it anyway", arg)
+			}
+			got := ResolveEffect(c, map[string]interface{}{"amount": arg})
+			if got.Quantified() {
+				t.Fatalf("%q must resolve unquantified, got %s", arg, got.BlastRadius.Text('f', -1))
+			}
+			if over, _ := (&EffectCeiling{MaxBlastRadius: num("500")}).Exceeds(got); !over {
+				t.Fatalf("%q resolved unquantified but did not exceed a finite ceiling", arg)
+			}
+		})
+	}
+	// A decimal string magnitude is unaffected — this arm still quantifies.
+	if got := ResolveEffect(c, map[string]interface{}{"amount": " 250 "}); !got.Quantified() ||
+		got.BlastRadius.Text('f', -1) != "250" {
+		t.Fatalf("a decimal string magnitude must still quantify, got %s", got)
 	}
 }
 

@@ -621,3 +621,118 @@ func TestJWTShortCircuitDenyStaysSoftWithAnIntactPin(t *testing.T) {
 		t.Error("a plain JWT authorization deny with no pin break must stay downgradable")
 	}
 }
+
+// TestTier2_BreakAllCoversToolsNotYetBaselined is the regression for a fail-open on a
+// session's FIRST tools/list.
+//
+// BreakAll is what armPinsFromToolsList reaches for when a response is wholly
+// untrustworthy — here, an entry nested past the scan bound, so the names it could be
+// impersonating are unknown rather than none. It used to sweep the baseline map, which on
+// a first listing is still EMPTY: Observe baselines the clean entries only after the walk
+// finishes. Nothing was broken, and the remaining entries of the very response that could
+// not be believed were baselined clean and stayed callable — exactly the case the code
+// says must "poison every pin instead".
+func TestTier2_BreakAllCoversToolsNotYetBaselined(t *testing.T) {
+	deep := `{"description":"leaf"}`
+	for i := 0; i < maxDuplicateKeyScanDepth+10; i++ {
+		deep = `{"p":` + deep + `}`
+	}
+	p := newTestManifestPDP(capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}})
+
+	// One scan-aborting entry beside one perfectly clean tool, on the session's first
+	// listing. A host parses this JSON fine; only the Go scan gives up on it.
+	catalog := json.RawMessage(`{"tools":[{"inputSchema":` + deep + `},` +
+		`{"name":"read_file","description":"Reads a file from disk."}]}`)
+
+	filtered, dec := listAndCall(t, p, "sess-1", "read_file", catalog)
+	if dec.Decision != capability.DecisionDeny {
+		t.Fatalf("a listing whose trust scan aborted must break every tool in the session, got %s", dec.Decision)
+	}
+	if strings.Contains(filtered, "read_file") {
+		t.Fatalf("a broken tool must be hidden from tools/list, got %s", filtered)
+	}
+
+	// Sticky and session-wide: a later CLEAN listing does not reopen the session, and a
+	// tool the upstream advertises for the first time after the break is broken too —
+	// "the impersonation set is unknown" covers names not yet seen.
+	clean := tier2Catalog(t, tier2Tool("read_file", "Reads a file from disk."), tier2Tool("write_file", "Writes a file."))
+	filtered, dec = listAndCall(t, p, "sess-1", "write_file", clean)
+	if dec.Decision != capability.DecisionDeny {
+		t.Fatal("the whole-session break must be sticky across a later clean listing")
+	}
+	if strings.Contains(filtered, "read_file") || strings.Contains(filtered, "write_file") {
+		t.Fatalf("every tool must stay hidden after a whole-session break, got %s", filtered)
+	}
+
+	// Scoped to the session: a different session on the same PDP is unaffected, which is
+	// what makes recovery a new session rather than a proxy restart.
+	if _, dec := listAndCall(t, p, "sess-2", "read_file", clean); dec.Decision != capability.DecisionAllow {
+		t.Fatalf("a fresh session must be unaffected by another session's break, got %s (%+v)", dec.Decision, dec.Denial)
+	}
+}
+
+// TestTier2_BaselineOverflowFailsClosed pins the per-session baseline bound. Tier-2 pins
+// every advertised name and retains removed ones, so a name-rotating upstream could grow
+// the map for the life of the session. At the ceiling the session must break WHOLE rather
+// than drop entries — a dropped baseline is an unpinned tool.
+func TestTier2_BaselineOverflowFailsClosed(t *testing.T) {
+	b := NewSurfaceBaseline()
+	tools := make([]ToolSurface, maxSessionSurfaceEntries)
+	for i := range tools {
+		tools[i] = ToolSurface{Name: fmt.Sprintf("t%d", i), Hash: "h"}
+	}
+	if got := b.Observe("s", tools, true); got != nil {
+		t.Fatalf("filling the baseline to the ceiling must report nothing, got %d findings", len(got))
+	}
+	if b.Broken("s", "t0") {
+		t.Fatal("a session AT the ceiling must not be broken")
+	}
+
+	// One name past it.
+	got := b.Observe("s", []ToolSurface{{Name: "overflow", Hash: "h"}}, true)
+	if len(got) == 0 || got[0].Kind != SurfaceOverflow {
+		t.Fatalf("want an overflow finding, got %+v", got)
+	}
+	if !strings.Contains(got[0].LogLine(), "ERROR drift=tier2") {
+		t.Errorf("an overflow denies, so it must log at ERROR: %s", got[0].LogLine())
+	}
+	for _, name := range []string{"t0", "overflow", "never-advertised"} {
+		if !b.Broken("s", name) {
+			t.Errorf("after overflow every tool must be broken, %q was not", name)
+		}
+	}
+	// Reported once per session, not once per over-cap name on every listing.
+	for _, c := range b.Observe("s", []ToolSurface{{Name: "overflow2", Hash: "h"}}, true) {
+		if c.Kind == SurfaceOverflow {
+			t.Error("the overflow line must be emitted once per session")
+		}
+	}
+}
+
+// TestTier2_RemovalIsReportedOncePerDisappearance pins the advisory to the transition. A
+// removed tool's baseline is retained on purpose, so without this the finding re-fires on
+// every later listing — steady duplicate WARN noise in the one stream an operator greps
+// for genuine break findings.
+func TestTier2_RemovalIsReportedOncePerDisappearance(t *testing.T) {
+	b := NewSurfaceBaseline()
+	both := []ToolSurface{{Name: "a", Hash: "h1"}, {Name: "b", Hash: "h2"}}
+	onlyB := []ToolSurface{{Name: "b", Hash: "h2"}}
+	b.Observe("s", both, true)
+
+	got := b.Observe("s", onlyB, true)
+	if len(got) != 1 || got[0].Tool != "a" || got[0].Kind != SurfaceRemoved {
+		t.Fatalf("the disappearance must be reported once, got %+v", got)
+	}
+	if got := b.Observe("s", onlyB, true); len(got) != 0 {
+		t.Fatalf("a tool that is still absent has not disappeared again, got %+v", got)
+	}
+
+	// It comes back, then goes again: a new transition, reported again.
+	if got := b.Observe("s", both, true); len(got) != 0 {
+		t.Fatalf("a returning tool matching its baseline is not a finding, got %+v", got)
+	}
+	got = b.Observe("s", onlyB, true)
+	if len(got) != 1 || got[0].Kind != SurfaceRemoved {
+		t.Fatalf("a second disappearance must report again, got %+v", got)
+	}
+}

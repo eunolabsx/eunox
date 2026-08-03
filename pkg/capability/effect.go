@@ -11,7 +11,6 @@ import (
 	"math"
 	"math/big"
 	"sort"
-	"strconv"
 	"strings"
 )
 
@@ -473,13 +472,35 @@ func SplitEffectRef(ref string) (id, digest string, ok bool) {
 // and a megabyte of string. Both bounds are therefore needed, and both are far above any
 // literal a real policy or a real tool argument carries — the exact arm exists to compare
 // integers around and above 2^63, which needs tens of digits.
+//
+// Neither bound says anything about a literal outside the decimal grammar: a binary or
+// hex-float exponent scales the value by a power of two that no decimal-digit budget
+// bounds, so NumericLiteralBounded refuses those forms outright rather than sizing them.
 const (
 	MaxNumericLiteralLen = 1024
 	MaxNumericLiteralExp = 1024
 )
 
-// NumericLiteralBounded reports whether a decimal literal is small enough to parse into
-// an arbitrary-precision value without materializing a huge 10^N intermediate.
+// NumericLiteralBounded reports whether s is a DECIMAL numeric literal small enough to
+// parse into an arbitrary-precision value without materializing a huge intermediate.
+//
+// The accepted grammar is exactly
+//
+//	[+-]? ( digits [ "." [digits] ] | "." digits ) ( [eE] [+-]? digits )?
+//
+// within MaxNumericLiteralLen bytes and with an exponent magnitude within
+// MaxNumericLiteralExp. Naming the grammar IS the bound. big.Float.SetString and
+// big.Rat.SetString accept a good deal more than decimal — a binary exponent
+// ("1p1000000"), a hex-float mantissa ("0x1p64"), digit-separating underscores
+// ("1_000"), a rational ("1/3"), the Inf spellings — and a guard that scanned only for
+// an 'e'/'E' exponent bounded none of them. "1p1000000" is nine caller-supplied bytes
+// whose magnitude is a power of TWO the decimal scan never looks at; it parses to a
+// value whose Text('f', -1) render costs seconds of CPU and hundreds of megabytes,
+// synchronously, inside the per-session decision.
+//
+// Restricting to decimal is also the only way the value a caller WRITES is the value
+// the bound compares: SetString reads "0x1p4" as 16 and "1_000" as 1000 — Go literal
+// semantics, not the decimal a policy author or a tool schema means.
 //
 // It lives here, in the package that owns the shared literal grammar, because THREE
 // layers need the identical bound against the identical input class: the JSON-RPC id
@@ -488,26 +509,56 @@ const (
 // copies and the third had none — which is exactly how a guard that everyone "mirrors"
 // ends up missing from the one place a caller can actually reach.
 //
-// An unparseable or over-bound exponent reports false, so every caller falls back to its
-// own documented not-exact path (a float64 comparison, a raw-bytes id, an unquantified
+// Anything outside the grammar — a non-decimal form, an unparseable literal, an
+// over-bound length or exponent — reports false, so every caller falls back to its own
+// documented not-exact path (a float64 comparison, a raw-bytes id, an unquantified
 // blast radius). Each of those is the conservative direction for that caller.
 func NumericLiteralBounded(s string) bool {
-	if len(s) > MaxNumericLiteralLen {
+	if len(s) == 0 || len(s) > MaxNumericLiteralLen {
 		return false
 	}
-	i := strings.IndexAny(s, "eE")
-	if i < 0 {
+	i := 0
+	if s[i] == '+' || s[i] == '-' {
+		i++
+	}
+	mantissa := 0
+	for ; i < len(s) && isASCIIDigit(s[i]); i++ {
+		mantissa++
+	}
+	if i < len(s) && s[i] == '.' {
+		for i++; i < len(s) && isASCIIDigit(s[i]); i++ {
+			mantissa++
+		}
+	}
+	if mantissa == 0 {
+		return false // "", "+", ".", "0x1p4", "Inf", "abc" — no decimal mantissa
+	}
+	if i == len(s) {
 		return true // no exponent: only the length cap applies
 	}
-	v, err := strconv.Atoi(strings.TrimPrefix(s[i+1:], "+"))
-	if err != nil {
+	if s[i] != 'e' && s[i] != 'E' {
+		return false // a trailing 'p', '_', '/', or anything else is not decimal
+	}
+	i++
+	if i < len(s) && (s[i] == '+' || s[i] == '-') {
+		i++
+	}
+	exp, digits := 0, 0
+	for ; i < len(s) && isASCIIDigit(s[i]); i++ {
+		digits++
+		if exp <= MaxNumericLiteralExp {
+			// Accumulation stops once the bound is passed, so a million-digit
+			// exponent cannot overflow the int on its way to being rejected.
+			exp = exp*10 + int(s[i]-'0')
+		}
+	}
+	if digits == 0 || i != len(s) {
 		return false
 	}
-	if v < 0 {
-		v = -v
-	}
-	return v <= MaxNumericLiteralExp
+	return exp <= MaxNumericLiteralExp
 }
+
+func isASCIIDigit(c byte) bool { return c >= '0' && c <= '9' }
 
 // ParseBlastRadiusNumber converts a numeric literal to an exact big.Float, so a bound
 // above 2^53 is compared exactly rather than through a lossy float64 widening (the same
@@ -743,11 +794,16 @@ func (s *BlastRadiusSpec) resolveRaw(args map[string]interface{}) (*big.Float, b
 		}
 		return new(big.Float).SetFloat64(v), true
 	case string:
-		// A numeric string ("250") is a magnitude; anything else is not. This does NOT
-		// fall through to counting characters — a free-form string has no magnitude, and
-		// inventing one would be exactly the inference this layer refuses to do. The same
-		// literal bound applies: a string argument is caller-supplied too, and a
-		// multi-million-digit one costs the same superlinear parse as the numeric form.
+		// A DECIMAL numeric string ("250") is a magnitude; anything else is not. This does
+		// NOT fall through to counting characters — a free-form string has no magnitude,
+		// and inventing one would be exactly the inference this layer refuses to do.
+		//
+		// This is the one arm where the literal reaching SetString is BOTH caller-supplied
+		// and free of JSON's number grammar: the json.Number arm above cannot spell a
+		// binary exponent or a hex float, and this one can. NumericLiteralBounded is
+		// therefore load-bearing here in full — length, exponent, AND decimal-only — since
+		// "1p100000000" is eleven bytes whose render would cost seconds and hundreds of
+		// megabytes on the per-session decision path.
 		t := strings.TrimSpace(v)
 		if !NumericLiteralBounded(t) {
 			return nil, false

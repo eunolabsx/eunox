@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strconv"
 	"sync"
 
 	"github.com/eunolabs/eunox/pkg/capability"
@@ -79,9 +80,30 @@ const (
 	// SurfaceRemoved — a baselined tool is absent from a later tools/list. Advisory for
 	// the same reason. The baseline entry is deliberately RETAINED, so a tool that
 	// disappears and returns with a rewritten surface still trips a break rather than
-	// being re-baselined to the rewritten value.
+	// being re-baselined to the rewritten value. Reported once per disappearance, not on
+	// every listing that continues to omit it.
 	SurfaceRemoved SurfaceChangeKind = "removed"
+	// SurfaceOverflow — the session's baseline reached maxSessionSurfaceEntries. The
+	// session is sticky-broken WHOLE (every tool denied, every tool hidden) rather than
+	// dropping the entry, which would silently leave a tool unpinned. Reported once per
+	// session, at ERROR: it denies.
+	SurfaceOverflow SurfaceChangeKind = "overflow"
 )
+
+// maxSessionSurfaceEntries bounds one session's Tier-2 baseline.
+//
+// Tier-2 pins EVERY advertised tool and retains a removed tool's baseline, so the map is
+// upstream-driven and grows across listings: a name-rotating server advertising fresh
+// names each time adds a batch per tools/list, for the life of a long-lived stdio session
+// or a slowly-reaped HTTP one. (The FM-5 map next to it cannot be flooded — it is keyed
+// off the operator's pinnedTools — which is precisely the bound Tier-2 gave up by
+// covering the tools nobody pinned.)
+//
+// At the ceiling the session fails closed, in the pin's own idiom: sticky-broken whole,
+// one ERROR line. Not dropping entries — a dropped baseline is an UNPINNED tool, which is
+// the fail-open direction — and not evicting the oldest, which an upstream could drive to
+// evict exactly the tool it means to rewrite. 100k names is far past any real catalog.
+const maxSessionSurfaceEntries = 100_000
 
 // SurfaceChange is one Tier-2 finding. Baseline and Observed are the surface hashes
 // either side of the comparison; both are empty for an added/removed finding.
@@ -112,6 +134,20 @@ type sessionSurface struct {
 	established bool
 	hashes      map[string]string
 	broken      map[string]struct{}
+	// allBroken is the sticky whole-session break BreakAll sets: every tool in this
+	// session is denied and hidden, whether or not it was ever baselined. A flag rather
+	// than a sweep over hashes, because the tools BreakAll must cover are exactly the
+	// ones a sweep cannot see — the not-yet-baselined ones on the response that
+	// triggered it, and any the upstream advertises later.
+	allBroken bool
+	// overflowed marks that maxSessionSurfaceEntries was hit, so the ERROR line is
+	// emitted once for the session rather than once per over-cap tool per listing.
+	overflowed bool
+	// reportedGone holds the baselined tools whose disappearance has already been
+	// reported. A removal is a per-disappearance event; without this, a tool that
+	// vanishes once logs on EVERY later listing, filling the stream that carries breaks.
+	// A tool seen again is dropped from the set, so a second disappearance reports again.
+	reportedGone map[string]struct{}
 }
 
 // NewSurfaceBaseline creates an empty Tier-2 baseline.
@@ -162,9 +198,22 @@ func (b *SurfaceBaseline) Observe(sessionID string, tools []ToolSurface, complet
 	seen := make(map[string]struct{}, len(tools))
 	for _, t := range tools {
 		seen[t.Name] = struct{}{}
+		// Present again: a later disappearance is a new event and reports again.
+		delete(s.reportedGone, t.Name)
 		baseline, known := s.hashes[t.Name]
 		switch {
 		case !known:
+			if len(s.hashes) >= maxSessionSurfaceEntries {
+				// Fail closed for the session instead of baselining an unbounded set. The
+				// tool is NOT recorded, so the map stops growing; allBroken is what keeps
+				// that from meaning "unpinned". See maxSessionSurfaceEntries.
+				s.allBroken = true
+				if !s.overflowed {
+					s.overflowed = true
+					changes = append(changes, SurfaceChange{Tool: t.Name, Kind: SurfaceOverflow})
+				}
+				continue
+			}
 			s.hashes[t.Name] = t.Hash
 			if reportMembership {
 				changes = append(changes, SurfaceChange{Tool: t.Name, Kind: SurfaceAdded})
@@ -183,12 +232,20 @@ func (b *SurfaceBaseline) Observe(sessionID string, tools []ToolSurface, complet
 		// as a set, and map order would make two identical sessions log differently.
 		var gone []string
 		for name := range s.hashes {
-			if _, still := seen[name]; !still {
-				gone = append(gone, name)
+			if _, still := seen[name]; still {
+				continue
 			}
+			if _, already := s.reportedGone[name]; already {
+				continue // its disappearance was reported; it has not disappeared again
+			}
+			gone = append(gone, name)
 		}
 		sort.Strings(gone)
 		for _, name := range gone {
+			if s.reportedGone == nil {
+				s.reportedGone = make(map[string]struct{})
+			}
+			s.reportedGone[name] = struct{}{}
 			changes = append(changes, SurfaceChange{Tool: name, Kind: SurfaceRemoved})
 		}
 	}
@@ -214,21 +271,26 @@ func (b *SurfaceBaseline) MarkBroken(sessionID string, tools ...string) {
 	}
 }
 
-// BreakAll sticky-breaks every tool this session has baselined. Reserved for an ambiguity
-// that taints a WHOLE tools/list response — an entry whose bytes aborted the trust scan
-// before its name set was known, so the names it could be impersonating are UNKNOWN
-// rather than none. Scoped to the session (Tier-2's whole state is), so recovery is a new
-// session rather than a proxy restart.
+// BreakAll sticky-breaks EVERY tool in this session — baselined or not, now or later.
+// Reserved for an ambiguity that taints a WHOLE tools/list response: an entry whose bytes
+// aborted the trust scan before its name set was known, so the names it could be
+// impersonating are UNKNOWN rather than none. Scoped to the session (Tier-2's whole state
+// is), so recovery is a new session rather than a proxy restart.
+//
+// It sets a flag rather than sweeping the baseline map, because the tools it has to cover
+// are the ones a sweep cannot see. On a session's FIRST tools/list the map is still empty
+// — Observe baselines the clean entries only after this walk finishes — so a sweep broke
+// nothing at all, and the remaining entries of the very response that could not be
+// believed were then baselined clean and stayed callable. That is the case this exists
+// for. The flag also covers tools a later listing adds, which is what "the impersonation
+// set is unknown" means once the response naming them is untrustworthy.
 func (b *SurfaceBaseline) BreakAll(sessionID string) {
 	if b == nil {
 		return
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	s := b.session(sessionID)
-	for name := range s.hashes {
-		s.broken[name] = struct{}{}
-	}
+	b.session(sessionID).allBroken = true
 }
 
 // session returns the session's state, creating it if absent. Callers hold b.mu.
@@ -244,14 +306,18 @@ func (b *SurfaceBaseline) session(sessionID string) *sessionSurface {
 	if s.broken == nil {
 		s.broken = make(map[string]struct{})
 	}
+	if s.reportedGone == nil {
+		s.reportedGone = make(map[string]struct{})
+	}
 	return s
 }
 
-// Broken reports whether a tool's Tier-2 pin has been broken in this session, i.e.
-// whether its advertised surface was ever observed to differ from the session's
-// baseline. Consulted on the tools/call leg (a hard deny) and by the tools/list filter
-// (the tool is hidden), so the catalog a host is shown never contains a tool its call
-// leg will reject.
+// Broken reports whether a tool's Tier-2 pin has been broken in this session — because
+// its advertised surface was observed to differ from the session's baseline, because an
+// untrustworthy entry could have been impersonating it (MarkBroken), or because the whole
+// session is broken (BreakAll, or a baseline overflow). Consulted on the tools/call leg (a
+// hard deny) and by the tools/list filter (the tool is hidden), so the catalog a host is
+// shown never contains a tool its call leg will reject.
 func (b *SurfaceBaseline) Broken(sessionID, tool string) bool {
 	if b == nil {
 		return false
@@ -261,6 +327,9 @@ func (b *SurfaceBaseline) Broken(sessionID, tool string) bool {
 	s := b.sessions[sessionID]
 	if s == nil {
 		return false
+	}
+	if s.allBroken {
+		return true
 	}
 	_, broken := s.broken[tool]
 	return broken
@@ -294,6 +363,10 @@ func (c SurfaceChange) LogLine() string {
 	case SurfaceRemoved:
 		return "[eunox] WARN drift=tier2 tool=" + quote(c.Tool) +
 			" — tool disappeared after the session's interface baseline was taken; its baseline is retained, so a return with a changed surface still trips a pin break"
+	case SurfaceOverflow:
+		return "[eunox] ERROR drift=tier2 tool=" + quote(c.Tool) +
+			" — the upstream advertised more than " + strconv.Itoa(maxSessionSurfaceEntries) +
+			" distinct tool names in this session, past the interface-pinning baseline's bound; every tool is now denied and hidden for the rest of this session (an upstream rotating tool names is itself anomalous). Recovery is a new session"
 	default:
 		return "[eunox] WARN drift=tier2 tool=" + quote(c.Tool)
 	}

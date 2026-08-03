@@ -100,6 +100,30 @@ const MaxWindowSeconds = min(
 // maxCalls the quota).
 const MaxEntries = math.MaxInt32
 
+// MaxWeightedEntriesPerKey bounds the live entries ONE (key, window) may hold under
+// WEIGHTED accounting, in both backends.
+//
+// A counted bucket needs no such bound: it is refused once its in-window count reaches
+// its limit, so its limit IS its retention. A weighted bucket's total is the SUM of its
+// entries' magnitudes, and a magnitude is caller-controlled whenever the contract
+// resolves it from a tool argument — so a session sending many calls of weight ~1e-9
+// under a maxTotal of 1000 is admitted, and recorded, indefinitely. Each later
+// admission re-sums the whole set: O(n) under the in-memory backend's global lock
+// (stalling every quota check proxy-wide) and O(n) inside the Redis backend's blocking
+// Lua script (stalling every replica). Nothing is bypassed — the sum stays exact — but
+// the work per call grows without bound, driven by call arguments.
+//
+// At the ceiling the commit is REFUSED with a structured error, the same trade
+// WithMaxKeys makes: availability for that one (key, window) while it is full, never a
+// bypass, and entries age out of the window on their own. The alternative — silently
+// declining to RECORD a call past the ceiling — is a fail-open: N unrecorded
+// near-threshold magnitudes sum to real unmetered spend.
+//
+// 100k is far above any real policy. A bucket bounded at $2,000/hour holds one entry
+// per call; reaching the ceiling takes 100k calls of that tool within one window, which
+// is the abusive shape this bounds and not a working deployment.
+const MaxWeightedEntriesPerKey = 100_000
+
 // checkWindowSec is the single guardrail both call-counter backends call before any
 // duration arithmetic. It rejects a non-positive window (no meaningful span) and
 // one above MaxWindowSeconds (which overflows time.Duration), so an out-of-range
