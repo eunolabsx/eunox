@@ -137,11 +137,15 @@ upstreams:
 	}
 }
 
-// failOnUnsetBracedEnvRef ignores the "$$" escape exactly as the other guards do, so an
-// operator escaping a literal dollar is not told a variable is unset.
+// The braced-only guard ignores the "$$" escape exactly as the full one does, so an operator
+// escaping a literal dollar is not told a variable is unset. The escape is deliberately NOT
+// part of what a grammar narrows: it is how a literal "${" is written at all, which a
+// braced-only field needs as much as a full one.
 func TestFailOnUnsetBracedEnvRef_SkipsEscapes(t *testing.T) {
-	if err := failOnUnsetBracedEnvRef("cfg.yaml", "upstream \"x\" command", "$${NOT_A_REF}"); err != nil {
-		t.Errorf("escaped $$ treated as a reference: %v", err)
+	for _, g := range []envGrammar{envGrammarFull, envGrammarBraced, envGrammarURL} {
+		if err := failOnUnsetEnvRefUnder("cfg.yaml", "upstream \"x\" command", "$${NOT_A_REF}", g); err != nil {
+			t.Errorf("escaped $$ treated as a reference under grammar %d: %v", g, err)
+		}
 	}
 }
 
@@ -213,4 +217,198 @@ upstreams:
 	if !strings.Contains(err.Error(), "EUNOX_TEST_NO_SUCH_TENANT") {
 		t.Errorf("error = %q, want it to name the unset variable", err)
 	}
+}
+
+// TestLoadGatewayConfig_BareDollarInURLQueryIsNotSubstituted is the other half of the split,
+// and the one the guard fix left open. The guard governs REFUSAL; expansion governs REWRITING.
+// A bare "$filter" in a query no longer fails startup, but the tree-wide expansion still
+// substituted it whenever a variable of that name happened to be set — a valid OData URL
+// rewritten into something else, silently, on the field that decides which upstream the proxy
+// talks to. "$$" escaped it, which is an escape an operator only learns about after the URL
+// breaks.
+func TestLoadGatewayConfig_BareDollarInURLQueryIsNotSubstituted(t *testing.T) {
+	t.Setenv("filter", "PWNED")
+	t.Setenv("select", "PWNED")
+	t.Setenv("frag", "PWNED")
+	const raw = "https://api.example.com/odata?$filter=name eq 'x'&$select=id#$frag"
+	cfg, err := LoadGatewayConfig(writeConfig(t, `
+schemaVersion: "0.1"
+transport: http
+listen:
+  bind: "127.0.0.1:9000"
+upstreams:
+  - name: odata
+    transport: http
+    upstreamUrl: "`+raw+`"
+    policy: ["odata.yaml"]
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := cfg.Upstreams[0].UpstreamURL; got != raw {
+		t.Errorf("upstreamUrl = %q, want the query and fragment preserved verbatim (%q)", got, raw)
+	}
+}
+
+// The authority half still expands the bare form: that is where a "$HOST" is a reference by
+// any reading, and narrowing it would be a silent loss of a working spelling.
+func TestLoadGatewayConfig_BareDollarInURLAuthorityStillExpands(t *testing.T) {
+	t.Setenv("EUNOX_TEST_HOST", "api.internal")
+	cfg, err := LoadGatewayConfig(writeConfig(t, `
+schemaVersion: "0.1"
+transport: http
+listen:
+  bind: "127.0.0.1:9000"
+upstreams:
+  - name: api
+    transport: http
+    upstreamUrl: "https://$EUNOX_TEST_HOST/mcp?$filter=x"
+    policy: ["api.yaml"]
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got, want := cfg.Upstreams[0].UpstreamURL, "https://api.internal/mcp?$filter=x"; got != want {
+		t.Errorf("upstreamUrl = %q, want %q — full grammar in the authority, braced-only in the query", got, want)
+	}
+}
+
+// The braced form is substituted everywhere in the URL, query included: it is unambiguous
+// intent, which is exactly why the guard still refuses it there when unset.
+func TestLoadGatewayConfig_BracedRefInURLQueryStillExpands(t *testing.T) {
+	t.Setenv("EUNOX_TEST_TENANT", "acme")
+	cfg, err := LoadGatewayConfig(writeConfig(t, `
+schemaVersion: "0.1"
+transport: http
+listen:
+  bind: "127.0.0.1:9000"
+upstreams:
+  - name: api
+    transport: http
+    upstreamUrl: "https://api.example.com/mcp?tenant=${EUNOX_TEST_TENANT}&$filter=x"
+    policy: ["api.yaml"]
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got, want := cfg.Upstreams[0].UpstreamURL, "https://api.example.com/mcp?tenant=acme&$filter=x"; got != want {
+		t.Errorf("upstreamUrl = %q, want %q", got, want)
+	}
+}
+
+// TestLoadGatewayConfig_BareDollarInArgvIsNotSubstituted is the same fix on the other
+// braced-only field family. argv is passed verbatim to another program, which is why its GUARD
+// was already braced-only — and why substituting a bare "$anchor" there was the same silent
+// rewrite: a regex, a jq expression, or anything the child interpolates itself.
+func TestLoadGatewayConfig_BareDollarInArgvIsNotSubstituted(t *testing.T) {
+	t.Setenv("anchor", "PWNED")
+	t.Setenv("HOME2", "PWNED")
+	cfg, err := LoadGatewayConfig(writeConfig(t, `
+schemaVersion: "0.1"
+transport: stdio
+upstreams:
+  - name: fs
+    transport: stdio
+    command: "/usr/bin/tool$anchor"
+    args: ["--match=^x$anchor", "--home=$HOME2"]
+    policy: ["fs.yaml"]
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got, want := cfg.Upstreams[0].Command, "/usr/bin/tool$anchor"; got != want {
+		t.Errorf("command = %q, want %q verbatim", got, want)
+	}
+	if got, want := cfg.Upstreams[0].Args, []string{"--match=^x$anchor", "--home=$HOME2"}; len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("args = %q, want %q verbatim — the grammar declared on the slice applies to each element", got, want)
+	}
+}
+
+// And the braced form still expands in argv, so an operator's ${SERVER_BIN} keeps working.
+func TestLoadGatewayConfig_BracedRefInArgvStillExpands(t *testing.T) {
+	t.Setenv("EUNOX_TEST_BIN", "/opt/mcp/server")
+	t.Setenv("EUNOX_TEST_ROOT", "/srv")
+	cfg, err := LoadGatewayConfig(writeConfig(t, `
+schemaVersion: "0.1"
+transport: stdio
+upstreams:
+  - name: fs
+    transport: stdio
+    command: "${EUNOX_TEST_BIN}"
+    args: ["--root=${EUNOX_TEST_ROOT}"]
+    policy: ["fs.yaml"]
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := cfg.Upstreams[0].Command; got != "/opt/mcp/server" {
+		t.Errorf("command = %q, want the braced reference expanded", got)
+	}
+	if got := cfg.Upstreams[0].Args; len(got) != 1 || got[0] != "--root=/srv" {
+		t.Errorf("args = %q, want the braced reference expanded", got)
+	}
+}
+
+// TestEnvGrammar_GuardAndExpansionReadOneDeclaration pins the property the whole type exists
+// for: for any given field, the spellings the guard treats as references are exactly the ones
+// the expansion substitutes. They were two independent rules, and the gap between them is what
+// let a URL query be refused by one and rewritten by the other.
+func TestEnvGrammar_GuardAndExpansionReadOneDeclaration(t *testing.T) {
+	t.Setenv("EUNOX_TEST_SET", "value")
+	for name, tc := range map[string]struct {
+		grammar    envGrammar
+		raw        string
+		recognized bool // does this field's grammar treat the reference as one?
+	}{
+		"bare in a full field":            {envGrammarFull, "$EUNOX_TEST_SET", true},
+		"braced in a full field":          {envGrammarFull, "${EUNOX_TEST_SET}", true},
+		"bare in a braced-only field":     {envGrammarBraced, "$EUNOX_TEST_SET", false},
+		"braced in a braced-only field":   {envGrammarBraced, "${EUNOX_TEST_SET}", true},
+		"bare in a URL authority":         {envGrammarURL, "https://$EUNOX_TEST_SET/x", true},
+		"bare in a URL query":             {envGrammarURL, "https://h/x?$EUNOX_TEST_SET=1", false},
+		"braced in a URL query":           {envGrammarURL, "https://h/x?${EUNOX_TEST_SET}=1", true},
+		"bare in a URL fragment":          {envGrammarURL, "https://h/x#$EUNOX_TEST_SET", false},
+		"bare in a URL path before query": {envGrammarURL, "https://h/$EUNOX_TEST_SET?a=1", true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			// The expansion half: a recognized reference is substituted, an unrecognized
+			// one is left exactly as written.
+			expanded := expandEnvRefsUnder(tc.raw, tc.grammar)
+			if got := expanded != tc.raw; got != tc.recognized {
+				t.Errorf("expansion rewrote %q to %q; recognized = %v, want %v", tc.raw, expanded, got, tc.recognized)
+			}
+			// The guard half, asked about the same spelling with the variable UNSET: a
+			// recognized reference is refused, an unrecognized one is literal text.
+			unset := strings.ReplaceAll(tc.raw, "EUNOX_TEST_SET", "EUNOX_TEST_UNSET_XYZ")
+			err := failOnUnsetEnvRefUnder("cfg.yaml", "field", unset, tc.grammar)
+			if got := err != nil; got != tc.recognized {
+				t.Errorf("guard on %q returned %v; recognized = %v, want %v", unset, err, got, tc.recognized)
+			}
+		})
+	}
+}
+
+// TestDeclaredEnvGrammar_ReadsTheFieldsOwnTag is the other half of "one declaration": the
+// guards' grammars come from the same struct tags the expansion walk reads, so a field whose
+// declaration changes cannot leave the guard on the old rule.
+func TestDeclaredEnvGrammar_ReadsTheFieldsOwnTag(t *testing.T) {
+	if upstreamURLEnvGrammar != envGrammarURL {
+		t.Errorf("upstreamUrl guard grammar = %d, want the URL grammar its field declares", upstreamURLEnvGrammar)
+	}
+	if upstreamCommandEnvGrammar != envGrammarBraced || upstreamArgsEnvGrammar != envGrammarBraced {
+		t.Errorf("command/args guard grammars = %d/%d, want braced-only", upstreamCommandEnvGrammar, upstreamArgsEnvGrammar)
+	}
+	if got := declaredEnvGrammar[UpstreamConfig]("upstreamAuthHeader"); got != envGrammarFull {
+		t.Errorf("an undeclared field = %d, want the full default", got)
+	}
+	// A field name that stops resolving must be loud, not silently full: falling back would
+	// restore exactly the guard/expansion mismatch this lookup removes.
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Error("declaredEnvGrammar must panic on a field name it cannot resolve")
+			}
+		}()
+		_ = declaredEnvGrammar[UpstreamConfig]("noSuchField")
+	}()
 }

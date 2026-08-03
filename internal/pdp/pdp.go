@@ -1265,7 +1265,8 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 		// here would leak on exactly the principal-scoped-miss shape the descriptionHash pin
 		// above is positioned to catch.
 		resp := p.withForwardObligations(ctx, denyResponse(p.engineClock(), capability.ErrCodeAuthorizationFailed, "",
-			fmt.Sprintf("%s %q is not listed in the capability manifest", target.Type, target.Name)), target)
+			fmt.Sprintf("%s %q is not listed in the capability manifest", target.Type, target.Name)), target,
+			func() []capability.Directive { return p.directivesNamingTarget(target) })
 		// Record the antecedent here too, matching every other downgradable deny branch.
 		// Under --audit this deny is forwarded and the manifest-absent tool actually RUNS,
 		// so omitting the record left a later enforced sequenceBlock naming it Peeking an
@@ -1723,11 +1724,17 @@ func (p *ManifestPDP) withForwardObligationsFor(ctx context.Context, r capabilit
 // the response is about to be forwarded, and any entry declaring a field of this target
 // redactable is reason enough to mask it. A no-match deny is only ever forwarded by a
 // route-level --audit, so this is a no-op on an enforce route.
-func (p *ManifestPDP) withForwardObligations(ctx context.Context, r capability.EnforceResponse, target EnforceTarget) capability.EnforceResponse {
+//
+// naming supplies that wider selection, and is a thunk so the walk happens only past the
+// forwardability gate below — the enforce-route path resolves nothing. The caller passes it
+// rather than this function reaching for directivesNamingTarget itself, so each site states
+// WHICH selection it is filling from: HardenRefusal passes its hardenSelection's, where the
+// two selections sit side by side and the widening is documented.
+func (p *ManifestPDP) withForwardObligations(ctx context.Context, r capability.EnforceResponse, target EnforceTarget, naming namingSelector) capability.EnforceResponse {
 	if r.Decision == capability.DecisionAllow || len(r.Obligations) > 0 || !enforcement.SkipQuota(ctx) {
 		return r
 	}
-	dirs := p.directivesNamingTarget(target)
+	dirs := naming()
 	chain := delegationFromContext(ctx)
 	// No early return on `len(dirs) == 0`: a delegated caller whose hops compose a
 	// redactFields list must have it applied even when no manifest entry names this target,
@@ -1937,30 +1944,59 @@ func (p *ManifestPDP) hardenOnEffectCeiling(ctx context.Context, sessionID strin
 	return p.withForwardObligationsFor(ctx, out, matched), true
 }
 
-// hardenSelection is the constraint (and the claims it was selected under) that
-// HardenRefusal's legs judge a refused request against — resolved ONCE per call and
-// passed down, rather than each leg re-deriving it from the same context and target.
+// namingSelector resolves the wider of HardenRefusal's two selections on demand. It is a
+// thunk rather than a resolved slice because only the last leg reaches it, and only on a
+// forwardable refusal: resolving eagerly would add a full walk of p.caps to every enforce-route
+// refusal, which does none today.
+type namingSelector func() []capability.Directive
+
+// hardenSelection is every selection HardenRefusal's legs make, resolved ONCE per call and
+// passed down rather than re-derived by each leg from the same context and target.
 //
-// matched is nil when no capability covers this target for this principal, or when the
-// one that does does not permit the target's required action: both mean there is no
-// authored rule for a harden leg to speak for, so every leg treats it as "leave the
-// outer layer's refusal alone". Folding that into the selection is what keeps the two
-// legs from drifting on which of them is the stricter test.
+// There are TWO of them, and they are deliberately different questions. Naming that here is
+// the point of the type: the difference used to live implicitly in which helper a leg happened
+// to call, and collapsing it is a fail-open with nothing to notice it.
 type hardenSelection struct {
-	claims  map[string]interface{}
+	// claims are the request's, resolved once — the input BOTH selections are judged under
+	// (matched applies them, naming deliberately does not).
+	claims map[string]interface{}
+
+	// matched answers "which authored rule governs this call": findConstraint under the
+	// request's claims, then decideTarget's own action check, so a harden leg speaks only for
+	// a constraint the enforced path would itself have matched.
+	//
+	// nil when no capability covers this target for this principal, or when the one that does
+	// does not permit the target's required action: both mean there is no authored rule for a
+	// harden leg to speak for, so every leg treats it as "leave the outer layer's refusal
+	// alone". Folding that into the selection is what keeps the two legs from drifting on
+	// which of them is the stricter test.
 	matched *capability.Constraint
+
+	// naming answers a different question — "what must be masked before this response
+	// leaves" — and is deliberately WIDER than matched: every capability NAMING the target,
+	// principal scoping IGNORED. The response is about to be forwarded by an --audit route,
+	// and any entry declaring a field of this target redactable is reason enough to mask it.
+	//
+	// It must STAY wider. Narrowing it to matched — the obvious "dedup" once both live on one
+	// struct — would drop a redaction that fires today on exactly the principal-scoped-miss
+	// shape this fill exists for: a leak, and a fail-open on the seam that closes it.
+	naming namingSelector
 }
 
-// selectForHardening resolves the hardening legs' shared inputs. It applies decideTarget's
-// own selection rule — findConstraint under the request's claims, then the action check —
-// so a harden leg speaks only for a constraint the enforced path would itself have matched.
+// selectForHardening resolves the hardening legs' shared inputs, both selections included, so
+// that one function owns every selection the harden path makes and the widening between them is
+// visible rather than implicit in which helper a leg reaches for.
 func (p *ManifestPDP) selectForHardening(ctx context.Context, target EnforceTarget) hardenSelection {
 	claims := jwtClaimsAsMap(ctx)
 	matched := p.findConstraint(target, claims)
 	if matched != nil && !containsAction(matched.Actions, requiredActionFor(target.Type)) {
 		matched = nil
 	}
-	return hardenSelection{claims: claims, matched: matched}
+	return hardenSelection{
+		claims:  claims,
+		matched: matched,
+		naming:  func() []capability.Directive { return p.directivesNamingTarget(target) },
+	}
 }
 
 // HardenRefusal composes this PDP's own verdicts onto a refusal another layer produced.
@@ -1987,10 +2023,12 @@ func (p *ManifestPDP) HardenRefusal(ctx context.Context, sessionID string, r cap
 	if hardened, broke := p.hardenOnBrokenInterface(sessionID, r, target); broke {
 		return hardened
 	}
-	// Selected ONCE for all three legs below. Each used to re-resolve the claims and
-	// re-walk p.caps for the same target — three full passes over identical inputs on a
-	// path that only ever runs for an already-refused call — and, more to the point, two
-	// hand-written copies of one selection rule that had to stay in agreement.
+	// Selected ONCE for all three legs below. Each used to re-resolve the claims and re-walk
+	// p.caps for the same target — three full passes over identical inputs on a path that only
+	// ever runs for an already-refused call — and, more to the point, the selection RULES were
+	// hand-written copies that had to stay in agreement. The third leg's rule is deliberately a
+	// different, wider one; it lives on the same struct now so that the difference is stated
+	// rather than inferred from which helper each leg happened to call. See hardenSelection.
 	sel := p.selectForHardening(ctx, target)
 	if hardened, over := p.hardenOnEffectCeiling(ctx, sessionID, r, target, args, sel); over {
 		return hardened
@@ -1998,7 +2036,7 @@ func (p *ManifestPDP) HardenRefusal(ctx context.Context, sessionID string, r cap
 	if hardened, unapproved := p.hardenOnUnapprovedDeclassify(ctx, sessionID, r, target, args, sel); unapproved {
 		return hardened
 	}
-	return p.withForwardObligations(ctx, r, target)
+	return p.withForwardObligations(ctx, r, target, sel.naming)
 }
 
 // hardenOnUnapprovedDeclassify replaces an outer layer's downgradable refusal with the

@@ -353,6 +353,12 @@ type HTTPProxy struct {
 	// so a raced registration is simply rejected (the caller retries) rather than the
 	// registry being closed forever. See reapAllKilledSessions and registerSession.
 	reapGen uint64
+	// revoked wakes the reclaim worker (reclaimOnRevocation) when the kill switch reports
+	// that its local view gained a revocation. One buffered slot, so a burst coalesces into
+	// one sweep and a revocation raised before the worker starts is not lost. Written only by
+	// onRevocation's non-blocking send, so the kill switch's delivery goroutines are never
+	// stalled by a sweep.
+	revoked chan struct{}
 	// establishing counts sessions that have RESERVED a maxSessions slot but have not
 	// registered into sessions yet — they are between tryReserveSessionSlot and
 	// registerSession, spending up to sessionStartTimeout on an upstream spawn,
@@ -455,7 +461,7 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 			fmt.Fprintf(os.Stderr, "[eunox] WARNING: listen.trustedProxyCIDRs entry %q is not a valid CIDR and will never be trusted: %v\n", cidr, err)
 		}
 	}
-	return &HTTPProxy{
+	p := &HTTPProxy{
 		jwtPDP:             opts.JWTPDP,
 		oauthMeta:          opts.OAuthMeta,
 		oauthMetaURL:       opts.OAuthMetaURL,
@@ -481,6 +487,46 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 		loopbackPinHosts:   buildLoopbackPinHosts(opts.AllowedOrigins),
 		routes:             opts.Routes,
 		sessions:           make(map[string]*httpSession),
+		revoked:            make(chan struct{}, 1),
+	}
+	// Registered at construction rather than at Serve, so a kill delivered during startup is
+	// not lost: the trigger is one buffered slot, so a revocation raised before the worker
+	// exists is coalesced into it and served by the first tick of the worker.
+	opts.KS.ObserveRevocations(p.onRevocation)
+	return p
+}
+
+// onRevocation is the kill switch's callback (killswitch.Manager.ObserveRevocations): it wakes
+// the reclaim worker and returns.
+//
+// It must not block, and it does not: the send is non-blocking onto a one-slot channel, so a
+// burst of revocations coalesces into a single sweep instead of one goroutine per event each
+// walking the whole registry. The caller is the backend's single real-time kill-event consumer
+// (its pub/sub listener) or its reconcile loop, and stalling either would delay the delivery of
+// every LATER kill on this instance — a kill switch made slower by its own reclaim.
+//
+// The event's fields are deliberately unused. A Revocation is a trigger, not a work list: the
+// sweep re-asks the kill switch about each session it actually holds, through the same
+// predicate the idle reaper uses, so an AGENT-scoped kill needs no agent→session map here and
+// the two paths cannot disagree about what "killed" means.
+func (p *HTTPProxy) onRevocation(killswitch.Revocation) {
+	select {
+	case p.revoked <- struct{}{}:
+	default: // a sweep is already pending; it will observe this kill too
+	}
+}
+
+// reclaimOnRevocation runs until ctx is done, sweeping for killed sessions each time the kill
+// switch reports a revocation. One worker, so concurrent revocations produce one sweep at a
+// time rather than a fan-out that could close the same session from N goroutines.
+func (p *HTTPProxy) reclaimOnRevocation(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.revoked:
+			p.reapKilledSessions() //nolint:contextcheck // teardown path: close()'s upstream session-termination DELETE intentionally uses a detached, bounded background context, as every other reap site does.
+		}
 	}
 }
 
@@ -727,6 +773,14 @@ func (p *HTTPProxy) Serve(ctx context.Context) error {
 	if p.sessionIdleMs > 0 {
 		go p.reapIdleSessions(reaperCtx)
 	}
+	// Reclaim on a kill's own DELIVERY, on the same cancelable child. Deliberately NOT gated
+	// on sessionIdleMs: the idle reaper's killed arm is the backstop, and it does not run at
+	// all under sessionIdleTimeoutMs: 0 — a documented, valid config on which a
+	// Redis-delivered kill (a sibling instance's /control/kill, or `eunox kill --redis-addr`)
+	// denied all traffic but reclaimed nothing, leaving the subprocess, the session slot and
+	// the SSE stream pinned until the process exited. It also removes the up-to-one-sweep
+	// (<=30s) reclaim latency the backstop carries even when it IS running.
+	go p.reclaimOnRevocation(reaperCtx)
 
 	// Teardown for EVERY Serve return path — a graceful ctx cancel OR a srv.Serve
 	// error (listener failure) — as a single defer so no return arm can forget it

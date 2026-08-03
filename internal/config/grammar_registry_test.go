@@ -198,53 +198,49 @@ func TestPolicyPredicates_DeriveFromEveryTokensDeclaredClass(t *testing.T) {
 	assert.True(t, seen[capability.StateNonAtomic], "no token in the vocabulary needs the decision turn")
 }
 
-// TestSubsystemGates_DeriveFromEveryTokensDeclaredSubsystems is the CONSUMER-side half of the
-// engine-subsystem gate, the twin of the state-class test above. pkg/capability's own test
-// proves every token declares its subsystems; this proves the manifest-level predicate the
-// route builder gates on actually reads that declaration, for every token in the vocabulary.
+// TestPolicyTokens_ReportsEveryTokenInTheVocabulary is the manifest-side half of the
+// engine-subsystem gate. What this layer owes the engine is a FACT — which discriminators the
+// policy carries — and the engine intersects it with its own handler registry to decide which
+// optional facilities to wire. So the property to hold here is completeness over the
+// vocabulary: every token a manifest can carry must be reported, or the engine skips a
+// subsystem on the strength of a token it was never told about.
 //
-// It is the test the two gates lacked. They asked hand-written questions — one naming
-// sequenceBlock, one naming the three flow token types — and a policy whose only token is a
-// NEW flow-store reader answers "no flow token" to the second: the engine is built
-// WithoutFlowLabels and the handler reads a set nothing populates. A hand-written disjunction
-// passes this today and fails it the moment a token is added, which is the whole point.
-func TestSubsystemGates_DeriveFromEveryTokensDeclaredSubsystems(t *testing.T) {
-	seen := map[capability.EngineSubsystem]bool{}
+// It replaces a predicate that answered the engine's question here (UsesEngineSubsystem), which
+// could not be right for a handler an embedder had replaced; see enforcement's own gate tests
+// for the consumer half.
+func TestPolicyTokens_ReportsEveryTokenInTheVocabulary(t *testing.T) {
 	for _, token := range allKnownTokens() {
 		t.Run(token, func(t *testing.T) {
-			c := constraintCarrying(t, token)
-			m := &LocalManifest{Capabilities: []capability.Constraint{c}}
-			for _, s := range capability.EngineSubsystems() {
-				want := capability.TokenUsesEngineSubsystem(token, s)
-				seen[s] = seen[s] || want
-				assert.Equal(t, want, m.UsesEngineSubsystem(s),
-					"UsesEngineSubsystem(%q) must follow what %q declares, not a list of token types", s, token)
-			}
+			m := &LocalManifest{Capabilities: []capability.Constraint{constraintCarrying(t, token)}}
+			assert.Equal(t, []string{token}, m.PolicyTokens(),
+				"a policy carrying %q must report it, whatever the token happens to depend on", token)
 		})
-	}
-	// And the walk is not vacuous: some token in the vocabulary really does depend on each
-	// subsystem, so a build where every declaration collapsed to SubsystemNone — which would
-	// skip both facilities for every policy — fails here rather than passing trivially.
-	for _, s := range capability.EngineSubsystems() {
-		assert.True(t, seen[s], "no token in the vocabulary declares %q, so its gate is never exercised", s)
 	}
 }
 
-// TestSubsystemGates_APolicyWithNeitherSkipsBoth is the negative half the gates exist for: a
-// quota-only policy must still have both facilities skipped, which is what makes the skip an
-// optimization worth keeping rather than a switch that is always on.
-func TestSubsystemGates_APolicyWithNeitherSkipsBoth(t *testing.T) {
+// TestPolicyTokens_DedupesSortsAndHandlesNoPolicy covers the shape the engine consumes: a set,
+// not a bag, and an EMPTY one for a route with no policy — which is a real statement ("carries
+// no tokens", so both facilities may be skipped) and must not be confused with the engine never
+// being told, which wires everything.
+func TestPolicyTokens_DedupesSortsAndHandlesNoPolicy(t *testing.T) {
 	m := &LocalManifest{Capabilities: []capability.Constraint{
-		{Target: "tool:x", Actions: []string{"call"}, Conditions: []capability.Condition{&capability.MaxCallsCondition{Count: 5, WindowSeconds: 60}}},
+		{Target: "tool:x", Actions: []string{"call"}, Conditions: []capability.Condition{
+			&capability.MaxCallsCondition{Count: 5, WindowSeconds: 60},
+			&capability.FlowLabelCondition{Allow: []string{capability.FlowLabelPublic}},
+		}},
+		{Target: "tool:y", Actions: []string{"call"}, Conditions: []capability.Condition{
+			&capability.MaxCallsCondition{Count: 5, WindowSeconds: 60},
+		}, Directives: []capability.Directive{
+			capability.LabelOutputDirective{Labels: []string{capability.FlowLabelConfidential}},
+		}},
 	}}
-	for _, s := range capability.EngineSubsystems() {
-		assert.False(t, m.UsesEngineSubsystem(s), "a maxCalls-only policy needs no %q", s)
-	}
-	// And a route with no policy at all needs neither.
+	assert.Equal(t, []string{
+		capability.ConditionTypeFlowLabel, capability.DirectiveTypeLabelOutput, capability.ConditionTypeMaxCalls,
+	}, m.PolicyTokens(), "one entry per distinct discriminator, conditions and directives alike, in a stable order")
+
 	var none *LocalManifest
-	for _, s := range capability.EngineSubsystems() {
-		assert.False(t, none.UsesEngineSubsystem(s))
-	}
+	assert.Empty(t, none.PolicyTokens(), "a route with no policy carries no token")
+	assert.Empty(t, (&LocalManifest{}).PolicyTokens())
 }
 
 // instanceStateClass reports the state class of whichever token the constraint carries, through
@@ -469,5 +465,5 @@ func TestThirdRevisionLoadsAFlowManifestEndToEnd(t *testing.T) {
 	m, err := LoadManifest(path)
 	require.NoError(t, err, "a revision published after 0.2 still contains 0.2's grammar")
 	require.Len(t, m.Capabilities, 1)
-	assert.True(t, m.UsesEngineSubsystem(capability.SubsystemFlowLabels))
+	assert.Equal(t, []string{capability.ConditionTypeFlowLabel, capability.DirectiveTypeLabelOutput}, m.PolicyTokens())
 }

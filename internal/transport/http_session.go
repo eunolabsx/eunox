@@ -257,6 +257,15 @@ type httpSession struct {
 	// the semaphores they guard are created lazily.
 	reqSaturation    saturationGate
 	notifySaturation saturationGate
+
+	// serverPool bounds, dispatches and drains this session's SERVER-initiated request
+	// handlers (sampling/createMessage, roots/list, elicitation) — a third pool beside the two
+	// above, and the same one the stdio proxy keeps for its single upstream. readUpstream hands
+	// each server-initiated request to it rather than running the handler inline; see
+	// serverRequestPool for why that is a correctness property of the reader rather than a
+	// latency preference. Per SESSION, so one session's flood cannot consume another's slots,
+	// and its saturation record cannot be elided by another's episode. Zero value usable.
+	serverPool serverRequestPool
 }
 
 // maxConcurrentSessionRequests bounds in-flight enforced-request handlers per HTTP
@@ -1001,18 +1010,7 @@ func (p *HTTPProxy) reapOnce(idle time.Duration) {
 			// goroutine — printing it before (for every stale-snapshot entry) produced
 			// false "reaped" messages for sessions the re-check then spared.
 			if killed {
-				// Re-checked for the same reason the idle arms are: an operator who
-				// revived the kill between the snapshot and now should not lose the
-				// session to this sweep.
-				if !p.sessionKilled(s) {
-					return
-				}
-				fmt.Fprintf(os.Stderr, "[eunox] HTTP session %s reaped (kill switch active for this session).\n", s.id)
-				// Evict the SSE stream explicitly: the GET keepalive arm is not
-				// kill-gated, so a killed session's open stream would otherwise survive
-				// its own teardown. The local kill path evicts through the same call.
-				s.evictStreams()
-				s.close(p.shutdownMs)
+				p.reclaimKilledSession(s)
 				return
 			}
 			if hardReap {
@@ -1068,6 +1066,69 @@ func (p *HTTPProxy) sessionKilled(s *httpSession) bool {
 	}
 	deny := s.route.pdp.CheckKill(ctx, s.id)
 	return deny != nil && deny.Denial != nil && deny.Denial.Code == capability.ErrCodeKillSwitch
+}
+
+// reapKilledSessions closes every registered session the kill switch NOW names, freeing its
+// upstream, its maxSessions slot and its SSE stream. It is the on-DELIVERY reclaim
+// (reclaimOnRevocation), and the idle reaper's killed arm is the same sweep on a timer.
+//
+// Two paths rather than one because they answer different failures. The reaper's arm is the
+// backstop for a revocation whose notification never arrived — a dropped publish, a
+// subscription being retried — and it does not run at all under sessionIdleTimeoutMs: 0. This
+// one is the timely path: it reclaims when the kill lands rather than up to one sweep interval
+// (<=30s) later, and it is the ONLY reclaim on a proxy with idle reaping off, where a
+// Redis-delivered kill previously denied all traffic (fail-closed held) but left the
+// subprocess, the session slot and the stream pinned until the process exited.
+//
+// Both go through reclaimKilledSession, so what "reclaiming a killed session" means has one
+// definition, and both ask p.sessionKilled, so what "killed" means does too — including the
+// agent dimension, which each session answers from its own claims.
+//
+// Sessions are snapshotted under the lock and closed outside it, concurrently: close() blocks
+// up to shutdownMs on an unresponsive upstream, so a serial loop would let one slow upstream
+// stall the reclaim of every other killed session. The batch is awaited so the sweep is
+// complete on return.
+func (p *HTTPProxy) reapKilledSessions() {
+	p.mu.RLock()
+	snapshot := make([]*httpSession, 0, len(p.sessions))
+	for _, s := range p.sessions {
+		snapshot = append(snapshot, s)
+	}
+	p.mu.RUnlock()
+	var wg sync.WaitGroup
+	for _, s := range snapshot {
+		// Same spare the sweep applies: a session still inside its handshake + drift check
+		// is not eligible on ANY arm, because tearing one down would race the establishment
+		// path's own teardown. It is denied throughout, and reclaimed by the next trigger or
+		// sweep once established.
+		if s.initInProgress.Load() || !p.sessionKilled(s) {
+			continue
+		}
+		wg.Add(1)
+		go func(s *httpSession) {
+			defer wg.Done()
+			p.reclaimKilledSession(s)
+		}(s)
+	}
+	wg.Wait()
+}
+
+// reclaimKilledSession tears down one session the kill switch names. Shared by the idle
+// reaper's killed arm and the on-delivery sweep so a change to what reclaiming entails — the
+// re-check, the stream eviction, the log line — cannot land on one and not the other.
+func (p *HTTPProxy) reclaimKilledSession(s *httpSession) {
+	// Re-checked immediately before teardown, for the same reason the idle arms re-check:
+	// an operator who revived the kill between the snapshot and now should not lose the
+	// session to this sweep.
+	if !p.sessionKilled(s) {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[eunox] HTTP session %s reaped (kill switch active for this session).\n", s.id)
+	// Evict the SSE stream explicitly: the GET keepalive arm is not kill-gated, so a killed
+	// session's open stream would otherwise survive its own teardown. The local kill path
+	// evicts through the same call.
+	s.evictStreams()
+	s.close(p.shutdownMs)
 }
 
 // hardReapEligible reports whether a session past the hard idle ceiling may be torn
@@ -1340,7 +1401,7 @@ func (s *httpSession) readUpstream(ctx context.Context) {
 				deliverUpstreamResponse(&s.pendingMu, s.byUpstreamID, msg)
 				continue
 			}
-			s.proxy.handleHTTPUpstreamRequest(ctx, s, msg)
+			s.dispatchUpstreamRequest(ctx, msg)
 			continue
 		}
 		if msg.IsResponse() {
@@ -1350,6 +1411,37 @@ func (s *httpSession) readUpstream(ctx context.Context) {
 			deliverUpstreamResponse(&s.pendingMu, s.byUpstreamID, msg)
 		}
 	}
+}
+
+// dispatchUpstreamRequest hands one server-initiated request to this session's
+// serverRequestPool, which runs its handler on its own goroutine or refuses it when the pool is
+// saturated. See serverRequestPool for why the handler must not run inline on readUpstream, and
+// for the ordering guarantee this path deliberately gives up.
+//
+// The blast radius the move closes is one session rather than the whole proxy — readUpstream is
+// this session's only response-delivery and SSE-relay goroutine, not the proxy's — which is why
+// it landed after the stdio half, not why it was acceptable. Under a task-anchored route the
+// turn holder can be a DIFFERENT session sharing the anchor, so the stall was not even bounded
+// by its own session's traffic.
+//
+// The writer this leg reaches on refusal is the upstream subprocess pipe, already written from
+// every host handler goroutine, and mcp.MsgWriter serializes whole frames under its own mutex.
+// The forward path (broadcastServerRequest) was already called off this goroutine — the SSE
+// write loop's failure path reaches the same tracker — and takes notifMu for the delivery plus
+// the tracker's own lock for the id; the delivery-failure correction stays single-writer
+// because serverReqTracker.take is what decides who writes it, and only one caller can take a
+// given id.
+//
+// route is dereferenced unconditionally for the refusal record's sink, matching this file's
+// notification leg and handleHTTPUpstreamRequest: production never builds a route-less session,
+// and what a guard would buy when taken is a SKIPPED audit record.
+func (s *httpSession) dispatchUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) {
+	s.serverPool.dispatch(ctx, msg, serverRequestDispatch{
+		rec:           asRecorder(s.route.sink),
+		sessionID:     s.id,
+		writeUpstream: func(m mcp.RPCMsg) { _ = s.upWriter.Write(m) },
+		handle:        func(hctx context.Context, m mcp.RPCMsg) { s.proxy.handleHTTPUpstreamRequest(hctx, s, m) },
+	})
 }
 
 // callUpstream sends msg to the upstream and waits for the response: remote mode
@@ -1521,6 +1613,12 @@ func releaseSessionState(sess *httpSession) {
 	// entirely, which is the fail-open the drain exists to close.
 	budget := sess.shutdownBudget()
 	sess.awaitInFlightDrained(budget)
+	// And for the server-initiated handlers, which run on their own goroutines rather than on
+	// the reader whose exit got us here: one still in flight would write its audit record into
+	// a sink whose route may already be shutting down, and could read flow state the release
+	// below has just cleared. Same concern as the host-decision drain above, same bound; the
+	// stdio transport does this at its own teardown (awaitServerRequestsDrained).
+	sess.serverPool.drain(budget)
 	// The decision gate held for this session's life goes back here, beside the flow-state
 	// release and AFTER the in-flight drain, for both of this function's reasons. It has to
 	// be on the funnel that covers every teardown — a session whose upstream exits on its own

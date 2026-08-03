@@ -6375,3 +6375,202 @@ func newTestHTTPProxy() *HTTPProxy {
 		preSessionDenies: newPreSessionDenyLimiter(),
 	}
 }
+
+// TestRevocationReclaim_KillDeliveredThroughTheStoreReclaimsWithIdleReapingOff is the
+// acceptance test for reclaiming on a kill's own DELIVERY.
+//
+// The idle reaper's killed arm reclaims a session a kill switch names, which covers a kill this
+// instance did not itself serve — `eunox kill --redis-addr`, or a sibling instance's
+// /control/kill, delivered here through the store. But that sweep is the IDLE reaper's, so it
+// does not run at all under sessionIdleTimeoutMs: 0, a documented and valid configuration. On
+// such a deployment the kill denied all traffic (fail-closed held) and reclaimed nothing: the
+// upstream, the maxSessions slot and the SSE stream stayed pinned until the process exited.
+//
+// The kill switch now reports the revocation the moment its local view gains one, and the proxy
+// reclaims on that rather than on a sweep it is not running.
+func TestRevocationReclaim_KillDeliveredThroughTheStoreReclaimsWithIdleReapingOff(t *testing.T) {
+	ks := killswitch.NewInMemory()
+	fake := newFakeUpstream()
+	upSrv := httptest.NewServer(http.StripPrefix("/mcp", fake))
+	t.Cleanup(upSrv.Close)
+	sink, _ := newTempAuditSink(t)
+	proxy := newHTTPProxy(httpProxyOptions{
+		UpstreamURL: upSrv.URL,
+		// A PDP that consults the kill switch, so the kill reaches this proxy the way a
+		// store-delivered one does: through the check, not through /control/kill.
+		PDP: newTestManifestPDPWithKS(ks),
+		KS:  ks,
+		// Idle reaping OFF: the sweep that used to be the only reclaim is not running.
+		SessionIdleMs: 0,
+		Sink:          sink,
+	})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/mcp", proxy.handleMCP)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	// Serve() is not run in these tests, so start the worker Serve would have started.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go proxy.reclaimOnRevocation(ctx)
+
+	sid := initSession(t, srv)
+	if proxy.sessionCount() != 1 {
+		t.Fatalf("session not established, count=%d", proxy.sessionCount())
+	}
+
+	// The kill lands in the store — no /control/kill call on this instance.
+	if err := ks.KillSession(context.Background(), sid); err != nil {
+		t.Fatalf("KillSession: %v", err)
+	}
+	waitForSessions(t, proxy, 0)
+}
+
+// And an AGENT-scoped kill reclaims its sessions too, without the proxy holding any
+// agent→session map: the sweep re-asks the kill switch about each session it holds, with that
+// session's own claims, through the same predicate the idle reaper uses.
+func TestRevocationReclaim_AgentKillReclaimsItsSessions(t *testing.T) {
+	ks := killswitch.NewInMemory()
+	fake := newFakeUpstream()
+	upSrv := httptest.NewServer(http.StripPrefix("/mcp", fake))
+	t.Cleanup(upSrv.Close)
+	sink, _ := newTempAuditSink(t)
+	proxy := newHTTPProxy(httpProxyOptions{
+		UpstreamURL:   upSrv.URL,
+		PDP:           newTestManifestPDPWithKS(ks),
+		KS:            ks,
+		SessionIdleMs: 0,
+		Sink:          sink,
+	})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/mcp", proxy.handleMCP)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go proxy.reclaimOnRevocation(ctx)
+
+	sid := initSession(t, srv)
+	sess := proxy.getSession(sid)
+	if sess == nil {
+		t.Fatal("session not found")
+	}
+	// The claims a JWT route would have captured at initialize — the same source the idle
+	// reaper's killed arm reads.
+	sess.claims = &pdp.JWTClaims{Subject: "svc", AgentID: "agent-9"}
+
+	if err := ks.KillAgent(context.Background(), "agent-9"); err != nil {
+		t.Fatalf("KillAgent: %v", err)
+	}
+	waitForSessions(t, proxy, 0)
+}
+
+// TestRevocationReclaim_AnUnkilledSessionSurvives is the control, and it is the one that
+// matters: the trigger is a revocation, but what is reclaimed is decided by re-asking the kill
+// switch about each session. A sweep that tore down whatever it found on any revocation would
+// pass the two tests above and take out every live session on the instance.
+func TestRevocationReclaim_AnUnkilledSessionSurvives(t *testing.T) {
+	ks := killswitch.NewInMemory()
+	fake := newFakeUpstream()
+	upSrv := httptest.NewServer(http.StripPrefix("/mcp", fake))
+	t.Cleanup(upSrv.Close)
+	sink, _ := newTempAuditSink(t)
+	proxy := newHTTPProxy(httpProxyOptions{
+		UpstreamURL:   upSrv.URL,
+		PDP:           newTestManifestPDPWithKS(ks),
+		KS:            ks,
+		SessionIdleMs: 0,
+		Sink:          sink,
+	})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/mcp", proxy.handleMCP)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go proxy.reclaimOnRevocation(ctx)
+
+	keep := initSession(t, srv)
+	doomed := initSession(t, srv)
+	if proxy.sessionCount() != 2 {
+		t.Fatalf("expected 2 sessions, got %d", proxy.sessionCount())
+	}
+
+	if err := ks.KillSession(context.Background(), doomed); err != nil {
+		t.Fatalf("KillSession: %v", err)
+	}
+	waitForSessions(t, proxy, 1)
+	if proxy.getSession(keep) == nil {
+		t.Fatal("a revocation naming another session must not reclaim this one")
+	}
+}
+
+// TestOnRevocation_NeverBlocksTheDeliveryGoroutine pins the contract the kill switch states:
+// the observer is called from the backend's single real-time kill-event consumer, so a burst
+// must coalesce rather than stall it. Without the non-blocking send, a proxy whose worker is
+// not running (or is mid-sweep) would wedge the goroutine that delivers every LATER kill on
+// the instance — a kill switch made slower by its own reclaim.
+func TestOnRevocation_NeverBlocksTheDeliveryGoroutine(t *testing.T) {
+	t.Parallel()
+	p := &HTTPProxy{revoked: make(chan struct{}, 1)}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// No worker is draining p.revoked: every one of these must return immediately.
+		for range 1000 {
+			p.onRevocation(killswitch.Revocation{SessionID: "s"})
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("onRevocation blocked: the kill switch's delivery goroutine would be stalled by the reclaim")
+	}
+	if len(p.revoked) != 1 {
+		t.Fatalf("a burst must coalesce into one pending sweep, got %d", len(p.revoked))
+	}
+}
+
+// TestRevocationReclaim_ConstructorRegistersAndServeRunsTheWorker pins the two halves of the
+// wiring the acceptance tests above cannot: they start the worker themselves (Serve is not run
+// in those), so a proxy that registered no observer, or a Serve that never started the worker,
+// would still pass them while reclaiming nothing in production.
+func TestRevocationReclaim_ConstructorRegistersAndServeRunsTheWorker(t *testing.T) {
+	t.Parallel()
+	ks := killswitch.NewInMemory()
+	port := freeTCPPort(t)
+	proxy := NewHTTPProxyGateway(HTTPGatewayOptions{
+		Routes: map[string]*UpstreamRoute{},
+		KS:     ks,
+		Bind:   "127.0.0.1",
+		Port:   port,
+		// Idle reaping off: nothing else would ever drain the trigger.
+		SessionIdleMs: 0,
+	})
+
+	// Half one: the constructor registered the observer, so a kill delivered through the
+	// store — before Serve, which is when a real one can arrive during startup — lands a
+	// pending sweep rather than being dropped.
+	if err := ks.KillSession(context.Background(), "sess-x"); err != nil {
+		t.Fatalf("KillSession: %v", err)
+	}
+	if len(proxy.revoked) != 1 {
+		t.Fatal("NewHTTPProxyGateway must register the revocation observer: a kill delivered through the store reached nothing")
+	}
+
+	// Half two: Serve starts the worker, which drains the pending trigger.
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- proxy.Serve(ctx) }()
+	waitForServer(t, fmt.Sprintf("http://127.0.0.1:%d/healthz", port))
+	deadline := time.Now().Add(2 * time.Second)
+	for len(proxy.revoked) > 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if len(proxy.revoked) != 0 {
+		t.Fatal("Serve must start the reclaim worker; the pending revocation was never swept")
+	}
+	cancel()
+	<-done
+}

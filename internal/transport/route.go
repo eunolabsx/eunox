@@ -658,18 +658,19 @@ func LoadUpstreamPDP(u *config.UpstreamConfig, hostTransport, baseDir string, co
 		enforcement.WithCallCounter(counter),
 		// Flow-label provenance lives in its own session-lifetime store, not the
 		// sliding-window counter. Wired unconditionally
-		// like the counter; the WithoutFlowLabels gate below skips the flow path for a
+		// like the counter; the engine's own flow gate skips the flow path for a
 		// non-flow policy, so a wired-but-unused store costs nothing.
 		enforcement.WithFlowLabelStore(flowStore),
 		enforcement.WithCounterKeyNamespace(u.Name),
-	}
-	if !merged.UsesEngineSubsystem(capability.SubsystemAntecedentHistory) {
-		// Nothing in the policy reads the antecedent history: the per-call marker is never
-		// read, so skip recording it (avoids a counter round-trip per call and the
-		// fail-closed deny path that could burn a committed maxCalls slot on a write
-		// fault). Derived from what each token DECLARES it depends on, not from a
-		// hand-written list of token types — see LocalManifest.UsesEngineSubsystem.
-		engineOpts = append(engineOpts, enforcement.WithoutAntecedentRecording())
+		// The tokens this policy carries — a fact, handed over so the ENGINE can decide
+		// which optional subsystems to wire (the antecedent history, the flow-label set).
+		// This transport used to make that decision itself, from what each token declares it
+		// depends on; that declaration describes the handler this build ships, and an
+		// embedder can register a different one for the same token, so the party that knows
+		// which handlers are actually registered is the only one that can answer. Passed
+		// even when empty: "this policy carries no tokens" and "nobody said" are different
+		// statements, and only the first may skip anything.
+		enforcement.WithPolicyTokens(merged.PolicyTokens()),
 	}
 	if merged.HasEffectCeiling() {
 		// The tool-agnostic consequence bound, checked on every allow. Wired only when the
@@ -684,15 +685,6 @@ func LoadUpstreamPDP(u *config.UpstreamConfig, hostTransport, baseDir string, co
 		// asks for it: it changes what every budget in the policy means, and a token that
 		// authenticated without carrying a task id is refused rather than accounted twice.
 		engineOpts = append(engineOpts, enforcement.WithTaskAnchoredState())
-	}
-	if !merged.UsesEngineSubsystem(capability.SubsystemFlowLabels) {
-		// Nothing in the policy reads or writes the flow-label set: the per-call
-		// flow-relevance scan and the peek/record path are pure overhead, and skipping them
-		// also drops the recordLabels fail-closed deny path a source-only policy would
-		// otherwise carry. Same derivation as the WithoutAntecedentRecording gate above,
-		// which is what keeps a future flow-store-reading condition from having this path
-		// skipped out from under it.
-		engineOpts = append(engineOpts, enforcement.WithoutFlowLabels())
 	}
 	engine := enforcement.New(engineOpts...)
 	digest, err := merged.Digest()

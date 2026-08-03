@@ -34,6 +34,58 @@ func (f ConditionHandlerFunc) Handle(ctx context.Context, condition capability.C
 	return f(ctx, condition, req)
 }
 
+// SubsystemDependent is the optional interface a [ConditionHandler] (or a [PolicyEvaluator])
+// implements to declare which OPTIONAL engine facilities its enforcement reads or writes.
+//
+// It exists because the thing that actually reads a store is the HANDLER, and the token type is
+// only the same object as its handler for the built-ins. [WithConditionHandler] can replace
+// ANY registered type, including one whose shipped handler touches nothing: an embedder
+// registering a handler for allowedValues that closes over the FlowLabelStore they also passed
+// to [WithFlowLabelStore] gets, from a policy of nothing but allowedValues, an engine that
+// never populates the flow set — an empty read, which is the fail-open the flow layer exists to
+// prevent. Declaring here is how such a handler keeps its facility wired.
+//
+// A handler that does NOT implement it is read from the built-in declaration it replaced, if it
+// replaced one, and is otherwise UNCLASSIFIED — which depends on every subsystem, so the
+// conservative outcome is the default and the interface is only ever needed to declare LESS.
+// The same unclassified rule applies to a malformed declaration; see
+// capability.DeclarationUsesSubsystem, which is where that rule lives for both declaration
+// kinds.
+//
+// Declare capability.SubsystemNone (not an empty slice) to state that a handler depends on
+// nothing: "declared none" and "declared nothing" must not be the same statement.
+type SubsystemDependent interface {
+	UsesEngineSubsystems() []capability.EngineSubsystem
+}
+
+// registeredHandler is one entry in the condition-handler registry: the handler plus what the
+// engine knows about which optional facilities it depends on.
+//
+// The declaration travels WITH the handler rather than in a parallel map, because the pair is
+// exactly what an override replaces: registering a new handler for a type must replace that
+// type's declaration in the same write, or the engine keeps skipping a subsystem on the
+// strength of what the handler that is no longer there used to do.
+type registeredHandler struct {
+	ConditionHandler
+	// uses is the declaration recorded at registration: the prototype registry's `Uses` for a
+	// built-in, or nil for an override that declared nothing (UNCLASSIFIED — depends on
+	// everything). A handler implementing SubsystemDependent answers for itself and this is
+	// not consulted.
+	uses []capability.EngineSubsystem
+}
+
+// dependsOn reports whether this entry's handler depends on subsystem s.
+//
+// A handler that declares for itself wins over the recorded declaration, unconditionally and
+// including for a built-in: that is the whole point of the interface, and the two extension
+// points use it to ask their evaluator rather than answer conservatively.
+func (r registeredHandler) dependsOn(s capability.EngineSubsystem) bool {
+	if d, ok := r.ConditionHandler.(SubsystemDependent); ok {
+		return capability.DeclarationUsesSubsystem(d.UsesEngineSubsystems(), s)
+	}
+	return capability.DeclarationUsesSubsystem(r.uses, s)
+}
+
 // DeferredCommit is one deferred (quota-consuming) condition's admission plan, derived
 // WITHOUT yet consuming anything, so the engine can admit every such condition on a
 // constraint in ONE atomic backend call.
@@ -186,10 +238,19 @@ type Engine struct {
 	// handlers is the condition-handler registry. It is fully populated during
 	// New (built-ins plus any WithConditionHandler options) and never written
 	// again, so the hot path reads it concurrently without a lock.
-	handlers        map[string]ConditionHandler
+	handlers        map[string]registeredHandler
 	clock           Clock
 	counter         capability.CallCounter
 	policyEvaluator PolicyEvaluator
+
+	// policyTokens is the set of condition/directive discriminators the policy this engine
+	// will decide actually carries, as declared by WithPolicyTokens, and policyTokensKnown
+	// records whether it was declared AT ALL — the two are not the same statement. An empty
+	// set means "this policy carries no tokens", which skips both optional subsystems; an
+	// undeclared one means the engine knows nothing about the policy and wires everything.
+	// Read once in New to derive the two skips, never on the hot path.
+	policyTokens      map[string]struct{}
+	policyTokensKnown bool
 
 	// flowStore holds per-session information-flow-control label state (the source's
 	// labelOutput write, the sink's flowLabel read). It is a seam distinct from
@@ -200,19 +261,21 @@ type Engine struct {
 	// pkg/flowlabelstore.
 	flowStore capability.FlowLabelStore
 
-	// skipAntecedentRecording is set when the policy provably contains no
-	// sequenceBlock condition, so the per-call antecedent marker RecordSessionCall
-	// writes is never read. Skipping the write avoids a needless counter round-trip
-	// and, more importantly, removes the RecordSessionCall fail-closed deny path —
-	// which, on a counter-write fault, would otherwise deny a call whose maxCalls
-	// slot runConditions already committed, burning quota for a marker nothing reads.
+	// skipAntecedentRecording is set when nothing that will run on this engine reads the
+	// antecedent history, so the per-call marker RecordSessionCall writes is never read.
+	// Skipping the write avoids a needless counter round-trip and, more importantly, removes
+	// the RecordSessionCall fail-closed deny path — which, on a counter-write fault, would
+	// otherwise deny a call whose maxCalls slot runConditions already committed, burning
+	// quota for a marker nothing reads.
+	//
+	// DERIVED in New (deriveSubsystemSkips), never set by a caller: see WithPolicyTokens.
 	skipAntecedentRecording bool
 
-	// skipFlow is set when the policy provably contains no flowLabel condition and no
-	// labelOutput directive, so evaluateMatched skips the per-call flow-relevance scan
-	// and the peek/record path entirely. Mirrors skipAntecedentRecording: it spares a
-	// non-flow policy the scan on every allow, and removes the recordLabels fail-closed
-	// deny path for a source-only policy whose markers no sink reads.
+	// skipFlow is set when nothing that will run on this engine reads or writes the
+	// flow-label set, so evaluateMatched skips the per-call flow-relevance scan and the
+	// peek/record path entirely. Mirrors skipAntecedentRecording: it spares a non-flow policy
+	// the scan on every allow, and removes the recordLabels fail-closed deny path for a
+	// source-only policy whose markers no sink reads. Derived the same way.
 	skipFlow bool
 
 	// effectCeiling is the policy's tool-agnostic consequence bound, applied to EVERY
@@ -283,29 +346,35 @@ func WithFlowLabelStore(store capability.FlowLabelStore) Option {
 	}
 }
 
-// WithoutAntecedentRecording tells the engine the policy contains no sequenceBlock
-// condition, so it skips writing the per-call sequenceBlock-history marker. The
-// marker exists only to be read by a later sequenceBlock; with none in the policy
-// the write is pure overhead, and skipping it also removes the RecordSessionCall
-// fail-closed deny path that could burn a just-committed maxCalls slot on a
-// counter-write fault. Only set this when the policy is known to use no
-// sequenceBlock — derived from what each token declares it uses, see
-// config.LocalManifest.UsesEngineSubsystem; leaving it unset
-// preserves the always-record fail-closed behavior.
-func WithoutAntecedentRecording() Option {
+// WithPolicyTokens declares which condition and directive discriminators the policy this
+// engine will decide actually carries (config.LocalManifest.PolicyTokens supplies them for a
+// manifest). The engine intersects them with its own handler registry to decide which optional
+// subsystems to wire — the antecedent history and the flow-label set — so a facility is skipped
+// only when nothing that can run reads it.
+//
+// It replaced two options a caller stated the CONCLUSION with (WithoutAntecedentRecording,
+// WithoutFlowLabels). The conclusion could be wrong in the fail-open direction, and not only
+// through carelessness: a caller deriving it from the manifest's token types was making a
+// statement about tokens, while the thing that reads a store is the handler, and
+// WithConditionHandler can replace the handler for any type — including one whose shipped
+// handler touches nothing. Naming the tokens is a FACT about the policy; deciding what that
+// implies is the engine's job, and it is the only party that knows which handlers are actually
+// registered. See SubsystemDependent for how an override declares its own dependency.
+//
+// Not calling it at all means the engine knows nothing about the policy and wires every
+// subsystem — the fail-closed default, and what an embedder gets by doing nothing. Calling it
+// with an empty set is the distinct, deliberate statement that the policy carries no tokens.
+//
+// A token this build has no handler for is UNCLASSIFIED and depends on everything; it fails
+// closed at decision time anyway (unknown condition type), and the skip must not be taken on
+// its account in the meantime.
+func WithPolicyTokens(tokens []string) Option {
 	return func(e *Engine) {
-		e.skipAntecedentRecording = true
-	}
-}
-
-// WithoutFlowLabels tells the engine the policy contains no flowLabel condition and no
-// labelOutput directive, so it skips the per-call flow-relevance scan and the flow
-// peek/record path. Only set this when the policy is known to use neither (see
-// config.LocalManifest.UsesEngineSubsystem); leaving it unset preserves the always-check
-// behavior. Mirrors WithoutAntecedentRecording.
-func WithoutFlowLabels() Option {
-	return func(e *Engine) {
-		e.skipFlow = true
+		e.policyTokens = make(map[string]struct{}, len(tokens))
+		for _, t := range tokens {
+			e.policyTokens[t] = struct{}{}
+		}
+		e.policyTokensKnown = true
 	}
 }
 
@@ -492,7 +561,7 @@ func (systemClock) Now() time.Time { return time.Now() }
 // New creates a new enforcement Engine with all built-in condition handlers registered.
 func New(opts ...Option) *Engine {
 	e := &Engine{
-		handlers: make(map[string]ConditionHandler),
+		handlers: make(map[string]registeredHandler),
 		clock:    systemClock{},
 	}
 	// Register built-ins first so a WithConditionHandler option can override one.
@@ -502,7 +571,55 @@ func New(opts ...Option) *Engine {
 	for _, opt := range opts {
 		opt(e)
 	}
+	e.deriveSubsystemSkips()
 	return e
+}
+
+// deriveSubsystemSkips decides which optional facilities this engine wires, by asking the
+// REGISTRY what the policy's tokens will actually run.
+//
+// It runs after every option, which is what makes the answer trustworthy: the handler registry
+// is final (WithConditionHandler has been applied), the policy's tokens are known
+// (WithPolicyTokens), and an extension point can consult the evaluator it was given. The skips
+// are therefore a derived property of a fully-built engine rather than an assertion a caller
+// made about it before it existed.
+//
+// Both skips are OPTIMIZATIONS: over-wiring costs work per call (a flow-relevance scan; a
+// counter round-trip and its fail-closed deny path) and never authority, while under-wiring
+// runs a handler against a facility nothing populates. So every uncertain path here — an
+// undeclared policy, a token with no handler, a handler that declared nothing — resolves to
+// "wired".
+func (e *Engine) deriveSubsystemSkips() {
+	e.skipAntecedentRecording = !e.policyUses(capability.SubsystemAntecedentHistory)
+	e.skipFlow = !e.policyUses(capability.SubsystemFlowLabels)
+}
+
+// policyUses reports whether anything this engine will run depends on subsystem s.
+//
+// Directives are covered by the token declaration alone, not by a handler lookup: their
+// enforcement is in-tree (labelOutput, declassify, redactFields are applied by the engine
+// itself) and there is no registration seam to override them, so the prototype registry's
+// `Uses` is both the declaration and the implementation. Conditions go through the registry,
+// because for those two the same token can name a different handler.
+func (e *Engine) policyUses(s capability.EngineSubsystem) bool {
+	if !e.policyTokensKnown {
+		return true
+	}
+	for token := range e.policyTokens {
+		if h, ok := e.handlers[token]; ok {
+			if h.dependsOn(s) {
+				return true
+			}
+			continue
+		}
+		// Not a registered condition type: a directive discriminator, or a token this build
+		// does not model. Both answer from capability's own declaration, whose unclassified
+		// rule already resolves the second to "depends on everything".
+		if capability.TokenUsesEngineSubsystem(token, s) {
+			return true
+		}
+	}
+	return false
 }
 
 // RecordSessionCall notes that an allowed call to req.TargetName occurred in this
@@ -736,10 +853,37 @@ func escalateResponse(requestID, now string, denial capability.DenialInfo) capab
 // (maxCalls) with a plain func therefore changes its evaluation ordering and opts it
 // out of the atomic multi-condition commit — implement the interface to preserve
 // deferred semantics.
+// An override is UNCLASSIFIED for the optional-subsystem gates unless it implements
+// [SubsystemDependent]: the declaration on the token's prototype-registry entry describes the
+// handler this build SHIPS for that type, and is not evidence about a replacement. Unclassified
+// means every subsystem stays wired, so the conservative outcome is the default and the
+// interface is only needed to declare less.
 func WithConditionHandler(name string, handler ConditionHandler) Option {
 	return func(e *Engine) {
-		e.handlers[name] = handler
+		e.register(name, handler, nil)
 	}
+}
+
+// register installs handler for name together with what the engine should assume its
+// enforcement depends on. It is the ONLY write to the registry — built-ins and overrides both
+// go through it — so a registration cannot install a handler while leaving the previous
+// handler's subsystem declaration in place.
+func (e *Engine) register(name string, handler ConditionHandler, uses []capability.EngineSubsystem) {
+	e.handlers[name] = registeredHandler{ConditionHandler: handler, uses: uses}
+}
+
+// registerBuiltin installs one of this build's own handlers, taking its subsystem declaration
+// from the token's prototype-registry entry — the entry every condition and directive
+// discriminator must declare (see capability/subsystem.go), and which describes exactly the
+// handler being registered here.
+func (e *Engine) registerBuiltin(name string, handler ConditionHandler) {
+	uses, ok := capability.TokenEngineSubsystems(name)
+	if !ok {
+		// Unclassified: no entry, or a malformed declaration. nil carries that through to
+		// dependsOn, which resolves it to "depends on everything".
+		uses = nil
+	}
+	e.register(name, handler, uses)
 }
 
 // runPureConditions evaluates every PURE (non-committing) condition on matched in order
@@ -1077,7 +1221,7 @@ func (e *Engine) committingHandler(condType string) (CommittingConditionHandler,
 	if !ok {
 		return nil, false
 	}
-	ch, ok := h.(CommittingConditionHandler)
+	ch, ok := h.ConditionHandler.(CommittingConditionHandler)
 	return ch, ok
 }
 

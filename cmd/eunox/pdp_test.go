@@ -585,6 +585,7 @@ func (e *errKillSwitch) Reset(_ context.Context) error                   { retur
 func (e *errKillSwitch) Status(_ context.Context) (*killswitch.Status, error) {
 	return &killswitch.Status{}, nil
 }
+func (e *errKillSwitch) ObserveRevocations(_ func(killswitch.Revocation)) {}
 
 // TestPolicyDecisionPoint_InterfaceSatisfied verifies that all concrete PDP
 // implementations satisfy the extended interface at compile time.

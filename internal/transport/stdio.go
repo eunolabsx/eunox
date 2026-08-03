@@ -179,20 +179,12 @@ type StdioProxy struct {
 	// struct literal is gated too.
 	hostSaturation saturationGate
 
-	// serverSem bounds concurrent in-flight SERVER-initiated request handlers, and
-	// serverSaturation gates their refusal record — the upstream-facing twins of hostSem and
-	// hostSaturation. readUpstream acquires a slot non-blockingly before dispatching a handler
-	// goroutine and releases it when the handler returns; on saturation the request is refused
-	// to the upstream rather than spawning. See maxConcurrentServerRequests and
-	// dispatchUpstreamRequest. Sized lazily on readUpstream entry, its sole writer.
-	serverSem        chan struct{}
-	serverSaturation saturationGate
-	// serverReqInFlight counts dispatched server-initiated handlers that have not returned, so
-	// teardown can wait for them the way it waits for host decisions (awaitDrained). They run
-	// off the read loop now, so draining the reader no longer implies they are done — and one
-	// still mid-decision would otherwise have its audit record dropped by a closed sink, or
-	// have its flow-state read raced by ReleaseSession.
-	serverReqInFlight atomic.Int64
+	// serverPool bounds, dispatches and drains this proxy's SERVER-initiated request
+	// handlers — the upstream-facing twin of hostSem/hostSaturation, and the same pool the
+	// HTTP transport keeps per session. readUpstream hands each server-initiated request to
+	// it rather than running the handler inline; see serverRequestPool for why that is a
+	// correctness property of the reader rather than a latency preference. Zero value usable.
+	serverPool serverRequestPool
 
 	// fwdHostWrites preserves host wire order across the request/notification
 	// boundary. It counts host requests that have been dispatched but not yet written
@@ -606,17 +598,11 @@ func (p *StdioProxy) awaitHostDecisionsDrained(timeout time.Duration) {
 }
 
 // awaitServerRequestsDrained blocks until every dispatched SERVER-initiated handler has
-// returned, or until timeout elapses. It is the other half of the same teardown concern: those
-// handlers moved off the read loop (dispatchUpstreamRequest), so draining the upstream reader
-// no longer implies they are finished, and one still running past this point would write its
-// audit record into a closed sink (dropped, not recorded) or read flow state ReleaseSession
-// has just cleared.
-//
-// Unlike the host drain it is NOT gated on decideGate: a server-initiated handler writes an
-// audit record on every path, serialized or not, so the record is what is being protected here
-// rather than the flow state alone.
+// returned, or until timeout elapses — the proxy-scoped name for the pool's own drain, which
+// the HTTP transport calls per session. See serverRequestPool.drain for the teardown concern
+// it answers.
 func (p *StdioProxy) awaitServerRequestsDrained(timeout time.Duration) {
-	awaitDrained(&p.serverReqInFlight, timeout)
+	p.serverPool.drain(timeout)
 }
 
 // awaitDrained polls counter to zero, giving up after timeout. Shared by the two teardown
@@ -976,20 +962,6 @@ func (p *StdioProxy) initUpstream(ctx context.Context) error {
 // never trips it; the remote-HTTP bridge caps its own POSTs separately
 // (maxInflightPosts).
 const maxConcurrentHostRequests = 256
-
-// maxConcurrentServerRequests bounds the in-flight handler goroutines readUpstream spawns for
-// SERVER-initiated requests (sampling/createMessage, roots/list, elicitation). It is the
-// upstream-facing twin of maxConcurrentHostRequests and exists for the same hazard from the
-// other direction: those handlers no longer run inline on the read loop, so without a cap an
-// upstream that emits requests faster than the host answers them grows goroutines without
-// bound — which is exactly the pressure moving them off the reader relieved the reader of.
-//
-// It is far smaller than the host cap, because the traffic is: a server-initiated request
-// needs a HUMAN-facing round trip on the host side (an LLM completion, a roots prompt), so
-// double-digit concurrency is already well past anything an honest upstream produces, while
-// the host cap has to absorb an agent pipelining tool calls. On saturation the request is
-// refused to the upstream with a structured, retryable error and the refusal is recorded.
-const maxConcurrentServerRequests = 32
 
 // jsonRPCCodeServerBusy is returned to the host when serveHost's in-flight cap is
 // saturated — and to the UPSTREAM when the server-initiated cap above is. -32000 is the
@@ -1430,61 +1402,24 @@ func (p *StdioProxy) forwardServerRequestToHost(msg mcp.RPCMsg) {
 	_ = p.hostWriter.Write(msg)
 }
 
-// dispatchUpstreamRequest runs one server-initiated request's handler on its OWN goroutine,
-// bounded by serverSem.
-//
-// The handler must not run inline on the read loop, and the reason is a cycle rather than a
-// slow path. readUpstream is the only goroutine that delivers upstream responses to waiting
-// host handlers; a declassifying host call holds the decision turn across its whole upstream
-// round trip; and the sampling leg takes that turn BEFORE DecideSampling runs. A
-// sampling/createMessage arriving mid-clear therefore parked the reader on a turn whose holder
-// was waiting for a response only that reader could deliver. Bounding the wait
-// (samplingTurnWait) turned the deadlock into a stall, which is where this began — but nothing
-// bounded how OFTEN: an upstream emitting one such request per in-flight clear costs the whole
-// session's response delivery that bound each time, and sampling need not even be permitted,
-// since the turn is taken before the decision that would refuse it. Off the read loop, a
-// blocked handler blocks itself and nothing else, and the bound stays as the backstop.
-//
-// ORDERING, stated rather than left to be inferred: server-initiated requests were handled in
-// receipt order purely because they ran inline, and they no longer are. Two requests the
-// upstream emits back to back may reach the host in either order, and one may now be overtaken
-// by a notification received after it. Nothing depends on that order — JSON-RPC correlates a
-// response to its request by id, and MCP defines no ordering between independent
-// server-initiated requests — but a future request kind that DID need ordering would have to
-// establish it here rather than inherit it from where this happens to run. Host-initiated
-// traffic keeps every ordering guarantee it had: its receipt order is fixed by serveHost's
-// ticket reservation and its request/notification barrier is fwdHostWrites, neither of which
-// this path touches.
+// dispatchUpstreamRequest hands one server-initiated request to the proxy's serverRequestPool,
+// which runs its handler on its own goroutine or refuses it when the pool is saturated. See
+// serverRequestPool for why the handler must not run inline on the read loop, and for the
+// ordering guarantee this path deliberately gives up.
 //
 // The two writers this leg reaches are both safe to share: mcp.MsgWriter serializes whole
 // frames under its own mutex (so a concurrent host reply cannot interleave with a serve-loop
 // write), and the upstream sink is documented concurrency-safe and already written from every
-// host handler goroutine.
-//
-// On saturation the request is refused to the upstream with a retryable server-busy error and
-// the refusal is RECORDED, mirroring serveHost's host-side cap through the same helper — an
-// upstream that floods this leg leaves a trace on the tamper-evident tape rather than only a
-// stream of error replies.
+// host handler goroutine. Host-initiated traffic keeps every ordering guarantee it had: its
+// receipt order is fixed by serveHost's ticket reservation and its request/notification barrier
+// is fwdHostWrites, neither of which this path touches.
 func (p *StdioProxy) dispatchUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) {
-	select {
-	case p.serverSem <- struct{}{}:
-		// A free slot means any saturation episode is over: re-arm the gate so the next
-		// refusal is recorded as a new episode rather than folded into the last one.
-		p.serverSaturation.clear()
-	default:
-		recordResourceExhausted(ctx, p.rec(), &p.serverSaturation, p.sessionID, msg.Method)
-		_ = p.upWriter.Write(mcp.ErrorResponse(msg.ID, jsonRPCCodeServerBusy,
-			"eunox: too many concurrent server-initiated requests in flight; retry"))
-		return
-	}
-	// Counted before the goroutine starts, so teardown's drain cannot observe zero for a
-	// request that has been admitted but not yet begun.
-	p.serverReqInFlight.Add(1)
-	go func() {
-		defer p.serverReqInFlight.Add(-1)
-		defer func() { <-p.serverSem }()
-		p.handleUpstreamRequest(ctx, msg)
-	}()
+	p.serverPool.dispatch(ctx, msg, serverRequestDispatch{
+		rec:           p.rec(),
+		sessionID:     p.sessionID,
+		writeUpstream: func(m mcp.RPCMsg) { _ = p.upWriter.Write(m) },
+		handle:        p.handleUpstreamRequest,
+	})
 }
 
 // handleUpstreamRequest handles one server-initiated JSON-RPC request from the
@@ -1834,13 +1769,6 @@ func (p *StdioProxy) reportUpstreamErr(upKey string, err error) bool {
 // waiting caller, notifications to the host, server-initiated requests for
 // enforcement.
 func (p *StdioProxy) readUpstream(ctx context.Context) {
-	// Size the server-initiated concurrency cap lazily on entry, mirroring serveHost's
-	// hostSem: this is the ONLY place serverSem is initialized (NewStdioProxy does not), and
-	// readUpstream is its sole writer and runs before any handler it dispatches, so this
-	// cannot race.
-	if p.serverSem == nil {
-		p.serverSem = make(chan struct{}, maxConcurrentServerRequests)
-	}
 	for {
 		msg, err := p.upReader.Read()
 		if err != nil {

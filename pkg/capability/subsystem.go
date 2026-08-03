@@ -80,6 +80,23 @@ func EngineSubsystems() []EngineSubsystem { return slices.Clone(engineSubsystems
 // modelled reports whether s is a facility this build knows about.
 func (s EngineSubsystem) modelled() bool { return slices.Contains(engineSubsystems, s) }
 
+// DeclarationUsesSubsystem reports whether a declaration depends on s, applying the
+// unclassified rule: a MALFORMED declaration (empty, a mix of SubsystemNone with a real
+// facility, or a name this build does not model) depends on EVERY subsystem.
+//
+// It is the one place that rule lives. Two kinds of declaration reach it — the `Uses` a
+// prototype-registry entry states for a built-in token, and the one a registered condition
+// handler states for itself (enforcement.SubsystemDependent) — and they must be read
+// identically, because the second exists precisely to override the first for a handler an
+// embedder swapped in. A second copy of "empty means everything" is how one of the two
+// silently starts meaning "nothing".
+func DeclarationUsesSubsystem(uses []EngineSubsystem, s EngineSubsystem) bool {
+	if !validSubsystemDeclaration(uses) {
+		return true
+	}
+	return slices.Contains(uses, s)
+}
+
 // validSubsystemDeclaration reports whether uses is a well-formed declaration: either exactly
 // SubsystemNone, or a non-empty set of modelled subsystems. Anything else — empty, a mix of
 // SubsystemNone with a real facility, a name this build does not model — is UNCLASSIFIED, and
@@ -136,24 +153,11 @@ func TokenUsesEngineSubsystem(token string, s EngineSubsystem) bool {
 	if !ok {
 		return true
 	}
-	return slices.Contains(uses, s)
+	return DeclarationUsesSubsystem(uses, s)
 }
 
-// ConditionUsesEngineSubsystem reports whether c's enforcement depends on s. A nil condition
-// carries no enforcement and depends on nothing. Both the pointer form the JSON loader builds
-// and the value form the JWT path builds are accepted, because the discriminator is read off
-// the interface rather than off a Go type switch.
-func ConditionUsesEngineSubsystem(c Condition, s EngineSubsystem) bool {
-	if isNilToken(c) {
-		return false
-	}
-	return TokenUsesEngineSubsystem(c.ConditionType(), s)
-}
-
-// DirectiveUsesEngineSubsystem is the directive-side twin of ConditionUsesEngineSubsystem.
-func DirectiveUsesEngineSubsystem(d Directive, s EngineSubsystem) bool {
-	if isNilToken(d) {
-		return false
-	}
-	return TokenUsesEngineSubsystem(d.DirectiveType(), s)
-}
+// There is deliberately no per-INSTANCE form of the lookup above (the state axis has
+// ConditionStateAccumulation/DirectiveStateAccumulation; this one does not). The consumer is
+// the engine, which asks about the tokens a policy carries and answers from its own handler
+// registry — a condition VALUE tells it nothing the discriminator does not, and a helper that
+// took one would invite the manifest layer to answer the engine's question again.

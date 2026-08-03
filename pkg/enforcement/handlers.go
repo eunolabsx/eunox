@@ -138,22 +138,61 @@ func directivesToRegoInput(directives []capability.Directive) ([]interface{}, er
 	return out, nil
 }
 
-// registerBuiltins registers all built-in condition handlers.
+// registerBuiltins registers all built-in condition handlers. Each goes in through
+// registerBuiltin, which reads its optional-subsystem declaration off the token's
+// prototype-registry entry rather than restating it here.
 func (e *Engine) registerBuiltins() {
-	e.handlers[capability.ConditionTypeTimeWindow] = ConditionHandlerFunc(e.handleTimeWindow)
-	e.handlers[capability.ConditionTypeIPRange] = ConditionHandlerFunc(e.handleIPRange)
-	e.handlers[capability.ConditionTypeMaxCalls] = maxCallsHandler{e: e}
-	e.handlers[capability.ConditionTypeAllowedOperations] = ConditionHandlerFunc(e.handleAllowedOperations)
-	e.handlers[capability.ConditionTypeAllowedExtensions] = ConditionHandlerFunc(e.handleAllowedExtensions)
-	e.handlers[capability.ConditionTypeAllowedTables] = ConditionHandlerFunc(e.handleAllowedTables)
-	e.handlers[capability.ConditionTypeRecipientDomain] = ConditionHandlerFunc(e.handleRecipientDomain)
-	e.handlers[capability.ConditionTypeAllowedValues] = ConditionHandlerFunc(e.handleAllowedValues)
-	e.handlers[capability.ConditionTypeSequenceBlock] = ConditionHandlerFunc(e.handleSequenceBlock)
-	e.handlers[capability.ConditionTypeFlowLabel] = ConditionHandlerFunc(e.handleFlowLabel)
-	e.handlers[capability.ConditionTypeEffectClass] = ConditionHandlerFunc(e.handleEffectClass)
-	e.handlers[capability.ConditionTypeBlastRadius] = blastRadiusHandler{e: e}
-	e.handlers[capability.ConditionTypePolicy] = ConditionHandlerFunc(e.handlePolicy)
-	e.handlers[capability.ConditionTypeCustom] = ConditionHandlerFunc(e.handleCustom)
+	e.registerBuiltin(capability.ConditionTypeTimeWindow, ConditionHandlerFunc(e.handleTimeWindow))
+	e.registerBuiltin(capability.ConditionTypeIPRange, ConditionHandlerFunc(e.handleIPRange))
+	e.registerBuiltin(capability.ConditionTypeMaxCalls, maxCallsHandler{e: e})
+	e.registerBuiltin(capability.ConditionTypeAllowedOperations, ConditionHandlerFunc(e.handleAllowedOperations))
+	e.registerBuiltin(capability.ConditionTypeAllowedExtensions, ConditionHandlerFunc(e.handleAllowedExtensions))
+	e.registerBuiltin(capability.ConditionTypeAllowedTables, ConditionHandlerFunc(e.handleAllowedTables))
+	e.registerBuiltin(capability.ConditionTypeRecipientDomain, ConditionHandlerFunc(e.handleRecipientDomain))
+	e.registerBuiltin(capability.ConditionTypeAllowedValues, ConditionHandlerFunc(e.handleAllowedValues))
+	e.registerBuiltin(capability.ConditionTypeSequenceBlock, ConditionHandlerFunc(e.handleSequenceBlock))
+	e.registerBuiltin(capability.ConditionTypeFlowLabel, ConditionHandlerFunc(e.handleFlowLabel))
+	e.registerBuiltin(capability.ConditionTypeEffectClass, ConditionHandlerFunc(e.handleEffectClass))
+	e.registerBuiltin(capability.ConditionTypeBlastRadius, blastRadiusHandler{e: e})
+	// The two extension points answer for themselves rather than from their registry entries,
+	// which declare every subsystem because what an out-of-tree evaluator reads is not
+	// knowable from a token type. It IS knowable from the evaluator, when the evaluator says
+	// so — see extensionPointHandler.
+	e.registerBuiltin(capability.ConditionTypePolicy, extensionPointHandler{e: e, fn: e.handlePolicy})
+	e.registerBuiltin(capability.ConditionTypeCustom, extensionPointHandler{e: e, fn: e.handleCustom})
+}
+
+// extensionPointHandler is the built-in handler for the two tokens whose enforcement is
+// supplied from OUTSIDE this build (policy, custom): it runs the in-tree dispatch and, for the
+// subsystem gates, forwards the question to the PolicyEvaluator that dispatch will call.
+//
+// Their prototype-registry entries declare every subsystem, and must: a token type cannot know
+// what an embedder's evaluator reads. The evaluator can, and the cost of not asking it is
+// charged to a policy's OTHER capabilities — a manifest mixing `policy` with a plain maxCalls
+// keeps antecedent recording wired for the whole engine, so every maxCalls call pays a counter
+// round-trip and re-arms a fail-closed deny path on a counter-write fault, for a sibling
+// capability that has nothing to do with the extension point.
+//
+// An evaluator that does not implement SubsystemDependent, or is not wired at all, leaves the
+// declaration unclassified — every subsystem, the conservative answer these tokens had before.
+type extensionPointHandler struct {
+	e  *Engine
+	fn func(context.Context, capability.Condition, *capability.EnforceRequest) *ConditionError
+}
+
+// Handle implements [ConditionHandler].
+func (h extensionPointHandler) Handle(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) *ConditionError {
+	return h.fn(ctx, cond, req)
+}
+
+// UsesEngineSubsystems implements [SubsystemDependent] by asking the evaluator that will
+// actually run. It is read once, after every option has been applied (deriveSubsystemSkips), so
+// the evaluator is the one this engine was built with.
+func (h extensionPointHandler) UsesEngineSubsystems() []capability.EngineSubsystem {
+	if d, ok := h.e.policyEvaluator.(SubsystemDependent); ok {
+		return d.UsesEngineSubsystems()
+	}
+	return nil // unclassified: depends on everything
 }
 
 func (e *Engine) handleTimeWindow(_ context.Context, cond capability.Condition, _ *capability.EnforceRequest) *ConditionError {

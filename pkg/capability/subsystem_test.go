@@ -122,19 +122,35 @@ func TestEngineSubsystems_ReturnsACopy(t *testing.T) {
 		"SubsystemNone is the declares-nothing marker, not a facility a policy can need")
 }
 
-// TestConditionAndDirectiveUsesEngineSubsystem_AreNilSafe covers the two forms a token can
-// take (the loader's pointer, a programmatically built value) and the typed nil a
-// programmatic build can produce, which must not panic on a value-receiver discriminator.
-func TestConditionAndDirectiveUsesEngineSubsystem_AreNilSafe(t *testing.T) {
+// TestDeclarationUsesSubsystem_AppliesTheUnclassifiedRuleToBothDeclarationKinds pins the one
+// rule two different declarations are read by: the `Uses` a prototype-registry entry states for
+// a built-in token, and the one a registered condition handler states for itself
+// (enforcement.SubsystemDependent). The second exists to override the first for a handler an
+// embedder swapped in, so if they disagreed about what "declared nothing" means, the override
+// would be read as depending on nothing — the exact fail-open direction.
+func TestDeclarationUsesSubsystem_AppliesTheUnclassifiedRuleToBothDeclarationKinds(t *testing.T) {
 	t.Parallel()
-	assert.True(t, ConditionUsesEngineSubsystem(&FlowLabelCondition{}, SubsystemFlowLabels))
-	assert.True(t, ConditionUsesEngineSubsystem(FlowLabelCondition{}, SubsystemFlowLabels))
-	assert.True(t, DirectiveUsesEngineSubsystem(&LabelOutputDirective{}, SubsystemFlowLabels))
-	assert.True(t, DirectiveUsesEngineSubsystem(LabelOutputDirective{}, SubsystemFlowLabels))
+	for name, uses := range map[string][]EngineSubsystem{
+		"nothing declared":                nil,
+		"empty declaration":               {},
+		"a facility this build models no": {EngineSubsystem("quantumStore")},
+		"none mixed with a real facility": {SubsystemNone, SubsystemFlowLabels},
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, s := range EngineSubsystems() {
+				assert.True(t, DeclarationUsesSubsystem(uses, s),
+					"an unclassified declaration must depend on %q: over-wiring costs work per call, under-wiring runs a handler against a facility nothing populates", s)
+			}
+		})
+	}
 
-	assert.False(t, ConditionUsesEngineSubsystem(nil, SubsystemFlowLabels))
-	assert.False(t, DirectiveUsesEngineSubsystem(nil, SubsystemFlowLabels))
-	assert.False(t, ConditionUsesEngineSubsystem((*FlowLabelCondition)(nil), SubsystemFlowLabels),
-		"a typed nil carries no enforcement and must not panic")
-	assert.False(t, DirectiveUsesEngineSubsystem((*LabelOutputDirective)(nil), SubsystemFlowLabels))
+	assert.False(t, DeclarationUsesSubsystem([]EngineSubsystem{SubsystemNone}, SubsystemFlowLabels),
+		"an explicit SubsystemNone is a decision, not an absence")
+	assert.True(t, DeclarationUsesSubsystem([]EngineSubsystem{SubsystemFlowLabels}, SubsystemFlowLabels))
+	assert.False(t, DeclarationUsesSubsystem([]EngineSubsystem{SubsystemFlowLabels}, SubsystemAntecedentHistory))
+
+	// And the token lookup is the same rule over the registry's own declarations.
+	assert.True(t, TokenUsesEngineSubsystem(ConditionTypeFlowLabel, SubsystemFlowLabels))
+	assert.True(t, TokenUsesEngineSubsystem("no-such-token", SubsystemFlowLabels),
+		"a token this build cannot classify depends on everything")
 }

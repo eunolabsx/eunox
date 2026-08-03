@@ -673,3 +673,48 @@ func TestScanToolEntry_NamesCompleteOnCleanWalk(t *testing.T) {
 		t.Fatalf("names = %v, want [a]", got.names)
 	}
 }
+
+// TestHardenRefusal_ObligationsComeFromTheWiderSelection pins the one thing unifying
+// HardenRefusal's selections onto a single struct must NOT do: narrow them to each other.
+//
+// hardenSelection now carries both — the constraint that governs the call (findConstraint under
+// the request's claims, plus the action check) and the directives of every capability NAMING
+// the target, principal scoping ignored. The second is deliberately wider, and the tempting
+// "dedup" of filling obligations from the matched constraint instead is a fail-open on exactly
+// the shape this fill exists for: a principal-scoped miss, where nothing matched and the
+// forwarded response still carries fields the manifest declared redactable.
+func TestHardenRefusal_ObligationsComeFromTheWiderSelection(t *testing.T) {
+	t.Parallel()
+	mdp := newTestManifestPDP(capability.Constraint{
+		Target:     "tool:read_file",
+		Actions:    []string{"call"},
+		Principal:  map[string][]string{"agent_id": {"analyst"}},
+		Directives: []capability.Directive{&capability.RedactFieldsDirective{Fields: []string{"$.ssn"}}},
+	})
+	target := EnforceTarget{Type: capability.TargetTypeTool, Name: "read_file"}
+
+	// No claims, so the principal-scoped entry does not apply: the narrow selection is empty.
+	ctx := enforcement.WithSkipQuota(context.Background())
+	if sel := mdp.selectForHardening(ctx, target); sel.matched != nil {
+		t.Fatalf("the narrow selection must be empty for this caller; got %+v", sel.matched)
+	} else if len(sel.naming()) != 1 {
+		t.Fatalf("the wider selection must still find the entry naming the target; got %+v", sel.naming())
+	}
+
+	// A soft refusal from an outer layer, as the JWT wrapper produces.
+	soft := capability.EnforceResponse{
+		Decision: capability.DecisionDeny,
+		Denial:   &capability.DenialInfo{Code: capability.ErrCodeAuthorizationFailed, Message: "not in the JWT capability claims"},
+	}
+	hardened := mdp.HardenRefusal(ctx, "sess", soft, target, map[string]interface{}{})
+	if len(hardened.Obligations) != 1 || hardened.Obligations[0].Type != capability.DirectiveTypeRedactFields {
+		t.Fatalf("a forwarded refusal must carry the target's declared redactFields; got %+v", hardened.Obligations)
+	}
+
+	// The control, and the reason the wide walk is a thunk: on an enforce route the refusal
+	// blocks, so there is no forwarded response to redact and nothing to resolve.
+	enforced := mdp.HardenRefusal(context.Background(), "sess", soft, target, map[string]interface{}{})
+	if len(enforced.Obligations) != 0 {
+		t.Fatalf("an enforced refusal carries no forwarded response; got %+v", enforced.Obligations)
+	}
+}
