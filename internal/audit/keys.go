@@ -124,8 +124,14 @@ func LoadOrCreateKeys(keyPath string) ([][]byte, error) {
 // every record report UNKNOWN_KEY and misdiagnose a mistyped --audit-key-path or a
 // wrong machine as a key rotation. Format and retired-key semantics match
 // LoadOrCreateKeys.
+//
+// Read-only means read-only: it does NOT tighten the key file's mode. A plain
+// `eunox audit-verify` chmod-ing a group-readable key to 0600 breaks the next read by a
+// separate monitoring or verification user — an operator-visible side effect of a
+// command that only reads. The proxy still tightens on its own path (LoadOrCreateKeys),
+// which is where the file's permissions are that process's business.
 func LoadKeys(keyPath string) ([][]byte, error) {
-	data, err := readAuditKeyFile(keyPath, true)
+	data, err := readAuditKeyFile(keyPath, false)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, fmt.Errorf("audit key file %q not found — pass --audit-key-path pointing at the key that signed this log", keyPath)

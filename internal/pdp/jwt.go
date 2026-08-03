@@ -1231,7 +1231,8 @@ func (p *JWTPDP) DecideSampling(ctx context.Context, sessionID, sourceIP string)
 	// invariant rather than a live hole; stating it here is what keeps it one, since the
 	// asymmetry — two of the three Decide* entry points checking and the third not — is
 	// exactly the kind of gap a later wiring change turns into a bypass.
-	if _, ok := jwtClaimsFromContext(ctx); !ok {
+	claims, ok := jwtClaimsFromContext(ctx)
+	if !ok {
 		return hardDenyResponse(p.clock, capability.ErrCodeNoJWTClaims, "no JWT claims in context — token was not validated")
 	}
 	// Per-route audience pin (mirrors Decide/filterList): a session whose token does not
@@ -1251,7 +1252,7 @@ func (p *JWTPDP) DecideSampling(ctx context.Context, sessionID, sourceIP string)
 	// the one place "the token can only restrict, never expand" failed in the
 	// exhaustive-deny direction. Deny instead, so the claim's contract holds for every
 	// enforced method.
-	if claims, ok := jwtClaimsFromContext(ctx); ok && claims.HasCapabilities {
+	if claims.HasCapabilities {
 		return denyResponse(p.clock, capability.ErrCodeSamplingDenied, "",
 			"the token carries an mcp.capabilities claim, which is an exhaustive allowlist, and sampling cannot be listed in it (system: targets are not expressible as capability claims); server-initiated sampling is therefore denied for this token")
 	}

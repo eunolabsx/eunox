@@ -1287,16 +1287,20 @@ func (s *httpSession) readUpstream(ctx context.Context) {
 			// of the kill only through CheckKill/pubsub — so gate the broadcast here too,
 			// mirroring the stdio transport. CheckKill reads the local cache (cheap) and
 			// denies on a store error (fail closed); the drop is recorded for auditability.
-			// s.route is non-nil in production; the guard covers a test-assembled session.
-			if s.route != nil && s.route.pdp != nil {
-				killCtx := ctx
-				if s.claims != nil {
-					killCtx = pdp.WithJWTClaims(killCtx, s.claims)
-				}
-				if deny := s.route.pdp.CheckKill(killCtx, s.id); deny != nil {
-					recordKillDrop(killCtx, asRecorder(s.route.sink), deny, verifiedSession(s.id), msg.Method, msg.Method, legHTTPUpstreamNotification)
-					continue
-				}
+			//
+			// Dereferenced unconditionally, with no `s.route != nil` guard. handleMCPGet
+			// rejects exactly that pattern in gate code for the reason it applies here:
+			// production never builds a route-less session, so the branch can only ever be
+			// taken by a test — and what it does when taken is SKIP a kill check and
+			// broadcast, i.e. fail open in the one place this block exists to close. A
+			// route-less session reaching here should panic like the construction bug it is.
+			killCtx := ctx
+			if s.claims != nil {
+				killCtx = pdp.WithJWTClaims(killCtx, s.claims)
+			}
+			if deny := s.route.pdp.CheckKill(killCtx, s.id); deny != nil {
+				recordKillDrop(killCtx, asRecorder(s.route.sink), deny, verifiedSession(s.id), msg.Method, msg.Method, legHTTPUpstreamNotification)
+				continue
 			}
 			s.broadcast(msg)
 			continue

@@ -403,23 +403,17 @@ func errIfBinaryConfig(kind, path string, data []byte) error {
 	return nil
 }
 
-// gatewaySchemaVersionFromRaw reads the top-level schemaVersion scalar's VERBATIM text
-// from raw, plus whether it was written as a bare number (an unquoted 0.1, which YAML
-// auto-types !!float). Verbatim matters: "0.10" must stay "0.10" and not renormalize to
-// "0.1", which is a different grammar version. Returns "" when the document does not parse
-// as YAML at all or carries no schemaVersion — the caller's strict decode then reports the
-// syntax error with its own path-qualified message, and an absent version is handled by
-// the version validator.
-func gatewaySchemaVersionFromRaw(raw []byte) (version string, numeric, parsed bool) {
-	var node yaml.Node
-	if err := yaml.Unmarshal(raw, &node); err != nil {
-		return "", false, false
-	}
-	val := topLevelValueNode(&node, "schemaVersion")
+// gatewaySchemaVersionFromNode reads the top-level schemaVersion scalar's VERBATIM text
+// off the already-parsed document, plus whether it was written as a bare number (an
+// unquoted 0.1, which YAML auto-types !!float). Verbatim matters: "0.10" must stay "0.10"
+// and not renormalize to "0.1", which is a different grammar version. Returns "" when the
+// document carries no schemaVersion, which the version validator handles.
+func gatewaySchemaVersionFromNode(root *yaml.Node) (version string, numeric bool) {
+	val := topLevelValueNode(root, "schemaVersion")
 	if val == nil || val.Kind != yaml.ScalarNode {
-		return "", false, true
+		return "", false
 	}
-	return val.Value, val.Tag == "!!int" || val.Tag == "!!float", true
+	return val.Value, val.Tag == "!!int" || val.Tag == "!!float"
 }
 
 // LoadGatewayConfig reads, parses, env-expands, and validates a gateway config.
@@ -453,8 +447,19 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	// version gate entirely and leaving the strict decode below to report the whole
 	// document with an opaque "cannot unmarshal !!float into string". The node carries the
 	// scalar's verbatim text regardless of tag, so the gate runs either way.
-	version, numericVersion, parsed := gatewaySchemaVersionFromRaw(raw)
+	// ONE parse into a node, shared by every check that must see the document as
+	// WRITTEN rather than as decoded: this version pre-read, the numeric-coercion guard,
+	// and the per-upstream key-presence map below. Each used to re-parse the same bytes.
+	// A document that does not parse as YAML at all falls through with parsed=false to
+	// the strict decode, which reports the syntax error with its own path-qualified
+	// message — so every node-derived check below is gated on the SAME flag rather than
+	// each swallowing its own parse error.
+	var root yaml.Node
+	parsed := yaml.Unmarshal(raw, &root) == nil
+	var version string
+	var numericVersion bool
 	if parsed {
+		version, numericVersion = gatewaySchemaVersionFromNode(&root)
 		if err := validateGatewaySchemaVersion(version); err != nil {
 			return nil, fmt.Errorf("invalid gateway config %q: %w", path, err)
 		}
@@ -498,9 +503,8 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	// every 64 bytes). The strict struct decode above accepts the coerced integer with no
 	// signal, so re-walk the raw node and fail closed, reusing the manifest loader's
 	// coercion machinery so the two operator-authored config surfaces agree on this.
-	var rawNode yaml.Node
-	if err := yaml.Unmarshal(raw, &rawNode); err == nil {
-		if err := rejectCoercedGatewayNumerics(&rawNode, path); err != nil {
+	if parsed {
+		if err := rejectCoercedGatewayNumerics(&root, path); err != nil {
 			return nil, err
 		}
 	}
@@ -625,14 +629,15 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	// absent key. Re-read which keys each upstream actually wrote so validate() can
 	// reject forbidden transport fields on key *presence*, as the JSON Schema does.
 	// Read from the unexpanded raw: expansion changes values, never keys.
-	present, err := upstreamKeyPresence(raw)
+	present, err := upstreamKeyPresence(&root)
 	if err != nil {
 		return nil, fmt.Errorf("parsing gateway config %q: %w", path, err)
 	}
-	// present is indexed parallel to cfg.Upstreams. Assert the lengths match rather
-	// than assume it: a future YAML feature the two decoders treat differently
-	// could desync them, silently checking one upstream's forbidden fields against
-	// another's key set. Fail closed.
+	// present is indexed parallel to cfg.Upstreams. Assert the lengths match rather than
+	// assume it: this list is derived from the NODE while cfg.Upstreams comes from the
+	// strict Decoder (which is what KnownFields requires), so the two readings can still
+	// disagree on a future YAML feature and silently check one upstream's forbidden
+	// fields against another's key set. Fail closed.
 	if len(present) != len(cfg.Upstreams) {
 		return nil, fmt.Errorf("parsing gateway config %q: internal upstream-count mismatch (%d typed vs %d presence entries)", path, len(cfg.Upstreams), len(present))
 	}
@@ -893,11 +898,11 @@ func rejectExtraYAMLDocuments(dec *yaml.Decoder, path, what string) error {
 // an explicit zero from an absent key; recording presence lets validate() reject
 // the same set the JSON Schema's "<field>": false does, keeping the two in
 // lockstep.
-func upstreamKeyPresence(raw []byte) ([]map[string]bool, error) {
+func upstreamKeyPresence(root *yaml.Node) ([]map[string]bool, error) {
 	var doc struct {
 		Upstreams []map[string]any `yaml:"upstreams"`
 	}
-	if err := yaml.Unmarshal(raw, &doc); err != nil {
+	if err := root.Decode(&doc); err != nil {
 		return nil, err
 	}
 	present := make([]map[string]bool, 0, len(doc.Upstreams))

@@ -1015,6 +1015,18 @@ func Open(logPath, keyPath string, rotateSizeBytes int64, retainRotated int, opt
 		}
 	}
 
+	// Enforce the retention bound NOW, not on the next size-triggered rotation. Pruning
+	// otherwise ran only after the active log next grew ~rotateSizeBytes, so an operator
+	// who LOWERED retainRotated — or whose siblings accumulated while retention was
+	// failing — kept the excess for days or weeks on a quiet proxy (the default rotate
+	// size is 100 MiB), with the configured disk bound silently unenforced and no signal
+	// that it was. Run here, while this goroutine is still the only one touching the sink
+	// and before the drainer starts, so it needs no coordination with a concurrent
+	// rotation; pruneRotated publishes its own retention-stalled status either way.
+	if s.retain > 0 {
+		s.pruneRotated()
+	}
+
 	s.wg.Add(1)
 	go s.drain()
 	return s, nil
@@ -2146,23 +2158,6 @@ func BoundEnvelopeField(s string) string {
 // round-trip idempotency both mechanisms depend on.
 func boundFieldTo(s string, limit int) string {
 	return capability.BoundString(s, limit)
-}
-
-// TruncateUTF8 normalizes s to valid UTF-8 (replacing any invalid byte sequence with
-// U+FFFD, same as boundFieldTo) and cuts it to at most limit bytes without splitting a
-// rune. A non-positive limit truncates to "". Unlike boundFieldTo, the result carries
-// no visible truncation marker — callers that need one build it themselves.
-//
-// Exported so a caller outside this package (internal/transport's sanitizeClaimedID,
-// which makes an attacker-controlled HTTP header safe for a signed refusal-record
-// field) shares this exact logic rather than re-deriving it: both calls exist to make
-// an attacker string safe to log, and letting them drift apart on the boundary-walk
-// or normalization details would be a maintenance trap neither copy's own tests would
-// catch. Thin wrapper over capability.TruncateUTF8, the shared home for this
-// primitive (also used by pkg/enforcement's denial-details bound, which cannot import
-// this package), kept here so existing callers of audit.TruncateUTF8 need no change.
-func TruncateUTF8(s string, limit int) string {
-	return capability.TruncateUTF8(s, limit)
 }
 
 // bareTargetName returns the canonical bare target value. Every method except

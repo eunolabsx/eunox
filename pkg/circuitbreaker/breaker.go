@@ -62,9 +62,12 @@ func DefaultConfig() Config {
 // expose its state read-only. Every state-machine method below is internal.
 //
 // Contract: each admitted probe (an allowProbe call returning true) must be followed
-// by exactly one outcome on the returned probe (success, failure, or drop). When
-// HalfOpenMaxProbes > 1, a probe that never reports can wedge the breaker in
-// half-open indefinitely. [Do] honors this even when the guarded call panics.
+// by exactly one outcome on the returned probe (success, failure, or drop). A probe
+// that never reports wedges the breaker in half-open indefinitely — including at the
+// DEFAULT HalfOpenMaxProbes of 1, where the single admitted probe fills the window on
+// its own, so the qualifier this once carried ("when HalfOpenMaxProbes > 1") described
+// the one configuration the hazard does not need. [Do] honors the contract even when
+// the guarded call panics.
 //
 // Concurrency: the probe returned by allowProbe is generation-aware, so a late
 // outcome from a reopened half-open window is dropped rather than misapplied (which

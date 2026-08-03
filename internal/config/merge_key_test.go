@@ -19,6 +19,8 @@ package config
 import (
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 // loadGatewayConfigErr loads cfg from a temp file and returns the load error with
@@ -103,7 +105,11 @@ func TestUpstreamKeyPresence_RecordsMergedKeysNotTheMergeKey(t *testing.T) {
     command: /bin/echo
     <<: *shared
 `)
-	present, err := upstreamKeyPresence(raw)
+	var root yaml.Node
+	if err := yaml.Unmarshal(raw, &root); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	present, err := upstreamKeyPresence(&root)
 	if err != nil {
 		t.Fatalf("upstreamKeyPresence: %v", err)
 	}

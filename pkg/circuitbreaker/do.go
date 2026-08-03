@@ -39,9 +39,10 @@ func Do[T any](ctx context.Context, b *Breaker, fn func(ctx context.Context) (T,
 	// outcome is harmless either way.
 	//
 	// If fn panics, record a failure before the panic unwinds so a half-open breaker
-	// re-opens instead of staying wedged with a spent-but-unreported probe (which
-	// would reject all traffic indefinitely when HalfOpenMaxProbes > 1). The panic is
-	// not recovered.
+	// re-opens instead of staying wedged with a spent-but-unreported probe (which would
+	// reject all traffic indefinitely — at the default HalfOpenMaxProbes of 1 just as
+	// much as above it, since one unreported probe fills a one-probe window). The panic
+	// is not recovered.
 	completed := false
 	defer func() {
 		if !completed {

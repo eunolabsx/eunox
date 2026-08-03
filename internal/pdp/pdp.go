@@ -1910,16 +1910,15 @@ func composeHardened(r, verdict capability.EnforceResponse) capability.EnforceRe
 // stats under-counting escalations exactly as before). The wrapping layer's own reason is
 // appended to the message so an operator fixing the token still sees why authorization
 // failed.
-func (p *ManifestPDP) hardenOnEffectCeiling(ctx context.Context, sessionID string, r capability.EnforceResponse, target EnforceTarget, args map[string]interface{}) (capability.EnforceResponse, bool) {
+func (p *ManifestPDP) hardenOnEffectCeiling(ctx context.Context, sessionID string, r capability.EnforceResponse, target EnforceTarget, args map[string]interface{}, sel hardenSelection) (capability.EnforceResponse, bool) {
 	if r.Decision == capability.DecisionAllow || r.Denial == nil || r.Denial.HardDeny {
 		return r, false
 	}
-	claims := jwtClaimsAsMap(ctx)
-	matched := p.findConstraint(target, claims)
-	if matched == nil || !containsAction(matched.Actions, requiredActionFor(target.Type)) {
+	matched := sel.matched
+	if matched == nil {
 		return r, false
 	}
-	verdict := p.engine.CeilingVerdictFor(ctx, hardenRequest(ctx, sessionID, target, args, claims), matched)
+	verdict := p.engine.CeilingVerdictFor(ctx, hardenRequest(ctx, sessionID, target, args, sel.claims), matched)
 	if verdict == nil {
 		return r, false
 	}
@@ -1936,6 +1935,32 @@ func (p *ManifestPDP) hardenOnEffectCeiling(ctx context.Context, sessionID strin
 	// exists to close: adding an effect ceiling silently removed redaction that the same
 	// request got without one.
 	return p.withForwardObligationsFor(ctx, out, matched), true
+}
+
+// hardenSelection is the constraint (and the claims it was selected under) that
+// HardenRefusal's legs judge a refused request against — resolved ONCE per call and
+// passed down, rather than each leg re-deriving it from the same context and target.
+//
+// matched is nil when no capability covers this target for this principal, or when the
+// one that does does not permit the target's required action: both mean there is no
+// authored rule for a harden leg to speak for, so every leg treats it as "leave the
+// outer layer's refusal alone". Folding that into the selection is what keeps the two
+// legs from drifting on which of them is the stricter test.
+type hardenSelection struct {
+	claims  map[string]interface{}
+	matched *capability.Constraint
+}
+
+// selectForHardening resolves the hardening legs' shared inputs. It applies decideTarget's
+// own selection rule — findConstraint under the request's claims, then the action check —
+// so a harden leg speaks only for a constraint the enforced path would itself have matched.
+func (p *ManifestPDP) selectForHardening(ctx context.Context, target EnforceTarget) hardenSelection {
+	claims := jwtClaimsAsMap(ctx)
+	matched := p.findConstraint(target, claims)
+	if matched != nil && !containsAction(matched.Actions, requiredActionFor(target.Type)) {
+		matched = nil
+	}
+	return hardenSelection{claims: claims, matched: matched}
 }
 
 // HardenRefusal composes this PDP's own verdicts onto a refusal another layer produced.
@@ -1962,10 +1987,15 @@ func (p *ManifestPDP) HardenRefusal(ctx context.Context, sessionID string, r cap
 	if hardened, broke := p.hardenOnBrokenInterface(sessionID, r, target); broke {
 		return hardened
 	}
-	if hardened, over := p.hardenOnEffectCeiling(ctx, sessionID, r, target, args); over {
+	// Selected ONCE for all three legs below. Each used to re-resolve the claims and
+	// re-walk p.caps for the same target — three full passes over identical inputs on a
+	// path that only ever runs for an already-refused call — and, more to the point, two
+	// hand-written copies of one selection rule that had to stay in agreement.
+	sel := p.selectForHardening(ctx, target)
+	if hardened, over := p.hardenOnEffectCeiling(ctx, sessionID, r, target, args, sel); over {
 		return hardened
 	}
-	if hardened, unapproved := p.hardenOnUnapprovedDeclassify(ctx, sessionID, r, target, args); unapproved {
+	if hardened, unapproved := p.hardenOnUnapprovedDeclassify(ctx, sessionID, r, target, args, sel); unapproved {
 		return hardened
 	}
 	return p.withForwardObligations(ctx, r, target)
@@ -2002,7 +2032,7 @@ func (p *ManifestPDP) HardenRefusal(ctx context.Context, sessionID string, r cap
 // refusal had two record shapes depending on whether a JWT layer wrapped the call, with the
 // JWT-wrapped one missing the field an approver needs first ("what is this session already
 // carrying"). One resolver, one refusal builder, one record shape.
-func (p *ManifestPDP) hardenOnUnapprovedDeclassify(ctx context.Context, sessionID string, r capability.EnforceResponse, target EnforceTarget, args map[string]interface{}) (capability.EnforceResponse, bool) {
+func (p *ManifestPDP) hardenOnUnapprovedDeclassify(ctx context.Context, sessionID string, r capability.EnforceResponse, target EnforceTarget, args map[string]interface{}, sel hardenSelection) (capability.EnforceResponse, bool) {
 	if r.Decision == capability.DecisionAllow || r.Denial == nil || r.Denial.HardDeny {
 		return r, false
 	}
@@ -2011,9 +2041,8 @@ func (p *ManifestPDP) hardenOnUnapprovedDeclassify(ctx context.Context, sessionI
 	if p.engine == nil {
 		return r, false
 	}
-	claims := jwtClaimsAsMap(ctx)
-	matched := p.findConstraint(target, claims)
-	if matched == nil || !containsAction(matched.Actions, requiredActionFor(target.Type)) {
+	matched := sel.matched
+	if matched == nil {
 		return r, false
 	}
 	// The cheap structural test BEFORE the request is built. DeclassifyVerdictFor's first
@@ -2026,7 +2055,7 @@ func (p *ManifestPDP) hardenOnUnapprovedDeclassify(ctx context.Context, sessionI
 	}
 	// The shared request shape, plus the approvals — the verdict turns on them, and the
 	// engine reads them off the request rather than the context.
-	req := hardenRequest(ctx, sessionID, target, args, claims)
+	req := hardenRequest(ctx, sessionID, target, args, sel.claims)
 	req.DeclassifyApprovals = declassifyApprovalsFromContext(ctx)
 	// nil means the declassification would have been authorized — a live covering approval,
 	// or nothing to clear at all — so the outer layer's verdict stands as it was. Every
@@ -2494,9 +2523,12 @@ func isSafeJSONKey(s string) bool {
 // the marshaled entries array for the value of fieldName while every other field
 // keeps its original bytes verbatim. For a conformant (unique-key) object the only
 // change versus the upstream is the pruned list — field order and sibling fields
-// are byte-faithful. A pathological duplicate-key object is collapsed to one entry
-// per key (last value wins), exactly as encoding/json and the prior map round-trip
-// did, so the output is the standard parse, not the original byte sequence. A
+// are byte-faithful. It never SEES a duplicate-key object: its sole producer,
+// decodeOrderedObject, rejects an envelope carrying duplicate or fold-colliding keys
+// outright, because the proxy cannot know which of the two values a host binds. (This
+// once described collapsing them last-wins, matching encoding/json — a description that
+// now contradicts the gate above it, in the file where duplicate-key handling IS the
+// security-critical behavior.) A
 // nil/empty entries slice is emitted as [] (never null) so the list field stays an array.
 // If fieldName is not among keys it is appended, so the encoded object always carries
 // the list field (an envelope is never returned with the list silently dropped).

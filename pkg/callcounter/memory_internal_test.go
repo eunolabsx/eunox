@@ -1284,8 +1284,8 @@ func TestAdmitAll_ZeroWeightCreatesNoEntry(t *testing.T) {
 		t.Fatalf("entries after a zero-weight call = %d, want 0 (it records nothing)", got)
 	}
 	// The single maxKeys slot is therefore still free for a call that does record.
-	real := capability.QuotaBucket{Key: "sess|tool:charge", WindowSec: 60, Weight: 5, Limit: 1000}
-	if admitted, _, _, _, err := m.AdmitAll(ctx, []capability.QuotaBucket{real}); err != nil || !admitted {
+	recording := capability.QuotaBucket{Key: "sess|tool:charge", WindowSec: 60, Weight: 5, Limit: 1000}
+	if admitted, _, _, _, err := m.AdmitAll(ctx, []capability.QuotaBucket{recording}); err != nil || !admitted {
 		t.Fatalf("recording call after a zero-weight one: admitted=%v err=%v, want true/nil", admitted, err)
 	}
 }

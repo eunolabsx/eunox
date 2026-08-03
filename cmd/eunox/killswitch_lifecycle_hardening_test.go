@@ -86,6 +86,10 @@ func TestValidateProxyNumericFlags(t *testing.T) {
 		{"sentinel upstream-timeout ok", []string{"--upstream-timeout", "-1"}, false, ""},
 		{"zero upstream-timeout ok", []string{"--upstream-timeout", "0"}, false, ""},
 		{"sub-sentinel upstream-timeout", []string{"--upstream-timeout", "-5000"}, true, "--upstream-timeout"},
+		// A duration flag, and one whose clamp is silent: a negative value became the
+		// 30s default, i.e. the opposite of an operator shortening the revocation window.
+		{"zero killswitch-reconcile-interval ok", []string{"--killswitch-reconcile-interval", "0"}, false, ""},
+		{"negative killswitch-reconcile-interval", []string{"--killswitch-reconcile-interval", "-5s"}, true, "--killswitch-reconcile-interval"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

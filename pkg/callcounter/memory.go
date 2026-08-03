@@ -435,6 +435,10 @@ func (m *InMemory) AdmitAll(_ context.Context, buckets []capability.QuotaBucket)
 	// above fails the call closed if a caller passes colliding buckets, so the storage keys
 	// within a committed batch never collide.
 	type bucketState struct {
+		// b is the bucket this state belongs to. Held here rather than re-indexed as
+		// buckets[i] at each later loop: states is built one-per-bucket, so carrying the
+		// pointer keeps the two from being re-associated by index three more times.
+		b        *capability.QuotaBucket
 		sk       string
 		e        *entry // nil until the bucket's first admitted call
 		valid    []time.Time
@@ -453,7 +457,7 @@ func (m *InMemory) AdmitAll(_ context.Context, buckets []capability.QuotaBucket)
 		b := &buckets[i]
 		window := time.Duration(b.WindowSec) * time.Second
 		cutoff := now.Add(-window)
-		st := bucketState{sk: storageKey(b.Key, b.WindowSec), window: window}
+		st := bucketState{b: b, sk: storageKey(b.Key, b.WindowSec), window: window}
 		if e, ok := m.entries[st.sk]; ok {
 			// Prune expired entries and write back now: idempotent maintenance the
 			// single-key paths also do on every call, so doing it before the admit decision
@@ -476,8 +480,8 @@ func (m *InMemory) AdmitAll(_ context.Context, buckets []capability.QuotaBucket)
 		// At least one bucket is full: record nothing new (each existing entry was already
 		// pruned above) and report the blocking bucket with the same retry-after estimate
 		// its single-bucket sibling gives.
-		b, st := &buckets[blocked], states[blocked]
-		return false, blocked, st.cur, bucketRetryAfter(b, st.valid, st.weights, st.cur, st.window, now), nil
+		st := states[blocked]
+		return false, blocked, st.cur, bucketRetryAfter(st.b, st.valid, st.weights, st.cur, st.window, now), nil
 	}
 
 	// Every bucket has headroom → commit all of them. Resolve ONCE what each bucket would
@@ -487,14 +491,14 @@ func (m *InMemory) AdmitAll(_ context.Context, buckets []capability.QuotaBucket)
 	var maxTotal float64
 	newKeys := 0
 	for i := range states {
-		b, st := &buckets[i], &states[i]
-		st.post = st.cur + bucketWeight(b)
+		st := &states[i]
+		st.post = st.cur + bucketWeight(st.b)
 		// A weight that cannot move the total is admitted WITHOUT being recorded: it can
 		// never affect a future decision, and recording it is the one case that would grow
 		// a key without bound.
 		st.record = st.post != st.cur
 		// This key is weighted from here on if it was before OR this bucket is weighted.
-		st.writeWeighted = st.weighted || !b.Counted
+		st.writeWeighted = st.weighted || !st.b.Counted
 		if st.record && st.e == nil {
 			// Counted only for a bucket that will actually WRITE. A zero-weight call on an
 			// unseen key records nothing, so charging it against maxKeys (and denying on a
@@ -519,19 +523,19 @@ func (m *InMemory) AdmitAll(_ context.Context, buckets []capability.QuotaBucket)
 	for i := range states {
 		st := &states[i]
 		if st.record && st.writeWeighted && m.maxWeightedEntries > 0 &&
-			len(st.valid)+1 > m.maxWeightedEntries {
+			len(st.valid) >= m.maxWeightedEntries {
 			return false, 0, 0, 0, m.errWeightedEntryLimit()
 		}
 	}
 
 	for i := range states {
-		b, st := &buckets[i], &states[i]
+		st := &states[i]
 		if !st.record {
 			continue
 		}
 		e := st.e
 		if e == nil {
-			e = &entry{windowSec: b.WindowSec}
+			e = &entry{windowSec: st.b.WindowSec}
 			m.entries[st.sk] = e
 			st.e = e
 		}
@@ -544,7 +548,7 @@ func (m *InMemory) AdmitAll(_ context.Context, buckets []capability.QuotaBucket)
 				weights[j] = 1
 			}
 		}
-		ts, weights = appendCall(ts, weights, now, bucketWeight(b), st.writeWeighted)
+		ts, weights = appendCall(ts, weights, now, bucketWeight(st.b), st.writeWeighted)
 		storeEntry(e, ts, weights, st.writeWeighted)
 	}
 	return true, 0, maxTotal, 0, nil

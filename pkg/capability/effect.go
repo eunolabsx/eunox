@@ -514,7 +514,7 @@ const (
 // documented not-exact path (a float64 comparison, a raw-bytes id, an unquantified
 // blast radius). Each of those is the conservative direction for that caller.
 func NumericLiteralBounded(s string) bool {
-	if len(s) == 0 || len(s) > MaxNumericLiteralLen {
+	if s == "" || len(s) > MaxNumericLiteralLen {
 		return false
 	}
 	i := 0

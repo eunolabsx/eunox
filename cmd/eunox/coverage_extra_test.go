@@ -586,14 +586,60 @@ func TestWriteDoctorAudit_WithKeyPresentAndTail(t *testing.T) {
 	var buf bytes.Buffer
 	writeDoctorAudit(&buf, logPath, keyPath, 50)
 	out := buf.String()
-	if !strings.Contains(out, "(present)") {
-		t.Errorf("expected the key-present marker:\n%s", out)
+	// Loadability, not mere existence: "exists but unreadable/corrupt" is precisely the
+	// deployment chasing UNKNOWN_KEY_ID, and it must not read as a healthy key.
+	if !strings.Contains(out, "(present, 1 key(s) loadable)") {
+		t.Errorf("expected the key-loadable marker:\n%s", out)
+	}
+	for _, k := range keyMaterialOf(t, keyPath) {
+		if strings.Contains(out, k) {
+			t.Error("the bundle must never contain key material")
+		}
 	}
 	if !strings.Contains(out, "records=2") {
 		t.Errorf("expected aggregate totals records=2:\n%s", out)
 	}
 	if !strings.Contains(out, "Last 2 record(s)") {
 		t.Errorf("expected a 2-record tail header:\n%s", out)
+	}
+}
+
+// keyMaterialOf returns the hex key lines of a key file, so a test can assert the support
+// bundle never reproduces them.
+func keyMaterialOf(t *testing.T, keyPath string) []string {
+	t.Helper()
+	data, err := os.ReadFile(keyPath) //nolint:gosec // test fixture path
+	if err != nil {
+		t.Fatalf("read key file: %v", err)
+	}
+	var out []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if line = strings.TrimSpace(line); line != "" && !strings.HasPrefix(line, "#") {
+			out = append(out, line)
+		}
+	}
+	if len(out) == 0 {
+		t.Fatal("precondition: the key file must carry a key")
+	}
+	return out
+}
+
+// TestWriteDoctorAudit_KeyPresentButUnloadableIsReportedAsSuch is the case "(present)"
+// papered over: the file exists, so a stat-only probe called it healthy, while the host
+// cannot actually verify its own tape with it.
+func TestWriteDoctorAudit_KeyPresentButUnloadableIsReportedAsSuch(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+	keyPath := filepath.Join(dir, "audit.key")
+	if err := os.WriteFile(keyPath, []byte("not-hex-at-all\n"), 0o600); err != nil {
+		t.Fatalf("write key file: %v", err)
+	}
+
+	var buf bytes.Buffer
+	writeDoctorAudit(&buf, logPath, keyPath, 0)
+	out := buf.String()
+	if !strings.Contains(out, "NOT loadable") {
+		t.Errorf("a corrupt key file must be reported as unloadable:\n%s", out)
 	}
 }
 
@@ -2449,8 +2495,8 @@ capabilities: []
 
 func TestCmdInit_MissingUpstreamURL(t *testing.T) {
 	code := cmdInit(nil)
-	if code != 1 {
-		t.Errorf("expected exit code 1 (missing --upstream-url), got %d", code)
+	if code != initUsageExit {
+		t.Errorf("expected exit code %d (missing --upstream-url), got %d", initUsageExit, code)
 	}
 }
 
@@ -2469,8 +2515,8 @@ func TestCmdInit_ConfigOutputWithoutOutput(t *testing.T) {
 	defer srv.Close()
 
 	code := cmdInit([]string{"--upstream-url", srv.URL, "--config-output", "/tmp/cfg.yaml"})
-	if code != 1 {
-		t.Errorf("expected exit code 1 (--config-output without --output), got %d", code)
+	if code != initUsageExit {
+		t.Errorf("expected exit code %d (--config-output without --output), got %d", initUsageExit, code)
 	}
 }
 

@@ -55,7 +55,7 @@ func interpretAuditTail(buf []byte, n int, readErr error, size int64) (string, e
 	// tail and mask the shrink.
 	//
 	// One branch, not two: an n == 0 arm ahead of this one was a strict subset of it
-	// (both callers guarantee len(buf) >= 1, so 0 < len(buf) always holds) differing
+	// (the caller guarantees len(buf) >= 1, so 0 < len(buf) always holds) differing
 	// only in the wording of an error nothing branches on — two exits to keep in step
 	// for one condition.
 	if n < len(buf) && errors.Is(readErr, io.EOF) {

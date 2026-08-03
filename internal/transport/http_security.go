@@ -19,7 +19,6 @@ import (
 	"os"
 	"strings"
 
-	"github.com/eunolabs/eunox/internal/audit"
 	"github.com/eunolabs/eunox/pkg/capability"
 )
 
@@ -401,14 +400,13 @@ const maxClaimedSessionIDLen = 200
 // The bound stays a BYTE bound: it exists to cap what an unauthenticated caller can
 // append to a record, and that is a byte budget.
 //
-// The normalize-then-rune-safe-cut logic itself lives in audit.TruncateUTF8 (this
-// package already depends on internal/audit for SanitizeAuditField, a different,
-// control-character-stripping helper) so it exists once rather than as an
-// independently-maintained second copy of internal/audit's identical boundFieldTo
-// logic; this wrapper keeps the threat-model documentation above local to the callers
-// that need it.
+// The normalize-then-rune-safe-cut logic itself lives in capability.TruncateUTF8 — the
+// shared home for the primitive, which internal/audit's own field bound and
+// pkg/enforcement's denial-details bound also build on — so it exists once rather than as
+// an independently-maintained second copy; this wrapper keeps the threat-model
+// documentation above local to the callers that need it.
 func sanitizeClaimedID(s string, limit int) string {
-	return audit.TruncateUTF8(s, limit)
+	return capability.TruncateUTF8(s, limit)
 }
 
 // maxRefusalDetailLen bounds the OTHER attacker-controlled strings a pre-session refusal
@@ -540,6 +538,8 @@ type rolledUpRecorder struct {
 	suppressed uint64
 }
 
+// RecordDeny stamps the rollup into this record's details and delegates. Only RecordDeny
+// is overridden: a rollup describes SUPPRESSED REFUSALS, and refusals are denies.
 func (r rolledUpRecorder) RecordDeny(ctx context.Context, sessionID, identifier, method, denialCode, condType string, details map[string]interface{}, observe bool) {
 	if details == nil {
 		details = make(map[string]interface{}, 2)
