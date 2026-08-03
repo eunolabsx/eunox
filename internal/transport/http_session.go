@@ -803,9 +803,11 @@ func (s *httpSession) beginDecisionTurn(ctx context.Context) func() {
 // Those captured claims are the same ones holdDecisionGate resolved from, so this hits the
 // cache; it still resolves and compares rather than reaching for s.decideGate directly, because
 // "the two agree" is a property to check, not one to assume. What makes the captured claims an
-// honest stand-in for the request identity in the first place is the session gate: on a route
-// that anchors state on the task, a request whose token resolves a DIFFERENT anchor is refused
-// rather than accounted against a bucket this leg cannot see (see ownerMismatch).
+// honest stand-in for the request identity is NOT a pin on the request — a session may span
+// anchors, and each host request is decided and keyed on its own — but the fact that this leg
+// does not decide at all once the session has spanned (see noteRequestAnchor and
+// samplingAnchorSplitDenial). Every turn taken here is therefore taken while one anchor is the
+// only one this session has resolved.
 func (s *httpSession) beginDecisionTurnWithin(w turnWait) (func(), bool) {
 	anchor := s.route.decisionAnchor(s.id, s.claims)
 	if gate := s.gateFor(anchor); gate != nil {

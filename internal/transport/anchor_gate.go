@@ -211,7 +211,7 @@ func (a *anchorGate) take(w turnWait) (end func(), ok bool) {
 		return a.held(), true
 	}
 	deadline := time.Now().Add(w.total)
-	timer := time.NewTimer(w.perHolder)
+	timer := time.NewTimer(w.window(deadline))
 	defer timer.Stop()
 	for {
 		// Read BEFORE the wait, so a handoff during the window is what the comparison sees.
@@ -227,10 +227,13 @@ func (a *anchorGate) take(w turnWait) (end func(), ok bool) {
 				return a.held(), true
 			default:
 			}
-			if a.handoffs.Load() == holder || !time.Now().Before(deadline) {
+			// The window is clamped to what is left of the ceiling, so this arm firing with no
+			// handoff behind it means EITHER the holder is stuck or the ceiling has arrived.
+			rest := w.window(deadline)
+			if a.handoffs.Load() == holder || rest <= 0 {
 				return nil, false
 			}
-			timer.Reset(w.perHolder)
+			timer.Reset(rest)
 		}
 	}
 }

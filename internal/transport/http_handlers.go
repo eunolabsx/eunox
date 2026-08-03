@@ -321,11 +321,13 @@ func (p *HTTPProxy) handleHTTPUpstreamRequest(ctx context.Context, sess *httpSes
 	// taken with (see serverRequestParams.claims), so the turn and the state key agree.
 	//
 	// Agreeing with each other is not enough — they must agree with the HOST leg, which reads
-	// each request's own claims. What makes them agree is the session gate: on a task-anchored
-	// route a request resolving a different anchor is refused (httpSession.anchorMismatch), so
-	// the captured claims and every request's claims resolve one anchor. Without that pin, a
-	// caller holding two tokens differing only in task_id taints one bucket through the host leg
-	// while this leg peeks another and finds it clean.
+	// each request's own claims. On a task-anchored route a session MAY span anchors (each host
+	// request is decided and keyed on its own), so what makes the two legs agree is not a pin on
+	// the request: it is that this leg refuses outright once the session has resolved a second
+	// anchor (anchorSplit below, httpSession.noteRequestAnchor for why). While it decides at
+	// all, the captured claims and every request's claims resolve one anchor. Without that
+	// refusal, a caller holding two tokens differing only in task_id taints one bucket through
+	// the host leg while this leg peeks another and finds it clean.
 	//
 	// Bounded: see samplingTurnWait for what the bound is for now that this no longer runs on
 	// the session's reader (it runs on its own goroutine, up to maxConcurrentServerRequests

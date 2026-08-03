@@ -1306,9 +1306,9 @@ var samplingTurnWait = turnWait{perHolder: 2 * time.Second, total: 8 * time.Seco
 //
 // The release is deferred, so it is panic-safe and runs before the caller's forward.
 func (fp serverRequestParams) decideSampling(ctx context.Context) capability.EnforceResponse {
-	// Before the turn, not after: a decision that cannot be made correctly should not queue for
-	// the right to make it, and a session in this state would take that turn on every
-	// server-initiated request for the rest of its life.
+	// Asked BEFORE the turn, so a decision that cannot be made correctly does not queue for the
+	// right to make it — a session in this state would take that turn on every server-initiated
+	// request for the rest of its life.
 	if fp.anchorSplit != nil && fp.anchorSplit() {
 		return samplingAnchorSplitDenial()
 	}
@@ -1318,6 +1318,16 @@ func (fp serverRequestParams) decideSampling(ctx context.Context) capability.Enf
 			return samplingTurnDenial()
 		}
 		defer end()
+		// And AGAIN once the turn is held, because the wait between the two is not short: it is
+		// bounded by samplingTurnWait, not by anything about this session, and the host leg can
+		// span its second anchor at any point inside it. The turn provides no ordering here —
+		// the two anchors take DIFFERENT gates, which is the whole reason this refusal exists —
+		// so without the re-check the window between "not split" and the flow peek it guards is
+		// the entire wait, and a taint committed under the other anchor during it is invisible
+		// to the peek that follows. The check is a lock-free atomic read.
+		if fp.anchorSplit != nil && fp.anchorSplit() {
+			return samplingAnchorSplitDenial()
+		}
 	}
 	return fp.pdp.DecideSampling(ctx, fp.sessionID, fp.sourceIP)
 }

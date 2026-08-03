@@ -126,6 +126,20 @@ func (e *Engine) DelegationEffectClassVerdictFor(_ context.Context, req *capabil
 	return e.checkDelegationEffectClass(req, effect, matched.IsAuditOnly(), NewRequestID(), e.clock.Now().UTC().Format(time.RFC3339Nano))
 }
 
+// IsDelegationRefusal reports whether d is a refusal one of the delegation gates produced.
+//
+// It reads the taxonomy slot every one of them stamps rather than the details discriminator,
+// because the slot is what the audit taxonomy keys on and it cannot be set by anything else:
+// delegationConditionType is not a condition an author can attach to a target.
+//
+// It is exported for a composing layer deciding whether it has anything to ADD. A verdict on
+// this axis composed onto a refusal already on this axis is not a hardening but a REPLACEMENT
+// — a different reason and a different hop, for a call the enforced path would have refused at
+// the earlier gate — so the layer that would compose asks this first.
+func IsDelegationRefusal(d *capability.DenialInfo) bool {
+	return d != nil && d.ConditionType == delegationConditionType
+}
+
 // delegationDenial builds the refusal every gate above returns, so the code, the taxonomy
 // slot, and the details shape are single-sourced.
 //

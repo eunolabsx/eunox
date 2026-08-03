@@ -1983,13 +1983,15 @@ naming an MCP-reserved component (`content`, `structuredContent`, `isError`,
 `contents`, `messages`, `_meta`) is left to that component's own handling rather
 than masking the whole component, which would hand the host a result it cannot
 decode; a dotted path *through* one (`structuredContent.ssn`) resolves normally and
-masks that leaf. The same exemption applies one level down to the two keys a content
-item is classified by (`type`, `text`): a bare `text` path does not mask the body
-wholesale, and a field named `text` *inside* it is still masked. Binary media content
-the proxy cannot address (the base64 `data` of an image or audio item) is preserved
-unchanged, but the keys such an item carries alongside it are walked like any other:
-a declared field hidden under a content item's `_meta` or `annotations` is masked,
-not forwarded.
+masks that leaf. The same exemption applies one level down to a content item's own
+protocol-structural keys (`type`, `text`, `data`, `mimeType`, `blob`, `uri`,
+`resource`, `annotations`, `_meta`): a bare `text` path does not mask the body
+wholesale and a bare `_meta` path does not replace an object with a string a host
+cannot decode, while a field named `text` or nested *inside* `_meta` is still masked.
+Binary media content the proxy cannot address (the base64 `data` of an image or audio
+item) is preserved unchanged, but every other key such an item carries is walked like
+any other — a declared field hidden under a content item's `_meta`, `annotations`, or
+a vendor extension is masked, not forwarded.
 
 > **Ambiguous JSON keys fail closed under an active `redactFields`.** A response whose
 > object keys the proxy and the host can resolve differently cannot be verified, so it is

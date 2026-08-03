@@ -2056,6 +2056,17 @@ func (p *ManifestPDP) hardenOnDelegatedEffectClass(ctx context.Context, sessionI
 	if sel.delegation.IsEmpty() {
 		return r, false
 	}
+	// A refusal ALREADY on this axis is left alone. The outer layer runs the delegation TARGET
+	// gate itself (DelegationTargetDenial, on the paths that never reach the engine), and the
+	// enforced path checks that gate FIRST — before the conditions and before the ceiling — so
+	// a call refused for reaching past its grant is refused there, not here. Composing the
+	// effect-class verdict onto it would rewrite `reason` and name a DIFFERENT hop, sending an
+	// operator to widen an effect cap while the target grant is what actually blocked the call.
+	// This leg exists to give a refusal an axis it did not have, never to relabel one that has
+	// it.
+	if enforcement.IsDelegationRefusal(r.Denial) {
+		return r, false
+	}
 	matched := sel.matched
 	if matched == nil {
 		return r, false

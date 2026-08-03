@@ -1578,6 +1578,15 @@ Section conventions:
 
 ### Security
 
+- **A request the engine cannot anchor writes no state, on every path — not only the ones
+  that reach a decision.** Under `taskAnchoredState` an authenticated caller whose token
+  carries no `mcp.task_id` is refused rather than accounted against a second, session-keyed
+  bucket. That rule lived in the decision tail, which a **no-match** deny never reaches — so on
+  an `--audit` route, where such a deny is forwarded and the unlisted tool actually runs, its
+  `sequenceBlock` antecedent was written under the SESSION key while every enforced sink reads
+  the task key: the sink Peeks an empty history and fails open. The guard now sits on the state
+  WRITE itself, so every caller inherits it instead of each remembering to ask.
+
 - **`redactFields` reaches a declared field inside a content ITEM, outside `text`.** The
   redaction ran three passes — each content item's `text` body, `structuredContent`, and every
   other **top-level** envelope key — and the third explicitly skipped `content`, so any key on

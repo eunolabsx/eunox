@@ -168,3 +168,39 @@ func TestApplyRedactObligs_ContentItemSiblingDuplicateKeyFailsClosed(t *testing.
 	body := []byte(`{"content":[{"type":"text","text":"benign","extra":"{\"data\":{\"ssn\":\"` + redactSSNValue + `\"},\"data\":{}}"}]}`)
 	assertRedactionFailsClosed(t, body, redactDataSSN, redactSSNValue)
 }
+
+// The gap the item walk itself could reopen, one type dispatch away: an image/audio item has
+// NO body pass, so if the walk skipped `text` unconditionally that key would be inspected by
+// no pass at all — the exact shape #204 closed for every other key.
+func TestApplyRedactObligs_TextOnABinaryItemIsStillWalked(t *testing.T) {
+	t.Parallel()
+	for _, typ := range []string{"image", "audio"} {
+		body := []byte(`{"content":[{"type":"` + typ + `","data":"e30=","mimeType":"image/png","text":"{\"data\":{\"ssn\":\"` + redactSSNValue + `\"}}"}]}`)
+		out, err := ApplyRedactObligs(body, redactDataSSN)
+		require.NoError(t, err, typ)
+		assert.NotContains(t, string(out), redactSSNValue,
+			"%s: a `text` key on an item whose dispatch runs no body pass must still be walked", typ)
+	}
+}
+
+// A single-segment path naming one of a content item's protocol-structural keys must not
+// replace it with the string sentinel: that is a hard protocol failure (a struct-binding host
+// cannot decode the result at all) in place of the field-level masking the operator asked for
+// — the same trade the envelope root makes for its reserved keys.
+func TestApplyRedactObligs_ContentItemProtocolKeysAreNotMaskedWholesale(t *testing.T) {
+	t.Parallel()
+	for _, key := range []string{"_meta", "annotations", "data", "mimeType"} {
+		body := []byte(`{"content":[{"type":"image","data":"e30=","mimeType":"image/png","_meta":{"a":1},"annotations":{"b":2}}]}`)
+		out, err := ApplyRedactObligs(body, []capability.Obligation{
+			{Type: capability.DirectiveTypeRedactFields, Paths: []string{key}},
+		})
+		require.NoError(t, err, key)
+		assert.NotContains(t, string(out), `"`+key+`":"`+redactedSentinel+`"`,
+			"%s carries protocol structure on a content item; masking it wholesale hands the host an item it cannot decode", key)
+	}
+
+	// The exemption costs the obligation nothing: a declared field INSIDE one of them is
+	// still masked, which is the whole point of walking the item's keys.
+	body := []byte(`{"content":[{"type":"text","text":"ok","_meta":{"data":{"ssn":"` + redactSSNValue + `"}}}]}`)
+	assertRedactedSSN(t, body, redactDataSSN)
+}

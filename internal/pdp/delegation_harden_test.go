@@ -9,6 +9,8 @@ import (
 
 	"github.com/eunolabs/eunox/pkg/capability"
 	"github.com/eunolabs/eunox/pkg/enforcement"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // The harden path applied a delegation chain to its OBLIGATIONS and not to its VERDICT: the
@@ -148,4 +150,31 @@ func TestHardenRefusal_DelegationCapDoesNotPreemptTheEscalation(t *testing.T) {
 	if hardened.Denial == nil || !hardened.Denial.HardDeny {
 		t.Fatalf("the composed refusal must stay hard: %+v", hardened.Denial)
 	}
+}
+
+// A refusal ALREADY on the delegation axis is left alone. The enforced path runs the target
+// gate FIRST — before conditions and before the ceiling — so a call refused for reaching past
+// its grant is refused there; composing the effect-class verdict onto it would rewrite the
+// reason and name a DIFFERENT hop, sending an operator to widen an effect cap while the target
+// grant is what actually blocked the call.
+func TestHardenRefusal_DoesNotRelabelADelegationTargetRefusal(t *testing.T) {
+	t.Parallel()
+	p := delegatedEffectPDP()
+	target := EnforceTarget{Type: capability.TargetTypeTool, Name: "wire_transfer"}
+
+	// What the outer layer's own target gate produces: soft, on this axis, naming the hop whose
+	// grant did not admit the target.
+	outer := *enforcement.DelegationTargetDenial(
+		&capability.DelegationChain{
+			Actors: []string{"agent-a"},
+			Grants: []capability.DelegationGrant{{Subject: "agent-a", Targets: &[]string{"tool:read_file"}}},
+		},
+		"tool:wire_transfer", false, "req-1", "2026-08-03T00:00:00Z")
+
+	hardened := p.HardenRefusal(cappedDelegationCtx(capability.EffectReversible), "s", outer, target, nil)
+	require.NotNil(t, hardened.Denial)
+	assert.Equal(t, "target_not_delegated", hardened.Denial.Details["reason"],
+		"a refusal already on this axis must keep its own reason: the target gate runs first on the enforced path")
+	assert.Equal(t, "agent-a", hardened.Denial.Details["delegate"],
+		"and must keep the hop that actually blocked the call")
 }

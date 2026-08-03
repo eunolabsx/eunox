@@ -222,3 +222,28 @@ func TestTaskAnchoredSession_SpanningRefusesTheSinkNotTheRequest(t *testing.T) {
 	require.True(t, sess.spansAnchors(), "the span does not clear")
 	assert.Equal(t, capability.DecisionDeny, samplingLeg().Decision)
 }
+
+// TestSamplingLeg_AnchorSplitIsRecheckedAfterTheTurn: the gap between the first check and the
+// flow peek it guards is the whole turn wait — bounded by samplingTurnWait, not by anything
+// about this session — and the host leg can span its second anchor at any point inside it. The
+// two anchors take different gates, so the turn provides no ordering; only a re-check does.
+func TestSamplingLeg_AnchorSplitIsRecheckedAfterTheTurn(t *testing.T) {
+	t.Parallel()
+	dp := pdp.NewManifestPDP([]capability.Constraint{
+		{Target: "system:sampling/createMessage", Actions: []string{"allow"}},
+	}, enforcement.New(), killswitch.NewInMemory())
+
+	spanned := false
+	fp := serverRequestParams{
+		sessionID:   "sess-a",
+		anchorSplit: func() bool { return spanned },
+		// The host leg spans its second anchor WHILE this leg waits for the turn.
+		decideLock: func() (func(), bool) { spanned = true; return func() {}, true },
+		pdp:        dp,
+	}
+	dec := fp.decideSampling(context.Background())
+	require.Equal(t, capability.DecisionDeny, dec.Decision,
+		"a span that lands during the turn wait must be caught: the peek that follows would read the wrong anchor")
+	require.NotNil(t, dec.Denial)
+	assert.Equal(t, "session_spans_anchors", dec.Denial.Details["reason"])
+}

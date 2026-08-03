@@ -31,7 +31,7 @@ import (
 // The result is decoded into a generic map so fields the proxy does not model
 // (structuredContent, _meta, annotations, non-text content) survive the round-trip.
 // Redaction applies to (1) each content item — its text body when it has one, plus every
-// other key it carries (see redactContentItemSiblings) — (2) the structuredContent object,
+// other key it carries (see redactContentItemKeys) — (2) the structuredContent object,
 // and (3) every other top-level envelope key. Content that is not a clean JSON container — free-form
 // text, malformed JSON, JSON embedded in prose, a scalar — carries no addressable JSON
 // object key and passes through unchanged; redactFields redacts cleanly-parseable JSON
@@ -225,11 +225,17 @@ func redactContentItem(obj map[string]interface{}, spec redactSpec) (bool, error
 				return false, fmt.Errorf("redactFields: response 'content' item has unrecognized type %q; cannot verify redaction (fail closed)", t)
 			}
 			// Recognized binary media (image/audio) carries no addressable JSON body of its
-			// OWN that a redactFields dot-path could match — but it may still carry sibling
-			// keys that do, so it falls through to the sibling walk instead of being passed
-			// through whole. `data` on an image item is base64 text, not a JSON container,
-			// so the walk leaves it alone by the same rule that passes prose through.
-			return redactContentItemSiblings(obj, spec)
+			// OWN that a redactFields dot-path could match — but it may still carry keys that
+			// do, so it falls through to the walk instead of being passed through whole. Its
+			// `data` is base64 text, not a JSON container, so the walk leaves it alone by the
+			// same rule that passes prose through.
+			//
+			// bodyHandled is FALSE here, and that is the load-bearing part: this item's `text`
+			// (if it has one — nothing in the protocol forbids it) got no body pass, so the
+			// walk must treat it as an ordinary key. Passing true would leave it inspected by
+			// no pass at all, which is exactly the gap this walk exists to close, one type
+			// dispatch away.
+			return redactContentItemKeys(obj, spec, false)
 		}
 	}
 	text, ok := obj["text"].(string)
@@ -242,18 +248,21 @@ func redactContentItem(obj map[string]interface{}, spec redactSpec) (bool, error
 	}
 	changed := redacted != text
 	obj["text"] = redacted
-	// The item's other keys, AFTER its body: the sibling walk skips `text`, so the body is
-	// processed exactly once, under the rigor its own pass applies.
-	sibChanged, sibErr := redactContentItemSiblings(obj, spec)
+	// The item's other keys, AFTER its body: the walk skips `text` because THIS pass handled
+	// it, so the body is processed exactly once, under the rigor its own pass applies.
+	sibChanged, sibErr := redactContentItemKeys(obj, spec, true)
 	if sibErr != nil {
 		return false, sibErr // fail closed
 	}
 	return changed || sibChanged, nil
 }
 
-// redactContentItemSiblings applies the redaction paths to every key of a `content` item
-// OTHER than the two ApplyRedactObligs dispatches on (`type` and `text`), which have their
-// own treatment above.
+// redactContentItemKeys applies the redaction paths to a `content` item's keys. bodyHandled
+// reports whether the caller already ran the `text` body through its own pass: when it did,
+// `text` is skipped here so the body is processed exactly once; when it did not (an
+// image/audio item, whose dispatch has no body pass), `text` is walked like any other key,
+// because a key no pass inspects is the whole defect this walk exists to close. `type` is
+// always skipped — it is read as a string by the dispatch and carries nothing addressable.
 //
 // It is redactSiblingTopLevelKeys' rationale one level down, and it is the same rationale
 // verbatim: `content` and `structuredContent` are the shapes MCP defines, but a content ITEM
@@ -273,10 +282,10 @@ func redactContentItem(obj map[string]interface{}, spec redactSpec) (bool, error
 // redactSiblingTopLevelKeys applies them to the envelope: the value walk below only ever sees
 // a key's VALUE, so a declared field sitting DIRECTLY on the item —
 // {"type":"text","text":"benign","ssn":"123-45-6789"} — would never be tested against its own
-// name. `type` and `text` are exempt from that pass alone (see contentItemRootExempt); every
-// other key is ordinary data at this level and masking one the operator NAMED is what they
-// asked for.
-func redactContentItemSiblings(obj map[string]interface{}, spec redactSpec) (bool, error) {
+// name. A single-segment path naming one of the item's PROTOCOL-structural keys is exempt from
+// that pass alone (see contentItemRootExempt); every other key is ordinary data at this level
+// and masking one the operator NAMED is what they asked for.
+func redactContentItemKeys(obj map[string]interface{}, spec redactSpec, bodyHandled bool) (bool, error) {
 	changed := false
 	for _, p := range spec.paths {
 		if contentItemRootExempt(p) {
@@ -287,7 +296,7 @@ func redactContentItemSiblings(obj map[string]interface{}, spec redactSpec) (boo
 		}
 	}
 	for key, val := range obj {
-		if _, dispatched := mcpContentItemKeys[key]; dispatched {
+		if key == "type" || (key == "text" && bodyHandled) {
 			continue
 		}
 		out, c, err := redactSiblingValue(key, val, spec)
@@ -306,21 +315,23 @@ func redactContentItemSiblings(obj map[string]interface{}, spec redactSpec) (boo
 
 // contentItemRootExempt reports whether a redact path must not be applied at a content item's
 // root. It is envelopeRootExempt one level down, with the same shape and the same reason:
-// only a SINGLE-SEGMENT path naming a key this pass DISPATCHES on is exempt, because masking
-// that key wholesale would replace something the dispatch depends on — a `type` the item
-// cannot be classified without (and which a spec-conformant host cannot decode as a string
-// sentinel), or the `text` body whose own pass redacts it with rigor this one does not have.
+// only a SINGLE-SEGMENT path naming one of the item's protocol-structural keys is exempt,
+// because masking one of those wholesale replaces a value the PROTOCOL owns with a string
+// sentinel, handing a host a content item it cannot decode — `annotations` and `_meta` are
+// objects, `resource` is an object, and a struct-binding SDK fails the whole tool result over
+// one of them. That is the identical trade mcpReservedRootKeys makes at the envelope, and it
+// costs the obligation nothing: the value walk still descends every one of these (except the
+// two the dispatch owns), so a declared field hidden INSIDE an item's `_meta` is masked
+// exactly as before — only the "mask the whole component" spelling is withheld.
 //
-// A DOTTED path through either is not exempt, matching the envelope rule. It names a leaf, and
-// masking that leaf is what the operator asked for — `text` holds a string, so the walk finds
-// nothing under it anyway, and the equivalent under a doubly-encoded body is reached by the
-// body's own pass.
+// A DOTTED path through one is not exempt, matching the envelope rule. It names a leaf, and
+// masking that leaf is what the operator asked for.
 func contentItemRootExempt(path string) bool {
 	if strings.Contains(path, ".") {
 		return false
 	}
-	_, dispatched := mcpContentItemKeys[path]
-	return dispatched
+	_, reserved := mcpContentItemReservedKeys[path]
+	return reserved
 }
 
 // redactionKeysAmbiguous reports whether raw — a result envelope, or a JSON container
@@ -732,6 +743,36 @@ func redactJSONValue(val interface{}, paths []string) bool {
 var mcpContentItemKeys = map[string]struct{}{
 	"type": {},
 	"text": {},
+}
+
+// mcpContentItemReservedKeys are a content item's PROTOCOL-structural keys: the two the
+// dispatch reads, the binary payload and its media type, an embedded resource and its uri,
+// and the two metadata sidecars MCP defines on an item.
+//
+// They are exempt from WHOLESALE masking at the item root, exactly as mcpReservedRootKeys is
+// at the envelope root and for the same reason: the sentinel is a string, and replacing a
+// protocol object (`annotations`, `_meta`, `resource`) or a typed field with one yields an
+// item a spec-conformant host cannot decode — a struct-binding SDK fails the whole tool
+// result over it, which is a hard protocol failure in place of the field-level masking the
+// operator asked for. It is not a redaction gap: the value walk still descends every one of
+// these except the two the dispatch owns, so a declared field hidden inside an item's `_meta`
+// is masked as before; only the "mask the whole component" spelling is withheld.
+//
+// They are deliberately NOT in the case-variant fold scope (redactionFoldKeys), unlike the
+// two dispatch keys. A variant here routes a key to the item-root MASK rather than away from
+// a stricter pass, so the divergence between this redactor and a case-insensitive host can
+// only produce more masking, never less — over-redaction, which is the safe direction and not
+// worth refusing a response over.
+var mcpContentItemReservedKeys = map[string]struct{}{
+	"type":        {},
+	"text":        {},
+	"data":        {},
+	"mimeType":    {},
+	"blob":        {},
+	"uri":         {},
+	"resource":    {},
+	"annotations": {},
+	"_meta":       {},
 }
 
 var mcpReservedRootKeys = map[string]struct{}{

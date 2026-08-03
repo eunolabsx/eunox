@@ -101,11 +101,13 @@ func TestTurnWait_StdioTotalCeilingCapsAMovingQueue(t *testing.T) {
 
 	start := time.Now()
 	// The queue hands off every 20ms forever (800ms of work), so per-holder alone would never
-	// fire. The ceiling is what ends the wait.
+	// fire. The ceiling is what ends the wait — and it must end it AT the ceiling, not at the
+	// first per-holder boundary past it, which is what a window that ignores the deadline gives.
 	_, ok := g.beginWithin(waiter, turnWait{perHolder: 200 * time.Millisecond, total: 150 * time.Millisecond})
 	waited := time.Since(start)
 	assert.False(t, ok, "a moving queue must still be bounded by the total ceiling")
-	assert.Less(t, waited, 600*time.Millisecond, "the ceiling must end the wait well before the queue drains")
+	assert.Less(t, waited, 190*time.Millisecond,
+		"the wait must end at the ceiling (150ms), not at the first per-holder window past it (200ms)")
 	<-done
 }
 
@@ -138,7 +140,8 @@ func TestTurnWait_HTTPGateFreshWindowPerHandoff(t *testing.T) {
 	assert.Nil(t, end)
 	assert.GreaterOrEqual(t, waited, 150*time.Millisecond,
 		"a waiter observing handoffs must keep taking fresh windows rather than expiring on the first")
-	assert.Less(t, waited, 3*time.Second, "and the ceiling must still end it")
+	assert.Less(t, waited, 700*time.Millisecond,
+		"and it must end AT the ceiling (400ms), not at the first per-holder window past it")
 }
 
 // The same stuck-holder property on the HTTP gate, with no handoffs at all: one window and out.

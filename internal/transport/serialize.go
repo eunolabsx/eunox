@@ -260,6 +260,19 @@ type turnWait struct {
 // bounded reports whether this waiter gives up at all.
 func (w turnWait) bounded() bool { return w.perHolder > 0 }
 
+// window is how long to wait before re-examining, given the absolute deadline: one holder's
+// window, or whatever is left of the ceiling when that is less. Without the clamp the ceiling
+// is only ever evaluated at a perHolder boundary, so the real bound is the first multiple at
+// or past total — which is exactly total for the shipped constants and silently is not for any
+// other pair. A non-positive result means the ceiling has passed.
+func (w turnWait) window(deadline time.Time) time.Duration {
+	rest := time.Until(deadline)
+	if rest < w.perHolder {
+		return rest
+	}
+	return w.perHolder
+}
+
 // beginWithin is begin bounded by w: it reports ok=false when the ticket's turn has not come up
 // under w's rule, having ABANDONED the ticket so no later one queues behind it. An unbounded w
 // waits forever (what begin does).
@@ -294,14 +307,14 @@ func (g *decisionSerializer) beginWithin(t decisionTicket, w turnWait) (end func
 	var timer *time.Timer
 	var deadline time.Time
 	if w.bounded() {
-		timer = time.AfterFunc(w.perHolder, func() {
+		deadline = time.Now().Add(w.total)
+		timer = time.AfterFunc(w.window(deadline), func() {
 			g.queues.lock()
 			defer g.queues.unlock()
 			expired = true
 			q.cond.Broadcast()
 		})
 		defer timer.Stop()
-		deadline = time.Now().Add(w.total)
 	}
 	g.queues.lock()
 	// The ticket holding the turn when this window opened. A change means the queue handed off
@@ -309,14 +322,20 @@ func (g *decisionSerializer) beginWithin(t decisionTicket, w turnWait) (end func
 	holder := q.serving
 	for q.serving != t.n {
 		if expired {
-			if q.serving == holder || !time.Now().Before(deadline) {
+			if q.serving == holder {
 				break
 			}
 			// A fresh window for the new holder: this waiter has not been stalled by anyone,
-			// it is queued behind work that is completing.
+			// it is queued behind work that is completing. window() clamps it to whatever is
+			// left of the ceiling, so a moving queue expires AT total rather than at the first
+			// perHolder multiple past it.
+			rest := w.window(deadline)
+			if rest <= 0 {
+				break
+			}
 			holder = q.serving
 			expired = false
-			timer.Reset(w.perHolder)
+			timer.Reset(rest)
 			continue
 		}
 		q.cond.Wait()

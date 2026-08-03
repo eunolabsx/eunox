@@ -5,6 +5,7 @@ package enforcement
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/eunolabs/eunox/pkg/capability"
@@ -500,6 +501,18 @@ func (e *SourceCommitError) Error() string { return e.Err.Error() }
 // and needs no rollback. carriedLabels is the pre-call accumulated set (peeked by the
 // caller before this commit), used to compute the rollback delta.
 func (e *Engine) recordSourceCall(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, flowRelevant bool, carriedLabels []string, decl declassifyOutcome) (labelsOut []string, cerr *SourceCommitError) {
+	// A request this engine cannot anchor as configured writes NOTHING. evaluateMatched refuses
+	// one long before the allow tail, so on that path this is a backstop — but this is also the
+	// entry point the PDP's audit-mode antecedent path uses for a deny that never ran the
+	// decision at all (a target absent from the manifest, forwarded by --audit, is the sharp
+	// case: no constraint matched, so nothing upstream of here asked). Falling back to session
+	// keying there writes exactly the split anchorUnresolved exists to refuse — a sequenceBlock
+	// antecedent under the session key that the enforced sink then Peeks under the task key and
+	// misses, failing OPEN — and writes it silently. The guard belongs on the WRITE, so every
+	// caller of it inherits the rule rather than each remembering to ask.
+	if e.anchorUnresolved(req) {
+		return nil, &SourceCommitError{Err: errUnanchorableStateWrite, Flow: flowRelevant}
+	}
 	var added []string
 	if flowRelevant {
 		var err error
@@ -538,6 +551,14 @@ func (e *Engine) recordSourceCall(ctx context.Context, req *capability.EnforceRe
 	}
 	return labelsOut, nil
 }
+
+// errUnanchorableStateWrite is the fault recordSourceCall reports for a request this engine
+// cannot anchor: task anchoring is on and the caller presented a token carrying no usable
+// mcp.task_id (see anchorUnresolved). It is a state-write refusal rather than a policy verdict,
+// which is why it travels as a SourceCommitError — every caller already maps one to a hard,
+// non-downgradable deny, which is what this needs: an --audit route forwarding the call is
+// precisely how the un-anchored write would happen.
+var errUnanchorableStateWrite = errors.New("this route anchors enforcement state on the task, but the presented token carries no mcp.task_id; refusing to record this call against a second, session-keyed bucket (fail closed)")
 
 // RecordSourceCall is the exported form of recordSourceCall for the audit-mode
 // antecedent path (recordAuditModeAntecedent): when an audit-mode source's deny is

@@ -1867,15 +1867,14 @@ func (e *Engine) CollectObligations(chain *capability.DelegationChain, matched *
 	// forgetting impossible.
 	//
 	// It is also a parameter rather than a read of req.Delegation, and that was reconsidered
-	// rather than inherited. Reading it inside would remove the appearance of two sources
-	// (three call sites pass req.Delegation, two pass delegationFromContext), but the two are
-	// the same context-derived value and the shape only holds where a REQUEST exists: the
-	// no-match site synthesizes a constraint with no request behind it, and the PDP's harden
-	// sites build one DELIBERATELY WITHOUT the chain (hardenRequest's doc says why — a
-	// harden-only seam may not produce the downgradable verdict a delegation refusal is). An
-	// inside read would therefore silently drop the chain's redaction on exactly the
-	// forwarded-refusal path this fill exists for. The parameter is what keeps "which chain
-	// applies here" a decision each call site makes in the open.
+	// rather than inherited. Every call site now passes the chain its own request carries (the
+	// PDP's harden sites included, since hardenRequest takes one), so the two are the same
+	// value — but the shape only holds where a REQUEST exists, and one site has none: the
+	// no-match fill synthesizes a constraint from the target alone. An inside read would
+	// therefore have to answer "no chain" there, silently dropping the chain's redaction on a
+	// forwarded refusal, which is one of the two paths this fill exists for. The parameter is
+	// what keeps "which chain applies here" a decision each call site makes in the open, and
+	// what makes a site that means "none" say so.
 	if ob := delegatedRedaction(chain); ob != nil {
 		obligations = append(obligations, *ob)
 	}
