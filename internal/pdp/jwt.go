@@ -2450,28 +2450,20 @@ func evaluateJWTConditions(clock enforcement.Clock, conditions []capability.Cond
 				}
 			}
 		case capability.AllowedValuesCondition:
-			// Distinguish "argument absent" from "present but not a string" (collapsing
-			// both would let a "*" pattern match an absent arg), mirroring the engine's
-			// handleAllowedValues MISSING_CONTEXT. ResolveArgument keeps "$.nested.key"
-			// resolution identical to the engine's.
-			rawVal, argExists := enforcement.ResolveArgument(args, c.Argument)
-			if !argExists {
-				resp := denyResponse(clock, capability.ErrCodeMissingContext, capability.ConditionTypeAllowedValues,
-					fmt.Sprintf("%q: argument %q is absent", name, c.Argument))
-				return &resp
-			}
-			// One enforcement point for both shapes: the shared MatchAllowedValue treats a
-			// string allowed-value as a glob (which cannot match a non-string argument) and
-			// a non-string allowed-value as an exact match with numeric coercion, so the
-			// string and non-string cases differ only in how the DENIAL reads — a string
-			// value is quoted into the message, a non-string one is not (its Go rendering
-			// would be neither the wire form nor useful).
-			if !enforcement.MatchAllowedValue(rawVal, c.Values, claims) {
-				detail := fmt.Sprintf("%q: argument %q value is not in the permitted set", name, c.Argument)
-				if val, isStr := rawVal.(string); isStr {
-					detail = fmt.Sprintf("%q: argument %q value %q is not permitted", name, c.Argument, val)
-				}
-				resp := denyResponse(clock, capability.ErrCodeValueNotPermitted, capability.ConditionTypeAllowedValues, detail)
+			// The engine's own predicate, NOT a copy of it. This arm used to re-implement
+			// handleAllowedValues line for line — ResolveArgument, the MISSING_CONTEXT arm,
+			// MatchAllowedValue, the VALUE_NOT_PERMITTED arm — and the copy had already
+			// drifted twice: it never gained the empty-argument guard, it never carried the
+			// structured details, and before MatchAllowedValue absorbed task-variable
+			// resolution a grant carrying a "${task.*}" reference matched nothing and denied
+			// every call under it. Calling the shared evaluator makes the next semantic added
+			// there reach this path by construction.
+			//
+			// It commits nothing, which is what makes it usable here: this runs BEFORE the
+			// inner PDP's own decision, so an evaluator that consumed a window slot or wrote a
+			// flow label would double-count against the manifest path that follows.
+			if cerr := enforcement.EvaluateAllowedValues(c, &capability.EnforceRequest{Arguments: args, Claims: claims}); cerr != nil {
+				resp := denyFromCondition(clock, name, cerr)
 				return &resp
 			}
 		default:

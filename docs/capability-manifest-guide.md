@@ -2444,11 +2444,25 @@ what happened; so does an allow whose commit faulted:
 | --- | --- |
 | `_eunox_declassify_spent_approval_id` | a **single-use** grant this call burned. Stamped on the allow and on any refusal, and whether or not a label moved — the grant is spent in every one of those cases |
 | `_eunox_declassify_not_applied` | the call was refused below the decision, so the approved clear was never made. Benign: the labels were never removed |
+| `_eunox_declassify_result_withheld` | qualifies the key above for the **redaction-failure** gate only: the upstream had already run the action and eunox dropped its result, so the sanitizing work is done and only the delivery failed |
 | `_eunox_declassify_commit_failed` | the call **ran** and the clear could not be applied. The session keeps taint the policy says the action dropped, so later sinks over-block until you retry under a new approval |
 
-`_eunox_declassify_commit_failed` is the one to alert on. None of the three reuses
+`_eunox_declassify_commit_failed` is the one to alert on. None of the four reuses
 `approval_id`, the top-level signed field, which keeps meaning "a declassification
 that actually took effect".
+
+The three gates are not one case, which is why the withheld-result key exists.
+`--require-audit=strict` blocks before the forward and an upstream transport failure
+can follow a side effect that already happened, so for both it is genuinely unknown
+whether the upstream ran anything. The redaction gate is reached only after a
+well-formed, successful reply: the transform really happened, and only eunox's own
+delivery of the result failed. The clear is still withheld there — the sanitized
+result never reached the host, so nothing sanitized entered the session, which is
+what a flow label tracks — but the burned `once` grant now costs a re-minted
+approval for a proxy- or manifest-side defect. This key is what tells you whether
+that approval is retrying the work or re-delivering work already done. A non-zero
+count is also a signal in its own right: a `redactFields` path and the real response
+shape disagree.
 
 The `_eunox_` prefix marks a key eunox injects rather than one a caller sent: two
 of these ride an **allow** record, whose `details` is the caller's own argument map

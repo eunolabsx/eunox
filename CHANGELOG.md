@@ -645,6 +645,60 @@ Section conventions:
 
 ### Fixed
 
+- **A withheld result is no longer recorded as a call that may never have run.** Three
+  gates below the decision refuse a call whose approved declassification therefore never
+  commits, and all three shared one record shape. They do not share one fact:
+  `--require-audit=strict` blocks before the forward and an upstream transport failure can
+  follow a side effect that already happened, so for both it is genuinely unknown whether
+  the upstream executed anything — while the **redaction-failure** gate is reached only
+  after a well-formed, successful reply, so there the sanitizing transform demonstrably ran
+  and only eunox's own delivery of the result failed. The clear is still withheld on that
+  exit (the sanitized result never reached the host, so nothing sanitized entered the
+  session, which is what a flow label tracks), but the burned `once` grant is then spent for
+  a proxy- or manifest-side defect. That refusal now stamps
+  `details._eunox_declassify_result_withheld` beside `_eunox_declassify_not_applied`, and
+  `eunox stats` counts it, so an operator reconciling the spent grant can tell "retry the
+  work" from "the work is done, only the delivery failed" — a distinction the tape did not
+  carry. A non-zero count is also its own signal: a `redactFields` path and the real
+  response shape disagree.
+
+- **`allowedValues` is one predicate instead of two.** The JWT capability-claim path
+  hand-copied the engine's `handleAllowedValues` — argument resolution, the
+  `MISSING_CONTEXT` arm, the match, the `VALUE_NOT_PERMITTED` arm — and the copy had drifted
+  on two axes: no empty-argument guard, and no structured `details`. One logical refusal
+  therefore reached the signed tape with **two shapes** depending only on whether a token
+  was involved, so a SIEM rule written against the manifest path's `allowedValues` denial
+  found nothing for a token-scoped caller, and the host-facing error could not name the
+  offending argument (the transport builds it from `details.argument`). The same mechanism
+  had already shipped a live defect once, when task-variable resolution was added on the
+  manifest side only and every grant carrying a `${task.*}` reference denied every call
+  under it. Both paths now call one exported, **non-committing** predicate
+  (`enforcement.EvaluateAllowedValues`), so a semantic added to it reaches both by
+  construction. The JWT-only fail-closed guards are untouched, and the JWT path's details go
+  through the same bound every engine-built deny inherits, so it does not become the one
+  denial able to carry a caller-sized value onto the tape.
+
+- **One audit-details merge, one aliasing semantic.** `internal/transport` had two
+  implementations of "fold extra keys into a details map" roughly 200 lines apart, with
+  different aliasing behavior: one returned its base map itself when there was nothing to
+  add, the other always allocated. The always-allocating one was load-bearing — its base is
+  the caller's live parsed argument map under `--audit`, and it writes the effect receipt in
+  afterwards — so the obvious cleanup of swapping in the helper that now existed in the same
+  package would have written a key the caller never sent into the request's own argument
+  map, and the signed record would have misreported the request it describes. There is now
+  one merge with one semantic (always allocate, except when there is nothing to own, which
+  preserves nil-vs-empty), both sites call it, and annotations go through the merge's input
+  rather than being written into its result.
+
+- **The `flow` audit discriminator is one shared constant.** `details.flow = true` is the
+  cross-cutting marker every information-flow event carries so that one filter finds them
+  all, and it was five independently typed string literals across two packages. A rename or
+  typo on either side splits an operator's flow query while **nothing fails** — the tape
+  stays well-formed, signed and chain-verifiable, and the query just returns less — and the
+  records that would vanish from it are the transport-side declassification annotations
+  nothing else on the tape reports. It is now `capability.FlowAuditDetailKey`, in the one
+  package both producers can import, with a test that fails on any respelling.
+
 - **`resources/unsubscribe` is enforced instead of denied.** It was mapped nowhere, so it
   fell to the fail-closed default in every mode and no manifest spelling could allow it: a
   host that subscribed to a permitted resource could never cancel through the proxy, and

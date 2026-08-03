@@ -483,7 +483,7 @@ func TestComputeAuditStats_CountsDeclassifications(t *testing.T) {
 	}
 }
 
-// TestComputeAuditStats_CountsDeclassifyFaults covers the three declassification facts that
+// TestComputeAuditStats_CountsDeclassifyFaults covers the four declassification facts that
 // live in `details` rather than in a signed top-level field, none of which this tool could
 // see at all before — it decoded six fields and never touched details, so an approved clear
 // that failed to apply was byte-indistinguishable from an ordinary allow, and a refused
@@ -492,7 +492,9 @@ func TestComputeAuditStats_CountsDeclassifications(t *testing.T) {
 // Each is counted separately because each sends an operator somewhere different: a failed
 // commit means the flow store faulted on a call that really ran (the session is now
 // over-tainted and later sinks over-block); a not-applied clear means the call was refused
-// and nothing moved; a spent grant means a one-shot approval is gone and has to be reissued.
+// and nothing moved; a withheld result means the action DID run and only its delivery
+// failed, so the re-minted approval re-delivers rather than re-runs; a spent grant means a
+// one-shot approval is gone and has to be reissued.
 func TestComputeAuditStats_CountsDeclassifyFaults(t *testing.T) {
 	t.Parallel()
 	tape := strings.Join([]string{
@@ -505,6 +507,12 @@ func TestComputeAuditStats_CountsDeclassifyFaults(t *testing.T) {
 		// The call was refused below the decision, so the clear was never made.
 		`{"decision":"deny","target":"sanitize","method":"tools/call","denial_code":"UPSTREAM_ERROR",` +
 			`"details":{"flow":true,"` + audit.DeclassifyNotAppliedKey + `":["pii"],"` + audit.DeclassifySpentApprovalKey + `":"apr-3"}}`,
+		// Refused too, but the action had already EXECUTED and its result was withheld
+		// because response redaction failed. It counts as not-applied AND as withheld: the
+		// second qualifies the first rather than replacing it.
+		`{"decision":"deny","target":"sanitize","method":"tools/call","denial_code":"ENFORCEMENT_ERROR",` +
+			`"details":{"flow":true,"` + audit.DeclassifyNotAppliedKey + `":["pii"],"` +
+			audit.DeclassifyResultWithheldKey + `":true,"` + audit.DeclassifySpentApprovalKey + `":"apr-4"}}`,
 		// An ordinary allow whose details are the caller's arguments: no declassify facts,
 		// and nothing here may be mistaken for one.
 		`{"decision":"allow","target":"read_file","method":"tools/call","details":{"path":"/tmp/x"}}`,
@@ -517,11 +525,14 @@ func TestComputeAuditStats_CountsDeclassifyFaults(t *testing.T) {
 	if got.declassifyCommitFailed != 1 {
 		t.Errorf("declassifyCommitFailed = %d, want 1 — the one an operator must act on", got.declassifyCommitFailed)
 	}
-	if got.declassifyNotApplied != 1 {
-		t.Errorf("declassifyNotApplied = %d, want 1", got.declassifyNotApplied)
+	if got.declassifyNotApplied != 2 {
+		t.Errorf("declassifyNotApplied = %d, want 2 — the withheld-result refusal is one of these too", got.declassifyNotApplied)
 	}
-	if got.spentApprovals != 3 {
-		t.Errorf("spentApprovals = %d, want 3 — a grant is spent on a clean clear, a failed commit and a refusal alike", got.spentApprovals)
+	if got.declassifyResultWithheld != 1 {
+		t.Errorf("declassifyResultWithheld = %d, want 1 — the one refusal where the action provably ran", got.declassifyResultWithheld)
+	}
+	if got.spentApprovals != 4 {
+		t.Errorf("spentApprovals = %d, want 4 — a grant is spent on a clean clear, a failed commit and a refusal alike", got.spentApprovals)
 	}
 	if got.declassified != 1 {
 		t.Errorf("declassified = %d, want 1 — only the clear that actually changed something", got.declassified)
@@ -537,7 +548,14 @@ func TestComputeAuditStats_CountsDeclassifyFaults(t *testing.T) {
 	if !strings.Contains(out.String(), "ATTENTION") {
 		t.Errorf("printAuditStats did not call out the failed commit:\n%s", out.String())
 	}
-	for _, want := range []string{"single-use approvals spent = 3", "declassify-not-applied = 1"} {
+	for _, want := range []string{
+		"single-use approvals spent = 4",
+		"declassify-not-applied = 2",
+		// The withheld-result subset must be legible on its own: it is the difference
+		// between reissuing an approval to retry the work and reissuing it to re-deliver
+		// work already done.
+		"had already EXECUTED upstream",
+	} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("printAuditStats is missing %q:\n%s", want, out.String())
 		}
@@ -554,6 +572,7 @@ func TestComputeAuditStats_DeclassifyProbeMatchesTheProducer(t *testing.T) {
 		audit.DeclassifySpentApprovalKey,
 		audit.DeclassifyNotAppliedKey,
 		audit.DeclassifyCommitFailedKey,
+		audit.DeclassifyResultWithheldKey,
 	} {
 		if !strings.HasPrefix(key, audit.DeclassifyDetailPrefix) {
 			t.Errorf("key %q does not carry the prefix %q the stats probe filters on", key, audit.DeclassifyDetailPrefix)

@@ -419,6 +419,32 @@ func denyResponse(clock enforcement.Clock, code, condType, message string) capab
 	}
 }
 
+// denyFromCondition builds this layer's deny from a verdict a SHARED condition evaluator
+// produced (enforcement.EvaluateAllowedValues today), so a refusal raised on the JWT
+// capability-claim path is the same refusal — code, condition type, and structured details —
+// the manifest path records for the same input.
+//
+// The details are the point. "One logical refusal, two record shapes depending only on
+// whether a token was involved" is the defect class this closes: the manifest path's
+// VALUE_NOT_PERMITTED carries details{argument, value, allowedValues} and the JWT path's
+// carried none, so a SIEM rule written against one found nothing for a token-scoped caller —
+// and the transport reads details["argument"] to name the offending argument in the
+// host-facing error, which that path could not do either.
+//
+// They go through BoundDenialDetails on the way, because these details echo the caller's own
+// failed argument and this path does not pass through the engine's denyResponse, which is
+// where every engine-built deny inherits that bound. Skipping it would make this the one
+// denial on the signed tape that can carry a caller-sized value.
+//
+// name — the capability-claim target this condition came from — is prefixed onto the shared
+// message rather than replacing it. A grant is one of an OR-list, so which entry refused is
+// the diagnostic a bare condition message cannot supply.
+func denyFromCondition(clock enforcement.Clock, name string, cerr *enforcement.ConditionError) capability.EnforceResponse {
+	resp := denyResponse(clock, cerr.Code, cerr.ConditionType, fmt.Sprintf("%q: %s", name, cerr.Message))
+	resp.Denial.Details = enforcement.BoundDenialDetails(cerr.Details)
+	return resp
+}
+
 // hardDenyResponse builds a deny that must never be downgraded to an audit-mode
 // forward — neither by decideTarget's stamp() (a per-constraint enforcement:audit
 // downgrade) nor by the transport's isObserveDeny gate (a route running under

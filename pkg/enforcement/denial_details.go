@@ -172,6 +172,19 @@ func boundDenialDetails(in map[string]interface{}) map[string]interface{} {
 	return out
 }
 
+// BoundDenialDetails applies boundDenialDetails' bound for a caller OUTSIDE the engine — a
+// PDP that evaluates a shared predicate (EvaluateAllowedValues) and assembles its own
+// EnforceResponse instead of going through denyResponse.
+//
+// It is exported so such a caller cannot produce the one denial on the tape exempt from the
+// bound the other twenty-odd inherit by construction. The details a shared predicate returns
+// echo the caller's failed argument verbatim, so a path that skipped this would hand a
+// post-auth caller the same signed-log amplifier this file exists to close — these are the
+// engine's own denial details, just assembled one layer up.
+func BoundDenialDetails(in map[string]interface{}) map[string]interface{} {
+	return boundDenialDetails(in)
+}
+
 // escapeReservedDetailKey re-spells a caller key that collides with the reserved
 // elision marker, so a marker on a record always means eunox elided something.
 func escapeReservedDetailKey(k string) string {

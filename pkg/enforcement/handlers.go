@@ -907,6 +907,34 @@ func (e *Engine) handleRecipientDomain(_ context.Context, cond capability.Condit
 }
 
 func (e *Engine) handleAllowedValues(_ context.Context, cond capability.Condition, req *capability.EnforceRequest) *ConditionError {
+	return EvaluateAllowedValues(cond, req)
+}
+
+// EvaluateAllowedValues is the ONE implementation of the allowedValues predicate, exported
+// so the JWT capability-claim path evaluates the identical check instead of hand-copying it.
+//
+// It is a plain function rather than a method because the check reads nothing off the engine:
+// no clock, no counter, no store. That is also what makes it safe for the composed caller —
+// it decides and COMMITS NOTHING, so a wrapping PDP can run it before the inner PDP's own
+// decision without double-counting a window slot, writing a flow label, or recording a
+// sequenceBlock antecedent. (The engine's full evaluator does commit, which is why routing
+// the shorthand path through EvaluateConditions is not the same fix; see the same constraint
+// on CeilingVerdictFor and DeclassifyVerdictFor.)
+//
+// The duplication it removes had already produced two divergences and one live defect. The
+// copy lacked the empty-argument guard and the structured Details below, so one logical
+// refusal reached the tape with two shapes depending only on whether a token was involved,
+// and a SIEM rule written against the manifest path's allowedValues denial found nothing for
+// a token-scoped caller. Earlier, task-variable resolution was added on this side and not the
+// other, and every grant carrying a "${task.*}" reference denied every call under it. Both
+// are the same mechanism, and a shared predicate is what retires it: the next semantic added
+// here — a coercion rule, a reference kind, a bounded-details rule — reaches both paths by
+// construction rather than by whoever edits it remembering there are two.
+//
+// A caller outside the engine must pass the returned Details through BoundDenialDetails
+// before they reach an audit record; on the engine's own path denyResponse does that for
+// every deny it builds.
+func EvaluateAllowedValues(cond capability.Condition, req *capability.EnforceRequest) *ConditionError {
 	av, condErr := castCondition[capability.AllowedValuesCondition](cond)
 	if condErr != nil {
 		return condErr
@@ -917,6 +945,17 @@ func (e *Engine) handleAllowedValues(_ context.Context, cond capability.Conditio
 			Code:          capability.ErrCodeConditionFailed,
 			ConditionType: capability.ConditionTypeAllowedValues,
 			Message:       "allowedValues condition has empty argument name",
+		}
+	}
+
+	// Unreachable from the engine, which never evaluates a condition without a request, but
+	// this is an exported seam now: a nil request must DENY rather than panic the request
+	// goroutine (fail-open-via-crash) or read as a condition that passed.
+	if req == nil {
+		return &ConditionError{
+			Code:          capability.ErrCodeConditionFailed,
+			ConditionType: capability.ConditionTypeAllowedValues,
+			Message:       "allowedValues evaluated with no request to check against",
 		}
 	}
 

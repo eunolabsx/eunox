@@ -470,6 +470,11 @@ func (fp forwardParams) recordUpstreamFailure(ctx context.Context, msg mcp.RPCMs
 // That is over-refusal — the operator mints another approval — and it is the fact the record
 // has to carry, since nothing else on the tape would name a grant spent by a call that did
 // not run.
+//
+// "Did not run" is true of the first two exits and NOT of the third, which is why the
+// redaction exit takes declassifyWithheldDetail instead of calling this directly: the labels
+// and the spent grant read the same on all three, but only there is it known that the action
+// executed.
 func (fp forwardParams) declassifyRefusalDetail(dec capability.EnforceResponse) map[string]interface{} {
 	// Either fact on its own is worth a record, and neither implies the other. A refusal
 	// below the decision carries the labels but no spent id when the grant was standing; the
@@ -487,6 +492,36 @@ func (fp forwardParams) declassifyRefusalDetail(dec capability.EnforceResponse) 
 	return detail
 }
 
+// declassifyWithheldDetail is declassifyRefusalDetail for the ONE refusal below the decision
+// where the upstream provably EXECUTED the declassifying action: redaction of its response
+// failed, so eunox dropped a well-formed, successful reply rather than forward it unredacted.
+//
+// It exists because the reasoning the other two exits share does not hold here. The strict
+// gate blocks before the forward and an upstream transport failure leaves it unknowable
+// whether a side effect landed, so for both of them "the approved clear did not take effect"
+// is the whole story. Here the sanitizing transform genuinely ran; only the delivery failed.
+// Sharing one detail shape across all three told an operator reconciling a burned `once`
+// grant that the call might never have happened, when on this exit it demonstrably did — the
+// difference between reissuing the approval to retry the work and reissuing it to re-deliver
+// work already done.
+//
+// The clear stays withheld, and that is decided here rather than inherited: the redacted
+// response never reached the host, so nothing sanitized entered the session and the taint
+// still describes it accurately. See audit.DeclassifyResultWithheldKey for the full reasoning
+// and the accepted cost. Returns nil for a decision that authorized no clear and spent no
+// grant, exactly as declassifyRefusalDetail does — a redaction failure on an ordinary call is
+// not a declassification event and gets no flow annotation.
+func (fp forwardParams) declassifyWithheldDetail(dec capability.EnforceResponse) map[string]interface{} {
+	detail := fp.declassifyRefusalDetail(dec)
+	if detail == nil {
+		return nil
+	}
+	// Beside the not-applied key rather than instead of it: both facts are true, and a
+	// consumer keyed on the benign "clear never ran" case must still find this refusal.
+	detail[audit.DeclassifyResultWithheldKey] = true
+	return detail
+}
+
 // declassifyDetail starts a declassification detail map with the discriminator every
 // information-flow event on the tape carries, so one filter finds these beside the sink
 // denials and the declassify escalations. Shared by the refusal and commit paths because
@@ -496,8 +531,13 @@ func (fp forwardParams) declassifyRefusalDetail(dec capability.EnforceResponse) 
 // The reserved `_eunox_declassify_*` keys, not this, are what a rule should MATCH on: two of
 // them ride an allow record whose details is the caller's argument map under --audit, and a
 // bare key there is caller-writable. This is a filter aid, not evidence.
+//
+// The key itself comes from capability.FlowAuditDetailKey rather than a literal spelled here:
+// this is the one producer outside pkg/enforcement, so a package-wide grep no longer catches a
+// divergence, and the records that would silently drop out of an operator's flow filter are
+// precisely the declassification ones nothing else on the tape reports.
 func declassifyDetail() map[string]interface{} {
-	return map[string]interface{}{"flow": true}
+	return map[string]interface{}{capability.FlowAuditDetailKey: true}
 }
 
 // addSpentApproval stamps the single-use declassify grant this call burned, if it burned
@@ -634,13 +674,33 @@ func (fp forwardParams) commitCleared(ctx context.Context, labels []string) ([]s
 	return fp.committer.CommitDeclassified(commitCtx, fp.sessionID, labels)
 }
 
-// mergeAuditDetails folds extra into base without mutating either — base may be the
-// caller's own live map (the audit-mode tools/call path passes the request's argument map
-// straight through), so writing into it would rewrite the request the record describes.
-// Returns base when extra is empty, so the overwhelmingly common no-declassification path
-// allocates nothing.
+// mergeAuditDetails folds extra into base and returns a map the caller OWNS, without
+// mutating either input. It is the package's one "fold extra keys into an audit details
+// map" primitive; both producers of an enforced record's details go through it.
+//
+// Always allocating is the load-bearing part, and it is why the empty-extra shortcut this
+// used to have is gone. base is routinely a map the record is supposed to DESCRIBE rather
+// than one this package owns:
+//
+//   - the audit-mode tools/call path passes the request's own parsed argument map straight
+//     through (see dispatchToolsCall), and
+//   - the deny paths pass the engine's denial.Details, read concurrently by nothing else but
+//     owned by the decision, not by the record builder.
+//
+// Handing one of those back means the next key a caller writes into the result — the effect
+// receipt, and any annotation added later — lands in the request's own argument map, so the
+// record silently misreports the request on the signed tape. Returning a fresh map on every
+// call makes that unrepresentable instead of a property of who currently writes what
+// afterwards. The saving it gives up is one shallow map copy on a path that is already
+// serializing, signing and writing an audit record.
+//
+// The one case that allocates nothing is the one where there is nothing to own: both inputs
+// empty returns base unchanged, preserving nil-vs-empty (the sink omits a nil details map
+// from the record entirely and marshals an empty one as {}), and an empty map has no entry
+// for a later write to corrupt. Callers that go on to write into the result must therefore
+// pass their key through extra rather than assigning into the return.
 func mergeAuditDetails(base, extra map[string]interface{}) map[string]interface{} {
-	if len(extra) == 0 {
+	if len(base) == 0 && len(extra) == 0 {
 		return base
 	}
 	out := make(map[string]interface{}, len(base)+len(extra))
@@ -842,10 +902,16 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 			// every redactFields-guarded call vanish from the audit trail. Also a
 			// forwarded-then-recorded boundary call, so it gets the same diagnostic.
 			//
-			// The third exit below the decision, and the clear is withheld for the same
-			// reason: the response never reaches the host, so the declassifying call did
-			// not deliver its result, and the taint it was authorized to drop stays.
-			redactDetail := fp.declassifyRefusalDetail(dec)
+			// The third exit below the decision, and the only one where the upstream
+			// provably RAN the declassifying action — this is reached solely after a
+			// well-formed, successful reply, so the sanitizing transform happened and only
+			// the delivery failed. The clear is still withheld, but on this exit's own
+			// reasoning rather than the other two's: nothing sanitized reached the host, so
+			// nothing sanitized entered the session, which is what a flow label tracks. The
+			// record says so — declassifyWithheldDetail marks the action executed and the
+			// result withheld, so an operator reconciling the burned grant can tell "the work
+			// is done, only the delivery failed" from "it may never have run".
+			redactDetail := fp.declassifyWithheldDetail(dec)
 			warnIfStrictAuditJustDegraded(fp.requireAuditStrict, fp.rec, kind, denialTarget, func() {
 				if fp.rec != nil {
 					fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, capability.ErrCodeEnforcementError, "", redactDetail, false)

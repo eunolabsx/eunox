@@ -522,23 +522,22 @@ func dispatchToolsCall(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mc
 			// denies every real call to that tool. nil when receipts are unconfigured or the
 			// server published none, which is the default and costs nothing.
 			receipt := d.effectReceiptDetail(upResp, dec, params.Name)
-			if extra == nil && receipt == nil {
-				return toolDetails
-			}
-			details := make(map[string]interface{}, len(toolDetails)+len(extra)+1)
-			for k, v := range toolDetails {
-				details[k] = v
-			}
-			for k, v := range extra {
-				details[k] = v
-			}
 			if receipt != nil {
+				if extra == nil {
+					extra = make(map[string]interface{}, 1)
+				}
 				// Under ONE reserved, underscore-prefixed key whose value is an object, so
 				// the verdict's several dimensions never flatten into the argument map a
 				// miner reads (see audit.EffectReceiptKey).
-				details[audit.EffectReceiptKey] = receipt
+				//
+				// Written into the ANNOTATION map this closure owns, never into
+				// mergeAuditDetails' return: the merge's contract is that its result is the
+				// caller's, and a caller that writes afterwards is one refactor away from
+				// writing into whichever input the merge happened to hand back — here, the
+				// live argument map the record exists to describe.
+				extra[audit.EffectReceiptKey] = receipt
 			}
-			return details
+			return mergeAuditDetails(toolDetails, extra)
 		})
 	return out
 }
