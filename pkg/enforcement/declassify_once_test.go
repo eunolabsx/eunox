@@ -41,7 +41,7 @@ func onceApprovedReq(session, name, approver, id string, labels ...string) *capa
 // The commit is part of the helper because the decision alone no longer moves a label; a
 // test that skipped it would be asserting against a session the clear never reached. See
 // TestDeclassify_PendingClearIsInvisibleUntilCommitted for why the two phases are separate.
-func taintAndClear(t *testing.T, eng *enforcement.Engine, source, declassifying *capability.EnforceRequest) (capability.EnforceResponse, []string) {
+func taintAndClear(t *testing.T, eng *enforcement.Engine, source, declassifying *capability.EnforceRequest) (decision capability.EnforceResponse, cleared []string) {
 	t.Helper()
 	ctx := context.Background()
 	src := eng.ValidateAction(ctx, source, sourceCaps(source.TargetName, capability.FlowLabelPII))
