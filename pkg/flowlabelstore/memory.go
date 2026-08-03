@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -30,9 +31,23 @@ const pressureWarnFraction = 0.9
 // still having its taint READ by a sink check — never ages out. Only an anchor nothing
 // has asked about for a whole idle TTL is reclaimed, which is the same rule the Redis
 // backend's refreshed EXPIRE applies.
+//
+// It is an atomic rather than a plain time.Time so the REFRESH can happen under the
+// store's READ lock. Get is on the path of every flow-relevant decision in the proxy
+// (peekSessionLabels calls it before each one), and the decision turn that serializes
+// those is keyed per ANCHOR while this mutex is store-WIDE — so making the read path take
+// the write lock in order to stamp a timestamp would serialize every session in the
+// process behind one lock for a field nothing reads transactionally.
 type labelSet struct {
-	labels  map[string]struct{}
-	touched time.Time
+	labels map[string]struct{}
+	// touched is Unix nanoseconds; the zero value is never stored (Add stamps it before
+	// the entry is published).
+	touched atomic.Int64
+}
+
+// idleFor reports how long this set has gone untouched as of now.
+func (l *labelSet) idleFor(now time.Time) time.Duration {
+	return now.Sub(time.Unix(0, l.touched.Load()))
 }
 
 // InMemory is an anchor-scoped flow-label store backed by in-process memory: each
@@ -48,11 +63,15 @@ type InMemory struct {
 	// maxKeys bounds how many distinct anchor keys the map may hold at once; 0 (the
 	// default) leaves it unbounded. See WithMaxKeys and admitNewKey.
 	maxKeys int
-	// ttl is the configured idle TTL as passed to WithMemoryIdleTTL (DefaultIdleTTL when
-	// unset). Stored verbatim; effectiveTTL applies the floor at the point of use, so
-	// the two backends guard a misconfigured value identically.
+	// ttl is the configured idle TTL as passed to WithMemoryIdleTTL. Zero — the default —
+	// DISABLES idle reclamation entirely, which is this store's historical behavior and
+	// stays the default for the reason WithMemoryIdleTTL gives.
 	ttl time.Duration
-	now func() time.Time
+	// lastReclaim is when the inline at-ceiling sweep last ran, so a store sitting AT its
+	// bound does one full scan per cleanup interval rather than one per refused call. See
+	// admitNewKey.
+	lastReclaim time.Time
+	now         func() time.Time
 	// logger receives the approach-of-ceiling and at-ceiling warnings. nil (the default)
 	// silences them; the binary wires one.
 	logger *slog.Logger
@@ -96,13 +115,24 @@ func WithMaxKeys(n int) InMemoryOption {
 	}
 }
 
-// WithMemoryIdleTTL overrides how long an anchor's label set is retained with nothing touching
-// it. It is the in-memory twin of the Redis backend's refreshed EXPIRE and carries the
-// identical contract: a safety-reclamation bound for an ABANDONED anchor, NOT a
-// security-relevant taint lifetime, because it is refreshed on every Add and Get — so a
-// live anchor never loses its provenance. Size it to the deployment's session (or task)
-// idle timeout. A value below one second falls back to DefaultIdleTTL (see effectiveTTL),
-// since a zero or negative bound would drop a live anchor's taint immediately.
+// WithMemoryIdleTTL enables idle reclamation and sets its bound: how long an anchor's
+// label set is retained with nothing touching it. It is the in-memory twin of the Redis
+// backend's refreshed EXPIRE and carries the identical contract — a safety-reclamation
+// bound for an ABANDONED anchor, NOT a taint lifetime, because it is refreshed on every
+// Add and Get, so a live anchor never loses its provenance. Size it to the deployment's
+// session (or task) idle timeout.
+//
+// Unset (the default) means NO idle reclamation, which is this store's historical
+// behavior and is deliberately kept as the default. Refresh-on-access scopes the bound to
+// an anchor's INACTIVITY rather than its taint's age, but "inactive" and "abandoned" are
+// not the same thing: a session-anchored key belongs to a live session that may simply be
+// quiet, and its real reclamation is the transport's teardown (ReleaseSession -> Clear).
+// Expiring it would age a taint out from under a session that is still going to make
+// another call — the fail-open this package exists to avoid. Enable this where the anchor
+// has NO teardown owner, which is precisely the task-anchored case: a task key outlives
+// its session by design, so an idle bound is the only reclamation it can safely have.
+// A value in (0, 1s) is raised to one second rather than honored, since a sub-second bound
+// would reclaim a live anchor on its next touch.
 func WithMemoryIdleTTL(d time.Duration) InMemoryOption {
 	return func(m *InMemory) {
 		m.ttl = d
@@ -129,27 +159,28 @@ func WithLogger(l *slog.Logger) InMemoryOption {
 
 // NewInMemory creates an in-memory anchor-scoped flow-label store.
 //
-// A set is reclaimed by exactly three things: Clear (session teardown), Remove dropping
-// its last label, and the idle TTL. The third is what covers an anchor no teardown will
-// ever reach — a task-anchored key, which deliberately OUTLIVES the session that created
-// it (clearing it on disconnect would restore the per-PEP boundary the anchor exists to
-// cross, and would let an agent launder a task's taint by reconnecting), and any anchor
-// belonging to a host that abandons sessions without a DELETE. Without it, WithMaxKeys
-// was the only backstop, and a ceiling with no reaper behind it is an availability cliff:
-// at the bound every flow-relevant source call fails closed for the rest of the process's
-// life.
+// A set is reclaimed by Clear (session teardown), by Remove dropping its last label, and —
+// only where WithMemoryIdleTTL enables it — by an idle bound. That third path is what
+// covers an anchor no teardown will ever reach: a TASK-anchored key deliberately OUTLIVES
+// the session that created it (clearing it on disconnect would restore the per-PEP
+// boundary the anchor exists to cross, and would let an agent launder a task's taint by
+// reconnecting), so nothing else can release it. Without it, WithMaxKeys was the only
+// backstop there — and a ceiling with no reaper behind it is an availability cliff: at the
+// bound every flow-relevant source call fails closed for the rest of the process's life.
 //
-// The TTL is scoped to ABANDONED anchors, which is the whole difficulty: this package's
-// contract is that provenance is monotonic and must not age out mid-session (a windowed
-// marker is a fail-open the "for all flows" claim cannot tolerate). Refresh-on-access is
-// the scoping — Add and Get both stamp the anchor live — so the bound measures INACTIVITY
-// of the anchor rather than the age of its taint. That is the same rule the Redis backend
-// has always applied, so the two backends now behave the same way in the one mode where
-// the difference mattered.
+// It is OFF by default, and that is the careful part. The bound has to be scoped to
+// ABANDONED anchors, because this package's contract is that provenance is monotonic and
+// must not age out mid-session (a windowed marker is a fail-open the "for all flows" claim
+// cannot tolerate). Refresh-on-access gets most of the way — Add and Get both stamp the
+// anchor live, so the bound measures INACTIVITY rather than the age of a taint — but
+// inactive is not the same as abandoned: a session-anchored key belongs to a live session
+// that may simply be quiet, and it already HAS a reclamation path in the transport's
+// teardown. Turning the bound on there would trade a real fail-open for a bound that
+// buys nothing. So the caller enables it exactly where the anchor has no owner; see
+// WithMemoryIdleTTL.
 func NewInMemory(opts ...InMemoryOption) *InMemory {
 	m := &InMemory{
 		sets: make(map[string]*labelSet),
-		ttl:  DefaultIdleTTL,
 		now:  time.Now,
 	}
 	for _, opt := range opts {
@@ -161,24 +192,35 @@ func NewInMemory(opts ...InMemoryOption) *InMemory {
 	return m
 }
 
-// effectiveTTL guards a configured value below one second, subsuming zero and negative:
-// either would reclaim a live anchor's taint on its next touch, capping provenance far
-// below any real session — a fail-open. Falling back to DefaultIdleTTL keeps a
-// misconfigured TTL fail-SAFE. It mirrors the Redis backend's guard exactly, including the
-// one-second floor, so a config value means the same thing under both backends.
+// effectiveTTL is the bound in force, or 0 when idle reclamation is disabled (the default).
+// A positive value below one second is raised to one second: a sub-second bound would
+// reclaim a live anchor's taint on its next touch, capping provenance far below any real
+// session — a fail-open. A negative value reads as "off", matching the zero default rather
+// than silently becoming a bound the caller did not ask for.
 func (m *InMemory) effectiveTTL() time.Duration {
-	if m.ttl < time.Second {
-		return DefaultIdleTTL
+	switch {
+	case m.ttl <= 0:
+		return 0
+	case m.ttl < time.Second:
+		return time.Second
+	default:
+		return m.ttl
 	}
-	return m.ttl
 }
+
+// idleReclamation reports whether this store expires anchors at all.
+func (m *InMemory) idleReclamation() bool { return m.effectiveTTL() > 0 }
 
 // live returns the anchor's set when it exists and has not idled out, nil otherwise.
 // Call under m.mu (either mode). An expired set is reported absent rather than deleted
 // here, so this stays usable from the read path; Cleanup and the write paths reclaim it.
+// With idle reclamation off (the default) an existing set is always live.
 func (m *InMemory) live(anchorKey string, now time.Time) *labelSet {
 	set, ok := m.sets[anchorKey]
-	if !ok || now.Sub(set.touched) >= m.effectiveTTL() {
+	if !ok {
+		return nil
+	}
+	if ttl := m.effectiveTTL(); ttl > 0 && set.idleFor(now) >= ttl {
 		return nil
 	}
 	return set
@@ -189,18 +231,23 @@ func (m *InMemory) live(anchorKey string, now time.Time) *labelSet {
 // Call under m.mu and only on the new-key path (adding to an existing anchor grows
 // the map by nothing). This is the fail-closed backstop described on WithMaxKeys.
 //
-// At the bound it sweeps idled-out anchors before refusing, so the ceiling bounds LIVE
-// anchors rather than every anchor the process has seen since the last background pass.
-// Without that, a store full of abandoned keys would refuse a genuinely new one for up to
-// a whole cleanup interval — turning the reclamation the TTL provides into something that
-// only helps if the reaper happens to have run.
+// At the bound it may sweep idled-out anchors before refusing, so the ceiling bounds LIVE
+// anchors rather than every anchor the process has seen since the last background pass:
+// without that, a store full of abandoned keys refuses a genuinely new one for up to a
+// whole cleanup interval, and the TTL only helps when the reaper happens to have run.
+//
+// That sweep is RATE-LIMITED to once per cleanup interval, which matters more than it
+// looks. A store sitting at its bound with nothing reclaimable would otherwise pay a full
+// O(n) map scan under the exclusive lock on EVERY refused call — so the ceiling, whose job
+// is to make a flood cheap to refuse, would instead amplify it into a store-wide stall
+// proportional to the flood's own rate. One scan per interval bounds that to the same work
+// the background sweep already does.
 func (m *InMemory) admitNewKey(now time.Time) error {
 	if m.maxKeys <= 0 || len(m.sets) < m.maxKeys {
 		m.refusalWarned = false
 		return nil
 	}
-	m.reclaimIdle(now)
-	if len(m.sets) < m.maxKeys {
+	if m.reclaimIdle(now) && len(m.sets) < m.maxKeys {
 		m.refusalWarned = false
 		return nil
 	}
@@ -208,16 +255,22 @@ func (m *InMemory) admitNewKey(now time.Time) error {
 	return fmt.Errorf("flowlabelstore: session limit reached (%d)", m.maxKeys)
 }
 
-// reclaimIdle drops every anchor past its idle TTL. Call under m.mu (write mode).
-// It is the same rule Cleanup applies from the background sweep, run inline at the moment
-// the answer actually changes an outcome.
-func (m *InMemory) reclaimIdle(now time.Time) {
+// reclaimIdle drops every anchor past its idle TTL, at most once per cleanup interval, and
+// reports whether it actually ran. Call under m.mu (write mode). It is the same rule
+// Cleanup applies from the background sweep, run inline at the moment the answer changes
+// an outcome — and skipped entirely when this store does not expire anchors at all.
+func (m *InMemory) reclaimIdle(now time.Time) bool {
 	ttl := m.effectiveTTL()
+	if ttl <= 0 || now.Sub(m.lastReclaim) < DefaultCleanupInterval {
+		return false
+	}
+	m.lastReclaim = now
 	for key, set := range m.sets {
-		if now.Sub(set.touched) >= ttl {
+		if set.idleFor(now) >= ttl {
 			delete(m.sets, key)
 		}
 	}
+	return true
 }
 
 // warnAtCeiling reports the cliff itself, once per refusal episode. Call under m.mu.
@@ -283,10 +336,11 @@ func (m *InMemory) Add(_ context.Context, anchorKey string, labels ...string) er
 			return err
 		}
 		set = &labelSet{labels: make(map[string]struct{}, len(labels))}
+		set.touched.Store(now.UnixNano())
 		m.sets[anchorKey] = set
 		m.warnApproachingCeiling()
 	}
-	set.touched = now
+	set.touched.Store(now.UnixNano())
 	for _, label := range labels {
 		set.labels[label] = struct{}{}
 	}
@@ -302,21 +356,22 @@ func (m *InMemory) Add(_ context.Context, anchorKey string, labels ...string) er
 // regardless, but a stable order keeps tests and any digest of the set reproducible.
 // The copy means a caller can never mutate the store's internal set.
 //
-// It takes the WRITE lock, unlike the read-only Get this replaced, because the refresh is
-// what scopes reclamation to abandoned anchors and a read that did not refresh would age
-// out a session doing nothing but sink checks. The Redis backend pays the same cost (its
-// Get is a transaction carrying an EXPIRE), and a flow-relevant decision is already
-// serialized per anchor by the transport's decision turn.
+// It keeps the READ lock, so concurrent decisions on distinct anchors still proceed in
+// parallel: the refresh is an atomic store on the entry, not a map mutation. That is
+// load-bearing rather than a micro-optimization — Get is on the path of every
+// flow-relevant decision in the proxy, and this mutex is store-WIDE while the transport's
+// decision turn is per-ANCHOR, so taking the write lock here would serialize every session
+// in the process behind one lock in order to stamp a timestamp.
 func (m *InMemory) Get(_ context.Context, anchorKey string) ([]string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 
 	now := m.now()
 	set := m.live(anchorKey, now)
 	if set == nil {
 		return nil, nil
 	}
-	set.touched = now
+	set.touched.Store(now.UnixNano())
 	out := make([]string, 0, len(set.labels))
 	for label := range set.labels {
 		out = append(out, label)
@@ -390,13 +445,22 @@ const cleanupDeleteBatch = 1024
 //
 // Safe to call at any time; StartCleanup runs it periodically.
 func (m *InMemory) Cleanup() {
-	now := m.now()
 	ttl := m.effectiveTTL()
+	if ttl <= 0 {
+		// No idle reclamation configured: there is nothing this sweep could collect, and
+		// scanning the map to discover that would be pure work on every tick.
+		return
+	}
+	now := m.now()
 
 	m.mu.RLock()
-	stale := make([]string, 0, len(m.sets))
+	// A nil slice grown on demand, NOT one pre-sized to the map: at the documented
+	// million-key ceiling a len(m.sets) pre-size would allocate tens of megabytes every
+	// tick even when nothing is stale — churning the heap the ceiling exists to bound.
+	// The callcounter's sweep sizes its own delete list the same way.
+	var stale []string
 	for key, set := range m.sets {
-		if now.Sub(set.touched) >= ttl {
+		if set.idleFor(now) >= ttl {
 			stale = append(stale, key)
 		}
 	}
@@ -409,7 +473,7 @@ func (m *InMemory) Cleanup() {
 			// Re-check under the write lock: a concurrent Add or Get may have touched the
 			// anchor since the scan, and reclaiming a live anchor's taint is the one
 			// fail-open this whole mechanism has to avoid.
-			if set, ok := m.sets[key]; ok && m.now().Sub(set.touched) >= ttl {
+			if set, ok := m.sets[key]; ok && set.idleFor(m.now()) >= ttl {
 				delete(m.sets, key)
 			}
 		}
@@ -429,6 +493,11 @@ func (m *InMemory) Cleanup() {
 // starts fresh — so a restart racing a teardown is never lost.
 func (m *InMemory) StartCleanup(ctx context.Context, interval time.Duration) bool {
 	if ctx.Err() != nil {
+		return false
+	}
+	if !m.idleReclamation() {
+		// Nothing expires, so there is nothing to sweep. Reporting false rather than
+		// starting a goroutine that wakes forever to do nothing.
 		return false
 	}
 	if interval <= 0 {

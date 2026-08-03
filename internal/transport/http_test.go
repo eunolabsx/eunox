@@ -1595,12 +1595,12 @@ func (r recordingDecisionPoint) DecidePromptGet(ctx context.Context, sessionID, 
 func (r recordingDecisionPoint) DecideSampling(ctx context.Context, sessionID, sourceIP string) capability.EnforceResponse {
 	return r.inner.DecideSampling(ctx, sessionID, sourceIP)
 }
-func (r recordingDecisionPoint) EvaluateClaimCondition(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (*enforcement.ConditionError, bool) {
-	return enforcement.NonCommittingConditionVerdict(ctx, cond, req)
-}
-
 func (r recordingDecisionPoint) HardenRefusal(ctx context.Context, sessionID string, resp capability.EnforceResponse, target pdp.EnforceTarget, args map[string]interface{}) capability.EnforceResponse {
 	return r.inner.HardenRefusal(ctx, sessionID, resp, target, args)
+}
+
+func (r recordingDecisionPoint) EvaluateClaimCondition(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (*enforcement.ConditionError, bool) {
+	return enforcement.NonCommittingConditionVerdict(ctx, cond, req)
 }
 func (r recordingDecisionPoint) CheckKill(ctx context.Context, sessionID string) *capability.EnforceResponse {
 	return r.inner.CheckKill(ctx, sessionID)

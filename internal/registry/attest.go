@@ -110,25 +110,19 @@ type Signature struct {
 	Statement string `json:"statement"`
 	// Value is the base64 (standard encoding) Ed25519 signature over AttestationPayload.
 	Value string `json:"signature"`
-
-	// raw is Value decoded, cached by Validate at corpus load. It follows the pattern
-	// TrustedKey.pub already establishes one struct down: the decode is length-checked at
-	// load and the bytes were then thrown away, so verification decoded the same string a
-	// second time and re-derived a near-identical error message for a failure the loader had
-	// already ruled out. nil for a Contract built by a caller that never went through
-	// Validate, which decoded() handles.
-	raw []byte
 }
 
-// decoded returns the signature bytes: the ones Validate already decoded when this entry
-// came from a corpus, or a fresh decode for a Contract a caller built directly. The second
-// path is not dead — VerifyAttestations is exported on an exported struct — and an
-// unparseable signature by a TRUSTED key is the tampering case, so it stays an error rather
-// than being treated as a stranger's mark.
+// decoded returns the signature bytes, decoded on every call.
+//
+// Validate decodes and length-checks the same string at corpus load, and caching the
+// result there would remove that second decode — but it would also make verification
+// correct only for a Signature nobody has touched since. Value is a plain field on an
+// exported struct: an in-process caller can swap it and leave the cache holding the bytes
+// that DID verify, which turns "this signature does not match this content" into a pass on
+// the one check that exists to catch exactly that. A base64 decode of 88 characters, on an
+// authoring-time CLI path, is not worth making an integrity result conditional on caller
+// discipline.
 func (s *Signature) decoded() ([]byte, error) {
-	if len(s.raw) > 0 {
-		return s.raw, nil
-	}
 	return base64.StdEncoding.DecodeString(s.Value)
 }
 
@@ -204,10 +198,6 @@ func (s *Signature) Validate(contractID string) error {
 	if len(raw) != ed25519.SignatureSize {
 		return fmt.Errorf("contract %q: signature %q is %d bytes, not the %d an Ed25519 signature is", contractID, s.KeyID, len(raw), ed25519.SignatureSize)
 	}
-	// Keep the bytes rather than discarding them: verification needs exactly these, and
-	// decoding the same string twice is a second place for the two to disagree about what
-	// this signature is.
-	s.raw = raw
 	return nil
 }
 

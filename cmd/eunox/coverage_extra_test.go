@@ -1640,7 +1640,7 @@ func TestPrintProxyUsage(t *testing.T) {
 // ───────────────────────── buildCallCounterAndKillSwitch ───────────────────
 
 func TestBuildCallCounterAndKillSwitch_InMemory(t *testing.T) {
-	backends, err := buildCallCounterAndKillSwitch("", "", false, false, 0, 0, 0)
+	backends, err := buildCallCounterAndKillSwitch("", "", false, false, 0, 0, 0, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1660,7 +1660,7 @@ func TestBuildCallCounterAndKillSwitch_InMemory(t *testing.T) {
 func TestBuildCallCounterAndKillSwitch_Redis(t *testing.T) {
 	mr := miniredis.RunT(t)
 
-	backends, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, true, 5*time.Second, 0, 0)
+	backends, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, true, 5*time.Second, 0, 0, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1678,7 +1678,7 @@ func TestBuildCallCounterAndKillSwitch_Redis(t *testing.T) {
 func TestBuildCallCounterAndKillSwitch_RedisFailClosed(t *testing.T) {
 	mr := miniredis.RunT(t)
 
-	backends, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, false, 0, 0, 0)
+	backends, err := buildCallCounterAndKillSwitch(mr.Addr(), "", false, false, 0, 0, 0, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

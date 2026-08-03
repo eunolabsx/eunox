@@ -2079,16 +2079,6 @@ func (p *ManifestPDP) selectForHardening(ctx context.Context, target EnforceTarg
 //
 // Nothing here commits: both pin reads are pure lookups against state an earlier tools/list
 // armed, and the ceiling goes through the engine's non-committing CeilingVerdictFor.
-// EvaluateClaimCondition dispatches through THIS PDP's engine, so an embedder's
-// WithConditionHandler override is what a claim-derived condition is judged by — the same
-// handler the manifest path runs for the same type on the same call. The engine refuses
-// (ok=false) a type it has no handler for, and one whose handler COMMITS state on admit,
-// since this runs before the decision and a committing evaluation would charge the call
-// twice. A nil engine falls back to the built-ins inside the engine method.
-func (p *ManifestPDP) EvaluateClaimCondition(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (*enforcement.ConditionError, bool) {
-	return p.engine.NonCommittingConditionVerdict(ctx, cond, req)
-}
-
 func (p *ManifestPDP) HardenRefusal(ctx context.Context, sessionID string, r capability.EnforceResponse, target EnforceTarget, args map[string]interface{}) capability.EnforceResponse {
 	if r.Decision == capability.DecisionAllow {
 		return r
@@ -2115,6 +2105,16 @@ func (p *ManifestPDP) HardenRefusal(ctx context.Context, sessionID string, r cap
 		return hardened
 	}
 	return p.withForwardObligations(ctx, r, target, sel.naming)
+}
+
+// EvaluateClaimCondition dispatches through THIS PDP's engine, so an embedder's
+// WithConditionHandler override is what a claim-derived condition is judged by — the same
+// handler the manifest path runs for the same type on the same call. The engine refuses
+// (ok=false) a type it has no handler for, and one whose handler COMMITS state on admit,
+// since this runs before the decision and a committing evaluation would charge the call
+// twice. A nil engine falls back to the built-ins inside the engine method.
+func (p *ManifestPDP) EvaluateClaimCondition(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (*enforcement.ConditionError, bool) {
+	return p.engine.NonCommittingConditionVerdict(ctx, cond, req)
 }
 
 // hardenOnUnapprovedDeclassify replaces an outer layer's downgradable refusal with the

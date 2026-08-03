@@ -401,3 +401,27 @@ func TestDeclassifyLedgerWindow_OutlivesEveryAdmittedToken(t *testing.T) {
 			"an admitted token outlives the ledger memory of its own burn")
 	}
 }
+
+// TestCheckDeclassifyApprovalLifetime_EpochIsNotUnset is the encoding trap the guard has to
+// survive. time.Unix(0, 0) is a real 1970 instant, so it is NOT IsZero — and its remaining
+// lifetime is decades in the past, comfortably "inside" the window. A caller that encoded
+// "no expiry established" that way would have a `once` grant admitted on a token whose
+// lifetime this build never bounded, which is the fail-open direction on the one property
+// this function guarantees. The unset case must be the zero Time, and this pins that the
+// two are treated differently.
+func TestCheckDeclassifyApprovalLifetime_EpochIsNotUnset(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	once := []capability.DeclassifyApproval{{
+		Labels: []string{capability.FlowLabelPII}, Target: "tool:publish",
+		Approver: "ada", ID: "apr-1", Once: true,
+	}}
+
+	require.Error(t, capability.CheckDeclassifyApprovalLifetime(once, time.Time{}, now, 0),
+		"the zero Time is 'no verified expiry' and must be refused")
+
+	// Documenting the trap rather than blessing it: an epoch instant is a real (long
+	// expired) timestamp, so it does NOT take the unset arm. A caller must not use it as a
+	// sentinel — see the function's own doc, and the JWT call site that guards for it.
+	assert.False(t, time.Unix(0, 0).IsZero(),
+		"time.Unix(0,0) is not the zero Time; a caller must not use it to mean 'unset'")
+}

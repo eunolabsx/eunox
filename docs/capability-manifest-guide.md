@@ -1240,16 +1240,24 @@ so it would deny every matching call at request time with nothing pointing at th
 manifest; naming an evaluator or handler that is not (yet) registered is a
 different case and still loads, denying fail-closed at request time.
 
-> **An override applies to the JWT capability-claim path too.**
+> **An `allowedValues` override applies to the JWT capability-claim path too.**
 > `WithConditionHandler` may replace ANY registered type, not just `custom`, and a
-> library embedder who redefines (say) `allowedValues` gets that definition on both
-> sides of a JWT/manifest intersection: the claim path asks the deciding PDP for the
-> verdict rather than calling the shipped predicate, so the two cannot enforce
-> different rules for the same condition on the same call. The one narrowing is that a
-> replacement which **commits state** on admit (implements
-> `CommittingConditionHandler`) cannot be evaluated ahead of the decision — running it
-> there would charge the call's quota twice — so a claim carrying that condition type is
-> **refused**, naming the type, rather than silently falling back to the built-in.
+> library embedder who redefines `allowedValues` gets that definition on both sides of a
+> JWT/manifest intersection: the claim path asks the deciding PDP for the verdict rather
+> than calling the shipped predicate, so the two cannot enforce different rules for the
+> same call. The one narrowing is that a replacement which **commits state** on admit
+> (implements `CommittingConditionHandler`) cannot be evaluated ahead of the decision —
+> running it there would charge the call's quota twice — so a claim carrying that
+> condition type is **refused**, naming the type, rather than silently falling back to
+> the built-in.
+>
+> The claim grammar emits exactly two condition types, and `allowedOperations` is
+> deliberately **not** covered: its claim-side semantics are different by design (the
+> shorthand cannot name the operation argument, so it scans every argument, while the
+> engine's handler hard-denies the empty argument the shorthand always emits), so there
+> is no shared handler to dispatch to. An override for `allowedOperations` therefore
+> applies to the manifest path only. Manifest form (Pattern C) is the preferred way to
+> express an operation restriction regardless.
 
 > **`redactFields` is a directive, not a condition.** It mutates the
 > response rather than allowing or denying, so it lives under `directives`
@@ -2805,16 +2813,20 @@ byte-for-byte what it was before this option existed.
 
 > **Task state outlives the session that wrote it.** That is the whole point, so session
 > teardown does not reclaim it — clearing it on disconnect would let an agent launder a
-> task's taint by reconnecting. What reclaims it instead is an **idle TTL**, on both
-> backends: a task's label set is released after 24 hours with nothing touching it, and
+> task's taint by reconnecting. What reclaims it instead is an **idle bound**: with this
+> option on, a task's label set is released after 24 hours with nothing touching it, and
 > every `labelOutput` write *and* every sink read refreshes that bound, so an active task
-> never loses its taint however long it runs. `--max-call-counter-keys` remains a
-> fail-closed *admission ceiling* behind that, not a reaper; the proxy logs a warning as
-> the count approaches it, and at it a new anchor's first labelled call is denied (over-
-> blocking, never a bypass). **Redis is still the backend for a multi-instance deployment
-> of this mode** — a task's state has to be visible to every enforcement point that
-> handles the task, which per-process stores cannot do — and eunox prints a startup notice
-> when the option is on with no `--redis-addr`.
+> never loses its taint however long it runs. The bound applies **only** in this mode. A
+> session-anchored key already has a reclamation path (the transport's teardown), so
+> expiring it would age a taint out from under a session that is merely quiet — a
+> fail-open — which is why the default backend does not expire anything.
+> `--max-call-counter-keys` remains a fail-closed *admission ceiling* behind all of this,
+> not a reaper; the proxy logs a warning as the count approaches it, and at it a new
+> anchor's first labelled call is denied (over-blocking, never a bypass). **Redis is still
+> the backend for a multi-instance deployment of this mode** — a task's state has to be
+> visible to every enforcement point that handles the task, which per-process stores
+> cannot do — and eunox prints a startup notice when the option is on with no
+> `--redis-addr`.
 
 > **Label rollback stands down under task anchoring.** When a source call's flow write
 > commits and a later write in the same commit faults, the engine normally removes the labels

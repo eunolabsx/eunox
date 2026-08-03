@@ -322,8 +322,14 @@ const DeclassifyLedgerWindowSec = 7 * 86400
 // outlived is the interval from the moment of the burn (no earlier than now, since the token
 // is being presented) to exp. leeway is the clock-skew grace the same validation applied to
 // exp, added to the remaining lifetime so a token accepted at the edge of that grace is
-// still inside the window. A zero exp (a caller that did not verify one) is refused for the
-// same reason a token with no exp is: an unbounded lifetime cannot be inside any window.
+// still inside the window.
+//
+// An UNSET exp — the zero Time — is refused for the same reason a token with no exp is: an
+// unbounded lifetime cannot be inside any window. Callers must encode "not established" as
+// the zero Time and not as an epoch instant: time.Unix(0, 0) is a real 1970 timestamp, so
+// it is not IsZero and would read here as a lifetime decades in the past, i.e. comfortably
+// inside the window. That is the fail-OPEN direction on the one property this function
+// exists to guarantee.
 //
 // Standing grants (Once unset) are unaffected — they are replayable for the token's lifetime
 // by design, which is the property the field's own doc states.

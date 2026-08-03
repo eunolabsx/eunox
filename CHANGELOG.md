@@ -246,23 +246,27 @@ Section conventions:
   lifetime by design. Remedy for a long-lived-token deployment: mint a short-lived token
   per approval (already the recommended practice), or drop `once`.
 
-- **BREAKING (pre-1.0): the in-memory flow-label store reclaims abandoned anchors on an
-  idle TTL, and `flowlabelstore.WithIdleTTL` is now `WithRedisIdleTTL` /
-  `WithMemoryIdleTTL`.** Both backends now release an anchor's label set after 24 hours
-  with nothing touching it, and the bound is refreshed by every `Add` **and** every `Get`
-  — so it measures the anchor's INACTIVITY, not the age of its taint, and a live anchor
-  never loses provenance however long it runs. This is what a **task-anchored** key needed:
-  it deliberately outlives its session (teardown reclaiming it would let an agent launder a
-  task's taint by reconnecting), so it previously had no reclamation at all and a
-  long-running proxy accrued one key per distinct `task_id` until the
-  `--max-call-counter-keys` ceiling, after which every flow-relevant source call failed
-  closed for the life of the process. The ceiling remains an ADMISSION bound, never a
-  reaper; the store now logs a warning as the live count approaches it and one line per
-  refusal episode at it. `eunox proxy` also prints a startup notice when `taskAnchoredState`
-  is enabled with no `--redis-addr`, since per-process stores cannot share a task's state
-  across instances. The option rename is because both backends take the setting now, and
-  their constructors take different option types — one name would have to be the one that
-  silently does not apply to the store you passed it to.
+- **BREAKING (pre-1.0): under `taskAnchoredState` the in-memory flow-label store reclaims
+  abandoned anchors on an idle bound, and `flowlabelstore.WithIdleTTL` is now
+  `WithRedisIdleTTL` / `WithMemoryIdleTTL`.** In that mode both backends release an
+  anchor's label set after 24 hours with nothing touching it, and the bound is refreshed by
+  every `Add` **and** every `Get` — so it measures the anchor's INACTIVITY, not the age of
+  its taint, and a live anchor never loses provenance however long it runs. This is what a
+  **task-anchored** key needed: it deliberately outlives its session (teardown reclaiming it
+  would let an agent launder a task's taint by reconnecting), so it previously had no
+  reclamation at all and a long-running proxy accrued one key per distinct `task_id` until
+  the `--max-call-counter-keys` ceiling, after which every flow-relevant source call failed
+  closed for the life of the process. The bound is scoped to that mode and **off by
+  default**: a session-anchored key already has a reclamation path in the transport's
+  teardown, and expiring it would age a taint out from under a session that is merely
+  quiet. The ceiling remains an ADMISSION bound, never a reaper; the store now logs a
+  warning as the live count approaches it and one line per refusal episode at it, and its
+  at-ceiling sweep is rate-limited so a store sitting at the bound refuses cheaply instead
+  of re-scanning per call. `eunox proxy` also prints a startup notice when
+  `taskAnchoredState` is enabled with no `--redis-addr`, since per-process stores cannot
+  share a task's state across instances. The option rename is because both backends take
+  the setting now, and their constructors take different option types — one name would have
+  to be the one that silently does not apply to the store you passed it to.
 
 - **BREAKING (pre-1.0): `pdp.PolicyDecisionPoint` gains `EvaluateClaimCondition`.** The JWT
   capability-claim path now asks the DECIDING PDP to evaluate a claim-derived condition
@@ -784,12 +788,13 @@ Section conventions:
   anti-forgery key encoding is now `capability.CompositeKey`, called by both the engine's
   counter keys and `DeclassifyApproval.LedgerID` (which had reproduced its output with a
   `Sprintf` it could not reach); `eunox contracts` shares one `findContract` lookup and
-  builds its table from one row shape instead of two near-identical literals; a corpus
-  signature's base64 and an entry's content digest are decoded/computed once at load and
-  reused, with the uncached path kept for a caller-built `Contract`; and the two
+  builds its table from one row shape instead of two near-identical literals; and the two
   operator-configured public-key file formats (the attestation trust store and the
   per-upstream receipt JWKS) now document why they take opposite positions on
-  unknown-key-versus-bad-signature.
+  unknown-key-versus-bad-signature. The corpus signature and content-digest recomputations
+  the issue also flagged are deliberately LEFT in place, with the reason recorded at each:
+  caching either makes an integrity result correct only for an entry nobody mutated since
+  load, and the saving is one hash and one base64 decode on an authoring-time CLI path.
 
 ### Removed
 

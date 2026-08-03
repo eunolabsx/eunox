@@ -3054,12 +3054,12 @@ func (c condPDP) DecidePromptGet(_ context.Context, _, _, _ string) capability.E
 func (condPDP) DecideSampling(_ context.Context, _, _ string) capability.EnforceResponse {
 	return denyResponse(nil, capability.ErrCodeSamplingDenied, "", "condPDP: sampling deny-by-default")
 }
-func (condPDP) EvaluateClaimCondition(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (*enforcement.ConditionError, bool) {
-	return enforcement.NonCommittingConditionVerdict(ctx, cond, req)
-}
-
 func (condPDP) HardenRefusal(_ context.Context, _ string, r capability.EnforceResponse, _ EnforceTarget, _ map[string]interface{}) capability.EnforceResponse {
 	return r
+}
+
+func (condPDP) EvaluateClaimCondition(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (*enforcement.ConditionError, bool) {
+	return enforcement.NonCommittingConditionVerdict(ctx, cond, req)
 }
 func (condPDP) CheckKill(_ context.Context, _ string) *capability.EnforceResponse {
 	return nil

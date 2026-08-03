@@ -1068,7 +1068,18 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 		// after accepting it — rather than a second dereference of stdClaims.Expiry: that
 		// pointer is non-nil only because the check above ran first, and a reordering would
 		// turn a second read into a nil dereference on a request goroutine.
-		if lifeErr := capability.CheckDeclassifyApprovalLifetime(declassify, time.Unix(tokenExpUnix, 0), now, p.leeway); lifeErr != nil {
+		//
+		// A non-positive tokenExpUnix stays the ZERO time rather than becoming
+		// time.Unix(0, 0). The two look interchangeable and are not: 1970-01-01 is a real
+		// instant, so it is not IsZero, and it would sail through the window check as a
+		// lifetime tens of years in the past — admitting a `once` grant on a token whose
+		// expiry this build never established. The unset case has to reach the guard that
+		// refuses it, so it is encoded as unset.
+		var tokenExp time.Time
+		if tokenExpUnix > 0 {
+			tokenExp = time.Unix(tokenExpUnix, 0)
+		}
+		if lifeErr := capability.CheckDeclassifyApprovalLifetime(declassify, tokenExp, now, p.leeway); lifeErr != nil {
 			return nil, capability.Terminal(jwtErr(jwtErrInvalidDeclassify, lifeErr))
 		}
 

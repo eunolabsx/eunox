@@ -83,12 +83,6 @@ type Contract struct {
 	// One type, so an author copies the block across with no translation step where the
 	// two could drift.
 	Effect *capability.EffectContract `json:"effect"`
-
-	// contentDigestCache is the digest recomputed from Effect at load, kept so the
-	// attestation payload and every signature verification read the value already in hand
-	// instead of re-hashing the same block per signed entry. Unexported, and never
-	// populated from the declared Digest — see contentDigest.
-	contentDigestCache string
 }
 
 // ServerRef identifies the MCP server a contract's tool belongs to.
@@ -144,24 +138,22 @@ var validReviews = map[string]bool{ReviewPending: true, ReviewCommunity: true, R
 // the caller declared rather than silently correcting it.
 func (c *Contract) Ref() string { return c.ID + "@" + c.Digest }
 
-// contentDigest is the digest of the entry's own CONTENT, cached by Validate at load.
+// contentDigest is the digest of the entry's own CONTENT, recomputed on every call.
 //
 // Every consumer that binds a signature to an entry must use this rather than c.Digest:
 // signing or verifying against a self-declared digest authenticates the declaration
 // instead of the content, which is exactly the substitution a content digest exists to
-// prevent. A Contract that never went through Validate has no cache and computes it here,
-// so an exported entry point cannot be made to skip the derivation.
+// prevent.
 //
-// INVARIANT: the cache belongs to the Effect that Validate saw. A caller that mutates
-// Effect in place afterwards must re-run Validate, exactly as it must for the decoded key
-// on TrustedKey.pub and the decoded signature on Signature.raw. This is not the tampering
-// case the digest defends against — that one edits the FILE, and every load recomputes
-// from the bytes on disk (and refuses a declared digest that no longer matches) — it is
-// the ordinary Go rule that a derived field is derived from the value it was derived from.
+// It is deliberately NOT cached at load, and the redundancy with Validate's own
+// computation is the price of an unconditional guarantee. A cache would be correct only
+// for a Contract nobody has touched since Validate ran — Effect is a pointer, so an
+// in-process caller can rewrite the block a signature covers and leave the cached digest
+// naming the old content, and VerifyAttestations would then report a tampered entry as
+// verified. That is precisely the substitution this whole layer exists to catch, so it
+// must not depend on caller discipline. The cost is one SHA-256 over a small JSON block,
+// on an authoring-time CLI path that never touches the decision path.
 func (c *Contract) contentDigest() (string, error) {
-	if c.contentDigestCache != "" {
-		return c.contentDigestCache, nil
-	}
 	return capability.EffectContractDigest(c.Effect)
 }
 
@@ -244,11 +236,6 @@ func (c *Contract) Validate() error {
 	if err != nil {
 		return fmt.Errorf("contract %q: %w", c.ID, err)
 	}
-	// Keep the recomputed value: it is the one every later consumer needs (the attestation
-	// payload, verification) and recomputing it per signed entry re-hashes the same block
-	// for an answer already in hand. It caches the CONTENT digest, never the declared one —
-	// the two are only equal because the check below passes.
-	c.contentDigestCache = actual
 	if actual != c.Digest {
 		return fmt.Errorf("contract %q: declared digest %s does not match its content digest %s — the entry was edited without re-digesting", c.ID, c.Digest, actual)
 	}

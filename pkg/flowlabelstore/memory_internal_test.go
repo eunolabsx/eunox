@@ -197,20 +197,55 @@ func TestInMemory_IdleTTL_RemoveDoesNotRefresh(t *testing.T) {
 	assert.Empty(t, got, "Remove must not have refreshed the idle bound")
 }
 
-// TestInMemory_IdleTTL_FloorGuardsAMisconfiguredValue pins the same fail-safe the Redis
-// backend applies: a zero or sub-second TTL would reclaim a live anchor's taint on its
-// next touch, so it falls back to the default rather than being honored.
-func TestInMemory_IdleTTL_FloorGuardsAMisconfiguredValue(t *testing.T) {
+// TestInMemory_IdleTTL_OffByDefaultAndFloored covers both ends of the knob.
+//
+// Unset or non-positive is OFF, which is this store's historical behavior and the right
+// default: a session-anchored key belongs to a live session that may simply be quiet, and
+// its real reclamation is the transport's teardown, so expiring it would age a taint out
+// from under a session still going to make another call. A positive sub-second value is
+// raised to one second rather than honored, for the reason the Redis backend floors its
+// own: it would reclaim a live anchor on its next touch.
+func TestInMemory_IdleTTL_OffByDefaultAndFloored(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	for _, ttl := range []time.Duration{0, -time.Hour, 500 * time.Millisecond} {
+
+	for _, ttl := range []time.Duration{0, -time.Hour} {
 		m := NewInMemory(WithMemoryIdleTTL(ttl))
-		assert.Equal(t, DefaultIdleTTL, m.effectiveTTL())
-		require.NoError(t, m.Add(ctx, "s1", "pii"))
-		got, err := m.Get(ctx, "s1")
-		require.NoError(t, err)
-		assert.Equal(t, []string{"pii"}, got)
+		assert.Zero(t, m.effectiveTTL(), "a non-positive TTL disables reclamation")
+		assert.False(t, m.idleReclamation())
 	}
+	assert.Zero(t, NewInMemory().effectiveTTL(), "unset is off")
+
+	m := NewInMemory(WithMemoryIdleTTL(500 * time.Millisecond))
+	assert.Equal(t, time.Second, m.effectiveTTL(), "a sub-second bound is raised, never honored")
+	require.NoError(t, m.Add(ctx, "s1", "pii"))
+	got, err := m.Get(ctx, "s1")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"pii"}, got)
+}
+
+// TestInMemory_NoReclamationByDefault is the regression guard for the fail-open a
+// default-on bound would have been: with no TTL configured a taint survives any amount of
+// idleness, because a quiet session is not an abandoned one and its reclamation is the
+// transport's teardown.
+func TestInMemory_NoReclamationByDefault(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	start := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	now := start
+	m := NewInMemory(WithTimeFunc(func() time.Time { return now }))
+
+	require.NoError(t, m.Add(ctx, "quiet-session", "pii"))
+	now = start.Add(30 * 24 * time.Hour)
+	m.Cleanup()
+	got, err := m.Get(ctx, "quiet-session")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"pii"}, got, "provenance is monotonic when no idle bound is configured")
+
+	// And the sweep does not even start, rather than waking forever to collect nothing.
+	ctxCancel, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	assert.False(t, m.StartCleanup(ctxCancel, time.Millisecond))
 }
 
 // TestInMemory_IdledOutAnchorDoesNotHoldACeilingSlot is the interaction between the two
@@ -296,4 +331,35 @@ func TestInMemory_StartCleanup_ReclaimsWithoutBeingTouched(t *testing.T) {
 	dead, stop := context.WithCancel(context.Background())
 	stop()
 	assert.False(t, NewInMemory().StartCleanup(dead, time.Millisecond))
+}
+
+// TestInMemory_AtCeilingSweepIsRateLimited is why the ceiling stays cheap to hit. A store
+// sitting at its bound with nothing reclaimable would otherwise pay a full O(n) map scan
+// under the exclusive lock on every refused call — so the ceiling, whose job is to make a
+// flood cheap to refuse, would amplify it into a store-wide stall at the flood's own rate.
+func TestInMemory_AtCeilingSweepIsRateLimited(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	start := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	now := start
+	m := NewInMemory(WithMaxKeys(1), WithMemoryIdleTTL(time.Hour),
+		WithTimeFunc(func() time.Time { return now }))
+
+	require.NoError(t, m.Add(ctx, "live", "pii"))
+
+	// The first refusal sweeps (nothing is reclaimable, so it still refuses) and stamps
+	// the sweep clock; the next one inside the interval must not scan again.
+	require.Error(t, m.Add(ctx, "new-1", "pii"))
+	first := m.lastReclaim
+	require.False(t, first.IsZero(), "the first at-ceiling admission attempt sweeps")
+
+	now = start.Add(time.Second)
+	require.Error(t, m.Add(ctx, "new-2", "pii"))
+	assert.Equal(t, first, m.lastReclaim, "a refusal inside the interval must not re-scan")
+
+	// Past the interval it sweeps again — and by then the held anchor has idled out, so
+	// the new one is admitted rather than refused for a slot nothing is using.
+	now = start.Add(DefaultCleanupInterval + time.Hour)
+	require.NoError(t, m.Add(ctx, "new-3", "pii"))
+	assert.True(t, m.lastReclaim.After(first))
 }
