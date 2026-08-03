@@ -359,6 +359,10 @@ type HTTPProxy struct {
 	// onRevocation's non-blocking send, so the kill switch's delivery goroutines are never
 	// stalled by a sweep.
 	revoked chan struct{}
+	// unobserveRevocations releases this proxy's registration on the shared kill switch.
+	// Written once in the constructor and called once by Serve's teardown. nil for a proxy
+	// assembled by a struct literal (as tests do), which registered nothing to release.
+	unobserveRevocations func()
 	// establishing counts sessions that have RESERVED a maxSessions slot but have not
 	// registered into sessions yet — they are between tryReserveSessionSlot and
 	// registerSession, spending up to sessionStartTimeout on an upstream spawn,
@@ -491,8 +495,12 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 	}
 	// Registered at construction rather than at Serve, so a kill delivered during startup is
 	// not lost: the trigger is one buffered slot, so a revocation raised before the worker
-	// exists is coalesced into it and served by the first tick of the worker.
-	opts.KS.ObserveRevocations(p.onRevocation)
+	// exists is coalesced into it and served by the first tick of the worker. The unregister
+	// is kept because the kill switch OUTLIVES this proxy — it is built once and may be handed
+	// to a second one (a retry after a listener error, a reload) — and Serve releases it on
+	// return, so a proxy that is done is not kept reachable, and called, by the backend it
+	// registered with.
+	p.unobserveRevocations = opts.KS.ObserveRevocations(p.onRevocation)
 	return p
 }
 
@@ -781,6 +789,13 @@ func (p *HTTPProxy) Serve(ctx context.Context) error {
 	// the SSE stream pinned until the process exited. It also removes the up-to-one-sweep
 	// (<=30s) reclaim latency the backstop carries even when it IS running.
 	go p.reclaimOnRevocation(reaperCtx)
+	// And hand the registration back when this proxy is done, so the kill switch — which may
+	// outlive it — is not left calling into a proxy that serves nothing, holding its session
+	// map, routes and sink reachable. Deferred beside the worker it feeds; nil only for a
+	// struct-literal proxy, which registered nothing.
+	if p.unobserveRevocations != nil {
+		defer p.unobserveRevocations()
+	}
 
 	// Teardown for EVERY Serve return path — a graceful ctx cancel OR a srv.Serve
 	// error (listener failure) — as a single defer so no return arm can forget it

@@ -1436,7 +1436,7 @@ func (r *Redis) handlePubSubMessage(payload string) {
 // from the reconcile loop's commit, so a kill reaches one whether or not its publish was
 // delivered. See the interface doc for the contract, and note the must-not-block rule: both
 // callers are single goroutines whose progress every other instance-local kill depends on.
-func (r *Redis) ObserveRevocations(fn func(Revocation)) { r.observers.observe(fn) }
+func (r *Redis) ObserveRevocations(fn func(Revocation)) func() { return r.observers.observe(fn) }
 
 // cutKillID returns the id carried by a prefixed kill-switch pub/sub event (e.g.
 // "agent:kill:foo" with prefix "agent:kill:" yields "foo"), or "" when payload lacks

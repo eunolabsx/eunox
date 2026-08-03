@@ -289,8 +289,12 @@ Section conventions:
   `${VAR}`. `$$` still collapses to a literal `$` under every grammar.
 
 - **BREAKING (pre-1.0): `killswitch.Manager` gained `ObserveRevocations`.** An implementation
-  outside this repo must add it; `ObserveRevocations(func(killswitch.Revocation)) {}` is a
-  valid no-op for a backend with no real-time delivery. See *Fixed* for what it closes.
+  outside this repo must add it;
+  `ObserveRevocations(func(killswitch.Revocation)) func() { return func() {} }` is a valid no-op
+  for a backend with no real-time delivery. It returns an idempotent unregister, because a kill
+  switch commonly outlives the consumer it was handed to (a proxy rebuilt after a listener
+  error, a config reload) and an append-only registration would keep the dead consumer — and
+  everything it captured — reachable and still called. See *Fixed* for what it closes.
 
 - **Server-initiated requests are no longer handled in receipt order on the HTTP transport
   either**, matching the caveat already documented for stdio, and at most 32 may be in flight
@@ -837,6 +841,9 @@ Section conventions:
   That also removes the up-to-one-sweep (<=30s) reclaim latency the sweep carried when it WAS
   running. The sweep stays as the backstop. An agent-scoped kill needs no agent->session map:
   each session is re-checked with its own claims, through the same predicate the sweep uses.
+  A kill that lands while a session is still in its handshake is reclaimed too: every sweep
+  spares an establishing session (tearing one down would race its own establishment teardown),
+  so the check also runs on the one edge where that spare ends.
 
 - **A stdio upstream can no longer stall the proxy's response delivery by emitting
   `sampling/createMessage` repeatedly.** Bounding that leg's wait for the decision turn (below)

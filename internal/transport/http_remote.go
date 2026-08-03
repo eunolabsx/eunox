@@ -237,7 +237,7 @@ func (p *HTTPProxy) newRemoteSession(ctx context.Context, route *UpstreamRoute, 
 	// check) so the idle reaper does not tear it down during that window — the same
 	// guard as local-subprocess newSession. See the initInProgress field comment.
 	sess.initInProgress.Store(true)
-	defer sess.initInProgress.Store(false)
+	defer p.finishEstablishing(sess) //nolint:contextcheck // the establishment edge's kill check and any teardown it triggers are deliberately detached: this defer runs as the request context is finishing, and binding the reclaim to it would cancel the teardown the moment the handler returns — the same rationale as the other reap sites.
 
 	if err := sess.initRemoteUpstream(ctx); err != nil {
 		// A partial initialize may already have captured the upstream session ID, so

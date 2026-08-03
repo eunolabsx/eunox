@@ -154,41 +154,46 @@ func (e *Engine) registerBuiltins() {
 	e.registerBuiltin(capability.ConditionTypeFlowLabel, ConditionHandlerFunc(e.handleFlowLabel))
 	e.registerBuiltin(capability.ConditionTypeEffectClass, ConditionHandlerFunc(e.handleEffectClass))
 	e.registerBuiltin(capability.ConditionTypeBlastRadius, blastRadiusHandler{e: e})
-	// The two extension points answer for themselves rather than from their registry entries,
-	// which declare every subsystem because what an out-of-tree evaluator reads is not
-	// knowable from a token type. It IS knowable from the evaluator, when the evaluator says
-	// so — see extensionPointHandler.
-	e.registerBuiltin(capability.ConditionTypePolicy, extensionPointHandler{e: e, fn: e.handlePolicy})
-	e.registerBuiltin(capability.ConditionTypeCustom, extensionPointHandler{e: e, fn: e.handleCustom})
+	// `policy` answers from the PolicyEvaluator its dispatch calls, rather than from its
+	// registry entry (which declares every subsystem, because what an out-of-tree evaluator
+	// reads is not knowable from a token TYPE — but IS knowable from the evaluator, when the
+	// evaluator says so). See policyConditionHandler.
+	e.registerBuiltin(capability.ConditionTypePolicy, policyConditionHandler{e: e})
+	// `custom` deliberately does NOT. handleCustom consults no evaluator at all — it fails
+	// closed and tells the embedder to supply a handler via WithConditionHandler — so
+	// answering from the PolicyEvaluator would let an evaluator wired for `policy` declare on
+	// behalf of a token it has nothing to do with: the same "the declaration describes
+	// something other than the handler that runs" defect the registry lookup exists to
+	// remove, and benign only for as long as handleCustom cannot allow. Its registry entry
+	// (every subsystem) is the honest answer here, and an embedder supplying the real handler
+	// declares for THAT through SubsystemDependent.
+	e.registerBuiltin(capability.ConditionTypeCustom, ConditionHandlerFunc(e.handleCustom))
 }
 
-// extensionPointHandler is the built-in handler for the two tokens whose enforcement is
-// supplied from OUTSIDE this build (policy, custom): it runs the in-tree dispatch and, for the
-// subsystem gates, forwards the question to the PolicyEvaluator that dispatch will call.
+// policyConditionHandler is the built-in handler for the `policy` extension point: it runs the
+// in-tree dispatch and, for the subsystem gates, forwards the question to the PolicyEvaluator
+// that dispatch will call.
 //
-// Their prototype-registry entries declare every subsystem, and must: a token type cannot know
-// what an embedder's evaluator reads. The evaluator can, and the cost of not asking it is
+// The token's prototype-registry entry declares every subsystem, and must: a token type cannot
+// know what an embedder's evaluator reads. The evaluator can, and the cost of not asking it is
 // charged to a policy's OTHER capabilities — a manifest mixing `policy` with a plain maxCalls
 // keeps antecedent recording wired for the whole engine, so every maxCalls call pays a counter
 // round-trip and re-arms a fail-closed deny path on a counter-write fault, for a sibling
 // capability that has nothing to do with the extension point.
 //
 // An evaluator that does not implement SubsystemDependent, or is not wired at all, leaves the
-// declaration unclassified — every subsystem, the conservative answer these tokens had before.
-type extensionPointHandler struct {
-	e  *Engine
-	fn func(context.Context, capability.Condition, *capability.EnforceRequest) *ConditionError
-}
+// declaration unclassified — every subsystem, the conservative answer this token had before.
+type policyConditionHandler struct{ e *Engine }
 
 // Handle implements [ConditionHandler].
-func (h extensionPointHandler) Handle(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) *ConditionError {
-	return h.fn(ctx, cond, req)
+func (h policyConditionHandler) Handle(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) *ConditionError {
+	return h.e.handlePolicy(ctx, cond, req)
 }
 
 // UsesEngineSubsystems implements [SubsystemDependent] by asking the evaluator that will
 // actually run. It is read once, after every option has been applied (deriveSubsystemSkips), so
 // the evaluator is the one this engine was built with.
-func (h extensionPointHandler) UsesEngineSubsystems() []capability.EngineSubsystem {
+func (h policyConditionHandler) UsesEngineSubsystems() []capability.EngineSubsystem {
 	if d, ok := h.e.policyEvaluator.(SubsystemDependent); ok {
 		return d.UsesEngineSubsystems()
 	}

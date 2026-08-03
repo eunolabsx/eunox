@@ -76,7 +76,7 @@ type tokenSpec[T any] struct {
 	// "accumulates nothing". See tokenstate.go for the rule that sets it.
 	State StateAccumulation
 	// Uses names the optional engine subsystems this token's enforcement reads or writes — the
-	// property the engine's two skip gates (WithoutAntecedentRecording, WithoutFlowLabels) are
+	// property the engine's two optional-subsystem skip gates are
 	// derived from. Declare SubsystemNone explicitly for a token that depends on none; an
 	// entry leaving it empty is UNCLASSIFIED, which every consumer treats as "depends on all
 	// of them". See subsystem.go for the rule that sets it.

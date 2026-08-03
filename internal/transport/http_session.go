@@ -445,7 +445,7 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 	// so the idle reaper does not tear the session down during the drift-check window.
 	// See the initInProgress field comment.
 	sess.initInProgress.Store(true)
-	defer sess.initInProgress.Store(false)
+	defer p.finishEstablishing(sess) //nolint:contextcheck // the establishment edge's kill check and any teardown it triggers are deliberately detached: this defer runs as the request context is finishing, and binding the reclaim to it would cancel the teardown the moment the handler returns — the same rationale as the other reap sites.
 
 	cmd := exec.Command(route.command, route.args...) //nolint:gosec,noctx // G204: args are user-supplied CLI arguments; session lifecycle managed via done channel, not ctx
 	ConfigureUpstreamCmd(cmd)
@@ -1111,6 +1111,35 @@ func (p *HTTPProxy) reapKilledSessions() {
 		}(s)
 	}
 	wg.Wait()
+}
+
+// finishEstablishing ends a session's initializing window and reclaims it if a kill landed
+// while it was establishing. Both constructors defer it.
+//
+// Clearing the flag alone is not enough, and the gap is exactly the configuration the
+// on-delivery reclaim was added for. Every sweep — the idle reaper's and the on-delivery one —
+// SPARES a session whose handshake is still running, because tearing one down would race the
+// establishment path's own teardown. A revocation fires once, so a kill delivered during that
+// window is swept while the session is spared and never revisited: with idle reaping off there
+// is no later sweep at all, and the session registers as established, holding its upstream and
+// its maxSessions slot until the process exits. Checking here, on the one edge where the spare
+// ENDS, closes it without giving any sweep the race it declines to take. It also covers the
+// registration that lands between a sweep's snapshot and its end, including under a global kill
+// (unlike reapAllKilledSessions, an on-delivery sweep does not bump reapGen — it must not, since
+// it may reclaim nothing and rejecting concurrent registrations on that basis would refuse
+// sessions no kill names).
+//
+// A session whose establishment FAILED is skipped: it is already closed and unregistered, so
+// there is nothing to reclaim and a "reaped" line would be misleading. The identity comparison
+// (not merely a presence check) also skips a stale id that a later session somehow reused.
+func (p *HTTPProxy) finishEstablishing(sess *httpSession) {
+	sess.initInProgress.Store(false)
+	if p.getSession(sess.id) != sess {
+		return
+	}
+	if p.sessionKilled(sess) {
+		p.reclaimKilledSession(sess)
+	}
 }
 
 // reclaimKilledSession tears down one session the kill switch names. Shared by the idle

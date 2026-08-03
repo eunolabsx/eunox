@@ -1443,7 +1443,7 @@ func targetOperationPhrase(t capability.TargetType) string {
 // stays label-free — matching the record a genuine allow of that constraint writes,
 // rather than over-reporting the session's accumulated labels on a call that is neither a
 // flow source nor a sink — and pays none of the vocabulary Peek cost, honoring the
-// WithoutFlowLabels optimization on this path too. RecordSessionCall stays ungated: the
+// flow-path skip on this path too. RecordSessionCall stays ungated: the
 // sequenceBlock antecedent must be recorded for every downgraded deny regardless of flow.
 //
 // clock is p.engineClock() at every call site so the frozen test clock is honored

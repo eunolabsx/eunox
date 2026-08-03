@@ -338,7 +338,7 @@ func WithCallCounter(counter capability.CallCounter) Option {
 // the CallCounter: flow-label provenance is a monotonic per-session set with a
 // session-scoped lifetime, so it must not live in the sliding-window counter that
 // backs maxCalls/sequenceBlock. Leave it unset only for a policy known to use no flow
-// control (see config.LocalManifest.UsesEngineSubsystem); a flow constraint with no store
+// control (the engine skips the flow path for one; see WithPolicyTokens); a flow constraint with no store
 // wired fails closed. See pkg/flowlabelstore.
 func WithFlowLabelStore(store capability.FlowLabelStore) Option {
 	return func(e *Engine) {
@@ -638,7 +638,7 @@ func (e *Engine) policyUses(s capability.EngineSubsystem) bool {
 // to known antecedents. A write fault therefore denies every allowed call in a
 // session while the backend faults, the deliberate cost of one consistent
 // fail-closed rule. The one bound applied is policy-wide: when the policy contains
-// NO sequenceBlock at all (WithoutAntecedentRecording), the marker is never read,
+// NO sequenceBlock at all (skipAntecedentRecording), the marker is never read,
 // so recording is skipped entirely — which also keeps a counter-write fault on a
 // maxCalls-only policy from denying a call whose maxCalls slot runConditions already
 // committed (the only case where the fail-closed deny would burn quota for nothing).
@@ -913,7 +913,7 @@ func (e *Engine) runPureConditions(ctx context.Context, req *capability.EnforceR
 	// denies a call whose maxCalls slot was already committed here. It is not rolled
 	// back, so that denied call has spent a slot. This is bounded to policies that
 	// actually use sequenceBlock: with none, RecordSessionCall is skipped entirely
-	// (WithoutAntecedentRecording), so a maxCalls-only policy never burns a slot on a
+	// (skipAntecedentRecording), so a maxCalls-only policy never burns a slot on a
 	// record-fault deny.
 	var deferred []capability.Condition
 	for _, cond := range matched.Conditions {

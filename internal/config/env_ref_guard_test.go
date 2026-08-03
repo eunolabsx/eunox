@@ -391,24 +391,54 @@ func TestEnvGrammar_GuardAndExpansionReadOneDeclaration(t *testing.T) {
 // TestDeclaredEnvGrammar_ReadsTheFieldsOwnTag is the other half of "one declaration": the
 // guards' grammars come from the same struct tags the expansion walk reads, so a field whose
 // declaration changes cannot leave the guard on the old rule.
+//
+// EVERY guarded field is checked, not only the ones that narrow today. A guard passing
+// envGrammarFull as a literal is correct until someone tags that field — and then it is the
+// same silent divergence on, say, audit.keyPath, where the expansion would leave
+// "$KEYDIR/audit.key" verbatim while the guard saw a resolved reference and passed it, writing
+// the HMAC signing key to a directory literally named "$KEYDIR".
 func TestDeclaredEnvGrammar_ReadsTheFieldsOwnTag(t *testing.T) {
+	for name, tc := range map[string]struct {
+		guard envGrammar
+		path  string
+	}{
+		"upstreamUrl":        {upstreamURLEnvGrammar, "upstreams.upstreamUrl"},
+		"command":            {upstreamCommandEnvGrammar, "upstreams.command"},
+		"args":               {upstreamArgsEnvGrammar, "upstreams.args"},
+		"upstreamAuthHeader": {upstreamAuthHeaderEnvGrammar, "upstreams.upstreamAuthHeader"},
+		"allowedOrigins":     {allowedOriginsEnvGrammar, "listen.allowedOrigins"},
+		"authToken":          {listenAuthTokenEnvGrammar, "listen.authToken"},
+		"audit.log":          {auditLogEnvGrammar, "audit.log"},
+		"audit.keyPath":      {auditKeyPathEnvGrammar, "audit.keyPath"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := declaredEnvGrammarAt(tc.path); got != tc.guard {
+				t.Errorf("guard grammar = %d, field declares %d — the guard and the expansion must read one declaration", tc.guard, got)
+			}
+		})
+	}
+	// And the declarations themselves are what this PR set them to.
 	if upstreamURLEnvGrammar != envGrammarURL {
-		t.Errorf("upstreamUrl guard grammar = %d, want the URL grammar its field declares", upstreamURLEnvGrammar)
+		t.Errorf("upstreamUrl = %d, want the URL grammar", upstreamURLEnvGrammar)
 	}
 	if upstreamCommandEnvGrammar != envGrammarBraced || upstreamArgsEnvGrammar != envGrammarBraced {
-		t.Errorf("command/args guard grammars = %d/%d, want braced-only", upstreamCommandEnvGrammar, upstreamArgsEnvGrammar)
+		t.Errorf("command/args = %d/%d, want braced-only", upstreamCommandEnvGrammar, upstreamArgsEnvGrammar)
 	}
-	if got := declaredEnvGrammar[UpstreamConfig]("upstreamAuthHeader"); got != envGrammarFull {
-		t.Errorf("an undeclared field = %d, want the full default", got)
+	for _, g := range []envGrammar{upstreamAuthHeaderEnvGrammar, allowedOriginsEnvGrammar, listenAuthTokenEnvGrammar, auditLogEnvGrammar, auditKeyPathEnvGrammar} {
+		if g != envGrammarFull {
+			t.Errorf("an undeclared field = %d, want the full default", g)
+		}
 	}
-	// A field name that stops resolving must be loud, not silently full: falling back would
-	// restore exactly the guard/expansion mismatch this lookup removes.
-	func() {
-		defer func() {
-			if recover() == nil {
-				t.Error("declaredEnvGrammar must panic on a field name it cannot resolve")
-			}
+	// A path that stops resolving must be loud, not silently full: falling back would restore
+	// exactly the guard/expansion mismatch this lookup removes.
+	for _, bad := range []string{"upstreams.noSuchField", "noSuchSection.x", "listen.authToken.deeper"} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("declaredEnvGrammarAt(%q) must panic rather than fall back to the full grammar", bad)
+				}
+			}()
+			_ = declaredEnvGrammarAt(bad)
 		}()
-		_ = declaredEnvGrammar[UpstreamConfig]("noSuchField")
-	}()
+	}
 }

@@ -6,6 +6,7 @@ package killswitch
 
 import (
 	"context"
+	"slices"
 	"sort"
 	"sync"
 )
@@ -80,7 +81,13 @@ type Manager interface {
 	// registration happened after a kill all leave the state to be found by the next
 	// reconcile. Every implementation also fires from its reconcile path for that reason,
 	// but a consumer that must not miss one keeps its sweep as the backstop.
-	ObserveRevocations(fn func(Revocation))
+	//
+	// It returns an idempotent unregister. A kill switch commonly OUTLIVES its consumer — it
+	// is built once and handed to a proxy that may be reconstructed (a retry after a listener
+	// error, a config reload) — and a registration with no way out keeps the dead consumer's
+	// closure, and everything it captured, reachable forever while still being called on
+	// every kill. A consumer with a lifetime shorter than the backend's must call it.
+	ObserveRevocations(fn func(Revocation)) (unregister func())
 }
 
 // Revocation reports one kill a backend's local view just gained. Exactly one dimension is
@@ -104,28 +111,56 @@ type Revocation struct {
 // locking, and the call-outside-the-lock rule have one implementation rather than two that
 // must agree about which goroutine holds what while a consumer's callback runs.
 type revocationObservers struct {
-	mu  sync.RWMutex
-	fns []func(Revocation)
+	mu   sync.RWMutex
+	fns  []registeredObserver
+	next uint64
 }
 
-// observe registers fn. Additive; safe to call concurrently with a notify.
-func (o *revocationObservers) observe(fn func(Revocation)) {
+// registeredObserver is one registration: the callback plus the id its unregister closes over.
+type registeredObserver struct {
+	id uint64
+	fn func(Revocation)
+}
+
+// observe registers fn and returns an idempotent unregister. Additive; safe to call
+// concurrently with a notify.
+//
+// Registrations are keyed by a monotonic id rather than by slice index, so unregistering one
+// cannot shift another's identity — an index-keyed removal silently unregisters the wrong
+// observer as soon as two consumers share a backend, which is exactly the deployment that
+// needs this.
+func (o *revocationObservers) observe(fn func(Revocation)) func() {
 	if fn == nil {
-		return
+		return func() {}
 	}
 	o.mu.Lock()
-	o.fns = append(o.fns, fn)
+	o.next++
+	id := o.next
+	o.fns = append(o.fns, registeredObserver{id: id, fn: fn})
 	o.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			o.mu.Lock()
+			o.fns = slices.DeleteFunc(o.fns, func(r registeredObserver) bool { return r.id == id })
+			o.mu.Unlock()
+		})
+	}
 }
 
 // notify calls every registered observer with ev. The caller must NOT hold the backend's own
 // state lock: an observer's documented response is to re-ask ShouldBlock, which takes it.
+//
+// The slice header is copied under the read lock and iterated outside it, so an observer that
+// unregisters itself (or another) from inside its own callback cannot deadlock; it may still be
+// called for THIS event, which is the same at-most-one-more-call race any callback deregistration
+// has.
 func (o *revocationObservers) notify(ev Revocation) {
 	o.mu.RLock()
 	fns := o.fns
 	o.mu.RUnlock()
-	for _, fn := range fns {
-		fn(ev)
+	for _, r := range fns {
+		r.fn(ev)
 	}
 }
 

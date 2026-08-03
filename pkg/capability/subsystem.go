@@ -5,7 +5,7 @@
 // registry entry beside the grammar revision and the state class.
 //
 // The engine builds two of its facilities conditionally: the per-call antecedent marker
-// (WithoutAntecedentRecording) and the flow-label peek/record path (WithoutFlowLabels). Both
+// (skipAntecedentRecording) and the flow-label peek/record path (skipFlow). Both
 // skips are OPTIMIZATIONS — the marker exists only to be read by a later sequenceBlock, and
 // the flow path only to be read by a flow token — so a policy carrying neither pays for
 // neither.
@@ -14,7 +14,7 @@
 // another naming the three flow token types. That is the shape the state-accumulation axis
 // already retired for the decision turn, and it fails the same way here, in the direction that
 // matters: add a condition that READS the flow-label set, and a policy carrying only that
-// condition reports "no flow token" — so the engine is built WithoutFlowLabels and the new
+// condition reports "no flow token" — so the engine skips the flow path and the new
 // handler runs against an engine holding no flow state. Depending on how it reaches the store
 // that denies, allows, or (the plausible one) silently reads an empty set: a fail-open arriving
 // through the gate rather than through the turn.
@@ -23,6 +23,13 @@
 // token can be added at all, an entry declaring nothing is UNCLASSIFIED, and every consumer
 // treats unclassified as "depends on every subsystem". The completeness test in
 // subsystem_test.go fails the build when an entry declares none.
+//
+// What this declares is the handler THIS BUILD SHIPS for the token, which is why it is not the
+// last word: enforcement.WithConditionHandler can replace any token's handler, so the ENGINE
+// decides the two skips, from its own handler registry intersected with the tokens a policy
+// carries. A replacement handler is unclassified — every facility stays wired — unless it
+// declares for itself through enforcement.SubsystemDependent, which reads its declaration
+// through the same DeclarationUsesSubsystem rule below.
 //
 // Over-declaring is not free, and the cost differs by subsystem — stated here rather than
 // waved at as "just an optimization". Keeping the flow path wired costs a per-call relevance
@@ -39,7 +46,9 @@
 // SubsystemAntecedentHistory. Reading or writing the flow-label set is SubsystemFlowLabels. A
 // token whose enforcement is supplied from OUTSIDE this build (policy, custom) declares every
 // subsystem: what an embedder's evaluator reads is not knowable here, and the conservative
-// answer costs one per-call scan.
+// answer costs one per-call scan. (`policy`'s built-in handler asks the wired PolicyEvaluator
+// when it declares, so the conservative entry is the fallback rather than the ceiling; `custom`
+// deliberately does not, because its handler consults no evaluator at all.)
 
 package capability
 
@@ -55,10 +64,10 @@ const (
 	// reasoned about and fails closed, the second is a decision.
 	SubsystemNone EngineSubsystem = "none"
 	// SubsystemAntecedentHistory is the per-call marker the engine records so a later call's
-	// sequenceBlock can ask what preceded it. Gated by WithoutAntecedentRecording.
+	// sequenceBlock can ask what preceded it. Gated by the engine's skipAntecedentRecording.
 	SubsystemAntecedentHistory EngineSubsystem = "antecedentHistory"
 	// SubsystemFlowLabels is the session/task-scoped flow-label set: the labels a source
-	// writes, a sink peeks, and a declassification clears. Gated by WithoutFlowLabels.
+	// writes, a sink peeks, and a declassification clears. Gated by the engine's skipFlow.
 	SubsystemFlowLabels EngineSubsystem = "flowLabels"
 )
 

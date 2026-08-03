@@ -142,12 +142,14 @@ func (silentEvaluator) Evaluate(context.Context, string, interface{}, interface{
 	return nil
 }
 
-// TestSubsystemGates_ExtensionPointsAskTheirEvaluator covers the two tokens whose enforcement is
-// supplied from outside this build. Their registry entries declare EVERY subsystem, and must —
-// a token type cannot know what an embedder's evaluator reads. The evaluator can, and the cost
-// of not asking it lands on the policy's OTHER capabilities: a manifest mixing `policy` with a
+// TestSubsystemGates_ExtensionPointsAskTheirEvaluator covers `policy`, whose enforcement is
+// supplied from outside this build. Its registry entry declares EVERY subsystem, and must — a
+// token type cannot know what an embedder's evaluator reads. The evaluator can, and the cost of
+// not asking it lands on the policy's OTHER capabilities: a manifest mixing `policy` with a
 // plain maxCalls keeps antecedent recording wired for the whole engine, so every maxCalls call
 // pays a counter round-trip and re-arms a fail-closed deny path on a counter-write fault.
+//
+// It also covers the token that must NOT follow the evaluator — see the `custom` case below.
 func TestSubsystemGates_ExtensionPointsAskTheirEvaluator(t *testing.T) {
 	t.Parallel()
 	mixed := []string{capability.ConditionTypePolicy, capability.ConditionTypeMaxCalls}
@@ -164,6 +166,17 @@ func TestSubsystemGates_ExtensionPointsAskTheirEvaluator(t *testing.T) {
 	assert.False(t, honest.skipFlow, "the evaluator reads the flow set")
 	assert.True(t, honest.skipAntecedentRecording,
 		"and the sibling maxCalls no longer pays for a facility nothing reads")
+
+	// `custom` must NOT follow the evaluator: handleCustom consults no evaluator at all, so
+	// an evaluator wired for `policy` would be declaring on behalf of a token it has nothing
+	// to do with — the defect the registry lookup exists to remove, arriving through the
+	// forwarding. Its registry entry (every subsystem) stands until an embedder supplies the
+	// real handler and declares for that.
+	withCustom := New(WithPolicyTokens([]string{capability.ConditionTypeCustom, capability.ConditionTypeMaxCalls}),
+		WithPolicyEvaluator(declaringEvaluator{declares: []capability.EngineSubsystem{capability.SubsystemNone}}))
+	assert.False(t, withCustom.skipFlow,
+		"a `policy` evaluator must not answer for `custom`, whose handler never calls it")
+	assert.False(t, withCustom.skipAntecedentRecording)
 
 	// The order options are applied in must not matter: the gates are derived after ALL of
 	// them, so an evaluator passed before or after the tokens is seen either way.

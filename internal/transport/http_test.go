@@ -6574,3 +6574,122 @@ func TestRevocationReclaim_ConstructorRegistersAndServeRunsTheWorker(t *testing.
 	cancel()
 	<-done
 }
+
+// TestRevocationReclaim_KillDuringTheHandshakeIsStillReclaimed closes the window every sweep
+// declines to take. A session inside its handshake + drift check is SPARED by both reclaim
+// paths, because tearing one down would race the establishment path's own teardown. A
+// revocation fires once, so a kill landing in that window is swept while the session is spared
+// and never revisited — and with idle reaping off there is no later sweep at all, which is the
+// exact configuration the on-delivery reclaim was added for. The check runs on the one edge
+// where the spare ends.
+func TestRevocationReclaim_KillDuringTheHandshakeIsStillReclaimed(t *testing.T) {
+	ks := killswitch.NewInMemory()
+	fake := newFakeUpstream()
+	upSrv := httptest.NewServer(http.StripPrefix("/mcp", fake))
+	t.Cleanup(upSrv.Close)
+	sink, _ := newTempAuditSink(t)
+	proxy := newHTTPProxy(httpProxyOptions{
+		UpstreamURL:   upSrv.URL,
+		PDP:           newTestManifestPDPWithKS(ks),
+		KS:            ks,
+		SessionIdleMs: 0,
+		Sink:          sink,
+	})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/mcp", proxy.handleMCP)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	// No reclaim worker here on purpose: its sweep runs asynchronously and would race the
+	// window under test, reclaiming the session once the flag clears and passing the test
+	// whether or not the establishment edge checks anything. The sweeps are driven explicitly
+	// below instead, so only finishEstablishing can account for the reclaim.
+
+	sid := initSession(t, srv)
+	sess := proxy.getSession(sid)
+	if sess == nil {
+		t.Fatal("session not found")
+	}
+
+	// Re-enter the establishing window and let the revocation land inside it: every sweep
+	// spares the session, and there is no second revocation and no idle sweep to follow up.
+	sess.initInProgress.Store(true)
+	if err := ks.KillSession(context.Background(), sid); err != nil {
+		t.Fatalf("KillSession: %v", err)
+	}
+	proxy.reapKilledSessions() // deterministic stand-in for the worker's sweep
+	if proxy.sessionCount() != 1 {
+		t.Fatal("a sweep must spare an establishing session, not race its establishment teardown")
+	}
+
+	// A second sweep still spares it, so nothing but the establishment edge is left.
+	proxy.reapKilledSessions()
+	if proxy.sessionCount() != 1 {
+		t.Fatal("still establishing: no sweep may reclaim it")
+	}
+
+	// Establishment completes: the one edge where the spare ends must reclaim it.
+	proxy.finishEstablishing(sess)
+	waitForSessions(t, proxy, 0)
+}
+
+// And the same edge leaves an UNKILLED session alone — establishment must not become a second
+// place that tears sessions down.
+func TestFinishEstablishing_SparesAnUnkilledSession(t *testing.T) {
+	ks := killswitch.NewInMemory()
+	fake := newFakeUpstream()
+	upSrv := httptest.NewServer(http.StripPrefix("/mcp", fake))
+	t.Cleanup(upSrv.Close)
+	sink, _ := newTempAuditSink(t)
+	proxy := newHTTPProxy(httpProxyOptions{
+		UpstreamURL: upSrv.URL, PDP: newTestManifestPDPWithKS(ks), KS: ks, SessionIdleMs: 0, Sink: sink,
+	})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/mcp", proxy.handleMCP)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	sid := initSession(t, srv)
+	sess := proxy.getSession(sid)
+	if sess == nil {
+		t.Fatal("session not found")
+	}
+	proxy.finishEstablishing(sess)
+	if proxy.sessionCount() != 1 {
+		t.Fatal("finishEstablishing must reclaim only a session the kill switch names")
+	}
+	if sess.initInProgress.Load() {
+		t.Fatal("finishEstablishing must clear the initializing flag")
+	}
+}
+
+// TestRevocationReclaim_ServeReleasesTheObserverRegistration pins that a proxy hands its
+// registration back when it is done. A kill switch is built once and can outlive the proxy it
+// was handed to — a retry after a listener error, a config reload — and an append-only
+// registration would keep the dead proxy's whole object graph (session map, routes, sink, route
+// PDPs) reachable and keep calling into it on every subsequent kill.
+func TestRevocationReclaim_ServeReleasesTheObserverRegistration(t *testing.T) {
+	t.Parallel()
+	ks := killswitch.NewInMemory()
+	port := freeTCPPort(t)
+	proxy := NewHTTPProxyGateway(HTTPGatewayOptions{
+		Routes: map[string]*UpstreamRoute{}, KS: ks, Bind: "127.0.0.1", Port: port,
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- proxy.Serve(ctx) }()
+	waitForServer(t, fmt.Sprintf("http://127.0.0.1:%d/healthz", port))
+	cancel()
+	<-done
+
+	// Drain whatever the worker left, then confirm nothing is delivered any more.
+	select {
+	case <-proxy.revoked:
+	default:
+	}
+	if err := ks.KillSession(context.Background(), "sess-after-serve"); err != nil {
+		t.Fatalf("KillSession: %v", err)
+	}
+	if len(proxy.revoked) != 0 {
+		t.Fatal("a proxy whose Serve has returned must not still be receiving revocations")
+	}
+}

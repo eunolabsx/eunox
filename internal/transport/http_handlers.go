@@ -325,8 +325,10 @@ func (p *HTTPProxy) handleHTTPUpstreamRequest(ctx context.Context, sess *httpSes
 	// caller holding two tokens differing only in task_id taints one bucket through the host leg
 	// while this leg peeks another and finds it clean.
 	//
-	// Bounded, because this runs on the session's single upstream-reader goroutine: see
-	// samplingTurnWait, and decideSampling for what a refused turn produces.
+	// Bounded: see samplingTurnWait for what the bound is for now that this no longer runs on
+	// the session's reader (it runs on its own goroutine, up to maxConcurrentServerRequests
+	// per session — so anything this function reaches must be safe for that concurrency), and
+	// decideSampling for what a refused turn produces.
 	var decideLock func() (end func(), ok bool)
 	if rt.serializes() {
 		decideLock = func() (func(), bool) { return sess.beginDecisionTurnWithin(samplingTurnWait) }

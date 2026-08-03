@@ -199,7 +199,7 @@ func (e *Engine) selectLiveApproval(ctx context.Context, approvals []capability.
 // taint that would have stopped the next one.
 func (e *Engine) checkDeclassify(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, carriedLabels []string, requestID, now string) (declassifyOutcome, *capability.EnforceResponse) {
 	if e.skipFlow {
-		// An engine built WithoutFlowLabels holds no flow state, so it can neither read
+		// An engine whose flow path is skipped holds no flow state, so it can neither read
 		// what a session carries nor clear it. Returning the zero outcome means such a
 		// constraint neither escalates nor pretends to declassify; the config layer keeps
 		// this unreachable in-tree by counting declassify as flow-relevant, and this is

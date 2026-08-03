@@ -152,4 +152,4 @@ func (m *InMemory) Status(_ context.Context) (*Status, error) {
 // revocation is issued in-process, so an observer is called synchronously on the goroutine
 // that called Kill* — after the state is committed and outside the lock, so it may re-ask
 // ShouldBlock and see the kill it was told about.
-func (m *InMemory) ObserveRevocations(fn func(Revocation)) { m.observers.observe(fn) }
+func (m *InMemory) ObserveRevocations(fn func(Revocation)) func() { return m.observers.observe(fn) }
