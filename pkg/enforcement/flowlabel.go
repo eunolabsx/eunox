@@ -683,6 +683,13 @@ func (e *Engine) CommitDeclassification(ctx context.Context, req *capability.Enf
 	// One authorization, one clear. A second commit of the same decision is a caller fault,
 	// and reporting it is what keeps a double-commit from looking like a healthy one — the
 	// grant behind it was burned exactly once.
+	//
+	// Claimed BEFORE the store write, deliberately, and the trade is the burn's own: a Remove
+	// that faults leaves the authorization spent, so a retry is refused rather than re-applied.
+	// That over-refuses (the operator mints another approval) instead of leaving an
+	// authorization live after a write that may well have landed — a Remove can delete and then
+	// lose its reply, and re-admitting a clear on that evidence is the direction that removes a
+	// label twice from a set store which cannot tell the two occurrences apart.
 	labels, err := decl.Claim()
 	if err != nil {
 		return nil, err

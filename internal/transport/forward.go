@@ -318,6 +318,21 @@ type forwardParams struct {
 	// one, and the failure that produces is silent in the direction of a policy whose
 	// sanitizing step never takes effect.
 	committer declassifyCommitter
+	// endDecision closes the decision critical section a serialize-relevant transport opened
+	// around this enforced request, and is idempotent. The Decide* handlers call it (via
+	// dispatchParams.finishDecision) IMMEDIATELY after the PDP decision so the upstream
+	// forward runs OUTSIDE the turn; the ONE call that keeps it past the decision — a
+	// declassifying call, whose two phases must not be interleaved — is released HERE, by the
+	// forward core, the moment its commit lands.
+	//
+	// That is why it lives on these params rather than beside the dispatcher's pdp: releasing
+	// it at handler return instead would hold the turn across the audit enqueue and the
+	// client-facing response write, and that write is bounded by a client that may simply stop
+	// reading. Under task anchoring the turn is shared, so a stalled client would be holding up
+	// another session's decisions. nil for a non-serialized request, where every call here is a
+	// no-op. The transports ALSO defer the same release, as a backstop for the paths that
+	// return before deciding.
+	endDecision func()
 	strictAuditState
 }
 
@@ -489,18 +504,35 @@ func declassifyRefusalDetail(dec capability.EnforceResponse) map[string]interfac
 	// Either fact on its own is worth a record, and neither implies the other. A refusal
 	// below the decision carries the labels but no spent id when the grant was standing; the
 	// engine's own declassify-leg commit fault carries a spent id but no labels, because the
-	// clear never got as far as being resolved. Both hang off the ONE handle now, so the
-	// presence test is its nil — as two parallel fields it was a pair that had to be checked
-	// in agreement, and keying on the labels alone had already dropped the id on exactly that
-	// second path.
-	decl := dec.Declassification
-	if decl == nil {
+	// clear never got as far as being resolved. Both hang off the ONE handle, so they cannot
+	// disagree about which decision they came from — but the presence test is still both
+	// facts, NOT the handle's nil. A handle exists for every APPROVED declassification, and an
+	// approved clear whose labels the anchor was not carrying, under a standing grant, has
+	// neither fact to report: testing the nil instead put a bare flow discriminator on the
+	// tape for a call with no declassification evidence, and let declassifyRedactionDetail
+	// stamp an executed-and-withheld claim on it.
+	if !dec.Declassification.PendingClear() {
+		return spentGrantDetail(dec)
+	}
+	detail := declassifyDetail()
+	detail[audit.DeclassifyNotAppliedKey] = dec.Declassification.Labels()
+	addSpentApproval(detail, dec)
+	return detail
+}
+
+// spentGrantDetail is the annotation for a call with nothing to clear but a burned single-use
+// grant to name: the flow discriminator and the spent id, or nil when the decision burned
+// nothing.
+//
+// It is the whole record a NO-OP clear produces — the decision authorized labels the anchor
+// was not carrying, so nothing is removed and nothing is "not applied", but the grant is spent
+// for good and this is the only record that will ever name it. Both the success path and the
+// refusal paths reach it, because the fact is the same on each.
+func spentGrantDetail(dec capability.EnforceResponse) map[string]interface{} {
+	if dec.Declassification.SpentApprovalID() == "" {
 		return nil
 	}
 	detail := declassifyDetail()
-	if decl.PendingClear() {
-		detail[audit.DeclassifyNotAppliedKey] = decl.Labels()
-	}
 	addSpentApproval(detail, dec)
 	return detail
 }
@@ -620,15 +652,20 @@ func commitDeclassify(ctx context.Context, committer declassifyCommitter, sessio
 	if !decl.PendingClear() {
 		// Either no declassify directive at all, or an approved one whose labels the anchor
 		// was not carrying — the decision resolved that intersection, so a no-op clear needs
-		// no store round trip and records no declassification. The grant it spent is still
-		// named, on the allow, by the caller's own spent-approval stamp.
-		return nil, nil
+		// no store round trip and records no declassification.
+		//
+		// A single-use grant it BURNED still has to reach the tape, and this is the only
+		// record that will ever name it: the signed labels_cleared/approver/approval_id triple
+		// rides a clear that changed something, and this one changed nothing. Returning a bare
+		// nil here left that grant named nowhere on a call that SUCCEEDED, while the refusal
+		// paths named it — the reconciliation gap backwards.
+		return nil, spentGrantDetail(dec)
 	}
 	detail = declassifyDetail()
 	addSpentApproval(detail, dec)
-	authorized := decl.Labels()
 	cleared, err := commitCleared(ctx, committer, sessionID, decl)
 	if err != nil {
+		authorized := decl.Labels()
 		// The call ran and the clear did not, so the tape says so. Spelled as its own key
 		// rather than a flag beside the refusal's, because the operator action differs: this
 		// one means the flow store faulted on a call that really happened, and the approval
@@ -1011,6 +1048,16 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 	} else {
 		declDetail = declassifyRefusalDetail(dec)
 	}
+	// The commit was the last thing that had to be inside the decision turn, so release it
+	// HERE rather than at handler return. What follows — the audit enqueue and the
+	// client-facing response write — does not touch the state the turn orders, and the write
+	// is bounded by a client that may simply stop reading. Under task anchoring the turn is
+	// shared, so holding it through that would let one client's backpressure stall another
+	// session's decisions. A no-op for every call that already released after its decision
+	// (finishDecision) and for a non-serialized request; idempotent either way.
+	if fp.endDecision != nil {
+		fp.endDecision()
+	}
 
 	// Carry dec.AuditOnly so a per-entry audit-mode forward is not logged as a
 	// genuine allow. allowDetails supplies the structured details.
@@ -1122,10 +1169,10 @@ type serverRequestParams struct {
 	sessionID string
 	sourceIP  string
 	claims    *pdp.JWTClaims
-	// pdp and committer are the SAME decision point and must never be set independently;
-	// build them through withPDP, which derives the second from the first.
+	// pdp is the decision point this leg decides with. Set it through withPDP, never in a
+	// literal: it is the one field a future PDP-shaped field must be derived FROM, and a
+	// source guard fails the build on a literal that assigns it.
 	pdp           pdp.PolicyDecisionPoint
-	committer     declassifyCommitter
 	forward       func(mcp.RPCMsg) bool
 	writeUpstream func(mcp.RPCMsg)
 	// decideLock serializes the sampling decision against the host-path
@@ -1138,49 +1185,122 @@ type serverRequestParams struct {
 	// serialization (a non-flow policy, or a direct test caller). It wraps ONLY the
 	// decision, never the forward. labelOutput on system:sampling is rejected at manifest
 	// load, so sampling is only ever a sink here, never a concurrent writer.
-	decideLock func() (end func())
+	//
+	// ok is false when the turn could not be entered within its bound. It exists because this
+	// runs on the session's SINGLE upstream-reader goroutine, which is also the only goroutine
+	// that delivers upstream responses: blocking it for the length of another call's turn
+	// stalls every in-flight request on the session, and under task anchoring that other call
+	// can be on a different session entirely. Failing the sampling request closed costs one
+	// deny-by-default request; waiting costs the session's whole response path.
+	decideLock func() (end func(), ok bool)
 	// strictAuditState (embedded) carries the --require-audit=strict gate, which also
 	// covers the enforced sampling/createMessage path below. See forwardParams.
 	strictAuditState
 }
 
-// withPDP records the policy decision point this leg decides with and derives every field
-// that must be the SAME one from it — today the committer, which applies the label clear an
-// approved declassification authorized once the request has been delivered.
+// withPDP records the policy decision point this leg decides with, and is the one place any
+// field derived FROM it may be set.
 //
-// It is the server-initiated twin of dispatchParams.withPDP and exists for the same reason:
-// a site that sets pdp and forgets committer compiles, passes every test that does not
-// exercise a declassification, and then never clears a label. This leg is the one
-// construction path that invariant did not cover — it assigned pdp directly at both sites
-// and had no committer field at all, so the compiler could not flag the omission and no test
-// could catch it.
+// It is the server-initiated twin of dispatchParams.withPDP and exists for the same reason: a
+// site that sets pdp and forgets a field that must be the same decision point compiles, passes
+// every test that does not exercise the feature, and then silently does nothing. This leg was
+// the one construction path that invariant did not cover — it assigned pdp directly at both
+// sites, so the compiler could not flag an omission and no test could catch one. The source
+// guard beside it (TestParamsLiterals_DoNotAssignThePDPFields) is what makes it an invariant
+// rather than a convention: a literal that spells `pdp:` fails the build.
 //
-// It is inert today by a LOAD-time restriction, not by anything here: requireSourceDirectiveTarget
-// refuses a declassify directive on a system: target, and sampling/createMessage is the only
-// enforced method on this leg, so no decision reaching it can authorize a clear. That is a
-// restriction in internal/config propping up a wiring invariant in internal/transport, and
-// this is what keeps relaxing the first from silently breaking the second: the leg now
-// commits and annotates exactly as the host path does, so the code is correct on the day the
-// restriction changes rather than on the day someone remembers it.
+// It deliberately carries NO committer. This leg does not commit a declassification and
+// refuses one instead (see forwardServerRequest): "the host was handed the request" is not
+// "the sanitizing action ran", so there is no honest commit point here to wire one to.
 //
 // Same scope note the killSubject type carries: this narrows a typo/omission surface, it does
 // not make the wrong value unassignable.
 func (fp serverRequestParams) withPDP(p pdp.PolicyDecisionPoint) serverRequestParams {
 	fp.pdp = p
-	fp.committer = p
 	return fp
 }
 
-// decideSampling runs the sampling decision under the decision lock when one is configured
-// (see decideLock), releasing it (defer, panic-safe) BEFORE the caller forwards to the host —
-// so the flow peek is serialized with host-path label writes while the forward stays
-// concurrent. A no-op wrapper when serialization is off.
+// samplingTurnWait bounds how long the server-initiated leg waits for the decision turn.
+//
+// It is a bound on a WEDGE, not on contention. This leg runs on the session's single
+// upstream-reader goroutine, which is also the only goroutine that delivers upstream responses
+// and relays notifications — so every microsecond spent blocked here is a microsecond in which
+// none of that session's in-flight calls can complete. The turn it waits for is held across
+// the whole upstream round trip by a declassifying host call (see finishDecision), and under
+// task anchoring by a call on a DIFFERENT session sharing the task, so the wait is bounded
+// only by --upstream-timeout — which may be 0, meaning unbounded.
+//
+// Two seconds is far above a healthy decision (microseconds on the in-memory backend, one
+// bounded round trip on Redis) and far below any upstream call worth waiting behind. Exceeding
+// it means a long-running turn holder, and the fail-closed answer is to refuse this one
+// deny-by-default request rather than to stall the session's whole response path.
+const samplingTurnWait = 2 * time.Second
+
+// decideSampling runs the sampling decision under the decision turn when one is configured
+// (see decideLock), releasing it BEFORE the caller forwards to the host — so the flow peek is
+// serialized with host-path label writes while the forward stays concurrent.
+//
+// A turn this leg cannot enter within samplingTurnWait produces a DENY rather than an
+// unserialized decision: the peek would be racing a host source's label write, which is the
+// exact fail-open the serialization exists to close, and the alternative (wait) wedges the
+// session's reader. The refusal is HARD — an --audit route must not downgrade it into the
+// forward it exists to prevent.
+//
+// The release is deferred, so it is panic-safe and runs before the caller's forward.
 func (fp serverRequestParams) decideSampling(ctx context.Context) capability.EnforceResponse {
 	if fp.decideLock != nil {
-		end := fp.decideLock()
+		end, ok := fp.decideLock()
+		if !ok {
+			return samplingTurnDenial()
+		}
 		defer end()
 	}
 	return fp.pdp.DecideSampling(ctx, fp.sessionID, fp.sourceIP)
+}
+
+// samplingTurnDenial is the fail-closed response for a sampling request whose decision could
+// not be serialized against the anchor's host-path decisions. It reports the flow layer's own
+// discriminator so the refusal lands beside the other information-flow events on the tape.
+func samplingTurnDenial() capability.EnforceResponse {
+	return samplingFlowDenial(
+		"the sampling decision could not be serialized against concurrent decisions on this anchor; refusing rather than reading flow state mid-write",
+		"turn_unavailable")
+}
+
+// samplingDeclassifyDenial is the fail-closed response for a sampling decision that authorized
+// a flow-label clear. This leg cannot commit one — see forwardServerRequest for why "the host
+// received the request" is not "the sanitizing action ran" — so it refuses rather than
+// forwarding the call with an authorization nothing will apply, or applying one on evidence
+// this path does not have.
+//
+// It CARRIES the refused decision's handle. The decision has already burned any single-use
+// grant it accepted, and replacing the response wholesale would leave that grant spent with
+// nothing on the tape naming it — the reconciliation gap the spent-approval key exists to
+// close, reintroduced by the refusal that is supposed to be the safe outcome. The leg's record
+// path reads the handle for exactly that annotation.
+func samplingDeclassifyDenial(dec capability.EnforceResponse) capability.EnforceResponse {
+	refusal := samplingFlowDenial(
+		"a declassification cannot be committed on the server-initiated leg: this path learns only that the host received the request, never that the sanitizing action ran",
+		"declassify_unsupported")
+	refusal.Declassification = dec.Declassification
+	refusal.CarriedLabels = dec.CarriedLabels
+	return refusal
+}
+
+// samplingFlowDenial builds this leg's flow-layer refusals. Both are HARD: an --audit route
+// downgrades a policy verdict being staged, and neither of these is one — forwarding either
+// would perform the very thing the refusal exists to prevent.
+func samplingFlowDenial(message, reason string) capability.EnforceResponse {
+	return capability.EnforceResponse{
+		Decision: capability.DecisionDeny,
+		Denial: &capability.DenialInfo{
+			Code:          capability.ErrCodeConditionFailed,
+			ConditionType: capability.ConditionTypeFlowLabel,
+			Message:       message,
+			HardDeny:      true,
+			Details:       map[string]interface{}{capability.FlowAuditDetailKey: true, "reason": reason},
+		},
+	}
 }
 
 // strictServerRequestAuditDenial applies the --require-audit=strict gate to a
@@ -1228,12 +1348,13 @@ func (fp serverRequestParams) strictServerRequestAuditDenial(ctx context.Context
 // beforehand, the same gate-before/record-after shape as enforcedForwardCore, so this
 // record call gets the same immediate boundary-call diagnostic under strict mode.
 //
-// dec supplies the record's flow fields (labels_out / carried_labels) and, when the caller's
-// commit changed something, the declassification's own signed triple — the same branch the
-// host path takes, on what the commit CHANGED rather than on what was authorized. The
-// non-sampling leg passes the zero decision: it runs no policy decision, so it has no flow
-// state and no declassification to report. declDetail carries the annotations for a clear
-// that did not land (see commitDeclassify / declassifyRefusalDetail).
+// dec supplies the record's flow fields (labels_out / carried_labels) and, when a clear
+// changed something, the declassification's own signed triple — the same branch the host path
+// takes, on what a commit CHANGED rather than on what was authorized. The non-sampling leg
+// passes the zero decision: it runs no policy decision, so it has no flow state and no
+// declassification to report, and this leg commits no clear at all today (cleared is always
+// nil — see forwardServerRequest). declDetail carries the annotations for a clear that did not
+// land (see declassifyRefusalDetail).
 func (fp serverRequestParams) recordForwardOutcome(ctx context.Context, method string, delivered, auditOnly bool, dec capability.EnforceResponse, cleared []string, declDetail map[string]interface{}) {
 	warnIfStrictAuditJustDegraded(fp.requireAuditStrict, fp.rec, method, method, func() {
 		if fp.rec == nil {
@@ -1316,6 +1437,24 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 	// host source's label write. The lock covers only the decision's flow peek;
 	// the forward below runs unlocked.
 	dec := fp.decideSampling(ctx)
+	// A decision on this leg may not authorize a clear, and the check is here rather than in a
+	// comment because the restriction that makes it unreachable lives in another package:
+	// requireSourceDirectiveTarget refuses a declassify directive at LOAD on a system: target
+	// (an egress is a place for a flow sink, not for clearing a label — clearing at an egress
+	// launders it at exactly the point the flow layer exists to gate), and
+	// sampling/createMessage is the only enforced method here.
+	//
+	// Relaxing that restriction must not silently produce a wrong clear on this leg, and it
+	// would: this path has no honest commit point. "Delivered" means the request was buffered
+	// onto an SSE channel or written to stdout, not that the host performed anything — a
+	// server-initiated request is answered later, out of band — so committing on delivery
+	// would drop taint for work that has not happened and may never happen. The host path's
+	// commit gate (a successful reply in hand) has no analogue here. Refusing is the
+	// fail-closed reading, and it is loud: whoever relaxes the load rule sees this, rather
+	// than a tape that says a declassification took effect.
+	if dec.Declassification.PendingClear() {
+		dec = samplingDeclassifyDenial(dec)
+	}
 	if dec.Decision == capability.DecisionAllow {
 		// --require-audit=strict gates this enforced method too: a degraded trail
 		// fails an allowed sampling request closed (AUDIT_UNAVAILABLE to the upstream
@@ -1326,31 +1465,13 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 			return
 		}
 		delivered := fp.forward(msg)
-		// The declassify legs mirror enforcedForwardCore's, and are inert today rather than
-		// absent. A declassify directive is refused at LOAD on a system: target
-		// (requireSourceDirectiveTarget: an egress is a place for a flow sink, not for
-		// clearing a label — clearing at an egress launders it at exactly the point the flow
-		// layer exists to gate), and sampling/createMessage is the only enforced method here,
-		// so no decision reaching this leg can authorize a clear and both calls below are
-		// no-ops. Writing them anyway is the point: the restriction that makes them
-		// unnecessary lives in another package, and a leg that only works because of it is a
-		// silent fail (no clear applied, a burned grant named nowhere) the moment it moves.
-		//
-		// Committed on DELIVERY, which is this leg's "the call ran": the sanitizing action is
-		// the host's handling of the request, and an undelivered request performed nothing.
-		// There is no upstream reply to inspect here, so declassifyCommitted has no analogue —
-		// a server-initiated request is answered later, out of band.
-		var cleared []string
-		var declDetail map[string]interface{}
-		if delivered {
-			cleared, declDetail = commitDeclassify(ctx, fp.committer, fp.sessionID, dec, "method", samplingMethod)
-		} else {
-			declDetail = declassifyRefusalDetail(dec)
-		}
 		// Carry the sampling decision's flow labels onto the tape: a flowLabel/labelOutput
 		// on the system:sampling constraint mutated session flow-state, so the record must
 		// show labels_out/carried_labels or the tape and state disagree for the sampling leg.
-		fp.recordForwardOutcome(ctx, samplingMethod, delivered, fp.audit, dec, cleared, declDetail)
+		// declassifyRefusalDetail is nil for every decision this leg can produce today and
+		// names a burned grant if one ever reaches it — the annotation costs nothing and does
+		// not depend on the load rule holding.
+		fp.recordForwardOutcome(ctx, samplingMethod, delivered, fp.audit, dec, nil, declassifyRefusalDetail(dec))
 		return
 	}
 

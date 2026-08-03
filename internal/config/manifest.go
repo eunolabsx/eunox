@@ -1866,9 +1866,9 @@ func checkTokenGrammarVersion(m *LocalManifest) error {
 	declared := strings.TrimSpace(m.SchemaVersion)
 	// The effect layer's two non-condition tokens — the top-level effectCeiling and a
 	// constraint's effect contract — are gated by the same rule. They are not
-	// conditions or directives, so they cannot ride tokenGrammarVersions (which is
-	// keyed by discriminator); gating them here keeps ONE grammar gate rather than a
-	// second one somewhere else that could be updated out of step.
+	// conditions or directives, so they have no prototype registry entry to carry a Since;
+	// gating them here keeps ONE grammar gate rather than a second one somewhere else that
+	// could be updated out of step.
 	if m.EffectCeiling != nil && declared != ManifestSchemaVersion02 {
 		return fmt.Errorf("the top-level effectCeiling was introduced in schemaVersion %q (the flow+effect grammar); this manifest declares schemaVersion %q, under which the key is not part of the grammar", ManifestSchemaVersion02, declared)
 	}
@@ -1888,9 +1888,9 @@ func checkTokenGrammarVersion(m *LocalManifest) error {
 			}
 		}
 		// Task-context variables are the batch's third non-discriminator token: they are
-		// VALUES inside a condition that exists in both revisions, so they cannot ride
-		// tokenGrammarVersions either. Gated here, beside the other two, so the whole
-		// grammar-version rule is readable in one function.
+		// VALUES inside a condition that exists in both revisions, so they carry no Since of
+		// their own either. Gated here, beside the other two, so the whole grammar-version
+		// rule is readable in one function.
 		if err := checkTaskVarGrammarVersion(i, c, declared); err != nil {
 			return err
 		}

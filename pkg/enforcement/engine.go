@@ -1368,7 +1368,7 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 		AuditOnly:   matched.IsAuditOnly(),
 		LabelsOut:   labelsOut,
 
-		Declassification: decl.handle(intersectLabels(decl.Labels, unionLabels(carriedLabels, labelsOut))),
+		Declassification: decl.handle(carriedLabels, labelsOut),
 		// The SAME resolution the two effect conditions and the ceiling read, handed on to
 		// the post-hoc receipt check rather than re-resolved there — one resolution per
 		// call, so the decision and the check cannot disagree about what the effect was.

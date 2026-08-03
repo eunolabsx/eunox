@@ -55,8 +55,8 @@ var (
 	// supportedManifestSchemaVersions enumerates the manifest grammar versions
 	// this build can parse. Keep in sync with the published
 	// schemas/eunox-capability-manifest.schema.json. A build understands both
-	// revisions at once; which tokens a document may use is decided per revision by
-	// tokenGrammarVersions, not by this set.
+	// revisions at once; which tokens a document may use is decided per revision by each
+	// token's own capability.TokenSince, not by this set.
 	supportedManifestSchemaVersions = map[string]bool{ManifestSchemaVersion01: true, ManifestSchemaVersion02: true}
 
 	// supportedGatewaySchemaVersions enumerates the gateway-config grammar

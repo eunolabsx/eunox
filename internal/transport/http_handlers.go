@@ -316,10 +316,13 @@ func (p *HTTPProxy) handleHTTPUpstreamRequest(ctx context.Context, sess *httpSes
 	// The anchor comes from the SESSION's claims, captured at initialize: a server-initiated
 	// request has no host request in scope, and those are the same claims its decision is
 	// taken with (see serverRequestParams.claims), so the turn and the state key agree.
-	var decideLock func() (end func())
+	//
+	// Bounded, because this runs on the session's single upstream-reader goroutine: see
+	// samplingTurnWait, and decideSampling for what a refused turn produces.
+	var decideLock func() (end func(), ok bool)
 	if rt.serializes() {
 		anchor := rt.decisionAnchor(sess.id, sess.claims)
-		decideLock = func() func() { return rt.decideGates.begin(anchor) }
+		decideLock = func() (func(), bool) { return rt.decideGates.beginWithin(anchor, samplingTurnWait) }
 	}
 	// sess.broadcastServerRequest reports whether an SSE subscriber received the
 	// request; sess.claims (captured at initialize) is attached for the sampling

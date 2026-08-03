@@ -18,9 +18,12 @@
 //     accepted an arbitrary []string was an unauthorized clear primitive: an embedder holding
 //     an engine could remove any label it named, with no approval presented and nothing on the
 //     tape to say so.
-//   - It is minted only by a decision that authorized something, and is nil on every other
-//     call, so "is there anything to commit?" is one nil test rather than four fields whose
-//     populated-together rule was prose.
+//   - It is minted only by a decision that authorized a declassification, and is nil on every
+//     other call — which is every call in a deployment that does not declassify. The two facts
+//     a record may have to carry (what a clear did not remove, and which single-use grant the
+//     decision burned) hang off this ONE handle, so they cannot disagree about which decision
+//     they came from; as four parallel response fields their populated-together rule was
+//     prose, and had already been broken once.
 //   - Claim is single-use, so an authorization cannot be replayed into two clears.
 //
 // SCOPE, honestly: an embedder can still construct one through NewDeclassification, which
@@ -34,6 +37,7 @@ package capability
 
 import (
 	"errors"
+	"slices"
 	"sync/atomic"
 )
 
@@ -88,7 +92,7 @@ type Declassification struct {
 // to reach the tape. The commit skips a handle with nothing to clear.
 func NewDeclassification(labels []string, approver, approvalID string, singleUse bool) *Declassification {
 	return &Declassification{
-		labels:     append([]string(nil), labels...),
+		labels:     slices.Clone(labels),
 		approver:   approver,
 		approvalID: approvalID,
 		singleUse:  singleUse,
@@ -104,7 +108,9 @@ func (d *Declassification) Labels() []string {
 	if d == nil {
 		return nil
 	}
-	return append([]string(nil), d.labels...)
+	// slices.Clone(nil) is nil, which preserves the nil-vs-empty distinction the no-op handle
+	// depends on (see NewDeclassification).
+	return slices.Clone(d.labels)
 }
 
 // PendingClear reports whether this handle authorizes a clear that would actually remove
@@ -164,10 +170,17 @@ func (d *Declassification) Claim() ([]string, error) {
 	if !d.committed.CompareAndSwap(false, true) {
 		return nil, ErrDeclassificationCommitted
 	}
-	return append([]string(nil), d.labels...), nil
+	return d.Labels(), nil
 }
 
-// Committed reports whether this handle's clear has been applied. It exists for the caller
-// that has to describe the outcome on the tape — a refusal below the decision leaves the
-// authorization uncommitted, and that is the fact the record carries.
+// Committed reports whether this handle's authorization has been consumed.
+//
+// It is the NON-DESTRUCTIVE half of the single-use claim, and that is its whole reason for
+// existing: the only other way to ask is to call Claim, which answers by consuming. A caller
+// deciding whether a commit still has to run — and the tests that pin "a path which cleared
+// nothing must leave the authorization spendable" — need to ask without spending.
+//
+// It is deliberately NOT what the audit record branches on. The tape reports what a commit
+// CHANGED (the cleared set), never what was claimed, so a claim whose clear moved no label
+// must not read as a declassification.
 func (d *Declassification) Committed() bool { return d != nil && d.committed.Load() }

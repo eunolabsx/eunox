@@ -1859,6 +1859,15 @@ func composeHardened(r, verdict capability.EnforceResponse) capability.EnforceRe
 		out.Denial = &denial
 	}
 	out.AuditOnly = out.AuditOnly && r.AuditOnly
+	// Carry the refusal being hardened's declassification handle when the harder verdict has
+	// none of its own. It is the one field whose LOSS is silent and unrecoverable: a handle on
+	// a refusal names a single-use grant the decision already burned, and this record is the
+	// only one that will ever name it, so replacing the response wholesale would spend an
+	// operator's approval with nothing on the tape to reconcile. Nothing else here needs
+	// carrying — the harder verdict is the authoritative one for every other field.
+	if out.Declassification == nil {
+		out.Declassification = r.Declassification
+	}
 	return out
 }
 

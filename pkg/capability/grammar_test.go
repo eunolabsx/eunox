@@ -69,3 +69,34 @@ func TestTokenSince_FlowAndEffectTokensAreTheLaterRevision(t *testing.T) {
 		assert.Equal(t, SchemaVersion01, since, "%q is base grammar", token)
 	}
 }
+
+// TestTokenRegistries_AreDisjoint keeps the one state the two-table classification could
+// represent from surviving the move onto the registries: a discriminator present in BOTH
+// vocabularies. TokenSince resolves conditions first, so such a token would silently take the
+// condition's revision — a directive spelling of it would then load under whichever revision
+// the condition declares. The old completeness test asserted "not in both" over the two
+// tables; this asserts it over the two registries, which is where it is now representable.
+func TestTokenRegistries_AreDisjoint(t *testing.T) {
+	// Not parallel: it reads the registries a sibling test temporarily adds an entry to.
+	for _, token := range KnownConditionTypes() {
+		_, alsoDirective := directivePrototypes[token]
+		assert.False(t, alsoDirective,
+			"%q is registered as BOTH a condition and a directive; one discriminator cannot have two classifications", token)
+	}
+}
+
+// TestTokenRegistries_EveryEntryCanInstantiate is the other half a generic registry value made
+// representable: an entry declaring only Since compiles, reads plausibly, and classifies fine —
+// and then panics on a nil func call the first time a manifest names it, turning a fail-closed
+// load error into a crash on the load path.
+func TestTokenRegistries_EveryEntryCanInstantiate(t *testing.T) {
+	// Not parallel: same reason as TestTokenRegistries_AreDisjoint above.
+	for token, spec := range conditionPrototypes {
+		require.NotNil(t, spec.New, "condition %q declares no constructor", token)
+		assert.NotNil(t, spec.New(), "condition %q must instantiate", token)
+	}
+	for token, spec := range directivePrototypes {
+		require.NotNil(t, spec.New, "directive %q declares no constructor", token)
+		assert.NotNil(t, spec.New(), "directive %q must instantiate", token)
+	}
+}

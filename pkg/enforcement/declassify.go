@@ -38,17 +38,21 @@ type declassifyOutcome struct {
 }
 
 // handle mints the commit handle for this outcome, carrying the labels the decision resolved
-// as clearable (the intersection with what the anchor was carrying) rather than everything the
-// approval covered. nil when the constraint authorized no declassification at all, which is
-// what makes the caller's presence test one nil check.
+// as clearable: the approved set INTERSECTED with what the anchor is carrying as of this
+// decision. nil when the constraint authorized no declassification at all, which is every call
+// in a deployment that does not declassify.
 //
-// It is the ONE place a handle is built on the decision path, so what the second phase may
-// clear is by construction what this check authorized — the widening a []string parameter left
-// open cannot be expressed.
-func (d declassifyOutcome) handle(pendingClear []string) *capability.Declassification {
+// It is the ONE place a handle is built on the decision path, and it computes the intersection
+// itself rather than taking it. Taking it would have moved the widening a []string parameter
+// left open exactly one frame up: a second call site passing anything other than this
+// intersection could mint a handle authorizing labels the approval never covered, and nothing
+// here could tell. carriedLabels is the pre-call accumulated set and labelsOut this call's own
+// contribution — the same two the caller already resolved for the record.
+func (d declassifyOutcome) handle(carriedLabels, labelsOut []string) *capability.Declassification {
 	if len(d.Labels) == 0 {
 		return nil
 	}
+	pendingClear := intersectLabels(d.Labels, unionLabels(carriedLabels, labelsOut))
 	return capability.NewDeclassification(pendingClear, d.Approver, d.ApprovalID, d.LedgerID != "")
 }
 

@@ -2435,6 +2435,11 @@ Two practical consequences for a policy author:
 - A declassifying call briefly serializes its own anchor — its session, or its
   whole task under `taskAnchoredState` — bounded by `--upstream-timeout`. Do not
   set that to `0` on a route that uses `declassify`.
+- While that turn is held, an upstream-initiated `sampling/createMessage` on the
+  same anchor is refused rather than queued behind it. Sampling is
+  deny-by-default and the alternative is stalling the session's whole response
+  path, but a policy that combines `declassify` with `system:sampling` should
+  expect the occasional refusal under load.
 
 The clear also requires the call to have **succeeded**. A sanitize whose upstream
 returns an error — a JSON-RPC error, or a tool result with `isError: true` — is

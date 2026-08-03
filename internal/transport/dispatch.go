@@ -48,16 +48,6 @@ type dispatchParams struct {
 	// initialize through the dispatcher; the initialize case fails closed if unset.
 	buildInit func(mcp.RPCMsg) mcp.RPCMsg
 
-	// endDecision closes the per-session decision critical section a serialize-relevant
-	// transport opened around this enforced request. The four Decide* handlers call it (via
-	// finishDecision) IMMEDIATELY after the PDP
-	// decision so the upstream forward runs OUTSIDE the lock — only the decision + state
-	// write serialize, not the slow round-trip. It is idempotent, so the transport also
-	// defers it as a backstop for the malformed-params path (which returns before the
-	// decision). nil for a non-serialized request (a non-flow/non-sequenceBlock policy, or
-	// a locally-answered method), where finishDecision is a no-op.
-	endDecision func()
-
 	// receipts verifies a tool result's signed effect receipt against this upstream's
 	// configured key domain. nil when the operator configured none, which is the default
 	// and skips the whole surface — no parse, no allocation, no recorded field.
@@ -664,7 +654,7 @@ func dispatchResourcesRead(ctx context.Context, d dispatchParams, msg mcp.RPCMsg
 	// Interface method (not a type-assert to *pdp.ManifestPDP) so JWT-only PDPs
 	// also enforce resource reads.
 	dec := d.pdp.DecideResourceRead(d.decideCtx(ctx), d.sessionID, params.URI, d.sourceIP)
-	d.finishDecision(dec) // release the per-session decision lock before the forward
+	d.finishDecision(dec) // release the decision turn before the forward
 	return enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodResourcesRead, params.URI, params.URI, "resource", true, upstreamErrorDetail)
 }
 
@@ -680,7 +670,7 @@ func dispatchResourcesSubscribe(ctx context.Context, d dispatchParams, msg mcp.R
 		return d.malformedDeny(ctx, msg, "resources/subscribe: uri must not be empty")
 	}
 	dec := d.pdp.DecideResourceRead(d.decideCtx(ctx), d.sessionID, params.URI, d.sourceIP)
-	d.finishDecision(dec) // release the per-session decision lock before the forward
+	d.finishDecision(dec) // release the decision turn before the forward
 	// recordObligations is false: a subscription does not log obligation names.
 	return enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodResourcesSubscribe, params.URI, params.URI, "resource subscription", false, upstreamErrorDetail)
 }
@@ -720,7 +710,7 @@ func dispatchResourcesUnsubscribe(ctx context.Context, d dispatchParams, msg mcp
 		return d.malformedDeny(ctx, msg, "resources/unsubscribe: uri must not be empty")
 	}
 	dec := d.pdp.DecideResourceCancel(ctx, d.sessionID, params.URI, d.sourceIP)
-	d.finishDecision(dec) // release the per-session decision lock before the forward
+	d.finishDecision(dec) // release the decision turn before the forward
 	// recordObligations is false: cancelling a subscription does not log obligation names.
 	return enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodResourcesUnsubscribe, params.URI, params.URI, "resource subscription", false, upstreamErrorDetail)
 }
@@ -738,7 +728,7 @@ func dispatchPromptsGet(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) m
 	}
 	// Interface method (not a type-assert to *pdp.ManifestPDP).
 	dec := d.pdp.DecidePromptGet(d.decideCtx(ctx), d.sessionID, params.Name, d.sourceIP)
-	d.finishDecision(dec) // release the per-session decision lock before the forward
+	d.finishDecision(dec) // release the decision turn before the forward
 	// auditID carries the "prompts/" display prefix; denialTarget is the bare name.
 	return enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodPromptsGet, "prompts/"+params.Name, params.Name, "prompt", true, upstreamErrorDetail)
 }

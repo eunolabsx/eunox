@@ -105,8 +105,8 @@ func TestAnchorGates_NilRegistryIsANoOp(t *testing.T) {
 	require.NotPanics(t, func() { g.begin("a")() })
 }
 
-// TestDecisionAnchor_FollowsTheStateAnchor is the whole point of #170's fix: the turn is
-// taken on the key the accumulated state lives on. Under task-anchored state two sessions
+// TestDecisionAnchor_FollowsTheStateAnchor pins the property the anchor keying exists for: the
+// turn is taken on the key the accumulated state lives on. Under task-anchored state two sessions
 // carrying one validated task id resolve to ONE key — a per-session lock did not span that,
 // so their decisions were not serialized against state they share.
 func TestDecisionAnchor_FollowsTheStateAnchor(t *testing.T) {
@@ -156,8 +156,8 @@ func TestDecisionAnchor_FollowsTheStateAnchor(t *testing.T) {
 	})
 }
 
-// TestDecisionTurn_SpansTwoSessionsSharingATask is the acceptance test for the residual #170
-// records: a declassifying call holds its turn across the upstream forward, and under task
+// TestDecisionTurn_SpansTwoSessionsSharingATask is the acceptance test for the cross-session
+// case: a declassifying call holds its turn across the upstream forward, and under task
 // anchoring the concurrent decision that must not interleave can be on ANOTHER session. With
 // a per-session gate that second decision ran unserialized; with the anchor-keyed one it
 // waits.
@@ -203,4 +203,31 @@ func TestDecisionTurn_SpansTwoSessionsSharingATask(t *testing.T) {
 			assert.True(t, started.Load())
 		})
 	}
+}
+
+// TestAnchorGates_BeginWithinGivesUp pins the bound the server-initiated leg depends on: a
+// busy anchor is reported, not waited for. That leg runs on the session's single
+// upstream-reader goroutine — the same goroutine that delivers every upstream response — so an
+// unbounded wait behind a declassifying call's turn stalls the whole session's response path,
+// and under task anchoring the turn holder can be a different session entirely.
+func TestAnchorGates_BeginWithinGivesUp(t *testing.T) {
+	t.Parallel()
+	g := newAnchorGates()
+	held := g.begin("a")
+
+	end, ok := g.beginWithin("a", 20*time.Millisecond)
+	assert.False(t, ok, "a busy anchor must be reported rather than waited for")
+	assert.Nil(t, end, "and no turn was taken, so there is nothing to release")
+
+	// The abandoned wait must not pin the gate: once the holder releases, the anchor is
+	// reclaimed exactly as if the wait had never happened.
+	held()
+	assert.Zero(t, g.size(), "an abandoned wait must drop its reference")
+
+	// A free anchor is entered immediately.
+	end, ok = g.beginWithin("a", time.Second)
+	require.True(t, ok)
+	require.NotNil(t, end)
+	end()
+	assert.Zero(t, g.size())
 }

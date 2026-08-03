@@ -246,7 +246,10 @@ Section conventions:
   The four fields had a populated-together-or-not-at-all rule that lived in prose, a presence
   test (`len(LabelsPendingClear) > 0`) spelled at four sites, and a `SpentApprovalID` that
   was never anything but `ApprovalID` plus one bit two sites had to keep in agreement — now
-  `SpentApprovalID()`, derived. The load-bearing part is the parameter: the second phase used
+  `SpentApprovalID()`, derived. The facts hang off one handle, so they can no longer disagree
+  about which decision produced them; what a record carries is still decided by the facts
+  (`PendingClear()`, `SpentApprovalID()`), not by the handle's presence. The load-bearing part
+  is the parameter: the second phase used
   to accept an arbitrary label set, so an embedder holding an `*Engine` could clear any label
   it named with no approval presented, no grant burned, no escalation raised, and nothing on
   the tape — every gate the declassify surface installs sits on the FIRST phase. The handle
@@ -688,6 +691,17 @@ Section conventions:
 
 ### Fixed
 
+- **A single-use declassify grant spent on a no-op clear now reaches the tape on the success
+  path too.** A `once` approval is burned by the decision that accepts it even when the clear
+  resolves to nothing (the anchor was not carrying the approved labels) — burning only on a
+  clear that moved a label would make the grant replayable by ordering. The signed
+  `labels_cleared`/`approver`/`approval_id` triple rides only a clear that *changed* something,
+  so for that call the `_eunox_declassify_spent_approval_id` detail is the only record that can
+  ever name the grant — and the commit returned early without writing it. Every refusal path
+  named it; the path where the call actually succeeded did not, which is the reconciliation gap
+  backwards. An operator reconciling outstanding one-shot approvals would have believed that
+  one was still live.
+
 - **The grammar classification is derived from the prototype registry instead of two
   hand-maintained tables.** `pkg/capability`'s condition and directive registries are the
   declared single source of the vocabulary, but the classification a manifest load depends on
@@ -703,18 +717,39 @@ Section conventions:
   `config.ManifestSchemaVersion01`/`02` are now aliases of `capability.SchemaVersion01`/`02`,
   so one revision has one spelling.
 
-- **The server-initiated leg derives its decision point the same way the host path does.**
-  `dispatchParams.withPDP` exists so a field that must be the *same* PDP the dispatcher
-  decides with cannot be set independently of it; `serverRequestParams` — the upstream→host
-  leg both transports share — assigned `pdp` directly at both of its construction sites and
-  had no committer field at all, so neither the compiler nor a test could see an omission.
-  It now has its own `withPDP` constructor, and the leg commits an approved clear on delivery
-  and stamps the declassify annotations on its refusal gates exactly as the host path does.
-  Inert today — `requireSourceDirectiveTarget` refuses a `declassify` directive on a
-  `system:` target at load, and `sampling/createMessage` is the only enforced method on that
-  leg — which is the point: that restriction lives in another package, and the leg no longer
-  depends on it being remembered. A source-level guard now fails the build if any params
-  literal assigns `pdp` or `committer` directly.
+- **The server-initiated leg derives its decision point the same way the host path does, and
+  refuses what it cannot honestly commit.** `dispatchParams.withPDP` exists so a field that
+  must be the *same* PDP the dispatcher decides with cannot be set independently of it;
+  `serverRequestParams` — the upstream→host leg both transports share — assigned `pdp`
+  directly at both of its construction sites, so neither the compiler nor a test could see a
+  derived field being forgotten. It now has its own `withPDP` constructor, and a source-level
+  guard fails the build if any params literal assigns `pdp` or `committer` directly.
+
+  The leg does **not** commit a declassification. It has no honest commit point: "delivered"
+  there means the request was buffered onto an SSE channel or written to stdout, and a
+  server-initiated request is answered later out of band — so the host path's commit gate (a
+  successful reply in hand) has no analogue, and committing on delivery would drop taint for
+  work that has not happened. A decision reaching that leg with a clear pending is therefore
+  **refused**, hard, with the burned grant named on the record. Unreachable today
+  (`requireSourceDirectiveTarget` refuses `declassify` on a `system:` target at load), which is
+  the point: that restriction lives in another package, and relaxing it now produces a loud
+  refusal rather than a silent wrong clear.
+
+- **The server-initiated leg no longer waits indefinitely for the decision turn.** It runs on
+  the session's single upstream-reader goroutine — the same goroutine that delivers every
+  upstream response — so blocking it behind a declassifying call's turn (held across a whole
+  upstream round trip, and unbounded when `--upstream-timeout` is `0`) stalled every in-flight
+  request on that session. Under task anchoring the turn holder can be a different session
+  entirely, which made it a cross-session stall. The leg now takes the turn with a bound and
+  fails the sampling request **closed** when it cannot get it: sampling is deny-by-default, and
+  refusing one request is cheaper than stalling a session's whole response path. The stdio
+  transport keeps waiting, deliberately — its gate is FIFO, so abandoning a ticket would stall
+  every later one, and its turn cannot span a second session.
+
+- **A declassifying call releases its turn as soon as the commit lands**, rather than when the
+  handler returns. Holding it through the audit enqueue and the client-facing response write
+  put a window bounded by *the client's* read behaviour inside a critical section that, under
+  task anchoring, other sessions queue on.
 
 - **A withheld result is no longer recorded as a call that may never have run.** Three
   gates below the decision refuse a call whose approved declassification therefore never

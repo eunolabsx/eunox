@@ -259,7 +259,7 @@ func TestFlowSerialize_SamplingSinkSerializedAgainstSource(t *testing.T) {
 			sessionID: sessionID,
 			// The sampling decision reserves its own (later) ticket and blocks until its turn —
 			// the exact wiring stdio's samplingDecideLock installs.
-			decideLock: func() func() { return gate.begin(gate.take()) },
+			decideLock: func() (func(), bool) { return gate.begin(gate.take()), true },
 		}.withPDP(dp)
 
 		var wg sync.WaitGroup
@@ -407,7 +407,7 @@ func TestFinishDecision_HoldsTheTurnForADeclassifyingCall(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			released := false
-			d := dispatchParams{endDecision: func() { released = true }}
+			d := dispatchParams{forwardParams: forwardParams{endDecision: func() { released = true }}}
 			d.finishDecision(tc.dec)
 			if released != tc.released {
 				t.Fatalf("turn released = %v, want %v", released, tc.released)

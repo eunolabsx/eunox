@@ -28,6 +28,7 @@ package transport
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/eunolabs/eunox/internal/pdp"
 )
@@ -83,10 +84,14 @@ type anchorGates struct {
 	gates map[string]*anchorGate
 }
 
-// anchorGate is one anchor's turn: a mutex held across a decision (and, for a declassifying
-// call, across its commit), plus the count of holders keeping it in the registry.
+// anchorGate is one anchor's turn, plus the count of holders keeping it in the registry.
+//
+// The turn is a one-slot channel rather than a sync.Mutex because one caller has to be able to
+// GIVE UP: the server-initiated leg waits for it on the session's single upstream-reader
+// goroutine, and a mutex offers no bounded acquire. A token in the channel means the turn is
+// held; taking the turn is a send, releasing it a receive.
 type anchorGate struct {
-	turn sync.Mutex
+	turn chan struct{}
 	refs int
 }
 
@@ -97,45 +102,78 @@ func newAnchorGates() *anchorGates {
 	return &anchorGates{gates: map[string]*anchorGate{}}
 }
 
-// begin blocks until this anchor's turn is free and returns the release func. The release is
-// idempotent (sync.OnceFunc), matching decisionSerializer.begin: a handler releases right
-// after its decision and defers the same func as a backstop for the paths that return before
-// deciding, so the turn advances exactly once.
+// begin blocks until this anchor's turn is free and returns the idempotent release func. It
+// is the host path's entry: that path holds the turn on its own request goroutine, so waiting
+// costs only the waiting request. A nil registry is a no-op returning a no-op release, so a
+// non-serialized route needs no branch at the call site.
+func (g *anchorGates) begin(key string) (end func()) {
+	end, _ = g.acquire(key, nil)
+	return end
+}
+
+// beginWithin is begin with a bound: it reports ok=false, having taken no turn, when the
+// anchor is still busy after d. The caller must then refuse the request rather than proceed —
+// an unserialized decision is the fail-open the turn exists to close.
+//
+// It exists for the server-initiated leg, which waits on the session's single upstream-reader
+// goroutine. That goroutine also delivers every upstream response, so blocking it for the
+// length of another call's turn — held across a whole upstream round trip by a declassifying
+// host call, and under task anchoring possibly by a call on a DIFFERENT session — stalls every
+// in-flight request on the session. See samplingTurnWait.
+func (g *anchorGates) beginWithin(key string, d time.Duration) (end func(), ok bool) {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	return g.acquire(key, timer.C)
+}
+
+// acquire takes the turn for key, giving up if giveUp fires first (nil waits forever). The
+// returned release is idempotent (sync.OnceFunc), matching decisionSerializer.begin: a handler
+// releases right after its decision and defers the same func as a backstop.
 //
 // The registry lock is held only across the map operations, never across the turn itself —
 // otherwise one session's decision would block every other anchor's lookup. The gate is
 // leaf-level: nothing else is locked under it, so it cannot participate in a cycle, and a
 // request only ever holds one.
-//
-// A nil registry is a no-op returning a no-op release, so a non-serialized route needs no
-// branch at the call site.
-func (g *anchorGates) begin(key string) (end func()) {
+func (g *anchorGates) acquire(key string, giveUp <-chan time.Time) (end func(), ok bool) {
 	if g == nil {
-		return func() {}
+		return func() {}, true
 	}
 	g.mu.Lock()
 	gate := g.gates[key]
 	if gate == nil {
-		gate = &anchorGate{}
+		gate = &anchorGate{turn: make(chan struct{}, 1)}
 		g.gates[key] = gate
 	}
+	// Referenced BEFORE the (possibly blocking) acquire, so the gate this caller is queued on
+	// cannot be reclaimed and replaced while it waits.
 	gate.refs++
 	g.mu.Unlock()
 
-	gate.turn.Lock()
-	return sync.OnceFunc(func() {
-		gate.turn.Unlock()
+	release := func() {
 		g.mu.Lock()
 		gate.refs--
 		if gate.refs == 0 {
 			// Deleted only at zero, and only while holding the registry lock, so a waiter
-			// that already took a reference keeps the gate it is queued on. A later begin
+			// that already took a reference keeps the gate it is queued on. A later acquire
 			// under the same key creates a fresh gate, which is correct precisely because
 			// nobody holds the old one.
 			delete(g.gates, key)
 		}
 		g.mu.Unlock()
-	})
+	}
+
+	select {
+	case gate.turn <- struct{}{}:
+		return sync.OnceFunc(func() {
+			<-gate.turn
+			release()
+		}), true
+	case <-giveUp:
+		// No turn was taken, so nothing is released — only this caller's reference is
+		// dropped, which is what keeps an abandoned wait from pinning the gate.
+		release()
+		return nil, false
+	}
 }
 
 // size reports how many gates are live. Test-only: the refcounting is what keeps a long-lived
