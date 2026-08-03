@@ -182,6 +182,13 @@ func (g *anchorGates) acquire(key string, giveUp <-chan time.Time) (end func(), 
 //
 // The release is idempotent (sync.OnceFunc), matching decisionSerializer.begin: a handler
 // releases right after its decision and defers the same func as a backstop.
+//
+// The turn is re-checked on the giveUp arm, which is what gives this leg the stdio twin's
+// turn-first guarantee (see decisionSerializer.beginWithin). A two-arm select over a free
+// turn and an expired timer resolves UNIFORMLY in Go, so a caller could be refused a turn
+// that was available at that instant — a hard turn_unavailable sampling denial for a decision
+// that could have run. The two legs are meant to answer identically; only this one lacked the
+// property.
 func (a *anchorGate) take(giveUp <-chan time.Time) (end func(), ok bool) {
 	if a == nil {
 		return func() {}, true
@@ -190,7 +197,14 @@ func (a *anchorGate) take(giveUp <-chan time.Time) (end func(), ok bool) {
 	case a.turn <- struct{}{}:
 		return sync.OnceFunc(func() { <-a.turn }), true
 	case <-giveUp:
-		return nil, false
+		// The turn is checked FIRST on the way out: a timer that fires in the same instant the
+		// turn comes up loses, so a caller is never refused a turn it could have had.
+		select {
+		case a.turn <- struct{}{}:
+			return sync.OnceFunc(func() { <-a.turn }), true
+		default:
+			return nil, false
+		}
 	}
 }
 

@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/eunolabs/eunox/pkg/capability"
@@ -37,7 +38,9 @@ import (
 // fails closed on a structural/resource guard: an unparseable (or trailing-data)
 // envelope, an envelope or unwrapped JSON leaf whose object keys duplicate — or case-collide
 // on a name this redaction resolves by matching — so that its decode may differ from what a
-// host renders (see redactionKeysAmbiguous and redactionFoldKeys), a
+// host renders (see redactionKeysAmbiguous and redactionFoldKeys), a lone top-level key
+// that folds to a reserved envelope key without being spelled canonically (see
+// refuseReservedRootKeyVariants), a
 // structurally unverifiable content array/item shape, the depth bound, or a
 // resource/resource_link content item (whose embedded text/blob body this redactor
 // cannot inspect) — the last so an upstream cannot evade a declared redactFields
@@ -115,6 +118,13 @@ func ApplyRedactObligs(resultBytes []byte, obligs []capability.Obligation) ([]by
 	// trusted to match what a host renders cannot verify a redaction, so they fail closed.
 	if redactionKeysAmbiguous(resultBytes, spec.fold) {
 		return nil, fmt.Errorf("redactFields: response envelope carries a duplicate or case-variant object key, so its decode may differ from what a host renders; cannot verify redaction (fail closed)")
+	}
+	// The gate above fires on a COLLISION — two keys that fold together. A LONE variant
+	// spelling collides with nothing, so it reached the dispatch below, missed every
+	// exact-match arm, and fell to the weaker generic sibling walk. See
+	// refuseReservedRootKeyVariants for why that is a bypass rather than an over-refusal.
+	if err := refuseReservedRootKeyVariants(result); err != nil {
+		return nil, err
 	}
 
 	// (1) Redact within each text content item. Any structurally unverifiable shape
@@ -644,6 +654,59 @@ var mcpReservedRootKeys = map[string]struct{}{
 	"contents":          {},
 	"messages":          {},
 	"_meta":             {},
+}
+
+// mcpReservedRootKeysFolded maps each reserved envelope key's FOLDED spelling to its
+// canonical one, so a top-level key can be tested against the whole set with a single
+// lookup instead of a fold-per-reserved-key scan for every key of every response.
+var mcpReservedRootKeysFolded = foldedReservedRootKeys()
+
+func foldedReservedRootKeys() map[string]string {
+	m := make(map[string]string, len(mcpReservedRootKeys))
+	for k := range mcpReservedRootKeys {
+		m[capability.FoldJSONKey(k)] = k
+	}
+	return m
+}
+
+// refuseReservedRootKeyVariants fails the response closed when a top-level key folds to a
+// reserved envelope key but is not spelled canonically — {"Content":[...]},
+// {"StructuredContent":{...}}, {"_Meta":{...}} — with no canonical sibling.
+//
+// redactionKeysAmbiguous cannot catch this one: its case-variant rule fires on a COLLISION,
+// two keys that fold together, and a lone variant collides with nothing. It then misses
+// ApplyRedactObligs' exact-match dispatch (result["content"] is not result["Content"]) and
+// falls to redactSiblingTopLevelKeys, which is strictly weaker — no resource-body guard, no
+// content-item shape checks, and dotted paths dropped under the walk's own prefixes. A
+// case-insensitive host — the Go MCP SDK's struct binding, .NET's
+// PropertyNameCaseInsensitive — then binds the variant as the real content, so
+// {"Content":[{"type":"resource",...}]} is forwarded verbatim while the canonical spelling of
+// the same bytes correctly fails closed. Nothing matched, so `changed` stayed false and the
+// ORIGINAL bytes went to the host while the record reported the obligation applied.
+//
+// Refusing is the only safe direction: an exact-match dispatch IS a resolution, and a
+// spelling this redactor resolves differently than the host cannot verify an obligation. It
+// costs an honest upstream nothing — a variant of a protocol-reserved key is not a shape a
+// spec-conformant server emits — and it only ever denies.
+//
+// The offenders are sorted before one is named so two identical responses fail identically;
+// map iteration order would otherwise make the message depend on the run.
+func refuseReservedRootKeyVariants(result map[string]interface{}) error {
+	var variants []string
+	for k := range result {
+		canon, reserved := mcpReservedRootKeysFolded[capability.FoldJSONKey(k)]
+		if !reserved || k == canon {
+			continue
+		}
+		variants = append(variants, k)
+	}
+	if len(variants) == 0 {
+		return nil
+	}
+	sort.Strings(variants)
+	k := variants[0]
+	canon := mcpReservedRootKeysFolded[capability.FoldJSONKey(k)]
+	return fmt.Errorf("redactFields: response top-level key %q is a case variant of the reserved key %q, which a case-insensitive host may bind as the real one; cannot verify redaction (fail closed)", k, canon)
 }
 
 // envelopeRootExempt reports whether a redact path must not be applied at the envelope

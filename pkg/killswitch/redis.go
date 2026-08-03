@@ -171,6 +171,23 @@ type Redis struct {
 	// as reconcileErrLogged does for the cache refresh on the same loop.
 	sessionTTLPublishErrLogged bool
 
+	// sessionTTLPublished latches on the first SUCCESSFUL explicit PublishSessionKillTTL and
+	// arms the reconcile loop's republish. Until then the loop's tick publishes nothing.
+	//
+	// It is what makes the loop honour the "call once at startup, then the loop keeps it
+	// alive" contract the republish documents rather than only describing it. The key is
+	// last-writer-wins, and the binary publishes it ONLY from each transport's ready hook
+	// precisely so a process that dies on the way up cannot clobber a running proxy's value.
+	// But Start (and therefore this loop) runs BEFORE the serve call, so any startup that
+	// survived one reconcile interval before failing — a wedging stdio handshake, a slow
+	// drift probe, a strict-drift refusal — published its TTL anyway; at the 1s interval the
+	// flag's own help recommends, virtually every startup failure did. An `eunox kill` in
+	// that window then wrote a tombstone with the doomed proxy's lifetime.
+	//
+	// atomic rather than mu-guarded: it is read on the reconcile goroutine and written on
+	// whichever goroutine publishes, and it must not take the hot-path lock to answer.
+	sessionTTLPublished atomic.Bool
+
 	reconcileInterval time.Duration
 
 	// sessionKillTTL is how long a session-kill tombstone lives; see

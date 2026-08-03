@@ -268,6 +268,35 @@ func TestAnchorGates_BeginWithinGivesUp(t *testing.T) {
 	assert.Zero(t, g.size())
 }
 
+// TestAnchorGates_TurnFirstWhenTheDeadlineHasPassed pins the stdio twin's guarantee on this
+// leg: a timer that fires in the same instant the turn comes up loses, so a caller is never
+// refused a turn it could have had.
+//
+// take is a select over a free turn and an expired giveUp, and Go resolves a ready two-arm
+// select UNIFORMLY — so with the deadline already passed and the turn sitting free, roughly
+// half of these calls used to come back as a hard turn_unavailable sampling denial for a
+// decision that could have run. decisionSerializer.beginWithin states the opposite property
+// explicitly and the two legs are meant to answer identically; only this one lacked it.
+func TestAnchorGates_TurnFirstWhenTheDeadlineHasPassed(t *testing.T) {
+	t.Parallel()
+	g := newAnchorGates()
+
+	// A CLOSED deadline channel, not a buffered one holding a single value: a receive on a
+	// closed channel is always ready, so both select arms are ready on EVERY iteration. A
+	// buffered value would be drained by the first refusal and leave the rest of the loop
+	// racing nothing.
+	expired := make(chan time.Time)
+	close(expired)
+
+	for i := 0; i < 200; i++ {
+		end, ok := g.acquire("a", expired)
+		require.True(t, ok, "iteration %d: a free turn must win over an expired deadline", i)
+		require.NotNil(t, end)
+		end()
+	}
+	assert.Zero(t, g.size())
+}
+
 // TestSessionGate_HeldOnceForTheSessionsLife is the shape the per-request registry round trip
 // was costing. On a route that anchors state on the SESSION, the turn's anchor is a per-session
 // constant, so resolving it through the route-wide registry on every enforced call took a

@@ -214,6 +214,27 @@ func TestLoadCorpusRejectsDuplicateIDs(t *testing.T) {
 	}
 }
 
+// TestLoadCorpusBoundsEachEntryRead pins the same rule the trust-store loader states two
+// files over: the corpus directory is operator-supplied, so a --dir fat-fingered at a data
+// directory holding a multi-gigabyte .json must produce an error, not an OOM. Each entry was
+// read with a bare os.ReadFile and buffered whole before the strict decode could reject it. A
+// real entry is a few kilobytes.
+func TestLoadCorpusBoundsEachEntryRead(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "huge.json"), make([]byte, maxContractFileBytes+1), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_, err := LoadCorpus(dir)
+	if err == nil || !strings.Contains(err.Error(), "larger than") {
+		t.Fatalf("an oversized corpus entry must be refused rather than buffered, got %v", err)
+	}
+	// It ERRORS rather than truncating: a truncated read would fail the decode for a reason
+	// that looks like a malformed entry.
+	if strings.Contains(err.Error(), "unknown field") || strings.Contains(err.Error(), "unexpected end") {
+		t.Fatalf("the bound must be reported as a size refusal, not as a decode failure: %v", err)
+	}
+}
+
 // TestLoadCorpusRejectsAnUnknownField pins strict decoding: a misspelled key in a corpus
 // entry decodes to nothing, and "nothing" in an effect contract means the fail-closed
 // default rather than what the author wrote — a difference the file itself would hide.

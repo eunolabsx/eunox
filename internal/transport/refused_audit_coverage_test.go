@@ -4,11 +4,14 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -612,6 +615,65 @@ func TestUnsupportedMediaType_RecordsRefusal(t *testing.T) {
 			// Neither the offending header value nor the request body may be recorded.
 			assertRecordsExclude(t, records, "text/plain", "s3cret-body")
 		})
+	}
+}
+
+// TestUnsupportedMediaType_StderrLineIsBoundedAndGated pins the duplicate-header stderr line
+// against the two properties its Origin twin already had. It printed strings.Join(vals, ", ")
+// unconditionally, ahead of and independent of the refusal limiter — attacker-controlled
+// header values, up to ~1 MiB under Go's default MaxHeaderBytes, one line per request, with no
+// credential needed on the default loopback deployment. That is the cheapest half of the
+// flooding primitive checkOrigin closed for itself, left open here while the record beside it
+// was carefully bounded to a count.
+func TestUnsupportedMediaType_StderrLineIsBoundedAndGated(t *testing.T) {
+	proxy := newHTTPProxy(httpProxyOptions{
+		PDP:         pdp.AlwaysAllowPDP{},
+		UpstreamURL: "http://upstream.invalid",
+	})
+	route := proxy.routes[""]
+	huge := CTJSON + "; padding=" + strings.Repeat("A", 64<<10)
+
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stderr = w
+	drained := make(chan string, 1)
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, r)
+		drained <- buf.String()
+	}()
+
+	// Far more requests than the pre-session bucket admits, so the gate has to be doing the
+	// bounding rather than the loop count.
+	const requests = 200
+	for i := 0; i < requests; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize"}`))
+		req.Header.Del("Content-Type")
+		req.Header.Add("Content-Type", huge)
+		req.Header.Add("Content-Type", huge)
+		req.RemoteAddr = "203.0.113.7:5555"
+		rec := httptest.NewRecorder()
+		proxy.handleMCPPost(rec, req, route)
+		if rec.Code != http.StatusUnsupportedMediaType {
+			t.Fatalf("status = %d, want 415", rec.Code)
+		}
+	}
+
+	_ = w.Close()
+	os.Stderr = old
+	logged := <-drained
+
+	if len(logged) >= requests*len(huge) {
+		t.Fatalf("the stderr line is unbounded: %d bytes for %d requests", len(logged), requests)
+	}
+	if strings.Contains(logged, strings.Repeat("A", maxRefusalDetailLen+1)) {
+		t.Errorf("the header value reached stderr past the %d-byte bound", maxRefusalDetailLen)
+	}
+	if got := strings.Count(logged, "Content-Type headers"); got == 0 || got >= requests {
+		t.Errorf("printed %d lines for %d requests; want a rate-limited subset, not one per request", got, requests)
 	}
 }
 

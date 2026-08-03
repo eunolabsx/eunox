@@ -32,6 +32,53 @@ func newTTLTestRedis(t *testing.T, opts ...RedisOption) (*Redis, *miniredis.Mini
 	return NewRedis(client, opts...), mr, client
 }
 
+// armSessionTTLPublished stands in for the startup publish the reconcile loop's republish is
+// gated on. refreshPublishedSessionKillTTL is a REFRESH: it keeps a value an explicit
+// PublishSessionKillTTL already wrote alive, and publishes nothing before one has succeeded
+// (see sessionTTLPublished). A test exercising the tick's own behaviour therefore has to
+// establish that precondition, and the flag is set directly rather than by a real publish
+// because two of the callers need the key in a state a publish would destroy — a WRONGTYPE
+// value, or a Redis that is already gone.
+func armSessionTTLPublished(t *testing.T, r *Redis) {
+	t.Helper()
+	r.sessionTTLPublished.Store(true)
+}
+
+// TestRefreshPublishedSessionKillTTL_InertBeforeStartupPublish is the gate itself. The proxy
+// publishes the TTL only from each transport's ready hook, because the key is last-writer-wins
+// and a process that dies on the way up must not have written it — but Start, and so this
+// loop, runs BEFORE the transport is serving. An unconditional SET on the tick made every
+// startup that survived one reconcile interval before failing publish anyway, and at the 1s
+// interval the flag's help recommends that is nearly all of them: an `eunox kill` in the window
+// then adopts a doomed proxy's lifetime.
+func TestRefreshPublishedSessionKillTTL_InertBeforeStartupPublish(t *testing.T) {
+	t.Parallel()
+	r, _, client := newTTLTestRedis(t, WithSessionKillTTL(24*time.Hour), WithReconcileInterval(30*time.Second))
+	ctx := context.Background()
+
+	// A running proxy elsewhere published its own lifetime.
+	require.NoError(t, client.Set(ctx, redisSessionTTLKey, "48h0m0s", 0).Err())
+
+	for i := 0; i < 3; i++ {
+		r.refreshPublishedSessionKillTTL(ctx)
+	}
+
+	got, ok, err := ReadPublishedSessionKillTTL(ctx, client)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, 48*time.Hour, got, "a proxy that has not finished starting must not clobber a running one's published value")
+
+	// Once the ready hook publishes, the loop takes over keeping it alive.
+	_, _, err = r.PublishSessionKillTTL(ctx)
+	require.NoError(t, err)
+	require.NoError(t, client.Set(ctx, redisSessionTTLKey, "48h0m0s", 0).Err())
+	r.refreshPublishedSessionKillTTL(ctx)
+	got, ok, err = ReadPublishedSessionKillTTL(ctx, client)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, 24*time.Hour, got, "after the startup publish the tick republishes as before")
+}
+
 // TestNormalizeSessionKillTTL pins the flag-to-effective conversion both spellings
 // depend on: the operator-facing value uses 0 for "the default" and a negative for
 // "never", while the effective value uses 0 for "never". A caller that re-derived this
@@ -441,6 +488,8 @@ func TestRefreshPublishedSessionKillTTL_WarnsOncePerDistinctPrior(t *testing.T) 
 		WithLogger(slog.New(h)))
 	ctx := context.Background()
 
+	armSessionTTLPublished(t, r)
+
 	// Another instance published a different lifetime.
 	require.NoError(t, client.Set(ctx, redisSessionTTLKey, "48h0m0s", 0).Err())
 
@@ -571,6 +620,8 @@ func TestRefreshPublishedSessionKillTTL_GetFailureStillPublishes(t *testing.T) {
 		WithLogger(slog.New(h)))
 	ctx := context.Background()
 
+	armSessionTTLPublished(t, r)
+
 	require.NoError(t, client.LPush(ctx, redisSessionTTLKey, "not-a-string").Err())
 	require.Error(t, client.Get(ctx, redisSessionTTLKey).Err(), "precondition: GET must fail on this key")
 
@@ -604,6 +655,7 @@ func TestRefreshPublishedSessionKillTTL_PublishFailureIsNotFatal(t *testing.T) {
 	t.Cleanup(func() { _ = client.Close() })
 	r := NewRedis(client, WithSessionKillTTL(time.Hour), WithReconcileInterval(30*time.Second), WithLogger(slog.New(h)))
 
+	armSessionTTLPublished(t, r)
 	mr.Close() // every command now fails
 
 	const failMsg = "could not refresh the session-kill TTL"

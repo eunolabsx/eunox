@@ -7,8 +7,6 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"fmt"
-	"io"
-	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -232,21 +230,13 @@ const maxTrustStoreBytes = 4 << 20
 // cannot: the trust store names the keys whose attestations are believed, so swapping it for a
 // symlink between the check and the read substitutes the operator's whole trust root.
 func readTrustStoreFile(path string) ([]byte, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|config.OpenNoFollow, 0) //nolint:gosec // G304: operator-supplied trust-store path
-	if err != nil {
-		return nil, fmt.Errorf("reading attestation trust store %q: %w", path, err)
-	}
-	defer func() { _ = f.Close() }()
-	// Read one byte past the bound so a file exactly at the limit still loads and anything
-	// larger is detectable without reading it all.
-	data, err := io.ReadAll(io.LimitReader(f, maxTrustStoreBytes+1))
-	if err != nil {
-		return nil, fmt.Errorf("reading attestation trust store %q: %w", path, err)
-	}
-	if len(data) > maxTrustStoreBytes {
-		return nil, fmt.Errorf("attestation trust store %q is larger than %d bytes; refusing to load it rather than trusting a truncated key set", path, maxTrustStoreBytes)
-	}
-	return data, nil
+	return readBoundedFile(boundedRead{
+		path:      path,
+		what:      "attestation trust store",
+		max:       maxTrustStoreBytes,
+		flags:     config.OpenNoFollow,
+		overLimit: "refusing to load it rather than trusting a truncated key set",
+	})
 }
 
 // LoadTrustStore reads a trusted-key file. The format is a JSON object with a "keys" array of

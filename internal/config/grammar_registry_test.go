@@ -61,6 +61,23 @@ func TestGrammarClassification_RejectsUnknownTokens(t *testing.T) {
 	}
 }
 
+// TestConditionValidators_CoverEveryKnownCondition is the condition twin of
+// TestDirectiveValidators_CoverEveryKnownDirective, and it exists because the switch this
+// table replaced failed the OTHER way. A directive missing from its table is refused at load
+// (loud); a condition missing from the switch fell through with err == nil — it loaded, with
+// its field checks unrun and, worse, the runtime state its Compile builds never built. So a
+// registry entry with no table entry here is a silent enforcement gap, not a diagnostic one.
+func TestConditionValidators_CoverEveryKnownCondition(t *testing.T) {
+	for _, condType := range capability.KnownConditionTypes() {
+		_, ok := conditionValidators[condType]
+		assert.True(t, ok, "conditionValidators has no entry for %q, so a manifest carrying it loads with its validation and its Compile silently skipped", condType)
+	}
+	for condType := range conditionValidators {
+		_, ok := capability.NewConditionPrototype(condType)
+		assert.True(t, ok, "conditionValidators names %q, which pkg/capability's registry does not model", condType)
+	}
+}
+
 // TestDirectiveValidators_CoverEveryKnownDirective walks the directive registry against this
 // package's per-type validation table. A directive present in the registry and missing here
 // loads no manifest at all — the fail-closed default refuses it — so the failure is a

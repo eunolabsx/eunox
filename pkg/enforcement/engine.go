@@ -1323,6 +1323,39 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 		}()
 	}
 
+	// An authenticated caller this engine cannot anchor as configured. It runs FIRST of the
+	// three request-shaped gates below, ahead of the flow-label peek, because it is the one
+	// that declares a bucket invalid: with no task id the anchor falls back to the SESSION
+	// key, so peeking first read the very session-keyed bucket this refusal exists to reject
+	// and the carried-labels defer then stamped that snapshot onto the record — evidence
+	// drawn from the bucket the engine just refused to use. Moving it up also keeps a
+	// label-store round trip and a delegation-gate evaluation off a denial an HTTP caller can
+	// produce at will by alternating token shapes.
+	//
+	// It reads only req and returns a HardDeny, so neither the obligations defer above nor
+	// the carried-labels defer below applies to it: no verdict changes, only the ordering.
+	// Falling back to session keying here would let one caller split its own taint, budgets
+	// and antecedents across two buckets by alternating tokens — see anchorUnresolved.
+	if e.anchorUnresolved(req) {
+		return denyResponse(requestID, now, matched.IsAuditOnly(), nil, capability.DenialInfo{
+			Code:          capability.ErrCodeMissingContext,
+			ConditionType: string(AnchorKindTask),
+			// HardDeny, which puts this beside the unapproved declassification and the
+			// over-ceiling effect rather than beside an ordinary authorization verdict. A
+			// downgradable refusal is FORWARDED on an audit-only constraint, and the observe
+			// path's own antecedent recorder then writes this call's labels and sequence marker
+			// through stateAnchor — which, with no task id to resolve, keys them on the SESSION.
+			// So the very state split this check exists to refuse is what the downgrade
+			// performs, on a route whose other constraints are reading the task-keyed bucket.
+			// It is a failed state write, not a verdict being staged, and an operator staging
+			// task anchoring still gets the diagnostic: the refusal is on the tape either way,
+			// carrying the reason.
+			HardDeny: true,
+			Message:  "this route anchors enforcement state on the task, but the presented token carries no mcp.task_id; refusing rather than accounting this call against a second, session-keyed bucket (fail closed)",
+			Details:  map[string]interface{}{"anchor": string(AnchorKindTask), "reason": "no_task_id"},
+		})
+	}
+
 	// Peek the incoming accumulated flow-label set up front (only for flow-relevant
 	// constraints, and skipped entirely when the whole policy has no flow — skipFlow —
 	// so a non-flow policy pays no scan or round-trip). It reflects what flowed IN,
@@ -1362,31 +1395,6 @@ func (e *Engine) evaluateMatched(ctx context.Context, req *capability.EnforceReq
 	// every condition may pass, and the call is still one this delegate was never handed.
 	if delegDeny := e.checkDelegationTarget(req, matched.IsAuditOnly(), requestID, now); delegDeny != nil {
 		return *delegDeny
-	}
-
-	// An authenticated caller this engine cannot anchor as configured. It sits beside the
-	// delegation gate for the same reason: it is a property of the request rather than of the
-	// conditions, and a call that cannot be accounted must not reach the state commits below.
-	// Falling back to session keying here would let one caller split its own taint, budgets
-	// and antecedents across two buckets by alternating tokens — see anchorUnresolved.
-	if e.anchorUnresolved(req) {
-		return denyResponse(requestID, now, matched.IsAuditOnly(), nil, capability.DenialInfo{
-			Code:          capability.ErrCodeMissingContext,
-			ConditionType: string(AnchorKindTask),
-			// HardDeny, which puts this beside the unapproved declassification and the
-			// over-ceiling effect rather than beside an ordinary authorization verdict. A
-			// downgradable refusal is FORWARDED on an audit-only constraint, and the observe
-			// path's own antecedent recorder then writes this call's labels and sequence marker
-			// through stateAnchor — which, with no task id to resolve, keys them on the SESSION.
-			// So the very state split this check exists to refuse is what the downgrade
-			// performs, on a route whose other constraints are reading the task-keyed bucket.
-			// It is a failed state write, not a verdict being staged, and an operator staging
-			// task anchoring still gets the diagnostic: the refusal is on the tape either way,
-			// carrying the reason.
-			HardDeny: true,
-			Message:  "this route anchors enforcement state on the task, but the presented token carries no mcp.task_id; refusing rather than accounting this call against a second, session-keyed bucket (fail closed)",
-			Details:  map[string]interface{}{"anchor": string(AnchorKindTask), "reason": "no_task_id"},
-		})
 	}
 
 	// PASS ONE: the pure predicates. The deferred (quota-consuming) conditions are

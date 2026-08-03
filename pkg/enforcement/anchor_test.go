@@ -202,6 +202,36 @@ func TestTaskAnchor_RefusesAnAuthenticatedCallerWithNoTaskID(t *testing.T) {
 	assert.Equal(t, capability.DecisionAllow, eng.ValidateAction(ctx, taskReq("s", "t1", "read_customer"), caps).Decision)
 }
 
+// TestTaskAnchor_UnresolvedRefusalCarriesNoSessionEvidence pins the ORDER of the refusal
+// against the flow-label peek beside it.
+//
+// The refusal's whole message is "refusing rather than accounting this call against a second,
+// session-keyed bucket". With no task id the anchor falls back to the SESSION key, so peeking
+// first read exactly that bucket and the carried-labels defer then stamped the snapshot onto
+// the signed record — evidence drawn from the bucket the engine had just declared invalid. It
+// also paid a label-store round trip and a delegation-gate evaluation per denied call, on a
+// shape an HTTP caller produces at will by alternating token shapes.
+func TestTaskAnchor_UnresolvedRefusalCarriesNoSessionEvidence(t *testing.T) {
+	eng := anchoredEngine(callcounter.NewInMemory(), flowlabelstore.NewInMemory(), true)
+	ctx := context.Background()
+
+	// An unauthenticated call falls back to the session and taints THAT bucket.
+	require.Equal(t, capability.DecisionAllow,
+		eng.ValidateAction(ctx, req("s", "read_customer"), sourceCaps("read_customer", capability.FlowLabelPII)).Decision)
+
+	// Now the same session presents a token with no task_id, at a flow-relevant sink — the
+	// one shape where the peek would have run before the anchor gate.
+	authed := req("s", "publish")
+	authed.Claims = map[string]interface{}{"sub": "svc@example.com"}
+	resp := eng.ValidateAction(ctx, authed, sinkCaps("publish", capability.FlowLabelPublic))
+
+	require.Equal(t, capability.DecisionDeny, resp.Decision)
+	require.NotNil(t, resp.Denial)
+	require.Equal(t, "no_task_id", resp.Denial.Details["reason"])
+	assert.Nil(t, resp.CarriedLabels,
+		"the refusal must not report labels read from the very bucket it refuses to account against")
+}
+
 // TestTaskAnchor_NoRollbackAcrossASharedTaskKey pins why the label rollback stands down under
 // task anchoring: the snapshot it computes its delta from is taken under ONE session's decision
 // lock, and that lock does not span a task key two sessions share. Removing a label a

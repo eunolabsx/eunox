@@ -170,6 +170,10 @@ func (r *Redis) PublishSessionKillTTL(ctx context.Context) (prior time.Duration,
 	if setErr := r.client.Set(ctx, redisSessionTTLKey, formatSessionKillTTL(mine), r.publishedValueExpiry(mine)).Err(); setErr != nil {
 		return 0, false, fmt.Errorf("killswitch: publish session-kill TTL: %w", setErr)
 	}
+	// The value is now published, so the reconcile loop's job of keeping it alive begins.
+	// Until this point the loop publishes nothing at all: see sessionTTLPublished for why a
+	// tick that publishes on its own defeats the caller's ready-hook ordering.
+	r.sessionTTLPublished.Store(true)
 	return prior, differs, nil
 }
 
@@ -191,6 +195,14 @@ func (r *Redis) PublishSessionKillTTL(ctx context.Context) (prior time.Duration,
 // so a persistent condition does not reprint every interval and train operators to ignore
 // the line; a CHANGED prior value warns again.
 func (r *Redis) refreshPublishedSessionKillTTL(ctx context.Context) {
+	// REFRESH means refresh: this republishes a value an explicit startup publish already
+	// wrote, and publishes nothing on its own. Start runs before the transport is serving,
+	// so an unconditional SET here made the loop the first writer for any startup that
+	// failed after one tick — clobbering a running proxy's published lifetime with a value
+	// nothing would ever enforce. See sessionTTLPublished.
+	if !r.sessionTTLPublished.Load() {
+		return
+	}
 	// Carve a short budget out of the loop's deadline-free context. This runs on the
 	// reconcile goroutine, immediately after the cache refresh that BOUNDS kill
 	// propagation -- so a slow-but-not-down Redis that let this advisory write consume

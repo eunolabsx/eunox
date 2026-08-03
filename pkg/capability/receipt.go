@@ -134,6 +134,15 @@ const (
 	// otherwise record as `verified`, the strongest signal this surface emits, for an
 	// attestation that never covered the one dimension the contract bounded.
 	ReceiptReasonBlastRadiusUnstated = "blast_radius_unstated"
+	// ReceiptReasonClassUnstated — the contract declared a class below the top and the
+	// receipt says nothing about the one it landed in. The same rule as
+	// ReceiptReasonBlastRadiusUnstated, applied to the other declared dimension: a server
+	// that performed an irreversible action against a `reversible` declaration and simply
+	// omitted `class` would otherwise record as `verified`, because every class comparison
+	// below is gated on the field being present. It does not fire when the declaration is
+	// already `irreversible` — an unstated class cannot exceed the top of the vocabulary, so
+	// there is nothing silence could be hiding.
+	ReceiptReasonClassUnstated = "effect_class_unstated"
 )
 
 // ReceiptResult is one receipt's outcome. A nil *ReceiptResult means the server published
@@ -396,6 +405,18 @@ func receiptInconsistencies(claims *EffectReceiptClaims, tool string, declared *
 	if declared == nil {
 		sort.Strings(reasons)
 		return reasons
+	}
+	if claims.Class == "" && declared.Class != EffectIrreversible {
+		// Silence is not agreement, on this dimension exactly as on the magnitude one below.
+		// Class is omitempty and every comparison in this function is gated on it being
+		// present, so a receipt carrying only `tool` + `iat` tripped nothing and recorded
+		// `verified` — the strongest signal this surface emits — for an attestation that
+		// never covered the class the contract bounded.
+		//
+		// Not fired at the top of the vocabulary: an unstated class cannot exceed
+		// `irreversible`, so silence there hides nothing and flagging it would report an
+		// inconsistency against a declaration no receipt could contradict.
+		reasons = append(reasons, ReceiptReasonClassUnstated)
 	}
 	if claims.Class != "" && IsEffectClass(claims.Class) && !EffectClassAtMost(claims.Class, declared.Class) {
 		reasons = append(reasons, ReceiptReasonClass)

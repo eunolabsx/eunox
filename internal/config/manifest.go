@@ -1115,55 +1115,24 @@ func validateLocalManifest(m *LocalManifest) error {
 			if capability.IsTypedNil(cond) {
 				return fmt.Errorf("capability at index %d, condition %d: a typed-nil condition is not permitted; every conditions entry must be a typed condition object", i, j)
 			}
-			// One arm per condition type, each pairing the value and pointer decode forms
-			// (validateTypedCondition normalizes to *T and runs the pointer-only Compile).
-			// Hand-writing the two forms as separate arms meant ~22 near-identical arms whose
-			// only asymmetry - Compile on the pointer arm alone - had to be remembered at every
-			// one, and getting one arm of a new pair wrong is invisible: the value form is a
-			// copy, so a missed Compile silently leaves the runtime state unbuilt. Mirrors the
-			// directive loop above. An unrecognized type falls through unvalidated exactly as
-			// before; the loader admits only these, and the engine fails closed on anything else.
-			var err error
-			switch cond.(type) {
-			case capability.AllowedOperationsCondition, *capability.AllowedOperationsCondition:
-				err = validateTypedCondition(i, j, cond, validateAllowedOperations)
-			case capability.AllowedExtensionsCondition, *capability.AllowedExtensionsCondition:
-				err = validateTypedCondition(i, j, cond, validateAllowedExtensions)
-			case capability.AllowedTablesCondition, *capability.AllowedTablesCondition:
-				err = validateTypedCondition(i, j, cond, validateAllowedTables)
-			case capability.RecipientDomainCondition, *capability.RecipientDomainCondition:
-				err = validateTypedCondition(i, j, cond, validateRecipientDomain)
-			case capability.AllowedValuesCondition, *capability.AllowedValuesCondition:
-				// The only per-type validator that needs the declared grammar revision:
-				// the ${task.*} surface exists in "0.2" and not in "0.1", so what counts
-				// as a malformed reference versus an ordinary literal differs between them.
-				err = validateTypedCondition(i, j, cond, func(i, j int, v *capability.AllowedValuesCondition) error {
-					return validateAllowedValues(i, j, v, declaredSchemaVersion)
-				})
-			case capability.MaxCallsCondition, *capability.MaxCallsCondition:
-				err = validateTypedCondition(i, j, cond, validateMaxCalls)
-			case capability.IPRangeCondition, *capability.IPRangeCondition:
-				err = validateTypedCondition(i, j, cond, validateIPRange)
-			case capability.TimeWindowCondition, *capability.TimeWindowCondition:
-				err = validateTypedCondition(i, j, cond, validateTimeWindow)
-			case capability.SequenceBlockCondition, *capability.SequenceBlockCondition:
-				err = validateTypedCondition(i, j, cond, validateSequenceBlock)
-			case capability.FlowLabelCondition, *capability.FlowLabelCondition:
-				err = validateTypedCondition(i, j, cond, func(i, j int, c *capability.FlowLabelCondition) error {
-					return validateFlowLabel(i, j, c.Allow)
-				})
-			case capability.EffectClassCondition, *capability.EffectClassCondition:
-				err = validateTypedCondition(i, j, cond, func(i, j int, c *capability.EffectClassCondition) error {
-					return validateEffectClass(i, j, c.Allow)
-				})
-			case capability.BlastRadiusCondition, *capability.BlastRadiusCondition:
-				err = validateTypedCondition(i, j, cond, validateBlastRadius)
-			case capability.PolicyCondition, *capability.PolicyCondition:
-				err = validateTypedCondition(i, j, cond, validatePolicyCondition)
-			case capability.CustomCondition, *capability.CustomCondition:
-				err = validateTypedCondition(i, j, cond, validateCustomCondition)
+			// Dispatched off the condition's own DISCRIMINATOR through conditionValidators,
+			// keyed by the same strings capability's conditionPrototypes registry holds — not
+			// off a type switch whose unmatched arm fell through with err == nil. The condition
+			// loader is registry-driven, so a condition added to the registry without a switch
+			// arm compiled, decoded and LOADED clean, with its load-time checks unrun and its
+			// runtime state left unbuilt by the missed Compile. Directives closed this exact
+			// hole (directiveValidators + its completeness test); this was the last
+			// hand-maintained mirror of the registry in the package.
+			validate, known := conditionValidators[cond.ConditionType()]
+			if !known {
+				// Fail closed, and enumerate FROM the registry, for the same reasons the
+				// directive loop's unknown arm does. Reachable only for a programmatically
+				// built manifest — the YAML/JSON loader instantiates from the registry and
+				// rejects an unknown type at decode.
+				return fmt.Errorf("capability at index %d, condition %d: unrecognized condition type %q; the supported conditions are %s",
+					i, j, cond.ConditionType(), strings.Join(capability.KnownConditionTypes(), ", "))
 			}
-			if err != nil {
+			if err := validate(i, j, cond, declaredSchemaVersion); err != nil {
 				return err
 			}
 		}
@@ -1179,33 +1148,94 @@ func validateLocalManifest(m *LocalManifest) error {
 	return nil
 }
 
-// validateTypedCondition folds one condition type's value and pointer decode forms into a
-// single validation arm: it normalizes cond to *T for the type's validator, then runs the
-// type's load-time Compile.
+// conditionValidator is the per-type validation one condition needs: its own field checks
+// plus the type's load-time Compile. i/j are the capability and condition indices for the
+// error message, cond the (non-nil, non-typed-nil — validateLocalManifest guarantees both
+// before dispatch) condition itself, and declaredSchemaVersion the manifest's grammar
+// revision, which exactly one type's rules genuinely turn on.
+type conditionValidator func(i, j int, cond capability.Condition, declaredSchemaVersion string) error
+
+// conditionValidators is the manifest loader's per-condition validation, keyed by the SAME
+// discriminator strings pkg/capability's conditionPrototypes registry holds.
+//
+// It replaces a type switch whose unmatched arm fell through with err == nil. The condition
+// loader is registry-driven, so a condition added to conditionPrototypes WITHOUT a switch arm
+// compiled, decoded and loaded clean — its load-time checks unrun and, worse, the runtime
+// state its Compile builds never built, because the missed arm is what called Compile.
+// Directives were converted to this shape for exactly that reason; conditions were the last
+// hand-maintained mirror of the registry in this package. A type present in the registry and
+// missing here is now a test failure (TestConditionValidators_CoverEveryKnownCondition)
+// rather than a silent gap.
+//
+// Each entry goes through typedCondition, which honours AsValueOrPointer's ok. Dispatch is on
+// the discriminator the condition REPORTS, not on its Go type, so a value whose
+// ConditionType() disagrees with its concrete type selects an entry the assertion then fails
+// — reported, rather than dereferenced as a type it is not.
+var conditionValidators = map[string]conditionValidator{
+	capability.ConditionTypeAllowedOperations: typedCondition(validateAllowedOperations),
+	capability.ConditionTypeAllowedExtensions: typedCondition(validateAllowedExtensions),
+	capability.ConditionTypeAllowedTables:     typedCondition(validateAllowedTables),
+	capability.ConditionTypeRecipientDomain:   typedCondition(validateRecipientDomain),
+	// The only per-type validator that needs the declared grammar revision: the ${task.*}
+	// surface exists in "0.2" and not in "0.1", so what counts as a malformed reference
+	// versus an ordinary literal differs between them.
+	capability.ConditionTypeAllowedValues: typedVersionedCondition(validateAllowedValues),
+	capability.ConditionTypeMaxCalls:      typedCondition(validateMaxCalls),
+	capability.ConditionTypeIPRange:       typedCondition(validateIPRange),
+	capability.ConditionTypeTimeWindow:    typedCondition(validateTimeWindow),
+	capability.ConditionTypeSequenceBlock: typedCondition(validateSequenceBlock),
+	capability.ConditionTypeFlowLabel: typedCondition(func(i, j int, c *capability.FlowLabelCondition) error {
+		return validateFlowLabel(i, j, c.Allow)
+	}),
+	capability.ConditionTypeEffectClass: typedCondition(func(i, j int, c *capability.EffectClassCondition) error {
+		return validateEffectClass(i, j, c.Allow)
+	}),
+	capability.ConditionTypeBlastRadius: typedCondition(validateBlastRadius),
+	capability.ConditionTypePolicy:      typedCondition(validatePolicyCondition),
+	capability.ConditionTypeCustom:      typedCondition(validateCustomCondition),
+}
+
+// typedCondition adapts a per-type validator that does not depend on the grammar revision.
+// It is the common case; typedVersionedCondition is the one type that does.
+func typedCondition[T any](check func(i, j int, v *T) error) conditionValidator {
+	return typedVersionedCondition(func(i, j int, v *T, _ string) error { return check(i, j, v) })
+}
+
+// typedVersionedCondition folds one condition type's value and pointer decode forms into a
+// single table entry: it normalizes cond to *T for the type's validator, then runs the type's
+// load-time Compile.
 //
 // The "Compile only on the POINTER form" rule is enforced by the type system rather than
-// remembered per arm. Compile has a pointer receiver on every condition that defines one,
+// remembered per entry. Compile has a pointer receiver on every condition that defines one,
 // so a cond holding the VALUE form does not satisfy this interface at all — while
 // AsValueOrPointer's *T is a pointer to a COPY for that form, and compiling it would build
 // state the engine never reads. A condition type with no Compile simply does not match.
-func validateTypedCondition[T any](i, j int, cond capability.Condition, validate func(int, int, *T) error) error {
-	v, ok := capability.AsValueOrPointer[T](cond)
-	if !ok {
-		// Unreachable: the caller's type switch already matched T or *T.
-		return fmt.Errorf("capability at index %d, condition %d: internal: condition is not %T", i, j, v)
-	}
-	if err := validate(i, j, v); err != nil {
-		return err
-	}
-	if c, compilable := cond.(interface{ Compile() error }); compilable {
-		// Compile cannot fail for any condition in tree (each validator already confirmed
-		// its inputs parse); the error is still checked so a future normalization that CAN
-		// fail is caught at load rather than silently skipped.
-		if err := c.Compile(); err != nil {
-			return fmt.Errorf("capability at index %d, condition %d: %w", i, j, err)
+//
+// The type mismatch is REPORTED rather than assumed away. It was unreachable under the type
+// switch this replaced (the switch had already matched T or *T); under discriminator dispatch
+// a programmatically built condition whose ConditionType() disagrees with its concrete type
+// reaches here, and a discarded ok would be a nil dereference — a fail-closed load error
+// turned into a crash. Same reason, same shape, as typedDirective's.
+func typedVersionedCondition[T any](check func(i, j int, v *T, declaredSchemaVersion string) error) conditionValidator {
+	return func(i, j int, cond capability.Condition, declaredSchemaVersion string) error {
+		v, ok := capability.AsValueOrPointer[T](cond)
+		if !ok || v == nil {
+			return fmt.Errorf("capability at index %d, condition %d: condition reports type %q but is not one; refusing rather than validating it as a type it is not",
+				i, j, cond.ConditionType())
 		}
+		if err := check(i, j, v, declaredSchemaVersion); err != nil {
+			return err
+		}
+		if c, compilable := cond.(interface{ Compile() error }); compilable {
+			// Compile cannot fail for any condition in tree (each validator already confirmed
+			// its inputs parse); the error is still checked so a future normalization that CAN
+			// fail is caught at load rather than silently skipped.
+			if err := c.Compile(); err != nil {
+				return fmt.Errorf("capability at index %d, condition %d: %w", i, j, err)
+			}
+		}
+		return nil
 	}
-	return nil
 }
 
 func validateTargetPatternBreadth(targetType capability.TargetType, bare, target string) error {
