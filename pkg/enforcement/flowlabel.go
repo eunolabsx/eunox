@@ -205,13 +205,14 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 			Message:       fmt.Sprintf("flow label(s) %v present in this session but not permitted at this sink", blocked),
 			Details: func() map[string]interface{} {
 				d := map[string]interface{}{
-					// "flow": true distinguishes a source->sink flow denial from a plain
-					// capability/argument denial. blockedLabels lists every offending class;
-					// blockedLabel is the highest-vocabulary-order one (untrusted-preferring),
-					// so a single-value consumer keyed on the integrity signal still sees it.
-					"flow":          true,
-					"blockedLabel":  blocked[len(blocked)-1],
-					"blockedLabels": blocked,
+					// The flow discriminator distinguishes a source->sink flow denial from a
+					// plain capability/argument denial. blockedLabels lists every offending
+					// class; blockedLabel is the highest-vocabulary-order one
+					// (untrusted-preferring), so a single-value consumer keyed on the integrity
+					// signal still sees it.
+					capability.FlowAuditDetailKey: true,
+					"blockedLabel":                blocked[len(blocked)-1],
+					"blockedLabels":               blocked,
 					// The EFFECTIVE allow-set the check ran against, not the authored one:
 					// under a delegation cap the two differ, and recording the manifest's
 					// list would put a set on the tape that no decision used — sending an
@@ -725,11 +726,11 @@ func labelRecordFailureDenial(requestID, now string, auditOnly bool, obligations
 		ConditionType: capability.ConditionTypeFlowLabel,
 		Message:       "flow-label recording failed; source->sink flow state is unreliable",
 		HardDeny:      true,
-		// "flow": true is the discriminator every information-flow event on the tape
+		// FlowAuditDetailKey is the discriminator every information-flow event on the tape
 		// carries (the flowLabel sink denial, the declassify refusal and its record
 		// fault). Without it here, a filter keyed on that field missed the one flow event
 		// an operator most needs to see: the hard deny raised when a source's label write
 		// faulted.
-		Details: map[string]interface{}{"flow": true, "phase": "record"},
+		Details: map[string]interface{}{capability.FlowAuditDetailKey: true, "phase": "record"},
 	})
 }

@@ -1774,14 +1774,14 @@ const UpstreamErrorCodeKey = "_eunox_upstream_error_code"
 // (internal/transport) and the miner (cmd/eunox/suggest) share one spelling.
 const EffectReceiptKey = "_eunox_effect_receipt"
 
-// The three declassification detail keys. They report the facts a declassification's
+// The four declassification detail keys. They report the facts a declassification's
 // top-level signed fields (labels_cleared / approver / approval_id) deliberately cannot:
 // those three appear together and ONLY when a clear actually changed the session's labels,
 // so on their own they leave a real approval spendable with nothing on the tape naming it,
 // and an authorized clear that never landed indistinguishable from a call that never asked
 // for one.
 //
-// Each has exactly ONE provenance, which is why there are three rather than one flag with a
+// Each has exactly ONE provenance, which is why there are four rather than one flag with a
 // mode. A consumer keyed on any of them knows what happened without also having to read the
 // record's decision:
 //
@@ -1791,17 +1791,27 @@ const EffectReceiptKey = "_eunox_effect_receipt"
 //     advertises. It is the key that answers "which of my outstanding single-use approvals
 //     are still live?", which neither approval_id (present only on a clear that changed
 //     something) nor a refusal-only key could.
-//   - DeclassifyNotAppliedKey: an approved clear did NOT run because the call was refused
-//     below the decision (the --require-audit=strict gate, an upstream transport failure, a
-//     redaction failure). Benign by construction — the labels were never removed, so the
-//     session is exactly as tainted as the calls it actually made — and recorded so a spent
-//     grant beside it is explicable.
+//   - DeclassifyNotAppliedKey: an approved clear did NOT take effect. Usually because the
+//     call was refused below the decision (the --require-audit=strict gate, an upstream
+//     transport failure, a redaction failure); also on an ALLOW whose upstream reply showed
+//     the action failing (an isError result, or a JSON-RPC error), where the response IS
+//     delivered but the transform never happened. Benign by construction either way — the
+//     labels were never removed, so the session is exactly as tainted as the calls it
+//     actually made — and recorded so a spent grant beside it is explicable. It is "the
+//     clear did not land", never "the request was rejected"; read the record's decision for
+//     that.
+//   - DeclassifyResultWithheldKey: the action EXECUTED and eunox withheld its result. It
+//     normally QUALIFIES the key above — both facts are true on that exit, and a consumer
+//     keyed on the benign case must still find the refusal — but it can ride alone on a
+//     no-op clear under a single-use grant, where the decision authorized labels the anchor
+//     was not carrying and there is therefore no not-applied set. Treat it as its own fact
+//     about a spent grant, not as a strict subset of the key above.
 //   - DeclassifyCommitFailedKey: the call RAN and the clear the policy authorized could not
 //     be applied. The session keeps taint it should have dropped, so a later sink
 //     over-blocks until the operator retries with a new approval. This is the direction the
 //     residual now fails in; it is not a fail-open, and it is counted by `eunox stats`.
 //
-// All three carry the reserved underscore prefix for EffectReceiptKey's reason, which binds
+// All four carry the reserved underscore prefix for EffectReceiptKey's reason, which binds
 // harder here: two of them ride an ALLOW record, and a tools/call allow's Details IS the
 // caller's argument map in audit mode, which `eunox suggest` mines as argument names. A bare
 // key would be drafted into an allowedValues condition on an argument no call carries.
@@ -1809,6 +1819,40 @@ const (
 	DeclassifySpentApprovalKey = DeclassifyDetailPrefix + "spent_approval_id"
 	DeclassifyNotAppliedKey    = DeclassifyDetailPrefix + "not_applied"
 	DeclassifyCommitFailedKey  = DeclassifyDetailPrefix + "commit_failed"
+
+	// DeclassifyResultWithheldKey says the declassifying action EXECUTED and eunox withheld
+	// its result — the proxy could not discharge a redactFields obligation on the response,
+	// so the response was dropped and the call refused with ENFORCEMENT_ERROR.
+	//
+	// It exists because the three refusals below the decision are not one case. Two of them
+	// (the --require-audit=strict gate, an upstream transport failure) leave it genuinely
+	// unknown whether the upstream ran anything: strict blocks before the forward, and a
+	// transport failure can follow a side effect that already happened. Only the redaction
+	// exit is reached after a reply came back. That distinction is what an operator
+	// reconciling a burned `once` grant needs — it separates "retry it" from "the work is
+	// done, only the delivery failed" — and nothing else on the tape carries it: the refusal
+	// otherwise shares DeclassifyNotAppliedKey's shape with the two exits where the action may
+	// never have run.
+	//
+	// "A reply came back" is NOT this key's claim, and the producer gates the difference. A
+	// reply flagged isError, a reply carrying an error member beside a result (which JSON-RPC
+	// forbids and a hostile upstream may still emit), and bytes the proxy cannot interpret can
+	// all reach that exit and fail redaction — so an ungated stamp would let an upstream write
+	// "the work is done" onto the tamper-evident tape at will, and the operator would re-mint
+	// the approval to re-deliver work that never ran. It is therefore written only for a reply
+	// that passes the SAME success test the clear itself is gated on, and only for a decision
+	// that was an allow (a downgraded deny is forwarded under --audit and must never be
+	// reported as an executed declassification).
+	//
+	// The clear is still withheld on this exit, which is a decision rather than an inheritance
+	// from its two siblings. The sanitized result never reached the host, so nothing sanitized
+	// entered the session — which is the thing a flow label tracks — and the taint therefore
+	// still describes the session accurately. The cost is over-blocking a later sink plus a
+	// re-minted approval (the grant is burned with the decision and has no refund), paid for a
+	// proxy- or manifest-side defect; the alternative is dropping taint on the strength of a
+	// response no consumer ever saw. This key is what makes that cost legible on the tape
+	// instead of silent.
+	DeclassifyResultWithheldKey = DeclassifyDetailPrefix + "result_withheld"
 )
 
 // ReservedArgumentsKey holds the caller-supplied tool arguments whose names collided with
@@ -1822,7 +1866,7 @@ const (
 // too rather than drafting "_eunox_reserved_arguments" as a tool argument name.
 const ReservedArgumentsKey = "_eunox_reserved_arguments"
 
-// DeclassifyDetailPrefix is the common prefix of the three keys above, and the three are
+// DeclassifyDetailPrefix is the common prefix of the four keys above, and all four are
 // BUILT from it rather than spelled out beside it. A consumer that has to scan for them —
 // `eunox stats` probes a record's raw details bytes for this substring before paying for a
 // decode, the same pre-filter the effect-receipt path uses — then cannot fall out of step
@@ -1833,13 +1877,14 @@ const DeclassifyDetailPrefix = "_eunox_declassify_"
 // reservedDetailKeys is the set of Details keys eunox itself injects into an allow record.
 // None is ever a caller-supplied tool argument.
 var reservedDetailKeys = map[string]bool{
-	TruncatedKey:               true,
-	UpstreamErrorCodeKey:       true,
-	EffectReceiptKey:           true,
-	DeclassifySpentApprovalKey: true,
-	DeclassifyNotAppliedKey:    true,
-	DeclassifyCommitFailedKey:  true,
-	ReservedArgumentsKey:       true,
+	TruncatedKey:                true,
+	UpstreamErrorCodeKey:        true,
+	EffectReceiptKey:            true,
+	DeclassifySpentApprovalKey:  true,
+	DeclassifyNotAppliedKey:     true,
+	DeclassifyCommitFailedKey:   true,
+	DeclassifyResultWithheldKey: true,
+	ReservedArgumentsKey:        true,
 }
 
 // IsReservedDetailKey reports whether a Details key is one eunox injects rather than one a

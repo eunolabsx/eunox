@@ -189,6 +189,13 @@ func TestRouteSink_DeclassifiedAllowStampsRouteIdentity(t *testing.T) {
 // The record still has to carry two facts: that an approved declassification did not take
 // effect, and that the single-use grant authorizing it is spent all the same (the burn is
 // atomic with the decision and has no un-burn).
+//
+// wantWithheld is the third fact, and it holds on exactly ONE of the three. The other two
+// leave it unknowable whether the upstream ran anything — strict blocks before the forward,
+// and a transport failure can follow a side effect that already happened — while the redaction
+// exit is reached only after a well-formed, successful reply, so the action demonstrably ran
+// and only its result was withheld. An operator reconciling the burned grant needs that
+// difference: it separates "retry the work" from "the work is done, only the delivery failed".
 func TestEnforcedForwardCore_RefusalBelowTheDecisionNeverCommits(t *testing.T) {
 	redactingDecision := func() capability.EnforceResponse {
 		dec := declassifiedAllow()
@@ -196,9 +203,10 @@ func TestEnforcedForwardCore_RefusalBelowTheDecisionNeverCommits(t *testing.T) {
 		return dec
 	}
 	for name, tc := range map[string]struct {
-		fp       func(*fwdRecorder, *commitSpy) forwardParams
-		dec      func() capability.EnforceResponse
-		wantCode string
+		fp           func(*fwdRecorder, *commitSpy) forwardParams
+		dec          func() capability.EnforceResponse
+		wantCode     string
+		wantWithheld bool
 	}{
 		// --require-audit=strict with a degraded trail: the upstream is never called.
 		"strict-audit gate": {
@@ -234,8 +242,9 @@ func TestEnforcedForwardCore_RefusalBelowTheDecisionNeverCommits(t *testing.T) {
 						return mcp.RPCMsg{ID: msg.ID, Result: json.RawMessage(`"not-an-object"`)}, nil
 					}}
 			},
-			dec:      redactingDecision,
-			wantCode: capability.ErrCodeEnforcementError,
+			dec:          redactingDecision,
+			wantCode:     capability.ErrCodeEnforcementError,
+			wantWithheld: true,
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -255,10 +264,122 @@ func TestEnforcedForwardCore_RefusalBelowTheDecisionNeverCommits(t *testing.T) {
 				"the tape must say an approved declassification did not take effect")
 			assert.Equal(t, "apr-9", got.details[audit.DeclassifySpentApprovalKey],
 				"the grant stays burned, so the record names it for reconciliation")
-			assert.Equal(t, true, got.details["flow"])
+			assert.Equal(t, true, got.details[capability.FlowAuditDetailKey])
 			assert.Empty(t, got.labelsCleared, "nothing was cleared, so nothing is claimed")
+
+			if tc.wantWithheld {
+				assert.Equal(t, true, got.details[audit.DeclassifyResultWithheldKey],
+					"the upstream ran the action here, so the tape must not read like the two exits where it may not have")
+				return
+			}
+			assert.Nil(t, got.details[audit.DeclassifyResultWithheldKey],
+				"whether the action executed is unknown on this exit; claiming it did would be a fact the proxy cannot back")
 		})
 	}
+}
+
+// TestDeclassifyRedactionDetail_ClaimsExecutionOnlyForASuccessfulReply is the guard on the
+// one fact this key asserts. Reaching the redaction exit means a reply came back; it does NOT
+// mean the sanitizing action succeeded, and the difference is upstream-controlled. A reply
+// flagged isError, a reply carrying an error member beside a result, and bytes this build
+// cannot interpret can all reach that exit and fail redaction — so an ungated claim would let
+// a hostile or merely broken upstream write "the work is done" onto the tamper-evident tape at
+// will, and an operator reconciling the burned grant would re-deliver work that never ran.
+//
+// The gate is declassifyCommitted, the SAME predicate the success path uses, so the two cannot
+// disagree about what counts as the action having happened.
+func TestDeclassifyRedactionDetail_ClaimsExecutionOnlyForASuccessfulReply(t *testing.T) {
+	fp := forwardParams{sessionID: "s"}
+	for name, tc := range map[string]struct {
+		upResp      mcp.RPCMsg
+		dec         func() capability.EnforceResponse
+		wantExecute bool
+	}{
+		"clean result": {successfulReply(), declassifiedAllow, true},
+		"tool-level failure": {
+			mcp.RPCMsg{ID: mcp.RawJSON(`1`), Result: json.RawMessage(`{"isError":true}`)},
+			declassifiedAllow, false,
+		},
+		"error beside a result (a hostile upstream may emit both)": {
+			mcp.RPCMsg{ID: mcp.RawJSON(`1`), Result: json.RawMessage(`{"ok":true}`),
+				Error: &mcp.RPCError{Code: -32000, Message: "no"}},
+			declassifiedAllow, false,
+		},
+		"uninterpretable bytes beside an isError probe": {
+			mcp.RPCMsg{ID: mcp.RawJSON(`1`), Result: json.RawMessage(`{"isError":`)},
+			declassifiedAllow, false,
+		},
+		// A downgraded deny is forwarded under --audit and still carries redactFields
+		// obligations, so it can reach this exit; it must never be reported as an executed
+		// declassification. The same guard the commit arm applies.
+		"observe-mode deny": {
+			successfulReply(),
+			func() capability.EnforceResponse {
+				dec := declassifiedAllow()
+				dec.Decision = capability.DecisionDeny
+				dec.Denial = &capability.DenialInfo{Code: capability.ErrCodeAuthorizationFailed}
+				return dec
+			}, false,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := fp.declassifyRedactionDetail(tc.dec(), tc.upResp)
+			require.NotNil(t, got, "an authorized clear that did not take effect is always reported")
+			assert.Equal(t, []string{capability.FlowLabelPII}, got[audit.DeclassifyNotAppliedKey])
+			assert.Equal(t, true, got[capability.FlowAuditDetailKey])
+			if tc.wantExecute {
+				assert.Equal(t, true, got[audit.DeclassifyResultWithheldKey],
+					"a successful reply is the one case where the proxy can say the action ran")
+				return
+			}
+			assert.Nil(t, got[audit.DeclassifyResultWithheldKey],
+				"the reply does not show the action succeeding, so claiming it did is a fact the proxy cannot back")
+		})
+	}
+}
+
+// TestDeclassifyRedactionDetail_SilentOnANonDeclassifyingCall is the negative half of the
+// withheld key. A redaction failure is an ordinary enforcement error on the overwhelming
+// majority of calls — no declassify directive anywhere in the deployment — and stamping a
+// flow annotation on those would put an information-flow event on the tape for a call that
+// has nothing to do with one, inflating exactly the filter the discriminator exists to keep
+// meaningful.
+func TestDeclassifyRedactionDetail_SilentOnANonDeclassifyingCall(t *testing.T) {
+	fp := forwardParams{sessionID: "s"}
+	assert.Nil(t, fp.declassifyRedactionDetail(allowDecision(), successfulReply()),
+		"a decision that authorized no clear and spent no grant is not a declassification event")
+
+	// A standing grant with no `once` id still authorizes a clear, so the withheld fact is
+	// reportable and rides beside the benign not-applied key rather than replacing it.
+	dec := declassifiedAllow()
+	dec.SpentApprovalID = ""
+	got := fp.declassifyRedactionDetail(dec, successfulReply())
+	require.NotNil(t, got)
+	assert.Equal(t, true, got[audit.DeclassifyResultWithheldKey])
+	assert.Equal(t, []string{capability.FlowLabelPII}, got[audit.DeclassifyNotAppliedKey],
+		"both facts are true, and a consumer keyed on the benign case must still find this refusal")
+	assert.Equal(t, true, got[capability.FlowAuditDetailKey])
+}
+
+// TestDeclassifyRedactionDetail_RidesAloneOnANoOpClear pins the one shape where the withheld
+// key has no not-applied key beside it, because the docs and `eunox stats` both used to assert
+// a containment that does not hold.
+//
+// A single-use grant is burned by the decision that accepts it even when the clear turns out
+// to be a no-op — the anchor was not carrying the approved labels — so LabelsPendingClear is
+// empty while SpentApprovalID is set. If that call then fails redaction, the withheld fact is
+// still worth recording (it is what says the spent grant bought work that actually happened),
+// and it is the only declassify key on the record.
+func TestDeclassifyRedactionDetail_RidesAloneOnANoOpClear(t *testing.T) {
+	dec := declassifiedAllow()
+	dec.LabelsPendingClear = nil // the anchor held none of the approved labels
+	got := forwardParams{sessionID: "s"}.declassifyRedactionDetail(dec, successfulReply())
+
+	require.NotNil(t, got, "the spent grant alone is worth a record")
+	assert.Equal(t, true, got[audit.DeclassifyResultWithheldKey])
+	assert.Equal(t, "apr-9", got[audit.DeclassifySpentApprovalKey])
+	assert.NotContains(t, got, audit.DeclassifyNotAppliedKey,
+		"there are no pending labels to report, so a consumer must not expect this key beside the withheld one")
 }
 
 // TestEnforcedForwardCore_CommitFaultIsRecordedOnTheAllow is the residual, and it now fails
@@ -327,7 +448,7 @@ func TestEnforcedForwardCore_StandingGrantStampsNoSpentID(t *testing.T) {
 	got := rec.records[0]
 	assert.Equal(t, []string{capability.FlowLabelPII}, got.labelsCleared)
 	assert.Nil(t, got.details[audit.DeclassifySpentApprovalKey], "nothing was spent, so there is nothing to reconcile")
-	assert.Equal(t, true, got.details["flow"],
+	assert.Equal(t, true, got.details[capability.FlowAuditDetailKey],
 		"every declassification event carries the information-flow discriminator, including this one")
 }
 
@@ -458,7 +579,7 @@ func TestEnforcedForwardCore_MissingCommitterIsRecordedNotSilent(t *testing.T) {
 	assert.Empty(t, rec.records[0].labelsCleared)
 }
 
-// TestDeclassifyDetailKeys_SignAndVerifyRoundTrip puts the three declassification detail
+// TestDeclassifyDetailKeys_SignAndVerifyRoundTrip puts the four declassification detail
 // keys through a real sink and the tamper-evident verifier, so they are covered by the record
 // HMAC and survive the chain intact.
 //
@@ -476,9 +597,18 @@ func TestDeclassifyDetailKeys_SignAndVerifyRoundTrip(t *testing.T) {
 		audit.DeclassifySpentApprovalKey: "apr-9",
 	}, nil, false, nil, []string{capability.FlowLabelPII})
 	rs.RecordDeny(context.Background(), "s", "sanitize", "tools/call", codeUpstreamError, "", map[string]interface{}{
-		"flow":                           true,
+		capability.FlowAuditDetailKey:    true,
 		audit.DeclassifyNotAppliedKey:    []string{capability.FlowLabelPII},
 		audit.DeclassifySpentApprovalKey: "apr-10",
+	}, false)
+	// The redaction exit's shape, whose withheld-result key is the newest of the four: a
+	// boolean rather than a label list, so its JSON form is one the chain has not carried
+	// before on this family of keys.
+	rs.RecordDeny(context.Background(), "s", "sanitize", "tools/call", capability.ErrCodeEnforcementError, "", map[string]interface{}{
+		capability.FlowAuditDetailKey:     true,
+		audit.DeclassifyNotAppliedKey:     []string{capability.FlowLabelPII},
+		audit.DeclassifyResultWithheldKey: true,
+		audit.DeclassifySpentApprovalKey:  "apr-11",
 	}, false)
 	require.NoError(t, sink.Close())
 
@@ -489,6 +619,8 @@ func TestDeclassifyDetailKeys_SignAndVerifyRoundTrip(t *testing.T) {
 		`"` + audit.DeclassifySpentApprovalKey + `":"apr-9"`,
 		`"` + audit.DeclassifyNotAppliedKey + `":["pii"]`,
 		`"` + audit.DeclassifySpentApprovalKey + `":"apr-10"`,
+		`"` + audit.DeclassifyResultWithheldKey + `":true`,
+		`"` + audit.DeclassifySpentApprovalKey + `":"apr-11"`,
 	} {
 		assert.Contains(t, string(data), want)
 	}
@@ -499,7 +631,7 @@ func TestDeclassifyDetailKeys_SignAndVerifyRoundTrip(t *testing.T) {
 	res, err := audit.VerifyLog(bytes.NewReader(data), audit.NewVerifier(keys), "", time.Time{}, &out)
 	require.NoError(t, err)
 	assert.True(t, res.OK(), "the declassification detail keys must verify under the record HMAC:\n%s", out.String())
-	assert.Equal(t, 2, res.Valid)
+	assert.Equal(t, 3, res.Valid)
 }
 
 // TestEnforcedForwardCore_ConcurrentSinkStaysBlockedDuringTheForward is the regression test
@@ -714,7 +846,7 @@ func TestEnforcedForwardCore_SpentGrantIsNamedWithoutPendingLabels(t *testing.T)
 		SpentApprovalID: "apr-9",
 		Denial: &capability.DenialInfo{
 			Code: capability.ErrCodeConditionFailed, ConditionType: capability.DirectiveTypeDeclassify,
-			HardDeny: true, Details: map[string]interface{}{"flow": true, "phase": "record"},
+			HardDeny: true, Details: map[string]interface{}{capability.FlowAuditDetailKey: true, "phase": "record"},
 		},
 	}
 	fp := forwardParams{rec: rec, sessionID: "s", committer: spy, callUpstream: cleanUpstream()}

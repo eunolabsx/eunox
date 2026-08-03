@@ -11,6 +11,30 @@ const ConditionTypeFlowLabel = "flowLabel"
 // source half of information-flow control.
 const DirectiveTypeLabelOutput = "labelOutput"
 
+// FlowAuditDetailKey is the cross-cutting discriminator every information-flow event
+// carries in its audit `details` map, so ONE filter finds all of them on the tape: the
+// flowLabel sink denial, the two label/ledger record faults, the declassify refusal, and
+// the transport's own declassification annotations.
+//
+// That property is only as strong as the spelling agreeing across every producer, and the
+// producers are no longer in one package: pkg/enforcement writes it on four paths and
+// internal/transport on one, where the records that would silently stop matching an
+// operator's flow query are exactly the ones nothing else on the tape reports. A rename or
+// typo on either side splits the filter without failing anything — the tape stays
+// well-formed, signed and chain-verifiable, and the query just quietly returns less. Hence
+// one constant the producers share, following the same rule internal/audit's reserved
+// detail keys already follow.
+//
+// pkg/capability is its home because pkg/ cannot import internal/, and this is a value
+// pkg/enforcement and internal/transport both need — the same reason BoundString and
+// TruncateUTF8 live here rather than in either consumer.
+//
+// It is a filter AID, not evidence. Two of the transport's declassification details ride an
+// allow record whose `details` is the caller's own argument map under --audit, where a bare
+// key is caller-writable; a rule that must not be forgeable matches the reserved
+// `_eunox_declassify_*` keys instead (see internal/audit).
+const FlowAuditDetailKey = "flow"
+
 // The native flow-label vocabulary: a closed, flat set of provenance/integrity
 // source classes. It is deliberately small (no partial order, no lattice) — a flow
 // label is an opaque tag the policy asserts, never a value the engine infers from

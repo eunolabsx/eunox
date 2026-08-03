@@ -712,7 +712,7 @@ func TestValidateArgumentSchema_TypeKeyword_ObjectAdditionalProperties(t *testin
 // TestValidateArgumentSchema_EnumNumericBridge verifies the enum check bridges
 // the int/float64 type gap: an enum populated with bare Go ints (as a
 // programmatic or embedded caller writes it) must match a request argument that
-// arrives as float64 from JSON decoding, matching handleAllowedValues. Values
+// arrives as float64 from JSON decoding, matching EvaluateAllowedValues. Values
 // outside the enum are still denied.
 func TestValidateArgumentSchema_EnumNumericBridge(t *testing.T) {
 	t.Parallel()

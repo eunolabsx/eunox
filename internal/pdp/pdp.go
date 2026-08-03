@@ -407,6 +407,25 @@ func IsKillSwitchDenial(d *capability.DenialInfo) bool {
 // incomplete. now comes from clockNow (a nil clock falls back to the wall clock),
 // so a frozen test clock is honored on the deny path identically to the allow path.
 func denyResponse(clock enforcement.Clock, code, condType, message string) capability.EnforceResponse {
+	return denyResponseWithDetails(clock, code, condType, message, nil)
+}
+
+// denyResponseWithDetails is denyResponse for a deny that carries structured details, and it
+// is the ONE place in this package that may set Denial.Details.
+//
+// The bound lives here rather than at each call site for the reason pkg/enforcement gives for
+// putting it inside its own denyResponse: a denial's details echo caller-controlled values —
+// the argument that missed the allowlist, the operation that was refused — so every denied
+// call is otherwise a lever on signed-log growth at whatever rate the caller can issue them.
+// A rule each producer has to remember is a rule that gets forgotten silently: the deny stays
+// well-formed, signed and chain-verifiable, just unbounded. Routing denyResponse through this
+// with nil details means the bound is inherited by every deny this package builds, and setting
+// Denial.Details anywhere else is the mistake to catch in review.
+//
+// enforcement.BoundDenialDetails is deliberately NOT idempotent (see its doc), which is the
+// other reason there is exactly one funnel: a value bounded here must not pass through it
+// again.
+func denyResponseWithDetails(clock enforcement.Clock, code, condType, message string, details map[string]interface{}) capability.EnforceResponse {
 	return capability.EnforceResponse{
 		Decision:  capability.DecisionDeny,
 		RequestID: enforcement.NewRequestID(),
@@ -415,8 +434,29 @@ func denyResponse(clock enforcement.Clock, code, condType, message string) capab
 			Code:          code,
 			ConditionType: condType,
 			Message:       message,
+			Details:       enforcement.BoundDenialDetails(details),
 		},
 	}
+}
+
+// denyFromCondition builds this layer's deny from a verdict a SHARED condition evaluator
+// produced (enforcement.EvaluateAllowedValues today), so a refusal raised on the JWT
+// capability-claim path is the same refusal — code, condition type, and structured details —
+// the manifest path records for the same input.
+//
+// The details are the point. "One logical refusal, two record shapes depending only on
+// whether a token was involved" is the defect class this closes: the manifest path's
+// VALUE_NOT_PERMITTED carries details{argument, value, allowedValues} and the JWT path's
+// carried none, so a SIEM rule written against one found nothing for a token-scoped caller —
+// and the transport reads details["argument"] to name the offending argument in the
+// host-facing error, which that path could not do either.
+//
+// name — the capability-claim target this condition came from — is prefixed onto the shared
+// message rather than replacing it. A grant is one of an OR-list, so which entry refused is
+// the diagnostic a bare condition message cannot supply.
+func denyFromCondition(clock enforcement.Clock, name string, cerr *enforcement.ConditionError) capability.EnforceResponse {
+	return denyResponseWithDetails(clock, cerr.Code, cerr.ConditionType,
+		fmt.Sprintf("%q: %s", name, cerr.Message), cerr.Details)
 }
 
 // hardDenyResponse builds a deny that must never be downgraded to an audit-mode

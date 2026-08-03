@@ -685,8 +685,8 @@ func denyResponse(requestID, now string, auditOnly bool, obligations []capabilit
 	// Every deny the engine produces passes through here, and denial.Details is what
 	// the transport hands verbatim to RecordDeny — so this is the one place that can
 	// bound the caller-controlled values condition handlers echo without asking each
-	// handler's Details literal to remember. See boundDenialDetails.
-	denial.Details = boundDenialDetails(denial.Details)
+	// handler's Details literal to remember. See BoundDenialDetails.
+	denial.Details = BoundDenialDetails(denial.Details)
 	return capability.EnforceResponse{
 		RequestID:   requestID,
 		Decision:    capability.DecisionDeny,
@@ -699,7 +699,7 @@ func denyResponse(requestID, now string, auditOnly bool, obligations []capabilit
 
 // escalateResponse builds an escalate EnforceResponse — the effect ceiling's
 // needs-human-approval outcome — from the same envelope denyResponse builds, including
-// the boundDenialDetails pass every refusal's details must go through before they reach
+// the BoundDenialDetails pass every refusal's details must go through before they reach
 // the signed tape. It exists so the escalate decision does not become the one refusal
 // shape assembled as a struct literal, silently exempt from a bound the other twenty-odd
 // sites inherit by construction.
@@ -713,7 +713,7 @@ func denyResponse(requestID, now string, auditOnly bool, obligations []capabilit
 // unforwardable on an audit route — and an unforwardable refusal has no response to
 // redact, so obligations would have nothing to apply to.
 func escalateResponse(requestID, now string, denial capability.DenialInfo) capability.EnforceResponse {
-	denial.Details = boundDenialDetails(denial.Details)
+	denial.Details = BoundDenialDetails(denial.Details)
 	return capability.EnforceResponse{
 		RequestID: requestID,
 		Decision:  capability.DecisionEscalate,

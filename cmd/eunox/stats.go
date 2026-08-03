@@ -89,7 +89,7 @@ type auditStatsSummary struct {
 	observed     int // denials with audit_only=true  (call was forwarded)
 	escalated    int // decision=escalate: refused pending human approval (never forwarded)
 	declassified int // allows that cleared a flow label under a human approval (labels_cleared present)
-	// The three declassification facts that live in `details` rather than in a top-level
+	// The four declassification facts that live in `details` rather than in a top-level
 	// field, because none of them is a declassification that HAPPENED — which is all the
 	// signed labels_cleared/approver/approval_id triple may describe. Without a count here
 	// each was byte-indistinguishable from an ordinary allow or an ordinary UPSTREAM_ERROR
@@ -103,6 +103,15 @@ type auditStatsSummary struct {
 	// declassifyNotApplied is benign — the call was refused below the decision, so the
 	// labels were never removed — but it is what explains a spent grant beside it.
 	declassifyNotApplied int
+	// declassifyResultWithheld counts the refusals where the action EXECUTED and eunox
+	// dropped its result (response redaction failed). It usually overlaps the count above but
+	// is NOT a strict subset — a no-op clear under a single-use grant carries no not-applied
+	// labels — so it is reported on its own line. Counted separately because the operator's
+	// remedy differs: the sanitizing work is already done, so the re-minted approval
+	// re-delivers rather than re-runs. It is a proxy- or manifest-side defect rather than
+	// anything the caller or the upstream did, so a non-zero count means a redactFields
+	// directive and a real response shape disagree.
+	declassifyResultWithheld int
 	// spentApprovals counts single-use grants this log shows being burned, which is the
 	// reconciliation signal: an operator asking "which of my outstanding one-shot approvals
 	// are still live?" cannot answer it from approval_id, which appears only when the clear
@@ -190,7 +199,7 @@ func computeAuditStats(r io.Reader) (auditStatsSummary, error) {
 var declassifyProbe = []byte(audit.DeclassifyDetailPrefix)
 
 // addDeclassifyDetails tallies the declassification facts that ride in a record's `details`
-// map. It is the only place this tool reads details at all, and it reads exactly three keys.
+// map. It is the only place this tool reads details at all, and it reads exactly four keys.
 //
 // It probes the WHOLE record line rather than a captured `details` field, and decodes only
 // on a hit. Capturing details on the outer struct — even as a json.RawMessage — is not free:
@@ -220,6 +229,9 @@ func (s *auditStatsSummary) addDeclassifyDetails(line []byte) {
 	}
 	if _, ok := details[audit.DeclassifyNotAppliedKey]; ok {
 		s.declassifyNotApplied++
+	}
+	if _, ok := details[audit.DeclassifyResultWithheldKey]; ok {
+		s.declassifyResultWithheld++
 	}
 	if _, ok := details[audit.DeclassifyCommitFailedKey]; ok {
 		s.declassifyCommitFailed++
@@ -260,6 +272,18 @@ func printAuditStats(w io.Writer, s auditStatsSummary) {
 	if s.declassifyNotApplied > 0 {
 		wf("  (declassify-not-applied = %d refused call(s) whose approved clear was therefore never made; the labels were never removed, so nothing is under-tainted.)\n",
 			s.declassifyNotApplied)
+	}
+	// Its own line, not "of those": it usually accompanies the count above but can stand
+	// alone (a no-op clear under a single-use grant leaves no not-applied labels), so a
+	// subset phrasing would print under a heading that was never emitted. The remedy is what
+	// makes it worth separating — on every other refusal below the decision it is unknown
+	// whether the upstream ran anything, so a re-minted approval retries the work, while here
+	// the work is done and only its delivery failed. A non-zero count is also a signal in its
+	// own right: a redactFields directive and the real response shape disagree.
+	if s.declassifyResultWithheld > 0 {
+		wf("  (declassify-result-withheld = %d refused call(s) whose action had already EXECUTED upstream, with the result dropped because response redaction failed;\n"+
+			"   the sanitizing work is done, so a fresh approval re-delivers rather than re-runs it. Check the redactFields paths against the real response shape.)\n",
+			s.declassifyResultWithheld)
 	}
 	if s.spentApprovals > 0 {
 		wf("  (single-use approvals spent = %d; each is burned for good, including on a clear that changed nothing or a call that was then refused. Reconcile these against your outstanding one-shot approvals — details.%s names each.)\n",

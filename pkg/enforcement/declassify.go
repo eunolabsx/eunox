@@ -344,18 +344,18 @@ func (e *Engine) DeclassifyVerdictFor(ctx context.Context, req *capability.Enfor
 
 // declassifyRefusal builds the ESCALATION_REQUIRED refusal that replaces the allow for an
 // unauthorized declassification. Every arm goes through it (rather than building an
-// EnforceResponse literal) so the boundDenialDetails pass and the details shape are
+// EnforceResponse literal) so the BoundDenialDetails pass and the details shape are
 // single-sourced — details here carries manifest-authored and request-derived values, and
 // the one refusal a human is expected to read is exactly the one that must not carry an
 // unbounded value onto the signed tape.
 func (e *Engine) declassifyRefusal(requestID, now string, carriedLabels, want []string, extra map[string]interface{}, message, reason string) *capability.EnforceResponse {
 	details := map[string]interface{}{
-		// "flow": true marks this a flow-layer refusal, the same discriminator a
+		// FlowAuditDetailKey marks this a flow-layer refusal, the same discriminator a
 		// flowLabel sink denial carries, so one filter finds every information-flow
 		// event on the tape.
-		"flow":              true,
-		"declassify_labels": want,
-		"reason":            reason,
+		capability.FlowAuditDetailKey: true,
+		"declassify_labels":           want,
+		"reason":                      reason,
 	}
 	for k, v := range extra {
 		details[k] = v
@@ -486,7 +486,7 @@ func declassifyRecordFailureDenial(requestID, now string, auditOnly bool, spentA
 		ConditionType: declassifyConditionType,
 		Message:       "the declassification leg of this call's state commit failed; the approved clear was not applied and the call is refused",
 		HardDeny:      true,
-		Details:       map[string]interface{}{"flow": true, "phase": "record"},
+		Details:       map[string]interface{}{capability.FlowAuditDetailKey: true, "phase": "record"},
 	})
 	resp.SpentApprovalID = spentApprovalID
 	return resp

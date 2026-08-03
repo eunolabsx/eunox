@@ -68,7 +68,7 @@ linters:
     gocyclo:
       min-complexity: 30 # target: 15. Four functions above 30 are grandfathered.
     gocognit:
-      min-complexity: 60 # target: 30. Two functions above 60 are grandfathered.
+      min-complexity: 60 # target: 30. One function above 60 is grandfathered.
     nestif:
       min-complexity: 13 # target: 6. Current max 12 (audit chain-resume blocks).
     dupl:
@@ -109,14 +109,12 @@ linters:
       #     grandfathered name) is now a two-line wrapper around
       #     buildLiveReport + renderLiveReport and carries none of the
       #     complexity; the entry moved with the logic when the function split.
-      #   evaluateJWTConditions: re-implements the engine's condition handlers
-      #     (cognit 70) -> route through engine.EvaluateConditions.
       - linters:
           - gocyclo
         text: 'func `(validateLocalManifest|\(\*GatewayConfig\)\.Validate|VerifyLog|renderLiveReport)` is high'
       - linters:
           - gocognit
-        text: 'func `(validateLocalManifest|evaluateJWTConditions)` is high'
+        text: 'func `validateLocalManifest` is high'
       # Length grandfathers (above the 110-line / 70-statement ceiling): the CLI
       # entry points (cmdProxy, cmdValidate, serveHTTPGateway), the audit-sink
       # constructor (openAuditSink), the POST dispatcher (handleMCPPost), the

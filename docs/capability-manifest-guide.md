@@ -2444,11 +2444,30 @@ what happened; so does an allow whose commit faulted:
 | --- | --- |
 | `_eunox_declassify_spent_approval_id` | a **single-use** grant this call burned. Stamped on the allow and on any refusal, and whether or not a label moved — the grant is spent in every one of those cases |
 | `_eunox_declassify_not_applied` | the call was refused below the decision, so the approved clear was never made. Benign: the labels were never removed |
+| `_eunox_declassify_result_withheld` | the action **executed** and eunox dropped its result. Stamped only at the **redaction-failure** gate, and only when that gate's reply passes the same success test the commit path uses — so the sanitizing work is done and only the delivery failed. Usually rides beside the key above; stands alone on a no-op clear under a `once` grant |
 | `_eunox_declassify_commit_failed` | the call **ran** and the clear could not be applied. The session keeps taint the policy says the action dropped, so later sinks over-block until you retry under a new approval |
 
-`_eunox_declassify_commit_failed` is the one to alert on. None of the three reuses
+`_eunox_declassify_commit_failed` is the one to alert on. None of the four reuses
 `approval_id`, the top-level signed field, which keeps meaning "a declassification
 that actually took effect".
+
+The three gates are not one case, which is why the withheld-result key exists.
+`--require-audit=strict` blocks before the forward and an upstream transport failure
+can follow a side effect that already happened, so for both it is genuinely unknown
+whether the upstream ran anything. Only the redaction gate is reached after a reply
+came back. "A reply came back" is not the same as "the action succeeded", though, and
+the key claims the second: a reply flagged `isError`, a reply carrying an error member
+beside a result, or bytes eunox cannot interpret can all reach that gate and fail
+redaction, and an upstream can produce any of them at will. So the key is stamped only
+for a reply that passes the same success test the clear itself is gated on; anything
+else records the plain "clear did not take effect" shape.
+
+The clear is withheld either way — the sanitized result never reached the host, so
+nothing sanitized entered the session, which is what a flow label tracks — but the
+burned `once` grant then costs a re-minted approval for a proxy- or manifest-side
+defect. This key is what tells you whether that approval is retrying the work or
+re-delivering work already done. A non-zero count is also a signal in its own right: a
+`redactFields` path and the real response shape disagree.
 
 The `_eunox_` prefix marks a key eunox injects rather than one a caller sent: two
 of these ride an **allow** record, whose `details` is the caller's own argument map

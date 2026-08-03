@@ -533,7 +533,7 @@ func writeTargetEntry(sb *strings.Builder, t *observedTarget, maxValues int) {
 		case name == "":
 			// An empty argument name (MCP arguments are an arbitrary JSON object, so
 			// {"": "x"} is legal and survives into the mined args). Both the manifest
-			// loader (validateAllowedValues) and the engine (handleAllowedValues ->
+			// loader (validateAllowedValues) and the engine (EvaluateAllowedValues ->
 			// CONDITION_FAILED) reject an allowedValues with an empty argument name, so
 			// emitting one would yield an unloadable draft that denies the observed
 			// call. Leave it unconstrained, like the other "would deny the observed

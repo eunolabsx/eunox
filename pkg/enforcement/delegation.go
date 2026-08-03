@@ -106,8 +106,10 @@ func (e *Engine) checkDelegationEffectClass(req *capability.EnforceRequest, eff 
 func delegationDenial(auditOnly bool, requestID, now, reason, hop, message string, extra map[string]interface{}) *capability.EnforceResponse {
 	details := map[string]interface{}{
 		// "delegation": true is the discriminator every refusal on this axis carries, so one
-		// filter finds every attenuation event on the tape — the same role "flow": true plays
-		// for the information-flow events.
+		// filter finds every attenuation event on the tape — the same role
+		// capability.FlowAuditDetailKey plays for the information-flow events. This one has a
+		// single producer, so it stays a literal; that one has five across two packages,
+		// which is why it does not.
 		"delegation": true,
 		"reason":     reason,
 	}

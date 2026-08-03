@@ -645,6 +645,72 @@ Section conventions:
 
 ### Fixed
 
+- **A withheld result is no longer recorded as a call that may never have run.** Three
+  gates below the decision refuse a call whose approved declassification therefore never
+  commits, and all three shared one record shape. They do not share one fact:
+  `--require-audit=strict` blocks before the forward and an upstream transport failure can
+  follow a side effect that already happened, so for both it is genuinely unknown whether
+  the upstream executed anything — while the **redaction-failure** gate is reached only
+  after a reply came back — and "a reply came back" is not the same claim. A reply flagged
+  `isError`, a reply carrying an error member beside a result, or bytes eunox cannot interpret
+  can all reach that gate and fail redaction, and an upstream can produce any of them at will,
+  so the executed fact is stamped only for a reply that passes the same success test the clear
+  itself is gated on. The clear is still withheld on that
+  exit (the sanitized result never reached the host, so nothing sanitized entered the
+  session, which is what a flow label tracks), but the burned `once` grant is then spent for
+  a proxy- or manifest-side defect. That refusal now stamps
+  `details._eunox_declassify_result_withheld` beside `_eunox_declassify_not_applied`, and
+  `eunox stats` counts it, so an operator reconciling the spent grant can tell "retry the
+  work" from "the work is done, only the delivery failed" — a distinction the tape did not
+  carry. A non-zero count is also its own signal: a `redactFields` path and the real
+  response shape disagree.
+
+- **`allowedValues` is one predicate instead of two, and every JWT condition denial now
+  carries details.** The JWT capability-claim path hand-copied the engine's
+  `handleAllowedValues` — argument resolution, the `MISSING_CONTEXT` arm, the match, the
+  `VALUE_NOT_PERMITTED` arm — and the copy had drifted on two axes: no empty-argument guard,
+  and no structured `details`. One logical refusal therefore reached the signed tape with
+  **two shapes** depending only on whether a token was involved, so a SIEM rule written
+  against the manifest path's `allowedValues` denial found nothing for a token-scoped caller,
+  and the host-facing error could not name the offending argument (the transport builds it
+  from `details.argument`). The same mechanism had already shipped a live defect once, when
+  task-variable resolution was added on the manifest side only and every grant carrying a
+  `${task.*}` reference denied every call under it. Both paths now call one exported,
+  **non-committing** predicate (`enforcement.EvaluateAllowedValues`), so a semantic added to
+  it reaches both by construction.
+
+  The sibling `allowedOperations` arm had the same detail-less denials and keeps its own
+  deliberately different scan-all-arguments semantics, so it cannot share the handler — but it
+  now shares the record **shape**, emitting the same `details` keys the engine records for the
+  same denial code. Every deny this layer builds routes through one funnel that applies the
+  bound `pkg/enforcement` applies to its own, so a denial's echo of a caller-supplied value
+  cannot reach the tape at the caller's chosen length, and a future producer inherits the bound
+  instead of having to remember it. `enforcement.BoundDenialDetails` is the exported name for
+  that bound (it replaces the unexported spelling; it is deliberately not idempotent, so it
+  belongs at a funnel and nowhere else). A typed-nil condition handed to any handler now denies
+  rather than panicking the request goroutine.
+
+- **One audit-details merge, one aliasing semantic.** `internal/transport` had two
+  implementations of "fold extra keys into a details map" roughly 200 lines apart, with
+  different aliasing behavior: one returned its base map itself when there was nothing to
+  add, the other always allocated. The always-allocating one was load-bearing — its base is
+  the caller's live parsed argument map under `--audit`, and it writes the effect receipt in
+  afterwards — so the obvious cleanup of swapping in the helper that now existed in the same
+  package would have written a key the caller never sent into the request's own argument
+  map, and the signed record would have misreported the request it describes. There is now
+  one merge with one semantic (always allocate, except when there is nothing to own, which
+  preserves nil-vs-empty), both sites call it, and annotations go through the merge's input
+  rather than being written into its result.
+
+- **The `flow` audit discriminator is one shared constant.** `details.flow = true` is the
+  cross-cutting marker every information-flow event carries so that one filter finds them
+  all, and it was five independently typed string literals across two packages. A rename or
+  typo on either side splits an operator's flow query while **nothing fails** — the tape
+  stays well-formed, signed and chain-verifiable, and the query just returns less — and the
+  records that would vanish from it are the transport-side declassification annotations
+  nothing else on the tape reports. It is now `capability.FlowAuditDetailKey`, in the one
+  package both producers can import, with a test that fails on any respelling.
+
 - **`resources/unsubscribe` is enforced instead of denied.** It was mapped nowhere, so it
   fell to the fail-closed default in every mode and no manifest spelling could allow it: a
   host that subscribed to a permitted resource could never cancel through the proxy, and
