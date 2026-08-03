@@ -167,7 +167,7 @@ func (g *decisionSerializer) takeOn(q *ticketQueue) decisionTicket {
 // side of this seam pays once per session; there is no reason for the transport with a
 // SINGLE anchor to pay it per request. The keying stays because it is what makes the
 // primitive right for a caller that ever resolves more than one.
-func (g *decisionSerializer) hold(anchor string) (*ticketQueue, func()) {
+func (g *decisionSerializer) hold(anchor string) (queue *ticketQueue, unpin func()) {
 	if g == nil {
 		return nil, func() {}
 	}

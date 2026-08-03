@@ -133,12 +133,12 @@ func newAnchorGates() *anchorGates {
 //
 // A nil registry yields a nil gate and a no-op drop, so a non-serialized route needs no branch
 // at the call site.
-func (g *anchorGates) hold(key string) (*anchorGate, func()) {
+func (g *anchorGates) hold(key string) (gate *anchorGate, drop func()) {
 	if g == nil {
 		return nil, func() {}
 	}
 	g.mu.Lock()
-	gate := g.gates[key]
+	gate = g.gates[key]
 	if gate == nil {
 		gate = &anchorGate{turn: make(chan struct{}, 1), registry: g, key: key}
 		g.gates[key] = gate
