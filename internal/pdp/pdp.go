@@ -119,9 +119,12 @@ type PolicyDecisionPoint interface {
 	ReleaseSession(ctx context.Context, sessionID string)
 
 	// CommitDeclassified applies an approved declassification's label clear, for a call the
-	// decision AUTHORIZED and the transport has now actually performed. labels is the
-	// decision's LabelsPendingClear — what the approval authorized, not what will
-	// necessarily change.
+	// decision AUTHORIZED and the transport has now actually performed. decl is the
+	// decision's own handle (EnforceResponse.Declassification) — what the approval
+	// authorized, not what will necessarily change — and is the only thing that names a
+	// clearable set: the handle carries it unexported, so no caller of this can clear a label
+	// its decision did not authorize. A nil handle is the no-declassification case and is a
+	// no-op, which is every call in a deployment with no declassify directive.
 	//
 	// It is on this interface because the two halves sit on opposite sides of it. Decide
 	// resolves the approval, burns a single-use grant, and hands back the labels to clear;
@@ -151,7 +154,7 @@ type PolicyDecisionPoint interface {
 	// and reporting success. Detach cancellation only (context.WithoutCancel), never the
 	// values. This differs from ReleaseSession above, which owns only session-anchored state
 	// and may be fully detached.
-	CommitDeclassified(ctx context.Context, sessionID string, labels []string) (cleared []string, err error)
+	CommitDeclassified(ctx context.Context, sessionID string, decl *capability.Declassification) (cleared []string, err error)
 
 	// HardenRefusal re-stamps a refusal that some OTHER layer produced with the verdicts
 	// THIS PDP would have contributed had it been consulted, and returns the composed
@@ -604,7 +607,7 @@ func (AlwaysAllowPDP) RecordObservedToolHashes(_ context.Context, result json.Ra
 func (AlwaysAllowPDP) ReleaseSession(_ context.Context, _ string) {}
 
 // CommitDeclassified never clears anything: a wiretap PDP holds no flow store and
-// authorizes no declassification, so no decision it returns can carry a LabelsPendingClear.
+// authorizes no declassification, so no decision it returns can carry a commit handle.
 //
 // Reaching it WITH labels therefore means some other layer authorized a clear this one
 // cannot perform, and that is reported as an error rather than as a silent empty result.
@@ -612,8 +615,8 @@ func (AlwaysAllowPDP) ReleaseSession(_ context.Context, _ string) {}
 // empty result means "the clear ran and moved nothing", which for a wiring fault would put
 // an ordinary allow on the tape for a policy whose sanitizing step never takes effect. The
 // old contract carried a `restored bool` for exactly this distinction.
-func (AlwaysAllowPDP) CommitDeclassified(_ context.Context, _ string, labels []string) ([]string, error) {
-	return nil, noFlowStateErr(labels, "audit-mode (wiretap) decision point")
+func (AlwaysAllowPDP) CommitDeclassified(_ context.Context, _ string, decl *capability.Declassification) ([]string, error) {
+	return nil, noFlowStateErr(decl, "audit-mode (wiretap) decision point")
 }
 
 // HardenRefusal returns the refusal unchanged: a wiretap PDP declares no pin, no ceiling
@@ -719,23 +722,26 @@ func (DenyAllPDP) ReleaseSession(_ context.Context, _ string) {}
 
 // CommitDeclassified never clears anything: the fail-closed default allows nothing, so no
 // decision it returns can authorize a clear. Same reporting rule as AlwaysAllowPDP's.
-func (DenyAllPDP) CommitDeclassified(_ context.Context, _ string, labels []string) ([]string, error) {
-	return nil, noFlowStateErr(labels, "deny-all (no policy) decision point")
+func (DenyAllPDP) CommitDeclassified(_ context.Context, _ string, decl *capability.Declassification) ([]string, error) {
+	return nil, noFlowStateErr(decl, "deny-all (no policy) decision point")
 }
 
-// noFlowStateErr builds the fault a decision point returns when it is handed labels to clear
-// and holds no flow state to clear them from, or nil for the empty set (where "cleared
-// nothing" and "nothing to clear" are genuinely the same state).
+// noFlowStateErr builds the fault a decision point returns when it is handed a clear to apply
+// and holds no flow state to apply it to, or nil for a handle that authorizes no clear (where
+// "cleared nothing" and "nothing to clear" are genuinely the same state).
 //
 // It exists so the several no-op implementations report identically. Each of them means the
 // same thing — the policy's sanitizing step will not take effect on this path — and a silent
 // empty result would make that indistinguishable from an approved clear whose labels the
 // anchor was not carrying, which is a routine, healthy outcome.
-func noFlowStateErr(labels []string, who string) error {
-	if len(labels) == 0 {
+//
+// It does NOT claim the handle: this path clears nothing, so consuming the single-use
+// authorization would leave a correctly-wired retry with nothing to commit.
+func noFlowStateErr(decl *capability.Declassification, who string) error {
+	if !decl.PendingClear() {
 		return nil
 	}
-	return fmt.Errorf("%s holds no flow-label state, so the approved declassification of %v cannot be applied (wiring fault, not a store failure)", who, labels)
+	return fmt.Errorf("%s holds no flow-label state, so the approved declassification of %v cannot be applied (wiring fault, not a store failure)", who, decl.Labels())
 }
 
 // HardenRefusal returns the refusal unchanged: the "no policy" default declares no pin, no
@@ -1116,21 +1122,21 @@ func (p *ManifestPDP) ReleaseSession(ctx context.Context, sessionID string) {
 // never asked to drop. Every other field of the request is irrelevant here —
 // CommitDeclassification is a keyed read-then-Remove and evaluates no policy — so this
 // deliberately does not rebuild the decision's target or arguments.
-func (p *ManifestPDP) CommitDeclassified(ctx context.Context, sessionID string, labels []string) ([]string, error) {
+func (p *ManifestPDP) CommitDeclassified(ctx context.Context, sessionID string, decl *capability.Declassification) ([]string, error) {
 	// p == nil covers a typed-nil (*ManifestPDP)(nil) reaching the transport's committer
 	// interface, where the caller's `!= nil` check passes and the dereference below would
 	// panic a request goroutine after the upstream call has already run.
 	if p == nil || p.engine == nil {
 		// A PDP with no engine holds no flow store, so the clear cannot happen. Reported as a
 		// fault, not as an empty result: see noFlowStateErr.
-		return nil, noFlowStateErr(labels, "manifest decision point with no engine")
+		return nil, noFlowStateErr(decl, "manifest decision point with no engine")
 	}
 	// The claims come from the context so the request resolves to the SAME anchor the
 	// decision used; see the interface's context contract.
 	return p.engine.CommitDeclassification(ctx, &capability.EnforceRequest{
 		SessionID: sessionID,
 		Claims:    jwtClaimsAsMap(ctx),
-	}, labels)
+	}, decl)
 }
 
 // Decide evaluates a tools/call against the manifest: it selects the
@@ -1853,6 +1859,15 @@ func composeHardened(r, verdict capability.EnforceResponse) capability.EnforceRe
 		out.Denial = &denial
 	}
 	out.AuditOnly = out.AuditOnly && r.AuditOnly
+	// Carry the refusal being hardened's declassification handle when the harder verdict has
+	// none of its own. It is the one field whose LOSS is silent and unrecoverable: a handle on
+	// a refusal names a single-use grant the decision already burned, and this record is the
+	// only one that will ever name it, so replacing the response wholesale would spend an
+	// operator's approval with nothing on the tape to reconcile. Nothing else here needs
+	// carrying — the harder verdict is the authoritative one for every other field.
+	if out.Declassification == nil {
+		out.Declassification = r.Declassification
+	}
 	return out
 }
 
@@ -3735,6 +3750,24 @@ func JWTClaimsPtr(ctx context.Context) *JWTClaims {
 		return c
 	}
 	return nil
+}
+
+// TaskAnchor reports the validated task id a task-anchored engine would key this caller's
+// accumulated state on, and whether there is one. Empty/absent for a caller with no token, a
+// token with no mcp.task_id, and a non-string or whitespace-only claim alike.
+//
+// It exists so a caller ABOVE the engine — the transport, deciding which decision turn a
+// request takes — resolves the anchor exactly as the engine's own key builder does. The
+// transport must serialize on the key the state actually lives on, and a second, hand-rolled
+// "read task_id off the claims" is precisely where the gate and the key would come to
+// disagree; the two must agree even about the cases that are NOT a task (a padded claim, a
+// numeric one), because each of those keys the state on the session.
+//
+// It reads the typed, already-VALIDATED claims. A caller must never resolve this from an
+// unverified token: the anchor decides which callers share a turn, so a caller who could
+// choose it could choose not to share one.
+func TaskAnchor(claims *JWTClaims) (string, bool) {
+	return capability.ResolveTaskVar(capability.TaskVarID, claims.flatMap())
 }
 
 // agentIDFromContext returns the agent_id from any JWT claims stored in ctx,

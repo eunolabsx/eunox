@@ -12,21 +12,22 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestGrammarTables_CoverTheWholeVocabulary is the gate that keeps this package's two
-// hand-maintained grammar tables in step with pkg/capability's prototype registries.
+// TestGrammarClassification_CoversTheWholeVocabulary is the gate that keeps the loader's
+// schemaVersion check total over pkg/capability's prototype registries.
 //
-// The registries made the vocabulary derivable INSIDE pkg/capability — the decoder, the
-// unknown-type message, the permitted-key sets and the published schema's drift guard all
-// read them. The classification a manifest load depends on lives one package over, and was
-// not derived from anything: tokenGrammarVersions was consulted with a comma-ok, so a token
-// absent from it was silently admitted under schemaVersion "0.1". That is the fail-OPEN
-// direction on the one guard whose entire job is stopping a later revision's predicate from
-// widening an earlier one, and no test in the tree walked the registries against it.
+// The classification a manifest load depends on used to live here, as two hand-maintained
+// maps: one naming the tokens a later revision introduced, one naming the base grammar. That
+// split made a state representable that a test had to exclude rather than the types — a token
+// filed in BOTH, or (the one that matters) filed in the WRONG one, which admits a "0.2"
+// predicate under a "0.1" manifest. The revision now rides the registry entry that declares
+// the token exists, so there is one answer per token by construction and this test asserts
+// only that every entry declares one.
 //
-// Every discriminator must now be classified into exactly one of the two tables. Being in
-// neither is refused at load (checkTokenRevision), so this test is the build-time half of a
-// gate that also fails closed at runtime.
-func TestGrammarTables_CoverTheWholeVocabulary(t *testing.T) {
+// A token TokenSince cannot classify is refused at load under every revision
+// (checkTokenRevision), so this is the build-time half of a gate that also fails closed at
+// runtime.
+func TestGrammarClassification_CoversTheWholeVocabulary(t *testing.T) {
+	published := map[string]bool{ManifestSchemaVersion01: true, ManifestSchemaVersion02: true}
 	for _, tc := range []struct {
 		kind   string
 		tokens []string
@@ -36,37 +37,24 @@ func TestGrammarTables_CoverTheWholeVocabulary(t *testing.T) {
 	} {
 		for _, token := range tc.tokens {
 			t.Run(tc.kind+"/"+token, func(t *testing.T) {
-				_, gated := tokenGrammarVersions[token]
-				base := baseGrammarTokens[token]
-				assert.False(t, gated && base,
-					"%q is in BOTH tables; it cannot be a base-grammar token and one a later revision introduced", token)
-				assert.True(t, gated || base,
-					"%q is in NEITHER tokenGrammarVersions nor baseGrammarTokens, so no manifest can carry it. "+
-						"A token introduced after \"0.1\" belongs in tokenGrammarVersions (with a test asserting it is REFUSED under \"0.1\"); "+
-						"one that is part of the base grammar belongs in baseGrammarTokens", token)
+				since, classified := capability.TokenSince(token)
+				require.True(t, classified,
+					"%q declares no Since on its pkg/capability prototype registry entry, so no manifest can carry it. "+
+						"Every entry needs the published schemaVersion that introduced its discriminator", token)
+				assert.True(t, published[since],
+					"%q declares Since %q, which is not a published grammar revision", token, since)
 			})
 		}
 	}
 }
 
-// TestGrammarTables_NameOnlyRealTokens is the reverse direction. A stale entry — a token
-// renamed or removed from the registry, with its classification left behind — is not
-// fail-open, but it is a dead line that makes the tables look maintained while the real
-// token is unclassified. The forward test above would still catch the real one; this names
-// the leftover so the fix is obvious rather than a second puzzle.
-func TestGrammarTables_NameOnlyRealTokens(t *testing.T) {
-	known := map[string]bool{}
-	for _, c := range capability.KnownConditionTypes() {
-		known[c] = true
-	}
-	for _, d := range capability.KnownDirectiveTypes() {
-		known[d] = true
-	}
-	for token := range tokenGrammarVersions {
-		assert.True(t, known[token], "tokenGrammarVersions names %q, which is in neither prototype registry", token)
-	}
-	for token := range baseGrammarTokens {
-		assert.True(t, known[token], "baseGrammarTokens names %q, which is in neither prototype registry", token)
+// TestGrammarClassification_RejectsUnknownTokens is the reverse direction: TokenSince must
+// not classify something the registries do not model. It is what keeps the loader's gate from
+// silently accepting a token this build cannot instantiate.
+func TestGrammarClassification_RejectsUnknownTokens(t *testing.T) {
+	for _, token := range []string{"", "no-such-token", "maxCall", "FLOWLABEL"} {
+		_, classified := capability.TokenSince(token)
+		assert.False(t, classified, "%q is in neither prototype registry and must not be classified", token)
 	}
 }
 
@@ -133,7 +121,7 @@ func TestUnclassifiedTokenIsRefused(t *testing.T) {
 	err := checkTokenGrammarVersion(m)
 	require.Error(t, err, "an unclassified token must not be admitted under any revision")
 	assert.Contains(t, err.Error(), "not classified into any published schemaVersion")
-	assert.Contains(t, err.Error(), "tokenGrammarVersions", "and the message must say how to fix it")
+	assert.Contains(t, err.Error(), "Since", "and the message must say how to fix it")
 
 	// The same manifest under the later revision is refused identically: the gate is about
 	// classification, not about which revision was declared.
@@ -142,14 +130,18 @@ func TestUnclassifiedTokenIsRefused(t *testing.T) {
 }
 
 // TestFlowAndEffectTokensAreRefusedUnder01 is the assertion CONTRIBUTING requires for every
-// token a revision later than "0.1" introduced, applied to the whole set at once and derived
-// from the table rather than listed. Adding an entry to tokenGrammarVersions therefore
-// brings its "refused under 0.1" coverage with it.
+// token a revision later than "0.1" introduced, applied to the whole vocabulary at once and
+// derived from the registry rather than listed. Declaring a later Since on a registry entry
+// therefore brings its "refused under 0.1" coverage with it.
 func TestFlowAndEffectTokensAreRefusedUnder01(t *testing.T) {
-	for token, required := range tokenGrammarVersions {
+	for _, token := range allKnownTokens() {
+		required, classified := capability.TokenSince(token)
+		if !classified || required == ManifestSchemaVersion01 {
+			continue // base grammar; TestBaseGrammarTokensLoadUnderBothRevisions covers those
+		}
 		t.Run(token, func(t *testing.T) {
 			require.Equal(t, ManifestSchemaVersion02, required,
-				"a third revision needs its own refusal cases here, not just a map entry")
+				"a third revision needs its own refusal cases here, not just a registry entry")
 			c := constraintCarrying(t, token)
 			m := &LocalManifest{SchemaVersion: ManifestSchemaVersion01, Capabilities: []capability.Constraint{c}}
 			err := checkTokenGrammarVersion(m)
@@ -160,6 +152,12 @@ func TestFlowAndEffectTokensAreRefusedUnder01(t *testing.T) {
 			assert.NoError(t, checkTokenGrammarVersion(m), "%q must load under the revision that introduced it", token)
 		})
 	}
+}
+
+// allKnownTokens is the whole closed vocabulary — every condition and directive
+// discriminator — read from the prototype registries the classification now rides on.
+func allKnownTokens() []string {
+	return append(capability.KnownConditionTypes(), capability.KnownDirectiveTypes()...)
 }
 
 // constraintCarrying builds a constraint holding one token of the named type, whichever
@@ -173,7 +171,7 @@ func constraintCarrying(t *testing.T, token string) capability.Constraint {
 		return c
 	}
 	dir, ok := capability.NewDirectivePrototype(token)
-	require.True(t, ok, "%q is in tokenGrammarVersions but in neither prototype registry", token)
+	require.True(t, ok, "%q is classified but in neither prototype registry", token)
 	c.Directives = []capability.Directive{dir}
 	return c
 }
@@ -192,10 +190,14 @@ func (unknownDirective) ToObligation() capability.Obligation {
 }
 
 // TestBaseGrammarTokensLoadUnderBothRevisions pins the other half of the classification: a
-// base-grammar token is admitted under every published revision, so folding the two tables
-// into one gate did not narrow "0.1".
+// base-grammar token is admitted under every published revision, so deriving the gate from
+// one registry entry did not narrow "0.1" (the mirror mistake of admitting a "0.2" token
+// under it).
 func TestBaseGrammarTokensLoadUnderBothRevisions(t *testing.T) {
-	for token := range baseGrammarTokens {
+	for _, token := range allKnownTokens() {
+		if since, classified := capability.TokenSince(token); !classified || since != ManifestSchemaVersion01 {
+			continue
+		}
 		t.Run(token, func(t *testing.T) {
 			c := constraintCarrying(t, token)
 			for _, v := range []string{ManifestSchemaVersion01, ManifestSchemaVersion02} {

@@ -235,6 +235,52 @@ Section conventions:
 
 ### Changed
 
+- **BREAKING (pre-1.0): the declassification's four response fields are one commit handle,
+  and the commit takes nothing else.** `EnforceResponse.LabelsPendingClear`, `Approver`,
+  `ApprovalID` and `SpentApprovalID` are replaced by a single
+  `Declassification *capability.Declassification` — nil when the decision authorized no
+  clear, which is every call in a deployment with no `declassify` directive.
+  `Engine.CommitDeclassification` and `pdp.PolicyDecisionPoint.CommitDeclassified` take that
+  handle in place of a `[]string`.
+
+  The four fields had a populated-together-or-not-at-all rule that lived in prose, a presence
+  test (`len(LabelsPendingClear) > 0`) spelled at four sites, and a `SpentApprovalID` that
+  was never anything but `ApprovalID` plus one bit two sites had to keep in agreement — now
+  `SpentApprovalID()`, derived. The facts hang off one handle, so they can no longer disagree
+  about which decision produced them; what a record carries is still decided by the facts
+  (`PendingClear()`, `SpentApprovalID()`), not by the handle's presence. The load-bearing part
+  is the parameter: the second phase used
+  to accept an arbitrary label set, so an embedder holding an `*Engine` could clear any label
+  it named with no approval presented, no grant burned, no escalation raised, and nothing on
+  the tape — every gate the declassify surface installs sits on the FIRST phase. The handle
+  carries its authorized set unexported and claims single-use, so a clear cannot be widened
+  past what the decision authorized and an authorization cannot be replayed into two clears.
+  The burn of a `once` grant deliberately stays with the decision: two concurrent decisions
+  get two handles, so no per-handle flag could make a grant single-use across them, and the
+  atomic ledger admission is what does.
+
+  **Migration:** read `dec.Declassification` (nil-safe accessors: `Labels()`, `Approver()`,
+  `ApprovalID()`, `SpentApprovalID()`, `PendingClear()`) and hand the handle itself to the
+  commit once the action has SUCCEEDED. Implementers of `pdp.PolicyDecisionPoint` change
+  `CommitDeclassified`'s third parameter to `*capability.Declassification`; a decision point
+  that holds no flow state must still return an ERROR rather than an empty set, and must not
+  claim the handle (a path that cleared nothing must leave the authorization spendable).
+
+- **The decision turn is keyed on the state anchor, not on the session.** A
+  flow-/`sequenceBlock`-relevant route serializes its decision phase; that turn used to be a
+  per-session lock, which under `taskAnchoredState` did not span the key the state actually
+  lives on — two sessions sharing one validated `mcp.task_id` held independent turns over
+  shared state, so a source read on one could interleave with the two phases of a
+  declassifying call on the other. The turn is now handed out per anchor (the task where the
+  route anchors on it and the caller presented one, the session otherwise), resolved through
+  the same claim lookup the engine's own key builder uses. With `taskAnchoredState` off (the
+  default) the anchor is the session and the behaviour is unchanged. Two sessions on one task
+  now queue behind each other for the microseconds of a decision — and, for a declassifying
+  call, for its upstream round trip, which is the existing reason not to run `declassify`
+  with `--upstream-timeout=0`. The gate is in-process: instances sharing a Redis backend
+  still hold independent turns, and the decision-time intersection is what bounds that
+  residual — see `docs/threat-model-mcp.md` §3.13.
+
 - **`eunox stats` reports the declassification faults it previously could not see.** It
   decoded six top-level fields and never read `details` at all, so an approved clear that
   failed to apply was byte-indistinguishable from an ordinary allow, and a refused
@@ -644,6 +690,66 @@ Section conventions:
   script's retry pivot — the backend divergence that check exists to prevent).
 
 ### Fixed
+
+- **A single-use declassify grant spent on a no-op clear now reaches the tape on the success
+  path too.** A `once` approval is burned by the decision that accepts it even when the clear
+  resolves to nothing (the anchor was not carrying the approved labels) — burning only on a
+  clear that moved a label would make the grant replayable by ordering. The signed
+  `labels_cleared`/`approver`/`approval_id` triple rides only a clear that *changed* something,
+  so for that call the `_eunox_declassify_spent_approval_id` detail is the only record that can
+  ever name the grant — and the commit returned early without writing it. Every refusal path
+  named it; the path where the call actually succeeded did not, which is the reconciliation gap
+  backwards. An operator reconciling outstanding one-shot approvals would have believed that
+  one was still live.
+
+- **The grammar classification is derived from the prototype registry instead of two
+  hand-maintained tables.** `pkg/capability`'s condition and directive registries are the
+  declared single source of the vocabulary, but the classification a manifest load depends on
+  lived one package over as two lookalike maps — one naming the tokens a later revision
+  introduced, one naming the base grammar. That split made a wrong answer representable and
+  cheap: a `0.2` condition filed in the base-grammar table passes the completeness test (it
+  is classified, exactly once) and is then admitted under a `0.1` manifest, which is
+  precisely the widening the gate exists to prevent. Each registry entry now declares the
+  revision that introduced it (`Since`), the loader reads it through the new
+  `capability.TokenSince`, and a token with no `Since` is still refused under every revision —
+  the fail-closed direction, kept. Adding a token is two coordinated edits (registry, JSON
+  Schema branch) rather than three, and mis-classification is no longer expressible.
+  `config.ManifestSchemaVersion01`/`02` are now aliases of `capability.SchemaVersion01`/`02`,
+  so one revision has one spelling.
+
+- **The server-initiated leg derives its decision point the same way the host path does, and
+  refuses what it cannot honestly commit.** `dispatchParams.withPDP` exists so a field that
+  must be the *same* PDP the dispatcher decides with cannot be set independently of it;
+  `serverRequestParams` — the upstream→host leg both transports share — assigned `pdp`
+  directly at both of its construction sites, so neither the compiler nor a test could see a
+  derived field being forgotten. It now has its own `withPDP` constructor, and a source-level
+  guard fails the build if any params literal assigns `pdp` or `committer` directly.
+
+  The leg does **not** commit a declassification. It has no honest commit point: "delivered"
+  there means the request was buffered onto an SSE channel or written to stdout, and a
+  server-initiated request is answered later out of band — so the host path's commit gate (a
+  successful reply in hand) has no analogue, and committing on delivery would drop taint for
+  work that has not happened. A decision reaching that leg with a clear pending is therefore
+  **refused**, hard, with the burned grant named on the record. Unreachable today
+  (`requireSourceDirectiveTarget` refuses `declassify` on a `system:` target at load), which is
+  the point: that restriction lives in another package, and relaxing it now produces a loud
+  refusal rather than a silent wrong clear.
+
+- **The server-initiated leg no longer waits indefinitely for the decision turn.** It runs on
+  the session's single upstream-reader goroutine — the same goroutine that delivers every
+  upstream response — so blocking it behind a declassifying call's turn (held across a whole
+  upstream round trip, and unbounded when `--upstream-timeout` is `0`) stalled every in-flight
+  request on that session. Under task anchoring the turn holder can be a different session
+  entirely, which made it a cross-session stall. The leg now takes the turn with a bound and
+  fails the sampling request **closed** when it cannot get it: sampling is deny-by-default, and
+  refusing one request is cheaper than stalling a session's whole response path. The stdio
+  transport keeps waiting, deliberately — its gate is FIFO, so abandoning a ticket would stall
+  every later one, and its turn cannot span a second session.
+
+- **A declassifying call releases its turn as soon as the commit lands**, rather than when the
+  handler returns. Holding it through the audit enqueue and the client-facing response write
+  put a window bounded by *the client's* read behaviour inside a critical section that, under
+  task anchoring, other sessions queue on.
 
 - **A withheld result is no longer recorded as a call that may never have run.** Three
   gates below the decision refuse a call whose approved declassification therefore never

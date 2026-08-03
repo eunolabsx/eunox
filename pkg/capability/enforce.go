@@ -126,51 +126,37 @@ type EnforceResponse struct {
 	// in the fixed vocabulary order for a deterministic record; nil on a non-flow call.
 	LabelsOut     []string `json:"labelsOut,omitempty"`
 	CarriedLabels []string `json:"carriedLabels,omitempty"`
-	// LabelsPendingClear is the set of native flow labels an APPROVED declassify directive
-	// is authorized to remove from the session on this call, and Approver / ApprovalID
-	// identify the human approval that authorized it. All three are populated together or
-	// not at all: a declassification with no named approver is not one this proxy performs.
+	// Declassification is the authorized second phase of a flow-label clear: the labels an
+	// APPROVED declassify directive may remove from the anchor on this call, plus the
+	// approval that authorized them. Nil on every call that authorized none, which is every
+	// call in a deployment with no declassify directive — so "did this decision authorize a
+	// clear?" is one nil test.
 	//
-	// PENDING is the load-bearing word. The clear is NOT applied by the decision — it is
-	// applied by the caller, through CommitDeclassification, once the call has actually
-	// run. Committing it inside the decision made the labels invisible to every concurrent
-	// decision for the whole upstream round trip, so a sink the taint existed to stop could
-	// be allowed and forwarded while the sanitizing call was still in flight. Holding the
-	// labels until the action completes is what makes the flow claim hold under
-	// concurrency, and it does so without leaning on the transport's per-session decision
-	// lock — which does not span a task key two sessions share.
+	// AUTHORIZED, not applied, is the load-bearing distinction. The clear is performed by the
+	// CALLER, through CommitDeclassification, once the call has actually run. Applying it
+	// inside the decision made the labels invisible to every concurrent decision for the
+	// whole upstream round trip, so a sink the taint existed to stop could be allowed and
+	// forwarded while the sanitizing call was still in flight. Holding the labels until the
+	// action completes is what makes the flow claim hold under concurrency, and it does so
+	// without leaning on the transport's decision turn.
 	//
-	// A caller that never commits leaves the session as tainted as it found it. That is the
-	// fail-closed direction (a later sink over-blocks) and the reason this ordering is safe
-	// where the old one was not.
+	// The handle is what carries that obligation, and it is the ONLY thing the commit
+	// accepts: the authorized set is unexported, so the second phase cannot clear anything
+	// the first did not authorize (see Declassification). A caller that never commits leaves
+	// the session as tainted as it found it — the fail-closed direction, and the reason this
+	// ordering is safe where the old one was not.
 	//
-	// The audit record's own declassification fields — the TOP-LEVEL, HMAC-signed
-	// labels_cleared / approver / approval_id triple, none of which rides details — report
-	// what the commit actually CHANGED, not what was authorized here, so the tape never
-	// records a declassification that did not happen. Vocabulary-ordered for a
-	// deterministic record; nil on every other call.
-	LabelsPendingClear []string `json:"labelsPendingClear,omitempty"`
-	Approver           string   `json:"approver,omitempty"`
-	ApprovalID         string   `json:"approvalId,omitempty"`
-	// SpentApprovalID names a SINGLE-USE declassify approval this call burned in the
-	// ledger, and is populated whether or not the clear it authorized went on to change
-	// anything.
+	// It rides an ALLOW, and also the one refusal the engine itself produces after burning a
+	// grant (declassifyRecordFailureDenial), where it carries no labels and exists so the
+	// spent approval reaches the tape.
 	//
-	// It is a different fact from ApprovalID, which is why it is a different field. A grant
-	// is spent by the decision that accepted it — burnApproval runs on every commit of an
-	// approved single-use declassification, deliberately including one whose clear turns
-	// out to be a no-op, because burning only on a clear that moved a label would make the
-	// grant trivially replayable by ordering. The declassification's own evidence
-	// (labels_cleared / approver / approval_id) meanwhile appears only when the clear
-	// CHANGED something. Between the two, a real approval could be spent with nothing
-	// anywhere on the signed tape naming it, and an operator could not answer "which of my
-	// outstanding single-use approvals are still live?".
-	//
-	// Empty for a standing grant, which spends nothing and needs no reconciliation. The
-	// caller stamps it as its own details key on both the allow and any refusal below the
-	// decision — never onto approval_id, which one key must not share a name with (see the
-	// consumed_approval_id rule in pkg/enforcement).
-	SpentApprovalID string `json:"spentApprovalId,omitempty"`
+	// In-process only (json:"-"), like Effect: it is a stateful decision artifact for the
+	// caller — single-use, with an unexported authorized set — and a JSON round trip would
+	// silently hand back an empty authorization. The audit record's own declassification
+	// fields (the TOP-LEVEL, HMAC-signed labels_cleared / approver / approval_id triple,
+	// none of which rides details) report what the commit actually CHANGED, not what was
+	// authorized here, so the tape never records a declassification that did not happen.
+	Declassification *Declassification `json:"-"`
 	// Effect is the contract the decision resolved against this call's arguments, stamped
 	// on an ALLOW so a post-hoc check has the declaration in hand. Its one consumer is the
 	// effect-receipt verifier, which compares what a server ATTESTS it did against what

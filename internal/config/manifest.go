@@ -1853,62 +1853,8 @@ func typedDirective[T any](check func(i, j int, target string, targetType capabi
 	}
 }
 
-// baseGrammarTokens names every condition and directive discriminator that is part of the
-// BASE published grammar ("0.1") and therefore needs no tokenGrammarVersions entry.
-//
-// It exists so the two tables are TOTAL over the vocabulary rather than one table plus an
-// implicit default. tokenGrammarVersions on its own is consulted with a comma-ok: a token
-// absent from it was silently admitted under every revision, which is the fail-OPEN
-// direction on the one gate whose entire job is stopping a later revision's predicate from
-// widening an earlier one. A new token now has to be classified into one of these two maps
-// to load at all, and the completeness test names it if it is in neither.
-//
-// Entries here are a statement about the PUBLISHED grammar, not a convenience: adding a
-// newly-introduced token to this map instead of to tokenGrammarVersions is precisely the
-// widening the gate prevents, so it takes a deliberate edit that reads as what it is.
-var baseGrammarTokens = map[string]bool{
-	capability.ConditionTypeTimeWindow:        true,
-	capability.ConditionTypeIPRange:           true,
-	capability.ConditionTypeAllowedOperations: true,
-	capability.ConditionTypeAllowedExtensions: true,
-	capability.ConditionTypeAllowedTables:     true,
-	capability.ConditionTypeMaxCalls:          true,
-	capability.ConditionTypeRecipientDomain:   true,
-	capability.ConditionTypeAllowedValues:     true,
-	capability.ConditionTypeSequenceBlock:     true,
-	capability.ConditionTypePolicy:            true,
-	capability.ConditionTypeCustom:            true,
-	capability.DirectiveTypeRedactFields:      true,
-}
-
-// tokenGrammarVersions maps a condition/directive discriminator to the manifest
-// schemaVersion that INTRODUCED it. It is one half of a TOTAL classification: a token
-// belongs here or in baseGrammarTokens, and one in neither is refused under every revision
-// (see checkTokenRevision). Absence used to mean "part of the base grammar", which is the
-// fail-OPEN reading — a token a contributor forgot to classify was silently admitted under
-// "0.1", on the one gate whose whole job is stopping a later revision's predicate from
-// widening an earlier one.
-//
-// It is the single source of the closed-grammar invariant across revisions: a token is
-// inert unless the manifest declares the revision that introduced it, so adding a future
-// token is one map entry — not a gate call threaded through each per-type validation case,
-// which a contributor could forget.
-//
-// A token requires its EXACT introducing version. That is deliberately not "this version
-// or later": there are two published revisions, so "later" has no members yet, and
-// spelling the rule as an ordering would invite a >= comparison over version strings that
-// is wrong the first time a revision is not orderable by string compare. When a third
-// revision lands, this map is what decides inheritance explicitly.
-var tokenGrammarVersions = map[string]string{
-	capability.ConditionTypeFlowLabel:   ManifestSchemaVersion02,
-	capability.DirectiveTypeLabelOutput: ManifestSchemaVersion02,
-	capability.DirectiveTypeDeclassify:  ManifestSchemaVersion02,
-	capability.ConditionTypeEffectClass: ManifestSchemaVersion02,
-	capability.ConditionTypeBlastRadius: ManifestSchemaVersion02,
-}
-
 // checkTokenGrammarVersion fails closed if any capability carries a token (per
-// tokenGrammarVersions) the declared schemaVersion does not admit — so a "0.1" manifest
+// capability.TokenSince) the declared schemaVersion does not admit — so a "0.1" manifest
 // that uses a flow+effect token is rejected (the closed grammar stays closed) rather than
 // silently enabling a predicate that revision does not define. It is the one authoritative
 // grammar-version gate: the per-type validation cases carry no version check, so a new
@@ -1920,9 +1866,9 @@ func checkTokenGrammarVersion(m *LocalManifest) error {
 	declared := strings.TrimSpace(m.SchemaVersion)
 	// The effect layer's two non-condition tokens — the top-level effectCeiling and a
 	// constraint's effect contract — are gated by the same rule. They are not
-	// conditions or directives, so they cannot ride tokenGrammarVersions (which is
-	// keyed by discriminator); gating them here keeps ONE grammar gate rather than a
-	// second one somewhere else that could be updated out of step.
+	// conditions or directives, so they have no prototype registry entry to carry a Since;
+	// gating them here keeps ONE grammar gate rather than a second one somewhere else that
+	// could be updated out of step.
 	if m.EffectCeiling != nil && declared != ManifestSchemaVersion02 {
 		return fmt.Errorf("the top-level effectCeiling was introduced in schemaVersion %q (the flow+effect grammar); this manifest declares schemaVersion %q, under which the key is not part of the grammar", ManifestSchemaVersion02, declared)
 	}
@@ -1942,9 +1888,9 @@ func checkTokenGrammarVersion(m *LocalManifest) error {
 			}
 		}
 		// Task-context variables are the batch's third non-discriminator token: they are
-		// VALUES inside a condition that exists in both revisions, so they cannot ride
-		// tokenGrammarVersions either. Gated here, beside the other two, so the whole
-		// grammar-version rule is readable in one function.
+		// VALUES inside a condition that exists in both revisions, so they carry no Since of
+		// their own either. Gated here, beside the other two, so the whole grammar-version
+		// rule is readable in one function.
 		if err := checkTaskVarGrammarVersion(i, c, declared); err != nil {
 			return err
 		}
@@ -1979,32 +1925,44 @@ func checkTaskVarGrammarVersion(i int, c *capability.Constraint, declared string
 	return nil
 }
 
-// checkTokenRevision decides whether the declared revision admits one token, given the two
-// tables that between them classify the whole vocabulary: tokenGrammarVersions (introduced
-// by a later revision, admitted only under that revision) and baseGrammarTokens (part of the
-// base "0.1" grammar, admitted under every revision).
+// checkTokenRevision decides whether the declared revision admits one token, reading the
+// introducing revision off pkg/capability's prototype registry (capability.TokenSince) — the
+// same entry that declares the token exists at all.
 //
-// A token in NEITHER is refused, under every revision. That is the fail-closed reading of a
-// gate this build cannot classify, and it reverses the direction the comma-ok lookup used to
-// fail in: a token missing from tokenGrammarVersions was silently admitted under "0.1", so
-// the one guard whose job is stopping a later revision's predicate from widening an earlier
-// one could be defeated by forgetting a map entry — with nothing anywhere reporting it. The
-// message says what to do, because the only way to reach it is a contributor adding a
-// discriminator to pkg/capability's registry without classifying it here.
+// A token this build cannot CLASSIFY is refused, under every revision. That is the
+// fail-closed reading of a gate with nothing to gate on, and it reverses the direction the
+// original comma-ok lookup failed in: a token missing from the classification was silently
+// admitted under "0.1", so the one guard whose job is stopping a later revision's predicate
+// from widening an earlier one could be defeated by forgetting a map entry, with nothing
+// anywhere reporting it. The message says what to do, because the only way to reach it is a
+// contributor adding a discriminator to that registry without declaring its Since.
+//
+// The admission rule itself is deliberately not an ORDERING over version strings. A base-
+// grammar token is inherited by every later revision; a token a later revision introduced
+// requires EXACTLY that revision. There are two published revisions, so "or later" has no
+// members yet, and spelling the rule as >= over version strings is wrong the first time a
+// revision is not orderable by string compare. When a third revision lands, revisionAdmits
+// is the one place that decides inheritance, explicitly.
 //
 // kind is "condition" or "directive", for the message only.
 func checkTokenRevision(i int, token, kind, declared string) error {
-	if req, gated := tokenGrammarVersions[token]; gated {
-		if declared != req {
-			return tokenGrammarVersionErr(i, "the "+token+" "+kind, req, declared)
-		}
-		return nil
+	since, classified := capability.TokenSince(token)
+	if !classified {
+		return fmt.Errorf("capability at index %d: the %s %s is not classified into any published schemaVersion, so this build cannot decide whether schemaVersion %q admits it; refusing rather than guessing (a new token needs a Since on its pkg/capability prototype registry entry)",
+			i, token, kind, declared)
 	}
-	if baseGrammarTokens[token] {
-		return nil
+	if !revisionAdmits(declared, since) {
+		return tokenGrammarVersionErr(i, "the "+token+" "+kind, since, declared)
 	}
-	return fmt.Errorf("capability at index %d: the %s %s is not classified into any published schemaVersion, so this build cannot decide whether schemaVersion %q admits it; refusing rather than guessing (a new token needs an entry in internal/config's tokenGrammarVersions, or in baseGrammarTokens if it is part of the base grammar)",
-		i, token, kind, declared)
+	return nil
+}
+
+// revisionAdmits reports whether a manifest declaring revision `declared` may carry a token
+// introduced by revision `since`. The base grammar is inherited (its tokens load under every
+// published revision); anything introduced later needs its exact revision declared. See
+// checkTokenRevision for why this is not a version comparison.
+func revisionAdmits(declared, since string) bool {
+	return since == ManifestSchemaVersion01 || declared == since
 }
 
 // tokenGrammarVersionErr builds the fail-closed rejection for a token used under a

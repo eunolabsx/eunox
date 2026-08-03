@@ -2406,7 +2406,7 @@ The decision **authorizes** the clear; it does not remove the label. The removal
 happens once the call has actually run and its response is deliverable.
 
 That ordering is what makes the clear safe under concurrency. The proxy releases
-its per-session decision lock right after the decision, so the slow upstream call
+its decision turn right after the decision, so the slow upstream call
 is not held under it — which means a clear applied inside the decision would be
 visible to every concurrent decision for the *whole* round trip. An egress decided
 in that window would read a clean label set and be forwarded while the sanitizing
@@ -2414,19 +2414,32 @@ call was still in flight. Deferring the removal closes that: the labels stay unt
 the action that clears them has completed.
 
 Two details keep the deferral from opening the opposite hole. **What** to clear is
-decided up front — the approved labels are intersected against what the session is
+decided up front — the approved labels are intersected against what the anchor is
 carrying at decision time, so a taint asserted by some *other* call while the
 sanitizing one is in flight is not in the set and cannot be removed by it. And a
-declassifying call **keeps the per-session decision turn** until its clear lands,
+declassifying call **keeps the decision turn** until its clear lands,
 so nothing interleaves between the two halves. Everything else still releases
 before the forward.
+
+That turn is taken on the **state anchor**, not on the connection: under
+`taskAnchoredState` the label set is keyed on the validated `mcp.task_id`, and two
+sessions sharing one task therefore share one turn. Without that, the second
+session's decisions would run unserialized against state the first is mid-way
+through changing. With task anchoring off (the default) the anchor is the session,
+so the behaviour is the per-session serialization it has always been.
 
 Two practical consequences for a policy author:
 
 - A call issued **concurrently** with a declassifying call still sees the old
   taint; one issued after its response is back sees the cleared set, as always.
-- A declassifying call briefly serializes its own session, bounded by
-  `--upstream-timeout`. Do not set that to `0` on a route that uses `declassify`.
+- A declassifying call briefly serializes its own anchor — its session, or its
+  whole task under `taskAnchoredState` — bounded by `--upstream-timeout`. Do not
+  set that to `0` on a route that uses `declassify`.
+- While that turn is held, an upstream-initiated `sampling/createMessage` on the
+  same anchor is refused rather than queued behind it. Sampling is
+  deny-by-default and the alternative is stalling the session's whole response
+  path, but a policy that combines `declassify` with `system:sampling` should
+  expect the occasional refusal under load.
 
 The clear also requires the call to have **succeeded**. A sanitize whose upstream
 returns an error — a JSON-RPC error, or a tool result with `isError: true` — is

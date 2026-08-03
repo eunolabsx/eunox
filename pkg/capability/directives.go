@@ -129,10 +129,11 @@ func unmarshalDirective(data []byte) (Directive, error) {
 
 // directivePrototypes is THE registry of directive discriminators this build models,
 // the directive twin of conditionPrototypes: the decoder instantiates from it
-// (newDirective), the closed vocabulary is derived from it (knownDirectiveTypes), and
-// the manifest loader's per-type permitted-key sets are reflected off its prototypes
-// (NewDirectivePrototype) — so adding a directive type means adding it HERE, not in
-// three hand-maintained tables that drift one entry at a time.
+// (newDirective), the closed vocabulary is derived from it (knownDirectiveTypes), the
+// manifest loader's per-type permitted-key sets are reflected off its prototypes
+// (NewDirectivePrototype), and its schemaVersion gate reads the entry's Since
+// (TokenSince) — so adding a directive type means adding it HERE, not in three
+// hand-maintained tables that drift one entry at a time.
 //
 // It replaces a switch plus two literals that had already drifted apart. The one that
 // mattered is KnownDirectiveTypes: the published schema's drift guard derives its
@@ -140,10 +141,10 @@ func unmarshalDirective(data []byte) (Directive, error) {
 // switch and forgotten in the literal left `want` and `branches` both at three and
 // shipped a token with no schema branch — the exact outcome the guard exists to
 // prevent.
-var directivePrototypes = map[string]func() Directive{
-	DirectiveTypeRedactFields: func() Directive { return &RedactFieldsDirective{} },
-	DirectiveTypeLabelOutput:  func() Directive { return &LabelOutputDirective{} },
-	DirectiveTypeDeclassify:   func() Directive { return &DeclassifyDirective{} },
+var directivePrototypes = map[string]tokenSpec[Directive]{
+	DirectiveTypeRedactFields: {New: func() Directive { return &RedactFieldsDirective{} }, Since: SchemaVersion01},
+	DirectiveTypeLabelOutput:  {New: func() Directive { return &LabelOutputDirective{} }, Since: SchemaVersion02},
+	DirectiveTypeDeclassify:   {New: func() Directive { return &DeclassifyDirective{} }, Since: SchemaVersion02},
 }
 
 // knownDirectiveTypes is every discriminator in the registry, sorted so the
@@ -162,11 +163,11 @@ var knownDirectiveTypes = sortedRegistryKeys(directivePrototypes)
 // The prototype is freshly constructed per call, so a caller cannot mutate the
 // registry's idea of a type.
 func NewDirectivePrototype(directiveType string) (Directive, bool) {
-	proto, ok := directivePrototypes[directiveType]
+	spec, ok := directivePrototypes[directiveType]
 	if !ok {
 		return nil, false
 	}
-	return proto(), true
+	return spec.New(), true
 }
 
 // KnownDirectiveTypes returns a fresh copy of the registry's directive discriminators in

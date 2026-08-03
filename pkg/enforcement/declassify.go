@@ -37,6 +37,25 @@ type declassifyOutcome struct {
 	LedgerID string
 }
 
+// handle mints the commit handle for this outcome, carrying the labels the decision resolved
+// as clearable: the approved set INTERSECTED with what the anchor is carrying as of this
+// decision. nil when the constraint authorized no declassification at all, which is every call
+// in a deployment that does not declassify.
+//
+// It is the ONE place a handle is built on the decision path, and it computes the intersection
+// itself rather than taking it. Taking it would have moved the widening a []string parameter
+// left open exactly one frame up: a second call site passing anything other than this
+// intersection could mint a handle authorizing labels the approval never covered, and nothing
+// here could tell. carriedLabels is the pre-call accumulated set and labelsOut this call's own
+// contribution — the same two the caller already resolved for the record.
+func (d declassifyOutcome) handle(carriedLabels, labelsOut []string) *capability.Declassification {
+	if len(d.Labels) == 0 {
+		return nil
+	}
+	pendingClear := intersectLabels(d.Labels, unionLabels(carriedLabels, labelsOut))
+	return capability.NewDeclassification(pendingClear, d.Approver, d.ApprovalID, d.LedgerID != "")
+}
+
 // declassifyLedgerWindowSec bounds how long a burned single-use approval is remembered. It
 // is a REAL bound on the guarantee, not a storage detail, and it is stated in the same terms
 // sequenceHistoryWindowSec states its own: after this long with no further presentation of
@@ -424,7 +443,8 @@ func canonicalApprovalTarget(req *capability.EnforceRequest) string {
 // it is the atomic test that makes "once" mean once, and two callers must not both be able to
 // reach it. That leaves it possible for a grant to be spent by a call whose clear is never
 // committed (a refusal below the decision, a fault at the commit); the response carries a
-// SpentApprovalID for exactly that case, so the tape names the grant an operator must replace.
+// handle whose SpentApprovalID names it for exactly that case, so the tape names the grant an
+// operator must replace.
 //
 // It runs on EVERY commit of an approved single-use declassification, including one whose
 // clear turns out to be a no-op because the anchor was not carrying the labels. That is the
@@ -488,6 +508,13 @@ func declassifyRecordFailureDenial(requestID, now string, auditOnly bool, spentA
 		HardDeny:      true,
 		Details:       map[string]interface{}{capability.FlowAuditDetailKey: true, "phase": "record"},
 	})
-	resp.SpentApprovalID = spentApprovalID
+	if spentApprovalID != "" {
+		// A handle carrying NO labels: nothing here authorizes a clear (the resolution never
+		// got that far), and its whole job is to name the burned grant. The commit skips a
+		// handle with an empty set, so this cannot become a clear on a refused call — see
+		// NewDeclassification for why the empty-set handle is a legitimate shape rather than
+		// a nil.
+		resp.Declassification = capability.NewDeclassification(nil, "", spentApprovalID, true)
+	}
 	return resp
 }

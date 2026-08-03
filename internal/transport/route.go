@@ -63,12 +63,24 @@ type UpstreamRoute struct {
 	// Read-only after BuildRoutes.
 	receipts *capability.EffectReceiptVerifier
 
-	// serializeDecisions is set when the route's policy is flow- or sequenceBlock-relevant,
-	// so each of its sessions serializes its decision phase (the PDP decision + state
-	// write, NOT the upstream forward) to order a source's write before a later sink's
-	// read. false keeps full intra-session
-	// decision parallelism. Read-only after BuildRoutes.
-	serializeDecisions bool
+	// taskAnchored mirrors the engine's WithTaskAnchoredState for this route. The transport
+	// needs it for ONE decision — which key a request's decision turn is taken on — because
+	// the turn has to span the anchor the state accrues to, and under task anchoring that is
+	// not the session. Read-only after BuildRoutes.
+	taskAnchored bool
+
+	// decideGates hands out this route's decision turn — the PDP decision and its state
+	// write, NOT the upstream forward — one gate per ANCHOR, so two sessions sharing a task
+	// share it. Non-nil exactly when the route's policy is flow- or sequenceBlock-relevant
+	// (both read accumulated state a source writes and a later call reads); nil keeps full
+	// decision parallelism, and is what serializes() reports on.
+	//
+	// Its presence IS the flag. A separate serializeDecisions bool beside it was a pair that
+	// had to be set together, whose disagreement is silent in the direction that matters: a
+	// route marked serialized with no registry runs every decision unserialized, which is the
+	// source->sink race the turn exists to close. Read-only after BuildRoutes (the registry
+	// itself is internally synchronized).
+	decideGates *anchorGates
 
 	// Policy provenance is captured once at load and lives only on sink, which is the
 	// sole runtime consumer (it stamps every audit record). Keeping one authoritative
@@ -347,19 +359,28 @@ func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability
 		}
 		configStrict := cfg.ResolvedStrictDrift(u)
 
-		dp, manifest, policyVersion, policySHA256, err := LoadUpstreamPDP(u, cfg.HostTransport(), cfg.BaseDir, counter, flowStore, ks, cfg.ResolvedTaskAnchoredState(u))
+		taskAnchored := cfg.ResolvedTaskAnchoredState(u)
+		dp, manifest, policyVersion, policySHA256, err := LoadUpstreamPDP(u, cfg.HostTransport(), cfg.BaseDir, counter, flowStore, ks, taskAnchored)
 		if err != nil {
 			return nil, err
 		}
 		r.pdp = dp
 		r.manifest = manifest
-		// Serialize this route's per-session decision phase when its policy is
-		// flow- or sequenceBlock-relevant (both read per-session state a source writes
+		r.taskAnchored = taskAnchored
+		// Serialize this route's decision phase when its policy is
+		// flow- or sequenceBlock-relevant (both read accumulated state a source writes
 		// and a later call reads), so a source's write is ordered before a later sink's
-		// read on the same session under concurrent in-flight requests.
+		// read on the same anchor under concurrent in-flight requests.
 		// A non-flow/non-sequence route keeps full
-		// intra-session decision parallelism.
-		r.serializeDecisions = manifest != nil && (manifest.HasFlowLabel() || manifest.HasSequenceBlock())
+		// decision parallelism (no registry, and serializes() reports false).
+		//
+		// The registry is per ROUTE, not per session: the turn has to span the anchor the
+		// state accrues to, and under task anchoring two sessions can share one. Per route
+		// rather than per proxy because routes namespace their own state, so identical task
+		// ids on two routes address different buckets and must not queue behind each other.
+		if manifest != nil && (manifest.HasFlowLabel() || manifest.HasSequenceBlock()) {
+			r.decideGates = newAnchorGates()
+		}
 		r.honorAttribution = manifest.HonorsAttributionInterface()
 		// strictDrift is used only to build this route's drift hook (its one
 		// consumer), so it stays a local rather than write-only route state.

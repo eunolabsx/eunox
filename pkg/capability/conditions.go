@@ -323,30 +323,37 @@ func jsonFieldNames(v any) map[string]bool {
 	return names
 }
 
-// conditionPrototypes is THE registry of condition discriminators this build models:
-// each maps to a constructor for its zero value. Everything else that needs to enumerate
-// or instantiate condition types derives from it — newCondition, the "did you mean" hint
-// (knownConditionTypes), and the manifest loader's per-type permitted-key sets
-// (ConditionJSONKeys) — so adding a condition type means adding it HERE, not in three
+// conditionPrototypes is THE registry of condition discriminators this build models: each
+// maps to a constructor for its zero value and the grammar revision that introduced it.
+// Everything else that needs to enumerate, instantiate or CLASSIFY condition types derives
+// from it — newCondition, the "did you mean" hint (knownConditionTypes), the manifest
+// loader's per-type permitted-key sets (ConditionJSONKeys), and its schemaVersion gate
+// (TokenSince) — so adding a condition type means adding it HERE, not in three
 // hand-maintained tables that drift one entry at a time.
+//
+// Since is part of the entry rather than a table elsewhere for the reason the registry itself
+// exists: a classification kept in a separate map can hold a DIFFERENT answer, and the
+// direction that fails (a later revision's token filed as base grammar) admits a "0.2"
+// predicate under a "0.1" manifest — the one thing the gate is there to prevent. Beside the
+// constructor there is one line to read and no second place to forget.
 //
 // redactFields is deliberately absent — it is a directive, and has its own migration error
 // pointing at directives.
-var conditionPrototypes = map[string]func() Condition{
-	ConditionTypeTimeWindow:        func() Condition { return &TimeWindowCondition{} },
-	ConditionTypeIPRange:           func() Condition { return &IPRangeCondition{} },
-	ConditionTypeAllowedOperations: func() Condition { return &AllowedOperationsCondition{} },
-	ConditionTypeAllowedExtensions: func() Condition { return &AllowedExtensionsCondition{} },
-	ConditionTypeAllowedTables:     func() Condition { return &AllowedTablesCondition{} },
-	ConditionTypeMaxCalls:          func() Condition { return &MaxCallsCondition{} },
-	ConditionTypeRecipientDomain:   func() Condition { return &RecipientDomainCondition{} },
-	ConditionTypeAllowedValues:     func() Condition { return &AllowedValuesCondition{} },
-	ConditionTypeSequenceBlock:     func() Condition { return &SequenceBlockCondition{} },
-	ConditionTypeFlowLabel:         func() Condition { return &FlowLabelCondition{} },
-	ConditionTypeEffectClass:       func() Condition { return &EffectClassCondition{} },
-	ConditionTypeBlastRadius:       func() Condition { return &BlastRadiusCondition{} },
-	ConditionTypePolicy:            func() Condition { return &PolicyCondition{} },
-	ConditionTypeCustom:            func() Condition { return &CustomCondition{} },
+var conditionPrototypes = map[string]tokenSpec[Condition]{
+	ConditionTypeTimeWindow:        {New: func() Condition { return &TimeWindowCondition{} }, Since: SchemaVersion01},
+	ConditionTypeIPRange:           {New: func() Condition { return &IPRangeCondition{} }, Since: SchemaVersion01},
+	ConditionTypeAllowedOperations: {New: func() Condition { return &AllowedOperationsCondition{} }, Since: SchemaVersion01},
+	ConditionTypeAllowedExtensions: {New: func() Condition { return &AllowedExtensionsCondition{} }, Since: SchemaVersion01},
+	ConditionTypeAllowedTables:     {New: func() Condition { return &AllowedTablesCondition{} }, Since: SchemaVersion01},
+	ConditionTypeMaxCalls:          {New: func() Condition { return &MaxCallsCondition{} }, Since: SchemaVersion01},
+	ConditionTypeRecipientDomain:   {New: func() Condition { return &RecipientDomainCondition{} }, Since: SchemaVersion01},
+	ConditionTypeAllowedValues:     {New: func() Condition { return &AllowedValuesCondition{} }, Since: SchemaVersion01},
+	ConditionTypeSequenceBlock:     {New: func() Condition { return &SequenceBlockCondition{} }, Since: SchemaVersion01},
+	ConditionTypeFlowLabel:         {New: func() Condition { return &FlowLabelCondition{} }, Since: SchemaVersion02},
+	ConditionTypeEffectClass:       {New: func() Condition { return &EffectClassCondition{} }, Since: SchemaVersion02},
+	ConditionTypeBlastRadius:       {New: func() Condition { return &BlastRadiusCondition{} }, Since: SchemaVersion02},
+	ConditionTypePolicy:            {New: func() Condition { return &PolicyCondition{} }, Since: SchemaVersion01},
+	ConditionTypeCustom:            {New: func() Condition { return &CustomCondition{} }, Since: SchemaVersion01},
 }
 
 // knownConditionTypes is every discriminator in the registry, sorted so the "did you mean"
@@ -381,11 +388,11 @@ func sortedRegistryKeys[V any](prototypes map[string]V) []string {
 // The prototype is freshly constructed per call, so a caller cannot mutate the registry's
 // idea of a type.
 func NewConditionPrototype(condType string) (Condition, bool) {
-	proto, ok := conditionPrototypes[condType]
+	spec, ok := conditionPrototypes[condType]
 	if !ok {
 		return nil, false
 	}
-	return proto(), true
+	return spec.New(), true
 }
 
 // KnownConditionTypes returns a fresh copy of the registry's discriminators in lexical

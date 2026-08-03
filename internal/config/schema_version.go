@@ -19,13 +19,20 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/eunolabs/eunox/pkg/capability"
 )
 
 // ManifestSchemaVersion01 is the base published grammar: deny-by-default capability
 // authorization over the original closed condition/directive vocabulary. It remains
 // supported and remains CLOSED — none of the flow+effect tokens introduced by "0.2"
 // is part of it, and a "0.1" manifest that uses one is refused at load.
-const ManifestSchemaVersion01 = "0.1"
+//
+// The string comes from pkg/capability rather than being spelled again here: the vocabulary's
+// prototype registry declares each token's introducing revision, and the loader's gate
+// compares a manifest's declared version against it. Two literals for one revision is one
+// more place for the gate's two sides to disagree.
+const ManifestSchemaVersion01 = capability.SchemaVersion01
 
 // ManifestSchemaVersion02 is the published flow+effect grammar revision. It adds the
 // information-flow tokens (the flowLabel condition, the labelOutput and declassify
@@ -40,14 +47,16 @@ const ManifestSchemaVersion01 = "0.1"
 // the old draft string is refused, with the supported list naming this version. Leaving
 // the draft accepted as a synonym would leave two spellings of one grammar in the wild
 // and a second version string every future gate has to remember.
-const ManifestSchemaVersion02 = "0.2"
+//
+// Single-sourced from pkg/capability for the same reason as the base revision above.
+const ManifestSchemaVersion02 = capability.SchemaVersion02
 
 var (
 	// supportedManifestSchemaVersions enumerates the manifest grammar versions
 	// this build can parse. Keep in sync with the published
 	// schemas/eunox-capability-manifest.schema.json. A build understands both
-	// revisions at once; which tokens a document may use is decided per revision by
-	// tokenGrammarVersions, not by this set.
+	// revisions at once; which tokens a document may use is decided per revision by each
+	// token's own capability.TokenSince, not by this set.
 	supportedManifestSchemaVersions = map[string]bool{ManifestSchemaVersion01: true, ManifestSchemaVersion02: true}
 
 	// supportedGatewaySchemaVersions enumerates the gateway-config grammar

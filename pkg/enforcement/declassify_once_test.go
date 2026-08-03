@@ -50,7 +50,7 @@ func taintAndClear(t *testing.T, eng *enforcement.Engine, source, declassifying 
 	if resp.Decision != capability.DecisionAllow {
 		return resp, nil
 	}
-	cleared, err := eng.CommitDeclassification(ctx, declassifying, resp.LabelsPendingClear)
+	cleared, err := eng.CommitDeclassification(ctx, declassifying, resp.Declassification)
 	require.NoError(t, err)
 	return resp, cleared
 }
@@ -67,8 +67,8 @@ func TestDeclassifyOnce_SecondPresentationEscalates(t *testing.T) {
 		onceApprovedReq("s", "publish", "ada@example.com", "apr-1", capability.FlowLabelPII))
 	require.Equal(t, capability.DecisionAllow, first.Decision)
 	require.Equal(t, []string{capability.FlowLabelPII}, cleared)
-	require.Equal(t, "ada@example.com", first.Approver)
-	require.Equal(t, "apr-1", first.SpentApprovalID,
+	require.Equal(t, "ada@example.com", first.Declassification.Approver())
+	require.Equal(t, "apr-1", first.Declassification.SpentApprovalID(),
 		"the burned grant is named on the decision so the tape can carry it")
 
 	// Re-taint, then present the identical grant again.
@@ -96,15 +96,15 @@ func TestDeclassifyOnce_StandingGrantStillReplays(t *testing.T) {
 
 	first, _ := taintAndClear(t, eng, req("s", "read_customer"), approvedReq("s", "publish", "ada@example.com", capability.FlowLabelPII))
 	require.Equal(t, capability.DecisionAllow, first.Decision)
-	require.Empty(t, first.SpentApprovalID, "a standing grant spends nothing, so there is nothing to reconcile")
+	require.Empty(t, first.Declassification.SpentApprovalID(), "a standing grant spends nothing, so there is nothing to reconcile")
 
 	require.Equal(t, capability.DecisionAllow,
 		eng.ValidateAction(ctx, req("s", "read_customer"), sourceCaps("read_customer", capability.FlowLabelPII)).Decision)
 	replayReq := approvedReq("s", "publish", "ada@example.com", capability.FlowLabelPII)
 	again := eng.ValidateAction(ctx, replayReq, declassifyCaps("publish", capability.FlowLabelPII))
 	assert.Equal(t, capability.DecisionAllow, again.Decision)
-	assert.Equal(t, []string{capability.FlowLabelPII}, again.LabelsPendingClear)
-	cleared, err := eng.CommitDeclassification(ctx, replayReq, again.LabelsPendingClear)
+	assert.Equal(t, []string{capability.FlowLabelPII}, again.Declassification.Labels())
+	cleared, err := eng.CommitDeclassification(ctx, replayReq, again.Declassification)
 	require.NoError(t, err)
 	assert.Equal(t, []string{capability.FlowLabelPII}, cleared)
 }
@@ -120,13 +120,13 @@ func TestDeclassifyOnce_BurnsEvenWhenTheClearIsANoOp(t *testing.T) {
 	noopReq := onceApprovedReq("s", "publish", "ada@example.com", "apr-1", capability.FlowLabelPII)
 	noop := eng.ValidateAction(ctx, noopReq, declassifyCaps("publish", capability.FlowLabelPII))
 	require.Equal(t, capability.DecisionAllow, noop.Decision)
-	noopCleared, err := eng.CommitDeclassification(ctx, noopReq, noop.LabelsPendingClear)
+	noopCleared, err := eng.CommitDeclassification(ctx, noopReq, noop.Declassification)
 	require.NoError(t, err)
 	require.Empty(t, noopCleared, "nothing was carried, so nothing was cleared")
 	// The grant is spent all the same, and the decision says so — which is the ONLY thing on
 	// the tape naming it, since the labels_cleared/approver/approval_id triple rides on a
 	// clear that changed something and this one did not.
-	require.Equal(t, "apr-1", noop.SpentApprovalID,
+	require.Equal(t, "apr-1", noop.Declassification.SpentApprovalID(),
 		"a single-use grant spent on a no-op clear must still be reconcilable from the tape")
 
 	require.Equal(t, capability.DecisionAllow,
@@ -158,8 +158,8 @@ func TestDeclassifyOnce_ASecondLiveGrantIsSelected(t *testing.T) {
 	}
 	resp := eng.ValidateAction(ctx, both, declassifyCaps("publish", capability.FlowLabelPII))
 	require.Equal(t, capability.DecisionAllow, resp.Decision)
-	assert.Equal(t, "grace@example.com", resp.Approver, "the spent grant must be passed over for the live one, not refused on")
-	assert.Equal(t, "apr-2", resp.ApprovalID)
+	assert.Equal(t, "grace@example.com", resp.Declassification.Approver(), "the spent grant must be passed over for the live one, not refused on")
+	assert.Equal(t, "apr-2", resp.Declassification.ApprovalID())
 }
 
 // TestDeclassifyOnce_LedgerFaultEscalates is the fail-closed posture a use-count demands:
@@ -436,7 +436,7 @@ func TestDeclassifyOnce_BurnedGrantIsNamedWhenTheCommitFaults(t *testing.T) {
 	require.NotNil(t, resp.Denial)
 	assert.True(t, resp.Denial.HardDeny,
 		"a call whose one-shot approval was just spent must not be downgraded and forwarded by an --audit route")
-	assert.Equal(t, "apr-1", resp.SpentApprovalID,
+	assert.Equal(t, "apr-1", resp.Declassification.SpentApprovalID(),
 		"the grant is burned and the call never ran, so this refusal is the only record that can name it")
-	assert.Empty(t, resp.LabelsPendingClear, "the clear was never resolved, so nothing is pending")
+	assert.Empty(t, resp.Declassification.Labels(), "the clear was never resolved, so nothing is pending")
 }

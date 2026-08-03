@@ -1336,12 +1336,11 @@ func (p *StdioProxy) handleUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) 
 		rec:              p.rec(),
 		audit:            p.audit,
 		sessionID:        p.sessionID,
-		pdp:              p.pdp,
 		forward:          func(m mcp.RPCMsg) bool { p.forwardServerRequestToHost(m); return true },
 		writeUpstream:    func(m mcp.RPCMsg) { _ = p.upWriter.Write(m) },
 		decideLock:       p.samplingDecideLock(),
 		strictAuditState: p.strictAudit(),
-	})
+	}.withPDP(p.pdp))
 }
 
 // samplingDecideLock returns the entry into this session's decision serializer for a
@@ -1350,14 +1349,19 @@ func (p *StdioProxy) handleUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) 
 // sampling flowLabel sink cannot read the flow set concurrently with a host source's write.
 // Unlike a host request, a sampling request is
 // upstream-initiated with no proxy-receipt order, so it simply takes the next ticket:
-// mutual exclusion — not receipt ordering — is the property it needs. The gate is
-// leaf-level and released before the forward, so the brief block it can impose on the
-// upstream reader is bounded by the decision path, never the upstream round-trip.
-func (p *StdioProxy) samplingDecideLock() func() (end func()) {
+// mutual exclusion — not receipt ordering — is the property it needs.
+//
+// It always reports ok, i.e. it WAITS, where the HTTP leg bounds the wait (samplingTurnWait).
+// The difference is the gate, not the hazard: this one is FIFO, and a ticket taken and then
+// abandoned would stall every later ticket behind it, so a timeout here would trade a bounded
+// stall for an unbounded one. The stall it can impose is also confined to the single session
+// that owns both sides of it — stdio has one host connection and no per-request token, so its
+// turn never spans a second session the way an anchor-keyed one can.
+func (p *StdioProxy) samplingDecideLock() func() (end func(), ok bool) {
 	if p.decideGate == nil {
 		return nil
 	}
-	return func() func() { return p.decideGate.begin(p.decideGate.take()) }
+	return func() (func(), bool) { return p.decideGate.begin(p.decideGate.take()), true }
 }
 
 // withUpstreamTimeout bounds a StdioProxy upstream round-trip (see boundUpstreamCall).
