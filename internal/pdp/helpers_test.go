@@ -120,6 +120,11 @@ func (denyAllPDP) HardenRefusal(_ context.Context, _ string, r capability.Enforc
 func (denyAllPDP) EvaluateClaimCondition(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (*enforcement.ConditionError, bool) {
 	return enforcement.NonCommittingConditionVerdict(ctx, cond, req)
 }
+
+// ConditionHandlerOverridden: this fake holds no condition engine, so nothing in it
+// can have been overridden.
+func (denyAllPDP) ConditionHandlerOverridden(_ string) bool { return false }
+
 func (denyAllPDP) CheckKill(_ context.Context, _ string) *capability.EnforceResponse {
 	return nil
 }
@@ -187,6 +192,11 @@ func (s *staticPDP) HardenRefusal(_ context.Context, sessionID string, r capabil
 func (s *staticPDP) EvaluateClaimCondition(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (*enforcement.ConditionError, bool) {
 	return enforcement.NonCommittingConditionVerdict(ctx, cond, req)
 }
+
+// ConditionHandlerOverridden: this fake holds no condition engine, so nothing in it
+// can have been overridden.
+func (*staticPDP) ConditionHandlerOverridden(_ string) bool { return false }
+
 func (*staticPDP) CheckKill(_ context.Context, _ string) *capability.EnforceResponse {
 	return nil
 }

@@ -1237,6 +1237,13 @@ type serverRequestParams struct {
 	// can be on a different session entirely. Failing the sampling request closed costs one
 	// deny-by-default request; waiting costs the session's whole response path.
 	decideLock func() (end func(), ok bool)
+	// anchorSplit reports whether this session's host leg has resolved MORE THAN ONE state
+	// anchor, in which case this leg cannot decide at all: it has no host request in scope, so
+	// which task a server-initiated request belongs to is genuinely undetermined, and deciding
+	// against the anchor its captured claims happen to name would peek one bucket while the
+	// host leg taints another. nil where the question cannot arise — stdio (one host connection,
+	// one anchor) and any route that does not anchor state on the task.
+	anchorSplit func() bool
 	// strictAuditState (embedded) carries the --require-audit=strict gate, which also
 	// covers the enforced sampling/createMessage path below. See forwardParams.
 	strictAuditState
@@ -1255,26 +1262,37 @@ type serverRequestParams struct {
 // transports: each server-initiated request now runs on its own goroutine
 // (serverRequestPool), so a handler parked here blocks only itself.
 //
-// What remains is a bound on an UNBOUNDED WAIT. The turn is held across the whole upstream
-// round trip by a declassifying host call (see finishDecision), and under task anchoring by a
-// call on a DIFFERENT session sharing the task, so without a bound this leg's wait is limited
-// only by --upstream-timeout — which may be 0, meaning never. A parked handler also holds one
-// of the pool's slots, so an unbounded wait converts into the pool's own saturation refusal
-// for later requests.
+// What remains is a bound on an UNBOUNDED WAIT, and the two parts below are calibrated against
+// that rather than inherited from the wedge:
 //
-// The change of reason has a consequence worth stating rather than leaving to be discovered:
-// handlers no longer serialize, so N of them parked on one held turn all start their bound at
-// once and all time out together, where the inline version gave each a fresh window because it
-// could not start the next until the previous finished. Refusing N at once on a genuinely
-// long-held turn is the fail-closed direction and each refusal is recorded, but it does mean
-// the constant is now calibrated against "how long may a server-initiated request wait" rather
-// than against "how long may this connection stop delivering responses".
+//   - perHolder (2s) bounds ONE turn holder. The turn is held across the whole upstream round
+//     trip by a declassifying host call (see finishDecision), and under task anchoring by a call
+//     on a DIFFERENT session sharing the task, so without a bound this leg's wait is limited
+//     only by --upstream-timeout — which may be 0, meaning never. Two seconds is far above a
+//     healthy decision (microseconds on the in-memory backend, one bounded round trip on Redis)
+//     and far below any upstream call worth waiting behind, so exceeding it means a holder that
+//     is stuck rather than busy.
 //
-// Two seconds is far above a healthy decision (microseconds on the in-memory backend, one
-// bounded round trip on Redis) and far below any upstream call worth waiting behind. Exceeding
-// it means a long-running turn holder, and the fail-closed answer is to refuse this one
-// deny-by-default request rather than to stall the session's whole response path.
-const samplingTurnWait = 2 * time.Second
+//     Bounding the HOLDER rather than the waiter's own arrival is what keeps a batch of waiters
+//     from being refused for one slow turn. Inline, request 2 was not read off the pipe until
+//     request 1 finished, so each got a fresh window for free; concurrently, N handlers parked
+//     on one gate started their windows together and expired together. Per-holder restores the
+//     fresh-window property without restoring the serialization: a waiter is refused only when
+//     the request actually holding the turn has held it too long, which is the condition worth
+//     refusing over.
+//
+//   - total (8s) is the absolute ceiling, because "the queue is moving" must not mean "forever".
+//     A parked handler holds one of the pool's slots, so an anchor with a steady stream of
+//     sub-2s holders would otherwise pin slots indefinitely and convert into the pool's own
+//     saturation refusals for later requests. Four holder-windows is enough that a healthy
+//     anchor never reaches it and short enough that a pathological one frees the slot.
+//
+// The refusal a give-up produces stays HARD (see samplingTurnDenial), and that is a choice
+// rather than an inheritance. A turn-wait failure is TRANSIENT, which reads like the pool's
+// retryable -32000 — but it is produced on the decision path, where a downgradable refusal is
+// FORWARDED by an --audit route, and forwarding a sampling request whose decision never ran is
+// exactly what the serialization exists to prevent. Transience buys a retry, not a forward.
+var samplingTurnWait = turnWait{perHolder: 2 * time.Second, total: 8 * time.Second}
 
 // decideSampling runs the sampling decision under the decision turn when one is configured
 // (see decideLock), releasing it BEFORE the caller forwards to the host — so the flow peek is
@@ -1288,12 +1306,28 @@ const samplingTurnWait = 2 * time.Second
 //
 // The release is deferred, so it is panic-safe and runs before the caller's forward.
 func (fp serverRequestParams) decideSampling(ctx context.Context) capability.EnforceResponse {
+	// Asked BEFORE the turn, so a decision that cannot be made correctly does not queue for the
+	// right to make it — a session in this state would take that turn on every server-initiated
+	// request for the rest of its life.
+	if fp.anchorSplit != nil && fp.anchorSplit() {
+		return samplingAnchorSplitDenial()
+	}
 	if fp.decideLock != nil {
 		end, ok := fp.decideLock()
 		if !ok {
 			return samplingTurnDenial()
 		}
 		defer end()
+		// And AGAIN once the turn is held, because the wait between the two is not short: it is
+		// bounded by samplingTurnWait, not by anything about this session, and the host leg can
+		// span its second anchor at any point inside it. The turn provides no ordering here —
+		// the two anchors take DIFFERENT gates, which is the whole reason this refusal exists —
+		// so without the re-check the window between "not split" and the flow peek it guards is
+		// the entire wait, and a taint committed under the other anchor during it is invisible
+		// to the peek that follows. The check is a lock-free atomic read.
+		if fp.anchorSplit != nil && fp.anchorSplit() {
+			return samplingAnchorSplitDenial()
+		}
 	}
 	return fp.pdp.DecideSampling(ctx, fp.sessionID, fp.sourceIP)
 }
@@ -1305,6 +1339,31 @@ func samplingTurnDenial() capability.EnforceResponse {
 	return samplingFlowDenial(
 		"the sampling decision could not be serialized against concurrent decisions on this anchor; refusing rather than reading flow state mid-write",
 		"turn_unavailable")
+}
+
+// samplingAnchorSplitDenial is the fail-closed response for a server-initiated request on a
+// session whose host leg has resolved more than one state anchor.
+//
+// A session on a task-anchored route may span tasks: each host request is decided, keyed and
+// serialized on its own anchor, which is correct however many there are. This leg is the one
+// that cannot be, because it has no host request in scope — which task a
+// sampling/createMessage belongs to is undetermined on such a session, and MCP defines no field
+// an upstream could use to say. Attributing it to the anchor the captured claims name would let
+// the sink peek one bucket while a source taints another, which is the exact fail-open the
+// anchor-keyed turn cannot catch (the leg's turn and its state key would agree with each other
+// and both disagree with the host leg).
+//
+// It is HARD, like this leg's other flow refusals: an --audit route downgrades a policy verdict
+// being staged, and this is not one — forwarding would perform the egress whose authorization
+// could not be evaluated. It is also STICKY for the session's life (see noteRequestAnchor): the
+// taint written under the other anchor outlives the request that wrote it, so a session that
+// has spanned cannot become decidable again. A client that needs sampling on a task-anchored
+// route keeps one session per task; one that multiplexes tasks gets every other guarantee and
+// loses this one feature, loudly and on the tape.
+func samplingAnchorSplitDenial() capability.EnforceResponse {
+	return samplingFlowDenial(
+		"this session has issued requests under more than one state anchor, so which task a server-initiated request belongs to is undetermined; refusing rather than reading one task's flow state for another",
+		"session_spans_anchors")
 }
 
 // samplingDeclassifyDenial is the fail-closed response for a sampling decision that authorized

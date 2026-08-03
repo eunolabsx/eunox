@@ -41,14 +41,12 @@ func taskAnchorKey(taskID string) string { return taskAnchor(taskID).Key() }
 // session-held gate left with no production callers would have gone on being the code these
 // tests pin while the code that runs is somewhere else.
 func beginTurn(g *anchorGates, key string) func() {
-	end, _ := g.acquire(key, nil)
+	end, _ := g.acquire(key, turnWait{})
 	return end
 }
 
 func beginTurnWithin(g *anchorGates, key string, d time.Duration) (func(), bool) {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	return g.acquire(key, timer.C)
+	return g.acquire(key, turnWait{perHolder: d, total: d})
 }
 
 // TestAnchorGates_ExcludeWithinAKeyAndNotAcross is the primitive's contract: one turn per
@@ -281,12 +279,10 @@ func TestAnchorGates_TurnFirstWhenTheDeadlineHasPassed(t *testing.T) {
 	t.Parallel()
 	g := newAnchorGates()
 
-	// A CLOSED deadline channel, not a buffered one holding a single value: a receive on a
-	// closed channel is always ready, so both select arms are ready on EVERY iteration. A
-	// buffered value would be drained by the first refusal and leave the rest of the loop
-	// racing nothing.
-	expired := make(chan time.Time)
-	close(expired)
+	// An ALREADY-ELAPSED window, so the give-up arm is ready on EVERY iteration and both
+	// select arms race on every one of them. A window long enough to be won by the turn arm
+	// would leave the rest of the loop racing nothing.
+	expired := turnWait{perHolder: time.Nanosecond, total: time.Nanosecond}
 
 	for i := 0; i < 200; i++ {
 		end, ok := g.acquire("a", expired)
@@ -441,7 +437,7 @@ func TestSessionGate_CacheFollowsTheResolvedAnchor(t *testing.T) {
 	}
 	// The server-initiated leg reads the session's captured claims, so it resolves the same
 	// anchor and takes the same gate.
-	end, ok := sess.beginDecisionTurnWithin(time.Second)
+	end, ok := sess.beginDecisionTurnWithin(turnWait{perHolder: time.Second, total: time.Second})
 	require.True(t, ok)
 	end()
 	assert.Equal(t, 1, rt.decideGates.size())

@@ -28,6 +28,7 @@ package transport
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/eunolabs/eunox/internal/pdp"
@@ -103,9 +104,9 @@ type anchorGates struct {
 // anchorGate is one anchor's turn.
 //
 // The turn is a one-slot channel rather than a sync.Mutex because one caller has to be able to
-// GIVE UP: the server-initiated leg waits for it on the session's single upstream-reader
-// goroutine, and a mutex offers no bounded acquire. A token in the channel means the turn is
-// held; taking the turn is a send, releasing it a receive.
+// GIVE UP: the server-initiated leg bounds its wait (see turnWait), and a mutex offers no
+// bounded acquire. A token in the channel means the turn is held; taking the turn is a send,
+// releasing it a receive.
 //
 // The embedded keyedEntry is the registry's bookkeeping (this gate's key and refcount), which
 // a holder can keep for a whole session and take turns on without going back through the map —
@@ -115,6 +116,12 @@ type anchorGates struct {
 type anchorGate struct {
 	keyedEntry
 	turn chan struct{}
+	// handoffs counts how many times this turn has been TAKEN. A bounded waiter reads it to
+	// tell "the holder is stuck" from "the queue is moving": its window bounds one HOLDER, so
+	// it gives up only when the count has not changed across a whole window. An atomic rather
+	// than a field under the registry mutex, because the turn itself is guarded by nothing and
+	// taking a lock to observe it would be the only lock on this path.
+	handoffs atomic.Uint64
 }
 
 // entry exposes this gate's registry bookkeeping (keyedRegistryValue).
@@ -145,7 +152,7 @@ func (g *anchorGates) hold(key string) (gate *anchorGate, drop func()) {
 	return g.reg.hold(key)
 }
 
-// acquire takes the turn for key, giving up if giveUp fires first (nil waits forever). It is
+// acquire takes the turn for key under w's give-up rule (an unbounded w waits forever). It is
 // the per-request path: it holds a reference only for the length of the turn, which is what
 // keeps a route's gate map from growing one entry per anchor it has ever served.
 //
@@ -156,14 +163,14 @@ func (g *anchorGates) hold(key string) (gate *anchorGate, drop func()) {
 //
 // A nil registry is a no-op returning a no-op release, so a non-serialized route needs no
 // branch at the call site.
-func (g *anchorGates) acquire(key string, giveUp <-chan time.Time) (end func(), ok bool) {
+func (g *anchorGates) acquire(key string, w turnWait) (end func(), ok bool) {
 	if g == nil {
 		return func() {}, true
 	}
 	// Referenced BEFORE the (possibly blocking) take, so the gate this caller is queued on
 	// cannot be reclaimed and replaced while it waits.
 	gate, drop := g.hold(key)
-	release, ok := gate.take(giveUp)
+	release, ok := gate.take(w)
 	if !ok {
 		// No turn was taken, so nothing is released — only this caller's reference is dropped,
 		// which is what keeps an abandoned wait from pinning the gate.
@@ -176,36 +183,68 @@ func (g *anchorGates) acquire(key string, giveUp <-chan time.Time) (end func(), 
 	return func() { release(); drop() }, true
 }
 
-// take waits for this gate's turn and returns the idempotent release, or ok=false when giveUp
-// fires first (nil waits forever). It touches no registry state: a caller holding the gate
-// across many turns (a session's cached gate) needs the turn and nothing else.
+// take waits for this gate's turn and returns the idempotent release, or ok=false when w's
+// give-up rule fires first (an unbounded w waits forever). It touches no registry state: a
+// caller holding the gate across many turns (a session's cached gate) needs the turn and
+// nothing else.
 //
 // The release is idempotent (sync.OnceFunc), matching decisionSerializer.begin: a handler
 // releases right after its decision and defers the same func as a backstop.
 //
-// The turn is re-checked on the giveUp arm, which is what gives this leg the stdio twin's
+// The turn is re-checked on the give-up arm, which is what gives this leg the stdio twin's
 // turn-first guarantee (see decisionSerializer.beginWithin). A two-arm select over a free
 // turn and an expired timer resolves UNIFORMLY in Go, so a caller could be refused a turn
 // that was available at that instant — a hard turn_unavailable sampling denial for a decision
 // that could have run. The two legs are meant to answer identically; only this one lacked the
 // property.
-func (a *anchorGate) take(giveUp <-chan time.Time) (end func(), ok bool) {
+//
+// The window is per HOLDER, exactly as the stdio twin's is: an expiry that finds the handoff
+// count changed means this waiter was queued behind work that completed, not stalled by
+// anything, so it takes a fresh window — up to w.total, which is what keeps a moving queue from
+// meaning an unbounded wait. See turnWait.
+func (a *anchorGate) take(w turnWait) (end func(), ok bool) {
 	if a == nil {
 		return func() {}, true
 	}
-	select {
-	case a.turn <- struct{}{}:
-		return sync.OnceFunc(func() { <-a.turn }), true
-	case <-giveUp:
-		// The turn is checked FIRST on the way out: a timer that fires in the same instant the
-		// turn comes up loses, so a caller is never refused a turn it could have had.
+	if !w.bounded() {
+		a.turn <- struct{}{}
+		return a.held(), true
+	}
+	deadline := time.Now().Add(w.total)
+	timer := time.NewTimer(w.window(deadline))
+	defer timer.Stop()
+	for {
+		// Read BEFORE the wait, so a handoff during the window is what the comparison sees.
+		holder := a.handoffs.Load()
 		select {
 		case a.turn <- struct{}{}:
-			return sync.OnceFunc(func() { <-a.turn }), true
-		default:
-			return nil, false
+			return a.held(), true
+		case <-timer.C:
+			// The turn is checked FIRST on the way out: a timer that fires in the same instant
+			// the turn comes up loses, so a caller is never refused a turn it could have had.
+			select {
+			case a.turn <- struct{}{}:
+				return a.held(), true
+			default:
+			}
+			// The window is clamped to what is left of the ceiling, so this arm firing with no
+			// handoff behind it means EITHER the holder is stuck or the ceiling has arrived.
+			rest := w.window(deadline)
+			if a.handoffs.Load() == holder || rest <= 0 {
+				return nil, false
+			}
+			timer.Reset(rest)
 		}
 	}
+}
+
+// held records that this caller now holds the turn and returns the idempotent release. The
+// count is bumped on ACQUIRE rather than on release so a waiter that opened its window while
+// the turn was free (and saw it taken and handed back within one window) still observes the
+// change.
+func (a *anchorGate) held() func() {
+	a.handoffs.Add(1)
+	return sync.OnceFunc(func() { <-a.turn })
 }
 
 // size reports how many gates are live. Test-only: the refcounting is what keeps a long-lived

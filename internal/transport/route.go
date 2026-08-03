@@ -739,6 +739,23 @@ func WrapRoutesWithJWT(routes map[string]*UpstreamRoute, opts pdp.JWTPDPOptions)
 			seen[eff] = struct{}{}
 			union = append(union, eff)
 		}
+		// A condition type the capability-claim path cannot dispatch through this route's own
+		// handler makes the two halves of one intersection mean different things. The claim
+		// grammar's `op=` shorthand cannot name the operation argument, so its arm scans every
+		// argument while the engine's handler hard-denies that empty argument — the divergence
+		// is deliberate, and sound only while both sides are the semantics this build ships.
+		// An embedder who replaced allowedOperations gets the replacement on the manifest path
+		// and the shipped predicate on the token path, silently. Refuse the WIRING here, where
+		// an operator can act on it, rather than leaving it to the first token-scoped call
+		// (which the claim arm refuses too, as the backstop for a JWTPDP built directly).
+		//
+		// Gated on ExperimentalCapabilities because without it a token carrying
+		// mcp.capabilities is rejected at validation outright, so the claim arm is unreachable
+		// and there is no divergence to refuse over.
+		if opts.ExperimentalCapabilities && rt.pdp.ConditionHandlerOverridden(capability.ConditionTypeAllowedOperations) {
+			return nil, fmt.Errorf("route %q registers a custom %s condition handler, which the JWT capability-claim path cannot enforce: its `op=` shorthand names no operation argument, so it scans every argument rather than dispatching through the handler. Drop the override, or disable --jwt-experimental-capabilities and express the restriction as a manifest constraint that names the operation argument",
+				name, capability.ConditionTypeAllowedOperations)
+		}
 	}
 
 	// The shared validator pins the union (token validation only); it makes no routing

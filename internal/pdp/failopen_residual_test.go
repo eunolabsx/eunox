@@ -12,8 +12,11 @@ import (
 	"testing"
 
 	"github.com/eunolabs/eunox/internal/mcp"
+	"github.com/eunolabs/eunox/pkg/callcounter"
 	"github.com/eunolabs/eunox/pkg/capability"
 	"github.com/eunolabs/eunox/pkg/enforcement"
+	"github.com/eunolabs/eunox/pkg/flowlabelstore"
+	"github.com/eunolabs/eunox/pkg/killswitch"
 )
 
 // -----------------------------------------------------------------
@@ -716,5 +719,48 @@ func TestHardenRefusal_ObligationsComeFromTheWiderSelection(t *testing.T) {
 	enforced := mdp.HardenRefusal(context.Background(), "sess", soft, target, map[string]interface{}{})
 	if len(enforced.Obligations) != 0 {
 		t.Fatalf("an enforced refusal carries no forwarded response; got %+v", enforced.Obligations)
+	}
+}
+
+// TestAuditModeAntecedent_UnanchorableRequestWritesNothing closes the write that the session
+// anchor pin used to catch on the way in.
+//
+// A task-anchored route running --audit forwards a no-match deny, so the unlisted tool actually
+// RUNS and its antecedent must be recorded — but a request whose token carries no mcp.task_id
+// resolves the SESSION anchor, and the engine's own rule is that an authenticated caller it
+// cannot anchor must not be accounted at all. That rule lives in evaluateMatched, which a
+// no-match deny never reaches: nothing matched, so nothing asked. The antecedent would land
+// under the session key while every enforced sequenceBlock reads the task key — the sink Peeks
+// an empty history and fails OPEN, which is the exact split the rule exists to refuse.
+func TestAuditModeAntecedent_UnanchorableRequestWritesNothing(t *testing.T) {
+	t.Parallel()
+	engine := enforcement.New(
+		enforcement.WithCallCounter(callcounter.NewInMemory()),
+		enforcement.WithFlowLabelStore(flowlabelstore.NewInMemory()),
+		enforcement.WithTaskAnchoredState(),
+	)
+	// The manifest names `deploy` only in a sequenceBlock's afterTools, so an unlisted
+	// `read_secret` is a no-match deny whose antecedent the observe path would record.
+	caps := []capability.Constraint{{
+		Target:  "tool:deploy",
+		Actions: []string{"call"},
+		Conditions: []capability.Condition{
+			capability.SequenceBlockCondition{AfterTools: []string{"read_secret"}},
+		},
+	}}
+	p := NewManifestPDP(caps, engine, killswitch.NewInMemory())
+
+	// --audit (SkipQuota) plus a validated token carrying a subject but NO task id.
+	ctx := enforcement.WithSkipQuota(WithJWTClaims(context.Background(),
+		&JWTClaims{Issuer: "iss", Subject: "sub"}))
+	resp := p.Decide(ctx, "sess-a", EnforceTarget{Type: capability.TargetTypeTool, Name: "read_secret"},
+		map[string]interface{}{}, "")
+
+	if resp.Decision == capability.DecisionAllow {
+		t.Fatalf("an unlisted tool must still be denied: %+v", resp)
+	}
+	if resp.Denial == nil || !resp.Denial.HardDeny {
+		t.Fatalf("the refusal must be HARD: a downgradable one is FORWARDED by --audit, which is "+
+			"how the un-anchored antecedent would be written in the first place; got %+v", resp.Denial)
 	}
 }

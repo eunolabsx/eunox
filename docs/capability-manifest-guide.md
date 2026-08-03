@@ -1255,9 +1255,17 @@ different case and still loads, denying fail-closed at request time.
 > deliberately **not** covered: its claim-side semantics are different by design (the
 > shorthand cannot name the operation argument, so it scans every argument, while the
 > engine's handler hard-denies the empty argument the shorthand always emits), so there
-> is no shared handler to dispatch to. An override for `allowedOperations` therefore
-> applies to the manifest path only. Manifest form (Pattern C) is the preferred way to
-> express an operation restriction regardless.
+> is no shared handler to dispatch to. Routing the claim arm through the override would
+> not enforce it — it would deny every `op=` grant in existence — so the **wiring is
+> refused instead**: with `--jwt-experimental-capabilities` enabled, a route whose engine
+> registers a custom `allowedOperations` handler **fails at startup**, naming the route and
+> the condition type. A `JWTPDP` constructed directly (library embedders, no startup check)
+> gets the same answer at the request: an `op=` grant is refused fail-closed with
+> `reason: handler_override_unsupported` rather than being judged by the shipped predicate
+> while the manifest path enforces the replacement. Either way the remedy is the same —
+> drop the override, or express the restriction in manifest form (Pattern C), which names
+> the operation argument, shares the engine's handler, and is the preferred spelling
+> regardless.
 
 > **`redactFields` is a directive, not a condition.** It mutates the
 > response rather than allowing or denying, so it lives under `directives`
@@ -1966,15 +1974,24 @@ before it is returned to the caller: each matched field keeps its key but has it
 value replaced by the placeholder string `"[redacted]"`, so the caller can see
 that the field was present without ever seeing its value. Matching is recursive
 (nested objects and array elements) and is applied to every JSON **text** content
-item, to the `structuredContent` object, **and to the result envelope itself** — a
-field sitting directly on a top-level result key (`{"content":[...],"ssn":"..."}`)
-is masked just like one nested inside a sibling key's value. A single-segment path
+item, to the `structuredContent` object, **and to every other key of the result
+envelope and of each content item** — a field sitting directly on a top-level
+result key (`{"content":[...],"ssn":"..."}`), or on a content item
+(`{"content":[{"type":"text","text":"...","extra":{"ssn":"..."}}]}`), is masked
+just like one nested inside a sibling key's value. A single-segment path
 naming an MCP-reserved component (`content`, `structuredContent`, `isError`,
 `contents`, `messages`, `_meta`) is left to that component's own handling rather
 than masking the whole component, which would hand the host a result it cannot
 decode; a dotted path *through* one (`structuredContent.ssn`) resolves normally and
-masks that leaf. Binary media content the proxy cannot address (images, audio) and
-metadata (`_meta`, content annotations) are preserved unchanged.
+masks that leaf. The same exemption applies one level down to a content item's own
+protocol-structural keys (`type`, `text`, `data`, `mimeType`, `blob`, `uri`,
+`resource`, `annotations`, `_meta`): a bare `text` path does not mask the body
+wholesale and a bare `_meta` path does not replace an object with a string a host
+cannot decode, while a field named `text` or nested *inside* `_meta` is still masked.
+Binary media content the proxy cannot address (the base64 `data` of an image or audio
+item) is preserved unchanged, but every other key such an item carries is walked like
+any other — a declared field hidden under a content item's `_meta`, `annotations`, or
+a vendor extension is masked, not forwarded.
 
 > **Ambiguous JSON keys fail closed under an active `redactFields`.** A response whose
 > object keys the proxy and the host can resolve differently cannot be verified, so it is
@@ -2827,6 +2844,32 @@ byte-for-byte what it was before this option existed.
 > visible to every enforcement point that handles the task, which per-process stores
 > cannot do — and eunox prints a startup notice when the option is on with no
 > `--redis-addr`.
+
+> **A session may span tasks; its sampling sink is what pays.** An agent runtime that
+> multiplexes several tasks over one long-lived MCP connection is a normal shape — and the
+> reason this option exists at all is that a task outlives a connection — so a session on a
+> task-anchored route is **not** pinned to one task. Every host request is decided, keyed and
+> serialized on the anchor **its own token** names, which is correct however many the session
+> spans.
+>
+> The one leg that cannot work that way is the **server-initiated** one. A
+> `sampling/createMessage` arrives from the upstream with no host request in scope, so on a
+> session that has used two tokens differing in `task_id`, which task it belongs to is
+> genuinely undetermined — MCP defines no field an upstream could use to say, and deciding
+> against whichever token `initialize` happened to carry would let the sink peek one task's
+> flow state while another task carries the taint. So from the first request that resolves a
+> second anchor, every server-initiated decision on that session is refused
+> (`CONDITION_FAILED`, `condition_type: flowLabel`, `reason: session_spans_anchors`), and the
+> refusal is **sticky for the session's life** — the taint written under the other anchor
+> outlives the request that wrote it — and **not downgradable** by `--audit`, since forwarding
+> would perform the egress whose authorization could not be evaluated.
+>
+> Practically: a client that needs `sampling/createMessage` on a task-anchored route keeps
+> one session per task. A client that multiplexes tasks keeps every other guarantee — per-task
+> budgets, taint, antecedents, and the decision turn — and loses that one feature, loudly and
+> on the tape. Routes that do not grant `system:sampling/createMessage`, and routes that do not
+> anchor on the task, are unaffected: on the latter every request resolves its session, so no
+> session can span anything.
 
 > **Label rollback stands down under task anchoring.** When a source call's flow write
 > commits and a later write in the same commit faults, the engine normally removes the labels

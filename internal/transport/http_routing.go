@@ -474,6 +474,17 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 		}
 		return
 	}
+	// Note which state anchor this request resolved. On a task-anchored route a session may
+	// legitimately span tasks — an agent runtime multiplexing several over one long-lived MCP
+	// connection is a normal shape — and every host request is decided, keyed and serialized on
+	// its OWN anchor, which is correct however many there are. What cannot be decided that way
+	// is the leg with no host request in scope, so the session records the span and its
+	// server-initiated leg refuses for the rest of its life. See httpSession.noteRequestAnchor.
+	//
+	// Here rather than in the session-gate verdict: that function is check-only and one of its
+	// callers runs it under the session-registry lock, while this is a write and belongs on the
+	// path that actually produces enforced decisions.
+	sess.noteRequestAnchor(pdp.JWTClaimsPtr(r.Context()))
 	// Check the kill switch BEFORE touchRequest, so a killed session's denied POSTs
 	// cannot keep deferring its idle reaping. handleKill now tears the session down
 	// proactively (reapKilledSession), but a request racing that teardown could still
@@ -747,9 +758,8 @@ type sessionGate struct {
 // sessionGateVerdict runs the two security checks every host-initiated action on an
 // EXISTING session must clear: the per-route audience pin (a token minted for a sibling
 // route's audience, accepted by the gateway's shared union validator, must not act on
-// this route's session) and the session-owner binding (only the JWT identity — issuer+sub,
-// plus the state ANCHOR on a route that anchors state on the task — that created the
-// session may act on it; see httpSession.ownerMismatch). Both are
+// this route's session) and the session-owner binding (only the JWT identity — issuer+sub —
+// that created the session may act on it; see httpSession.ownerMismatch). Both are
 // properties of the session, so applying them to EVERY host-initiated action is what stops
 // a second same-audience identity that learned a victim's Mcp-Session-Id from driving,
 // notifying, reading, or tearing down the victim's upstream session (the audience pin alone
@@ -791,17 +801,13 @@ func (route *UpstreamRoute) contextGateVerdict(ctx context.Context) (sessionGate
 	return sessionGate{}, false
 }
 
-// sessionOnlyGateVerdict runs the session gates that need the session object — the
-// session-owner binding and, on a task-anchored route, the session's anchor binding. Both are
-// in-process comparisons over already-validated claims (the anchor resolution reads a memoized
-// claim map through a concrete function, not through an implementable interface), so this half
-// is safe to run under the registry lock, which is what lets handleMCPDelete keep its
+// sessionOnlyGateVerdict runs the session gate that needs the session object — the
+// session-owner binding. It is an in-process comparison over already-validated claims, so this
+// half is safe to run under the registry lock, which is what lets handleMCPDelete keep its
 // check-and-delete atomic.
 func sessionOnlyGateVerdict(ctx context.Context, sess *httpSession) (sessionGate, bool) {
-	// The reason comes back FROM the check rather than being restated here: the binding has two
-	// halves (the principal, and — on a task-anchored route — the state anchor), and a record
-	// that named the principal for an anchor refusal would send an operator looking for a
-	// second client that does not exist.
+	// The reason comes back FROM the check rather than being restated here, so a gate added to
+	// the binding names itself on the record instead of inheriting whatever the caller assumed.
 	if reason, mismatch := sess.ownerMismatch(pdp.JWTClaimsPtr(ctx)); mismatch {
 		return sessionGate{code: capability.ErrCodeAuthorizationFailed, reason: reason}, true
 	}

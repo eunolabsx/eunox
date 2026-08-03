@@ -2981,8 +2981,8 @@ func TestRecordBoundsAgentTaskID(t *testing.T) {
 	keyPath := filepath.Join(dir, "audit.key")
 
 	huge := strings.Repeat("A", 5<<20) // ~5 MiB attacker-controlled JWT claim
-	sink, err := Open(logPath, keyPath, 0, 0, WithIdentity(func(context.Context) (string, string, string) {
-		return huge, huge, huge
+	sink, err := Open(logPath, keyPath, 0, 0, WithIdentity(func(context.Context) Identity {
+		return Identity{AgentID: huge, TaskID: huge, UserID: huge, Delegate: huge}
 	}))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -3040,10 +3040,10 @@ func TestRecordUserID_SignAndVerifyRoundTrip(t *testing.T) {
 	// First record carries a subject; second carries none (extractor returns "").
 	subjects := []string{"user-7", ""}
 	idx := 0
-	sink, err := Open(logPath, keyPath, 0, 0, WithIdentity(func(context.Context) (string, string, string) {
+	sink, err := Open(logPath, keyPath, 0, 0, WithIdentity(func(context.Context) Identity {
 		s := subjects[idx]
 		idx++
-		return "agent-1", "task-9", s
+		return Identity{AgentID: "agent-1", TaskID: "task-9", UserID: s}
 	}))
 	if err != nil {
 		t.Fatalf("Open: %v", err)

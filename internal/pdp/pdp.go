@@ -213,6 +213,30 @@ type PolicyDecisionPoint interface {
 	//     JWT-only route) answers from the built-ins, which are that deployment's semantics
 	//     precisely because there is no engine to have overridden them.
 	EvaluateClaimCondition(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (*enforcement.ConditionError, bool)
+
+	// ConditionHandlerOverridden reports whether THIS PDP's semantics for condType were
+	// replaced by an embedder (enforcement.WithConditionHandler) rather than being the ones
+	// this build ships.
+	//
+	// It is the other half of EvaluateClaimCondition, for the one claim-side condition that
+	// seam cannot cover. The claim grammar emits two condition types. `allowedValues` routes
+	// through the deciding PDP, so an override is enforced on both sides of a JWT/manifest
+	// intersection. `allowedOperations` cannot: the `op=` shorthand has no way to NAME the
+	// operation argument, so the claim arm scans every argument while the engine's handler
+	// hard-denies exactly that empty argument — dispatching it through the registry would not
+	// enforce an override, it would deny every `op=` grant in existence. So the composing layer
+	// asks this instead and fails closed, rather than enforcing the replacement on the manifest
+	// path and the shipped predicate on the token path for the same call.
+	//
+	// Contract for implementers:
+	//   - Answer about the semantics this PDP would ACTUALLY apply, including a PDP it wraps:
+	//     the question is being asked by a layer that is about to substitute its own predicate
+	//     for this one's, so a wrapper answering "no" on its own behalf is the divergence.
+	//   - A PDP with no condition engine of its own (AlwaysAllowPDP, DenyAllPDP, a JWT-only
+	//     route) has overridden nothing: the built-ins are that deployment's semantics
+	//     precisely because there is no engine to have replaced them.
+	//   - It is a pure question about wiring. It MUST NOT decide, commit, or block.
+	ConditionHandlerOverridden(condType string) bool
 }
 
 // ListFilterer filters tools/resources/prompts list results down to the entries
@@ -663,6 +687,11 @@ func (AlwaysAllowPDP) EvaluateClaimCondition(ctx context.Context, cond capabilit
 	return enforcement.NonCommittingConditionVerdict(ctx, cond, req)
 }
 
+// ConditionHandlerOverridden is false for the reason EvaluateClaimCondition answers from the
+// built-ins: a wiretap route holds no engine, so there is no registry an embedder could have
+// replaced an entry in.
+func (AlwaysAllowPDP) ConditionHandlerOverridden(_ string) bool { return false }
+
 // FilterToolsList passes the tools/list result through unchanged: wiretap/audit
 // mode applies no policy. It still reports an accurate entry count (Upstream ==
 // Kept) so a JWT route layered over a wiretap inner audits the right numbers.
@@ -794,6 +823,10 @@ func (DenyAllPDP) HardenRefusal(_ context.Context, _ string, r capability.Enforc
 func (DenyAllPDP) EvaluateClaimCondition(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (*enforcement.ConditionError, bool) {
 	return enforcement.NonCommittingConditionVerdict(ctx, cond, req)
 }
+
+// ConditionHandlerOverridden is false for the same reason the wiretap PDP's is: the "no policy"
+// default holds no engine to have overridden anything in.
+func (DenyAllPDP) ConditionHandlerOverridden(_ string) bool { return false }
 
 // FilterToolsList filters the tools/list result down to nothing (keep == false
 // for every entry), reusing the shared fail-closed envelope round-trip.
@@ -1311,7 +1344,7 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 		// above is positioned to catch.
 		resp := p.withForwardObligations(ctx, denyResponse(p.engineClock(), capability.ErrCodeAuthorizationFailed, "",
 			fmt.Sprintf("%s %q is not listed in the capability manifest", target.Type, target.Name)), target,
-			func() []capability.Directive { return p.directivesNamingTarget(target) })
+			func() []capability.Directive { return p.directivesNamingTarget(target) }, req.Delegation)
 		// Record the antecedent here too, matching every other downgradable deny branch.
 		// Under --audit this deny is forwarded and the manifest-absent tool actually RUNS,
 		// so omitting the record left a later enforced sequenceBlock naming it Peeking an
@@ -1387,7 +1420,11 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 		// manifest declared (a condition, argumentSchema, or action-check failure all reach
 		// here without having run collectObligations). The genuine-allow path collects them
 		// in evaluateMatched; mirror it for the downgraded deny.
-		return p.withForwardObligationsFor(ctx, r, matched)
+		//
+		// The chain comes off the REQUEST this decision is about — the one field that already
+		// says which delegation applies to it — rather than from a second read of the context
+		// beside it.
+		return p.withForwardObligationsFor(ctx, r, matched, req.Delegation)
 	}
 
 	// The constraint's actions list must contain the required action for this
@@ -1748,14 +1785,21 @@ func willForwardDeny(ctx context.Context, matched *capability.Constraint) bool {
 // carries none yet — a flow/record-fault deny already carries them. CollectObligations
 // returns a HardDeny for an unwired directive type; honor it (fail closed) rather than
 // forwarding unredacted.
-func (p *ManifestPDP) withForwardObligationsFor(ctx context.Context, r capability.EnforceResponse, matched *capability.Constraint) capability.EnforceResponse {
+//
+// chain is a PARAMETER rather than a read of delegationFromContext(ctx), so the caller states
+// which chain this response's redaction composes from. It is the same rule CollectObligations
+// itself applies one layer down, and it is here for a sharper reason: the harden path used to
+// build its request deliberately WITHOUT a chain while this helper read one off the context,
+// so one call had the chain out of scope for deciding and in scope for redacting, stated
+// nowhere the two met. Each caller now passes the chain its own request carries.
+func (p *ManifestPDP) withForwardObligationsFor(ctx context.Context, r capability.EnforceResponse, matched *capability.Constraint, chain *capability.DelegationChain) capability.EnforceResponse {
 	if r.Decision == capability.DecisionAllow || len(r.Obligations) > 0 {
 		return r
 	}
 	if !willForwardDeny(ctx, matched) || matched == nil {
 		return r
 	}
-	obs, deny := p.engine.CollectObligations(delegationFromContext(ctx), matched, r.RequestID, r.DecidedAt)
+	obs, deny := p.engine.CollectObligations(chain, matched, r.RequestID, r.DecidedAt)
 	if deny != nil {
 		return *deny
 	}
@@ -1775,12 +1819,14 @@ func (p *ManifestPDP) withForwardObligationsFor(ctx context.Context, r capabilit
 // rather than this function reaching for directivesNamingTarget itself, so each site states
 // WHICH selection it is filling from: HardenRefusal passes its hardenSelection's, where the
 // two selections sit side by side and the widening is documented.
-func (p *ManifestPDP) withForwardObligations(ctx context.Context, r capability.EnforceResponse, target EnforceTarget, naming namingSelector) capability.EnforceResponse {
+//
+// chain is a parameter for the reason it is on withForwardObligationsFor: which chain a
+// response's redaction composes from is a decision each call site makes in the open.
+func (p *ManifestPDP) withForwardObligations(ctx context.Context, r capability.EnforceResponse, target EnforceTarget, naming namingSelector, chain *capability.DelegationChain) capability.EnforceResponse {
 	if r.Decision == capability.DecisionAllow || len(r.Obligations) > 0 || !enforcement.SkipQuota(ctx) {
 		return r
 	}
 	dirs := naming()
-	chain := delegationFromContext(ctx)
 	// No early return on `len(dirs) == 0`: a delegated caller whose hops compose a
 	// redactFields list must have it applied even when no manifest entry names this target,
 	// and CollectObligations already answers "is there anything to apply" — restating that
@@ -1868,12 +1914,17 @@ func (p *ManifestPDP) hardenOnBrokenInterface(sessionID string, r capability.Enf
 // build, so a contract naming one of those resolves to the same value here that the full path
 // would have resolved.
 //
-// Delegation is deliberately absent, for both callers. A *VerdictFor seam may only HARDEN a
-// refusal, and a delegation refusal is downgradable by design — the full path forwards it
-// under --audit too, so there is no inversion here for a composed delegation verdict to
-// close, and producing a soft verdict through a harden-only seam would break that seam's
-// contract to fix nothing.
-func hardenRequest(ctx context.Context, sessionID string, target EnforceTarget, args, claims map[string]interface{}) *capability.EnforceRequest {
+// Delegation is a PARAMETER rather than a field this function decides for its callers, and
+// that is the whole point of it being here. It used to be deliberately absent, on the argument
+// that a *VerdictFor seam may only HARDEN a refusal while a delegation refusal is downgradable
+// by design — sound for the VERDICT, and silently contradicted by the same path's obligation
+// fill, which read the chain off the context and applied its composed redactFields to the very
+// response this request decided. One call, chain out of scope for deciding and in scope for
+// redacting, with the reasoning living in this doc where the obligation helpers never passed.
+// Now every harden leg states which chain it is asking about (HardenRefusal resolves it ONCE,
+// onto hardenSelection), the obligation helpers take it off the request rather than the
+// context, and a seam that must not act on it simply is not handed it.
+func hardenRequest(ctx context.Context, sessionID string, target EnforceTarget, args, claims map[string]interface{}, chain *capability.DelegationChain) *capability.EnforceRequest {
 	return &capability.EnforceRequest{
 		SessionID:  sessionID,
 		TargetName: target.Name,
@@ -1884,6 +1935,7 @@ func hardenRequest(ctx context.Context, sessionID string, target EnforceTarget, 
 		},
 		Claims:         claims,
 		DeclaredLabels: declaredLabelsFromContext(ctx),
+		Delegation:     chain,
 	}
 }
 
@@ -1970,7 +2022,56 @@ func (p *ManifestPDP) hardenOnEffectCeiling(ctx context.Context, sessionID strin
 	if matched == nil {
 		return r, false
 	}
-	return p.hardenViaVerdict(ctx, r, matched, hardenRequest(ctx, sessionID, target, args, sel.claims), p.engine.CeilingVerdictFor)
+	return p.hardenViaVerdict(ctx, r, matched, hardenRequest(ctx, sessionID, target, args, sel.claims, sel.delegation), p.engine.CeilingVerdictFor)
+}
+
+// hardenOnDelegatedEffectClass re-stamps a refusal that some OTHER layer produced as the
+// delegation chain's own effect-class refusal when a hop capped this delegate below the action's
+// resolved class. capped reports whether it fired.
+//
+// It is the delegation half of hardenOnEffectCeiling's wrapper problem, and it exists because
+// the harden path applied the chain to its OBLIGATIONS and not to its VERDICT: the forwarded
+// response was masked by the chain's composed redactFields while the refusal itself was taken as
+// if the caller held no delegation at all. What that cost is attribution, not authority — a
+// delegated caller over its hop's cap was refused either way, but under the wrapping layer's
+// generic AUTHORIZATION_FAILED, so nothing on the tape named the axis or the hop and no
+// delegation filter found the event.
+//
+// It runs LAST of the verdict legs, which INVERTS the full path's order (there the cap is
+// checked before the declassify gate). That is deliberate and is the seam's contract rather than
+// a faithfulness lapse: a delegation refusal is downgradable by design, the ceiling's escalation
+// and the unapproved-declassification refusal are both HARD, and a harden-only seam must never
+// preempt a harder verdict with a softer one. Placing it here means it speaks only when nothing
+// harder did — where its statement is the most specific one available.
+//
+// It commits nothing: the cap is a comparison against one ResolveEffect of the matched
+// constraint's contract, which is why it can run on a path the inner PDP deliberately never
+// reached.
+func (p *ManifestPDP) hardenOnDelegatedEffectClass(ctx context.Context, sessionID string, r capability.EnforceResponse, target EnforceTarget, args map[string]interface{}, sel hardenSelection) (capability.EnforceResponse, bool) {
+	if r.Decision == capability.DecisionAllow || r.Denial == nil || r.Denial.HardDeny {
+		return r, false
+	}
+	// The overwhelmingly common case: no token, or a token declaring no delegation. Asked here
+	// so a non-delegated refusal builds no request and resolves no effect.
+	if sel.delegation.IsEmpty() {
+		return r, false
+	}
+	// A refusal ALREADY on this axis is left alone. The outer layer runs the delegation TARGET
+	// gate itself (DelegationTargetDenial, on the paths that never reach the engine), and the
+	// enforced path checks that gate FIRST — before the conditions and before the ceiling — so
+	// a call refused for reaching past its grant is refused there, not here. Composing the
+	// effect-class verdict onto it would rewrite `reason` and name a DIFFERENT hop, sending an
+	// operator to widen an effect cap while the target grant is what actually blocked the call.
+	// This leg exists to give a refusal an axis it did not have, never to relabel one that has
+	// it.
+	if enforcement.IsDelegationRefusal(r.Denial) {
+		return r, false
+	}
+	matched := sel.matched
+	if matched == nil {
+		return r, false
+	}
+	return p.hardenViaVerdict(ctx, r, matched, hardenRequest(ctx, sessionID, target, args, sel.claims, sel.delegation), p.engine.DelegationEffectClassVerdictFor)
 }
 
 // hardenViaVerdict is the tail both harden legs share: ask a non-committing *VerdictFor seam,
@@ -2008,8 +2109,9 @@ func (p *ManifestPDP) hardenViaVerdict(
 	}
 	// Still downgradable (the ceiling's onExceed: deny), so a route running --audit WILL
 	// forward it — and a forwarded response must carry the manifest's redactFields obligations
-	// or it reaches the host unmasked.
-	return p.withForwardObligationsFor(ctx, out, matched), true
+	// or it reaches the host unmasked. The chain is the one this leg's request was built with,
+	// so the verdict and the redaction speak about the same delegation.
+	return p.withForwardObligationsFor(ctx, out, matched, req.Delegation), true
 }
 
 // namingSelector resolves the wider of HardenRefusal's two selections on demand. It is a
@@ -2028,6 +2130,14 @@ type hardenSelection struct {
 	// claims are the request's, resolved once — the input BOTH selections are judged under
 	// (matched applies them, naming deliberately does not).
 	claims map[string]interface{}
+
+	// delegation is the request's validated chain, resolved ONCE for every leg below. It sits
+	// here rather than being read from the context at each site because the harden path's two
+	// halves — what it DECIDES and what it REDACTS — used to answer that question separately
+	// and differently, which is a divergence nothing in the process ever compares. One
+	// resolution, threaded into hardenRequest and into the obligations fill, is what keeps them
+	// speaking about the same delegation.
+	delegation *capability.DelegationChain
 
 	// matched answers "which authored rule governs this call": findConstraint under the
 	// request's claims, then decideTarget's own action check, so a harden leg speaks only for
@@ -2061,9 +2171,10 @@ func (p *ManifestPDP) selectForHardening(ctx context.Context, target EnforceTarg
 		matched = nil
 	}
 	return hardenSelection{
-		claims:  claims,
-		matched: matched,
-		naming:  func() []capability.Directive { return p.directivesNamingTarget(target) },
+		claims:     claims,
+		delegation: delegationFromContext(ctx),
+		matched:    matched,
+		naming:     func() []capability.Directive { return p.directivesNamingTarget(target) },
 	}
 }
 
@@ -2104,7 +2215,12 @@ func (p *ManifestPDP) HardenRefusal(ctx context.Context, sessionID string, r cap
 	if hardened, unapproved := p.hardenOnUnapprovedDeclassify(ctx, sessionID, r, target, args, sel); unapproved {
 		return hardened
 	}
-	return p.withForwardObligations(ctx, r, target, sel.naming)
+	// The delegation cap LAST of the verdict legs: it is the only one whose own refusal is
+	// downgradable, so it must not preempt either hard verdict above. See the leg's doc.
+	if hardened, capped := p.hardenOnDelegatedEffectClass(ctx, sessionID, r, target, args, sel); capped {
+		return hardened
+	}
+	return p.withForwardObligations(ctx, r, target, sel.naming, sel.delegation)
 }
 
 // EvaluateClaimCondition dispatches through THIS PDP's engine, so an embedder's
@@ -2115,6 +2231,13 @@ func (p *ManifestPDP) HardenRefusal(ctx context.Context, sessionID string, r cap
 // twice. A nil engine falls back to the built-ins inside the engine method.
 func (p *ManifestPDP) EvaluateClaimCondition(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (*enforcement.ConditionError, bool) {
 	return p.engine.NonCommittingConditionVerdict(ctx, cond, req)
+}
+
+// ConditionHandlerOverridden reports what THIS PDP's engine dispatches for condType, so a
+// composing layer that cannot route through an override learns it exists rather than
+// substituting the shipped predicate for it silently. A nil engine has overridden nothing.
+func (p *ManifestPDP) ConditionHandlerOverridden(condType string) bool {
+	return p.engine.ConditionHandlerOverridden(condType)
 }
 
 // hardenOnUnapprovedDeclassify replaces an outer layer's downgradable refusal with the
@@ -2171,7 +2294,7 @@ func (p *ManifestPDP) hardenOnUnapprovedDeclassify(ctx context.Context, sessionI
 	}
 	// The shared request shape, plus the approvals — the verdict turns on them, and the
 	// engine reads them off the request rather than the context.
-	req := hardenRequest(ctx, sessionID, target, args, sel.claims)
+	req := hardenRequest(ctx, sessionID, target, args, sel.claims, sel.delegation)
 	req.DeclassifyApprovals = declassifyApprovalsFromContext(ctx)
 	// Every refusal arm the seam returns is the engine's own, including the hard
 	// `ledger_unavailable` one: a fault that left a downgradable verdict in place made an

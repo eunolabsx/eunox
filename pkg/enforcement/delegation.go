@@ -4,7 +4,9 @@
 package enforcement
 
 import (
+	"context"
 	"fmt"
+	"time"
 
 	"github.com/eunolabs/eunox/pkg/capability"
 )
@@ -90,6 +92,52 @@ func (e *Engine) checkDelegationEffectClass(req *capability.EnforceRequest, eff 
 	return delegationDenial(auditOnly, requestID, now, "effect_class", subject,
 		fmt.Sprintf("this action's effect class %q exceeds the %q cap delegated to %q", eff.Class, cap0, subject),
 		map[string]interface{}{"effect_class": eff.Class, "delegated_max_effect_class": cap0})
+}
+
+// DelegationEffectClassVerdictFor answers ONE question — "is this action more consequential
+// than the tightest maxEffectClass the request's chain delegated?" — for a constraint that has
+// already been selected, WITHOUT evaluating a single condition and WITHOUT committing any
+// state. It returns the refusal the cap would produce, or nil when the request carries no
+// chain, no hop caps the class, or the action is within the cap.
+//
+// It is the delegation half of the COMPOSED case CeilingVerdictFor exists for, and it exists
+// because the two halves of one harden path disagreed about whether a chain was in scope: the
+// obligations fill applied the chain's composed redactFields to the forwarded response while
+// the verdict was taken without the chain at all, so a delegated caller whose hop capped its
+// effect class below the route's ceiling got a refusal hardened by the ceiling and not by the
+// cap. Both choices were individually defensible and neither was stated where they met.
+//
+// What it composes is an ATTRIBUTION, not extra hardness: a delegation refusal is downgradable
+// by design (see delegationDenial), so this can only ever replace one soft refusal with another
+// — the caller's composition takes the AND of the two audit postures, and the caller only
+// reaches this at all for a refusal that is already soft. What it buys is that the tape names
+// the axis and the hop (`delegation: true`, `reason: effect_class`, `delegate`) instead of
+// carrying the wrapping layer's generic authorization failure, which is the same reason the
+// ceiling's own seam exists. A caller must therefore still use it ONLY on an already-refused
+// call, and never where a HARDER verdict is available.
+//
+// Like the ceiling's, it reads ONE ResolveEffect of the matched constraint's contract, so it
+// cannot disagree with the full path about what the call's effect was.
+func (e *Engine) DelegationEffectClassVerdictFor(_ context.Context, req *capability.EnforceRequest, matched *capability.Constraint) *capability.EnforceResponse {
+	if e == nil || req == nil || matched == nil || req.Delegation.IsEmpty() {
+		return nil
+	}
+	effect := capability.ResolveEffect(matched.Effect, req.Arguments)
+	return e.checkDelegationEffectClass(req, effect, matched.IsAuditOnly(), NewRequestID(), e.clock.Now().UTC().Format(time.RFC3339Nano))
+}
+
+// IsDelegationRefusal reports whether d is a refusal one of the delegation gates produced.
+//
+// It reads the taxonomy slot every one of them stamps rather than the details discriminator,
+// because the slot is what the audit taxonomy keys on and it cannot be set by anything else:
+// delegationConditionType is not a condition an author can attach to a target.
+//
+// It is exported for a composing layer deciding whether it has anything to ADD. A verdict on
+// this axis composed onto a refusal already on this axis is not a hardening but a REPLACEMENT
+// — a different reason and a different hop, for a call the enforced path would have refused at
+// the earlier gate — so the layer that would compose asks this first.
+func IsDelegationRefusal(d *capability.DenialInfo) bool {
+	return d != nil && d.ConditionType == delegationConditionType
 }
 
 // delegationDenial builds the refusal every gate above returns, so the code, the taxonomy

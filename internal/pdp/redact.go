@@ -30,8 +30,9 @@ import (
 //
 // The result is decoded into a generic map so fields the proxy does not model
 // (structuredContent, _meta, annotations, non-text content) survive the round-trip.
-// Redaction applies to (1) each text content item whose body is clean JSON and (2)
-// the structuredContent object. Content that is not a clean JSON container — free-form
+// Redaction applies to (1) each content item — its text body when it has one, plus every
+// other key it carries (see redactContentItemKeys) — (2) the structuredContent object,
+// and (3) every other top-level envelope key. Content that is not a clean JSON container — free-form
 // text, malformed JSON, JSON embedded in prose, a scalar — carries no addressable JSON
 // object key and passes through unchanged; redactFields redacts cleanly-parseable JSON
 // only and does NOT fail the response closed over string content it cannot parse. It
@@ -114,11 +115,11 @@ func ApplyRedactObligs(resultBytes []byte, obligs []capability.Obligation) ([]by
 		return nil, err
 	}
 
-	// (1) Redact within each text content item. Any structurally unverifiable shape
-	// — a non-array `content`, a non-object item, an item with no string `type`, an
-	// unrecognized type, or a type=="text" item whose body is not a string — could
-	// hide the named field, so each fails the whole response closed rather than
-	// forward unredacted.
+	// (1) Redact within each content item — its `text` body, and every OTHER key it
+	// carries. Any structurally unverifiable shape — a non-array `content`, a non-object
+	// item, an item with no string `type`, an unrecognized type, or a type=="text" item
+	// whose body is not a string — could hide the named field, so each fails the whole
+	// response closed rather than forward unredacted.
 	changed := false
 	if raw, present := result["content"]; present {
 		content, ok := raw.([]interface{})
@@ -130,43 +131,13 @@ func ApplyRedactObligs(resultBytes []byte, obligs []capability.Obligation) ([]by
 			if !ok {
 				return nil, fmt.Errorf("redactFields: response 'content' item is not an object (%T); cannot verify redaction (fail closed)", item)
 			}
-			t, ok := obj["type"].(string)
-			if !ok || t == "" {
-				return nil, fmt.Errorf("redactFields: response 'content' item has no string 'type'; cannot verify redaction (fail closed)")
-			}
-			if t != "text" {
-				switch t {
-				case "resource", "resource_link":
-					// A resource / resource_link content item nests a `resource` object that
-					// can carry a `text` or `blob` body holding arbitrary (possibly sensitive)
-					// data this redactor does NOT walk. Silently forwarding it would let an
-					// upstream evade a declared redactFields obligation by embedding the named
-					// field inside a resource body. An active redaction obligation cannot be
-					// satisfied over content the redactor cannot inspect, so fail the whole
-					// response closed rather than forward it unredacted. See
-					// docs/capability-manifest-guide.md.
-					return nil, fmt.Errorf("redactFields: response 'content' item type %q carries an embedded resource body this redactor cannot inspect; cannot verify redaction (fail closed)", t)
-				default:
-					if !isRecognizedContentType(t) {
-						return nil, fmt.Errorf("redactFields: response 'content' item has unrecognized type %q; cannot verify redaction (fail closed)", t)
-					}
-					// Recognized binary media (image/audio) carries no addressable JSON body a
-					// redactFields dot-path could match, so it is preserved unchanged.
-					continue
-				}
-			}
-			text, ok := obj["text"].(string)
-			if !ok {
-				return nil, fmt.Errorf("redactFields: text content item has a non-string 'text' body (%T); cannot verify redaction (fail closed)", obj["text"])
-			}
-			redacted, err := redactJSONText(text, spec)
+			c, err := redactContentItem(obj, spec)
 			if err != nil {
 				return nil, err // fail closed
 			}
-			if redacted != text {
+			if c {
 				changed = true
 			}
-			obj["text"] = redacted
 		}
 	}
 
@@ -221,6 +192,147 @@ func ApplyRedactObligs(resultBytes []byte, obligs []capability.Obligation) ([]by
 		return nil, fmt.Errorf("redactFields: failed to re-marshal redacted response: %w", err)
 	}
 	return out, nil
+}
+
+// redactContentItem redacts ONE `content` item in place and reports whether anything was
+// masked. It is the per-item body of pass (1), split out of ApplyRedactObligs so that
+// function stays a loop over the array rather than a nested type switch inside one.
+//
+// The type dispatch decides what happens to the item's BODY — text is walked, image/audio
+// have none, resource/resource_link fail the response closed — and every item that survives
+// the dispatch then has its remaining keys walked by redactContentItemSiblings. The
+// fail-closed arm therefore stays AHEAD of the walk: an item this redactor cannot inspect is
+// refused before anything is masked, unchanged.
+func redactContentItem(obj map[string]interface{}, spec redactSpec) (bool, error) {
+	t, ok := obj["type"].(string)
+	if !ok || t == "" {
+		return false, fmt.Errorf("redactFields: response 'content' item has no string 'type'; cannot verify redaction (fail closed)")
+	}
+	if t != "text" {
+		switch t {
+		case "resource", "resource_link":
+			// A resource / resource_link content item nests a `resource` object that
+			// can carry a `text` or `blob` body holding arbitrary (possibly sensitive)
+			// data this redactor does NOT walk. Silently forwarding it would let an
+			// upstream evade a declared redactFields obligation by embedding the named
+			// field inside a resource body. An active redaction obligation cannot be
+			// satisfied over content the redactor cannot inspect, so fail the whole
+			// response closed rather than forward it unredacted. See
+			// docs/capability-manifest-guide.md.
+			return false, fmt.Errorf("redactFields: response 'content' item type %q carries an embedded resource body this redactor cannot inspect; cannot verify redaction (fail closed)", t)
+		default:
+			if !isRecognizedContentType(t) {
+				return false, fmt.Errorf("redactFields: response 'content' item has unrecognized type %q; cannot verify redaction (fail closed)", t)
+			}
+			// Recognized binary media (image/audio) carries no addressable JSON body of its
+			// OWN that a redactFields dot-path could match — but it may still carry keys that
+			// do, so it falls through to the walk instead of being passed through whole. Its
+			// `data` is base64 text, not a JSON container, so the walk leaves it alone by the
+			// same rule that passes prose through.
+			//
+			// bodyHandled is FALSE here, and that is the load-bearing part: this item's `text`
+			// (if it has one — nothing in the protocol forbids it) got no body pass, so the
+			// walk must treat it as an ordinary key. Passing true would leave it inspected by
+			// no pass at all, which is exactly the gap this walk exists to close, one type
+			// dispatch away.
+			return redactContentItemKeys(obj, spec, t, false)
+		}
+	}
+	text, ok := obj["text"].(string)
+	if !ok {
+		return false, fmt.Errorf("redactFields: text content item has a non-string 'text' body (%T); cannot verify redaction (fail closed)", obj["text"])
+	}
+	redacted, err := redactJSONText(text, spec)
+	if err != nil {
+		return false, err // fail closed
+	}
+	changed := redacted != text
+	obj["text"] = redacted
+	// The item's other keys, AFTER its body: the walk skips `text` because THIS pass handled
+	// it, so the body is processed exactly once, under the rigor its own pass applies.
+	sibChanged, sibErr := redactContentItemKeys(obj, spec, t, true)
+	if sibErr != nil {
+		return false, sibErr // fail closed
+	}
+	return changed || sibChanged, nil
+}
+
+// redactContentItemKeys applies the redaction paths to a `content` item's keys. bodyHandled
+// reports whether the caller already ran the `text` body through its own pass: when it did,
+// `text` is skipped here so the body is processed exactly once; when it did not (an
+// image/audio item, whose dispatch has no body pass), `text` is walked like any other key,
+// because a key no pass inspects is the whole defect this walk exists to close. `type` is
+// always skipped — it is read as a string by the dispatch and carries nothing addressable.
+//
+// It is redactSiblingTopLevelKeys' rationale one level down, and it is the same rationale
+// verbatim: `content` and `structuredContent` are the shapes MCP defines, but a content ITEM
+// may legally carry more than `type`/`text` — `annotations` and `_meta` are in the spec, and
+// vendor extensions are ordinary — and no other pass walks them. The envelope-root pass
+// explicitly skips `key == "content"`, so a named field sitting in any other key of a content
+// item was forwarded UNREDACTED while the audit record reported the obligation applied. An
+// upstream returning {"content":[{"type":"text","text":"benign","extra":{"ssn":"…"}}]}
+// defeated the obligation entirely, and the identical field one level out was masked.
+//
+// Both of redactSiblingValue's anchorings are wanted here for the reasons stated there:
+// ITEM-relative, so "extra.ssn" reaches an ssn inside a doubly-encoded blob at a key named
+// `extra`, and value-relative, so a container an upstream RELOCATED under some other key is
+// still masked. Deliberate over-redaction is the safe direction for a DLP obligation.
+//
+// The paths are also applied to the item map ITSELF first, for the reason
+// redactSiblingTopLevelKeys applies them to the envelope: the value walk below only ever sees
+// a key's VALUE, so a declared field sitting DIRECTLY on the item —
+// {"type":"text","text":"benign","ssn":"123-45-6789"} — would never be tested against its own
+// name. A single-segment path naming one of the item's PROTOCOL-structural keys is exempt from
+// that pass alone (see contentItemRootExempt); every other key is ordinary data at this level
+// and masking one the operator NAMED is what they asked for.
+func redactContentItemKeys(obj map[string]interface{}, spec redactSpec, itemType string, bodyHandled bool) (bool, error) {
+	changed := false
+	reserved := contentItemReservedKeys(itemType)
+	for _, p := range spec.paths {
+		if contentItemRootExempt(p, reserved) {
+			continue
+		}
+		if redactDotPathRec(obj, p) {
+			changed = true
+		}
+	}
+	for key, val := range obj {
+		if key == "type" || (key == "text" && bodyHandled) {
+			continue
+		}
+		out, c, err := redactSiblingValue(key, val, spec)
+		if err != nil {
+			return false, err // fail closed
+		}
+		if c {
+			// Containers are mutated in place, so this write only matters for a string leaf
+			// (replaced by value); assigning to an already-present key during the range is safe.
+			obj[key] = out
+			changed = true
+		}
+	}
+	return changed, nil
+}
+
+// contentItemRootExempt reports whether a redact path must not be applied at a content item's
+// root. It is envelopeRootExempt one level down, with the same shape and the same reason:
+// only a SINGLE-SEGMENT path naming one of the item's protocol-structural keys is exempt,
+// because masking one of those wholesale replaces a value the PROTOCOL owns with a string
+// sentinel, handing a host a content item it cannot decode — `annotations` and `_meta` are
+// objects, `resource` is an object, and a struct-binding SDK fails the whole tool result over
+// one of them. That is the identical trade mcpReservedRootKeys makes at the envelope, and it
+// costs the obligation nothing: the value walk still descends every one of these (except the
+// two the dispatch owns), so a declared field hidden INSIDE an item's `_meta` is masked
+// exactly as before — only the "mask the whole component" spelling is withheld.
+//
+// A DOTTED path through one is not exempt, matching the envelope rule. It names a leaf, and
+// masking that leaf is what the operator asked for.
+func contentItemRootExempt(path string, reserved map[string]struct{}) bool {
+	if strings.Contains(path, ".") {
+		return false
+	}
+	_, isReserved := reserved[path]
+	return isReserved
 }
 
 // redactionKeysAmbiguous reports whether raw — a result envelope, or a JSON container
@@ -632,6 +744,52 @@ func redactJSONValue(val interface{}, paths []string) bool {
 var mcpContentItemKeys = map[string]struct{}{
 	"type": {},
 	"text": {},
+}
+
+// textItemReservedKeys and binaryItemReservedKeys are a content item's PROTOCOL-structural
+// keys, PER TYPE: what the protocol owns on a `text` item, and what it owns on an
+// `image`/`audio` one. (`resource`/`resource_link` items need no set — they are refused before
+// any walk.)
+//
+// They are exempt from WHOLESALE masking at the item root, exactly as mcpReservedRootKeys is
+// at the envelope root and for the same reason: the sentinel is a string, and replacing a
+// protocol object (`annotations`, `_meta`) or a typed field with one yields an item a
+// spec-conformant host cannot decode — a struct-binding SDK fails the whole tool result over
+// it, which is a hard protocol failure in place of the field-level masking the operator asked
+// for. It is not a redaction gap: the value walk still descends every one of these except the
+// two the dispatch owns, so a declared field hidden inside an item's `_meta` is masked as
+// before; only the "mask the whole component" spelling is withheld.
+//
+// Split by type rather than unioned, because the union costs real coverage: `data` is the
+// binary payload on an image item and an ordinary field NAME anywhere else, so exempting it
+// everywhere would forward a declared `data` on a text item — a leak, to protect a shape that
+// item cannot have. The rule is "what the PROTOCOL owns here", and that is a property of the
+// item's type.
+//
+// They are deliberately NOT in the case-variant fold scope (redactionFoldKeys), unlike the
+// two dispatch keys. A variant here routes a key to the item-root MASK rather than away from
+// a stricter pass, so the divergence between this redactor and a case-insensitive host can
+// only produce more masking, never less — over-redaction, which is the safe direction and not
+// worth refusing a response over.
+var (
+	textItemReservedKeys = map[string]struct{}{
+		"type": {}, "text": {}, "annotations": {}, "_meta": {},
+	}
+	binaryItemReservedKeys = map[string]struct{}{
+		"type": {}, "data": {}, "mimeType": {}, "annotations": {}, "_meta": {},
+	}
+)
+
+// contentItemReservedKeys returns the protocol-structural keys of a content item of type t.
+// An unrecognized type never reaches here (the dispatch fails the response closed), so the
+// text set is the conservative default rather than a case that runs.
+func contentItemReservedKeys(t string) map[string]struct{} {
+	switch t {
+	case "image", "audio":
+		return binaryItemReservedKeys
+	default:
+		return textItemReservedKeys
+	}
 }
 
 var mcpReservedRootKeys = map[string]struct{}{

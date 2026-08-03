@@ -84,6 +84,7 @@ import (
 	jose "github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
 
+	"github.com/eunolabs/eunox/internal/audit"
 	"github.com/eunolabs/eunox/pkg/capability"
 	"github.com/eunolabs/eunox/pkg/circuitbreaker"
 	"github.com/eunolabs/eunox/pkg/enforcement"
@@ -196,15 +197,32 @@ func jwtClaimsFromContext(ctx context.Context) (*JWTClaims, bool) {
 	return c, ok && c != nil
 }
 
-// AuditIdentityFromContext returns the agent/task/user identity from any validated
-// JWT claims in ctx (empty strings when none). The user identity is the token
-// subject (sub), the human/principal the agent acts for. Wired into the audit sink
-// via audit.WithIdentity so it stamps IdP identity without importing the JWT layer.
-func AuditIdentityFromContext(ctx context.Context) (agentID, taskID, userID string) {
-	if c, ok := jwtClaimsFromContext(ctx); ok {
-		return c.AgentID, c.TaskID, c.Subject
+// AuditIdentityFromContext returns the caller identity from any validated JWT claims in ctx
+// (the zero Identity when there are none). The user identity is the token subject (sub), the
+// human/principal the agent acts for. Wired into the audit sink via audit.WithIdentity so it
+// stamps IdP identity without importing the JWT layer.
+//
+// The delegation half is what makes a DELEGATED allow attributable. A refusal on that axis
+// already names the hop that blocked it, in the denial's details; an allow carried nothing at
+// all, so a call made by agent-b, delegated from agent-a, acting for a human, produced a record
+// whose only identity was that human's — indistinguishable from one they made directly, which
+// is backwards for the record an investigator most needs to attribute.
+func AuditIdentityFromContext(ctx context.Context) audit.Identity {
+	c, ok := jwtClaimsFromContext(ctx)
+	if !ok {
+		return audit.Identity{}
 	}
-	return "", "", ""
+	return audit.Identity{
+		AgentID:  c.AgentID,
+		TaskID:   c.TaskID,
+		UserID:   c.Subject,
+		Delegate: c.Delegation.Delegate(),
+		// len(Actors), not len(Grants): the actors are the identities the token passed
+		// through, which is what a depth means to a reader reconstructing user -> a -> b. A
+		// chain may carry per-hop grants without an act claim, and Delegate() is empty there
+		// too — the two fields agree about what they describe.
+		DelegationDepth: c.Delegation.ActorDepth(),
+	}
 }
 
 // mcpClaimVersion is the only accepted value for the mcp claim set's "v" field.
@@ -1563,6 +1581,7 @@ func (p *JWTPDP) decideInner(ctx context.Context, sessionID string, target Enfor
 // contract implementation to say so.
 type claimConditionEvaluator interface {
 	EvaluateClaimCondition(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (*enforcement.ConditionError, bool)
+	ConditionHandlerOverridden(condType string) bool
 }
 
 // claimConditionVerdict asks the deciding PDP, or the built-ins when there is none.
@@ -1579,11 +1598,28 @@ func claimConditionVerdict(eval claimConditionEvaluator, ctx context.Context, co
 	return eval.EvaluateClaimCondition(ctx, cond, req)
 }
 
+// claimConditionOverridden asks the deciding PDP whether an embedder replaced its semantics
+// for condType, for the ONE claim-side arm that cannot dispatch through the replacement (see
+// PolicyDecisionPoint.ConditionHandlerOverridden). The nil case reads exactly as it does in
+// claimConditionVerdict: no wrapped PDP means no engine, so nothing can have been overridden.
+func claimConditionOverridden(eval claimConditionEvaluator, condType string) bool {
+	return eval != nil && eval.ConditionHandlerOverridden(condType)
+}
+
 // EvaluateClaimCondition delegates to the PDP this one wraps, so a stack of wrappers
 // resolves to the semantics of whatever is actually deciding. With no inner PDP there is
 // no engine either, so the built-ins are the route's semantics — see claimConditionVerdict.
 func (p *JWTPDP) EvaluateClaimCondition(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (*enforcement.ConditionError, bool) {
 	return claimConditionVerdict(p.inner, ctx, cond, req)
+}
+
+// ConditionHandlerOverridden delegates to the PDP this one wraps, for the reason
+// EvaluateClaimCondition does: a stack of wrappers must resolve to the semantics of whatever is
+// actually deciding, and a wrapper answering on its own behalf ("I hold no engine") is exactly
+// the divergence the question exists to detect. No inner PDP means no engine, so nothing has
+// been overridden.
+func (p *JWTPDP) ConditionHandlerOverridden(condType string) bool {
+	return claimConditionOverridden(p.inner, condType)
 }
 
 // jwtClaimEnforceRequest builds the EnforceRequest a capability claim's conditions are
@@ -2510,6 +2546,29 @@ func evaluateJWTConditions(ctx context.Context, clock enforcement.Clock, eval cl
 	for _, cond := range conditions {
 		switch c := cond.(type) {
 		case capability.AllowedOperationsCondition:
+			// The one arm that cannot be dispatched through the deciding PDP's own handler.
+			// Everything below is a DIFFERENT predicate from the engine's: the claim grammar
+			// cannot name the operation argument, so this scans every argument while the
+			// engine's handler hard-denies exactly that empty argument. That divergence is
+			// deliberate and documented — and sound only while both sides are the semantics
+			// this build ships. An embedder who redefined allowedOperations
+			// (enforcement.WithConditionHandler) would otherwise get the replacement enforced
+			// on the manifest path and the shipped predicate here, for the same condition type
+			// on the same call: nothing fails, nothing logs, and the two verdicts are each
+			// internally consistent and only wrong together.
+			//
+			// Routing this arm through the override is not the fix (it would deny every `op=`
+			// grant in existence, since the engine's handler refuses the argument-less form),
+			// so the honest answer is to refuse the GRANT. Startup refuses the wiring outright
+			// — see transport.WrapRoutesWithJWT — and this is the backstop for a JWTPDP built
+			// directly, where no startup check ran.
+			if claimConditionOverridden(eval, capability.ConditionTypeAllowedOperations) {
+				resp := denyResponseWithDetails(clock, capability.ErrCodeConditionFailed, capability.ConditionTypeAllowedOperations,
+					fmt.Sprintf("%q: the deciding policy redefines %s, and this capability claim's argument-less op= form cannot be judged by that handler; deny (fail closed) — grant the operation through a manifest constraint that names the operation argument instead",
+						name, capability.ConditionTypeAllowedOperations),
+					map[string]interface{}{"conditionType": capability.ConditionTypeAllowedOperations, "reason": "handler_override_unsupported"})
+				return &resp
+			}
 			if c.Argument != "" {
 				// Intentional fail-closed guard, NOT dead code: this capability-claim grammar
 				// has no way to name the operation argument (buildV2Constraint always emits

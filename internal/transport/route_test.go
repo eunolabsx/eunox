@@ -1134,3 +1134,42 @@ func TestGateway_SessionOwnerBinding_DifferentSubRefused(t *testing.T) {
 		t.Error("the session owner (agent-1) must still call tools on its own session")
 	}
 }
+
+// TestWrapRoutesWithJWT_RefusesAnUnenforceableOperationsOverride pins the startup half of the
+// allowedOperations divergence. The capability-claim path's `op=` shorthand names no operation
+// argument, so its arm scans every argument and cannot dispatch through an embedder's
+// replacement handler — enforcing the replacement on the manifest path and the shipped
+// predicate on the token path for the same call, silently. The wiring is refused where an
+// operator can act on it, and only where the claim path is reachable at all.
+func TestWrapRoutesWithJWT_RefusesAnUnenforceableOperationsOverride(t *testing.T) {
+	overridden := enforcement.New(enforcement.WithConditionHandler(
+		capability.ConditionTypeAllowedOperations,
+		enforcement.ConditionHandlerFunc(func(_ context.Context, _ capability.Condition, _ *capability.EnforceRequest) *enforcement.ConditionError {
+			return nil
+		})))
+	newRoutes := func(engine *enforcement.Engine) map[string]*UpstreamRoute {
+		return map[string]*UpstreamRoute{
+			"a": {name: "a", pdp: pdp.NewManifestPDP(nil, engine, killswitch.NewInMemory()), sink: &routeSink{}},
+		}
+	}
+	opts := pdp.JWTPDPOptions{Issuer: "iss", AllowAnyAudience: true, ExperimentalCapabilities: true}
+
+	if _, err := WrapRoutesWithJWT(newRoutes(overridden), opts); err == nil {
+		t.Fatal("WrapRoutesWithJWT accepted a route whose engine redefines allowedOperations while the capability-claim path is enabled; want a fail-closed startup error")
+	} else if !strings.Contains(err.Error(), capability.ConditionTypeAllowedOperations) {
+		t.Fatalf("the error must name the condition type an operator has to act on: %v", err)
+	}
+
+	// Without the experimental claim schema the arm is unreachable (a token carrying
+	// mcp.capabilities is rejected at validation), so there is no divergence to refuse over.
+	noClaims := opts
+	noClaims.ExperimentalCapabilities = false
+	if _, err := WrapRoutesWithJWT(newRoutes(overridden), noClaims); err != nil {
+		t.Fatalf("the override must not block startup when the capability-claim path is disabled: %v", err)
+	}
+
+	// And an engine carrying only the built-ins is unaffected either way.
+	if _, err := WrapRoutesWithJWT(newRoutes(enforcement.New()), opts); err != nil {
+		t.Fatalf("an un-overridden engine must wrap cleanly: %v", err)
+	}
+}

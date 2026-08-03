@@ -476,7 +476,7 @@ func TestDecisionSerializer_ZeroTicketIsANoOp(t *testing.T) {
 	t.Parallel()
 	g := newDecisionSerializer()
 	require.NotPanics(t, func() { g.begin(decisionTicket{})() })
-	end, ok := g.beginWithin(decisionTicket{}, time.Millisecond)
+	end, ok := g.beginWithin(decisionTicket{}, turnWait{perHolder: time.Millisecond, total: time.Millisecond})
 	assert.True(t, ok, "an unserialized request is never refused its (absent) turn")
 	require.NotPanics(t, end)
 }
@@ -497,7 +497,7 @@ func TestDecisionSerializer_AbandonedTicketDoesNotStrandTheQueue(t *testing.T) {
 	later := g.take(anchor)
 
 	// The middle ticket gives up while the first still holds the turn.
-	end, ok := g.beginWithin(abandoned, 20*time.Millisecond)
+	end, ok := g.beginWithin(abandoned, turnWait{perHolder: 20 * time.Millisecond, total: 20 * time.Millisecond})
 	assert.False(t, ok, "a turn that does not come up within the bound must be reported, not waited for")
 	assert.Nil(t, end, "and no turn was taken, so there is nothing to release")
 
@@ -528,7 +528,7 @@ func TestDecisionSerializer_ConsecutiveAbandonmentsAreSkipped(t *testing.T) {
 
 	first := g.begin(g.take(anchor))
 	for range 3 {
-		_, ok := g.beginWithin(g.take(anchor), 10*time.Millisecond)
+		_, ok := g.beginWithin(g.take(anchor), turnWait{perHolder: 10 * time.Millisecond, total: 10 * time.Millisecond})
 		require.False(t, ok)
 	}
 	last := g.take(anchor)
@@ -553,7 +553,7 @@ func TestDecisionSerializer_BeginWithinTakesATurnThatIsAvailable(t *testing.T) {
 	g := newDecisionSerializer()
 	anchor := sessionAnchorKey("sess-a")
 
-	end, ok := g.beginWithin(g.take(anchor), time.Second)
+	end, ok := g.beginWithin(g.take(anchor), turnWait{perHolder: time.Second, total: time.Second})
 	require.True(t, ok)
 	require.NotNil(t, end)
 
@@ -600,9 +600,9 @@ func TestStdioSamplingTurn_BoundedRatherThanWedgingTheReader(t *testing.T) {
 	waited := time.Since(start)
 	assert.False(t, ok, "the sampling leg must give up rather than park the session's reader goroutine")
 	assert.Nil(t, end, "no turn was taken, so there is nothing to release")
-	assert.GreaterOrEqual(t, waited, samplingTurnWait/2,
+	assert.GreaterOrEqual(t, waited, samplingTurnWait.perHolder/2,
 		"it must WAIT for the turn — an instant refusal would fail every sampling request under ordinary contention")
-	assert.Less(t, waited, 4*samplingTurnWait, "and give up on roughly its own bound")
+	assert.Less(t, waited, 4*samplingTurnWait.total, "and give up on roughly its own bound")
 
 	// The host's next request is still served: the abandoned ticket did not strand the queue.
 	next := p.decideGate.takeOn(p.decideQueue)
@@ -651,7 +651,7 @@ func TestStdioUpstreamRequest_ReturnsWhileTheTurnIsHeld(t *testing.T) {
 	}()
 	select {
 	case <-done:
-	case <-time.After(4 * samplingTurnWait):
+	case <-time.After(4 * samplingTurnWait.total):
 		t.Fatal("the upstream reader is wedged on a turn whose holder is waiting for a response only it can deliver")
 	}
 
@@ -830,10 +830,10 @@ func TestStdioUpstreamRequest_DoesNotStallResponseDelivery(t *testing.T) {
 
 	select {
 	case <-reply:
-	case <-time.After(4 * samplingTurnWait):
+	case <-time.After(4 * samplingTurnWait.total):
 		t.Fatal("the response never arrived: the reader is wedged behind the sampling handler")
 	}
-	assert.Less(t, time.Since(start), samplingTurnWait/2,
+	assert.Less(t, time.Since(start), samplingTurnWait.perHolder/2,
 		"the reader must keep delivering responses while a sampling handler waits for the turn, "+
 			"not stall for the length of that wait")
 
@@ -842,7 +842,7 @@ func TestStdioUpstreamRequest_DoesNotStallResponseDelivery(t *testing.T) {
 	held()
 	require.NoError(t, pw.Close())
 	<-readerDone
-	p.awaitServerRequestsDrained(4 * samplingTurnWait)
+	p.awaitServerRequestsDrained(4 * samplingTurnWait.total)
 	assert.Zero(t, p.serverPool.inFlight.Load(), "every dispatched handler must be accounted for at teardown")
 }
 
@@ -884,7 +884,7 @@ func TestHTTPUpstreamRequest_DoesNotStallTheSessionReader(t *testing.T) {
 
 	// A declassifying host call on this session holds the turn across its upstream round trip,
 	// waiting for the very response this reader has to deliver.
-	held, ok := sess.beginDecisionTurnWithin(4 * samplingTurnWait)
+	held, ok := sess.beginDecisionTurnWithin(turnWait{perHolder: 4 * samplingTurnWait.total, total: 4 * samplingTurnWait.total})
 	require.True(t, ok, "the turn must be available before the test holds it")
 
 	// That call's in-flight registration, exactly as callSubprocessUpstream makes it.
@@ -901,10 +901,10 @@ func TestHTTPUpstreamRequest_DoesNotStallTheSessionReader(t *testing.T) {
 
 	select {
 	case <-reply:
-	case <-time.After(4 * samplingTurnWait):
+	case <-time.After(4 * samplingTurnWait.total):
 		t.Fatal("the response never arrived: the session reader is wedged behind the sampling handler")
 	}
-	assert.Less(t, time.Since(start), samplingTurnWait/2,
+	assert.Less(t, time.Since(start), samplingTurnWait.perHolder/2,
 		"the session reader must keep delivering responses while a sampling handler waits for the "+
 			"turn, not stall for the length of that wait")
 
@@ -913,7 +913,7 @@ func TestHTTPUpstreamRequest_DoesNotStallTheSessionReader(t *testing.T) {
 	held()
 	require.NoError(t, pw.Close())
 	<-sess.done
-	sess.serverPool.drain(4 * samplingTurnWait)
+	sess.serverPool.drain(4 * samplingTurnWait.total)
 	assert.Zero(t, sess.serverPool.inFlight.Load(), "every dispatched handler must be accounted for at teardown")
 }
 
@@ -959,7 +959,7 @@ func TestHTTPUpstreamRequest_SaturationIsRefusedAndRecorded(t *testing.T) {
 	assert.Equal(t, jsonRPCCodeServerBusy, uw.messages[0].Error.Code, "and refused as retryable overload, not as a policy denial")
 
 	close(release)
-	sess.serverPool.drain(4 * samplingTurnWait)
+	sess.serverPool.drain(4 * samplingTurnWait.total)
 	assert.Zero(t, sess.serverPool.inFlight.Load())
 
 	require.NoError(t, sink.Close())
@@ -1052,10 +1052,10 @@ func TestStdioUpstreamRequest_SaturationIsRefusedAndRecorded(t *testing.T) {
 
 	// A freed slot ends the episode: the next request is dispatched normally.
 	close(release)
-	p.awaitServerRequestsDrained(4 * samplingTurnWait)
+	p.awaitServerRequestsDrained(4 * samplingTurnWait.total)
 	p.dispatchUpstreamRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`8`), Method: capability.MethodSamplingCreateMessage,
 	})
-	p.awaitServerRequestsDrained(4 * samplingTurnWait)
+	p.awaitServerRequestsDrained(4 * samplingTurnWait.total)
 	assert.Zero(t, p.serverPool.inFlight.Load())
 }

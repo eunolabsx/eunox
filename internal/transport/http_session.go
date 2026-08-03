@@ -132,6 +132,13 @@ type httpSession struct {
 	// including the natural upstream exit that close() deliberately does not cover.
 	dropDecideGate func()
 
+	// spanned records that a host request on this session resolved a state anchor OTHER than
+	// the one its server-initiated leg decides against. Sticky and one-way: two anchors having
+	// been seen is not a condition that can be undone, because the taint one of them carries
+	// outlives the request that wrote it. Only ever true on a task-anchored route. See
+	// noteRequestAnchor for what it costs and why the cost lands on that leg.
+	spanned atomic.Bool
+
 	notifMu   sync.Mutex
 	notifSubs []chan mcp.RPCMsg
 
@@ -361,12 +368,9 @@ func (s *httpSession) buildInitResponse(msg mcp.RPCMsg) mcp.RPCMsg {
 // (never a concatenation, which could collide across values). A refreshed token from the same
 // principal (new jti/exp, same iss+sub) still matches; a different principal does not.
 //
-// The ANCHOR pin runs first and runs even on an unbound session, because it is not about the
-// principal — see anchorMismatch.
+// The state ANCHOR is deliberately NOT one of these gates: a session may span tasks, and what
+// that costs is its server-initiated leg rather than the request. See noteRequestAnchor.
 func (s *httpSession) ownerMismatch(cur *pdp.JWTClaims) (string, bool) {
-	if s.anchorMismatch(cur) {
-		return "session_anchor_mismatch", true
-	}
 	if s.claims == nil || s.claims.Subject == "" {
 		return "", false // unbound: no creating identity to enforce
 	}
@@ -379,9 +383,11 @@ func (s *httpSession) ownerMismatch(cur *pdp.JWTClaims) (string, bool) {
 	return "", false
 }
 
-// anchorMismatch reports whether cur resolves a DIFFERENT state anchor than the one this
-// session is bound to. It is a no-op on a route that does not anchor state on the task, where
-// every request on a session resolves that session and the check is vacuous.
+// noteRequestAnchor records that a host request resolved cur's state anchor. It only ever
+// RECORDS; the question it feeds is asked through spansAnchors, so a caller cannot mistake
+// "this request spans" for "this session has spanned" — the second is the one that matters and
+// it is sticky. It is a no-op on a route that does not anchor state on the task, where every
+// request on a session resolves that session and the question is vacuous.
 //
 // It exists because the session has TWO legs that decide, and only one of them has a request in
 // scope. The host leg reads the current request's validated claims — for its decision, its
@@ -394,23 +400,42 @@ func (s *httpSession) ownerMismatch(cur *pdp.JWTClaims) (string, bool) {
 // sampling leg's turn and its state key agree with each other and both disagree with the host
 // leg. The turn's guarantee holds; it is the wrong key.
 //
-// So a session on a task-anchored route is bound to its ANCHOR, and a request resolving another
-// one is refused rather than silently accounted against a bucket this session's other leg
-// cannot see. That is the fail-closed direction, and it is what makes the captured claims an
-// honest stand-in for "this session's identity". It also refuses an authenticated request whose
-// token carries NO task id — which the engine refuses on its own (a task-anchored request must
-// not be session-keyed), just with its own denial rather than this one.
+// The first answer to that was to BIND the session to its anchor and refuse a request resolving
+// another. Fail-closed, and it made a session unable to span tasks at all — so an agent runtime
+// multiplexing several tasks over one long-lived MCP connection, which is a normal shape and
+// the reason task anchoring exists (a task outlives a connection), had to open one session and
+// one upstream subprocess per task, with no remedy but that.
 //
-// The comparison goes through the route's resolver, the same one the engine's key builder uses,
-// so it cannot come to a different answer about which anchor a request has — and so a third
+// So the SINK is refused rather than the session. Each host request is decided, keyed and
+// serialized on its OWN anchor, which is correct however many the session spans — every one of
+// those reads and writes the bucket its own token names. What cannot be decided is the leg with
+// no request in scope: on a session that has resolved two anchors, which task a
+// sampling/createMessage belongs to is genuinely undetermined, and MCP has no field an upstream
+// could use to say. That leg is therefore refused for the rest of the session's life (see
+// samplingAnchorSplitDenial), loudly and on the tape, rather than deciding against whichever
+// bucket the captured claims happen to name. Nothing else about the session changes.
+//
+// A request whose token carries NO task id under task anchoring resolves the SESSION, so it
+// counts as a second anchor here — and the engine refuses it on its own grounds anyway (a
+// task-anchored request must not be session-keyed), which is the more precise refusal.
+//
+// The resolution goes through the route's resolver, the same one the engine's key builder uses,
+// so this cannot come to a different answer about which anchor a request has — and so a third
 // anchor kind is covered by construction rather than by a second reading of the claims here.
-func (s *httpSession) anchorMismatch(cur *pdp.JWTClaims) bool {
+func (s *httpSession) noteRequestAnchor(cur *pdp.JWTClaims) {
 	rt := s.route
 	if rt == nil || !rt.taskAnchored {
-		return false
+		return
 	}
-	return rt.decisionAnchor(s.id, cur) != rt.decisionAnchor(s.id, s.claims)
+	if rt.decisionAnchor(s.id, cur) != rt.decisionAnchor(s.id, s.claims) {
+		s.spanned.Store(true)
+	}
 }
+
+// spansAnchors reports whether this session has ever resolved a state anchor other than the one
+// its server-initiated leg decides against. It is the predicate that leg refuses on; see
+// noteRequestAnchor for why the refusal is there rather than on the request.
+func (s *httpSession) spansAnchors() bool { return s != nil && s.spanned.Load() }
 
 // newSession spawns an upstream subprocess and performs the MCP initialize
 // handshake. The session is registered in p.sessions before readUpstream starts so
@@ -763,32 +788,32 @@ func (s *httpSession) gateFor(anchor enforcement.StateAnchor) *anchorGate {
 func (s *httpSession) beginDecisionTurn(ctx context.Context) func() {
 	anchor := s.route.decisionAnchorFromContext(ctx, s.id)
 	if gate := s.gateFor(anchor); gate != nil {
-		end, _ := gate.take(nil)
+		end, _ := gate.take(turnWait{})
 		return end
 	}
-	end, _ := s.route.decideGates.acquire(anchor.Key(), nil)
+	end, _ := s.route.decideGates.acquire(anchor.Key(), turnWait{})
 	return end
 }
 
-// beginDecisionTurnWithin is beginDecisionTurn for the server-initiated leg, bounded by d and
+// beginDecisionTurnWithin is beginDecisionTurn for the server-initiated leg, bounded by w and
 // anchored on the SESSION's claims (captured at initialize) because that leg has no host
-// request in scope. ok is false when the turn could not be entered in time, which the caller
-// must turn into a refusal — see samplingTurnWait.
+// request in scope. ok is false when the turn could not be entered under w's rule, which the
+// caller must turn into a refusal — see samplingTurnWait.
 //
 // Those captured claims are the same ones holdDecisionGate resolved from, so this hits the
 // cache; it still resolves and compares rather than reaching for s.decideGate directly, because
 // "the two agree" is a property to check, not one to assume. What makes the captured claims an
-// honest stand-in for the request identity in the first place is the session gate: on a route
-// that anchors state on the task, a request whose token resolves a DIFFERENT anchor is refused
-// rather than accounted against a bucket this leg cannot see (see ownerMismatch).
-func (s *httpSession) beginDecisionTurnWithin(d time.Duration) (func(), bool) {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
+// honest stand-in for the request identity is NOT a pin on the request — a session may span
+// anchors, and each host request is decided and keyed on its own — but the fact that this leg
+// does not decide at all once the session has spanned (see noteRequestAnchor and
+// samplingAnchorSplitDenial). Every turn taken here is therefore taken while one anchor is the
+// only one this session has resolved.
+func (s *httpSession) beginDecisionTurnWithin(w turnWait) (func(), bool) {
 	anchor := s.route.decisionAnchor(s.id, s.claims)
 	if gate := s.gateFor(anchor); gate != nil {
-		return gate.take(timer.C)
+		return gate.take(w)
 	}
-	return s.route.decideGates.acquire(anchor.Key(), timer.C)
+	return s.route.decideGates.acquire(anchor.Key(), w)
 }
 
 // getSession returns the session for id, or nil.

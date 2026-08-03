@@ -27,6 +27,26 @@ Section conventions:
 
 ### Added
 
+- **Two audit fields attribute a DELEGATED call: `delegate` and `delegation_depth`.** A
+  delegation *refusal* already named the hop that blocked it, in the denial details, while an
+  **allow** carried nothing — so a call made by `agent-b`, delegated from `agent-a`, acting for
+  a human, produced a record whose only identity was that human's `user_id` and was
+  indistinguishable from one they made directly. That is backwards for the record an
+  investigator most needs to attribute ("which sub-agent actually invoked
+  `tool:wire_transfer`"). Every record for a call on a token carrying an `act` chain now stamps
+  the current holder (the outermost actor) and how many hops the chain declares, both covered
+  by the record HMAC and both omitted for the overwhelming majority of records, which carry no
+  delegation at all. The terminal actor plus a depth rather than the whole actor list is a
+  deliberate size trade — every top-level field on the signed tape is a size commitment, and
+  the list is unbounded up to the 8-hop cap — and `delegate` is length-bounded exactly like
+  `agent_id`/`task_id`/`user_id`, since `act.sub` is IdP-supplied. See
+  [`docs/threat-model-mcp.md`](./docs/threat-model-mcp.md) §6.1.
+
+  **BREAKING (pre-1.0, library):** `audit.WithIdentity` now takes
+  `func(context.Context) audit.Identity` instead of a three-string tuple. Named fields rather
+  than five positional values of which three share a type: a transposition there swaps two
+  structured identity fields on the signed tape with nothing to notice it.
+
 - **Single-use declassify approvals (`once`).** A `mcp.declassify` grant marked
   `"once": true` is **burned on first use**, so a replay is refused
   `approval_consumed` instead of clearing a flow label again. The burn is keyed by the
@@ -234,6 +254,47 @@ Section conventions:
   `mcp.MethodNotificationsInitialized`, the other half of the same handshake.
 
 ### Changed
+
+- **BREAKING (pre-1.0): a session on a task-anchored route may span tasks; its
+  server-initiated leg is what pays.** Such a session used to be pinned to one anchor, and a
+  request resolving another was refused (`session_anchor_mismatch`) — fail-closed, and with no
+  remedy for an agent runtime multiplexing several tasks over one long-lived MCP connection,
+  which is a normal shape and the reason `taskAnchoredState` exists at all (a task outlives a
+  connection). Every host request is now decided, keyed and serialized on the anchor **its own
+  token** names, which is correct however many the session spans. The refusal moves to the one
+  leg that cannot work that way: a `sampling/createMessage` arrives with no host request in
+  scope, so on a session that has resolved two anchors, which task it belongs to is genuinely
+  undetermined — and deciding against whichever token `initialize` carried would let the sink
+  peek one task's flow state while another carries the taint. From the first request that
+  resolves a second anchor, every server-initiated decision on that session is refused
+  (`CONDITION_FAILED`, `condition_type: flowLabel`, `reason: session_spans_anchors`), sticky
+  for the session's life and not downgradable by `--audit`. Clients needing sampling on such a
+  route keep one session per task.
+
+- **The server-initiated leg's decision-turn wait now bounds the turn HOLDER, not the
+  waiter's arrival.** The 2-second bound was calibrated against a wedge that no longer exists
+  (the leg used to run on the upstream reader goroutine; it now runs on its own). Once
+  handlers stopped serializing, N of them parked on one gate started a single window together
+  and expired together, refusing N requests for one slow holder — where the inline version had
+  given each a fresh window for free. A waiter is now refused only when the request actually
+  holding the turn has held it for a whole window (2s) without handing off, with an absolute
+  8-second ceiling so a steadily-moving queue cannot pin a server-request pool slot
+  indefinitely. The refusal stays **hard**, stated rather than inherited: it is transient,
+  which reads like the pool's retryable `-32000`, but it is produced on the decision path where
+  an `--audit` route forwards a downgradable refusal — and forwarding a sampling request whose
+  decision never ran is what the serialization exists to prevent.
+
+- **BREAKING (pre-1.0, library): a route whose engine redefines `allowedOperations` is
+  refused at startup when the JWT capability-claim path is enabled.** `WithConditionHandler`
+  may replace any registered condition type, and the claim path can dispatch through the
+  replacement for `allowedValues` but **not** for `allowedOperations`: the `op=` shorthand
+  names no operation argument, so its arm scans every argument while the engine's handler
+  hard-denies exactly that empty argument. Routing it through the override would not enforce
+  the override — it would deny every `op=` grant in existence — so the wiring is refused where
+  an operator can act on it, and a `JWTPDP` constructed directly (no startup check) refuses the
+  grant at the request instead, with `reason: handler_override_unsupported`. Deployments that
+  register no such override, or that leave `--jwt-experimental-capabilities` off, are
+  unaffected. `pdp.PolicyDecisionPoint` gains `ConditionHandlerOverridden(condType string)`.
 
 - **BREAKING (pre-1.0): a `once` declassify grant may not ride a token that outlives the
   ledger.** A burn is remembered for seven days, so a longer-lived token could present the
@@ -870,6 +931,20 @@ Section conventions:
 
 ### Fixed
 
+- **The harden path applies a delegation chain to its verdict, not only to its obligations.**
+  `HardenRefusal` composes this PDP's verdicts onto a refusal the JWT layer produced. Its
+  obligation fill read the chain off the context and applied the chain's composed
+  `redactFields` to the forwarded response, while the request it built for the verdict
+  deliberately carried no chain at all — so one call had the chain out of scope for deciding
+  and in scope for redacting, with the reasoning living where neither half's reader would pass
+  it. The chain is now resolved ONCE per call and threaded into both halves, and the delegated
+  `maxEffectClass` composes: a delegated caller whose hop capped its effect class below the
+  route's ceiling is refused on that axis, naming the hop, instead of under the wrapping
+  layer's generic `AUTHORIZATION_FAILED`. Not an authority change in either direction — the
+  call was refused either way — and the delegation leg runs LAST, after the two hard verdicts,
+  since a harden-only seam must never preempt a hard refusal with the downgradable one a
+  delegation bound produces.
+
 - **An embedder's `allowedValues` override no longer applies to only half of a JWT/manifest
   intersection.** `WithConditionHandler` is the documented seam for redefining a built-in
   condition type, and the manifest path dispatched through the engine's registry while the
@@ -1502,6 +1577,29 @@ Section conventions:
   session establishment forever. All four now share one helper.
 
 ### Security
+
+- **A request the engine cannot anchor writes no state, on every path — not only the ones
+  that reach a decision.** Under `taskAnchoredState` an authenticated caller whose token
+  carries no `mcp.task_id` is refused rather than accounted against a second, session-keyed
+  bucket. That rule lived in the decision tail, which a **no-match** deny never reaches — so on
+  an `--audit` route, where such a deny is forwarded and the unlisted tool actually runs, its
+  `sequenceBlock` antecedent was written under the SESSION key while every enforced sink reads
+  the task key: the sink Peeks an empty history and fails open. The guard now sits on the state
+  WRITE itself, so every caller inherits it instead of each remembering to ask.
+
+- **`redactFields` reaches a declared field inside a content ITEM, outside `text`.** The
+  redaction ran three passes — each content item's `text` body, `structuredContent`, and every
+  other **top-level** envelope key — and the third explicitly skipped `content`, so any key on
+  a content item other than `type`/`text` was walked by no pass at all. An upstream returning
+  `{"content":[{"type":"text","text":"benign","extra":{"ssn":"…"}}]}` defeated the obligation
+  entirely, and `annotations` and `_meta` are legal on a content item, so no vendor extension
+  was even needed. Worse than a miss: nothing matched, so `changed` stayed false and the
+  ORIGINAL bytes went to the host while the audit record reported the obligation applied — the
+  same silent shape the duplicate-key gate and the envelope's sibling pass close one level out.
+  A content item's other keys now get the walk the envelope's siblings get, under both
+  anchorings, including on `image`/`audio` items (whose base64 body is still passed through).
+  The `resource`/`resource_link` fail-closed arm stays ahead of the walk, and the item's `text`
+  body is still processed exactly once, by its own pass.
 
 - **A declassification's label clear is now two-phase, and the second phase runs after the
   call.** The clear used to commit *inside* the decision, while the transport releases its
