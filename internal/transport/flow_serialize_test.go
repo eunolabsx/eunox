@@ -473,6 +473,163 @@ func TestDecisionSerializer_ZeroTicketIsANoOp(t *testing.T) {
 	t.Parallel()
 	g := newDecisionSerializer()
 	require.NotPanics(t, func() { g.begin(decisionTicket{})() })
+	end, ok := g.beginWithin(decisionTicket{}, time.Millisecond)
+	assert.True(t, ok, "an unserialized request is never refused its (absent) turn")
+	require.NotPanics(t, end)
+}
+
+// TestDecisionSerializer_AbandonedTicketDoesNotStrandTheQueue is the property that makes
+// bounding the server-initiated leg's wait SAFE, and it is the objection that kept that leg
+// unbounded: this is a FIFO, so a ticket taken and then abandoned is a hole in the sequence,
+// and every later ticket on the anchor waits behind a turn that will never come — trading a
+// bounded stall for an unbounded one. Recording the give-up lets the turn skip it.
+func TestDecisionSerializer_AbandonedTicketDoesNotStrandTheQueue(t *testing.T) {
+	t.Parallel()
+	g := newDecisionSerializer()
+	anchor := sessionAnchorKey("sess-a")
+
+	// Ticket 0 runs; tickets 1 and 2 are reserved behind it.
+	first := g.begin(g.take(anchor))
+	abandoned := g.take(anchor)
+	later := g.take(anchor)
+
+	// The middle ticket gives up while the first still holds the turn.
+	end, ok := g.beginWithin(abandoned, 20*time.Millisecond)
+	assert.False(t, ok, "a turn that does not come up within the bound must be reported, not waited for")
+	assert.Nil(t, end, "and no turn was taken, so there is nothing to release")
+
+	// The ticket BEHIND the abandoned one must still be served.
+	served := make(chan struct{})
+	go func() { defer close(served); g.begin(later)() }()
+	select {
+	case <-served:
+		t.Fatal("the last ticket must still wait for the first holder")
+	case <-time.After(20 * time.Millisecond):
+	}
+	first()
+	select {
+	case <-served:
+	case <-time.After(2 * time.Second):
+		t.Fatal("an abandoned ticket stranded every later ticket on the anchor")
+	}
+	assert.Zero(t, g.size(), "and the queue is reclaimed once the skipped ticket has been passed")
+}
+
+// TestDecisionSerializer_ConsecutiveAbandonmentsAreSkipped: a wedged reader can give up more
+// than once, so the skip is a loop. One un-skipped hole stalls the anchor for the proxy's life,
+// which is why this is asserted rather than left to the shape of the code.
+func TestDecisionSerializer_ConsecutiveAbandonmentsAreSkipped(t *testing.T) {
+	t.Parallel()
+	g := newDecisionSerializer()
+	anchor := sessionAnchorKey("sess-a")
+
+	first := g.begin(g.take(anchor))
+	for range 3 {
+		_, ok := g.beginWithin(g.take(anchor), 10*time.Millisecond)
+		require.False(t, ok)
+	}
+	last := g.take(anchor)
+
+	served := make(chan struct{})
+	go func() { defer close(served); g.begin(last)() }()
+	first()
+	select {
+	case <-served:
+	case <-time.After(2 * time.Second):
+		t.Fatal("three consecutive abandonments must all be skipped, not just the first")
+	}
+	assert.Zero(t, g.size())
+}
+
+// TestDecisionSerializer_BeginWithinTakesATurnThatIsAvailable is the other half of the bound: a
+// free anchor is entered immediately and the turn really is held afterwards. A bound that
+// refused a turn it could have had would fail every sampling request on a busy-but-not-wedged
+// proxy closed.
+func TestDecisionSerializer_BeginWithinTakesATurnThatIsAvailable(t *testing.T) {
+	t.Parallel()
+	g := newDecisionSerializer()
+	anchor := sessionAnchorKey("sess-a")
+
+	end, ok := g.beginWithin(g.take(anchor), time.Second)
+	require.True(t, ok)
+	require.NotNil(t, end)
+
+	queued := make(chan struct{})
+	ticket := g.take(anchor)
+	go func() { defer close(queued); g.begin(ticket)() }()
+	select {
+	case <-queued:
+		t.Fatal("a turn entered through the bounded path must exclude just as the unbounded one does")
+	case <-time.After(20 * time.Millisecond):
+	}
+	end()
+	select {
+	case <-queued:
+	case <-time.After(time.Second):
+		t.Fatal("the turn must advance once released")
+	}
+	assert.Zero(t, g.size())
+}
+
+// TestStdioSamplingTurn_BoundedRatherThanWedgingTheReader is the acceptance test for the
+// deadlock the bound closes.
+//
+// On stdio the server-initiated leg runs INLINE on the upstream reader goroutine, and that
+// goroutine is the only one that delivers upstream responses to waiting host handlers. A
+// declassifying host call holds its turn across its whole upstream round trip. So a sampling
+// request arriving mid-clear waits for a turn whose holder is waiting for a response only the
+// now-blocked reader can deliver: with an unbounded wait that unwinds when --upstream-timeout
+// fires, and never at all when it is 0.
+//
+// Two things are asserted: the leg gives up rather than waiting forever, and the give-up leaves
+// the FIFO usable — which is the objection that kept it unbounded.
+func TestStdioSamplingTurn_BoundedRatherThanWedgingTheReader(t *testing.T) {
+	t.Parallel()
+	p := &StdioProxy{sessionID: "sess-a", decideGate: newDecisionSerializer()}
+	p.pinDecisionQueue()
+	t.Cleanup(p.dropDecideQueue)
+
+	// The host's declassifying call takes the turn and keeps it across its forward.
+	host := p.decideGate.begin(p.decideGate.takeOn(p.decideQueue))
+
+	start := time.Now()
+	end, ok := p.samplingDecideLock()()
+	waited := time.Since(start)
+	assert.False(t, ok, "the sampling leg must give up rather than park the session's reader goroutine")
+	assert.Nil(t, end, "no turn was taken, so there is nothing to release")
+	assert.GreaterOrEqual(t, waited, samplingTurnWait/2,
+		"it must WAIT for the turn — an instant refusal would fail every sampling request under ordinary contention")
+	assert.Less(t, waited, 4*samplingTurnWait, "and give up on roughly its own bound")
+
+	// The host's next request is still served: the abandoned ticket did not strand the queue.
+	next := p.decideGate.takeOn(p.decideQueue)
+	served := make(chan struct{})
+	go func() { defer close(served); p.decideGate.begin(next)() }()
+	host()
+	select {
+	case <-served:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the abandoned sampling ticket stalled the host leg — a bounded stall traded for an unbounded one")
+	}
+}
+
+// TestDecideSampling_RefusedTurnIsAHardDeny pins what a refused turn produces. The refusal has
+// to be a DENY rather than an unserialized decision (the peek would be racing a host source's
+// label write, the exact fail-open the turn exists to close), and it has to be HARD so an
+// --audit route cannot downgrade it into the forward it exists to prevent.
+func TestDecideSampling_RefusedTurnIsAHardDeny(t *testing.T) {
+	t.Parallel()
+	fp := serverRequestParams{
+		sessionID:  "sess-a",
+		decideLock: func() (func(), bool) { return nil, false },
+	}.withPDP(pdp.AlwaysAllowPDP{})
+
+	dec := fp.decideSampling(context.Background())
+	require.Equal(t, capability.DecisionDeny, dec.Decision, "an unenterable turn must not be decided unserialized")
+	require.NotNil(t, dec.Denial)
+	assert.Equal(t, capability.ConditionTypeFlowLabel, dec.Denial.ConditionType)
+	assert.True(t, dec.Denial.HardDeny, "an --audit route must not downgrade it into the forward it prevents")
+	assert.Equal(t, "turn_unavailable", dec.Denial.Details["reason"])
 }
 
 // TestStdioDecisionAnchor_ResolvesThroughTheSharedResolver pins that the stdio proxy asks the
@@ -484,16 +641,16 @@ func TestStdioDecisionAnchor_ResolvesThroughTheSharedResolver(t *testing.T) {
 	claims := &pdp.JWTClaims{TaskID: "task-42"}
 
 	plain := &StdioProxy{sessionID: "sess-a"}
-	assert.Equal(t, sessionAnchorKey("sess-a"), plain.decisionAnchor())
+	assert.Equal(t, sessionAnchorKey("sess-a"), plain.decisionAnchorKey())
 	plain.claims = claims
-	assert.Equal(t, sessionAnchorKey("sess-a"), plain.decisionAnchor(),
+	assert.Equal(t, sessionAnchorKey("sess-a"), plain.decisionAnchorKey(),
 		"an operator who did not enable task anchoring sees the session turn, claims or no claims")
 
 	anchored := &StdioProxy{sessionID: "sess-a", taskAnchored: true}
-	assert.Equal(t, sessionAnchorKey("sess-a"), anchored.decisionAnchor(),
+	assert.Equal(t, sessionAnchorKey("sess-a"), anchored.decisionAnchorKey(),
 		"a connection with no token anchors on the session, exactly as the engine keys it")
 	anchored.claims = claims
-	assert.Equal(t, taskAnchorKey("task-42"), anchored.decisionAnchor(),
+	assert.Equal(t, taskAnchorKey("task-42"), anchored.decisionAnchorKey(),
 		"and a validated task claim keys the turn where the state lives")
 }
 

@@ -786,12 +786,18 @@ func (route *UpstreamRoute) contextGateVerdict(ctx context.Context) (sessionGate
 }
 
 // sessionOnlyGateVerdict runs the session gates that need the session object — the
-// session-owner binding. This half is a pure in-process field comparison with no interface
-// dispatch outside the package, so it is safe to run under the registry lock, which is
-// what lets handleMCPDelete keep its check-and-delete atomic.
+// session-owner binding and, on a task-anchored route, the session's anchor binding. Both are
+// in-process comparisons over already-validated claims (the anchor resolution reads a memoized
+// claim map through a concrete function, not through an implementable interface), so this half
+// is safe to run under the registry lock, which is what lets handleMCPDelete keep its
+// check-and-delete atomic.
 func sessionOnlyGateVerdict(ctx context.Context, sess *httpSession) (sessionGate, bool) {
-	if sess.ownerMismatch(pdp.JWTClaimsPtr(ctx)) {
-		return sessionGate{code: capability.ErrCodeAuthorizationFailed, reason: "session_owner_mismatch"}, true
+	// The reason comes back FROM the check rather than being restated here: the binding has two
+	// halves (the principal, and — on a task-anchored route — the state anchor), and a record
+	// that named the principal for an anchor refusal would send an operator looking for a
+	// second client that does not exist.
+	if reason, mismatch := sess.ownerMismatch(pdp.JWTClaimsPtr(ctx)); mismatch {
+		return sessionGate{code: capability.ErrCodeAuthorizationFailed, reason: reason}, true
 	}
 	return sessionGate{}, false
 }

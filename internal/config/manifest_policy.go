@@ -48,43 +48,62 @@ func (m *LocalManifest) anyDirective(pred func(capability.Directive) bool) bool 
 	return false
 }
 
-// HasMaxCalls reports whether any capability entry carries a maxCalls condition.
-// The in-memory call counter is per-process, so the multi-instance state advisory
-// uses this to warn only when sharing that state would matter.
-func (m *LocalManifest) HasMaxCalls() bool {
-	return m.anyCondition(func(cond capability.Condition) bool {
-		switch cond.(type) {
-		case capability.MaxCallsCondition, *capability.MaxCallsCondition:
-			return true
-		}
+// anyTokenState reports whether any condition or directive on any capability entry has a
+// cross-call state class satisfying pred. It is the one walk both derived policy properties
+// (NeedsDecisionTurn, AccumulatesSharedState) read, over the class each token DECLARES on its
+// pkg/capability prototype-registry entry rather than over a list of token types spelled out
+// here — which is what keeps a newly added accumulating token from silently reporting neither.
+//
+// An UNCLASSIFIED token (one whose registry entry declares no class, or a discriminator this
+// build does not model) is treated as the strongest class, so it satisfies every predicate:
+// the build-time completeness test is what stops it from ever shipping, and the runtime answer
+// while it exists is "serialize, and warn" rather than "neither".
+func (m *LocalManifest) anyTokenState(pred func(capability.StateAccumulation) bool) bool {
+	if m == nil {
 		return false
-	})
+	}
+	classify := func(s capability.StateAccumulation, ok bool) capability.StateAccumulation {
+		if !ok {
+			return capability.StateNonAtomic
+		}
+		return s
+	}
+	for i := range m.Capabilities {
+		for _, cond := range m.Capabilities[i].Conditions {
+			if pred(classify(capability.ConditionStateAccumulation(cond))) {
+				return true
+			}
+		}
+		for _, dir := range m.Capabilities[i].Directives {
+			if pred(classify(capability.DirectiveStateAccumulation(dir))) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
-// HasBlastRadiusVelocity reports whether any capability entry carries a CUMULATIVE
-// blastRadius bound. Such a bound consumes a sliding-window budget exactly as maxCalls
-// consumes a slot, so it is per-process state under the in-memory counter — and the
-// operator advisory about running several replicas without a shared Redis has to know
-// about it, or a $2,000-an-hour ceiling is silently enforced as $6,000 across three
-// replicas with no notice printed. The per-call `max` bound consumes nothing and does not
-// count.
-func (m *LocalManifest) HasBlastRadiusVelocity() bool {
-	return m.anyCondition(func(cond capability.Condition) bool {
-		switch v := cond.(type) {
-		case capability.BlastRadiusCondition:
-			return v.HasVelocity()
-		case *capability.BlastRadiusCondition:
-			return v.HasVelocity()
-		}
-		return false
-	})
+// AccumulatesSharedState reports whether this policy depends on state that outlives a single
+// call — a maxCalls or cumulative blastRadius budget, the sequenceBlock antecedent history, the
+// flow-label set. All of it is PER-PROCESS under the default in-memory backends, so the
+// multi-instance advisory warns on it: three replicas without a shared Redis enforce a
+// maxCalls of 20 as 60, and a source recorded on one instance is invisible to a sink on
+// another.
+//
+// It replaced four hand-written per-token predicates ORed together at each of its two call
+// sites (the stdio host's and the gateway's). Those were four places to forget for one
+// question, and forgetting was silent in the direction that matters: the operator who most
+// needs the advisory is the one running a policy the list has not caught up with.
+func (m *LocalManifest) AccumulatesSharedState() bool {
+	return m.anyTokenState(capability.StateAccumulation.AccumulatesSharedState)
 }
 
 // HasSequenceBlock reports whether any capability entry carries a sequenceBlock
 // condition. The engine records a per-call antecedent marker only so a later
 // sequenceBlock can read it; when no entry uses sequenceBlock the marker is never
 // read, so recording (and its fail-closed deny on a counter-write fault) can be
-// skipped entirely.
+// skipped entirely. Like HasFlowLabel it is a SUBSYSTEM question — the
+// WithoutAntecedentRecording gate — and not the state-accumulation one.
 func (m *LocalManifest) HasSequenceBlock() bool {
 	return m.anyCondition(func(cond capability.Condition) bool {
 		switch cond.(type) {
@@ -96,11 +115,16 @@ func (m *LocalManifest) HasSequenceBlock() bool {
 }
 
 // HasFlowLabel reports whether any capability entry uses information-flow control — a
-// flowLabel condition (sink; reads per-session label state) or a labelOutput directive
-// (source; writes it). Both rely on cross-call CallCounter state exactly like maxCalls
-// and sequenceBlock, so the multi-instance shared-state advisory must warn on them too:
-// without shared Redis, a source recording a label on one instance and a sink Peeking it
-// on another fails open silently.
+// flowLabel condition (sink; reads per-anchor label state), a labelOutput directive (source;
+// writes it), or a declassify directive (the approval-gated clear).
+//
+// It is a SUBSYSTEM question, not the state-accumulation one: its consumer is the engine's
+// WithoutFlowLabels gate, which skips the flow peek/record path entirely for a policy that has
+// no flow token. That is deliberately narrower than "does this policy accumulate state" — a
+// sequenceBlock-only policy accumulates plenty and still wants the flow path skipped — so it
+// stays a per-token predicate while the decision turn and the shared-state advisory derive
+// from the tokens' declared classes. The failure direction differs too: a subsystem gate left
+// un-skipped costs a per-call scan, where a missed turn reopens a race.
 func (m *LocalManifest) HasFlowLabel() bool {
 	// Single-sourced through the capability predicates (value/pointer-safe) so this
 	// config-level advisory and the engine's constraintHasFlow gate cannot drift on
@@ -111,25 +135,32 @@ func (m *LocalManifest) HasFlowLabel() bool {
 }
 
 // NeedsDecisionTurn reports whether this policy's decisions must be SERIALIZED on the state
-// anchor: whether it reads or writes accumulated state that one call commits and a later one
-// reads back. Both transports gate their decision turn on it.
+// anchor: whether any of its tokens does a NON-ATOMIC read-then-write against accumulated
+// state — one call committing what a later one reads back, with a window in between. Both
+// transports gate their decision turn on it.
 //
-// The two conditions are the two ways such a dependency exists today. A flow-relevant policy
-// has a source that writes labels and a sink that reads them; a sequenceBlock has an
-// antecedent marker with the same shape. Without an ordered decision phase a host that
-// pipelines the source and the sink lets the sink's read run before the source's write
-// commits, which is the fail-open the turn exists to close. Everything else keeps full
+// Non-atomic is the whole of the predicate, and stating it loosely is how the wrong tokens get
+// counted: maxCalls and a cumulative blastRadius also accumulate state that a later call reads
+// back, and deliberately need NO turn, because AdmitAll admits or refuses a whole batch of
+// buckets indivisibly. A flowLabel sink peeking a set a labelOutput source Adds to, and a
+// sequenceBlock reading an antecedent marker an earlier call recorded, have no such atomicity:
+// a host that pipelines the source and the sink lets the sink's read run before the source's
+// write commits, which is the fail-open the turn exists to close. Everything else keeps full
 // decision parallelism.
 //
-// It lives here, beside HasFlowLabel/HasSequenceBlock/HasMaxCalls, because it was previously
-// spelled out twice — once in the stdio host's wiring, once in the gateway's route builder —
-// and a mirrored predicate is a second place to update whose failure is silent: a third
-// state-accumulating condition added to one copy and not the other leaves one transport
-// serializing and the other racing, with nothing failing to say so.
+// The classification is DECLARED BY THE TOKEN — on its pkg/capability prototype-registry entry,
+// beside the grammar revision — and this derives from it rather than naming the tokens that
+// happen to accumulate today. The predicate was previously spelled out twice (once per
+// transport) and then once as a literal disjunction of two per-token predicates; both shapes
+// have the same failure, and it is silent: a new accumulating condition simply is not in the
+// list, both transports run its decisions unserialized, and every completeness test still
+// passes. A token that declares nothing now fails the build instead
+// (TestTokenStateAccumulation_EveryRegisteredTokenDeclaresAClass), and is treated as needing
+// the turn until it does.
 //
 // A nil manifest (a route with no policy) accumulates nothing and needs no turn.
 func (m *LocalManifest) NeedsDecisionTurn() bool {
-	return m != nil && (m.HasFlowLabel() || m.HasSequenceBlock())
+	return m.anyTokenState(capability.StateAccumulation.NeedsSerializedDecisions)
 }
 
 // HasDeclassify reports whether this policy carries a declassify directive — the one

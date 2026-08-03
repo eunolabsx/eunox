@@ -25,6 +25,7 @@ import (
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/pdp"
 	"github.com/eunolabs/eunox/pkg/capability"
+	"github.com/eunolabs/eunox/pkg/enforcement"
 )
 
 // httpSession is one client session.  In local mode it owns an upstream
@@ -102,25 +103,29 @@ type httpSession struct {
 	// span it. Under the default session anchoring the route's gate for this session's key
 	// IS a per-session mutex, so nothing changed for that deployment. See anchor_gate.go.
 	//
-	// Both entries above branch on decideGate rather than routing through one helper: the
-	// cached path must render no anchor key, and threading the key past that branch as a
-	// closure only moves the allocation it saves into a closure the branch then never calls.
-	// The registry arm is the ALWAYS-CORRECT path and the cache is the special case — a
-	// session-anchored route's anchor cannot change between requests, so one gate serves the
-	// session, and anything else (a task-anchored route, a session a test assembled without
-	// registering) resolves per request.
+	// The registry is the ALWAYS-CORRECT path and the gate below is a CACHE of one entry in
+	// it: going back through the route's registry per request cost a route-wide mutex, a map
+	// insert and a map delete on every enforced call — the refcount fell to zero the moment a
+	// non-overlapping request finished, so ordinary sequential traffic re-created the same
+	// entry per call on the microsecond decision path.
 	//
-	// decideGate is that gate, resolved ONCE at registration and held for the session's
-	// life, for the case where it is a per-session constant: a route that does not anchor
-	// state on the task. There the anchor is invariantly this session's id, so going back
-	// through the route's registry per request bought nothing and cost a route-wide mutex,
-	// a map insert and a map delete on every enforced call — the refcount fell to zero the
-	// moment a non-overlapping request finished, so ordinary sequential traffic re-created
-	// the same entry per call on the microsecond decision path. nil on a task-anchored
-	// route, where the anchor genuinely varies per request and the registry round trip is
-	// the point, and nil on a non-serialized route (and on a test-assembled session that
-	// never registered, which falls back to the always-correct registry path).
-	decideGate *anchorGate
+	// decideAnchor is the anchor decideGate was resolved for, and it is what makes the cache
+	// USABLE: every request resolves its own anchor and compares it to this one, taking the
+	// cached gate on a hit and falling through to the registry on a miss. That comparison is
+	// the whole of the correctness argument. The alternative — deciding from the route's
+	// taskAnchored bit that the anchor "cannot change" — is a second, independent reading of
+	// the question enforcement.ResolveStateAnchor exists to answer: a third anchor kind
+	// (an agent id, a conversation, a delegation chain) breaks every caller of the resolver at
+	// compile time, but a hand-written restatement of its outcome compiles untouched and the
+	// session then keeps serving turns on a gate the per-request resolver no longer reaches.
+	// Comparing the resolutions is correct for any number of anchor kinds by construction, and
+	// it extends the fast path to a task-anchored session that stays on one task — which the
+	// bool could not do.
+	//
+	// nil on a non-serialized route (no registry at all) and on a test-assembled session that
+	// never registered; both fall back to the registry path, which is a no-op for the former.
+	decideAnchor enforcement.StateAnchor
+	decideGate   *anchorGate
 	// dropDecideGate releases the reference above at teardown, so a long-lived gateway does
 	// not accumulate one gate per session it has ever served. nil when none is held, and
 	// idempotent. Called from releaseSessionState — the funnel that runs on EVERY teardown,
@@ -334,26 +339,68 @@ func (s *httpSession) buildInitResponse(msg mcp.RPCMsg) mcp.RPCMsg {
 }
 
 // ownerMismatch reports whether cur (the JWT identity on the CURRENT request) differs
-// from the identity that created this session, so a re-initialize from it must be
-// refused. The re-initialize echo returns the upstream capabilities and serverInfo
-// captured at creation, so only the creating client may receive them; a second identity
-// authenticated to the same route (same audience pin, different sub) that learns the
-// session id must not read another client's captured state.
+// from the identity that created this session, so an action from it must be
+// refused, and names WHICH pin failed for the deny record. The re-initialize echo returns the
+// upstream capabilities and serverInfo captured at creation, so only the creating client may
+// receive them; a second identity authenticated to the same route (same audience pin,
+// different sub) that learns the session id must not read another client's captured state.
 //
 // A session created without a JWT identity (claims nil or no subject) is UNBOUND —
 // there is no per-client identity to enforce (e.g. a no-JWT route where every client is
-// anonymous) — so it never mismatches. Identity is the (issuer, subject) pair: sub is
-// unique only within an issuer, so both are compared, and as separate fields (never a
-// concatenation, which could collide across values). A refreshed token from the same
+// anonymous) — so it never mismatches on the principal. Identity is the (issuer, subject)
+// pair: sub is unique only within an issuer, so both are compared, and as separate fields
+// (never a concatenation, which could collide across values). A refreshed token from the same
 // principal (new jti/exp, same iss+sub) still matches; a different principal does not.
-func (s *httpSession) ownerMismatch(cur *pdp.JWTClaims) bool {
+//
+// The ANCHOR pin runs first and runs even on an unbound session, because it is not about the
+// principal — see anchorMismatch.
+func (s *httpSession) ownerMismatch(cur *pdp.JWTClaims) (string, bool) {
+	if s.anchorMismatch(cur) {
+		return "session_anchor_mismatch", true
+	}
 	if s.claims == nil || s.claims.Subject == "" {
-		return false // unbound: no creating identity to enforce
+		return "", false // unbound: no creating identity to enforce
 	}
 	if cur == nil {
-		return true // bound session, but the request carries no identity
+		return "session_owner_mismatch", true // bound session, but the request carries no identity
 	}
-	return cur.Issuer != s.claims.Issuer || cur.Subject != s.claims.Subject
+	if cur.Issuer != s.claims.Issuer || cur.Subject != s.claims.Subject {
+		return "session_owner_mismatch", true
+	}
+	return "", false
+}
+
+// anchorMismatch reports whether cur resolves a DIFFERENT state anchor than the one this
+// session is bound to. It is a no-op on a route that does not anchor state on the task, where
+// every request on a session resolves that session and the check is vacuous.
+//
+// It exists because the session has TWO legs that decide, and only one of them has a request in
+// scope. The host leg reads the current request's validated claims — for its decision, its
+// state key, and its turn. The server-initiated (sampling) leg has no host request at all, so
+// it reads the claims captured at initialize, for all three. Under task anchoring those are two
+// different task ids for the same session as soon as a caller sends requests with a second
+// token, since sub/iss alone accepted it: a labelOutput source then records its taint under the
+// request's task while the sampling sink peeks the session's, finds it clean, and forwards the
+// egress the label existed to stop. The anchor-keyed decision turn cannot catch that — the
+// sampling leg's turn and its state key agree with each other and both disagree with the host
+// leg. The turn's guarantee holds; it is the wrong key.
+//
+// So a session on a task-anchored route is bound to its ANCHOR, and a request resolving another
+// one is refused rather than silently accounted against a bucket this session's other leg
+// cannot see. That is the fail-closed direction, and it is what makes the captured claims an
+// honest stand-in for "this session's identity". It also refuses an authenticated request whose
+// token carries NO task id — which the engine refuses on its own (a task-anchored request must
+// not be session-keyed), just with its own denial rather than this one.
+//
+// The comparison goes through the route's resolver, the same one the engine's key builder uses,
+// so it cannot come to a different answer about which anchor a request has — and so a third
+// anchor kind is covered by construction rather than by a second reading of the claims here.
+func (s *httpSession) anchorMismatch(cur *pdp.JWTClaims) bool {
+	rt := s.route
+	if rt == nil || !rt.taskAnchored {
+		return false
+	}
+	return rt.decisionAnchor(s.id, cur) != rt.decisionAnchor(s.id, s.claims)
 }
 
 // newSession spawns an upstream subprocess and performs the MCP initialize
@@ -665,23 +712,37 @@ func (p *HTTPProxy) registerSession(sess *httpSession, startGen uint64) error {
 	return nil
 }
 
-// holdDecisionGate takes and keeps this session's decision-turn gate for the cases where the
-// turn's anchor is a per-session CONSTANT — a serialized route that does not anchor state on
-// the task. The reference is released by close().
+// holdDecisionGate resolves this session's anchor once and caches the registry gate for it,
+// for the session's life. The reference is released by releaseSessionState.
 //
-// A task-anchored route holds nothing: its anchor is resolved per request from that request's
-// validated claims, and two sessions sharing a task must reach the same gate, which is exactly
-// what the registry is for. A non-serialized route has no registry at all.
+// The anchor is resolved from the session's OWN claims — the identity every request on the
+// session carries, which the session gate pins (ownerMismatch) — so on a well-formed session
+// this is the gate every request resolves. It is a cache, not a decision that the anchor
+// cannot change: each request resolves its own and compares (see gateFor), so a request that
+// lands on a different anchor reaches the registry rather than the wrong turn.
+//
+// A non-serialized route has no registry and caches nothing; hold is a no-op on a nil registry,
+// so this needs no branch of its own for that case.
 func (s *httpSession) holdDecisionGate() {
 	rt := s.route
-	if !rt.serializes() || rt.taskAnchored {
+	if !rt.serializes() {
 		return
 	}
-	// Resolved through the route's own anchor resolver with no claims, which is what a
-	// non-task-anchored route resolves for every request on this session anyway — so the
-	// cached gate is the same gate the per-request path would have found, not a second
-	// keying scheme.
-	s.decideGate, s.dropDecideGate = rt.decideGates.hold(rt.decisionAnchor(s.id, nil))
+	s.decideAnchor = rt.decisionAnchor(s.id, s.claims)
+	s.decideGate, s.dropDecideGate = rt.decideGates.hold(s.decideAnchor.Key())
+}
+
+// gateFor returns this session's cached gate when it is the gate anchor resolves to, or nil to
+// send the caller through the registry.
+//
+// The comparison is on the RESOLVED anchor (a comparable two-string struct, so it allocates
+// nothing and renders no key), never on a restatement of how the resolver decides. That is what
+// makes the cache correct for any anchor kind rather than for the two that exist today.
+func (s *httpSession) gateFor(anchor enforcement.StateAnchor) *anchorGate {
+	if s.decideGate == nil || s.decideAnchor != anchor {
+		return nil
+	}
+	return s.decideGate
 }
 
 // beginDecisionTurn enters this request's decision turn and returns the idempotent release,
@@ -689,14 +750,14 @@ func (s *httpSession) holdDecisionGate() {
 // goroutine, so it waits without a bound.
 //
 // ctx supplies the request's VALIDATED claims, which decide the anchor on a task-anchored
-// route. A session-anchored route takes its turn on the gate held for the session's life and
-// touches the registry not at all.
+// route.
 func (s *httpSession) beginDecisionTurn(ctx context.Context) func() {
-	if s.decideGate != nil {
-		end, _ := s.decideGate.take(nil)
+	anchor := s.route.decisionAnchorFromContext(ctx, s.id)
+	if gate := s.gateFor(anchor); gate != nil {
+		end, _ := gate.take(nil)
 		return end
 	}
-	end, _ := s.route.decideGates.acquire(s.route.decisionAnchorFromContext(ctx, s.id), nil)
+	end, _ := s.route.decideGates.acquire(anchor.Key(), nil)
 	return end
 }
 
@@ -704,13 +765,21 @@ func (s *httpSession) beginDecisionTurn(ctx context.Context) func() {
 // anchored on the SESSION's claims (captured at initialize) because that leg has no host
 // request in scope. ok is false when the turn could not be entered in time, which the caller
 // must turn into a refusal — see samplingTurnWait.
+//
+// Those captured claims are the same ones holdDecisionGate resolved from, so this hits the
+// cache; it still resolves and compares rather than reaching for s.decideGate directly, because
+// "the two agree" is a property to check, not one to assume. What makes the captured claims an
+// honest stand-in for the request identity in the first place is the session gate: on a route
+// that anchors state on the task, a request whose token resolves a DIFFERENT anchor is refused
+// rather than accounted against a bucket this leg cannot see (see ownerMismatch).
 func (s *httpSession) beginDecisionTurnWithin(d time.Duration) (func(), bool) {
 	timer := time.NewTimer(d)
 	defer timer.Stop()
-	if s.decideGate != nil {
-		return s.decideGate.take(timer.C)
+	anchor := s.route.decisionAnchor(s.id, s.claims)
+	if gate := s.gateFor(anchor); gate != nil {
+		return gate.take(timer.C)
 	}
-	return s.route.decideGates.acquire(s.route.decisionAnchor(s.id, s.claims), timer.C)
+	return s.route.decideGates.acquire(anchor.Key(), timer.C)
 }
 
 // getSession returns the session for id, or nil.

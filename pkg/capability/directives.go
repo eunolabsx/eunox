@@ -141,10 +141,15 @@ func unmarshalDirective(data []byte) (Directive, error) {
 // switch and forgotten in the literal left `want` and `branches` both at three and
 // shipped a token with no schema branch — the exact outcome the guard exists to
 // prevent.
+//
+// State follows the same rule as on the condition registry (see tokenstate.go): redactFields
+// masks fields in one response and remembers nothing, while labelOutput writes the flow-label
+// set a later sink reads back and declassify clears it and burns a single-use grant — both
+// non-atomic read-then-writes, and both reasons a policy carrying them needs the decision turn.
 var directivePrototypes = map[string]tokenSpec[Directive]{
-	DirectiveTypeRedactFields: {New: func() Directive { return &RedactFieldsDirective{} }, Since: SchemaVersion01},
-	DirectiveTypeLabelOutput:  {New: func() Directive { return &LabelOutputDirective{} }, Since: SchemaVersion02},
-	DirectiveTypeDeclassify:   {New: func() Directive { return &DeclassifyDirective{} }, Since: SchemaVersion02},
+	DirectiveTypeRedactFields: {New: func() Directive { return &RedactFieldsDirective{} }, Since: SchemaVersion01, State: StateNone},
+	DirectiveTypeLabelOutput:  {New: func() Directive { return &LabelOutputDirective{} }, Since: SchemaVersion02, State: StateNonAtomic},
+	DirectiveTypeDeclassify:   {New: func() Directive { return &DeclassifyDirective{} }, Since: SchemaVersion02, State: StateNonAtomic},
 }
 
 // knownDirectiveTypes is every discriminator in the registry, sorted so the

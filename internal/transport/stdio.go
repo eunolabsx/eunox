@@ -1407,12 +1407,21 @@ func (p *StdioProxy) handleUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) 
 // upstream-initiated with no proxy-receipt order, so it simply takes the next ticket:
 // mutual exclusion — not receipt ordering — is the property it needs.
 //
-// It always reports ok, i.e. it WAITS, where the HTTP leg bounds the wait (samplingTurnWait).
-// The difference is the gate, not the hazard: this one is FIFO, and a ticket taken and then
-// abandoned would stall every later ticket behind it, so a timeout here would trade a bounded
-// stall for an unbounded one. The stall it can impose is also confined to the single session
-// that owns both sides of it — stdio has one host connection and no per-request token, so its
-// turn never spans a second session the way an anchor-keyed one can.
+// The wait is BOUNDED by samplingTurnWait, exactly as the HTTP leg's is, and for a hazard that
+// is worse here than there. This leg runs INLINE on the upstream reader goroutine, which is
+// also the only goroutine that delivers upstream responses to waiting host handlers — and a
+// declassifying host call holds its turn across its whole upstream round trip. So a sampling
+// request arriving mid-clear waits for a turn whose holder is waiting for a response only this
+// blocked reader can deliver: a deadlock that unwinds when --upstream-timeout fires and NEVER
+// with --upstream-timeout=0. It does not require sampling to be permitted, either — the turn is
+// taken before DecideSampling runs, so any upstream could wedge a declassify-using proxy by
+// emitting one sampling/createMessage at the right moment, including one policy denies
+// sampling to.
+//
+// What made bounding it unsafe before was the FIFO: a ticket taken and abandoned stalled every
+// later ticket behind it, trading a bounded stall for an unbounded one. beginWithin abandons
+// the ticket properly (the turn skips it), so the give-up costs this one deny-by-default
+// request and nothing else.
 func (p *StdioProxy) samplingDecideLock() func() (end func(), ok bool) {
 	if p.decideGate == nil {
 		return nil
@@ -1424,7 +1433,7 @@ func (p *StdioProxy) samplingDecideLock() func() (end func(), ok bool) {
 		// claims, and the two legs landing on different queues is precisely the fail-open this
 		// lock exists to close: a sampling flowLabel sink would no longer be serialized
 		// against a host source's label write.
-		return p.decideGate.begin(p.takeDecisionTicket()), true
+		return p.decideGate.beginWithin(p.takeDecisionTicket(), samplingTurnWait)
 	}
 }
 
@@ -1441,7 +1450,7 @@ func (p *StdioProxy) takeDecisionTicket() decisionTicket {
 	if p.decideQueue != nil {
 		return p.decideGate.takeOn(p.decideQueue)
 	}
-	return p.decideGate.take(p.decisionAnchor())
+	return p.decideGate.take(p.decisionAnchorKey())
 }
 
 // pinDecisionQueue resolves this connection's anchor once and pins its ticket queue for the
@@ -1457,20 +1466,24 @@ func (p *StdioProxy) pinDecisionQueue() {
 	if p.decideGate == nil {
 		return
 	}
-	p.decideQueue, p.dropDecideQueue = p.decideGate.hold(p.decisionAnchor())
+	p.decideQueue, p.dropDecideQueue = p.decideGate.hold(p.decisionAnchorKey())
 }
 
-// decisionAnchor is the key this proxy serializes its decisions on: the validated task when
+// decisionAnchorKey is the key this proxy serializes its decisions on: the validated task when
 // the operator anchors state on the task and this connection presented one, the session
 // otherwise.
 //
-// It goes through decisionAnchorKey — the same builder the gateway route uses, over the same
-// enforcement.ResolveStateAnchor the engine's own key builder resolves through — so the turn
-// and the state key cannot come to different answers, and neither transport re-derives the
+// It goes through resolveDecisionAnchor — the same builder the gateway route uses, over the
+// same enforcement.ResolveStateAnchor the engine's own key builder resolves through — so the
+// turn and the state key cannot come to different answers, and neither transport re-derives the
 // fallback. The claims are the proxy's captured connection identity, which is the one source
 // both of this transport's legs read (see StdioProxy.claims).
-func (p *StdioProxy) decisionAnchor() string {
-	return decisionAnchorKey(p.taskAnchored, p.claims, p.sessionID)
+//
+// It renders the key here, where the HTTP side carries the resolved anchor further: this
+// transport's ticket queues are addressed by key and it never has to compare two resolutions,
+// because its anchor is a per-connection constant.
+func (p *StdioProxy) decisionAnchorKey() string {
+	return resolveDecisionAnchor(p.taskAnchored, p.claims, p.sessionID).Key()
 }
 
 // withUpstreamTimeout bounds a StdioProxy upstream round-trip (see boundUpstreamCall).

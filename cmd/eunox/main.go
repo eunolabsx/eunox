@@ -1502,18 +1502,23 @@ func newJWKSHTTPClient(allowInsecure bool) *http.Client {
 	}
 }
 
-// warnNoRedisSharedState prints the multi-instance advisory when a policy depends on
-// shared counter/kill-switch state (maxCalls quotas OR sequenceBlock call-ordering
-// history) but no Redis backend is configured: the in-memory backend is per-process,
-// so running more than one instance silently multiplies quotas, de-syncs kills, and
-// lets a sequenceBlock gate fail open when a session's antecedent and blocked calls
-// land on different instances. Shared by the stdio and gateway serve paths so the
-// wording and trigger cannot drift.
+// warnNoRedisSharedState prints the multi-instance advisory when a policy depends on state
+// that outlives a single call (a maxCalls or cumulative blastRadius budget, sequenceBlock's
+// call-ordering history, the flow-label set) but no Redis backend is configured: the in-memory
+// backends are per-process, so running more than one instance silently multiplies quotas,
+// de-syncs kills, and lets a sequenceBlock or flowLabel gate fail open when a session's
+// antecedent (or a source's taint) and the call it should block land on different instances.
+// Shared by the stdio and gateway serve paths so the wording and trigger cannot drift.
+//
+// Both call sites pass ONE derived predicate — config.AccumulatesSharedState, over the class
+// each token declares on its prototype-registry entry — rather than a disjunction of per-token
+// predicates, so a policy using a newly added accumulating token is warned about without this
+// advisory being edited.
 func warnNoRedisSharedState(redisConfigured, policyUsesSharedState bool) {
 	if redisConfigured || !policyUsesSharedState {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "[eunox] NOTICE: a policy uses maxCalls or sequenceBlock but no --redis-addr is set — call-counter, call-ordering history, and kill-switch state are per-process. Running multiple instances will not share quotas, sequence history, or revocations; configure --redis-addr for multi-instance deployments.\n")
+	fmt.Fprintf(os.Stderr, "[eunox] NOTICE: a policy accumulates cross-call state (a maxCalls or blastRadius budget, sequenceBlock history, or flow labels) but no --redis-addr is set — call-counter, call-ordering history, flow-label, and kill-switch state are per-process. Running multiple instances will not share quotas, sequence history, taint, or revocations; configure --redis-addr for multi-instance deployments.\n")
 }
 
 // anyRouteTaskAnchored reports whether any upstream resolves to task-anchored state, so the
@@ -1716,7 +1721,7 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 		return err
 	}
 
-	warnNoRedisSharedState(pf.redisConfigured, transport.AnyRouteHasMaxCalls(routes) || transport.AnyRouteHasBlastRadiusVelocity(routes) || transport.AnyRouteHasSequenceBlock(routes) || transport.AnyRouteHasFlowLabel(routes))
+	warnNoRedisSharedState(pf.redisConfigured, transport.AnyRouteAccumulatesSharedState(routes))
 	warnTaskAnchoringWithoutJWT(pf.jwksURI != "", anyRouteTaskAnchored(cfg))
 
 	bind := cfg.Listen.Bind
@@ -1919,7 +1924,7 @@ func serveStdioHost(ctx context.Context, cfg *config.GatewayConfig, sink *audit.
 
 	upstreamTimeMs := transport.ResolveUpstreamTimeout(pf.upstreamTimeoutMs, cfg.Defaults.UpstreamTimeoutMs)
 
-	warnNoRedisSharedState(pf.redisConfigured, manifest.HasMaxCalls() || manifest.HasBlastRadiusVelocity() || manifest.HasSequenceBlock() || manifest.HasFlowLabel())
+	warnNoRedisSharedState(pf.redisConfigured, manifest.AccumulatesSharedState())
 	// THIS upstream's resolved posture, not the config's. A stdio host runs exactly one
 	// upstream, so scanning every upstream in the file made it advise about a route this
 	// process is not serving — and stay silent when the one it IS serving turned the option

@@ -255,7 +255,7 @@ func TestOAuthMetadataPathSuffix_UnparseableReturnsEmpty(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// LocalManifest.HasSamplingGrant / AnyRouteHasMaxCalls — pure manifest
+// LocalManifest.HasSamplingGrant / AnyRouteAccumulatesSharedState — pure manifest
 // inspection helpers. HasSamplingGrant is single-sourced in internal/config so
 // the startup HTTP-upstream sampling guard and DecideSampling cannot drift; it is
 // action-aware, matching DecideSampling's containsAction(...,"allow") rule.
@@ -321,7 +321,7 @@ func TestManifestHasSamplingGrant(t *testing.T) {
 	}
 }
 
-func TestAnyRouteHasMaxCalls(t *testing.T) {
+func TestAnyRouteAccumulatesSharedState(t *testing.T) {
 	t.Parallel()
 
 	maxCallsCap := capability.Constraint{
@@ -337,18 +337,18 @@ func TestAnyRouteHasMaxCalls(t *testing.T) {
 		"a": {manifest: &config.LocalManifest{Capabilities: []capability.Constraint{plainCap}}},
 		"b": {manifest: &config.LocalManifest{Capabilities: []capability.Constraint{maxCallsCap}}},
 	}
-	if !AnyRouteHasMaxCalls(withMax) {
+	if !AnyRouteAccumulatesSharedState(withMax) {
 		t.Error("a route whose manifest uses maxCalls must be detected")
 	}
 
-	// A nil-manifest (wiretap) route plus a maxCalls-free route ⟹ false; the nil
+	// A nil-manifest (wiretap) route plus a stateless route ⟹ false; the nil
 	// guard must not panic.
 	withoutMax := map[string]*UpstreamRoute{
 		"wiretap": {manifest: nil},
 		"plain":   {manifest: &config.LocalManifest{Capabilities: []capability.Constraint{plainCap}}},
 	}
-	if AnyRouteHasMaxCalls(withoutMax) {
-		t.Error("no route uses maxCalls ⟹ false")
+	if AnyRouteAccumulatesSharedState(withoutMax) {
+		t.Error("no route accumulates cross-call state ⟹ false")
 	}
 }
 
@@ -379,38 +379,68 @@ func TestFirstRouteAudiencePin(t *testing.T) {
 	}
 }
 
-// TestAnyRouteHasSequenceBlock mirrors TestAnyRouteHasMaxCalls: the multi-instance
-// advisory must fire for a sequenceBlock-only policy too, since sequenceBlock reads
-// per-session history out of the same per-process counter that maxCalls uses.
-func TestAnyRouteHasSequenceBlock(t *testing.T) {
+// TestAnyRouteAccumulatesSharedState_NonMaxCallsTokens is the half a per-token predicate kept
+// having to be extended for: the advisory must fire for a sequenceBlock-only or flow-only
+// policy too, since each reads state out of the same per-process backend maxCalls uses. The
+// predicate derives from the class each token declares, so a token added to the grammar is
+// covered without this list — but a route carrying only tokens that accumulate NOTHING must
+// still stay silent, which is the assertion a "warn on everything" simplification would break.
+func TestAnyRouteAccumulatesSharedState_NonMaxCallsTokens(t *testing.T) {
 	t.Parallel()
 
-	seqCap := capability.Constraint{
-		Target:  "tool:deploy",
-		Actions: []string{"call"},
-		Conditions: []capability.Condition{
-			&capability.SequenceBlockCondition{AfterTools: []string{"tool:read_secret"}},
-		},
+	routeWith := func(c capability.Constraint) map[string]*UpstreamRoute {
+		return map[string]*UpstreamRoute{
+			"wiretap": {manifest: nil},
+			"a":       {manifest: &config.LocalManifest{Capabilities: []capability.Constraint{c}}},
+		}
 	}
-	plainCap := capability.Constraint{Target: "tool:write_file", Actions: []string{"call"}}
+	for name, tc := range map[string]struct {
+		constraint capability.Constraint
+		want       bool
+	}{
+		"sequenceBlock reads per-anchor history": {capability.Constraint{
+			Target: "tool:deploy", Actions: []string{"call"},
+			Conditions: []capability.Condition{&capability.SequenceBlockCondition{AfterTools: []string{"tool:read_secret"}}},
+		}, true},
+		"a flowLabel sink reads per-anchor taint": {capability.Constraint{
+			Target: "tool:send", Actions: []string{"call"},
+			Conditions: []capability.Condition{&capability.FlowLabelCondition{Allow: []string{capability.FlowLabelPublic}}},
+		}, true},
+		"a labelOutput source writes it": {capability.Constraint{
+			Target: "tool:read", Actions: []string{"call"},
+			Directives: []capability.Directive{&capability.LabelOutputDirective{Labels: []string{capability.FlowLabelPII}}},
+		}, true},
+		"a cumulative blastRadius consumes a window budget": {capability.Constraint{
+			Target: "tool:refund", Actions: []string{"call"},
+			Conditions: []capability.Condition{&capability.BlastRadiusCondition{
+				MaxTotal: numberPtr("2000"), WindowSeconds: 3600,
+			}},
+		}, true},
+		"a per-call blastRadius stores nothing": {capability.Constraint{
+			Target: "tool:refund", Actions: []string{"call"},
+			Conditions: []capability.Condition{&capability.BlastRadiusCondition{Max: numberPtr("500")}},
+		}, false},
+		"a timeWindow decides from the clock alone": {capability.Constraint{
+			Target: "tool:read", Actions: []string{"call"},
+			Conditions: []capability.Condition{&capability.TimeWindowCondition{NotAfter: "2030-01-01T00:00:00Z"}},
+		}, false},
+		"redactFields masks one response and remembers nothing": {capability.Constraint{
+			Target: "tool:read", Actions: []string{"call"},
+			Directives: []capability.Directive{&capability.RedactFieldsDirective{Fields: []string{"a.b"}}},
+		}, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := AnyRouteAccumulatesSharedState(routeWith(tc.constraint)); got != tc.want {
+				t.Errorf("AnyRouteAccumulatesSharedState() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
 
-	withSeq := map[string]*UpstreamRoute{
-		"a": {manifest: &config.LocalManifest{Capabilities: []capability.Constraint{plainCap}}},
-		"b": {manifest: &config.LocalManifest{Capabilities: []capability.Constraint{seqCap}}},
-	}
-	if !AnyRouteHasSequenceBlock(withSeq) {
-		t.Error("a route whose manifest uses sequenceBlock must be detected")
-	}
-
-	// A nil-manifest (wiretap) route plus a sequenceBlock-free route ⟹ false; the nil
-	// guard must not panic.
-	withoutSeq := map[string]*UpstreamRoute{
-		"wiretap": {manifest: nil},
-		"plain":   {manifest: &config.LocalManifest{Capabilities: []capability.Constraint{plainCap}}},
-	}
-	if AnyRouteHasSequenceBlock(withoutSeq) {
-		t.Error("no route uses sequenceBlock ⟹ false")
-	}
+// numberPtr builds a *json.Number for a blastRadius bound.
+func numberPtr(s string) *json.Number {
+	n := json.Number(s)
+	return &n
 }
 
 // ---------------------------------------------------------------------------

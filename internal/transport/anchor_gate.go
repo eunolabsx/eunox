@@ -39,8 +39,8 @@ import (
 // than a parallel bool, so "serialized" and "has somewhere to serialize on" cannot disagree.
 func (r *UpstreamRoute) serializes() bool { return r != nil && r.decideGates != nil }
 
-// decisionAnchor is the key this route serializes a request's decision on: the validated task
-// when the route anchors state on the task and the caller presented one, the session
+// decisionAnchor is the anchor this route serializes a request's decision on: the validated
+// task when the route anchors state on the task and the caller presented one, the session
 // otherwise.
 //
 // It resolves through enforcement.ResolveStateAnchor — the SAME function the engine's own key
@@ -51,6 +51,11 @@ func (r *UpstreamRoute) serializes() bool { return r != nil && r.decideGates != 
 // pdp.TaskAnchor, which reads the same claim through the same resolver the key builder uses,
 // so the two agree even about the cases that are NOT a task (a padded claim, a numeric one).
 //
+// It returns the resolved enforcement.StateAnchor rather than its rendered key, because one
+// caller has to COMPARE two resolutions: a session caching a gate must be able to ask whether
+// this request resolves the anchor it cached, and a comparable two-string struct answers that
+// without rendering anything. Key() is applied where the registry is actually addressed.
+//
 // claims must be the VALIDATED claims — the transport's HTTP entry point verifies the bearer
 // token before dispatch and attaches them to the request context. Resolving this from an
 // unverified token would let a caller choose which turn it takes, and therefore choose not to
@@ -60,26 +65,26 @@ func (r *UpstreamRoute) serializes() bool { return r != nil && r.decideGates != 
 // session, and so is one whose token carries no task id (which the engine refuses outright
 // under task anchoring — a turn on the session is the right one for a call that is about to
 // be denied).
-func (r *UpstreamRoute) decisionAnchor(sessionID string, claims *pdp.JWTClaims) string {
-	return decisionAnchorKey(r != nil && r.taskAnchored, claims, sessionID)
+func (r *UpstreamRoute) decisionAnchor(sessionID string, claims *pdp.JWTClaims) enforcement.StateAnchor {
+	return resolveDecisionAnchor(r != nil && r.taskAnchored, claims, sessionID)
 }
 
-// decisionAnchorKey is the one place a transport turns (its anchoring setting, a request's
-// validated claims, a session id) into the turn key. Both transports call it — a second
+// resolveDecisionAnchor is the one place a transport turns (its anchoring setting, a request's
+// validated claims, a session id) into the turn's anchor. Both transports call it — a second
 // hand-rolled copy of the fallback branching is the shape this whole seam exists to remove,
 // and the engine's key builder resolving through enforcement.ResolveStateAnchor while a
 // transport re-derived it is precisely how the turn and the key would come to disagree.
-func decisionAnchorKey(taskAnchored bool, claims *pdp.JWTClaims, sessionID string) string {
+func resolveDecisionAnchor(taskAnchored bool, claims *pdp.JWTClaims, sessionID string) enforcement.StateAnchor {
 	id, hasTask := "", false
 	if taskAnchored {
 		id, hasTask = pdp.TaskAnchor(claims)
 	}
-	return enforcement.ResolveStateAnchor(taskAnchored, hasTask, id, sessionID).Key()
+	return enforcement.ResolveStateAnchor(taskAnchored, hasTask, id, sessionID)
 }
 
 // decisionAnchorFromContext is decisionAnchor for the host request path, whose validated
 // claims ride the request context (attached by handleMCP's pre-dispatch token validation).
-func (r *UpstreamRoute) decisionAnchorFromContext(ctx context.Context, sessionID string) string {
+func (r *UpstreamRoute) decisionAnchorFromContext(ctx context.Context, sessionID string) enforcement.StateAnchor {
 	return r.decisionAnchor(sessionID, pdp.JWTClaimsPtr(ctx))
 }
 

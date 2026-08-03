@@ -21,13 +21,18 @@ import (
 // encoding in a second place — which is the drift the shared resolver exists to remove — while
 // what these tests are actually about is WHICH anchor a request resolves to (task or session,
 // and under which id), not how it is spelled.
-func sessionAnchorKey(sessionID string) string {
-	return enforcement.ResolveStateAnchor(false, false, "", sessionID).Key()
+func sessionAnchor(sessionID string) enforcement.StateAnchor {
+	return enforcement.ResolveStateAnchor(false, false, "", sessionID)
 }
 
-func taskAnchorKey(taskID string) string {
-	return enforcement.ResolveStateAnchor(true, true, taskID, "some-session").Key()
+func taskAnchor(taskID string) enforcement.StateAnchor {
+	return enforcement.ResolveStateAnchor(true, true, taskID, "some-session")
 }
+
+// The rendered forms, for the ticket queues and the gate registry, which are keyed by string.
+func sessionAnchorKey(sessionID string) string { return sessionAnchor(sessionID).Key() }
+
+func taskAnchorKey(taskID string) string { return taskAnchor(taskID).Key() }
 
 // beginTurn and beginTurnWithin drive the registry's one entry point, anchorGates.acquire,
 // which is what httpSession.acquireDecisionTurn calls for a task-anchored route and for any
@@ -159,15 +164,15 @@ func TestDecisionAnchor_FollowsTheStateAnchor(t *testing.T) {
 		a := anchored.decisionAnchor("sess-a", noTaskClaims)
 		b := anchored.decisionAnchor("sess-b", noTaskClaims)
 		assert.NotEqual(t, a, b, "the engine keys these on their sessions, so the turn must too")
-		assert.Equal(t, sessionAnchorKey("sess-a"), a)
+		assert.Equal(t, sessionAnchor("sess-a"), a)
 	})
 
 	t.Run("no token at all falls back to the session", func(t *testing.T) {
-		assert.Equal(t, sessionAnchorKey("sess-a"), anchored.decisionAnchor("sess-a", nil))
+		assert.Equal(t, sessionAnchor("sess-a"), anchored.decisionAnchor("sess-a", nil))
 	})
 
 	t.Run("a route that does not anchor on the task ignores the claim", func(t *testing.T) {
-		assert.Equal(t, sessionAnchorKey("sess-a"), sessionOnly.decisionAnchor("sess-a", taskClaims),
+		assert.Equal(t, sessionAnchor("sess-a"), sessionOnly.decisionAnchor("sess-a", taskClaims),
 			"an operator who did not enable task anchoring must see exactly the per-session turn")
 		assert.NotEqual(t,
 			sessionOnly.decisionAnchor("sess-a", taskClaims),
@@ -182,8 +187,8 @@ func TestDecisionAnchor_FollowsTheStateAnchor(t *testing.T) {
 
 	t.Run("the request's claims come from its context on the host path", func(t *testing.T) {
 		ctx := pdp.WithJWTClaims(context.Background(), taskClaims)
-		assert.Equal(t, taskAnchorKey("task-42"), anchored.decisionAnchorFromContext(ctx, "sess-a"))
-		assert.Equal(t, sessionAnchorKey("sess-a"), anchored.decisionAnchorFromContext(context.Background(), "sess-a"))
+		assert.Equal(t, taskAnchor("task-42"), anchored.decisionAnchorFromContext(ctx, "sess-a"))
+		assert.Equal(t, sessionAnchor("sess-a"), anchored.decisionAnchorFromContext(context.Background(), "sess-a"))
 	})
 }
 
@@ -206,7 +211,7 @@ func TestDecisionTurn_SpansTwoSessionsSharingATask(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			// Session A takes its turn and holds it, as a declassifying call does across its
 			// forward.
-			endA := beginTurn(tc.route.decideGates, tc.route.decisionAnchor("sess-a", claims))
+			endA := beginTurn(tc.route.decideGates, tc.route.decisionAnchor("sess-a", claims).Key())
 
 			var started atomic.Bool
 			ready := make(chan struct{})
@@ -215,7 +220,7 @@ func TestDecisionTurn_SpansTwoSessionsSharingATask(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				close(ready)
-				end := beginTurn(tc.route.decideGates, tc.route.decisionAnchor("sess-b", claims))
+				end := beginTurn(tc.route.decideGates, tc.route.decisionAnchor("sess-b", claims).Key())
 				started.Store(true)
 				end()
 			}()
@@ -292,7 +297,7 @@ func TestSessionGate_HeldOnceForTheSessionsLife(t *testing.T) {
 
 	// The registry path resolves the very same gate, so the cache is an optimization rather
 	// than a second turn a concurrent resolver could take independently.
-	viaRegistry, drop := rt.decideGates.hold(rt.decisionAnchor(sess.id, nil))
+	viaRegistry, drop := rt.decideGates.hold(rt.decisionAnchor(sess.id, nil).Key())
 	assert.Same(t, held, viaRegistry)
 	drop()
 
@@ -336,23 +341,27 @@ func TestSessionGate_ReleasedOnEveryTeardownPath(t *testing.T) {
 	}
 }
 
-// TestSessionGate_TaskAnchoredRouteResolvesPerRequest is the negative half: caching is only
-// correct where the anchor cannot change between requests. A task-anchored route's anchor comes
-// from each request's own validated claims, and two sessions sharing a task must reach ONE gate
-// — which is exactly what the registry is for.
+// TestSessionGate_TaskAnchoredRouteResolvesPerRequest is the negative half: the cache serves a
+// request only when the request RESOLVES the anchor it was taken for. Here neither session
+// presented a task at initialize, so each caches its own session anchor — and requests that do
+// carry a task resolve an anchor neither cached, must therefore reach the registry, and must
+// land on ONE gate, which is exactly what task anchoring is for.
 func TestSessionGate_TaskAnchoredRouteResolvesPerRequest(t *testing.T) {
 	t.Parallel()
-	rt := &UpstreamRoute{decideGates: newAnchorGates(), taskAnchored: true}
+	rt := &UpstreamRoute{decideGates: newAnchorGates(), taskAnchored: true, pdp: pdp.DenyAllPDP{}}
 	a := newTestSession(&httpSession{id: "sess-a", route: rt})
 	b := newTestSession(&httpSession{id: "sess-b", route: rt})
 	a.holdDecisionGate()
 	b.holdDecisionGate()
-	assert.Nil(t, a.decideGate, "a task-anchored route must not pin a per-session gate")
-	assert.Zero(t, rt.decideGates.size())
+	require.Equal(t, sessionAnchor("sess-a"), a.decideAnchor, "a session with no task claim anchors on itself")
+	require.Equal(t, 2, rt.decideGates.size(), "two sessions, two session-anchored gates")
+
+	ctx := pdp.WithJWTClaims(context.Background(), &pdp.JWTClaims{TaskID: "task-42"})
+	require.Nil(t, a.gateFor(rt.decisionAnchorFromContext(ctx, a.id)),
+		"a request resolving another anchor must not be served the cached gate")
 
 	// Two sessions, one task: the second must wait for the first, which is only true if both
-	// resolved through the registry.
-	ctx := pdp.WithJWTClaims(context.Background(), &pdp.JWTClaims{TaskID: "task-42"})
+	// fell through to the registry.
 	end := a.beginDecisionTurn(ctx)
 	waiting := make(chan func(), 1)
 	go func() { waiting <- b.beginDecisionTurn(ctx) }()
@@ -363,7 +372,77 @@ func TestSessionGate_TaskAnchoredRouteResolvesPerRequest(t *testing.T) {
 	}
 	end()
 	(<-waiting)()
-	assert.Zero(t, rt.decideGates.size(), "and the shared gate is reclaimed once both are done")
+	assert.Equal(t, 2, rt.decideGates.size(),
+		"the shared task gate is reclaimed once both are done; the two session gates are held for the sessions' lives")
+	releaseSessionState(a)
+	releaseSessionState(b)
+	assert.Zero(t, rt.decideGates.size())
+}
+
+// TestSessionGate_CacheFollowsTheResolvedAnchor is the property that replaced "this route does
+// not anchor on the task, so the anchor cannot change".
+//
+// That restatement was correct for the two anchor kinds that exist and asserted independently
+// of enforcement.ResolveStateAnchor, which is the function that actually decides. A third kind
+// (an agent id, a conversation, a delegation chain) breaks every caller of the resolver at
+// compile time — and a hand-written restatement of its outcome compiles untouched, leaving the
+// session serving turns on a gate the per-request path no longer reaches while the engine writes
+// state under the new key: two callers on one logical anchor, holding independent turns.
+//
+// Deciding from the resolved anchor is correct for any number of kinds by construction. The
+// bonus is here too: a task-anchored session that stays on one task now uses the fast path,
+// which the bool could not express.
+func TestSessionGate_CacheFollowsTheResolvedAnchor(t *testing.T) {
+	t.Parallel()
+	rt := &UpstreamRoute{decideGates: newAnchorGates(), taskAnchored: true, pdp: pdp.DenyAllPDP{}}
+	claims := &pdp.JWTClaims{Subject: "agent-1", TaskID: "task-42"}
+	sess := newTestSession(&httpSession{id: "sess-a", route: rt, claims: claims})
+	sess.holdDecisionGate()
+	require.Equal(t, taskAnchor("task-42"), sess.decideAnchor, "the session's own task is what it caches")
+	require.NotNil(t, sess.decideGate)
+	require.Equal(t, 1, rt.decideGates.size())
+
+	// A request on that same task takes the cached gate and never re-enters the registry.
+	held := sess.decideGate
+	ctx := pdp.WithJWTClaims(context.Background(), claims)
+	for range 20 {
+		sess.beginDecisionTurn(ctx)()
+		assert.Same(t, held, sess.decideGate)
+		assert.Equal(t, 1, rt.decideGates.size(), "a session that stays on one task must not re-enter the registry")
+	}
+	// The server-initiated leg reads the session's captured claims, so it resolves the same
+	// anchor and takes the same gate.
+	end, ok := sess.beginDecisionTurnWithin(time.Second)
+	require.True(t, ok)
+	end()
+	assert.Equal(t, 1, rt.decideGates.size())
+
+	// A request resolving a DIFFERENT anchor must not be served the cached turn: it goes
+	// through the registry, so it excludes another session on that anchor and not this one.
+	other := pdp.WithJWTClaims(context.Background(), &pdp.JWTClaims{Subject: "agent-1", TaskID: "task-99"})
+	require.Nil(t, sess.gateFor(rt.decisionAnchorFromContext(other, sess.id)))
+	sibling := newTestSession(&httpSession{id: "sess-b", route: rt})
+	endOther := sess.beginDecisionTurn(other)
+	blocked := make(chan struct{})
+	go func() { defer close(blocked); sibling.beginDecisionTurn(other)() }()
+	select {
+	case <-blocked:
+		t.Fatal("two callers on one resolved anchor must share a turn, cache or no cache")
+	case <-time.After(20 * time.Millisecond):
+	}
+	// ...and the session's OWN anchor is still free while that one is held, which a single
+	// per-session lock could not have expressed.
+	free := sess.beginDecisionTurn(ctx)
+	require.NotNil(t, free)
+	free()
+	endOther()
+	select {
+	case <-blocked:
+	case <-time.After(time.Second):
+		t.Fatal("the turn must advance once released")
+	}
+	releaseSessionState(sess)
+	assert.Zero(t, rt.decideGates.size())
 }
 
 // TestSessionGate_UnregisteredSessionStillSerializes covers the fallback. The cache is set at

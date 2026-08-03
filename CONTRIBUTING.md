@@ -218,6 +218,18 @@ rules:
 - For new condition types, add table-driven tests under
   `pkg/capability/`. Include at least one allow case, one deny case, and one
   malformed-input case.
+- A new condition or directive declares two things on its `pkg/capability`
+  prototype-registry entry, beside its constructor, and the build fails without
+  either: `Since`, the published `schemaVersion` that introduced its
+  discriminator, and `State`, the cross-call state its enforcement touches.
+  `State` is `StateNone` when the token decides from the request alone;
+  `StateAtomic` when it consumes a budget through one atomic `AdmitAll`
+  admission per call (which is accumulated state the multi-instance advisory
+  must warn about, but needs no decision turn); and `StateNonAtomic` when one
+  call commits what a later call reads back, with a window in between — a
+  flow-label set, an antecedent marker — which is what the transports' decision
+  turn exists to order. Both transports derive whether to serialize from it, so
+  a token that declares nothing is treated as `StateNonAtomic` until it does.
 - For new MCP method coverage, add an enforcement-gap-style test in
   `internal/transport/enforcement_gaps_test.go`.
 - For new audit-record fields, add a sign-and-verify round-trip test.
