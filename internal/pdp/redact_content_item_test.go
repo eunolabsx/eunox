@@ -196,8 +196,16 @@ func TestApplyRedactObligs_ContentItemProtocolKeysAreNotMaskedWholesale(t *testi
 		})
 		require.NoError(t, err, key)
 		assert.NotContains(t, string(out), `"`+key+`":"`+redactedSentinel+`"`,
-			"%s carries protocol structure on a content item; masking it wholesale hands the host an item it cannot decode", key)
+			"%s carries protocol structure on an image item; masking it wholesale hands the host an item it cannot decode", key)
 	}
+
+	// The exemption is PER TYPE, and that is the point: `data` is the binary payload on an
+	// image item and an ordinary field name on a text one, so exempting it everywhere would
+	// forward a declared field to protect a shape the item cannot have.
+	textItem := []byte(`{"content":[{"type":"text","text":"benign","data":"` + redactSSNValue + `"}]}`)
+	assertRedactedSSN(t, textItem, []capability.Obligation{
+		{Type: capability.DirectiveTypeRedactFields, Paths: []string{"data"}},
+	})
 
 	// The exemption costs the obligation nothing: a declared field INSIDE one of them is
 	// still masked, which is the whole point of walking the item's keys.
