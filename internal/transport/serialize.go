@@ -100,25 +100,25 @@ func decisionEndFromContext(ctx context.Context) func() {
 // holder is itself waiting for. That is a cycle rather than a slowdown, so that leg waits
 // through beginWithin and fails closed instead; see beginWithin for the full shape.
 type decisionSerializer struct {
-	mu sync.Mutex
-	// queues holds one FIFO per LIVE anchor. An entry is dropped once every ticket it handed
-	// out has been served and no holder is pinning it, so a proxy that ever serves many
-	// anchors does not accumulate one counter pair per anchor it has seen — the same reason
-	// the HTTP gate registry refcounts.
-	queues map[string]*ticketQueue
+	// queues holds one FIFO per LIVE anchor, through the shared keyedRegistry
+	// (keyed_registry.go): the map, the key, the pin count and the delete-at-zero are that
+	// registry's, so a proxy that ever serves many anchors does not accumulate one counter
+	// pair per anchor it has seen, and the HTTP gate registry's lifetime cannot drift from
+	// this one. What is supplied HERE is the reclaim trigger that genuinely differs — a FIFO
+	// with no pin can still have handed out tickets whose waiters are parked on it, so it
+	// stays until handed == serving as well.
+	//
+	// Its mutex guards the ticket counters below too (each queue's cond is built over it), so
+	// there is exactly one lock between "which queue is this" and "whose turn is it".
+	queues keyedRegistry[*ticketQueue]
 }
 
 // ticketQueue is one anchor's FIFO turn.
 type ticketQueue struct {
-	anchor  string
-	cond    *sync.Cond // over the serializer's mu; broadcasts wake only this anchor's waiters
-	handed  uint64     // next ticket to hand out
-	serving uint64     // ticket currently allowed to run its decision
-	// pins counts long-lived holders (see hold). Tickets in flight are NOT counted here:
-	// handed != serving already says a ticket is outstanding, and a second counter restating
-	// that is one more thing to keep in agreement — one that, left above zero by a future
-	// path, would silently pin the queue forever.
-	pins int
+	keyedEntry            // the registry's key + pin count (see decisionSerializer.queues)
+	cond       *sync.Cond // over the registry's mutex; broadcasts wake only this anchor's waiters
+	handed     uint64     // next ticket to hand out
+	serving    uint64     // ticket currently allowed to run its decision
 	// abandoned holds the tickets whose waiter gave up (beginWithin). The turn SKIPS them when
 	// serving reaches them, which is what makes giving up safe: without it an abandoned ticket
 	// is a hole in the FIFO that every later ticket on this anchor waits behind forever, so a
@@ -126,6 +126,19 @@ type ticketQueue struct {
 	// give-up, which on every deployment is never.
 	abandoned map[uint64]struct{}
 }
+
+// entry exposes this queue's registry bookkeeping (keyedRegistryValue). The refs it carries
+// are the long-lived PINS (see hold); tickets in flight are deliberately not counted there —
+// handed != serving already says a ticket is outstanding, and a second counter restating that
+// is one more thing to keep in agreement, one that a future path leaving it above zero would
+// silently pin the queue with forever.
+func (q *ticketQueue) entry() *keyedEntry { return &q.keyedEntry }
+
+// idleQueue is the registry's extra reclaim condition for a FIFO: an unpinned queue may be
+// dropped only once every ticket it handed out has been served. A waiter — which by
+// definition holds a ticket the serving counter has not reached — therefore always keeps the
+// queue it is parked on.
+func idleQueue(q *ticketQueue) bool { return q.handed == q.serving }
 
 // decisionTicket is a reserved place in one anchor's queue. Its zero value is the
 // "not serialized" ticket, which begin treats as a no-op.
@@ -140,7 +153,12 @@ type decisionTicket struct {
 // caller through one queue. The HTTP transport uses the route's anchor-keyed gate registry
 // instead, because there a turn can have to span two sessions.
 func newDecisionSerializer() *decisionSerializer {
-	return &decisionSerializer{queues: map[string]*ticketQueue{}}
+	g := &decisionSerializer{}
+	g.queues.init(
+		func() *ticketQueue { return &ticketQueue{cond: sync.NewCond(g.queues.locker())} },
+		idleQueue,
+	)
+	return g
 }
 
 // take reserves the next ticket in receipt order for anchor. Call it from the single-threaded
@@ -149,9 +167,9 @@ func newDecisionSerializer() *decisionSerializer {
 // rejected), so every reserved ticket is eventually served — an un-begun ticket would
 // stall every later one behind it on the same anchor.
 func (g *decisionSerializer) take(anchor string) decisionTicket {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.queueLocked(anchor).ticket()
+	g.queues.lock()
+	defer g.queues.unlock()
+	return g.queues.entryLocked(anchor).ticket()
 }
 
 // takeOn reserves the next ticket on a queue the caller already holds pinned, skipping the
@@ -162,8 +180,8 @@ func (g *decisionSerializer) take(anchor string) decisionTicket {
 // decisions unserialized, silently, which is the fail-open the turn exists to close. Callers
 // that may hold no pin resolve through take instead; see StdioProxy.takeDecisionTicket.
 func (g *decisionSerializer) takeOn(q *ticketQueue) decisionTicket {
-	g.mu.Lock()
-	defer g.mu.Unlock()
+	g.queues.lock()
+	defer g.queues.unlock()
 	return q.ticket()
 }
 
@@ -183,38 +201,10 @@ func (g *decisionSerializer) hold(anchor string) (queue *ticketQueue, unpin func
 	if g == nil {
 		return nil, func() {}
 	}
-	g.mu.Lock()
-	q := g.queueLocked(anchor)
-	q.pins++
-	g.mu.Unlock()
-	return q, sync.OnceFunc(func() {
-		g.mu.Lock()
-		q.pins--
-		g.reclaimLocked(q)
-		g.mu.Unlock()
-	})
+	return g.queues.hold(anchor)
 }
 
-// queueLocked returns this anchor's queue, creating it if needed. Caller holds g.mu.
-func (g *decisionSerializer) queueLocked(anchor string) *ticketQueue {
-	q := g.queues[anchor]
-	if q == nil {
-		q = &ticketQueue{anchor: anchor, cond: sync.NewCond(&g.mu)}
-		g.queues[anchor] = q
-	}
-	return q
-}
-
-// reclaimLocked drops a queue with no pin and no outstanding ticket. Caller holds g.mu.
-// Reclaimed only when both are true, so a waiter — which by definition holds a ticket the
-// serving counter has not reached — always keeps the queue it is parked on.
-func (g *decisionSerializer) reclaimLocked(q *ticketQueue) {
-	if q.pins == 0 && q.handed == q.serving {
-		delete(g.queues, q.anchor)
-	}
-}
-
-// ticket reserves the next place in this queue's FIFO. Caller holds the serializer's mu.
+// ticket reserves the next place in this queue's FIFO. Caller holds the registry's mutex.
 func (q *ticketQueue) ticket() decisionTicket {
 	t := decisionTicket{queue: q, n: q.handed}
 	q.handed++
@@ -277,14 +267,14 @@ func (g *decisionSerializer) beginWithin(t decisionTicket, d time.Duration) (end
 	gaveUp := false
 	if d > 0 {
 		timer := time.AfterFunc(d, func() {
-			g.mu.Lock()
-			defer g.mu.Unlock()
+			g.queues.lock()
+			defer g.queues.unlock()
 			gaveUp = true
 			q.cond.Broadcast()
 		})
 		defer timer.Stop()
 	}
-	g.mu.Lock()
+	g.queues.lock()
 	for q.serving != t.n && !gaveUp {
 		q.cond.Wait()
 	}
@@ -292,28 +282,29 @@ func (g *decisionSerializer) beginWithin(t decisionTicket, d time.Duration) (end
 		// The turn is checked FIRST on the way out: a timer that fires in the same instant the
 		// turn comes up loses, so a caller is never refused a turn it could have had.
 		q.abandonLocked(t.n)
-		g.mu.Unlock()
+		g.queues.unlock()
 		return nil, false
 	}
-	g.mu.Unlock()
+	g.queues.unlock()
 	// sync.OnceFunc guards the turn-advance: the Decide* handler ends the critical section
 	// right after its decision (before the forward), and the serve loop defers the same end
 	// as a backstop for a path that returns before the decision (malformed params), so the
 	// turn advances exactly once either way.
 	return sync.OnceFunc(func() {
-		g.mu.Lock()
+		g.queues.lock()
 		q.advanceLocked()
-		// Every ticket this queue handed out has now been served (and nobody has pinned it),
-		// so nothing is queued on it and nothing can be: a later take under the same anchor
-		// builds a fresh queue, which is correct precisely because no waiter holds the old one.
-		g.reclaimLocked(q)
+		// The turn moving can make this queue reclaimable without any reference changing —
+		// once every ticket it handed out has been served (and nobody has pinned it), nothing
+		// is queued on it and nothing can be: a later take under the same anchor builds a
+		// fresh queue, which is correct precisely because no waiter holds the old one.
+		g.queues.reapLocked(q)
 		q.cond.Broadcast()
-		g.mu.Unlock()
+		g.queues.unlock()
 	}), true
 }
 
 // abandonLocked records that ticket n will never be begun, so advanceLocked skips it. Caller
-// holds the serializer's mu.
+// holds the registry's mutex.
 //
 // Only a ticket that has NOT come up can be abandoned (beginWithin checks the turn first), so
 // n is always strictly ahead of serving and the entry is always consumed by a later advance:
@@ -326,7 +317,7 @@ func (q *ticketQueue) abandonLocked(n uint64) {
 }
 
 // advanceLocked moves the turn to the next ticket that still has a waiter, skipping any that
-// were abandoned. Caller holds the serializer's mu.
+// were abandoned. Caller holds the registry's mutex.
 //
 // Skipping is a loop rather than a single step because abandonments can be consecutive (a
 // wedged reader that gives up twice), and one un-skipped hole stalls the anchor for good.
@@ -344,8 +335,4 @@ func (q *ticketQueue) advanceLocked() {
 // size reports how many anchor queues are live. Test-only, for the same reason the HTTP
 // registry exposes one: the drop-at-zero is what keeps a long-lived proxy from accumulating
 // an entry per anchor it has ever served, and that is invisible from the outside.
-func (g *decisionSerializer) size() int {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return len(g.queues)
-}
+func (g *decisionSerializer) size() int { return g.queues.size() }

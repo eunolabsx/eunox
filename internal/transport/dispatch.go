@@ -38,7 +38,12 @@ import (
 // fail-closed "no policy" default.
 type dispatchParams struct {
 	forwardParams
-	decidingPDP
+	// pdp is the decision point every enforced handler decides with, and the committer the
+	// handlers hand to enforcedForwardCore for an approved declassification's clear. ONE
+	// field: the committer used to be a second copy of it on forwardParams, kept in agreement
+	// by a constructor step and an AST guard, and passing it down to the core instead removes
+	// the pair rather than policing it.
+	pdp      pdp.PolicyDecisionPoint
 	sourceIP string
 	// buildInit answers a host `initialize` locally from the upstream capabilities
 	// captured at session start (HTTP: the session's; stdio: the proxy's). It is
@@ -62,45 +67,6 @@ type dispatchParams struct {
 	// the interface is union-only, so ignoring it falls back to the conservative session
 	// join, which is the stricter reading.
 	honorAttribution bool
-}
-
-// decidingPDP holds the policy decision point a params struct decides with. It exists to make
-// the field UNSPELLABLE in a composite literal: Go forbids setting a promoted field in a
-// literal, so `dispatchParams{pdp: p}` and `serverRequestParams{pdp: p}` no longer compile in
-// any spelling — including the two an AST guard is most likely to miss, an element of a
-// slice/map literal that ELIDES its type and a literal built somewhere the guard does not walk.
-//
-// That matters because every field derived FROM the decision point (today the committer) must
-// be set by the same step that sets it; a site that assigns pdp and forgets the derived field
-// compiles, passes every test that does not exercise a declassification, and then silently
-// never clears a label. withPDP is the one step, and this type is what forces callers through
-// it rather than merely asking them to.
-//
-// SCOPE, stated rather than implied: Go's encapsulation is package-scoped, so a literal of
-// THIS type (`decidingPDP{pdp: p}`) and an assignment to the promoted field (`d.pdp = p`) are
-// both still writable from anywhere in internal/transport. Those two spellings are what the
-// source guard beside the type covers (see TestParamsLiterals_DoNotAssignThePDPFields); this
-// closes the accidental version, the guard closes the deliberate one, and neither pretends the
-// wrong value is unassignable.
-type decidingPDP struct {
-	pdp pdp.PolicyDecisionPoint
-}
-
-// withPDP records the policy decision point and derives every field that must be the SAME
-// PDP from it — today the embedded forwardParams.committer, which applies the label clear an
-// approved declassification authorized once this transport has performed the call.
-//
-// It exists so those two cannot be set independently. They were, at both construction
-// sites, two lines apart; nothing tied them together, and the failure a divergence produces
-// is silent: a site that sets pdp and forgets committer compiles, passes every test that
-// does not exercise a declassification, and then never clears a label — every sanitizing
-// step in the policy silently failing to take effect, with the session over-blocking from
-// then on. Deriving it here means a new dispatchParams site inherits the commit by
-// construction.
-func (d dispatchParams) withPDP(p pdp.PolicyDecisionPoint) dispatchParams {
-	d.pdp = p
-	d.committer = p
-	return d
 }
 
 // finishDecision closes the decision critical section, if one is open (see
@@ -517,7 +483,7 @@ func dispatchToolsCall(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mc
 	if (d.audit || dec.AuditOnly) && len(params.Arguments) > 0 {
 		toolDetails = quarantineReservedArgs(params.Arguments)
 	}
-	out := enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodToolsCall, params.Name, params.Name, "tool", true,
+	out := enforcedForwardCore(ctx, d.forwardParams, d.pdp, msg, dec, capability.MethodToolsCall, params.Name, params.Name, "tool", true,
 		func(upResp mcp.RPCMsg) map[string]interface{} {
 			// Record the forwarded upstream's error code, as every other enforced method
 			// does, so a tools/call the upstream rejected is not byte-for-byte identical
@@ -677,7 +643,7 @@ func dispatchResourcesRead(ctx context.Context, d dispatchParams, msg mcp.RPCMsg
 	// also enforce resource reads.
 	dec := d.pdp.DecideResourceRead(d.decideCtx(ctx), d.sessionID, params.URI, d.sourceIP)
 	d.finishDecision(dec) // release the decision turn before the forward
-	return enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodResourcesRead, params.URI, params.URI, "resource", true, upstreamErrorDetail)
+	return enforcedForwardCore(ctx, d.forwardParams, d.pdp, msg, dec, capability.MethodResourcesRead, params.URI, params.URI, "resource", true, upstreamErrorDetail)
 }
 
 // dispatchResourcesSubscribe enforces resources/subscribe under the same
@@ -694,7 +660,7 @@ func dispatchResourcesSubscribe(ctx context.Context, d dispatchParams, msg mcp.R
 	dec := d.pdp.DecideResourceRead(d.decideCtx(ctx), d.sessionID, params.URI, d.sourceIP)
 	d.finishDecision(dec) // release the decision turn before the forward
 	// recordObligations is false: a subscription does not log obligation names.
-	return enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodResourcesSubscribe, params.URI, params.URI, "resource subscription", false, upstreamErrorDetail)
+	return enforcedForwardCore(ctx, d.forwardParams, d.pdp, msg, dec, capability.MethodResourcesSubscribe, params.URI, params.URI, "resource subscription", false, upstreamErrorDetail)
 }
 
 // dispatchResourcesUnsubscribe enforces resources/unsubscribe against the SAME manifest
@@ -734,7 +700,7 @@ func dispatchResourcesUnsubscribe(ctx context.Context, d dispatchParams, msg mcp
 	dec := d.pdp.DecideResourceCancel(ctx, d.sessionID, params.URI, d.sourceIP)
 	d.finishDecision(dec) // release the decision turn before the forward
 	// recordObligations is false: cancelling a subscription does not log obligation names.
-	return enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodResourcesUnsubscribe, params.URI, params.URI, "resource subscription", false, upstreamErrorDetail)
+	return enforcedForwardCore(ctx, d.forwardParams, d.pdp, msg, dec, capability.MethodResourcesUnsubscribe, params.URI, params.URI, "resource subscription", false, upstreamErrorDetail)
 }
 
 // dispatchPromptsGet enforces the capability manifest for prompts/get requests.
@@ -752,7 +718,7 @@ func dispatchPromptsGet(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) m
 	dec := d.pdp.DecidePromptGet(d.decideCtx(ctx), d.sessionID, params.Name, d.sourceIP)
 	d.finishDecision(dec) // release the decision turn before the forward
 	// auditID carries the "prompts/" display prefix; denialTarget is the bare name.
-	return enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodPromptsGet, "prompts/"+params.Name, params.Name, "prompt", true, upstreamErrorDetail)
+	return enforcedForwardCore(ctx, d.forwardParams, d.pdp, msg, dec, capability.MethodPromptsGet, "prompts/"+params.Name, params.Name, "prompt", true, upstreamErrorDetail)
 }
 
 // dispatchList forwards a */list request to the upstream and prunes the result

@@ -110,7 +110,7 @@ func TestDispatchToolsCall_AnnotationsNeverLandInTheCallersArguments(t *testing.
 					Error: &mcp.RPCError{Code: -32000, Message: "upstream said no"}}, nil
 			},
 		},
-		decidingPDP: decidingPDP{pdp: dp},
+		pdp: dp,
 	}
 	// The exact bytes the host sent, kept so the parsed map can be compared against them.
 	const rawArgs = `{"path":"/tmp/x"}`
@@ -321,7 +321,7 @@ func TestFlowDiscriminator_IsOneSharedConstant(t *testing.T) {
 // annotation cannot rewrite the request it annotates.
 func TestEnforcedForwardCore_AllowDetailsAreNotTheCallersMap(t *testing.T) {
 	rec, spy := &fwdRecorder{}, &commitSpy{}
-	fp := forwardParams{rec: rec, sessionID: "s", committer: spy,
+	fp := forwardParams{rec: rec, sessionID: "s",
 		callUpstream: func(_ context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, error) {
 			return mcp.RPCMsg{ID: msg.ID, Result: json.RawMessage(`{"ok":true}`)}, nil
 		}}
@@ -331,7 +331,7 @@ func TestEnforcedForwardCore_AllowDetailsAreNotTheCallersMap(t *testing.T) {
 	// statement beside the caller's arguments — the shape this guard needs.
 	spy.failErr = errors.New("flow store unreachable (test probe)")
 
-	enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
+	enforcedForwardCore(context.Background(), fp, spy, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
 		declassifiedAllow(), "tools/call", "sanitize", "sanitize", "tool", false,
 		func(mcp.RPCMsg) map[string]interface{} { return live })
 

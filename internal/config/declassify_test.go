@@ -110,7 +110,7 @@ func TestDeclassify_CountsAsFlowForTheSharedStateAdvisory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if !m.HasFlowLabel() {
+	if !m.UsesEngineSubsystem(capability.SubsystemFlowLabels) {
 		t.Fatal("a declassify policy is flow-relevant")
 	}
 }

@@ -45,13 +45,21 @@ var guardedStructs = map[string]struct {
 			"Both constructors take resolved session state (an *httpSession, or the stdio " +
 			"proxy's own id) and so cannot be handed a raw Mcp-Session-Id header; a literal can",
 	},
+	"dispatchParams": {
+		files:       []string{"stdio.go", "http_handlers.go"},
+		constructor: "(*HTTPProxy).dispatchParams or (*StdioProxy).dispatchParams",
+		why: "dispatchParams carries forwardParams' session provenance AND the pdp every " +
+			"enforced handler decides with — which dispatchRequest dereferences, so a literal " +
+			"that simply omits it compiles and panics rather than failing closed. Both " +
+			"constructors supply a PDP that is never nil (NewStdioProxy and BuildRoutes " +
+			"substitute DenyAllPDP for an omitted one)",
+	},
 	"serverRequestParams": {
 		files:       []string{"stdio.go", "http_handlers.go"},
-		constructor: "a literal at one of the allowlisted sites, completed with .withPDP(pdp)",
+		constructor: "a literal at one of the allowlisted sites",
 		why: "serverRequestParams.sessionID is recorded as the session a server-initiated " +
 			"sampling/roots/elicitation request was answered for, with the same provenance " +
-			"requirement as forwardParams; its pdp and committer must also come from ONE " +
-			"decision point, which is what withPDP derives",
+			"requirement as forwardParams",
 	},
 }
 

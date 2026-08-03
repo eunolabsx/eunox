@@ -1539,6 +1539,11 @@ func TestStdioReadUpstream_Paths(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("readUpstream did not return after pipe was closed")
 	}
+	// The reader returning does NOT imply its server-initiated handlers have: they run on
+	// their own goroutines (dispatchUpstreamRequest) precisely so a blocked one cannot stall
+	// response delivery, which means the reader must be free to exit ahead of them. Drain them
+	// the same way Start's teardown does before reading what they wrote.
+	p.awaitServerRequestsDrained(5 * time.Second)
 
 	// Notification should have been forwarded to host
 	found := false

@@ -146,10 +146,14 @@ func unmarshalDirective(data []byte) (Directive, error) {
 // masks fields in one response and remembers nothing, while labelOutput writes the flow-label
 // set a later sink reads back and declassify clears it and burns a single-use grant — both
 // non-atomic read-then-writes, and both reasons a policy carrying them needs the decision turn.
+//
+// Uses follows the rule in subsystem.go, and the split is the same one: redactFields reads no
+// engine facility at all, while the two flow directives write and clear the flow-label set —
+// so a policy carrying either must NOT have the flow path skipped out from under it.
 var directivePrototypes = map[string]tokenSpec[Directive]{
-	DirectiveTypeRedactFields: {New: func() Directive { return &RedactFieldsDirective{} }, Since: SchemaVersion01, State: StateNone},
-	DirectiveTypeLabelOutput:  {New: func() Directive { return &LabelOutputDirective{} }, Since: SchemaVersion02, State: StateNonAtomic},
-	DirectiveTypeDeclassify:   {New: func() Directive { return &DeclassifyDirective{} }, Since: SchemaVersion02, State: StateNonAtomic},
+	DirectiveTypeRedactFields: {New: func() Directive { return &RedactFieldsDirective{} }, Since: SchemaVersion01, State: StateNone, Uses: usesNothing},
+	DirectiveTypeLabelOutput:  {New: func() Directive { return &LabelOutputDirective{} }, Since: SchemaVersion02, State: StateNonAtomic, Uses: []EngineSubsystem{SubsystemFlowLabels}},
+	DirectiveTypeDeclassify:   {New: func() Directive { return &DeclassifyDirective{} }, Since: SchemaVersion02, State: StateNonAtomic, Uses: []EngineSubsystem{SubsystemFlowLabels}},
 }
 
 // knownDirectiveTypes is every discriminator in the registry, sorted so the

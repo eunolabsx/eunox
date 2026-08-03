@@ -54,10 +54,10 @@ var publishedSchemaVersions = []string{SchemaVersion01, SchemaVersion02}
 func PublishedSchemaVersions() []string { return slices.Clone(publishedSchemaVersions) }
 
 // tokenSpec is one entry of a prototype registry: how to instantiate the token's zero value,
-// the published grammar revision that introduced its discriminator, and what cross-call state
-// its enforcement accumulates.
+// the published grammar revision that introduced its discriminator, what cross-call state its
+// enforcement accumulates, and which optional engine subsystems that enforcement depends on.
 //
-// The three travel together because they are added together. A contributor cannot declare a
+// The four travel together because they are added together. A contributor cannot declare a
 // token without declaring when it entered the grammar, and cannot file it under the wrong
 // revision by editing a lookalike map fifty lines from the one they meant — the classification
 // is on the same line as the constructor.
@@ -75,6 +75,12 @@ type tokenSpec[T any] struct {
 	// is UNCLASSIFIED, which every consumer treats as the strongest class rather than as
 	// "accumulates nothing". See tokenstate.go for the rule that sets it.
 	State StateAccumulation
+	// Uses names the optional engine subsystems this token's enforcement reads or writes — the
+	// property the engine's two skip gates (WithoutAntecedentRecording, WithoutFlowLabels) are
+	// derived from. Declare SubsystemNone explicitly for a token that depends on none; an
+	// entry leaving it empty is UNCLASSIFIED, which every consumer treats as "depends on all
+	// of them". See subsystem.go for the rule that sets it.
+	Uses []EngineSubsystem
 }
 
 // TokenSince reports the published schemaVersion that introduced the named condition or

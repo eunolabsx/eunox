@@ -235,6 +235,33 @@ Section conventions:
 
 ### Changed
 
+- **BREAKING (pre-1.0): the engine's two skip gates derive from what each token declares, and
+  the two per-token predicates behind them are gone.** `config.LocalManifest.HasSequenceBlock`
+  and `HasFlowLabel` are replaced by `LocalManifest.UsesEngineSubsystem(subsystem)`. Each
+  condition and directive now declares a third thing on its `pkg/capability`
+  prototype-registry entry, beside `Since` and `State`: `Uses`, the optional engine
+  subsystems its enforcement reads (`SubsystemNone`, `SubsystemAntecedentHistory`,
+  `SubsystemFlowLabels`). `WithoutAntecedentRecording` and `WithoutFlowLabels` are derived
+  from it. The predicates they replaced named concrete token types — one naming
+  `sequenceBlock`, the other naming `flowLabel`/`labelOutput`/`declassify` — so a condition
+  added later that READ the flow-label set would report "no flow token", have the flow path
+  skipped out from under it, and most plausibly read an empty set: a fail-open arriving
+  through the gate rather than through the decision turn. A token that declares nothing is
+  treated as depending on every subsystem, which costs a per-call scan and nothing else, and
+  the build fails until it declares one. No manifest, schema or audit shape changed, and no
+  policy's allow/deny outcome changes.
+
+- **BREAKING (pre-1.0): `enforcedForwardCore` takes the declassification committer as a
+  parameter, and `forwardParams.committer` is gone.** It held the same value as the
+  dispatcher's own decision point, and keeping the two in agreement cost an embedded
+  `decidingPDP` wrapper, a `withPDP` constructor on each of the two params structs, and an
+  AST walk over every literal and assignment in the package. Every call site is a handler
+  that already holds the deciding PDP, so it is passed down — the shape `commitDeclassify`
+  one layer below always had. The pair stops existing, so there is nothing left to keep in
+  agreement; what survives is a source guard asserting each call site passes
+  `X.forwardParams` and `X.pdp` for the same `X`, plus `dispatchParams` joining the
+  composite-literal allowlist so a literal that simply omits the decision point is caught.
+
 - **BREAKING (pre-1.0): the four per-token shared-state predicates are one derived predicate.**
   `config.LocalManifest.HasMaxCalls` / `HasBlastRadiusVelocity` and
   `transport.AnyRouteHasMaxCalls` / `AnyRouteHasBlastRadiusVelocity` /
@@ -245,8 +272,9 @@ Section conventions:
   prototype-registry entry, so a policy using a newly added accumulating token is warned about
   without the advisory being edited. Its wording changed to match ("accumulates cross-call
   state" rather than "uses maxCalls or sequenceBlock"). `HasSequenceBlock` and `HasFlowLabel`
-  stay: they answer which engine SUBSYSTEM a policy uses, which is a narrower question with a
-  different failure direction (extra work, not a reopened race). Same trigger set as before —
+  stayed at the time: they answered which engine SUBSYSTEM a policy uses, a narrower question
+  with a different failure direction (extra work, not a reopened race). They have since been
+  replaced in turn by `UsesEngineSubsystem` — see the entry above. Same trigger set as before —
   including a per-call-only `blastRadius`, which still does not warn.
 
 - **The decision turn no longer round-trips a route-wide registry on every enforced request.**
@@ -719,6 +747,23 @@ Section conventions:
   script's retry pivot — the backend divergence that check exists to prevent).
 
 ### Fixed
+
+- **A stdio upstream can no longer stall the proxy's response delivery by emitting
+  `sampling/createMessage` repeatedly.** Bounding that leg's wait for the decision turn (below)
+  converted a deadlock into a stall, and nothing bounded how OFTEN it could be provoked: the
+  handler ran inline on the upstream reader — the only goroutine that delivers upstream
+  responses to waiting host handlers — so an upstream emitting one such request per in-flight
+  declassifying call cost the whole session two seconds of response delivery each time, on
+  calls that had nothing to do with sampling. Sampling did not have to be permitted, either:
+  the turn is taken before the decision that would refuse it. Each server-initiated request now
+  runs on its own goroutine, bounded by a cap of its own (32 in flight; on saturation the
+  upstream is answered with a retryable server-busy error and the refusal is recorded
+  `RESOURCE_EXHAUSTED`), and `Start`'s teardown drains those handlers before releasing session
+  state so none loses its audit record. **Server-initiated requests consequently have no
+  ordering guarantee among themselves** — two the upstream emits back to back may reach the
+  host in either order, and one may be overtaken by a notification received after it. Nothing
+  in MCP orders independent server-initiated requests, and host-initiated traffic keeps every
+  ordering guarantee it had (receipt-order ticketing, and the request/notification barrier).
 
 - **A stdio proxy no longer deadlocks when an upstream emits `sampling/createMessage` during a
   declassifying call.** The server-initiated leg waits for the same decision turn the host leg

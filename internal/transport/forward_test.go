@@ -127,7 +127,7 @@ func TestEnforcedForwardCore_AllowRecordsUpstreamErrorDetail(t *testing.T) {
 			return mcp.RPCMsg{Error: &mcp.RPCError{Code: -32000, Message: "upstream said no"}}, nil
 		},
 	}
-	resp := enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, allowDecision(), "tools/call", "read_file", "read_file", "tool", false, upstreamErrorDetail)
+	resp := enforcedForwardCore(context.Background(), fp, nil, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, allowDecision(), "tools/call", "read_file", "read_file", "tool", false, upstreamErrorDetail)
 
 	// The upstream's error response is forwarded to the host verbatim...
 	require.NotNil(t, resp.Error)
@@ -149,7 +149,7 @@ func TestEnforcedForwardCore_AllowCleanSuccessHasNoDetail(t *testing.T) {
 			return mcp.RPCMsg{ID: msg.ID, Result: json.RawMessage(`{"ok":true}`)}, nil
 		},
 	}
-	resp := enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, allowDecision(), "tools/call", "read_file", "read_file", "tool", false, upstreamErrorDetail)
+	resp := enforcedForwardCore(context.Background(), fp, nil, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, allowDecision(), "tools/call", "read_file", "read_file", "tool", false, upstreamErrorDetail)
 
 	require.Nil(t, resp.Error)
 	require.Len(t, rec.records, 1)
@@ -172,7 +172,7 @@ func TestEnforcedForwardCore_HardDenyDoesNotCallUpstream(t *testing.T) {
 		Decision: capability.DecisionDeny,
 		Denial:   &capability.DenialInfo{Code: capability.ErrCodeCapabilityDenied},
 	}
-	resp := enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, dec, "tools/call", "read_file", "read_file", "tool", false, upstreamErrorDetail)
+	resp := enforcedForwardCore(context.Background(), fp, nil, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, dec, "tools/call", "read_file", "read_file", "tool", false, upstreamErrorDetail)
 
 	assert.False(t, called, "a hard deny must never reach the upstream")
 	require.NotNil(t, resp.Error)
@@ -200,7 +200,7 @@ func TestEnforcedForwardCore_RedactionFailureRecordsDeny(t *testing.T) {
 		Decision:    capability.DecisionAllow,
 		Obligations: []capability.Obligation{{Type: capability.DirectiveTypeRedactFields, Paths: []string{"ssn"}}},
 	}
-	resp := enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, dec, "tools/call", "read_file", "read_file", "tool", true, upstreamErrorDetail)
+	resp := enforcedForwardCore(context.Background(), fp, nil, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, dec, "tools/call", "read_file", "read_file", "tool", true, upstreamErrorDetail)
 
 	require.NotNil(t, resp.Error, "host must receive an internal error when redaction fails")
 	require.Len(t, rec.records, 1, "a redaction failure must still write exactly one audit record")
@@ -260,7 +260,7 @@ func TestEnforcedForwardCore_RecordsRedactPaths(t *testing.T) {
 
 	t.Run("tool call records type:path tokens", func(t *testing.T) {
 		rec := &fwdRecorder{}
-		resp := enforcedForwardCore(context.Background(), newFP(rec), mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, dec, "tools/call", "get_secret_record", "get_secret_record", "tool", true, upstreamErrorDetail)
+		resp := enforcedForwardCore(context.Background(), newFP(rec), nil, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, dec, "tools/call", "get_secret_record", "get_secret_record", "tool", true, upstreamErrorDetail)
 		require.Nil(t, resp.Error)
 		require.Len(t, rec.records, 1)
 		assert.Equal(t, "allow", rec.records[0].decision)
@@ -269,7 +269,7 @@ func TestEnforcedForwardCore_RecordsRedactPaths(t *testing.T) {
 
 	t.Run("subscription records no obligation tokens", func(t *testing.T) {
 		rec := &fwdRecorder{}
-		_ = enforcedForwardCore(context.Background(), newFP(rec), mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, dec, "resources/subscribe", "memory:notes", "memory:notes", "resource subscription", false, upstreamErrorDetail)
+		_ = enforcedForwardCore(context.Background(), newFP(rec), nil, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, dec, "resources/subscribe", "memory:notes", "memory:notes", "resource subscription", false, upstreamErrorDetail)
 		require.Len(t, rec.records, 1)
 		assert.Nil(t, rec.records[0].obligs)
 	})
@@ -289,7 +289,7 @@ func TestEnforcedForwardCore_RecordsRedactPaths(t *testing.T) {
 				return mcp.RPCMsg{ID: msg.ID, Error: &mcp.RPCError{Code: -32000, Message: "upstream boom"}}, nil
 			},
 		}
-		resp := enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, dec, "tools/call", "get_secret_record", "get_secret_record", "tool", true, upstreamErrorDetail)
+		resp := enforcedForwardCore(context.Background(), fp, nil, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, dec, "tools/call", "get_secret_record", "get_secret_record", "tool", true, upstreamErrorDetail)
 		require.NotNil(t, resp.Error, "the upstream error must be forwarded to the host")
 		require.Len(t, rec.records, 1)
 		assert.Equal(t, "allow", rec.records[0].decision, "policy allowed the call, so it records an allow")
@@ -313,7 +313,7 @@ func TestEnforcedForwardCore_RecordsRedactPaths(t *testing.T) {
 				}}, nil
 			},
 		}
-		resp := enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, dec, "tools/call", "get_secret_record", "get_secret_record", "tool", true, upstreamErrorDetail)
+		resp := enforcedForwardCore(context.Background(), fp, nil, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, dec, "tools/call", "get_secret_record", "get_secret_record", "tool", true, upstreamErrorDetail)
 		require.NotNil(t, resp.Error, "the upstream error is still forwarded to the host")
 		assert.Nil(t, resp.Error.Data, "error.data must be dropped fail-closed under a redactFields obligation")
 		assert.Equal(t, "boom", resp.Error.Message, "the error message and code still reach the host")
@@ -336,7 +336,7 @@ func TestEnforcedForwardCore_RecordsRedactPaths(t *testing.T) {
 				}, nil
 			},
 		}
-		resp := enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, dec, "tools/call", "get_secret_record", "get_secret_record", "tool", true, upstreamErrorDetail)
+		resp := enforcedForwardCore(context.Background(), fp, nil, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, dec, "tools/call", "get_secret_record", "get_secret_record", "tool", true, upstreamErrorDetail)
 		require.NotNil(t, resp.Error, "the error object is still forwarded")
 		assert.Nil(t, resp.Error.Data, "error.data must be dropped even when a result is present")
 		assert.NotContains(t, string(resp.Result), "123-45-6789", "the secret must not leak via either channel")
@@ -358,7 +358,7 @@ func TestEnforcedForwardCore_RecordsRedactPaths(t *testing.T) {
 			},
 		}
 		noOblig := capability.EnforceResponse{Decision: capability.DecisionAllow}
-		resp := enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, noOblig, "tools/call", "get_record", "get_record", "tool", true, upstreamErrorDetail)
+		resp := enforcedForwardCore(context.Background(), fp, nil, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, noOblig, "tools/call", "get_record", "get_record", "tool", true, upstreamErrorDetail)
 		require.NotNil(t, resp.Error)
 		require.NotNil(t, resp.Error.Data, "error.data must be preserved when no redact obligation is attached")
 		assert.Contains(t, string(resp.Error.Data), "diagnostic")
@@ -381,7 +381,7 @@ func TestEnforcedForwardCore_NilDenialDoesNotPanic(t *testing.T) {
 		},
 	}
 	dec := capability.EnforceResponse{Decision: capability.DecisionDeny} // Denial left nil
-	resp := enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, dec, "tools/call", "read_file", "read_file", "tool", false, upstreamErrorDetail)
+	resp := enforcedForwardCore(context.Background(), fp, nil, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, dec, "tools/call", "read_file", "read_file", "tool", false, upstreamErrorDetail)
 
 	assert.False(t, called, "a nil-Denial deny must still hard-block the upstream")
 	require.NotNil(t, resp.Error)
@@ -457,7 +457,7 @@ func TestEnforcedForwardCore_StrictAudit_DegradedDeniesAndSkipsUpstream(t *testi
 			return mcp.RPCMsg{}, nil
 		},
 	}
-	resp := enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, allowDecision(), "tools/call", "read_file", "read_file", "tool", false, upstreamErrorDetail)
+	resp := enforcedForwardCore(context.Background(), fp, nil, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, allowDecision(), "tools/call", "read_file", "read_file", "tool", false, upstreamErrorDetail)
 
 	assert.False(t, called, "a degraded strict-audit gate must never reach the upstream")
 	require.NotNil(t, resp.Error)
@@ -486,7 +486,7 @@ func TestEnforcedForwardCore_StrictAudit_HealthyForwards(t *testing.T) {
 			return mcp.RPCMsg{ID: msg.ID, Result: json.RawMessage(`{"ok":true}`)}, nil
 		},
 	}
-	resp := enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, allowDecision(), "tools/call", "read_file", "read_file", "tool", false, upstreamErrorDetail)
+	resp := enforcedForwardCore(context.Background(), fp, nil, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, allowDecision(), "tools/call", "read_file", "read_file", "tool", false, upstreamErrorDetail)
 
 	assert.True(t, called, "a healthy strict-audit gate must forward normally")
 	assert.Nil(t, resp.Error)
@@ -517,7 +517,7 @@ func TestEnforcedForwardCore_StrictAudit_BoundaryCallWarnsImmediately(t *testing
 	r, w, err := os.Pipe()
 	require.NoError(t, err)
 	os.Stderr = w
-	resp := enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, allowDecision(), "tools/call", "read_file", "read_file", "tool", false, upstreamErrorDetail)
+	resp := enforcedForwardCore(context.Background(), fp, nil, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, allowDecision(), "tools/call", "read_file", "read_file", "tool", false, upstreamErrorDetail)
 	_ = w.Close()
 	os.Stderr = oldStderr
 	captured, err := io.ReadAll(r)
@@ -546,7 +546,7 @@ func TestEnforcedForwardCore_NonStrict_DegradedStillForwards(t *testing.T) {
 			return mcp.RPCMsg{ID: msg.ID, Result: json.RawMessage(`{"ok":true}`)}, nil
 		},
 	}
-	resp := enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, allowDecision(), "tools/call", "read_file", "read_file", "tool", false, upstreamErrorDetail)
+	resp := enforcedForwardCore(context.Background(), fp, nil, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, allowDecision(), "tools/call", "read_file", "read_file", "tool", false, upstreamErrorDetail)
 
 	assert.True(t, called, "without strict mode a degraded trail must not block the forward")
 	assert.Nil(t, resp.Error)
@@ -571,7 +571,7 @@ func TestDispatchList_StrictAudit_DegradedDeniesAndSkipsUpstream(t *testing.T) {
 			},
 		},
 		// CheckKill returns nil; the strict gate is what fires
-		decidingPDP: decidingPDP{pdp: pdp.AlwaysAllowPDP{}},
+		pdp: pdp.AlwaysAllowPDP{},
 	}
 	resp := dispatchList(context.Background(), d, mcp.RPCMsg{ID: mcp.RawJSON(`1`), Method: "tools/list"}, pdp.ListFilterer.FilterToolsList)
 
@@ -594,7 +594,7 @@ func TestForwardServerRequest_StrictAudit_DegradedDeniesSampling(t *testing.T) {
 	fp := serverRequestParams{
 		rec:              rec,
 		sessionID:        "s",
-		decidingPDP:      decidingPDP{pdp: newTestManifestPDP(capability.Constraint{Target: "system:sampling/createMessage", Actions: []string{"allow"}})},
+		pdp:              newTestManifestPDP(capability.Constraint{Target: "system:sampling/createMessage", Actions: []string{"allow"}}),
 		forward:          func(mcp.RPCMsg) bool { forwarded = true; return true },
 		writeUpstream:    func(m mcp.RPCMsg) { upstreamReply = m },
 		strictAuditState: strictAuditState{requireAuditStrict: true},
@@ -617,7 +617,7 @@ func TestForwardServerRequest_StrictAudit_HealthyForwardsSampling(t *testing.T) 
 	fp := serverRequestParams{
 		rec:              rec,
 		sessionID:        "s",
-		decidingPDP:      decidingPDP{pdp: newTestManifestPDP(capability.Constraint{Target: "system:sampling/createMessage", Actions: []string{"allow"}})},
+		pdp:              newTestManifestPDP(capability.Constraint{Target: "system:sampling/createMessage", Actions: []string{"allow"}}),
 		forward:          func(mcp.RPCMsg) bool { forwarded = true; return true },
 		writeUpstream:    func(mcp.RPCMsg) { t.Error("a healthy gate must not write an error to the upstream") },
 		strictAuditState: strictAuditState{requireAuditStrict: true},
@@ -660,9 +660,9 @@ func TestForwardServerRequest_SamplingFlowLabelDenyRecordsDetails(t *testing.T) 
 	rec := &fwdRecorder{}
 	var upstreamReply mcp.RPCMsg
 	fp := serverRequestParams{
-		rec:         rec,
-		sessionID:   "s",
-		decidingPDP: decidingPDP{pdp: dp},
+		rec:       rec,
+		sessionID: "s",
+		pdp:       dp,
 		forward: func(mcp.RPCMsg) bool {
 			t.Error("an enforced flowLabel deny must not forward to the host")
 			return false
@@ -696,7 +696,7 @@ func TestForwardServerRequest_StrictAudit_DegradedDeniesNonSampling(t *testing.T
 		rec:       rec,
 		sessionID: "s",
 		// CheckKill returns nil; the strict gate is what fires
-		decidingPDP:      decidingPDP{pdp: pdp.AlwaysAllowPDP{}},
+		pdp:              pdp.AlwaysAllowPDP{},
 		forward:          func(mcp.RPCMsg) bool { forwarded = true; return true },
 		writeUpstream:    func(m mcp.RPCMsg) { upstreamReply = m },
 		strictAuditState: strictAuditState{requireAuditStrict: true},
@@ -720,7 +720,7 @@ func TestForwardServerRequest_StrictAudit_HealthyForwardsNonSampling(t *testing.
 	fp := serverRequestParams{
 		rec:              rec,
 		sessionID:        "s",
-		decidingPDP:      decidingPDP{pdp: pdp.AlwaysAllowPDP{}},
+		pdp:              pdp.AlwaysAllowPDP{},
 		forward:          func(mcp.RPCMsg) bool { forwarded = true; return true },
 		writeUpstream:    func(mcp.RPCMsg) { t.Error("a healthy gate must not write an error to the upstream") },
 		strictAuditState: strictAuditState{requireAuditStrict: true},
@@ -746,7 +746,7 @@ func TestForwardServerRequest_ObserveLeg_RecordsDenyBeforeForward(t *testing.T) 
 		sessionID: "s",
 		// An empty manifest denies sampling/createMessage; audit mode downgrades the
 		// hard deny to an observe.
-		decidingPDP: decidingPDP{pdp: newTestManifestPDP(capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}})},
+		pdp: newTestManifestPDP(capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}}),
 		forward: func(mcp.RPCMsg) bool {
 			// Capture how many records existed at the moment of forwarding: the deny
 			// observation must already be among them.
@@ -802,7 +802,7 @@ func TestForwardServerRequest_ObserveLeg_RecordsBeforeLogging(t *testing.T) {
 		sessionID: "s",
 		// An empty manifest denies sampling/createMessage; audit mode downgrades the
 		// hard deny to an observe.
-		decidingPDP:   decidingPDP{pdp: newTestManifestPDP(capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}})},
+		pdp:           newTestManifestPDP(capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}}),
 		forward:       func(mcp.RPCMsg) bool { return true },
 		writeUpstream: func(mcp.RPCMsg) { t.Error("observe leg must not write an error to the upstream") },
 	}
@@ -838,7 +838,7 @@ func TestForwardServerRequest_StrictAudit_DegradedDeniesSamplingObserveLeg(t *te
 		audit:     true, // route audit mode → a would-be-deny is observed-and-forwarded
 		// No system:sampling opt-in → DecideSampling denies (a capability deny, not a
 		// kill-switch deny), so the request reaches the audit-mode observe leg.
-		decidingPDP:      decidingPDP{pdp: newTestManifestPDP(capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}})},
+		pdp:              newTestManifestPDP(capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}}),
 		forward:          func(mcp.RPCMsg) bool { forwarded = true; return true },
 		writeUpstream:    func(m mcp.RPCMsg) { upstreamReply = m },
 		strictAuditState: strictAuditState{requireAuditStrict: true},
@@ -867,7 +867,7 @@ func TestEnforcedForwardCore_UpstreamErrorDetailSignsAndVerifies(t *testing.T) {
 			return mcp.RPCMsg{Error: &mcp.RPCError{Code: -32000, Message: "upstream refused"}}, nil
 		},
 	}
-	_ = enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, allowDecision(), "tools/call", "read_file", "read_file", "tool", false, upstreamErrorDetail)
+	_ = enforcedForwardCore(context.Background(), fp, nil, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, allowDecision(), "tools/call", "read_file", "read_file", "tool", false, upstreamErrorDetail)
 
 	require.NoError(t, sink.Close()) // flush the drainer to disk
 

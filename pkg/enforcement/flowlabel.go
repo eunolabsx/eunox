@@ -748,7 +748,7 @@ func (e *Engine) ClearSessionLabels(ctx context.Context, sessionID string) error
 // (carries a flowLabel condition or a labelOutput directive), so the engine peeks and
 // records label state only for flow-relevant constraints. Delegates to the single-sourced,
 // nil-safe capability.ConstraintHasFlow so the engine's allow-path gate, the PDP's
-// audit-mode antecedent gate, and the config-level HasFlowLabel cannot drift on what
+// audit-mode antecedent gate, and the config-level subsystem gate cannot drift on what
 // counts as flow.
 func constraintHasFlow(matched *capability.Constraint) bool {
 	return capability.ConstraintHasFlow(matched)

@@ -308,17 +308,6 @@ type forwardParams struct {
 	sessionID      string
 	upstreamTimeMs int
 	callUpstream   func(context.Context, mcp.RPCMsg) (mcp.RPCMsg, error)
-	// committer applies an approved declassification's label clear once this transport has
-	// actually performed the call. nil in a params built with no PDP (the session-creating
-	// initialize gate, tests), where no decision is in hand and so none can carry a
-	// declassification handle. See declassifyCommitter.
-	//
-	// It is populated by dispatchParams' own constructor from the SAME field the dispatcher
-	// decides with (see withPDP), not assigned independently at each site: two fields holding
-	// one PDP is a drift surface where the next construction site sets `pdp` and forgets this
-	// one, and the failure that produces is silent in the direction of a policy whose
-	// sanitizing step never takes effect.
-	committer declassifyCommitter
 	// endDecision closes the decision critical section a serialize-relevant transport opened
 	// around this enforced request, and is idempotent. The Decide* handlers call it (via
 	// dispatchParams.finishDecision) IMMEDIATELY after the PDP decision so the upstream
@@ -647,8 +636,11 @@ func addSpentApproval(detail map[string]interface{}, dec capability.EnforceRespo
 //
 // committer and sessionID are passed rather than read off a params struct so the two legs that
 // can hold a decision — the host path (forwardParams) and the server-initiated one
-// (serverRequestParams) — share this body instead of mirroring it. Both derive their committer
-// from the PDP they decide with, so neither can hand this one that did not make the decision.
+// (serverRequestParams) — share this body instead of mirroring it. It is the shape
+// enforcedForwardCore itself now takes, for the same reason and one stronger: the committer
+// must be the decision point that MADE the decision, and a params field holding a second copy
+// of it is a pair to keep in agreement rather than one value passed down from the dispatcher
+// that holds it.
 func commitDeclassify(ctx context.Context, committer declassifyCommitter, sessionID string, dec capability.EnforceResponse, kind, target string) (cleared []string, detail map[string]interface{}) {
 	decl := dec.Declassification
 	if !decl.PendingClear() {
@@ -903,7 +895,18 @@ func isObserveDeny(denial *capability.DenialInfo, auditMode, auditOnly bool) boo
 // pass upstreamErrorDetail; tools/call passes its audit-mode argument map).
 // recordObligations controls whether obligation tokens are recorded (the two
 // resources/(un)subscribe legs record none).
-func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, dec capability.EnforceResponse, method, auditID, denialTarget, kind string, recordObligations bool, allowDetails func(mcp.RPCMsg) map[string]interface{}) mcp.RPCMsg {
+//
+// committer is the decision point that MADE dec, and applies the label clear an approved
+// declassification authorized once the call has actually run. It is a parameter rather than a
+// field on fp — mirroring commitDeclassify one layer down, which takes it for the same reason
+// — because every call site is a dispatchParams handler already holding the deciding PDP. A
+// field would be a second copy of that one value, and "these two must be the same PDP" is an
+// invariant nothing in the language enforces: a site that set the decision point and forgot
+// the derived field compiled, passed every test that did not exercise a declassification, and
+// then silently never cleared a label. Passing it down removes the pair rather than guarding
+// it. nil is legitimate and means the same thing it always did — no decision point is in hand
+// (the session-creating initialize gate, a test), so no decision can carry a clear to commit.
+func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declassifyCommitter, msg mcp.RPCMsg, dec capability.EnforceResponse, method, auditID, denialTarget, kind string, recordObligations bool, allowDetails func(mcp.RPCMsg) map[string]interface{}) mcp.RPCMsg {
 	observe := false
 	var denial *capability.DenialInfo // set on the deny path; reused by the observe branch below
 	// Fail closed on anything that is not an explicit allow, not just the literal
@@ -1084,7 +1087,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 	// a declassification handle, so this is defense in depth against a PDP that stamps one; the cost
 	// is a field comparison on the one path that already resolved the decision.
 	if dec.Decision == capability.DecisionAllow && declassifyCommitted(upResp) {
-		labelsCleared, declDetail = commitDeclassify(ctx, fp.committer, fp.sessionID, dec, kind, denialTarget)
+		labelsCleared, declDetail = commitDeclassify(ctx, committer, fp.sessionID, dec, kind, denialTarget)
 	} else {
 		declDetail = declassifyRefusalDetail(dec)
 	}
@@ -1209,11 +1212,11 @@ type serverRequestParams struct {
 	sessionID string
 	sourceIP  string
 	claims    *pdp.JWTClaims
-	// decidingPDP (embedded) carries the decision point this leg decides with. It is
-	// EMBEDDED so `pdp:` cannot be named in a literal of this type at all — Go rejects a
-	// promoted field in a composite literal — leaving withPDP as the only way to set it and
-	// so the only place a future field derived from it can be forgotten. See decidingPDP.
-	decidingPDP
+	// pdp is the decision point this leg decides with. Nothing on this leg is DERIVED from
+	// it: a declassification is refused here rather than committed (see forwardServerRequest),
+	// so there is no second field that has to name the same PDP and no constructor step to
+	// forget. A plain field is the whole of it.
+	pdp           pdp.PolicyDecisionPoint
 	forward       func(mcp.RPCMsg) bool
 	writeUpstream func(mcp.RPCMsg)
 	// decideLock serializes the sampling decision against the host-path
@@ -1237,28 +1240,6 @@ type serverRequestParams struct {
 	// strictAuditState (embedded) carries the --require-audit=strict gate, which also
 	// covers the enforced sampling/createMessage path below. See forwardParams.
 	strictAuditState
-}
-
-// withPDP records the policy decision point this leg decides with, and is the one place any
-// field derived FROM it may be set.
-//
-// It is the server-initiated twin of dispatchParams.withPDP and exists for the same reason: a
-// site that sets pdp and forgets a field that must be the same decision point compiles, passes
-// every test that does not exercise the feature, and then silently does nothing. This leg was
-// the one construction path that invariant did not cover — it assigned pdp directly at both
-// sites, so the compiler could not flag an omission and no test could catch one. The source
-// guard beside it (TestParamsLiterals_DoNotAssignThePDPFields) is what makes it an invariant
-// rather than a convention: a literal that spells `pdp:` fails the build.
-//
-// It deliberately carries NO committer. This leg does not commit a declassification and
-// refuses one instead (see forwardServerRequest): "the host was handed the request" is not
-// "the sanitizing action ran", so there is no honest commit point here to wire one to.
-//
-// Same scope note the killSubject type carries: this narrows a typo/omission surface, it does
-// not make the wrong value unassignable.
-func (fp serverRequestParams) withPDP(p pdp.PolicyDecisionPoint) serverRequestParams {
-	fp.pdp = p
-	return fp
 }
 
 // samplingTurnWait bounds how long the server-initiated leg waits for the decision turn. BOTH

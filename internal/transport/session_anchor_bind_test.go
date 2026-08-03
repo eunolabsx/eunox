@@ -118,7 +118,8 @@ func TestTaskAnchoredSession_SourceTaintIsVisibleToTheSamplingSink(t *testing.T)
 			decideLock: func() (func(), bool) {
 				return sess.beginDecisionTurnWithin(samplingTurnWait)
 			},
-		}.withPDP(rt.pdp)
+			pdp: rt.pdp,
+		}
 		// forwardServerRequest attaches fp.claims to the decision context; this drives the
 		// decision half directly, so it does the same.
 		return fp.decideSampling(pdp.WithJWTClaims(context.Background(), fp.claims))
@@ -152,7 +153,8 @@ func TestTaskAnchoredSession_SourceTaintIsVisibleToTheSamplingSink(t *testing.T)
 	clean := serverRequestParams{
 		sessionID: "sess-b",
 		claims:    &pdp.JWTClaims{Issuer: "iss-a", Subject: "sub-a", TaskID: "task-3"},
-	}.withPDP(rt.pdp)
+		pdp:       rt.pdp,
+	}
 	assert.Equal(t, capability.DecisionAllow,
 		clean.decideSampling(pdp.WithJWTClaims(context.Background(), clean.claims)).Decision,
 		"a taint recorded under another task is invisible here — which is exactly what the session's anchor pin refuses to let happen")
