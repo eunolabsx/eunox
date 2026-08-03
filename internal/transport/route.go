@@ -771,24 +771,19 @@ func WrapRoutesWithJWT(routes map[string]*UpstreamRoute, opts pdp.JWTPDPOptions)
 	return validator, nil
 }
 
-// AnyRouteHasMaxCalls reports whether any route's manifest uses maxCalls.
-func AnyRouteHasMaxCalls(routes map[string]*UpstreamRoute) bool {
+// AnyRouteAccumulatesSharedState reports whether any route's policy depends on state that
+// outlives a single call — a maxCalls or cumulative blastRadius budget, the sequenceBlock
+// antecedent history, the flow-label set. All of it is per-PROCESS under the default in-memory
+// backends, so the gateway's multi-instance advisory warns on it.
+//
+// One predicate, derived from the class each token declares (config.AccumulatesSharedState),
+// where there were four hand-written per-token spellings ORed together at the call site. The
+// operator this advisory exists for is the one whose policy the list has not caught up with.
+func AnyRouteAccumulatesSharedState(routes map[string]*UpstreamRoute) bool {
 	for _, rt := range routes {
-		// A policyless (wiretap) route has a nil manifest; guard explicitly.
-		if rt.manifest != nil && rt.manifest.HasMaxCalls() {
-			return true
-		}
-	}
-	return false
-}
-
-// AnyRouteHasBlastRadiusVelocity reports whether any route's policy carries a cumulative
-// blastRadius bound — the weighted sibling of AnyRouteHasMaxCalls, and per-process state
-// under the in-memory counter for the same reason, so the shared-state advisory covers both.
-func AnyRouteHasBlastRadiusVelocity(routes map[string]*UpstreamRoute) bool {
-	for _, rt := range routes {
-		// A policyless (wiretap) route has a nil manifest; guard explicitly.
-		if rt.manifest != nil && rt.manifest.HasBlastRadiusVelocity() {
+		// A policyless (wiretap) route has a nil manifest; the predicate is nil-safe, but
+		// guard explicitly to match its siblings here.
+		if rt.manifest != nil && rt.manifest.AccumulatesSharedState() {
 			return true
 		}
 	}
@@ -810,35 +805,6 @@ func FirstRouteAudiencePin(routes map[string]*UpstreamRoute) (string, bool) {
 		}
 	}
 	return "", false
-}
-
-// AnyRouteHasSequenceBlock reports whether any route's manifest uses sequenceBlock.
-// Like maxCalls, sequenceBlock enforcement reads per-session call history out of the
-// shared call counter, which is per-process under the default in-memory backend; the
-// multi-instance advisory uses this so a sequenceBlock-only policy is warned about too.
-func AnyRouteHasSequenceBlock(routes map[string]*UpstreamRoute) bool {
-	for _, rt := range routes {
-		// A policyless (wiretap) route has a nil manifest; guard explicitly.
-		if rt.manifest != nil && rt.manifest.HasSequenceBlock() {
-			return true
-		}
-	}
-	return false
-}
-
-// AnyRouteHasFlowLabel reports whether any route's manifest uses information-flow
-// control (a flowLabel condition or a labelOutput directive). Like maxCalls/
-// sequenceBlock, flow labels are per-session state in the shared call counter — per
-// process under the default in-memory backend — so the multi-instance advisory warns on
-// a flow policy too: without shared Redis, a source on one instance and a sink on
-// another fail open silently.
-func AnyRouteHasFlowLabel(routes map[string]*UpstreamRoute) bool {
-	for _, rt := range routes {
-		if rt.manifest != nil && rt.manifest.HasFlowLabel() {
-			return true
-		}
-	}
-	return false
 }
 
 // LoadEffectReceiptVerifier builds an upstream's effect-receipt verifier from a local JWKS

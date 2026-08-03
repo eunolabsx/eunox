@@ -235,6 +235,20 @@ Section conventions:
 
 ### Changed
 
+- **BREAKING (pre-1.0): the four per-token shared-state predicates are one derived predicate.**
+  `config.LocalManifest.HasMaxCalls` / `HasBlastRadiusVelocity` and
+  `transport.AnyRouteHasMaxCalls` / `AnyRouteHasBlastRadiusVelocity` /
+  `AnyRouteHasSequenceBlock` / `AnyRouteHasFlowLabel` are replaced by
+  `LocalManifest.AccumulatesSharedState` and `transport.AnyRouteAccumulatesSharedState`. The
+  multi-instance advisory ORed the old four together at each of its two call sites; it now asks
+  one question, answered from the state class each token declares on its `pkg/capability`
+  prototype-registry entry, so a policy using a newly added accumulating token is warned about
+  without the advisory being edited. Its wording changed to match ("accumulates cross-call
+  state" rather than "uses maxCalls or sequenceBlock"). `HasSequenceBlock` and `HasFlowLabel`
+  stay: they answer which engine SUBSYSTEM a policy uses, which is a narrower question with a
+  different failure direction (extra work, not a reopened race). Same trigger set as before —
+  including a per-call-only `blastRadius`, which still does not warn.
+
 - **The decision turn no longer round-trips a route-wide registry on every enforced request.**
   On a route that anchors accumulated state on the session, the turn's anchor is a per-session
   constant, so resolving it per request took a route-wide mutex, minted a gate entry and deleted
@@ -705,6 +719,62 @@ Section conventions:
   script's retry pivot — the backend divergence that check exists to prevent).
 
 ### Fixed
+
+- **A stdio proxy no longer deadlocks when an upstream emits `sampling/createMessage` during a
+  declassifying call.** The server-initiated leg waits for the same decision turn the host leg
+  takes, and on stdio it waits *on the upstream reader goroutine* — which is the only goroutine
+  that delivers upstream responses to waiting host handlers. A `declassify`-using policy holds
+  its turn across the whole upstream round trip (the two phases of the clear are one critical
+  section), so a `sampling/createMessage` arriving mid-clear parked the reader on a turn whose
+  holder was waiting for a response only that reader could deliver. It unwound when
+  `--upstream-timeout` fired and hung the proxy permanently under `--upstream-timeout=0`, and it
+  did not require sampling to be *permitted*: the turn is taken before the sampling decision
+  runs. That leg now bounds its wait at the same two seconds the HTTP leg uses and fails the
+  request closed (`CONDITION_FAILED`, `flowLabel`, `reason: turn_unavailable`). Bounding it
+  needed the FIFO ticket to be abandonable — the turn now skips a ticket whose waiter gave up,
+  so the give-up costs one deny-by-default request instead of stalling every later request on
+  the anchor.
+
+- **A task-anchored session is bound to its state anchor, so its two deciding legs cannot read
+  different buckets.** The host leg decides from the current request's validated claims; the
+  server-initiated (sampling) leg has no host request in scope and decides from the claims
+  captured at `initialize`. The session-owner pin compared only issuer and subject, so a caller
+  holding two tokens that differ only in `mcp.task_id` had both accepted on one session — and
+  under `taskAnchoredState` those are two anchors: a `labelOutput` source taints one, the
+  sampling sink peeks the other, finds it clean, and forwards the egress the flow label existed
+  to stop. The anchor-keyed decision turn could not catch it, because the sampling leg's turn and
+  its state key agreed with each other and both disagreed with the host leg. On a route that
+  anchors state on the task, a request resolving a different anchor than its session's is now
+  refused (`AUTHORIZATION_FAILED`, `reason: session_anchor_mismatch`), through the same resolver
+  the engine's key builder uses. Routes that do not anchor on the task are unaffected.
+
+- **"Which tokens accumulate cross-call state" is declared by the token instead of listed by
+  hand.** The predicate both transports gate their decision turn on was a literal disjunction of
+  two per-token predicates, and the same question was asked in four other spellings elsewhere. A
+  new condition with `flowLabel`'s shape — peeking shared state in one call, committing it in
+  another — would have been absent from all of them: both transports would have run its
+  decisions unserialized, reopening the source→sink race, while every completeness test passed,
+  since nothing asserted that a token declares this. Each condition and directive
+  prototype-registry entry now declares its class beside `Since` (`StateNone`, `StateAtomic` for
+  a budget admitted through one atomic `AdmitAll`, `StateNonAtomic` for a non-atomic
+  read-then-write), the turn gate and the shared-state advisory derive from it, an unclassified
+  token is treated as the strongest class, and a completeness test mirroring the grammar gate's
+  fails the build on an entry that declares none. The documented predicate is corrected too: it
+  said "reads or writes accumulated state that one call commits and a later one reads back",
+  which is equally true of `maxCalls` and a cumulative `blastRadius` — both of which
+  deliberately need no turn, because their admission is atomic.
+
+- **The HTTP session's cached decision gate is keyed on the resolved anchor, not on a route
+  bool.** The cache decided it was *allowed* to cache by reading the route's task-anchoring
+  bit — a hand-written restatement of what `enforcement.ResolveStateAnchor` decides, correct for
+  the two anchor kinds that exist and asserted independently of the resolver. A third kind
+  (an agent id, a conversation, a delegation chain) breaks every caller of the resolver at
+  compile time, but that restatement would have compiled untouched: the session would have kept
+  serving turns on the gate it cached while the per-request resolver reached a different one and
+  the engine wrote state under the new key, reopening the race for that route with nothing
+  failing. Each request now resolves its anchor and compares it to the cached one, which is
+  correct for any number of kinds by construction — and extends the fast path to a task-anchored
+  session that stays on one task, which the bool could not express. No behavior change today.
 
 - **A future `schemaVersion` no longer refuses the tokens its predecessor published.** The
   manifest loader's grammar gate admitted a token when the base grammar introduced it or when

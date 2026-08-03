@@ -163,6 +163,52 @@ func allKnownTokens() []string {
 	return append(capability.KnownConditionTypes(), capability.KnownDirectiveTypes()...)
 }
 
+// TestPolicyPredicates_DeriveFromEveryTokensDeclaredClass is the CONSUMER-side half of the
+// state-accumulation gate. pkg/capability's own test proves every token declares a class; this
+// proves the two manifest-level predicates actually read it, for every token in the vocabulary.
+//
+// A hand-written disjunction passes this today and fails it the moment a token is added — which
+// is the whole point, and the thing that was missing when "does this policy need the decision
+// turn" was a literal `HasFlowLabel() || HasSequenceBlock()`: a new state-accumulating condition
+// was absent from it, both transports ran its decisions unserialized, and nothing failed.
+//
+// The expectation comes from the INSTANCE rather than the registry entry, because one token
+// refines per value: a zero-valued blastRadius declares no cumulative bound and therefore
+// accumulates nothing, while its registry entry declares the strongest class it could reach.
+func TestPolicyPredicates_DeriveFromEveryTokensDeclaredClass(t *testing.T) {
+	seen := map[capability.StateAccumulation]bool{}
+	for _, token := range allKnownTokens() {
+		t.Run(token, func(t *testing.T) {
+			c := constraintCarrying(t, token)
+			want, ok := instanceStateClass(t, &c)
+			require.True(t, ok, "%q is in a prototype registry but declares no state class", token)
+			seen[want] = true
+
+			m := &LocalManifest{Capabilities: []capability.Constraint{c}}
+			assert.Equal(t, want.NeedsSerializedDecisions(), m.NeedsDecisionTurn(),
+				"NeedsDecisionTurn must follow %q's declared class (%q), not a list of token types", token, want)
+			assert.Equal(t, want.AccumulatesSharedState(), m.AccumulatesSharedState(),
+				"AccumulatesSharedState must follow %q's declared class (%q)", token, want)
+		})
+	}
+	// And the walk is not vacuous: the vocabulary really does span the classes whose predicates
+	// differ, so a build where everything collapsed to one class fails here rather than passing
+	// every assertion above trivially.
+	assert.True(t, seen[capability.StateNone], "no token in the vocabulary is stateless")
+	assert.True(t, seen[capability.StateNonAtomic], "no token in the vocabulary needs the decision turn")
+}
+
+// instanceStateClass reports the state class of whichever token the constraint carries, through
+// the same per-instance lookups the manifest predicates use.
+func instanceStateClass(t *testing.T, c *capability.Constraint) (capability.StateAccumulation, bool) {
+	t.Helper()
+	if len(c.Conditions) == 1 {
+		return capability.ConditionStateAccumulation(c.Conditions[0])
+	}
+	require.Len(t, c.Directives, 1, "constraintCarrying builds exactly one token")
+	return capability.DirectiveStateAccumulation(c.Directives[0])
+}
+
 // constraintCarrying builds a constraint holding one token of the named type, whichever
 // vocabulary it belongs to. It instantiates from pkg/capability's own prototype registries,
 // so a token added there needs no case added here.

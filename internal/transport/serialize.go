@@ -47,6 +47,7 @@ package transport
 import (
 	"context"
 	"sync"
+	"time"
 )
 
 // decisionEndKey carries the decision-turn release func through the stdio
@@ -86,13 +87,18 @@ func decisionEndFromContext(ctx context.Context) func() {
 // is what a single queue gave.
 //
 // Liveness: because the turn is held across the decision's flow-store round-trip, one slow
-// decision does impose head-of-line blocking — later tickets ON THAT ANCHOR (and, for the
-// sampling leg, the upstream reader that borrows the gate) wait behind it. This is a bounded
-// slowdown, not a deadlock: the decision path is microseconds on the in-memory backend, and
-// the Redis backend's client carries its own read/write timeouts, so a stalled backend fails
-// the decision closed and advances the turn rather than parking it forever. It is the
-// accepted cost of the ordering guarantee (a non-flow/non-sequenceBlock session takes no
-// ticket and keeps full parallelism).
+// decision does impose head-of-line blocking — later tickets ON THAT ANCHOR wait behind it.
+// For a host request that is a bounded slowdown, not a deadlock: each waits on its own handler
+// goroutine, the decision path is microseconds on the in-memory backend, and the Redis
+// backend's client carries its own read/write timeouts, so a stalled backend fails the decision
+// closed and advances the turn rather than parking it forever. It is the accepted cost of the
+// ordering guarantee (a non-flow/non-sequenceBlock session takes no ticket and keeps full
+// parallelism).
+//
+// The sampling leg is the one waiter for which that reasoning does NOT hold, because it waits
+// on the upstream READER goroutine — the only goroutine that can deliver the response the turn
+// holder is itself waiting for. That is a cycle rather than a slowdown, so that leg waits
+// through beginWithin and fails closed instead; see beginWithin for the full shape.
 type decisionSerializer struct {
 	mu sync.Mutex
 	// queues holds one FIFO per LIVE anchor. An entry is dropped once every ticket it handed
@@ -113,6 +119,12 @@ type ticketQueue struct {
 	// that is one more thing to keep in agreement — one that, left above zero by a future
 	// path, would silently pin the queue forever.
 	pins int
+	// abandoned holds the tickets whose waiter gave up (beginWithin). The turn SKIPS them when
+	// serving reaches them, which is what makes giving up safe: without it an abandoned ticket
+	// is a hole in the FIFO that every later ticket on this anchor waits behind forever, so a
+	// bounded wait would have traded a bounded stall for an unbounded one. Nil until the first
+	// give-up, which on every deployment is never.
+	abandoned map[uint64]struct{}
 }
 
 // decisionTicket is a reserved place in one anchor's queue. Its zero value is the
@@ -217,14 +229,71 @@ func (q *ticketQueue) ticket() decisionTicket {
 //
 // A zero ticket (a request that was never serialized) returns a no-op end, so a caller needs
 // no branch of its own.
+//
+// It waits without a bound, which is right for the host path: each host request waits on its
+// OWN handler goroutine, so a slow turn holder delays that request and nothing else. The
+// server-initiated leg does not have that property and uses beginWithin.
 func (g *decisionSerializer) begin(t decisionTicket) (end func()) {
+	// With no bound there is no give-up path — the wait loop can only exit on the turn — so ok
+	// is invariably true and the end func is never nil. A future second reason to give up would
+	// have to make this branch, rather than silently returning a nil release to a deferred call.
+	end, _ = g.beginWithin(t, 0)
+	return end
+}
+
+// beginWithin is begin bounded by d: it reports ok=false when the ticket's turn has not come
+// up within d, having ABANDONED the ticket so no later one queues behind it. d <= 0 waits
+// forever (what begin does).
+//
+// The bound exists for one caller — the server-initiated (sampling) leg — and for one hazard,
+// which on this transport is a CYCLE rather than a slow turn:
+//
+//   - handleUpstreamRequest runs INLINE on the upstream reader goroutine, and that goroutine is
+//     also the only one that delivers upstream responses to waiting host handlers;
+//   - a declassifying host call deliberately holds its turn across the whole upstream round
+//     trip (finishDecision does not release it while a clear is pending), because the two
+//     phases of the clear are one critical section;
+//   - so a sampling request arriving mid-clear parks the reader on a turn that is waiting for
+//     a response only that reader can deliver.
+//
+// That deadlocks until --upstream-timeout fires, and forever when it is 0. The wait is bounded
+// here and the caller fails the sampling request CLOSED (samplingTurnDenial), which is exactly
+// what the HTTP leg already does with the identical hazard — the two legs now answer "what
+// happens when the turn is held by a declassifying call" the same way.
+//
+// Abandoning is what makes bounding safe. The queue's invariant is handed/serving, so a ticket
+// nobody will ever begin is a hole every later ticket waits behind; recording it in abandoned
+// lets the turn skip it when serving arrives, which is the difference between a bounded stall
+// and an unbounded one.
+func (g *decisionSerializer) beginWithin(t decisionTicket, d time.Duration) (end func(), ok bool) {
 	q := t.queue
 	if q == nil {
-		return func() {}
+		return func() {}, true
+	}
+	// sync.Cond has no bounded Wait, so the bound is a timer that broadcasts. gaveUp is this
+	// call's own variable, written and read under g.mu; a broadcast wakes every waiter on the
+	// anchor and each re-checks its own two conditions, which is the ordinary spurious-wakeup
+	// discipline the loop already had.
+	gaveUp := false
+	if d > 0 {
+		timer := time.AfterFunc(d, func() {
+			g.mu.Lock()
+			defer g.mu.Unlock()
+			gaveUp = true
+			q.cond.Broadcast()
+		})
+		defer timer.Stop()
 	}
 	g.mu.Lock()
-	for q.serving != t.n {
+	for q.serving != t.n && !gaveUp {
 		q.cond.Wait()
+	}
+	if q.serving != t.n {
+		// The turn is checked FIRST on the way out: a timer that fires in the same instant the
+		// turn comes up loses, so a caller is never refused a turn it could have had.
+		q.abandonLocked(t.n)
+		g.mu.Unlock()
+		return nil, false
 	}
 	g.mu.Unlock()
 	// sync.OnceFunc guards the turn-advance: the Decide* handler ends the critical section
@@ -233,14 +302,43 @@ func (g *decisionSerializer) begin(t decisionTicket) (end func()) {
 	// turn advances exactly once either way.
 	return sync.OnceFunc(func() {
 		g.mu.Lock()
-		q.serving++
+		q.advanceLocked()
 		// Every ticket this queue handed out has now been served (and nobody has pinned it),
 		// so nothing is queued on it and nothing can be: a later take under the same anchor
 		// builds a fresh queue, which is correct precisely because no waiter holds the old one.
 		g.reclaimLocked(q)
 		q.cond.Broadcast()
 		g.mu.Unlock()
-	})
+	}), true
+}
+
+// abandonLocked records that ticket n will never be begun, so advanceLocked skips it. Caller
+// holds the serializer's mu.
+//
+// Only a ticket that has NOT come up can be abandoned (beginWithin checks the turn first), so
+// n is always strictly ahead of serving and the entry is always consumed by a later advance:
+// every ticket before it is outstanding, and each of those either ends or abandons in turn.
+func (q *ticketQueue) abandonLocked(n uint64) {
+	if q.abandoned == nil {
+		q.abandoned = map[uint64]struct{}{}
+	}
+	q.abandoned[n] = struct{}{}
+}
+
+// advanceLocked moves the turn to the next ticket that still has a waiter, skipping any that
+// were abandoned. Caller holds the serializer's mu.
+//
+// Skipping is a loop rather than a single step because abandonments can be consecutive (a
+// wedged reader that gives up twice), and one un-skipped hole stalls the anchor for good.
+func (q *ticketQueue) advanceLocked() {
+	q.serving++
+	for {
+		if _, skipped := q.abandoned[q.serving]; !skipped {
+			return
+		}
+		delete(q.abandoned, q.serving)
+		q.serving++
+	}
 }
 
 // size reports how many anchor queues are live. Test-only, for the same reason the HTTP

@@ -300,6 +300,19 @@ func (c *BlastRadiusCondition) HasVelocity() bool {
 	return c != nil && c.MaxTotal != nil && c.WindowSeconds > 0
 }
 
+// RefineStateAccumulation narrows the registry's declared class to what THIS bound actually
+// accumulates (see StateRefiner). A cumulative bound consumes a sliding-window budget exactly
+// as maxCalls consumes a slot, so it is per-process state under the in-memory counter and the
+// multi-instance advisory must fire for it. A per-call `max` compares one call's magnitude
+// against a constant and stores nothing, so a policy whose only blastRadius is per-call does
+// not depend on shared state and must not be warned about as if it did.
+func (c BlastRadiusCondition) RefineStateAccumulation() StateAccumulation {
+	if c.HasVelocity() {
+		return StateAtomic
+	}
+	return StateNone
+}
+
 // ConditionType returns the blastRadius discriminator.
 func (BlastRadiusCondition) ConditionType() string { return ConditionTypeBlastRadius }
 

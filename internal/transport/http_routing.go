@@ -742,8 +742,9 @@ type sessionGate struct {
 // sessionGateVerdict runs the two security checks every host-initiated action on an
 // EXISTING session must clear: the per-route audience pin (a token minted for a sibling
 // route's audience, accepted by the gateway's shared union validator, must not act on
-// this route's session) and the session-owner binding (only the JWT identity — issuer+sub
-// — that created the session may act on it; see httpSession.ownerMismatch). Both are
+// this route's session) and the session-owner binding (only the JWT identity — issuer+sub,
+// plus the state ANCHOR on a route that anchors state on the task — that created the
+// session may act on it; see httpSession.ownerMismatch). Both are
 // properties of the session, so applying them to EVERY host-initiated action is what stops
 // a second same-audience identity that learned a victim's Mcp-Session-Id from driving,
 // notifying, reading, or tearing down the victim's upstream session (the audience pin alone
@@ -786,12 +787,18 @@ func (route *UpstreamRoute) contextGateVerdict(ctx context.Context) (sessionGate
 }
 
 // sessionOnlyGateVerdict runs the session gates that need the session object — the
-// session-owner binding. This half is a pure in-process field comparison with no interface
-// dispatch outside the package, so it is safe to run under the registry lock, which is
-// what lets handleMCPDelete keep its check-and-delete atomic.
+// session-owner binding and, on a task-anchored route, the session's anchor binding. Both are
+// in-process comparisons over already-validated claims (the anchor resolution reads a memoized
+// claim map through a concrete function, not through an implementable interface), so this half
+// is safe to run under the registry lock, which is what lets handleMCPDelete keep its
+// check-and-delete atomic.
 func sessionOnlyGateVerdict(ctx context.Context, sess *httpSession) (sessionGate, bool) {
-	if sess.ownerMismatch(pdp.JWTClaimsPtr(ctx)) {
-		return sessionGate{code: capability.ErrCodeAuthorizationFailed, reason: "session_owner_mismatch"}, true
+	// The reason comes back FROM the check rather than being restated here: the binding has two
+	// halves (the principal, and — on a task-anchored route — the state anchor), and a record
+	// that named the principal for an anchor refusal would send an operator looking for a
+	// second client that does not exist.
+	if reason, mismatch := sess.ownerMismatch(pdp.JWTClaimsPtr(ctx)); mismatch {
+		return sessionGate{code: capability.ErrCodeAuthorizationFailed, reason: reason}, true
 	}
 	return sessionGate{}, false
 }

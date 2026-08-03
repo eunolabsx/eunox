@@ -339,21 +339,31 @@ func jsonFieldNames(v any) map[string]bool {
 //
 // redactFields is deliberately absent — it is a directive, and has its own migration error
 // pointing at directives.
+// State is part of the entry for the same reason and against the same failure: "which tokens
+// accumulate cross-call state" was asked in five hand-written spellings, and a new
+// state-accumulating condition missing from the one that gates the decision turn runs its
+// decisions unserialized — the source->sink race, reopened silently, with every completeness
+// test still green. See tokenstate.go for the rule that sets it.
 var conditionPrototypes = map[string]tokenSpec[Condition]{
-	ConditionTypeTimeWindow:        {New: func() Condition { return &TimeWindowCondition{} }, Since: SchemaVersion01},
-	ConditionTypeIPRange:           {New: func() Condition { return &IPRangeCondition{} }, Since: SchemaVersion01},
-	ConditionTypeAllowedOperations: {New: func() Condition { return &AllowedOperationsCondition{} }, Since: SchemaVersion01},
-	ConditionTypeAllowedExtensions: {New: func() Condition { return &AllowedExtensionsCondition{} }, Since: SchemaVersion01},
-	ConditionTypeAllowedTables:     {New: func() Condition { return &AllowedTablesCondition{} }, Since: SchemaVersion01},
-	ConditionTypeMaxCalls:          {New: func() Condition { return &MaxCallsCondition{} }, Since: SchemaVersion01},
-	ConditionTypeRecipientDomain:   {New: func() Condition { return &RecipientDomainCondition{} }, Since: SchemaVersion01},
-	ConditionTypeAllowedValues:     {New: func() Condition { return &AllowedValuesCondition{} }, Since: SchemaVersion01},
-	ConditionTypeSequenceBlock:     {New: func() Condition { return &SequenceBlockCondition{} }, Since: SchemaVersion01},
-	ConditionTypeFlowLabel:         {New: func() Condition { return &FlowLabelCondition{} }, Since: SchemaVersion02},
-	ConditionTypeEffectClass:       {New: func() Condition { return &EffectClassCondition{} }, Since: SchemaVersion02},
-	ConditionTypeBlastRadius:       {New: func() Condition { return &BlastRadiusCondition{} }, Since: SchemaVersion02},
-	ConditionTypePolicy:            {New: func() Condition { return &PolicyCondition{} }, Since: SchemaVersion01},
-	ConditionTypeCustom:            {New: func() Condition { return &CustomCondition{} }, Since: SchemaVersion01},
+	ConditionTypeTimeWindow:        {New: func() Condition { return &TimeWindowCondition{} }, Since: SchemaVersion01, State: StateNone},
+	ConditionTypeIPRange:           {New: func() Condition { return &IPRangeCondition{} }, Since: SchemaVersion01, State: StateNone},
+	ConditionTypeAllowedOperations: {New: func() Condition { return &AllowedOperationsCondition{} }, Since: SchemaVersion01, State: StateNone},
+	ConditionTypeAllowedExtensions: {New: func() Condition { return &AllowedExtensionsCondition{} }, Since: SchemaVersion01, State: StateNone},
+	ConditionTypeAllowedTables:     {New: func() Condition { return &AllowedTablesCondition{} }, Since: SchemaVersion01, State: StateNone},
+	ConditionTypeMaxCalls:          {New: func() Condition { return &MaxCallsCondition{} }, Since: SchemaVersion01, State: StateAtomic},
+	ConditionTypeRecipientDomain:   {New: func() Condition { return &RecipientDomainCondition{} }, Since: SchemaVersion01, State: StateNone},
+	ConditionTypeAllowedValues:     {New: func() Condition { return &AllowedValuesCondition{} }, Since: SchemaVersion01, State: StateNone},
+	ConditionTypeSequenceBlock:     {New: func() Condition { return &SequenceBlockCondition{} }, Since: SchemaVersion01, State: StateNonAtomic},
+	ConditionTypeFlowLabel:         {New: func() Condition { return &FlowLabelCondition{} }, Since: SchemaVersion02, State: StateNonAtomic},
+	ConditionTypeEffectClass:       {New: func() Condition { return &EffectClassCondition{} }, Since: SchemaVersion02, State: StateNone},
+	// The strongest class a blastRadius bound can reach; an instance carrying only the
+	// per-call `max` narrows itself to StateNone (RefineStateAccumulation).
+	ConditionTypeBlastRadius: {New: func() Condition { return &BlastRadiusCondition{} }, Since: SchemaVersion02, State: StateAtomic},
+	// An external evaluator (OPA, Cedar) may keep state of its own, but none of it is state
+	// THIS engine accumulates, orders, or shares between replicas — which is the only thing
+	// the two derived predicates can speak for.
+	ConditionTypePolicy: {New: func() Condition { return &PolicyCondition{} }, Since: SchemaVersion01, State: StateNone},
+	ConditionTypeCustom: {New: func() Condition { return &CustomCondition{} }, Since: SchemaVersion01, State: StateNone},
 }
 
 // knownConditionTypes is every discriminator in the registry, sorted so the "did you mean"

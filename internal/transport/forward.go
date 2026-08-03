@@ -1261,7 +1261,10 @@ func (fp serverRequestParams) withPDP(p pdp.PolicyDecisionPoint) serverRequestPa
 	return fp
 }
 
-// samplingTurnWait bounds how long the server-initiated leg waits for the decision turn.
+// samplingTurnWait bounds how long the server-initiated leg waits for the decision turn. BOTH
+// transports bound it here: the hazard is a property of where this leg runs, not of which gate
+// it waits on, so stdio and HTTP give the same answer to "what happens when the turn is held by
+// a declassifying call".
 //
 // It is a bound on a WEDGE, not on contention. This leg runs on the session's single
 // upstream-reader goroutine, which is also the only goroutine that delivers upstream responses
@@ -1269,7 +1272,9 @@ func (fp serverRequestParams) withPDP(p pdp.PolicyDecisionPoint) serverRequestPa
 // none of that session's in-flight calls can complete. The turn it waits for is held across
 // the whole upstream round trip by a declassifying host call (see finishDecision), and under
 // task anchoring by a call on a DIFFERENT session sharing the task, so the wait is bounded
-// only by --upstream-timeout — which may be 0, meaning unbounded.
+// only by --upstream-timeout — which may be 0, meaning unbounded. On stdio it is worse than a
+// stall: the host call holding the turn is itself waiting for a response only this blocked
+// reader can deliver, which is a deadlock rather than a wait.
 //
 // Two seconds is far above a healthy decision (microseconds on the in-memory backend, one
 // bounded round trip on Redis) and far below any upstream call worth waiting behind. Exceeding

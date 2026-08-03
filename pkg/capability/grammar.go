@@ -54,9 +54,10 @@ var publishedSchemaVersions = []string{SchemaVersion01, SchemaVersion02}
 func PublishedSchemaVersions() []string { return slices.Clone(publishedSchemaVersions) }
 
 // tokenSpec is one entry of a prototype registry: how to instantiate the token's zero value,
-// and the published grammar revision that introduced its discriminator.
+// the published grammar revision that introduced its discriminator, and what cross-call state
+// its enforcement accumulates.
 //
-// The two travel together because they are added together. A contributor cannot declare a
+// The three travel together because they are added together. A contributor cannot declare a
 // token without declaring when it entered the grammar, and cannot file it under the wrong
 // revision by editing a lookalike map fifty lines from the one they meant — the classification
 // is on the same line as the constructor.
@@ -68,6 +69,12 @@ type tokenSpec[T any] struct {
 	// published revisions above; an entry leaving it empty is refused at manifest load
 	// (TokenSince reports it as unclassified) rather than admitted under a guess.
 	Since string
+	// State is the cross-call state this token's enforcement touches — the property the
+	// transports' decision turn and the multi-instance shared-state advisory are both derived
+	// from. It must be one of the classes in stateAccumulationOrder; an entry leaving it empty
+	// is UNCLASSIFIED, which every consumer treats as the strongest class rather than as
+	// "accumulates nothing". See tokenstate.go for the rule that sets it.
+	State StateAccumulation
 }
 
 // TokenSince reports the published schemaVersion that introduced the named condition or
