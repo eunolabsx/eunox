@@ -358,7 +358,7 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 	// desync case.
 	//nolint:contextcheck // teardown: detached, bounded background context; this hook fires from inside a framed write, which carries no request context.
 	p.hostWriter.SetPoisonHook(func() {
-		fmt.Fprintf(p.errOut(), "[eunox] FATAL: host stdout framing desynced (partial write); tearing down the upstream — no further responses can be delivered.\n")
+		_, _ = fmt.Fprintf(p.errOut(), "[eunox] FATAL: host stdout framing desynced (partial write); tearing down the upstream — no further responses can be delivered.\n")
 		p.killUpstream()
 	})
 	// Captured once: a stdio host has one connection, so these are the claims every request
@@ -438,11 +438,11 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 		if !ok {
 			return
 		}
-		fmt.Fprintf(p.errOut(), "[eunox] Received %s; shutting down upstream.\n", sig)
+		_, _ = fmt.Fprintf(p.errOut(), "[eunox] Received %s; shutting down upstream.\n", sig)
 		p.signalUpstream(sig)
 	}()
 
-	fmt.Fprintf(p.errOut(), "[eunox] Session %s initialized; proxying to %q.\n", p.sessionID, p.upstreamLabel())
+	_, _ = fmt.Fprintf(p.errOut(), "[eunox] Session %s initialized; proxying to %q.\n", p.sessionID, p.upstreamLabel())
 
 	// Post-startup effects (see StdioProxyOptions.OnReady), placed after every fallible
 	// startup step so a proxy that never comes up cannot overwrite shared state a running
@@ -617,7 +617,7 @@ func (p *StdioProxy) signalUpstream(sig os.Signal) {
 	signalUpstreamProcess(p.upCmd.Process, sig)
 	t := time.AfterFunc(p.killDelay(), func() {
 		if p.upCmd.Process != nil {
-			fmt.Fprintf(p.errOut(), "[eunox] Upstream did not exit; sending SIGKILL.\n")
+			_, _ = fmt.Fprintf(p.errOut(), "[eunox] Upstream did not exit; sending SIGKILL.\n")
 			killUpstreamProcess(p.upCmd.Process)
 		}
 	})
@@ -636,7 +636,7 @@ func (p *StdioProxy) awaitUpstreamDrain() {
 	case <-p.upstreamDone:
 		return
 	case <-time.After(p.killDelay()):
-		fmt.Fprintf(p.errOut(), "[eunox] Upstream did not exit after host disconnect; forcing shutdown.\n")
+		_, _ = fmt.Fprintf(p.errOut(), "[eunox] Upstream did not exit after host disconnect; forcing shutdown.\n")
 		p.killUpstream()
 		// Bound the post-kill wait independently: the kill EOFs the pipe almost immediately
 		// in the ordinary case, but a descendant that escaped the process group can still
@@ -778,7 +778,7 @@ func (p *StdioProxy) initUpstream(ctx context.Context) error {
 		initID,
 		p.upWriter,
 		func(msg mcp.RPCMsg) {
-			fmt.Fprintf(p.errOut(),
+			_, _ = fmt.Fprintf(p.errOut(),
 				"[eunox] debug: discarding upstream message during initialize handshake (method=%q).\n",
 				msg.Method)
 		},
@@ -951,7 +951,7 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 			// EOF is the ordinary host-closed-stdin case and stays silent; anything else is
 			// a session that died mid-stream for a reason otherwise invisible to the operator.
 			if !errors.Is(r.err, io.EOF) {
-				fmt.Fprintf(p.errOut(), "[eunox] host read error: %v; ending session\n", r.err)
+				_, _ = fmt.Fprintf(p.errOut(), "[eunox] host read error: %v; ending session\n", r.err)
 			}
 			break // host stdin closed (EOF) or an unrecoverable read error
 		}
@@ -1149,7 +1149,7 @@ func (p *StdioProxy) dispatchParams() dispatchParams {
 // returned message to the host.
 func (p *StdioProxy) buildInitResponse(msg mcp.RPCMsg) mcp.RPCMsg {
 	resp := buildInitializeResponse(msg.ID, p.upstreamCaps, p.upstreamInstructions)
-	fmt.Fprintf(p.errOut(),
+	_, _ = fmt.Fprintf(p.errOut(),
 		"[eunox] Session %s: host initialized (protocol %s).\n",
 		p.sessionID, MCPProtocolVersion,
 	)
@@ -1481,7 +1481,7 @@ func (p *StdioProxy) readUpstream(ctx context.Context) {
 			// malformed message) is abnormal; log it so it is diagnosable rather
 			// than a silent reader exit.
 			if !errors.Is(err, io.EOF) {
-				fmt.Fprintf(p.errOut(), "[eunox] upstream read error: %v\n", err)
+				_, _ = fmt.Fprintf(p.errOut(), "[eunox] upstream read error: %v\n", err)
 			}
 			return
 		}

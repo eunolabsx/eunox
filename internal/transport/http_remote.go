@@ -80,7 +80,7 @@ func DeleteMCPHTTPSession(client *http.Client, endpoint, sessID, authHeaderLine 
 	if err != nil {
 		// Scrub before logging: net/http's *url.Error strips only the password, not the
 		// username/query-string credential (same leak class as scrubURLError elsewhere).
-		fmt.Fprintf(os.Stderr, "[eunox] upstream session DELETE failed: %v\n", scrubURLError(err))
+		_, _ = fmt.Fprintf(os.Stderr, "[eunox] upstream session DELETE failed: %v\n", scrubURLError(err))
 		return
 	}
 	_ = resp.Body.Close()
@@ -230,7 +230,7 @@ func (p *HTTPProxy) newRemoteSession(ctx context.Context, route *UpstreamRoute, 
 		delete(p.sessions, sess.id)
 		p.mu.Unlock()
 		releaseSessionState(sess)
-		fmt.Fprintf(p.errOut(), "[eunox] HTTP session %s ended.\n", sess.id)
+		_, _ = fmt.Fprintf(p.errOut(), "[eunox] HTTP session %s ended.\n", sess.id)
 	}()
 
 	// Always synchronous so FM-5 aborts before the session is returned; --strict-drift
@@ -244,7 +244,7 @@ func (p *HTTPProxy) newRemoteSession(ctx context.Context, route *UpstreamRoute, 
 	// from readiness, not from registration (which ran before the handshake/drift probe).
 	sess.touchRequest()
 
-	fmt.Fprintf(p.errOut(), "[eunox] HTTP session %s started (remote: %s).\n", sess.id, capability.RedactURLForLog(route.upstreamURL))
+	_, _ = fmt.Fprintf(p.errOut(), "[eunox] HTTP session %s started (remote: %s).\n", sess.id, capability.RedactURLForLog(route.upstreamURL))
 	return sess, nil
 }
 

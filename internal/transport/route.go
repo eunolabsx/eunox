@@ -386,7 +386,7 @@ func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability
 		if manifest == nil {
 			// No policy but explicit enforcement: wiretap mode, every DISPATCHED call
 			// forwarded and logged, none blocked on policy grounds.
-			fmt.Fprintf(w,
+			_, _ = fmt.Fprintf(w,
 				"[eunox] NOTICE: upstream %q has no policy and runs in AUDIT mode on /mcp/%s — "+
 					"every dispatched call is forwarded and logged, none blocked by policy (wiretap).\n",
 				u.Name, u.Name)
@@ -410,7 +410,7 @@ func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability
 		routes[u.Name] = r
 	}
 	if globalStrictDrift && !anyPoliced {
-		fmt.Fprintf(w, "[eunox] WARNING: --strict-drift had no effect: no route has a policy to check drift against.\n")
+		_, _ = fmt.Fprintf(w, "[eunox] WARNING: --strict-drift had no effect: no route has a policy to check drift against.\n")
 	}
 	return routes, nil
 }

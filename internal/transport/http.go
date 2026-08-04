@@ -408,7 +408,7 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 			// GatewayConfig.Validate rejects a malformed entry before the CLI reaches here, but
 			// this is an exported constructor a caller could invoke directly, so warn rather
 			// than silently trust fewer peers than configured.
-			fmt.Fprintf(opts.Stderr, "[eunox] WARNING: listen.trustedProxyCIDRs entry %q is not a valid CIDR and will never be trusted: %v\n", cidr, err)
+			_, _ = fmt.Fprintf(opts.Stderr, "[eunox] WARNING: listen.trustedProxyCIDRs entry %q is not a valid CIDR and will never be trusted: %v\n", cidr, err)
 		}
 	}
 	p := &HTTPProxy{
@@ -487,7 +487,7 @@ func (p *HTTPProxy) warnForwardedForPosture() {
 		return
 	}
 	if len(p.trustedProxyNets) == 0 {
-		fmt.Fprintf(p.errOut(),
+		_, _ = fmt.Fprintf(p.errOut(),
 			"[eunox] SECURITY: --trust-forwarded-for is enabled but listen.trustedProxyCIDRs is empty, "+
 				"so no peer can ever match — X-Forwarded-For is never trusted and every request's source IP "+
 				"is its own connection address. Set listen.trustedProxyCIDRs to the reverse proxy's address(es) "+
@@ -496,7 +496,7 @@ func (p *HTTPProxy) warnForwardedForPosture() {
 		return
 	}
 	if !bindIsLoopbackOnly(p.bind) {
-		fmt.Fprintf(p.errOut(),
+		_, _ = fmt.Fprintf(p.errOut(),
 			"[eunox] SECURITY: --trust-forwarded-for is enabled on a non-loopback bind (%q). "+
 				"X-Forwarded-For is honored only from a peer matching listen.trustedProxyCIDRs; "+
 				"scope that allowlist tightly to the real reverse proxy's address; a broader range "+
@@ -508,7 +508,7 @@ func (p *HTTPProxy) warnForwardedForPosture() {
 	// symmetric: under-declaring is safe, but OVER-declaring points the read at a
 	// client-supplied entry, letting a client behind the proxy forge its own ipRange source.
 	if hops := p.proxyHops(); hops > 1 {
-		fmt.Fprintf(p.errOut(),
+		_, _ = fmt.Fprintf(p.errOut(),
 			"[eunox] SECURITY: listen.trustedProxyHops is %d, so the client is read %d entries from the right "+
 				"of X-Forwarded-For. This MUST equal the number of trusted proxies that append to the header in "+
 				"front of eunox — declaring more than actually run lets a client behind them forge its own source "+
@@ -642,7 +642,7 @@ func (p *HTTPProxy) Serve(ctx context.Context) error {
 		if name != "" {
 			path = "/mcp/" + name
 		}
-		fmt.Fprintf(p.errOut(), "[eunox] HTTP proxy listening on http://%s%s\n", ln.Addr(), path)
+		_, _ = fmt.Fprintf(p.errOut(), "[eunox] HTTP proxy listening on http://%s%s\n", ln.Addr(), path)
 	}
 
 	p.warnForwardedForPosture()
@@ -651,7 +651,7 @@ func (p *HTTPProxy) Serve(ctx context.Context) error {
 	// open to any off-host client: checkAuth is a no-op without a token/JWKS, and the Origin
 	// guard passes any request that simply omits the Origin header (any non-browser client can).
 	if openNonLoopbackBind(p.bind, p.authToken, p.jwtPDP != nil) {
-		fmt.Fprintf(p.errOut(),
+		_, _ = fmt.Fprintf(p.errOut(),
 			"[eunox] SECURITY: proxy is bound to a non-loopback address (%q) with no listen.authToken and no --jwks-uri. "+
 				"The enforced /mcp endpoint is reachable by any off-host client — the Origin check does not gate a "+
 				"non-browser client that omits the Origin header. Configure listen.authToken (or --jwks-uri) and restrict "+

@@ -401,7 +401,7 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 		// Runs on EVERY teardown path (idle reap, DELETE, kill, shutdown, natural exit), so
 		// it's the one place that reclaims this session's flow-label state.
 		releaseSessionState(sess)
-		fmt.Fprintf(p.errOut(), "[eunox] HTTP session %s ended.\n", sess.id)
+		_, _ = fmt.Fprintf(p.errOut(), "[eunox] HTTP session %s ended.\n", sess.id)
 	}()
 
 	// Pass the proxy's serve context, not the request-scoped ctx, so kill-switch lookups on
@@ -420,7 +420,7 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 	// duration is reap-eligible before the client's first post-init request.
 	sess.touchRequest()
 
-	fmt.Fprintf(p.errOut(), "[eunox] HTTP session %s started.\n", sess.id)
+	_, _ = fmt.Fprintf(p.errOut(), "[eunox] HTTP session %s started.\n", sess.id)
 	return sess, nil
 }
 
@@ -733,14 +733,14 @@ func (p *HTTPProxy) reapOnce(idle time.Duration) {
 				if s.lastRequest.Load() >= hardCutoff || !p.hardReapEligible(s) {
 					return
 				}
-				fmt.Fprintf(p.errOut(), "[eunox] HTTP session %s reaped (no host request > %s, hard idle ceiling; SSE stream may have been open).\n", s.id, hard)
+				_, _ = fmt.Fprintf(p.errOut(), "[eunox] HTTP session %s reaped (no host request > %s, hard idle ceiling; SSE stream may have been open).\n", s.id, hard)
 			} else {
 				// An enforced request started after the snapshot also spares this arm: tearing
 				// down would kill the upstream out from under the in-flight callUpstream.
 				if s.lastActive.Load() >= cutoff || s.hasSubscribers() || s.inFlight.Load() > 0 {
 					return
 				}
-				fmt.Fprintf(p.errOut(), "[eunox] HTTP session %s reaped (idle > %s).\n", s.id, idle)
+				_, _ = fmt.Fprintf(p.errOut(), "[eunox] HTTP session %s reaped (idle > %s).\n", s.id, idle)
 			}
 			s.close(p.shutdownMs)
 		}()
@@ -820,7 +820,7 @@ func (p *HTTPProxy) reclaimKilledSession(s *httpSession) {
 	if !p.sessionKilled(s) {
 		return
 	}
-	fmt.Fprintf(p.errOut(), "[eunox] HTTP session %s reaped (kill switch active for this session).\n", s.id)
+	_, _ = fmt.Fprintf(p.errOut(), "[eunox] HTTP session %s reaped (kill switch active for this session).\n", s.id)
 	// Explicit eviction: the GET keepalive arm isn't kill-gated, so the stream would
 	// otherwise survive its own session's teardown.
 	s.evictStreams()
@@ -1010,7 +1010,7 @@ func (s *httpSession) readUpstream(ctx context.Context) {
 			// io.EOF is a normal stream end. Any other error (oversized message, JSON-RPC
 			// parse failure) is abnormal; log it so an operator can tell it from a clean exit.
 			if !errors.Is(err, io.EOF) {
-				fmt.Fprintf(s.errOut(), "[eunox] HTTP session %s: upstream read error: %v\n", s.id, err)
+				_, _ = fmt.Fprintf(s.errOut(), "[eunox] HTTP session %s: upstream read error: %v\n", s.id, err)
 			}
 			return
 		}
@@ -1153,7 +1153,7 @@ func (s *httpSession) forwardNotification(ctx context.Context, msg mcp.RPCMsg) {
 		defer cancel()
 		if _, err := s.callRemoteUpstream(notifyCtx, msg); err != nil {
 			// No response to deliver to the host; log so a dropped notification isn't silent.
-			fmt.Fprintf(s.errOut(), "[eunox] HTTP session %s: notification %q POST to upstream failed: %v\n", s.id, msg.Method, err)
+			_, _ = fmt.Fprintf(s.errOut(), "[eunox] HTTP session %s: notification %q POST to upstream failed: %v\n", s.id, msg.Method, err)
 		}
 		return
 	}
@@ -1300,7 +1300,7 @@ func (s *httpSession) broadcast(msg mcp.RPCMsg) {
 			// Slow subscriber: channel full, notification dropped. Track and warn on the
 			// first drop so a lost tools/list_changed is observable, not silent.
 			if s.droppedNotifs.Add(1) == 1 {
-				fmt.Fprintf(s.errOut(),
+				_, _ = fmt.Fprintf(s.errOut(),
 					"[eunox] WARNING: HTTP session %s dropped a notification (method=%q) to a slow SSE subscriber; further drops counted but not individually logged.\n",
 					s.id, msg.Method)
 			}
