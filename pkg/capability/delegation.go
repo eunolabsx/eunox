@@ -11,21 +11,14 @@ import (
 	"strings"
 )
 
-// Delegation attenuation is the other half of scoping authority to an identity. `principal`
-// answers "which caller does this capability apply to"; this answers "what is left of that
-// caller's authority after it hands work to a sub-agent". A delegate is not a second
-// principal with its own grants — it is its delegator's authority MINUS something, and the
-// minus is what has to be checkable.
+// Delegation attenuation answers "what is left of a caller's authority after it hands work
+// to a sub-agent" — the complement of `principal` ("which caller does this apply to"). A
+// delegate is its delegator's authority MINUS something, checkable rather than assumed.
 //
-// Two claims carry it, both on a token this proxy has already verified:
-//
-//   - `act`, the RFC 8693 §4.1 actor chain, nested most-recent-actor-outermost. It carries
-//     WHO: `{"sub":"user","act":{"sub":"agent-b","act":{"sub":"agent-a"}}}` reads "agent-b,
-//     which got this from agent-a, acting for user".
-//   - `mcp.delegation`, an array of grants ordered delegator-first (agent-a, then agent-b),
-//     one per hop. It carries WHAT each hop kept.
-//
-// Every grant NARROWS along a fixed direction per field:
+// Two claims on an already-verified token carry it: `act` (RFC 8693 §4.1 actor chain,
+// nested most-recent-outermost, carrying WHO) and `mcp.delegation` (grants ordered
+// delegator-first, carrying WHAT each hop kept). Every grant NARROWS along a fixed
+// direction per field:
 //
 //	targets       subset      — a delegate may reach fewer actions, never more
 //	labels        superset    — a delegate's calls carry at least as much taint
@@ -33,24 +26,14 @@ import (
 //	redactFields  superset    — a delegate sees at least as much redacted
 //	maxEffectClass  no higher — a delegate may cause no more consequential an effect
 //
-// Three of the five are also ASSERTED at the token boundary (ValidateDelegationChain) rather
-// than left to the minting side's care. A hop that moves one of those the other way is a
-// WIDENING, and a widening token is rejected outright rather than clamped. Clamping would let a
-// mis-minted (or forged-upstream) token keep working while quietly meaning something other than
-// what it says, and the whole value of the chain is that "the delegate is no broader than its
-// delegator" is a property someone can check rather than a convention someone follows. The
-// other two — labels and redactFields — are unioned across hops by the decision path and so
-// cannot widen at all; NarrowsFrom says why asserting them anyway was harmful.
-//
-// The assertion is not what the enforcement rests on, though — the decision path applies
-// EVERY hop's grant, not just the last one. So even a chain whose monotonicity check was
-// somehow skipped cannot let hop 3 reach what hop 1 forbade. The assertion exists to make a
-// broken chain loud at the boundary; the per-hop application makes it harmless regardless.
-//
-// Nothing here can widen anything, which is why consuming these claims needs no experimental
-// gate (unlike `mcp.capabilities`, which REPLACES the authorization surface and therefore
-// fails open if a build ignores it). A token with no `act` and no `mcp.delegation` — that is,
-// nearly every token — costs a nil check.
+// Three of the five (targets, allowLabels, maxEffectClass) are also ASSERTED at the token
+// boundary (ValidateDelegationChain): a hop that widens one is REJECTED outright rather than
+// clamped, so "no broader than its delegator" is checkable rather than a minting convention.
+// labels/redactFields are unioned across hops and so cannot widen at all — see NarrowsFrom.
+// Enforcement does not rest on the assertion alone, though: the decision path applies EVERY
+// hop's grant, so even a skipped monotonicity check cannot let hop 3 reach what hop 1
+// forbade. Nothing here can widen anything, so consuming these claims needs no experimental
+// gate (unlike `mcp.capabilities`, which replaces the authorization surface).
 const (
 	// ClaimActor is the RFC 8693 actor-chain claim name.
 	ClaimActor = "act"
@@ -472,36 +455,20 @@ func (g *DelegationGrant) Validate() error {
 }
 
 // NarrowsFrom reports whether g is no broader than prior on every axis, naming the axis and
-// the offending value when it is not. It is the monotonicity assertion, and it is written as
-// a per-axis check rather than a single "is a subset" because each axis narrows in its OWN
-// direction — targets and allowLabels shrink, labels and redactFields grow — and a reader has
-// to be able to see that each direction was chosen deliberately.
+// offending value when it is not. Written per-axis rather than as one subset test because
+// each axis narrows in its OWN direction (targets/allowLabels shrink, labels/redactFields
+// grow). A field either side leaves unset bounds/removes nothing, so it can't count as a
+// widening.
 //
-// A field the delegator left unset bounds nothing, so a delegate setting one is a narrowing
-// (there is nothing to compare against and nothing was widened). A field the delegate leaves
-// unset likewise removes nothing: the delegator's grant is applied at decision time in its own
-// right, so an omitted field cannot escape it.
-//
-// Only THREE of the five axes are asserted here, and the split is not an oversight. An axis is
-// checkable at the boundary when a hop's value reads as a CLAIM OF AUTHORITY — targets ("I may
-// reach these"), allowLabels ("I may carry taint into these sinks"), maxEffectClass ("I may
-// cause up to this") — where declaring more than the delegator held is visible nonsense worth
-// being loud about even though the decision path refuses it anyway.
-//
-// labels and redactFields are the other kind: a hop declaring them imposes something on ITSELF,
-// and the decision path UNIONS them across every hop. A hop that names a different taint than
-// its delegator adds to it; a hop that names none inherits its delegator's untouched. Neither
-// can widen, by construction — so there is nothing at the boundary to assert, and asserting it
-// anyway did real damage: it demanded every hop restate every ancestor's labels and redactions,
-// and a chain that did not (which is the ordinary way these are minted, since the union makes
-// restating pointless) was reported as a widening and REJECTED THE TOKEN. A monotonicity check
-// that denies a monotone chain is worse than no check on that axis.
+// Only THREE of the five axes are asserted here (targets, allowLabels, maxEffectClass) —
+// the ones where a hop's value is a CLAIM OF AUTHORITY, so declaring more than the delegator
+// held is worth being loud about. labels/redactFields are unioned across hops by the
+// decision path and so cannot widen by construction; asserting them anyway demanded every
+// hop restate every ancestor's values and rejected ordinary, monotone chains that didn't.
 func (g *DelegationGrant) NarrowsFrom(prior *DelegationGrant) error {
 	if g == nil {
-		// Every other method in this package guards its receiver; this one is reached with a
-		// slice element in-tree, so the guard is defense in depth rather than a live path —
-		// but an API whose neighbours are all nil-safe must not have the one member that
-		// panics.
+		// Defense in depth: reached only via a slice element in-tree, but an API whose
+		// neighbours are all nil-safe must not have the one member that panics.
 		return fmt.Errorf("delegation grant is null")
 	}
 	if prior == nil {
@@ -535,17 +502,11 @@ func (g *DelegationGrant) NarrowsFrom(prior *DelegationGrant) error {
 	return nil
 }
 
-// tightenedBy folds one hop into the running floor the next hop is compared against: the
-// narrowest value seen so far on each axis, in that axis's own direction. It is the
-// accumulator ValidateDelegationChain walks the chain with, so a hop that omits an axis
-// carries the previous constraint forward rather than erasing it.
-//
-// It is deliberately NOT the effective grant the decision path applies — that stays "every hop
-// applies", so the enforcement does not depend on this fold being right. This only decides
-// what a later hop is measured against.
-// It folds only the three axes NarrowsFrom asserts. labels and redactFields are unioned by the
-// decision path across every hop and cannot widen (see NarrowsFrom), so accumulating them into
-// a floor nobody compares against was work with no reader.
+// tightenedBy folds one hop into the running floor the next hop is compared against — the
+// narrowest value seen so far per axis — so a hop that omits an axis carries the previous
+// constraint forward rather than erasing it. It is NOT the effective grant the decision path
+// applies (that stays "every hop applies"); it only decides what the next hop is measured
+// against, and folds only the three axes NarrowsFrom asserts.
 func (g *DelegationGrant) tightenedBy(next *DelegationGrant) *DelegationGrant {
 	out := *g
 	out.Subject = next.Subject

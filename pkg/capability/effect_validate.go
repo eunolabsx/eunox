@@ -1,17 +1,12 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// Semantic validation for the effect layer. This package owns the reversibility
-// vocabulary and the contract digest, so it owns what makes a contract WELL-FORMED too.
-//
-// The rules lived in internal/config, reachable only from the manifest loader. That left
-// the registry corpus — the "reviewable, pinnable" artifact the whole effect layer is
-// anchored on — able to validate and digest an entry that is semantically nonsense: a
-// class outside the closed vocabulary ("safe"), a compensable contract with no
-// compensating action, a blast
-// radius declaring both a fixed value and an argument. The entry then passed its own
-// checks and failed later, at manifest load, as a confusing error about a block the author
-// had copied verbatim from a corpus that told them it was fine.
+// Semantic validation for the effect layer. This package owns the reversibility vocabulary
+// and the contract digest, so it owns what makes a contract WELL-FORMED too — these rules
+// used to live in internal/config, reachable only from the manifest loader, which let the
+// registry corpus validate and digest an entry that was semantically nonsense (wrong class,
+// compensable with no compensating action, ...) and fail later at manifest load with a
+// confusing error about a block copied verbatim from a corpus that said it was fine.
 //
 // Errors carry NO positional framing (no capability index, no file name): each caller adds
 // its own, so the same rule reads correctly whether it fired on a manifest capability or a

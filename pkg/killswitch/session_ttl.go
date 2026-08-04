@@ -18,63 +18,40 @@ import (
 
 const (
 	// redisSessionTTLKey holds the session-kill tombstone lifetime the proxy is running
-	// with, so every process that writes a tombstone to this Redis applies the same one.
+	// with, so every process writing a tombstone applies the same one. `eunox kill
+	// --redis-addr` writes tombstones directly too, so a disagreement's failure mode
+	// runs one way — the shorter lifetime wins, and an expiring tombstone LIFTS the
+	// kill. The proxy publishes here at startup so the CLI can adopt it rather than guess.
 	//
-	// The TTL is stamped by whichever process WRITES the key, and the proxy is not the
-	// only writer: `eunox kill --redis-addr` writes tombstones directly, because that is
-	// the sole out-of-band revocation channel a stdio proxy has. As two independently
-	// configured values there was no way to detect a disagreement, and the failure mode
-	// runs one way -- the shorter lifetime wins whenever the CLI is the writer, and an
-	// expiring tombstone LIFTS the kill, silently re-admitting a revoked session. The
-	// proxy publishes its value here at startup so the CLI can adopt it rather than
-	// guess.
-	//
-	// It sits under its own killswitch:config: prefix, outside the killswitch:agent: and
-	// killswitch:session: prefixes the reconcile scan and Reset sweep walk, so it is
-	// never mistaken for a kill and never cleared by a state reset -- it is
-	// configuration, not kill-switch state.
+	// It sits under its own killswitch:config: prefix, outside the reconcile scan and
+	// Reset sweep's prefixes, so it is never mistaken for a kill or cleared by a reset.
 	redisSessionTTLKey = "killswitch:config:session-kill-ttl"
 
-	// sessionKillTTLNever is the wire spelling of a tombstone that never expires. The
-	// in-process representation of "never" is a zero duration (Redis SET applies no
-	// expiry at 0), which reads as "unset" to a human running `redis-cli GET` on the
-	// key; the word cannot be misread.
+	// sessionKillTTLNever is the wire spelling of a tombstone that never expires: the
+	// in-process zero duration reads as "unset" to a human running `redis-cli GET`, so
+	// the word cannot be misread.
 	sessionKillTTLNever = "never"
 
-	// maxSessionTTLValueBytes bounds the published value before it is parsed. A
-	// well-formed value is a couple of dozen bytes ("720h0m0s"), so anything larger is
-	// garbage or hostile and is rejected without being handed to time.ParseDuration.
+	// maxSessionTTLValueBytes bounds the published value before parsing: a well-formed
+	// value is a couple dozen bytes, so anything larger is garbage or hostile.
 	maxSessionTTLValueBytes = 64
 
-	// sessionTTLKeyExpiryFactor sets the published key's own Redis expiry as a MULTIPLE
-	// of the reconcile interval, because the two are coupled: the running proxy keeps the
-	// key alive by re-publishing it from that loop, so an expiry shorter than a couple of
-	// intervals would expire a live proxy's value on one missed tick or a brief stall.
-	// Derived rather than a fixed duration so an operator who lengthens
-	// --killswitch-reconcile-interval does not silently invalidate this bound.
-	//
-	// Three is the smallest factor that tolerates a missed tick plus jitter. Keeping it
-	// small is the point: the value's whole purpose is to say "a proxy configured this
-	// way is running right now", and a decommissioned instance's value should stop
-	// answering that question quickly.
+	// sessionTTLKeyExpiryFactor sets the key's own Redis expiry as a MULTIPLE of the
+	// reconcile interval (not a fixed duration), since the running proxy keeps it alive
+	// by re-publishing from that loop; three tolerates a missed tick plus jitter while
+	// still making a decommissioned instance's value stop answering quickly.
 	sessionTTLKeyExpiryFactor = 3
 
-	// sessionTTLPublishTimeout bounds the reconcile tick's re-publish. It is a small
-	// fraction of the default reconcile interval on purpose: the publish shares its
-	// goroutine with the cache refresh that bounds kill propagation, so its worst case
-	// must stay well inside one interval or it delays convergence.
+	// sessionTTLPublishTimeout bounds the reconcile tick's re-publish. A small fraction
+	// of the interval, since the publish shares a goroutine with the cache refresh that
+	// bounds kill propagation and must not delay it.
 	sessionTTLPublishTimeout = 3 * time.Second
 )
 
 // sessionTTLKeyExpiry is how long a published value stays readable without being
-// refreshed. Expiry is what makes the key's absence meaningful: the reader side already
-// treats "nothing published" correctly and loudly (ReadPublishedSessionKillTTL reports
-// (0, false, nil) and the CLI falls back to its own lifetime with a message naming it),
-// so bounding freshness turns a STALE value — indistinguishable from a live one, since
-// the key carries no timestamp or writer identity — into an ABSENT one, routing it into a
-// path that is already written and already correct. That is why no version, nonce, or
-// reader-side staleness check is needed: the bad state is made unrepresentable rather
-// than detectable.
+// refreshed. Bounding freshness turns a STALE value — indistinguishable from a live one,
+// since the key carries no timestamp or writer identity — into an ABSENT one, routing it
+// into the already-correct "nothing published" fallback path.
 func (r *Redis) sessionTTLKeyExpiry() time.Duration {
 	iv := r.reconcileInterval
 	if iv <= 0 {
@@ -82,30 +59,18 @@ func (r *Redis) sessionTTLKeyExpiry() time.Duration {
 	}
 	expiry := sessionTTLKeyExpiryFactor * iv
 	if expiry <= 0 {
-		// The multiply overflowed int64 (an absurd --killswitch-reconcile-interval near
-		// the duration ceiling). A negative expiry is worse than useless here: go-redis
-		// treats a negative-but-not-KeepTTL expiration as "no expiration at all", so the
-		// SET would silently succeed with a PERSISTENT key -- the exact opposite of this
-		// function's guarantee, and undetectable from the outside. Fall back to the
-		// default-derived bound. staleness() guards the same overflow on the same field.
+		// Overflowed int64 (an absurd reconcile interval). A negative expiry is worse
+		// than useless: go-redis treats it as "no expiration", making the key PERSISTENT
+		// — the opposite of this function's guarantee. Fall back to the default bound.
 		return sessionTTLKeyExpiryFactor * defaultReconcileInterval
 	}
 	return expiry
 }
 
-// publishedValueExpiry is the expiry to stamp on a published value, which is NOT always
-// sessionTTLKeyExpiry: a permanent lifetime is published with no expiry at all.
-//
-// The freshness bound exists to stop a stale value from SHORTENING a revocation below
-// what the running proxy enforces. A published "never expires" cannot shorten anything --
-// it is the maximal value -- so letting it lapse buys nothing and costs the one direction
-// that matters: with the key gone, `eunox kill` falls back to its own 30-day default and
-// writes a tombstone that lifts the kill a month later, on a deployment configured for
-// permanent revocations. That is the fail-open the publish mechanism exists to prevent.
-//
-// A stale permanent value can only ever OVER-block a session id that is already gone,
-// which is the same safe direction ResolveSessionKillTTLConflict already prefers when it
-// resolves a disagreement to the longer-lived of two lifetimes.
+// publishedValueExpiry is the expiry to stamp on a published value, NOT always
+// sessionTTLKeyExpiry: a permanent lifetime is published with no expiry, since letting a
+// "never expires" value lapse would only make `eunox kill` fall back to its own 30-day
+// default — the fail-open direction — while a stale permanent value can only OVER-block.
 func (r *Redis) publishedValueExpiry(effective time.Duration) time.Duration {
 	if effective <= 0 {
 		return 0 // never expires, in both the value and the key
@@ -135,31 +100,19 @@ func (r *Redis) SessionKillTTL() time.Duration {
 }
 
 // PublishSessionKillTTL writes this manager's effective session-kill TTL to the shared
-// config key, so a process that writes tombstones out-of-band -- `eunox kill
-// --redis-addr`, the only revocation channel a stdio proxy has -- applies the proxy's
-// lifetime instead of its own default. Call it once at startup, after connectivity is
-// confirmed; Start's reconcile loop then keeps the key alive (see sessionTTLKeyExpiry),
-// so a value outlives the process that wrote it by at most a few reconcile intervals.
+// config key, so `eunox kill --redis-addr` (the only out-of-band revocation channel a
+// stdio proxy has) applies the proxy's lifetime instead of its own default. Call once at
+// startup; Start's reconcile loop then keeps the key alive (see sessionTTLKeyExpiry).
 //
-// It returns the previously published lifetime and true when one was present and
-// DIFFERS from this instance's: two proxies sharing one Redis with different
-// configurations, or a restart that changed the value. That is a real ambiguity (the
-// key is last-writer-wins) and the caller should say so; an absent, identical, or
-// unparseable prior value reports false, since none of the three leaves an operator
-// with two live values to reconcile.
-//
-// The read is best-effort and only feeds that diagnostic: a failed GET still publishes,
-// and only a failed SET is returned as an error. Publishing is advisory -- enforcement
-// uses this instance's own configured value either way -- so a caller should warn on an
-// error rather than refuse to start.
+// It returns the previously published lifetime and true when one DIFFERS from this
+// instance's — a real ambiguity (last-writer-wins) worth surfacing; absent, identical, or
+// unparseable reports false. The read is best-effort (a failed GET yields no diagnostic,
+// but still publishes); only a failed SET is returned as an error.
 func (r *Redis) PublishSessionKillTTL(ctx context.Context) (prior time.Duration, differs bool, err error) {
-	// Arm the reconcile loop's republish HERE, before the round trip and regardless of how it
-	// goes. What the loop must not do is publish before the caller's ready hook has run at
-	// all; once it has, a FAILED publish is exactly the case the loop should retry — that is
-	// the self-healing an unconditional tick used to provide for a proxy that came up while
-	// Redis was briefly unreachable, and latching on success alone would have silently
-	// disabled the republish (and its own edge-triggered warning) for the life of the
-	// process. See sessionTTLPublished.
+	// Arm the reconcile loop's republish HERE, regardless of how the round trip goes: once
+	// the caller's ready hook has run, a FAILED publish is exactly the case the loop should
+	// retry. Latching on success alone would silently disable that self-healing. See
+	// sessionTTLPublished.
 	r.sessionTTLPublished.Store(true)
 	mine := r.SessionKillTTL()
 	// Read before writing so the caller can report a disagreement. A GET error (or an
@@ -169,12 +122,8 @@ func (r *Redis) PublishSessionKillTTL(ctx context.Context) (prior time.Duration,
 			prior, differs = parsed, true
 		}
 	}
-	// setErr, not err: the named return err is never otherwise assigned in this
-	// function (both paths use an explicit return triple), so shadowing it here would
-	// be harmless today but a future edit that merges this branch into a shared error
-	// path (e.g. "err = ...; return") could silently start returning the outer,
-	// never-assigned err (nil) instead of this one -- the caller would then believe
-	// the publish succeeded when the SET actually failed.
+	// setErr, not err: a future edit merging this into a shared error path could
+	// otherwise silently return the outer, never-assigned err (nil) instead.
 	if setErr := r.client.Set(ctx, redisSessionTTLKey, formatSessionKillTTL(mine), r.publishedValueExpiry(mine)).Err(); setErr != nil {
 		return 0, false, fmt.Errorf("killswitch: publish session-kill TTL: %w", setErr)
 	}
@@ -182,38 +131,20 @@ func (r *Redis) PublishSessionKillTTL(ctx context.Context) (prior time.Duration,
 }
 
 // refreshPublishedSessionKillTTL re-publishes the value from the reconcile tick, keeping
-// the key alive for as long as this proxy runs and letting it expire once the proxy is
-// gone. It rides the EXISTING reconcile loop deliberately: it adds no goroutine, no
-// ticker, and no second connection, and it must stay that way -- a dedicated timer here
-// would be new background network activity rather than one more command on a loop that
-// already talks to this Redis on a schedule the operator configured.
-//
-// Re-publishing also fixes the disagreement diagnostic that a one-shot startup check
-// cannot. Two proxies with different lifetimes overwrite each other continuously, so each
-// sees the other's value on its next tick -- including the case where the second proxy
-// started an hour later, which no startup-only comparison can catch.
-//
-// Everything here is advisory and never fatal: this proxy applies its own configured
-// lifetime to the tombstones it writes regardless of what is published, so a failure is
-// logged and the loop continues. Both the disagreement and the failure are edge-triggered
-// so a persistent condition does not reprint every interval and train operators to ignore
-// the line; a CHANGED prior value warns again.
+// the key alive for as long as this proxy runs. It rides the EXISTING loop deliberately
+// (no new goroutine, ticker, or connection) and also fixes the disagreement diagnostic a
+// one-shot startup check cannot, since two proxies with different lifetimes overwrite each
+// other continuously. Advisory and never fatal: a failure is logged and the loop continues.
 func (r *Redis) refreshPublishedSessionKillTTL(ctx context.Context) {
-	// REFRESH means refresh: this keeps alive a value an explicit startup publish has already
-	// attempted, and publishes nothing on its own. Start runs before the transport is
-	// serving, so an unconditional SET here made the loop the first writer for any startup
-	// that failed after one tick — clobbering a running proxy's published lifetime with a
-	// value nothing would ever enforce. See sessionTTLPublished.
+	// REFRESH means refresh: publishes nothing on its own. Start runs before the
+	// transport serves, so an unconditional SET here would let any failed startup
+	// clobber a running proxy's published lifetime. See sessionTTLPublished.
 	if !r.sessionTTLPublished.Load() {
 		return
 	}
-	// Carve a short budget out of the loop's deadline-free context. This runs on the
-	// reconcile goroutine, immediately after the cache refresh that BOUNDS kill
-	// propagation -- so a slow-but-not-down Redis that let this advisory write consume
-	// tens of seconds would push the next reconcile tick out past its interval and stretch
-	// the very denial window ADR-0003 promises the interval bounds. The publish is a
-	// coordination hint; it must never delay convergence. Same carve-out, same reason, as
-	// the published-TTL read on the CLI side.
+	// Carve a short budget out of the loop's deadline-free context: this runs right
+	// after the cache refresh that BOUNDS kill propagation, so a slow Redis must not let
+	// this advisory write stretch the reconcile interval and the denial window with it.
 	pubCtx, cancel := context.WithTimeout(ctx, sessionTTLPublishTimeout)
 	defer cancel()
 	prior, differs, err := r.PublishSessionKillTTL(pubCtx)
@@ -230,13 +161,9 @@ func (r *Redis) refreshPublishedSessionKillTTL(ctx context.Context) {
 	}
 	r.markSessionTTLPublishErr(false)
 	if !differs {
-		// Deliberately does NOT reset the dedupe. Two proxies ticking at different rates
-		// make the faster one alternate between reading its own value (agreement) and the
-		// other's (disagreement); clearing here would re-arm the warning on every
-		// alternation and print it forever -- the exact "tuned out by operators" outcome
-		// the dedupe exists to prevent. A disagreement that genuinely resolves stays
-		// silent, and a DIFFERENT prior value still warns, which is the distinction worth
-		// keeping.
+		// Deliberately does NOT reset the dedupe: two proxies ticking at different rates
+		// would otherwise alternate between agreement and disagreement, re-arming the
+		// warning every tick and printing it forever.
 		return
 	}
 	if r.markSessionTTLDisagreement(formatSessionKillTTL(prior)) {
@@ -246,12 +173,9 @@ func (r *Redis) refreshPublishedSessionKillTTL(ctx context.Context) {
 	}
 }
 
-// markSessionTTLDisagreement records the prior value just observed and reports whether it
-// is NEW -- i.e. whether this disagreement is worth another log line. Keyed on the value
-// itself rather than a simple "already warned" flag so a prior value that CHANGES (a third
-// instance appearing, or one being reconfigured) warns again. No companion "was it set"
-// flag is needed: formatSessionKillTTL never returns the empty string, so the zero value
-// is unambiguously "nothing warned yet".
+// markSessionTTLDisagreement records the prior value observed and reports whether it is
+// NEW, worth another log line. Keyed on the value itself, not a flag, so a value that
+// CHANGES warns again; formatSessionKillTTL never returns "", so zero is unambiguous.
 func (r *Redis) markSessionTTLDisagreement(prior string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -262,10 +186,8 @@ func (r *Redis) markSessionTTLDisagreement(prior string) bool {
 	return true
 }
 
-// markSessionTTLPublishErr edge-triggers the re-publish failure log: it records the
-// current state and reports whether a failure should be logged now (failing after being
-// healthy). Mirrors reconcileErrLogged, which throttles the cache-refresh breadcrumb the
-// same way on the same loop.
+// markSessionTTLPublishErr edge-triggers the re-publish failure log (failing after being
+// healthy), mirroring reconcileErrLogged on the same loop.
 func (r *Redis) markSessionTTLPublishErr(failing bool) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -275,16 +197,9 @@ func (r *Redis) markSessionTTLPublishErr(failing bool) bool {
 }
 
 // ReadPublishedSessionKillTTL returns the EFFECTIVE session-kill tombstone lifetime a
-// proxy on this Redis published at startup (zero means tombstones never expire) and
-// whether one was published at all. A caller that writes tombstones itself should apply
-// this value rather than its own default, so a revocation cannot expire earlier than
-// the proxy's own kills do.
-//
-// A missing key reports (0, false, nil) -- no proxy has published one (none has started
-// against this Redis since the value existed, or the write failed) -- which is a
-// fallback-to-local condition, not an error. A malformed value IS an error: it means
-// something other than a proxy wrote the key, and silently treating that as "absent"
-// would hide it.
+// proxy on this Redis published at startup, and whether one was published at all. A
+// missing key reports (0, false, nil), a fallback-to-local condition, not an error; a
+// malformed value IS an error, since something other than a proxy wrote the key.
 func ReadPublishedSessionKillTTL(ctx context.Context, client redis.Cmdable) (time.Duration, bool, error) {
 	raw, err := client.Get(ctx, redisSessionTTLKey).Result()
 	if errors.Is(err, redis.Nil) {
@@ -301,20 +216,11 @@ func ReadPublishedSessionKillTTL(ctx context.Context, client redis.Cmdable) (tim
 }
 
 // ResolveSessionKillTTLConflict decides which of two EFFECTIVE session-kill lifetimes a
-// tombstone write should use when a value this writer would use on its own (local,
-// already normalized -- e.g. through NormalizeSessionKillTTL) disagrees with a value
-// published by a proxy on the same Redis (published, from ReadPublishedSessionKillTTL).
-// It returns the longer-lived of the two -- zero (never expires) beats every positive
-// value -- and whether the two actually disagreed.
-//
-// Preferring the LONGER lifetime, not the published one outright, matters because the
-// tombstone this decision governs is itself an emergency-stop write: refusing to write
-// it because two lifetimes disagree fails in the one direction that matters, while a
-// too-long tombstone only ever over-blocks a session id that is already gone. This is
-// exported, not folded into the CLI, so a future non-CLI writer of session tombstones
-// can reuse the decision rather than re-derive it -- naively preferring its own local
-// value over the published one is exactly the fail-open direction this coordination
-// exists to close.
+// tombstone write should use when local (already normalized) disagrees with published
+// (from ReadPublishedSessionKillTTL). Returns the LONGER-lived of the two, not the
+// published one outright: the tombstone is an emergency-stop write, so refusing it on
+// disagreement fails in the one direction that matters, while over-long only over-blocks
+// an already-gone session id.
 func ResolveSessionKillTTLConflict(local, published time.Duration) (effective time.Duration, mismatch bool) {
 	if local == published {
 		return local, false
@@ -331,9 +237,8 @@ func longerTombstone(a, b time.Duration) time.Duration {
 	return max(a, b)
 }
 
-// DescribeSessionKillTTL renders an effective lifetime for an operator-facing message,
-// spelling the zero value as "never expires" rather than "0s" -- the one value whose
-// numeric form says the opposite of what it means.
+// DescribeSessionKillTTL renders an effective lifetime for an operator message, spelling
+// zero as "never expires" rather than "0s", the one form that says the opposite of what it means.
 func DescribeSessionKillTTL(effective time.Duration) string {
 	if effective <= 0 {
 		return "never expires"
@@ -350,15 +255,11 @@ func formatSessionKillTTL(effective time.Duration) string {
 }
 
 // parseSessionKillTTL decodes a published value into an effective lifetime (zero means
-// never expires). A non-positive duration is rejected rather than mapped onto "never":
-// the two spellings of never would then differ by a sign that no writer intends, and a
-// "0s" that actually meant "expire immediately" would be read as a permanent tombstone.
+// never expires). A non-positive duration is rejected rather than mapped onto "never",
+// since a "0s" meaning "expire immediately" would otherwise read as a permanent tombstone.
 func parseSessionKillTTL(raw string) (time.Duration, error) {
-	// Bound the RAW length before any processing, including TrimSpace: checking the
-	// trimmed string instead would let arbitrary whitespace padding around a short,
-	// well-formed value (e.g. a few hundred KB of spaces around "24h") trim down to
-	// something under the limit and sail through as valid -- exactly the "handed to
-	// time.ParseDuration" outcome this bound exists to prevent for a value this large.
+	// Bound the RAW length before TrimSpace: checking the trimmed string would let
+	// megabytes of whitespace around a short value sail through under the limit.
 	if len(raw) > maxSessionTTLValueBytes {
 		return 0, fmt.Errorf("killswitch: published session-kill TTL is %d bytes; expected a duration or %q", len(raw), sessionKillTTLNever)
 	}

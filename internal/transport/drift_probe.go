@@ -12,12 +12,10 @@ import (
 	"github.com/eunolabs/eunox/internal/mcp"
 )
 
-// fetchUpstreamToolsRaw sends a tools/list probe over the HTTP session's
-// callUpstream and returns the raw JSON result. As session-start work it is marked
-// withoutUpstreamTimeout: bounded by sessionStartTimeout, not --upstream-timeout.
-// Binding it to the per-request knob would let a tight --upstream-timeout fail
-// session establishment when the manifest pins descriptionHash (fetch failure is
-// fatal then), even though the upstream answers within the session-start budget.
+// fetchUpstreamToolsRaw sends a tools/list probe over the HTTP session's callUpstream and
+// returns the raw JSON result. Marked withoutUpstreamTimeout since it's session-start work,
+// bounded by sessionStartTimeout instead — a tight --upstream-timeout must not fail session
+// establishment when the manifest pins descriptionHash (fetch failure is fatal then).
 func (sess *httpSession) fetchUpstreamToolsRaw(ctx context.Context) (json.RawMessage, error) {
 	return drift.FetchAllToolPages(func(cursor string) (json.RawMessage, error) {
 		req := drift.ToolsListRequest(mcp.RawJSON(`"_drift"`), cursor)
@@ -32,31 +30,20 @@ func (sess *httpSession) fetchUpstreamToolsRaw(ctx context.Context) (json.RawMes
 	})
 }
 
-// fetchUpstreamToolsRaw sends tools/list to the configured upstream before the
-// background readUpstream goroutine starts, dispatching on the upstream transport:
-// a subprocess stdin/stdout pipe, or — when p.upHTTP is set — the remote HTTP
-// bridge. It returns the raw JSON result.
+// fetchUpstreamToolsRaw sends tools/list to the configured upstream before the background
+// readUpstream goroutine starts, dispatching on the upstream transport (subprocess pipe or,
+// when p.upHTTP is set, the remote HTTP bridge). Returns the raw JSON result.
 //
-// As session-start work the bridge bounds it by the session-start budget, NOT
-// --upstream-timeout (mirroring the httpSession probe's initCtx): a tight
-// --upstream-timeout would otherwise fail startup when the manifest pins
-// descriptionHash (fetch failure is fatal then) even though the upstream answers in
-// time. It is bounded by --upstream-timeout in NEITHER direction: a generous
-// --upstream-timeout does not widen it either, so the same upstream/manifest/flags
-// establishes a session identically behind a stdio host and an HTTP host.
+// Bounded by the session-start budget, NOT --upstream-timeout in either direction (mirroring
+// the httpSession probe's initCtx), so the same upstream/manifest/flags establishes a session
+// identically behind a stdio host and an HTTP host.
 //
-// On the remote-HTTP bridge that budget bounds the ENTIRE multi-page probe once,
-// not each page: a fresh per-page deadline would let a slow upstream answering each
-// of up to maxToolsListPages pages just under the budget stretch startup to
-// pages*budget. The single deadline also makes the bridge read honor cancellation
-// (readCtx), so a parent-context cancel during startup — or an expired deadline —
-// returns an error instead of blocking forever (spawnPost can drop a POST on an
-// already-canceled ctx, leaving nothing in-flight for the plain Read to receive).
+// On the remote-HTTP bridge that budget bounds the ENTIRE multi-page probe once, not each
+// page — a fresh per-page deadline would let a slow upstream stretch startup to
+// pages*budget. The single deadline also makes the bridge read honor cancellation (readCtx).
 //
-// It discards any number of notifications arriving before the response.
-// Termination is guaranteed on the subprocess path by the pipe closing on process
-// exit (EOF → Read error) bounded by runBoundedStartup's watchdog, and on the HTTP
-// bridge by the probe-wide deadline plus readCtx honoring it.
+// Termination is guaranteed on the subprocess path by the pipe closing on process exit (EOF),
+// bounded by runBoundedStartup's watchdog; on the HTTP bridge by the probe-wide deadline.
 func (p *StdioProxy) fetchUpstreamToolsRaw(ctx context.Context) (json.RawMessage, error) {
 	// Derive one deadline for the whole HTTP-bridge probe (all pages share it), bounding it
 	// by the session-start budget exactly as runBoundedStartup bounds the subprocess path
@@ -89,13 +76,10 @@ func (p *StdioProxy) fetchUpstreamToolsRaw(ctx context.Context) (json.RawMessage
 	})
 }
 
-// readProbeReply reads the next upstream message during startup — the initialize
-// handshake (initUpstream) and the tools/list drift probe. On the remote-HTTP bridge it
-// honors ctx (readCtx) so a canceled or timed-out startup returns promptly rather than
-// blocking until session teardown — the plain Read is not context-aware and done is
-// closed only by close(), which the stuck startup never reaches. The subprocess path
-// keeps the plain Read, whose overall bound is runBoundedStartup's child-kill watchdog
-// (pipe EOF unblocks it).
+// readProbeReply reads the next upstream message during startup (the initialize handshake and
+// the tools/list drift probe). On the remote-HTTP bridge it honors ctx (readCtx) so a
+// canceled/timed-out startup returns promptly rather than blocking until teardown. The
+// subprocess path keeps the plain Read, bounded by runBoundedStartup's child-kill watchdog.
 func (p *StdioProxy) readProbeReply(ctx context.Context) (mcp.RPCMsg, error) {
 	if p.upHTTP != nil {
 		return p.upHTTP.readCtx(ctx)

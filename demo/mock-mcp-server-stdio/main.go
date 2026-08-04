@@ -1,18 +1,9 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// mock-mcp-server-stdio is the stdio-transport twin of mock-mcp-server.
-// It exposes the same three tools (read_file, write_file, query_db) and
-// returns identical deterministic fake responses, but communicates over
-// stdin/stdout using newline-delimited JSON-RPC 2.0 — making it usable as
-// a local subprocess upstream for eunox in stdio transport mode.
-//
-// Usage (via eunox): declare it as a stdio upstream in the config and run
-//
-//	eunox proxy --config eunox.yaml
-//
-// where eunox.yaml has `transport: stdio` and an `upstreams[0]` with
-// `transport: stdio`, `command: ./mock-mcp-server-stdio`, `policy: [...]`.
+// mock-mcp-server-stdio is the stdio-transport twin of mock-mcp-server: same
+// three tools and deterministic responses, but newline-delimited JSON-RPC over
+// stdin/stdout, so it can run as a local subprocess upstream for eunox.
 package main
 
 import (
@@ -119,20 +110,18 @@ var toolList = []toolDef{
 	},
 }
 
-// requiredStringArgs lists the arguments each tool advertises as required string
-// parameters in its input schema. dispatchTool substitutes empty strings on a
-// failed type assertion, so without this check a tools/call with missing or
-// wrong-typed arguments would return a successful result and let the mock violate
-// its own advertised contract.
+// requiredStringArgs is checked because dispatchTool substitutes empty strings
+// on a failed type assertion, which would otherwise let the mock silently
+// violate its own advertised required-argument schema.
 var requiredStringArgs = map[string][]string{
 	"read_file":  {"path"},
 	"write_file": {"path", "content"},
 	"query_db":   {"query"},
 }
 
-// validateToolArgs returns a non-empty message when args does not satisfy name's
-// advertised required string arguments (missing, null, or the wrong type). An
-// unknown tool has no entry and validates clean here; handle reports it separately.
+// validateToolArgs returns a non-empty message when args doesn't satisfy name's
+// advertised required string arguments; an unknown tool validates clean here
+// and is reported separately by handle.
 func validateToolArgs(name string, args map[string]interface{}) string {
 	for _, field := range requiredStringArgs[name] {
 		v, ok := args[field]
@@ -181,11 +170,8 @@ func dispatchTool(name string, args map[string]interface{}) string {
 func handle(msg rpcMsg) { //nolint:gocritic // hugeParam: rpcMsg passed by value intentionally (mirrors cmd/eunox convention)
 	switch {
 	case msg.isNotification():
-		// A notification (id ABSENT) never gets a response, regardless of method
-		// name. This guard must precede the method branches below so an id-less
-		// "initialize" is treated as a notification and answered with nothing, rather
-		// than producing an id-less initialize response (JSON-RPC servers must never
-		// respond to notifications).
+		// Must precede the method branches: an id-less "initialize" is a notification
+		// and gets no response (JSON-RPC servers must never reply to notifications).
 	case msg.Method == "initialize":
 		writeResult(msg.ID, map[string]interface{}{
 			"protocolVersion": mcpProtocolVersion,

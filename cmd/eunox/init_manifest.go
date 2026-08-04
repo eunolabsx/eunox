@@ -1,12 +1,9 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// The `init` subcommand (cmdInit and its upstream-spec parsing) and the starter manifest
-// generator behind it.
-//
-// generateInitManifestYAML produces a YAML manifest with every tool commented
-// out; operators uncomment and add conditions only for tools the agent needs.
-// Re-running init after a server update and diffing surfaces additions/removals.
+// The `init` subcommand and the starter manifest generator behind it: produces a YAML
+// manifest with every tool commented out, so operators uncomment and add conditions only
+// for tools the agent needs.
 
 package main
 
@@ -29,28 +26,15 @@ import (
 	"github.com/eunolabs/eunox/pkg/capability"
 )
 
-// yamlScalar renders s as a single-line YAML scalar safe in BOTH block and flow
-// contexts. Upstream-controlled tool/property/type names are interpolated into the
-// scaffold; without proper quoting a name like "read: report # prod" produces
-// invalid YAML (or silently retargets the entry) once uncommented. For a value the
-// YAML encoder would render across lines it falls back to a Go-quoted form, or to a
-// single-line !!binary scalar when (and only when) the quoted form would not
-// round-trip (a name carrying invalid UTF-8 bytes).
+// yamlScalar renders s as a single-line YAML scalar safe in both block and flow contexts.
+// Upstream-controlled names are interpolated into the scaffold, so an unquoted name like
+// "read: report # prod" would produce invalid YAML (or silently retarget the entry) once
+// uncommented.
 func yamlScalar(s string) string {
-	// Prefer yaml.v3's own rendering, but only when it stays on one physical line and
-	// round-trips back to exactly s in ALL THREE shapes the value is interpolated into:
-	// a bare scalar VALUE (the `- target: X` value and the `X:` body), a flow-sequence
-	// element (the `required: [X]` flow call site), and a block-mapping KEY (the
-	// property key `X: { ... }`). Verifying the round-trip in the exact shapes — rather
-	// than enumerating yaml's significant characters — is self-validating: the bare
-	// check rejects a block-scalar header whose body TrimRight stripped (e.g. "\n"
-	// renders as "|4+", which decodes to ""); the flow check rejects any plain rendering
-	// yaml.Marshal leaves unquoted that is structural in flow context (`,` `[` `]` `{`
-	// `}` `:` `?`, so "a,b" splits a list and "?x" injects a mapping key); and the
-	// block-key check rejects the merge key "<<", which is structural ONLY in key
-	// position (it round-trips fine as a value and a flow element, so the first two
-	// checks miss it). All three push the value to the always-safe quoted fallback below
-	// with no per-character list to keep current.
+	// Accept yaml.v3's own rendering only when it round-trips in ALL THREE shapes the value
+	// is interpolated into (bare value, flow-sequence element, block-mapping key) — each
+	// shape catches a distinct failure a per-character check would miss (e.g. "<<" is only
+	// structural as a key). Anything that fails falls to the quoted fallback below.
 	if b, err := yaml.Marshal(s); err == nil {
 		out := strings.TrimRight(string(b), "\n")
 		if strings.IndexFunc(out, isYAMLLineBreak) == -1 &&
@@ -58,12 +42,8 @@ func yamlScalar(s string) string {
 			return out
 		}
 	}
-	// Fallback for a value yaml renders across lines, or a plain scalar carrying a
-	// flow delimiter. strconv.Quote is a YAML-correct single-line scalar for valid
-	// UTF-8, but NOT for invalid UTF-8: Go's \xNN escape means a raw byte while YAML's
-	// \xNN means code point U+00NN, so a name carrying raw bytes 0x80-0xFF would decode
-	// to a different string. Use the quoted form only when it round-trips; otherwise
-	// emit a single-line !!binary scalar, which round-trips any byte sequence.
+	// strconv.Quote is YAML-correct for valid UTF-8, but not for raw bytes 0x80-0xFF
+	// (Go's \xNN means a raw byte, YAML's means U+00NN) — fall back to !!binary for those.
 	if q := strconv.Quote(s); yamlDecodesTo(q, s) {
 		return q
 	}
@@ -77,12 +57,9 @@ func yamlDecodesTo(text, want string) bool {
 	return yaml.Unmarshal([]byte(text), &got) == nil && got == want
 }
 
-// yamlFlowSeqDecodesTo reports whether out, placed as a single flow-sequence element
-// ("[" + out + "]"), decodes back to exactly want. yamlScalar interpolates its result
-// into the `required: [..]` flow call site, where `,` `[` `]` `{` `}` `:` `?` are
-// structural; verifying the value in that exact flow shape rejects any plain
-// rendering that would split the list or be reinterpreted as a mapping key, with no
-// per-character enumeration to keep in sync with yaml's grammar.
+// yamlFlowSeqDecodesTo reports whether out, placed as a single flow-sequence element,
+// decodes back to exactly want — catching a plain rendering that would split the
+// `required: [..]` list or be reinterpreted as a mapping key.
 func yamlFlowSeqDecodesTo(out, want string) bool {
 	var got []string
 	if err := yaml.Unmarshal([]byte("["+out+"]"), &got); err != nil {
@@ -91,14 +68,9 @@ func yamlFlowSeqDecodesTo(out, want string) bool {
 	return len(got) == 1 && got[0] == want
 }
 
-// yamlBlockKeyDecodesTo reports whether out, placed as a block-mapping KEY (out +
-// ": v"), decodes to a single mapping whose only key is exactly want. yamlScalar
-// interpolates its result into the property-key call site (`X: { ... }`), where the
-// YAML merge key "<<" is structural ONLY in key position: "<<" round-trips cleanly as
-// a scalar value and as a flow element (so the other two checks pass), but as a key it
-// merges the value map into the parent and silently drops the "<<" property. Verifying
-// the value in this exact key shape rejects that case (and any other key-position
-// surprise) so it falls through to the always-safe quoted fallback.
+// yamlBlockKeyDecodesTo reports whether out, placed as a block-mapping key, decodes to a
+// single mapping whose only key is exactly want — catches the YAML merge key "<<", which
+// round-trips fine as a value/flow element but silently merges when used as a key.
 func yamlBlockKeyDecodesTo(out, want string) bool {
 	var m map[string]string
 	if err := yaml.Unmarshal([]byte(out+": v\n"), &m); err != nil {
@@ -108,21 +80,17 @@ func yamlBlockKeyDecodesTo(out, want string) bool {
 	return len(m) == 1 && ok
 }
 
-// generateInitManifestYAML returns a deny-all starter YAML manifest: every tool
-// entry is commented out, so the capabilities section is valid but empty until
-// the operator uncomments entries. A non-empty serverVersion is added as a
-// commented-out field for optional version pinning. With pinDescriptions, each
-// entry gets a descriptionHash for startup detection of description changes.
+// generateInitManifestYAML returns a deny-all starter YAML manifest: every tool entry is
+// commented out. With pinDescriptions, each entry gets a descriptionHash for startup
+// detection of description changes.
 func generateInitManifestYAML(tools []drift.UpstreamTool, manifestName, serverVersion string, pinDescriptions bool) string {
 	var sb strings.Builder
 	sb.WriteString("schemaVersion: \"0.1\"\n")
 	fmt.Fprintf(&sb, "name: %s\n", yamlScalar(manifestName))
 	sb.WriteString("version: \"0.1.0\"\n")
 	if serverVersion != "" {
-		// Show an exact pin, plus a wildcard suggestion when one exists that is both
-		// looser than the exact version and still matches it (a bare major like "2"
-		// has no looser form the drift matcher accepts, so suggesting one would only
-		// mislead). serverVersionWildcard guarantees the round trip.
+		// Suggest a wildcard only when it's both looser than the exact version and still
+		// matches it — a bare major like "2" has no such form, so skip the suggestion.
 		wildcard := serverVersionWildcard(serverVersion)
 		if wildcard != serverVersion {
 			fmt.Fprintf(&sb, "# serverVersion: %s  # uncomment to pin; use %s to allow updates\n",
@@ -148,9 +116,8 @@ func generateInitManifestYAML(tools []drift.UpstreamTool, manifestName, serverVe
 		}
 		for _, line := range toolEntryYAMLLines(tool, pinDescriptions) {
 			// Re-prefix every physical line: an untrusted upstream name may carry an
-			// embedded line break, which would otherwise break out of the comment and
-			// plant an ACTIVE capability into the deny-all starter. yaml.v3 treats CR,
-			// NEL, LS, and PS as line breaks too, so split on all of them (isYAMLLineBreak).
+			// embedded line break, which would otherwise break out of the comment and plant
+			// an ACTIVE capability into the deny-all starter.
 			for _, phys := range strings.FieldsFunc(line, isYAMLLineBreak) {
 				sb.WriteString("  # ")
 				sb.WriteString(phys)
@@ -173,9 +140,8 @@ func isYAMLLineBreak(r rune) bool {
 	}
 }
 
-// initUpstreamSpec describes the upstream `init` was pointed at, used to scaffold
-// a matching runnable config. Exactly one of {URL, Command} is set, selected by
-// Transport.
+// initUpstreamSpec describes the upstream `init` was pointed at. Exactly one of
+// {URL, Command} is set, selected by Transport.
 type initUpstreamSpec struct {
 	Transport     string   // "http" or "stdio"
 	URL           string   // http: upstream base URL
@@ -185,15 +151,13 @@ type initUpstreamSpec struct {
 	Args          []string // stdio: subprocess args
 }
 
-// initRouteName is the default name of the single upstream scaffolded by
-// `eunox init`. It's a placeholder — the operator renames it (it becomes
-// the /mcp/<name> route segment in http mode) before flipping to production.
+// initRouteName is the placeholder route name `eunox init` scaffolds; it becomes the
+// /mcp/<name> segment in http mode and is renamed by the operator before production.
 const initRouteName = "upstream"
 
-// generateInitConfigYAML returns a runnable eunox config that fronts the
-// introspected upstream and enforces the generated manifest. The host transport
-// mirrors the upstream transport (http→gateway with a listen block; stdio→stdio
-// host) so `eunox proxy --config` works out of the box.
+// generateInitConfigYAML returns a runnable eunox config fronting the introspected
+// upstream. The host transport mirrors the upstream transport so `eunox proxy --config`
+// works out of the box.
 func generateInitConfigYAML(u initUpstreamSpec, manifestPath string) string {
 	var sb strings.Builder
 	sb.WriteString("# eunox config generated by `eunox init`. Run:\n")
@@ -227,12 +191,9 @@ func generateInitConfigYAML(u initUpstreamSpec, manifestPath string) string {
 		sb.WriteString("    transport: http\n")
 		fmt.Fprintf(&sb, "    upstreamUrl: %s\n", yamlScalar(u.URL))
 		if u.AuthHeader != "" {
-			// The literal --upstream-auth-header value is persisted here verbatim (not an
-			// env-ref like ${UPSTREAM_TOKEN}) so the generated config is runnable
-			// out of the box, matching every other init-scaffolded field. That means
-			// this file now holds a cleartext credential — flag it in-line (and see the
-			// matching stderr warning in cmdInit) so an operator does not commit it or
-			// paste it into a bug report without noticing.
+			// Persisted verbatim (not as an env-ref) so the config is runnable out of the
+			// box — that means this file now holds a cleartext credential, so flag it
+			// in-line (and see the matching stderr warning in cmdInit).
 			sb.WriteString("    # SECURITY: the line below is a cleartext credential (from --upstream-auth-header).\n")
 			sb.WriteString("    # Consider replacing it with an env-ref, e.g. \"Authorization: Bearer ${UPSTREAM_TOKEN}\",\n")
 			sb.WriteString("    # and keep this file out of version control either way.\n")
@@ -240,8 +201,7 @@ func generateInitConfigYAML(u initUpstreamSpec, manifestPath string) string {
 		} else {
 			sb.WriteString("    # upstreamAuthHeader: \"Authorization: Bearer ${UPSTREAM_TOKEN}\"\n")
 		}
-		// Preserve --upstream-tls-skip-verify so the config can reconnect to the
-		// same self-signed upstream `init` introspected.
+		// Preserve so the config can reconnect to the same self-signed upstream `init` used.
 		if u.TLSSkipVerify {
 			sb.WriteString("    upstreamTlsSkipVerify: true   # init introspected with --upstream-tls-skip-verify (development only)\n")
 		}
@@ -252,10 +212,8 @@ func generateInitConfigYAML(u initUpstreamSpec, manifestPath string) string {
 	return sb.String()
 }
 
-// yamlStringList renders a string slice as a YAML flow-style sequence with each
-// element rendered through yamlScalar so an operator-supplied arg carrying a flow
-// delimiter, line break, or invalid UTF-8 still round-trips through the YAML loader,
-// e.g. ["-y", "@modelcontextprotocol/server-filesystem"].
+// yamlStringList renders a string slice as a YAML flow-style sequence, each element via
+// yamlScalar so an arg carrying a flow delimiter or invalid UTF-8 still round-trips.
 func yamlStringList(items []string) string {
 	parts := make([]string, len(items))
 	for i, s := range items {
@@ -264,11 +222,9 @@ func yamlStringList(items []string) string {
 	return "[" + strings.Join(parts, ", ") + "]"
 }
 
-// toolEntryYAMLLines returns the unindented YAML content lines for one tool entry
-// (the caller prefixes each with "  # "). With pinDescriptions, a descriptionHash
-// is emitted for every tool including one with an empty description — the hash of
-// "" is a verifiable pin, and skipping it would leave a tool-poisoning gap (an
-// empty description silently changing into a prompt-injecting one).
+// toolEntryYAMLLines returns the unindented YAML content lines for one tool entry (the
+// caller prefixes each with "  # "). With pinDescriptions, a hash is emitted even for an
+// empty description — skipping it would leave a tool-poisoning gap.
 func toolEntryYAMLLines(tool drift.UpstreamTool, pinDescriptions bool) []string {
 	lines := []string{
 		fmt.Sprintf("- target: %s", yamlScalar("tool:"+tool.Name)),
@@ -289,16 +245,12 @@ func toolEntryYAMLLines(tool drift.UpstreamTool, pinDescriptions bool) []string 
 func argumentSchemaYAML(schema map[string]interface{}) []string {
 	props, ok := drift.SchemaProperties(schema)
 	if !ok || len(props) == 0 {
-		// Nothing to scaffold when the live schema declares no parameters.
 		return nil
 	}
 
-	// additionalProperties: false makes the scaffolded schema a CLOSED enumeration
-	// of the tool's current parameters. It fails a call carrying an undeclared
-	// argument closed at request time, and it arms the FM-6 startup drift check:
-	// without it, FM-6's "a new, unreviewed parameter appeared" detection cannot
-	// fire (an open schema permits any added parameter by definition). The operator
-	// reviews and relaxes it if a tool legitimately takes open-ended arguments.
+	// additionalProperties: false closes the schema, both denying an undeclared argument
+	// at request time and arming the FM-6 startup drift check (an open schema can't detect
+	// a new, unreviewed parameter). The operator relaxes it if the tool needs open args.
 	lines := []string{
 		"    type: object",
 		"    additionalProperties: false",
@@ -313,11 +265,9 @@ func argumentSchemaYAML(schema map[string]interface{}) []string {
 		required := make([]string, 0, len(reqRaw))
 		for _, r := range reqRaw {
 			if s, ok := r.(string); ok {
-				// Only keep a required name that has a matching property schema. The
-				// scaffold always emits additionalProperties:false, so a required field
-				// absent from properties would make the (uncommented) schema unsatisfiable
-				// — config.LoadManifest rejects exactly that shape, failing the whole
-				// manifest. Filtering keeps the deny-all scaffold loadable as documented.
+				// Only keep a required name with a matching property: since the scaffold
+				// emits additionalProperties:false, a required field absent from properties
+				// would make the schema unsatisfiable and fail the whole manifest.
 				if _, inProps := props[s]; inProps {
 					required = append(required, yamlScalar(s))
 				}
@@ -331,15 +281,10 @@ func argumentSchemaYAML(schema map[string]interface{}) []string {
 	return lines
 }
 
-// propertyTypeYAML renders the `type:` value for one inputSchema property as a
-// YAML scalar or flow sequence. JSON Schema permits `type` to be an array (a
-// union), and nullable parameters are routinely declared as ["string","null"]
-// (or ["integer","null"], etc.). The manifest grammar's multi-type SchemaType
-// accepts a flow sequence, and the enforcement engine checks declared types
-// strictly — so a union type collapsed to a wrong scalar (e.g. an
-// ["integer","null"] argument emitted as `string`) would make the proxy deny
-// legitimate calls once the operator uncomments the entry. Emit the array form
-// for a union and fall back to `string` only when no usable type is present.
+// propertyTypeYAML renders the `type:` value for one inputSchema property as a YAML scalar
+// or flow sequence. JSON Schema permits `type` to be a union array (e.g. nullable params as
+// ["string","null"]); collapsing that to a wrong scalar would make the proxy deny legitimate
+// calls once the entry is uncommented, since the engine checks declared types strictly.
 func propertyTypeYAML(prop interface{}) string {
 	propMap, ok := prop.(map[string]interface{})
 	if !ok {
@@ -364,23 +309,10 @@ func propertyTypeYAML(prop interface{}) string {
 	return "string"
 }
 
-// serverVersionWildcard returns a wildcarded pin suggestion derived from v, loose
-// enough to allow updates while still matching v itself under the drift matcher
-// (internal/drift.matchServerVersion). That round-trip is the load-bearing
-// property: the matcher treats a trailing "*" as "any value AT this position and
-// beyond" and still requires the actual version to HAVE a component there, so a
-// wildcard appended past v's last component would not match v — and an operator
-// following the inline advice would pin a constraint that fails FM-4 drift against
-// the very unchanged server it came from (a self-inflicted strict-drift abort).
-// Hence the suggestion only ever wildcards a component v already has:
-//
-//	"1.2.3" -> "1.2.*"  (any patch of 1.2)
-//	"1.2"   -> "1.*"    (any minor of 1; "1.2.*" would need a 3rd component)
-//	"2"     -> "2"      (no minor/patch to wildcard; exact pin is the only match)
-//
-// The sole caller (cmdInit) guards on serverVersion != "", so v is never empty here;
-// no empty-string special case is needed (and a bare "*" would contradict the
-// "only wildcard a component v has" invariant above).
+// serverVersionWildcard returns a wildcard pin suggestion loose enough to allow updates
+// while still matching v under the drift matcher — it only ever wildcards a component v
+// already has ("1.2.3"->"1.2.*", "2"->"2"), since a wildcard past v's last component would
+// not match v and would self-inflict an FM-4 drift abort.
 func serverVersionWildcard(v string) string {
 	parts := strings.Split(v, ".")
 	switch len(parts) {
@@ -393,8 +325,7 @@ func serverVersionWildcard(v string) string {
 	}
 }
 
-// sortedKeys returns the keys of any string-keyed map in sorted order. The value
-// type is a parameter so one helper serves every caller.
+// sortedKeys returns the keys of any string-keyed map in sorted order.
 func sortedKeys[V any](m map[string]V) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
@@ -404,18 +335,12 @@ func sortedKeys[V any](m map[string]V) []string {
 	return keys
 }
 
-// initUsageExit is init's exit code for a usage error. It is 2, matching validate — the
-// sibling it shares live-introspection flags with — and contracts, rather than the 1 it
-// used: init reports no findings, so it has nothing 1 could mean, and an operator (or a
-// scaffolding script) reading a 1 from one command and a 2 from the other for the same
-// class of mistake has to learn each command's private convention.
+// initUsageExit is init's exit code for a usage error: 2, matching validate/contracts
+// rather than 1, since init reports no findings and 1 would mean nothing here.
 const initUsageExit = 2
 
-// cmdInit runs the `init` subcommand and returns the process exit code (rather
-// than calling os.Exit itself), so tests can drive every branch — including the
-// fail-closed error paths — without terminating the test binary. args carries
-// the subcommand's own arguments (os.Args[2:] in a real invocation), threaded
-// from run.
+// cmdInit runs the `init` subcommand, returning the exit code (rather than calling
+// os.Exit) so tests can drive every branch including the fail-closed error paths.
 func cmdInit(args []string) int {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	fs.Usage = func() {
@@ -459,10 +384,8 @@ Flags:
 		return initUsageExit
 	}
 
-	// Reject the incoherent --config-output-without--output combination up front, before
-	// the live upstream fetch — otherwise the operator waits out the whole introspection
-	// (up to liveUpstreamTimeout) only to be told their flags were incoherent (matches
-	// buildInitUpstreamSpec's reject-flag-mixes-before-the-first-network-call posture).
+	// Reject before the live upstream fetch — otherwise the operator waits out the whole
+	// introspection only to be told their flags were incoherent.
 	if *configOutput != "" && *output == "" {
 		fmt.Fprintf(os.Stderr, "eunox init: --config-output requires --output (the config references the manifest file)\n")
 		return initUsageExit
@@ -501,8 +424,7 @@ Flags:
 	fmt.Fprintf(os.Stderr, "Generated manifest %s — review and uncomment the capabilities you want to permit.\n", *output)
 
 	if *configOutput != "" {
-		// Resolve the manifest path to absolute so the config works regardless of
-		// the CWD when `proxy --config` is invoked.
+		// Absolute so the config works regardless of CWD when `proxy --config` is invoked.
 		absManifest, err := filepath.Abs(*output)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "eunox init: resolving manifest path: %v\n", err)
@@ -521,10 +443,9 @@ Flags:
 	return 0
 }
 
-// buildInitUpstreamSpec validates and returns the live-introspection target,
-// rejecting cross-axis flag mixes (http vs stdio) up front rather than at the
-// first network call. Shared by `init` and `validate --live`; error messages are
-// subcommand-agnostic.
+// buildInitUpstreamSpec validates and returns the live-introspection target, rejecting
+// cross-axis flag mixes up front rather than at the first network call. Shared by `init`
+// and `validate --live`.
 func buildInitUpstreamSpec(transportMode, upstreamURL, authHeader string, tlsSkipVerify bool, positional []string) (initUpstreamSpec, error) {
 	switch transportMode {
 	case config.HostTransportHTTP:

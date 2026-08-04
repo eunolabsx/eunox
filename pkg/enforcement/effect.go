@@ -14,73 +14,53 @@ import (
 	"github.com/eunolabs/eunox/pkg/capability"
 )
 
-// Effect enforcement — the "what may break" axis, evaluated at the SAME interception
-// point as everything else.
+// Effect enforcement — the "what may break" axis, evaluated at the same interception point as
+// everything else.
 //
-// Two per-target conditions (effectClass, blastRadius) run through the existing
-// ConditionHandler registry like any other predicate. The tool-agnostic effectCeiling is
-// different in kind: it is not a condition an author attaches to a target, it is a bound
-// EVERY allowed action is additionally checked against, so it runs once on the allow tail
-// after the conditions have passed. That placement is the point — a per-target condition
-// only guards the targets someone remembered to write one for, while the ceiling catches
-// the tool nobody thought about, including the unannotated one.
+// effectClass and blastRadius run as ordinary per-target ConditionHandlers; effectCeiling is
+// different in kind — not a condition an author attaches, but a bound EVERY allowed action is
+// additionally checked against on the allow tail, catching the target nobody wrote a rule for.
 //
-// All three read ONE resolution of the matched constraint's contract against the call's
-// arguments, threaded through the context by evaluateMatched. A second resolution would
-// be a place for the condition verdict, the ceiling verdict, and the audit record to
-// silently disagree about what the call's effect was.
+// All three read ONE resolution of the matched constraint's contract, threaded through the
+// context by evaluateMatched, so the condition verdict, ceiling verdict, and audit record
+// can't disagree about what the call's effect was.
 
 // resolvedEffectKey types the context value carrying the call's resolved effect from
-// evaluateMatched into the condition handlers, mirroring withDirectives/withCarriedLabels.
-// The ConditionHandler signature is (ctx, condition, request) — it deliberately does not
-// see the matched constraint — so the contract, which lives on the constraint, has to
-// arrive this way.
+// evaluateMatched to the condition handlers, mirroring withDirectives/withCarriedLabels.
 type resolvedEffectKey struct{}
 
 // withResolvedEffect returns a child context carrying the call's resolved effect.
 //
-// By pointer, not by value: one resolution is threaded to three readers (the two
-// conditions and the ceiling), and a resolved effect is read-only once produced, so
-// copying it per reader buys nothing and costs a multi-word copy on the hot path.
+// By pointer: one resolution is threaded to three readers, and it's read-only once produced,
+// so copying per reader buys nothing on the hot path.
 func withResolvedEffect(ctx context.Context, eff *capability.ResolvedEffect) context.Context {
 	return context.WithValue(ctx, resolvedEffectKey{}, eff)
 }
 
-// resolvedEffectFromContext returns the effect evaluateMatched resolved for this call.
-// ok is false for a direct caller of an exported entrypoint that did not thread one; the
-// handlers then fail closed rather than guess, because the alternative — resolving an
-// UNANNOTATED default here — would silently judge every direct caller's call as
-// irreversible without telling them why. A threaded-but-nil pointer reports false for the
-// same reason: unevaluable must fail closed, never dereference nil.
+// resolvedEffectFromContext returns the effect evaluateMatched resolved for this call. ok is
+// false for a direct caller that threaded none, or a threaded-but-nil pointer — either way the
+// handlers fail closed rather than silently resolving an unannotated default here.
 func resolvedEffectFromContext(ctx context.Context) (*capability.ResolvedEffect, bool) {
 	eff, ok := ctx.Value(resolvedEffectKey{}).(*capability.ResolvedEffect)
 	return eff, ok && eff != nil
 }
 
-// handleEffectClass denies a call whose resolved effect class is not in the condition's
-// Allow set — the per-target consequence gate ("this target may only ever do reversible
-// things").
-//
-// An unannotated constraint resolves to irreversible, so a target with an effectClass
-// condition and no contract denies. That is the flywheel working as intended at the
-// per-target scale: the author asked for a class gate, so leaving the class undeclared
-// cannot pass it.
+// handleEffectClass denies a call whose resolved effect class is not in the condition's Allow
+// set. An unannotated constraint resolves to irreversible, so a target with this condition and
+// no contract denies by default — the flywheel working as intended at the per-target scale.
 func (e *Engine) handleEffectClass(ctx context.Context, cond capability.Condition, _ *capability.EnforceRequest) *ConditionError {
 	ec, condErr := castCondition[capability.EffectClassCondition](cond)
 	if condErr != nil {
 		return condErr
 	}
-	// Defense in depth against a typed-nil *EffectClassCondition: castCondition matches
-	// the `*T` case and returns the nil pointer with condErr == nil, so reading ec.Allow
-	// below would dereference nil. runConditions rejects a typed-nil condition before
-	// dispatch, so this is unreachable in-tree — but an unevaluable condition must fail
-	// closed, never panic the enforcement goroutine (mirrors handleFlowLabel).
+	// Defense in depth against a typed-nil *EffectClassCondition (castCondition returns it as
+	// non-error): runConditions already rejects this before dispatch, but an unevaluable
+	// condition must fail closed, never panic (mirrors handleFlowLabel).
 	if ec == nil {
 		return effectDenial(capability.ConditionTypeEffectClass, "effectClass condition is nil and cannot be evaluated", nil)
 	}
-	// The loader rejects an empty allow set and an unknown class, but a programmatically
-	// built condition can carry either. Surface both rather than silently admit: an empty
-	// set that fell through as "no restriction" would invert the condition's meaning.
+	// The loader rejects an empty allow set and an unknown class, but a programmatically built
+	// condition can carry either — surface both rather than silently admit.
 	if len(ec.Allow) == 0 {
 		return effectDenial(capability.ConditionTypeEffectClass,
 			"effectClass declares an empty 'allow' set, which admits no effect class", nil)
@@ -135,12 +115,10 @@ func checkPerCallBlastRadius(br *capability.BlastRadiusCondition, eff *capabilit
 }
 
 // velocityBucket derives the weighted bucket a cumulative bound draws on, after the checks
-// that must fail closed before any budget is considered: an unquantified magnitude, one the
-// accumulator cannot represent, and the structural session/target guards.
-//
-// It COMMITS nothing — the engine admits the returned bucket alongside every other
-// quota-consuming condition on the constraint, in one atomic call, after the effect ceiling
-// has had its chance to refuse.
+// that must fail closed first: an unquantified magnitude, one the accumulator can't
+// represent, and the structural session/target guards. Commits nothing — the engine admits
+// the bucket alongside every other quota condition in one atomic call, after the ceiling has
+// had its chance to refuse.
 func (e *Engine) velocityBucket(ctx context.Context, br *capability.BlastRadiusCondition, eff *capability.ResolvedEffect, req *capability.EnforceRequest) (DeferredCommit, bool, *ConditionError) {
 	limit, ok := capability.ParseBlastRadiusNumber(*br.MaxTotal)
 	if !ok {
@@ -148,9 +126,9 @@ func (e *Engine) velocityBucket(ctx context.Context, br *capability.BlastRadiusC
 			"blastRadius 'maxTotal' is not a number (%q)", br.MaxTotal.String()), nil)
 	}
 	if !eff.Quantified() {
-		// The same rule the per-call bound applies, for the same reason: an action whose
-		// size cannot be established must not contribute 0 to a sum. Treating it as
-		// weightless would make the unannotated call the one way to spend nothing.
+		// Same rule the per-call bound applies: an action whose size can't be established
+		// must not contribute 0 to a sum, or the unannotated call becomes the way to spend
+		// nothing.
 		return DeferredCommit{}, false, effectDenial(capability.ConditionTypeBlastRadius, fmt.Sprintf(
 			"this call's blast radius could not be quantified, so it cannot be summed against the cumulative bound of %s per %ds%s",
 			br.MaxTotal.String(), br.WindowSeconds, unannotatedHint(eff)), velocityDetails(eff, br))
@@ -169,9 +147,9 @@ func (e *Engine) velocityBucket(ctx context.Context, br *capability.BlastRadiusC
 		return DeferredCommit{}, false, condErr
 	}
 	if skip {
-		// Observe mode (--audit): the budget must not be consumed. The per-call bound has
-		// already been evaluated above, which is the half observe mode must still report —
-		// leaving it on the commit side is what let it go unchecked on this exact run.
+		// Observe mode: the per-call bound above has already run, which is the half observe
+		// mode must still report — leaving it on the commit side let it go unchecked on this
+		// run.
 		return DeferredCommit{}, true, nil
 	}
 	return DeferredCommit{
@@ -184,10 +162,9 @@ func (e *Engine) velocityBucket(ctx context.Context, br *capability.BlastRadiusC
 		Deny: func(total float64, retryAfter time.Duration) *ConditionError {
 			details := velocityDetails(eff, br)
 			details["blast_radius_total"] = total
-			// The SHARED helper every other quota condition uses: it rounds a fractional
-			// estimate UP (a truncating conversion reported a 900ms wait as 0, telling the
-			// caller to retry immediately into a guaranteed denial) and falls back to the
-			// full window when no estimate could be made.
+			// Shared helper every quota condition uses: rounds a fractional wait UP
+			// (truncating reported a 900ms wait as 0, telling the caller to retry into a
+			// guaranteed denial).
 			details["retry_after_seconds"] = retryAfterSeconds(retryAfter, br.WindowSeconds)
 			return effectDenial(capability.ConditionTypeBlastRadius, fmt.Sprintf(
 				"this call's blast radius %s would take this session's cumulative total for the target past the permitted %s per %ds (already %s within the window)",
@@ -198,18 +175,12 @@ func (e *Engine) velocityBucket(ctx context.Context, br *capability.BlastRadiusC
 
 // weightSummable reports whether a resolved magnitude can join a weighted total at all.
 //
-// It tests REPRESENTABILITY, not exactness. Requiring big.Exact here was wrong and broke
-// the feature's own headline case: ParseBlastRadiusNumber builds the magnitude at 64-bit
-// precision, so narrowing to a float64's 53-bit mantissa reports Below/Above for any
-// decimal that is not dyadic — which is most currency amounts. A $19.99 refund was denied
-// under a $2,000-an-hour bound, with a message calling it "too large".
-//
-// A rounded fractional magnitude IS summable, and the counter contract already says so:
-// both backends accumulate in IEEE-754 double precision, and a fractional value can differ
-// from an exact decimal sum in the last bits, far below any bound an operator authors. What
-// is genuinely unsummable is a value the double cannot hold at all — non-finite, negative,
-// or above the 2^53 bound where the Redis backend's Lua arithmetic stops being exact —
-// and each of those is refused, matching the counter's own guard.
+// Tests REPRESENTABILITY, not exactness: requiring big.Exact broke the feature's headline
+// case, denying a $19.99 refund under a $2,000/hr bound as "too large" because most decimal
+// amounts aren't dyadic at float64 precision. A rounded fractional magnitude IS summable —
+// both counter backends already accumulate in IEEE-754 double precision. What's genuinely
+// unsummable is non-finite, negative, or above the 2^53 bound where Redis's Lua arithmetic
+// stops being exact.
 func weightSummable(weight float64) bool {
 	if math.IsNaN(weight) || math.IsInf(weight, 0) {
 		return false
@@ -217,11 +188,9 @@ func weightSummable(weight float64) bool {
 	return weight >= 0 && weight <= capability.MaxWeightedTotal
 }
 
-// velocityDetails builds the structured denial details every cumulative-bound refusal
-// carries: the effect's own fields plus the bound that was not met. One builder, because
-// the three refusal sites had hand-copied it and one copy had already dropped
-// blast_radius_window_seconds — leaving a SIEM rule keyed on that field silently blind to
-// one whole class of velocity denial.
+// velocityDetails builds the structured details every cumulative-bound refusal carries. One
+// builder, because three hand-copied sites had let blast_radius_window_seconds drift out of
+// one of them, leaving a SIEM rule keyed on it blind to that class of denial.
 func velocityDetails(eff *capability.ResolvedEffect, br *capability.BlastRadiusCondition) map[string]interface{} {
 	details := eff.AuditDetails()
 	details["blast_radius_max_total"] = br.MaxTotal.String()
@@ -235,25 +204,23 @@ func formatTotal(total float64) string {
 	return strconv.FormatFloat(total, 'f', -1, 64)
 }
 
-// blastRadiusBucket derives the counter bucket a cumulative bound sums into, under the
-// same fail-closed guards maxCallsBucket applies and keyed the same way — so a session's
-// velocity budget is per (session, target type, target name), never shared across sessions
-// or across two targets that happen to share a bare name.
+// blastRadiusBucket derives the counter bucket a cumulative bound sums into, under the same
+// fail-closed guards and keying as maxCallsBucket, so a session's velocity budget is per
+// (session, target type, target name).
 //
-// The namespace is its own ("blastradius:"), so a velocity budget and a maxCalls quota on
-// the same target never share a bucket: one counts calls and the other sums magnitudes, and
-// collapsing them would make each corrupt the other's accounting.
+// Own namespace ("blastradius:") so a velocity budget and a maxCalls quota on the same target
+// never share a bucket and corrupt each other's accounting.
 //
-// skip is true under observe mode (--audit), derived SOLELY from the request context, as
-// the CommittingConditionHandler contract requires.
+// skip is true under observe mode, derived solely from context per the
+// CommittingConditionHandler contract.
 func (e *Engine) blastRadiusBucket(ctx context.Context, req *capability.EnforceRequest) (key string, skip bool, condErr *ConditionError) {
 	if e.counter == nil {
 		return "", false, effectDenial(capability.ConditionTypeBlastRadius,
 			"call counter not configured, so a cumulative blast-radius bound cannot be enforced", nil)
 	}
 	if req == nil || req.SessionID == "" {
-		// A missing session would merge every anonymous caller's magnitude into one budget
-		// — a shared bucket is both a bypass (one caller's spend blocks another) and a DoS.
+		// A missing session would merge every anonymous caller's magnitude into one budget —
+		// a bypass and a DoS at once.
 		return "", false, &ConditionError{
 			Code:          capability.ErrCodeMissingContext,
 			ConditionType: capability.ConditionTypeBlastRadius,
@@ -268,11 +235,8 @@ func (e *Engine) blastRadiusBucket(ctx context.Context, req *capability.EnforceR
 			Message:       "tool or resource name is required for a cumulative blastRadius bound",
 		}
 	}
-	// After the structural guards, never before them — the same ordering maxCallsBucket
-	// documents. Observe mode exists to predict what enforcement would do, and only the
-	// budget WRITE is what it must not perform; a nil counter or an unidentifiable target
-	// are misconfigurations that deny in enforce mode whatever the budget holds, and
-	// skipping first would hide exactly those from the run made to find them.
+	// After the structural guards, never before: observe mode must still surface a nil
+	// counter or an unidentifiable target as it would deny in enforce mode.
 	if SkipQuota(ctx) {
 		return "", true, nil
 	}
@@ -281,20 +245,13 @@ func (e *Engine) blastRadiusBucket(ctx context.Context, req *capability.EnforceR
 
 // blastRadiusHandler is the built-in blastRadius condition handler. A condition declaring a
 // CUMULATIVE bound commits a weighted slice of a sliding-window budget on admit, so beyond
-// the plain Handle path it implements CommittingConditionHandler: the engine runs it after
-// every pure predicate and after the effect ceiling, so a magnitude is never charged to a
-// call a later check then refuses.
+// Handle it implements CommittingConditionHandler, running after every pure predicate and
+// after the effect ceiling so a magnitude is never charged to a call a later check then
+// refuses.
 //
-// PrepareCommit carries the PER-CALL bound as well as the bucket. That is not tidiness: the
-// per-call `max` is a pure check, and leaving it in Handle alone meant observe mode — which
-// skips the commit — skipped the bound too, so a constraint carrying `max` and `maxTotal`
-// together had its per-call bound evaluated or not depending on how many deferred conditions
-// happened to sit beside it.
-//
-// A per-call-only condition commits nothing and reports that by preparing a commit with no
-// bucket (DeferredCommit.Commits() == false); its bound has still been checked. Deferral is
-// keyed by condition TYPE, so both shapes arrive here and the distinction has to be
-// per-condition rather than per-type.
+// PrepareCommit carries the per-call bound too: leaving it in Handle alone meant observe mode
+// (which skips the commit) also skipped the per-call check for a constraint carrying both
+// bounds.
 type blastRadiusHandler struct{ e *Engine }
 
 // Handle implements ConditionHandler by routing through PrepareCommit and admitting the
@@ -315,9 +272,9 @@ func (h blastRadiusHandler) PrepareCommit(ctx context.Context, cond capability.C
 			"blastRadius condition is nil and cannot be evaluated", nil)
 	}
 	if br.Max == nil && !br.HasVelocity() {
-		// The loader requires at least one bound, and rejects a half-written cumulative
-		// pair; a programmatically built condition may carry neither, or half of one. A
-		// condition that bounds nothing must not read as "checked and fine".
+		// The loader requires at least one bound and rejects a half-written pair; a
+		// programmatically built condition may carry neither — must not read as "checked and
+		// fine".
 		return DeferredCommit{}, false, effectDenial(capability.ConditionTypeBlastRadius,
 			"blastRadius declares neither 'max' nor a complete 'maxTotal'/'windowSeconds' pair, so it bounds nothing", nil)
 	}
@@ -328,10 +285,9 @@ func (h blastRadiusHandler) PrepareCommit(ctx context.Context, cond capability.C
 			"effect contract was not resolved for this call; blast radius is unavailable", nil)
 	}
 
-	// The per-call bound first, and only then the cumulative one. A call over the per-call
-	// bound must be refused WITHOUT consuming any of the cumulative budget: charging a
-	// refused call's magnitude to the window would let a burst of oversized attempts exhaust
-	// the budget of the calls that were actually permitted.
+	// Per-call bound first, cumulative only after: a call over the per-call bound must be
+	// refused WITHOUT consuming the cumulative budget, or a burst of oversized attempts
+	// exhausts the window.
 	if br.Max != nil {
 		if condErr := checkPerCallBlastRadius(br, eff); condErr != nil {
 			return DeferredCommit{}, false, condErr
@@ -345,8 +301,8 @@ func (h blastRadiusHandler) PrepareCommit(ctx context.Context, cond capability.C
 }
 
 // unannotatedHint appends the remediation that differs between "declared, and it does not
-// pass" and "never declared, so it defaulted to the most consequential reading". Both
-// deny; only the fix differs, and an operator reading a denial needs to know which.
+// pass" and "never declared, so it defaulted to the most consequential reading". Both deny;
+// only the fix differs, and an operator reading a denial needs to know which.
 func unannotatedHint(eff *capability.ResolvedEffect) string {
 	if eff.Annotated {
 		return ""
@@ -354,8 +310,8 @@ func unannotatedHint(eff *capability.ResolvedEffect) string {
 	return " — this target declares no effect contract, so it resolves to the fail-closed default (irreversible, unquantified); annotate it to buy it out of maximum friction"
 }
 
-// effectDenial builds a CONDITION_FAILED for the effect layer. details is stamped onto
-// the denial so the tape carries the structured consequence inputs (class, magnitude,
+// effectDenial builds a CONDITION_FAILED for the effect layer. details is stamped onto the
+// denial so the tape carries the structured consequence inputs (class, magnitude,
 // compensating action) rather than only the prose.
 func effectDenial(condType, message string, details map[string]interface{}) *ConditionError {
 	return &ConditionError{
@@ -366,22 +322,18 @@ func effectDenial(condType, message string, details map[string]interface{}) *Con
 	}
 }
 
-// checkEffectCeiling applies the tool-agnostic consequence bound to an action the
-// conditions have ALREADY allowed. It returns nil when the call passes, and otherwise the
-// response that replaces the allow: an ESCALATION_REQUIRED escalate (the default) or a
-// plain deny, per the ceiling's onExceed.
+// checkEffectCeiling applies the tool-agnostic consequence bound to an action the conditions
+// have ALREADY allowed. Returns nil on pass, or the response that replaces the allow: an
+// ESCALATION_REQUIRED (default) or a plain deny, per the ceiling's onExceed.
 //
-// It runs last, on the allow tail, and it can only ever narrow — so it never admits
-// anything the allowlist or the conditions denied. Ordering against the state commit is
-// load-bearing: an over-ceiling call is NOT forwarded, so it must not leave a
-// sequenceBlock antecedent or a flow label behind, exactly as a hard-denied call must
+// Runs last, on the allow tail — it can only narrow, never admit what the allowlist denied —
+// and ordering against the state commit is load-bearing: an over-ceiling call is not
+// forwarded, so it must leave no antecedent or flow label behind, as a hard-denied call must
 // not (see evaluateMatched).
 //
-// The escalate outcome is a REFUSAL that says why, not a pending state: with no approval
-// integration in the in-path proxy, the fail-closed reading of "escalate" is "not
-// forwarded". What it buys over a plain deny is the record — decision=escalate plus the
-// consequence inputs — so an auditor or a control plane can tell an action awaiting a
-// human from one policy forbids outright.
+// Escalate is a REFUSAL, not a pending state: with no approval integration in-path, the
+// fail-closed reading of "escalate" is "not forwarded" — what it buys over a plain deny is the
+// decision=escalate record for an auditor or control plane.
 func (e *Engine) checkEffectCeiling(eff *capability.ResolvedEffect, matched *capability.Constraint, carriedLabels []string, requestID, now string) *capability.EnforceResponse {
 	exceeds, reasons := e.effectCeiling.Exceeds(eff)
 	if !exceeds {
@@ -389,13 +341,9 @@ func (e *Engine) checkEffectCeiling(eff *capability.ResolvedEffect, matched *cap
 	}
 	details := eff.AuditDetails()
 	details["ceiling_exceeded"] = reasons
-	// Stamp the session's accumulated flow labels INTO the escalation's structured
-	// details. The top-level carried_labels field is reserved for allow records (a deny
-	// carries none), but an escalation is the one refusal a human is expected to read and
-	// act on, and "which provenance produced this" is the first thing they need: it is
-	// what ties the who-may-know axis to the what-may-break one on a single record. Empty
-	// for a non-flow policy, where the key is simply absent.
 	if len(carriedLabels) > 0 {
+		// Stamped into the escalation's details (not the allow-only top-level carried_labels
+		// field) since an escalation is the one refusal a human is expected to act on.
 		details["carried_labels"] = carriedLabels
 	}
 	if e.effectCeiling.MaxEffectClass != "" {
@@ -408,13 +356,10 @@ func (e *Engine) checkEffectCeiling(eff *capability.ResolvedEffect, matched *cap
 	message := fmt.Sprintf("this action exceeds the policy's effect ceiling (%s): %s%s",
 		strings.Join(reasons, ", "), eff.String(), unannotatedHint(eff))
 
-	// Both arms go through the shared constructors rather than building an
-	// EnforceResponse literal. Those constructors are where BoundDenialDetails runs, and
-	// details here carries caller-controlled bytes: blast_radius is rendered from a tool
-	// ARGUMENT, and compensating_action / effect_contract come from the manifest. A
-	// hand-built literal skipped the bound entirely, so the one refusal shape a human is
-	// expected to read was also the one that could carry an unbounded value onto the
-	// signed tape.
+	// Both arms route through the shared constructors rather than a literal, since that's
+	// where BoundDenialDetails runs — details here carries a caller-controlled blast_radius
+	// argument, and a hand-built literal skipped the bound on the one refusal shape a human is
+	// meant to read.
 	if e.effectCeiling.Outcome() == capability.OnExceedDeny {
 		resp := denyResponse(requestID, now, matched.IsAuditOnly(), nil, capability.DenialInfo{
 			Code:          capability.ErrCodeConditionFailed,
@@ -429,79 +374,54 @@ func (e *Engine) checkEffectCeiling(eff *capability.ResolvedEffect, matched *cap
 		ConditionType: ceilingConditionType,
 		Message:       message,
 		Details:       details,
-		// Hard: same reason AuditOnly stays false (see escalateResponse) — a route-wide
-		// --audit must not turn "needs human approval" into "performed anyway, logged".
+		// Hard, same reason AuditOnly stays false: --audit must not turn "needs human
+		// approval" into "performed anyway, logged".
 		HardDeny: true,
 	})
 	return &resp
 }
 
 // CeilingVerdictFor answers ONE question — "does this action exceed the policy's effect
-// ceiling?" — for a constraint that has already been selected, WITHOUT evaluating a single
-// condition and WITHOUT committing any state. It returns the refusal the ceiling would
-// produce (an ESCALATION_REQUIRED escalate, or a plain deny per onExceed), or nil when the
-// policy sets no ceiling, no constraint was selected, or the action is within it.
+// ceiling?" — for an already-selected constraint, WITHOUT evaluating conditions or committing
+// state. Returns the refusal the ceiling would produce, or nil.
 //
-// It exists for the COMPOSED case. A PDP wrapping this engine's PDP — the JWT layer — can
-// refuse a call on its own terms and short-circuit above the inner PDP, so evaluateMatched
-// never runs and the ceiling never evaluates. The call is still refused, but the KIND of
-// refusal is wrong in two ways that matter: the escalation never happens, so an action
-// that should have entered the approval queue silently does not and the escalation counts
-// under-report; and the composed refusal is a soft deny, which a route running --audit
-// downgrades to a FORWARD — so adding a JWT would forward a call the same manifest refuses
-// outright, inverting the rule that a token may only ever restrict.
+// Exists for the COMPOSED case: a wrapping PDP (the JWT layer) can refuse before
+// evaluateMatched ever runs, which both under-counts escalations and produces a soft refusal
+// that --audit would downgrade to a forward — inverting the rule that a token may only
+// restrict.
 //
-// Non-committing is the whole design constraint, and it is why this answers the ceiling
-// question ALONE rather than replaying the full decision. Reaching the ceiling the normal
-// way means running the matched constraint's conditions, and some of those COMMIT: maxCalls
-// consumes a window slot, labelOutput writes a flow label, sequenceBlock writes an
-// antecedent. Running them for a call that is already refused and will never be forwarded
-// would leave exactly the phantom state evaluateMatched's ordering exists to prevent — the
-// reason checkEffectCeiling runs before the state commit in the first place. Trading a
-// wrong denial code for corrupted session state is not a fix. The ceiling's inputs are the
-// resolved effect of the matched constraint's contract and nothing else, so this cannot
-// disagree with the full path about whether the action is over the ceiling.
+// Non-committing because some of the matched constraint's conditions COMMIT (maxCalls
+// consumes a window, labelOutput writes a label, sequenceBlock writes an antecedent);
+// replaying them for a call already refused would leave exactly the phantom state
+// evaluateMatched's ordering exists to prevent.
 //
-// What it deliberately does NOT reproduce: when a condition would have denied FIRST, the
-// full path returns that condition's verdict and never reaches the ceiling, while this
-// reports the ceiling. The caller composes a refusal for a call that is being refused
-// either way, so the difference is a harder refusal rather than a wrong one — and the
-// ceiling statement it carries is true regardless of which check the full path would have
-// stopped at. The caller must therefore only ever use this to HARDEN a refusal, never to
-// produce an allow, and never on a path that would otherwise forward.
+// Does NOT reproduce a condition denial that would have fired first — the caller composes a
+// harder refusal for a call refused either way, never an allow.
 //
-// The DELEGATED maxEffectClass deliberately does not compose here, though it bounds the same
-// axis. This function may only ever HARDEN a refusal, and a delegation refusal is an
-// authorization verdict that is downgradable by design — so the full path forwards it under
-// --audit too, and there is no inversion for the composed path to close. The ceiling composes
-// because its own refusal is HARD, which is exactly the property a JWT short-circuit would
-// otherwise erase.
+// The delegated maxEffectClass deliberately does not compose here: it bounds the same axis
+// but a delegation refusal is downgradable by design, so there's no inversion for this to
+// close. The ceiling composes because its own refusal is HARD.
 //
-// The flow-label peek is the one backend read here, and it is a pure Get, taken only for a
-// flow-relevant constraint. Its failure is swallowed rather than converted into a deny:
-// this is asked about a call that is ALREADY refused, so a label-store fault must not be
-// able to weaken (or replace) the refusal being hardened.
+// The flow-label peek is a pure Get, taken only for a flow-relevant constraint, and its
+// failure is swallowed — this runs on an already-refused call, so a store fault must not
+// weaken it.
 func (e *Engine) CeilingVerdictFor(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint) *capability.EnforceResponse {
-	// A nil engine sets no ceiling, so there is nothing to compose — and this runs on a
-	// refusal path, where a panic would replace an answered denial with a dropped connection.
-	// A ManifestPDP may legitimately hold none (see engineClock).
+	// A nil engine sets no ceiling; this runs on a refusal path, where a panic would replace
+	// an answered denial with a dropped connection. A ManifestPDP may legitimately hold none.
 	if e == nil || req == nil || matched == nil || !e.effectCeiling.IsSet() {
 		return nil
 	}
 	requestID := NewRequestID()
 	now := e.clock.Now().UTC().Format(time.RFC3339Nano)
 
-	// One ResolveEffect of the matched constraint's contract against this call's
-	// arguments — the same single resolution evaluateMatched threads to the two effect
-	// conditions and the ceiling, so the composed verdict and a full-path verdict cannot
-	// disagree about what the call's effect was.
+	// Same single resolution evaluateMatched threads to the two effect conditions and the
+	// ceiling, so this can't disagree with a full-path verdict.
 	effect := capability.ResolveEffect(matched.Effect, req.Arguments)
 
 	var carriedLabels []string
 	if !e.skipFlow && constraintHasFlow(matched) {
-		// A pure read. "Which provenance produced this" is the first thing a human in the
-		// approval queue needs, and it is one of the consequence inputs the short-circuit
-		// was dropping, so it is worth the round trip on a constraint that has flow at all.
+		// A pure read: "which provenance produced this" is one of the consequence inputs the
+		// short-circuit was dropping.
 		if labels, err := e.peekSessionLabels(ctx, req); err == nil {
 			carriedLabels = labels
 		}
@@ -511,18 +431,15 @@ func (e *Engine) CeilingVerdictFor(ctx context.Context, req *capability.EnforceR
 	if resp == nil {
 		return nil
 	}
-	// Stamp the snapshot onto the response as evaluateMatched's defer does for every
-	// non-allow exit, so a composed escalation carries the same top-level field a
-	// full-path one does.
 	if resp.CarriedLabels == nil {
+		// Mirrors evaluateMatched's defer, so a composed escalation carries the same
+		// top-level field a full-path one does.
 		resp.CarriedLabels = carriedLabels
 	}
 	return resp
 }
 
-// ceilingConditionType is the conditionType stamped on a ceiling verdict. The ceiling is
-// not a condition an author attaches to a target, so it has no condition discriminator of
-// its own; naming it explicitly keeps the audit taxonomy honest about which check fired
-// rather than borrowing effectClass, which an operator could then not distinguish from a
+// ceilingConditionType is the conditionType stamped on a ceiling verdict — its own taxonomy
+// slot rather than borrowing effectClass, which an operator couldn't then distinguish from a
 // per-target class gate.
 const ceilingConditionType = "effectCeiling"

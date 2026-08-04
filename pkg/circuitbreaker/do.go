@@ -32,23 +32,18 @@ func Do[T any](ctx context.Context, b *Breaker, fn func(ctx context.Context) (T,
 		return zero, ErrOpen
 	}
 
-	// Report exactly one outcome through the generation-bound probe so that, with
-	// overlapping probes (HalfOpenMaxProbes > 1), a slow probe finishing after a
-	// reopen is dropped rather than counted toward closing the new window. A
-	// closed-state admission reserves no slot, so a stale-generation drop of its
-	// outcome is harmless either way.
+	// Report exactly one outcome through the generation-bound probe so an overlapping
+	// slow probe finishing after a reopen is dropped rather than counted toward the new
+	// window.
 	//
 	// If fn panics, record a failure before the panic unwinds so a half-open breaker
-	// re-opens instead of staying wedged with a spent-but-unreported probe (which would
-	// reject all traffic indefinitely — at the default HalfOpenMaxProbes of 1 just as
-	// much as above it, since one unreported probe fills a one-probe window). The panic
+	// re-opens instead of staying wedged with a spent-but-unreported probe. The panic
 	// is not recovered.
 	completed := false
 	defer func() {
 		if !completed {
 			// fn panicked. Unlike a clean client cancellation (neutral, below), a panic
-			// is a defect, so record it as a failure: this reports the mandatory single
-			// outcome and re-opens a half-open breaker. The panic propagates unchanged.
+			// is a defect: record it as a failure so the panic propagates unchanged.
 			pr.failure()
 		}
 	}()
@@ -57,12 +52,9 @@ func Do[T any](ctx context.Context, b *Breaker, fn func(ctx context.Context) (T,
 	completed = true
 	if err != nil {
 		if clientCanceled(ctx, err) {
-			// A client-initiated cancellation is not evidence the upstream is
-			// unhealthy, so recording it as a failure would let a burst of cancels trip
-			// the breaker on a healthy upstream. Report the neutral drop instead: it
-			// reports exactly one outcome and frees the slot, but counts as neither
-			// success nor failure. (context.DeadlineExceeded is left as a failure on
-			// purpose — a persistently slow upstream must still trip the breaker.)
+			// A client-initiated cancellation is not evidence the upstream is unhealthy,
+			// so a burst of cancels must not trip the breaker; drop it neutrally instead.
+			// (DeadlineExceeded stays a failure — a persistently slow upstream must trip it.)
 			pr.drop()
 			return zero, err
 		}
@@ -74,12 +66,9 @@ func Do[T any](ctx context.Context, b *Breaker, fn func(ctx context.Context) (T,
 	return result, nil
 }
 
-// clientCanceled reports whether err is a client-initiated cancellation that must
-// not count as an upstream failure. It requires both that err wraps context.Canceled
-// AND that the caller's own ctx was canceled: an upstream returning context.Canceled
-// from its own context while the caller's ctx is still live is an upstream failure
-// and must count. context.DeadlineExceeded does not qualify — it is the request
-// timeout, an upstream-health signal that must trip the breaker.
+// clientCanceled reports whether err is a client-initiated cancellation, requiring both
+// that err wraps context.Canceled AND the caller's own ctx was canceled — an upstream
+// returning Canceled from its own context while ctx is still live is a real failure.
 func clientCanceled(ctx context.Context, err error) bool {
 	return errors.Is(err, context.Canceled) && errors.Is(ctx.Err(), context.Canceled)
 }

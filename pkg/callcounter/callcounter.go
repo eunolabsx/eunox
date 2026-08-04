@@ -12,18 +12,11 @@ import (
 	"github.com/eunolabs/eunox/pkg/capability"
 )
 
-// checkDistinctBuckets reports an error if any (Key, WindowSec) pair repeats in an
-// AdmitAll batch. Two buckets sharing a (Key, WindowSec) resolve to one physical storage
-// key; committing both would either silently drop one (InMemory's map overwrite — a
-// fail-open under-count) or double-count into one set (Redis), so the two backends would
-// diverge. The in-product caller never produces a colliding batch (the manifest loader
-// rejects two quota conditions on one constraint sharing a bucket), so this is a shared
-// fail-closed guard for a direct pkg/callcounter consumer passing the unsupported input.
+// checkDistinctBuckets rejects a batch with a repeated (Key, WindowSec) pair: two buckets
+// sharing one physical storage key would silently drop one or double-count instead.
 func checkDistinctBuckets(buckets []capability.QuotaBucket) error {
-	// Key on storageKey(Key, WindowSec) — the exact physical key the InMemory backend
-	// commits each bucket under, and injective over the pair (the window is a trailing
-	// ":<decimal>" with no embedded colon). So a storageKey collision is precisely a
-	// duplicate bucket, with no over- or under-rejection.
+	// storageKey is injective over (Key, WindowSec), so a collision here is exactly a
+	// duplicate bucket.
 	seen := make(map[string]struct{}, len(buckets))
 	for i := range buckets {
 		sk := storageKey(buckets[i].Key, buckets[i].WindowSec)
@@ -35,10 +28,9 @@ func checkDistinctBuckets(buckets []capability.QuotaBucket) error {
 	return nil
 }
 
-// checkBuckets validates an AdmitAll batch before either backend touches storage, so a
-// malformed batch fails closed identically on both. It rejects an empty batch, any
-// out-of-range window, weight or limit, and a duplicate bucket. It is the single source of
-// the batch preamble the InMemory and Redis AdmitAll share, so the two cannot drift.
+// checkBuckets validates an AdmitAll batch before either backend touches storage — the
+// single source of the batch preamble InMemory and Redis AdmitAll share, so both fail
+// closed identically.
 func checkBuckets(buckets []capability.QuotaBucket) error {
 	if len(buckets) == 0 {
 		return fmt.Errorf("callcounter: AdmitAll requires at least one bucket")
@@ -53,9 +45,8 @@ func checkBuckets(buckets []capability.QuotaBucket) error {
 			return e
 		}
 		if buckets[i].Counted {
-			// A counted bucket contributes exactly one entry, so its weight is not read —
-			// but its LIMIT is a number of CALLS, which checkTotalLimit alone does not
-			// establish: that check bounds the range (0, MaxWeightedTotal], nothing more.
+			// A counted bucket's LIMIT is a number of CALLS — checkTotalLimit alone only
+			// bounds the range, not integrality.
 			if e := checkCountedLimit(buckets[i].Limit); e != nil {
 				return e
 			}
@@ -68,67 +59,28 @@ func checkBuckets(buckets []capability.QuotaBucket) error {
 	return checkDistinctBuckets(buckets)
 }
 
-// cleanupMarginFactor is the multiple of a window after which a counter's state
-// can be safely reclaimed: InMemory.Cleanup drops an entry once its newest
-// timestamp is older than windowSec*cleanupMarginFactor, and Redis sets the key
-// TTL to the same. MaxWindowSeconds divides by this same factor, so widening the
-// margin re-derives the overflow bound in lockstep rather than leaving it stale.
+// cleanupMarginFactor is the reclaim margin (in window multiples) both InMemory.Cleanup
+// and Redis's key TTL use; MaxWindowSeconds divides by it to stay in lockstep.
 const cleanupMarginFactor = 2
 
-// MaxWindowSeconds is the largest windowSec any backend accepts. Both compute a
-// cleanup/TTL margin of windowSec*cleanupMarginFactor*time.Second; since
-// time.Duration is int64 nanoseconds, a larger windowSec overflows that product,
-// wraps to a tiny/negative duration, and lands the cutoff (or TTL) at/after "now"
-// — every call reads as the first in its window and the quota fails open.
-// ~4.6e9 seconds (~146 years) is beyond any real window, so rejecting more costs
-// nothing.
-//
-// The min with math.MaxInt keeps the constant representable as the int windowSec
-// is passed as: on 64-bit the overflow bound binds; on 32-bit math.MaxInt binds
-// and is the true max (a 32-bit windowSec can't exceed it, and the margin still
-// can't overflow). Without it, int(MaxWindowSeconds) would truncate on 32-bit.
+// MaxWindowSeconds is the largest windowSec accepted: beyond it, windowSec*cleanupMarginFactor
+// overflows time.Duration and wraps the quota's cutoff open. math.MaxInt bounds it on 32-bit.
 const MaxWindowSeconds = min(
 	math.MaxInt64/(cleanupMarginFactor*int64(time.Second)),
 	math.MaxInt,
 )
 
-// MaxEntries is the largest retention cap any backend accepts. The Redis trim
-// widens to int64 (-(int64(maxEntries)+1)) and is what actually prevents overflow;
-// this cap exists so checkMaxEntries does not accept math.MaxInt, where the older
-// int-width -(maxEntries+1) wrapped through math.MinInt and turned the trim into a
-// no-op. math.MaxInt32 (~2.1e9) dwarfs any real cap (sequenceBlock uses 1,
-// maxCalls the quota).
+// MaxEntries is the largest retention cap accepted: above it, the Redis trim's
+// -(maxEntries+1) can wrap through int overflow and silently become a no-op.
 const MaxEntries = math.MaxInt32
 
-// MaxWeightedEntriesPerKey bounds the live entries ONE (key, window) may hold under
-// WEIGHTED accounting, in both backends.
-//
-// A counted bucket needs no such bound: it is refused once its in-window count reaches
-// its limit, so its limit IS its retention. A weighted bucket's total is the SUM of its
-// entries' magnitudes, and a magnitude is caller-controlled whenever the contract
-// resolves it from a tool argument — so a session sending many calls of weight ~1e-9
-// under a maxTotal of 1000 is admitted, and recorded, indefinitely. Each later
-// admission re-sums the whole set: O(n) under the in-memory backend's global lock
-// (stalling every quota check proxy-wide) and O(n) inside the Redis backend's blocking
-// Lua script (stalling every replica). Nothing is bypassed — the sum stays exact — but
-// the work per call grows without bound, driven by call arguments.
-//
-// At the ceiling the commit is REFUSED with a structured error, the same trade
-// WithMaxKeys makes: availability for that one (key, window) while it is full, never a
-// bypass, and entries age out of the window on their own. The alternative — silently
-// declining to RECORD a call past the ceiling — is a fail-open: N unrecorded
-// near-threshold magnitudes sum to real unmetered spend.
-//
-// 100k is far above any real policy. A bucket bounded at $2,000/hour holds one entry
-// per call; reaching the ceiling takes 100k calls of that tool within one window, which
-// is the abusive shape this bounds and not a working deployment.
+// MaxWeightedEntriesPerKey bounds live entries per weighted (key, window) in both
+// backends: unlike a counted bucket (whose limit IS its retention), a caller-controlled
+// magnitude could otherwise grow one key — and its O(n) re-sum cost — without bound.
 const MaxWeightedEntriesPerKey = 100_000
 
-// checkWindowSec is the single guardrail both call-counter backends call before any
-// duration arithmetic. It rejects a non-positive window (no meaningful span) and
-// one above MaxWindowSeconds (which overflows time.Duration), so an out-of-range
-// value fails closed at the backend — the engine surfaces the error and denies —
-// rather than overflowing into a fail-open counter reset.
+// checkWindowSec rejects a non-positive or over-MaxWindowSeconds window before duration
+// arithmetic runs, so an out-of-range value fails closed rather than overflowing the counter.
 func checkWindowSec(windowSec int) error {
 	if windowSec < 1 {
 		return fmt.Errorf("callcounter: windowSec must be >= 1, got %d", windowSec)
@@ -139,12 +91,8 @@ func checkWindowSec(windowSec int) error {
 	return nil
 }
 
-// checkMaxEntries guards the IncrementAndGet retention cap. A non-positive cap is
-// rejected (fail closed) rather than treated as "unbounded" — an unbounded
-// in-window slice is the heap-growth sink, and no real caller needs one
-// (sequenceBlock needs maxEntries=1; maxCalls goes through AdmitAll, whose retention
-// is bounded by the quota itself). A 0-means-unlimited escape hatch could silently
-// re-open that sink.
+// checkMaxEntries rejects a non-positive cap rather than treating it as "unbounded":
+// an unbounded in-window slice is a heap-growth sink no real caller needs.
 func checkMaxEntries(maxEntries int) error {
 	if maxEntries < 1 {
 		return fmt.Errorf("callcounter: maxEntries must be >= 1, got %d", maxEntries)
@@ -155,23 +103,12 @@ func checkMaxEntries(maxEntries int) error {
 	return nil
 }
 
-// MaxWeightedTotal re-exports the contract's bound so a backend guard reads it beside the
-// other backend limits. It lives in pkg/capability because the CallCounter contract that
-// documents it does, and because the ENGINE has to apply the same bound to a resolved
-// magnitude before handing it to a backend — and the engine must not import a backend
-// package to learn what its own contract promises.
+// MaxWeightedTotal re-exports the contract's bound from pkg/capability, so the engine can
+// apply it without importing a backend package.
 const MaxWeightedTotal = capability.MaxWeightedTotal
 
-// checkWeight guards one call's contribution to a weighted total. A NaN or infinite
-// weight is rejected rather than added: NaN poisons every later comparison into false
-// (which admits forever — the fail-OPEN direction), and an infinity saturates the total so
-// nothing is ever admitted again. A negative weight is rejected because a magnitude is
-// non-negative by construction and a negative one would let a caller REFUND its own
-// consumed quota, which is the bypass a cumulative bound exists to close. A weight above
-// MaxWeightedTotal cannot be summed exactly and is refused rather than rounded.
-//
-// Zero IS admitted: a genuinely zero-magnitude action consumes no budget, and the
-// alternative — refusing it — would deny a call the policy considers weightless.
+// checkWeight rejects NaN/Inf (poisons comparisons fail-open), negative (would let a
+// caller refund its own quota), and over-MaxWeightedTotal weights; zero is admitted.
 func checkWeight(weight float64) error {
 	if math.IsNaN(weight) || math.IsInf(weight, 0) {
 		return fmt.Errorf("callcounter: weight must be a finite number, got %v", weight)
@@ -185,25 +122,9 @@ func checkWeight(weight float64) error {
 	return nil
 }
 
-// checkCountedLimit guards a COUNTED bucket's threshold, on top of checkTotalLimit's range
-// bound. A counted bucket's limit is a number of calls, so it must be a whole number and at
-// least 1, and neither follows from being a positive float64.
-//
-// Both halves are load-bearing, and neither is theoretical:
-//
-//   - A limit below 1 can never admit, but that denial is a MISCONFIGURATION rather than an
-//     exhausted quota and the two must stay distinguishable. Without this, a bound of 0.5
-//     denies every call forever with a nil error, which a caller reads (and audits) as
-//     "rate limit exceeded" — the silent-deny-all this package refuses everywhere else.
-//   - A FRACTIONAL limit additionally makes the two backends disagree, which is the one
-//     thing checkBuckets exists to prevent: the in-memory backend compares against it
-//     directly and returns an ordinary denial, while the Redis script derives its
-//     retry-after pivot as `total - limit` and hands that fractional index to ZRANGE, which
-//     errors the whole admission. Same input, one backend denying and the other faulting.
-//
-// The manifest loader already rejects maxCalls.count < 1 and carries it as an int, so this
-// guards direct library use and custom backends — the same reach the retired single-bucket
-// admission's own limit guard had.
+// checkCountedLimit rejects a counted bucket's limit below 1 (a misconfiguration, distinct
+// from an exhausted quota) or fractional (which would deny on InMemory but fault Redis's
+// ZRANGE retry-after pivot, `total - limit`).
 func checkCountedLimit(limit float64) error {
 	if limit < 1 {
 		return fmt.Errorf("callcounter: counted bucket limit must be >= 1, got %v", limit)
@@ -214,11 +135,8 @@ func checkCountedLimit(limit float64) error {
 	return nil
 }
 
-// checkTotalLimit guards a QuotaBucket's admission threshold, counted and weighted alike.
-// A non-positive limit can never admit anything with a positive weight, but that is a
-// misconfiguration rather than an exhausted budget and the two must stay distinguishable:
-// a structured error lets the caller surface and audit it instead of reading it as
-// "cumulative bound reached".
+// checkTotalLimit rejects a non-positive, NaN/Inf, or over-MaxWeightedTotal limit as a
+// structured misconfiguration error, distinct from an exhausted-budget denial.
 func checkTotalLimit(limit float64) error {
 	if math.IsNaN(limit) || math.IsInf(limit, 0) {
 		return fmt.Errorf("callcounter: total limit must be a finite number, got %v", limit)

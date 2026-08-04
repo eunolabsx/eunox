@@ -59,7 +59,7 @@ func IsEscapedArgumentLiteral(ref string) bool {
 // ref unchanged — the existing "a.b" literal behavior.
 func ArgumentLiteralKey(ref string) string {
 	if IsEscapedArgumentLiteral(ref) {
-		return ref[1:] // drop exactly one leading '$'
+		return ref[1:]
 	}
 	return ref
 }

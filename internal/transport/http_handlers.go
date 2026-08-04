@@ -2,9 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // The upstream-timeout and denial helpers shared by the enforcement path, plus the
-// server-initiated request leg. The per-method handlers themselves (tools/call,
-// resources/*, prompts/*) live in dispatch.go, with the method->handler mapping both
-// transports share.
+// server-initiated request leg. Per-method handlers live in dispatch.go.
 
 package transport
 
@@ -20,17 +18,13 @@ import (
 	"github.com/eunolabs/eunox/pkg/capability"
 )
 
-// sessionStartTimeout bounds session-establishment work (the upstream initialize
-// handshake and the startup drift tools/list probe). It is deliberately
-// independent of --upstream-timeout so a tight per-request value cannot fail
-// startup when the manifest pins descriptionHash (a probe failure is fatal then)
-// even though the upstream answers within the start budget. Shared by the HTTP
-// session-start path and the stdio remote-HTTP drift probe so the two agree.
+// sessionStartTimeout bounds session-establishment work (initialize handshake + drift probe),
+// deliberately independent of --upstream-timeout so a tight per-request value cannot fail
+// startup when the manifest pins descriptionHash. Shared by HTTP and stdio so the two agree.
 const sessionStartTimeout = 20 * time.Second
 
-// noUpstreamTimeoutCtxKey marks a context that must NOT be bounded by
-// --upstream-timeout. Session-start work carries it so that knob cannot gate
-// session establishment; that work is bounded by sessionStartTimeout instead.
+// noUpstreamTimeoutCtxKey marks a context that must NOT be bounded by --upstream-timeout.
+// Session-start work carries it, bounded by sessionStartTimeout instead.
 type noUpstreamTimeoutCtxKey struct{}
 
 // withoutUpstreamTimeout marks ctx so boundUpstreamCall leaves it unbounded by
@@ -39,12 +33,9 @@ func withoutUpstreamTimeout(ctx context.Context) context.Context {
 	return context.WithValue(ctx, noUpstreamTimeoutCtxKey{}, struct{}{})
 }
 
-// boundUpstreamCall returns a child context limited by --upstream-timeout (timeMs)
-// when configured, and a no-op cancel when the timeout is unset or ctx is marked
-// withoutUpstreamTimeout. Both transports' withUpstreamTimeout delegate here so
-// the timeout and its opt-out mean the same on each. Applied once per upstream
-// round-trip, so handler forwards and notification forwarding are bounded without
-// each call site wrapping.
+// boundUpstreamCall returns a child context limited by --upstream-timeout (timeMs) when
+// configured, and a no-op cancel when unset or ctx is marked withoutUpstreamTimeout. Both
+// transports delegate here so the timeout and its opt-out mean the same on each.
 func boundUpstreamCall(ctx context.Context, timeMs int) (context.Context, context.CancelFunc) {
 	if timeMs <= 0 || ctx.Value(noUpstreamTimeoutCtxKey{}) != nil {
 		return ctx, func() {}
@@ -69,13 +60,10 @@ const (
 	codeInvalidRequest = "INVALID_REQUEST"
 )
 
-// Non-policy refusal codes for requests denied BEFORE (or independent of) a PDP
-// decision: a failed transport-auth credential, a saturated handler pool, or a
-// startup drift refusal. They are recorded so an off-host bearer/control-token
-// brute-force, a pool-saturation flood, or a tool-poisoning drift refusal leaves a
-// trace on the tamper-evident tape rather than only a silent 401 (auth), 500 (HTTP
-// drift), or JSON-RPC server-busy reply (saturation). All are non-policy (no target to
-// mine), so IsInfraDenialCode returns true for each and the suggest subcommand skips them.
+// Non-policy refusal codes for requests denied BEFORE (or independent of) a PDP decision, so
+// a brute-force/saturation/drift-refusal probe leaves a trace on the tape rather than only a
+// silent 401/500/server-busy reply. All non-policy (no target to mine), so IsInfraDenialCode
+// returns true and suggest skips them.
 const (
 	// codeAuthFailed marks a missing/invalid static Authorization bearer token
 	// (--listen-auth-token). The presented credential is NEVER recorded.
@@ -83,128 +71,86 @@ const (
 	// codeControlAuthFailed marks a missing/invalid X-Eunox-Control-Token on the
 	// loopback emergency-stop endpoint (SEC-07). The presented token is NEVER recorded.
 	codeControlAuthFailed = "CONTROL_AUTH_FAILED"
-	// codeResourceExhausted marks a host request refused because the concurrent-handler
-	// pool was saturated (server-busy), so a DoS-probe flood is visible on the tape.
+	// codeResourceExhausted marks a host request refused because the concurrent-handler pool
+	// was saturated, so a DoS-probe flood is visible on the tape.
 	codeResourceExhausted = "RESOURCE_EXHAUSTED"
-	// codeDriftRefused marks a session refused at startup because the manifest-drift
-	// check failed (FM-5 descriptionHash rug-pull / strict-drift refusal) — the security
-	// event this feature exists to catch, otherwise invisible to the audit trail.
+	// codeDriftRefused marks a session refused at startup because the manifest-drift check
+	// failed (descriptionHash rug-pull / strict-drift refusal).
 	codeDriftRefused = "DRIFT_REFUSED"
 	// codeLoopbackRejected marks a request refused by the loopback-only gate fronting
-	// /control/kill, /healthz and /metrics: an off-host source, a DNS-rebinding Host, or
-	// an X-Forwarded-For arriving under --trust-forwarded-for. That gate runs BEFORE
-	// checkControlToken, so without its own code an off-host probe of the emergency stop
-	// left no trace while the same-host wrong-token caller was fully recorded.
+	// /control/kill, /healthz and /metrics. Runs BEFORE checkControlToken, so without its
+	// own code an off-host probe of the emergency stop left no trace.
 	codeLoopbackRejected = "LOOPBACK_REJECTED"
-	// codeUnsupportedMediaType marks a POST body refused because its Content-Type was
-	// absent, duplicated, or not application/json (requireJSONContentType). Recorded for
-	// the same reason as its siblings: a content-type sweep probing the sessionless
-	// initialize POST or the emergency stop is attack signal, and it was the one
-	// transport refusal that left no trace.
+	// codeUnsupportedMediaType marks a POST body refused because its Content-Type was absent,
+	// duplicated, or not application/json — a content-type sweep is attack signal.
 	codeUnsupportedMediaType = "UNSUPPORTED_MEDIA_TYPE"
 )
 
-// MethodControlKill is the audit `method` stamped on the record for a successful
-// /control/kill activation. It is deliberately NOT an MCP method: the kill endpoint is
-// eunox's own administrative surface, so deriveTargetFields finds no target type for it
-// and leaves target_type/target empty rather than fabricating one. Exported so a SIEM
-// rule and the audit reader agree on the one spelling.
+// MethodControlKill is the audit `method` stamped on a successful /control/kill activation.
+// Deliberately NOT an MCP method, so deriveTargetFields fabricates no target type.
 const MethodControlKill = "control/kill"
 
-// JSON-RPC 2.0 error codes this package returns to the host. Named constants rather
-// than bare literals at each site: the numbers are indistinguishable from each other at
-// a glance, and a transposed digit produces a valid-looking but wrong error class that
-// no test would catch.
+// JSON-RPC 2.0 error codes this package returns to the host. Named constants rather than
+// bare literals: a transposed digit would otherwise produce a valid-looking wrong error class.
 const (
 	jsonRPCCodeInvalidRequest = -32600
 	jsonRPCCodeInvalidParams  = -32602
 	jsonRPCCodeInternalError  = -32603
 )
 
-// IsInfraDenialCode reports whether code marks an infrastructure failure rather
-// than a policy decision. Consumers that mine the audit tape for policy signals
-// (the suggest subcommand) skip these records.
+// IsInfraDenialCode reports whether code marks an infrastructure failure rather than a
+// policy decision. Consumers mining the audit tape for policy signals skip these.
 func IsInfraDenialCode(code string) bool {
 	switch code {
 	case codeUpstreamError, codeUpstreamTimeout, codeRequestCanceled, codeInvalidRequest:
-		// codeInvalidRequest is a host protocol fault — a duplicate in-flight JSON-RPC id,
-		// or a malformed / empty-target enforced request (dispatchParams.malformedDeny) —
-		// not a policy decision, so suggest must skip it: mining it would fabricate a
-		// phantom target named after the MCP method (e.g. "tool:tools/call"). It is
-		// deliberately NOT keyed on capability.ErrCodeInvalidParams, which the manifest's
-		// argumentSchema check ALSO emits (pdp.go) as a real policy denial against a real
-		// target that suggest must keep seeing.
+		// codeInvalidRequest is a host protocol fault, not a policy decision — mining it
+		// would fabricate a phantom target like "tool:tools/call". Deliberately NOT keyed on
+		// capability.ErrCodeInvalidParams, which is a real policy denial suggest must keep seeing.
 		return true
 	case capability.ErrCodeKillSwitch, capability.ErrCodeKillSwitchError, capability.ErrCodeAuditUnavailable:
-		// Operator/infra denials, not policy decisions: KILL_SWITCH[_ERROR] is an operator
-		// emergency stop (pdp.IsKillSwitchDenial classifies the same two codes as
-		// hard-blocking non-policy denials), and AUDIT_UNAVAILABLE is the --require-audit=
-		// strict gate tripping after an audit-queue overflow. Mining any of these would let
-		// suggest fabricate a deny-only allowlist suggestion for a target that policy never
-		// actually denied.
+		// Operator/infra denials, not policy decisions: an emergency stop or the strict-audit
+		// gate tripping. Mining these would fabricate a deny-only suggestion for a target
+		// policy never actually denied.
 		return true
 	case codeAuthFailed, codeControlAuthFailed, codeResourceExhausted, codeDriftRefused, codeLoopbackRejected, codeUnsupportedMediaType:
-		// Non-policy refusals recorded before/independent of a PDP decision: a failed
-		// transport-auth credential, a saturated handler pool, a startup drift refusal, or
-		// a loopback/rebinding gate rejection. None names a policy target, so mining them
-		// would fabricate a phantom-target suggestion; suggest must skip them like the
-		// other infra denials.
+		// Non-policy refusals recorded before/independent of a PDP decision. None names a
+		// policy target, so mining them would fabricate a phantom-target suggestion.
 		return true
 	}
 	return false
 }
 
-// upstreamErrInfo maps a callUpstream error to an audit code, a HOST-SAFE reason
-// string, and the JSON-RPC error code to return, so both transports emit the same
-// classification per failure class: UPSTREAM_TIMEOUT (deadline expired),
-// REQUEST_CANCELED (host abandoned first), INVALID_REQUEST (a host protocol fault
-// such as a duplicate in-flight id — the upstream was never called), UPSTREAM_ERROR
-// (everything else).
+// upstreamErrInfo maps a callUpstream error to an audit code, a HOST-SAFE reason string, and
+// the JSON-RPC error code to return, so both transports classify failures identically.
 //
-// The reason never embeds the underlying error text: for a remote HTTP upstream
-// that text can carry the upstream's internal hostname/path or response body, and
-// the host should only ever see the failure class.
-//
-// The generic (UPSTREAM_ERROR) branch logs the full error to operator stderr so
-// operators keep the diagnosability the host is denied. Only that branch logs: the
-// timeout/canceled/invalid-request reasons carry no upstream text and are already in
-// the audit trail, so re-logging them would spam stderr under a sustained outage.
+// The reason never embeds the underlying error text (which can carry a remote upstream's
+// internal hostname/path), so the host only ever sees the failure class. Only the generic
+// UPSTREAM_ERROR branch logs the full error to stderr — the others are already on the tape,
+// so re-logging them would spam stderr under a sustained outage.
 func upstreamErrInfo(err error, upstreamTimeMs int) (code, reason string, rpcCode int) {
 	switch {
 	case errors.Is(err, errDuplicateID):
-		// A host pipelined a request reusing an in-flight JSON-RPC id: a client fault,
-		// not an upstream failure. Report invalid-request so the host is not told the
-		// upstream errored (and so the record is not mined as an upstream outage).
+		// A host pipelined a request reusing an in-flight JSON-RPC id: a client fault, not an
+		// upstream failure — the record must not be mined as an upstream outage.
 		return codeInvalidRequest, "duplicate JSON-RPC request id already in flight", jsonRPCCodeInvalidRequest
 	case errors.Is(err, mcp.ErrFrameDesync):
-		// A partial frame from a NON-deadline cause (EPIPE on an upstream that died
-		// mid-write, ENOSPC, an interrupted >PIPE_BUF write). The stream is unusable, but
-		// it is not a timeout: reporting it as one would stamp a fabricated
-		// "did not respond within N ms" on the tape for an upstream that crashed, and with
-		// --upstream-timeout=0 would cite a deadline that does not exist. Falls to the
-		// generic upstream-error class, which also gives the operator the stderr dump with
-		// the underlying errno.
+		// A partial frame from a NON-deadline cause (EPIPE, ENOSPC, an interrupted write). Not a
+		// timeout: reporting it as one would fabricate a "did not respond within N ms" for an
+		// upstream that crashed. Falls to the generic upstream-error class.
 		return codeUpstreamError, "upstream connection failed", jsonRPCCodeInternalError
 	case errors.Is(err, mcp.ErrUpstreamWriteTimeout):
-		// The bounded upstream stdin write timed out (a subprocess that stopped draining its
-		// stdin). It is a genuine upstream timeout, so classify it as UPSTREAM_TIMEOUT rather
-		// than the generic UPSTREAM_ERROR — otherwise the same physical failure is recorded as
-		// UPSTREAM_TIMEOUT on the read side and UPSTREAM_ERROR on the write side depending on
-		// which bound wins. Its sentinel text carries no upstream host/path, but routing it
-		// here also keeps it out of the default branch's stderr dump.
+		// The bounded upstream stdin write timed out (subprocess stopped draining stdin) — a
+		// genuine timeout, classified as UPSTREAM_TIMEOUT rather than the generic UPSTREAM_ERROR
+		// so the same physical failure doesn't get two different codes depending on which side.
 		return codeUpstreamTimeout, upstreamTimeoutReason(upstreamTimeMs), jsonRPCCodeInternalError
 	case errors.Is(err, context.DeadlineExceeded):
 		return codeUpstreamTimeout, upstreamTimeoutReason(upstreamTimeMs), jsonRPCCodeInternalError
 	case errors.Is(err, context.Canceled):
 		return codeRequestCanceled, "request canceled before the upstream responded", jsonRPCCodeInternalError
 	default:
-		// A remote HTTP upstream's transport-level ResponseHeaderTimeout fires as a
-		// *url.Error that is a net.Error with Timeout()==true but does NOT wrap
-		// context.DeadlineExceeded, so the errors.Is check above misses it. Classify it
-		// as UPSTREAM_TIMEOUT too (it is a genuine timeout) so the same physical failure
-		// is not recorded sometimes as UPSTREAM_TIMEOUT and sometimes as UPSTREAM_ERROR
-		// depending on which timer wins, and so its raw text (which can carry the
-		// upstream's internal host/path) is not dumped to operator stderr.
+		// A remote HTTP upstream's ResponseHeaderTimeout fires as a *url.Error that is a
+		// net.Error with Timeout()==true but does NOT wrap context.DeadlineExceeded, so the
+		// errors.Is check above misses it. Classify it as UPSTREAM_TIMEOUT too.
 		var ne net.Error
 		if errors.As(err, &ne) && ne.Timeout() {
 			return codeUpstreamTimeout, upstreamTimeoutReason(upstreamTimeMs), jsonRPCCodeInternalError
@@ -214,9 +160,8 @@ func upstreamErrInfo(err error, upstreamTimeMs int) (code, reason string, rpcCod
 	}
 }
 
-// upstreamTimeoutReason builds the host-safe reason string for an upstream timeout,
-// naming the configured --upstream-timeout when one is set and otherwise attributing
-// the expiry to the inherited request deadline (no misleading duration).
+// upstreamTimeoutReason builds the host-safe reason string for an upstream timeout, naming
+// the configured --upstream-timeout when set, else the inherited request deadline.
 func upstreamTimeoutReason(upstreamTimeMs int) string {
 	if upstreamTimeMs <= 0 {
 		return "upstream did not respond before the request deadline"
@@ -224,10 +169,9 @@ func upstreamTimeoutReason(upstreamTimeMs int) string {
 	return fmt.Sprintf("upstream did not respond within %d ms", upstreamTimeMs)
 }
 
-// strictAudit builds the --require-audit=strict configuration from the proxy's own
-// fields, so the five call sites that thread it into dispatchParams/serverRequestParams
-// share one construction and a new strictAuditState field cannot be silently dropped
-// from a subset of them (which would disable the gate on that path).
+// strictAudit builds the --require-audit=strict configuration from the proxy's own fields, so
+// the five call sites threading it into dispatchParams/serverRequestParams share one
+// construction and can't silently drop a new field on a subset of them.
 func (p *HTTPProxy) strictAudit() strictAuditState {
 	return strictAuditState{
 		requireAuditStrict: p.requireAuditStrict,
@@ -235,10 +179,9 @@ func (p *HTTPProxy) strictAudit() strictAuditState {
 	}
 }
 
-// dispatchParams bundles this session's policy/audit/upstream wiring for the
-// shared request dispatcher. The route sink is routed through asRecorder so a nil
-// sink becomes a true nil interface, keeping the core's nil check a real "no sink"
-// test.
+// dispatchParams bundles this session's policy/audit/upstream wiring for the shared request
+// dispatcher. The route sink is routed through asRecorder so a nil sink becomes a true nil
+// interface.
 func (p *HTTPProxy) dispatchParams(sess *httpSession, sourceIP string) dispatchParams {
 	rt := sess.route
 	return dispatchParams{
@@ -258,34 +201,26 @@ func (p *HTTPProxy) dispatchParams(sess *httpSession, sourceIP string) dispatchP
 	}
 }
 
-// initStrictAuditDenial applies the --require-audit=strict gate to the
-// session-creating initialize branch. Creating a session is a privileged side
-// effect (it spawns/contacts an upstream), so once the audit trail degrades it is
-// refused fail-closed with a recorded AUDIT_UNAVAILABLE deny, mirroring the gate
-// on the enforced-forward, */list, and sampling paths. Returns the JSON-RPC denial
-// and true when the gate blocks; (zero, false) when the caller should proceed. The
-// route sink is routed through asRecorder so a nil sink becomes a true nil interface,
-// keeping the nil check a real "no sink" test.
+// initStrictAuditDenial applies the --require-audit=strict gate to the session-creating
+// initialize branch. Creating a session is a privileged side effect (spawns/contacts an
+// upstream), so a degraded trail refuses it fail-closed, mirroring the other enforced paths.
+// Returns the JSON-RPC denial and true when the gate blocks.
 func (p *HTTPProxy) initStrictAuditDenial(ctx context.Context, route *UpstreamRoute, msg mcp.RPCMsg) (mcp.RPCMsg, bool) {
 	fp := forwardParams{
 		rec:              asRecorder(route.sink),
 		sessionID:        "", // no session exists yet on the creating initialize
 		strictAuditState: p.strictAudit(),
 	}
-	// initialize addresses no sub-target, so the audit id, method, and denial
-	// target all collapse to "initialize" (see dispatchList for the same pattern).
-	// A zero decision: no session and no decision exist yet on a session-creating
-	// initialize, so nothing can have cleared a flow label.
+	// initialize addresses no sub-target, so audit id/method/denial target all collapse to
+	// "initialize" (see dispatchList for the same pattern). Zero decision: nothing exists yet
+	// to have cleared a flow label.
 	return fp.strictAuditDenial(ctx, msg, mcp.MethodInitialize, mcp.MethodInitialize, mcp.MethodInitialize, capability.EnforceResponse{})
 }
 
 // initAudienceDenial applies the per-route JWT audience pin to the session-creating
 // initialize, before any upstream is spawned/contacted: a token valid only for another
 // route's audience (accepted by the gateway's shared union validator) must not create a
-// session on this route. Returns the host-facing denial and true when the gate blocks;
-// (zero, false) when the caller should proceed. Mirrors initStrictAuditDenial and the
-// kill-switch pre-spawn gate; non-JWT routes return a nil CheckAudience and never block.
-// The route sink is routed through asRecorder so a nil sink becomes a true nil interface.
+// session here. Mirrors initStrictAuditDenial; non-JWT routes never block.
 func (p *HTTPProxy) initAudienceDenial(ctx context.Context, route *UpstreamRoute, msg mcp.RPCMsg) (mcp.RPCMsg, bool) {
 	deny := route.pdp.CheckAudience(ctx)
 	if deny == nil {
@@ -298,48 +233,31 @@ func (p *HTTPProxy) initAudienceDenial(ctx context.Context, route *UpstreamRoute
 	return denialResult(msg.ID, d.Code, d.ConditionType, mcp.MethodInitialize, ""), true
 }
 
-// handleHTTPUpstreamRequest handles server-initiated JSON-RPC requests from
-// the upstream subprocess (local mode only; remote mode has no background
-// reader).  sampling/createMessage is denied by default unless the manifest
-// explicitly permits it and the session is not killed; all other
-// server-initiated requests are broadcast to SSE subscribers.
+// handleHTTPUpstreamRequest handles server-initiated JSON-RPC requests from the upstream
+// subprocess (local mode only). sampling/createMessage is denied by default unless the
+// manifest explicitly permits it; all other server-initiated requests broadcast to SSE.
 func (p *HTTPProxy) handleHTTPUpstreamRequest(ctx context.Context, sess *httpSession, msg mcp.RPCMsg) {
-	// rt is dereferenced unconditionally (rt.sink/audit/pdp below), matching
-	// dispatchParams and the GET/DELETE paths: a session always carries the route it was
-	// established on. The half-guard this replaced tested rt != nil on one field and then
-	// dereferenced rt three lines later anyway, so it bought nothing except the impression
-	// that a nil route is survivable here.
+	// rt is dereferenced unconditionally, matching dispatchParams and the GET/DELETE paths: a
+	// session always carries the route it was established on.
 	rt := sess.route
-	// Serialize the sampling decision against the host-path decisions on the same anchor for
-	// a flow-/sequenceBlock-relevant route, so a flowLabel sink on system:sampling cannot
-	// peek the flow set concurrently with a host source's label write. Same anchor-keyed gate
-	// the host path uses; released before
-	// the forward. nil (no serialization) for a non-flow route.
+	// Serialize the sampling decision against host-path decisions on the same anchor, so a
+	// flowLabel sink on system:sampling cannot peek the flow set concurrently with a host
+	// source's write. Same anchor-keyed gate the host path uses; nil for a non-flow route.
 	//
-	// The anchor comes from the SESSION's claims, captured at initialize: a server-initiated
-	// request has no host request in scope, and those are the same claims its decision is
-	// taken with (see serverRequestParams.claims), so the turn and the state key agree.
+	// The anchor comes from the SESSION's claims captured at initialize (see
+	// serverRequestParams.claims), so the turn and the state key agree. Agreeing with each
+	// other is not enough — a task-anchored session may span anchors, so this leg refuses
+	// outright once the session has resolved a second one (anchorSplit below), rather than
+	// risk peeking a bucket the host leg taints under a different anchor.
 	//
-	// Agreeing with each other is not enough — they must agree with the HOST leg, which reads
-	// each request's own claims. On a task-anchored route a session MAY span anchors (each host
-	// request is decided and keyed on its own), so what makes the two legs agree is not a pin on
-	// the request: it is that this leg refuses outright once the session has resolved a second
-	// anchor (anchorSplit below, httpSession.noteRequestAnchor for why). While it decides at
-	// all, the captured claims and every request's claims resolve one anchor. Without that
-	// refusal, a caller holding two tokens differing only in task_id taints one bucket through
-	// the host leg while this leg peeks another and finds it clean.
-	//
-	// Bounded: see samplingTurnWait for what the bound is for now that this no longer runs on
-	// the session's reader (it runs on its own goroutine, up to maxConcurrentServerRequests
-	// per session — so anything this function reaches must be safe for that concurrency), and
-	// decideSampling for what a refused turn produces.
+	// Bounded (see samplingTurnWait): runs on its own goroutine, up to
+	// maxConcurrentServerRequests per session, not the reader — see decideSampling.
 	var decideLock func() (end func(), ok bool)
 	if rt.serializes() {
 		decideLock = func() (func(), bool) { return sess.beginDecisionTurnWithin(samplingTurnWait) }
 	}
-	// sess.broadcastServerRequest reports whether an SSE subscriber received the
-	// request; sess.claims (captured at initialize) is attached for the sampling
-	// decision so per-agent kills are honored and the record carries agent_id/task_id.
+	// sess.broadcastServerRequest reports whether an SSE subscriber received the request;
+	// sess.claims is attached so per-agent kills are honored and records carry agent_id.
 	forwardServerRequest(ctx, msg, serverRequestParams{
 		rec:           asRecorder(rt.sink),
 		audit:         rt.audit,
@@ -350,9 +268,8 @@ func (p *HTTPProxy) handleHTTPUpstreamRequest(ctx context.Context, sess *httpSes
 		writeUpstream: func(m mcp.RPCMsg) { _ = sess.upWriter.Write(m) },
 		decideLock:    decideLock,
 		// A session that has spanned two state anchors cannot decide on this leg at all; see
-		// samplingAnchorSplitDenial. Always wired (not only for a task-anchored route): the
-		// session answers false unless it actually spanned, so the question is asked in one
-		// place rather than re-derived from the route's mode here.
+		// samplingAnchorSplitDenial. Always wired: the session answers false unless it
+		// actually spanned, so the question is asked in one place.
 		anchorSplit:      sess.spansAnchors,
 		strictAuditState: p.strictAudit(),
 		pdp:              rt.pdp,

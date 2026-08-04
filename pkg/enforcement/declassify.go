@@ -11,43 +11,31 @@ import (
 	"github.com/eunolabs/eunox/pkg/capability"
 )
 
-// declassifyConditionType is the condition_type stamped on a declassification refusal.
-// It is the directive's own discriminator rather than a condition name: no condition
-// failed, and labelling the refusal "flowLabel" would make an operator grep for a sink
-// rule that does not exist. The audit field is a taxonomy slot, not a claim that a
-// condition ran — the effect ceiling uses it the same way.
+// declassifyConditionType is the taxonomy slot stamped on a declassification refusal — not a
+// condition name, since no condition ran (mirrors the effect ceiling's own slot).
 const declassifyConditionType = capability.DirectiveTypeDeclassify
 
 // declassifyOutcome is what checkDeclassify resolved for a call: the labels an approved
-// directive will clear plus the approval that authorized them, or nothing at all when the
-// constraint carries no declassify directive. It is computed BEFORE any state is
-// committed and applied inside the atomic source commit, so an unapproved call never
-// reaches the commit and an approved one clears exactly what was authorized.
+// directive will clear plus the approval that authorized them, computed BEFORE any state is
+// committed so an unapproved call never reaches the commit.
 type declassifyOutcome struct {
-	// Labels are the labels to remove, canonical vocabulary order. Empty means "no
-	// declassification on this call".
+	// Labels are the labels to remove, canonical vocabulary order; empty means no
+	// declassification.
 	Labels []string
 	// Approver and ApprovalID come from the grant that covered Labels.
 	Approver   string
 	ApprovalID string
-	// LedgerID is the ledger member to burn when the grant is single-use, empty for a
-	// standing one. It is resolved here, with the grant, rather than re-derived at commit
-	// time: the commit must burn EXACTLY the approval this check authorized, and a second
-	// derivation is a place for the two to pick different grants.
+	// LedgerID is the ledger member to burn for a single-use grant, empty for a standing one —
+	// resolved here with the grant so the commit burns exactly what this check authorized.
 	LedgerID string
 }
 
-// handle mints the commit handle for this outcome, carrying the labels the decision resolved
-// as clearable: the approved set INTERSECTED with what the anchor is carrying as of this
-// decision. nil when the constraint authorized no declassification at all, which is every call
-// in a deployment that does not declassify.
+// handle mints the commit handle for this outcome: the approved labels intersected with what
+// the anchor is carrying as of this decision. nil when nothing was authorized.
 //
-// It is the ONE place a handle is built on the decision path, and it computes the intersection
-// itself rather than taking it. Taking it would have moved the widening a []string parameter
-// left open exactly one frame up: a second call site passing anything other than this
-// intersection could mint a handle authorizing labels the approval never covered, and nothing
-// here could tell. carriedLabels is the pre-call accumulated set and labelsOut this call's own
-// contribution — the same two the caller already resolved for the record.
+// It computes the intersection itself rather than taking one, since a second call site
+// passing anything other than this intersection could mint a handle authorizing more than the
+// approval covered.
 func (d declassifyOutcome) handle(carriedLabels, labelsOut []string) *capability.Declassification {
 	if len(d.Labels) == 0 {
 		return nil
@@ -58,41 +46,24 @@ func (d declassifyOutcome) handle(carriedLabels, labelsOut []string) *capability
 
 // declassifyLedgerWindowSec bounds how long a burned single-use approval is remembered.
 //
-// It is capability.DeclassifyLedgerWindowSec rather than a number of its own, because the
-// window is only half of the guarantee and the other half is enforced at the TOKEN
-// boundary: a token whose remaining lifetime exceeds this window is refused outright
-// (capability.CheckDeclassifyApprovalLifetime). The burn is written no earlier than the
-// moment the token is presented, so a window this long always outlives a token admitted
-// under that bound — which is what makes "once" mean once unconditionally rather than
-// "once per seven days". Two numbers here would be a way for the boundary to admit a token
-// the ledger cannot remember.
+// The other half of the guarantee is enforced at the token boundary: a token whose remaining
+// lifetime exceeds this window is refused outright, so a burn always outlives the token that
+// could replay it.
 const declassifyLedgerWindowSec = capability.DeclassifyLedgerWindowSec
 
-// declassifyLedgerKey addresses ONE single-use grant's burn. The key is the route namespace
-// plus the grant's ledger id, and deliberately carries no session and no task:
+// declassifyLedgerKey addresses ONE single-use grant's burn: route namespace plus the grant's
+// ledger id, deliberately carrying no session and no task — "approve clearing this once" means
+// once, and anchoring it made it once-per-session/task instead (see the file-level exception).
 //
-//   - "Approve clearing this once" means once. Anchoring the ledger made it once-per-session
-//     by default — session teardown reclaimed it and two concurrent sessions held two
-//     independent ledgers — so the property the grant advertises held in no default
-//     deployment. Anchoring it to the task merely moved the boundary.
-//   - A per-grant key rather than one set per anchor also bounds the state: each burn is
-//     reclaimed on its own window instead of accumulating in a set that is never pruned.
-//
-// It lives in the CallCounter rather than the FlowLabelStore, which reverses the original
-// choice, and the reason is atomicity. The flow store offers no test-and-set: a Get-then-Add
-// burn is a check-then-act that two concurrent callers both win, which double-spends exactly
-// the approval this mechanism exists to make single-use. The counter's AdmitAll is the
-// codebase's ONE atomic admission primitive, and a counted bucket with a limit of 1 is
-// precisely "admit once, ever". The cost is that the counter is windowed — see
-// declassifyLedgerWindowSec, and the token-boundary bound that keeps a grant from outliving
-// it.
+// Lives in the CallCounter rather than the FlowLabelStore because the counter's AdmitAll is
+// the codebase's one atomic admission primitive; the flow store's Get-then-Add would let two
+// concurrent callers both win, double-spending the grant.
 func (e *Engine) declassifyLedgerKey(ledgerID string) string {
 	return compositeCounterKey("declassify", e.counterKeyNamespace, ledgerID)
 }
 
-// declassifyLedgerBucket is the one-slot quota a single-use grant draws on. Counted with a
-// limit of 1: the first AdmitAll records the entry and admits, every later one is refused
-// having recorded nothing.
+// declassifyLedgerBucket is the one-slot quota a single-use grant draws on: the first
+// AdmitAll admits, every later one is refused having recorded nothing.
 func (e *Engine) declassifyLedgerBucket(ledgerID string) capability.QuotaBucket {
 	return capability.QuotaBucket{
 		Key:       e.declassifyLedgerKey(ledgerID),
@@ -103,15 +74,10 @@ func (e *Engine) declassifyLedgerBucket(ledgerID string) capability.QuotaBucket 
 }
 
 // approvalSpent reports whether a single-use grant looks already burned. It is a PEEK — it
-// records nothing — because it runs during selection, before the ceiling and the quota
-// commits have had their chance to refuse the call, and a check that spent the grant would
-// consume a human approval for a call that never ran.
-//
-// It is therefore advisory: two concurrent callers can both peek clean. That race is closed at
-// the commit, where burnApproval's atomic admission lets exactly one through and the loser
-// hard-denies. The error is NOT swallowed — a fault means the proxy cannot tell a fresh
-// approval from a spent one, and treating that as fresh would make an unreachable backend the
-// way to replay every one-shot grant in a token.
+// records nothing — because it runs during selection, before the ceiling and quota commits
+// have had their chance to refuse the call, and spending the grant here would burn a human
+// approval for a call that never ran. The race this leaves open is closed at burnApproval's
+// atomic commit.
 func (e *Engine) approvalSpent(ctx context.Context, ledgerID string) (bool, error) {
 	if ledgerID == "" {
 		return false, nil
@@ -126,25 +92,15 @@ func (e *Engine) approvalSpent(ctx context.Context, ledgerID string) (bool, erro
 	return n > 0, nil
 }
 
-// There is deliberately no exported "is there a usable approval for this?" predicate.
-//
-// One existed (UsableDeclassifyApproval), for the wrapping-PDP hardening path, and answering
-// only THAT question is what left the rest of the answer to be hand-rolled at the call site —
-// which is where the caller re-derived the canonical approval target without trimming a padded
-// name, and built its own refusal without CarriedLabels. Scoping a seam to the boolean and
-// leaving the target resolution and the record shape to the caller reproduces, one layer up,
-// exactly the divergence canonicalApprovalTarget was centralized to prevent.
-//
-// DeclassifyVerdictFor is the seam instead: it answers the whole question — resolve the target,
-// select a live grant, and build the refusal — through the same checkDeclassify the decision
-// path runs, so the composed verdict cannot be looser than, or shaped differently from, the
-// unwrapped one. A caller that needs only the boolean can test its result for nil.
+// There is deliberately no exported "is there a usable approval for this?" predicate:
+// DeclassifyVerdictFor answers the whole question (target, selection, refusal shape) through
+// checkDeclassify, so a caller needing only the boolean tests its result for nil instead of
+// hand-rolling target resolution and refusal construction that can drift from the decision path.
 
 // approvalSelection is what one walk of the covering grants found: the first still-live grant
-// (nil when every covering grant is spent, or none covers), its ledger member, and how many
-// covering grants were passed over as already burned — the count that separates "no approval
-// covers this" from "the approval was real and has been spent", which are different operator
-// actions.
+// (nil if all spent or none cover), its ledger member, and how many were passed over as
+// burned — which distinguishes "no approval covers this" from "it was spent", different
+// operator actions.
 type approvalSelection struct {
 	approval *capability.DeclassifyApproval
 	ledgerID string
@@ -152,17 +108,12 @@ type approvalSelection struct {
 	consumed int
 }
 
-// selectLiveApproval is the ONE walk over the covering grants. checkDeclassify is its only
-// caller now, and so — through checkDeclassify — is the wrapping-PDP hardening path, which
-// reaches it via DeclassifyVerdictFor rather than through a predicate of its own. A hardening
-// check looser than the decision means adding a token makes the proxy allow more, and a second
-// copy of "walk, peek, take the first live one" is exactly where that divergence had already
-// happened once.
+// selectLiveApproval is the ONE walk over covering grants; checkDeclassify (and, through it,
+// the wrapping-PDP hardening path via DeclassifyVerdictFor) is its only caller, so a hardening
+// check cannot be looser than the decision.
 //
-// It walks rather than taking the first covering grant, because scope is not the whole test: a
-// single-use grant already burned covers the call on paper and must be passed over in favour of
-// a later grant that is still live. One Peek per covering grant, bounded by
-// MaxDeclassifyApprovals.
+// It walks rather than taking the first covering grant because a single-use grant already
+// burned still covers the call on paper and must be passed over for a later live one.
 func (e *Engine) selectLiveApproval(ctx context.Context, approvals []capability.DeclassifyApproval, target string, want []string) (approvalSelection, error) {
 	sel := approvalSelection{covering: capability.CoveringDeclassifyApprovals(approvals, target, want)}
 	for _, cand := range sel.covering {
@@ -182,29 +133,21 @@ func (e *Engine) selectLiveApproval(ctx context.Context, approvals []capability.
 }
 
 // checkDeclassify resolves the constraint's declassify directive against the request's
-// approvals. It returns the outcome to apply on commit and, when the call is not
-// authorized, the refusal that REPLACES the allow.
+// approvals, returning the outcome to apply on commit and, when unauthorized, the refusal
+// that REPLACES the allow.
 //
-// It runs on the allow tail — after the conditions and after the effect ceiling, before
-// the deferred-condition commit and the flow/antecedent write — for the same reason the
-// ceiling does: an unapproved declassification is NOT forwarded, so it must leave neither
-// a spent quota slot, nor a phantom sequenceBlock antecedent, nor any change to the
-// session's label set.
+// It runs on the allow tail, after conditions and the effect ceiling and before any commit,
+// so an unapproved declassification leaves no spent quota slot, no phantom antecedent, no
+// label change.
 //
-// Why the refusal is an ESCALATION and not a deny: "no human has approved dropping this
-// label here" is precisely the condition `escalate` was introduced to name. It is a hard
-// refusal with AuditOnly unset (escalateResponse), so a route running --audit cannot turn
-// it into a forward — the same non-negotiable that keeps an over-ceiling action from being
-// performed-anyway-and-logged. A declassification is if anything the stronger case: the
-// forward would not merely perform the action, it would perform it while ALSO clearing the
-// taint that would have stopped the next one.
+// The refusal is an ESCALATION rather than a deny — "no human approved dropping this label"
+// is what `escalate` exists to name — and it is HARD (AuditOnly unset), so --audit cannot
+// turn it into a forward: that would perform the action while also clearing the taint meant
+// to stop it.
 func (e *Engine) checkDeclassify(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, carriedLabels []string, requestID, now string) (declassifyOutcome, *capability.EnforceResponse) {
 	if e.skipFlow {
-		// An engine whose flow path is skipped holds no flow state, so it can neither read
-		// what a session carries nor clear it. Returning the zero outcome means such a
-		// constraint neither escalates nor pretends to declassify; the config layer keeps
-		// this unreachable in-tree by counting declassify as flow-relevant, and this is
-		// the same defense in depth its two siblings carry.
+		// No flow state to read or clear; the config layer keeps this unreachable in-tree by
+		// counting declassify as flow-relevant, and this is defense in depth for that.
 		return declassifyOutcome{}, nil
 	}
 	want := capability.DeclassifyLabelsOf(matched)
@@ -212,10 +155,8 @@ func (e *Engine) checkDeclassify(ctx context.Context, req *capability.EnforceReq
 		return declassifyOutcome{}, nil
 	}
 
-	// Fail closed on an unknown label the same way recordLabels and handleFlowLabel do.
-	// A loaded manifest cannot reach here with one (validation rejects it); a
-	// programmatically built constraint can, and a label this build cannot interpret must
-	// not be quietly removed from a set the sink check reads.
+	// Fail closed on an unknown label, matching recordLabels and handleFlowLabel: a loaded
+	// manifest cannot reach here with one, but a programmatically built constraint can.
 	for _, l := range want {
 		if !capability.IsFlowLabel(l) {
 			return declassifyOutcome{}, e.declassifyRefusal(requestID, now, carriedLabels, want, nil,
@@ -224,9 +165,8 @@ func (e *Engine) checkDeclassify(ctx context.Context, req *capability.EnforceReq
 		}
 	}
 
-	// The store and session guards mirror recordLabels': without both, the Remove cannot
-	// be performed, and forwarding the call while the clear silently did not happen would
-	// leave the operator believing a label was dropped.
+	// The store and session guards mirror recordLabels': without both, the Remove cannot be
+	// performed, and forwarding while a clear silently failed would mislead the operator.
 	if e.flowStore == nil {
 		return declassifyOutcome{}, e.declassifyRefusal(requestID, now, carriedLabels, want, nil,
 			"flow-label store not configured; a declassification cannot be applied", "no_store")
@@ -242,15 +182,13 @@ func (e *Engine) checkDeclassify(ctx context.Context, req *capability.EnforceReq
 			"the request carries no resolvable target, so no approval can be scoped to it", "no_target")
 	}
 
-	// The first still-live grant among those whose scope covers this call. The wrapping-PDP
-	// hardening path reaches this same walk through DeclassifyVerdictFor, so it cannot answer
-	// the question more loosely than the decision does.
+	// First still-live grant among those scoped to this call; DeclassifyVerdictFor reaches
+	// this same walk, so hardening can't answer more loosely than the decision.
 	sel, err := e.selectLiveApproval(ctx, req.DeclassifyApprovals, target, want)
 	if err != nil {
-		// The ledger is unreadable, so "already used" cannot be distinguished from "never
-		// used". Escalating is the only answer that does not make an unreachable backend the
-		// way to replay every one-shot grant in a token — the same fail-closed posture every
-		// other flow-state read fault takes.
+		// Unreadable ledger means "already used" can't be distinguished from "never used";
+		// escalating is the only answer that doesn't make an unreachable backend a replay
+		// vector.
 		return declassifyOutcome{}, e.declassifyRefusal(requestID, now, carriedLabels, want, nil,
 			fmt.Sprintf("single-use declassify approval state could not be read: %v", err),
 			"ledger_unavailable")
@@ -258,26 +196,18 @@ func (e *Engine) checkDeclassify(ctx context.Context, req *capability.EnforceReq
 	approval, ledgerID, covering, consumed := sel.approval, sel.ledgerID, sel.covering, sel.consumed
 	if approval == nil {
 		if consumed > 0 {
-			// A distinct reason from "no approval", because it is a distinct operator
-			// action: the grant was real and scoped correctly, and it has been spent. Told
-			// "no approval covers this", an operator re-checks the scope they already got
-			// right; told "consumed", they mint a new one. The approval id is safe to name
-			// (it is the control plane's own record identifier, and it is already stamped
-			// on the allow that spent it) and is what joins this refusal to that record.
-			//
-			// Spelled consumed_approval_id rather than approval_id: the latter is a
-			// top-level SIGNED field on the allow that performed a declassification, and
-			// reusing the name inside a refusal's details would put the same key in two
-			// places with two provenances on one tape.
+			// Distinct reason from "no approval": the grant was scoped correctly and has been
+			// spent, a different operator action than widening scope. consumed_approval_id
+			// (not approval_id, reserved for a signed successful clear) joins this refusal to
+			// the allow that spent it.
 			return declassifyOutcome{}, e.declassifyRefusal(requestID, now, carriedLabels, want,
 				map[string]interface{}{"approvals_consumed": consumed, "consumed_approval_id": covering[0].ID},
 				fmt.Sprintf("the human approval covering flow label(s) %v at %s is single-use and has already been consumed; a new approval is required", want, target),
 				"approval_consumed")
 		}
-		// One message for "no grant at all" and "a grant that does not cover this",
-		// because the distinction is not one the caller may act on differently and
-		// enumerating which labels a presented grant was missing would echo the token's
-		// contents back to it. The count is safe and is the operator's first diagnostic.
+		// One message for "no grant" and "a grant that doesn't cover this" — the distinction
+		// isn't actionable differently, and enumerating missing labels would echo the token
+		// back to it.
 		return declassifyOutcome{}, e.declassifyRefusal(requestID, now, carriedLabels, want, approvalCountDetail(req),
 			fmt.Sprintf("clearing flow label(s) %v at %s requires a human approval covering all of them; the request carries none", want, target),
 			"no_approval")
@@ -291,58 +221,28 @@ func (e *Engine) checkDeclassify(ctx context.Context, req *capability.EnforceReq
 	}, nil
 }
 
-// DeclassifyVerdictFor answers ONE question — "would this constraint's declassification
-// have been authorized?" — for a constraint that has already been selected, WITHOUT
-// evaluating a single condition and WITHOUT committing any state. It returns the refusal
-// checkDeclassify would produce (an ESCALATION_REQUIRED escalate), or nil when the
-// constraint clears nothing, the engine holds no flow state, or the request carries a live
-// covering approval.
+// DeclassifyVerdictFor answers ONE question — "would this constraint's declassification have
+// been authorized?" — for an already-selected constraint, WITHOUT evaluating conditions or
+// committing state. Returns the ESCALATION_REQUIRED refusal checkDeclassify would produce, or
+// nil.
 //
-// It is the declassify twin of CeilingVerdictFor and exists for the same COMPOSED case: a
-// PDP wrapping this engine's PDP — the JWT layer — can refuse a call on its own terms and
-// short-circuit above the inner PDP, so evaluateMatched never runs and checkDeclassify
-// never fires. The call is still refused, but that refusal is a SOFT deny an --audit route
-// downgrades to a FORWARD, which would perform the action AND leave the taint the policy
-// says the action clears. Adding a token must never make the proxy allow more.
+// It exists for the COMPOSED case: a wrapping PDP (the JWT layer) can refuse a call on its own
+// terms before checkDeclassify ever runs, and a bare wrapping refusal is soft — downgradable by
+// --audit — which would let the forward perform the action AND clear the taint it should have
+// stopped. Routing through checkDeclassify (rather than a hand-rolled target/refusal, which
+// previously diverged on untrimmed names and a missing CarriedLabels field) gives one
+// canonical resolver and one refusal shape.
 //
-// What makes this a SEAM rather than a convenience is that the wrapping path used to
-// answer the question itself, and a hand-rolled answer diverges. It resolved the approval
-// target as `string(target.Type) + ":" + target.Name` — reintroducing one of the three
-// divergences canonicalApprovalTarget's doc records as already paid for, so a request
-// whose target name carried surrounding whitespace resolved to a target no
-// already-trimmed grant could ever match, and a correctly-scoped approval became a
-// permanent, unsatisfiable escalation. It also built its own DenialInfo and omitted
-// CarriedLabels, so the same logical refusal had two record shapes depending on whether a
-// JWT layer wrapped the call — and the JWT-wrapped one dropped the field an approver acts
-// on first. Routing through checkDeclassify gives one canonical-target resolver, one
-// refusal builder, and one record shape, and means a future change to checkDeclassify
-// needs no hand-mirroring.
+// Non-committing is inherited from checkDeclassify itself; its only backend touch is the
+// ledger PEEK, which records nothing.
 //
-// Non-committing is a property of checkDeclassify itself, not something reproduced here:
-// it runs before any commit precisely so an unapproved declassification spends no quota
-// slot, writes no antecedent, and changes no label. Its only backend touch is the ledger
-// PEEK behind selectLiveApproval, which records nothing.
-//
-// Like CeilingVerdictFor, the caller may use this ONLY to HARDEN a refusal — never to
-// produce an allow, and never on a path that would otherwise forward. When a condition
-// would have denied first, the full path reports that condition and never reaches the
-// declassify check, while this reports the declassification; the call is refused either
-// way, so the difference is a harder refusal rather than a wrong one.
-//
-// The flow-label peek is a pure Get and its failure is swallowed, matching
-// CeilingVerdictFor: this is asked about a call that is ALREADY refused, so a label-store
-// fault must not weaken (or replace) the refusal being hardened. The peeked set is only
-// evidence on the record; the authorization test itself does not read it.
+// Use ONLY to HARDEN an already-refused call, never to produce an allow. The flow-label peek's
+// failure is swallowed, matching CeilingVerdictFor: the refusal being hardened must not
+// weaken.
 func (e *Engine) DeclassifyVerdictFor(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint) *capability.EnforceResponse {
-	// e == nil first, and it is not defensive noise. This is an exported method on an
-	// exported type whose fields are unexported, so an embedder legitimately holds an
-	// unwired *Engine — and the predicate this replaced (UsableDeclassifyApproval) guarded
-	// exactly that, with a test pinning it. Dereferencing instead would panic a request
-	// goroutine on a refusal path, which is fail-open-via-crash: the connection drops with
-	// no denial and no audit record for the refusal being hardened. The sibling
-	// CommitDeclassification guards the same way for the same reason. nil means "no
-	// engine, so no checkDeclassify on the unwrapped path either" — there is no verdict
-	// this could be weaker than.
+	// e == nil first: an exported method on unexported fields, so an embedder can legitimately
+	// hold an unwired *Engine. Dereferencing would panic a request goroutine on a refusal path
+	// — fail-open-via-crash. Mirrors CommitDeclassification's same guard.
 	if e == nil || req == nil || matched == nil || e.skipFlow {
 		return nil
 	}
@@ -356,23 +256,17 @@ func (e *Engine) DeclassifyVerdictFor(ctx context.Context, req *capability.Enfor
 	if labels, err := e.peekSessionLabels(ctx, req); err == nil {
 		carriedLabels = labels
 	}
-	// The outcome is discarded on purpose: it describes what a COMMIT would apply, and
-	// this path commits nothing. Only the refusal is the answer.
+	// Outcome discarded: it describes what a COMMIT would apply, and this commits nothing.
 	_, refusal := e.checkDeclassify(ctx, req, matched, carriedLabels, requestID, now)
 	return refusal
 }
 
-// declassifyRefusal builds the ESCALATION_REQUIRED refusal that replaces the allow for an
-// unauthorized declassification. Every arm goes through it (rather than building an
-// EnforceResponse literal) so the BoundDenialDetails pass and the details shape are
-// single-sourced — details here carries manifest-authored and request-derived values, and
-// the one refusal a human is expected to read is exactly the one that must not carry an
-// unbounded value onto the signed tape.
+// declassifyRefusal builds the ESCALATION_REQUIRED refusal for an unauthorized
+// declassification. Every arm routes through it so BoundDenialDetails and the details shape
+// are single-sourced.
 func (e *Engine) declassifyRefusal(requestID, now string, carriedLabels, want []string, extra map[string]interface{}, message, reason string) *capability.EnforceResponse {
 	details := map[string]interface{}{
-		// FlowAuditDetailKey marks this a flow-layer refusal, the same discriminator a
-		// flowLabel sink denial carries, so one filter finds every information-flow
-		// event on the tape.
+		// Marks this a flow-layer refusal, same discriminator a flowLabel sink denial carries.
 		capability.FlowAuditDetailKey: true,
 		"declassify_labels":           want,
 		"reason":                      reason,
@@ -380,10 +274,8 @@ func (e *Engine) declassifyRefusal(requestID, now string, carriedLabels, want []
 	for k, v := range extra {
 		details[k] = v
 	}
-	// The session's accumulated labels, for the same reason the ceiling's escalation
-	// carries them: this is a refusal a human is expected to act on, and "what is this
-	// session already carrying" is the first thing they need in order to decide whether
-	// the declassification should be approved at all.
+	// The session's accumulated labels: this refusal is meant for a human to act on, and what
+	// the session already carries is the first thing they need.
 	if len(carriedLabels) > 0 {
 		details["carried_labels"] = carriedLabels
 	}
@@ -392,8 +284,8 @@ func (e *Engine) declassifyRefusal(requestID, now string, carriedLabels, want []
 		ConditionType: declassifyConditionType,
 		Message:       message,
 		Details:       details,
-		// Hard, for the same reason the ceiling's escalation is: --audit downgrades a
-		// policy verdict being staged, and this is not one.
+		// Hard, same reason the ceiling's escalation is: --audit must not downgrade this to a
+		// forward.
 		HardDeny: true,
 	})
 	resp.CarriedLabels = carriedLabels
@@ -401,10 +293,9 @@ func (e *Engine) declassifyRefusal(requestID, now string, carriedLabels, want []
 }
 
 // approvalCountDetail reports how many approvals the request presented, so an operator can
-// tell "the token carried no declassify claim at all" (an integration that was never wired)
-// from "it carried grants, none covering this action" (a scoping mistake). Only the count
-// is recorded — the grants' contents are the token's, and echoing them onto the tape would
-// put an IdP's claim payload into the audit record for a call that was refused.
+// tell "no declassify claim at all" from "grants presented, none covering this" — only the
+// count, not the grants' contents, since those are the token's and echoing them onto the tape
+// would leak it.
 func approvalCountDetail(req *capability.EnforceRequest) map[string]interface{} {
 	if len(req.DeclassifyApprovals) == 0 {
 		return nil
@@ -413,18 +304,12 @@ func approvalCountDetail(req *capability.EnforceRequest) map[string]interface{} 
 }
 
 // canonicalApprovalTarget renders the request's target in the "<type>:<bare>" spelling an
-// approval names. It delegates to resolveRequestTarget — the ONE resolver
-// FindMatchingCapability uses to select the constraint in the first place — so the target
-// an approval is scoped against is by construction the target that selected the entry.
+// approval names, delegating to resolveRequestTarget — the same resolver
+// FindMatchingCapability uses to select the constraint — so an approval is scoped against the
+// target that selected it.
 //
-// A second, hand-rolled resolver here diverged from it in three ways that each made a
-// correctly-written approval unsatisfiable: it preferred req.Target wholesale rather than
-// per-field, it did not trim a padded name, and it rejected an unrecognized prefix where
-// splitEnginePrefix defaults one to the tool namespace. Every one of those produced a
-// permanent escalation on a grant the operator had scoped correctly.
-//
-// An empty bare name yields "", which checkDeclassify turns into a refusal — never into an
-// approval that matches everything.
+// A hand-rolled resolver previously diverged (whole-Target preference, no trimming, rejecting
+// unrecognized prefixes) in ways that made correctly-scoped approvals unsatisfiable.
 func canonicalApprovalTarget(req *capability.EnforceRequest) string {
 	reqType, bare := resolveRequestTarget(req)
 	if bare == "" || reqType == "" {
@@ -433,41 +318,26 @@ func canonicalApprovalTarget(req *capability.EnforceRequest) string {
 	return reqType + ":" + bare
 }
 
-// burnApproval spends a single-use grant: one atomic admission against the grant's one-slot
-// bucket. It is the ONLY authoritative test — approvalSpent's peek is advisory, so two
-// concurrent callers can both reach here believing the grant is live, and exactly one of them
-// is admitted. The loser gets admitted=false and an error, which the caller turns into a hard
-// deny: over-refusing one of two racing calls is the only outcome that keeps "once" meaning
-// once. A standing grant (empty ledgerID) burns nothing and costs no round trip.
+// burnApproval spends a single-use grant via one atomic admission against its one-slot
+// bucket — the ONLY authoritative test (approvalSpent's peek is advisory); the loser of a
+// concurrent race is hard-denied. A standing grant (empty ledgerID) burns nothing.
 //
-// It runs inside the DECISION's commit — not with the deferred clear it authorizes — because
-// it is the atomic test that makes "once" mean once, and two callers must not both be able to
-// reach it. That leaves it possible for a grant to be spent by a call whose clear is never
-// committed (a refusal below the decision, a fault at the commit); the response carries a
-// handle whose SpentApprovalID names it for exactly that case, so the tape names the grant an
-// operator must replace.
+// Runs inside the DECISION's commit, not the deferred clear it authorizes, because it is the
+// atomic test that makes "once" mean once. That leaves a grant possibly spent by a call whose
+// clear never lands (a later fault); the response's SpentApprovalID names it for
+// reconciliation.
 //
-// It runs on EVERY commit of an approved single-use declassification, including one whose
-// clear turns out to be a no-op because the anchor was not carrying the labels. That is the
-// property, not an oversight: the approval is what turned an escalation into an allow, so it
-// was spent whether or not a label moved. Burning only on a clear that changed something
-// would make the grant trivially replayable by ordering — present it once while clean (no
-// burn), acquire the taint, present it again to the clear that matters.
+// Burns on EVERY commit of an approved single-use declassification, even a no-op clear — the
+// approval turned an escalation into an allow, so it was spent regardless of whether a label
+// moved. Burning only on an effective clear would make the grant replayable by ordering.
 //
-// There is deliberately no un-burn. The counter has no delete, and that is the right shape
-// here: a call refused AFTER its burn leaves the grant spent, which over-refuses (the operator
-// mints another approval) rather than handing a use back. The un-burn this replaced was a
-// fail-OPEN on one path — a soft antecedent-fault deny is downgraded and FORWARDED by an
-// --audit route, so the action ran while the grant was handed back.
+// No un-burn by design: a call refused after its burn over-refuses (mint another approval)
+// rather than handing the use back to a route that already forwarded it once (the fail-open
+// the old un-burn had on an --audit route).
 //
-// It is also NOT skipped under SkipQuota, which makes it the one thing on the commit path that
-// an --audit route still spends. That asymmetry is deliberate and follows from what observe
-// mode actually does: a maxCalls bucket is skipped because observe consumes no BUDGET, but the
-// label clear this grant authorizes is performed for real on an observe route (flow state has
-// to stay accurate or the predictions are worthless). Skipping only the burn would leave a real
-// clear behind a grant still marked live — the replay this ledger exists to close, reachable by
-// putting the route in observe mode. The burn and the clear are one transaction; observe either
-// does both or neither, and it does both.
+// NOT skipped under SkipQuota: observe mode skips budget spend, but the label clear this
+// grant authorizes still runs for real, so the burn that guards its single-use property must
+// too.
 func (e *Engine) burnApproval(ctx context.Context, ledgerID string) error {
 	if ledgerID == "" {
 		return nil
@@ -486,21 +356,14 @@ func (e *Engine) burnApproval(ctx context.Context, ledgerID string) error {
 }
 
 // declassifyRecordFailureDenial is the fail-closed response when the declassify leg of the
-// source commit faulted. It is a HARD deny: the soft antecedent-fault deny beside it is
-// downgraded and FORWARDED by an --audit route, and forwarding a call whose one-shot
-// approval was just spent runs the action while the operator's single approval is gone with
-// nothing to show for it.
+// source commit faulted. HARD deny: the soft antecedent-fault deny beside it is downgradable
+// by --audit, and forwarding a call whose one-shot approval was just spent burns the approval
+// with nothing performed to show for it.
 //
-// Nothing was cleared on this path — the clear is the caller's second phase and never ran —
-// so the session's flow state is exactly as accurate as before the call. What may have
-// changed is the LEDGER: spentApprovalID names a single-use grant this commit burned before
-// faulting, empty when nothing was spent. It rides the refusal because this is the only
-// record the grant will ever appear on, and an operator reconciling one-shot approvals would
-// otherwise believe it was still live.
-// The id rides the RESPONSE field rather than being stamped into details here: the detail
-// key belongs to the audit layer, and one producer of it — the transport, which stamps it
-// identically on the allow and on every refusal — is what keeps a single spelling and a
-// single provenance on the tape.
+// Nothing was cleared on this path (the clear is phase two and never ran). spentApprovalID
+// names a single-use grant this commit burned before faulting, so an operator reconciling
+// one-shot approvals doesn't believe it's still live; it rides the response field rather than
+// a detail key so the audit layer stamps it identically on allow and refusal.
 func declassifyRecordFailureDenial(requestID, now string, auditOnly bool, spentApprovalID string) capability.EnforceResponse {
 	resp := denyResponse(requestID, now, auditOnly, nil, capability.DenialInfo{
 		Code:          capability.ErrCodeConditionFailed,
@@ -510,12 +373,9 @@ func declassifyRecordFailureDenial(requestID, now string, auditOnly bool, spentA
 		Details:       map[string]interface{}{capability.FlowAuditDetailKey: true, "phase": "record"},
 	})
 	if spentApprovalID != "" {
-		// A handle carrying NO labels and no authorizing approval: nothing here authorized a
-		// clear (the resolution never got that far), and its whole job is to name the burned
-		// grant. The dedicated constructor is what keeps the id off ApprovalID(), which feeds
-		// the top-level signed approval_id — reserved for a declassification that actually
-		// took effect, so a refusal must not populate it. The commit skips a handle with an
-		// empty set, so this cannot become a clear on a refused call either.
+		// Carries no labels and no authorizing approval — its only job is to name the burned
+		// grant. The dedicated constructor keeps the id off ApprovalID(), reserved for a
+		// declassification that actually took effect.
 		resp.Declassification = capability.NewSpentGrantOnly(spentApprovalID)
 	}
 	return resp

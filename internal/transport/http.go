@@ -110,11 +110,9 @@ func ResolveUpstreamTimeout(flagVal, cfgVal int) int {
 	return defaultUpstreamTimeoutMs
 }
 
-// msToDuration converts milliseconds to a time.Duration, saturating at
-// math.MaxInt64 (~292 years) instead of overflowing. Without this, ms*time.Millisecond
-// wraps past config.MaxDurationMs into a negative/tiny value that would expire calls
-// instantly and make the idle reaper treat every session as already stale. Callers
-// guard ms <= 0 ("disabled") before calling.
+// msToDuration converts milliseconds to a time.Duration, saturating at math.MaxInt64 instead
+// of overflowing. Without this, ms*time.Millisecond wraps past config.MaxDurationMs into a
+// negative/tiny value that expires calls instantly. Callers guard ms <= 0 ("disabled").
 func msToDuration(ms int) time.Duration {
 	if int64(ms) > config.MaxDurationMs {
 		return time.Duration(math.MaxInt64)
@@ -122,12 +120,9 @@ func msToDuration(ms int) time.Duration {
 	return time.Duration(ms) * time.Millisecond
 }
 
-// addSlack adds writeSlack to d, saturating at math.MaxInt64 instead of overflowing.
-// msToDuration saturates the ms->Duration conversion, but at the documented-max
-// upstream timeout (config.MaxDurationMs) the in-range product sits within a few
-// hundred microseconds of math.MaxInt64, so a bare `d + writeSlack` would wrap to a
-// large negative value — a write deadline in the PAST that fails every response write.
-// d is assumed non-negative (it comes from msToDuration or a positive constant budget).
+// addSlack adds writeSlack to d, saturating at math.MaxInt64 instead of overflowing. At the
+// documented-max upstream timeout, a bare `d + writeSlack` would wrap negative — a write
+// deadline in the PAST that fails every response write.
 func addSlack(d time.Duration) time.Duration {
 	if d > time.Duration(math.MaxInt64)-writeSlack {
 		return time.Duration(math.MaxInt64)
@@ -135,27 +130,18 @@ func addSlack(d time.Duration) time.Duration {
 	return d + writeSlack
 }
 
-// rearmWriteDeadline resets the connection's write deadline to a fresh window before a
-// handler leg does slow work and then writes its response.
+// rearmWriteDeadline resets the connection's write deadline to a fresh window before a handler
+// leg does slow work and then writes its response.
 //
-// The deadline armed at handler entry is measured FROM entry, so any leg whose work can
-// approach it — a teardown bounded by --shutdown-timeout, a notification forwarded to a
-// slow upstream — can reach its own write with the deadline already past. The response is
-// then dropped for an operation that in fact succeeded, which is at its worst on the kill
-// endpoint: `eunox kill` prints a failure for an emergency stop that took effect.
+// The deadline armed at handler entry is measured FROM entry, so a leg whose work approaches
+// it (a --shutdown-timeout teardown, a slow-upstream notification) can reach its write with
+// the deadline already past — dropping a response for an operation that in fact succeeded,
+// worst on the kill endpoint: `eunox kill` reporting failure for a stop that took effect.
 //
-// budgetMs is the leg's own budget in milliseconds (0 means "no configured budget"); the
-// window is that budget plus writeSlack, floored at httpWriteTimeout so a small or absent
-// budget still leaves a usable window for the write itself. Best-effort, matching every
-// other SetWriteDeadline site: a ResponseWriter that does not support it changes nothing.
-//
-// Every response-write deadline in this package goes through this helper (or its Duration
-// and teardown spellings). Four hand-written expressions of "how long may this write take"
-// is how the entry-deadline bug arose in the first place — each site computed its own
-// window and one of them was wrong for its leg. One helper with one floor rule is what
-// keeps that class of bug from recurring. The SSE delivery loop is the deliberate
-// exception: it arms a per-chunk FORWARD-PROGRESS deadline, a different policy on purpose
-// (see the SSE write-deadline entry in docs/threat-model-mcp.md), and must not be folded in.
+// budgetMs is the leg's own budget (0 = none); window is budget+writeSlack, floored at
+// httpWriteTimeout. Every response-write deadline in this package goes through this helper (or
+// its Duration/teardown spellings) so the floor rule lives once. The SSE delivery loop is the
+// deliberate exception — a per-chunk forward-progress deadline, a different policy on purpose.
 func rearmWriteDeadline(w http.ResponseWriter, budgetMs int) {
 	var budget time.Duration
 	if budgetMs > 0 {
@@ -165,11 +151,9 @@ func rearmWriteDeadline(w http.ResponseWriter, budgetMs int) {
 }
 
 // rearmWriteDeadlineFor is rearmWriteDeadline's core, taking the leg's budget as a Duration
-// for the one caller that computes one directly (session establishment, whose budget is the
-// larger of sessionStartTimeout and --upstream-timeout). Routing that caller through the
-// millisecond spelling would mean converting a Duration to int milliseconds only to convert
-// it back, which truncates and can overflow int on a 32-bit build at the saturated budget
-// msToDuration deliberately produces.
+// for the one caller that computes one directly (session establishment). Routing that caller
+// through the millisecond spelling would truncate and could overflow int at the saturated
+// budget msToDuration produces.
 //
 // budget <= 0 means "no configured budget"; see rearmWriteDeadline for the floor rule.
 func rearmWriteDeadlineFor(w http.ResponseWriter, budget time.Duration) {
@@ -182,14 +166,11 @@ func rearmWriteDeadlineFor(w http.ResponseWriter, budget time.Duration) {
 	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(window))
 }
 
-// rearmWriteDeadlineForTeardown re-arms for a leg that waits on httpSession.close, whose
-// worst case is TWO sequential --shutdown-timeout bounds, not one: close waits that long
-// for the subprocess to exit, then SIGKILLs it and calls waitBounded for the SAME budget
-// again. Arming a single budget therefore left the deadline past at exactly the setting
-// the re-arm exists for (--shutdown-timeout of 30s: a 35s window against a 60s worst
-// case), so the operator still saw `eunox kill` or a DELETE fail on a teardown that in
-// fact succeeded. The global kill sweeps sessions in parallel, so its wall clock is that
-// same per-session worst case rather than N times it.
+// rearmWriteDeadlineForTeardown re-arms for a leg that waits on httpSession.close, whose worst
+// case is TWO sequential --shutdown-timeout bounds: close waits that long for the subprocess
+// to exit, then SIGKILLs it and waits again. Arming a single budget left the deadline past at
+// exactly the setting the re-arm exists for. The global kill sweeps sessions in parallel, so
+// its wall clock is that same per-session worst case, not N times it.
 func rearmWriteDeadlineForTeardown(w http.ResponseWriter, shutdownMs int) {
 	if shutdownMs > 0 && shutdownMs <= math.MaxInt/2 {
 		shutdownMs *= 2
@@ -197,44 +178,29 @@ func rearmWriteDeadlineForTeardown(w http.ResponseWriter, shutdownMs int) {
 	rearmWriteDeadline(w, shutdownMs)
 }
 
-// ResolveMaxSessions folds the --max-sessions flag and the config's
-// listen.maxSessions into the effective concurrent-session cap.
-//
-// A present config value wins, including 0 (unlimited): cfgVal is a pointer, so a
-// present key overrides the flag while an absent key (nil) leaves the flag's value
-// in force. This keeps "0 = unlimited" expressible from config. Delegates to the
-// shared config.ResolveInt pointer-override resolver.
+// ResolveMaxSessions folds the --max-sessions flag and the config's listen.maxSessions into
+// the effective concurrent-session cap. A present config value wins, including 0 (unlimited):
+// cfgVal is a pointer, so an absent key (nil) leaves the flag's value in force.
 func ResolveMaxSessions(flagVal int, cfgVal *int) int {
 	return config.ResolveInt(cfgVal, flagVal)
 }
 
 // ResolveSessionIdleTimeout folds the --session-idle-timeout flag and the config's
-// listen.sessionIdleTimeoutMs into the effective idle-reap window (milliseconds).
-//
-// A present config value wins, including 0 (no idle reaping): cfgVal is a pointer, so a
-// present key overrides the flag while an absent key (nil) leaves the flag's value in
-// force. This keeps "0 = no idle reaping" expressible from config even when the flag is
-// non-zero. Mirrors ResolveMaxSessions; both delegate to config.ResolveInt.
+// listen.sessionIdleTimeoutMs into the effective idle-reap window. Mirrors ResolveMaxSessions:
+// a present config value wins, including 0 (no idle reaping).
 func ResolveSessionIdleTimeout(flagVal int, cfgVal *int) int {
 	return config.ResolveInt(cfgVal, flagVal)
 }
 
-// killActivator is the one-way half of the kill switch: the loopback control endpoint
-// can ISSUE a revocation and can never lift one. It exists to make that invariant
-// structural rather than documentary.
+// killActivator is the one-way half of the kill switch: the loopback control endpoint can
+// ISSUE a revocation and can never lift one — structural, not documentary.
 //
-// The reason is the endpoint's own threat model. A same-host process that reaches the
-// loopback endpoint holding the control token can already halt this proxy — a documented
-// residual. Giving that same reach an undo would let it lift the very revocation issued
-// against it, which is why `eunox kill --revive` is deliberately Redis-only. With the
-// handle typed as the full killswitch.Manager, "generalize /control/kill for symmetry
-// with the CLI" is a three-line additive diff that compiles and runs with no resistance
-// from the type system or the existing tests. Narrowed, it does not compile.
+// A same-host process holding the control token can already halt this proxy (a documented
+// residual); giving that reach an undo would let it lift the very revocation issued against
+// it, which is why `eunox kill --revive` is deliberately Redis-only.
 //
-// Keep this interface narrow. Widening it back to killswitch.Manager is not a tidy-up:
-// it re-opens the undo path this type exists to keep shut. The CLI side already holds
-// itself to the same bar — reviveViaRedis takes the concrete *killswitch.Redis rather
-// than the Manager interface, for exactly this reason.
+// Keep this interface narrow: widening it back to killswitch.Manager re-opens the undo path
+// this type exists to keep shut. The CLI's reviveViaRedis holds itself to the same bar.
 type killActivator interface {
 	// ActivateGlobal stops the whole deployment. There is no DeactivateGlobal here.
 	ActivateGlobal(ctx context.Context) error
@@ -250,57 +216,41 @@ type HTTPProxy struct {
 	oauthMeta    *OAuthResourceMetadata // non-nil when --oauth-resource / listen.oauthResource is set (which the CLI admits only alongside bearer-token validation)
 	oauthMetaURL string                 // absolute metadata URL for WWW-Authenticate; empty when --oauth-resource is not set
 	sink         *audit.Sink
-	// ks is deliberately the kill-ONLY interface, not killswitch.Manager: see
-	// killActivator. health.go's healthReporter assertion is on the dynamic type and is
-	// unaffected by the narrowing.
+	// ks is deliberately the kill-ONLY interface, not killswitch.Manager: see killActivator.
 	ks                 killActivator
 	shutdownMs         int
 	upstreamTimeMs     int
 	requireAuditStrict bool // --require-audit=strict: deny forwards once the audit trail degrades
-	// strictAuditWarned makes the sticky strict-gate stderr warning one-shot; the
-	// durable per-call signal is the AUDIT_UNAVAILABLE audit record.
+	// strictAuditWarned makes the sticky strict-gate stderr warning one-shot.
 	strictAuditWarned atomic.Bool
 	authToken         string
-	// controlToken authenticates POST /control/kill (loopback only). Generated at
-	// startup so the emergency-stop endpoint is never reachable by a same-host
-	// process merely because it is on loopback (SEC-07). Empty ⟹ refuse all requests
-	// (fail closed).
+	// controlToken authenticates POST /control/kill (loopback only) so a same-host process is
+	// not automatically trusted merely for being on loopback (SEC-07). Empty means fail closed.
 	controlToken string
-	// afterListen runs once the listener has bound and before any request is served,
-	// for startup work that must not happen when the bind fails. See HTTPGatewayOptions.
+	// afterListen runs once the listener has bound and before any request is served, for
+	// startup work that must not happen when the bind fails. See HTTPGatewayOptions.
 	afterListen func(context.Context) error
-	// afterListenBudget bounds that hook. Per-proxy rather than read from the package
-	// constant at the call site so a test can shorten it without mutating shared state —
-	// the property worth testing (a stalled hook is abandoned) is only observable over a
-	// window measured in seconds otherwise, and a package-level knob would race across
-	// parallel tests. Zero means afterListenTimeout.
+	// afterListenBudget bounds that hook. Per-proxy (not a package constant) so a test can
+	// shorten it without racing other parallel tests. Zero means afterListenTimeout.
 	afterListenBudget time.Duration
-	// authTimingKey is a per-process random HMAC key folding presented/expected
-	// tokens to a fixed-length MAC before the constant-time comparison in checkAuth /
-	// checkControlToken. See constantTimeTokenEqual for the timing rationale.
+	// authTimingKey is a per-process random HMAC key folding presented/expected tokens to a
+	// fixed-length MAC before the constant-time comparison. See constantTimeTokenEqual.
 	authTimingKey []byte
-	// preSessionDenies bounds the rate of transport-level refusal records. Those are the
-	// only audit writes an unauthenticated caller can trigger, so without a bound they are
-	// a lever on --require-audit=strict; see newPreSessionDenyLimiter.
+	// preSessionDenies bounds the rate of transport-level refusal records — the only audit
+	// writes an unauthenticated caller can trigger, else a lever on --require-audit=strict.
 	preSessionDenies *categoryRecordLimiter
 	trustFwdFor      bool
-	// trustedProxyNets is the compiled listen.trustedProxyCIDRs allowlist: under
-	// trustFwdFor, the immediate TCP peer (RemoteAddr) must match one of these
-	// networks before X-Forwarded-For is honored — see sourceIP. Empty means no peer
-	// can ever match, so trustFwdFor alone has no effect until CIDRs are configured.
+	// trustedProxyNets is the compiled listen.trustedProxyCIDRs allowlist: under trustFwdFor,
+	// the immediate TCP peer must match one before X-Forwarded-For is honored — see sourceIP.
 	trustedProxyNets []*net.IPNet
-	// trustedProxyHops is listen.trustedProxyHops: the number of trusted proxies in
-	// front of eunox, and so how many right-most X-Forwarded-For entries are
-	// proxy-written. 0 means unset; sourceIP reads it through proxyHops, which supplies
-	// the single-proxy default, so the zero value is the common production case rather
-	// than an invalid one.
+	// trustedProxyHops is listen.trustedProxyHops: how many right-most X-Forwarded-For
+	// entries are proxy-written. 0 means unset; sourceIP applies the single-proxy default.
 	trustedProxyHops int
 	bind             string
 	port             int
 
-	// maxSessions caps concurrent sessions (0 = unlimited); sessionIdleMs reaps
-	// sessions idle for that many milliseconds (0 = no reaping). Both bound the
-	// otherwise-unbounded subprocess-per-session resource footprint.
+	// maxSessions caps concurrent sessions (0 = unlimited); sessionIdleMs reaps sessions idle
+	// for that many milliseconds (0 = no reaping) — bounding the per-session subprocess footprint.
 	maxSessions   int
 	sessionIdleMs int
 
@@ -309,78 +259,56 @@ type HTTPProxy struct {
 	// accepted (loopback names plus the non-wildcard bind host).
 	allowedOrigins []string
 	// loopbackPinHosts holds the hostnames of allowedOrigins entries, read ONLY by the
-	// DNS-rebinding Host pin on the loopback endpoints so it is no stricter than the /mcp
-	// Origin gate. Deliberately not merged into allowedOriginHosts: see buildLoopbackPinHosts.
+	// DNS-rebinding Host pin on the loopback endpoints. Not merged into allowedOriginHosts:
+	// see buildLoopbackPinHosts.
 	loopbackPinHosts   map[string]bool
 	allowedOriginHosts map[string]bool
 
-	// routes maps a route name (the /mcp/<name> path segment) to its upstream wiring
-	// and enforcement state. Single-upstream mode keys one route by "" (served at
-	// /mcp); gateway mode holds one route per upstream.
+	// routes maps a route name (the /mcp/<name> path segment) to its upstream wiring and
+	// enforcement state. Single-upstream mode keys one route by "" (served at /mcp).
 	routes map[string]*UpstreamRoute
 
-	// baseCtx is the serve-lifetime context. Session reader goroutines outlive the
-	// HTTP request that created the session, so they inherit this — not the request's
-	// context — for kill-switch lookups on the upstream-initiated path. Guarded by
-	// p.mu: Serve writes it once at startup while handler goroutines (via serveCtx)
-	// read it concurrently, so the publish must be synchronized (a plain
-	// interface-field write/read is a data race under -race, and a torn read could
-	// surface a nil context to a downstream ctx.Done()). serveCtx must never be called
-	// while already holding p.mu (p.mu is not reentrant); today its sole caller,
-	// newSession, evaluates it after registerSession has released the lock.
+	// baseCtx is the serve-lifetime context. Session reader goroutines outlive the HTTP
+	// request that created the session, so they inherit this rather than the request's
+	// context, for kill-switch lookups on the upstream-initiated path. Guarded by p.mu since
+	// Serve writes it once while handler goroutines read it concurrently (a plain
+	// interface-field write/read is a data race under -race).
 	baseCtx context.Context
 
-	// mu guards sessions, baseCtx, and shuttingDown. An RWMutex so the read-only
-	// per-request paths (getSession, sessionCount, serveCtx) take RLock and run
-	// concurrently with each other and the reaper instead of serializing on an
-	// exclusive lock; the check-then-write paths (registerSession's cap check-then-
-	// insert, handleMCPDelete, closeAllSessions, the remote cleanup delete) keep Lock.
+	// mu guards sessions, baseCtx, and shuttingDown. An RWMutex so read-only per-request paths
+	// (getSession, sessionCount, serveCtx) take RLock and run concurrently; check-then-write
+	// paths (registerSession's cap check, handleMCPDelete, closeAllSessions) keep Lock.
 	mu       sync.RWMutex
 	sessions map[string]*httpSession
-	// shuttingDown is set under mu at the start of closeAllSessions so a slow
-	// in-flight initialize whose registerSession lands AFTER the registry is emptied
-	// fails closed instead of leaking its upstream subprocess + goroutines into a map
-	// nothing will ever reap. See registerSession.
+	// shuttingDown is set under mu at the start of closeAllSessions so a slow in-flight
+	// initialize registering AFTER the registry is emptied fails closed instead of leaking
+	// its upstream subprocess. See registerSession.
 	shuttingDown bool
-	// reapGen is incremented under mu by reapAllKilledSessions each time it sweeps the
-	// registry. newSession/newRemoteSession capture the generation in force when they
-	// begin (currentReapGen), and registerSession rejects the insert if the generation
-	// has since advanced — closing the race where a session-creating initialize that
-	// started before a global kill finishes its (possibly slow) handshake and would
-	// otherwise register into the fresh map AFTER the sweep, leaking an undead upstream
-	// and its maxSessions slot. Unlike shuttingDown this is not a permanent latch: the
-	// registry keeps serving new registrations (e.g. once the kill is later cleared),
-	// so a raced registration is simply rejected (the caller retries) rather than the
-	// registry being closed forever. See reapAllKilledSessions and registerSession.
+	// reapGen is incremented under mu by reapAllKilledSessions each sweep. registerSession
+	// rejects an insert if the generation has advanced since the session began establishing —
+	// closing the race where an initialize that started before a global kill would otherwise
+	// register into the fresh map after the sweep, leaking an undead upstream. Unlike
+	// shuttingDown this is not a permanent latch: a raced registration is simply rejected
+	// (the caller retries). See reapAllKilledSessions and registerSession.
 	reapGen uint64
-	// revoked wakes the reclaim worker (reclaimOnRevocation) when the kill switch reports
-	// that its local view gained a revocation. One buffered slot, so a burst coalesces into
-	// one sweep and a revocation raised before the worker starts is not lost. Written only by
-	// onRevocation's non-blocking send, so the kill switch's delivery goroutines are never
-	// stalled by a sweep.
+	// revoked wakes the reclaim worker (reclaimOnRevocation). One buffered slot, so a burst
+	// coalesces into one sweep and nothing raised before the worker starts is lost.
 	revoked chan struct{}
-	// unobserveRevocations releases this proxy's registration on the shared kill switch.
-	// Written once in the constructor and called once by Serve's teardown. nil for a proxy
-	// assembled by a struct literal (as tests do), which registered nothing to release.
+	// unobserveRevocations releases this proxy's registration on the shared kill switch. nil
+	// for a proxy assembled by a struct literal (tests), which registered nothing.
 	unobserveRevocations func()
 	// establishing counts sessions that have RESERVED a maxSessions slot but have not
-	// registered into sessions yet — they are between tryReserveSessionSlot and
-	// registerSession, spending up to sessionStartTimeout on an upstream spawn,
-	// initialize handshake, and drift probe. Guarded by mu.
+	// registered yet — between tryReserveSessionSlot and registerSession, spending up to
+	// sessionStartTimeout on an upstream spawn, handshake, and drift probe. Guarded by mu.
 	//
-	// The cap must count them: registerSession alone makes the cap authoritative over
-	// what is REGISTERED, but N concurrent initialize POSTs against an empty registry
-	// would all pass a registry-only pre-check, all spawn an upstream, and only
-	// maxSessions of them register — the rest torn down after the handshake, repeatable
-	// every window. That is PID/FD/memory exhaustion despite the cap, and it
-	// contradicts --max-sessions' documented "refused with 503 rather than spawning".
-	// Reserving before the spawn and releasing on every path closes the window.
+	// The cap must count them: registerSession alone would let N concurrent initialize POSTs
+	// against an empty registry all pass a registry-only pre-check and all spawn an
+	// upstream, repeatable every window — PID/FD/memory exhaustion despite the cap.
 	establishing int
 }
 
-// HTTPGatewayOptions configures a multi-upstream gateway HTTPProxy: one process
-// fronting N upstreams, one per route, sharing a single audit sink and
-// kill-switch. Routes are built by BuildRoutes from a gateway config.
+// HTTPGatewayOptions configures a multi-upstream gateway HTTPProxy: one process fronting N
+// upstreams, one per route, sharing a single audit sink and kill-switch.
 type HTTPGatewayOptions struct {
 	Routes         map[string]*UpstreamRoute
 	Sink           *audit.Sink
@@ -391,41 +319,33 @@ type HTTPGatewayOptions struct {
 	ShutdownMs     int
 	UpstreamTimeMs int
 	AuthToken      string
-	// ControlToken authenticates POST /control/kill (loopback only). Generated at
-	// startup by the proxy command; required independently of AuthToken/JWT mode.
+	// ControlToken authenticates POST /control/kill (loopback only), required independently
+	// of AuthToken/JWT mode.
 	ControlToken string
-	// AfterListen, when non-nil, runs inside Serve immediately after the listener binds
-	// and before the server accepts anything. It exists for startup effects that must not
-	// happen when the bind fails: persisting the control token overwrites the shared
-	// default path, so doing it before the bind lets a second proxy that dies on "address
-	// already in use" replace the RUNNING proxy's token on disk and break `eunox kill`
-	// against it. Returning an error closes the listener and fails Serve, so a hook that
-	// cannot complete does not leave a half-started proxy serving.
+	// AfterListen, when non-nil, runs inside Serve immediately after the listener binds and
+	// before the server accepts anything — startup effects that must not happen when the bind
+	// fails: persisting the control token before the bind would let a second proxy that dies
+	// on "address already in use" replace the RUNNING proxy's token on disk.
 	//
-	// The context it receives is bounded (afterListenTimeout) and cancels on Serve's own
-	// ctx. A hook MUST honour it: the socket is already bound and accepting into the
-	// kernel backlog while this runs, but nothing is answering yet, so every second spent
-	// here is a second a client racing startup spends hung rather than being cleanly
-	// refused. Expiry is expected to abort the hook's effect, not merely be reported —
-	// see WriteControlTokenFile, which checks it immediately before its publishing rename
-	// so an abandoned write cannot land later.
+	// The context it receives is bounded (afterListenTimeout) and cancels on Serve's own ctx.
+	// A hook MUST honour it: the socket is already accepting into the kernel backlog while
+	// this runs but nothing answers yet, so every second here is a client racing startup
+	// spending it hung. Expiry must abort the hook's effect, not merely be reported — see
+	// WriteControlTokenFile, which checks it immediately before its publishing rename.
 	AfterListen func(ctx context.Context) error
 	TrustFwdFor bool
-	// TrustedProxyCIDRs is listen.trustedProxyCIDRs: the reverse-proxy peer addresses
-	// trusted to set X-Forwarded-For under TrustFwdFor. Entries must already be valid
-	// CIDRs (GatewayConfig.Validate parses and rejects malformed ones at config load);
-	// an entry that still fails to parse here is skipped (never trusted) and logged,
-	// rather than silently narrowing the allowlist.
+	// TrustedProxyCIDRs is listen.trustedProxyCIDRs: reverse-proxy peers trusted to set
+	// X-Forwarded-For under TrustFwdFor. An entry that fails to parse here is skipped (never
+	// trusted) and logged, rather than silently narrowing the allowlist.
 	TrustedProxyCIDRs []string
-	// TrustedProxyHops is listen.trustedProxyHops: how many trusted proxies sit in
-	// front of eunox, i.e. how many right-most X-Forwarded-For entries were written by
-	// trusted hops. 0 (unset) is normalized to 1. See sourceIP.
+	// TrustedProxyHops is listen.trustedProxyHops: how many right-most X-Forwarded-For
+	// entries were written by trusted hops. 0 (unset) is normalized to 1. See sourceIP.
 	TrustedProxyHops int
 	Bind             string
 	Port             int
 
-	// RequireAuditStrict is the --require-audit=strict gate: deny enforced forwards
-	// (and */list enumeration) fail-closed once the shared audit trail degrades.
+	// RequireAuditStrict is the --require-audit=strict gate: deny enforced forwards (and
+	// */list enumeration) fail-closed once the shared audit trail degrades.
 	RequireAuditStrict bool
 
 	// MaxSessions caps concurrent sessions (0 = unlimited); SessionIdleMs reaps
@@ -457,11 +377,9 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 		if _, ipNet, err := net.ParseCIDR(cidr); err == nil {
 			trustedProxyNets = append(trustedProxyNets, ipNet)
 		} else {
-			// GatewayConfig.Validate rejects a malformed entry before the CLI ever
-			// reaches here, so this should be unreachable on that path — but
-			// NewHTTPProxyGateway is an exported constructor a caller could invoke
-			// directly with an unvalidated list, so warn rather than silently trust
-			// fewer peers than configured.
+			// GatewayConfig.Validate rejects a malformed entry before the CLI reaches here, but
+			// this is an exported constructor a caller could invoke directly, so warn rather
+			// than silently trust fewer peers than configured.
 			fmt.Fprintf(os.Stderr, "[eunox] WARNING: listen.trustedProxyCIDRs entry %q is not a valid CIDR and will never be trusted: %v\n", cidr, err)
 		}
 	}
@@ -493,13 +411,9 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 		sessions:           make(map[string]*httpSession),
 		revoked:            make(chan struct{}, 1),
 	}
-	// Registered at construction rather than at Serve, so a kill delivered during startup is
-	// not lost: the trigger is one buffered slot, so a revocation raised before the worker
-	// exists is coalesced into it and served by the first tick of the worker. The unregister
-	// is kept because the kill switch OUTLIVES this proxy — it is built once and may be handed
-	// to a second one (a retry after a listener error, a reload) — and Serve releases it on
-	// return, so a proxy that is done is not kept reachable, and called, by the backend it
-	// registered with.
+	// Registered at construction (not Serve) so a kill delivered during startup is not lost —
+	// the buffered slot coalesces it, served by the worker's first tick. Unregister is kept
+	// because the kill switch OUTLIVES this proxy and may be handed to a second one.
 	p.unobserveRevocations = opts.KS.ObserveRevocations(p.onRevocation)
 	return p
 }
@@ -507,16 +421,12 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 // onRevocation is the kill switch's callback (killswitch.Manager.ObserveRevocations): it wakes
 // the reclaim worker and returns.
 //
-// It must not block, and it does not: the send is non-blocking onto a one-slot channel, so a
-// burst of revocations coalesces into a single sweep instead of one goroutine per event each
-// walking the whole registry. The caller is the backend's single real-time kill-event consumer
-// (its pub/sub listener) or its reconcile loop, and stalling either would delay the delivery of
-// every LATER kill on this instance — a kill switch made slower by its own reclaim.
+// Must not block: the send is non-blocking onto a one-slot channel, so a burst of revocations
+// coalesces into a single sweep instead of stalling the backend's real-time kill-event consumer.
 //
 // The event's fields are deliberately unused. A Revocation is a trigger, not a work list: the
 // sweep re-asks the kill switch about each session it actually holds, through the same
-// predicate the idle reaper uses, so an AGENT-scoped kill needs no agent→session map here and
-// the two paths cannot disagree about what "killed" means.
+// predicate the idle reaper uses, so an AGENT-scoped kill needs no agent→session map here.
 func (p *HTTPProxy) onRevocation(killswitch.Revocation) {
 	select {
 	case p.revoked <- struct{}{}:
@@ -525,8 +435,8 @@ func (p *HTTPProxy) onRevocation(killswitch.Revocation) {
 }
 
 // reclaimOnRevocation runs until ctx is done, sweeping for killed sessions each time the kill
-// switch reports a revocation. One worker, so concurrent revocations produce one sweep at a
-// time rather than a fan-out that could close the same session from N goroutines.
+// switch reports a revocation. One worker, so concurrent revocations produce one sweep, not a
+// fan-out that could close the same session from N goroutines.
 func (p *HTTPProxy) reclaimOnRevocation(ctx context.Context) {
 	for {
 		select {
@@ -539,14 +449,10 @@ func (p *HTTPProxy) reclaimOnRevocation(ctx context.Context) {
 }
 
 // warnForwardedForPosture emits the startup SECURITY lines describing how this proxy will
-// resolve a client IP from X-Forwarded-For. Split out of Serve so the posture rules read
-// as one unit rather than as another block in the startup sequence.
-//
-// --trust-forwarded-for only honors X-Forwarded-For from a peer whose RemoteAddr matches
-// listen.trustedProxyCIDRs (see sourceIP); a request from any other peer falls back to its
-// own RemoteAddr, so a client that connects directly cannot spoof an ipRange source purely
-// by setting the header. Warn anyway: an empty allowlist makes the flag a no-op, and even
-// a configured allowlist is only as strong as how tightly it is scoped.
+// resolve a client IP from X-Forwarded-For. Split out of Serve so the posture rules read as
+// one unit. Warns even though a direct-connecting client cannot spoof an ipRange source (see
+// sourceIP): an empty allowlist makes the flag a no-op, and a configured one is only as
+// strong as how tightly it is scoped.
 func (p *HTTPProxy) warnForwardedForPosture() {
 	if !p.trustFwdFor {
 		return
@@ -570,12 +476,8 @@ func (p *HTTPProxy) warnForwardedForPosture() {
 		)
 	}
 	// The declared hop count is trusted verbatim, and the two ways to get it wrong are not
-	// symmetric. Under-declaring is safe (the read lands on a proxy-written entry further
-	// right, or the chain is short and fails closed); OVER-declaring points the read at a
-	// client-supplied entry, so a client behind the proxy can choose its own ipRange source
-	// with a single forged header. Nothing can validate the count at runtime without
-	// reintroducing the CIDR inference this design rejects, so state it at startup where an
-	// operator can compare it against the real topology.
+	// symmetric: under-declaring is safe, but OVER-declaring points the read at a
+	// client-supplied entry, letting a client behind the proxy forge its own ipRange source.
 	if hops := p.proxyHops(); hops > 1 {
 		fmt.Fprintf(os.Stderr,
 			"[eunox] SECURITY: listen.trustedProxyHops is %d, so the client is read %d entries from the right "+
@@ -587,33 +489,25 @@ func (p *HTTPProxy) warnForwardedForPosture() {
 	}
 }
 
-// runAfterListen runs the post-bind startup hook under a bound, closing ln and returning
-// an error if it cannot complete. Split out of Serve so the bound and its abandonment
-// rules sit together in one readable unit rather than as a block in the middle of server
-// assembly.
+// runAfterListen runs the post-bind startup hook under a bound, closing ln and returning an
+// error if it cannot complete. Split out of Serve so the bound and its abandonment rules sit
+// together in one readable unit.
 //
-// Between net.Listen returning and srv.Serve starting the accept loop, the kernel
-// completes handshakes into the backlog for a socket no userspace is reading, so a request
-// arriving in this window HANGS rather than being refused. The hook's slowest step is an
-// fsync, which has no upper bound on a contended volume or a stalled mount.
-//
-// The hook therefore runs on its own goroutine and the select ABANDONS it on expiry.
-// Passing the bounded context and calling the hook synchronously would not bound anything:
-// Go cannot interrupt a blocked fsync, so the deadline would only be observed after the
-// stall had already ended -- the same hang, plus a new startup failure. Abandoning is what
-// makes the window finite, and it is safe precisely because WriteControlTokenFile
-// re-checks the context immediately before its publishing rename: an abandoned write
-// cannot land later and clobber the token of whatever proxy is actually serving.
+// Between net.Listen returning and srv.Serve starting the accept loop, the kernel completes
+// handshakes into the backlog for a socket no userspace is reading, so a request arriving in
+// this window HANGS rather than being refused. The hook's slowest step (an fsync) has no
+// upper bound, so it runs on its own goroutine and the select ABANDONS it on expiry — Go
+// cannot interrupt a blocked fsync, so a synchronous call would not bound anything. Safe
+// because WriteControlTokenFile re-checks the context immediately before its publishing
+// rename: an abandoned write cannot land later and clobber a running proxy's token.
 func (p *HTTPProxy) runAfterListen(ctx context.Context, ln net.Listener) error {
 	if p.afterListen == nil {
 		return nil
 	}
 	hook := p.afterListen
 	// Drop the reference before running it, not after: Serve blocks for the life of the
-	// process, so a hook that never returns (or the p itself outliving this call) would
-	// otherwise pin the hook's closed-over state -- e.g. a control-token path string, or
-	// whatever a future caller captures -- in the heap for no further purpose once this
-	// one-shot startup effect has fired.
+	// process, so a hook that never returns would otherwise pin its closed-over state in the
+	// heap forever.
 	p.afterListen = nil
 
 	budget := p.afterListenBudget
@@ -635,14 +529,11 @@ func (p *HTTPProxy) runAfterListen(ctx context.Context, ln net.Listener) error {
 		return nil
 	}
 	_ = ln.Close()
-	// A hook cut short by SHUTDOWN is not a startup failure. Serve's ctx is cancelled by
-	// the signal handler, and hookCtx inherits that, so without this an operator who stops
-	// the proxy during startup would get a fatal error and a non-zero exit where the
-	// process previously shut down cleanly -- enough to make a restart-on-failure
-	// supervisor loop during a rollout. A genuine expiry (ctx still live, deadline hit)
-	// still fails Serve, which is the right direction on the merits: the hook persists the
-	// control token, and a proxy whose emergency stop cannot be authenticated should not
-	// come up.
+	// A hook cut short by SHUTDOWN is not a startup failure: Serve's ctx is cancelled by the
+	// signal handler and hookCtx inherits that, so without this an operator stopping the
+	// proxy during startup would get a fatal error on a clean shutdown. A genuine expiry
+	// (ctx still live) still fails Serve — a proxy whose emergency stop can't be
+	// authenticated should not come up.
 	if ctx.Err() != nil {
 		return nil
 	}
@@ -652,9 +543,8 @@ func (p *HTTPProxy) runAfterListen(ctx context.Context, ln net.Listener) error {
 // Serve starts the HTTP server and blocks until ctx is canceled or a fatal
 // error occurs.
 func (p *HTTPProxy) Serve(ctx context.Context) error {
-	// Publish the serve-lifetime context under p.mu so the concurrent reads in
-	// serveCtx (from session reader goroutines) are synchronized. The write happens
-	// before srv.Serve accepts any connection, so no handler can observe the zero value.
+	// Publish the serve-lifetime context under p.mu so the concurrent reads in serveCtx are
+	// synchronized. Happens before srv.Serve accepts any connection.
 	p.mu.Lock()
 	p.baseCtx = ctx
 	p.mu.Unlock()
@@ -668,11 +558,10 @@ func (p *HTTPProxy) Serve(ctx context.Context) error {
 	// Loopback-only operational endpoints (same guard as /control/kill).
 	mux.HandleFunc("/healthz", p.handleHealth)
 	mux.HandleFunc("/metrics", p.handleMetrics)
-	// RFC 9728: serve the protected-resource metadata document at the well-known
-	// base path and, in gateway mode, at the per-route path-inserted variant for
-	// each route. All paths serve the same global document. Track every registered
-	// metadata path so the path-bearing-resource registration below cannot
-	// double-register one (a duplicate mux.HandleFunc panics).
+	// RFC 9728: serve the protected-resource metadata document at the well-known base path
+	// and, in gateway mode, at each route's path-inserted variant. Track registered paths so
+	// the path-bearing-resource registration below cannot double-register (mux.HandleFunc
+	// panics on a duplicate).
 	registeredMeta := map[string]struct{}{metadataBasePath: {}}
 	mux.HandleFunc(metadataBasePath, p.serveOAuthMetadata)
 	for name := range p.routes {
@@ -682,16 +571,11 @@ func (p *HTTPProxy) Serve(ctx context.Context) error {
 			mux.HandleFunc(path, p.serveOAuthMetadata)
 		}
 	}
-	// A path-bearing --oauth-resource: BuildOAuthMetadataURL inserts the resource path
-	// after the well-known base (RFC 9728 §3.1), and that inserted path is what every
-	// 401's WWW-Authenticate challenge advertises. Register it so a client following the
-	// challenge does not get a 404. This covers BOTH single-upstream mode (the "" route)
-	// AND gateway mode where the resource path is not one of the /mcp/<name> routes
-	// registered above — the gateway loop only enumerates route names, so without this a
-	// path-bearing resource that is not a route path advertises an unserved URL. Skip
-	// when the suffix is empty (the base path is already registered) or already
-	// registered as a route path, since a duplicate mux.HandleFunc panics. The suffix is
-	// derived from the served URL so it stays in lockstep with what is advertised.
+	// A path-bearing --oauth-resource: BuildOAuthMetadataURL inserts the resource path after
+	// the well-known base (RFC 9728 §3.1), which every 401's WWW-Authenticate challenge
+	// advertises — register it so a client following the challenge doesn't get a 404. Covers
+	// gateway mode where the resource path is not one of the /mcp/<name> routes above. Skip
+	// when already registered, since a duplicate mux.HandleFunc panics.
 	if p.oauthMetaURL != "" {
 		if suffix := oauthMetadataPathSuffix(p.oauthMetaURL); suffix != "" {
 			path := metadataBasePath + suffix
@@ -702,10 +586,8 @@ func (p *HTTPProxy) Serve(ctx context.Context) error {
 		}
 	}
 
-	// net.JoinHostPort, not fmt.Sprintf("%s:%d"): an IPv6 literal must be bracketed
-	// before ":port" or net.Listen rejects it ("too many colons in address"). Plain
-	// interpolation breaks every IPv6 bind, including the explicitly-supported
-	// bind-all "::" (which would become ":::<port>").
+	// net.JoinHostPort, not fmt.Sprintf("%s:%d"): an IPv6 literal must be bracketed before
+	// ":port" or net.Listen rejects it — plain interpolation breaks every IPv6 bind.
 	addr := net.JoinHostPort(p.bind, strconv.Itoa(p.port))
 	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", addr)
 	if err != nil {
@@ -713,20 +595,14 @@ func (p *HTTPProxy) Serve(ctx context.Context) error {
 	}
 	// Post-bind startup effects (see HTTPGatewayOptions.AfterListen). Runs only once the
 	// address is actually held, so a proxy that loses the bind race leaves the running
-	// instance's on-disk state alone; a hook failure closes the listener and aborts.
+	// instance's on-disk state alone.
 	if err := p.runAfterListen(ctx, ln); err != nil {
 		return err
 	}
-	// A shutdown that lands in the post-bind window ends startup here. runAfterListen
-	// reports a hook cut short by shutdown as success (it is a stop, not a startup
-	// failure) but has already closed the listener on that path, and a hook that
-	// finished just before the signal leaves the listener open with nothing left to
-	// close it. Both need this return: without it srv.Serve gets a listener that is
-	// closed or about to be, and its immediate "use of closed network connection" races
-	// the ctx.Done() arm of the select below -- select picks uniformly among ready
-	// cases, so a graceful stop surfaces a fatal error and a non-zero exit roughly half
-	// the time. Close is idempotent enough for the already-closed arm (it just reports
-	// ErrClosed, which has no bearing on a shutdown path).
+	// A shutdown that lands in the post-bind window ends startup here. Without this, srv.Serve
+	// gets a listener that is closed or about to be, and its immediate "use of closed network
+	// connection" races the ctx.Done() arm of the select below — select picks uniformly among
+	// ready cases, so a graceful stop would surface a fatal error roughly half the time.
 	if ctx.Err() != nil {
 		_ = ln.Close()
 		return nil
@@ -742,12 +618,9 @@ func (p *HTTPProxy) Serve(ctx context.Context) error {
 
 	p.warnForwardedForPosture()
 
-	// A non-loopback bind with neither an auth token nor JWT leaves the enforced /mcp
-	// endpoint open to any off-host client: checkAuth is a no-op without a token/JWKS,
-	// and the Origin guard passes any request that simply omits the Origin header (which
-	// any non-browser client can). Surface this open posture the same way the other
-	// open-posture warnings are, so an operator pairs a non-loopback bind with auth and
-	// network controls deliberately rather than by omission.
+	// A non-loopback bind with neither an auth token nor JWT leaves the enforced /mcp endpoint
+	// open to any off-host client: checkAuth is a no-op without a token/JWKS, and the Origin
+	// guard passes any request that simply omits the Origin header (any non-browser client can).
 	if openNonLoopbackBind(p.bind, p.authToken, p.jwtPDP != nil) {
 		fmt.Fprintf(os.Stderr,
 			"[eunox] SECURITY: proxy is bound to a non-loopback address (%q) with no listen.authToken and no --jwks-uri. "+
@@ -758,9 +631,8 @@ func (p *HTTPProxy) Serve(ctx context.Context) error {
 		)
 	}
 
-	// SEC-03: read/write timeouts prevent Slowloris-style DoS from slow clients.
-	// Long-lived SSE GET streams (handleMCPGet) re-arm a bounded per-chunk
-	// sseWriteTimeout per frame instead of being bound by this fixed WriteTimeout.
+	// SEC-03: read/write timeouts prevent Slowloris-style DoS. Long-lived SSE GET streams
+	// re-arm a bounded per-chunk sseWriteTimeout instead of being bound by this fixed one.
 	srv := &http.Server{
 		// requireValidOrigin wraps every route so the DNS-rebinding Origin check
 		// applies uniformly at one choke point — no handler can forget it.
@@ -772,55 +644,42 @@ func (p *HTTPProxy) Serve(ctx context.Context) error {
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Serve(ln) }()
 
-	// Idle-session reaper: close sessions whose host has gone silent so idle
-	// upstreams cannot pin resources. Disabled when sessionIdleMs is 0. It runs on a
-	// cancelable child of ctx so it stops on EVERY Serve return — a srv.Serve error,
-	// not only an external ctx cancel — rather than being stranded against a dead server.
+	// Idle-session reaper: close sessions whose host has gone silent so idle upstreams cannot
+	// pin resources. Runs on a cancelable child of ctx so it stops on EVERY Serve return, not
+	// only an external ctx cancel.
 	reaperCtx, cancelReaper := context.WithCancel(ctx)
 	defer cancelReaper()
 	if p.sessionIdleMs > 0 {
 		go p.reapIdleSessions(reaperCtx)
 	}
-	// Reclaim on a kill's own DELIVERY, on the same cancelable child. Deliberately NOT gated
-	// on sessionIdleMs: the idle reaper's killed arm is the backstop, and it does not run at
-	// all under sessionIdleTimeoutMs: 0 — a documented, valid config on which a
-	// Redis-delivered kill (a sibling instance's /control/kill, or `eunox kill --redis-addr`)
-	// denied all traffic but reclaimed nothing, leaving the subprocess, the session slot and
-	// the SSE stream pinned until the process exited. It also removes the up-to-one-sweep
-	// (<=30s) reclaim latency the backstop carries even when it IS running.
+	// Reclaim on a kill's own DELIVERY, on the same cancelable child. Deliberately NOT gated on
+	// sessionIdleMs: the idle reaper's killed arm is the backstop, and it does not run at all
+	// under sessionIdleTimeoutMs: 0, where a Redis-delivered kill would otherwise deny traffic
+	// but reclaim nothing until the process exited.
 	go p.reclaimOnRevocation(reaperCtx)
-	// And hand the registration back when this proxy is done, so the kill switch — which may
-	// outlive it — is not left calling into a proxy that serves nothing, holding its session
-	// map, routes and sink reachable. Deferred beside the worker it feeds; nil only for a
+	// Hand the registration back when this proxy is done, so the kill switch (which may
+	// outlive it) is not left calling into a proxy that serves nothing. nil only for a
 	// struct-literal proxy, which registered nothing.
 	if p.unobserveRevocations != nil {
 		defer p.unobserveRevocations()
 	}
 
-	// Teardown for EVERY Serve return path — a graceful ctx cancel OR a srv.Serve
-	// error (listener failure) — as a single defer so no return arm can forget it
-	// (the leak this replaces was exactly an error arm that skipped the reap). Order
-	// on return: srv.Shutdown drains in-flight handlers FIRST — it waits for active
-	// requests, so a handler cannot complete registerSession and leak a session AFTER
-	// closeAllSessions empties the registry — then closeAllSessions reaps every live
-	// session's upstream subprocess/connection. cancelReaper (deferred above, so it
-	// runs last) then stops the reaper. A fresh background context is required because
-	// ctx may already be canceled.
+	// Teardown for EVERY Serve return path, as a single defer so no return arm can forget it.
+	// Order: srv.Shutdown drains in-flight handlers FIRST (so a handler cannot complete
+	// registerSession and leak a session AFTER closeAllSessions empties the registry), then
+	// closeAllSessions reaps every live session. Fresh background context since ctx may
+	// already be canceled.
 	defer func() { //nolint:contextcheck // teardown path: closeAllSessions's upstream session-termination DELETE intentionally uses a detached, bounded background context — close/reaper/signal/shutdown carry no request context.
-		// Evict open SSE GET streams FIRST. srv.Shutdown does not cancel in-flight
-		// request contexts, and an SSE handler holds its response open indefinitely
-		// (it selects on the subscriber channel, keepalive, evicted, done, and the
-		// request context — none of which Shutdown fires), so any connected stream would
-		// otherwise pin srv.Shutdown for the full shutdownMs. Closing the evicted signal
-		// wakes every handleMCPGet loop so it returns, letting Shutdown drain promptly.
+		// Evict open SSE GET streams FIRST. srv.Shutdown does not cancel in-flight request
+		// contexts, and an SSE handler holds its response open indefinitely, so any connected
+		// stream would otherwise pin srv.Shutdown for the full shutdownMs.
 		p.evictAllSessionStreams()
 		shutCtx, cancel := context.WithTimeout(context.Background(), msToDuration(p.shutdownMs))
 		defer cancel()
 		_ = srv.Shutdown(shutCtx)
 		p.closeAllSessions()
-		// Release each route's shared upstream connection pool now that every session is
-		// torn down — per-session close() no longer does this (the pool is shared), so the
-		// wholesale release happens once here at shutdown.
+		// Release each route's shared upstream connection pool now that every session is torn
+		// down — per-session close() no longer does this since the pool is shared.
 		for _, rt := range p.routes {
 			rt.closeIdleUpstreamConns()
 		}
@@ -834,12 +693,11 @@ func (p *HTTPProxy) Serve(ctx context.Context) error {
 	}
 }
 
-// serveCtx returns the serve-lifetime context, falling back to
-// context.Background() in tests that bypass Serve.
+// serveCtx returns the serve-lifetime context, falling back to context.Background() in
+// tests that bypass Serve.
 func (p *HTTPProxy) serveCtx() context.Context {
-	// Read baseCtx under p.mu (RLock — read-only) to pair with the synchronized publish
-	// in Serve. Callers must not hold p.mu (it is not reentrant); newSession calls this
-	// only after registerSession has released the lock.
+	// Read baseCtx under p.mu (RLock) to pair with the synchronized publish in Serve.
+	// Callers must not hold p.mu (not reentrant).
 	p.mu.RLock()
 	ctx := p.baseCtx
 	p.mu.RUnlock()

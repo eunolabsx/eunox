@@ -2,12 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // mock-mcp-server is a minimal MCP Streamable HTTP server used only in the
-// eunox demo (demo/docker-compose.yml).  It exposes three tools — read_file,
-// write_file, query_db — and returns deterministic fake responses so every
-// demo scenario produces predictable, inspectable output.
-//
-// The server is intentionally not wired to any real storage.  Its sole purpose
-// is to give eunox a realistic upstream to enforce policies against.
+// eunox demo. It exposes three tools with deterministic fake responses and is
+// not wired to any real storage.
 package main
 
 import (
@@ -47,14 +43,10 @@ type rpcError struct {
 func (m *rpcMsg) isRequest() bool      { return m.ID != nil && m.Method != "" }
 func (m *rpcMsg) isNotification() bool { return m.ID == nil && m.Method != "" }
 
-// UnmarshalJSON distinguishes an ABSENT id (a notification) from an explicit
-// `"id": null` (a valid request identifier). Plain *json.RawMessage decoding
-// collapses both to a nil pointer, so an id:null request would be misclassified as
-// a notification: the initialize path falls through to 202 Accepted with no
-// session, and other id:null requests are silently dropped. Mirrors the hardened
-// internal/mcp.RPCMsg.UnmarshalJSON — decode the id as a value json.RawMessage
-// (zero-length ⟹ absent) and keep any present id, including the literal `null`, as
-// a non-nil pointer so isRequest() classifies it correctly.
+// UnmarshalJSON distinguishes an ABSENT id (notification) from an explicit
+// `"id": null` (a valid request id) — plain *json.RawMessage decoding collapses
+// both to nil, which would misclassify an id:null request as a dropped
+// notification. Mirrors the hardened internal/mcp.RPCMsg.UnmarshalJSON.
 func (m *rpcMsg) UnmarshalJSON(b []byte) error {
 	type alias struct {
 		JSONRPC string          `json:"jsonrpc"`
@@ -104,10 +96,8 @@ func newSessionID() string {
 
 // ServeHTTP dispatches GET/POST/DELETE on /mcp, plus a side-effect-free /healthz.
 func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Liveness probe for container healthchecks. It must NOT touch the session map:
-	// using a real `initialize` request as a periodic probe (the old healthcheck)
-	// allocated and stored a fresh session every interval, with no matching DELETE, so
-	// a healthy long-running demo grew resident sessions without bound.
+	// Must NOT touch the session map: the old healthcheck used a real `initialize`
+	// as its probe, leaking one session per interval with no matching DELETE.
 	if r.URL.Path == "/healthz" {
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "ok\n")
@@ -150,21 +140,15 @@ func (s *server) handlePost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON-RPC body", http.StatusBadRequest)
 		return
 	}
-	// A single JSON-RPC POST body is exactly one JSON value. Decode a second value
-	// and require io.EOF: any trailing non-whitespace token (a stray second message,
-	// or garbage) means the body is malformed and must be rejected before we
-	// dispatch the first value or allocate a session off a clean-looking initialize.
+	// A POST body is exactly one JSON value; decoding a second and requiring io.EOF
+	// catches trailing garbage before we dispatch or allocate a session off it.
 	if err := dec.Decode(new(json.RawMessage)); err != io.EOF {
 		http.Error(w, "invalid JSON-RPC body: trailing data after JSON-RPC message", http.StatusBadRequest)
 		return
 	}
 
-	// initialize always creates a new session regardless of any existing header.
-	// Gate on isRequest() so an initialize *notification* (no id) does not
-	// allocate and store a session: it would return a result/header as if it were
-	// a request and leak one resident session per invalid notification, growing
-	// the in-memory session map without bound. A notification falls through
-	// to the isNotification() branch below and is accepted without mutating state.
+	// Gate on isRequest(): an initialize *notification* (no id) must not allocate a
+	// session, or an invalid notification would leak one resident session each time.
 	if msg.Method == "initialize" && msg.isRequest() {
 		sid := newSessionID()
 		s.mu.Lock()
@@ -193,7 +177,6 @@ func (s *server) handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// All other requests require an existing session.
 	sid := r.Header.Get(sessionHeader)
 	if sid == "" {
 		http.Error(w, "Mcp-Session-Id header required", http.StatusBadRequest)
@@ -217,7 +200,6 @@ func (s *server) handlePost(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// toolDef describes one MCP tool for tools/list.
 type toolDef struct {
 	Name        string                 `json:"name"`
 	Description string                 `json:"description"`
@@ -277,21 +259,18 @@ func (s *server) handleToolsList(w http.ResponseWriter, msg rpcMsg) { //nolint:g
 	writeResult(w, msg.ID, map[string]interface{}{"tools": toolList})
 }
 
-// requiredStringArgs lists the arguments each tool advertises as required string
-// parameters in its input schema. dispatchTool substitutes empty strings on a
-// failed type assertion, so without this check a tools/call with missing or
-// wrong-typed arguments would return a successful result and let the mock violate
-// its own advertised contract. Mirrors the stdio twin (mock-mcp-server-stdio).
+// requiredStringArgs is checked because dispatchTool substitutes empty strings
+// on a failed type assertion, which would otherwise let the mock silently
+// violate its own advertised schema. Mirrors the stdio twin.
 var requiredStringArgs = map[string][]string{
 	"read_file":  {"path"},
 	"write_file": {"path", "content"},
 	"query_db":   {"query"},
 }
 
-// validateToolArgs returns a non-empty message when args does not satisfy name's
-// advertised required string arguments (missing, null, or the wrong type). An
-// unknown tool has no entry and validates clean here; handleToolsCall reports it
-// separately after dispatch.
+// validateToolArgs returns a non-empty message when args doesn't satisfy name's
+// advertised required string arguments; an unknown tool validates clean here
+// and is reported separately by handleToolsCall.
 func validateToolArgs(name string, args map[string]interface{}) string {
 	for _, field := range requiredStringArgs[name] {
 		v, ok := args[field]
@@ -317,9 +296,8 @@ func (s *server) handleToolsCall(w http.ResponseWriter, msg rpcMsg) { //nolint:g
 	if params.Arguments == nil {
 		params.Arguments = map[string]interface{}{}
 	}
-	// Reject calls that violate a tool's advertised required-argument schema with
-	// -32602, matching the stdio twin, instead of fabricating a successful result with
-	// blank substituted strings.
+	// -32602 here, matching the stdio twin, instead of fabricating a successful
+	// result with blank substituted strings.
 	if errMsg := validateToolArgs(params.Name, params.Arguments); errMsg != "" {
 		writeRPCError(w, msg.ID, -32602, errMsg)
 		return

@@ -17,10 +17,8 @@ import (
 )
 
 // afterListenTimeout bounds the post-bind startup hook (see HTTPGatewayOptions.AfterListen),
-// whose one production job is persisting the control token. Generous enough that a merely
-// loaded filesystem still completes, short enough to sit well inside any supervisor's
-// startup patience — and it matches the budget `eunox kill` already gives its own request,
-// so the client racing this window cannot wait longer than the window itself.
+// whose one production job is persisting the control token. Matches the budget `eunox kill`
+// already gives its own request, so a client racing this window cannot wait longer.
 const afterListenTimeout = 10 * time.Second
 
 // ControlTokenHeader carries the loopback control token on POST /control/kill. A
@@ -32,30 +30,20 @@ const ControlTokenHeader = "X-Eunox-Control-Token" //nolint:gosec // G101: heade
 // when --control-token-path is not set and EUNOX_CONTROL_TOKEN is not used.
 const defaultControlTokenPath = "~/.eunox/control.token" //nolint:gosec // G101: a file path, not a credential
 
-// tightenTokenDir enforces the mode of a PRE-EXISTING control-token directory. The
-// split is by who owns the location, not by how loose the mode is:
+// tightenTokenDir enforces the mode of a PRE-EXISTING control-token directory, split by who
+// owns the location rather than by how loose the mode is:
 //
-//   - eunoxOwned (the default ~/.eunox, which only eunox writes): chmod to 0700 and fail
-//     closed if that cannot be done. This is the upgrade path — an older version, or a
-//     packaging step, that left the directory 0755 must not leave the loopback
-//     emergency-stop token sitting in a directory the docs claim is 0700. There is no
-//     shared-use case for this directory, so tightening it cannot break anyone.
-//   - operator-chosen (--control-token-path pointing at /tmp, /var/run, /etc/eunox):
-//     never chmod. Forcing 0700 would strip /tmp's sticky bit and world access
-//     (system-wide breakage as root) or fail with EPERM on a directory the user does not
-//     own. A merely group/world-READABLE directory is warned about — the token file
-//     itself is 0600, so its bytes stay unreadable. A group/world-WRITABLE directory
-//     without the sticky bit is refused outright: any local user can then rename the
-//     token file away and substitute their own, which hands them the emergency stop.
-//     That is an authorization hole, and the fail-closed rule applies.
+//   - eunoxOwned (the default ~/.eunox, which only eunox writes): chmod to 0700, fail closed
+//     if that fails. Repairs an older version/packaging step that left it 0755.
+//   - operator-chosen (--control-token-path elsewhere): never chmod — forcing 0700 could strip
+//     /tmp's sticky bit or fail with EPERM on a directory eunox doesn't own. A merely
+//     group/world-readable directory is warned about (the token file itself is 0600); a
+//     group/world-writable one with no sticky bit is refused outright, since any local user
+//     could substitute their own token file and take over the emergency stop.
 //
-// fi is the RESOLVED directory (os.Stat, symlinks followed), because the mode that
-// matters for both the warning and the refusal is the one that actually governs the
-// directory the token lands in. eunoxOwned is false whenever the path is a symlink, so
-// the chmod never fires through one: os.Chmod follows links, and there is no portable
-// lchmod, so tightening a symlinked ~/.eunox would silently rewrite the mode of whatever
-// it points at — /tmp losing its sticky bit being the worst case. Warning about a linked
-// directory is safe; mutating one eunox did not create is not.
+// fi is the RESOLVED directory (symlinks followed): eunoxOwned is false for a symlink so the
+// chmod never fires through one — os.Chmod follows links and there is no portable lchmod, so
+// tightening a symlinked ~/.eunox would silently rewrite whatever it points at.
 func tightenTokenDir(dir string, fi os.FileInfo, eunoxOwned bool) error {
 	perm := fi.Mode().Perm()
 	if perm&0o077 == 0 {
@@ -74,18 +62,15 @@ func tightenTokenDir(dir string, fi os.FileInfo, eunoxOwned bool) error {
 	return nil
 }
 
-// eunoxOwnedTokenDir reports whether dir is eunox's OWN control-token directory — the
-// one the default --control-token-path lives in, which nothing else writes — and so may
-// be tightened in place.
+// eunoxOwnedTokenDir reports whether dir is eunox's OWN control-token directory — the one the
+// default --control-token-path lives in, which nothing else writes — and so may be tightened.
 //
-// It compares resolved LOCATIONS, not the spelling of the flag. Keying on the raw string
-// made the identical directory take different security treatment depending on how the
-// operator typed it: a systemd unit cannot use "~", and an interactive shell expands it
-// before eunox ever sees the argument, so the deployments most likely to be carrying a
-// 0755 ~/.eunox left by an older release were exactly the ones the upgrade repair skipped.
+// Compares resolved LOCATIONS, not the spelling of the flag: keying on the raw string made an
+// identical directory get different treatment depending on how the operator typed it (e.g. a
+// systemd unit can't use "~"), missing exactly the deployments most likely to need the repair.
 //
-// A symlink is never eunox-owned however it resolves: see tightenTokenDir on why the
-// chmod must not follow one.
+// A symlink is never eunox-owned however it resolves: see tightenTokenDir on why the chmod
+// must not follow one.
 func eunoxOwnedTokenDir(dir string) bool {
 	if lfi, err := os.Lstat(dir); err != nil || lfi.Mode()&os.ModeSymlink != 0 {
 		return false
@@ -107,27 +92,15 @@ func GenerateControlToken() (string, error) {
 	return hex.EncodeToString(b[:]), nil
 }
 
-// WriteControlTokenFile writes token to path (default defaultControlTokenPath)
-// with 0600 perms, overwriting any previous token so a stale one cannot be
-// replayed. Returns the expanded absolute path written. The containing directory
-// is created at 0700 when missing; a pre-existing one is handled by
-// tightenTokenDir, which tightens eunox's own directory and refuses an
-// operator-chosen one that any local user could write the token file into.
+// WriteControlTokenFile writes token to path (default defaultControlTokenPath) with 0600
+// perms, overwriting any previous token, and returns the expanded absolute path written.
 //
-// It writes a fresh temp file (0600 regardless of any pre-existing file's mode)
-// and atomically renames it into place, so the secret never lands in a
-// looser-mode file and a concurrent reader observes the old or new token, never a
-// partial one.
-//
-// ctx bounds the write. The sequence is not the "single small create/rename" it looks
-// like — it stats and possibly chmods the directory, creates a temp file, and fsyncs it
-// before the rename — and that fsync has no upper bound on a contended volume or a
-// stalled network mount. Serve runs this after the listener binds and before the accept
-// loop starts, so an unbounded write leaves the socket accepting connections that nothing
-// answers: a client racing startup hangs until its own timeout instead of getting the
-// immediate connection-refused it would have got a moment earlier. `eunox kill` is the
-// client most likely to be in that race, and fast unambiguous feedback matters more on
-// the emergency-stop path than almost anywhere else.
+// Writes a fresh temp file (always 0600) and atomically renames it into place, so the secret
+// never lands in a looser-mode file and a concurrent reader sees the old or new token, never a
+// partial one. ctx bounds the write: the sequence includes an unbounded-on-a-stalled-mount
+// fsync, and Serve runs this after the listener binds but before accepting — an unbounded hang
+// here would leave `eunox kill` (the client most likely racing startup) hung instead of
+// getting an immediate connection-refused.
 func WriteControlTokenFile(ctx context.Context, path, token string) (string, error) {
 	if path == "" {
 		path = defaultControlTokenPath
@@ -174,11 +147,9 @@ func WriteControlTokenFile(ctx context.Context, path, token string) (string, err
 		_ = tmp.Close()
 		return "", fmt.Errorf("writing control token: %w", err)
 	}
-	// fsync the data before the rename so the durable on-disk ordering matches the
-	// atomic-rename intent: without it a crash can leave the rename visible while the
-	// data blocks are not yet persisted, yielding a zero-length control-token file —
-	// ResolveControlToken then reads an empty token and the loopback emergency stop is
-	// unusable exactly when it is most needed.
+	// fsync before the rename: without it a crash can leave the rename visible while the data
+	// blocks are not yet persisted, yielding a zero-length token file exactly when the
+	// emergency stop is most needed.
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
 		return "", fmt.Errorf("syncing control-token temp file: %w", err)
@@ -186,30 +157,20 @@ func WriteControlTokenFile(ctx context.Context, path, token string) (string, err
 	if err := tmp.Close(); err != nil {
 		return "", fmt.Errorf("closing control-token temp file: %w", err)
 	}
-	// The deadline is enforced HERE, immediately before the rename, and not by a watchdog
-	// around the call. A caller that abandoned a slow write would leave this function still
-	// running, and its os.Rename could still land seconds later — overwriting the token of
-	// whatever proxy is actually serving. That is the exact clobber the post-bind ordering
-	// exists to prevent, just with a longer fuse, and it is strictly worse than the hang it
-	// would be trying to fix. Checking at the last point before publication means an expired
-	// deadline aborts WITHOUT publishing, which is the property that matters: the token of
-	// whatever proxy is serving is left exactly as it was. The deferred os.Remove cleans up
-	// the temp file. Directory work already done (MkdirAll, and tightenTokenDir's chmod to
-	// 0700 on eunox's own directory) is deliberately NOT undone -- both only ever restrict,
-	// so reverting them on an abort would loosen a directory holding an emergency-stop
-	// token, which is the wrong direction to fail in.
+	// Checked HERE, immediately before the rename, not by a watchdog around the whole call:
+	// an abandoned caller's os.Rename could otherwise land seconds later, clobbering the token
+	// of whatever proxy is actually serving. Directory work already done (MkdirAll,
+	// tightenTokenDir's chmod) is deliberately NOT undone on abort -- both only restrict, so
+	// reverting them would loosen a directory holding an emergency-stop token.
 	if err := ctx.Err(); err != nil {
 		return "", fmt.Errorf("control token not published to %s: %w (the write did not complete in time; any existing token file is left untouched)", expanded, err)
 	}
 	if err := os.Rename(tmpName, expanded); err != nil {
 		return "", fmt.Errorf("publishing control token to %s: %w", expanded, err)
 	}
-	// fsync the parent directory so the rename itself (the directory entry) is durable;
-	// otherwise a crash could lose the rename even though the file data was synced.
-	// Best-effort with a diagnostic, mirroring the audit key writer's syncDir: a
-	// directory that cannot be opened or synced (some filesystems reject directory
-	// fsync) is logged and tolerated rather than failing the write — the gap it closes
-	// is a crash-recovery edge case, and the token data itself is already synced above.
+	// fsync the parent directory so the rename entry itself is durable. Best-effort with a
+	// diagnostic (some filesystems reject directory fsync); a crash-recovery edge case, not
+	// worth failing the write over since the token data itself is already synced.
 	if d, err := os.Open(dir); err != nil { //nolint:gosec // G304: dir derives from the operator-configured --control-token-path
 		fmt.Fprintf(os.Stderr, "[eunox] WARN: cannot open control-token dir %q to fsync: %v\n", dir, err)
 	} else {

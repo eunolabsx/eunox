@@ -17,17 +17,10 @@ import (
 	"github.com/eunolabs/eunox/internal/config"
 )
 
-// loadConfigAuditDefaults loads configPath and fills empty audit-log / audit-key-path
-// flags from its audit block, leaving any explicitly-set flag untouched. keyPath may be
-// nil (stats has no --audit-key-path), which skips the key default. cmdName labels the
-// load error. A no-op returning (nil, nil) when configPath is empty.
-//
-// The load error is RETURNED with the parsed config rather than printed, so a caller can
-// choose its own stance: every audit-log reader treats an unloadable config as fatal
-// (applyConfigAuditDefaults), while doctor carries the failure into the support bundle —
-// a config that will not parse is exactly the deployment a bundle exists to describe.
-// Returning the config as well lets that caller reuse this parse instead of loading the
-// same file a second time.
+// loadConfigAuditDefaults loads configPath and fills empty audit-log / audit-key-path flags
+// from its audit block, leaving explicit flags untouched (keyPath nil skips that default).
+// The load error is returned rather than printed so callers can choose their own stance —
+// doctor carries it into the bundle instead of aborting.
 func loadConfigAuditDefaults(cmdName, configPath string, logPath, keyPath *string) (*config.GatewayConfig, error) {
 	if configPath == "" {
 		return nil, nil
@@ -45,32 +38,18 @@ func loadConfigAuditDefaults(cmdName, configPath string, logPath, keyPath *strin
 	return cfg, nil
 }
 
-// applyConfigAuditDefaults is loadConfigAuditDefaults for the readers that have nothing
-// useful to do with an unloadable config — audit-verify, stats, suggest — so the error is
-// theirs to report and abort on. doctor deliberately does NOT use this.
+// applyConfigAuditDefaults is loadConfigAuditDefaults for readers that abort on an
+// unloadable config (audit-verify, stats, suggest); doctor deliberately does not use this.
 func applyConfigAuditDefaults(cmdName, configPath string, logPath, keyPath *string) error {
 	_, err := loadConfigAuditDefaults(cmdName, configPath, logPath, keyPath)
 	return err
 }
 
-// parseReaderArgs is the stance-free half of the preamble every subcommand that reads
-// the audit tape (suggest, stats, audit-verify, doctor) performs identically: parse args
-// (the subcommand's own arguments, os.Args[2:] in a real invocation) into the flag set,
-// map -h/--help to a clean exit, and reject a stray positional.
-//
-// done reports that the caller must return code immediately: 0 for -h, 1 for a usage
-// error (already reported on stderr). When done is false, code is 0 and parsing
-// succeeded.
-//
-// The stray-positional rejection is the load-bearing half: the log is chosen with
-// --audit-log/--config, never positionally, so `eunox stats audit.jsonl` must not
-// silently report on the DEFAULT log while naming another file on the command line.
-//
-// Config defaulting is deliberately NOT this function's job: audit-verify/stats/suggest
-// abort on an unloadable --config (applyConfigAuditDefaults) while doctor carries the
-// failure into its bundle (loadConfigAuditDefaults) — that stance belongs at the caller,
-// which is why parseAuditReaderFlags and parseDoctorReaderFlags each add their own step
-// after calling this one.
+// parseReaderArgs is the stance-free half of the preamble every audit-tape reader (suggest,
+// stats, audit-verify, doctor) shares: parse args, map -h/--help to a clean exit, and reject
+// a stray positional — the log is chosen with --audit-log/--config, never positionally, so
+// `eunox stats audit.jsonl` must not silently report on the default log instead.
+// done reports the caller must return code immediately (0 for -h, 1 for a usage error).
 func parseReaderArgs(name string, fs *flag.FlagSet, args []string) (code int, done bool) {
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -85,19 +64,9 @@ func parseReaderArgs(name string, fs *flag.FlagSet, args []string) (code int, do
 	return 0, false
 }
 
-// parseAuditReaderFlags runs the preamble every subcommand that reads the audit tape
-// (suggest, stats, audit-verify, doctor) performs identically: parse args (the
-// subcommand's own arguments, os.Args[2:] in a real invocation) into the flag set,
-// map -h/--help to a clean exit, reject a stray positional, and let a --config fill any
-// audit path the operator left empty.
-//
-// done reports that the caller must return code immediately: 0 for -h, 1 for a usage or
-// config error (already reported on stderr). When done is false, code is 0 and parsing
-// succeeded. keyPath may be nil for a reader that has no --audit-key-path.
-//
-// Every flag argument is a POINTER, configPath included: they are read after fs.Parse
-// runs here, so a by-value configPath would capture the pre-parse empty string and
-// silently skip the config defaulting entirely.
+// parseAuditReaderFlags runs parseReaderArgs, then lets --config fill any audit path the
+// operator left empty. configPath is a pointer (not a value) because it is read only after
+// fs.Parse runs here; a by-value copy would capture the pre-parse empty string.
 func parseAuditReaderFlags(name string, fs *flag.FlagSet, args []string, configPath, logPath, keyPath *string) (code int, done bool) {
 	if code, done := parseReaderArgs(name, fs, args); done {
 		return code, done
@@ -109,11 +78,9 @@ func parseAuditReaderFlags(name string, fs *flag.FlagSet, args []string, configP
 	return 0, false
 }
 
-// resolveAuditReaderLogPath expands the reader's --audit-log to a concrete path,
-// reporting a resolution failure under the subcommand's own name. ok is false when the
-// caller must return 1. Kept separate from parseAuditReaderFlags because doctor
-// deliberately does NOT resolve here: it reports an unresolvable path inside the support
-// bundle rather than refusing to print one.
+// resolveAuditReaderLogPath expands the reader's --audit-log to a concrete path. Kept
+// separate from parseAuditReaderFlags because doctor does not resolve here — it reports an
+// unresolvable path inside the bundle instead of refusing to print one.
 func resolveAuditReaderLogPath(name, configured string) (string, bool) {
 	logPath, err := audit.ResolveLogPath(configured)
 	if err != nil {
@@ -123,28 +90,18 @@ func resolveAuditReaderLogPath(name, configured string) (string, bool) {
 	return logPath, true
 }
 
-// auditVerifySummaryFormat is the one-line tally `audit-verify` prints. Hoisted to a
-// constant so the site-drift test can assert the published landing-page demo still
-// quotes tallies this command actually emits: the previous copy drifted silently when a
-// tally was removed, because nothing tied the two together.
-// auditVerifyUsageExit is audit-verify's exit code for a usage, config, key-resolution,
-// or log-read failure. Exit 1 is RESERVED for a log that fails verification, exactly as
-// validate reserves it for findings: the whole point of the tamper-evidence tool is that
-// a cron or CI job can gate on its exit code, and it has to be able to tell "this log
-// fails verification" (page someone) from "the key path was wrong on this host" (fix the
-// job). One code for both makes a mistyped flag indistinguishable from tampering.
-//
-// The shared reader preamble (parseAuditReaderFlags) reports its usage errors as 1, which
-// is what its other callers — suggest, stats, doctor — document for themselves, so this
-// command translates at that call rather than changing theirs.
+// auditVerifyUsageExit is audit-verify's exit code for a usage, config, key-resolution, or
+// log-read failure. Exit 1 is reserved for a log that fails verification (like validate
+// reserves it for findings), so a cron/CI job can tell tampering from a misconfigured flag.
+// parseAuditReaderFlags reports usage errors as 1, so this command translates at the call site.
 const auditVerifyUsageExit = 2
 
+// auditVerifySummaryFormat is hoisted to a constant so the site-drift test can assert the
+// landing-page demo still quotes tallies this command actually emits.
 const auditVerifySummaryFormat = "Checked %d record(s): %d valid, %d invalid, %d skipped, %d unknown-key, %d unverifiable; %d chain break(s).\n"
 
-// cmdAuditVerify runs the `audit-verify` subcommand and returns the process
-// exit code (rather than calling os.Exit itself), so tests can drive every branch.
-// args carries the subcommand's own arguments (os.Args[2:] in a real
-// invocation), threaded from run.
+// cmdAuditVerify runs the `audit-verify` subcommand, returning the exit code (rather than
+// calling os.Exit) so tests can drive every branch.
 func cmdAuditVerify(args []string) int {
 	fs := flag.NewFlagSet("audit-verify", flag.ContinueOnError)
 	fs.Usage = func() {
@@ -171,9 +128,8 @@ Flags:
 
 	if code, done := parseAuditReaderFlags("audit-verify", fs, args, configPath, auditLogPath, auditKeyPath); done {
 		if code != 0 {
-			// The shared preamble reports a usage or config error as 1 — the convention
-			// its other callers document. Translate at that boundary; see
-			// auditVerifyUsageExit for why this command cannot share it.
+			// Translate the shared preamble's 1 to this command's own usage exit code;
+			// see auditVerifyUsageExit.
 			return auditVerifyUsageExit
 		}
 		return code
@@ -189,32 +145,26 @@ Flags:
 		fmt.Fprintf(os.Stderr, "eunox audit-verify: %v\n", err)
 		return auditVerifyUsageExit
 	}
-	// Load-only: audit-verify must never mint a key as a side effect. A missing key
-	// file is an operator error (mistyped --audit-key-path, wrong machine) — creating a
-	// fresh key here would make every record report UNKNOWN_KEY and misdiagnose that as a
-	// key rotation. LoadKeys returns a clear not-found error instead.
+	// Load-only: minting a key here on a missing/mistyped path would make every record
+	// report UNKNOWN_KEY and misdiagnose an operator error as a key rotation.
 	keys, err := audit.LoadKeys(expandedKeyPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "eunox audit-verify: loading audit key: %v\n", err)
 		return auditVerifyUsageExit
 	}
 
-	// Verifier keyring holds every key indexed by key id, so records straddling a
-	// rotation each verify against the key that signed them; records with no key_id
-	// (pre-rotation format) are tried against every key.
+	// Keyed by key id, so records straddling a rotation each verify against the key that
+	// signed them; records with no key_id (pre-rotation format) are tried against every key.
 	verifier := audit.NewVerifier(keys)
 
-	// Verify the whole rotated set as one chain (oldest sibling -> current base),
-	// not just the base file. The tamper-evident chain spans rotation, so checking
-	// a single file would miss deletion of an entire interior rotated file —
-	// threading every sibling catches it (prev_hmac mismatch + seq gap).
+	// Verify the whole rotated set as one chain, not just the base file — deletion of an
+	// entire interior rotated file would otherwise go undetected.
 	chainFiles, err := audit.LogChainFiles(logPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "eunox audit-verify: discovering rotated audit logs: %v\n", err)
 		return auditVerifyUsageExit
 	}
 	if len(chainFiles) == 0 {
-		// No base log and no rotated siblings: same first-run hint as the readers.
 		fmt.Fprint(os.Stderr, auditLogMissingHint("audit-verify", logPath))
 		return auditVerifyUsageExit
 	}
@@ -238,8 +188,8 @@ Flags:
 	}
 
 	if res.Total == 0 {
-		// An empty log is not itself a failure, but it is indistinguishable from a
-		// fully truncated one without an external anchor — say so plainly.
+		// Not itself a failure, but indistinguishable from a fully truncated log without
+		// an external anchor — say so plainly.
 		fmt.Println("Checked 0 record(s). The log is empty; note that an empty or fully " +
 			"truncated log cannot be distinguished from a never-written one without an " +
 			"external high-water mark (ship records to an append-only sink).")
@@ -248,29 +198,22 @@ Flags:
 
 	fmt.Printf(auditVerifySummaryFormat,
 		res.Total, res.Valid, res.Invalid, res.Skipped, res.UnknownKey, res.Unverifiable, res.ChainBreaks)
-	// UNKNOWN_KEY_ID is a missing-key state, not tampering — kept distinct from the
-	// INVALID tally so a key rotation is not mistaken for corruption. The verdict
-	// still fails (OK() counts it): the records can't be verified without the key.
+	// A missing-key state, not tampering — kept distinct from INVALID so a key rotation
+	// isn't mistaken for corruption. The verdict still fails: unverified is unverified.
 	if res.UnknownKey > 0 {
 		fmt.Printf("Note: %d record(s) were signed with a key absent from the verification ring (UNKNOWN_KEY_ID) — "+
 			"expected after a key rotation that retired the signing key. Add the retired key(s) to the ring "+
 			"(--audit-key-path / the configured keyPath) to verify them; they are NOT counted as tampered.\n", res.UnknownKey)
 	}
-	// UNVERIFIABLE is a record NO key was available to check: an empty verification ring,
-	// or a record naming no key_id that no held key matched. Nothing was checked, so it
-	// cannot be proven tampered the way a named-but-missing key_id can. Surfaced
-	// distinctly from INVALID, but the verdict still fails (OK() counts it) — fail-closed,
-	// since the cause may be tampering.
+	// A record no key was available to check at all — nothing was checked, so it can't be
+	// proven tampered the way a named-but-missing key_id can, but the verdict still fails.
 	if res.Unverifiable > 0 {
 		fmt.Printf("Note: %d record(s) could not be checked against any key (UNVERIFIABLE) — "+
 			"typically a pre-key_id-era record whose signing key was retired. Add the original key(s) to the ring "+
 			"to verify them; until then they cannot be distinguished from tampering and the verdict fails.\n", res.Unverifiable)
 	}
-	// Chain verification always runs, so the only note worth surfacing is a non-1
-	// starting seq. Walked as one chain, seq > 1 means the oldest record across all
-	// retained files is not seq 1 — leading records or whole leading rotated files
-	// were removed or pruned. That deletion (and trailing truncation) is the one
-	// case unprovable from local files without an external high-water mark.
+	// seq > 1 across the whole chain means leading records (or whole rotated files) were
+	// removed or pruned — unprovable from local files alone without an external anchor.
 	if res.FirstSeq > 1 {
 		fmt.Printf("Note: the oldest record across the retained log files is seq %d, not 1 — "+
 			"leading records (or whole leading rotated files) were removed or pruned by "+

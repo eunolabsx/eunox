@@ -30,11 +30,9 @@ type healthSnapshot struct {
 	AuditWriteFailed  int64  `json:"auditWriteFailed"`  // records that reached the drainer but failed to write to disk
 	AuditConfigured   bool   `json:"auditConfigured"`   // false when the audit sink failed to open
 	KillSwitchHealthy bool   `json:"killSwitchHealthy"` // false when a Redis backend is degraded
-	// AuditMaintenanceStalled is true when rotation or retention pruning has stopped
-	// making progress. Records are still written and signed, so this is NOT an
-	// audit-integrity loss and does not gate traffic — it means the configured size /
-	// retention bound is currently unenforced and the log will grow until the underlying
-	// fault (an unlistable log directory, an undeletable rotated sibling) is fixed.
+	// AuditMaintenanceStalled is true when rotation/retention pruning has stopped making
+	// progress. Records are still written and signed (not an audit-integrity loss, does not
+	// gate traffic) — the size/retention bound is just unenforced until the fault is fixed.
 	AuditMaintenanceStalled bool   `json:"auditMaintenanceStalled"`
 	AuditMaintenanceReason  string `json:"auditMaintenanceReason,omitempty"`
 }
@@ -55,26 +53,20 @@ func (p *HTTPProxy) snapshot() healthSnapshot {
 		snap.AuditWriteFailed = p.sink.WriteFailures()
 		snap.AuditMaintenanceStalled, snap.AuditMaintenanceReason = p.sink.MaintenanceStalled()
 	}
-	// A degraded kill switch (e.g. a Redis partition) flips status to "degraded".
-	// The operational consequence depends on the configured degraded mode, NOT a
-	// fixed "fails open": the shipped default is fail-closed (deny all traffic until
-	// the backend recovers), and fail-open (serve the last-known cache, so a fresh
-	// revocation may be missed) is opt-in. Either way the kill switch is not
-	// operating normally, so surface it for incident response.
+	// A degraded kill switch (e.g. a Redis partition) flips status to "degraded". The
+	// operational consequence depends on the configured degraded mode (fail-closed by
+	// default, fail-open opt-in) — either way it's not operating normally.
 	if hr, ok := p.ks.(healthReporter); ok && hr.HealthStatus() != nil {
 		snap.KillSwitchHealthy = false
 		snap.Status = "degraded"
 	}
-	// Audit-integrity loss also flips status to "degraded": no sink configured,
-	// dropped records, or failed writes each mean the tamper-evident audit trail is
-	// incomplete — a readiness regression to alert on.
+	// Audit-integrity loss also flips status to "degraded": no sink, dropped records, or
+	// failed writes each mean the tamper-evident audit trail is incomplete.
 	if !snap.AuditConfigured || snap.AuditDropped > 0 || snap.AuditWriteFailed > 0 {
 		snap.Status = "degraded"
 	}
-	// A stalled rotation/prune is a readiness regression too — the disk bound is not being
-	// enforced and the volume will fill — even though no record has been lost. It flips
-	// the reported status so an alert fires, but it is NOT part of AuditDegraded, so it
-	// never denies live traffic under --require-audit=strict.
+	// A stalled rotation/prune is a readiness regression too, even though no record was lost.
+	// NOT part of AuditDegraded, so it never denies live traffic under --require-audit=strict.
 	if snap.AuditMaintenanceStalled {
 		snap.Status = "degraded"
 	}

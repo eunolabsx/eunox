@@ -1,28 +1,13 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// mock-host is the MCP host (client) for the eunox end-to-end test suite
-// (demo/e2e). It drives the REAL compiled eunox binary as a black box —
-// over real transports, against the real upstream mock-server, writing a real
-// on-disk audit log — and asserts the policy outcome of every enforced MCP
-// method, in positive, negative, and edge cases.
+// mock-host is the MCP host (client) for the eunox end-to-end test suite. It
+// drives the real compiled eunox binary as a black box, over real transports,
+// to catch bugs in-process unit tests can't: transport framing, subprocess
+// lifecycle, list filtering, redaction, and audit-log integrity.
 //
-// This catches the class of bugs that in-process unit tests cannot: CLI/config
-// wiring, transport framing, subprocess lifecycle, list filtering, response
-// redaction, the server-initiated sampling round-trip, and audit-log integrity
-// across process restarts.
-//
-// Modes (selected with --mode):
-//
-//	stdio  — spawn `eunox proxy --config <cfg>` and talk over its
-//	         stdin/stdout. --suite full | sampling-deny selects the battery.
-//	http   — connect to an already-running eunox HTTP gateway at --url,
-//	         exercising session isolation, kill-switch, and per-route cases.
-//	audit  — parse the audit JSONL at --audit-log and assert specific records
-//	         (decision, denial_code, condition_type, target_type, obligations).
-//
-// The process exits 0 only if every assertion passes; any failure exits 1 with
-// a FAIL line, so run.sh / CI gates on the exit code.
+// Modes (--mode): stdio spawns `eunox proxy` and talks over its stdio pipes;
+// http drives an already-running gateway; audit parses --audit-log's JSONL.
 package main
 
 import (
@@ -122,9 +107,8 @@ func (s *suite) expectDeny(desc, wantCode, wantType string, m rpcMsg, err error)
 	s.ok(desc)
 }
 
-// expectErrorCode asserts a JSON-RPC error with a specific numeric code (used
-// for fail-closed internal errors such as redaction failure, which carry no
-// structured denial data).
+// expectErrorCode asserts a numeric JSON-RPC error code, for fail-closed
+// internal errors (e.g. redaction failure) that carry no structured denial data.
 func (s *suite) expectErrorCode(desc string, want int, m rpcMsg, err error) { //nolint:gocritic,unparam // hugeParam; want is intentionally explicit for readability.
 	switch {
 	case err != nil:
@@ -254,9 +238,8 @@ func newStdioConn(proxyBin, config string) (*stdioConn, error) {
 	return c, nil
 }
 
-// readLoop dispatches every line from the proxy: a server-initiated request
-// (sampling/createMessage) is answered inline; a response is delivered to the
-// resp channel for call() to match by id; notifications are ignored.
+// readLoop dispatches each line: server-initiated requests are answered
+// inline, responses go to resp for call() to match by id, notifications skipped.
 func (c *stdioConn) readLoop(stdout io.Reader) {
 	sc := bufio.NewScanner(stdout)
 	sc.Buffer(make([]byte, 1<<20), 8<<20)
@@ -281,9 +264,8 @@ func (c *stdioConn) readLoop(stdout io.Reader) {
 	close(c.resp)
 }
 
-// answerServerRequest replies to a server-initiated request. The only one the
-// suite expects is sampling/createMessage, which it satisfies with a canned
-// model result so the upstream's round-trip completes.
+// answerServerRequest satisfies the only server-initiated request the suite
+// expects, sampling/createMessage, with a canned result so the round-trip completes.
 func (c *stdioConn) answerServerRequest(m rpcMsg) { //nolint:gocritic // hugeParam.
 	if m.Method != "sampling/createMessage" {
 		return
@@ -366,7 +348,6 @@ func (c *stdioConn) close() {
 	_ = c.cmd.Wait()
 }
 
-// toolCall builds the (method, params) pair for a tools/call request.
 func toolCall(name string, args map[string]interface{}) (method string, params interface{}) {
 	return "tools/call", map[string]interface{}{"name": name, "arguments": args}
 }
@@ -450,12 +431,8 @@ func runStdioFull(c *stdioConn, s *suite) {
 	m, e = tc("get_secret_record", map[string]interface{}{"id": "1"})
 	checkRedaction(s, m, e)
 
-	// get_malformed returns a JSON-LOOKING but invalid body (`{"secret":"x", "oops"`).
-	// redactFields acts on cleanly-parseable JSON only and never fails the response
-	// closed over content it cannot parse, so the malformed body passes through
-	// UNCHANGED — the "secret" field is NOT redacted. This is the accepted residual:
-	// data that may arrive malformed must be redacted upstream (docs/threat-model-mcp.md
-	// § 6.3).
+	// get_malformed returns invalid JSON; redactFields only acts on cleanly-parseable
+	// JSON, so this passes through unredacted — accepted residual (docs/threat-model-mcp.md § 6.3).
 	m, e = tc("get_malformed", map[string]interface{}{"id": "1"})
 	if e == nil && m.Error == nil && strings.Contains(toolText(m), `"secret"`) {
 		s.ok("tools/call get_malformed -> ALLOW (malformed JSON passes through unredacted; accepted residual, redact upstream)")
@@ -527,10 +504,8 @@ func runStdioFull(c *stdioConn, s *suite) {
 	}
 
 	// ── ping is answered locally, NOT denied ──
-	// It carries no arguments, names no target, and reaches no upstream, so there is
-	// nothing for a manifest to authorize; denying it broke the liveness probe every MCP
-	// host is entitled to send. It is answered by the proxy (never forwarded, so it cannot
-	// probe upstream liveness) and still passes through the shared kill gate.
+	// It carries no target for a manifest to authorize; denying it broke the liveness
+	// probe every MCP host is entitled to send. Still passes the shared kill gate.
 	m, e = c.call("ping", map[string]interface{}{})
 	s.expectAllow("ping -> ALLOW (answered locally by the proxy)", m, e)
 
@@ -547,9 +522,8 @@ func runStdioFull(c *stdioConn, s *suite) {
 	} else {
 		s.bad("id preservation (string)", fmt.Sprintf("err=%v id=%v", e, idStr(m.ID)))
 	}
-	// 2^53+1 is NOT exactly representable as float64, so a proxy that decoded
-	// JSON-RPC ids through a float would corrupt it — this exercises that
-	// big-integer precision path, which a sub-2^53 value cannot.
+	// 2^53+1 is not exactly representable as float64, so a proxy that decoded ids
+	// through a float would corrupt it; a sub-2^53 value can't exercise that path.
 	const bigID = `9007199254740993`
 	m, e = c.callRawID(bigID, "tools/call", map[string]interface{}{"name": "read_file", "arguments": map[string]interface{}{"path": "/reports/q3.pdf"}})
 	if e == nil && m.ID != nil && string(*m.ID) == bigID {
@@ -650,11 +624,8 @@ type httpConn struct {
 	nextID  int // monotonically increasing per-request id, pre-incremented before use (first id is 1)
 }
 
-// validateRPCEnvelope checks that an HTTP JSON-RPC RESPONSE is a well-formed reply
-// to the request with id wantID: a 2xx status, jsonrpc "2.0", an id that exactly
-// matches, and exactly one of result/error. Without this the e2e suite would pass
-// against a gateway returning a stale/wrong-id response (or one missing the version)
-// as long as it carried a result/error shaped like the expected outcome.
+// validateRPCEnvelope rejects a stale/wrong-id or version-less HTTP reply so the
+// suite can't pass just because result/error happens to match the expected shape.
 func validateRPCEnvelope(m rpcMsg, code, wantID int) error { //nolint:gocritic // hugeParam.
 	if code < 200 || code >= 300 {
 		return fmt.Errorf("non-2xx status %d for a JSON-RPC request response", code)
@@ -699,8 +670,7 @@ func (h *httpConn) post(body string) (rpcMsg, int, error) {
 	defer func() { _ = resp.Body.Close() }()
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		// A truncated/aborted response body is a transport-framing failure the
-		// e2e suite must surface, not silently treat as a clean (empty) ack.
+		// A truncated/aborted body is a framing failure to surface, not a clean ack.
 		return rpcMsg{}, resp.StatusCode, fmt.Errorf("reading response body: %w", err)
 	}
 	if sid := resp.Header.Get("Mcp-Session-Id"); sid != "" {
@@ -709,13 +679,9 @@ func (h *httpConn) post(body string) (rpcMsg, int, error) {
 	var m rpcMsg
 	if len(bytes.TrimSpace(raw)) > 0 {
 		decErr := json.Unmarshal(raw, &m)
-		// A 2xx response MUST decode as a JSON-RPC envelope: a malformed/truncated
-		// body on a success status is a transport-framing regression,
-		// about, so surface it rather than treating it as a valid outcome. Non-2xx
-		// responses (404 "unknown upstream route", 400 malformed-request, 5xx)
-		// legitimately carry a plain-text error body, so a decode failure there is
-		// expected and not an error — the caller checks the status code. A JSON
-		// error envelope on a non-2xx still decodes and populates m.Error.
+		// A 2xx must decode as JSON-RPC; a malformed body there is a framing
+		// regression. Non-2xx bodies may legitimately be plain text (decode
+		// failure there is expected — the caller checks the status code instead).
 		if decErr != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			return rpcMsg{}, resp.StatusCode, fmt.Errorf("2xx response body is not valid JSON-RPC: %w (body %q)", decErr, truncateBody(raw))
 		}
@@ -748,15 +714,8 @@ func (h *httpConn) initialize() error {
 	if h.session == "" || m.Error != nil {
 		return fmt.Errorf("initialize failed: code=%d session=%q err=%v", code, h.session, m.Error)
 	}
-	// A non-empty initialize RESULT is already assured: validateRPCEnvelope required
-	// exactly one of result/error, and the m.Error check above rejected the error
-	// case, so the result is present without a separate guard.
-	//
-	// Check the notifications/initialized post instead of discarding its outcome:
-	// a transport error or malformed body here is also a framing regression.
-	// post() returns nil for a non-2xx plain-text body, so the status MUST also be
-	// checked: a gateway that rejects the notification with 4xx/5xx otherwise looks
-	// like a completed handshake and lets the suite pass against a broken session.
+	// The notification's status must be checked too: post() returns nil for non-2xx
+	// text bodies, so skipping it would hide a gateway that rejects the notification.
 	_, notifCode, err := h.post(`{"jsonrpc":"2.0","method":"notifications/initialized"}`)
 	if err != nil {
 		return fmt.Errorf("notifications/initialized failed: %w", err)
@@ -776,9 +735,8 @@ func (h *httpConn) call(method string, params interface{}) (rpcMsg, error) {
 	if err != nil {
 		return m, err
 	}
-	// Validate the response envelope: a fresh per-call id plus this check means a
-	// stale/wrong-id reply, or one missing jsonrpc "2.0", is surfaced as a framing
-	// error instead of being accepted whenever its result/error happens to match.
+	// A fresh id + envelope check surfaces a stale/wrong-id or version-less reply as
+	// a framing error, rather than accepting it whenever result/error happens to match.
 	if err := validateRPCEnvelope(m, code, id); err != nil {
 		return rpcMsg{}, err
 	}
@@ -933,10 +891,8 @@ func runHTTPKillSwitch(base string, s *suite) {
 
 	body := fmt.Sprintf(`{"sessionId":%q}`, k.session)
 
-	// /control/kill requires the proxy's auto-generated control token (SEC-07).
-	// First prove it is enforced: a request with no token is rejected (401), and
-	// because the rejection happens before the body is read, the session is not
-	// killed -- the real kill below still exercises the kill switch.
+	// /control/kill requires the proxy's control token (SEC-07); prove that first
+	// with a tokenless request (401, rejected before the body is read, session intact).
 	noTok, _ := http.NewRequest(http.MethodPost, base+"/control/kill", strings.NewReader(body)) //nolint:noctx // test client.
 	noTok.Header.Set("Content-Type", "application/json")
 	if resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(noTok); err == nil {

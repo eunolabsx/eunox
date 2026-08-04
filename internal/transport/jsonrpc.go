@@ -14,19 +14,13 @@ import (
 	"github.com/eunolabs/eunox/pkg/capability"
 )
 
-// maxTrackedServerReqs bounds the outstanding server-initiated request IDs a
-// session tracks. An ID is removed only when the host answers, so a host that
-// never responds would grow the set unbounded. At the cap an arbitrary tracked
-// ID is evicted to bound memory; that ID belongs to a real in-flight request
-// whose upstream is now blocked, so its one call may re-hang until session
-// teardown. This only triggers under a pathological flood (1024+ ignored
-// requests, where the upstream is already wedged), so bounding memory is the
-// safer failure than unbounded growth.
+// maxTrackedServerReqs bounds outstanding server-initiated request IDs so a host that never
+// answers can't grow the set unbounded; past the cap an arbitrary tracked ID is evicted
+// (its call may re-hang until teardown), which is a safer failure than unbounded growth.
 const maxTrackedServerReqs = 1024
 
-// trackServerReqID adds key to ids (allocating on first use), keeping the set
-// bounded by maxTrackedServerReqs, and returns the map plus whether a tracked ID
-// had to be evicted. Caller must hold the set's mutex. Shared by both transports.
+// trackServerReqID adds key to ids (allocating on first use), keeping the set bounded, and
+// returns the map plus whether a tracked ID had to be evicted. Caller holds the set's mutex.
 func trackServerReqID(ids map[string]struct{}, key string) (map[string]struct{}, bool) {
 	if ids == nil {
 		ids = make(map[string]struct{})
@@ -51,16 +45,13 @@ func trackServerReqID(ids map[string]struct{}, key string) (map[string]struct{},
 type serverReqTracker struct {
 	mu  sync.Mutex
 	ids map[string]struct{}
-	// evictions tallies every eviction made to stay under maxTrackedServerReqs;
-	// only the first is logged, so a sustained flood is recorded without spamming
-	// stderr. Guarded by mu.
+	// evictions tallies every eviction; only the first is logged, so a sustained flood
+	// doesn't spam stderr. Guarded by mu.
 	evictions uint64
 }
 
-// track records key as an outstanding server-initiated request ID, evicting an
-// arbitrary tracked ID if the bounded set is full (see maxTrackedServerReqs).
-// Every eviction is tallied; only the first is logged, surfacing the re-hung
-// call without letting a flood spam stderr.
+// track records key as an outstanding server-initiated request ID, evicting an arbitrary
+// tracked one if the bounded set is full. Only the first eviction is logged.
 func (t *serverReqTracker) track(key string) {
 	t.mu.Lock()
 	var evicted bool
@@ -101,32 +92,20 @@ var errUpstreamExited = errors.New("upstream exited")
 // rather than blaming the upstream with UPSTREAM_ERROR.
 var errDuplicateID = errors.New("duplicate JSON-RPC message ID")
 
-// upstreamResult is what awaitNonced's routing channel carries: either a genuine
-// upstream response (msg set, err nil) or a transport-level failure the upstream
-// bridge could not turn into an in-band reply (err set, msg zero). Widening the
-// channel to carry both lets a transport failure ride the SAME routing path as a
-// normal response (deliverUpstreamResponse / deliverUpstreamError -> the one
-// per-call channel awaitNonced selects on), instead of a parallel nonce-keyed error
-// map kept in lockstep with the routing map: the result dies with the channel when
-// a caller is abandoned, with nothing further to leak or clean up.
+// upstreamResult is what awaitNonced's routing channel carries: either a genuine upstream
+// response (msg set) or a transport-level failure the bridge couldn't turn into an in-band
+// reply (err set). Carrying both on one channel lets a transport failure ride the same
+// routing path as a normal response instead of a parallel error map to keep in lockstep.
 type upstreamResult struct {
 	msg mcp.RPCMsg
 	err error
 }
 
-// sendUpstreamResult is the shared non-blocking delivery core for
-// deliverUpstreamResponse and deliverUpstreamError: it looks up key in byID
-// (guarded by mu) and, if a caller is still waiting, sends result on its
-// buffered(1) channel.
-//
-// The map is byUpstreamID — the nonce-keyed ROUTER — never the host-id-keyed
-// `pending` set, which exists only to reject a duplicate in-flight host ID. The
-// parameter was named `pending`, which read as though delivery went through that
-// map; it never did. The send never blocks, so the reader/bridge goroutine
-// delivering it never wedges: an untracked, already-served, or abandoned key is
-// simply dropped (there is nothing to deliver to). Returns whether a registered
-// caller was found — callers that need a fallback when nobody was waiting (the
-// stdio-to-HTTP bridge's in-band synthesized response) key it off this.
+// sendUpstreamResult is the shared non-blocking delivery core for deliverUpstreamResponse
+// and deliverUpstreamError: looks up key in byID (guarded by mu) and, if a caller is still
+// waiting, sends on its buffered(1) channel. The send never blocks, so the delivering
+// goroutine never wedges on an untracked/already-served/abandoned key. Returns whether a
+// caller was found, for a fallback path (the stdio-to-HTTP bridge's synthesized response).
 func sendUpstreamResult(mu *sync.Mutex, byID map[string]chan upstreamResult, key string, result upstreamResult) bool {
 	mu.Lock()
 	ch, ok := byID[key]
@@ -148,15 +127,11 @@ func deliverUpstreamResponse(mu *sync.Mutex, byID map[string]chan upstreamResult
 	sendUpstreamResult(mu, byID, mcp.MsgKey(msg.ID), upstreamResult{msg: msg})
 }
 
-// deliverUpstreamError routes a transport-level failure (connection refused, DNS,
-// non-2xx, per-call timeout — anything the upstream bridge could not turn into an
-// in-band JSON-RPC reply) to the caller registered under upKey, if any, and reports
-// whether one was found. This is the stdio-to-HTTP bridge's fire-and-forget POST
-// failure path (see StdioProxy.reportUpstreamErr); a caller no longer registered
-// (already timed out or the upstream exited) is a no-op — there is no separate
-// error lifecycle to leak — and the bridge falls back to its in-band synthesized
-// response instead (the handshake/probe path never registers in byUpstreamID at
-// all, since it reads the bridge directly rather than through callUpstream).
+// deliverUpstreamError routes a transport-level failure (connection refused, DNS, non-2xx,
+// timeout — anything the bridge couldn't turn into an in-band JSON-RPC reply) to the caller
+// registered under upKey, reporting whether one was found. Used by the stdio-to-HTTP
+// bridge's fire-and-forget POST failure path; an unregistered caller is a no-op and the
+// bridge falls back to its in-band synthesized response.
 func deliverUpstreamError(mu *sync.Mutex, byID map[string]chan upstreamResult, upKey string, err error) bool {
 	return sendUpstreamResult(mu, byID, upKey, upstreamResult{err: err})
 }
@@ -172,31 +147,16 @@ func isMalformedResponse(resp mcp.RPCMsg) bool {
 	return (resp.Result == nil) == (resp.Error == nil)
 }
 
-// correlateUpstreamReply validates that resp is a genuine JSON-RPC response to req
-// and returns the reply to deliver, or an error if it must be refused (fail closed).
-// It is the single source of truth for upstream reply-shape correlation, shared by
-// every HTTP-upstream site that reads one POST's own response body (the stdio host's
-// bridge post(), the gateway's callRemoteUpstream, and the remote initialize
-// handshake) so the fail-closed rule cannot drift between them — a drift between two
-// hand-mirrored copies is exactly how a method-bearing reply once slipped through.
-//
-// For a request (req carries an id):
-//   - a non-response reply — id-less or method-bearing, IsResponse()==false — is
-//     refused: a method-bearing reply echoing the proxy-known nonce id would otherwise
-//     be reclassified as a forged server-initiated request and forwarded to the host;
-//   - a reply whose id does not echo the request — whether a result OR an error — is
-//     refused (fail closed): it may carry content (a result body, or an error
-//     message/data) computed for a DIFFERENT call, so binding it to this caller would
-//     let an adversarial upstream with concurrent callers inject one caller's reply
-//     into another's reply channel (cross-call leakage). The caller surfaces a generic
-//     upstream error for its own request instead of forwarding the mismatched reply.
-//   - a reply that violates the JSON-RPC 2.0 invariant of carrying exactly one of
-//     result/error — neither (an empty {"jsonrpc":"2.0","id":N}) or both — is refused
-//     (fail closed): IsResponse() only inspects the id/method shape, so a malformed or
-//     adversarial upstream could otherwise have an empty/contradictory response
-//     forwarded to the host instead of a proxy-substituted upstream error.
-//
-// A notification (req.ID == nil) has no response to correlate and passes through.
+// correlateUpstreamReply validates that resp is a genuine JSON-RPC response to req and
+// returns the reply to deliver, or a fail-closed error if it must be refused. Single source
+// of truth shared by every HTTP-upstream site reading a POST's own response, so the rule
+// cannot drift between hand-mirrored copies (which is how a method-bearing reply once
+// slipped through). For a request it refuses: a non-response reply (would otherwise be
+// reclassified as a forged server-initiated request), a reply whose id doesn't echo the
+// request (an adversarial upstream could inject one caller's reply into another's — the id
+// match alone isn't enough, a result or error may carry content computed for a different
+// call), or one violating the exactly-one-of-result/error invariant. A notification passes
+// through untouched.
 func correlateUpstreamReply(req, resp mcp.RPCMsg) (mcp.RPCMsg, error) {
 	if req.ID == nil {
 		return resp, nil
@@ -205,34 +165,24 @@ func correlateUpstreamReply(req, resp mcp.RPCMsg) (mcp.RPCMsg, error) {
 		return mcp.RPCMsg{}, fmt.Errorf("upstream returned a non-response reply for request %s (expected a JSON-RPC result or error)", req.Method)
 	}
 	if mcp.MsgKey(resp.ID) != mcp.MsgKey(req.ID) {
-		// An id that does not echo the request — on a result OR an error — may carry
-		// content computed for a DIFFERENT call, so refuse it (fail closed) rather than
-		// re-stamp and mis-bind it to this caller. Previously a mismatched error was
-		// re-stamped with the request id and delivered; an adversarial upstream with
-		// concurrent callers could exploit that to craft an error for caller B, label it
-		// with caller A's id, and inject B's error message/data into A's reply channel.
-		// Dropping it makes the caller surface a generic upstream error for its own
-		// request instead.
+		// Refuse rather than re-stamp and mis-bind: a mismatched id's result/error may be
+		// content computed for a different call. Previously a mismatched error was
+		// re-stamped with the request id, letting an adversarial upstream inject one
+		// caller's error into another's reply channel.
 		return mcp.RPCMsg{}, fmt.Errorf("upstream response id %s does not match request id %s for %s", mcp.MsgKey(resp.ID), mcp.MsgKey(req.ID), req.Method)
 	}
-	// A JSON-RPC 2.0 response MUST carry exactly one of result/error. IsResponse()
-	// only checks the id/method shape, so a reply such as {"jsonrpc":"2.0","id":N}
-	// (neither result nor error) or one carrying BOTH satisfies it and the id match
-	// above, then would be forwarded to the host as a malformed/empty response.
-	// Assert the invariant here — the one shared correlation site — so the rule
-	// cannot drift, and let the caller's wrapping surface a clean -32603 instead.
+	// IsResponse() only checks id/method shape, so a reply carrying neither or both of
+	// result/error would otherwise pass through as malformed/empty.
 	if isMalformedResponse(resp) {
 		return mcp.RPCMsg{}, fmt.Errorf("upstream response for %s carried neither result nor error (or both)", req.Method)
 	}
 	return resp, nil
 }
 
-// buildInitializeParams marshals the initialize params the proxy sends to every
-// upstream: it advertises no capabilities of its own and stamps clientInfo with the
-// proxy name and build version. Package-internal: the CLI's live-upstream probe reaches
-// this through BuildInitializeRequestWithID (the whole message), not through the params
-// alone, so the handshake stays identical to the running proxy's without a second
-// exported spelling of it.
+// buildInitializeParams marshals the initialize params the proxy sends to every upstream:
+// no capabilities of its own, clientInfo stamped with the proxy name/version.
+// Package-internal — the CLI probe reaches it via BuildInitializeRequestWithID instead, so
+// the handshake stays identical without a second exported spelling.
 func buildInitializeParams() json.RawMessage {
 	params, _ := json.Marshal(map[string]interface{}{
 		"protocolVersion": MCPProtocolVersion,
@@ -245,36 +195,27 @@ func buildInitializeParams() json.RawMessage {
 	return params
 }
 
-// BuildInitializeRequestWithID constructs the MCP `initialize` request the proxy sends
-// to every upstream, with a caller-supplied id. Exported so the CLI live-upstream probes
-// (which need the string ids "_init"/"1") build the identical envelope the running proxy
-// does, rather than hand-assembling their own copy that could drift from it (e.g. a new
-// capabilities entry). Both the id-derived proxy handshake below and the CLI probes flow
-// through this one builder.
+// BuildInitializeRequestWithID constructs the MCP `initialize` request the proxy sends to
+// every upstream, with a caller-supplied id. Exported so the CLI's live-upstream probes
+// build the identical envelope the running proxy does, rather than a copy that could drift.
 func BuildInitializeRequestWithID(id *json.RawMessage) mcp.RPCMsg {
 	return mcp.RPCMsg{JSONRPC: "2.0", ID: id, Method: mcp.MethodInitialize, Params: buildInitializeParams()}
 }
 
-// buildInitializeRequest constructs the MCP `initialize` request the proxy sends
-// to every upstream. The id derives from idCounter so the caller can match the
-// response; the proxy advertises no capabilities of its own. Shared by all three
-// upstream handshakes (stdio, local-HTTP, remote-HTTP).
+// buildInitializeRequest constructs the MCP `initialize` request, with the id derived
+// from idCounter so the caller can match the response. Shared by all three upstream
+// handshakes (stdio, local-HTTP, remote-HTTP).
 func buildInitializeRequest(idCounter int64) (mcp.RPCMsg, *json.RawMessage) {
 	initID := mcp.RawJSON(fmt.Sprintf("%d", idCounter))
 	return BuildInitializeRequestWithID(initID), initID
 }
 
 // buildInitializeResponse constructs the host-facing `initialize` response from the
-// upstream capabilities and instructions gathered at session startup. A nil caps map
-// defaults to advertising an empty `tools` capability (so a host still sees the proxy
-// as MCP-capable). On the practically-impossible marshal failure it returns a -32603
-// error response. Both transports produce the response body through this one builder,
-// injected into the shared dispatcher as dispatchParams.buildInit: `initialize` now
-// flows THROUGH dispatchRequest (dispatchInitialize) like every other locally-answered
-// method, so its cross-cutting kill gate cannot drift — only the response body differs
-// per transport, and it lives here. The lone carve-out is the HTTP session-CREATING
-// initialize (no session/dispatchParams yet, and it carries the strict-audit gate),
-// which the HTTP transport answers before the dispatcher.
+// upstream capabilities/instructions gathered at session startup. A nil caps map defaults
+// to an empty `tools` capability so the host still sees the proxy as MCP-capable. Both
+// transports produce the body through this one builder, injected as dispatchParams.buildInit
+// so `initialize` flows through the shared dispatcher's kill gate like every other
+// locally-answered method — only the response body differs per transport.
 func buildInitializeResponse(id *json.RawMessage, caps map[string]interface{}, instructions string) mcp.RPCMsg {
 	if caps == nil {
 		caps = map[string]interface{}{"tools": map[string]interface{}{}}
@@ -296,13 +237,9 @@ func buildInitializeResponse(id *json.RawMessage, caps map[string]interface{}, i
 }
 
 // RejectPreInitServerRequest replies a JSON-RPC error to a server-initiated request
-// received during a startup read loop (the initialize handshake or the drift
-// tools/list probe), before the background reader is running to route it. A
-// JSON-RPC request blocks its initiator until answered, so silently dropping one
-// would wedge the upstream until session teardown. A no-op for any non-request
-// message. Shared by StdioProxy.initUpstream, httpSession.runInitHandshake, the
-// stdio drift probe, and the CLI live-upstream probe so the error code and wording
-// stay in one place.
+// received during a startup read loop, before the background reader exists to route it —
+// silently dropping a request would otherwise wedge the upstream until teardown. A no-op
+// for any non-request message.
 func RejectPreInitServerRequest(w mcp.MsgSink, msg mcp.RPCMsg) {
 	if !msg.IsRequest() {
 		return
@@ -311,22 +248,13 @@ func RejectPreInitServerRequest(w mcp.MsgSink, msg mcp.RPCMsg) {
 		"server-initiated request received before initialize handshake completed"))
 }
 
-// awaitStartupReply reads upstream messages until the response matching wantID arrives and
-// returns it. Every other message is discarded, and a discarded server-initiated REQUEST is
-// answered through RejectPreInitServerRequest so the upstream is not left blocked — these
-// startup paths all run before the background reader is up, so nothing else would answer
-// it. onDiscard, when non-nil, is invoked with each discarded message before it is
-// rejected (the stdio handshake uses it to log, making a chattering upstream observable).
-//
-// This is the protocol fragment the three startup read loops share —
-// StdioProxy.initUpstream, httpSession.runInitHandshake, and the stdio drift probe's
-// tools/list fetch. They previously hand-mirrored it, so a fix to the discard path (say,
-// bounding how many pre-init messages are absorbed) had to land in three places or silently
-// protect only some of them. read and the post-match handling stay with the callers: each
-// reads through a different mechanism (context-aware bridge read vs blocking pipe read) and
-// does something different with the reply, but the loop itself is now single-sourced.
-//
-// A read error is returned unwrapped so each caller can attach its own context.
+// awaitStartupReply reads upstream messages until the response matching wantID arrives.
+// Every other message is discarded, with a discarded server-initiated REQUEST answered via
+// RejectPreInitServerRequest so the upstream isn't left blocked (these startup paths run
+// before the background reader exists). onDiscard, when non-nil, is invoked before each
+// rejection (the stdio handshake logs it). Shared by the three startup read loops so a fix
+// to the discard path lands once. A read error is returned unwrapped for the caller's own
+// context.
 func awaitStartupReply(
 	read func() (mcp.RPCMsg, error),
 	wantID *json.RawMessage,
@@ -349,12 +277,10 @@ func awaitStartupReply(
 	}
 }
 
-// applyInitializeResult validates an upstream's `initialize` response and
-// extracts the server capabilities, version, and instructions. Fails closed on
-// any non-success shape — a JSON-RPC error (upstream rejected initialize), a
-// response with neither result nor error, or an unparseable result — rather than
-// handing the client a session backed by an unconfirmed upstream. serverInfo.version
-// is captured for the FM-4 drift check. Shared by all three handshakes.
+// applyInitializeResult validates an upstream's `initialize` response and extracts the
+// server capabilities, version, and instructions. Fails closed on any non-success shape
+// rather than handing the client a session backed by an unconfirmed upstream.
+// serverInfo.version is captured for the FM-4 drift check.
 func applyInitializeResult(resp mcp.RPCMsg) (caps map[string]interface{}, serverVersion, instructions string, err error) {
 	if resp.Error != nil {
 		return nil, "", "", fmt.Errorf("upstream initialize rejected: %s (code %d)", resp.Error.Message, resp.Error.Code)
@@ -379,11 +305,9 @@ func applyInitializeResult(resp mcp.RPCMsg) (caps map[string]interface{}, server
 	return caps, serverVersion, result.Instructions, nil
 }
 
-// validateInitializeResultFields rejects a structurally invalid MCP
-// InitializeResult — most importantly a JSON `null` result, which unmarshals
-// without error but leaves every field zero. A valid handshake carries a
-// non-empty protocolVersion plus capabilities and serverInfo objects. Shared by
-// the proxy handshake and the CLI live-introspection probe.
+// validateInitializeResultFields rejects a structurally invalid MCP InitializeResult —
+// most importantly a JSON `null` result, which unmarshals without error but leaves every
+// field zero.
 func validateInitializeResultFields(result mcp.InitResult) error {
 	if result.ProtocolVersion == "" {
 		return fmt.Errorf("upstream initialize result missing required 'protocolVersion' (a null or empty result is not a valid MCP handshake)")
@@ -413,15 +337,14 @@ func denialToJSONRPCCode(code string) int {
 	return wire
 }
 
-// denialErrorData is the structured payload carried in a denial's error.data.
-// Every field names something the caller already supplied (the target it
-// addressed, the argument it set) or describes the policy that rejected it —
-// never a raw caller-supplied argument *value* (§ 7.6).
+// denialErrorData is the structured payload carried in a denial's error.data. Every field
+// names something the caller already supplied or describes the rejecting policy — never a
+// raw caller-supplied argument *value* (§ 7.6).
 type denialErrorData struct {
-	Code     string `json:"code"`               // symbolic code, e.g. CONDITION_FAILED
-	Type     string `json:"type,omitempty"`     // failing condition type, e.g. allowedValues
-	Target   string `json:"target,omitempty"`   // tool/resource/prompt the call addressed
-	Argument string `json:"argument,omitempty"` // argument name a condition checked
+	Code     string `json:"code"`
+	Type     string `json:"type,omitempty"`
+	Target   string `json:"target,omitempty"`
+	Argument string `json:"argument,omitempty"`
 }
 
 // denialMessage builds an operator-actionable error.message beginning with the

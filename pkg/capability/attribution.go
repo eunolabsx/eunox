@@ -9,30 +9,15 @@ import (
 	"strings"
 )
 
-// The attribution interface — the specified escape hatch for the conservative flow join.
+// The attribution interface lets a cooperating client narrow eunox's conservative
+// session-level flow join by declaring labels it knows a call's inputs carry.
 //
-// eunox cannot see how a host assembles a model's context, so its default propagation is a
-// conservative SESSION-level set union: everything that flowed into the session is treated
-// as having flowed into every later call. That over-approximates, and for a long-running
-// agent it over-blocks. The honest answer is not to guess better — that would be inference
-// — but to let a client that DOES know say so, through a specified interface. The weakness
-// becomes spec surface rather than a classifier.
-//
-// The interface is deliberately ONE-DIRECTIONAL: a client may declare labels the proxy did
-// not know about, and those are UNIONED into the effective set for that call. It may not
-// declare that a call carries FEWER labels than the session join believes.
-//
-// That asymmetry is not a simplification, it is the security property. The premise of the
-// whole flow layer is that the agent may be prompt-injected; an agent that could narrow its
-// own taint would defeat information-flow control with a single extra field, and it would
-// be the FIRST thing an injection reached for. Union-only means an untrusted client's
-// declaration can only produce MORE denials, so honoring it needs no trust decision at all.
-//
-// The sound narrowing direction exists, but it is a different mechanism: a DELEGATOR
-// narrowing a DELEGATE's authority is attenuation, where the party doing the narrowing is
-// the one giving something up. That belongs to the delegation surface, not here. A client
-// narrowing its own taint is not attenuation; it is self-attestation by the party under
-// suspicion.
+// It is deliberately ONE-DIRECTIONAL (union-only): a client may only ADD labels the proxy
+// did not know about, never remove ones the session join believes apply. That asymmetry is
+// the security property, not a simplification — an agent that could narrow its own taint
+// would defeat flow control with one field, the first thing a prompt injection would reach
+// for. The sound narrowing direction (a delegator narrowing a delegate) is attenuation, a
+// different mechanism that belongs to the delegation surface, not here.
 
 // MetaKeyContextManifest is the reverse-DNS `_meta` key a cooperating client uses to
 // attribute a call's inputs. Namespaced so a non-supporting client, host, or upstream

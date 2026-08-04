@@ -14,72 +14,39 @@ import (
 	"github.com/eunolabs/eunox/internal/config"
 )
 
-// A content digest establishes that an entry is what it says it is. It says nothing about
-// WHO is saying it, and nothing about whether anyone else has looked. Those are the two
-// things that turn a corpus of files into a corpus with a trust model, and they are what this
-// file adds: a signature over an entry's content, made by a named key an operator chose to
-// trust, carrying either "I attest to this" or "I dispute this".
+// A content digest proves an entry is what it says; a signature adds who is saying it
+// and whether anyone looked. Four rules keep that honest: verification is LOCAL only (no
+// key fetch, no network — same rule that keeps the registry off the decision path);
+// attestations are authoring-time input, never consulted on the decision path (a manifest
+// still pins by content digest); a signature claims AUTHORSHIP, not truth (a dispute is
+// advisory, like the drift layer's manifest/upstream mismatch signal, never a detection
+// result); and an untrusted signature is inert, but a signature by a TRUSTED key that
+// fails to verify is an error — the entry was edited after it was signed.
 //
-// Four properties keep it honest, and each is a deliberate limit rather than an omission:
-//
-//  1. LOCAL, always. Verification takes a trust store the operator points at on disk and
-//     nothing else. There is no key discovery, no fetch, no fallback to a well-known URL —
-//     the same rule that keeps the registry off the decision path keeps it off the network
-//     entirely, so verifying a corpus someone handed you works offline.
-//  2. NEVER on the decision path. Attestations are authoring-time input, checked by
-//     `eunox contracts` and by whatever CI an operator runs. A manifest still pins an entry
-//     by content digest, and that pin is still what the manifest loader verifies. An
-//     unattested contract enforces exactly as it did before; attestation changes what a human
-//     knows when choosing to pin it, not what the proxy does with it.
-//  3. It is a claim of AUTHORSHIP, not of truth. A vendor signature says the vendor asserts
-//     this is what their tool does. Nothing here observes the tool. A dispute is likewise a
-//     community-advisory signal, not a detection result — the same posture the drift layer
-//     takes about a manifest/upstream mismatch.
-//  4. An untrusted signature is INERT, but a trusted signature that does not verify is an
-//     ERROR. Those are different failures. A corpus may carry signatures from keys an
-//     operator has never heard of, and refusing to load it over one would make every entry's
-//     usability depend on the operator having collected every publisher's key. But a
-//     signature by a key the operator DID configure, which does not verify against the
-//     content in front of it, means the entry was edited after it was signed — which is the
-//     substitution the whole mechanism exists to catch.
-//
-// This is the SECOND operator-configured public-key file in the codebase, beside the
-// per-upstream JWKS in pkg/capability/receipt.go, and the divergence is deliberate rather
-// than an oversight. Property 4 above splits "unknown key" from "trusted key, bad
-// signature"; the receipt verifier deliberately COLLAPSES the same two into one
-// ReceiptUnverified verdict, because splitting them there would invite a consumer to treat
-// some unverified receipts as softer than others when all of them earn nothing. The two
-// surfaces are genuinely different objects — a detached signature over content, read by a
-// human at authoring time, versus a JWS with claims verified on the request path — so one
-// shared format would have to pick a posture that is wrong for one of them. An operator
-// reasoning from one file about the other gets it backwards, which is why
-// docs/effect-contracts.md states the difference where both are documented.
+// This is deliberately a separate trust-key file from the per-upstream JWKS in
+// pkg/capability/receipt.go: one is a detached signature reviewed by a human at authoring
+// time, the other a JWS with claims verified on the request path, and each needs its own
+// posture (see docs/effect-contracts.md).
 const (
-	// AttestRoleVendor marks a signature by the party that publishes the MCP server the
-	// contract describes: the strongest claim available here, because the signer is the one
-	// who would know and the one accountable for it being wrong.
+	// AttestRoleVendor marks a signature by the tool's own publisher — the strongest
+	// claim available, since they'd know and are accountable if it's wrong.
 	AttestRoleVendor = "vendor"
-	// AttestRoleReviewer marks a signature by a third party who read the entry and its
-	// notes. It is the community-review signal — several independent reviewers is evidence
-	// of a kind, and it is not a vendor's word.
+	// AttestRoleReviewer marks a signature by a third party who reviewed the entry — a
+	// community signal, not a vendor's word.
 	AttestRoleReviewer = "reviewer"
 
 	// AttestStatementAttests asserts the contract is a correct description of the tool.
 	AttestStatementAttests = "attests"
-	// AttestStatementDisputes asserts it is not. A dispute is the reason this surface is a
-	// list rather than a single signature: the useful signal is often that someone who
-	// looked disagreed, and a format with nowhere to record that loses it.
+	// AttestStatementDisputes asserts it is not — the reason this surface is a list of
+	// signatures rather than a single one.
 	AttestStatementDisputes = "disputes"
 
-	// AttestAlgorithmEd25519 is the only signature algorithm this build verifies. One
-	// algorithm, chosen rather than negotiated: a corpus is a distributed artifact read by
-	// many parties, and an algorithm field a verifier honors is an algorithm an attacker
-	// selects. Ed25519 needs no parameters, has no curve or hash to get wrong, and is in the
-	// standard library, so adding it costs the one-static-binary rule nothing.
+	// AttestAlgorithmEd25519 is the only algorithm this build verifies. Fixed rather
+	// than negotiated — an algorithm field a verifier honors is one an attacker selects.
 	AttestAlgorithmEd25519 = "ed25519"
 
-	// attestPayloadPrefix domain-separates the signed bytes. Without it a signature over a
-	// contract could be replayed anywhere else the same key signs a similar-looking string.
+	// attestPayloadPrefix domain-separates the signed bytes. Without it a signature over
+	// a contract could be replayed anywhere else the same key signs a similar-looking string.
 	attestPayloadPrefix = "eunox-effect-contract-attestation/v1"
 )
 
@@ -88,75 +55,48 @@ var validAttestStatements = map[string]bool{AttestStatementAttests: true, Attest
 
 // Signature is one party's signed statement about a corpus entry.
 //
-// There is deliberately no timestamp field. A signature carrying an unsigned timestamp
-// invites exactly the mistake the format should not permit — reading a value beside a
-// signature as though the signature covered it — and a timestamp INSIDE the payload would
-// promise a freshness story an offline, local-only trust store cannot deliver (there is no
-// revocation, no expiry check, and nothing to compare a date against). The signed claim is
-// the whole claim: this key, in this role, says this about this content.
+// Deliberately no timestamp field: an unsigned one invites reading it as though the
+// signature covered it, and a signed one would promise a freshness story an offline,
+// local-only trust store can't deliver (no revocation, no expiry check).
 type Signature struct {
-	// KeyID names the key that produced the signature. It is matched against the operator's
-	// trust store; a signature whose key is not there is inert, never an error.
+	// KeyID is matched against the operator's trust store; an unmatched key is inert,
+	// never an error.
 	KeyID string `json:"keyId"`
 	// Algorithm must be AttestAlgorithmEd25519.
 	Algorithm string `json:"algorithm"`
-	// Role is the standing the signer claims: AttestRoleVendor or AttestRoleReviewer. It is
-	// part of the SIGNED payload, so a reviewer's signature cannot be re-presented as a
-	// vendor's, and the trust store may additionally refuse a key the role it is used in.
+	// Role is part of the SIGNED payload, so a reviewer's signature cannot be
+	// re-presented as a vendor's.
 	Role string `json:"role"`
-	// Statement is AttestStatementAttests or AttestStatementDisputes. Also part of the
-	// signed payload: without it, a dispute could be stripped down to look like an
-	// endorsement by editing one unsigned field.
+	// Statement is also part of the signed payload — otherwise a dispute could be
+	// edited down to look like an endorsement.
 	Statement string `json:"statement"`
 	// Value is the base64 (standard encoding) Ed25519 signature over AttestationPayload.
 	Value string `json:"signature"`
 }
 
-// decoded returns the signature bytes, decoded on every call.
-//
-// Validate decodes and length-checks the same string at corpus load, and caching the
-// result there would remove that second decode — but it would also make verification
-// correct only for a Signature nobody has touched since. Value is a plain field on an
-// exported struct: an in-process caller can swap it and leave the cache holding the bytes
-// that DID verify, which turns "this signature does not match this content" into a pass on
-// the one check that exists to catch exactly that. A base64 decode of 88 characters, on an
-// authoring-time CLI path, is not worth making an integrity result conditional on caller
-// discipline.
+// decoded returns the signature bytes, decoded on every call rather than cached — Value
+// is a mutable exported field, and a stale cache could pass a signature that no longer
+// matches its content.
 func (s *Signature) decoded() ([]byte, error) {
 	return base64.StdEncoding.DecodeString(s.Value)
 }
 
-// AttestationPayload returns the exact bytes a signature covers: the domain separator, the
-// contract id, its content digest, the signer's role, and the statement, newline-separated.
+// AttestationPayload returns the exact bytes a signature covers: domain separator,
+// contract id, content digest, role, and statement, newline-separated. Exported so a
+// publisher can produce the same bytes to sign (`eunox contracts --attest-payload`
+// prints them).
 //
-// Every field that gives the signature its meaning is in here, and nothing that does not. The
-// digest is what binds it to CONTENT — re-signing is required after any edit to the effect
-// block, which is the property that makes a stale signature detectable rather than a rubber
-// stamp that survives a rewrite.
-//
-// Exported because a publisher has to be able to produce these bytes to sign them, and
-// deriving them from a prose description of the format is how two implementations end up
-// disagreeing about a trailing newline. `eunox contracts --attest-payload` prints exactly
-// this.
-//
-// The separator is a newline rather than the length prefix this codebase uses for counter keys,
-// and that is sound HERE for a reason worth stating, since the usual answer is the opposite.
-// Field confusion needs two distinct field tuples to render the same bytes. Reading this
-// payload from the END is unambiguous: statement and role come from closed vocabularies and
-// digest is 64 hex characters, so none of the three can contain a newline and each is
-// determined by counting back from the tail. Everything between the fixed prefix and those
-// three is the id, whatever it contains. There is no shift to find. The one field that COULD
-// carry a newline is the id, and Contract.Validate refuses one outright rather than leaving
-// this argument as the only thing standing between a corpus and a re-presented signature.
+// A newline separator (not a length prefix) is safe here because reading from the END is
+// unambiguous — statement/role are closed vocabularies and digest is 64 hex chars, so
+// only the id could hide a newline, and Contract.Validate refuses one outright.
 func AttestationPayload(id, digest, role, statement string) []byte {
 	return []byte(strings.Join([]string{attestPayloadPrefix, id, digest, role, statement}, "\n"))
 }
 
-// NewSignaturePayload returns the bytes a signer covers for one corpus entry, validating the
-// role and statement first so a typo produces an error rather than a payload nobody will ever
-// be able to verify against. The digest is recomputed from the entry's own content, never
-// taken from its declaration, for the reason VerifyAttestations recomputes it: a signature
-// over a self-declared digest authenticates the declaration instead of the content.
+// NewSignaturePayload returns the bytes a signer covers for one corpus entry, validating
+// role and statement first. The digest is recomputed from content, never taken from the
+// declaration — signing a self-declared digest would authenticate the declaration, not
+// the content.
 func NewSignaturePayload(c *Contract, role, statement string) ([]byte, error) {
 	if !validAttestRoles[role] {
 		return nil, fmt.Errorf("attestation role %q is not one of %s", role, sortedKeys(validAttestRoles))
@@ -171,10 +111,9 @@ func NewSignaturePayload(c *Contract, role, statement string) ([]byte, error) {
 	return AttestationPayload(c.ID, digest, role, statement), nil
 }
 
-// Validate checks a signature's structure — everything checkable without a key. It runs at
-// corpus load, so a malformed signature is a rejected ENTRY rather than one that silently
-// verifies against nothing later: a signature nobody can evaluate is worse than no signature,
-// because it looks like assurance in a listing.
+// Validate checks a signature's structure — everything checkable without a key. Runs at
+// corpus load so a malformed signature rejects the entry, rather than silently looking
+// like assurance later.
 func (s *Signature) Validate(contractID string) error {
 	if s == nil {
 		return fmt.Errorf("contract %q has a null entry in 'signatures'", contractID)
@@ -209,13 +148,11 @@ type TrustedKey struct {
 	Algorithm string `json:"algorithm"`
 	// PublicKey is the base64 (standard encoding) raw 32-byte Ed25519 public key.
 	PublicKey string `json:"publicKey"`
-	// Owner is the human-readable party this key belongs to, shown in reports. It is what an
-	// operator reads to decide whether a green checkmark means anything to them.
+	// Owner is the human-readable party this key belongs to — what an operator reads to
+	// judge whether a checkmark means anything to them.
 	Owner string `json:"owner"`
-	// Roles optionally restricts the roles this key may assert. Empty means any. It exists
-	// because trusting a key is not one decision: an operator may well trust a security
-	// researcher's key as a REVIEWER while not accepting it as the vendor of anything, and
-	// without this the two would be the same grant.
+	// Roles optionally restricts the roles this key may assert (empty means any) —
+	// trusting a key as a reviewer is not the same decision as trusting it as a vendor.
 	Roles []string `json:"roles,omitempty"`
 
 	pub ed25519.PublicKey
@@ -240,20 +177,14 @@ func (t *TrustStore) Len() int {
 	return len(t.keys)
 }
 
-// maxTrustStoreBytes bounds a trust-store file. It is a bound on how much a MISDIRECTED path
-// can make this read, not on how many keys an operator may configure: RefuseNonRegularPath
-// rejects the device and FIFO cases up front, but a plain regular file of the wrong kind
-// (a log, a core dump, a pointed-at disk image) is exactly what a fat-fingered --trust-keys
-// produces, and reading it whole before discovering it is not JSON is the difference between an
-// error message and an OOM. Four mebibytes is roughly ten thousand Ed25519 keys with their
-// metadata — far past any real store — and it errors rather than truncating, because a
-// truncated store would silently stop trusting the keys past the cut.
+// maxTrustStoreBytes bounds what a MISDIRECTED path (a fat-fingered --trust-keys pointed
+// at a log or disk image) can make this read — an error, not a truncation, since a
+// truncated store would silently drop trust in the keys past the cut.
 const maxTrustStoreBytes = 4 << 20
 
-// readTrustStoreFile opens the store with the same symlink guard the audit key file uses and
-// reads it under the size bound. O_NOFOLLOW closes the Lstat->open window RefuseNonRegularPath
-// cannot: the trust store names the keys whose attestations are believed, so swapping it for a
-// symlink between the check and the read substitutes the operator's whole trust root.
+// readTrustStoreFile opens with O_NOFOLLOW, closing the Lstat->open TOCTOU window
+// RefuseNonRegularPath alone cannot: a symlink swap there would substitute the operator's
+// whole trust root.
 func readTrustStoreFile(path string) ([]byte, error) {
 	return readBoundedFile(boundedRead{
 		path:      path,
@@ -264,11 +195,9 @@ func readTrustStoreFile(path string) ([]byte, error) {
 	})
 }
 
-// LoadTrustStore reads a trusted-key file. The format is a JSON object with a "keys" array of
-// TrustedKey. Unknown fields are rejected, and every failure is an error rather than a skipped
-// key: a trust store that silently dropped a malformed entry would report an entry as
-// unattested when the operator believes they configured its key, which is the wrong direction
-// to be wrong in for a file whose whole job is to say what is trusted.
+// LoadTrustStore reads a "keys" array of TrustedKey. Every failure is an error, not a
+// skipped key — silently dropping a malformed entry would report it unattested when the
+// operator believes they configured its key.
 func LoadTrustStore(path string) (*TrustStore, error) {
 	resolved, err := config.ExpandHome(path)
 	if err != nil {
@@ -319,20 +248,15 @@ func LoadTrustStore(path string) (*TrustStore, error) {
 
 // AttestationStatus is what verification concluded about one entry.
 type AttestationStatus struct {
-	// Attested and Disputed name the OWNERS (not the key ids) of verified signatures, sorted.
-	// Owners rather than key ids because the question an operator is answering is "whose word
-	// is this", and a key id is an identifier they would have to look up in the same file
-	// they already configured.
+	// Attested and Disputed name the OWNERS (not key ids) of verified signatures,
+	// sorted — the question an operator answers is "whose word is this".
 	Attested []string
 	Disputed []string
-	// VendorAttested is true when at least one verified attests-signature was made in the
-	// vendor role. It is the single bit most consumers want, kept separate from the owner
-	// lists so a caller does not re-derive it (and get it wrong for a disputing vendor).
+	// VendorAttested is true when a verified attests-signature was made in the vendor
+	// role — the single bit most consumers want.
 	VendorAttested bool
-	// Unverified counts signatures whose key is not in the trust store, or which the store
-	// trusts only in another role. Reported rather than hidden: "3 signatures, none I can
-	// check" is a materially different state from "no signatures", and collapsing the two
-	// would let a corpus look bare when it is merely signed by strangers.
+	// Unverified counts signatures whose key isn't trusted (or trusted only in another
+	// role) — reported, since "signed by strangers" is a different state from "no signatures".
 	Unverified int
 }
 
@@ -341,9 +265,8 @@ func (s AttestationStatus) Summary() string {
 	var head string
 	switch {
 	case len(s.Disputed) > 0:
-		// A dispute leads, always, even alongside attestations. The whole reason to record
-		// one is that a reader must not skim past it, and a row that led with "vendor" while
-		// someone who looked disagreed would bury the signal under the endorsement.
+		// A dispute always leads, even alongside attestations — a reader must not
+		// skim past it.
 		head = fmt.Sprintf("DISPUTED(%d)", len(s.Disputed))
 	case s.VendorAttested:
 		head = "vendor"
@@ -354,29 +277,25 @@ func (s AttestationStatus) Summary() string {
 	default:
 		return "-"
 	}
-	// The unverified count rides ALONGSIDE whatever verified, never gets replaced by it. The
-	// Unverified field exists precisely because "signed by strangers" and "not signed" are
-	// different states; reporting only the head hid the same distinction one level up, so an
-	// entry with one trusted reviewer and nine signatures from unknown keys rendered as a bare
-	// "reviewed(1)" and the operator had no indication the nine existed.
+	// The unverified count rides ALONGSIDE the verified head, never replaces it —
+	// otherwise an entry with one reviewer and nine stranger signatures rendered as a
+	// bare "reviewed(1)".
 	if s.Unverified > 0 {
 		return fmt.Sprintf("%s +unverified(%d)", head, s.Unverified)
 	}
 	return head
 }
 
-// VerifyAttestations checks every signature on c against the trust store and reports what
-// held. A signature by an untrusted (or wrongly-roled) key is counted as unverified; a
-// signature by a TRUSTED key that does not verify is an error, because the only way to get
-// one is to edit an entry after it was signed.
+// VerifyAttestations checks every signature on c against the trust store. An untrusted
+// (or wrongly-roled) key counts as unverified; a TRUSTED key whose signature fails to
+// verify is an error — the only way to get one is editing the entry after it was signed.
 func (c *Contract) VerifyAttestations(store *TrustStore) (AttestationStatus, error) {
 	var status AttestationStatus
 	if len(c.Signatures) == 0 {
 		return status, nil
 	}
-	// The digest derived from the entry's own CONTENT, never the declared one: a signature
-	// verified against a self-declared digest would authenticate the declaration instead of
-	// the content, which is precisely the substitution the digest exists to prevent.
+	// Derived from content, never the declared digest — verifying against a
+	// self-declared value would authenticate the declaration instead of the content.
 	digest, err := c.contentDigest()
 	if err != nil {
 		return status, fmt.Errorf("contract %q: %w", c.ID, err)
@@ -393,24 +312,19 @@ func (c *Contract) VerifyAttestations(store *TrustStore) (AttestationStatus, err
 		}
 		raw, decErr := sig.decoded()
 		if decErr != nil {
-			// Structurally checked at load; a caller-built Contract can still carry one, and
-			// an unparseable signature by a TRUSTED key is the tampering case, not the
-			// stranger case.
+			// Structurally checked at load; a caller-built Contract can still bypass
+			// that, and an unparseable signature by a TRUSTED key is tampering, not a stranger.
 			return AttestationStatus{}, fmt.Errorf("contract %q: signature %q is not valid base64: %w", c.ID, sig.KeyID, decErr)
 		}
-		// VERIFY FIRST, then decide whether the verified statement counts. Testing the role
-		// restriction before the signature collapsed two different failures into one: a key
-		// the operator trusts only as a reviewer, whose vendor-role signature no longer
-		// matches the content, was reported as a stranger's signature rather than as the
-		// tampering it is — and tampering is the substitution this whole mechanism exists to
-		// catch, in an entry the operator explicitly configured a key for.
+		// Verify FIRST, then check role: testing the role restriction first would
+		// misreport a trusted key's tampered signature as merely "wrong role" instead
+		// of the tampering it is.
 		if !ed25519.Verify(key.pub, AttestationPayload(c.ID, digest, sig.Role, sig.Statement), raw) {
 			return AttestationStatus{}, fmt.Errorf("contract %q: signature by trusted key %q (%s) does not verify against this entry's content; the entry was edited after it was signed, or the signature was copied from another entry", c.ID, sig.KeyID, key.Owner)
 		}
 		if !key.permits(sig.Role) {
-			// A genuine signature, in a role this operator does not accept from this key.
-			// Trusting a key is not one decision, so this counts for nothing rather than
-			// erroring.
+			// A genuine signature, in a role this operator doesn't accept from this
+			// key — counts for nothing rather than erroring.
 			status.Unverified++
 			continue
 		}
@@ -418,12 +332,9 @@ func (c *Contract) VerifyAttestations(store *TrustStore) (AttestationStatus, err
 		if owner == "" {
 			owner = key.KeyID
 		}
-		// An explicit switch with a fail-closed default. Signature.Validate closes the
-		// statement vocabulary, but it runs only on the LoadCorpus path, and this method is
-		// exported on an exported struct — a caller-built or externally-decoded Contract
-		// reaches here with an unchecked Statement. Falling through to "attested" would let a
-		// statement this build does not understand ("revoked", or a capitalized "Disputes")
-		// earn the strongest badge the report emits.
+		// Explicit switch with a fail-closed default: Signature.Validate closes the
+		// statement vocabulary only on the LoadCorpus path, so a caller-built Contract
+		// can still reach here with an unchecked Statement.
 		switch sig.Statement {
 		case AttestStatementDisputes:
 			disputed[owner] = true

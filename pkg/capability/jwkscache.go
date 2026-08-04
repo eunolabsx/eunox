@@ -25,27 +25,22 @@ import (
 	jose "github.com/go-jose/go-jose/v4"
 )
 
-// ErrJWKSUnavailable tags every failure to obtain a usable key set from the JWKS
-// endpoint — a network error, a non-200 response, an empty or oversized set, an
-// unparseable body, or an open circuit breaker. It marks the failure as an
-// availability problem with the key infrastructure rather than a problem with the
-// token: when a fetch fails, the presented token was never even checked against a
-// key, so it must NOT be recorded in the fail-closed audit trail as if it were
-// forged. Callers surface it through the "fetch JWKS"/"refresh JWKS" %w wraps in
-// VerifyWithKeyRotation, so errors.Is finds it end-to-end; the audit layer keys on
-// it to classify the record as a JWKS outage (see ClassifyJWTError).
+// ErrJWKSUnavailable tags every failure to obtain a usable key set from the JWKS endpoint —
+// a network error, a non-200, an empty/oversized set, an unparseable body, or an open
+// circuit breaker. It marks the failure as a key-infrastructure availability problem, not a
+// forged token: the presented token was never even checked against a key, so it must NOT be
+// recorded in the audit trail as if it were. The audit layer keys on it via errors.Is to
+// classify the record as a JWKS outage (see ClassifyJWTError).
 var ErrJWKSUnavailable = errors.New("JWKS unavailable")
 
-// JWKSCache fetches and caches a remote JSON Web Key Set. It is the shared cache
-// consumed by the gateway's IdP-JWT validator, which keeps only its own
-// claim-validation logic and delegates all fetch/cache/singleflight/breaker/TTL
-// behaviour here.
+// JWKSCache fetches and caches a remote JSON Web Key Set. It is the shared cache consumed by
+// the gateway's IdP-JWT validator, which keeps only its own claim-validation logic and
+// delegates fetch/cache/singleflight/breaker/TTL behaviour here.
 //
-// Concurrency: a singleflight group collapses concurrent refreshes into one HTTP
-// round-trip whose result waiters share. The fetch is decoupled from any caller's
-// context (context.WithoutCancel) so one caller's deadline neither aborts the
-// shared fetch nor charges a spurious breaker failure for every waiter; the HTTP
-// client's own timeout still bounds it.
+// Concurrency: a singleflight group collapses concurrent refreshes into one HTTP round-trip
+// whose result waiters share. The fetch is decoupled from any caller's context
+// (context.WithoutCancel) so one caller's deadline neither aborts the shared fetch nor
+// charges a spurious breaker failure for every waiter.
 type JWKSCache struct {
 	jwksURI string
 	client  *http.Client
@@ -57,56 +52,48 @@ type JWKSCache struct {
 	jwks      *jose.JSONWebKeySet
 	fetchedAt time.Time
 	cacheTTL  time.Duration
-	// fetchTicket issues a monotonically increasing generation to each fetch when
-	// it begins; installedFetchGen records the ticket of the installed set. Forced
-	// and non-forced refreshes run concurrently with no completion ordering, so the
-	// generation guard commits an install only when its ticket is newer than the
-	// installed one — otherwise an earlier-started, later-finishing fetch could
-	// overwrite a newer forced rotation and reintroduce a removed key for the TTL.
-	// Both guarded by mu.
+	// fetchTicket issues a monotonically increasing generation to each fetch when it begins;
+	// installedFetchGen records the ticket of the installed set. Forced and non-forced
+	// refreshes run concurrently with no completion ordering, so the guard commits an
+	// install only when its ticket is newer than the installed one — otherwise an
+	// earlier-started, later-finishing fetch could overwrite a newer forced rotation and
+	// reintroduce a removed key for the TTL. Both guarded by mu.
 	fetchTicket       uint64
 	installedFetchGen uint64
 
-	// maxFetch is the ceiling applied to the shared fetch when the HTTP client has
-	// no finite timeout of its own (see maxJWKSFetch). Overridable in tests.
+	// maxFetch is the ceiling applied to the shared fetch when the HTTP client has no finite
+	// timeout of its own (see maxJWKSFetch). Overridable in tests.
 	maxFetch time.Duration
 
-	// sfGroup deduplicates concurrent refreshes into one in-flight round-trip;
-	// callers block on the group (not c.mu) and share the result.
+	// sfGroup deduplicates concurrent refreshes into one in-flight round-trip; callers block
+	// on the group (not c.mu) and share the result.
 	sfGroup singleflight.Group
 
-	// negMu guards negKIDs, the negative cache of key IDs a forced refresh failed to
-	// resolve (see ForceRefreshForKID), so a flood of distinct unknown-kid tokens
-	// cannot amplify into one round-trip each. Separate from mu so a kid-miss lookup
-	// never contends with a fetch's write lock; an RWMutex so the kidRecentlyAbsent
-	// hot path (a pure read) runs concurrently across flood callers.
+	// negMu guards negKIDs, the negative cache of key IDs a forced refresh failed to resolve
+	// (see ForceRefreshForKID), so a flood of distinct unknown-kid tokens cannot amplify into
+	// one round-trip each. Separate from mu so a kid-miss lookup never contends with a
+	// fetch's write lock; RWMutex so the hot-path read runs concurrently across flood callers.
 	negMu   sync.RWMutex
 	negKIDs map[string]time.Time
 }
 
 const (
-	// negativeKIDTTL bounds how long a kid a forced refetch failed to resolve is
-	// remembered as absent; while remembered, a token carrying it fails closed
-	// without another forced fetch. Short so a genuinely rotated-in kid is retried
-	// promptly.
+	// negativeKIDTTL bounds how long a kid a forced refetch failed to resolve is remembered
+	// as absent (fails closed without another forced fetch); short so a genuinely
+	// rotated-in kid is retried promptly.
 	negativeKIDTTL = 30 * time.Second
-	// negativeKIDMaxLen caps the negative cache so a flood of distinct unknown kids
-	// cannot grow the map without bound. At the cap a new kid is not recorded and
-	// falls back to the breaker-bounded forced-refresh path, degrading safely.
+	// negativeKIDMaxLen caps the negative cache so a flood of distinct unknown kids cannot
+	// grow the map without bound. At the cap a new kid falls back to the breaker-bounded
+	// forced-refresh path, degrading safely.
 	negativeKIDMaxLen = 1024
-	// maxJWKSKeys bounds how many keys a JWKS response may carry. A kid-less token
-	// trials every key (FindKeys returns the whole set), so an oversized set lets a
-	// compromised endpoint force O(keys) asymmetric verifications per such token. A
-	// response over the cap is rejected wholesale (fail closed); the breaker records
-	// it and any cached good set keeps serving. Far above any legitimate rotation
-	// overlap. Mirrors maxResolverKeys on the co-issuer proof path.
+	// maxJWKSKeys bounds how many keys a JWKS response may carry. A kid-less token trials
+	// every key, so an oversized set lets a compromised endpoint force O(keys) asymmetric
+	// verifications per such token. Over the cap is rejected wholesale (fail closed); the
+	// breaker records it and any cached good set keeps serving.
 	maxJWKSKeys = 100
-	// maxJWKSFetch is the ceiling on the shared fetch when the HTTP client has no
-	// finite timeout of its own. The fetch is decoupled from the caller's context
-	// (context.WithoutCancel) assuming the client's Timeout bounds it, but a custom
-	// zero-value client has Timeout == 0; without this ceiling a stalled transport
-	// would hang every later verification joining the singleflight call. Generous so
-	// a slow-but-live issuer still succeeds.
+	// maxJWKSFetch is the ceiling on the shared fetch when the HTTP client has no finite
+	// timeout of its own (a zero-value client has Timeout == 0); without this a stalled
+	// transport would hang every verification joining the singleflight call.
 	maxJWKSFetch = 30 * time.Second
 )
 
@@ -123,12 +110,10 @@ type JWKSCacheConfig struct {
 	Client *http.Client
 	// Logger for operational messages. Default: slog.Default().
 	Logger *slog.Logger
-	// Breaker optionally protects refreshes from a flapping upstream. When nil
-	// the cache fetches directly; callers that want breaker protection on every
-	// fetch (e.g. the shipped proxy) must supply one.
+	// Breaker optionally protects refreshes from a flapping upstream. When nil the cache
+	// fetches directly; a caller wanting breaker protection on every fetch must supply one.
 	Breaker *circuitbreaker.Breaker
-	// Now is an optional clock used for the cache-TTL comparison (testing).
-	// Default: time.Now.
+	// Now is an optional clock used for the cache-TTL comparison (testing). Default: time.Now.
 	Now func() time.Time
 }
 
@@ -140,12 +125,11 @@ func NewJWKSCache(cfg JWKSCacheConfig) *JWKSCache { //nolint:gocritic // hugePar
 	if cfg.Client == nil {
 		cfg.Client = &http.Client{
 			Timeout: 10 * time.Second,
-			// Refuse to follow redirects: the JWKS endpoint is the root of trust, so
-			// a 30x to another host (an SSRF pivot or attacker-chosen key source) must
-			// never be followed silently. A legitimate endpoint answers 200 directly;
-			// ErrUseLastResponse surfaces the redirect as a non-200 that fetchKeys
-			// fails closed on. This is the in-library defense for direct cache callers
-			// (the CLI also validates scheme/host up front).
+			// Refuse to follow redirects: the JWKS endpoint is the root of trust, so a 30x to
+			// another host (an SSRF pivot or attacker-chosen key source) must never be followed
+			// silently. ErrUseLastResponse surfaces the redirect as a non-200 fetchKeys fails
+			// closed on. In-library defense for direct cache callers; the CLI also validates
+			// scheme/host up front.
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
@@ -157,16 +141,14 @@ func NewJWKSCache(cfg JWKSCacheConfig) *JWKSCache { //nolint:gocritic // hugePar
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	// The JWKS endpoint is the root of trust for token verification, so a plaintext
-	// http:// URL to a non-loopback host is silently MITM-able. The CLI validates the
-	// scheme up front (with an explicit --jwks-allow-insecure-http opt-out), but a direct
-	// library consumer gets no such check — warn loudly here (the in-library floor,
-	// mirroring the redirect refusal above), without failing construction so the CLI's
-	// explicit opt-out is not double-reported.
+	// The JWKS endpoint is the root of trust for token verification, so a plaintext http://
+	// URL to a non-loopback host is silently MITM-able. The CLI validates the scheme up
+	// front, but a direct library consumer gets no such check — warn loudly here (without
+	// failing construction, so the CLI's own opt-out isn't double-reported).
 	if u, err := url.Parse(cfg.JWKSURL); err == nil && u.Scheme == "http" && !IsLoopbackHost(u.Hostname()) {
 		// Redact: some IdPs gate the JWKS endpoint behind a query key or basic-auth
-		// userinfo, and this attribute lands in whatever handler the consumer wired —
-		// commonly a JSON log shipped to a central store.
+		// userinfo, and this lands in whatever handler the consumer wired — commonly a
+		// JSON log shipped to a central store.
 		cfg.Logger.Warn("JWKS URL uses plaintext http to a non-loopback host; the key set is the root of trust for token verification and is MITM-able over http — use https", slog.String("url", RedactURLForLog(cfg.JWKSURL)))
 	}
 	return &JWKSCache{
@@ -181,16 +163,13 @@ func NewJWKSCache(cfg JWKSCacheConfig) *JWKSCache { //nolint:gocritic // hugePar
 	}
 }
 
-// IsLoopbackHost reports whether host (a URL hostname, no port) is a loopback
-// name or address — the one case where a plaintext http JWKS URL carries no MITM
-// exposure (the traffic never leaves the machine). Exported as the single source
-// of truth for this check: cmd/eunox's startup --jwks-uri scheme gate consults it
-// too, so the CLI's validation and this package's own warning cannot re-diverge
-// the way two independent copies previously did.
+// IsLoopbackHost reports whether host (a URL hostname, no port) is a loopback name or
+// address — the one case where a plaintext http JWKS URL carries no MITM exposure. Exported
+// as the single source of truth: cmd/eunox's startup --jwks-uri scheme gate consults it too,
+// so the two cannot re-diverge the way two independent copies previously did.
 func IsLoopbackHost(host string) bool {
-	// DNS host names are case-insensitive (RFC 4343) and url.Parse does not
-	// normalize case, so "LOCALHOST"/"Localhost" reach here verbatim. Trim a
-	// trailing FQDN dot too ("localhost.").
+	// DNS host names are case-insensitive (RFC 4343) and url.Parse does not normalize case,
+	// so "LOCALHOST"/"Localhost" reach here verbatim. Trim a trailing FQDN dot too.
 	if strings.EqualFold(strings.TrimSuffix(host, "."), "localhost") {
 		return true
 	}
@@ -200,38 +179,32 @@ func IsLoopbackHost(host string) bool {
 	return false
 }
 
-// freshAt reports whether a key set is installed and still inside its TTL as of now —
-// the single staleness predicate for the cache. GetKeys, refresh's pre-singleflight
-// check, and refresh's in-closure double-check all ask exactly this question at different
-// lock depths, so a change to what "fresh" means (a jitter, a soft-TTL grace) must land
-// in one place rather than three that can silently disagree about when a key set expires.
+// freshAt reports whether a key set is installed and still inside its TTL as of now — the
+// single staleness predicate for the cache, asked at three different lock depths (GetKeys,
+// refresh's pre-singleflight check, refresh's in-closure double-check) so a change to what
+// "fresh" means lands in one place.
 //
-// The clock reading is the CALLER's (`c.freshAt(c.now())`) rather than taken inside:
-// c.now is an injectable func field, and an indirect call through it pushes this past the
-// inliner's budget — turning a predicate on the per-token verification path into a real
-// call frame. Passing the sampled time keeps the one predicate AND the inlining.
+// The clock reading is the CALLER's rather than taken inside: c.now is an injectable func
+// field, and an indirect call through it pushes this past the inliner's budget on the
+// per-token verification path. Passing the sampled time keeps the predicate inlined.
 //
 // The caller MUST hold c.mu (read or write): it reads jwks and fetchedAt, both guarded.
 func (c *JWKSCache) freshAt(now time.Time) bool {
 	return c.jwks != nil && now.Sub(c.fetchedAt) < c.cacheTTL
 }
 
-// GetKeys returns the cached JWKS when it is still within the TTL, otherwise it
-// fetches a fresh copy.
+// GetKeys returns the cached JWKS when it is still within the TTL, otherwise it fetches a
+// fresh copy.
 //
-// The returned set's Keys SLICE is independent of the cache's (see copyKeySet), so a
-// caller may hold, append to, or reorder it without disturbing the verifications running
-// concurrently. Refresh and both ForceRefresh* methods carry the same contract — every
-// exported accessor copies, so no caller holds the live instance.
+// The returned set's Keys SLICE is independent of the cache's (see copyKeySet), so a caller
+// may hold, append to, or reorder it without disturbing concurrent verifications — every
+// exported accessor shares this contract, so no caller holds the live instance.
 //
-// The copy is one level deep: each jose.JSONWebKey still carries a Key interface{}
-// pointing at the same underlying *rsa.PublicKey / *ecdsa.PublicKey, so the KEYS
-// THEMSELVES remain read-only. Mutating one would corrupt the root-of-trust material
-// seen by every concurrent token validation. FindKeys has the same bound.
+// The copy is one level deep: each jose.JSONWebKey still carries a Key interface{} pointing
+// at the same underlying public key, so the KEYS THEMSELVES remain read-only; mutating one
+// would corrupt the root-of-trust material seen by every concurrent validation.
 //
-// The production consumer (VerifyWithKeyRotation) does not call this: it uses
-// getKeysLive, the uncopied core below, since it narrows the result through FindKeys
-// immediately, which already returns its own fresh slice — see getKeysLive's doc.
+// The production consumer (VerifyWithKeyRotation) uses getKeysLive instead — see its doc.
 func (c *JWKSCache) GetKeys(ctx context.Context) (*jose.JSONWebKeySet, error) {
 	keys, err := c.getKeysLive(ctx)
 	if err != nil {
@@ -240,17 +213,14 @@ func (c *JWKSCache) GetKeys(ctx context.Context) (*jose.JSONWebKeySet, error) {
 	return copyKeySet(keys), nil
 }
 
-// getKeysLive is GetKeys' uncopied core: it returns the cache's live
-// *jose.JSONWebKeySet (or a fresh one just fetched), never a copy.
+// getKeysLive is GetKeys' uncopied core: it returns the cache's live *jose.JSONWebKeySet (or
+// a fresh one just fetched), never a copy.
 //
-// Unexported, and reached only from VerifyWithKeyRotation, which immediately narrows
-// whatever this returns through FindKeys — itself always allocating a fresh slice
-// independent of the cache — so copyKeySet's whole-set copy on this path is pure
-// transient garbage: measured at up to ~14.4 KB per call at maxJWKSKeys keys, paid on
-// every token verification including the common cache-hit case. GetKeys wraps this
-// with copyKeySet for every other caller (out-of-package, or any future in-package one
-// that does not immediately narrow the result the way FindKeys does), whose contract
-// still promises an independent set.
+// Unexported, reached only from VerifyWithKeyRotation, which immediately narrows the result
+// through FindKeys — itself always allocating a fresh slice — so copyKeySet's whole-set copy
+// on this path is pure transient garbage (measured ~14.4 KB per call at maxJWKSKeys keys,
+// paid on every verification including the cache-hit case). GetKeys wraps this with
+// copyKeySet for every other caller, whose contract still promises an independent set.
 func (c *JWKSCache) getKeysLive(ctx context.Context) (*jose.JSONWebKeySet, error) {
 	c.mu.RLock()
 	if c.freshAt(c.now()) {
@@ -263,16 +233,14 @@ func (c *JWKSCache) getKeysLive(ctx context.Context) (*jose.JSONWebKeySet, error
 	return keys, err
 }
 
-// copyKeySet returns a set whose Keys SLICE is independent of the cached one, so a
-// caller appending to, reordering, or truncating the returned set cannot mutate the
-// shared cache other verifications are concurrently reading. Handing out the live
-// pointer made the cache's aliasing defense -- which FindKeys documents and applies --
-// bypassable by anyone who called GetKeys/Refresh directly.
+// copyKeySet returns a set whose Keys SLICE is independent of the cached one, so a caller
+// appending to, reordering, or truncating the result cannot mutate the shared cache other
+// verifications are concurrently reading. Handing out the live pointer made that aliasing
+// defense bypassable by anyone calling GetKeys/Refresh directly.
 //
-// The copy is one level deep. Each jose.JSONWebKey still carries a Key interface{}
-// pointing at the same underlying *rsa.PublicKey / *ecdsa.PublicKey, so mutating a KEY'S
-// INTERNALS still reaches the cache; that is inherent to the type and is the same bound
-// FindKeys has. The realistic accident -- slice mutation -- is what this closes.
+// The copy is one level deep: mutating a KEY'S INTERNALS still reaches the cache (inherent
+// to the type, same bound FindKeys has) — the realistic accident this closes is slice
+// mutation.
 func copyKeySet(set *jose.JSONWebKeySet) *jose.JSONWebKeySet {
 	if set == nil {
 		return nil
@@ -280,46 +248,33 @@ func copyKeySet(set *jose.JSONWebKeySet) *jose.JSONWebKeySet {
 	return &jose.JSONWebKeySet{Keys: append([]jose.JSONWebKey(nil), set.Keys...)}
 }
 
-// Refresh returns a fresh JWKS, respecting the cache TTL: if the cached copy is
-// still within TTL it is returned without an HTTP fetch.
-//
-// The returned set's Keys slice is independent of the cache's (see copyKeySet), so a
-// caller may hold, append to, or reorder it without disturbing concurrent verifications.
-// Handing out the live pointer made the aliasing defense FindKeys documents bypassable by
-// anyone calling this directly. Individual jose.JSONWebKey values still share their
-// underlying crypto key, so treat the KEYS themselves as read-only.
+// Refresh returns a fresh JWKS, respecting the cache TTL: if the cached copy is still
+// within TTL it is returned without an HTTP fetch. The returned set's Keys slice is
+// independent of the cache's (see copyKeySet); individual jose.JSONWebKey values still
+// share their underlying crypto key, so treat the KEYS themselves as read-only.
 func (c *JWKSCache) Refresh(ctx context.Context) (*jose.JSONWebKeySet, error) {
 	keys, _, err := c.refresh(ctx, false)
 	return copyKeySet(keys), err
 }
 
-// ForceRefreshForKID performs a rate-limited forced fetch (refresh(ctx, true)), but
-// suppresses it for a kid that cannot be resolved right now, returning the cached set
-// instead, so a stream of distinct unknown-kid tokens cannot drive one round-trip per
-// token. The caller still fails closed when suppressed (the kid is absent from the
-// returned set).
+// ForceRefreshForKID performs a rate-limited forced fetch, but suppresses it for a kid
+// that cannot be resolved right now, returning the cached set instead — so a stream of
+// distinct unknown-kid tokens cannot drive one round-trip per token. The caller still
+// fails closed when suppressed (the kid is absent from the returned set).
 //
 // Two suppression signals gate the fetch, both bounded by negativeKIDTTL:
 //   - per-kid: a kid a recent forced refetch failed to resolve is not refetched;
-//   - shared budget (sharedRefreshSentinel): once a forced fetch returns an
-//     unchanged set it is charged, and while charged DISTINCT unknown kids are
-//     suppressed too — the bound the per-kid cache alone cannot give, since an
-//     unchanged 200 never trips the breaker.
+//   - shared budget (sharedRefreshSentinel): once a forced fetch returns an unchanged set
+//     it is charged, and while charged DISTINCT unknown kids are suppressed too — the
+//     bound the per-kid cache alone can't give, since an unchanged 200 never trips the
+//     breaker.
 //
-// Tradeoff: while the budget is charged, a kid the issuer rotates IN is not
-// observed for up to negativeKIDTTL (attacker-triggerable). It is bounded and
-// self-healing and far below CacheTTL: when the budget expires the next lookup
-// fetches, sees the CHANGED set, resolves the kid, and does not re-charge, so a run
-// of rotations is not blocked.
+// Tradeoff: while the budget is charged, a kid the issuer rotates IN is not observed for up
+// to negativeKIDTTL. Bounded and self-healing: when the budget expires the next lookup
+// fetches, sees the CHANGED set, resolves the kid, and does not re-charge.
 //
-// An empty kid is never suppressed, and a found kid never CHARGES either signal.
-// When the cache holds no set at all the fetch is not suppressed, so a cold start
-// never denies purely for lack of a cached copy.
-//
-// The returned set's Keys slice is independent of the cache's (see copyKeySet), like
-// Refresh's and GetKeys'. copyKeySet wraps forceRefreshForKIDLive, the uncopied core,
-// on both the suppressed and fetched arm — see that method's doc for why the copy is
-// skipped there.
+// An empty kid is never suppressed, a found kid never charges either signal, and a cold
+// cache (no set at all) is never suppressed.
 func (c *JWKSCache) ForceRefreshForKID(ctx context.Context, kid string) (*jose.JSONWebKeySet, error) {
 	keys, err := c.forceRefreshForKIDLive(ctx, kid)
 	if err != nil {
@@ -328,20 +283,16 @@ func (c *JWKSCache) ForceRefreshForKID(ctx context.Context, kid string) (*jose.J
 	return copyKeySet(keys), nil
 }
 
-// forceRefreshForKIDLive is ForceRefreshForKID's uncopied core: like getKeysLive, it
-// returns the cache's live *jose.JSONWebKeySet on both the suppressed arm (the cached
-// pointer) and the fetched arm (refresh's own reference), never a copy. Unexported and
-// reached only from VerifyWithKeyRotation, which immediately narrows whatever this
-// returns through FindKeys — always a fresh, independent slice — so ForceRefreshForKID's
-// copy would be pure allocation on a pre-auth path a flood of distinct unknown-kid
-// tokens can drive at will (up to ~14.4 KB per token at maxJWKSKeys keys, on the
-// suppressed arm that exists specifically to cost nothing beyond a map probe).
+// forceRefreshForKIDLive is ForceRefreshForKID's uncopied core: like getKeysLive, it returns
+// the cache's live *jose.JSONWebKeySet on both arms, never a copy. Reached only from
+// VerifyWithKeyRotation, which narrows the result through FindKeys — always a fresh,
+// independent slice — so ForceRefreshForKID's copy would be pure allocation on a pre-auth
+// path a flood of unknown-kid tokens can drive at will.
 func (c *JWKSCache) forceRefreshForKIDLive(ctx context.Context, kid string) (*jose.JSONWebKeySet, error) {
 	if kid == "" {
-		// A kid-less lookup is not an unknown-kid lookup. The suppression block below
-		// is gated on kid != "", so routing it here would skip the rate-limit and let
-		// a flood of kid-less tokens hammer the endpoint. Delegate to the rate-limited
-		// kid-less path.
+		// A kid-less lookup is not an unknown-kid lookup. The suppression block below is
+		// gated on kid != "", so routing it here would skip the rate-limit and let a flood
+		// of kid-less tokens hammer the endpoint. Delegate to the rate-limited kid-less path.
 		return c.forceRefreshForVerifyLive(ctx)
 	}
 	if c.kidRecentlyAbsent(kid) || c.kidRecentlyAbsent(sharedRefreshSentinel) {
@@ -352,18 +303,16 @@ func (c *JWKSCache) forceRefreshForKIDLive(ctx context.Context, kid string) (*jo
 			return cached, nil
 		}
 	}
-	// changed reports whether THIS fetch altered the key set, computed atomically
-	// inside the singleflight closure so the shared-budget decision never races a
-	// concurrent rotation.
+	// changed reports whether THIS fetch altered the key set, computed atomically inside the
+	// singleflight closure so the shared-budget decision never races a concurrent rotation.
 	keys, changed, err := c.refresh(ctx, true)
 	if err != nil {
 		return nil, err
 	}
 	if len(FindKeys(keys, kid)) == 0 {
 		// Still absent after a real fetch. Record it per-kid, and — when the set was
-		// UNCHANGED — also charge the shared budget so the next distinct unknown kid
-		// is suppressed. A CHANGED set leaves the budget open so distinct unknown kids
-		// keep fetching while rotations are actively landing.
+		// UNCHANGED — also charge the shared budget so the next distinct unknown kid is
+		// suppressed. A CHANGED set leaves the budget open so rotations keep landing.
 		c.markKIDAbsent(kid)
 		if !changed {
 			c.markKIDAbsent(sharedRefreshSentinel)
@@ -372,29 +321,19 @@ func (c *JWKSCache) forceRefreshForKIDLive(ctx context.Context, kid string) (*jo
 	return keys, nil
 }
 
-// sharedRefreshSentinel is the negKIDs key for a SHARED forced-refresh budget
-// across both kid-rotation paths (ForceRefreshForVerify and ForceRefreshForKID).
-// It is marked whenever a forced fetch returns an unchanged set ("the endpoint has
-// exactly our keys, so another fetch cannot resolve any absent kid"), and while
-// marked both paths serve the cached set. This is what bounds a flood of DISTINCT
-// unknown kids, which the per-kid cache (same-kid only) cannot. A real JWT kid is
-// never empty, so this cannot collide with a genuine kid.
+// sharedRefreshSentinel is the negKIDs key for a SHARED forced-refresh budget across both
+// kid-rotation paths. It is marked whenever a forced fetch returns an unchanged set ("the
+// endpoint has exactly our keys, so another fetch cannot resolve any absent kid"), and while
+// marked both paths serve the cached set — bounding a flood of DISTINCT unknown kids, which
+// the per-kid cache (same-kid only) cannot. A real JWT kid is never empty, so no collision.
 const sharedRefreshSentinel = ""
 
-// ForceRefreshForVerify forces a single JWKS refresh for the kid-LESS rotation
-// case: a token with no kid matches every cached key, so ForceRefreshForKID never
-// runs for it, and after a key rotation it would be rejected until the TTL
-// elapsed. This pulls the rotated key in immediately.
-//
-// Like ForceRefreshForKID it is rate-limited to at most one forced fetch per
-// negativeKIDTTL, tracked under sharedRefreshSentinel (which ForceRefreshForKID
-// charges too, so the two paths share one budget). The caller fails closed when
+// ForceRefreshForVerify forces a single JWKS refresh for the kid-LESS rotation case: a token
+// with no kid matches every cached key, so ForceRefreshForKID never runs for it, and after a
+// rotation it would be rejected until the TTL elapsed. This pulls the rotated key in
+// immediately, rate-limited to at most one forced fetch per negativeKIDTTL (sharing the
+// sharedRefreshSentinel budget with ForceRefreshForKID). The caller fails closed when
 // suppressed.
-//
-// The returned set's Keys slice is independent of the cache's (see copyKeySet), on
-// both the suppressed and the fetched path. copyKeySet wraps forceRefreshForVerifyLive,
-// the uncopied core — see that method's doc, and forceRefreshForKIDLive's, for why the
-// copy is skipped there.
 func (c *JWKSCache) ForceRefreshForVerify(ctx context.Context) (*jose.JSONWebKeySet, error) {
 	keys, err := c.forceRefreshForVerifyLive(ctx)
 	if err != nil {
@@ -403,11 +342,10 @@ func (c *JWKSCache) ForceRefreshForVerify(ctx context.Context) (*jose.JSONWebKey
 	return copyKeySet(keys), nil
 }
 
-// forceRefreshForVerifyLive is ForceRefreshForVerify's uncopied core, unexported and
-// reached only from VerifyWithKeyRotation for the same reason as
-// forceRefreshForKIDLive: the caller immediately narrows the result through FindKeys,
-// which always allocates its own fresh slice, so copying here first is wasted work on
-// a pre-auth path a flood of bad-signature kid-less tokens can drive.
+// forceRefreshForVerifyLive is ForceRefreshForVerify's uncopied core, for the same reason as
+// forceRefreshForKIDLive: the caller immediately narrows the result through FindKeys, so
+// copying here first is wasted work on a pre-auth path a flood of bad-signature kid-less
+// tokens can drive.
 func (c *JWKSCache) forceRefreshForVerifyLive(ctx context.Context) (*jose.JSONWebKeySet, error) {
 	if c.kidRecentlyAbsent(sharedRefreshSentinel) {
 		c.mu.RLock()
@@ -417,18 +355,16 @@ func (c *JWKSCache) forceRefreshForVerifyLive(ctx context.Context) (*jose.JSONWe
 			return cached, nil
 		}
 	}
-	// refresh reports whether this fetch changed the set atomically inside the
-	// singleflight closure, so we do not snapshot the cache here (a pre-fetch
-	// snapshot could observe another goroutine's rotation).
+	// refresh reports whether this fetch changed the set atomically inside the singleflight
+	// closure, so we do not snapshot the cache here (a pre-fetch snapshot could observe
+	// another goroutine's rotation).
 	keys, changed, err := c.refresh(ctx, true)
 	if err != nil {
 		return nil, err
 	}
-	// Charge the sentinel ONLY when the set was unchanged: an immediate retry would
-	// be pointless and this rate-limits a flood of bad-signature kid-less tokens.
-	// When the set CHANGED, leave the fast path open so a second rotation within the
-	// window is not blocked. Identity is by RFC 7638 thumbprint (order-independent),
-	// so a same-length hard rotation is correctly seen as a change.
+	// Charge the sentinel ONLY when the set was unchanged: an immediate retry would be
+	// pointless, and this rate-limits a flood of bad-signature kid-less tokens while leaving
+	// the fast path open when the set CHANGED, so a second rotation isn't blocked.
 	if !changed {
 		c.markKIDAbsent(sharedRefreshSentinel)
 	}
@@ -436,11 +372,10 @@ func (c *JWKSCache) forceRefreshForVerifyLive(ctx context.Context) (*jose.JSONWe
 }
 
 // jwksKeysUnchanged reports whether two key sets hold the same keys by RFC 7638
-// thumbprint, independent of order. A nil set differs from any non-nil set (so the
-// first fetch into a cold cache counts as a change and is not suppressed). On any
-// thumbprint error it returns false (treat as changed): the only cost is an extra
-// forced refresh, never a wrongly suppressed one — the fail-safe direction for a
-// rotation-detection guard.
+// thumbprint, independent of order. A nil set differs from any non-nil set (so the first
+// fetch into a cold cache counts as a change). On any thumbprint error it returns false
+// (treat as changed) — the fail-safe direction: the cost is an extra refresh, never a
+// wrongly suppressed one.
 func jwksKeysUnchanged(before, after *jose.JSONWebKeySet) bool {
 	if before == nil || after == nil {
 		return before == nil && after == nil
@@ -449,11 +384,9 @@ func jwksKeysUnchanged(before, after *jose.JSONWebKeySet) bool {
 }
 
 // sameKeyMultiset reports whether two key slices hold the same keys by RFC 7638
-// thumbprint, order-independent (a multiset compare). Shared by jwksKeysUnchanged
-// (rotation-detection guard) and VerifyWithKeyRotation's retry-skip guard so the
-// security-relevant thumbprint comparison lives once. On any thumbprint error it returns
-// false (treat as different) — the fail-safe direction for both callers: the only cost is
-// an extra forced refresh or an extra retry, never a wrongly suppressed one.
+// thumbprint, order-independent. Shared by jwksKeysUnchanged and VerifyWithKeyRotation's
+// retry-skip guard so the security-relevant comparison lives once. On any thumbprint error
+// it returns false (treat as different) — the fail-safe direction for both callers.
 func sameKeyMultiset(before, after []jose.JSONWebKey) bool {
 	if len(before) != len(after) {
 		return false
@@ -479,13 +412,12 @@ func sameKeyMultiset(before, after []jose.JSONWebKey) bool {
 	return true
 }
 
-// kidRecentlyAbsent reports whether kid was marked absent within negativeKIDTTL,
-// pruning an expired entry on read. The hot path (present and unexpired) is a pure
-// read under the read lock, so concurrent validations consult the sentinel in
-// parallel rather than serializing — that serialization was itself a DoS-
-// amplification vector under the very kid-flood the sentinel absorbs. The write
-// lock is taken only on the expiry branch, re-checking after acquiring it (RWMutex
-// has no atomic upgrade) so a concurrent refresh is not clobbered.
+// kidRecentlyAbsent reports whether kid was marked absent within negativeKIDTTL, pruning an
+// expired entry on read. The hot path (present and unexpired) is a pure read under the read
+// lock, so concurrent validations consult the sentinel in parallel rather than serializing —
+// serializing would itself be a DoS-amplification vector under the kid-flood the sentinel
+// absorbs. The write lock is taken only on the expiry branch, re-checking after acquiring it
+// (RWMutex has no atomic upgrade) so a concurrent refresh is not clobbered.
 func (c *JWKSCache) kidRecentlyAbsent(kid string) bool {
 	c.negMu.RLock()
 	at, ok := c.negKIDs[kid]
@@ -495,14 +427,13 @@ func (c *JWKSCache) kidRecentlyAbsent(kid string) bool {
 	}
 	if c.now().Sub(at) < negativeKIDTTL {
 		c.negMu.RUnlock()
-		return true // hot path: pure read under the shared lock
+		return true
 	}
 	c.negMu.RUnlock()
 
-	// Expired under the read lock: take the write lock and re-check, since a
-	// concurrent markKIDAbsent may have re-inserted the kid with a fresh timestamp
-	// between RUnlock and Lock. If so it IS recently absent and we report true;
-	// otherwise prune and report not-absent.
+	// Expired under the read lock: take the write lock and re-check, since a concurrent
+	// markKIDAbsent may have re-inserted the kid with a fresh timestamp between RUnlock
+	// and Lock.
 	c.negMu.Lock()
 	defer c.negMu.Unlock()
 	at2, ok2 := c.negKIDs[kid]
@@ -510,18 +441,16 @@ func (c *JWKSCache) kidRecentlyAbsent(kid string) bool {
 		return false
 	}
 	if c.now().Sub(at2) < negativeKIDTTL {
-		// Re-inserted fresh between the unlock and the write lock: still absent.
 		return true
 	}
 	delete(c.negKIDs, kid)
 	return false
 }
 
-// markKIDAbsent records that a forced refetch did not resolve kid. It first
-// sweeps expired entries so a long-running process does not accumulate kids, and
-// honours negativeKIDMaxLen so a flood of distinct kids cannot grow the map
-// without bound. The shared refresh sentinel is exempt from the cap so it can
-// always be recorded (see the cap check below).
+// markKIDAbsent records that a forced refetch did not resolve kid. It first sweeps expired
+// entries so a long-running process does not accumulate kids, and honours negativeKIDMaxLen
+// so a flood of distinct kids cannot grow the map without bound. The shared refresh
+// sentinel is exempt from the cap (see the cap check below).
 func (c *JWKSCache) markKIDAbsent(kid string) {
 	c.negMu.Lock()
 	defer c.negMu.Unlock()
@@ -531,54 +460,48 @@ func (c *JWKSCache) markKIDAbsent(kid string) {
 			delete(c.negKIDs, k)
 		}
 	}
-	// Anchor the suppress window to the FIRST absent observation: overwriting on
-	// every presentation would slide the window forward indefinitely, letting a
-	// client that keeps presenting a stale kid pin it even after a JWKS update adds
-	// it back. An already-tracked kid keeps its original timestamp; only a new kid
-	// is inserted, and only with room under negativeKIDMaxLen.
+	// Anchor the suppress window to the FIRST absent observation: overwriting on every
+	// presentation would slide the window forward indefinitely, letting a client that keeps
+	// presenting a stale kid pin it even after a JWKS update adds it back.
 	if _, ok := c.negKIDs[kid]; ok {
 		return
 	}
-	// The shared sentinel must always be insertable: dropping it because a flood of
-	// distinct kids filled the map would disable the forced-refresh rate-limit it
-	// provides, letting an attacker drive unbounded JWKS fetches. It costs at most
-	// one extra slot; real kids still honour the cap.
+	// The shared sentinel must always be insertable: dropping it because a flood of distinct
+	// kids filled the map would disable the forced-refresh rate-limit it provides. Costs at
+	// most one extra slot; real kids still honour the cap.
 	if kid != sharedRefreshSentinel && len(c.negKIDs) >= negativeKIDMaxLen {
 		return
 	}
 	c.negKIDs[kid] = now
 }
 
-// refresh fetches a fresh JWKS and stores it. When force is false it first
-// double-checks the TTL under the read lock; when true it always fetches. The
-// store and log line run inside the singleflight closure, so they happen once per
-// round-trip even when N callers are unblocked together.
+// refresh fetches a fresh JWKS and stores it. When force is false it first double-checks the
+// TTL under the read lock; when true it always fetches. The store and log line run inside
+// the singleflight closure, so they happen once per round-trip even when N callers are
+// unblocked together.
 func (c *JWKSCache) refresh(ctx context.Context, force bool) (*jose.JSONWebKeySet, bool, error) {
 	if !force {
 		c.mu.RLock()
 		if c.freshAt(c.now()) {
 			keys := c.jwks
 			c.mu.RUnlock()
-			// No fetch happened (still within TTL), so the key set did not change.
 			return keys, false, nil
 		}
 		c.mu.RUnlock()
 	}
 
 	// Key the singleflight group by force so a forced caller never coalesces with a
-	// non-forced leader and inherits its TTL fast-path — which would hand the forced
-	// caller stale keys during a rotation and make ForceRefreshForKID mark the kid
-	// absent for the window. Separate keys give forced callers an always-fetching
-	// slot while still collapsing concurrent same-kind refreshes into one round-trip.
+	// non-forced leader and inherits its TTL fast-path — which would hand it stale keys
+	// during a rotation. Separate keys give forced callers an always-fetching slot while
+	// still collapsing concurrent same-kind refreshes into one round-trip.
 	sfKey := "background"
 	if force {
 		sfKey = "forced"
 	}
 	v, err, _ := c.sfGroup.Do(sfKey, func() (interface{}, error) {
-		// Double-checked staleness: the TTL check above runs OUTSIDE the
-		// singleflight, so a non-forced refresh whose cache became fresh while it
-		// waited would otherwise issue a redundant fetch. Re-check under the lock and
-		// return the fresh set with no round-trip. Forced refreshes always fetch.
+		// Double-checked staleness: the TTL check above runs OUTSIDE the singleflight, so a
+		// non-forced refresh whose cache became fresh while it waited would otherwise issue
+		// a redundant fetch. Forced refreshes always fetch.
 		if !force {
 			c.mu.RLock()
 			if c.freshAt(c.now()) {
@@ -588,15 +511,13 @@ func (c *JWKSCache) refresh(ctx context.Context, force bool) (*jose.JSONWebKeySe
 			}
 			c.mu.RUnlock()
 		}
-		// Decouple the shared fetch from the first caller's context: every waiter
-		// shares this fetch, so binding it to one caller's context would let that
-		// caller's deadline fail every waiter and charge a spurious breaker failure.
-		// WithoutCancel keeps context values while stripping cancellation/deadline;
-		// the HTTP client's timeout still bounds it.
+		// Decouple the shared fetch from the first caller's context: every waiter shares
+		// this fetch, so binding it to one caller's context would let that caller's
+		// deadline fail every waiter and charge a spurious breaker failure. WithoutCancel
+		// keeps context values while stripping cancellation/deadline.
 		fetchCtx := context.WithoutCancel(ctx)
-		// A custom client may have Timeout <= 0, so impose an internal ceiling in that
-		// case; otherwise a hung transport would block this singleflight call — and
-		// every verification joining it — forever.
+		// A custom client may have Timeout <= 0, so impose an internal ceiling; otherwise a
+		// hung transport would block this call — and every verification joining it — forever.
 		if c.client.Timeout <= 0 {
 			var cancel context.CancelFunc
 			fetchCtx, cancel = context.WithTimeout(fetchCtx, c.maxFetch)
@@ -606,9 +527,9 @@ func (c *JWKSCache) refresh(ctx context.Context, force bool) (*jose.JSONWebKeySe
 			return c.fetchKeys(fc)
 		}
 
-		// Take a fetch generation as this fetch begins; the install below commits only
-		// if it is still the newest, so a slower earlier-started fetch cannot clobber
-		// a newer one's result.
+		// Take a fetch generation as this fetch begins; the install below commits only if
+		// it is still the newest, so a slower earlier-started fetch cannot clobber a
+		// newer one's result.
 		c.mu.Lock()
 		c.fetchTicket++
 		myGen := c.fetchTicket
@@ -622,10 +543,9 @@ func (c *JWKSCache) refresh(ctx context.Context, force bool) (*jose.JSONWebKeySe
 			jwks, ferr = circuitbreaker.Do(fetchCtx, c.breaker, fetch)
 			if ferr != nil {
 				if errors.Is(ferr, circuitbreaker.ErrOpen) {
-					// Breaker-open is a JWKS-availability failure by a different mechanism than
-					// a fetchKeys error (which the defer already tags): the endpoint is being
-					// shielded because recent fetches failed. Tag it too so the audit layer
-					// classifies it as an outage, not a forged token.
+					// Breaker-open is a JWKS-availability failure too (the endpoint is being
+					// shielded because recent fetches failed) — tag it like a fetchKeys error
+					// so the audit layer classifies it as an outage, not a forged token.
 					return nil, fmt.Errorf("%w: JWKS fetch blocked by circuit breaker: %w", ErrJWKSUnavailable, ferr)
 				}
 				return nil, ferr
@@ -637,30 +557,25 @@ func (c *JWKSCache) refresh(ctx context.Context, force bool) (*jose.JSONWebKeySe
 			}
 		}
 
-		// Snapshot the replaced set and compute "changed" here, under the same lock
-		// that installs the new set and inside the closure owning the shared fetch, so
-		// every joiner shares a determination reflecting THIS fetch's old->new
-		// transition rather than a caller's stale pre-call snapshot.
+		// Snapshot the replaced set and compute "changed" here, under the same lock that
+		// installs the new set, so every joiner shares a determination reflecting THIS
+		// fetch's old->new transition rather than a caller's stale pre-call snapshot.
 		c.mu.Lock()
 		before := c.jwks
 		installed := false
-		// resultKeys is what this closure reports to joiners: normally this fetch's
-		// keys, but the installed set when the install is skipped (a newer-generation
-		// refresh already committed). Reporting our discarded fetch would hand callers
-		// a set GetKeys never serves and let a forced caller re-charge the sentinel
-		// against it, cascading redundant fetches.
+		// resultKeys is what this closure reports to joiners: normally this fetch's keys,
+		// but the installed set when the install is skipped (a newer-generation refresh
+		// already committed) — reporting our discarded fetch would hand callers a set
+		// GetKeys never serves and let a forced caller re-charge the sentinel against it.
 		resultKeys := jwks
 		if myGen > c.installedFetchGen {
-			// At least as fresh as the installed set: commit it. An older-started fetch
-			// with a now-stale generation is dropped so completion order cannot undo
-			// start order.
+			// At least as fresh as the installed set: commit it. An older-started fetch with
+			// a now-stale generation is dropped so completion order cannot undo start order.
 			c.jwks = jwks
 			c.fetchedAt = c.now()
 			c.installedFetchGen = myGen
 			installed = true
 		} else if c.jwks != nil {
-			// Install skipped: report the currently-installed set so the keys returned
-			// match what GetKeys serves and "changed" is computed against it.
 			resultKeys = c.jwks
 		}
 		c.mu.Unlock()
@@ -669,10 +584,9 @@ func (c *JWKSCache) refresh(ctx context.Context, force bool) (*jose.JSONWebKeySe
 		} else {
 			c.logger.Info("discarded stale JWKS fetch superseded by a newer refresh", slog.Int("keys", len(jwks.Keys)))
 		}
-		// "changed" compares resultKeys (what this closure reports) against `before`
-		// (the set read at the top of this locked section). On the install path this
-		// is old-vs-new as intended; on the superseded path resultKeys IS `before`, so
-		// changed is false — correct, since this closure committed nothing.
+		// On the install path this compares old-vs-new as intended; on the superseded path
+		// resultKeys IS `before`, so changed is correctly false (this closure committed
+		// nothing).
 		return refreshResult{keys: resultKeys, changed: !jwksKeysUnchanged(before, resultKeys)}, nil
 	})
 	if err != nil {
@@ -682,10 +596,9 @@ func (c *JWKSCache) refresh(ctx context.Context, force bool) (*jose.JSONWebKeySe
 	return res.keys, res.changed, nil
 }
 
-// refreshResult is the singleflight closure's return value: the fetched key set
-// and whether that fetch changed it relative to the set it replaced. Bundling both
-// lets every joiner of the shared fetch observe the same, atomically-computed
-// change determination.
+// refreshResult is the singleflight closure's return value: the fetched key set and whether
+// that fetch changed it relative to the set it replaced. Bundling both lets every joiner
+// observe the same, atomically-computed change determination.
 type refreshResult struct {
 	keys    *jose.JSONWebKeySet
 	changed bool
@@ -693,22 +606,18 @@ type refreshResult struct {
 
 // refuseCrossOriginResponse fails closed unless resp was served by the host the cache was
 // configured to fetch from. net/http sets resp.Request to the LAST request in a redirect
-// chain, so this sees the final hop no matter how many redirects were followed or which
-// client followed them — which is the point: it is the one same-origin check that does not
-// depend on the caller's CheckRedirect being intact.
+// chain, so this sees the final hop regardless of how many redirects were followed — the
+// one same-origin check that does not depend on the caller's CheckRedirect being intact.
 //
-// The rule mirrors the CLI's redirect policy so the two layers cannot disagree: the
-// hostname must match, port and path may change (an IdP may relocate the key set within its
-// own host), and a hop between two loopback spellings (localhost <-> 127.0.0.1) is allowed
-// because it never leaves the machine and so has no on-path attacker surface.
+// Mirrors the CLI's redirect policy: hostname must match, port and path may change (an IdP
+// may relocate the key set within its own host), and a hop between loopback spellings
+// (localhost <-> 127.0.0.1) is allowed since it never leaves the machine.
 func (c *JWKSCache) refuseCrossOriginResponse(resp *http.Response) error {
 	if resp.Request == nil || resp.Request.URL == nil {
-		// Fail closed rather than exempt: resp.Request is documented as "only populated
-		// for Client requests" (net/http), so a caller-supplied *http.Client whose
-		// RoundTripper builds its own *http.Response — the same caller-supplied-client
-		// scenario this whole function exists to cover — can leave it nil. Admitting the
-		// response here would make exactly that RoundTripper the one way to bypass the
-		// floor this function is the last line of defense for.
+		// Fail closed rather than exempt: resp.Request is documented as "only populated for
+		// Client requests" (net/http), so a caller-supplied *http.Client whose RoundTripper
+		// builds its own *http.Response can leave it nil — admitting the response here would
+		// make exactly that RoundTripper the one way to bypass this floor.
 		return fmt.Errorf("JWKS response carries no final-request URL to verify against the configured JWKS host %q; refusing (the HTTP client's RoundTripper did not populate resp.Request)", c.jwksURI)
 	}
 	want, err := url.Parse(c.jwksURI)
@@ -726,11 +635,9 @@ func (c *JWKSCache) refuseCrossOriginResponse(resp *http.Response) error {
 }
 
 func (c *JWKSCache) fetchKeys(ctx context.Context) (_ *jose.JSONWebKeySet, err error) {
-	// Every non-nil return below is a failure to obtain a usable key set; tag them all
-	// with ErrJWKSUnavailable in one place so the audit layer can tell a JWKS-infra
-	// outage apart from a forged token (the token was never checked against a key). The
-	// %w keeps errors.Is transparent to the underlying cause and leaves the descriptive
-	// message (checked by existing substring tests) intact.
+	// Every non-nil return below is a failure to obtain a usable key set; tag them all with
+	// ErrJWKSUnavailable in one place so the audit layer can tell a JWKS-infra outage apart
+	// from a forged token. %w keeps errors.Is transparent while leaving the message intact.
 	defer func() {
 		if err != nil {
 			err = fmt.Errorf("%w: %w", ErrJWKSUnavailable, err)
@@ -748,24 +655,19 @@ func (c *JWKSCache) fetchKeys(ctx context.Context) (_ *jose.JSONWebKeySet, err e
 	defer func() { _ = resp.Body.Close() }()
 
 	// Enforce the same-origin floor HERE, on the response, rather than relying on the
-	// client's CheckRedirect. The redirect refusal installed in NewJWKSCache applies only
-	// to the DEFAULT client, so any consumer supplying its own *http.Client — a natural
-	// thing to do for a proxy, a custom transport, or a different timeout — silently got
-	// Go's default redirect-following back, and an IdP open redirect could then substitute
-	// the key set and forge every token the proxy accepts. net/http rewrites
-	// resp.Request.URL to the FINAL hop, so comparing it to the configured URI catches any
-	// number of redirects regardless of which client was used, and needs no cooperation
-	// from the caller.
+	// client's CheckRedirect: the redirect refusal in NewJWKSCache applies only to the
+	// DEFAULT client, so a consumer supplying its own gets Go's default redirect-following
+	// back, and an IdP open redirect could then substitute the key set and forge every
+	// token the proxy accepts.
 	if err := c.refuseCrossOriginResponse(resp); err != nil {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 		return nil, err
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		// Drain the body before returning so net/http can reuse the keep-alive
-		// connection instead of tearing down the TCP+TLS handshake on the next
-		// probe. Bound the drain to the same 1 MiB ceiling as the success
-		// path so a hostile endpoint cannot stream unbounded bytes here.
+		// Drain the body before returning so net/http can reuse the keep-alive connection
+		// instead of tearing down the handshake on the next probe. Bound to the same 1 MiB
+		// ceiling as the success path so a hostile endpoint cannot stream unbounded bytes.
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 		return nil, fmt.Errorf("JWKS endpoint returned %d", resp.StatusCode)
 	}
@@ -779,33 +681,29 @@ func (c *JWKSCache) fetchKeys(ctx context.Context) (_ *jose.JSONWebKeySet, err e
 	if err := json.Unmarshal(body, &jwks); err != nil {
 		return nil, fmt.Errorf("parse JWKS: %w", err)
 	}
-	// A 200 carrying an empty key set (a rotation window or degraded endpoint)
-	// would otherwise cache as success for the full TTL, rejecting every JWT with no
-	// breaker signal. Treat it as a fetch failure so the breaker records it and the
-	// previously-cached set keeps serving.
+	// A 200 carrying an empty key set (a rotation window or degraded endpoint) would
+	// otherwise cache as success for the full TTL, rejecting every JWT with no breaker
+	// signal. Treat it as a fetch failure so the breaker records it and the previously
+	// cached set keeps serving.
 	if len(jwks.Keys) == 0 {
 		return nil, fmt.Errorf("JWKS endpoint returned an empty key set")
 	}
-	// Bound the key count so a kid-less token cannot be made to trial an
-	// unbounded number of keys (see maxJWKSKeys). Fail closed on an oversized
-	// set: the breaker records it and the previously-cached set keeps serving.
+	// Bound the key count so a kid-less token cannot be made to trial an unbounded number
+	// of keys (see maxJWKSKeys). Fail closed on an oversized set.
 	if len(jwks.Keys) > maxJWKSKeys {
 		return nil, fmt.Errorf("JWKS endpoint returned %d keys, exceeding the limit of %d", len(jwks.Keys), maxJWKSKeys)
 	}
 	return &jwks, nil
 }
 
-// FindKeys returns the keys matching kid from the JWKS, all keys when kid is empty.
-// A nil JWKS yields no keys rather than panicking.
+// FindKeys returns the keys matching kid from the JWKS, all keys when kid is empty. A nil
+// JWKS yields no keys rather than panicking.
 //
-// The returned SLICE is always fresh — never an alias into the cached set's backing
-// array — so a caller cannot reorder or overwrite entries in the shared
-// root-of-trust set seen by every concurrent verification. Its elements are SHALLOW
-// copies of the jose.JSONWebKey structs, so the key material each one reaches
-// through its Key field (a *rsa.PublicKey / *ecdsa.PublicKey) is still shared:
-// callers must treat an entry's Key as read-only, since mutating THROUGH it would
-// corrupt the cached set for every other verification. No caller mutates today;
-// verification only reads.
+// The returned SLICE is always fresh — never an alias into the cached set's backing array —
+// so a caller cannot reorder or overwrite entries in the shared root-of-trust set. Its
+// elements are SHALLOW copies, so the key material each reaches through its Key field is
+// still shared: callers must treat it as read-only, since mutating THROUGH it would corrupt
+// the cached set for every other verification.
 func FindKeys(jwks *jose.JSONWebKeySet, kid string) []jose.JSONWebKey {
 	if jwks == nil {
 		return nil

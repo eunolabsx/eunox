@@ -1,13 +1,10 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// Package config holds the binary's configuration and manifest loading layer:
-// the LocalManifest type with its load/validate/merge path (LoadManifest,
-// MergeManifests), the GatewayConfig parser (LoadGatewayConfig), and the
-// schema-version negotiation both documents share. It depends only on pkg/*,
-// gopkg.in/yaml.v3 (config + manifest parsing), and the stdlib — never back on
-// cmd/eunox — so the CLI subcommands and (soon) the transport layer can
-// import the config types from a non-main home.
+// Package config holds the binary's configuration and manifest loading layer: LocalManifest's
+// load/validate/merge path, the GatewayConfig parser, and the schema-version negotiation both
+// documents share. Depends only on pkg/*, gopkg.in/yaml.v3, and the stdlib — never on
+// cmd/eunox — so the CLI subcommands and the transport layer can import from a non-main home.
 package config
 
 import (
@@ -35,48 +32,33 @@ import (
 
 // LocalManifest declares the capabilities an agent requires.
 type LocalManifest struct {
-	// SchemaVersion is the manifest grammar/dialect version (two-part, e.g.
-	// "0.1"), distinct from the policy-content Version below. Required: a
-	// manifest declaring an absent or unsupported schemaVersion is refused at
-	// load (fail-closed). See schema_version.go.
+	// SchemaVersion is the manifest grammar/dialect version (e.g. "0.1"), distinct from
+	// the policy-content Version below. Required; refused at load if absent/unsupported.
 	SchemaVersion string                  `json:"schemaVersion"`
 	Name          string                  `json:"name"`
 	Version       string                  `json:"version"`
 	Description   string                  `json:"description,omitempty"`
 	ServerVersion string                  `json:"serverVersion,omitempty"`
 	Capabilities  []capability.Constraint `json:"capabilities"`
-	// Audience, when set, pins the JWT 'aud' claim required on THIS route in gateway
-	// mode: a token is authorized on the route only if its aud carries this value,
-	// overriding the global --jwt-audience for the route (which stays the fallback for
-	// routes that declare none). See WrapRoutesWithJWT in internal/transport/route.go and
-	// the per-route check in internal/pdp/jwt.go; --jwt-allow-any-audience disables
-	// audience pinning entirely. Single-upstream (non-gateway) mode does not consult this
-	// field — its audience comes from --jwt-audience. On a multi-file merge it is folded
-	// with a conflict check (first non-empty wins; two disagreeing files are rejected),
-	// like serverVersion — never silently dropped. See docs/capability-manifest-guide.md.
+	// Audience, when set, pins the JWT 'aud' claim required on THIS route in gateway mode,
+	// overriding the global --jwt-audience for the route. See WrapRoutesWithJWT and
+	// internal/pdp/jwt.go. On a multi-file merge it is folded with a conflict check
+	// (first non-empty wins; disagreeing files are rejected), like serverVersion.
 	Audience string `json:"audience,omitempty"`
 	// EffectCeiling is the tool-agnostic consequence bound EVERY allowed action is
 	// additionally checked against, keyed on the action's effect properties rather than
-	// on which tool it is (see capability.EffectCeiling). It can only ever narrow — it
-	// runs after a constraint has already allowed the call — so it never admits anything
-	// the allowlist denied. Absent means no consequence bound. Staged behind the
-	// flow+effect draft schemaVersion until the batched grammar bump. On a multi-file
-	// merge it is folded with a conflict check (first non-empty wins; two disagreeing
-	// files are rejected), like serverVersion and audience: silently dropping one file's
-	// ceiling would raise the bound for every capability the other file contributed.
+	// which tool it is. It can only narrow (it runs after a constraint has already
+	// allowed the call). Merged with the same conflict check as Audience/serverVersion.
 	EffectCeiling *capability.EffectCeiling `json:"effectCeiling,omitempty"`
 }
 
-// LoadManifest reads and validates a LocalManifest from a manifest file of any
-// extension (YAML, JSON, or none). Every file is decoded through a yaml.Node first
-// (YAML is a JSON superset) so the fail-closed hardening — duplicate-key rejection,
-// multi-document rejection, timestamp guard, scalar-coercion guard — applies
-// uniformly; an unrecognized/absent extension no longer falls through to a bare
-// json.Unmarshal that would skip those guards. The scalar-coercion guard runs for
-// both formats but rejects a JSON number only when the coercion is numerically
-// lossy (so valid JSON like values: [1.0] is still accepted). The node is then
-// converted to JSON so the existing capability.Constraint JSON unmarshalling (with
-// polymorphic conditions) is reused unchanged.
+// LoadManifest reads and validates a LocalManifest from a manifest file of any extension
+// (YAML, JSON, or none). Every file is decoded through a yaml.Node first (YAML is a JSON
+// superset) so the fail-closed hardening — duplicate-key rejection, multi-document rejection,
+// timestamp guard, scalar-coercion guard — applies uniformly rather than an
+// unrecognized/absent extension falling through to a guard-skipping bare json.Unmarshal. The
+// node is then converted to JSON so capability.Constraint's polymorphic JSON unmarshalling is
+// reused unchanged.
 func LoadManifest(path string) (*LocalManifest, error) {
 	data, err := os.ReadFile(path) //nolint:gosec // G304: path is a user-specified manifest file path (CLI argument)
 	if err != nil {
@@ -87,44 +69,27 @@ func LoadManifest(path string) (*LocalManifest, error) {
 	}
 
 	lp := strings.ToLower(path)
-	// Route EVERY manifest — YAML, JSON, or an unrecognized/absent extension —
-	// through the yaml.Node decode below. YAML is a JSON superset, so a .json file
-	// parses cleanly here, and crucially node.Decode rejects DUPLICATE mapping keys
-	// and multi-document streams. encoding/json silently keeps the last value for a
-	// duplicated key, a fail-closed gap on a security-critical surface (e.g. two
-	// `enforcement:` values), so an extensionless JSON-content file must NOT fall
-	// through to a bare json.Unmarshal that skips these guards. errIfBinaryConfig
-	// already screened binaries; genuine garbage fails the YAML parse loudly.
-	// isJSON selects the numeric-coercion policy: a JSON number is unambiguous, so
-	// the guard rejects only a NUMERICALLY lossy value (a beyond-float64 integer),
-	// whereas YAML rejects any auto-typing (1.0 -> 1). Treat a file as JSON when it is
-	// named .json OR has no recognized YAML extension but its content is valid JSON
-	// (an extensionless or oddly-named JSON manifest). A .yaml/.yml file stays
-	// YAML-strict even when it happens to be valid JSON — the operator chose YAML.
-	// Content detection keeps an extensionless JSON manifest's non-canonical numbers
-	// (e.g. values: [1.0]) accepted, matching the pre-hardening bare json.Unmarshal
-	// path, while still routing every file through the yaml.Node hardening below.
+	// Route EVERY manifest — YAML, JSON, or an unrecognized/absent extension — through the
+	// yaml.Node decode below: node.Decode rejects DUPLICATE mapping keys and multi-document
+	// streams where encoding/json silently keeps the last value, a fail-closed gap on a
+	// security-critical surface. isJSON selects the numeric-coercion policy: JSON rejects only
+	// a numerically lossy coercion, YAML rejects any auto-typing. Content detection (not just
+	// extension) keeps an extensionless JSON manifest's non-canonical numbers accepted.
 	isYAMLExt := strings.HasSuffix(lp, ".yaml") || strings.HasSuffix(lp, ".yml")
 	isJSON := strings.HasSuffix(lp, ".json") || (!isYAMLExt && json.Valid(data))
 	what := "YAML manifest"
 	if isJSON {
 		what = "JSON manifest"
 	}
-	// A .json file must be valid JSON. The yaml.Node decode below gives us
-	// duplicate-key rejection, but yaml.v3 also accepts the YAML SUPERSET (unquoted
-	// keys, single-quoted strings, # comments, a bare non-object document), which would
-	// silently admit a .json file that strict JSON rejects. Re-impose JSON strictness so
-	// the .json extension still means JSON; the yaml.Node decode then layers duplicate-key
-	// rejection on top. Only enforce it for a .json-EXTENSION file: a content-detected
-	// JSON file (json.Valid already true) needs no recheck, and a .yaml file is exempt.
+	// A .json-EXTENSION file must be valid JSON: yaml.v3 also accepts the YAML SUPERSET
+	// (unquoted keys, single-quoted strings, # comments), which would silently admit a .json
+	// file that strict JSON rejects. A content-detected JSON file needs no recheck.
 	if strings.HasSuffix(lp, ".json") && !json.Valid(data) {
 		return nil, fmt.Errorf("parsing JSON manifest %q: content is not valid JSON", path)
 	}
-	// Decode into a yaml.Node (not interface{}) so we can suppress yaml.v3's
-	// timestamp inference before the JSON round-trip: an unquoted date like
-	// 2026-01-01 would otherwise become "2026-01-01T00:00:00Z", so an
-	// allowedValues condition would silently enforce a different string than the
-	// manifest text. See forceTimestampsToStrings.
+	// Decode into a yaml.Node (not interface{}) so we can suppress yaml.v3's timestamp
+	// inference before the JSON round-trip: an unquoted 2026-01-01 would otherwise become
+	// "2026-01-01T00:00:00Z". See forceTimestampsToStrings.
 	var node yaml.Node
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	if err := dec.Decode(&node); err != nil {
@@ -136,22 +101,15 @@ func LoadManifest(path string) (*LocalManifest, error) {
 			return nil, fmt.Errorf("parsing %s %q: %w", what, path, err)
 		}
 	}
-	// Reject a multi-document stream: a second content-bearing "---" document
-	// would be silently ignored, so an appended restrictive manifest would load
-	// yet enforce none of it. A trailing empty/null document is tolerated, matching
-	// the gateway-config loader.
+	// Reject a multi-document stream: a second content-bearing "---" document would be
+	// silently ignored. A trailing empty/null document is tolerated.
 	if err := rejectExtraYAMLDocuments(dec, path, what); err != nil {
 		return nil, err
 	}
 	// Gate on the declared grammar version FIRST, before any guard that INTERPRETS the
-	// content, mirroring LoadGatewayConfig's pre-decode probe. The scalar-coercion guard
-	// below reads condition values under the 0.1 grammar, so a manifest declaring a future
-	// version was reported as (say) a scalar that must be quoted — sending the operator to
-	// fix a spelling in a correctly-spelled file while the real problem is that the whole
-	// document is a dialect this binary does not speak. Read straight off the parsed node,
-	// which is tolerant of everything else in the document; a document with no top-level
-	// schemaVersion scalar simply falls through to the authoritative post-decode check
-	// below, which stays the one that decides.
+	// content: the scalar-coercion guard below reads condition values under the 0.1 grammar,
+	// so a manifest declaring a future version would otherwise be reported as a scalar that
+	// must be quoted rather than an unsupported dialect.
 	if v, ok := schemaVersionFromNode(&node); ok {
 		if err := validateManifestSchemaVersion(v); err != nil {
 			return nil, fmt.Errorf("invalid manifest %q: %w", path, err)
@@ -159,12 +117,9 @@ func LoadManifest(path string) (*LocalManifest, error) {
 	}
 	forceTimestampsToStrings(&node)
 	forceSchemaVersionToString(&node)
-	// Reject a scalar in a condition values:/enum: list that auto-typed away from
-	// its source text (YAML: 010 -> 8 octal, 1.0 -> 1 float; JSON: a beyond-float64
-	// integer yaml.v3 rounds), which would otherwise silently enforce a value the
-	// author did not write. The JSON path rejects only NUMERICALLY lossy coercions
-	// (so valid JSON like values: [1.0] is still accepted); see
-	// rejectCoercedScalarsForFormat.
+	// Reject a scalar in a condition values:/enum: list that auto-typed away from its source
+	// text (YAML: 010 -> 8 octal, 1.0 -> 1 float; JSON: a beyond-float64 integer rounds),
+	// which would otherwise silently enforce a value the author did not write.
 	if err := rejectCoercedScalarsForFormat(&node, isJSON, path); err != nil {
 		return nil, err
 	}
@@ -178,12 +133,9 @@ func LoadManifest(path string) (*LocalManifest, error) {
 		return nil, fmt.Errorf("converting manifest to JSON: %w", err)
 	}
 
-	// Gate on the declared grammar version FIRST, before interpreting any content: refuse
-	// an unknown dialect rather than parse it under the wrong grammar. Read from a lenient
-	// decode of just this field, because both checks below interpret content under the
-	// 0.1 grammar — a manifest declaring a future version would otherwise be reported as
-	// carrying an "unknown key" that is perfectly valid in the dialect it declares,
-	// burying the actionable "unsupported schemaVersion" the operator needs.
+	// Gate on the declared grammar version FIRST, before interpreting any content: without
+	// this, a manifest declaring a future version could be reported as carrying an "unknown
+	// key" that is valid in the dialect it declares, burying the real diagnostic.
 	var version struct {
 		SchemaVersion string `json:"schemaVersion"`
 	}
@@ -193,11 +145,8 @@ func LoadManifest(path string) (*LocalManifest, error) {
 	if err := validateManifestSchemaVersion(version.SchemaVersion); err != nil {
 		return nil, fmt.Errorf("invalid manifest %q: %w", path, err)
 	}
-	// Then the recursive unknown-key check, BEFORE the typed decode. Both reject a typo'd
-	// key, but only this one names the offending path and offers a "did you mean"
-	// suggestion; the condition and directive decoders' own unknown-field checks
-	// (unmarshalCondition, unmarshalDirective) would otherwise surface first with a
-	// blunter message for those two cases.
+	// Then the recursive unknown-key check, BEFORE the typed decode: only this one names
+	// the offending path and offers a "did you mean" suggestion.
 	if err := checkManifestKeys(data); err != nil {
 		return nil, fmt.Errorf("invalid manifest %q: %w", path, err)
 	}
@@ -205,10 +154,8 @@ func LoadManifest(path string) (*LocalManifest, error) {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, fmt.Errorf("parsing manifest %q: %w", path, err)
 	}
-	// Canonicalize to the trimmed form validation accepted: an explicitly quoted
-	// padded scalar (e.g. " 0.1") validates by trimming a copy, but the padding
-	// otherwise survives into MergeManifests' exact-string conflict check and the
-	// Digest(), causing spurious conflicts between " 0.1" and "0.1".
+	// Canonicalize to the trimmed form validation accepted: the padding of an explicitly
+	// quoted " 0.1" would otherwise survive into MergeManifests' exact-string conflict check.
 	m.SchemaVersion = strings.TrimSpace(m.SchemaVersion)
 	if err := validateLocalManifest(&m); err != nil {
 		return nil, fmt.Errorf("invalid manifest %q: %w", path, err)
@@ -216,17 +163,10 @@ func LoadManifest(path string) (*LocalManifest, error) {
 	return &m, nil
 }
 
-// rejectCoercedScalarsForFormat runs the scalar-coercion guard
-// (rejectCoercedValueScalars) for both formats. For YAML it rejects any scalar
-// whose canonical form differs textually from its source (010 -> 8, 1.0 -> 1).
-// For JSON — whose numbers are unambiguous, so a 1.0 -> 1 textual difference is
-// harmless — it rejects only a NUMERICALLY lossy coercion: an integer beyond
-// float64 precision that yaml.v3's node.Decode rounds to a different value than
-// written (the value pipeline is node.Decode -> json.Marshal, and yaml.v3 decodes
-// an integer larger than uint64 to float64). Without this, a JSON allowlist value
-// like 12345678901234567890123 loads rounded, silently widening the allowlist
-// against a request arg that rounds to the same float64. Kept separate so
-// LoadManifest's decode block stays flat.
+// rejectCoercedScalarsForFormat runs the scalar-coercion guard for both formats. YAML rejects
+// any scalar whose canonical form differs textually from its source (010 -> 8, 1.0 -> 1); JSON
+// rejects only a NUMERICALLY lossy coercion (an integer beyond float64 precision that
+// node.Decode rounds), since a plain 1.0 -> 1 textual difference is harmless there.
 func rejectCoercedScalarsForFormat(node *yaml.Node, isJSON bool, path string) error {
 	if err := rejectCoercedValueScalars(node, isJSON); err != nil {
 		return fmt.Errorf("invalid manifest %q: %w", path, err)
@@ -235,9 +175,7 @@ func rejectCoercedScalarsForFormat(node *yaml.Node, isJSON bool, path string) er
 }
 
 // topLevelValueNode returns the value node of a top-level mapping key, unwrapping a
-// DocumentNode wrapper first. Returns nil if the document isn't a mapping or the key is
-// absent, shared by schemaVersionFromNode and forceSchemaVersionToString so the top-level
-// walk exists once.
+// DocumentNode wrapper first. Shared by schemaVersionFromNode and forceSchemaVersionToString.
 func topLevelValueNode(node *yaml.Node, key string) *yaml.Node {
 	doc := node
 	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 {
@@ -255,11 +193,9 @@ func topLevelValueNode(node *yaml.Node, key string) *yaml.Node {
 	return nil
 }
 
-// schemaVersionFromNode reads the top-level schemaVersion scalar's SOURCE TEXT off the
-// parsed document, reporting whether the key was present as a scalar. It exists so the
-// grammar-version gate can run before any guard that interprets the document's content
-// under the current grammar (see LoadManifest); it reads Value, so it is independent of
-// the !!int/!!float retag forceSchemaVersionToString applies.
+// schemaVersionFromNode reads the top-level schemaVersion scalar's SOURCE TEXT off the parsed
+// document, reporting whether the key was present as a scalar. Reads Value, so it is
+// independent of the !!int/!!float retag forceSchemaVersionToString applies.
 func schemaVersionFromNode(node *yaml.Node) (string, bool) {
 	val := topLevelValueNode(node, "schemaVersion")
 	if val == nil || val.Kind != yaml.ScalarNode {
@@ -268,18 +204,13 @@ func schemaVersionFromNode(node *yaml.Node) (string, bool) {
 	return val.Value, true
 }
 
-// forceSchemaVersionToString retags an unquoted top-level `schemaVersion` scalar to
-// !!str so the natural `schemaVersion: 0.1` (which yaml.v3 auto-types as a float)
-// decodes as the string "0.1" and negotiates identically to the quoted form. The
-// gateway-config loader does NOT do this — it decodes strictly from the raw bytes for
-// KnownFields, so it cannot retag in place — and instead rejects a bare-number
-// schemaVersion with an explicit "quote it" error. Without
-// this the number flows through node.Decode → json.Marshal → json.Unmarshal into the
-// string SchemaVersion field and fails with an opaque "cannot unmarshal number into ...
-// string" before validateManifestSchemaVersion can emit its friendly message. Retagging
-// keeps the verbatim text, so "0.10" stays "0.10" (≠ "0.1") rather than renormalizing;
-// an unsupported unquoted value (e.g. 1) then reaches the version check and is rejected
-// with a clear "unsupported version" error instead of a decode error.
+// forceSchemaVersionToString retags an unquoted top-level `schemaVersion` scalar to !!str so
+// the natural `schemaVersion: 0.1` (auto-typed as a float by yaml.v3) decodes as the string
+// "0.1" instead of failing with an opaque "cannot unmarshal number into ... string" before
+// validateManifestSchemaVersion can emit its friendly message. The gateway-config loader
+// cannot do this (it decodes strictly from raw bytes for KnownFields) and instead rejects a
+// bare-number schemaVersion outright. Retagging keeps the verbatim text, so "0.10" stays
+// "0.10" rather than renormalizing to "0.1".
 func forceSchemaVersionToString(node *yaml.Node) {
 	val := topLevelValueNode(node, "schemaVersion")
 	if val != nil && val.Kind == yaml.ScalarNode && (val.Tag == "!!int" || val.Tag == "!!float") {
@@ -287,10 +218,9 @@ func forceSchemaVersionToString(node *yaml.Node) {
 	}
 }
 
-// forceTimestampsToStrings retags every !!timestamp scalar to !!str so the
-// subsequent node.Decode yields the literal text rather than a time.Time,
-// stopping unquoted manifest dates from being rewritten to RFC3339 across the
-// YAML->JSON conversion. Every other scalar type is left untouched.
+// forceTimestampsToStrings retags every !!timestamp scalar to !!str so the subsequent
+// node.Decode yields the literal text rather than a time.Time, stopping unquoted manifest
+// dates from being rewritten to RFC3339 across the YAML->JSON conversion.
 func forceTimestampsToStrings(n *yaml.Node) {
 	if n == nil {
 		return
@@ -303,29 +233,15 @@ func forceTimestampsToStrings(n *yaml.Node) {
 	}
 }
 
-// rejectCoercedValueScalars walks n and rejects any unquoted scalar in a condition
-// "values:" (allowedValues) or argumentSchema "enum:" list that YAML auto-typed away
-// from its written text — an unquoted leading-zero integer read as octal (010 -> 8),
-// a decimal-pointed integer read as a float (1.0 -> 1), a sign/underscore/scientific
-// form normalized on the way through. Such an entry makes the manifest enforce a
-// value that differs from its own source (both an over-restriction — the intended
-// literal is denied — and a widening — the coerced value is admitted), with no
-// load-time signal.
-//
-// This closes the same class as the !!timestamp handling (forceTimestampsToStrings):
-// yaml.v3 auto-types scalars the JSON/string model does not, and only !!timestamp
-// was retagged. Rather than retag (which would turn a legitimately numeric allowlist
-// entry into a string the engine's numericEqual could no longer match), this fails
-// closed and forces the author to disambiguate: quote it ("010") to mean the string,
-// or write the canonical number (8) to mean the number. Numbers whose text already
-// round-trips (200, 1.5, -3) are untouched.
-// numericPolicyScalarKeys are policy fields holding a bare numeric scalar (not a
-// values:/enum: list) that carry the identical YAML auto-typing coercion risk: an
-// unquoted leading-zero integer read as octal silently changes an enforced
-// number, e.g. `maxCalls: {windowSeconds: 0600}` loads as 384 (a quietly
-// shortened rate window) and `argumentSchema: {minimum: 010}` enforces 8, not
-// 10. rejectCoercedValueScalars walks these the same way it walks values:/enum:
-// list scalars.
+// rejectCoercedValueScalars walks n and rejects any unquoted scalar in a condition "values:"
+// (allowedValues) or argumentSchema "enum:" list that YAML auto-typed away from its written
+// text (leading-zero octal, decimal-pointed float, …), making the manifest enforce a value
+// that differs from its own source with no load-time signal. Rather than retag (which would
+// turn a legitimately numeric allowlist entry into a string the engine could no longer
+// match), this fails closed and forces the author to disambiguate.
+// numericPolicyScalarKeys are policy fields holding a bare numeric scalar (not a values:/enum:
+// list) with the identical coercion risk, e.g. `maxCalls: {windowSeconds: 0600}` silently
+// loading as 384.
 var numericPolicyScalarKeys = map[string]bool{
 	"count":         true, // maxCalls
 	"windowSeconds": true, // maxCalls
@@ -338,24 +254,17 @@ var numericPolicyScalarKeys = map[string]bool{
 }
 
 // scopedNumericPolicyScalarKeys are the effect layer's numeric bounds, which carry the
-// identical coercion risk (an authored `max: 0600` loads as an enforced bound of 384) but
-// whose SPELLINGS are generic. They are keyed by the block they must appear in, because
-// the walk below visits every mapping in the document: matching a bare "max"/"value"
-// anywhere would also reject an opaque `policy`/`custom` condition payload (both are
-// `interface{}` — author-defined input handed verbatim to an external evaluator, where
-// eunox enforces nothing and so cannot "silently change the enforced policy"), and any
-// future field that happens to share the name. Every other entry in
-// numericPolicyScalarKeys is specific enough that the name IS the field.
+// identical coercion risk but whose SPELLINGS are generic ("max", "value"). Keyed by the
+// block they must appear in, since a bare-name match would also reject an opaque
+// `policy`/`custom` condition payload the engine does not itself enforce.
 var scopedNumericPolicyScalarKeys = map[string]map[string]bool{
 	"blastRadius":   {"value": true},          // effect contract's / a byArgument case's magnitude
 	"conditions":    {"max": true},            // the blastRadius condition's bound
 	"effectCeiling": {"maxBlastRadius": true}, // the top-level ceiling's magnitude bound
 }
 
-// numericPolicyScalarKeyApplies reports whether key names an enforced number at this point
-// in the document: an unscoped policy field, or a scoped one sitting in the block it
-// belongs to. enclosingKey is the mapping key the containing node hangs off ("" at the
-// document root).
+// numericPolicyScalarKeyApplies reports whether key names an enforced number at this point in
+// the document: an unscoped policy field, or a scoped one sitting in its own block.
 func numericPolicyScalarKeyApplies(enclosingKey, key string) bool {
 	if numericPolicyScalarKeys[key] {
 		return true
@@ -367,10 +276,8 @@ func rejectCoercedValueScalars(n *yaml.Node, isJSON bool) error {
 	return rejectCoercedScalarsUnder(n, isJSON, "")
 }
 
-// rejectCoercedScalarsUnder is rejectCoercedValueScalars' walk, carrying the mapping key
-// the current node hangs off so a scoped numeric key can be recognized only inside its own
-// block. A sequence passes its own enclosing key down to each element, so a condition
-// object inside `conditions:` is scoped to "conditions".
+// rejectCoercedScalarsUnder is rejectCoercedValueScalars' walk, carrying the mapping key the
+// current node hangs off so a scoped numeric key is recognized only inside its own block.
 func rejectCoercedScalarsUnder(n *yaml.Node, isJSON bool, enclosingKey string) error {
 	if n == nil {
 		return nil
@@ -378,19 +285,14 @@ func rejectCoercedScalarsUnder(n *yaml.Node, isJSON bool, enclosingKey string) e
 	if n.Kind == yaml.MappingNode {
 		for i := 0; i+1 < len(n.Content); i += 2 {
 			key, val := n.Content[i], n.Content[i+1]
-			// Follow an alias on the key too: `&vk values` anchored elsewhere and
-			// referenced as `*vk: [010]` is a mapping key that is an AliasNode, not
-			// a ScalarNode, so the switch below would silently skip it without this.
+			// Follow an alias on the key too (`&vk values` referenced as `*vk: [010]`) and
+			// on the value, so `values: *ref` cannot smuggle a coerced scalar past the check.
 			key = resolveYAMLAlias(key)
-			// Follow an alias so `values: *ref` (the whole list anchored elsewhere)
-			// cannot smuggle a coerced scalar past the SequenceNode check below.
 			val = resolveYAMLAlias(val)
 			switch {
 			case key.Kind == yaml.ScalarNode && (key.Value == "values" || key.Value == "enum") && val.Kind == yaml.SequenceNode:
-				// One visited-set per list, shared across all its items: bounds a
-				// self-referential anchor (values: &loop [*loop], which aliases back into
-				// itself) and collapses an exponentially-branching (billion-laughs style)
-				// alias graph to linear time. See checkValueScalarNotCoerced.
+				// One visited-set per list bounds a self-referential anchor (values: &loop
+				// [*loop]) and collapses a billion-laughs-style alias graph to linear time.
 				seen := make(map[*yaml.Node]bool)
 				for _, item := range val.Content {
 					if err := checkValueScalarNotCoerced(item, key.Value, isJSON, seen); err != nil {
@@ -403,9 +305,8 @@ func rejectCoercedScalarsUnder(n *yaml.Node, isJSON bool, enclosingKey string) e
 				}
 			}
 		}
-		// Recurse pairwise so each value carries the key it hangs off. A key node is
-		// walked too (with no enclosing key): a complex YAML key is a legal, if exotic,
-		// composite the pre-scoping walk also descended into.
+		// Recurse pairwise so each value carries the key it hangs off; a key node is walked
+		// too, with no enclosing key.
 		for i := 0; i+1 < len(n.Content); i += 2 {
 			if err := rejectCoercedScalarsUnder(n.Content[i], isJSON, ""); err != nil {
 				return err
@@ -429,10 +330,8 @@ func rejectCoercedScalarsUnder(n *yaml.Node, isJSON bool, enclosingKey string) e
 }
 
 // resolveYAMLAlias returns the node an alias points at (its anchored target), or n
-// unchanged when it is not an alias. The coercion guard must inspect the anchored
-// scalar, not the AliasNode (which has no Content and no Tag of its own), so a value
-// written as `*ref` cannot bypass the check while node.Decode still resolves it to
-// the coerced value.
+// unchanged when it is not an alias. The coercion guard must inspect the anchored scalar,
+// not the AliasNode itself, so a value written as `*ref` cannot bypass the check.
 func resolveYAMLAlias(n *yaml.Node) *yaml.Node {
 	if n != nil && n.Kind == yaml.AliasNode && n.Alias != nil {
 		return n.Alias
@@ -440,43 +339,32 @@ func resolveYAMLAlias(n *yaml.Node) *yaml.Node {
 	return n
 }
 
-// checkValueScalarNotCoerced rejects a single values:/enum: scalar that YAML
-// auto-typed to a number whose canonical form differs from the author's source text.
-// A quoted/block scalar (Style != 0) is an explicit string and is left alone; only an
-// unquoted (plain) !!int/!!float is at risk, since !!str keeps the text verbatim and
-// bool/null forms preserve their textual representation.
+// checkValueScalarNotCoerced rejects a single values:/enum: scalar that YAML auto-typed to a
+// number whose canonical form differs from the author's source text. A quoted/block scalar is
+// an explicit string and is left alone; only an unquoted !!int/!!float is at risk.
 //
-// seen is a visited set of *yaml.Node, one per top-level values:/enum: list (see
-// rejectCoercedValueScalars), that guards the alias walk: a self-referential anchor
-// (values: &loop [*loop], whose only element aliases back to the list itself) has no
-// other cycle-breaking condition and previously recursed until the stack overflowed —
-// an uncatchable fatal error that killed the whole process. The same guard collapses an
-// exponentially-branching (billion-laughs style) alias graph to linear time, since each
-// distinct anchor is only ever walked once.
+// seen is a visited set of *yaml.Node that guards the alias walk: a self-referential anchor
+// (values: &loop [*loop]) previously recursed until the stack overflowed — an uncatchable
+// fatal error. The same guard collapses a billion-laughs-style alias graph to linear time.
 func checkValueScalarNotCoerced(item *yaml.Node, listKey string, isJSON bool, seen map[*yaml.Node]bool) error {
 	if item == nil || seen[item] {
 		return nil
 	}
 	seen[item] = true
 	if item.Kind == yaml.AliasNode {
-		// A list element written as an alias (`*ref`) resolves to its anchored scalar,
-		// which is what node.Decode will enforce — check that, not the AliasNode. Mark
-		// the resolved target seen too (gated on Kind == AliasNode, not a bare
-		// resolveYAMLAlias call: for a non-alias item, resolveYAMLAlias returns item
-		// itself, and re-marking-and-checking the identical, already-just-marked pointer
-		// would make every plain node look "already seen" on its first visit).
+		// A list element written as an alias resolves to its anchored scalar, which is what
+		// node.Decode enforces — check that. Gated on Kind == AliasNode rather than a bare
+		// resolveYAMLAlias call, or every plain node would look "already seen" on first visit.
 		item = resolveYAMLAlias(item)
 		if item == nil || seen[item] {
 			return nil
 		}
 		seen[item] = true
 	}
-	// A nested sequence or mapping element (e.g. `values: [[010]]`) is not itself a
-	// scalar, but its children carry the same coercion risk one nesting level down.
-	// The outer rejectCoercedValueScalars recursion does not re-apply this check to
-	// them (they are not values:/enum:-keyed mappings), so descend here to keep the
-	// guard depth-uniform. For a mapping this also walks the keys, since a coerced
-	// numeric key is the same silent-drift class.
+	// A nested sequence or mapping element (e.g. `values: [[010]]`) is not itself a scalar,
+	// but its children carry the same coercion risk one level down; the outer recursion
+	// does not re-apply this check to them, so descend here. For a mapping this also walks
+	// the keys, since a coerced numeric key is the same silent-drift class.
 	if item.Kind == yaml.SequenceNode || item.Kind == yaml.MappingNode {
 		for _, child := range item.Content {
 			if err := checkValueScalarNotCoerced(child, listKey, isJSON, seen); err != nil {
@@ -489,18 +377,14 @@ func checkValueScalarNotCoerced(item *yaml.Node, listKey string, isJSON bool, se
 	if !ok || !coerced {
 		return nil
 	}
-	// YAML: any textual difference (010 -> 8, 1.0 -> 1) is a silent auto-typing the
-	// author did not write; fail closed and make them disambiguate. JSON: only a
-	// numerically-lossy coercion is rejected (coercionError/numericallyEqual).
+	// YAML: any textual difference is a silent auto-typing to reject. JSON: only a
+	// numerically-lossy coercion is (coercionError/numericallyEqual).
 	return coercionError("entry", listKey, false, item, src, canonical, isJSON)
 }
 
-// scalarCoercion reports whether item is a plain (unquoted) !!int/!!float scalar
-// whose YAML-decoded value differs textually from its source text — the shared
-// coercion-detection core for both checkValueScalarNotCoerced (values:/enum: list
-// entries) and checkNumericFieldNotCoerced (bare numeric policy fields). ok is
-// false when item carries no coercion risk (not a plain numeric scalar, or a
-// genuine decode failure that surfaces later at node.Decode instead).
+// scalarCoercion reports whether item is a plain (unquoted) !!int/!!float scalar whose
+// YAML-decoded value differs textually from its source text — the shared coercion-detection
+// core for checkValueScalarNotCoerced and checkNumericFieldNotCoerced.
 func scalarCoercion(item *yaml.Node) (src, canonical string, coerced, ok bool) {
 	if item.Kind != yaml.ScalarNode || item.Style != 0 {
 		return "", "", false, false
@@ -521,29 +405,18 @@ func scalarCoercion(item *yaml.Node) (src, canonical string, coerced, ok bool) {
 	return src, canonical, src != canonical, true
 }
 
-// numericallyEqual reports whether src and canonical denote the same number,
-// compared exactly via big.Rat so a beyond-float64-precision integer (which a
-// naive float comparison could round to a false match) is judged correctly.
+// numericallyEqual reports whether src and canonical denote the same number, compared exactly
+// via big.Rat so a beyond-float64-precision integer is judged correctly.
 func numericallyEqual(src, canonical string) bool {
 	srcRat, ok1 := new(big.Rat).SetString(src)
 	canRat, ok2 := new(big.Rat).SetString(canonical)
 	return ok1 && ok2 && srcRat.Cmp(canRat) == 0
 }
 
-// coercionError builds the "this literal number was silently coerced" error
-// shared by checkValueScalarNotCoerced (a values:/enum: list entry, kind
-// "entry") and checkNumericFieldNotCoerced (a bare numeric policy field, kind
-// "value"), so the two message shapes cannot drift apart on a future wording
-// tweak. label names the values:/enum: key or the policy field name; forField
-// switches the two spots where a field's message additionally calls out that
-// the coercion changes ENFORCED policy, not just an allowlist entry.
-//
-// For JSON, only a numerically-lossy coercion is rejected — JSON numbers are
-// unambiguous, so a textual difference like 1.0 -> 1 is harmless — returning
-// nil when src and canonical are numerically equal. For YAML, any textual
-// difference is a silent auto-typing the author did not write, and is always
-// rejected (scalarCoercion already confirmed src != canonical before this is
-// called).
+// coercionError builds the "this literal number was silently coerced" error shared by
+// checkValueScalarNotCoerced (kind "entry") and checkNumericFieldNotCoerced (kind "value"),
+// so the two message shapes cannot drift. For JSON, only a numerically-lossy coercion is
+// rejected; for YAML any textual difference is (scalarCoercion already confirmed one exists).
 func coercionError(kind, label string, forField bool, item *yaml.Node, src, canonical string, isJSON bool) error {
 	valueNoun, yamlSuffix := "the value", ""
 	if forField {
@@ -560,13 +433,10 @@ func coercionError(kind, label string, forField bool, item *yaml.Node, src, cano
 		label, kind, item.Value, canonical, yamlSuffix, item.Value, canonical)
 }
 
-// checkNumericFieldNotCoerced rejects a bare numeric policy field (maxCalls'
-// count/windowSeconds, argumentSchema's minimum/maximum/minLength/maxLength/
-// minItems/maxItems — see numericPolicyScalarKeys) whose YAML auto-typed value
-// differs textually from its source. This is the same coercion class
-// checkValueScalarNotCoerced catches for values:/enum: list scalars, but here the
-// coercion directly changes an enforced number (a rate-limit window, an argument
-// bound) rather than an allowlist entry.
+// checkNumericFieldNotCoerced rejects a bare numeric policy field (see
+// numericPolicyScalarKeys) whose YAML auto-typed value differs textually from its source —
+// the same coercion class checkValueScalarNotCoerced catches, but changing an enforced
+// number rather than an allowlist entry.
 func checkNumericFieldNotCoerced(item *yaml.Node, fieldName string, isJSON bool) error {
 	item = resolveYAMLAlias(item)
 	src, canonical, coerced, ok := scalarCoercion(item)
@@ -578,25 +448,18 @@ func checkNumericFieldNotCoerced(item *yaml.Node, fieldName string, isJSON bool)
 
 // MergeManifests combines the Capabilities lists from all manifests.
 //
-// Pure-metadata fields (name, version, description) are inherited from the first
-// manifest — none feeds enforcement or drift, so dropping the rest loses nothing.
+// Pure-metadata fields (name, version, description) are inherited from the first manifest,
+// since none feeds enforcement or drift. Single-value fields that DO — serverVersion,
+// schemaVersion, audience — are folded instead: first non-empty wins, two conflicting
+// non-empty values are rejected, so a later file's pin cannot be silently dropped.
 //
-// Single-value fields that DO drive enforcement or drift — serverVersion (FM-4),
-// schemaVersion, and audience — are folded instead: the first non-empty value is adopted
-// so a value set in any one file survives, and two files with *conflicting* non-empty
-// values are rejected. Silently collapsing serverVersion would disable a later pin;
-// audience pins the per-route JWT audience in gateway mode (see LocalManifest.Audience
-// and WrapRoutesWithJWT), so dropping a later file's value would silently widen the
-// route's accepted audience — the same fail-closed loss the fold prevents.
-//
-// The merge is likewise rejected when two capabilities from DIFFERENT files tie
-// in the engine's equal-specificity selection, whose declaration-order tie-break
-// would silently shadow the later one. See detectMergeConflicts.
+// The merge is likewise rejected when two capabilities from DIFFERENT files tie in the
+// engine's equal-specificity selection, whose declaration-order tie-break would silently
+// shadow the later one. See detectMergeConflicts.
 func MergeManifests(ms []*LocalManifest) (*LocalManifest, error) {
 	if len(ms) == 0 {
-		// Empty input yields an empty manifest (zero capabilities ⟹ deny
-		// everything). The empty sentinel has no name, so it skips
-		// validateLocalManifest.
+		// Zero capabilities ⟹ deny everything; the empty sentinel has no name, so it
+		// skips validateLocalManifest.
 		return &LocalManifest{}, nil
 	}
 	if len(ms) == 1 {
@@ -605,12 +468,8 @@ func MergeManifests(ms []*LocalManifest) (*LocalManifest, error) {
 	if err := detectMergeConflicts(ms); err != nil {
 		return nil, err
 	}
-	// ServerVersion, SchemaVersion, and Audience are enforcement/drift-bearing single
-	// values, so they are folded by the loop below WITH a conflict check (first non-empty
-	// wins; two disagreeing non-empty values are rejected) and deliberately not pre-seeded
-	// here. Audience pins the per-route JWT audience in gateway mode, so silently keeping
-	// only the first file's value would drop a pin declared in a later file — the same
-	// fail-closed loss mergeSingleValueField prevents for serverVersion.
+	// ServerVersion, SchemaVersion, and Audience are folded by the loop below WITH a
+	// conflict check (first non-empty wins) and deliberately not pre-seeded here.
 	merged := &LocalManifest{
 		Name:        ms[0].Name,
 		Version:     ms[0].Version,
@@ -633,21 +492,17 @@ func MergeManifests(ms []*LocalManifest) (*LocalManifest, error) {
 		}
 		merged.EffectCeiling = ceiling
 	}
-	// Re-validate the merged union. This is load-bearing, not merely defensive: two
+	// Re-validate the merged union: this is load-bearing, not defensive — two
 	// individually-valid files can each pin the SAME tool to a DIFFERENT descriptionHash,
-	// and only the merged whole is ambiguous — validateLocalManifest's conflicting-pin
-	// check catches that here (it cannot be seen on either file alone). It also guards a
-	// future merge change from producing an otherwise-invalid manifest. Do not drop it.
+	// and only the merged whole is ambiguous. Do not drop it.
 	if err := validateLocalManifest(merged); err != nil {
 		return nil, fmt.Errorf("merged manifest is invalid: %w", err)
 	}
 	return merged, nil
 }
 
-// mergeSingleValueField folds one manifest's value for a single-valued top-level
-// field into the accumulating merged value: first non-empty wins (so a pin in any
-// one file survives), and a second, disagreeing non-empty value is rejected
-// rather than silently dropped.
+// mergeSingleValueField folds one manifest's value for a single-valued top-level field into
+// the accumulating merged value: first non-empty wins, a disagreeing non-empty value rejected.
 func mergeSingleValueField(merged *string, next, field string) error {
 	switch {
 	case next == "":
@@ -660,27 +515,18 @@ func mergeSingleValueField(merged *string, next, field string) error {
 	return nil
 }
 
-// detectMergeConflicts rejects a merge in which two capabilities from DIFFERENT
-// manifests target the same resource with overlapping actions and principal
-// scopes a single request can satisfy at once. The engine scores such a pair
-// identically and breaks the tie by declaration order; across files that is just
-// the order the policy files are listed, so the effective policy silently depends
-// on file order (appending a file to tighten could leave it inert, or downgrade a
-// later restrictive entry to allow-and-log) — a fail-open. Surface it at load.
-//
-// Two capabilities from the SAME manifest are left alone: within one file the
-// first-in-order tie-break is documented behavior and visible in one place.
-//
-// Whether a pair ties uses the engine's own rules — targetsCanTie, actionsOverlap,
-// principalsConflict — which compare by SEMANTIC overlap, not byte-equality, so a
-// glob pair like `tool:read_*` / `tool:*_file` (both matching `read_file`) or two
-// co-satisfiable scopes keyed on different claims are still caught. Only pairs no
-// single request can satisfy together are exempt.
+// detectMergeConflicts rejects a merge in which two capabilities from DIFFERENT manifests
+// target the same resource with overlapping actions and principal scopes a single request
+// can satisfy at once. The engine breaks such a tie by declaration order, which across files
+// is just file-list order, so the effective policy would silently depend on it (fail-open) —
+// surfaced at load instead. Two capabilities from the SAME manifest are left alone: within
+// one file the first-in-order tie-break is documented and visible in one place. Ties are
+// judged by SEMANTIC overlap (targetsCanTie, actionsOverlap, principalsConflict), not
+// byte-equality, so a glob pair like `tool:read_*` / `tool:*_file` is still caught.
 func detectMergeConflicts(ms []*LocalManifest) error {
-	// prior records every capability seen and its manifest, so a later one can be
-	// compared pairwise (not via a string-keyed map) against every earlier
-	// cross-file one whose target could OVERLAP — catching glob pairs like
-	// `read_*` / `*_file` that same-string keying would miss.
+	// prior records every capability seen and its manifest, so a later one can be compared
+	// pairwise against every earlier cross-file one whose target could OVERLAP — catching
+	// glob pairs like `read_*` / `*_file` that same-string keying would miss.
 	type prior struct {
 		manifestIdx int
 		target      string
@@ -705,11 +551,10 @@ func detectMergeConflicts(ms []*LocalManifest) error {
 	return nil
 }
 
-// targetsCanTie reports whether two targets could both match a single request and
-// so tie. Different namespaces never tie; within a namespace it reduces to whether
-// the bare patterns overlap. An unparseable target is treated as potentially tying
-// (fail closed); validateLocalManifest rejects such targets earlier, so this is
-// defense-in-depth.
+// targetsCanTie reports whether two targets could both match a single request and so tie.
+// Different namespaces never tie; within a namespace it reduces to whether the bare patterns
+// overlap. An unparseable target is treated as potentially tying (fail closed, defense-in-depth
+// — validateLocalManifest already rejects such targets).
 func targetsCanTie(a, b string) bool {
 	aType, aBare, aErr := capability.ParseTarget(a)
 	bType, bBare, bErr := capability.ParseTarget(b)
@@ -722,26 +567,16 @@ func targetsCanTie(a, b string) bool {
 	return globTargetsOverlap(aBare, bBare)
 }
 
-// globTargetsOverlap reports whether two bare target patterns could TIE — the
-// only case producing a silent file-order shadow. Identical targets tie; two
-// distinct literals never tie; a literal and a glob covering it do NOT tie (the
-// exact match outranks the glob regardless of order). Two overlapping globs tie
-// only when the engine's own specificity scoring (enforcement.ResourceSpecificity)
-// would rank them equally — a different-specificity pair is resolved
-// deterministically by the engine regardless of file order, so it is not a tie.
+// globTargetsOverlap reports whether two bare target patterns could TIE — the only case
+// producing a silent file-order shadow. Identical targets tie; two distinct literals never
+// tie; a literal and a glob covering it do NOT tie (the exact match outranks the glob). Two
+// overlapping globs tie only when enforcement.ResourceSpecificity would rank them equally.
 //
-// This shares the equal/literal-vs-literal/glob skeleton with patternPairCanOverlap
-// (principal-claim overlap) but answers a deliberately DIFFERENT question, so the
-// two are kept separate rather than merged:
-//   - matcher: target overlap uses enforcement.MatchesResource semantics (resource
-//     segments, "**"); principal overlap uses stdpath.Match (claim values).
-//   - glob-vs-glob: here two globs can be PROVEN disjoint via literalPrefixesDisjoint,
-//     and are further screened by specificity — a literal-vs-glob pair does NOT tie
-//     (the literal's exact match outranks the glob by specificity); patternPairCanOverlap
-//     treats glob-vs-glob as always overlapping and a literal-vs-glob pair as
-//     overlapping, because principals carry no specificity ranking to break a tie. A
-//     change to glob semantics must be applied to whichever of the two it concerns,
-//     NOT blindly mirrored.
+// Shares its equal/literal/glob skeleton with patternPairCanOverlap (principal-claim overlap)
+// but answers a DIFFERENT question and is kept separate: target overlap uses
+// enforcement.MatchesResource semantics while principal overlap uses stdpath.Match, and here
+// two globs can be PROVEN disjoint and screened by specificity, where patternPairCanOverlap
+// treats glob-vs-glob as always overlapping since principals carry no specificity ranking.
 func globTargetsOverlap(a, b string) bool {
 	if a == b {
 		return true
@@ -755,23 +590,16 @@ func globTargetsOverlap(a, b string) bool {
 		if literalPrefixesDisjoint(a, b) {
 			return false
 		}
-		// Overlapping globs of different specificity never tie in the engine: it
-		// deterministically picks the more-specific one (resourceSpecificity),
-		// regardless of policy-file order, so only an equal-specificity pair is a
-		// genuine file-order shadow. toolName is passed as "" (a value neither
-		// pattern equals, since both contain glob metacharacters) so
-		// ResourceSpecificity always takes its literal/wildcard-counting branch
-		// rather than its exact-match shortcut.
+		// Overlapping globs of different specificity never tie: the engine deterministically
+		// picks the more-specific one. toolName is "" so ResourceSpecificity always takes its
+		// literal/wildcard-counting branch rather than its exact-match shortcut.
 		return enforcement.ResourceSpecificity(a, "") == enforcement.ResourceSpecificity(b, "")
 	default:
-		// One literal, one glob: the literal's exact match outranks the glob, so
-		// the engine resolves the overlap deterministically — no order shadow.
-		return false
+		return false // one literal, one glob: the literal's exact match outranks the glob
 	}
 }
 
-// literalPrefix returns the leading run of pattern containing no glob
-// metacharacter — the bytes every matching name must begin with verbatim. It reads
+// literalPrefix returns the leading run of pattern containing no glob metacharacter. Reads
 // capability.GlobMetaChars so the set cannot drift from ContainsGlobMeta.
 func literalPrefix(pattern string) string {
 	if i := strings.IndexAny(pattern, capability.GlobMetaChars); i >= 0 {
@@ -780,34 +608,24 @@ func literalPrefix(pattern string) string {
 	return pattern
 }
 
-// literalPrefixesDisjoint reports whether two glob patterns can be PROVEN to share
-// no matching name from their mandatory literal prefixes alone: a single name
-// would have to begin with both prefixes verbatim, impossible unless one prefix is
-// a prefix of the other. It is sound (never reports disjoint for patterns that
-// actually overlap) but incomplete — patterns it cannot separate are treated as
-// overlapping by the caller (fail closed).
+// literalPrefixesDisjoint reports whether two glob patterns can be PROVEN to share no
+// matching name from their mandatory literal prefixes alone. Sound but incomplete — patterns
+// it cannot separate are treated as overlapping by the caller (fail closed).
 func literalPrefixesDisjoint(a, b string) bool {
 	pa, pb := literalPrefix(a), literalPrefix(b)
 	return !strings.HasPrefix(pa, pb) && !strings.HasPrefix(pb, pa)
 }
 
-// principalsConflict reports whether two constraints' principal scopes can be
-// satisfied by a single request (the principal half of a positional tie):
-//
-//   - Two general (unscoped) entries always both match, so they conflict.
-//   - A general entry and a scoped one do NOT conflict: the engine prefers the
-//     scoped entry when its principal matches, otherwise the general one,
-//     deterministically.
-//   - Two scoped entries conflict unless some claim named by BOTH pins the request
-//     to disjoint values. A claim named by only one cannot separate them, so two
-//     entries keyed on entirely DIFFERENT claims (sub vs iss) DO conflict. Mirrors
-//     PrincipalMatches, which ANDs a scope across its own claims.
+// principalsConflict reports whether two constraints' principal scopes can be satisfied by a
+// single request (the principal half of a positional tie): two general entries always
+// conflict; a general and a scoped entry do NOT (the engine deterministically prefers the
+// scoped one); two scoped entries conflict unless some claim named by BOTH pins the request to
+// disjoint values (a claim named by only one cannot separate them). Mirrors PrincipalMatches,
+// which ANDs a scope across its own claims.
 func principalsConflict(a, b map[string][]string) bool {
 	aScoped, bScoped := len(a) > 0, len(b) > 0
 	if !aScoped || !bScoped {
-		// A general/scoped pair the engine resolves deterministically, so it is
-		// never a positional tie; only two general entries always co-match.
-		return !aScoped && !bScoped
+		return !aScoped && !bScoped // a general/scoped pair is never a positional tie
 	}
 	for claim, aPats := range a {
 		if bPats, ok := b[claim]; ok && !patternsCanOverlap(aPats, bPats) {
@@ -817,10 +635,9 @@ func principalsConflict(a, b map[string][]string) bool {
 	return true
 }
 
-// patternsCanOverlap reports whether some single claim value matches at least one
-// pattern in each list (i.e. the sets are not provably disjoint). Exact for
-// literals and a literal-vs-glob; two globs are conservatively treated as
-// overlapping (fail closed). Glob semantics are path.Match's, matching the engine.
+// patternsCanOverlap reports whether some single claim value matches at least one pattern in
+// each list. Exact for literals and literal-vs-glob; two globs are conservatively treated as
+// overlapping (fail closed).
 func patternsCanOverlap(a, b []string) bool {
 	for _, pa := range a {
 		for _, pb := range b {
@@ -832,13 +649,11 @@ func patternsCanOverlap(a, b []string) bool {
 	return false
 }
 
-// patternPairCanOverlap reports whether a single claim value can satisfy both
-// patterns. It mirrors globTargetsOverlap's equal/literal/glob skeleton but for
-// PRINCIPAL claims, with two deliberate differences (see globTargetsOverlap):
-// principal matching uses stdpath.Match (not enforcement.MatchesResource), and two
-// globs — and a literal-vs-glob pair — are treated as overlapping rather than
-// specificity-ranked, because principal scopes have no specificity ordering to
-// break a positional tie. Keep the divergence in mind before "unifying" the two.
+// patternPairCanOverlap reports whether a single claim value can satisfy both patterns. It
+// mirrors globTargetsOverlap's equal/literal/glob skeleton for PRINCIPAL claims, with two
+// deliberate differences (see globTargetsOverlap): stdpath.Match rather than
+// enforcement.MatchesResource, and glob-vs-glob is always overlapping since principal scopes
+// have no specificity ordering.
 func patternPairCanOverlap(pa, pb string) bool {
 	if pa == pb {
 		return true
@@ -861,10 +676,8 @@ func patternPairCanOverlap(pa, pb string) bool {
 	}
 }
 
-// actionsOverlap reports whether two action lists share at least one action a
-// single request could exercise. The "*" wildcard overlaps every action. The
-// lists are tiny (one verb plus an optional wildcard per target type), so the
-// nested scan is cheap.
+// actionsOverlap reports whether two action lists share at least one action a single request
+// could exercise. The "*" wildcard overlaps every action.
 func actionsOverlap(a, b []string) bool {
 	for _, x := range a {
 		if x == "*" {
@@ -882,12 +695,10 @@ func actionsOverlap(a, b []string) bool {
 // semverRe matches the strict three-part semver core (no leading zeros, no v prefix).
 var semverRe = regexp.MustCompile(`^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$`)
 
-// serverVersionPinRe is the grammar matchServerVersion supports: a dot-separated
-// version string of version tokens or "*" wildcards. matchServerVersion does
-// component-wise equality, NOT semver-range comparison, so a range like ">=2.0.0"
-// or "1.2.* || 2.0.*" would split into components no version matches — a pin that
-// can never be satisfied and blocks every session under strictDrift. Validating
-// here turns that silent blackout into an up-front manifest error.
+// serverVersionPinRe is the grammar matchServerVersion supports: a dot-separated version
+// string of tokens or "*" wildcards. matchServerVersion does component-wise equality, NOT
+// semver-range comparison, so a range like ">=2.0.0" would never match and block every
+// session under strictDrift — validated here to turn that silent blackout into a load error.
 var serverVersionPinRe = regexp.MustCompile(`^[0-9A-Za-z*][0-9A-Za-z.*+_-]*$`)
 
 func validateLocalManifest(m *LocalManifest) error {
@@ -895,8 +706,7 @@ func validateLocalManifest(m *LocalManifest) error {
 		return fmt.Errorf("'name' must not be empty")
 	}
 	// The declared grammar revision, trimmed once. Only validateAllowedValues consults it
-	// (the ${task.*} surface is defined by "0.2" and absent from "0.1"); every other
-	// per-type validator is revision-independent, and the authoritative version gate for
+	// (the ${task.*} surface is "0.2"-only); the authoritative version gate for
 	// discriminator tokens stays checkTokenGrammarVersion below.
 	declaredSchemaVersion := strings.TrimSpace(m.SchemaVersion)
 	if err := validateEffectCeiling(m.EffectCeiling); err != nil {
@@ -913,14 +723,11 @@ func validateLocalManifest(m *LocalManifest) error {
 			return fmt.Errorf("'serverVersion' is a dot-separated version pin with '*' wildcards (e.g. \"1.2.3\", \"1.2.*\", \"*\"), not a semver range; comparison/range operators (>=, >, <=, ~, ^, ||) are not supported and would never match, got %q", m.ServerVersion)
 		}
 		// matchServerVersion treats a '*' as a wildcard only when it is a WHOLE
-		// dot-component; a mid-component form like "1.2*" splits into component "2*",
-		// which equals no live version and makes FM-4 fire every session (fatal under
-		// strictDrift). Reject it up front rather than ship a pin that can never match.
+		// dot-component; a mid-component form like "1.2*" would make FM-4 fire every
+		// session (fatal under strictDrift). Reject it up front.
 		for _, part := range strings.Split(m.ServerVersion, ".") {
-			// An empty dot-component (a trailing '.', a doubled '..', or a lone '*.')
-			// passes the regex but can never equal any real version component, so the pin
-			// never matches and FM-4 fires every session — fatal under --strict-drift (a
-			// self-inflicted blackout), alarm fatigue otherwise. Reject the typo up front.
+			// An empty dot-component (a trailing '.', a doubled '..') passes the regex but can
+			// never equal any real version component, so the pin never matches. Reject the typo.
 			if part == "" {
 				return fmt.Errorf("'serverVersion' has an empty dot-component (e.g. \"1.2.\" or \"1..2\"); it can never match a real server version, got %q", m.ServerVersion)
 			}
@@ -929,11 +736,8 @@ func validateLocalManifest(m *LocalManifest) error {
 			}
 		}
 	}
-	// Audience, when set, pins the JWT 'aud' claim compared VERBATIM against the
-	// route's required audience; a normal token carries a whitespace-free aud, so
-	// surrounding whitespace on the manifest value would never match and would
-	// silently deny every call on the route. Reject it up front like the other
-	// match-sensitive fields (allowedTables/allowedOperations/recipientDomain).
+	// Audience, when set, is compared VERBATIM against a token's 'aud' claim, so
+	// surrounding whitespace would never match and would silently deny every call.
 	if m.Audience != "" {
 		if strings.TrimSpace(m.Audience) == "" {
 			return fmt.Errorf("'audience' is whitespace-only; the audience is matched verbatim against a token's 'aud' claim, so it would never match and would silently deny every call — set a real audience or remove the field")
@@ -944,12 +748,8 @@ func validateLocalManifest(m *LocalManifest) error {
 	}
 	// pinnedHashByTool tracks, per bare tool name, the descriptionHash the first pinned
 	// exact-tool entry declared, so a second entry pinning the SAME tool to a DIFFERENT hash
-	// is rejected as an ambiguous pin. The ambiguity is a static property of the manifest
-	// text (two exact-tool entries for one name are permitted — first-wins tie-break — but
-	// two DIFFERENT hashes for one name cannot both be authoritative), so it is caught here at
-	// load rather than carried into the PDP's hot enforcement path. MergeManifests re-runs this
-	// validator on the merged result, so a conflict arising across separate --policy files is
-	// caught too. See the per-entry accumulation in the descriptionHash block below.
+	// is rejected as an ambiguous pin, caught here at load rather than the PDP's hot path.
+	// MergeManifests re-runs this validator on the merged result, catching cross-file conflicts.
 	pinnedHashByTool := map[string]string{}
 	for i := range m.Capabilities {
 		c := &m.Capabilities[i]
@@ -990,10 +790,9 @@ func validateLocalManifest(m *LocalManifest) error {
 				return fmt.Errorf("capability at index %d: constraint %q has %w", i, c.Target, err)
 			}
 		}
-		// Validate descriptionHash when present. FM-5 startup verification fetches
-		// tools/list only, so the pin is only meaningful on tool: targets.
-		// Glob targets are also rejected: a single hash cannot represent the
-		// description of every tool the glob might match.
+		// FM-5 startup verification fetches tools/list only, so the pin is only meaningful on
+		// tool: targets. Glob targets are rejected too, since a single hash cannot represent
+		// every tool a glob might match.
 		if c.DescriptionHash != "" {
 			if targetType != capability.TargetTypeTool {
 				return fmt.Errorf("capability at index %d: descriptionHash is only supported on tool: targets (FM-5 startup verification fetches tools/list; resource: and prompt: descriptions are not verified at startup)", i)
@@ -1004,26 +803,22 @@ func validateLocalManifest(m *LocalManifest) error {
 			if err := validateDescriptionHashFormat(c.DescriptionHash); err != nil {
 				return fmt.Errorf("capability at index %d: %w", i, err)
 			}
-			// Reject a conflicting pin: this is a pinned exact tool (tool target, non-glob,
-			// valid hash), so if an earlier entry pinned the same bare name to a different
-			// hash the manifest is ambiguous — neither hash can be the authoritative
-			// description for the same tool. Fail closed at load with a clear error rather
-			// than let the ambiguity reach the enforcement path.
+			// If an earlier entry pinned the same bare name to a different hash, the manifest
+			// is ambiguous — fail closed at load rather than let it reach the enforcement path.
 			if prev, ok := pinnedHashByTool[bare]; ok && prev != c.DescriptionHash {
 				return fmt.Errorf("capability at index %d: conflicting descriptionHash pins for tool %q — %q and %q; a tool cannot be pinned to two different descriptions, so remove or reconcile one of the entries", i, bare, prev, c.DescriptionHash)
 			}
 			pinnedHashByTool[bare] = c.DescriptionHash
 		}
 		if c.ArgumentSchema != nil {
-			// argumentSchema validates a tool-call's argument map and the spec
-			// scopes it to tool: targets. A resource:/prompt:/system: request carries
-			// no such map, so accepting one is a fail-open (a guard with no runtime
-			// effect). Reject at load.
+			// argumentSchema validates a tool-call's argument map, scoped to tool: targets: a
+			// resource:/prompt:/system: request carries no such map, so accepting one is a
+			// fail-open guard with no runtime effect.
 			if targetType != capability.TargetTypeTool {
 				return fmt.Errorf("capability at index %d: constraint %q carries an argumentSchema, which applies only to tool: targets (the proxy validates tool-call arguments structurally; %s requests carry no tool-argument map to validate)", i, c.Target, targetType)
 			}
-			// Compile every `pattern` once at load: a malformed regex is rejected
-			// here (fail closed) instead of denying the first live request, and each
+			// Compile every `pattern` once at load: a malformed regex is rejected here
+			// (fail closed) instead of denying the first live request, and each
 			// valid pattern is primed into the enforcement regexp cache so the hot
 			// path never recompiles it.
 			if err := enforcement.CompileSchemaPatterns(fmt.Sprintf("capabilities[%d].argumentSchema", i), c.ArgumentSchema); err != nil {
@@ -1042,44 +837,32 @@ func validateLocalManifest(m *LocalManifest) error {
 		if err := validatePrincipal(c.Principal); err != nil {
 			return fmt.Errorf("capability at index %d: %w", i, err)
 		}
-		// Validate the effect contract. It is the single input every effect check reads
-		// (the effectClass condition, the blastRadius condition, and the ceiling), so a
-		// malformed one would make all three wrong at once — and wrong in the direction
-		// of looking declared while quantifying nothing.
+		// The effect contract is the single input every effect check reads, so a malformed
+		// one would make all three (effectClass, blastRadius, ceiling) wrong at once.
 		if err := validateEffectContract(i, c.Effect); err != nil {
 			return err
 		}
-		// Validate directives. Each type's own rules live in directiveValidators, keyed by
-		// the same discriminator pkg/capability's registry uses; the grammar-revision gate
-		// is separate (checkTokenGrammarVersion), so a per-type validator carries no
-		// version check and cannot bypass one by omitting it. A null directive is rejected
-		// fail-closed like a null condition.
+		// Each directive type's rules live in directiveValidators, keyed by the same
+		// discriminator pkg/capability's registry uses; the grammar-revision gate is separate
+		// (checkTokenGrammarVersion). A null directive is rejected fail-closed like a null
+		// condition.
 		for j, dir := range c.Directives {
 			if dir == nil {
 				return fmt.Errorf("capability at index %d, directive %d: a null directive is not permitted; every directives entry must be a typed directive object", i, j)
 			}
-			// A typed-nil pointer (e.g. (*LabelOutputDirective)(nil)) is a non-nil
-			// interface, so it survives the dir==nil check above but would panic when a
-			// case below dereferences d.Fields/d.Labels. Reject it fail-closed, matching
-			// the engine's collectObligations typed-nil guard (same capability.IsTypedNil).
+			// A typed-nil pointer is a non-nil interface, so it survives the dir==nil check
+			// above but would panic when a case below dereferences it. Mirrors the engine's
+			// collectObligations typed-nil guard.
 			if capability.IsTypedNil(dir) {
 				return fmt.Errorf("capability at index %d, directive %d: a typed-nil directive is not permitted; every directives entry must be a typed directive object", i, j)
 			}
 			// Dispatched off the directive's own DISCRIMINATOR through directiveValidators,
-			// which is keyed by the same strings capability's directivePrototypes registry
-			// holds — not off a type switch whose arms and whose "the only supported
-			// directives are…" default message were two more hand-maintained mirrors of that
-			// registry. A directive type present in the registry and missing here is caught
-			// by the completeness test rather than shipping a token every manifest carrying
-			// it is refused for, with a message naming three directives that are not the
-			// problem.
+			// keyed the same as capability's directivePrototypes registry — not a type switch,
+			// which would be a second hand-maintained mirror of that registry.
 			validate, known := directiveValidators[dir.DirectiveType()]
 			if !known {
-				// Fail closed, and enumerate FROM the registry: a literal list here is a
-				// third mirror, and one whose staleness an author reading the message has no
-				// way to detect. Reachable only for a programmatically built manifest — the
-				// YAML/JSON loader instantiates from the registry and rejects an unknown type
-				// at decode — so this is defense in depth, not a manifest-author hole.
+				// Enumerate FROM the registry rather than a literal list, which would be a
+				// third mirror. Reachable only for a programmatically built manifest.
 				return fmt.Errorf("capability at index %d, directive %d: unrecognized directive type %q; the supported directives are %s",
 					i, j, dir.DirectiveType(), strings.Join(capability.KnownDirectiveTypes(), ", "))
 			}
@@ -1092,43 +875,30 @@ func validateLocalManifest(m *LocalManifest) error {
 		if err := validateDeclassifyCoherence(i, c); err != nil {
 			return err
 		}
-		// Reject two quota-consuming conditions that would address the same counter
-		// bucket, before the per-condition pass, so the cross-condition collision is
-		// reported clearly. See validateQuotaBucketsDistinct.
+		// Reject two quota-consuming conditions addressing the same counter bucket before
+		// the per-condition pass. See validateQuotaBucketsDistinct.
 		if err := validateQuotaBucketsDistinct(i, c.Conditions); err != nil {
 			return err
 		}
-		// Validate conditions. Conditions needing an explicit argument name fail
-		// closed at runtime when it is empty; reject them here instead.
 		for j, cond := range c.Conditions {
-			// A null conditions entry (YAML `~`/JSON null) decodes to a nil Condition and
-			// would slip through this type switch (no case matches nil), then panic the
-			// engine at request time when it calls ConditionType() on the nil interface —
-			// a whole-proxy DoS from one route manifest. Reject it at load, fail closed.
+			// A null conditions entry decodes to a nil Condition and would slip through this
+			// type switch, then panic the engine at request time on the nil interface — a
+			// whole-proxy DoS from one route manifest. Reject it at load, fail closed.
 			if cond == nil {
 				return fmt.Errorf("capability at index %d, condition %d: a null condition is not permitted; every conditions entry must be a typed condition object", i, j)
 			}
-			// A typed-nil pointer (e.g. (*FlowLabelCondition)(nil)) is a non-nil interface,
-			// so it survives the cond==nil check above but would panic when a *Condition case
-			// below dereferences v (e.g. v.Allow). Reject it fail-closed, mirroring the
-			// directive loop's typed-nil guard (same capability.IsTypedNil).
+			// A typed-nil pointer is a non-nil interface, so it survives the cond==nil check
+			// above but would panic when a case below dereferences it, mirroring the
+			// directive loop's typed-nil guard.
 			if capability.IsTypedNil(cond) {
 				return fmt.Errorf("capability at index %d, condition %d: a typed-nil condition is not permitted; every conditions entry must be a typed condition object", i, j)
 			}
 			// Dispatched off the condition's own DISCRIMINATOR through conditionValidators,
-			// keyed by the same strings capability's conditionPrototypes registry holds — not
-			// off a type switch whose unmatched arm fell through with err == nil. The condition
-			// loader is registry-driven, so a condition added to the registry without a switch
-			// arm compiled, decoded and LOADED clean, with its load-time checks unrun and its
-			// runtime state left unbuilt by the missed Compile. Directives closed this exact
-			// hole (directiveValidators + its completeness test); this was the last
-			// hand-maintained mirror of the registry in the package.
+			// keyed the same as capability's conditionPrototypes registry — not a type switch,
+			// under which a condition added to the registry without a switch arm loaded clean
+			// with its Compile never run.
 			validate, known := conditionValidators[cond.ConditionType()]
 			if !known {
-				// Fail closed, and enumerate FROM the registry, for the same reasons the
-				// directive loop's unknown arm does. Reachable only for a programmatically
-				// built manifest — the YAML/JSON loader instantiates from the registry and
-				// rejects an unknown type at decode.
 				return fmt.Errorf("capability at index %d, condition %d: unrecognized condition type %q; the supported conditions are %s",
 					i, j, cond.ConditionType(), strings.Join(capability.KnownConditionTypes(), ", "))
 			}
@@ -1137,11 +907,9 @@ func validateLocalManifest(m *LocalManifest) error {
 			}
 		}
 	}
-	// Single authoritative grammar-version gate: reject any token the declared
-	// schemaVersion does not define. Runs after the per-capability loop (so every
-	// condition/directive is non-nil and well-typed) rather than at each token's
-	// validation case, so a future token cannot slip under an older revision by omitting
-	// a per-case gate.
+	// Single authoritative grammar-version gate, run after the per-capability loop (so
+	// every condition/directive is non-nil and well-typed) rather than per-case, so a
+	// future token cannot slip under an older revision by omitting one.
 	if err := checkTokenGrammarVersion(m); err != nil {
 		return err
 	}
@@ -1149,28 +917,20 @@ func validateLocalManifest(m *LocalManifest) error {
 }
 
 // conditionValidator is the per-type validation one condition needs: its own field checks
-// plus the type's load-time Compile. i/j are the capability and condition indices for the
-// error message, cond the (non-nil, non-typed-nil — validateLocalManifest guarantees both
-// before dispatch) condition itself, and declaredSchemaVersion the manifest's grammar
-// revision, which exactly one type's rules genuinely turn on.
+// plus the type's load-time Compile. cond is guaranteed non-nil, non-typed-nil by
+// validateLocalManifest before dispatch; declaredSchemaVersion is the manifest's grammar
+// revision, which exactly one type's rules turn on.
 type conditionValidator func(i, j int, cond capability.Condition, declaredSchemaVersion string) error
 
 // conditionValidators is the manifest loader's per-condition validation, keyed by the SAME
-// discriminator strings pkg/capability's conditionPrototypes registry holds.
-//
-// It replaces a type switch whose unmatched arm fell through with err == nil. The condition
-// loader is registry-driven, so a condition added to conditionPrototypes WITHOUT a switch arm
-// compiled, decoded and loaded clean — its load-time checks unrun and, worse, the runtime
-// state its Compile builds never built, because the missed arm is what called Compile.
-// Directives were converted to this shape for exactly that reason; conditions were the last
-// hand-maintained mirror of the registry in this package. A type present in the registry and
-// missing here is now a test failure (TestConditionValidators_CoverEveryKnownCondition)
-// rather than a silent gap.
+// discriminator strings pkg/capability's conditionPrototypes registry holds — not a type
+// switch, under which a condition added to the registry without a switch arm loaded clean with
+// its Compile never run and its runtime state never built. A type missing here is now a test
+// failure (TestConditionValidators_CoverEveryKnownCondition) rather than a silent gap.
 //
 // Each entry goes through typedCondition, which honours AsValueOrPointer's ok. Dispatch is on
-// the discriminator the condition REPORTS, not on its Go type, so a value whose
-// ConditionType() disagrees with its concrete type selects an entry the assertion then fails
-// — reported, rather than dereferenced as a type it is not.
+// the discriminator the condition REPORTS, not its Go type, so a mismatched ConditionType()
+// is reported rather than dereferenced as a type it is not.
 var conditionValidators = map[string]conditionValidator{
 	capability.ConditionTypeAllowedOperations: typedCondition(validateAllowedOperations),
 	capability.ConditionTypeAllowedExtensions: typedCondition(validateAllowedExtensions),
@@ -1202,20 +962,12 @@ func typedCondition[T any](check func(i, j int, v *T) error) conditionValidator 
 }
 
 // typedVersionedCondition folds one condition type's value and pointer decode forms into a
-// single table entry: it normalizes cond to *T for the type's validator, then runs the type's
-// load-time Compile.
-//
-// The "Compile only on the POINTER form" rule is enforced by the type system rather than
-// remembered per entry. Compile has a pointer receiver on every condition that defines one,
-// so a cond holding the VALUE form does not satisfy this interface at all — while
-// AsValueOrPointer's *T is a pointer to a COPY for that form, and compiling it would build
-// state the engine never reads. A condition type with no Compile simply does not match.
-//
-// The type mismatch is REPORTED rather than assumed away. It was unreachable under the type
-// switch this replaced (the switch had already matched T or *T); under discriminator dispatch
-// a programmatically built condition whose ConditionType() disagrees with its concrete type
-// reaches here, and a discarded ok would be a nil dereference — a fail-closed load error
-// turned into a crash. Same reason, same shape, as typedDirective's.
+// single table entry: normalizes cond to *T, then runs the type's load-time Compile. The
+// "Compile only on the POINTER form" rule is enforced by the type system — Compile has a
+// pointer receiver, so the VALUE form does not satisfy the interface at all. The type mismatch
+// is REPORTED rather than assumed away: under discriminator dispatch a programmatically built
+// condition whose ConditionType() disagrees with its concrete type reaches here, where a
+// discarded ok would be a nil dereference instead of a fail-closed load error.
 func typedVersionedCondition[T any](check func(i, j int, v *T, declaredSchemaVersion string) error) conditionValidator {
 	return func(i, j int, cond capability.Condition, declaredSchemaVersion string) error {
 		v, ok := capability.AsValueOrPointer[T](cond)
@@ -1227,9 +979,8 @@ func typedVersionedCondition[T any](check func(i, j int, v *T, declaredSchemaVer
 			return err
 		}
 		if c, compilable := cond.(interface{ Compile() error }); compilable {
-			// Compile cannot fail for any condition in tree (each validator already confirmed
-			// its inputs parse); the error is still checked so a future normalization that CAN
-			// fail is caught at load rather than silently skipped.
+			// Compile cannot fail today (each validator already confirmed its inputs parse);
+			// the error is still checked so a future normalization that CAN fail is caught.
 			if err := c.Compile(); err != nil {
 				return fmt.Errorf("capability at index %d, condition %d: %w", i, j, err)
 			}
@@ -1262,31 +1013,19 @@ func validateTargetPatternBreadth(targetType capability.TargetType, bare, target
 	return nil
 }
 
-// isBareWildcardTarget reports whether the bare pattern is a match-everything
-// target with nothing to scope it — a run of "*"/"?" that includes at least one
-// "*" ("*", "**", "*?", "?*", …). Rejected as too broad for tool: and resource:.
-// A run of ONLY "?" (e.g. "?", "??") is NOT rejected here: path.Match's "?"
-// matches exactly one character, so "??" matches only two-character names — a
-// bounded, legitimately-scoped target, not match-everything. Requiring a "*" in
-// the trimmed-to-empty pattern is what closes the tool:*? / tool:?* bypass
-// (mixing in a "*" makes the run match any non-empty name) without also
-// rejecting a pure fixed-length "?" pattern. prompt:* is the documented
-// exception and never routed here.
+// isBareWildcardTarget reports whether the bare pattern is a match-everything target with
+// nothing to scope it — a run of "*"/"?" including at least one "*". A run of ONLY "?" is NOT
+// rejected: "??" matches only two-character names, a bounded and legitimately-scoped target.
+// prompt:* is the documented exception and never routed here.
 func isBareWildcardTarget(bare string) bool {
 	return bare != "" && strings.Trim(bare, "*?") == "" && strings.Contains(bare, "*")
 }
 
-// resourceOpaqueURIWildcard reports whether bare is an opaque (non-hierarchical)
-// resource URI (e.g. urn:…, mailto:… — a scheme with no "//" authority) carrying a
-// glob metacharacter. Opaque URIs match by exact equality only, so any wildcard in
-// one is rejected at load.
-//
-// Opaqueness is decided solely by the absence of a "//" authority component: a "/"
-// in the scheme-specific part does NOT make the URI hierarchical. A URN's
-// namespace-specific string ("urn:example:foo/bar") or a path-like opaque value
-// routinely contains "/", yet still matches by exact equality — so a glob in one
-// must be rejected too. (Keying off any "/" let "urn:example:foo/bar*" slip past
-// this guard, contradicting the stated invariant.)
+// resourceOpaqueURIWildcard reports whether bare is an opaque (non-hierarchical) resource URI
+// (e.g. urn:…, mailto:…) carrying a glob metacharacter. Opaque URIs match by exact equality
+// only, so any wildcard is rejected. Opaqueness is decided solely by the absence of a "//"
+// authority component — a "/" in the scheme-specific part (e.g. a URN namespace string) does
+// NOT make the URI hierarchical.
 func resourceOpaqueURIWildcard(bare string) bool {
 	colon := strings.Index(bare, ":")
 	if colon <= 0 {
@@ -1317,15 +1056,10 @@ func resourceWildcardsSchemeOrAuthority(pattern string) bool {
 	return capability.ContainsGlobMeta(authority)
 }
 
-// validateArgumentRef rejects a condition 'argument' reference that fails closed at
-// runtime: an empty reference (every call denied for want of a named parameter), or
-// a malformed nested "$." path — an empty body ("$."), an empty segment ("$.a..b"),
-// or a trailing dot ("$.a."). ArgumentPathSegments returns nil for such a path, and
-// ResolveArgument fails closed on a nil segment list (the same signal as a missing
-// argument), so the condition silently denies every matching call with no load-time
-// signal. Catch both at validate time. emptyMsg is the condition-specific message
-// for the empty case (each validator already had a tailored one). Argument-bearing
-// condition validators call this in place of their old `v.Argument == ""` check.
+// validateArgumentRef rejects a condition 'argument' reference that fails closed at runtime:
+// an empty reference, or a malformed nested "$." path — an empty body, an empty segment, or a
+// trailing dot. Both cases silently deny every matching call with no load-time signal
+// otherwise. emptyMsg is the condition-specific message for the empty case.
 func validateArgumentRef(i, j int, argument, emptyMsg string) error {
 	if argument == "" {
 		return fmt.Errorf("capability at index %d, condition %d: %s", i, j, emptyMsg)
@@ -1336,56 +1070,40 @@ func validateArgumentRef(i, j int, argument, emptyMsg string) error {
 	return nil
 }
 
-// validateAllowedTables rejects an allowedTables condition that fails closed or
-// enforces non-deterministically: a missing 'argument' (every call denied), or
-// two 'columns' keys differing only in case. Column-map keys are matched
-// case-insensitively, so case variants like {users, Users} address one table and
-// the engine lowercases them into a single key where one silently overwrites the
-// other — and which survives depends on randomized map iteration order. Reject the
-// contradiction at load (the 'tables' list tolerates case variants since it builds
-// a plain membership set, losing nothing).
+// validateAllowedTables rejects an allowedTables condition that fails closed or enforces
+// non-deterministically: a missing 'argument', or two 'columns' keys differing only in case —
+// the engine lowercases them into one key where which survives depends on map iteration order.
 func validateAllowedTables(i, j int, v *capability.AllowedTablesCondition) error {
 	if err := validateArgumentRef(i, j, v.Argument, "allowedTables requires an 'argument' field naming the tool parameter that carries the table name"); err != nil {
 		return err
 	}
-	// An empty 'tables' list denies every call (column entries cannot rescue it —
-	// they apply only to already-allowed tables). Reject so a `table:`/`tables:`
-	// typo surfaces at validate-time.
+	// An empty 'tables' list denies every call (column entries only apply to already-allowed
+	// tables and cannot rescue it).
 	if len(v.Tables) == 0 {
 		return fmt.Errorf("capability at index %d, condition %d: allowedTables requires a non-empty 'tables' list; an empty list matches no table and denies every call", i, j)
 	}
-	// A blank/whitespace entry never matches a real table name, so an all-blank
-	// list denies every call like an empty one. Reject any blank entry.
 	for k, table := range v.Tables {
 		if strings.TrimSpace(table) == "" {
 			return fmt.Errorf("capability at index %d, condition %d, table %d: allowedTables contains an empty or whitespace-only table entry; remove it or replace it with a real table name", i, j, k)
 		}
-		// Surrounding whitespace is the same footgun as a blank entry: request table
-		// names are trimmed before matching, so " users" would never match and would
-		// silently deny every call. Reject it at load like the all-blank case.
+		// Surrounding whitespace is the same footgun: request table names are trimmed
+		// before matching, so " users" would never match and silently deny every call.
 		if table != strings.TrimSpace(table) {
 			return fmt.Errorf("capability at index %d, condition %d, table %d: allowedTables entry %q has leading or trailing whitespace; table names are trimmed before matching, so this entry would never match and would silently deny every call — remove the surrounding whitespace", i, j, k, table)
 		}
 	}
 	seen := make(map[string]string, len(v.Columns))
 	for table, cols := range v.Columns {
-		// Normalize EXACTLY as the runtime compiler does (ToLower AFTER TrimSpace).
-		// Checking collisions on the untrimmed name while the engine keys on the trimmed
-		// one let {"users", " users"} pass validation and then collapse onto one bucket,
-		// with which column allowlist survived decided by randomized map iteration order
-		// — so a manifest could enforce a narrower ACL on one process and a wider one on
-		// the next, silently. Trimming here is what makes the "case-colliding keys"
-		// rejection cover the whitespace-colliding case too.
+		// Normalize EXACTLY as the runtime compiler does (ToLower AFTER TrimSpace):
+		// checking collisions on the untrimmed name let {"users", " users"} pass validation
+		// then collapse onto one bucket at runtime, non-deterministically.
 		key := strings.ToLower(strings.TrimSpace(table))
 		if prior, dup := seen[key]; dup {
 			return fmt.Errorf("capability at index %d, condition %d: allowedTables 'columns' has case-colliding keys %q and %q; table names are matched case-insensitively, so they address the same table and one column allowlist would non-deterministically overwrite the other — merge them under a single key", i, j, prior, table)
 		}
 		seen[key] = table
-		// An empty column allowlist denies every access to the table
-		// unconditionally (the runtime treats it as a present-but-unsatisfiable
-		// restriction), even though the table is listed in 'tables'. To allow any
-		// column, OMIT the key; to deny the table, remove it from 'tables'. Reject at
-		// load.
+		// An empty column allowlist denies every access to the table unconditionally, even
+		// though it is listed in 'tables'. To allow any column, OMIT the key instead.
 		if len(cols) == 0 {
 			return fmt.Errorf("capability at index %d, condition %d: allowedTables 'columns' has an empty column allowlist for table %q, which denies every access to that table unconditionally; to allow any column omit %q from 'columns', or to deny the table entirely remove it from 'tables'", i, j, table, table)
 		}
@@ -1453,30 +1171,19 @@ func validateAllowedValues(i, j int, v *capability.AllowedValuesCondition, decla
 	if len(v.Values) == 0 {
 		return fmt.Errorf("capability at index %d, condition %d: allowedValues requires a non-empty 'values' list; an empty list matches nothing and denies every call", i, j)
 	}
-	// String values double as MatchValueGlob patterns at runtime. A malformed
-	// pattern (e.g. unclosed "[invalid") is silently treated as a non-match,
-	// quietly tightening the policy. Validate through enforcement.ValidateValueGlob,
-	// the same decomposition the runtime matcher uses, so a "**"-bearing pattern is
-	// caught here too.
+	// String values double as MatchValueGlob patterns at runtime; a malformed pattern is
+	// silently treated as a non-match, quietly tightening the policy.
 	for k, val := range v.Values {
 		s, ok := val.(string)
 		if !ok {
 			continue
 		}
-		// A task-context variable is a REFERENCE, not a pattern: it is resolved from the
-		// validated token and compared by exact equality (see enforcement.matchTaskVars),
-		// so it is validated as a reference and skips the glob check entirely. Anything
-		// carrying a "${" that is not a well-formed, recognized reference is a load error
-		// — the closed grammar's rule, applied to the variable surface: a misspelled
-		// ${task.identifier} must not load as an inert literal that denies every call.
-		//
-		// Gated on the revision that DEFINES the surface. Under "0.1" a "${" is an
-		// ordinary character in a literal value (it is not a glob metacharacter), so a
-		// document that was valid before the variable surface existed keeps loading;
-		// applying the rule there would turn an existing manifest into a startup failure
-		// over a token its grammar does not contain. A recognized reference under "0.1" is
-		// still refused — by checkTaskVarGrammarVersion, which names the revision that
-		// introduced it, exactly as every other 0.2 token is refused.
+		// A task-context variable is a REFERENCE, not a pattern: resolved from the validated
+		// token and compared by exact equality, so it skips the glob check entirely. A
+		// misspelled ${task.identifier} must not load as an inert literal that denies every
+		// call. Gated on the revision that DEFINES the surface — under "0.1" a "${" is
+		// ordinary literal text — with a recognized reference under "0.1" still refused by
+		// checkTaskVarGrammarVersion.
 		if revisionAdmits(declared, ManifestSchemaVersion02) && capability.ContainsVariableRef(s) {
 			if err := capability.ValidateVariableRef(s); err != nil {
 				return fmt.Errorf("capability at index %d, condition %d, value %d: %w", i, j, k, err)
@@ -1490,27 +1197,17 @@ func validateAllowedValues(i, j int, v *capability.AllowedValuesCondition, decla
 	return nil
 }
 
-// validateRedactFields rejects the structurally malformed redactFields paths the
-// runtime redactor (internal/pdp's redactDotPathRec, whose root marker is stripped by
-// normalizeDotPathRoot) would silently no-op on — forwarding the
-// field unredacted while the audit record reports redaction applied, a fail-open
-// leak. The redactor splits on '.' and looks up each segment as a literal object
-// key, so array-index notation ("users[0].ssn"), an empty segment ("a..b"), or a
-// segment with surrounding whitespace never resolves. A plain dot path
-// ("users.ssn") already redacts from every array element, so the index is unneeded.
-//
-// This catches malformed SYNTAX, not every possible no-op. The '.' separator is
-// inherently ambiguous: a dot path "a.b" targets nested object a -> key b, so a
-// FLAT upstream key literally named "a.b" (legal JSON) is unaddressable and is
-// redacted by no path — a silent no-op this validator does not (and cannot, from
-// the manifest alone) detect. Keys containing a literal '.' cannot be targeted; see
+// validateRedactFields rejects the structurally malformed redactFields paths the runtime
+// redactor would silently no-op on — forwarding the field unredacted while the audit record
+// reports redaction applied, a fail-open leak. The redactor splits on '.' and looks up each
+// segment as a literal object key, so array-index notation, an empty segment, or surrounding
+// whitespace never resolves. This catches malformed SYNTAX only; a FLAT upstream key literally
+// named "a.b" is unaddressable and cannot be detected from the manifest alone — see
 // docs/capability-manifest-guide.md.
 func validateRedactFields(i, j int, fields []string) error {
-	// An empty (or omitted) fields list declares a redaction that redacts nothing
-	// while enforcedForwardCore still records the redactFields obligation as applied
-	// — a fail-open leak of a declared DLP control plus a falsely "discharged" audit
-	// record. The per-field loop below cannot catch this degenerate shape, so reject
-	// it up front, mirroring the other fail-open guards in this function.
+	// An empty (or omitted) fields list declares a redaction that redacts nothing while
+	// enforcedForwardCore still records the obligation as applied — a fail-open leak plus a
+	// falsely "discharged" audit record.
 	if len(fields) == 0 {
 		return fmt.Errorf("capability at index %d, directive %d: redactFields requires a non-empty 'fields' list; an empty list declares a redaction that redacts nothing while the audit log reports it applied — list the field(s) to redact (e.g. fields: [\"users.ssn\"]) or remove the directive", i, j)
 	}
@@ -1518,14 +1215,9 @@ func validateRedactFields(i, j int, fields []string) error {
 		if strings.ContainsAny(field, "[]") {
 			return fmt.Errorf("capability at index %d, directive %d: redactFields path %q uses array-index notation ('[N]'), which is not supported and would silently redact nothing; use a dot path such as \"users.ssn\" to redact the field from every array element, or omit the index", i, j, field)
 		}
-		// Strip the leading root marker ("$." or a lone "$") before splitting, mirroring
-		// the redactor. Any OTHER "$"-prefixed form is rejected below: the runtime
-		// normalizeDotPathRoot strips only those two spellings, so a path like
-		// "$users.ssn" (a likely typo for "$.users.ssn") would reach the redactor
-		// unchanged, which then looks up a literal first key "$users", finds nothing, and
-		// silently redacts nothing. Reserving a leading "$" for the root marker means a
-		// field literally named with a leading "$" cannot be targeted with one; that is a
-		// documented limitation (docs/capability-manifest-guide.md).
+		// Strip the leading root marker ("$." or a lone "$") before splitting, mirroring the
+		// redactor. Any OTHER "$"-prefixed form is a likely typo (e.g. "$users.ssn" for
+		// "$.users.ssn") that reaches the redactor unchanged and silently redacts nothing.
 		var path string
 		switch {
 		case strings.HasPrefix(field, "$."):
@@ -1533,10 +1225,6 @@ func validateRedactFields(i, j int, fields []string) error {
 		case field == "$":
 			path = ""
 		case strings.HasPrefix(field, "$"):
-			// "$"-prefixed but neither "$." nor the lone "$": a fail-open trap. At runtime
-			// it matches nothing while the audit record reports the redactFields obligation
-			// applied — exactly what this validator exists to catch. Guide the operator to
-			// the root-anchored form or to dropping the '$'.
 			return fmt.Errorf("capability at index %d, directive %d: redactFields path %q begins with '$' but is not the root marker \"$.\" or the lone \"$\" sentinel; it would silently redact nothing while the audit log reports it applied — write \"$.%s\" to anchor at the response root, or remove the leading '$' to target a field literally named without one", i, j, field, strings.TrimPrefix(field, "$"))
 		default:
 			path = field
@@ -1548,9 +1236,8 @@ func validateRedactFields(i, j int, fields []string) error {
 			if seg == "" {
 				return fmt.Errorf("capability at index %d, directive %d: redactFields path %q has an empty path segment (a leading, trailing, or doubled '.'), which would silently redact nothing; use a well-formed dot path such as \"users.ssn\"", i, j, field)
 			}
-			// The redactor matches each segment as a LITERAL key with no trimming,
-			// so a segment with surrounding or all whitespace never matches and
-			// silently redacts nothing. Reject it here.
+			// The redactor matches each segment as a LITERAL key with no trimming, so a
+			// whitespace segment never matches and silently redacts nothing.
 			if strings.TrimSpace(seg) == "" {
 				return fmt.Errorf("capability at index %d, directive %d: redactFields path %q has a whitespace-only path segment, which would silently redact nothing; use a well-formed dot path such as \"users.ssn\"", i, j, field)
 			}
@@ -1562,11 +1249,9 @@ func validateRedactFields(i, j int, fields []string) error {
 	return nil
 }
 
-// validateMaxCalls rejects a maxCalls condition with a non-positive count or
-// window. A missing windowSeconds would silently become a never-resetting
-// lifetime cap rather than a rolling limit, so require it. A windowSeconds past
-// callcounter.MaxWindowSeconds is rejected too: it overflows the duration
-// arithmetic and would silently reset the quota (a fail-open bypass).
+// validateMaxCalls rejects a maxCalls condition with a non-positive count or window. A
+// windowSeconds past callcounter.MaxWindowSeconds overflows the duration arithmetic and would
+// silently reset the quota (a fail-open bypass), so it is rejected too.
 func validateMaxCalls(i, j int, v *capability.MaxCallsCondition) error {
 	if v.Count < 1 {
 		return fmt.Errorf("capability at index %d, condition %d: maxCalls requires 'count' >= 1 (the maximum calls permitted per window)", i, j)
@@ -1581,27 +1266,12 @@ func validateMaxCalls(i, j int, v *capability.MaxCallsCondition) error {
 }
 
 // validateQuotaBucketsDistinct rejects a capability whose quota-consuming conditions would
-// address the SAME counter bucket: two maxCalls sharing a windowSeconds, or two cumulative
-// blastRadius bounds sharing one. The counter keys each bucket by (session, targetType,
-// name, windowSeconds) within its own namespace, so two such conditions share one physical
-// bucket: every call is counted (or summed) once per condition, halving the effective
-// limit. The combination adds no expressiveness — one condition with the lower bound is the
-// faithful rewrite — so reject it at load. Distinct windows are independent limits and are
-// left alone.
-//
-// Mixing the two TYPES is explicitly fine and is an ordinary policy ("no more than 20
-// refunds an hour AND no more than $2,000 an hour"): they draw on separately-namespaced
-// keys, and the engine admits a counted bucket and a weighted one together in ONE atomic
-// backend call, so neither can spend the other's budget on a call the other denies.
-//
-// The type switch is complete for its INPUT DOMAIN and only for that: a manifest carries
-// only the closed set of grammar conditions, so a registry-supplied custom committing
-// handler cannot appear here. The backstop for that case is the counter's own
-// checkDistinctBuckets, which fails the admission closed at request time.
-//
-// A non-positive window is skipped and left to each condition's own sharper "windowSeconds
-// >= 1" message, rather than reported here as a duplicate-window conflict that would
-// misdirect the author.
+// address the SAME counter bucket (two maxCalls, or two cumulative blastRadius bounds,
+// sharing a windowSeconds): the counter keys each bucket by namespace, so two such conditions
+// share one physical bucket and halve the effective limit. Distinct windows are independent
+// and left alone. Mixing the two TYPES is fine — they draw on separately-namespaced keys and
+// the engine admits both together in ONE atomic backend call. The counter's own
+// checkDistinctBuckets is the backstop for anything outside a manifest's closed condition set.
 func validateQuotaBucketsDistinct(i int, conditions []capability.Condition) error {
 	// Keyed by (namespace, window): only a collision WITHIN one namespace is a shared
 	// bucket, because that is exactly how the counter keys them.
@@ -1641,9 +1311,8 @@ func validateQuotaBucketsDistinct(i int, conditions []capability.Condition) erro
 	return nil
 }
 
-// validateIPRange rejects an ipRange condition with an empty CIDR list (denies
-// every call), a malformed CIDR (a typo would otherwise only surface as a runtime
-// denial), or a CIDR carrying host bits.
+// validateIPRange rejects an ipRange condition with an empty CIDR list, a malformed CIDR,
+// or a CIDR carrying host bits.
 func validateIPRange(i, j int, v *capability.IPRangeCondition) error {
 	if len(v.CIDRs) == 0 {
 		return fmt.Errorf("capability at index %d, condition %d: ipRange requires a non-empty 'cidrs' list; an empty list matches no source IP and denies every call", i, j)
@@ -1653,10 +1322,8 @@ func validateIPRange(i, j int, v *capability.IPRangeCondition) error {
 		if err != nil {
 			return fmt.Errorf("capability at index %d, condition %d: ipRange contains an invalid CIDR %q (expected e.g. 10.0.0.0/8): %w", i, j, cidr, err)
 		}
-		// net.ParseCIDR silently masks host bits, so "10.0.0.5/8" behaves as
-		// "10.0.0.0/8" — usually a /32-vs-network mistake that widens the allowlist.
-		// The returned host IP differs from the masked network exactly when host bits
-		// are set; reject that.
+		// net.ParseCIDR silently masks host bits, so "10.0.0.5/8" behaves as "10.0.0.0/8" —
+		// usually a /32-vs-network mistake that widens the allowlist.
 		if !ip.Equal(network.IP) {
 			return fmt.Errorf("capability at index %d, condition %d: ipRange CIDR %q has host bits set; use the network address %q, or /32 to allow just that host", i, j, cidr, network.String())
 		}
@@ -1664,11 +1331,9 @@ func validateIPRange(i, j int, v *capability.IPRangeCondition) error {
 	return nil
 }
 
-// validateRecipientDomain rejects a recipientDomain condition that fails closed
-// or ships a dead allowlist entry: a missing 'argument' or empty 'domains' list
-// (both deny every call), an empty/whitespace-only domain entry, or an entry
-// beginning with '@' (an accidental full-address paste like "@example.com" that
-// the runtime handler could only match against a malformed double-@ recipient).
+// validateRecipientDomain rejects a recipientDomain condition that fails closed or ships a
+// dead allowlist entry: a missing 'argument', empty/blank domains, or an entry beginning with
+// '@' (an accidental full-address paste that could only match a malformed double-@ recipient).
 func validateRecipientDomain(i, j int, v *capability.RecipientDomainCondition) error {
 	if err := validateArgumentRef(i, j, v.Argument, "recipientDomain requires an 'argument' field naming the tool parameter that carries the recipient address"); err != nil {
 		return err
@@ -1681,15 +1346,9 @@ func validateRecipientDomain(i, j int, v *capability.RecipientDomainCondition) e
 		if trimmed == "" {
 			return fmt.Errorf("capability at index %d, condition %d, domain %d: recipientDomain contains an empty or whitespace-only domain entry; remove it or replace it with a real domain (e.g. example.com)", i, j, k)
 		}
-		// Surrounding whitespace is the same footgun: recipient domains are trimmed
-		// before matching, so "example.com " would never match and would silently deny
-		// every call. Reject it at load like the all-blank case.
 		if d != trimmed {
 			return fmt.Errorf("capability at index %d, condition %d, domain %d: recipientDomain entry %q has leading or trailing whitespace; recipient domains are trimmed before matching, so this entry would never match and would silently deny every call — remove the surrounding whitespace", i, j, k, d)
 		}
-		// A leading "@" is an accidental full-address paste. The runtime extracts a
-		// bare domain without an "@", so such an entry could only match a malformed
-		// double-@ recipient. Reject it.
 		if strings.HasPrefix(trimmed, "@") {
 			return fmt.Errorf("capability at index %d, condition %d, domain %d: recipientDomain entry %q must not start with '@'; use the bare domain (e.g. example.com)", i, j, k, d)
 		}
@@ -1697,10 +1356,8 @@ func validateRecipientDomain(i, j int, v *capability.RecipientDomainCondition) e
 	return nil
 }
 
-// validateTimeWindow rejects a timeWindow condition that declares neither bound
-// (restricts nothing), carries a non-RFC3339 timestamp (a typo would otherwise
-// only deny at runtime), or whose notBefore is at or after notAfter (an empty
-// window that denies every call).
+// validateTimeWindow rejects a timeWindow condition that declares neither bound, carries a
+// non-RFC3339 timestamp, or whose notBefore is at or after notAfter (an empty window).
 func validateTimeWindow(i, j int, v *capability.TimeWindowCondition) error {
 	if v.NotBefore == "" && v.NotAfter == "" {
 		return fmt.Errorf("capability at index %d, condition %d: timeWindow requires at least one of 'notBefore' or 'notAfter'; a window with neither bound restricts nothing", i, j)
@@ -1725,14 +1382,10 @@ func validateTimeWindow(i, j int, v *capability.TimeWindowCondition) error {
 
 // validatePolicyCondition rejects a policy condition with no backend name. The engine
 // resolves the evaluator by name at request time and denies (fail closed) when nothing is
-// registered under it, so a blank or whitespace-only backend is a silent deny-all with no
-// load-time signal at all — the author sees a valid-looking policy and a runtime where
-// every matching call is refused. Every other condition whose misconfiguration denies at
-// runtime is rejected at load; policy and custom were the only two with no arm.
-//
-// The backend's EXISTENCE is deliberately not checked: evaluators are registered by the
-// embedding program, possibly after the manifest loads, so requiring registration here
-// would reject a legitimate wiring order. Requiring a NAME does not.
+// registered under it, so a blank backend is a silent deny-all with no load-time signal. The
+// backend's EXISTENCE is deliberately not checked: evaluators may register after the manifest
+// loads, so requiring registration would reject a legitimate wiring order — requiring a NAME
+// does not.
 func validatePolicyCondition(i, j int, v *capability.PolicyCondition) error {
 	if strings.TrimSpace(v.Backend) == "" {
 		return fmt.Errorf("capability at index %d, condition %d: policy requires a non-empty 'backend' naming the external policy evaluator (e.g. opa, cedar); an unnamed backend resolves to no evaluator and denies every matching call at request time", i, j)
@@ -1750,19 +1403,11 @@ func validateCustomCondition(i, j int, v *capability.CustomCondition) error {
 	return nil
 }
 
-// validateSequenceBlock rejects a sequenceBlock condition whose afterTools list
-// would fail OPEN at runtime. The handler keys session history by the bare tool
-// name (stripped of its namespace prefix), so three authoring mistakes silently
-// never match — an empty list, an entry naming no tool once stripped/trimmed (a
-// list of such entries makes the whole block pass), and an entry with an
-// unrecognized namespace prefix (e.g. mcp:read_file, looked up under a key no call
-// records). The strip-then-trim check stays in lockstep with the engine's runtime
-// guard.
-//
-// The colon-prefix check is conservative: it also rejects a bare resource URI like
-// "file:///secrets" (which would fire at runtime), since at load time it is
-// indistinguishable from a prefix typo. Requiring the explicit
-// "resource:file:///secrets" keeps the policy unambiguous.
+// validateSequenceBlock rejects a sequenceBlock condition whose afterTools list would fail
+// OPEN at runtime: an empty list, an entry naming no tool once stripped/trimmed, or an entry
+// with an unrecognized namespace prefix (looked up under a key no call records). The
+// colon-prefix check is conservative — it also rejects a bare resource URI like
+// "file:///secrets", indistinguishable at load time from a prefix typo.
 func validateSequenceBlock(i, j int, v *capability.SequenceBlockCondition) error {
 	if len(v.AfterTools) == 0 {
 		return fmt.Errorf("capability at index %d, condition %d: sequenceBlock requires a non-empty 'afterTools' list naming the tools whose prior use in the session blocks this call; an empty list never fires and fails closed at runtime", i, j)
@@ -1772,29 +1417,16 @@ func validateSequenceBlock(i, j int, v *capability.SequenceBlockCondition) error
 		if strings.TrimSpace(stripped) == "" {
 			return fmt.Errorf("capability at index %d, condition %d, afterTools entry %d: sequenceBlock entry %q names no tool once its namespace prefix is stripped and surrounding whitespace is trimmed (e.g. \"\", a bare \"tool:\", or \"  \"); use a bare tool name (e.g. read_file) or a tool: prefix (e.g. tool:read_file)", i, j, k, entry)
 		}
-		// A colon-bearing entry stripEnginePrefix returns unchanged is ambiguous:
-		// the text before ':' is not a recognized prefix, so the runtime matches the
-		// whole entry literally. A namespace typo then silently never fires, and a
-		// bare resource URI is indistinguishable from one at load. Require an explicit
-		// prefix (see the doc comment).
+		// A colon-bearing entry stripEnginePrefix returns unchanged is ambiguous: the text
+		// before ':' is not a recognized prefix, so the runtime matches the whole entry
+		// literally and a namespace typo silently never fires. Require an explicit prefix.
 		if strings.Contains(entry, ":") && stripped == entry {
 			return fmt.Errorf("capability at index %d, condition %d, afterTools entry %d: sequenceBlock entry %q is ambiguous: the text before its first ':' is not a recognized namespace prefix (tool:, resource:, prompt:, system:), so the entry is matched literally — a namespace typo like 'mcp:read_file' then silently never fires, and a resource URI must carry the explicit resource: prefix (resource:file:///secrets). Add one of tool:, resource:, prompt:, or system: to disambiguate", i, j, k, entry)
 		}
-		// afterTools is matched LITERALLY against the concrete names recordSessionCall
-		// persisted (splitEnginePrefix + an exact-key Peek), never glob-expanded, for EVERY
-		// namespace including resource:. A wildcard therefore never matches a real recorded
-		// name, so an entry like "read_*" silently fails OPEN — a sequenceBlock that looks
-		// armed but never fires. Reject at load, mirroring the target-pattern glob rejection
-		// (validateTargetPatternBreadth).
-		//
-		// The rejected set is narrower for a resource: entry. A resource URI legitimately
-		// contains '[' (an IPv6 literal host, resource:file://[::1]/x) and '?' (a query
-		// string), and those characters cannot by themselves make an entry look armed while
-		// silently never firing the way a wildcard does — but '*' is a wildcard in a resource
-		// URI exactly as in a tool name, and resource TARGETS legitimately glob, so an author
-		// who globs a target is the most likely to glob an antecedent. Rejecting '*' for
-		// resource: too is what keeps the fail-open closed; exempting only the URI-syntax
-		// characters is what keeps valid antecedents loadable.
+		// afterTools is matched LITERALLY against recorded call names, never glob-expanded,
+		// so a wildcard like "read_*" silently fails OPEN. The rejected set is narrower for a
+		// resource: entry, which legitimately contains '[' (IPv6 host) and '?' (query
+		// string); '*' is still rejected since resource TARGETS legitimately glob.
 		reject := capability.GlobMetaChars
 		if strings.HasPrefix(entry, "resource:") {
 			reject = "*"
@@ -1806,30 +1438,19 @@ func validateSequenceBlock(i, j int, v *capability.SequenceBlockCondition) error
 	return nil
 }
 
-// directiveValidator is the per-type validation one directive needs: its target
-// restriction and its own field checks. i/j are the capability and directive indices for the
-// error message, target/targetType the constraint's target, and dir the (non-nil,
-// non-typed-nil — validateLocalManifest guarantees both before dispatch) directive itself.
+// directiveValidator is the per-type validation one directive needs: its target restriction
+// and its own field checks. dir is guaranteed non-nil, non-typed-nil by validateLocalManifest
+// before dispatch.
 type directiveValidator func(i, j int, target string, targetType capability.TargetType, dir capability.Directive) error
 
 // directiveValidators is the manifest loader's per-directive validation, keyed by the SAME
-// discriminator strings pkg/capability's directivePrototypes registry holds.
+// discriminator strings pkg/capability's directivePrototypes registry holds — not a type
+// switch, whose default-arm message hard-coded the directive list and would name three
+// directives that were not the problem if a fourth were added and forgotten here.
 //
-// It replaces a type switch whose arms — and whose default-arm message, which spelled out
-// "redactFields, labelOutput and declassify" — were two more hand-maintained mirrors of that
-// registry, one package over from the ones the registry already absorbed. A fourth directive
-// added to the registry and forgotten here was refused at load with a message listing three
-// directives that were not the problem: fail-closed, but a diagnostic pointing away from the
-// fault. A map keyed by discriminator makes that a missing key the completeness test names
-// (see the directive-coverage test), and makes the unknown-type message derive from
-// KnownDirectiveTypes rather than restate it.
-//
-// Each entry goes through typedDirective, which honours AsValueOrPointer's ok. Dispatch is
-// on the discriminator the directive REPORTS, not on its Go type, so a value whose
-// DirectiveType() disagrees with its concrete type selects an entry the assertion then
-// fails — and a discarded ok there is a nil dereference, i.e. a fail-closed load error
-// turned into a crash. The type switch this replaced could not reach that state; the
-// adapter is what restores the property.
+// Each entry goes through typedDirective, which honours AsValueOrPointer's ok. Dispatch is on
+// the discriminator the directive REPORTS, not its Go type, so a mismatched DirectiveType()
+// is reported rather than dereferenced as a type it is not.
 var directiveValidators = map[string]directiveValidator{
 	capability.DirectiveTypeRedactFields: typedDirective(func(i, j int, target string, targetType capability.TargetType, d *capability.RedactFieldsDirective) error {
 		// redactFields mutates the tools/call RESPONSE, so it applies only to tool: targets:
@@ -1849,10 +1470,8 @@ var directiveValidators = map[string]directiveValidator{
 		return validateLabelOutput(i, j, d.Labels)
 	}),
 	capability.DirectiveTypeDeclassify: typedDirective(func(i, j int, target string, targetType capability.TargetType, d *capability.DeclassifyDirective) error {
-		// Same target restriction as labelOutput, for the mirror reason: a declassification
-		// is a TRANSFORM — the sanitize/redact/review step whose completion a human approved
-		// — so it sits where data is produced or read. A prompt: fetch or the sampling opt-in
-		// is an egress the agent drives, and clearing a label at an egress launders it at
+		// Same target restriction as labelOutput: a declassification is a TRANSFORM that sits
+		// where data is produced or read; clearing a label at an egress would launder it at
 		// exactly the point the flow layer exists to gate.
 		if err := requireSourceDirectiveTarget(i, target, targetType, capability.DirectiveTypeDeclassify); err != nil {
 			return err
@@ -1861,17 +1480,11 @@ var directiveValidators = map[string]directiveValidator{
 	}),
 }
 
-// typedDirective adapts a per-type validator to the discriminator-keyed table, normalizing
-// the value and pointer decode forms to *T and REPORTING a type that does not match the
-// discriminator it was filed under rather than dereferencing nil.
-//
-// It is the directive twin of validateTypedCondition, and it exists for a reason that only
-// appeared when dispatch moved off the Go type: capability.Directive is an exported
-// interface whose DirectiveType() is self-reported, so a programmatically built manifest —
-// exactly the input the fail-closed arm below exists for, reachable through the exported
-// MergeManifests — can present a directive claiming "redactFields" that is not one. Under
-// the old type switch that landed in the default arm and returned an error; keyed dispatch
-// sends it here, and a discarded ok would panic the loader instead.
+// typedDirective adapts a per-type validator to the discriminator-keyed table, normalizing the
+// value and pointer decode forms to *T and REPORTING a type that does not match the
+// discriminator it was filed under, rather than dereferencing nil — a programmatically built
+// manifest (reachable through MergeManifests) can present a directive whose DirectiveType()
+// lies about its concrete type.
 func typedDirective[T any](check func(i, j int, target string, targetType capability.TargetType, d *T) error) directiveValidator {
 	return func(i, j int, target string, targetType capability.TargetType, dir capability.Directive) error {
 		d, ok := capability.AsValueOrPointer[T](dir)
@@ -1883,27 +1496,17 @@ func typedDirective[T any](check func(i, j int, target string, targetType capabi
 	}
 }
 
-// checkTokenGrammarVersion fails closed if any capability carries a token (per
-// capability.TokenSince) the declared schemaVersion does not admit — so a "0.1" manifest
-// that uses a flow+effect token is rejected (the closed grammar stays closed) rather than
-// silently enabling a predicate that revision does not define. It is the one authoritative
-// grammar-version gate: the per-type validation cases carry no version check, so a new
-// token cannot bypass the gate by omitting one. It runs after the per-capability
-// structural validation, so every condition/directive is non-nil and well-typed and
-// ConditionType()/DirectiveType() cannot panic on a null or typed-nil entry. SchemaVersion
-// is compared trimmed so a quoted, whitespace-padded scalar is judged on its real value.
+// checkTokenGrammarVersion fails closed if any capability carries a token the declared
+// schemaVersion does not admit (per capability.TokenSince) — the one authoritative
+// grammar-version gate, so the per-type validation cases carry no version check and a new
+// token cannot bypass it by omitting one. Runs after the per-capability structural
+// validation, so ConditionType()/DirectiveType() cannot panic on a null or typed-nil entry.
 func checkTokenGrammarVersion(m *LocalManifest) error {
 	declared := strings.TrimSpace(m.SchemaVersion)
-	// The effect layer's two non-condition tokens — the top-level effectCeiling and a
-	// constraint's effect contract — are gated by the same rule. They are not
-	// conditions or directives, so they have no prototype registry entry to carry a Since;
-	// gating them here keeps ONE grammar gate rather than a second one somewhere else that
-	// could be updated out of step.
-	//
-	// Through revisionAdmits, not an equality: a token is admitted by the revision that
-	// introduced it and by every revision published after it, and an equality check refuses
-	// its own token the moment a third revision exists — including a semantics-only one that
-	// introduces nothing. Every gate in this file reads the same rule for that reason.
+	// The effect layer's two non-condition tokens — effectCeiling and a constraint's effect
+	// contract — are gated by the same rule here, since they have no registry entry of
+	// their own. Through revisionAdmits, not an equality, so a semantics-only later
+	// revision does not refuse its own token.
 	if m.EffectCeiling != nil && !revisionAdmits(declared, ManifestSchemaVersion02) {
 		return fmt.Errorf("the top-level effectCeiling was introduced in schemaVersion %q (the flow+effect grammar); this manifest declares schemaVersion %q, under which the key is not part of the grammar", ManifestSchemaVersion02, declared)
 	}
@@ -1922,10 +1525,8 @@ func checkTokenGrammarVersion(m *LocalManifest) error {
 				return err
 			}
 		}
-		// Task-context variables are the batch's third non-discriminator token: they are
-		// VALUES inside a condition that exists in both revisions, so they carry no Since of
-		// their own either. Gated here, beside the other two, so the whole grammar-version
-		// rule is readable in one function.
+		// Task-context variables are VALUES inside a condition that exists in both revisions,
+		// so they carry no Since of their own either; gated here beside the other two.
 		if err := checkTaskVarGrammarVersion(i, c, declared); err != nil {
 			return err
 		}
@@ -1934,9 +1535,8 @@ func checkTokenGrammarVersion(m *LocalManifest) error {
 }
 
 // checkTaskVarGrammarVersion rejects a ${task.*} reference under a revision that does not
-// define it. Validation has already run, so every reference present here is well-formed
-// and recognized; this decides only whether the declared revision admits the surface at
-// all.
+// define it. Validation has already run, so this decides only whether the declared revision
+// admits the surface at all.
 func checkTaskVarGrammarVersion(i int, c *capability.Constraint, declared string) error {
 	if revisionAdmits(declared, ManifestSchemaVersion02) {
 		return nil
@@ -1949,9 +1549,8 @@ func checkTaskVarGrammarVersion(i int, c *capability.Constraint, declared string
 		for _, val := range av.Values {
 			s, isString := val.(string)
 			if !isString || !capability.IsTaskVarRef(s) {
-				// Only a RECOGNIZED reference is a "0.2" token. An unrecognized "${...}"
-				// under "0.1" is a literal that revision has always accepted, so refusing
-				// it here would be a breaking change dressed as a grammar gate.
+				// Only a RECOGNIZED reference is a "0.2" token; an unrecognized "${...}" under
+				// "0.1" is a literal that revision has always accepted.
 				continue
 			}
 			return tokenGrammarVersionErr(i, "the task-context variable "+s, ManifestSchemaVersion02, declared)
@@ -1961,22 +1560,10 @@ func checkTaskVarGrammarVersion(i int, c *capability.Constraint, declared string
 }
 
 // checkTokenRevision decides whether the declared revision admits one token, reading the
-// introducing revision off pkg/capability's prototype registry (capability.TokenSince) — the
-// same entry that declares the token exists at all.
-//
-// A token this build cannot CLASSIFY is refused, under every revision. That is the
-// fail-closed reading of a gate with nothing to gate on, and it reverses the direction the
-// original comma-ok lookup failed in: a token missing from the classification was silently
-// admitted under "0.1", so the one guard whose job is stopping a later revision's predicate
-// from widening an earlier one could be defeated by forgetting a map entry, with nothing
-// anywhere reporting it. The message says what to do, because the only way to reach it is a
-// contributor adding a discriminator to that registry without declaring its Since.
-//
-// The admission rule itself is an ordering over the PUBLISHED SEQUENCE, never over the
-// version strings: a token is admitted by the revision that introduced it and by every
-// revision published after it. See revisionAdmits.
-//
-// kind is "condition" or "directive", for the message only.
+// introducing revision off pkg/capability's prototype registry (capability.TokenSince). A
+// token this build cannot CLASSIFY is refused under every revision — the fail-closed reading
+// of a gate with nothing to gate on, reachable only when a contributor adds a discriminator
+// without declaring its Since. kind is "condition" or "directive", for the message only.
 func checkTokenRevision(i int, token, kind, declared string) error {
 	since, classified := capability.TokenSince(token)
 	if !classified {
@@ -1990,23 +1577,15 @@ func checkTokenRevision(i int, token, kind, declared string) error {
 }
 
 // tokenGrammarVersionErr builds the fail-closed rejection for a token used under a
-// schemaVersion that does not define it.
-//
-// It names the introducing revision and nothing else. It used to call that revision "the
-// flow+effect grammar", which was accurate only while "0.2" was the sole revision that could
-// reach this argument: with inheritance running forward along the published sequence, a token
-// introduced by any later revision reaches it too, and so does a base-grammar token under an
-// unrecognized declared version — both of which the parenthetical would have mislabeled to an
-// operator debugging a refused load.
+// schemaVersion that does not define it. Names the introducing revision and nothing else —
+// naming it "the flow+effect grammar" would mislabel a token introduced by a later revision.
 func tokenGrammarVersionErr(i int, feature, required, declared string) error {
 	return fmt.Errorf("capability at index %d: %s was introduced in schemaVersion %q; this manifest declares schemaVersion %q, under which the token is not part of the grammar", i, feature, required, declared)
 }
 
-// requireResponseDirectiveTarget rejects a response-mutating directive (redactFields)
-// on a non-tool target: the proxy redacts tools/call results only, so such a directive
-// would never apply — a fail-open leak plus a false "discharged" audit record.
-// labelOutput does not go through here; it is an enforce-time state directive valid on
-// any source target.
+// requireResponseDirectiveTarget rejects a response-mutating directive (redactFields) on a
+// non-tool target: the proxy redacts tools/call results only, so it would never apply — a
+// fail-open leak plus a false "discharged" audit record.
 func requireResponseDirectiveTarget(i int, target string, targetType capability.TargetType) error {
 	if targetType != capability.TargetTypeTool {
 		return fmt.Errorf("capability at index %d: constraint %q carries a redactFields directive; redactFields directives apply only to tool: targets (the proxy redacts tools/call results, not %s responses)", i, target, targetType)
@@ -2015,14 +1594,9 @@ func requireResponseDirectiveTarget(i int, target string, targetType capability.
 }
 
 // requireSourceDirectiveTarget restricts the two flow-state directives — labelOutput and
-// declassify — to tool: and resource: source targets, the boundaries a sensitive read or
-// a sanitizing transform sits at. A prompt: or system: target is not a flow SOURCE: a
-// sampling/createMessage request is an egress the agent drives, a place a flowLabel SINK
-// belongs, not a source that asserts new taint (nor one that may clear it — clearing at
-// an egress launders a label at exactly the point the flow layer exists to gate). This
-// restriction is why sampling can only ever be a flow sink, never a concurrent flow
-// writer — see the per-session serialization in internal/transport. Reject at load rather
-// than admit the directive on a non-source target.
+// declassify — to tool: and resource: source targets. A prompt: or system: target is not a
+// flow SOURCE (a sampling/createMessage request is an egress, a flowLabel SINK's place, not
+// one that asserts or clears taint) — this is why sampling can only ever be a flow sink.
 func requireSourceDirectiveTarget(i int, target string, targetType capability.TargetType, directive string) error {
 	if targetType != capability.TargetTypeTool && targetType != capability.TargetTypeResource {
 		return fmt.Errorf("capability at index %d: constraint %q carries a %s directive, which is valid only on tool: or resource: source targets (a %s target is not a flow source)", i, target, directive, targetType)
@@ -2031,9 +1605,8 @@ func requireSourceDirectiveTarget(i int, target string, targetType capability.Ta
 }
 
 // validateFlowLabel checks a flowLabel condition's Allow set against the closed native
-// vocabulary, so a misspelled label is a load-time error rather than an inert entry
-// (the closed grammar is a determinism invariant). An empty Allow is valid — it admits
-// only an unlabeled, clean-context flow (the strictest, fail-closed sink).
+// vocabulary, so a misspelled label is a load-time error rather than an inert entry. An
+// empty Allow is valid — it admits only an unlabeled, clean-context flow.
 func validateFlowLabel(i, j int, allow []string) error {
 	for _, l := range allow {
 		if !capability.IsFlowLabel(l) {
@@ -2043,9 +1616,8 @@ func validateFlowLabel(i, j int, allow []string) error {
 	return nil
 }
 
-// validateLabelOutput checks a labelOutput directive: a non-empty Labels list (an
-// empty one records nothing and is an authoring mistake, like an empty sequenceBlock),
-// every entry drawn from the closed native vocabulary.
+// validateLabelOutput checks a labelOutput directive: a non-empty Labels list (an empty one
+// records nothing and is an authoring mistake), every entry from the closed native vocabulary.
 func validateLabelOutput(i, j int, labels []string) error {
 	if len(labels) == 0 {
 		return fmt.Errorf("capability at index %d, directive %d: labelOutput requires a non-empty 'labels' list naming the native flow labels this call's output carries; an empty list records nothing", i, j)
@@ -2059,10 +1631,8 @@ func validateLabelOutput(i, j int, labels []string) error {
 }
 
 // validateDeclassify checks a declassify directive's label list against the closed native
-// vocabulary, mirroring validateLabelOutput. An empty list is rejected for a sharper
-// reason than labelOutput's: a declassify directive that clears nothing still ESCALATES
-// every call it sits on (the approval check runs on the directive's presence), so the
-// author would get a permanently-refused capability with no way to satisfy it.
+// vocabulary. An empty list is rejected for a sharper reason than labelOutput's: it clears
+// nothing yet still ESCALATES every call it sits on, leaving a permanently-refused capability.
 func validateDeclassify(i, j int, labels []string) error {
 	if len(labels) == 0 {
 		return fmt.Errorf("capability at index %d, directive %d: declassify requires a non-empty 'labels' list naming the native flow labels this action clears; an empty list clears nothing while still requiring an approval, so the capability could never be satisfied", i, j)
@@ -2075,19 +1645,13 @@ func validateDeclassify(i, j int, labels []string) error {
 	return nil
 }
 
-// validateDeclassifyCoherence rejects the two constraint shapes a declassify directive
-// cannot mean anything sensible in. Both are load errors rather than runtime surprises,
-// because both would produce a policy whose written intent and enforced behavior differ.
+// validateDeclassifyCoherence rejects the two constraint shapes a declassify directive cannot
+// mean anything sensible in, both load errors rather than runtime surprises:
 //
-//  1. declassify together with labelOutput on ONE constraint. The two write the same
-//     session state in opposite directions on the same call, and the order in which they
-//     resolve would silently decide the outcome (assert-then-clear leaves nothing;
-//     clear-then-assert leaves everything). An author who wants a source read that carries
-//     a different label than it clears writes two constraints.
-//  2. more than one declassify directive on one constraint. Two grants' worth of labels
-//     on one action reads as "either approval suffices" but enforces as "one approval must
-//     cover the union" — the stricter reading, arrived at by accident. One directive
-//     listing every label says the same thing unambiguously.
+//  1. declassify together with labelOutput on ONE constraint — the two write the same
+//     session state in opposite directions, and evaluation order would silently decide it.
+//  2. more than one declassify directive on one constraint — reads as "either approval
+//     suffices" but enforces as "one approval must cover the union", arrived at by accident.
 func validateDeclassifyCoherence(i int, c *capability.Constraint) error {
 	count := 0
 	for _, dir := range c.Directives {
@@ -2109,10 +1673,8 @@ func validateDeclassifyCoherence(i int, c *capability.Constraint) error {
 	return nil
 }
 
-// validatePrincipal checks a constraint's principal scoping: every claim name
-// must be one eunox can match on (SupportedPrincipalClaims) and must list at least
-// one non-empty pattern, so a typo'd claim name (which would silently never match)
-// is caught at load.
+// validatePrincipal checks a constraint's principal scoping: every claim name must be one
+// eunox can match on and must list at least one non-empty pattern, catching a typo at load.
 func validatePrincipal(principal map[string][]string) error {
 	if len(principal) == 0 {
 		return nil
@@ -2128,8 +1690,8 @@ func validatePrincipal(principal map[string][]string) error {
 			if strings.TrimSpace(p) == "" {
 				return fmt.Errorf("principal claim %q has an empty value", claimName)
 			}
-			// Reject a malformed glob at load: PrincipalMatches skips an
-			// ErrBadPattern pattern, so an invalid glob would silently never match.
+			// PrincipalMatches skips an ErrBadPattern pattern, so an invalid glob would
+			// silently never match; reject it at load instead.
 			if _, err := stdpath.Match(p, ""); err != nil {
 				return fmt.Errorf("principal claim %q has an invalid pattern %q: %w", claimName, p, err)
 			}
@@ -2138,33 +1700,25 @@ func validatePrincipal(principal map[string][]string) error {
 	return nil
 }
 
-// checkManifestKeys rejects unknown keys anywhere in the manifest. The typed
-// json.Unmarshal in LoadManifest is intentionally lenient at the struct level (those
-// types are shared with IdP-issued JWT capability claims, which tolerate unknown
-// fields), so without this a typo'd key (`arguments` for `argument`) would be silently
-// dropped. Conditions and directives are the exception — unmarshalCondition and
-// unmarshalDirective reject an unknown field themselves — but this walk still runs
-// first, because only it can name the offending path and suggest the intended key. The
-// manifest is the security-critical surface, so fail closed on any unrecognized
-// key. argumentSchema keywords are checked recursively by
+// checkManifestKeys rejects unknown keys anywhere in the manifest. The typed json.Unmarshal
+// in LoadManifest is intentionally lenient at the struct level (those types are shared with
+// IdP-issued JWT capability claims, which tolerate unknown fields), so without this a typo'd
+// key would be silently dropped. This walk runs first because only it can name the offending
+// path and suggest the intended key. argumentSchema keywords are checked by
 // checkArgumentSchemaKeywords.
 func checkManifestKeys(data []byte) error {
 	var root map[string]interface{}
 	if err := json.Unmarshal(data, &root); err != nil {
-		// Not a JSON object, so there are no keys to walk. Returning nil here is NOT a
-		// judgement that the manifest is acceptable — LoadManifest's typed decode, which
-		// runs immediately after this check, rejects a non-object document. Do not read
-		// this as "some other check owns it": if this function is ever called from a path
-		// with no following typed decode, that path must reject a non-object itself.
+		// Not a JSON object, so there are no keys to walk. NOT a judgement that the manifest
+		// is acceptable — LoadManifest's typed decode, which runs immediately after this
+		// check, rejects a non-object document.
 		return nil //nolint:nilerr // a non-object document has no key structure to validate
 	}
 	if err := checkObjectKeys("", root, jsonFieldKeys(reflect.TypeOf(LocalManifest{}))); err != nil {
 		return err
 	}
-	// The effect layer's nested objects (a constraint's effect block, the top-level
-	// effectCeiling) are walked by their own checker: checkObjectKeys above covers only
-	// the top-level key of each, and a typo INSIDE one decodes to nothing while looking
-	// like a declaration.
+	// The effect layer's nested objects are walked by their own checker: checkObjectKeys
+	// above covers only the top-level key of each.
 	if err := checkEffectKeys(root); err != nil {
 		return err
 	}
@@ -2234,16 +1788,11 @@ var validJSONSchemaTypeNames = map[string]bool{
 }
 
 // validateSchemaTypeValue checks a raw (not-yet-typed) `type` keyword value.
-// capability.SchemaType.UnmarshalJSON accepts any string, array, or null and
-// normalizes an empty array the same as "no type declared" (SchemaType.IsZero),
-// which silently disables ValidateArgumentSchema's type check — a numeric argument
-// then never reaches schemaValidateString, so a string-only `pattern` is silently
-// bypassed. This walks the RAW decoded value (a map key present with an empty/
-// invalid value is NOT the same as the key being absent, but the typed SchemaType
-// cannot tell them apart) and rejects the shapes that would silently weaken the
-// declared policy: an empty array, an empty string, an unrecognized type name, and
-// a duplicate name within an array. `type` is optional — an absent key, or an
-// explicit `null`, means no type constraint and is valid.
+// capability.SchemaType.UnmarshalJSON normalizes an empty array the same as "no type
+// declared", silently disabling the type check — this walks the RAW decoded value (which the
+// typed SchemaType cannot distinguish from an absent key) and rejects the shapes that would
+// silently weaken the declared policy. `type` is optional; an absent key or explicit `null`
+// is valid.
 func validateSchemaTypeValue(path string, raw interface{}) error {
 	switch v := raw.(type) {
 	case nil:
@@ -2287,11 +1836,9 @@ func validateSchemaTypeValue(path string, raw interface{}) error {
 	}
 }
 
-// argumentSchemaKeywords is the closed set of JSON-Schema keywords an
-// argumentSchema may use. Anything outside it is rejected at load (recursively
-// through properties and items), so an unsupported keyword (const, $ref, allOf,
-// format, …) is flagged rather than silently unenforced. Keep in sync with
-// capability.ArgumentSchema and the runtime validator in pkg/enforcement/schema.go.
+// argumentSchemaKeywords is the closed set of JSON-Schema keywords an argumentSchema may use.
+// Anything outside it is rejected recursively (through properties and items). Keep in sync
+// with capability.ArgumentSchema and pkg/enforcement/schema.go.
 var argumentSchemaKeywords = map[string]bool{
 	"type":                 true,
 	"enum":                 true,
@@ -2309,11 +1856,9 @@ var argumentSchemaKeywords = map[string]bool{
 	"description":          true,
 }
 
-// validateArgumentSchemaConsistency rejects a structurally unsatisfiable
-// argumentSchema. When `additionalProperties` is false, every `required` name must
-// appear in `properties`; otherwise the field is both required and forbidden, so
-// every call is denied with a confusing "additional property" error. Recurses
-// through `properties` and `items`.
+// validateArgumentSchemaConsistency rejects a structurally unsatisfiable argumentSchema. When
+// `additionalProperties` is false, every `required` name must appear in `properties`, or the
+// field is both required and forbidden. Recurses through `properties` and `items`.
 func validateArgumentSchemaConsistency(path string, s *capability.ArgumentSchema) error {
 	if s == nil {
 		return nil
@@ -2325,8 +1870,8 @@ func validateArgumentSchemaConsistency(path string, s *capability.ArgumentSchema
 			}
 		}
 	}
-	// Recurse into nested subschemas, visiting properties in a stable order so
-	// the reported error is deterministic.
+	// Recurse into nested subschemas, visiting properties in a stable order for a
+	// deterministic error.
 	names := make([]string, 0, len(s.Properties))
 	for name := range s.Properties {
 		names = append(names, name)
@@ -2334,16 +1879,11 @@ func validateArgumentSchemaConsistency(path string, s *capability.ArgumentSchema
 	sort.Strings(names)
 	for _, name := range names {
 		sub := s.Properties[name]
-		// Reject an explicit null subschema (`properties: {x: null}`): it decodes to
-		// a nil *ArgumentSchema, which the validator treats as "any", so the declared
-		// property silently accepts any value/type — a structural footgun where the
-		// author meant to constrain x. The empty object `{}` is the correct
-		// JSON-Schema "any" and decodes to a non-nil zero-value schema, so it is still
-		// accepted; only the anomalous null form is refused, matching this file's
-		// "reject ambiguous schema up front" posture. The sibling `items: null` is the
-		// same footgun for array elements but is rejected in checkArgumentSchemaKeywords
-		// instead — the typed Items pointer collapses present-null and absent to nil, so
-		// only the raw layer (which still sees the key) can tell them apart.
+		// Reject an explicit null subschema (`properties: {x: null}`): it decodes to a nil
+		// *ArgumentSchema, which the validator treats as "any" — a structural footgun. The
+		// empty object `{}` is still accepted; only the anomalous null form is refused. The
+		// sibling `items: null` is rejected in checkArgumentSchemaKeywords instead, since only
+		// the raw layer can tell present-null from absent.
 		if sub == nil {
 			return fmt.Errorf("%s.properties.%s: property has a null schema, which would accept any value for the declared property — use an empty object {} for an explicit \"any\" subschema, or give the property a concrete schema", path, name)
 		}
@@ -2359,16 +1899,12 @@ func validateArgumentSchemaConsistency(path string, s *capability.ArgumentSchema
 	return nil
 }
 
-// checkArgumentSchemaKeywords walks an argumentSchema node (raw, as decoded from
-// the manifest) and rejects the first keyword outside argumentSchemaKeywords,
-// with a path-qualified error such as
-// `capabilities[2].argumentSchema.properties.path: unknown keyword "format"`.
-// It recurses into every subschema reachable through `properties` (one per
-// named property) and `items`. A non-object node (e.g. a `type` array element)
-// is not a schema and is left to the typed decode. It also rejects an explicit
-// null `items` subschema (the array-element counterpart of the null-property
-// rejection in validateArgumentSchemaConsistency), which can only be detected here
-// because the typed Items pointer cannot distinguish present-null from absent.
+// checkArgumentSchemaKeywords walks an argumentSchema node (raw, as decoded from the
+// manifest) and rejects the first keyword outside argumentSchemaKeywords, recursing into
+// every subschema reachable through `properties` and `items`. It also rejects an explicit
+// null `items` subschema — the array-element counterpart of the null-property rejection in
+// validateArgumentSchemaConsistency, detectable only here since the typed Items pointer
+// cannot distinguish present-null from absent.
 func checkArgumentSchemaKeywords(path string, raw interface{}) error {
 	obj, ok := raw.(map[string]interface{})
 	if !ok {
@@ -2392,8 +1928,7 @@ func checkArgumentSchemaKeywords(path string, raw interface{}) error {
 			return err
 		}
 	}
-	// Recurse into nested subschemas. properties is an object of name→subschema;
-	// items is a single subschema.
+	// properties is an object of name→subschema; items is a single subschema.
 	if props, ok := obj["properties"].(map[string]interface{}); ok {
 		names := make([]string, 0, len(props))
 		for name := range props {
@@ -2407,15 +1942,9 @@ func checkArgumentSchemaKeywords(path string, raw interface{}) error {
 		}
 	}
 	if items, ok := obj["items"]; ok {
-		// Reject an explicit null items subschema (`items: null`): like a null property
-		// subschema it would accept any array element unchecked, the same footgun
-		// validateArgumentSchemaConsistency rejects for `properties: {x: null}`. It is
-		// caught HERE rather than there because the typed *ArgumentSchema cannot see it:
-		// Items is a single pointer, so a present-but-null items decodes identically to an
-		// absent one (both nil), whereas the typed Properties map distinguishes the two by
-		// key membership. This raw layer still has the key present, so it can tell `items:
-		// null` (reject) from an absent items (fine); `items: {}` is the explicit "any
-		// element" and is a non-nil empty object that recurses cleanly.
+		// Reject an explicit null items subschema (`items: null`): the typed Items pointer
+		// cannot distinguish present-null from absent, so this raw layer catches it instead.
+		// `items: {}` is the explicit "any element" and recurses cleanly.
 		if items == nil {
 			return fmt.Errorf("%s.items: array element schema is null, which would accept any element — use an empty object {} for an explicit \"any\" element schema, or give items a concrete schema", path)
 		}
@@ -2426,9 +1955,8 @@ func checkArgumentSchemaKeywords(path string, raw interface{}) error {
 	return nil
 }
 
-// checkObjectKeys reports the first key in obj that is not in allowed, in
-// deterministic (sorted) order so the error is stable. When a near match
-// exists, it is offered as a "did you mean" hint.
+// checkObjectKeys reports the first key in obj that is not in allowed, in deterministic
+// (sorted) order. When a near match exists, it is offered as a "did you mean" hint.
 func checkObjectKeys(path string, obj map[string]interface{}, allowed map[string]bool) error {
 	keys := make([]string, 0, len(obj))
 	for k := range obj {
@@ -2451,8 +1979,8 @@ func checkObjectKeys(path string, obj map[string]interface{}, allowed map[string
 	return nil
 }
 
-// jsonFieldKeys returns the set of JSON object keys declared by struct type t,
-// derived from its `json:"..."` field tags.
+// jsonFieldKeys returns the set of JSON object keys declared by struct type t, derived from
+// its `json:"..."` field tags.
 func jsonFieldKeys(t reflect.Type) map[string]bool {
 	if t.Kind() == reflect.Pointer {
 		t = t.Elem()
@@ -2460,10 +1988,9 @@ func jsonFieldKeys(t reflect.Type) map[string]bool {
 	out := make(map[string]bool, t.NumField())
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
-		// An unexported, non-anonymous field is never a valid JSON key (encoding/json
-		// ignores it), so skip it — this keeps a runtime-only field like
-		// IPRangeCondition.parsed from being mistaken for a permitted manifest key.
-		// Anonymous embeds fall through to the promotion handling below.
+		// An unexported, non-anonymous field is never a valid JSON key, so skip it — this
+		// keeps a runtime-only field like IPRangeCondition.parsed from being mistaken for a
+		// permitted manifest key.
 		if !f.IsExported() && !f.Anonymous {
 			continue
 		}
@@ -2475,9 +2002,8 @@ func jsonFieldKeys(t reflect.Type) map[string]bool {
 		if comma := strings.IndexByte(tag, ','); comma >= 0 {
 			name = tag[:comma]
 		}
-		// An untagged embedded struct promotes its JSON keys to the parent
-		// object, so its own fields are the valid keys — not the embed's type
-		// name. (A tagged embed nests under the tag and is treated as one key.)
+		// An untagged embedded struct promotes its JSON keys to the parent object, so its
+		// own fields are the valid keys, not the embed's type name.
 		if name == "" && f.Anonymous {
 			ft := f.Type
 			if ft.Kind() == reflect.Pointer {
@@ -2498,15 +2024,10 @@ func jsonFieldKeys(t reflect.Type) map[string]bool {
 	return out
 }
 
-// conditionKeysFor returns the permitted key set for a condition of the given
-// discriminator type (always including "type"). The second result is false for a
-// type this build does not model; the caller then skips key checking (the unknown
-// type is already rejected by the typed decode).
-//
-// The prototype comes from pkg/capability's ONE condition registry rather than a
-// reflect.TypeOf switch mirrored here. The mirror was a second table to update per new
-// condition type, and one that failed silently: a type missing from it returned "not
-// known", so its keys went unchecked and a typo in it loaded clean.
+// conditionKeysFor returns the permitted key set for a condition of the given discriminator
+// type (always including "type"). The second result is false for a type this build does not
+// model. The prototype comes from pkg/capability's ONE condition registry rather than a
+// hand-mirrored switch, which failed silently by leaving a missing type's keys unchecked.
 func conditionKeysFor(condType string) (map[string]bool, bool) {
 	proto, known := capability.NewConditionPrototype(condType)
 	if !known {
@@ -2518,12 +2039,8 @@ func conditionKeysFor(condType string) (map[string]bool, bool) {
 }
 
 // directiveKeysFor mirrors conditionKeysFor for directives — and, like it, reads the ONE
-// registry rather than a hand-written type switch.
-//
-// The switch it replaced was a fail-open: the caller skips the unknown-key check for a
-// type this returns "not known" for, so a directive whose arm someone forgot to add would
-// silently accept a misspelled field and load it as an empty value — exactly the shape the
-// unknown-key check exists to reject.
+// registry rather than a hand-written type switch, which was a fail-open: a forgotten arm let
+// a misspelled field load as an empty value.
 func directiveKeysFor(dirType string) (map[string]bool, bool) {
 	proto, known := capability.NewDirectivePrototype(dirType)
 	if !known {
@@ -2535,10 +2052,8 @@ func directiveKeysFor(dirType string) (map[string]bool, bool) {
 }
 
 // validateDescriptionHashFormat reports an error if s is not a valid
-// "sha256:<64 lowercase hex chars>" description hash value. It delegates to
-// capability.ValidateSHA256Pin, which the effect layer's ref pin also uses, so the two
-// pins cannot drift on what a valid digest is — the package that owns the digest owns
-// its format.
+// "sha256:<64 lowercase hex chars>" description hash value. Delegates to
+// capability.ValidateSHA256Pin, which the effect layer's ref pin also uses.
 func validateDescriptionHashFormat(s string) error {
 	return capability.ValidateSHA256Pin("descriptionHash", s)
 }

@@ -382,8 +382,7 @@ func (l *lazyFileReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// close releases the fd (if any) and marks the reader done. Idempotent, so the
-// VerifyLogFiles backstop can call it unconditionally.
+// close is idempotent, so the VerifyLogFiles backstop can call it unconditionally.
 func (l *lazyFileReader) close() {
 	if l.f != nil {
 		_ = l.f.Close()

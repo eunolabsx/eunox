@@ -2,10 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Per-route state for the multi-upstream gateway: what is a per-process scalar on
-// HTTPProxy in single-upstream mode (upstream wiring, PDP, manifest, audit-mode
-// flag) becomes per route here, so one HTTPProxy can front N upstreams. The
-// shared audit sink is wrapped by a routeSink that stamps each record with the
-// route name and the in-force policy version/digest.
+// HTTPProxy in single-upstream mode becomes per-route here, so one HTTPProxy can front N
+// upstreams. The shared audit sink is wrapped by a routeSink that stamps each record with
+// the route name and the in-force policy version/digest.
 
 package transport
 
@@ -47,70 +46,55 @@ type UpstreamRoute struct {
 	audit      bool                  // observe mode: evaluate and log, but forward instead of block
 	driftCheck drift.CheckFunc       // set inside BuildRoutes from its driftCheckFor hook; nil = no drift checking
 
-	// honorAttribution is set when the route's policy opts into the flow+effect draft
-	// grammar, which is what admits the client-supplied attribution interface (the
-	// io.eunolabs.context-manifest block in a request's _meta). It is the runtime half of
-	// the same grammar-version discipline checkTokenGrammarVersion applies at load: that gate
-	// cannot cover this token because the token never appears in a manifest, so a route
-	// running the published grammar must ignore the block rather than act on it. Read-only
-	// after BuildRoutes. See (*config.LocalManifest).HonorsAttributionInterface.
+	// honorAttribution opts a route into the flow+effect draft grammar, admitting the
+	// client-supplied io.eunolabs.context-manifest block in a request's _meta. Runtime
+	// half of checkTokenGrammarVersion's load-time gate, which can't cover this since the
+	// token never appears in a manifest. Read-only after BuildRoutes.
 	honorAttribution bool
 
-	// receipts verifies the signed effect receipts this upstream publishes in a tool
-	// result's `_meta`, against the key domain the operator configured for THIS upstream.
-	// nil (the default) means no key domain is configured, and Verify then returns nil
-	// without parsing anything — so a route that did not opt in pays nothing at all.
-	// Read-only after BuildRoutes.
+	// receipts verifies this upstream's signed effect receipts against the operator-
+	// configured key domain for it. nil (default, no key domain configured) means Verify
+	// returns nil without parsing anything, so an opted-out route pays nothing. Read-only
+	// after BuildRoutes.
 	receipts *capability.EffectReceiptVerifier
 
-	// taskAnchored mirrors the engine's WithTaskAnchoredState for this route. The transport
-	// needs it for ONE decision — which key a request's decision turn is taken on — because
-	// the turn has to span the anchor the state accrues to, and under task anchoring that is
-	// not the session. Read-only after BuildRoutes.
+	// taskAnchored mirrors the engine's WithTaskAnchoredState for this route: the
+	// transport needs it to pick which key a request's decision turn is taken on, since
+	// under task anchoring that isn't the session. Read-only after BuildRoutes.
 	taskAnchored bool
 
-	// decideGates hands out this route's decision turn — the PDP decision and its state
-	// write, NOT the upstream forward — one gate per ANCHOR, so two sessions sharing a task
-	// share it. Non-nil exactly when the route's policy is flow- or sequenceBlock-relevant
-	// (both read accumulated state a source writes and a later call reads); nil keeps full
-	// decision parallelism, and is what serializes() reports on.
+	// decideGates hands out this route's decision turn (the PDP decision + state write,
+	// not the upstream forward) — one gate per ANCHOR, so two sessions sharing a task
+	// share it. Non-nil exactly when the policy is flow- or sequenceBlock-relevant; nil
+	// keeps full decision parallelism.
 	//
-	// Its presence IS the flag. A separate serializeDecisions bool beside it was a pair that
-	// had to be set together, whose disagreement is silent in the direction that matters: a
-	// route marked serialized with no registry runs every decision unserialized, which is the
-	// source->sink race the turn exists to close. Read-only after BuildRoutes (the registry
-	// itself is internally synchronized).
+	// Its presence IS the flag: a separate serializeDecisions bool beside it could
+	// silently disagree, running every decision unserialized despite being marked
+	// serialized — the source->sink race the turn exists to close. Read-only after
+	// BuildRoutes (the registry itself is internally synchronized).
 	decideGates *anchorGates
 
-	// Policy provenance is captured once at load and lives only on sink, which is the
-	// sole runtime consumer (it stamps every audit record). Keeping one authoritative
-	// home avoids a route-side copy drifting from what the audit tape records.
+	// Policy provenance is captured once at load and lives only on sink, the sole runtime
+	// consumer, to avoid a route-side copy drifting from what the audit tape records.
 
 	sink *routeSink
 
 	// upstreamTransport is the shared *http.Transport for this route's remote-HTTP
-	// upstream, built once (guarded by upstreamTransportOnce) and reused across all of
-	// the route's client sessions so warm TCP/TLS connections are pooled instead of a
-	// fresh handshake per session. Idle-conn accumulation under session churn is bounded
-	// by the transport's IdleConnTimeout/MaxIdleConnsPerHost, not a per-session
-	// CloseIdleConnections. nil for a stdio route (and until the first remote session).
+	// upstream, built once (upstreamTransportOnce) and reused across the route's client
+	// sessions so warm TCP/TLS connections are pooled instead of a fresh handshake per
+	// session. nil for a stdio route (and until the first remote session).
 	//
-	// Atomic rather than a plain field because the two accessors run concurrently at
-	// shutdown: closeIdleUpstreamConns is deferred until after srv.Shutdown, which
-	// returns on TIMEOUT with straggler handlers still executing — one of which may be
-	// inside sharedUpstreamTransport's Do, mid-write. A plain field would make that a
-	// -race-detectable write/read pair with a possible torn or nil observation. The Once
-	// still guarantees exactly one build; the atomic only makes the publish visible.
-	// (Reading through the same Once would also close the race, but a shutdown that won
-	// the Do would then permanently hand every straggler a nil transport, silently
-	// demoting them to http.DefaultTransport and dropping this route's TLS settings.)
+	// Atomic rather than a plain field: closeIdleUpstreamConns runs at shutdown
+	// concurrently with a straggler handler still mid-write inside Do — a plain field
+	// would make that a -race-detectable torn/nil read. The Once still guarantees exactly
+	// one build; the atomic only makes the publish visible.
 	upstreamTransport     atomic.Pointer[http.Transport]
 	upstreamTransportOnce sync.Once
 }
 
 // sharedUpstreamTransport lazily builds (once) and returns this route's shared
-// *http.Transport for its remote-HTTP upstream. upstreamTimeMs is the proxy-global
-// per-call budget, constant for the proxy's lifetime, so a single build is correct.
+// *http.Transport for its remote-HTTP upstream. upstreamTimeMs is constant for the
+// proxy's lifetime, so a single build is correct.
 func (r *UpstreamRoute) sharedUpstreamTransport(upstreamTimeMs int) *http.Transport {
 	r.upstreamTransportOnce.Do(func() {
 		r.upstreamTransport.Store(buildUpstreamTransport(r.upstreamTLSSkipVerify, upstreamTimeMs))
@@ -118,25 +102,21 @@ func (r *UpstreamRoute) sharedUpstreamTransport(upstreamTimeMs int) *http.Transp
 	return r.upstreamTransport.Load()
 }
 
-// closeIdleUpstreamConns releases the route's shared upstream connection pool, called at
-// proxy shutdown so idle sockets are freed promptly rather than lingering to process
-// exit. A route that never opened a remote session (nil transport) is a no-op.
+// closeIdleUpstreamConns releases the route's shared upstream connection pool at proxy
+// shutdown. A route that never opened a remote session (nil transport) is a no-op.
 //
-// The load is atomic because this runs concurrently with sharedUpstreamTransport's
-// publish (see the field's comment): srv.Shutdown can return on timeout with a straggler
-// handler still building the transport. Losing that race is benign — a transport
-// published after this load simply keeps its idle conns until process exit, which is
-// immediate here — while reading it unsynchronized would be an actual data race.
+// The load is atomic because this can race sharedUpstreamTransport's publish (see the
+// field's comment); losing that race is benign (the transport just keeps its idle conns
+// until the imminent process exit), but an unsynchronized read would be a real data race.
 func (r *UpstreamRoute) closeIdleUpstreamConns() {
 	if t := r.upstreamTransport.Load(); t != nil {
 		t.CloseIdleConnections()
 	}
 }
 
-// routeSink wraps the shared *audit.Sink with one route's identity so handler
-// call-sites keep the same Record(...) signature; the route name and policy
-// version/digest are injected here. A nil sink (audit log failed to open) is a
-// no-op.
+// routeSink wraps the shared *audit.Sink with one route's identity so handler call-sites
+// keep the same Record(...) signature; the route name and policy version/digest are
+// injected here. A nil sink (audit log failed to open) is a no-op.
 type routeSink struct {
 	sink          *audit.Sink
 	upstream      string
@@ -213,12 +193,10 @@ func (r *routeSink) RecordDeny(ctx context.Context, sessionID, identifier, metho
 	})
 }
 
-// AuditDegraded delegates to the shared sink so the --require-audit=strict gate
-// sees the same drop/write-failure state for every route. detail carries the
-// discrete counts for the structured deny record (reason stays prose, host-facing
-// only). A nil receiver or nil sink reports healthy, mirroring RecordAllow/RecordDeny's
-// guard so the three methods treat a missing sink identically: a strict proxy whose
-// sink failed to open is refused at startup, so the runtime gate never observes one.
+// AuditDegraded delegates to the shared sink so the --require-audit=strict gate sees the
+// same drop/write-failure state for every route. A nil receiver or nil sink reports
+// healthy, matching RecordAllow/RecordDeny's guard: a strict proxy whose sink failed to
+// open is refused at startup, so the runtime gate never actually observes one.
 func (r *routeSink) AuditDegraded() (degraded bool, reason string, detail map[string]interface{}) {
 	if r == nil || r.sink == nil {
 		return false, "", nil
@@ -242,11 +220,9 @@ func ResolveStrictDrift(configured, globalFlag, policed bool) bool {
 // (BuildRoutes) and stdio-host (StdioProxy.connectUpstream) NOTICEs cannot drift.
 const serverInitiatedMethods = "roots/list, elicitation/create, sampling/createMessage"
 
-// mountClause renders the " on /mcp/<name>" suffix a startup notice appends to name the
-// gateway route a message concerns, or "" for the single stdio upstream (no route
-// mount, since it isn't reachable at a /mcp/<name> path). Single-sourced so
-// printRemoteUpstreamNotice and PrintRoutePolicyNotices cannot spell the mount
-// convention two different ways.
+// mountClause renders the " on /mcp/<name>" suffix a startup notice appends, or "" for the
+// single stdio upstream. Single-sourced so printRemoteUpstreamNotice and
+// PrintRoutePolicyNotices can't spell the mount convention two different ways.
 func mountClause(routePath string) string {
 	if routePath == "" {
 		return ""
@@ -287,19 +263,17 @@ func PrintRoutePolicyNotices(w io.Writer, name, routePath string, auditOnlyCount
 			name, auditOnlyCount, mount)
 	}
 	if auditMode {
-		// Name the ENFORCED set, not the whole dispatch table: initialize and ping are
-		// answered locally and never reach the upstream or the tape, and the …/list
-		// flavors forward the catalog unfiltered and are recorded as enumeration events,
-		// so a banner that swept all of them into "forwarded and logged" traded one
-		// over-claim for another.
+		// Name the ENFORCED set, not the whole dispatch table: initialize/ping are
+		// answered locally and never reach the upstream or the tape, and …/list forwards
+		// the catalog unfiltered as an enumeration event — sweeping all of them into
+		// "forwarded and logged" would over-claim.
 		_, _ = fmt.Fprintf(w,
 			"[eunox] AUDIT MODE: upstream %q%s runs in observe mode — its policy is evaluated but NOT enforced; every enforced call (%s) is forwarded and logged, and …/list forwards the full upstream catalog unfiltered.\n",
 			name, mount, enforcedMethodSummary)
-		// "Denied" is scoped to a host REQUEST. A method outside the dispatch table that
-		// arrives as a host notification, or as a server-initiated request from the
-		// upstream, is not routed through dispatchRequest at all — saying otherwise would
-		// tell an operator that sampling/createMessage (an enforced method that observe
-		// mode downgrades and FORWARDS) is blocked on this route.
+		// "Denied" is scoped to a host REQUEST — a method outside the dispatch table
+		// arriving as a notification or server-initiated request never reaches
+		// dispatchRequest, so saying otherwise would claim sampling/createMessage (which
+		// observe mode forwards) is blocked here.
 		_, _ = fmt.Fprintf(w,
 			"[eunox] AUDIT MODE: upstream %q%s — observe mode does NOT lift the fail-closed default: a host REQUEST naming a method eunox does not dispatch (%s) is still denied and recorded, and the kill switch still hard-blocks. Server-initiated requests are decided separately (see sampling/createMessage).\n",
 			name, mount, unmappedMethodExamples)
@@ -330,20 +304,17 @@ func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability
 			upstreamAuthHeader:    u.UpstreamAuthHeader,
 			upstreamTLSSkipVerify: u.UpstreamTLSSkipVerify,
 			audit:                 cfg.AuditModeFor(u),
-			// Placeholder only — always overwritten below before the route serves any
-			// request. DenyAllPDP matches the package's no-policy-default posture (an
-			// AlwaysAllowPDP placeholder would silently allow everything if a future
-			// change ever left it unreplaced).
+			// Placeholder only, always overwritten below. DenyAllPDP matches the
+			// package's no-policy-default posture; an AlwaysAllowPDP placeholder would
+			// silently allow everything if a future change left it unreplaced.
 			pdp: pdp.DenyAllPDP{},
 		}
 
 		// The upstream's own receipt-signing key domain, loaded ONCE at startup from a
-		// local file — no fetch here or anywhere else. A configured-but-unreadable key set
-		// is fatal rather than a route that silently records every receipt as unverifiable:
-		// an operator who wired a key domain asked for the check, and a typo'd path that
-		// degraded to "no receipt ever verifies" is indistinguishable from a server that
-		// stopped signing. Absent (the default) leaves the verifier nil, and the whole
-		// surface costs nothing.
+		// local file (no fetch anywhere). A configured-but-unreadable key set is fatal
+		// rather than a route that silently records every receipt as unverifiable —
+		// indistinguishable from a server that stopped signing. Absent leaves the
+		// verifier nil at no cost.
 		receipts, err := LoadEffectReceiptVerifier(cfg.BaseDir, u.EffectReceiptKeys)
 		if err != nil {
 			return nil, fmt.Errorf("upstream %q: %w", u.Name, err)
@@ -351,9 +322,8 @@ func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability
 		r.receipts = receipts
 
 		// Fail-closed per-upstream startup guards (config-declared strictDrift requires
-		// a policy; a policyless route must be in audit mode — otherwise it would
-		// silently allow every call unenforced). Single-sourced in config so this
-		// gateway and the stdio host (serveStdioHost) cannot drift on what they refuse.
+		// a policy; a policyless route must be in audit mode). Single-sourced in config
+		// so this gateway and the stdio host (serveStdioHost) cannot drift.
 		if err := cfg.StartupPolicyError(u); err != nil {
 			return nil, err
 		}
@@ -367,35 +337,28 @@ func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability
 		r.pdp = dp
 		r.manifest = manifest
 		r.taskAnchored = taskAnchored
-		// Serialize this route's decision phase when its policy accumulates state one call
-		// writes and a later one reads, so a source's write is ordered before a later sink's
-		// read on the same anchor under concurrent in-flight requests. A policy that
-		// accumulates nothing keeps full decision parallelism (no registry, and serializes()
-		// reports false).
+		// Serialize this route's decision phase when its policy accumulates state one
+		// call writes and a later one reads, so a source's write orders before a later
+		// sink's read on the same anchor under concurrent requests. A non-accumulating
+		// policy keeps full decision parallelism (no registry, serializes() false).
 		//
-		// The predicate is config's NeedsDecisionTurn, the same one the stdio host consults.
-		// Spelled out at both sites it was a mirrored condition whose failure is silent: a
-		// third state-accumulating token added to one copy leaves one transport serializing
-		// and the other racing, with nothing failing to say so.
+		// The predicate is config's NeedsDecisionTurn, shared with the stdio host so a
+		// third state-accumulating token can't leave one transport serializing and the
+		// other racing silently.
 		//
-		// The registry is per ROUTE, not per session: the turn has to span the anchor the
-		// state accrues to, and under task anchoring two sessions can share one. Per route
-		// rather than per proxy because routes namespace their own state, so identical task
-		// ids on two routes address different buckets and must not queue behind each other.
+		// The registry is per ROUTE, not per session, because the turn has to span the
+		// anchor the state accrues to — identical task ids on two routes must address
+		// different buckets.
 		if manifest.NeedsDecisionTurn() {
 			r.decideGates = newAnchorGates()
 		}
 		r.honorAttribution = manifest.HonorsAttributionInterface()
-		// strictDrift is used only to build this route's drift hook (its one
-		// consumer), so it stays a local rather than write-only route state.
 		strictDrift := ResolveStrictDrift(configStrict, globalStrictDrift, manifest != nil)
 		r.driftCheck = driftCheckFor(manifest, strictDrift)
 		anyPoliced = anyPoliced || manifest != nil
 
-		// The three open-posture notices shared with the stdio host (TLS-skip WARNING,
-		// per-entry AUDIT NOTICE, whole-route AUDIT MODE banner). For a policyless route
-		// auditOnlyCount is 0 and the AUDIT MODE banner is suppressed — the no-policy
-		// wiretap NOTICE below carries that route's posture instead.
+		// A policyless route has auditOnlyCount 0 and a suppressed AUDIT MODE banner —
+		// the no-policy wiretap NOTICE below carries its posture instead.
 		auditOnlyCount, auditBanner := 0, false
 		if manifest != nil {
 			auditOnlyCount = manifest.AuditOnlyCount()
@@ -403,45 +366,31 @@ func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability
 		}
 		PrintRoutePolicyNotices(os.Stderr, u.Name, u.Name, auditOnlyCount, auditBanner, r.upstreamTLSSkipVerify)
 
-		// A remote HTTP upstream has no inbound stream: eunox issues request/response
-		// POSTs and never opens an SSE GET back to the upstream, so a server-initiated
-		// request it sends (roots/list, elicitation/create, sampling/createMessage) is
-		// never read and the upstream gets no reply. A manifest grant for the one
-		// enforced server-initiated method (sampling) is already refused at startup in
-		// LoadUpstreamPDP; surface the broader limitation as a NOTICE so an operator is
-		// not left debugging a silent hang.
+		// A remote HTTP upstream has no inbound stream: eunox POSTs and never opens an
+		// SSE GET back, so a server-initiated request the upstream sends is never read
+		// and it gets no reply. A sampling grant on http is already refused at startup
+		// in LoadUpstreamPDP; this surfaces the broader limitation.
 		if r.transport == config.HostTransportHTTP {
 			printRemoteUpstreamNotice(os.Stderr, u.Name, u.Name)
 		}
 
 		if manifest == nil {
-			// No policy but explicit enforcement: audit (the guard above rejected
-			// no-policy-without-audit). Wiretap mode: every DISPATCHED call forwarded and
-			// logged, none blocked on policy grounds. Surface the open posture loudly (the
-			// AUDIT MODE banner already fired above, including the fail-closed-default
-			// caveat; this adds the "no policy / wiretap" specifics).
+			// No policy but explicit enforcement: wiretap mode, every DISPATCHED call
+			// forwarded and logged, none blocked on policy grounds.
 			fmt.Fprintf(os.Stderr,
 				"[eunox] NOTICE: upstream %q has no policy and runs in AUDIT mode on /mcp/%s — "+
 					"every dispatched call is forwarded and logged, none blocked by policy (wiretap).\n",
 				u.Name, u.Name)
 		}
 
-		// Only wrap a real sink. A &routeSink{sink: nil} is never the nil pointer
+		// Only wrap a real sink: a &routeSink{sink: nil} is never the nil pointer
 		// asRecorder's zero-value check looks for, so wrapping unconditionally would
-		// hand every call site a NON-nil auditRecorder on a sink-less route and
-		// silently defeat every "no sink configured" fast path that tests
-		// `rec != nil` — dispatchList would decode and count every */list catalog it
-		// has nowhere to record. That is the same typed-nil trap StdioProxy.rec()
-		// documents and avoids for the stdio host; leaving r.sink nil here keeps
-		// asRecorder(route.sink) a genuine nil interface at each site. routeSink's
-		// own methods no-op on a nil inner sink, so a caller that ignores the nil
-		// and records anyway stays safe either way.
+		// hand every call site a non-nil recorder on a sink-less route and defeat every
+		// `rec != nil` fast path (the same typed-nil trap StdioProxy.rec() avoids).
 		if sink != nil {
-			// Bound the three provenance fields ONCE here rather than on every audit
-			// record: they are fixed for the route's lifetime, so re-deriving their
-			// UTF-8 validity and length bound per enforced call (as Sink.Record used to)
-			// was pure per-request waste on values that cannot change between calls.
-			// See audit.BoundEnvelopeField's doc.
+			// Bound the three provenance fields ONCE here rather than re-deriving their
+			// UTF-8 validity/length bound on every audit record (see
+			// audit.BoundEnvelopeField's doc).
 			r.sink = &routeSink{
 				sink:          sink,
 				upstream:      audit.BoundEnvelopeField(r.name),
@@ -465,56 +414,43 @@ func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability
 // check, so it stays the single source of truth). It touches no network,
 // CallCounter, or kill switch.
 //
-// hostTransport is the DEPLOYMENT's host-facing transport
-// (config.GatewayConfig.HostTransport — stdio vs http gateway), a different axis
-// from u.Transport (each upstream's OWN subprocess-vs-remote-HTTP reachability,
-// orthogonal to how the host reaches eunox) — needed only by the audience-pin
-// check below. This one function, not two split by which axis a check needs, is
-// what lets `validate --config` and `doctor` (which parse the config but never
-// see the eventual `proxy` invocation's flags) and LoadUpstreamPDP all share
-// every startup-fatal check through a single call: a caller that has the
-// deployment's host transport (all of them do — it's cfg.HostTransport(), read
-// once) cannot forget half of what proxy would refuse to boot on.
+// hostTransport is the DEPLOYMENT's host-facing transport (stdio vs http gateway),
+// a different axis from u.Transport (each upstream's own subprocess-vs-remote-HTTP
+// reachability) — needed only by the audience-pin check below. This one function
+// lets `validate --config` and `doctor` (which never see the eventual `proxy`
+// invocation's flags) and LoadUpstreamPDP share every startup-fatal check through
+// a single call.
 //
 // LoadUpstreamPDP calls this once it has merged. A caller that has ALREADY loaded
 // and merged the same manifests for its own purposes (doctor's
-// writeDoctorManifests, validate's validateConfigRoutes, both of which print the
-// merged digest) should call this directly instead of calling LoadUpstreamPDP a
-// second time just to read its error — that would re-parse and re-merge the
-// manifest files and spin up a throwaway engine/PDP purely to discard it.
+// writeDoctorManifests, validate's validateConfigRoutes) should call this
+// directly instead of calling LoadUpstreamPDP a second time just to read its
+// error.
 func startupFatalManifestCheck(u *config.UpstreamConfig, hostTransport string, merged *config.LocalManifest) error {
 	if u.ExpectVersion != "" && u.ExpectVersion != merged.Version {
 		return fmt.Errorf("upstream %q: manifest version %q does not match pinned expectVersion %q", u.Name, merged.Version, u.ExpectVersion)
 	}
 	// A system:sampling/createMessage opt-in cannot be enforced for a remote HTTP
-	// upstream: eunox reads server-initiated requests only from a subprocess
-	// upstream, so a remote upstream's sampling/createMessage is never seen. Fail
-	// closed rather than load a silently-inert grant.
+	// upstream: eunox reads server-initiated requests only from a subprocess upstream.
+	// Fail closed rather than load a silently-inert grant.
 	if u.Transport == config.HostTransportHTTP && merged.HasSamplingGrant() {
 		return fmt.Errorf("upstream %q: manifest grants system:sampling/createMessage, but server-initiated sampling cannot be enforced for an http upstream — eunox does not read server-initiated requests back from a remote HTTP upstream, so the opt-in would be silently inert. Remove the sampling grant, or reach this upstream over stdio where sampling is enforced", u.Name)
 	}
-	// An audience pin is a JWT concept enforced only in gateway (transport: http)
-	// mode with --jwks-uri; --jwks-uri is categorically rejected on a stdio host
-	// (see serveStdioHost's own --jwks-uri rejection), so the pin can never be
-	// enforced there regardless of any flag — unlike the gateway's
-	// FirstRouteAudiencePin (which only fires when --jwks-uri is unset, a CLI flag
-	// no caller here has visibility into), this is decidable from the config
-	// alone. Fail closed rather than let an operator believe the route is
-	// audience-gated when it is not.
+	// An audience pin is a JWT concept enforced only in gateway mode with --jwks-uri,
+	// which is categorically rejected on a stdio host, so the pin can never be enforced
+	// there. Decidable from config alone, so fail closed rather than let an operator
+	// believe the route is audience-gated when it is not.
 	if hostTransport == config.HostTransportStdio && merged.Audience != "" {
 		return fmt.Errorf("upstream %q declares an audience pin in its policy manifest, but audience pins are a JWT concept enforced only in gateway (transport: http) mode with --jwks-uri; a stdio host cannot enforce it. Remove the manifest 'audience' field or run this upstream as an http gateway route", u.Name)
 	}
-	// A declassify directive is satisfiable only by a human approval, and an approval
-	// arrives only on a validated JWT — which a stdio HOST can never present, since
-	// --jwks-uri is categorically rejected there and no stdio path populates claims. Every
-	// call to such a capability would escalate ESCALATION_REQUIRED/no_approval forever with
-	// no way to supply the approval and no startup error, which is the same
-	// "the capability could never be satisfied" outcome validateDeclassify refuses an empty
-	// label list to avoid. Decidable from the config alone, so refuse it here for the same
-	// reason the audience pin above is refused.
+	// A declassify directive is satisfiable only by a human approval carried on a
+	// validated JWT, which a stdio host can never present (--jwks-uri is rejected
+	// there). Every call would escalate forever with no way to approve it — the same
+	// "could never be satisfied" outcome validateDeclassify already refuses at the
+	// manifest level, refused here for the same reason the audience pin is.
 	//
-	// The axis is the HOST transport, not the upstream's: a stdio UPSTREAM behind an http
-	// gateway is fine, because the token arrives on the host leg.
+	// The axis is the HOST transport, not the upstream's: a stdio upstream behind an
+	// http gateway is fine, since the token arrives on the host leg.
 	if hostTransport == config.HostTransportStdio && merged.HasDeclassify() {
 		return fmt.Errorf("upstream %q declares a declassify directive in its policy manifest, but a declassification requires a human approval carried on a validated JWT, and a stdio host has no HTTP listener to present one to (--jwks-uri requires transport: http); every call to that capability would escalate forever with no way to approve it. Remove the directive or run this upstream as an http gateway route", u.Name)
 	}
@@ -563,10 +499,9 @@ func WalkRouteManifests(cfg *config.GatewayConfig, u *config.UpstreamConfig) Rou
 	var out RouteManifestOutcome
 	manifests := make([]*config.LocalManifest, 0, len(u.Policy))
 	for _, pf := range u.Policy {
-		// Resolve a relative policy path against the config file's directory, the
-		// same way LoadUpstreamPDP (the proxy load path) does. An unresolvable "~"
-		// form is reported as this entry's load error, so validate --config shows it
-		// against the offending policy: line like any other bad path.
+		// Resolve a relative policy path against the config file's directory, the same
+		// way LoadUpstreamPDP does, so an unresolvable "~" form shows against the
+		// offending policy: line like any other bad path.
 		resolved, err := config.ResolvePolicyPath(cfg.BaseDir, pf)
 		var m *config.LocalManifest
 		if err == nil {
@@ -622,11 +557,8 @@ func LoadUpstreamPDP(u *config.UpstreamConfig, hostTransport, baseDir string, co
 
 	manifests := make([]*config.LocalManifest, 0, len(u.Policy))
 	for _, pf := range u.Policy {
-		// Resolve a relative policy path against the config file's directory, not the
-		// process cwd, so a config launched from any directory still finds its
-		// manifests. An absolute path (or an empty baseDir, e.g. a programmatically
-		// built config) is used verbatim. Shared with validate --config via
-		// config.ResolvePolicyPath so the two paths cannot diverge.
+		// Resolve against the config file's directory, not the process cwd. Shared with
+		// validate --config via config.ResolvePolicyPath so the two paths cannot diverge.
 		resolved, err := config.ResolvePolicyPath(baseDir, pf)
 		if err != nil {
 			return nil, nil, "", "", fmt.Errorf("upstream %q: %w", u.Name, err)
@@ -646,44 +578,37 @@ func LoadUpstreamPDP(u *config.UpstreamConfig, hostTransport, baseDir string, co
 		return nil, nil, "", "", err
 	}
 
-	// Namespace this route's counter keys by the upstream/route name so gateway routes
-	// that share one CallCounter address disjoint maxCalls/sequenceBlock buckets — a
-	// fail-closed backstop in the key itself against a session-id collision or a
-	// cross-route session-binding regression, independent of the transport's per-route
-	// session uniqueness. u.Name is always set (config rejects an empty name, and the
-	// single-upstream path synthesizes one), so every route — including a lone
-	// single-upstream route, where cross-route collision is impossible anyway — is
-	// namespaced.
+	// Namespace this route's counter keys by upstream/route name so gateway routes
+	// sharing one CallCounter address disjoint maxCalls/sequenceBlock buckets — a
+	// fail-closed backstop against a session-id collision or cross-route session-binding
+	// regression, independent of the transport's own per-route session uniqueness.
 	engineOpts := []enforcement.Option{
 		enforcement.WithCallCounter(counter),
 		// Flow-label provenance lives in its own session-lifetime store, not the
-		// sliding-window counter. Wired unconditionally
-		// like the counter; the engine's own flow gate skips the flow path for a
-		// non-flow policy, so a wired-but-unused store costs nothing.
+		// sliding-window counter. Wired unconditionally; the engine's own flow gate
+		// skips the flow path for a non-flow policy, so this costs nothing unused.
 		enforcement.WithFlowLabelStore(flowStore),
 		enforcement.WithCounterKeyNamespace(u.Name),
-		// The tokens this policy carries — a fact, handed over so the ENGINE can decide
-		// which optional subsystems to wire (the antecedent history, the flow-label set).
-		// This transport used to make that decision itself, from what each token declares it
-		// depends on; that declaration describes the handler this build ships, and an
-		// embedder can register a different one for the same token, so the party that knows
-		// which handlers are actually registered is the only one that can answer. Passed
-		// even when empty: "this policy carries no tokens" and "nobody said" are different
-		// statements, and only the first may skip anything.
+		// The tokens this policy carries — a fact, handed to the ENGINE so it can decide
+		// which optional subsystems to wire. This transport used to decide that itself
+		// from what each token declares it depends on, but that declaration describes the
+		// handler this build ships, and an embedder can register a different one for the
+		// same token — only the party that knows which handlers are actually registered
+		// can answer. Passed even when empty: "carries no tokens" and "nobody said" are
+		// different statements, and only the first may skip anything.
 		enforcement.WithPolicyTokens(merged.PolicyTokens()),
 	}
 	if merged.HasEffectCeiling() {
-		// The tool-agnostic consequence bound, checked on every allow. Wired only when the
-		// policy declares one: the ceiling can only narrow, so an absent one changes
-		// nothing, and leaving it unset skips the per-allow check entirely.
+		// The tool-agnostic consequence bound, checked on every allow. Wired only when
+		// declared: it can only narrow, and leaving it unset skips the per-allow check.
 		engineOpts = append(engineOpts, enforcement.WithEffectCeiling(merged.EffectCeiling))
 	}
 	if taskAnchored {
 		// Key this route's accumulated state on the caller's validated mcp.task_id claim
-		// instead of on its session, so taint, antecedents, budgets, and spent one-shot
-		// approvals survive a hop to another enforcement point. Wired only when the route
-		// asks for it: it changes what every budget in the policy means, and a token that
-		// authenticated without carrying a task id is refused rather than accounted twice.
+		// instead of its session, so taint/antecedents/budgets/spent approvals survive a
+		// hop to another enforcement point. Wired only when asked: it changes what every
+		// budget in the policy means, and a token with no task id is refused rather than
+		// accounted twice.
 		engineOpts = append(engineOpts, enforcement.WithTaskAnchoredState())
 	}
 	engine := enforcement.New(engineOpts...)
@@ -706,21 +631,15 @@ func LoadUpstreamPDP(u *config.UpstreamConfig, hostTransport, baseDir string, co
 // shared validator accepts the UNION of every route's effective audience, so a token
 // minted for ANY route clears signature/exp/iss/aud validation once; each route wrapper
 // then narrows to its OWN effective audience, so a token for route A's audience is
-// denied on route B (the model deferred from the earlier documentation-only fix). The split keeps
-// signature/exp/iss validation shared while making the audience assertion per-route.
-// --jwt-allow-any-audience disables both layers, unchanged.
+// denied on route B. --jwt-allow-any-audience disables both layers.
 //
-// Fails closed when audience pinning is active (AllowAnyAudience is false) but a route
-// has no effective audience — neither a manifest 'audience' nor the global Audience
-// fallback. An empty (or whitespace-only) effective audience would put "" into the
-// accepted-audience union (widening the shared validator to accept any pinned route's
-// token) and give the route wrapper an empty RouteAudience, which disables per-route
-// narrowing and makes the route accept-any instead of reject. A whitespace-only value
-// is caught here too because the shared validator's sanitizeAudiences drops it from the
-// union, so admitting it would silently reject every token instead of surfacing the
-// misconfiguration. The CLI never reaches this (validateJWTAudienceConfig requires a
-// non-blank --jwt-audience whenever pinning is active), so the guard protects direct
-// callers of this exported seam.
+// Fails closed when audience pinning is active but a route has no effective audience: an
+// empty (or whitespace-only) value would widen the shared validator's union and make the
+// route wrapper accept-any instead of reject — including a whitespace-only value, which
+// the validator's own sanitizeAudiences would drop from the union anyway, silently
+// rejecting every token. The CLI never reaches this (validateJWTAudienceConfig requires a
+// non-blank --jwt-audience whenever pinning is active); the guard protects direct callers
+// of this exported seam.
 func WrapRoutesWithJWT(routes map[string]*UpstreamRoute, opts pdp.JWTPDPOptions) (*pdp.JWTPDP, error) {
 	// Effective per-route audience and the union the shared validator accepts.
 	routeAud := make(map[string]string, len(routes))
@@ -739,19 +658,16 @@ func WrapRoutesWithJWT(routes map[string]*UpstreamRoute, opts pdp.JWTPDPOptions)
 			seen[eff] = struct{}{}
 			union = append(union, eff)
 		}
-		// A condition type the capability-claim path cannot dispatch through this route's own
-		// handler makes the two halves of one intersection mean different things. The claim
-		// grammar's `op=` shorthand cannot name the operation argument, so its arm scans every
-		// argument while the engine's handler hard-denies that empty argument — the divergence
-		// is deliberate, and sound only while both sides are the semantics this build ships.
-		// An embedder who replaced allowedOperations gets the replacement on the manifest path
-		// and the shipped predicate on the token path, silently. Refuse the WIRING here, where
-		// an operator can act on it, rather than leaving it to the first token-scoped call
-		// (which the claim arm refuses too, as the backstop for a JWTPDP built directly).
+		// The claim grammar's `op=` shorthand can't name the operation argument, so it
+		// scans every argument while the engine's own handler hard-denies that empty
+		// argument — a deliberate divergence, but only sound while both sides run the
+		// semantics this build ships. An embedder who replaced allowedOperations gets the
+		// replacement on the manifest path and the shipped predicate on the token path,
+		// silently. Refuse the wiring here, where an operator can act on it.
 		//
-		// Gated on ExperimentalCapabilities because without it a token carrying
-		// mcp.capabilities is rejected at validation outright, so the claim arm is unreachable
-		// and there is no divergence to refuse over.
+		// Gated on ExperimentalCapabilities: without it a token carrying mcp.capabilities
+		// is rejected at validation, so the claim arm is unreachable and there's no
+		// divergence to refuse.
 		if opts.ExperimentalCapabilities && rt.pdp.ConditionHandlerOverridden(capability.ConditionTypeAllowedOperations) {
 			return nil, fmt.Errorf("route %q registers a custom %s condition handler, which the JWT capability-claim path cannot enforce: its `op=` shorthand names no operation argument, so it scans every argument rather than dispatching through the handler. Drop the override, or disable --jwt-experimental-capabilities and express the restriction as a manifest constraint that names the operation argument",
 				name, capability.ConditionTypeAllowedOperations)
@@ -768,12 +684,9 @@ func WrapRoutesWithJWT(routes map[string]*UpstreamRoute, opts pdp.JWTPDPOptions)
 	for name, rt := range routes {
 		// Share the validator's JWKS cache; wrappers never fetch keys, so skip the
 		// throwaway JWKSCache+breaker NewJWTPDP would allocate. Copy opts and override
-		// only the two per-route fields (RouteAudience, Inner), mirroring the vopts
-		// pattern above, so a new validation-relevant JWTPDPOptions field cannot silently
-		// be dropped from per-route wrappers. AcceptedAudiences is cleared because a route
-		// wrapper pins its single RouteAudience, not the shared union; the cache fields
-		// (JWKSURI/Client/Breaker/CacheTTL) are ignored by NewJWTPDPWithCache, which takes
-		// the shared cache explicitly.
+		// only the two per-route fields so a new validation-relevant field can't
+		// silently be dropped from per-route wrappers. AcceptedAudiences is cleared
+		// because a route wrapper pins its single RouteAudience, not the shared union.
 		wopts := opts
 		wopts.AcceptedAudiences = nil
 		wopts.RouteAudience = routeAud[name]
@@ -823,10 +736,9 @@ func FirstRouteAudiencePin(routes map[string]*UpstreamRoute) (string, bool) {
 // path, or returns nil for an empty path — the default, under which no receipt handling
 // happens at all.
 //
-// The path is LOCAL and read once at startup. eunox does not fetch receipt keys: they are
-// part of an upstream's configuration exactly as its command line is, and a network
-// dependency behind a check whose whole value is being local and unfalsifiable would trade
-// that value away. It is also a DISTINCT key domain from the caller-authenticating JWKS —
+// The path is LOCAL and read once at startup: eunox does not fetch receipt keys, since a
+// network dependency would trade away the whole value of this check being local and
+// unfalsifiable. It is also a DISTINCT key domain from the caller-authenticating JWKS —
 // a receipt is a server's statement about its own behavior, and tying it to the token
 // issuer that authenticates callers would let any party who can mint a caller token also
 // mint attestations about a server.
@@ -837,20 +749,17 @@ func LoadEffectReceiptVerifier(baseDir, path string) (*capability.EffectReceiptV
 	if strings.TrimSpace(path) == "" {
 		return nil, nil
 	}
-	// Resolved against the CONFIG's directory, exactly as `policy:` is (ResolvePolicyPath):
-	// a relative path beside the config must mean the same thing however the proxy was
-	// launched. Resolving against the process cwd instead either failed startup outright or
-	// — worse — silently adopted a different file as the receipt trust anchor, under which
-	// forged receipts verify and genuine ones record as unverified.
+	// Resolved against the CONFIG's directory, exactly as `policy:` is: a relative path
+	// beside the config must mean the same thing however the proxy was launched.
+	// Resolving against the process cwd could silently adopt a different file as the
+	// receipt trust anchor, under which forged receipts verify and genuine ones don't.
 	resolved, err := config.ResolvePolicyPath(baseDir, path)
 	if err != nil {
 		return nil, fmt.Errorf("resolving effectReceiptKeys path: %w", err)
 	}
-	// Same symlink and regular-file discipline every other operator-supplied key path in
-	// the binary gets: a key set is a trust anchor, so following a symlink to one is how a
-	// local attacker substitutes it. RefuseNonRegularPath is the portable half (it also
-	// refuses directories, devices and FIFOs); config.OpenNoFollow closes the open race
-	// where the platform supports it.
+	// Same symlink and regular-file discipline every operator-supplied key path in the
+	// binary gets: a key set is a trust anchor, so following a symlink to one is how a
+	// local attacker substitutes it.
 	if err := config.RefuseNonRegularPath(resolved, "effect-receipt key set"); err != nil {
 		return nil, err
 	}
@@ -870,7 +779,7 @@ func LoadEffectReceiptVerifier(baseDir, path string) (*capability.EffectReceiptV
 	return v, nil
 }
 
-// maxEffectReceiptJWKSBytes bounds the key document read. A JWKS holding even a few dozen
-// keys is a handful of kilobytes; the cap exists so a mistyped path pointing at something
-// enormous fails as a parse error rather than as a startup that reads a gigabyte first.
+// maxEffectReceiptJWKSBytes bounds the key document read: a JWKS with a few dozen keys is
+// a handful of kilobytes, so a mistyped path pointing at something enormous fails as a
+// parse error rather than a startup that reads a gigabyte first.
 const maxEffectReceiptJWKSBytes = 1 << 20

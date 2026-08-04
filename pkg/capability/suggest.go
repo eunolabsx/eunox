@@ -5,11 +5,9 @@ package capability
 
 import "strings"
 
-// NearestString returns the candidate closest to s by case-insensitive
-// Levenshtein edit distance, provided that distance is less than 3; otherwise
-// it returns "". Candidates are considered in order, so ties resolve to the
-// earliest — pass them pre-sorted for lexicographic tie-breaking. It powers the
-// "did you mean …?" hints for unrecognized manifest keys and condition types.
+// NearestString returns the candidate closest to s by case-insensitive Levenshtein edit
+// distance, provided that distance is less than 3; otherwise it returns "". Candidates are
+// considered in order, so ties resolve to the earliest — pass them pre-sorted.
 func NearestString(s string, candidates []string) string {
 	best := ""
 	bestDist := 3
@@ -23,9 +21,8 @@ func NearestString(s string, candidates []string) string {
 	return best
 }
 
-// levenshtein returns the edit distance between a and b, measured in Unicode code
-// points (runes), not UTF-8 bytes — a single multi-byte rune typo counts as one
-// edit, so "did you mean …?" hints rank correctly for non-ASCII input.
+// levenshtein returns the edit distance between a and b, measured in Unicode code points
+// (runes), not UTF-8 bytes — a single multi-byte rune typo counts as one edit.
 func levenshtein(a, b string) int {
 	ra, rb := []rune(a), []rune(b)
 	la, lb := len(ra), len(rb)

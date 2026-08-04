@@ -5,12 +5,8 @@
 //
 //	MCP host  ──stdin/stdout──►  StdioProxy  ──►  upstream MCP server (subprocess)
 //
-// Enforced host requests pass through a PDP decision before reaching the upstream.
-// Unmapped host requests are denied fail-closed (AUTHORIZATION_FAILED), */list
-// responses are filtered to the permitted subset, and initialize is answered
-// locally; notifications are gated by the dispatch allowlists rather than blindly
-// relayed. One goroutine reads from the host, one from the upstream; upstream
-// responses are routed back to the matching pending request.
+// Enforced requests pass a PDP decision before forwarding; unmapped requests deny
+// fail-closed. One goroutine reads the host, one reads the upstream.
 
 package transport
 
@@ -37,9 +33,7 @@ import (
 
 const (
 	// proxyName is the clientInfo.name the proxy presents to upstreams. The CLI's
-	// live-upstream probe identifies itself identically without a second spelling of
-	// it: it builds the whole handshake through BuildInitializeRequestWithID, which
-	// stamps this value, rather than reading the name out of this package.
+	// live-upstream probe reuses it via BuildInitializeRequestWithID rather than a second spelling.
 	proxyName = "eunox-proxy"
 
 	// MCPProtocolVersion is the MCP protocol version the proxy advertises;
@@ -47,8 +41,7 @@ const (
 	MCPProtocolVersion = "2025-11-25"
 )
 
-// proxyVersion is the version string reported in MCP initialize responses,
-// kept in sync with the build version via SetProxyVersion.
+// proxyVersion is the version reported in MCP initialize responses; set via SetProxyVersion.
 var proxyVersion = "dev"
 
 // SetProxyVersion sets the version string the proxy reports in MCP initialize
@@ -57,12 +50,9 @@ var proxyVersion = "dev"
 func SetProxyVersion(v string) { proxyVersion = v }
 
 // StdioProxy proxies MCP messages between the host (stdin/stdout) and an upstream MCP
-// server (a subprocess, or a remote HTTP upstream via the bridge), applying PDP
-// enforcement to every enforced method: tools/call, resources/read, resources/subscribe,
-// resources/unsubscribe and prompts/get on the host leg, sampling/createMessage on the
-// server-initiated leg, plus the */list response filters. Five wire methods over four
-// Decide* entry points — resources/subscribe is authorized through DecideResourceRead,
-// while resources/unsubscribe has its own (see the PolicyDecisionPoint contract).
+// server, applying PDP enforcement to every enforced method plus the */list filters.
+// Five wire methods map to four Decide* entry points: resources/subscribe is authorized
+// through DecideResourceRead, while resources/unsubscribe has its own.
 type StdioProxy struct {
 	// Upstream wiring. A non-empty command selects a local subprocess upstream
 	// (stdio); a non-empty upstreamURL selects a remote HTTP upstream. Exactly
@@ -75,18 +65,12 @@ type StdioProxy struct {
 
 	pdp  pdp.PolicyDecisionPoint
 	sink *audit.Sink
-	// policyVersion and policySHA256 are stamped onto every audit record via rec()
-	// (see StdioProxyOptions.PolicyVersion/PolicySHA256).
+	// policyVersion and policySHA256 are stamped onto every audit record via rec().
 	policyVersion string
 	policySHA256  string
-	// recOnce/recCached lazily build and cache rec()'s auditRecorder exactly once,
-	// from whatever sink/policyVersion/policySHA256 hold at the first call — every
-	// production path sets those three fields once at construction (NewStdioProxy)
-	// before any request flows, and test helpers that build a StdioProxy via a bare
-	// struct literal set them once immediately after, before exercising any call
-	// path that reaches rec(). recCached stays the untyped nil auditRecorder value
-	// when sink is nil, so rec() returns a genuine nil (not a non-nil interface
-	// wrapping a nil sink) — see rec()'s doc comment.
+	// recOnce/recCached cache rec()'s auditRecorder, built once from sink/policyVersion/
+	// policySHA256. recCached stays the untyped nil auditRecorder when sink is nil, so
+	// rec() returns a genuine nil rather than a non-nil interface wrapping a nil sink.
 	recOnce            sync.Once
 	recCached          auditRecorder
 	sessionID          string
@@ -95,8 +79,7 @@ type StdioProxy struct {
 	audit              bool // observe mode: evaluate and log, but forward instead of block
 	requireAuditStrict bool // --require-audit=strict: deny forwards once the audit trail degrades
 	// strictAuditWarned makes the strict-gate stderr warning one-shot (the gate is
-	// sticky, so it would otherwise log per request); the durable per-call signal is
-	// the AUDIT_UNAVAILABLE record.
+	// sticky); the durable per-call signal is the AUDIT_UNAVAILABLE record.
 	strictAuditWarned atomic.Bool
 	driftCheck        drift.CheckFunc
 
@@ -112,10 +95,8 @@ type StdioProxy struct {
 	upReader mcp.MsgSource
 
 	// killTimer is the SIGKILL fallback armed by signalUpstream during a graceful
-	// shutdown; Start's teardown stops it once the upstream has exited. Stopping it
-	// is harmless after the process is reaped (the callback is a no-op then) but
-	// suppresses a spurious "sending SIGKILL" log line and frees the timer promptly.
-	// killMu guards it: signalUpstream (signal goroutine) writes, teardown reads.
+	// shutdown; Start's teardown stops it once the upstream has exited, suppressing a
+	// spurious "sending SIGKILL" log line. killMu: signalUpstream writes, teardown reads.
 	killMu    sync.Mutex
 	killTimer *time.Timer
 
@@ -126,117 +107,86 @@ type StdioProxy struct {
 
 	// pendingMu guards byUpstreamID, hostToUp, and upstreamSeq.
 	pendingMu sync.Mutex
-	// byUpstreamID routes upstream responses (and remote-HTTP-bridge transport
-	// failures — see deliverUpstreamError) back to the waiting caller, keyed by the
-	// proxy-generated upstream ID (the nonce). A result carrying a stale nonce (its
-	// caller already timed out and removed the entry) lands nowhere, so a late
-	// response for a timed-out request can never be misrouted into a later request
-	// that reused the same host ID.
+	// byUpstreamID routes upstream responses back to the waiting caller, keyed by the
+	// proxy-generated nonce, so a late response for a timed-out call can never be
+	// misrouted into a later request that reused the same host ID.
 	byUpstreamID map[string]chan upstreamResult
-	// hostToUp maps a live request's host ID (canonical MsgKey) to the upstream
-	// nonce the proxy put on the wire, so a host notifications/cancelled can have
-	// its params.requestId translated to the nonce the upstream actually saw --
-	// otherwise the cancel names an id the upstream never received and is a no-op.
-	// Populated and cleared alongside byUpstreamID under pendingMu.
-	//
-	// It doubles as the in-flight host-ID SET the duplicate-ID rejection reads (see
-	// awaitNonced): a key is present for exactly the window a request is in flight, which
-	// is precisely what a separate `pending` set held.
+	// hostToUp maps a live request's host ID to the upstream nonce, so a
+	// notifications/cancelled can have its params.requestId translated to the id the
+	// upstream actually saw. Also doubles as the in-flight host-ID set the duplicate-ID
+	// rejection in awaitNonced reads, rather than keeping a separate `pending` set.
 	hostToUp map[string]*json.RawMessage
 	// upstreamSeq is the monotonically increasing nonce source for upstream IDs.
 	upstreamSeq uint64
 
-	// serverReqs tracks the IDs of server-initiated requests (e.g.
-	// sampling/createMessage, roots/list) the proxy forwarded to the host. serveHost
-	// consults it to route the host's response (same ID) back to the upstream rather
-	// than dropping it, which would hang the upstream.
+	// serverReqs tracks server-initiated request IDs forwarded to the host, so serveHost
+	// can route the host's response back to the upstream instead of dropping it.
 	serverReqs serverReqTracker
 
 	// upstreamDone is closed by readUpstream when the upstream exits, so pending
 	// callUpstream callers return immediately rather than waiting for ctx cancel.
 	upstreamDone chan struct{}
 
-	// upstreamCaps holds the server capabilities from the upstream initialize response.
-	upstreamCaps map[string]interface{}
-	// upstreamServerVersion holds the version string from the upstream serverInfo.
+	upstreamCaps          map[string]interface{}
 	upstreamServerVersion string
-	// upstreamInstructions holds the instructions field from the upstream initialize response.
-	upstreamInstructions string
+	upstreamInstructions  string
 
 	// idCounter is used for the proxy→upstream initialize request ID.
 	idCounter int64
 
-	// hostSem bounds concurrent in-flight host-request handler goroutines (and the
-	// pending/byUpstreamID entries each one holds). serveHost acquires a slot
-	// non-blockingly before dispatching a request goroutine and releases it when the
-	// handler returns; on saturation the request is rejected with a structured error
-	// instead of spawning, so a pipelining host — or a silent upstream under
-	// --upstream-timeout=0, where handlers never return — cannot grow goroutines or
-	// the pending maps without bound. serveHost sizes it lazily on entry (the sole
-	// initialization site), before dispatching any handler goroutine, so it is always
-	// sized by the time a request is handled.
+	// hostSem bounds concurrent in-flight host-request handler goroutines. serveHost
+	// acquires a slot non-blockingly and rejects with a structured error on saturation, so
+	// a pipelining host — or a silent upstream under --upstream-timeout=0, where handlers
+	// never return — cannot grow goroutines or the pending maps without bound. Sized
+	// lazily on serveHost entry, the sole initialization site, before any handler dispatch.
 	hostSem chan struct{}
 
-	// hostSaturation gates the RESOURCE_EXHAUSTED record hostSem writes when it refuses a
-	// request, the stdio counterpart of the two per-session gates the HTTP transport keeps.
-	// It collapses an episode of saturation into a single record carrying the count of
-	// refusals elided since; see saturationGate. Zero value usable, so a proxy built by a
-	// struct literal is gated too.
+	// hostSaturation gates the RESOURCE_EXHAUSTED record hostSem writes on refusal, the
+	// stdio counterpart of the HTTP transport's per-session gates; collapses a saturation
+	// episode into one record carrying the elided-refusal count. Zero value usable.
 	hostSaturation saturationGate
 
 	// serverPool bounds, dispatches and drains this proxy's SERVER-initiated request
-	// handlers — the upstream-facing twin of hostSem/hostSaturation, and the same pool the
-	// HTTP transport keeps per session. readUpstream hands each server-initiated request to
-	// it rather than running the handler inline; see serverRequestPool for why that is a
-	// correctness property of the reader rather than a latency preference. Zero value usable.
+	// handlers, the upstream-facing twin of hostSem/hostSaturation. readUpstream hands each
+	// server-initiated request to it rather than running the handler inline — see
+	// serverRequestPool for why that is a correctness property of the reader, not a latency
+	// preference. Zero value usable.
 	serverPool serverRequestPool
 
-	// fwdHostWrites preserves host wire order across the request/notification
-	// boundary. It counts host requests that have been dispatched but not yet written
-	// to the upstream; serveHost waits on it before forwarding a host notification, so
-	// a notification (e.g. notifications/cancelled targeting an in-flight request)
-	// cannot overtake the requests the host sent before it. callUpstream releases a
-	// request's slot the instant the request reaches the wire — not when its response
-	// arrives — so cancelling a slow call never deadlocks the barrier.
+	// fwdHostWrites preserves host wire order across the request/notification boundary: it
+	// counts requests dispatched but not yet written upstream, and serveHost waits on it
+	// before forwarding a notification so it cannot overtake requests sent before it.
+	// callUpstream releases a request's slot the instant it reaches the wire — not when its
+	// response arrives — so cancelling a slow call never deadlocks the barrier.
 	fwdHostWrites sync.WaitGroup
 	// fwdHostInFlight mirrors fwdHostWrites' counter as a readable atomic so
-	// waitHostForwardOrShutdown can take a zero-cost fast path (no waiter goroutine +
-	// channel) when the barrier is already drained — the common case for a
-	// notification-heavy host. Incremented in serveHost (the sole Add site) alongside
-	// fwdHostWrites.Add, decremented in the same OnceFunc release as fwdHostWrites.Done.
+	// waitHostForwardOrShutdown can skip the waiter goroutine when the barrier is already
+	// drained — the common case for a notification-heavy host.
 	fwdHostInFlight atomic.Int64
 
-	// decideGate serializes this proxy's enforced-request decisions in proxy-receipt
-	// order, per state ANCHOR, when the policy accumulates state one call writes and a later
-	// one reads; the serve loop gates on decideGate != nil. nil keeps full intra-session
-	// decision parallelism. Set from StdioProxyOptions.SerializeDecisions at construction.
+	// decideGate serializes this proxy's enforced-request decisions in proxy-receipt order,
+	// per state anchor, when the policy accumulates state one call writes and a later one
+	// reads. nil keeps full intra-session decision parallelism.
 	decideGate *decisionSerializer
 
-	// taskAnchored is the operator's WithTaskAnchoredState setting for this upstream, the
-	// same bit the PDP's engine was built with (StdioProxyOptions.TaskAnchoredState). The
-	// proxy carries it for one purpose: resolving the anchor a request's decision turn is
-	// keyed on, through the same resolver the engine's own key builder uses, so the turn
-	// spans the key the state lives on. See decisionAnchor.
+	// taskAnchored is the operator's WithTaskAnchoredState setting for this upstream (the
+	// same bit the PDP's engine was built with), carried so the proxy can resolve a
+	// request's decision-turn anchor through the same resolver the engine's key builder
+	// uses. See decisionAnchor.
 	taskAnchored bool
 
-	// claims are the validated JWT claims this host connection carries, captured ONCE from
-	// the context handed to Start. A stdio host has one connection and no per-request token
-	// channel, so a connection-level identity is the only identity there is — which is the
-	// same thing httpSession.claims is for an HTTP session, captured at initialize. Both the
-	// host leg and the server-initiated leg resolve their anchor from this ONE field rather
-	// than each reaching for a context of its own: the two legs must land on the same turn,
-	// and two sources for one identity is exactly how they would stop.
-	//
-	// nil in every shipped configuration (--jwks-uri is refused on a stdio host, and nothing
-	// on this path attaches claims), which resolves every request to the session anchor.
+	// claims are the validated JWT claims this host connection carries, captured ONCE in
+	// Start. A stdio host has one connection and no per-request token channel, so a
+	// connection-level identity is the only identity there is; both legs resolve their
+	// anchor from this one field so they cannot land on different turns. nil in every
+	// shipped configuration (--jwks-uri is refused on stdio), resolving every request to
+	// the session anchor.
 	claims *pdp.JWTClaims
 
-	// decideQueue is this proxy's pinned ticket queue and dropDecideQueue releases it. The
-	// anchor is a per-proxy CONSTANT (see claims), so the queue is resolved once instead of
-	// re-rendering the key and re-entering the registry on every enforced request — the
-	// registry reclaims a queue the moment its last ticket is served, so per-request
-	// resolution meant creating and destroying the same queue per call on the read loop,
-	// which is also the only goroutine that routes host replies back to the upstream.
+	// decideQueue is this proxy's pinned ticket queue; dropDecideQueue releases it. The
+	// anchor is a per-proxy constant (see claims), so the queue is resolved once at startup
+	// rather than re-rendering the key and re-entering the registry on every enforced
+	// request on the hot read loop.
 	decideQueue     *ticketQueue
 	dropDecideQueue func()
 
@@ -245,11 +195,11 @@ type StdioProxy struct {
 	receipts *capability.EffectReceiptVerifier
 
 	// honorAttribution admits the client-supplied attribution interface. Set from
-	// StdioProxyOptions.HonorAttribution at construction; see that field.
+	// StdioProxyOptions.HonorAttribution at construction.
 	honorAttribution bool
 
 	// onReady is the post-startup hook, run once the session is live. Set from
-	// StdioProxyOptions.OnReady at construction; see that field.
+	// StdioProxyOptions.OnReady at construction.
 	onReady func(ctx context.Context)
 }
 
@@ -263,11 +213,8 @@ type StdioProxyOptions struct {
 	UpstreamTLSSkipVerify bool   // skip TLS verification for the remote upstream (dev only)
 	PDP                   pdp.PolicyDecisionPoint
 	Sink                  *audit.Sink
-	// PolicyVersion and PolicySHA256 are the merged manifest's provenance
-	// (config.LocalManifest.Version and its digest), stamped onto every audit
-	// record the same way the gateway's routeSink stamps them for each route —
-	// so a stdio-host deployment's audit trail carries the same provenance a
-	// gateway route's does, instead of leaving policy_version/policy_sha256 empty.
+	// PolicyVersion and PolicySHA256 are the merged manifest's provenance, stamped onto
+	// every audit record the same way the gateway's routeSink stamps them per route.
 	PolicyVersion      string
 	PolicySHA256       string
 	SessionID          string
@@ -277,61 +224,39 @@ type StdioProxyOptions struct {
 	RequireAuditStrict bool // --require-audit=strict: deny forwards once the audit trail degrades
 
 	// SerializeDecisions serializes this proxy's enforced-request decisions in
-	// proxy-receipt order, per state anchor, when the policy accumulates state one call
-	// writes and a later one reads, so a source's flow-label write is ordered before a
-	// later sink's read even under a pipelining client. The binary sets it from
-	// config.LocalManifest.NeedsDecisionTurn — the same predicate the gateway's route
-	// builder uses, so the two transports cannot disagree about which policies need a turn.
+	// proxy-receipt order, per state anchor, so a source's flow-label write is ordered
+	// before a later sink's read even under a pipelining client. The binary sets it from
+	// config.LocalManifest.NeedsDecisionTurn, the same predicate the gateway route builder
+	// uses, so the two transports cannot disagree about which policies need a turn.
 	SerializeDecisions bool
 
 	// TaskAnchoredState reports that this upstream's engine keys accumulated state on the
-	// validated mcp.task_id claim rather than on the session (config's
-	// ResolvedTaskAnchoredState, the same value passed to LoadUpstreamPDP). The proxy uses
-	// it to key each request's decision turn on the anchor the state actually lives on.
-	//
-	// It is inert on a stdio host as shipped — nothing on this path attaches validated
-	// claims, so every request anchors on the session — and it is wired anyway because the
-	// alternative is a load-bearing assumption held up by a flag check in another package
-	// (see serialize.go). An embedder handing this proxy a token-aware PDP through the PDP
-	// seam gets anchor-keyed serialization by construction rather than a single FIFO that
-	// silently stopped being the anchor.
+	// validated mcp.task_id claim rather than on the session; the proxy keys each request's
+	// decision turn on the same anchor. Inert on a stdio host as shipped (nothing on this
+	// path attaches validated claims, so every request anchors on the session) but wired
+	// anyway so a token-aware PDP handed in through the PDP seam gets anchor-keyed
+	// serialization by construction.
 	TaskAnchoredState bool
 
 	// HonorAttribution admits the client-supplied attribution interface (the
-	// io.eunolabs.context-manifest block in a request's _meta). The binary sets it from
-	// manifest.HonorsAttributionInterface() — i.e. only under the flow+effect draft
-	// schemaVersion — so a policy running the published grammar ignores the block instead
-	// of acting on a token that grammar does not contain.
+	// io.eunolabs.context-manifest block in a request's _meta). The binary sets it only
+	// under the flow+effect draft schemaVersion, so a policy on the published grammar
+	// ignores a block that grammar does not contain.
 	HonorAttribution bool
 
 	// EffectReceipts verifies signed effect receipts this upstream publishes in a tool
-	// result's `_meta`. nil (the default) disables the surface entirely: nothing is
-	// parsed and nothing is recorded, so an operator who configured no key domain for
-	// this upstream pays nothing.
+	// result's `_meta`. nil (the default) disables the surface entirely.
 	EffectReceipts *capability.EffectReceiptVerifier
 
 	// DriftCheck is the injected drift hook; nil = no drift checking.
 	DriftCheck drift.CheckFunc
 
-	// OnReady, when non-nil, runs inside Start once the session is live — the upstream is
-	// connected, the initialize handshake has answered, and the drift check has passed —
-	// and before the host serve loop begins. It is the stdio analogue of
-	// HTTPGatewayOptions.AfterListen and exists for the same reason: startup effects that
-	// overwrite SHARED, last-writer-wins state other processes then trust (the
-	// session-kill TTL this proxy publishes for `eunox kill`) must not be performed by a
-	// process that never comes up. The stdio host has no bind step, so the fallible steps
-	// it must clear instead are its own — a missing upstream binary, an upstream that
-	// never answers initialize, a refused drift check — each of which returns straight out
-	// of Start. Running the hook before them let a doomed process clobber a RUNNING
-	// proxy's published state on its way to dying.
-	//
-	// It receives Start's context so an effect that talks to a network service bounds its
-	// round-trip by the proxy's own lifetime rather than running detached — the gateway
-	// hook's contract too, and what keeps a cancelled startup from landing a write.
-	//
-	// Unlike AfterListen it returns no error: its callers are advisory (a failure warns and
-	// the proxy runs on), and there is no useful "abort startup" for an effect whose whole
-	// contract is best-effort. It is called exactly once, on the success path only.
+	// OnReady, when non-nil, runs inside Start once the session is live and before the host
+	// serve loop begins — the stdio analogue of HTTPGatewayOptions.AfterListen. It runs
+	// after every fallible startup step so a process that never comes up cannot clobber
+	// shared, last-writer-wins state (e.g. the session-kill TTL) a running proxy owns.
+	// Bounded by Start's context; unlike AfterListen it returns no error since its callers
+	// are advisory-only. Called exactly once, on the success path.
 	OnReady func(ctx context.Context)
 }
 
@@ -377,32 +302,19 @@ func NewStdioProxy(opts StdioProxyOptions) *StdioProxy {
 	return p
 }
 
-// rec returns the auditRecorder every enforcement/notification path in this file
-// records through, wrapping p.sink in a routeSink (upstream "" — single-upstream
-// mode, matching Record's own doc comment) so policyVersion/policySHA256 are
-// stamped onto every stdio audit record exactly as the gateway's routeSink stamps
-// them for each route. Built and cached once (recOnce/recCached): unlike the
-// prior asRecorder(p.sink) call at each site, wrapping a non-nil *routeSink in the
-// auditRecorder interface every call would (a) allocate on every enforced
-// request/notification/kill-drop for no reason, since sink/policyVersion/
-// policySHA256 never change after construction, and (b) — the correctness issue —
-// always yield a NON-nil auditRecorder even when p.sink is nil (a &routeSink{} is
-// never the nil pointer asRecorder's zero-value check looks for), silently
-// defeating every "no sink configured" fast path that tests `rec() != nil`
-// (e.g. dispatchList's list-decode skip). Returning the untyped nil interface
-// directly when p.sink is nil — rather than asRecorder(&routeSink{...}) — fixes
-// that: recCached stays nil, so rec() itself is nil, and every existing
-// `d.rec != nil` guard behaves exactly as it did when call sites held
-// asRecorder(p.sink) directly. routeSink's own RecordAllow/RecordDeny/
-// AuditDegraded also no-op on a nil inner sink, so a caller that ignores the nil
-// and calls through it anyway (there are none today) stays safe either way.
+// rec returns the auditRecorder every enforcement/notification path in this file records
+// through, wrapping p.sink in a routeSink (upstream "" — single-upstream mode) so
+// policyVersion/policySHA256 are stamped exactly as the gateway's routeSink stamps them
+// per route. Cached once (recOnce/recCached) rather than rebuilt per call, both to avoid
+// a per-request allocation and because a freshly-wrapped &routeSink{} is never the nil
+// pointer callers' `rec() != nil` / `d.rec != nil` guards look for — returning the
+// untyped nil interface directly when p.sink is nil keeps those guards a real "no sink"
+// test rather than the typed-nil trap.
 func (p *StdioProxy) rec() auditRecorder {
 	p.recOnce.Do(func() {
 		if p.sink != nil {
-			// Bound once here, matching BuildRoutes' gateway routeSink construction:
-			// policyVersion/policySHA256 are fixed for the process's lifetime, so
-			// per-record re-bounding (as Sink.Record used to do) was pure per-request
-			// waste. See audit.BoundEnvelopeField's doc.
+			// Bound once here, matching BuildRoutes' gateway routeSink construction: these
+			// fields are fixed for the process's lifetime. See audit.BoundEnvelopeField.
 			p.recCached = &routeSink{
 				sink:          p.sink,
 				policyVersion: audit.BoundEnvelopeField(p.policyVersion),
@@ -416,24 +328,19 @@ func (p *StdioProxy) rec() auditRecorder {
 // Start runs the proxy until the host closes stdin or the upstream exits.
 // It returns when the session ends.
 func (p *StdioProxy) Start(ctx context.Context) error {
-	// Arm the host stdout writer's desync teardown before anything can write to it.
-	// Its writes are fire-and-forget at every call site (a dropped host reply has nowhere
-	// to return an error to), so without a hook a single partial write latches the writer
-	// and the proxy goes on enforcing policy and forwarding calls upstream while every
-	// response is silently discarded: real side effects, no replies, no diagnostic. No
-	// deadline is armed on it — a slow host is not a policy failure, and stdout may not be
-	// a pollable pipe — so this covers only the desync case. Wired here rather than in the
-	// constructor so the teardown it performs sits on a context-carrying path, like every
-	// other killUpstream call site.
-	//nolint:contextcheck // teardown path: the upstream session-termination DELETE intentionally uses a detached, bounded background context — this hook fires from inside a framed write, which carries no request context (same rule as the killUpstream call sites below).
+	// Arm the host stdout writer's desync teardown before anything can write to it: writes
+	// are fire-and-forget, so without a hook a single partial write latches the writer and
+	// the proxy keeps enforcing and forwarding while every response is silently discarded.
+	// No deadline is armed — a slow host is not a policy failure — so this covers only the
+	// desync case.
+	//nolint:contextcheck // teardown: detached, bounded background context; this hook fires from inside a framed write, which carries no request context.
 	p.hostWriter.SetPoisonHook(func() {
 		fmt.Fprintf(os.Stderr, "[eunox] FATAL: host stdout framing desynced (partial write); tearing down the upstream — no further responses can be delivered.\n")
 		p.killUpstream()
 	})
-	// This connection's identity, captured once: a stdio host has one host connection, so
-	// the claims on the context it is served under are the claims every request on it
-	// carries. Both legs' decision turns and the engine's own state key resolve from this,
-	// so they cannot disagree about which subject this proxy's state accrues to.
+	// Captured once: a stdio host has one connection, so these are the claims every request
+	// on it carries. Both legs' decision turns resolve from this field so they cannot
+	// disagree about which subject this proxy's state accrues to.
 	p.claims = pdp.JWTClaimsPtr(ctx)
 	// The anchor follows from that identity and is therefore a constant, so the ticket queue
 	// is resolved now rather than on every enforced request. Released in Start's teardown.
@@ -448,51 +355,32 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 	}
 
 	// ── 2-3. Initialize handshake + drift check, bounded by sessionStartTimeout ──
-	// Both run blocking upstream pipe reads inline, before readUpstream owns the
-	// reader. A subprocess that launches but never answers initialize (or the drift
-	// tools/list probe) has no internal read deadline, so without this watchdog Start
-	// hangs indefinitely until an operator signals the process — the HTTP path bounds
-	// the same work with sessionStartTimeout, and this backports it. The drift check
-	// runs before readUpstream so we own upReader exclusively.
+	// Both run blocking upstream pipe reads inline, before readUpstream owns the reader.
+	// A subprocess that launches but never answers has no internal read deadline, so
+	// without this watchdog Start hangs indefinitely until an operator signals it.
 	if err := p.runBoundedStartup(ctx, func() error {
 		if err := p.initUpstream(ctx); err != nil {
 			return fmt.Errorf("upstream initialize: %w", err)
 		}
 		if p.driftCheck != nil {
 			raw, probeErr := p.fetchUpstreamToolsRaw(ctx)
-			// Take the Tier-2 interface baseline from the session-start probe, the earliest
-			// view of the advertised surface this session has, so a rewrite between startup
-			// and the host's first tools/list already trips a pin break. It runs BEFORE the
-			// drift check so a session the check then refuses leaves no half-baselined
-			// state behind (ReleaseSession clears it on teardown either way). A probe
-			// failure records nothing — the PDP refuses to baseline an unreadable response
-			// — and the first host tools/list establishes the baseline instead.
+			// Take the Tier-2 interface baseline from the earliest view of the advertised
+			// surface this session has, so a rewrite before the host's first tools/list
+			// already trips a pin break. Runs before the drift check so a refused session
+			// leaves no half-baselined state (ReleaseSession clears it either way). A probe
+			// failure records nothing; the first host tools/list establishes the baseline.
 			if probeErr == nil {
 				p.pdp.RecordObservedToolHashes(pdp.WithCompleteToolListing(pdp.WithSessionID(ctx, p.sessionID)), raw)
 			}
 			if err := p.driftCheck(raw, p.upstreamServerVersion, probeErr); err != nil {
-				// Record the refusal before tearing down: a startup drift failure is the
-				// FM-5 tool-poisoning / rug-pull event this check exists to catch, so it
-				// must be on the tamper-evident tape, not only stderr. The raw drift reason
-				// (which names drifted tools) stays on stderr where drift already logs it;
-				// the tape carries the stable DRIFT_REFUSED category, matching the
-				// JWT_INVALID fixed-code-not-free-form-prose discipline. p.rec() is nil when
-				// no audit sink is configured (guard, as elsewhere).
+				// A startup drift failure is the FM-5 tool-poisoning / rug-pull event this
+				// check exists to catch, so it belongs on the tamper-evident tape, not only
+				// stderr (which keeps the raw, tool-naming reason).
 				recordDriftRefused(ctx, p.rec(), p.sessionID)
-				// Release the per-session Tier-2 state the baseline above just recorded.
-				// The inline comment there says "ReleaseSession clears it on teardown
-				// either way", and on THIS path it did not: a startup refusal returns
-				// straight out of Start, so nothing ever released it. Harmless for the
-				// binary (the process exits), but StdioProxy is an exported seam, and an
-				// embedder that recovers from a refused start and retries would accumulate
-				// baselines keyed by session id for the life of its process.
-				//
-				// Detached and bounded, like the teardown release below and for the same
-				// reason: a drift refusal is routinely REACHED with ctx already done (an
-				// operator's Ctrl-C during startup, or a probe deadline, is itself one of
-				// the ways the probe fails), and ReleaseSession does a flow-store round
-				// trip whose error it discards — so releasing on the dead request context
-				// would silently skip the Redis clear this line exists to perform.
+				// Release the Tier-2 baseline just recorded above: a startup refusal returns
+				// straight out of Start, so the normal teardown release never runs this path.
+				// Detached and bounded like the teardown release below, since a drift refusal
+				// is routinely reached with ctx already done (e.g. a Ctrl-C during startup).
 				releaseCtx, releaseCancel := context.WithTimeout(context.Background(), time.Duration(p.shutdownMs)*time.Millisecond)
 				p.pdp.ReleaseSession(releaseCtx, p.sessionID) //nolint:contextcheck // startup-refusal teardown: detached and bounded, matching Start's own release path.
 				releaseCancel()
@@ -501,12 +389,10 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 		}
 		return nil
 	}); err != nil {
-		p.killUpstream() //nolint:contextcheck // teardown path: the upstream session-termination DELETE intentionally uses a detached, bounded background context — close/reaper/signal/shutdown carry no request context.
-		// Reap the killed subprocess, mirroring the normal-shutdown step 7 and the HTTP
-		// transport's failed-initialize reap: killUpstream only signals, so without Wait
-		// the child stays a zombie and os/exec never closes the stdin/stdout pipe FDs (it
-		// does so inside Wait). The inline startup fn has returned, so no reader races Wait;
-		// waitUpstream is a no-op for a remote HTTP upstream (nil upCmd).
+		p.killUpstream() //nolint:contextcheck // teardown: detached, bounded background context; no request context here.
+		// Reap the killed subprocess: killUpstream only signals, so without Wait the child
+		// stays a zombie and os/exec never closes the stdin/stdout pipe FDs. No reader races
+		// Wait since the inline startup fn has returned; a no-op for a remote HTTP upstream.
 		p.waitUpstream()
 		return err
 	}
@@ -524,7 +410,7 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 	// ── 5. Install signal handler → graceful upstream shutdown ─────────────────
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() { //nolint:contextcheck // teardown path: the upstream session-termination DELETE intentionally uses a detached, bounded background context — close/reaper/signal/shutdown carry no request context.
+	go func() { //nolint:contextcheck // teardown: detached, bounded background context; no request context here.
 		sig, ok := <-sigCh
 		if !ok {
 			return
@@ -535,12 +421,9 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 
 	fmt.Fprintf(os.Stderr, "[eunox] Session %s initialized; proxying to %q.\n", p.sessionID, p.upstreamLabel())
 
-	// Post-startup effects (see StdioProxyOptions.OnReady). This is the stdio host's ready
-	// point — the analogue of the HTTP transport's post-bind hook — and it is placed HERE,
-	// after every fallible startup step, rather than before Start: connectUpstream, the
-	// initialize handshake, and the drift check each return straight out of Start, so a
-	// hook run ahead of them would let a proxy that never comes up overwrite shared state a
-	// running one owns. Nothing between this line and the serve loop can fail.
+	// Post-startup effects (see StdioProxyOptions.OnReady), placed after every fallible
+	// startup step so a proxy that never comes up cannot overwrite shared state a running
+	// one owns. Nothing between this line and the serve loop can fail.
 	if p.onReady != nil {
 		p.onReady(ctx)
 	}
@@ -551,50 +434,35 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 	// ── 7. Drain upstream reader ──────────────────────────────────────────────
 	signal.Stop(sigCh)
 	close(sigCh)
-	p.closeUpstreamInput() //nolint:contextcheck // teardown path: the upstream session-termination DELETE intentionally uses a detached, bounded background context — close/reaper/signal/shutdown carry no request context.
-	p.awaitUpstreamDrain() //nolint:contextcheck // teardown path: the force-kill's upstream session-termination DELETE intentionally uses a detached, bounded background context — close/reaper/signal/shutdown carry no request context.
+	p.closeUpstreamInput() //nolint:contextcheck // teardown: detached, bounded background context; no request context here.
+	p.awaitUpstreamDrain() //nolint:contextcheck // teardown: detached, bounded background context; no request context here.
 	// Upstream has exited: stop the SIGKILL fallback (if armed) so a clean shutdown
 	// emits no spurious "sending SIGKILL" line and the timer is freed promptly.
 	p.stopKillTimer()
 	p.waitUpstream()
 
 	// ── 8. Release this session's per-session enforcement state ─────────────────
-	// Free the session's accumulated flow-label set so an ended session retains nothing
-	// and a reused session id starts clean. Ordered
-	// LAST, and gated behind a bounded drain of in-flight host decisions: on the clean-EOF
-	// path serveHost already waited for every handler, but on the signal/upstream-exit
-	// paths it returns WITHOUT waiting, and draining the upstream reader does NOT cover a
-	// handler still mid-DECISION (a sink peeking the flow set touches no upstream). Without
-	// the drain a Clear could empty the taint between a source's committed Add and a sink
-	// still deciding on this session. Detached, bounded context — teardown must
-	// not block on a slow store, and a Redis store reclaims an orphaned key by idle TTL
-	// regardless. A no-op when the policy uses no flow control.
+	// Ordered last and gated behind a bounded drain of in-flight host decisions: on the
+	// signal/upstream-exit paths serveHost returns WITHOUT waiting for handlers, and
+	// draining the upstream reader does not cover a handler still mid-decision (a sink
+	// peeking the flow set touches no upstream) — without the drain, a release here could
+	// empty the taint between a source's committed write and a sink still deciding.
 	p.awaitHostDecisionsDrained(time.Duration(p.shutdownMs) * time.Millisecond)
-	// And for the server-initiated handlers, which run on their own goroutines rather than on
-	// the reader that step 7 just drained: one still in flight would have its audit record
-	// dropped by the sink the caller closes when Start returns, and could read flow state the
-	// release below has already cleared.
+	// Same concern for server-initiated handlers, which run on their own goroutines rather
+	// than the reader step 7 just drained.
 	p.awaitServerRequestsDrained(time.Duration(p.shutdownMs) * time.Millisecond)
 	releaseCtx, releaseCancel := context.WithTimeout(context.Background(), time.Duration(p.shutdownMs)*time.Millisecond)
-	p.pdp.ReleaseSession(releaseCtx, p.sessionID) //nolint:contextcheck // teardown path: the host is gone; a detached, bounded context is correct here as for the other teardown steps.
+	p.pdp.ReleaseSession(releaseCtx, p.sessionID) //nolint:contextcheck // teardown: the host is gone; detached, bounded context is correct here too.
 	releaseCancel()
 
 	return nil
 }
 
-// awaitHostDecisionsDrained blocks until no dispatched host request is still mid-decision
-// (fwdHostInFlight == 0), or until timeout elapses, so teardown does not clear per-session
-// flow state out from under a sink still deciding. serveHost returns without waiting for its
-// handler goroutines on the signal and upstream-exit paths, and the upstream drain does not
-// cover a handler still in its PDP decision (which touches no upstream), so releasing flow
-// state before those finish could drop a live taint (the stdio analogue of
-// httpSession.awaitInFlightDrained). It is a no-op for a
-// non-flow/non-sequenceBlock session (decideGate nil) — ReleaseSession is itself a no-op
-// there, so there is nothing to protect and no reason to add teardown latency. Bounded and
-// poll-based: teardown is off the hot path and must never hang on a wedged handler. The read
-// loop (the sole fwdHostInFlight increment site) has already exited by the time Start calls
-// this, so the counter only falls — no request can slip in uncounted, unlike the HTTP path's
-// getSession/inFlight window.
+// awaitHostDecisionsDrained blocks until no dispatched host request is still mid-decision, or
+// until timeout elapses, so teardown does not clear per-session flow state out from under a
+// sink still deciding (the stdio analogue of httpSession.awaitInFlightDrained). A no-op when
+// decideGate is nil, since ReleaseSession is itself a no-op then. Bounded and poll-based:
+// teardown must never hang on a wedged handler.
 func (p *StdioProxy) awaitHostDecisionsDrained(timeout time.Duration) {
 	if p.decideGate == nil {
 		return
@@ -611,11 +479,8 @@ func (p *StdioProxy) awaitServerRequestsDrained(timeout time.Duration) {
 }
 
 // awaitDrained polls counter to zero, giving up after timeout. Shared by the two teardown
-// drains rather than written twice: they differ only in which counter they watch and when
-// they are worth doing, and a bound or a poll interval fixed on one copy is not fixed on the
-// other. Bounded and poll-based because teardown is off the hot path and must never hang on a
-// wedged handler; both counters' increment sites have stopped by the time Start calls these,
-// so a counter only falls and nothing can slip in uncounted.
+// drains since both counters' increment sites have stopped by the time Start calls these, so
+// a counter only falls and nothing can slip in uncounted.
 func awaitDrained(counter *atomic.Int64, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for counter.Load() > 0 {
@@ -632,21 +497,15 @@ func (p *StdioProxy) connectUpstream(ctx context.Context) error {
 	if p.upstreamURL != "" {
 		up := newHTTPUpstream(ctx, p.upstreamURL, p.upstreamAuthHeader, p.upstreamTLSSkipVerify, p.upstreamTimeMs)
 		// A transport-level POST failure is reported back through upErr so the waiting
-		// caller records a deny/UPSTREAM_ERROR (matching the gateway) rather than an
-		// allow. reportUpstreamErr only stashes while the caller is still registered, so
-		// a handshake/probe POST (no byUpstreamID entry) is unaffected and still surfaces
-		// its error through the synthesized in-band response.
+		// caller records a deny/UPSTREAM_ERROR (matching the gateway) rather than an allow.
 		up.reportErr = p.reportUpstreamErr
 		p.upHTTP = up
 		p.upWriter = up
 		p.upReader = up
-		// Same limitation as the gateway path (see printRemoteUpstreamNotice in
-		// route.go): a remote HTTP upstream has no inbound stream, so server-initiated
-		// requests it issues are never read or replied to. Surface it so an operator is
-		// not left debugging a silent hang.
-		// Redact the URL: unlike the gateway caller (which passes the route NAME), the
-		// stdio host has no route name, so it labels the notice with the upstream URL —
-		// which must not carry a userinfo/query credential to stderr.
+		// A remote HTTP upstream has no inbound stream, so its own server-initiated requests
+		// are never read or replied to; surface that so an operator isn't left debugging a
+		// silent hang. Redact the URL — no route name here to label the notice with instead —
+		// so a userinfo/query credential never reaches stderr.
 		printRemoteUpstreamNotice(os.Stderr, capability.RedactURLForLog(p.upstreamURL), "")
 		return nil
 	}
@@ -677,14 +536,11 @@ func (p *StdioProxy) connectUpstream(ctx context.Context) error {
 		_ = upIn.Close()
 		return fmt.Errorf("upstream stdout: %w", err)
 	}
-	// Bound each host->upstream pipe write by --upstream-timeout so a subprocess that
-	// stops draining its stdin (e.g. a sampling-capable upstream awaiting its reply) cannot
-	// wedge a write — and, through the MsgWriter mutex + the serve loop's ordering barrier,
-	// the whole session — until SIGINT. On a write timeout the writer poisons and invokes the
-	// onPoison hook (killUpstream), so ANY wedging write path — request, notification, or the
-	// serve loop's server-reply relay — tears the upstream down (readUpstream then EOFs and
-	// the serve loop unblocks) rather than only the request path. --upstream-timeout=0 leaves
-	// the write unbounded (the operator's opt-out).
+	// Bound each host->upstream pipe write by --upstream-timeout so a subprocess that stops
+	// draining its stdin cannot wedge the write — and, through the MsgWriter mutex and the
+	// serve loop's ordering barrier, the whole session — until SIGINT. A write timeout
+	// poisons the writer and kills the upstream, unblocking readUpstream and the serve loop;
+	// --upstream-timeout=0 leaves the write unbounded (the operator's opt-out).
 	p.upWriter = mcp.NewMsgWriterWithTimeout(upIn, msToDuration(p.upstreamTimeMs), p.killUpstream)
 	p.upReader = mcp.NewMsgReader(upOut)
 
@@ -747,14 +603,11 @@ func (p *StdioProxy) signalUpstream(sig os.Signal) {
 	p.killMu.Unlock()
 }
 
-// awaitUpstreamDrain waits for readUpstream to finish (upstreamDone) after the
-// proxy→upstream input has been closed, but bounds the wait: a daemon-style subprocess
-// that ignores stdin EOF and holds its stdout open never lets readUpstream error, so a
-// plain <-upstreamDone would hang Start forever on a host disconnect — defeating graceful
-// shutdown and skipping the deferred audit-sink flush. On the signal path signalUpstream
-// already armed a SIGKILL fallback; the host-EOF path has none, so this force-kills the
-// upstream after shutdownMs and then waits, mirroring httpSession.close's bounded
-// teardown. killUpstream and the drain are idempotent, so the two paths converge safely.
+// awaitUpstreamDrain waits for readUpstream to finish after the proxy→upstream input has
+// been closed, but bounds the wait: a daemon-style subprocess that ignores stdin EOF and
+// holds its stdout open would otherwise hang Start forever on a host disconnect, defeating
+// graceful shutdown and skipping the deferred audit-sink flush. Force-kills after shutdownMs
+// and waits, mirroring httpSession.close's bounded teardown.
 func (p *StdioProxy) awaitUpstreamDrain() {
 	select {
 	case <-p.upstreamDone:
@@ -762,36 +615,22 @@ func (p *StdioProxy) awaitUpstreamDrain() {
 	case <-time.After(p.killDelay()):
 		fmt.Fprintf(os.Stderr, "[eunox] Upstream did not exit after host disconnect; forcing shutdown.\n")
 		p.killUpstream()
-		// Bound the post-kill wait independently, exactly as httpSession.close does.
-		// The kill EOFs the pipe almost immediately in the ordinary case, but "almost
-		// immediately" is not "always": a descendant that escaped the process group
-		// (a double-fork, an explicit setsid) still holds the pipe, and on a platform
-		// with no process-group teardown at all every wrapper-launched grandchild does.
-		// An unbounded wait here turns that into a proxy that never exits and never
-		// flushes its audit sink — the opposite of what this bounded teardown exists
-		// for. The subprocess is already killed; abandoning the wait leaves only the
-		// reader goroutine, which drains and exits on its own if the pipe ever closes.
+		// Bound the post-kill wait independently: the kill EOFs the pipe almost immediately
+		// in the ordinary case, but a descendant that escaped the process group can still
+		// hold it open, and an unbounded wait here would leave the proxy never exiting and
+		// never flushing its audit sink.
 		waitBounded(p.upstreamDone, p.killDelay(), "upstream output stream")
 	}
 }
 
 // stopKillTimer cancels the SIGKILL fallback signalUpstream armed, if any, and reports
 // whether it was cancelled before firing. Every teardown that has already reaped the
-// upstream must call it: the fallback is a time.AfterFunc, so an uncancelled one runs its
-// goroutine — logging a spurious "sending SIGKILL" and signalling an already-reaped
-// process — at an arbitrary point after the shutdown it was meant to bound.
+// upstream must call it: an uncancelled time.AfterFunc logs a spurious "sending SIGKILL"
+// and signals an already-reaped process at an arbitrary later point.
 //
-// It is a method rather than an inline block in Start so a caller that drives the upstream
-// lifecycle directly performs the same teardown Start does. A test that skipped it left a
-// goroutine outliving the test, which then read os.Stderr while another test swapped that
-// process-global (see captureStderr) — a data race the race detector attributes to
-// whichever test happened to be running.
-//
-// A false return means the timer had already fired; Stop does NOT wait for a started
-// AfterFunc, and this deliberately does not either. Waiting would make teardown block on
-// that goroutine's stderr write, which is exactly the stall the audit sink avoids by
-// keeping stderr writes off its lock — a dead log collector's full pipe must not be able
-// to wedge a shutdown.
+// A false return means the timer had already fired; Stop does not wait for a started
+// AfterFunc, and this deliberately does not either — waiting would block teardown on that
+// goroutine's stderr write, the same stall the audit sink avoids by keeping stderr off its lock.
 func (p *StdioProxy) stopKillTimer() bool {
 	p.killMu.Lock()
 	t := p.killTimer
@@ -803,9 +642,8 @@ func (p *StdioProxy) stopKillTimer() bool {
 }
 
 // killDelay is the grace period before a graceful upstream shutdown escalates to a
-// force-kill: the configured shutdownMs, or a 5s fallback for a zero-value proxy. Shared
-// by the signal path (signalUpstream's SIGKILL timer) and the host-EOF path
-// (awaitUpstreamDrain) so both bound a wedged upstream identically.
+// force-kill: the configured shutdownMs, or a 5s fallback for a zero-value proxy. Shared by
+// the signal and host-EOF teardown paths so both bound a wedged upstream identically.
 func (p *StdioProxy) killDelay() time.Duration {
 	killMs := p.shutdownMs
 	if killMs <= 0 {
@@ -835,15 +673,12 @@ func (p *StdioProxy) waitUpstream() {
 	}
 }
 
-// runBoundedStartup runs the blocking session-start work fn under a
-// sessionStartTimeout deadline. fn blocks on upstream pipe reads that carry no
-// internal deadline, so on expiry the subprocess is killed (EOF-ing the pipe) to
-// unblock the Read, then fn is awaited — mirroring httpSession.initUpstream.
-// Without this, a subprocess that launches but never writes the initialize
-// response (or never answers the drift tools/list probe) hangs Start until an
-// operator signals it. The remote-HTTP bridge already bounds its own reads
-// (per-request HTTP timeouts), and a second watchdog could kill a slow-but-valid
-// remote, so the watchdog applies only to the subprocess path.
+// runBoundedStartup runs the blocking session-start work fn under a sessionStartTimeout
+// deadline: on expiry the subprocess is killed (EOF-ing the pipe) to unblock fn's read, then
+// fn is awaited — mirroring httpSession.initUpstream. Without this, a subprocess that never
+// answers initialize (or the drift probe) hangs Start until an operator signals it. The
+// remote-HTTP bridge already bounds its own reads via per-request timeouts, so the watchdog
+// applies only to the subprocess path.
 func (p *StdioProxy) runBoundedStartup(ctx context.Context, fn func() error) error {
 	if p.upHTTP != nil {
 		return fn()
@@ -857,12 +692,9 @@ func (p *StdioProxy) runBoundedStartup(ctx context.Context, fn func() error) err
 	case err := <-done:
 		return err
 	case <-startCtx.Done():
-		p.killUpstream() //nolint:contextcheck // teardown path: the upstream session-termination DELETE intentionally uses a detached, bounded background context — close/reaper/signal/shutdown carry no request context.
-		// fn observes the pipe EOF the kill produced and returns — bounded, because a
-		// descendant that escaped the process group (or a platform without one) can hold
-		// that pipe open indefinitely, and an unbounded wait here would hang the very
-		// startup watchdog whose whole job is to bound a wedged upstream. Mirrors
-		// awaitUpstreamDrain's second bound.
+		p.killUpstream() //nolint:contextcheck // teardown: detached, bounded background context; no request context here.
+		// Bound the post-kill wait too: an escaped-process-group descendant can hold the
+		// pipe open indefinitely, and this watchdog's whole job is to bound a wedged upstream.
 		waitBounded(done, p.killDelay(), "upstream startup output stream")
 		return fmt.Errorf("upstream did not complete startup within %s: %w", timeout, startCtx.Err())
 	}
@@ -881,9 +713,8 @@ func (p *StdioProxy) startupBudget() time.Duration {
 
 // httpBridgeStartCtx bounds a remote-HTTP-bridge startup step (the initialize handshake,
 // the tools/list drift probe) by the session-start budget, and returns ctx unchanged on
-// the subprocess path (whose overall bound is runBoundedStartup's child-kill watchdog).
-// The budget is deliberately independent of --upstream-timeout in BOTH directions: a tight
-// value must not fail startup, and a generous one must not widen it. The caller must
+// the subprocess path (whose bound is runBoundedStartup's child-kill watchdog instead). The
+// budget is deliberately independent of --upstream-timeout in both directions. Caller must
 // invoke the returned cancel.
 func (p *StdioProxy) httpBridgeStartCtx(ctx context.Context) (context.Context, context.CancelFunc) {
 	if p.upHTTP == nil {
@@ -897,23 +728,19 @@ func (p *StdioProxy) httpBridgeStartCtx(ctx context.Context) (context.Context, c
 // HTTP bridge path.
 func (p *StdioProxy) initUpstream(ctx context.Context) error {
 	// Bound the whole remote-HTTP-bridge handshake by the session-start budget (a no-op on
-	// the subprocess path). runBoundedStartup does NOT wrap the HTTP path with a deadline,
-	// and postWithCtx passes bound=0, so without this a hung upstream + a disabled
-	// --upstream-timeout (no http.Client header timeout) would wedge startup indefinitely.
-	// The old upWriter.Write path bounded this at notifyPostTimeout; this restores a bound
-	// and matches how the drift probe bounds its own tools/list read.
+	// the subprocess path): runBoundedStartup does not wrap the HTTP path with a deadline,
+	// so without this a hung upstream plus a disabled --upstream-timeout would wedge startup
+	// indefinitely.
 	ctx, cancel := p.httpBridgeStartCtx(ctx)
 	defer cancel()
 
 	p.idCounter++
 	initReq, initID := buildInitializeRequest(p.idCounter)
-	// On the remote-HTTP bridge, POST the initialize via the context-aware path and read
-	// the response via readProbeReply (readCtx) so the handshake honors ctx.Done(). The
-	// bridge's plain Read selects only on incoming/done, and spawnPost can drop the POST
-	// on an already-canceled ctx (leaving nothing in-flight to feed incoming), so a
-	// SIGINT/SIGTERM during a slow handshake — or an expired budget above — would otherwise
-	// wedge Start until SIGKILL. The subprocess path keeps the blocking pipe Write/Read,
-	// which runBoundedStartup's child-kill watchdog bounds via pipe EOF.
+	// POST via the context-aware path and read via readProbeReply so the handshake honors
+	// ctx.Done(): the bridge's plain Read selects only on incoming/done, and a POST can be
+	// dropped on an already-canceled ctx, so a signal during a slow handshake would otherwise
+	// wedge Start until SIGKILL. The subprocess path's blocking pipe Write/Read is instead
+	// bounded by runBoundedStartup's child-kill watchdog.
 	if p.upHTTP != nil {
 		p.upHTTP.postWithCtx(ctx, initReq)
 	} else if err := p.upWriter.Write(initReq); err != nil {
@@ -947,25 +774,20 @@ func (p *StdioProxy) initUpstream(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// For the remote-HTTP bridge, Write is fire-and-forget, so the host's first
-	// request could race notifications/initialized and trip strict upstreams.
-	// Deliver it synchronously so the handshake is not reported complete until the
-	// notification has been POSTed. The subprocess path's Write is already a
-	// synchronous pipe write.
+	// For the remote-HTTP bridge, Write is fire-and-forget, so the host's first request
+	// could race notifications/initialized and trip strict upstreams; deliver it
+	// synchronously instead. The subprocess path's Write is already synchronous.
 	if p.upHTTP != nil {
 		return p.upHTTP.writeSync(ctx, notif)
 	}
 	return p.upWriter.Write(notif)
 }
 
-// maxConcurrentHostRequests bounds the in-flight host-request handler goroutines
-// serveHost spawns. Each handler can block on the upstream round-trip (unboundedly
-// under --upstream-timeout=0 with a silent upstream) and holds a pending /
-// byUpstreamID entry, so an uncapped goroutine-per-request lets a pipelining host
-// exhaust memory and FDs. On saturation serveHost rejects further requests with a
-// structured error rather than spawning. Generous enough that honest pipelining
-// never trips it; the remote-HTTP bridge caps its own POSTs separately
-// (maxInflightPosts).
+// maxConcurrentHostRequests bounds the in-flight host-request handler goroutines serveHost
+// spawns. Each handler can block on the upstream round-trip unboundedly under
+// --upstream-timeout=0, so an uncapped goroutine-per-request lets a pipelining host exhaust
+// memory and FDs; on saturation serveHost rejects with a structured error instead of
+// spawning. The remote-HTTP bridge caps its own POSTs separately (maxInflightPosts).
 const maxConcurrentHostRequests = 256
 
 // jsonRPCCodeServerBusy is returned to the host when serveHost's in-flight cap is
@@ -995,50 +817,32 @@ func releaseHostForward(ctx context.Context) {
 	}
 }
 
-// waitHostForwardOrShutdown blocks until the host-forward ordering barrier
-// (fwdHostWrites) drains — every host request received before the current
-// notification has reached the upstream — or the session is shutting down (ctx
-// cancelled or the upstream exited). It returns true only when the barrier drained,
-// so the caller forwards the notification in wire order; false means stop. Keeping
-// the wait interruptible matters because a request's upstream write can wedge under
-// --upstream-timeout=0 against an upstream that stops draining its stdin; a blocking
-// WaitGroup.Wait there would pin the serve loop past a signal. The waiter goroutine
-// outlives a shutdown-cancelled wait until the barrier eventually drains, which is
-// fine on the teardown path (the process is exiting).
+// waitHostForwardOrShutdown blocks until the host-forward ordering barrier (fwdHostWrites)
+// drains — every host request received before the current notification has reached the
+// upstream — or the session is shutting down. True means the barrier drained and the caller
+// forwards in wire order; false means stop. The wait must stay interruptible: a request's
+// upstream write can wedge under --upstream-timeout=0, and a blocking WaitGroup.Wait there
+// would pin the serve loop past a signal.
 //
-// Interruptibility on the shutdown legs also bounds the former sampling + write-wedge
-// deadlock: the serve loop is the sole router of host responses to server-initiated
-// requests (serveHost's IsResponse branch), so a handler wedged in a raw upstream stdin
-// write — holding both a fwdHostWrites slot and the MsgWriter mutex because a
-// sampling-capable upstream stopped draining its stdin — used to park this loop on the
-// barrier forever, with the sampling reply that would unblock the upstream stuck behind
-// it. That is now resolved at the write itself: the subprocess MsgWriter carries a
-// per-write deadline of --upstream-timeout (NewMsgWriterWithTimeout), so a wedged write
-// returns ErrUpstreamWriteTimeout instead of blocking indefinitely; callUpstream then
-// tears the upstream down, which drains this barrier and unblocks the loop. Under
-// --upstream-timeout=0 the write is intentionally unbounded (the operator's opt-out), so
-// the interruptible wait here remains the residual "recoverable by shutdown" backstop.
+// Interruptibility here also bounds a former sampling + write-wedge deadlock: a handler
+// wedged in a raw upstream write (holding both a fwdHostWrites slot and the MsgWriter mutex,
+// e.g. against a sampling-capable upstream that stopped draining stdin) used to park the
+// serve loop on this barrier forever, with the sampling reply that would unblock the
+// upstream stuck behind it. That is now resolved at the write itself (NewMsgWriterWithTimeout
+// poisons and tears the upstream down on a wedged write), so this wait is the residual
+// "recoverable by shutdown" backstop for the --upstream-timeout=0 opt-out.
 func (p *StdioProxy) waitHostForwardOrShutdown(ctx context.Context) bool {
-	// Fast path: no host request is in flight ahead of this notification, so the
-	// wire-order barrier is already drained — skip the throwaway waiter goroutine and
-	// channel entirely (the common case for a notification-heavy host, and it also
-	// avoids the documented shutdown-time leak of that goroutine in that case). The
-	// counter is incremented only by serveHost, the same single-threaded loop that
-	// calls this, so a zero read here cannot race with a concurrent Add; a concurrent
-	// decrement (a handler releasing) only ever makes the count smaller, so a 0 read is
-	// never a false "drained".
+	// Fast path: skip the waiter goroutine when nothing is in flight (the common case for a
+	// notification-heavy host). Only serveHost increments the counter and it is the sole
+	// caller here, so a zero read here cannot race with a concurrent Add.
 	if p.fwdHostInFlight.Load() == 0 {
 		return true
 	}
 	drained := make(chan struct{})
-	// On a shutdown wake (ctx.Done / upstreamDone) this returns while the goroutine is
-	// still blocked in Wait(); it ends only once the barrier eventually drains. That is
-	// safe because the sole caller stops serving on a false return (it does not loop
-	// back and issue another fwdHostWrites.Add while this waiter is still registered —
-	// Add-concurrent-with-Wait is documented WaitGroup misuse and panics), and because
-	// StdioProxy runs in a binary that exits on shutdown, so the leaked goroutine dies
-	// with the process. If StdioProxy is ever reused as a long-lived library component,
-	// replace this with a sync.OnceFunc-posted channel so the waiter cannot accumulate.
+	// On a shutdown wake this returns while the goroutine is still blocked in Wait(), ending
+	// only once the barrier eventually drains — safe because the sole caller stops serving on
+	// a false return (never issues another Add while this waiter is registered) and the
+	// process exits on shutdown, so the leaked goroutine dies with it.
 	go func() { p.fwdHostWrites.Wait(); close(drained) }()
 	select {
 	case <-drained:
@@ -1067,16 +871,12 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 
 	var wg sync.WaitGroup
 
-	// Run the blocking host read off the serve loop so the loop can select on
-	// ctx.Done()/upstreamDone too. The reader exits on the first read error (EOF), or
-	// when ctx is cancelled or the upstream exits while it is parked trying to hand off a
-	// message; a reader still parked inside the syscall on os.Stdin is reclaimed when the
-	// process exits (os.Stdin.Read is not context-cancelable, so this is the one leak the
-	// binary accepts — it is bounded because the sole caller is a one-shot leaf that then
-	// exits). The hand-off select mirrors the serve loop's arms below, including
-	// upstreamDone: without it a reader that finished a Read just as the loop returned via
-	// upstreamDone would block on the hand-off until ctx cancels (never, on the
-	// upstream-self-exit path), leaking for a long-lived library caller of NewStdioProxy.
+	// Run the blocking host read off the serve loop so the loop can also select on
+	// ctx.Done()/upstreamDone. A reader parked inside the os.Stdin syscall (not
+	// context-cancelable) is reclaimed only when the process exits — the one leak the binary
+	// accepts, since its sole caller is a one-shot leaf. The hand-off select mirrors the
+	// serve loop's arms, including upstreamDone, so a reader finishing just as the loop
+	// exits via upstreamDone does not block the hand-off until ctx cancels.
 	type hostRead struct {
 		msg mcp.RPCMsg
 		err error
@@ -1106,39 +906,27 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 		select {
 		case r = <-reads:
 		case <-ctx.Done():
-			// Signal / parent cancellation: stop serving immediately so the proxy
-			// self-terminates. Do NOT wait for in-flight handlers here — that would
-			// re-couple shutdown latency to a stuck upstream, the very signal-deafness
-			// this loop was restructured to fix. Each handler unblocks on the shared ctx
-			// or, if wedged in a raw upstream-pipe write, when Start's teardown kills the
-			// upstream; their deferred cleanup then runs. Start drains the upstream next.
+			// Stop serving immediately; do NOT wait for in-flight handlers here — that
+			// would re-couple shutdown latency to a stuck upstream. Each handler unblocks
+			// on the shared ctx, or on Start's teardown kill if wedged in a raw write.
 			return
 		case <-p.upstreamDone:
-			// Upstream exited on its own: every further request would just fail with
-			// errUpstreamExited, so stop serving and let Start tear down. Handlers
-			// awaiting the upstream already observe upstreamDone and return; nothing
-			// remains to forward, so do not block on them either.
+			// Upstream exited on its own: further requests would just fail, so stop and let
+			// Start tear down; handlers already observe upstreamDone and return.
 			return
 		}
 		if r.err != nil {
-			// A malformed line is recoverable: the newline framing is intact, so answer
-			// JSON-RPC -32700 (id null, per the spec — a parse error has no reliable id)
-			// and keep serving, matching how MCP stdio transports handle bad input. Any
-			// other error (EOF, bufio.ErrTooLong, I/O) loses framing and ends the session.
+			// A malformed line is recoverable: framing is intact, so answer -32700 and keep
+			// serving. Any other error (EOF, bufio.ErrTooLong, I/O) loses framing and ends
+			// the session.
 			if errors.Is(r.err, mcp.ErrParse) {
-				// id null, per the JSON-RPC 2.0 spec: pass an explicit "null" rather than
-				// nil so the marshaled response carries "id":null. RPCMsg.ID is
-				// `json:"id,omitempty"`, so a nil id would drop the member entirely and a
-				// spec-strict client could reject the reply as neither response nor
-				// notification.
+				// Explicit "null" id, per the JSON-RPC 2.0 spec: RPCMsg.ID is
+				// `json:"id,omitempty"`, so a nil id would drop the member entirely.
 				_ = p.hostWriter.Write(mcp.ErrorResponse(mcp.RawJSON("null"), jsonRPCCodeParseError, "Parse error"))
 				continue
 			}
-			// A terminal host read error ends the session. EOF is the ordinary
-			// host-closed-stdin case and stays silent; anything else — a 4 MiB
-			// bufio.ErrTooLong, an I/O fault — is a session that died mid-stream for a
-			// reason the operator cannot otherwise see, since this leg wrote nothing at
-			// all. readUpstream already logs the same class from the other direction.
+			// EOF is the ordinary host-closed-stdin case and stays silent; anything else is
+			// a session that died mid-stream for a reason otherwise invisible to the operator.
 			if !errors.Is(r.err, io.EOF) {
 				fmt.Fprintf(os.Stderr, "[eunox] host read error: %v; ending session\n", r.err)
 			}
@@ -1148,56 +936,43 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 
 		if msg.IsNotification() {
 			// forwardHostNotification returns true only when a shutdown woke the
-			// wire-ordering barrier, in which case serveHost must stop immediately
-			// (matching the ctx.Done / upstreamDone cases in the select above).
+			// wire-ordering barrier, matching the ctx.Done/upstreamDone cases above.
 			if p.forwardHostNotification(ctx, msg) {
 				return
 			}
 			continue
 		}
 		if msg.IsRequest() {
-			// Bound concurrent handlers (see maxConcurrentHostRequests). Acquire is
-			// non-blocking: the read loop must keep routing the host's replies to
-			// server-initiated requests (the IsResponse branch below), so it must never
-			// stall on a saturated pool. On saturation, reject with a structured,
-			// retryable error instead of spawning an unbounded goroutine.
+			// Acquire is non-blocking: the read loop must keep routing host replies to
+			// server-initiated requests (the IsResponse branch below), so it must never stall
+			// on a saturated pool.
 			select {
 			case p.hostSem <- struct{}{}:
-				// The pool had a free slot, so any saturation episode is over: re-arm the
-				// gate so the next refusal is recorded as a new episode rather than folded
-				// into the last one. Mirrors the HTTP pools' acquire helpers.
+				// A free slot means any saturation episode is over; re-arm the gate so the
+				// next refusal is recorded as a new episode rather than folded into the last.
 				p.hostSaturation.clear()
 			default:
-				// Record the refusal so a host saturating the handler pool (a DoS probe, or a
-				// runaway client) leaves a trace on the tamper-evident tape rather than only a
-				// server-busy reply, mirroring the HTTP per-session cap through the same helper
-				// (which also keeps the refused method out of the target field). p.rec() is nil
-				// when no audit sink is configured; the helper skips the record then.
+				// Record the refusal so a host saturating the handler pool leaves a trace on
+				// the tamper-evident tape rather than only a server-busy reply.
 				recordResourceExhausted(ctx, p.rec(), &p.hostSaturation, p.sessionID, msg.Method)
 				_ = p.hostWriter.Write(mcp.ErrorResponse(msg.ID, jsonRPCCodeServerBusy, "eunox: too many concurrent requests in flight; retry"))
 				continue
 			}
 			// Reserve the decision ticket HERE, in the single-threaded read loop, so it
-			// reflects proxy-RECEIPT order — the handler goroutines then run their
-			// decisions in that order regardless of scheduling. Only enforced methods take a
-			// ticket (only they run a PDP decision +
-			// state write), and only after the hostSem acquire above, so a server-busy
-			// rejection never strands an un-begun ticket that would stall every later one.
-			// A non-serialized session (non-flow/non-sequenceBlock policy) reserves none.
+			// reflects proxy-RECEIPT order — the handler goroutines then run their decisions
+			// in that order regardless of scheduling. Only enforced methods take one, and
+			// only after the hostSem acquire above, so a server-busy rejection never strands
+			// an un-begun ticket that would stall every later one.
 			serialized := p.decideGate != nil && isEnforcedMethod(msg.Method)
 			var ticket decisionTicket
 			if serialized {
-				// Reserved HERE, in the reader, because that is where the receipt order is.
 				ticket = p.takeDecisionTicket()
 			}
-			// One goroutine per request. The read loop must NOT block on a request: it
-			// is also the only path that routes the host's replies to server-initiated
-			// requests back to the upstream, so blocking dispatch here would deadlock a
-			// sampling/roots-capable upstream (the loop stalls, and handlers waiting on
-			// those replies never progress). The ordering barrier (fwdHostWrites) is
-			// released when the request reaches the upstream (callUpstream, via the ctx
-			// value) or — for a denied/errored request that never does — when the handler
-			// returns; sync.OnceFunc makes the double call a single Done.
+			// One goroutine per request: the read loop must not block, since it is also the
+			// only path routing host replies to server-initiated requests back to the
+			// upstream — blocking here would deadlock a sampling/roots-capable upstream. The
+			// ordering barrier releases when the request reaches the upstream or, for a
+			// denied/errored request that never does, when the handler returns.
 			p.fwdHostWrites.Add(1)
 			p.fwdHostInFlight.Add(1)
 			release := sync.OnceFunc(func() {
@@ -1210,12 +985,10 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 				defer func() { <-p.hostSem }()
 				defer release()
 				hctx := context.WithValue(ctx, fwdReleaseKey{}, release)
-				// For a serialized enforced request, wait this ticket's turn before the
-				// decision runs (begin blocks until the earlier tickets' decisions
-				// commit), and advance the turn afterward. The Decide* handler releases
-				// early via finishDecision (before the upstream forward); this defer is
-				// the idempotent backstop for the malformed-params path, which returns
-				// before the decision. The end func is threaded to the handler via ctx.
+				// Wait this ticket's turn before the decision runs and advance it afterward.
+				// The Decide* handler releases early via finishDecision (before the upstream
+				// forward); this defer is the idempotent backstop for the malformed-params
+				// path, which returns before the decision.
 				if serialized {
 					end := p.decideGate.begin(ticket)
 					defer end()
@@ -1230,17 +1003,12 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 			// forwarded (e.g. the LLM result for sampling/createMessage). Route it back
 			// to the waiting upstream; an untracked ID is ignored.
 			if p.serverReqs.take(mcp.MsgKey(msg.ID)) {
-				// Mirror the HTTP transport's kill gate on this leg (http_routing.go): a
-				// kill that lands after the request was forwarded but before the host's
-				// reply arrives must not deliver that reply to a killed session's upstream.
-				// The tracked id is consumed above (no leak); a kill does not tear the
-				// upstream down, so its blocked server-initiated request is left unanswered
-				// and the upstream is reclaimed on teardown.
+				// A kill landing after the request was forwarded but before the host's reply
+				// arrives must not deliver that reply to a killed session's upstream; a kill
+				// does not tear the upstream down, so the blocked request is simply left
+				// unanswered and reclaimed on teardown.
 				if deny := p.pdp.CheckKill(ctx, p.sessionID); deny != nil {
-					// Record the dropped host reply so a killed session's suppressed
-					// server-response is visible on the tape, mirroring the host-notification
-					// kill record (forwardHostNotification). A response carries no method, so
-					// use a fixed "server-response" identifier.
+					// A response carries no method, so use a fixed identifier for the record.
 					recordKillDrop(ctx, p.rec(), deny, verifiedSession(p.sessionID), "server-response", "server-response", legStdioServerResponse)
 				} else {
 					_ = p.upWriter.Write(msg)
@@ -1250,48 +1018,30 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 		}
 		// Ignore malformed messages.
 	}
-	// Host stdin closed (EOF). Wait for in-flight handlers to finish their upstream
-	// round-trip before returning; the upstream input stays OPEN here so a request
-	// the host pipelined just before closing stdin can still be forwarded and
-	// answered (closing it first would race the handler's outbound write). Start
-	// closes the upstream input only after this returns.
-	//
-	// This is unbounded only under --upstream-timeout=0 with an upstream that never
-	// responds — inherent to opting out of per-call timeouts; the default timeout
-	// cancels a stuck handler and lets wg.Wait return.
+	// Host stdin closed (EOF). Wait for in-flight handlers before returning; the upstream
+	// input stays open here so a request pipelined just before stdin closed can still be
+	// forwarded and answered. Unbounded only under --upstream-timeout=0 with an upstream
+	// that never responds; the default timeout cancels a stuck handler.
 	wg.Wait()
 }
 
-// forwardHostNotification forwards one host->upstream notification, enforcing (in
-// order) the swallow of notifications/initialized (and a mid-session "initialize"
-// sent as a notification), the session kill switch, the host wire-ordering barrier,
-// and the notifications/cancelled id translation. It returns stop=true ONLY when a
-// shutdown woke the ordering barrier, signalling serveHost to return immediately;
-// false to continue the serve loop.
+// forwardHostNotification forwards one host->upstream notification, enforcing (in order) the
+// swallow of notifications/initialized, the session kill switch, the host wire-ordering
+// barrier, and the notifications/cancelled id translation. Returns stop=true ONLY when a
+// shutdown woke the ordering barrier, signalling serveHost to return immediately.
 //
-// notifications/initialized is swallowed (the proxy already sent its own to the
-// upstream during its client handshake). An id-less "initialize" is swallowed too:
-// IsNotification()'s classification is purely structural, so a client can send
-// "initialize" with no id and have it classified as a notification even though the
-// method is ordinarily a request — forwarding that verbatim would let it re-trigger
-// the upstream's handshake outside dispatchRequest's kill gate and audit trail,
-// mirroring the HTTP transport's sessionless-initialize-notification drop. A killed
-// session must not push notifications upstream either — mirror the HTTP transport's
-// notification kill check so the kill is enforced identically on both transports; a
-// notification is fire-and-forget, so the kill is recorded and the message dropped
-// (p.pdp is non-nil: NewStdioProxy defaults an omitted PDP).
+// An id-less "initialize" is swallowed too: IsNotification()'s classification is purely
+// structural, so a client can send "initialize" with no id and have it classified as a
+// notification — forwarding that verbatim would re-trigger the upstream's handshake outside
+// dispatchRequest's kill gate and audit trail.
 //
-// The wire-ordering barrier waits for every request the host sent before this
-// notification to reach the upstream first, so on a SUBPROCESS upstream a
-// notifications/cancelled cannot be delivered ahead of the tools/call it cancels. On a
-// remote HTTP upstream it orders the proxy's dispatch only — each call is its own POST —
-// so cancellation there is best-effort, as it is on the gateway.
-//
-// The barrier releases on the upstream WRITE,
-// not the response, so cancelling a slow in-flight call does not block it. On a
-// shutdown wake it returns stop=true rather than looping: a leaked waiter is still
-// registered on fwdHostWrites, so reading further requests (each fwdHostWrites.Add)
-// would be Add-concurrent-with-Wait, a WaitGroup misuse that panics on teardown.
+// The wire-ordering barrier waits for every request the host sent before this notification to
+// reach the upstream first, so on a subprocess upstream a notifications/cancelled cannot be
+// delivered ahead of the tools/call it cancels; on a remote HTTP upstream cancellation is
+// best-effort, as on the gateway. It releases on the upstream WRITE, not the response, so
+// cancelling a slow in-flight call does not block it. On a shutdown wake it returns stop=true
+// rather than looping: a leaked waiter is still registered on fwdHostWrites, so reading
+// further requests would be Add-concurrent-with-Wait, a WaitGroup misuse that panics.
 func (p *StdioProxy) forwardHostNotification(ctx context.Context, msg mcp.RPCMsg) (stop bool) {
 	if isSwallowedHostNotification(msg.Method) {
 		return false
@@ -1300,20 +1050,13 @@ func (p *StdioProxy) forwardHostNotification(ctx context.Context, msg mcp.RPCMsg
 		recordKillDrop(ctx, p.rec(), deny, verifiedSession(p.sessionID), msg.Method, msg.Method, legStdioNotification)
 		return false
 	}
-	// An enforced method (tools/call, resources/read, resources/subscribe,
-	// resources/unsubscribe, prompts/get) framed as a notification (no id) is a fail-closed reject —
-	// see denyEnforcedMethodNotification, shared with the HTTP transport's
-	// equivalent guard so the check and its audit record cannot drift between
-	// the two transports.
+	// An enforced method framed as a notification (no id) is a fail-closed reject; shared
+	// with the HTTP transport's equivalent guard so the two cannot drift.
 	if denyEnforcedMethodNotification(ctx, p.rec(), p.sessionID, msg) {
 		return false
 	}
-	// Any notification method outside the forwardable allowlist (notifications/
-	// cancelled, notifications/progress, notifications/roots/list_changed) is a
-	// fail-closed reject — see denyUnmappedHostNotification, shared with the HTTP
-	// transport's equivalent guard so a notification-framed novel/unmapped method
-	// cannot reach the upstream invisibly while its request-framed twin would be
-	// denied and logged by dispatchUnmapped.
+	// Any notification method outside the forwardable allowlist is a fail-closed reject,
+	// shared with the HTTP transport's equivalent guard.
 	if denyUnmappedHostNotification(ctx, p.rec(), p.sessionID, msg) {
 		return false
 	}
@@ -1340,10 +1083,9 @@ func (p *StdioProxy) forwardHostNotification(ctx context.Context, msg mcp.RPCMsg
 // response is supplied by p.buildInitResponse (wired into dispatchParams).
 func (p *StdioProxy) handleHostRequest(ctx context.Context, msg mcp.RPCMsg) {
 	d := p.dispatchParams()
-	// decisionEndFromContext is the per-session decision-lock release (nil unless the
-	// serve loop threaded one for a serialized enforced request); the Decide* handlers
-	// call it right after the PDP decision so the upstream forward runs outside the lock.
-	// A direct test caller of handleHostRequest threads none, so it is nil.
+	// nil unless the serve loop threaded a decision-lock release for a serialized enforced
+	// request; the Decide* handlers call it right after the decision so the upstream forward
+	// runs outside the lock.
 	d.endDecision = decisionEndFromContext(ctx)
 	_ = p.hostWriter.Write(dispatchRequest(ctx, d, msg))
 }
@@ -1358,11 +1100,8 @@ func (p *StdioProxy) strictAudit() strictAuditState {
 	}
 }
 
-// dispatchParams bundles the proxy's policy/audit/upstream wiring for the shared
-// request dispatcher. stdio carries no per-request client address, so sourceIP is
-// empty; the sink is routed through asRecorder so a nil sink becomes a true nil
-// interface, keeping the core's nil check a real "no sink" test (not the typed-nil
-// trap).
+// dispatchParams bundles the proxy's policy/audit/upstream wiring for the shared request
+// dispatcher. stdio carries no per-request client address, so sourceIP is empty.
 func (p *StdioProxy) dispatchParams() dispatchParams {
 	return dispatchParams{
 		forwardParams: forwardParams{
@@ -1412,16 +1151,12 @@ func (p *StdioProxy) forwardServerRequestToHost(msg mcp.RPCMsg) {
 }
 
 // dispatchUpstreamRequest hands one server-initiated request to the proxy's serverRequestPool,
-// which runs its handler on its own goroutine or refuses it when the pool is saturated. See
+// which runs its handler on its own goroutine or refuses it when saturated. See
 // serverRequestPool for why the handler must not run inline on the read loop, and for the
-// ordering guarantee this path deliberately gives up.
-//
-// The two writers this leg reaches are both safe to share: mcp.MsgWriter serializes whole
-// frames under its own mutex (so a concurrent host reply cannot interleave with a serve-loop
-// write), and the upstream sink is documented concurrency-safe and already written from every
-// host handler goroutine. Host-initiated traffic keeps every ordering guarantee it had: its
-// receipt order is fixed by serveHost's ticket reservation and its request/notification barrier
-// is fwdHostWrites, neither of which this path touches.
+// ordering guarantee this path gives up. The two writers it reaches are both safe to share:
+// mcp.MsgWriter serializes whole frames under its own mutex, and the upstream sink is
+// documented concurrency-safe. Host-initiated traffic's ordering guarantees (ticket
+// reservation, fwdHostWrites) are untouched by this path.
 func (p *StdioProxy) dispatchUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) {
 	p.serverPool.dispatch(ctx, msg, serverRequestDispatch{
 		rec:           p.rec(),
@@ -1440,18 +1175,12 @@ func (p *StdioProxy) dispatchUpstreamRequest(ctx context.Context, msg mcp.RPCMsg
 // It is called on a per-request goroutine (dispatchUpstreamRequest), never on the read loop.
 // Tests call it directly and synchronously, which is the same body without the dispatch.
 func (p *StdioProxy) handleUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) {
-	// The stdio transport has no network client: no source IP to gate sampling on
-	// (an ipRange condition fails closed here) and no JWT identity.
+	// No network client on this transport: no source IP to gate sampling on, no JWT identity.
 	//
-	// forward always reports true, which is an honest inaccuracy rather than a
-	// guarantee: writes to the host writer are fire-and-forget (a dropped host reply
-	// has nowhere to return an error to), so a poisoned stdout — a partial frame that
-	// latched the writer — discards the request while the audit record still says
-	// delivered=true. The HTTP transport can report the failure because its forward has
-	// a response writer to fail against. What bounds the stdio window is the writer's
-	// poison hook, armed in Start: the FIRST desync tears the upstream down and ends the
-	// session, so at most the frames already in flight are misrecorded rather than an
-	// open-ended stream of them.
+	// forward always reports true — an honest inaccuracy, not a guarantee: host writes are
+	// fire-and-forget, so a poisoned stdout discards the request while the audit record still
+	// says delivered=true. The writer's poison hook (armed in Start) bounds the window: the
+	// FIRST desync tears the upstream down, so at most frames already in flight are misrecorded.
 	forwardServerRequest(ctx, msg, serverRequestParams{
 		rec:              p.rec(),
 		audit:            p.audit,
@@ -1465,39 +1194,30 @@ func (p *StdioProxy) handleUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) 
 }
 
 // samplingDecideLock returns the entry into this session's decision serializer for a
-// server-initiated (sampling) decision, or nil when the session is not serialize-relevant.
-// It reserves a ticket and waits its turn on the SAME decideGate the host path uses, so a
-// sampling flowLabel sink cannot read the flow set concurrently with a host source's write.
-// Unlike a host request, a sampling request is
-// upstream-initiated with no proxy-receipt order, so it simply takes the next ticket:
-// mutual exclusion — not receipt ordering — is the property it needs.
+// server-initiated (sampling) decision, or nil when not serialize-relevant. It reserves a
+// ticket on the SAME decideGate the host path uses, so a sampling flowLabel sink cannot read
+// the flow set concurrently with a host source's write. A sampling request has no
+// proxy-receipt order, so it simply takes the next ticket: mutual exclusion, not ordering.
 //
-// The wait is BOUNDED by samplingTurnWait, exactly as the HTTP leg's is, and for a hazard that
-// is worse here than there. This leg runs INLINE on the upstream reader goroutine, which is
-// also the only goroutine that delivers upstream responses to waiting host handlers — and a
-// declassifying host call holds its turn across its whole upstream round trip. So a sampling
-// request arriving mid-clear waits for a turn whose holder is waiting for a response only this
-// blocked reader can deliver: a deadlock that unwinds when --upstream-timeout fires and NEVER
-// with --upstream-timeout=0. It does not require sampling to be permitted, either — the turn is
-// taken before DecideSampling runs, so any upstream could wedge a declassify-using proxy by
-// emitting one sampling/createMessage at the right moment, including one policy denies
-// sampling to.
+// The wait is BOUNDED (samplingTurnWait), for a hazard worse than the HTTP leg's: this runs
+// INLINE on the upstream reader goroutine, the only goroutine that delivers upstream responses
+// to waiting host handlers. A declassifying host call holds its turn across its whole upstream
+// round trip, so a sampling request arriving mid-clear waits for a turn whose holder is waiting
+// on a response only this blocked reader can deliver — a deadlock that unwinds only when
+// --upstream-timeout fires, never at 0. It applies even when sampling is denied, since the turn
+// is taken before DecideSampling runs.
 //
-// What made bounding it unsafe before was the FIFO: a ticket taken and abandoned stalled every
-// later ticket behind it, trading a bounded stall for an unbounded one. beginWithin abandons
-// the ticket properly (the turn skips it), so the give-up costs this one deny-by-default
-// request and nothing else.
+// A plain FIFO made bounding this unsafe: an abandoned ticket stalled every later ticket behind
+// it. beginWithin abandons the ticket properly (the turn skips it), so a give-up costs only
+// this one request.
 func (p *StdioProxy) samplingDecideLock() func() (end func(), ok bool) {
 	if p.decideGate == nil {
 		return nil
 	}
 	return func() (func(), bool) {
-		// The SAME queue the host leg takes its tickets from, through the same helper — not a
-		// second anchor resolution. A server-initiated request has no host request in scope,
-		// so a leg that resolved its own anchor would have to reach for some other source of
-		// claims, and the two legs landing on different queues is precisely the fail-open this
-		// lock exists to close: a sampling flowLabel sink would no longer be serialized
-		// against a host source's label write.
+		// The SAME queue the host leg takes its tickets from — not a second anchor
+		// resolution. A server-initiated request has no host request to derive claims from,
+		// so landing on a different queue would defeat the serialization this lock exists for.
 		return p.decideGate.beginWithin(p.takeDecisionTicket(), samplingTurnWait)
 	}
 }
@@ -1505,12 +1225,10 @@ func (p *StdioProxy) samplingDecideLock() func() (end func(), ok bool) {
 // takeDecisionTicket reserves this proxy's next decision ticket in receipt order, preferring
 // the queue pinned at startup and falling back to resolving the anchor through the registry.
 //
-// The fallback is the ALWAYS-CORRECT path and the pin is the optimization — the same shape the
-// HTTP session's cached gate has. It is not a formality: a caller that drives serveHost
-// directly without going through Start holds no pin, and a nil pin that quietly produced the
-// zero ticket would run every decision on that proxy unserialized while every test still
-// passed. Resolving here costs one key render, which is what the pin exists to avoid on the
-// read loop, and is paid only where there is no pin.
+// The fallback is the always-correct path and the pin is the optimization. It is not a
+// formality: a caller that drives serveHost directly without going through Start holds no
+// pin, and a nil pin that quietly produced the zero ticket would run every decision on that
+// proxy unserialized while every test still passed.
 func (p *StdioProxy) takeDecisionTicket() decisionTicket {
 	if p.decideQueue != nil {
 		return p.decideGate.takeOn(p.decideQueue)
@@ -1519,14 +1237,10 @@ func (p *StdioProxy) takeDecisionTicket() decisionTicket {
 }
 
 // pinDecisionQueue resolves this connection's anchor once and pins its ticket queue for the
-// proxy's life. Called from Start, after the serve context (and so any claims an embedder
-// attached to it) is in hand.
-//
-// The anchor is a per-proxy constant because the identity it resolves from is: one host
-// connection, one claims set. That is what makes pinning correct, and it is the same
-// reasoning that lets an HTTP session hold one gate on a route which does not anchor on the
-// task. Giving this transport per-REQUEST tokens would break the premise — and this function
-// is where it would break, rather than somewhere the anchor is silently no longer consulted.
+// proxy's life. Called from Start once the serve context (and so any claims attached to it)
+// is in hand. The anchor is a per-proxy constant because one host connection carries one
+// claims set — giving this transport per-request tokens would break that premise, and this
+// function is where it would break.
 func (p *StdioProxy) pinDecisionQueue() {
 	if p.decideGate == nil {
 		return
@@ -1536,17 +1250,9 @@ func (p *StdioProxy) pinDecisionQueue() {
 
 // decisionAnchorKey is the key this proxy serializes its decisions on: the validated task when
 // the operator anchors state on the task and this connection presented one, the session
-// otherwise.
-//
-// It goes through resolveDecisionAnchor — the same builder the gateway route uses, over the
-// same enforcement.ResolveStateAnchor the engine's own key builder resolves through — so the
-// turn and the state key cannot come to different answers, and neither transport re-derives the
-// fallback. The claims are the proxy's captured connection identity, which is the one source
-// both of this transport's legs read (see StdioProxy.claims).
-//
-// It renders the key here, where the HTTP side carries the resolved anchor further: this
-// transport's ticket queues are addressed by key and it never has to compare two resolutions,
-// because its anchor is a per-connection constant.
+// otherwise. Goes through resolveDecisionAnchor — the same builder the gateway route uses,
+// over the same enforcement.ResolveStateAnchor the engine's key builder resolves through — so
+// the turn and the state key cannot come to different answers.
 func (p *StdioProxy) decisionAnchorKey() string {
 	return resolveDecisionAnchor(p.taskAnchored, p.claims, p.sessionID).Key()
 }
@@ -1561,17 +1267,12 @@ func (p *StdioProxy) withUpstreamTimeout(ctx context.Context) (context.Context, 
 // the upstream's echoed response carries a nonce the proxy controls. seq must be
 // guarded by the caller's pendingMu.
 func upstreamNonceID(seq uint64) (id *json.RawMessage, key string) {
-	// Encode the nonce as a JSON string via json.Marshal, not fmt's %q: the wire id must
-	// be valid JSON, and %q produces Go-quoted strings that only COINCIDENTALLY equal
-	// JSON strings for the current fixed-ASCII "eunox-up-<n>" format. Marshal makes the
-	// JSON-encoding contract explicit, so a future format change (a path, a hostname, a
-	// non-ASCII byte) cannot silently emit a Go-escaped string that is not valid JSON.
-	// Marshaling a string never errors.
+	// json.Marshal, not fmt's %q: the wire id must be valid JSON, and %q's Go-quoting only
+	// coincidentally matches for the current fixed-ASCII format. Marshaling a string never errors.
 	raw, _ := json.Marshal(fmt.Sprintf("eunox-up-%d", seq))
 	id = mcp.RawJSON(string(raw))
-	// Key by the canonical MsgKey, not the raw wire bytes: deliverUpstreamResponse
-	// looks the channel up under mcp.MsgKey(resp.ID), so the raw spelling would not
-	// match and the response would never be delivered.
+	// Key by the canonical MsgKey, not the raw wire bytes: deliverUpstreamResponse looks the
+	// channel up under mcp.MsgKey(resp.ID), so a mismatch would drop the response.
 	return id, mcp.MsgKey(id)
 }
 
@@ -1579,21 +1280,16 @@ func upstreamNonceID(seq uint64) (id *json.RawMessage, key string) {
 // in-flight request (params.requestId names the request's id).
 const methodNotificationsCancelled = "notifications/cancelled"
 
-// rewriteCancelToNonce translates a host notifications/cancelled's
-// params.requestId to the upstream nonce the proxy substituted for the target
-// request on the wire. Every host request to a nonce-rewriting upstream has its
-// id replaced by a proxy nonce (awaitNonced), but a cancel notification is
-// forwarded verbatim, so its requestId names an id the upstream never saw --
-// upstream finds no matching in-flight request and ignores the cancel (per
-// spec), making cancellation a permanent no-op through the proxy.
+// rewriteCancelToNonce translates a host notifications/cancelled's params.requestId to the
+// upstream nonce the proxy substituted for the target request on the wire. Every host request
+// to a nonce-rewriting upstream has its id replaced (awaitNonced), but a cancel notification
+// is forwarded verbatim, so without this its requestId would name an id the upstream never
+// saw and the cancel would be a permanent no-op.
 //
-// It returns the message with params.requestId swapped to the live nonce and
-// true when an in-flight request matches; false when the notification is not a
-// well-formed cancel or nothing is in flight (the caller drops it -- an upstream
-// ignores a cancel for an unknown/completed request anyway). Only the
-// nonce-rewriting upstream paths (subprocess, stdio HTTP bridge) call this; the
-// gateway remote-HTTP path forwards host ids unchanged, so its cancels already
-// correlate and must NOT be rewritten.
+// Returns the message with params.requestId swapped and true when an in-flight request
+// matches; false when the notification is malformed or nothing is in flight. Only the
+// nonce-rewriting upstream paths call this; the gateway remote-HTTP path forwards host ids
+// unchanged and must NOT rewrite.
 func rewriteCancelToNonce(mu *sync.Mutex, hostToUp map[string]*json.RawMessage, msg mcp.RPCMsg) (mcp.RPCMsg, bool) {
 	if msg.Method != methodNotificationsCancelled || len(msg.Params) == 0 {
 		return msg, false
@@ -1624,17 +1320,10 @@ func rewriteCancelToNonce(mu *sync.Mutex, hostToUp map[string]*json.RawMessage, 
 }
 
 // awaitNonced correlates one request/response round-trip while defending against
-// timed-out-response misrouting.
-//
-// pending (keyed by host ID) is the duplicate-ID guard: a second in-flight
-// request reusing a host ID is rejected rather than overwriting the first
-// caller's entry. byUpstreamID (keyed by a proxy-generated nonce) is the response
-// router: the request goes upstream carrying the nonce, the reader delivers the
-// matching response through byUpstreamID, and on timeout the nonce entry is
-// removed so a late response lands nowhere (it cannot leak into a later request
-// reusing the same host ID).
-//
-// rewrite installs the nonce ID on the outbound message; send transmits it.
+// timed-out-response misrouting. hostToUp (keyed by host ID) is the duplicate-ID guard, and
+// byUpstreamID (keyed by proxy-generated nonce) is the response router: on timeout the nonce
+// entry is removed so a late response lands nowhere rather than leaking into a later request
+// that reused the same host ID. rewrite installs the nonce ID; send transmits it.
 func awaitNonced(
 	ctx context.Context,
 	mu *sync.Mutex,
@@ -1649,9 +1338,7 @@ func awaitNonced(
 	ch := make(chan upstreamResult, 1)
 	mu.Lock()
 	// hostToUp IS the in-flight host-ID set: an entry exists for exactly the window a
-	// request is in flight, added and removed here under this mutex. A separate `pending`
-	// set held the same keys, under the same lock, mutated at the same three points — a
-	// second copy of one fact, which is the shape that eventually disagrees with itself.
+	// request is in flight. Must not be nil, or a duplicate host ID would be silently admitted.
 	if _, exists := hostToUp[hostKey]; exists {
 		mu.Unlock()
 		return mcp.RPCMsg{}, fmt.Errorf("%w %q: request already pending", errDuplicateID, hostKey)
@@ -1660,10 +1347,7 @@ func awaitNonced(
 	upID, upKey := upstreamNonceID(*seq)
 	byUpstreamID[upKey] = ch
 	// Record host-id -> nonce so a later notifications/cancelled can translate its
-	// params.requestId to the id the upstream actually saw. Both callers initialize
-	// hostToUp before calling (lazily, for a directly-assembled proxy/session), and it
-	// now carries the duplicate-ID rejection as well, so it must not be nil: a nil map
-	// would silently admit a duplicate host ID rather than degrade a correlation.
+	// params.requestId to the id the upstream actually saw.
 	hostToUp[hostKey] = upID
 	mu.Unlock()
 	defer func() {
@@ -1680,26 +1364,18 @@ func awaitNonced(
 
 	select {
 	case result := <-ch:
-		// A remote-HTTP-bridge transport failure (connection refused, DNS, non-2xx,
-		// per-call timeout) rides result.err, not the response body: deliverUpstreamError
-		// (the bridge's fire-and-forget POST failure path) sends it directly on this same
-		// channel, so surface it as the call's error. enforcedForwardCore/dispatch then
-		// classify it through upstreamErrInfo and record a deny/UPSTREAM_ERROR (matching
-		// the gateway) instead of an allow carrying upstream_error_code. Never set on the
-		// subprocess path (no bridge).
+		// A remote-HTTP-bridge transport failure rides result.err, not the response body:
+		// deliverUpstreamError sends it directly on this same channel. dispatch then classifies
+		// it and records a deny/UPSTREAM_ERROR instead of an allow. Never set on the subprocess
+		// path (no bridge).
 		if result.err != nil {
 			return mcp.RPCMsg{}, result.err
 		}
 		resp := result.msg
-		// A valid response carries an id, NO method, and exactly one of result/error.
-		// readUpstream delivers a message-bearing reply here when it echoes a live nonce (a
-		// forged/confused upstream message), and IsResponse()/isMalformedResponse alone check
-		// only part of the shape, so enforce BOTH: !IsResponse() refuses a method-bearing
-		// reply (a response has no method) and isMalformedResponse refuses one carrying
-		// neither result/error (an empty {"jsonrpc":"2.0","id":...}) or both. Together they
-		// match correlateUpstreamReply's !IsResponse()+malformed refusal on the HTTP-upstream
-		// bridge (see jsonrpc.go), so a method-bearing or malformed reply is never fed to the
-		// host as a response and the rule cannot drift between the two transports.
+		// A valid response carries an id, no method, and exactly one of result/error.
+		// !IsResponse() refuses a method-bearing reply (a forged/confused upstream message
+		// echoing a live nonce) and isMalformedResponse refuses one carrying neither or both,
+		// matching correlateUpstreamReply's refusal on the HTTP-upstream bridge.
 		if !resp.IsResponse() || isMalformedResponse(resp) {
 			return mcp.RPCMsg{}, fmt.Errorf("upstream reply was not a valid JSON-RPC response (method-bearing, or carrying neither result nor error, or both)")
 		}
@@ -1720,11 +1396,9 @@ func awaitNonced(
 func (p *StdioProxy) callUpstream(ctx context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, error) {
 	ctx, cancel := p.withUpstreamTimeout(ctx)
 	defer cancel()
-	// NewStdioProxy initializes these, so this lazy init only fires for a
-	// test-assembled proxy; under pendingMu so it cannot race awaitNonced/readUpstream.
-	// hostToUp is initialized here too: awaitNonced receives the maps BY VALUE, and it
-	// now both writes the correlation and reads the duplicate-ID set from it, so a nil
-	// map would panic on exactly the test-assembled proxy this block accommodates.
+	// NewStdioProxy initializes these; this lazy init only fires for a test-assembled proxy,
+	// under pendingMu so it cannot race awaitNonced/readUpstream. Both must be non-nil since
+	// awaitNonced both writes the correlation and reads the duplicate-ID set from hostToUp.
 	p.pendingMu.Lock()
 	if p.byUpstreamID == nil {
 		p.byUpstreamID = make(map[string]chan upstreamResult)
@@ -1741,16 +1415,11 @@ func (p *StdioProxy) callUpstream(ctx context.Context, msg mcp.RPCMsg) (mcp.RPCM
 			// and would bypass per-call deadlines.
 			if p.upHTTP != nil {
 				p.upHTTP.postWithCtx(ctx, msg)
-				// The request is on its way to the upstream: release the host-forward
-				// ordering barrier so a host notification queued behind it may proceed.
-				//
-				// On THIS arm the barrier orders the proxy's own dispatch, not the wire.
-				// Each call is an independent POST, so the upstream may still observe a
-				// notifications/cancelled ahead of the request it targets — the same
-				// best-effort cancellation the gateway path documents for its own
-				// concurrent handlers, and the same thing the MCP spec assumes of a
-				// notification that may arrive after its target already completed. Only the
-				// subprocess arm below, writing through one MsgWriter, orders the bytes.
+				// Release the host-forward ordering barrier now that the request is on its way.
+				// On this arm the barrier only orders the proxy's own dispatch, not the wire:
+				// each call is an independent POST, so cancellation is best-effort here, as on
+				// the gateway. Only the subprocess arm below, writing through one MsgWriter,
+				// orders the bytes.
 				releaseHostForward(ctx)
 				return nil
 			}
@@ -1758,23 +1427,19 @@ func (p *StdioProxy) callUpstream(ctx context.Context, msg mcp.RPCMsg) (mcp.RPCM
 			if err == nil {
 				releaseHostForward(ctx)
 			}
-			// A write timeout (ErrUpstreamWriteTimeout) has already torn the upstream down via
-			// the writer's onPoison hook (killUpstream), so this only returns the error; the
-			// handler's deferred release() then drains the ordering barrier so a parked host
-			// notification proceeds, and readUpstream's EOF unblocks the serve loop.
+			// A write timeout has already torn the upstream down via the writer's onPoison
+			// hook, so this only returns the error; the handler's deferred release() then
+			// drains the barrier and readUpstream's EOF unblocks the serve loop.
 			return err
 		})
 }
 
-// reportUpstreamErr delivers a remote-HTTP-bridge transport failure directly to the
-// in-flight call identified by the upstream nonce upKey, so awaitNonced returns it
-// as the call's error, and reports whether a live caller was found. It is a thin
-// wrapper over deliverUpstreamError: a caller no longer registered in byUpstreamID
-// (the bridge's POST goroutine runs fire-and-forget and may deliver its failure
-// after the caller already gave up — per-call timeout, upstream exit) is simply a
-// no-op reporting false, with no separate map entry to leak. A handshake/probe POST
-// (no byUpstreamID entry) likewise reports false; either way the bridge's post()
-// falls back to its synthesized in-band response instead.
+// reportUpstreamErr delivers a remote-HTTP-bridge transport failure directly to the in-flight
+// call identified by the upstream nonce upKey, so awaitNonced returns it as the call's error,
+// and reports whether a live caller was found. A caller no longer registered in byUpstreamID
+// (the bridge's POST runs fire-and-forget and may deliver its failure after the caller already
+// gave up) is simply a no-op reporting false; the bridge's post() then falls back to its
+// synthesized in-band response.
 func (p *StdioProxy) reportUpstreamErr(upKey string, err error) bool {
 	if err == nil {
 		return false
@@ -1799,18 +1464,10 @@ func (p *StdioProxy) readUpstream(ctx context.Context) {
 		}
 
 		if msg.IsNotification() {
-			// A killed session must not keep receiving the upstream->host notification
-			// relay: stdio's equivalent of the HTTP transport gating its SSE relay on the
-			// kill (http_session.readUpstream). CheckKill reads the local cache (cheap
-			// even for the Redis backend), so this does not add a round-trip per
-			// notification, and it denies on a kill-store error too (fail closed).
-			// Recording the drop keeps a killed session's suppressed notifications visible
-			// on the tape, mirroring serveHost's host-notification kill record (so a
-			// transient store outage drops-and-records rather than silently swallowing).
-			// Unguarded, like the two sibling kill checks: NewStdioProxy defaults an
-			// omitted PDP, so p.pdp is never nil in production and a nil-PDP proxy is a
-			// construction bug better surfaced than skipped — skipping the kill check is
-			// the fail-OPEN direction.
+			// A killed session must not keep receiving the upstream->host notification relay,
+			// stdio's equivalent of the HTTP transport gating its SSE relay on the kill.
+			// Recording the drop keeps a killed session's suppressed notifications visible on
+			// the tape rather than silently swallowed.
 			if deny := p.pdp.CheckKill(ctx, p.sessionID); deny != nil {
 				recordKillDrop(ctx, p.rec(), deny, verifiedSession(p.sessionID), msg.Method, msg.Method, legStdioUpstreamNotification)
 				continue
@@ -1819,16 +1476,12 @@ func (p *StdioProxy) readUpstream(ctx context.Context) {
 			continue
 		}
 
-		// Server-initiated requests (e.g. sampling/createMessage, roots/list). A message
-		// carrying BOTH an id and a method (IsRequest()) that echoes a LIVE outstanding
-		// upstream nonce is NOT a server-initiated request — it is a forged/confused reply to
-		// that in-flight call, and must be refused rather than reclassified and forwarded to
-		// the host. Route it to the waiting caller, which refuses a method-bearing reply
-		// (awaitNonced's response-shape check), mirroring correlateUpstreamReply's
-		// !IsResponse() refusal on the HTTP-upstream bridge so the nonce-correlation invariant
-		// holds symmetrically. A method-bearing message whose id is NOT a live nonce is a
-		// genuine server-initiated request. Scoping the nonce lookup to the method-bearing
-		// case keeps a normal response (below, no method) on a single lock/lookup.
+		// A message carrying both an id and a method that echoes a LIVE outstanding upstream
+		// nonce is NOT a server-initiated request — it is a forged/confused reply to that
+		// in-flight call, and must be routed to the waiting caller (which refuses a
+		// method-bearing reply), mirroring correlateUpstreamReply's refusal on the
+		// HTTP-upstream bridge. A method-bearing message whose id is not a live nonce is a
+		// genuine server-initiated request (e.g. sampling/createMessage, roots/list).
 		if msg.IsRequest() {
 			p.pendingMu.Lock()
 			_, liveNonce := p.byUpstreamID[mcp.MsgKey(msg.ID)]

@@ -321,27 +321,15 @@ func (c *Constraint) PrincipalMatches(claims map[string]interface{}) bool {
 }
 
 // matchesAnyPattern reports whether value equals (exact-first) or glob-matches
-// (path.Match) any of the patterns. Matching is exact-first-then-glob: a pattern equal
-// to value matches even when it is a malformed glob (e.g. the literal "agent-["), and a
-// malformed pattern that does NOT equal value is skipped by path.Match's error branch
-// rather than erroring. A manifest loaded through the loader never carries a malformed
-// pattern (config's validatePrincipal runs path.Match against each at load time), so
-// the malformed case only matters for a programmatically built Constraint — where the
-// exact-equality branch means it still matches its own literal text, never widening the
-// scope beyond that literal. (This exact-first order differs from
-// enforcement.MatchAllowedValue, which is glob-only so a literal pattern cannot bypass a
-// glob; principal patterns are IdP-issued identities where matching the literal is the
-// desired behavior.)
+// (path.Match) any of the patterns. Exact-first so a malformed glob pattern (e.g. the
+// literal "agent-[") still matches its own literal text rather than erroring; this
+// differs from enforcement.MatchAllowedValue's glob-only matching, since principal
+// patterns are IdP-issued identities where matching the literal is desired.
 //
-// Principal matching deliberately uses plain [path.Match] (single-segment glob:
-// '*' does NOT cross '/'), distinct from the engine's two other matchers:
-// enforcement.MatchesResource (target names, ':'-namespaced) and
-// enforcement.MatchValueGlob (argument values, with '**'/segment semantics). The
-// divergence is intentional, not drift to reconcile: a principal is a flat identity
-// string (an agent id, a subject, an email like "*@corp.com"), not a '/'-structured
-// path or URI, so it must NOT inherit the '**' / '/'-segment / encoded-separator
-// handling MatchValueGlob applies to file-path and URI values. A metachar change to
-// MatchValueGlob therefore neither does nor should propagate here.
+// Uses plain path.Match ('*' does not cross '/') rather than enforcement.MatchValueGlob's
+// '**'/segment semantics: a principal is a flat identity string (an agent id, an email
+// like "*@corp.com"), not a '/'-structured path or URI, so it should not inherit
+// path-value glob handling.
 func matchesAnyPattern(value string, patterns []string) bool {
 	for _, p := range patterns {
 		if p == value {
@@ -420,30 +408,11 @@ func (a *ArgumentSchema) UnmarshalJSON(data []byte) error {
 	// UseNumber so enum literals above 2^53 stay json.Number here too, matching the
 	// Constraint decoder that would otherwise have provided it.
 	dec.UseNumber()
-	// Reject unknown keys, as Constraint.UnmarshalJSON and unmarshalCondition do. A
-	// misspelled keyword here is the same silent widening: {"type":"string","maxLen":8}
-	// decodes with MaxLength nil and validates length not at all, so the argument
-	// constraint the author wrote is simply absent.
-	//
-	// Unlike those two, this uses dec.DisallowUnknownFields() on THIS decode rather
-	// than the shared rejectUnknownJSONFields(data, alias{}, ...) helper every other
-	// UnmarshalJSON in this package calls. That helper decodes data into
-	// map[string]json.RawMessage first to enumerate keys — a second full scan of the
-	// same bytes, since encoding/json must walk every byte to find each value's span
-	// even though it only copies rather than parses them. Constraint.UnmarshalJSON and
-	// unmarshalCondition each decode a flat, non-recursive struct, so that extra scan
-	// costs them once. THIS method recurses into every nested properties/items
-	// ArgumentSchema value — each such value's own UnmarshalJSON call runs this same
-	// code again — and because each level's captured "data" spans its own full
-	// (shrinking) subtree, paying the extra scan at every level compounds with nesting
-	// depth into an O(depth^2) cost that internal/config imposes no ceiling on (no
-	// manifest-size or schema-depth cap). Folding the check into dec's own pass via
-	// DisallowUnknownFields keeps the identical field-set semantics (Go's decoder
-	// already resolves a key case-insensitively before deciding it is unknown, matching
-	// jsonFieldNames' lowercased comparison) at no extra scanning cost: measured on a
-	// depth-400/16.8KB chain-nested schema, this single-pass form costs the same
-	// ~41ms as a plain dec.Decode with no unknown-field check at all, versus ~89ms for
-	// the two-pass form.
+	// Uses dec.DisallowUnknownFields() rather than the shared rejectUnknownJSONFields
+	// helper: this method recurses into every nested properties/items ArgumentSchema
+	// value, so the helper's extra map-decode scan would compound into O(depth^2) on a
+	// deeply nested schema (measured: ~41ms vs ~89ms at depth 400). Same field-set
+	// semantics either way — encoding/json already folds case before flagging unknown.
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&aux); err != nil {
 		// Reformat encoding/json's own `json: unknown field "x"` into this package's
@@ -484,29 +453,14 @@ func exactFloatBound(n json.Number) (*float64, error) {
 	if !ok {
 		return nil, fmt.Errorf("bound %q is not a valid number", n.String())
 	}
-	// Round-trip exactness is required whenever EITHER of two things is true:
-	//
-	//  - orig.IsInt(): the literal was written as an integer, at ANY magnitude
-	//    (including beyond int64 range). This is the original check: an
-	//    out-of-precision integer bound must never load silently rounded, since
-	//    that is a "silently-shifted boundary" regardless of which comparison
-	//    path (exact-int64 or float64-fallback) later reads it.
-	//  - FloatToInt64(f): the enforcement comparison (compareToBound) switches
-	//    to EXACT int64 precision whenever the bound's float64 value f happens to
-	//    be a whole number in int64 range — regardless of whether the manifest
-	//    author wrote the literal with a decimal point. So round-trip exactness
-	//    cannot be checked only for bounds written as integers: a FRACTIONAL
-	//    literal whose magnitude is large enough that float64 rounds away its
-	//    fractional part (e.g. minimum: 9007199254740993.5 rounding to
-	//    9007199254740994.0) would silently become an exact-int64 bound
-	//    different from the one written, admitting an argument at that rounded
-	//    whole-number boundary the author never wrote.
-	//
-	// A bound that is neither — a fractional literal whose rounding stays
-	// fractional, or whose rounding lands outside int64 range without itself
-	// being written as an integer — is compared in float64 on both sides
-	// (compareToBound's fallback), where its float64 approximation is
-	// consistent, so it is accepted as before.
+	// Round-trip exactness is required when the literal was written as an integer
+	// (orig.IsInt()) OR when its float64 value happens to be int64-whole (FloatToInt64):
+	// compareToBound switches to exact int64 precision in that second case regardless of
+	// whether the author wrote a decimal point, so a fractional literal that rounds to a
+	// whole number (e.g. 9007199254740993.5 -> ...994.0) must be checked too, or it would
+	// silently admit arguments at a boundary the author never wrote. A bound that is
+	// neither stays in compareToBound's float64 fallback, where its approximation is
+	// consistent on both sides.
 	_, whole := FloatToInt64(f)
 	if orig.IsInt() || whole {
 		rf := new(big.Rat).SetFloat64(f)

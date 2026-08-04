@@ -24,45 +24,27 @@ import (
 
 // requireJSONContentType admits only a request body labelled application/json, failing
 // closed on an absent, unparseable, or duplicated Content-Type header. Every POST this
-// proxy serves — the /mcp JSON-RPC body and the /control/kill body — is JSON, and the
-// MCP Streamable HTTP spec already requires conformant clients to say so, so no honest
-// caller is turned away.
+// proxy serves is JSON per the MCP spec, so no honest caller is turned away.
 //
-// It is a CSRF hardening measure, not merely conformance. checkOrigin is the primary
-// control and already rejects the cross-origin browser POST (browsers attach Origin to
-// every cross-origin POST, and both a foreign origin and the opaque "null" are refused).
-// This gate covers the class from the other side: a body sent with the default
-// text/plain (or a form/multipart) content type is a CORS SIMPLE request, dispatched
-// with no preflight, and the sessionless initialize POST is the one /mcp entry point
-// that needs no custom header — so requiring a JSON content type forces a preflight on
-// exactly the request that could otherwise reach a handler without one. Session-bound
-// POSTs are already preflighted by their Mcp-Session-Id header.
+// It's a CSRF hardening measure, not merely conformance: checkOrigin already rejects the
+// cross-origin browser case, but a body sent with the default text/plain content type is a
+// CORS SIMPLE request dispatched with no preflight — requiring JSON forces a preflight on
+// exactly the sessionless initialize POST that could otherwise reach a handler without one
+// (session-bound POSTs are already preflighted by their Mcp-Session-Id header).
 //
-// A refusal IS recorded on the tape, through the same rate-limited pre-session path
-// checkOrigin uses. The gate sits behind the transport credential on both endpoints —
-// checkAuth/ValidateToken for /mcp, checkControlToken for /control/kill — so on a
-// deployment that configures either one this is an AUTHENTICATED caller's refusal, not
-// an anonymous one; and where no credential is configured, the pre-session bucket is
-// exactly the bucket that makes an anonymous caller's refusals safe to write. Leaving
-// it unrecorded made a content-type sweep of the sessionless initialize POST and the
-// emergency stop the one transport refusal invisible to an incident responder, while
-// the same actor's wrong-Origin attempts were fully logged.
+// A refusal IS recorded, through the same rate-limited pre-session path checkOrigin uses —
+// leaving it unrecorded made a content-type sweep of the initialize POST and the emergency
+// stop the one transport refusal invisible to an incident responder. route is whichever
+// route the caller already resolved (nil for /control/kill), passed to recordRefusal so
+// the record is stamped exactly when known. The header value itself is never recorded,
+// only the count.
 //
-// route is whichever route the caller has already resolved — the gateway's /mcp path
-// always has one by the time it reaches here (handleMCP 404s first), /control/kill has
-// none — and is passed straight to recordRefusal, mirroring recordSessionCapDeny: the
-// record is route-stamped exactly when a route is already known, never inferred. The
-// header value is NOT recorded either way — it is attacker-controlled free text, and the
-// count is the only part worth keeping.
-//
-// More than one Content-Type header is rejected outright, for the reason checkOrigin
-// rejects a duplicated Origin: Header.Get would validate the first while a proxy or host
-// downstream may act on another. That leg also prints a stderr line, because it is the
-// one refusal an operator can hit through no fault of their client — a reverse proxy
-// that re-adds the header duplicates it — and a silent total-outage 415 is the hardest
-// possible thing to diagnose. Note the duplicate rule is a HEADER-level one: Go's mime
-// accepts a repeated *parameter* whose value is identical, so only the count check below
-// enforces it.
+// More than one Content-Type header is rejected outright, mirroring checkOrigin's
+// duplicated-Origin rule: Header.Get would validate the first while a downstream proxy may
+// act on another. That leg also prints a stderr line since a reverse proxy re-adding the
+// header is an operator-caused failure mode worth diagnosing directly. The duplicate rule
+// is HEADER-level: Go's mime accepts a repeated identical *parameter*, so only the count
+// check below enforces it.
 func (p *HTTPProxy) requireJSONContentType(w http.ResponseWriter, r *http.Request, route *UpstreamRoute) bool {
 	vals := r.Header.Values("Content-Type")
 	if len(vals) == 1 && isJSONMediaType(vals[0]) {
@@ -71,14 +53,10 @@ func (p *HTTPProxy) requireJSONContentType(w http.ResponseWriter, r *http.Reques
 	admitted := p.recordRefusal(r, route, codeUnsupportedMediaType, catContentType, map[string]interface{}{
 		"header_count": len(vals),
 	})
-	// Bounded AND gated on the same admission verdict as the record, mirroring checkOrigin.
-	// The line printed strings.Join(vals, ", ") unconditionally, ahead of and independent of
-	// the limiter: attacker-controlled header values, up to ~1 MiB under Go's default
-	// MaxHeaderBytes, at one line per request with no credential required on the default
-	// loopback deployment. That is the cheapest half of the flooding primitive checkOrigin
-	// already closed for its twin, while the record beside it was carefully bounded to a
-	// count. A suppressed burst is still visible, as the rollup count on the next admitted
-	// record.
+	// Bounded AND gated on the same admission verdict as the record, mirroring checkOrigin:
+	// an unbounded, ungated stderr line here would be the cheapest half of the flooding
+	// primitive checkOrigin already closed for its twin. A suppressed burst is still
+	// visible, as the rollup count on the next admitted record.
 	if admitted && len(vals) > 1 {
 		fmt.Fprintf(os.Stderr,
 			"[eunox] SECURITY: rejected request carrying %d Content-Type headers (%q); exactly one is required (a reverse proxy that re-adds the header will trip this)\n",
@@ -90,17 +68,14 @@ func (p *HTTPProxy) requireJSONContentType(w http.ResponseWriter, r *http.Reques
 
 // isJSONMediaType reports whether a Content-Type header value denotes application/json.
 //
-// The common shapes — a bare "application/json" and any ASCII-case variant of it — are
-// answered without touching mime.ParseMediaType, which allocates its parameter map
-// unconditionally (measurably: ~290ns/48B for the bare form, ~800ns/336B with a charset
-// parameter, against ~55ns and no allocation here) on a gate that now precedes every
-// enforced MCP call. Anything carrying a parameter falls through to the real parser, so
-// the accept/reject set is unchanged.
+// The common bare "application/json" (and ASCII-case variants) is answered without
+// touching mime.ParseMediaType, which allocates its parameter map unconditionally on a
+// gate that now precedes every enforced MCP call (~290ns/48B vs ~55ns/no-alloc here).
+// Anything carrying a parameter falls through to the real parser.
 //
-// The fold is ASCII-only ON PURPOSE: strings.EqualFold applies Unicode simple folding,
-// under which U+017F (LATIN SMALL LETTER LONG S) folds to 's' — so "application/jſon"
-// would pass a fold-based fast path while ParseMediaType rejects it, making the fast and
-// slow paths disagree about the same header.
+// The fold is ASCII-only ON PURPOSE: strings.EqualFold's Unicode folding maps U+017F
+// (LATIN SMALL LETTER LONG S) to 's', so "application/jſon" would pass this fast path
+// while ParseMediaType rejects it — making the two paths disagree about the same header.
 func isJSONMediaType(v string) bool {
 	if !strings.Contains(v, ";") && asciiEqualFold(strings.TrimSpace(v), CTJSON) {
 		return true
@@ -144,14 +119,11 @@ func newAuthTimingKey() []byte {
 	return key
 }
 
-// constantTimeTokenEqual reports whether presented equals want without leaking
-// either operand's length through timing. ConstantTimeCompare (via hmac.Equal)
-// returns early in non-constant time when its inputs differ in length, so comparing
-// raw tokens would let an attacker binary-search the secret's length by timing 401s.
-// Folding both sides to a fixed-length keyed MAC first guarantees equal-length inputs,
-// and the per-process random key makes the MACs unpredictable so candidates cannot be
-// precomputed. Both MACs are computed per call so a struct-literal-constructed proxy
-// stays valid.
+// constantTimeTokenEqual reports whether presented equals want without leaking either
+// operand's length through timing: hmac.Equal returns early when inputs differ in length,
+// so comparing raw tokens would let an attacker binary-search the secret's length. Folding
+// both sides to a fixed-length keyed MAC first guarantees equal-length inputs, with the
+// per-process random key making the MACs unpredictable so candidates can't be precomputed.
 func constantTimeTokenEqual(key []byte, presented, want string) bool {
 	pm := hmac.New(sha256.New, key)
 	pm.Write([]byte(presented))
@@ -224,24 +196,16 @@ func (p *HTTPProxy) checkControlToken(w http.ResponseWriter, r *http.Request) bo
 }
 
 // buildLoopbackPinHosts returns the extra host NAMES the DNS-rebinding pin on the
-// loopback-only endpoints accepts, derived from the operator's listen.allowedOrigins.
+// loopback-only endpoints accepts, derived from listen.allowedOrigins.
 //
-// It exists because the pin was strictly STRICTER than the /mcp gate it claims to mirror.
-// checkOrigin admits an Origin two ways: an exact allowedOrigins match, or a hostname in
-// the constructor-seeded host set. The pin consulted only the second, so an operator who
-// allowlisted "http://eunox.internal:8080" could reach /mcp from that origin but got a 403
-// on /healthz, /metrics and /control/kill from the same host — the more sensitive endpoint
-// was the permissive one.
+// It exists because the pin was strictly STRICTER than the /mcp gate it mirrors: checkOrigin
+// admits an origin by exact allowedOrigins match OR by hostname in the seeded host set, but
+// the pin only consulted the second, so an allowlisted origin could reach /mcp but 403 on
+// the more sensitive /healthz, /metrics, /control/kill.
 //
-// This is a SEPARATE set rather than more entries in allowedOriginHosts on purpose. That
-// set is matched on hostname alone with any scheme and port, so folding these names into it
-// would widen /mcp from "exactly http://eunox.internal:8080" to "eunox.internal on any
-// scheme and port" — a real weakening of the Origin check. Only the Host pin, which
-// compares bare hostnames by construction, reads this.
-//
-// A configured origin that is not a parseable http(s) web origin (the opaque "null", a
-// file:// front-end) contributes no hostname: those opt into /mcp through the exact-match
-// path only, and a Host header cannot carry a scheme to match exactly against.
+// A SEPARATE set on purpose: folding these names into allowedOriginHosts (matched on
+// hostname alone, any scheme/port) would widen /mcp itself — a real weakening. A configured
+// origin that isn't a parseable http(s) web origin contributes no hostname here.
 func buildLoopbackPinHosts(allowedOrigins []string) map[string]bool {
 	hosts := make(map[string]bool, len(allowedOrigins))
 	for _, o := range allowedOrigins {
@@ -271,16 +235,12 @@ func buildAllowedOriginHosts(bind string) map[string]bool {
 		"127.0.0.1": true,
 		"::1":       true,
 	}
-	// Strip the surrounding brackets from a bracketed IPv6 bind literal so the key
-	// matches url.Hostname() (which returns the host without brackets); otherwise a
-	// legitimate IPv6 Origin is rejected. On a valid bind literal the brackets are a
-	// matched pair ("[::1]"), so trimming the "[]" set strips exactly the wrapper.
+	// Strip bracketed-IPv6-literal brackets so the key matches url.Hostname() (which
+	// returns the host without them); otherwise a legitimate IPv6 Origin is rejected.
 	b := strings.ToLower(strings.TrimSpace(bind))
 	b = strings.Trim(b, "[]")
-	// Exclude every spelling of the unspecified (all-interfaces) address — "0.0.0.0",
-	// "::", "::0", "0:0:0:0:0:0:0:0" — via IsUnspecified() rather than a brittle
-	// string match, so an alternate wildcard spelling is not added to the
-	// DNS-rebinding Origin allowlist. A non-wildcard bind host is added as before.
+	// Exclude every spelling of the unspecified address via IsUnspecified() rather than a
+	// brittle string match, so an alternate wildcard spelling isn't added to the allowlist.
 	if b != "" {
 		if ip := net.ParseIP(b); ip == nil || !ip.IsUnspecified() {
 			hosts[b] = true
@@ -300,14 +260,12 @@ func (p *HTTPProxy) requireValidOrigin(next http.Handler) http.Handler {
 	})
 }
 
-// checkOrigin enforces the MCP Streamable HTTP Origin check that prevents
-// DNS-rebinding: without it a same-machine browser tab can use a rebound DNS name to
-// reach the loopback listener. Only a truly absent Origin passes unconditionally
-// (non-browser hosts send none; browsers always attach Origin to the cross-site
-// requests rebinding exploits). Any present value — including "" and the opaque "null"
-// origin — must satisfy originAllowed or the request is rejected with 403. More than
-// one Origin header (forbidden by RFC 6454 §7.1; a header-smuggling vector) is rejected
-// outright. Returns true if the request may proceed; on rejection the response is written.
+// checkOrigin enforces the MCP Streamable HTTP Origin check that prevents DNS-rebinding:
+// without it a same-machine browser tab can use a rebound DNS name to reach the loopback
+// listener. Only a truly absent Origin passes unconditionally (browsers always attach
+// Origin to the cross-site requests rebinding exploits); any present value must satisfy
+// originAllowed. More than one Origin header (RFC 6454 §7.1 forbids it; a smuggling
+// vector) is rejected outright.
 func (p *HTTPProxy) checkOrigin(w http.ResponseWriter, r *http.Request) bool {
 	// Distinguish an absent header from a present-but-empty value: Header.Get collapses
 	// both to "", but only a missing header passes freely.
@@ -315,10 +273,8 @@ func (p *HTTPProxy) checkOrigin(w http.ResponseWriter, r *http.Request) bool {
 	if len(vals) == 0 {
 		return true
 	}
-	// RFC 6454 §7.1 permits at most one Origin header. Multiple headers let a client
-	// that can set arbitrary headers smuggle an allowed origin alongside a disallowed
-	// one, validating only the first while the host may act on another. Reject outright
-	// when more than one is present.
+	// RFC 6454 §7.1 permits at most one Origin header; multiple headers let a client
+	// smuggle an allowed origin alongside a disallowed one that a downstream host acts on.
 	multiple := len(vals) > 1
 	origin := vals[0]
 	if !multiple && p.originAllowed(origin) {
@@ -329,10 +285,8 @@ func (p *HTTPProxy) checkOrigin(w http.ResponseWriter, r *http.Request) bool {
 	if multiple {
 		recordedOrigin = strings.Join(vals, ", ")
 	}
-	// Bound it before it reaches either the tape or stderr: an unauthenticated client can
-	// put ~1 MiB (Go's default MaxHeaderBytes) in an Origin header, and both destinations
-	// wrote it whole. That made every rejected request a kilobyte-per-byte amplifier for
-	// signed-log growth and for a stderr line the rate limiter does not gate.
+	// Bound it before it reaches the tape or stderr: an unauthenticated client can put
+	// ~1 MiB (Go's default MaxHeaderBytes) in an Origin header otherwise.
 	bounded := boundedRefusalDetail(recordedOrigin)
 	details := map[string]interface{}{"origin": bounded}
 	if bounded != recordedOrigin {
@@ -342,12 +296,8 @@ func (p *HTTPProxy) checkOrigin(w http.ResponseWriter, r *http.Request) bool {
 	}
 	recordedOrigin = bounded
 	// Unstamped by design (no route/policy fields): the Origin gate runs before route
-	// resolution — see recordPreSessionDeny.
-	// The stderr line is gated on the SAME admission verdict as the record. It is ~600
-	// bytes per rejected request and reachable with no credential at all, so leaving it
-	// ungated left the cheapest half of the flooding primitive open while the tape beside
-	// it was carefully bounded; a suppressed burst is still visible, as the rollup count
-	// on the next admitted record.
+	// resolution — see recordPreSessionDeny. The stderr line is gated on the SAME admission
+	// verdict as the record, for the reason given on requireJSONContentType's stderr gate above.
 	if admitted := p.recordPreSessionDeny(r, "ORIGIN_REJECTED", catOrigin, details); admitted {
 		if multiple {
 			fmt.Fprintf(os.Stderr,
@@ -365,73 +315,42 @@ func (p *HTTPProxy) checkOrigin(w http.ResponseWriter, r *http.Request) bool {
 	return false
 }
 
-// addClaimedSessionID records the client-supplied Mcp-Session-Id header into a
-// deny's details under claimed_session_id, never as the structured session_id. The
-// transport-level denials that use it directly (origin rejection, JWT rejection) fire
-// BEFORE any session lookup, so the header is unverified and attacker-controlled;
-// stamping it as session_id would let an unauthenticated caller forge those records
-// against a victim's session. killSubject's claimedSession (forward.go) is the other
-// caller family, reached via auditDetails for a kill-switch record: there a lookup DID
-// run — against the session registry — and failed to resolve, which is a different
-// lifecycle stage but the identical unverified-header risk, so the same treatment
-// applies. The claimed value is kept as a clearly-unverified detail for correlation,
-// and only when present so a missing header leaves no empty key. Centralizing the rule
-// keeps every claimed-but-unresolved-session path consistent — a new one cannot
-// reintroduce the forgery by hand-rolling it.
-// maxClaimedSessionIDLen bounds the attacker-controlled header this stamps into a record.
-// A session id is a UUID; anything longer is not a real id, and without a bound a single
-// unauthenticated request could append most of a 1 MiB header (Go's default
-// MaxHeaderBytes) to the tape, turning the refusal record into a log-flooding primitive.
+// addClaimedSessionID records the client-supplied Mcp-Session-Id header into a deny's
+// details under claimed_session_id, never as the structured session_id: the transport-level
+// denials that use it fire BEFORE any session lookup, so the header is unverified and
+// attacker-controlled, and stamping it as session_id would let a caller forge records
+// against a victim's session. killSubject's claimedSession (forward.go) is the other caller
+// family, for the identical risk at a different lifecycle stage. Kept only when present so
+// a missing header leaves no empty key.
+// maxClaimedSessionIDLen bounds the attacker-controlled header this stamps into a record. A
+// session id is a UUID; anything longer isn't a real id, and without a bound a request
+// could append most of a 1 MiB header to the tape as a log-flooding primitive.
 const maxClaimedSessionIDLen = 200
 
-// sanitizeClaimedID makes an attacker-controlled header value safe to put in a signed
-// audit field: it replaces any invalid UTF-8 with the replacement character, then cuts to
-// at most limit BYTES without splitting a rune.
+// sanitizeClaimedID makes an attacker-controlled header value safe to put in a signed audit
+// field: replaces invalid UTF-8 with the replacement character, then cuts to at most limit
+// BYTES without splitting a rune. Both halves are load-bearing: without the UTF-8 pass,
+// json.Marshal silently rewrites bytes >= 0x80 (a raw Mcp-Session-Id may carry them) to
+// U+FFFD at serialize time, diverging the signed field from what a SIEM holds; without the
+// rune-safe cut, truncation alone can land mid-rune for the same silent rewrite. Order
+// matters: sanitizing FIRST bounds the walk-back to at most 3 real continuation bytes,
+// where cutting first could walk a run of attacker-chosen 0x80 bytes to zero and stamp an
+// empty field, discarding the correlation evidence it exists for.
 //
-// Both halves are load-bearing, and the byte cut alone is not enough. Go's net/http
-// admits bytes >= 0x80 in a header value, so the raw Mcp-Session-Id can be arbitrary
-// bytes:
-//
-//   - Without the ToValidUTF8 pass, json.Marshal silently rewrites those bytes to U+FFFD
-//     when the record is serialized, so the signed field diverges from the header a SIEM
-//     holds — with or without truncation, since a short invalid header is never cut at
-//     all. Replacing them here makes the substitution explicit and identical on both
-//     sides of the wire instead of an artifact of the encoder.
-//   - Without the rune-boundary walk, the cut lands mid-rune and produces the same
-//     silent U+FFFD rewrite for a perfectly valid multi-byte header.
-//
-// Order matters: sanitizing FIRST means the walk-back only ever skips real continuation
-// bytes and so drops at most 3, where cutting first could walk a run of attacker-chosen
-// 0x80 bytes all the way to zero and stamp an EMPTY claimed_session_id on a request that
-// carried a 300-byte header — discarding the correlation evidence the field exists for.
-//
-// The bound stays a BYTE bound: it exists to cap what an unauthenticated caller can
-// append to a record, and that is a byte budget.
-//
-// The normalize-then-rune-safe-cut logic itself lives in capability.TruncateUTF8 — the
-// shared home for the primitive, which internal/audit's own field bound and
-// pkg/enforcement's denial-details bound also build on — so it exists once rather than as
-// an independently-maintained second copy; this wrapper keeps the threat-model
-// documentation above local to the callers that need it.
+// The logic itself lives in capability.TruncateUTF8, shared with internal/audit and
+// pkg/enforcement's own bounds so it exists once.
 func sanitizeClaimedID(s string, limit int) string {
 	return capability.TruncateUTF8(s, limit)
 }
 
 // maxRefusalDetailLen bounds the OTHER attacker-controlled strings a pre-session refusal
-// stamps into its details: the rejected Origin and the requested path. Both are
-// client-chosen and, unlike a session id, have no fixed shape to bound them by — but no
-// legitimate value approaches 512 bytes, while Go's default MaxHeaderBytes lets an
-// unauthenticated caller put ~1 MiB in either. Unbounded, one refused request per
-// connection is a multi-megabyte-per-second lever on both signed-log growth and the
-// stderr stream, from a caller holding no credential. Larger than the session-id bound
-// because a URL or an allowlist-adjacent origin can legitimately be a few hundred bytes.
+// stamps into its details: the rejected Origin and the requested path. Larger than the
+// session-id bound because a URL or an allowlist-adjacent origin can legitimately run a
+// few hundred bytes, but no legitimate value approaches 512.
 const maxRefusalDetailLen = 512
 
 // boundedRefusalDetail sanitizes and cuts an attacker-controlled refusal detail to
-// maxRefusalDetailLen, using the same rune-safe, valid-UTF-8 treatment the claimed session
-// id gets (see sanitizeClaimedID) so the signed field matches what the caller actually sent
-// rather than an encoder artifact. Compare the result against the input to detect that a
-// value was altered.
+// maxRefusalDetailLen, using the same rune-safe, valid-UTF-8 treatment as sanitizeClaimedID.
 func boundedRefusalDetail(s string) string {
 	return sanitizeClaimedID(s, maxRefusalDetailLen)
 }
@@ -440,11 +359,9 @@ func addClaimedSessionID(details map[string]interface{}, r *http.Request) map[st
 	return addClaimedSessionIDValue(details, r.Header.Get(SessionHeader))
 }
 
-// addClaimedSessionIDValue is addClaimedSessionID's request-independent core: every rule
-// (empty-header no-op, nil-details allocation, sanitize/bound, the truncated flag) lives
-// here once, so a caller that already holds the extracted header value — killSubject,
-// which stores the string rather than the *http.Request precisely to avoid re-deriving it
-// — gets the identical treatment through one call instead of a second implementation.
+// addClaimedSessionIDValue is addClaimedSessionID's request-independent core, so a caller
+// that already holds the extracted header value (killSubject) gets identical treatment
+// through one call instead of a second implementation.
 func addClaimedSessionIDValue(details map[string]interface{}, claimed string) map[string]interface{} {
 	if claimed == "" {
 		return details
@@ -466,53 +383,34 @@ func addClaimedSessionIDValue(details map[string]interface{}, claimed string) ma
 }
 
 // recordPreSessionDeny writes a transport-level deny that fires BEFORE any session
-// lookup — a rejected Origin, JWT, static bearer, or control token. It centralizes the
-// forgery guard those four share: the structured session_id is left EMPTY (at this point
-// the client-supplied Mcp-Session-Id is unverified and attacker-controlled, so stamping
-// it as session_id would let anyone forge these records against a victim's session),
-// while the claimed value is preserved as the clearly-unverified details.claimed_session_id
-// via addClaimedSessionID. The presented credential is NEVER passed in — callers supply
-// only non-secret context (source_ip, origin, error_type) in extra. A nil sink skips the
-// record. Folding the four sites here keeps the empty-session_id rule from being
-// re-hand-rolled — and re-broken — at each new pre-session refusal path.
-// Writes are rate-limited (see newPreSessionDenyLimiter): these are the only audit records an
-// unauthenticated caller can trigger, so an unbounded one-per-refusal write lets a remote
-// attacker drive the audit queue into its monotonic drop counter and permanently trip
-// --require-audit=strict against every legitimate client. A suppressed refusal is folded
-// into the next admitted record's suppressed_refusal_count rather than vanishing — into
-// whichever record of the SAME category is admitted next, which need not be on the same
-// route, hence the suppressed_refusal_scope that ships beside it.
+// lookup — a rejected Origin, JWT, static bearer, or control token. Centralizes the
+// forgery guard those four share: session_id is left EMPTY (the client-supplied
+// Mcp-Session-Id is unverified at this point), with the claimed value preserved only as
+// details.claimed_session_id. The presented credential is NEVER passed in. Writes are
+// rate-limited: unauthenticated callers can trigger these, so an unbounded write lets an
+// attacker drive the audit queue's drop counter and permanently trip
+// --require-audit=strict. A suppressed refusal is folded into the next admitted record of
+// the SAME category rather than vanishing.
 //
-// These records deliberately carry NO route name and no policy_version/policy_sha256
-// stamp: they are written through the proxy-wide p.sink rather than a route's
-// routeSink, because these callers fire before route resolution — and stay there on
-// purpose, since resolving the route first would turn the 404-vs-401 split into an
-// oracle for enumerating route names. An auditor diffing record shapes should read
-// the missing stamp as "refused before any route was chosen", not as a stamping bug.
-// The one refusal that DOES know its route by the time it fires — the session cap —
-// goes through recordSessionCapDeny instead, which keeps this rate limiter and this
-// claimed_session_id rule but writes through the route's sink so its record carries the
-// same route stamp as its in-flight-cap sibling.
-// It returns the rate limiter's verdict (see recordRefusal), which a caller pairs its own
-// stderr diagnostic with so both halves of a refusal are bounded by one decision.
+// These records carry NO route/policy stamp on purpose: resolving the route first would
+// turn the 404-vs-401 split into a route-name enumeration oracle. The one refusal that DOES
+// know its route by firing time — the session cap — goes through recordSessionCapDeny
+// instead, which keeps this rate limiter but writes through the route's sink.
+// Returns the rate limiter's verdict so a caller can gate its own stderr diagnostic on the
+// same decision.
 func (p *HTTPProxy) recordPreSessionDeny(r *http.Request, code string, category refusalCategory, extra map[string]interface{}) bool {
 	return p.recordRefusal(r, nil, code, category, extra)
 }
 
 // preSessionKillRecorder returns the recorder a PRE-SESSION kill-switch site must write
-// its record through, or nil when the bucket suppressed this one (in which case the site
-// still denies the request — only the RECORD is elided, never the enforcement).
+// its record through, or nil when the bucket suppressed this one (the site still denies
+// the request either way — only the RECORD is elided).
 //
-// Those sites — the session-creating initialize, the sessionless initialize notification,
-// and a POST naming an unknown or killed session — fire for raw, unauthenticated requests.
-// Left unbounded they are an audit-queue flooding primitive exactly like the transport
-// refusals beside them: one signed record per sprayed request while a global kill is
-// active, and one dropped record latches AuditDegraded() for the process lifetime, which
-// under the default --require-audit=strict strict-denies every route until restart. So an
-// attacker could turn an emergency stop into a permanent outage that outlives it.
-//
-// It does NOT bound kill records for an established session (see catKill): those describe
-// a caller the proxy already admitted, and are what an operator reads during a stop.
+// Those sites fire for raw, unauthenticated requests and are otherwise an audit-queue
+// flooding primitive: one dropped record latches AuditDegraded() for the process lifetime,
+// which under --require-audit=strict strict-denies every route until restart — turning an
+// emergency stop into an outage that outlives it. It does NOT bound kill records for an
+// established session (see catKill): those describe an already-admitted caller.
 func (p *HTTPProxy) preSessionKillRecorder(route *UpstreamRoute) auditRecorder {
 	rec := asRecorder(route.sink)
 	if rec == nil {
@@ -533,14 +431,12 @@ func (p *HTTPProxy) preSessionKillRecorder(route *UpstreamRoute) auditRecorder {
 	return rolledUpRecorder{auditRecorder: rec, suppressed: suppressed}
 }
 
-// rolledUpRecorder folds a suppressed-refusal rollup into the details of the one record
-// it passes through, so a bounded record still reports how much was elided — the property
-// that makes the bound evidence-preserving rather than evidence-destroying.
-//
-// It wraps rather than widening recordKillDenial/recordKillDrop with a details parameter:
-// those two are the single source of the kill record's SHAPE, shared with the
-// verified-session sites that take no rollup, and threading an always-nil argument through
-// every one of them to serve three is how a shape grows a hole.
+// rolledUpRecorder folds a suppressed-refusal rollup into the details of the one record it
+// passes through, so a bounded record still reports how much was elided. It wraps rather
+// than widening recordKillDenial/recordKillDrop with a details parameter: those two are the
+// single source of the kill record's SHAPE, shared with verified-session sites that take no
+// rollup, and threading an always-nil argument through them to serve three is how a shape
+// grows a hole.
 type rolledUpRecorder struct {
 	auditRecorder
 	suppressed uint64
@@ -552,8 +448,8 @@ func (r rolledUpRecorder) RecordDeny(ctx context.Context, sessionID, identifier,
 	if details == nil {
 		details = make(map[string]interface{}, 2)
 	}
-	// Always paired, for the reason the keys' own doc gives: a count whose scope a reader
-	// has to infer from the stamp beside it is a count that gets misread.
+	// Always paired: a count whose scope a reader has to infer from the stamp beside it
+	// is a count that gets misread.
 	details[detailSuppressedRefusalCount] = r.suppressed
 	details[detailSuppressedRefusalScope] = suppressedScopeProxyCategory
 	r.auditRecorder.RecordDeny(ctx, sessionID, identifier, method, denialCode, condType, details, observe)
@@ -562,54 +458,38 @@ func (r rolledUpRecorder) RecordDeny(ctx context.Context, sessionID, identifier,
 // recordSessionCapDeny records a session-cap refusal — the pre-spawn slot reservation and
 // the errSessionLimit leg of writeSessionCreateError, the two halves of one condition.
 //
-// It writes RESOURCE_EXHAUSTED through the ROUTE's sink, so the record carries the route
-// name and policy stamp exactly like the per-session in-flight cap's record: one denial
-// code, one record shape, whichever cap the flood hit. What it does NOT drop is the rate
-// limit — unlike the in-flight cap, this refusal is reachable WITHOUT an established
-// session, so an unbounded write here would hand a remote caller the audit-queue flooding
-// primitive the pre-session bucket exists to deny.
+// Writes RESOURCE_EXHAUSTED through the ROUTE's sink so the record carries the route
+// stamp like the per-session in-flight cap's record, but keeps the rate limit since —
+// unlike that cap — this refusal is reachable WITHOUT an established session.
 //
-// It is therefore the one refusal that can be route-stamped AND carry a rollup from a
+// It is therefore the one refusal that is route-stamped AND can carry a rollup from a
 // bucket whose tally spans every route. The rollup names its own scope
-// (detailSuppressedRefusalScope: suppressedScopeProxyCategory) precisely so this record's
-// stamp is not read as qualifying the number: `upstream: github` with a count of 5000
-// means 5000 saturation refusals across every route, not 5000 against github. The count
-// covers only this record's own CATEGORY, which is what the per-category buckets made
-// true — it is not a tally of the Origin/JWT/auth floods a reader of the old shared-bucket
-// wording would have folded in.
+// (suppressedScopeProxyCategory) so `upstream: github` with a count of 5000 is read as
+// 5000 saturation refusals across every route, not 5000 against github specifically.
 func (p *HTTPProxy) recordSessionCapDeny(r *http.Request, route *UpstreamRoute) {
 	p.recordRefusal(r, route, codeResourceExhausted, catSaturation, map[string]interface{}{
 		"reason": "session_limit_reached",
 	})
 }
 
-// recordRefusal is the shared body of the two above: rate-limit, fold any suppressed
-// count in, stamp the source IP and the unverified claimed_session_id, and write through
-// route's sink when the route is already known (nil ⟹ the proxy-wide sink).
-// It returns whether the refusal was ADMITTED by the rate limiter, so a caller whose own
-// stderr diagnostic is part of the same flood (checkOrigin's ~600-byte SECURITY line) can
-// gate it on the same verdict. Rate-limiting the tape while leaving the log line per-request
-// left the cheapest half of the primitive open: an unauthenticated caller could still drive
-// unbounded log volume through a rejected Origin.
+// recordRefusal is the shared body of the two above: rate-limit, fold any suppressed count
+// in, stamp the source IP and the unverified claimed_session_id, and write through route's
+// sink when known (nil ⟹ the proxy-wide sink). Returns whether the refusal was ADMITTED by
+// the rate limiter, so a caller whose own stderr diagnostic is part of the same flood
+// (checkOrigin's SECURITY line) can gate it on the same verdict.
 func (p *HTTPProxy) recordRefusal(r *http.Request, route *UpstreamRoute, code string, category refusalCategory, extra map[string]interface{}) bool {
 	rec := asRecorder(p.sink)
 	if route != nil {
 		rec = asRecorder(route.sink)
 	}
-	// The bucket is charged BEFORE the sink is consulted, so the verdict this returns
-	// bounds the caller's stderr line whether or not a tape exists. A nil sink is
-	// reachable in production — --require-audit=off with an unopenable audit path leaves
-	// openConfiguredAuditSink returning (nil, nil) — and short-circuiting to "admitted"
-	// there left the log-volume half of the flooding primitive completely unbounded in
-	// exactly the deployment where stderr is the ONLY refusal signal. There is nothing to
-	// charge the bucket against but the refusal itself, which is the thing being bounded.
+	// Charged BEFORE the sink is consulted, so the verdict bounds the caller's stderr line
+	// whether or not a tape exists — a nil sink is reachable in production
+	// (--require-audit=off with an unopenable path), and short-circuiting to "admitted"
+	// there would leave stderr, the only surviving signal, completely unbounded.
 	//
-	// No nil-limiter fallback for a proxy that HAS a tape: a "defensive" branch there
-	// wrote the refusal record with NO rate limit at all, which is a fail-open on the
-	// exact DoS bound this file exists to enforce. NewHTTPProxyGateway always builds the
-	// limiter, so a nil one alongside a sink is a construction bug and panics like one.
-	// Neither a sink nor a limiter can only be an in-package test literal: there is
-	// nothing to write and nothing to charge.
+	// No nil-limiter fallback for a proxy that HAS a tape: NewHTTPProxyGateway always
+	// builds the limiter, so a nil one alongside a sink is a construction bug that panics
+	// like one rather than silently disabling the DoS bound.
 	if rec == nil && p.preSessionDenies == nil {
 		return true
 	}
@@ -626,9 +506,6 @@ func (p *HTTPProxy) recordRefusal(r *http.Request, route *UpstreamRoute, code st
 		if extra == nil {
 			extra = make(map[string]interface{}, 2)
 		}
-		// Always paired: the count is meaningless to a reader who has to infer its scope
-		// from the stamp beside it, and this record may well carry a route stamp the count
-		// does not respect. See the key constants for the misreading this closes.
 		extra[detailSuppressedRefusalCount] = suppressed
 		extra[detailSuppressedRefusalScope] = suppressedScopeProxyCategory
 	}
@@ -636,15 +513,11 @@ func (p *HTTPProxy) recordRefusal(r *http.Request, route *UpstreamRoute, code st
 	return true
 }
 
-// addRefusalContext stamps the two details EVERY refusal record carries about its caller:
-// the resolved source IP and the unverified claimed_session_id.
-//
-// source_ip lives here rather than at each call site because that is how it got lost. It
-// was hand-added by each of the eight callers, and the two that forgot were an
-// unauthenticated Origin probe and a JWT rejection — precisely the records an incident
-// responder reads to find where an attack came from. Centralizing it makes a refusal path
-// added later carry the source by construction, the same way it inherits the empty
-// session_id rule and the rate limit.
+// addRefusalContext stamps the two details EVERY refusal record carries: the resolved
+// source IP and the unverified claimed_session_id. Centralized here rather than at each
+// call site because that is how it got lost before — hand-added by each of eight callers,
+// with the two that forgot being an unauthenticated Origin probe and a JWT rejection,
+// precisely the records an incident responder reads to find where an attack came from.
 func (p *HTTPProxy) addRefusalContext(details map[string]interface{}, r *http.Request) map[string]interface{} {
 	if details == nil {
 		details = make(map[string]interface{}, 2)
@@ -654,25 +527,22 @@ func (p *HTTPProxy) addRefusalContext(details map[string]interface{}, r *http.Re
 }
 
 // originAllowed reports whether a present Origin value is permitted. The origin must
-// match a configured allowlist entry exactly (case-insensitively), or its host must be
-// a loopback name or the bind host. Nothing is implicit: "null" and an empty value are
-// accepted only if listed in listen.allowedOrigins. An unparseable or hostless Origin
-// fails closed.
+// match a configured allowlist entry exactly (case-insensitively), or its host must be a
+// loopback name or the bind host. Nothing is implicit: "null" and an empty value are
+// accepted only if listed. An unparseable or hostless Origin fails closed.
 //
-// Deliberate port asymmetry: allowedOrigins entries match exactly (scheme + port),
-// while the host-set path matches hostname only and accepts ANY port on a loopback or
-// bind host. DNS rebinding is host-based, not port-based, and any local port on a
-// loopback host is equally local; operators who must pin a port list the exact origin.
+// Deliberate port asymmetry: allowedOrigins entries match exactly (scheme + port), while
+// the host-set path accepts ANY port on a loopback or bind host — DNS rebinding is
+// host-based, not port-based, so any local port on a loopback host is equally local.
 func (p *HTTPProxy) originAllowed(origin string) bool {
 	for _, a := range p.allowedOrigins {
 		if strings.EqualFold(origin, a) {
 			return true
 		}
 	}
-	// A valid RFC 6454 web origin (scheme "://" host[:port]) has no query component, so
-	// any '?' is malformed. Reject it before parsing: url.Parse consumes a trailing bare
-	// '?' as an empty query delimiter, leaving u.RawQuery == "" so the structural guard
-	// below would not catch "http://localhost?". This pre-parse check closes that gap.
+	// A valid RFC 6454 web origin has no query component, so any '?' is malformed. Reject
+	// before parsing: url.Parse consumes a trailing bare '?' as an empty query delimiter,
+	// leaving u.RawQuery == "" so the structural guard below would miss "http://localhost?".
 	if strings.Contains(origin, "?") {
 		return false
 	}
@@ -682,17 +552,12 @@ func (p *HTTPProxy) originAllowed(origin string) bool {
 		// any field of u is read below.
 		return false
 	}
-	// A valid Origin is exactly scheme://host[:port] (RFC 6454 §6.1). url.Parse
-	// retains the scheme, userinfo, fragment, query, and path as struct fields
-	// rather than stripping them, so each is checked explicitly. The host-set path
-	// admits only the http(s) web-origin schemes (case-folded): without the scheme
-	// check a non-web scheme ("file://localhost") or a scheme-relative reference
-	// ("//localhost", empty scheme) would still yield a trusted u.Hostname() and
-	// slip past the guard, and without the userinfo/fragment checks
-	// "http://evil@localhost" or "http://localhost#@evil.com" would too. A trailing
-	// "/" path ("http://localhost/") is accepted: some browsers include it and it
-	// carries no injection risk. Opaque "null"/"file://…" front-ends opt in
-	// explicitly through the exact-match allowedOrigins loop above.
+	// A valid Origin is exactly scheme://host[:port] (RFC 6454 §6.1). url.Parse retains
+	// scheme, userinfo, fragment, query, and path as struct fields, so each is checked
+	// explicitly: without the scheme check "file://localhost" or a scheme-relative
+	// "//localhost" would still yield a trusted Hostname() and slip past, and without the
+	// userinfo/fragment checks "http://evil@localhost" or "...#@evil.com" would too. A
+	// trailing "/" path is accepted (some browsers include it, no injection risk).
 	scheme := strings.ToLower(u.Scheme)
 	if (scheme != "http" && scheme != "https") || u.Host == "" || u.User != nil ||
 		u.Fragment != "" || u.RawQuery != "" || (u.Path != "" && u.Path != "/") {
@@ -703,40 +568,28 @@ func (p *HTTPProxy) originAllowed(origin string) bool {
 
 // sourceIP extracts the client IP address for PDP evaluation.
 //
-// Under --trust-forwarded-for the proxy trusts X-Forwarded-For — but only when the
-// immediate peer (RemoteAddr) itself matches listen.trustedProxyCIDRs. Without this
-// check, --trust-forwarded-for alone would trust the header from ANY directly-connecting
-// client, letting it spoof an ipRange source; requiring the peer to be a configured
-// trusted hop closes that gap.
+// Under --trust-forwarded-for the proxy trusts X-Forwarded-For only when the immediate
+// peer (RemoteAddr) itself matches listen.trustedProxyCIDRs — otherwise the flag alone
+// would trust the header from ANY directly-connecting client, letting it spoof an ipRange source.
 //
-// The client is resolved by COUNTING hops, not by inspecting addresses. With N trusted
-// proxies in front (listen.trustedProxyHops, default 1), each hop appends the address it
-// saw — client → p1 → p2 → eunox yields [client, p1] — so the right-most N entries are
-// exactly the ones trusted proxies wrote and the client's real address is the N-th from
-// the right. Everything further left is client-supplied and ignored, so a client cannot
-// spoof an ipRange source by prepending forged hops.
+// The client is resolved by COUNTING hops, not inspecting addresses: with N trusted
+// proxies (listen.trustedProxyHops), each appends the address it saw, so the right-most N
+// entries are exactly proxy-written and the client's real address is the N-th from the
+// right. The count is declared rather than inferred by testing each entry against
+// trustedProxyCIDRs, because inference can't distinguish a proxy hop from a client whose
+// OWN address falls inside that range (a plausible shared-supernet deployment) and would
+// then return a forged entry to its left.
 //
-// The count is declared rather than inferred by testing each entry against
-// trustedProxyCIDRs. Inference cannot distinguish a proxy hop from a client whose OWN
-// address falls inside that range — a plausible internal deployment where clients and
-// proxies share a private supernet — and would then skip the client's real (proxy-
-// written) entry and return a forged one to its left, exactly the spoof the peer gate
-// exists to prevent.
-//
-// A chain that carries entries but FEWER than N does not match the declared topology, so
-// no entry is provably proxy-written. Falling back to RemoteAddr there would be a silent
-// fail-OPEN: the enclosing branch has already established the peer is a trusted proxy, so
-// RemoteAddr is by construction inside listen.trustedProxyCIDRs, and an ipRange condition
-// allowing the internal supernet those proxies sit in would then match every request
-// regardless of its real client. Such a request instead yields an empty source IP, which
-// an ipRange condition denies with MISSING_CONTEXT — the mismatch is loud rather than
-// permissive. A header that carries no entries at all is treated as "no XFF" and uses
-// RemoteAddr, exactly as a request without the header does.
+// A chain with FEWER than N entries doesn't match the declared topology, so no entry is
+// provably proxy-written; falling back to RemoteAddr there would be a silent fail-OPEN
+// (RemoteAddr is by construction inside trustedProxyCIDRs on this branch, so an ipRange
+// condition allowing that supernet would match every request). Such a request instead
+// yields an empty source IP, which an ipRange condition denies loudly with MISSING_CONTEXT.
 func (p *HTTPProxy) sourceIP(r *http.Request) string {
 	if p.trustFwdFor && p.peerIsTrustedProxy(r.RemoteAddr) {
-		// Flatten ALL X-Forwarded-For lines, not just the first: an intermediary that
-		// adds its own line would otherwise let an attacker-controlled first line shadow
-		// the trusted right-most hop.
+		// Flatten ALL X-Forwarded-For lines, not just the first: an intermediary adding
+		// its own line would otherwise let an attacker-controlled first line shadow the
+		// trusted right-most hop.
 		if vals := r.Header.Values("X-Forwarded-For"); len(vals) > 0 {
 			var all []string
 			for _, v := range vals {
@@ -752,11 +605,10 @@ func (p *HTTPProxy) sourceIP(r *http.Request) string {
 				if idx < 0 {
 					return "" // chain shorter than declared: fail closed, see above
 				}
-				// Normalize like the RemoteAddr path below: proxies may append the client as
-				// IP:port or a bracketed IPv6 literal, and the downstream ipRange condition
-				// runs net.ParseIP, which returns nil for either form. An entry that
-				// normalizes to nothing (":8080", "[]") is returned RAW so it still fails
-				// net.ParseIP downstream and denies, rather than falling back to the peer.
+				// Normalize like the RemoteAddr path below (proxies may append IP:port or a
+				// bracketed IPv6 literal). An entry normalizing to nothing (":8080", "[]") is
+				// returned RAW so it still fails net.ParseIP downstream and denies, rather
+				// than falling back to the peer.
 				if host := normalizeHost(all[idx]); host != "" {
 					return host
 				}
@@ -769,10 +621,9 @@ func (p *HTTPProxy) sourceIP(r *http.Request) string {
 }
 
 // normalizeHost strips an optional port and IPv6 brackets from a host-ish value, yielding
-// the bare host net.ParseIP accepts. Shared by sourceIP's X-Forwarded-For read (a proxy
-// may append the client as a bare address, IP:port, or a bracketed IPv6 literal) and
-// loopbackOnly's Host pin, so the two agree on what a host string reduces to rather than
-// each carrying its own copy of the rule. Empty in, empty out.
+// the bare host net.ParseIP accepts. Shared by sourceIP's X-Forwarded-For read and
+// loopbackOnly's Host pin, so the two agree on what a host string reduces to. Empty in,
+// empty out.
 func normalizeHost(entry string) string {
 	if host, _, err := net.SplitHostPort(entry); err == nil {
 		return host
@@ -780,10 +631,8 @@ func normalizeHost(entry string) string {
 	return strings.TrimSuffix(strings.TrimPrefix(entry, "["), "]")
 }
 
-// proxyHops is the effective listen.trustedProxyHops: the declared count, or 1 when the
-// key is unset (the zero value). A single trusted proxy is the overwhelmingly common
-// topology and makes the read the plain right-most X-Forwarded-For entry, so an absent
-// key resolves to that rather than to a chain depth nobody declared. Config validation
+// proxyHops is the effective listen.trustedProxyHops: the declared count, or 1 when unset,
+// since a single trusted proxy is the overwhelmingly common topology. Config validation
 // already rejects an explicit value below 1, so the clamp only supplies the default.
 func (p *HTTPProxy) proxyHops() int {
 	if p.trustedProxyHops < 1 {
@@ -792,11 +641,10 @@ func (p *HTTPProxy) proxyHops() int {
 	return p.trustedProxyHops
 }
 
-// hostInTrustedProxyNets reports whether a bare host (no port, no brackets) parses to an
-// IP inside listen.trustedProxyCIDRs. Backs peerIsTrustedProxy, the immediate-peer gate.
-// Deliberately NOT applied to X-Forwarded-For entries: membership in this range does not
-// prove an entry was written by a proxy rather than by a client that happens to share the
-// range, so sourceIP counts declared hops instead. An empty CIDR set matches nothing.
+// hostInTrustedProxyNets reports whether a bare host parses to an IP inside
+// listen.trustedProxyCIDRs. Backs peerIsTrustedProxy. Deliberately NOT applied to
+// X-Forwarded-For entries: membership doesn't prove an entry was proxy-written rather than
+// client-supplied from a shared range, so sourceIP counts declared hops instead.
 func (p *HTTPProxy) hostInTrustedProxyNets(host string) bool {
 	if len(p.trustedProxyNets) == 0 {
 		return false
@@ -825,13 +673,10 @@ func (p *HTTPProxy) peerIsTrustedProxy(remoteAddr string) bool {
 	return p.hostInTrustedProxyNets(host)
 }
 
-// bindIsLoopbackOnly reports whether the bind host accepts connections only from
-// the local loopback interface. A wildcard bind ("" / 0.0.0.0 / ::), or any routable
-// address or non-loopback hostname, is NOT loopback-only — it may be reachable
-// directly, which matters for the --trust-forwarded-for warning in Serve. Delegates
-// to capability.IsLoopbackHost (case-insensitive, trailing-FQDN-dot-tolerant) rather
-// than keeping a second, independently-maintained loopback check, which had drifted
-// from it (case-sensitive, no trailing-dot handling) before this fix.
+// bindIsLoopbackOnly reports whether the bind host accepts connections only from the local
+// loopback interface — matters for the --trust-forwarded-for warning in Serve. Delegates to
+// capability.IsLoopbackHost rather than a second, independently-maintained check, which had
+// drifted from it (case-sensitive, no trailing-dot handling) before this fix.
 func bindIsLoopbackOnly(host string) bool {
 	if host == "" {
 		return false // empty == wildcard (all interfaces)
@@ -854,31 +699,24 @@ func openNonLoopbackBind(bind, authToken string, jwtConfigured bool) bool {
 	return !bindIsLoopbackOnly(bind) && authToken == "" && !jwtConfigured
 }
 
-// loopbackOnly reports whether the request originates from a loopback address AND
-// carries a trusted Host, writing a 403 and returning false otherwise. Shared by the
-// control, health, and metrics endpoints so none of them is reachable off-host.
+// loopbackOnly reports whether the request originates from a loopback address AND carries
+// a trusted Host, writing a 403 and returning false otherwise. Shared by the control,
+// health, and metrics endpoints so none is reachable off-host.
 //
-// The Host check is the DNS-rebinding guard: a loopback RemoteAddr alone is satisfied
-// by the victim's OWN browser after a rebind (attacker.com → 127.0.0.1), because the
-// TCP connection still originates on the local machine. Without also pinning the Host
-// to a trusted name, attacker JS on a rebound page could read /healthz and /metrics
-// operational state (session/route counts, audit-degradation and kill-switch health)
-// cross-site — the checkOrigin path already applies exactly this Host allowlist to
-// /mcp, but these endpoints are gated by loopbackOnly alone.
+// The Host check is the DNS-rebinding guard: a loopback RemoteAddr alone is satisfied by
+// the victim's OWN browser after a rebind, since the TCP connection still originates
+// locally. Without pinning the Host too, attacker JS on a rebound page could read
+// /healthz and /metrics cross-site — checkOrigin applies this same allowlist to /mcp, but
+// these endpoints are gated by loopbackOnly alone.
 func (p *HTTPProxy) loopbackOnly(w http.ResponseWriter, r *http.Request) bool {
-	// Under --trust-forwarded-for a reverse proxy may sit in front of the listener and
-	// forward these loopback-only control/health/metrics paths: it then connects from a
-	// loopback RemoteAddr on behalf of an OFF-HOST client, so RemoteAddr alone would admit
-	// that client. A directly-connecting local caller never sends X-Forwarded-For, so when
-	// the trust flag is set treat the presence of that header as "this arrived via the
-	// proxy" and fail closed. This can only DENY (never admit) — an attacker who reaches a
-	// directly-exposed listener and injects a spurious X-Forwarded-For merely self-blocks
-	// these endpoints, so the failure mode is safe.
-	// Each refusal below is recorded. loopbackOnly is the FIRST gate on /control/kill,
-	// /healthz and /metrics — it runs before checkControlToken, which does record — so an
-	// OFF-HOST probe of the emergency stop was the one attack against the transport surface
-	// that left nothing on the tape, while the same-host caller who merely got the token
-	// wrong was fully logged. The more remote attacker must not be the invisible one.
+	// Under --trust-forwarded-for a reverse proxy may forward these paths, connecting from
+	// a loopback RemoteAddr on behalf of an OFF-HOST client. A directly-connecting local
+	// caller never sends X-Forwarded-For, so treat its presence as "arrived via the proxy"
+	// and fail closed — this can only DENY, so an attacker injecting a spurious header
+	// merely self-blocks.
+	// Each refusal below is recorded: loopbackOnly is the FIRST gate here, before
+	// checkControlToken, so an off-host probe must not be the one attack that leaves
+	// nothing on the tape while a same-host wrong-token attempt is fully logged.
 	if p.trustFwdFor && len(r.Header.Values("X-Forwarded-For")) > 0 {
 		p.recordPreSessionDeny(r, codeLoopbackRejected, catLoopback, map[string]interface{}{
 			"reason": "forwarded_for_present",
@@ -897,12 +735,10 @@ func (p *HTTPProxy) loopbackOnly(w http.ResponseWriter, r *http.Request) bool {
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return false
 	}
-	// DNS-rebinding guard: also require a trusted Host. normalizeHost reduces r.Host to
-	// a bare hostname the same way originAllowed's url.Hostname() reduces an Origin, so
-	// the two checks agree on what they are comparing. A rebound request carries the
-	// attacker's name (Host: attacker.com) and is rejected; a legitimate loopback scrape
-	// uses localhost / 127.0.0.1 / ::1 / the non-wildcard bind host, all of which
-	// buildAllowedOriginHosts seeds.
+	// DNS-rebinding guard: also require a trusted Host. normalizeHost reduces r.Host the
+	// same way originAllowed's url.Hostname() reduces an Origin, so the two checks agree.
+	// A rebound request carries the attacker's name and is rejected; a legitimate loopback
+	// scrape uses localhost/127.0.0.1/::1/the bind host, all seeded by buildAllowedOriginHosts.
 	reqHost := strings.ToLower(normalizeHost(r.Host))
 	if !p.hostAllowedForLoopbackEndpoint(r.Host, reqHost) {
 		p.recordPreSessionDeny(r, codeLoopbackRejected, catLoopback, map[string]interface{}{
@@ -918,34 +754,20 @@ func (p *HTTPProxy) loopbackOnly(w http.ResponseWriter, r *http.Request) bool {
 // hostAllowedForLoopbackEndpoint reports whether reqHost (already normalized to a bare,
 // lower-cased hostname) is a trusted name for a loopback-only endpoint.
 //
-// What the guard must stop is a DNS rebind, and a rebind always presents a NAME the
-// attacker controls (Host: attacker.com) — that is the mechanism: the victim's browser
-// still believes it is talking to the attacker's hostname, which is what makes the
-// response same-origin readable. So the rule is "reject foreign names", not "reject
-// everything unlisted", and three things are admitted:
+// A DNS rebind always presents a NAME the attacker controls, so the rule is "reject
+// foreign names", not "reject everything unlisted", and three things are admitted: the
+// origin-host allowlist plus any listen.allowedOrigins hostnames (every name checkOrigin
+// would accept on /mcp); any loopback host, name or literal (local by construction, and a
+// browser can't be steered into sending a loopback literal as a rebound page's Host —
+// fetching it directly is cross-origin and requireValidOrigin rejects it first); and a
+// genuinely ABSENT Host (every browser sends one, so no value means a non-browser local
+// caller).
 //
-//   - The origin-host allowlist the constructor seeds (loopback names plus any
-//     non-wildcard bind host), plus the hostnames of any listen.allowedOrigins entries —
-//     together, every name checkOrigin would accept an Origin from on /mcp.
-//   - Any loopback host, name or literal. A caller reaching a loopback endpoint over
-//     127.0.0.2 or an alternate loopback alias is local by construction, and a browser
-//     cannot be steered into sending a loopback LITERAL as the Host of a rebound page:
-//     fetching the literal directly is cross-origin, so it carries an Origin and
-//     requireValidOrigin (which wraps every route) rejects it first.
-//   - A genuinely ABSENT Host. HTTP/1.1 requires the header and every browser sends it, so
-//     no value at all is a non-browser local caller (an HTTP/1.0 liveness probe, a
-//     hand-rolled client) and cannot be a rebind.
+// The absent-Host allowance keys off rawHost, NOT the normalized value: normalizeHost
+// reduces a present-but-host-less value like ":8080" to "", so gating on the normalized
+// value would have let `Host: :8080` (a header that WAS sent) skip the whole rebinding pin.
 //
-// The absent-Host allowance keys off rawHost — the header as received — NOT off the
-// normalized value. normalizeHost reduces a PRESENT but host-less value to the empty
-// string: net.SplitHostPort succeeds on ":8080" and returns host "", and "[]" reduces the
-// same way. Gating on the normalized value therefore admitted `Host: :8080`, which is a
-// header that was sent, so the "no value means non-browser caller" reasoning does not hold
-// for it and the whole rebinding pin was skippable by any caller able to set a raw Host
-// line.
-//
-// The source-IP loopback check remains the primary gate; this is the rebinding layer on
-// top of it.
+// The source-IP loopback check remains the primary gate; this is the rebinding layer on top.
 func (p *HTTPProxy) hostAllowedForLoopbackEndpoint(rawHost, reqHost string) bool {
 	if rawHost == "" {
 		return true
@@ -958,10 +780,8 @@ func (p *HTTPProxy) hostAllowedForLoopbackEndpoint(rawHost, reqHost string) bool
 	if p.allowedOriginHosts[reqHost] {
 		return true
 	}
-	// A host the operator explicitly allowlisted as a trusted Origin is, by definition, not
-	// a foreign name — it is the same trust decision checkOrigin already makes for the more
-	// sensitive /mcp route. Omitting it made these endpoints stricter than /mcp, contrary to
-	// this function's own contract.
+	// An operator-allowlisted Origin host is, by definition, not a foreign name — the same
+	// trust decision checkOrigin makes for the more sensitive /mcp route.
 	if p.loopbackPinHosts[reqHost] {
 		return true
 	}

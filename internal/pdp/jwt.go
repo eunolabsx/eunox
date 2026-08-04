@@ -3,66 +3,26 @@
 
 // JWT PDP mode for IdP-issued capability claims (--jwks-uri).
 //
-// When --jwks-uri is set the proxy validates the Authorization: Bearer token on
-// every HTTP request, extracts MCP capability claims, translates them into
-// capability.Constraint values, and evaluates them on each MCP call.
+// The proxy validates the Authorization: Bearer token on every HTTP request,
+// extracts MCP capability claims (schema v0.2, nested under "mcp" since IdPs treat
+// claim-name dots as path separators), and evaluates them per call as
+// capability.Constraint values.
 //
-// Claim schema (JWT schema v0.2 — Keycloak and most IdPs nest on dots):
+// Shorthand: "<namespace>:<name>[?<key>=<value>&…]", e.g.
+// "tool:read_file?path=/reports/*" or "resource:https://api/data?format=json" (the
+// "?" there is the URL's own query, not a condition suffix). See parseV2Claim and
+// evaluateJWTConditions for the full grammar and condition semantics.
 //
-//	{
-//	  "mcp": {
-//	    "v":             "0.2",
-//	    "capabilities": ["tool:read_file?path=/reports/*", "tool:query_db?op=SELECT"],
-//	    "task_id":       "task-abc123",
-//	    "agent_id":      "agent-xyz"
-//	  }
-//	}
+// EXPERIMENTAL: mcp.capabilities enforcement is off by default
+// (--jwt-experimental-capabilities); a token carrying it is rejected, not silently
+// admitted with its restriction dropped, until the flag is set. Identity claims and
+// signature/exp/iss/aud verification are always active regardless.
 //
-// Claim shorthand (v0.2): "<namespace>:<name>[?<key>=<value>[&<key>=<value>…]]"
+// With --policy also set, JWT and manifest are intersected: a token can only
+// restrict what the manifest allows, never expand it.
 //
-//	"tool:read_file"                       → tools/call for read_file, no conditions
-//	"tool:read_file?path=/reports/*"       → AllowedValues(path=/reports/*)
-//	"tool:query_db?op=SELECT"              → AllowedOperations=[SELECT] (scan-all-args)
-//	"tool:query_db?op=SELECT&table=sales"  → op=SELECT AND table=sales
-//	"resource:file:///data/*"              → resources/read for file:///data/*
-//	"resource:https://api/data?format=json"→ resources/read; the "?…" is the URI's
-//	                                          query string, NOT a condition suffix
-//	"prompt:code_review"                   → prompts/get for code_review
-//
-// The optional "?…" suffix follows the form-urlencoded convention (§ 4.2): pairs
-// split on '&', key from value on '=', combined with logical AND; each value is
-// percent-decoded ('+' → space) before matching. Keys MUST NOT be percent-encoded;
-// an encoded key, a pair missing '=', or any unparseable suffix rejects the token
-// (HTTP 401).
-//
-// Exception for http(s) resources: when the value is an http(s) URL, '?' begins the
-// URL's query component, not a condition list, so the whole URL is kept as the
-// resource name (otherwise the URL is truncated and misread as a never-satisfiable
-// condition). Other schemes still treat '?' as the condition separator. When
-// matching (matchClaimBare) a query-bearing claim pins the query exactly; a
-// query-less claim is a path-only wildcard accepting any target query — there is no
-// glob syntax for the query component.
-//
-// Condition keys: "op" → AllowedOperationsCondition (scan-all-args); any other key
-// → AllowedValuesCondition on the named argument. "op=" is best-effort first-word
-// matching that does NOT parse SQL (stacked/CTE-wrapped statements escape it) — pair
-// it with a least-privilege database role; the manifest form (Pattern C) names the
-// argument and is preferred.
-//
-// EXPERIMENTAL: the mcp.capabilities claim schema (the whole "capabilities"
-// feature described above) is experimental and OFF by default. Enforcement requires
-// --jwt-experimental-capabilities (JWTPDPOptions.ExperimentalCapabilities). With the
-// flag unset, a token carrying mcp.capabilities is rejected at validation (HTTP 401,
-// fail closed) rather than admitted with its capability restriction silently dropped
-// — the latter would fail open. JWT signature/exp/iss/aud verification and the
-// identity claims (sub, mcp.task_id, mcp.agent_id) are stable and always active,
-// independent of the flag. The claim format may change before 1.0.
-//
-// When both --jwks-uri and --policy are set AND the flag is on, the intersection is
-// taken: JWT claims can only restrict what the manifest allows, never expand it.
-//
-// Breaking change from v0.1: tokens with mcp.v other than "0.2" are rejected
-// (HTTP 401); the v0.1 colon-only shorthand is not accepted.
+// Breaking change from v0.1: only mcp.v="0.2" is accepted; the v0.1 colon-only
+// shorthand is rejected.
 
 package pdp
 
@@ -90,69 +50,50 @@ import (
 	"github.com/eunolabs/eunox/pkg/killswitch"
 )
 
-// jwtClaimsKey is the unexported context key type for JWT claims.
 type jwtClaimsKey struct{}
 
 // JWTClaims holds the MCP capability claims extracted from an IdP JWT.
 type JWTClaims struct {
 	Capabilities []string
-	// HasCapabilities is true when the JWT contained the mcp.capabilities
-	// array (even if it was empty).  When false, the JWT carries no
-	// capability restriction and decisions fall through to the manifest PDP.
+	// HasCapabilities distinguishes "field absent" from "present but empty": true
+	// means the token carries an exhaustive allowlist even if it lists nothing;
+	// false means the JWT imposes no restriction and defers to the manifest PDP.
 	HasCapabilities bool
 	TaskID          string
 	AgentID         string
 	Subject         string
 	Issuer          string
-	// Audiences is the token's verified `aud` claim (always a list; a scalar aud
-	// decodes to a one-element slice). Captured so a per-route JWTPDP wrapper can pin
-	// its own audience after the shared validator has accepted the token — see
-	// JWTPDP.routeAudience and WrapRoutesWithJWT. Empty when the token carried no aud.
+	// Audiences is the verified `aud` claim (always a list). Lets a per-route
+	// wrapper pin its own audience after the shared validator accepts the token
+	// for the union of all routes — see routeAudience / WrapRoutesWithJWT.
 	Audiences []string
-	// Declassify holds the validated human approvals the token's `mcp.declassify` claim
-	// granted. Nil for the overwhelming majority of tokens. It is the ONLY thing that
-	// lets a declassify directive clear a flow label instead of escalating, which is why
-	// it is parsed and validated at the token boundary (ValidateToken) rather than read
-	// out of Extra on the decision path.
+	// Declassify holds validated human approvals from `mcp.declassify`, parsed and
+	// checked at the token boundary (not read from Extra) because it is the only
+	// thing that lets a declassify directive clear a flow label instead of escalating.
 	Declassify []capability.DeclassifyApproval
-	// Delegation holds the token's validated delegation chain: its RFC 8693 `act` actors
-	// and its `mcp.delegation` per-hop grants, already asserted to narrow at every hop.
-	// Nil for the overwhelming majority of tokens. Like Declassify it is decoded and
-	// checked at the token boundary (ValidateToken) rather than read out of Extra on the
-	// decision path — a widening chain is a rejected token, not a decision-time surprise.
+	// Delegation holds the validated RFC 8693 `act` chain plus `mcp.delegation`
+	// grants, already asserted to narrow at every hop — a widening chain is a
+	// rejected token at ValidateToken, not a decision-time surprise.
 	Delegation *capability.DelegationChain
-	// ExpiresAt is the verified token's `exp` as a wall-clock time. ValidateToken
-	// rejects a token with no exp, so this is always set on a validated JWTClaims; it is
-	// the zero Time for a JWTClaims built without ValidateToken (e.g. tests). A long-lived
-	// server->client stream (an SSE GET) is validated only once at open, so the transport
-	// arms a timer at this instant to end the stream when the token's lifetime elapses —
-	// otherwise an expired (or IdP-revoked but not kill-switched) client keeps receiving
-	// traffic until it disconnects or the idle reaper runs. Kill-switch eviction covers
-	// administrative revocation; this covers plain expiry.
+	// ExpiresAt is the verified `exp`. A long-lived SSE stream is validated once at
+	// open, so the transport arms a timer at this instant to cut the stream at token
+	// expiry — the idle reaper alone would let an expired client keep reading.
 	ExpiresAt time.Time
-	// Extra holds every raw top-level claim from the verified token, keyed exactly
-	// as the IdP emitted it (standard fields, the nested mcp object, custom claims).
-	// It is the source of input.claims (see jwtClaimsAsMap), so a policy can
-	// reference any IdP claim. Populated only after signature verification; nil when
-	// no token was parsed.
+	// Extra holds every raw top-level claim as the IdP emitted it, feeding
+	// input.claims (jwtClaimsAsMap) so a policy can reference any IdP claim.
 	Extra map[string]interface{}
 
-	// parsedCaps caches the cheap-phase parse of Capabilities (parseCapHeads),
-	// computed once at validation, so later Decides skip re-parsing each claim's head.
-	// Nil for a JWTClaims built without ValidateToken (e.g. tests), where Decide falls
-	// back to parsing Capabilities directly.
+	// parsedCaps caches parseCapHeads's output from validation time, so later
+	// Decides skip re-parsing each claim head. Nil for a JWTClaims built without
+	// ValidateToken (tests), where Decide parses Capabilities directly.
 	parsedCaps []capHead
 
-	// flatClaims caches the flattened input.claims map (see buildFlatClaims / the
-	// jwtClaimsAsMap doc), computed ONCE at validation. Every enforced request, list
-	// filter, and sampling decision consumes it read-only, so rebuilding it per call
-	// (copying every Extra entry each time) was pure repeated work — JWTClaims is
-	// immutable after validation. Populated eagerly at validation (not lazily) because
-	// the *JWTClaims is shared across a session's requests, so a lazy write would race
-	// concurrent readers. Nil for a JWTClaims built without ValidateToken, where
-	// jwtClaimsAsMap falls back to computing the map on the fly (never storing it).
-	// MUST be treated as read-only by every consumer (it is handed to third-party
-	// PolicyEvaluators).
+	// flatClaims caches the flattened input.claims map, built once at validation
+	// since every request against this token reuses it read-only (rebuilding per
+	// call copied every Extra entry each time). Populated eagerly rather than
+	// lazily because the *JWTClaims is shared across a session's requests and a
+	// lazy write would race concurrent readers. MUST stay read-only — it is handed
+	// to third-party PolicyEvaluators.
 	flatClaims map[string]interface{}
 }
 
@@ -161,15 +102,11 @@ func WithJWTClaims(ctx context.Context, claims *JWTClaims) context.Context {
 	return context.WithValue(ctx, jwtClaimsKey{}, claims)
 }
 
-// declassifyApprovalsFromContext returns the human declassification approvals the
-// request's VERIFIED token granted, or nil when there is no token or it carried none —
-// which is the default, and is exactly what makes a deployment with no approval
-// integration escalate a declassify directive rather than silently performing it.
-//
-// It reads the validated JWTClaims rather than the flat input.claims map on purpose: the
-// map is a convenience surface for third-party policy evaluators and holds raw,
-// re-decoded claim values, while this input decides whether a flow label may be removed.
-// A security-critical input takes the typed, already-validated path.
+// declassifyApprovalsFromContext returns the token's granted declassify approvals, or
+// nil (the default, without a token or approval) — which makes a deployment with no
+// approval integration escalate a declassify directive rather than silently perform it.
+// Reads the typed, validated JWTClaims rather than the flat input.claims map, since a
+// security-critical decision should not depend on the third-party-evaluator convenience view.
 func declassifyApprovalsFromContext(ctx context.Context) []capability.DeclassifyApproval {
 	if c, ok := jwtClaimsFromContext(ctx); ok {
 		return c.Declassify
@@ -177,12 +114,9 @@ func declassifyApprovalsFromContext(ctx context.Context) []capability.Declassify
 	return nil
 }
 
-// delegationFromContext returns the validated delegation chain the request's token declared,
-// or nil when there is no token or it declared none — the default, and what makes a
-// deployment with no delegation integration behave exactly as it does today.
-//
-// It reads the typed, already-validated JWTClaims rather than the flat input.claims map, for
-// the reason declassifyApprovalsFromContext does: every axis this carries bounds a decision.
+// delegationFromContext returns the token's validated delegation chain, or nil (the
+// default) when there is none — reads the typed JWTClaims for the same reason
+// declassifyApprovalsFromContext does.
 func delegationFromContext(ctx context.Context) *capability.DelegationChain {
 	if c, ok := jwtClaimsFromContext(ctx); ok {
 		return c.Delegation
@@ -196,52 +130,39 @@ func jwtClaimsFromContext(ctx context.Context) (*JWTClaims, bool) {
 	return c, ok && c != nil
 }
 
-// The caller identity a record is stamped with is deliberately NOT built here, even though
-// this package owns the claims it comes from. audit.WithIdentity exists so the audit writer
-// need not import the JWT/PDP layer, and returning the writer's own struct from here satisfied
-// that by inverting the arrow rather than removing it — every consumer of this package then
-// linked the audit writer, internal/drift included. The adapter lives at the one place that
-// imports both, cmd/eunox/audit_identity.go, over the exported JWTClaimsPtr.
+// The caller identity a record is stamped with is deliberately NOT built here: returning
+// the audit writer's own struct would have linked internal/pdp to the audit writer for
+// every consumer. The adapter lives at cmd/eunox/audit_identity.go, the one place that
+// imports both, over the exported JWTClaimsPtr.
 
-// mcpClaimVersion is the only accepted value for the mcp claim set's "v" field.
-// Other versions (including the legacy "0.1") are rejected so a schema change is
-// caught early rather than silently misinterpreted.
+// mcpClaimVersion is the only accepted value for the mcp claim set's "v" field —
+// other versions (including "0.1") are rejected rather than silently misinterpreted.
 const mcpClaimVersion = "0.2"
 
-// mcpClaimSet holds the MCP-specific fields nested under the "mcp" key (IdPs treat
-// dots in a claim name as path separators, so "mcp.capabilities" nests).
+// mcpClaimSet holds the MCP-specific fields nested under "mcp" (IdPs treat dots in a
+// claim name as path separators).
 //
-// Capabilities is a pointer to distinguish "field absent" (nil) from "present but
-// empty" (&[]string{}): per the exhaustive-allowlist rule (§ 5.2) a present-empty
-// array denies everything, whereas an absent field defers to the manifest.
+// Capabilities is a pointer to distinguish absent (nil, defers to the manifest) from
+// present-but-empty (&[]string{}, denies everything per the exhaustive-allowlist rule).
 type mcpClaimSet struct {
 	Version      string    `json:"v"`
-	Capabilities *[]string `json:"capabilities,omitempty"` // nil ⟹ field absent
+	Capabilities *[]string `json:"capabilities,omitempty"`
 	TaskID       string    `json:"task_id"`
 	AgentID      string    `json:"agent_id"`
-	// Declassify carries the human approvals to drop flow labels
-	// (capability.DeclassifyApproval). It is held raw and decoded through
-	// capability.ParseDeclassifyApprovals so the wire type, its validation, and its
-	// unknown-field rejection live in the package that owns the grammar rather than
-	// being re-modeled here. Absent on every token that is not carrying an approval,
-	// which is nearly all of them.
+	// Declassify is held raw and decoded via capability.ParseDeclassifyApprovals so
+	// the grammar, validation, and unknown-field rejection live in that package.
 	Declassify json.RawMessage `json:"declassify,omitempty"`
-	// Delegation carries the per-hop attenuation grants of a delegation chain
-	// (capability.DelegationGrant), held raw and decoded through
-	// capability.ParseDelegationGrants for the same reason Declassify is: the grammar,
-	// its validation, and its unknown-field rejection live in the package that owns
-	// them. Absent on every token that is not a delegated one.
+	// Delegation is held raw and decoded via capability.ParseDelegationGrants, for
+	// the same reason Declassify is.
 	Delegation json.RawMessage `json:"delegation,omitempty"`
 }
 
 // idpJWTPayload is the subset of IdP JWT claims relevant to MCP enforcement.
-// Standard JWT fields (iss, sub, exp, iat, aud) are parsed separately by
-// jwt.Claims; this struct handles only the MCP-specific custom claims.
+// Standard fields (iss, sub, exp, iat, aud) are parsed separately by jwt.Claims.
 type idpJWTPayload struct {
 	MCP mcpClaimSet `json:"mcp"`
-	// Act is the RFC 8693 §4.1 actor chain, a top-level claim rather than an mcp one
-	// because it is a standard OAuth token-exchange claim an IdP emits on its own terms.
-	// Held raw and walked by capability.ParseActorChain.
+	// Act is top-level rather than nested under mcp because it is a standard RFC
+	// 8693 §4.1 OAuth claim an IdP emits on its own terms; walked by ParseActorChain.
 	Act json.RawMessage `json:"act,omitempty"`
 }
 
@@ -254,41 +175,31 @@ type JWTPDP struct {
 	cache            *capability.JWKSCache
 	issuer           string
 	audience         string
-	allowAnyAudience bool // --jwt-allow-any-audience: skip audience pinning entirely
-	allowAnyIssuer   bool // --jwt-allow-any-issuer: skip issuer pinning entirely
-	// acceptedAudiences is the set of audiences ValidateToken accepts (go-jose
-	// "at least one of"). Empty falls back to []string{audience}, so a single-upstream
-	// JWTPDP keeps its existing single-audience pin. The gateway's shared validator sets
-	// it to the UNION of every route's effective audience, so a token minted for ANY
-	// route clears validation; each route wrapper then narrows to its own audience via
-	// routeAudience. Unused by route wrappers (they read already-validated claims).
+	allowAnyAudience bool
+	allowAnyIssuer   bool
+	// acceptedAudiences is the set ValidateToken accepts (go-jose "at least one
+	// of"); empty falls back to {audience}. The gateway's shared validator sets it to
+	// the UNION of every route's audience so any route's token clears validation,
+	// then each route wrapper narrows via routeAudience. Unused by route wrappers.
 	acceptedAudiences []string
-	// routeAudience is this wrapper's required audience for the per-route check in
-	// Decide/filterList: the route's manifest 'audience' when it declares one, else the
-	// global --jwt-audience fallback. A token is authorized on this route only if its
-	// aud claim carries routeAudience. Empty (the single-upstream/shared-validator case)
-	// or --jwt-allow-any-audience disables the per-route check. Set by WrapRoutesWithJWT.
+	// routeAudience is this wrapper's per-route audience check in Decide/filterList:
+	// the route's manifest 'audience', else the global --jwt-audience fallback. Empty
+	// (single-upstream/shared-validator) or --jwt-allow-any-audience disables it.
 	routeAudience string
 	inner         PolicyDecisionPoint // optional manifest PDP for intersection
 	ks            killswitch.Checker  // kill switch enforced even in JWT-only mode
-	// leeway is the clock-skew grace for standard-claim (exp/nbf/iat) validation,
-	// resolved from JWTPDPOptions.Leeway at construction (effectiveLeeway).
-	leeway time.Duration
-	// clock supplies "now" for JWT exp/nbf validation; nil falls back to the wall
-	// clock. enforcement.Clock is shared with the engine and the JWKS cache so a
-	// frozen test clock stays consistent across all three.
+	leeway        time.Duration       // clock-skew grace, resolved via effectiveLeeway
+	// clock supplies "now"; nil falls back to the wall clock. Shared type with the
+	// engine and JWKS cache so a frozen test clock stays consistent across all three.
 	clock enforcement.Clock
-	// experimentalCapabilities gates the EXPERIMENTAL mcp.capabilities claim schema
-	// (JWT v0.2). When false (the default) ValidateToken rejects any token carrying
-	// mcp.capabilities (fail closed) rather than dropping its restriction (fail open);
-	// identity claims and signature/exp/iss/aud verification are unaffected. Set from
-	// the --jwt-experimental-capabilities flag.
+	// experimentalCapabilities gates mcp.capabilities enforcement (--jwt-experimental-capabilities).
+	// False rejects a token carrying the claim (fail closed) rather than admitting it
+	// with the restriction silently dropped (fail open).
 	experimentalCapabilities bool
 	// tokenCache memoizes verified *JWTClaims by token hash so a repeat bearer token
-	// skips signature re-verification and the two claim decodes (see newJWTTokenCache).
-	// Consulted only by ValidateToken (the shared validator); per-route wrappers call
-	// Decide, not ValidateToken, so their cache stays empty. The kill switch, route
-	// audience, and policy are still checked per call in Decide.
+	// skips signature re-verification and claim decoding. Consulted only by
+	// ValidateToken (the shared validator) — route wrappers call Decide and leave
+	// their cache empty. Kill switch, route audience, and policy are still per-call.
 	tokenCache *capability.PayloadCache[*JWTClaims]
 }
 
@@ -297,31 +208,23 @@ type JWTPDPOptions struct {
 	JWKSURI  string
 	Issuer   string
 	Audience string
-	// AllowAnyAudience disables audience pinning (--jwt-allow-any-audience): a token
-	// is accepted regardless of aud. When false (default) the audience is always
-	// pinned to Audience — and when Audience (and AcceptedAudiences) is empty, EVERY
-	// token is rejected regardless of its aud, including one whose aud is the literal
-	// empty string. validateStandardClaims refuses outright there rather than falling
-	// back to jwt.Expected{AnyAudience: [""]}, whose set-intersection match would have
-	// admitted exactly those empty-aud tokens.
+	// AllowAnyAudience disables audience pinning. When false (default) and Audience
+	// (and AcceptedAudiences) is empty, EVERY token is rejected regardless of aud —
+	// including a literal empty aud — rather than falling back to
+	// jwt.Expected{AnyAudience: [""]}, whose set-intersection match would admit it.
 	AllowAnyAudience bool
-	// AcceptedAudiences widens the validator's accepted-audience set beyond the single
-	// Audience: a token is valid if its aud carries AT LEAST ONE entry. Empty falls back
-	// to {Audience}. The gateway's shared validator sets it to the union of every route's
-	// effective audience so a token for any route clears validation; each route wrapper
-	// then narrows via RouteAudience. Leave empty for single-upstream (single-audience)
-	// mode. Ignored when AllowAnyAudience is set.
+	// AcceptedAudiences widens validation beyond the single Audience: valid if aud
+	// carries at least one entry. Empty falls back to {Audience}. The gateway's shared
+	// validator sets this to the union of every route's audience; each route wrapper
+	// then narrows via RouteAudience. Ignored when AllowAnyAudience is set.
 	AcceptedAudiences []string
-	// RouteAudience is the per-route required audience enforced in Decide/filterList
-	// (the route's manifest 'audience', else the global Audience fallback). A token is
-	// authorized on this route only if its aud carries RouteAudience. Empty disables the
-	// per-route check (single-upstream, or the shared validator). Set by WrapRoutesWithJWT;
-	// ignored when AllowAnyAudience is set.
+	// RouteAudience is the per-route audience required in Decide/filterList (the
+	// route's manifest 'audience', else Audience). Empty disables the per-route
+	// check. Set by WrapRoutesWithJWT; ignored when AllowAnyAudience is set.
 	RouteAudience string
-	// AllowAnyIssuer disables issuer pinning (--jwt-allow-any-issuer): a token is
-	// accepted regardless of iss. When false (default) the issuer is always pinned to
-	// Issuer — even when Issuer is empty, which rejects every token with a non-empty
-	// iss (fail closed) rather than accepting any issuer that shares the JWKS.
+	// AllowAnyIssuer disables issuer pinning. When false (default), Issuer is always
+	// pinned — even empty, which fail-closed rejects every non-empty-iss token
+	// rather than accepting any issuer that happens to share the JWKS.
 	AllowAnyIssuer bool
 	// Inner is the manifest PDP for intersection when both --jwks-uri and --policy
 	// are set. When nil, only JWT claims are enforced.
@@ -329,17 +232,11 @@ type JWTPDPOptions struct {
 	// KillSwitch is consulted at the top of every Decide so global and
 	// per-session/per-agent kills take effect even in JWT-only mode.
 	KillSwitch killswitch.Checker
-	// CacheTTL is how long a fetched JWKS is served from cache (default 5 minutes,
-	// see capability.JWKSCacheConfig). It governs KEY freshness only.
-	//
-	// It does NOT govern the verified-token claim cache, which memoizes an
-	// already-verified token's claims for a FIXED window (jwtTokenCacheTTL, 30s) that
-	// no option exposes — so lowering CacheTTL to tighten key-rotation latency does not
-	// tighten how long a token stays trusted. That window is deliberately not
-	// operator-tunable: it is capped by the token's own exp, and the kill switch,
-	// per-route audience, and manifest policy are re-checked on every call, so the
-	// cache skips only the signature/exp/iss/aud re-verification. Revocation latency
-	// is therefore bounded by the kill switch, not by this TTL.
+	// CacheTTL is how long a fetched JWKS is served from cache (default 5 minutes).
+	// It governs KEY freshness only — NOT the separate verified-token claim cache
+	// (fixed 30s, not operator-tunable, capped by the token's own exp). The kill
+	// switch, route audience, and policy are still re-checked every call, so
+	// revocation latency is bounded by the kill switch, not this TTL.
 	CacheTTL time.Duration
 	Client   *http.Client
 	// Breaker optionally guards JWKS fetches. When nil, NewJWTPDP installs one with
@@ -351,57 +248,44 @@ type JWTPDPOptions struct {
 	// Leeway is the clock-skew grace for standard JWT claim validation. Zero selects
 	// DefaultJWTLeeway; a negative value disables leeway (exp must be strictly future).
 	Leeway time.Duration
-	// ExperimentalCapabilities enables enforcement of the EXPERIMENTAL mcp.capabilities
-	// claim schema (JWT v0.2). When false (the default), ValidateToken rejects a token
-	// carrying mcp.capabilities (HTTP 401, fail closed) instead of silently ignoring its
-	// capability restriction; identity-only tokens and all signature/exp/iss/aud checks
-	// are unaffected. Wired from the --jwt-experimental-capabilities flag.
+	// ExperimentalCapabilities enables mcp.capabilities enforcement (--jwt-experimental-capabilities);
+	// false rejects a carrying token rather than silently dropping its restriction.
 	ExperimentalCapabilities bool
 }
 
-// DefaultJWTLeeway is the clock-skew grace applied to standard JWT claim
-// validation when JWTPDPOptions.Leeway is left at its zero value. It aliases
-// capability.DefaultTokenLeeway, the one source of truth for every JWKS-verified
+// DefaultJWTLeeway is the clock-skew grace used when JWTPDPOptions.Leeway is zero.
+// Aliases capability.DefaultTokenLeeway, the source of truth for every JWKS-verified
 // token-validation path in the binary.
 const DefaultJWTLeeway = capability.DefaultTokenLeeway
 
-// effectiveLeeway resolves the configured leeway (zero → default, negative →
-// disabled, positive → as-is) via capability.EffectiveLeeway so the two token
-// paths cannot diverge.
+// effectiveLeeway resolves configured leeway (zero -> default, negative -> disabled,
+// positive -> as-is) via capability.EffectiveLeeway so the two token paths agree.
 func effectiveLeeway(configured time.Duration) time.Duration {
 	return capability.EffectiveLeeway(configured)
 }
 
-// jwtLogger pins JWT/JWKS logging to stderr: stdout is the JSON-RPC channel in stdio
-// mode, so logging must never inherit a slog default that could corrupt the framing.
-// Package-level so the constructor's misconfiguration warnings and the parser-drift
-// warnings in parseCapHeads (which has no receiver to reach a field) emit through the
-// SAME handler — those drift warnings used to be raw fmt.Fprintf lines, unstructured
-// and impossible to correlate in a SIEM alongside every other line this package emits.
+// jwtLogger pins JWT/JWKS logging to stderr, since stdout is the JSON-RPC channel in
+// stdio mode. Package-level so parseCapHeads (which has no receiver) and the
+// constructor's warnings emit through the same structured, SIEM-correlatable handler.
 var jwtLogger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 // NewJWTPDP creates a JWTPDP ready to validate tokens.
 func NewJWTPDP(opts JWTPDPOptions) *JWTPDP {
-	// Default breaker so the shipped proxy always has JWKS-fetch protection;
-	// capability.NewJWKSCache leaves it opt-in, so apply it here.
+	// capability.NewJWKSCache leaves the breaker opt-in; default one here so the
+	// shipped proxy always has JWKS-fetch protection.
 	breaker := opts.Breaker
 	if breaker == nil {
 		breaker = circuitbreaker.New(circuitbreaker.DefaultConfig())
 	}
 	logger := jwtLogger
 	if normalizeAudience(opts.Audience) == "" && len(sanitizeAudiences(opts.AcceptedAudiences)) == 0 && !opts.AllowAnyAudience {
-		// No audience pinned but not opted out: EVERY token is rejected regardless of
-		// its aud claim (fail closed), mirroring the issuer check below — there is no
-		// pinned audience to trust, so a token cannot clear validation, including one
-		// that sets aud to the literal empty string (or a whitespace-only pin, which
-		// normalizeAudience collapses to none). Likely a misconfiguration, so surface it.
+		// No audience pinned and no opt-out: every token will be rejected regardless
+		// of aud. Likely a misconfiguration, so surface it.
 		logger.Warn("JWTPDP created without an Audience and without AllowAnyAudience; all tokens will be rejected regardless of aud because no audience is pinned (set --jwt-audience, or --jwt-allow-any-audience to accept any)")
 	}
 	if opts.Issuer == "" && !opts.AllowAnyIssuer {
-		// No issuer pinned but not opted out: EVERY token is rejected regardless of its
-		// iss claim (fail closed) — unlike the audience check, an empty p.issuer makes
-		// the comparison reject even a token with no iss at all, so identity-only tokens
-		// do not slip through. Likely a misconfiguration, so surface it.
+		// No issuer pinned and no opt-out: every token will be rejected regardless of
+		// iss (even one with no iss at all). Likely a misconfiguration, so surface it.
 		logger.Warn("JWTPDP created without an Issuer and without AllowAnyIssuer; all tokens will be rejected regardless of iss because no issuer is pinned (set --jwt-issuer, or --jwt-allow-any-issuer to accept any)")
 	}
 	cacheConfig := capability.JWKSCacheConfig{
@@ -411,29 +295,24 @@ func NewJWTPDP(opts JWTPDPOptions) *JWTPDP {
 		Breaker:  breaker,
 		Logger:   logger,
 	}
-	// Wire the injected clock into the cache so a frozen clock stays consistent
-	// across exp/nbf validation, the engine, and the cache TTL. A nil clock leaves
-	// Now unset (the cache defaults to time.Now).
+	// Wire the injected clock in so a frozen test clock stays consistent across
+	// exp/nbf validation, the engine, and the cache TTL.
 	if opts.Clock != nil {
 		cacheConfig.Now = opts.Clock.Now
 	}
 	p := newJWTPDP(opts, capability.NewJWKSCache(cacheConfig))
-	// Wire the verified-token cache to the PDP's clock so a frozen test clock stays
-	// consistent with exp/nbf validation and the cache TTL. Only a VALIDATOR gets one:
-	// the cache is written solely by ValidateToken, which the transport calls on the
-	// shared validator alone. A gateway route wrapper (NewJWTPDPWithCache) only
-	// intersects already-validated claims, so its cache could never hold an entry —
-	// N-1 caches allocated to stay empty for the process lifetime. PayloadCache's
-	// Get/Put are nil-receiver safe, so leaving it nil there is simply the miss path.
+	// Only a shared VALIDATOR gets a token cache: it is written solely by
+	// ValidateToken, and a per-route wrapper (NewJWTPDPWithCache) only intersects
+	// already-validated claims, so its cache would stay empty for the process
+	// lifetime — PayloadCache's Get/Put are nil-receiver safe, so leaving it nil
+	// there is simply the miss path.
 	p.tokenCache = newJWTTokenCache(p.now)
 	return p
 }
 
-// normalizeAudience collapses a whitespace-only audience to the empty string so the
-// single-audience fail-closed guard in validateStandardClaims (which tests == "")
-// rejects every token when no real audience is pinned. A non-empty audience is
-// returned byte-for-byte unchanged, so an audience with surrounding spaces (unusual
-// but the operator's choice) still matches exactly.
+// normalizeAudience collapses a whitespace-only audience to "" so the fail-closed
+// guard in validateStandardClaims (which tests == "") catches it. A non-empty
+// audience is returned unchanged, byte-for-byte.
 func normalizeAudience(aud string) string {
 	if strings.TrimSpace(aud) == "" {
 		return ""
@@ -441,14 +320,11 @@ func normalizeAudience(aud string) string {
 	return aud
 }
 
-// sanitizeAudiences drops empty and whitespace-only entries from an accepted-audience
-// list. An empty ("" or "   ") entry is a fail-open hole: go-jose matches audiences by
-// set intersection, so an expected AnyAudience carrying "" ACCEPTS a token whose own
-// aud is the literal empty string — the empty sentinel does not reject everything as
-// intended, it silently admits empty-aud tokens. Non-empty entries are left unchanged
-// so real audiences keep matching exactly. Returns a fresh slice (never aliases the
-// caller's). When every entry is dropped the result is empty, so validateStandardClaims
-// falls back to the single-audience path and its == "" guard fails closed.
+// sanitizeAudiences drops empty/whitespace-only entries from an accepted-audience
+// list. go-jose matches audiences by set intersection, so an AnyAudience carrying ""
+// would ACCEPT a token whose own aud is the literal empty string instead of rejecting
+// everything as intended. Returns a fresh slice; dropping every entry falls back to
+// validateStandardClaims' single-audience fail-closed path.
 func sanitizeAudiences(auds []string) []string {
 	if len(auds) == 0 {
 		return auds
@@ -463,21 +339,15 @@ func sanitizeAudiences(auds []string) []string {
 }
 
 // newJWTPDP assembles a JWTPDP from opts and an already-resolved JWKS cache. Both
-// NewJWTPDP (which builds its own cache) and NewJWTPDPWithCache (which shares an
-// existing one) route through this, so the field set is defined once and the two
-// constructors cannot drift when a field is added.
+// NewJWTPDP and NewJWTPDPWithCache route through this so the field set is defined
+// once and the two constructors cannot drift when a field is added.
 func newJWTPDP(opts JWTPDPOptions, cache *capability.JWKSCache) *JWTPDP {
 	p := &JWTPDP{
 		cache:  cache,
 		issuer: opts.Issuer,
-		// Normalize a whitespace-only audience to "" so the fail-closed guard in
-		// validateStandardClaims (which tests p.audience == "") catches it, and drop any
-		// empty/whitespace entry from acceptedAudiences: go-jose matches audiences by set
-		// intersection, so an AnyAudience carrying "" would ACCEPT a token whose own aud is
-		// the literal empty string (see sanitizeAudiences). The shipped wiring already
-		// rejects an empty effective audience one seam away (transport/route.go + the CLI),
-		// so this is defense in depth for a direct JWTPDPOptions consumer and for the
-		// whitespace case == "" misses.
+		// normalizeAudience/sanitizeAudiences guard the fail-closed empty-audience
+		// checks below; kept here too as defense in depth for a direct
+		// JWTPDPOptions consumer bypassing the transport/CLI wiring.
 		audience:                 normalizeAudience(opts.Audience),
 		allowAnyAudience:         opts.AllowAnyAudience,
 		acceptedAudiences:        sanitizeAudiences(opts.AcceptedAudiences),
@@ -493,11 +363,9 @@ func newJWTPDP(opts JWTPDPOptions, cache *capability.JWKSCache) *JWTPDP {
 }
 
 // NewJWTPDPWithCache builds a per-route JWTPDP sharing an already-constructed JWKS
-// cache instead of allocating its own. The gateway wraps every route in a JWTPDP
-// that only intersects already-validated claims against that route's manifest;
-// route wrappers never fetch keys, so building a fresh JWKSCache per route would
-// waste N-1 allocations. No audience warning here — the shared validator (built via
-// NewJWTPDP) already warns once.
+// cache. Route wrappers never fetch keys themselves, so a fresh JWKSCache per route
+// would waste N-1 allocations. No audience warning here — the shared validator
+// (NewJWTPDP) already warns once.
 func NewJWTPDPWithCache(opts JWTPDPOptions, cache *capability.JWKSCache) *JWTPDP {
 	return newJWTPDP(opts, cache)
 }
@@ -508,12 +376,9 @@ func (p *JWTPDP) Cache() *capability.JWKSCache {
 	return p.cache
 }
 
-// innerEnforces reports whether p.inner is a real policy backstop able to decide an
-// identity-only (no mcp.capabilities) request. A nil inner or an AlwaysAllowPDP
-// (value or pointer form) is not: in JWT mode the JWTPDP must fail closed rather
-// than inherit alwaysAllow's allow-everything. A ManifestPDP (even a deny-all one)
-// is a backstop. Derived from p.inner rather than cached so every construction path
-// is consistent.
+// innerEnforces reports whether p.inner is a real policy backstop for an
+// identity-only (no mcp.capabilities) request. Neither nil nor AlwaysAllowPDP
+// qualify — in JWT mode the wrapper must fail closed, not inherit allow-everything.
 func (p *JWTPDP) innerEnforces() bool {
 	switch p.inner.(type) {
 	case nil:
@@ -525,14 +390,12 @@ func (p *JWTPDP) innerEnforces() bool {
 	}
 }
 
-// jwtPayloadSegment base64url-decodes a compact JWS's (header.payload.signature) middle
-// segment, so a caller needing the raw payload bytes — rather than a value decoded from
-// them — does not restate the split-and-decode every claims-preserving-numbers decode
-// already performs.
+// jwtPayloadSegment base64url-decodes a compact JWS's middle (payload) segment, for a
+// caller needing the raw bytes rather than a value decoded from them.
 func jwtPayloadSegment(tokenStr string) ([]byte, error) {
 	parts := strings.Split(tokenStr, ".")
-	// A JWS compact serialization has exactly three segments. Reject anything else
-	// (fail closed) in case a future caller invokes this before verification.
+	// Reject anything but the standard three segments (fail closed), in case a
+	// future caller invokes this before verification.
 	if len(parts) != 3 {
 		return nil, fmt.Errorf("malformed JWT: expected 3 segments (header.payload.signature), got %d", len(parts))
 	}
@@ -543,12 +406,10 @@ func jwtPayloadSegment(tokenStr string) ([]byte, error) {
 	return payloadBytes, nil
 }
 
-// decodeJWTClaimsPreservingNumbers decodes the top-level claim map from a compact
-// JWS (header.payload.signature) using json.Number, so integer claims above 2^53
-// are preserved exactly instead of rounded through float64 (which go-jose's
-// UnsafeClaimsWithoutVerification does). The caller verifies the signature first,
-// so the payload is authentic; this re-decodes those bytes only to keep numeric
-// precision for input.claims.
+// decodeJWTClaimsPreservingNumbers re-decodes the claim map with json.Number so
+// integers above 2^53 survive exactly for input.claims, instead of rounding through
+// float64 as go-jose's UnsafeClaimsWithoutVerification would. The signature is
+// already verified by the caller, so these bytes are known authentic.
 func decodeJWTClaimsPreservingNumbers(tokenStr string) (map[string]interface{}, error) {
 	payloadBytes, err := jwtPayloadSegment(tokenStr)
 	if err != nil {
@@ -560,19 +421,17 @@ func decodeJWTClaimsPreservingNumbers(tokenStr string) (map[string]interface{}, 
 	if err := dec.Decode(&claims); err != nil {
 		return nil, fmt.Errorf("decoding claims: %w", err)
 	}
-	// Reject trailing bytes after the JSON object (fail closed), matching the
-	// trailing-data guard the audit decoders use. A well-formed JWT payload is a
-	// single JSON object; trailer bytes signal a non-conforming issuer.
+	// Reject trailing bytes (fail closed): a well-formed payload is one JSON object,
+	// and trailer bytes signal a non-conforming issuer.
 	if dec.More() {
 		return nil, fmt.Errorf("trailing data in JWT claims payload")
 	}
 	return claims, nil
 }
 
-// Stable JWT-failure category codes recorded as the JWT_INVALID audit record's
-// error_type detail. They are a closed set so a record never carries the raw
-// go-jose / validation message (which can disclose claim values, the accepted
-// algorithm, the configured issuer, or key-rotation state to a SIEM downstream).
+// Stable JWT-failure category codes for the JWT_INVALID audit record's error_type
+// detail — a closed set so a record never carries the raw go-jose/validation
+// message, which can disclose claim values, algorithm, issuer, or key-rotation state.
 const (
 	jwtErrMalformedHeader      = "malformed_authorization_header"
 	jwtErrMalformedToken       = "malformed_token"
@@ -588,26 +447,20 @@ const (
 	jwtErrInvalidCapabilities  = "invalid_capabilities"
 	jwtErrInvalidDeclassify    = "invalid_declassify"
 	jwtErrInvalidDelegation    = "invalid_delegation"
-	// jwtErrAmbiguousClaims marks a top-level `mcp`/`act` claim, or a member of the `mcp`
-	// block itself, spelled more than one way — see capability.ClaimMembers. Distinct from
-	// jwtErrMalformedToken because the payload IS valid JSON; what is wrong is that two
-	// members bind to the one value encoding/json reads, and which one wins is invisible to
-	// the token's own author.
+	// jwtErrAmbiguousClaims marks a top-level `mcp`/`act` claim, or an `mcp` member,
+	// spelled more than one way (see capability.ClaimMembers) — the payload IS valid
+	// JSON, but which spelling wins is invisible to the token's own author.
 	jwtErrAmbiguousClaims   = "ambiguous_claims"
 	jwtErrSenderConstrained = "sender_constrained"
-	// jwtErrJWKSUnavailable marks a validation that failed because the key set could
-	// not be fetched (network error, non-200, empty/oversized set, open breaker), not
-	// because the token was bad — the token was never checked against a key. Keeping it
-	// distinct from "invalid" stops an IdP/JWKS outage from being recorded identically
-	// to a forged token in the fail-closed audit trail.
+	// jwtErrJWKSUnavailable marks a key-fetch failure rather than a bad token, so an
+	// IdP/JWKS outage is not recorded identically to a forged token in the audit trail.
 	jwtErrJWKSUnavailable = "jwks_unavailable"
 	jwtErrUnknown         = "invalid"
 )
 
 // jwtValidationError tags a ValidateToken failure with a stable category code while
-// preserving the descriptive message for the validator's own logs and tests.
-// ClassifyJWTError reads the code via errors.As, so the wrapping order through
-// capability.Terminal (which Unwraps) does not matter.
+// preserving the message for logs/tests. ClassifyJWTError reads the code via
+// errors.As, so wrapping through capability.Terminal (which Unwraps) is safe.
 type jwtValidationError struct {
 	code string
 	err  error
@@ -616,18 +469,15 @@ type jwtValidationError struct {
 func (e *jwtValidationError) Error() string { return e.err.Error() }
 func (e *jwtValidationError) Unwrap() error { return e.err }
 
-// jwtErr tags err with a stable classification code (see ClassifyJWTError). The
-// returned error prints exactly as err, so existing message-substring tests and
-// the terminal-error detection in VerifyWithKeyRotation are unaffected.
+// jwtErr tags err with a stable classification code (see ClassifyJWTError). Prints
+// exactly as err, so existing message-substring tests are unaffected.
 func jwtErr(code string, err error) error { return &jwtValidationError{code: code, err: err} }
 
 // ClassifyJWTError maps a ValidateToken error to a small, stable category code for
-// the JWT_INVALID audit record. It NEVER returns the raw error text: the underlying
-// go-jose / validation message can disclose claim values, the accepted algorithm,
-// the configured issuer, or key-rotation state, and audit logs are routinely
-// forwarded to third-party SIEMs — the same disclosure the opaque-401 HTTP response
-// avoids. Operators get the failure category; the verbose message stays with the
-// validator. An empty error yields "" and an unrecognized one yields "invalid".
+// the JWT_INVALID audit record. It NEVER returns the raw error text, since the
+// underlying message can disclose claim values, algorithm, issuer, or key-rotation
+// state to a SIEM the audit log is forwarded to. Empty error yields ""; unrecognized
+// yields "invalid".
 func ClassifyJWTError(err error) string {
 	if err == nil {
 		return ""
@@ -637,18 +487,14 @@ func ClassifyJWTError(err error) string {
 	if errors.As(err, &ve) {
 		return ve.code
 	}
-	// The untagged standard-claim path (stdClaims.ValidateWithLeeway) emits only
-	// these sentinels under eunox's Expected{Time, AnyAudience}: expiry, not-before,
-	// future-iat, and audience. Issuer and subject failures do NOT arrive here — eunox
-	// runs its own iss/sub checks and tags them (caught by errors.As above), and go-jose
-	// skips its built-in iss/sub validation because Expected leaves those fields unset.
-	// A signature mismatch surfaces as jose.ErrCryptoFailure from the verify closure.
+	// The untagged standard-claim path emits only these sentinels under eunox's
+	// Expected{Time, AnyAudience}. Issuer/subject failures don't arrive here — eunox
+	// runs its own checks (caught above) — and go-jose skips its built-in iss/sub
+	// validation since Expected leaves those fields unset.
 	switch {
 	case errors.Is(err, capability.ErrJWKSUnavailable):
-		// A fetch/refresh failure (network, non-200, empty/oversized set, open breaker)
-		// propagated up through VerifyWithKeyRotation's "fetch JWKS"/"refresh JWKS" wraps.
-		// The token was never checked against a key, so this is an infrastructure outage,
-		// not an invalid token — classify it as such rather than collapsing to "invalid".
+		// The key set could not be fetched — an infrastructure outage, not a bad
+		// token, so classify it distinctly rather than collapsing to "invalid".
 		return jwtErrJWKSUnavailable
 	case errors.Is(err, jwt.ErrExpired):
 		return jwtErrExpired
@@ -665,22 +511,15 @@ func ClassifyJWTError(err error) string {
 	}
 }
 
-// parseDelegationChain decodes and asserts a token's delegation state: the RFC 8693 `act`
-// actor chain and the mcp.delegation per-hop grants. It runs at the TOKEN boundary, for the
-// same reason the declassify approvals are parsed there: a chain this build cannot read, or
-// one whose hops WIDEN rather than narrow, is a token making a delegation claim the proxy
-// cannot honor — and the operator's whole reason for minting the chain is that "the delegate
-// is no broader than its delegator" is checkable. Rejecting the token is what makes it
-// checkable; clamping a widening hop would leave the token working while quietly meaning
-// something other than what it says.
+// parseDelegationChain decodes and asserts a token's delegation state (the RFC 8693
+// `act` chain plus `mcp.delegation` grants) at the TOKEN boundary, like the declassify
+// approvals: a chain this build cannot read, or whose hops WIDEN, is a rejected token
+// rather than a silently-clamped one — clamping would leave the token meaning
+// something other than what it says. Unlike mcp.capabilities this is not behind the
+// experimental gate: every axis only narrows, so there is no fail-open direction to
+// gate against.
 //
-// Like the approvals and unlike mcp.capabilities, this is not behind the experimental gate:
-// every axis a grant carries NARROWS, so a build that honors it can only deny more than one
-// that ignores it. There is no fail-open direction to gate against.
-//
-// Returns (nil, nil) for the overwhelming majority of tokens, which declare neither claim.
-// Every error is already Terminal-wrapped for the caller (verified-but-invalid, not a
-// retryable transport fault).
+// Returns (nil, nil) for tokens declaring neither claim. Errors are Terminal-wrapped.
 func parseDelegationChain(payload idpJWTPayload) (*capability.DelegationChain, error) {
 	actors, err := capability.ParseActorChain(payload.Act)
 	if err != nil {
@@ -697,36 +536,20 @@ func parseDelegationChain(payload idpJWTPayload) (*capability.DelegationChain, e
 	return chain, nil
 }
 
-// watchedTopLevelClaims is every top-level claim THIS BUILD READS, and therefore every one
-// whose ambiguity it must refuse rather than resolve by member order. It is one list, built
-// once, because it is the answer to a single question — "what does eunox trust from this
-// payload?" — and splitting it across a var and a spliced literal at the call site is how a
-// claim gets added to one and missed in the other.
+// watchedTopLevelClaims is every top-level claim THIS BUILD READS — one list rather
+// than a var plus a spliced call-site literal, so a claim can't be added to one and
+// missed in the other. Membership is "does this build read it", not "is it a
+// registered claim" (ClaimMembers' own criterion):
 //
-// Membership is decided by "does this build read it", not by "is it a registered claim".
-// That criterion is ClaimMembers' own (an ambiguity in a claim carried for another audience
-// is not this build's business to refuse a token over), and it cuts both ways:
+//   - `jti` is deliberately ABSENT — nothing here decodes it, so watching it would
+//     reject tokens over a spelling collision in a claim eunox never reads.
+//   - `cnf` is deliberately PRESENT despite not being a go-jose std claim: it is read
+//     from the raw map (last-member-wins), and an ambiguous `cnf` fails OPEN —
+//     `{"cnf":{"jkt":…},"cnf":null}` resolves to null, which CnfIsSenderConstrained
+//     reads as absent, silently downgrading a PoP-bound token to a plain bearer token.
 //
-//   - `jti` is deliberately ABSENT. Nothing in this binary reads it — newValidatedClaims
-//     copies sub/iss/aud/exp and never jwt.Claims.ID — so watching it would reject every
-//     token from an IdP whose template happens to emit two spellings of a claim eunox never
-//     decodes: an availability regression bought for no security.
-//   - `cnf` is deliberately PRESENT even though it is not one of go-jose's std claims. It
-//     is read from the raw claim map (RFC 7800 sender-constrained detection), and that map
-//     is a plain map decode — last member wins. An ambiguous `cnf` is the one entry here
-//     that fails OPEN rather than merely picking wrong: `{"cnf":{"jkt":…},"cnf":null}`
-//     resolves to null, CnfIsSenderConstrained reads null as ABSENT, and a
-//     proof-of-possession token is accepted as a plain bearer token by a proxy that
-//     verifies no PoP — the exact downgrade that rejection exists to prevent.
-//
-// The std claims are listed rather than reflected off jwt.Claims because the list must name
-// what eunox TRUSTS, not what a dependency happens to model: a go-jose release that adds a
-// field would silently widen a security check, and one that renames a tag would silently
-// narrow it. Both directions are worse than an explicit list beside the check.
-//
-// go-jose decodes sub/iss/aud/exp/nbf/iat through a plain encoding/json.Unmarshal into
-// jwt.Claims — a struct with no custom UnmarshalJSON — so an ambiguous pair among them
-// resolves by member ORDER exactly as `mcp`/`act` do.
+// Listed explicitly rather than reflected off jwt.Claims, so a go-jose release that
+// adds or renames a field can't silently widen or narrow this check.
 var watchedTopLevelClaims = []string{
 	// The proxy's own claim blocks.
 	"mcp", "act",
@@ -738,31 +561,21 @@ var watchedTopLevelClaims = []string{
 	"cnf",
 }
 
-// rejectAmbiguousTopLevelClaims confirms the token's payload names each claim this build
-// reads (watchedTopLevelClaims) at most once, and that the `mcp` block itself names each of
-// its own members at most once, before ANYTHING decoded from any of them is trusted.
+// rejectAmbiguousTopLevelClaims confirms the payload names each watched claim, and the
+// `mcp` block each of its own members, at most once — before anything decoded from
+// them is trusted.
 //
-// The struct unmarshals that already ran (tok.Claims into jwt.Claims,
-// UnsafeClaimsWithoutVerification into idpJWTPayload) resolved any collision silently —
-// encoding/json folds field names case-insensitively and keeps the last one, so a payload
-// carrying both "act" and "Act", or an mcp block carrying both "delegation" and
-// "Delegation", bound whichever spelling the author wrote LAST with no signal a narrower
-// or differently-scoped sibling ever existed. A JWT is signed by its issuer, so this is
-// not an externally forgeable ambiguity — but it is the same "an IdP template mistake
-// becomes a rejected token, not a silently-resolved one" failure the per-grant decoders
-// (decodeClaimObject) already refuse one layer in; a minting pipeline that merges claim
-// sources, or a migration that renamed a claim and left both spellings live, can produce
-// it exactly as easily one layer out. See capability.ClaimMembers.
+// The earlier struct unmarshals resolve any collision silently: encoding/json folds
+// field names case-insensitively and keeps the last one, so e.g. both "act" and "Act"
+// bind to whichever spelling was written LAST with no signal a sibling ever existed.
+// Not externally forgeable (the JWT is signed), but an IdP template mistake or a
+// migration that left two spellings live should be a rejected token, not a
+// silently-resolved one — matching the per-grant decoders one layer in.
 //
-// The standard claims are watched alongside them because they decide MORE than the custom
-// ones do. `sub` is what a manifest's `principal:` scoping reads, so a payload carrying
-// both "sub" and "Sub" is enforced under whichever identity sorts last in the payload
-// bytes — a value neither side of the token exchange controls or can verify, and one that
-// can resolve a narrowly-scoped agent's token to a broader identity's constraints.
-// `exp`/`nbf` decide whether the token is live at all, and `aud`/`iss` decide whether it
-// was minted for this proxy. Refusing the token is the only reading of "on any ambiguity,
-// deny" that holds here: there is no safe way to pick between two spellings of the
-// caller's own name.
+// `sub` matters most: a payload with both "sub" and "Sub" would be enforced under
+// whichever identity sorts last, a value neither side of the exchange controls,
+// potentially widening a narrowly-scoped agent's token to a broader identity's
+// constraints.
 func rejectAmbiguousTopLevelClaims(tokenStr string) error {
 	payloadBytes, err := jwtPayloadSegment(tokenStr)
 	if err != nil {
@@ -783,11 +596,9 @@ func rejectAmbiguousTopLevelClaims(tokenStr string) error {
 	return nil
 }
 
-// newValidatedClaims assembles the *JWTClaims a successful ValidateToken returns,
-// memoizing at validation the two derived views later per-request decisions reuse:
-// the parsed capability heads (parsedCaps) and the flattened input.claims map
-// (flatClaims). Both are computed once here so decide/list-filter/sampling calls hand
-// out precomputed values instead of re-parsing/re-building per request.
+// newValidatedClaims assembles the *JWTClaims ValidateToken returns, memoizing the
+// two derived views later requests reuse (parsedCaps, flatClaims) so decide/list-filter/
+// sampling calls hand out precomputed values instead of rebuilding them per request.
 func newValidatedClaims(capsList []string, capsPresent bool, declassify []capability.DeclassifyApproval, delegation *capability.DelegationChain, payload idpJWTPayload, std jwt.Claims, rawClaims map[string]interface{}) *JWTClaims {
 	claims := &JWTClaims{
 		Capabilities:    capsList,
@@ -798,16 +609,13 @@ func newValidatedClaims(capsList []string, capsPresent bool, declassify []capabi
 		AgentID:         payload.MCP.AgentID,
 		Subject:         std.Subject,
 		Issuer:          std.Issuer,
-		// Carry the verified aud so a per-route wrapper can pin its own audience
-		// (routeAudience) after the shared validator accepted the token.
-		Audiences:  []string(std.Audience),
-		Extra:      rawClaims,
-		parsedCaps: parseCapHeads(capsList),
+		Audiences:       []string(std.Audience),
+		Extra:           rawClaims,
+		parsedCaps:      parseCapHeads(capsList),
 	}
-	// Capture the verified exp as wall-clock time so a long-lived SSE stream can bound
-	// itself to the token lifetime. validateStandardClaims (run before this) rejects a
-	// token with no exp, so std.Expiry is non-nil on the ValidateToken path; guard anyway
-	// for any other caller.
+	// validateStandardClaims (run before this) rejects a token with no exp, so
+	// std.Expiry is non-nil here on the ValidateToken path; guard anyway for callers
+	// that build claims directly.
 	if std.Expiry != nil {
 		claims.ExpiresAt = std.Expiry.Time()
 	}
@@ -816,37 +624,26 @@ func newValidatedClaims(capsList []string, capsPresent bool, declassify []capabi
 }
 
 // validateStandardClaims enforces the RFC 7519 standard claims on an already
-// signature-verified token and returns the token's exp (Unix seconds) so the caller
-// can cap the verified-token cache TTL at it. now is the single lazily-sampled
-// validation clock, so exp/nbf are deterministic across key-rotation retries. Every
-// returned error is capability.Terminal-wrapped (verified-but-invalid, not a
-// retryable signature failure). Extracted from ValidateToken so that hot path stays
-// under the cyclomatic-complexity budget.
+// signature-verified token and returns exp (Unix seconds) so the caller can cap the
+// verified-token cache TTL at it. now is the single lazily-sampled validation clock,
+// so exp/nbf are deterministic across key-rotation retries. Extracted from
+// ValidateToken to keep that function under the complexity budget.
 func (p *JWTPDP) validateStandardClaims(stdClaims jwt.Claims, now time.Time) (int64, error) {
-	// Require iat explicitly: go-jose validates it only when present, so an iat-absent
-	// token has no lower temporal bound. Reject before the exp check.
+	// go-jose validates iat/exp only when present, so require both explicitly —
+	// otherwise an absent one imposes no bound (no lower bound, or never expires).
 	if stdClaims.IssuedAt == nil {
 		return 0, capability.Terminal(jwtErr(jwtErrMissingClaims, fmt.Errorf("token has no iat claim; tokens without an issued-at time are rejected")))
 	}
-	// Require exp explicitly: go-jose checks Expiry only when present, so an exp-absent
-	// token would never expire, defeating expiry and revocation.
 	if stdClaims.Expiry == nil {
 		return 0, capability.Terminal(jwtErr(jwtErrMissingClaims, fmt.Errorf("token has no exp claim; non-expiring tokens are rejected")))
 	}
-	// Pin the audience unless --jwt-allow-any-audience. go-jose skips the audience check
-	// when AnyAudience is nil, so the default path always sets it. acceptedAudiences
-	// widens the set for the gateway shared validator (the UNION of every route's
-	// effective audience) so a token minted for ANY route clears validation here; the
-	// per-route wrapper then narrows to its own audience (routeAudience) in Decide.
+	// acceptedAudiences widens validation to the UNION of every route's audience (the
+	// gateway's shared validator); the per-route wrapper narrows via routeAudience later.
 	//
-	// When neither is configured (p.audience == "" and no acceptedAudiences — the
-	// misconfigured case NewJWTPDP warns about), reject explicitly here rather than
-	// falling back to jwt.Expected{AnyAudience: [""]}: go-jose's audience check matches
-	// by set intersection, so an AnyAudience of [""] accepts a token whose own aud claim
-	// is the literal empty string — the sentinel does NOT reject everything as intended,
-	// only tokens with a non-empty aud. Mirror the issuer check just below (an explicit
-	// Go comparison, not a library sentinel) so misconfiguration means a real total
-	// rejection regardless of the token's aud claim.
+	// When neither audience nor acceptedAudiences is configured, reject explicitly
+	// here rather than fall back to jwt.Expected{AnyAudience: [""]}: go-jose's
+	// set-intersection match would admit a token whose own aud is the literal empty
+	// string instead of rejecting everything as the sentinel intends.
 	if !p.allowAnyAudience && len(p.acceptedAudiences) == 0 && p.audience == "" {
 		return 0, capability.Terminal(jwtErr(jwtErrInvalidAudience, fmt.Errorf("no audience is pinned (jwt-audience unset and jwt-allow-any-audience not set); all tokens are rejected regardless of aud")))
 	}
@@ -861,43 +658,28 @@ func (p *JWTPDP) validateStandardClaims(stdClaims jwt.Claims, now time.Time) (in
 	if err := stdClaims.ValidateWithLeeway(expected, p.leeway); err != nil {
 		return 0, capability.Terminal(fmt.Errorf("token claims invalid: %w", err))
 	}
-	// Pin the issuer unless --jwt-allow-any-issuer. Mirroring the audience check, the
-	// default path always enforces it — even when p.issuer is empty, where the
-	// `p.issuer == ""` disjunct rejects EVERY token regardless of its iss (there is no
-	// pinned issuer to trust; leaving it unchecked would accept any issuer whose signing
-	// key happens to be in the shared JWKS). Only the deliberate opt-out skips it.
+	// Mirrors the audience check: enforced even when p.issuer is empty, so there is
+	// no pinned issuer to silently trust an arbitrary JWKS-sharing signer under.
 	if !p.allowAnyIssuer && (p.issuer == "" || stdClaims.Issuer != p.issuer) {
 		return 0, capability.Terminal(jwtErr(jwtErrInvalidIssuer, fmt.Errorf("token issuer %q does not match expected %q", stdClaims.Issuer, p.issuer)))
 	}
 	return stdClaims.Expiry.Time().Unix(), nil
 }
 
-// parseDeclassifyApprovals decodes the mcp.declassify claim and refuses a token whose
-// single-use grants would outlive the ledger's memory of their own burn. The two are one
-// function because they are one question — "can this build enforce the approvals this token
-// declares, as written?" — and both answers are a rejected TOKEN.
+// parseDeclassifyApprovals decodes mcp.declassify and refuses a token whose single-use
+// grants would outlive the burn ledger's WINDOW — otherwise a long-lived token could
+// present the same grant again after the burn aged out and clear a second time on one
+// human approval. Refusing bounds the token's remaining lifetime against the same exp
+// validateStandardClaims just accepted, so a later burn always outlives any token that
+// could replay it. Runs at the token boundary for the same reason every claim-borne
+// narrowing does: an unenforceable grant is a rejected token, not a decision-time surprise.
 //
-// The burn lives in a WINDOWED ledger, so a token that outlives the window would present
-// the same grant again after the burn aged out and clear a second time — one human
-// approval, two declassifications, and nothing on the tape saying so. Refusing here bounds
-// the token's remaining lifetime against the same exp and the same leeway
-// validateStandardClaims just accepted it under, so the burn a later call writes always
-// outlives the token that could replay it. A standing grant is unaffected.
+// expUnix reuses validateStandardClaims' already-accepted exp rather than a second
+// dereference of stdClaims.Expiry, which is non-nil only because that check ran first.
 //
-// It runs at the token boundary rather than on the decision path for the reason every other
-// claim-borne narrowing does: a grant this build cannot enforce as written is a rejected
-// token, not a decision-time surprise the operator has no error to grep for.
-//
-// expUnix is the value validateStandardClaims returned after accepting exp, rather than a
-// second dereference of stdClaims.Expiry: that pointer is non-nil only because the check
-// above ran first, and a reordering would turn a second read into a nil dereference on a
-// request goroutine.
-//
-// A non-positive expUnix stays the ZERO time rather than becoming time.Unix(0, 0). The two
-// look interchangeable and are not: 1970-01-01 is a real instant, so it is not IsZero, and
-// it would sail through the window check as a lifetime tens of years in the past —
-// admitting a `once` grant on a token whose expiry this build never established. The unset
-// case has to reach the guard that refuses it, so it is encoded as unset.
+// A non-positive expUnix stays the ZERO time rather than time.Unix(0, 0): the latter is
+// a real (non-zero) 1970 instant that would sail through the window check as a lifetime
+// decades in the past, admitting a `once` grant on a token with no established expiry.
 func (p *JWTPDP) parseDeclassifyApprovals(raw json.RawMessage, expUnix int64, now time.Time) ([]capability.DeclassifyApproval, error) {
 	approvals, err := capability.ParseDeclassifyApprovals(raw)
 	if err != nil {
@@ -917,21 +699,17 @@ func (p *JWTPDP) parseDeclassifyApprovals(raw json.RawMessage, expUnix int64, no
 // extracts eunox claims, and returns a new context carrying the claims.
 // On failure it returns an error whose message is safe to surface as HTTP 401.
 func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.Context, error) {
-	// RFC 7235 §2.1: the auth-scheme is case-insensitive, so match it with
-	// EqualFold (the length guard keeps the slice in range); the token stays
-	// case-sensitive.
+	// RFC 7235 §2.1: the auth-scheme is case-insensitive, matched with EqualFold;
+	// the token itself stays case-sensitive.
 	const prefix = "Bearer "
 	if len(authHeader) < len(prefix) || !strings.EqualFold(authHeader[:len(prefix)], prefix) {
 		return ctx, jwtErr(jwtErrMalformedHeader, fmt.Errorf("missing or malformed Authorization header"))
 	}
 	tokenStr := authHeader[len(prefix):]
 
-	// Fast path: a token verified within the cache TTL skips signature re-verification
-	// and the two claim decodes below. A miss (or a nil cache on a bare test literal)
-	// falls through to full verification. The kill switch, route audience, and policy
-	// are still checked per call in Decide, so this only elides the crypto + decode.
-	// Hash the token once and reuse the key for the get here and the put on success,
-	// so a cache miss (the cold-cache / high-churn common case) hashes only once.
+	// Fast path: a token verified within the cache TTL skips re-verification and
+	// re-decoding. Kill switch, route audience, and policy are still checked per call
+	// in Decide, so this only elides the crypto + decode.
 	cacheKey := capability.HashTokenKey(tokenStr)
 	if cached, ok := p.tokenCache.Get(cacheKey); ok {
 		return WithJWTClaims(ctx, cached), nil
@@ -942,42 +720,28 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 		return ctx, jwtErr(jwtErrMalformedToken, fmt.Errorf("invalid JWT: %w", err))
 	}
 
-	// Select the signing key from EVERY header's kid, not a hard-coded headers[0],
-	// removing the foot-gun should a multi-signature token ever reach this path.
-	// A kid-less token keeps the "" (try-all-keys) sentinel: this path enforces no
-	// kid-required policy.
+	// Select the signing key from EVERY header's kid, not a hard-coded headers[0], so
+	// a multi-signature token is handled correctly. A kid-less token keeps the ""
+	// (try-all-keys) sentinel; this enforces no kid-required policy.
 	kids, err := capability.CandidateKIDs(tok.Headers)
 	if err != nil {
 		return ctx, jwtErr(jwtErrMalformedToken, err)
 	}
 
-	// The per-key verifier is the only IdP-specific part; the key-selection and
-	// rotation-retry choreography lives in capability.VerifyWithKeyRotation, out of
-	// this function. Per its contract the closure returns
-	// (claims, nil) on success, (nil, Terminal(err)) for a verified-but-invalid
-	// failure that must not be retried, and (nil, err) for a signature failure.
+	// capability.VerifyWithKeyRotation owns key-selection and rotation-retry
+	// choreography; the closure returns (claims, nil) on success, (nil,
+	// Terminal(err)) for a verified-but-invalid failure that must not be retried,
+	// and (nil, err) for a signature failure.
 	//
-	// Sample the validation clock lazily on the first verify call (nowSampled), and
-	// re-sample once per genuine JWKS refresh (freshKeySet). Three properties:
-	//   - After the key fetch, not before: sampling up front captured now ahead of a
-	//     potentially slow JWKS round-trip, widening the exp window by the fetch
-	//     duration — a fail-open letting a token that expires during the fetch verify.
-	//     nowSampled defers the first sample until the closure runs, after GetKeys.
-	//   - Pinned across a cached set: a set served from cache (including every cached
-	//     kid of a multi-signature token) passes freshKeySet=false, so the exp+leeway
-	//     verdict cannot flip between sibling/cached keys on network latency. nowSampled
-	//     is load-bearing, not redundant: it samples on the first cached-set call where
-	//     freshKeySet is false.
-	//   - Re-sampled across a genuine refresh: freshKeySet is true on the first call
-	//     against a set fetched mid-verify (a forced-refresh rotation retry), so a token
-	//     that expires DURING a slow forced refresh is checked against the post-refresh
-	//     clock, not a stale pre-refresh one. Re-sampling only moves now forward, the
-	//     fail-closed direction.
+	// now is sampled lazily on first use (nowSampled) rather than up front, so a
+	// slow JWKS round-trip doesn't widen the exp window (fail-open). It is
+	// re-sampled only on a genuine refresh (freshKeySet) — never on a cache hit, so
+	// the exp+leeway verdict can't flip between sibling/cached keys on network
+	// latency — and re-sampling only ever moves now forward, the fail-closed direction.
 	var now time.Time
 	var nowSampled bool
-	// tokenExpUnix captures the verified token's exp so the cache entry's TTL can be
-	// capped at the token's remaining lifetime (never serving a structurally expired
-	// token). Set inside the closure once exp is validated non-nil.
+	// tokenExpUnix caps the cache entry's TTL at the token's remaining lifetime, so
+	// a structurally expired token is never served from cache.
 	var tokenExpUnix int64
 	validated, err := capability.VerifyWithKeyRotationMultiKID[JWTClaims](ctx, p.cache, kids, func(key *jose.JSONWebKey, freshKeySet bool) (*JWTClaims, error) {
 		if !nowSampled || freshKeySet {
@@ -986,25 +750,20 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 		}
 		var stdClaims jwt.Claims
 
-		// Step 1: verify the signature only. Passing just &stdClaims keeps a
-		// signature mismatch reported as such (not conflated with a payload unmarshal
-		// failure). A plain (un-Terminal) error marks a retryable signature failure.
+		// Step 1: verify the signature only, so a mismatch is reported as such and
+		// not conflated with a payload unmarshal failure. A plain (un-Terminal)
+		// error marks a retryable signature failure.
 		if err := tok.Claims(key, &stdClaims); err != nil {
 			return nil, err
 		}
 
-		// Step 2 (signature verified): unmarshal the IdP payload and the raw
-		// top-level claim map (so non-standard claims reach policies). The token bytes
-		// are key-independent, so a parse failure here is terminal — retrying other
-		// keys would report a later key's error over the real payload problem.
+		// Step 2 (signature verified): the token bytes are key-independent, so a
+		// parse failure here is terminal — retrying other keys would report a later
+		// key's error over the real payload problem.
 		var payload idpJWTPayload
 		if err := tok.UnsafeClaimsWithoutVerification(&payload); err != nil {
 			return nil, capability.Terminal(jwtErr(jwtErrMalformedToken, fmt.Errorf("jwt payload unmarshal: %w", err)))
 		}
-		// Re-decode the raw claims with json.Number so a custom integer claim above
-		// 2^53 survives intact for input.claims instead of rounding through float64
-		// (which could flip an OPA/Cedar comparison). The signature was verified, so
-		// the payload bytes are authentic.
 		rawClaims, rawErr := decodeJWTClaimsPreservingNumbers(tokenStr)
 		if rawErr != nil {
 			return nil, capability.Terminal(jwtErr(jwtErrMalformedToken, fmt.Errorf("jwt raw claims decode: %w", rawErr)))
@@ -1014,17 +773,14 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 		if err := rejectAmbiguousTopLevelClaims(tokenStr); err != nil {
 			return nil, err
 		}
-		// Standard claims (iat/exp/audience/issuer). Returns the token's exp so the
-		// verified-token cache TTL can be capped at it; now is the single lazy sample.
 		exp, stdErr := p.validateStandardClaims(stdClaims, now)
 		if stdErr != nil {
 			return nil, stdErr
 		}
 		tokenExpUnix = exp
 
-		// Distinguish an absent mcp claim (zero-value Version "") from a wrong
-		// version, since the absent block is the most common IdP-template
-		// misconfiguration — give it an actionable message before the version check.
+		// An absent mcp claim block is the most common IdP-template
+		// misconfiguration; give it an actionable message before the version check.
 		if payload.MCP.Version == "" {
 			return nil, capability.Terminal(jwtErr(jwtErrMissingClaims, fmt.Errorf("jwt is missing the required mcp capability claim (expected mcp.v=%q); the token has no mcp claim block", mcpClaimVersion)))
 		}
@@ -1033,28 +789,20 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 		}
 
 		// A present `mcp.capabilities` of JSON null must be REJECTED, not treated as
-		// absent: the *[]string pointer cannot tell absent from explicit null (both
-		// decode to nil), so a `"capabilities": null` token would otherwise be
-		// identity-only and bypass the exhaustive allowlist. Probe the raw claims for
-		// the literal key. (Non-array values already fail the typed unmarshal above,
-		// so null is the only gap.)
+		// absent: the *[]string pointer can't tell absent from explicit null (both
+		// decode to nil), so a null token would otherwise bypass the exhaustive
+		// allowlist as identity-only. Probe the raw claims for the literal key.
 		if mcpRaw, ok := rawClaims["mcp"].(map[string]interface{}); ok {
 			if capRaw, present := mcpRaw["capabilities"]; present && capRaw == nil {
 				return nil, capability.Terminal(jwtErr(jwtErrInvalidCapabilities, fmt.Errorf("mcp.capabilities is present but null; a null capability claim is rejected — use [] for an empty (deny-all) allowlist or omit the field to defer to the manifest")))
 			}
 		}
 
-		// A nil Capabilities pointer means the field was absent; a non-nil pointer
-		// (even to an empty slice) means present.
 		capabilitiesPresent := payload.MCP.Capabilities != nil
 
-		// EXPERIMENTAL-feature gate. The mcp.capabilities claim schema (JWT v0.2) is
-		// experimental and enforced only under --jwt-experimental-capabilities. When the
-		// flag is off (the default), a token that carries the claim is rejected here (fail
-		// closed) rather than admitted with its restriction silently dropped — dropping it
-		// would fail open, widening access past what the token issuer intended. A token
-		// that omits the claim is identity-only and unaffected, as are all the
-		// signature/exp/iss/aud checks above and the identity claims below.
+		// EXPERIMENTAL gate: off by default, a carrying token is rejected here rather
+		// than admitted with its restriction silently dropped (which would fail open,
+		// widening access past what the issuer intended).
 		if capabilitiesPresent && !p.experimentalCapabilities {
 			return nil, capability.Terminal(jwtErr(jwtErrCapabilitiesDisabled, fmt.Errorf("mcp.capabilities is present but experimental capability-claim enforcement is disabled; pass --jwt-experimental-capabilities to enable the experimental JWT capability-claim intersection (JWT schema v0.2), or omit the claim to use the token for identity only")))
 		}
@@ -1064,56 +812,43 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 			capsList = *payload.MCP.Capabilities
 		}
 
-		// Every capability claim must have the v0.2 format; reject the token on any
-		// malformed entry (fail closed) rather than silently ignoring it.
+		// Reject the token on any malformed entry (fail closed) rather than
+		// silently ignoring it.
 		for _, claim := range capsList {
 			if _, _, _, err := parseV2Claim(claim); err != nil {
 				return nil, capability.Terminal(jwtErr(jwtErrInvalidCapabilities, fmt.Errorf("JWT capability claim has invalid format: %w", err)))
 			}
 		}
 
-		// Declassification approvals. Parsed HERE, at the token boundary, so a grant this
-		// build cannot enforce rejects the TOKEN rather than evaluating later to "covers
-		// nothing" — which would turn an IdP template mistake into a permanent, invisible
-		// escalation loop an operator has no error to grep for.
-		//
-		// Unlike mcp.capabilities this is NOT behind the experimental gate, and the reason
-		// is that it cannot widen anything on its own. A capability claim REPLACES the
-		// authorization surface, so admitting it under a build that ignores its restriction
-		// fails open. An approval is inert unless the manifest carries a declassify
-		// directive — a schemaVersion 0.2 token the operator wrote — so the manifest is
-		// already the opt-in, and a second gate would only add a way to configure the
-		// approval path off while leaving the directive on, i.e. a policy that can never be
-		// satisfied.
+		// Parsed HERE, at the token boundary, so a grant this build cannot enforce
+		// rejects the TOKEN rather than evaluating later to "covers nothing" — which
+		// would turn an IdP template mistake into a permanent, invisible escalation
+		// loop with no error to grep for. Unlike mcp.capabilities this is NOT behind
+		// the experimental gate: it can only narrow, and it is already gated by the
+		// manifest carrying a declassify directive at all.
 		declassify, declErr := p.parseDeclassifyApprovals(payload.MCP.Declassify, tokenExpUnix, now)
 		if declErr != nil {
 			return nil, declErr
 		}
 
-		// Delegation attenuation, decoded and asserted at this same boundary.
 		delegation, delegErr := parseDelegationChain(payload)
 		if delegErr != nil {
 			return nil, delegErr
 		}
 
-		// Sub is the primary identity anchor; without it a token cannot be attributed
-		// in audit records or matched against principal-scoped constraints. Reject
-		// (fail closed).
+		// Sub is the primary identity anchor; without it a token cannot be
+		// attributed in audit records or matched against principal-scoped
+		// constraints.
 		if stdClaims.Subject == "" {
 			return nil, capability.Terminal(jwtErr(jwtErrMissingClaims, fmt.Errorf("JWT missing required sub claim")))
 		}
 
-		// A sender-constrained token (RFC 7800 cnf: a DPoP jkt, embedded jwk, kid
-		// reference, or an RFC 8705 mTLS x5t#S256 binding) is bound to a proof-of-possession
-		// key and MUST NOT be honored as a plain bearer token — the proxy has no PoP
-		// verification path, so accepting one would let anyone who captured it replay it.
-		// The predicate is capability.CnfIsSenderConstrained, which decodes through
-		// Confirmation.IsSenderConstrained — the one canonical sender-constrained rule
-		// every JWT-verification path in the binary shares. A present non-object cnf is
-		// malformed and rejected as a malformed token (not mislabeled sender_constrained);
-		// either way we fail closed. An explicit `"cnf": null` is the one exception: it
-		// decodes to a nil value, which CnfIsSenderConstrained treats as absent — neither
-		// constraining nor malformed — so it passes through like a token carrying no cnf.
+		// A sender-constrained token (RFC 7800 cnf: DPoP jkt, embedded jwk, or an
+		// RFC 8705 mTLS binding) is bound to a proof-of-possession key the proxy
+		// cannot verify, so it must not be honored as a plain bearer token — anyone
+		// who captured it could replay it. An explicit `"cnf": null` is the one
+		// exception: CnfIsSenderConstrained treats it as absent, so it passes
+		// through like a token carrying no cnf at all.
 		if constrained, malformed := capability.CnfIsSenderConstrained(rawClaims["cnf"]); malformed {
 			return nil, capability.Terminal(jwtErr(jwtErrMalformedToken, fmt.Errorf("cnf claim is present but not a JSON object (RFC 7800 requires an object); rejecting (fail closed)")))
 		} else if constrained {
@@ -1125,31 +860,26 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 	if err != nil {
 		return ctx, err
 	}
-	// Cache the verified claims so a repeat of this exact token skips the work above.
-	// TTL is capped at the token's remaining lifetime inside Put. Reuses the key hashed
-	// once at entry. Consumers must treat the returned claims as read-only (see
-	// newJWTTokenCache): the cache hands the same pointer to concurrent sessions.
+	// TTL is capped at the token's remaining lifetime inside Put. Consumers must
+	// treat the returned claims as read-only: the cache hands the same pointer to
+	// concurrent sessions.
 	p.tokenCache.Put(cacheKey, validated, tokenExpUnix)
 	return WithJWTClaims(ctx, validated), nil
 }
 
-// CheckKill consults the JWTPDP's kill switch, returning a non-nil deny when the
-// session is killed (or the kill store errors, fail closed). The */list handlers
-// call it before contacting the upstream so a killed session cannot enumerate the
-// catalog even in JWT mode.
+// CheckKill consults the kill switch, returning non-nil when the session is killed
+// (or the kill store errors, fail closed). The */list handlers call it before
+// contacting the upstream so a killed session cannot enumerate the catalog.
 func (p *JWTPDP) CheckKill(ctx context.Context, sessionID string) *capability.EnforceResponse {
 	return killCheck(ctx, p.clock, p.ks, sessionID)
 }
 
-// CheckAudience enforces this route's per-route audience pin at session creation, before
-// any upstream is spawned or contacted. The shared validator accepts the UNION of every
-// route's effective audience, so a token minted for another route clears token
-// validation; this narrows to THIS route so a cross-audience token cannot spin up this
-// route's upstream or read its serverInfo via the initialize handshake. The
-// Decide/filterList/DecideSampling paths embed the same pin for enforced actions; this
-// covers the session-creating initialize, which does not flow through them. Returns nil
-// when no audience is pinned (routeAudience unset, e.g. single-upstream) or
-// --jwt-allow-any-audience; a missing claim under a set pin fails closed.
+// CheckAudience enforces this route's audience pin at session creation, before any
+// upstream is spawned — the shared validator accepts the UNION of every route's
+// audience, so this narrows to THIS route so a cross-audience token can't spin up
+// this route's upstream via initialize. Decide/filterList/DecideSampling embed the
+// same pin for enforced actions; this covers the session-creating initialize, which
+// doesn't flow through them. Returns nil when no audience is pinned.
 func (p *JWTPDP) CheckAudience(ctx context.Context) *capability.EnforceResponse {
 	if p.routeAudience == "" || p.allowAnyAudience {
 		return nil
@@ -1168,18 +898,15 @@ func (p *JWTPDP) DecideResourceRead(ctx context.Context, sessionID, uri, sourceI
 	return p.Decide(ctx, sessionID, EnforceTarget{Type: capability.TargetTypeResource, Name: uri}, nil, sourceIP)
 }
 
-// DecideResourceCancel authorizes a resources/unsubscribe through the JWT layer without
-// routing it into Decide, because Decide is the READ decision and a cancel must not be
-// metered by it (see the contract). The token can still only RESTRICT: kill, the per-route
-// audience pin, and — when the token carries an exhaustive mcp.capabilities claim — the
-// requirement that some claim cover this resource, all apply before the inner PDP's own
-// match-only decision.
+// DecideResourceCancel authorizes a resources/unsubscribe without routing through
+// Decide, since Decide is the READ decision and a cancel must not be metered by it.
+// The token still only RESTRICTS: kill, the audience pin, and (when the token carries
+// an exhaustive mcp.capabilities claim) coverage of this resource all apply before the
+// inner PDP's match-only decision.
 //
-// Unlike Decide, the denials here are not routed through withInnerVerdicts.
-// Neither half of that helper applies to a cancel: the interface-pin hardening it carries
-// is tool-only (hardenOnBrokenInterface returns unchanged for a resource target), and
-// obligations describe how to redact a FORWARDED response — an unsubscribe result carries
-// no data to redact even when an --audit route downgrades the denial to a forward.
+// Denials here skip withInnerVerdicts: its interface-pin hardening is tool-only, and
+// its redaction obligations don't apply — an unsubscribe result carries no data to
+// redact even when downgraded to a forward.
 func (p *JWTPDP) DecideResourceCancel(ctx context.Context, sessionID, uri, sourceIP string) capability.EnforceResponse {
 	if deny := killCheck(ctx, p.clock, p.ks, sessionID); deny != nil {
 		return *deny
@@ -1193,40 +920,34 @@ func (p *JWTPDP) DecideResourceCancel(ctx context.Context, sessionID, uri, sourc
 		return p.audienceDeny(fmt.Sprintf("token audience %v does not satisfy the route's required audience %q", claims.Audiences, p.routeAudience))
 	}
 	target := EnforceTarget{Type: capability.TargetTypeResource, Name: uri}
-	// The delegation target gate, for the same reason Decide runs one: this method can
-	// resolve entirely inside the wrapper (an exhaustive claim plus a nil or wiretap inner),
-	// so the chain would otherwise bound the subscribe and not the cancel.
+	// Mirrors Decide's delegation gate: this method can resolve entirely inside the
+	// wrapper (exhaustive claim + nil/wiretap inner), so without it the chain would
+	// bound the subscribe but not the cancel.
 	if deny := delegationTargetDenial(ctx, p.clock, target, false); deny != nil {
 		return *deny
 	}
 	if claims.HasCapabilities {
-		// The claim is an exhaustive allowlist, so a resource it does not name is not
-		// cancellable through this token either. Matching (not condition evaluation) is
-		// the whole question here, which is what anyCapCovers answers — the same
-		// predicate the JWT list filter uses.
+		// Matching only (no conditions) — anyCapCovers is the same predicate the
+		// list filter uses.
 		if !anyCapCovers(parsedCapHeads(claims), target) {
 			return denyResponse(p.clock, capability.ErrCodeAuthorizationFailed, "jwtCapability",
 				fmt.Sprintf("resource %q is not in the JWT capability claims, so this token holds no subscription to it to cancel", uri))
 		}
-		// The plain nil check, matching the same branch in Decide and for the same reason:
-		// the token has ALREADY authorized this URI against its exhaustive allowlist, so
-		// delegating to a permissive inner can only re-affirm — a weaker gate cannot fail
-		// open here. Using innerEnforces() instead made the two legs of one subscription
-		// disagree on a wiretap route: the same token was allowed the subscribe (Decide's
-		// nil check reaches AlwaysAllowPDP) and denied the unsubscribe.
+		// Plain nil check, not innerEnforces(): the token already authorized this URI
+		// against its exhaustive allowlist, so a permissive inner can only re-affirm.
+		// innerEnforces() here made a wiretap route disagree between its own subscribe
+		// (allowed) and unsubscribe (denied) for the same token.
 		if p.inner != nil {
 			return p.inner.DecideResourceCancel(ctx, sessionID, uri, sourceIP)
 		}
 		return newAllowResponse(p.clock)
 	}
-	// No mcp.capabilities claim: the JWT ABSTAINS, so a permissive inner would fail open
-	// and only a real policy can authorize. That is the stricter innerEnforces() gate, the
-	// same asymmetry Decide documents.
+	// No mcp.capabilities claim: the JWT abstains, so only a real backstop
+	// (innerEnforces) can authorize — same asymmetry Decide documents.
 	if p.innerEnforces() {
 		return p.inner.DecideResourceCancel(ctx, sessionID, uri, sourceIP)
 	}
-	// Identity-only token on a route with no policy: the same posture Decide takes for an
-	// unpoliced JWT route — the token authenticates, it does not authorize.
+	// Identity-only token, no route policy: the token authenticates, not authorizes.
 	return denyResponse(p.clock, capability.ErrCodeAuthorizationFailed, "",
 		"no capability policy is configured for this route, so no subscription was authorized to cancel")
 }
@@ -1237,66 +958,45 @@ func (p *JWTPDP) DecidePromptGet(ctx context.Context, sessionID, promptName, sou
 	return p.Decide(ctx, sessionID, EnforceTarget{Type: capability.TargetTypePrompt, Name: promptName}, nil, sourceIP)
 }
 
-// DecideSampling implements SamplingAuthorizer. The kill switch is enforced first.
-// The session's validated JWT claims ARE in scope here — they drive the per-route
-// audience pin and the agent-kill dimension enforced just below. What is NOT in scope
-// is a per-request bearer token attributable to this upstream-initiated request (per
-// ADR-0001 sampling originates from the upstream, not a host call carrying a token),
-// so the JWT layer does not intersect capability claims for it: the capability decision
-// delegates to the inner PDP, whose manifest "system:sampling/createMessage" opt-in is
-// authoritative. With no inner authorizer (JWT-only, or an unpoliced route wrapped by
-// JWT), sampling stays denied (fail closed).
+// DecideSampling implements SamplingAuthorizer. Per ADR-0001 sampling originates
+// from the upstream, not a host call carrying a bearer token, so the JWT layer does
+// not intersect capability claims for it — the decision delegates to the inner PDP's
+// manifest "system:sampling/createMessage" opt-in. With no inner authorizer, sampling
+// stays denied (fail closed).
 func (p *JWTPDP) DecideSampling(ctx context.Context, sessionID, sourceIP string) capability.EnforceResponse {
-	// Always run the wrapper's own kill check FIRST — before the audience pin below and
-	// before any delegation to the inner PDP. Previously this was skipped when the inner
-	// ManifestPDP shared the same manager (deferring to the inner's own check), but the
-	// audience pin runs before that delegation, so a session that is BOTH killed and
-	// cross-audience was denied with AUTHORIZATION_FAILED/jwtAudience instead of
-	// KILL_SWITCH — flipping the audit denial code on wiring rather than session state and
-	// hiding the kill from any monitoring keyed on KILL_SWITCH. Kill takes precedence over
-	// audience (as this method's contract states), so the check is unconditional; the
-	// possible redundant inner re-check is the accepted price of a correct, wiring-
-	// independent denial code, matching the Decide path.
+	// Kill runs unconditionally, before the audience pin: previously this was
+	// skipped when the inner PDP shared the kill manager (deferring to its own
+	// check), but the audience pin runs before that delegation — so a session both
+	// killed and cross-audience was denied with the wrong code, hiding the kill
+	// from KILL_SWITCH-keyed monitoring.
 	if deny := killCheck(ctx, p.clock, p.ks, sessionID); deny != nil {
 		return *deny
 	}
-	// No validated claims in scope at all: hard-deny, mirroring Decide and filterList.
-	// This is an authentication boundary — the token was never validated — so it must not
-	// be downgraded to a logged forward under a route running --audit, and it must not be
-	// silently delegated past. Today the transport wiring only reaches DecideSampling with
-	// claims attached (forwardServerRequest attaches them), so this is a mirror of an
-	// invariant rather than a live hole; stating it here is what keeps it one, since the
-	// asymmetry — two of the three Decide* entry points checking and the third not — is
-	// exactly the kind of gap a later wiring change turns into a bypass.
+	// No validated claims at all: hard-deny (an authentication boundary), mirroring
+	// Decide/filterList. The transport wiring only reaches here with claims already
+	// attached (forwardServerRequest), so this documents the invariant rather than
+	// closing a live hole — stating it is what keeps a later wiring change from
+	// silently reopening it.
 	claims, ok := jwtClaimsFromContext(ctx)
 	if !ok {
 		return hardDenyResponse(p.clock, capability.ErrCodeNoJWTClaims, "no JWT claims in context — token was not validated")
 	}
-	// Per-route audience pin (mirrors Decide/filterList): a session whose token does not
-	// carry this route's audience gets NO enforced action on the route, including a
-	// server-initiated sampling forward to the host. Reuse CheckAudience so the pin
-	// logic lives once; claims are attached by forwardServerRequest, and when
-	// routeAudience is unset (single-upstream, or stdio with no JWT) it is a no-op.
+	// Per-route audience pin, mirroring Decide/filterList: a no-op when
+	// routeAudience is unset (single-upstream, or stdio with no JWT).
 	if deny := p.CheckAudience(ctx); deny != nil {
 		return *deny
 	}
-	// A present mcp.capabilities field is an EXHAUSTIVE allowlist: Decide denies any
-	// target the claim does not list, even an empty array. Sampling was the one enforced
-	// method that ignored it — DecideSampling delegated straight to the manifest — and
-	// because parseV2Claim refuses system: claims, a token can never LIST sampling. So a
-	// deny-all token ("capabilities": []) still got server-initiated sampling forwarded on
-	// its session wherever the route's manifest opted into system:sampling/createMessage:
-	// the one place "the token can only restrict, never expand" failed in the
-	// exhaustive-deny direction. Deny instead, so the claim's contract holds for every
-	// enforced method.
+	// mcp.capabilities is an EXHAUSTIVE allowlist even when empty, but sampling was
+	// the one enforced method that ignored it (delegated straight to the manifest) —
+	// and since parseV2Claim refuses system: claims, a token could never LIST
+	// sampling, so a deny-all token still got sampling forwarded wherever the
+	// manifest opted in. Deny here instead, closing that exhaustive-deny gap.
 	if claims.HasCapabilities {
 		return denyResponse(p.clock, capability.ErrCodeSamplingDenied, "",
 			"the token carries an mcp.capabilities claim, which is an exhaustive allowlist, and sampling cannot be listed in it (system: targets are not expressible as capability claims); server-initiated sampling is therefore denied for this token")
 	}
-	// innerEnforces gates the delegation so an AlwaysAllowPDP inner is NOT a sampling
-	// backstop (matching the identity-only Decide path): without it
-	// AlwaysAllowPDP.DecideSampling would be reached and silently grant sampling on a
-	// JWT route carrying no sampling policy.
+	// innerEnforces (not a nil check) so an AlwaysAllowPDP inner is not a sampling
+	// backstop, matching the identity-only Decide path.
 	if p.innerEnforces() {
 		return p.inner.DecideSampling(ctx, sessionID, sourceIP)
 	}
@@ -1304,15 +1004,10 @@ func (p *JWTPDP) DecideSampling(ctx context.Context, sessionID, sourceIP string)
 		"server-initiated sampling requires a manifest with an explicit system:sampling/createMessage opt-in")
 }
 
-// routeAudienceSatisfied reports whether a token whose verified aud is auds is
-// authorized on a route requiring routeAudience. It is the per-route narrowing that
-// composes with the shared validator: the validator already accepted the token for
-// SOME route's audience (the union), and this asserts it carries THIS route's. An
-// empty routeAudience (single-upstream, or the shared validator itself) or
-// --jwt-allow-any-audience disables the check (returns true). Otherwise the token must
-// carry routeAudience among its aud values — the natural per-route extension of
-// go-jose's "at least one of" semantics, so a multi-audience token issued for both
-// svc-a and svc-b is accepted on either route.
+// routeAudienceSatisfied is the per-route narrowing on top of the shared validator,
+// which already accepted the token for SOME route's audience (the union): this
+// asserts it carries THIS route's, so a multi-audience token issued for both svc-a
+// and svc-b is accepted on either route.
 func (p *JWTPDP) routeAudienceSatisfied(claims *JWTClaims) bool {
 	if p.allowAnyAudience || p.routeAudience == "" {
 		return true
@@ -1325,43 +1020,34 @@ func (p *JWTPDP) routeAudienceSatisfied(claims *JWTClaims) bool {
 	return false
 }
 
-// audienceDeny builds the per-route audience denial used by Decide, DecideSampling, and
-// CheckAudience. It is marked HardDeny so a route running under --audit (observe) posture
-// does NOT downgrade it to a logged forward: a token's audience is an authentication /
-// tenancy boundary (like the kill switch, which is likewise never downgraded), not a
-// per-call policy decision, so a cross-audience request is refused outright even in
-// observe mode — matching the unconditional initialize-time pre-spawn gate.
+// audienceDeny is marked HardDeny so a route running under --audit does NOT downgrade
+// it to a logged forward: audience is an authentication/tenancy boundary (like the
+// kill switch), not a per-call policy decision.
 func (p *JWTPDP) audienceDeny(message string) capability.EnforceResponse {
 	resp := denyResponse(p.clock, capability.ErrCodeAuthorizationFailed, "jwtAudience", message)
 	resp.Denial.HardDeny = true
 	return resp
 }
 
-// withInnerVerdicts composes the inner PDP's own verdicts onto one of JWTPDP's OWN denies,
-// which the wrapper produced by short-circuiting above the inner PDP.
+// withInnerVerdicts composes the inner PDP's own verdicts onto one of JWTPDP's own
+// denies produced by short-circuiting above the inner PDP.
 //
-// JWTPDP short-circuits on three non-HardDeny paths — target absent from mcp.capabilities,
-// a JWT condition failure, and no-capabilities-with-no-backstop — so the inner PDP never
-// runs and never contributes the three things it would have: the redaction obligations a
-// route running --audit needs when it downgrades the deny to a forward, the interface-pin
-// break, and the effect ceiling. Each omission made the composed refusal WEAKER than the
-// same request without the JWT, inverting "a JWT may only restrict".
+// JWTPDP short-circuits on three non-HardDeny paths (unlisted target, a JWT
+// condition failure, no-capabilities-with-no-backstop), so the inner PDP never
+// contributes the redaction obligations a --audit route needs on downgrade, the
+// interface-pin break, or the effect ceiling — each omission made the composed
+// refusal WEAKER than the same request without the JWT, inverting "a JWT may only
+// restrict".
 //
-// It goes through the PolicyDecisionPoint contract (HardenRefusal), not a type assertion to
-// *ManifestPDP. The assertion silently did nothing for any other implementation, so a
-// third-party inner PDP holding a pin or a ceiling composed as if it held neither — and the
-// ORDER of the three checks had to be restated here, away from the decideTarget ordering it
-// mirrors. Both now live with the implementation that owns them.
-//
-// args is threaded through because the ceiling's verdict depends on the call's arguments (a
-// blast radius is routinely an argument's value).
+// Goes through the PolicyDecisionPoint contract (HardenRefusal), not a type
+// assertion to *ManifestPDP, so a third-party inner PDP's own pin/ceiling composes
+// correctly instead of silently doing nothing.
 func (p *JWTPDP) withInnerVerdicts(ctx context.Context, sessionID string, r capability.EnforceResponse, target EnforceTarget, args map[string]interface{}) capability.EnforceResponse {
 	if p.inner == nil || r.Decision == capability.DecisionAllow || len(r.Obligations) > 0 {
 		return r
 	}
 	if r.Denial != nil && r.Denial.HardDeny {
-		// Never downgraded to a forward, so there is no response to redact and no softer
-		// verdict to harden.
+		// Never downgraded to a forward, so nothing to redact or harden.
 		return r
 	}
 	return p.inner.HardenRefusal(ctx, sessionID, r, target, args)
@@ -1380,60 +1066,44 @@ func (p *JWTPDP) withInnerVerdicts(ctx context.Context, sessionID string, r capa
 // of the same target, BOTH must pass — achieved by evaluating JWT conditions here
 // then delegating to the inner PDP, so neither side can waive the other's.
 func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTarget, args map[string]interface{}, sourceIP string) capability.EnforceResponse {
-	// Check the kill switch first so kills take effect even without --policy. This
-	// is unconditional (not skipped when the inner shares the manager, as
-	// DecideSampling can): Decide has early-return paths that never reach decideInner
-	// — an unlisted target, or failing JWT conditions — so deferring to the inner
-	// would leave the kill unconsulted there, denying with the wrong code and no
-	// kill-switch observability. DecideResourceRead/DecidePromptGet delegate here, so
-	// this covers all three host-initiated paths.
+	// Unconditional (not skipped when the inner shares the kill manager, as
+	// DecideSampling can be): Decide has early-return paths that never reach
+	// decideInner (unlisted target, failing JWT conditions), so deferring to the
+	// inner would leave the kill unconsulted there.
 	if deny := killCheck(ctx, p.clock, p.ks, sessionID); deny != nil {
 		return *deny
 	}
 
 	claims, ok := jwtClaimsFromContext(ctx)
 	if !ok {
-		// No validated JWT claims in scope at all — the token was never validated. That
-		// is an authentication boundary, an even stronger failure than the cross-audience
-		// deny below (which is HardDeny), so it must not be downgraded to a logged forward
-		// under a route running --audit. Hard-deny it, mirroring the audience deny.
+		// An authentication boundary, stronger than the cross-audience deny below,
+		// so it must not be downgraded to a logged forward under --audit.
 		return hardDenyResponse(p.clock, capability.ErrCodeNoJWTClaims, "no JWT claims in context — token was not validated")
 	}
 
-	// Per-route audience pin: the shared validator accepted this token for SOME route's
-	// audience (the union); narrow it to THIS route's. A token minted for route A's
-	// audience is denied on route B. Runs before the capability/manifest logic so a
-	// cross-audience token cannot reach either side. No-op for single-upstream (no
-	// routeAudience) or --jwt-allow-any-audience.
+	// Per-route audience pin: the shared validator accepted this token for SOME
+	// route's audience (the union); narrow to THIS route's before the
+	// capability/manifest logic runs at all.
 	if !p.routeAudienceSatisfied(claims) {
 		return p.audienceDeny(fmt.Sprintf("token audience %v does not satisfy the route's required audience %q", claims.Audiences, p.routeAudience))
 	}
 
-	// The delegation target gate, applied HERE rather than left to the inner PDP. Every
-	// other axis of the chain composes inside the enforcement engine, but this wrapper has
-	// decision paths that never reach one: a JWT-only route has no manifest engine, and a
-	// policyless route's inner is the wiretap AlwaysAllowPDP. On those routes the chain was
-	// validated at the token boundary — a widening hop rejected the token — and then applied
-	// to nothing, so a delegate whose grant reaches no target was still allowed. Running it
-	// before the capability logic also means a delegated call is refused for the reason that
-	// actually bounds it rather than for whichever check happened to fire first.
+	// Applied HERE rather than left to the inner PDP: a JWT-only route has no
+	// manifest engine, and a policyless route's inner is the wiretap
+	// AlwaysAllowPDP, so on those routes the chain was validated at the token
+	// boundary and then applied to nothing — a delegate whose grant reaches no
+	// target was still allowed.
 	//
-	// Composed through withInnerVerdicts for the reason every other short-circuit above the
-	// inner PDP is: the refusal is downgradable by design (see delegationDenial), so on an
-	// --audit route it becomes a FORWARD — and a forward assembled here carries none of the
-	// three things the inner PDP would have contributed had it run. Without this, adding a
-	// delegation chain to a token made the same request forward UNREDACTED, past a broken
-	// interface pin, and past the effect ceiling. That is the exact inversion the seam exists
-	// to prevent, arrived at through the one axis that only ever narrows.
+	// Composed through withInnerVerdicts because the refusal is downgradable by
+	// design: on an --audit route it becomes a forward, and without composing it
+	// would carry none of the redaction/pin/ceiling the inner PDP would have added.
 	if deny := delegationTargetDenial(ctx, p.clock, target, false); deny != nil {
 		return p.withInnerVerdicts(ctx, sessionID, *deny, target, args)
 	}
 
-	// No mcp.capabilities field: the JWT provides identity only and the decision
-	// defers to the inner manifest PDP. That is safe only with a real backstop —
-	// with no manifest (an AlwaysAllowPDP or nil inner) a token omitting
-	// mcp.capabilities would be granted every target, making enforcement an
-	// issuer-controlled opt-in. JWT mode fails closed instead.
+	// No mcp.capabilities field: identity-only, deferring to the inner manifest
+	// PDP — safe only with a real backstop (innerEnforces), since an
+	// AlwaysAllowPDP/nil inner would grant every target to an identity-only token.
 	if !claims.HasCapabilities {
 		if p.innerEnforces() {
 			return p.decideInner(ctx, sessionID, target, args, sourceIP)
@@ -1443,9 +1113,8 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 				"JWT mode denies by default — issue a token with capability claims or add a manifest policy to the route"), target, args)
 	}
 
-	// mcp.capabilities present → exhaustive allowlist; an unlisted target is denied
-	// regardless of the manifest. Use the heads parsed at validation time (cached hot
-	// path) when available, else parse the raw claims.
+	// Exhaustive allowlist: an unlisted target is denied regardless of the
+	// manifest. Use the heads parsed at validation time when available.
 	var constraints []capability.Constraint
 	if claims.parsedCaps != nil {
 		constraints = buildConstraintsFromParsed(claims.parsedCaps, target)
@@ -1453,11 +1122,9 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 		constraints = buildConstraintsFromClaims(claims.Capabilities, target)
 	}
 	if len(constraints) == 0 {
-		// "Not in the claims" is the usual reason and the only one an operator can act on
-		// by editing the token. A claim that NAMES this target but whose condition suffix
-		// failed to parse also lands here (it grants nothing, fail closed), and reporting
-		// that as absent sends the operator looking for a claim that is right in front of
-		// them. Say which case it is; the parse failure itself is already logged in full.
+		// A claim that NAMES this target but whose condition suffix failed to parse
+		// also lands here (it grants nothing) — distinguish it so the operator isn't
+		// sent looking for a claim that's right in front of them.
 		msg := fmt.Sprintf("%s %q is not in the JWT capability claims", target.Type, target.Name)
 		if claimNamesTargetButFailedToParse(claims, target) {
 			msg = fmt.Sprintf("a JWT capability claim names %s %q, but its condition suffix could not be parsed, so it grants nothing (see the eunox log for the parse error)", target.Type, target.Name)
@@ -1465,19 +1132,13 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 		return p.withInnerVerdicts(ctx, sessionID, denyResponse(p.clock, capability.ErrCodeAuthorizationFailed, "jwtCapability", msg), target, args)
 	}
 
-	// mcp.capabilities is an OR-list: the call is permitted if ANY matching entry's
-	// conditions pass. Evaluate every matching entry and allow on the first that
-	// passes, avoiding an order-dependent first-match deny (e.g. separate
-	// op=SELECT / op=INSERT grants for one tool). Conditions evaluate against the
-	// same arg map the inner manifest sees — tools/call carries real args, while
-	// resources/read and prompts/get synthesize the name under "uri"/"name" — so a
-	// resource:/prompt: allowedValues claim does not always deny with MISSING_CONTEXT.
+	// OR-list: permitted if ANY matching entry's conditions pass. Evaluate every
+	// matching entry rather than stopping at the first, avoiding an order-dependent
+	// deny (e.g. separate op=SELECT / op=INSERT grants for one tool).
 	condArgs := jwtConditionArgs(target, args)
-	// Hoisted beside condArgs: both are loop-invariant, and flatMap falls back to REBUILDING
-	// the flat claim map for a *JWTClaims that never went through ValidateToken (the
-	// documented test/embedder case), which inside the loop would be one map allocation per
-	// candidate grant. The request is built once for the same reason — every candidate grant
-	// is judged against the identical call.
+	// Hoisted beside condArgs since both are loop-invariant: flatMap falls back to
+	// rebuilding the flat claim map for a test-built JWTClaims, which inside the
+	// loop would allocate once per candidate grant instead of once total.
 	condReq := jwtClaimEnforceRequest(sessionID, target, condArgs, claims.flatMap())
 	var lastDeny *capability.EnforceResponse
 	for i := range constraints {
@@ -1498,38 +1159,26 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 		return p.withInnerVerdicts(ctx, sessionID, *lastDeny, target, args)
 	}
 
-	// JWT allows — intersect with the inner manifest PDP if configured (both sides
-	// must pass, § 5.2.1). The inner PDP stamps its own correlation fields.
-	//
-	// This gate is the plain p.inner != nil, deliberately weaker than the
-	// innerEnforces() gate the no-capabilities branch above uses — and that asymmetry is
-	// safe here. The two branches face opposite risks: there the JWT ABSTAINS (no
-	// mcp.capabilities), so an AlwaysAllow/nil inner would fail OPEN, which innerEnforces()
-	// prevents; here the JWT has ALREADY authorized this target against its exhaustive
-	// allowlist, so delegating to a permissive inner (an AlwaysAllowPDP) can only
-	// re-affirm the allow — a weaker gate cannot fail open. Using innerEnforces() here too
-	// would yield the identical decision (only the audit-stamping helper differs:
-	// AlwaysAllowPDP.Decide vs. newAllowResponse below), so the plain nil check is kept.
+	// Plain p.inner != nil, deliberately weaker than the no-capabilities branch's
+	// innerEnforces(): here the JWT already authorized this target against its
+	// exhaustive allowlist, so a permissive inner can only re-affirm the allow — it
+	// cannot fail open the way it could when the JWT abstains entirely.
 	if p.inner != nil {
 		return p.decideInner(ctx, sessionID, target, args, sourceIP)
 	}
 
-	// JWT-only allow (no inner): stamp the audit-correlation fields the
-	// engine-bypassing allow paths share (newAllowResponse).
 	return newAllowResponse(p.clock)
 }
 
-// now returns the injected clock's instant (or the wall clock), via the shared
-// clockNow so the JWT and AlwaysAllowPDP paths honor a frozen test clock identically.
+// now returns the injected clock's instant via the shared clockNow, so the JWT and
+// AlwaysAllowPDP paths honor a frozen test clock identically.
 func (p *JWTPDP) now() time.Time {
 	return clockNow(p.clock)
 }
 
-// decideInner delegates the post-JWT decision to the inner PDP, dispatching by
-// target type so resources/read and prompts/get reach the inner methods that
-// synthesize the {"uri"}/{"name"} argument maps. Routing every type through
-// inner.Decide (the tools/call path) would evaluate a resource/prompt entry's
-// conditions against an empty map and deny with MISSING_CONTEXT.
+// decideInner dispatches by target type so resources/read and prompts/get reach the
+// inner methods that synthesize the {"uri"}/{"name"} argument maps — routing every
+// type through inner.Decide would deny a resource/prompt with MISSING_CONTEXT.
 func (p *JWTPDP) decideInner(ctx context.Context, sessionID string, target EnforceTarget, args map[string]interface{}, sourceIP string) capability.EnforceResponse {
 	switch target.Type {
 	case capability.TargetTypeResource:
@@ -1537,38 +1186,29 @@ func (p *JWTPDP) decideInner(ctx context.Context, sessionID string, target Enfor
 	case capability.TargetTypePrompt:
 		return p.inner.DecidePromptGet(ctx, sessionID, target.Name, sourceIP)
 	case capability.TargetTypeTool:
-		// tools/call carries real arguments, so inner.Decide evaluates against them
-		// directly. system targets do NOT come through here: sampling is enforced via
-		// the separate DecideSampling path, and inner.Decide does not check the
-		// sampling opt-in, so a system target falls to the deny below.
+		// system targets do NOT come through here: sampling is decided via the
+		// separate DecideSampling path, so a system target falls to the deny below.
 		return p.inner.Decide(ctx, sessionID, target, args, sourceIP)
 	default:
-		// Fail closed on any unhandled type: a new type, or one needing name-to-arg
-		// synthesis (like resource/prompt), would re-introduce the empty-arg
-		// MISSING_CONTEXT regression if it silently fell through to inner.Decide.
-		// system lands here on purpose (see the tool case).
+		// Fail closed on any unhandled type: falling through to inner.Decide would
+		// re-introduce the empty-arg MISSING_CONTEXT regression for a type needing
+		// name-to-arg synthesis. system lands here on purpose.
 		return hardDenyResponse(p.clock, capability.ErrCodeEnforcementError,
 			fmt.Sprintf("decideInner: unhandled target type %q — update decideInner", target.Type))
 	}
 }
 
-// claimConditionEvaluator is the narrow view evaluateJWTConditions needs of the PDP whose
-// condition semantics this deployment enforces. It is the one method of
-// PolicyDecisionPoint that matters here, named separately so the evaluator can be nil
-// (a JWT-only route, which has no wrapped PDP) without the caller having to hold a full
-// contract implementation to say so.
+// claimConditionEvaluator is the narrow view evaluateJWTConditions needs of the
+// deciding PDP, named separately so the evaluator can be nil (a JWT-only route)
+// without the caller holding a full PolicyDecisionPoint implementation.
 type claimConditionEvaluator interface {
 	EvaluateClaimCondition(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (*enforcement.ConditionError, bool)
 	ConditionHandlerOverridden(condType string) bool
 }
 
 // claimConditionVerdict asks the deciding PDP, or the built-ins when there is none.
-//
-// The nil case is a route with no wrapped PDP at all: no engine exists, so no
-// WithConditionHandler override can exist either, and the shipped predicate is by
-// construction this route's semantics. That is the ONLY reading of nil — it must never
-// become the fallback for "the PDP is there but did not answer", which is what ok=false
-// reports and the caller fails closed on.
+// nil means a route with no wrapped PDP at all (so nothing could be overridden) —
+// it must never stand in for "the PDP is there but did not answer" (ok=false).
 func claimConditionVerdict(eval claimConditionEvaluator, ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (*enforcement.ConditionError, bool) {
 	if eval == nil {
 		return enforcement.NonCommittingConditionVerdict(ctx, cond, req)
@@ -1576,59 +1216,35 @@ func claimConditionVerdict(eval claimConditionEvaluator, ctx context.Context, co
 	return eval.EvaluateClaimCondition(ctx, cond, req)
 }
 
-// claimConditionOverridden asks the deciding PDP whether an embedder replaced its semantics
-// for condType, for the ONE claim-side arm that cannot dispatch through the replacement (see
-// PolicyDecisionPoint.ConditionHandlerOverridden). The nil case reads exactly as it does in
-// claimConditionVerdict: no wrapped PDP means no engine, so nothing can have been overridden.
+// claimConditionOverridden asks the deciding PDP whether an embedder replaced
+// condType's semantics — for the one claim-side arm (allowedOperations) that can't
+// dispatch through the replacement. nil means no wrapped PDP, so nothing overridden.
 func claimConditionOverridden(eval claimConditionEvaluator, condType string) bool {
 	return eval != nil && eval.ConditionHandlerOverridden(condType)
 }
 
 // EvaluateClaimCondition delegates to the PDP this one wraps, so a stack of wrappers
-// resolves to the semantics of whatever is actually deciding. With no inner PDP there is
-// no engine either, so the built-ins are the route's semantics — see claimConditionVerdict.
+// resolves to whatever is actually deciding. No inner PDP means no engine, so the
+// built-ins are the route's semantics.
 func (p *JWTPDP) EvaluateClaimCondition(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (*enforcement.ConditionError, bool) {
 	return claimConditionVerdict(p.inner, ctx, cond, req)
 }
 
-// ConditionHandlerOverridden delegates to the PDP this one wraps, for the reason
-// EvaluateClaimCondition does: a stack of wrappers must resolve to the semantics of whatever is
-// actually deciding, and a wrapper answering on its own behalf ("I hold no engine") is exactly
-// the divergence the question exists to detect. No inner PDP means no engine, so nothing has
-// been overridden.
+// ConditionHandlerOverridden delegates to the PDP this one wraps, for the same
+// reason EvaluateClaimCondition does.
 func (p *JWTPDP) ConditionHandlerOverridden(condType string) bool {
 	return claimConditionOverridden(p.inner, condType)
 }
 
-// jwtClaimEnforceRequest builds the EnforceRequest a capability claim's conditions are
-// evaluated against.
-//
-// It exists because the shared predicate's guarantee is only as good as what it is FED.
-// enforcement.EvaluateAllowedValues reads Arguments and Claims today, and the call site
-// used to pass a two-field literal — correct, and silently wrong the moment a semantic
-// added there reads any other field: it would see the real value on the manifest path and
-// the zero value here, with no compile error and no test failure, because there is no
-// longer a second hand-written implementation whose incompleteness a reviewer would notice
-// by diffing it against the first. So the identity of the call is populated as fully as
-// this layer knows it, and what is left zero is left zero deliberately:
-//
-//   - SessionID, TargetName, Target — populated. All three are the identity of the call
-//     being authorized, all three are already in scope at the call site, and they are what
-//     a target-scoped or session-keyed rule added later would read.
-//   - Context (source IP, timestamp) — zero. Threading it would mean a claim-scoped
-//     condition could turn on the network position of the caller, which is the manifest's
-//     job: the intersection runs the manifest path immediately after, with the real value.
-//   - Directives — zero. Directives come from the MATCHED MANIFEST constraint, and no
-//     constraint has been selected at this point. A claim grant carries none.
-//   - DeclaredLabels, DeclassifyApprovals, Delegation — zero. Each is enforced on its own
-//     path (the flow layer, the declassify seam, the delegation gate, all of which run
-//     over the full request), and populating them here would let a claim-scoped condition
-//     evaluate a second, partial view of state whose authoritative evaluation is one frame
-//     away.
-//
-// internal/pdp pins this decision with a test that fails when a field is added to
-// capability.EnforceRequest, so the next field is a deliberate choice rather than an
-// omission nobody notices.
+// jwtClaimEnforceRequest builds the EnforceRequest a capability claim's conditions
+// evaluate against. SessionID/TargetName/Target/Arguments/Claims are populated, since
+// they are the call's identity and already in scope; Context, Directives,
+// DeclaredLabels, DeclassifyApprovals, and Delegation stay zero deliberately — each
+// is authoritative on a different path (manifest, matched constraint, flow layer,
+// declassify seam, delegation gate) that runs one frame later with the real value,
+// so populating a partial view here would let a claim condition see a second,
+// stale one. A test fails when a field is added to EnforceRequest, so the next
+// addition is a deliberate choice, not a silent omission.
 func jwtClaimEnforceRequest(sessionID string, target EnforceTarget, args, claims map[string]interface{}) *capability.EnforceRequest {
 	return &capability.EnforceRequest{
 		SessionID:  sessionID,
@@ -1643,10 +1259,9 @@ func jwtClaimEnforceRequest(sessionID string, target EnforceTarget, args, claims
 }
 
 // jwtConditionArgs returns the argument map JWT shorthand conditions evaluate
-// against. tools/call carries real arguments; resources/read and prompts/get carry
-// none, so the target name is synthesized under "uri"/"name" to match the inner
-// manifest's synthesis. Keep these keys in lockstep with
-// DecideResourceRead/DecidePromptGet.
+// against. resources/read and prompts/get carry no real args, so the target name is
+// synthesized under "uri"/"name" to match the inner manifest's synthesis — keep
+// these keys in lockstep with DecideResourceRead/DecidePromptGet.
 func jwtConditionArgs(target EnforceTarget, args map[string]interface{}) map[string]interface{} {
 	switch target.Type {
 	case capability.TargetTypeResource:
@@ -1681,78 +1296,52 @@ type jwtCondPair struct {
 // suffix, returns a non-nil error.  The v0.1 colon-only shorthand
 // ("read_file:/reports/*") is rejected because it lacks a recognized prefix.
 func parseV2Claim(claim string) (prefix capability.TargetType, bareName string, conds []jwtCondPair, err error) {
-	// Split off the optional condition suffix, leaving a resource URI's query string
-	// attached to the name (see splitV2Claim).
+	// A resource URI's own query string stays attached to the name (see splitV2Claim).
 	namepart, condpart, hadSep := splitV2Claim(claim)
 
-	// A '?' separator with no pairs after it ("tool:read_file?") is malformed;
-	// reject the token (fail closed) rather than treat it as an unconditioned
-	// (maximally permissive) grant.
+	// A '?' with no pairs after it ("tool:read_file?") is malformed; reject rather
+	// than treat it as an unconditioned (maximally permissive) grant.
 	if hadSep && condpart == "" {
 		return "", "", nil, fmt.Errorf("JWT capability claim %q: trailing '?' with no condition pairs", claim)
 	}
 
-	// Parse the namespace prefix and bare name using the shared parser.
 	p, bare, parseErr := capability.ParseTarget(namepart)
 	if parseErr != nil {
 		return "", "", nil, fmt.Errorf("JWT capability claim %q: %w", claim, parseErr)
 	}
 
-	// A system: claim validates through ParseTarget but is consulted by nothing: Decide
-	// never sees a system target (sampling is decided by the inner manifest per ADR-0001,
-	// and decideInner deliberately drops system to the fail-closed default). Admitting one
-	// would be an inert grant — the same silently-ineffective grammar this parser already
-	// rejects for a non-SQL op= or a trailing '?'. Reject it so the token surfaces the
-	// misconfiguration up front; a system-level capability (sampling) is granted via the
-	// manifest's system:sampling/createMessage opt-in, not a JWT claim. This path is only
-	// reached under --jwt-experimental-capabilities (ValidateToken rejects mcp.capabilities
-	// outright otherwise), so a normal token is unaffected.
+	// A system: claim validates through ParseTarget but is consulted by nothing —
+	// Decide never sees a system target (sampling is decided by the inner manifest
+	// per ADR-0001) — so admitting one would be an inert grant. Reject it so the
+	// token surfaces the misconfiguration up front.
 	if p == capability.TargetTypeSystem {
 		return "", "", nil, fmt.Errorf("JWT capability claim %q: the system: namespace is not grantable from a JWT capability claim; system capabilities such as sampling are authorized by the manifest's system:sampling/createMessage opt-in, not a token claim", claim)
 	}
 
-	// Validate the bare target as a path.Match glob, mirroring the manifest loader
-	// (enforcement.ValidateResourcePattern, called from internal/config) so a malformed
-	// target glob is rejected identically whether it arrives in a manifest or a JWT claim:
-	// the manifest layer already forbids these patterns at load, and this keeps the JWT
-	// claim path at parity rather than admitting a grant the manifest could not express.
-	// For a glob-intended target (e.g. "tool:read_[*") a malformed pattern would otherwise
-	// reach enforce time and path.Match would swallow the ErrBadPattern to a silent
-	// non-match (matchesResource), an inert deny-all surfacing only as an opaque
-	// AUTHORIZATION_FAILED. (A target whose literal string merely contains a metachar —
-	// e.g. a tool named exactly "read_[file" — could instead match via matchesResource's
-	// exact-name fast path, so such a grant is not necessarily inert; rejecting it here
-	// still fails closed and preserves manifest/JWT parity, at the cost that this unusual
-	// literal is no longer grantable from a token — the manifest cannot grant it either.)
-	// claimGlobParts owns which substring is the glob (an http(s)-resource '?query' is
-	// compared literally, so only the path before '?' is validated), shared with
-	// matchClaimBare so validation and enforcement stay in lockstep.
+	// Mirrors the manifest loader's glob validation so a malformed pattern (e.g.
+	// "tool:read_[*") is rejected here rather than reaching enforce time, where
+	// path.Match would swallow ErrBadPattern into a silent, opaque deny-all.
+	// claimGlobParts owns the glob/literal split, shared with matchClaimBare so
+	// validation and enforcement stay in lockstep.
 	globPart, _, _ := claimGlobParts(p, bare)
 	if err := enforcement.ValidateResourcePattern(globPart); err != nil {
 		return "", "", nil, fmt.Errorf("JWT capability claim %q: invalid target pattern: %w", claim, err)
 	}
 
-	// Parse the optional condition suffix.
 	if condpart != "" {
 		conds, parseErr = parseCondSuffix(condpart)
 		if parseErr != nil {
 			return "", "", nil, fmt.Errorf("JWT capability claim %q: %w", claim, parseErr)
 		}
-		// Every non-"op" condition pair becomes an AllowedValues glob at runtime
-		// (buildV2Constraint). A malformed pattern (e.g. unclosed class "[invalid")
-		// silently matches nothing, turning the grant into a deny-all that surfaces
-		// only as a misleading VALUE_NOT_PERMITTED. Validate here, as the manifest path
-		// does, so a misconfigured claim is rejected up front. ("op" pairs become
-		// AllowedOperations, not value globs, so they are exempt.)
+		// Every non-"op" pair becomes an AllowedValues glob at runtime; validate it
+		// here (as the manifest path does) so a malformed pattern is rejected up
+		// front instead of silently matching nothing (VALUE_NOT_PERMITTED).
 		for _, cp := range conds {
 			if cp.key == "op" {
-				// An "op=" pair has no explicit argument name (buildV2Constraint emits
-				// Argument: ""), so it runs in scan-all-args mode, which only supports
-				// SQL verbs — a non-SQL verb fails closed on every tools/call at
-				// evaluation time. Reject it here so the misconfiguration surfaces as a
-				// token-validation error instead of an opaque CONDITION_FAILED on every
-				// subsequent call. Non-SQL operations require the manifest form with an
-				// explicit argument naming the operation parameter.
+				// "op=" has no explicit argument name, so it runs in scan-all-args
+				// mode, which only supports SQL verbs. Reject a non-SQL verb here so
+				// the misconfiguration surfaces at validation, not as an opaque
+				// CONDITION_FAILED on every subsequent call.
 				if !isSQLVerb(cp.value) {
 					return "", "", nil, fmt.Errorf("JWT capability claim %q: op= value %q is not a recognised SQL verb; non-SQL operations require the manifest form with an explicit argument naming the operation parameter", claim, cp.value)
 				}
@@ -1767,19 +1356,10 @@ func parseV2Claim(claim string) (prefix capability.TargetType, bareName string, 
 	return p, bare, conds, nil
 }
 
-// splitV2Claim splits a v0.2 capability claim into its name part and optional raw
-// condition suffix (everything after the separating '?').
-//
-// It splits at the FIRST '?' EXCEPT for an http(s) resource claim, where '?' begins
-// the URL's query component rather than a condition list, so the whole URL is kept
-// as the name (otherwise it is truncated and the query misread as a never-satisfiable
-// condition). The exception is scoped to http(s) only — other schemes (file://, urn:)
-// and the tool/prompt/system shorthands keep '?' as the condition separator. The
-// tradeoff: an http(s) resource claim cannot also carry conditions.
-//
-// hadSep reports whether a '?' separator was present, distinguishing an
-// unconditioned claim ("tool:read_file") from a malformed trailing-'?' one
-// ("tool:read_file?", hadSep=true, condpart="") that must be rejected.
+// splitV2Claim splits a v0.2 claim at the first '?', except for an http(s) resource
+// claim, where '?' begins the URL's own query rather than a condition list — such a
+// claim cannot also carry conditions. hadSep distinguishes an unconditioned claim
+// from a malformed trailing-'?' one ("tool:read_file?", hadSep=true, condpart="").
 func splitV2Claim(claim string) (namepart, condpart string, hadSep bool) {
 	if i := strings.IndexByte(claim, '?'); i >= 0 && !isHTTPResourceClaim(claim[:i]) {
 		return claim[:i], claim[i+1:], true
@@ -1795,9 +1375,6 @@ func isHTTPResourceClaim(head string) bool {
 	if !strings.HasPrefix(head, ns) {
 		return false
 	}
-	// URI schemes are case-insensitive (RFC 3986 §3.1), so detect on a lowercased
-	// copy ("resource:HTTPS://…" still counts). Only detection is lowercased;
-	// splitV2Claim keeps the original-case namepart for manifest lookup.
 	return isHTTPResourceValue(head[len(ns):])
 }
 
@@ -1809,13 +1386,10 @@ func isHTTPResourceValue(bareName string) bool {
 	return strings.HasPrefix(v, "http://") || strings.HasPrefix(v, "https://")
 }
 
-// claimGlobParts decomposes a capability claim's bare target into the substring matched
-// as a path.Match glob and, for an http(s)-resource claim carrying a query, the literal
-// query tail. An http(s) resource's query is compared literally (there is no glob syntax
-// for a query), so there the glob is only the path before '?'; every other claim (a
-// non-resource target, a non-http resource, or a query-less one) globs its whole bare
-// name. This is the single source of the glob/literal split that parseV2Claim validates
-// and matchClaimBare enforces, so validation and enforcement cannot drift apart.
+// claimGlobParts is the single source of the glob/literal split parseV2Claim
+// validates and matchClaimBare enforces (so the two cannot drift): an http(s)
+// resource's query is compared literally, so there the glob is only the path
+// before '?'; every other claim globs its whole bare name.
 func claimGlobParts(prefix capability.TargetType, bareName string) (globPart, query string, hasQuery bool) {
 	if prefix == capability.TargetTypeResource && isHTTPResourceValue(bareName) {
 		if pPath, pQuery, pHasQuery := strings.Cut(bareName, "?"); pHasQuery {
@@ -1825,25 +1399,16 @@ func claimGlobParts(prefix capability.TargetType, bareName string) (globPart, qu
 	return bareName, "", false
 }
 
-// matchClaimBare matches a JWT capability claim's bare name (prefix stripped)
-// against a request target name with the right semantics for the namespace.
+// matchClaimBare matches a JWT capability claim's bare name against a target name.
 //
-// For http(s) resource claims the query component is only special-cased when the CLAIM
-// carries one. splitV2Claim keeps a resource URI's "?query" on the bare name, but
-// matchBare's path.Match would read a structural '?' in the claim as a single-char
-// wildcard (".../search?q=widget" matching ".../searchXq=widget"). So a query-BEARING
-// claim is split at the first '?': the path keeps glob semantics while the query is
-// compared literally (there is no glob syntax for the query), and it grants only a
-// target with that exact query. A query-LESS claim carries no '?' to misread, so it is
-// matched as one whole string via matchBare — identical to the manifest's whole-URI
-// matchesResource (matchBare IS enforcement.MatchesResource). That keeps the two paths
-// consistent: an exact query-less claim (".../export") grants only its exact URI and
-// NOT an arbitrary target query (".../export?scope=all"), closing a fail-open widening,
-// while a path-glob query-less claim (".../search/*") still absorbs a target query
-// exactly as the manifest's glob does. Every other namespace keeps plain matchBare.
+// A query-bearing http(s) resource claim would otherwise have its '?' misread by
+// matchBare's path.Match as a single-char wildcard (".../search?q=widget" matching
+// ".../searchXq=widget"), so it is split: the path keeps glob semantics, the query is
+// compared literally. A query-less claim matches as one whole string, identical to the
+// manifest's matchesResource — so an exact claim (".../export") does not also grant an
+// arbitrary target query (".../export?scope=all"), while a path-glob claim still
+// absorbs one, matching the manifest's glob behavior.
 func matchClaimBare(prefix capability.TargetType, bareName, targetName string) bool {
-	// claimGlobParts owns the glob/literal split (shared with parseV2Claim's validation),
-	// so what is globbed here is exactly what was validated at token verification.
 	globPart, claimQuery, hasQuery := claimGlobParts(prefix, bareName)
 	if hasQuery {
 		tPath, tQuery, tHasQuery := strings.Cut(targetName, "?")
@@ -1920,20 +1485,13 @@ func buildV2Constraint(prefix capability.TargetType, bareName string, conds []jw
 	return c
 }
 
-// jwtShorthandValues returns the allowed-value set for one v0.2 shorthand condition
-// value. The grammar carries every value as a percent-decoded STRING, but a tool
-// argument arrives with its native JSON type, and MatchAllowedValue treats a string
-// allowed-value as a glob that cannot match a non-string argument — so a string-only
-// value would silently deny every numeric/boolean call.
-//
-// When raw parses as a whole JSON number/boolean/null, ONLY the typed scalar is
-// returned — not the raw string too — so e.g. "?id=42" grants the numeric argument
-// 42 and does not ALSO grant a string argument "42" the claim never typed. A number
-// is kept as a json.Number holding the exact lexeme so a large integer compares
-// exactly against the argument side (which decodes with UseNumber), not rounded
-// through float64. Anything else (a bare string, a glob pattern, a JSON string or
-// container literal) keeps the raw string as-is, matching a string argument and
-// preserving glob patterns.
+// jwtShorthandValues types one v0.2 shorthand condition value: the grammar carries
+// every value as a STRING, but MatchAllowedValue treats a string allowed-value as a
+// glob that cannot match a non-string argument, so a string-only value would
+// silently deny every numeric/boolean call. When raw parses as a whole JSON
+// number/boolean/null, only the typed scalar is returned (not the raw string too),
+// with a number kept as json.Number so a large integer compares exactly rather than
+// rounding through float64. Everything else keeps the raw string, preserving globs.
 func jwtShorthandValues(raw string) []interface{} {
 	// Validate raw as a single, whole JSON value before deriving a typed scalar.
 	// json.Unmarshal (unlike Decoder.Decode) rejects trailing bytes natively, so
@@ -1979,20 +1537,12 @@ type capHead struct {
 	condpart string // raw condition suffix; "" => no conditions
 }
 
-// parseCapHeads runs the cheap phase of claim parsing — splitting off the optional
-// "?<conditions>" suffix and parsing only the namespace+bare-name head — dropping
-// malformed entries so they grant nothing (fail closed). The expensive
-// parseCondSuffix stays lazy in buildConstraintsFromParsed so a non-matching claim
-// never pays for it.
-//
-// A drop here "should not occur": ValidateToken structurally validates every claim
-// before it reaches this function. So a drop means the validator and this parser have
-// diverged (e.g. a future grammar extension landed in one but not the other), which
-// would silently grant fewer capabilities than the token encodes — fail-closed in
-// result, but invisible. Each drop is logged through jwtLogger — the same structured
-// stderr handler the rest of this package uses, so the drop is greppable and
-// correlatable in a SIEM — rather than surfacing only as unexplained
-// AUTHORIZATION_FAILED denials downstream.
+// parseCapHeads runs the cheap phase of claim parsing (split + namespace/bare-name
+// only), dropping malformed entries so they grant nothing. The expensive
+// parseCondSuffix stays lazy in buildConstraintsFromParsed. A drop here "should not
+// occur" — ValidateToken already validated every claim — so it means the validator
+// and this parser have diverged; logged via jwtLogger so it's greppable rather than
+// surfacing only as an unexplained AUTHORIZATION_FAILED downstream.
 func parseCapHeads(caps []string) []capHead {
 	heads := make([]capHead, 0, len(caps))
 	for _, claim := range caps {
@@ -2015,30 +1565,22 @@ func parseCapHeads(caps []string) []capHead {
 	return heads
 }
 
-// buildConstraintsFromClaims returns the constraint for every JWT capability claim
-// matching target, in claim order (mcp.capabilities is an OR-list). The fallback for
-// callers holding only raw claim strings; the hot path uses
-// buildConstraintsFromParsed against the cached heads.
+// buildConstraintsFromClaims is the fallback for callers holding only raw claim
+// strings; the hot path uses buildConstraintsFromParsed against cached heads.
 func buildConstraintsFromClaims(caps []string, target EnforceTarget) []capability.Constraint {
 	return buildConstraintsFromParsed(parseCapHeads(caps), target)
 }
 
-// claimNamesTargetButFailedToParse reports whether some capability claim MATCHES target
-// but contributed no constraint because its condition suffix would not parse.
-//
-// It exists so the deny message can distinguish "your token does not list this target"
-// from "your token lists it, but the claim is malformed" — two different operator actions
-// behind one identical denial. It re-walks the heads only on the deny path (the allow path
-// never reaches it) and re-parses only the suffixes of claims that match this target, which
-// is the same bounded work buildConstraintsFromParsed already did for them.
+// claimNamesTargetButFailedToParse reports whether some claim MATCHES target but
+// contributed no constraint because its condition suffix would not parse — so the
+// deny message can distinguish "not in your token" from "malformed in your token",
+// two different operator actions behind one identical denial.
 func claimNamesTargetButFailedToParse(claims *JWTClaims, target EnforceTarget) bool {
 	for _, h := range parsedCapHeads(claims) {
 		if h.prefix != target.Type || !matchClaimBare(h.prefix, h.bareName, target.Name) {
 			continue
 		}
 		if h.condpart == "" {
-			// A matching claim with no suffix always yields a constraint, so reaching here
-			// with none built at all is impossible; treat it as the ordinary case.
 			continue
 		}
 		if _, err := parseCondSuffix(h.condpart); err != nil {
@@ -2049,13 +1591,8 @@ func claimNamesTargetButFailedToParse(claims *JWTClaims, target EnforceTarget) b
 }
 
 // buildConstraintsFromParsed is the matching/condition phase shared by the hot path
-// and buildConstraintsFromClaims. The expensive parseCondSuffix runs only for claims
-// that actually match this target.
-//
-// A condition-suffix parse failure here is the same validator/parser divergence
-// parseCapHeads logs for the head phase — ValidateToken already accepted the whole
-// claim, suffix included — so it is reported the same way rather than dropped
-// silently, which would surface only as an unexplained AUTHORIZATION_FAILED.
+// and buildConstraintsFromClaims; the expensive parseCondSuffix runs only for claims
+// that actually match target.
 func buildConstraintsFromParsed(heads []capHead, target EnforceTarget) []capability.Constraint {
 	var out []capability.Constraint
 	for _, h := range heads {
@@ -2066,10 +1603,8 @@ func buildConstraintsFromParsed(heads []capHead, target EnforceTarget) []capabil
 		if h.condpart != "" {
 			c, err := parseCondSuffix(h.condpart)
 			if err != nil {
-				// A malformed suffix on a matching claim grants nothing (fail closed).
-				// Logged through jwtLogger, like its head-phase twin in parseCapHeads: the
-				// two halves report the same validator/parser divergence, so they must be
-				// greppable and correlatable the same way in a SIEM.
+				// A malformed suffix on a matching claim grants nothing (fail closed);
+				// same validator/parser divergence parseCapHeads logs for the head phase.
 				jwtLogger.Warn("JWT capability claim passed validation but its condition suffix failed to parse; dropping (this is a bug)",
 					"claim", fmt.Sprintf("%s:%s?%s", h.prefix, h.bareName, h.condpart), "reason", err.Error())
 				continue
@@ -2081,11 +1616,9 @@ func buildConstraintsFromParsed(heads []capHead, target EnforceTarget) []capabil
 	return out
 }
 
-// parsedCapHeads returns the claim heads parsed once at token validation, falling back to
-// parsing them here for a JWTClaims built directly (tests, and any caller that set
-// Capabilities without going through ValidateToken). Four paths need the same fallback —
-// the capability decision, the list filter, the malformed-claim diagnosis, and the
-// resources/unsubscribe cancel check — so it is written once rather than re-spelled at each.
+// parsedCapHeads returns the heads parsed once at token validation, falling back to
+// parsing here for a JWTClaims built directly (tests, callers bypassing
+// ValidateToken). Four call sites need the same fallback, so it is written once.
 func parsedCapHeads(claims *JWTClaims) []capHead {
 	if claims.parsedCaps != nil {
 		return claims.parsedCaps
@@ -2093,13 +1626,10 @@ func parsedCapHeads(claims *JWTClaims) []capHead {
 	return parseCapHeads(claims.Capabilities)
 }
 
-// anyCapCovers reports whether any pre-parsed claim head covers target. Conditions
-// are not consulted — a list response carries no arguments, and a cancel names only a URI —
-// so a target is retained whenever a claim matches its namespace and bare name. That
-// condition-blindness is exactly what makes it the right predicate for DecideResourceCancel,
-// which is a match-only decision by design. It takes the same []capHead the Decide path
-// caches (JWTClaims.parsedCaps) so list filtering, cancellation, and Decide share one claim
-// parser instead of maintaining a second name-only variant.
+// anyCapCovers reports whether any pre-parsed head covers target, ignoring
+// conditions — the right predicate for DecideResourceCancel's match-only decision
+// and for list filtering, since a list/cancel response carries no arguments to
+// evaluate conditions against.
 func anyCapCovers(parsed []capHead, target EnforceTarget) bool {
 	for _, c := range parsed {
 		if c.prefix == target.Type && matchClaimBare(c.prefix, c.bareName, target.Name) {
@@ -2141,28 +1671,20 @@ func anyCapCoversName(name string, targetType capability.TargetType, parsed []ca
 
 // filterList is the shared body of the three JWT ListFilterer methods.
 //
-// No JWT claims at all: fail closed like Decide's ErrCodeNoJWTClaims — empty the
-// listing without consulting the inner PDP. No mcp.capabilities field: delegate to
-// the inner PDP if present, else empty the listing.
+// No claims, or no route-audience match: fail closed to an empty listing without
+// consulting the inner PDP. No mcp.capabilities: delegate to the inner PDP if it's a
+// real backstop, else empty.
 //
-// mcp.capabilities present (intersection): run the inner PDP ONCE — it parses and
-// prunes the list and exposes the survivors pre-parsed (ListFilterResult.Entries)
-// — then apply the JWT claim filter to those entries in memory and splice the
-// result back into the inner PDP's already-ordered envelope. The response is parsed
-// once instead of twice (the inner re-parsing an emptyListing-marshaled
-// intermediate). Intersection is commutative, so the final entry set, the true
-// upstream count (inner.Upstream), and the post-filter count are identical to an
-// empty-then-inner order. emptyListing is used for the no-claims / no-capabilities
-// branches, where the listing is emptied while still reporting the upstream count.
+// mcp.capabilities present: run the inner PDP ONCE — it prunes the list and exposes
+// pre-parsed survivors (Entries) — then apply the JWT claim filter to those in memory
+// and splice back into the inner's already-ordered envelope, so the response is
+// parsed once instead of twice. Intersection is commutative, so this yields the same
+// result as filtering in the other order.
 func (p *JWTPDP) filterList(ctx context.Context, result json.RawMessage, desc listTypeDesc) ListFilterResult {
 	claims, ok := jwtClaimsFromContext(ctx)
 	if !ok {
-		// No JWT claims: mirror Decide's hard-deny by emptying the listing without
-		// deferring to the inner PDP's OUTPUT (filterList has no error channel).
 		return p.emptyListingArmingPins(ctx, result, desc)
 	}
-	// Per-route audience pin (mirrors Decide): a token minted for a different route's
-	// audience must not enumerate this route's catalog. Fail closed to an empty listing.
 	if !p.routeAudienceSatisfied(claims) {
 		return p.emptyListingArmingPins(ctx, result, desc)
 	}
@@ -2173,33 +1695,29 @@ func (p *JWTPDP) filterList(ctx context.Context, result json.RawMessage, desc li
 		return emptyListing(result, desc.key)
 	}
 	innerRes := p.innerFilter(ctx, result, desc.filter, desc.key)
-	// Reuse the claim heads parsed once at token validation (parsedCaps); fall back to
-	// parsing here for a test-built JWTClaims that set Capabilities directly. Mirrors
-	// Decide's use of parsedCaps so list filtering never re-parses on the hot path.
+	// Reuse the heads parsed once at validation, mirroring Decide, so list
+	// filtering never re-parses on the hot path.
 	parsed := parsedCapHeads(claims)
-	// The delegation chain narrows the catalog here as well as the call leg, mirroring the
-	// ManifestPDP filters. On a JWT-only or wiretap route the inner filter is a passthrough,
-	// so without this the chain bounded what a delegate could CALL while the listing still
-	// advertised everything its capability claim named — and the two catalogs a host is shown
-	// would disagree depending on which PDP happened to filter.
+	// The delegation chain narrows the catalog here too, mirroring the ManifestPDP
+	// filters — on a JWT-only/wiretap route the inner filter is a passthrough, so
+	// without this the listing would advertise more than the chain lets the
+	// delegate actually call.
 	chain := claims.Delegation
 	kept := make([]json.RawMessage, 0, len(innerRes.Entries))
 	for i, raw := range innerRes.Entries {
 		var covered bool
 		var id string
 		if i < len(innerRes.entryIDs) && innerRes.entryIDs[i] != "" {
-			// ID already decoded by inner PDP's keep func — skip re-unmarshal. An empty
-			// ID means the inner decoded none (e.g. the byClaims path), so fall back to
-			// decoding the entry rather than treating "" as the identifier.
+			// ID already decoded by the inner PDP's keep func — skip re-unmarshal.
+			// An empty ID means the inner decoded none, so fall back below.
 			id = innerRes.entryIDs[i]
 			covered = anyCapCoversName(id, desc.targetType, parsed)
 		} else {
 			id, covered = entryCoveredByClaims(raw, parsed, desc.idField, desc.targetType)
 		}
 		if covered && !chain.IsEmpty() {
-			// An entry whose id could not be decoded cannot be scoped against the chain, so
-			// it is dropped rather than admitted — the same fail-closed reading the call leg
-			// applies to an unresolvable target.
+			// An entry whose id couldn't be decoded can't be scoped against the
+			// chain, so drop rather than admit it (fail closed).
 			if id == "" {
 				covered = false
 			} else if permitted, _ := chain.PermitsTarget(string(desc.targetType) + ":" + id); !permitted {
@@ -2210,7 +1728,6 @@ func (p *JWTPDP) filterList(ctx context.Context, result json.RawMessage, desc li
 			kept = append(kept, raw)
 		}
 	}
-	// Use pre-parsed envelope when available to avoid re-parsing.
 	var (
 		out []byte
 		err error
@@ -2221,9 +1738,8 @@ func (p *JWTPDP) filterList(ctx context.Context, result json.RawMessage, desc li
 		out, err = replaceOrderedListField(innerRes.Result, desc.key, kept)
 	}
 	if err != nil {
-		// A ManifestPDP inner always emits a clean {listKey:[...]} envelope, but a
-		// passthrough inner (nil/AlwaysAllow) forwards the upstream bytes verbatim, so a
-		// malformed upstream body can land here. Fail closed to an empty listing rather
+		// A passthrough inner (nil/AlwaysAllow) forwards the upstream bytes
+		// verbatim, so a malformed upstream body can land here. Fail closed rather
 		// than forward whatever the splice could not re-emit.
 		return emptyListing(result, desc.key)
 	}
@@ -2245,9 +1761,8 @@ func (p *JWTPDP) FilterPromptsList(ctx context.Context, result json.RawMessage) 
 	return p.filterList(ctx, result, promptsDesc)
 }
 
-// HardenRefusal delegates to the inner PDP: JWTPDP holds no pin, no ceiling and no
-// directives of its own, so everything it could compose onto another layer's refusal comes
-// from what it wraps. A JWT-only route (no inner) returns the refusal unchanged.
+// HardenRefusal delegates to the inner PDP: JWTPDP holds no pin, ceiling, or
+// directives of its own. A JWT-only route returns the refusal unchanged.
 func (p *JWTPDP) HardenRefusal(ctx context.Context, sessionID string, r capability.EnforceResponse, target EnforceTarget, args map[string]interface{}) capability.EnforceResponse {
 	if p.inner == nil {
 		return r
@@ -2255,14 +1770,10 @@ func (p *JWTPDP) HardenRefusal(ctx context.Context, sessionID string, r capabili
 	return p.inner.HardenRefusal(ctx, sessionID, r, target, args)
 }
 
-// RecordObservedToolHashes delegates to the inner PDP, which holds any description-hash
-// pins — the JWT layer pins no tool descriptions of its own. A nil inner records nothing
-// but still reports an accurate entry count, so the caller need not decode result again.
-//
-// The count comes from the length-only countListEntries rather than passThroughList: the
-// caller wants a NUMBER, and passThroughList builds an ordered envelope nothing here
-// reads. AlwaysAllowPDP's twin already documents choosing countListEntries for exactly
-// this case.
+// RecordObservedToolHashes delegates to the inner PDP, which holds any
+// description-hash pins. A nil inner records nothing but still reports an accurate
+// count via countListEntries rather than passThroughList, whose envelope nothing
+// here reads.
 func (p *JWTPDP) RecordObservedToolHashes(ctx context.Context, result json.RawMessage) int {
 	if p.inner != nil {
 		return p.inner.RecordObservedToolHashes(ctx, result)
@@ -2270,10 +1781,8 @@ func (p *JWTPDP) RecordObservedToolHashes(ctx context.Context, result json.RawMe
 	return countListEntries(result, listKeyTools)
 }
 
-// ReleaseSession delegates to the inner PDP so a wrapped ManifestPDP releases the
-// session's flow-label state on teardown. The JWT wrapper holds no per-session flow
-// state of its own (claims live in the request context, not per-session), so a nil inner
-// is a no-op.
+// ReleaseSession delegates to the inner PDP so a wrapped ManifestPDP releases
+// per-session flow-label state on teardown; a nil inner is a no-op.
 func (p *JWTPDP) ReleaseSession(ctx context.Context, sessionID string) {
 	if p.inner != nil {
 		p.inner.ReleaseSession(ctx, sessionID)
@@ -2281,15 +1790,10 @@ func (p *JWTPDP) ReleaseSession(ctx context.Context, sessionID string) {
 }
 
 // CommitDeclassified delegates to the inner PDP, which owns the flow store the clear
-// applies to. The JWT layer clears no label of its own — a token can only restrict — so a
-// nil inner has nothing to commit. p == nil guards the typed-nil case for the same reason
-// ManifestPDP's does: this is reached through the transport's committer interface after the
-// upstream call has already run, where a panic is a crash with the response in hand.
-//
-// A nil inner clears nothing and says so. Reaching here with an authorizing handle means the
-// authorization came from a layer this wrapper cannot see, so reporting an empty set would
-// be indistinguishable from a clear that legitimately moved nothing — and would put an
-// ordinary allow on the tape for a declassification that will never take effect.
+// applies to — a token can only restrict, so the JWT layer clears no label of its
+// own. p == nil guards the typed-nil case, since this runs through the transport's
+// committer interface after the upstream call, where a panic is a crash with the
+// response already in hand.
 func (p *JWTPDP) CommitDeclassified(ctx context.Context, sessionID string, decl *capability.Declassification) ([]string, error) {
 	if p == nil || p.inner == nil {
 		return nil, noFlowStateErr(decl, "JWT decision point with no inner policy")
@@ -2297,11 +1801,8 @@ func (p *JWTPDP) CommitDeclassified(ctx context.Context, sessionID string, decl 
 	return p.inner.CommitDeclassified(ctx, sessionID, decl)
 }
 
-// innerFilter applies the inner PDP's list filter (selected by sel) to intersect
-// with the JWT claim filter. A nil inner passes the result through (counting its
-// entries via fieldName so the composed counts stay accurate), so the JWT claim
-// filter alone applies. (An AlwaysAllowPDP inner also passes through, via its own
-// ListFilterer methods.)
+// innerFilter intersects the inner PDP's list filter with the JWT claim filter. A
+// nil inner passes the result through (still counting entries via fieldName).
 func (p *JWTPDP) innerFilter(
 	ctx context.Context,
 	result json.RawMessage,
@@ -2315,27 +1816,12 @@ func (p *JWTPDP) innerFilter(
 }
 
 // emptyListingArmingPins is emptyListing for the two branches that reject the CALLER
-// rather than the catalog — no JWT claims, and a token minted for another route's
-// audience. The host sees the same empty listing either way; what differs is that the
-// descriptionHash pin is still armed from the bytes the upstream returned.
-//
-// Without it the pin went un-refreshed for that caller's tools/list, so a catalog the
-// upstream had already poisoned was observed by nobody. Distinct from a
-// catalog-integrity break — Decide still hard-denies the actual call — but the pin should
-// not go stale merely because the caller's token was rejected. The bytes come from the
-// UPSTREAM, not the caller, so this arms from the genuine catalog: a rejected caller
-// controls only WHEN the observation happens, never what is observed.
-//
-// It calls RecordObservedToolHashes — the contract's named method for exactly this, whose
-// whole contract is "record the pinned tools' live hashes WITHOUT filtering the catalog"
-// — rather than running the inner list filter and discarding its output. That matters for
-// more than tidiness: the filter decodes every entry and scores it against every manifest
-// constraint, so on a large catalog the discarded pass cost a rejected caller MORE than a
-// fully authorized one, on the branch whose entire purpose is cheap fail-closed rejection.
-//
-// Tools only. Pins exist for tools alone, so running the resources or prompts filter here
-// armed nothing and was pure waste. RecordObservedToolHashes self-gates on the pinned set,
-// so a manifest declaring no descriptionHash pays nothing at all.
+// rather than the catalog (no JWT claims, or wrong route audience), but still arms
+// the descriptionHash pin from the genuine upstream bytes — otherwise a rejected
+// caller's tools/list would leave a poisoned catalog unobserved by anyone. Uses
+// RecordObservedToolHashes rather than running the (discarded) inner filter, which
+// would cost a rejected caller MORE than an authorized one on this fail-closed path.
+// Tools only, since pins exist for tools alone.
 func (p *JWTPDP) emptyListingArmingPins(ctx context.Context, result json.RawMessage, desc listTypeDesc) ListFilterResult {
 	if desc.key == listKeyTools && p.innerEnforces() {
 		_ = p.inner.RecordObservedToolHashes(ctx, result)
@@ -2343,41 +1829,22 @@ func (p *JWTPDP) emptyListingArmingPins(ctx context.Context, result json.RawMess
 	return emptyListing(result, desc.key)
 }
 
-// emptyListing empties every entry of one list kind (listKey, e.g. "tools") while
-// still reporting the upstream (pre-filter) count. filterList's no-claims,
-// no-route-audience-match, and no-capabilities branches all fail closed to this:
-// none of them has any capability claim to filter by, so the correct result is
-// always "keep nothing," never a claim-based filter (that generality was dead —
-// every production call site passed a nil claim list, which anyCapCovers/
-// entryCoveredByClaims always resolves to false for).
+// emptyListing empties every entry of one list kind while still reporting the
+// upstream (pre-filter) count. filterList's no-claims, no-audience-match, and
+// no-capabilities branches all fail closed to this rather than a claim-based filter.
 func emptyListing(resultBytes json.RawMessage, listKey string) ListFilterResult {
 	return filterListResult(resultBytes, listKey, func(json.RawMessage) (bool, string) {
 		return false, ""
 	})
 }
 
-// entryCoveredByClaims reports a single list entry's identifier — the JSON field idField,
-// "name" for tools/prompts or "uri" for resources — and whether it is covered by a
-// capability claim of targetType. Conditions are not evaluated (list methods carry
-// no arguments) and it fails closed (false) on a decode error. Both id fields are
-// decoded and the requested one selected, so an entry missing idField yields the
-// empty-name target. Used by the JWT intersection's in-memory second pass
-// (filterList) to match entries against real, non-empty parsed claim heads.
-//
-// entryKeysAmbiguous is checked first and fails closed (false) on an ambiguous entry —
-// a duplicate or case-variant top-level key (e.g. "name"/"Name", "uri"/"URI") — for the
-// same reason ManifestPDP's list filters apply it: an entry Go decodes one way here can
-// render a different name/uri to a case-sensitive host, and this path (reached whenever
-// the inner PDP is nil or AlwaysAllowPDP, i.e. its result comes from an unfiltered
-// passThroughList) is the one list-filter path that had no per-entry gate at all.
-// It returns the identifier alongside the verdict because the caller needs both — the verdict
-// to keep the entry, the id to scope it against a delegation chain — and asking two functions
-// meant two duplicate-key scans and two unmarshals of the same bytes, per entry, on every
-// list. A 200-entry catalog paid that twice over for nothing; the id falls out of the decode
-// the coverage test already performs.
-//
-// An ambiguous or undecodable entry yields ("", false): no identifier to scope and nothing to
-// keep, which is the same fail-closed answer both halves gave separately.
+// entryCoveredByClaims reports one list entry's identifier (idField: "name" or
+// "uri") and whether it is covered by a claim of targetType. Conditions are not
+// evaluated (list entries carry no arguments), and it fails closed on a decode
+// error or on an ambiguous entry (entryKeysAmbiguous — a duplicate/case-variant key
+// like "name"/"Name" that Go and a case-sensitive host could decode differently).
+// Returns id alongside the verdict since the caller also needs it to scope against a
+// delegation chain, sparing a second unmarshal of the same bytes per entry.
 func entryCoveredByClaims(raw json.RawMessage, parsed []capHead, idField string, targetType capability.TargetType) (id string, covered bool) {
 	if entryKeysAmbiguous(raw) {
 		return "", false
@@ -2396,29 +1863,19 @@ func entryCoveredByClaims(raw json.RawMessage, parsed []capHead, idField string,
 	return id, anyCapCovers(parsed, EnforceTarget{Type: targetType, Name: id})
 }
 
-// sqlVerbs is the set of SQL statement verbs the op= scan-all-args evaluator
-// recognizes. A token granting op=<X> permits a call only if some argument begins
-// with X; any other argument whose first word is one of these verbs but is NOT the
-// granted op is a hard denial — this stops a dangerous statement (COPY ... TO
-// PROGRAM) riding along behind a benign SELECT. It aims to cover dangerous
-// DML/DDL/DCL/admin verbs comprehensively, omitting read-CTE prefixes (WITH, EXPLAIN,
-// …) that legitimately lead a read query.
+// sqlVerbs is the set the op= scan-all-args evaluator recognizes. A token granting
+// op=<X> permits a call only if some argument begins with X; any argument whose
+// first word is a DIFFERENT verb in this set is a hard denial, stopping a dangerous
+// statement (COPY ... TO PROGRAM) riding along behind a benign SELECT.
 //
-// Best-effort first-word matching: it does NOT parse SQL, so stacked or CTE-wrapped
-// mutations escape it. For hard enforcement use a least-privilege database role (see
-// examples/policies/postgres.yaml).
+// Best-effort first-word matching only — it does NOT parse SQL, so stacked or
+// CTE-wrapped mutations escape it; pair with a least-privilege database role.
 //
-// The set intentionally reaches past query openers into session/admin verbs that are
-// not DML — SET, RESET, USE, and the MySQL-specific KILL and HANDLER — because in
-// scan-all-args mode (op= shorthand, empty Argument) the first word of EVERY string
-// argument is checked, and any of these appearing outside the granted op is a hard
-// deny. The trade-off is deliberate but operator-visible: a legitimate call that
-// passes a session-config string such as "SET search_path TO public" in some argument
-// is denied with OPERATION_NOT_PERMITTED unless that verb is the granted op. An
-// operator who needs to allow such verbs alongside a query should use the manifest
-// form (Pattern C) with an explicit argument: naming the operation parameter, which
-// scopes the check to that one argument instead of scanning all of them. The set
-// stays conservative by design: it denies unrecognized verbs, never widens a grant.
+// Deliberately includes non-DML session/admin verbs (SET, RESET, USE, KILL,
+// HANDLER): since scan-all-args checks every string argument's first word, a
+// legitimate "SET search_path TO public" elsewhere in the call is denied unless SET
+// is the granted op. An operator needing that should use the manifest form (Pattern
+// C) naming the operation argument instead, scoping the check to just that argument.
 var sqlVerbs = map[string]bool{
 	// DML
 	"SELECT": true, "INSERT": true, "UPDATE": true, "DELETE": true,
@@ -2452,15 +1909,11 @@ func isSQLVerb(s string) bool {
 // deeply nested payload would exhaust the goroutine stack and crash the proxy.
 const maxArgStringDepth = 64
 
-// collectArgStrings appends every string scalar reachable from v — including those
-// nested inside objects and arrays — to out. The scan-all allowedOperations path
-// inspects the first word of each, so a SQL verb hidden in a nested object or array
-// value is caught rather than skipped. Maps are visited in sorted-key order and
-// slices in index order so the result (and therefore any matched operation or
-// denial message) is deterministic regardless of Go's randomized map iteration.
-//
-// It returns false (fail closed) if the argument nesting exceeds maxArgStringDepth,
-// so the caller denies rather than recursing without bound.
+// collectArgStrings appends every string scalar reachable from v, including those
+// nested in objects/arrays, so a SQL verb hidden in a nested value is caught. Maps
+// are visited in sorted-key order (slices in index order) so the result is
+// deterministic despite Go's randomized map iteration. Returns false (fail closed)
+// if nesting exceeds maxArgStringDepth.
 func collectArgStrings(v interface{}, out *[]string) bool {
 	return collectArgStringsDepth(v, out, 0)
 }
@@ -2493,29 +1946,23 @@ func collectArgStringsDepth(v interface{}, out *[]string, depth int) bool {
 	return true
 }
 
-// evaluateJWTConditions checks JWT-derived conditions against the call the request
-// describes. Returns a non-nil denial response if any condition fails.
+// evaluateJWTConditions checks JWT-derived conditions against the call req
+// describes, returning a non-nil denial if any fails.
 //
-// req is the whole call, not a pair of maps: its Claims carry the caller's flat
-// input.claims — the same map the manifest path threads into the engine, so a `${task.*}`
-// reference an issuer wrote into a capability claim resolves here exactly as it does there
-// — and its Arguments the values the conditions match against. Handing this the arguments
-// but not the identity is what once let a grant carrying a recognized reference match
-// nothing and deny every call under it. See jwtClaimEnforceRequest for which of the
-// remaining fields are populated and which are deliberately zero.
+// req.Claims carries the caller's flat input.claims (the same map the manifest path
+// threads into the engine) so a `${task.*}` reference in a capability claim resolves
+// here exactly as it does there — without it, such a grant matched nothing and
+// denied every call under it. See jwtClaimEnforceRequest for the rest.
 //
-// eval is the PDP whose condition semantics this deployment enforces — the inner PDP when
-// one is wired. It is a parameter, and reached rather than assumed, because
-// enforcement.WithConditionHandler can replace what a condition TYPE means for an
-// embedder's engine: calling the package-level built-in here would enforce the override on
-// the manifest path and the shipped predicate on this one, for the same condition on the
-// same call. nil means there is no wrapped PDP at all (a JWT-only route), where the
-// built-ins are the semantics because there is no engine to have overridden them.
+// eval is a parameter rather than assumed, because enforcement.WithConditionHandler
+// can replace a condition TYPE's meaning for an embedder's engine: calling the
+// built-in directly here would enforce the override on the manifest path and the
+// shipped predicate here, for the same condition on the same call. nil means a
+// JWT-only route with no engine, where the built-ins ARE the semantics.
 func evaluateJWTConditions(ctx context.Context, clock enforcement.Clock, eval claimConditionEvaluator, conditions []capability.Condition, req *capability.EnforceRequest) *capability.EnforceResponse {
 	if req == nil {
-		// Unreachable from Decide, which always builds one — but this is the JWT path's
-		// whole condition evaluator, and a nil request must DENY rather than read as a
-		// grant whose conditions all passed.
+		// Unreachable from Decide (which always builds one), but a nil request must
+		// DENY rather than read as a grant whose conditions all passed.
 		resp := denyResponse(clock, capability.ErrCodeConditionFailed, "",
 			"JWT capability-claim conditions were evaluated with no request to check against; deny (fail closed)")
 		return &resp
@@ -2524,22 +1971,14 @@ func evaluateJWTConditions(ctx context.Context, clock enforcement.Clock, eval cl
 	for _, cond := range conditions {
 		switch c := cond.(type) {
 		case capability.AllowedOperationsCondition:
-			// The one arm that cannot be dispatched through the deciding PDP's own handler.
-			// Everything below is a DIFFERENT predicate from the engine's: the claim grammar
-			// cannot name the operation argument, so this scans every argument while the
-			// engine's handler hard-denies exactly that empty argument. That divergence is
-			// deliberate and documented — and sound only while both sides are the semantics
-			// this build ships. An embedder who redefined allowedOperations
-			// (enforcement.WithConditionHandler) would otherwise get the replacement enforced
-			// on the manifest path and the shipped predicate here, for the same condition type
-			// on the same call: nothing fails, nothing logs, and the two verdicts are each
-			// internally consistent and only wrong together.
-			//
-			// Routing this arm through the override is not the fix (it would deny every `op=`
-			// grant in existence, since the engine's handler refuses the argument-less form),
-			// so the honest answer is to refuse the GRANT. Startup refuses the wiring outright
-			// — see transport.WrapRoutesWithJWT — and this is the backstop for a JWTPDP built
-			// directly, where no startup check ran.
+			// The one arm that cannot dispatch through the deciding PDP's own handler:
+			// the claim grammar cannot name the operation argument, so this always
+			// scans every argument, while the engine's handler hard-denies exactly
+			// that empty-argument form. Sound only while both sides are this build's
+			// shipped semantics — an embedder who redefines allowedOperations would
+			// otherwise get silently divergent verdicts on the manifest vs. claim
+			// path. Startup refuses that wiring outright (WrapRoutesWithJWT); this is
+			// the backstop for a JWTPDP built directly.
 			if claimConditionOverridden(eval, capability.ConditionTypeAllowedOperations) {
 				resp := denyResponseWithDetails(clock, capability.ErrCodeConditionFailed, capability.ConditionTypeAllowedOperations,
 					fmt.Sprintf("%q: the deciding policy redefines %s, and this capability claim's argument-less op= form cannot be judged by that handler; deny (fail closed) — grant the operation through a manifest constraint that names the operation argument instead",
@@ -2548,29 +1987,20 @@ func evaluateJWTConditions(ctx context.Context, clock enforcement.Clock, eval cl
 				return &resp
 			}
 			if c.Argument != "" {
-				// Intentional fail-closed guard, NOT dead code: this capability-claim grammar
-				// has no way to name the operation argument (buildV2Constraint always emits
-				// Argument: "" for an "op=" pair), so a validated claim never reaches here. A
-				// named argument can only appear on a programmatically built constraint. Keep
-				// the guard rather than let it fall to the scan-all-args else branch below: a
-				// named argument means "match THIS argument", and scanning all args instead
-				// would silently match an alternative — the "never silently match alternatives"
-				// invariant. Fail closed rather than re-implement the engine's per-argument
-				// taxonomy for this claim-unreachable form. It RETURNS, so the scan-all-args
-				// body below follows at this level rather than sitting in an else — one
-				// gratuitous nesting level off the longest, most security-sensitive stretch
-				// in this function.
+				// Fail-closed guard, not dead code: buildV2Constraint always emits
+				// Argument: "" for an op= pair, so a validated claim never reaches
+				// here — only a programmatically built constraint could. Kept rather
+				// than falling to scan-all-args below, since a named argument means
+				// "match THIS one" and scanning all would silently match an
+				// alternative (the "never silently match alternatives" invariant).
 				resp := denyResponseWithDetails(clock, capability.ErrCodeConditionFailed, capability.ConditionTypeAllowedOperations,
 					fmt.Sprintf("%q: allowedOperations with a named argument is not supported from a capability claim", name),
 					map[string]interface{}{"argument": c.Argument, "allowedOperations": c.Operations})
 				return &resp
 			}
-			// Scan-all-args mode: the first word of each string argument is checked
-			// against the permitted set. This is sound only for SQL ops, where the
-			// isSQLVerb hard-deny below catches a disallowed statement smuggled into
-			// any argument. For a non-SQL op there is no "disallowed verbs" set, so
-			// fail closed and require the manifest form (Pattern C) that names the
-			// operation argument.
+			// Sound only for SQL ops, where the isSQLVerb hard-deny below catches a
+			// disallowed statement smuggled into any argument; a non-SQL op has no
+			// "disallowed verbs" set to check against, so fail closed instead.
 			for _, op := range c.Operations {
 				if !isSQLVerb(op) {
 					resp := denyResponseWithDetails(clock, capability.ErrCodeConditionFailed, capability.ConditionTypeAllowedOperations,
@@ -2579,23 +2009,16 @@ func evaluateJWTConditions(ctx context.Context, clock enforcement.Clock, eval cl
 					return &resp
 				}
 			}
-			// All granted ops are SQL verbs: scan ALL arguments (do not break on the
-			// first match) and deny if any argument's first word is a SQL verb
-			// outside the allowed set. This closes the multi-argument bypass (e.g.
-			// op=SELECT granted, but {"sql":"DROP TABLE x","note":"SELECT 1"}).
+			// Scan ALL arguments (not just until the first match) and deny if any
+			// argument's first word is a SQL verb outside the allowed set — closes
+			// the multi-argument bypass (op=SELECT granted, but
+			// {"sql":"DROP TABLE x","note":"SELECT 1"}).
 			var matchedOp string
-			// Scan every string scalar reachable from the arguments, including those
-			// nested inside objects and arrays: a SQL verb smuggled into a nested
-			// value (e.g. {"query":{"sql":"DROP TABLE x"}}) would otherwise be skipped,
-			// letting a disallowed statement through while a benign sibling string
-			// matched a permitted op. collectArgStrings walks maps in sorted-key order
-			// and slices in index order, so matchedOp and any denial message stay
-			// deterministic (independent of Go's randomized map iteration).
+			// collectArgStrings walks nested objects/arrays too, so a verb smuggled
+			// into e.g. {"query":{"sql":"DROP TABLE x"}} isn't skipped; sorted-key
+			// order keeps the result deterministic despite map iteration order.
 			var argStrings []string
 			if !collectArgStrings(args, &argStrings) {
-				// Argument nesting exceeded the depth bound; fail closed rather
-				// than risk stack exhaustion or an incomplete (and therefore
-				// unsound) scan.
 				resp := denyResponseWithDetails(clock, capability.ErrCodeConditionFailed, capability.ConditionTypeAllowedOperations,
 					fmt.Sprintf("%q: arguments nested too deeply to scan for operations", name),
 					map[string]interface{}{"maxDepth": maxArgStringDepth, "allowedOperations": c.Operations})
@@ -2610,52 +2033,39 @@ func evaluateJWTConditions(ctx context.Context, clock enforcement.Clock, eval cl
 					matchedOp = word
 					continue
 				}
-				// A disallowed SQL statement in any argument is a hard denial.
 				if isSQLVerb(word) {
-					// The SAME details the engine's handleAllowedOperations records for this exact
-					// code, so a SIEM rule keyed on the manifest path's denial finds a token-scoped
-					// caller too — the parity allowedValues just got, on the other arm of the same
-					// function. This path cannot share the engine's HANDLER (its scan-all-arguments
-					// semantics are deliberately different, and the engine hard-denies the empty
-					// argument this claim grammar always emits), but it can share the record shape.
+					// Same detail shape as the engine's handleAllowedOperations for
+					// this code, so a SIEM rule keyed on the manifest path's denial
+					// also catches a token-scoped caller.
 					resp := denyResponseWithDetails(clock, capability.ErrCodeOperationNotPermitted, capability.ConditionTypeAllowedOperations,
 						fmt.Sprintf("%q: operation %q is not in the permitted set %v", name, word, c.Operations),
 						map[string]interface{}{"operation": word, "allowedOperations": c.Operations})
 					return &resp
 				}
 			}
-			// matchedOp is non-empty only if some argument matched a permitted
-			// operation, so the only failure left is "no argument matched any".
 			if matchedOp == "" {
-				// No "argument" key here, unlike the engine's MISSING_CONTEXT for this condition:
-				// that one names the argument the manifest declared, and this path has none — the
-				// claim grammar cannot express one, which is why it scans every argument. Naming a
-				// phantom argument would send an operator looking for a field that does not exist.
+				// No "argument" key, unlike the engine's MISSING_CONTEXT for this
+				// condition: the claim grammar can't name one, which is why every
+				// argument is scanned — naming a phantom field would mislead.
 				resp := denyResponseWithDetails(clock, capability.ErrCodeMissingContext, capability.ConditionTypeAllowedOperations,
 					fmt.Sprintf("%q: no matching operation found in arguments", name),
 					map[string]interface{}{"allowedOperations": c.Operations})
 				return &resp
 			}
 		case capability.AllowedValuesCondition:
-			// The engine's own predicate, NOT a copy of it. This arm used to re-implement
-			// handleAllowedValues line for line — ResolveArgument, the MISSING_CONTEXT arm,
-			// MatchAllowedValue, the VALUE_NOT_PERMITTED arm — and the copy had already
-			// drifted twice: it never gained the empty-argument guard, it never carried the
-			// structured details, and before MatchAllowedValue absorbed task-variable
-			// resolution a grant carrying a "${task.*}" reference matched nothing and denied
-			// every call under it. Calling the shared evaluator makes the next semantic added
-			// there reach this path by construction.
+			// Calls the engine's own predicate rather than a copy: a prior
+			// hand-written copy drifted twice (missing the empty-argument guard,
+			// and denying every call under a "${task.*}" grant before
+			// MatchAllowedValue absorbed task-variable resolution).
 			//
-			// It commits nothing, which is what makes it usable here: this runs BEFORE the
-			// inner PDP's own decision, so an evaluator that consumed a window slot or wrote a
-			// flow label would double-count against the manifest path that follows.
+			// Commits nothing — it runs BEFORE the inner PDP's own decision, so an
+			// evaluator that consumed a quota or wrote a flow label would
+			// double-count against the manifest path that follows.
 			//
-			// It is reached through the DECIDING PDP rather than called directly, because a
-			// shared function closes copy-drift and not handler overriding: an embedder who
-			// redefined allowedValues via WithConditionHandler had it enforced on the
-			// manifest path and silently not on this one. The seam refuses (ok=false) a type
-			// it cannot evaluate without committing, which is the one case where running the
-			// override here would be worse than not having it.
+			// Reached through the DECIDING PDP, not called directly, so an embedder's
+			// WithConditionHandler override for allowedValues applies here too
+			// instead of silently only on the manifest path. The seam refuses
+			// (ok=false) a type it cannot evaluate without committing.
 			cerr, ok := claimConditionVerdict(eval, ctx, c, req)
 			if !ok {
 				resp := denyResponseWithDetails(clock, capability.ErrCodeConditionFailed, c.ConditionType(),

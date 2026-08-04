@@ -15,160 +15,106 @@ import (
 	"github.com/eunolabs/eunox/pkg/capability"
 )
 
-// A condition denial's Details map is the one place caller-controlled bytes cross
-// from a rejected request into the HMAC-signed OCSF tape. Handlers echo the value
-// that failed the check — the argument that missed the allowlist, the path whose
-// extension was refused — because that is what makes a deny actionable to the
-// operator reading it back. Nothing upstream bounds a tool-call argument before the
-// condition check runs, so verbatim echoes made every denied call a kilobyte-per-byte
-// lever on signed-log growth: an agent that can trigger a condition denial with a
-// large argument inflates the tape at whatever rate it can issue calls. This is the
-// same amplifier the transport layer closed for the rejected Origin header and the
-// loopback endpoints' path (boundedRefusalDetail / maxRefusalDetailLen), reachable
-// post-auth through an argument instead of pre-auth through a header.
+// A condition denial's Details map is the one place caller-controlled bytes cross from a
+// rejected request into the HMAC-signed OCSF tape: handlers echo the failing value so a deny
+// is actionable, but nothing upstream bounds a tool-call argument, so an unbounded echo made
+// every denied call a kilobyte-per-byte lever on signed-log growth — the same amplifier closed
+// pre-auth for the Origin header and loopback paths, reachable here post-auth via an argument.
 //
-// The bound lives at the single funnel every deny passes through (denyResponse)
-// rather than at each handler's Details literal, so a handler added later inherits it
-// by construction — the property that keeps 20-odd sites from drifting out of sync,
-// and the reason the transport side centralized its source_ip stamping instead of
-// asking eight call sites to remember.
+// The bound lives at denyResponse, the single funnel every deny passes through, so a handler
+// added later inherits it by construction instead of one of 20-odd sites forgetting to call it.
 //
-// It is deliberately NOT a substitute for the audit sink's own caps
-// (auditDetailValueCap / auditDetailsTotalCap). Those exist to keep any record —
-// including an audit-mode ALLOW, which carries full arguments on purpose — under the
-// scanner buffer the chain resume depends on. These are far tighter because a DENY's
-// details are a diagnostic echo, not the record of what was actually forwarded.
+// Not a substitute for the audit sink's own caps (auditDetailValueCap/auditDetailsTotalCap),
+// which are far looser: those guard any record including a full-argument audit-mode ALLOW,
+// while these guard a DENY's diagnostic echo.
 const (
-	// maxDenialDetailStringLen bounds one string value inside a denial's details.
-	// 512 bytes matches the transport's maxRefusalDetailLen for the same reason: no
-	// legitimate echoed value — an argument, a file path, a resource URI, an operation
-	// verb — approaches it, while the truncation marker keeps the cut visible to a
-	// reader rather than silently presenting a prefix as the whole value.
+	// maxDenialDetailStringLen bounds one string value inside a denial's details. 512 matches
+	// the transport's maxRefusalDetailLen — no legitimate echoed value approaches it.
 	maxDenialDetailStringLen = 512
 
-	// maxDenialDetailsBytes bounds the WHOLE map. A per-string cap alone bounds a
-	// handler that echoes one argument; it does not bound EvaluateAllowedValues echoing
-	// an argument that decoded to a large object or a 100k-element array, where each
-	// element is individually tiny — or, worse, an array of EMPTY containers, which
-	// carry no strings and no scalars at all. Every key, every scalar AND every
-	// container the walk visits is charged (see denialDetailContainerCost), so the
-	// marshaled details of a deny cannot exceed a few KiB whatever shape the caller
-	// sent.
+	// maxDenialDetailsBytes bounds the WHOLE map. A per-string cap alone doesn't bound a
+	// handler echoing a huge array of individually-tiny (or empty) elements — every key,
+	// scalar, and container the walk visits is charged (see denialDetailContainerCost), so
+	// the total stays a few KiB whatever shape the caller sent.
 	maxDenialDetailsBytes = 8 << 10 // 8 KiB
 
-	// maxDenialDetailDepth bounds nesting independently of the byte budget. Eight
-	// levels is past any real tool argument worth echoing.
+	// maxDenialDetailDepth bounds nesting independently of the byte budget; eight levels is
+	// past any real tool argument worth echoing.
 	maxDenialDetailDepth = 8
 
-	// minDenialDetailKeyBudget is the floor on the per-key share below. It bounds how
-	// far the whole map can overshoot maxDenialDetailsBytes when a handler records an
-	// unusual number of keys (share x keys), and no handler in the tree records more
-	// than five.
+	// minDenialDetailKeyBudget floors the per-key share below, bounding how far the whole map
+	// can overshoot maxDenialDetailsBytes when a handler records an unusual number of keys.
 	minDenialDetailKeyBudget = 512
 )
 
-// denialDetailContainerCost is what one map or slice charges against the byte budget,
-// counted before its contents. Without it an EMPTY container was free: the map arm
-// charges per key and the slice arm per element, so `[{},{},{}…]` and `[[],[],[]…]`
-// carried a full copy of a caller-sized structure into a "bounded" result — measured
-// at 600 KB against an 8 KiB budget, which then tripped the audit sink's coarse 1 MiB
-// cap and replaced the WHOLE details map with a marker, destroying the diagnostic
-// content this walk exists to preserve. The value approximates a container's marshaled
-// punctuation; what matters is that it is non-zero, so breadth is bounded like depth.
+// denialDetailContainerCost is what one map or slice charges before its contents. Without it
+// an EMPTY container was free — `[{},{},{}…]` carried a full caller-sized structure through a
+// "bounded" result, measured at 600 KB against an 8 KiB budget, tripping the audit sink's
+// coarse cap and replacing the whole details map with a marker.
 const denialDetailContainerCost = 8
 
-// denialDetailScalarCost is what one non-string scalar charges: roughly its marshaled
-// width, so an array of a million booleans is elided on the same budget a long string
-// is rather than passing through free.
+// denialDetailScalarCost is what one non-string scalar charges, so an array of a million
+// booleans is bounded like a long string rather than passing through free.
 const denialDetailScalarCost = 8
 
-// DenialDetailElided replaces a value dropped for exceeding the byte budget or
-// maxDenialDetailDepth. A marker rather than an omitted key: a reader must be able to
-// tell "this handler recorded nothing here" from "this was recorded and then cut",
-// and a SIEM rule can match the marker to spot a caller probing the bound.
+// DenialDetailElided replaces a value dropped for exceeding the byte budget or depth — a
+// marker rather than an omission, so a reader (or SIEM rule) can tell "recorded nothing" from
+// "cut".
 const DenialDetailElided = "[eunox: elided]"
 
-// DenialDetailElidedKey names the marker entry boundDetailMap adds when a key's share
-// ran out partway through an object. The underscore prefix follows the audit package's
-// reserved-key convention — but the convention alone is not a guarantee, because a
-// caller-supplied argument key is just a string and nothing rejects this spelling. A
-// caller planting it would forge elision provenance on the signed tape, making the
-// detector forgeable by the party it exists to detect (and, planted on every call,
-// noise that buries genuine elisions). escapeReservedDetailKey is what closes that,
-// mirroring the collision guard internal/transport/dispatch.go applies to its own
-// reserved key.
+// DenialDetailElidedKey names the marker entry boundDetailMap adds when a key's share runs
+// out mid-object. The reserved-key convention alone doesn't stop a caller planting this exact
+// string to forge elision provenance; escapeReservedDetailKey closes that by re-spelling a
+// colliding caller key, mirroring internal/transport/dispatch.go's own collision guard.
 const DenialDetailElidedKey = "_eunox_elided"
 
-// denialDetailForgedKeyPrefix re-spells a caller key that collides with the reserved
-// marker. The result is still visible to a reader — nothing is dropped — but it can no
-// longer be mistaken for a marker eunox wrote.
+// denialDetailForgedKeyPrefix re-spells a caller key colliding with the reserved marker so it
+// can't be mistaken for one eunox wrote.
 const denialDetailForgedKeyPrefix = "_eunox_caller_"
 
-// denialDetailSliceElidedRe matches the marker boundDetailSlice appends in place of
-// the slice elements it drops: "[eunox: N elements elided]" when the whole slice was
-// already over budget before any element ("[eunox: %d elements elided]", len(in)),
-// "[eunox: N of M elements elided]" when only the tail was ("[eunox: %d of %d
-// elements elided]", len(in)-i, len(in)). IsDenialDetailSliceElided recognizes both
-// spellings as one marker family rather than the caller needing to know there are two.
+// denialDetailSliceElidedRe matches the two marker spellings boundDetailSlice appends for a
+// fully- vs. partially-elided slice, so IsDenialDetailSliceElided recognizes both as one
+// family.
 var denialDetailSliceElidedRe = regexp.MustCompile(`^\[eunox: \d+( of \d+)? elements elided\]$`)
 
-// IsDenialDetailElided reports whether s is exactly DenialDetailElided, the marker
-// boundDetailValue substitutes for a scalar value dropped for exceeding the byte
-// budget or maxDenialDetailDepth.
+// IsDenialDetailElided reports whether s is exactly DenialDetailElided.
 //
-// Exported alongside the marker (like DenialDetailElided/DenialDetailElidedKey
-// themselves) so a consumer mining a denial's Details for real caller-supplied
-// values — cmd/eunox's suggest miner is the only one today — can recognize this
-// layer's elision placeholder instead of mining it as a literal value no caller ever
-// sent. Mirrors internal/audit.IsOverCapValuePlaceholder, which exists so the same
-// miner does not mistake THAT layer's differently-shaped truncation convention for a
-// literal value either; producer and detector living apart (as these three markers
-// did before this) is exactly how a miner drifts out of sync with what it mines.
+// Exported alongside the marker so a consumer mining a denial's Details for real values
+// (cmd/eunox's suggest miner) can recognize this layer's placeholder rather than mining it as
+// literal caller data. Mirrors internal/audit.IsOverCapValuePlaceholder for that layer's own
+// truncation marker.
 func IsDenialDetailElided(s string) bool {
 	return s == DenialDetailElided
 }
 
-// IsDenialDetailSliceElided reports whether s is exactly one of the markers
-// boundDetailSlice substitutes for one or more slice elements dropped for exceeding
-// the byte budget. See IsDenialDetailElided.
+// IsDenialDetailSliceElided reports whether s is one of the markers boundDetailSlice
+// substitutes for dropped slice elements. See IsDenialDetailElided.
 func IsDenialDetailSliceElided(s string) bool {
 	return denialDetailSliceElidedRe.MatchString(s)
 }
 
-// BoundDenialDetails returns a bounded deep copy of a denial's details map, or nil
-// when there is nothing to bound.
+// BoundDenialDetails returns a bounded deep copy of a denial's details map, or nil.
 //
-// Deep copy, not in-place: the maps and slices a handler puts in Details routinely
-// alias live structures — the matched constraint's allowedValues slice, the decoded
-// request arguments — and both are read concurrently by other in-flight decisions.
-// Truncating in place would mutate the loaded manifest.
+// Deep copy, not in-place: a handler's Details routinely aliases live structures (the matched
+// constraint's allowedValues, decoded request arguments) read concurrently by other
+// decisions — truncating in place would mutate the loaded manifest.
 //
-// The budget is divided into a per-key SHARE rather than spent first-come. Keys were
-// walked in sorted order against one shared budget, and every handler's policy-list
-// key (allowedValues, allowedExtensions, allowedCIDRs, …) sorts before its evidence
-// keys (argument, value, filePath, …) — so an ordinary manifest with a few hundred
-// allowed values consumed the whole budget and elided the denied argument NAME and
-// VALUE, the two fields the bound exists to preserve. (The transport also reads
-// Details["argument"] to build the host-facing error message.) An equal share per key
-// cannot starve one key with another, needs no hand-maintained list of which keys are
-// "important", and stays deterministic.
-// It is EXPORTED, with no unexported twin, for the reason capability.BoundString is: the
-// layer above evaluates a shared predicate (EvaluateAllowedValues) and assembles its own
-// EnforceResponse rather than going through denyResponse, so without a reachable bound it
-// would produce the one denial on the tape exempt from the cap the other twenty-odd inherit
-// by construction. Those are the engine's own denial details, just assembled one layer up.
-// Its one external caller routes every deny it builds through a single funnel, so the
-// "remember to call this" surface is one function rather than one call site per denial.
+// The budget is a per-key SHARE, not first-come: keys walked in sorted order against one
+// shared budget meant a manifest with a few hundred allowedValues consumed the whole budget
+// and elided the denied argument's name and value — the two fields the bound exists to
+// preserve.
 //
-// NOT idempotent, and it must not be applied twice: boundDetailMap WRITES DenialDetailElidedKey
-// for an elided entry, and escapeReservedDetailKey re-spells that same key when it appears on
-// INPUT — so a second pass rewrites eunox's own elision marker into the caller-forgery spelling
-// and the tape reads as though a client planted it. Bound once, at the funnel.
+// Exported with no unexported twin because EvaluateAllowedValues assembles its own
+// EnforceResponse one layer up rather than going through denyResponse, so it needs a reachable
+// bound of its own; its one caller routes every deny through a single funnel.
+//
+// NOT idempotent: boundDetailMap writes DenialDetailElidedKey for an elided entry, and
+// applying this twice would re-spell eunox's own marker as caller forgery. Bound once, at the
+// funnel.
 func BoundDenialDetails(in map[string]interface{}) map[string]interface{} {
 	if len(in) == 0 {
-		// Preserve nil-vs-empty: a nil details map is omitted from the audit record
-		// entirely, and an empty non-nil one marshals to {}. Handlers rely on the
-		// former for denials that carry no structured context.
+		// Preserve nil-vs-empty: a nil map is omitted from the audit record, {} marshals for
+		// an empty non-nil one, and handlers rely on the former for denials with no context.
 		return in
 	}
 	share := maxDenialDetailsBytes / len(in)
@@ -184,8 +130,8 @@ func BoundDenialDetails(in map[string]interface{}) map[string]interface{} {
 	return out
 }
 
-// escapeReservedDetailKey re-spells a caller key that collides with the reserved
-// elision marker, so a marker on a record always means eunox elided something.
+// escapeReservedDetailKey re-spells a caller key colliding with the reserved elision marker,
+// so a marker on a record always means eunox elided something.
 func escapeReservedDetailKey(k string) string {
 	if k == DenialDetailElidedKey {
 		return denialDetailForgedKeyPrefix + k
@@ -193,8 +139,8 @@ func escapeReservedDetailKey(k string) string {
 	return k
 }
 
-// boundDetailMap bounds one object level against the caller's remaining budget,
-// charging every key and recursing for every value.
+// boundDetailMap bounds one object level against the caller's remaining budget, charging
+// every key and recursing for every value.
 func boundDetailMap(in map[string]interface{}, budget *int, depth int) map[string]interface{} {
 	*budget -= denialDetailContainerCost
 	if *budget < 0 {
@@ -204,18 +150,14 @@ func boundDetailMap(in map[string]interface{}, budget *int, depth int) map[strin
 	for k := range in {
 		keys = append(keys, k)
 		if len(keys) == cap(keys) {
-			// Stop collecting once the remaining budget provably cannot admit another
-			// entry. Sizing the slice — and the sort below — from len(in) meant a 4 MiB
-			// argument allocated tens of MiB and ordered a few hundred thousand keys to
-			// produce a few KiB of output, per denied request, on a path an attacker
-			// triggers at will.
+			// Stop once the remaining budget provably can't admit another entry — sizing from
+			// len(in) meant a 4 MiB argument allocated tens of MiB to sort a few hundred
+			// thousand keys for a few KiB of output, on a path an attacker triggers at will.
 			break
 		}
 	}
-	// Sorted so that WHICH entries survive an exhausted budget is deterministic: Go's
-	// randomized map iteration would otherwise make two identical denied calls write
-	// different records, which an operator (and a diffing SIEM rule) reads as a
-	// difference in the requests.
+	// Sorted so which entries survive an exhausted budget is deterministic — Go's randomized
+	// map iteration would otherwise make two identical denied calls write different records.
 	sort.Strings(keys)
 
 	out := make(map[string]interface{}, len(keys))
@@ -223,8 +165,8 @@ func boundDetailMap(in map[string]interface{}, budget *int, depth int) map[strin
 		bk := escapeReservedDetailKey(boundDetailString(k))
 		*budget -= len(bk)
 		if *budget < 0 {
-			// Budget exhausted mid-map. ONE marker naming the elision, not one per
-			// dropped key — a per-key marker would itself be proportional to the input.
+			// ONE marker naming the elision, not one per dropped key — a per-key marker would
+			// itself be proportional to the input.
 			out[DenialDetailElidedKey] = fmt.Sprintf("%d of %d entries elided", len(in)-i, len(in))
 			return out
 		}
@@ -236,10 +178,8 @@ func boundDetailMap(in map[string]interface{}, budget *int, depth int) map[strin
 	return out
 }
 
-// boundedPrealloc caps a make() hint (and the iteration that fills it) taken from
-// untrusted input at what the remaining budget could possibly admit. Two bytes is below
-// the smallest thing that can be charged — a one-character key plus its value — so the
-// cap can never be smaller than what actually fits.
+// boundedPrealloc caps a make() hint (and the fill loop) from untrusted input at what the
+// remaining budget could admit.
 func boundedPrealloc(n, budget int) int {
 	if budget < 0 {
 		budget = 0
@@ -263,22 +203,18 @@ func boundDetailValue(v interface{}, budget *int, depth int) interface{} {
 		}
 		return b
 	case json.Number:
-		// A json.Number is a string underneath, and the JSON grammar puts no ceiling on
-		// a numeric literal's digit count — the stack preserves them undecoded for exact
-		// comparison, so an arbitrarily long one reaches here intact. Bound it like any
-		// other string, but keep the json.Number type so a consumer that type-switches on
-		// it still sees a number.
+		// A json.Number is a string underneath with no ceiling on digit count, so an
+		// arbitrarily long literal reaches here intact; bound it like a string but keep the
+		// json.Number type.
 		b, ok := chargeBoundedString(string(t), budget)
 		if !ok {
 			return DenialDetailElided
 		}
 		return json.Number(b)
 	case []byte:
-		// Modelled explicitly rather than left to the default arm: a []byte is neither
-		// fixed-width nor immutable, so passing it through would exempt it from the
-		// budget, the deep copy AND the UTF-8 normalization. It is reachable from a
-		// custom ConditionHandler or an external PolicyEvaluator — the same surface that
-		// motivates bounding the denial taxonomy at the sink.
+		// Modelled explicitly: a []byte is neither fixed-width nor immutable, so the default
+		// arm would exempt it from the budget, deep copy, and UTF-8 normalization. Reachable
+		// from a custom ConditionHandler or external PolicyEvaluator.
 		b, ok := chargeBoundedString(string(t), budget)
 		if !ok {
 			return DenialDetailElided
@@ -291,13 +227,10 @@ func boundDetailValue(v interface{}, budget *int, depth int) interface{} {
 			func(s string) interface{} { return s },
 			func(e interface{}) interface{} { return boundDetailValue(e, budget, depth+1) })
 	case []string:
-		// Handlers echo the manifest's own lists (allowedExtensions, allowedCIDRs,
-		// allowedOperations) and the flow-label engine echoes its blocked set in this
-		// concrete form. Bounded like []interface{} even though most entries are
-		// operator-supplied: the rule is "every string in a denial's details is
-		// bounded", with no provenance exemption a future handler could accidentally
-		// route an argument through. The []string TYPE is preserved rather than
-		// normalized away — a Go consumer reading Details reasonably type-asserts it.
+		// Bounded like []interface{} even though most entries are operator-supplied lists
+		// (allowedExtensions, allowedCIDRs, …) — no provenance exemption a future handler
+		// could route an argument through. Type preserved since a Go consumer reasonably
+		// type-asserts it.
 		return boundDetailSlice(t, budget,
 			func(s string) string { return s },
 			func(e string) string {
@@ -308,9 +241,9 @@ func boundDetailValue(v interface{}, budget *int, depth int) interface{} {
 				return b
 			})
 	default:
-		// A named scalar type (`type Path string`) reaches here rather than the string
-		// arm, and it is neither fixed-width nor already normalized — so recover its
-		// underlying string through reflection instead of letting it bypass every bound.
+		// A named scalar type (`type Path string`) lands here rather than the string arm;
+		// recover its underlying string via reflection instead of letting it bypass every
+		// bound.
 		if rv := reflect.ValueOf(v); rv.IsValid() && rv.Kind() == reflect.String {
 			b, ok := chargeBoundedString(rv.String(), budget)
 			if !ok {
@@ -318,9 +251,8 @@ func boundDetailValue(v interface{}, budget *int, depth int) interface{} {
 			}
 			return b
 		}
-		// Bools, numbers already decoded to float64/int, and nil: fixed-width and
-		// immutable, so they need neither a copy nor a bound. Charged a nominal amount
-		// so a large array of them still exhausts the budget.
+		// Bools, decoded numbers, nil: fixed-width and immutable, so no copy or bound needed
+		// — charged a nominal amount so a large array of them still exhausts the budget.
 		*budget -= denialDetailScalarCost
 		if *budget < 0 {
 			return DenialDetailElided
@@ -333,21 +265,14 @@ func boundDetailValue(v interface{}, budget *int, depth int) interface{} {
 // instantiate the same generic helper the []string arm uses.
 func in2any(v []interface{}) []interface{} { return v }
 
-// chargeBoundedString bounds s and charges the result against budget, reporting false
-// when that exhausts it. It is the one place the subtract-then-check order lives, so no
-// arm can charge and then forget to check — the []string arm previously checked only at
-// the top of its loop, writing the element that crossed the budget in full and never
-// checking the last element at all, while the []interface{} arm elided it.
+// chargeBoundedString bounds s and charges the result against budget, reporting false when
+// that exhausts it — the one place subtract-then-check lives, so no caller can charge and
+// forget to check (the []string arm previously missed its last element).
 //
-// The charge is FLOORED at denialDetailScalarCost rather than being the string's own
-// length, because a short string is not free to carry: it still marshals with its quotes
-// and its separator, and unlike a map key it has no uniqueness constraint bounding how
-// many of it a caller can send. Charging len() alone made the EMPTY string cost zero, so
-// an argument that decoded to an array of them was admitted in full — half a million
-// elements marshaled to ~1.5 MB against an 8 KiB budget, the same unbounded-breadth hole
-// denialDetailContainerCost closed for empty maps and arrays, one shape further down.
-// Every non-string scalar already charges this floor; a string is charged no less than a
-// bool for occupying a slot.
+// The charge floors at denialDetailScalarCost rather than s's own length: charging len()
+// alone made the empty string free, so an array of them was admitted in full — half a million
+// elements marshaling to ~1.5 MB against an 8 KiB budget, the same unbounded-breadth hole
+// denialDetailContainerCost closed for empty containers.
 func chargeBoundedString(s string, budget *int) (string, bool) {
 	b := boundDetailString(s)
 	cost := len(b)
@@ -361,11 +286,10 @@ func chargeBoundedString(s string, budget *int) (string, bool) {
 	return b, true
 }
 
-// boundDetailSlice bounds one array level, charging the container and then each element
-// through bound. Shared by the []interface{} and []string arms, which were near-copies
-// that charged in different orders — two spellings of one elision policy, where the next
-// edit to either would have missed the other. marker builds the elision entry in the
-// caller's element type, which is what lets each arm keep its own concrete slice type.
+// boundDetailSlice bounds one array level, charging the container then each element. Shared
+// by the []interface{} and []string arms, which were near-copies that charged in different
+// orders; marker builds the elision entry in the caller's element type so each arm keeps its
+// own slice type.
 func boundDetailSlice[T any](in []T, budget *int, marker func(string) T, bound func(T) T) []T {
 	*budget -= denialDetailContainerCost
 	if *budget < 0 {
@@ -382,20 +306,13 @@ func boundDetailSlice[T any](in []T, budget *int, marker func(string) T, bound f
 	return out
 }
 
-// boundDetailString truncates one string to maxDenialDetailStringLen with a visible
-// marker recording the original length, keeping the marker WITHIN the cap so the
-// result never exceeds it.
+// boundDetailString truncates s to maxDenialDetailStringLen with a visible marker recording
+// the original length, keeping the marker within the cap.
 //
-// Delegates to capability.BoundString, which first normalizes to valid UTF-8. Every
-// string reaching here can hold raw caller-supplied bytes (a tool argument is decoded
-// from the wire, not validated as UTF-8 beyond JSON's own rules), and encoding/json is
-// not idempotent across a decode-then-re-encode round trip for invalid UTF-8 — the
-// audit chain's HMAC recompute and canonical-bytes check both depend on that
-// idempotency, and the audit sink's own boundFieldTo normalizes the envelope for
-// exactly this reason (capability.BoundString is their shared home: pkg/ cannot
-// import internal/audit, so the primitive lives one level down instead of being
-// re-derived here). Details take the same treatment so a denial echo cannot be the
-// field that makes a genuine record fail verification.
+// Delegates to capability.BoundString, which normalizes to valid UTF-8 first: a tool argument
+// is wire-decoded, not UTF-8-validated beyond JSON's own rules, and encoding/json isn't
+// idempotent across decode-then-re-encode for invalid UTF-8 — the audit chain's HMAC verify
+// depends on that idempotency, same as the audit sink's own boundFieldTo.
 func boundDetailString(s string) string {
 	return capability.BoundString(s, maxDenialDetailStringLen)
 }

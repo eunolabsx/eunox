@@ -21,20 +21,12 @@ type EnforceRequestTarget struct {
 // EnforceRequest is the input payload for runtime capability enforcement.
 type EnforceRequest struct {
 	SessionID string `json:"sessionId"`
-	// TargetName identifies what is being enforced, in the OPTIONALLY PREFIXED
-	// spelling the caller used: a bare tool name ("read_file"), an explicitly
-	// namespaced one ("tool:read_file"), a resource URI ("resource:file:///etc/hosts"),
-	// a prompt ("prompt:summarize"), or a system target
-	// ("system:sampling/createMessage"). A bare name defaults to the tool namespace.
-	//
-	// It is deliberately NOT tool-only — every namespace the proxy enforces arrives
-	// here — which is why it is not called ToolName: under that name the field read as
-	// a tool identifier while carrying resource URIs and system targets, so every
-	// helper reconciling it with Target had to spend a paragraph on the mismatch.
-	// Target carries the same identity already SPLIT into (type, bare name) and is set
-	// by every ManifestPDP entry point; prefer it when you have it, and treat this
-	// field as the caller-supplied spelling to be split (splitEnginePrefix) or matched
-	// verbatim.
+	// TargetName identifies what is being enforced, in the OPTIONALLY PREFIXED spelling
+	// the caller used: a bare tool name, an explicitly namespaced one ("tool:read_file"),
+	// a resource URI, a prompt, or a system target. A bare name defaults to the tool
+	// namespace. Deliberately NOT called ToolName since every namespace arrives here, not
+	// just tools; Target carries the same identity already split into (type, name) — prefer
+	// it when set.
 	TargetName string                 `json:"targetName"`
 	Arguments  map[string]interface{} `json:"arguments"`
 	Context    EnforceRequestContext  `json:"context"`
@@ -127,47 +119,29 @@ type EnforceResponse struct {
 	LabelsOut     []string `json:"labelsOut,omitempty"`
 	CarriedLabels []string `json:"carriedLabels,omitempty"`
 	// Declassification is the authorized second phase of a flow-label clear: the labels an
-	// APPROVED declassify directive may remove from the anchor on this call, plus the
-	// approval that authorized them. Nil on every call that authorized none, which is every
-	// call in a deployment with no declassify directive — so "did this decision authorize a
-	// clear?" is one nil test.
+	// APPROVED declassify directive may remove, plus the approval that authorized them. Nil
+	// when nothing was authorized (the common case).
 	//
-	// AUTHORIZED, not applied, is the load-bearing distinction. The clear is performed by the
-	// CALLER, through CommitDeclassification, once the call has actually run. Applying it
-	// inside the decision made the labels invisible to every concurrent decision for the
-	// whole upstream round trip, so a sink the taint existed to stop could be allowed and
-	// forwarded while the sanitizing call was still in flight. Holding the labels until the
-	// action completes is what makes the flow claim hold under concurrency, and it does so
-	// without leaning on the transport's decision turn.
+	// AUTHORIZED, not applied, is the load-bearing distinction: the clear is performed by the
+	// CALLER via CommitDeclassification once the call has actually run. Applying it inside
+	// the decision would make the labels invisible to concurrent decisions for the whole
+	// upstream round trip, letting a sink the taint exists to stop be forwarded while the
+	// sanitizing call is still in flight. The handle is the ONLY thing the commit accepts —
+	// its authorized set is unexported, so the second phase cannot clear more than the first
+	// authorized — and a caller that never commits leaves the session as tainted as it found
+	// it (fail-closed).
 	//
-	// The handle is what carries that obligation, and it is the ONLY thing the commit
-	// accepts: the authorized set is unexported, so the second phase cannot clear anything
-	// the first did not authorize (see Declassification). A caller that never commits leaves
-	// the session as tainted as it found it — the fail-closed direction, and the reason this
-	// ordering is safe where the old one was not.
-	//
-	// It rides an ALLOW, and also the one refusal the engine itself produces after burning a
-	// grant (declassifyRecordFailureDenial), where it carries no labels and exists so the
-	// spent approval reaches the tape.
-	//
-	// In-process only (json:"-"), like Effect: it is a stateful decision artifact for the
-	// caller — single-use, with an unexported authorized set — and a JSON round trip would
-	// silently hand back an empty authorization. The audit record's own declassification
-	// fields (the TOP-LEVEL, HMAC-signed labels_cleared / approver / approval_id triple,
-	// none of which rides details) report what the commit actually CHANGED, not what was
-	// authorized here, so the tape never records a declassification that did not happen.
+	// In-process only (json:"-"): a stateful, single-use decision artifact for the caller. The
+	// audit record's own top-level, HMAC-signed labels_cleared/approver/approval_id fields
+	// report what the commit actually CHANGED, never what was merely authorized here.
 	Declassification *Declassification `json:"-"`
-	// Effect is the contract the decision resolved against this call's arguments, stamped
-	// on an ALLOW so a post-hoc check has the declaration in hand. Its one consumer is the
-	// effect-receipt verifier, which compares what a server ATTESTS it did against what
-	// policy DECLARED it would do; without the declaration threaded here, that comparison
-	// would have to re-resolve the contract from the matched constraint, and a second
-	// resolution is a place for the decision and the check to silently disagree about what
-	// the call's effect was.
+	// Effect is the contract the decision resolved against this call's arguments, stamped on
+	// an ALLOW so the effect-receipt verifier can compare what a server ATTESTS it did
+	// against what policy DECLARED — without this, that comparison would have to re-resolve
+	// the contract, a second resolution that could silently disagree with the first.
 	//
-	// In-process only (json:"-"), like HardDeny: it is a decision artifact for the
-	// transport, not a wire field, and the audit record carries the effect's own rendered
-	// details rather than this struct.
+	// In-process only (json:"-"), like HardDeny: a decision artifact for the transport, not a
+	// wire field.
 	Effect *ResolvedEffect `json:"-"`
 }
 
@@ -208,24 +182,16 @@ type DenialInfo struct {
 // CallCounter tracks per-key invocation counts within a sliding time window.
 // Implementations must be safe for concurrent use.
 //
-// Every method is mandatory — the full contract WithCallCounter accepts, not a
-// core with optional type-asserted extensions: IncrementAndGet backs the counting
-// conditions, Peek backs sequenceBlock, and AdmitAll backs every quota bound
-// (maxCalls and the cumulative blastRadius alike). Folding them into one contract
-// means a backend that omits any fails to satisfy CallCounter at compile time,
-// rather than wiring up cleanly and then failing every maxCalls/sequenceBlock
-// condition closed at runtime. A custom backend pins conformance with
-// `var _ capability.CallCounter = (*MyCounter)(nil)`.
+// Every method is mandatory: IncrementAndGet backs the counting conditions, Peek backs
+// sequenceBlock, and AdmitAll backs every quota bound. Folding them into one contract means
+// a backend that omits any fails to satisfy CallCounter at compile time rather than wiring
+// up cleanly and failing conditions closed at runtime. A custom backend pins conformance
+// with `var _ capability.CallCounter = (*MyCounter)(nil)`.
 //
-// There is exactly ONE admission primitive on purpose. AdmitAll subsumed two
-// single-bucket forms (IncrementIfBelow, AddIfTotalBelow) that the decision path
-// stopped calling once every handler routed its commit through it, and leaving them
-// on the contract would have been the same "two implementations of one semantics
-// that can drift" hazard their merger removed one layer up: a backend could get the
-// retired pair exactly right — they were independently testable, so they would look
-// solid — while getting AdmitAll subtly wrong, and nothing on the decision path
-// would exercise the difference. A backend author writes one admission and every
-// quota bound rides it.
+// There is exactly ONE admission primitive (AdmitAll) on purpose: it replaced two
+// single-bucket forms that could each be independently correct while quietly diverging from
+// each other, a drift nothing on the decision path would exercise. A backend author writes
+// one admission and every quota bound rides it.
 type CallCounter interface {
 	// IncrementAndGet records a call and returns the in-window count, retaining at
 	// most maxEntries most-recent in-window timestamps so storage stays bounded
@@ -237,70 +203,40 @@ type CallCounter interface {
 	// lookup itself counting.
 	Peek(ctx context.Context, key string, windowSec int) (int64, error)
 
-	// AdmitAll is the ONE quota admission: it records all of the given buckets only when
-	// every one has headroom (admitted=true), otherwise records NOTHING (admitted=false)
-	// with deniedIndex naming a blocking bucket, total its resulting total, and retryAfter
-	// its estimate. A single-bucket batch is an ordinary call — that is how a lone maxCalls
-	// or a lone cumulative blastRadius commits — and a multi-bucket batch is what keeps a
-	// constraint carrying more than one quota-consuming condition from over-admitting by
-	// racing the check->commit gap a per-bucket commit would leave.
+	// AdmitAll is the ONE quota admission: records all buckets only when every one has
+	// headroom (admitted=true), otherwise records NOTHING (admitted=false), with
+	// deniedIndex naming the blocking bucket, total its resulting total, and retryAfter an
+	// estimate. A multi-bucket batch admits mixed accountings (entry-counted maxCalls,
+	// weight-summed cumulative blastRadius) atomically, so "20 refunds/hr AND $2,000/hr" is
+	// one commit rather than two that could let one budget spend past the other.
 	//
-	// An over-limit call records NOTHING, which maxCalls requires: writing the denied call
-	// would let a client extend its own lockout by retrying, and would grow the backing
-	// store on exactly the path that must not grow it.
+	// An over-limit call records NOTHING (retrying must not extend the lockout or grow the
+	// store). buckets must be non-empty, each valid, and no two may share a (Key,
+	// WindowSec) — a malformed batch fails closed.
 	//
-	// The buckets may MIX accountings. A QuotaBucket either counts entries (maxCalls) or
-	// sums magnitudes (a cumulative blastRadius bound), and one call to this method admits
-	// both kinds together atomically. That is the whole point: "no more than 20 refunds an
-	// hour AND no more than $2,000 an hour" is one natural policy, and committing the two
-	// separately would let a call the second denies spend the first's budget.
-	//
-	// buckets must be non-empty, each bucket valid (see QuotaBucket), and no two may address
-	// the same (Key, WindowSec) — two buckets sharing one physical key cannot be committed
-	// consistently. A malformed batch fails closed and records nothing.
-	//
-	// total is the LARGEST post-admission total across the batch when admitted (an absolute
-	// magnitude, not a fraction of any bucket's limit — with limits of differing scale it
-	// need not be the bucket closest to its own bound), and the blocking bucket's current
-	// total when denied. retryAfter estimates when the blocking bucket frees enough room for
-	// THIS call.
-	//
-	// PRECISION. A weighted total accumulates in IEEE-754 double precision, in timestamp
-	// order, deliberately: the Redis backend's Lua arithmetic is float64 and nothing else
-	// is available there, so making an in-process backend exact would be the two backends
-	// disagreeing rather than one of them being right. Every total below MaxWeightedTotal
-	// composed of integral magnitudes is exact; a fractional magnitude (a currency amount)
-	// can differ from an exact decimal sum in the last bits, far below any bound an
-	// operator authors.
+	// PRECISION: a weighted total accumulates in IEEE-754 double precision to match the
+	// Redis backend's Lua arithmetic, so an in-process backend stays consistent with it
+	// rather than being independently exact and therefore disagreeing.
 	AdmitAll(ctx context.Context, buckets []QuotaBucket) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error)
 }
 
 // MaxWeightedTotal is the largest weighted total a CallCounter backend represents exactly,
 // and therefore the largest limit — and largest single weight — a QuotaBucket accepts.
 //
-// It is 2^53 for the same reason the counting limit is: the Redis backend evaluates its
-// admission in Lua, whose numbers are IEEE-754 doubles, so a larger value would be
-// silently rounded to a threshold the operator never authored. No real cumulative bound
-// approaches it — a $2,000-per-hour refund ceiling is thirteen orders of magnitude below.
-//
-// It lives on the CONTRACT rather than in a backend package because three layers apply it
-// to the same input class: the manifest loader (rejecting an unrepresentable authored
-// bound), the engine (refusing to sum a magnitude it would have to round), and each
-// backend (its own fail-closed guard). A bound every layer "mirrors" is exactly the guard
-// that ends up missing from one of them.
+// It is 2^53 because the Redis backend evaluates admission in Lua (IEEE-754 doubles), so a
+// larger value would silently round to a threshold the operator never authored. Lives on
+// the contract, not a backend package, because the manifest loader, the engine, and each
+// backend all apply it to the same input class.
 const MaxWeightedTotal float64 = 1 << 53
 
 // QuotaBucket is one quota-consuming admission in a multi-condition commit: the sliding
 // window it draws on, what this call contributes, and the bound the resulting total must
 // not exceed.
 //
-// Counted is the one field that changes the ACCOUNTING, and it exists for cost rather than
-// expressiveness. A counted bucket's total is the number of entries in the window, which
-// every backend answers in O(1) (a ZCARD, a slice length); a weighted bucket's total is the
-// sum of the per-entry magnitudes, which is O(n). maxCalls is a weighted bucket with every
-// weight equal to 1, so the two could be one — but folding them would make every rate-limit
-// check pay a linear scan it does not need, and a maxCalls quota is documented to reach the
-// millions. Declaring the accounting per bucket keeps one commit path without that cost.
+// Counted changes the ACCOUNTING for cost, not expressiveness: a counted bucket's total is
+// O(1) (entry count), a weighted bucket's is O(n) (summed magnitudes). maxCalls could be a
+// weighted bucket with every weight 1, but folding them would make every rate-limit check
+// (documented to reach the millions) pay a linear scan it doesn't need.
 type QuotaBucket struct {
 	// Key is the caller-namespaced counter key; WindowSec the sliding window it is
 	// counted over. Together they address one physical bucket.

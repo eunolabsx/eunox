@@ -23,82 +23,42 @@ import (
 	"github.com/eunolabs/eunox/pkg/enforcement"
 )
 
-// dispatchParams bundles everything the per-method enforced handlers need,
-// independent of transport. HTTP fills these from sess.route + the session;
-// stdio from the proxy itself (with an empty source IP — stdio has no
-// per-request client address). It embeds forwardParams (consumed verbatim by the
-// shared enforced-forward core) and adds only the parse→decide bits (pdp,
-// sourceIP), so handlers pass d.forwardParams straight through.
-// pdp is never nil: every production constructor (NewStdioProxy; and, for HTTP,
-// NewHTTPProxyGateway fed by BuildRoutes) substitutes a concrete PDP (DenyAllPDP /
-// AlwaysAllowPDP) for an omitted one, so
-// the invariant is established at construction and every dispatch path may
-// dereference d.pdp directly. A nil here is a wiring bug, not a runtime condition to
-// tolerate — DenyAllPDP, not a nil-forwards-verbatim special case, is the
-// fail-closed "no policy" default.
+// dispatchParams bundles everything the per-method enforced handlers need, independent of
+// transport (HTTP fills it from sess.route + session; stdio from the proxy itself).
+//
+// pdp is never nil: every production constructor substitutes a concrete PDP (DenyAllPDP is the
+// fail-closed "no policy" default), so every handler may dereference d.pdp directly.
 type dispatchParams struct {
 	forwardParams
-	// pdp is the decision point every enforced handler decides with, and the committer the
-	// handlers hand to enforcedForwardCore for an approved declassification's clear. ONE
-	// field: the committer used to be a second copy of it on forwardParams, kept in agreement
-	// by a constructor step and an AST guard, and passing it down to the core instead removes
-	// the pair rather than policing it.
+	// pdp is the decision point every handler decides with AND the committer handed to
+	// enforcedForwardCore for a declassification's clear — one field, not two kept in sync.
 	pdp      pdp.PolicyDecisionPoint
 	sourceIP string
-	// buildInit answers a host `initialize` locally from the upstream capabilities
-	// captured at session start (HTTP: the session's; stdio: the proxy's). It is
-	// injected per-transport so `initialize` can flow through dispatchRequest like
-	// every other enforced method — the response differs per transport, the
-	// cross-cutting gate (the kill check) does not. nil only in tests that never send
-	// initialize through the dispatcher; the initialize case fails closed if unset.
+	// buildInit answers a host `initialize` locally, injected per-transport so initialize can
+	// flow through dispatchRequest like every other method — the response differs, the kill
+	// gate does not. nil only in tests; fails closed if unset.
 	buildInit func(mcp.RPCMsg) mcp.RPCMsg
 
 	// receipts verifies a tool result's signed effect receipt against this upstream's
-	// configured key domain. nil when the operator configured none, which is the default
-	// and skips the whole surface — no parse, no allocation, no recorded field.
+	// configured key domain. nil (the default) skips the whole surface entirely.
 	receipts *capability.EffectReceiptVerifier
 
-	// honorAttribution admits the client-supplied attribution interface (the
-	// io.eunolabs.context-manifest block in a request's _meta). It is the runtime staging
-	// gate for a wire token a later grammar revision introduced — set only when the route's policy declares the
-	// flow+effect draft schemaVersion — because the manifest-side gate
-	// (checkTokenGrammarVersion) structurally cannot cover a token that arrives on a
-	// REQUEST rather than in the policy. False means the block is IGNORED, not rejected:
-	// the interface is union-only, so ignoring it falls back to the conservative session
-	// join, which is the stricter reading.
+	// honorAttribution admits the client-supplied attribution interface (_meta's
+	// io.eunolabs.context-manifest block), gated on the route's schemaVersion since the
+	// manifest-side grammar gate can't cover a token that arrives on a REQUEST. False means
+	// ignored (union-only, so falling back to the session join is the stricter reading).
 	honorAttribution bool
 }
 
-// finishDecision closes the decision critical section, if one is open (see
-// dispatchParams.endDecision). The Decide* handlers call it right after the PDP decision
-// and before enforcedForwardCore, so the upstream forward is never held under the
-// turn. A no-op when the request is not serialized.
+// finishDecision closes the decision critical section (if open) right after the PDP decision
+// and before the forward. One exception: a declassifying call keeps the turn until the
+// handler returns, because its flow-state write splits across the decision (resolves what to
+// clear) and the post-forward commit (removes it) — releasing early would let a concurrent
+// source land between the two and commit a fresh taint the commit then wrongly clears.
 //
-// It makes ONE exception, and it is the reason this takes the decision rather than no
-// arguments: a call that authorized a declassification keeps the turn until the handler
-// returns. Such a call splits its flow-state write across the decision (which resolves what
-// to clear) and the commit after the forward (which removes it), and those two must not have
-// another decision interleaved between them. With the turn released early, a source read
-// decided during the forward committed a FRESH taint that the commit then removed — the
-// approval was granted before that read existed, and a set store cannot tell the new
-// occurrence of the label from the old one, so nothing downstream could catch it. Holding
-// the turn is what makes the two phases one critical section.
-//
-// The turn spans the state ANCHOR (see anchor_gate.go), which is what makes that hold mean
-// something under task-anchored state: two sessions sharing a task share the turn, so a
-// concurrent source on the OTHER session cannot land between a declassifying call's two
-// phases either. It is still an in-process gate — two eunox instances on one Redis backend
-// hold independent turns — and what bounds the damage there is the decision-time
-// intersection, which is a property of the decision rather than of any lock: a label not
-// carried at decision time is not in the authorized set, so no commit can remove it.
-//
-// The cost is head-of-line blocking on that anchor for the length of one declassifying
-// call, bounded by --upstream-timeout (and unbounded when that is 0, which is the one
-// setting a deployment using declassify should not choose). It is paid only by callers that
-// actually declassify: every other call still releases before the forward and keeps the full
-// concurrency the split exists for. The turn is not leaked — both transports ALSO defer this
-// same idempotent release in the handler goroutine, so it advances when the handler returns
-// whatever path it takes.
+// Cost: head-of-line blocking on the anchor for one declassifying call, bounded by
+// --upstream-timeout (unbounded at 0). Paid only by calls that actually declassify; both
+// transports also defer this same idempotent release as a backstop.
 func (d dispatchParams) finishDecision(dec capability.EnforceResponse) {
 	if d.endDecision == nil || dec.Declassification.PendingClear() {
 		return
@@ -106,15 +66,10 @@ func (d dispatchParams) finishDecision(dec capability.EnforceResponse) {
 	d.endDecision()
 }
 
-// killDenied runs the session kill-switch check for a locally-answered method that
-// does NOT flow through a Decide* path (which embeds its own richer kill record via
-// enforcedForwardCore). If the session is killed it returns the recordKillDenial
-// response and true. dispatchRequest applies this once, at the boundary, for the whole
-// locally-answered set (initialize, */list, the unmapped default), so those handlers no
-// longer self-gate and a new locally-answered method inherits revocation by construction.
-// The one remaining direct caller is malformedDeny — the malformed-params sub-path of a
-// Decide* method, reached before the PDP and so not covered by the boundary gate. A
-// kill-store error fails closed inside CheckKill.
+// killDenied runs the kill-switch check for a locally-answered method (Decide* methods embed
+// their own richer kill record via enforcedForwardCore). Applied once at the dispatchRequest
+// boundary so a new locally-answered method inherits revocation by construction; malformedDeny
+// is the one other caller, reached before the PDP.
 func (d dispatchParams) killDenied(ctx context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, bool) {
 	if deny := d.pdp.CheckKill(ctx, d.sessionID); deny != nil {
 		return recordKillDenial(ctx, d.rec, deny, msg.ID, verifiedSession(d.sessionID), msg.Method), true
@@ -122,9 +77,8 @@ func (d dispatchParams) killDenied(ctx context.Context, msg mcp.RPCMsg) (mcp.RPC
 	return mcp.RPCMsg{}, false
 }
 
-// decideCtx applies the audit-mode quota skip: in observe mode the MaxCalls quota
-// is skipped (WithSkipQuota) so the observed call consumes none, while
-// sequenceBlock evaluation and session history are unaffected.
+// decideCtx applies the audit-mode quota skip: in observe mode MaxCalls is skipped
+// (WithSkipQuota) so the observed call consumes none; sequenceBlock/history are unaffected.
 func (d dispatchParams) decideCtx(ctx context.Context) context.Context {
 	if d.audit {
 		return enforcement.WithSkipQuota(ctx)
@@ -132,15 +86,9 @@ func (d dispatchParams) decideCtx(ctx context.Context) context.Context {
 	return ctx
 }
 
-// decideMethodHandlers maps each Decide*-method (tools/call, resources/read,
-// resources/subscribe, resources/unsubscribe, prompts/get) to its dispatch handler.
-// It is the single source of truth for "is this an enforced method requiring a PDP decision":
-// dispatchRequest routes through it below, and isEnforcedMethod (consulted by
-// both transports' notification paths, since IsNotification's classification
-// is purely structural with no method allowlist) derives its answer from the
-// SAME map, so the two questions — "which handler does this method route to"
-// and "is this method enforced" — cannot silently diverge the way two
-// independently-maintained case lists could.
+// decideMethodHandlers maps each Decide*-method to its dispatch handler, and is the single
+// source of truth for "is this an enforced method": isEnforcedMethod derives from the same
+// map so the two questions cannot silently diverge.
 var decideMethodHandlers = map[string]func(context.Context, dispatchParams, mcp.RPCMsg) mcp.RPCMsg{
 	capability.MethodToolsCall:            dispatchToolsCall,
 	capability.MethodResourcesRead:        dispatchResourcesRead,
@@ -149,29 +97,19 @@ var decideMethodHandlers = map[string]func(context.Context, dispatchParams, mcp.
 	capability.MethodPromptsGet:           dispatchPromptsGet,
 }
 
-// isEnforcedMethod reports whether method is one of the Decide* methods above,
-// derived from decideMethodHandlers so it cannot drift from dispatchRequest's
-// own routing table.
+// isEnforcedMethod reports whether method is one of the Decide* methods, derived from
+// decideMethodHandlers so it cannot drift from dispatchRequest's routing table.
 func isEnforcedMethod(method string) bool {
 	_, ok := decideMethodHandlers[method]
 	return ok
 }
 
-// swallowedHostNotifications is the set of host->upstream notification methods
-// both transports drop rather than forward verbatim:
+// swallowedHostNotifications is the set of host->upstream notifications both transports drop:
+//   - "notifications/initialized": the proxy already sent its own during its handshake.
+//   - "initialize": can arrive with no id (a notification by IsNotification's structural
+//     classification); forwarding it would re-trigger the handshake outside the kill gate.
 //
-//   - "notifications/initialized": the proxy already sent its own to the upstream
-//     during its client handshake, so re-forwarding the host's would double it.
-//   - "initialize": IsNotification()'s classification is purely structural, so a
-//     client can send "initialize" with no id and have it counted as a notification
-//     even though the method is ordinarily a request. Forwarding that verbatim would
-//     let it re-trigger the upstream's handshake outside dispatchRequest's kill gate
-//     and audit trail, so it is swallowed on the notification path.
-//
-// It is the single source of truth for this set so the stdio and HTTP transports
-// (forwardHostNotification and handleSessionPost) provably agree — the "enforced
-// identically on both transports" property their comments assert is mechanical
-// rather than two hand-mirrored literal lists that could silently diverge.
+// Single source of truth so stdio and HTTP provably agree rather than hand-mirroring it.
 var swallowedHostNotifications = map[string]struct{}{
 	mcp.MethodNotificationsInitialized: {},
 	mcp.MethodInitialize:               {},
@@ -184,27 +122,19 @@ func isSwallowedHostNotification(method string) bool {
 	return ok
 }
 
-// methodNotificationsProgress and methodNotificationsRootsListChanged are
-// host->upstream notification methods the proxy forwards verbatim (see
-// forwardableHostNotifications). Neither has any other reference in this package
-// (unlike methodNotificationsCancelled, which rewriteCancelToNonce also consults),
-// so they are defined here rather than in stdio.go.
+// methodNotificationsProgress and methodNotificationsRootsListChanged are notifications the
+// proxy forwards verbatim (see forwardableHostNotifications); defined here since nothing else
+// in the package references them.
 const (
 	methodNotificationsProgress         = "notifications/progress"
 	methodNotificationsRootsListChanged = "notifications/roots/list_changed"
 )
 
-// forwardableHostNotifications is the allowlist of host->upstream notification
-// methods forwarded to the upstream verbatim once the swallowed set
-// (isSwallowedHostNotification) and the enforced-method fail-closed reject
-// (denyEnforcedMethodNotification) have already passed. Before this allowlist
-// existed, every method reaching this point — regardless of what it was — was
-// forwarded with no policy check and no audit record: a notification-framed
-// "tools/uninstall" (or any other unrecognized method) reached the upstream
-// invisibly, while its request-framed twin was denied and logged by
-// dispatchUnmapped. isForwardableHostNotification closes that gap; anything not
-// in this set is dropped and recorded by denyUnmappedHostNotification instead,
-// mirroring dispatchUnmapped's fail-closed default for the request-framed case.
+// forwardableHostNotifications is the allowlist of notifications forwarded verbatim once the
+// swallowed and enforced-method checks have passed. Anything not in this set is dropped and
+// recorded by denyUnmappedHostNotification, mirroring dispatchUnmapped's fail-closed default
+// for the request-framed case — before this existed, an unrecognized notification-framed
+// method reached the upstream invisibly while its request-framed twin was denied and logged.
 var forwardableHostNotifications = map[string]struct{}{
 	methodNotificationsCancelled:        {},
 	methodNotificationsProgress:         {},
@@ -219,13 +149,9 @@ func isForwardableHostNotification(method string) bool {
 	return ok
 }
 
-// denyUnmappedHostNotification checks whether msg's method is outside the
-// forwardable allowlist and, if so, records a fail-closed deny for it rather than
-// letting the caller forward it verbatim — the notification-framed analogue of
-// dispatchUnmapped's fail-closed default for request-framed calls. Shared by both
-// transports' notification paths so the check and its audit record live once,
-// matching denyEnforcedMethodNotification's "single source of truth" pattern.
-// Returns true when msg was denied; the caller must not forward it in that case.
+// denyUnmappedHostNotification denies (and records) a notification outside the forwardable
+// allowlist — the notification-framed analogue of dispatchUnmapped. Shared by both transports
+// so the check and record live once. Returns true when msg was denied.
 func denyUnmappedHostNotification(ctx context.Context, rec auditRecorder, sessionID string, msg mcp.RPCMsg) bool {
 	if isForwardableHostNotification(msg.Method) {
 		return false
@@ -239,17 +165,10 @@ func denyUnmappedHostNotification(ctx context.Context, rec auditRecorder, sessio
 	return true
 }
 
-// denyEnforcedMethodNotification checks whether msg's method is an enforced
-// Decide* method and, if so, records the fail-closed deny for it having been
-// smuggled in via notification framing (no id) instead of the request framing
-// a legitimate MCP host always uses for these methods — forwarding it verbatim
-// would bypass both the PDP decision and the audit record the request-framed
-// equivalent gets. Shared by both transports' notification paths (stdio's
-// forwardHostNotification, HTTP's handleSessionPost) so the check and its
-// audit record live once instead of being hand-mirrored per transport, the
-// same "single source of truth" principle dispatchRequest upholds for
-// request-framed calls. Returns true when msg was denied; the caller must not
-// forward it to the upstream in that case.
+// denyEnforcedMethodNotification denies (and records) an enforced Decide* method smuggled in
+// via notification framing (no id) rather than request framing — forwarding it verbatim would
+// bypass both the PDP decision and the audit record. Shared by both transports; returns true
+// when msg was denied.
 func denyEnforcedMethodNotification(ctx context.Context, rec auditRecorder, sessionID string, msg mcp.RPCMsg) bool {
 	if !isEnforcedMethod(msg.Method) {
 		return false
@@ -260,38 +179,21 @@ func denyEnforcedMethodNotification(ctx context.Context, rec auditRecorder, sess
 	return true
 }
 
-// dispatchRequest routes an enforced MCP request to its handler and returns the
-// JSON-RPC message to deliver to the host. It is the single source of truth for
-// the method→handler mapping and the fail-closed default both transports share.
-// initialize routes through here too (via dispatchInitialize) so its cross-cutting
-// kill gate cannot drift from the other locally-answered paths; only the response
-// body differs per transport, supplied by the injected d.buildInit. The HTTP
-// session-CREATING initialize (which spawns/contacts an upstream and carries the
-// strict-audit gate) stays in the HTTP transport — no session/dispatchParams exist
-// yet on that path.
+// dispatchRequest routes an enforced MCP request to its handler and returns the JSON-RPC
+// message to deliver to the host — the single source of truth for the method→handler mapping
+// and the fail-closed default both transports share.
 //
-// The kill gate is applied STRUCTURALLY, by which arm of the split a method lands in,
-// rather than per-handler:
-//
-//   - Decide* methods (tools/call, resources/read, resources/subscribe,
-//     resources/unsubscribe, prompts/get)
-//     embed a richer kill record inside enforcedForwardCore, so they are dispatched
-//     WITHOUT the boundary gate. Their malformed-params sub-path — reached before the
-//     PDP — gates separately inside malformedDeny.
-//   - Every other method is locally answered (initialize, the */list family, and the
-//     fail-closed unmapped default) and shares ONE simple kill gate applied here, at the
-//     dispatch boundary. A newly-added locally-answered method inherits revocation by
-//     construction — it need only be added to the second switch — instead of re-placing
-//     killDenied inside its handler (the per-site pattern that previously leaked the gate
-//     across every such method).
+// The kill gate is applied STRUCTURALLY: Decide* methods embed their own richer kill record
+// inside enforcedForwardCore and skip the boundary gate; every other (locally-answered) method
+// shares one simple gate applied here, so a new locally-answered method inherits revocation by
+// construction rather than needing killDenied re-placed inside its handler.
 func dispatchRequest(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
 	if handler, ok := decideMethodHandlers[msg.Method]; ok {
 		return handler(ctx, d, msg)
 	}
 
-	// Locally-answered set: none of these flow through a Decide* path, so they share the
-	// one simple kill gate, applied once here before routing. A killed session is recorded
-	// as KILL_SWITCH (not the method's own denial code) and never contacts the upstream.
+	// Locally-answered set shares one simple kill gate applied once here. A killed session is
+	// recorded as KILL_SWITCH (not the method's own code) and never contacts the upstream.
 	if resp, killed := d.killDenied(ctx, msg); killed {
 		return resp
 	}
@@ -304,16 +206,9 @@ func dispatchRequest(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.
 // methodPing is the MCP liveness probe, answered locally without contacting the upstream.
 const methodPing = "ping"
 
-// locallyAnsweredHandlers maps each method dispatchRequest answers WITHOUT a PDP Decide*
-// call — the handshake, the liveness probe, and the three */list flavors — to its handler.
-// It is a table rather than a switch for the same reason decideMethodHandlers is: routing
-// and "is this method dispatched at all" are then one fact rather than two hand-maintained
-// lists that can disagree. The audit-mode banner asks the SECOND question — it names the
-// enforced set (enforcedMethodSummary) and says an undispatched method is still denied — and
-// this table is what makes that claim checkable instead of prose.
-//
-// Everything NOT in this table or in decideMethodHandlers falls to dispatchUnmapped's
-// fail-closed deny, in every mode.
+// locallyAnsweredHandlers maps each method dispatchRequest answers WITHOUT a PDP Decide* call
+// to its handler. A table, like decideMethodHandlers, so routing and "is this dispatched"
+// stay one fact. Anything in neither table falls to dispatchUnmapped's fail-closed deny.
 var locallyAnsweredHandlers = map[string]func(context.Context, dispatchParams, mcp.RPCMsg) mcp.RPCMsg{
 	mcp.MethodInitialize: dispatchInitialize,
 	methodPing: func(_ context.Context, _ dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
@@ -330,13 +225,9 @@ var locallyAnsweredHandlers = map[string]func(context.Context, dispatchParams, m
 	},
 }
 
-// enforcedMethodSummary is the subset the audit-mode banner's "forwarded and logged"
-// sentence may name: only the Decide* methods actually reach the upstream AND leave a
-// decision record. The locally-answered half of the dispatch table does not — initialize
-// and ping never touch the upstream and write no record, and the …/list flavors forward
-// the catalog unfiltered and are recorded as enumeration events, not decisions — so
-// sweeping them into one "every dispatched call is forwarded and logged" claim replaced
-// the old "ALL calls" over-claim with a narrower false one.
+// enforcedMethodSummary is the subset the audit-mode banner may claim as "forwarded and
+// logged": only Decide* methods reach the upstream AND leave a decision record — initialize,
+// ping, and */list do not (no record, or an enumeration event rather than a decision).
 var enforcedMethodSummary = sortedMethods(decideMethodHandlers)
 
 // unmappedMethodExamples names MCP methods this build does NOT dispatch, so the banner's
@@ -345,11 +236,8 @@ var enforcedMethodSummary = sortedMethods(decideMethodHandlers)
 const unmappedMethodExamples = "e.g. completion/complete, logging/setLevel, resources/templates/list"
 
 // sortedMethods joins a routing table's keys in sorted order, so a banner derived from a
-// table cannot drift from what the dispatcher does (and a map's iteration order cannot
-// make the text unstable). It took a variadic list of tables when the banner summarized
-// the whole dispatch table; the banner now names only the enforced half, so the extra
-// shape survived on the strength of a test that exercised it — which is the tail wagging
-// the dog. One table, one caller.
+// table cannot drift from what the dispatcher does, and a map's iteration order cannot make
+// the text unstable.
 func sortedMethods(table map[string]func(context.Context, dispatchParams, mcp.RPCMsg) mcp.RPCMsg) string {
 	methods := make([]string, 0, len(table))
 	for m := range table {
@@ -359,14 +247,10 @@ func sortedMethods(table map[string]func(context.Context, dispatchParams, mcp.RP
 	return strings.Join(methods, ", ")
 }
 
-// dispatchInitialize answers a host initialize request by delegating to the
-// per-transport buildInit responder. The shared kill gate runs at the dispatchRequest
-// boundary (a killed session must not receive the upstream capability set — buildInit
-// echoes them without consulting the PDP), so this handler no longer self-gates. Routing
-// initialize through the shared dispatcher keeps its kill gate from being copy-maintained
-// across the stdio and HTTP re-initialize sites. A missing buildInit (a misconfigured
-// dispatchParams, only reachable in tests) fails closed with an internal error rather
-// than a nil-call panic.
+// dispatchInitialize answers a host initialize by delegating to the per-transport buildInit
+// responder. The shared kill gate runs at the dispatchRequest boundary (buildInit echoes
+// capabilities without consulting the PDP), so this handler no longer self-gates. A missing
+// buildInit (test misconfiguration) fails closed rather than nil-call panicking.
 func dispatchInitialize(_ context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
 	if d.buildInit == nil {
 		return mcp.ErrorResponse(msg.ID, jsonRPCCodeInternalError, "internal error: initialize responder not configured")
@@ -374,53 +258,26 @@ func dispatchInitialize(_ context.Context, d dispatchParams, msg mcp.RPCMsg) mcp
 	return d.buildInit(msg)
 }
 
-// dispatchPing answers the MCP utility ping locally with the spec's empty result.
-//
-// ping carries no arguments, names no target, and reaches no upstream, so there is
-// nothing for a manifest to authorize — but falling through to dispatchUnmapped denied it
-// with AUTHORIZATION_FAILED, which breaks the liveness probe every MCP host is entitled to
-// send and writes a policy-denial record for a call that was never a policy question. That
-// is a fail-closed default doing the wrong thing rather than a security property: nothing
-// is protected by refusing to say "I am here".
-//
-// It is answered locally rather than forwarded so a ping cannot be used to probe upstream
-// liveness through the proxy, and it sits inside the locally-answered set so the shared
-// kill gate at the dispatchRequest boundary still applies: a killed session gets
-// KILL_SWITCH, not a pong. No audit record — like initialize, this is a handshake-level
-// utility that is not a guarded action, and recording every host heartbeat would bury the
-// tape in noise.
+// dispatchPing answers the MCP utility ping locally with the spec's empty result: ping
+// authorizes nothing, so falling through to dispatchUnmapped's AUTHORIZATION_FAILED broke a
+// liveness probe every host is entitled to send. Answered locally (not forwarded) so a ping
+// can't probe upstream liveness through the proxy; the shared kill gate still applies, so a
+// killed session gets KILL_SWITCH, not a pong. No audit record — a heartbeat, not a guarded
+// action.
 func dispatchPing(msg mcp.RPCMsg) mcp.RPCMsg {
 	return mcp.RPCMsg{JSONRPC: "2.0", ID: msg.ID, Result: json.RawMessage(`{}`)}
 }
 
-// malformedDeny records a fail-closed audit deny for an enforced request rejected
-// BEFORE the PDP is consulted — unparseable params or an empty required target — then
-// returns the -32602 host response. Without the record these denials would leave no
-// trace on the tamper-evident tape, unlike every PDP deny and dispatchUnmapped, so a
-// probe of an enforced method with malformed input would be invisible to an auditor
-// (the "deny AND log" invariant). The method fills both the method and target audit
-// fields: the real target failed to parse or was empty, and the method is the only
-// stable identifier (mirroring dispatchList, where the method IS the target).
-//
-// The audit code is codeInvalidRequest (a host protocol fault), NOT
-// capability.ErrCodeInvalidParams: the target here is the METHOD name (the real target
-// could not be parsed), so a policy-mining consumer must skip it — IsInfraDenialCode
-// covers codeInvalidRequest, and suggest would otherwise fabricate a phantom target like
-// "tool:tools/call". ErrCodeInvalidParams is reserved for the manifest argumentSchema
-// denial, which carries a real target suggest must keep seeing. The host still gets the
-// standard -32602 (invalid params) JSON-RPC code, independent of the audit classification.
+// malformedDeny records a fail-closed audit deny for an enforced request rejected BEFORE the
+// PDP (unparseable params, empty target), so a probe with malformed input isn't invisible to
+// an auditor. Uses codeInvalidRequest, not capability.ErrCodeInvalidParams — the real target
+// never parsed, so IsInfraDenialCode lets suggest skip it rather than fabricate a phantom
+// target like "tool:tools/call".
 func (d dispatchParams) malformedDeny(ctx context.Context, msg mcp.RPCMsg, reason string) mcp.RPCMsg {
-	// Kill gate FIRST, so it uniformly precedes both malformed and well-formed enforced
-	// handling. The well-formed Decide* path consults the kill switch inside
-	// enforcedForwardCore, and the locally-answered set is gated at the dispatchRequest
-	// boundary — but the malformed path sits between them: it is a Decide* method (so it
-	// skips the boundary gate) yet is rejected BEFORE the PDP (so it never reaches
-	// enforcedForwardCore). Without this call a revoked session probing an enforced method
-	// with malformed params would be recorded as a request-shape fault (INVALID_REQUEST)
-	// rather than KILL_SWITCH — invisible to KILL_SWITCH-keyed triage of the continued
-	// activity. The request never reaches the upstream either way (the security property
-	// is intact); this corrects which signal the tamper-evident record carries. This is
-	// the one killDenied site the structural boundary gate cannot absorb.
+	// Kill gate FIRST: the malformed path is a Decide* method (skips the boundary gate) that's
+	// rejected before the PDP (never reaches enforcedForwardCore's own check), so without this
+	// a revoked session's malformed probe would be recorded as INVALID_REQUEST rather than
+	// KILL_SWITCH.
 	if resp, killed := d.killDenied(ctx, msg); killed {
 		return resp
 	}
@@ -443,17 +300,9 @@ func dispatchToolsCall(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mc
 	if params.Arguments == nil {
 		params.Arguments = map[string]interface{}{}
 	}
-	// The attribution interface: a cooperating client may attribute this call's inputs in
-	// `_meta`, and those labels are unioned into the session's accumulated set for this
-	// call's sink check. A malformed block is a malformed REQUEST, not a silently ignored
-	// hint — a client that tried to attribute a call and got the shape wrong must find
-	// out, rather than proceed believing a tightening is in force when it is not.
-	//
-	// Gated on honorAttribution, which is the DRAFT staging discipline: under the
-	// published grammar the whole block — including that malformed-request rejection — is
-	// skipped, so a `0.1` operator sees no behavior change from a token their grammar does
-	// not contain. Ignoring rather than rejecting is the conservative direction here
-	// because the interface is union-only and can only ever tighten.
+	// The attribution interface: `_meta`'s labels union into the session's accumulated set.
+	// A malformed block is a malformed REQUEST, not a silently ignored hint. Gated on
+	// honorAttribution (the draft-schema staging discipline) so a 0.1 operator sees no change.
 	decideCtx := d.decideCtx(ctx)
 	if d.honorAttribution {
 		declared, metaErr := capability.ParseContextManifest(params.Meta)
@@ -465,61 +314,36 @@ func dispatchToolsCall(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mc
 		}
 	}
 	dec := d.pdp.Decide(decideCtx, d.sessionID, pdp.EnforceTarget{Type: capability.TargetTypeTool, Name: params.Name}, params.Arguments, d.sourceIP)
-	// Close the per-session decision critical section here — the decision and its flow/
-	// sequence state write are done — so the upstream forward below runs concurrently.
-	// Everything after this reads the settled dec. A decision that authorized a
-	// declassification keeps the turn instead; see finishDecision.
+	// Close the decision critical section here so the forward below runs concurrently.
+	// A declassification-authorizing decision keeps the turn instead; see finishDecision.
 	d.finishDecision(dec)
 
-	// In audit mode the allow record logs the full tool arguments; otherwise none.
-	// Unlike resources/prompts, tools/call's details slot holds that argument map
-	// rather than an upstream_error_code note.
+	// In audit mode the allow record logs the full tool arguments; unlike resources/prompts,
+	// tools/call's details slot holds that argument map rather than an upstream_error_code note.
 	var toolDetails map[string]interface{}
-	// Log arguments under route-level --audit OR a per-constraint enforcement:audit
-	// decision (dec.AuditOnly). Guarding only on d.audit dropped the argument map for
-	// an observe-mode constraint, leaving its allow records without the very detail
-	// the operator attached audit mode to capture.
+	// Log arguments under route-level --audit OR a per-constraint enforcement:audit decision
+	// (dec.AuditOnly) — guarding only on d.audit dropped the map for observe-mode constraints.
 	if (d.audit || dec.AuditOnly) && len(params.Arguments) > 0 {
 		toolDetails = quarantineReservedArgs(params.Arguments)
 	}
 	out := enforcedForwardCore(ctx, d.forwardParams, d.pdp, msg, dec, capability.MethodToolsCall, params.Name, params.Name, "tool", true,
 		func(upResp mcp.RPCMsg) map[string]interface{} {
-			// Record the forwarded upstream's error code, as every other enforced method
-			// does, so a tools/call the upstream rejected is not byte-for-byte identical
-			// to a clean success on the tamper-evident tape. Reuse upstreamErrorDetail
-			// (the shared source of the field name and the never-record-the-message rule)
-			// and merge it into a COPY of toolDetails so the caller's live
-			// params.Arguments map is never mutated.
-			//
-			// No per-key collision branch here: quarantineReservedArgs has already moved
-			// every reserved name out of the caller's map before it became toolDetails, so
-			// nothing eunox writes below can shadow a real argument, and nothing a caller
-			// sent can be mistaken for something eunox wrote. That replaces a guard which
-			// covered only this one key and produced a shape (`{"arguments": {…}, …}`) that
-			// a miner could not tell apart from a tool genuinely called with an argument
-			// named "arguments" — see the disambiguation eunox suggest used to need.
+			// Record the upstream's forwarded error code so a rejected call isn't identical to
+			// a clean success on the tape. Merges into a COPY of toolDetails — never mutates
+			// the caller's live params.Arguments map. quarantineReservedArgs has already moved
+			// every reserved name out, so nothing here can shadow a real argument.
 			extra := upstreamErrorDetail(upResp)
-			// The signed effect receipt, verified here so its verdict rides the SAME allow
-			// record as the call it describes rather than a second one. A separate record
-			// was a second `decision: allow` for one tools/call: it double-counted allows in
-			// `eunox stats`, and `eunox suggest` mined its details as the caller's argument
-			// map — drafting allowedValues conditions on arguments no call carries, which
-			// denies every real call to that tool. nil when receipts are unconfigured or the
-			// server published none, which is the default and costs nothing.
+			// The signed effect receipt, verified here so its verdict rides the SAME allow record
+			// rather than a second one — a separate record double-counted allows in `eunox stats`
+			// and let `eunox suggest` mine it as a fake argument map. nil costs nothing.
 			receipt := d.effectReceiptDetail(upResp, dec, params.Name)
 			if receipt != nil {
 				if extra == nil {
 					extra = make(map[string]interface{}, 1)
 				}
-				// Under ONE reserved, underscore-prefixed key whose value is an object, so
-				// the verdict's several dimensions never flatten into the argument map a
-				// miner reads (see audit.EffectReceiptKey).
-				//
-				// Written into the ANNOTATION map this closure owns, never into
-				// mergeAuditDetails' return: the merge's contract is that its result is the
-				// caller's, and a caller that writes afterwards is one refactor away from
-				// writing into whichever input the merge happened to hand back — here, the
-				// live argument map the record exists to describe.
+				// One reserved, underscore-prefixed key so the verdict never flattens into the
+				// argument map a miner reads. Written into the ANNOTATION map this closure owns,
+				// never into mergeAuditDetails' return (whose contract is that it's the caller's).
 				extra[audit.EffectReceiptKey] = receipt
 			}
 			return mergeAuditDetails(toolDetails, extra)
@@ -527,26 +351,10 @@ func dispatchToolsCall(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mc
 	return out
 }
 
-// quarantineReservedArgs returns args with any key in eunox's own reserved details namespace
-// moved under a nested holder, so a caller-supplied tool argument can never land on the tape
-// spelled as a fact the proxy asserts. args is not mutated: on the overwhelmingly common
-// path (no reserved key) it is returned unchanged and nothing is allocated.
-//
-// A tools/call allow's details IS the caller's argument map under --audit, and eunox merges
-// its own annotations into that same map. Those annotations are read as proxy statements:
-// `eunox stats` counts details._eunox_declassify_commit_failed and prints an ATTENTION line
-// telling the operator their flow store faulted, and `eunox suggest` skips reserved keys
-// when mining arguments. Left alone, any client could put those keys in its arguments and
-// forge the alert — or, by repetition, bury a real one — on a proxy where no declassification
-// ever ran. The signed top-level fields (labels_cleared, approver, approval_id) are
-// structurally immune because they are not in this namespace; these keys are not, so the
-// namespace has to be defended at the point the caller's map enters it.
-//
-// Quarantining rather than dropping keeps the record faithful to the request: the argument
-// really was sent, and an auditor reconstructing the call should see it — just not in a
-// position where it reads as eunox's own annotation. This generalizes the single-key nested
-// fallback the upstream-error-code merge already performs, to every current and future
-// reserved key.
+// quarantineReservedArgs moves any key in eunox's reserved details namespace under a nested
+// holder, so a caller-supplied argument can never forge a proxy annotation on the tape — e.g.
+// spoofing the ATTENTION alert `eunox stats` prints for details._eunox_declassify_commit_failed.
+// Quarantining (not dropping) keeps the record faithful: the argument was really sent.
 func quarantineReservedArgs(args map[string]interface{}) map[string]interface{} {
 	reserved := false
 	for k := range args {
@@ -572,29 +380,17 @@ func quarantineReservedArgs(args map[string]interface{}) map[string]interface{} 
 }
 
 // effectReceiptDetail verifies the signed effect receipt an upstream published in the tool
-// result's `_meta` and returns the structured verdict for this call's audit record, or nil
-// when there is nothing to record.
+// result's `_meta` and returns the structured verdict, or nil when there's nothing to record.
 //
-// It is POST-HOC by construction and must stay so. The call has already been forwarded and
-// answered; a receipt cannot un-forward it, so an inconsistency is evidence on the tape and
-// an input to future friction, never a late denial. Nothing here touches the response the
-// host receives.
-//
-// It is also VERIFICATION ONLY: the declared block is read and nothing else. No
-// server-egress watching, no inference from the payload.
-//
-// Zero cost when unconfigured: with no key domain for this upstream (the default) this
-// returns before touching a single byte of the result.
+// POST-HOC by construction: the call has already run, so an inconsistency is evidence on the
+// tape, never a late denial. Verification only — no server-egress watching or inference.
 func (d dispatchParams) effectReceiptDetail(upResp mcp.RPCMsg, dec capability.EnforceResponse, tool string) map[string]interface{} {
 	if d.receipts == nil || upResp.Result == nil {
 		return nil
 	}
-	// A substring probe before the full decode. A tool result is the largest body on the
-	// wire — base64 image content, file reads, query dumps — and almost none of them carry
-	// a receipt, so paying a whole JSON scan per call to discover its absence is the cost
-	// this avoids. A miss is safe in the only direction that matters: an escaped or
-	// otherwise unrecognizable key reads as "no receipt", which earns nothing, exactly as
-	// the default does.
+	// A substring probe before the full decode: a tool result is the largest body on the wire
+	// and almost none carry a receipt, so this avoids a whole JSON scan per call. A miss is
+	// safe — it just reads as "no receipt".
 	if !bytes.Contains(upResp.Result, []byte(capability.MetaKeyEffectReceipt)) {
 		return nil
 	}
@@ -608,19 +404,16 @@ func (d dispatchParams) effectReceiptDetail(upResp mcp.RPCMsg, dec capability.En
 	if !present {
 		return nil
 	}
-	// Only an allowed call reached the upstream, and only an allow carries a resolved
-	// contract to check the attestation against. An observe-mode forward is deliberately
-	// included: the call ran, so the server's account of it is worth the same scrutiny —
-	// it just has no declaration to compare against, which Verify handles.
+	// Only an allow carries a resolved contract to check against. Observe-mode forwards are
+	// included deliberately — the call ran, so it's worth the same scrutiny — Verify handles
+	// having no declaration to compare against.
 	result := d.receipts.Verify(raw, tool, dec.Effect, time.Now())
 	if result == nil {
 		return nil
 	}
 	if result.Verdict == capability.ReceiptInconsistent {
-		// The one verdict that is a finding rather than bookkeeping: a server whose own
-		// signed account contradicts the contract policy was written against. Surfaced on
-		// the operator's stderr channel beside the interface-drift findings, because a
-		// contract that no longer describes its tool is a policy defect a human must act on.
+		// The one verdict that is a finding rather than bookkeeping: the server's own signed
+		// account contradicts the contract policy was written against.
 		fmt.Fprintf(os.Stderr,
 			"[eunox] WARN effect-receipt tool=%q — the upstream's signed receipt contradicts the effect contract this policy declares (%s); the call already ran, so this is evidence, not a refusal\n",
 			audit.SanitizeAuditField(tool), strings.Join(result.Reasons, ", "))
@@ -662,32 +455,15 @@ func dispatchResourcesSubscribe(ctx context.Context, d dispatchParams, msg mcp.R
 	return enforcedForwardCore(ctx, d.forwardParams, d.pdp, msg, dec, capability.MethodResourcesSubscribe, params.URI, params.URI, "resource subscription", false, upstreamErrorDetail)
 }
 
-// dispatchResourcesUnsubscribe enforces resources/unsubscribe against the SAME manifest
-// entry as resources/read and resources/subscribe (identical wire shape: a single uri), but
-// through DecideResourceCancel rather than DecideResourceRead — the URI must still be
-// permitted, and no consumable policy state is charged for cancelling.
+// dispatchResourcesUnsubscribe enforces resources/unsubscribe against the SAME manifest entry
+// as resources/read/subscribe, but through DecideResourceCancel rather than DecideResourceRead
+// — the URI must still be permitted, but no policy state is charged for cancelling.
 //
-// It is mapped rather than left to the fail-closed default deliberately. Unmapped is the
-// right default for a method whose effect the proxy cannot reason about, but this one is
-// the exact inverse of a method that IS enforced and forwarded: a host that subscribed to
-// a permitted resource could never cancel through the proxy, so the upstream kept pushing
-// resource-updated notifications for the rest of the session. Denying it protected
-// nothing — it only ever REDUCES data flow — while costing the host the one way to stop a
-// stream it already established.
-//
-// Routing it through the cancel decision instead of the read decision is what makes that
-// argument hold in practice. A read decision is metered: it spends the URI's maxCalls
-// budget, records a sequenceBlock antecedent, and applies the entry's labelOutput taint.
-// Charging a cancellation that way reintroduces the very failure this handler exists to
-// remove — a one-call budget spent by the subscribe leaves the unsubscribe denied
-// RATE_LIMITED, so the stream can never be stopped — and taints the session for a request
-// that transfers no data. DecideResourceCancel keeps the match requirement (a URI the
-// manifest never permitted was never subscribable, so an unsubscribe naming it is a host
-// talking about a channel it does not have) and drops the metering, which also keeps the
-// audit trail symmetric: every subscribe on the tape has its matching unsubscribe.
-//
-// d.decideCtx is deliberately NOT applied: its only effect is the observe-mode quota skip,
-// and this path consumes no quota in either mode.
+// Mapped rather than left to the fail-closed default deliberately: unsubscribe only ever
+// REDUCES data flow, so denying it protects nothing while costing the host its one way to
+// stop a stream it already established. Using the cancel (not read) decision avoids charging
+// maxCalls/sequenceBlock/labelOutput for a call that transfers no data — a metered read would
+// let a one-call subscribe budget block the matching unsubscribe forever.
 func dispatchResourcesUnsubscribe(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
 	var params mcp.ResourceReadParams
 	if err := mcp.DecodeParams(msg.Params, &params); err != nil {
@@ -720,35 +496,22 @@ func dispatchPromptsGet(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) m
 	return enforcedForwardCore(ctx, d.forwardParams, d.pdp, msg, dec, capability.MethodPromptsGet, "prompts/"+params.Name, params.Name, "prompt", true, upstreamErrorDetail)
 }
 
-// dispatchList forwards a */list request to the upstream and prunes the result
-// to permitted entries (filter selects the ListFilterer method for the flavor).
-// When no policy is configured an enforce route uses DenyAllPDP and the list is
-// filtered to empty (fail closed); only an audit-mode (AlwaysAllowPDP) wiretap
-// route returns the upstream catalog unfiltered. The enumeration is recorded —
-// listing is a common reconnaissance step — and upstreamErrorDetail distinguishes
-// a forwarded upstream error from a clean enumeration.
+// dispatchList forwards a */list request to the upstream and prunes the result to permitted
+// entries. No policy configured uses DenyAllPDP, filtering to empty (fail closed); only an
+// audit-mode wiretap route returns the catalog unfiltered. The enumeration is recorded, since
+// listing is a common reconnaissance step.
 func dispatchList(ctx context.Context, d dispatchParams, msg mcp.RPCMsg, filter func(pdp.ListFilterer, context.Context, json.RawMessage) pdp.ListFilterResult) mcp.RPCMsg {
-	// The kill-switch check runs at the dispatchRequest boundary for the whole
-	// locally-answered set (a killed session must not enumerate the catalog), so this
-	// handler no longer self-gates. The enforced Decide* paths embed their own check;
-	// */list does not flow through them, hence its place in the boundary-gated set.
+	// The kill-switch check runs at the dispatchRequest boundary (a killed session must not
+	// enumerate the catalog), so this handler no longer self-gates.
 
-	// --require-audit=strict: once the audit trail has degraded, fail the
-	// enumeration closed rather than forward an unrecorded one (mirroring
-	// enforcedForwardCore). strictAuditDenial's three string args (audit id, method,
-	// denial target) all collapse to the method name here: a */list request
-	// addresses no sub-target, so the method IS the target. The repetition is
-	// intentional.
-	// nil extra: a */list is never an enforced decision, so it can carry no
-	// declassification for a gate block to report.
+	// --require-audit=strict: fail the enumeration closed rather than forward an unrecorded
+	// one. The three string args collapse to the method name: a */list has no sub-target.
 	if denied, blocked := d.strictAuditDenial(ctx, msg, msg.Method, msg.Method, msg.Method, capability.EnforceResponse{}); blocked {
 		return denied
 	}
 
-	// The ListFilterer/RecordObservedToolHashes seams take (ctx, result) and no session —
-	// unlike the enforced Decide* paths, which receive it as a parameter — so the session
-	// id rides the context, as JWT claims already do. The Tier-2 interface baseline is
-	// per-session (see pdp.SurfaceBaseline), so both paths below need it.
+	// ListFilterer/RecordObservedToolHashes take (ctx, result), no session param, so the
+	// session id rides the context (the per-session Tier-2 baseline needs it).
 	ctx = pdp.WithSessionID(ctx, d.sessionID)
 
 	upResp, err := d.callUpstream(ctx, msg)
@@ -756,14 +519,9 @@ func dispatchList(ctx context.Context, d dispatchParams, msg mcp.RPCMsg, filter 
 		return d.recordUpstreamFailure(ctx, msg, err, msg.Method, msg.Method, nil)
 	}
 
-	// Defense-in-depth: a non-error response carrying no result is malformed, and
-	// forwarding it verbatim would bypass list filtering (filtering operates on the
-	// result). callUpstream now rejects a neither-result-nor-error reply before it
-	// returns (awaitNonced's isMalformedResponse check, shared with the HTTP-upstream
-	// bridge), so this is no longer reachable via a live upstream — but it is kept as
-	// a cheap fail-closed backstop against a future path that bypasses that check.
-	// (An upstream ERROR response — Error != nil, Result nil — is a legitimate
-	// diagnostic and is forwarded below.)
+	// Defense-in-depth: a neither-result-nor-error reply is malformed, and forwarding it
+	// would bypass list filtering. callUpstream now rejects this before returning, so it's
+	// no longer reachable live — kept as a backstop against a future bypass.
 	if upResp.Error == nil && upResp.Result == nil {
 		warnIfStrictAuditJustDegraded(d.requireAuditStrict, d.rec, msg.Method, msg.Method, func() {
 			if d.rec != nil {
@@ -773,62 +531,40 @@ func dispatchList(ctx context.Context, d dispatchParams, msg mcp.RPCMsg, filter 
 		return mcp.ErrorResponse(msg.ID, jsonRPCCodeInternalError, "upstream returned a malformed list response (no result and no error)")
 	}
 
-	// Mark a tools/list observation that covers the WHOLE advertised surface, so the
-	// Tier-2 baseline can report a tool APPEARING or DISAPPEARING mid-session and not only
-	// a surface rewrite. Without this the only complete observation a session ever took was
-	// the session-start drift probe — always that session's FIRST, and therefore never
-	// comparable against an earlier one — so those two findings could not fire at all, and
-	// a session on a route with no drift check took no complete observation whatsoever. See
-	// completeToolsListing for what makes a listing complete; an incomplete one still
-	// baselines and re-diffs each tool it carries, which is where the pin BREAK comes from.
+	// Mark a tools/list observation that covers the WHOLE surface, so Tier-2 can report a tool
+	// appearing/disappearing mid-session — without this, the only complete observation was the
+	// session-start probe, which has nothing to compare against. See completeToolsListing.
 	if msg.Method == capability.MethodToolsList && upResp.Result != nil && completeToolsListing(msg.Params, upResp.Result) {
 		ctx = pdp.WithCompleteToolListing(ctx)
 	}
 
-	// In audit (observe/wiretap) mode the enumeration must return the full upstream
-	// catalog: filtering here would hide tools the host can still CALL (deny
-	// downgraded to observe), contradicting "observe everything, block nothing".
+	// In audit mode the enumeration must return the full catalog: filtering would hide tools
+	// the host can still CALL (deny downgraded to observe).
 	//
 	// The upstream and filtered entry counts feed only the allow record below.
 	var upstreamCount, filteredCount int
 	switch {
 	case upResp.Result != nil && !d.audit:
-		// Only the manifest filter is bypassed in audit mode; the kill-switch check
-		// above stays unconditional (a kill hard-blocks even in audit mode). d.pdp is
-		// always non-nil (see dispatchParams), so a "no policy" route uses DenyAllPDP —
-		// which filters the catalog to empty — rather than forwarding it verbatim. The
-		// filter computes both entry counts while pruning, so the record reads them
-		// directly rather than re-parsing the catalog.
+		// d.pdp is always non-nil (see dispatchParams), so "no policy" uses DenyAllPDP,
+		// filtering to empty rather than forwarding verbatim.
 		fr := filter(d.pdp, ctx, upResp.Result)
 		upResp.Result = fr.Result
 		upstreamCount, filteredCount = fr.Upstream, fr.Kept()
 	case msg.Method == capability.MethodToolsList && upResp.Result != nil:
-		// Audit mode tools/list (the enforce-mode case above already handled a non-audit
-		// non-nil result, so reaching here means audit mode; the filter is bypassed, so
-		// upstream == filtered — the full catalog is forwarded verbatim). This is what
-		// lets the call-leg descriptionHash pin fire on a mid-session description
-		// rotation, a hard deny that must hold EVEN under --audit — so it runs
-		// UNCONDITIONALLY, never gated on d.rec: an audit-mode route with no sink
-		// configured must still have that defense armed, not silently disarmed for lack
-		// of a configured recorder. Its return value is this decode's entry count, so no
-		// second decode of the same bytes is needed for the audit record below.
+		// Audit mode tools/list: filter bypassed, but this arms the descriptionHash pin
+		// (must hold EVEN under --audit) — runs unconditionally, never gated on d.rec.
 		upstreamCount = d.pdp.RecordObservedToolHashes(ctx, upResp.Result)
 		filteredCount = upstreamCount
 	case d.rec != nil:
-		// Audit mode on resources/prompts (no descriptionHash pin to arm), or a nil
-		// result: the verbatim upstream catalog is returned with no filtering, so
-		// upstream == filtered. Count only when a recorder will actually read it, so a
-		// route with no sink pays no decode cost here.
+		// Audit mode on resources/prompts, or a nil result: verbatim, no filtering. Count
+		// only when a recorder will read it, so a route with no sink pays no decode cost.
 		upstreamCount = pdp.CountListEntries(msg.Method, upResp.Result)
 		filteredCount = upstreamCount
 	}
 
-	// AuditOnly never applies to list methods (no per-entry deny to downgrade), so
-	// d.audit alone carries the observe posture. The allow details carry filter
-	// statistics so an auditor can tell an empty client view caused by policy
-	// filtering from a genuinely empty upstream. This *list enumeration follows the
-	// same gate-before/record-after shape as enforcedForwardCore, so it gets the
-	// same immediate boundary-call diagnostic under strict mode.
+	// AuditOnly never applies to list methods, so d.audit alone carries the observe posture.
+	// Details carry filter statistics so an auditor can tell filtering from a genuinely empty
+	// upstream apart.
 	warnIfStrictAuditJustDegraded(d.requireAuditStrict, d.rec, msg.Method, msg.Method, func() {
 		if d.rec != nil {
 			d.rec.RecordAllow(ctx, d.sessionID, msg.Method, msg.Method, listAllowDetails(upResp, upstreamCount, filteredCount, d.audit), nil, d.audit, nil, nil)
@@ -839,23 +575,18 @@ func dispatchList(ctx context.Context, d dispatchParams, msg mcp.RPCMsg, filter 
 	return upResp
 }
 
-// listAllowDetails builds the structured audit details for a */list allow:
-// filter statistics (upstream/filtered/suppressed counts) plus, when present, the
-// forwarded upstream JSON-RPC error code. The counts live in the existing details
-// map (no new top-level audit field) and show how much the manifest pruned.
-// observeMode marks the audit/observe posture so a reader can tell a 0 suppressed
-// count caused by bypassed filtering from one caused by an all-permitting manifest.
+// listAllowDetails builds the structured audit details for a */list allow: filter statistics
+// plus, when present, the forwarded upstream JSON-RPC error code. observeMode marks the
+// audit/observe posture so a reader can distinguish a policy-filtered 0 from an all-permitting
+// manifest.
 func listAllowDetails(upResp mcp.RPCMsg, upstreamCount, filteredCount int, observeMode bool) map[string]interface{} {
 	details := map[string]interface{}{
 		"upstream_count":   upstreamCount,
 		"filtered_count":   filteredCount,
 		"suppressed_count": upstreamCount - filteredCount,
 	}
-	// In audit (observe) mode the manifest filter is bypassed, so suppressed_count is 0
-	// because nothing was filtered — NOT because the manifest permits every entry. Stamp
-	// observe_mode so an auditor comparing an enforce-mode log to an observe-mode one
-	// does not misread "suppressed_count: 0" as "policy allows all". Only set when true,
-	// so enforce-mode records keep their existing shape.
+	// In observe mode suppressed_count is 0 because filtering is bypassed, not because the
+	// manifest permits everything. Stamp observe_mode so an auditor doesn't misread that.
 	if observeMode {
 		details["observe_mode"] = true
 	}
@@ -867,34 +598,20 @@ func listAllowDetails(upResp mcp.RPCMsg, upstreamCount, filteredCount int, obser
 	return details
 }
 
-// completeToolsListing reports whether a tools/list request and the upstream response to
-// it, together, cover the WHOLE advertised tool set — the precondition Tier-2 requires
-// before it may conclude that a tool is missing rather than merely on another page.
-//
-// Both halves are load-bearing. A request carrying a `cursor` asked for ONE page by
-// definition, so its response says nothing about the rest. A response carrying a
-// `nextCursor` has more pages behind it. Only a cursor-less request answered with a
-// cursor-less response is the entire surface, and that is the ordinary shape: pagination
-// is optional in MCP and most servers return every tool in one reply.
-//
-// Every ambiguous input reports false — unparseable params, a non-object result, bytes
-// that do not decode. False is the conservative direction: it suppresses the advisory
-// added/removed findings and never suppresses a surface-change break, which is per-tool
-// and needs no membership knowledge.
+// completeToolsListing reports whether a request/response pair together cover the WHOLE
+// advertised tool set — the precondition Tier-2 needs before concluding a tool is missing
+// rather than merely on another page. A cursored request or a nextCursor response means
+// false; every ambiguous input reports false too (the conservative direction).
 func completeToolsListing(params, result json.RawMessage) bool {
 	if len(params) > 0 {
-		// Cursor as a *string, not a string: a request that sends `"cursor": null` (a
-		// client filling an optional field) is asking for the first page, exactly as an
-		// absent key does, and must not be read as a paginated fetch.
+		// Cursor as a *string, not a string: `"cursor": null` asks for the first page, exactly
+		// as an absent key does, and must not be read as a paginated fetch.
 		var req struct {
 			Cursor *string `json:"cursor"`
 		}
-		// mcp.DecodeParams, not a bare json.Unmarshal: it rejects a duplicate or
-		// case-folded object key before decoding. Go keeps the LAST value on a duplicate,
-		// so `{"cursor":"page2","cursor":null}` would otherwise decode to "no cursor" and
-		// mark a single-page fetch COMPLETE — after which Tier-2 reports every tool on the
-		// remaining pages as removed. Every other params decode in this file already goes
-		// through it; this is the same parser differential, reached through a new door.
+		// mcp.DecodeParams, not json.Unmarshal: it rejects a duplicate key before decoding, so
+		// `{"cursor":"page2","cursor":null}` can't decode to "no cursor" and falsely mark a
+		// single-page fetch COMPLETE.
 		if err := mcp.DecodeParams(params, &req); err != nil {
 			return false
 		}
@@ -915,23 +632,13 @@ func completeToolsListing(params, result json.RawMessage) bool {
 // with AUTHORIZATION_FAILED and never forwarded to the upstream. The method name
 // is logged so operators can detect protocol drift or novel MCP extensions.
 func dispatchUnmapped(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
-	// The kill-switch check runs at the dispatchRequest boundary for the whole
-	// locally-answered set, so a killed session is reported as KILL_SWITCH (not
-	// AUTHORIZATION_FAILED) before ever reaching this handler — triage and
-	// KILL_SWITCH-keyed alerting see the revocation. This handler is the fail-closed
-	// default for a live session's unmapped method.
-	// msg.Method is attacker-controlled (it arrives in the host JSON-RPC envelope).
-	// %q already escapes control runes, but sanitize first for defense in depth and
-	// consistency with the audit log's own diagnostic output, so a method name
-	// carrying control characters cannot shape this line for a downstream log parser.
-	// Sanitize once and reuse for the host-facing denial too: the method also flows
-	// into denialResult's error message, so the two host/log surfaces stay symmetric.
-	// The structured audit field stays the raw method — the record is JSON-encoded,
-	// which escapes control runes, and RecordDeny owns its own fields.
+	// Kill-switch check runs at the dispatchRequest boundary, so a killed session is reported
+	// as KILL_SWITCH before reaching this handler. msg.Method is attacker-controlled; sanitize
+	// once and reuse for both the stderr line and the host-facing denial. The structured audit
+	// field stays raw (JSON-encoding already escapes control runes).
 	sanitizedMethod := audit.SanitizeAuditField(msg.Method)
-	// Record-before-act: write the tamper-evident audit record before the stderr
-	// notice, so a crash between the two never leaves a SIEM alert with no
-	// corresponding audit trail entry.
+	// Record-before-act: write the audit record before the stderr notice, so a crash between
+	// the two never leaves a SIEM alert with no corresponding audit trail entry.
 	if d.rec != nil {
 		d.rec.RecordDeny(ctx, d.sessionID, msg.Method, msg.Method, capability.ErrCodeAuthorizationFailed, "", nil, false)
 	}

@@ -24,10 +24,6 @@ import (
 	"github.com/eunolabs/eunox/internal/config"
 )
 
-// -----------------------------------------------------------------
-// HMAC key management
-// -----------------------------------------------------------------
-
 // tightenLogMode drops any group/world access from an already-open log file,
 // preserving owner bits, re-securing a log left readable by a looser umask, a
 // restore, or a pre-created path (O_CREATE's restrictive mode applies only on

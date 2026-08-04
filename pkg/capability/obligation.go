@@ -21,8 +21,7 @@ func (o Obligation) MarshalJSON() ([]byte, error) {
 	switch o.Type {
 	case DirectiveTypeRedactFields:
 		// Normalize a nil Paths to an empty slice so the marshaled shape is always
-		// "paths":[], never "paths":null, matching the package's "always [], never
-		// null" convention for the obligations/directives surface.
+		// "paths":[], never "paths":null.
 		paths := o.Paths
 		if paths == nil {
 			paths = []string{}
@@ -39,12 +38,9 @@ func (o Obligation) MarshalJSON() ([]byte, error) {
 	}
 }
 
-// UnmarshalJSON deserializes Obligation based on its discriminator. No production
-// path decodes an Obligation today (obligations are only ever constructed via
-// Directive.ToObligation and marshaled out); this exists for symmetry with
-// MarshalJSON on this exported pkg/capability type — reflection-based default
-// unmarshal would silently accept an unknown Type instead of failing closed, and
-// is exercised by TestObligation_PopulatedPathsRoundTrip.
+// UnmarshalJSON deserializes Obligation based on its discriminator. No production path
+// decodes an Obligation today; this exists for symmetry with MarshalJSON — reflection-based
+// default unmarshal would silently accept an unknown Type instead of failing closed.
 func (o *Obligation) UnmarshalJSON(data []byte) error {
 	var envelope struct {
 		Type string `json:"type"`

@@ -24,89 +24,57 @@ const (
 	redisSessionPfx  = "killswitch:session:"
 	redisPubSubChan  = "killswitch:events"
 
-	// defaultReconcileInterval is how often the local cache is fully refreshed from
-	// Redis, independent of pub/sub. Pub/sub is at-most-once, so a kill event lost
-	// during a brief disconnect would never be observed without this; it also
-	// re-converges a replica that started degraded (Redis unreachable at boot) and
-	// bounds how long degraded mode persists after recovery.
+	// defaultReconcileInterval is how often the local cache is fully refreshed from Redis,
+	// independent of pub/sub, so an at-most-once kill event lost during a brief
+	// disconnect is still observed, and a degraded-boot replica re-converges.
 	defaultReconcileInterval = 30 * time.Second
 
-	// defaultSessionKillTTL bounds how long a SESSION kill tombstone lives in Redis.
-	//
-	// Session ids are ephemeral -- one MCP connection, bounded by the idle reaper and the
-	// proxy's own lifetime -- but their tombstones were written with no expiry, so a
-	// long-running deployment accumulated one dead key per killed session forever, with
-	// nothing to ever collect them. That is unbounded Redis memory growth, and every
-	// reconcile SCAN pays for it.
-	//
-	// This is a garbage-collection bound, NOT a policy expiry, and the default is chosen
-	// to make that distinction safe: 30 days is orders of magnitude longer than any
-	// session can live, so a tombstone can only expire long after the session it names is
-	// gone. Note the direction of the risk if it were set too low -- an expiring tombstone
-	// LIFTS the kill -- so a value shorter than the longest session a deployment can hold
-	// open would be a fail-open. AGENT kills are deliberately NOT expired: an agent
-	// identity is long-lived and its revocation is meant to be durable.
+	// defaultSessionKillTTL bounds how long a SESSION kill tombstone lives in Redis: a
+	// garbage-collection bound (unbounded tombstones from ephemeral session ids would
+	// otherwise accumulate forever), NOT a policy expiry. 30 days is far longer than any
+	// session can live, so a value shorter than that would be a fail-open (expiry LIFTS
+	// the kill). AGENT kills are never expired: that identity is long-lived.
 	defaultSessionKillTTL = 30 * 24 * time.Hour
 )
 
 // DefaultSessionKillTTL is the exported form of the default session-tombstone lifetime,
-// so the binary's startup banner can state the effective value rather than restating the
-// number and drifting from it.
+// so the binary's startup banner states it without restating (and risking drifting from) it.
 const DefaultSessionKillTTL = defaultSessionKillTTL
 
 // subscribeConfirmTimeout bounds the initial pub/sub subscription-confirmation read in
-// Start. pubsub.Receive issues a deadline-less socket read (go-redis passes timeout=0),
-// so a blackholed or half-open connection -- the TCP dial and SUBSCRIBE write are
-// accepted but the confirmation never arrives -- would block Start forever. Start holds
-// lifeMu across that call and Stop must take lifeMu to reach r.cancel, so an unbounded
-// block deadlocks a concurrent Stop (the cancel that could unblock the read is itself
-// unreachable). Bounding the confirmation read funnels a hung subscribe into the same
-// retried, reconcile-only degraded mode as an outright subscribe error. A var, not a
-// const, only so the deadlock regression test can shrink it; production never mutates it.
+// Start: pubsub.Receive's deadline-less socket read would otherwise block a blackholed
+// connection forever, and Start holds lifeMu across it, deadlocking a concurrent Stop. A
+// var, not a const, only so the deadlock regression test can shrink it.
 var subscribeConfirmTimeout = 5 * time.Second
 
-// subscribeRetryInitialDelay and subscribeRetryMaxDelay bound the background
-// resubscribe backoff. Because subscribeConfirmTimeout is a hard cutoff, a
-// slow-but-healthy Redis -- a failover, a load spike, a saturated link -- can miss the
-// confirmation deadline without being down. Without a retry that instance would run
-// reconcile-only for its entire lifetime, stretching kill propagation from
-// milliseconds to a full reconcile interval until someone restarted the process. The
-// backoff keeps a genuinely unreachable backend from being hammered. Vars, not consts,
-// only so tests can shrink them; production never mutates them.
+// subscribeRetryInitialDelay and subscribeRetryMaxDelay bound the background resubscribe
+// backoff: since subscribeConfirmTimeout is a hard cutoff, a merely slow (not down) Redis
+// can miss it and would otherwise run reconcile-only for the rest of its lifetime. Vars,
+// not consts, only so tests can shrink them.
 var (
 	subscribeRetryInitialDelay = 1 * time.Second
 	subscribeRetryMaxDelay     = 30 * time.Second
 )
 
-// pubSubClient is the optional Subscribe facet of the Redis client. redis.Cmdable
-// does not include Subscribe (a limited Cmdable or a test fake may omit it), so the
-// capability is detected by assertion and the subscription path is skipped when it is
-// absent.
+// pubSubClient is the optional Subscribe facet of the Redis client. redis.Cmdable does
+// not include Subscribe, so the capability is detected by assertion and skipped when absent.
 type pubSubClient interface {
 	Subscribe(ctx context.Context, channels ...string) *redis.PubSub
 }
 
-// ErrBackendUnreachable is returned by ShouldBlock in the default fail-closed
-// degraded mode when the most recent Redis refresh failed, so the cache may be
-// stale; the caller treats it as a denial. The underlying Redis error is NOT
-// wrapped so backend connection details do not leak into a client-facing message;
-// operators read the real error from HealthStatus().
+// ErrBackendUnreachable is returned by ShouldBlock in the default fail-closed degraded
+// mode when the most recent Redis refresh failed, so the cache may be stale. The
+// underlying error is NOT wrapped so connection details don't leak; see HealthStatus().
 var ErrBackendUnreachable = errors.New("killswitch: redis backend unreachable; failing closed (kill-switch state cannot be confirmed)")
 
-// ErrNotStarted is returned by ShouldBlock before Start has loaded the initial
-// kill-switch state. The local cache has never been seeded from Redis, so the
-// switch cannot tell "nothing is killed" from "state never loaded": it fails closed
-// (the caller treats it as a denial) rather than admit every request as a silent
-// no-op. Unlike ErrBackendUnreachable this is a WIRING error, not a transient
-// outage, so it fails closed regardless of WithFailOpen — an unstarted kill switch
-// is never an all-clear.
+// ErrNotStarted is returned by ShouldBlock before Start has loaded initial state: the
+// cache cannot tell "nothing is killed" from "never loaded", so it fails closed
+// regardless of WithFailOpen — a WIRING error, not a transient outage.
 var ErrNotStarted = errors.New("killswitch: redis kill switch queried before Start(); failing closed (state never loaded)")
 
-// ErrStopped is returned by ShouldBlock on a non-match after the Start context has
-// been canceled and the reconcile/pub-sub loops have exited. The cache can no longer
-// converge, so a non-match is unconfirmed. Like ErrNotStarted this is a liveness
-// (not transient-outage) condition, so it fails closed regardless of WithFailOpen —
-// a frozen kill switch must never be a silent all-clear.
+// ErrStopped is returned by ShouldBlock on a non-match once the Start context is
+// canceled and the convergence loops have exited: like ErrNotStarted, a liveness
+// condition that fails closed regardless of WithFailOpen.
 var ErrStopped = errors.New("killswitch: redis kill switch convergence stopped (Start context canceled); failing closed (state can no longer be confirmed)")
 
 // Redis is a Redis-backed kill-switch manager with pub/sub propagation and local cache.
@@ -114,22 +82,16 @@ type Redis struct {
 	client redis.Cmdable
 	logger *slog.Logger
 
-	// observers receive a Revocation the moment this instance's local view gains one. It is
-	// what makes a kill issued ELSEWHERE — `eunox kill --redis-addr`, or a sibling instance's
-	// /control/kill — reclaim anything here: this instance learns of it through pub/sub or
-	// the reconcile scan and has no request to hang a teardown off. Fired from BOTH paths, so
-	// a dropped publish still reclaims on the next reconcile rather than waiting for whatever
-	// sweep the consumer happens to run. See Manager.ObserveRevocations.
+	// observers receive a Revocation the moment this instance's local view gains one,
+	// including a kill issued ELSEWHERE that this instance learns of via pub/sub or the
+	// reconcile scan and has no request to hang a teardown off. Fired from BOTH paths, so
+	// a dropped publish still reclaims on the next reconcile. See Manager.ObserveRevocations.
 	observers revocationObservers
 
-	// refreshMu serializes refreshState so two refreshes cannot overlap. Their
-	// snapshots are built lock-free (outside mu, so ShouldBlock is never stalled on
-	// Redis I/O), and the commit is guarded only by cacheGen against a racing cache
-	// MUTATION -- but two concurrent refreshes capture the same cacheGen and neither
-	// commit bumps it, so an OLDER scan could commit after (and overwrite) a NEWER
-	// one, erasing a kill until the next reconcile tick. Serializing here makes
-	// commits land in scan order. Distinct from mu on purpose: the scan must stay
-	// off the hot-path lock.
+	// refreshMu serializes refreshState so two scans cannot commit out of order: cacheGen
+	// alone only guards against a racing cache MUTATION, not a second concurrent refresh
+	// capturing the same generation, which could let an older scan overwrite a newer one.
+	// Distinct from mu since the scan must stay off the hot-path lock.
 	refreshMu sync.Mutex
 
 	// Local cache for fast reads (refreshed via pub/sub and the reconcile loop).
@@ -138,62 +100,36 @@ type Redis struct {
 	killedAgents   map[string]bool
 	killedSessions map[string]bool
 	lastRefreshErr error // last refresh error; nil means healthy
-	// lastRefreshOK is when a refresh last CONFIRMED state against Redis. It exists
-	// because lastRefreshErr is edge-triggered: it is only set once a refresh has run
-	// AND failed. If Redis partitions immediately after a successful refresh, no refresh
-	// has failed yet, so lastRefreshErr stays nil and — in fail-CLOSED mode, whose whole
-	// promise is that an unconfirmable request is denied — every non-match was served
-	// `false, nil` from a cache that could no longer see a new kill. Pub/sub is down
-	// during the same partition, so a kill issued via a reachable replica was invisible
-	// for the entire window; a wedged reconcile loop made it indefinite. Gating on
-	// staleness makes the fail-closed guarantee time-bounded rather than
-	// failure-detection-bounded. Zero means no refresh has ever succeeded.
+	// lastRefreshOK is when a refresh last CONFIRMED state against Redis. lastRefreshErr
+	// is edge-triggered (set only once a refresh has run AND failed), so a partition
+	// beginning right after a success would otherwise leave fail-closed mode serving a
+	// stale all-clear indefinitely; staleness makes that guarantee time-bounded instead
+	// of failure-detection-bounded. Zero means no refresh has ever succeeded.
 	lastRefreshOK time.Time
-	// cacheGen is bumped under mu on every local-cache mutation. refreshState
-	// captures it before its lock-free Redis scan and only commits the snapshot if it
-	// is unchanged; otherwise a kill applied during the scan would be erased by the
-	// stale snapshot, failing open until the next reconcile.
+	// cacheGen is bumped under mu on every local-cache mutation. refreshState captures it
+	// before its lock-free scan and only commits if unchanged, or a kill applied during
+	// the scan would be erased by the stale snapshot until the next reconcile.
 	cacheGen uint64
-	// reconcileErrLogged is true once a background-refresh failure has been logged,
-	// so a sustained outage does not warn on every tick. Reset on recovery. Distinct
-	// from lastRefreshErr (the authoritative health signal); this only throttles the
-	// operator log breadcrumb.
+	// reconcileErrLogged edge-triggers the background-refresh-failure warning so a
+	// sustained outage does not log every tick. Distinct from lastRefreshErr (the
+	// authoritative health signal); this only throttles the breadcrumb.
 	reconcileErrLogged bool
 
-	// sessionTTLWarnedPrior dedupes the periodic session-kill-TTL disagreement warning on
-	// the PRIOR VALUE rather than on a bare "already warned" flag, so a persistent
-	// disagreement warns once while a changed one warns again.
-	// Without the dedupe this line prints every reconcile interval for the life of the
-	// process, which is how a real diagnostic gets tuned out. See
-	// refreshPublishedSessionKillTTL.
+	// sessionTTLWarnedPrior dedupes the session-kill-TTL disagreement warning on the
+	// PRIOR VALUE, not a bare flag, so a persistent disagreement warns once while a
+	// changed one warns again. See refreshPublishedSessionKillTTL.
 	sessionTTLWarnedPrior string
-	// sessionTTLPublishErrLogged edge-triggers the re-publish failure warning, exactly
-	// as reconcileErrLogged does for the cache refresh on the same loop.
+	// sessionTTLPublishErrLogged edge-triggers the re-publish failure warning, mirroring
+	// reconcileErrLogged on the same loop.
 	sessionTTLPublishErrLogged bool
 
-	// sessionTTLPublished latches when an explicit PublishSessionKillTTL is CALLED, and arms
-	// the reconcile loop's republish. Until then the loop's tick publishes nothing.
-	//
-	// It is what makes the loop honour the "call once at startup, then the loop keeps it
-	// alive" contract the republish documents rather than only describing it. The key is
-	// last-writer-wins, and the binary publishes it ONLY from each transport's ready hook
-	// precisely so a process that dies on the way up cannot clobber a running proxy's value.
-	// But Start (and therefore this loop) runs BEFORE the serve call, so any startup that
-	// survived one reconcile interval before failing — a wedging stdio handshake, a slow
-	// drift probe, a strict-drift refusal — published its TTL anyway; at the 1s interval the
-	// flag's own help recommends, virtually every startup failure did. An `eunox kill` in
-	// that window then wrote a tombstone with the doomed proxy's lifetime.
-	//
-	// Called, NOT succeeded. The ordering this protects is "the ready hook has run"; a
-	// startup publish that reached Redis and failed is a proxy that IS serving, and the tick
-	// retrying is the self-healing the unconditional SET used to provide (the caller warns
-	// and continues by design — see cmd/eunox's publishSessionKillTTL). Latching on success
-	// would have left a proxy that booted during a brief Redis outage with the republish and
-	// its own edge-triggered warning both dead for the life of the process, and `eunox kill`
-	// falling back to its own default — the direction the threat model calls unsafe.
-	//
-	// atomic rather than mu-guarded: it is read on the reconcile goroutine and written on
-	// whichever goroutine publishes, and it must not take the hot-path lock to answer.
+	// sessionTTLPublished latches when PublishSessionKillTTL is CALLED (not succeeded),
+	// arming the reconcile loop's republish; until then its tick publishes nothing. Start
+	// runs before the transport serves, so an unconditional republish would let any
+	// startup that survived one reconcile tick before failing clobber a running proxy's
+	// published TTL. Latching on success instead would leave a proxy that booted during a
+	// brief outage with the republish permanently dead. atomic since it's read on the
+	// reconcile goroutine and written on whichever goroutine publishes.
 	sessionTTLPublished atomic.Bool
 
 	reconcileInterval time.Duration
@@ -214,97 +150,70 @@ type Redis struct {
 
 	cancel context.CancelFunc
 
-	// refreshTrigger decouples the pub/sub listener from the full Redis SCAN a reset
-	// or unknown event requires: handlePubSubMessage does a non-blocking send instead
-	// of running the scan inline, and drainRefreshTrigger consumes it. The 1-element
-	// buffer coalesces a burst of events into at most one pending scan, so the single
-	// listener never blocks on N sequential SCANs. Created in Start, torn down via
-	// subCtx.
+	// refreshTrigger decouples the pub/sub listener from the full Redis SCAN a reset or
+	// unknown event requires: handlePubSubMessage sends non-blocking and
+	// drainRefreshTrigger consumes it. The 1-element buffer coalesces a burst into at
+	// most one pending scan, so the listener never blocks on N sequential SCANs.
 	refreshTrigger chan struct{}
 
-	// lifeMu serializes the whole Start body against Stop. It is SEPARATE from mu (the
-	// hot-path cache lock) because Start holds it across the initial refreshState
-	// network round-trip, during which mu must stay free. Holding it across Start
-	// orders every wg.Add before a concurrent Stop's wg.Wait, so Wait cannot return on
-	// a still-zero counter mid-refresh. stopped (under lifeMu) makes a Start that
-	// loses the race to Stop a no-op.
+	// lifeMu serializes the whole Start body against Stop, SEPARATE from mu since Start
+	// holds it across the initial refreshState round-trip, during which mu must stay
+	// free. Holding it across Start orders every wg.Add before a concurrent Stop's
+	// wg.Wait. stopped (under lifeMu) makes a Start that loses the race a no-op.
 	lifeMu  sync.Mutex
 	stopped bool
 
-	// startedOnce guards Start (under lifeMu, alongside stopped) so the listener and
-	// reconcile loop launch at most once; a second Start would otherwise overwrite
-	// r.cancel, orphan the first goroutines beyond Stop's reach, and run duplicate
-	// loops. A bool under the lock lifeMu already holds across the whole Start body,
-	// rather than a separate sync.Once, keeps the lifecycle guarded by one mechanism.
+	// startedOnce guards Start (under lifeMu) so the listener and reconcile loop launch
+	// at most once; a second Start would overwrite r.cancel and orphan the first
+	// goroutines beyond Stop's reach.
 	startedOnce bool
 
-	// runCtx is the Start-derived context that governs the reconcile/pub-sub loops
-	// (subCtx). It is set once under mu in Start and read by ShouldBlock: once it is
-	// canceled (via Stop or the caller's own context) the loops exit and the cache can
-	// no longer track new kills, so ShouldBlock must fail closed on a non-match rather
-	// than serve the stale all-clear — otherwise a Start context that outlives neither
-	// the instance nor its ShouldBlock callers (an ordinary run-/request-scoped context)
-	// would silently turn the switch into a permanent no-op. Reading runCtx.Err()
-	// derives liveness straight from the context that already encodes it, so cancellation
-	// is observed synchronously with no window (unlike a separate flag latched by a
-	// context.AfterFunc goroutine, which trails cancellation). nil before Start, at which
-	// point the started guard already fails closed.
+	// runCtx is the Start-derived context governing the reconcile/pub-sub loops, set once
+	// under mu and read by ShouldBlock: once canceled the loops exit and the cache can no
+	// longer track new kills, so ShouldBlock must fail closed on a non-match rather than
+	// serve a stale all-clear. Reading runCtx.Err() observes cancellation synchronously,
+	// unlike a flag latched by a context.AfterFunc goroutine. nil before Start.
 	runCtx context.Context
 	// started is set true once Start has run its initial state load. Until then the
-	// local cache has never been seeded from Redis, so ShouldBlock cannot distinguish
-	// "nothing is killed" from "state never loaded": it fails closed (ErrNotStarted)
-	// rather than admit every request as a silent no-op. A wiring guard, not a
-	// runtime-outage signal (that is lastRefreshErr/failOpen), so it fails closed even
-	// in fail-open mode — an unstarted kill switch must never be a no-op.
+	// cache cannot distinguish "nothing is killed" from "state never loaded", so it
+	// fails closed (ErrNotStarted) even under WithFailOpen — a wiring guard, not a
+	// runtime-outage signal.
 	started atomic.Bool
 
-	// wg tracks the background goroutines so Stop can block until they exit; without
-	// it Stop's cancel() returns while a goroutine is still touching shared state,
-	// racing a caller that frees the client or logger.
+	// wg tracks the background goroutines so Stop can block until they exit; without it
+	// Stop's cancel() returns while a goroutine still touches shared state, racing a
+	// caller that frees the client or logger.
 	wg sync.WaitGroup
 }
 
-// RedisOption configures the Redis kill-switch manager at construction.
-//
-// Configuration is applied here rather than through chained setters on a live
-// instance because every field below is read by ShouldBlock and the background
-// loops WITHOUT synchronization. As post-construction setters their "must be called
-// before Start" contract was enforceable only by doc comment, so a caller who
-// reordered a chain past Start raced the loops with nothing to catch it. Threading
-// them through NewRedis makes the contract structural: the options run before the
-// constructor returns, so there is no instance to misconfigure later. Mirrors the
-// option shape pkg/callcounter, pkg/flowlabelstore, and pkg/circuitbreaker use.
+// RedisOption configures the Redis kill-switch manager at construction, rather than
+// through chained setters on a live instance, because every field is read by ShouldBlock
+// and the background loops WITHOUT synchronization — threading options through NewRedis
+// makes "must be called before Start" structural rather than an unenforced doc comment.
 type RedisOption func(*Redis)
 
-// WithSessionKillTTL overrides how long a session-kill tombstone lives in Redis. A
-// negative value disables expiry (tombstones live forever, the pre-existing behavior);
-// zero selects the default. This is the OPERATOR-FACING spelling, matching the
-// --killswitch-session-ttl flag; NormalizeSessionKillTTL resolves its two sentinels.
+// WithSessionKillTTL overrides how long a session-kill tombstone lives in Redis. Negative
+// disables expiry; zero selects the default. This is the OPERATOR-FACING spelling
+// (--killswitch-session-ttl); NormalizeSessionKillTTL resolves its two sentinels.
 //
-// Raise it only if sessions in your deployment can outlive the default; LOWERING it below
-// the longest session you can hold open is a fail-open, because an expiring tombstone
-// lifts the kill on a session that may still be connected. Agent kills are never expired.
+// LOWERING it below the longest session you can hold open is a fail-open, since an
+// expiring tombstone lifts the kill on a session that may still be connected. Agent kills
+// are never expired.
 func WithSessionKillTTL(d time.Duration) RedisOption {
 	return WithSessionKillTTLEffective(NormalizeSessionKillTTL(d))
 }
 
 // WithSessionKillTTLEffective sets the tombstone lifetime from an ALREADY-RESOLVED
-// effective value, the form ReadPublishedSessionKillTTL and (*Redis).SessionKillTTL
-// return: zero means the tombstone never expires, and any positive value is the
-// lifetime verbatim.
-//
-// It exists so a caller adopting a lifetime resolved elsewhere does not have to funnel
-// it back through WithSessionKillTTL's sentinels, where zero means "use the 30-day
-// default" instead -- passing a permanent lifetime to that option would quietly convert
-// it into an expiring one, which is the fail-open direction. A negative value is treated
-// as never expiring, the same as zero, since no other reading of it is safe.
+// effective value (the form ReadPublishedSessionKillTTL and SessionKillTTL return): zero
+// means never expires, any positive value is verbatim. Exists so a caller adopting a
+// lifetime resolved elsewhere skips WithSessionKillTTL's sentinels, where zero instead
+// means "use the default" — passing a permanent lifetime there would quietly convert it
+// into an expiring one.
 func WithSessionKillTTLEffective(d time.Duration) RedisOption {
 	return func(r *Redis) {
-		// durationsentinel.Resolve's zero-case and this option's "already resolved"
-		// zero happen to coincide (both mean "never expires" here, since 0 is passed
-		// as the default), so the same negative-clamps-to-zero helper applies even
-		// though this option's zero does not mean "use a default" the way
-		// NormalizeSessionKillTTL's does.
+		// durationsentinel.Resolve's zero-case happens to coincide with this option's
+		// already-resolved zero (both mean "never expires" here), even though this
+		// option's zero does not mean "use a default" the way NormalizeSessionKillTTL's does.
 		r.sessionKillTTL = durationsentinel.Resolve(d, 0)
 	}
 }
@@ -330,28 +239,19 @@ func WithLogger(logger *slog.Logger) RedisOption {
 	}
 }
 
-// WithFailOpen selects the degraded-mode behaviour when Redis is unreachable.
-//
-// The default (false) is fail-CLOSED: while the most recent refresh has failed,
-// ShouldBlock denies every request, honouring the emergency stop even when its
-// backend is partitioned, at the cost of blocking the data plane until Redis health
-// is reconfirmed (at the latest on the next reconcile tick).
-//
-// WithFailOpen(true) is availability-first: ShouldBlock serves the last-known cache
-// during an outage. Choose it only where availability outweighs a bounded window in
-// which a revocation may be delayed, and Redis HA is in place. See ADR-0003.
+// WithFailOpen selects the degraded-mode behaviour when Redis is unreachable. Default
+// (false) is fail-CLOSED: ShouldBlock denies every request while the last refresh failed,
+// honouring the emergency stop at the cost of blocking the data plane. WithFailOpen(true)
+// is availability-first, serving the last-known cache instead. See ADR-0003.
 func WithFailOpen(failOpen bool) RedisOption {
 	return func(r *Redis) {
 		r.failOpen = failOpen
 	}
 }
 
-// NewRedis creates a Redis-backed kill-switch manager.
-// It subscribes to a pub/sub channel for real-time state propagation.
-//
-// Every setting is supplied here (see RedisOption); the instance is fully configured
-// by the time it is returned, so no caller can mutate state the background loops
-// read once Start is running.
+// NewRedis creates a Redis-backed kill-switch manager. Every setting is supplied here
+// (see RedisOption), so the instance is fully configured before Start's background
+// loops begin reading it.
 func NewRedis(client redis.Cmdable, opts ...RedisOption) *Redis {
 	r := &Redis{
 		client:            client,
@@ -366,56 +266,47 @@ func NewRedis(client redis.Cmdable, opts ...RedisOption) *Redis {
 	return r
 }
 
-// Start begins the pub/sub subscription for state synchronization. Call once at
-// startup. It is idempotent: repeated calls launch the listener and reconcile loop
-// only once (a second call would otherwise overwrite r.cancel, leak the first
-// goroutines, and run duplicate loops).
+// Start begins the pub/sub subscription for state synchronization. Call once at startup.
+// It is idempotent: repeated calls launch the listener and reconcile loop only once (a
+// second call would otherwise overwrite r.cancel and run duplicate loops).
 func (r *Redis) Start(ctx context.Context) {
-	// Hold lifeMu across the whole Start body so a concurrent Stop blocks until cancel
-	// is published, the initial refresh completes, and both goroutines are registered.
-	// This orders every wg.Add before a concurrent Stop's wg.Wait.
+	// Hold lifeMu across the whole Start body so a concurrent Stop blocks until cancel is
+	// published and both goroutines are registered, ordering every wg.Add before Stop's
+	// wg.Wait.
 	r.lifeMu.Lock()
 	defer r.lifeMu.Unlock()
 	// Start at most once. If Stop already ran, do not start either: launching
-	// goroutines now would orphan them beyond Stop's reach and use the client after
-	// Stop promised teardown was safe.
+	// goroutines now would orphan them beyond Stop's reach.
 	if r.startedOnce || r.stopped {
 		return
 	}
 	r.startedOnce = true
 
 	subCtx, cancel := context.WithCancel(ctx)
-	// Write cancel/runCtx/refreshTrigger under r.mu so handlePubSubMessage and
-	// ShouldBlock, which read them under the same lock, have a consistent view. The
-	// channel is always non-nil by the time a send is attempted.
+	// Write under r.mu so handlePubSubMessage and ShouldBlock, which read them under the
+	// same lock, have a consistent view.
 	r.mu.Lock()
 	r.cancel = cancel
 	r.runCtx = subCtx
 	r.refreshTrigger = make(chan struct{}, 1)
 	r.mu.Unlock()
 
-	// Subscribe BEFORE the initial snapshot, and confirm the subscription is
-	// active first. If the snapshot ran first, a kill published in the window
-	// between its final read and an active subscription would reach neither the
-	// committed cache nor any subscriber, leaving the subject permitted until the
-	// next reconcile. Subscribing first means any handoff-window event is either
-	// delivered (bumping cacheGen, forcing the in-flight refreshState to re-read)
-	// or captured by the snapshot.
+	// Subscribe BEFORE the initial snapshot and confirm it is active first: otherwise a
+	// kill published in the handoff window would reach neither the committed cache nor
+	// any subscriber. Subscribing first means it is either delivered (bumping cacheGen,
+	// forcing the in-flight refreshState to re-read) or captured by the snapshot.
 	if sub, ok := r.client.(pubSubClient); ok {
 		pubsub, err := r.subscribeConfirmed(subCtx, sub)
 		if err != nil {
 			if r.logger != nil {
 				// Degraded, but NOT for the process's lifetime: resubscribeLoop keeps
-				// retrying in the background, so say what converges state meanwhile and
-				// that the real-time path can come back on its own.
+				// retrying in the background.
 				r.logger.Warn("kill switch: pub/sub subscription could not be confirmed; converging state on the periodic reconcile only while the subscription is retried in the background",
 					slog.String("error", err.Error()))
 			}
-			// Retry off the Start goroutine: Start holds lifeMu, so blocking here to
-			// retry would extend the window in which a concurrent Stop cannot reach
-			// r.cancel -- the very deadlock subscribeConfirmTimeout exists to bound.
-			// Registering the goroutine under lifeMu keeps this wg.Add ordered before a
-			// concurrent Stop's wg.Wait, as for the loops below.
+			// Retry off the Start goroutine: blocking here would extend the window in
+			// which a concurrent Stop cannot reach r.cancel, the deadlock
+			// subscribeConfirmTimeout exists to bound.
 			r.wg.Add(1)
 			go func() {
 				defer r.wg.Done()
@@ -429,18 +320,15 @@ func (r *Redis) Start(ctx context.Context) {
 			}()
 		}
 	} else if r.logger != nil {
-		// The client does not implement Subscribe (e.g. a minimal fake or a limited
-		// Cmdable), so real-time pub/sub propagation is unavailable and kill events will
-		// only converge on the periodic reconcile tick. Surface it so a degraded
-		// propagation path is not silent, mirroring the pub/sub-failure warning above.
+		// The client does not implement Subscribe, so kill events will only converge on
+		// the periodic reconcile tick; surface it so the degraded path is not silent.
 		r.logger.Warn("kill switch: redis client does not support pub/sub; kill events will propagate on the periodic reconcile only",
 			slog.String("clientType", fmt.Sprintf("%T", r.client)),
 			slog.Duration("reconcileInterval", r.reconcileInterval))
 	}
 
-	// Load initial state. On failure (logged as a warning) the switch starts
-	// degraded — BLOCKING in fail-closed mode, allowing the empty cache in
-	// fail-open — and self-corrects on the next event or reconcile tick.
+	// Load initial state. On failure the switch starts degraded (blocking in
+	// fail-closed, allowing the empty cache in fail-open) and self-corrects later.
 	if err := r.refreshState(subCtx); err != nil {
 		if r.logger != nil {
 			mode := "blocking all traffic until Redis is reachable (fail-closed)"
@@ -479,16 +367,13 @@ func (r *Redis) Start(ctx context.Context) {
 	}()
 }
 
-// reconcileLoop periodically refreshes the local cache from Redis so that kill
-// events lost by pub/sub, and fail-open state from a cold start during a Redis
-// outage, converge to the authoritative Redis state within one interval.
+// reconcileLoop periodically refreshes the local cache from Redis so kill events lost by
+// pub/sub, and fail-open state from a cold start, converge within one interval.
 //
-// It also re-publishes the session-kill TTL, which is what keeps that key's expiry from
-// outliving the process that set it. The re-publish rides this tick on purpose rather
-// than owning a timer: it is the same connection on a schedule the operator already
-// configured, so it adds a command, not background activity of its own. It is deliberately
-// NOT folded into reconcileRefresh, which a pub/sub resync also calls -- a kill event
-// arriving should converge the cache, not trigger a config write.
+// It also re-publishes the session-kill TTL, riding this tick rather than owning a timer
+// (adds a command, not new background activity), deliberately NOT folded into
+// reconcileRefresh — a pub/sub resync also calls that, and a kill event should converge
+// the cache, not trigger a config write.
 func (r *Redis) reconcileLoop(ctx context.Context) {
 	interval := r.reconcileInterval
 	if interval <= 0 {
@@ -502,12 +387,10 @@ func (r *Redis) reconcileLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			r.reconcileRefresh(ctx)
-			// Skip the advisory re-publish when the refresh that just ran could not reach
-			// Redis: two more round trips are guaranteed to fail the same way, and each
-			// burns its own timeout on the goroutine that has to converge kill state the
-			// moment Redis returns. The key's expiry tolerates the missed ticks; if the
-			// outage outlasts it, the CLI's absent-value fallback is the documented and
-			// loud behaviour.
+			// Skip the advisory re-publish when the refresh just failed: two more round
+			// trips are guaranteed to fail too, burning the timeout the goroutine needs to
+			// converge kill state the moment Redis returns. The key's expiry tolerates
+			// missed ticks.
 			if !r.lastRefreshFailed() {
 				r.refreshPublishedSessionKillTTL(ctx)
 			}
@@ -515,10 +398,9 @@ func (r *Redis) reconcileLoop(ctx context.Context) {
 	}
 }
 
-// drainRefreshTrigger consumes the coalescing refreshTrigger channel and runs a
-// full reconcileRefresh per signal. Moving the SCAN off the listener goroutine keeps
-// real-time kill events flowing during a reset/unknown-triggered scan; the 1-element
-// buffer coalesces a burst into one scan. It exits when ctx is cancelled (Stop).
+// drainRefreshTrigger consumes the coalescing refreshTrigger channel and runs a full
+// reconcileRefresh per signal, moving the SCAN off the listener goroutine so real-time
+// kill events keep flowing during a reset/unknown-triggered scan.
 func (r *Redis) drainRefreshTrigger(ctx context.Context) {
 	for {
 		select {
@@ -531,20 +413,17 @@ func (r *Redis) drainRefreshTrigger(ctx context.Context) {
 	}
 }
 
-// reconcileRefresh runs a background state refresh (a reconcile tick or pub/sub
-// resync) and logs edge-triggered: one warning on healthy->failing and a notice on
-// recovery, so a sustained outage does not log every tick. HealthStatus() remains
-// the authoritative health signal; this is the operator breadcrumb. A refresh error
-// is otherwise non-fatal (fail-closed denies, fail-open serves the cache; ADR-0003).
+// reconcileRefresh runs a background state refresh (reconcile tick or pub/sub resync) and
+// logs edge-triggered: one warning on healthy->failing, one notice on recovery, so a
+// sustained outage does not log every tick. HealthStatus() is the authoritative signal.
 func (r *Redis) reconcileRefresh(ctx context.Context) {
 	_ = r.refreshState(ctx)
 	if r.logger == nil {
 		return
 	}
-	// Decide the log edge from the committed lastRefreshErr (under the lock guarding
-	// reconcileErrLogged), not this call's local result: the ticker and a pub/sub
-	// resync can call this concurrently, and reading committed state keeps the
-	// breadcrumb consistent when their refreshes interleave.
+	// Decide the log edge from the committed lastRefreshErr, not this call's local
+	// result: the ticker and a pub/sub resync can call this concurrently, and reading
+	// committed state keeps the breadcrumb consistent when their refreshes interleave.
 	r.mu.Lock()
 	lastErr := r.lastRefreshErr
 	wasLogged := r.reconcileErrLogged
@@ -572,17 +451,14 @@ func (r *Redis) lastRefreshFailed() bool {
 	return r.lastRefreshErr != nil
 }
 
-// Stop cancels the pub/sub subscription and blocks until all background goroutines
-// have exited, so a caller may free the Redis client or logger once Stop returns
-// without racing an in-flight refresh. Stop before, concurrently with, or after
-// Start, from any goroutine, is safe: lifeMu serializes it against the whole Start
-// body, so a racing Stop either blocks until Start has registered both goroutines or
-// wins the race and marks the switch stopped (making the Start body a no-op).
+// Stop cancels the pub/sub subscription and blocks until all background goroutines have
+// exited, so a caller may free the client or logger once Stop returns. Safe before,
+// concurrently with, or after Start, from any goroutine: lifeMu serializes it against the
+// whole Start body.
 func (r *Redis) Stop() {
 	// Take lifeMu to order against the whole Start body: setting stopped makes a
-	// not-yet-started Start a no-op, and because Start holds lifeMu across its wg.Add
-	// calls, those Adds happen-before the wg.Wait below (closing the zero-counter
-	// race).
+	// not-yet-started Start a no-op, and Start's wg.Add calls happen-before the
+	// wg.Wait below.
 	r.lifeMu.Lock()
 	r.stopped = true
 	cancel := r.cancel
@@ -596,21 +472,12 @@ func (r *Redis) Stop() {
 }
 
 // HealthStatus returns the error from the most recent state refresh, or nil if it
-// succeeded. It is the public health-probe API; embedders poll it to tell healthy
-// from degraded without an extra refreshState round-trip.
-//
-// By default the kill switch fails CLOSED on an outage (ShouldBlock denies anything
-// not known killed, since a kill issued during the partition cannot be confirmed);
-// WithFailOpen instead serves the last-known cache. Either way a kill issued during
-// the outage is observed once Redis recovers, at the latest on the next reconcile tick.
+// succeeded — the public health-probe API, letting embedders poll healthy vs degraded
+// without an extra refreshState round-trip. See ADR-0003 for the fail-open/closed choice.
 func (r *Redis) HealthStatus() error {
-	// Mirror ShouldBlock's gate ORDER exactly (not-started, then stopped, then the
-	// refresh error) so a health probe and the data plane never disagree about
-	// whether the switch is serving. Checked before r.mu so an unstarted switch --
-	// whose runCtx/lastRefreshErr are still zero -- reports the wiring cause instead
-	// of a nil "healthy". A switch that is constructed but never Started denies 100%
-	// of enforced traffic (ShouldBlock returns ErrNotStarted); reporting nil here
-	// would publish status "ok" through a total data-plane outage.
+	// Mirror ShouldBlock's gate ORDER exactly so a health probe and the data plane never
+	// disagree. Checked before r.mu so a never-Started switch (which denies 100% of
+	// traffic) reports the wiring cause instead of a misleading nil "healthy".
 	if !r.started.Load() {
 		return ErrNotStarted
 	}
@@ -618,39 +485,30 @@ func (r *Redis) HealthStatus() error {
 	defer r.mu.RUnlock()
 	switch r.livenessLocked() {
 	case killStopped:
-		// A stopped switch can no longer converge, so report the liveness cause rather
-		// than the stale refresh error the final in-flight refresh latched as Stop
-		// canceled it (context.Canceled) — a permanently frozen switch, not a transient
-		// backend outage.
+		// Report the liveness cause, not the stale refresh error Stop's cancellation
+		// latched — a permanently frozen switch, not a transient outage.
 		return ErrStopped
 	case killRefreshFailed:
 		// The RAW error, unlike ShouldBlock's sanitized sentinel: this is the operator's
-		// channel, and connection detail is what makes it actionable.
+		// channel, where connection detail is what makes it actionable.
 		return r.lastRefreshErr
 	case killStale:
 		// No refresh has failed, but none has succeeded recently either — the reconcile
-		// loop is not converging. In fail-closed mode the data plane is already denying
-		// on this, so a probe reporting "ok" here would publish healthy through an
-		// outage.
+		// loop is not converging, and a probe reporting "ok" here would publish healthy
+		// through an outage the data plane is already denying on.
 		return fmt.Errorf("killswitch: no successful redis refresh in over %s; the reconcile loop is not converging and cached kill state cannot be confirmed", r.staleness())
 	case killLive:
 	}
 	return nil
 }
 
-// ShouldBlock checks if any kill switch is active, using the local cache first.
-//
-// A kill present in the cache blocks unconditionally, even while Redis is degraded.
-// Only when nothing matches does degraded mode matter: fail-closed denies
-// (ErrBackendUnreachable) rather than admit an unconfirmed request; fail-open serves
-// the cache. See ADR-0003.
+// ShouldBlock checks if any kill switch is active, using the local cache first. A kill
+// present blocks unconditionally even while Redis is degraded; only when nothing matches
+// does degraded mode matter (fail-closed denies, fail-open serves the cache). See ADR-0003.
 func (r *Redis) ShouldBlock(_ context.Context, agentID, sessionID string) (bool, error) {
-	// Fail closed until Start has seeded the cache. An unstarted switch has an empty
-	// cache and a nil lastRefreshErr — indistinguishable from an all-clear — so
-	// without this guard a NewRedis wired into the enforcement path but never Started
-	// would be a silent no-op, ignoring every KillAgent/KillSession/ActivateGlobal in
-	// Redis. A wiring error, not a runtime outage, so it fails closed even under
-	// WithFailOpen.
+	// Fail closed until Start has seeded the cache: an unstarted switch has an empty
+	// cache and nil lastRefreshErr, indistinguishable from an all-clear, so a NewRedis
+	// wired in but never Started would otherwise ignore every kill in Redis silently.
 	if !r.started.Load() {
 		return false, ErrNotStarted
 	}
@@ -691,17 +549,9 @@ func (r *Redis) ShouldBlock(_ context.Context, agentID, sessionID string) (bool,
 	return false, nil
 }
 
-// killLiveness classifies why a NON-MATCH cannot be served as a confident all-clear.
-// It is the single definition of that gate chain, shared by the data plane
-// (ShouldBlock) and the health probe (HealthStatus) so the two cannot disagree about
-// whether the switch is serving.
-//
-// The two callers deliberately differ in the ERROR VALUE they map each state to — the
-// data plane returns sanitized sentinels so backend connection details never reach a
-// client, the health probe returns the raw refresh error for the operator — but the
-// ORDER and the set of states are defined once, here. Hand-mirroring them is how a
-// fourth state (staleness) ended up gating the data plane while a probe still reported
-// "ok" through it.
+// killLiveness classifies why a NON-MATCH cannot be served as a confident all-clear — the
+// single definition of that gate chain, shared by ShouldBlock and HealthStatus (which map
+// each state to a different ERROR VALUE, sanitized vs raw) so the two cannot disagree.
 type killLiveness int
 
 const (
@@ -713,14 +563,12 @@ const (
 
 // livenessLocked classifies the cache's confidence. Caller must hold at least mu.RLock.
 // The not-started case is deliberately NOT here: r.started is atomic and both callers
-// check it before taking mu, so an unstarted switch reports its wiring cause without
-// touching zero-valued fields.
+// check it before taking mu.
 func (r *Redis) livenessLocked() killLiveness {
 	// Liveness before transient health: once the Start context is canceled the
-	// convergence loops have exited and a non-match is PERMANENTLY unconfirmed, which is
-	// a different (and more actionable) cause than a transient outage. Stop cancels
-	// runCtx and an in-flight refresh then latches context.Canceled as lastRefreshErr, so
-	// a stopped switch is frequently ALSO "degraded"; this ordering reports the real one.
+	// convergence loops have exited (a PERMANENT, more actionable cause than a transient
+	// outage). Stop's cancellation also latches context.Canceled as lastRefreshErr, so a
+	// stopped switch is frequently ALSO "degraded"; this ordering reports the real one.
 	if r.runCtx != nil && r.runCtx.Err() != nil {
 		return killStopped
 	}
@@ -742,43 +590,20 @@ func (r *Redis) clock() time.Time {
 }
 
 // maxRefreshCycleBudget is how long one healthy refresh cycle may plausibly take
-// end-to-end: a GET plus two SCAN loops, each a series of round trips bounded only by the
-// caller-supplied client's own timeouts, and the whole thing retried up to
-// maxRefreshAttempts times when a concurrent kill keeps racing the scan. None of that is
-// a fault, and none of it is proportional to the reconcile interval.
-//
-// It exists because the staleness budget gates a TOTAL, non-downgradable denial (in the
-// default fail-closed mode a stale cache denies every request, even under --audit). A bare
-// multiple of the reconcile interval makes that denial MORE likely the lower the interval
-// goes — and lowering it is exactly what the flag's own help text recommends for faster
-// kill propagation, so tuning for responsiveness could take the data plane down against a
-// perfectly healthy Redis.
+// end-to-end (a GET plus two retried SCAN loops, none of it proportional to the
+// reconcile interval), so the staleness budget's TOTAL denial doesn't get more likely
+// the more an operator lowers the interval for faster kill propagation.
 const maxRefreshCycleBudget = 30 * time.Second
 
 // staleness returns how old a confirmed refresh may be before the cache is treated as
-// unconfirmed. Two reconcile intervals: one missed tick is ordinary jitter, two means the
-// convergence loop is not running or Redis is not answering.
+// unconfirmed: two reconcile intervals (one missed tick is jitter, two means the loop
+// isn't converging), floored at one interval plus a refresh-cycle budget since the stamp
+// is set on COMPLETION, so interval + cycle is legitimate even when healthy.
 //
-// Floored at one interval plus a realistic refresh-cycle budget, because the stamp is set
-// when a refresh COMPLETES: the next tick fires an interval later and then takes up to a
-// cycle to finish, so the age at the moment of the next successful stamp is legitimately
-// interval + cycle even when nothing is wrong. At the default 30s interval the floor and
-// the multiple coincide exactly (60s), so only a lowered interval sees any change.
-//
-// The floor is a TRADE, and it runs against revocation latency in the one case the
-// staleness gate is the sole detector: a refresh that HANGS rather than errors (a
-// blackholed or half-open connection). An outright failure latches lastRefreshErr and
-// livenessLocked reports killRefreshFailed before ever consulting staleness, so only the
-// hang reaches here. For that case an operator who set --killswitch-reconcile-interval to
-// 1s now serves the last-known cache for ~31s instead of ~2s before failing closed, so a
-// kill issued elsewhere during the hang goes unenforced for that much longer.
-//
-// It is still the right default: without the floor, the same operator's HEALTHY Redis was
-// judged stale whenever one ordinary refresh cycle outran two intervals, and fail-closed
-// mode then denied ALL traffic — a certain, self-inflicted outage traded against a longer
-// window on a rare failure mode. Tuning the interval down for faster kill PROPAGATION
-// (the pub/sub-miss reconvergence the flag's help describes) still works exactly as
-// documented; it is only this hang-detection window that no longer shrinks with it.
+// The floor trades against revocation latency in the one case staleness is the sole
+// detector — a HUNG (not erroring) refresh — but is still the right default: without it,
+// a healthy Redis whose ordinary cycle outran two short intervals would be judged stale
+// and fail-closed mode would deny ALL traffic, a certain outage traded against a rare one.
 func (r *Redis) staleness() time.Duration {
 	iv := r.reconcileInterval
 	if iv <= 0 {
@@ -796,13 +621,9 @@ func (r *Redis) staleness() time.Duration {
 }
 
 // staleLocked reports whether the cache has gone too long without a confirmed refresh.
-// Caller must hold at least a read lock on mu.
-//
-// A zero lastRefreshOK means no refresh has ever succeeded. That is NOT reported as stale
-// here: Start seeds the cache before started is set, so reaching this point with a zero
-// stamp means the seed itself came from a path that did not stamp — and the started/stopped
-// guards above already cover the genuinely-unseeded cases. Reporting stale on zero would
-// turn a healthy freshly-started switch into a denial.
+// Caller must hold at least a read lock on mu. A zero lastRefreshOK is NOT reported as
+// stale: the started/stopped guards already cover the genuinely-unseeded case, and
+// reporting stale on zero would turn a healthy freshly-started switch into a denial.
 func (r *Redis) staleLocked() bool {
 	if r.lastRefreshOK.IsZero() {
 		return false
@@ -816,9 +637,8 @@ func (r *Redis) ActivateGlobal(ctx context.Context) error {
 		return err
 	}
 	// Update the local cache BEFORE publishing so the issuing instance is never in a
-	// fail-open window: a ShouldBlock between the Redis write and the publish must
-	// already observe the kill. Remote replicas converge on the event (or the next
-	// reconcile if it is lost).
+	// fail-open window: a ShouldBlock between the write and the publish must already
+	// observe the kill.
 	r.mu.Lock()
 	r.globalActive = true
 	r.cacheGen++
@@ -839,17 +659,12 @@ func (r *Redis) DeactivateGlobal(ctx context.Context) error {
 	return r.publish(ctx, "global:deactivate")
 }
 
-// setBlock is the shared body of KillAgent/ReviveAgent/KillSession/ReviveSession.
-// The two booleans are the only real axes: kill (Set+add vs Del+remove) and session
-// (which entity dimension). Everything else — the key prefix, the publish verb, the
-// cache map, and the error-message names — is DERIVED from those two here, so a caller
-// cannot mismatch (e.g. write the agent key while publishing on the session channel).
-// kill=true SETs the durable Redis key and adds the id to the cache; kill=false DELs
-// it and removes the id; the cache map is selected and mutated under r.mu, so a
-// concurrent Reset that swaps the maps cannot route the write to a stale one. An empty
-// id is rejected because it would write the bare prefix key and publish a verb with an
-// empty suffix, polluting the key space and triggering a spurious full refresh on every
-// replica. The broadcast happens after the cache update (see ActivateGlobal).
+// setBlock is the shared body of KillAgent/ReviveAgent/KillSession/ReviveSession. The two
+// booleans (kill, session) are the only real axes; the key prefix, publish verb, cache map,
+// and error-message names are all DERIVED from them, so a caller cannot mismatch (e.g.
+// write the agent key while publishing on the session channel). An empty id is rejected
+// rather than writing the bare prefix key and triggering a spurious full refresh on every
+// replica.
 func (r *Redis) setBlock(ctx context.Context, kill, session bool, id string) error {
 	verb := "Kill"
 	if !kill {
@@ -866,8 +681,7 @@ func (r *Redis) setBlock(ctx context.Context, kill, session bool, id string) err
 	var err error
 	if kill {
 		// Only SESSION tombstones expire; an agent kill is durable revocation of a
-		// long-lived identity. See defaultSessionKillTTL for why the expiry is a
-		// garbage-collection bound rather than a policy one.
+		// long-lived identity. See defaultSessionKillTTL.
 		ttl := time.Duration(0)
 		if session {
 			ttl = r.sessionKillTTL
@@ -879,8 +693,7 @@ func (r *Redis) setBlock(ctx context.Context, kill, session bool, id string) err
 	if err != nil {
 		return err
 	}
-	// Update the local cache before publishing; see ActivateGlobal. The map field is
-	// selected under the lock so a concurrent Reset swap is not raced.
+	// The map field is selected under the lock so a concurrent Reset swap is not raced.
 	r.mu.Lock()
 	cache := r.killedAgents
 	if session {
@@ -893,8 +706,7 @@ func (r *Redis) setBlock(ctx context.Context, kill, session bool, id string) err
 	}
 	r.cacheGen++
 	r.mu.Unlock()
-	// The published channel name mirrors the durable-key dimension:
-	// "<entity>:<action>:<id>", e.g. "agent:kill:abc123".
+	// Channel name mirrors the durable-key dimension: "<entity>:<action>:<id>".
 	action := "kill"
 	if !kill {
 		action = "revive"
@@ -952,30 +764,18 @@ func (r *Redis) Reset(ctx context.Context) error {
 	r.mu.Unlock()
 
 	// Re-read Redis after the clear to re-seed any kill that landed between the delete
-	// sweep and now: a concurrent KillAgent can SET its key after deleteByPrefix, then
-	// have its cache write wiped by the clear above, leaving the kill durable but
-	// invisible to ShouldBlock until the next reconcile. refreshState shrinks that
-	// fail-open window to the sub-millisecond read-to-swap gap. Best-effort: a
-	// transient refresh error must not fail an otherwise-complete Reset.
+	// sweep and now (a concurrent KillAgent's SET could otherwise be wiped by the clear
+	// above and stay invisible until the next reconcile). Best-effort: a transient
+	// refresh error must not fail an otherwise-complete Reset.
 	//
-	// Use runCtx, not the caller's ctx: Reset's durable work (the deletes and publish
-	// above) is already done by this point, so a caller ctx that gets canceled right
-	// after calling Reset (a request-scoped ctx returning to its handler) must not
-	// turn this best-effort reseed into a recorded refresh failure — refreshState
-	// cannot tell a caller-cancel from genuine Redis unreachability, and
-	// recordRefreshErr's context.Canceled would then trip ShouldBlock's fail-closed
-	// non-match path (denying every request) for up to a reconcile tick on an
-	// otherwise-healthy backend. runCtx is the same background-lifetime context every
-	// other best-effort refresh (reconcileRefresh, the ticker/pub-sub loops) already
-	// uses, and is nil only before Start — fall back to the caller's ctx then, since
-	// there is no longer-lived context to prefer.
+	// Use runCtx, not the caller's ctx: Reset's durable work is already done, so a caller
+	// ctx canceled right after Reset returns must not be misattributed by refreshState as
+	// a genuine Redis failure, tripping ShouldBlock's fail-closed path on a healthy
+	// backend. runCtx is nil only before Start, when there's no longer-lived context to prefer.
 	reseedCtx := ctx //nolint:contextcheck // reseedCtx is deliberately reassigned to r.runCtx below when set: the switch's own background-lifetime context (Start), not derived from this function's ctx parameter, so a caller ctx canceled right after Reset returns cannot be misattributed as a refresh failure (see the comment above).
-	// runCtx is written under r.mu in Start, so read it under r.mu too. This
-	// goroutine holds no lock here (Reset's durable work is done and its critical
-	// sections have all been released), so taking RLock is safe -- a caller that
-	// already holds r.mu must read the field directly instead, since re-acquiring an
-	// RWMutex for reading from a goroutine that already holds it risks blocking
-	// behind a writer that arrived in between (Go's sync.RWMutex favors writers).
+	// runCtx is written under r.mu in Start, so read it under r.mu too (RLock is safe
+	// here since this goroutine holds no lock; a caller already holding r.mu must read
+	// the field directly instead).
 	r.mu.RLock()
 	runCtx := r.runCtx
 	r.mu.RUnlock()
@@ -986,48 +786,30 @@ func (r *Redis) Reset(ctx context.Context) error {
 	return pubErr
 }
 
-// Status returns the current kill-switch state from the LOCAL cache.
+// Status returns the current kill-switch state from the LOCAL cache. Unlike ShouldBlock,
+// it never fails closed — a pre-Start or degraded Status reports an empty/stale snapshot,
+// not an error; HealthStatus is the authoritative freshness signal.
 //
-// Unlike ShouldBlock, Status does not fail closed: it returns a nil error even before
-// Start has seeded the cache and while a Redis outage has left the cache stale, so a
-// pre-Start or degraded Status reports an empty/stale snapshot rather than an error.
-// It is an operator-visibility view of the local cache, not an authoritative
-// enumeration of Redis; HealthStatus is the authoritative freshness signal, and a
-// kill issued during an outage becomes visible here once Redis recovers (at the latest
-// on the next reconcile tick).
-//
-// That self-correcting framing assumes Start eventually runs. It does NOT hold for an
-// instance that is never Started: Status then returns the zero snapshot
-// (GlobalActive:false, no killed agents or sessions) forever, with a nil error,
-// indistinguishable from "confirmed: nothing is killed". This is safe for every
-// current caller — the one-shot un-Started idiom this package's callers use
-// (killswitch.NewRedis(rdb), skip Start, one write, rdb.Close()) only ever performs
-// writes, never a Status read — but a future caller that copies that idiom and adds a
-// Status() call must Start first, or treat the result as meaningless rather than as an
-// all-clear.
+// That self-correcting framing assumes Start eventually runs. An instance never Started
+// returns the zero snapshot forever with a nil error, indistinguishable from "confirmed:
+// nothing is killed" — safe for the write-only, never-Started idiom this package's
+// callers use, but a future caller adding a Status() call to that idiom must Start first.
 func (r *Redis) Status(_ context.Context) (*Status, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return buildStatus(r.globalActive, r.killedAgents, r.killedSessions), nil
 }
 
-// publish broadcasts msg on the kill-switch channel and returns any publish error.
-// The durable write and cache update already happened, so a publish failure does NOT
-// undo the kill on the issuing instance — it only delays remote convergence to the
-// next reconcile; returning the error lets the caller report partial propagation.
-//
-// Called directly on r.client: Publish is part of redis.Cmdable, so every client this
-// type can hold has it. (Subscribe, which the pub/sub receive path guards for, is NOT on
-// Cmdable — that assertion is live, this one never was.)
+// publish broadcasts msg on the kill-switch channel. The durable write and cache update
+// already happened, so a publish failure does NOT undo the kill — it only delays remote
+// convergence to the next reconcile. Publish is part of redis.Cmdable, so no assertion needed.
 func (r *Redis) publish(ctx context.Context, msg string) error {
 	return r.client.Publish(ctx, redisPubSubChan, msg).Err()
 }
 
-// recordRefreshErr stores err as the last refresh error under the lock and returns
-// it, so refreshState's three Redis-read failure paths share one stamp-and-return.
-// It is only ever called from within refreshState, which holds refreshMu for its
-// whole scan+commit body, so lastRefreshErr has a single serialized writer: no
-// concurrent refresh can clear an error this one recorded, or vice versa.
+// recordRefreshErr stores err as the last refresh error and returns it, so refreshState's
+// three failure paths share one stamp-and-return. Only ever called within refreshState,
+// which holds refreshMu for its whole body, so lastRefreshErr has a single serialized writer.
 func (r *Redis) recordRefreshErr(err error) error {
 	r.mu.Lock()
 	r.lastRefreshErr = err
@@ -1105,10 +887,8 @@ func (r *Redis) refreshState(ctx context.Context) error {
 	}
 }
 
-// notifyRevocations calls the observers for every revocation a refresh added. Always OUTSIDE
-// r.mu — an observer's documented response is to re-ask ShouldBlock, which takes it — and on
-// the refreshing goroutine, so a slow observer delays the next reconcile rather than being
-// reordered against the cache state that justifies it.
+// notifyRevocations calls the observers for every revocation a refresh added. Always
+// OUTSIDE r.mu, since an observer's documented response is to re-ask ShouldBlock.
 func (r *Redis) notifyRevocations(gained []Revocation) {
 	for _, ev := range gained {
 		r.observers.notify(ev)
@@ -1116,26 +896,14 @@ func (r *Redis) notifyRevocations(gained []Revocation) {
 }
 
 // commitRefreshLocked installs a completed scan's snapshot and stamps the refresh as
-// healthy. Caller must hold r.mu for writing.
+// healthy. Caller must hold r.mu for writing. Shared by both commit sites so the health
+// stamp (lastRefreshErr cleared, lastRefreshOK set) cannot drift between them — the
+// staleness gate denies ALL traffic in fail-closed mode when it is not maintained.
 //
-// The two commit sites -- the clean one and the sustained-mutation fallback, twenty lines
-// apart -- ran the identical five statements. Sharing them is not cosmetic: the health
-// stamp is the pair (lastRefreshErr cleared, lastRefreshOK set), and the staleness gate
-// denies ALL traffic in fail-closed mode when it is not maintained. A future field added
-// to that stamp on one commit path and not the other would leave the fallback path
-// committing a snapshot that reads as unconfirmed.
-//
-// Clearing lastRefreshErr is correct on both: the Redis read succeeded, and refreshMu
-// serializes refreshes, so no concurrent refresh can have recorded a fresher error
-// between this scan's start and this commit.
-//
-// It returns the revocations the snapshot ADDS to the local view, for the caller to notify
-// after releasing r.mu. The reconcile loop fires observers as well as pub/sub does, because a
-// publish that never arrives (a subscription being retried, a message dropped during a
-// partition, a kill issued before this instance subscribed) would otherwise leave a consumer
-// with nothing to reclaim on until its own sweep — and the sessionIdleTimeoutMs: 0 case has no
-// sweep at all. Real-time delivery and the periodic scan are two paths to the same fact, so
-// both raise it.
+// It returns the revocations the snapshot ADDS, for the caller to notify after releasing
+// r.mu. The reconcile loop fires observers too, not just pub/sub, because a publish that
+// never arrives would otherwise leave a consumer with nothing to reclaim on (and the
+// sessionIdleTimeoutMs: 0 case has no sweep at all).
 func (r *Redis) commitRefreshLocked(global bool, agents, sessions map[string]bool) []Revocation {
 	var gained []Revocation
 	if global && !r.globalActive {
@@ -1159,30 +927,20 @@ func (r *Redis) commitRefreshLocked(global bool, agents, sessions map[string]boo
 	return gained
 }
 
-// scanner is the subset of a Redis node needed to enumerate keys by prefix. It is a
-// PARAMETER type for the per-node helpers, which are called both with r.client and with
-// an individual master from ForEachMaster; it is not a capability test, since redis.Cmdable
-// (the only type r.client can hold) statically carries Scan.
+// scanner is the subset of a Redis node needed to enumerate keys by prefix. A PARAMETER
+// type for the per-node helpers (called with both r.client and an individual
+// ForEachMaster master), not a capability test.
 type scanner interface {
 	Scan(ctx context.Context, cursor uint64, match string, count int64) *redis.ScanCmd
 }
 
 func (r *Redis) scanPrefix(ctx context.Context, prefix string, target map[string]bool) error {
-	// A keyless SCAN on a *redis.ClusterClient hits one random master, so a
-	// cluster-wide enumeration must visit every master and merge the scans; otherwise
-	// refreshState loads a partial snapshot, treats it as healthy, and drops kills on
-	// the other masters. ForEachMaster runs concurrently, so target needs a mutex.
-	//
-	// Reachable only by a LIBRARY consumer: the shipped binary always builds a
-	// single-node client. It is kept because deleting it would not remove the cluster
-	// case, only the handling of it -- a ClusterClient would then load a partial kill set
-	// and report healthy, which is a fail-open on the emergency stop.
-	//
-	// Note the asymmetry it exposes, since nothing else in the tree states it: pkg/
-	// callcounter has NO cluster handling, so a consumer who supplies a ClusterClient gets
-	// correct kill-switch enumeration alongside per-master maxCalls counting that silently
-	// under-counts. Redis Cluster is not a supported eunox deployment; use a single-node
-	// or replicated (non-sharded) endpoint.
+	// A keyless SCAN on a *redis.ClusterClient hits one random master, so a cluster-wide
+	// enumeration must visit every master and merge the scans, or refreshState loads a
+	// partial snapshot and reports healthy — a fail-open on the emergency stop.
+	// Reachable only by a LIBRARY consumer (the shipped binary is single-node); kept
+	// because deleting it would leave the cluster case unhandled rather than absent.
+	// Note pkg/callcounter has NO cluster handling — Redis Cluster is unsupported.
 	if cc, ok := r.client.(*redis.ClusterClient); ok {
 		var mu sync.Mutex
 		return cc.ForEachMaster(ctx, func(ctx context.Context, node *redis.Client) error {
@@ -1193,9 +951,8 @@ func (r *Redis) scanPrefix(ctx context.Context, prefix string, target map[string
 	return scanNode(ctx, r.client, prefix, target, nil)
 }
 
-// scanNode SCANs a single node for keys matching prefix and records the stripped
-// IDs in target. mu, when non-nil, guards target for concurrent callers (cluster
-// fan-out via ForEachMaster); pass nil for a single-node scan.
+// scanNode SCANs a single node for keys matching prefix and records the stripped IDs in
+// target. mu, when non-nil, guards target for concurrent callers (ForEachMaster fan-out).
 func scanNode(ctx context.Context, sc scanner, prefix string, target map[string]bool, mu *sync.Mutex) error {
 	var cursor uint64
 	for {
@@ -1240,10 +997,8 @@ func (r *Redis) deleteByPrefix(ctx context.Context, prefix string) error {
 	return deleteNodeKeys(ctx, r.client, prefix)
 }
 
-// deleteNodeKeys SCANs a single node for keys matching prefix and deletes them one
-// at a time: in a cluster, keys from one node's SCAN can map to different hash slots
-// and a multi-key DEL spanning slots fails with CROSSSLOT, whereas per-key DEL is
-// slot-safe on both standalone and cluster nodes.
+// deleteNodeKeys SCANs a single node and deletes keys one at a time: a multi-key DEL can
+// span cluster hash slots and fail CROSSSLOT, whereas per-key DEL is always slot-safe.
 func deleteNodeKeys(ctx context.Context, sd scanDeleter, prefix string) error {
 	var cursor uint64
 	for {
@@ -1263,14 +1018,10 @@ func deleteNodeKeys(ctx context.Context, sd scanDeleter, prefix string) error {
 	}
 }
 
-// subscribeConfirmed subscribes to the kill-event channel and blocks until the server
-// confirms the subscription, so a caller may order a state snapshot strictly after the
-// subscription is live. The confirmation read is bounded by subscribeConfirmTimeout:
-// pubsub.Receive issues a deadline-less socket read (go-redis passes timeout=0), so a
-// blackholed or half-open connection would otherwise block forever -- and in Start that
-// block holds lifeMu, deadlocking a concurrent Stop. A WithTimeout ctx carries a
-// deadline, so the read returns i/o timeout instead of hanging. On any failure the
-// pubsub is closed so its connection is not leaked across a retry.
+// subscribeConfirmed subscribes and blocks until the server confirms it, so a caller may
+// order a state snapshot strictly after. Bounded by subscribeConfirmTimeout: pubsub.Receive's
+// deadline-less read would otherwise block forever on a blackholed connection, deadlocking
+// Start's concurrent Stop. On failure the pubsub is closed to avoid leaking it across a retry.
 func (r *Redis) subscribeConfirmed(ctx context.Context, sub pubSubClient) (*redis.PubSub, error) {
 	pubsub := sub.Subscribe(ctx, redisPubSubChan)
 	recvCtx, recvCancel := context.WithTimeout(ctx, subscribeConfirmTimeout)
@@ -1282,11 +1033,9 @@ func (r *Redis) subscribeConfirmed(ctx context.Context, sub pubSubClient) (*redi
 	return pubsub, nil
 }
 
-// supervisePubSub consumes a confirmed subscription and, if it is lost while ctx is
-// still live, hands off to resubscribeLoop. It exists so the real-time path has one
-// owner goroutine for the whole run: listenPubSub returning early (an unexpected
-// channel close) is a recoverable loss of propagation, not a reason to spend the rest
-// of the process reconcile-only.
+// supervisePubSub consumes a confirmed subscription and, if lost while ctx is still live,
+// hands off to resubscribeLoop — an unexpected channel close is recoverable, not a reason
+// to spend the rest of the process reconcile-only.
 func (r *Redis) supervisePubSub(ctx context.Context, sub pubSubClient, pubsub *redis.PubSub) {
 	r.listenPubSub(ctx, pubsub)
 	if ctx.Err() != nil {
@@ -1295,15 +1044,10 @@ func (r *Redis) supervisePubSub(ctx context.Context, sub pubSubClient, pubsub *r
 	r.resubscribeLoop(ctx, sub)
 }
 
-// resubscribeLoop re-establishes the pub/sub subscription in the background with
-// capped exponential backoff, then consumes it, repeating for as long as ctx is live.
-// It runs off the Start goroutine so retrying never extends the lifeMu hold that
-// subscribeConfirmTimeout exists to bound.
-//
-// Retry failures are not logged per attempt: the caller already logged one warning on
-// entering degraded mode, and a sustained outage would otherwise log on every attempt.
-// Only the recovery edge is logged, matching reconcileRefresh's edge-triggered
-// breadcrumbs. HealthStatus() remains the authoritative health signal.
+// resubscribeLoop re-establishes the subscription in the background with capped
+// exponential backoff, repeating for as long as ctx is live. Runs off the Start goroutine
+// so retrying never extends the lifeMu hold subscribeConfirmTimeout bounds. Only the
+// recovery edge is logged, not each retry, matching reconcileRefresh's breadcrumbs.
 func (r *Redis) resubscribeLoop(ctx context.Context, sub pubSubClient) {
 	delay := subscribeRetryInitialDelay
 	timer := time.NewTimer(delay)
@@ -1328,12 +1072,9 @@ func (r *Redis) resubscribeLoop(ctx context.Context, sub pubSubClient) {
 		if r.logger != nil {
 			r.logger.Info("kill switch: pub/sub subscription re-established; real-time kill propagation restored")
 		}
-		// Pub/sub is at-most-once, so every event published while the subscription was
-		// down was missed. Reconcile immediately rather than leave those kills
-		// unobserved until the next reconcile tick. Ordered AFTER the confirmed
-		// subscribe (as Start orders its initial snapshot) so an event racing this
-		// refresh is delivered on the now-live subscription instead of falling into the
-		// handoff window.
+		// Pub/sub is at-most-once, so events published while down were missed; reconcile
+		// immediately rather than wait for the next tick. Ordered AFTER the confirmed
+		// subscribe so a racing event lands on the live subscription, not the handoff window.
 		r.reconcileRefresh(ctx)
 		r.listenPubSub(ctx, pubsub)
 		if ctx.Err() != nil {
@@ -1355,15 +1096,10 @@ func (r *Redis) listenPubSub(ctx context.Context, pubsub *redis.PubSub) {
 			return
 		case msg, ok := <-ch:
 			if !ok {
-				// go-redis closes this channel only on an explicit pubsub.Close()
-				// (transient network drops auto-reconnect and resubscribe WITHOUT
-				// closing it). The sole Close() on this pubsub is this function's own
-				// deferred one, which runs after we return, and on teardown the
-				// ctx.Done() case above wins first — so reaching here means the channel
-				// closed while ctx is still live: an unexpected loss of the real-time
-				// path, not the normal shutdown. State still converges on the reconcile
-				// loop (fail-closed preserved) and supervisePubSub resubscribes, but
-				// surface it so the degraded propagation is not silent.
+				// go-redis closes this channel only via an explicit pubsub.Close() (transient
+				// drops auto-reconnect without closing it); reaching here with ctx still live
+				// means an unexpected loss of the real-time path. State still converges on
+				// the reconcile loop and supervisePubSub resubscribes, but surface it.
 				if r.logger != nil && ctx.Err() == nil {
 					r.logger.Warn("kill switch: pub/sub channel closed unexpectedly while running; converging state on the periodic reconcile only while the subscription is retried in the background")
 				}
@@ -1380,11 +1116,9 @@ func (r *Redis) listenPubSub(ctx context.Context, pubsub *redis.PubSub) {
 func (r *Redis) handlePubSubMessage(payload string) {
 	r.mu.Lock()
 	shouldRefresh := false
-	// gained collects the revocations this event ADDS to the local view, notified after the
-	// lock is released (an observer's documented response re-enters this backend through
-	// ShouldBlock). Only real additions: re-announcing a kill this instance already holds
-	// reclaims nothing, and a duplicate publish is normal — every instance receives the
-	// message, and a reconcile can land the same kill first.
+	// gained collects the revocations this event ADDS, notified after the lock is
+	// released. Only real additions: re-announcing a kill this instance already holds
+	// reclaims nothing.
 	var gained []Revocation
 
 	switch payload {
@@ -1400,9 +1134,7 @@ func (r *Redis) handlePubSubMessage(payload string) {
 		r.killedAgents = make(map[string]bool)
 		r.killedSessions = make(map[string]bool)
 		// Re-read Redis after the clear (as Reset() does): a kill that raced the
-		// publisher's delete sweep can land in Redis after the delete but before this
-		// event, and clearing local state alone would hide it until the next reconcile,
-		// failing open on a non-initiating replica.
+		// publisher's delete sweep could otherwise stay hidden on this replica.
 		shouldRefresh = true
 	default:
 		// Prefixed events carry a non-empty id; cutKillID returns "" for a non-match
@@ -1426,47 +1158,40 @@ func (r *Redis) handlePubSubMessage(payload string) {
 			shouldRefresh = true
 		}
 	}
-	// Bump the cache generation for every event so a concurrent in-flight
-	// refreshState discards its now-stale snapshot rather than overwrite this update.
+	// Bump the cache generation for every event so a concurrent in-flight refreshState
+	// discards its now-stale snapshot rather than overwrite this update.
 	r.cacheGen++
-	// Snapshot refreshTrigger under r.mu to avoid a race with Start, which creates it
-	// under the same lock.
+	// Snapshot under r.mu to avoid a race with Start, which creates it under the same lock.
 	var trigger chan struct{}
 	if shouldRefresh {
 		trigger = r.refreshTrigger
 	}
 	r.mu.Unlock()
 
-	// Signal the drainRefreshTrigger goroutine rather than run the SCAN inline, so a
-	// reset/unknown event cannot block the single real-time kill-event consumer on
-	// Redis I/O. The send is non-blocking and the channel 1-element buffered, so
-	// concurrent triggers coalesce.
+	// Signal drainRefreshTrigger rather than run the SCAN inline, so a reset/unknown
+	// event cannot block the single real-time consumer on Redis I/O.
 	if shouldRefresh && trigger != nil {
 		select {
 		case trigger <- struct{}{}:
 		default:
 		}
 	}
-	// This runs on the SINGLE real-time kill-event consumer goroutine, which is exactly why
-	// an observer must not block (Manager.ObserveRevocations says so): a slow one would stall
-	// the delivery of every later kill. Notifying here rather than from a goroutine per event
-	// is deliberate — a fan-out would reorder revocations against the cache updates that
-	// justify them, and an observer's whole job is to re-read that cache.
+	// Runs on the SINGLE real-time consumer goroutine, why an observer must not block.
+	// Not fanned out to a goroutine per event: that would reorder revocations against
+	// the cache updates that justify them.
 	for _, ev := range gained {
 		r.observers.notify(ev)
 	}
 }
 
-// ObserveRevocations implements [Manager]. Observers are called from the pub/sub listener and
-// from the reconcile loop's commit, so a kill reaches one whether or not its publish was
-// delivered. See the interface doc for the contract, and note the must-not-block rule: both
-// callers are single goroutines whose progress every other instance-local kill depends on.
+// ObserveRevocations implements [Manager]. Observers are called from the pub/sub listener
+// and the reconcile loop's commit, so a kill reaches one whether or not its publish was
+// delivered — both callers are single goroutines the must-not-block rule protects.
 func (r *Redis) ObserveRevocations(fn func(Revocation)) func() { return r.observers.observe(fn) }
 
-// cutKillID returns the id carried by a prefixed kill-switch pub/sub event (e.g.
-// "agent:kill:foo" with prefix "agent:kill:" yields "foo"), or "" when payload lacks
-// the prefix or carries it with an empty id. Treating an empty id as no match makes a
-// bare "agent:kill:" fall through to a full refresh.
+// cutKillID returns the id carried by a prefixed event (e.g. "agent:kill:foo" with prefix
+// "agent:kill:" yields "foo"), or "" for a non-match OR an empty id, so a bare
+// "agent:kill:" falls through to a full refresh rather than matching.
 func cutKillID(payload, prefix string) string {
 	if id, ok := strings.CutPrefix(payload, prefix); ok {
 		return id

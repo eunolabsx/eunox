@@ -9,30 +9,18 @@ import (
 	"fmt"
 )
 
-// The claim-borne grants in this package (delegation grants, declassify approvals, actor-chain
-// nodes) are decoded from a token an IdP minted, and every one of them NARROWS something. That
-// makes their decoding asymmetric with the manifest's: a manifest that fails to parse is an
-// operator's file and an operator's error, while a grant that parses to something WEAKER than
-// it reads is an invisible loss of a control someone believes is in force.
+// Claim-borne grants (delegation grants, declassify approvals, actor-chain nodes) are decoded
+// from a token an IdP minted, and every one of them NARROWS something — so unlike a manifest,
+// where a parse failure is the operator's own error, a grant that parses to something WEAKER
+// than it reads is an invisible loss of a control someone believes is in force.
 //
-// Three JSON shapes produce exactly that, and none of them is caught by decoding into a struct:
-//
-//   - An unknown member. `{"targts":["tool:read"]}` decodes to a grant with NO target
-//     restriction — the widest value the field has.
-//   - An explicit null. `{"targets":null}` decodes to a nil pointer, which this package reads as
-//     "this hop places no target restriction". `{"once":null}` decodes to false, turning a
-//     single-use approval into a standing one. In both cases the author WROTE the key, so
-//     "absent means unrestricted" is not the reading they intended.
-//   - A duplicate key. `{"targets":["tool:read"],"Targets":[]}` is two members; encoding/json
-//     matches field names case-insensitively and keeps the LAST, so which of the two takes
-//     effect depends on member order rather than on anything the author can see. That is the
-//     same ambiguity the JSON-RPC envelope and tools/list scans already refuse, for the same
-//     reason, and FoldJSONKey is shared with them so the three cannot drift on what "the same
-//     key" means.
-//
-// All three are refused, which rejects the TOKEN. That is the loud failure: an IdP template
-// mistake becomes a caller who cannot authenticate rather than a caller whose narrowing quietly
-// evaporated.
+// Three JSON shapes produce exactly that and none is caught by a plain struct decode: an
+// unknown member (a misspelled "targts" decodes to NO restriction), an explicit null (the
+// author wrote the key, so "absent means unrestricted" isn't what they meant), and a duplicate
+// key (encoding/json folds case-insensitively and keeps the last, so which member wins depends
+// on order, not on anything the author can see — the same ambiguity FoldJSONKey closes for the
+// JSON-RPC envelope and tools/list scans). All three REJECT THE TOKEN rather than silently
+// evaporating the narrowing.
 
 // MaxClaimListEntries bounds how many entries one grant's list-valued member may carry. Like
 // MaxDelegationDepth this is a bound on attacker-influenced input, not hygiene: a chain is

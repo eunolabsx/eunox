@@ -1,24 +1,16 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// Remote HTTP upstream support for the MCP proxy (--upstream-url).
+// Remote HTTP upstream support for the MCP proxy (--upstream-url): each client session
+// forwards to a remote MCP HTTP server instead of a local subprocess, still through the
+// full PDP enforcement stack.
 //
-// When UpstreamURL is set, each client session forwards to a remote MCP HTTP
-// server instead of spawning a local subprocess; the proxy still applies the full
-// PDP enforcement stack before forwarding. On the first client initialize the proxy
-// initializes its own session with the remote server, stores the upstream
-// Mcp-Session-Id, then reuses it for every forwarded call.
-//
-// Limitations:
-//   - SSE notifications pushed by the remote server are not forwarded to the client.
-//     The client's GET /mcp stream is held open but events arrive only if the proxy
-//     emits them (e.g. kill-switch).
-//   - Server-initiated requests from the remote upstream (sampling/createMessage,
-//     roots/list, elicitation/create) are not serviced: this path is strictly
-//     request/response (one POST per host request, reading only that POST's
-//     response), so the upstream has no inbound channel to deliver one. A
-//     sampling/createMessage opt-in for an HTTP upstream is therefore rejected at
-//     startup (route.go). Use stdio if server-initiated requests must be enforced.
+// Limitations: SSE notifications pushed by the remote server are not forwarded to the
+// client (the GET /mcp stream only emits proxy-originated events like kill-switch).
+// Server-initiated requests (sampling/createMessage, roots/list, elicitation/create) are
+// not serviced — this path is strict request/response with no inbound channel to deliver
+// one, so that opt-in is rejected at startup for an HTTP upstream (route.go). Use stdio if
+// server-initiated requests must be enforced.
 
 package transport
 
@@ -44,14 +36,11 @@ import (
 	"github.com/eunolabs/eunox/pkg/capability"
 )
 
-// scrubURLError redacts the credentialed URL carried by a *url.Error (the error type
-// net/http returns from client.Do) before it is wrapped and surfaced. The stdlib's own
-// formatting strips only the userinfo PASSWORD, leaving the userinfo username and the
-// entire query string (a ?api_key=/?token= credential) in the message — which then
-// reaches the live-probe's stderr and the paste-ready doctor support bundle. Replacing
-// the *url.Error with one whose URL is run through capability.RedactURLForLog closes that leak
-// while preserving the operation and the wrapped cause (so errors.Is/As still match).
-// A non-URL error is returned unchanged.
+// scrubURLError redacts the credentialed URL carried by a *url.Error before it is surfaced.
+// The stdlib's own formatting strips only the userinfo PASSWORD, leaving the username and
+// query string (a ?api_key=/?token= credential) in the message — which reaches the
+// live-probe's stderr and the doctor support bundle. Preserves the wrapped cause so
+// errors.Is/As still match. A non-URL error is returned unchanged.
 func scrubURLError(err error) error {
 	var ue *url.Error
 	if errors.As(err, &ue) {
@@ -65,12 +54,11 @@ func scrubURLError(err error) error {
 // enough not to stall a graceful stop on an unresponsive upstream.
 const upstreamSessionDeleteTimeout = 5 * time.Second
 
-// DeleteMCPHTTPSession sends a best-effort, bounded MCP session-termination DELETE
-// so the remote frees the session's server-side state instead of leaking it. A
-// blank sessID is a no-op. It uses a fresh background context since it runs from
-// teardown paths whose own context is typically being canceled; failures are logged,
-// not returned, so teardown never blocks. Shared by the gateway's per-session remote
-// path and the stdio host's HTTP bridge.
+// DeleteMCPHTTPSession sends a best-effort, bounded MCP session-termination DELETE so the
+// remote frees the session's server-side state instead of leaking it. A blank sessID is a
+// no-op. Uses a fresh background context since it runs from teardown paths whose own
+// context is typically being canceled; failures are logged, not returned, so teardown never
+// blocks.
 func DeleteMCPHTTPSession(client *http.Client, endpoint, sessID, authHeaderLine string) {
 	if sessID == "" || client == nil {
 		return
@@ -82,20 +70,16 @@ func DeleteMCPHTTPSession(client *http.Client, endpoint, sessID, authHeaderLine 
 		return
 	}
 	req.Header.Set(SessionHeader, sessID)
-	// A session-termination DELETE is a post-handshake request, so it must carry the
-	// negotiated protocol version (matching DoMCPHTTP). Without it a spec-conformant
-	// upstream rejects the DELETE with 400 and never frees the session's server-side
-	// state — the exact leak this function exists to prevent.
+	// A post-handshake request must carry the negotiated protocol version; without it a
+	// spec-conformant upstream rejects the DELETE with 400 and leaks the session.
 	req.Header.Set("MCP-Protocol-Version", MCPProtocolVersion)
 	if name, value, ok := splitHeaderLine(authHeaderLine); ok {
 		req.Header.Set(name, value)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		// Scrub the credentialed endpoint from the *url.Error before logging (net/http
-		// strips only the password): the same leak class scrubURLError closes on the
-		// DoMCPHTTP client.Do path, reached here from both the gateway per-session close
-		// and the stdio bridge close.
+		// Scrub before logging: net/http's *url.Error strips only the password, not the
+		// username/query-string credential (same leak class as scrubURLError elsewhere).
 		fmt.Fprintf(os.Stderr, "[eunox] upstream session DELETE failed: %v\n", scrubURLError(err))
 		return
 	}
@@ -116,16 +100,12 @@ const (
 // tlsSkipVerify is true it accepts any TLS certificate (development only; callers warn).
 // upstreamTimeoutMs is the resolved per-call timeout; pass <= 0 when disabled.
 //
-// Idle keep-alive connections are bounded by the transport's own IdleConnTimeout (from
-// the cloned DefaultTransport) and MaxIdleConnsPerHost, so a single transport can be
-// SHARED across a route's sessions (see UpstreamRoute.sharedUpstreamTransport) without
-// idle-conn accumulation under session churn — while still reusing warm TCP/TLS
-// connections instead of a fresh handshake per session.
+// Idle connections are bounded by IdleConnTimeout and MaxIdleConnsPerHost, so a single
+// transport can be SHARED across a route's sessions (UpstreamRoute.sharedUpstreamTransport)
+// without idle-conn accumulation under session churn, while still reusing warm connections.
 func buildUpstreamTransport(tlsSkipVerify bool, upstreamTimeoutMs int) *http.Transport {
-	// Clone the default transport when it is the stdlib *http.Transport. If the
-	// process replaced it with a non-*http.Transport (e.g. a tracing wrapper or test
-	// spy), a bare type assertion would panic and crash this proxy, so fall back to a
-	// fresh transport with secure defaults.
+	// Clone the default transport only when it's still the stdlib *http.Transport; a bare
+	// type assertion on a replaced (tracing wrapper, test spy) DefaultTransport would panic.
 	var transport *http.Transport
 	if t, ok := http.DefaultTransport.(*http.Transport); ok {
 		transport = t.Clone()
@@ -136,21 +116,16 @@ func buildUpstreamTransport(tlsSkipVerify bool, upstreamTimeoutMs int) *http.Tra
 			IdleConnTimeout:       90 * time.Second,
 		}
 	}
-	// All of a route's sessions target the same upstream host, so raise the per-host
-	// idle-conn cap above the stdlib default of 2 to keep more warm connections
-	// available for reuse under concurrency (still bounded, still reaped by
-	// IdleConnTimeout — the "no idle accumulation" property a shared transport needs).
+	// All of a route's sessions target the same host, so raise the per-host idle-conn cap
+	// above the stdlib default of 2 for more reuse under concurrency (still bounded and
+	// reaped by IdleConnTimeout).
 	transport.MaxIdleConnsPerHost = 32
-	// Bound the wait for response headers. ResponseHeaderTimeout is a transport
-	// property, so it applies to every request through this client (foreground calls
-	// AND the session-start drift probe) on top of any per-call context deadline. Set
-	// it to max(configured, sessionStartTimeout): a hardcoded value would silently
-	// undercut a larger --upstream-timeout and dishonor --upstream-timeout=0, while the
-	// floor keeps a tight per-call timeout from shortening the drift probe's header
-	// wait (the probe runs outside the per-call budget under the session-start
-	// deadline). Foreground calls are still bounded by their per-call deadline, so this
-	// cap is only ever a backstop. Disabled (<= 0): leave unset and rely on context
-	// deadlines.
+	// ResponseHeaderTimeout is a transport property, so it applies to every request
+	// (foreground calls AND the session-start drift probe) on top of any per-call context
+	// deadline. Floor it at sessionStartTimeout: a hardcoded value would undercut a larger
+	// --upstream-timeout, while the floor keeps a tight per-call timeout from shortening the
+	// drift probe's header wait. Foreground calls stay bounded by their own deadline, so
+	// this is only a backstop; <= 0 leaves it unset.
 	if upstreamTimeoutMs > 0 {
 		rht := msToDuration(upstreamTimeoutMs)
 		if rht < sessionStartTimeout {
@@ -170,10 +145,9 @@ func buildUpstreamTransport(tlsSkipVerify bool, upstreamTimeoutMs int) *http.Tra
 func newUpstreamClient(transport *http.Transport) *http.Client {
 	return &http.Client{
 		Transport: transport,
-		// Refuse to follow redirects. An MCP JSON-RPC POST has no legitimate redirect,
-		// and Go's client only strips Authorization/Cookie cross-host — a custom
-		// upstreamAuthHeader (e.g. "X-Api-Key: ...") would otherwise be replayed to
-		// whatever host a compromised upstream names in a 30x Location, leaking it.
+		// Refuse redirects: an MCP JSON-RPC POST has none legitimately, and Go's client
+		// only strips Authorization/Cookie cross-host — a custom upstreamAuthHeader would
+		// otherwise be replayed to whatever host a compromised upstream names in a 30x.
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
@@ -203,28 +177,24 @@ func (s *httpSession) mcpEndpointURL() string {
 	return UpstreamMCPEndpoint(s.route.upstreamURL)
 }
 
-// newRemoteSession creates a client session backed by the configured remote HTTP
-// upstream: it performs the initialize handshake, stores the upstream session ID,
-// and registers the session in p.sessions.
+// newRemoteSession creates a client session backed by the configured remote HTTP upstream:
+// performs the initialize handshake, stores the upstream session ID, registers in p.sessions.
 // startGen is the reap generation the CALLER observed before its pre-spawn kill gate (see
 // handleMCPPost and newSession).
 func (p *HTTPProxy) newRemoteSession(ctx context.Context, route *UpstreamRoute, clientIP string, startGen uint64) (*httpSession, error) {
-	// Share the route's single *http.Transport (connection pool) across sessions so a
-	// session-creating initialize reuses a warm TCP/TLS connection instead of paying a
-	// fresh handshake; the *http.Client wrapper is per-session but cheap.
+	// Share the route's *http.Transport (connection pool) across sessions so a
+	// session-creating initialize reuses a warm connection; the *http.Client is per-session.
 	client := newUpstreamClient(route.sharedUpstreamTransport(p.upstreamTimeMs))
 
-	// The session-scoped context's sole job is teardown signaling (canceled in close()),
-	// so it descends from Background, NOT the request ctx that created the session — that
-	// ctx ends when initialize returns, which must not cancel later per-call teardown.
+	// Descends from Background, NOT the request ctx that created the session: that ctx ends
+	// when initialize returns, which must not cancel later per-call teardown.
 	sessCtx, sessCancel := context.WithCancel(context.Background())
 	sess := &httpSession{
 		id:    uuid.New().String(),
 		proxy: p,
 		route: route,
-		// byUpstreamID and hostToUp are left nil: they correlate and nonce-rewrite
-		// subprocess-upstream traffic and are never touched on the remote-HTTP path,
-		// which is plain request/response through doRemoteHTTP.
+		// byUpstreamID and hostToUp are left nil: they never apply on the remote-HTTP
+		// path, which is plain request/response through doRemoteHTTP.
 		done:         make(chan struct{}),
 		evicted:      make(chan struct{}),
 		sessCtx:      sessCtx,
@@ -233,9 +203,8 @@ func (p *HTTPProxy) newRemoteSession(ctx context.Context, route *UpstreamRoute, 
 		claims:       pdp.JWTClaimsPtr(ctx),
 		clientIP:     clientIP,
 	}
-	// Mark initializing until newRemoteSession returns (after the synchronous drift
-	// check) so the idle reaper does not tear it down during that window — the same
-	// guard as local-subprocess newSession. See the initInProgress field comment.
+	// Marks initializing until this returns (after the drift check) so the idle reaper
+	// doesn't tear it down mid-establishment — same guard as local-subprocess newSession.
 	sess.initInProgress.Store(true)
 	defer p.finishEstablishing(sess) //nolint:contextcheck // the establishment edge's kill check and any teardown it triggers are deliberately detached: this defer runs as the request context is finishing, and binding the reclaim to it would cancel the teardown the moment the handler returns — the same rationale as the other reap sites.
 
@@ -246,10 +215,9 @@ func (p *HTTPProxy) newRemoteSession(ctx context.Context, route *UpstreamRoute, 
 		return nil, fmt.Errorf("upstream initialize: %w", err)
 	}
 
-	// Register before starting any goroutine that might close the session: a fast
-	// close otherwise fires the cleanup goroutine before the entry exists, leaking the
-	// dead session into the map (same ordering invariant as newSession). registerSession
-	// also enforces the maxSessions cap; on overflow, release the remote session.
+	// Register before starting any goroutine that might close the session: a fast close
+	// otherwise fires the cleanup goroutine before the entry exists, leaking the dead
+	// session into the map (same ordering invariant as newSession).
 	if err := p.registerSession(sess, startGen); err != nil {
 		sess.close(p.shutdownMs) //nolint:contextcheck // teardown path: the upstream session-termination DELETE intentionally uses a detached, bounded background context — close/reaper/signal/shutdown carry no request context.
 		return nil, err
@@ -261,24 +229,19 @@ func (p *HTTPProxy) newRemoteSession(ctx context.Context, route *UpstreamRoute, 
 		p.mu.Lock()
 		delete(p.sessions, sess.id)
 		p.mu.Unlock()
-		// Release this session's per-session flow-label state, mirroring the local-subprocess
-		// cleanup path.
 		releaseSessionState(sess)
 		fmt.Fprintf(os.Stderr, "[eunox] HTTP session %s ended.\n", sess.id)
 	}()
 
-	// Drift check (remote mode: callUpstream works without a readUpstream goroutine).
 	// Always synchronous so FM-5 aborts before the session is returned; --strict-drift
-	// additionally gates FM-1/2/4. On failure delete synchronously (the cleanup
-	// goroutine deletes only after done is signaled) so the failed session stops
-	// counting against maxSessions immediately; the goroutine's later delete is a no-op.
+	// additionally gates FM-1/2/4. On failure delete synchronously so the failed session
+	// stops counting against maxSessions immediately; the goroutine's later delete is a no-op.
 	if err := p.runDriftCheckOrTeardown(ctx, sess, route); err != nil {
 		return nil, err
 	}
 
-	// Re-stamp the activity clocks now that establishment is complete, so idle is
-	// measured from readiness, not from registration (which ran before the handshake
-	// and drift probe). See the matching comment in newSession.
+	// Re-stamp the activity clocks now that establishment is complete, so idle is measured
+	// from readiness, not from registration (which ran before the handshake/drift probe).
 	sess.touchRequest()
 
 	fmt.Fprintf(os.Stderr, "[eunox] HTTP session %s started (remote: %s).\n", sess.id, capability.RedactURLForLog(route.upstreamURL))
@@ -286,36 +249,27 @@ func (p *HTTPProxy) newRemoteSession(ctx context.Context, route *UpstreamRoute, 
 }
 
 // initRemoteUpstream performs the MCP initialize handshake with the remote upstream:
-// it sends initialize, captures the upstream Mcp-Session-Id, stores the server
-// capabilities, then sends notifications/initialized.
+// sends initialize, captures the upstream Mcp-Session-Id, stores the server capabilities,
+// then sends notifications/initialized.
 func (s *httpSession) initRemoteUpstream(ctx context.Context) error {
 	s.idCounter++
 	initReq, _ := buildInitializeRequest(s.idCounter)
 
 	respMsg, respHdr, err := s.doRemoteHTTP(ctx, initReq, "")
-	// Capture the upstream session ID the instant the response headers arrive, BEFORE
-	// any gate — including the doRemoteHTTP/DoMCPHTTP error returns. A non-2xx status, a
-	// 202 to a request, an empty 200 body, or a 200 SSE stream with no matching event all
-	// return the response header alongside an error, and a remote upstream may already
-	// have ALLOCATED a session (set Mcp-Session-Id) on such an error response. So close()
-	// must be able to DELETE it on every path below: the doRemoteHTTP error, the
-	// correlation failure, a malformed result, or the notifications/initialized send. A
-	// true transport error from client.Do returns a nil header (no session was allocated),
-	// so the guard skips it; a blank header is a no-op. Capturing it only after the error
-	// guard (its prior position) leaked the session whenever initialize failed inside
-	// DoMCPHTTP; capturing it only after correlation leaked it for a mismatched-id reply.
+	// Capture the session ID the instant headers arrive, BEFORE any gate: a non-2xx, a
+	// 202 to a request, an empty 200 body, or an SSE stream with no matching event all
+	// return headers alongside an error, and the upstream may already have ALLOCATED a
+	// session on such a response — close() must be able to DELETE it on every failure
+	// path below. A true transport error returns a nil header, so the guard skips it.
 	if respHdr != nil {
 		s.upstreamSessID = respHdr.Get(SessionHeader)
 	}
 	if err != nil {
 		return fmt.Errorf("sending initialize: %w", err)
 	}
-	// Correlate the reply by shape via the shared rule (same as callRemoteUpstream and
-	// the stdio bridge). The SSE body path already filters by id, but the plain-JSON
-	// body path does not, so a mismatched or non-response reply must fail closed here. A
-	// reply with the wrong id is refused whether it is a result OR an error: a result may
-	// carry another request's data, and re-stamping a mismatched error would let an
-	// adversarial upstream inject one caller's error into this initialize handshake.
+	// Correlate by shape via the shared rule (same as callRemoteUpstream and the stdio
+	// bridge): a wrong-id reply is refused even as an error, since re-stamping it would let
+	// an adversarial upstream inject one caller's error into this handshake.
 	respMsg, err = correlateUpstreamReply(initReq, respMsg)
 	if err != nil {
 		return fmt.Errorf("upstream initialize: %w", err)
@@ -332,23 +286,17 @@ func (s *httpSession) initRemoteUpstream(ctx context.Context) error {
 	return err
 }
 
-// callRemoteUpstream forwards msg to the remote upstream and returns the response,
-// bounded by --upstream-timeout and by the session's teardown. Notifications (no ID)
-// return an empty rpcMsg on success. The initialize handshake uses doRemoteHTTP directly
-// (bounded by the session-start deadline), so it is not double-bounded here.
+// callRemoteUpstream forwards msg to the remote upstream and returns the response, bounded
+// by --upstream-timeout and by the session's teardown. Notifications (no ID) return an
+// empty rpcMsg on success. The initialize handshake uses doRemoteHTTP directly (bounded by
+// the session-start deadline), so it is not double-bounded here.
 func (s *httpSession) callRemoteUpstream(ctx context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, error) {
 	ctx, cancel := s.withUpstreamTimeout(ctx)
 	defer cancel()
-	// Add the teardown dimension: cancel this call if the session ends, so a stuck
-	// round-trip cannot outlive the session — essential under --upstream-timeout=0, where
-	// close() only drops idle connections (CloseIdleConnections does not cancel an active
-	// request). We must OWN a cancel here: withUpstreamTimeout's cancel above is a no-op
-	// under --upstream-timeout=0 (boundUpstreamCall), which is precisely the case this
-	// mechanism exists for — so derive a real cancelable child and fire it on teardown.
-	// context.AfterFunc registers on the session context (a *cancelCtx) and, on the
-	// completed-call path, spawns NO goroutine (the deferred stop deregisters it) — unlike
-	// the old per-call watcher goroutine, free per call. sessCtx is always live (set in
-	// newSession/newRemoteSession, and in tests by newTestSession), so this is unconditional.
+	// Cancel this call if the session ends, so a stuck round-trip cannot outlive it —
+	// essential under --upstream-timeout=0, where withUpstreamTimeout's cancel is a no-op
+	// and close() only drops idle connections. context.AfterFunc on the session context
+	// spawns no goroutine on the completed-call path (the deferred stop deregisters it).
 	var teardownCancel context.CancelFunc
 	ctx, teardownCancel = context.WithCancel(ctx)
 	defer teardownCancel()
@@ -359,21 +307,17 @@ func (s *httpSession) callRemoteUpstream(ctx context.Context, msg mcp.RPCMsg) (m
 	if err != nil {
 		return resp, err
 	}
-	// Correlate the reply by shape: enforcedForwardCore later overwrites the id with the
-	// host's, masking a mismatch and binding the wrong result, so a non-response reply
-	// (method-bearing or id-less) must fail closed here rather than be forwarded to the
-	// host as a malformed response. The shared correlateUpstreamReply is the single
-	// source of truth for the fail-closed rule, identical to the stdio bridge's post().
+	// enforcedForwardCore later overwrites the id with the host's, masking a mismatch, so
+	// a non-response or wrong-id reply must fail closed here rather than be forwarded.
 	return correlateUpstreamReply(msg, resp)
 }
 
-// DoMCPHTTP marshals msg and POSTs it to endpoint, setting the session-id header
-// when sessID is non-empty and parsing authHeaderLine as "Name: Value" for the auth
-// header. A 202 Accepted is a valid no-body ack only for a notification; for a
-// request it is a spec-violating empty answer and returns an error (fail closed).
-// The single HTTP-upstream implementation, shared by the gateway's per-session path
-// (doRemoteHTTP), the validation live-check (fetchLiveTools), and the stdio host's
-// HTTP bridge (httpUpstream.do).
+// DoMCPHTTP marshals msg and POSTs it to endpoint, setting the session-id header when
+// sessID is non-empty and parsing authHeaderLine as "Name: Value" for the auth header. A
+// 202 Accepted is a valid no-body ack only for a notification; for a request it is a
+// spec-violating empty answer and returns an error (fail closed). The single HTTP-upstream
+// implementation, shared by the gateway's per-session path, the validation live-check, and
+// the stdio host's HTTP bridge.
 func DoMCPHTTP(ctx context.Context, client *http.Client, endpoint string, msg mcp.RPCMsg, sessID, authHeaderLine string) (mcp.RPCMsg, http.Header, error) {
 	data, err := json.Marshal(msg)
 	if err != nil {
@@ -381,11 +325,9 @@ func DoMCPHTTP(ctx context.Context, client *http.Client, endpoint string, msg mc
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(data)) //nolint:gosec // G107: endpoint is operator-configured (user-supplied URL or config file)
 	if err != nil {
-		// Scrub before surfacing: a url.Parse-fatal endpoint (bad port, bad %-escape) makes
-		// NewRequestWithContext return a *url.Error whose URL is the raw, UNstripped input,
-		// so an embedded userinfo credential — password included, unlike the client.Do path
-		// net/http partially strips below — would otherwise reach the live-probe stderr and
-		// the doctor bundle.
+		// Scrub before surfacing: a url.Parse-fatal endpoint makes NewRequestWithContext
+		// return a *url.Error whose URL is the raw, UNstripped input — password included,
+		// unlike the client.Do path below — which would otherwise leak to stderr/the doctor bundle.
 		return mcp.RPCMsg{}, nil, fmt.Errorf("building request: %w", scrubURLError(err))
 	}
 	req.Header.Set("Content-Type", CTJSON)
@@ -405,19 +347,15 @@ func DoMCPHTTP(ctx context.Context, client *http.Client, endpoint string, msg mc
 	}
 	resp, err := client.Do(req) //nolint:gosec // G704: endpoint is the operator-configured upstream MCP URL (gateway config / CLI flag), not attacker-controlled input — reaching it is the proxy's purpose, not an SSRF (same rationale as the G107 suppression on the request build above)
 	if err != nil {
-		// Scrub the credentialed URL from the transport error before it is surfaced: the
-		// *url.Error text otherwise leaks the userinfo username and query string to the
-		// live-probe's stderr and the doctor bundle (net/http strips only the password).
+		// net/http's *url.Error strips only the password, not username/query; scrub before surfacing.
 		return mcp.RPCMsg{}, nil, fmt.Errorf("upstream HTTP: %w", scrubURLError(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusAccepted {
-		// A 202 with no body is a valid ack only for input expecting no response (a
-		// notification or a forwarded response). For an enforced REQUEST the spec
-		// requires a 200 with a body; a 202 here would otherwise be returned as an empty
-		// RPCMsg with nil error and recorded as an allow, so fail closed with a transport
-		// error. Gating on IsRequest (not a bare id != nil) keeps a 202-ack to a
-		// forwarded response (id, no method) valid.
+		// A 202 with no body is a valid ack only for input expecting no response. For an
+		// enforced REQUEST it would otherwise be returned as an empty RPCMsg with nil error
+		// and recorded as an allow, so fail closed. Gating on IsRequest (not id != nil) keeps
+		// a 202-ack to a forwarded response (id, no method) valid.
 		if msg.IsRequest() {
 			return mcp.RPCMsg{}, resp.Header, fmt.Errorf("upstream returned 202 Accepted with no body to a request expecting a response; the MCP Streamable HTTP spec requires a 200 with a JSON-RPC result or error")
 		}
@@ -427,15 +365,10 @@ func DoMCPHTTP(ctx context.Context, client *http.Client, endpoint string, msg mc
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxUpstreamErrBodyBytes))
 		return mcp.RPCMsg{}, resp.Header, fmt.Errorf("upstream returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
-	// A 200 OK may carry either a JSON body or an SSE body. For SSE, extract the
-	// matching JSON-RPC payload from the event stream; otherwise decode JSON directly.
-	//
-	// A lenient upstream may answer a NOTIFICATION (or a forwarded response) — input
-	// that expects no JSON-RPC response — with a 200 OK and an empty body (or a 200 SSE
-	// stream carrying no matching event) instead of the spec's 202. That message rides
-	// no security decision (it was already sent), so treat the absent body/event as a
-	// valid ack, symmetric to the 202 handling above. A genuine REQUEST still fails
-	// closed: it needs a result/error.
+	// A 200 OK may carry a JSON or SSE body; for SSE, extract the matching JSON-RPC payload.
+	// A lenient upstream may answer a notification with an empty body/no matching event
+	// instead of the spec's 202 — treat that as a valid ack too, symmetric to the 202
+	// handling above. A genuine REQUEST still fails closed: it needs a result/error.
 	body := io.LimitReader(resp.Body, maxUpstreamRespBytes)
 	if isSSEContentType(resp.Header.Get("Content-Type")) {
 		out, err := sseResponseForID(body, msg.ID)
@@ -474,27 +407,23 @@ func isSSEContentType(contentType string) bool {
 	return strings.EqualFold(strings.TrimSpace(mediaType), ctSSE)
 }
 
-// sseResponseForID reads an SSE event stream from r and returns the first event
-// whose decoded JSON-RPC id matches wantID. A server MAY interleave unrelated
-// messages (e.g. a notification) ahead of the response, so events are correlated by
-// id; events with no id or a non-matching id are skipped. Each event's payload is the
-// concatenation of its consecutive "data:" lines (ending at a blank line). Bounded by
-// the maxUpstreamRespBytes LimitReader the caller wraps r in.
+// sseResponseForID reads an SSE event stream from r and returns the first event whose
+// decoded JSON-RPC id matches wantID (a server may interleave unrelated messages ahead of
+// the response). Each event's payload is the concatenation of its consecutive "data:"
+// lines. Bounded by the maxUpstreamRespBytes LimitReader the caller wraps r in.
 func sseResponseForID(r io.Reader, wantID *json.RawMessage) (mcp.RPCMsg, error) {
-	// Strip a single leading UTF-8 BOM before scanning: it would otherwise turn the
-	// first field into a "data:" that strings.CutPrefix misses, losing a response in
-	// the first event.
+	// Strip a leading UTF-8 BOM: it would otherwise turn the first field into a "data:"
+	// that strings.CutPrefix misses, losing a response in the first event.
 	br := bufio.NewReaderSize(r, 64<<10)
 	if bom, _ := br.Peek(3); len(bom) == 3 && bom[0] == 0xEF && bom[1] == 0xBB && bom[2] == 0xBF {
 		_, _ = br.Discard(3)
 	}
 	scanner := bufio.NewScanner(br)
-	// Allow a single SSE data line up to the upstream response cap; the default
-	// 64 KiB token limit would reject a large-but-legitimate JSON-RPC payload.
+	// Allow a single SSE data line up to the upstream cap; bufio's default 64 KiB token
+	// limit would reject a large-but-legitimate JSON-RPC payload.
 	scanner.Buffer(make([]byte, 0, 64<<10), maxUpstreamRespBytes)
-	// SSE lines may end in CR, LF, or CRLF (WHATWG/EventSource). The default
-	// bufio.ScanLines does not treat a bare CR as a terminator, so a bare-CR upstream
-	// would frame no events; use a splitter that honors all three.
+	// bufio.ScanLines doesn't treat a bare CR as a terminator, so a bare-CR upstream (WHATWG/
+	// EventSource allows CR/LF/CRLF) would frame no events; use a splitter that honors all three.
 	scanner.Split(scanSSELines)
 	want := mcp.MsgKey(wantID)
 	var data []byte
@@ -510,10 +439,8 @@ func sseResponseForID(r io.Reader, wantID *json.RawMessage) (mcp.RPCMsg, error) 
 		if err := json.Unmarshal(data, &out); err != nil {
 			return mcp.RPCMsg{}, false
 		}
-		// An id-less event (a notification) keys to "" — the same key a nil wantID
-		// produces. Without the explicit out.ID == nil guard, a nil wantID (a forwarded
-		// notification) would match the first interleaved notification. An id-less event
-		// is never a match.
+		// An id-less event keys to "" — the same key a nil wantID produces — so without
+		// this explicit guard a forwarded notification would match the first interleaved one.
 		if out.ID == nil || mcp.MsgKey(out.ID) != want {
 			return mcp.RPCMsg{}, false
 		}
@@ -572,9 +499,8 @@ func scanSSELines(data []byte, atEOF bool) (advance int, token []byte, err error
 				}
 				return i + 1, data[:i], nil // bare CR
 			}
-			// CR at the end of the current buffer. If more bytes may follow, ask for
-			// them so a CRLF pair is not split across two reads (which would emit a
-			// spurious empty line). At EOF the CR is the final terminator.
+			// CR at buffer end: ask for more so a CRLF pair isn't split across reads
+			// (which would emit a spurious empty line). At EOF the CR is the terminator.
 			if atEOF {
 				return i + 1, data[:i], nil
 			}
