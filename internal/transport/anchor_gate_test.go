@@ -366,11 +366,13 @@ func TestSessionGate_ReleasedOnEveryTeardownPath(t *testing.T) {
 	}
 }
 
-// TestSessionGate_TaskAnchoredRouteResolvesPerRequest is the negative half: the cache serves a
+// TestSessionGate_TaskAnchoredRouteResolvesPerRequest is the negative half: the PIN serves a
 // request only when the request RESOLVES the anchor it was taken for. Here neither session
-// presented a task at initialize, so each caches its own session anchor — and requests that do
-// carry a task resolve an anchor neither cached, must therefore reach the registry, and must
-// land on ONE gate, which is exactly what task anchoring is for.
+// presented a task at initialize, so each pins its own session anchor — and requests that do
+// carry a task resolve an anchor neither pinned, so each session reaches it through its span
+// cache instead, and both must land on ONE gate, which is exactly what task anchoring is for.
+// (What the span cache changes is who HOLDS that gate between calls; what it must not change is
+// that there is one of it. See session_gate_cache_test.go.)
 func TestSessionGate_TaskAnchoredRouteResolvesPerRequest(t *testing.T) {
 	t.Parallel()
 	rt := &UpstreamRoute{decideGates: newAnchorGates(), taskAnchored: true, pdp: pdp.DenyAllPDP{}}
@@ -397,8 +399,9 @@ func TestSessionGate_TaskAnchoredRouteResolvesPerRequest(t *testing.T) {
 	}
 	end()
 	(<-waiting)()
-	assert.Equal(t, 2, rt.decideGates.size(),
-		"the shared task gate is reclaimed once both are done; the two session gates are held for the sessions' lives")
+	assert.Equal(t, 3, rt.decideGates.size(),
+		"three live gates: each session's own, plus the ONE both sessions resolved for task-42 — "+
+			"which each now holds through its span cache rather than re-minting per call")
 	releaseSessionState(a)
 	releaseSessionState(b)
 	assert.Zero(t, rt.decideGates.size())
@@ -467,7 +470,9 @@ func TestSessionGate_CacheFollowsTheResolvedAnchor(t *testing.T) {
 		t.Fatal("the turn must advance once released")
 	}
 	releaseSessionState(sess)
-	assert.Zero(t, rt.decideGates.size())
+	releaseSessionState(sibling)
+	assert.Zero(t, rt.decideGates.size(),
+		"both sessions spanned onto task-99 and each cached its gate, so both teardowns are what empties the registry")
 }
 
 // TestSessionGate_UnregisteredSessionStillSerializes covers the fallback. The cache is set at

@@ -2336,7 +2336,7 @@ func TestServeStdioHost_AuditModeStartsAndFailsFast(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "audit.jsonl")
 	keyPath := filepath.Join(dir, "audit.key")
-	sink, err := audit.Open(logPath, keyPath, 0, 0, audit.WithIdentity(pdp.AuditIdentityFromContext))
+	sink, err := audit.Open(logPath, keyPath, 0, 0, audit.WithIdentity(auditIdentity))
 	if err != nil {
 		t.Fatalf("audit.Open: %v", err)
 	}
@@ -2577,7 +2577,7 @@ func TestCmdAuditVerify_InvalidSince(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "audit.jsonl")
 	keyPath := filepath.Join(dir, "audit.key")
-	sink, err := audit.Open(logPath, keyPath, 0, 0, audit.WithIdentity(pdp.AuditIdentityFromContext))
+	sink, err := audit.Open(logPath, keyPath, 0, 0, audit.WithIdentity(auditIdentity))
 	if err != nil {
 		t.Fatalf("audit.Open: %v", err)
 	}
@@ -2863,7 +2863,7 @@ func TestCmdAuditVerify_UnknownKeyID(t *testing.T) {
 	keyPathA := filepath.Join(dir, "keyA.key")
 	keyPathB := filepath.Join(dir, "keyB.key")
 
-	sink, err := audit.Open(logPath, keyPathA, 0, 0, audit.WithIdentity(pdp.AuditIdentityFromContext))
+	sink, err := audit.Open(logPath, keyPathA, 0, 0, audit.WithIdentity(auditIdentity))
 	if err != nil {
 		t.Fatalf("audit.Open: %v", err)
 	}
@@ -2874,7 +2874,7 @@ func TestCmdAuditVerify_UnknownKeyID(t *testing.T) {
 
 	// Mint key B by opening a throwaway sink at its path, so the ring loads and holds
 	// a real key that simply did not sign these records.
-	otherSink, err := audit.Open(filepath.Join(dir, "other.jsonl"), keyPathB, 0, 0, audit.WithIdentity(pdp.AuditIdentityFromContext))
+	otherSink, err := audit.Open(filepath.Join(dir, "other.jsonl"), keyPathB, 0, 0, audit.WithIdentity(auditIdentity))
 	if err != nil {
 		t.Fatalf("audit.Open (key B): %v", err)
 	}

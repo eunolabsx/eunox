@@ -109,10 +109,11 @@ type httpSession struct {
 	// non-overlapping request finished, so ordinary sequential traffic re-created the same
 	// entry per call on the microsecond decision path.
 	//
-	// decideAnchor is the anchor decideGate was resolved for, and it is what makes the cache
+	// decideAnchor is the anchor decideGate was resolved for, and it is what makes the pin
 	// USABLE: every request resolves its own anchor and compares it to this one, taking the
-	// cached gate on a hit and falling through to the registry on a miss. That comparison is
-	// the whole of the correctness argument. The alternative — deciding from the route's
+	// pinned gate on a hit and falling through to decideCache (and, past its cap, to the
+	// registry) on a miss. That comparison is the whole of the correctness argument for
+	// reading decideGate with no lock at all. The alternative — deciding from the route's
 	// taskAnchored bit that the anchor "cannot change" — is a second, independent reading of
 	// the question enforcement.ResolveStateAnchor exists to answer: a third anchor kind
 	// (an agent id, a conversation, a delegation chain) breaks every caller of the resolver at
@@ -122,10 +123,27 @@ type httpSession struct {
 	// it extends the fast path to a task-anchored session that stays on one task — which the
 	// bool could not do.
 	//
+	// The pin is written once, at registration, and read with no lock by every concurrent
+	// request — which is exactly why it is never RE-pointed at an anchor a later request
+	// resolves. Moving it means returning the registry reference it holds, and that reference
+	// is the only thing stopping the registry reclaiming that gate and building a fresh one
+	// under a request that read the old pointer and has not yet taken its turn. Two gates for
+	// one anchor is not slow, it is unserialized. decideCache is where the other anchors go,
+	// with the reference counting that hazard needs.
+	//
 	// nil on a non-serialized route (no registry at all) and on a test-assembled session that
 	// never registered; both fall back to the registry path, which is a no-op for the former.
 	decideAnchor enforcement.StateAnchor
 	decideGate   *anchorGate
+	// decideCache holds the gates for the OTHER anchors a session resolves. The pin above
+	// covers a session-anchored route and a task-anchored session that stays on one task; a
+	// session that SPANS tasks — the shape task anchoring exists for — matched it on neither
+	// the second task nor any after it, and took the route-wide registry round trip on every
+	// enforced call for the rest of its life. The pin is deliberately not re-pointed to chase
+	// that: see session_gate_cache.go for why moving a lock-free reference is the one thing
+	// this cannot do, and for the reference counting that makes evicting a cached one safe.
+	// Zero value ready; allocates nothing for a session that never spans.
+	decideCache gateCache
 	// dropDecideGate releases the reference above at teardown, so a long-lived gateway does
 	// not accumulate one gate per session it has ever served. nil when none is held, and
 	// idempotent. Called from releaseSessionState — the funnel that runs on EVERY teardown,
@@ -746,14 +764,14 @@ func (p *HTTPProxy) registerSession(sess *httpSession, startGen uint64) error {
 	return nil
 }
 
-// holdDecisionGate resolves this session's anchor once and caches the registry gate for it,
-// for the session's life. The reference is released by releaseSessionState.
+// holdDecisionGate resolves this session's anchor once and pins the registry gate for it, for
+// the session's life. The reference is released by releaseSessionState.
 //
 // The anchor is resolved from the session's OWN claims — the identity every request on the
 // session carries, which the session gate pins (ownerMismatch) — so on a well-formed session
 // this is the gate every request resolves. It is a cache, not a decision that the anchor
 // cannot change: each request resolves its own and compares (see gateFor), so a request that
-// lands on a different anchor reaches the registry rather than the wrong turn.
+// lands on a different anchor reaches decideCache or the registry rather than the wrong turn.
 //
 // A non-serialized route has no registry and caches nothing; hold is a no-op on a nil registry,
 // so this needs no branch of its own for that case.
@@ -766,17 +784,55 @@ func (s *httpSession) holdDecisionGate() {
 	s.decideGate, s.dropDecideGate = rt.decideGates.hold(s.decideAnchor.Key())
 }
 
-// gateFor returns this session's cached gate when it is the gate anchor resolves to, or nil to
-// send the caller through the registry.
+// gateFor returns this session's PINNED gate when it is the gate anchor resolves to, or nil to
+// send the caller on to the cache and then the registry.
 //
 // The comparison is on the RESOLVED anchor (a comparable two-string struct, so it allocates
 // nothing and renders no key), never on a restatement of how the resolver decides. That is what
-// makes the cache correct for any anchor kind rather than for the two that exist today.
+// makes the pin correct for any anchor kind rather than for the two that exist today.
 func (s *httpSession) gateFor(anchor enforcement.StateAnchor) *anchorGate {
 	if s.decideGate == nil || s.decideAnchor != anchor {
 		return nil
 	}
 	return s.decideGate
+}
+
+// beginTurn enters anchor's decision turn under w's give-up rule and returns the idempotent
+// release. ok is false only when a bounded w gave up; an unbounded one always enters.
+//
+// Three ways to reach the same turn, in cost order, and the ordering is the whole design:
+//
+//  1. The session's PIN, read with no lock at all. It covers every request on a
+//     session-anchored route and every request of a task-anchored session that stays on one
+//     task — which is to say almost every request this proxy serves.
+//  2. The session's CACHE, on the session's own mutex, for the other anchors a spanning
+//     session resolves. See session_gate_cache.go.
+//  3. The route REGISTRY, the always-correct path, on a route-wide mutex. Reached by a route
+//     that does not serialize (where it is a no-op) and by a request racing its own session's
+//     teardown, after the cache has stopped admitting. Reaching the cache's cap does NOT send a
+//     request here — the cache sheds its least recently used entry and serves the request — so
+//     this tier is not a capacity overflow path.
+//
+// All three resolve the turn for the SAME anchor and none of them is consulted without one:
+// what is compared is the resolved enforcement.StateAnchor, never a restatement of how the
+// resolver decides, so a future third anchor kind keeps every one of them correct.
+func (s *httpSession) beginTurn(anchor enforcement.StateAnchor, w turnWait) (func(), bool) {
+	if gate := s.gateFor(anchor); gate != nil {
+		return gate.take(w)
+	}
+	if gate, release, ok := s.decideCache.acquire(anchor, s.route.decideGates); ok {
+		end, taken := gate.take(w)
+		if !taken {
+			// No turn taken, so nothing to release but this caller's use of the cache entry —
+			// which is what keeps an abandoned wait from pinning the entry against eviction.
+			release()
+			return nil, false
+		}
+		// Composed rather than guarded by a third sync.OnceFunc: both halves are already
+		// idempotent, matching what anchorGates.acquire does with its own pair.
+		return func() { end(); release() }, true
+	}
+	return s.route.decideGates.acquire(anchor.Key(), w)
 }
 
 // beginDecisionTurn enters this request's decision turn and returns the idempotent release,
@@ -786,12 +842,8 @@ func (s *httpSession) gateFor(anchor enforcement.StateAnchor) *anchorGate {
 // ctx supplies the request's VALIDATED claims, which decide the anchor on a task-anchored
 // route.
 func (s *httpSession) beginDecisionTurn(ctx context.Context) func() {
-	anchor := s.route.decisionAnchorFromContext(ctx, s.id)
-	if gate := s.gateFor(anchor); gate != nil {
-		end, _ := gate.take(turnWait{})
-		return end
-	}
-	end, _ := s.route.decideGates.acquire(anchor.Key(), turnWait{})
+	// Unbounded, so the turn is always entered and the release is never nil.
+	end, _ := s.beginTurn(s.route.decisionAnchorFromContext(ctx, s.id), turnWait{})
 	return end
 }
 
@@ -809,11 +861,7 @@ func (s *httpSession) beginDecisionTurn(ctx context.Context) func() {
 // samplingAnchorSplitDenial). Every turn taken here is therefore taken while one anchor is the
 // only one this session has resolved.
 func (s *httpSession) beginDecisionTurnWithin(w turnWait) (func(), bool) {
-	anchor := s.route.decisionAnchor(s.id, s.claims)
-	if gate := s.gateFor(anchor); gate != nil {
-		return gate.take(w)
-	}
-	return s.route.decideGates.acquire(anchor.Key(), w)
+	return s.beginTurn(s.route.decisionAnchor(s.id, s.claims), w)
 }
 
 // getSession returns the session for id, or nil.
@@ -1681,9 +1729,21 @@ func releaseSessionState(sess *httpSession) {
 	// prevent. And it has to be after the drain: dropping the last reference deletes the gate
 	// from the registry, so a request still taking turns on it would be holding a gate a later
 	// caller under the same key could no longer reach.
+	//
+	// Residual, stated because the cache below closes the same hole and the pin cannot: the
+	// drain is BOUNDED, so a handler still holding the turn when the budget runs out has this
+	// reference dropped out from under it, and a later caller on the same anchor is then handed
+	// a FRESH gate — two gates, no mutual exclusion, for as long as that handler runs. The cache
+	// retires such an entry instead, because it counts the requests on it; the pin is read with
+	// no lock and counts nothing, which is exactly what makes it free on the path that matters.
+	// Reachable only where the drain gives up (a wedged upstream under a disabled timeout), on a
+	// task-anchored route, with another session on the same task.
 	if sess.dropDecideGate != nil {
 		sess.dropDecideGate()
 	}
+	// And the gates cached for the other anchors a spanning session resolved, for the same two
+	// reasons and at the same point. See gateCache.close.
+	sess.decideCache.close()
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 	sess.route.pdp.ReleaseSession(ctx, sess.id)
