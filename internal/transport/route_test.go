@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -71,32 +70,6 @@ func mustWriteFile(t *testing.T, dir, name, content string) string {
 	return p
 }
 
-// captureStderr redirects os.Stderr for the duration of fn and returns everything
-// written to it. A goroutine drains the pipe concurrently so a large write cannot
-// deadlock on a full pipe buffer, and both pipe ends are closed before returning.
-// os.Stderr is process-global, so callers must not run with t.Parallel().
-func captureStderr(t *testing.T, fn func()) string {
-	t.Helper()
-	old := os.Stderr
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("os.Pipe: %v", err)
-	}
-	os.Stderr = w
-	defer func() { os.Stderr = old }()
-	done := make(chan string, 1)
-	go func() {
-		var buf bytes.Buffer
-		_, _ = io.Copy(&buf, r)
-		done <- buf.String()
-	}()
-	fn()
-	_ = w.Close()
-	out := <-done
-	_ = r.Close()
-	return out
-}
-
 func TestBuildRoutes_VersionAndPDP(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -110,7 +83,7 @@ func TestBuildRoutes_VersionAndPDP(t *testing.T) {
 		t.Fatalf("audit.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = sink.Close() })
-	routes, err := BuildRoutes(cfg, sink, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil })
+	routes, err := BuildRoutes(cfg, sink, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil }, nil)
 	if err != nil {
 		t.Fatalf("BuildRoutes: %v", err)
 	}
@@ -148,7 +121,7 @@ func TestBuildRoutes_NilSinkLeavesRouteSinkNil(t *testing.T) {
 	cfg := &config.GatewayConfig{Upstreams: []config.UpstreamConfig{{
 		Name: "fs", Transport: "stdio", Command: "echo", Policy: []string{manifest},
 	}}}
-	routes, err := BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil })
+	routes, err := BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil }, nil)
 	if err != nil {
 		t.Fatalf("BuildRoutes: %v", err)
 	}
@@ -169,7 +142,7 @@ func TestBuildRoutes_NoPolicyInheritsAudit(t *testing.T) {
 	t.Parallel()
 	cfg := &config.GatewayConfig{Upstreams: []config.UpstreamConfig{{Name: "fs", Transport: "stdio", Command: "echo"}}}
 	cfg.Defaults.Enforcement = capability.EnforcementAudit
-	routes, err := BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil })
+	routes, err := BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil }, nil)
 	if err != nil {
 		t.Fatalf("BuildRoutes: %v", err)
 	}
@@ -194,7 +167,7 @@ func TestBuildRoutes_NoPolicyInheritsAudit(t *testing.T) {
 		t.Fatalf("audit.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = sink.Close() })
-	routes, err = BuildRoutes(cfg, sink, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil })
+	routes, err = BuildRoutes(cfg, sink, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil }, nil)
 	if err != nil {
 		t.Fatalf("BuildRoutes with sink: %v", err)
 	}
@@ -210,6 +183,7 @@ func TestBuildRoutes_NoPolicyInheritsAudit(t *testing.T) {
 // NOTICE never fires. BuildRoutes must still emit a loud AUDIT MODE banner, matching
 // the stdio host, so a globally-observed policy is not silently un-enforced.
 func TestBuildRoutes_ManifestWithRouteAuditEmitsBanner(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	manifest := mustWriteFile(t, dir, "m.yaml", "schemaVersion: \"0.1\"\nname: test\nversion: \"1.0.0\"\ncapabilities:\n  - target: tool:read_file\n    actions: [call]\n")
 	cfg := &config.GatewayConfig{Upstreams: []config.UpstreamConfig{{
@@ -217,15 +191,15 @@ func TestBuildRoutes_ManifestWithRouteAuditEmitsBanner(t *testing.T) {
 		Policy: []string{manifest}, Enforcement: capability.EnforcementAudit,
 	}}}
 
-	var buildErr error
-	out := captureStderr(t, func() {
-		_, buildErr = BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil })
-	})
+	// The banner is captured by handing BuildRoutes its own writer, not by swapping the
+	// process-global os.Stderr — see route.go's BuildRoutes doc and issue 215.
+	var out bytes.Buffer
+	_, buildErr := BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil }, &out)
 	if buildErr != nil {
 		t.Fatalf("BuildRoutes: %v", buildErr)
 	}
-	if !strings.Contains(out, "AUDIT MODE") {
-		t.Errorf("expected a loud AUDIT MODE banner for a manifest + route-level audit route, got:\n%s", out)
+	if !strings.Contains(out.String(), "AUDIT MODE") {
+		t.Errorf("expected a loud AUDIT MODE banner for a manifest + route-level audit route, got:\n%s", out.String())
 	}
 }
 
@@ -234,6 +208,7 @@ func TestBuildRoutes_ManifestWithRouteAuditEmitsBanner(t *testing.T) {
 // so an operator is warned at runtime instead of debugging a silent hang; a stdio
 // upstream must NOT emit it.
 func TestBuildRoutes_RemoteUpstreamServerInitiatedNotice(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	manifest := mustWriteFile(t, dir, "m.yaml", "schemaVersion: \"0.1\"\nname: test\nversion: \"1.0.0\"\ncapabilities:\n  - target: tool:read_file\n    actions: [call]\n")
 	cfg := &config.GatewayConfig{Upstreams: []config.UpstreamConfig{
@@ -241,13 +216,14 @@ func TestBuildRoutes_RemoteUpstreamServerInitiatedNotice(t *testing.T) {
 		{Name: "local", Transport: "stdio", Command: "echo", Policy: []string{manifest}},
 	}}
 
-	var buildErr error
-	s := captureStderr(t, func() {
-		_, buildErr = BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil })
-	})
+	// Captured via BuildRoutes' own writer parameter rather than swapping os.Stderr — see
+	// TestBuildRoutes_ManifestWithRouteAuditEmitsBanner.
+	var buf bytes.Buffer
+	_, buildErr := BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil }, &buf)
 	if buildErr != nil {
 		t.Fatalf("BuildRoutes: %v", buildErr)
 	}
+	s := buf.String()
 	if !strings.Contains(s, "remote HTTP upstream") || !strings.Contains(s, "server-initiated requests") {
 		t.Errorf("expected a server-initiated-not-serviced NOTICE for the remote upstream, got:\n%s", s)
 	}
@@ -273,7 +249,7 @@ func TestBuildRoutes_NoPolicyPerRouteAudit(t *testing.T) {
 	cfg := &config.GatewayConfig{Upstreams: []config.UpstreamConfig{{
 		Name: "fs", Transport: "stdio", Command: "echo", Enforcement: capability.EnforcementAudit,
 	}}}
-	routes, err := BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil })
+	routes, err := BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil }, nil)
 	if err != nil {
 		t.Fatalf("BuildRoutes: %v", err)
 	}
@@ -338,7 +314,7 @@ func TestBuildRoutes_GlobalStrictDrift(t *testing.T) {
 
 	t.Run("flag off honors per-route config", func(t *testing.T) {
 		var calls []driftArg
-		if _, err := BuildRoutes(newCfg(), nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, captureDrift(&calls)); err != nil {
+		if _, err := BuildRoutes(newCfg(), nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, captureDrift(&calls), nil); err != nil {
 			t.Fatalf("BuildRoutes: %v", err)
 		}
 		for _, c := range calls {
@@ -350,7 +326,7 @@ func TestBuildRoutes_GlobalStrictDrift(t *testing.T) {
 
 	t.Run("flag on promotes policed routes only", func(t *testing.T) {
 		var calls []driftArg
-		if _, err := BuildRoutes(newCfg(), nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), true, captureDrift(&calls)); err != nil {
+		if _, err := BuildRoutes(newCfg(), nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), true, captureDrift(&calls), nil); err != nil {
 			t.Fatalf("BuildRoutes: %v", err)
 		}
 		// Two policed routes (policed + optedOut — the latter's strictDrift:false is
@@ -381,7 +357,7 @@ func TestBuildRoutes_GlobalStrictDrift(t *testing.T) {
 			{Name: "a", Transport: "stdio", Command: "echo", Enforcement: capability.EnforcementAudit},
 		}}
 		var calls []driftArg
-		if _, err := BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), true, captureDrift(&calls)); err != nil {
+		if _, err := BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), true, captureDrift(&calls), nil); err != nil {
 			t.Fatalf("BuildRoutes: %v (flag must warn, not fail, on policyless config)", err)
 		}
 		for _, c := range calls {
@@ -795,7 +771,7 @@ func TestBuildRoutes_RelativePolicyResolvedAgainstConfigDir(t *testing.T) {
 			Name: "fs", Transport: "stdio", Command: "echo", Policy: []string{"policy.yaml"},
 		}},
 	}
-	routes, err := BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, driftFor)
+	routes, err := BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, driftFor, nil)
 	if err != nil {
 		t.Fatalf("BuildRoutes with BaseDir: %v", err)
 	}
@@ -810,7 +786,7 @@ func TestBuildRoutes_RelativePolicyResolvedAgainstConfigDir(t *testing.T) {
 			Name: "fs", Transport: "stdio", Command: "echo", Policy: []string{"policy.yaml"},
 		}},
 	}
-	if _, err := BuildRoutes(cwdCfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, driftFor); err == nil {
+	if _, err := BuildRoutes(cwdCfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, driftFor, nil); err == nil {
 		t.Error("BuildRoutes with empty BaseDir from a different cwd should fail to find the relative policy, but succeeded")
 	}
 }

@@ -14,7 +14,6 @@ import (
 	"io"
 	"math"
 	"net/http"
-	"os"
 	"os/exec"
 	"sync"
 	"sync/atomic"
@@ -402,7 +401,7 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 		// Runs on EVERY teardown path (idle reap, DELETE, kill, shutdown, natural exit), so
 		// it's the one place that reclaims this session's flow-label state.
 		releaseSessionState(sess)
-		fmt.Fprintf(os.Stderr, "[eunox] HTTP session %s ended.\n", sess.id)
+		fmt.Fprintf(p.errOut(), "[eunox] HTTP session %s ended.\n", sess.id)
 	}()
 
 	// Pass the proxy's serve context, not the request-scoped ctx, so kill-switch lookups on
@@ -421,7 +420,7 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 	// duration is reap-eligible before the client's first post-init request.
 	sess.touchRequest()
 
-	fmt.Fprintf(os.Stderr, "[eunox] HTTP session %s started.\n", sess.id)
+	fmt.Fprintf(p.errOut(), "[eunox] HTTP session %s started.\n", sess.id)
 	return sess, nil
 }
 
@@ -734,14 +733,14 @@ func (p *HTTPProxy) reapOnce(idle time.Duration) {
 				if s.lastRequest.Load() >= hardCutoff || !p.hardReapEligible(s) {
 					return
 				}
-				fmt.Fprintf(os.Stderr, "[eunox] HTTP session %s reaped (no host request > %s, hard idle ceiling; SSE stream may have been open).\n", s.id, hard)
+				fmt.Fprintf(p.errOut(), "[eunox] HTTP session %s reaped (no host request > %s, hard idle ceiling; SSE stream may have been open).\n", s.id, hard)
 			} else {
 				// An enforced request started after the snapshot also spares this arm: tearing
 				// down would kill the upstream out from under the in-flight callUpstream.
 				if s.lastActive.Load() >= cutoff || s.hasSubscribers() || s.inFlight.Load() > 0 {
 					return
 				}
-				fmt.Fprintf(os.Stderr, "[eunox] HTTP session %s reaped (idle > %s).\n", s.id, idle)
+				fmt.Fprintf(p.errOut(), "[eunox] HTTP session %s reaped (idle > %s).\n", s.id, idle)
 			}
 			s.close(p.shutdownMs)
 		}()
@@ -821,7 +820,7 @@ func (p *HTTPProxy) reclaimKilledSession(s *httpSession) {
 	if !p.sessionKilled(s) {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "[eunox] HTTP session %s reaped (kill switch active for this session).\n", s.id)
+	fmt.Fprintf(p.errOut(), "[eunox] HTTP session %s reaped (kill switch active for this session).\n", s.id)
 	// Explicit eviction: the GET keepalive arm isn't kill-gated, so the stream would
 	// otherwise survive its own session's teardown.
 	s.evictStreams()
@@ -1011,7 +1010,7 @@ func (s *httpSession) readUpstream(ctx context.Context) {
 			// io.EOF is a normal stream end. Any other error (oversized message, JSON-RPC
 			// parse failure) is abnormal; log it so an operator can tell it from a clean exit.
 			if !errors.Is(err, io.EOF) {
-				fmt.Fprintf(os.Stderr, "[eunox] HTTP session %s: upstream read error: %v\n", s.id, err)
+				fmt.Fprintf(s.errOut(), "[eunox] HTTP session %s: upstream read error: %v\n", s.id, err)
 			}
 			return
 		}
@@ -1086,6 +1085,12 @@ func (s *httpSession) withUpstreamTimeout(ctx context.Context) (context.Context,
 	return s.proxy.withUpstreamTimeout(ctx)
 }
 
+// errOut returns this session's diagnostic writer — its proxy's, or os.Stderr for a
+// proxy-less test session — mirroring shutdownBudget's nil-safe fallback.
+func (s *httpSession) errOut() io.Writer {
+	return s.proxy.errOut()
+}
+
 // shutdownBudget is this session's configured teardown budget (--shutdown-grace), or a 5s
 // fallback for a proxy-less test session — mirroring stdio's killDelay default.
 func (s *httpSession) shutdownBudget() time.Duration {
@@ -1148,7 +1153,7 @@ func (s *httpSession) forwardNotification(ctx context.Context, msg mcp.RPCMsg) {
 		defer cancel()
 		if _, err := s.callRemoteUpstream(notifyCtx, msg); err != nil {
 			// No response to deliver to the host; log so a dropped notification isn't silent.
-			fmt.Fprintf(os.Stderr, "[eunox] HTTP session %s: notification %q POST to upstream failed: %v\n", s.id, msg.Method, err)
+			fmt.Fprintf(s.errOut(), "[eunox] HTTP session %s: notification %q POST to upstream failed: %v\n", s.id, msg.Method, err)
 		}
 		return
 	}
@@ -1195,13 +1200,38 @@ func releaseSessionState(sess *httpSession) {
 	// reaches close()) and after the drain (dropping the last reference deletes the gate from
 	// the registry, so a still-turn-taking request must not find it gone first).
 	if sess.dropDecideGate != nil {
-		sess.dropDecideGate()
+		if sess.inFlight.Load() == 0 && sess.serverPool.inFlight.Load() == 0 {
+			sess.dropDecideGate()
+		} else {
+			// The bounded drain above gave up on a handler still holding this session's pinned
+			// turn. Dropping now anyway would delete the gate out from under it: the registry
+			// would reap the entry and hand the next caller on the same anchor a FRESH gate with
+			// an empty channel — two gates for one anchor, unserialized for as long as the
+			// wedged handler runs. Hand the drop off to a waiter that keeps polling past the
+			// budget instead of forcing it: one goroutine per timed-out teardown (a path that
+			// already means something is wrong), unbounded in time, resolving whenever the
+			// wedged handler finally returns.
+			go awaitAndDropDecideGate(sess)
+		}
 	}
 	// Gates cached for other anchors a spanning session resolved; see gateCache.close.
 	sess.decideCache.close()
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 	sess.route.pdp.ReleaseSession(ctx, sess.id)
+}
+
+// awaitAndDropDecideGate is releaseSessionState's fallback when its bounded drain gave up with
+// a handler still holding the session's pinned decision gate. It polls past the budget — the
+// same counters awaitInFlightDrained and serverPool.drain already watch, so this is not a
+// second notion of "idle" — and drops the gate the instant both read zero, closing the window
+// during which a request sharing this session's anchor could be handed a second, unserialized
+// gate.
+func awaitAndDropDecideGate(sess *httpSession) {
+	for sess.inFlight.Load() > 0 || sess.serverPool.inFlight.Load() > 0 {
+		time.Sleep(inFlightDrainPoll)
+	}
+	sess.dropDecideGate()
 }
 
 // awaitInFlightDrained blocks until this session has no enforced request in flight, or until
@@ -1270,7 +1300,7 @@ func (s *httpSession) broadcast(msg mcp.RPCMsg) {
 			// Slow subscriber: channel full, notification dropped. Track and warn on the
 			// first drop so a lost tools/list_changed is observable, not silent.
 			if s.droppedNotifs.Add(1) == 1 {
-				fmt.Fprintf(os.Stderr,
+				fmt.Fprintf(s.errOut(),
 					"[eunox] WARNING: HTTP session %s dropped a notification (method=%q) to a slow SSE subscriber; further drops counted but not individually logged.\n",
 					s.id, msg.Method)
 			}

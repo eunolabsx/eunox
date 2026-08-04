@@ -230,7 +230,7 @@ func (p *HTTPProxy) newRemoteSession(ctx context.Context, route *UpstreamRoute, 
 		delete(p.sessions, sess.id)
 		p.mu.Unlock()
 		releaseSessionState(sess)
-		fmt.Fprintf(os.Stderr, "[eunox] HTTP session %s ended.\n", sess.id)
+		fmt.Fprintf(p.errOut(), "[eunox] HTTP session %s ended.\n", sess.id)
 	}()
 
 	// Always synchronous so FM-5 aborts before the session is returned; --strict-drift
@@ -244,7 +244,7 @@ func (p *HTTPProxy) newRemoteSession(ctx context.Context, route *UpstreamRoute, 
 	// from readiness, not from registration (which ran before the handshake/drift probe).
 	sess.touchRequest()
 
-	fmt.Fprintf(os.Stderr, "[eunox] HTTP session %s started (remote: %s).\n", sess.id, capability.RedactURLForLog(route.upstreamURL))
+	fmt.Fprintf(p.errOut(), "[eunox] HTTP session %s started (remote: %s).\n", sess.id, capability.RedactURLForLog(route.upstreamURL))
 	return sess, nil
 }
 

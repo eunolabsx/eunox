@@ -5124,28 +5124,33 @@ func TestServe_AfterListenShutdownDuringStartupIsClean(t *testing.T) {
 // in the log: a proxy stopped during startup never reaches the serving stage, and so
 // never announces itself as listening.
 func TestServe_ShutdownDuringStartupStopsBeforeServing(t *testing.T) {
-	// captureStderr swaps the process-global os.Stderr, so no t.Parallel() here.
+	t.Parallel()
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
+	// The banner is captured via the proxy's own Stderr option rather than swapping the
+	// process-global os.Stderr — see route.go's BuildRoutes doc and issue 215. syncBuffer
+	// (not bytes.Buffer) because Serve's background goroutines could still write after this
+	// test starts reading it back.
+	var out syncBuffer
 	proxy := NewHTTPProxyGateway(HTTPGatewayOptions{
 		// A named route gives the startup banner something to print; the zero value
 		// covers everything the teardown path would touch on the regressed ordering.
 		Routes: map[string]*UpstreamRoute{"fs": {name: "fs"}},
 		Bind:   "127.0.0.1",
 		Port:   freeTCPPort(t),
+		Stderr: &out,
 		AfterListen: func(hookCtx context.Context) error {
 			cancel()
 			<-hookCtx.Done()
 			return hookCtx.Err()
 		},
 	})
-	var err error
-	out := captureStderr(t, func() { err = proxy.Serve(ctx) })
+	err := proxy.Serve(ctx)
 	if err != nil {
 		t.Errorf("a hook cut short by shutdown must not fail Serve, got %v", err)
 	}
-	if strings.Contains(out, "listening on") {
-		t.Errorf("startup ran on past the shutdown and announced itself as listening, so srv.Serve got the closed listener and races ctx.Done(); stderr:\n%s", out)
+	if strings.Contains(out.String(), "listening on") {
+		t.Errorf("startup ran on past the shutdown and announced itself as listening, so srv.Serve got the closed listener and races ctx.Done(); stderr:\n%s", out.String())
 	}
 }
 

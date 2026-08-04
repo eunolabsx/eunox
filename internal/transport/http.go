@@ -23,6 +23,7 @@ package transport
 import (
 	"context"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"net/http"
@@ -216,6 +217,13 @@ type HTTPProxy struct {
 	oauthMeta    *OAuthResourceMetadata // non-nil when --oauth-resource / listen.oauthResource is set (which the CLI admits only alongside bearer-token validation)
 	oauthMetaURL string                 // absolute metadata URL for WWW-Authenticate; empty when --oauth-resource is not set
 	sink         *audit.Sink
+	// stderr is where this proxy writes its diagnostic lines (startup banners, SECURITY/WARNING
+	// notices, session lifecycle lines) — read through errOut(), never referenced directly, so a
+	// bare struct-literal test proxy (stderr left nil) still gets a writer. Never swapped after
+	// construction: a caller that wants to capture output builds the proxy with a pipe/buffer
+	// here instead of reassigning the process-global os.Stderr, which raced concurrent tests
+	// reading it.
+	stderr io.Writer
 	// ks is deliberately the kill-ONLY interface, not killswitch.Manager: see killActivator.
 	ks                 killActivator
 	shutdownMs         int
@@ -307,6 +315,18 @@ type HTTPProxy struct {
 	establishing int
 }
 
+// errOut returns p's diagnostic writer, falling back to os.Stderr for a nil proxy or one
+// assembled by a bare struct literal (stderr left unset) — the same nil-tolerant shape as
+// shutdownBudget's proxy-less test session. Every stderr write in this file goes through it
+// rather than os.Stderr directly, so a caller wanting to capture output configures the writer
+// at construction instead of reassigning the process-global.
+func (p *HTTPProxy) errOut() io.Writer {
+	if p == nil || p.stderr == nil {
+		return os.Stderr
+	}
+	return p.stderr
+}
+
 // HTTPGatewayOptions configures a multi-upstream gateway HTTPProxy: one process fronting N
 // upstreams, one per route, sharing a single audit sink and kill-switch.
 type HTTPGatewayOptions struct {
@@ -319,6 +339,11 @@ type HTTPGatewayOptions struct {
 	ShutdownMs     int
 	UpstreamTimeMs int
 	AuthToken      string
+	// Stderr is where this proxy writes its diagnostic lines. Nil (the default) means
+	// os.Stderr; a caller that wants to capture them (a test asserting on a startup banner)
+	// passes its own writer here instead of reassigning the process-global os.Stderr, which
+	// races any other goroutine reading it concurrently.
+	Stderr io.Writer
 	// ControlToken authenticates POST /control/kill (loopback only), required independently
 	// of AuthToken/JWT mode.
 	ControlToken string
@@ -372,6 +397,9 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 	if opts.Port <= 0 {
 		opts.Port = 3000
 	}
+	if opts.Stderr == nil {
+		opts.Stderr = os.Stderr
+	}
 	var trustedProxyNets []*net.IPNet
 	for _, cidr := range opts.TrustedProxyCIDRs {
 		if _, ipNet, err := net.ParseCIDR(cidr); err == nil {
@@ -380,7 +408,7 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 			// GatewayConfig.Validate rejects a malformed entry before the CLI reaches here, but
 			// this is an exported constructor a caller could invoke directly, so warn rather
 			// than silently trust fewer peers than configured.
-			fmt.Fprintf(os.Stderr, "[eunox] WARNING: listen.trustedProxyCIDRs entry %q is not a valid CIDR and will never be trusted: %v\n", cidr, err)
+			fmt.Fprintf(opts.Stderr, "[eunox] WARNING: listen.trustedProxyCIDRs entry %q is not a valid CIDR and will never be trusted: %v\n", cidr, err)
 		}
 	}
 	p := &HTTPProxy{
@@ -388,6 +416,7 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 		oauthMeta:          opts.OAuthMeta,
 		oauthMetaURL:       opts.OAuthMetaURL,
 		sink:               opts.Sink,
+		stderr:             opts.Stderr,
 		ks:                 opts.KS,
 		shutdownMs:         opts.ShutdownMs,
 		upstreamTimeMs:     opts.UpstreamTimeMs,
@@ -458,7 +487,7 @@ func (p *HTTPProxy) warnForwardedForPosture() {
 		return
 	}
 	if len(p.trustedProxyNets) == 0 {
-		fmt.Fprintf(os.Stderr,
+		fmt.Fprintf(p.errOut(),
 			"[eunox] SECURITY: --trust-forwarded-for is enabled but listen.trustedProxyCIDRs is empty, "+
 				"so no peer can ever match — X-Forwarded-For is never trusted and every request's source IP "+
 				"is its own connection address. Set listen.trustedProxyCIDRs to the reverse proxy's address(es) "+
@@ -467,7 +496,7 @@ func (p *HTTPProxy) warnForwardedForPosture() {
 		return
 	}
 	if !bindIsLoopbackOnly(p.bind) {
-		fmt.Fprintf(os.Stderr,
+		fmt.Fprintf(p.errOut(),
 			"[eunox] SECURITY: --trust-forwarded-for is enabled on a non-loopback bind (%q). "+
 				"X-Forwarded-For is honored only from a peer matching listen.trustedProxyCIDRs; "+
 				"scope that allowlist tightly to the real reverse proxy's address; a broader range "+
@@ -479,7 +508,7 @@ func (p *HTTPProxy) warnForwardedForPosture() {
 	// symmetric: under-declaring is safe, but OVER-declaring points the read at a
 	// client-supplied entry, letting a client behind the proxy forge its own ipRange source.
 	if hops := p.proxyHops(); hops > 1 {
-		fmt.Fprintf(os.Stderr,
+		fmt.Fprintf(p.errOut(),
 			"[eunox] SECURITY: listen.trustedProxyHops is %d, so the client is read %d entries from the right "+
 				"of X-Forwarded-For. This MUST equal the number of trusted proxies that append to the header in "+
 				"front of eunox — declaring more than actually run lets a client behind them forge its own source "+
@@ -613,7 +642,7 @@ func (p *HTTPProxy) Serve(ctx context.Context) error {
 		if name != "" {
 			path = "/mcp/" + name
 		}
-		fmt.Fprintf(os.Stderr, "[eunox] HTTP proxy listening on http://%s%s\n", ln.Addr(), path)
+		fmt.Fprintf(p.errOut(), "[eunox] HTTP proxy listening on http://%s%s\n", ln.Addr(), path)
 	}
 
 	p.warnForwardedForPosture()
@@ -622,7 +651,7 @@ func (p *HTTPProxy) Serve(ctx context.Context) error {
 	// open to any off-host client: checkAuth is a no-op without a token/JWKS, and the Origin
 	// guard passes any request that simply omits the Origin header (any non-browser client can).
 	if openNonLoopbackBind(p.bind, p.authToken, p.jwtPDP != nil) {
-		fmt.Fprintf(os.Stderr,
+		fmt.Fprintf(p.errOut(),
 			"[eunox] SECURITY: proxy is bound to a non-loopback address (%q) with no listen.authToken and no --jwks-uri. "+
 				"The enforced /mcp endpoint is reachable by any off-host client — the Origin check does not gate a "+
 				"non-browser client that omits the Origin header. Configure listen.authToken (or --jwks-uri) and restrict "+

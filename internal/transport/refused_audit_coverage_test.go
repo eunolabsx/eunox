@@ -4,14 +4,11 @@
 package transport
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 
@@ -626,41 +623,19 @@ func TestUnsupportedMediaType_RecordsRefusal(t *testing.T) {
 // flooding primitive checkOrigin closed for itself, left open here while the record beside it
 // was carefully bounded to a count.
 func TestUnsupportedMediaType_StderrLineIsBoundedAndGated(t *testing.T) {
+	t.Parallel()
+	// Captured through the proxy's own Stderr option rather than swapping the
+	// process-global os.Stderr — see route.go's BuildRoutes doc and issue 215. syncBuffer
+	// because requireJSONContentType's writes race this test's own concurrent-safety
+	// requirements no differently than any other proxy background write would.
+	var out syncBuffer
 	proxy := newHTTPProxy(httpProxyOptions{
 		PDP:         pdp.AlwaysAllowPDP{},
 		UpstreamURL: "http://upstream.invalid",
+		Stderr:      &out,
 	})
 	route := proxy.routes[""]
 	huge := CTJSON + "; padding=" + strings.Repeat("A", 64<<10)
-
-	old := os.Stderr
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("os.Pipe: %v", err)
-	}
-	os.Stderr = w
-	drained := make(chan string, 1)
-	go func() {
-		var buf bytes.Buffer
-		_, _ = io.Copy(&buf, r)
-		drained <- buf.String()
-	}()
-	// Deferred, not just unwound at the bottom: a t.Fatalf inside the loop below runs
-	// runtime.Goexit, so an inline restore would leave os.Stderr pointing at a pipe nobody
-	// closes and the drain goroutine parked on it. Every later test in this package that
-	// writes a SECURITY line to stderr would then block once the 64 KiB pipe buffer filled,
-	// hanging the run instead of reporting the one real failure. Idempotent (sync.Once is
-	// unnecessary — the tail below no longer restores).
-	restored := false
-	restore := func() {
-		if restored {
-			return
-		}
-		restored = true
-		os.Stderr = old
-		_ = w.Close()
-	}
-	defer restore()
 
 	// Far more requests than the pre-session bucket admits, so the gate has to be doing the
 	// bounding rather than the loop count.
@@ -678,8 +653,7 @@ func TestUnsupportedMediaType_StderrLineIsBoundedAndGated(t *testing.T) {
 		}
 	}
 
-	restore()
-	logged := <-drained
+	logged := out.String()
 
 	if len(logged) >= requests*len(huge) {
 		t.Fatalf("the stderr line is unbounded: %d bytes for %d requests", len(logged), requests)
