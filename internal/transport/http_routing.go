@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"time"
 
 	"github.com/eunolabs/eunox/internal/mcp"
@@ -150,7 +149,7 @@ func (p *HTTPProxy) writeSessionCreateError(w http.ResponseWriter, r *http.Reque
 	case errors.Is(err, errShuttingDown):
 		http.Error(w, "server shutting down; retry", http.StatusServiceUnavailable)
 	default:
-		fmt.Fprintf(os.Stderr, "[eunox] failed to start upstream: %v\n", err)
+		_, _ = fmt.Fprintf(p.errOut(), "[eunox] failed to start upstream: %v\n", err)
 		http.Error(w, "upstream unavailable", http.StatusInternalServerError)
 	}
 }
@@ -417,7 +416,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 				// upstream round trip, a 202 identical to success) and enough records latch
 				// AuditDegraded(), which under --require-audit=strict denies every route.
 				recordResourceExhausted(r.Context(), asRecorder(route.sink), &sess.notifySaturation, sessionID, msg.Method)
-				fmt.Fprintf(os.Stderr, "[eunox] HTTP session %s: notification %q dropped: too many concurrent notifications in flight\n", sessionID, msg.Method)
+				_, _ = fmt.Fprintf(p.errOut(), "[eunox] HTTP session %s: notification %q dropped: too many concurrent notifications in flight\n", sessionID, msg.Method)
 				w.WriteHeader(http.StatusAccepted)
 				return
 			}
@@ -450,7 +449,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 			default:
 				// Remote-upstream mode has no upWriter to route the response back. Unreachable
 				// today (remote sessions issue no server-initiated requests), pending a fix.
-				fmt.Fprintf(os.Stderr,
+				_, _ = fmt.Fprintf(p.errOut(),
 					"[eunox] WARNING: dropped host response to a server-initiated request: no upstream writer in remote-upstream mode\n")
 			}
 		}
@@ -890,7 +889,7 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 		// Propagate a kill-store write failure (fail closed): returning {"ok":true} on a
 		// failed emergency stop would leave the operator believing the system is safe.
 		if err := p.ks.ActivateGlobal(r.Context()); err != nil {
-			fmt.Fprintf(os.Stderr, "[eunox] kill switch activation failed: %v\n", err)
+			_, _ = fmt.Fprintf(p.errOut(), "[eunox] kill switch activation failed: %v\n", err)
 			http.Error(w, "kill switch activation failed", http.StatusInternalServerError)
 			return
 		}
@@ -919,7 +918,7 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := p.ks.KillSession(r.Context(), body.SessionID); err != nil {
-		fmt.Fprintf(os.Stderr, "[eunox] kill switch session kill failed: %v\n", err)
+		_, _ = fmt.Fprintf(p.errOut(), "[eunox] kill switch session kill failed: %v\n", err)
 		http.Error(w, "kill switch session kill failed", http.StatusInternalServerError)
 		return
 	}

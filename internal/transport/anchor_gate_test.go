@@ -366,6 +366,48 @@ func TestSessionGate_ReleasedOnEveryTeardownPath(t *testing.T) {
 	}
 }
 
+// TestSessionGate_TimedOutDrainHandsOffTheDropRatherThanForcingIt is issue 214: a handler still
+// holding the session's pinned turn when releaseSessionState's bounded drain gives up must not
+// have its gate deleted out from under it. Forcing the drop at that point would let the
+// registry reap the entry and hand the next caller on the same anchor a FRESH gate with an
+// empty turn channel — two gates for one anchor, unserialized until the wedged handler returns.
+func TestSessionGate_TimedOutDrainHandsOffTheDropRatherThanForcingIt(t *testing.T) {
+	t.Parallel()
+	rt := &UpstreamRoute{decideGates: newAnchorGates(), pdp: pdp.DenyAllPDP{}}
+	sess := newTestSession(&httpSession{id: "sess-wedged", route: rt, proxy: &HTTPProxy{shutdownMs: 20}})
+	sess.holdDecisionGate()
+	held := sess.decideGate
+	require.NotNil(t, held)
+	key := held.entry().key
+
+	// Simulate a handler holding the pinned turn that outlives the shutdown budget: inFlight
+	// never falls to zero, so awaitInFlightDrained gives up without the handler returning.
+	sess.inFlight.Add(1)
+
+	done := make(chan struct{})
+	go func() {
+		releaseSessionState(sess)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("releaseSessionState must return once its bounded budget elapses, not block on the wedged handler")
+	}
+
+	assert.Same(t, held, registryGate(rt.decideGates, key),
+		"a timed-out drain must not delete the pinned gate while its holder is still running")
+
+	// The wedged handler finally returns.
+	sess.inFlight.Add(-1)
+
+	require.Eventually(t, func() bool {
+		return registryGate(rt.decideGates, key) == nil
+	}, time.Second, inFlightDrainPoll,
+		"the handed-off waiter must drop the gate once the handler actually finishes, closing the window")
+}
+
 // TestSessionGate_TaskAnchoredRouteResolvesPerRequest is the negative half: the PIN serves a
 // request only when the request RESOLVES the anchor it was taken for. Here neither session
 // presented a task at initialize, so each pins its own session anchor — and requests that do

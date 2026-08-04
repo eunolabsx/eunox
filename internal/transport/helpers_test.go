@@ -10,8 +10,10 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -55,6 +57,30 @@ func restoreStderr(_ *bytes.Buffer) {}
 // tests); the surrounding assertions confirm the drift check ran.
 func waitForLog(t *testing.T, _ *bytes.Buffer, _ string) {
 	t.Helper()
+}
+
+// syncBuffer is a mutex-guarded bytes.Buffer for tests that inject a writer into an
+// HTTPProxy/StdioProxy (via HTTPGatewayOptions.Stderr / StdioProxyOptions.Stderr) and then
+// read it back: a proxy's diagnostic lines can be written from a background goroutine (session
+// reaping, cleanup) concurrently with the test's own read of the captured text, which a plain
+// bytes.Buffer does not allow under -race. Replaces captureStderr's process-global os.Stderr
+// swap (issue 215): the proxy under test gets its own writer at construction instead of
+// racing every other test in the package over the same global.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // JWT test helpers for the package-transport tests that exercise the proxy
@@ -295,6 +321,11 @@ type httpProxyOptions struct {
 
 	// DriftCheck is the injected drift hook; nil = no drift checking.
 	DriftCheck drift.CheckFunc
+
+	// Stderr, when set, captures this proxy's diagnostic lines instead of the real
+	// os.Stderr — the injectable-writer seam a test asserting on a startup/lifecycle line
+	// uses instead of swapping the process-global (see HTTPProxy.stderr).
+	Stderr io.Writer
 }
 
 // newHTTPProxy builds a single-upstream test HTTPProxy. It synthesizes one route
@@ -344,6 +375,7 @@ func newHTTPProxy(opts httpProxyOptions) *HTTPProxy {
 		SessionIdleMs:      opts.SessionIdleMs,
 		AllowedOrigins:     opts.AllowedOrigins,
 		RequireAuditStrict: opts.RequireAuditStrict,
+		Stderr:             opts.Stderr,
 	})
 }
 

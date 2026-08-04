@@ -1424,7 +1424,7 @@ func gatewayJWTLayer(routes map[string]*transport.UpstreamRoute, ks killswitch.M
 func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audit.Sink, counter capability.CallCounter, flowStore capability.FlowLabelStore, ks killswitch.Manager, pf proxyFlags, onServeReady func(context.Context)) error { //nolint:gocritic // hugeParam: pf is a small flag bundle
 	// drift.MakeDriftCheck is the per-route hook factory; BuildRoutes wires it inside, so
 	// this layer never reaches into route internals.
-	routes, err := transport.BuildRoutes(cfg, sink, counter, flowStore, ks, pf.strictDrift, drift.MakeDriftCheck)
+	routes, err := transport.BuildRoutes(cfg, sink, counter, flowStore, ks, pf.strictDrift, drift.MakeDriftCheck, os.Stderr)
 	if err != nil {
 		return err
 	}

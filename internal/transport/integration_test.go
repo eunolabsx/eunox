@@ -544,18 +544,22 @@ func TestStdioProxy_HTTPUpstreamWiring(t *testing.T) {
 // half of the remote-HTTP-upstream limitation: connecting a remote HTTP upstream
 // emits the server-initiated-not-serviced NOTICE so an operator is not left
 // debugging a silent hang. The gateway half is covered by
-// TestBuildRoutes_RemoteUpstreamServerInitiatedNotice. It must not run in parallel:
-// captureStderr swaps the process-global os.Stderr.
+// TestBuildRoutes_RemoteUpstreamServerInitiatedNotice. The NOTICE is captured through the
+// proxy's own stderr field rather than the process-global os.Stderr (issue 215), so this can
+// run in parallel like any other test.
 func TestStdioProxy_ConnectUpstream_HTTPEmitsServerInitiatedNotice(t *testing.T) {
+	t.Parallel()
+	var buf syncBuffer
 	p := &StdioProxy{
 		upstreamURL: "https://upstream.example.com",
 		shutdownMs:  200,
+		stderr:      &buf,
 	}
-	var connErr error
-	s := captureStderr(t, func() { connErr = p.connectUpstream(context.Background()) })
+	connErr := p.connectUpstream(context.Background())
 	if connErr != nil {
 		t.Fatalf("connectUpstream (http): %v", connErr)
 	}
+	s := buf.String()
 	if !strings.Contains(s, "is a remote HTTP upstream") || !strings.Contains(s, "server-initiated requests") {
 		t.Errorf("expected the stdio host to emit a server-initiated-not-serviced NOTICE, got:\n%s", s)
 	}

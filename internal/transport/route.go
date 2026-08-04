@@ -289,7 +289,16 @@ func PrintRoutePolicyNotices(w io.Writer, name, routePath string, auditOnlyCount
 //
 // driftCheckFor builds each route's session-start drift hook (the caller passes
 // drift.MakeDriftCheck), keeping the drift policy logic out of this layer.
-func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability.CallCounter, flowStore capability.FlowLabelStore, ks killswitch.Manager, globalStrictDrift bool, driftCheckFor func(*config.LocalManifest, bool) drift.CheckFunc) (map[string]*UpstreamRoute, error) {
+//
+// w is where the startup notices (open-posture warnings, AUDIT MODE banners, the remote-HTTP
+// server-initiated NOTICE) are written; a nil w means os.Stderr. Threaded as a parameter
+// rather than hardcoded so a caller that wants to capture these lines (a test asserting on a
+// banner) passes its own writer instead of reassigning the process-global os.Stderr, which
+// races any other goroutine reading it.
+func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability.CallCounter, flowStore capability.FlowLabelStore, ks killswitch.Manager, globalStrictDrift bool, driftCheckFor func(*config.LocalManifest, bool) drift.CheckFunc, w io.Writer) (map[string]*UpstreamRoute, error) {
+	if w == nil {
+		w = os.Stderr
+	}
 	routes := make(map[string]*UpstreamRoute, len(cfg.Upstreams))
 	anyPoliced := false
 	for i := range cfg.Upstreams {
@@ -364,20 +373,20 @@ func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability
 			auditOnlyCount = manifest.AuditOnlyCount()
 			auditBanner = r.audit
 		}
-		PrintRoutePolicyNotices(os.Stderr, u.Name, u.Name, auditOnlyCount, auditBanner, r.upstreamTLSSkipVerify)
+		PrintRoutePolicyNotices(w, u.Name, u.Name, auditOnlyCount, auditBanner, r.upstreamTLSSkipVerify)
 
 		// A remote HTTP upstream has no inbound stream: eunox POSTs and never opens an
 		// SSE GET back, so a server-initiated request the upstream sends is never read
 		// and it gets no reply. A sampling grant on http is already refused at startup
 		// in LoadUpstreamPDP; this surfaces the broader limitation.
 		if r.transport == config.HostTransportHTTP {
-			printRemoteUpstreamNotice(os.Stderr, u.Name, u.Name)
+			printRemoteUpstreamNotice(w, u.Name, u.Name)
 		}
 
 		if manifest == nil {
 			// No policy but explicit enforcement: wiretap mode, every DISPATCHED call
 			// forwarded and logged, none blocked on policy grounds.
-			fmt.Fprintf(os.Stderr,
+			_, _ = fmt.Fprintf(w,
 				"[eunox] NOTICE: upstream %q has no policy and runs in AUDIT mode on /mcp/%s — "+
 					"every dispatched call is forwarded and logged, none blocked by policy (wiretap).\n",
 				u.Name, u.Name)
@@ -401,7 +410,7 @@ func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability
 		routes[u.Name] = r
 	}
 	if globalStrictDrift && !anyPoliced {
-		fmt.Fprintf(os.Stderr, "[eunox] WARNING: --strict-drift had no effect: no route has a policy to check drift against.\n")
+		_, _ = fmt.Fprintf(w, "[eunox] WARNING: --strict-drift had no effect: no route has a policy to check drift against.\n")
 	}
 	return routes, nil
 }

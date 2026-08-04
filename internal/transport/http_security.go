@@ -16,7 +16,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 
 	"github.com/eunolabs/eunox/pkg/capability"
@@ -58,7 +57,7 @@ func (p *HTTPProxy) requireJSONContentType(w http.ResponseWriter, r *http.Reques
 	// primitive checkOrigin already closed for its twin. A suppressed burst is still
 	// visible, as the rollup count on the next admitted record.
 	if admitted && len(vals) > 1 {
-		fmt.Fprintf(os.Stderr,
+		_, _ = fmt.Fprintf(p.errOut(),
 			"[eunox] SECURITY: rejected request carrying %d Content-Type headers (%q); exactly one is required (a reverse proxy that re-adds the header will trip this)\n",
 			len(vals), boundedRefusalDetail(strings.Join(vals, ", ")))
 	}
@@ -300,12 +299,12 @@ func (p *HTTPProxy) checkOrigin(w http.ResponseWriter, r *http.Request) bool {
 	// verdict as the record, for the reason given on requireJSONContentType's stderr gate above.
 	if admitted := p.recordPreSessionDeny(r, "ORIGIN_REJECTED", catOrigin, details); admitted {
 		if multiple {
-			fmt.Fprintf(os.Stderr,
+			_, _ = fmt.Fprintf(p.errOut(),
 				"[eunox] SECURITY: rejected request carrying %d Origin headers (%q); RFC 6454 permits only one (DNS-rebinding guard)\n",
 				len(vals), recordedOrigin,
 			)
 		} else {
-			fmt.Fprintf(os.Stderr,
+			_, _ = fmt.Fprintf(p.errOut(),
 				"[eunox] SECURITY: rejected request with disallowed Origin %q (DNS-rebinding guard)\n",
 				recordedOrigin,
 			)

@@ -201,6 +201,20 @@ type StdioProxy struct {
 	// onReady is the post-startup hook, run once the session is live. Set from
 	// StdioProxyOptions.OnReady at construction.
 	onReady func(ctx context.Context)
+
+	// stderr is where this proxy writes its diagnostic lines. Read through errOut(), never
+	// referenced directly — see HTTPProxy.stderr for why: a caller that wants to capture
+	// output configures the writer here rather than reassigning the process-global os.Stderr.
+	stderr io.Writer
+}
+
+// errOut returns p's diagnostic writer, falling back to os.Stderr for a nil proxy or one
+// assembled by a bare struct literal (stderr left unset).
+func (p *StdioProxy) errOut() io.Writer {
+	if p == nil || p.stderr == nil {
+		return os.Stderr
+	}
+	return p.stderr
 }
 
 // StdioProxyOptions configures a StdioProxy. The upstream is either a local
@@ -258,6 +272,11 @@ type StdioProxyOptions struct {
 	// Bounded by Start's context; unlike AfterListen it returns no error since its callers
 	// are advisory-only. Called exactly once, on the success path.
 	OnReady func(ctx context.Context)
+
+	// Stderr is where this proxy writes its diagnostic lines. Nil (the default) means
+	// os.Stderr; a caller that wants to capture them passes its own writer here instead of
+	// reassigning the process-global os.Stderr, which races any other goroutine reading it.
+	Stderr io.Writer
 }
 
 // NewStdioProxy creates a StdioProxy ready to call Start.
@@ -270,6 +289,9 @@ func NewStdioProxy(opts StdioProxyOptions) *StdioProxy {
 	}
 	if opts.ShutdownMs <= 0 {
 		opts.ShutdownMs = 5000
+	}
+	if opts.Stderr == nil {
+		opts.Stderr = os.Stderr
 	}
 	p := &StdioProxy{
 		command:               opts.Command,
@@ -291,6 +313,7 @@ func NewStdioProxy(opts StdioProxyOptions) *StdioProxy {
 		honorAttribution:      opts.HonorAttribution,
 		receipts:              opts.EffectReceipts,
 		onReady:               opts.OnReady,
+		stderr:                opts.Stderr,
 		byUpstreamID:          make(map[string]chan upstreamResult),
 		hostToUp:              make(map[string]*json.RawMessage),
 		hostReader:            mcp.NewMsgReader(os.Stdin),
@@ -335,7 +358,7 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 	// desync case.
 	//nolint:contextcheck // teardown: detached, bounded background context; this hook fires from inside a framed write, which carries no request context.
 	p.hostWriter.SetPoisonHook(func() {
-		fmt.Fprintf(os.Stderr, "[eunox] FATAL: host stdout framing desynced (partial write); tearing down the upstream — no further responses can be delivered.\n")
+		_, _ = fmt.Fprintf(p.errOut(), "[eunox] FATAL: host stdout framing desynced (partial write); tearing down the upstream — no further responses can be delivered.\n")
 		p.killUpstream()
 	})
 	// Captured once: a stdio host has one connection, so these are the claims every request
@@ -415,11 +438,11 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 		if !ok {
 			return
 		}
-		fmt.Fprintf(os.Stderr, "[eunox] Received %s; shutting down upstream.\n", sig)
+		_, _ = fmt.Fprintf(p.errOut(), "[eunox] Received %s; shutting down upstream.\n", sig)
 		p.signalUpstream(sig)
 	}()
 
-	fmt.Fprintf(os.Stderr, "[eunox] Session %s initialized; proxying to %q.\n", p.sessionID, p.upstreamLabel())
+	_, _ = fmt.Fprintf(p.errOut(), "[eunox] Session %s initialized; proxying to %q.\n", p.sessionID, p.upstreamLabel())
 
 	// Post-startup effects (see StdioProxyOptions.OnReady), placed after every fallible
 	// startup step so a proxy that never comes up cannot overwrite shared state a running
@@ -506,7 +529,7 @@ func (p *StdioProxy) connectUpstream(ctx context.Context) error {
 		// are never read or replied to; surface that so an operator isn't left debugging a
 		// silent hang. Redact the URL — no route name here to label the notice with instead —
 		// so a userinfo/query credential never reaches stderr.
-		printRemoteUpstreamNotice(os.Stderr, capability.RedactURLForLog(p.upstreamURL), "")
+		printRemoteUpstreamNotice(p.errOut(), capability.RedactURLForLog(p.upstreamURL), "")
 		return nil
 	}
 
@@ -594,7 +617,7 @@ func (p *StdioProxy) signalUpstream(sig os.Signal) {
 	signalUpstreamProcess(p.upCmd.Process, sig)
 	t := time.AfterFunc(p.killDelay(), func() {
 		if p.upCmd.Process != nil {
-			fmt.Fprintf(os.Stderr, "[eunox] Upstream did not exit; sending SIGKILL.\n")
+			_, _ = fmt.Fprintf(p.errOut(), "[eunox] Upstream did not exit; sending SIGKILL.\n")
 			killUpstreamProcess(p.upCmd.Process)
 		}
 	})
@@ -613,7 +636,7 @@ func (p *StdioProxy) awaitUpstreamDrain() {
 	case <-p.upstreamDone:
 		return
 	case <-time.After(p.killDelay()):
-		fmt.Fprintf(os.Stderr, "[eunox] Upstream did not exit after host disconnect; forcing shutdown.\n")
+		_, _ = fmt.Fprintf(p.errOut(), "[eunox] Upstream did not exit after host disconnect; forcing shutdown.\n")
 		p.killUpstream()
 		// Bound the post-kill wait independently: the kill EOFs the pipe almost immediately
 		// in the ordinary case, but a descendant that escaped the process group can still
@@ -755,7 +778,7 @@ func (p *StdioProxy) initUpstream(ctx context.Context) error {
 		initID,
 		p.upWriter,
 		func(msg mcp.RPCMsg) {
-			fmt.Fprintf(os.Stderr,
+			_, _ = fmt.Fprintf(p.errOut(),
 				"[eunox] debug: discarding upstream message during initialize handshake (method=%q).\n",
 				msg.Method)
 		},
@@ -928,7 +951,7 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 			// EOF is the ordinary host-closed-stdin case and stays silent; anything else is
 			// a session that died mid-stream for a reason otherwise invisible to the operator.
 			if !errors.Is(r.err, io.EOF) {
-				fmt.Fprintf(os.Stderr, "[eunox] host read error: %v; ending session\n", r.err)
+				_, _ = fmt.Fprintf(p.errOut(), "[eunox] host read error: %v; ending session\n", r.err)
 			}
 			break // host stdin closed (EOF) or an unrecoverable read error
 		}
@@ -1126,7 +1149,7 @@ func (p *StdioProxy) dispatchParams() dispatchParams {
 // returned message to the host.
 func (p *StdioProxy) buildInitResponse(msg mcp.RPCMsg) mcp.RPCMsg {
 	resp := buildInitializeResponse(msg.ID, p.upstreamCaps, p.upstreamInstructions)
-	fmt.Fprintf(os.Stderr,
+	_, _ = fmt.Fprintf(p.errOut(),
 		"[eunox] Session %s: host initialized (protocol %s).\n",
 		p.sessionID, MCPProtocolVersion,
 	)
@@ -1458,7 +1481,7 @@ func (p *StdioProxy) readUpstream(ctx context.Context) {
 			// malformed message) is abnormal; log it so it is diagnosable rather
 			// than a silent reader exit.
 			if !errors.Is(err, io.EOF) {
-				fmt.Fprintf(os.Stderr, "[eunox] upstream read error: %v\n", err)
+				_, _ = fmt.Fprintf(p.errOut(), "[eunox] upstream read error: %v\n", err)
 			}
 			return
 		}
