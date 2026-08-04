@@ -46,6 +46,27 @@ func spanningSession(t *testing.T, rt *UpstreamRoute, id, ownTask string) *httpS
 	return sess
 }
 
+// visit drives one request per named task through sess, in order, for passes rounds. Filling and
+// then WARMING is what the tests below need: an entry is only shed once a full pass of the cache
+// has gone by without a use of it (gateCache.admitsLocked), so making one entry the coldest means
+// using the others, not merely inserting more.
+func visit(sess *httpSession, passes int, tasks ...string) {
+	for range passes {
+		for _, task := range tasks {
+			sess.beginDecisionTurn(taskCtx(task))()
+		}
+	}
+}
+
+// fillTasks names the maxCachedSessionGates anchors the tests below fill the cache with.
+func fillTasks() []string {
+	names := make([]string, maxCachedSessionGates)
+	for i := range names {
+		names[i] = fmt.Sprintf("task-%d", i)
+	}
+	return names
+}
+
 // TestGateCache_SpanningSessionStopsReenteringTheRegistry is the shape this cache exists for.
 //
 // A session pins the gate for the anchor it registered on, and that pin serves every request
@@ -152,11 +173,13 @@ func TestGateCache_EvictionNeverDropsAGateInUse(t *testing.T) {
 	victimGate := registryGate(rt.decideGates, taskAnchor("task-victim").Key())
 	require.NotNil(t, victimGate)
 
-	// Push the victim out of the cache: it is the least recently used the moment anything else
-	// is touched, and one more anchor than the cap guarantees an eviction.
-	for i := range maxCachedSessionGates + 1 {
-		sess.beginDecisionTurn(taskCtx(fmt.Sprintf("task-%d", i)))()
-	}
+	// Fill the rest of the cache, then WARM those entries so the victim is the coldest by more
+	// than a full pass — which is what makes it shed-able at all (gateCache.admitsLocked) — and
+	// one more anchor to actually shed it.
+	warm := fillTasks()[1:]
+	visit(sess, 3, warm...)
+	require.Equal(t, maxCachedSessionGates, sess.decideCache.size(), "the victim plus the warm set fill it")
+	visit(sess, 1, "task-displacer")
 	assert.Equal(t, maxCachedSessionGates, sess.decideCache.size(), "the cache holds no more than its cap")
 
 	// The evicted-but-in-use gate is still the registry's gate for that anchor, so a second
@@ -188,9 +211,9 @@ func TestGateCache_EvictionNeverDropsAGateInUse(t *testing.T) {
 
 // TestGateCache_CapBoundsWhatOneSessionPins is the memory bound. The anchors are validated task
 // claims, so a client with many tasks — or one authenticated client minting them — must not be
-// able to pin one route gate per task for the life of a connection. Past the cap the least
-// recently used entry goes and the request that displaced it is still served, from the registry
-// path that served all of them before this cache existed.
+// able to pin one route gate per task for the life of a connection. Every request is still
+// served past the cap, from the registry path that served all of them before this cache existed;
+// what the cap bounds is what the SESSION holds, not what it may ask for.
 func TestGateCache_CapBoundsWhatOneSessionPins(t *testing.T) {
 	t.Parallel()
 	rt := &UpstreamRoute{decideGates: newAnchorGates(), taskAnchored: true, pdp: pdp.DenyAllPDP{}}
@@ -266,33 +289,61 @@ func TestGateCache_TeardownRetiresAnEntryStillInUse(t *testing.T) {
 	assert.Zero(t, rt.decideGates.size())
 }
 
-// TestGateCache_EvictsTheLeastRecentlyUsed pins the eviction ORDER. The cap is what bounds the
-// memory; which entry it sheds is what decides whether a session that keeps returning to the
-// same few tasks keeps its fast path. Shedding the oldest USE (not the oldest insert) is what
-// makes a re-visited anchor stay.
-func TestGateCache_EvictsTheLeastRecentlyUsed(t *testing.T) {
+// TestGateCache_ShedsTheColdestEntry pins WHICH entry the cap sheds. The cap bounds the memory;
+// which entry it sheds is what decides whether a session that keeps returning to the same few
+// tasks keeps its fast path. Shedding the oldest USE (not the oldest insert) is what makes a
+// re-visited anchor stay.
+func TestGateCache_ShedsTheColdestEntry(t *testing.T) {
 	t.Parallel()
 	rt := &UpstreamRoute{decideGates: newAnchorGates(), taskAnchored: true, pdp: pdp.DenyAllPDP{}}
 	sess := spanningSession(t, rt, "sess-a", "own")
 	t.Cleanup(func() { releaseSessionState(sess) })
 
-	// Fill the cache exactly.
-	for i := range maxCachedSessionGates {
-		sess.beginDecisionTurn(taskCtx(fmt.Sprintf("task-%d", i)))()
-	}
+	// Fill the cache exactly, then keep using every entry EXCEPT task-1 — which leaves task-1
+	// the coldest by more than a full pass, and every other entry in rotation.
+	all := fillTasks()
+	visit(sess, 1, all...)
 	require.Equal(t, maxCachedSessionGates, sess.decideCache.size())
+	warm := append([]string{all[0]}, all[2:]...)
+	visit(sess, 2, warm...)
 
-	// Re-visit the OLDEST entry, making the second-oldest the least recently used.
-	sess.beginDecisionTurn(taskCtx("task-0"))()
-
-	// One more anchor forces exactly one eviction, and it must be task-1 rather than task-0.
-	sess.beginDecisionTurn(taskCtx("task-new"))()
+	// One more anchor now shows the choice: task-1 goes, task-0 stays.
+	visit(sess, 1, "task-new")
 	assert.Equal(t, maxCachedSessionGates, sess.decideCache.size())
 	assert.NotNil(t, registryGate(rt.decideGates, taskAnchor("task-0").Key()),
-		"a re-visited anchor keeps its place: eviction is by last USE, not by insertion order")
+		"an anchor still in rotation keeps its place: what is shed is the COLDEST, not the oldest insert")
 	assert.Nil(t, registryGate(rt.decideGates, taskAnchor("task-1").Key()),
-		"the least recently used anchor is the one shed")
+		"the entry the session stopped using is the one shed")
 	assert.NotNil(t, registryGate(rt.decideGates, taskAnchor("task-new").Key()))
+}
+
+// TestGateCache_KeepsEntriesStillInRotation is the anti-thrash rule, and it is a COST property
+// rather than a correctness one — which is why it is pinned rather than left to a benchmark
+// nobody runs.
+//
+// A session cycling one more live anchor than the cache holds is the only workload that reaches
+// the cap. Under plain least-recently-used eviction it sheds, on every single request, the entry
+// the next request wants: it loses every hit AND adds this file's bookkeeping to the registry
+// round trip it would have paid anyway, measurably slower than having no cache at all. So an
+// entry is only shed once a full pass has gone by without a use of it, and a session whose live
+// set does not fit keeps the entries that do rather than losing the cache for all of them.
+func TestGateCache_KeepsEntriesStillInRotation(t *testing.T) {
+	t.Parallel()
+	rt := &UpstreamRoute{decideGates: newAnchorGates(), taskAnchored: true, pdp: pdp.DenyAllPDP{}}
+	sess := spanningSession(t, rt, "sess-a", "own")
+	t.Cleanup(func() { releaseSessionState(sess) })
+
+	// One more live anchor than the cache can hold, cycled round-robin many times over.
+	cycle := append(fillTasks(), "task-overflow")
+	visit(sess, 10, cycle...)
+
+	assert.Equal(t, maxCachedSessionGates, sess.decideCache.size())
+	for _, task := range fillTasks() {
+		assert.NotNilf(t, registryGate(rt.decideGates, taskAnchor(task).Key()),
+			"%s is used every pass and must keep its entry; shedding it per miss is the thrash this rule exists to stop", task)
+	}
+	assert.Nil(t, registryGate(rt.decideGates, taskAnchor("task-overflow").Key()),
+		"the anchor that does not fit takes the registry path, which is what every request took before this cache")
 }
 
 // TestGateCache_ClosedCacheStillServesTurns covers a request racing its own session's teardown.
@@ -380,15 +431,15 @@ func TestGateCache_AbandonedBoundedWaitReleasesItsUse(t *testing.T) {
 	require.Nil(t, end)
 	blocker()
 
-	// The entry exists and has no users, so eviction may reclaim it — which is what a leaked
-	// use would prevent. Driving the cap is how that is observable.
+	// The entry exists and has no users, so the cap may shed it — which is what a leaked use
+	// would prevent, since a retired entry with a phantom user never returns its reference.
+	// Filling and warming the cache around it is how that is observable.
 	require.Equal(t, 1, sess.decideCache.size())
-	for i := range maxCachedSessionGates {
-		sess.beginDecisionTurn(taskCtx(fmt.Sprintf("task-%d", i)))()
-	}
+	visit(sess, 3, fillTasks()[1:]...)
+	visit(sess, 1, "task-displacer")
 	assert.Equal(t, maxCachedSessionGates, sess.decideCache.size())
 	assert.Nil(t, registryGate(rt.decideGates, spanned.Key()),
-		"an abandoned wait must return its use, so its entry is evictable and its gate reclaimable")
+		"an abandoned wait must return its use, so its entry can be shed and its gate reclaimed")
 
 	releaseSessionState(sess)
 	assert.Zero(t, rt.decideGates.size())

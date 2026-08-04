@@ -808,8 +808,10 @@ func (s *httpSession) gateFor(anchor enforcement.StateAnchor) *anchorGate {
 //  2. The session's CACHE, on the session's own mutex, for the other anchors a spanning
 //     session resolves. See session_gate_cache.go.
 //  3. The route REGISTRY, the always-correct path, on a route-wide mutex. Reached by a route
-//     that does not serialize (where it is a no-op), by a session past its cache's cap, and by
-//     one racing its own teardown.
+//     that does not serialize (where it is a no-op) and by a request racing its own session's
+//     teardown, after the cache has stopped admitting. Reaching the cache's cap does NOT send a
+//     request here — the cache sheds its least recently used entry and serves the request — so
+//     this tier is not a capacity overflow path.
 //
 // All three resolve the turn for the SAME anchor and none of them is consulted without one:
 // what is compared is the resolved enforcement.StateAnchor, never a restatement of how the
@@ -1727,6 +1729,15 @@ func releaseSessionState(sess *httpSession) {
 	// prevent. And it has to be after the drain: dropping the last reference deletes the gate
 	// from the registry, so a request still taking turns on it would be holding a gate a later
 	// caller under the same key could no longer reach.
+	//
+	// Residual, stated because the cache below closes the same hole and the pin cannot: the
+	// drain is BOUNDED, so a handler still holding the turn when the budget runs out has this
+	// reference dropped out from under it, and a later caller on the same anchor is then handed
+	// a FRESH gate — two gates, no mutual exclusion, for as long as that handler runs. The cache
+	// retires such an entry instead, because it counts the requests on it; the pin is read with
+	// no lock and counts nothing, which is exactly what makes it free on the path that matters.
+	// Reachable only where the drain gives up (a wedged upstream under a disabled timeout), on a
+	// task-anchored route, with another session on the same task.
 	if sess.dropDecideGate != nil {
 		sess.dropDecideGate()
 	}

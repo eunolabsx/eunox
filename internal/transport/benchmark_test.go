@@ -937,28 +937,47 @@ func BenchmarkAuditRecord(b *testing.B) {
 // on a session-anchored route and every request of a task-anchored session that stays on one
 // task, and it touches no map and no shared lock at all.
 //
-// Run the three together to see what each tier costs:
+// Run them together; each pair below is meant to be read against its own control, never across
+// workloads (a task-anchored request resolves its anchor from claims and a session-anchored one
+// does not, so the two workloads are not comparable per-op):
 //
-//	go test -run XXX -bench 'BenchmarkDecisionTurn' -cpu=8 ./internal/transport/
+//	go test -run XXX -bench 'BenchmarkDecisionTurn' -count=6 -cpu=8 ./internal/transport/
 func BenchmarkDecisionTurn_Pinned(b *testing.B) {
 	benchmarkDecisionTurn(b, turnPinned)
 }
 
-// BenchmarkDecisionTurn_SpanCached is the same measurement for a session that has MOVED off the
-// anchor it pinned — an agent runtime multiplexing task-2 … task-n over one long-lived
-// connection, which is the shape task anchoring exists for. It is served from the session's own
-// gate cache: one uncontended session-local mutex, no route-wide lock and no map churn.
+// BenchmarkDecisionTurn_Registry is the always-correct path both faster tiers sit in front of,
+// on the session-anchored workload: a route-wide mutex, a map insert and a map delete per
+// request, since the refcount falls to zero the instant a non-overlapping request finishes. It
+// is the control for BenchmarkDecisionTurn_Pinned.
+func BenchmarkDecisionTurn_Registry(b *testing.B) {
+	benchmarkDecisionTurn(b, turnRegistry)
+}
+
+// BenchmarkDecisionTurn_SpanCached is the shape this cache exists for: a session that has MOVED
+// off the anchor it pinned — an agent runtime multiplexing task-2 … task-n over one long-lived
+// connection — with its live anchors inside the cap. Its control is
+// BenchmarkDecisionTurn_SpanUncached, which is the same workload with the cache off, i.e. what
+// such a session paid on EVERY call before this existed.
 func BenchmarkDecisionTurn_SpanCached(b *testing.B) {
 	benchmarkDecisionTurn(b, turnSpanCached)
 }
 
-// BenchmarkDecisionTurn_Registry is the always-correct path both caches sit in front of, and
-// what a spanning session paid on EVERY call before the cache existed: a route-wide mutex, a map
-// insert and a map delete per request, since the refcount falls to zero the instant a
-// non-overlapping request finishes. It is still what a session past its cache's cap takes, so
-// the number is a live cost rather than a historical one.
-func BenchmarkDecisionTurn_Registry(b *testing.B) {
-	benchmarkDecisionTurn(b, turnRegistry)
+// BenchmarkDecisionTurn_SpanThrashing is the cache's WORST case, on the same workload as its
+// control: a session cycling one more live anchor than the cap, so every request misses, files
+// an entry and immediately sheds the one the next request wants. Read against
+// BenchmarkDecisionTurn_SpanUncached it says what the cache costs a session it cannot help — a
+// cache that is slower than the thing it fronts, on a reachable shape, is a cost with no
+// benefit, and the answer would be to stop admitting past the cap rather than to raise it.
+func BenchmarkDecisionTurn_SpanThrashing(b *testing.B) {
+	benchmarkDecisionTurn(b, turnSpanThrashing)
+}
+
+// BenchmarkDecisionTurn_SpanUncached is the control for the two spanning tiers: the same
+// task-anchored, off-pin workload with the cache closed, so every request resolves through the
+// route registry.
+func BenchmarkDecisionTurn_SpanUncached(b *testing.B) {
+	benchmarkDecisionTurn(b, turnSpanUncached)
 }
 
 // Which tier of httpSession.beginTurn the benchmark below exercises.
@@ -966,34 +985,70 @@ type turnTier int
 
 const (
 	turnPinned turnTier = iota
-	turnSpanCached
 	turnRegistry
+	turnSpanCached
+	turnSpanThrashing
+	turnSpanUncached
 )
+
+// spans reports whether this tier drives requests OFF the session's pinned anchor, onto a
+// task-anchored route.
+func (t turnTier) spans() bool {
+	return t == turnSpanCached || t == turnSpanThrashing || t == turnSpanUncached
+}
+
+// caches reports whether this tier leaves the session's span cache open.
+func (t turnTier) caches() bool {
+	return t == turnSpanCached || t == turnSpanThrashing
+}
+
+// liveAnchors is how many distinct off-pin anchors this tier cycles a session through.
+func (t turnTier) liveAnchors() int {
+	if t == turnSpanThrashing {
+		return maxCachedSessionGates + 1 // one more than the cache can hold: every request misses
+	}
+	return 1
+}
 
 func benchmarkDecisionTurn(b *testing.B, tier turnTier) {
 	b.Helper()
-	rt := &UpstreamRoute{decideGates: newAnchorGates(), taskAnchored: tier == turnSpanCached}
+	rt := &UpstreamRoute{decideGates: newAnchorGates(), taskAnchored: tier.spans()}
 	var seq atomic.Uint64
 	b.ReportAllocs()
 	b.RunParallel(func(pb *testing.PB) {
 		n := seq.Add(1)
 		sess := &httpSession{id: fmt.Sprintf("sess-%d", n), route: rt}
-		ctx := context.Background()
 		if tier != turnRegistry {
-			// The pin every registered session takes. On the spanning tier the requests below
-			// resolve a task the pin does not name, so they fall through to the cache.
+			// The pin every registered session takes. On a spanning tier the requests below
+			// resolve a task the pin does not name, so they go past it.
 			sess.holdDecisionGate()
 			defer sess.dropDecideGate()
 		}
-		if tier == turnSpanCached {
-			ctx = taskCtx(fmt.Sprintf("task-%d", n))
+		if tier.caches() {
 			defer sess.decideCache.close()
 		} else {
-			// No pin and no cache: every request resolves through the route registry.
+			// Closed up front so nothing is cached. On turnPinned that changes nothing (every
+			// request resolves the pinned anchor and never reaches the cache); on the two
+			// uncached tiers it is what sends every request through the route registry.
 			sess.decideCache.close()
 		}
+
+		// One context per live anchor, cycled round-robin. A non-spanning tier gets a single
+		// context on the session's own anchor.
+		spread := make([]context.Context, tier.liveAnchors())
+		for i := range spread {
+			spread[i] = context.Background()
+			if tier.spans() {
+				spread[i] = taskCtx(fmt.Sprintf("task-%d-%d", n, i))
+			}
+		}
+		i := 0
 		for pb.Next() {
-			sess.beginDecisionTurn(ctx)()
+			sess.beginDecisionTurn(spread[i])()
+			i++
+			if i == len(spread) {
+				i = 0
+			}
 		}
 	})
 }

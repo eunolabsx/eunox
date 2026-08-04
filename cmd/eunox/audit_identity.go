@@ -41,7 +41,7 @@ import (
 // whose only identity was that human's — indistinguishable from one they made directly, which
 // is backwards for the record an investigator most needs to attribute.
 //
-// Wired into the sink via audit.WithIdentity (see setupAuditSink). It reads the typed,
+// Wired into the sink via audit.WithIdentity (see openConfiguredAuditSink). It reads the typed,
 // already-validated claims through pdp.JWTClaimsPtr; a caller identity taken from an unverified
 // token would be an attacker-chosen value signed onto the tape as fact.
 func auditIdentity(ctx context.Context) audit.Identity {

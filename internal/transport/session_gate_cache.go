@@ -28,19 +28,30 @@
 //   - A cached entry holds its own registry reference, for as long as the cache holds it.
 //   - Every request that takes a turn on a cached gate is COUNTED for the whole turn, so an
 //     entry can never lose its reference while a request is queued on the gate it names.
-//   - Eviction therefore never drops a reference in use: an entry with users is retired instead
-//     — removed from the map so nothing new joins it, its reference dropped by whichever request
-//     leaves last. Which is the ordinary refcount discipline, kept on the SESSION's mutex
+//   - Shedding an entry therefore never drops a reference in use: an entry with users is retired
+//     instead — removed from the map so nothing new joins it, its reference returned by whichever
+//     request leaves last. Which is the ordinary refcount discipline, kept on the SESSION's mutex
 //     (uncontended: one session's own requests) rather than on the route's (contended by every
 //     session on the route).
 //
-// The bound is a cap on entries with LRU eviction, and it is a memory bound rather than a
-// working-set estimate: the anchors are validated task claims, so a legitimate client with many
-// tasks — or one authenticated client minting them — must not be able to pin one gate per task
-// for the life of a connection. Past the cap the least recently used entry goes and the request
-// that displaced it is served; a session whose anchors genuinely cycle wider than the cap falls
-// back to the registry for the ones that miss, which is the always-correct path it took for all
-// of them before.
+// The bound is a cap on entries, and it is a memory bound rather than a working-set estimate:
+// the anchors are validated task claims, so a legitimate client with many tasks — or one
+// authenticated client minting them — must not be able to pin one gate per task for the life of
+// a connection. What the cap sheds is the COLDEST entry, and only once the session has stopped
+// cycling through it (admitsLocked); a session whose live anchors do not fit keeps the ones that
+// do and takes the registry path for the rest. Plain least-recently-used eviction is the obvious
+// rule and is wrong here, measurably: on the one workload that reaches the cap it sheds, per
+// request, the entry the next request wants, so it loses every hit AND adds this file's
+// bookkeeping to the round trip it would have paid anyway.
+//
+// It deliberately does not reuse keyedRegistry, which is the one home for the map + refcount +
+// delete-at-zero shape the two decision-turn primitives share, and the reason is that two of the
+// three pieces genuinely differ. Its key is the RESOLVED anchor, a comparable struct, not the
+// rendered string key — rendering one per lookup is an allocation on the path this exists to
+// make cheaper. And the count here is not a hold/drop refcount over a value the registry owns:
+// it counts REQUESTS on a value owned by another registry, so the reclaim it drives is
+// "return someone else's reference", which is what retirement below means and what an `idle`
+// predicate cannot express. What they share is the discipline, not the code.
 
 package transport
 
@@ -57,8 +68,9 @@ import (
 // the order of a kilobyte — and without one, a client running a long series of tasks over a
 // single connection would pin one gate per task it ever touched until the connection closed.
 // Eight is chosen to cover the shape this cache is for (a session interleaving a handful of
-// live tasks) while keeping that per-session ceiling small; a session that cycles wider than it
-// still gets the cache for its most recent eight anchors and the registry for the rest.
+// live tasks) while keeping that per-session ceiling small. It is also the unit the admission
+// rule measures staleness in — an entry is shed once a full pass of the cache has gone by
+// without a use — so the cap and "still in rotation" cannot drift apart into two constants.
 const maxCachedSessionGates = 8
 
 // gateCache holds one session's decision gates for anchors its pin does not cover. Its zero
@@ -74,9 +86,11 @@ type gateCache struct {
 	// key, so a lookup compares the same two-string struct the pin compares and renders
 	// nothing. nil until the first insert.
 	entries map[enforcement.StateAnchor]*cachedGate
-	// tick orders entries for LRU eviction: every acquire stamps the entry with the next
-	// value. A counter rather than a timestamp because it needs only an ordering, and because
-	// a monotonic clock read per request would cost more than the map lookup it accompanies.
+	// tick orders entries by recency of USE: every hit and every admission stamps its entry
+	// with the next value, and a refusal advances nothing. A counter rather than a timestamp
+	// because what the admission rule needs is "how many passes of the cache ago", not a
+	// duration — and because a monotonic clock read per request would cost more than the map
+	// lookup it accompanies.
 	tick uint64
 	// closed is set at session teardown. It stops the cache admitting anything new, so a
 	// request racing teardown resolves through the registry (always correct) instead of
@@ -92,14 +106,15 @@ type cachedGate struct {
 	// a sync.OnceFunc), which matters because retire-then-close can reach it twice.
 	drop func()
 	// users is the number of requests that have acquired this entry and not yet released.
-	// It is what makes eviction safe: an entry with users is retired rather than dropped, so
-	// a request queued on the gate cannot have that gate reclaimed and replaced beneath it.
+	// It is what makes shedding safe: an entry with users is retired rather than dropped, so a
+	// request queued on the gate cannot have that gate reclaimed and replaced beneath it.
 	users int
-	// used is the tick value of the most recent acquire — the LRU ordering.
+	// used is the tick value of this entry's most recent use — what admitsLocked compares
+	// against the current tick to tell an entry still in rotation from a cold one.
 	used uint64
-	// retired marks an entry evicted from the map (or caught by teardown) while still in use.
-	// The last user to leave drops the reference. Nothing new can join it: it is no longer
-	// reachable from entries.
+	// retired marks an entry taken out of the map (by the cap or by teardown) while still in
+	// use. The last user to leave returns the reference. Nothing new can join it: it is no
+	// longer reachable from entries.
 	retired bool
 }
 
@@ -109,8 +124,8 @@ type cachedGate struct {
 //
 // The use is held for the whole turn, not just for the lookup: the caller must call release
 // only after it has finished with the gate (see httpSession.beginTurn, which composes it behind
-// the turn's own release). Releasing early would put the entry back in reach of eviction while
-// a request is still queued on its gate, which is the one thing this cache exists to prevent.
+// the turn's own release). Releasing early would put the entry back in reach of being shed while
+// a request is still queued on its gate, which is the one hazard this file is arranged around.
 //
 // reg is the route's gate registry — passed rather than reached for, so this type never needs a
 // back-pointer to the session or the route.
@@ -118,8 +133,18 @@ func (c *gateCache) acquire(anchor enforcement.StateAnchor, reg *anchorGates) (g
 	if c == nil || reg == nil {
 		return nil, nil, false
 	}
-	if e := c.use(anchor); e != nil {
+	e, admits := c.lookup(anchor)
+	if e != nil {
 		return e.gate, c.releaser(e), true
+	}
+	// "Would not admit" is answered by the LOOKUP rather than discovered by the insert, because
+	// the two cost differently: a refused insert has already taken a registry reference it must
+	// then hand back, so the request pays FOUR acquisitions of the route-wide mutex where the
+	// plain registry path pays two. Both refusal reasons — a closed cache, and a full one whose
+	// entries are all still in rotation — are steady states rather than one-offs, so that
+	// doubling would be what a session in either of them paid per request.
+	if !admits {
+		return nil, nil, false
 	}
 	// Referenced OUTSIDE c.mu: the registry is a lock of its own, and taking it under the
 	// session's would nest two locks on the miss path for no reason. The cost of losing a race
@@ -146,26 +171,79 @@ func (c *gateCache) acquire(anchor enforcement.StateAnchor, reg *anchorGates) (g
 	return e.gate, c.releaser(e), true
 }
 
-// use records a use of anchor's entry and returns it, or nil when the cache does not hold one.
-func (c *gateCache) use(anchor enforcement.StateAnchor) *cachedGate {
+// lookup records a use of anchor's entry and returns it, or nil when the cache does not hold
+// one. admits reports whether the cache would TAKE one — false once closed, and false while it
+// is full of entries still in rotation. Both are different answers from "not cached yet", and
+// asking here is what lets acquire skip a registry round trip it would only hand back.
+func (c *gateCache) lookup(anchor enforcement.StateAnchor) (entry *cachedGate, admits bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
-		return nil
+		return nil, false
 	}
 	e, present := c.entries[anchor]
 	if !present {
-		return nil
+		return nil, c.admitsLocked()
 	}
 	c.touchLocked(e)
-	return e
+	return e, true
 }
 
-// insert files anchor's entry, evicting the least recently used one when the cap is reached,
-// and records a use of whatever entry ends up serving anchor. kept reports whether the caller's
-// registry reference was taken over by the cache; when it is false the caller must drop it.
+// admitsLocked reports whether a new anchor may be filed: there is room, or the coldest entry
+// has gone a full pass of the cache without a use. Caller holds c.mu.
 //
-// A nil entry with kept=false means the cache is closed and the caller must use the registry.
+// The second clause is what keeps the cap from turning into a THRASH. Shedding the least
+// recently used entry on every miss is the obvious rule and is wrong for the one workload the
+// cap is reached by: a session cycling through one more live anchor than the cache holds sheds,
+// on every request, the entry the next request wants — so it misses every time AND pays this
+// file's bookkeeping on top of the registry round trip it would have paid anyway. Measured, that
+// was ~30% slower per call than no cache at all; with the rule below the same workload is ~45%
+// FASTER than it, because the entries that do fit keep hitting
+// (BenchmarkDecisionTurn_SpanThrashing against its control, BenchmarkDecisionTurn_SpanUncached).
+//
+// An entry is therefore only shed once the session has stopped cycling through it, and "stopped"
+// is measured in the cache's own unit rather than a tuned one: a full pass, maxCachedSessionGates
+// uses, with none of them its own. A session whose live anchors do not fit keeps the ones that
+// do and takes the always-correct registry path for the rest — which is what every request took
+// before this cache existed — instead of losing the cache for all of them.
+//
+// The tick advances only on a USE (a hit or an admission), never on a refusal, which is what
+// makes the comparison mean "passes of the cache" rather than "requests". A session that resolves
+// each anchor exactly once therefore fills the cache and then freezes, holding those entries
+// unused for its life: bounded at the cap, and each of its requests pays one map lookup over the
+// registry path — the honest cost of a workload no cache of any shape can help.
+func (c *gateCache) admitsLocked() bool {
+	if len(c.entries) < maxCachedSessionGates {
+		return true
+	}
+	_, coldest := c.coldestLocked()
+	return coldest != nil && c.tick-coldest.used > uint64(maxCachedSessionGates)
+}
+
+// coldestLocked returns the least recently used entry and its key, or the zero anchor and nil
+// for an empty cache. Caller holds c.mu.
+//
+// A linear scan rather than an ordered structure: the cap is small enough that a scan over it is
+// cheaper than the bookkeeping any ordering would add to the HIT path, which is the path that
+// matters.
+func (c *gateCache) coldestLocked() (enforcement.StateAnchor, *cachedGate) {
+	var coldestKey enforcement.StateAnchor
+	var coldest *cachedGate
+	for k, e := range c.entries {
+		if coldest == nil || e.used < coldest.used {
+			coldestKey, coldest = k, e
+		}
+	}
+	return coldestKey, coldest
+}
+
+// insert files anchor's entry, shedding the coldest one when the cap is reached and the
+// admission rule allows it, and records a use of whatever entry ends up serving anchor. kept
+// reports whether the caller's registry reference was taken over by the cache; when it is false
+// the caller must drop it.
+//
+// A nil entry with kept=false means the cache would not admit — closed, or full and still
+// cycling — and the caller must use the registry.
 func (c *gateCache) insert(anchor enforcement.StateAnchor, gate *anchorGate, drop func()) (entry *cachedGate, kept bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -175,10 +253,22 @@ func (c *gateCache) insert(anchor enforcement.StateAnchor, gate *anchorGate, dro
 	// Re-checked under the lock: two requests on this session can miss concurrently and both
 	// reach the registry, which hands each its own reference to the SAME gate. Whoever files
 	// first wins the slot and the other's reference is surplus — never a second entry, which
-	// would double the cache's footprint for one anchor and mean two independent LRU lives.
+	// would double the cache's footprint for one anchor and give it two independent recencies.
 	if e, present := c.entries[anchor]; present {
 		c.touchLocked(e)
 		return e, false
+	}
+	// Re-asked under this lock: acquire asked before releasing it to take the registry
+	// reference, and a concurrent request may have filled the last slot since.
+	if !c.admitsLocked() {
+		return nil, false
+	}
+	// Shed BEFORE filing, so the entry that just arrived is never its own victim and the map
+	// never exceeds the cap even transiently.
+	if len(c.entries) >= maxCachedSessionGates {
+		if k, coldest := c.coldestLocked(); coldest != nil {
+			c.retireLocked(k, coldest)
+		}
 	}
 	if c.entries == nil {
 		c.entries = make(map[enforcement.StateAnchor]*cachedGate, maxCachedSessionGates)
@@ -186,9 +276,6 @@ func (c *gateCache) insert(anchor enforcement.StateAnchor, gate *anchorGate, dro
 	e := &cachedGate{gate: gate, drop: drop}
 	c.entries[anchor] = e
 	c.touchLocked(e)
-	// Evicted AFTER the insert and AFTER the new entry is stamped, so the entry that just
-	// arrived is the most recently used and can never be its own victim.
-	c.evictLocked()
 	return e, true
 }
 
@@ -199,36 +286,24 @@ func (c *gateCache) touchLocked(e *cachedGate) {
 	e.users++
 }
 
-// evictLocked drops the least recently used entry while the cache is over its cap. Caller holds
-// c.mu.
+// retireLocked takes e out of the cache, returning its registry reference if it can. Caller
+// holds c.mu. It is the ONE place an entry leaves, shared by the cap and by teardown, because
+// the condition it turns on is the whole safety argument and two copies of it is one copy that
+// can be fixed alone.
 //
-// An entry with no users has its registry reference released here. One WITH users cannot: a
-// request that read its gate is queued on that gate, and dropping the last reference lets the
-// registry reclaim it and build a fresh gate for the same anchor under a later caller — two
-// gates, no mutual exclusion. It is retired instead: removed from the map so nothing new joins
-// it, its reference dropped by the last user to leave (see releaser).
-//
-// A loop rather than a single step because the cap is also enforced when entries are retired
-// rather than dropped, and because one pass leaves the invariant true for exactly one insert.
-func (c *gateCache) evictLocked() {
-	for len(c.entries) > maxCachedSessionGates {
-		var victimKey enforcement.StateAnchor
-		var victim *cachedGate
-		for k, e := range c.entries {
-			if victim == nil || e.used < victim.used {
-				victimKey, victim = k, e
-			}
-		}
-		if victim == nil { // unreachable while the loop condition holds; a guard, not a case
-			return
-		}
-		delete(c.entries, victimKey)
-		if victim.users > 0 {
-			victim.retired = true
-			continue
-		}
-		victim.drop()
+// An entry with no users has its reference released here. One WITH users cannot: a request that
+// read its gate is queued on that gate, and dropping the last reference lets the registry
+// reclaim it and build a FRESH gate for the same anchor under a later caller — two gates, no
+// mutual exclusion, on the path with no second reader to notice. It is retired instead: removed
+// from the map so nothing new joins it, its reference returned by the last user to leave (see
+// releaser).
+func (c *gateCache) retireLocked(key enforcement.StateAnchor, e *cachedGate) {
+	delete(c.entries, key)
+	if e.users > 0 {
+		e.retired = true
+		return
 	}
+	e.drop()
 }
 
 // releaser returns the idempotent func ending one use of e. Idempotent because the decision
@@ -261,12 +336,7 @@ func (c *gateCache) close() {
 	defer c.mu.Unlock()
 	c.closed = true
 	for k, e := range c.entries {
-		delete(c.entries, k)
-		if e.users > 0 {
-			e.retired = true
-			continue
-		}
-		e.drop()
+		c.retireLocked(k, e)
 	}
 	c.entries = nil
 }

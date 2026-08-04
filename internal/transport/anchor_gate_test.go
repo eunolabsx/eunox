@@ -366,11 +366,13 @@ func TestSessionGate_ReleasedOnEveryTeardownPath(t *testing.T) {
 	}
 }
 
-// TestSessionGate_TaskAnchoredRouteResolvesPerRequest is the negative half: the cache serves a
+// TestSessionGate_TaskAnchoredRouteResolvesPerRequest is the negative half: the PIN serves a
 // request only when the request RESOLVES the anchor it was taken for. Here neither session
-// presented a task at initialize, so each caches its own session anchor — and requests that do
-// carry a task resolve an anchor neither cached, must therefore reach the registry, and must
-// land on ONE gate, which is exactly what task anchoring is for.
+// presented a task at initialize, so each pins its own session anchor — and requests that do
+// carry a task resolve an anchor neither pinned, so each session reaches it through its span
+// cache instead, and both must land on ONE gate, which is exactly what task anchoring is for.
+// (What the span cache changes is who HOLDS that gate between calls; what it must not change is
+// that there is one of it. See session_gate_cache_test.go.)
 func TestSessionGate_TaskAnchoredRouteResolvesPerRequest(t *testing.T) {
 	t.Parallel()
 	rt := &UpstreamRoute{decideGates: newAnchorGates(), taskAnchored: true, pdp: pdp.DenyAllPDP{}}
